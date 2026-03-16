@@ -49,9 +49,14 @@ extern "C" fn exception_sync_el1(frame: &ExceptionFrame) {
     }
 }
 
+/// IRQ handler for EL1. Returns the (potentially new) SP for context switching.
+/// If the scheduler decides to preempt, it returns a different thread's SP.
 #[unsafe(no_mangle)]
-extern "C" fn exception_irq_el1(_frame: &ExceptionFrame) {
+extern "C" fn exception_irq_el1(frame_sp: u64) -> u64 {
     crate::arch::aarch64::irq::handle_irq();
+    // After handling the IRQ (which includes the timer), let the scheduler
+    // decide if we should switch threads.
+    crate::sched::tick(frame_sp)
 }
 
 #[unsafe(no_mangle)]

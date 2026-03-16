@@ -5,9 +5,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Timer interval in counter ticks. Set during init based on CNTFRQ_EL0.
-static mut TIMER_INTERVAL: u64 = 0;
+static TIMER_INTERVAL: AtomicU64 = AtomicU64::new(0);
 
 /// Read the counter frequency (ticks per second).
 fn cntfrq() -> u64 {
@@ -28,7 +26,7 @@ pub fn counter() -> u64 {
 pub fn init() {
     let freq = cntfrq();
     let interval = freq / 100; // 100 Hz
-    unsafe { TIMER_INTERVAL = interval };
+    TIMER_INTERVAL.store(interval, Ordering::Relaxed);
 
     // Set the timer compare value.
     unsafe {
@@ -49,8 +47,9 @@ pub fn handle_timer_irq() {
     let ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
     // Reset the timer for the next interval.
+    let interval = TIMER_INTERVAL.load(Ordering::Relaxed);
     unsafe {
-        core::arch::asm!("msr cntp_tval_el0, {}", in(reg) TIMER_INTERVAL);
+        core::arch::asm!("msr cntp_tval_el0, {}", in(reg) interval);
     }
 
     // Print every 100 ticks (once per second).
