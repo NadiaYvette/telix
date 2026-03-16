@@ -1,0 +1,8 @@
+[package]
+name = "telix-kernel"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "telix-kernel"
+path = "src/main.rs"

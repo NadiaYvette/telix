@@ -1,0 +1,10 @@
+[build]
+target = "aarch64-unknown-none"
+
+[target.aarch64-unknown-none]
+runner = "tools/run-qemu.sh"
+rustflags = ["-C", "link-arg=-Tkernel/src/arch/aarch64/linker.ld"]
+
+[unstable]
+build-std = ["core"]
+build-std-features = ["compiler-builtins-mem"]
