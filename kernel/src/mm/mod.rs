@@ -7,4 +7,5 @@ pub mod phys;
 pub mod slab;
 pub mod stats;
 pub mod vma;
+pub mod vmatree;
 pub mod wsclock;

@@ -179,6 +179,7 @@ static CACHE_64: SpinLock<SlabCache> = SpinLock::new(SlabCache::new(64, 64));
 static CACHE_128: SpinLock<SlabCache> = SpinLock::new(SlabCache::new(128, 64));
 static CACHE_256: SpinLock<SlabCache> = SpinLock::new(SlabCache::new(256, 64));
 static CACHE_512: SpinLock<SlabCache> = SpinLock::new(SlabCache::new(512, 64));
+static CACHE_2048: SpinLock<SlabCache> = SpinLock::new(SlabCache::new(2048, 64));
 
 fn cache_for_size(size: usize) -> Option<&'static SpinLock<SlabCache>> {
     if size <= 64 {
@@ -189,6 +190,8 @@ fn cache_for_size(size: usize) -> Option<&'static SpinLock<SlabCache>> {
         Some(&CACHE_256)
     } else if size <= 512 {
         Some(&CACHE_512)
+    } else if size <= 2048 {
+        Some(&CACHE_2048)
     } else {
         None
     }
@@ -209,8 +212,8 @@ pub fn free(addr: PhysAddr, size: usize) {
 
 /// Print slab allocator statistics.
 pub fn print_stats() {
-    let sizes = [64, 128, 256, 512];
-    let caches: [&SpinLock<SlabCache>; 4] = [&CACHE_64, &CACHE_128, &CACHE_256, &CACHE_512];
+    let sizes = [64, 128, 256, 512, 2048];
+    let caches: [&SpinLock<SlabCache>; 5] = [&CACHE_64, &CACHE_128, &CACHE_256, &CACHE_512, &CACHE_2048];
 
     crate::println!("  Slab allocator caches:");
     for (size, cache) in sizes.iter().zip(caches.iter()) {

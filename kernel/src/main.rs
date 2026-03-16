@@ -52,6 +52,10 @@ pub fn kmain() -> ! {
     println!("Testing extent tree...");
     mm::extent::run_tests();
 
+    // VMA tree tests.
+    println!("Testing VMA tree...");
+    mm::vmatree::run_tests();
+
     // Capability system test.
     test_capabilities();
 
@@ -466,11 +470,10 @@ fn test_demand_paging() {
     let test_va = 0x80_0000_0000usize;
     let num_pages = 4;
     mm::aspace::with_aspace(aspace_id, |aspace| {
-        let vma_idx = aspace.map_anon(test_va, num_pages, VmaProt::ReadWrite)
+        let vma = aspace.map_anon(test_va, num_pages, VmaProt::ReadWrite)
             .expect("map_anon");
-        println!("  Mapped {} pages at VA {:#x} (VMA {})", num_pages, test_va, vma_idx);
+        println!("  Mapped {} pages at VA {:#x}", num_pages, test_va);
 
-        let vma = &aspace.vmas[vma_idx];
         assert_eq!(vma.installed_count(), 0);
         assert_eq!(vma.page_count(), num_pages);
         assert_eq!(vma.mmu_page_count(), num_pages * PAGE_MMUCOUNT);

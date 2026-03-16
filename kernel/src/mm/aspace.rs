@@ -1,10 +1,11 @@
 //! Address space — per-task virtual memory management.
 //!
-//! Each address space owns a page table root and a set of VMAs.
-//! The WSCLOCK clock hand state is also stored here.
+//! Each address space owns a page table root and a B+ tree of VMAs.
+//! The WSCLOCK clock hand (VmaCursor) is also stored here.
 
 use super::object::{self, ObjectId};
-use super::vma::{Vma, VmaProt, MAX_VMAS};
+use super::vma::{Vma, VmaProt};
+use super::vmatree::{VmaCursor, VmaTree};
 use crate::sync::SpinLock;
 
 /// Maximum number of address spaces.
@@ -13,32 +14,16 @@ pub const MAX_ASPACES: usize = 16;
 /// Address space ID type.
 pub type ASpaceId = u32;
 
-/// WSCLOCK clock hand position.
-#[derive(Clone, Copy)]
-pub struct ClockHand {
-    pub vma_idx: usize,
-    pub mmu_page_offset: usize,
-}
-
-impl ClockHand {
-    const fn new() -> Self {
-        Self {
-            vma_idx: 0,
-            mmu_page_offset: 0,
-        }
-    }
-}
-
 /// An address space.
 pub struct AddressSpace {
     /// Physical address of the page table root (L0/PML4/root table).
     pub page_table_root: usize,
-    /// VMAs in this address space.
-    pub vmas: [Vma; MAX_VMAS],
+    /// VMAs in this address space (B+ tree keyed by VA interval).
+    pub vmas: VmaTree,
     /// Whether this address space slot is in use.
     pub active: bool,
     /// WSCLOCK clock hand.
-    pub clock_hand: ClockHand,
+    pub clock_hand: VmaCursor,
     /// Address space ID.
     pub id: ASpaceId,
 }
@@ -47,24 +32,21 @@ impl AddressSpace {
     const fn empty() -> Self {
         Self {
             page_table_root: 0,
-            vmas: {
-                const EMPTY_VMA: Vma = Vma::empty();
-                [EMPTY_VMA; MAX_VMAS]
-            },
+            vmas: VmaTree::new(),
             active: false,
-            clock_hand: ClockHand::new(),
+            clock_hand: VmaCursor::new(),
             id: 0,
         }
     }
 
     /// Map an anonymous region into this address space.
-    /// Returns the VMA index on success.
+    /// Returns a mutable reference to the new VMA on success.
     pub fn map_anon(
         &mut self,
         va_start: usize,
         page_count: usize,
         prot: VmaProt,
-    ) -> Option<usize> {
+    ) -> Option<&mut Vma> {
         // Create the backing memory object.
         let obj_id = object::create_anon(page_count as u16)?;
 
@@ -73,43 +55,26 @@ impl AddressSpace {
             obj.add_mapping(self.id, va_start);
         });
 
-        // Find a free VMA slot.
-        for (i, vma) in self.vmas.iter_mut().enumerate() {
-            if !vma.active {
-                vma.va_start = va_start;
-                vma.va_len = page_count * super::page::PAGE_SIZE;
-                vma.prot = prot;
-                vma.object_id = obj_id;
-                vma.object_offset = 0;
-                vma.installed = [0; (super::vma::MAX_VMA_MMUPAGES + 63) / 64];
-                vma.zeroed = [0; (super::vma::MAX_VMA_MMUPAGES + 63) / 64];
-                vma.active = true;
-                return Some(i);
+        // Insert into the VMA tree.
+        let va_len = page_count * super::page::PAGE_SIZE;
+        match self.vmas.insert(va_start, va_len, prot, obj_id, 0) {
+            Some(vma) => Some(vma),
+            None => {
+                // OOM — clean up.
+                object::destroy(obj_id);
+                None
             }
         }
-        // No free VMA slot — clean up.
-        object::destroy(obj_id);
-        None
-    }
-
-    /// Find the VMA containing virtual address `va`.
-    pub fn find_vma(&self, va: usize) -> Option<usize> {
-        for (i, vma) in self.vmas.iter().enumerate() {
-            if vma.active && vma.contains(va) {
-                return Some(i);
-            }
-        }
-        None
     }
 
     /// Find the VMA containing `va` and return a mutable reference.
     pub fn find_vma_mut(&mut self, va: usize) -> Option<&mut Vma> {
-        for vma in self.vmas.iter_mut() {
-            if vma.active && vma.contains(va) {
-                return Some(vma);
-            }
-        }
-        None
+        self.vmas.find_mut(va)
+    }
+
+    /// Find the VMA containing `va` (immutable).
+    pub fn find_vma(&self, va: usize) -> Option<&Vma> {
+        self.vmas.find(va)
     }
 }
 
@@ -143,8 +108,7 @@ pub fn create(page_table_root: usize) -> Option<ASpaceId> {
             space.active = true;
             space.id = id;
             space.page_table_root = page_table_root;
-            space.clock_hand = ClockHand::new();
-            // Increment after successful allocation.
+            space.clock_hand = VmaCursor::new();
             table.next_id = id + 1;
             return Some(id);
         }
@@ -158,12 +122,15 @@ pub fn destroy(id: ASpaceId) {
     for space in table.spaces.iter_mut() {
         if space.active && space.id == id {
             // Destroy backing objects for all VMAs.
-            for vma in space.vmas.iter_mut() {
-                if vma.active {
-                    object::destroy(vma.object_id);
-                    *vma = Vma::empty();
+            {
+                let mut it = space.vmas.iter();
+                while let Some(vma) = it.next() {
+                    if vma.active {
+                        object::destroy(vma.object_id);
+                    }
                 }
             }
+            space.vmas.clear();
             space.active = false;
             return;
         }
