@@ -111,6 +111,9 @@ pub fn map_user_pages(
 /// Public user page flags for use from main.rs.
 pub const USER_RWX_FLAGS: u64 = USER_PAGE;
 pub const USER_RW_FLAGS: u64 = USER_PAGE | PT_UXN;
+/// Read-only user page: AP = 11 (EL1 RO, EL0 RO), no execute.
+const PT_AP_RO_ALL: u64 = 3 << 6;
+pub const USER_RO_FLAGS: u64 = PT_VALID | PT_PAGE | PT_AF | PT_SH_INNER | PT_AP_RO_ALL | PT_ATTR_IDX_0 | PT_UXN;
 
 /// Get or create a next-level table at the given index.
 fn get_or_create_table(table: *mut u64, index: usize) -> Option<*mut u64> {

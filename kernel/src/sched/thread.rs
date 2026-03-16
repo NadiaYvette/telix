@@ -12,6 +12,14 @@ pub enum ThreadState {
     Dead,
 }
 
+/// Why a thread is blocked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockReason {
+    None,
+    PortRecv(u32),
+    PortSend(u32),
+}
+
 /// Maximum number of threads.
 pub const MAX_THREADS: usize = 64;
 
@@ -39,6 +47,8 @@ pub struct Thread {
     pub saved_sp: u64,
     /// Physical address of the base of this thread's stack page.
     pub stack_base: usize,
+    /// Why this thread is blocked (only valid when state == Blocked).
+    pub blocked_on: BlockReason,
 }
 
 impl Thread {
@@ -52,6 +62,7 @@ impl Thread {
             default_quantum: 10,
             saved_sp: 0,
             stack_base: 0,
+            blocked_on: BlockReason::None,
         }
     }
 }

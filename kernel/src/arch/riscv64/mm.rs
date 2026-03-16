@@ -24,6 +24,7 @@ const DEV_GIGA: u64 = PTE_V | PTE_R | PTE_W | PTE_A | PTE_D | PTE_G;
 /// User page flags (public for main.rs).
 pub const USER_RWX_FLAGS: u64 = PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_A | PTE_D;
 pub const USER_RW_FLAGS: u64 = PTE_V | PTE_R | PTE_W | PTE_U | PTE_A | PTE_D;
+pub const USER_RO_FLAGS: u64 = PTE_V | PTE_R | PTE_U | PTE_A;
 
 /// Create a leaf PTE from a physical address and flags.
 fn pte_leaf(phys: usize, flags: u64) -> u64 {

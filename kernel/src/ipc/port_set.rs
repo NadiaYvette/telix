@@ -44,7 +44,7 @@ impl PortSet {
     pub fn try_recv(&self) -> Option<(PortId, Message)> {
         for i in 0..self.count {
             let pid = self.ports[i];
-            if let Ok(msg) = port::recv(pid) {
+            if let Ok(msg) = port::recv_nb(pid) {
                 return Some((pid, msg));
             }
         }

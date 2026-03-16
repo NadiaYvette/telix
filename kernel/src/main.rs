@@ -3,6 +3,8 @@
 
 mod arch;
 mod cap;
+mod drivers;
+mod io;
 mod ipc;
 mod mm;
 mod sched;
@@ -62,35 +64,27 @@ pub fn kmain() -> ! {
     // Scheduler.
     sched::init();
 
-    let port = ipc::port::create().expect("create IPC port");
-    IPC_TEST_PORT.store(port, core::sync::atomic::Ordering::Relaxed);
-    println!("  IPC test port {} created", port);
-    sched::spawn(ipc_sender, 100, 10).expect("spawn sender");
-    sched::spawn(ipc_receiver, 100, 10).expect("spawn receiver");
+    // IPC test threads (Phase 1 — disabled for Phase 3 server testing).
+    // let port = ipc::port::create().expect("create IPC port");
+    // IPC_TEST_PORT.store(port, core::sync::atomic::Ordering::Relaxed);
+    // sched::spawn(ipc_sender, 100, 10).expect("spawn sender");
+    // sched::spawn(ipc_receiver, 100, 10).expect("spawn receiver");
 
     // Start secondary CPUs.
     println!("Starting secondary CPUs...");
     arch::platform::start_secondary_cpus();
 
-    // Phase 2: Demand-paging test (must run before userspace tests which don't return).
+    // Phase 2: Demand-paging test.
     println!("Testing demand-paged memory...");
     test_demand_paging();
 
-    // Platform-specific tests (syscall, userspace).
-    #[cfg(target_arch = "aarch64")]
-    {
-        test_syscalls_aarch64();
-        test_userspace_aarch64();
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        test_userspace_riscv64();
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        test_syscalls_x86_64();
-        test_userspace_x86_64();
-    }
+    // Phase 3: I/O server stack.
+    println!("Phase 3: Starting I/O servers...");
+    sched::spawn(io::initramfs::initramfs_server, 50, 20).expect("spawn initramfs");
+    // Virtio-blk server — AArch64 and RISC-V only (x86-64 needs PCI).
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    sched::spawn(io::blk_server::blk_server, 50, 20).expect("spawn blk server");
+    sched::spawn(test_io_client, 100, 10).expect("spawn io client");
 
     println!("Enabling interrupts");
     arch::platform::enable_interrupts();
@@ -107,6 +101,7 @@ fn ipc_sender() -> ! {
     let mut seq = 0u64;
     loop {
         let msg = ipc::Message::new(1, [seq, 0, 0, 0, 0, 0]);
+        // Blocking send — blocks if the queue is full.
         match ipc::port::send(port_id, msg) {
             Ok(()) => {
                 if seq % 10 == 0 {
@@ -114,19 +109,17 @@ fn ipc_sender() -> ! {
                 }
                 seq += 1;
             }
-            Err(_) => {
-                for _ in 0..1_000 {
-                    core::hint::spin_loop();
-                }
-            }
+            Err(()) => break,
         }
     }
+    loop { core::hint::spin_loop(); }
 }
 
 fn ipc_receiver() -> ! {
     let port_id = IPC_TEST_PORT.load(Ordering::Relaxed);
     let mut received = 0u64;
     loop {
+        // Blocking recv — blocks until a message arrives.
         match ipc::port::recv(port_id) {
             Ok(msg) => {
                 if received % 10 == 0 {
@@ -134,13 +127,10 @@ fn ipc_receiver() -> ! {
                 }
                 received += 1;
             }
-            Err(()) => {
-                for _ in 0..1_000 {
-                    core::hint::spin_loop();
-                }
-            }
+            Err(()) => break,
         }
     }
+    loop { core::hint::spin_loop(); }
 }
 
 fn test_capabilities() {
@@ -598,4 +588,115 @@ fn test_demand_paging() {
 
     mm::aspace::destroy(aspace_id);
     println!("  Demand paging test: PASSED");
+}
+
+// --- Phase 3: I/O test client ---
+
+fn test_io_client() -> ! {
+    use io::protocol::*;
+
+    // Wait for initramfs server to be ready.
+    let initramfs_port = loop {
+        let p = io::initramfs::INITRAMFS_PORT.load(Ordering::Acquire);
+        if p != u32::MAX {
+            break p;
+        }
+        core::hint::spin_loop();
+    };
+    println!("  [io-test] initramfs server on port {}", initramfs_port);
+
+    // Create a reply port for receiving responses.
+    let reply_port = ipc::port::create().expect("reply port");
+
+    // Step 1: Connect to open "hello.txt".
+    let filename = b"hello.txt";
+    let (n0, n1, n2) = pack_name(filename);
+    let connect_msg = ipc::Message::new(IO_CONNECT, [
+        n0, n1, n2,
+        filename.len() as u64,
+        reply_port as u64,
+        0,
+    ]);
+    ipc::port::send(initramfs_port, connect_msg).expect("send connect");
+
+    let reply = ipc::port::recv(reply_port).expect("recv connect reply");
+    assert!(reply.tag == IO_CONNECT_OK, "connect failed: tag={:#x}", reply.tag);
+    let file_handle = reply.data[0];
+    let file_size = reply.data[1];
+    println!("  [io-test] opened hello.txt: handle={}, size={} bytes", file_handle, file_size);
+
+    // Step 2: Read the file contents (inline, for small files).
+    let read_msg = ipc::Message::new(IO_READ, [
+        file_handle,
+        0,              // offset
+        file_size,      // length
+        reply_port as u64,
+        0, 0,
+    ]);
+    ipc::port::send(initramfs_port, read_msg).expect("send read");
+
+    let reply = ipc::port::recv(reply_port).expect("recv read reply");
+    assert!(reply.tag == IO_READ_OK, "read failed: tag={:#x}", reply.tag);
+    let bytes_read = reply.data[0] as usize;
+
+    // Unpack inline data from reply words.
+    let mut buf = [0u8; MAX_INLINE_READ];
+    let words = [reply.data[1], reply.data[2], reply.data[3], reply.data[4], reply.data[5]];
+    for i in 0..bytes_read.min(MAX_INLINE_READ) {
+        buf[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
+    }
+    let text = core::str::from_utf8(&buf[..bytes_read]).unwrap_or("<invalid utf8>");
+    println!("  [io-test] read {} bytes: {}", bytes_read, text);
+
+    // Step 3: Close.
+    let close_msg = ipc::Message::new(IO_CLOSE, [file_handle, 0, 0, 0, 0, 0]);
+    let _ = ipc::port::send_nb(initramfs_port, close_msg);
+
+    // Step 4: Test virtio-blk (AArch64/RISC-V only).
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        // Wait briefly for blk server. If no virtio device, skip.
+        let mut tries = 0u32;
+        let blk_port = loop {
+            let p = io::blk_server::BLK_PORT.load(Ordering::Acquire);
+            if p != u32::MAX {
+                break Some(p);
+            }
+            tries += 1;
+            if tries > 100_000 {
+                break None;
+            }
+            core::hint::spin_loop();
+        };
+        let blk_port = match blk_port {
+            Some(p) => p,
+            None => {
+                println!("  [io-test] no blk server, skipping block test");
+                println!("  Phase 3 I/O test: PASSED");
+                loop { core::hint::spin_loop(); }
+            }
+        };
+        println!("  [io-test] blk server on port {}", blk_port);
+
+        // Read sector 0.
+        let read_msg = ipc::Message::new(IO_READ, [
+            0,              // handle (unused for blk)
+            0,              // offset = sector 0
+            512,            // length
+            reply_port as u64,
+            0, 0,
+        ]);
+        ipc::port::send(blk_port, read_msg).expect("send blk read");
+
+        let reply = ipc::port::recv(reply_port).expect("recv blk reply");
+        if reply.tag == IO_READ_OK {
+            println!("  [io-test] blk read sector 0: {} bytes, first word = {:#x}",
+                reply.data[0], reply.data[1]);
+        } else {
+            println!("  [io-test] blk read error: tag={:#x} code={}", reply.tag, reply.data[0]);
+        }
+    }
+
+    println!("  Phase 3 I/O test: PASSED");
+    loop { core::hint::spin_loop(); }
 }

@@ -157,15 +157,21 @@ pub fn create() -> Option<PortId> {
 
 /// Send a message to a port (non-blocking).
 /// Returns Ok(()) on success, Err(msg) if the queue is full.
-pub fn send(port_id: PortId, msg: Message) -> Result<(), Message> {
+pub fn send_nb(port_id: PortId, msg: Message) -> Result<(), Message> {
     let mut table = PORT_TABLE.lock();
+    if (port_id as usize) >= MAX_PORTS {
+        return Err(msg);
+    }
     let port = &mut table.ports[port_id as usize];
     if !port.active {
         return Err(msg);
     }
     match port.try_send(msg) {
-        Ok(_wakeup) => {
-            // TODO: wake up blocked receiver thread via scheduler.
+        Ok(wakeup) => {
+            drop(table);
+            if let Some(tid) = wakeup {
+                crate::sched::wake_thread(tid);
+            }
             Ok(())
         }
         Err(msg) => Err(msg),
@@ -174,18 +180,88 @@ pub fn send(port_id: PortId, msg: Message) -> Result<(), Message> {
 
 /// Receive a message from a port (non-blocking).
 /// Returns Ok(msg) on success, Err(()) if empty.
-pub fn recv(port_id: PortId) -> Result<Message, ()> {
+pub fn recv_nb(port_id: PortId) -> Result<Message, ()> {
     let mut table = PORT_TABLE.lock();
+    if (port_id as usize) >= MAX_PORTS {
+        return Err(());
+    }
     let port = &mut table.ports[port_id as usize];
     if !port.active {
         return Err(());
     }
     match port.try_recv() {
-        Ok((msg, _wakeup)) => {
-            // TODO: wake up blocked sender thread.
+        Ok((msg, wakeup)) => {
+            drop(table);
+            if let Some(tid) = wakeup {
+                crate::sched::wake_thread(tid);
+            }
             Ok(msg)
         }
         Err(()) => Err(()),
+    }
+}
+
+/// Send a message to a port (blocking).
+/// Blocks if the queue is full until space is available.
+pub fn send(port_id: PortId, msg: Message) -> Result<(), ()> {
+    use crate::sched::thread::BlockReason;
+    let mut pending = msg;
+    loop {
+        let mut table = PORT_TABLE.lock();
+        if (port_id as usize) >= MAX_PORTS {
+            return Err(());
+        }
+        let port = &mut table.ports[port_id as usize];
+        if !port.active {
+            return Err(());
+        }
+        match port.try_send(pending) {
+            Ok(wakeup) => {
+                drop(table);
+                if let Some(tid) = wakeup {
+                    crate::sched::wake_thread(tid);
+                }
+                return Ok(());
+            }
+            Err(returned_msg) => {
+                let tid = crate::sched::current_thread_id();
+                port.add_send_waiter(tid);
+                pending = returned_msg;
+                drop(table);
+                crate::sched::block_current(BlockReason::PortSend(port_id));
+            }
+        }
+    }
+}
+
+/// Receive a message from a port (blocking).
+/// Blocks if the queue is empty until a message arrives.
+pub fn recv(port_id: PortId) -> Result<Message, ()> {
+    use crate::sched::thread::BlockReason;
+    loop {
+        let mut table = PORT_TABLE.lock();
+        if (port_id as usize) >= MAX_PORTS {
+            return Err(());
+        }
+        let port = &mut table.ports[port_id as usize];
+        if !port.active {
+            return Err(());
+        }
+        match port.try_recv() {
+            Ok((msg, wakeup)) => {
+                drop(table);
+                if let Some(tid) = wakeup {
+                    crate::sched::wake_thread(tid);
+                }
+                return Ok(msg);
+            }
+            Err(()) => {
+                let tid = crate::sched::current_thread_id();
+                port.add_recv_waiter(tid);
+                drop(table);
+                crate::sched::block_current(BlockReason::PortRecv(port_id));
+            }
+        }
     }
 }
 

@@ -23,6 +23,8 @@ pub const SYS_PORT_SET_CREATE: u64 = 5;
 pub const SYS_PORT_SET_ADD: u64 = 6;
 pub const SYS_YIELD: u64 = 7;
 pub const SYS_THREAD_ID: u64 = 8;
+pub const SYS_SEND_NB: u64 = 9;
+pub const SYS_RECV_NB: u64 = 10;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -110,6 +112,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_PORT_SET_ADD => sys_port_set_add(a0, a1),
         SYS_YIELD => sys_yield(),
         SYS_THREAD_ID => sys_thread_id(),
+        SYS_SEND_NB => sys_send_nb(a0, a1, [a2, a3, a4, a5, 0, 0]),
+        SYS_RECV_NB => sys_recv_nb(a0, frame),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -140,6 +144,14 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
     let msg = crate::ipc::Message::new(tag, data);
     match crate::ipc::port::send(port_id as u32, msg) {
         Ok(()) => 0,
+        Err(()) => 1,
+    }
+}
+
+fn sys_send_nb(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
+    let msg = crate::ipc::Message::new(tag, data);
+    match crate::ipc::port::send_nb(port_id as u32, msg) {
+        Ok(()) => 0,
         Err(_) => 1, // Queue full.
     }
 }
@@ -147,7 +159,6 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
 fn sys_recv(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
     match crate::ipc::port::recv(port_id as u32) {
         Ok(msg) => {
-            // Return message data in registers via the frame.
             set_reg(frame, 1, msg.tag);
             set_reg(frame, 2, msg.data[0]);
             set_reg(frame, 3, msg.data[1]);
@@ -155,7 +166,23 @@ fn sys_recv(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
             set_reg(frame, 5, msg.data[3]);
             set_reg(frame, 6, msg.data[4]);
             set_reg(frame, 7, msg.data[5]);
-            0 // Success.
+            0
+        }
+        Err(()) => 1,
+    }
+}
+
+fn sys_recv_nb(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
+    match crate::ipc::port::recv_nb(port_id as u32) {
+        Ok(msg) => {
+            set_reg(frame, 1, msg.tag);
+            set_reg(frame, 2, msg.data[0]);
+            set_reg(frame, 3, msg.data[1]);
+            set_reg(frame, 4, msg.data[2]);
+            set_reg(frame, 5, msg.data[3]);
+            set_reg(frame, 6, msg.data[4]);
+            set_reg(frame, 7, msg.data[5]);
+            0
         }
         Err(()) => 1, // Queue empty.
     }

@@ -45,10 +45,8 @@ pub fn init() {
 pub fn handle_timer_irq() {
     let ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
-    // Print every 100 ticks (~once per second).
-    if ticks % 100 == 0 {
-        crate::println!("[tick {}]", ticks);
-    }
+    // Uncomment for debugging:
+    // if ticks % 100 == 0 { crate::println!("[tick {}]", ticks); }
 }
 
 /// Enable interrupts (STI).

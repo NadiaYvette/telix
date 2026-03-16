@@ -141,10 +141,8 @@ fn handle_timer_irq() {
     let now = read_time();
     sbi_set_timer(now + interval);
 
-    // Print every 100 ticks (once per second).
-    if ticks % 100 == 0 {
-        crate::println!("[tick {}]", ticks);
-    }
+    // Uncomment for debugging:
+    // if ticks % 100 == 0 { crate::println!("[tick {}]", ticks); }
 }
 
 /// Main Rust trap handler. Called from vectors.S with current SP as argument.

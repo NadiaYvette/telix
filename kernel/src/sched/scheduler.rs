@@ -9,7 +9,7 @@
 //! SMP: Run queues are shared across all CPUs, protected by the scheduler
 //! spinlock. Each CPU tracks its own current/idle thread via smp::PerCpuData.
 
-use super::thread::{Thread, ThreadId, ThreadState, MAX_THREADS, EXCEPTION_FRAME_SIZE};
+use super::thread::{Thread, ThreadId, ThreadState, BlockReason, MAX_THREADS, EXCEPTION_FRAME_SIZE};
 use super::task::{Task, MAX_TASKS};
 use super::smp;
 use crate::sync::SpinLock;
@@ -243,12 +243,10 @@ impl Scheduler {
         // Save current thread's SP.
         self.threads[prev_id as usize].saved_sp = current_sp;
         let prev_prio = self.threads[prev_id as usize].priority;
-        if self.threads[prev_id as usize].state == ThreadState::Running {
-            self.threads[prev_id as usize].state = ThreadState::Ready;
-            // Don't put idle threads on the run queue.
-            if prev_id != idle_id {
-                self.run_queues[prev_prio as usize].push(prev_id);
-            }
+        self.threads[prev_id as usize].state = ThreadState::Ready;
+        // Don't put idle threads on the run queue.
+        if prev_id != idle_id {
+            self.run_queues[prev_prio as usize].push(prev_id);
         }
 
         // Load next thread's SP.
@@ -297,6 +295,33 @@ pub fn tick(current_sp: u64) -> u64 {
 pub fn schedule() {
     // For voluntary yield, we would need to save our own context and switch.
     // This is more complex and will be implemented later.
+}
+
+/// Per-thread wakeup flags. Set by wake_thread(), checked by block_current().
+/// Using atomics avoids needing the scheduler lock in the spin loop.
+static WAKEUP_FLAGS: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS] = {
+    const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    [INIT; super::thread::MAX_THREADS]
+};
+
+/// Block the current thread with the given reason.
+/// The thread will be preempted on the next timer tick and will not
+/// be re-enqueued until `wake_thread()` is called.
+pub fn block_current(_reason: BlockReason) {
+    let tid = current_thread_id();
+    WAKEUP_FLAGS[tid as usize].store(false, Ordering::Release);
+    // Spin until the wakeup flag is set. The thread stays Running and
+    // gets preempted normally by timer ticks (quantum-based). This avoids
+    // a race where wake_thread() re-enqueues a Blocked thread that's still
+    // executing on its CPU, causing double-scheduling on SMP.
+    while !WAKEUP_FLAGS[tid as usize].load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+}
+
+/// Wake a blocked thread, making it runnable.
+pub fn wake_thread(tid: ThreadId) {
+    WAKEUP_FLAGS[tid as usize].store(true, Ordering::Release);
 }
 
 #[allow(dead_code)]

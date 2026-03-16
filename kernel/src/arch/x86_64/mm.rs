@@ -19,6 +19,7 @@ const MMU_PAGE_SIZE: usize = 4096;
 /// User page flags (public for main.rs).
 pub const USER_RWX_FLAGS: u64 = PTE_P | PTE_RW | PTE_US;
 pub const USER_RW_FLAGS: u64 = PTE_P | PTE_RW | PTE_US | PTE_NX;
+pub const USER_RO_FLAGS: u64 = PTE_P | PTE_US | PTE_NX; // No PTE_RW = read-only
 
 /// Allocate a zero-filled 4K page for a page table.
 fn alloc_table() -> Option<usize> {

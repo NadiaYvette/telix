@@ -62,10 +62,8 @@ pub fn handle_timer_irq() {
         core::arch::asm!("msr cntp_tval_el0, {}", in(reg) interval);
     }
 
-    // Print every 100 ticks (once per second).
-    if ticks % 100 == 0 {
-        crate::println!("[tick {}]", ticks);
-    }
+    // Uncomment for debugging:
+    // if ticks % 100 == 0 { crate::println!("[tick {}]", ticks); }
 }
 
 /// Unmask IRQs (clear DAIF.I bit) to allow interrupts.
