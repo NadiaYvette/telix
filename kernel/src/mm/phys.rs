@@ -281,20 +281,12 @@ impl PhysAllocator {
     }
 }
 
-// Global allocator instance using UnsafeCell for interior mutability.
-use core::cell::UnsafeCell;
+use crate::sync::SpinLock;
 
-struct GlobalAllocator(UnsafeCell<PhysAllocator>);
-
-// Safety: we only access the allocator from a single core during init, and later
-// with interrupts disabled (or behind a spinlock when SMP is added).
-unsafe impl Sync for GlobalAllocator {}
-
-static ALLOCATOR: GlobalAllocator = GlobalAllocator(UnsafeCell::new(PhysAllocator::new()));
+static ALLOCATOR: SpinLock<PhysAllocator> = SpinLock::new(PhysAllocator::new());
 
 fn with_allocator<T>(f: impl FnOnce(&mut PhysAllocator) -> T) -> T {
-    // Safety: single-threaded access during boot; will add spinlock for SMP.
-    unsafe { f(&mut *ALLOCATOR.0.get()) }
+    f(&mut ALLOCATOR.lock())
 }
 
 /// Initialize the physical memory allocator.
