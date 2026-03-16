@@ -13,8 +13,8 @@ pub const MAX_TASKS: usize = 16;
 pub struct Task {
     pub id: TaskId,
     pub active: bool,
-    // In Phase 1, there's no per-task page table — all threads run in kernel space.
-    // The capability space will be added when we integrate with the cap system.
+    /// Address space ID (0 = kernel, uses identity mapping).
+    pub aspace_id: u32,
 }
 
 impl Task {
@@ -22,6 +22,7 @@ impl Task {
         Self {
             id: 0,
             active: false,
+            aspace_id: 0,
         }
     }
 }

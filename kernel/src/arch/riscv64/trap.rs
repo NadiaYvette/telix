@@ -26,6 +26,9 @@ const SCAUSE_INTERRUPT_BIT: u64 = 1 << 63;
 const SCAUSE_S_TIMER_IRQ: u64 = SCAUSE_INTERRUPT_BIT | 5;
 const SCAUSE_ECALL_FROM_UMODE: u64 = 8;
 const SCAUSE_ECALL_FROM_SMODE: u64 = 9;
+const SCAUSE_INST_PAGE_FAULT: u64 = 12;
+const SCAUSE_LOAD_PAGE_FAULT: u64 = 13;
+const SCAUSE_STORE_PAGE_FAULT: u64 = 15;
 
 /// SBI TIME extension ID and function.
 const SBI_EXT_TIME: u64 = 0x54494D45;
@@ -163,6 +166,32 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             // Advance sepc past the ecall instruction (4 bytes).
             frame.sepc += 4;
             crate::syscall::dispatch(frame);
+            frame_sp
+        }
+
+        SCAUSE_INST_PAGE_FAULT | SCAUSE_LOAD_PAGE_FAULT | SCAUSE_STORE_PAGE_FAULT => {
+            let stval = read_stval();
+            let fault_type = match scause {
+                SCAUSE_INST_PAGE_FAULT => crate::mm::fault::FaultType::Exec,
+                SCAUSE_STORE_PAGE_FAULT => crate::mm::fault::FaultType::Write,
+                _ => crate::mm::fault::FaultType::Read,
+            };
+            let aspace_id = crate::sched::current_aspace_id();
+            if aspace_id == 0 {
+                crate::println!(
+                    "Kernel page fault: cause={:#x} sepc={:#x} stval={:#x}",
+                    scause, frame.sepc, stval
+                );
+                loop { core::hint::spin_loop(); }
+            }
+            let result = crate::mm::fault::handle_page_fault(aspace_id, stval as usize, fault_type);
+            if result == crate::mm::fault::FaultResult::Failed {
+                crate::println!(
+                    "Unhandled page fault: cause={:#x} sepc={:#x} stval={:#x}",
+                    scause, frame.sepc, stval
+                );
+                loop { core::hint::spin_loop(); }
+            }
             frame_sp
         }
 

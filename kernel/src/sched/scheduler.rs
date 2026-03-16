@@ -303,3 +303,13 @@ pub fn schedule() {
 pub fn current_thread_id() -> ThreadId {
     smp::current().current_thread.load(Ordering::Relaxed)
 }
+
+/// Get the address space ID of the current thread's task.
+/// Returns 0 if the thread/task has no address space (kernel context).
+pub fn current_aspace_id() -> u32 {
+    let tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let sched = SCHEDULER.lock();
+    let thread = &sched.threads[tid as usize];
+    let task = &sched.tasks[thread.task_id as usize];
+    task.aspace_id
+}

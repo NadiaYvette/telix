@@ -92,6 +92,128 @@ fn get_or_create_table(table: *mut u64, index: usize) -> Option<*mut u64> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-MMU-page operations for demand paging
+// ---------------------------------------------------------------------------
+
+/// x86-64 PTE Accessed bit.
+const PTE_A: u64 = 1 << 5;
+
+/// Map a single 4K MMU page at `va` to physical address `pa` with given flags.
+pub fn map_single_mmupage(pml4: usize, va: usize, pa: usize, flags: u64) -> bool {
+    let pml4_table = pml4 as *mut u64;
+    let pml4_idx = (va >> 39) & 0x1FF;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pd_idx = (va >> 21) & 0x1FF;
+    let pt_idx = (va >> 12) & 0x1FF;
+
+    let pdpt = match get_or_create_table(pml4_table, pml4_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let pd = match get_or_create_table(pdpt, pdpt_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let pt = match get_or_create_table(pd, pd_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    unsafe {
+        *pt.add(pt_idx) = (pa as u64 & !0xFFF) | flags;
+    }
+    // invlpg
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) va);
+    }
+    true
+}
+
+/// Unmap a single 4K MMU page at `va`. Returns the old physical address, or 0.
+pub fn unmap_single_mmupage(pml4: usize, va: usize) -> usize {
+    let pml4_table = pml4 as *mut u64;
+    let pml4_idx = (va >> 39) & 0x1FF;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pd_idx = (va >> 21) & 0x1FF;
+    let pt_idx = (va >> 12) & 0x1FF;
+
+    let pdpt = match walk_table(pml4_table, pml4_idx) {
+        Some(t) => t,
+        None => return 0,
+    };
+    let pd = match walk_table(pdpt, pdpt_idx) {
+        Some(t) => t,
+        None => return 0,
+    };
+    let pt = match walk_table(pd, pd_idx) {
+        Some(t) => t,
+        None => return 0,
+    };
+
+    let entry = unsafe { *pt.add(pt_idx) };
+    if entry & PTE_P == 0 {
+        return 0;
+    }
+    let pa = (entry & 0x000F_FFFF_FFFF_F000) as usize;
+    unsafe {
+        *pt.add(pt_idx) = 0;
+    }
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) va);
+    }
+    pa
+}
+
+/// Read and clear the Accessed bit for the PTE at `va`.
+/// Returns true if the page was referenced.
+pub fn read_and_clear_ref_bit(pml4: usize, va: usize) -> bool {
+    let pml4_table = pml4 as *mut u64;
+    let pml4_idx = (va >> 39) & 0x1FF;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pd_idx = (va >> 21) & 0x1FF;
+    let pt_idx = (va >> 12) & 0x1FF;
+
+    let pdpt = match walk_table(pml4_table, pml4_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let pd = match walk_table(pdpt, pdpt_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let pt = match walk_table(pd, pd_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let entry = unsafe { *pt.add(pt_idx) };
+    if entry & PTE_P == 0 {
+        return false;
+    }
+    let referenced = (entry & PTE_A) != 0;
+    if referenced {
+        unsafe {
+            *pt.add(pt_idx) = entry & !PTE_A;
+        }
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) va);
+        }
+    }
+    referenced
+}
+
+/// Walk an existing non-leaf table entry. Returns next-level table pointer or None.
+fn walk_table(table: *mut u64, index: usize) -> Option<*mut u64> {
+    let entry = unsafe { *table.add(index) };
+    if entry & PTE_P != 0 && entry & PTE_PS == 0 {
+        let next = (entry & 0x000F_FFFF_FFFF_F000) as usize;
+        Some(next as *mut u64)
+    } else {
+        None
+    }
+}
+
 /// Reload CR3 to flush the TLB after page table changes.
 pub fn enable_mmu(pml4: usize) {
     unsafe {

@@ -86,6 +86,14 @@ extern "C" fn exception_sync_el0(frame: &mut ExceptionFrame) {
             // SVC from AArch64 EL0.
             crate::syscall::dispatch(frame);
         }
+        // Data Abort from EL0.
+        0x24 => {
+            handle_abort_el0(frame);
+        }
+        // Instruction Abort from EL0.
+        0x20 => {
+            handle_abort_el0(frame);
+        }
         _ => {
             crate::println!(
                 "EL0 Sync exception: EC={:#x} ESR={:#x} ELR={:#x}",
@@ -95,6 +103,41 @@ extern "C" fn exception_sync_el0(frame: &mut ExceptionFrame) {
                 core::hint::spin_loop();
             }
         }
+    }
+}
+
+/// Handle a data/instruction abort from EL0 by dispatching to the VM fault handler.
+fn handle_abort_el0(frame: &ExceptionFrame) {
+    let far: u64;
+    unsafe { core::arch::asm!("mrs {}, far_el1", out(reg) far); }
+    let ec = (frame.esr >> 26) & 0x3f;
+    let iss = frame.esr & 0x1FFFFFF;
+    let fault_type = if ec == 0x20 {
+        crate::mm::fault::FaultType::Exec
+    } else if iss & (1 << 6) != 0 {
+        // WnR bit (bit 6 of ISS for data aborts): 1 = write.
+        crate::mm::fault::FaultType::Write
+    } else {
+        crate::mm::fault::FaultType::Read
+    };
+
+    // Get the current task's address space.
+    let aspace_id = crate::sched::current_aspace_id();
+    if aspace_id == 0 {
+        crate::println!(
+            "EL0 Abort with no address space: FAR={:#x} EC={:#x} ELR={:#x}",
+            far, ec, frame.elr
+        );
+        loop { core::hint::spin_loop(); }
+    }
+
+    let result = crate::mm::fault::handle_page_fault(aspace_id, far as usize, fault_type);
+    if result == crate::mm::fault::FaultResult::Failed {
+        crate::println!(
+            "EL0 Abort: unhandled fault FAR={:#x} EC={:#x} ELR={:#x}",
+            far, ec, frame.elr
+        );
+        loop { core::hint::spin_loop(); }
     }
 }
 

@@ -116,6 +116,111 @@ fn get_or_create_table(table: *mut u64, index: usize) -> Option<*mut u64> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-MMU-page operations for demand paging
+// ---------------------------------------------------------------------------
+
+/// Map a single 4K MMU page at `va` to physical address `pa` with given flags.
+pub fn map_single_mmupage(root: usize, va: usize, pa: usize, flags: u64) -> bool {
+    let root_table = root as *mut u64;
+    let vpn2 = (va >> 30) & 0x1FF;
+    let vpn1 = (va >> 21) & 0x1FF;
+    let vpn0 = (va >> 12) & 0x1FF;
+
+    let l1 = match get_or_create_table(root_table, vpn2) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l2 = match get_or_create_table(l1, vpn1) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    unsafe {
+        *l2.add(vpn0) = pte_leaf(pa, flags);
+    }
+    // TLB invalidate.
+    unsafe {
+        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
+    }
+    true
+}
+
+/// Unmap a single 4K MMU page at `va`. Returns the old physical address, or 0.
+pub fn unmap_single_mmupage(root: usize, va: usize) -> usize {
+    let root_table = root as *mut u64;
+    let vpn2 = (va >> 30) & 0x1FF;
+    let vpn1 = (va >> 21) & 0x1FF;
+    let vpn0 = (va >> 12) & 0x1FF;
+
+    let l1 = match walk_table(root_table, vpn2) {
+        Some(t) => t,
+        None => return 0,
+    };
+    let l2 = match walk_table(l1, vpn1) {
+        Some(t) => t,
+        None => return 0,
+    };
+
+    let entry = unsafe { *l2.add(vpn0) };
+    if entry & PTE_V == 0 {
+        return 0;
+    }
+    let pa = ((entry >> 10) << 12) as usize;
+    unsafe {
+        *l2.add(vpn0) = 0;
+    }
+    unsafe {
+        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
+    }
+    pa
+}
+
+/// Read and clear the Accessed bit for the PTE at `va`.
+/// Returns true if the page was referenced.
+pub fn read_and_clear_ref_bit(root: usize, va: usize) -> bool {
+    let root_table = root as *mut u64;
+    let vpn2 = (va >> 30) & 0x1FF;
+    let vpn1 = (va >> 21) & 0x1FF;
+    let vpn0 = (va >> 12) & 0x1FF;
+
+    let l1 = match walk_table(root_table, vpn2) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l2 = match walk_table(l1, vpn1) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let entry = unsafe { *l2.add(vpn0) };
+    if entry & PTE_V == 0 {
+        return false;
+    }
+    let referenced = (entry & PTE_A) != 0;
+    if referenced {
+        unsafe {
+            *l2.add(vpn0) = entry & !PTE_A;
+        }
+        unsafe {
+            core::arch::asm!("sfence.vma {}, zero", in(reg) va);
+        }
+    }
+    referenced
+}
+
+/// Walk an existing non-leaf table entry. Returns next-level table pointer or None.
+fn walk_table(table: *mut u64, index: usize) -> Option<*mut u64> {
+    let entry = unsafe { *table.add(index) };
+    if entry & PTE_V != 0 && entry & (PTE_R | PTE_W | PTE_X) == 0 {
+        // Non-leaf: extract physical address.
+        let phys = ((entry >> 10) << 12) as usize;
+        Some(phys as *mut u64)
+    } else {
+        None
+    }
+}
+
 /// Enable Sv39 paging by writing the satp CSR.
 pub fn enable_mmu(root: usize) {
     let ppn = (root >> 12) as u64;

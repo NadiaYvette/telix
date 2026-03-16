@@ -1,3 +1,10 @@
+pub mod aspace;
+pub mod extent;
+pub mod fault;
+pub mod object;
 pub mod page;
 pub mod phys;
 pub mod slab;
+pub mod stats;
+pub mod vma;
+pub mod wsclock;

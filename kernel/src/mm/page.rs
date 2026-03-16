@@ -1,13 +1,30 @@
 //! Page size constants and address types.
 
-/// Hardware MMU page size (4 KiB on AArch64).
+/// Hardware MMU page size (4 KiB on all supported architectures).
 pub const MMUPAGE_SIZE: usize = 4096;
 pub const MMUPAGE_SHIFT: usize = 12;
 
 /// Allocation page size: configurable multiple of MMUPAGE_SIZE.
-/// 64 KiB = 16 MMU pages. This is the minimum allocation unit for the physical allocator.
+/// Selected at compile time via cargo features.
+#[cfg(feature = "page_size_16k")]
+pub const PAGE_SIZE: usize = 16384;
+#[cfg(feature = "page_size_16k")]
+pub const PAGE_SHIFT: usize = 14;
+
+#[cfg(feature = "page_size_64k")]
 pub const PAGE_SIZE: usize = 65536;
+#[cfg(feature = "page_size_64k")]
 pub const PAGE_SHIFT: usize = 16;
+
+#[cfg(feature = "page_size_128k")]
+pub const PAGE_SIZE: usize = 131072;
+#[cfg(feature = "page_size_128k")]
+pub const PAGE_SHIFT: usize = 17;
+
+#[cfg(feature = "page_size_256k")]
+pub const PAGE_SIZE: usize = 262144;
+#[cfg(feature = "page_size_256k")]
+pub const PAGE_SHIFT: usize = 18;
 
 /// Number of MMU pages per allocation page.
 pub const PAGE_MMUCOUNT: usize = PAGE_SIZE / MMUPAGE_SIZE;

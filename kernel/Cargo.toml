@@ -6,3 +6,10 @@ edition = "2024"
 [[bin]]
 name = "telix-kernel"
 path = "src/main.rs"
+
+[features]
+default = ["page_size_64k"]
+page_size_16k = []
+page_size_64k = []
+page_size_128k = []
+page_size_256k = []

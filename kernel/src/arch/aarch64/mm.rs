@@ -14,6 +14,7 @@ const PT_AP_RW_EL1: u64 = 0 << 6; // EL1 RW, EL0 no access
 const PT_AP_RW_ALL: u64 = 1 << 6; // EL1 RW, EL0 RW
 const PT_UXN: u64 = 1 << 54;      // Unprivileged execute-never
 const PT_PXN: u64 = 1 << 53;      // Privileged execute-never
+const PT_CONTIGUOUS: u64 = 1 << 52; // Contiguous hint (16 × 4K = 64K group)
 const PT_ATTR_IDX_0: u64 = 0 << 2; // MAIR index 0 (normal memory)
 const PT_ATTR_IDX_1: u64 = 1 << 2; // MAIR index 1 (device memory)
 
@@ -127,6 +128,212 @@ fn get_or_create_table(table: *mut u64, index: usize) -> Option<*mut u64> {
         }
         Some(next as *mut u64)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-MMU-page operations for demand paging
+// ---------------------------------------------------------------------------
+
+/// Map a single 4K MMU page at `va` to physical address `pa` with given flags.
+/// Creates intermediate table entries as needed. Invalidates TLB for the VA.
+pub fn map_single_mmupage(l0: usize, va: usize, pa: usize, flags: u64) -> bool {
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+
+    let l1 = match get_or_create_table(l0_table, l0_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l2 = match get_or_create_table(l1, l1_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l3 = match get_or_create_table(l2, l2_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    unsafe {
+        *l3.add(l3_idx) = (pa as u64) | flags;
+    }
+    // TLB invalidate for this VA (inner-shareable).
+    unsafe {
+        let va_shifted = (va >> 12) as u64;
+        core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("isb");
+    }
+    true
+}
+
+/// Unmap a single 4K MMU page at `va`. Returns the old physical address, or 0 if not mapped.
+pub fn unmap_single_mmupage(l0: usize, va: usize) -> usize {
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+
+    // Walk down — if any level is missing, the page isn't mapped.
+    let l1 = match walk_table(l0_table, l0_idx) {
+        Some(t) => t,
+        None => return 0,
+    };
+    let l2 = match walk_table(l1, l1_idx) {
+        Some(t) => t,
+        None => return 0,
+    };
+    let l3 = match walk_table(l2, l2_idx) {
+        Some(t) => t,
+        None => return 0,
+    };
+
+    let entry = unsafe { *l3.add(l3_idx) };
+    if entry & PT_VALID == 0 {
+        return 0;
+    }
+    let pa = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+    unsafe {
+        *l3.add(l3_idx) = 0;
+    }
+    // TLB invalidate.
+    unsafe {
+        let va_shifted = (va >> 12) as u64;
+        core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("isb");
+    }
+    pa
+}
+
+/// Read and clear the Access Flag (AF) for the PTE at `va`.
+/// Returns true if AF was set (page was referenced).
+pub fn read_and_clear_ref_bit(l0: usize, va: usize) -> bool {
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+
+    let l1 = match walk_table(l0_table, l0_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l2 = match walk_table(l1, l1_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l3 = match walk_table(l2, l2_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let entry = unsafe { *l3.add(l3_idx) };
+    if entry & PT_VALID == 0 {
+        return false;
+    }
+    let referenced = (entry & PT_AF) != 0;
+    if referenced {
+        // Clear AF.
+        unsafe {
+            *l3.add(l3_idx) = entry & !PT_AF;
+        }
+        // TLB invalidate so the CPU will set AF again on next access.
+        unsafe {
+            let va_shifted = (va >> 12) as u64;
+            core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+            core::arch::asm!("dsb ish");
+            core::arch::asm!("isb");
+        }
+    }
+    referenced
+}
+
+/// Walk an existing table entry (no creation). Returns next-level table pointer or None.
+fn walk_table(table: *mut u64, index: usize) -> Option<*mut u64> {
+    let entry = unsafe { *table.add(index) };
+    if entry & PT_VALID != 0 && entry & PT_TABLE != 0 {
+        let next = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+        Some(next as *mut u64)
+    } else {
+        None
+    }
+}
+
+/// Number of contiguous L3 PTEs in a contiguous group (16 × 4K = 64K).
+const CONTIGUOUS_GROUP_SIZE: usize = 16;
+
+/// Try to promote a contiguous group of 16 4K PTEs to use the contiguous hint.
+/// `l0`: page table root. `va`: any VA within the group. `group_count`: how many
+/// of the 16 entries in the group are installed (from VMA bitmap).
+/// Returns true if promotion was applied.
+pub fn try_contiguous_promotion(l0: usize, va: usize, group_count: usize) -> bool {
+    if group_count != CONTIGUOUS_GROUP_SIZE {
+        return false;
+    }
+
+    // Align VA down to 64K boundary (the contiguous group boundary).
+    let group_va = va & !(CONTIGUOUS_GROUP_SIZE * MMU_PAGE_SIZE - 1);
+
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (group_va >> 39) & 0x1FF;
+    let l1_idx = (group_va >> 30) & 0x1FF;
+    let l2_idx = (group_va >> 21) & 0x1FF;
+    let l3_base_idx = (group_va >> 12) & 0x1FF;
+
+    // Walk to L3 table (read-only, no creation).
+    let l1 = match walk_table(l0_table, l0_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l2 = match walk_table(l1, l1_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l3 = match walk_table(l2, l2_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    // Verify all 16 PTEs are valid and don't already have the contiguous bit.
+    for i in 0..CONTIGUOUS_GROUP_SIZE {
+        let entry = unsafe { *l3.add(l3_base_idx + i) };
+        if entry & PT_VALID == 0 {
+            return false;
+        }
+    }
+
+    // Check if already promoted.
+    let first = unsafe { *l3.add(l3_base_idx) };
+    if first & PT_CONTIGUOUS != 0 {
+        return false;
+    }
+
+    // Set the contiguous bit on all 16 PTEs.
+    for i in 0..CONTIGUOUS_GROUP_SIZE {
+        unsafe {
+            let entry = *l3.add(l3_base_idx + i);
+            *l3.add(l3_base_idx + i) = entry | PT_CONTIGUOUS;
+        }
+    }
+
+    // TLB invalidate the entire group.
+    for i in 0..CONTIGUOUS_GROUP_SIZE {
+        let entry_va = group_va + i * MMU_PAGE_SIZE;
+        unsafe {
+            let va_shifted = (entry_va >> 12) as u64;
+            core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+        }
+    }
+    unsafe {
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("isb");
+    }
+
+    true
 }
 
 /// Enable the MMU with the given L0 page table in TTBR0.

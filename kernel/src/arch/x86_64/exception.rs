@@ -91,7 +91,9 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         11 => exception_fault("Segment Not Present (#NP)", frame),
         12 => exception_fault("Stack Segment (#SS)", frame),
         13 => exception_fault("General Protection (#GP)", frame),
-        14 => exception_fault("Page Fault (#PF)", frame),
+        14 => {
+            return handle_page_fault_x86(frame, frame_sp);
+        }
         16 => exception_fault("x87 FP Exception (#MF)", frame),
         17 => exception_fault("Alignment Check (#AC)", frame),
         18 => exception_fault("Machine Check (#MC)", frame),
@@ -125,6 +127,45 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         }
     }
 
+    frame_sp
+}
+
+fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
+    let cr2: u64;
+    unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2); }
+    let error = frame.error_code();
+    // Error code bits: bit 0 = P (present), bit 1 = W/R, bit 2 = U/S, bit 4 = I/D.
+    let fault_type = if error & (1 << 4) != 0 {
+        crate::mm::fault::FaultType::Exec
+    } else if error & (1 << 1) != 0 {
+        crate::mm::fault::FaultType::Write
+    } else {
+        crate::mm::fault::FaultType::Read
+    };
+    let is_user = (error & (1 << 2)) != 0;
+    if !is_user {
+        crate::println!(
+            "Kernel #PF at RIP={:#x} CR2={:#x} error={:#x}",
+            frame.rip(), cr2, error
+        );
+        loop { core::hint::spin_loop(); }
+    }
+    let aspace_id = crate::sched::current_aspace_id();
+    if aspace_id == 0 {
+        crate::println!(
+            "User #PF with no address space: CR2={:#x} RIP={:#x}",
+            cr2, frame.rip()
+        );
+        loop { core::hint::spin_loop(); }
+    }
+    let result = crate::mm::fault::handle_page_fault(aspace_id, cr2 as usize, fault_type);
+    if result == crate::mm::fault::FaultResult::Failed {
+        crate::println!(
+            "Unhandled #PF: CR2={:#x} RIP={:#x} error={:#x}",
+            cr2, frame.rip(), error
+        );
+        loop { core::hint::spin_loop(); }
+    }
     frame_sp
 }
 

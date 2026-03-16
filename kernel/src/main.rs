@@ -48,13 +48,16 @@ pub fn kmain() -> ! {
         println!("  Slab alloc test: freed");
     }
 
+    // Extent tree tests.
+    println!("Testing extent tree...");
+    mm::extent::run_tests();
+
     // Capability system test.
     test_capabilities();
 
     // Scheduler.
     sched::init();
 
-    // IPC test.
     let port = ipc::port::create().expect("create IPC port");
     IPC_TEST_PORT.store(port, core::sync::atomic::Ordering::Relaxed);
     println!("  IPC test port {} created", port);
@@ -65,6 +68,10 @@ pub fn kmain() -> ! {
     println!("Starting secondary CPUs...");
     arch::platform::start_secondary_cpus();
 
+    // Phase 2: Demand-paging test (must run before userspace tests which don't return).
+    println!("Testing demand-paged memory...");
+    test_demand_paging();
+
     // Platform-specific tests (syscall, userspace).
     #[cfg(target_arch = "aarch64")]
     {
@@ -73,8 +80,6 @@ pub fn kmain() -> ! {
     }
     #[cfg(target_arch = "riscv64")]
     {
-        // Note: S-mode ecall goes to M-mode (OpenSBI), not our trap handler.
-        // Syscalls are only testable from U-mode on RISC-V.
         test_userspace_riscv64();
     }
     #[cfg(target_arch = "x86_64")]
@@ -408,4 +413,186 @@ fn test_userspace_x86_64() {
             options(noreturn),
         );
     }
+}
+
+// --- Phase 2: Demand paging test ---
+
+fn test_demand_paging() {
+    use mm::page::{PAGE_SIZE, MMUPAGE_SIZE, PAGE_MMUCOUNT};
+    use mm::vma::VmaProt;
+
+    // Get the current page table root.
+    #[cfg(target_arch = "aarch64")]
+    let pt_root = {
+        let cr: u64;
+        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) cr); }
+        let root = cr as usize;
+        if root == 0 {
+            // MMU not yet enabled — allocate a fresh page table root for the test.
+            let pa = mm::phys::alloc_page().expect("alloc pt root");
+            unsafe { core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE); }
+            pa.as_usize()
+        } else {
+            root
+        }
+    };
+    #[cfg(target_arch = "riscv64")]
+    let pt_root = {
+        let satp: u64;
+        unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp); }
+        let root = ((satp & 0x0FFF_FFFF_FFFF) << 12) as usize;
+        if root == 0 {
+            // MMU not yet enabled — allocate a fresh page table root for the test.
+            let pa = mm::phys::alloc_page().expect("alloc pt root");
+            unsafe { core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE); }
+            pa.as_usize()
+        } else {
+            root
+        }
+    };
+    #[cfg(target_arch = "x86_64")]
+    let pt_root = {
+        let cr3: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3); }
+        (cr3 & !0xFFF) as usize
+    };
+
+    let aspace_id = mm::aspace::create(pt_root).expect("create aspace");
+    println!("  Created address space {}", aspace_id);
+
+    // Map 4 allocation pages of anonymous memory (lazy — no PTEs installed).
+    // Use a high VA to avoid conflicting with kernel identity mapping.
+    // L0 index 1 = VA 0x80_0000_0000 onwards (not used by kernel).
+    let test_va = 0x80_0000_0000usize;
+    let num_pages = 4;
+    mm::aspace::with_aspace(aspace_id, |aspace| {
+        let vma_idx = aspace.map_anon(test_va, num_pages, VmaProt::ReadWrite)
+            .expect("map_anon");
+        println!("  Mapped {} pages at VA {:#x} (VMA {})", num_pages, test_va, vma_idx);
+
+        let vma = &aspace.vmas[vma_idx];
+        assert_eq!(vma.installed_count(), 0);
+        assert_eq!(vma.page_count(), num_pages);
+        assert_eq!(vma.mmu_page_count(), num_pages * PAGE_MMUCOUNT);
+    });
+
+    // Simulate demand faults by calling handle_page_fault directly.
+    let test_addrs = [
+        test_va,
+        test_va + MMUPAGE_SIZE,
+        test_va + PAGE_SIZE,
+        test_va + 2 * PAGE_SIZE + 3 * MMUPAGE_SIZE,
+    ];
+
+    for &addr in &test_addrs {
+        println!("  Faulting at {:#x}...", addr);
+        let result = mm::fault::handle_page_fault(
+            aspace_id, addr, mm::fault::FaultType::Write,
+        );
+        println!("  Result: {:?}", result);
+        assert!(
+            result == mm::fault::FaultResult::HandledMajor,
+            "Expected major fault at {:#x}, got {:?}", addr, result
+        );
+    }
+
+    mm::aspace::with_aspace(aspace_id, |aspace| {
+        let vma = aspace.find_vma_mut(test_va).unwrap();
+        assert_eq!(vma.installed_count(), test_addrs.len());
+        println!("  {} PTEs installed after {} major faults", vma.installed_count(), test_addrs.len());
+    });
+
+    // Test minor fault: clear installed bit + unmap PTE, re-fault.
+    mm::aspace::with_aspace(aspace_id, |aspace| {
+        let vma = aspace.find_vma_mut(test_va).unwrap();
+        let mmu_idx = vma.mmu_index_of(test_va);
+        vma.clear_installed(mmu_idx);
+    });
+
+    #[cfg(target_arch = "aarch64")]
+    arch::aarch64::mm::unmap_single_mmupage(pt_root, test_va);
+    #[cfg(target_arch = "riscv64")]
+    arch::riscv64::mm::unmap_single_mmupage(pt_root, test_va);
+    #[cfg(target_arch = "x86_64")]
+    arch::x86_64::mm::unmap_single_mmupage(pt_root, test_va);
+
+    let result = mm::fault::handle_page_fault(
+        aspace_id, test_va, mm::fault::FaultType::Read,
+    );
+    assert!(
+        result == mm::fault::FaultResult::HandledMinor,
+        "Expected minor fault, got {:?}", result
+    );
+    println!("  Minor fault test: PASSED");
+
+    // AArch64 contiguous PTE promotion test: fault all 16 MMU pages in the
+    // first 64K-aligned contiguous group. The contiguous hint requires all 16
+    // consecutive 4K L3 PTEs to be installed.
+    #[cfg(target_arch = "aarch64")]
+    {
+        const CONTIG_GROUP: usize = 16; // 16 × 4K = 64K, AArch64 architecture constant
+        let promotions_before = mm::stats::CONTIGUOUS_PROMOTIONS.load(core::sync::atomic::Ordering::Relaxed);
+        // We already faulted mmu_idx 0 and 1 (test_va and test_va+4K). Fault the rest of the group.
+        for i in 2..CONTIG_GROUP {
+            let addr = test_va + i * MMUPAGE_SIZE;
+            let result = mm::fault::handle_page_fault(
+                aspace_id, addr, mm::fault::FaultType::Write,
+            );
+            assert!(
+                result == mm::fault::FaultResult::HandledMajor,
+                "Expected major fault at {:#x}, got {:?}", addr, result
+            );
+        }
+        let promotions_after = mm::stats::CONTIGUOUS_PROMOTIONS.load(core::sync::atomic::Ordering::Relaxed);
+        let promoted = promotions_after - promotions_before;
+        println!("  Contiguous PTE promotions: {} (expected 1)", promoted);
+        assert_eq!(promoted, 1, "Expected exactly 1 contiguous promotion");
+        println!("  AArch64 contiguous PTE test: PASSED");
+    }
+
+    // WSCLOCK reclaim test.
+    // After the faults above, we have PTEs installed but the hardware reference
+    // bits are NOT set (we called handle_page_fault directly, not real accesses).
+    // Running WSCLOCK should clear all unreferenced PTEs and free allocation pages.
+    {
+        let installed_before = mm::aspace::with_aspace(aspace_id, |aspace| {
+            let vma = aspace.find_vma_mut(test_va).unwrap();
+            vma.installed_count()
+        });
+        println!("  WSCLOCK: {} PTEs installed before scan", installed_before);
+
+        // Pass 1: clears reference bits on all referenced pages.
+        let scan1 = mm::wsclock::scan(aspace_id, 100);
+        println!("  WSCLOCK pass 1: scanned={}, cleared={}, freed={}",
+            scan1.pages_scanned, scan1.ptes_cleared, scan1.pages_freed);
+
+        // Pass 2: pages not re-accessed since pass 1 have ref bit clear → evict.
+        let scan2 = mm::wsclock::scan(aspace_id, 100);
+        println!("  WSCLOCK pass 2: scanned={}, cleared={}, freed={}",
+            scan2.pages_scanned, scan2.ptes_cleared, scan2.pages_freed);
+
+        let installed_after = mm::aspace::with_aspace(aspace_id, |aspace| {
+            let vma = aspace.find_vma_mut(test_va).unwrap();
+            vma.installed_count()
+        });
+        println!("  WSCLOCK: {} PTEs installed after scan", installed_after);
+        assert_eq!(installed_after, 0, "All PTEs should be cleared");
+        let total_freed = scan1.pages_freed + scan2.pages_freed;
+        assert!(total_freed > 0, "Should have freed at least 1 allocation page");
+
+        // Re-fault the first address — should be a major fault since the page was freed.
+        let result = mm::fault::handle_page_fault(
+            aspace_id, test_va, mm::fault::FaultType::Write,
+        );
+        assert!(
+            result == mm::fault::FaultResult::HandledMajor,
+            "Expected major fault after reclaim, got {:?}", result
+        );
+        println!("  WSCLOCK re-fault after reclaim: PASSED");
+    }
+
+    mm::stats::print();
+
+    mm::aspace::destroy(aspace_id);
+    println!("  Demand paging test: PASSED");
 }

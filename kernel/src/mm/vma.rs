@@ -1,0 +1,143 @@
+//! Virtual Memory Area (VMA) — describes a contiguous virtual address range
+//! within an address space, backed by a memory object.
+
+use super::page::{PAGE_MMUCOUNT, PAGE_SIZE};
+
+/// Maximum VMAs per address space.
+pub const MAX_VMAS: usize = 32;
+
+/// Maximum allocation pages per VMA. With 64K pages, 256 pages = 16 MiB.
+pub const MAX_VMA_PAGES: usize = 256;
+
+/// Maximum MMU pages tracked per VMA.
+pub const MAX_VMA_MMUPAGES: usize = MAX_VMA_PAGES * PAGE_MMUCOUNT;
+
+/// Number of u64 words needed to bitmap MAX_VMA_MMUPAGES.
+const BITMAP_WORDS: usize = (MAX_VMA_MMUPAGES + 63) / 64;
+
+/// VMA protection flags.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum VmaProt {
+    ReadOnly = 0,
+    ReadWrite = 1,
+    ReadExec = 2,
+    ReadWriteExec = 3,
+}
+
+impl VmaProt {
+    pub fn readable(self) -> bool { true }
+    pub fn writable(self) -> bool { matches!(self, Self::ReadWrite | Self::ReadWriteExec) }
+    pub fn executable(self) -> bool { matches!(self, Self::ReadExec | Self::ReadWriteExec) }
+}
+
+/// A virtual memory area within an address space.
+pub struct Vma {
+    /// Base virtual address (PAGE_SIZE-aligned).
+    pub va_start: usize,
+    /// Length in bytes (PAGE_SIZE-aligned).
+    pub va_len: usize,
+    /// Protection.
+    pub prot: VmaProt,
+    /// Backing memory object ID.
+    pub object_id: u32,
+    /// Offset into the memory object (in PAGE_SIZE units).
+    pub object_offset: u32,
+    /// Bitmap: which MMU pages have PTEs installed.
+    pub installed: [u64; BITMAP_WORDS],
+    /// Bitmap: which MMU pages have been zeroed.
+    pub zeroed: [u64; BITMAP_WORDS],
+    /// Whether this VMA slot is in use.
+    pub active: bool,
+}
+
+impl Vma {
+    pub const fn empty() -> Self {
+        Self {
+            va_start: 0,
+            va_len: 0,
+            prot: VmaProt::ReadWrite,
+            object_id: 0,
+            object_offset: 0,
+            installed: [0; BITMAP_WORDS],
+            zeroed: [0; BITMAP_WORDS],
+            active: false,
+        }
+    }
+
+    /// Number of allocation pages in this VMA.
+    pub fn page_count(&self) -> usize {
+        self.va_len / PAGE_SIZE
+    }
+
+    /// Number of MMU pages in this VMA.
+    pub fn mmu_page_count(&self) -> usize {
+        self.va_len / super::page::MMUPAGE_SIZE
+    }
+
+    /// Check if MMU page at `mmu_idx` within this VMA has its PTE installed.
+    pub fn is_installed(&self, mmu_idx: usize) -> bool {
+        let word = mmu_idx / 64;
+        let bit = mmu_idx % 64;
+        (self.installed[word] & (1u64 << bit)) != 0
+    }
+
+    /// Mark MMU page at `mmu_idx` as having its PTE installed.
+    pub fn set_installed(&mut self, mmu_idx: usize) {
+        let word = mmu_idx / 64;
+        let bit = mmu_idx % 64;
+        self.installed[word] |= 1u64 << bit;
+    }
+
+    /// Clear the installed bit for MMU page at `mmu_idx`.
+    pub fn clear_installed(&mut self, mmu_idx: usize) {
+        let word = mmu_idx / 64;
+        let bit = mmu_idx % 64;
+        self.installed[word] &= !(1u64 << bit);
+    }
+
+    /// Check if MMU page at `mmu_idx` has been zeroed.
+    pub fn is_zeroed(&self, mmu_idx: usize) -> bool {
+        let word = mmu_idx / 64;
+        let bit = mmu_idx % 64;
+        (self.zeroed[word] & (1u64 << bit)) != 0
+    }
+
+    /// Mark MMU page at `mmu_idx` as zeroed.
+    pub fn set_zeroed(&mut self, mmu_idx: usize) {
+        let word = mmu_idx / 64;
+        let bit = mmu_idx % 64;
+        self.zeroed[word] |= 1u64 << bit;
+    }
+
+    /// Clear the zeroed bit for MMU page at `mmu_idx`.
+    pub fn clear_zeroed(&mut self, mmu_idx: usize) {
+        let word = mmu_idx / 64;
+        let bit = mmu_idx % 64;
+        self.zeroed[word] &= !(1u64 << bit);
+    }
+
+    /// Count how many MMU pages have their PTE installed.
+    pub fn installed_count(&self) -> usize {
+        let mut count = 0;
+        for &w in &self.installed {
+            count += w.count_ones() as usize;
+        }
+        count
+    }
+
+    /// Check if a virtual address falls within this VMA.
+    pub fn contains(&self, va: usize) -> bool {
+        va >= self.va_start && va < self.va_start + self.va_len
+    }
+
+    /// Compute the MMU page index within this VMA for a virtual address.
+    pub fn mmu_index_of(&self, va: usize) -> usize {
+        (va - self.va_start) / super::page::MMUPAGE_SIZE
+    }
+
+    /// Compute the allocation page index within this VMA for a virtual address.
+    pub fn page_index_of(&self, va: usize) -> usize {
+        (va - self.va_start) / PAGE_SIZE
+    }
+}
