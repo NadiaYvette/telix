@@ -32,8 +32,9 @@ _start:
     // Set up boot stack (grows downward from top of __boot_stack_top).
     la      sp, __boot_stack_top
 
-    // Pass DTB pointer as first argument to Rust entry.
+    // Pass DTB pointer as first arg, hart ID as second arg.
     mv      a0, s1
+    mv      a1, s0
     call    _rust_entry
 
     // Should not return; halt if it does.
@@ -44,6 +45,32 @@ _start:
 .secondary_spin:
     wfi
     j       .secondary_spin
+
+// ============================================================================
+// Secondary hart entry point (called via SBI HSM hart_start).
+// On entry: a0 = hart_id, a1 = opaque (= cpu_index).
+// We need to set up a stack and jump to Rust.
+// ============================================================================
+.global _secondary_hart_entry
+_secondary_hart_entry:
+    // a1 = cpu_index (opaque from SBI hart_start)
+    mv      s0, a1              // Save cpu_index in callee-saved reg.
+
+    // Load our stack top from the AP_STACK_TOPS array.
+    // The array is AtomicU64 (8 bytes each), so offset = cpu_index * 8.
+    la      t0, AP_STACK_TOPS
+    slli    t1, s0, 3           // t1 = cpu_index * 8
+    add     t0, t0, t1
+    ld      sp, 0(t0)           // sp = stack_top
+
+    // Enter Rust. a0 = cpu_index.
+    mv      a0, s0
+    call    secondary_hart_rust_entry
+
+    // Should not return.
+.secondary_halt:
+    wfi
+    j       .secondary_halt
 
 // Atomic boot lock (in data section so it's zero-initialized before BSS clear).
 .section .data

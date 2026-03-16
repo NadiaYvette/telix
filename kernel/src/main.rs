@@ -61,6 +61,10 @@ pub fn kmain() -> ! {
     sched::spawn(ipc_sender, 100, 10).expect("spawn sender");
     sched::spawn(ipc_receiver, 100, 10).expect("spawn receiver");
 
+    // Start secondary CPUs.
+    println!("Starting secondary CPUs...");
+    arch::platform::start_secondary_cpus();
+
     // Platform-specific tests (syscall, userspace).
     #[cfg(target_arch = "aarch64")]
     {

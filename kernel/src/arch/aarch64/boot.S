@@ -89,9 +89,51 @@ _start:
     wfe
     b       .halt
 
+// Secondaries that arrive during initial boot spin here (held by firmware).
+// PSCI CPU_ON will direct them to _secondary_entry instead.
 .secondary_spin:
     wfe
     b       .secondary_spin
+
+// ============================================================================
+// Secondary CPU entry point (called via PSCI CPU_ON).
+// On entry: x0 = stack_top (context_id from PSCI).
+// CPU ID is read from MPIDR_EL1.
+// ============================================================================
+.global _secondary_entry
+_secondary_entry:
+    // x0 = stack_top (passed by BSP via PSCI context_id).
+    mov     x20, x0             // Save stack_top in callee-saved reg.
+
+    // Set SP_EL1 mode.
+    msr     spsel, #1
+
+    // Safe SCTLR_EL1 (MMU off, caches off, RES1 bits).
+    movz    x9, #0x0800
+    movk    x9, #0x30d0, lsl #16
+    msr     sctlr_el1, x9
+    isb
+
+    // Enable FP/SIMD at EL1.
+    mov     x9, #(3 << 20)
+    msr     cpacr_el1, x9
+    isb
+
+    // Set up stack.
+    mov     sp, x20
+
+    // Get CPU ID from MPIDR_EL1 Aff0.
+    mrs     x19, mpidr_el1
+    and     x19, x19, #0xff
+
+    // Enter Rust secondary init. x0 = cpu_id.
+    mov     x0, x19
+    bl      secondary_rust_entry
+
+    // Should not return.
+.secondary_halt:
+    wfe
+    b       .secondary_halt
 
 // Boot stack: 64 KiB in BSS.
 .section .bss.boot_stack, "aw", @nobits

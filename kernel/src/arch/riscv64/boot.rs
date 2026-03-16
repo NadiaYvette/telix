@@ -8,6 +8,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// DTB pointer saved from boot for later parsing.
 pub static DTB_ADDR: AtomicUsize = AtomicUsize::new(0);
 
+/// Boot hart ID (saved during early boot, used for SMP startup).
+pub static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(0);
+
 /// QEMU virt machine RAM base address (RISC-V).
 pub const QEMU_VIRT_RAM_BASE: usize = 0x8000_0000;
 
@@ -22,10 +25,11 @@ pub fn kernel_end_addr() -> usize {
 
 /// Rust entry point called from assembly.
 #[unsafe(no_mangle)]
-pub extern "C" fn _rust_entry(dtb_ptr: usize) -> ! {
+pub extern "C" fn _rust_entry(dtb_ptr: usize, hart_id: usize) -> ! {
     DTB_ADDR.store(dtb_ptr, Ordering::Relaxed);
+    BOOT_HART_ID.store(hart_id, Ordering::Relaxed);
 
-    crate::println!("Telix booting on RISC-V 64");
+    crate::println!("Telix booting on RISC-V 64 (boot hart {})", hart_id);
     crate::println!("  DTB at: {:#x}", dtb_ptr);
     crate::println!("  Kernel end at: {:#x}", kernel_end_addr());
 

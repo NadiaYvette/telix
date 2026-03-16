@@ -3,6 +3,7 @@ pub mod exception;
 pub mod irq;
 pub mod mm;
 pub mod serial;
+pub mod smp;
 pub mod timer;
 pub mod usertest;
 
@@ -33,6 +34,11 @@ pub fn kernel_end_addr() -> usize {
 /// Enable interrupts (unmask IRQ).
 pub fn enable_interrupts() {
     timer::enable_interrupts();
+}
+
+/// Start secondary CPUs.
+pub fn start_secondary_cpus() {
+    smp::start_secondary_cpus();
 }
 
 /// Idle loop — WFI until interrupted.

@@ -1,5 +1,6 @@
 pub mod boot;
 pub mod serial;
+pub mod smp;
 pub mod trap;
 
 use core::arch::global_asm;
@@ -27,6 +28,11 @@ pub fn kernel_end_addr() -> usize {
 /// Enable interrupts (set sstatus.SIE).
 pub fn enable_interrupts() {
     trap::enable_interrupts();
+}
+
+/// Start secondary harts.
+pub fn start_secondary_cpus() {
+    smp::start_secondary_cpus();
 }
 
 /// Idle loop — WFI until interrupted.

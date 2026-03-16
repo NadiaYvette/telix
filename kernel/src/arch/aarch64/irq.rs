@@ -27,6 +27,55 @@ const GICR_IPRIORITYR_OFFSET: usize = 0x400;
 pub const INTID_TIMER_EL1_PHYS: u32 = 30; // PPI: EL1 physical timer (CNTP)
 const INTID_SPURIOUS: u32 = 1023;
 
+/// Initialize the GICv3 redistributor for a specific CPU.
+/// Called by secondary CPUs during their init.
+pub fn init_cpu(cpu: u32) {
+    let gicr_base = GICR_BASE + (cpu as usize) * GICR_STRIDE;
+
+    // Wake this CPU's redistributor.
+    let waker = (gicr_base + GICR_WAKER_OFFSET) as *mut u32;
+    unsafe {
+        let val = core::ptr::read_volatile(waker);
+        core::ptr::write_volatile(waker, val & !(1 << 1));
+        while core::ptr::read_volatile(waker) & (1 << 2) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Put all SGIs/PPIs into Group 1.
+    let sgi_base = gicr_base + GICR_SGI_BASE_OFFSET;
+    unsafe {
+        let igroupr0 = (sgi_base + GICR_IGROUPR0_OFFSET) as *mut u32;
+        core::ptr::write_volatile(igroupr0, 0xFFFF_FFFF);
+    }
+
+    // Configure ICC system registers for this CPU.
+    unsafe {
+        core::arch::asm!("mrs {tmp}, S3_0_C12_C12_5", "orr {tmp}, {tmp}, #1", "msr S3_0_C12_C12_5, {tmp}", "isb", tmp = out(reg) _);
+        core::arch::asm!("mov {tmp}, #0xFF", "msr S3_0_C4_C6_0, {tmp}", tmp = out(reg) _);
+        core::arch::asm!("mov {tmp}, #1", "msr S3_0_C12_C12_7, {tmp}", "isb", tmp = out(reg) _);
+    }
+
+    // Enable the timer PPI on this CPU's redistributor.
+    enable_interrupt_on_cpu(INTID_TIMER_EL1_PHYS, gicr_base);
+}
+
+/// Enable a PPI/SGI on a specific CPU's redistributor.
+fn enable_interrupt_on_cpu(intid: u32, gicr_base: usize) {
+    if intid < 32 {
+        let sgi_base = gicr_base + GICR_SGI_BASE_OFFSET;
+        let reg = (sgi_base + GICR_ISENABLER0_OFFSET) as *mut u32;
+        unsafe {
+            let val = core::ptr::read_volatile(reg);
+            core::ptr::write_volatile(reg, val | (1 << intid));
+        }
+        let prio_reg = (sgi_base + GICR_IPRIORITYR_OFFSET + intid as usize) as *mut u8;
+        unsafe {
+            core::ptr::write_volatile(prio_reg, 0x80);
+        }
+    }
+}
+
 /// Initialize the GICv3 for the boot CPU (CPU 0).
 pub fn init() {
     // 1. Wake the redistributor for CPU 0.

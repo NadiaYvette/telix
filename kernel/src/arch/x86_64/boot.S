@@ -58,21 +58,18 @@ _start:
     or      eax, 0x03       // Present + Writable
     mov     [boot_pml4], eax
 
-    // PDPT[0] = address of PD | present | writable
-    lea     eax, [boot_pd]
-    or      eax, 0x03       // Present + Writable
-    mov     [boot_pdpt], eax
-
-    // Fill PD with 512 entries of 2 MiB pages (identity map 0..1 GiB)
-    lea     ebx, [boot_pd]
-    mov     eax, 0x83       // Present + Writable + PageSize (2 MiB)
-    mov     ecx, 512
-.fill_pd:
-    mov     [ebx], eax
-    add     eax, 0x200000   // Next 2 MiB page
-    add     ebx, 8
-    dec     ecx
-    jnz     .fill_pd
+    // Fill PDPT with 4 entries using 1 GiB pages (identity map 0..4 GiB).
+    // This covers the LAPIC MMIO region at 0xFEE00000 (in the 3-4 GiB range).
+    // PDPT entry: address | Present | Writable | PageSize (1 GiB page).
+    lea     ebx, [boot_pdpt]
+    mov     dword ptr [ebx + 0x00], 0x00000083     // 0 GiB
+    mov     dword ptr [ebx + 0x04], 0x00000000
+    mov     dword ptr [ebx + 0x08], 0x40000083     // 1 GiB
+    mov     dword ptr [ebx + 0x0C], 0x00000000
+    mov     dword ptr [ebx + 0x10], 0x80000083     // 2 GiB
+    mov     dword ptr [ebx + 0x14], 0x00000000
+    mov     dword ptr [ebx + 0x18], 0xC0000083     // 3 GiB (includes LAPIC)
+    mov     dword ptr [ebx + 0x1C], 0x00000000
 
     // --- Enable PAE ---
     mov     eax, cr4

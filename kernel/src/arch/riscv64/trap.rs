@@ -84,6 +84,28 @@ pub fn init() {
         freq, interval, 1000 * interval / freq);
 }
 
+/// Initialize trap/timer on a secondary hart.
+pub fn init_ap() {
+    // Set stvec (already done in assembly, but be safe).
+    unsafe {
+        core::arch::asm!(
+            "la {tmp}, _trap_entry",
+            "csrw stvec, {tmp}",
+            tmp = out(reg) _,
+        );
+    }
+
+    // Set first timer deadline for this hart.
+    let interval = TIMER_INTERVAL.load(Ordering::Relaxed);
+    let now = read_time();
+    sbi_set_timer(now + interval);
+
+    // Enable S-mode timer interrupt in sie.
+    unsafe {
+        core::arch::asm!("csrs sie, {}", in(reg) 1u64 << 5);
+    }
+}
+
 /// Enable S-mode interrupts (set sstatus.SIE).
 pub fn enable_interrupts() {
     unsafe {

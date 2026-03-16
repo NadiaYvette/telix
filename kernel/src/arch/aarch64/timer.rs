@@ -42,6 +42,16 @@ pub fn init() {
         freq, interval, 1000 * interval / freq);
 }
 
+/// Initialize the timer on a secondary CPU. The timer interval is already
+/// known; just program the timer and enable the PPI (done by irq::init_cpu).
+pub fn init_ap() {
+    let interval = TIMER_INTERVAL.load(Ordering::Relaxed);
+    unsafe {
+        core::arch::asm!("msr cntp_tval_el0, {}", in(reg) interval);
+        core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1u64);
+    }
+}
+
 /// Handle timer interrupt: reset the timer and increment tick count.
 pub fn handle_timer_irq() {
     let ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;

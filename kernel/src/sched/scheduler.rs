@@ -5,10 +5,15 @@
 //! thread's kernel stack. If preemption is needed, we save the current SP
 //! in the thread's TCB, load the new thread's SP, and the exception return
 //! path restores the new thread's registers and `eret`s to it.
+//!
+//! SMP: Run queues are shared across all CPUs, protected by the scheduler
+//! spinlock. Each CPU tracks its own current/idle thread via smp::PerCpuData.
 
 use super::thread::{Thread, ThreadId, ThreadState, MAX_THREADS, EXCEPTION_FRAME_SIZE};
 use super::task::{Task, MAX_TASKS};
+use super::smp;
 use crate::sync::SpinLock;
+use core::sync::atomic::Ordering;
 
 const NUM_PRIORITIES: usize = 256;
 const MAX_QUEUE_LEN: usize = MAX_THREADS;
@@ -54,10 +59,8 @@ struct Scheduler {
     threads: [Thread; MAX_THREADS],
     tasks: [Task; MAX_TASKS],
     run_queues: [RunQueue; NUM_PRIORITIES],
-    current: ThreadId,
     next_thread_id: ThreadId,
     next_task_id: u32,
-    idle_thread_id: ThreadId,
 }
 
 impl Scheduler {
@@ -66,28 +69,44 @@ impl Scheduler {
             threads: [const { Thread::empty() }; MAX_THREADS],
             tasks: [const { Task::empty() }; MAX_TASKS],
             run_queues: [const { RunQueue::new() }; NUM_PRIORITIES],
-            current: 0,
             next_thread_id: 0,
             next_task_id: 0,
-            idle_thread_id: 0,
         }
     }
 
+    /// Initialize task 0 and the BSP's idle thread (thread 0).
     fn init(&mut self) {
         self.tasks[0].id = 0;
         self.tasks[0].active = true;
         self.next_task_id = 1;
 
-        // Thread 0 = boot/idle thread. Its saved_sp will be set on first preemption.
+        // Thread 0 = BSP idle thread. Its saved_sp will be set on first preemption.
         self.threads[0].id = 0;
         self.threads[0].state = ThreadState::Running;
         self.threads[0].task_id = 0;
         self.threads[0].priority = 255;
         self.threads[0].quantum = u32::MAX;
         self.threads[0].default_quantum = u32::MAX;
-        self.idle_thread_id = 0;
-        self.current = 0;
         self.next_thread_id = 1;
+    }
+
+    /// Create an idle thread for a secondary CPU. Returns its ThreadId.
+    fn create_idle_thread(&mut self) -> Option<ThreadId> {
+        let id = self.next_thread_id;
+        if id as usize >= MAX_THREADS {
+            return None;
+        }
+        self.next_thread_id += 1;
+
+        let thread = &mut self.threads[id as usize];
+        thread.id = id;
+        thread.state = ThreadState::Running;
+        thread.task_id = 0;
+        thread.priority = 255; // lowest
+        thread.quantum = u32::MAX;
+        thread.default_quantum = u32::MAX;
+        // saved_sp will be set on first preemption
+        Some(id)
     }
 
     fn create_thread(
@@ -172,18 +191,17 @@ impl Scheduler {
         Some(id)
     }
 
-    fn pick_next(&mut self) -> ThreadId {
+    fn pick_next(&mut self, idle_id: ThreadId) -> ThreadId {
         for prio in 0..NUM_PRIORITIES {
             if let Some(id) = self.run_queues[prio].pop() {
                 return id;
             }
         }
-        self.idle_thread_id
+        idle_id
     }
 
-    fn timer_tick(&mut self) -> bool {
-        let current = self.current;
-        if current == self.idle_thread_id {
+    fn timer_tick_for(&mut self, current: ThreadId, idle_id: ThreadId) -> bool {
+        if current == idle_id {
             return self.has_ready_threads();
         }
         let thread = &mut self.threads[current as usize];
@@ -204,15 +222,19 @@ impl Scheduler {
         false
     }
 
-    /// Attempt to switch threads. Called from IRQ handler with current SP.
-    /// Returns the new SP to use for restore_regs (may be same as current if no switch).
+    /// Attempt to switch threads on the current CPU.
+    /// Called from IRQ handler with current SP.
+    /// Returns the new SP to use for restore_regs.
     fn try_switch(&mut self, current_sp: u64) -> u64 {
-        if !self.timer_tick() {
+        let pcpu = smp::current();
+        let prev_id = pcpu.current_thread.load(Ordering::Relaxed);
+        let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
+
+        if !self.timer_tick_for(prev_id, idle_id) {
             return current_sp; // No preemption needed.
         }
 
-        let next_id = self.pick_next();
-        let prev_id = self.current;
+        let next_id = self.pick_next(idle_id);
 
         if prev_id == next_id {
             return current_sp;
@@ -223,12 +245,15 @@ impl Scheduler {
         let prev_prio = self.threads[prev_id as usize].priority;
         if self.threads[prev_id as usize].state == ThreadState::Running {
             self.threads[prev_id as usize].state = ThreadState::Ready;
-            self.run_queues[prev_prio as usize].push(prev_id);
+            // Don't put idle threads on the run queue.
+            if prev_id != idle_id {
+                self.run_queues[prev_prio as usize].push(prev_id);
+            }
         }
 
         // Load next thread's SP.
         self.threads[next_id as usize].state = ThreadState::Running;
-        self.current = next_id;
+        pcpu.current_thread.store(next_id, Ordering::Relaxed);
         self.threads[next_id as usize].saved_sp
     }
 }
@@ -236,8 +261,23 @@ impl Scheduler {
 static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 
 pub fn init() {
-    SCHEDULER.lock().init();
-    crate::println!("  Scheduler initialized");
+    let mut sched = SCHEDULER.lock();
+    sched.init();
+    let idle_id = 0; // Thread 0 = BSP idle
+    drop(sched);
+
+    smp::init_bsp(idle_id);
+    crate::println!("  Scheduler initialized (BSP = CPU 0)");
+}
+
+/// Called by secondary CPUs to create their idle thread and register.
+pub fn init_ap(cpu: u32) {
+    let idle_id = {
+        let mut sched = SCHEDULER.lock();
+        sched.create_idle_thread().expect("AP idle thread")
+    };
+    smp::init_ap(cpu, idle_id);
+    crate::println!("  CPU {} scheduler ready (idle thread {})", cpu, idle_id);
 }
 
 pub fn spawn(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
@@ -261,5 +301,5 @@ pub fn schedule() {
 
 #[allow(dead_code)]
 pub fn current_thread_id() -> ThreadId {
-    SCHEDULER.lock().current
+    smp::current().current_thread.load(Ordering::Relaxed)
 }

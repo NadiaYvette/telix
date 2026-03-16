@@ -85,3 +85,15 @@ pub fn init() {
 
     crate::println!("  IDT loaded (256 vectors)");
 }
+
+/// Load the IDT on the current CPU (for APs — IDT is already initialized).
+pub fn load() {
+    unsafe {
+        let idt = &*IDT.0.get();
+        let ptr = IdtPtr {
+            limit: (core::mem::size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
+            base: idt.as_ptr() as u64,
+        };
+        core::arch::asm!("lidt [{}]", in(reg) &ptr, options(nostack));
+    }
+}

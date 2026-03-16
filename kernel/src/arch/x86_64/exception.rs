@@ -97,9 +97,11 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         18 => exception_fault("Machine Check (#MC)", frame),
         19 => exception_fault("SIMD FP Exception (#XM)", frame),
 
-        // PIT timer (IRQ 0 -> vector 32).
+        // Timer (PIT IRQ 0 -> vector 32, or LAPIC timer -> vector 32).
         32 => {
             super::timer::handle_timer_irq();
+            // Send EOI to both LAPIC and PIC (safe even if only one is active).
+            super::lapic::eoi();
             super::pic::send_eoi(0);
             // Let the scheduler decide if we should context switch.
             return crate::sched::tick(frame_sp);
