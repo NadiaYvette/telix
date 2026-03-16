@@ -70,6 +70,9 @@ pub fn kmain() -> ! {
     // M10: Syscall test from EL1 (using SVC).
     test_syscalls();
 
+    // M12: Minimal userspace test.
+    test_userspace();
+
     println!("Enabling interrupts");
     arch::aarch64::timer::enable_interrupts();
 
@@ -173,6 +176,64 @@ fn test_capabilities() {
         println!("  Cap test: server still has {:?}", server_space.lookup(server_slot).unwrap());
     }
     println!("  Cap test: PASSED");
+}
+
+fn test_userspace() {
+    use arch::aarch64::mm;
+    use arch::aarch64::usertest;
+
+    println!("  Setting up page tables...");
+
+    // Set up a unified page table: identity-mapped kernel + user regions.
+    let l0 = mm::setup_tables().expect("page tables");
+    println!("  L0 table at {:#x}", l0);
+
+    // Allocate a page for user code and copy the test binary.
+    let user_code_page = crate::mm::phys::alloc_page().expect("user code page");
+    let user_code_phys = user_code_page.as_usize();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            usertest::USER_CODE.as_ptr(),
+            user_code_phys as *mut u8,
+            usertest::USER_CODE.len(),
+        );
+    }
+
+    // Allocate a page for user stack.
+    let user_stack_page = crate::mm::phys::alloc_page().expect("user stack page");
+    let user_stack_phys = user_stack_page.as_usize();
+
+    // User virtual addresses — in a separate 1 GiB region (L1[2] = 0x8000_0000+).
+    let user_code_virt: usize = 0x8000_0000;
+    let user_stack_virt: usize = 0x8001_0000;
+
+    // Map user code and stack into the page table.
+    mm::map_user_pages(l0, user_code_virt, user_code_phys,
+        usertest::USER_CODE.len(), mm::USER_RWX_FLAGS).expect("map user code");
+    mm::map_user_pages(l0, user_stack_virt, user_stack_phys,
+        4096, mm::USER_RW_FLAGS).expect("map user stack");
+    println!("  User mappings: code at {:#x}, stack at {:#x}", user_code_virt, user_stack_virt);
+
+    // Enable MMU.
+    println!("  Enabling MMU...");
+    mm::enable_mmu(l0);
+    println!("  MMU enabled — identity mapping active");
+
+    // Drop to EL0 and execute the user binary.
+    println!("  Jumping to EL0...");
+    let user_sp = user_stack_virt + 4096;
+    unsafe {
+        core::arch::asm!(
+            "msr sp_el0, {sp}",
+            "msr elr_el1, {pc}",
+            "mov x0, #0",             // SPSR: EL0t, all interrupts enabled
+            "msr spsr_el1, x0",
+            "eret",
+            sp = in(reg) user_sp as u64,
+            pc = in(reg) user_code_virt as u64,
+            options(noreturn),
+        );
+    }
 }
 
 fn test_syscalls() {
