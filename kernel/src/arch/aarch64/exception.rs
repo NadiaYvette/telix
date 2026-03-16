@@ -38,14 +38,22 @@ extern "C" fn exception_unhandled(frame: &ExceptionFrame) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn exception_sync_el1(frame: &ExceptionFrame) {
+extern "C" fn exception_sync_el1(frame: &mut ExceptionFrame) {
     let ec = (frame.esr >> 26) & 0x3f;
-    crate::println!(
-        "EL1 Sync exception: EC={:#x} ESR={:#x} ELR={:#x}",
-        ec, frame.esr, frame.elr
-    );
-    loop {
-        core::hint::spin_loop();
+    match ec {
+        0x15 => {
+            // SVC from AArch64. Dispatch syscall.
+            crate::syscall::dispatch(frame);
+        }
+        _ => {
+            crate::println!(
+                "EL1 Sync exception: EC={:#x} ESR={:#x} ELR={:#x}",
+                ec, frame.esr, frame.elr
+            );
+            loop {
+                core::hint::spin_loop();
+            }
+        }
     }
 }
 
@@ -71,14 +79,22 @@ extern "C" fn exception_serror_el1(frame: &ExceptionFrame) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn exception_sync_el0(frame: &ExceptionFrame) {
+extern "C" fn exception_sync_el0(frame: &mut ExceptionFrame) {
     let ec = (frame.esr >> 26) & 0x3f;
-    crate::println!(
-        "EL0 Sync exception: EC={:#x} ESR={:#x} ELR={:#x}",
-        ec, frame.esr, frame.elr
-    );
-    loop {
-        core::hint::spin_loop();
+    match ec {
+        0x15 => {
+            // SVC from AArch64 EL0.
+            crate::syscall::dispatch(frame);
+        }
+        _ => {
+            crate::println!(
+                "EL0 Sync exception: EC={:#x} ESR={:#x} ELR={:#x}",
+                ec, frame.esr, frame.elr
+            );
+            loop {
+                core::hint::spin_loop();
+            }
+        }
     }
 }
 

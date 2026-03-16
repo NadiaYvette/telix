@@ -41,6 +41,11 @@ impl fmt::Write for Pl011 {
     }
 }
 
+/// Write a single byte to the UART.
+pub fn putc(c: u8) {
+    Pl011.putc(c);
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;

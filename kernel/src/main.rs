@@ -7,6 +7,7 @@ mod ipc;
 mod mm;
 mod sched;
 mod sync;
+mod syscall;
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -65,6 +66,9 @@ pub fn kmain() -> ! {
 
     sched::spawn(ipc_sender, 100, 10).expect("spawn sender");
     sched::spawn(ipc_receiver, 100, 10).expect("spawn receiver");
+
+    // M10: Syscall test from EL1 (using SVC).
+    test_syscalls();
 
     println!("Enabling interrupts");
     arch::aarch64::timer::enable_interrupts();
@@ -169,4 +173,39 @@ fn test_capabilities() {
         println!("  Cap test: server still has {:?}", server_space.lookup(server_slot).unwrap());
     }
     println!("  Cap test: PASSED");
+}
+
+fn test_syscalls() {
+    // Test SVC from EL1 (kernel mode).
+    // SYS_DEBUG_PUTCHAR = 0, write 'S' to serial.
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x8, #0",     // SYS_DEBUG_PUTCHAR
+            "mov x0, #0x53",  // 'S'
+            "svc #0",
+            out("x0") ret,
+            out("x8") _,
+            out("x1") _, out("x2") _, out("x3") _,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+        );
+    }
+    // Should have printed 'S' to serial.
+    println!(""); // Newline after the 'S'.
+    println!("  Syscall test: debug_putchar returned {}", ret);
+
+    // Test SYS_THREAD_ID = 8.
+    let tid: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x8, #8",     // SYS_THREAD_ID
+            "svc #0",
+            out("x0") tid,
+            out("x8") _,
+            out("x1") _, out("x2") _, out("x3") _,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+        );
+    }
+    println!("  Syscall test: thread_id={}", tid);
+    println!("  Syscall test: PASSED");
 }
