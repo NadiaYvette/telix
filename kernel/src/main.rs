@@ -3,6 +3,7 @@
 
 mod arch;
 mod cap;
+mod ipc;
 mod mm;
 mod sched;
 mod sync;
@@ -56,8 +57,14 @@ pub fn kmain() -> ! {
 
     // M7/M8: Scheduler + thread management.
     sched::init();
-    sched::spawn(thread_a, 100, 10).expect("spawn thread A");
-    sched::spawn(thread_b, 100, 10).expect("spawn thread B");
+
+    // M9: IPC test — create a port, spawn sender/receiver threads.
+    let port = ipc::port::create().expect("create IPC port");
+    IPC_TEST_PORT.store(port, core::sync::atomic::Ordering::Relaxed);
+    println!("  IPC test port {} created", port);
+
+    sched::spawn(ipc_sender, 100, 10).expect("spawn sender");
+    sched::spawn(ipc_receiver, 100, 10).expect("spawn receiver");
 
     println!("Enabling interrupts");
     arch::aarch64::timer::enable_interrupts();
@@ -70,29 +77,48 @@ pub fn kmain() -> ! {
     }
 }
 
-fn thread_a() -> ! {
-    let mut i = 0u64;
+use core::sync::atomic::{AtomicU32, Ordering};
+static IPC_TEST_PORT: AtomicU32 = AtomicU32::new(0);
+
+fn ipc_sender() -> ! {
+    let port_id = IPC_TEST_PORT.load(Ordering::Relaxed);
+    let mut seq = 0u64;
     loop {
-        if i % 100 == 0 {
-            println!("[thread A] count={}", i);
-        }
-        i += 1;
-        // Busy-wait a bit to slow output.
-        for _ in 0..10_000 {
-            core::hint::spin_loop();
+        let msg = ipc::Message::new(1, [seq, 0, 0, 0, 0, 0]);
+        match ipc::port::send(port_id, msg) {
+            Ok(()) => {
+                if seq % 10 == 0 {
+                    println!("[sender] sent seq={}", seq);
+                }
+                seq += 1;
+            }
+            Err(_) => {
+                // Queue full — spin and retry.
+                for _ in 0..1_000 {
+                    core::hint::spin_loop();
+                }
+            }
         }
     }
 }
 
-fn thread_b() -> ! {
-    let mut i = 0u64;
+fn ipc_receiver() -> ! {
+    let port_id = IPC_TEST_PORT.load(Ordering::Relaxed);
+    let mut received = 0u64;
     loop {
-        if i % 100 == 0 {
-            println!("[thread B] count={}", i);
-        }
-        i += 1;
-        for _ in 0..10_000 {
-            core::hint::spin_loop();
+        match ipc::port::recv(port_id) {
+            Ok(msg) => {
+                if received % 10 == 0 {
+                    println!("[receiver] got tag={} seq={}", msg.tag, msg.data[0]);
+                }
+                received += 1;
+            }
+            Err(()) => {
+                // Queue empty — spin and retry.
+                for _ in 0..1_000 {
+                    core::hint::spin_loop();
+                }
+            }
         }
     }
 }
