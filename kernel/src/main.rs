@@ -71,6 +71,17 @@ pub fn kmain() -> ! {
         test_syscalls_aarch64();
         test_userspace_aarch64();
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        // Note: S-mode ecall goes to M-mode (OpenSBI), not our trap handler.
+        // Syscalls are only testable from U-mode on RISC-V.
+        test_userspace_riscv64();
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        test_syscalls_x86_64();
+        test_userspace_x86_64();
+    }
 
     println!("Enabling interrupts");
     arch::platform::enable_interrupts();
@@ -239,4 +250,162 @@ fn test_syscalls_aarch64() {
     }
     println!("  Syscall test: thread_id={}", tid);
     println!("  Syscall test: PASSED");
+}
+
+// --- RISC-V specific tests ---
+
+#[cfg(target_arch = "riscv64")]
+fn test_userspace_riscv64() {
+    use arch::riscv64::mm;
+    use arch::riscv64::usertest;
+
+    println!("  Setting up Sv39 page tables...");
+
+    let root = mm::setup_tables().expect("page tables");
+    println!("  Root table at {:#x}", root);
+
+    let user_code = usertest::user_code();
+    let user_code_page = crate::mm::phys::alloc_page().expect("user code page");
+    let user_code_phys = user_code_page.as_usize();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            user_code.as_ptr(),
+            user_code_phys as *mut u8,
+            user_code.len(),
+        );
+    }
+
+    let user_stack_page = crate::mm::phys::alloc_page().expect("user stack page");
+    let user_stack_phys = user_stack_page.as_usize();
+
+    // User virtual addresses (in VPN[2]=1 range, avoiding kernel gigapage regions).
+    let user_code_virt: usize = 0x4000_0000;
+    let user_stack_virt: usize = 0x4001_0000;
+
+    mm::map_user_pages(root, user_code_virt, user_code_phys,
+        user_code.len(), mm::USER_RWX_FLAGS).expect("map user code");
+    mm::map_user_pages(root, user_stack_virt, user_stack_phys,
+        4096, mm::USER_RW_FLAGS).expect("map user stack");
+    println!("  User mappings: code at {:#x}, stack at {:#x}", user_code_virt, user_stack_virt);
+
+    println!("  Enabling Sv39 MMU...");
+    mm::enable_mmu(root);
+    println!("  MMU enabled — identity mapping active");
+
+    // Re-arm timer so it doesn't fire immediately when SPIE enables interrupts.
+    arch::riscv64::trap::rearm_timer();
+
+    println!("  Jumping to U-mode...");
+    let user_sp = user_stack_virt + 4096;
+    unsafe {
+        core::arch::asm!(
+            // Set sstatus.SPP = 0 (return to U-mode), SPIE = 1.
+            "li t0, (1 << 8)",       // SPP bit
+            "csrc sstatus, t0",
+            "li t0, (1 << 5)",       // SPIE bit
+            "csrs sstatus, t0",
+            // Set sepc = user code entry point.
+            "csrw sepc, {pc}",
+            // Save kernel sp in sscratch for trap entry from U-mode.
+            "csrw sscratch, sp",
+            // Set user stack pointer.
+            "mv sp, {sp}",
+            "sret",
+            pc = in(reg) user_code_virt,
+            sp = in(reg) user_sp,
+            options(noreturn),
+        );
+    }
+}
+
+// --- x86-64 specific tests ---
+
+#[cfg(target_arch = "x86_64")]
+fn test_syscalls_x86_64() {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov rax, 0", "mov rdi, 0x53", "int 0x80",
+            out("rax") ret,
+            out("rdi") _, out("rsi") _, out("rdx") _,
+            out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+        );
+    }
+    println!("");
+    println!("  Syscall test: debug_putchar returned {}", ret);
+
+    let tid: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov rax, 8", "int 0x80",
+            out("rax") tid,
+            out("rdi") _, out("rsi") _, out("rdx") _,
+            out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+        );
+    }
+    println!("  Syscall test: thread_id={}", tid);
+    println!("  Syscall test: PASSED");
+}
+
+#[cfg(target_arch = "x86_64")]
+fn test_userspace_x86_64() {
+    use arch::x86_64::{mm, usertest, gdt};
+
+    println!("  Setting up user page tables...");
+
+    let pml4 = mm::setup_tables().expect("page tables");
+    println!("  PML4 at {:#x}", pml4);
+
+    let user_code = usertest::user_code();
+    let user_code_page = crate::mm::phys::alloc_page().expect("user code page");
+    let user_code_phys = user_code_page.as_usize();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            user_code.as_ptr(),
+            user_code_phys as *mut u8,
+            user_code.len(),
+        );
+    }
+
+    let user_stack_page = crate::mm::phys::alloc_page().expect("user stack page");
+    let user_stack_phys = user_stack_page.as_usize();
+
+    // User virtual addresses at PML4 index 1 (VA >= 0x80_0000_0000).
+    let user_code_virt: usize = 0x80_0000_0000;
+    let user_stack_virt: usize = 0x80_0001_0000;
+
+    mm::map_user_pages(pml4, user_code_virt, user_code_phys,
+        user_code.len(), mm::USER_RWX_FLAGS).expect("map user code");
+    mm::map_user_pages(pml4, user_stack_virt, user_stack_phys,
+        4096, mm::USER_RW_FLAGS).expect("map user stack");
+    println!("  User mappings: code at {:#x}, stack at {:#x}", user_code_virt, user_stack_virt);
+
+    // Flush TLB with the new mappings.
+    mm::enable_mmu(pml4);
+    println!("  Page tables updated");
+
+    // Set the kernel RSP0 in TSS for ring 3 → ring 0 transitions.
+    let kernel_rsp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp); }
+    gdt::set_rsp0(kernel_rsp);
+
+    println!("  Jumping to ring 3...");
+    let user_sp = user_stack_virt + 4096;
+    let user_cs = (gdt::USER_CS as u64) | 3; // RPL = 3
+    let user_ss = (gdt::USER_DS as u64) | 3; // RPL = 3
+    unsafe {
+        core::arch::asm!(
+            "push {ss}",      // SS
+            "push {sp}",      // RSP
+            "pushfq",         // RFLAGS (with IF set)
+            "push {cs}",      // CS
+            "push {ip}",      // RIP
+            "iretq",
+            ss = in(reg) user_ss,
+            sp = in(reg) user_sp as u64,
+            cs = in(reg) user_cs,
+            ip = in(reg) user_code_virt as u64,
+            options(noreturn),
+        );
+    }
 }

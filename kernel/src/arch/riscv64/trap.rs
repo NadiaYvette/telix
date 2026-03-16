@@ -113,6 +113,14 @@ pub fn enable_interrupts() {
     }
 }
 
+/// Re-arm the timer so the next interrupt is one interval from now.
+/// Used before entering U-mode to prevent a stale timer firing immediately.
+pub fn rearm_timer() {
+    let interval = TIMER_INTERVAL.load(Ordering::Relaxed);
+    let now = read_time();
+    sbi_set_timer(now + interval);
+}
+
 /// Disable S-mode interrupts (clear sstatus.SIE).
 #[allow(dead_code)]
 pub fn disable_interrupts() {

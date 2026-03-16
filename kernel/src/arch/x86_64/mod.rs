@@ -3,16 +3,19 @@ pub mod exception;
 pub mod gdt;
 pub mod idt;
 pub mod lapic;
+pub mod mm;
 pub mod pic;
 pub mod serial;
 pub mod smp;
 pub mod timer;
+pub mod usertest;
 
 use core::arch::global_asm;
 
 global_asm!(include_str!("boot.S"));
 global_asm!(include_str!("vectors.S"));
 global_asm!(include_str!("ap_trampoline.S"));
+global_asm!(include_str!("usertest.S"));
 
 /// Platform init: GDT, IDT, PIC, PIT timer, LAPIC.
 pub fn init() {

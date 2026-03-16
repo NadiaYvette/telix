@@ -1,12 +1,15 @@
 pub mod boot;
+pub mod mm;
 pub mod serial;
 pub mod smp;
 pub mod trap;
+pub mod usertest;
 
 use core::arch::global_asm;
 
 global_asm!(include_str!("boot.S"));
 global_asm!(include_str!("vectors.S"));
+global_asm!(include_str!("usertest.S"));
 
 /// Platform init: trap vector, timer.
 pub fn init() {
