@@ -20,17 +20,12 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 pub fn kmain() -> ! {
     println!("Telix kernel initializing...");
 
-    // M2: Exception handling, interrupt controller, timer.
-    arch::aarch64::exception::init();
-    arch::aarch64::irq::init();
-    arch::aarch64::timer::init();
+    // Platform init: exceptions, interrupt controller, timer.
+    arch::platform::init();
 
-    // M3: Physical memory allocator.
-    // QEMU virt: RAM at 0x4000_0000, size = 256 MiB (from -m 256M).
-    let ram_start = arch::aarch64::boot::QEMU_VIRT_RAM_BASE;
-    let ram_end = ram_start + 256 * 1024 * 1024;
-    let kernel_end = arch::aarch64::boot::kernel_end_addr();
-    // Reserve from RAM start through kernel end (includes kernel image + BSS).
+    // Physical memory allocator.
+    let (ram_start, ram_end) = arch::platform::ram_range();
+    let kernel_end = arch::platform::kernel_end_addr();
     mm::phys::init(ram_start, ram_end, ram_start, kernel_end);
 
     // Quick phys allocator test.
@@ -40,7 +35,7 @@ pub fn kmain() -> ! {
         println!("  Phys alloc test: freed");
     }
 
-    // M4: Slab allocator test.
+    // Slab allocator test.
     mm::slab::print_stats();
     if let Some(obj) = mm::slab::alloc(64) {
         println!("  Slab alloc test: 64-byte object at {:?}", obj);
@@ -53,35 +48,31 @@ pub fn kmain() -> ! {
         println!("  Slab alloc test: freed");
     }
 
-    // M6: Capability system test.
+    // Capability system test.
     test_capabilities();
 
-    // M7/M8: Scheduler + thread management.
+    // Scheduler.
     sched::init();
 
-    // M9: IPC test — create a port, spawn sender/receiver threads.
+    // IPC test.
     let port = ipc::port::create().expect("create IPC port");
     IPC_TEST_PORT.store(port, core::sync::atomic::Ordering::Relaxed);
     println!("  IPC test port {} created", port);
-
     sched::spawn(ipc_sender, 100, 10).expect("spawn sender");
     sched::spawn(ipc_receiver, 100, 10).expect("spawn receiver");
 
-    // M10: Syscall test from EL1 (using SVC).
-    test_syscalls();
-
-    // M12: Minimal userspace test.
-    test_userspace();
+    // Platform-specific tests (syscall, userspace).
+    #[cfg(target_arch = "aarch64")]
+    {
+        test_syscalls_aarch64();
+        test_userspace_aarch64();
+    }
 
     println!("Enabling interrupts");
-    arch::aarch64::timer::enable_interrupts();
+    arch::platform::enable_interrupts();
 
     println!("Telix kernel initialized — entering idle loop");
-    loop {
-        unsafe {
-            core::arch::asm!("wfi");
-        }
-    }
+    arch::platform::idle_loop()
 }
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -100,7 +91,6 @@ fn ipc_sender() -> ! {
                 seq += 1;
             }
             Err(_) => {
-                // Queue full — spin and retry.
                 for _ in 0..1_000 {
                     core::hint::spin_loop();
                 }
@@ -121,7 +111,6 @@ fn ipc_receiver() -> ! {
                 received += 1;
             }
             Err(()) => {
-                // Queue empty — spin and retry.
                 for _ in 0..1_000 {
                     core::hint::spin_loop();
                 }
@@ -134,13 +123,11 @@ fn test_capabilities() {
     use cap::{Capability, CapType, Rights, CapSpace, Cdt};
     use sync::SpinLock;
 
-    // CDT is ~128 KB — too large for the stack. Use a static.
     static CDT_STORAGE: SpinLock<Cdt> = SpinLock::new(Cdt::new());
     {
         let mut cdt = CDT_STORAGE.lock();
         cdt.init();
 
-        // Task 0: server with full port capability.
         let mut server_space = CapSpace::new(0);
         let port_cap = Capability::new(
             CapType::Port,
@@ -150,27 +137,18 @@ fn test_capabilities() {
         let server_slot = server_space.insert(port_cap, &mut cdt).unwrap();
         println!("  Cap test: server has {:?} at slot {}", server_space.lookup(server_slot).unwrap(), server_slot);
 
-        // Task 1: client gets a derived send-only capability.
         let mut client_space = CapSpace::new(1);
         let client_slot = server_space.derive_to(
-            server_slot,
-            Rights::SEND,
-            &mut client_space,
-            &mut cdt,
+            server_slot, Rights::SEND, &mut client_space, &mut cdt,
         ).unwrap();
         println!("  Cap test: client has {:?} at slot {}", client_space.lookup(client_slot).unwrap(), client_slot);
 
-        // Task 2: another client gets send+grant derived from server.
         let mut client2_space = CapSpace::new(2);
         let client2_slot = server_space.derive_to(
-            server_slot,
-            Rights::SEND.union(Rights::GRANT),
-            &mut client2_space,
-            &mut cdt,
+            server_slot, Rights::SEND.union(Rights::GRANT), &mut client2_space, &mut cdt,
         ).unwrap();
         println!("  Cap test: client2 has {:?} at slot {}", client2_space.lookup(client2_slot).unwrap(), client2_slot);
 
-        // Revoke all derived capabilities.
         let revoked = server_space.revoke(server_slot, &mut cdt);
         println!("  Cap test: revoked {} derived capabilities", revoked);
         println!("  Cap test: server still has {:?}", server_space.lookup(server_slot).unwrap());
@@ -178,17 +156,18 @@ fn test_capabilities() {
     println!("  Cap test: PASSED");
 }
 
-fn test_userspace() {
+// --- AArch64-specific tests ---
+
+#[cfg(target_arch = "aarch64")]
+fn test_userspace_aarch64() {
     use arch::aarch64::mm;
     use arch::aarch64::usertest;
 
     println!("  Setting up page tables...");
 
-    // Set up a unified page table: identity-mapped kernel + user regions.
     let l0 = mm::setup_tables().expect("page tables");
     println!("  L0 table at {:#x}", l0);
 
-    // Allocate a page for user code and copy the test binary.
     let user_code_page = crate::mm::phys::alloc_page().expect("user code page");
     let user_code_phys = user_code_page.as_usize();
     unsafe {
@@ -199,34 +178,29 @@ fn test_userspace() {
         );
     }
 
-    // Allocate a page for user stack.
     let user_stack_page = crate::mm::phys::alloc_page().expect("user stack page");
     let user_stack_phys = user_stack_page.as_usize();
 
-    // User virtual addresses — in a separate 1 GiB region (L1[2] = 0x8000_0000+).
     let user_code_virt: usize = 0x8000_0000;
     let user_stack_virt: usize = 0x8001_0000;
 
-    // Map user code and stack into the page table.
     mm::map_user_pages(l0, user_code_virt, user_code_phys,
         usertest::USER_CODE.len(), mm::USER_RWX_FLAGS).expect("map user code");
     mm::map_user_pages(l0, user_stack_virt, user_stack_phys,
         4096, mm::USER_RW_FLAGS).expect("map user stack");
     println!("  User mappings: code at {:#x}, stack at {:#x}", user_code_virt, user_stack_virt);
 
-    // Enable MMU.
     println!("  Enabling MMU...");
     mm::enable_mmu(l0);
     println!("  MMU enabled — identity mapping active");
 
-    // Drop to EL0 and execute the user binary.
     println!("  Jumping to EL0...");
     let user_sp = user_stack_virt + 4096;
     unsafe {
         core::arch::asm!(
             "msr sp_el0, {sp}",
             "msr elr_el1, {pc}",
-            "mov x0, #0",             // SPSR: EL0t, all interrupts enabled
+            "mov x0, #0",
             "msr spsr_el1, x0",
             "eret",
             sp = in(reg) user_sp as u64,
@@ -236,33 +210,25 @@ fn test_userspace() {
     }
 }
 
-fn test_syscalls() {
-    // Test SVC from EL1 (kernel mode).
-    // SYS_DEBUG_PUTCHAR = 0, write 'S' to serial.
+#[cfg(target_arch = "aarch64")]
+fn test_syscalls_aarch64() {
     let ret: u64;
     unsafe {
         core::arch::asm!(
-            "mov x8, #0",     // SYS_DEBUG_PUTCHAR
-            "mov x0, #0x53",  // 'S'
-            "svc #0",
-            out("x0") ret,
-            out("x8") _,
+            "mov x8, #0", "mov x0, #0x53", "svc #0",
+            out("x0") ret, out("x8") _,
             out("x1") _, out("x2") _, out("x3") _,
             out("x4") _, out("x5") _, out("x6") _, out("x7") _,
         );
     }
-    // Should have printed 'S' to serial.
-    println!(""); // Newline after the 'S'.
+    println!("");
     println!("  Syscall test: debug_putchar returned {}", ret);
 
-    // Test SYS_THREAD_ID = 8.
     let tid: u64;
     unsafe {
         core::arch::asm!(
-            "mov x8, #8",     // SYS_THREAD_ID
-            "svc #0",
-            out("x0") tid,
-            out("x8") _,
+            "mov x8, #8", "svc #0",
+            out("x0") tid, out("x8") _,
             out("x1") _, out("x2") _, out("x3") _,
             out("x4") _, out("x5") _, out("x6") _, out("x7") _,
         );

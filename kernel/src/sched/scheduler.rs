@@ -108,20 +108,54 @@ impl Scheduler {
 
         // Create a fake exception frame at the top of the stack.
         // When we "return" from the IRQ handler with this thread's SP,
-        // restore_regs will load these values and eret to the entry point.
+        // restore_regs will load these values and eret/sret to the entry point.
         let frame_sp = stack_top - EXCEPTION_FRAME_SIZE;
         let frame = frame_sp as *mut u64;
         unsafe {
-            // Zero the entire frame (x0-x30 = 0, sp_el0 = 0).
-            for i in 0..36 {
+            // Zero the entire frame.
+            for i in 0..(EXCEPTION_FRAME_SIZE / 8) {
                 *frame.add(i) = 0;
             }
-            // ELR_EL1 = entry point (offset 256 / 8 = 32).
-            *frame.add(32) = entry as *const () as u64;
-            // SPSR_EL1 = EL1h (0x5), IRQs enabled (DAIF.I = 0).
-            // 0x5 = EL1h mode. We want PSTATE.I = 0 (IRQs unmasked).
-            *frame.add(33) = 0x5;
-            // ESR_EL1 = 0 (offset 34).
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                // ELR_EL1 = entry point (offset 256 / 8 = 32).
+                *frame.add(32) = entry as *const () as u64;
+                // SPSR_EL1 = EL1h (0x5), IRQs enabled (DAIF.I = 0).
+                // 0x5 = EL1h mode. We want PSTATE.I = 0 (IRQs unmasked).
+                *frame.add(33) = 0x5;
+                // ESR_EL1 = 0 (offset 34).
+            }
+
+            #[cfg(target_arch = "riscv64")]
+            {
+                // TrapFrame layout: x1-x31 (31 regs at indices 0..30),
+                // sepc at index 31, sstatus at index 32, scause at index 33.
+                // sepc = entry point.
+                *frame.add(31) = entry as *const () as u64;
+                // sstatus: SPP=1 (return to S-mode), SPIE=1 (enable interrupts on sret).
+                // SPP = bit 8, SPIE = bit 5.
+                *frame.add(32) = (1 << 8) | (1 << 5);
+                // scause = 0.
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                // ExceptionFrame layout (22 u64s):
+                //   [0..14]  = r15, r14, r13, r12, r11, r10, r9, r8, rbp, rdi, rsi, rdx, rcx, rbx, rax
+                //   [15]     = vector number
+                //   [16]     = error code (dummy)
+                //   [17]     = rip (entry point)
+                //   [18]     = cs (kernel code segment = 0x08)
+                //   [19]     = rflags (interrupts enabled = 0x200)
+                //   [20]     = rsp (doesn't matter for kernel threads, set to stack_top)
+                //   [21]     = ss (kernel data segment = 0x10)
+                *frame.add(17) = entry as *const () as u64;     // RIP
+                *frame.add(18) = 0x08;                           // CS = kernel code
+                *frame.add(19) = 0x200;                          // RFLAGS = IF (interrupts enabled)
+                *frame.add(20) = stack_top as u64;               // RSP
+                *frame.add(21) = 0x10;                           // SS = kernel data
+            }
         }
 
         let thread = &mut self.threads[id as usize];

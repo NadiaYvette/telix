@@ -1,27 +1,29 @@
 pub mod boot;
 pub mod exception;
-pub mod irq;
-pub mod mm;
+pub mod gdt;
+pub mod idt;
+pub mod pic;
 pub mod serial;
 pub mod timer;
-pub mod usertest;
 
 use core::arch::global_asm;
 
 global_asm!(include_str!("boot.S"));
 global_asm!(include_str!("vectors.S"));
 
-/// Platform init: exceptions, interrupt controller, timer.
+/// Platform init: GDT, IDT, PIC, PIT timer.
 pub fn init() {
-    exception::init();
-    irq::init();
+    gdt::init();
+    idt::init();
+    pic::init();
     timer::init();
 }
 
 /// RAM range for the physical allocator.
+/// x86 QEMU: RAM starts at 1 MiB, we use 256 MiB total.
 pub fn ram_range() -> (usize, usize) {
-    let start = boot::QEMU_VIRT_RAM_BASE;
-    let end = start + 256 * 1024 * 1024; // 256 MiB
+    let start = boot::RAM_BASE;
+    let end = start + 256 * 1024 * 1024;
     (start, end)
 }
 
@@ -30,14 +32,14 @@ pub fn kernel_end_addr() -> usize {
     boot::kernel_end_addr()
 }
 
-/// Enable interrupts (unmask IRQ).
+/// Enable interrupts (STI).
 pub fn enable_interrupts() {
     timer::enable_interrupts();
 }
 
-/// Idle loop — WFI until interrupted.
+/// Idle loop — HLT until interrupted.
 pub fn idle_loop() -> ! {
     loop {
-        unsafe { core::arch::asm!("wfi"); }
+        unsafe { core::arch::asm!("hlt"); }
     }
 }

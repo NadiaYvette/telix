@@ -5,6 +5,14 @@ target = "aarch64-unknown-none"
 runner = "tools/run-qemu.sh"
 rustflags = ["-C", "link-arg=-Tkernel/src/arch/aarch64/linker.ld"]
 
+[target.riscv64gc-unknown-none-elf]
+runner = "tools/run-qemu-riscv.sh"
+rustflags = ["-C", "link-arg=-Tkernel/src/arch/riscv64/linker.ld"]
+
+[target.x86_64-unknown-none]
+runner = "tools/run-qemu-x86.sh"
+rustflags = ["-C", "link-arg=-Tkernel/src/arch/x86_64/linker.ld", "-C", "code-model=small", "-C", "relocation-model=static"]
+
 [unstable]
 build-std = ["core"]
 build-std-features = ["compiler-builtins-mem"]

@@ -15,8 +15,16 @@ pub enum ThreadState {
 /// Maximum number of threads.
 pub const MAX_THREADS: usize = 64;
 
-/// Size of the exception frame saved by vectors.S (288 bytes = 36 x u64).
+/// Size of the exception frame saved by vectors.S.
+/// AArch64: 288 bytes = 36 x u64 (x0-x30, sp_el0, elr, spsr, esr).
+/// RISC-V:  272 bytes = 34 x u64 (x1-x31, sepc, sstatus, scause).
+#[cfg(target_arch = "aarch64")]
 pub const EXCEPTION_FRAME_SIZE: usize = 288;
+#[cfg(target_arch = "riscv64")]
+pub const EXCEPTION_FRAME_SIZE: usize = 272;
+/// x86-64: 176 bytes = 22 x u64 (r15-rax, vector, error_code, rip, cs, rflags, rsp, ss).
+#[cfg(target_arch = "x86_64")]
+pub const EXCEPTION_FRAME_SIZE: usize = 176;
 
 /// Thread control block.
 pub struct Thread {

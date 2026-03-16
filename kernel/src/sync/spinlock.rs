@@ -1,7 +1,6 @@
 //! Interrupt-safe spinlock.
 //!
-//! Disables IRQs on acquire (saves DAIF), re-enables on release.
-//! Uses ARM64 `ldaxr`/`stlxr` for the lock word.
+//! Disables IRQs on acquire (saves interrupt state), re-enables on release.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -13,8 +12,6 @@ pub struct SpinLock<T> {
     data: UnsafeCell<T>,
 }
 
-// Safety: SpinLock provides mutual exclusion via the atomic lock word,
-// and disables interrupts to prevent deadlock on the same core.
 unsafe impl<T: Send> Sync for SpinLock<T> {}
 unsafe impl<T: Send> Send for SpinLock<T> {}
 
@@ -26,32 +23,28 @@ impl<T> SpinLock<T> {
         }
     }
 
-    /// Acquire the lock, disabling interrupts. Returns a guard that
-    /// releases the lock and restores interrupt state on drop.
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
-        let saved_daif = disable_irqs();
+        let saved = arch_disable_irqs();
 
-        // Spin until we acquire the lock.
         while self
             .lock
             .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            // Hint to the processor that we're spinning.
             core::hint::spin_loop();
         }
 
         SpinLockGuard {
             lock: self,
-            saved_daif,
+            saved,
         }
     }
 }
 
-/// RAII guard — releases the lock and restores DAIF on drop.
+/// RAII guard — releases the lock and restores interrupt state on drop.
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
-    saved_daif: u64,
+    saved: usize,
 }
 
 impl<T> Deref for SpinLockGuard<'_, T> {
@@ -70,31 +63,81 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.lock.store(0, Ordering::Release);
-        restore_irqs(self.saved_daif);
+        arch_restore_irqs(self.saved);
     }
 }
 
-/// Disable IRQs (set DAIF.I) and return the previous DAIF value.
+// --- Architecture-specific interrupt save/restore ---
+
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn disable_irqs() -> u64 {
+fn arch_disable_irqs() -> usize {
     let daif: u64;
     unsafe {
         core::arch::asm!(
             "mrs {0}, daif",
-            "msr daifset, #2",  // Set I bit (mask IRQs)
+            "msr daifset, #2",
             out(reg) daif,
         );
     }
-    daif
+    daif as usize
 }
 
-/// Restore DAIF to a previously saved value.
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn restore_irqs(saved: u64) {
+fn arch_restore_irqs(saved: usize) {
     unsafe {
         core::arch::asm!(
             "msr daif, {0}",
-            in(reg) saved,
+            in(reg) saved as u64,
         );
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn arch_disable_irqs() -> usize {
+    let sstatus: usize;
+    unsafe {
+        core::arch::asm!(
+            "csrrci {0}, sstatus, 0x2",  // Clear SIE bit, return old value
+            out(reg) sstatus,
+        );
+    }
+    sstatus
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn arch_restore_irqs(saved: usize) {
+    // Restore only the SIE bit from saved sstatus.
+    if saved & 0x2 != 0 {
+        unsafe {
+            core::arch::asm!("csrsi sstatus, 0x2"); // Set SIE
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn arch_disable_irqs() -> usize {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {0}",
+            "cli",
+            out(reg) flags,
+        );
+    }
+    flags as usize
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn arch_restore_irqs(saved: usize) {
+    if saved & 0x200 != 0 {
+        // IF was set — re-enable interrupts.
+        unsafe { core::arch::asm!("sti"); }
     }
 }

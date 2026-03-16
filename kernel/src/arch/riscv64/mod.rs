@@ -1,21 +1,15 @@
 pub mod boot;
-pub mod exception;
-pub mod irq;
-pub mod mm;
 pub mod serial;
-pub mod timer;
-pub mod usertest;
+pub mod trap;
 
 use core::arch::global_asm;
 
 global_asm!(include_str!("boot.S"));
 global_asm!(include_str!("vectors.S"));
 
-/// Platform init: exceptions, interrupt controller, timer.
+/// Platform init: trap vector, timer.
 pub fn init() {
-    exception::init();
-    irq::init();
-    timer::init();
+    trap::init();
 }
 
 /// RAM range for the physical allocator.
@@ -30,9 +24,9 @@ pub fn kernel_end_addr() -> usize {
     boot::kernel_end_addr()
 }
 
-/// Enable interrupts (unmask IRQ).
+/// Enable interrupts (set sstatus.SIE).
 pub fn enable_interrupts() {
-    timer::enable_interrupts();
+    trap::enable_interrupts();
 }
 
 /// Idle loop — WFI until interrupted.
