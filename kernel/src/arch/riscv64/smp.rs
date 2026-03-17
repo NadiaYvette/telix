@@ -92,14 +92,18 @@ pub fn start_secondary_cpus() {
 extern "C" fn secondary_hart_rust_entry(cpu_id: u64) {
     let cpu = cpu_id as u32;
 
+    // Enable MMU using BSP's kernel page table (must happen before user VA handling).
+    super::mm::enable_mmu_secondary();
+
     // Set tp = cpu_id for smp::cpu_id().
     unsafe {
         core::arch::asm!("mv tp, {}", in(reg) cpu_id);
     }
 
-    // Install trap vector.
+    // Install trap vector and ensure sscratch = 0 (S-mode convention).
     unsafe {
         core::arch::asm!(
+            "csrw sscratch, zero",
             "la {tmp}, _trap_entry",
             "csrw stvec, {tmp}",
             tmp = out(reg) _,

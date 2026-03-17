@@ -11,6 +11,24 @@ use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
 pub const MAX_CPUS: usize = 4;
 
+/// Per-hart trap scratch data for RISC-V tp/sscratch swap convention.
+/// Accessed from vectors.S — layout and symbol name must stay in sync.
+#[cfg(target_arch = "riscv64")]
+#[repr(C, align(32))]
+pub struct TrapScratch {
+    pub kernel_sp: u64,   // offset 0: kernel stack pointer for user traps
+    pub cpu_id: u64,      // offset 8: this hart's CPU ID
+    pub user_sp: u64,     // offset 16: temporary save of user sp during trap entry
+    pub _pad: u64,        // offset 24: padding to 32 bytes
+}
+
+#[cfg(target_arch = "riscv64")]
+#[unsafe(no_mangle)]
+pub static mut TRAP_SCRATCH_ARRAY: [TrapScratch; MAX_CPUS] = {
+    const INIT: TrapScratch = TrapScratch { kernel_sp: 0, cpu_id: 0, user_sp: 0, _pad: 0 };
+    [INIT; MAX_CPUS]
+};
+
 /// Per-CPU data. Each CPU has its own instance, accessed lock-free by cpu_id().
 pub struct PerCpuData {
     /// Currently running thread on this CPU.
@@ -83,6 +101,7 @@ pub fn init_bsp(idle_thread: ThreadId) {
     #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!("mv tp, zero");
+        TRAP_SCRATCH_ARRAY[0].cpu_id = 0;
     }
 
     // x86-64: LAPIC ID 0 is the BSP on QEMU — no setup needed.
@@ -96,6 +115,11 @@ pub fn init_bsp(idle_thread: ThreadId) {
 
 /// Called by each secondary CPU after it finishes local init.
 pub fn init_ap(cpu: u32, idle_thread: ThreadId) {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        TRAP_SCRATCH_ARRAY[cpu as usize].cpu_id = cpu as u64;
+    }
+
     let pcpu = get(cpu);
     pcpu.current_thread.store(idle_thread, Ordering::Relaxed);
     pcpu.idle_thread_id.store(idle_thread, Ordering::Relaxed);

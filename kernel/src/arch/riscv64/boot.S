@@ -4,6 +4,7 @@
 // CPU enters in S-mode. a0 = hart ID, a1 = DTB pointer.
 // The boot hart may be any hart (not necessarily 0).
 
+.option arch, +zaamo
 .section .text.boot, "ax"
 .global _start
 

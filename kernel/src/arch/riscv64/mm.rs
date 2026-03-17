@@ -4,6 +4,16 @@
 //! Kernel is identity-mapped via 1 GiB gigapages.
 //! User pages are mapped at arbitrary VAs via 4K leaf entries.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Kernel page table root, set by BSP after enable_mmu.
+static KERNEL_PT_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+/// Get the kernel page table root address.
+pub fn kernel_pt_root() -> usize {
+    KERNEL_PT_ROOT.load(Ordering::Acquire)
+}
+
 /// Sv39 PTE flags.
 const PTE_V: u64 = 1 << 0; // Valid
 const PTE_R: u64 = 1 << 1; // Read
@@ -258,6 +268,22 @@ pub fn switch_page_table(root: usize) {
 pub fn enable_mmu(root: usize) {
     let ppn = (root >> 12) as u64;
     let satp = (8u64 << 60) | ppn; // Mode 8 = Sv39
+    unsafe {
+        core::arch::asm!(
+            "csrw satp, {}",
+            "sfence.vma",
+            in(reg) satp,
+        );
+    }
+    KERNEL_PT_ROOT.store(root, Ordering::Release);
+}
+
+/// Enable MMU on a secondary hart using the BSP's page table root.
+pub fn enable_mmu_secondary() {
+    let root = KERNEL_PT_ROOT.load(Ordering::Acquire);
+    assert!(root != 0, "BSP must enable MMU before secondaries");
+    let ppn = (root >> 12) as u64;
+    let satp = (8u64 << 60) | ppn;
     unsafe {
         core::arch::asm!(
             "csrw satp, {}",

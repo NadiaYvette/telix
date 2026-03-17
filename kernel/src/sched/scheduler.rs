@@ -238,12 +238,16 @@ impl Scheduler {
         unsafe {
             core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
         }
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!("fence.i");
+        }
 
         // Map user stack.
         #[cfg(target_arch = "aarch64")]
         const USER_STACK_TOP: usize = 0x7FFF_F000_0000;
         #[cfg(target_arch = "riscv64")]
-        const USER_STACK_TOP: usize = 0x3FFF_F000_0000;
+        const USER_STACK_TOP: usize = 0x3F_F000_0000; // Below Sv39 256 GiB limit
         #[cfg(target_arch = "x86_64")]
         const USER_STACK_TOP: usize = 0x7FFF_FFFF_0000;
 
@@ -438,6 +442,15 @@ impl Scheduler {
                 crate::arch::riscv64::mm::switch_page_table(next_root);
                 #[cfg(target_arch = "x86_64")]
                 crate::arch::x86_64::mm::switch_page_table(next_root);
+            } else {
+                // Switching to kernel task: restore kernel page table.
+                #[cfg(target_arch = "riscv64")]
+                {
+                    let kern_root = crate::arch::riscv64::mm::kernel_pt_root();
+                    if kern_root != 0 {
+                        crate::arch::riscv64::mm::switch_page_table(kern_root);
+                    }
+                }
             }
         }
 

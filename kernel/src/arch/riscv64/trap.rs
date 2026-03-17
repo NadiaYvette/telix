@@ -57,9 +57,10 @@ fn sbi_set_timer(stime_value: u64) {
 
 /// Initialize trap handling: set stvec, configure timer.
 pub fn init() {
-    // Set stvec to our trap vector (direct mode).
+    // Set stvec to our trap vector (direct mode) and ensure sscratch = 0 (S-mode).
     unsafe {
         core::arch::asm!(
+            "csrw sscratch, zero",
             "la {tmp}, _trap_entry",
             "csrw stvec, {tmp}",
             tmp = out(reg) _,
@@ -176,9 +177,12 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             };
             let aspace_id = crate::sched::current_aspace_id();
             if aspace_id == 0 {
+                let cpu = crate::sched::smp::cpu_id();
+                let tid = crate::sched::current_thread_id();
+                let spp = (frame.sstatus >> 8) & 1;
                 crate::println!(
-                    "Kernel page fault: cause={:#x} sepc={:#x} stval={:#x}",
-                    scause, frame.sepc, stval
+                    "Kernel page fault: cause={:#x} sepc={:#x} stval={:#x} cpu={} tid={} spp={} sstatus={:#x} sp(frame)={:#x}",
+                    scause, frame.sepc, stval, cpu, tid, spp, frame.sstatus, frame.regs[1]
                 );
                 loop { core::hint::spin_loop(); }
             }

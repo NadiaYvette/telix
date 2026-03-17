@@ -26,6 +26,9 @@ pub fn kernel_end_addr() -> usize {
 /// Rust entry point called from assembly.
 #[unsafe(no_mangle)]
 pub extern "C" fn _rust_entry(dtb_ptr: usize, hart_id: usize) -> ! {
+    // Set tp = 0 for BSP (CPU 0) — used by smp::cpu_id().
+    unsafe { core::arch::asm!("mv tp, zero"); }
+
     DTB_ADDR.store(dtb_ptr, Ordering::Relaxed);
     BOOT_HART_ID.store(hart_id, Ordering::Relaxed);
 
