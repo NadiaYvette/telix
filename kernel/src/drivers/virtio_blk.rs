@@ -76,7 +76,8 @@ pub fn irq_handler() {
     // ACK the virtio interrupt.
     let status = mmio::read32(base, mmio::INTERRUPT_STATUS);
     mmio::write32(base, mmio::INTERRUPT_ACK, status);
-    // Wake the waiting thread.
+    // Wake the waiting thread (if any). This is a best-effort optimization —
+    // wait_complete also polls the used ring as a fallback.
     let tid = BLK_WAITER_TID.load(Ordering::Acquire);
     if tid != u32::MAX {
         crate::sched::wake_thread(tid);
@@ -382,23 +383,17 @@ impl VirtioBlk {
     }
 
     fn wait_complete(&mut self) {
-        use crate::sched::thread::BlockReason;
         let used = self.used_pa as *mut VringUsed;
+        let tid = crate::sched::current_thread_id();
+        // Store our tid so the IRQ handler can wake us (best-effort).
+        BLK_WAITER_TID.store(tid, Ordering::Release);
+        // Enable interrupts (may be masked if called from a syscall path).
+        // QEMU TCG can lose virtio IRQs, so we poll the used ring on each
+        // wakeup (timer tick or device IRQ) rather than relying solely on
+        // the IRQ-driven wakeup flag. WFI yields the vCPU between polls,
+        // preventing busy-looping from starving QEMU's I/O thread.
+        let saved = crate::sched::arch_irq_save_enable();
         loop {
-            // Check if already complete (IRQ may have fired before we block).
-            let idx = unsafe {
-                core::sync::atomic::fence(Ordering::Acquire);
-                (*used).idx
-            };
-            if idx != self.last_used_idx {
-                self.last_used_idx = idx;
-                return;
-            }
-            // Block until woken by IRQ handler.
-            let tid = crate::sched::current_thread_id();
-            crate::sched::clear_wakeup_flag(tid);
-            BLK_WAITER_TID.store(tid, Ordering::Release);
-            // Re-check used ring after storing waiter to prevent lost wakeup.
             let idx = unsafe {
                 core::sync::atomic::fence(Ordering::Acquire);
                 (*used).idx
@@ -406,11 +401,17 @@ impl VirtioBlk {
             if idx != self.last_used_idx {
                 self.last_used_idx = idx;
                 BLK_WAITER_TID.store(u32::MAX, Ordering::Release);
-                crate::sched::wake_thread(tid); // Cancel the clear
+                crate::sched::arch_irq_restore(saved);
                 return;
             }
-            crate::sched::block_current(BlockReason::None);
-            BLK_WAITER_TID.store(u32::MAX, Ordering::Release);
+            // Wait for next interrupt (timer or device). On QEMU TCG this
+            // yields the vCPU, allowing the I/O thread to process virtio.
+            #[cfg(target_arch = "aarch64")]
+            unsafe { core::arch::asm!("wfi"); }
+            #[cfg(target_arch = "riscv64")]
+            unsafe { core::arch::asm!("wfi"); }
+            #[cfg(target_arch = "x86_64")]
+            unsafe { core::arch::asm!("hlt"); }
         }
     }
 }

@@ -547,6 +547,12 @@ impl Scheduler {
         if current == idle_id {
             return self.has_ready_threads();
         }
+        // If the thread is spinning in block_current, preempt immediately
+        // so other threads can run. Don't consume quantum — the thread
+        // will need it when it actually gets woken up.
+        if YIELD_ASAP[current as usize].load(Ordering::Acquire) {
+            return true;
+        }
         let thread = &mut self.threads[current as usize];
         thread.quantum = thread.quantum.saturating_sub(1);
         if thread.quantum == 0 {
@@ -733,6 +739,15 @@ static THREAD_PRIO: [core::sync::atomic::AtomicU8; super::thread::MAX_THREADS] =
     [INIT; super::thread::MAX_THREADS]
 };
 
+/// Per-thread yield-ASAP flag. When set, `timer_tick_for` will force
+/// preemption on the very next timer tick instead of waiting for the
+/// full quantum to expire. This prevents spinning threads in
+/// `block_current` from starving real work on SMP.
+static YIELD_ASAP: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS] = {
+    const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    [INIT; super::thread::MAX_THREADS]
+};
+
 /// Clear the wakeup flag for a thread. Must be called while holding the
 /// relevant lock (PORT_TABLE etc.) BEFORE adding the thread as a waiter,
 /// to prevent a lost-wakeup race where wake_thread() sets the flag between
@@ -749,6 +764,10 @@ pub fn clear_wakeup_flag(tid: ThreadId) {
 /// the relevant lock, BEFORE adding itself as a waiter and dropping the lock.
 pub fn block_current(_reason: BlockReason) {
     let tid = current_thread_id();
+    // Signal the scheduler to preempt us on the next timer tick instead of
+    // waiting for the full quantum. This prevents spinning threads from
+    // starving real work on SMP systems.
+    YIELD_ASAP[tid as usize].store(true, Ordering::Release);
     // Enable interrupts so the timer can preempt us while we spin.
     // This is critical when called from a syscall handler (SVC/ecall/int),
     // because hardware masks IRQs on exception entry.
@@ -758,14 +777,21 @@ pub fn block_current(_reason: BlockReason) {
     // a race where wake_thread() re-enqueues a Blocked thread that's still
     // executing on its CPU, causing double-scheduling on SMP.
     while !WAKEUP_FLAGS[tid as usize].load(Ordering::Acquire) {
-        core::hint::spin_loop();
+        // Use WFI to wait for the next interrupt (timer tick or device IRQ).
+        // This is critical on QEMU TCG: spin_loop() keeps the vCPU busy,
+        // starving QEMU's I/O thread from processing virtio requests.
+        // WFI causes the vCPU to pause until an interrupt arrives.
+        arch_wait_for_interrupt();
     }
+    YIELD_ASAP[tid as usize].store(false, Ordering::Release);
     arch_restore_irqs(saved);
 }
 
 /// Wake a blocked thread, making it runnable.
 pub fn wake_thread(tid: ThreadId) {
     WAKEUP_FLAGS[tid as usize].store(true, Ordering::Release);
+    // Signal all CPUs so any core spinning in block_current's WFE wakes immediately.
+    arch_send_event();
 }
 
 #[allow(dead_code)]
@@ -859,6 +885,19 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
 // --- Architecture-specific IRQ helpers for blocking paths ---
 
 /// Save current interrupt state and enable IRQs. Returns saved state.
+/// Public so drivers (e.g. virtio_blk) can use polling with WFI.
+#[inline(always)]
+pub fn arch_irq_save_enable() -> usize {
+    arch_save_and_enable_irqs()
+}
+
+/// Restore interrupt state.
+/// Public so drivers (e.g. virtio_blk) can use polling with WFI.
+#[inline(always)]
+pub fn arch_irq_restore(saved: usize) {
+    arch_restore_irqs(saved);
+}
+
 #[inline(always)]
 fn arch_save_and_enable_irqs() -> usize {
     #[cfg(target_arch = "aarch64")]
@@ -931,6 +970,32 @@ fn arch_enable_irqs() {
     unsafe { core::arch::asm!("csrsi sstatus, 0x2"); }
     #[cfg(target_arch = "x86_64")]
     unsafe { core::arch::asm!("sti"); }
+}
+
+/// Wait for the next interrupt. Pauses the CPU until an interrupt arrives.
+/// On AArch64: WFI. On RISC-V: WFI. On x86-64: HLT.
+/// IRQs must be enabled before calling this.
+///
+/// Critical on QEMU TCG: without this, busy-looping vCPUs starve QEMU's
+/// I/O thread, preventing virtio request completion.
+#[inline(always)]
+fn arch_wait_for_interrupt() {
+    #[cfg(target_arch = "aarch64")]
+    unsafe { core::arch::asm!("wfi"); }
+    #[cfg(target_arch = "riscv64")]
+    unsafe { core::arch::asm!("wfi"); }
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::asm!("hlt"); }
+}
+
+/// Send an event to all CPUs. On AArch64, SEV wakes WFE waiters.
+/// Currently a no-op since we use WFI (woken by interrupts) instead of WFE.
+#[inline(always)]
+fn arch_send_event() {
+    // WFI-based blocking is woken by interrupts, not events.
+    // SEV is unnecessary but harmless as a hint.
+    #[cfg(target_arch = "aarch64")]
+    unsafe { core::arch::asm!("sev"); }
 }
 
 /// Check if a child thread's task has exited. Returns exit code if so.
