@@ -85,12 +85,20 @@ pub fn kmain() -> ! {
 
     // Phase 3: I/O server stack.
     println!("Phase 3: Starting I/O servers...");
+
+    // Name server (kernel thread) — must start first for service registration.
+    sched::spawn(io::namesrv::namesrv_server, 50, 20).expect("spawn namesrv");
+    // Wait for name server to be ready.
+    while io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire) == u32::MAX {
+        core::hint::spin_loop();
+    }
+
     sched::spawn(io::initramfs::initramfs_server, 50, 20).expect("spawn initramfs");
     // Virtio-blk server — AArch64 and RISC-V only (x86-64 needs PCI).
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     sched::spawn(io::blk_server::blk_server, 50, 20).expect("spawn blk server");
 
-    // Phase 4: Userspace processes.
+    // Phase 4: Spawning init process...
     println!("Phase 4: Spawning init process...");
 
     // Spawn userspace initramfs server with CPIO data mapped at 0x3_0000_0000.
@@ -99,12 +107,32 @@ pub fn kmain() -> ! {
         let cpio_data: &[u8] = include_bytes!("io/initramfs.cpio");
         let srv_port = ipc::port::create().expect("initramfs_srv port");
         io::initramfs::USER_INITRAMFS_PORT.store(srv_port, Ordering::Release);
+
+        // Register initramfs with name server.
+        {
+            let nsrv = io::namesrv::NAMESRV_PORT.load(Ordering::Acquire);
+            let (n0, n1, n2) = io::protocol::pack_name(b"initramfs");
+            let name_len = 9u64;
+            let reply_port = ipc::port::create().expect("reg reply port");
+            let d3 = name_len | ((reply_port as u64) << 32);
+            let msg = ipc::Message::new(io::protocol::NS_REGISTER, [n0, n1, srv_port as u64, d3, 0, 0]);
+            let _ = ipc::port::send(nsrv, msg);
+            let _ = ipc::port::recv(reply_port); // wait for NS_REGISTER_OK
+            ipc::port::destroy(reply_port);
+        }
+
         match sched::spawn_user_with_data(
             b"initramfs_srv", 50, 20, cpio_data, 0x3_0000_0000, srv_port as u64,
         ) {
             Some(tid) => println!("  initramfs_srv spawned (thread {}, port {})", tid, srv_port),
             None => println!("  ERROR: failed to spawn initramfs_srv"),
         }
+    }
+
+    // Spawn ramdisk server (userspace, no data copy needed).
+    match sched::spawn_user(b"ramdisk_srv", 50, 20, 0) {
+        Some(tid) => println!("  ramdisk_srv spawned (thread {})", tid),
+        None => println!("  WARNING: ramdisk_srv not found (ok if not yet built)"),
     }
 
     match sched::spawn_user(b"init", 50, 20, 0) {

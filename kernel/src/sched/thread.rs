@@ -18,6 +18,7 @@ pub enum BlockReason {
     None,
     PortRecv(u32),
     PortSend(u32),
+    PortSetRecv(u32),
 }
 
 /// Maximum number of threads.

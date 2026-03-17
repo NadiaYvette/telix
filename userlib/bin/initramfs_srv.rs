@@ -174,6 +174,10 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
     syscall::debug_puts(b"\n");
 
     let port = port_id as u32;
+    let my_aspace = syscall::aspace_id();
+
+    // Register with name server.
+    syscall::ns_register(b"initramfs", port);
 
     // Server loop.
     loop {
@@ -196,7 +200,10 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
 
                 match fs.find(name) {
                     Some(idx) => {
-                        syscall::send_nb(reply_port, IO_CONNECT_OK, idx as u64, fs.files[idx].data_len as u64);
+                        // data[0]=handle, data[1]=size, data[2]=server_aspace_id
+                        syscall::send(reply_port, IO_CONNECT_OK,
+                            idx as u64, fs.files[idx].data_len as u64,
+                            my_aspace as u64, 0);
                     }
                     None => {
                         syscall::send_nb(reply_port, IO_ERROR, ERR_NOT_FOUND, 0);
@@ -207,10 +214,12 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
             IO_READ => {
                 // data[0] = handle, data[1] = offset
                 // data[2] = length (low 32) | reply_port (high 32)
+                // data[3] = grant_dst_va (if grant), data[4] = flags
                 let file_handle = msg.data[0] as usize;
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
                 let reply_port = (msg.data[2] >> 32) as u32;
+                let grant_va = msg.data[3] as usize;
 
                 if file_handle >= fs.count || !fs.files[file_handle].active {
                     syscall::send_nb(reply_port, IO_ERROR, ERR_INVALID, 0);
@@ -221,11 +230,22 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                 let start = f.data_offset + offset.min(f.data_len);
                 let end = f.data_offset + (offset + length).min(f.data_len);
                 let data = &cpio_data[start..end];
-                let bytes_read = data.len().min(MAX_INLINE_READ);
-                let packed = pack_inline_data(&data[..bytes_read]);
 
-                syscall::send(reply_port, IO_READ_OK,
-                    bytes_read as u64, packed[0], packed[1], packed[2]);
+                if grant_va != 0 {
+                    // Grant-based read: copy file data into granted pages.
+                    let bytes_read = data.len();
+                    let dst = grant_va as *mut u8;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(data.as_ptr(), dst, bytes_read);
+                    }
+                    syscall::send_nb(reply_port, IO_READ_OK, bytes_read as u64, 0);
+                } else {
+                    // Inline read: pack into message words.
+                    let bytes_read = data.len().min(MAX_INLINE_READ);
+                    let packed = pack_inline_data(&data[..bytes_read]);
+                    syscall::send(reply_port, IO_READ_OK,
+                        bytes_read as u64, packed[0], packed[1], packed[2]);
+                }
             }
 
             IO_STAT => {

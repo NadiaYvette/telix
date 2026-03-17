@@ -30,6 +30,8 @@ pub struct Port {
     /// Threads blocked waiting to send (queue full).
     send_waiters: [ThreadId; MAX_WAITERS],
     send_waiter_count: usize,
+    /// Port set this port belongs to (u32::MAX = none).
+    pub port_set_id: u32,
 }
 
 impl Port {
@@ -45,12 +47,14 @@ impl Port {
             recv_waiter_count: 0,
             send_waiters: [0; MAX_WAITERS],
             send_waiter_count: 0,
+            port_set_id: u32::MAX,
         }
     }
 
-    /// Try to enqueue a message. Returns Ok(Option<ThreadId>) where the
-    /// Option is a receiver to wake up, or Err(msg) if the queue is full.
-    pub fn try_send(&mut self, msg: Message) -> Result<Option<ThreadId>, Message> {
+    /// Try to enqueue a message. Returns Ok((direct_wakeup, port_set_id)) where
+    /// direct_wakeup is a receiver thread to wake, and port_set_id is the set
+    /// to notify if no direct receiver exists. Err(msg) if queue is full.
+    pub fn try_send(&mut self, msg: Message) -> Result<(Option<ThreadId>, u32), Message> {
         if self.len >= PORT_QUEUE_CAPACITY {
             return Err(msg); // Queue full.
         }
@@ -60,14 +64,13 @@ impl Port {
         self.len += 1;
 
         // Wake up a blocked receiver if any.
-        let wakeup = if self.recv_waiter_count > 0 {
+        if self.recv_waiter_count > 0 {
             self.recv_waiter_count -= 1;
-            Some(self.recv_waiters[self.recv_waiter_count])
+            Ok((Some(self.recv_waiters[self.recv_waiter_count]), u32::MAX))
         } else {
-            None
-        };
-
-        Ok(wakeup)
+            // No direct receiver — notify port set if this port belongs to one.
+            Ok((None, self.port_set_id))
+        }
     }
 
     /// Try to dequeue a message. Returns Ok(msg, Option<ThreadId>) where
@@ -167,10 +170,12 @@ pub fn send_nb(port_id: PortId, msg: Message) -> Result<(), Message> {
         return Err(msg);
     }
     match port.try_send(msg) {
-        Ok(wakeup) => {
+        Ok((wakeup, set_id)) => {
             drop(table);
             if let Some(tid) = wakeup {
                 crate::sched::wake_thread(tid);
+            } else if set_id != u32::MAX {
+                super::port_set::wake_set_waiter(set_id);
             }
             Ok(())
         }
@@ -216,15 +221,18 @@ pub fn send(port_id: PortId, msg: Message) -> Result<(), ()> {
             return Err(());
         }
         match port.try_send(pending) {
-            Ok(wakeup) => {
+            Ok((wakeup, set_id)) => {
                 drop(table);
                 if let Some(tid) = wakeup {
                     crate::sched::wake_thread(tid);
+                } else if set_id != u32::MAX {
+                    super::port_set::wake_set_waiter(set_id);
                 }
                 return Ok(());
             }
             Err(returned_msg) => {
                 let tid = crate::sched::current_thread_id();
+                crate::sched::clear_wakeup_flag(tid);
                 port.add_send_waiter(tid);
                 pending = returned_msg;
                 drop(table);
@@ -257,11 +265,20 @@ pub fn recv(port_id: PortId) -> Result<Message, ()> {
             }
             Err(()) => {
                 let tid = crate::sched::current_thread_id();
+                crate::sched::clear_wakeup_flag(tid);
                 port.add_recv_waiter(tid);
                 drop(table);
                 crate::sched::block_current(BlockReason::PortRecv(port_id));
             }
         }
+    }
+}
+
+/// Set the port set membership for a port.
+pub fn set_port_set(port_id: PortId, set_id: u32) {
+    let mut table = PORT_TABLE.lock();
+    if (port_id as usize) < MAX_PORTS {
+        table.ports[port_id as usize].port_set_id = set_id;
     }
 }
 

@@ -35,6 +35,8 @@ pub const SYS_GRANT_PAGES: u64 = 18;
 pub const SYS_REVOKE: u64 = 19;
 pub const SYS_ASPACE_ID: u64 = 20;
 pub const SYS_GET_INITRAMFS_PORT: u64 = 21;
+pub const SYS_PORT_SET_RECV: u64 = 22;
+pub const SYS_NSRV_PORT: u64 = 23;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -139,6 +141,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_REVOKE => sys_revoke(a0, a1),
         SYS_ASPACE_ID => sys_aspace_id(),
         SYS_GET_INITRAMFS_PORT => sys_get_initramfs_port(),
+        SYS_PORT_SET_RECV => sys_port_set_recv(a0, frame),
+        SYS_NSRV_PORT => sys_nsrv_port(),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -430,6 +434,28 @@ fn sys_get_initramfs_port() -> u64 {
     use core::sync::atomic::Ordering;
     let port = crate::io::initramfs::USER_INITRAMFS_PORT.load(Ordering::Acquire);
     port as u64
+}
+
+fn sys_port_set_recv(set_id: u64, frame: &mut ExceptionFrame) -> u64 {
+    match crate::ipc::port_set::recv_blocking(set_id as u32) {
+        Some((port_id, msg)) => {
+            // Pack port_id into high 32 bits of status register.
+            set_reg(frame, 1, msg.tag);
+            set_reg(frame, 2, msg.data[0]);
+            set_reg(frame, 3, msg.data[1]);
+            set_reg(frame, 4, msg.data[2]);
+            set_reg(frame, 5, msg.data[3]);
+            set_reg(frame, 6, msg.data[4]);
+            set_reg(frame, 7, msg.data[5]);
+            (port_id as u64) << 32 // status=0, port_id in high bits
+        }
+        None => 1,
+    }
+}
+
+fn sys_nsrv_port() -> u64 {
+    use core::sync::atomic::Ordering;
+    crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire) as u64
 }
 
 /// Copy `dst.len()` bytes from user virtual address `user_va` into `dst`,

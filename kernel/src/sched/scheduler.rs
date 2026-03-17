@@ -718,12 +718,22 @@ static WAKEUP_FLAGS: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS
     [INIT; super::thread::MAX_THREADS]
 };
 
+/// Clear the wakeup flag for a thread. Must be called while holding the
+/// relevant lock (PORT_TABLE etc.) BEFORE adding the thread as a waiter,
+/// to prevent a lost-wakeup race where wake_thread() sets the flag between
+/// the lock drop and block_current's flag clear.
+pub fn clear_wakeup_flag(tid: ThreadId) {
+    WAKEUP_FLAGS[tid as usize].store(false, Ordering::Release);
+}
+
 /// Block the current thread with the given reason.
 /// The thread will be preempted on the next timer tick and will not
 /// be re-enqueued until `wake_thread()` is called.
+///
+/// IMPORTANT: The caller must call `clear_wakeup_flag(tid)` while holding
+/// the relevant lock, BEFORE adding itself as a waiter and dropping the lock.
 pub fn block_current(_reason: BlockReason) {
     let tid = current_thread_id();
-    WAKEUP_FLAGS[tid as usize].store(false, Ordering::Release);
     // Enable interrupts so the timer can preempt us while we spin.
     // This is critical when called from a syscall handler (SVC/ecall/int),
     // because hardware masks IRQs on exception entry.

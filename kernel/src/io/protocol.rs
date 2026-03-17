@@ -69,6 +69,22 @@ pub const IO_CLOSE: u64 = 0x500;
 ///   data[0] = error code
 pub const IO_ERROR: u64 = 0xF00;
 
+// --- I/O flags ---
+
+/// Grant-based I/O (as opposed to inline).
+pub const FLAG_GRANT: u64 = 1;
+
+// --- Name server tags ---
+
+/// Register a service: data[0..2] = packed name, data[3] = name_len | (reply_port << 32), data[4] = service_port
+pub const NS_REGISTER: u64 = 0x1000;
+pub const NS_REGISTER_OK: u64 = 0x1001;
+
+/// Lookup a service: data[0..2] = packed name, data[3] = name_len | (reply_port << 32)
+pub const NS_LOOKUP: u64 = 0x1100;
+/// Lookup result: data[0] = service_port (or u32::MAX if not found)
+pub const NS_LOOKUP_OK: u64 = 0x1101;
+
 // --- Error codes ---
 pub const ERR_NOT_FOUND: u64 = 1;
 pub const ERR_IO: u64 = 2;

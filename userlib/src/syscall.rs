@@ -20,6 +20,10 @@ const SYS_GRANT_PAGES: u64 = 18;
 const SYS_REVOKE: u64 = 19;
 const SYS_ASPACE_ID: u64 = 20;
 const SYS_GET_INITRAMFS_PORT: u64 = 21;
+const SYS_PORT_SET_CREATE: u64 = 5;
+const SYS_PORT_SET_ADD: u64 = 6;
+const SYS_PORT_SET_RECV: u64 = 22;
+const SYS_NSRV_PORT: u64 = 23;
 
 /// Print a single character to the debug console.
 pub fn debug_putchar(ch: u8) {
@@ -196,4 +200,74 @@ pub fn recv_msg(port: u32) -> Option<Message> {
         tag: r1,
         data: [r2, r3, r4, r5, r6, r7],
     })
+}
+
+/// Get the name server port.
+pub fn nsrv_port() -> u32 {
+    unsafe { arch::syscall0(SYS_NSRV_PORT) as u32 }
+}
+
+/// Create a port set.
+pub fn port_set_create() -> u64 {
+    unsafe { arch::syscall0(SYS_PORT_SET_CREATE) }
+}
+
+/// Add a port to a port set.
+pub fn port_set_add(set_id: u32, port_id: u32) -> bool {
+    unsafe { arch::syscall2(SYS_PORT_SET_ADD, set_id as u64, port_id as u64) == 0 }
+}
+
+/// Pack a name (up to 24 bytes) into 3 u64 words.
+pub fn pack_name(name: &[u8]) -> (u64, u64, u64) {
+    let mut words = [0u64; 3];
+    for (i, &b) in name.iter().enumerate().take(24) {
+        words[i / 8] |= (b as u64) << ((i % 8) * 8);
+    }
+    (words[0], words[1], words[2])
+}
+
+/// Lookup a service by name via the name server. Returns port ID or None.
+pub fn ns_lookup(name: &[u8]) -> Option<u32> {
+    let nsrv = nsrv_port();
+    if nsrv == u32::MAX { return None; }
+
+    let reply_port = port_create() as u32;
+    let (n0, n1, n2) = pack_name(name);
+    let d3 = (name.len() as u64) | ((reply_port as u64) << 32);
+
+    // NS_LOOKUP = 0x1100
+    send(nsrv, 0x1100, n0, n1, n2, d3);
+
+    let result = if let Some(reply) = recv_msg(reply_port) {
+        if reply.tag == 0x1101 {
+            let port = reply.data[0] as u32;
+            if port != u32::MAX { Some(port) } else { None }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // We don't destroy the reply port (no syscall for it in userlib yet).
+    result
+}
+
+/// Register a service with the name server.
+pub fn ns_register(name: &[u8], service_port: u32) -> bool {
+    let nsrv = nsrv_port();
+    if nsrv == u32::MAX { return false; }
+
+    let reply_port = port_create() as u32;
+    let (n0, n1, n2) = pack_name(name);
+    let d3 = (name.len() as u64) | ((reply_port as u64) << 32);
+
+    // NS_REGISTER = 0x1000
+    // data[0..1] = name, data[2] = service_port, data[3] = name_len | reply_port
+    send(nsrv, 0x1000, n0, n1, service_port as u64, d3);
+
+    if let Some(reply) = recv_msg(reply_port) {
+        reply.tag == 0x1001
+    } else {
+        false
+    }
 }
