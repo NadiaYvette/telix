@@ -188,7 +188,10 @@ pub fn handle_irq() {
         }
         // Virtio-mmio devices: INTID 48-79 (SPI 16-47, 32 devices on QEMU virt)
         48..=79 => {
-            crate::drivers::virtio_blk::irq_handler();
+            // Try userspace dispatch first; fall back to kernel driver.
+            if !crate::io::irq_dispatch::handle_irq(intid) {
+                crate::drivers::virtio_blk::irq_handler();
+            }
         }
         _ => {
             crate::println!("Unhandled IRQ: {}", intid);

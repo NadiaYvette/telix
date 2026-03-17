@@ -37,6 +37,9 @@ pub const SYS_ASPACE_ID: u64 = 20;
 pub const SYS_GET_INITRAMFS_PORT: u64 = 21;
 pub const SYS_PORT_SET_RECV: u64 = 22;
 pub const SYS_NSRV_PORT: u64 = 23;
+pub const SYS_MMAP_DEVICE: u64 = 24;
+pub const SYS_VIRT_TO_PHYS: u64 = 25;
+pub const SYS_IRQ_WAIT: u64 = 26;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -143,6 +146,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_GET_INITRAMFS_PORT => sys_get_initramfs_port(),
         SYS_PORT_SET_RECV => sys_port_set_recv(a0, frame),
         SYS_NSRV_PORT => sys_nsrv_port(),
+        SYS_MMAP_DEVICE => sys_mmap_device(a0, a1),
+        SYS_VIRT_TO_PHYS => sys_virt_to_phys(a0),
+        SYS_IRQ_WAIT => sys_irq_wait(a0, a1),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -462,6 +468,125 @@ fn sys_port_set_recv(set_id: u64, frame: &mut ExceptionFrame) -> u64 {
 fn sys_nsrv_port() -> u64 {
     use core::sync::atomic::Ordering;
     crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire) as u64
+}
+
+fn sys_mmap_device(phys_addr: u64, page_count: u64) -> u64 {
+    let phys = phys_addr as usize;
+    let pages = page_count as usize;
+    if pages == 0 || pages > 16 {
+        return u64::MAX;
+    }
+
+    // Page-align the physical address (PTEs require page-aligned PA).
+    let page_offset = phys & 0xFFF;
+    let phys_aligned = phys & !0xFFF;
+    // If the range spans an extra page due to offset, account for it.
+    let total_pages = if page_offset > 0 { pages + 1 } else { pages };
+
+    // Validate phys_addr is within approved device MMIO ranges.
+    let end = phys_aligned + total_pages * 4096;
+    let valid = {
+        #[cfg(target_arch = "aarch64")]
+        { phys_aligned >= 0x0a00_0000 && end <= 0x0a00_7000 }
+        #[cfg(target_arch = "riscv64")]
+        { phys_aligned >= 0x1000_1000 && end <= 0x1000_9000 }
+        #[cfg(target_arch = "x86_64")]
+        { let _ = end; false } // x86-64: no MMIO device mapping
+    };
+    if !valid {
+        return u64::MAX;
+    }
+
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    if aspace_id == 0 {
+        return u64::MAX;
+    }
+
+    // Allocate VA in userspace heap.
+    let va = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+        aspace.alloc_heap_va(total_pages)
+    });
+
+    let pt_root = crate::sched::scheduler::current_page_table_root();
+
+    // Device memory PTE flags (user-accessible).
+    #[cfg(target_arch = "aarch64")]
+    let pte_flags: u64 = {
+        // MAIR Attr1 = device-nGnRnE. User RW, no execute.
+        const PT_VALID: u64 = 1 << 0;
+        const PT_PAGE: u64 = 1 << 1;
+        const PT_AF: u64 = 1 << 10;
+        const PT_AP_RW_ALL: u64 = 1 << 6;
+        const PT_ATTR_IDX_1: u64 = 1 << 2;
+        const PT_UXN: u64 = 1 << 54;
+        const PT_PXN: u64 = 1 << 53;
+        PT_VALID | PT_PAGE | PT_AF | PT_AP_RW_ALL | PT_ATTR_IDX_1 | PT_UXN | PT_PXN
+    };
+    #[cfg(target_arch = "riscv64")]
+    let pte_flags: u64 = crate::arch::riscv64::mm::USER_RW_FLAGS;
+    #[cfg(target_arch = "x86_64")]
+    let pte_flags: u64 = 0; // unreachable
+
+    for i in 0..total_pages {
+        let page_va = va + i * 4096;
+        let page_pa = phys_aligned + i * 4096;
+
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::aarch64::mm::map_single_mmupage(pt_root, page_va, page_pa, pte_flags);
+        #[cfg(target_arch = "riscv64")]
+        crate::arch::riscv64::mm::map_single_mmupage(pt_root, page_va, page_pa, pte_flags);
+        #[cfg(target_arch = "x86_64")]
+        { let _ = (pt_root, page_va, page_pa, pte_flags); }
+    }
+
+    // Return VA + page_offset so caller gets pointer to exact MMIO base.
+    (va + page_offset) as u64
+}
+
+fn sys_virt_to_phys(va: u64) -> u64 {
+    let pt_root = crate::sched::scheduler::current_page_table_root();
+    if pt_root == 0 {
+        return u64::MAX; // kernel context
+    }
+
+    let pa = {
+        #[cfg(target_arch = "aarch64")]
+        { crate::arch::aarch64::mm::translate_va(pt_root, va as usize) }
+        #[cfg(target_arch = "riscv64")]
+        { crate::arch::riscv64::mm::translate_va(pt_root, va as usize) }
+        #[cfg(target_arch = "x86_64")]
+        { crate::arch::x86_64::mm::translate_va(pt_root, va as usize) }
+    };
+
+    match pa {
+        Some(pa) => pa as u64,
+        None => u64::MAX,
+    }
+}
+
+fn sys_irq_wait(irq_num: u64, mmio_base: u64) -> u64 {
+    let irq = irq_num as u32;
+
+    // Validate IRQ is in device range.
+    #[cfg(target_arch = "aarch64")]
+    let valid = irq >= 48 && irq <= 79;
+    #[cfg(target_arch = "riscv64")]
+    let valid = irq >= 1 && irq <= 8;
+    #[cfg(target_arch = "x86_64")]
+    let valid = { let _ = irq; false };
+
+    if !valid {
+        return u64::MAX;
+    }
+
+    // Registration call: register mmio_base, enable IRQ, return immediately.
+    if mmio_base != 0 {
+        crate::io::irq_dispatch::register(irq, mmio_base as usize);
+        return 0;
+    }
+
+    // Subsequent calls: block until IRQ fires.
+    crate::io::irq_dispatch::wait(irq)
 }
 
 /// Copy `dst.len()` bytes from user virtual address `user_va` into `dst`,

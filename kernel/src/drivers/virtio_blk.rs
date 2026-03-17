@@ -2,6 +2,10 @@
 //!
 //! Minimal polling-based driver using virtio-mmio transport.
 //! Single virtqueue, supports read and write block operations.
+//!
+//! Note: The VirtioBlk struct is no longer instantiated after Phase 9
+//! (block driver moved to userspace). The irq_handler() function is still
+//! used as a fallback in the kernel IRQ path.
 
 use super::virtio_mmio as mmio;
 use crate::mm::phys;

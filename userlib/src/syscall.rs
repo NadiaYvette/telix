@@ -20,6 +20,9 @@ const SYS_GRANT_PAGES: u64 = 18;
 const SYS_REVOKE: u64 = 19;
 const SYS_ASPACE_ID: u64 = 20;
 const SYS_GET_INITRAMFS_PORT: u64 = 21;
+const SYS_MMAP_DEVICE: u64 = 24;
+const SYS_VIRT_TO_PHYS: u64 = 25;
+const SYS_IRQ_WAIT: u64 = 26;
 const SYS_PORT_SET_CREATE: u64 = 5;
 const SYS_PORT_SET_ADD: u64 = 6;
 #[allow(dead_code)]
@@ -251,6 +254,24 @@ pub fn ns_lookup(name: &[u8]) -> Option<u32> {
     };
     // We don't destroy the reply port (no syscall for it in userlib yet).
     result
+}
+
+/// Map device MMIO registers into userspace. Returns VA or None.
+pub fn mmap_device(phys: usize, page_count: usize) -> Option<usize> {
+    let r = unsafe { arch::syscall2(SYS_MMAP_DEVICE, phys as u64, page_count as u64) };
+    if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+/// Translate a virtual address to physical. Returns PA or None.
+pub fn virt_to_phys(va: usize) -> Option<usize> {
+    let r = unsafe { arch::syscall1(SYS_VIRT_TO_PHYS, va as u64) };
+    if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+/// Wait for a device IRQ. On first call, pass mmio_base to register.
+/// Subsequent calls: pass mmio_base=0.
+pub fn irq_wait(irq: u32, mmio_base: usize) -> u64 {
+    unsafe { arch::syscall2(SYS_IRQ_WAIT, irq as u64, mmio_base as u64) }
 }
 
 /// Register a service with the name server.

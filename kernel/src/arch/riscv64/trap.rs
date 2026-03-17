@@ -160,7 +160,10 @@ fn handle_external_irq() {
     // via -device, it typically gets IRQ 1. We match any IRQ in 1..=8 to the virtio-blk handler.
     match irq {
         1..=8 => {
-            crate::drivers::virtio_blk::irq_handler();
+            // Try userspace dispatch first; fall back to kernel driver.
+            if !crate::io::irq_dispatch::handle_irq(irq) {
+                crate::drivers::virtio_blk::irq_handler();
+            }
         }
         _ => {
             crate::println!("PLIC: unhandled IRQ {}", irq);

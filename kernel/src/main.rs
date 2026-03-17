@@ -94,9 +94,38 @@ pub fn kmain() -> ! {
     }
 
     sched::spawn(io::initramfs::initramfs_server, 50, 20).expect("spawn initramfs");
-    // Virtio-blk server — AArch64 and RISC-V only (x86-64 needs PCI).
+    // Virtio-blk driver — spawn as userspace process on AArch64 and RISC-V.
+    // Pack mmio_base | (irq << 48) into arg0 for the driver.
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    sched::spawn(io::blk_server::blk_server, 50, 20).expect("spawn blk server");
+    {
+        if let Some(base) = drivers::virtio_mmio::find_device(drivers::virtio_mmio::DEVICE_BLK) {
+            #[cfg(target_arch = "aarch64")]
+            let irq = {
+                let dev_index = (base - 0x0a00_0000) / 0x200;
+                48 + dev_index as u64 // GIC SPI INTID
+            };
+            #[cfg(target_arch = "riscv64")]
+            let irq = match base {
+                0x1000_8000 => 8u64,
+                0x1000_7000 => 7,
+                0x1000_6000 => 6,
+                0x1000_5000 => 5,
+                0x1000_4000 => 4,
+                0x1000_3000 => 3,
+                0x1000_2000 => 2,
+                0x1000_1000 => 1,
+                _ => 1,
+            };
+            let arg0 = (base as u64) | (irq << 48);
+            println!("  virtio-blk at {:#x}, irq {}, spawning blk_srv with arg0={:#x}", base, irq, arg0);
+            match sched::spawn_user(b"blk_srv", 50, 20, arg0) {
+                Some(tid) => println!("  blk_srv spawned (thread {})", tid),
+                None => println!("  WARNING: blk_srv not found (ok if not yet built)"),
+            }
+        } else {
+            println!("  no virtio-blk device found, skipping blk_srv");
+        }
+    }
 
     // Phase 4: Spawning init process...
     println!("Phase 4: Spawning init process...");

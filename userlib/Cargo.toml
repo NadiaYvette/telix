@@ -26,3 +26,7 @@ path = "bin/initramfs_srv.rs"
 [[bin]]
 name = "ramdisk_srv"
 path = "bin/ramdisk_srv.rs"
+
+[[bin]]
+name = "blk_srv"
+path = "bin/blk_srv.rs"
