@@ -143,6 +143,26 @@ fn align4(n: usize) -> usize {
     (n + 3) & !3
 }
 
+/// Lazily-initialized file table for kernel-internal lookups.
+/// The server thread has its own local copy; this is for the ELF loader etc.
+static PARSED: crate::sync::SpinLock<Option<Initramfs>> = crate::sync::SpinLock::new(None);
+
+/// Look up a file in the initramfs by name.
+/// Returns a static slice into the embedded CPIO data, or None if not found.
+/// Safe to call from any kernel context (no IPC needed).
+pub fn lookup_file(name: &[u8]) -> Option<&'static [u8]> {
+    let mut guard = PARSED.lock();
+    if guard.is_none() {
+        let mut fs = Initramfs::new();
+        fs.parse(INITRAMFS);
+        *guard = Some(fs);
+    }
+    let fs = guard.as_ref().unwrap();
+    let idx = fs.find(name)?;
+    let f = &fs.files[idx];
+    Some(&INITRAMFS[f.data_offset..f.data_offset + f.data_len])
+}
+
 /// The initramfs server thread entry point.
 pub fn initramfs_server() -> ! {
     // Parse the embedded archive.

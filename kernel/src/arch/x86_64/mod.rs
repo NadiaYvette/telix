@@ -39,6 +39,13 @@ pub fn kernel_end_addr() -> usize {
     boot::kernel_end_addr()
 }
 
+/// Set up page tables and enable the MMU.
+pub fn enable_mmu() {
+    let pml4 = mm::setup_tables().expect("page tables");
+    mm::enable_mmu(pml4);
+    crate::println!("  MMU enabled (PML4 at {:#x})", pml4);
+}
+
 /// Enable interrupts (STI).
 pub fn enable_interrupts() {
     timer::enable_interrupts();

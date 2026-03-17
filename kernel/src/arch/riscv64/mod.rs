@@ -28,6 +28,13 @@ pub fn kernel_end_addr() -> usize {
     boot::kernel_end_addr()
 }
 
+/// Set up page tables and enable the MMU.
+pub fn enable_mmu() {
+    let root = mm::setup_tables().expect("page tables");
+    mm::enable_mmu(root);
+    crate::println!("  MMU enabled (root at {:#x})", root);
+}
+
 /// Enable interrupts (set sstatus.SIE).
 pub fn enable_interrupts() {
     trap::enable_interrupts();

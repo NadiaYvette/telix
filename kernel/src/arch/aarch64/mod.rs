@@ -31,6 +31,14 @@ pub fn kernel_end_addr() -> usize {
     boot::kernel_end_addr()
 }
 
+/// Set up page tables and enable the MMU.
+/// Must be called after phys allocator init, before secondary CPUs.
+pub fn enable_mmu() {
+    let l0 = mm::setup_tables().expect("page tables");
+    mm::enable_mmu(l0);
+    crate::println!("  MMU enabled (L0 at {:#x})", l0);
+}
+
 /// Enable interrupts (unmask IRQ).
 pub fn enable_interrupts() {
     timer::enable_interrupts();

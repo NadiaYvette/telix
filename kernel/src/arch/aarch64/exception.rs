@@ -142,8 +142,9 @@ fn handle_abort_el0(frame: &ExceptionFrame) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn exception_irq_el0(_frame: &ExceptionFrame) {
+extern "C" fn exception_irq_el0(frame_sp: u64) -> u64 {
     crate::arch::aarch64::irq::handle_irq();
+    crate::sched::tick(frame_sp)
 }
 
 #[unsafe(no_mangle)]

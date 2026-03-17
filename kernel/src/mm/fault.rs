@@ -119,41 +119,36 @@ pub fn handle_page_fault(
 /// Get architecture-specific PTE flags for a VMA.
 fn pte_flags_for_vma(vma: &super::vma::Vma) -> u64 {
     use super::vma::VmaProt;
-    match vma.prot {
-        VmaProt::ReadOnly | VmaProt::ReadExec => user_rx_flags(),
-        VmaProt::ReadWrite | VmaProt::ReadWriteExec => user_rwx_flags(),
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::arch::aarch64::mm;
+        match vma.prot {
+            VmaProt::ReadOnly => mm::USER_RO_FLAGS,
+            VmaProt::ReadWrite => mm::USER_RW_FLAGS,
+            VmaProt::ReadExec => mm::USER_RWX_FLAGS, // RX needs execute (no UXN)
+            VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
+        }
     }
-}
-
-// Architecture-specific flag helpers.
-#[cfg(target_arch = "aarch64")]
-fn user_rwx_flags() -> u64 {
-    crate::arch::aarch64::mm::USER_RWX_FLAGS
-}
-
-#[cfg(target_arch = "aarch64")]
-fn user_rx_flags() -> u64 {
-    crate::arch::aarch64::mm::USER_RW_FLAGS // read-only uses RW flags with UXN
-}
-
-#[cfg(target_arch = "riscv64")]
-fn user_rwx_flags() -> u64 {
-    crate::arch::riscv64::mm::USER_RWX_FLAGS
-}
-
-#[cfg(target_arch = "riscv64")]
-fn user_rx_flags() -> u64 {
-    crate::arch::riscv64::mm::USER_RW_FLAGS
-}
-
-#[cfg(target_arch = "x86_64")]
-fn user_rwx_flags() -> u64 {
-    crate::arch::x86_64::mm::USER_RWX_FLAGS
-}
-
-#[cfg(target_arch = "x86_64")]
-fn user_rx_flags() -> u64 {
-    crate::arch::x86_64::mm::USER_RW_FLAGS
+    #[cfg(target_arch = "riscv64")]
+    {
+        use crate::arch::riscv64::mm;
+        match vma.prot {
+            VmaProt::ReadOnly => mm::USER_RO_FLAGS,
+            VmaProt::ReadWrite => mm::USER_RW_FLAGS,
+            VmaProt::ReadExec => mm::USER_RWX_FLAGS,
+            VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::arch::x86_64::mm;
+        match vma.prot {
+            VmaProt::ReadOnly => mm::USER_RO_FLAGS,
+            VmaProt::ReadWrite => mm::USER_RW_FLAGS,
+            VmaProt::ReadExec => mm::USER_RWX_FLAGS,
+            VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
+        }
+    }
 }
 
 /// Try to promote a contiguous group of PTEs (AArch64 only).

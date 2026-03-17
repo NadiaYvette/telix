@@ -161,8 +161,9 @@ vec_sync_el0:
 
 vec_irq_el0:
     save_regs
-    mov     x0, sp
-    bl      exception_irq_el0
+    mov     x0, sp              // Pass current SP (pointing to exception frame) as arg
+    bl      exception_irq_el0   // Returns new SP in x0 (may be different thread's stack)
+    mov     sp, x0              // Switch to the (potentially new) stack
     restore_regs
     eret
 

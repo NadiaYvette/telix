@@ -222,6 +222,38 @@ fn walk_table(table: *mut u64, index: usize) -> Option<*mut u64> {
     }
 }
 
+/// Translate a user VA to a physical address by walking the Sv39 page table.
+/// Returns None if the page is not mapped.
+pub fn translate_va(root: usize, va: usize) -> Option<usize> {
+    let root_table = root as *mut u64;
+    let vpn2 = (va >> 30) & 0x1FF;
+    let vpn1 = (va >> 21) & 0x1FF;
+    let vpn0 = (va >> 12) & 0x1FF;
+    let l1 = walk_table(root_table, vpn2)?;
+    let l2 = walk_table(l1, vpn1)?;
+    let entry = unsafe { *l2.add(vpn0) };
+    if entry & PTE_V == 0 {
+        return None;
+    }
+    let pa = ((entry >> 10) << 12) as usize;
+    Some(pa | (va & 0xFFF))
+}
+
+/// Switch the page table to a different Sv39 root.
+/// Used on context switch between tasks with different address spaces.
+pub fn switch_page_table(root: usize) {
+    let ppn = (root >> 12) as u64;
+    let satp = (8u64 << 60) | ppn;
+    unsafe {
+        core::arch::asm!(
+            "sfence.vma",
+            "csrw satp, {satp}",
+            "sfence.vma",
+            satp = in(reg) satp,
+        );
+    }
+}
+
 /// Enable Sv39 paging by writing the satp CSR.
 pub fn enable_mmu(root: usize) {
     let ppn = (root >> 12) as u64;

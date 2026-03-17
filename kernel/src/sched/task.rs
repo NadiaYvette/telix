@@ -15,6 +15,9 @@ pub struct Task {
     pub active: bool,
     /// Address space ID (0 = kernel, uses identity mapping).
     pub aspace_id: u32,
+    /// Physical address of the page table root for this task.
+    /// 0 = kernel task (uses boot page table, no switching needed).
+    pub page_table_root: usize,
 }
 
 impl Task {
@@ -23,6 +26,7 @@ impl Task {
             id: 0,
             active: false,
             aspace_id: 0,
+            page_table_root: 0,
         }
     }
 }

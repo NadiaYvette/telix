@@ -1,0 +1,16 @@
+[package]
+name = "telix-userlib"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "userlib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "init"
+path = "bin/init.rs"
+
+[[bin]]
+name = "hello"
+path = "bin/hello.rs"

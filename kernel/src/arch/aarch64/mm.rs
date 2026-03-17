@@ -4,6 +4,12 @@
 //! Both kernel (identity-mapped) and user mappings go through TTBR0,
 //! since the kernel runs at 0x4008_0000 (low VA space).
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Kernel page table root (L0), set by BSP after enable_mmu.
+/// Used by secondary CPUs to enable their MMU with the same identity mapping.
+static KERNEL_PT_ROOT: AtomicUsize = AtomicUsize::new(0);
+
 /// Page table entry flags.
 const PT_VALID: u64 = 1 << 0;
 const PT_TABLE: u64 = 1 << 1;     // Non-leaf: next-level table
@@ -266,6 +272,38 @@ fn walk_table(table: *mut u64, index: usize) -> Option<*mut u64> {
     }
 }
 
+/// Translate a user VA to a physical address by walking the page table.
+/// Returns None if the page is not mapped.
+pub fn translate_va(l0: usize, va: usize) -> Option<usize> {
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1 = walk_table(l0_table, l0_idx)?;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2 = walk_table(l1, l1_idx)?;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3 = walk_table(l2, l2_idx)?;
+    let l3_idx = (va >> 12) & 0x1FF;
+    let entry = unsafe { *l3.add(l3_idx) };
+    if entry & PT_VALID == 0 {
+        return None;
+    }
+    let pa = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+    Some(pa | (va & 0xFFF))
+}
+
+/// Read the raw L3 PTE for a VA. Returns 0 if any level is missing.
+pub fn read_pte(l0: usize, va: usize) -> u64 {
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1 = match walk_table(l0_table, l0_idx) { Some(t) => t, None => return 0 };
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2 = match walk_table(l1, l1_idx) { Some(t) => t, None => return 0 };
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3 = match walk_table(l2, l2_idx) { Some(t) => t, None => return 0 };
+    let l3_idx = (va >> 12) & 0x1FF;
+    unsafe { *l3.add(l3_idx) }
+}
+
 /// Number of contiguous L3 PTEs in a contiguous group (16 × 4K = 64K).
 const CONTIGUOUS_GROUP_SIZE: usize = 16;
 
@@ -339,6 +377,21 @@ pub fn try_contiguous_promotion(l0: usize, va: usize, group_count: usize) -> boo
     true
 }
 
+/// Switch the user page table to a different L0 root.
+/// Used on context switch between tasks with different address spaces.
+pub fn switch_page_table(root: usize) {
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {root}",
+            "isb",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            root = in(reg) root as u64,
+        );
+    }
+}
+
 /// Enable the MMU with the given L0 page table in TTBR0.
 pub fn enable_mmu(l0: usize) {
     unsafe {
@@ -372,4 +425,13 @@ pub fn enable_mmu(l0: usize) {
         core::arch::asm!("msr sctlr_el1, {}", in(reg) sctlr);
         core::arch::asm!("isb");
     }
+    KERNEL_PT_ROOT.store(l0, Ordering::Release);
+}
+
+/// Enable MMU on a secondary CPU using the BSP's kernel page table.
+/// Must be called early in secondary CPU init, before any non-identity-mapped access.
+pub fn enable_mmu_secondary() {
+    let l0 = KERNEL_PT_ROOT.load(Ordering::Acquire);
+    assert!(l0 != 0, "BSP must enable MMU before secondaries");
+    enable_mmu(l0);
 }

@@ -79,6 +79,9 @@ extern "C" fn secondary_rust_entry(cpu_id: u64) {
         core::arch::asm!("msr tpidr_el1, {}", in(reg) cpu_id);
     }
 
+    // Enable MMU with the BSP's kernel page table.
+    super::mm::enable_mmu_secondary();
+
     // Install exception vectors.
     unsafe {
         core::arch::asm!(

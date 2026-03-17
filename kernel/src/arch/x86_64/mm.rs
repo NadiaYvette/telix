@@ -215,6 +215,61 @@ fn walk_table(table: *mut u64, index: usize) -> Option<*mut u64> {
     }
 }
 
+/// Translate a user VA to a physical address by walking the x86-64 page table.
+/// Returns None if the page is not mapped.
+pub fn translate_va(pml4: usize, va: usize) -> Option<usize> {
+    let pml4_table = pml4 as *mut u64;
+    let pml4_idx = (va >> 39) & 0x1FF;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pd_idx = (va >> 21) & 0x1FF;
+    let pt_idx = (va >> 12) & 0x1FF;
+
+    let pdpt = walk_table(pml4_table, pml4_idx)?;
+    let pd = walk_table(pdpt, pdpt_idx)?;
+    let pt = walk_table(pd, pd_idx)?;
+    let entry = unsafe { *pt.add(pt_idx) };
+    if entry & PTE_P == 0 {
+        return None;
+    }
+    let pa = (entry & 0x000F_FFFF_FFFF_F000) as usize;
+    Some(pa | (va & 0xFFF))
+}
+
+/// Create a new PML4 for a user process, copying the kernel's identity-mapped
+/// entries from the boot page table. Returns the physical address of the new PML4.
+pub fn create_user_page_table() -> Option<usize> {
+    // Read boot PML4 from CR3.
+    let boot_pml4: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) boot_pml4); }
+    let boot_pml4_addr = (boot_pml4 & !0xFFF) as usize;
+
+    // Allocate a fresh PML4.
+    let new_pml4 = alloc_table()?;
+
+    // Copy the first 4 entries (covering 0-2 TiB) which includes the kernel
+    // identity-mapped region (0-4 GiB at PML4[0]).
+    unsafe {
+        let src = boot_pml4_addr as *const u64;
+        let dst = new_pml4 as *mut u64;
+        for i in 0..4 {
+            *dst.add(i) = *src.add(i);
+        }
+    }
+
+    Some(new_pml4)
+}
+
+/// Switch the page table to a different PML4.
+/// Used on context switch between tasks with different address spaces.
+pub fn switch_page_table(root: usize) {
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {root}",
+            root = in(reg) root as u64,
+        );
+    }
+}
+
 /// Reload CR3 to flush the TLB after page table changes.
 pub fn enable_mmu(pml4: usize) {
     unsafe {

@@ -5,3 +5,7 @@ version = 4
 [[package]]
 name = "telix-kernel"
 version = "0.1.0"
+
+[[package]]
+name = "telix-userlib"
+version = "0.1.0"

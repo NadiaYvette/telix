@@ -25,6 +25,9 @@ pub const SYS_YIELD: u64 = 7;
 pub const SYS_THREAD_ID: u64 = 8;
 pub const SYS_SEND_NB: u64 = 9;
 pub const SYS_RECV_NB: u64 = 10;
+pub const SYS_EXIT: u64 = 11;
+pub const SYS_SPAWN: u64 = 12;
+pub const SYS_DEBUG_PUTS: u64 = 14;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -114,6 +117,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_THREAD_ID => sys_thread_id(),
         SYS_SEND_NB => sys_send_nb(a0, a1, [a2, a3, a4, a5, 0, 0]),
         SYS_RECV_NB => sys_recv_nb(a0, frame),
+        SYS_EXIT => sys_exit(a0),
+        SYS_SPAWN => sys_spawn(a0, a1, a2),
+        SYS_DEBUG_PUTS => sys_debug_puts(a0, a1),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -210,4 +216,85 @@ fn sys_yield() -> u64 {
 
 fn sys_thread_id() -> u64 {
     crate::sched::scheduler::current_thread_id() as u64
+}
+
+fn sys_exit(_code: u64) -> u64 {
+    // For now, just loop forever. Full task teardown (destroying aspace,
+    // deactivating task when last thread exits) will come later.
+    // Mark thread dead by looping — the scheduler won't pick it up again
+    // since it never returns to the run queue.
+    loop { core::hint::spin_loop(); }
+}
+
+fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64) -> u64 {
+    let pt_root = crate::sched::scheduler::current_page_table_root();
+    let len = (name_len as usize).min(64);
+
+    // Copy the filename from user memory.
+    let mut buf = [0u8; 64];
+    if !copy_from_user(pt_root, name_ptr as usize, &mut buf[..len]) {
+        return u64::MAX;
+    }
+
+    let name = &buf[..len];
+    match crate::sched::scheduler::spawn_user(name, priority as u8, 20) {
+        Some(tid) => tid as u64,
+        None => u64::MAX,
+    }
+}
+
+fn sys_debug_puts(buf_ptr: u64, buf_len: u64) -> u64 {
+    let pt_root = crate::sched::scheduler::current_page_table_root();
+    let len = (buf_len as usize).min(256);
+    let mut buf = [0u8; 256];
+    if !copy_from_user(pt_root, buf_ptr as usize, &mut buf[..len]) {
+        return u64::MAX;
+    }
+    for &ch in &buf[..len] {
+        crate::arch::platform::serial::putc(ch);
+    }
+    0
+}
+
+/// Copy `dst.len()` bytes from user virtual address `user_va` into `dst`,
+/// using the page table at `pt_root` to translate addresses.
+fn copy_from_user(pt_root: usize, user_va: usize, dst: &mut [u8]) -> bool {
+    if pt_root == 0 {
+        // Kernel thread — direct access.
+        unsafe {
+            core::ptr::copy_nonoverlapping(user_va as *const u8, dst.as_mut_ptr(), dst.len());
+        }
+        return true;
+    }
+
+    let mut offset = 0;
+    while offset < dst.len() {
+        let va = user_va + offset;
+        let pa = {
+            #[cfg(target_arch = "aarch64")]
+            { crate::arch::aarch64::mm::translate_va(pt_root, va) }
+            #[cfg(target_arch = "riscv64")]
+            { crate::arch::riscv64::mm::translate_va(pt_root, va) }
+            #[cfg(target_arch = "x86_64")]
+            { crate::arch::x86_64::mm::translate_va(pt_root, va) }
+        };
+
+        let pa = match pa {
+            Some(pa) => pa,
+            None => return false,
+        };
+
+        // Copy up to the end of this 4K page.
+        let page_remaining = 4096 - (pa & 0xFFF);
+        let to_copy = page_remaining.min(dst.len() - offset);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                pa as *const u8,
+                dst.as_mut_ptr().add(offset),
+                to_copy,
+            );
+        }
+        offset += to_copy;
+    }
+    true
 }

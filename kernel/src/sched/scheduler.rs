@@ -10,9 +10,10 @@
 //! spinlock. Each CPU tracks its own current/idle thread via smp::PerCpuData.
 
 use super::thread::{Thread, ThreadId, ThreadState, BlockReason, MAX_THREADS, EXCEPTION_FRAME_SIZE};
-use super::task::{Task, MAX_TASKS};
+use super::task::{Task, TaskId, MAX_TASKS};
 use super::smp;
 use crate::sync::SpinLock;
+use crate::mm::page::{PAGE_SIZE, MMUPAGE_SIZE};
 use core::sync::atomic::Ordering;
 
 const NUM_PRIORITIES: usize = 256;
@@ -191,6 +192,182 @@ impl Scheduler {
         Some(id)
     }
 
+    /// Create a user-mode thread in a new task, loading an ELF binary from initramfs.
+    fn create_user_thread(
+        &mut self,
+        elf_name: &[u8],
+        priority: u8,
+        quantum: u32,
+    ) -> Option<ThreadId> {
+        // Look up the ELF binary in the initramfs.
+        let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
+
+        // Allocate a new task.
+        let task_id = self.next_task_id;
+        if task_id as usize >= MAX_TASKS {
+            return None;
+        }
+        self.next_task_id += 1;
+
+        // Create a page table with kernel identity mapping.
+        #[cfg(target_arch = "aarch64")]
+        let pt_root = crate::arch::aarch64::mm::setup_tables()?;
+        #[cfg(target_arch = "riscv64")]
+        let pt_root = crate::arch::riscv64::mm::setup_tables()?;
+        #[cfg(target_arch = "x86_64")]
+        let pt_root = crate::arch::x86_64::mm::create_user_page_table()?;
+
+        // Create address space.
+        let aspace_id = crate::mm::aspace::create(pt_root)?;
+
+        // Set up the task.
+        let task = &mut self.tasks[task_id as usize];
+        task.id = task_id;
+        task.active = true;
+        task.aspace_id = aspace_id;
+        task.page_table_root = pt_root;
+
+        // Load ELF segments into the address space.
+        let entry = match crate::loader::elf::load_elf(elf_data, aspace_id, pt_root) {
+            Ok(e) => e,
+            Err(_) => return None,
+        };
+        // Flush instruction cache: code was written via identity-mapped VA
+        // but will be executed via user VA.
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
+        }
+
+        // Map user stack.
+        #[cfg(target_arch = "aarch64")]
+        const USER_STACK_TOP: usize = 0x7FFF_F000_0000;
+        #[cfg(target_arch = "riscv64")]
+        const USER_STACK_TOP: usize = 0x3FFF_F000_0000;
+        #[cfg(target_arch = "x86_64")]
+        const USER_STACK_TOP: usize = 0x7FFF_FFFF_0000;
+
+        let stack_pages = 1; // One allocation page for user stack.
+        let stack_va = USER_STACK_TOP - stack_pages * PAGE_SIZE;
+
+        // Map the user stack in the address space.
+        let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+            let vma = aspace.map_anon(stack_va, stack_pages, crate::mm::vma::VmaProt::ReadWrite)
+                .ok_or(())?;
+            Ok::<_, ()>(vma.object_id)
+        }).ok()?;
+
+        // Eagerly allocate and map stack pages.
+        let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
+        for page_idx in 0..stack_pages {
+            let page_va = stack_va + page_idx * PAGE_SIZE;
+
+            let pa = crate::mm::object::with_object(obj_id, |obj| {
+                obj.ensure_page(page_idx)
+            })?;
+            let pa_usize = pa.as_usize();
+
+            // Zero the page.
+            unsafe {
+                core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
+            }
+
+            // Map each MMU page.
+            #[cfg(target_arch = "aarch64")]
+            let pte_flags = crate::arch::aarch64::mm::USER_RW_FLAGS;
+            #[cfg(target_arch = "riscv64")]
+            let pte_flags = crate::arch::riscv64::mm::USER_RW_FLAGS;
+            #[cfg(target_arch = "x86_64")]
+            let pte_flags = crate::arch::x86_64::mm::USER_RW_FLAGS;
+
+            for mmu_idx in 0..mmu_count {
+                let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
+                let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
+
+                #[cfg(target_arch = "aarch64")]
+                crate::arch::aarch64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+                #[cfg(target_arch = "riscv64")]
+                crate::arch::riscv64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+                #[cfg(target_arch = "x86_64")]
+                crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+            }
+
+            // Mark installed in VMA.
+            crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+                if let Some(vma) = aspace.find_vma_mut(page_va) {
+                    for mmu_idx in 0..mmu_count {
+                        let idx = vma.mmu_index_of(page_va + mmu_idx * MMUPAGE_SIZE);
+                        vma.set_installed(idx);
+                        vma.set_zeroed(idx);
+                    }
+                }
+            });
+        }
+
+        // Allocate kernel stack for this thread.
+        let kstack_page = crate::mm::phys::alloc_page()?;
+        let kstack_base = kstack_page.as_usize();
+        let kstack_top = kstack_base + PAGE_SIZE;
+
+        // Build a fake exception frame for user-mode entry.
+        let frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
+        let frame = frame_sp as *mut u64;
+        unsafe {
+            for i in 0..(EXCEPTION_FRAME_SIZE / 8) {
+                *frame.add(i) = 0;
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                // ELR_EL1 = user entry point.
+                *frame.add(32) = entry as u64;
+                // SPSR_EL1 = EL0t (0x0), IRQs enabled.
+                *frame.add(33) = 0x0;
+                // SP_EL0 (frame offset 31) = user stack top.
+                *frame.add(31) = USER_STACK_TOP as u64;
+            }
+
+            #[cfg(target_arch = "riscv64")]
+            {
+                // sepc = user entry point.
+                *frame.add(31) = entry as u64;
+                // sstatus: SPP=0 (U-mode), SPIE=1 (enable IRQs on sret).
+                *frame.add(32) = 1 << 5; // SPIE only, SPP=0
+                // x2/sp (frame index 1) = user stack top.
+                *frame.add(1) = USER_STACK_TOP as u64;
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                *frame.add(17) = entry as u64;                            // RIP
+                *frame.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3; // CS = user code | RPL=3
+                *frame.add(19) = 0x200;                                    // RFLAGS = IF
+                *frame.add(20) = USER_STACK_TOP as u64;                    // RSP = user stack
+                *frame.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3; // SS = user data | RPL=3
+            }
+        }
+
+        // Allocate thread.
+        let id = self.next_thread_id;
+        if id as usize >= MAX_THREADS {
+            return None;
+        }
+        self.next_thread_id += 1;
+
+        let thread = &mut self.threads[id as usize];
+        thread.id = id;
+        thread.state = ThreadState::Ready;
+        thread.task_id = task_id;
+        thread.priority = priority;
+        thread.quantum = quantum;
+        thread.default_quantum = quantum;
+        thread.saved_sp = frame_sp as u64;
+        thread.stack_base = kstack_base;
+
+        self.run_queues[priority as usize].push(id);
+        Some(id)
+    }
+
     fn pick_next(&mut self, idle_id: ThreadId) -> ThreadId {
         for prio in 0..NUM_PRIORITIES {
             if let Some(id) = self.run_queues[prio].pop() {
@@ -249,6 +426,28 @@ impl Scheduler {
             self.run_queues[prev_prio as usize].push(prev_id);
         }
 
+        // Switch page tables if crossing task boundaries.
+        let prev_task = self.threads[prev_id as usize].task_id;
+        let next_task = self.threads[next_id as usize].task_id;
+        if prev_task != next_task {
+            let next_root = self.tasks[next_task as usize].page_table_root;
+            if next_root != 0 {
+                #[cfg(target_arch = "aarch64")]
+                crate::arch::aarch64::mm::switch_page_table(next_root);
+                #[cfg(target_arch = "riscv64")]
+                crate::arch::riscv64::mm::switch_page_table(next_root);
+                #[cfg(target_arch = "x86_64")]
+                crate::arch::x86_64::mm::switch_page_table(next_root);
+            }
+        }
+
+        // On x86-64, update TSS RSP0 for ring 3→0 transitions.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let next_kstack_top = self.threads[next_id as usize].stack_base + PAGE_SIZE;
+            crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
+        }
+
         // Load next thread's SP.
         self.threads[next_id as usize].state = ThreadState::Running;
         pcpu.current_thread.store(next_id, Ordering::Relaxed);
@@ -280,6 +479,29 @@ pub fn init_ap(cpu: u32) {
 
 pub fn spawn(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
     SCHEDULER.lock().create_thread(entry, priority, quantum)
+}
+
+/// Spawn a new user-mode process from an ELF binary in the initramfs.
+/// Creates a new task with its own address space.
+pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32) -> Option<ThreadId> {
+    SCHEDULER.lock().create_user_thread(elf_name, priority, quantum)
+}
+
+/// Get the task ID of the current thread.
+#[allow(dead_code)]
+pub fn current_task_id() -> TaskId {
+    let tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let sched = SCHEDULER.lock();
+    sched.threads[tid as usize].task_id
+}
+
+/// Get the page table root of the current thread's task.
+#[allow(dead_code)]
+pub fn current_page_table_root() -> usize {
+    let tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let sched = SCHEDULER.lock();
+    let task_id = sched.threads[tid as usize].task_id;
+    sched.tasks[task_id as usize].page_table_root
 }
 
 /// Called from the timer IRQ handler. Takes the current kernel SP

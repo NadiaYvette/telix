@@ -1,0 +1,60 @@
+#!/bin/bash
+# Build userspace ELF binaries for Telix and pack them into initramfs.
+# Usage: tools/build-user.sh [aarch64|riscv64|x86_64]
+set -e
+
+ARCH="${1:-aarch64}"
+ROOTDIR="$(cd "$(dirname "$0")/.." && pwd)"
+USERLIB="$ROOTDIR/userlib"
+INITRAMFS_DIR="$ROOTDIR/initramfs"
+RUSTC="${RUSTC:-/home/nyc/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc}"
+CARGO="${CARGO:-/home/nyc/.cargo/bin/cargo}"
+
+case "$ARCH" in
+    aarch64)
+        TARGET="aarch64-unknown-none"
+        LINKER="$USERLIB/link-aarch64.ld"
+        ;;
+    riscv64)
+        TARGET="riscv64gc-unknown-none-elf"
+        LINKER="$USERLIB/link-riscv64.ld"
+        ;;
+    x86_64)
+        TARGET="x86_64-unknown-none"
+        LINKER="$USERLIB/link-x86_64.ld"
+        ;;
+    *)
+        echo "Unknown arch: $ARCH (expected aarch64, riscv64, x86_64)"
+        exit 1
+        ;;
+esac
+
+echo "Building userspace binaries for $ARCH ($TARGET)..."
+
+# Build with user linker script, overriding workspace rustflags.
+RUSTFLAGS="-C link-arg=-T$LINKER" \
+    RUSTC="$RUSTC" "$CARGO" build \
+    --target "$TARGET" \
+    -p telix-userlib \
+    --release \
+    --config "unstable.build-std=[\"core\"]" \
+    --config "unstable.build-std-features=[\"compiler-builtins-mem\"]"
+
+BINDIR="$ROOTDIR/target/$TARGET/release"
+
+# Copy ELF binaries to initramfs directory.
+for bin in init hello; do
+    if [ -f "$BINDIR/$bin" ]; then
+        cp "$BINDIR/$bin" "$INITRAMFS_DIR/$bin"
+        SIZE=$(wc -c < "$INITRAMFS_DIR/$bin")
+        echo "  $bin: $SIZE bytes"
+    else
+        echo "  WARNING: $bin not found in $BINDIR"
+    fi
+done
+
+# Rebuild the CPIO archive.
+echo "Packing initramfs..."
+"$ROOTDIR/tools/make-initramfs.sh"
+
+echo "Done! User binaries packed into initramfs."
