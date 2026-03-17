@@ -8,7 +8,7 @@
 
 use super::aspace::{self, ASpaceId};
 use super::object;
-use super::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT};
+use super::page::MMUPAGE_SIZE;
 use super::stats;
 use core::sync::atomic::Ordering;
 
@@ -67,18 +67,17 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
                     stats::PTES_REMOVED.fetch_add(1, Ordering::Relaxed);
 
                     // Check if all MMU pages in this allocation page are now unmapped.
-                    let alloc_page_start = mmu_idx - (mmu_idx % PAGE_MMUCOUNT);
+                    let (ap_start, ap_end) = vma.alloc_page_mmu_range(mmu_idx);
                     let mut all_unmapped = true;
-                    for i in 0..PAGE_MMUCOUNT {
-                        if vma.is_installed(alloc_page_start + i) {
+                    for i in ap_start..ap_end {
+                        if vma.is_installed(i) {
                             all_unmapped = false;
                             break;
                         }
                     }
 
                     if all_unmapped {
-                        let page_idx = alloc_page_start / PAGE_MMUCOUNT;
-                        let obj_page_idx = vma.object_offset as usize + page_idx;
+                        let obj_page_idx = vma.obj_page_index(mmu_idx);
                         let obj_id = vma.object_id;
                         object::with_object(obj_id, |obj| {
                             if let Some(pa) = obj.get_page(obj_page_idx) {
@@ -86,8 +85,8 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
                                 obj.phys_pages[obj_page_idx] = 0;
                             }
                         });
-                        for i in 0..PAGE_MMUCOUNT {
-                            vma.clear_zeroed(alloc_page_start + i);
+                        for i in ap_start..ap_end {
+                            vma.clear_zeroed(i);
                         }
                         result.pages_freed += 1;
                         stats::PAGES_RECLAIMED.fetch_add(1, Ordering::Relaxed);

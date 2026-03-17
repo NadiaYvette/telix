@@ -36,18 +36,20 @@ pub fn grant_pages(
     readonly: bool,
 ) -> Result<(), GrantError> {
     // Step 1: Look up the source VMA and collect its object ID + offset + phys pages.
-    let (obj_id, obj_offset, phys_pages) = aspace::with_aspace(src_aspace, |aspace| {
+    let (obj_id, obj_mmu_offset, phys_pages) = aspace::with_aspace(src_aspace, |aspace| {
         let vma = aspace.find_vma(src_va).ok_or(GrantError::NoSourceVma)?;
-        let page_idx_start = vma.page_index_of(src_va);
+        let mmu_idx_start = vma.mmu_index_of(src_va);
         let mut pages = [0usize; 256];
         for i in 0..page_count {
-            let obj_page = vma.object_offset as usize + page_idx_start + i;
+            let obj_page = vma.obj_page_index(mmu_idx_start + i * PAGE_MMUCOUNT);
             let pa = object::with_object(vma.object_id, |obj| {
                 obj.get_page(obj_page).map(|p| p.as_usize())
             });
             pages[i] = pa.ok_or(GrantError::NoBackingPage)?;
         }
-        Ok((vma.object_id, vma.object_offset + page_idx_start as u32, pages))
+        // object_offset for destination in MMUPAGE_SIZE units.
+        let dst_obj_offset = vma.object_offset + mmu_idx_start as u32;
+        Ok((vma.object_id, dst_obj_offset, pages))
     })?;
 
     // Step 2: Register the mapping in the object.
@@ -59,7 +61,7 @@ pub fn grant_pages(
     aspace::with_aspace(dst_aspace, |aspace| {
         let prot = if readonly { VmaProt::ReadOnly } else { VmaProt::ReadWrite };
         let va_len = page_count * PAGE_SIZE;
-        let vma = aspace.vmas.insert(dst_va, va_len, prot, obj_id, obj_offset)
+        let vma = aspace.vmas.insert(dst_va, va_len, prot, obj_id, obj_mmu_offset)
             .ok_or(GrantError::DestMapFailed)?;
 
         // Step 4: Install PTEs for all MMU pages that have physical backing.

@@ -7,7 +7,7 @@
 
 use super::aspace::{self, ASpaceId};
 use super::object;
-use super::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT};
+use super::page::MMUPAGE_SIZE;
 use super::stats;
 use core::sync::atomic::Ordering;
 
@@ -63,8 +63,7 @@ pub fn handle_page_fault(
 
         // Compute indices.
         let mmu_idx = vma.mmu_index_of(fault_addr);
-        let page_idx = vma.page_index_of(fault_addr);
-        let obj_page_idx = vma.object_offset as usize + page_idx;
+        let obj_page_idx = vma.obj_page_index(mmu_idx);
         let obj_id = vma.object_id;
 
         // Check if this is a minor fault (page is resident but PTE was removed).
@@ -73,8 +72,7 @@ pub fn handle_page_fault(
             // The underlying allocation page should still be resident.
             let pa = object::with_object(obj_id, |obj| obj.get_page(obj_page_idx));
             if let Some(pa) = pa {
-                let mmu_offset_in_page = mmu_idx % PAGE_MMUCOUNT;
-                let mmu_pa = pa.as_usize() + mmu_offset_in_page * MMUPAGE_SIZE;
+                let mmu_pa = pa.as_usize() + vma.mmu_offset_in_page(mmu_idx) * MMUPAGE_SIZE;
                 let va_aligned = fault_addr & !(MMUPAGE_SIZE - 1);
                 let flags = pte_flags_for_vma(vma);
                 install_pte(pt_root, va_aligned, mmu_pa, flags);
@@ -94,8 +92,7 @@ pub fn handle_page_fault(
         };
 
         // Zero just the specific 4K MMU sub-page within the allocation page.
-        let mmu_offset_in_page = mmu_idx % PAGE_MMUCOUNT;
-        let mmu_pa = pa.as_usize() + mmu_offset_in_page * MMUPAGE_SIZE;
+        let mmu_pa = pa.as_usize() + vma.mmu_offset_in_page(mmu_idx) * MMUPAGE_SIZE;
 
         if !vma.is_zeroed(mmu_idx) {
             unsafe {

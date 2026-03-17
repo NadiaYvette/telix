@@ -30,6 +30,10 @@ pub const PAGE_SHIFT: usize = 18;
 /// Number of MMU pages per allocation page.
 pub const PAGE_MMUCOUNT: usize = PAGE_SIZE / MMUPAGE_SIZE;
 
+/// Shift from MMU-page index to allocation-page index (log2(PAGE_MMUCOUNT)).
+#[allow(dead_code)]
+pub const PAGE_MMUSHIFT: usize = PAGE_SHIFT - MMUPAGE_SHIFT;
+
 /// Physical address (wrapper for type safety).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
