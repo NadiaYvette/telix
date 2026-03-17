@@ -14,7 +14,15 @@ use super::task::{Task, TaskId, MAX_TASKS};
 use super::smp;
 use crate::sync::SpinLock;
 use crate::mm::page::{PAGE_SIZE, MMUPAGE_SIZE};
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Per-CPU deferred kernel stack free. When a thread exits, it can't free
+/// its own stack (it's running on it). The address is stored here and freed
+/// by the next thread scheduled on that CPU.
+static DEFERRED_KSTACK: [AtomicUsize; smp::MAX_CPUS] = {
+    const INIT: AtomicUsize = AtomicUsize::new(0);
+    [INIT; smp::MAX_CPUS]
+};
 
 const NUM_PRIORITIES: usize = 256;
 const MAX_QUEUE_LEN: usize = MAX_THREADS;
@@ -110,17 +118,46 @@ impl Scheduler {
         Some(id)
     }
 
+    /// Find a reusable (Dead) thread slot, or allocate a new one.
+    fn alloc_thread_id(&mut self) -> Option<ThreadId> {
+        // First, scan for a Dead slot to reuse.
+        for i in 1..self.next_thread_id as usize {
+            if self.threads[i].state == ThreadState::Dead && self.threads[i].stack_base == 0 {
+                return Some(i as ThreadId);
+            }
+        }
+        // Otherwise, allocate a new slot.
+        let id = self.next_thread_id;
+        if id as usize >= MAX_THREADS {
+            return None;
+        }
+        self.next_thread_id += 1;
+        Some(id)
+    }
+
+    /// Find a reusable (inactive) task slot, or allocate a new one.
+    fn alloc_task_id(&mut self) -> Option<TaskId> {
+        // Skip task 0 (kernel task).
+        for i in 1..self.next_task_id as usize {
+            if !self.tasks[i].active && self.tasks[i].exited {
+                return Some(i as TaskId);
+            }
+        }
+        let id = self.next_task_id;
+        if id as usize >= MAX_TASKS {
+            return None;
+        }
+        self.next_task_id += 1;
+        Some(id)
+    }
+
     fn create_thread(
         &mut self,
         entry: fn() -> !,
         priority: u8,
         quantum: u32,
     ) -> Option<ThreadId> {
-        let id = self.next_thread_id;
-        if id as usize >= MAX_THREADS {
-            return None;
-        }
-        self.next_thread_id += 1;
+        let id = self.alloc_thread_id()?;
 
         let stack_page = crate::mm::phys::alloc_page()?;
         let stack_base = stack_page.as_usize();
@@ -202,12 +239,8 @@ impl Scheduler {
         // Look up the ELF binary in the initramfs.
         let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
 
-        // Allocate a new task.
-        let task_id = self.next_task_id;
-        if task_id as usize >= MAX_TASKS {
-            return None;
-        }
-        self.next_task_id += 1;
+        // Allocate a task slot (may reuse an exited slot).
+        let task_id = self.alloc_task_id()?;
 
         // Create a page table with kernel identity mapping.
         #[cfg(target_arch = "aarch64")]
@@ -226,6 +259,11 @@ impl Scheduler {
         task.active = true;
         task.aspace_id = aspace_id;
         task.page_table_root = pt_root;
+        task.exit_code = 0;
+        task.exited = false;
+        // Record the parent task (caller's task) for waitpid.
+        let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
+        task.parent_task = self.threads[caller_tid as usize].task_id;
 
         // Load ELF segments into the address space.
         let entry = match crate::loader::elf::load_elf(elf_data, aspace_id, pt_root) {
@@ -351,12 +389,8 @@ impl Scheduler {
             }
         }
 
-        // Allocate thread.
-        let id = self.next_thread_id;
-        if id as usize >= MAX_THREADS {
-            return None;
-        }
-        self.next_thread_id += 1;
+        // Allocate thread (may reuse a Dead slot).
+        let id = self.alloc_thread_id()?;
 
         let thread = &mut self.threads[id as usize];
         thread.id = id;
@@ -407,6 +441,13 @@ impl Scheduler {
     /// Called from IRQ handler with current SP.
     /// Returns the new SP to use for restore_regs.
     fn try_switch(&mut self, current_sp: u64) -> u64 {
+        // Drain deferred kernel stack free from a previous exit on this CPU.
+        let cpu = smp::cpu_id();
+        let deferred = DEFERRED_KSTACK[cpu as usize].swap(0, Ordering::AcqRel);
+        if deferred != 0 {
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(deferred));
+        }
+
         let pcpu = smp::current();
         let prev_id = pcpu.current_thread.load(Ordering::Relaxed);
         let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
@@ -424,9 +465,9 @@ impl Scheduler {
         // Save current thread's SP.
         self.threads[prev_id as usize].saved_sp = current_sp;
         let prev_prio = self.threads[prev_id as usize].priority;
-        self.threads[prev_id as usize].state = ThreadState::Ready;
-        // Don't put idle threads on the run queue.
-        if prev_id != idle_id {
+        // Don't re-enqueue Dead threads (they are exiting).
+        if prev_id != idle_id && self.threads[prev_id as usize].state != ThreadState::Dead {
+            self.threads[prev_id as usize].state = ThreadState::Ready;
             self.run_queues[prev_prio as usize].push(prev_id);
         }
 
@@ -572,4 +613,82 @@ pub fn current_aspace_id() -> u32 {
     let thread = &sched.threads[tid as usize];
     let task = &sched.tasks[thread.task_id as usize];
     task.aspace_id
+}
+
+/// Terminate the current thread and destroy its task's resources.
+/// This function never returns.
+pub fn exit_current_thread(exit_code: i32) -> ! {
+    let (aspace_id, pt_root, kstack_base) = {
+        let pcpu = smp::current();
+        let tid = pcpu.current_thread.load(Ordering::Relaxed);
+        let mut sched = SCHEDULER.lock();
+        let thread = &mut sched.threads[tid as usize];
+        thread.state = ThreadState::Dead;
+        let task_id = thread.task_id;
+        let kstack_base = thread.stack_base;
+        thread.stack_base = 0; // Mark slot as reusable after deferred kstack free.
+        let task = &mut sched.tasks[task_id as usize];
+        task.exit_code = exit_code;
+        task.exited = true;
+        task.active = false;
+        let aspace_id = task.aspace_id;
+        let pt_root = task.page_table_root;
+        (aspace_id, pt_root, kstack_base)
+    }; // scheduler lock dropped here
+
+    // Switch to kernel/boot page table before freeing user page table.
+    if pt_root != 0 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let boot_root = crate::arch::aarch64::mm::boot_page_table_root();
+            crate::arch::aarch64::mm::switch_page_table(boot_root);
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            let boot_root = crate::arch::riscv64::mm::boot_page_table_root();
+            crate::arch::riscv64::mm::switch_page_table(boot_root);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let boot_root = crate::arch::x86_64::mm::boot_page_table_root();
+            crate::arch::x86_64::mm::switch_page_table(boot_root);
+        }
+    }
+
+    // Destroy address space (frees VMAs and backing physical pages).
+    if aspace_id != 0 {
+        crate::mm::aspace::destroy(aspace_id);
+    }
+
+    // Free page table intermediate pages.
+    if pt_root != 0 {
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::aarch64::mm::free_page_table_tree(pt_root);
+        #[cfg(target_arch = "riscv64")]
+        crate::arch::riscv64::mm::free_page_table_tree(pt_root);
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::x86_64::mm::free_page_table_tree(pt_root);
+    }
+
+    // Defer freeing our own kernel stack — we're running on it.
+    let cpu = smp::cpu_id();
+    DEFERRED_KSTACK[cpu as usize].store(kstack_base, Ordering::Release);
+
+    // Spin until preempted. The scheduler won't re-enqueue us (Dead state).
+    loop { core::hint::spin_loop(); }
+}
+
+/// Check if a child thread's task has exited. Returns exit code if so.
+pub fn waitpid(child_tid: ThreadId) -> Option<i32> {
+    let sched = SCHEDULER.lock();
+    if child_tid as usize >= MAX_THREADS {
+        return None;
+    }
+    let task_id = sched.threads[child_tid as usize].task_id;
+    let task = &sched.tasks[task_id as usize];
+    if task.exited {
+        Some(task.exit_code)
+    } else {
+        None
+    }
 }

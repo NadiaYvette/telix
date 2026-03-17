@@ -44,7 +44,7 @@ RUSTFLAGS="-C link-arg=-T$LINKER ${EXTRA_RUSTFLAGS:-}" \
 BINDIR="$ROOTDIR/target/$TARGET/release"
 
 # Copy ELF binaries to initramfs directory.
-for bin in init hello; do
+for bin in init hello echo_client; do
     if [ -f "$BINDIR/$bin" ]; then
         cp "$BINDIR/$bin" "$INITRAMFS_DIR/$bin"
         SIZE=$(wc -c < "$INITRAMFS_DIR/$bin")

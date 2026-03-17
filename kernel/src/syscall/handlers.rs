@@ -28,6 +28,7 @@ pub const SYS_RECV_NB: u64 = 10;
 pub const SYS_EXIT: u64 = 11;
 pub const SYS_SPAWN: u64 = 12;
 pub const SYS_DEBUG_PUTS: u64 = 14;
+pub const SYS_WAITPID: u64 = 15;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -89,7 +90,12 @@ fn set_reg(frame: &mut ExceptionFrame, reg: usize, val: u64) {
         match reg {
             1 => frame.set_rdi(val),
             2 => frame.set_rsi(val),
-            _ => { /* additional regs not yet mapped */ }
+            3 => frame.set_rdx(val),
+            4 => frame.set_r10(val),
+            5 => frame.set_r8(val),
+            6 => frame.set_r9(val),
+            7 => frame.set_rbx(val),
+            _ => {}
         }
     }
 }
@@ -120,6 +126,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_EXIT => sys_exit(a0),
         SYS_SPAWN => sys_spawn(a0, a1, a2),
         SYS_DEBUG_PUTS => sys_debug_puts(a0, a1),
+        SYS_WAITPID => sys_waitpid(a0),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -218,12 +225,16 @@ fn sys_thread_id() -> u64 {
     crate::sched::scheduler::current_thread_id() as u64
 }
 
-fn sys_exit(_code: u64) -> u64 {
-    // For now, just loop forever. Full task teardown (destroying aspace,
-    // deactivating task when last thread exits) will come later.
-    // Mark thread dead by looping — the scheduler won't pick it up again
-    // since it never returns to the run queue.
-    loop { core::hint::spin_loop(); }
+fn sys_exit(code: u64) -> u64 {
+    crate::sched::scheduler::exit_current_thread(code as i32);
+    // unreachable
+}
+
+fn sys_waitpid(child_tid: u64) -> u64 {
+    match crate::sched::scheduler::waitpid(child_tid as u32) {
+        Some(code) => code as u64,
+        None => u64::MAX,
+    }
 }
 
 fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64) -> u64 {

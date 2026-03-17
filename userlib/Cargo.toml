@@ -14,3 +14,7 @@ path = "bin/init.rs"
 [[bin]]
 name = "hello"
 path = "bin/hello.rs"
+
+[[bin]]
+name = "echo_client"
+path = "bin/echo_client.rs"

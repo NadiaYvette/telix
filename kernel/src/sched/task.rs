@@ -18,6 +18,12 @@ pub struct Task {
     /// Physical address of the page table root for this task.
     /// 0 = kernel task (uses boot page table, no switching needed).
     pub page_table_root: usize,
+    /// Exit code set by sys_exit.
+    pub exit_code: i32,
+    /// Task that spawned this task (for waitpid).
+    pub parent_task: TaskId,
+    /// True once exit cleanup is done.
+    pub exited: bool,
 }
 
 impl Task {
@@ -27,6 +33,9 @@ impl Task {
             active: false,
             aspace_id: 0,
             page_table_root: 0,
+            exit_code: 0,
+            parent_task: 0,
+            exited: false,
         }
     }
 }

@@ -377,6 +377,67 @@ pub fn try_contiguous_promotion(l0: usize, va: usize, group_count: usize) -> boo
     true
 }
 
+/// Return the kernel page table root (for switching back during exit).
+pub fn boot_page_table_root() -> usize {
+    KERNEL_PT_ROOT.load(Ordering::Acquire)
+}
+
+/// Free all intermediate page table pages for a user page table.
+/// Does NOT free leaf physical pages (those are freed by aspace::destroy).
+/// The L0 has one entry (L0[0]) pointing to an L1 that contains kernel
+/// block entries (L1[0], L1[1]) and user table entries (L1[2+]).
+/// We only recurse into user table entries.
+pub fn free_page_table_tree(root: usize) {
+    let l0 = root as *const u64;
+    unsafe {
+        let entry0 = *l0.add(0);
+        if entry0 & PT_VALID != 0 && entry0 & PT_TABLE != 0 {
+            let l1 = (entry0 & 0x0000_FFFF_FFFF_F000) as usize;
+            free_l1_user(l1);
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l1));
+        }
+        // L0[1..511]: if any user tables exist at higher L0 indices, free them too.
+        for i in 1..512 {
+            let entry = *l0.add(i);
+            if entry & PT_VALID != 0 && entry & PT_TABLE != 0 {
+                let l1 = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+                free_l1_user(l1);
+                crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l1));
+            }
+        }
+    }
+    crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(root));
+}
+
+/// Free L2/L3 tables under an L1. Skip block descriptors (kernel entries).
+unsafe fn free_l1_user(l1: usize) {
+    let table = l1 as *const u64;
+    for i in 0..512 {
+        let entry = *table.add(i);
+        // Only recurse into table descriptors, not blocks.
+        if entry & PT_VALID != 0 && entry & PT_TABLE != 0 {
+            // Check if this is an L1 block (1 GiB) — block descriptors have bit 1 clear.
+            // Actually, for L1 entries, bit 1 == 1 means table, bit 1 == 0 means block.
+            let l2 = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+            free_l2_user(l2);
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l2));
+        }
+    }
+}
+
+/// Free L3 tables under an L2. Skip block descriptors (2 MiB kernel entries).
+unsafe fn free_l2_user(l2: usize) {
+    let table = l2 as *const u64;
+    for i in 0..512 {
+        let entry = *table.add(i);
+        if entry & PT_VALID != 0 && entry & PT_TABLE != 0 {
+            let l3 = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+            // L3 is a leaf table — just free it.
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l3));
+        }
+    }
+}
+
 /// Switch the user page table to a different L0 root.
 /// Used on context switch between tasks with different address spaces.
 pub fn switch_page_table(root: usize) {

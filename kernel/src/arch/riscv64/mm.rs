@@ -249,6 +249,46 @@ pub fn translate_va(root: usize, va: usize) -> Option<usize> {
     Some(pa | (va & 0xFFF))
 }
 
+/// Return the kernel page table root (for switching back during exit).
+pub fn boot_page_table_root() -> usize {
+    KERNEL_PT_ROOT.load(Ordering::Acquire)
+}
+
+/// Free all intermediate page table pages for a user page table.
+/// Does NOT free leaf physical pages (those are freed by aspace::destroy).
+/// Sv39: root → L1 → L0 (leaf). Kernel gigapages at root[0] and root[2]
+/// are leaf entries (not tables), so they are automatically skipped.
+pub fn free_page_table_tree(root_addr: usize) {
+    let root = root_addr as *const u64;
+    unsafe {
+        for i in 0..512 {
+            let entry = *root.add(i);
+            if entry & PTE_V != 0 && entry & (PTE_R | PTE_W | PTE_X) == 0 {
+                // Non-leaf: this is an L1 table pointer.
+                let l1 = ((entry >> 10) << 12) as usize;
+                free_sv39_l1(l1);
+                crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l1));
+            }
+            // Leaf entries (gigapages) are kernel entries — skip.
+        }
+    }
+    crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(root_addr));
+}
+
+/// Free L0 (leaf) tables under an Sv39 L1 table.
+unsafe fn free_sv39_l1(l1: usize) {
+    let table = l1 as *const u64;
+    for i in 0..512 {
+        let entry = *table.add(i);
+        if entry & PTE_V != 0 && entry & (PTE_R | PTE_W | PTE_X) == 0 {
+            // Non-leaf: L0 table pointer.
+            let l0 = ((entry >> 10) << 12) as usize;
+            // L0 is a leaf table — just free it.
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l0));
+        }
+    }
+}
+
 /// Switch the page table to a different Sv39 root.
 /// Used on context switch between tasks with different address spaces.
 pub fn switch_page_table(root: usize) {

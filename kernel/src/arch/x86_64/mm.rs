@@ -303,6 +303,66 @@ pub fn switch_page_table(root: usize) {
     }
 }
 
+/// Return the boot PML4 physical address (for switching back during exit).
+pub fn boot_page_table_root() -> usize {
+    BOOT_PML4.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Free all intermediate page table pages for a user page table.
+/// Does NOT free leaf physical pages (those are freed by aspace::destroy).
+/// Skips kernel-range entries (PML4[1..3] point to shared boot tables).
+pub fn free_page_table_tree(root: usize) {
+    let pml4 = root as *const u64;
+    unsafe {
+        // PML4[0] was deep-copied (its own PDPT). Recurse and free it.
+        let entry0 = *pml4.add(0);
+        if entry0 & PTE_P != 0 && entry0 & PTE_PS == 0 {
+            let pdpt = (entry0 & 0x000F_FFFF_FFFF_F000) as usize;
+            free_pdpt_user(pdpt);
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(pdpt));
+        }
+        // PML4[1..3] are shared with boot — do NOT free.
+        // PML4[4..511]: user-range entries (if any).
+        for i in 4..512 {
+            let entry = *pml4.add(i);
+            if entry & PTE_P != 0 && entry & PTE_PS == 0 {
+                let pdpt = (entry & 0x000F_FFFF_FFFF_F000) as usize;
+                free_pdpt_user(pdpt);
+                crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(pdpt));
+            }
+        }
+    }
+    // Free the PML4 itself.
+    crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(root));
+}
+
+/// Free all sub-tables under a PDPT, skipping gigapage (PS) entries.
+unsafe fn free_pdpt_user(pdpt: usize) {
+    let table = pdpt as *const u64;
+    for i in 0..512 {
+        let entry = *table.add(i);
+        if entry & PTE_P != 0 && entry & PTE_PS == 0 {
+            let pd = (entry & 0x000F_FFFF_FFFF_F000) as usize;
+            free_pd_user(pd);
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(pd));
+        }
+    }
+}
+
+/// Free all sub-tables under a PD, skipping large page (PS) entries.
+unsafe fn free_pd_user(pd: usize) {
+    let table = pd as *const u64;
+    for i in 0..512 {
+        let entry = *table.add(i);
+        if entry & PTE_P != 0 && entry & PTE_PS == 0 {
+            let pt = (entry & 0x000F_FFFF_FFFF_F000) as usize;
+            // PT is a leaf table — just free it (leaf PTEs point to user pages,
+            // which are freed by aspace::destroy, not here).
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(pt));
+        }
+    }
+}
+
 /// Reload CR3 to flush the TLB after page table changes.
 pub fn enable_mmu(pml4: usize) {
     unsafe {

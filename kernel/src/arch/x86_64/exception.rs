@@ -59,8 +59,14 @@ impl ExceptionFrame {
     pub fn ss(&self) -> u64 { self.regs[21] }
 
     pub fn set_rax(&mut self, v: u64) { self.regs[14] = v; }
-    pub fn set_rdi(&mut self, v: u64) { self.regs[9] = v; }
+    pub fn set_rbx(&mut self, v: u64) { self.regs[13] = v; }
+    pub fn set_rcx(&mut self, v: u64) { self.regs[12] = v; }
+    pub fn set_rdx(&mut self, v: u64) { self.regs[11] = v; }
     pub fn set_rsi(&mut self, v: u64) { self.regs[10] = v; }
+    pub fn set_rdi(&mut self, v: u64) { self.regs[9] = v; }
+    pub fn set_r8(&mut self, v: u64) { self.regs[7] = v; }
+    pub fn set_r9(&mut self, v: u64) { self.regs[6] = v; }
+    pub fn set_r10(&mut self, v: u64) { self.regs[5] = v; }
 }
 
 /// Number of u64 values in the exception frame.

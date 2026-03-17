@@ -65,3 +65,54 @@ pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     }
     ret
 }
+
+#[inline(always)]
+pub unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") nr,
+            inlateout("x0") a0 => ret,
+            inlateout("x1") a1 => _,
+            inlateout("x2") a2 => _,
+            inlateout("x3") a3 => _,
+        );
+    }
+    ret
+}
+
+#[inline(always)]
+pub unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") nr,
+            inlateout("x0") a0 => ret,
+            inlateout("x1") a1 => _,
+            inlateout("x2") a2 => _,
+            inlateout("x3") a3 => _,
+            inlateout("x4") a4 => _,
+        );
+    }
+    ret
+}
+
+#[inline(always)]
+pub unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") nr,
+            inlateout("x0") a0 => ret,
+            inlateout("x1") a1 => _,
+            inlateout("x2") a2 => _,
+            inlateout("x3") a3 => _,
+            inlateout("x4") a4 => _,
+            inlateout("x5") a5 => _,
+        );
+    }
+    ret
+}
