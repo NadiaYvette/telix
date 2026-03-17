@@ -19,9 +19,17 @@ fn ensure_kernel_pt() {
     crate::arch::aarch64::mm::switch_page_table(kern_root);
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "riscv64")]
 fn ensure_kernel_pt() {
-    // RISC-V: scheduler already restores kernel PT for kernel threads.
+    let kern_root = crate::arch::riscv64::mm::boot_page_table_root();
+    crate::arch::riscv64::mm::switch_page_table(kern_root);
+    // Grant pages have PTE_U set (they're mapped for userspace). S-mode must
+    // set sstatus.SUM (bit 18) to access U-flagged pages.
+    unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 18); }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ensure_kernel_pt() {
     // x86-64: blk_server not used.
 }
 
