@@ -18,3 +18,7 @@ path = "bin/hello.rs"
 [[bin]]
 name = "echo_client"
 path = "bin/echo_client.rs"
+
+[[bin]]
+name = "initramfs_srv"
+path = "bin/initramfs_srv.rs"

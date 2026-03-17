@@ -9,8 +9,11 @@ use crate::ipc::Message;
 use super::protocol::*;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Global port ID for the initramfs server (u32::MAX = not yet ready).
+/// Global port ID for the kernel initramfs server (u32::MAX = not yet ready).
 pub static INITRAMFS_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Global port ID for the userspace initramfs server (u32::MAX = not yet ready).
+pub static USER_INITRAMFS_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Embedded CPIO archive.
 static INITRAMFS: &[u8] = include_bytes!("initramfs.cpio");

@@ -92,7 +92,22 @@ pub fn kmain() -> ! {
 
     // Phase 4: Userspace processes.
     println!("Phase 4: Spawning init process...");
-    match sched::spawn_user(b"init", 50, 20) {
+
+    // Spawn userspace initramfs server with CPIO data mapped at 0x3_0000_0000.
+    {
+        use core::sync::atomic::Ordering;
+        let cpio_data: &[u8] = include_bytes!("io/initramfs.cpio");
+        let srv_port = ipc::port::create().expect("initramfs_srv port");
+        io::initramfs::USER_INITRAMFS_PORT.store(srv_port, Ordering::Release);
+        match sched::spawn_user_with_data(
+            b"initramfs_srv", 50, 20, cpio_data, 0x3_0000_0000, srv_port as u64,
+        ) {
+            Some(tid) => println!("  initramfs_srv spawned (thread {}, port {})", tid, srv_port),
+            None => println!("  ERROR: failed to spawn initramfs_srv"),
+        }
+    }
+
+    match sched::spawn_user(b"init", 50, 20, 0) {
         Some(tid) => println!("  init process spawned (thread {})", tid),
         None => println!("  ERROR: failed to spawn init"),
     }

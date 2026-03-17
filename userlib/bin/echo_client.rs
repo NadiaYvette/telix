@@ -27,7 +27,7 @@ fn print_hex(n: u64) {
 }
 
 #[unsafe(no_mangle)]
-fn main() {
+fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  echo_client: IPC self-test\n");
 
     // Create our own port.

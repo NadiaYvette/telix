@@ -14,6 +14,12 @@ const SYS_EXIT: u64 = 11;
 const SYS_SPAWN: u64 = 12;
 const SYS_DEBUG_PUTS: u64 = 14;
 const SYS_WAITPID: u64 = 15;
+const SYS_MMAP_ANON: u64 = 16;
+const SYS_MUNMAP: u64 = 17;
+const SYS_GRANT_PAGES: u64 = 18;
+const SYS_REVOKE: u64 = 19;
+const SYS_ASPACE_ID: u64 = 20;
+const SYS_GET_INITRAMFS_PORT: u64 = 21;
 
 /// Print a single character to the debug console.
 pub fn debug_putchar(ch: u8) {
@@ -65,11 +71,129 @@ pub fn exit(code: u64) -> ! {
 /// Spawn a new process from an ELF in initramfs.
 /// Returns thread ID or u64::MAX on error.
 pub fn spawn(name: &[u8], priority: u8) -> u64 {
-    unsafe { arch::syscall3(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, priority as u64) }
+    unsafe { arch::syscall4(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, priority as u64, 0) }
 }
 
 /// Wait for a child thread to exit. Returns Some(exit_code) or None.
 pub fn waitpid(child_tid: u64) -> Option<u64> {
     let r = unsafe { arch::syscall1(SYS_WAITPID, child_tid) };
     if r == u64::MAX { None } else { Some(r) }
+}
+
+/// Allocate anonymous pages. va=0 for auto-pick. prot: 0=RO, 1=RW, 2=RX, 3=RWX.
+/// Returns mapped VA or None on error.
+pub fn mmap_anon(va: usize, page_count: usize, prot: u8) -> Option<usize> {
+    let r = unsafe { arch::syscall3(SYS_MMAP_ANON, va as u64, page_count as u64, prot as u64) };
+    if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+/// Unmap a previously mmap'd region. Returns true on success.
+pub fn munmap(va: usize) -> bool {
+    let r = unsafe { arch::syscall1(SYS_MUNMAP, va as u64) };
+    r == 0
+}
+
+/// Grant pages from our address space to another.
+pub fn grant_pages(dst_aspace: u32, src_va: usize, dst_va: usize, page_count: usize, readonly: bool) -> bool {
+    let r = unsafe { arch::syscall5(SYS_GRANT_PAGES, dst_aspace as u64, src_va as u64, dst_va as u64, page_count as u64, readonly as u64) };
+    r == 0
+}
+
+/// Revoke a grant.
+pub fn revoke(dst_aspace: u32, dst_va: usize) -> bool {
+    let r = unsafe { arch::syscall2(SYS_REVOKE, dst_aspace as u64, dst_va as u64) };
+    r == 0
+}
+
+/// Get our address space ID.
+pub fn aspace_id() -> u32 {
+    unsafe { arch::syscall0(SYS_ASPACE_ID) as u32 }
+}
+
+/// Spawn a new process with an argument passed to main().
+pub fn spawn_with_arg(name: &[u8], priority: u8, arg0: u64) -> u64 {
+    unsafe { arch::syscall4(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, priority as u64, arg0) }
+}
+
+/// Get the userspace initramfs server's port ID.
+pub fn get_initramfs_port() -> u32 {
+    unsafe { arch::syscall0(SYS_GET_INITRAMFS_PORT) as u32 }
+}
+
+/// IPC message with tag + 6 data words.
+pub struct Message {
+    pub tag: u64,
+    pub data: [u64; 6],
+}
+
+/// Blocking receive that returns the full message (tag + data).
+pub fn recv_msg(port: u32) -> Option<Message> {
+    let status: u64;
+    let r1: u64;
+    let r2: u64;
+    let r3: u64;
+    let r4: u64;
+    let r5: u64;
+    let r6: u64;
+    let r7: u64;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_RECV,
+            inlateout("x0") port as u64 => status,
+            lateout("x1") r1,
+            lateout("x2") r2,
+            lateout("x3") r3,
+            lateout("x4") r4,
+            lateout("x5") r5,
+            lateout("x6") r6,
+            lateout("x7") r7,
+        );
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a7") SYS_RECV as u64 => r7,
+            inlateout("a0") port as u64 => status,
+            lateout("a1") r1,
+            lateout("a2") r2,
+            lateout("a3") r3,
+            lateout("a4") r4,
+            lateout("a5") r5,
+            lateout("a6") r6,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "int 0x80",
+            "mov {r7}, rbx",
+            "pop rbx",
+            r7 = lateout(reg) r7,
+            inlateout("rax") SYS_RECV => status,
+            inlateout("rdi") port as u64 => r1,
+            lateout("rsi") r2,
+            lateout("rdx") r3,
+            lateout("r10") r4,
+            lateout("r8") r5,
+            lateout("r9") r6,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+
+    if status != 0 {
+        return None;
+    }
+
+    Some(Message {
+        tag: r1,
+        data: [r2, r3, r4, r5, r6, r7],
+    })
 }

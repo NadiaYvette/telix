@@ -24,6 +24,15 @@ static DEFERRED_KSTACK: [AtomicUsize; smp::MAX_CPUS] = {
     [INIT; smp::MAX_CPUS]
 };
 
+/// Per-CPU deferred thread ID — the thread whose kstack is in DEFERRED_KSTACK.
+/// When try_switch drains the deferred free, it also sets stack_base=0 on this
+/// thread, making the slot eligible for reuse. This prevents a race where a
+/// slot is reused while the dead thread is still physically running.
+static DEFERRED_THREAD: [AtomicUsize; smp::MAX_CPUS] = {
+    const INIT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    [INIT; smp::MAX_CPUS]
+};
+
 const NUM_PRIORITIES: usize = 256;
 const MAX_QUEUE_LEN: usize = MAX_THREADS;
 
@@ -235,6 +244,7 @@ impl Scheduler {
         elf_name: &[u8],
         priority: u8,
         quantum: u32,
+        arg0: u64,
     ) -> Option<ThreadId> {
         // Look up the ELF binary in the initramfs.
         let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
@@ -387,6 +397,14 @@ impl Scheduler {
                 *frame.add(20) = USER_STACK_TOP as u64;                    // RSP = user stack
                 *frame.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3; // SS = user data | RPL=3
             }
+
+            // Write arg0 into the child's first argument register.
+            #[cfg(target_arch = "aarch64")]
+            { *frame.add(0) = arg0; } // x0
+            #[cfg(target_arch = "riscv64")]
+            { *frame.add(9) = arg0; } // a0 = x10 at frame index 9
+            #[cfg(target_arch = "x86_64")]
+            { *frame.add(9) = arg0; } // rdi at frame index 9
         }
 
         // Allocate thread (may reuse a Dead slot).
@@ -404,6 +422,108 @@ impl Scheduler {
 
         self.run_queues[priority as usize].push(id);
         Some(id)
+    }
+
+    /// Like create_user_thread, but also copies `data` into the child's address space
+    /// at `data_va`, and sets arg1=data_va, arg2=data_len in the initial frame.
+    fn create_user_thread_with_data(
+        &mut self,
+        elf_name: &[u8],
+        priority: u8,
+        quantum: u32,
+        arg0: u64,
+        data: &[u8],
+        data_va: usize,
+    ) -> Option<ThreadId> {
+        // First, create the thread normally.
+        let tid = self.create_user_thread(elf_name, priority, quantum, arg0)?;
+
+        let task_id = self.threads[tid as usize].task_id;
+        let aspace_id = self.tasks[task_id as usize].aspace_id;
+        let pt_root = self.tasks[task_id as usize].page_table_root;
+
+        // Map data pages into the child's address space.
+        let data_pages = (data.len() + PAGE_SIZE - 1) / PAGE_SIZE;
+        if data_pages > 0 {
+            let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+                let vma = aspace.map_anon(data_va, data_pages, crate::mm::vma::VmaProt::ReadOnly)
+                    .ok_or(())?;
+                Ok::<_, ()>(vma.object_id)
+            }).ok()?;
+
+            let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
+            #[cfg(target_arch = "aarch64")]
+            let pte_flags = crate::arch::aarch64::mm::USER_RO_FLAGS;
+            #[cfg(target_arch = "riscv64")]
+            let pte_flags = crate::arch::riscv64::mm::USER_RO_FLAGS;
+            #[cfg(target_arch = "x86_64")]
+            let pte_flags = crate::arch::x86_64::mm::USER_RO_FLAGS;
+
+            for page_idx in 0..data_pages {
+                let page_va = data_va + page_idx * PAGE_SIZE;
+                let pa = crate::mm::object::with_object(obj_id, |obj| {
+                    obj.ensure_page(page_idx)
+                })?;
+                let pa_usize = pa.as_usize();
+
+                // Zero the page first, then copy data.
+                unsafe {
+                    core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
+                    let copy_start = page_idx * PAGE_SIZE;
+                    let copy_end = (copy_start + PAGE_SIZE).min(data.len());
+                    if copy_start < data.len() {
+                        core::ptr::copy_nonoverlapping(
+                            data[copy_start..copy_end].as_ptr(),
+                            pa_usize as *mut u8,
+                            copy_end - copy_start,
+                        );
+                    }
+                }
+
+                for mmu_idx in 0..mmu_count {
+                    let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
+                    let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
+                    #[cfg(target_arch = "aarch64")]
+                    crate::arch::aarch64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+                    #[cfg(target_arch = "riscv64")]
+                    crate::arch::riscv64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+                    #[cfg(target_arch = "x86_64")]
+                    crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+                }
+
+                crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+                    if let Some(vma) = aspace.find_vma_mut(page_va) {
+                        for mmu_idx in 0..mmu_count {
+                            let idx = vma.mmu_index_of(page_va + mmu_idx * MMUPAGE_SIZE);
+                            vma.set_installed(idx);
+                            vma.set_zeroed(idx);
+                        }
+                    }
+                });
+            }
+        }
+
+        // Set arg1 = data_va, arg2 = data_len in the thread's exception frame.
+        let frame = self.threads[tid as usize].saved_sp as *mut u64;
+        unsafe {
+            #[cfg(target_arch = "aarch64")]
+            {
+                *frame.add(1) = data_va as u64; // x1
+                *frame.add(2) = data.len() as u64; // x2
+            }
+            #[cfg(target_arch = "riscv64")]
+            {
+                *frame.add(10) = data_va as u64; // a1 = x11 at frame index 10
+                *frame.add(11) = data.len() as u64; // a2 = x12 at frame index 11
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                *frame.add(10) = data_va as u64; // rsi at frame index 10
+                *frame.add(11) = data.len() as u64; // rdx at frame index 11
+            }
+        }
+
+        Some(tid)
     }
 
     fn pick_next(&mut self, idle_id: ThreadId) -> ThreadId {
@@ -446,6 +566,11 @@ impl Scheduler {
         let deferred = DEFERRED_KSTACK[cpu as usize].swap(0, Ordering::AcqRel);
         if deferred != 0 {
             crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(deferred));
+            // Now mark the dead thread's slot as reusable (stack_base=0).
+            let dead_tid = DEFERRED_THREAD[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
+            if dead_tid < MAX_THREADS {
+                self.threads[dead_tid].stack_base = 0;
+            }
         }
 
         let pcpu = smp::current();
@@ -536,9 +661,22 @@ pub fn spawn(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
 }
 
 /// Spawn a new user-mode process from an ELF binary in the initramfs.
-/// Creates a new task with its own address space.
-pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32) -> Option<ThreadId> {
-    SCHEDULER.lock().create_user_thread(elf_name, priority, quantum)
+/// Creates a new task with its own address space. `arg0` is passed to main().
+pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
+    SCHEDULER.lock().create_user_thread(elf_name, priority, quantum, arg0)
+}
+
+/// Spawn a user-mode process with data mapped into its address space.
+/// Sets arg0, arg1=data_va, arg2=data_len in the child's initial frame.
+pub fn spawn_user_with_data(
+    elf_name: &[u8],
+    priority: u8,
+    quantum: u32,
+    data: &[u8],
+    data_va: usize,
+    arg0: u64,
+) -> Option<ThreadId> {
+    SCHEDULER.lock().create_user_thread_with_data(elf_name, priority, quantum, arg0, data, data_va)
 }
 
 /// Get the task ID of the current thread.
@@ -586,6 +724,10 @@ static WAKEUP_FLAGS: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS
 pub fn block_current(_reason: BlockReason) {
     let tid = current_thread_id();
     WAKEUP_FLAGS[tid as usize].store(false, Ordering::Release);
+    // Enable interrupts so the timer can preempt us while we spin.
+    // This is critical when called from a syscall handler (SVC/ecall/int),
+    // because hardware masks IRQs on exception entry.
+    let saved = arch_save_and_enable_irqs();
     // Spin until the wakeup flag is set. The thread stays Running and
     // gets preempted normally by timer ticks (quantum-based). This avoids
     // a race where wake_thread() re-enqueues a Blocked thread that's still
@@ -593,6 +735,7 @@ pub fn block_current(_reason: BlockReason) {
     while !WAKEUP_FLAGS[tid as usize].load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
+    arch_restore_irqs(saved);
 }
 
 /// Wake a blocked thread, making it runnable.
@@ -618,7 +761,7 @@ pub fn current_aspace_id() -> u32 {
 /// Terminate the current thread and destroy its task's resources.
 /// This function never returns.
 pub fn exit_current_thread(exit_code: i32) -> ! {
-    let (aspace_id, pt_root, kstack_base) = {
+    let (tid, aspace_id, pt_root, kstack_base) = {
         let pcpu = smp::current();
         let tid = pcpu.current_thread.load(Ordering::Relaxed);
         let mut sched = SCHEDULER.lock();
@@ -626,14 +769,18 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         thread.state = ThreadState::Dead;
         let task_id = thread.task_id;
         let kstack_base = thread.stack_base;
-        thread.stack_base = 0; // Mark slot as reusable after deferred kstack free.
+        // NOTE: Do NOT set stack_base=0 here. The thread is still running on
+        // its CPU. Setting it to 0 would allow alloc_thread_id to reuse the
+        // slot before we're actually off the CPU. Instead, try_switch will set
+        // stack_base=0 when it drains DEFERRED_KSTACK (proving the dead thread
+        // has been context-switched away).
         let task = &mut sched.tasks[task_id as usize];
         task.exit_code = exit_code;
         task.exited = true;
         task.active = false;
         let aspace_id = task.aspace_id;
         let pt_root = task.page_table_root;
-        (aspace_id, pt_root, kstack_base)
+        (tid, aspace_id, pt_root, kstack_base)
     }; // scheduler lock dropped here
 
     // Switch to kernel/boot page table before freeing user page table.
@@ -671,11 +818,94 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     }
 
     // Defer freeing our own kernel stack — we're running on it.
+    // Also store our thread ID so try_switch can mark the slot as reusable.
     let cpu = smp::cpu_id();
+    DEFERRED_THREAD[cpu as usize].store(tid as usize, Ordering::Release);
     DEFERRED_KSTACK[cpu as usize].store(kstack_base, Ordering::Release);
+
+    // Enable interrupts so the timer can preempt us (we may be in a syscall
+    // handler where hardware masked IRQs on exception entry).
+    arch_enable_irqs();
 
     // Spin until preempted. The scheduler won't re-enqueue us (Dead state).
     loop { core::hint::spin_loop(); }
+}
+
+// --- Architecture-specific IRQ helpers for blocking paths ---
+
+/// Save current interrupt state and enable IRQs. Returns saved state.
+#[inline(always)]
+fn arch_save_and_enable_irqs() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let daif: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {0}, daif",
+                "msr daifclr, #2", // Clear IRQ mask → enable IRQs
+                out(reg) daif,
+            );
+        }
+        daif as usize
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let sstatus: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrrsi {0}, sstatus, 0x2", // Set SIE bit, return old value
+                out(reg) sstatus,
+            );
+        }
+        sstatus
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let flags: u64;
+        unsafe {
+            core::arch::asm!(
+                "pushfq",
+                "pop {0}",
+                "sti",
+                out(reg) flags,
+            );
+        }
+        flags as usize
+    }
+}
+
+/// Restore interrupt state.
+#[inline(always)]
+fn arch_restore_irqs(saved: usize) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("msr daif, {0}", in(reg) saved as u64);
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        if saved & 0x2 == 0 {
+            // SIE was clear before — restore it.
+            unsafe { core::arch::asm!("csrci sstatus, 0x2"); }
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if saved & 0x200 == 0 {
+            // IF was clear before — disable interrupts.
+            unsafe { core::arch::asm!("cli"); }
+        }
+    }
+}
+
+/// Unconditionally enable IRQs.
+#[inline(always)]
+fn arch_enable_irqs() {
+    #[cfg(target_arch = "aarch64")]
+    unsafe { core::arch::asm!("msr daifclr, #2"); }
+    #[cfg(target_arch = "riscv64")]
+    unsafe { core::arch::asm!("csrsi sstatus, 0x2"); }
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::asm!("sti"); }
 }
 
 /// Check if a child thread's task has exited. Returns exit code if so.

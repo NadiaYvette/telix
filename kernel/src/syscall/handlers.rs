@@ -29,6 +29,12 @@ pub const SYS_EXIT: u64 = 11;
 pub const SYS_SPAWN: u64 = 12;
 pub const SYS_DEBUG_PUTS: u64 = 14;
 pub const SYS_WAITPID: u64 = 15;
+pub const SYS_MMAP_ANON: u64 = 16;
+pub const SYS_MUNMAP: u64 = 17;
+pub const SYS_GRANT_PAGES: u64 = 18;
+pub const SYS_REVOKE: u64 = 19;
+pub const SYS_ASPACE_ID: u64 = 20;
+pub const SYS_GET_INITRAMFS_PORT: u64 = 21;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -124,9 +130,15 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SEND_NB => sys_send_nb(a0, a1, [a2, a3, a4, a5, 0, 0]),
         SYS_RECV_NB => sys_recv_nb(a0, frame),
         SYS_EXIT => sys_exit(a0),
-        SYS_SPAWN => sys_spawn(a0, a1, a2),
+        SYS_SPAWN => sys_spawn(a0, a1, a2, a3),
         SYS_DEBUG_PUTS => sys_debug_puts(a0, a1),
         SYS_WAITPID => sys_waitpid(a0),
+        SYS_MMAP_ANON => sys_mmap_anon(a0, a1, a2),
+        SYS_MUNMAP => sys_munmap(a0),
+        SYS_GRANT_PAGES => sys_grant_pages(a0, a1, a2, a3, a4),
+        SYS_REVOKE => sys_revoke(a0, a1),
+        SYS_ASPACE_ID => sys_aspace_id(),
+        SYS_GET_INITRAMFS_PORT => sys_get_initramfs_port(),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -237,7 +249,7 @@ fn sys_waitpid(child_tid: u64) -> u64 {
     }
 }
 
-fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64) -> u64 {
+fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64, arg0: u64) -> u64 {
     let pt_root = crate::sched::scheduler::current_page_table_root();
     let len = (name_len as usize).min(64);
 
@@ -248,7 +260,7 @@ fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64) -> u64 {
     }
 
     let name = &buf[..len];
-    match crate::sched::scheduler::spawn_user(name, priority as u8, 20) {
+    match crate::sched::scheduler::spawn_user(name, priority as u8, 20, arg0) {
         Some(tid) => tid as u64,
         None => u64::MAX,
     }
@@ -265,6 +277,159 @@ fn sys_debug_puts(buf_ptr: u64, buf_len: u64) -> u64 {
         crate::arch::platform::serial::putc(ch);
     }
     0
+}
+
+fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64) -> u64 {
+    use crate::mm::page::{PAGE_SIZE, MMUPAGE_SIZE, PAGE_MMUCOUNT};
+    use crate::mm::vma::VmaProt;
+
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    if aspace_id == 0 {
+        return u64::MAX; // kernel context
+    }
+
+    let pages = page_count as usize;
+    if pages == 0 || pages > 256 {
+        return u64::MAX;
+    }
+
+    let prot = match prot {
+        0 => VmaProt::ReadOnly,
+        1 => VmaProt::ReadWrite,
+        2 => VmaProt::ReadExec,
+        3 => VmaProt::ReadWriteExec,
+        _ => return u64::MAX,
+    };
+
+    // Determine VA: auto-pick if hint is 0, otherwise use hint.
+    let va = if va_hint == 0 {
+        crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+            aspace.alloc_heap_va(pages)
+        })
+    } else {
+        va_hint as usize
+    };
+
+    // Create VMA + backing object.
+    let obj_id = match crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+        aspace.map_anon(va, pages, prot).map(|vma| vma.object_id)
+    }) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    // Eagerly allocate physical pages and install PTEs.
+    let pt_root = crate::sched::scheduler::current_page_table_root();
+
+    #[cfg(target_arch = "aarch64")]
+    let pte_flags = match prot {
+        VmaProt::ReadOnly => crate::arch::aarch64::mm::USER_RO_FLAGS,
+        VmaProt::ReadWrite => crate::arch::aarch64::mm::USER_RW_FLAGS,
+        VmaProt::ReadExec => crate::arch::aarch64::mm::USER_RWX_FLAGS,
+        VmaProt::ReadWriteExec => crate::arch::aarch64::mm::USER_RWX_FLAGS,
+    };
+    #[cfg(target_arch = "riscv64")]
+    let pte_flags = match prot {
+        VmaProt::ReadOnly => crate::arch::riscv64::mm::USER_RO_FLAGS,
+        VmaProt::ReadWrite => crate::arch::riscv64::mm::USER_RW_FLAGS,
+        VmaProt::ReadExec => crate::arch::riscv64::mm::USER_RWX_FLAGS,
+        VmaProt::ReadWriteExec => crate::arch::riscv64::mm::USER_RWX_FLAGS,
+    };
+    #[cfg(target_arch = "x86_64")]
+    let pte_flags = match prot {
+        VmaProt::ReadOnly => crate::arch::x86_64::mm::USER_RO_FLAGS,
+        VmaProt::ReadWrite => crate::arch::x86_64::mm::USER_RW_FLAGS,
+        VmaProt::ReadExec => crate::arch::x86_64::mm::USER_RWX_FLAGS,
+        VmaProt::ReadWriteExec => crate::arch::x86_64::mm::USER_RWX_FLAGS,
+    };
+
+    for page_idx in 0..pages {
+        let page_va = va + page_idx * PAGE_SIZE;
+
+        let pa = match crate::mm::object::with_object(obj_id, |obj| {
+            obj.ensure_page(page_idx)
+        }) {
+            Some(pa) => pa,
+            None => return u64::MAX,
+        };
+        let pa_usize = pa.as_usize();
+
+        // Zero the page.
+        unsafe {
+            core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
+        }
+
+        // Map each MMU page.
+        for mmu_idx in 0..PAGE_MMUCOUNT {
+            let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
+            let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
+
+            #[cfg(target_arch = "aarch64")]
+            crate::arch::aarch64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+            #[cfg(target_arch = "riscv64")]
+            crate::arch::riscv64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+        }
+
+        // Mark installed in VMA.
+        crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+            if let Some(vma) = aspace.find_vma_mut(page_va) {
+                for mmu_idx in 0..PAGE_MMUCOUNT {
+                    let idx = vma.mmu_index_of(page_va + mmu_idx * MMUPAGE_SIZE);
+                    vma.set_installed(idx);
+                    vma.set_zeroed(idx);
+                }
+            }
+        });
+    }
+
+    va as u64
+}
+
+fn sys_munmap(va: u64) -> u64 {
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    if aspace_id == 0 {
+        return u64::MAX;
+    }
+    if crate::mm::aspace::unmap_anon(aspace_id, va as usize) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+fn sys_grant_pages(dst_aspace: u64, src_va: u64, dst_va: u64, page_count: u64, readonly: u64) -> u64 {
+    let my_aspace = crate::sched::scheduler::current_aspace_id();
+    if my_aspace == 0 {
+        return u64::MAX;
+    }
+    match crate::mm::grant::grant_pages(
+        my_aspace,
+        src_va as usize,
+        dst_aspace as u32,
+        dst_va as usize,
+        page_count as usize,
+        readonly != 0,
+    ) {
+        Ok(()) => 0,
+        Err(_) => u64::MAX,
+    }
+}
+
+fn sys_revoke(dst_aspace: u64, dst_va: u64) -> u64 {
+    crate::mm::grant::revoke_grant(dst_aspace as u32, dst_va as usize);
+    0
+}
+
+fn sys_aspace_id() -> u64 {
+    crate::sched::scheduler::current_aspace_id() as u64
+}
+
+fn sys_get_initramfs_port() -> u64 {
+    use core::sync::atomic::Ordering;
+    let port = crate::io::initramfs::USER_INITRAMFS_PORT.load(Ordering::Acquire);
+    port as u64
 }
 
 /// Copy `dst.len()` bytes from user virtual address `user_va` into `dst`,

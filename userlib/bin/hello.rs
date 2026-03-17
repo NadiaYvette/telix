@@ -4,7 +4,7 @@
 extern crate userlib;
 
 #[unsafe(no_mangle)]
-fn main() {
+fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     userlib::syscall::debug_puts(b"Hello from userspace!\n");
     let tid = userlib::syscall::thread_id();
     userlib::syscall::debug_puts(b"  thread id = ");

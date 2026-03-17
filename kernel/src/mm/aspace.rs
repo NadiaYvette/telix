@@ -14,6 +14,9 @@ pub const MAX_ASPACES: usize = 16;
 /// Address space ID type.
 pub type ASpaceId = u32;
 
+/// Heap VA base: 8 GiB (above ELF load at 4 GiB, below stack).
+pub const HEAP_VA_BASE: usize = 0x2_0000_0000;
+
 /// An address space.
 pub struct AddressSpace {
     /// Physical address of the page table root (L0/PML4/root table).
@@ -26,6 +29,8 @@ pub struct AddressSpace {
     pub clock_hand: VmaCursor,
     /// Address space ID.
     pub id: ASpaceId,
+    /// Bump pointer for heap VA allocation.
+    pub heap_next: usize,
 }
 
 impl AddressSpace {
@@ -36,6 +41,7 @@ impl AddressSpace {
             active: false,
             clock_hand: VmaCursor::new(),
             id: 0,
+            heap_next: HEAP_VA_BASE,
         }
     }
 
@@ -65,6 +71,13 @@ impl AddressSpace {
                 None
             }
         }
+    }
+
+    /// Allocate `page_count` pages of heap VA space (bump pointer).
+    pub fn alloc_heap_va(&mut self, page_count: usize) -> usize {
+        let va = self.heap_next;
+        self.heap_next += page_count * super::page::PAGE_SIZE;
+        va
     }
 
     /// Find the VMA containing `va` and return a mutable reference.
@@ -109,6 +122,7 @@ pub fn create(page_table_root: usize) -> Option<ASpaceId> {
             space.id = id;
             space.page_table_root = page_table_root;
             space.clock_hand = VmaCursor::new();
+            space.heap_next = HEAP_VA_BASE;
             table.next_id = id + 1;
             return Some(id);
         }
@@ -135,6 +149,55 @@ pub fn destroy(id: ASpaceId) {
             return;
         }
     }
+}
+
+/// Unmap an anonymous region from an address space.
+/// Unmaps PTEs, removes VMA, destroys backing object.
+pub fn unmap_anon(id: ASpaceId, va: usize) -> bool {
+    let mut table = ASPACES.lock();
+    for space in table.spaces.iter_mut() {
+        if space.active && space.id == id {
+            let pt_root = space.page_table_root;
+            // Find the VMA and collect info needed for cleanup.
+            let info = if let Some(vma) = space.find_vma(va) {
+                let obj_id = vma.object_id;
+                let va_start = vma.va_start;
+                let mmu_count = vma.mmu_page_count();
+                // Unmap all installed PTEs.
+                for mmu_idx in 0..mmu_count {
+                    if vma.is_installed(mmu_idx) {
+                        let mmu_va = va_start + mmu_idx * super::page::MMUPAGE_SIZE;
+                        unmap_single_mmupage(pt_root, mmu_va);
+                    }
+                }
+                // Remove object mapping record.
+                object::with_object(obj_id, |obj| {
+                    obj.remove_mapping(id, va_start);
+                });
+                Some((va_start, obj_id))
+            } else {
+                None
+            };
+
+            if let Some((va_start, obj_id)) = info {
+                space.vmas.remove(va_start);
+                // Destroy object (frees phys pages) — acquires OBJECTS lock.
+                object::destroy(obj_id);
+                return true;
+            }
+            return false;
+        }
+    }
+    false
+}
+
+fn unmap_single_mmupage(pt_root: usize, va: usize) {
+    #[cfg(target_arch = "aarch64")]
+    { crate::arch::aarch64::mm::unmap_single_mmupage(pt_root, va); }
+    #[cfg(target_arch = "riscv64")]
+    { crate::arch::riscv64::mm::unmap_single_mmupage(pt_root, va); }
+    #[cfg(target_arch = "x86_64")]
+    { crate::arch::x86_64::mm::unmap_single_mmupage(pt_root, va); }
 }
 
 /// Access an address space by ID within a closure.
