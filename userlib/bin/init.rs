@@ -568,6 +568,56 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"Phase 10 FAT16 filesystem: SKIPPED\n");
     }
 
+    // --- Test 10: Console server ---
+    syscall::debug_puts(b"  init: testing console server...\n");
+
+    // Give console_srv time to start and register.
+    for _ in 0..200 { syscall::yield_now(); }
+
+    let mut con_port: Option<u32> = None;
+    for _ in 0..500 {
+        if let Some(p) = syscall::ns_lookup(b"console") {
+            con_port = Some(p);
+            break;
+        }
+        syscall::yield_now();
+    }
+
+    if let Some(cp) = con_port {
+        syscall::debug_puts(b"  init: ns_lookup(console) = port ");
+        print_num(cp as u64);
+        syscall::debug_puts(b"\n");
+
+        let con_reply = syscall::port_create() as u32;
+
+        // CON_WRITE test: send a test string.
+        let test_msg = b"Phase 11 OK\n";
+        let (w0, w1, _) = pack_name(test_msg);
+        let d2 = (test_msg.len() as u64) | ((con_reply as u64) << 32);
+        syscall::send(cp, 0x3100, w0, w1, d2, 0);
+
+        if let Some(reply) = syscall::recv_msg(con_reply) {
+            if reply.tag == 0x3101 {
+                syscall::debug_puts(b"Phase 11 console server: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 11 console server: FAILED\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 11 console server: FAILED (no reply)\n");
+        }
+
+        // Spawn interactive shell.
+        let shell_tid = syscall::spawn(b"shell", 50);
+        if shell_tid != u64::MAX {
+            syscall::debug_puts(b"  init: shell spawned (tid=");
+            print_num(shell_tid);
+            syscall::debug_puts(b")\n");
+        }
+    } else {
+        syscall::debug_puts(b"  init: console not found\n");
+        syscall::debug_puts(b"Phase 11 console server: SKIPPED\n");
+    }
+
     // Init loops forever, yielding.
     loop {
         syscall::yield_now();

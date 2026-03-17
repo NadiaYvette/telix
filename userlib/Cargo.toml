@@ -34,3 +34,11 @@ path = "bin/blk_srv.rs"
 [[bin]]
 name = "fat16_srv"
 path = "bin/fat16_srv.rs"
+
+[[bin]]
+name = "console_srv"
+path = "bin/console_srv.rs"
+
+[[bin]]
+name = "shell"
+path = "bin/shell.rs"

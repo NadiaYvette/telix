@@ -40,6 +40,7 @@ pub const SYS_NSRV_PORT: u64 = 23;
 pub const SYS_MMAP_DEVICE: u64 = 24;
 pub const SYS_VIRT_TO_PHYS: u64 = 25;
 pub const SYS_IRQ_WAIT: u64 = 26;
+pub const SYS_GETCHAR: u64 = 27;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -149,6 +150,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_MMAP_DEVICE => sys_mmap_device(a0, a1),
         SYS_VIRT_TO_PHYS => sys_virt_to_phys(a0),
         SYS_IRQ_WAIT => sys_irq_wait(a0, a1),
+        SYS_GETCHAR => sys_getchar(),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -587,6 +589,13 @@ fn sys_irq_wait(irq_num: u64, mmio_base: u64) -> u64 {
 
     // Subsequent calls: block until IRQ fires.
     crate::io::irq_dispatch::wait(irq)
+}
+
+fn sys_getchar() -> u64 {
+    match crate::arch::platform::serial::getc() {
+        Some(ch) => ch as u64,
+        None => u64::MAX,
+    }
 }
 
 /// Copy `dst.len()` bytes from user virtual address `user_va` into `dst`,

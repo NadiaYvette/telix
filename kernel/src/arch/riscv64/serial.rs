@@ -12,6 +12,7 @@ const THR: usize = 0x00; // Transmitter Holding Register (write)
 const LSR: usize = 0x05; // Line Status Register (read)
 
 // LSR bits.
+const LSR_DR: u8 = 1 << 0;   // Data Ready
 const LSR_THRE: u8 = 1 << 5; // Transmit Holding Register Empty
 
 struct Uart16550;
@@ -38,6 +39,18 @@ impl fmt::Write for Uart16550 {
             self.putc(byte);
         }
         Ok(())
+    }
+}
+
+/// Read a single byte from the UART (non-blocking).
+pub fn getc() -> Option<u8> {
+    let base = UART_BASE as *mut u8;
+    unsafe {
+        if core::ptr::read_volatile(base.add(LSR)) & LSR_DR == 0 {
+            None
+        } else {
+            Some(core::ptr::read_volatile(base.add(THR)))
+        }
     }
 }
 

@@ -21,6 +21,9 @@ const FS_OPEN: u64 = 0x2000;
 const FS_OPEN_OK: u64 = 0x2001;
 const FS_READ: u64 = 0x2100;
 const FS_READ_OK: u64 = 0x2101;
+const FS_READDIR: u64 = 0x2200;
+const FS_READDIR_OK: u64 = 0x2201;
+const FS_READDIR_END: u64 = 0x2202;
 const FS_CLOSE: u64 = 0x2400;
 const FS_ERROR: u64 = 0x2F00;
 
@@ -517,6 +520,91 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     );
                     syscall::send(reply_port, FS_READ_OK,
                         inline_len as u64, packed[0], packed[1], packed[2]);
+                }
+            }
+
+            FS_READDIR => {
+                // data[0] = entry_index, data[2] = reply_port (low 32)
+                let start_index = msg.data[0] as u32;
+                let reply_port = (msg.data[2] & 0xFFFF_FFFF) as u32;
+
+                // Iterate root directory from start_index.
+                let entries_per_sector = 16u32; // 512 / 32
+                let total_entries = (layout.root_dir_sectors * entries_per_sector) as u32;
+                let mut found = false;
+
+                let mut idx = start_index;
+                while idx < total_entries {
+                    let sector_idx = idx / entries_per_sector;
+                    let entry_in_sector = idx % entries_per_sector;
+
+                    let mut sec = [0u8; 512];
+                    if !blk.read_sector(layout.root_dir_start + sector_idx, &mut sec) {
+                        break;
+                    }
+
+                    let off = (entry_in_sector * 32) as usize;
+                    let first_byte = sec[off];
+                    if first_byte == 0x00 {
+                        break; // No more entries.
+                    }
+                    idx += 1;
+                    if first_byte == 0xE5 {
+                        continue; // Deleted.
+                    }
+                    let attrs = sec[off + 11];
+                    if attrs & 0x08 != 0 || attrs & 0x10 != 0 {
+                        continue; // Volume label or subdirectory.
+                    }
+
+                    // Format 8.3 name with dot: "HELLO   TXT" → "HELLO.TXT"
+                    let raw_name = &sec[off..off + 11];
+                    let mut name = [0u8; 13]; // max "12345678.123"
+                    let mut ni = 0;
+                    // Copy base name (trimming trailing spaces).
+                    let mut base_end = 8;
+                    while base_end > 0 && raw_name[base_end - 1] == b' ' {
+                        base_end -= 1;
+                    }
+                    for i in 0..base_end {
+                        name[ni] = raw_name[i];
+                        ni += 1;
+                    }
+                    // Copy extension (trimming trailing spaces).
+                    let mut ext_end = 3;
+                    while ext_end > 0 && raw_name[8 + ext_end - 1] == b' ' {
+                        ext_end -= 1;
+                    }
+                    if ext_end > 0 {
+                        name[ni] = b'.';
+                        ni += 1;
+                        for i in 0..ext_end {
+                            name[ni] = raw_name[8 + i];
+                            ni += 1;
+                        }
+                    }
+
+                    let file_size = read_u32(&sec, off + 28);
+
+                    // Pack name into 2 u64 words.
+                    let mut name_lo = 0u64;
+                    let mut name_hi = 0u64;
+                    for i in 0..ni.min(8) {
+                        name_lo |= (name[i] as u64) << (i * 8);
+                    }
+                    for i in 8..ni.min(16) {
+                        name_hi |= (name[i] as u64) << ((i - 8) * 8);
+                    }
+
+                    // FS_READDIR_OK: data[0]=file_size, data[1]=name_lo, data[2]=name_hi, data[3]=next_index
+                    syscall::send(reply_port, FS_READDIR_OK,
+                        file_size as u64, name_lo, name_hi, idx as u64);
+                    found = true;
+                    break;
+                }
+
+                if !found {
+                    syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
                 }
             }
 

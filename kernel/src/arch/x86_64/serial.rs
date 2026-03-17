@@ -11,6 +11,7 @@ const THR: u16 = 0; // Transmit Holding Register (write)
 const LSR: u16 = 5; // Line Status Register (read)
 
 // LSR bits.
+const LSR_DR: u8 = 1 << 0;   // Data Ready
 const LSR_THRE: u8 = 1 << 5; // Transmit Holding Register Empty
 
 #[inline]
@@ -48,6 +49,17 @@ impl fmt::Write for Serial {
             self.putc(byte);
         }
         Ok(())
+    }
+}
+
+/// Read a single byte from the UART (non-blocking).
+pub fn getc() -> Option<u8> {
+    unsafe {
+        if inb(COM1_PORT + LSR) & LSR_DR == 0 {
+            None
+        } else {
+            Some(inb(COM1_PORT + THR))
+        }
     }
 }
 

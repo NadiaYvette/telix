@@ -12,6 +12,7 @@ const UARTDR: usize = 0x000; // Data register
 const UARTFR: usize = 0x018; // Flag register
 
 // Flag register bits.
+const UARTFR_RXFE: u32 = 1 << 4; // Receive FIFO empty
 const UARTFR_TXFF: u32 = 1 << 5; // Transmit FIFO full
 
 struct Pl011;
@@ -38,6 +39,18 @@ impl fmt::Write for Pl011 {
             self.putc(byte);
         }
         Ok(())
+    }
+}
+
+/// Read a single byte from the UART (non-blocking).
+pub fn getc() -> Option<u8> {
+    let base = PL011_BASE as *mut u32;
+    unsafe {
+        if core::ptr::read_volatile(base.byte_add(UARTFR)) & UARTFR_RXFE != 0 {
+            None
+        } else {
+            Some(core::ptr::read_volatile(base.byte_add(UARTDR)) as u8)
+        }
     }
 }
 

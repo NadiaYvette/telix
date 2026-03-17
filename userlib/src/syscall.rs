@@ -5,8 +5,10 @@ use crate::arch;
 // Syscall numbers (must match kernel/src/syscall/handlers.rs).
 const SYS_DEBUG_PUTCHAR: u64 = 0;
 const SYS_PORT_CREATE: u64 = 1;
+const SYS_PORT_DESTROY: u64 = 2;
 const SYS_SEND: u64 = 3;
 const SYS_SEND_NB: u64 = 9;
+const SYS_RECV_NB: u64 = 10;
 const SYS_RECV: u64 = 4;
 const SYS_YIELD: u64 = 7;
 const SYS_THREAD_ID: u64 = 8;
@@ -23,6 +25,7 @@ const SYS_GET_INITRAMFS_PORT: u64 = 21;
 const SYS_MMAP_DEVICE: u64 = 24;
 const SYS_VIRT_TO_PHYS: u64 = 25;
 const SYS_IRQ_WAIT: u64 = 26;
+const SYS_GETCHAR: u64 = 27;
 const SYS_PORT_SET_CREATE: u64 = 5;
 const SYS_PORT_SET_ADD: u64 = 6;
 #[allow(dead_code)]
@@ -42,6 +45,11 @@ pub fn debug_puts(s: &[u8]) {
 /// Create a new IPC port. Returns port ID or u64::MAX on error.
 pub fn port_create() -> u64 {
     unsafe { arch::syscall0(SYS_PORT_CREATE) }
+}
+
+/// Destroy an IPC port, freeing the port ID for reuse.
+pub fn port_destroy(port: u32) {
+    unsafe { arch::syscall1(SYS_PORT_DESTROY, port as u64); }
 }
 
 /// Non-blocking send on a port.
@@ -252,7 +260,7 @@ pub fn ns_lookup(name: &[u8]) -> Option<u32> {
     } else {
         None
     };
-    // We don't destroy the reply port (no syscall for it in userlib yet).
+    port_destroy(reply_port);
     result
 }
 
@@ -274,6 +282,84 @@ pub fn irq_wait(irq: u32, mmio_base: usize) -> u64 {
     unsafe { arch::syscall2(SYS_IRQ_WAIT, irq as u64, mmio_base as u64) }
 }
 
+/// Non-blocking read of a single character from the serial console.
+pub fn getchar() -> Option<u8> {
+    let r = unsafe { arch::syscall0(SYS_GETCHAR) };
+    if r == u64::MAX { None } else { Some(r as u8) }
+}
+
+/// Non-blocking receive that returns the full message, or None if queue is empty.
+pub fn recv_nb_msg(port: u32) -> Option<Message> {
+    let status: u64;
+    let r1: u64;
+    let r2: u64;
+    let r3: u64;
+    let r4: u64;
+    let r5: u64;
+    let r6: u64;
+    let r7: u64;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_RECV_NB,
+            inlateout("x0") port as u64 => status,
+            lateout("x1") r1,
+            lateout("x2") r2,
+            lateout("x3") r3,
+            lateout("x4") r4,
+            lateout("x5") r5,
+            lateout("x6") r6,
+            lateout("x7") r7,
+        );
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a7") SYS_RECV_NB as u64 => r7,
+            inlateout("a0") port as u64 => status,
+            lateout("a1") r1,
+            lateout("a2") r2,
+            lateout("a3") r3,
+            lateout("a4") r4,
+            lateout("a5") r5,
+            lateout("a6") r6,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "int 0x80",
+            "mov {r7}, rbx",
+            "pop rbx",
+            r7 = lateout(reg) r7,
+            inlateout("rax") SYS_RECV_NB => status,
+            inlateout("rdi") port as u64 => r1,
+            lateout("rsi") r2,
+            lateout("rdx") r3,
+            lateout("r10") r4,
+            lateout("r8") r5,
+            lateout("r9") r6,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+
+    if status != 0 {
+        return None;
+    }
+
+    Some(Message {
+        tag: r1,
+        data: [r2, r3, r4, r5, r6, r7],
+    })
+}
+
 /// Register a service with the name server.
 pub fn ns_register(name: &[u8], service_port: u32) -> bool {
     let nsrv = nsrv_port();
@@ -287,9 +373,11 @@ pub fn ns_register(name: &[u8], service_port: u32) -> bool {
     // data[0..1] = name, data[2] = service_port, data[3] = name_len | reply_port
     send(nsrv, 0x1000, n0, n1, service_port as u64, d3);
 
-    if let Some(reply) = recv_msg(reply_port) {
+    let result = if let Some(reply) = recv_msg(reply_port) {
         reply.tag == 0x1001
     } else {
         false
-    }
+    };
+    port_destroy(reply_port);
+    result
 }

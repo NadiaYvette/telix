@@ -150,13 +150,21 @@ static PORT_TABLE: SpinLock<PortTable> = SpinLock::new(PortTable::new());
 /// Create a new port. Returns its ID.
 pub fn create() -> Option<PortId> {
     let mut table = PORT_TABLE.lock();
+    // First try the fast path: allocate from next_id.
     let id = table.next_id;
-    if id as usize >= MAX_PORTS {
-        return None;
+    if (id as usize) < MAX_PORTS {
+        table.ports[id as usize] = Port::new(id);
+        table.next_id += 1;
+        return Some(id);
     }
-    table.ports[id as usize] = Port::new(id);
-    table.next_id += 1;
-    Some(id)
+    // Slow path: scan for a destroyed (inactive) port to reuse.
+    for i in 0..MAX_PORTS {
+        if !table.ports[i].active {
+            table.ports[i] = Port::new(i as u32);
+            return Some(i as u32);
+        }
+    }
+    None
 }
 
 /// Send a message to a port (non-blocking).

@@ -158,6 +158,12 @@ pub fn kmain() -> ! {
         }
     }
 
+    // Spawn console server (userspace, all architectures).
+    match sched::spawn_user(b"console_srv", 50, 20, 0) {
+        Some(tid) => println!("  console_srv spawned (thread {})", tid),
+        None => println!("  WARNING: console_srv not found (ok if not yet built)"),
+    }
+
     // Spawn FAT16 filesystem server (userspace, connects to blk_srv via IPC).
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     match sched::spawn_user(b"fat16_srv", 50, 20, 0) {
