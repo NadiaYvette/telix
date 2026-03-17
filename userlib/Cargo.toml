@@ -30,3 +30,7 @@ path = "bin/ramdisk_srv.rs"
 [[bin]]
 name = "blk_srv"
 path = "bin/blk_srv.rs"
+
+[[bin]]
+name = "fat16_srv"
+path = "bin/fat16_srv.rs"

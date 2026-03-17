@@ -431,7 +431,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         };
 
         if blk_aspace != 0 {
-            // Allocate buffer page and fill with 0xA5 pattern.
+            // Non-destructive test: read sector 0, verify FAT16 boot signature (0x55AA).
             let blk_buf = match syscall::mmap_anon(0, 1, 1) {
                 Some(va) => va,
                 None => {
@@ -440,58 +440,31 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             };
 
-            // Fill first 512 bytes with 0xA5 pattern.
-            for i in 0..512 {
-                unsafe { *((blk_buf + i) as *mut u8) = 0xA5; }
-            }
-
             // Grant buffer to blk server.
             let blk_grant_va: usize = 0x5_0000_0000;
             syscall::grant_pages(blk_aspace, blk_buf, blk_grant_va, 1, false);
 
-            // IO_WRITE 512 bytes at offset 0: data[0]=handle, data[1]=offset, data[2]=len|(reply<<32), data[3]=grant_va
-            let blk_wr_d2 = 512u64 | ((blk_reply as u64) << 32);
-            syscall::send(bp, 0x300, 0, 0, blk_wr_d2, blk_grant_va as u64);
-
-            if let Some(rr) = syscall::recv_msg(blk_reply) {
-                if rr.tag == 0x301 {
-                    syscall::debug_puts(b"  init: blk wrote ");
-                    print_num(rr.data[0]);
-                    syscall::debug_puts(b" bytes\n");
-                } else {
-                    syscall::debug_puts(b"  init: blk write error\n");
-                }
-            }
-
-            // Revoke grant, zero the buffer.
-            syscall::revoke(blk_aspace, blk_grant_va);
-            for i in 0..512 {
-                unsafe { *((blk_buf + i) as *mut u8) = 0; }
-            }
-
-            // Grant buffer again for read.
-            syscall::grant_pages(blk_aspace, blk_buf, blk_grant_va, 1, false);
-
-            // IO_READ 512 bytes at offset 0.
+            // IO_READ 512 bytes at offset 0 (sector 0 = boot sector).
             let blk_rd_d2 = 512u64 | ((blk_reply as u64) << 32);
             syscall::send(bp, 0x200, 0, 0, blk_rd_d2, blk_grant_va as u64);
 
             if let Some(rr) = syscall::recv_msg(blk_reply) {
                 if rr.tag == 0x201 {
                     let bytes_read = rr.data[0] as usize;
-                    // Verify 0xA5 pattern.
-                    let mut ok = bytes_read == 512;
-                    for i in 0..512 {
-                        let b = unsafe { *((blk_buf + i) as *const u8) };
-                        if b != 0xA5 {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    if ok {
+                    // Verify boot signature at bytes 510-511.
+                    let sig0 = unsafe { *((blk_buf + 510) as *const u8) };
+                    let sig1 = unsafe { *((blk_buf + 511) as *const u8) };
+                    if bytes_read == 512 && sig0 == 0x55 && sig1 == 0xAA {
                         syscall::debug_puts(b"Phase 8 async block I/O: PASSED\n");
                     } else {
-                        syscall::debug_puts(b"Phase 8 async block I/O: DATA MISMATCH\n");
+                        syscall::debug_puts(b"  init: boot sig=");
+                        print_num(sig0 as u64);
+                        syscall::debug_puts(b",");
+                        print_num(sig1 as u64);
+                        syscall::debug_puts(b" bytes=");
+                        print_num(bytes_read as u64);
+                        syscall::debug_puts(b"\n");
+                        syscall::debug_puts(b"Phase 8 async block I/O: SIGNATURE MISMATCH\n");
                     }
                 } else {
                     syscall::debug_puts(b"  init: blk read error\n");
@@ -504,6 +477,95 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     } else {
         syscall::debug_puts(b"  init: blk not found, skipping block test\n");
         syscall::debug_puts(b"Phase 8 async block I/O: SKIPPED (no blk device)\n");
+    }
+
+    // --- Test 9: FAT16 filesystem via fat16_srv ---
+    syscall::debug_puts(b"  init: testing FAT16 filesystem...\n");
+
+    // Wait for fat16_srv to register.
+    let mut fat16_port: Option<u32> = None;
+    for _ in 0..500 {
+        if let Some(p) = syscall::ns_lookup(b"fat16") {
+            fat16_port = Some(p);
+            break;
+        }
+        syscall::yield_now();
+    }
+
+    if let Some(fp) = fat16_port {
+        syscall::debug_puts(b"  init: ns_lookup(fat16) = port ");
+        print_num(fp as u64);
+        syscall::debug_puts(b"\n");
+
+        let fs_reply = syscall::port_create() as u32;
+
+        // FS_OPEN "HELLO.TXT"
+        let fname = b"HELLO.TXT";
+        let (fn0, fn1, _) = pack_name(fname);
+        let fs_d2 = (fname.len() as u64) | ((fs_reply as u64) << 32);
+        syscall::send(fp, 0x2000, fn0, fn1, fs_d2, 0);
+
+        let mut fs_ok = false;
+        if let Some(reply) = syscall::recv_msg(fs_reply) {
+            if reply.tag == 0x2001 {
+                let handle = reply.data[0];
+                let file_size = reply.data[1];
+                syscall::debug_puts(b"  init: FS_OPEN ok, handle=");
+                print_num(handle);
+                syscall::debug_puts(b" size=");
+                print_num(file_size);
+                syscall::debug_puts(b"\n");
+
+                if file_size == 17 {
+                    // FS_READ inline (17 bytes fits in 3 words = 24 bytes max)
+                    let rd_d2 = file_size | ((fs_reply as u64) << 32);
+                    syscall::send(fp, 0x2100, handle, 0, rd_d2, 0);
+
+                    if let Some(rr) = syscall::recv_msg(fs_reply) {
+                        if rr.tag == 0x2101 {
+                            let bytes_read = rr.data[0] as usize;
+                            // Unpack inline data from words 1..3
+                            let expected = b"Hello from FAT16!";
+                            let mut match_ok = bytes_read == 17;
+                            let words = [rr.data[1], rr.data[2], rr.data[3]];
+                            for i in 0..17 {
+                                let got = (words[i / 8] >> ((i % 8) * 8)) as u8;
+                                if got != expected[i] {
+                                    match_ok = false;
+                                    break;
+                                }
+                            }
+                            if match_ok {
+                                syscall::debug_puts(b"  init: FAT16 content verified\n");
+                                fs_ok = true;
+                            } else {
+                                syscall::debug_puts(b"  init: FAT16 content MISMATCH\n");
+                            }
+                        } else {
+                            syscall::debug_puts(b"  init: FS_READ failed\n");
+                        }
+                    }
+
+                    // FS_CLOSE
+                    syscall::send_nb(fp, 0x2400, handle, 0);
+                } else {
+                    syscall::debug_puts(b"  init: unexpected file size\n");
+                }
+            } else {
+                syscall::debug_puts(b"  init: FS_OPEN failed, tag=");
+                print_num(reply.tag);
+                syscall::debug_puts(b"\n");
+            }
+        }
+
+        if fs_ok {
+            syscall::debug_puts(b"Phase 10 FAT16 filesystem: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 10 FAT16 filesystem: FAILED\n");
+        }
+    } else {
+        syscall::debug_puts(b"  init: fat16 not found, skipping\n");
+        syscall::debug_puts(b"Phase 10 FAT16 filesystem: SKIPPED\n");
     }
 
     // Init loops forever, yielding.
