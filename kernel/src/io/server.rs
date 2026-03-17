@@ -6,6 +6,7 @@ use crate::ipc::Message;
 /// Run a server event loop: block on the given port and dispatch
 /// each message to the handler function.
 /// The handler receives the port ID the message arrived on and the message.
+#[allow(dead_code)]
 pub fn server_loop(service_port: PortId, handler: fn(PortId, Message)) -> ! {
     loop {
         match port::recv(service_port) {

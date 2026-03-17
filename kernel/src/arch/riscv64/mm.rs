@@ -79,6 +79,7 @@ pub fn setup_tables() -> Option<usize> {
 }
 
 /// Add user 4K page mappings to an existing root table.
+#[allow(dead_code)]
 pub fn map_user_pages(
     root: usize,
     virt: usize,
@@ -279,7 +280,7 @@ pub fn free_page_table_tree(root_addr: usize) {
 unsafe fn free_sv39_l1(l1: usize) {
     let table = l1 as *const u64;
     for i in 0..512 {
-        let entry = *table.add(i);
+        let entry = unsafe { *table.add(i) };
         if entry & PTE_V != 0 && entry & (PTE_R | PTE_W | PTE_X) == 0 {
             // Non-leaf: L0 table pointer.
             let l0 = ((entry >> 10) << 12) as usize;

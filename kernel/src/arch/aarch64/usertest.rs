@@ -39,6 +39,7 @@
 ///     svc #0
 ///     b spin
 /// ```
+#[allow(dead_code)]
 pub static USER_CODE: &[u8] = &[
     // mov x8, #0
     0x08, 0x00, 0x80, 0xD2,

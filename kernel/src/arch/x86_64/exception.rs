@@ -34,6 +34,7 @@ pub struct ExceptionFrame {
 }
 
 // Named indices into ExceptionFrame.regs for convenience.
+#[allow(dead_code)]
 impl ExceptionFrame {
     pub fn rax(&self) -> u64 { self.regs[14] }
     pub fn rbx(&self) -> u64 { self.regs[13] }
@@ -70,9 +71,11 @@ impl ExceptionFrame {
 }
 
 /// Number of u64 values in the exception frame.
+#[allow(dead_code)]
 pub const FRAME_SIZE_U64: usize = 22;
 
 /// Size of the exception frame in bytes.
+#[allow(dead_code)]
 pub const EXCEPTION_FRAME_SIZE: usize = FRAME_SIZE_U64 * 8; // 176 bytes
 
 /// Common interrupt/exception handler called from assembly.

@@ -43,7 +43,7 @@ pub fn init() {
 
 /// Handle PIT timer interrupt (IRQ 0). Called from interrupt handler.
 pub fn handle_timer_irq() {
-    let ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
     // Uncomment for debugging:
     // if ticks % 100 == 0 { crate::println!("[tick {}]", ticks); }

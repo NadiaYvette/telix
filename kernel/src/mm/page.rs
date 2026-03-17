@@ -2,6 +2,7 @@
 
 /// Hardware MMU page size (4 KiB on all supported architectures).
 pub const MMUPAGE_SIZE: usize = 4096;
+#[allow(dead_code)]
 pub const MMUPAGE_SHIFT: usize = 12;
 
 /// Allocation page size: configurable multiple of MMUPAGE_SIZE.
@@ -54,6 +55,7 @@ impl PhysAddr {
     }
 
     /// Page number (index of the allocation page containing this address).
+    #[allow(dead_code)]
     pub const fn page_number(self) -> usize {
         self.0 >> PAGE_SHIFT
     }

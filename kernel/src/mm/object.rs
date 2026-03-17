@@ -5,7 +5,7 @@
 //! Objects track their physical backing (via the extent tree) and the
 //! set of address spaces that map them.
 
-use super::page::{PhysAddr, PAGE_SIZE};
+use super::page::PhysAddr;
 use super::phys;
 use crate::sync::SpinLock;
 

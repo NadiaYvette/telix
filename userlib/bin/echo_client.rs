@@ -5,6 +5,7 @@ extern crate userlib;
 
 use userlib::syscall;
 
+#[allow(dead_code)]
 fn print_hex(n: u64) {
     syscall::debug_puts(b"0x");
     if n == 0 {

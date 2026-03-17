@@ -54,7 +54,7 @@ pub fn init_ap() {
 
 /// Handle timer interrupt: reset the timer and increment tick count.
 pub fn handle_timer_irq() {
-    let ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
     // Reset the timer for the next interval.
     let interval = TIMER_INTERVAL.load(Ordering::Relaxed);

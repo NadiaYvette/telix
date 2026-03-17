@@ -128,6 +128,7 @@ pub fn enable_interrupts() {
 
 /// Re-arm the timer so the next interrupt is one interval from now.
 /// Used before entering U-mode to prevent a stale timer firing immediately.
+#[allow(dead_code)]
 pub fn rearm_timer() {
     let interval = TIMER_INTERVAL.load(Ordering::Relaxed);
     let now = read_time();
@@ -171,7 +172,7 @@ fn handle_external_irq() {
 
 /// Handle timer interrupt: reset the timer and increment tick count.
 fn handle_timer_irq() {
-    let ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
     // Rearm the timer.
     let interval = TIMER_INTERVAL.load(Ordering::Relaxed);

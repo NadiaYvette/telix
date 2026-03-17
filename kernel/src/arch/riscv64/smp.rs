@@ -20,6 +20,7 @@ static AP_STACK_TOPS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_
 
 /// CPU index for each hart (written by BSP, read by secondary).
 /// Maps hart_id → cpu_index.
+#[allow(dead_code)]
 static HART_TO_CPU: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
 /// SBI ecall: hart_start(hartid, start_addr, opaque).

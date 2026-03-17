@@ -11,6 +11,7 @@ const GICD_BASE: usize = 0x0800_0000;
 const GICD_CTLR: usize = GICD_BASE + 0x000;
 const GICD_ISENABLER: usize = GICD_BASE + 0x100; // Array of 32-bit registers
 const GICD_IPRIORITYR: usize = GICD_BASE + 0x400; // Array of 8-bit fields
+#[allow(dead_code)]
 const GICD_ITARGETSR: usize = GICD_BASE + 0x800; // Array of 8-bit fields
 
 // GICR (Redistributor) registers — one per CPU, 128 KiB stride
@@ -25,6 +26,7 @@ const GICR_IPRIORITYR_OFFSET: usize = 0x400;
 
 // Interrupt IDs
 pub const INTID_TIMER_EL1_PHYS: u32 = 30; // PPI: EL1 physical timer (CNTP)
+#[allow(dead_code)]
 pub const INTID_VIRTIO_BLK: u32 = 48; // SPI: virtio-blk (device at 0x0a003e00)
 const INTID_SPURIOUS: u32 = 1023;
 

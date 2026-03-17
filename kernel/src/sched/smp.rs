@@ -128,6 +128,7 @@ pub fn init_ap(cpu: u32, idle_thread: ThreadId) {
 }
 
 /// Number of CPUs currently online.
+#[allow(dead_code)]
 pub fn online_cpus() -> u32 {
     ONLINE_CPUS.load(Ordering::Acquire)
 }

@@ -51,6 +51,7 @@ pub fn setup_tables() -> Option<usize> {
 ///
 /// Non-leaf entries are created with U/S=1 so the CPU allows user-mode
 /// page walks through the hierarchy.
+#[allow(dead_code)]
 pub fn map_user_pages(
     pml4: usize,
     virt: usize,
@@ -340,10 +341,10 @@ pub fn free_page_table_tree(root: usize) {
 unsafe fn free_pdpt_user(pdpt: usize) {
     let table = pdpt as *const u64;
     for i in 0..512 {
-        let entry = *table.add(i);
+        let entry = unsafe { *table.add(i) };
         if entry & PTE_P != 0 && entry & PTE_PS == 0 {
             let pd = (entry & 0x000F_FFFF_FFFF_F000) as usize;
-            free_pd_user(pd);
+            unsafe { free_pd_user(pd) };
             crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(pd));
         }
     }
@@ -353,7 +354,7 @@ unsafe fn free_pdpt_user(pdpt: usize) {
 unsafe fn free_pd_user(pd: usize) {
     let table = pd as *const u64;
     for i in 0..512 {
-        let entry = *table.add(i);
+        let entry = unsafe { *table.add(i) };
         if entry & PTE_P != 0 && entry & PTE_PS == 0 {
             let pt = (entry & 0x000F_FFFF_FFFF_F000) as usize;
             // PT is a leaf table — just free it (leaf PTEs point to user pages,

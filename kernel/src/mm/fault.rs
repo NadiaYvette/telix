@@ -7,7 +7,7 @@
 
 use super::aspace::{self, ASpaceId};
 use super::object;
-use super::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE};
+use super::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT};
 use super::stats;
 use core::sync::atomic::Ordering;
 
@@ -23,6 +23,7 @@ pub enum FaultType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultResult {
     /// Fault handled successfully.
+    #[allow(dead_code)]
     Handled,
     /// Major fault: had to allocate and zero a new page.
     HandledMajor,

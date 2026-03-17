@@ -28,6 +28,7 @@ struct SlabHeader {
 /// A cache of fixed-size objects.
 pub struct SlabCache {
     obj_size: usize,        // Size of each object (rounded up to align)
+    #[allow(dead_code)]
     obj_align: usize,       // Alignment of each object
     slab_pages: [usize; MAX_SLABS], // Physical addresses of slab pages (0 = empty)
     slab_count: usize,      // Number of active slabs

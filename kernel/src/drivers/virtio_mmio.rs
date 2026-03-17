@@ -7,6 +7,7 @@
 pub const MAGIC_VALUE: usize = 0x000;
 pub const VERSION: usize = 0x004;
 pub const DEVICE_ID: usize = 0x008;
+#[allow(dead_code)]
 pub const VENDOR_ID: usize = 0x00C;
 pub const DEVICE_FEATURES: usize = 0x010;
 pub const DEVICE_FEATURES_SEL: usize = 0x014;
@@ -17,6 +18,7 @@ pub const GUEST_PAGE_SIZE: usize = 0x028;
 pub const QUEUE_SEL: usize = 0x030;
 pub const QUEUE_NUM_MAX: usize = 0x034;
 pub const QUEUE_NUM: usize = 0x038;
+#[allow(dead_code)]
 pub const QUEUE_ALIGN: usize = 0x03C;
 pub const QUEUE_PFN: usize = 0x040;
 /// Modern (v2) registers.

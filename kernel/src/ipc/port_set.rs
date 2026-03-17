@@ -13,6 +13,7 @@ const MAX_SET_PORTS: usize = 16;
 
 /// A set of ports that can be waited on together.
 pub struct PortSet {
+    #[allow(dead_code)]
     pub id: PortSetId,
     pub active: bool,
     ports: [PortId; MAX_SET_PORTS],
@@ -106,6 +107,7 @@ pub fn add_port(set_id: PortSetId, port_id: PortId) -> bool {
 }
 
 /// Try to receive from any port in a set (non-blocking).
+#[allow(dead_code)]
 pub fn recv(set_id: PortSetId) -> Option<(PortId, Message)> {
     let table = PORT_SET_TABLE.lock();
     if (set_id as usize) < MAX_PORT_SETS {

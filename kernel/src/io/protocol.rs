@@ -3,6 +3,7 @@
 //! All I/O uses the kernel's fixed-size IPC messages (tag + 6 data words).
 //! Tags identify the operation; data words carry arguments/results.
 
+
 // --- Message tags ---
 
 /// Client → server: open a channel to a named resource.
@@ -45,10 +46,12 @@ pub const IO_READ_OK: u64 = 0x201;
 ///   data[3] = client reply port ID
 ///   data[4] = inline data or grant VA
 ///   data[5] = flags
+#[allow(dead_code)]
 pub const IO_WRITE: u64 = 0x300;
 
 /// Server → client: write completed.
 ///   data[0] = bytes written
+#[allow(dead_code)]
 pub const IO_WRITE_OK: u64 = 0x301;
 
 /// Client → server: stat request (query metadata).
@@ -72,6 +75,7 @@ pub const IO_ERROR: u64 = 0xF00;
 // --- I/O flags ---
 
 /// Grant-based I/O (as opposed to inline).
+#[allow(dead_code)]
 pub const FLAG_GRANT: u64 = 1;
 
 // --- Name server tags ---
@@ -87,8 +91,10 @@ pub const NS_LOOKUP_OK: u64 = 0x1101;
 
 // --- Error codes ---
 pub const ERR_NOT_FOUND: u64 = 1;
+#[allow(dead_code)]
 pub const ERR_IO: u64 = 2;
 pub const ERR_INVALID: u64 = 3;
+#[allow(dead_code)]
 pub const ERR_FULL: u64 = 4;
 
 // --- Helpers ---

@@ -9,6 +9,7 @@ unsafe extern "C" {
 }
 
 /// Get the user test code as a byte slice.
+#[allow(dead_code)]
 pub fn user_code() -> &'static [u8] {
     unsafe {
         let start = &_usertest_start as *const u8;

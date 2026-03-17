@@ -153,6 +153,7 @@ impl Cdt {
 
     /// Remove a single node from the CDT (and all its descendants).
     /// Returns the number of nodes removed.
+    #[allow(dead_code)]
     pub fn remove(&mut self, idx: u32) -> usize {
         if idx as usize >= MAX_CDT_NODES || !self.nodes[idx as usize].active {
             return 0;
@@ -168,6 +169,7 @@ impl Cdt {
     }
 
     /// Get the task_id and slot_index for a CDT node (for revocation callbacks).
+    #[allow(dead_code)]
     pub fn get_location(&self, idx: u32) -> Option<(u32, u16)> {
         if idx as usize >= MAX_CDT_NODES || !self.nodes[idx as usize].active {
             return None;
@@ -214,6 +216,7 @@ impl Cdt {
     }
 
     /// Remove `child` from `parent`'s child linked list.
+    #[allow(dead_code)]
     fn unlink_child(&mut self, parent: u32, child: u32) {
         let first = self.nodes[parent as usize].first_child;
         if first == child {

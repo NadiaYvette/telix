@@ -18,6 +18,7 @@ pub enum GrantError {
     /// Failed to create destination VMA.
     DestMapFailed,
     /// Failed to install PTEs in destination.
+    #[allow(dead_code)]
     PteFailed,
 }
 

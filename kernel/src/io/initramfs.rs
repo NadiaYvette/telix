@@ -4,7 +4,7 @@
 //! `include_bytes!`. The server parses the archive at startup into a
 //! fixed-size file table, then handles I/O protocol messages.
 
-use crate::ipc::port::{self, PortId};
+use crate::ipc::port::{self};
 use crate::ipc::Message;
 use super::protocol::*;
 use core::sync::atomic::{AtomicU32, Ordering};

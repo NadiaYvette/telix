@@ -30,6 +30,7 @@ impl CNode {
     }
 
     /// Get a mutable reference to a slot by index.
+    #[allow(dead_code)]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut Capability> {
         if index < CNODE_SLOTS {
             Some(&mut self.slots[index])
@@ -52,6 +53,7 @@ impl CNode {
 
     /// Remove (null out) the capability at the given slot index.
     /// Returns the removed capability.
+    #[allow(dead_code)]
     pub fn remove(&mut self, index: usize) -> Option<Capability> {
         if index < CNODE_SLOTS {
             let old = self.slots[index];

@@ -111,7 +111,7 @@ pub fn kmain() -> ! {
         // Register initramfs with name server.
         {
             let nsrv = io::namesrv::NAMESRV_PORT.load(Ordering::Acquire);
-            let (n0, n1, n2) = io::protocol::pack_name(b"initramfs");
+            let (n0, n1, _n2) = io::protocol::pack_name(b"initramfs");
             let name_len = 9u64;
             let reply_port = ipc::port::create().expect("reg reply port");
             let d3 = name_len | ((reply_port as u64) << 32);
@@ -148,8 +148,10 @@ pub fn kmain() -> ! {
 }
 
 use core::sync::atomic::{AtomicU32, Ordering};
+#[allow(dead_code)]
 static IPC_TEST_PORT: AtomicU32 = AtomicU32::new(0);
 
+#[allow(dead_code)]
 fn ipc_sender() -> ! {
     let port_id = IPC_TEST_PORT.load(Ordering::Relaxed);
     let mut seq = 0u64;
@@ -169,6 +171,7 @@ fn ipc_sender() -> ! {
     loop { core::hint::spin_loop(); }
 }
 
+#[allow(dead_code)]
 fn ipc_receiver() -> ! {
     let port_id = IPC_TEST_PORT.load(Ordering::Relaxed);
     let mut received = 0u64;
@@ -227,6 +230,7 @@ fn test_capabilities() {
 // --- AArch64-specific tests ---
 
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 fn test_userspace_aarch64() {
     use arch::aarch64::mm;
     use arch::aarch64::usertest;
@@ -279,6 +283,7 @@ fn test_userspace_aarch64() {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 fn test_syscalls_aarch64() {
     let ret: u64;
     unsafe {
@@ -308,6 +313,7 @@ fn test_syscalls_aarch64() {
 // --- RISC-V specific tests ---
 
 #[cfg(target_arch = "riscv64")]
+#[allow(dead_code)]
 fn test_userspace_riscv64() {
     use arch::riscv64::mm;
     use arch::riscv64::usertest;
@@ -374,6 +380,7 @@ fn test_userspace_riscv64() {
 // --- x86-64 specific tests ---
 
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 fn test_syscalls_x86_64() {
     let ret: u64;
     unsafe {
@@ -401,6 +408,7 @@ fn test_syscalls_x86_64() {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 fn test_userspace_x86_64() {
     use arch::x86_64::{mm, usertest, gdt};
 
@@ -646,6 +654,7 @@ fn test_demand_paging() {
 
 // --- Phase 3: I/O test client ---
 
+#[allow(dead_code)]
 fn test_io_client() -> ! {
     use io::protocol::*;
 

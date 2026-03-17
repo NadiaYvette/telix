@@ -3,7 +3,7 @@
 //! Each address space owns a page table root and a B+ tree of VMAs.
 //! The WSCLOCK clock hand (VmaCursor) is also stored here.
 
-use super::object::{self, ObjectId};
+use super::object::{self};
 use super::vma::{Vma, VmaProt};
 use super::vmatree::{VmaCursor, VmaTree};
 use crate::sync::SpinLock;

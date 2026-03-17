@@ -5,7 +5,6 @@
 
 use super::virtio_mmio as mmio;
 use crate::mm::phys;
-use crate::mm::page::PhysAddr;
 use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 
 /// Virtqueue size (number of descriptors).

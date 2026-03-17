@@ -34,6 +34,7 @@ impl CapSpace {
     }
 
     /// Insert a capability at a specific slot as a root capability.
+    #[allow(dead_code)]
     pub fn insert_at(&mut self, slot: usize, mut cap: Capability, cdt: &mut Cdt) -> bool {
         if slot >= CNODE_SLOTS {
             return false;

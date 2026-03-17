@@ -2,7 +2,7 @@
 
 use crate::drivers::virtio_blk::VirtioBlk;
 use crate::drivers::virtio_mmio;
-use crate::ipc::port::{self, PortId};
+use crate::ipc::port::{self};
 use crate::ipc::Message;
 use super::protocol::*;
 use core::sync::atomic::{AtomicU32, Ordering};

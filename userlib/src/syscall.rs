@@ -22,6 +22,7 @@ const SYS_ASPACE_ID: u64 = 20;
 const SYS_GET_INITRAMFS_PORT: u64 = 21;
 const SYS_PORT_SET_CREATE: u64 = 5;
 const SYS_PORT_SET_ADD: u64 = 6;
+#[allow(dead_code)]
 const SYS_PORT_SET_RECV: u64 = 22;
 const SYS_NSRV_PORT: u64 = 23;
 
@@ -258,7 +259,7 @@ pub fn ns_register(name: &[u8], service_port: u32) -> bool {
     if nsrv == u32::MAX { return false; }
 
     let reply_port = port_create() as u32;
-    let (n0, n1, n2) = pack_name(name);
+    let (n0, n1, _n2) = pack_name(name);
     let d3 = (name.len() as u64) | ((reply_port as u64) << 32);
 
     // NS_REGISTER = 0x1000

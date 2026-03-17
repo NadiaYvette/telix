@@ -887,6 +887,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
 /// Save current interrupt state and enable IRQs. Returns saved state.
 /// Public so drivers (e.g. virtio_blk) can use polling with WFI.
 #[inline(always)]
+#[allow(dead_code)]
 pub fn arch_irq_save_enable() -> usize {
     arch_save_and_enable_irqs()
 }
@@ -894,6 +895,7 @@ pub fn arch_irq_save_enable() -> usize {
 /// Restore interrupt state.
 /// Public so drivers (e.g. virtio_blk) can use polling with WFI.
 #[inline(always)]
+#[allow(dead_code)]
 pub fn arch_irq_restore(saved: usize) {
     arch_restore_irqs(saved);
 }

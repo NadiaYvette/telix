@@ -13,6 +13,7 @@ const LAPIC_ICR_LOW: usize = 0x300;
 const LAPIC_ICR_HIGH: usize = 0x310;
 const LAPIC_TIMER_LVT: usize = 0x320;
 const LAPIC_TIMER_INIT: usize = 0x380;
+#[allow(dead_code)]
 const LAPIC_TIMER_CURRENT: usize = 0x390;
 const LAPIC_TIMER_DIV: usize = 0x3E0;
 

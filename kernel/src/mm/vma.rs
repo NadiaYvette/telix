@@ -4,6 +4,7 @@
 use super::page::{PAGE_MMUCOUNT, PAGE_SIZE};
 
 /// Maximum VMAs per address space.
+#[allow(dead_code)]
 pub const MAX_VMAS: usize = 32;
 
 /// Maximum allocation pages per VMA. With 64K pages, 256 pages = 16 MiB.
@@ -26,6 +27,7 @@ pub enum VmaProt {
 }
 
 impl VmaProt {
+    #[allow(dead_code)]
     pub fn readable(self) -> bool { true }
     pub fn writable(self) -> bool { matches!(self, Self::ReadWrite | Self::ReadWriteExec) }
     pub fn executable(self) -> bool { matches!(self, Self::ReadExec | Self::ReadWriteExec) }

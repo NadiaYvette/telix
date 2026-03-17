@@ -16,10 +16,12 @@ impl Rights {
     pub const EXEC: Rights = Rights(1 << 5);
     pub const MANAGE: Rights = Rights(1 << 6);  // Create/destroy child objects
 
+    #[allow(dead_code)]
     pub const fn bits(self) -> u32 {
         self.0
     }
 
+    #[allow(dead_code)]
     pub const fn from_bits(bits: u32) -> Self {
         Self(bits)
     }
@@ -30,6 +32,7 @@ impl Rights {
     }
 
     /// Intersection of two rights sets.
+    #[allow(dead_code)]
     pub const fn intersect(self, other: Rights) -> Rights {
         Rights(self.0 & other.0)
     }
@@ -40,6 +43,7 @@ impl Rights {
     }
 
     /// Check if any rights are set.
+    #[allow(dead_code)]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
@@ -76,6 +80,7 @@ impl core::fmt::Debug for Rights {
 /// The type of kernel object a capability references.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[allow(dead_code)]
 pub enum CapType {
     /// Empty/invalid slot.
     Null = 0,

@@ -84,6 +84,7 @@ pub fn setup_tables() -> Option<usize> {
 }
 
 /// Add user 4K page mappings to an existing L0 table.
+#[allow(dead_code)]
 pub fn map_user_pages(
     l0: usize,
     virt: usize,
@@ -292,6 +293,7 @@ pub fn translate_va(l0: usize, va: usize) -> Option<usize> {
 }
 
 /// Read the raw L3 PTE for a VA. Returns 0 if any level is missing.
+#[allow(dead_code)]
 pub fn read_pte(l0: usize, va: usize) -> u64 {
     let l0_table = l0 as *mut u64;
     let l0_idx = (va >> 39) & 0x1FF;
@@ -413,13 +415,13 @@ pub fn free_page_table_tree(root: usize) {
 unsafe fn free_l1_user(l1: usize) {
     let table = l1 as *const u64;
     for i in 0..512 {
-        let entry = *table.add(i);
+        let entry = unsafe { *table.add(i) };
         // Only recurse into table descriptors, not blocks.
         if entry & PT_VALID != 0 && entry & PT_TABLE != 0 {
             // Check if this is an L1 block (1 GiB) — block descriptors have bit 1 clear.
             // Actually, for L1 entries, bit 1 == 1 means table, bit 1 == 0 means block.
             let l2 = (entry & 0x0000_FFFF_FFFF_F000) as usize;
-            free_l2_user(l2);
+            unsafe { free_l2_user(l2) };
             crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l2));
         }
     }
@@ -429,7 +431,7 @@ unsafe fn free_l1_user(l1: usize) {
 unsafe fn free_l2_user(l2: usize) {
     let table = l2 as *const u64;
     for i in 0..512 {
-        let entry = *table.add(i);
+        let entry = unsafe { *table.add(i) };
         if entry & PT_VALID != 0 && entry & PT_TABLE != 0 {
             let l3 = (entry & 0x0000_FFFF_FFFF_F000) as usize;
             // L3 is a leaf table — just free it.

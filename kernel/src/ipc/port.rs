@@ -17,6 +17,7 @@ const MAX_WAITERS: usize = 8;
 
 /// A port's message queue.
 pub struct Port {
+    #[allow(dead_code)]
     pub id: PortId,
     pub active: bool,
     /// Circular buffer of queued messages.

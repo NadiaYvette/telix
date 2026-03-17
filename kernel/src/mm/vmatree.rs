@@ -49,7 +49,7 @@ struct InteriorNode {
 
 /// Leaf node. Stores (key, vma_ptr) pairs sorted by va_start.
 #[repr(C)]
-struct LeafNode {
+pub(crate) struct LeafNode {
     tag: NodeTag,
     entry_count: u8,
     _pad: [u8; 6],
@@ -299,6 +299,7 @@ impl VmaTree {
     }
 
     /// Return the first leaf node (for sequential iteration).
+    #[allow(dead_code)]
     pub fn first_leaf(&self) -> *mut LeafNode {
         if self.root.is_null() {
             return ptr::null_mut();
@@ -628,6 +629,7 @@ impl VmaIter {
 #[derive(Clone, Copy)]
 pub struct VmaCursor {
     /// Current leaf node.
+    #[allow(dead_code)]
     pub leaf: *mut LeafNode,
     /// Index within the current leaf.
     pub leaf_index: usize,

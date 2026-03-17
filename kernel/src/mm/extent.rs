@@ -23,6 +23,7 @@ use core::ptr;
 #[repr(transparent)]
 pub struct ExtentFlags(pub u16);
 
+#[allow(dead_code)]
 impl ExtentFlags {
     pub const NONE: Self = Self(0);
     pub const DIRTY: Self = Self(1 << 0);
@@ -110,7 +111,7 @@ struct InteriorNode {
 
 /// Leaf node of the B+ tree.
 #[repr(C)]
-struct LeafNode {
+pub(crate) struct LeafNode {
     tag: NodeTag,
     entry_count: u8,
     _pad: [u8; 6],
@@ -241,6 +242,7 @@ impl ExtentTree {
     }
 
     /// Look up a mutable reference to the extent containing `addr`.
+    #[allow(dead_code)]
     pub fn lookup_mut(&mut self, addr: PhysAddr) -> Option<&mut ExtentEntry> {
         if self.root.is_null() {
             return None;
@@ -693,6 +695,7 @@ impl ExtentTree {
     }
 
     /// Return the leftmost leaf (for iteration).
+    #[allow(dead_code)]
     pub fn first_leaf(&self) -> *mut LeafNode {
         if self.root.is_null() {
             return ptr::null_mut();

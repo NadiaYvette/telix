@@ -8,6 +8,7 @@ pub type ThreadId = u32;
 pub enum ThreadState {
     Ready,
     Running,
+    #[allow(dead_code)]
     Blocked,
     Dead,
 }
@@ -52,6 +53,7 @@ pub struct Thread {
     /// Physical address of the base of this thread's stack page.
     pub stack_base: usize,
     /// Why this thread is blocked (only valid when state == Blocked).
+    #[allow(dead_code)]
     pub blocked_on: BlockReason,
 }
 
