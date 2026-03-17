@@ -22,6 +22,7 @@ case "$ARCH" in
     x86_64)
         TARGET="x86_64-unknown-none"
         LINKER="$USERLIB/link-x86_64.ld"
+        EXTRA_RUSTFLAGS="-C relocation-model=static -C code-model=large"
         ;;
     *)
         echo "Unknown arch: $ARCH (expected aarch64, riscv64, x86_64)"
@@ -32,7 +33,7 @@ esac
 echo "Building userspace binaries for $ARCH ($TARGET)..."
 
 # Build with user linker script, overriding workspace rustflags.
-RUSTFLAGS="-C link-arg=-T$LINKER" \
+RUSTFLAGS="-C link-arg=-T$LINKER ${EXTRA_RUSTFLAGS:-}" \
     RUSTC="$RUSTC" "$CARGO" build \
     --target "$TARGET" \
     -p telix-userlib \

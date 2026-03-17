@@ -139,6 +139,9 @@ extern "C" fn ap_rust_entry(cpu_id: u32) {
     // Initialize this CPU's LAPIC.
     super::lapic::init_ap();
 
+    // Load per-CPU GDT with TSS (needed for ring 3→0 transitions).
+    super::gdt::init_ap(cpu_id);
+
     // Load the IDT (shared with BSP — it's at a fixed address).
     super::idt::load();
 

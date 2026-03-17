@@ -16,6 +16,11 @@ const PTE_NX: u64 = 1u64 << 63;  // No Execute
 
 const MMU_PAGE_SIZE: usize = 4096;
 
+/// Boot PML4 address, saved during init so create_user_page_table always
+/// copies from the original kernel page table (not the current CR3 which
+/// may be a user process's page table during sys_spawn).
+static BOOT_PML4: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// User page flags (public for main.rs).
 pub const USER_RWX_FLAGS: u64 = PTE_P | PTE_RW | PTE_US;
 pub const USER_RW_FLAGS: u64 = PTE_P | PTE_RW | PTE_US | PTE_NX;
@@ -36,7 +41,10 @@ fn alloc_table() -> Option<usize> {
 pub fn setup_tables() -> Option<usize> {
     let cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3); }
-    Some((cr3 & !0xFFF) as usize)
+    let pml4 = (cr3 & !0xFFF) as usize;
+    // Save boot PML4 for create_user_page_table.
+    BOOT_PML4.store(pml4, core::sync::atomic::Ordering::Release);
+    Some(pml4)
 }
 
 /// Add user 4K page mappings to the existing PML4.
@@ -237,21 +245,46 @@ pub fn translate_va(pml4: usize, va: usize) -> Option<usize> {
 
 /// Create a new PML4 for a user process, copying the kernel's identity-mapped
 /// entries from the boot page table. Returns the physical address of the new PML4.
+///
+/// The boot PML4[0] points to a shared PDPT containing 1 GiB gigapages.
+/// We must deep-copy this PDPT so that user page table walks (which call
+/// get_or_create_table on PDPT entries) don't modify the shared boot PDPT
+/// and corrupt other address spaces.
 pub fn create_user_page_table() -> Option<usize> {
-    // Read boot PML4 from CR3.
-    let boot_pml4: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) boot_pml4); }
-    let boot_pml4_addr = (boot_pml4 & !0xFFF) as usize;
+    // Use the saved boot PML4 (not current CR3, which may be a user page table).
+    let boot_pml4_addr = BOOT_PML4.load(core::sync::atomic::Ordering::Acquire);
+    if boot_pml4_addr == 0 {
+        return None;
+    }
 
     // Allocate a fresh PML4.
     let new_pml4 = alloc_table()?;
 
-    // Copy the first 4 entries (covering 0-2 TiB) which includes the kernel
-    // identity-mapped region (0-4 GiB at PML4[0]).
     unsafe {
         let src = boot_pml4_addr as *const u64;
         let dst = new_pml4 as *mut u64;
-        for i in 0..4 {
+
+        // Deep-copy PML4[0]: allocate a new PDPT and copy all 512 entries.
+        // This gives each process its own PDPT so user mappings in the
+        // lower 512 GiB region don't collide with the boot tables.
+        let boot_pml4_0 = *src.add(0);
+        if boot_pml4_0 & PTE_P != 0 {
+            let boot_pdpt = (boot_pml4_0 & 0x000F_FFFF_FFFF_F000) as usize;
+            let new_pdpt = alloc_table()?;
+            core::ptr::copy_nonoverlapping(
+                boot_pdpt as *const u64,
+                new_pdpt as *mut u64,
+                512,
+            );
+            // Point new PML4[0] to the copied PDPT.
+            // Add U/S so the CPU allows user-mode page table walks to the PDPT.
+            // Kernel gigapages at PDPT[0-3] are safe: they lack U/S, so user
+            // code still can't access kernel memory.
+            *dst.add(0) = (new_pdpt as u64) | PTE_P | PTE_RW | PTE_US;
+        }
+
+        // Copy PML4[1..4] directly (these don't typically have user mappings).
+        for i in 1..4 {
             *dst.add(i) = *src.add(i);
         }
     }

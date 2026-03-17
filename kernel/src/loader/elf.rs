@@ -12,6 +12,7 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3; // PIE executables (x86-64 default)
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
@@ -97,7 +98,7 @@ pub fn load_elf(
     if ehdr.e_ident[5] != ELFDATA2LSB {
         return Err(ElfError::BadEndian);
     }
-    if ehdr.e_type != ET_EXEC {
+    if ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN {
         return Err(ElfError::BadType);
     }
     if ehdr.e_machine != EM_EXPECTED {

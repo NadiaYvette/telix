@@ -1,49 +1,17 @@
 //! Global Descriptor Table (GDT) for x86-64.
 //!
-//! Defines kernel and user code/data segments, plus a TSS for ring 3→0
-//! transitions. The boot GDT in boot.S gets us into long mode; this GDT
-//! is the permanent one used once Rust is running.
+//! Defines kernel and user code/data segments, plus a per-CPU TSS for
+//! ring 3→0 transitions. Each CPU gets its own GDT and TSS so that
+//! RSP0 can be updated independently on SMP systems.
 
-use core::cell::UnsafeCell;
+use crate::sched::smp::MAX_CPUS;
 use core::mem::size_of;
 
-/// GDT entry (segment descriptor).
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct GdtEntry(u64);
-
-impl GdtEntry {
-    const fn null() -> Self {
-        GdtEntry(0)
-    }
-
-    /// Kernel code segment: 64-bit, present, DPL=0, executable, readable.
-    const fn kernel_code() -> Self {
-        GdtEntry(0x00AF_9A00_0000_FFFF)
-    }
-
-    /// Kernel data segment: present, DPL=0, writable.
-    const fn kernel_data() -> Self {
-        GdtEntry(0x00CF_9200_0000_FFFF)
-    }
-
-    /// User data segment: present, DPL=3, writable.
-    const fn user_data() -> Self {
-        GdtEntry(0x00CF_F200_0000_FFFF)
-    }
-
-    /// User code segment: 64-bit, present, DPL=3, executable, readable.
-    const fn user_code() -> Self {
-        GdtEntry(0x00AF_FA00_0000_FFFF)
-    }
-}
-
-/// GDTR pointer structure for lgdt instruction.
-#[repr(C, packed)]
-struct GdtPtr {
-    limit: u16,
-    base: u64,
-}
+pub const KERNEL_CS: u16 = 0x08;
+pub const KERNEL_DS: u16 = 0x10;
+pub const USER_DS: u16 = 0x18;
+pub const USER_CS: u16 = 0x20;
+const TSS_SEL: u16 = 0x28;
 
 /// 64-bit TSS structure.
 #[repr(C, packed)]
@@ -59,56 +27,62 @@ struct Tss {
     iopb_offset: u16,
 }
 
-/// GDT: null + kcode + kdata + udata + ucode + TSS (2 entries) = 7 entries.
-/// TSS descriptor is 16 bytes (2 GDT slots).
-#[repr(C, align(16))]
-struct GdtStorage {
-    entries: UnsafeCell<[u64; 7]>,
+/// GDTR pointer structure for lgdt instruction.
+#[repr(C, packed)]
+struct GdtPtr {
+    limit: u16,
+    base: u64,
 }
 
-unsafe impl Sync for GdtStorage {}
+/// Per-CPU GDT: null + kcode + kdata + udata + ucode + TSS (2 entries) = 7 entries.
+#[repr(C, align(16))]
+struct PerCpuGdt {
+    entries: [u64; 7],
+}
 
-static GDT: GdtStorage = GdtStorage {
-    entries: UnsafeCell::new([
-        0x0000_0000_0000_0000,                    // 0x00: Null
-        GdtEntry::kernel_code().0,                // 0x08: Kernel code
-        GdtEntry::kernel_data().0,                // 0x10: Kernel data
-        GdtEntry::user_data().0,                  // 0x18: User data (DPL=3)
-        GdtEntry::user_code().0,                  // 0x20: User code (DPL=3)
-        0, // 0x28: TSS low (filled at runtime)
-        0, // 0x30: TSS high (filled at runtime)
-    ]),
+/// Per-CPU GDT and TSS arrays.
+static mut PER_CPU_GDT: [PerCpuGdt; MAX_CPUS] = {
+    const INIT: PerCpuGdt = PerCpuGdt {
+        entries: [
+            0x0000_0000_0000_0000,  // 0x00: Null
+            0x00AF_9A00_0000_FFFF,  // 0x08: Kernel code (64-bit, DPL=0)
+            0x00CF_9200_0000_FFFF,  // 0x10: Kernel data (DPL=0)
+            0x00CF_F200_0000_FFFF,  // 0x18: User data (DPL=3)
+            0x00AF_FA00_0000_FFFF,  // 0x20: User code (64-bit, DPL=3)
+            0,                       // 0x28: TSS low (filled at runtime)
+            0,                       // 0x30: TSS high (filled at runtime)
+        ],
+    };
+    [INIT; MAX_CPUS]
 };
 
-static mut TSS: Tss = Tss {
-    reserved0: 0,
-    rsp0: 0,
-    rsp1: 0,
-    rsp2: 0,
-    reserved1: 0,
-    ist: [0; 7],
-    reserved2: 0,
-    reserved3: 0,
-    iopb_offset: size_of::<Tss>() as u16,
+static mut PER_CPU_TSS: [Tss; MAX_CPUS] = {
+    const INIT: Tss = Tss {
+        reserved0: 0,
+        rsp0: 0,
+        rsp1: 0,
+        rsp2: 0,
+        reserved1: 0,
+        ist: [0; 7],
+        reserved2: 0,
+        reserved3: 0,
+        iopb_offset: size_of::<Tss>() as u16,
+    };
+    [INIT; MAX_CPUS]
 };
-
-pub const KERNEL_CS: u16 = 0x08;
-pub const KERNEL_DS: u16 = 0x10;
-pub const USER_DS: u16 = 0x18;
-pub const USER_CS: u16 = 0x20;
-const TSS_SEL: u16 = 0x28;
 
 /// Set the kernel stack pointer used when entering ring 0 from ring 3.
+/// Updates the current CPU's TSS.
 pub fn set_rsp0(rsp0: u64) {
+    let cpu = crate::sched::smp::cpu_id() as usize;
     unsafe {
-        TSS.rsp0 = rsp0;
+        PER_CPU_TSS[cpu].rsp0 = rsp0;
     }
 }
 
-/// Load the kernel GDT with user segments and TSS, reload segment registers.
-pub fn init() {
-    // Fill in the TSS descriptor at runtime (needs the TSS address).
-    let tss_addr = unsafe { core::ptr::addr_of!(TSS) as u64 };
+/// Build and load a TSS descriptor into the given CPU's GDT, then lgdt + ltr.
+fn load_gdt_for_cpu(cpu: usize) {
+    let tss_addr = unsafe { core::ptr::addr_of!(PER_CPU_TSS[cpu]) as u64 };
     let tss_limit = (size_of::<Tss>() - 1) as u64;
 
     // TSS descriptor low: limit[15:0], base[23:0], type=0x9, P=1, base[31:24]
@@ -121,22 +95,14 @@ pub fn init() {
     // TSS descriptor high: base[63:32]
     let tss_high: u64 = tss_addr >> 32;
 
-    // Set RSP0 to the current kernel stack (boot stack).
     unsafe {
-        let rsp: u64;
-        core::arch::asm!("mov {}, rsp", out(reg) rsp);
-        TSS.rsp0 = rsp;
-    }
-
-    unsafe {
-        let gdt = &mut *GDT.entries.get();
-        gdt[5] = tss_low;
-        gdt[6] = tss_high;
+        PER_CPU_GDT[cpu].entries[5] = tss_low;
+        PER_CPU_GDT[cpu].entries[6] = tss_high;
     }
 
     let ptr = GdtPtr {
         limit: (size_of::<[u64; 7]>() - 1) as u16,
-        base: GDT.entries.get() as u64,
+        base: unsafe { PER_CPU_GDT[cpu].entries.as_ptr() as u64 },
     };
 
     unsafe {
@@ -163,6 +129,30 @@ pub fn init() {
             tmp = lateout(reg) _,
         );
     }
+}
 
+/// Load the BSP's GDT with user segments and TSS.
+pub fn init() {
+    // Set RSP0 to the current kernel stack (boot stack).
+    unsafe {
+        let rsp: u64;
+        core::arch::asm!("mov {}, rsp", out(reg) rsp);
+        PER_CPU_TSS[0].rsp0 = rsp;
+    }
+
+    load_gdt_for_cpu(0);
     crate::println!("  GDT loaded");
+}
+
+/// Load a per-CPU GDT with TSS for a secondary CPU.
+pub fn init_ap(cpu: u32) {
+    let cpu = cpu as usize;
+    // Set RSP0 to the current AP stack.
+    unsafe {
+        let rsp: u64;
+        core::arch::asm!("mov {}, rsp", out(reg) rsp);
+        PER_CPU_TSS[cpu].rsp0 = rsp;
+    }
+
+    load_gdt_for_cpu(cpu);
 }
