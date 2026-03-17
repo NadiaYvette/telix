@@ -40,7 +40,10 @@ pub struct Thread {
     pub id: ThreadId,
     pub state: ThreadState,
     pub task_id: u32,
-    pub priority: u8,
+    /// Base (static) priority assigned at creation.
+    pub base_priority: u8,
+    /// Effective priority — may be temporarily boosted by priority inheritance.
+    pub effective_priority: u8,
     pub quantum: u32,
     pub default_quantum: u32,
     /// Saved kernel stack pointer. When the thread is not running,
@@ -58,7 +61,8 @@ impl Thread {
             id: 0,
             state: ThreadState::Dead,
             task_id: 0,
-            priority: 128,
+            base_priority: 128,
+            effective_priority: 128,
             quantum: 10,
             default_quantum: 10,
             saved_sp: 0,

@@ -24,6 +24,7 @@ pub struct TrapFrame {
 // scause values
 const SCAUSE_INTERRUPT_BIT: u64 = 1 << 63;
 const SCAUSE_S_TIMER_IRQ: u64 = SCAUSE_INTERRUPT_BIT | 5;
+const SCAUSE_S_EXTERNAL_IRQ: u64 = SCAUSE_INTERRUPT_BIT | 9;
 const SCAUSE_ECALL_FROM_UMODE: u64 = 8;
 const SCAUSE_ECALL_FROM_SMODE: u64 = 9;
 const SCAUSE_INST_PAGE_FAULT: u64 = 12;
@@ -78,11 +79,14 @@ pub fn init() {
     let now = read_time();
     sbi_set_timer(now + interval);
 
-    // Enable S-mode timer interrupt in sie.
+    // Enable S-mode timer interrupt and external interrupt in sie.
     unsafe {
-        // sie.STIE = bit 5
-        core::arch::asm!("csrs sie, {}", in(reg) 1u64 << 5);
+        // sie.STIE = bit 5, sie.SEIE = bit 9
+        core::arch::asm!("csrs sie, {}", in(reg) (1u64 << 5) | (1u64 << 9));
     }
+
+    // Initialize PLIC for hart 0.
+    super::plic::init(0);
 
     crate::println!("  Timer initialized: timebase={}Hz, interval={} ticks ({}ms)",
         freq, interval, 1000 * interval / freq);
@@ -104,10 +108,15 @@ pub fn init_ap() {
     let now = read_time();
     sbi_set_timer(now + interval);
 
-    // Enable S-mode timer interrupt in sie.
+    // Enable S-mode timer and external interrupts in sie.
     unsafe {
-        core::arch::asm!("csrs sie, {}", in(reg) 1u64 << 5);
+        core::arch::asm!("csrs sie, {}", in(reg) (1u64 << 5) | (1u64 << 9));
     }
+
+    // Initialize PLIC for this hart.
+    let hart: u32;
+    unsafe { core::arch::asm!("mv {0}, tp", out(reg) hart); }
+    super::plic::init(hart);
 }
 
 /// Enable S-mode interrupts (set sstatus.SIE).
@@ -131,6 +140,33 @@ pub fn disable_interrupts() {
     unsafe {
         core::arch::asm!("csrc sstatus, {}", in(reg) 1u64 << 1);
     }
+}
+
+/// Handle S-mode external interrupt via PLIC.
+fn handle_external_irq() {
+    // Determine hart ID from tp register.
+    let hart: u32;
+    unsafe { core::arch::asm!("mv {0}, tp", out(reg) hart); }
+
+    let irq = super::plic::claim(hart);
+    if irq == 0 {
+        return; // Spurious
+    }
+
+    // Virtio-blk on QEMU virt is PLIC IRQ 1-8 (first virtio device = highest address = IRQ 8,
+    // but QEMU virt maps them in reverse: device at 0x10008000 = IRQ 8, 0x10007000 = IRQ 7, etc.)
+    // The virtio-blk device gets the first available IRQ. With a single virtio device added
+    // via -device, it typically gets IRQ 1. We match any IRQ in 1..=8 to the virtio-blk handler.
+    match irq {
+        1..=8 => {
+            crate::drivers::virtio_blk::irq_handler();
+        }
+        _ => {
+            crate::println!("PLIC: unhandled IRQ {}", irq);
+        }
+    }
+
+    super::plic::complete(hart, irq);
 }
 
 /// Handle timer interrupt: reset the timer and increment tick count.
@@ -159,6 +195,11 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             handle_timer_irq();
             // Let the scheduler decide if we should switch threads.
             crate::sched::tick(frame_sp)
+        }
+
+        SCAUSE_S_EXTERNAL_IRQ => {
+            handle_external_irq();
+            frame_sp
         }
 
         SCAUSE_ECALL_FROM_SMODE | SCAUSE_ECALL_FROM_UMODE => {

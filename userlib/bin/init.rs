@@ -396,6 +396,116 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"Phase 7 zero-copy I/O test: FAILED\n");
     }
 
+    // --- Test 8: Block device I/O via grant ---
+    syscall::debug_puts(b"  init: testing block device I/O...\n");
+
+    // Give blk server time to start and register.
+    for _ in 0..200 { syscall::yield_now(); }
+
+    let blk_port = syscall::ns_lookup(b"blk");
+    if let Some(bp) = blk_port {
+        syscall::debug_puts(b"  init: ns_lookup(blk) = port ");
+        print_num(bp as u64);
+        syscall::debug_puts(b"\n");
+
+        let blk_reply = syscall::port_create() as u32;
+
+        // IO_CONNECT to blk server.
+        let (bn0, bn1, _) = pack_name(b"blk");
+        let blk_d2 = 3u64 | ((blk_reply as u64) << 32);
+        syscall::send(bp, 0x100, bn0, bn1, blk_d2, 0);
+
+        let blk_aspace = if let Some(reply) = syscall::recv_msg(blk_reply) {
+            if reply.tag == 0x101 {
+                syscall::debug_puts(b"  init: blk connected, size=");
+                print_num(reply.data[1]);
+                syscall::debug_puts(b" bytes\n");
+                reply.data[2] as u32
+            } else {
+                syscall::debug_puts(b"  init: blk connect failed\n");
+                0
+            }
+        } else {
+            syscall::debug_puts(b"  init: blk no connect reply\n");
+            0
+        };
+
+        if blk_aspace != 0 {
+            // Allocate buffer page and fill with 0xA5 pattern.
+            let blk_buf = match syscall::mmap_anon(0, 1, 1) {
+                Some(va) => va,
+                None => {
+                    syscall::debug_puts(b"  init: blk buf alloc FAILED\n");
+                    loop { syscall::yield_now(); }
+                }
+            };
+
+            // Fill first 512 bytes with 0xA5 pattern.
+            for i in 0..512 {
+                unsafe { *((blk_buf + i) as *mut u8) = 0xA5; }
+            }
+
+            // Grant buffer to blk server.
+            let blk_grant_va: usize = 0x5_0000_0000;
+            syscall::grant_pages(blk_aspace, blk_buf, blk_grant_va, 1, false);
+
+            // IO_WRITE 512 bytes at offset 0: data[0]=handle, data[1]=offset, data[2]=len|(reply<<32), data[3]=grant_va
+            let blk_wr_d2 = 512u64 | ((blk_reply as u64) << 32);
+            syscall::send(bp, 0x300, 0, 0, blk_wr_d2, blk_grant_va as u64);
+
+            if let Some(rr) = syscall::recv_msg(blk_reply) {
+                if rr.tag == 0x301 {
+                    syscall::debug_puts(b"  init: blk wrote ");
+                    print_num(rr.data[0]);
+                    syscall::debug_puts(b" bytes\n");
+                } else {
+                    syscall::debug_puts(b"  init: blk write error\n");
+                }
+            }
+
+            // Revoke grant, zero the buffer.
+            syscall::revoke(blk_aspace, blk_grant_va);
+            for i in 0..512 {
+                unsafe { *((blk_buf + i) as *mut u8) = 0; }
+            }
+
+            // Grant buffer again for read.
+            syscall::grant_pages(blk_aspace, blk_buf, blk_grant_va, 1, false);
+
+            // IO_READ 512 bytes at offset 0.
+            let blk_rd_d2 = 512u64 | ((blk_reply as u64) << 32);
+            syscall::send(bp, 0x200, 0, 0, blk_rd_d2, blk_grant_va as u64);
+
+            if let Some(rr) = syscall::recv_msg(blk_reply) {
+                if rr.tag == 0x201 {
+                    let bytes_read = rr.data[0] as usize;
+                    // Verify 0xA5 pattern.
+                    let mut ok = bytes_read == 512;
+                    for i in 0..512 {
+                        let b = unsafe { *((blk_buf + i) as *const u8) };
+                        if b != 0xA5 {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        syscall::debug_puts(b"Phase 8 async block I/O: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 8 async block I/O: DATA MISMATCH\n");
+                    }
+                } else {
+                    syscall::debug_puts(b"  init: blk read error\n");
+                }
+            }
+
+            syscall::revoke(blk_aspace, blk_grant_va);
+            syscall::munmap(blk_buf);
+        }
+    } else {
+        syscall::debug_puts(b"  init: blk not found, skipping block test\n");
+        syscall::debug_puts(b"Phase 8 async block I/O: SKIPPED (no blk device)\n");
+    }
+
     // Init loops forever, yielding.
     loop {
         syscall::yield_now();

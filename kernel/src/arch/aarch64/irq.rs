@@ -25,6 +25,7 @@ const GICR_IPRIORITYR_OFFSET: usize = 0x400;
 
 // Interrupt IDs
 pub const INTID_TIMER_EL1_PHYS: u32 = 30; // PPI: EL1 physical timer (CNTP)
+pub const INTID_VIRTIO_BLK: u32 = 48; // SPI: virtio-blk (device at 0x0a003e00)
 const INTID_SPURIOUS: u32 = 1023;
 
 /// Initialize the GICv3 redistributor for a specific CPU.
@@ -182,6 +183,10 @@ pub fn handle_irq() {
     match intid {
         INTID_TIMER_EL1_PHYS => {
             crate::arch::aarch64::timer::handle_timer_irq();
+        }
+        // Virtio-mmio devices: INTID 48-79 (SPI 16-47, 32 devices on QEMU virt)
+        48..=79 => {
+            crate::drivers::virtio_blk::irq_handler();
         }
         _ => {
             crate::println!("Unhandled IRQ: {}", intid);

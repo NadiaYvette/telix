@@ -1,5 +1,6 @@
 pub mod boot;
 pub mod mm;
+pub mod plic;
 pub mod serial;
 pub mod smp;
 pub mod trap;

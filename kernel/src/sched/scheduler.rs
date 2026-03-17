@@ -102,7 +102,9 @@ impl Scheduler {
         self.threads[0].id = 0;
         self.threads[0].state = ThreadState::Running;
         self.threads[0].task_id = 0;
-        self.threads[0].priority = 255;
+        self.threads[0].base_priority = 255;
+        self.threads[0].effective_priority = 255;
+        THREAD_PRIO[0].store(255, Ordering::Relaxed);
         self.threads[0].quantum = u32::MAX;
         self.threads[0].default_quantum = u32::MAX;
         self.next_thread_id = 1;
@@ -120,7 +122,9 @@ impl Scheduler {
         thread.id = id;
         thread.state = ThreadState::Running;
         thread.task_id = 0;
-        thread.priority = 255; // lowest
+        thread.base_priority = 255;
+        thread.effective_priority = 255; // lowest
+        THREAD_PRIO[id as usize].store(255, Ordering::Relaxed);
         thread.quantum = u32::MAX;
         thread.default_quantum = u32::MAX;
         // saved_sp will be set on first preemption
@@ -228,7 +232,9 @@ impl Scheduler {
         thread.id = id;
         thread.state = ThreadState::Ready;
         thread.task_id = 0;
-        thread.priority = priority;
+        thread.base_priority = priority;
+        thread.effective_priority = priority;
+        THREAD_PRIO[id as usize].store(priority, Ordering::Relaxed);
         thread.quantum = quantum;
         thread.default_quantum = quantum;
         thread.saved_sp = frame_sp as u64;
@@ -414,7 +420,9 @@ impl Scheduler {
         thread.id = id;
         thread.state = ThreadState::Ready;
         thread.task_id = task_id;
-        thread.priority = priority;
+        thread.base_priority = priority;
+        thread.effective_priority = priority;
+        THREAD_PRIO[id as usize].store(priority, Ordering::Relaxed);
         thread.quantum = quantum;
         thread.default_quantum = quantum;
         thread.saved_sp = frame_sp as u64;
@@ -589,7 +597,7 @@ impl Scheduler {
 
         // Save current thread's SP.
         self.threads[prev_id as usize].saved_sp = current_sp;
-        let prev_prio = self.threads[prev_id as usize].priority;
+        let prev_prio = self.threads[prev_id as usize].effective_priority;
         // Don't re-enqueue Dead threads (they are exiting).
         if prev_id != idle_id && self.threads[prev_id as usize].state != ThreadState::Dead {
             self.threads[prev_id as usize].state = ThreadState::Ready;
@@ -715,6 +723,13 @@ pub fn schedule() {
 /// Using atomics avoids needing the scheduler lock in the spin loop.
 static WAKEUP_FLAGS: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS] = {
     const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    [INIT; super::thread::MAX_THREADS]
+};
+
+/// Per-thread effective priority, readable without the scheduler lock.
+/// Updated by boost_priority/reset_priority and thread creation.
+static THREAD_PRIO: [core::sync::atomic::AtomicU8; super::thread::MAX_THREADS] = {
+    const INIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(255);
     [INIT; super::thread::MAX_THREADS]
 };
 
@@ -930,5 +945,36 @@ pub fn waitpid(child_tid: ThreadId) -> Option<i32> {
         Some(task.exit_code)
     } else {
         None
+    }
+}
+
+/// Boost a thread's effective priority if `to_prio` is higher (lower number).
+pub fn boost_priority(tid: ThreadId, to_prio: u8) {
+    let mut sched = SCHEDULER.lock();
+    if (tid as usize) < MAX_THREADS {
+        let thread = &mut sched.threads[tid as usize];
+        if to_prio < thread.effective_priority {
+            thread.effective_priority = to_prio;
+            THREAD_PRIO[tid as usize].store(to_prio, Ordering::Release);
+        }
+    }
+}
+
+/// Reset a thread's effective priority back to its base priority.
+pub fn reset_priority(tid: ThreadId) {
+    let mut sched = SCHEDULER.lock();
+    if (tid as usize) < MAX_THREADS {
+        let thread = &mut sched.threads[tid as usize];
+        thread.effective_priority = thread.base_priority;
+        THREAD_PRIO[tid as usize].store(thread.base_priority, Ordering::Release);
+    }
+}
+
+/// Get a thread's current effective priority (lock-free).
+pub fn thread_effective_priority(tid: ThreadId) -> u8 {
+    if (tid as usize) < MAX_THREADS {
+        THREAD_PRIO[tid as usize].load(Ordering::Acquire)
+    } else {
+        255
     }
 }

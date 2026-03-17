@@ -6,6 +6,7 @@
 use super::virtio_mmio as mmio;
 use crate::mm::phys;
 use crate::mm::page::PhysAddr;
+use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 
 /// Virtqueue size (number of descriptors).
 const QUEUE_SIZE: usize = 16;
@@ -58,6 +59,28 @@ struct VirtioBlkReqHdr {
     req_type: u32,
     reserved: u32,
     sector: u64,
+}
+
+/// MMIO base stored for IRQ handler access.
+static BLK_MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
+/// Thread ID waiting for I/O completion (set before submitting).
+static BLK_WAITER_TID: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Called from architecture-specific IRQ handler when virtio-blk fires.
+/// Safe in IRQ context: only reads MMIO registers and sets an atomic flag.
+pub fn irq_handler() {
+    let base = BLK_MMIO_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    // ACK the virtio interrupt.
+    let status = mmio::read32(base, mmio::INTERRUPT_STATUS);
+    mmio::write32(base, mmio::INTERRUPT_ACK, status);
+    // Wake the waiting thread.
+    let tid = BLK_WAITER_TID.load(Ordering::Acquire);
+    if tid != u32::MAX {
+        crate::sched::wake_thread(tid);
+    }
 }
 
 /// A virtio block device.
@@ -137,6 +160,9 @@ impl VirtioBlk {
 
         let desc_pa = vq_base;
         let avail_pa = desc_pa + 16 * QUEUE_SIZE;
+
+        // Store MMIO base for IRQ handler.
+        BLK_MMIO_BASE.store(base, Ordering::Release);
 
         if version == 1 {
             // Legacy MMIO: used ring at page-aligned offset from base.
@@ -356,20 +382,35 @@ impl VirtioBlk {
     }
 
     fn wait_complete(&mut self) {
+        use crate::sched::thread::BlockReason;
         let used = self.used_pa as *mut VringUsed;
         loop {
+            // Check if already complete (IRQ may have fired before we block).
             let idx = unsafe {
-                core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                core::sync::atomic::fence(Ordering::Acquire);
                 (*used).idx
             };
             if idx != self.last_used_idx {
                 self.last_used_idx = idx;
-                // ACK interrupt.
-                mmio::write32(self.mmio_base, mmio::INTERRUPT_ACK,
-                    mmio::read32(self.mmio_base, mmio::INTERRUPT_STATUS));
                 return;
             }
-            core::hint::spin_loop();
+            // Block until woken by IRQ handler.
+            let tid = crate::sched::current_thread_id();
+            crate::sched::clear_wakeup_flag(tid);
+            BLK_WAITER_TID.store(tid, Ordering::Release);
+            // Re-check used ring after storing waiter to prevent lost wakeup.
+            let idx = unsafe {
+                core::sync::atomic::fence(Ordering::Acquire);
+                (*used).idx
+            };
+            if idx != self.last_used_idx {
+                self.last_used_idx = idx;
+                BLK_WAITER_TID.store(u32::MAX, Ordering::Release);
+                crate::sched::wake_thread(tid); // Cancel the clear
+                return;
+            }
+            crate::sched::block_current(BlockReason::None);
+            BLK_WAITER_TID.store(u32::MAX, Ordering::Release);
         }
     }
 }

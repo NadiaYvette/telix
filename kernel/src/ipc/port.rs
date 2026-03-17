@@ -160,7 +160,10 @@ pub fn create() -> Option<PortId> {
 
 /// Send a message to a port (non-blocking).
 /// Returns Ok(()) on success, Err(msg) if the queue is full.
-pub fn send_nb(port_id: PortId, msg: Message) -> Result<(), Message> {
+pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {
+    // Stamp sender priority for priority inheritance.
+    let tid = crate::sched::current_thread_id();
+    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
     let mut table = PORT_TABLE.lock();
     if (port_id as usize) >= MAX_PORTS {
         return Err(msg);
@@ -208,8 +211,11 @@ pub fn recv_nb(port_id: PortId) -> Result<Message, ()> {
 
 /// Send a message to a port (blocking).
 /// Blocks if the queue is full until space is available.
-pub fn send(port_id: PortId, msg: Message) -> Result<(), ()> {
+pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
     use crate::sched::thread::BlockReason;
+    // Stamp sender priority for priority inheritance.
+    let tid = crate::sched::current_thread_id();
+    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
     let mut pending = msg;
     loop {
         let mut table = PORT_TABLE.lock();
@@ -246,6 +252,9 @@ pub fn send(port_id: PortId, msg: Message) -> Result<(), ()> {
 /// Blocks if the queue is empty until a message arrives.
 pub fn recv(port_id: PortId) -> Result<Message, ()> {
     use crate::sched::thread::BlockReason;
+    // Reset priority to base on recv entry (priority inheritance protocol).
+    let my_tid = crate::sched::current_thread_id();
+    crate::sched::reset_priority(my_tid);
     loop {
         let mut table = PORT_TABLE.lock();
         if (port_id as usize) >= MAX_PORTS {
@@ -261,6 +270,8 @@ pub fn recv(port_id: PortId) -> Result<Message, ()> {
                 if let Some(tid) = wakeup {
                     crate::sched::wake_thread(tid);
                 }
+                // Boost to sender's priority (priority inheritance).
+                crate::sched::boost_priority(my_tid, msg.data[5] as u8);
                 return Ok(msg);
             }
             Err(()) => {

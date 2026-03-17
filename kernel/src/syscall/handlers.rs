@@ -170,7 +170,10 @@ fn sys_port_destroy(port_id: u64) -> u64 {
 }
 
 fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
-    let msg = crate::ipc::Message::new(tag, data);
+    let mut msg = crate::ipc::Message::new(tag, data);
+    // Stamp sender's effective priority into data[5] for priority inheritance.
+    let tid = crate::sched::current_thread_id();
+    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
     match crate::ipc::port::send(port_id as u32, msg) {
         Ok(()) => 0,
         Err(()) => 1,
@@ -178,7 +181,10 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
 }
 
 fn sys_send_nb(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
-    let msg = crate::ipc::Message::new(tag, data);
+    let mut msg = crate::ipc::Message::new(tag, data);
+    // Stamp sender's effective priority into data[5] for priority inheritance.
+    let tid = crate::sched::current_thread_id();
+    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
     match crate::ipc::port::send_nb(port_id as u32, msg) {
         Ok(()) => 0,
         Err(_) => 1, // Queue full.
