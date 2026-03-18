@@ -14,7 +14,24 @@ use super::task::{Task, TaskId, MAX_TASKS};
 use super::smp;
 use crate::sync::SpinLock;
 use crate::mm::page::{PAGE_SIZE, MMUPAGE_SIZE};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
+
+/// Per-CPU saved frame SP. The exception handler stores the current frame_sp
+/// here before calling syscall dispatch, so that park_current_for_ipc() can
+/// read it without changing dispatch()'s signature.
+static CURRENT_FRAME_SP: [AtomicU64; smp::MAX_CPUS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; smp::MAX_CPUS]
+};
+
+/// Per-CPU pending context switch target SP. When a syscall handler parks the
+/// current thread or does a direct handoff, it stores the target thread's SP
+/// here. The exception handler checks this after dispatch() returns and uses
+/// it as the new SP if non-zero.
+static PENDING_SWITCH_SP: [AtomicU64; smp::MAX_CPUS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; smp::MAX_CPUS]
+};
 
 /// Per-CPU deferred kernel stack free. When a thread exits, it can't free
 /// its own stack (it's running on it). The address is stored here and freed
@@ -74,7 +91,7 @@ impl RunQueue {
 }
 
 pub struct Scheduler {
-    threads: [Thread; MAX_THREADS],
+    pub(crate) threads: [Thread; MAX_THREADS],
     pub tasks: [Task; MAX_TASKS],
     run_queues: [RunQueue; NUM_PRIORITIES],
     next_thread_id: ThreadId,
@@ -1276,4 +1293,158 @@ pub fn thread_effective_priority(tid: ThreadId) -> u8 {
     } else {
         255
     }
+}
+
+// --- L4-style handoff scheduling ---
+
+/// Store the current frame SP for use by park/handoff functions.
+/// Called by the arch exception handler before dispatching a syscall.
+pub fn store_frame_sp(sp: u64) {
+    let cpu = smp::cpu_id() as usize;
+    CURRENT_FRAME_SP[cpu].store(sp, Ordering::Release);
+}
+
+/// Take (read and clear) any pending context switch SP.
+/// Called by the arch exception handler after syscall dispatch returns.
+/// Returns 0 if no switch is pending.
+pub fn take_pending_switch() -> u64 {
+    let cpu = smp::cpu_id() as usize;
+    PENDING_SWITCH_SP[cpu].swap(0, Ordering::AcqRel)
+}
+
+/// Get a thread's saved SP. Used by inject_recv_into_frame to write into
+/// a parked thread's exception frame.
+pub fn thread_saved_sp(tid: ThreadId) -> u64 {
+    SCHEDULER.lock().threads[tid as usize].saved_sp
+}
+
+/// Park the current thread for IPC (true off-CPU park).
+/// Saves the current SP from CURRENT_FRAME_SP, marks the thread Blocked,
+/// picks the next runnable thread, and stores its SP in PENDING_SWITCH_SP.
+/// The exception handler will complete the switch on return.
+///
+/// Unlike block_current() which spins on-CPU, this truly takes the thread
+/// off the run queue and saves its frame for later injection by a sender.
+pub fn park_current_for_ipc(reason: BlockReason) {
+    let cpu = smp::cpu_id() as usize;
+    let frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
+
+    let mut sched = SCHEDULER.lock();
+    let pcpu = smp::current();
+    let tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
+    let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
+
+    // Save current thread's state.
+    sched.threads[tid].saved_sp = frame_sp;
+    sched.threads[tid].state = ThreadState::Blocked;
+    sched.threads[tid].blocked_on = reason;
+
+    // Pick next thread (don't re-enqueue current — it's Blocked).
+    let next_id = sched.pick_next(idle_id);
+
+    // Switch page tables if needed.
+    let prev_task = sched.threads[tid].task_id;
+    let next_task = sched.threads[next_id as usize].task_id;
+    if prev_task != next_task {
+        let next_root = sched.tasks[next_task as usize].page_table_root;
+        if next_root != 0 {
+            #[cfg(target_arch = "aarch64")]
+            crate::arch::aarch64::mm::switch_page_table(next_root);
+            #[cfg(target_arch = "riscv64")]
+            crate::arch::riscv64::mm::switch_page_table(next_root);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::mm::switch_page_table(next_root);
+        } else {
+            #[cfg(target_arch = "riscv64")]
+            {
+                let kern_root = crate::arch::riscv64::mm::kernel_pt_root();
+                if kern_root != 0 {
+                    crate::arch::riscv64::mm::switch_page_table(kern_root);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let next_kstack_top = sched.threads[next_id as usize].stack_base + PAGE_SIZE;
+        crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
+    }
+
+    sched.threads[next_id as usize].state = ThreadState::Running;
+    pcpu.current_thread.store(next_id, Ordering::Relaxed);
+    let next_sp = sched.threads[next_id as usize].saved_sp;
+    drop(sched);
+
+    PENDING_SWITCH_SP[cpu].store(next_sp, Ordering::Release);
+}
+
+/// Wake a parked thread by marking it Ready and enqueueing it.
+/// This is for threads parked via park_current_for_ipc (Blocked state).
+pub fn wake_parked_thread(tid: ThreadId) {
+    let mut sched = SCHEDULER.lock();
+    if (tid as usize) < MAX_THREADS && sched.threads[tid as usize].state == ThreadState::Blocked {
+        let prio = sched.threads[tid as usize].effective_priority;
+        sched.threads[tid as usize].state = ThreadState::Ready;
+        sched.run_queues[prio as usize].push(tid);
+    }
+}
+
+/// L4-style direct handoff: sender donates its remaining quantum to receiver.
+/// Saves sender's SP, loads receiver as current thread, stores receiver's SP
+/// in PENDING_SWITCH_SP. Receiver must already have its frame injected.
+pub fn handoff_to(receiver_tid: ThreadId) {
+    let cpu = smp::cpu_id() as usize;
+    let frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
+
+    let mut sched = SCHEDULER.lock();
+    let pcpu = smp::current();
+    let sender_tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
+
+    // Save sender: goes to Ready on run queue.
+    sched.threads[sender_tid].saved_sp = frame_sp;
+    let sender_prio = sched.threads[sender_tid].effective_priority;
+    sched.threads[sender_tid].state = ThreadState::Ready;
+    sched.run_queues[sender_prio as usize].push(sender_tid as ThreadId);
+
+    // Donate remaining quantum to receiver.
+    let remaining_quantum = sched.threads[sender_tid].quantum;
+    sched.threads[receiver_tid as usize].quantum = remaining_quantum;
+
+    // Switch page tables if needed.
+    let sender_task = sched.threads[sender_tid].task_id;
+    let recv_task = sched.threads[receiver_tid as usize].task_id;
+    if sender_task != recv_task {
+        let next_root = sched.tasks[recv_task as usize].page_table_root;
+        if next_root != 0 {
+            #[cfg(target_arch = "aarch64")]
+            crate::arch::aarch64::mm::switch_page_table(next_root);
+            #[cfg(target_arch = "riscv64")]
+            crate::arch::riscv64::mm::switch_page_table(next_root);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::mm::switch_page_table(next_root);
+        } else {
+            #[cfg(target_arch = "riscv64")]
+            {
+                let kern_root = crate::arch::riscv64::mm::kernel_pt_root();
+                if kern_root != 0 {
+                    crate::arch::riscv64::mm::switch_page_table(kern_root);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let next_kstack_top = sched.threads[receiver_tid as usize].stack_base + PAGE_SIZE;
+        crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
+    }
+
+    // Activate receiver.
+    sched.threads[receiver_tid as usize].state = ThreadState::Running;
+    pcpu.current_thread.store(receiver_tid, Ordering::Relaxed);
+    let recv_sp = sched.threads[receiver_tid as usize].saved_sp;
+    drop(sched);
+
+    PENDING_SWITCH_SP[cpu].store(recv_sp, Ordering::Release);
 }

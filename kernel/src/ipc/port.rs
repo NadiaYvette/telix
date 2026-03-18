@@ -199,15 +199,37 @@ pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {
     }
     match port.try_send(msg) {
         Ok((wakeup, set_id)) => {
-            drop(table);
-            if let Some(tid) = wakeup {
-                crate::sched::wake_thread(tid);
-            } else if set_id != u32::MAX {
-                super::port_set::wake_set_waiter(set_id);
+            if let Some(waiter_tid) = wakeup {
+                // Check if the waiter is parked (Blocked from recv_or_park).
+                use crate::sched::thread::ThreadState;
+                let is_parked = {
+                    let sched = crate::sched::scheduler::SCHEDULER.lock();
+                    sched.threads[waiter_tid as usize].state == ThreadState::Blocked
+                };
+                if is_parked {
+                    // Dequeue the message we just queued — we'll inject it directly.
+                    let dequeued = port.try_recv();
+                    drop(table);
+                    if let Ok((queued_msg, _)) = dequeued {
+                        crate::syscall::handlers::deliver_to_parked_receiver(waiter_tid, &queued_msg);
+                    }
+                    crate::sched::scheduler::wake_parked_thread(waiter_tid);
+                } else {
+                    drop(table);
+                    crate::sched::wake_thread(waiter_tid);
+                }
+            } else {
+                drop(table);
+                if set_id != u32::MAX {
+                    super::port_set::wake_set_waiter(set_id);
+                }
             }
             Ok(())
         }
-        Err(msg) => Err(msg),
+        Err(msg) => {
+            drop(table);
+            Err(msg)
+        },
     }
 }
 
@@ -253,11 +275,29 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
         }
         match port.try_send(pending) {
             Ok((wakeup, set_id)) => {
-                drop(table);
-                if let Some(tid) = wakeup {
-                    crate::sched::wake_thread(tid);
-                } else if set_id != u32::MAX {
-                    super::port_set::wake_set_waiter(set_id);
+                if let Some(waiter_tid) = wakeup {
+                    use crate::sched::thread::ThreadState;
+                    let is_parked = {
+                        let sched = crate::sched::scheduler::SCHEDULER.lock();
+                        sched.threads[waiter_tid as usize].state == ThreadState::Blocked
+                    };
+                    if is_parked {
+                        // Dequeue the message — inject directly into parked receiver.
+                        let dequeued = port.try_recv();
+                        drop(table);
+                        if let Ok((queued_msg, _)) = dequeued {
+                            crate::syscall::handlers::deliver_to_parked_receiver(waiter_tid, &queued_msg);
+                        }
+                        crate::sched::scheduler::wake_parked_thread(waiter_tid);
+                    } else {
+                        drop(table);
+                        crate::sched::wake_thread(waiter_tid);
+                    }
+                } else {
+                    drop(table);
+                    if set_id != u32::MAX {
+                        super::port_set::wake_set_waiter(set_id);
+                    }
                 }
                 return Ok(());
             }
@@ -330,5 +370,108 @@ pub fn destroy(port_id: PortId) {
     let mut table = PORT_TABLE.lock();
     if (port_id as usize) < MAX_PORTS {
         table.ports[port_id as usize].active = false;
+    }
+}
+
+/// Result of a send with direct-transfer optimization.
+pub enum SendDirectResult {
+    /// Message was queued normally (or queued + spin-blocked waiter woken).
+    Queued,
+    /// A receiver was parked (Blocked) — message NOT queued. Caller must inject + wake/handoff.
+    DirectTransfer(crate::sched::thread::ThreadId),
+    /// Queue is full.
+    Full,
+    /// Port inactive or invalid.
+    Error,
+}
+
+/// Try to send with direct-transfer optimization.
+/// If a receiver is parked (Blocked state, from recv_or_park) on this port,
+/// returns DirectTransfer(tid) without queueing the message. The caller is
+/// responsible for injecting the message and waking/handing off to the receiver.
+///
+/// For spin-blocked receivers (old block_current path, Running state),
+/// falls through to the normal try_send + wake_thread path.
+pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
+    use crate::sched::thread::ThreadState;
+
+    let tid = crate::sched::current_thread_id();
+    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
+
+    let mut table = PORT_TABLE.lock();
+    if (port_id as usize) >= MAX_PORTS {
+        return SendDirectResult::Error;
+    }
+    let port = &mut table.ports[port_id as usize];
+    if !port.active {
+        return SendDirectResult::Error;
+    }
+
+    // Check for a parked (Blocked) receiver — direct transfer candidate.
+    if port.recv_waiter_count > 0 {
+        let waiter = port.recv_waiters[port.recv_waiter_count - 1];
+        let is_parked = {
+            let sched = crate::sched::scheduler::SCHEDULER.lock();
+            sched.threads[waiter as usize].state == ThreadState::Blocked
+        };
+        if is_parked {
+            port.recv_waiter_count -= 1;
+            drop(table);
+            return SendDirectResult::DirectTransfer(waiter);
+        }
+    }
+
+    // No parked receiver — try to queue normally.
+    match port.try_send(*msg) {
+        Ok((wakeup, set_id)) => {
+            drop(table);
+            if let Some(waiter) = wakeup {
+                crate::sched::wake_thread(waiter);
+            } else if set_id != u32::MAX {
+                super::port_set::wake_set_waiter(set_id);
+            }
+            SendDirectResult::Queued
+        }
+        Err(_) => {
+            drop(table);
+            SendDirectResult::Full
+        }
+    }
+}
+
+/// Try to receive from a port, or park the current thread as a waiter.
+/// Returns Ok(msg) if a message was immediately available.
+/// Returns Err(()) if the thread was parked (message will be injected by sender).
+pub fn recv_or_park(port_id: PortId) -> Result<Message, ()> {
+    use crate::sched::thread::BlockReason;
+    let my_tid = crate::sched::current_thread_id();
+    crate::sched::reset_priority(my_tid);
+
+    let mut table = PORT_TABLE.lock();
+    if (port_id as usize) >= MAX_PORTS {
+        return Err(());
+    }
+    let port = &mut table.ports[port_id as usize];
+    if !port.active {
+        return Err(());
+    }
+
+    match port.try_recv() {
+        Ok((msg, wakeup)) => {
+            drop(table);
+            if let Some(tid) = wakeup {
+                crate::sched::wake_thread(tid);
+            }
+            crate::sched::boost_priority(my_tid, msg.data[5] as u8);
+            Ok(msg)
+        }
+        Err(()) => {
+            crate::sched::clear_wakeup_flag(my_tid);
+            port.add_recv_waiter(my_tid);
+            drop(table);
+            // Park: thread goes off-CPU. Sender will inject message into our frame.
+            crate::sched::scheduler::park_current_for_ipc(BlockReason::PortRecv(port_id));
+            Err(())
+        }
     }
 }

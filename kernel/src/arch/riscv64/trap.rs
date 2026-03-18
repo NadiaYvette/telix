@@ -209,7 +209,14 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
         SCAUSE_ECALL_FROM_SMODE | SCAUSE_ECALL_FROM_UMODE => {
             // Advance sepc past the ecall instruction (4 bytes).
             frame.sepc += 4;
+            // Store frame SP so park/handoff can read it.
+            crate::sched::scheduler::store_frame_sp(frame_sp);
             crate::syscall::dispatch(frame);
+            // Check if the syscall triggered a context switch (park or handoff).
+            let pending = crate::sched::scheduler::take_pending_switch();
+            if pending != 0 {
+                return pending;
+            }
             frame_sp
         }
 

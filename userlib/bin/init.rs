@@ -1302,6 +1302,74 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 26: L4-style handoff scheduling ---
+    syscall::debug_puts(b"  init: testing L4 handoff IPC...\n");
+    {
+        // Test that blocking send/recv with parking works correctly.
+        let req_port = syscall::port_create() as u32;
+        let rply_port = syscall::port_create() as u32;
+        let mut handoff_ok = true;
+
+        // Test 1: queue path — send then recv on same port.
+        let tag: u64 = 0x2600;
+        syscall::send(req_port, tag, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD);
+        if let Some(msg) = syscall::recv_msg(req_port) {
+            if msg.tag != tag || msg.data[0] != 0xAAAA || msg.data[1] != 0xBBBB {
+                syscall::debug_puts(b"  init: L4 queue recv data mismatch\n");
+                handoff_ok = false;
+            }
+        } else {
+            syscall::debug_puts(b"  init: L4 queue recv failed\n");
+            handoff_ok = false;
+        }
+
+        // Test 2: cross-server IPC exercises park + wake + inject.
+        // Send NS_LOOKUP to name server, recv reply on our reply port.
+        let nsrv = syscall::nsrv_port() as u32;
+        let ns_tag: u64 = 0x1100; // NS_LOOKUP
+        let name = b"blk\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let w0 = u64::from_le_bytes(name[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(name[8..16].try_into().unwrap());
+        let w2 = u64::from_le_bytes(name[16..24].try_into().unwrap());
+        let len_reply = 3u64 | ((rply_port as u64) << 32);
+        syscall::send(nsrv, ns_tag, w0, w1, w2, len_reply);
+        if let Some(reply) = syscall::recv_msg(rply_port) {
+            let port_id = reply.data[0] as u32;
+            if port_id == 0 || port_id > 63 {
+                syscall::debug_puts(b"  init: L4 ns_lookup got bad port\n");
+                handoff_ok = false;
+            }
+        } else {
+            syscall::debug_puts(b"  init: L4 ns_lookup recv failed\n");
+            handoff_ok = false;
+        }
+
+        // Test 3: Measure self-send+recv round-trip (exercises queue path latency).
+        let t0 = syscall::get_cycles();
+        for _ in 0..100u32 {
+            syscall::send(req_port, 0x2601, 0, 0, 0, 0);
+            let _ = syscall::recv_msg(req_port);
+        }
+        let t1 = syscall::get_cycles();
+        let avg_cy = (t1 - t0) / 100;
+        let freq = syscall::get_timer_freq();
+        let avg_us = if freq > 0 { avg_cy * 1_000_000 / freq } else { 0 };
+        syscall::debug_puts(b"  init: L4 self-rtt: ");
+        print_num(avg_cy);
+        syscall::debug_puts(b" cy (~");
+        print_num(avg_us);
+        syscall::debug_puts(b" us)\n");
+
+        syscall::port_destroy(req_port);
+        syscall::port_destroy(rply_port);
+
+        if handoff_ok {
+            syscall::debug_puts(b"Phase 26 L4 handoff scheduling: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 26 L4 handoff scheduling: FAILED\n");
+        }
+    }
+
     // --- Test 21: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

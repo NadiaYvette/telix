@@ -38,12 +38,19 @@ extern "C" fn exception_unhandled(frame: &ExceptionFrame) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn exception_sync_el1(frame: &mut ExceptionFrame) {
+extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
+    let frame = unsafe { &mut *(frame_sp as *mut ExceptionFrame) };
     let ec = (frame.esr >> 26) & 0x3f;
     match ec {
         0x15 => {
             // SVC from AArch64. Dispatch syscall.
+            crate::sched::scheduler::store_frame_sp(frame_sp);
             crate::syscall::dispatch(frame);
+            let pending = crate::sched::scheduler::take_pending_switch();
+            if pending != 0 {
+                return pending;
+            }
+            frame_sp
         }
         _ => {
             crate::println!(
@@ -79,20 +86,29 @@ extern "C" fn exception_serror_el1(frame: &ExceptionFrame) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn exception_sync_el0(frame: &mut ExceptionFrame) {
+extern "C" fn exception_sync_el0(frame_sp: u64) -> u64 {
+    let frame = unsafe { &mut *(frame_sp as *mut ExceptionFrame) };
     let ec = (frame.esr >> 26) & 0x3f;
     match ec {
         0x15 => {
             // SVC from AArch64 EL0.
+            crate::sched::scheduler::store_frame_sp(frame_sp);
             crate::syscall::dispatch(frame);
+            let pending = crate::sched::scheduler::take_pending_switch();
+            if pending != 0 {
+                return pending;
+            }
+            frame_sp
         }
         // Data Abort from EL0.
         0x24 => {
             handle_abort_el0(frame);
+            frame_sp
         }
         // Instruction Abort from EL0.
         0x20 => {
             handle_abort_el0(frame);
+            frame_sp
         }
         _ => {
             crate::println!(

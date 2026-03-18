@@ -120,7 +120,14 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
 
         // Syscall via int 0x80.
         0x80 => {
+            // Store frame SP so park/handoff can read it without changing dispatch()'s signature.
+            crate::sched::scheduler::store_frame_sp(frame_sp);
             crate::syscall::dispatch(frame);
+            // Check if the syscall triggered a context switch (park or handoff).
+            let pending = crate::sched::scheduler::take_pending_switch();
+            if pending != 0 {
+                return pending;
+            }
             return frame_sp;
         }
 

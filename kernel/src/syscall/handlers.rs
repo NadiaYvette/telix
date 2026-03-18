@@ -91,7 +91,7 @@ fn syscall_arg(frame: &ExceptionFrame, n: usize) -> u64 {
 
 /// Set the return value in the frame.
 #[inline]
-fn set_return(frame: &mut ExceptionFrame, val: u64) {
+pub(crate) fn set_return(frame: &mut ExceptionFrame, val: u64) {
     #[cfg(target_arch = "aarch64")]
     { frame.regs[0] = val; } // x0
     #[cfg(target_arch = "riscv64")]
@@ -102,7 +102,7 @@ fn set_return(frame: &mut ExceptionFrame, val: u64) {
 
 /// Set additional return register (for recv).
 #[inline]
-fn set_reg(frame: &mut ExceptionFrame, reg: usize, val: u64) {
+pub(crate) fn set_reg(frame: &mut ExceptionFrame, reg: usize, val: u64) {
     #[cfg(target_arch = "aarch64")]
     { frame.regs[reg] = val; }
     #[cfg(target_arch = "riscv64")]
@@ -189,6 +189,32 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
     if crate::sched::scheduler::is_killed(tid) {
         crate::sched::scheduler::exit_current_thread(-9);
     }
+}
+
+/// Inject a received message into a parked thread's saved exception frame.
+/// Called by sender after direct-transfer from send_direct().
+fn inject_recv_into_frame(receiver_tid: u32, msg: &crate::ipc::Message) {
+    let sp = crate::sched::scheduler::thread_saved_sp(receiver_tid);
+    let frame = unsafe { &mut *(sp as *mut ExceptionFrame) };
+    set_return(frame, 0); // recv returns 0 = success
+    set_reg(frame, 1, msg.tag);
+    set_reg(frame, 2, msg.data[0]);
+    set_reg(frame, 3, msg.data[1]);
+    set_reg(frame, 4, msg.data[2]);
+    set_reg(frame, 5, msg.data[3]);
+    set_reg(frame, 6, msg.data[4]);
+    set_reg(frame, 7, msg.data[5]);
+}
+
+/// Deliver a message to a parked (Blocked) receiver thread by injecting it into
+/// the thread's saved exception frame. Also handles auto-grant caps and priority
+/// inheritance. Called from port::send/send_nb when the old queue path wakes a
+/// parked receiver.
+pub(crate) fn deliver_to_parked_receiver(receiver_tid: u32, msg: &crate::ipc::Message) {
+    inject_recv_into_frame(receiver_tid, msg);
+    let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
+    auto_grant_reply_caps(receiver_task, msg);
+    crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
 }
 
 /// Check if the current task has a port capability with the needed rights.
@@ -315,12 +341,27 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
         return ECAP;
     }
     let mut msg = crate::ipc::Message::new(tag, data);
-    // Stamp sender's effective priority into data[5] for priority inheritance.
-    let tid = crate::sched::current_thread_id();
-    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
-    match crate::ipc::port::send(port_id as u32, msg) {
-        Ok(()) => 0,
-        Err(()) => 1,
+
+    match crate::ipc::port::send_direct(port_id as u32, &mut msg) {
+        crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
+            // L4-style direct handoff: inject message and switch to receiver.
+            let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
+            auto_grant_reply_caps(receiver_task, &msg);
+            inject_recv_into_frame(receiver_tid, &msg);
+            crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
+            // Handoff: donate our quantum to receiver, switch immediately.
+            crate::sched::scheduler::handoff_to(receiver_tid);
+            0
+        }
+        crate::ipc::port::SendDirectResult::Queued => 0,
+        crate::ipc::port::SendDirectResult::Full => {
+            // Queue full — fall back to blocking send (spin-blocks until space).
+            match crate::ipc::port::send(port_id as u32, msg) {
+                Ok(()) => 0,
+                Err(()) => 1,
+            }
+        }
+        crate::ipc::port::SendDirectResult::Error => 1,
     }
 }
 
@@ -329,12 +370,20 @@ fn sys_send_nb(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
         return ECAP;
     }
     let mut msg = crate::ipc::Message::new(tag, data);
-    // Stamp sender's effective priority into data[5] for priority inheritance.
-    let tid = crate::sched::current_thread_id();
-    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
-    match crate::ipc::port::send_nb(port_id as u32, msg) {
-        Ok(()) => 0,
-        Err(_) => 1, // Queue full.
+
+    match crate::ipc::port::send_direct(port_id as u32, &mut msg) {
+        crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
+            // Direct transfer: inject message into parked receiver's frame and wake.
+            let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
+            auto_grant_reply_caps(receiver_task, &msg);
+            inject_recv_into_frame(receiver_tid, &msg);
+            crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
+            crate::sched::scheduler::wake_parked_thread(receiver_tid);
+            0
+        }
+        crate::ipc::port::SendDirectResult::Queued => 0,
+        crate::ipc::port::SendDirectResult::Full => 1,
+        crate::ipc::port::SendDirectResult::Error => 1,
     }
 }
 
@@ -342,9 +391,9 @@ fn sys_recv(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
     if !check_port_cap(port_id as u32, crate::cap::Rights::RECV) {
         return ECAP;
     }
-    match crate::ipc::port::recv(port_id as u32) {
+    match crate::ipc::port::recv_or_park(port_id as u32) {
         Ok(msg) => {
-            // Auto-grant SEND caps for reply port IDs in message data.
+            // Message was immediately available from the queue.
             let task_id = crate::sched::current_task_id();
             auto_grant_reply_caps(task_id, &msg);
             set_reg(frame, 1, msg.tag);
@@ -356,7 +405,13 @@ fn sys_recv(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
             set_reg(frame, 7, msg.data[5]);
             0
         }
-        Err(()) => 1,
+        Err(()) => {
+            // Thread was parked. A sender will inject the message directly into
+            // our saved exception frame and wake us. When we resume, our frame
+            // already has the return values set. Return 0 as placeholder (will
+            // be overwritten by inject_recv_into_frame before we actually run).
+            0
+        }
     }
 }
 

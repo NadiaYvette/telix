@@ -134,6 +134,7 @@ vec_sync_el1:
     save_regs
     mov     x0, sp
     bl      exception_sync_el1
+    mov     sp, x0              // Use return value as new SP (L4 handoff support)
     restore_regs
     eret
 
@@ -156,6 +157,7 @@ vec_sync_el0:
     save_regs
     mov     x0, sp
     bl      exception_sync_el0
+    mov     sp, x0              // Use return value as new SP (L4 handoff support)
     restore_regs
     eret
 
