@@ -183,9 +183,28 @@ struct BlkDev {
     last_used_idx: u16,
     /// Capacity in 512-byte sectors.
     capacity: u64,
+    /// Actual virtqueue size (device-reported on PCI, negotiated on MMIO).
+    queue_size: usize,
+}
+
+// --- Legacy virtio-PCI BAR0 register offsets ---
+#[cfg(target_arch = "x86_64")]
+mod pci_regs {
+    pub const DEVICE_FEATURES: u16 = 0x00;  // 32-bit read
+    pub const DRIVER_FEATURES: u16 = 0x04;  // 32-bit write
+    pub const QUEUE_ADDRESS: u16 = 0x08;    // 32-bit write (PFN)
+    pub const QUEUE_SIZE: u16 = 0x0C;       // 16-bit read
+    pub const QUEUE_SELECT: u16 = 0x0E;     // 16-bit write
+    pub const QUEUE_NOTIFY: u16 = 0x10;     // 16-bit write
+    pub const DEVICE_STATUS: u16 = 0x12;    // 8-bit r/w
+    pub const ISR_STATUS: u16 = 0x13;       // 8-bit read
+    // Block device config starts at offset 0x14.
+    pub const BLK_CAPACITY_LO: u16 = 0x14;  // 32-bit
+    pub const BLK_CAPACITY_HI: u16 = 0x18;  // 32-bit
 }
 
 impl BlkDev {
+    #[cfg(not(target_arch = "x86_64"))]
     fn init(mmio_phys: usize, irq: u32) -> Option<Self> {
         // Map MMIO registers into our address space.
         let mmio_va = syscall::mmap_device(mmio_phys, 1)?;
@@ -293,6 +312,7 @@ impl BlkDev {
                 next_desc: 0,
                 last_used_idx: 0,
                 capacity,
+                queue_size: QUEUE_SIZE,
             });
         }
 
@@ -324,6 +344,93 @@ impl BlkDev {
             next_desc: 0,
             last_used_idx: 0,
             capacity,
+            queue_size: QUEUE_SIZE,
+        })
+    }
+
+    /// PCI transport init for x86_64.
+    #[cfg(target_arch = "x86_64")]
+    fn init(bar0_port: usize, irq: u32) -> Option<Self> {
+        let base = bar0_port as u16;
+
+        syscall::debug_puts(b"  [blk_srv] PCI BAR0 port ");
+        print_hex(base as u64);
+        syscall::debug_puts(b"\n");
+
+        // Reset.
+        syscall::ioport_outb(base + pci_regs::DEVICE_STATUS, 0);
+
+        // ACK + DRIVER.
+        syscall::ioport_outb(base + pci_regs::DEVICE_STATUS, STATUS_ACK as u8);
+        syscall::ioport_outb(base + pci_regs::DEVICE_STATUS,
+            (STATUS_ACK | STATUS_DRIVER) as u8);
+
+        // Feature negotiation.
+        let _features = syscall::ioport_inl(base + pci_regs::DEVICE_FEATURES);
+        syscall::ioport_outl(base + pci_regs::DRIVER_FEATURES, 0);
+
+        // Read capacity from device config (BAR0 + 0x14).
+        let cap_lo = syscall::ioport_inl(base + pci_regs::BLK_CAPACITY_LO) as u64;
+        let cap_hi = syscall::ioport_inl(base + pci_regs::BLK_CAPACITY_HI) as u64;
+        let capacity = cap_lo | (cap_hi << 32);
+
+        // Select queue 0.
+        syscall::ioport_outw(base + pci_regs::QUEUE_SELECT, 0);
+        let max_size = syscall::ioport_inw(base + pci_regs::QUEUE_SIZE);
+        if max_size == 0 {
+            syscall::debug_puts(b"  [blk_srv] queue size 0\n");
+            return None;
+        }
+
+        // Legacy PCI: queue size is fixed by the device (read-only register).
+        // We MUST use the device's queue size for ring layout calculations.
+        let qsz = max_size as usize;
+
+        // Allocate virtqueue page (64K alloc page fits desc+avail+used with 4K alignment).
+        let vq_va = syscall::mmap_anon(0, 1, 1)?;
+        let vq_pa = syscall::virt_to_phys(vq_va)?;
+        unsafe { core::ptr::write_bytes(vq_va as *mut u8, 0, 4096 * 16); }
+
+        let desc_pa = vq_pa;
+        let avail_pa = desc_pa + 16 * qsz;
+
+        // Legacy PCI: used ring is page-aligned after avail.
+        let avail_end = avail_pa + 6 + 2 * qsz;
+        let used_pa = (avail_end + 4095) & !4095;
+
+        // Write queue PFN (physical frame number = phys_addr / 4096).
+        let pfn = (vq_pa / 4096) as u32;
+        syscall::ioport_outl(base + pci_regs::QUEUE_ADDRESS, pfn);
+
+        // Allocate buffer page.
+        let buf_va = syscall::mmap_anon(0, 1, 1)?;
+        let buf_pa = syscall::virt_to_phys(buf_va)?;
+        unsafe { core::ptr::write_bytes(buf_va as *mut u8, 0, 4096); }
+
+        let req_hdr_pa = buf_pa;
+        let status_pa = buf_pa + 16;
+        let data_pa = buf_pa + 32;
+
+        // DRIVER_OK.
+        syscall::ioport_outb(base + pci_regs::DEVICE_STATUS,
+            (STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK) as u8);
+
+        // Store BAR0 base as mmio_va for notify/ISR access.
+        Some(Self {
+            mmio_va: base as usize,
+            irq,
+            vq_va,
+            buf_va,
+            desc_pa,
+            avail_pa,
+            used_pa,
+            req_hdr_pa,
+            status_pa,
+            data_pa,
+            next_desc: 0,
+            last_used_idx: 0,
+            capacity,
+            queue_size: qsz,
         })
     }
 
@@ -428,18 +535,22 @@ impl BlkDev {
     }
 
     fn submit(&mut self, head: u16) {
-        let avail_va = self.vq_va + 16 * QUEUE_SIZE;
+        let avail_offset = self.avail_pa - self.desc_pa;
+        let avail_va = self.vq_va + avail_offset;
         let avail_idx_ptr = (avail_va + 2) as *mut u16;
         let avail_ring_ptr = (avail_va + 4) as *mut u16;
 
         unsafe {
             let idx = core::ptr::read_volatile(avail_idx_ptr);
-            core::ptr::write_volatile(avail_ring_ptr.add((idx as usize) % QUEUE_SIZE), head);
+            core::ptr::write_volatile(avail_ring_ptr.add((idx as usize) % self.queue_size), head);
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             core::ptr::write_volatile(avail_idx_ptr, idx.wrapping_add(1));
         }
         // Notify device.
+        #[cfg(not(target_arch = "x86_64"))]
         mmio_write32(self.mmio_va, MMIO_QUEUE_NOTIFY, 0);
+        #[cfg(target_arch = "x86_64")]
+        syscall::ioport_outw(self.mmio_va as u16 + pci_regs::QUEUE_NOTIFY, 0);
     }
 
     fn wait_complete(&mut self) {
@@ -448,9 +559,6 @@ impl BlkDev {
         let used_idx_ptr = (used_va + 2) as *const u16; // VringUsed.idx at offset 2
 
         // Poll the used ring, yielding between checks.
-        // QEMU TCG can lose virtio IRQs, so we can't rely solely on
-        // irq_wait blocking. Yield gives the QEMU I/O thread time to
-        // process the request, similar to the kernel driver's WFI loop.
         loop {
             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             let idx = unsafe { core::ptr::read_volatile(used_idx_ptr) };
@@ -465,17 +573,19 @@ impl BlkDev {
 
 #[unsafe(no_mangle)]
 fn main(arg0: u64, _arg1: u64, _arg2: u64) {
-    // Unpack device info from arg0: mmio_base in low 48 bits, irq in bits 48-63.
-    let mmio_phys = (arg0 & 0xFFFF_FFFF_FFFF) as usize;
+    // Unpack device info from arg0: base in low 48 bits, irq in bits 48-63.
+    // On aarch64/riscv64: base = MMIO physical address.
+    // On x86_64: base = BAR0 I/O port number.
+    let base = (arg0 & 0xFFFF_FFFF_FFFF) as usize;
     let irq = (arg0 >> 48) as u32;
 
-    syscall::debug_puts(b"  [blk_srv] starting, mmio=");
-    print_hex(mmio_phys as u64);
+    syscall::debug_puts(b"  [blk_srv] starting, base=");
+    print_hex(base as u64);
     syscall::debug_puts(b" irq=");
     print_num(irq as u64);
     syscall::debug_puts(b"\n");
 
-    let mut dev = match BlkDev::init(mmio_phys, irq) {
+    let mut dev = match BlkDev::init(base, irq) {
         Some(d) => d,
         None => {
             syscall::debug_puts(b"  [blk_srv] failed to init device\n");

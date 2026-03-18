@@ -41,6 +41,7 @@ pub const SYS_MMAP_DEVICE: u64 = 24;
 pub const SYS_VIRT_TO_PHYS: u64 = 25;
 pub const SYS_IRQ_WAIT: u64 = 26;
 pub const SYS_GETCHAR: u64 = 27;
+pub const SYS_IOPORT: u64 = 28;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -151,6 +152,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_VIRT_TO_PHYS => sys_virt_to_phys(a0),
         SYS_IRQ_WAIT => sys_irq_wait(a0, a1),
         SYS_GETCHAR => sys_getchar(),
+        SYS_IOPORT => sys_ioport(a0, a1, a2),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -575,7 +577,7 @@ fn sys_irq_wait(irq_num: u64, mmio_base: u64) -> u64 {
     #[cfg(target_arch = "riscv64")]
     let valid = irq >= 1 && irq <= 8;
     #[cfg(target_arch = "x86_64")]
-    let valid = { let _ = irq; false };
+    let valid = irq >= 1 && irq <= 15;
 
     if !valid {
         return u64::MAX;
@@ -589,6 +591,34 @@ fn sys_irq_wait(irq_num: u64, mmio_base: u64) -> u64 {
 
     // Subsequent calls: block until IRQ fires.
     crate::io::irq_dispatch::wait(irq)
+}
+
+fn sys_ioport(op: u64, port: u64, value: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let port = port as u16;
+        // Only allow ports >= 0x1000 (avoids system ports like PIC/PIT/COM1).
+        if port < 0x1000 {
+            return u64::MAX;
+        }
+        use crate::arch::x86_64::serial;
+        unsafe {
+            match op {
+                0 => serial::inb(port) as u64,
+                1 => serial::inw(port) as u64,
+                2 => serial::inl(port) as u64,
+                3 => { serial::outb(port, value as u8); 0 }
+                4 => { serial::outw(port, value as u16); 0 }
+                5 => { serial::outl(port, value as u32); 0 }
+                _ => u64::MAX,
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (op, port, value);
+        u64::MAX
+    }
 }
 
 fn sys_getchar() -> u64 {

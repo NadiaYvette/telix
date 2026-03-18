@@ -4,6 +4,7 @@ pub mod gdt;
 pub mod idt;
 pub mod lapic;
 pub mod mm;
+pub mod pci;
 pub mod pic;
 pub mod serial;
 pub mod smp;

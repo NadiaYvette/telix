@@ -26,6 +26,7 @@ const SYS_MMAP_DEVICE: u64 = 24;
 const SYS_VIRT_TO_PHYS: u64 = 25;
 const SYS_IRQ_WAIT: u64 = 26;
 const SYS_GETCHAR: u64 = 27;
+const SYS_IOPORT: u64 = 28;
 const SYS_PORT_SET_CREATE: u64 = 5;
 const SYS_PORT_SET_ADD: u64 = 6;
 #[allow(dead_code)]
@@ -358,6 +359,36 @@ pub fn recv_nb_msg(port: u32) -> Option<Message> {
         tag: r1,
         data: [r2, r3, r4, r5, r6, r7],
     })
+}
+
+/// Read a byte from an I/O port (x86_64 only).
+pub fn ioport_inb(port: u16) -> u8 {
+    unsafe { arch::syscall2(SYS_IOPORT, 0, port as u64) as u8 }
+}
+
+/// Read a 16-bit word from an I/O port (x86_64 only).
+pub fn ioport_inw(port: u16) -> u16 {
+    unsafe { arch::syscall2(SYS_IOPORT, 1, port as u64) as u16 }
+}
+
+/// Read a 32-bit dword from an I/O port (x86_64 only).
+pub fn ioport_inl(port: u16) -> u32 {
+    unsafe { arch::syscall2(SYS_IOPORT, 2, port as u64) as u32 }
+}
+
+/// Write a byte to an I/O port (x86_64 only).
+pub fn ioport_outb(port: u16, val: u8) {
+    unsafe { arch::syscall3(SYS_IOPORT, 3, port as u64, val as u64); }
+}
+
+/// Write a 16-bit word to an I/O port (x86_64 only).
+pub fn ioport_outw(port: u16, val: u16) {
+    unsafe { arch::syscall3(SYS_IOPORT, 4, port as u64, val as u64); }
+}
+
+/// Write a 32-bit dword to an I/O port (x86_64 only).
+pub fn ioport_outl(port: u16, val: u32) {
+    unsafe { arch::syscall3(SYS_IOPORT, 5, port as u64, val as u64); }
 }
 
 /// Register a service with the name server.

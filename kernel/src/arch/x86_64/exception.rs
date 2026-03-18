@@ -127,7 +127,9 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         // Other IRQs (33-47).
         33..=47 => {
             let irq = (vector - 32) as u8;
-            crate::println!("Unhandled IRQ {}", irq);
+            if !crate::io::irq_dispatch::handle_irq(irq as u32) {
+                crate::println!("Unhandled IRQ {}", irq);
+            }
             super::pic::send_eoi(irq);
         }
 

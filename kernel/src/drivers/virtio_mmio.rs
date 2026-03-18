@@ -42,6 +42,7 @@ pub const STATUS_DRIVER_OK: u32 = 4;
 pub const STATUS_FAILED: u32 = 128;
 
 /// Virtio device IDs.
+pub const DEVICE_NET: u32 = 1;
 pub const DEVICE_BLK: u32 = 2;
 
 /// Expected magic value.

@@ -42,3 +42,7 @@ path = "bin/console_srv.rs"
 [[bin]]
 name = "shell"
 path = "bin/shell.rs"
+
+[[bin]]
+name = "net_srv"
+path = "bin/net_srv.rs"

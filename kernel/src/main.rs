@@ -127,6 +127,60 @@ pub fn kmain() -> ! {
         }
     }
 
+    // Virtio-net driver — spawn as userspace process on AArch64 and RISC-V.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        if let Some(base) = drivers::virtio_mmio::find_device(drivers::virtio_mmio::DEVICE_NET) {
+            #[cfg(target_arch = "aarch64")]
+            let irq = {
+                let dev_index = (base - 0x0a00_0000) / 0x200;
+                48 + dev_index as u64
+            };
+            #[cfg(target_arch = "riscv64")]
+            let irq = match base {
+                0x1000_8000 => 8u64,
+                0x1000_7000 => 7,
+                0x1000_6000 => 6,
+                0x1000_5000 => 5,
+                0x1000_4000 => 4,
+                0x1000_3000 => 3,
+                0x1000_2000 => 2,
+                0x1000_1000 => 1,
+                _ => 1,
+            };
+            let arg0 = (base as u64) | (irq << 48);
+            println!("  virtio-net at {:#x}, irq {}, spawning net_srv with arg0={:#x}", base, irq, arg0);
+            match sched::spawn_user(b"net_srv", 50, 20, arg0) {
+                Some(tid) => println!("  net_srv spawned (thread {})", tid),
+                None => println!("  WARNING: net_srv not found (ok if not yet built)"),
+            }
+        } else {
+            println!("  no virtio-net device found, skipping net_srv");
+        }
+    }
+
+    // x86_64: Discover virtio devices via PCI bus scan.
+    #[cfg(target_arch = "x86_64")]
+    {
+        println!("  Scanning PCI bus for virtio devices...");
+        // virtio-blk-pci: device ID 0x1001
+        if let Some(dev) = arch::x86_64::pci::find_virtio_device(0x1001) {
+            let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
+            match sched::spawn_user(b"blk_srv", 50, 20, arg0) {
+                Some(tid) => println!("  blk_srv spawned (thread {})", tid),
+                None => println!("  WARNING: blk_srv not found (ok if not yet built)"),
+            }
+        }
+        // virtio-net-pci: device ID 0x1000
+        if let Some(dev) = arch::x86_64::pci::find_virtio_device(0x1000) {
+            let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
+            match sched::spawn_user(b"net_srv", 50, 20, arg0) {
+                Some(tid) => println!("  net_srv spawned (thread {})", tid),
+                None => println!("  WARNING: net_srv not found (ok if not yet built)"),
+            }
+        }
+    }
+
     // Phase 4: Spawning init process...
     println!("Phase 4: Spawning init process...");
 
@@ -165,7 +219,6 @@ pub fn kmain() -> ! {
     }
 
     // Spawn FAT16 filesystem server (userspace, connects to blk_srv via IPC).
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     match sched::spawn_user(b"fat16_srv", 50, 20, 0) {
         Some(tid) => println!("  fat16_srv spawned (thread {})", tid),
         None => println!("  WARNING: fat16_srv not found (ok if not yet built)"),

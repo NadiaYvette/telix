@@ -28,6 +28,12 @@ if [ -f "$DISK_IMG" ]; then
     )
 fi
 
+# Add virtio-net (QEMU user-mode networking).
+QEMU_ARGS+=(
+    -netdev user,id=net0
+    -device virtio-net-device,netdev=net0
+)
+
 # Add debug flags if requested.
 if [ "${1:-}" = "--debug" ]; then
     QEMU_ARGS+=(-S -s)

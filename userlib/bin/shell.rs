@@ -17,6 +17,12 @@ const CON_WRITE: u64 = 0x3100;
 #[allow(dead_code)]
 const CON_WRITE_OK: u64 = 0x3101;
 
+// Net protocol.
+const NET_STATUS: u64 = 0x4000;
+const NET_STATUS_OK: u64 = 0x4001;
+const NET_PING: u64 = 0x4100;
+const NET_PING_OK: u64 = 0x4101;
+
 // FS protocol.
 const FS_OPEN: u64 = 0x2000;
 const FS_OPEN_OK: u64 = 0x2001;
@@ -163,11 +169,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         if line == b"help" {
             con_puts(con_port, reply_port, b"Commands:\r\n");
-            con_puts(con_port, reply_port, b"  help  - show this\r\n");
-            con_puts(con_port, reply_port, b"  ls    - list files\r\n");
-            con_puts(con_port, reply_port, b"  cat F - show file\r\n");
-            con_puts(con_port, reply_port, b"  echo  - echo text\r\n");
-            con_puts(con_port, reply_port, b"  info  - sys info\r\n");
+            con_puts(con_port, reply_port, b"  help     - show this\r\n");
+            con_puts(con_port, reply_port, b"  ls       - list files\r\n");
+            con_puts(con_port, reply_port, b"  cat F    - show file\r\n");
+            con_puts(con_port, reply_port, b"  echo     - echo text\r\n");
+            con_puts(con_port, reply_port, b"  info     - sys info\r\n");
+            con_puts(con_port, reply_port, b"  net      - net status\r\n");
+            con_puts(con_port, reply_port, b"  ping IP  - ping host\r\n");
         } else if line == b"ls" {
             cmd_ls(con_port, reply_port, fat16_port);
         } else if starts_with(line, b"cat ") {
@@ -177,6 +185,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             con_puts(con_port, reply_port, b"\r\n");
         } else if line == b"info" {
             cmd_info(con_port, reply_port);
+        } else if line == b"net" {
+            cmd_net(con_port, reply_port);
+        } else if starts_with(line, b"ping ") {
+            cmd_ping(con_port, reply_port, &line[5..]);
         } else {
             con_puts(con_port, reply_port, b"unknown: ");
             con_puts(con_port, reply_port, line);
@@ -306,6 +318,117 @@ fn cmd_cat(con_port: u32, reply_port: u32, fat16_port: Option<u32>, filename: &[
 
     // FS_CLOSE.
     syscall::send_nb(fp, FS_CLOSE, handle, 0);
+}
+
+fn cmd_net(con_port: u32, reply_port: u32) {
+    let np = match syscall::ns_lookup(b"net") {
+        Some(p) => p,
+        None => {
+            con_puts(con_port, reply_port, b"no network\r\n");
+            return;
+        }
+    };
+    let net_reply = syscall::port_create() as u32;
+    syscall::send(np, NET_STATUS, net_reply as u64, 0, 0, 0);
+
+    if let Some(msg) = syscall::recv_msg(net_reply) {
+        if msg.tag == NET_STATUS_OK {
+            let mac_val = msg.data[0];
+            let ip_val = msg.data[1] as u32;
+            let ip = ip_val.to_be_bytes();
+
+            con_puts(con_port, reply_port, b"  MAC: ");
+            let mut mac_buf = [0u8; 17]; // xx:xx:xx:xx:xx:xx
+            for i in 0..6 {
+                let byte = (mac_val >> (i * 8)) as u8;
+                let hi = byte >> 4;
+                let lo = byte & 0xF;
+                mac_buf[i * 3] = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+                mac_buf[i * 3 + 1] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+                if i < 5 { mac_buf[i * 3 + 2] = b':'; }
+            }
+            con_puts(con_port, reply_port, &mac_buf);
+            con_puts(con_port, reply_port, b"\r\n  IP:  ");
+
+            let mut ip_buf = [0u8; 20];
+            let mut pos = 0;
+            for i in 0..4 {
+                if i > 0 { ip_buf[pos] = b'.'; pos += 1; }
+                let n = fmt_num(ip[i] as u64, &mut ip_buf[pos..]);
+                pos += n;
+            }
+            con_puts(con_port, reply_port, &ip_buf[..pos]);
+            con_puts(con_port, reply_port, b"\r\n");
+        }
+    }
+    syscall::port_destroy(net_reply);
+}
+
+fn parse_ip(s: &[u8]) -> Option<u32> {
+    let mut octets = [0u8; 4];
+    let mut octet_idx = 0;
+    let mut val: u32 = 0;
+    let mut has_digit = false;
+    for &ch in s {
+        if ch == b'.' {
+            if !has_digit || octet_idx >= 3 { return None; }
+            if val > 255 { return None; }
+            octets[octet_idx] = val as u8;
+            octet_idx += 1;
+            val = 0;
+            has_digit = false;
+        } else if ch >= b'0' && ch <= b'9' {
+            val = val * 10 + (ch - b'0') as u32;
+            has_digit = true;
+        } else {
+            return None;
+        }
+    }
+    if !has_digit || octet_idx != 3 || val > 255 { return None; }
+    octets[3] = val as u8;
+    Some(u32::from_be_bytes(octets))
+}
+
+fn cmd_ping(con_port: u32, reply_port: u32, target: &[u8]) {
+    let np = match syscall::ns_lookup(b"net") {
+        Some(p) => p,
+        None => {
+            con_puts(con_port, reply_port, b"no network\r\n");
+            return;
+        }
+    };
+
+    let ip = match parse_ip(target) {
+        Some(v) => v,
+        None => {
+            con_puts(con_port, reply_port, b"bad IP address\r\n");
+            return;
+        }
+    };
+
+    let net_reply = syscall::port_create() as u32;
+    syscall::send(np, NET_PING, ip as u64, net_reply as u64, 0, 0);
+
+    con_puts(con_port, reply_port, b"pinging...\r\n");
+
+    // Wait for reply with timeout (poll-based).
+    let mut got_reply = false;
+    for _ in 0..20000 {
+        if let Some(msg) = syscall::recv_nb_msg(net_reply) {
+            if msg.tag == NET_PING_OK {
+                con_puts(con_port, reply_port, b"reply received\r\n");
+            } else {
+                con_puts(con_port, reply_port, b"ping failed\r\n");
+            }
+            got_reply = true;
+            break;
+        }
+        syscall::yield_now();
+    }
+    if !got_reply {
+        con_puts(con_port, reply_port, b"timeout\r\n");
+    }
+    syscall::port_destroy(net_reply);
 }
 
 fn cmd_info(con_port: u32, reply_port: u32) {

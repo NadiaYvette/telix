@@ -618,6 +618,50 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"Phase 11 console server: SKIPPED\n");
     }
 
+    // --- Test 11: Virtio-net + ICMP ping ---
+    syscall::debug_puts(b"  init: testing network...\n");
+
+    // Give net_srv time to start and register.
+    for _ in 0..200 { syscall::yield_now(); }
+
+    let mut net_port: Option<u32> = None;
+    for _ in 0..500 {
+        if let Some(p) = syscall::ns_lookup(b"net") {
+            net_port = Some(p);
+            break;
+        }
+        syscall::yield_now();
+    }
+
+    if let Some(np) = net_port {
+        syscall::debug_puts(b"  init: ns_lookup(net) = port ");
+        print_num(np as u64);
+        syscall::debug_puts(b"\n");
+
+        let net_reply = syscall::port_create() as u32;
+
+        // NET_PING gateway (10.0.2.2).
+        let target_ip: u64 = (10u64 << 24) | (0 << 16) | (2 << 8) | 2; // 0x0A000202
+        syscall::send(np, 0x4100, target_ip, net_reply as u64, 0, 0);
+
+        // Wait for reply (blocking — net_srv always replies with OK or FAIL).
+        let mut ping_ok = false;
+        if let Some(reply) = syscall::recv_msg(net_reply) {
+            if reply.tag == 0x4101 {
+                ping_ok = true;
+            }
+        }
+
+        if ping_ok {
+            syscall::debug_puts(b"Phase 12 virtio-net ping: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 12 virtio-net ping: FAILED\n");
+        }
+    } else {
+        syscall::debug_puts(b"  init: net not found, skipping\n");
+        syscall::debug_puts(b"Phase 12 virtio-net ping: SKIPPED\n");
+    }
+
     // Init loops forever, yielding.
     loop {
         syscall::yield_now();

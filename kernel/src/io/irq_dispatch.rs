@@ -62,6 +62,10 @@ pub fn register(irq: u32, mmio_base: usize) {
         unsafe { core::arch::asm!("mv {0}, tp", out(reg) hart); }
         crate::arch::riscv64::plic::enable_irq(hart, irq);
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::x86_64::pic::unmask(irq as u8);
+    }
 }
 
 /// Called from sys_irq_wait: block until the IRQ fires.
