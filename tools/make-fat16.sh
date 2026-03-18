@@ -16,6 +16,12 @@ echo -n "Hello from FAT16!" > "$TMPFILE"
 mcopy -i "$OUTFILE" "$TMPFILE" ::HELLO.TXT
 rm -f "$TMPFILE"
 
+# Create 32 KB benchmark data file (repeating 0x00-0xFF pattern).
+BENCHFILE=$(mktemp)
+python3 -c "import sys; sys.stdout.buffer.write(bytes(range(256)) * 128)" > "$BENCHFILE"
+mcopy -i "$OUTFILE" "$BENCHFILE" ::BENCH.DAT
+rm -f "$BENCHFILE"
+
 # Optionally copy a hello ELF binary for exec-from-filesystem testing.
 # Usage: make-fat16.sh [target-triple]
 # e.g.:  make-fat16.sh x86_64-unknown-none

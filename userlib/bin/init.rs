@@ -1180,6 +1180,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 22: Macrobenchmark Suite ---
+    syscall::debug_puts(b"  init: running macrobenchmark suite...\n");
+    {
+        let mbench_tid = syscall::spawn(b"macro_bench", 50);
+        if mbench_tid != u64::MAX {
+            loop {
+                if let Some(_code) = syscall::waitpid(mbench_tid) {
+                    break;
+                }
+                syscall::yield_now();
+            }
+            syscall::debug_puts(b"Phase 23 macrobenchmarks: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 23 macrobenchmarks: FAILED (spawn)\n");
+        }
+    }
+
     // Init loops forever, yielding.
     loop {
         syscall::yield_now();

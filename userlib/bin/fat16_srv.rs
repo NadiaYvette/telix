@@ -31,6 +31,8 @@ const FS_CREATE: u64 = 0x2500;
 const FS_CREATE_OK: u64 = 0x2501;
 const FS_WRITE: u64 = 0x2600;
 const FS_WRITE_OK: u64 = 0x2601;
+const FS_DELETE: u64 = 0x2700;
+const FS_DELETE_OK: u64 = 0x2701;
 const FS_ERROR: u64 = 0x2F00;
 
 const ERR_NOT_FOUND: u64 = 1;
@@ -876,6 +878,75 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         blk.write_sector(f.dir_sector, &sec);
                     }
                     open_files[handle].active = false;
+                }
+            }
+
+            FS_DELETE => {
+                // data[0] = name_lo, data[1] = name_hi, data[2] = name_len|(reply<<32)
+                let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
+                let reply_port = (msg.data[2] >> 32) as u32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                let mut name83 = [0u8; 11];
+                to_8_3(name, &mut name83);
+
+                // Search root directory for the file.
+                let mut found_sector = 0u32;
+                let mut found_offset = 0usize;
+                let mut first_cluster: u16 = 0;
+                let mut found = false;
+
+                'del_search: for s in 0..layout.root_dir_sectors {
+                    let mut sec = [0u8; 512];
+                    if !blk.read_sector(layout.root_dir_start + s, &mut sec) {
+                        break;
+                    }
+                    for e in 0..16 {
+                        let off = e * 32;
+                        let first_byte = sec[off];
+                        if first_byte == 0x00 { break 'del_search; }
+                        if first_byte == 0xE5 { continue; }
+                        let attrs = sec[off + 11];
+                        if attrs & 0x18 != 0 { continue; } // Skip volume label + subdir
+                        if &sec[off..off + 11] == &name83 {
+                            first_cluster = read_u16(&sec, off + 26);
+                            found_sector = layout.root_dir_start + s;
+                            found_offset = off;
+                            found = true;
+                            break 'del_search;
+                        }
+                    }
+                }
+
+                if found {
+                    // Close any open handles for this file.
+                    for f in open_files.iter_mut() {
+                        if f.active && f.first_cluster == first_cluster {
+                            f.active = false;
+                        }
+                    }
+
+                    // Mark directory entry as deleted.
+                    let mut sec = [0u8; 512];
+                    blk.read_sector(found_sector, &mut sec);
+                    sec[found_offset] = 0xE5;
+                    blk.write_sector(found_sector, &sec);
+
+                    // Free FAT chain.
+                    let mut cluster = first_cluster;
+                    while cluster >= 2 && cluster < 0xFFF8 {
+                        let next = fat_entry(fat_va, cluster);
+                        set_fat_entry(fat_va, cluster, 0x0000);
+                        cluster = next;
+                    }
+
+                    // Flush FAT to disk.
+                    flush_fat(&blk, fat_va, layout.fat_start, fat_sectors);
+
+                    syscall::send(reply_port, FS_DELETE_OK, 0, 0, 0, 0);
+                } else {
+                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
                 }
             }
 
