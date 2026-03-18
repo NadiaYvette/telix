@@ -182,6 +182,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             con_puts(con_port, reply_port, b"  ping IP  - ping host\r\n");
             con_puts(con_port, reply_port, b"  run F    - exec file\r\n");
             con_puts(con_port, reply_port, b"  write F D- write D to F\r\n");
+            con_puts(con_port, reply_port, b"  A | B    - pipe A to B\r\n");
+        } else if find_byte(line, b'|').is_some() {
+            let pos = find_byte(line, b'|').unwrap();
+            let left = trim_slice(&line[..pos]);
+            let right = trim_slice(&line[pos + 1..]);
+            if left.is_empty() || right.is_empty() {
+                con_puts(con_port, reply_port, b"usage: CMD | CMD\r\n");
+            } else {
+                cmd_pipe(con_port, reply_port, fat16_port, left, right);
+            }
         } else if line == b"ls" {
             cmd_ls(con_port, reply_port, fat16_port);
         } else if starts_with(line, b"cat ") {
@@ -695,4 +705,121 @@ fn cmd_info(con_port: u32, reply_port: u32) {
     let len = fmt_num(aspace as u64, &mut buf);
     con_puts(con_port, reply_port, &buf[..len]);
     con_puts(con_port, reply_port, b"\r\n");
+}
+
+fn find_byte(s: &[u8], b: u8) -> Option<usize> {
+    for (i, &ch) in s.iter().enumerate() {
+        if ch == b { return Some(i); }
+    }
+    None
+}
+
+fn trim_slice(s: &[u8]) -> &[u8] {
+    let mut start = 0;
+    while start < s.len() && s[start] == b' ' { start += 1; }
+    let mut end = s.len();
+    while end > start && s[end - 1] == b' ' { end -= 1; }
+    &s[start..end]
+}
+
+fn cmd_pipe(con_port: u32, reply_port: u32, fat16_port: Option<u32>, left: &[u8], right: &[u8]) {
+    let pipe_port = syscall::port_create() as u32;
+
+    // Extract right-side binary name (first word).
+    let right_cmd = first_word(right);
+
+    // Spawn right-side process with pipe_port as arg0. It reads from the pipe.
+    let tid = syscall::spawn_with_arg(right_cmd, 50, pipe_port as u64);
+    if tid == u64::MAX {
+        con_puts(con_port, reply_port, b"spawn failed: ");
+        con_puts(con_port, reply_port, right_cmd);
+        con_puts(con_port, reply_port, b"\r\n");
+        syscall::port_destroy(pipe_port);
+        return;
+    }
+
+    // Give reader time to start and block on recv.
+    for _ in 0..10 { syscall::yield_now(); }
+
+    // Execute left-side inline, writing to pipe instead of console.
+    if starts_with(left, b"echo ") {
+        userlib::pipe::pipe_write(pipe_port, &left[5..]);
+    } else if starts_with(left, b"cat ") {
+        pipe_cat(pipe_port, reply_port, fat16_port, &left[4..]);
+    } else {
+        con_puts(con_port, reply_port, b"pipe: unsupported left cmd\r\n");
+    }
+    userlib::pipe::pipe_close_writer(pipe_port);
+
+    // Wait for right-side child to exit.
+    loop {
+        if let Some(_) = syscall::waitpid(tid) { break; }
+        syscall::yield_now();
+    }
+
+    syscall::port_destroy(pipe_port);
+}
+
+/// Read a file and write its contents to a pipe port (instead of console).
+fn pipe_cat(pipe_port: u32, reply_port: u32, fat16_port: Option<u32>, filename: &[u8]) {
+    let fp = match fat16_port {
+        Some(p) => p,
+        None => return,
+    };
+
+    let fs_reply = syscall::port_create() as u32;
+
+    // FS_OPEN.
+    let (n0, n1, _) = pack_name(filename);
+    let d2 = (filename.len() as u64) | ((fs_reply as u64) << 32);
+    syscall::send(fp, FS_OPEN, n0, n1, d2, 0);
+
+    let (handle, file_size) = if let Some(msg) = syscall::recv_msg(fs_reply) {
+        if msg.tag == FS_OPEN_OK {
+            (msg.data[0], msg.data[1] as u32)
+        } else {
+            syscall::port_destroy(fs_reply);
+            return;
+        }
+    } else {
+        syscall::port_destroy(fs_reply);
+        return;
+    };
+
+    // Read in chunks and write to pipe.
+    let mut offset = 0u32;
+    while offset < file_size {
+        let to_read = (file_size - offset).min(24);
+        let rd_d2 = (to_read as u64) | ((fs_reply as u64) << 32);
+        syscall::send(fp, FS_READ, handle, offset as u64, rd_d2, 0);
+
+        if let Some(msg) = syscall::recv_msg(fs_reply) {
+            if msg.tag == FS_READ_OK {
+                let bytes_read = msg.data[0] as usize;
+                if bytes_read == 0 { break; }
+
+                // Unpack inline data.
+                let words = [msg.data[1], msg.data[2], msg.data[3]];
+                let mut buf = [0u8; 24];
+                for i in 0..bytes_read.min(24) {
+                    buf[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
+                }
+                userlib::pipe::pipe_write(pipe_port, &buf[..bytes_read]);
+                offset += bytes_read as u32;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    syscall::send_nb(fp, FS_CLOSE, handle, 0);
+    syscall::port_destroy(fs_reply);
+}
+
+fn first_word(s: &[u8]) -> &[u8] {
+    let mut end = 0;
+    while end < s.len() && s[end] != b' ' { end += 1; }
+    &s[..end]
 }

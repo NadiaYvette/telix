@@ -46,3 +46,7 @@ path = "bin/shell.rs"
 [[bin]]
 name = "net_srv"
 path = "bin/net_srv.rs"
+
+[[bin]]
+name = "pipe_upper"
+path = "bin/pipe_upper.rs"

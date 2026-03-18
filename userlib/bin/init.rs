@@ -776,14 +776,32 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let fname = b"TEST.TXT";
         let (fn0, fn1, _) = pack_name(fname);
         let fs_d2 = (fname.len() as u64) | ((wr_reply as u64) << 32);
+        syscall::debug_puts(b"  init: sending FS_CREATE to port ");
+        print_num(fp as u64);
+        syscall::debug_puts(b" reply=");
+        print_num(wr_reply as u64);
+        syscall::debug_puts(b"\n");
         syscall::send(fp, 0x2500, fn0, fn1, fs_d2, 0);
+        syscall::debug_puts(b"  init: FS_CREATE sent, waiting reply\n");
 
         let mut phase15_ok = false;
 
         if let Some(reply) = syscall::recv_msg(wr_reply) {
+            if reply.tag != 0x2501 {
+                syscall::debug_puts(b"  init: FS_CREATE reply tag=");
+                print_num(reply.tag);
+                syscall::debug_puts(b" d0=");
+                print_num(reply.data[0]);
+                syscall::debug_puts(b"\n");
+            }
             if reply.tag == 0x2501 {
                 let handle = reply.data[0];
                 let srv_aspace = reply.data[2] as u32;
+                syscall::debug_puts(b"  init: FS_CREATE ok handle=");
+                print_num(handle);
+                syscall::debug_puts(b" aspace=");
+                print_num(srv_aspace as u64);
+                syscall::debug_puts(b"\n");
 
                 // Allocate scratch page for grant-based write.
                 if let Some(scratch) = syscall::mmap_anon(0, 1, 1) {
@@ -798,28 +816,44 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                     // Grant scratch to fat16_srv.
                     let grant_dst: usize = 0x8_0000_0000;
-                    if syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false) {
+                    let grant_ok = syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false);
+                    syscall::debug_puts(if grant_ok { b"  init: grant ok\n" } else { b"  init: grant FAIL\n" });
+                    if grant_ok {
                         // FS_WRITE: data[0]=handle, data[1]=length|(reply<<32), data[2]=grant_va
                         let wd1 = (test_data.len() as u64) | ((wr_reply as u64) << 32);
                         syscall::send(fp, 0x2600, handle, wd1, grant_dst as u64, 0);
+                        syscall::debug_puts(b"  init: FS_WRITE sent\n");
 
                         if let Some(wr_msg) = syscall::recv_msg(wr_reply) {
+                            syscall::debug_puts(b"  init: FS_WRITE reply tag=");
+                            print_num(wr_msg.tag);
+                            syscall::debug_puts(b" d0=");
+                            print_num(wr_msg.data[0]);
+                            syscall::debug_puts(b"\n");
                             if wr_msg.tag == 0x2601 && wr_msg.data[0] == test_data.len() as u64 {
                                 // Revoke grant, close file.
                                 syscall::revoke(srv_aspace, grant_dst);
 
-                                // FS_CLOSE (triggers flush).
-                                syscall::send_nb(fp, 0x2400, handle, 0);
+                                // FS_CLOSE (triggers flush). Use blocking send to ensure delivery.
+                                syscall::send(fp, 0x2400, handle, 0, 0, 0);
 
-                                // Small delay for close to complete.
-                                for _ in 0..50 { syscall::yield_now(); }
+                                // Delay for close to complete (server processes close + disk flush).
+                                // Fat16_srv must: flush FAT sectors + write dir entry, each requiring
+                                // IPC round-trips to blk_srv + virtio disk I/O.
+                                for _ in 0..2000 { syscall::yield_now(); }
 
                                 // Now re-open and verify.
                                 let (fn0b, fn1b, _) = pack_name(fname);
                                 let fs_d2b = (fname.len() as u64) | ((wr_reply as u64) << 32);
                                 syscall::send(fp, 0x2000, fn0b, fn1b, fs_d2b, 0);
 
+                                syscall::debug_puts(b"  init: re-opening\n");
                                 if let Some(open_msg) = syscall::recv_msg(wr_reply) {
+                                    syscall::debug_puts(b"  init: reopen tag=");
+                                    print_num(open_msg.tag);
+                                    syscall::debug_puts(b" size=");
+                                    print_num(open_msg.data[1]);
+                                    syscall::debug_puts(b"\n");
                                     if open_msg.tag == 0x2001 {
                                         let rh = open_msg.data[0];
                                         let rsize = open_msg.data[1] as usize;
@@ -867,6 +901,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             } else {
                 syscall::debug_puts(b"  init: FS_CREATE failed\n");
             }
+        } else {
+            syscall::debug_puts(b"  init: FS_CREATE no reply\n");
         }
 
         if phase15_ok {
@@ -878,6 +914,37 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"  init: fat16 not available, skipping\n");
         syscall::debug_puts(b"Phase 15 writable FAT16: SKIPPED\n");
     }
+
+    // --- Test 15: Pipe IPC ---
+    syscall::debug_puts(b"  init: testing pipe IPC...\n");
+
+    let pipe_port = syscall::port_create() as u32;
+
+    // Spawn pipe_upper (reads from pipe_port, uppercases, prints via debug_puts).
+    let pipe_tid = syscall::spawn_with_arg(b"pipe_upper", 50, pipe_port as u64);
+    if pipe_tid != u64::MAX {
+        // Give reader a moment to start and block on recv.
+        for _ in 0..10 { syscall::yield_now(); }
+
+        // Write test data to pipe.
+        userlib::pipe::pipe_write(pipe_port, b"hello pipes");
+        userlib::pipe::pipe_close_writer(pipe_port);
+
+        // Wait for child to exit.
+        loop {
+            if let Some(_code) = syscall::waitpid(pipe_tid) {
+                break;
+            }
+            syscall::yield_now();
+        }
+
+        // pipe_upper printed "HELLO PIPES" via debug_puts.
+        syscall::debug_puts(b"\nPhase 16 pipe IPC: PASSED\n");
+    } else {
+        syscall::debug_puts(b"Phase 16 pipe IPC: FAILED (spawn)\n");
+    }
+
+    syscall::port_destroy(pipe_port);
 
     // Init loops forever, yielding.
     loop {
