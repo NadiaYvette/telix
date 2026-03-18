@@ -100,27 +100,6 @@ fn print_num(n: u64) {
     }
 }
 
-#[allow(dead_code)]
-fn print_hex(n: u64) {
-    syscall::debug_puts(b"0x");
-    if n == 0 {
-        syscall::debug_putchar(b'0');
-        return;
-    }
-    let mut buf = [0u8; 16];
-    let mut val = n;
-    let mut i = 0;
-    while val > 0 {
-        let d = (val & 0xF) as u8;
-        buf[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
-        val >>= 4;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        syscall::debug_putchar(buf[i]);
-    }
-}
 
 fn pack_inline_data(data: &[u8]) -> [u64; 3] {
     let mut words = [0u64; 3];
@@ -199,7 +178,9 @@ impl BlkClient {
         }
 
         // Grant our scratch page to blk_srv.
-        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
+        let grant_ok = syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false);
+        if !grant_ok {
+            syscall::debug_puts(b"  [fat16_srv] GRANT FAILED for write\n");
             return false;
         }
 
@@ -329,9 +310,10 @@ fn find_free_dir_entry(blk: &BlkClient, layout: &Fat16Layout, root_entry_count: 
 }
 
 /// Write a 32-byte directory entry to a specific sector at a given offset.
-fn write_dir_entry(blk: &BlkClient, sector: u32, offset: usize, name: &[u8; 11], cluster: u16, size: u32) {
+fn write_dir_entry(blk: &BlkClient, sector: u32, offset: usize, name: &[u8; 11], cluster: u16, size: u32) -> bool {
     let mut sec = [0u8; 512];
-    blk.read_sector(sector, &mut sec);
+    let rd = blk.read_sector(sector, &mut sec);
+    if !rd { return false; }
     // Clear entry.
     for i in 0..32 { sec[offset + i] = 0; }
     // 8.3 name.
@@ -342,7 +324,7 @@ fn write_dir_entry(blk: &BlkClient, sector: u32, offset: usize, name: &[u8; 11],
     write_u16(&mut sec, offset + 26, cluster);
     // File size.
     write_u32(&mut sec, offset + 28, size);
-    blk.write_sector(sector, &sec);
+    blk.write_sector(sector, &sec)
 }
 
 /// Unpack a filename from FS_OPEN message data words.
@@ -575,6 +557,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             f.active = true;
                             f.first_cluster = first_cluster;
                             f.file_size = file_size;
+                            f.writable = false;
+                            f.dir_sector = 0;
+                            f.dir_offset = 0;
                             handle = i as u64;
                             break;
                         }

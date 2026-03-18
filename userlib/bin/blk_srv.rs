@@ -439,31 +439,34 @@ impl BlkDev {
             return Err(());
         }
 
-        // Write request header (at buf_va offset 0).
+        // Write request header (at buf_va offset 0) using volatile.
         let hdr = self.buf_va as *mut VirtioBlkReqHdr;
         unsafe {
-            (*hdr).req_type = VIRTIO_BLK_T_IN;
-            (*hdr).reserved = 0;
-            (*hdr).sector = sector;
+            core::ptr::write_volatile(&raw mut (*hdr).req_type, VIRTIO_BLK_T_IN);
+            core::ptr::write_volatile(&raw mut (*hdr).reserved, 0);
+            core::ptr::write_volatile(&raw mut (*hdr).sector, sector);
         }
 
         // Status byte.
         let status_va = self.buf_va + 16;
-        unsafe { *(status_va as *mut u8) = 0xFF; }
+        unsafe { core::ptr::write_volatile(status_va as *mut u8, 0xFF); }
 
         self.build_chain(VRING_DESC_F_WRITE);
         self.submit(0);
         self.wait_complete();
 
-        let status = unsafe { *(status_va as *const u8) };
+        let status = unsafe { core::ptr::read_volatile(status_va as *const u8) };
         if status != 0 {
             return Err(());
         }
 
-        // Copy data from data buffer to output.
+        // Copy data from DMA buffer using volatile reads.
         let data_va = self.buf_va + 32;
         unsafe {
-            core::ptr::copy_nonoverlapping(data_va as *const u8, out.as_mut_ptr(), 512);
+            let src = data_va as *const u8;
+            for i in 0..512 {
+                out[i] = core::ptr::read_volatile(src.add(i));
+            }
         }
 
         self.next_desc = 0;
@@ -477,18 +480,21 @@ impl BlkDev {
 
         let hdr = self.buf_va as *mut VirtioBlkReqHdr;
         unsafe {
-            (*hdr).req_type = VIRTIO_BLK_T_OUT;
-            (*hdr).reserved = 0;
-            (*hdr).sector = sector;
+            core::ptr::write_volatile(&raw mut (*hdr).req_type, VIRTIO_BLK_T_OUT);
+            core::ptr::write_volatile(&raw mut (*hdr).reserved, 0);
+            core::ptr::write_volatile(&raw mut (*hdr).sector, sector);
         }
 
         let status_va = self.buf_va + 16;
-        unsafe { *(status_va as *mut u8) = 0xFF; }
+        unsafe { core::ptr::write_volatile(status_va as *mut u8, 0xFF); }
 
-        // Copy data into data buffer.
+        // Copy data into DMA buffer using volatile writes.
         let data_va = self.buf_va + 32;
         unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), data_va as *mut u8, 512);
+            let dst = data_va as *mut u8;
+            for i in 0..512 {
+                core::ptr::write_volatile(dst.add(i), data[i]);
+            }
         }
 
         // For write: data descriptor is device-read (no WRITE flag).
@@ -546,6 +552,14 @@ impl BlkDev {
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             core::ptr::write_volatile(avail_idx_ptr, idx.wrapping_add(1));
         }
+        // Full system barrier before notifying device — ensures all DMA buffer
+        // writes are committed to memory (visible to the device), not just ordered.
+        // DMB ISH (from fence(Release)) only orders between CPUs; DSB SY / fence iorw,iorw
+        // ensures completion for device-observable memory.
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("dsb sy"); }
+        #[cfg(target_arch = "riscv64")]
+        unsafe { core::arch::asm!("fence iorw, iorw"); }
         // Notify device.
         #[cfg(not(target_arch = "x86_64"))]
         mmio_write32(self.mmio_va, MMIO_QUEUE_NOTIFY, 0);
@@ -560,6 +574,11 @@ impl BlkDev {
 
         // Poll the used ring, yielding between checks.
         loop {
+            // DSB ensures device writes to the used ring are visible before we read.
+            #[cfg(target_arch = "aarch64")]
+            unsafe { core::arch::asm!("dsb sy"); }
+            #[cfg(target_arch = "riscv64")]
+            unsafe { core::arch::asm!("fence iorw, iorw"); }
             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             let idx = unsafe { core::ptr::read_volatile(used_idx_ptr) };
             if idx != self.last_used_idx {
