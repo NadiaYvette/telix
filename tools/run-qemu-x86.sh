@@ -37,7 +37,7 @@ fi
 
 # Add virtio-net (QEMU user-mode networking).
 QEMU_ARGS+=(
-    -netdev user,id=net0
+    -netdev user,id=net0,guestfwd=tcp:10.0.2.100:1234-cmd:cat
     -device virtio-net-pci,netdev=net0
 )
 

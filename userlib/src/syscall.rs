@@ -58,9 +58,14 @@ pub fn port_destroy(port: u32) {
     unsafe { arch::syscall1(SYS_PORT_DESTROY, port as u64); }
 }
 
-/// Non-blocking send on a port.
+/// Non-blocking send on a port (2 data words, rest zeroed).
 pub fn send_nb(port: u32, tag: u64, d0: u64, d1: u64) -> u64 {
     unsafe { arch::syscall6(SYS_SEND_NB, port as u64, tag, d0, d1, 0, 0) }
+}
+
+/// Non-blocking send on a port with all 4 data words.
+pub fn send_nb_4(port: u32, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) -> u64 {
+    unsafe { arch::syscall6(SYS_SEND_NB, port as u64, tag, d0, d1, d2, d3) }
 }
 
 /// Blocking send on a port.

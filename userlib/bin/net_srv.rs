@@ -18,6 +18,40 @@ const NET_PING: u64 = 0x4100;
 const NET_PING_OK: u64 = 0x4101;
 const NET_PING_FAIL: u64 = 0x41FF;
 
+// TCP IPC protocol.
+const NET_TCP_CONNECT: u64 = 0x4200;
+const NET_TCP_CONNECTED: u64 = 0x4201;
+const NET_TCP_FAIL: u64 = 0x42FF;
+const NET_TCP_SEND: u64 = 0x4300;
+const NET_TCP_SEND_OK: u64 = 0x4301;
+const NET_TCP_RECV: u64 = 0x4400;
+const NET_TCP_DATA: u64 = 0x4401;
+const NET_TCP_CLOSED: u64 = 0x44FF;
+const NET_TCP_CLOSE: u64 = 0x4500;
+const NET_TCP_CLOSE_OK: u64 = 0x4501;
+
+// TCP flags.
+const TCP_FIN: u8 = 0x01;
+const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
+const TCP_PSH: u8 = 0x08;
+const TCP_ACK: u8 = 0x10;
+
+// TCP states.
+const TCP_CLOSED: u8 = 0;
+const TCP_SYN_SENT: u8 = 1;
+const TCP_ESTABLISHED: u8 = 2;
+const TCP_FIN_WAIT_1: u8 = 3;
+const TCP_FIN_WAIT_2: u8 = 4;
+const TCP_TIME_WAIT: u8 = 5;
+const TCP_CLOSE_WAIT: u8 = 6;
+const TCP_LAST_ACK: u8 = 7;
+
+const MAX_TCP_CONNS: usize = 4;
+const TCP_RX_BUF_SIZE: usize = 2048;
+const TCP_TIMEOUT: u32 = 10000;
+const TCP_TIME_WAIT_TIMEOUT: u32 = 5000;
+
 // --- Virtio MMIO registers ---
 const MMIO_MAGIC_VALUE: usize = 0x000;
 const MMIO_VERSION: usize = 0x004;
@@ -180,6 +214,106 @@ fn get_u16_be(buf: &[u8], off: usize) -> u16 {
     ((buf[off] as u16) << 8) | (buf[off + 1] as u16)
 }
 
+fn get_u32_be(buf: &[u8], off: usize) -> u32 {
+    ((buf[off] as u32) << 24) | ((buf[off+1] as u32) << 16)
+    | ((buf[off+2] as u32) << 8) | (buf[off+3] as u32)
+}
+
+fn put_u32_be(buf: &mut [u8], off: usize, val: u32) {
+    buf[off] = (val >> 24) as u8;
+    buf[off+1] = (val >> 16) as u8;
+    buf[off+2] = (val >> 8) as u8;
+    buf[off+3] = val as u8;
+}
+
+/// TCP checksum with IP pseudo-header.
+fn tcp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], tcp_data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    // Pseudo-header: src_ip (4) + dst_ip (4) + zero + proto(6) + tcp_len (2)
+    sum += ((src_ip[0] as u32) << 8) | (src_ip[1] as u32);
+    sum += ((src_ip[2] as u32) << 8) | (src_ip[3] as u32);
+    sum += ((dst_ip[0] as u32) << 8) | (dst_ip[1] as u32);
+    sum += ((dst_ip[2] as u32) << 8) | (dst_ip[3] as u32);
+    sum += 6u32; // protocol = TCP
+    sum += tcp_data.len() as u32;
+    // TCP segment data
+    let mut i = 0;
+    while i + 1 < tcp_data.len() {
+        sum += ((tcp_data[i] as u32) << 8) | (tcp_data[i + 1] as u32);
+        i += 2;
+    }
+    if i < tcp_data.len() {
+        sum += (tcp_data[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+struct TcpConn {
+    state: u8,
+    local_port: u16,
+    remote_ip: [u8; 4],
+    remote_port: u16,
+    snd_nxt: u32,
+    snd_una: u32,
+    rcv_nxt: u32,
+    reply_port: u32,
+    recv_reply_port: u32,
+    rx_buf: [u8; TCP_RX_BUF_SIZE],
+    rx_head: usize,
+    rx_tail: usize,
+    timeout: u32,
+}
+
+impl TcpConn {
+    const fn new() -> Self {
+        Self {
+            state: TCP_CLOSED,
+            local_port: 0,
+            remote_ip: [0; 4],
+            remote_port: 0,
+            snd_nxt: 0,
+            snd_una: 0,
+            rcv_nxt: 0,
+            reply_port: 0,
+            recv_reply_port: 0,
+            rx_buf: [0; TCP_RX_BUF_SIZE],
+            rx_head: 0,
+            rx_tail: 0,
+            timeout: 0,
+        }
+    }
+
+    fn rx_len(&self) -> usize {
+        if self.rx_head >= self.rx_tail {
+            self.rx_head - self.rx_tail
+        } else {
+            TCP_RX_BUF_SIZE - self.rx_tail + self.rx_head
+        }
+    }
+
+    fn rx_push(&mut self, data: &[u8]) {
+        for &b in data {
+            let next = (self.rx_head + 1) % TCP_RX_BUF_SIZE;
+            if next == self.rx_tail { break; } // full
+            self.rx_buf[self.rx_head] = b;
+            self.rx_head = next;
+        }
+    }
+
+    fn rx_pop(&mut self, dst: &mut [u8]) -> usize {
+        let mut n = 0;
+        while n < dst.len() && self.rx_tail != self.rx_head {
+            dst[n] = self.rx_buf[self.rx_tail];
+            self.rx_tail = (self.rx_tail + 1) % TCP_RX_BUF_SIZE;
+            n += 1;
+        }
+        n
+    }
+}
+
 // --- Per-queue state ---
 
 struct Virtqueue {
@@ -255,6 +389,10 @@ struct NetDev {
     ping_polls: u32,
     ping_active: bool,
     ping_sent_icmp: bool,
+    // TCP state.
+    tcp: [TcpConn; MAX_TCP_CONNS],
+    next_ephemeral_port: u16,
+    tcp_isn: u32,
 }
 
 impl NetDev {
@@ -274,6 +412,10 @@ impl NetDev {
             ping_polls: 0,
             ping_active: false,
             ping_sent_icmp: false,
+            tcp: [const { TcpConn::new() }; MAX_TCP_CONNS],
+            next_ephemeral_port: 49152,
+            tcp_isn: (mac[0] as u32) << 24 | (mac[1] as u32) << 16
+                   | (mac[2] as u32) << 8 | (mac[3] as u32),
         }
     }
 
@@ -668,6 +810,8 @@ impl NetDev {
                 self.send_icmp_echo(self.ping_target, sender_mac, self.ping_seq);
                 self.ping_sent_icmp = true;
             }
+            // Send pending TCP SYNs for this IP.
+            self.handle_arp_for_tcp(sender_ip);
         } else if op == 1 {
             // ARP request for our IP: reply.
             let target_ip = [data[24], data[25], data[26], data[27]];
@@ -685,10 +829,15 @@ impl NetDev {
         let ihl = (data[0] & 0x0F) as usize * 4;
         let total_len = get_u16_be(data, 2) as usize;
         let proto = data[9];
-        if proto == 1 && total_len > ihl {
-            // ICMP.
-            let end = total_len.min(data.len());
-            self.handle_icmp(&data[ihl..end]);
+        let end = total_len.min(data.len());
+        if end <= ihl { return; }
+        match proto {
+            1 => self.handle_icmp(&data[ihl..end]),
+            6 => {
+                let src_ip = [data[12], data[13], data[14], data[15]];
+                self.handle_tcp_rx(src_ip, &data[ihl..end]);
+            }
+            _ => {}
         }
     }
 
@@ -735,6 +884,358 @@ impl NetDev {
         if self.ping_polls >= PING_TIMEOUT {
             syscall::send_nb(self.ping_reply_port, NET_PING_FAIL, 1, 0);
             self.ping_active = false;
+        }
+    }
+
+    // --- TCP ---
+
+    fn build_tcp_packet(
+        &mut self,
+        dst_ip: [u8; 4],
+        dst_mac: [u8; 6],
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) {
+        let tcp_len = 20 + payload.len();
+        let ip_total = 20 + tcp_len;
+        let frame_len = 14 + ip_total;
+        let mut frame = [0u8; 14 + 20 + 20 + 1460]; // max MTU
+        // Ethernet header.
+        frame[0..6].copy_from_slice(&dst_mac);
+        frame[6..12].copy_from_slice(&self.mac);
+        frame[12] = 0x08;
+        frame[13] = 0x00; // IPv4
+        // IPv4 header (20 bytes at offset 14).
+        let ip = &mut frame[14..34];
+        ip[0] = 0x45; // v4, IHL=5
+        put_u16_be(ip, 2, ip_total as u16);
+        put_u16_be(ip, 4, 0); // identification
+        put_u16_be(ip, 6, 0x4000); // don't fragment
+        ip[8] = 64; // TTL
+        ip[9] = 6;  // TCP
+        ip[12..16].copy_from_slice(&MY_IP);
+        ip[16..20].copy_from_slice(&dst_ip);
+        let cksum = inet_checksum(ip);
+        ip[10] = (cksum >> 8) as u8;
+        ip[11] = cksum as u8;
+        // TCP header (20 bytes at offset 34).
+        let tcp = &mut frame[34..34 + tcp_len];
+        put_u16_be(tcp, 0, src_port);
+        put_u16_be(tcp, 2, dst_port);
+        put_u32_be(tcp, 4, seq);
+        put_u32_be(tcp, 8, ack);
+        tcp[12] = 5 << 4; // data offset = 5 (20 bytes)
+        tcp[13] = flags;
+        put_u16_be(tcp, 14, 2048); // window size
+        // Copy payload.
+        if !payload.is_empty() {
+            tcp[20..20 + payload.len()].copy_from_slice(payload);
+        }
+        // TCP checksum.
+        let cksum = tcp_checksum(&MY_IP, &dst_ip, tcp);
+        tcp[16] = (cksum >> 8) as u8;
+        tcp[17] = cksum as u8;
+        self.tx_send(&frame[..frame_len]);
+    }
+
+    fn send_tcp_for_conn(&mut self, conn_idx: usize, flags: u8, payload: &[u8]) {
+        let dst_ip = self.tcp[conn_idx].remote_ip;
+        let src_port = self.tcp[conn_idx].local_port;
+        let dst_port = self.tcp[conn_idx].remote_port;
+        let seq = self.tcp[conn_idx].snd_nxt;
+        let ack = self.tcp[conn_idx].rcv_nxt;
+        if let Some(mac) = self.arp_lookup(dst_ip) {
+            self.build_tcp_packet(dst_ip, mac, src_port, dst_port, seq, ack, flags, payload);
+        }
+    }
+
+    fn handle_tcp_connect(&mut self, dst_ip_be: u32, dst_port: u16, reply_port: u32) {
+        // Find free slot.
+        let slot = self.tcp.iter().position(|c| c.state == TCP_CLOSED);
+        let slot = match slot {
+            Some(s) => s,
+            None => {
+                syscall::send_nb(reply_port, NET_TCP_FAIL, 1, 0);
+                return;
+            }
+        };
+        let local_port = self.next_ephemeral_port;
+        self.next_ephemeral_port = self.next_ephemeral_port.wrapping_add(1);
+        if self.next_ephemeral_port < 49152 { self.next_ephemeral_port = 49152; }
+
+        let isn = self.tcp_isn;
+        self.tcp_isn = self.tcp_isn.wrapping_add(64000);
+
+        let remote_ip = dst_ip_be.to_be_bytes();
+        self.tcp[slot] = TcpConn {
+            state: TCP_SYN_SENT,
+            local_port,
+            remote_ip,
+            remote_port: dst_port,
+            snd_nxt: isn,
+            snd_una: isn,
+            rcv_nxt: 0,
+            reply_port,
+            recv_reply_port: 0,
+            rx_buf: [0; TCP_RX_BUF_SIZE],
+            rx_head: 0,
+            rx_tail: 0,
+            timeout: 0,
+        };
+
+        syscall::debug_puts(b"  [net_srv] TCP connect to ");
+        print_ip(remote_ip);
+        syscall::debug_puts(b":");
+        print_num(dst_port as u64);
+        syscall::debug_puts(b" slot=");
+        print_num(slot as u64);
+        syscall::debug_puts(b"\n");
+
+        // ARP lookup — send SYN if cached, else ARP request.
+        if let Some(mac) = self.arp_lookup(remote_ip) {
+            self.build_tcp_packet(
+                remote_ip, mac, local_port, dst_port, isn, 0, TCP_SYN, &[],
+            );
+        } else {
+            self.send_arp_request(remote_ip);
+        }
+    }
+
+    fn handle_arp_for_tcp(&mut self, ip: [u8; 4]) {
+        // After ARP reply, send pending SYN for any SYN_SENT connections to this IP.
+        let mac = match self.arp_lookup(ip) {
+            Some(m) => m,
+            None => return,
+        };
+        for i in 0..MAX_TCP_CONNS {
+            if self.tcp[i].state == TCP_SYN_SENT && self.tcp[i].remote_ip == ip {
+                let src_port = self.tcp[i].local_port;
+                let dst_port = self.tcp[i].remote_port;
+                let seq = self.tcp[i].snd_nxt;
+                self.build_tcp_packet(ip, mac, src_port, dst_port, seq, 0, TCP_SYN, &[]);
+            }
+        }
+    }
+
+    fn handle_tcp_rx(&mut self, src_ip: [u8; 4], tcp_data: &[u8]) {
+        if tcp_data.len() < 20 { return; }
+        let src_port = get_u16_be(tcp_data, 0);
+        let dst_port = get_u16_be(tcp_data, 2);
+        let seq = get_u32_be(tcp_data, 4);
+        let ack = get_u32_be(tcp_data, 8);
+        let data_off = ((tcp_data[12] >> 4) as usize) * 4;
+        let flags = tcp_data[13];
+        let payload = if data_off < tcp_data.len() { &tcp_data[data_off..] } else { &[] };
+
+        // Find matching connection.
+        let idx = self.tcp.iter().position(|c| {
+            c.state != TCP_CLOSED
+                && c.local_port == dst_port
+                && c.remote_port == src_port
+                && c.remote_ip == src_ip
+        });
+        let idx = match idx {
+            Some(i) => i,
+            None => return, // No matching connection, drop.
+        };
+
+        if flags & TCP_RST != 0 {
+            let reply_port = self.tcp[idx].reply_port;
+            self.tcp[idx].state = TCP_CLOSED;
+            syscall::send_nb(reply_port, NET_TCP_FAIL, 2, 0);
+            return;
+        }
+
+        match self.tcp[idx].state {
+            TCP_SYN_SENT => {
+                // Expect SYN+ACK.
+                if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 {
+                    // Verify ACK covers our SYN.
+                    if ack != self.tcp[idx].snd_nxt.wrapping_add(1) {
+                        return;
+                    }
+                    self.tcp[idx].snd_una = ack;
+                    self.tcp[idx].snd_nxt = ack;
+                    self.tcp[idx].rcv_nxt = seq.wrapping_add(1);
+                    self.tcp[idx].state = TCP_ESTABLISHED;
+                    self.tcp[idx].timeout = 0;
+                    // Send ACK.
+                    self.send_tcp_for_conn(idx, TCP_ACK, &[]);
+                    // Notify client.
+                    let reply_port = self.tcp[idx].reply_port;
+                    syscall::send_nb(reply_port, NET_TCP_CONNECTED, idx as u64, 0);
+                    syscall::debug_puts(b"  [net_srv] TCP ESTABLISHED slot=");
+                    print_num(idx as u64);
+                    syscall::debug_puts(b"\n");
+                }
+            }
+            TCP_ESTABLISHED => {
+                // Data and/or FIN.
+                if flags & TCP_ACK != 0 {
+                    self.tcp[idx].snd_una = ack;
+                }
+                if !payload.is_empty() && seq == self.tcp[idx].rcv_nxt {
+                    self.tcp[idx].rcv_nxt = seq.wrapping_add(payload.len() as u32);
+                    self.tcp[idx].rx_push(payload);
+                    // Send ACK.
+                    self.send_tcp_for_conn(idx, TCP_ACK, &[]);
+                    // If someone waiting for recv, deliver now.
+                    let recv_port = self.tcp[idx].recv_reply_port;
+                    if recv_port != 0 {
+                        self.tcp[idx].recv_reply_port = 0;
+                        self.deliver_tcp_data(idx, recv_port);
+                    }
+                }
+                if flags & TCP_FIN != 0 {
+                    self.tcp[idx].rcv_nxt = self.tcp[idx].rcv_nxt.wrapping_add(1);
+                    self.send_tcp_for_conn(idx, TCP_ACK, &[]);
+                    self.tcp[idx].state = TCP_CLOSE_WAIT;
+                    // Notify pending recv.
+                    let recv_port = self.tcp[idx].recv_reply_port;
+                    if recv_port != 0 {
+                        self.tcp[idx].recv_reply_port = 0;
+                        syscall::send_nb(recv_port, NET_TCP_CLOSED, idx as u64, 0);
+                    }
+                }
+            }
+            TCP_FIN_WAIT_1 => {
+                if flags & TCP_ACK != 0 {
+                    self.tcp[idx].snd_una = ack;
+                    if flags & TCP_FIN != 0 {
+                        // Simultaneous close: FIN+ACK.
+                        self.tcp[idx].rcv_nxt = seq.wrapping_add(1);
+                        self.send_tcp_for_conn(idx, TCP_ACK, &[]);
+                        self.tcp[idx].state = TCP_TIME_WAIT;
+                        self.tcp[idx].timeout = 0;
+                    } else {
+                        self.tcp[idx].state = TCP_FIN_WAIT_2;
+                    }
+                }
+            }
+            TCP_FIN_WAIT_2 => {
+                if flags & TCP_FIN != 0 {
+                    self.tcp[idx].rcv_nxt = seq.wrapping_add(1);
+                    self.send_tcp_for_conn(idx, TCP_ACK, &[]);
+                    self.tcp[idx].state = TCP_TIME_WAIT;
+                    self.tcp[idx].timeout = 0;
+                }
+            }
+            TCP_LAST_ACK => {
+                if flags & TCP_ACK != 0 {
+                    self.tcp[idx].state = TCP_CLOSED;
+                    let reply_port = self.tcp[idx].reply_port;
+                    syscall::send_nb(reply_port, NET_TCP_CLOSE_OK, idx as u64, 0);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn deliver_tcp_data(&mut self, idx: usize, reply_port: u32) {
+        let mut buf = [0u8; 24]; // max inline bytes in 3 IPC data words
+        let n = self.tcp[idx].rx_pop(&mut buf);
+        if n == 0 { return; }
+        // Pack into IPC: data[0]=len, data[1..3]=bytes (up to 24 bytes in 3 words).
+        let mut d1: u64 = 0;
+        let mut d2: u64 = 0;
+        let mut d3: u64 = 0;
+        for i in 0..n.min(8) {
+            d1 |= (buf[i] as u64) << (i * 8);
+        }
+        for i in 0..n.saturating_sub(8).min(8) {
+            d2 |= (buf[8 + i] as u64) << (i * 8);
+        }
+        for i in 0..n.saturating_sub(16).min(8) {
+            d3 |= (buf[16 + i] as u64) << (i * 8);
+        }
+        syscall::send_nb_4(reply_port, NET_TCP_DATA, n as u64, d1, d2, d3);
+    }
+
+    fn handle_tcp_send(&mut self, conn_id: usize, payload: &[u8], reply_port: u32) {
+        if conn_id >= MAX_TCP_CONNS || self.tcp[conn_id].state != TCP_ESTABLISHED {
+            syscall::send_nb(reply_port, NET_TCP_FAIL, 0, 0);
+            return;
+        }
+        self.send_tcp_for_conn(conn_id, TCP_ACK | TCP_PSH, payload);
+        self.tcp[conn_id].snd_nxt = self.tcp[conn_id].snd_nxt.wrapping_add(payload.len() as u32);
+        syscall::send_nb(reply_port, NET_TCP_SEND_OK, conn_id as u64, 0);
+    }
+
+    fn handle_tcp_recv(&mut self, conn_id: usize, reply_port: u32) {
+        if conn_id >= MAX_TCP_CONNS || self.tcp[conn_id].state == TCP_CLOSED {
+            syscall::send_nb(reply_port, NET_TCP_FAIL, 0, 0);
+            return;
+        }
+        if self.tcp[conn_id].rx_len() > 0 {
+            self.deliver_tcp_data(conn_id, reply_port);
+        } else if self.tcp[conn_id].state == TCP_ESTABLISHED {
+            // Defer: store reply port for when data arrives.
+            self.tcp[conn_id].recv_reply_port = reply_port;
+        } else {
+            // Connection closed and no data.
+            syscall::send_nb(reply_port, NET_TCP_CLOSED, conn_id as u64, 0);
+        }
+    }
+
+    fn handle_tcp_close(&mut self, conn_id: usize, reply_port: u32) {
+        if conn_id >= MAX_TCP_CONNS {
+            syscall::send_nb(reply_port, NET_TCP_FAIL, 0, 0);
+            return;
+        }
+        self.tcp[conn_id].reply_port = reply_port;
+        match self.tcp[conn_id].state {
+            TCP_ESTABLISHED => {
+                self.send_tcp_for_conn(conn_id, TCP_FIN | TCP_ACK, &[]);
+                self.tcp[conn_id].snd_nxt = self.tcp[conn_id].snd_nxt.wrapping_add(1);
+                self.tcp[conn_id].state = TCP_FIN_WAIT_1;
+                self.tcp[conn_id].timeout = 0;
+            }
+            TCP_CLOSE_WAIT => {
+                self.send_tcp_for_conn(conn_id, TCP_FIN | TCP_ACK, &[]);
+                self.tcp[conn_id].snd_nxt = self.tcp[conn_id].snd_nxt.wrapping_add(1);
+                self.tcp[conn_id].state = TCP_LAST_ACK;
+                self.tcp[conn_id].timeout = 0;
+            }
+            _ => {
+                self.tcp[conn_id].state = TCP_CLOSED;
+                syscall::send_nb(reply_port, NET_TCP_CLOSE_OK, conn_id as u64, 0);
+            }
+        }
+    }
+
+    fn tick_tcp(&mut self) {
+        for i in 0..MAX_TCP_CONNS {
+            match self.tcp[i].state {
+                TCP_SYN_SENT => {
+                    self.tcp[i].timeout += 1;
+                    if self.tcp[i].timeout >= TCP_TIMEOUT {
+                        let reply_port = self.tcp[i].reply_port;
+                        self.tcp[i].state = TCP_CLOSED;
+                        syscall::send_nb(reply_port, NET_TCP_FAIL, 3, 0);
+                    }
+                }
+                TCP_FIN_WAIT_1 | TCP_FIN_WAIT_2 | TCP_LAST_ACK => {
+                    self.tcp[i].timeout += 1;
+                    if self.tcp[i].timeout >= TCP_TIMEOUT {
+                        let reply_port = self.tcp[i].reply_port;
+                        self.tcp[i].state = TCP_CLOSED;
+                        syscall::send_nb(reply_port, NET_TCP_CLOSE_OK, i as u64, 0);
+                    }
+                }
+                TCP_TIME_WAIT => {
+                    self.tcp[i].timeout += 1;
+                    if self.tcp[i].timeout >= TCP_TIME_WAIT_TIMEOUT {
+                        let reply_port = self.tcp[i].reply_port;
+                        self.tcp[i].state = TCP_CLOSED;
+                        syscall::send_nb(reply_port, NET_TCP_CLOSE_OK, i as u64, 0);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -802,12 +1303,41 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"\n");
                     dev.start_ping(target, reply_port);
                 }
+                NET_TCP_CONNECT => {
+                    let dst_ip_be = msg.data[0] as u32;
+                    let dst_port = msg.data[1] as u16;
+                    let reply_port = (msg.data[1] >> 16) as u32;
+                    dev.handle_tcp_connect(dst_ip_be, dst_port, reply_port);
+                }
+                NET_TCP_SEND => {
+                    let conn_id = msg.data[0] as usize;
+                    let len = (msg.data[1] & 0xFFFF) as usize;
+                    let reply_port = (msg.data[1] >> 16) as u32;
+                    // Payload packed in data[2] and data[3] (up to 16 bytes).
+                    let mut payload = [0u8; 16];
+                    let d2 = msg.data[2];
+                    let d3 = msg.data[3];
+                    for i in 0..8 { payload[i] = (d2 >> (i * 8)) as u8; }
+                    for i in 0..8 { payload[8 + i] = (d3 >> (i * 8)) as u8; }
+                    dev.handle_tcp_send(conn_id, &payload[..len.min(16)], reply_port);
+                }
+                NET_TCP_RECV => {
+                    let conn_id = msg.data[0] as usize;
+                    let reply_port = (msg.data[1] >> 16) as u32;
+                    dev.handle_tcp_recv(conn_id, reply_port);
+                }
+                NET_TCP_CLOSE => {
+                    let conn_id = msg.data[0] as usize;
+                    let reply_port = msg.data[1] as u32;
+                    dev.handle_tcp_close(conn_id, reply_port);
+                }
                 _ => {}
             }
         }
 
-        // 3. Tick ping timeout.
+        // 3. Tick timeouts.
         dev.tick_ping();
+        dev.tick_tcp();
 
         // 4. Yield.
         syscall::yield_now();

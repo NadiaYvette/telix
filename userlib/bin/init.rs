@@ -1028,6 +1028,108 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 19: TCP echo via net_srv ---
+    syscall::debug_puts(b"  init: testing TCP echo...\n");
+
+    // Re-use net_port from Phase 12 test, or look it up.
+    let tcp_net_port = net_port.unwrap_or_else(|| {
+        for _ in 0..500 {
+            if let Some(p) = syscall::ns_lookup(b"net") {
+                return p;
+            }
+            syscall::yield_now();
+        }
+        0
+    });
+
+    if tcp_net_port != 0 {
+        let tcp_reply = syscall::port_create() as u32;
+
+        // NET_TCP_CONNECT: data[0]=dst_ip (BE), data[1]= port | (reply_port << 16)
+        let dst_ip: u64 = (10u64 << 24) | (0 << 16) | (2 << 8) | 100; // 10.0.2.100
+        let d1_connect = 1234u64 | ((tcp_reply as u64) << 16);
+        syscall::send(tcp_net_port, 0x4200, dst_ip, d1_connect, 0, 0);
+
+        let mut tcp_ok = false;
+        let mut conn_id: u64 = 0;
+
+        // Wait for NET_TCP_CONNECTED or NET_TCP_FAIL.
+        if let Some(reply) = syscall::recv_msg(tcp_reply) {
+            if reply.tag == 0x4201 {
+                conn_id = reply.data[0];
+                syscall::debug_puts(b"  init: TCP connected, conn=");
+                print_num(conn_id);
+                syscall::debug_puts(b"\n");
+
+                // NET_TCP_SEND: data[0]=conn_id, data[1]=len|(reply<<16), data[2..3]=payload
+                let test_str = b"Hello TCP!\n";
+                let mut d2: u64 = 0;
+                let mut d3: u64 = 0;
+                for i in 0..test_str.len().min(8) {
+                    d2 |= (test_str[i] as u64) << (i * 8);
+                }
+                for i in 0..test_str.len().saturating_sub(8).min(8) {
+                    d3 |= (test_str[8 + i] as u64) << (i * 8);
+                }
+                let d1_send = (test_str.len() as u64) | ((tcp_reply as u64) << 16);
+                syscall::send(tcp_net_port, 0x4300, conn_id, d1_send, d2, d3);
+
+                // Wait for SEND_OK.
+                if let Some(sr) = syscall::recv_msg(tcp_reply) {
+                    if sr.tag == 0x4301 {
+                        // NET_TCP_RECV: data[0]=conn_id, data[1]=0|(reply<<16)
+                        let d1_recv = (tcp_reply as u64) << 16;
+                        syscall::send(tcp_net_port, 0x4400, conn_id, d1_recv, 0, 0);
+
+                        // Wait for NET_TCP_DATA.
+                        if let Some(dr) = syscall::recv_msg(tcp_reply) {
+                            if dr.tag == 0x4401 {
+                                let recv_len = dr.data[0] as usize;
+                                // Unpack received bytes.
+                                let mut recv_buf = [0u8; 24];
+                                let words = [dr.data[1], dr.data[2], dr.data[3]];
+                                for i in 0..recv_len.min(24) {
+                                    recv_buf[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
+                                }
+                                // Compare with sent data.
+                                if recv_len == test_str.len()
+                                    && &recv_buf[..recv_len] == test_str
+                                {
+                                    tcp_ok = true;
+                                } else {
+                                    syscall::debug_puts(b"  init: TCP echo mismatch, got ");
+                                    print_num(recv_len as u64);
+                                    syscall::debug_puts(b" bytes\n");
+                                }
+                            } else if dr.tag == 0x44FF {
+                                syscall::debug_puts(b"  init: TCP connection closed\n");
+                            }
+                        }
+                    }
+                }
+
+                // NET_TCP_CLOSE.
+                syscall::send(tcp_net_port, 0x4500, conn_id, tcp_reply as u64, 0, 0);
+                // Wait for close OK (best effort).
+                let _ = syscall::recv_msg(tcp_reply);
+            } else {
+                syscall::debug_puts(b"  init: TCP connect failed, tag=");
+                print_num(reply.tag);
+                syscall::debug_puts(b"\n");
+            }
+        }
+
+        syscall::port_destroy(tcp_reply);
+
+        if tcp_ok {
+            syscall::debug_puts(b"Phase 19 TCP echo: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 19 TCP echo: FAILED\n");
+        }
+    } else {
+        syscall::debug_puts(b"Phase 19 TCP echo: SKIPPED (no net)\n");
+    }
+
     // Init loops forever, yielding.
     loop {
         syscall::yield_now();
