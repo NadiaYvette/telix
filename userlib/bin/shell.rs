@@ -176,6 +176,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             con_puts(con_port, reply_port, b"  info     - sys info\r\n");
             con_puts(con_port, reply_port, b"  net      - net status\r\n");
             con_puts(con_port, reply_port, b"  ping IP  - ping host\r\n");
+            con_puts(con_port, reply_port, b"  run F    - exec file\r\n");
         } else if line == b"ls" {
             cmd_ls(con_port, reply_port, fat16_port);
         } else if starts_with(line, b"cat ") {
@@ -189,6 +190,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             cmd_net(con_port, reply_port);
         } else if starts_with(line, b"ping ") {
             cmd_ping(con_port, reply_port, &line[5..]);
+        } else if starts_with(line, b"run ") {
+            cmd_run(con_port, reply_port, fat16_port, &line[4..]);
         } else {
             con_puts(con_port, reply_port, b"unknown: ");
             con_puts(con_port, reply_port, line);
@@ -429,6 +432,146 @@ fn cmd_ping(con_port: u32, reply_port: u32, target: &[u8]) {
         con_puts(con_port, reply_port, b"timeout\r\n");
     }
     syscall::port_destroy(net_reply);
+}
+
+fn cmd_run(con_port: u32, reply_port: u32, fat16_port: Option<u32>, filename: &[u8]) {
+    let fp = match fat16_port {
+        Some(p) => p,
+        None => {
+            con_puts(con_port, reply_port, b"no filesystem\r\n");
+            return;
+        }
+    };
+
+    let fs_reply = syscall::port_create() as u32;
+
+    // FS_OPEN.
+    let (n0, n1, _) = pack_name(filename);
+    let d2 = (filename.len() as u64) | ((fs_reply as u64) << 32);
+    syscall::send(fp, FS_OPEN, n0, n1, d2, 0);
+
+    let (handle, file_size, srv_aspace) = if let Some(msg) = syscall::recv_msg(fs_reply) {
+        if msg.tag == FS_OPEN_OK {
+            (msg.data[0], msg.data[1] as usize, msg.data[2] as u32)
+        } else {
+            con_puts(con_port, reply_port, b"file not found\r\n");
+            syscall::port_destroy(fs_reply);
+            return;
+        }
+    } else {
+        syscall::port_destroy(fs_reply);
+        return;
+    };
+
+    if file_size == 0 {
+        con_puts(con_port, reply_port, b"empty file\r\n");
+        syscall::send_nb(fp, FS_CLOSE, handle, 0);
+        syscall::port_destroy(fs_reply);
+        return;
+    }
+
+    // Allocate buffer for ELF data.
+    let elf_pages = (file_size + 4095) / 4096;
+    let elf_va = match syscall::mmap_anon(0, elf_pages, 1) {
+        Some(va) => va,
+        None => {
+            con_puts(con_port, reply_port, b"alloc failed\r\n");
+            syscall::send_nb(fp, FS_CLOSE, handle, 0);
+            syscall::port_destroy(fs_reply);
+            return;
+        }
+    };
+
+    // Allocate scratch page for grant-based transfer.
+    let scratch_va = match syscall::mmap_anon(0, 1, 1) {
+        Some(va) => va,
+        None => {
+            con_puts(con_port, reply_port, b"alloc failed\r\n");
+            syscall::munmap(elf_va);
+            syscall::send_nb(fp, FS_CLOSE, handle, 0);
+            syscall::port_destroy(fs_reply);
+            return;
+        }
+    };
+
+    // Grant scratch page to fat16_srv.
+    let grant_dst: usize = 0x6_0000_0000;
+    if !syscall::grant_pages(srv_aspace, scratch_va, grant_dst, 1, false) {
+        con_puts(con_port, reply_port, b"grant failed\r\n");
+        syscall::munmap(scratch_va);
+        syscall::munmap(elf_va);
+        syscall::send_nb(fp, FS_CLOSE, handle, 0);
+        syscall::port_destroy(fs_reply);
+        return;
+    }
+
+    // Read entire file via grant-based FS_READ.
+    let mut offset = 0usize;
+    let mut read_ok = true;
+    while offset < file_size {
+        let remaining = file_size - offset;
+        let chunk = if remaining > 512 { 512 } else { remaining };
+        let rd_d2 = (chunk as u64) | ((fs_reply as u64) << 32);
+        syscall::send(fp, FS_READ, handle, offset as u64, rd_d2, grant_dst as u64);
+
+        if let Some(msg) = syscall::recv_msg(fs_reply) {
+            if msg.tag == FS_READ_OK {
+                let bytes_read = msg.data[0] as usize;
+                if bytes_read == 0 { break; }
+                // Copy from scratch into elf_buf at correct offset.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        scratch_va as *const u8,
+                        (elf_va + offset) as *mut u8,
+                        bytes_read,
+                    );
+                }
+                offset += bytes_read;
+            } else {
+                read_ok = false;
+                break;
+            }
+        } else {
+            read_ok = false;
+            break;
+        }
+    }
+
+    // Cleanup grant + file handle.
+    syscall::revoke(srv_aspace, grant_dst);
+    syscall::send_nb(fp, FS_CLOSE, handle, 0);
+
+    if !read_ok || offset < file_size {
+        con_puts(con_port, reply_port, b"read error\r\n");
+        syscall::munmap(scratch_va);
+        syscall::munmap(elf_va);
+        syscall::port_destroy(fs_reply);
+        return;
+    }
+
+    // Spawn from ELF data.
+    let elf_data = unsafe { core::slice::from_raw_parts(elf_va as *const u8, file_size) };
+    let tid = syscall::spawn_elf(elf_data, 50, 0);
+
+    // Free buffers (ELF data is copied into kernel during spawn_elf).
+    syscall::munmap(scratch_va);
+    syscall::munmap(elf_va);
+
+    if tid == u64::MAX {
+        con_puts(con_port, reply_port, b"exec failed\r\n");
+        syscall::port_destroy(fs_reply);
+        return;
+    }
+
+    // Wait for child to exit.
+    loop {
+        if let Some(_code) = syscall::waitpid(tid) {
+            break;
+        }
+        syscall::yield_now();
+    }
+
+    syscall::port_destroy(fs_reply);
 }
 
 fn cmd_info(con_port: u32, reply_port: u32) {

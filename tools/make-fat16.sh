@@ -16,4 +16,15 @@ echo -n "Hello from FAT16!" > "$TMPFILE"
 mcopy -i "$OUTFILE" "$TMPFILE" ::HELLO.TXT
 rm -f "$TMPFILE"
 
-echo "test.img created: $(wc -c < "$OUTFILE") bytes (FAT16, contains HELLO.TXT)"
+# Optionally copy a hello ELF binary for exec-from-filesystem testing.
+# Usage: make-fat16.sh [target-triple]
+# e.g.:  make-fat16.sh x86_64-unknown-none
+if [ -n "$1" ]; then
+    HELLO_BIN="$(dirname "$0")/../target/$1/release/hello"
+    if [ -f "$HELLO_BIN" ]; then
+        mcopy -i "$OUTFILE" "$HELLO_BIN" ::HELLO.ELF
+        echo "  Copied hello binary as HELLO.ELF ($(wc -c < "$HELLO_BIN") bytes)"
+    fi
+fi
+
+echo "test.img created: $(wc -c < "$OUTFILE") bytes (FAT16)"

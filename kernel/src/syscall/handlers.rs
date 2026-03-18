@@ -42,6 +42,7 @@ pub const SYS_VIRT_TO_PHYS: u64 = 25;
 pub const SYS_IRQ_WAIT: u64 = 26;
 pub const SYS_GETCHAR: u64 = 27;
 pub const SYS_IOPORT: u64 = 28;
+pub const SYS_SPAWN_ELF: u64 = 29;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -153,6 +154,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_IRQ_WAIT => sys_irq_wait(a0, a1),
         SYS_GETCHAR => sys_getchar(),
         SYS_IOPORT => sys_ioport(a0, a1, a2),
+        SYS_SPAWN_ELF => sys_spawn_elf(a0, a1, a2, a3),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -624,6 +626,34 @@ fn sys_ioport(op: u64, port: u64, value: u64) -> u64 {
 fn sys_getchar() -> u64 {
     match crate::arch::platform::serial::getc() {
         Some(ch) => ch as u64,
+        None => u64::MAX,
+    }
+}
+
+/// Maximum ELF size for spawn_elf (256 KiB).
+const SPAWN_ELF_MAX: usize = 256 * 1024;
+
+/// Static buffer for ELF data during spawn_elf. Protected by SPAWN_ELF_LOCK.
+static SPAWN_ELF_LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+static mut SPAWN_ELF_BUF: [u8; SPAWN_ELF_MAX] = [0u8; SPAWN_ELF_MAX];
+
+fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
+    let len = elf_len as usize;
+    if len == 0 || len > SPAWN_ELF_MAX {
+        return u64::MAX;
+    }
+
+    let pt_root = crate::sched::scheduler::current_page_table_root();
+    let _guard = SPAWN_ELF_LOCK.lock();
+
+    // Copy ELF data from user memory into the static buffer.
+    let buf = unsafe { &mut SPAWN_ELF_BUF[..len] };
+    if !copy_from_user(pt_root, elf_ptr as usize, buf) {
+        return u64::MAX;
+    }
+
+    match crate::sched::spawn_user_from_elf(buf, priority as u8, 20, arg0) {
+        Some(tid) => tid as u64,
         None => u64::MAX,
     }
 }

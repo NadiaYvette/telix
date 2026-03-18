@@ -27,6 +27,7 @@ const SYS_VIRT_TO_PHYS: u64 = 25;
 const SYS_IRQ_WAIT: u64 = 26;
 const SYS_GETCHAR: u64 = 27;
 const SYS_IOPORT: u64 = 28;
+const SYS_SPAWN_ELF: u64 = 29;
 const SYS_PORT_SET_CREATE: u64 = 5;
 const SYS_PORT_SET_ADD: u64 = 6;
 #[allow(dead_code)]
@@ -130,6 +131,11 @@ pub fn aspace_id() -> u32 {
 /// Spawn a new process with an argument passed to main().
 pub fn spawn_with_arg(name: &[u8], priority: u8, arg0: u64) -> u64 {
     unsafe { arch::syscall4(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, priority as u64, arg0) }
+}
+
+/// Spawn a new process from ELF data in memory. Returns thread ID or u64::MAX.
+pub fn spawn_elf(elf_data: &[u8], priority: u8, arg0: u64) -> u64 {
+    unsafe { arch::syscall4(SYS_SPAWN_ELF, elf_data.as_ptr() as u64, elf_data.len() as u64, priority as u64, arg0) }
 }
 
 /// Get the userspace initramfs server's port ID.

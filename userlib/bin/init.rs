@@ -662,6 +662,110 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"Phase 12 virtio-net ping: SKIPPED\n");
     }
 
+    // --- Test 13: Execute ELF from FAT16 filesystem ---
+    syscall::debug_puts(b"  init: testing exec from filesystem...\n");
+
+    if let Some(fp) = fat16_port {
+        let exec_reply = syscall::port_create() as u32;
+
+        // FS_OPEN "HELLO.ELF"
+        let fname = b"HELLO.ELF";
+        let (fn0, fn1, _) = pack_name(fname);
+        let fs_d2 = (fname.len() as u64) | ((exec_reply as u64) << 32);
+        syscall::send(fp, 0x2000, fn0, fn1, fs_d2, 0);
+
+        let mut exec_ok = false;
+        if let Some(reply) = syscall::recv_msg(exec_reply) {
+            if reply.tag == 0x2001 {
+                let handle = reply.data[0];
+                let file_size = reply.data[1] as usize;
+                let srv_aspace = reply.data[2] as u32;
+
+                // Allocate ELF buffer and scratch page.
+                let elf_pages = (file_size + 4095) / 4096;
+                let elf_va = syscall::mmap_anon(0, elf_pages, 1);
+                let scratch_va = syscall::mmap_anon(0, 1, 1);
+
+                if let (Some(elf_buf), Some(scratch)) = (elf_va, scratch_va) {
+                    // Grant scratch to fat16_srv.
+                    let grant_dst: usize = 0x7_0000_0000;
+                    if syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false) {
+                        // Read entire file via grant-based FS_READ.
+                        let mut offset = 0usize;
+                        let mut read_ok = true;
+                        while offset < file_size {
+                            let remaining = file_size - offset;
+                            let chunk = if remaining > 512 { 512 } else { remaining };
+                            let rd_d2 = (chunk as u64) | ((exec_reply as u64) << 32);
+                            syscall::send(fp, 0x2100, handle, offset as u64, rd_d2, grant_dst as u64);
+
+                            if let Some(msg) = syscall::recv_msg(exec_reply) {
+                                if msg.tag == 0x2101 {
+                                    let bytes_read = msg.data[0] as usize;
+                                    if bytes_read == 0 { break; }
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            scratch as *const u8,
+                                            (elf_buf + offset) as *mut u8,
+                                            bytes_read,
+                                        );
+                                    }
+                                    offset += bytes_read;
+                                } else {
+                                    read_ok = false;
+                                    break;
+                                }
+                            } else {
+                                read_ok = false;
+                                break;
+                            }
+                        }
+
+                        syscall::revoke(srv_aspace, grant_dst);
+
+                        if read_ok && offset == file_size {
+                            // Spawn from ELF data.
+                            let elf_data = unsafe {
+                                core::slice::from_raw_parts(elf_buf as *const u8, file_size)
+                            };
+                            let tid = syscall::spawn_elf(elf_data, 50, 0);
+                            if tid != u64::MAX {
+                                // Wait for child to exit.
+                                loop {
+                                    if let Some(_code) = syscall::waitpid(tid) {
+                                        exec_ok = true;
+                                        break;
+                                    }
+                                    syscall::yield_now();
+                                }
+                            } else {
+                                syscall::debug_puts(b"  init: spawn_elf failed\n");
+                            }
+                        } else {
+                            syscall::debug_puts(b"  init: file read incomplete\n");
+                        }
+                    }
+
+                    syscall::munmap(scratch);
+                    syscall::munmap(elf_buf);
+                }
+
+                syscall::send_nb(fp, 0x2400, handle, 0);
+            } else {
+                syscall::debug_puts(b"  init: HELLO.ELF not found on disk\n");
+            }
+        }
+
+        if exec_ok {
+            syscall::debug_puts(b"Phase 14 exec from filesystem: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 14 exec from filesystem: FAILED\n");
+        }
+    } else {
+        syscall::debug_puts(b"  init: fat16 not available, skipping\n");
+        syscall::debug_puts(b"Phase 14 exec from filesystem: SKIPPED\n");
+    }
+
     // Init loops forever, yielding.
     loop {
         syscall::yield_now();

@@ -254,7 +254,17 @@ impl Scheduler {
     ) -> Option<ThreadId> {
         // Look up the ELF binary in the initramfs.
         let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
+        self.create_user_thread_from_elf(elf_data, priority, quantum, arg0)
+    }
 
+    /// Create a user-mode thread in a new task from ELF data already in kernel memory.
+    fn create_user_thread_from_elf(
+        &mut self,
+        elf_data: &[u8],
+        priority: u8,
+        quantum: u32,
+        arg0: u64,
+    ) -> Option<ThreadId> {
         // Allocate a task slot (may reuse an exited slot).
         let task_id = self.alloc_task_id()?;
 
@@ -678,6 +688,11 @@ pub fn spawn(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
 /// Creates a new task with its own address space. `arg0` is passed to main().
 pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
     SCHEDULER.lock().create_user_thread(elf_name, priority, quantum, arg0)
+}
+
+/// Spawn a new user-mode process from ELF data already in kernel memory.
+pub fn spawn_user_from_elf(elf_data: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
+    SCHEDULER.lock().create_user_thread_from_elf(elf_data, priority, quantum, arg0)
 }
 
 /// Spawn a user-mode process with data mapped into its address space.
