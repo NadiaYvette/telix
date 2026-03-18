@@ -766,6 +766,119 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"Phase 14 exec from filesystem: SKIPPED\n");
     }
 
+    // --- Test 14: Writable FAT16 filesystem ---
+    syscall::debug_puts(b"  init: testing writable FAT16...\n");
+
+    if let Some(fp) = fat16_port {
+        let wr_reply = syscall::port_create() as u32;
+
+        // FS_CREATE "TEST.TXT"
+        let fname = b"TEST.TXT";
+        let (fn0, fn1, _) = pack_name(fname);
+        let fs_d2 = (fname.len() as u64) | ((wr_reply as u64) << 32);
+        syscall::send(fp, 0x2500, fn0, fn1, fs_d2, 0);
+
+        let mut phase15_ok = false;
+
+        if let Some(reply) = syscall::recv_msg(wr_reply) {
+            if reply.tag == 0x2501 {
+                let handle = reply.data[0];
+                let srv_aspace = reply.data[2] as u32;
+
+                // Allocate scratch page for grant-based write.
+                if let Some(scratch) = syscall::mmap_anon(0, 1, 1) {
+                    let test_data = b"Telix write test";
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            test_data.as_ptr(),
+                            scratch as *mut u8,
+                            test_data.len(),
+                        );
+                    }
+
+                    // Grant scratch to fat16_srv.
+                    let grant_dst: usize = 0x8_0000_0000;
+                    if syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false) {
+                        // FS_WRITE: data[0]=handle, data[1]=length|(reply<<32), data[2]=grant_va
+                        let wd1 = (test_data.len() as u64) | ((wr_reply as u64) << 32);
+                        syscall::send(fp, 0x2600, handle, wd1, grant_dst as u64, 0);
+
+                        if let Some(wr_msg) = syscall::recv_msg(wr_reply) {
+                            if wr_msg.tag == 0x2601 && wr_msg.data[0] == test_data.len() as u64 {
+                                // Revoke grant, close file.
+                                syscall::revoke(srv_aspace, grant_dst);
+
+                                // FS_CLOSE (triggers flush).
+                                syscall::send_nb(fp, 0x2400, handle, 0);
+
+                                // Small delay for close to complete.
+                                for _ in 0..50 { syscall::yield_now(); }
+
+                                // Now re-open and verify.
+                                let (fn0b, fn1b, _) = pack_name(fname);
+                                let fs_d2b = (fname.len() as u64) | ((wr_reply as u64) << 32);
+                                syscall::send(fp, 0x2000, fn0b, fn1b, fs_d2b, 0);
+
+                                if let Some(open_msg) = syscall::recv_msg(wr_reply) {
+                                    if open_msg.tag == 0x2001 {
+                                        let rh = open_msg.data[0];
+                                        let rsize = open_msg.data[1] as usize;
+                                        let rsrv = open_msg.data[2] as u32;
+
+                                        if rsize == test_data.len() {
+                                            // Grant-based read to verify.
+                                            let grant_rd: usize = 0x8_0000_0000;
+                                            // Zero out scratch.
+                                            unsafe {
+                                                core::ptr::write_bytes(scratch as *mut u8, 0, 512);
+                                            }
+                                            if syscall::grant_pages(rsrv, scratch, grant_rd, 1, false) {
+                                                let rd_d2 = (rsize as u64) | ((wr_reply as u64) << 32);
+                                                syscall::send(fp, 0x2100, rh, 0, rd_d2, grant_rd as u64);
+
+                                                if let Some(rd_msg) = syscall::recv_msg(wr_reply) {
+                                                    if rd_msg.tag == 0x2101 {
+                                                        let bytes_read = rd_msg.data[0] as usize;
+                                                        let buf = unsafe {
+                                                            core::slice::from_raw_parts(scratch as *const u8, bytes_read)
+                                                        };
+                                                        if bytes_read == test_data.len() && buf == test_data {
+                                                            phase15_ok = true;
+                                                        }
+                                                    }
+                                                }
+                                                syscall::revoke(rsrv, grant_rd);
+                                            }
+                                        }
+                                        syscall::send_nb(fp, 0x2400, rh, 0);
+                                    }
+                                }
+                            } else {
+                                syscall::revoke(srv_aspace, grant_dst);
+                                syscall::send_nb(fp, 0x2400, handle, 0);
+                            }
+                        } else {
+                            syscall::revoke(srv_aspace, grant_dst);
+                            syscall::send_nb(fp, 0x2400, handle, 0);
+                        }
+                    }
+                    syscall::munmap(scratch);
+                }
+            } else {
+                syscall::debug_puts(b"  init: FS_CREATE failed\n");
+            }
+        }
+
+        if phase15_ok {
+            syscall::debug_puts(b"Phase 15 writable FAT16: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 15 writable FAT16: FAILED\n");
+        }
+    } else {
+        syscall::debug_puts(b"  init: fat16 not available, skipping\n");
+        syscall::debug_puts(b"Phase 15 writable FAT16: SKIPPED\n");
+    }
+
     // Init loops forever, yielding.
     loop {
         syscall::yield_now();

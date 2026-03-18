@@ -15,6 +15,8 @@ const IO_CONNECT: u64 = 0x100;
 const IO_CONNECT_OK: u64 = 0x101;
 const IO_READ: u64 = 0x200;
 const IO_READ_OK: u64 = 0x201;
+const IO_WRITE: u64 = 0x300;
+const IO_WRITE_OK: u64 = 0x301;
 
 // --- FS protocol constants (served by this server) ---
 const FS_OPEN: u64 = 0x2000;
@@ -25,6 +27,10 @@ const FS_READDIR: u64 = 0x2200;
 const FS_READDIR_OK: u64 = 0x2201;
 const FS_READDIR_END: u64 = 0x2202;
 const FS_CLOSE: u64 = 0x2400;
+const FS_CREATE: u64 = 0x2500;
+const FS_CREATE_OK: u64 = 0x2501;
+const FS_WRITE: u64 = 0x2600;
+const FS_WRITE_OK: u64 = 0x2601;
 const FS_ERROR: u64 = 0x2F00;
 
 const ERR_NOT_FOUND: u64 = 1;
@@ -58,11 +64,18 @@ struct OpenFile {
     first_cluster: u16,
     file_size: u32,
     active: bool,
+    writable: bool,
+    dir_sector: u32,
+    dir_offset: usize,
+    last_cluster: u16,
 }
 
 impl OpenFile {
     const fn empty() -> Self {
-        Self { first_cluster: 0, file_size: 0, active: false }
+        Self {
+            first_cluster: 0, file_size: 0, active: false,
+            writable: false, dir_sector: 0, dir_offset: 0, last_cluster: 0,
+        }
     }
 }
 
@@ -173,6 +186,36 @@ impl BlkClient {
         syscall::revoke(self.blk_aspace, self.grant_va);
         ok
     }
+
+    /// Write a single 512-byte sector to disk.
+    fn write_sector(&self, sector: u32, data: &[u8; 512]) -> bool {
+        // Copy data into scratch page.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.scratch_va as *mut u8,
+                512,
+            );
+        }
+
+        // Grant our scratch page to blk_srv.
+        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
+            return false;
+        }
+
+        let offset = (sector as u64) * 512;
+        let d2 = 512u64 | ((self.reply_port as u64) << 32);
+        syscall::send(self.blk_port, IO_WRITE, 0, offset, d2, self.grant_va as u64);
+
+        let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
+            rr.tag == IO_WRITE_OK
+        } else {
+            false
+        };
+
+        syscall::revoke(self.blk_aspace, self.grant_va);
+        ok
+    }
 }
 
 /// Convert a filename like "HELLO.TXT" to FAT16 8.3 format (11 bytes, space-padded).
@@ -205,6 +248,101 @@ fn to_8_3(name: &[u8], out: &mut [u8; 11]) {
 
 fn to_upper(b: u8) -> u8 {
     if b >= b'a' && b <= b'z' { b - 32 } else { b }
+}
+
+/// Write a u16 to a byte slice at the given offset (little-endian).
+fn write_u16(buf: &mut [u8], off: usize, val: u16) {
+    buf[off] = val as u8;
+    buf[off + 1] = (val >> 8) as u8;
+}
+
+/// Write a u32 to a byte slice at the given offset (little-endian).
+fn write_u32(buf: &mut [u8], off: usize, val: u32) {
+    buf[off] = val as u8;
+    buf[off + 1] = (val >> 8) as u8;
+    buf[off + 2] = (val >> 16) as u8;
+    buf[off + 3] = (val >> 24) as u8;
+}
+
+/// Set a FAT16 entry in the in-memory FAT table.
+fn set_fat_entry(fat_va: usize, cluster: u16, value: u16) {
+    let offset = (cluster as usize) * 2;
+    let ptr = (fat_va + offset) as *mut u16;
+    unsafe { core::ptr::write(ptr, value); }
+}
+
+/// Find first free cluster (FAT entry == 0x0000). Starts from cluster 2.
+fn find_free_cluster(fat_va: usize, max_clusters: usize) -> Option<u16> {
+    for c in 2..max_clusters {
+        let entry = fat_entry(fat_va, c as u16);
+        if entry == 0x0000 {
+            return Some(c as u16);
+        }
+    }
+    None
+}
+
+/// Allocate a single cluster: find free, mark as end-of-chain (0xFFFF).
+fn alloc_cluster(fat_va: usize, max_clusters: usize) -> Option<u16> {
+    let c = find_free_cluster(fat_va, max_clusters)?;
+    set_fat_entry(fat_va, c, 0xFFFF);
+    Some(c)
+}
+
+/// Flush the in-memory FAT table back to disk.
+fn flush_fat(blk: &BlkClient, fat_va: usize, fat_start: u32, fat_sectors: u32) {
+    for i in 0..fat_sectors {
+        let mut sec = [0u8; 512];
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (fat_va + (i as usize) * 512) as *const u8,
+                sec.as_mut_ptr(),
+                512,
+            );
+        }
+        blk.write_sector(fat_start + i, &sec);
+    }
+}
+
+/// Find a free directory entry in the root directory. Returns (sector, byte_offset_in_sector).
+fn find_free_dir_entry(blk: &BlkClient, layout: &Fat16Layout, root_entry_count: u16) -> Option<(u32, usize)> {
+    let entries_per_sector = 16usize; // 512 / 32
+    let total_entries = root_entry_count as usize;
+    let mut idx = 0;
+    while idx < total_entries {
+        let sector_idx = idx / entries_per_sector;
+        let mut sec = [0u8; 512];
+        if !blk.read_sector(layout.root_dir_start + sector_idx as u32, &mut sec) {
+            return None;
+        }
+        for e in 0..entries_per_sector {
+            if idx + e >= total_entries { return None; }
+            let off = e * 32;
+            let first_byte = sec[off];
+            if first_byte == 0x00 || first_byte == 0xE5 {
+                return Some((layout.root_dir_start + sector_idx as u32, off));
+            }
+        }
+        idx += entries_per_sector;
+    }
+    None
+}
+
+/// Write a 32-byte directory entry to a specific sector at a given offset.
+fn write_dir_entry(blk: &BlkClient, sector: u32, offset: usize, name: &[u8; 11], cluster: u16, size: u32) {
+    let mut sec = [0u8; 512];
+    blk.read_sector(sector, &mut sec);
+    // Clear entry.
+    for i in 0..32 { sec[offset + i] = 0; }
+    // 8.3 name.
+    sec[offset..offset + 11].copy_from_slice(name);
+    // Attribute: normal file (0x20 = archive).
+    sec[offset + 11] = 0x20;
+    // First cluster low.
+    write_u16(&mut sec, offset + 26, cluster);
+    // File size.
+    write_u32(&mut sec, offset + 28, size);
+    blk.write_sector(sector, &sec);
 }
 
 /// Unpack a filename from FS_OPEN message data words.
@@ -363,6 +501,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     syscall::debug_puts(b"  [fat16_srv] FAT loaded, ready\n");
+
+    // Max clusters addressable by the FAT we loaded (fat_sectors * 256 entries per sector).
+    let max_clusters = (fat_sectors as usize) * 256;
 
     // Open file table.
     let mut open_files = [OpenFile::empty(); MAX_OPEN_FILES];
@@ -608,9 +749,147 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             }
 
+            FS_CREATE => {
+                // data[0] = name_lo, data[1] = name_hi, data[2] = name_len|(reply<<32)
+                let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
+                let reply_port = (msg.data[2] >> 32) as u32;
+
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                let mut name83 = [0u8; 11];
+                to_8_3(name, &mut name83);
+
+                // Find free directory entry.
+                let dir_slot = find_free_dir_entry(&blk, &layout, bpb.root_entry_count);
+                if dir_slot.is_none() {
+                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    continue;
+                }
+                let (dir_sector, dir_offset) = dir_slot.unwrap();
+
+                // Allocate first cluster.
+                let first_cluster = match alloc_cluster(fat_va, max_clusters) {
+                    Some(c) => c,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Write directory entry with size=0 (will be updated on close).
+                write_dir_entry(&blk, dir_sector, dir_offset, &name83, first_cluster, 0);
+
+                // Allocate a handle.
+                let mut handle = u64::MAX;
+                for (i, f) in open_files.iter_mut().enumerate() {
+                    if !f.active {
+                        f.active = true;
+                        f.writable = true;
+                        f.first_cluster = first_cluster;
+                        f.file_size = 0;
+                        f.dir_sector = dir_sector;
+                        f.dir_offset = dir_offset;
+                        f.last_cluster = first_cluster;
+                        handle = i as u64;
+                        break;
+                    }
+                }
+                if handle == u64::MAX {
+                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                } else {
+                    syscall::send(reply_port, FS_CREATE_OK,
+                        handle, 0, my_aspace as u64, 0);
+                }
+            }
+
+            FS_WRITE => {
+                // data[0] = handle, data[1] = data_len|(reply<<32), data[2] = grant_va, data[3] = unused
+                let handle = msg.data[0] as usize;
+                let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
+                let reply_port = (msg.data[1] >> 32) as u32;
+                let grant_va = msg.data[2] as usize;
+
+                if handle >= MAX_OPEN_FILES || !open_files[handle].active || !open_files[handle].writable {
+                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    continue;
+                }
+
+                let cluster_size = (layout.sectors_per_cluster * 512) as usize;
+                let mut written = 0usize;
+                let file = &mut open_files[handle];
+
+                while written < length {
+                    let file_offset = file.file_size as usize;
+                    let offset_in_cluster = file_offset % cluster_size;
+
+                    // Check if we need a new cluster (not for the very first write if file_size==0).
+                    if file_offset > 0 && offset_in_cluster == 0 {
+                        // Current cluster is full, allocate new one.
+                        let new_cluster = match alloc_cluster(fat_va, max_clusters) {
+                            Some(c) => c,
+                            None => break,
+                        };
+                        // Link old last_cluster -> new_cluster.
+                        set_fat_entry(fat_va, file.last_cluster, new_cluster);
+                        file.last_cluster = new_cluster;
+                    }
+
+                    // Compute physical sector.
+                    let sector_in_cluster = (offset_in_cluster / 512) as u32;
+                    let offset_in_sector = offset_in_cluster % 512;
+                    let sector = layout.data_start
+                        + (file.last_cluster as u32 - 2) * layout.sectors_per_cluster
+                        + sector_in_cluster;
+
+                    // How much can we write into this sector?
+                    let space_in_sector = 512 - offset_in_sector;
+                    let remaining = length - written;
+                    let to_write = remaining.min(space_in_sector);
+
+                    // Read-modify-write the sector.
+                    let mut sec = [0u8; 512];
+                    if offset_in_sector != 0 || to_write < 512 {
+                        // Partial sector — must read existing data first.
+                        blk.read_sector(sector, &mut sec);
+                    }
+
+                    // Copy data from grant page into sector buffer.
+                    if grant_va != 0 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                (grant_va + written) as *const u8,
+                                sec[offset_in_sector..].as_mut_ptr(),
+                                to_write,
+                            );
+                        }
+                    }
+
+                    if !blk.write_sector(sector, &sec) {
+                        break;
+                    }
+
+                    file.file_size += to_write as u32;
+                    written += to_write;
+                }
+
+                syscall::send(reply_port, FS_WRITE_OK, written as u64, 0, 0, 0);
+            }
+
             FS_CLOSE => {
                 let handle = msg.data[0] as usize;
-                if handle < MAX_OPEN_FILES {
+                if handle < MAX_OPEN_FILES && open_files[handle].active {
+                    if open_files[handle].writable {
+                        // Flush FAT to disk.
+                        flush_fat(&blk, fat_va, layout.fat_start, fat_sectors);
+                        // Update directory entry with final file size.
+                        let f = &open_files[handle];
+                        let mut sec = [0u8; 512];
+                        blk.read_sector(f.dir_sector, &mut sec);
+                        write_u16(&mut sec, f.dir_offset + 26, f.first_cluster);
+                        write_u32(&mut sec, f.dir_offset + 28, f.file_size);
+                        blk.write_sector(f.dir_sector, &sec);
+                    }
                     open_files[handle].active = false;
                 }
             }

@@ -33,6 +33,10 @@ const FS_READDIR_OK: u64 = 0x2201;
 #[allow(dead_code)]
 const FS_READDIR_END: u64 = 0x2202;
 const FS_CLOSE: u64 = 0x2400;
+const FS_CREATE: u64 = 0x2500;
+const FS_CREATE_OK: u64 = 0x2501;
+const FS_WRITE_FILE: u64 = 0x2600;
+const FS_WRITE_OK: u64 = 0x2601;
 
 fn pack_name(name: &[u8]) -> (u64, u64, u64) {
     let mut words = [0u64; 3];
@@ -177,6 +181,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             con_puts(con_port, reply_port, b"  net      - net status\r\n");
             con_puts(con_port, reply_port, b"  ping IP  - ping host\r\n");
             con_puts(con_port, reply_port, b"  run F    - exec file\r\n");
+            con_puts(con_port, reply_port, b"  write F D- write D to F\r\n");
         } else if line == b"ls" {
             cmd_ls(con_port, reply_port, fat16_port);
         } else if starts_with(line, b"cat ") {
@@ -192,6 +197,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             cmd_ping(con_port, reply_port, &line[5..]);
         } else if starts_with(line, b"run ") {
             cmd_run(con_port, reply_port, fat16_port, &line[4..]);
+        } else if starts_with(line, b"write ") {
+            cmd_write(con_port, reply_port, fat16_port, &line[6..]);
         } else {
             con_puts(con_port, reply_port, b"unknown: ");
             con_puts(con_port, reply_port, line);
@@ -572,6 +579,107 @@ fn cmd_run(con_port: u32, reply_port: u32, fat16_port: Option<u32>, filename: &[
     }
 
     syscall::port_destroy(fs_reply);
+}
+
+fn cmd_write(con_port: u32, reply_port: u32, fat16_port: Option<u32>, args: &[u8]) {
+    let fp = match fat16_port {
+        Some(p) => p,
+        None => {
+            con_puts(con_port, reply_port, b"no filesystem\r\n");
+            return;
+        }
+    };
+
+    // Parse "FILENAME DATA..." — split on first space.
+    let mut split = 0;
+    while split < args.len() && args[split] != b' ' {
+        split += 1;
+    }
+    if split == 0 || split >= args.len() {
+        con_puts(con_port, reply_port, b"usage: write FILE DATA\r\n");
+        return;
+    }
+    let filename = &args[..split];
+    let data = &args[split + 1..];
+    if data.is_empty() {
+        con_puts(con_port, reply_port, b"usage: write FILE DATA\r\n");
+        return;
+    }
+
+    let fs_reply = syscall::port_create() as u32;
+
+    // FS_CREATE.
+    let (n0, n1, _) = pack_name(filename);
+    let d2 = (filename.len() as u64) | ((fs_reply as u64) << 32);
+    syscall::send(fp, FS_CREATE, n0, n1, d2, 0);
+
+    let (handle, srv_aspace) = if let Some(msg) = syscall::recv_msg(fs_reply) {
+        if msg.tag == FS_CREATE_OK {
+            (msg.data[0], msg.data[2] as u32)
+        } else {
+            con_puts(con_port, reply_port, b"create failed\r\n");
+            syscall::port_destroy(fs_reply);
+            return;
+        }
+    } else {
+        syscall::port_destroy(fs_reply);
+        return;
+    };
+
+    // Allocate scratch page for grant-based write.
+    let scratch_va = match syscall::mmap_anon(0, 1, 1) {
+        Some(va) => va,
+        None => {
+            con_puts(con_port, reply_port, b"alloc failed\r\n");
+            syscall::send_nb(fp, FS_CLOSE, handle, 0);
+            syscall::port_destroy(fs_reply);
+            return;
+        }
+    };
+
+    // Copy data into scratch page.
+    let write_len = data.len().min(4096);
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            scratch_va as *mut u8,
+            write_len,
+        );
+    }
+
+    // Grant scratch to fat16_srv.
+    let grant_dst: usize = 0x6_0000_0000;
+    if !syscall::grant_pages(srv_aspace, scratch_va, grant_dst, 1, false) {
+        con_puts(con_port, reply_port, b"grant failed\r\n");
+        syscall::munmap(scratch_va);
+        syscall::send_nb(fp, FS_CLOSE, handle, 0);
+        syscall::port_destroy(fs_reply);
+        return;
+    }
+
+    // FS_WRITE: data[0]=handle, data[1]=length|(reply<<32), data[2]=grant_va
+    let wd1 = (write_len as u64) | ((fs_reply as u64) << 32);
+    syscall::send(fp, FS_WRITE_FILE, handle, wd1, grant_dst as u64, 0);
+
+    let mut wrote = 0usize;
+    if let Some(msg) = syscall::recv_msg(fs_reply) {
+        if msg.tag == FS_WRITE_OK {
+            wrote = msg.data[0] as usize;
+        }
+    }
+
+    // Revoke grant, close file.
+    syscall::revoke(srv_aspace, grant_dst);
+    syscall::munmap(scratch_va);
+    syscall::send_nb(fp, FS_CLOSE, handle, 0);
+    syscall::port_destroy(fs_reply);
+
+    // Print confirmation.
+    con_puts(con_port, reply_port, b"wrote ");
+    let mut nbuf = [0u8; 20];
+    let nlen = fmt_num(wrote as u64, &mut nbuf);
+    con_puts(con_port, reply_port, &nbuf[..nlen]);
+    con_puts(con_port, reply_port, b" bytes\r\n");
 }
 
 fn cmd_info(con_port: u32, reply_port: u32) {
