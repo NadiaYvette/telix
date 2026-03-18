@@ -287,6 +287,7 @@ impl Scheduler {
         task.page_table_root = pt_root;
         task.exit_code = 0;
         task.exited = false;
+        task.thread_count = 1;
         // Record the parent task (caller's task) for waitpid.
         let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
         task.parent_task = self.threads[caller_tid as usize].task_id;
@@ -438,6 +439,86 @@ impl Scheduler {
         thread.saved_sp = frame_sp as u64;
         thread.stack_base = kstack_base;
 
+        self.run_queues[priority as usize].push(id);
+        Some(id)
+    }
+
+    /// Create a new thread in an existing task (shared address space).
+    /// The caller provides the user entry point, stack top, and an argument.
+    fn create_thread_in_task(
+        &mut self,
+        task_id: u32,
+        entry: u64,
+        stack_top: u64,
+        arg: u64,
+        priority: u8,
+        quantum: u32,
+    ) -> Option<ThreadId> {
+        if !self.tasks[task_id as usize].active {
+            return None;
+        }
+
+        // Allocate kernel stack.
+        let kstack_page = crate::mm::phys::alloc_page()?;
+        let kstack_base = kstack_page.as_usize();
+        let kstack_top = kstack_base + PAGE_SIZE;
+
+        // Build exception frame for user-mode entry.
+        let frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
+        let frame = frame_sp as *mut u64;
+        unsafe {
+            for i in 0..(EXCEPTION_FRAME_SIZE / 8) {
+                *frame.add(i) = 0;
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                *frame.add(32) = entry;          // ELR_EL1
+                *frame.add(33) = 0x0;            // SPSR_EL1 = EL0t
+                *frame.add(31) = stack_top;      // SP_EL0
+            }
+
+            #[cfg(target_arch = "riscv64")]
+            {
+                *frame.add(31) = entry;          // sepc
+                *frame.add(32) = 1 << 5;         // sstatus: SPIE=1, SPP=0
+                *frame.add(1) = stack_top;       // sp (x2)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                *frame.add(17) = entry;                                              // RIP
+                *frame.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3;   // CS
+                *frame.add(19) = 0x200;                                              // RFLAGS = IF
+                *frame.add(20) = stack_top;                                          // RSP
+                *frame.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3;   // SS
+            }
+
+            // arg in first argument register
+            #[cfg(target_arch = "aarch64")]
+            { *frame.add(0) = arg; } // x0
+            #[cfg(target_arch = "riscv64")]
+            { *frame.add(9) = arg; } // a0 = x10
+            #[cfg(target_arch = "x86_64")]
+            { *frame.add(9) = arg; } // rdi
+        }
+
+        let id = self.alloc_thread_id()?;
+
+        let thread = &mut self.threads[id as usize];
+        thread.id = id;
+        thread.state = ThreadState::Ready;
+        thread.task_id = task_id;
+        thread.base_priority = priority;
+        thread.effective_priority = priority;
+        THREAD_PRIO[id as usize].store(priority, Ordering::Relaxed);
+        thread.quantum = quantum;
+        thread.default_quantum = quantum;
+        thread.saved_sp = frame_sp as u64;
+        thread.stack_base = kstack_base;
+        thread.exit_code = 0;
+
+        self.tasks[task_id as usize].thread_count += 1;
         self.run_queues[priority as usize].push(id);
         Some(id)
     }
@@ -611,6 +692,7 @@ impl Scheduler {
             return current_sp;
         }
 
+
         // Save current thread's SP.
         self.threads[prev_id as usize].saved_sp = current_sp;
         let prev_prio = self.threads[prev_id as usize].effective_priority;
@@ -708,6 +790,34 @@ pub fn spawn_user_with_data(
     SCHEDULER.lock().create_user_thread_with_data(elf_name, priority, quantum, arg0, data, data_va)
 }
 
+/// Create a new thread in the caller's task. Returns thread ID or None.
+pub fn thread_create(task_id: u32, entry: u64, stack_top: u64, arg: u64) -> Option<ThreadId> {
+    let mut sched = SCHEDULER.lock();
+    // Inherit the caller's priority and quantum.
+    let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let priority = sched.threads[caller_tid as usize].base_priority;
+    let quantum = sched.threads[caller_tid as usize].default_quantum;
+    sched.create_thread_in_task(task_id, entry, stack_top, arg, priority, quantum)
+}
+
+/// Check if a thread has exited and return its exit code.
+/// Returns Some(exit_code) if dead and in the same task, None otherwise.
+pub fn thread_join_poll(tid: ThreadId, caller_task: u32) -> Option<i32> {
+    let sched = SCHEDULER.lock();
+    if (tid as usize) >= MAX_THREADS {
+        return None;
+    }
+    let t = &sched.threads[tid as usize];
+    if t.task_id != caller_task {
+        return None;
+    }
+    if t.state == ThreadState::Dead {
+        Some(t.exit_code)
+    } else {
+        None
+    }
+}
+
 /// Get the task ID of the current thread.
 #[allow(dead_code)]
 pub fn current_task_id() -> TaskId {
@@ -762,6 +872,11 @@ static YIELD_ASAP: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS] 
     const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     [INIT; super::thread::MAX_THREADS]
 };
+
+/// Set YIELD_ASAP for a thread, causing it to be preempted on the next timer tick.
+pub fn set_yield_asap(tid: ThreadId) {
+    YIELD_ASAP[tid as usize].store(true, Ordering::Release);
+}
 
 /// Clear the wakeup flag for a thread. Must be called while holding the
 /// relevant lock (PORT_TABLE etc.) BEFORE adding the thread as a waiter,
@@ -827,12 +942,13 @@ pub fn current_aspace_id() -> u32 {
 /// Terminate the current thread and destroy its task's resources.
 /// This function never returns.
 pub fn exit_current_thread(exit_code: i32) -> ! {
-    let (tid, aspace_id, pt_root, kstack_base) = {
+    let (tid, is_last_thread, aspace_id, pt_root, kstack_base) = {
         let pcpu = smp::current();
         let tid = pcpu.current_thread.load(Ordering::Relaxed);
         let mut sched = SCHEDULER.lock();
         let thread = &mut sched.threads[tid as usize];
         thread.state = ThreadState::Dead;
+        thread.exit_code = exit_code;
         let task_id = thread.task_id;
         let kstack_base = thread.stack_base;
         // NOTE: Do NOT set stack_base=0 here. The thread is still running on
@@ -841,46 +957,53 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         // stack_base=0 when it drains DEFERRED_KSTACK (proving the dead thread
         // has been context-switched away).
         let task = &mut sched.tasks[task_id as usize];
-        task.exit_code = exit_code;
-        task.exited = true;
-        task.active = false;
+        task.thread_count -= 1;
+        let is_last = task.thread_count == 0;
+        if is_last {
+            task.exit_code = exit_code;
+            task.exited = true;
+            task.active = false;
+        }
         let aspace_id = task.aspace_id;
         let pt_root = task.page_table_root;
-        (tid, aspace_id, pt_root, kstack_base)
+        (tid, is_last, aspace_id, pt_root, kstack_base)
     }; // scheduler lock dropped here
 
-    // Switch to kernel/boot page table before freeing user page table.
-    if pt_root != 0 {
-        #[cfg(target_arch = "aarch64")]
-        {
-            let boot_root = crate::arch::aarch64::mm::boot_page_table_root();
-            crate::arch::aarch64::mm::switch_page_table(boot_root);
+    // Only destroy task resources when the last thread exits.
+    if is_last_thread {
+        // Switch to kernel/boot page table before freeing user page table.
+        if pt_root != 0 {
+            #[cfg(target_arch = "aarch64")]
+            {
+                let boot_root = crate::arch::aarch64::mm::boot_page_table_root();
+                crate::arch::aarch64::mm::switch_page_table(boot_root);
+            }
+            #[cfg(target_arch = "riscv64")]
+            {
+                let boot_root = crate::arch::riscv64::mm::boot_page_table_root();
+                crate::arch::riscv64::mm::switch_page_table(boot_root);
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                let boot_root = crate::arch::x86_64::mm::boot_page_table_root();
+                crate::arch::x86_64::mm::switch_page_table(boot_root);
+            }
         }
-        #[cfg(target_arch = "riscv64")]
-        {
-            let boot_root = crate::arch::riscv64::mm::boot_page_table_root();
-            crate::arch::riscv64::mm::switch_page_table(boot_root);
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            let boot_root = crate::arch::x86_64::mm::boot_page_table_root();
-            crate::arch::x86_64::mm::switch_page_table(boot_root);
-        }
-    }
 
-    // Destroy address space (frees VMAs and backing physical pages).
-    if aspace_id != 0 {
-        crate::mm::aspace::destroy(aspace_id);
-    }
+        // Destroy address space (frees VMAs and backing physical pages).
+        if aspace_id != 0 {
+            crate::mm::aspace::destroy(aspace_id);
+        }
 
-    // Free page table intermediate pages.
-    if pt_root != 0 {
-        #[cfg(target_arch = "aarch64")]
-        crate::arch::aarch64::mm::free_page_table_tree(pt_root);
-        #[cfg(target_arch = "riscv64")]
-        crate::arch::riscv64::mm::free_page_table_tree(pt_root);
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::x86_64::mm::free_page_table_tree(pt_root);
+        // Free page table intermediate pages.
+        if pt_root != 0 {
+            #[cfg(target_arch = "aarch64")]
+            crate::arch::aarch64::mm::free_page_table_tree(pt_root);
+            #[cfg(target_arch = "riscv64")]
+            crate::arch::riscv64::mm::free_page_table_tree(pt_root);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::mm::free_page_table_tree(pt_root);
+        }
     }
 
     // Defer freeing our own kernel stack — we're running on it.

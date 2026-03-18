@@ -24,6 +24,8 @@ pub struct Task {
     pub parent_task: TaskId,
     /// True once exit cleanup is done.
     pub exited: bool,
+    /// Number of live threads in this task.
+    pub thread_count: u32,
 }
 
 impl Task {
@@ -36,6 +38,7 @@ impl Task {
             exit_code: 0,
             parent_task: 0,
             exited: false,
+            thread_count: 0,
         }
     }
 }

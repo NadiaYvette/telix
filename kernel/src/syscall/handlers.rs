@@ -43,6 +43,8 @@ pub const SYS_IRQ_WAIT: u64 = 26;
 pub const SYS_GETCHAR: u64 = 27;
 pub const SYS_IOPORT: u64 = 28;
 pub const SYS_SPAWN_ELF: u64 = 29;
+pub const SYS_THREAD_CREATE: u64 = 30;
+pub const SYS_THREAD_JOIN: u64 = 31;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -155,6 +157,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_GETCHAR => sys_getchar(),
         SYS_IOPORT => sys_ioport(a0, a1, a2),
         SYS_SPAWN_ELF => sys_spawn_elf(a0, a1, a2, a3),
+        SYS_THREAD_CREATE => sys_thread_create(a0, a1, a2),
+        SYS_THREAD_JOIN => sys_thread_join(a0),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -251,7 +255,9 @@ fn sys_port_set_add(set_id: u64, port_id: u64) -> u64 {
 }
 
 fn sys_yield() -> u64 {
-    // For now, just return — preemption via timer handles scheduling.
+    // Set YIELD_ASAP so the next timer tick will preempt us immediately.
+    let tid = crate::sched::current_thread_id();
+    crate::sched::scheduler::set_yield_asap(tid);
     0
 }
 
@@ -654,6 +660,23 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
 
     match crate::sched::spawn_user_from_elf(buf, priority as u8, 20, arg0) {
         Some(tid) => tid as u64,
+        None => u64::MAX,
+    }
+}
+
+fn sys_thread_create(entry: u64, stack_top: u64, arg: u64) -> u64 {
+    let task_id = crate::sched::scheduler::current_task_id();
+    match crate::sched::thread_create(task_id, entry, stack_top, arg) {
+        Some(child_tid) => child_tid as u64,
+        None => u64::MAX,
+    }
+}
+
+/// Poll: returns exit code if target thread is dead and in same task, else u64::MAX.
+fn sys_thread_join(tid: u64) -> u64 {
+    let caller_task = crate::sched::scheduler::current_task_id();
+    match crate::sched::thread_join_poll(tid as u32, caller_task) {
+        Some(exit_code) => exit_code as u64,
         None => u64::MAX,
     }
 }

@@ -28,6 +28,8 @@ const SYS_IRQ_WAIT: u64 = 26;
 const SYS_GETCHAR: u64 = 27;
 const SYS_IOPORT: u64 = 28;
 const SYS_SPAWN_ELF: u64 = 29;
+const SYS_THREAD_CREATE: u64 = 30;
+const SYS_THREAD_JOIN: u64 = 31;
 const SYS_PORT_SET_CREATE: u64 = 5;
 const SYS_PORT_SET_ADD: u64 = 6;
 #[allow(dead_code)]
@@ -136,6 +138,29 @@ pub fn spawn_with_arg(name: &[u8], priority: u8, arg0: u64) -> u64 {
 /// Spawn a new process from ELF data in memory. Returns thread ID or u64::MAX.
 pub fn spawn_elf(elf_data: &[u8], priority: u8, arg0: u64) -> u64 {
     unsafe { arch::syscall4(SYS_SPAWN_ELF, elf_data.as_ptr() as u64, elf_data.len() as u64, priority as u64, arg0) }
+}
+
+/// Create a new thread in the current process. Returns thread ID or u64::MAX on error.
+/// `entry` is the user function address, `stack_top` is the top of the pre-allocated stack,
+/// `arg` is passed as the first argument to the entry function.
+pub fn thread_create(entry: u64, stack_top: u64, arg: u64) -> u64 {
+    unsafe { arch::syscall3(SYS_THREAD_CREATE, entry, stack_top, arg) }
+}
+
+/// Poll: check if a thread has exited. Returns Some(exit_code) or None.
+pub fn thread_join_poll(tid: u32) -> Option<i64> {
+    let r = unsafe { arch::syscall1(SYS_THREAD_JOIN, tid as u64) };
+    if r == u64::MAX { None } else { Some(r as i64) }
+}
+
+/// Block until a thread exits. Returns its exit code.
+pub fn thread_join(tid: u32) -> i64 {
+    loop {
+        if let Some(code) = thread_join_poll(tid) {
+            return code;
+        }
+        yield_now();
+    }
 }
 
 /// Get the userspace initramfs server's port ID.

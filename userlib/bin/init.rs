@@ -946,8 +946,60 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     syscall::port_destroy(pipe_port);
 
+    // --- Test 17: Multi-threaded processes ---
+    {
+        // Allocate shared memory page.
+        let shared_va = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
+        if shared_va != 0 {
+            // Clear shared memory.
+            unsafe { core::ptr::write_volatile(shared_va as *mut u64, 0); }
+
+            // Allocate stack for child thread.
+            let child_stack_va = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
+            if child_stack_va != 0 {
+                let stack_top = child_stack_va + 0x4000; // 16 KiB, safe on all PAGE_SIZE configs
+
+                let child_tid = syscall::thread_create(
+                    thread_child_entry as u64,
+                    stack_top as u64,
+                    shared_va as u64,
+                );
+
+                if child_tid != u64::MAX {
+                    let exit_code = syscall::thread_join(child_tid as u32);
+                    let val = unsafe { core::ptr::read_volatile(shared_va as *const u64) };
+
+                    if val == 0xCAFE && exit_code == 42 {
+                        syscall::debug_puts(b"Phase 17 multi-threaded processes: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 17 multi-threaded processes: FAILED (val=");
+                        print_num(val);
+                        syscall::debug_puts(b" exit=");
+                        print_num(exit_code as u64);
+                        syscall::debug_puts(b")\n");
+                    }
+                } else {
+                    syscall::debug_puts(b"Phase 17 multi-threaded processes: FAILED (create)\n");
+                }
+            } else {
+                syscall::debug_puts(b"Phase 17 multi-threaded processes: FAILED (stack alloc)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 17 multi-threaded processes: FAILED (shared alloc)\n");
+        }
+    }
+
     // Init loops forever, yielding.
     loop {
         syscall::yield_now();
     }
+}
+
+/// Child thread entry point for Phase 17 test.
+/// Writes 0xCAFE to shared memory (passed as arg), then exits with code 42.
+#[unsafe(no_mangle)]
+extern "C" fn thread_child_entry(arg: u64) {
+    let ptr = arg as *mut u64;
+    unsafe { core::ptr::write_volatile(ptr, 0xCAFE); }
+    syscall::exit(42);
 }

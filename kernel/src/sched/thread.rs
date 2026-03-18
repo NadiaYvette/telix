@@ -55,6 +55,8 @@ pub struct Thread {
     /// Why this thread is blocked (only valid when state == Blocked).
     #[allow(dead_code)]
     pub blocked_on: BlockReason,
+    /// Exit code set by sys_exit (for thread_join).
+    pub exit_code: i32,
 }
 
 impl Thread {
@@ -70,6 +72,7 @@ impl Thread {
             saved_sp: 0,
             stack_base: 0,
             blocked_on: BlockReason::None,
+            exit_code: 0,
         }
     }
 }
