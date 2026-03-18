@@ -241,6 +241,226 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         print_result(b"kill_respawn", t1 - t0, N, freq);
     }
 
+    // --- Benchmark 8: Grant/revoke overhead ---
+    {
+        const GRANT_BENCH_ASPACE: u64 = 0x7000;
+        const GRANT_BENCH_QUIT: u64 = 0x70FF;
+        const DST_VA: usize = 0xA_0000_0000;
+        const N: u64 = 1_000;
+
+        // Allocate 1 page and touch it to ensure physical backing.
+        if let Some(src_va) = syscall::mmap_anon(0, 1, 1) {
+            unsafe { core::ptr::write_volatile(src_va as *mut u8, 0xAA); }
+
+            let coord_port = syscall::port_create() as u32;
+            let child_tid = syscall::spawn_with_arg(b"grant_echo", 50, coord_port as u64);
+            if child_tid != u64::MAX {
+                // Receive child's aspace_id.
+                let child_aspace = if let Some(msg) = syscall::recv_msg(coord_port) {
+                    if msg.tag == GRANT_BENCH_ASPACE { msg.data[0] as u32 } else { 0 }
+                } else { 0 };
+
+                if child_aspace != 0 {
+                    // Warmup.
+                    for _ in 0..10 {
+                        syscall::grant_pages(child_aspace, src_va, DST_VA, 1, true);
+                        syscall::revoke(child_aspace, DST_VA);
+                    }
+
+                    let t0 = syscall::get_cycles();
+                    for _ in 0..N {
+                        syscall::grant_pages(child_aspace, src_va, DST_VA, 1, true);
+                        syscall::revoke(child_aspace, DST_VA);
+                    }
+                    let t1 = syscall::get_cycles();
+                    print_result(b"grant_revoke", t1 - t0, N, freq);
+                } else {
+                    syscall::debug_puts(b"  bench: grant_revoke: SKIP (no aspace)\n");
+                }
+
+                syscall::send_nb(coord_port, GRANT_BENCH_QUIT, 0, 0);
+                loop {
+                    if syscall::waitpid(child_tid).is_some() { break; }
+                    syscall::yield_now();
+                }
+            } else {
+                syscall::debug_puts(b"  bench: grant_revoke: SKIP (spawn failed)\n");
+            }
+            syscall::port_destroy(coord_port);
+            syscall::munmap(src_va);
+        }
+    }
+
+    // --- Benchmark 9: Grant 64 KB (compare with pipe_64k) ---
+    {
+        const GRANT_BENCH_ASPACE: u64 = 0x7000;
+        const GRANT_BENCH_QUIT: u64 = 0x70FF;
+        const DST_VA: usize = 0xA_0000_0000;
+
+        // Allocate 16 pages (64 KB at 4 KB MMU page size).
+        if let Some(src_va) = syscall::mmap_anon(0, 16, 1) {
+            // Touch all pages to ensure backing.
+            for i in 0..16 {
+                unsafe {
+                    core::ptr::write_volatile((src_va + i * 4096) as *mut u8, 0xBB);
+                }
+            }
+
+            let coord_port = syscall::port_create() as u32;
+            let child_tid = syscall::spawn_with_arg(b"grant_echo", 50, coord_port as u64);
+            if child_tid != u64::MAX {
+                let child_aspace = if let Some(msg) = syscall::recv_msg(coord_port) {
+                    if msg.tag == GRANT_BENCH_ASPACE { msg.data[0] as u32 } else { 0 }
+                } else { 0 };
+
+                if child_aspace != 0 {
+                    // Warmup.
+                    syscall::grant_pages(child_aspace, src_va, DST_VA, 16, true);
+                    syscall::revoke(child_aspace, DST_VA);
+
+                    let t0 = syscall::get_cycles();
+                    syscall::grant_pages(child_aspace, src_va, DST_VA, 16, true);
+                    syscall::revoke(child_aspace, DST_VA);
+                    let t1 = syscall::get_cycles();
+
+                    let total = t1 - t0;
+                    syscall::debug_puts(b"  bench: grant_64k: ");
+                    print_num(total);
+                    syscall::debug_puts(b" cy for 65536 B (grant+revoke)\n");
+                } else {
+                    syscall::debug_puts(b"  bench: grant_64k: SKIP (no aspace)\n");
+                }
+
+                syscall::send_nb(coord_port, GRANT_BENCH_QUIT, 0, 0);
+                loop {
+                    if syscall::waitpid(child_tid).is_some() { break; }
+                    syscall::yield_now();
+                }
+            } else {
+                syscall::debug_puts(b"  bench: grant_64k: SKIP (spawn failed)\n");
+            }
+            syscall::port_destroy(coord_port);
+            syscall::munmap(src_va);
+        }
+    }
+
+    // --- Benchmark 10: Priority scheduling under load ---
+    {
+        const N: u64 = 500;
+        let pong_port = syscall::port_create() as u32;
+        let reply_port = syscall::port_create() as u32;
+
+        // Spawn pong at high priority (10).
+        let pong_tid = syscall::spawn_with_arg(b"pong", 10, pong_port as u64);
+        if pong_tid != u64::MAX {
+            for _ in 0..20 { syscall::yield_now(); }
+
+            // Warmup.
+            for _ in 0..10 {
+                syscall::send(pong_port, BENCH_PING, reply_port as u64, 0, 0, 0);
+                let _ = syscall::recv_msg(reply_port);
+            }
+
+            // Measure without load.
+            let t0 = syscall::get_cycles();
+            for _ in 0..N {
+                syscall::send(pong_port, BENCH_PING, reply_port as u64, 0, 0, 0);
+                let _ = syscall::recv_msg(reply_port);
+            }
+            let t1 = syscall::get_cycles();
+            print_result(b"prio_ipc_noload", t1 - t0, N, freq);
+
+            // Spawn 2 low-priority CPU-bound tasks.
+            let spin1 = syscall::spawn(b"spin", 200);
+            let spin2 = syscall::spawn(b"spin", 200);
+            for _ in 0..10 { syscall::yield_now(); }
+
+            // Measure with load.
+            let t0 = syscall::get_cycles();
+            for _ in 0..N {
+                syscall::send(pong_port, BENCH_PING, reply_port as u64, 0, 0, 0);
+                let _ = syscall::recv_msg(reply_port);
+            }
+            let t1 = syscall::get_cycles();
+            print_result(b"prio_ipc_loaded", t1 - t0, N, freq);
+
+            // Cleanup.
+            if spin1 != u64::MAX {
+                syscall::kill(spin1 as u32);
+                loop {
+                    if syscall::waitpid(spin1).is_some() { break; }
+                    syscall::yield_now();
+                }
+            }
+            if spin2 != u64::MAX {
+                syscall::kill(spin2 as u32);
+                loop {
+                    if syscall::waitpid(spin2).is_some() { break; }
+                    syscall::yield_now();
+                }
+            }
+            syscall::send_nb(pong_port, BENCH_QUIT, 0, 0);
+            loop {
+                if syscall::waitpid(pong_tid).is_some() { break; }
+                syscall::yield_now();
+            }
+        } else {
+            syscall::debug_puts(b"  bench: prio_ipc: SKIP (spawn failed)\n");
+        }
+        syscall::port_destroy(reply_port);
+        syscall::port_destroy(pong_port);
+    }
+
+    // --- Benchmark 11: Server fault isolation + recovery ---
+    {
+        const N: u64 = 50;
+        let pong_port = syscall::port_create() as u32;
+        let reply_port = syscall::port_create() as u32;
+
+        let mut pong_tid = syscall::spawn_with_arg(b"pong", 50, pong_port as u64);
+        if pong_tid != u64::MAX {
+            for _ in 0..20 { syscall::yield_now(); }
+
+            // Warmup: verify server works.
+            for _ in 0..5 {
+                syscall::send(pong_port, BENCH_PING, reply_port as u64, 0, 0, 0);
+                let _ = syscall::recv_msg(reply_port);
+            }
+
+            let t0 = syscall::get_cycles();
+            for _ in 0..N {
+                // Kill current server.
+                syscall::kill(pong_tid as u32);
+                loop {
+                    if syscall::waitpid(pong_tid).is_some() { break; }
+                    syscall::yield_now();
+                }
+                // Respawn on the same port.
+                pong_tid = syscall::spawn_with_arg(b"pong", 50, pong_port as u64);
+                if pong_tid == u64::MAX { break; }
+                for _ in 0..10 { syscall::yield_now(); }
+                // Verify new server is operational.
+                syscall::send(pong_port, BENCH_PING, reply_port as u64, 0, 0, 0);
+                let _ = syscall::recv_msg(reply_port);
+            }
+            let t1 = syscall::get_cycles();
+
+            // Cleanup.
+            if pong_tid != u64::MAX {
+                syscall::send_nb(pong_port, BENCH_QUIT, 0, 0);
+                loop {
+                    if syscall::waitpid(pong_tid).is_some() { break; }
+                    syscall::yield_now();
+                }
+            }
+            print_result(b"srv_restart", t1 - t0, N, freq);
+        } else {
+            syscall::debug_puts(b"  bench: srv_restart: SKIP (spawn failed)\n");
+        }
+        syscall::port_destroy(reply_port);
+        syscall::port_destroy(pong_port);
+    }
+
     syscall::debug_puts(b"=== Benchmarks complete ===\n");
     syscall::exit(0);
 }

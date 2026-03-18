@@ -62,3 +62,7 @@ path = "bin/bench.rs"
 [[bin]]
 name = "pong"
 path = "bin/pong.rs"
+
+[[bin]]
+name = "grant_echo"
+path = "bin/grant_echo.rs"

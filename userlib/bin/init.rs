@@ -1174,9 +1174,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 syscall::yield_now();
             }
-            syscall::debug_puts(b"Phase 21 benchmarks: PASSED\n");
+            syscall::debug_puts(b"Phase 22 benchmarks: PASSED\n");
         } else {
-            syscall::debug_puts(b"Phase 21 benchmarks: FAILED (spawn)\n");
+            syscall::debug_puts(b"Phase 22 benchmarks: FAILED (spawn)\n");
         }
     }
 
