@@ -472,11 +472,33 @@ pub fn set_quota(child_task: u32, resource_type: u32, limit: u32) -> bool {
 }
 
 const SYS_FORK: u64 = 39;
+const SYS_SEND_CAP: u64 = 40;
+#[allow(dead_code)]
+const SYS_CAP_REVOKE: u64 = 41;
 
 /// Fork the current process. Returns child task ID to parent (>0),
 /// 0 to the child, or 0 on failure.
 pub fn fork() -> u64 {
     unsafe { arch::syscall0(SYS_FORK) }
+}
+
+/// Send a message with an attached capability transfer.
+/// Grants the specified port's capability (with given rights) to the
+/// receiver on dest_port. The receiver gets:
+///   data[0] = d0, data[1] = d1, data[2] = receiver's new cap slot,
+///   data[3] = granted port ID, data[4] = granted rights.
+pub fn send_cap(dest_port: u32, tag: u64, d0: u64, d1: u64, grant_port: u32, grant_rights: u32) -> bool {
+    unsafe {
+        arch::syscall6(SYS_SEND_CAP, dest_port as u64, tag, d0, d1,
+            grant_port as u64, grant_rights as u64) == 0
+    }
+}
+
+/// Revoke all derived capabilities for a port.
+/// Requires MANAGE right on the port. Returns number of caps revoked.
+#[allow(dead_code)]
+pub fn cap_revoke(port_id: u32) -> u64 {
+    unsafe { arch::syscall1(SYS_CAP_REVOKE, port_id as u64) }
 }
 
 /// Register a service with the name server.

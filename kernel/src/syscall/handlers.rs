@@ -53,6 +53,8 @@ pub const SYS_GET_CYCLES: u64 = 36;
 pub const SYS_GET_TIMER_FREQ: u64 = 37;
 pub const SYS_SET_QUOTA: u64 = 38;
 pub const SYS_FORK: u64 = 39;
+pub const SYS_SEND_CAP: u64 = 40;
+pub const SYS_CAP_REVOKE: u64 = 41;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -178,6 +180,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_GET_TIMER_FREQ => sys_get_timer_freq(),
         SYS_SET_QUOTA => sys_set_quota(a0, a1, a2),
         SYS_FORK => crate::sched::scheduler::fork_current(),
+        SYS_SEND_CAP => sys_send_cap(a0, a1, a2, a3, a4, a5),
+        SYS_CAP_REVOKE => sys_cap_revoke(a0),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -956,6 +960,94 @@ fn sys_set_quota(child_tid: u64, resource_type: u64, limit: u64) -> u64 {
         _ => return u64::MAX,
     }
     0
+}
+
+/// Send a message with an attached capability transfer.
+///
+/// Args: dest_port, tag, data0, data1, grant_port_id, grant_rights
+///
+/// The kernel grants the specified port capability (with attenuated rights)
+/// to the receiver task, then sends the message. The receiver gets:
+///   data[0] = sender's data0
+///   data[1] = sender's data1
+///   data[2] = receiver's new cap slot index
+///   data[3] = granted port ID
+///   data[4] = granted rights
+fn sys_send_cap(dest_port: u64, tag: u64, d0: u64, d1: u64, grant_port: u64, grant_rights: u64) -> u64 {
+    // Check sender has SEND on dest_port.
+    if !check_port_cap(dest_port as u32, crate::cap::Rights::SEND) {
+        return ECAP;
+    }
+
+    let sender_task = crate::sched::current_task_id();
+    let grant_port_id = grant_port as u32;
+    let rights = crate::cap::Rights::from_bits(grant_rights as u32);
+
+    // Check sender has the cap for grant_port with the requested rights.
+    if sender_task != 0 && !crate::cap::has_port_cap_fast(sender_task, grant_port_id, rights) {
+        return ECAP;
+    }
+
+    // Find receiver task: first task (other than sender) with RECV on dest_port.
+    let receiver_task = match crate::cap::find_recv_task(dest_port as u32, sender_task) {
+        Some(t) => t,
+        None => return u64::MAX, // No receiver found.
+    };
+
+    // Grant the cap to receiver.
+    let receiver_slot = {
+        let mut caps = crate::cap::CAP_SYSTEM.lock();
+        match caps.grant_port_cap(receiver_task, grant_port_id, rights) {
+            Some(slot) => slot as u64,
+            None => return u64::MAX, // CSpace full.
+        }
+    };
+
+    // Build and send the message.
+    let mut msg = crate::ipc::Message {
+        tag,
+        data: [d0, d1, receiver_slot, grant_port_id as u64, rights.bits() as u64, 0],
+    };
+
+    match crate::ipc::port::send_direct(dest_port as u32, &mut msg) {
+        crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
+            let recv_task = crate::sched::scheduler::thread_task_id(receiver_tid);
+            auto_grant_reply_caps(recv_task, &msg);
+            inject_recv_into_frame(receiver_tid, &msg);
+            crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
+            crate::sched::scheduler::handoff_to(receiver_tid);
+            0
+        }
+        crate::ipc::port::SendDirectResult::Queued => 0,
+        crate::ipc::port::SendDirectResult::Full => {
+            match crate::ipc::port::send(dest_port as u32, msg) {
+                Ok(()) => 0,
+                Err(()) => u64::MAX,
+            }
+        }
+        crate::ipc::port::SendDirectResult::Error => u64::MAX,
+    }
+}
+
+/// Revoke all derived capabilities from a cap slot.
+/// Returns the number of capabilities revoked, or u64::MAX on error.
+fn sys_cap_revoke(port_id: u64) -> u64 {
+    let task_id = crate::sched::current_task_id();
+    if task_id == 0 { return u64::MAX; }
+
+    let mut caps = crate::cap::CAP_SYSTEM.lock();
+    // Find the slot containing a cap for this port.
+    let slot = match caps.spaces[task_id as usize].find_port_cap(
+        port_id as usize,
+        crate::cap::Rights::MANAGE,
+    ) {
+        Some(s) => s,
+        None => return u64::MAX,
+    };
+    // Need to split the borrow: get cdt pointer first.
+    let cdt = &mut caps.cdt as *mut crate::cap::Cdt;
+    let count = caps.spaces[task_id as usize].revoke(slot, unsafe { &mut *cdt });
+    count as u64
 }
 
 /// Copy `dst.len()` bytes from user virtual address `user_va` into `dst`,

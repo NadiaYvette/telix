@@ -1418,6 +1418,71 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 24: Capability Transfer via IPC ---
+    syscall::debug_puts(b"  init: testing cap transfer via IPC...\n");
+    {
+        // Create a notification port that child will listen on.
+        let port_notify = syscall::port_create() as u32;
+
+        let pid = syscall::fork();
+        if pid == 0 {
+            // Child: create our own port and tell parent about it.
+            let port_child = syscall::port_create() as u32;
+            syscall::send(port_notify, 0xAA, port_child as u64, 0, 0, 0);
+
+            // Recv on our port — parent will send_cap granting us SEND on a new port.
+            if let Some(msg) = syscall::recv_msg(port_child) {
+                let granted_port = msg.data[3] as u32; // data[3] = granted port ID
+                // Try to send on the granted port — this should work if cap transfer succeeded.
+                syscall::send(granted_port, 0xBB, 0xCAFE, 0, 0, 0);
+                syscall::exit(77); // success
+            }
+            syscall::exit(99); // failure
+        } else if pid > 0 {
+            // Parent: create a new port AFTER fork — child doesn't have caps for it.
+            let port_secret = syscall::port_create() as u32;
+
+            // Recv child's port_child ID.
+            if let Some(msg) = syscall::recv_msg(port_notify) {
+                let port_child = msg.data[0] as u32;
+
+                // Transfer SEND cap for port_secret to child via port_child.
+                // Rights: 1 = SEND
+                syscall::send_cap(port_child, 0xCC, 0, 0, port_secret, 1);
+
+                // Now recv on port_secret — child should be able to send here.
+                let mut cap_ok = false;
+                for _ in 0..2000 {
+                    if let Some(msg2) = syscall::recv_nb_msg(port_secret) {
+                        if msg2.tag == 0xBB && msg2.data[0] == 0xCAFE {
+                            cap_ok = true;
+                        }
+                        break;
+                    }
+                    syscall::yield_now();
+                }
+
+                // Wait for child to exit.
+                let mut child_ok = false;
+                for _ in 0..1000 {
+                    if let Some(code) = syscall::waitpid(pid) {
+                        child_ok = code == 77;
+                        break;
+                    }
+                    syscall::yield_now();
+                }
+
+                if cap_ok && child_ok {
+                    syscall::debug_puts(b"Phase 28 cap transfer via IPC: PASSED\n");
+                } else {
+                    syscall::debug_puts(b"Phase 28 cap transfer via IPC: FAILED\n");
+                }
+            }
+            syscall::port_destroy(port_secret);
+        }
+        syscall::port_destroy(port_notify);
+    }
+
     // --- Test 21: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

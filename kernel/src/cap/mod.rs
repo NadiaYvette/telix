@@ -115,11 +115,38 @@ impl CapSystem {
         result
     }
 
+    /// Grant a port cap with arbitrary rights to a task.
+    pub fn grant_port_cap(&mut self, task_id: u32, port_id: u32, rights: Rights) -> Option<usize> {
+        // Skip if already has a cap with these rights.
+        if self.spaces[task_id as usize].find_port_cap(port_id as usize, rights).is_some() {
+            return Some(0);
+        }
+        let cap = Capability::new(CapType::Port, rights, port_id as usize);
+        let result = self.spaces[task_id as usize].insert(cap, &mut self.cdt);
+        if result.is_some() {
+            bitmap_grant(task_id, port_id, rights);
+        }
+        result
+    }
+
     /// Remove all caps for a port from a task, and clear bitmaps.
     pub fn remove_port_caps(&mut self, task_id: u32, port_id: u32) {
         self.spaces[task_id as usize].remove_port_caps(port_id as usize);
         bitmap_remove_port(task_id, port_id);
     }
+}
+
+/// Find the first task (other than `exclude_task`) that has RECV cap for `port_id`.
+pub fn find_recv_task(port_id: u32, exclude_task: u32) -> Option<u32> {
+    if port_id as usize >= 64 { return None; }
+    let mask = 1u64 << port_id;
+    for task_id in 0..MAX_TASKS as u32 {
+        if task_id == exclude_task { continue; }
+        if CAP_RECV[task_id as usize].load(Ordering::Relaxed) & mask != 0 {
+            return Some(task_id);
+        }
+    }
+    None
 }
 
 pub static CAP_SYSTEM: SpinLock<CapSystem> = SpinLock::new(CapSystem::new());
