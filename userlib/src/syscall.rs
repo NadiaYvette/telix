@@ -34,6 +34,8 @@ const SYS_FUTEX_WAIT: u64 = 32;
 const SYS_FUTEX_WAKE: u64 = 33;
 const SYS_KILL: u64 = 34;
 const SYS_GETPID: u64 = 35;
+const SYS_GET_CYCLES: u64 = 36;
+const SYS_GET_TIMER_FREQ: u64 = 37;
 const SYS_PORT_SET_CREATE: u64 = 5;
 const SYS_PORT_SET_ADD: u64 = 6;
 #[allow(dead_code)]
@@ -190,6 +192,16 @@ pub fn kill(tid: u32) -> bool {
 /// Get the current process (task) ID.
 pub fn getpid() -> u32 {
     unsafe { arch::syscall0(SYS_GETPID) as u32 }
+}
+
+/// Read the hardware cycle/timer counter.
+pub fn get_cycles() -> u64 {
+    unsafe { arch::syscall0(SYS_GET_CYCLES) }
+}
+
+/// Get the timer frequency in Hz.
+pub fn get_timer_freq() -> u64 {
+    unsafe { arch::syscall0(SYS_GET_TIMER_FREQ) }
 }
 
 /// Get the userspace initramfs server's port ID.

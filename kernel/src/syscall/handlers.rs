@@ -49,6 +49,8 @@ pub const SYS_FUTEX_WAIT: u64 = 32;
 pub const SYS_FUTEX_WAKE: u64 = 33;
 pub const SYS_KILL: u64 = 34;
 pub const SYS_GETPID: u64 = 35;
+pub const SYS_GET_CYCLES: u64 = 36;
+pub const SYS_GET_TIMER_FREQ: u64 = 37;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -167,6 +169,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_FUTEX_WAKE => crate::sync::futex::futex_wake(a0 as usize, a1 as u32),
         SYS_KILL => sys_kill(a0),
         SYS_GETPID => sys_getpid(),
+        SYS_GET_CYCLES => sys_get_cycles(),
+        SYS_GET_TIMER_FREQ => sys_get_timer_freq(),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -297,6 +301,24 @@ fn sys_kill(tid: u64) -> u64 {
 
 fn sys_getpid() -> u64 {
     crate::sched::scheduler::current_task_id() as u64
+}
+
+fn sys_get_cycles() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    { crate::arch::aarch64::timer::counter() }
+    #[cfg(target_arch = "riscv64")]
+    { crate::arch::riscv64::trap::read_time() }
+    #[cfg(target_arch = "x86_64")]
+    { crate::arch::x86_64::timer::rdtsc() }
+}
+
+fn sys_get_timer_freq() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    { crate::arch::aarch64::timer::cntfrq() }
+    #[cfg(target_arch = "riscv64")]
+    { 10_000_000 } // QEMU virt timebase
+    #[cfg(target_arch = "x86_64")]
+    { 1_000_000_000 } // approximate RDTSC freq on QEMU
 }
 
 fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64, arg0: u64) -> u64 {

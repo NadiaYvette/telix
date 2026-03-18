@@ -8,7 +8,7 @@ static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 static TIMER_INTERVAL: AtomicU64 = AtomicU64::new(0);
 
 /// Read the counter frequency (ticks per second).
-fn cntfrq() -> u64 {
+pub fn cntfrq() -> u64 {
     let freq: u64;
     unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq) };
     freq

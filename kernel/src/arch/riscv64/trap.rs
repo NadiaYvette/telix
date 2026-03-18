@@ -36,7 +36,7 @@ const SBI_EXT_TIME: u64 = 0x54494D45;
 const SBI_FUN_SET_TIMER: u64 = 0;
 
 /// Read the `time` CSR (or rdtime pseudo-instruction).
-fn read_time() -> u64 {
+pub fn read_time() -> u64 {
     let val: u64;
     unsafe { core::arch::asm!("rdtime {}", out(reg) val) };
     val

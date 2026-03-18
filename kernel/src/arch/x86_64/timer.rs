@@ -49,6 +49,14 @@ pub fn handle_timer_irq() {
     // if ticks % 100 == 0 { crate::println!("[tick {}]", ticks); }
 }
 
+/// Read the Time Stamp Counter (RDTSC).
+pub fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
 /// Enable interrupts (STI).
 pub fn enable_interrupts() {
     unsafe {

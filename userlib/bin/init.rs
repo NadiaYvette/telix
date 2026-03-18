@@ -1163,6 +1163,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 21: Benchmark Suite ---
+    syscall::debug_puts(b"  init: running benchmark suite...\n");
+    {
+        let bench_tid = syscall::spawn(b"bench", 50);
+        if bench_tid != u64::MAX {
+            loop {
+                if let Some(_code) = syscall::waitpid(bench_tid) {
+                    break;
+                }
+                syscall::yield_now();
+            }
+            syscall::debug_puts(b"Phase 21 benchmarks: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 21 benchmarks: FAILED (spawn)\n");
+        }
+    }
+
     // Init loops forever, yielding.
     loop {
         syscall::yield_now();

@@ -54,3 +54,11 @@ path = "bin/pipe_upper.rs"
 [[bin]]
 name = "spin"
 path = "bin/spin.rs"
+
+[[bin]]
+name = "bench"
+path = "bin/bench.rs"
+
+[[bin]]
+name = "pong"
+path = "bin/pong.rs"
