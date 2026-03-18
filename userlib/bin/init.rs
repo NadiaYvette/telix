@@ -989,6 +989,45 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 18: Futex/Mutex ---
+    {
+        // Reset shared state.
+        unsafe { MUTEX_TEST_COUNTER = 0; }
+
+        let stack1 = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
+        let stack2 = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
+        if stack1 != 0 && stack2 != 0 {
+            let t1 = syscall::thread_create(
+                mutex_test_thread as u64,
+                (stack1 + 0x4000) as u64,
+                0,
+            );
+            let t2 = syscall::thread_create(
+                mutex_test_thread as u64,
+                (stack2 + 0x4000) as u64,
+                0,
+            );
+
+            if t1 != u64::MAX && t2 != u64::MAX {
+                syscall::thread_join(t1 as u32);
+                syscall::thread_join(t2 as u32);
+
+                let counter = unsafe { MUTEX_TEST_COUNTER };
+                if counter == 2000 {
+                    syscall::debug_puts(b"Phase 18 futex/mutex: PASSED\n");
+                } else {
+                    syscall::debug_puts(b"Phase 18 futex/mutex: FAILED (count=");
+                    print_num(counter);
+                    syscall::debug_puts(b")\n");
+                }
+            } else {
+                syscall::debug_puts(b"Phase 18 futex/mutex: FAILED (create)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 18 futex/mutex: FAILED (stack alloc)\n");
+        }
+    }
+
     // Init loops forever, yielding.
     loop {
         syscall::yield_now();
@@ -996,10 +1035,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 }
 
 /// Child thread entry point for Phase 17 test.
-/// Writes 0xCAFE to shared memory (passed as arg), then exits with code 42.
 #[unsafe(no_mangle)]
 extern "C" fn thread_child_entry(arg: u64) {
     let ptr = arg as *mut u64;
     unsafe { core::ptr::write_volatile(ptr, 0xCAFE); }
     syscall::exit(42);
+}
+
+static TEST_MUTEX: userlib::sync::Mutex = userlib::sync::Mutex::new();
+static mut MUTEX_TEST_COUNTER: u64 = 0;
+
+/// Phase 18 mutex test thread. Increments shared counter 1000 times under mutex.
+#[unsafe(no_mangle)]
+extern "C" fn mutex_test_thread(_arg: u64) {
+    for _ in 0..1000 {
+        TEST_MUTEX.lock();
+        unsafe { MUTEX_TEST_COUNTER += 1; }
+        TEST_MUTEX.unlock();
+    }
+    syscall::exit(0);
 }

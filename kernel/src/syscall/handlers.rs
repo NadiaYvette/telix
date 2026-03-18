@@ -45,6 +45,8 @@ pub const SYS_IOPORT: u64 = 28;
 pub const SYS_SPAWN_ELF: u64 = 29;
 pub const SYS_THREAD_CREATE: u64 = 30;
 pub const SYS_THREAD_JOIN: u64 = 31;
+pub const SYS_FUTEX_WAIT: u64 = 32;
+pub const SYS_FUTEX_WAKE: u64 = 33;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -159,6 +161,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SPAWN_ELF => sys_spawn_elf(a0, a1, a2, a3),
         SYS_THREAD_CREATE => sys_thread_create(a0, a1, a2),
         SYS_THREAD_JOIN => sys_thread_join(a0),
+        SYS_FUTEX_WAIT => crate::sync::futex::futex_wait(a0 as usize, a1 as u32),
+        SYS_FUTEX_WAKE => crate::sync::futex::futex_wake(a0 as usize, a1 as u32),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -683,7 +687,7 @@ fn sys_thread_join(tid: u64) -> u64 {
 
 /// Copy `dst.len()` bytes from user virtual address `user_va` into `dst`,
 /// using the page table at `pt_root` to translate addresses.
-fn copy_from_user(pt_root: usize, user_va: usize, dst: &mut [u8]) -> bool {
+pub(crate) fn copy_from_user(pt_root: usize, user_va: usize, dst: &mut [u8]) -> bool {
     if pt_root == 0 {
         // Kernel thread — direct access.
         unsafe {

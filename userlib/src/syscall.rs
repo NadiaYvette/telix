@@ -30,6 +30,8 @@ const SYS_IOPORT: u64 = 28;
 const SYS_SPAWN_ELF: u64 = 29;
 const SYS_THREAD_CREATE: u64 = 30;
 const SYS_THREAD_JOIN: u64 = 31;
+const SYS_FUTEX_WAIT: u64 = 32;
+const SYS_FUTEX_WAKE: u64 = 33;
 const SYS_PORT_SET_CREATE: u64 = 5;
 const SYS_PORT_SET_ADD: u64 = 6;
 #[allow(dead_code)]
@@ -161,6 +163,16 @@ pub fn thread_join(tid: u32) -> i64 {
         }
         yield_now();
     }
+}
+
+/// Block if the u32 at `addr` equals `expected`. Returns 0 on wake, 1 on value mismatch.
+pub fn futex_wait(addr: *const u32, expected: u32) -> u64 {
+    unsafe { arch::syscall2(SYS_FUTEX_WAIT, addr as u64, expected as u64) }
+}
+
+/// Wake up to `count` threads waiting on the futex at `addr`. Returns number woken.
+pub fn futex_wake(addr: *const u32, count: u32) -> u64 {
+    unsafe { arch::syscall2(SYS_FUTEX_WAKE, addr as u64, count as u64) }
 }
 
 /// Get the userspace initramfs server's port ID.
