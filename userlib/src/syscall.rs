@@ -463,6 +463,14 @@ pub fn ioport_outl(port: u16, val: u32) {
     unsafe { arch::syscall3(SYS_IOPORT, 5, port as u64, val as u64); }
 }
 
+const SYS_SET_QUOTA: u64 = 38;
+
+/// Set a resource quota on a child task.
+/// resource_type: 0=ports, 1=threads, 2=pages. Returns true on success.
+pub fn set_quota(child_task: u32, resource_type: u32, limit: u32) -> bool {
+    unsafe { arch::syscall3(SYS_SET_QUOTA, child_task as u64, resource_type as u64, limit as u64) == 0 }
+}
+
 /// Register a service with the name server.
 pub fn ns_register(name: &[u8], service_port: u32) -> bool {
     let nsrv = nsrv_port();

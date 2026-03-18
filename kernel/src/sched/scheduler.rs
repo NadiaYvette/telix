@@ -73,9 +73,9 @@ impl RunQueue {
     }
 }
 
-struct Scheduler {
+pub struct Scheduler {
     threads: [Thread; MAX_THREADS],
-    tasks: [Task; MAX_TASKS],
+    pub tasks: [Task; MAX_TASKS],
     run_queues: [RunQueue; NUM_PRIORITIES],
     next_thread_id: ThreadId,
     next_task_id: u32,
@@ -125,6 +125,7 @@ impl Scheduler {
         thread.base_priority = 255;
         thread.effective_priority = 255; // lowest
         THREAD_PRIO[id as usize].store(255, Ordering::Relaxed);
+        THREAD_TASK[id as usize].store(0, Ordering::Relaxed);
         thread.quantum = u32::MAX;
         thread.default_quantum = u32::MAX;
         // saved_sp will be set on first preemption
@@ -228,6 +229,9 @@ impl Scheduler {
             }
         }
 
+        // Clear killed flag from any previous occupant of this slot.
+        KILLED[id as usize].store(false, Ordering::Release);
+
         let thread = &mut self.threads[id as usize];
         thread.id = id;
         thread.state = ThreadState::Ready;
@@ -291,6 +295,32 @@ impl Scheduler {
         // Record the parent task (caller's task) for waitpid.
         let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
         task.parent_task = self.threads[caller_tid as usize].task_id;
+
+        // Bootstrap capabilities: grant SEND caps for well-known kernel ports,
+        // and full cap for arg0 if it's a valid active port (port passing on spawn).
+        {
+            let mut caps = crate::cap::CAP_SYSTEM.lock();
+            caps.spaces[task_id as usize] = crate::cap::CapSpace::new(task_id);
+
+            let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
+            if nsrv != u32::MAX {
+                caps.grant_send_cap(task_id, nsrv);
+            }
+
+            let iramfs = crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
+            if iramfs != u32::MAX {
+                caps.grant_send_cap(task_id, iramfs);
+            }
+
+            // If arg0 looks like a valid nonzero port, grant full cap for it.
+            // This enables the common pattern of parent creating a port and
+            // passing it to a child process. Skip arg0=0 (default/no arg).
+            if arg0 > 0 && (arg0 as usize) < crate::ipc::port::MAX_PORTS {
+                if crate::ipc::port::port_is_active(arg0 as u32) {
+                    caps.grant_full_port_cap(task_id, arg0 as u32);
+                }
+            }
+        }
 
         // Load ELF segments into the address space.
         let entry = match crate::loader::elf::load_elf(elf_data, aspace_id, pt_root) {
@@ -427,6 +457,9 @@ impl Scheduler {
         // Allocate thread (may reuse a Dead slot).
         let id = self.alloc_thread_id()?;
 
+        // Clear killed flag from any previous occupant of this slot.
+        KILLED[id as usize].store(false, Ordering::Release);
+
         let thread = &mut self.threads[id as usize];
         thread.id = id;
         thread.state = ThreadState::Ready;
@@ -434,6 +467,7 @@ impl Scheduler {
         thread.base_priority = priority;
         thread.effective_priority = priority;
         THREAD_PRIO[id as usize].store(priority, Ordering::Relaxed);
+        THREAD_TASK[id as usize].store(task_id, Ordering::Relaxed);
         thread.quantum = quantum;
         thread.default_quantum = quantum;
         thread.saved_sp = frame_sp as u64;
@@ -505,6 +539,9 @@ impl Scheduler {
 
         let id = self.alloc_thread_id()?;
 
+        // Clear killed flag from any previous occupant of this slot.
+        KILLED[id as usize].store(false, Ordering::Release);
+
         let thread = &mut self.threads[id as usize];
         thread.id = id;
         thread.state = ThreadState::Ready;
@@ -512,6 +549,7 @@ impl Scheduler {
         thread.base_priority = priority;
         thread.effective_priority = priority;
         THREAD_PRIO[id as usize].store(priority, Ordering::Relaxed);
+        THREAD_TASK[id as usize].store(task_id, Ordering::Relaxed);
         thread.quantum = quantum;
         thread.default_quantum = quantum;
         thread.saved_sp = frame_sp as u64;
@@ -740,7 +778,7 @@ impl Scheduler {
     }
 }
 
-static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
+pub static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 
 pub fn init() {
     let mut sched = SCHEDULER.lock();
@@ -760,6 +798,11 @@ pub fn init_ap(cpu: u32) {
     };
     smp::init_ap(cpu, idle_id);
     crate::println!("  CPU {} scheduler ready (idle thread {})", cpu, idle_id);
+}
+
+/// Get the task ID for a given thread.
+pub fn thread_task_id(tid: ThreadId) -> u32 {
+    SCHEDULER.lock().threads[tid as usize].task_id
 }
 
 pub fn spawn(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
@@ -822,8 +865,7 @@ pub fn thread_join_poll(tid: ThreadId, caller_task: u32) -> Option<i32> {
 #[allow(dead_code)]
 pub fn current_task_id() -> TaskId {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let sched = SCHEDULER.lock();
-    sched.threads[tid as usize].task_id
+    THREAD_TASK[tid as usize].load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Get the page table root of the current thread's task.
@@ -861,6 +903,13 @@ static WAKEUP_FLAGS: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS
 /// Updated by boost_priority/reset_priority and thread creation.
 static THREAD_PRIO: [core::sync::atomic::AtomicU8; super::thread::MAX_THREADS] = {
     const INIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(255);
+    [INIT; super::thread::MAX_THREADS]
+};
+
+/// Per-thread task_id, readable without the scheduler lock.
+/// Updated on thread creation.
+static THREAD_TASK: [core::sync::atomic::AtomicU32; super::thread::MAX_THREADS] = {
+    const INIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     [INIT; super::thread::MAX_THREADS]
 };
 

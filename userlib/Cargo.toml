@@ -70,3 +70,11 @@ path = "bin/grant_echo.rs"
 [[bin]]
 name = "macro_bench"
 path = "bin/macro_bench.rs"
+
+[[bin]]
+name = "cap_test"
+path = "bin/cap_test.rs"
+
+[[bin]]
+name = "cache_srv"
+path = "bin/cache_srv.rs"

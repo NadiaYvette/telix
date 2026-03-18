@@ -87,6 +87,35 @@ impl CapSpace {
         0
     }
 
+    /// Find a Port capability for the given port_id with at least `needed` rights.
+    /// Returns the slot index, or None if not found.
+    pub fn find_port_cap(&self, port_id: usize, needed: Rights) -> Option<usize> {
+        for i in 0..CNODE_SLOTS {
+            if let Some(cap) = self.root.get(i) {
+                if cap.cap_type as u8 == super::capability::CapType::Port as u8
+                    && cap.object == port_id
+                    && cap.rights.contains(needed)
+                {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Remove all capabilities referencing the given port_id.
+    pub fn remove_port_caps(&mut self, port_id: usize) {
+        for i in 0..CNODE_SLOTS {
+            if let Some(cap) = self.root.get(i) {
+                if cap.cap_type as u8 == super::capability::CapType::Port as u8
+                    && cap.object == port_id
+                {
+                    self.root.insert(i, super::capability::Capability::null());
+                }
+            }
+        }
+    }
+
     /// Look up a capability by slot index.
     pub fn lookup(&self, slot: usize) -> Option<&Capability> {
         let cap = self.root.get(slot)?;

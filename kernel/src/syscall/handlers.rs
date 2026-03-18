@@ -51,6 +51,10 @@ pub const SYS_KILL: u64 = 34;
 pub const SYS_GETPID: u64 = 35;
 pub const SYS_GET_CYCLES: u64 = 36;
 pub const SYS_GET_TIMER_FREQ: u64 = 37;
+pub const SYS_SET_QUOTA: u64 = 38;
+
+/// Error code: capability check failed.
+const ECAP: u64 = 2;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -171,6 +175,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_GETPID => sys_getpid(),
         SYS_GET_CYCLES => sys_get_cycles(),
         SYS_GET_TIMER_FREQ => sys_get_timer_freq(),
+        SYS_SET_QUOTA => sys_set_quota(a0, a1, a2),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -186,24 +191,129 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
     }
 }
 
+/// Check if the current task has a port capability with the needed rights.
+/// Uses lockless bitmap for SEND/RECV checks (fast path).
+/// Falls back to CAP_SYSTEM lock for MANAGE checks.
+/// Task 0 (kernel) bypasses all checks.
+#[inline]
+fn check_port_cap(port_id: u32, needed: crate::cap::Rights) -> bool {
+    let task_id = crate::sched::current_task_id();
+    if task_id == 0 { return true; }
+    // Fast path: SEND and RECV are tracked in lockless bitmaps.
+    if !crate::cap::has_port_cap_fast(task_id, port_id, needed) {
+        return false;
+    }
+    // MANAGE requires the slow path (rare — only port_destroy).
+    if needed.contains(crate::cap::Rights::MANAGE) {
+        let caps = crate::cap::CAP_SYSTEM.lock();
+        return caps.spaces[task_id as usize].find_port_cap(port_id as usize, needed).is_some();
+    }
+    true
+}
+
+/// Auto-grant SEND caps for active port IDs found in message data words
+/// to the receiving task. Only checks high-32 and low-32 of each word,
+/// plus bits 16-47 (for protocols that pack port IDs at offset 16).
+fn auto_grant_reply_caps(task_id: u32, msg: &crate::ipc::Message) {
+    if task_id == 0 { return; }
+    let max = crate::ipc::port::MAX_PORTS as u32;
+    // Collect unique candidate port IDs that we don't already have SEND caps for.
+    let mut candidates = [u32::MAX; 18];
+    let mut count = 0usize;
+    for i in 0..6 {
+        let word = msg.data[i];
+        for shift in [0u32, 16, 32] {
+            let val = (word >> shift) as u32;
+            if val > 0 && val < max {
+                // Fast bitmap check — skip if we already have SEND cap.
+                if crate::cap::has_port_cap_fast(task_id, val, crate::cap::Rights::SEND) {
+                    continue;
+                }
+                let mut dup = false;
+                for j in 0..count {
+                    if candidates[j] == val { dup = true; break; }
+                }
+                if !dup && count < 18 {
+                    candidates[count] = val;
+                    count += 1;
+                }
+            }
+        }
+    }
+    if count == 0 { return; }
+    // Filter by port_is_active BEFORE locking CAP_SYSTEM (lock ordering).
+    let mut active_count = 0usize;
+    for i in 0..count {
+        if crate::ipc::port::port_is_active(candidates[i]) {
+            candidates[active_count] = candidates[i];
+            active_count += 1;
+        }
+    }
+    if active_count == 0 { return; }
+    let mut caps = crate::cap::CAP_SYSTEM.lock();
+    for i in 0..active_count {
+        caps.grant_send_cap(task_id, candidates[i]);
+    }
+}
+
 fn sys_debug_putchar(ch: u64) -> u64 {
     crate::arch::platform::serial::putc(ch as u8);
     0
 }
 
 fn sys_port_create() -> u64 {
+    let task_id = crate::sched::current_task_id();
+    // Check resource quota.
+    if task_id != 0 {
+        let sched = crate::sched::scheduler::SCHEDULER.lock();
+        let task = &sched.tasks[task_id as usize];
+        if task.cur_ports >= task.max_ports {
+            return u64::MAX;
+        }
+        drop(sched);
+    }
     match crate::ipc::port::create() {
-        Some(id) => id as u64,
+        Some(id) => {
+            // Grant full port cap (SEND|RECV|MANAGE) to creator.
+            if task_id != 0 {
+                let mut caps = crate::cap::CAP_SYSTEM.lock();
+                caps.grant_full_port_cap(task_id, id);
+            }
+            // Increment port quota counter.
+            if task_id != 0 {
+                let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+                sched.tasks[task_id as usize].cur_ports += 1;
+            }
+            id as u64
+        }
         None => u64::MAX,
     }
 }
 
 fn sys_port_destroy(port_id: u64) -> u64 {
+    if !check_port_cap(port_id as u32, crate::cap::Rights::MANAGE) {
+        return ECAP;
+    }
     crate::ipc::port::destroy(port_id as u32);
+    // Remove port caps from caller's CSpace.
+    let task_id = crate::sched::current_task_id();
+    if task_id != 0 {
+        let mut caps = crate::cap::CAP_SYSTEM.lock();
+        caps.remove_port_caps(task_id, port_id as u32);
+        drop(caps);
+        // Decrement port quota counter.
+        let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+        if sched.tasks[task_id as usize].cur_ports > 0 {
+            sched.tasks[task_id as usize].cur_ports -= 1;
+        }
+    }
     0
 }
 
 fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
+    if !check_port_cap(port_id as u32, crate::cap::Rights::SEND) {
+        return ECAP;
+    }
     let mut msg = crate::ipc::Message::new(tag, data);
     // Stamp sender's effective priority into data[5] for priority inheritance.
     let tid = crate::sched::current_thread_id();
@@ -215,6 +325,9 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
 }
 
 fn sys_send_nb(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
+    if !check_port_cap(port_id as u32, crate::cap::Rights::SEND) {
+        return ECAP;
+    }
     let mut msg = crate::ipc::Message::new(tag, data);
     // Stamp sender's effective priority into data[5] for priority inheritance.
     let tid = crate::sched::current_thread_id();
@@ -226,8 +339,14 @@ fn sys_send_nb(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
 }
 
 fn sys_recv(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
+    if !check_port_cap(port_id as u32, crate::cap::Rights::RECV) {
+        return ECAP;
+    }
     match crate::ipc::port::recv(port_id as u32) {
         Ok(msg) => {
+            // Auto-grant SEND caps for reply port IDs in message data.
+            let task_id = crate::sched::current_task_id();
+            auto_grant_reply_caps(task_id, &msg);
             set_reg(frame, 1, msg.tag);
             set_reg(frame, 2, msg.data[0]);
             set_reg(frame, 3, msg.data[1]);
@@ -242,8 +361,13 @@ fn sys_recv(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
 }
 
 fn sys_recv_nb(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
+    if !check_port_cap(port_id as u32, crate::cap::Rights::RECV) {
+        return ECAP;
+    }
     match crate::ipc::port::recv_nb(port_id as u32) {
         Ok(msg) => {
+            let task_id = crate::sched::current_task_id();
+            auto_grant_reply_caps(task_id, &msg);
             set_reg(frame, 1, msg.tag);
             set_reg(frame, 2, msg.data[0]);
             set_reg(frame, 3, msg.data[1]);
@@ -265,6 +389,9 @@ fn sys_port_set_create() -> u64 {
 }
 
 fn sys_port_set_add(set_id: u64, port_id: u64) -> u64 {
+    if !check_port_cap(port_id as u32, crate::cap::Rights::RECV) {
+        return ECAP;
+    }
     if crate::ipc::port_set::add_port(set_id as u32, port_id as u32) {
         0
     } else {
@@ -365,6 +492,17 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64) -> u64 {
         return u64::MAX;
     }
 
+    // Check page quota.
+    let task_id = crate::sched::current_task_id();
+    if task_id != 0 {
+        let sched = crate::sched::scheduler::SCHEDULER.lock();
+        let task = &sched.tasks[task_id as usize];
+        if task.cur_pages + pages as u32 > task.max_pages {
+            return u64::MAX;
+        }
+        drop(sched);
+    }
+
     let prot = match prot {
         0 => VmaProt::ReadOnly,
         1 => VmaProt::ReadWrite,
@@ -456,6 +594,12 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64) -> u64 {
         });
     }
 
+    // Increment page quota counter.
+    if task_id != 0 {
+        let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+        sched.tasks[task_id as usize].cur_pages += pages as u32;
+    }
+
     va as u64
 }
 
@@ -507,7 +651,8 @@ fn sys_get_initramfs_port() -> u64 {
 fn sys_port_set_recv(set_id: u64, frame: &mut ExceptionFrame) -> u64 {
     match crate::ipc::port_set::recv_blocking(set_id as u32) {
         Some((port_id, msg)) => {
-            // Pack port_id into high 32 bits of status register.
+            let task_id = crate::sched::current_task_id();
+            auto_grant_reply_caps(task_id, &msg);
             set_reg(frame, 1, msg.tag);
             set_reg(frame, 2, msg.data[0]);
             set_reg(frame, 3, msg.data[1]);
@@ -710,6 +855,15 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
 
 fn sys_thread_create(entry: u64, stack_top: u64, arg: u64) -> u64 {
     let task_id = crate::sched::scheduler::current_task_id();
+    // Check thread quota.
+    if task_id != 0 {
+        let sched = crate::sched::scheduler::SCHEDULER.lock();
+        let task = &sched.tasks[task_id as usize];
+        if task.thread_count >= task.max_threads {
+            return u64::MAX;
+        }
+        drop(sched);
+    }
     match crate::sched::thread_create(task_id, entry, stack_top, arg) {
         Some(child_tid) => child_tid as u64,
         None => u64::MAX,
@@ -723,6 +877,28 @@ fn sys_thread_join(tid: u64) -> u64 {
         Some(exit_code) => exit_code as u64,
         None => u64::MAX,
     }
+}
+
+fn sys_set_quota(child_tid: u64, resource_type: u64, limit: u64) -> u64 {
+    let caller = crate::sched::current_task_id();
+    // Resolve thread_id to task_id.
+    let child_task = crate::sched::thread_task_id(child_tid as u32);
+    if child_task as usize >= crate::sched::task::MAX_TASKS {
+        return u64::MAX;
+    }
+    let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+    let task = &sched.tasks[child_task as usize];
+    if !task.active || task.parent_task != caller {
+        return u64::MAX; // Only parent can set quotas.
+    }
+    let limit32 = limit as u32;
+    match resource_type {
+        0 => sched.tasks[child_task as usize].max_ports = limit32,
+        1 => sched.tasks[child_task as usize].max_threads = limit32,
+        2 => sched.tasks[child_task as usize].max_pages = limit32,
+        _ => return u64::MAX,
+    }
+    0
 }
 
 /// Copy `dst.len()` bytes from user virtual address `user_va` into `dst`,

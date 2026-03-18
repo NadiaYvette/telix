@@ -111,6 +111,15 @@ pub fn namesrv_server() -> ! {
                 let name = &name_buf[..name_len.min(MAX_SVC_NAME)];
 
                 let port_id = table.lookup(name).unwrap_or(u32::MAX);
+
+                // Grant SEND cap for the looked-up service port to the client task.
+                if port_id != u32::MAX {
+                    if let Some(client_task) = port::port_creator(reply_port) {
+                        let mut caps = crate::cap::CAP_SYSTEM.lock();
+                        caps.grant_send_cap(client_task, port_id);
+                    }
+                }
+
                 let _ = port::send_nb(reply_port, Message::new(NS_LOOKUP_OK, [port_id as u64, 0, 0, 0, 0, 0]));
             }
 

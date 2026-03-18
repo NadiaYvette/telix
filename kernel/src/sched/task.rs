@@ -26,6 +26,12 @@ pub struct Task {
     pub exited: bool,
     /// Number of live threads in this task.
     pub thread_count: u32,
+    // --- Resource quotas ---
+    pub max_ports: u32,
+    pub max_threads: u32,
+    pub max_pages: u32,
+    pub cur_ports: u32,
+    pub cur_pages: u32,
 }
 
 impl Task {
@@ -39,6 +45,11 @@ impl Task {
             parent_task: 0,
             exited: false,
             thread_count: 0,
+            max_ports: 16,
+            max_threads: 8,
+            max_pages: 256,
+            cur_ports: 0,
+            cur_pages: 0,
         }
     }
 }

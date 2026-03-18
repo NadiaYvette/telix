@@ -1163,6 +1163,145 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 23: Capability Enforcement + Resource Quotas ---
+    syscall::debug_puts(b"  init: running capability test...\n");
+    {
+        // Register a test service for ns_lookup cap brokering test.
+        let svc_port = syscall::port_create() as u32;
+        syscall::ns_register(b"cap_svc", svc_port);
+
+        // Spawn cap_test (no special arg0 needed).
+        let ct_tid = syscall::spawn(b"cap_test", 50);
+        if ct_tid != u64::MAX {
+            // Set child's port quota to 2 (kernel resolves tid -> task_id).
+            syscall::set_quota(ct_tid as u32, 0, 2); // max 2 ports
+
+            loop {
+                if let Some(code) = syscall::waitpid(ct_tid) {
+                    if code == 0 {
+                        syscall::debug_puts(b"Phase 24 capabilities: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 24 capabilities: FAILED (exit code)\n");
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+        } else {
+            syscall::debug_puts(b"Phase 24 capabilities: FAILED (spawn)\n");
+        }
+
+        syscall::port_destroy(svc_port);
+    }
+
+    // --- Test 25: Cache Server ---
+    syscall::debug_puts(b"  init: testing cache server...\n");
+    {
+        let mut cache_ok = false;
+
+        // Look up cache_blk with retry.
+        let mut cache_port_opt = None;
+        for _ in 0..200 {
+            cache_port_opt = syscall::ns_lookup(b"cache_blk");
+            if cache_port_opt.is_some() { break; }
+            syscall::yield_now();
+        }
+
+        if let Some(cache_port) = cache_port_opt {
+            let cache_reply = syscall::port_create() as u32;
+
+            // IO_CONNECT to cache_srv.
+            let (n0, n1, _) = syscall::pack_name(b"cache_blk");
+            let d2 = 9u64 | ((cache_reply as u64) << 32);
+            syscall::send(cache_port, 0x100, n0, n1, d2, 0);
+
+            if let Some(cr) = syscall::recv_msg(cache_reply) {
+                if cr.tag == 0x101 {
+                    let cache_aspace = cr.data[2] as u32;
+
+                    // Allocate scratch page for grant-based reads.
+                    if let Some(scratch_va) = syscall::mmap_anon(0, 1, 1) {
+                        let grant_va: usize = 0x7_0000_0000;
+
+                        // Read 1: sector 0 (cache miss).
+                        if syscall::grant_pages(cache_aspace, scratch_va, grant_va, 1, false) {
+                            let rd2 = 512u64 | ((cache_reply as u64) << 32);
+                            syscall::send(cache_port, 0x200, 0, 0, rd2, grant_va as u64);
+
+                            if let Some(rr) = syscall::recv_msg(cache_reply) {
+                                if rr.tag == 0x201 && rr.data[0] == 512 {
+                                    // Save first 8 bytes of sector 0.
+                                    let mut first_read = [0u8; 8];
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            scratch_va as *const u8,
+                                            first_read.as_mut_ptr(),
+                                            8,
+                                        );
+                                    }
+
+                                    syscall::revoke(cache_aspace, grant_va);
+
+                                    // Read 2: sector 0 again (should be cache hit).
+                                    if syscall::grant_pages(cache_aspace, scratch_va, grant_va, 1, false) {
+                                        syscall::send(cache_port, 0x200, 0, 0, rd2, grant_va as u64);
+
+                                        if let Some(rr2) = syscall::recv_msg(cache_reply) {
+                                            if rr2.tag == 0x201 && rr2.data[0] == 512 {
+                                                let mut second_read = [0u8; 8];
+                                                unsafe {
+                                                    core::ptr::copy_nonoverlapping(
+                                                        scratch_va as *const u8,
+                                                        second_read.as_mut_ptr(),
+                                                        8,
+                                                    );
+                                                }
+
+                                                // Verify data matches.
+                                                if first_read == second_read {
+                                                    // Query cache stats.
+                                                    syscall::revoke(cache_aspace, grant_va);
+                                                    let sd0 = (cache_reply as u64) << 32;
+                                                    syscall::send(cache_port, 0xC100, sd0, 0, 0, 0);
+                                                    if let Some(sr) = syscall::recv_msg(cache_reply) {
+                                                        if sr.tag == 0xC101 && sr.data[0] > 0 {
+                                                            cache_ok = true;
+                                                            syscall::debug_puts(b"  init: cache hits=");
+                                                            print_num(sr.data[0]);
+                                                            syscall::debug_puts(b" misses=");
+                                                            print_num(sr.data[1]);
+                                                            syscall::debug_puts(b"\n");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Best-effort revoke for second grant.
+                                        syscall::revoke(cache_aspace, grant_va);
+                                    }
+                                } else {
+                                    syscall::revoke(cache_aspace, grant_va);
+                                }
+                            } else {
+                                syscall::revoke(cache_aspace, grant_va);
+                            }
+                        }
+
+                        syscall::munmap(scratch_va);
+                    }
+                }
+            }
+
+            syscall::port_destroy(cache_reply);
+        }
+
+        if cache_ok {
+            syscall::debug_puts(b"Phase 25 cache server: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 25 cache server: FAILED\n");
+        }
+    }
+
     // --- Test 21: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

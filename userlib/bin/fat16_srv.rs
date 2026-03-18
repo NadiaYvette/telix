@@ -352,15 +352,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(port as u64);
     syscall::debug_puts(b"\n");
 
-    // Look up blk_srv with retry.
+    // Look up cache_blk (cache server proxy) with retry.
     let blk_port = loop {
-        if let Some(p) = syscall::ns_lookup(b"blk") {
+        if let Some(p) = syscall::ns_lookup(b"cache_blk") {
             break p;
         }
         for _ in 0..50 { syscall::yield_now(); }
     };
 
-    syscall::debug_puts(b"  [fat16_srv] blk_srv on port ");
+    syscall::debug_puts(b"  [fat16_srv] cache_blk on port ");
     print_num(blk_port as u64);
     syscall::debug_puts(b"\n");
 

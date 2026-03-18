@@ -33,6 +33,8 @@ pub struct Port {
     send_waiter_count: usize,
     /// Port set this port belongs to (u32::MAX = none).
     pub port_set_id: u32,
+    /// Task that created this port.
+    pub creator_task: u32,
 }
 
 impl Port {
@@ -49,6 +51,7 @@ impl Port {
             send_waiters: [0; MAX_WAITERS],
             send_waiter_count: 0,
             port_set_id: u32::MAX,
+            creator_task: 0,
         }
     }
 
@@ -149,11 +152,13 @@ static PORT_TABLE: SpinLock<PortTable> = SpinLock::new(PortTable::new());
 
 /// Create a new port. Returns its ID.
 pub fn create() -> Option<PortId> {
+    let creator = crate::sched::current_task_id();
     let mut table = PORT_TABLE.lock();
     // First try the fast path: allocate from next_id.
     let id = table.next_id;
     if (id as usize) < MAX_PORTS {
         table.ports[id as usize] = Port::new(id);
+        table.ports[id as usize].creator_task = creator;
         table.next_id += 1;
         return Some(id);
     }
@@ -161,10 +166,21 @@ pub fn create() -> Option<PortId> {
     for i in 0..MAX_PORTS {
         if !table.ports[i].active {
             table.ports[i] = Port::new(i as u32);
+            table.ports[i].creator_task = creator;
             return Some(i as u32);
         }
     }
     None
+}
+
+/// Get the creator task of a port, or None if port is inactive.
+pub fn port_creator(port_id: PortId) -> Option<u32> {
+    let table = PORT_TABLE.lock();
+    if (port_id as usize) < MAX_PORTS && table.ports[port_id as usize].active {
+        Some(table.ports[port_id as usize].creator_task)
+    } else {
+        None
+    }
 }
 
 /// Send a message to a port (non-blocking).
@@ -300,6 +316,12 @@ pub fn set_port_set(port_id: PortId, set_id: u32) {
     if (port_id as usize) < MAX_PORTS {
         table.ports[port_id as usize].port_set_id = set_id;
     }
+}
+
+/// Check if a port is active (for auto-grant heuristics).
+pub fn port_is_active(port_id: PortId) -> bool {
+    let table = PORT_TABLE.lock();
+    (port_id as usize) < MAX_PORTS && table.ports[port_id as usize].active
 }
 
 /// Destroy a port.

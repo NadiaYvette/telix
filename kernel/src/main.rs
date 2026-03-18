@@ -63,7 +63,14 @@ pub fn kmain() -> ! {
     println!("Testing VMA tree...");
     mm::vmatree::run_tests();
 
-    // Capability system test.
+    // Initialize capability system.
+    {
+        let mut caps = cap::CAP_SYSTEM.lock();
+        caps.init();
+    }
+    println!("  Cap system initialized");
+
+    // Capability system test (validates CDT/CNode logic).
     test_capabilities();
 
     // Scheduler.
@@ -207,7 +214,14 @@ pub fn kmain() -> ! {
         match sched::spawn_user_with_data(
             b"initramfs_srv", 50, 20, cpio_data, 0x3_0000_0000, srv_port as u64,
         ) {
-            Some(tid) => println!("  initramfs_srv spawned (thread {}, port {})", tid, srv_port),
+            Some(tid) => {
+                // Grant SEND|RECV|MANAGE cap for the initramfs port to the new task.
+                let task_id = sched::thread_task_id(tid);
+                let mut caps = cap::CAP_SYSTEM.lock();
+                caps.grant_full_port_cap(task_id, srv_port);
+                drop(caps);
+                println!("  initramfs_srv spawned (thread {}, port {})", tid, srv_port);
+            }
             None => println!("  ERROR: failed to spawn initramfs_srv"),
         }
     }
@@ -218,7 +232,13 @@ pub fn kmain() -> ! {
         None => println!("  WARNING: console_srv not found (ok if not yet built)"),
     }
 
-    // Spawn FAT16 filesystem server (userspace, connects to blk_srv via IPC).
+    // Spawn cache server (userspace, block device caching proxy).
+    match sched::spawn_user(b"cache_srv", 50, 20, 0) {
+        Some(tid) => println!("  cache_srv spawned (thread {})", tid),
+        None => println!("  WARNING: cache_srv not found (ok if not yet built)"),
+    }
+
+    // Spawn FAT16 filesystem server (userspace, connects to cache_srv via IPC).
     match sched::spawn_user(b"fat16_srv", 50, 20, 0) {
         Some(tid) => println!("  fat16_srv spawned (thread {})", tid),
         None => println!("  WARNING: fat16_srv not found (ok if not yet built)"),
