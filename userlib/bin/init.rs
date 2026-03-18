@@ -1130,6 +1130,39 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"Phase 19 TCP echo: SKIPPED (no net)\n");
     }
 
+    // --- Test 20: Signal/Kill ---
+    syscall::debug_puts(b"  init: testing signal/kill...\n");
+    {
+        let spin_tid = syscall::spawn(b"spin", 50);
+        if spin_tid != u64::MAX {
+            // Let it run for a bit.
+            for _ in 0..50 { syscall::yield_now(); }
+
+            // Kill it.
+            let killed = syscall::kill(spin_tid as u32);
+            if killed {
+                // Wait for the task to exit.
+                let mut exited = false;
+                for _ in 0..1000 {
+                    if let Some(_code) = syscall::waitpid(spin_tid) {
+                        exited = true;
+                        break;
+                    }
+                    syscall::yield_now();
+                }
+                if exited {
+                    syscall::debug_puts(b"Phase 20 signal/kill: PASSED\n");
+                } else {
+                    syscall::debug_puts(b"Phase 20 signal/kill: FAILED (not exited)\n");
+                }
+            } else {
+                syscall::debug_puts(b"Phase 20 signal/kill: FAILED (kill returned false)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 20 signal/kill: FAILED (spawn)\n");
+        }
+    }
+
     // Init loops forever, yielding.
     loop {
         syscall::yield_now();

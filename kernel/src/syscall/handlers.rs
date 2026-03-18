@@ -47,6 +47,8 @@ pub const SYS_THREAD_CREATE: u64 = 30;
 pub const SYS_THREAD_JOIN: u64 = 31;
 pub const SYS_FUTEX_WAIT: u64 = 32;
 pub const SYS_FUTEX_WAKE: u64 = 33;
+pub const SYS_KILL: u64 = 34;
+pub const SYS_GETPID: u64 = 35;
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -163,6 +165,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_THREAD_JOIN => sys_thread_join(a0),
         SYS_FUTEX_WAIT => crate::sync::futex::futex_wait(a0 as usize, a1 as u32),
         SYS_FUTEX_WAKE => crate::sync::futex::futex_wake(a0 as usize, a1 as u32),
+        SYS_KILL => sys_kill(a0),
+        SYS_GETPID => sys_getpid(),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -170,6 +174,12 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
     };
 
     set_return(frame, result);
+
+    // Check if this thread was killed — terminate before returning to userspace.
+    let tid = crate::sched::scheduler::current_thread_id();
+    if crate::sched::scheduler::is_killed(tid) {
+        crate::sched::scheduler::exit_current_thread(-9);
+    }
 }
 
 fn sys_debug_putchar(ch: u64) -> u64 {
@@ -279,6 +289,14 @@ fn sys_waitpid(child_tid: u64) -> u64 {
         Some(code) => code as u64,
         None => u64::MAX,
     }
+}
+
+fn sys_kill(tid: u64) -> u64 {
+    if crate::sched::scheduler::kill_task(tid as u32) { 0 } else { u64::MAX }
+}
+
+fn sys_getpid() -> u64 {
+    crate::sched::scheduler::current_task_id() as u64
 }
 
 fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64, arg0: u64) -> u64 {

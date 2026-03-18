@@ -32,6 +32,8 @@ const SYS_THREAD_CREATE: u64 = 30;
 const SYS_THREAD_JOIN: u64 = 31;
 const SYS_FUTEX_WAIT: u64 = 32;
 const SYS_FUTEX_WAKE: u64 = 33;
+const SYS_KILL: u64 = 34;
+const SYS_GETPID: u64 = 35;
 const SYS_PORT_SET_CREATE: u64 = 5;
 const SYS_PORT_SET_ADD: u64 = 6;
 #[allow(dead_code)]
@@ -178,6 +180,16 @@ pub fn futex_wait(addr: *const u32, expected: u32) -> u64 {
 /// Wake up to `count` threads waiting on the futex at `addr`. Returns number woken.
 pub fn futex_wake(addr: *const u32, count: u32) -> u64 {
     unsafe { arch::syscall2(SYS_FUTEX_WAKE, addr as u64, count as u64) }
+}
+
+/// Kill all threads in the task that `tid` belongs to. Returns true on success.
+pub fn kill(tid: u32) -> bool {
+    unsafe { arch::syscall1(SYS_KILL, tid as u64) == 0 }
+}
+
+/// Get the current process (task) ID.
+pub fn getpid() -> u32 {
+    unsafe { arch::syscall0(SYS_GETPID) as u32 }
 }
 
 /// Get the userspace initramfs server's port ID.

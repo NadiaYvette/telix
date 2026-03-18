@@ -873,6 +873,13 @@ static YIELD_ASAP: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS] 
     [INIT; super::thread::MAX_THREADS]
 };
 
+/// Per-thread killed flag. When set, block_current() exits early and the
+/// syscall return path calls exit_current_thread(-9).
+static KILLED: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS] = {
+    const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    [INIT; super::thread::MAX_THREADS]
+};
+
 /// Set YIELD_ASAP for a thread, causing it to be preempted on the next timer tick.
 pub fn set_yield_asap(tid: ThreadId) {
     YIELD_ASAP[tid as usize].store(true, Ordering::Release);
@@ -907,6 +914,10 @@ pub fn block_current(_reason: BlockReason) {
     // a race where wake_thread() re-enqueues a Blocked thread that's still
     // executing on its CPU, causing double-scheduling on SMP.
     while !WAKEUP_FLAGS[tid as usize].load(Ordering::Acquire) {
+        // Check if this thread was killed — break out immediately.
+        if KILLED[tid as usize].load(Ordering::Acquire) {
+            break;
+        }
         // Use WFI to wait for the next interrupt (timer tick or device IRQ).
         // This is critical on QEMU TCG: spin_loop() keeps the vCPU busy,
         // starving QEMU's I/O thread from processing virtio requests.
@@ -922,6 +933,40 @@ pub fn wake_thread(tid: ThreadId) {
     WAKEUP_FLAGS[tid as usize].store(true, Ordering::Release);
     // Signal all CPUs so any core spinning in block_current's WFE wakes immediately.
     arch_send_event();
+}
+
+/// Check if a thread has been marked for kill.
+pub fn is_killed(tid: ThreadId) -> bool {
+    KILLED[tid as usize].load(Ordering::Acquire)
+}
+
+/// Kill all threads in the task that `tid` belongs to.
+/// Returns true if the thread was found and the kill signal was sent.
+pub fn kill_task(tid: ThreadId) -> bool {
+    if tid as usize >= MAX_THREADS {
+        return false;
+    }
+    let sched = SCHEDULER.lock();
+    let target_thread = &sched.threads[tid as usize];
+    if target_thread.state == ThreadState::Dead && target_thread.stack_base == 0 {
+        return false; // Slot not in use.
+    }
+    let task_id = target_thread.task_id;
+    // Kill all non-dead threads in this task.
+    for i in 0..MAX_THREADS {
+        let t = &sched.threads[i];
+        if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
+            KILLED[i].store(true, Ordering::Release);
+        }
+    }
+    drop(sched);
+    // Wake all killed threads so they exit block_current spin loops.
+    for i in 0..MAX_THREADS {
+        if KILLED[i].load(Ordering::Relaxed) {
+            wake_thread(i as ThreadId);
+        }
+    }
+    true
 }
 
 #[allow(dead_code)]
