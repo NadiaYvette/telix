@@ -30,6 +30,7 @@ pub fn kmain() -> ! {
     let (ram_start, ram_end) = arch::platform::ram_range();
     let kernel_end = arch::platform::kernel_end_addr();
     mm::phys::init(ram_start, ram_end, ram_start, kernel_end);
+    mm::frame::init(ram_start);
 
     // Enable MMU: set up kernel identity-mapped page tables.
     // Must happen before secondary CPU startup (they need the page table root).

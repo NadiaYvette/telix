@@ -81,7 +81,9 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
                         let obj_id = vma.object_id;
                         object::with_object(obj_id, |obj| {
                             if let Some(pa) = obj.get_page(obj_page_idx) {
-                                super::phys::free_page(pa);
+                                if super::frame::dec_ref(pa) == 0 {
+                                    super::phys::free_page(pa);
+                                }
                                 obj.phys_pages[obj_page_idx] = 0;
                             }
                         });

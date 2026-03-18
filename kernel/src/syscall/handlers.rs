@@ -5,13 +5,13 @@
 //!   RISC-V:  number in a7, args in a0-a5, return value in a0. Invoked via `ecall`.
 
 #[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::exception::ExceptionFrame;
+pub(crate) use crate::arch::aarch64::exception::ExceptionFrame;
 
 #[cfg(target_arch = "riscv64")]
-use crate::arch::riscv64::trap::TrapFrame as ExceptionFrame;
+pub(crate) use crate::arch::riscv64::trap::TrapFrame as ExceptionFrame;
 
 #[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::exception::ExceptionFrame;
+pub(crate) use crate::arch::x86_64::exception::ExceptionFrame;
 
 // Syscall numbers.
 pub const SYS_DEBUG_PUTCHAR: u64 = 0;
@@ -52,6 +52,7 @@ pub const SYS_GETPID: u64 = 35;
 pub const SYS_GET_CYCLES: u64 = 36;
 pub const SYS_GET_TIMER_FREQ: u64 = 37;
 pub const SYS_SET_QUOTA: u64 = 38;
+pub const SYS_FORK: u64 = 39;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -176,6 +177,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_GET_CYCLES => sys_get_cycles(),
         SYS_GET_TIMER_FREQ => sys_get_timer_freq(),
         SYS_SET_QUOTA => sys_set_quota(a0, a1, a2),
+        SYS_FORK => crate::sched::scheduler::fork_current(),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error

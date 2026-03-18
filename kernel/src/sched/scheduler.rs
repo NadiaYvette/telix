@@ -1050,6 +1050,134 @@ pub fn current_aspace_id() -> u32 {
     task.aspace_id
 }
 
+/// Fork the current task: clone address space (COW), create child task+thread.
+/// Returns the child thread ID (>0) to the parent, or 0 if fork failed.
+/// The child will return 0 from this syscall (set in its exception frame).
+pub fn fork_current() -> u64 {
+    let cpu = smp::cpu_id() as usize;
+    let parent_frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
+    if parent_frame_sp == 0 {
+        return 0;
+    }
+
+    // Gather parent info.
+    let (parent_tid, parent_task_id, parent_aspace_id, parent_priority, parent_quantum) = {
+        let tid = smp::current().current_thread.load(Ordering::Relaxed);
+        let sched = SCHEDULER.lock();
+        let thread = &sched.threads[tid as usize];
+        let task = &sched.tasks[thread.task_id as usize];
+        (tid, thread.task_id, task.aspace_id, thread.base_priority, thread.default_quantum)
+    };
+
+    // Clone the address space (COW). This is done outside the scheduler lock
+    // because it acquires ASPACES and OBJECTS locks.
+    let (child_aspace_id, child_pt_root) = match crate::mm::aspace::clone_for_cow(parent_aspace_id) {
+        Some(x) => x,
+        None => return 0,
+    };
+
+    // Create child task and thread under the scheduler lock.
+    let mut sched = SCHEDULER.lock();
+
+    let child_task_id = match sched.alloc_task_id() {
+        Some(id) => id,
+        None => return 0,
+    };
+
+    // Set up child task.
+    {
+        let task = &mut sched.tasks[child_task_id as usize];
+        task.id = child_task_id;
+        task.active = true;
+        task.aspace_id = child_aspace_id;
+        task.page_table_root = child_pt_root;
+        task.exit_code = 0;
+        task.exited = false;
+        task.thread_count = 1;
+        task.parent_task = parent_task_id;
+    }
+
+    // Bootstrap capabilities: copy parent's SEND/RECV bitmaps and grant
+    // well-known port caps.
+    {
+        // Copy the fast-path bitmaps so child inherits parent's port access.
+        let parent_send = crate::cap::CAP_SEND[parent_task_id as usize]
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let parent_recv = crate::cap::CAP_RECV[parent_task_id as usize]
+            .load(core::sync::atomic::Ordering::Relaxed);
+        crate::cap::CAP_SEND[child_task_id as usize]
+            .store(parent_send, core::sync::atomic::Ordering::Relaxed);
+        crate::cap::CAP_RECV[child_task_id as usize]
+            .store(parent_recv, core::sync::atomic::Ordering::Relaxed);
+
+        let mut caps = crate::cap::CAP_SYSTEM.lock();
+        caps.spaces[child_task_id as usize] = crate::cap::CapSpace::new(child_task_id);
+
+        // Grant SEND caps for well-known kernel ports.
+        let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
+        if nsrv != u32::MAX {
+            caps.grant_send_cap(child_task_id, nsrv);
+        }
+        let iramfs = crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
+        if iramfs != u32::MAX {
+            caps.grant_send_cap(child_task_id, iramfs);
+        }
+    }
+
+    // Allocate kernel stack for child thread.
+    let kstack_page = match crate::mm::phys::alloc_page() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let kstack_base = kstack_page.as_usize();
+    let kstack_top = kstack_base + PAGE_SIZE;
+
+    // Copy parent's exception frame to child's kernel stack.
+    let child_frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            parent_frame_sp as *const u8,
+            child_frame_sp as *mut u8,
+            EXCEPTION_FRAME_SIZE,
+        );
+    }
+
+    // Set child's return value to 0.
+    {
+        let child_frame = unsafe { &mut *(child_frame_sp as *mut crate::syscall::handlers::ExceptionFrame) };
+        crate::syscall::handlers::set_return(child_frame, 0);
+    }
+
+    // Allocate child thread.
+    let child_tid = match sched.alloc_thread_id() {
+        Some(id) => id,
+        None => return 0,
+    };
+
+    // Clear killed flag.
+    KILLED[child_tid as usize].store(false, Ordering::Release);
+
+    let thread = &mut sched.threads[child_tid as usize];
+    thread.id = child_tid;
+    thread.state = ThreadState::Ready;
+    thread.task_id = child_task_id;
+    thread.base_priority = parent_priority;
+    thread.effective_priority = parent_priority;
+    THREAD_PRIO[child_tid as usize].store(parent_priority, Ordering::Relaxed);
+    THREAD_TASK[child_tid as usize].store(child_task_id, Ordering::Relaxed);
+    thread.quantum = parent_quantum;
+    thread.default_quantum = parent_quantum;
+    thread.saved_sp = child_frame_sp as u64;
+    thread.stack_base = kstack_base;
+    thread.exit_code = 0;
+
+    sched.run_queues[parent_priority as usize].push(child_tid);
+
+    // Return child thread ID to parent (nonzero = parent, 0 = child).
+    // This matches the waitpid API which takes a thread ID.
+    child_tid as u64
+}
+
 /// Terminate the current thread and destroy its task's resources.
 /// This function never returns.
 pub fn exit_current_thread(exit_code: i32) -> ! {

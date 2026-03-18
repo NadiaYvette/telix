@@ -1,6 +1,7 @@
 pub mod aspace;
 pub mod extent;
 pub mod fault;
+pub mod frame;
 pub mod grant;
 pub mod object;
 pub mod page;

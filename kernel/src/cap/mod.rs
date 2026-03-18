@@ -14,11 +14,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Per-task lockless bitmaps for fast cap checks.
 /// Bit i is set if the task holds the corresponding right for port i.
 /// These are updated under CAP_SYSTEM lock but read locklessly.
-static CAP_SEND: [AtomicU64; MAX_TASKS] = {
+pub static CAP_SEND: [AtomicU64; MAX_TASKS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; MAX_TASKS]
 };
-static CAP_RECV: [AtomicU64; MAX_TASKS] = {
+pub static CAP_RECV: [AtomicU64; MAX_TASKS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; MAX_TASKS]
 };

@@ -379,6 +379,46 @@ pub fn try_contiguous_promotion(l0: usize, va: usize, group_count: usize) -> boo
     true
 }
 
+/// Downgrade a single 4K PTE from writable to read-only (for COW).
+/// Returns true if the PTE was present and downgraded.
+pub fn downgrade_pte_readonly(l0: usize, va: usize) -> bool {
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+
+    let l1 = match walk_table(l0_table, l0_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l2 = match walk_table(l1, l1_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l3 = match walk_table(l2, l2_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let entry = unsafe { *l3.add(l3_idx) };
+    if entry & PT_VALID == 0 {
+        return false;
+    }
+    // Set AP[2] (bit 7) to make read-only: AP=11 means EL1/EL0 read-only.
+    unsafe {
+        *l3.add(l3_idx) = entry | (1 << 7);
+    }
+    // TLB invalidate.
+    unsafe {
+        let va_shifted = (va >> 12) as u64;
+        core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("isb");
+    }
+    true
+}
+
 /// Return the kernel page table root (for switching back during exit).
 pub fn boot_page_table_root() -> usize {
     KERNEL_PT_ROOT.load(Ordering::Acquire)

@@ -75,6 +75,7 @@ impl MemObject {
         // Allocate a new page.
         let pa = phys::alloc_page()?;
         self.phys_pages[page_idx] = pa.as_usize();
+        super::frame::set_ref(pa, 1);
         Some(pa)
     }
 
@@ -90,10 +91,14 @@ impl MemObject {
     }
 
     /// Free all physical pages owned by this object.
+    /// Decrements reference counts; only frees the physical page when refcount hits 0.
     pub fn free_pages(&mut self) {
         for i in 0..self.page_count as usize {
             if self.phys_pages[i] != 0 {
-                phys::free_page(PhysAddr::new(self.phys_pages[i]));
+                let pa = PhysAddr::new(self.phys_pages[i]);
+                if super::frame::dec_ref(pa) == 0 {
+                    phys::free_page(pa);
+                }
                 self.phys_pages[i] = 0;
             }
         }
@@ -157,6 +162,41 @@ pub fn create_anon(page_count: u16) -> Option<ObjectId> {
         }
     }
     None
+}
+
+/// Clone a memory object for COW. Creates a new object that shares all
+/// physical pages with the original (incrementing their refcounts).
+/// Returns the new object ID.
+pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
+    let mut table = OBJECTS.lock();
+    let page_count = table.objects[src_id as usize].page_count;
+
+    // Find a free slot.
+    let mut dst_slot = None;
+    for (i, obj) in table.objects.iter().enumerate() {
+        if obj.obj_type == ObjectType::Free {
+            dst_slot = Some(i);
+            break;
+        }
+    }
+    let dst_idx = dst_slot?;
+
+    // Copy physical page pointers and increment refcounts.
+    table.objects[dst_idx].obj_type = ObjectType::Anonymous;
+    table.objects[dst_idx].page_count = page_count;
+    for i in 0..page_count as usize {
+        let pa = table.objects[src_id as usize].phys_pages[i];
+        table.objects[dst_idx].phys_pages[i] = pa;
+        if pa != 0 {
+            super::frame::inc_ref(super::page::PhysAddr::new(pa));
+        }
+    }
+    // Clear mappings on the new object (caller will add its own).
+    for m in &mut table.objects[dst_idx].mappings {
+        *m = Mapping::empty();
+    }
+
+    Some(dst_idx as ObjectId)
 }
 
 /// Destroy a memory object, freeing all its physical pages.

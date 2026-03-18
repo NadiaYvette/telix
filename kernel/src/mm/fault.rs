@@ -29,6 +29,9 @@ pub enum FaultResult {
     HandledMajor,
     /// Minor fault: page was resident, just reinstalled PTE.
     HandledMinor,
+    /// COW fault: copied a shared page to make it writable.
+    #[allow(dead_code)]
+    HandledCOW,
     /// Fault could not be handled (bad address, permission error, etc.).
     Failed,
 }
@@ -65,6 +68,12 @@ pub fn handle_page_fault(
         let mmu_idx = vma.mmu_index_of(fault_addr);
         let obj_page_idx = vma.obj_page_index(mmu_idx);
         let obj_id = vma.object_id;
+
+        // COW fault check: VMA is writable, page has PTE installed, but we got
+        // a write fault. This means the PTE is read-only due to COW sharing.
+        if fault_type == FaultType::Write && vma.prot.writable() && vma.is_installed(mmu_idx) {
+            return handle_cow_fault(pt_root, vma, obj_id, obj_page_idx, mmu_idx, fault_addr);
+        }
 
         // Check if this is a minor fault (page is resident but PTE was removed).
         if vma.is_zeroed(mmu_idx) && !vma.is_installed(mmu_idx) {
@@ -178,6 +187,81 @@ fn try_contiguous_promotion(pt_root: usize, vma: &super::vma::Vma, mmu_idx: usiz
     {
         let _ = (pt_root, vma, mmu_idx);
     }
+}
+
+/// Handle a COW (copy-on-write) fault.
+///
+/// The page is installed (PTE present) but read-only due to sharing.
+/// If refcount == 1, just upgrade the PTE to writable.
+/// If refcount > 1, copy the page and install the copy as writable.
+fn handle_cow_fault(
+    pt_root: usize,
+    vma: &mut super::vma::Vma,
+    obj_id: u32,
+    obj_page_idx: usize,
+    mmu_idx: usize,
+    fault_addr: usize,
+) -> FaultResult {
+    use super::page::{PhysAddr, PAGE_SIZE, MMUPAGE_SIZE, PAGE_MMUCOUNT};
+
+    let pa = object::with_object(obj_id, |obj| obj.get_page(obj_page_idx));
+    let old_pa = match pa {
+        Some(pa) => pa,
+        None => return FaultResult::Failed,
+    };
+
+    let refcount = super::frame::get_ref(old_pa);
+
+    if refcount <= 1 {
+        // Exclusively owned — just upgrade PTE to writable.
+        let mmu_pa = old_pa.as_usize() + vma.mmu_offset_in_page(mmu_idx) * MMUPAGE_SIZE;
+        let va_aligned = fault_addr & !(MMUPAGE_SIZE - 1);
+        let flags = pte_flags_for_vma(vma);
+        install_pte(pt_root, va_aligned, mmu_pa, flags);
+        stats::COW_FAULTS.fetch_add(1, Ordering::Relaxed);
+        return FaultResult::HandledCOW;
+    }
+
+    // Shared page — allocate a new page, copy, replace.
+    let new_pa = match super::phys::alloc_page() {
+        Some(pa) => pa,
+        None => return FaultResult::Failed, // OOM
+    };
+    super::frame::set_ref(new_pa, 1);
+
+    // Copy the entire allocation page.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            old_pa.as_usize() as *const u8,
+            new_pa.as_usize() as *mut u8,
+            PAGE_SIZE,
+        );
+    }
+
+    // Decrement old page's refcount.
+    if super::frame::dec_ref(old_pa) == 0 {
+        super::phys::free_page(old_pa);
+    }
+
+    // Update the object to point to the new page.
+    object::with_object(obj_id, |obj| {
+        obj.phys_pages[obj_page_idx] = new_pa.as_usize();
+    });
+
+    // Reinstall PTEs for all MMU pages in this allocation page that are installed.
+    let (ap_start, ap_end) = vma.alloc_page_mmu_range(mmu_idx);
+    let flags = pte_flags_for_vma(vma);
+    for i in ap_start..ap_end {
+        if vma.is_installed(i) {
+            let mmu_pa = new_pa.as_usize() + vma.mmu_offset_in_page(i) * MMUPAGE_SIZE;
+            let va = vma.va_start + i * MMUPAGE_SIZE;
+            install_pte(pt_root, va, mmu_pa, flags);
+        }
+    }
+
+    stats::COW_FAULTS.fetch_add(1, Ordering::Relaxed);
+    stats::COW_PAGES_COPIED.fetch_add(1, Ordering::Relaxed);
+    FaultResult::HandledCOW
 }
 
 /// Install a PTE via the arch-specific function.

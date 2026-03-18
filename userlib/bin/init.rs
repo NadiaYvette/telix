@@ -1370,6 +1370,54 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 23: COW Fork ---
+    syscall::debug_puts(b"  init: testing COW fork...\n");
+    {
+        // Allocate a page and write a known value.
+        let cow_page = syscall::mmap_anon(0, 1, 1); // va=0 (kernel picks), 1 page, RW (prot=1)
+        if let Some(cow_va) = cow_page {
+            let ptr = cow_va as *mut u64;
+            unsafe { core::ptr::write_volatile(ptr, 0xDEAD_BEEF_CAFE_1234); }
+
+            let pid = syscall::fork();
+            if pid == 0 {
+                // Child: read the value (should be parent's value via COW).
+                let val = unsafe { core::ptr::read_volatile(ptr) };
+                if val == 0xDEAD_BEEF_CAFE_1234 {
+                    // Write to trigger COW fault — this should NOT affect parent.
+                    unsafe { core::ptr::write_volatile(ptr, 0x1111_2222_3333_4444); }
+                    // Verify our write took effect.
+                    let val2 = unsafe { core::ptr::read_volatile(ptr) };
+                    if val2 == 0x1111_2222_3333_4444 {
+                        syscall::exit(42); // Success code.
+                    }
+                }
+                syscall::exit(99); // Failure code.
+            } else if pid > 0 {
+                // Parent: wait for child.
+                let mut child_ok = false;
+                for _ in 0..1000 {
+                    if let Some(code) = syscall::waitpid(pid) {
+                        child_ok = code == 42;
+                        break;
+                    }
+                    syscall::yield_now();
+                }
+                // Verify parent's page is unchanged.
+                let parent_val = unsafe { core::ptr::read_volatile(ptr) };
+                if child_ok && parent_val == 0xDEAD_BEEF_CAFE_1234 {
+                    syscall::debug_puts(b"Phase 27 COW fork: PASSED\n");
+                } else {
+                    syscall::debug_puts(b"Phase 27 COW fork: FAILED\n");
+                }
+            } else {
+                syscall::debug_puts(b"Phase 27 COW fork: FAILED (fork returned 0)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 27 COW fork: FAILED (mmap)\n");
+        }
+    }
+
     // --- Test 21: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

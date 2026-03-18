@@ -250,6 +250,37 @@ pub fn translate_va(root: usize, va: usize) -> Option<usize> {
     Some(pa | (va & 0xFFF))
 }
 
+/// Downgrade a single 4K PTE from writable to read-only (for COW).
+/// Returns true if the PTE was present and downgraded.
+pub fn downgrade_pte_readonly(root: usize, va: usize) -> bool {
+    let root_table = root as *mut u64;
+    let vpn2 = (va >> 30) & 0x1FF;
+    let vpn1 = (va >> 21) & 0x1FF;
+    let vpn0 = (va >> 12) & 0x1FF;
+
+    let l1 = match walk_table(root_table, vpn2) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l2 = match walk_table(l1, vpn1) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let entry = unsafe { *l2.add(vpn0) };
+    if entry & PTE_V == 0 {
+        return false;
+    }
+    // Clear the W bit to make read-only.
+    unsafe {
+        *l2.add(vpn0) = entry & !PTE_W;
+    }
+    unsafe {
+        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
+    }
+    true
+}
+
 /// Return the kernel page table root (for switching back during exit).
 pub fn boot_page_table_root() -> usize {
     KERNEL_PT_ROOT.load(Ordering::Acquire)

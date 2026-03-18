@@ -364,6 +364,42 @@ unsafe fn free_pd_user(pd: usize) {
     }
 }
 
+/// Downgrade a single 4K PTE from writable to read-only (for COW).
+/// Returns true if the PTE was present and downgraded.
+pub fn downgrade_pte_readonly(pml4: usize, va: usize) -> bool {
+    let pml4_table = pml4 as *mut u64;
+    let pml4_idx = (va >> 39) & 0x1FF;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pd_idx = (va >> 21) & 0x1FF;
+    let pt_idx = (va >> 12) & 0x1FF;
+
+    let pdpt = match walk_table(pml4_table, pml4_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let pd = match walk_table(pdpt, pdpt_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let pt = match walk_table(pd, pd_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let entry = unsafe { *pt.add(pt_idx) };
+    if entry & PTE_P == 0 {
+        return false;
+    }
+    // Clear the RW bit to make read-only.
+    unsafe {
+        *pt.add(pt_idx) = entry & !PTE_RW;
+    }
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) va);
+    }
+    true
+}
+
 /// Reload CR3 to flush the TLB after page table changes.
 pub fn enable_mmu(pml4: usize) {
     unsafe {

@@ -471,6 +471,14 @@ pub fn set_quota(child_task: u32, resource_type: u32, limit: u32) -> bool {
     unsafe { arch::syscall3(SYS_SET_QUOTA, child_task as u64, resource_type as u64, limit as u64) == 0 }
 }
 
+const SYS_FORK: u64 = 39;
+
+/// Fork the current process. Returns child task ID to parent (>0),
+/// 0 to the child, or 0 on failure.
+pub fn fork() -> u64 {
+    unsafe { arch::syscall0(SYS_FORK) }
+}
+
 /// Register a service with the name server.
 pub fn ns_register(name: &[u8], service_port: u32) -> bool {
     let nsrv = nsrv_port();
