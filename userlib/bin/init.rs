@@ -2170,6 +2170,196 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 30: Phase 39 ext2 Filesystem Server ---
+    syscall::debug_puts(b"  init: testing ext2 filesystem...\n");
+    {
+        let mut ext2_ok = true;
+
+        // Step 1: Look up ext2 server via name server.
+        let ext2_port = {
+            let mut found = None;
+            for _ in 0..200 {
+                if let Some(p) = syscall::ns_lookup(b"ext2") {
+                    found = Some(p);
+                    break;
+                }
+                for _ in 0..50 { syscall::yield_now(); }
+            }
+            found
+        };
+
+        if let Some(ext2_port) = ext2_port {
+            let reply_port = syscall::port_create() as u32;
+
+            // Step 2: Open hello.txt
+            {
+                let (n0, n1, _) = pack_name(b"hello.txt");
+                let d2 = 9u64 | ((reply_port as u64) << 32);
+                syscall::send(ext2_port, 0x2000, n0, n1, d2, 0);
+            }
+
+            let (handle, file_size, fs_aspace) = if let Some(reply) = syscall::recv_msg(reply_port) {
+                if reply.tag == 0x2001 {
+                    (reply.data[0], reply.data[1], reply.data[2] as u32)
+                } else {
+                    syscall::debug_puts(b"    ext2 open hello.txt FAILED tag=");
+                    print_num(reply.tag);
+                    syscall::debug_puts(b"\n");
+                    ext2_ok = false;
+                    (u64::MAX, 0, 0)
+                }
+            } else {
+                syscall::debug_puts(b"    ext2 open hello.txt no reply\n");
+                ext2_ok = false;
+                (u64::MAX, 0, 0)
+            };
+
+            if handle != u64::MAX {
+                syscall::debug_puts(b"    ext2 opened hello.txt: size=");
+                print_num(file_size);
+                syscall::debug_puts(b"\n");
+
+                // Step 3: Read hello.txt content (inline, small file).
+                {
+                    let d2 = file_size | ((reply_port as u64) << 32);
+                    syscall::send(ext2_port, 0x2100, handle, 0, d2, 0);
+                }
+
+                if let Some(reply) = syscall::recv_msg(reply_port) {
+                    if reply.tag == 0x2101 {
+                        let bytes_read = reply.data[0] as usize;
+                        // Verify content is "Hello from ext2!"
+                        let expected = b"Hello from ext2!";
+                        let mut content = [0u8; 24];
+                        let words = [reply.data[1], reply.data[2], reply.data[3]];
+                        for i in 0..bytes_read.min(24) {
+                            content[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
+                        }
+                        if bytes_read == expected.len() && &content[..bytes_read] == expected {
+                            syscall::debug_puts(b"    ext2 read hello.txt: OK (\"Hello from ext2!\")\n");
+                        } else {
+                            syscall::debug_puts(b"    ext2 read hello.txt: content mismatch\n");
+                            ext2_ok = false;
+                        }
+                    } else {
+                        syscall::debug_puts(b"    ext2 read FAILED\n");
+                        ext2_ok = false;
+                    }
+                }
+
+                // Step 4: FS_STAT — verify Unix permissions.
+                {
+                    let d2 = reply_port as u64;
+                    syscall::send(ext2_port, 0x2300, handle, 0, d2, 0);
+                }
+
+                if let Some(reply) = syscall::recv_msg(reply_port) {
+                    if reply.tag == 0x2301 {
+                        let stat_size = reply.data[0] as u32;
+                        let mode = reply.data[1] as u16;
+                        let uid = (reply.data[2] & 0xFFFF) as u16;
+                        let gid = ((reply.data[2] >> 16) & 0xFFFF) as u16;
+
+                        // hello.txt should be mode 0100644, uid 1000, gid 1000
+                        if stat_size != file_size as u32 {
+                            syscall::debug_puts(b"    ext2 stat: size mismatch\n");
+                            ext2_ok = false;
+                        }
+                        if mode != 0o100644 {
+                            syscall::debug_puts(b"    ext2 stat: mode mismatch (expected 0100644, got ");
+                            print_num(mode as u64);
+                            syscall::debug_puts(b")\n");
+                            ext2_ok = false;
+                        }
+                        if uid != 1000 || gid != 1000 {
+                            syscall::debug_puts(b"    ext2 stat: uid/gid mismatch\n");
+                            ext2_ok = false;
+                        } else {
+                            syscall::debug_puts(b"    ext2 stat: mode/uid/gid OK\n");
+                        }
+                    } else {
+                        syscall::debug_puts(b"    ext2 stat FAILED\n");
+                        ext2_ok = false;
+                    }
+                }
+
+                // Step 5: Close hello.txt.
+                syscall::send(ext2_port, 0x2400, handle, 0, 0, 0);
+            }
+
+            // Step 6: Open secret.txt and verify restricted permissions.
+            {
+                let (n0, n1, _) = pack_name(b"secret.txt");
+                let d2 = 10u64 | ((reply_port as u64) << 32);
+                syscall::send(ext2_port, 0x2000, n0, n1, d2, 0);
+            }
+
+            if let Some(reply) = syscall::recv_msg(reply_port) {
+                if reply.tag == 0x2001 {
+                    let secret_handle = reply.data[0];
+                    // Stat it — should be mode 0100600, uid 0, gid 0.
+                    let d2 = reply_port as u64;
+                    syscall::send(ext2_port, 0x2300, secret_handle, 0, d2, 0);
+
+                    if let Some(stat_reply) = syscall::recv_msg(reply_port) {
+                        if stat_reply.tag == 0x2301 {
+                            let mode = stat_reply.data[1] as u16;
+                            let uid = (stat_reply.data[2] & 0xFFFF) as u16;
+                            let gid = ((stat_reply.data[2] >> 16) & 0xFFFF) as u16;
+                            if mode == 0o100600 && uid == 0 && gid == 0 {
+                                syscall::debug_puts(b"    ext2 secret.txt permissions: OK\n");
+                            } else {
+                                syscall::debug_puts(b"    ext2 secret.txt permissions: mismatch\n");
+                                ext2_ok = false;
+                            }
+                        }
+                    }
+                    syscall::send(ext2_port, 0x2400, secret_handle, 0, 0, 0);
+                }
+            }
+
+            // Step 7: READDIR — enumerate root directory.
+            {
+                let mut entry_count = 0u32;
+                let mut next_offset = 0u64;
+                loop {
+                    let d2 = reply_port as u64;
+                    syscall::send(ext2_port, 0x2200, next_offset, 0, d2, 0);
+
+                    if let Some(reply) = syscall::recv_msg(reply_port) {
+                        if reply.tag == 0x2201 {
+                            entry_count += 1;
+                            next_offset = reply.data[3];
+                        } else {
+                            // FS_READDIR_END
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                syscall::debug_puts(b"    ext2 readdir: ");
+                print_num(entry_count as u64);
+                syscall::debug_puts(b" entries\n");
+                // We created hello.txt, bench.dat, secret.txt, testdir, plus lost+found
+                if entry_count < 3 {
+                    syscall::debug_puts(b"    ext2 readdir: too few entries\n");
+                    ext2_ok = false;
+                }
+            }
+
+            syscall::port_destroy(reply_port);
+
+            if ext2_ok {
+                syscall::debug_puts(b"Phase 39 ext2 filesystem: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 39 ext2 filesystem: FAILED\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 39 ext2 filesystem: SKIPPED (no ext2 server)\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

@@ -82,3 +82,7 @@ path = "bin/cache_srv.rs"
 [[bin]]
 name = "security_srv"
 path = "bin/security_srv.rs"
+
+[[bin]]
+name = "ext2_srv"
+path = "bin/ext2_srv.rs"

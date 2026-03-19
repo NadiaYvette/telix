@@ -44,7 +44,7 @@ RUSTFLAGS="-C link-arg=-T$LINKER ${EXTRA_RUSTFLAGS:-}" \
 BINDIR="$ROOTDIR/target/$TARGET/release"
 
 # Copy ELF binaries to initramfs directory.
-for bin in init hello echo_client initramfs_srv ramdisk_srv blk_srv cache_srv fat16_srv console_srv shell net_srv pipe_upper spin bench pong grant_echo macro_bench cap_test security_srv; do
+for bin in init hello echo_client initramfs_srv ramdisk_srv blk_srv cache_srv fat16_srv ext2_srv console_srv shell net_srv pipe_upper spin bench pong grant_echo macro_bench cap_test security_srv; do
     if [ -f "$BINDIR/$bin" ]; then
         cp "$BINDIR/$bin" "$INITRAMFS_DIR/$bin"
         SIZE=$(wc -c < "$INITRAMFS_DIR/$bin")
@@ -57,6 +57,10 @@ done
 # Rebuild the FAT16 test disk with hello ELF for exec-from-filesystem test.
 echo "Building FAT16 test disk..."
 "$ROOTDIR/tools/make-fat16.sh" "$TARGET"
+
+# Append ext2 partition to the test disk.
+echo "Building ext2 partition..."
+"$ROOTDIR/tools/make-ext2.sh"
 
 # Rebuild the CPIO archive.
 echo "Packing initramfs..."
