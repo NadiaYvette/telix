@@ -90,6 +90,47 @@ pub const NS_LOOKUP: u64 = 0x1100;
 /// Lookup result: data[0] = service_port (or u32::MAX if not found)
 pub const NS_LOOKUP_OK: u64 = 0x1101;
 
+// --- Security protocol tags ---
+
+/// Client → security_srv: authenticate.
+///   data[0] = username_hash, data[1] = password_hash, data[2] = reply_port
+pub const SEC_LOGIN: u64 = 0x700;
+
+/// security_srv → client: login succeeded.
+///   data[0] = credential_port, data[1] = role_bits
+pub const SEC_LOGIN_OK: u64 = 0x701;
+
+/// security_srv → client: login failed.
+///   data[0] = error_code
+pub const SEC_LOGIN_FAIL: u64 = 0x702;
+
+/// Server → security_srv: verify a credential.
+///   data[0] = credential_port, data[2] = reply_port
+pub const SEC_VERIFY: u64 = 0x703;
+
+/// security_srv → server: credential valid.
+///   data[0] = credential_port, data[1] = role_bits, data[2] = username_hash
+pub const SEC_VERIFY_OK: u64 = 0x704;
+
+/// security_srv → server: credential invalid.
+///   data[0] = error_code
+pub const SEC_VERIFY_FAIL: u64 = 0x705;
+
+/// Client → security_srv: revoke a credential.
+///   data[0] = credential_port, data[2] = reply_port
+pub const SEC_REVOKE: u64 = 0x706;
+
+/// security_srv → client: credential revoked.
+pub const SEC_REVOKE_OK: u64 = 0x707;
+
+// Role constants for security policy.
+#[allow(dead_code)]
+pub const ROLE_ADMIN: u64 = 0x01;
+#[allow(dead_code)]
+pub const ROLE_USER: u64 = 0x02;
+#[allow(dead_code)]
+pub const ROLE_GUEST: u64 = 0x04;
+
 // --- Error codes ---
 pub const ERR_NOT_FOUND: u64 = 1;
 #[allow(dead_code)]

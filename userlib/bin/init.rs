@@ -1904,6 +1904,115 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 28: Phase 36 Security Policy Servers ---
+    syscall::debug_puts(b"  init: testing security policy servers...\n");
+    {
+        let mut sec_ok = true;
+
+        // Create the service port here and pass it to security_srv via arg0.
+        // This avoids ns_register timing issues during test.
+        let sec_port = syscall::port_create() as u32;
+
+        // Spawn security_srv with the pre-created port as arg0.
+        let sec_tid = syscall::spawn_with_arg(b"security_srv", 50, sec_port as u64);
+        if sec_tid == u64::MAX {
+            syscall::debug_puts(b"  init: security_srv spawn FAILED\n");
+            sec_ok = false;
+        }
+
+        // Give it time to start.
+        for _ in 0..50 { syscall::yield_now(); }
+
+        if sec_ok {
+            let reply = syscall::port_create() as u32;
+
+            // Part A: Login with valid credentials (root).
+            // username_hash=0x0001_0001, password_hash=0x0001_0002
+            syscall::send(sec_port, 0x700, 0x0001_0001, 0x0001_0002, reply as u64, 0);
+            let cred_port;
+            let cred_roles;
+            if let Some(r) = syscall::recv_msg(reply) {
+                if r.tag == 0x701 { // SEC_LOGIN_OK
+                    cred_port = r.data[0] as u32;
+                    cred_roles = r.data[1];
+                    if cred_roles != 0x03 { // ADMIN|USER
+                        syscall::debug_puts(b"  init: login roles wrong\n");
+                        sec_ok = false;
+                    }
+                } else {
+                    syscall::debug_puts(b"  init: login failed unexpectedly\n");
+                    sec_ok = false;
+                    cred_port = 0;
+                    cred_roles = 0;
+                }
+            } else {
+                syscall::debug_puts(b"  init: login no reply\n");
+                sec_ok = false;
+                cred_port = 0;
+                cred_roles = 0;
+            }
+
+            // Part B: Login with wrong password.
+            syscall::send(sec_port, 0x700, 0x0001_0001, 0xBAD_0000, reply as u64, 0);
+            if let Some(r) = syscall::recv_msg(reply) {
+                if r.tag != 0x702 { // SEC_LOGIN_FAIL
+                    syscall::debug_puts(b"  init: bad login not rejected\n");
+                    sec_ok = false;
+                }
+            } else {
+                sec_ok = false;
+            }
+
+            if sec_ok && cred_port != 0 {
+                // Part C: Verify credential.
+                syscall::send(sec_port, 0x703, cred_port as u64, 0, reply as u64, 0);
+                if let Some(r) = syscall::recv_msg(reply) {
+                    if r.tag == 0x704 { // SEC_VERIFY_OK
+                        if r.data[1] != cred_roles || r.data[2] != 0x0001_0001 {
+                            syscall::debug_puts(b"  init: verify data mismatch\n");
+                            sec_ok = false;
+                        }
+                    } else {
+                        syscall::debug_puts(b"  init: verify failed\n");
+                        sec_ok = false;
+                    }
+                } else {
+                    sec_ok = false;
+                }
+
+                // Part D: Revoke credential.
+                syscall::send(sec_port, 0x706, cred_port as u64, 0, reply as u64, 0);
+                if let Some(r) = syscall::recv_msg(reply) {
+                    if r.tag != 0x707 { // SEC_REVOKE_OK
+                        syscall::debug_puts(b"  init: revoke failed\n");
+                        sec_ok = false;
+                    }
+                } else {
+                    sec_ok = false;
+                }
+
+                // Part E: Verify after revoke should fail.
+                syscall::send(sec_port, 0x703, cred_port as u64, 0, reply as u64, 0);
+                if let Some(r) = syscall::recv_msg(reply) {
+                    if r.tag != 0x705 { // SEC_VERIFY_FAIL
+                        syscall::debug_puts(b"  init: verify after revoke not denied\n");
+                        sec_ok = false;
+                    }
+                } else {
+                    sec_ok = false;
+                }
+            }
+
+            syscall::port_destroy(reply);
+        }
+
+        if sec_ok {
+            syscall::debug_puts(b"Phase 36 security policy servers: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 36 security policy servers: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
