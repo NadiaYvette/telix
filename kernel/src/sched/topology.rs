@@ -70,6 +70,16 @@ pub fn get(cpu: usize) -> CpuTopoEntry {
     }
 }
 
+/// Set the online state for a CPU (used by hotplug).
+///
+/// # Safety
+/// Caller must ensure `cpu < MAX_CPUS`.
+pub unsafe fn set_online(cpu: usize, online: bool) {
+    if cpu < MAX_CPUS {
+        unsafe { CPU_TOPO[cpu].online = online; }
+    }
+}
+
 /// Print topology at boot.
 pub fn print() {
     crate::println!("  CPU topology:");

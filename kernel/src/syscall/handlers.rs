@@ -65,6 +65,8 @@ pub const SYS_GET_AFFINITY: u64 = 48;
 pub const SYS_CPU_TOPOLOGY: u64 = 49;
 pub const SYS_TRACE_CTRL: u64 = 50;
 pub const SYS_TRACE_READ: u64 = 51;
+pub const SYS_CPU_HOTPLUG: u64 = 52;
+pub const SYS_CPU_LOAD: u64 = 53;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -208,6 +210,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
             let pt_root = crate::sched::scheduler::current_page_table_root();
             crate::trace::trace_read(pt_root, a0 as usize, a1 as usize)
         }
+        SYS_CPU_HOTPLUG => sys_cpu_hotplug(a0, a1),
+        SYS_CPU_LOAD => sys_cpu_load(a0),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1223,4 +1227,27 @@ fn sys_cpu_topology(cpu_id: u64) -> u64 {
         | ((entry.smt_id as u64) << 16)
         | ((entry.online as u64) << 24)
         | (online_cpus << 32)
+}
+
+/// CPU hotplug: offline or online a CPU.
+/// action: 0 = offline, 1 = online.
+fn sys_cpu_hotplug(cpu_id: u64, action: u64) -> u64 {
+    match action {
+        0 => crate::sched::hotplug::cpu_offline(cpu_id as u32),
+        1 => crate::sched::hotplug::cpu_online(cpu_id as u32),
+        _ => 1,
+    }
+}
+
+/// Query per-CPU load and online state.
+/// Returns: load (bits 0-31) | load_window (bits 32-47) | online_mask (bits 48-63 low 16 bits).
+fn sys_cpu_load(cpu_id: u64) -> u64 {
+    let cpu = cpu_id as u32;
+    if (cpu as usize) >= crate::sched::smp::MAX_CPUS {
+        return u64::MAX;
+    }
+    let load = crate::sched::hotplug::cpu_load(cpu) as u64;
+    let window = crate::sched::hotplug::load_window() as u64;
+    let online = crate::sched::hotplug::online_mask();
+    load | (window << 32) | ((online & 0xFFFF) << 48)
 }

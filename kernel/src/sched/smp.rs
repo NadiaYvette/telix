@@ -127,8 +127,9 @@ pub fn init_ap(cpu: u32, idle_thread: ThreadId) {
     ONLINE_CPUS.fetch_add(1, Ordering::Release);
 }
 
-/// Number of CPUs currently online.
+/// Number of CPUs currently online (reflects hotplug state).
 #[allow(dead_code)]
 pub fn online_cpus() -> u32 {
-    ONLINE_CPUS.load(Ordering::Acquire)
+    let mask = super::hotplug::online_mask();
+    mask.count_ones()
 }

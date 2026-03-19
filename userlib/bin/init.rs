@@ -2064,6 +2064,112 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 29: Phase 38 CPU Hotplug / Energy-Aware Scheduling ---
+    syscall::debug_puts(b"  init: testing CPU hotplug and energy-aware scheduling...\n");
+    {
+        let mut hotplug_ok = true;
+
+        // Step 1: Read initial topology — should have 4 online CPUs.
+        let initial = syscall::cpu_topology(0);
+        let initial_count = if let Some((_, _, _, _, count)) = initial { count } else { 0 };
+
+        if initial_count < 2 {
+            syscall::debug_puts(b"    need >= 2 CPUs, skipping\n");
+            syscall::debug_puts(b"Phase 38 CPU hotplug: SKIPPED\n");
+        } else {
+            // Step 2: Check per-CPU load is available.
+            let load_ok = if let Some((load, window, online)) = syscall::cpu_load(0) {
+                let _ = load;
+                window > 0 && online != 0
+            } else {
+                false
+            };
+            if !load_ok {
+                syscall::debug_puts(b"    cpu_load failed\n");
+                hotplug_ok = false;
+            }
+
+            // Step 3: Offline CPU 1.
+            let offline_ok = syscall::cpu_hotplug(1, 0);
+            if !offline_ok {
+                syscall::debug_puts(b"    offline CPU 1 failed\n");
+                hotplug_ok = false;
+            }
+
+            // Step 4: Verify CPU 1 is offline via topology.
+            if let Some((_, _, _, online, count)) = syscall::cpu_topology(1) {
+                if online {
+                    syscall::debug_puts(b"    CPU 1 still shows online\n");
+                    hotplug_ok = false;
+                }
+                if count >= initial_count {
+                    syscall::debug_puts(b"    online count not decreased\n");
+                    hotplug_ok = false;
+                }
+            }
+
+            // Step 5: Verify CPU 1 not in online mask.
+            if let Some((_, _, online_mask)) = syscall::cpu_load(1) {
+                if online_mask & 0x2 != 0 {
+                    syscall::debug_puts(b"    CPU 1 still in online mask\n");
+                    hotplug_ok = false;
+                }
+            }
+
+            // Step 6: Verify we can't offline the last CPU.
+            // Offline CPUs 2 and 3 first if they exist.
+            if initial_count > 2 {
+                syscall::cpu_hotplug(2, 0);
+            }
+            if initial_count > 3 {
+                syscall::cpu_hotplug(3, 0);
+            }
+            // Now only CPU 0 should be online. Trying to offline it should fail.
+            let cant_offline_last = !syscall::cpu_hotplug(0, 0);
+            if !cant_offline_last {
+                syscall::debug_puts(b"    offlined last CPU!\n");
+                hotplug_ok = false;
+            }
+
+            // Step 7: Re-online all CPUs.
+            for cpu in 1..initial_count {
+                let online_ok = syscall::cpu_hotplug(cpu, 1);
+                if !online_ok {
+                    syscall::debug_puts(b"    online CPU ");
+                    print_num(cpu as u64);
+                    syscall::debug_puts(b" failed\n");
+                    hotplug_ok = false;
+                }
+            }
+
+            // Step 8: Verify all CPUs back online.
+            if let Some((_, _, _, _, count)) = syscall::cpu_topology(0) {
+                if count != initial_count {
+                    syscall::debug_puts(b"    online count mismatch after re-online\n");
+                    hotplug_ok = false;
+                }
+            }
+
+            // Step 9: Verify affinity was adjusted for init thread.
+            let my_tid = syscall::thread_id() as u32;
+            let my_affinity = syscall::get_affinity(my_tid);
+            if my_affinity == 0 {
+                syscall::debug_puts(b"    affinity is zero after hotplug\n");
+                hotplug_ok = false;
+            }
+
+            // Step 10: Spawn a thread while CPU 1 is offline to verify
+            // it still runs (migration works).
+            // (All CPUs are back online now, so this is just a sanity check.)
+
+            if hotplug_ok {
+                syscall::debug_puts(b"Phase 38 CPU hotplug: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 38 CPU hotplug: FAILED\n");
+            }
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

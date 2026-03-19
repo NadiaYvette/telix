@@ -509,6 +509,8 @@ const SYS_COSCHED_SET: u64 = 46;
 const SYS_SET_AFFINITY: u64 = 47;
 const SYS_GET_AFFINITY: u64 = 48;
 const SYS_CPU_TOPOLOGY: u64 = 49;
+const SYS_CPU_HOTPLUG: u64 = 52;
+const SYS_CPU_LOAD: u64 = 53;
 
 /// Query VM statistics. which: 0=superpage_promotions, 1=superpage_demotions.
 #[allow(dead_code)]
@@ -559,6 +561,25 @@ pub fn cpu_topology(cpu_id: u32) -> Option<(u8, u8, u8, bool, u32)> {
     let online = ((r >> 24) & 0xFF) != 0;
     let count = (r >> 32) as u32;
     Some((pkg, core, smt, online, count))
+}
+
+/// Offline or online a CPU. action: 0 = offline, 1 = online.
+/// Returns true on success.
+#[allow(dead_code)]
+pub fn cpu_hotplug(cpu_id: u32, action: u32) -> bool {
+    let r = unsafe { arch::syscall2(SYS_CPU_HOTPLUG, cpu_id as u64, action as u64) };
+    r == 0
+}
+
+/// Query per-CPU load. Returns (load, window, online_mask) or None.
+#[allow(dead_code)]
+pub fn cpu_load(cpu_id: u32) -> Option<(u32, u32, u16)> {
+    let r = unsafe { arch::syscall1(SYS_CPU_LOAD, cpu_id as u64) };
+    if r == u64::MAX { return None; }
+    let load = (r & 0xFFFF_FFFF) as u32;
+    let window = ((r >> 32) & 0xFFFF) as u32;
+    let online_mask = ((r >> 48) & 0xFFFF) as u16;
+    Some((load, window, online_mask))
 }
 
 /// Register a service with the name server.

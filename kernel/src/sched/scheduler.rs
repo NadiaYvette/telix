@@ -779,8 +779,14 @@ impl Scheduler {
     /// Called from IRQ handler with current SP.
     /// Returns the new SP to use for restore_regs.
     fn try_switch(&mut self, current_sp: u64) -> u64 {
-        // Drain deferred kernel stack free from a previous exit on this CPU.
+        // Update per-CPU load tracking for energy-aware scheduling.
         let cpu = smp::cpu_id();
+        let pcpu = smp::get(cpu);
+        let idle_id_for_load = pcpu.idle_thread_id.load(Ordering::Relaxed);
+        let cur_for_load = pcpu.current_thread.load(Ordering::Relaxed);
+        super::hotplug::tick_load(cpu, cur_for_load == idle_id_for_load);
+
+        // Drain deferred kernel stack free from a previous exit on this CPU.
         let deferred = DEFERRED_KSTACK[cpu as usize].swap(0, Ordering::AcqRel);
         if deferred != 0 {
             crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(deferred));
@@ -889,6 +895,7 @@ pub fn init() {
     drop(sched);
 
     smp::init_bsp(idle_id);
+    super::hotplug::mark_online(0);
     crate::println!("  Scheduler initialized (BSP = CPU 0)");
 }
 
@@ -899,6 +906,7 @@ pub fn init_ap(cpu: u32) {
         sched.create_idle_thread().expect("AP idle thread")
     };
     smp::init_ap(cpu, idle_id);
+    super::hotplug::mark_online(cpu);
     crate::println!("  CPU {} scheduler ready (idle thread {})", cpu, idle_id);
 }
 
