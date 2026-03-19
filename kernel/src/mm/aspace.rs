@@ -254,8 +254,11 @@ pub fn unmap_anon(id: ASpaceId, va: usize) -> bool {
 
             if let Some((va_start, obj_id)) = info {
                 space.vmas.remove(va_start);
-                // Destroy object (frees phys pages) — acquires OBJECTS lock.
-                object::destroy(obj_id);
+                // Destroy object only if no other mappings reference it.
+                let remaining = object::with_object(obj_id, |obj| obj.mapping_count());
+                if remaining == 0 {
+                    object::destroy(obj_id);
+                }
                 return true;
             }
             return false;
@@ -539,6 +542,358 @@ fn map_single_mmupage(pt_root: usize, va: usize, pa: usize, flags: u64) {
     { crate::arch::riscv64::mm::map_single_mmupage(pt_root, va, pa, flags); }
     #[cfg(target_arch = "x86_64")]
     { crate::arch::x86_64::mm::map_single_mmupage(pt_root, va, pa, flags); }
+}
+
+/// Change the protection of a virtual address range within an address space.
+/// `addr` and `len` must be MMUPAGE_SIZE-aligned. Handles VMA splitting if the
+/// range doesn't align to VMA boundaries.
+/// Returns true on success.
+pub fn mprotect(id: ASpaceId, addr: usize, len: usize, new_prot: VmaProt) -> bool {
+    use super::page::MMUPAGE_SIZE;
+
+    if addr % MMUPAGE_SIZE != 0 || len % MMUPAGE_SIZE != 0 || len == 0 {
+        return false;
+    }
+
+    let mut table = ASPACES.lock();
+    for space in table.spaces.iter_mut() {
+        if space.active && space.id == id {
+            let pt_root = space.page_table_root;
+            let end = addr + len;
+
+            // First pass: split VMAs at boundaries if needed.
+            // Split at `addr` if it falls in the middle of a VMA.
+            if let Some(vma) = space.vmas.find(addr) {
+                if vma.va_start < addr {
+                    let split_at = addr;
+                    let orig_start = vma.va_start;
+                    let orig_len = vma.va_len;
+                    let orig_prot = vma.prot;
+                    let orig_obj = vma.object_id;
+                    let orig_off = vma.object_offset;
+
+                    // Copy bitmaps for both halves.
+                    let left_mmu = (split_at - orig_start) / MMUPAGE_SIZE;
+                    let total_mmu = orig_len / MMUPAGE_SIZE;
+
+                    let mut left_installed = [0u64; 64];
+                    let mut left_zeroed = [0u64; 64];
+                    let mut right_installed = [0u64; 64];
+                    let mut right_zeroed = [0u64; 64];
+
+                    for i in 0..total_mmu {
+                        let w = i / 64;
+                        let b = i % 64;
+                        if w >= 64 { break; }
+                        if i < left_mmu {
+                            left_installed[w] |= vma.installed[w] & (1u64 << b);
+                            left_zeroed[w] |= vma.zeroed[w] & (1u64 << b);
+                        } else {
+                            let ri = i - left_mmu;
+                            let rw = ri / 64;
+                            let rb = ri % 64;
+                            if rw < 64 {
+                                if (vma.installed[w] & (1u64 << b)) != 0 {
+                                    right_installed[rw] |= 1u64 << rb;
+                                }
+                                if (vma.zeroed[w] & (1u64 << b)) != 0 {
+                                    right_zeroed[rw] |= 1u64 << rb;
+                                }
+                            }
+                        }
+                    }
+
+                    // Remove old VMA and insert two new ones.
+                    space.vmas.remove(orig_start);
+                    let left_len = split_at - orig_start;
+                    let right_len = orig_len - left_len;
+                    let right_off = orig_off + (left_mmu as u32);
+
+                    // Add mapping record for the right half (same object, new VA).
+                    super::object::with_object(orig_obj, |obj| {
+                        obj.add_mapping(id, split_at);
+                    });
+
+                    if let Some(lv) = space.vmas.insert(orig_start, left_len, orig_prot, orig_obj, orig_off) {
+                        let bw = (left_mmu + 63) / 64;
+                        for w in 0..bw.min(64) {
+                            lv.installed[w] = left_installed[w];
+                            lv.zeroed[w] = left_zeroed[w];
+                        }
+                    }
+                    if let Some(rv) = space.vmas.insert(split_at, right_len, orig_prot, orig_obj, right_off) {
+                        let rmmu = right_len / MMUPAGE_SIZE;
+                        let bw = (rmmu + 63) / 64;
+                        for w in 0..bw.min(64) {
+                            rv.installed[w] = right_installed[w];
+                            rv.zeroed[w] = right_zeroed[w];
+                        }
+                    }
+                }
+            }
+
+            // Split at `end` if it falls in the middle of a VMA.
+            if let Some(vma) = space.vmas.find(end.saturating_sub(1)) {
+                let vma_end = vma.va_start + vma.va_len;
+                if end < vma_end && end > vma.va_start {
+                    let split_at = end;
+                    let orig_start = vma.va_start;
+                    let orig_len = vma.va_len;
+                    let orig_prot = vma.prot;
+                    let orig_obj = vma.object_id;
+                    let orig_off = vma.object_offset;
+
+                    let left_mmu = (split_at - orig_start) / MMUPAGE_SIZE;
+                    let total_mmu = orig_len / MMUPAGE_SIZE;
+
+                    let mut left_installed = [0u64; 64];
+                    let mut left_zeroed = [0u64; 64];
+                    let mut right_installed = [0u64; 64];
+                    let mut right_zeroed = [0u64; 64];
+
+                    for i in 0..total_mmu {
+                        let w = i / 64;
+                        let b = i % 64;
+                        if w >= 64 { break; }
+                        if i < left_mmu {
+                            left_installed[w] |= vma.installed[w] & (1u64 << b);
+                            left_zeroed[w] |= vma.zeroed[w] & (1u64 << b);
+                        } else {
+                            let ri = i - left_mmu;
+                            let rw = ri / 64;
+                            let rb = ri % 64;
+                            if rw < 64 {
+                                if (vma.installed[w] & (1u64 << b)) != 0 {
+                                    right_installed[rw] |= 1u64 << rb;
+                                }
+                                if (vma.zeroed[w] & (1u64 << b)) != 0 {
+                                    right_zeroed[rw] |= 1u64 << rb;
+                                }
+                            }
+                        }
+                    }
+
+                    space.vmas.remove(orig_start);
+                    let left_len = split_at - orig_start;
+                    let right_len = orig_len - left_len;
+                    let right_off = orig_off + (left_mmu as u32);
+
+                    super::object::with_object(orig_obj, |obj| {
+                        obj.add_mapping(id, split_at);
+                    });
+
+                    if let Some(lv) = space.vmas.insert(orig_start, left_len, orig_prot, orig_obj, orig_off) {
+                        let bw = (left_mmu + 63) / 64;
+                        for w in 0..bw.min(64) {
+                            lv.installed[w] = left_installed[w];
+                            lv.zeroed[w] = left_zeroed[w];
+                        }
+                    }
+                    if let Some(rv) = space.vmas.insert(split_at, right_len, orig_prot, orig_obj, right_off) {
+                        let rmmu = right_len / MMUPAGE_SIZE;
+                        let bw = (rmmu + 63) / 64;
+                        for w in 0..bw.min(64) {
+                            rv.installed[w] = right_installed[w];
+                            rv.zeroed[w] = right_zeroed[w];
+                        }
+                    }
+                }
+            }
+
+            // Second pass: update protection on all VMAs fully within [addr, end).
+            let mut it = space.vmas.iter();
+            while let Some(vma) = it.next() {
+                if !vma.active { continue; }
+                if vma.va_start >= end { break; }
+                let vma_end = vma.va_start + vma.va_len;
+                if vma_end <= addr { continue; }
+
+                // This VMA should be fully within [addr, end) after splitting.
+                if vma.va_start >= addr && vma_end <= end {
+                    let old_prot = vma.prot;
+                    vma.prot = new_prot;
+
+                    // Update PTE flags for all installed MMU pages.
+                    if old_prot != new_prot {
+                        let new_flags = rw_flags_for_prot(new_prot);
+                        let mmu_count = vma.mmu_page_count();
+
+                        // Demote superpages first.
+                        {
+                            let super_size = 2 * 1024 * 1024;
+                            let old_flags = rw_flags_for_prot(old_prot);
+                            let mut m = 0;
+                            while m < mmu_count {
+                                let mmu_va = vma.va_start + m * MMUPAGE_SIZE;
+                                let super_va = mmu_va & !(super_size - 1);
+                                if super::fault::is_superpage_mapped(pt_root, super_va).is_some() {
+                                    super::fault::demote_superpage(pt_root, super_va, old_flags);
+                                }
+                                let next = ((super_va + super_size) - vma.va_start) / MMUPAGE_SIZE;
+                                m = if next > m { next } else { m + (super_size / MMUPAGE_SIZE) };
+                            }
+                        }
+
+                        for mmu_idx in 0..mmu_count {
+                            if vma.is_installed(mmu_idx) {
+                                let mmu_va = vma.va_start + mmu_idx * MMUPAGE_SIZE;
+                                update_pte_flags(pt_root, mmu_va, new_flags);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+    }
+    false
+}
+
+/// Remap (resize) an anonymous mapping. Supports grow and shrink.
+/// `old_addr` must be the start of an existing VMA.
+/// `old_len` must match the VMA length.
+/// `new_len` is the desired new length (MMUPAGE_SIZE-aligned).
+/// Returns the new VA (same as old_addr on success), or 0 on error.
+pub fn mremap(id: ASpaceId, old_addr: usize, old_len: usize, new_len: usize) -> usize {
+    use super::page::{MMUPAGE_SIZE, PAGE_SIZE};
+
+    if old_addr % MMUPAGE_SIZE != 0 || old_len % MMUPAGE_SIZE != 0
+        || new_len % MMUPAGE_SIZE != 0 || new_len == 0
+    {
+        return 0;
+    }
+
+    let mut table = ASPACES.lock();
+    for space in table.spaces.iter_mut() {
+        if space.active && space.id == id {
+            let pt_root = space.page_table_root;
+
+            let vma = match space.find_vma_mut(old_addr) {
+                Some(v) => v,
+                None => return 0,
+            };
+
+            if vma.va_start != old_addr || vma.va_len != old_len {
+                return 0;
+            }
+
+            if new_len == old_len {
+                return old_addr;
+            }
+
+            if new_len < old_len {
+                // Shrink: unmap excess MMU pages, truncate VMA.
+                let old_mmu = old_len / MMUPAGE_SIZE;
+                let new_mmu = new_len / MMUPAGE_SIZE;
+
+                // Demote superpages in the excess region.
+                {
+                    let super_size = 2 * 1024 * 1024;
+                    let flags = super::fault::pte_flags_for_vma_pub(vma);
+                    let mut m = new_mmu;
+                    while m < old_mmu {
+                        let mmu_va = old_addr + m * MMUPAGE_SIZE;
+                        let super_va = mmu_va & !(super_size - 1);
+                        if super::fault::is_superpage_mapped(pt_root, super_va).is_some() {
+                            super::fault::demote_superpage(pt_root, super_va, flags);
+                        }
+                        let next = ((super_va + super_size) - old_addr) / MMUPAGE_SIZE;
+                        m = if next > m { next } else { m + (super_size / MMUPAGE_SIZE) };
+                    }
+                }
+
+                // Unmap installed PTEs in the excess region.
+                for mmu_idx in new_mmu..old_mmu {
+                    if vma.is_installed(mmu_idx) {
+                        let mmu_va = old_addr + mmu_idx * MMUPAGE_SIZE;
+                        unmap_single_mmupage(pt_root, mmu_va);
+                        vma.clear_installed(mmu_idx);
+                    }
+                    if vma.is_zeroed(mmu_idx) {
+                        vma.clear_zeroed(mmu_idx);
+                    }
+                }
+
+                vma.va_len = new_len;
+
+                // Free excess backing pages that are no longer referenced.
+                let new_page_count = (new_len + PAGE_SIZE - 1) / PAGE_SIZE;
+                let old_page_count = (old_len + PAGE_SIZE - 1) / PAGE_SIZE;
+                let obj_id = vma.object_id;
+
+                if new_page_count < old_page_count {
+                    super::object::with_object(obj_id, |obj| {
+                        for p in new_page_count..old_page_count {
+                            if obj.phys_pages[p] != 0 {
+                                let pa = super::page::PhysAddr::new(obj.phys_pages[p]);
+                                if super::frame::dec_ref(pa) == 0 {
+                                    super::phys::free_page(pa);
+                                }
+                                obj.phys_pages[p] = 0;
+                            }
+                        }
+                        obj.page_count = new_page_count as u16;
+                    });
+                }
+
+                return old_addr;
+            }
+
+            // Grow: extend VMA and object.
+            let new_page_count = (new_len + PAGE_SIZE - 1) / PAGE_SIZE;
+            let obj_id = vma.object_id;
+
+            // Check if the object can hold the new page count.
+            let can_grow = super::object::with_object(obj_id, |obj| {
+                new_page_count <= obj.phys_pages.len()
+            });
+            if !can_grow {
+                return 0;
+            }
+
+            // Check no overlapping VMA exists in the growth region.
+            let growth_start = old_addr + old_len;
+            let growth_end = old_addr + new_len;
+            let mut overlap = false;
+            {
+                let mut it = space.vmas.iter();
+                while let Some(v) = it.next() {
+                    if !v.active { continue; }
+                    if v.va_start == old_addr { continue; } // skip self
+                    let v_end = v.va_start + v.va_len;
+                    if v.va_start < growth_end && v_end > growth_start {
+                        overlap = true;
+                        break;
+                    }
+                }
+            }
+            if overlap {
+                return 0;
+            }
+
+            // Extend the VMA and object.
+            let vma = space.find_vma_mut(old_addr).unwrap();
+            vma.va_len = new_len;
+            super::object::with_object(obj_id, |obj| {
+                if (new_page_count as u16) > obj.page_count {
+                    obj.page_count = new_page_count as u16;
+                }
+            });
+
+            return old_addr;
+        }
+    }
+    0
+}
+
+fn update_pte_flags(pt_root: usize, va: usize, flags: u64) {
+    #[cfg(target_arch = "aarch64")]
+    { crate::arch::aarch64::mm::update_pte_flags(pt_root, va, flags); }
+    #[cfg(target_arch = "riscv64")]
+    { crate::arch::riscv64::mm::update_pte_flags(pt_root, va, flags); }
+    #[cfg(target_arch = "x86_64")]
+    { crate::arch::x86_64::mm::update_pte_flags(pt_root, va, flags); }
 }
 
 /// Access an address space by ID within a closure.

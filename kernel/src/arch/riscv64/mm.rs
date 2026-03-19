@@ -281,6 +281,37 @@ pub fn downgrade_pte_readonly(root: usize, va: usize) -> bool {
     true
 }
 
+/// Update the flags of an existing 4K PTE, keeping the physical address.
+/// Returns true if the PTE was present and updated.
+pub fn update_pte_flags(root: usize, va: usize, new_flags: u64) -> bool {
+    let root_table = root as *mut u64;
+    let vpn2 = (va >> 30) & 0x1FF;
+    let vpn1 = (va >> 21) & 0x1FF;
+    let vpn0 = (va >> 12) & 0x1FF;
+
+    let l1 = match walk_table(root_table, vpn2) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l2 = match walk_table(l1, vpn1) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let entry = unsafe { *l2.add(vpn0) };
+    if entry & PTE_V == 0 {
+        return false;
+    }
+    let ppn = entry & !0x3FF; // Keep PPN bits (10..53), clear flag bits (0..9)
+    unsafe {
+        *l2.add(vpn0) = ppn | new_flags;
+    }
+    unsafe {
+        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
+    }
+    true
+}
+
 /// Install a 2 MiB megapage at `va` (must be 2 MiB-aligned) backed by `pa` (must be 2 MiB-aligned).
 /// In Sv39, a megapage is a leaf entry at L1 level (vpn1).
 pub fn install_superpage(root: usize, va: usize, pa: usize, flags: u64) -> bool {

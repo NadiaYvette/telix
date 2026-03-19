@@ -419,6 +419,45 @@ pub fn downgrade_pte_readonly(l0: usize, va: usize) -> bool {
     true
 }
 
+/// Update the flags of an existing 4K PTE, keeping the physical address.
+/// Returns true if the PTE was present and updated.
+pub fn update_pte_flags(l0: usize, va: usize, new_flags: u64) -> bool {
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+
+    let l1 = match walk_table(l0_table, l0_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l2 = match walk_table(l1, l1_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l3 = match walk_table(l2, l2_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let entry = unsafe { *l3.add(l3_idx) };
+    if entry & PT_VALID == 0 {
+        return false;
+    }
+    let pa = entry & 0x0000_FFFF_FFFF_F000;
+    unsafe {
+        *l3.add(l3_idx) = pa | new_flags;
+    }
+    unsafe {
+        let va_shifted = (va >> 12) as u64;
+        core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("isb");
+    }
+    true
+}
+
 /// Return the kernel page table root (for switching back during exit).
 pub fn boot_page_table_root() -> usize {
     KERNEL_PT_ROOT.load(Ordering::Acquire)

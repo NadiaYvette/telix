@@ -73,6 +73,8 @@ pub const SYS_SIGPROCMASK: u64 = 56;
 pub const SYS_SIGRETURN: u64 = 57;
 pub const SYS_KILL_SIG: u64 = 58;
 pub const SYS_SIGPENDING: u64 = 59;
+pub const SYS_MPROTECT: u64 = 60;
+pub const SYS_MREMAP: u64 = 61;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -232,6 +234,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_KILL_SIG => sys_kill_sig(a0, a1),
         SYS_SIGPENDING => crate::sched::get_signal_pending(),
+        SYS_MPROTECT => sys_mprotect(a0, a1, a2),
+        SYS_MREMAP => sys_mremap(a0, a1, a2),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1459,6 +1463,37 @@ fn sys_cpu_load(cpu_id: u64) -> u64 {
     let window = crate::sched::hotplug::load_window() as u64;
     let online = crate::sched::hotplug::online_mask();
     load | (window << 32) | ((online & 0xFFFF) << 48)
+}
+
+// --- Phase 42: mprotect + mremap ---
+
+/// mprotect(addr, len, prot) -> 0 on success, u64::MAX on error.
+fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    if aspace_id == 0 { return u64::MAX; }
+
+    let new_prot = match prot {
+        0 => crate::mm::vma::VmaProt::ReadOnly,
+        1 => crate::mm::vma::VmaProt::ReadWrite,
+        2 => crate::mm::vma::VmaProt::ReadExec,
+        3 => crate::mm::vma::VmaProt::ReadWriteExec,
+        _ => return u64::MAX,
+    };
+
+    if crate::mm::aspace::mprotect(aspace_id, addr as usize, len as usize, new_prot) {
+        0
+    } else {
+        u64::MAX
+    }
+}
+
+/// mremap(old_addr, old_len, new_len) -> new_addr on success, u64::MAX on error.
+fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64) -> u64 {
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    if aspace_id == 0 { return u64::MAX; }
+
+    let result = crate::mm::aspace::mremap(aspace_id, old_addr as usize, old_len as usize, new_len as usize);
+    if result == 0 { u64::MAX } else { result as u64 }
 }
 
 // --- Phase 41: Signal delivery framework ---

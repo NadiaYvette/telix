@@ -2462,6 +2462,136 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 42: mprotect + mremap ---
+    syscall::debug_puts(b"  init: testing mprotect + mremap...\n");
+    {
+        let mut phase42_ok = true;
+
+        // Test mprotect: allocate RW page, write to it, change to RO, verify data survives.
+        if let Some(va) = syscall::mmap_anon(0, 1, 1) { // 1 page, RW
+            let page_size = 0x10000usize; // PAGE_SIZE = 64K
+            let mmu_page = 0x1000usize;   // MMUPAGE_SIZE = 4K
+
+            // Write a known value.
+            unsafe { core::ptr::write_volatile(va as *mut u64, 0xDEAD_BEEF); }
+
+            // Change protection to RO.
+            if !syscall::mprotect(va, page_size, 0) {
+                syscall::debug_puts(b"  init: mprotect to RO failed\n");
+                phase42_ok = false;
+            }
+
+            // Read the value back — should still be there.
+            let val = unsafe { core::ptr::read_volatile(va as *const u64) };
+            if val != 0xDEAD_BEEF {
+                syscall::debug_puts(b"  init: mprotect data corrupted\n");
+                phase42_ok = false;
+            }
+
+            // Change back to RW to verify we can write again.
+            if !syscall::mprotect(va, page_size, 1) {
+                syscall::debug_puts(b"  init: mprotect to RW failed\n");
+                phase42_ok = false;
+            }
+
+            // Write after re-enabling RW.
+            unsafe { core::ptr::write_volatile(va as *mut u64, 0xCAFE_BABE); }
+            let val2 = unsafe { core::ptr::read_volatile(va as *const u64) };
+            if val2 != 0xCAFE_BABE {
+                syscall::debug_puts(b"  init: mprotect write-after-RW failed\n");
+                phase42_ok = false;
+            }
+
+            // Test mprotect on sub-range: split VMA.
+            // Change first MMU page to RO, rest stays RW.
+            if !syscall::mprotect(va, mmu_page, 0) {
+                syscall::debug_puts(b"  init: mprotect sub-range failed\n");
+                phase42_ok = false;
+            }
+
+            // Read from the RO sub-page should work.
+            let val3 = unsafe { core::ptr::read_volatile(va as *const u64) };
+            if val3 != 0xCAFE_BABE {
+                syscall::debug_puts(b"  init: mprotect sub-range read failed\n");
+                phase42_ok = false;
+            }
+
+            // Write to second MMU page (still RW) should work.
+            let second_page = (va + mmu_page) as *mut u64;
+            unsafe { core::ptr::write_volatile(second_page, 0x1234_5678); }
+            let val4 = unsafe { core::ptr::read_volatile(second_page as *const u64) };
+            if val4 != 0x1234_5678 {
+                syscall::debug_puts(b"  init: mprotect second page RW failed\n");
+                phase42_ok = false;
+            }
+
+            syscall::munmap(va);
+        } else {
+            syscall::debug_puts(b"  init: mmap for mprotect test failed\n");
+            phase42_ok = false;
+        }
+
+        // Test mremap grow: allocate 1 page, write data, grow to 2 pages,
+        // verify original data survives and new region is accessible.
+        if let Some(va) = syscall::mmap_anon(0, 1, 1) {
+            let page_size = 0x10000usize;
+
+            // Write a sentinel.
+            unsafe { core::ptr::write_volatile(va as *mut u64, 0xAAAA_BBBB); }
+
+            // Grow from 1 page to 2 pages.
+            if let Some(new_va) = syscall::mremap(va, page_size, page_size * 2) {
+                if new_va != va {
+                    syscall::debug_puts(b"  init: mremap moved unexpectedly\n");
+                    phase42_ok = false;
+                }
+
+                // Original data intact.
+                let val = unsafe { core::ptr::read_volatile(new_va as *const u64) };
+                if val != 0xAAAA_BBBB {
+                    syscall::debug_puts(b"  init: mremap data lost\n");
+                    phase42_ok = false;
+                }
+
+                // Write to new region.
+                let new_region = (new_va + page_size) as *mut u64;
+                unsafe { core::ptr::write_volatile(new_region, 0xCCCC_DDDD); }
+                let val2 = unsafe { core::ptr::read_volatile(new_region as *const u64) };
+                if val2 != 0xCCCC_DDDD {
+                    syscall::debug_puts(b"  init: mremap new region write failed\n");
+                    phase42_ok = false;
+                }
+
+                // Shrink back to 1 page.
+                if let Some(shrunk_va) = syscall::mremap(new_va, page_size * 2, page_size) {
+                    let val3 = unsafe { core::ptr::read_volatile(shrunk_va as *const u64) };
+                    if val3 != 0xAAAA_BBBB {
+                        syscall::debug_puts(b"  init: mremap shrink data lost\n");
+                        phase42_ok = false;
+                    }
+                    syscall::munmap(shrunk_va);
+                } else {
+                    syscall::debug_puts(b"  init: mremap shrink failed\n");
+                    phase42_ok = false;
+                    syscall::munmap(new_va);
+                }
+            } else {
+                syscall::debug_puts(b"  init: mremap grow failed\n");
+                phase42_ok = false;
+                syscall::munmap(va);
+            }
+        } else {
+            syscall::debug_puts(b"  init: mmap for mremap test failed\n");
+            phase42_ok = false;
+        }
+
+        if phase42_ok {
+            syscall::debug_puts(b"Phase 42 mprotect + mremap: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 42 mprotect + mremap: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

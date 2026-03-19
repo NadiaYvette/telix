@@ -650,6 +650,27 @@ pub fn cpu_load(cpu_id: u32) -> Option<(u32, u32, u16)> {
     Some((load, window, online_mask))
 }
 
+const SYS_MPROTECT: u64 = 60;
+const SYS_MREMAP: u64 = 61;
+
+/// Change the protection of a memory region.
+/// addr and len must be MMUPAGE_SIZE (4K) aligned.
+/// prot: 0=RO, 1=RW, 2=RX, 3=RWX.
+/// Returns true on success.
+pub fn mprotect(addr: usize, len: usize, prot: u8) -> bool {
+    let r = unsafe { arch::syscall3(SYS_MPROTECT, addr as u64, len as u64, prot as u64) };
+    r == 0
+}
+
+/// Resize an existing anonymous mapping.
+/// old_addr must be the start of a VMA, old_len must match VMA length.
+/// new_len is the desired new size (MMUPAGE_SIZE aligned).
+/// Returns the new VA (same as old_addr) or None on error.
+pub fn mremap(old_addr: usize, old_len: usize, new_len: usize) -> Option<usize> {
+    let r = unsafe { arch::syscall3(SYS_MREMAP, old_addr as u64, old_len as u64, new_len as u64) };
+    if r == u64::MAX { None } else { Some(r as usize) }
+}
+
 /// Register a service with the name server.
 pub fn ns_register(name: &[u8], service_port: u32) -> bool {
     let nsrv = nsrv_port();

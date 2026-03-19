@@ -122,6 +122,11 @@ impl MemObject {
         false
     }
 
+    /// Count active mappings.
+    pub fn mapping_count(&self) -> usize {
+        self.mappings.iter().filter(|m| m.active).count()
+    }
+
     /// Remove a mapping record.
     pub fn remove_mapping(&mut self, aspace_id: u32, va_start: usize) {
         for m in &mut self.mappings {

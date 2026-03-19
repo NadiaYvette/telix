@@ -400,6 +400,42 @@ pub fn downgrade_pte_readonly(pml4: usize, va: usize) -> bool {
     true
 }
 
+/// Update the flags of an existing 4K PTE, keeping the physical address.
+/// Returns true if the PTE was present and updated.
+pub fn update_pte_flags(pml4: usize, va: usize, new_flags: u64) -> bool {
+    let pml4_table = pml4 as *mut u64;
+    let pml4_idx = (va >> 39) & 0x1FF;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pd_idx = (va >> 21) & 0x1FF;
+    let pt_idx = (va >> 12) & 0x1FF;
+
+    let pdpt = match walk_table(pml4_table, pml4_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let pd = match walk_table(pdpt, pdpt_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let pt = match walk_table(pd, pd_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let entry = unsafe { *pt.add(pt_idx) };
+    if entry & PTE_P == 0 {
+        return false;
+    }
+    let pa = entry & 0x000F_FFFF_FFFF_F000;
+    unsafe {
+        *pt.add(pt_idx) = pa | new_flags;
+    }
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) va);
+    }
+    true
+}
+
 /// Install a 2 MiB superpage at `va` (must be 2 MiB-aligned) backed by `pa` (must be 2 MiB-aligned).
 /// Replaces the PD entry with a large page entry (PTE_PS). Frees the old PT page if one existed.
 pub fn install_superpage(pml4: usize, va: usize, pa: usize, flags: u64) -> bool {
