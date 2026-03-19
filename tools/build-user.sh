@@ -54,6 +54,10 @@ for bin in init hello echo_client initramfs_srv ramdisk_srv blk_srv cache_srv fa
     fi
 done
 
+# Rebuild the FAT16 test disk with hello ELF for exec-from-filesystem test.
+echo "Building FAT16 test disk..."
+"$ROOTDIR/tools/make-fat16.sh" "$TARGET"
+
 # Rebuild the CPIO archive.
 echo "Packing initramfs..."
 "$ROOTDIR/tools/make-initramfs.sh"
