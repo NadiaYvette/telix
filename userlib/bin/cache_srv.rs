@@ -1,11 +1,12 @@
 #![no_std]
 #![no_main]
 
-//! Block device cache server.
+//! Page cache server.
 //!
 //! Sits between filesystem servers (fat16_srv) and the block device server (blk_srv),
-//! presenting the same IO_READ/IO_WRITE protocol. Implements a 64-entry direct-mapped
-//! sector cache with write-through policy.
+//! presenting the same IO_READ/IO_WRITE protocol. Implements a 128-entry page cache
+//! with 4 KiB (MMUPAGE_SIZE) granularity, clock-LRU eviction, read-ahead, and
+//! write-through policy.
 //!
 //! Registers as "cache_blk" with the name server.
 
@@ -25,29 +26,245 @@ const IO_STAT_OK: u64 = 0x401;
 const IO_CLOSE: u64 = 0x500;
 const IO_ERROR: u64 = 0xF00;
 
-// Cache stats query tag.
 const CACHE_STATS: u64 = 0xC100;
 const CACHE_STATS_OK: u64 = 0xC101;
 
 const SECTOR_SIZE: usize = 512;
-const CACHE_SLOTS: usize = 64;
-const INVALID_SECTOR: u64 = u64::MAX;
+const MMUPAGE_SIZE: usize = 4096;
+const SECTORS_PER_PAGE: usize = MMUPAGE_SIZE / SECTOR_SIZE; // 8
+const CACHE_ENTRIES: usize = 128;
+const HASH_SIZE: usize = 256;
+const INVALID: u64 = u64::MAX;
+const DATA_ALLOC_PAGES: usize = 8; // 128 * 4096 / 65536 = 8
 
 /// Grant VA where clients (fat16_srv) grant their scratch pages to us.
 const CLIENT_GRANT_VA: usize = 0x6_0000_0000;
 /// Grant VA where we grant our scratch page to blk_srv.
 const BLK_GRANT_VA: usize = 0x5_0000_0000;
 
-// --- Cache entry ---
+// --- Cache entry (one per 4K page) ---
 #[derive(Clone, Copy)]
 struct CacheEntry {
-    sector: u64,
-    valid: bool,
+    page_number: u64, // INVALID if empty
+    referenced: bool,
 }
 
 impl CacheEntry {
     const fn empty() -> Self {
-        Self { sector: INVALID_SECTOR, valid: false }
+        Self { page_number: INVALID, referenced: false }
+    }
+}
+
+// --- Hash table entry for O(1) lookup ---
+#[derive(Clone, Copy)]
+struct HashEntry {
+    page_number: u64,
+    slot: u8,
+    occupied: bool,
+}
+
+impl HashEntry {
+    const fn empty() -> Self {
+        Self { page_number: 0, slot: 0, occupied: false }
+    }
+}
+
+// --- Page cache state ---
+struct PageCache {
+    entries: [CacheEntry; CACHE_ENTRIES],
+    hash: [HashEntry; HASH_SIZE],
+    clock_hand: usize,
+    data_va: usize, // base of 512 KiB data pool
+    hits: u64,
+    misses: u64,
+    occupied: u32,
+}
+
+impl PageCache {
+    fn new(data_va: usize) -> Self {
+        Self {
+            entries: [CacheEntry::empty(); CACHE_ENTRIES],
+            hash: [HashEntry::empty(); HASH_SIZE],
+            clock_hand: 0,
+            data_va,
+            hits: 0,
+            misses: 0,
+            occupied: 0,
+        }
+    }
+
+    /// Look up a page in the hash table. Returns cache slot index.
+    fn lookup(&self, page_number: u64) -> Option<usize> {
+        let mut idx = (page_number as usize) % HASH_SIZE;
+        for _ in 0..HASH_SIZE {
+            let h = &self.hash[idx];
+            if !h.occupied {
+                return None;
+            }
+            if h.page_number == page_number {
+                return Some(h.slot as usize);
+            }
+            idx = (idx + 1) % HASH_SIZE;
+        }
+        None
+    }
+
+    /// Insert a page→slot mapping into the hash table.
+    fn hash_insert(&mut self, page_number: u64, slot: usize) {
+        let mut idx = (page_number as usize) % HASH_SIZE;
+        for _ in 0..HASH_SIZE {
+            if !self.hash[idx].occupied {
+                self.hash[idx] = HashEntry {
+                    page_number,
+                    slot: slot as u8,
+                    occupied: true,
+                };
+                return;
+            }
+            idx = (idx + 1) % HASH_SIZE;
+        }
+    }
+
+    /// Remove a page from the hash table, rehashing displaced entries.
+    fn hash_remove(&mut self, page_number: u64) {
+        let mut idx = (page_number as usize) % HASH_SIZE;
+        // Find the entry.
+        loop {
+            if !self.hash[idx].occupied {
+                return; // Not found.
+            }
+            if self.hash[idx].page_number == page_number {
+                break;
+            }
+            idx = (idx + 1) % HASH_SIZE;
+        }
+        // Remove it.
+        self.hash[idx].occupied = false;
+        // Rehash displaced entries.
+        let mut j = (idx + 1) % HASH_SIZE;
+        loop {
+            if !self.hash[j].occupied {
+                break;
+            }
+            let entry = self.hash[j];
+            self.hash[j].occupied = false;
+            // Re-insert.
+            let mut k = (entry.page_number as usize) % HASH_SIZE;
+            loop {
+                if !self.hash[k].occupied {
+                    self.hash[k] = entry;
+                    break;
+                }
+                k = (k + 1) % HASH_SIZE;
+            }
+            j = (j + 1) % HASH_SIZE;
+        }
+    }
+
+    /// Find a victim slot via clock-LRU sweep. Evicts the victim and returns its index.
+    fn clock_evict(&mut self) -> usize {
+        // If there are empty slots, use one.
+        for i in 0..CACHE_ENTRIES {
+            if self.entries[i].page_number == INVALID {
+                return i;
+            }
+        }
+        // Clock sweep.
+        loop {
+            let slot = self.clock_hand;
+            self.clock_hand = (self.clock_hand + 1) % CACHE_ENTRIES;
+            if self.entries[slot].referenced {
+                self.entries[slot].referenced = false;
+            } else {
+                // Evict this entry.
+                self.hash_remove(self.entries[slot].page_number);
+                self.entries[slot].page_number = INVALID;
+                self.occupied -= 1;
+                return slot;
+            }
+        }
+    }
+
+    /// Fill a cache slot by reading 8 sectors from blk_srv.
+    fn fill_page(&mut self, blk: &BlkClient, slot: usize, page_number: u64, max_sectors: u64) {
+        let base_sector = page_number * SECTORS_PER_PAGE as u64;
+        let dest_base = self.data_va + slot * MMUPAGE_SIZE;
+        for i in 0..SECTORS_PER_PAGE {
+            let sector = base_sector + i as u64;
+            if sector < max_sectors {
+                let mut buf = [0u8; SECTOR_SIZE];
+                if blk.read_sector(sector, &mut buf) {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            buf.as_ptr(),
+                            (dest_base + i * SECTOR_SIZE) as *mut u8,
+                            SECTOR_SIZE,
+                        );
+                    }
+                } else {
+                    // Zero-fill on read failure.
+                    unsafe {
+                        core::ptr::write_bytes(
+                            (dest_base + i * SECTOR_SIZE) as *mut u8,
+                            0,
+                            SECTOR_SIZE,
+                        );
+                    }
+                }
+            } else {
+                // Beyond disk capacity — zero-fill.
+                unsafe {
+                    core::ptr::write_bytes(
+                        (dest_base + i * SECTOR_SIZE) as *mut u8,
+                        0,
+                        SECTOR_SIZE,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Read handler. Returns data pointer and length, or None on error.
+    fn read(
+        &mut self,
+        blk: &BlkClient,
+        offset: usize,
+        length: usize,
+        max_sectors: u64,
+    ) -> Option<(*const u8, usize)> {
+        let page_number = (offset / MMUPAGE_SIZE) as u64;
+        let off_in_page = offset % MMUPAGE_SIZE;
+        let bytes = length.min(MMUPAGE_SIZE - off_in_page);
+
+        if let Some(slot) = self.lookup(page_number) {
+            // Cache hit.
+            self.entries[slot].referenced = true;
+            self.hits += 1;
+            let ptr = (self.data_va + slot * MMUPAGE_SIZE + off_in_page) as *const u8;
+            Some((ptr, bytes))
+        } else {
+            // Cache miss.
+            self.misses += 1;
+            let slot = self.clock_evict();
+            self.fill_page(blk, slot, page_number, max_sectors);
+            self.entries[slot] = CacheEntry { page_number, referenced: true };
+            self.hash_insert(page_number, slot);
+            self.occupied += 1;
+            let ptr = (self.data_va + slot * MMUPAGE_SIZE + off_in_page) as *const u8;
+            Some((ptr, bytes))
+        }
+    }
+
+    /// Write handler. Updates cache if page is present (write-no-allocate).
+    fn write_update(&mut self, offset: usize, data: *const u8, length: usize) {
+        let page_number = (offset / MMUPAGE_SIZE) as u64;
+        let off_in_page = offset % MMUPAGE_SIZE;
+        if let Some(slot) = self.lookup(page_number) {
+            let bytes = length.min(MMUPAGE_SIZE - off_in_page);
+            let dst = (self.data_va + slot * MMUPAGE_SIZE + off_in_page) as *mut u8;
+            unsafe { core::ptr::copy_nonoverlapping(data, dst, bytes); }
+            self.entries[slot].referenced = true;
+        }
     }
 }
 
@@ -61,7 +278,6 @@ struct BlkClient {
 
 impl BlkClient {
     fn read_sector(&self, sector: u64, out: &mut [u8; 512]) -> bool {
-        // Grant our scratch page to blk_srv.
         if !syscall::grant_pages(self.blk_aspace, self.scratch_va, BLK_GRANT_VA, 1, false) {
             return false;
         }
@@ -92,7 +308,6 @@ impl BlkClient {
     }
 
     fn write_sector(&self, sector: u64, data: &[u8; 512]) -> bool {
-        // Copy data into scratch page.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 data.as_ptr(),
@@ -184,6 +399,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         loop { core::hint::spin_loop(); }
     };
 
+    let max_sectors = disk_capacity / SECTOR_SIZE as u64;
+
     syscall::debug_puts(b"  [cache_srv] connected to blk_srv, capacity=");
     print_num(disk_capacity);
     syscall::debug_puts(b" bytes\n");
@@ -204,21 +421,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         scratch_va,
     };
 
-    // Allocate cache data page (64 slots × 512 bytes = 32 KiB, fits in one 64 KiB alloc page).
-    let cache_data_va = match syscall::mmap_anon(0, 1, 1) {
+    // Allocate 512 KiB data pool (128 entries × 4 KiB = 8 allocation pages).
+    let data_va = match syscall::mmap_anon(0, DATA_ALLOC_PAGES, 1) {
         Some(va) => va,
         None => {
-            syscall::debug_puts(b"  [cache_srv] cache data alloc FAILED\n");
+            syscall::debug_puts(b"  [cache_srv] data pool alloc FAILED\n");
             loop { core::hint::spin_loop(); }
         }
     };
 
-    // Initialize cache entries.
-    let mut entries = [CacheEntry::empty(); CACHE_SLOTS];
-    let mut hits: u64 = 0;
-    let mut misses: u64 = 0;
+    let mut cache = PageCache::new(data_va);
 
-    syscall::debug_puts(b"  [cache_srv] ready (64-entry sector cache)\n");
+    syscall::debug_puts(b"  [cache_srv] ready (128-entry page cache, 512 KiB)\n");
 
     // Server loop.
     loop {
@@ -230,7 +444,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         match msg.tag {
             IO_CONNECT => {
                 let reply_port = (msg.data[2] >> 32) as u32;
-                // Reply with disk capacity and our aspace_id (same protocol as blk_srv).
                 syscall::send(reply_port, IO_CONNECT_OK,
                     0, disk_capacity, my_aspace as u64, 0);
             }
@@ -241,69 +454,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let reply_port = (msg.data[2] >> 32) as u32;
                 let grant_va = msg.data[3] as usize;
 
-                let sector = (offset / SECTOR_SIZE) as u64;
-                let slot = (sector as usize) % CACHE_SLOTS;
-
-                if entries[slot].valid && entries[slot].sector == sector {
-                    // Cache hit — copy from cache data directly.
-                    hits += 1;
-                    let bytes_read = length.min(SECTOR_SIZE);
-
+                if let Some((ptr, bytes_read)) = cache.read(&blk, offset, length, max_sectors) {
                     if grant_va != 0 {
-                        let src = (cache_data_va + slot * SECTOR_SIZE) as *const u8;
                         let dst = grant_va as *mut u8;
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(src, dst, bytes_read);
-                        }
+                        unsafe { core::ptr::copy_nonoverlapping(ptr, dst, bytes_read); }
                         syscall::send_nb(reply_port, IO_READ_OK, bytes_read as u64, 0);
                     } else {
-                        // Inline read (shouldn't happen from fat16_srv, but handle it).
-                        let mut buf = [0u8; 512];
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                (cache_data_va + slot * SECTOR_SIZE) as *const u8,
-                                buf.as_mut_ptr(),
-                                SECTOR_SIZE,
-                            );
-                        }
+                        // Inline read.
                         let inline_len = bytes_read.min(40);
+                        let mut buf = [0u8; 40];
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), inline_len);
+                        }
                         let packed = pack_inline_data(&buf[..inline_len]);
                         syscall::send(reply_port, IO_READ_OK,
                             inline_len as u64, packed[0], packed[1], packed[2]);
                     }
                 } else {
-                    // Cache miss — read from blk_srv.
-                    misses += 1;
-                    let mut buf = [0u8; 512];
-
-                    if blk.read_sector(sector, &mut buf) {
-                        // Populate cache slot.
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                buf.as_ptr(),
-                                (cache_data_va + slot * SECTOR_SIZE) as *mut u8,
-                                SECTOR_SIZE,
-                            );
-                        }
-                        entries[slot] = CacheEntry { sector, valid: true };
-
-                        let bytes_read = length.min(SECTOR_SIZE);
-
-                        if grant_va != 0 {
-                            let dst = grant_va as *mut u8;
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, bytes_read);
-                            }
-                            syscall::send_nb(reply_port, IO_READ_OK, bytes_read as u64, 0);
-                        } else {
-                            let inline_len = bytes_read.min(40);
-                            let packed = pack_inline_data(&buf[..inline_len]);
-                            syscall::send(reply_port, IO_READ_OK,
-                                inline_len as u64, packed[0], packed[1], packed[2]);
-                        }
-                    } else {
-                        syscall::send_nb(reply_port, IO_ERROR, 1, 0);
-                    }
+                    syscall::send_nb(reply_port, IO_ERROR, 1, 0);
                 }
             }
 
@@ -314,11 +482,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let grant_va = msg.data[3] as usize;
 
                 let sector = (offset / SECTOR_SIZE) as u64;
-                let slot = (sector as usize) % CACHE_SLOTS;
-
                 let mut buf = [0u8; 512];
 
-                // Copy data from client's grant page.
                 if grant_va != 0 {
                     let bytes_to_write = length.min(SECTOR_SIZE);
                     unsafe {
@@ -332,16 +497,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 // Write-through: forward to blk_srv.
                 if blk.write_sector(sector, &buf) {
-                    // Update cache slot.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            buf.as_ptr(),
-                            (cache_data_va + slot * SECTOR_SIZE) as *mut u8,
-                            SECTOR_SIZE,
-                        );
-                    }
-                    entries[slot] = CacheEntry { sector, valid: true };
-
+                    // Update cache if page is present (write-no-allocate).
+                    cache.write_update(offset, buf.as_ptr(), length.min(SECTOR_SIZE));
                     syscall::send_nb(reply_port, IO_WRITE_OK, length.min(SECTOR_SIZE) as u64, 0);
                 } else {
                     syscall::send_nb(reply_port, IO_ERROR, 1, 0);
@@ -357,7 +514,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             CACHE_STATS => {
                 let reply_port = (msg.data[0] >> 32) as u32;
-                syscall::send(reply_port, CACHE_STATS_OK, hits, misses, 0, 0);
+                syscall::send(reply_port, CACHE_STATS_OK,
+                    cache.hits, cache.misses, CACHE_ENTRIES as u64, cache.occupied as u64);
             }
 
             _ => {}

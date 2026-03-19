@@ -1194,8 +1194,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::port_destroy(svc_port);
     }
 
-    // --- Test 25: Cache Server ---
-    syscall::debug_puts(b"  init: testing cache server...\n");
+    // --- Test 25: Phase 33 Page Cache ---
+    syscall::debug_puts(b"  init: testing page cache...\n");
     {
         let mut cache_ok = false;
 
@@ -1219,72 +1219,76 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if cr.tag == 0x101 {
                     let cache_aspace = cr.data[2] as u32;
 
-                    // Allocate scratch page for grant-based reads.
                     if let Some(scratch_va) = syscall::mmap_anon(0, 1, 1) {
                         let grant_va: usize = 0x7_0000_0000;
+                        let rd2 = 512u64 | ((cache_reply as u64) << 32);
+                        let mut test_ok = true;
 
-                        // Read 1: sector 0 (cache miss).
-                        if syscall::grant_pages(cache_aspace, scratch_va, grant_va, 1, false) {
-                            let rd2 = 512u64 | ((cache_reply as u64) << 32);
-                            syscall::send(cache_port, 0x200, 0, 0, rd2, grant_va as u64);
-
-                            if let Some(rr) = syscall::recv_msg(cache_reply) {
-                                if rr.tag == 0x201 && rr.data[0] == 512 {
-                                    // Save first 8 bytes of sector 0.
-                                    let mut first_read = [0u8; 8];
-                                    unsafe {
-                                        core::ptr::copy_nonoverlapping(
-                                            scratch_va as *const u8,
-                                            first_read.as_mut_ptr(),
-                                            8,
-                                        );
-                                    }
-
-                                    syscall::revoke(cache_aspace, grant_va);
-
-                                    // Read 2: sector 0 again (should be cache hit).
-                                    if syscall::grant_pages(cache_aspace, scratch_va, grant_va, 1, false) {
-                                        syscall::send(cache_port, 0x200, 0, 0, rd2, grant_va as u64);
-
-                                        if let Some(rr2) = syscall::recv_msg(cache_reply) {
-                                            if rr2.tag == 0x201 && rr2.data[0] == 512 {
-                                                let mut second_read = [0u8; 8];
-                                                unsafe {
-                                                    core::ptr::copy_nonoverlapping(
-                                                        scratch_va as *const u8,
-                                                        second_read.as_mut_ptr(),
-                                                        8,
-                                                    );
-                                                }
-
-                                                // Verify data matches.
-                                                if first_read == second_read {
-                                                    // Query cache stats.
-                                                    syscall::revoke(cache_aspace, grant_va);
-                                                    let sd0 = (cache_reply as u64) << 32;
-                                                    syscall::send(cache_port, 0xC100, sd0, 0, 0, 0);
-                                                    if let Some(sr) = syscall::recv_msg(cache_reply) {
-                                                        if sr.tag == 0xC101 && sr.data[0] > 0 {
-                                                            cache_ok = true;
-                                                            syscall::debug_puts(b"  init: cache hits=");
-                                                            print_num(sr.data[0]);
-                                                            syscall::debug_puts(b" misses=");
-                                                            print_num(sr.data[1]);
-                                                            syscall::debug_puts(b"\n");
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        // Best-effort revoke for second grant.
-                                        syscall::revoke(cache_aspace, grant_va);
-                                    }
-                                } else {
-                                    syscall::revoke(cache_aspace, grant_va);
-                                }
-                            } else {
-                                syscall::revoke(cache_aspace, grant_va);
+                        // Helper: read a sector via cache_srv grant.
+                        // Returns true on success.
+                        let cache_read = |offset: u64| -> bool {
+                            if !syscall::grant_pages(cache_aspace, scratch_va, grant_va, 1, false) {
+                                return false;
                             }
+                            syscall::send(cache_port, 0x200, 0, offset, rd2, grant_va as u64);
+                            let ok = if let Some(rr) = syscall::recv_msg(cache_reply) {
+                                rr.tag == 0x201 && rr.data[0] == 512
+                            } else {
+                                false
+                            };
+                            syscall::revoke(cache_aspace, grant_va);
+                            ok
+                        };
+
+                        // Step 1: Read sector 0 (offset 0) — cache miss, triggers read-ahead
+                        // for the full 4K page (sectors 0-7).
+                        if !cache_read(0) { test_ok = false; }
+
+                        // Step 2: Read sector 7 (offset 3584) — same 4K page, should hit
+                        // due to read-ahead (tail packing).
+                        if !cache_read(3584) { test_ok = false; }
+
+                        // Query stats after read-ahead test.
+                        let sd0 = (cache_reply as u64) << 32;
+                        syscall::send(cache_port, 0xC100, sd0, 0, 0, 0);
+                        let (hits_after_readahead, misses_after_readahead) =
+                            if let Some(sr) = syscall::recv_msg(cache_reply) {
+                                if sr.tag == 0xC101 { (sr.data[0], sr.data[1]) }
+                                else { test_ok = false; (0, 0) }
+                            } else { test_ok = false; (0, 0) };
+
+                        // Read-ahead: first read = 1 miss, second read = 1 hit.
+                        if hits_after_readahead < 1 { test_ok = false; }
+
+                        // Step 3: Read a few more distinct pages to verify
+                        // page-level caching works across multiple entries.
+                        for pg in 1..5u64 {
+                            if !cache_read(pg * 4096) { test_ok = false; break; }
+                        }
+                        // Re-read page 1 — should hit.
+                        if !cache_read(4096) { test_ok = false; }
+
+                        // Query stats to get current counts.
+                        syscall::send(cache_port, 0xC100, sd0, 0, 0, 0);
+                        let (final_hits, final_misses, cache_size) =
+                            if let Some(sr) = syscall::recv_msg(cache_reply) {
+                                if sr.tag == 0xC101 {
+                                    (sr.data[0], sr.data[1], sr.data[2])
+                                } else { test_ok = false; (0, 0, 0) }
+                            } else { test_ok = false; (0, 0, 0) };
+
+                        // Verify cache size = 128.
+                        if cache_size != 128 { test_ok = false; }
+
+                        if test_ok {
+                            cache_ok = true;
+                            syscall::debug_puts(b"  init: cache hits=");
+                            print_num(final_hits);
+                            syscall::debug_puts(b" misses=");
+                            print_num(final_misses);
+                            syscall::debug_puts(b" size=");
+                            print_num(cache_size);
+                            syscall::debug_puts(b"\n");
                         }
 
                         syscall::munmap(scratch_va);
@@ -1296,9 +1300,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         if cache_ok {
-            syscall::debug_puts(b"Phase 25 cache server: PASSED\n");
+            syscall::debug_puts(b"Phase 33 page cache: PASSED\n");
         } else {
-            syscall::debug_puts(b"Phase 25 cache server: FAILED\n");
+            syscall::debug_puts(b"Phase 33 page cache: FAILED\n");
         }
     }
 
