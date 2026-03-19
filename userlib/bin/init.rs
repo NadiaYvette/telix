@@ -32,6 +32,22 @@ fn pack_name(name: &[u8]) -> (u64, u64, u64) {
     (words[0], words[1], words[2])
 }
 
+/// Global flag address for signal handler test.
+static mut SIG_FLAG_PTR: *mut u64 = core::ptr::null_mut();
+
+/// Signal handler for SIGUSR1: writes 42 to the flag, then calls sigreturn.
+#[unsafe(no_mangle)]
+fn signal_handler_sigusr1(_sig: u64, frame_addr: u64) {
+    unsafe {
+        if !SIG_FLAG_PTR.is_null() {
+            core::ptr::write_volatile(SIG_FLAG_PTR, 42);
+        }
+    }
+    syscall::sigreturn(frame_addr);
+    // sigreturn never returns, but just in case:
+    loop { core::hint::spin_loop(); }
+}
+
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"Telix init starting\n");
@@ -2360,7 +2376,64 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    // --- Test 31: Phase 40 execve syscall ---
+    // --- Test 31: Phase 41 signal delivery ---
+    syscall::debug_puts(b"  init: testing signal delivery...\n");
+    {
+        // Use a known VA for a signal-received flag (in our mmap'd region).
+        // Allocate one page for signal state.
+        let flag_page = syscall::mmap_anon(0, 1, 1); // RW
+        if let Some(flag_va) = flag_page {
+            let flag_ptr = flag_va as *mut u64;
+            unsafe {
+                *flag_ptr = 0;
+                SIG_FLAG_PTR = flag_ptr;
+            }
+
+            let handler_addr = signal_handler_sigusr1 as *const () as u64;
+            let old = syscall::sigaction(syscall::SIGUSR1, handler_addr, 0, 0);
+
+            // Send SIGUSR1 to ourselves.
+            let my_tid = syscall::thread_id() as u32;
+            syscall::kill_sig(my_tid, syscall::SIGUSR1);
+
+            // After signal delivery and handler execution, flag should be set.
+            // The handler runs before we get back here.
+            let flag_val = unsafe { core::ptr::read_volatile(flag_ptr) };
+            if flag_val == 42 {
+                syscall::debug_puts(b"Phase 41 signal delivery: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 41 signal delivery: FAILED (flag=");
+                print_num(flag_val);
+                syscall::debug_puts(b")\n");
+            }
+
+            // Restore default handler.
+            syscall::sigaction(syscall::SIGUSR1, syscall::SIG_DFL, 0, 0);
+
+            // Test sigprocmask: block SIGUSR2, send it, check pending.
+            let _old_mask = syscall::sigprocmask(0, syscall::sig_bit(syscall::SIGUSR2)); // SIG_BLOCK
+            syscall::kill_sig(my_tid, syscall::SIGUSR2);
+            let pending = syscall::sigpending();
+            let usr2_pending = pending & syscall::sig_bit(syscall::SIGUSR2) != 0;
+
+            // Unblock — signal should be delivered (default action = terminate,
+            // but we want to survive, so install ignore first).
+            syscall::sigaction(syscall::SIGUSR2, syscall::SIG_IGN, 0, 0);
+            syscall::sigprocmask(1, syscall::sig_bit(syscall::SIGUSR2)); // SIG_UNBLOCK
+
+            if usr2_pending {
+                syscall::debug_puts(b"  sigprocmask/sigpending: OK\n");
+            } else {
+                syscall::debug_puts(b"  sigprocmask/sigpending: FAILED\n");
+            }
+
+            syscall::munmap(flag_va);
+        } else {
+            syscall::debug_puts(b"Phase 41 signal delivery: FAILED (mmap)\n");
+        }
+    }
+
+    // --- Test 32: Phase 40 execve syscall ---
     syscall::debug_puts(b"  init: testing execve...\n");
     {
         let child = syscall::fork();

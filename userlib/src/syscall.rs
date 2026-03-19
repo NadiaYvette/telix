@@ -472,6 +472,11 @@ pub fn set_quota(child_task: u32, resource_type: u32, limit: u32) -> bool {
 }
 
 const SYS_EXECVE: u64 = 54;
+const SYS_SIGACTION: u64 = 55;
+const SYS_SIGPROCMASK: u64 = 56;
+const SYS_SIGRETURN: u64 = 57;
+const SYS_KILL_SIG: u64 = 58;
+const SYS_SIGPENDING: u64 = 59;
 const SYS_FORK: u64 = 39;
 const SYS_SEND_CAP: u64 = 40;
 #[allow(dead_code)]
@@ -487,6 +492,62 @@ pub fn fork() -> u64 {
 /// On success, this function never returns. On failure, returns u64::MAX.
 pub fn execve(name: &[u8]) -> u64 {
     unsafe { arch::syscall2(SYS_EXECVE, name.as_ptr() as u64, name.len() as u64) }
+}
+
+// Signal constants.
+pub const SIG_DFL: u64 = 0;
+pub const SIG_IGN: u64 = 1;
+pub const SIGHUP: u32 = 1;
+pub const SIGINT: u32 = 2;
+pub const SIGQUIT: u32 = 3;
+pub const SIGILL: u32 = 4;
+pub const SIGABRT: u32 = 6;
+pub const SIGBUS: u32 = 7;
+pub const SIGFPE: u32 = 8;
+pub const SIGKILL: u32 = 9;
+pub const SIGUSR1: u32 = 10;
+pub const SIGSEGV: u32 = 11;
+pub const SIGUSR2: u32 = 12;
+pub const SIGPIPE: u32 = 13;
+pub const SIGALRM: u32 = 14;
+pub const SIGTERM: u32 = 15;
+pub const SIGCHLD: u32 = 17;
+pub const SIGCONT: u32 = 18;
+pub const SIGSTOP: u32 = 19;
+
+/// Bitmask for a signal number (1-based).
+pub const fn sig_bit(sig: u32) -> u64 {
+    if sig >= 1 && sig <= 32 { 1u64 << (sig - 1) } else { 0 }
+}
+
+/// Install a signal handler. handler: 0=SIG_DFL, 1=SIG_IGN, else=function pointer.
+/// sa_mask: additional signals to mask during handler execution.
+/// flags: bit 0 = SA_RESTART.
+/// Returns the previous handler, or u64::MAX on error.
+pub fn sigaction(sig: u32, handler: u64, sa_mask: u64, flags: u64) -> u64 {
+    unsafe { arch::syscall4(SYS_SIGACTION, sig as u64, handler, sa_mask, flags) }
+}
+
+/// Modify the signal mask. how: 0=SIG_BLOCK, 1=SIG_UNBLOCK, 2=SIG_SETMASK.
+/// Returns the previous mask.
+pub fn sigprocmask(how: u32, set: u64) -> u64 {
+    unsafe { arch::syscall2(SYS_SIGPROCMASK, how as u64, set) }
+}
+
+/// Restore the pre-signal state after a signal handler completes.
+/// `frame_addr` is the signal frame address passed as the second argument to the handler.
+pub fn sigreturn(frame_addr: u64) {
+    unsafe { arch::syscall1(SYS_SIGRETURN, frame_addr); }
+}
+
+/// Get the set of pending signals.
+pub fn sigpending() -> u64 {
+    unsafe { arch::syscall0(SYS_SIGPENDING) }
+}
+
+/// Send a specific signal to a task (identified by any thread ID in it).
+pub fn kill_sig(tid: u32, sig: u32) -> bool {
+    unsafe { arch::syscall2(SYS_KILL_SIG, tid as u64, sig as u64) == 0 }
 }
 
 /// Send a message with an attached capability transfer.

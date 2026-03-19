@@ -68,6 +68,11 @@ pub const SYS_TRACE_READ: u64 = 51;
 pub const SYS_CPU_HOTPLUG: u64 = 52;
 pub const SYS_CPU_LOAD: u64 = 53;
 pub const SYS_EXECVE: u64 = 54;
+pub const SYS_SIGACTION: u64 = 55;
+pub const SYS_SIGPROCMASK: u64 = 56;
+pub const SYS_SIGRETURN: u64 = 57;
+pub const SYS_KILL_SIG: u64 = 58;
+pub const SYS_SIGPENDING: u64 = 59;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -218,6 +223,15 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
             sys_execve(a0, a1, frame);
             return;
         }
+        SYS_SIGACTION => sys_sigaction(a0, a1, a2, a3),
+        SYS_SIGPROCMASK => sys_sigprocmask(a0, a1),
+        SYS_SIGRETURN => {
+            // sigreturn restores the saved frame — bypass set_return.
+            sys_sigreturn(frame);
+            return;
+        }
+        SYS_KILL_SIG => sys_kill_sig(a0, a1),
+        SYS_SIGPENDING => crate::sched::get_signal_pending(),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -231,6 +245,11 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
     let tid = crate::sched::scheduler::current_thread_id();
     if crate::sched::scheduler::is_killed(tid) {
         crate::sched::scheduler::exit_current_thread(-9);
+    }
+
+    // Deliver pending signals before returning to userspace (user tasks only).
+    if crate::sched::scheduler::current_aspace_id() != 0 {
+        deliver_pending_signals(frame);
     }
 }
 
@@ -1440,4 +1459,207 @@ fn sys_cpu_load(cpu_id: u64) -> u64 {
     let window = crate::sched::hotplug::load_window() as u64;
     let online = crate::sched::hotplug::online_mask();
     load | (window << 32) | ((online & 0xFFFF) << 48)
+}
+
+// --- Phase 41: Signal delivery framework ---
+
+/// sigaction(sig, handler, sa_mask, flags) -> old_handler or u64::MAX on error.
+/// flags: bit 0 = SA_RESTART.
+/// handler: 0 = SIG_DFL, 1 = SIG_IGN, else = user function pointer.
+fn sys_sigaction(sig: u64, handler: u64, sa_mask: u64, flags: u64) -> u64 {
+    use crate::sched::task::{SigHandler, SignalAction};
+
+    let sig = sig as u32;
+    let new_handler = match handler {
+        0 => SigHandler::Default,
+        1 => SigHandler::Ignore,
+        addr => SigHandler::User(addr),
+    };
+    let action = SignalAction {
+        handler: new_handler,
+        sa_mask,
+        restart: flags & 1 != 0,
+    };
+
+    match crate::sched::set_signal_action(sig, action) {
+        Some(old) => match old.handler {
+            SigHandler::Default => 0,
+            SigHandler::Ignore => 1,
+            SigHandler::User(addr) => addr,
+        },
+        None => u64::MAX,
+    }
+}
+
+/// sigprocmask(how, new_mask) -> old_mask.
+/// how: 0 = SIG_BLOCK (add to mask), 1 = SIG_UNBLOCK (remove from mask),
+///      2 = SIG_SETMASK (replace mask).
+fn sys_sigprocmask(how: u64, new_set: u64) -> u64 {
+    let current = crate::sched::get_signal_mask();
+    let final_mask = match how {
+        0 => current | new_set,  // SIG_BLOCK
+        1 => current & !new_set, // SIG_UNBLOCK
+        2 => new_set,            // SIG_SETMASK
+        _ => return current,     // invalid how, return current mask unchanged
+    };
+    crate::sched::set_signal_mask(final_mask)
+}
+
+/// kill_sig(tid, sig) -> 0 on success, u64::MAX on error.
+/// Sends signal `sig` to the task containing thread `tid`.
+fn sys_kill_sig(tid: u64, sig: u64) -> u64 {
+    let task_id = crate::sched::thread_task_id(tid as u32);
+    if crate::sched::send_signal_to_task(task_id, sig as u32) { 0 } else { u64::MAX }
+}
+
+/// sigreturn(frame_addr): restore the exception frame from the signal frame.
+/// frame_addr is the address of the signal frame on the user stack (passed as arg0).
+fn sys_sigreturn(frame: &mut ExceptionFrame) {
+    let pt_root = crate::sched::scheduler::current_page_table_root();
+
+    // frame_addr is passed as the first syscall argument.
+    let frame_addr = syscall_arg(frame, 0) as usize;
+
+    // The signal frame layout (pushed by deliver_pending_signals):
+    //   [frame_addr + 0]      = saved_mask (8 bytes)
+    //   [frame_addr + 8]      = saved frame data (EXCEPTION_FRAME_SIZE bytes)
+    let saved_mask_va = frame_addr;
+    let saved_frame_va = frame_addr + 8;
+
+    // Restore signal mask.
+    let mut mask_buf = [0u8; 8];
+    if copy_from_user(pt_root, saved_mask_va, &mut mask_buf) {
+        let mask = u64::from_le_bytes(mask_buf);
+        crate::sched::set_signal_mask(mask);
+    }
+
+    // Restore exception frame.
+    let frame_size = crate::sched::thread::EXCEPTION_FRAME_SIZE;
+    let frame_bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            frame as *mut ExceptionFrame as *mut u8,
+            frame_size,
+        )
+    };
+    copy_from_user(pt_root, saved_frame_va, frame_bytes);
+    // frame is now restored — dispatch() returns and exception return
+    // will jump back to wherever the program was before the signal.
+}
+
+/// Signal frame layout on user stack (grows downward):
+///   [SP + 0]   = saved signal mask (u64, 8 bytes)
+///   [SP + 8]   = saved exception frame (EXCEPTION_FRAME_SIZE bytes)
+///   [SP + 8 + EXCEPTION_FRAME_SIZE] = sigreturn trampoline code (if needed)
+/// Total = 8 + EXCEPTION_FRAME_SIZE, aligned to 16 bytes.
+const SIGFRAME_OVERHEAD: usize = 8; // saved_mask
+
+/// Deliver pending signals to the current thread by rewriting the exception frame.
+/// Called at the end of dispatch() before returning to userspace.
+fn deliver_pending_signals(frame: &mut ExceptionFrame) {
+    // Dequeue one signal at a time.
+    let sig = match crate::sched::dequeue_signal() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let action = match crate::sched::get_signal_action(sig) {
+        Some(a) => a,
+        None => return,
+    };
+
+    use crate::sched::task::SigHandler;
+
+    match action.handler {
+        SigHandler::Default => {
+            // Default action: terminate for most signals.
+            if crate::sched::task::sig_default_is_term(sig) {
+                crate::sched::scheduler::exit_current_thread(-(sig as i32));
+            }
+            // Default ignore: nothing to do.
+        }
+        SigHandler::Ignore => {
+            // Explicitly ignored — do nothing.
+        }
+        SigHandler::User(handler_addr) => {
+            // Push a signal frame and redirect execution to the handler.
+            let pt_root = crate::sched::scheduler::current_page_table_root();
+            let frame_size = crate::sched::thread::EXCEPTION_FRAME_SIZE;
+            let total_frame = SIGFRAME_OVERHEAD + frame_size;
+            // Align to 16 bytes.
+            let aligned_size = (total_frame + 15) & !15;
+
+            // Get current user SP.
+            #[cfg(target_arch = "aarch64")]
+            let user_sp = frame.regs[31] as usize;
+            #[cfg(target_arch = "riscv64")]
+            let user_sp = frame.regs[1] as usize;
+            #[cfg(target_arch = "x86_64")]
+            let user_sp = frame.rsp() as usize;
+
+            let new_sp = user_sp - aligned_size;
+
+            // Save current signal mask to signal frame.
+            let old_mask = crate::sched::get_signal_mask();
+            let mask_bytes = old_mask.to_le_bytes();
+            if !copy_to_user(pt_root, new_sp, &mask_bytes) {
+                // Can't write signal frame — terminate.
+                crate::sched::scheduler::exit_current_thread(-(sig as i32));
+            }
+
+            // Save current exception frame to signal frame.
+            let frame_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    frame as *const ExceptionFrame as *const u8,
+                    frame_size,
+                )
+            };
+            if !copy_to_user(pt_root, new_sp + SIGFRAME_OVERHEAD, frame_bytes) {
+                crate::sched::scheduler::exit_current_thread(-(sig as i32));
+            }
+
+            // Block signals specified in sa_mask + the delivered signal itself.
+            let new_mask = old_mask | action.sa_mask | crate::sched::task::sig_bit(sig);
+            crate::sched::set_signal_mask(new_mask);
+
+            // Rewrite frame to jump to the signal handler.
+            // Handler signature: fn handler(sig: u64, frame_addr: u64)
+            // frame_addr is passed so the handler can call sigreturn(frame_addr).
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                frame.regs[0] = sig as u64;            // arg0 = signal number
+                frame.regs[1] = new_sp as u64;          // arg1 = signal frame address
+                frame.regs[31] = new_sp as u64;         // SP_EL0 = new stack
+                frame.regs[30] = 0;                     // LR = 0 (handler must sigreturn)
+                let fp = frame as *mut ExceptionFrame as *mut u64;
+                unsafe { *fp.add(32) = handler_addr; }
+            }
+
+            #[cfg(target_arch = "riscv64")]
+            {
+                frame.regs[9] = sig as u64;             // a0 = signal number
+                frame.regs[10] = new_sp as u64;         // a1 = signal frame address
+                frame.regs[1] = new_sp as u64;          // sp = new stack
+                frame.regs[0] = 0;                      // ra = 0
+                let fp = frame as *mut ExceptionFrame as *mut u64;
+                unsafe { *fp.add(31) = handler_addr; }
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Push return address (0) on the new stack for x86 calling convention.
+                let call_sp = new_sp - 8;
+                let zero_bytes = 0u64.to_le_bytes();
+                let _ = copy_to_user(pt_root, call_sp, &zero_bytes);
+
+                let fp = frame as *mut ExceptionFrame as *mut u64;
+                unsafe {
+                    *fp.add(9) = sig as u64;             // rdi = signal number
+                    *fp.add(10) = new_sp as u64;          // rsi = signal frame address
+                    *fp.add(17) = handler_addr;           // RIP = handler
+                    *fp.add(20) = call_sp as u64;         // RSP = adjusted stack
+                }
+            }
+        }
+    }
 }

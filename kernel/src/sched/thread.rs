@@ -60,6 +60,10 @@ pub struct Thread {
     pub blocked_on: BlockReason,
     /// Exit code set by sys_exit (for thread_join).
     pub exit_code: i32,
+    /// Per-thread signal mask — bitmask of blocked signals (bit N = signal N+1).
+    pub sig_mask: u64,
+    /// Per-thread pending signal set.
+    pub sig_pending: u64,
 }
 
 impl Thread {
@@ -76,6 +80,8 @@ impl Thread {
             stack_base: 0,
             blocked_on: BlockReason::None,
             exit_code: 0,
+            sig_mask: 0,
+            sig_pending: 0,
         }
     }
 }

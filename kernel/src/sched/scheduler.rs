@@ -313,6 +313,8 @@ impl Scheduler {
         thread.default_quantum = quantum;
         thread.saved_sp = frame_sp as u64;
         thread.stack_base = stack_base;
+        thread.sig_mask = 0;
+        thread.sig_pending = 0;
 
         self.run_queues[priority as usize].push(id);
         Some(id)
@@ -544,6 +546,8 @@ impl Scheduler {
         thread.default_quantum = quantum;
         thread.saved_sp = frame_sp as u64;
         thread.stack_base = kstack_base;
+        thread.sig_mask = 0;
+        thread.sig_pending = 0;
 
         self.run_queues[priority as usize].push(id);
         Some(id)
@@ -629,6 +633,8 @@ impl Scheduler {
         thread.saved_sp = frame_sp as u64;
         thread.stack_base = kstack_base;
         thread.exit_code = 0;
+        thread.sig_mask = 0;
+        thread.sig_pending = 0;
 
         self.tasks[task_id as usize].thread_count += 1;
         self.run_queues[priority as usize].push(id);
@@ -1174,6 +1180,154 @@ pub fn kill_task(tid: ThreadId) -> bool {
     true
 }
 
+/// Send a signal to a task (process-directed). Queues on the first
+/// thread in the task that has the signal unmasked, or the first thread.
+/// SIGKILL always uses the old kill path (immediate termination).
+pub fn send_signal_to_task(task_id: u32, sig: u32) -> bool {
+    use super::task::{sig_bit, SIGKILL, SIGSTOP, UNCATCHABLE, MAX_SIGNALS};
+    if sig < 1 || sig > MAX_SIGNALS as u32 { return false; }
+    if sig == SIGKILL {
+        // Use existing kill path for SIGKILL.
+        let sched = SCHEDULER.lock();
+        // Find any thread in this task.
+        for i in 0..MAX_THREADS {
+            let t = &sched.threads[i];
+            if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
+                drop(sched);
+                return kill_task(i as ThreadId);
+            }
+        }
+        return false;
+    }
+
+    let bit = sig_bit(sig);
+    let mut sched = SCHEDULER.lock();
+
+    // Check handler disposition.
+    if (task_id as usize) < super::task::MAX_TASKS {
+        let task = &sched.tasks[task_id as usize];
+        if !task.active { return false; }
+        let action = &task.sig_actions[(sig - 1) as usize];
+        // If ignored (and not uncatchable), drop the signal.
+        if action.handler == super::task::SigHandler::Ignore {
+            return true; // accepted but ignored
+        }
+        // If default and default is ignore, drop it.
+        if action.handler == super::task::SigHandler::Default
+            && !super::task::sig_default_is_term(sig)
+        {
+            return true;
+        }
+    }
+
+    // Find a thread to receive: prefer one with signal unmasked.
+    let mut target: Option<usize> = None;
+    let mut any_thread: Option<usize> = None;
+    for i in 0..sched.next_thread_id as usize {
+        let t = &sched.threads[i];
+        if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
+            if any_thread.is_none() { any_thread = Some(i); }
+            if t.sig_mask & bit == 0 {
+                target = Some(i);
+                break;
+            }
+        }
+    }
+    let tid = match target.or(any_thread) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    sched.threads[tid].sig_pending |= bit;
+    drop(sched);
+
+    // Wake the target thread so it can deliver the signal.
+    wake_thread(tid as ThreadId);
+    true
+}
+
+/// Send a signal to a specific thread.
+pub fn send_signal_to_thread(tid: ThreadId, sig: u32) -> bool {
+    use super::task::{sig_bit, SIGKILL, MAX_SIGNALS};
+    if sig < 1 || sig > MAX_SIGNALS as u32 { return false; }
+    if tid as usize >= MAX_THREADS { return false; }
+    if sig == SIGKILL {
+        return kill_task(tid);
+    }
+
+    let bit = sig_bit(sig);
+    let mut sched = SCHEDULER.lock();
+    let t = &mut sched.threads[tid as usize];
+    if t.state == ThreadState::Dead || t.stack_base == 0 { return false; }
+    t.sig_pending |= bit;
+    drop(sched);
+    wake_thread(tid);
+    true
+}
+
+/// Get and clear the next deliverable signal for the current thread.
+/// Returns Some(signal_number) if there's a pending, unmasked signal.
+pub fn dequeue_signal() -> Option<u32> {
+    let tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    let t = &mut sched.threads[tid as usize];
+    let deliverable = t.sig_pending & !t.sig_mask;
+    if deliverable == 0 { return None; }
+    // Find lowest-numbered signal.
+    let bit_idx = deliverable.trailing_zeros();
+    let sig = bit_idx + 1;
+    t.sig_pending &= !(1u64 << bit_idx);
+    Some(sig)
+}
+
+/// Get the signal action for a signal in the current thread's task.
+pub fn get_signal_action(sig: u32) -> Option<super::task::SignalAction> {
+    let tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let sched = SCHEDULER.lock();
+    let task_id = sched.threads[tid as usize].task_id;
+    let task = &sched.tasks[task_id as usize];
+    if sig < 1 || sig > super::task::MAX_SIGNALS as u32 { return None; }
+    Some(task.sig_actions[(sig - 1) as usize])
+}
+
+/// Set signal action for the current task. Returns previous action.
+pub fn set_signal_action(sig: u32, action: super::task::SignalAction) -> Option<super::task::SignalAction> {
+    use super::task::{UNCATCHABLE, MAX_SIGNALS, sig_bit};
+    if sig < 1 || sig > MAX_SIGNALS as u32 { return None; }
+    if sig_bit(sig) & UNCATCHABLE != 0 { return None; } // can't change SIGKILL/SIGSTOP
+    let tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    let task_id = sched.threads[tid as usize].task_id;
+    let old = sched.tasks[task_id as usize].sig_actions[(sig - 1) as usize];
+    sched.tasks[task_id as usize].sig_actions[(sig - 1) as usize] = action;
+    Some(old)
+}
+
+/// Set the signal mask for the current thread. Returns old mask.
+pub fn set_signal_mask(new_mask: u64) -> u64 {
+    use super::task::UNCATCHABLE;
+    let tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    let old = sched.threads[tid as usize].sig_mask;
+    // Cannot mask SIGKILL or SIGSTOP.
+    sched.threads[tid as usize].sig_mask = new_mask & !UNCATCHABLE;
+    old
+}
+
+/// Get the signal mask for the current thread.
+pub fn get_signal_mask() -> u64 {
+    let tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let sched = SCHEDULER.lock();
+    sched.threads[tid as usize].sig_mask
+}
+
+/// Get the pending signal set for the current thread.
+pub fn get_signal_pending() -> u64 {
+    let tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let sched = SCHEDULER.lock();
+    sched.threads[tid as usize].sig_pending
+}
+
 #[allow(dead_code)]
 pub fn current_thread_id() -> ThreadId {
     smp::current().current_thread.load(Ordering::Relaxed)
@@ -1232,12 +1386,12 @@ pub fn fork_current() -> u64 {
     }
 
     // Gather parent info.
-    let (parent_tid, parent_task_id, parent_aspace_id, parent_priority, parent_quantum) = {
+    let (parent_tid, parent_task_id, parent_aspace_id, parent_priority, parent_quantum, parent_sig_mask) = {
         let tid = smp::current().current_thread.load(Ordering::Relaxed);
         let sched = SCHEDULER.lock();
         let thread = &sched.threads[tid as usize];
         let task = &sched.tasks[thread.task_id as usize];
-        (tid, thread.task_id, task.aspace_id, thread.base_priority, thread.default_quantum)
+        (tid, thread.task_id, task.aspace_id, thread.base_priority, thread.default_quantum, thread.sig_mask)
     };
 
     // Clone the address space (COW). This is done outside the scheduler lock
@@ -1343,6 +1497,8 @@ pub fn fork_current() -> u64 {
     thread.saved_sp = child_frame_sp as u64;
     thread.stack_base = kstack_base;
     thread.exit_code = 0;
+    thread.sig_mask = parent_sig_mask;
+    thread.sig_pending = 0;
 
     sched.run_queues[parent_priority as usize].push(child_tid);
 
