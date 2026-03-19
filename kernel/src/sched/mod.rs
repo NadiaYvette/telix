@@ -2,6 +2,7 @@ pub mod thread;
 pub mod task;
 pub mod scheduler;
 pub mod smp;
+pub mod stats;
 pub mod topology;
 
 #[allow(unused_imports)]

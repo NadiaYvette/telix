@@ -1814,6 +1814,96 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 27: Phase 35 Profiling Infrastructure ---
+    syscall::debug_puts(b"  init: testing profiling infrastructure...\n");
+    {
+        let mut prof_ok = true;
+
+        // Part A: Verify new stat counters increment.
+        let sys_before = syscall::vm_stats(14); // SYSCALLS
+        let send_before = syscall::vm_stats(15); // IPC_SENDS
+        let recv_before = syscall::vm_stats(16); // IPC_RECVS
+
+        // Do IPC work.
+        let tp = syscall::port_create() as u32;
+        syscall::send_nb(tp, 0xBEEF, 42, 0);
+        let _ = syscall::recv_nb_msg(tp);
+        syscall::port_destroy(tp);
+
+        let sys_after = syscall::vm_stats(14);
+        let send_after = syscall::vm_stats(15);
+        let recv_after = syscall::vm_stats(16);
+
+        if sys_after <= sys_before { prof_ok = false; }
+        if send_after <= send_before { prof_ok = false; }
+        if recv_after <= recv_before { prof_ok = false; }
+
+        // Verify newly exposed mm stats are accessible.
+        let pages_zeroed = syscall::vm_stats(5);
+        let ptes_installed = syscall::vm_stats(6);
+        if pages_zeroed == u64::MAX || ptes_installed == u64::MAX { prof_ok = false; }
+
+        // Part B: Trace ring buffer.
+        // Clear and enable.
+        userlib::profile::trace_clear();
+        userlib::profile::trace_enable();
+
+        // Do operations to generate trace events.
+        let tp2 = syscall::port_create() as u32;
+        syscall::send_nb(tp2, 0xAAAA, 1, 2);
+        let _ = syscall::recv_nb_msg(tp2);
+        syscall::port_destroy(tp2);
+
+        // Disable.
+        userlib::profile::trace_disable();
+
+        // Read trace entries.
+        if let Some(trace_va) = syscall::mmap_anon(0, 1, 1) {
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(
+                    trace_va as *mut userlib::profile::TraceEntry,
+                    64,
+                )
+            };
+            let count = userlib::profile::trace_read(buf);
+
+            if count == 0 { prof_ok = false; }
+
+            // Verify at least one SYSCALL_ENTER event.
+            let mut found_syscall = false;
+            for i in 0..count {
+                if buf[i].event_type == userlib::profile::EVT_SYSCALL_ENTER {
+                    found_syscall = true;
+                    break;
+                }
+            }
+            if !found_syscall { prof_ok = false; }
+
+            syscall::munmap(trace_va);
+
+            // Print summary.
+            syscall::debug_puts(b"  stats: ctx_sw=");
+            print_num(syscall::vm_stats(13));
+            syscall::debug_puts(b" syscalls=");
+            print_num(sys_after);
+            syscall::debug_puts(b" ipc_send=");
+            print_num(send_after);
+            syscall::debug_puts(b" ipc_recv=");
+            print_num(recv_after);
+            syscall::debug_puts(b" trace=");
+            print_num(count as u64);
+            syscall::debug_puts(b"\n");
+        } else {
+            prof_ok = false;
+        }
+
+        if prof_ok {
+            syscall::debug_puts(b"Phase 35 profiling infrastructure: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 35 profiling infrastructure: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

@@ -11,6 +11,7 @@ mod mm;
 mod sched;
 mod sync;
 mod syscall;
+mod trace;
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {

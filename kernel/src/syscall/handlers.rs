@@ -63,6 +63,8 @@ pub const SYS_COSCHED_SET: u64 = 46;
 pub const SYS_SET_AFFINITY: u64 = 47;
 pub const SYS_GET_AFFINITY: u64 = 48;
 pub const SYS_CPU_TOPOLOGY: u64 = 49;
+pub const SYS_TRACE_CTRL: u64 = 50;
+pub const SYS_TRACE_READ: u64 = 51;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -148,6 +150,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
     let a4 = syscall_arg(frame, 4);
     let a5 = syscall_arg(frame, 5);
 
+    crate::sched::stats::SYSCALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::trace::trace_event(crate::trace::EVT_SYSCALL_ENTER, nr as u32, 0);
+
     let result = match nr {
         SYS_DEBUG_PUTCHAR => sys_debug_putchar(a0),
         SYS_PORT_CREATE => sys_port_create(),
@@ -198,12 +203,18 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SET_AFFINITY => sys_set_affinity(a0, a1),
         SYS_GET_AFFINITY => crate::sched::get_affinity(a0 as u32),
         SYS_CPU_TOPOLOGY => sys_cpu_topology(a0),
+        SYS_TRACE_CTRL => crate::trace::trace_ctrl(a0),
+        SYS_TRACE_READ => {
+            let pt_root = crate::sched::scheduler::current_page_table_root();
+            crate::trace::trace_read(pt_root, a0 as usize, a1 as usize)
+        }
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
         }
     };
 
+    crate::trace::trace_event(crate::trace::EVT_SYSCALL_EXIT, nr as u32, result as u32);
     set_return(frame, result);
 
     // Check if this thread was killed — terminate before returning to userspace.
@@ -1075,8 +1086,7 @@ fn sys_cap_revoke(port_id: u64) -> u64 {
     count as u64
 }
 
-/// Return VM statistics. `which` selects the stat:
-///   0 = superpage promotions, 1 = superpage demotions
+/// Return VM/scheduler/IPC statistics. `which` selects the stat.
 fn sys_vm_stats(which: u64) -> u64 {
     use crate::mm::stats;
     use core::sync::atomic::Ordering;
@@ -1086,6 +1096,18 @@ fn sys_vm_stats(which: u64) -> u64 {
         2 => stats::MAJOR_FAULTS.load(Ordering::Relaxed),
         3 => stats::MINOR_FAULTS.load(Ordering::Relaxed),
         4 => crate::sched::scheduler::COSCHED_HITS.load(Ordering::Relaxed),
+        5 => stats::PAGES_ZEROED.load(Ordering::Relaxed),
+        6 => stats::PTES_INSTALLED.load(Ordering::Relaxed),
+        7 => stats::PTES_REMOVED.load(Ordering::Relaxed),
+        8 => stats::PAGES_RECLAIMED.load(Ordering::Relaxed),
+        9 => stats::WSCLOCK_SCANS.load(Ordering::Relaxed),
+        10 => stats::CONTIGUOUS_PROMOTIONS.load(Ordering::Relaxed),
+        11 => stats::COW_FAULTS.load(Ordering::Relaxed),
+        12 => stats::COW_PAGES_COPIED.load(Ordering::Relaxed),
+        13 => crate::sched::stats::CONTEXT_SWITCHES.load(Ordering::Relaxed),
+        14 => crate::sched::stats::SYSCALLS.load(Ordering::Relaxed),
+        15 => crate::sched::stats::IPC_SENDS.load(Ordering::Relaxed),
+        16 => crate::sched::stats::IPC_RECVS.load(Ordering::Relaxed),
         _ => u64::MAX,
     }
 }
@@ -1125,6 +1147,47 @@ pub(crate) fn copy_from_user(pt_root: usize, user_va: usize, dst: &mut [u8]) -> 
             core::ptr::copy_nonoverlapping(
                 pa as *const u8,
                 dst.as_mut_ptr().add(offset),
+                to_copy,
+            );
+        }
+        offset += to_copy;
+    }
+    true
+}
+
+/// Copy `src.len()` bytes to user virtual address `user_va`,
+/// using the page table at `pt_root` to translate addresses.
+pub(crate) fn copy_to_user(pt_root: usize, user_va: usize, src: &[u8]) -> bool {
+    if pt_root == 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), user_va as *mut u8, src.len());
+        }
+        return true;
+    }
+
+    let mut offset = 0;
+    while offset < src.len() {
+        let va = user_va + offset;
+        let pa = {
+            #[cfg(target_arch = "aarch64")]
+            { crate::arch::aarch64::mm::translate_va(pt_root, va) }
+            #[cfg(target_arch = "riscv64")]
+            { crate::arch::riscv64::mm::translate_va(pt_root, va) }
+            #[cfg(target_arch = "x86_64")]
+            { crate::arch::x86_64::mm::translate_va(pt_root, va) }
+        };
+
+        let pa = match pa {
+            Some(pa) => pa,
+            None => return false,
+        };
+
+        let page_remaining = 4096 - (pa & 0xFFF);
+        let to_copy = page_remaining.min(src.len() - offset);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr().add(offset),
+                pa as *mut u8,
                 to_copy,
             );
         }

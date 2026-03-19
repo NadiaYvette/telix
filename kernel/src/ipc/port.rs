@@ -250,6 +250,8 @@ pub fn recv_nb(port_id: PortId) -> Result<Message, ()> {
             if let Some(tid) = wakeup {
                 crate::sched::wake_thread(tid);
             }
+            crate::sched::stats::IPC_RECVS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::trace::trace_event(crate::trace::EVT_IPC_RECV, port_id, 0);
             Ok(msg)
         }
         Err(()) => Err(()),
@@ -263,6 +265,7 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
     // Stamp sender priority for priority inheritance.
     let tid = crate::sched::current_thread_id();
     msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
+    crate::sched::stats::IPC_SENDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut pending = msg;
     loop {
         let mut table = PORT_TABLE.lock();
@@ -397,6 +400,8 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
 
     let tid = crate::sched::current_thread_id();
     msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
+    crate::sched::stats::IPC_SENDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::trace::trace_event(crate::trace::EVT_IPC_SEND, port_id, 0);
 
     let mut table = PORT_TABLE.lock();
     if (port_id as usize) >= MAX_PORTS {
@@ -462,6 +467,7 @@ pub fn recv_or_park(port_id: PortId) -> Result<Message, ()> {
             if let Some(tid) = wakeup {
                 crate::sched::wake_thread(tid);
             }
+            crate::sched::stats::IPC_RECVS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             crate::sched::boost_priority(my_tid, msg.data[5] as u8);
             Ok(msg)
         }

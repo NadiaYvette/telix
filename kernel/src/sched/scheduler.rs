@@ -829,6 +829,8 @@ impl Scheduler {
             return current_sp;
         }
 
+        crate::sched::stats::CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        crate::trace::trace_event(crate::trace::EVT_CTX_SWITCH, prev_id, next_id);
 
         // Save current thread's SP.
         self.threads[prev_id as usize].saved_sp = current_sp;
