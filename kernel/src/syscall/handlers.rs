@@ -55,6 +55,7 @@ pub const SYS_SET_QUOTA: u64 = 38;
 pub const SYS_FORK: u64 = 39;
 pub const SYS_SEND_CAP: u64 = 40;
 pub const SYS_CAP_REVOKE: u64 = 41;
+pub const SYS_VM_STATS: u64 = 42;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -182,6 +183,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_FORK => crate::sched::scheduler::fork_current(),
         SYS_SEND_CAP => sys_send_cap(a0, a1, a2, a3, a4, a5),
         SYS_CAP_REVOKE => sys_cap_revoke(a0),
+        SYS_VM_STATS => sys_vm_stats(a0),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -655,6 +657,15 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64) -> u64 {
         });
     }
 
+    // Try superpage promotion for 2 MiB-aligned regions.
+    crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+        if let Some(vma) = aspace.find_vma_mut(va) {
+            crate::mm::fault::try_superpage_promotion_eager(
+                pt_root, vma, obj_id,
+            );
+        }
+    });
+
     // Increment page quota counter.
     if task_id != 0 {
         let mut sched = crate::sched::scheduler::SCHEDULER.lock();
@@ -1048,6 +1059,20 @@ fn sys_cap_revoke(port_id: u64) -> u64 {
     let cdt = &mut caps.cdt as *mut crate::cap::Cdt;
     let count = caps.spaces[task_id as usize].revoke(slot, unsafe { &mut *cdt });
     count as u64
+}
+
+/// Return VM statistics. `which` selects the stat:
+///   0 = superpage promotions, 1 = superpage demotions
+fn sys_vm_stats(which: u64) -> u64 {
+    use crate::mm::stats;
+    use core::sync::atomic::Ordering;
+    match which {
+        0 => stats::SUPERPAGE_PROMOTIONS.load(Ordering::Relaxed),
+        1 => stats::SUPERPAGE_DEMOTIONS.load(Ordering::Relaxed),
+        2 => stats::MAJOR_FAULTS.load(Ordering::Relaxed),
+        3 => stats::MINOR_FAULTS.load(Ordering::Relaxed),
+        _ => u64::MAX,
+    }
 }
 
 /// Copy `dst.len()` bytes from user virtual address `user_va` into `dst`,

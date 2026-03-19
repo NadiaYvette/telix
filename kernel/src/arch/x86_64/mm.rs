@@ -400,6 +400,116 @@ pub fn downgrade_pte_readonly(pml4: usize, va: usize) -> bool {
     true
 }
 
+/// Install a 2 MiB superpage at `va` (must be 2 MiB-aligned) backed by `pa` (must be 2 MiB-aligned).
+/// Replaces the PD entry with a large page entry (PTE_PS). Frees the old PT page if one existed.
+pub fn install_superpage(pml4: usize, va: usize, pa: usize, flags: u64) -> bool {
+    const SUPER_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
+    debug_assert!(va & (SUPER_SIZE - 1) == 0);
+    debug_assert!(pa & (SUPER_SIZE - 1) == 0);
+
+    let pml4_table = pml4 as *mut u64;
+    let pml4_idx = (va >> 39) & 0x1FF;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pd_idx = (va >> 21) & 0x1FF;
+
+    let pdpt = match get_or_create_table(pml4_table, pml4_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let pd = match get_or_create_table(pdpt, pdpt_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let old_entry = unsafe { *pd.add(pd_idx) };
+
+    // If there was a PT (non-PS, present), free it.
+    if old_entry & PTE_P != 0 && old_entry & PTE_PS == 0 {
+        let pt_addr = (old_entry & 0x000F_FFFF_FFFF_F000) as usize;
+        crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(pt_addr));
+    }
+
+    // Install 2 MiB large page entry.
+    unsafe {
+        *pd.add(pd_idx) = (pa as u64 & !0x1FFFFF) | flags | PTE_PS;
+    }
+    // Flush TLB for entire 2 MiB range.
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) va);
+    }
+    true
+}
+
+/// Check if `va` is mapped as a 2 MiB superpage. Returns (is_super, pa) if so.
+pub fn is_superpage(pml4: usize, va: usize) -> Option<usize> {
+    let pml4_table = pml4 as *mut u64;
+    let pml4_idx = (va >> 39) & 0x1FF;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pd_idx = (va >> 21) & 0x1FF;
+
+    let pdpt = walk_table(pml4_table, pml4_idx)?;
+    let pd = walk_table(pdpt, pdpt_idx)?;
+    let entry = unsafe { *pd.add(pd_idx) };
+    if entry & PTE_P != 0 && entry & PTE_PS != 0 {
+        let pa = (entry & 0x000F_FFFF_FFE0_0000) as usize; // Mask to 2 MiB alignment
+        Some(pa)
+    } else {
+        None
+    }
+}
+
+/// Demote a 2 MiB superpage back to 512 individual 4K PTEs.
+/// Allocates a new PT page, fills it with 512 entries pointing to the
+/// contiguous physical pages, and replaces the PD entry.
+pub fn demote_superpage(pml4: usize, va: usize, flags: u64) -> bool {
+    let pml4_table = pml4 as *mut u64;
+    let pml4_idx = (va >> 39) & 0x1FF;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pd_idx = (va >> 21) & 0x1FF;
+
+    let pdpt = match walk_table(pml4_table, pml4_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let pd = match walk_table(pdpt, pdpt_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let entry = unsafe { *pd.add(pd_idx) };
+    if entry & PTE_P == 0 || entry & PTE_PS == 0 {
+        return false; // Not a superpage.
+    }
+
+    let base_pa = (entry & 0x000F_FFFF_FFE0_0000) as usize;
+
+    // Allocate a PT page.
+    let pt = match alloc_table() {
+        Some(t) => t,
+        None => return false,
+    };
+    let pt_table = pt as *mut u64;
+
+    // Fill 512 entries.
+    for i in 0..512 {
+        let pa = base_pa + i * MMU_PAGE_SIZE;
+        unsafe {
+            *pt_table.add(i) = (pa as u64 & !0xFFF) | flags;
+        }
+    }
+
+    // Replace PD entry with table pointer.
+    unsafe {
+        *pd.add(pd_idx) = (pt as u64) | PTE_P | PTE_RW | PTE_US;
+    }
+
+    // Flush TLB.
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) va);
+    }
+    true
+}
+
 /// Reload CR3 to flush the TLB after page table changes.
 pub fn enable_mmu(pml4: usize) {
     unsafe {

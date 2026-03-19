@@ -281,6 +281,102 @@ pub fn downgrade_pte_readonly(root: usize, va: usize) -> bool {
     true
 }
 
+/// Install a 2 MiB megapage at `va` (must be 2 MiB-aligned) backed by `pa` (must be 2 MiB-aligned).
+/// In Sv39, a megapage is a leaf entry at L1 level (vpn1).
+pub fn install_superpage(root: usize, va: usize, pa: usize, flags: u64) -> bool {
+    const SUPER_SIZE: usize = 2 * 1024 * 1024;
+    debug_assert!(va & (SUPER_SIZE - 1) == 0);
+    debug_assert!(pa & (SUPER_SIZE - 1) == 0);
+
+    let root_table = root as *mut u64;
+    let vpn2 = (va >> 30) & 0x1FF;
+    let vpn1 = (va >> 21) & 0x1FF;
+
+    let l1 = match get_or_create_table(root_table, vpn2) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let old_entry = unsafe { *l1.add(vpn1) };
+
+    // If there was an L0 table (non-leaf, valid), free it.
+    if old_entry & PTE_V != 0 && old_entry & (PTE_R | PTE_W | PTE_X) == 0 {
+        let l0_addr = ((old_entry >> 10) << 12) as usize;
+        crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l0_addr));
+    }
+
+    // Install megapage leaf entry at L1.
+    unsafe {
+        *l1.add(vpn1) = pte_leaf(pa, flags);
+    }
+    unsafe {
+        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
+    }
+    true
+}
+
+/// Check if `va` is mapped as a 2 MiB megapage (leaf at L1 level).
+pub fn is_superpage(root: usize, va: usize) -> Option<usize> {
+    let root_table = root as *mut u64;
+    let vpn2 = (va >> 30) & 0x1FF;
+    let vpn1 = (va >> 21) & 0x1FF;
+
+    // Walk to L1 through root (non-leaf entry at root[vpn2]).
+    let l1 = walk_table(root_table, vpn2)?;
+    let entry = unsafe { *l1.add(vpn1) };
+    if entry & PTE_V != 0 && entry & (PTE_R | PTE_W | PTE_X) != 0 {
+        // Leaf at L1 = megapage.
+        let pa = ((entry >> 10) << 12) as usize;
+        // For megapages, PA[20:0] must be 0 (2 MiB-aligned).
+        Some(pa & !0x1FFFFF)
+    } else {
+        None
+    }
+}
+
+/// Demote a 2 MiB megapage back to 512 individual 4K PTEs.
+pub fn demote_superpage(root: usize, va: usize, flags: u64) -> bool {
+    let root_table = root as *mut u64;
+    let vpn2 = (va >> 30) & 0x1FF;
+    let vpn1 = (va >> 21) & 0x1FF;
+
+    let l1 = match walk_table(root_table, vpn2) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let entry = unsafe { *l1.add(vpn1) };
+    if entry & PTE_V == 0 || entry & (PTE_R | PTE_W | PTE_X) == 0 {
+        return false; // Not a megapage leaf.
+    }
+
+    let base_pa = (((entry >> 10) << 12) as usize) & !0x1FFFFF;
+
+    // Allocate an L0 table.
+    let l0 = match alloc_table() {
+        Some(t) => t,
+        None => return false,
+    };
+    let l0_table = l0 as *mut u64;
+
+    // Fill 512 entries.
+    for i in 0..512 {
+        let pa = base_pa + i * MMU_PAGE_SIZE;
+        unsafe {
+            *l0_table.add(i) = pte_leaf(pa, flags);
+        }
+    }
+
+    // Replace L1 entry with non-leaf pointer to L0.
+    unsafe {
+        *l1.add(vpn1) = pte_table(l0);
+    }
+    unsafe {
+        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
+    }
+    true
+}
+
 /// Return the kernel page table root (for switching back during exit).
 pub fn boot_page_table_root() -> usize {
     KERNEL_PT_ROOT.load(Ordering::Acquire)

@@ -501,6 +501,14 @@ pub fn cap_revoke(port_id: u32) -> u64 {
     unsafe { arch::syscall1(SYS_CAP_REVOKE, port_id as u64) }
 }
 
+const SYS_VM_STATS: u64 = 42;
+
+/// Query VM statistics. which: 0=superpage_promotions, 1=superpage_demotions.
+#[allow(dead_code)]
+pub fn vm_stats(which: u32) -> u64 {
+    unsafe { arch::syscall1(SYS_VM_STATS, which as u64) }
+}
+
 /// Register a service with the name server.
 pub fn ns_register(name: &[u8], service_port: u32) -> bool {
     let nsrv = nsrv_port();

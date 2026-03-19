@@ -163,6 +163,21 @@ pub fn unmap_anon(id: ASpaceId, va: usize) -> bool {
                 let obj_id = vma.object_id;
                 let va_start = vma.va_start;
                 let mmu_count = vma.mmu_page_count();
+                // Demote any superpages before unmapping individual PTEs.
+                {
+                    let super_size = 2 * 1024 * 1024;
+                    let flags = super::fault::pte_flags_for_vma_pub(vma);
+                    let mut m = 0;
+                    while m < mmu_count {
+                        let mmu_va = va_start + m * super::page::MMUPAGE_SIZE;
+                        let super_va = mmu_va & !(super_size - 1);
+                        if super::fault::is_superpage_mapped(pt_root, super_va).is_some() {
+                            super::fault::demote_superpage(pt_root, super_va, flags);
+                        }
+                        let next = ((super_va + super_size) - va_start) / super::page::MMUPAGE_SIZE;
+                        m = if next > m { next } else { m + (super_size / super::page::MMUPAGE_SIZE) };
+                    }
+                }
                 // Unmap all installed PTEs.
                 for mmu_idx in 0..mmu_count {
                     if vma.is_installed(mmu_idx) {
@@ -321,8 +336,27 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
             }
 
             // Downgrade writable PTEs in both parent and child.
+            // First demote any superpages in the parent so individual PTEs can be downgraded.
             if info.prot.writable() {
                 let mmu_count = info.va_len / super::page::MMUPAGE_SIZE;
+                // Demote parent superpages covering this VMA.
+                {
+                    let super_size = 2 * 1024 * 1024;
+                    let super_mmu = super_size / super::page::MMUPAGE_SIZE; // 512
+                    let flags = rw_flags_for_prot(info.prot);
+                    let mut m = 0;
+                    while m < mmu_count {
+                        let va = info.va_start + m * super::page::MMUPAGE_SIZE;
+                        let super_va = va & !(super_size - 1);
+                        if super::fault::is_superpage_mapped(parent_pt, super_va).is_some() {
+                            super::fault::demote_superpage(parent_pt, super_va, flags);
+                            super::stats::SUPERPAGE_DEMOTIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        }
+                        // Jump to next 2 MiB boundary.
+                        let next_super = ((super_va + super_size) - info.va_start) / super::page::MMUPAGE_SIZE;
+                        m = if next_super > m { next_super } else { m + super_mmu };
+                    }
+                }
                 for mmu_idx in 0..mmu_count {
                     let word = mmu_idx / 64;
                     let bit = mmu_idx % 64;

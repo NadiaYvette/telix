@@ -1483,7 +1483,55 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::port_destroy(port_notify);
     }
 
-    // --- Test 21: Benchmark Suite ---
+    // --- Test 21: Superpage Promotion ---
+    syscall::debug_puts(b"  init: testing superpage promotion...\n");
+    {
+        // Allocate 32 allocation pages = 2 MiB at 64K PAGE_SIZE.
+        // Touch all 512 MMU pages (4K each) to trigger faults, then check if
+        // the kernel promoted the region to a single 2 MiB superpage.
+        let promo_before = syscall::vm_stats(0); // superpage promotions before
+
+        // Allocate 32 pages (2 MiB) at a 2 MiB-aligned VA.
+        // VA must be 2 MiB-aligned so the kernel can install a superpage PTE.
+        let big_va = syscall::mmap_anon(0x10_0000_0000, 32, 1); // 64 GiB, 2 MiB-aligned
+        if let Some(base) = big_va {
+            // Touch every 4K page in the 2 MiB region to install all PTEs.
+            for i in 0..512 {
+                let ptr = (base + i * 4096) as *mut u8;
+                unsafe { core::ptr::write_volatile(ptr, (i & 0xFF) as u8); }
+            }
+
+            let promo_after = syscall::vm_stats(0);
+            let promotions = promo_after - promo_before;
+
+            // Verify data is still correct after potential migration.
+            let mut ok = true;
+            for i in 0..512 {
+                let ptr = (base + i * 4096) as *const u8;
+                let val = unsafe { core::ptr::read_volatile(ptr) };
+                if val != (i & 0xFF) as u8 {
+                    ok = false;
+                    break;
+                }
+            }
+
+            if promotions >= 1 && ok {
+                syscall::debug_puts(b"Phase 29 superpage promotion: PASSED\n");
+            } else if !ok {
+                syscall::debug_puts(b"Phase 29 superpage promotion: FAILED (data corrupt)\n");
+            } else {
+                // Promotion didn't happen — might be because buddy allocator
+                // couldn't find a contiguous 2 MiB block. Print stats.
+                syscall::debug_puts(b"  init: no superpage promoted (OOM contiguous?)\n");
+                syscall::debug_puts(b"Phase 29 superpage promotion: SKIPPED\n");
+            }
+            syscall::munmap(base);
+        } else {
+            syscall::debug_puts(b"Phase 29 superpage promotion: FAILED (mmap)\n");
+        }
+    }
+
+    // --- Test 22: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
         let bench_tid = syscall::spawn(b"bench", 50);

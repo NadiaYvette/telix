@@ -58,6 +58,15 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
                 scanned += 1;
 
                 let va = vma.va_start + mmu_idx * MMUPAGE_SIZE;
+
+                // If this VA is part of a superpage, demote it first.
+                let super_va = va & !(0x1FFFFF); // 2 MiB-aligned
+                if super::fault::is_superpage_mapped(pt_root, super_va).is_some() {
+                    let flags = super::fault::pte_flags_for_vma_pub(vma);
+                    super::fault::demote_superpage(pt_root, super_va, flags);
+                    stats::SUPERPAGE_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
+                }
+
                 let referenced = read_and_clear_ref_bit(pt_root, va);
 
                 if !referenced {
