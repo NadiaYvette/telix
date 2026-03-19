@@ -14,7 +14,7 @@ use super::task::{Task, TaskId, MAX_TASKS};
 use super::smp;
 use crate::sync::SpinLock;
 use crate::mm::page::{PAGE_SIZE, MMUPAGE_SIZE};
-use core::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicUsize, AtomicU32, AtomicU64, Ordering};
 
 /// Per-CPU saved frame SP. The exception handler stores the current frame_sp
 /// here before calling syscall dispatch, so that park_current_for_ipc() can
@@ -88,6 +88,27 @@ impl RunQueue {
             None
         }
     }
+
+    /// Search for and remove a thread belonging to the given coscheduling group.
+    /// Returns the first matching thread ID, or None.
+    fn find_remove_by_group(&mut self, group: u32) -> Option<ThreadId> {
+        for i in 0..self.len {
+            let idx = (self.head + i) % MAX_QUEUE_LEN;
+            let tid = self.entries[idx];
+            if COSCHED_GROUP[tid as usize].load(Ordering::Relaxed) == group {
+                // Remove by shifting subsequent entries toward head.
+                for j in i..self.len - 1 {
+                    let from = (self.head + j + 1) % MAX_QUEUE_LEN;
+                    let to = (self.head + j) % MAX_QUEUE_LEN;
+                    self.entries[to] = self.entries[from];
+                }
+                self.len -= 1;
+                self.tail = if self.tail == 0 { MAX_QUEUE_LEN - 1 } else { self.tail - 1 };
+                return Some(tid);
+            }
+        }
+        None
+    }
 }
 
 pub struct Scheduler {
@@ -96,6 +117,7 @@ pub struct Scheduler {
     run_queues: [RunQueue; NUM_PRIORITIES],
     next_thread_id: ThreadId,
     next_task_id: u32,
+    cosched_burst: u32,
 }
 
 impl Scheduler {
@@ -106,6 +128,7 @@ impl Scheduler {
             run_queues: [const { RunQueue::new() }; NUM_PRIORITIES],
             next_thread_id: 0,
             next_task_id: 0,
+            cosched_burst: 0,
         }
     }
 
@@ -741,7 +764,29 @@ impl Scheduler {
             return current_sp; // No preemption needed.
         }
 
-        let next_id = self.pick_next(idle_id);
+        // Cosched-aware pick: if prev has a group, try to find a group mate.
+        let prev_group = COSCHED_GROUP[prev_id as usize].load(Ordering::Relaxed);
+        let next_id = if prev_group != 0 && self.cosched_burst < MAX_COSCHED_BURST {
+            // Search all priority levels for a group mate.
+            let mut mate = None;
+            for prio in 0..NUM_PRIORITIES {
+                if let Some(id) = self.run_queues[prio].find_remove_by_group(prev_group) {
+                    mate = Some(id);
+                    break;
+                }
+            }
+            if let Some(id) = mate {
+                self.cosched_burst += 1;
+                COSCHED_HITS.fetch_add(1, Ordering::Relaxed);
+                id
+            } else {
+                self.cosched_burst = 0;
+                self.pick_next(idle_id)
+            }
+        } else {
+            self.cosched_burst = 0;
+            self.pick_next(idle_id)
+        };
 
         if prev_id == next_id {
             return current_sp;
@@ -945,6 +990,20 @@ static KILLED: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS] = {
     const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     [INIT; super::thread::MAX_THREADS]
 };
+
+// --- Coscheduling ---
+
+/// Per-thread coscheduling group ID (0 = no group).
+static COSCHED_GROUP: [AtomicU32; MAX_THREADS] = {
+    const INIT: AtomicU32 = AtomicU32::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Maximum consecutive cosched picks before yielding to other threads.
+const MAX_COSCHED_BURST: u32 = 4;
+
+/// Count of coscheduling hits (for testing/diagnostics).
+pub static COSCHED_HITS: AtomicU64 = AtomicU64::new(0);
 
 // --- Scheduler Activations ---
 
@@ -1667,4 +1726,10 @@ pub fn sa_getid() -> u64 {
         }
     }
     u64::MAX
+}
+
+/// Set the coscheduling group for the current thread. group=0 removes from any group.
+pub fn cosched_set(group: u32) {
+    let tid = current_thread_id();
+    COSCHED_GROUP[tid as usize].store(group, Ordering::Relaxed);
 }

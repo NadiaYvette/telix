@@ -1604,6 +1604,63 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 24: Phase 31 coscheduling ---
+    syscall::debug_puts(b"  init: testing coscheduling...\n");
+    {
+        let stacks = syscall::mmap_anon(0, 1, 1); // RW page for 4 stacks
+
+        if let Some(sk) = stacks {
+            // Record cosched hits before test.
+            let hits_before = syscall::vm_stats(4);
+
+            let stack_size: usize = 0x4000; // 16 KiB per stack
+            let tid_a = syscall::thread_create(
+                cosched_worker as u64,
+                (sk + stack_size) as u64,
+                1, // group_id = 1
+            );
+            let tid_b = syscall::thread_create(
+                cosched_worker as u64,
+                (sk + 2 * stack_size) as u64,
+                1, // group_id = 1
+            );
+            let tid_c1 = syscall::thread_create(
+                cosched_worker as u64,
+                (sk + 3 * stack_size) as u64,
+                0, // no group
+            );
+            let tid_c2 = syscall::thread_create(
+                cosched_worker as u64,
+                (sk + 4 * stack_size) as u64,
+                0, // no group
+            );
+
+            if tid_a != u64::MAX && tid_b != u64::MAX && tid_c1 != u64::MAX && tid_c2 != u64::MAX {
+                // Wait for all 4 threads.
+                syscall::thread_join(tid_a as u32);
+                syscall::thread_join(tid_b as u32);
+                syscall::thread_join(tid_c1 as u32);
+                syscall::thread_join(tid_c2 as u32);
+
+                let hits_after = syscall::vm_stats(4);
+                let cosched_hits = hits_after - hits_before;
+                // With 2 grouped threads doing busy work across many timer ticks,
+                // the scheduler should have picked cosched mates multiple times.
+                if cosched_hits > 0 {
+                    syscall::debug_puts(b"Phase 31 coscheduling: PASSED (hits=");
+                    print_num(cosched_hits);
+                    syscall::debug_puts(b")\n");
+                } else {
+                    syscall::debug_puts(b"Phase 31 coscheduling: FAILED (hits=0)\n");
+                }
+            } else {
+                syscall::debug_puts(b"Phase 31 coscheduling: FAILED (thread create)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 31 coscheduling: FAILED (mmap)\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
@@ -1662,6 +1719,29 @@ fn green_fiber_entry(counter_addr: u64) {
         unsafe { core::ptr::write_volatile(ptr, val + 1); }
         userlib::green::fiber_yield();
     }
+}
+
+/// Phase 31 cosched worker thread. arg = group_id (0 = no group).
+/// Does busy work across many timer ticks to give the scheduler
+/// opportunities for coscheduling decisions.
+#[unsafe(no_mangle)]
+extern "C" fn cosched_worker(group_id: u64) {
+    if group_id != 0 {
+        syscall::cosched_set(group_id as u32);
+    }
+
+    // Burn CPU across many timer ticks.
+    // Each yield_now sets YIELD_ASAP so next tick preempts us.
+    // The busy loop between yields ensures we survive at least one tick.
+    for _ in 0..20 {
+        syscall::yield_now();
+        // Busy spin to ensure this iteration spans at least one timer tick.
+        for _ in 0..50_000 {
+            core::hint::spin_loop();
+        }
+    }
+
+    syscall::exit(0);
 }
 
 static TEST_MUTEX: userlib::sync::Mutex = userlib::sync::Mutex::new();

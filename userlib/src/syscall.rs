@@ -505,6 +505,7 @@ const SYS_VM_STATS: u64 = 42;
 const SYS_SA_REGISTER: u64 = 43;
 const SYS_SA_WAIT: u64 = 44;
 const SYS_SA_GETID: u64 = 45;
+const SYS_COSCHED_SET: u64 = 46;
 
 /// Query VM statistics. which: 0=superpage_promotions, 1=superpage_demotions.
 #[allow(dead_code)]
@@ -526,6 +527,11 @@ pub fn sa_wait() -> u64 {
 /// Get the index (0-based) of the current kthread within its task.
 pub fn sa_getid() -> u64 {
     unsafe { arch::syscall0(SYS_SA_GETID) }
+}
+
+/// Set the coscheduling group for the current thread. group=0 removes from any group.
+pub fn cosched_set(group: u32) {
+    unsafe { arch::syscall1(SYS_COSCHED_SET, group as u64); }
 }
 
 /// Register a service with the name server.

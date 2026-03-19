@@ -59,6 +59,7 @@ pub const SYS_VM_STATS: u64 = 42;
 pub const SYS_SA_REGISTER: u64 = 43;
 pub const SYS_SA_WAIT: u64 = 44;
 pub const SYS_SA_GETID: u64 = 45;
+pub const SYS_COSCHED_SET: u64 = 46;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -190,6 +191,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SA_REGISTER => { crate::sched::sa_register(); 0 }
         SYS_SA_WAIT => crate::sched::sa_wait(),
         SYS_SA_GETID => crate::sched::sa_getid(),
+        SYS_COSCHED_SET => { crate::sched::cosched_set(a0 as u32); 0 }
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1077,6 +1079,7 @@ fn sys_vm_stats(which: u64) -> u64 {
         1 => stats::SUPERPAGE_DEMOTIONS.load(Ordering::Relaxed),
         2 => stats::MAJOR_FAULTS.load(Ordering::Relaxed),
         3 => stats::MINOR_FAULTS.load(Ordering::Relaxed),
+        4 => crate::sched::scheduler::COSCHED_HITS.load(Ordering::Relaxed),
         _ => u64::MAX,
     }
 }
