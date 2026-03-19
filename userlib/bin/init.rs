@@ -1661,6 +1661,62 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 25: Phase 32 topology-aware scheduling ---
+    syscall::debug_puts(b"  init: testing topology-aware scheduling...\n");
+    {
+        let mut topo_ok = true;
+        let mut total_cpus = 0u32;
+
+        // Step 1: Query topology for all CPUs.
+        for cpu in 0..4u32 {
+            if let Some((_pkg, _core, _smt, online, count)) = syscall::cpu_topology(cpu) {
+                if online { total_cpus += 1; }
+                if count < 1 { topo_ok = false; }
+            } else {
+                topo_ok = false;
+            }
+        }
+
+        // Verify at least 1 CPU online.
+        if total_cpus < 1 { topo_ok = false; }
+
+        // Step 2: Test affinity - pin self to CPU 0.
+        let my_tid = syscall::thread_id() as u32;
+        let old_mask = syscall::get_affinity(my_tid);
+        let set_ok = syscall::set_affinity(my_tid, 1); // Only CPU 0
+        if !set_ok { topo_ok = false; }
+
+        // Yield to let scheduler enforce.
+        for _ in 0..5 { syscall::yield_now(); }
+
+        // Restore full affinity.
+        syscall::set_affinity(my_tid, old_mask);
+
+        // Step 3: Test affinity on child thread.
+        if let Some(stack_va) = syscall::mmap_anon(0, 1, 1) {
+            let child = syscall::thread_create(
+                affinity_test_worker as u64,
+                (stack_va + 0x4000) as u64,
+                0,
+            );
+            if child != u64::MAX {
+                // Pin child to CPU 0.
+                syscall::set_affinity(child as u32, 1);
+                syscall::thread_join(child as u32);
+            } else {
+                topo_ok = false;
+            }
+        }
+
+        if topo_ok {
+            syscall::debug_puts(b"Phase 32 topology-aware scheduling: PASSED (cpus=");
+            print_num(total_cpus as u64);
+            syscall::debug_puts(b")\n");
+        } else {
+            syscall::debug_puts(b"Phase 32 topology-aware scheduling: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
@@ -1741,6 +1797,15 @@ extern "C" fn cosched_worker(group_id: u64) {
         }
     }
 
+    syscall::exit(0);
+}
+
+/// Phase 32 affinity test worker. Just yields a few times and exits.
+#[unsafe(no_mangle)]
+extern "C" fn affinity_test_worker(_arg: u64) {
+    for _ in 0..10 {
+        syscall::yield_now();
+    }
     syscall::exit(0);
 }
 

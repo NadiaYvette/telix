@@ -89,21 +89,49 @@ impl RunQueue {
         }
     }
 
-    /// Search for and remove a thread belonging to the given coscheduling group.
-    /// Returns the first matching thread ID, or None.
-    fn find_remove_by_group(&mut self, group: u32) -> Option<ThreadId> {
+    /// Remove the entry at position `i` (relative to head).
+    fn remove_at(&mut self, i: usize) {
+        if i == 0 {
+            // Fast path: same as pop — just advance head.
+            self.head = (self.head + 1) % MAX_QUEUE_LEN;
+        } else {
+            // Shift subsequent entries toward head.
+            for j in i..self.len - 1 {
+                let from = (self.head + j + 1) % MAX_QUEUE_LEN;
+                let to = (self.head + j) % MAX_QUEUE_LEN;
+                self.entries[to] = self.entries[from];
+            }
+            self.tail = if self.tail == 0 { MAX_QUEUE_LEN - 1 } else { self.tail - 1 };
+        }
+        self.len -= 1;
+    }
+
+    /// Search for and remove a thread belonging to the given coscheduling group
+    /// that can run on the given CPU.
+    fn find_remove_by_group_for_cpu(&mut self, group: u32, cpu: u32) -> Option<ThreadId> {
+        let cpu_bit = 1u64 << cpu;
         for i in 0..self.len {
             let idx = (self.head + i) % MAX_QUEUE_LEN;
             let tid = self.entries[idx];
-            if COSCHED_GROUP[tid as usize].load(Ordering::Relaxed) == group {
-                // Remove by shifting subsequent entries toward head.
-                for j in i..self.len - 1 {
-                    let from = (self.head + j + 1) % MAX_QUEUE_LEN;
-                    let to = (self.head + j) % MAX_QUEUE_LEN;
-                    self.entries[to] = self.entries[from];
-                }
-                self.len -= 1;
-                self.tail = if self.tail == 0 { MAX_QUEUE_LEN - 1 } else { self.tail - 1 };
+            if COSCHED_GROUP[tid as usize].load(Ordering::Relaxed) == group
+                && AFFINITY_MASK[tid as usize].load(Ordering::Relaxed) & cpu_bit != 0
+            {
+                self.remove_at(i);
+                return Some(tid);
+            }
+        }
+        None
+    }
+
+    /// Search for and remove the first thread whose affinity allows it to run
+    /// on the given CPU.
+    fn find_remove_for_cpu(&mut self, cpu: u32) -> Option<ThreadId> {
+        let cpu_bit = 1u64 << cpu;
+        for i in 0..self.len {
+            let idx = (self.head + i) % MAX_QUEUE_LEN;
+            let tid = self.entries[idx];
+            if AFFINITY_MASK[tid as usize].load(Ordering::Relaxed) & cpu_bit != 0 {
+                self.remove_at(i);
                 return Some(tid);
             }
         }
@@ -269,8 +297,10 @@ impl Scheduler {
             }
         }
 
-        // Clear killed flag from any previous occupant of this slot.
+        // Clear killed/affinity flags from any previous occupant of this slot.
         KILLED[id as usize].store(false, Ordering::Release);
+        AFFINITY_MASK[id as usize].store(u64::MAX, Ordering::Relaxed);
+        LAST_CPU[id as usize].store(smp::cpu_id(), Ordering::Relaxed);
 
         let thread = &mut self.threads[id as usize];
         thread.id = id;
@@ -497,8 +527,10 @@ impl Scheduler {
         // Allocate thread (may reuse a Dead slot).
         let id = self.alloc_thread_id()?;
 
-        // Clear killed flag from any previous occupant of this slot.
+        // Clear killed/affinity flags from any previous occupant of this slot.
         KILLED[id as usize].store(false, Ordering::Release);
+        AFFINITY_MASK[id as usize].store(u64::MAX, Ordering::Relaxed);
+        LAST_CPU[id as usize].store(smp::cpu_id(), Ordering::Relaxed);
 
         let thread = &mut self.threads[id as usize];
         thread.id = id;
@@ -579,8 +611,10 @@ impl Scheduler {
 
         let id = self.alloc_thread_id()?;
 
-        // Clear killed flag from any previous occupant of this slot.
+        // Clear killed/affinity flags from any previous occupant of this slot.
         KILLED[id as usize].store(false, Ordering::Release);
+        AFFINITY_MASK[id as usize].store(u64::MAX, Ordering::Relaxed);
+        LAST_CPU[id as usize].store(smp::cpu_id(), Ordering::Relaxed);
 
         let thread = &mut self.threads[id as usize];
         thread.id = id;
@@ -704,8 +738,9 @@ impl Scheduler {
     }
 
     fn pick_next(&mut self, idle_id: ThreadId) -> ThreadId {
+        let cpu = smp::cpu_id();
         for prio in 0..NUM_PRIORITIES {
-            if let Some(id) = self.run_queues[prio].pop() {
+            if let Some(id) = self.run_queues[prio].find_remove_for_cpu(cpu) {
                 return id;
             }
         }
@@ -764,13 +799,15 @@ impl Scheduler {
             return current_sp; // No preemption needed.
         }
 
-        // Cosched-aware pick: if prev has a group, try to find a group mate.
+        // Cosched-aware pick: if prev has a group, try to find a group mate
+        // that can also run on this CPU.
+        let cpu = smp::cpu_id();
         let prev_group = COSCHED_GROUP[prev_id as usize].load(Ordering::Relaxed);
         let next_id = if prev_group != 0 && self.cosched_burst < MAX_COSCHED_BURST {
-            // Search all priority levels for a group mate.
+            // Search all priority levels for a group mate eligible for this CPU.
             let mut mate = None;
             for prio in 0..NUM_PRIORITIES {
-                if let Some(id) = self.run_queues[prio].find_remove_by_group(prev_group) {
+                if let Some(id) = self.run_queues[prio].find_remove_by_group_for_cpu(prev_group, cpu) {
                     mate = Some(id);
                     break;
                 }
@@ -836,6 +873,7 @@ impl Scheduler {
         // Load next thread's SP.
         self.threads[next_id as usize].state = ThreadState::Running;
         pcpu.current_thread.store(next_id, Ordering::Relaxed);
+        LAST_CPU[next_id as usize].store(cpu, Ordering::Relaxed);
         self.threads[next_id as usize].saved_sp
     }
 }
@@ -1004,6 +1042,18 @@ const MAX_COSCHED_BURST: u32 = 4;
 
 /// Count of coscheduling hits (for testing/diagnostics).
 pub static COSCHED_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-thread CPU affinity bitmask. Default u64::MAX = all CPUs allowed.
+static AFFINITY_MASK: [AtomicU64; MAX_THREADS] = {
+    const INIT: AtomicU64 = AtomicU64::new(u64::MAX);
+    [INIT; MAX_THREADS]
+};
+
+/// Per-thread last CPU the thread ran on.
+static LAST_CPU: [AtomicU32; MAX_THREADS] = {
+    const INIT: AtomicU32 = AtomicU32::new(0);
+    [INIT; MAX_THREADS]
+};
 
 // --- Scheduler Activations ---
 
@@ -1233,8 +1283,10 @@ pub fn fork_current() -> u64 {
         None => return 0,
     };
 
-    // Clear killed flag.
+    // Clear killed/affinity flags.
     KILLED[child_tid as usize].store(false, Ordering::Release);
+    AFFINITY_MASK[child_tid as usize].store(u64::MAX, Ordering::Relaxed);
+    LAST_CPU[child_tid as usize].store(smp::cpu_id(), Ordering::Relaxed);
 
     let thread = &mut sched.threads[child_tid as usize];
     thread.id = child_tid;
@@ -1732,4 +1784,21 @@ pub fn sa_getid() -> u64 {
 pub fn cosched_set(group: u32) {
     let tid = current_thread_id();
     COSCHED_GROUP[tid as usize].store(group, Ordering::Relaxed);
+}
+
+/// Set CPU affinity mask for a thread. Returns true on success.
+pub fn set_affinity(tid: u32, mask: u64) -> bool {
+    if (tid as usize) >= MAX_THREADS || mask == 0 {
+        return false;
+    }
+    AFFINITY_MASK[tid as usize].store(mask, Ordering::Relaxed);
+    true
+}
+
+/// Get CPU affinity mask for a thread.
+pub fn get_affinity(tid: u32) -> u64 {
+    if (tid as usize) >= MAX_THREADS {
+        return 0;
+    }
+    AFFINITY_MASK[tid as usize].load(Ordering::Relaxed)
 }

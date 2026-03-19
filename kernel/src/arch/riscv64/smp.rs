@@ -116,6 +116,7 @@ extern "C" fn secondary_hart_rust_entry(cpu_id: u64) {
 
     // Register with the scheduler.
     crate::sched::scheduler::init_ap(cpu);
+    crate::sched::topology::init_ap(cpu);
 
     // Signal ready.
     AP_READY_COUNT.fetch_add(1, Ordering::Release);

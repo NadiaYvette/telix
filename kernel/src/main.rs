@@ -76,6 +76,7 @@ pub fn kmain() -> ! {
 
     // Scheduler.
     sched::init();
+    sched::topology::init();
 
     // IPC test threads (Phase 1 — disabled for Phase 3 server testing).
     // let port = ipc::port::create().expect("create IPC port");
@@ -86,6 +87,7 @@ pub fn kmain() -> ! {
     // Start secondary CPUs.
     println!("Starting secondary CPUs...");
     arch::platform::start_secondary_cpus();
+    sched::topology::print();
 
     // Phase 2: Demand-paging test.
     println!("Testing demand-paged memory...");

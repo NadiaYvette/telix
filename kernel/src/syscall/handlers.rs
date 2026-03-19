@@ -60,6 +60,9 @@ pub const SYS_SA_REGISTER: u64 = 43;
 pub const SYS_SA_WAIT: u64 = 44;
 pub const SYS_SA_GETID: u64 = 45;
 pub const SYS_COSCHED_SET: u64 = 46;
+pub const SYS_SET_AFFINITY: u64 = 47;
+pub const SYS_GET_AFFINITY: u64 = 48;
+pub const SYS_CPU_TOPOLOGY: u64 = 49;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -192,6 +195,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SA_WAIT => crate::sched::sa_wait(),
         SYS_SA_GETID => crate::sched::sa_getid(),
         SYS_COSCHED_SET => { crate::sched::cosched_set(a0 as u32); 0 }
+        SYS_SET_AFFINITY => sys_set_affinity(a0, a1),
+        SYS_GET_AFFINITY => crate::sched::get_affinity(a0 as u32),
+        SYS_CPU_TOPOLOGY => sys_cpu_topology(a0),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1125,4 +1131,32 @@ pub(crate) fn copy_from_user(pt_root: usize, user_va: usize, dst: &mut [u8]) -> 
         offset += to_copy;
     }
     true
+}
+
+// --- Phase 32: Topology-aware scheduling syscalls ---
+
+/// Set CPU affinity mask for a thread (must be in the same task).
+fn sys_set_affinity(tid: u64, mask: u64) -> u64 {
+    let caller_task = crate::sched::current_task_id();
+    let target_task = crate::sched::thread_task_id(tid as u32);
+    if target_task != caller_task {
+        return u64::MAX;
+    }
+    if crate::sched::set_affinity(tid as u32, mask) { 0 } else { u64::MAX }
+}
+
+/// Query CPU topology for a given CPU index.
+/// Returns packed word: pkg | (core<<8) | (smt<<16) | (online<<24) | (online_cpus<<32)
+fn sys_cpu_topology(cpu_id: u64) -> u64 {
+    let cpu = cpu_id as usize;
+    if cpu >= crate::sched::smp::MAX_CPUS {
+        return u64::MAX;
+    }
+    let entry = crate::sched::topology::get(cpu);
+    let online_cpus = crate::sched::smp::online_cpus() as u64;
+    (entry.package_id as u64)
+        | ((entry.core_id as u64) << 8)
+        | ((entry.smt_id as u64) << 16)
+        | ((entry.online as u64) << 24)
+        | (online_cpus << 32)
 }

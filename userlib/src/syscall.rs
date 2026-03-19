@@ -506,6 +506,9 @@ const SYS_SA_REGISTER: u64 = 43;
 const SYS_SA_WAIT: u64 = 44;
 const SYS_SA_GETID: u64 = 45;
 const SYS_COSCHED_SET: u64 = 46;
+const SYS_SET_AFFINITY: u64 = 47;
+const SYS_GET_AFFINITY: u64 = 48;
+const SYS_CPU_TOPOLOGY: u64 = 49;
 
 /// Query VM statistics. which: 0=superpage_promotions, 1=superpage_demotions.
 #[allow(dead_code)]
@@ -532,6 +535,30 @@ pub fn sa_getid() -> u64 {
 /// Set the coscheduling group for the current thread. group=0 removes from any group.
 pub fn cosched_set(group: u32) {
     unsafe { arch::syscall1(SYS_COSCHED_SET, group as u64); }
+}
+
+/// Set CPU affinity mask for a thread. Returns true on success.
+pub fn set_affinity(tid: u32, mask: u64) -> bool {
+    let r = unsafe { arch::syscall2(SYS_SET_AFFINITY, tid as u64, mask) };
+    r == 0
+}
+
+/// Get CPU affinity mask for a thread.
+pub fn get_affinity(tid: u32) -> u64 {
+    unsafe { arch::syscall1(SYS_GET_AFFINITY, tid as u64) }
+}
+
+/// Query CPU topology for a given CPU index.
+/// Returns (package_id, core_id, smt_id, online, online_cpu_count), or None if invalid.
+pub fn cpu_topology(cpu_id: u32) -> Option<(u8, u8, u8, bool, u32)> {
+    let r = unsafe { arch::syscall1(SYS_CPU_TOPOLOGY, cpu_id as u64) };
+    if r == u64::MAX { return None; }
+    let pkg = (r & 0xFF) as u8;
+    let core = ((r >> 8) & 0xFF) as u8;
+    let smt = ((r >> 16) & 0xFF) as u8;
+    let online = ((r >> 24) & 0xFF) != 0;
+    let count = (r >> 32) as u32;
+    Some((pkg, core, smt, online, count))
 }
 
 /// Register a service with the name server.

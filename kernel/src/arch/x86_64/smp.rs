@@ -150,6 +150,7 @@ extern "C" fn ap_rust_entry(cpu_id: u32) {
 
     // Register with the scheduler.
     crate::sched::scheduler::init_ap(cpu_id);
+    crate::sched::topology::init_ap(cpu_id);
 
     // Signal ready.
     AP_READY_COUNT.fetch_add(1, Ordering::Release);
