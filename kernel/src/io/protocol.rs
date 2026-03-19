@@ -21,36 +21,29 @@ pub const IO_CONNECT: u64 = 0x100;
 pub const IO_CONNECT_OK: u64 = 0x101;
 
 /// Client → server: read request.
-///   data[0] = channel/file handle
+///   data[0] = request_id (echoed in completion; 0 for legacy sync)
 ///   data[1] = offset (bytes)
-///   data[2] = length (bytes)
-///   data[3] = client reply port ID
-///   data[4] = client aspace ID (for grants)
-///   data[5] = flags (0 = inline, 1 = grant)
+///   data[2] = length (low 32) | reply_port (high 32)
+///   data[3] = grant_va (0 for inline)
 pub const IO_READ: u64 = 0x200;
 
 /// Server → client: read completed.
 ///   data[0] = bytes read
-///   data[1] = inline data bytes 0-7 (if inline)
-///   data[2] = inline data bytes 8-15 (if inline)
-///   data[3] = inline data bytes 16-23 (if inline)
-///   data[4] = inline data bytes 24-31 (if inline)
-///   data[5] = inline data bytes 32-39 (if inline)
-/// For grant reads, data[1] = grant VA, data[2] = grant page count.
+///   data[1] = request_id (echoed from request)
+/// For inline reads, data[2..5] = inline data bytes.
 pub const IO_READ_OK: u64 = 0x201;
 
 /// Client → server: write request.
-///   data[0] = channel/file handle
+///   data[0] = request_id (echoed in completion; 0 for legacy sync)
 ///   data[1] = offset (bytes)
-///   data[2] = length (bytes)
-///   data[3] = client reply port ID
-///   data[4] = inline data or grant VA
-///   data[5] = flags
+///   data[2] = length (low 32) | reply_port (high 32)
+///   data[3] = grant_va (0 for inline)
 #[allow(dead_code)]
 pub const IO_WRITE: u64 = 0x300;
 
 /// Server → client: write completed.
 ///   data[0] = bytes written
+///   data[1] = request_id (echoed from request)
 #[allow(dead_code)]
 pub const IO_WRITE_OK: u64 = 0x301;
 
@@ -67,6 +60,14 @@ pub const IO_STAT_OK: u64 = 0x401;
 /// Client → server: close channel.
 ///   data[0] = channel/file handle
 pub const IO_CLOSE: u64 = 0x500;
+
+/// Client → server: I/O barrier (fence).
+///   data[2] = (reply_port << 32)
+/// Server guarantees all prior requests are complete before replying.
+pub const IO_BARRIER: u64 = 0x600;
+
+/// Server → client: barrier complete.
+pub const IO_BARRIER_OK: u64 = 0x601;
 
 /// Server → client: error response.
 ///   data[0] = error code

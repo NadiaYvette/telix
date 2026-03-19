@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod aio;
 pub mod arch;
 pub mod green;
 pub mod pipe;

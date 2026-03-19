@@ -1721,6 +1721,99 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 26: Phase 34 Async Completion ---
+    syscall::debug_puts(b"  init: testing async completion model...\n");
+    {
+        let mut async_ok = false;
+
+        // Look up cache_blk.
+        let mut cache_port_opt = None;
+        for _ in 0..200 {
+            cache_port_opt = syscall::ns_lookup(b"cache_blk");
+            if cache_port_opt.is_some() { break; }
+            syscall::yield_now();
+        }
+
+        if let Some(cache_port) = cache_port_opt {
+            let reply_port = syscall::port_create() as u32;
+
+            // IO_CONNECT to cache_srv.
+            let (n0, n1, _) = syscall::pack_name(b"cache_blk");
+            let d2 = 9u64 | ((reply_port as u64) << 32);
+            syscall::send(cache_port, 0x100, n0, n1, d2, 0);
+
+            if let Some(cr) = syscall::recv_msg(reply_port) {
+                if cr.tag == 0x101 {
+                    let cache_aspace = cr.data[2] as u32;
+
+                    if let Some(scratch_va) = syscall::mmap_anon(0, 1, 1) {
+                        let grant_va: usize = 0x9_0000_0000;
+
+                        // Grant scratch page to cache_srv once for all reads.
+                        if syscall::grant_pages(cache_aspace, scratch_va, grant_va, 1, false) {
+                            // Submit 4 async reads with request_ids 1..4.
+                            let mut submitted = 0u32;
+                            for i in 1..=4u64 {
+                                let offset = (i - 1) * 4096;
+                                if userlib::aio::aio_read(
+                                    cache_port, offset, 512, reply_port,
+                                    grant_va, i,
+                                ) {
+                                    submitted += 1;
+                                }
+                            }
+
+                            // Collect all completions.
+                            let mut received = [false; 5]; // index 1..4
+                            let mut collected = 0u32;
+                            let mut attempts = 0u32;
+                            while collected < submitted && attempts < 10000 {
+                                if let Some(result) = userlib::aio::aio_collect(reply_port) {
+                                    if result.tag == 0x201 && result.request_id >= 1
+                                        && result.request_id <= 4
+                                    {
+                                        received[result.request_id as usize] = true;
+                                        collected += 1;
+                                    }
+                                } else {
+                                    syscall::yield_now();
+                                }
+                                attempts += 1;
+                            }
+
+                            // Verify all 4 received.
+                            let all_received = received[1] && received[2]
+                                && received[3] && received[4];
+
+                            // Barrier test.
+                            let mut barrier_ok = false;
+                            if all_received {
+                                userlib::aio::aio_barrier(cache_port, reply_port);
+                                barrier_ok = true;
+                            }
+
+                            if all_received && barrier_ok && submitted == 4 {
+                                async_ok = true;
+                            }
+
+                            syscall::revoke(cache_aspace, grant_va);
+                        }
+
+                        syscall::munmap(scratch_va);
+                    }
+                }
+            }
+
+            syscall::port_destroy(reply_port);
+        }
+
+        if async_ok {
+            syscall::debug_puts(b"Phase 34 async completion: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 34 async completion: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

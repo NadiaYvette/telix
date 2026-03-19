@@ -24,6 +24,8 @@ const IO_WRITE_OK: u64 = 0x301;
 const IO_STAT: u64 = 0x400;
 const IO_STAT_OK: u64 = 0x401;
 const IO_CLOSE: u64 = 0x500;
+const IO_BARRIER: u64 = 0x600;
+const IO_BARRIER_OK: u64 = 0x601;
 const IO_ERROR: u64 = 0xF00;
 
 const CACHE_STATS: u64 = 0xC100;
@@ -449,6 +451,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             IO_READ => {
+                let request_id = msg.data[0];
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
                 let reply_port = (msg.data[2] >> 32) as u32;
@@ -458,7 +461,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     if grant_va != 0 {
                         let dst = grant_va as *mut u8;
                         unsafe { core::ptr::copy_nonoverlapping(ptr, dst, bytes_read); }
-                        syscall::send_nb(reply_port, IO_READ_OK, bytes_read as u64, 0);
+                        syscall::send_nb_4(reply_port, IO_READ_OK,
+                            bytes_read as u64, request_id, 0, 0);
                     } else {
                         // Inline read.
                         let inline_len = bytes_read.min(40);
@@ -468,7 +472,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         }
                         let packed = pack_inline_data(&buf[..inline_len]);
                         syscall::send(reply_port, IO_READ_OK,
-                            inline_len as u64, packed[0], packed[1], packed[2]);
+                            inline_len as u64, request_id, packed[0], packed[1]);
                     }
                 } else {
                     syscall::send_nb(reply_port, IO_ERROR, 1, 0);
@@ -476,6 +480,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             IO_WRITE => {
+                let request_id = msg.data[0];
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
                 let reply_port = (msg.data[2] >> 32) as u32;
@@ -499,7 +504,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if blk.write_sector(sector, &buf) {
                     // Update cache if page is present (write-no-allocate).
                     cache.write_update(offset, buf.as_ptr(), length.min(SECTOR_SIZE));
-                    syscall::send_nb(reply_port, IO_WRITE_OK, length.min(SECTOR_SIZE) as u64, 0);
+                    syscall::send_nb_4(reply_port, IO_WRITE_OK,
+                        length.min(SECTOR_SIZE) as u64, request_id, 0, 0);
                 } else {
                     syscall::send_nb(reply_port, IO_ERROR, 1, 0);
                 }
@@ -511,6 +517,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             IO_CLOSE => {}
+
+            IO_BARRIER => {
+                let reply_port = (msg.data[2] >> 32) as u32;
+                syscall::send_nb(reply_port, IO_BARRIER_OK, 0, 0);
+            }
 
             CACHE_STATS => {
                 let reply_port = (msg.data[0] >> 32) as u32;
