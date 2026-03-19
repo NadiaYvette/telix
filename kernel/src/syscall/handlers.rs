@@ -56,6 +56,9 @@ pub const SYS_FORK: u64 = 39;
 pub const SYS_SEND_CAP: u64 = 40;
 pub const SYS_CAP_REVOKE: u64 = 41;
 pub const SYS_VM_STATS: u64 = 42;
+pub const SYS_SA_REGISTER: u64 = 43;
+pub const SYS_SA_WAIT: u64 = 44;
+pub const SYS_SA_GETID: u64 = 45;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -184,6 +187,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SEND_CAP => sys_send_cap(a0, a1, a2, a3, a4, a5),
         SYS_CAP_REVOKE => sys_cap_revoke(a0),
         SYS_VM_STATS => sys_vm_stats(a0),
+        SYS_SA_REGISTER => { crate::sched::sa_register(); 0 }
+        SYS_SA_WAIT => crate::sched::sa_wait(),
+        SYS_SA_GETID => crate::sched::sa_getid(),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error

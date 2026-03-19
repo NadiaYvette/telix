@@ -502,11 +502,30 @@ pub fn cap_revoke(port_id: u32) -> u64 {
 }
 
 const SYS_VM_STATS: u64 = 42;
+const SYS_SA_REGISTER: u64 = 43;
+const SYS_SA_WAIT: u64 = 44;
+const SYS_SA_GETID: u64 = 45;
 
 /// Query VM statistics. which: 0=superpage_promotions, 1=superpage_demotions.
 #[allow(dead_code)]
 pub fn vm_stats(which: u32) -> u64 {
     unsafe { arch::syscall1(SYS_VM_STATS, which as u64) }
+}
+
+/// Register the current task for scheduler activations.
+pub fn sa_register() {
+    unsafe { arch::syscall0(SYS_SA_REGISTER); }
+}
+
+/// Block until a scheduler activation event occurs.
+/// Returns the blocked kthread's TID.
+pub fn sa_wait() -> u64 {
+    unsafe { arch::syscall0(SYS_SA_WAIT) }
+}
+
+/// Get the index (0-based) of the current kthread within its task.
+pub fn sa_getid() -> u64 {
+    unsafe { arch::syscall0(SYS_SA_GETID) }
 }
 
 /// Register a service with the name server.

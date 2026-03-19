@@ -32,6 +32,8 @@ pub struct Task {
     pub max_pages: u32,
     pub cur_ports: u32,
     pub cur_pages: u32,
+    /// Scheduler activations enabled for this task.
+    pub sa_enabled: bool,
 }
 
 impl Task {
@@ -50,6 +52,7 @@ impl Task {
             max_pages: 256,
             cur_ports: 0,
             cur_pages: 0,
+            sa_enabled: false,
         }
     }
 }

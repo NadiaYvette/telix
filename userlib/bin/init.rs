@@ -1531,7 +1531,80 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    // --- Test 22: Benchmark Suite ---
+    // --- Test 22: M:N Green Threads + Scheduler Activations ---
+    syscall::debug_puts(b"  init: testing M:N green threads...\n");
+    {
+        // Allocate a page for fiber stacks (64 KiB = 16 fibers * 4 KiB each).
+        let fiber_stacks = syscall::mmap_anon(0, 1, 1);
+        // Allocate shared counter page.
+        let counter_page = syscall::mmap_anon(0, 1, 1);
+
+        if let (Some(stacks), Some(cpage)) = (fiber_stacks, counter_page) {
+            // Zero the counter.
+            let counter_ptr = cpage as *mut u64;
+            unsafe { core::ptr::write_volatile(counter_ptr, 0); }
+
+            // Register scheduler activations.
+            syscall::sa_register();
+
+            // Verify sa_getid returns a valid index for the main thread.
+            let main_sa_id = syscall::sa_getid();
+
+            // Initialize the green thread scheduler.
+            userlib::green::init(stacks);
+
+            // Spawn 8 fibers, each increments counter 100 times with yields.
+            for _ in 0..8 {
+                userlib::green::spawn(green_fiber_entry, cpage as u64);
+            }
+
+            // Allocate stacks for 2 worker kernel threads.
+            let ws1 = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
+            let ws2 = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
+
+            if ws1 != 0 && ws2 != 0 {
+                let t1 = syscall::thread_create(
+                    userlib::green::green_worker_entry as u64,
+                    (ws1 + 0x4000) as u64,
+                    0, // worker_id = 0
+                );
+                let t2 = syscall::thread_create(
+                    userlib::green::green_worker_entry as u64,
+                    (ws2 + 0x4000) as u64,
+                    1, // worker_id = 1
+                );
+
+                if t1 != u64::MAX && t2 != u64::MAX {
+                    // Wait for both workers to complete.
+                    syscall::thread_join(t1 as u32);
+                    syscall::thread_join(t2 as u32);
+
+                    let final_count = unsafe { core::ptr::read_volatile(counter_ptr) };
+                    let completed = userlib::green::COMPLETED.load(core::sync::atomic::Ordering::Relaxed);
+
+                    if final_count == 800 && completed == 8 && main_sa_id != u64::MAX {
+                        syscall::debug_puts(b"Phase 30 M:N green threads: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 30 M:N green threads: FAILED (count=");
+                        print_num(final_count);
+                        syscall::debug_puts(b" completed=");
+                        print_num(completed as u64);
+                        syscall::debug_puts(b" sa_id=");
+                        print_num(main_sa_id);
+                        syscall::debug_puts(b")\n");
+                    }
+                } else {
+                    syscall::debug_puts(b"Phase 30 M:N green threads: FAILED (worker create)\n");
+                }
+            } else {
+                syscall::debug_puts(b"Phase 30 M:N green threads: FAILED (worker stack alloc)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 30 M:N green threads: FAILED (mmap)\n");
+        }
+    }
+
+    // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
         let bench_tid = syscall::spawn(b"bench", 50);
@@ -1577,6 +1650,18 @@ extern "C" fn thread_child_entry(arg: u64) {
     let ptr = arg as *mut u64;
     unsafe { core::ptr::write_volatile(ptr, 0xCAFE); }
     syscall::exit(42);
+}
+
+/// Phase 30 green thread fiber entry. Increments counter 100 times with yields.
+fn green_fiber_entry(counter_addr: u64) {
+    let ptr = counter_addr as *mut u64;
+    for _ in 0..100 {
+        // Atomic-style increment (only one fiber runs per worker at a time,
+        // and the spinlock in fiber_yield serializes access).
+        let val = unsafe { core::ptr::read_volatile(ptr) };
+        unsafe { core::ptr::write_volatile(ptr, val + 1); }
+        userlib::green::fiber_yield();
+    }
 }
 
 static TEST_MUTEX: userlib::sync::Mutex = userlib::sync::Mutex::new();

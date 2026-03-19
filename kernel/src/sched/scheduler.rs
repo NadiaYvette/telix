@@ -946,6 +946,26 @@ static KILLED: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS] = {
     [INIT; super::thread::MAX_THREADS]
 };
 
+// --- Scheduler Activations ---
+
+/// Per-task SA pending flag: true when an activation event is ready.
+static SA_PENDING: [core::sync::atomic::AtomicBool; MAX_TASKS] = {
+    const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    [INIT; MAX_TASKS]
+};
+
+/// Per-task SA event data: packed (blocked_tid as u64).
+static SA_EVENT: [AtomicU64; MAX_TASKS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_TASKS]
+};
+
+/// Per-task SA waiter thread ID (u32::MAX = no waiter).
+static SA_WAITER: [core::sync::atomic::AtomicU32; MAX_TASKS] = {
+    const INIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+    [INIT; MAX_TASKS]
+};
+
 /// Set YIELD_ASAP for a thread, causing it to be preempted on the next timer tick.
 pub fn set_yield_asap(tid: ThreadId) {
     YIELD_ASAP[tid as usize].store(true, Ordering::Release);
@@ -1502,7 +1522,21 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     sched.threads[next_id as usize].state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     let next_sp = sched.threads[next_id as usize].saved_sp;
+
+    // Read SA state while holding lock.
+    let parked_task_id = sched.threads[tid].task_id;
+    let sa_enabled = sched.tasks[parked_task_id as usize].sa_enabled;
     drop(sched);
+
+    // Scheduler activation: notify userspace that a kthread blocked.
+    if sa_enabled {
+        let waiter = SA_WAITER[parked_task_id as usize].load(Ordering::Acquire);
+        if waiter != u32::MAX && waiter as usize != tid {
+            SA_EVENT[parked_task_id as usize].store(tid as u64, Ordering::Release);
+            SA_PENDING[parked_task_id as usize].store(true, Ordering::Release);
+            wake_thread(waiter);
+        }
+    }
 
     PENDING_SWITCH_SP[cpu].store(next_sp, Ordering::Release);
 }
@@ -1575,4 +1609,62 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     drop(sched);
 
     PENDING_SWITCH_SP[cpu].store(recv_sp, Ordering::Release);
+}
+
+// --- Scheduler Activations API ---
+
+/// Register the current task for scheduler activations.
+pub fn sa_register() {
+    let task_id = current_task_id();
+    if task_id == 0 { return; }
+    let mut sched = SCHEDULER.lock();
+    sched.tasks[task_id as usize].sa_enabled = true;
+}
+
+/// Block until a scheduler activation event occurs.
+/// Returns the blocked kthread's TID, or u64::MAX on error.
+pub fn sa_wait() -> u64 {
+    let task_id = current_task_id();
+    if task_id == 0 { return u64::MAX; }
+
+    // Fast path: event already pending.
+    if SA_PENDING[task_id as usize].swap(false, Ordering::SeqCst) {
+        SA_WAITER[task_id as usize].store(u32::MAX, Ordering::Relaxed);
+        return SA_EVENT[task_id as usize].load(Ordering::Relaxed);
+    }
+
+    // Register as waiter.
+    let tid = current_thread_id();
+    clear_wakeup_flag(tid);
+    SA_WAITER[task_id as usize].store(tid, Ordering::Release);
+
+    // Double-check after registering (prevents lost wakeup).
+    if SA_PENDING[task_id as usize].swap(false, Ordering::SeqCst) {
+        SA_WAITER[task_id as usize].store(u32::MAX, Ordering::Relaxed);
+        return SA_EVENT[task_id as usize].load(Ordering::Relaxed);
+    }
+
+    // Block until woken by SA notification.
+    block_current(BlockReason::ActivationWait);
+    SA_WAITER[task_id as usize].store(u32::MAX, Ordering::Relaxed);
+    SA_PENDING[task_id as usize].store(false, Ordering::Relaxed);
+    SA_EVENT[task_id as usize].load(Ordering::Relaxed)
+}
+
+/// Get the index (0-based) of the current kthread within its task.
+pub fn sa_getid() -> u64 {
+    let tid = current_thread_id();
+    let task_id = current_task_id();
+    let sched = SCHEDULER.lock();
+    let mut idx = 0u64;
+    for i in 0..MAX_THREADS {
+        let t = &sched.threads[i];
+        if t.task_id == task_id && t.state != ThreadState::Dead
+            && (t.stack_base != 0 || i == 0)
+        {
+            if i as u32 == tid { return idx; }
+            idx += 1;
+        }
+    }
+    u64::MAX
 }
