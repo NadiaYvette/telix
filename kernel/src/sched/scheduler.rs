@@ -432,7 +432,7 @@ impl Scheduler {
             let page_va = stack_va + page_idx * PAGE_SIZE;
 
             let pa = crate::mm::object::with_object(obj_id, |obj| {
-                obj.ensure_page(page_idx)
+                obj.ensure_page(page_idx).map(|(pa, _)| pa)
             })?;
             let pa_usize = pa.as_usize();
 
@@ -673,7 +673,7 @@ impl Scheduler {
             for page_idx in 0..data_pages {
                 let page_va = data_va + page_idx * PAGE_SIZE;
                 let pa = crate::mm::object::with_object(obj_id, |obj| {
-                    obj.ensure_page(page_idx)
+                    obj.ensure_page(page_idx).map(|(pa, _)| pa)
                 })?;
                 let pa_usize = pa.as_usize();
 

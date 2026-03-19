@@ -90,6 +90,9 @@ pub fn kmain() -> ! {
     arch::platform::start_secondary_cpus();
     sched::topology::print();
 
+    // Background page pre-zeroing daemon.
+    sched::spawn(mm::zeropool::zero_daemon, 1, 5).expect("spawn zero_daemon");
+
     // Phase 2: Demand-paging test.
     println!("Testing demand-paged memory...");
     test_demand_paging();
@@ -664,9 +667,12 @@ fn test_demand_paging() {
             aspace_id, addr, mm::fault::FaultType::Write,
         );
         println!("  Result: {:?}", result);
+        // With background pre-zeroing, a sub-page in the same allocation page
+        // as a prior major fault may be minor (already zeroed + resident).
         assert!(
-            result == mm::fault::FaultResult::HandledMajor,
-            "Expected major fault at {:#x}, got {:?}", addr, result
+            result == mm::fault::FaultResult::HandledMajor
+                || result == mm::fault::FaultResult::HandledMinor,
+            "Expected major or minor fault at {:#x}, got {:?}", addr, result
         );
     }
 

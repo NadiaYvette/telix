@@ -22,6 +22,7 @@ pub enum BlockReason {
     PortSetRecv(u32),
     FutexWait,
     ActivationWait,
+    ZeroPool,
 }
 
 /// Maximum number of threads.

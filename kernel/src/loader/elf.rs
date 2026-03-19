@@ -179,7 +179,7 @@ fn load_segment(
 
         // Allocate or get existing physical page.
         let pa = object::with_object(obj_id, |obj| {
-            obj.ensure_page(0) // page_idx within this single-page object is always 0
+            obj.ensure_page(0).map(|(pa, _)| pa) // page_idx within this single-page object is always 0
         }).ok_or(ElfError::AllocFailed)?;
 
         let pa_usize = pa.as_usize();

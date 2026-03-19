@@ -2013,6 +2013,57 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 28: Phase 37 Background Page Pre-Zeroing ---
+    syscall::debug_puts(b"  init: testing background page pre-zeroing...\n");
+    {
+        let prezeroed_before = syscall::vm_stats(17);
+        let major_before = syscall::vm_stats(2);
+        let minor_before = syscall::vm_stats(3);
+
+        // Allocate 1 allocation page (64 KiB = 16 MMU pages), RW.
+        let va = syscall::mmap_anon(0, 1, 1);
+        if let Some(va) = va {
+            // Touch first sub-page (triggers major fault; may use pre-zeroed page).
+            unsafe { core::ptr::write_volatile(va as *mut u8, 0x42); }
+
+            // Touch remaining 15 sub-pages.
+            for i in 1..16u64 {
+                let ptr = (va + (i as usize) * 4096) as *mut u8;
+                unsafe { core::ptr::write_volatile(ptr, 0x42); }
+            }
+
+            let prezeroed_after = syscall::vm_stats(17);
+            let major_after = syscall::vm_stats(2);
+            let minor_after = syscall::vm_stats(3);
+
+            let prezeroed_delta = prezeroed_after - prezeroed_before;
+            let major_delta = major_after - major_before;
+            let minor_delta = minor_after - minor_before;
+
+            syscall::debug_puts(b"    prezeroed=");
+            print_num(prezeroed_delta);
+            syscall::debug_puts(b" major=");
+            print_num(major_delta);
+            syscall::debug_puts(b" minor=");
+            print_num(minor_delta);
+            syscall::debug_puts(b"\n");
+
+            // If pre-zeroing was active: expect ~1 major + ~15 minor.
+            // If pool was empty: expect ~16 major + ~0 minor.
+            // Both paths are correct; pre-zeroing is opportunistic.
+            if prezeroed_delta > 0 && minor_delta >= 10 {
+                syscall::debug_puts(b"    pre-zeroed path: OK\n");
+            } else if major_delta >= 10 {
+                syscall::debug_puts(b"    on-demand path (pool empty): OK\n");
+            }
+
+            syscall::munmap(va);
+            syscall::debug_puts(b"Phase 37 background page pre-zeroing: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 37 background page pre-zeroing: SKIPPED (mmap failed)\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

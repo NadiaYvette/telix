@@ -27,6 +27,7 @@ pub const STAT_CONTEXT_SWITCHES: u32 = 13;
 pub const STAT_SYSCALLS: u32 = 14;
 pub const STAT_IPC_SENDS: u32 = 15;
 pub const STAT_IPC_RECVS: u32 = 16;
+pub const STAT_PAGES_PREZEROED: u32 = 17;
 
 /// Read a kernel stat counter by index.
 pub fn stat(which: u32) -> u64 {

@@ -11,3 +11,4 @@ pub mod stats;
 pub mod vma;
 pub mod vmatree;
 pub mod wsclock;
+pub mod zeropool;

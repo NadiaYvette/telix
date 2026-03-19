@@ -100,16 +100,21 @@ pub fn handle_page_fault(
         }
 
         // Major fault: need to allocate/zero the page.
-        let pa = object::with_object(obj_id, |obj| obj.ensure_page(obj_page_idx));
-        let pa = match pa {
-            Some(pa) => pa,
+        let (pa, pre_zeroed) = match object::with_object(obj_id, |obj| obj.ensure_page(obj_page_idx)) {
+            Some(result) => result,
             None => return FaultResult::Failed, // OOM
         };
 
         // Zero just the specific 4K MMU sub-page within the allocation page.
         let mmu_pa = pa.as_usize() + vma.mmu_offset_in_page(mmu_idx) * MMUPAGE_SIZE;
 
-        if !vma.is_zeroed(mmu_idx) {
+        if pre_zeroed {
+            // Entire PAGE_SIZE page is already zero. Mark all MMU sub-pages as zeroed.
+            let (ap_start, ap_end) = vma.alloc_page_mmu_range(mmu_idx);
+            for i in ap_start..ap_end {
+                vma.set_zeroed(i);
+            }
+        } else if !vma.is_zeroed(mmu_idx) {
             unsafe {
                 core::ptr::write_bytes(mmu_pa as *mut u8, 0, MMUPAGE_SIZE);
             }

@@ -64,19 +64,24 @@ impl MemObject {
     }
 
     /// Allocate the physical page at offset `page_idx` if not already allocated.
-    /// Returns the physical address of the page.
-    pub fn ensure_page(&mut self, page_idx: usize) -> Option<PhysAddr> {
+    /// Returns `(PhysAddr, pre_zeroed)` where `pre_zeroed` is true if the page
+    /// came from the zero pool (entire PAGE_SIZE already zeroed).
+    pub fn ensure_page(&mut self, page_idx: usize) -> Option<(PhysAddr, bool)> {
         if page_idx >= self.page_count as usize {
             return None;
         }
         if self.phys_pages[page_idx] != 0 {
-            return Some(PhysAddr::new(self.phys_pages[page_idx]));
+            return Some((PhysAddr::new(self.phys_pages[page_idx]), false));
         }
-        // Allocate a new page.
-        let pa = phys::alloc_page()?;
+        // Try pre-zeroed pool first, then dirty allocator.
+        let (pa, pre_zeroed) = if let Some(pa) = super::zeropool::alloc_zeroed_page() {
+            (pa, true)
+        } else {
+            (phys::alloc_page()?, false)
+        };
         self.phys_pages[page_idx] = pa.as_usize();
         super::frame::set_ref(pa, 1);
-        Some(pa)
+        Some((pa, pre_zeroed))
     }
 
     /// Get the physical address of page at offset `page_idx`, or None if not allocated.

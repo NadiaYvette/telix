@@ -645,7 +645,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64) -> u64 {
         let page_va = va + page_idx * PAGE_SIZE;
 
         let pa = match crate::mm::object::with_object(obj_id, |obj| {
-            obj.ensure_page(page_idx)
+            obj.ensure_page(page_idx).map(|(pa, _)| pa)
         }) {
             Some(pa) => pa,
             None => return u64::MAX,
@@ -1108,6 +1108,7 @@ fn sys_vm_stats(which: u64) -> u64 {
         14 => crate::sched::stats::SYSCALLS.load(Ordering::Relaxed),
         15 => crate::sched::stats::IPC_SENDS.load(Ordering::Relaxed),
         16 => crate::sched::stats::IPC_RECVS.load(Ordering::Relaxed),
+        17 => stats::PAGES_PREZEROED.load(Ordering::Relaxed),
         _ => u64::MAX,
     }
 }
