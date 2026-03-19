@@ -471,6 +471,7 @@ pub fn set_quota(child_task: u32, resource_type: u32, limit: u32) -> bool {
     unsafe { arch::syscall3(SYS_SET_QUOTA, child_task as u64, resource_type as u64, limit as u64) == 0 }
 }
 
+const SYS_EXECVE: u64 = 54;
 const SYS_FORK: u64 = 39;
 const SYS_SEND_CAP: u64 = 40;
 #[allow(dead_code)]
@@ -480,6 +481,12 @@ const SYS_CAP_REVOKE: u64 = 41;
 /// 0 to the child, or 0 on failure.
 pub fn fork() -> u64 {
     unsafe { arch::syscall0(SYS_FORK) }
+}
+
+/// Replace the current process image with a new ELF from initramfs.
+/// On success, this function never returns. On failure, returns u64::MAX.
+pub fn execve(name: &[u8]) -> u64 {
+    unsafe { arch::syscall2(SYS_EXECVE, name.as_ptr() as u64, name.len() as u64) }
 }
 
 /// Send a message with an attached capability transfer.

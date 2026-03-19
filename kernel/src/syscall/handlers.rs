@@ -67,6 +67,7 @@ pub const SYS_TRACE_CTRL: u64 = 50;
 pub const SYS_TRACE_READ: u64 = 51;
 pub const SYS_CPU_HOTPLUG: u64 = 52;
 pub const SYS_CPU_LOAD: u64 = 53;
+pub const SYS_EXECVE: u64 = 54;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -212,6 +213,11 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_CPU_HOTPLUG => sys_cpu_hotplug(a0, a1),
         SYS_CPU_LOAD => sys_cpu_load(a0),
+        SYS_EXECVE => {
+            // execve completely replaces the frame — bypass set_return.
+            sys_execve(a0, a1, frame);
+            return;
+        }
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -952,6 +958,190 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
         Some(tid) => tid as u64,
         None => u64::MAX,
     }
+}
+
+/// execve: replace current process image with a new ELF from initramfs.
+/// a0 = pointer to filename, a1 = filename length.
+/// On success, the frame is completely rewritten and we never return to the caller.
+/// On failure (before point-of-no-return), sets return value to u64::MAX.
+fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
+    use crate::mm::page::{PAGE_SIZE, MMUPAGE_SIZE};
+
+    let pt_root = crate::sched::scheduler::current_page_table_root();
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    if aspace_id == 0 {
+        set_return(frame, u64::MAX);
+        return;
+    }
+
+    // Copy filename from user memory.
+    let len = (name_len as usize).min(64);
+    let mut name_buf = [0u8; 64];
+    if !copy_from_user(pt_root, name_ptr as usize, &mut name_buf[..len]) {
+        set_return(frame, u64::MAX);
+        return;
+    }
+    let name = &name_buf[..len];
+
+    // Look up the ELF in initramfs (before point-of-no-return).
+    let elf_data = match crate::io::initramfs::lookup_file(name) {
+        Some(d) => d,
+        None => {
+            set_return(frame, u64::MAX);
+            return;
+        }
+    };
+
+    // Validate ELF header (basic checks before we destroy anything).
+    if elf_data.len() < 64 || elf_data[0..4] != [0x7f, b'E', b'L', b'F'] {
+        set_return(frame, u64::MAX);
+        return;
+    }
+
+    // === POINT OF NO RETURN ===
+
+    // Kill sibling threads.
+    crate::sched::scheduler::kill_other_threads_in_task();
+
+    // Create a fresh page table for the new image.
+    #[cfg(target_arch = "aarch64")]
+    let new_pt_root = crate::arch::aarch64::mm::setup_tables().expect("execve: pt alloc");
+    #[cfg(target_arch = "riscv64")]
+    let new_pt_root = crate::arch::riscv64::mm::setup_tables().expect("execve: pt alloc");
+    #[cfg(target_arch = "x86_64")]
+    let new_pt_root = crate::arch::x86_64::mm::create_user_page_table().expect("execve: pt alloc");
+
+    // Reset address space: destroy all VMAs/PTEs, free old page table, install new one.
+    crate::mm::aspace::reset(aspace_id, new_pt_root);
+
+    // Update task's page table root.
+    crate::sched::scheduler::update_task_page_table(new_pt_root);
+
+    // Switch to new page table.
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::mm::switch_page_table(new_pt_root);
+    #[cfg(target_arch = "riscv64")]
+    crate::arch::riscv64::mm::switch_page_table(new_pt_root);
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::mm::switch_page_table(new_pt_root);
+
+    // Load ELF segments into the fresh address space.
+    let entry = match crate::loader::elf::load_elf(elf_data, aspace_id, new_pt_root) {
+        Ok(e) => e,
+        Err(_) => {
+            // Past point-of-no-return, can't recover — exit.
+            crate::println!("execve: ELF load failed for {:?}", core::str::from_utf8(name));
+            crate::sched::scheduler::exit_current_thread(-1);
+        }
+    };
+
+    // Flush instruction cache.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
+    }
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence.i");
+    }
+
+    // Map a fresh user stack.
+    #[cfg(target_arch = "aarch64")]
+    const USER_STACK_TOP: usize = 0x7FFF_F000_0000;
+    #[cfg(target_arch = "riscv64")]
+    const USER_STACK_TOP: usize = 0x3F_F000_0000;
+    #[cfg(target_arch = "x86_64")]
+    const USER_STACK_TOP: usize = 0x7FFF_FFFF_0000;
+
+    let stack_pages = 1;
+    let stack_va = USER_STACK_TOP - stack_pages * PAGE_SIZE;
+
+    let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+        aspace.map_anon(stack_va, stack_pages, crate::mm::vma::VmaProt::ReadWrite)
+            .map(|vma| vma.object_id)
+    }).expect("execve: stack map");
+
+    // Eagerly allocate and map stack pages.
+    let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
+    for page_idx in 0..stack_pages {
+        let page_va = stack_va + page_idx * PAGE_SIZE;
+
+        let pa = crate::mm::object::with_object(obj_id, |obj| {
+            obj.ensure_page(page_idx).map(|(pa, _)| pa)
+        }).expect("execve: stack alloc");
+        let pa_usize = pa.as_usize();
+
+        unsafe {
+            core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        let pte_flags = crate::arch::aarch64::mm::USER_RW_FLAGS;
+        #[cfg(target_arch = "riscv64")]
+        let pte_flags = crate::arch::riscv64::mm::USER_RW_FLAGS;
+        #[cfg(target_arch = "x86_64")]
+        let pte_flags = crate::arch::x86_64::mm::USER_RW_FLAGS;
+
+        for mmu_idx in 0..mmu_count {
+            let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
+            let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
+
+            #[cfg(target_arch = "aarch64")]
+            crate::arch::aarch64::mm::map_single_mmupage(new_pt_root, mmu_va, mmu_pa, pte_flags);
+            #[cfg(target_arch = "riscv64")]
+            crate::arch::riscv64::mm::map_single_mmupage(new_pt_root, mmu_va, mmu_pa, pte_flags);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::mm::map_single_mmupage(new_pt_root, mmu_va, mmu_pa, pte_flags);
+        }
+
+        crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+            if let Some(vma) = aspace.find_vma_mut(page_va) {
+                for mmu_idx in 0..mmu_count {
+                    let idx = vma.mmu_index_of(page_va + mmu_idx * MMUPAGE_SIZE);
+                    vma.set_installed(idx);
+                    vma.set_zeroed(idx);
+                }
+            }
+        });
+    }
+
+    // Rewrite the exception frame for the new program.
+    unsafe {
+        let frame_ptr = frame as *mut ExceptionFrame as *mut u64;
+        let frame_words = crate::sched::thread::EXCEPTION_FRAME_SIZE / 8;
+        for i in 0..frame_words {
+            *frame_ptr.add(i) = 0;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            *frame_ptr.add(32) = entry as u64;          // ELR_EL1
+            *frame_ptr.add(33) = 0x0;                   // SPSR_EL1 = EL0t
+            *frame_ptr.add(31) = USER_STACK_TOP as u64; // SP_EL0
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            *frame_ptr.add(31) = entry as u64;           // sepc
+            *frame_ptr.add(32) = 1 << 5;                 // sstatus: SPIE=1, SPP=0
+            *frame_ptr.add(1) = USER_STACK_TOP as u64;   // sp (x2)
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            *frame_ptr.add(17) = entry as u64;                                              // RIP
+            *frame_ptr.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3;           // CS
+            *frame_ptr.add(19) = 0x200;                                                      // RFLAGS = IF
+            *frame_ptr.add(20) = USER_STACK_TOP as u64;                                      // RSP
+            *frame_ptr.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3;           // SS
+        }
+
+        // arg0 = 0 (no argument for execve'd process)
+        // (registers were zeroed above, so arg0 is already 0)
+    }
+
+    // dispatch() returns after this — the exception return path will
+    // restore the rewritten frame and jump to the new program's entry point.
 }
 
 fn sys_thread_create(entry: u64, stack_top: u64, arg: u64) -> u64 {

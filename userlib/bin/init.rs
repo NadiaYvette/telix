@@ -2360,6 +2360,35 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 31: Phase 40 execve syscall ---
+    syscall::debug_puts(b"  init: testing execve...\n");
+    {
+        let child = syscall::fork();
+        if child == 0 {
+            // Child: replace ourselves with "hello" binary.
+            let r = syscall::execve(b"hello");
+            // If execve returns, it failed.
+            syscall::debug_puts(b"Phase 40 execve: FAILED (execve returned)\n");
+            let _ = r;
+            syscall::exit(1);
+        } else if child > 0 {
+            // Parent: wait for child to exit.
+            loop {
+                if let Some(code) = syscall::waitpid(child) {
+                    if code == 0 {
+                        syscall::debug_puts(b"Phase 40 execve: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 40 execve: FAILED (bad exit code)\n");
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+        } else {
+            syscall::debug_puts(b"Phase 40 execve: FAILED (fork failed)\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

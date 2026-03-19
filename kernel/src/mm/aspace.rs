@@ -151,6 +151,64 @@ pub fn destroy(id: ASpaceId) {
     }
 }
 
+/// Reset an address space: destroy all VMAs and backing objects but keep the
+/// slot active. Used by execve to replace the address space contents without
+/// destroying the aspace itself. The page table intermediate pages are freed
+/// by the caller (who also sets up a fresh page table).
+pub fn reset(id: ASpaceId, new_pt_root: usize) {
+    let mut table = ASPACES.lock();
+    for space in table.spaces.iter_mut() {
+        if space.active && space.id == id {
+            let old_pt_root = space.page_table_root;
+            // Destroy backing objects for all VMAs.
+            // First unmap all installed PTEs.
+            {
+                let mut it = space.vmas.iter();
+                while let Some(vma) = it.next() {
+                    if vma.active {
+                        let mmu_count = vma.mmu_page_count();
+                        // Demote superpages first.
+                        {
+                            let super_size = 2 * 1024 * 1024;
+                            let flags = super::fault::pte_flags_for_vma_pub(vma);
+                            let mut m = 0;
+                            while m < mmu_count {
+                                let mmu_va = vma.va_start + m * super::page::MMUPAGE_SIZE;
+                                let super_va = mmu_va & !(super_size - 1);
+                                if super::fault::is_superpage_mapped(old_pt_root, super_va).is_some() {
+                                    super::fault::demote_superpage(old_pt_root, super_va, flags);
+                                }
+                                let next = ((super_va + super_size) - vma.va_start) / super::page::MMUPAGE_SIZE;
+                                m = if next > m { next } else { m + (super_size / super::page::MMUPAGE_SIZE) };
+                            }
+                        }
+                        for mmu_idx in 0..mmu_count {
+                            if vma.is_installed(mmu_idx) {
+                                let mmu_va = vma.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
+                                unmap_single_mmupage(old_pt_root, mmu_va);
+                            }
+                        }
+                        object::with_object(vma.object_id, |obj| {
+                            obj.remove_mapping(id, vma.va_start);
+                        });
+                        object::destroy(vma.object_id);
+                    }
+                }
+            }
+            space.vmas.clear();
+            space.page_table_root = new_pt_root;
+            space.heap_next = HEAP_VA_BASE;
+            space.clock_hand = VmaCursor::new();
+
+            // Free old page table tree.
+            if old_pt_root != 0 {
+                free_page_table_tree(old_pt_root);
+            }
+            return;
+        }
+    }
+}
+
 /// Unmap an anonymous region from an address space.
 /// Unmaps PTEs, removes VMA, destroys backing object.
 pub fn unmap_anon(id: ASpaceId, va: usize) -> bool {

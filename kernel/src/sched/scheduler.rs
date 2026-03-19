@@ -1179,6 +1179,38 @@ pub fn current_thread_id() -> ThreadId {
     smp::current().current_thread.load(Ordering::Relaxed)
 }
 
+/// Kill all other threads in the current thread's task (for execve).
+/// Marks them as Dead and dequeues from run queues. Returns the number killed.
+pub fn kill_other_threads_in_task() -> usize {
+    let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    let task_id = sched.threads[my_tid as usize].task_id;
+    let mut killed = 0;
+
+    for i in 0..sched.next_thread_id as usize {
+        if i == my_tid as usize { continue; }
+        let t = &mut sched.threads[i];
+        if t.task_id == task_id && t.state != ThreadState::Dead {
+            t.state = ThreadState::Dead;
+            t.exit_code = -9;
+            KILLED[i].store(true, Ordering::Release);
+            killed += 1;
+        }
+    }
+
+    // Set thread_count to 1 (just us).
+    sched.tasks[task_id as usize].thread_count = 1;
+    killed
+}
+
+/// Update the task's page table root after execve replaces the address space.
+pub fn update_task_page_table(new_pt_root: usize) {
+    let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    let task_id = sched.threads[my_tid as usize].task_id;
+    sched.tasks[task_id as usize].page_table_root = new_pt_root;
+}
+
 /// Get the address space ID of the current thread's task.
 /// Returns 0 if the thread/task has no address space (kernel context).
 pub fn current_aspace_id() -> u32 {
