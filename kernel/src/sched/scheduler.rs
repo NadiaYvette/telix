@@ -367,6 +367,15 @@ impl Scheduler {
         // Record the parent task (caller's task) for waitpid.
         let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
         task.parent_task = self.threads[caller_tid as usize].task_id;
+        // Process group defaults to own task_id; session and ctty inherited from parent.
+        let parent_tid = task.parent_task;
+        let parent_sid = self.tasks[parent_tid as usize].sid;
+        let parent_ctty = self.tasks[parent_tid as usize].ctty_port;
+        let task = &mut self.tasks[task_id as usize];
+        task.pgid = task_id;
+        task.sid = parent_sid;
+        task.ctty_port = parent_ctty;
+        task.fg_pgid = 0;
 
         // Bootstrap capabilities: grant SEND caps for well-known kernel ports,
         // and full cap for arg0 if it's a valid active port (port passing on spawn).
@@ -1328,6 +1337,197 @@ pub fn get_signal_pending() -> u64 {
     sched.threads[tid as usize].sig_pending
 }
 
+// --- Phase 43: Process groups, sessions, controlling terminals ---
+
+/// Set the process group ID of a task.
+/// pid=0 means current task. pgid=0 means set pgid=pid.
+/// Returns 0 on success, u64::MAX on error.
+pub fn setpgid(pid: u32, pgid: u32) -> u64 {
+    let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    let my_task = sched.threads[my_tid as usize].task_id;
+
+    let target_task = if pid == 0 { my_task } else { pid };
+
+    if target_task as usize >= super::task::MAX_TASKS { return u64::MAX; }
+    if !sched.tasks[target_task as usize].active { return u64::MAX; }
+    if target_task != my_task && sched.tasks[target_task as usize].parent_task != my_task {
+        return u64::MAX;
+    }
+
+    let new_pgid = if pgid == 0 { target_task } else { pgid };
+    let target_sid = sched.tasks[target_task as usize].sid;
+
+    if new_pgid != target_task {
+        let mut found = false;
+        for i in 0..super::task::MAX_TASKS {
+            if sched.tasks[i].active && sched.tasks[i].sid == target_sid && sched.tasks[i].pgid == new_pgid {
+                found = true;
+                break;
+            }
+        }
+        if !found { return u64::MAX; }
+    }
+
+    sched.tasks[target_task as usize].pgid = new_pgid;
+    0
+}
+
+/// Get the process group ID of a task.
+/// pid=0 means current task.
+pub fn getpgid(pid: u32) -> u64 {
+    let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let sched = SCHEDULER.lock();
+    let target_task = if pid == 0 {
+        sched.threads[my_tid as usize].task_id
+    } else {
+        pid
+    };
+    if target_task as usize >= super::task::MAX_TASKS { return u64::MAX; }
+    let task = &sched.tasks[target_task as usize];
+    if !task.active { return u64::MAX; }
+    task.pgid as u64
+}
+
+/// Create a new session. The calling task becomes the session leader.
+/// Returns the new session ID (= task_id) or u64::MAX on error.
+pub fn setsid() -> u64 {
+    let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    let my_task = sched.threads[my_tid as usize].task_id;
+
+    let current_pgid = sched.tasks[my_task as usize].pgid;
+    if current_pgid == my_task {
+        for i in 0..super::task::MAX_TASKS {
+            if sched.tasks[i].active && sched.tasks[i].id != my_task && sched.tasks[i].pgid == my_task {
+                return u64::MAX;
+            }
+        }
+    }
+
+    sched.tasks[my_task as usize].sid = my_task;
+    sched.tasks[my_task as usize].pgid = my_task;
+    sched.tasks[my_task as usize].ctty_port = 0;
+    my_task as u64
+}
+
+/// Get the session ID of a task.
+/// pid=0 means current task.
+pub fn getsid(pid: u32) -> u64 {
+    let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let sched = SCHEDULER.lock();
+    let target_task = if pid == 0 {
+        sched.threads[my_tid as usize].task_id
+    } else {
+        pid
+    };
+    if target_task as usize >= super::task::MAX_TASKS { return u64::MAX; }
+    let task = &sched.tasks[target_task as usize];
+    if !task.active { return u64::MAX; }
+    task.sid as u64
+}
+
+/// Set the foreground process group for the controlling terminal.
+/// The caller must be in the same session as the ctty.
+pub fn tcsetpgrp(pgid: u32) -> u64 {
+    let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    let my_task = sched.threads[my_tid as usize].task_id;
+
+    if sched.tasks[my_task as usize].ctty_port == 0 { return u64::MAX; }
+
+    let my_sid = sched.tasks[my_task as usize].sid;
+    let mut found = false;
+    for i in 0..super::task::MAX_TASKS {
+        if sched.tasks[i].active && sched.tasks[i].sid == my_sid && sched.tasks[i].pgid == pgid {
+            found = true;
+            break;
+        }
+    }
+    if !found { return u64::MAX; }
+
+    // Store the foreground pgid in the session leader.
+    for i in 0..super::task::MAX_TASKS {
+        if sched.tasks[i].active && sched.tasks[i].id == my_sid {
+            sched.tasks[i].fg_pgid = pgid;
+            return 0;
+        }
+    }
+    u64::MAX
+}
+
+/// Get the foreground process group for the controlling terminal.
+pub fn tcgetpgrp() -> u64 {
+    let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let sched = SCHEDULER.lock();
+    let my_task = sched.threads[my_tid as usize].task_id;
+
+    if sched.tasks[my_task as usize].ctty_port == 0 { return u64::MAX; }
+
+    let my_sid = sched.tasks[my_task as usize].sid;
+    for i in 0..super::task::MAX_TASKS {
+        if sched.tasks[i].active && sched.tasks[i].id == my_sid {
+            return sched.tasks[i].fg_pgid as u64;
+        }
+    }
+    u64::MAX
+}
+
+/// Send a signal to all tasks in a process group.
+pub fn send_signal_to_pgroup(pgid: u32, sig: u32) -> bool {
+    use super::task::MAX_SIGNALS;
+    if sig < 1 || sig > MAX_SIGNALS as u32 { return false; }
+
+    let sched = SCHEDULER.lock();
+    let mut task_ids = [0u32; super::task::MAX_TASKS];
+    let mut count = 0;
+    for i in 0..super::task::MAX_TASKS {
+        if sched.tasks[i].active && sched.tasks[i].pgid == pgid && count < task_ids.len() {
+            task_ids[count] = sched.tasks[i].id;
+            count += 1;
+        }
+    }
+    drop(sched);
+
+    if count == 0 { return false; }
+
+    let mut any = false;
+    for i in 0..count {
+        if send_signal_to_task(task_ids[i], sig) {
+            any = true;
+        }
+    }
+    any
+}
+
+/// Set the controlling terminal for the current session.
+/// Only the session leader can do this, and only if it has no ctty yet.
+pub fn set_ctty(port: u32) -> u64 {
+    let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    let my_task = sched.threads[my_tid as usize].task_id;
+
+    // Must be session leader.
+    if sched.tasks[my_task as usize].sid != my_task {
+        return u64::MAX;
+    }
+    // Must not already have a ctty.
+    if sched.tasks[my_task as usize].ctty_port != 0 {
+        return u64::MAX;
+    }
+
+    sched.tasks[my_task as usize].ctty_port = port;
+
+    // Propagate ctty to all tasks in this session.
+    let sid = my_task;
+    for i in 0..super::task::MAX_TASKS {
+        if sched.tasks[i].active && sched.tasks[i].sid == sid {
+            sched.tasks[i].ctty_port = port;
+        }
+    }
+    0
+}
+
 #[allow(dead_code)]
 pub fn current_thread_id() -> ThreadId {
     smp::current().current_thread.load(Ordering::Relaxed)
@@ -1382,7 +1582,7 @@ pub fn fork_current() -> u64 {
     let cpu = smp::cpu_id() as usize;
     let parent_frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
     if parent_frame_sp == 0 {
-        return 0;
+        return u64::MAX;
     }
 
     // Gather parent info.
@@ -1398,7 +1598,7 @@ pub fn fork_current() -> u64 {
     // because it acquires ASPACES and OBJECTS locks.
     let (child_aspace_id, child_pt_root) = match crate::mm::aspace::clone_for_cow(parent_aspace_id) {
         Some(x) => x,
-        None => return 0,
+        None => return u64::MAX,
     };
 
     // Create child task and thread under the scheduler lock.
@@ -1406,11 +1606,14 @@ pub fn fork_current() -> u64 {
 
     let child_task_id = match sched.alloc_task_id() {
         Some(id) => id,
-        None => return 0,
+        None => return u64::MAX,
     };
 
     // Set up child task.
     {
+        let parent_pgid = sched.tasks[parent_task_id as usize].pgid;
+        let parent_sid = sched.tasks[parent_task_id as usize].sid;
+        let parent_ctty = sched.tasks[parent_task_id as usize].ctty_port;
         let task = &mut sched.tasks[child_task_id as usize];
         task.id = child_task_id;
         task.active = true;
@@ -1420,6 +1623,11 @@ pub fn fork_current() -> u64 {
         task.exited = false;
         task.thread_count = 1;
         task.parent_task = parent_task_id;
+        // Fork inherits parent's process group, session, and ctty.
+        task.pgid = parent_pgid;
+        task.sid = parent_sid;
+        task.ctty_port = parent_ctty;
+        task.fg_pgid = 0; // Only session leader tracks fg_pgid.
     }
 
     // Bootstrap capabilities: copy parent's SEND/RECV bitmaps and grant
@@ -1452,7 +1660,7 @@ pub fn fork_current() -> u64 {
     // Allocate kernel stack for child thread.
     let kstack_page = match crate::mm::phys::alloc_page() {
         Some(p) => p,
-        None => return 0,
+        None => return u64::MAX,
     };
     let kstack_base = kstack_page.as_usize();
     let kstack_top = kstack_base + PAGE_SIZE;
@@ -1476,7 +1684,7 @@ pub fn fork_current() -> u64 {
     // Allocate child thread.
     let child_tid = match sched.alloc_thread_id() {
         Some(id) => id,
-        None => return 0,
+        None => return u64::MAX,
     };
 
     // Clear killed/affinity flags.

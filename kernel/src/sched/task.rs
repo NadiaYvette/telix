@@ -108,6 +108,14 @@ pub struct Task {
     pub sa_enabled: bool,
     /// Per-signal action table (indexed by signal_number - 1).
     pub sig_actions: [SignalAction; MAX_SIGNALS],
+    /// Process group ID. Defaults to task_id on creation.
+    pub pgid: TaskId,
+    /// Session ID. Defaults to parent's sid, or task_id for setsid().
+    pub sid: TaskId,
+    /// Controlling terminal port (0 = no ctty).
+    pub ctty_port: u32,
+    /// Foreground process group (only meaningful on the session leader).
+    pub fg_pgid: TaskId,
 }
 
 impl Task {
@@ -128,6 +136,10 @@ impl Task {
             cur_pages: 0,
             sa_enabled: false,
             sig_actions: [const { SignalAction::default() }; MAX_SIGNALS],
+            pgid: 0,
+            sid: 0,
+            ctty_port: 0,
+            fg_pgid: 0,
         }
     }
 }

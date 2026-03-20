@@ -75,6 +75,13 @@ pub const SYS_KILL_SIG: u64 = 58;
 pub const SYS_SIGPENDING: u64 = 59;
 pub const SYS_MPROTECT: u64 = 60;
 pub const SYS_MREMAP: u64 = 61;
+pub const SYS_SETPGID: u64 = 62;
+pub const SYS_GETPGID: u64 = 63;
+pub const SYS_SETSID: u64 = 64;
+pub const SYS_GETSID: u64 = 65;
+pub const SYS_TCSETPGRP: u64 = 66;
+pub const SYS_TCGETPGRP: u64 = 67;
+pub const SYS_SET_CTTY: u64 = 68;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -236,6 +243,24 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SIGPENDING => crate::sched::get_signal_pending(),
         SYS_MPROTECT => sys_mprotect(a0, a1, a2),
         SYS_MREMAP => sys_mremap(a0, a1, a2),
+        SYS_SETPGID => {
+            // User passes thread_id (from fork); convert to task_id. 0 = self.
+            let pid = if a0 != 0 { crate::sched::thread_task_id(a0 as u32) } else { 0 };
+            let pgid = if a1 != 0 { crate::sched::thread_task_id(a1 as u32) } else { 0 };
+            crate::sched::setpgid(pid, pgid)
+        },
+        SYS_GETPGID => {
+            let pid = if a0 != 0 { crate::sched::thread_task_id(a0 as u32) } else { 0 };
+            crate::sched::getpgid(pid)
+        },
+        SYS_SETSID => crate::sched::setsid(),
+        SYS_GETSID => {
+            let pid = if a0 != 0 { crate::sched::thread_task_id(a0 as u32) } else { 0 };
+            crate::sched::getsid(pid)
+        },
+        SYS_TCSETPGRP => crate::sched::tcsetpgrp(a0 as u32),
+        SYS_TCGETPGRP => crate::sched::tcgetpgrp(),
+        SYS_SET_CTTY => crate::sched::set_ctty(a0 as u32),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1540,11 +1565,25 @@ fn sys_sigprocmask(how: u64, new_set: u64) -> u64 {
     crate::sched::set_signal_mask(final_mask)
 }
 
-/// kill_sig(tid, sig) -> 0 on success, u64::MAX on error.
-/// Sends signal `sig` to the task containing thread `tid`.
-fn sys_kill_sig(tid: u64, sig: u64) -> u64 {
-    let task_id = crate::sched::thread_task_id(tid as u32);
-    if crate::sched::send_signal_to_task(task_id, sig as u32) { 0 } else { u64::MAX }
+/// kill_sig(target, sig) -> 0 on success, u64::MAX on error.
+/// If target > 0: sends signal to the task containing thread `target`.
+/// If target is negative (high bit set): sends signal to process group |target|.
+fn sys_kill_sig(target: u64, sig: u64) -> u64 {
+    let target_i64 = target as i64;
+    if target_i64 < 0 {
+        // Send to process group. User passes thread_id; convert to task_id for pgid.
+        let raw = (-target_i64) as u32;
+        let pgid = if (raw as usize) < crate::sched::thread::MAX_THREADS {
+            crate::sched::thread_task_id(raw)
+        } else {
+            // Not a valid thread_id; treat as raw task_id (pgid).
+            raw
+        };
+        if crate::sched::send_signal_to_pgroup(pgid, sig as u32) { 0 } else { u64::MAX }
+    } else {
+        let task_id = crate::sched::thread_task_id(target as u32);
+        if crate::sched::send_signal_to_task(task_id, sig as u32) { 0 } else { u64::MAX }
+    }
 }
 
 /// sigreturn(frame_addr): restore the exception frame from the signal frame.

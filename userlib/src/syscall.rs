@@ -652,6 +652,13 @@ pub fn cpu_load(cpu_id: u32) -> Option<(u32, u32, u16)> {
 
 const SYS_MPROTECT: u64 = 60;
 const SYS_MREMAP: u64 = 61;
+const SYS_SETPGID: u64 = 62;
+const SYS_GETPGID: u64 = 63;
+const SYS_SETSID: u64 = 64;
+const SYS_GETSID: u64 = 65;
+const SYS_TCSETPGRP: u64 = 66;
+const SYS_TCGETPGRP: u64 = 67;
+const SYS_SET_CTTY: u64 = 68;
 
 /// Change the protection of a memory region.
 /// addr and len must be MMUPAGE_SIZE (4K) aligned.
@@ -669,6 +676,50 @@ pub fn mprotect(addr: usize, len: usize, prot: u8) -> bool {
 pub fn mremap(old_addr: usize, old_len: usize, new_len: usize) -> Option<usize> {
     let r = unsafe { arch::syscall3(SYS_MREMAP, old_addr as u64, old_len as u64, new_len as u64) };
     if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+/// Set the process group ID. pid=0 means self, pgid=0 means set pgid=pid.
+/// Returns true on success.
+pub fn setpgid(pid: u32, pgid: u32) -> bool {
+    unsafe { arch::syscall2(SYS_SETPGID, pid as u64, pgid as u64) == 0 }
+}
+
+/// Get the process group ID. pid=0 means self.
+/// Returns the pgid, or u64::MAX on error.
+pub fn getpgid(pid: u32) -> u64 {
+    unsafe { arch::syscall1(SYS_GETPGID, pid as u64) }
+}
+
+/// Create a new session. Returns the new session ID or u64::MAX on error.
+pub fn setsid() -> u64 {
+    unsafe { arch::syscall0(SYS_SETSID) }
+}
+
+/// Get the session ID. pid=0 means self.
+pub fn getsid(pid: u32) -> u64 {
+    unsafe { arch::syscall1(SYS_GETSID, pid as u64) }
+}
+
+/// Set the foreground process group for the controlling terminal.
+pub fn tcsetpgrp(pgid: u32) -> bool {
+    unsafe { arch::syscall1(SYS_TCSETPGRP, pgid as u64) == 0 }
+}
+
+/// Get the foreground process group for the controlling terminal.
+pub fn tcgetpgrp() -> u64 {
+    unsafe { arch::syscall0(SYS_TCGETPGRP) }
+}
+
+/// Set the controlling terminal for the current session.
+/// Only the session leader can call this.
+pub fn set_ctty(port: u32) -> bool {
+    unsafe { arch::syscall1(SYS_SET_CTTY, port as u64) == 0 }
+}
+
+/// Send a signal to a process group. Equivalent to kill(-pgid, sig).
+pub fn kill_pgroup(pgid: u32, sig: u32) -> bool {
+    let neg_pgid = (-(pgid as i64)) as u64;
+    unsafe { arch::syscall2(SYS_KILL_SIG, neg_pgid, sig as u64) == 0 }
 }
 
 /// Register a service with the name server.

@@ -2462,6 +2462,147 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 43: Process groups, sessions, controlling terminals ---
+    syscall::debug_puts(b"  init: testing process groups and sessions...\n");
+    {
+        let mut phase43_ok = true;
+        let my_pid = syscall::getpid();
+
+        // Initially: pgid == task_id, sid inherited from parent (0 for init).
+        let my_pgid = syscall::getpgid(0);
+        if my_pgid == u64::MAX {
+            syscall::debug_puts(b"  init: getpgid failed\n");
+            phase43_ok = false;
+        }
+
+        // Create a new session. init becomes session leader.
+        let new_sid = syscall::setsid();
+        if new_sid == u64::MAX {
+            syscall::debug_puts(b"  init: setsid failed\n");
+            phase43_ok = false;
+        } else if new_sid != my_pid as u64 {
+            syscall::debug_puts(b"  init: setsid returned wrong sid\n");
+            phase43_ok = false;
+        }
+
+        // After setsid: sid == pgid == my_pid.
+        let sid = syscall::getsid(0);
+        if sid != my_pid as u64 {
+            syscall::debug_puts(b"  init: getsid after setsid wrong\n");
+            phase43_ok = false;
+        }
+        let pgid = syscall::getpgid(0);
+        if pgid != my_pid as u64 {
+            syscall::debug_puts(b"  init: pgid after setsid wrong\n");
+            phase43_ok = false;
+        }
+
+        // Set a controlling terminal (use a dummy port).
+        let ctty_port = syscall::port_create() as u32;
+        if !syscall::set_ctty(ctty_port) {
+            syscall::debug_puts(b"  init: set_ctty failed\n");
+            phase43_ok = false;
+        }
+
+        // Fork a child and test process group inheritance.
+        let fork_result = syscall::fork();
+        if fork_result == 0 {
+            // Child: should inherit parent's pgid, sid, and ctty.
+            let child_pgid = syscall::getpgid(0);
+            let child_sid = syscall::getsid(0);
+            let parent_pgid = my_pid as u64;
+
+            if child_pgid != parent_pgid || child_sid != my_pid as u64 {
+                syscall::exit(1); // Failed.
+            }
+
+            // setpgid to own task_id (create own process group).
+            let child_pid = syscall::getpid();
+            if !syscall::setpgid(0, 0) {
+                syscall::exit(2);
+            }
+            let new_pgid = syscall::getpgid(0);
+            if new_pgid != child_pid as u64 {
+                syscall::exit(3);
+            }
+
+            syscall::exit(0);
+        } else if fork_result > 0 && fork_result != u64::MAX {
+            // Parent: wait for child.
+            loop {
+                if let Some(code) = syscall::waitpid(fork_result) {
+                    if code != 0 {
+                        syscall::debug_puts(b"  init: child pgroup test failed (code=");
+                        print_num(code);
+                        syscall::debug_puts(b")\n");
+                        phase43_ok = false;
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+        } else {
+            syscall::debug_puts(b"  init: fork for pgroup test failed\n");
+            phase43_ok = false;
+        }
+
+        // Test tcsetpgrp/tcgetpgrp: set init's pgid as foreground.
+        if !syscall::tcsetpgrp(my_pid) {
+            syscall::debug_puts(b"  init: tcsetpgrp failed\n");
+            phase43_ok = false;
+        }
+        let fg = syscall::tcgetpgrp();
+        if fg != my_pid as u64 {
+            syscall::debug_puts(b"  init: tcgetpgrp wrong\n");
+            phase43_ok = false;
+        }
+
+        // Yield to let any exited children fully clean up (aspace destruction
+        // happens after task.exited is set, so waitpid returns before aspace is freed).
+        for _ in 0..50 { syscall::yield_now(); }
+
+        // Test pgroup kill: fork one child, put in own group, kill group.
+        let child1 = syscall::fork();
+        if child1 == 0 {
+            // Child: spin.
+            loop { syscall::yield_now(); }
+        }
+
+        if child1 > 0 && child1 != u64::MAX {
+            // Put child in its own process group.
+            syscall::setpgid(child1 as u32, child1 as u32);
+
+            for _ in 0..10 { syscall::yield_now(); }
+
+            // Kill the group.
+            syscall::kill_pgroup(child1 as u32, syscall::SIGKILL);
+
+            let mut found = false;
+            for _ in 0..500 {
+                if let Some(_) = syscall::waitpid(child1) {
+                    found = true;
+                    break;
+                }
+                syscall::yield_now();
+            }
+            if !found {
+                syscall::debug_puts(b"  init: pgroup kill failed\n");
+                phase43_ok = false;
+            }
+        } else {
+            syscall::debug_puts(b"  init: fork for pgroup kill test failed\n");
+            phase43_ok = false;
+        }
+
+        syscall::port_destroy(ctty_port);
+
+        if phase43_ok {
+            syscall::debug_puts(b"Phase 43 process groups/sessions: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 43 process groups/sessions: FAILED\n");
+        }
+    }
+
     // --- Phase 42: mprotect + mremap ---
     syscall::debug_puts(b"  init: testing mprotect + mremap...\n");
     {
