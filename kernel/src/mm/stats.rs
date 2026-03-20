@@ -15,6 +15,7 @@ pub static COW_PAGES_COPIED: AtomicU64 = AtomicU64::new(0);
 pub static SUPERPAGE_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
 pub static SUPERPAGE_DEMOTIONS: AtomicU64 = AtomicU64::new(0);
 pub static PAGES_PREZEROED: AtomicU64 = AtomicU64::new(0);
+pub static PAGER_FAULTS: AtomicU64 = AtomicU64::new(0);
 
 pub fn print() {
     crate::println!("  VM stats:");
@@ -31,4 +32,5 @@ pub fn print() {
     crate::println!("    Superpage promotions: {}", SUPERPAGE_PROMOTIONS.load(Ordering::Relaxed));
     crate::println!("    Superpage demotions: {}", SUPERPAGE_DEMOTIONS.load(Ordering::Relaxed));
     crate::println!("    Pages pre-zeroed:  {}", PAGES_PREZEROED.load(Ordering::Relaxed));
+    crate::println!("    Pager faults:  {}", PAGER_FAULTS.load(Ordering::Relaxed));
 }

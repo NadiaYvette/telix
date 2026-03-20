@@ -24,6 +24,8 @@ pub enum BlockReason {
     ActivationWait,
     ZeroPool,
     Sleep,
+    PagerFault,
+    PagerWait,
 }
 
 /// Maximum number of threads.

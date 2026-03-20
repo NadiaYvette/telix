@@ -177,12 +177,21 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
         loop { core::hint::spin_loop(); }
     }
     let result = crate::mm::fault::handle_page_fault(aspace_id, cr2 as usize, fault_type);
-    if result == crate::mm::fault::FaultResult::Failed {
-        crate::println!(
-            "Unhandled #PF: CR2={:#x} RIP={:#x} error={:#x}",
-            cr2, frame.rip(), error
-        );
-        loop { core::hint::spin_loop(); }
+    match result {
+        crate::mm::fault::FaultResult::NeedPager { token } => {
+            crate::sched::scheduler::store_frame_sp(frame_sp);
+            crate::mm::pager::initiate_fault(token);
+            let pending = crate::sched::scheduler::take_pending_switch();
+            return if pending != 0 { pending } else { frame_sp };
+        }
+        crate::mm::fault::FaultResult::Failed => {
+            crate::println!(
+                "Unhandled #PF: CR2={:#x} RIP={:#x} error={:#x}",
+                cr2, frame.rip(), error
+            );
+            loop { core::hint::spin_loop(); }
+        }
+        _ => {}
     }
     frame_sp
 }

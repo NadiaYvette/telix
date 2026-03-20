@@ -85,6 +85,9 @@ pub const SYS_SET_CTTY: u64 = 68;
 pub const SYS_CLOCK_GETTIME: u64 = 69;
 pub const SYS_NANOSLEEP: u64 = 70;
 pub const SYS_ALARM: u64 = 71;
+pub const SYS_MMAP_FILE: u64 = 72;
+pub const SYS_WAIT_FAULT: u64 = 73;
+pub const SYS_FAULT_COMPLETE: u64 = 74;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -267,6 +270,12 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_CLOCK_GETTIME => sys_clock_gettime(a0),
         SYS_NANOSLEEP => sys_nanosleep(a0),
         SYS_ALARM => crate::sched::alarm(a0, a1),
+        SYS_MMAP_FILE => sys_mmap_file(a0, a1, a2, a3, a4, a5),
+        SYS_WAIT_FAULT => {
+            sys_wait_fault(frame);
+            return;
+        }
+        SYS_FAULT_COMPLETE => sys_fault_complete(a0, a1, a2),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1583,6 +1592,91 @@ fn sys_nanosleep(ns: u64) -> u64 {
     let deadline = crate::sched::get_monotonic_ns() + ns;
     crate::sched::park_current_for_sleep(deadline);
     0
+}
+
+fn sys_mmap_file(va_hint: u64, page_count: u64, prot: u64, file_handle: u64, file_offset_lo: u64, file_offset_hi: u64) -> u64 {
+    use crate::mm::page::PAGE_SIZE;
+    use crate::mm::vma::VmaProt;
+
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    if aspace_id == 0 { return u64::MAX; }
+
+    let pages = page_count as usize;
+    if pages == 0 || pages > 256 { return u64::MAX; }
+
+    let prot = match prot {
+        0 => VmaProt::ReadOnly,
+        1 => VmaProt::ReadWrite,
+        2 => VmaProt::ReadExec,
+        3 => VmaProt::ReadWriteExec,
+        _ => return u64::MAX,
+    };
+
+    let file_offset = file_offset_lo | (file_offset_hi << 32);
+
+    // Determine VA.
+    let va = if va_hint == 0 {
+        crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(pages))
+    } else {
+        va_hint as usize
+    };
+
+    // Create pager-backed object.
+    let obj_id = match crate::mm::object::create_pager(pages as u16, file_handle as u32, file_offset) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    // Register mapping and insert VMA.
+    let ok = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+        crate::mm::object::with_object(obj_id, |obj| {
+            obj.add_mapping(aspace_id, va);
+        });
+        let va_len = pages * PAGE_SIZE;
+        aspace.vmas.insert(va, va_len, prot, obj_id, 0).is_some()
+    });
+
+    if !ok {
+        crate::mm::object::destroy(obj_id);
+        return u64::MAX;
+    }
+
+    va as u64
+}
+
+fn sys_wait_fault(frame: &mut ExceptionFrame) {
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    if aspace_id == 0 {
+        set_return(frame, u64::MAX);
+        return;
+    }
+
+    match crate::mm::pager::wait_fault(aspace_id) {
+        Some((token, fault_va, file_handle, file_offset, len)) => {
+            set_return(frame, token as u64);
+            set_reg(frame, 1, fault_va as u64);
+            set_reg(frame, 2, file_handle as u64);
+            set_reg(frame, 3, file_offset);
+            set_reg(frame, 4, len as u64);
+        }
+        None => {
+            // Parked — initiate_fault injected data into our saved frame.
+            // When woken, frame already has the right values. Nothing to do.
+        }
+    }
+
+    // Deliver pending signals.
+    if crate::sched::scheduler::current_aspace_id() != 0 {
+        deliver_pending_signals(frame);
+    }
+}
+
+fn sys_fault_complete(token: u64, data_va: u64, data_len: u64) -> u64 {
+    if crate::mm::pager::complete_fault(token as u32, data_va as usize, data_len as usize) {
+        0
+    } else {
+        u64::MAX
+    }
 }
 
 /// If target is negative (high bit set): sends signal to process group |target|.

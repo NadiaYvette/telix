@@ -39,6 +39,8 @@ pub enum FaultResult {
     HandledCOW,
     /// Fault could not be handled (bad address, permission error, etc.).
     Failed,
+    /// Pager-backed VMA: page allocated, fault recorded, needs pager thread.
+    NeedPager { token: u32 },
 }
 
 /// Handle a page fault from userspace.
@@ -73,6 +75,36 @@ pub fn handle_page_fault(
         let mmu_idx = vma.mmu_index_of(fault_addr);
         let obj_page_idx = vma.obj_page_index(mmu_idx);
         let obj_id = vma.object_id;
+
+        // Pager-backed VMA: allocate page, record fault, return NeedPager.
+        let obj_type = object::with_object(obj_id, |obj| obj.obj_type);
+        if obj_type == super::object::ObjectType::Pager {
+            let (pa, _) = match object::with_object(obj_id, |obj| obj.ensure_page(obj_page_idx)) {
+                Some(r) => r,
+                None => return FaultResult::Failed,
+            };
+            let (file_handle, file_base) = object::with_object(obj_id, |obj| {
+                (obj.file_handle, obj.file_base_offset)
+            });
+            let file_offset = file_base + (obj_page_idx as u64) * (PAGE_SIZE as u64);
+            let fault_va = fault_addr & !(MMUPAGE_SIZE - 1);
+            let token = match super::pager::record_fault(super::pager::PagerFaultInfo {
+                aspace_id,
+                thread_id: crate::sched::scheduler::current_thread_id(),
+                fault_va,
+                phys_addr: pa.as_usize(),
+                obj_page_idx,
+                obj_id,
+                mmu_idx,
+                vma_va: vma.va_start,
+                file_handle,
+                file_offset,
+            }) {
+                Some(t) => t,
+                None => return FaultResult::Failed,
+            };
+            return FaultResult::NeedPager { token };
+        }
 
         // COW fault check: VMA is writable, page has PTE installed, but we got
         // a write fault. This means the PTE is read-only due to COW sharing.

@@ -21,6 +21,7 @@ const MAX_MAPPINGS: usize = 8;
 pub enum ObjectType {
     Free = 0,
     Anonymous = 1,
+    Pager = 2,
 }
 
 /// A mapping record: which address space maps this object and where.
@@ -41,7 +42,7 @@ impl Mapping {
     }
 }
 
-/// Anonymous memory object — demand-zero pages.
+/// Memory object — demand-zero (anonymous) or pager-backed pages.
 pub struct MemObject {
     pub obj_type: ObjectType,
     /// Total size in allocation pages.
@@ -51,6 +52,10 @@ pub struct MemObject {
     pub phys_pages: [usize; 256],
     /// Mappings from address spaces.
     pub mappings: [Mapping; MAX_MAPPINGS],
+    /// For Pager objects: file handle passed to the pager thread.
+    pub file_handle: u32,
+    /// For Pager objects: byte offset of this object's start within the file.
+    pub file_base_offset: u64,
 }
 
 impl MemObject {
@@ -60,6 +65,8 @@ impl MemObject {
             page_count: 0,
             phys_pages: [0; 256],
             mappings: [Mapping::empty(); MAX_MAPPINGS],
+            file_handle: 0,
+            file_base_offset: 0,
         }
     }
 
@@ -158,6 +165,22 @@ impl ObjectTable {
             },
         }
     }
+}
+
+/// Create a new pager-backed memory object.
+/// Returns the object ID.
+pub fn create_pager(page_count: u16, file_handle: u32, file_base_offset: u64) -> Option<ObjectId> {
+    let mut table = OBJECTS.lock();
+    for (i, obj) in table.objects.iter_mut().enumerate() {
+        if obj.obj_type == ObjectType::Free {
+            obj.obj_type = ObjectType::Pager;
+            obj.page_count = page_count;
+            obj.file_handle = file_handle;
+            obj.file_base_offset = file_base_offset;
+            return Some(i as ObjectId);
+        }
+    }
+    None
 }
 
 /// Create a new anonymous memory object of `page_count` allocation pages.

@@ -102,13 +102,11 @@ extern "C" fn exception_sync_el0(frame_sp: u64) -> u64 {
         }
         // Data Abort from EL0.
         0x24 => {
-            handle_abort_el0(frame);
-            frame_sp
+            handle_abort_el0(frame, frame_sp)
         }
         // Instruction Abort from EL0.
         0x20 => {
-            handle_abort_el0(frame);
-            frame_sp
+            handle_abort_el0(frame, frame_sp)
         }
         _ => {
             crate::println!(
@@ -123,7 +121,7 @@ extern "C" fn exception_sync_el0(frame_sp: u64) -> u64 {
 }
 
 /// Handle a data/instruction abort from EL0 by dispatching to the VM fault handler.
-fn handle_abort_el0(frame: &ExceptionFrame) {
+fn handle_abort_el0(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
     let far: u64;
     unsafe { core::arch::asm!("mrs {}, far_el1", out(reg) far); }
     let ec = (frame.esr >> 26) & 0x3f;
@@ -148,12 +146,22 @@ fn handle_abort_el0(frame: &ExceptionFrame) {
     }
 
     let result = crate::mm::fault::handle_page_fault(aspace_id, far as usize, fault_type);
-    if result == crate::mm::fault::FaultResult::Failed {
-        crate::println!(
-            "EL0 Abort: unhandled fault FAR={:#x} EC={:#x} ELR={:#x}",
-            far, ec, frame.elr
-        );
-        loop { core::hint::spin_loop(); }
+    match result {
+        crate::mm::fault::FaultResult::NeedPager { token } => {
+            crate::sched::scheduler::store_frame_sp(frame_sp);
+            crate::mm::pager::initiate_fault(token);
+            let pending = crate::sched::scheduler::take_pending_switch();
+            if pending != 0 { return pending; }
+            frame_sp
+        }
+        crate::mm::fault::FaultResult::Failed => {
+            crate::println!(
+                "EL0 Abort: unhandled fault FAR={:#x} EC={:#x} ELR={:#x}",
+                far, ec, frame.elr
+            );
+            loop { core::hint::spin_loop(); }
+        }
+        _ => frame_sp,
     }
 }
 

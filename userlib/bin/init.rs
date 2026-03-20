@@ -2801,6 +2801,88 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 45: file-backed mmap (pager thread) ---
+    syscall::debug_puts(b"  init: testing file-backed mmap (pager thread)...\n");
+    {
+        let mut phase45_ok = true;
+
+        // Allocate a stack for the pager thread.
+        let pager_stack = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
+        if pager_stack == 0 {
+            syscall::debug_puts(b"  FAIL: cannot allocate pager stack\n");
+            phase45_ok = false;
+        }
+
+        if phase45_ok {
+            let pager_stack_top = pager_stack + 0x4000;
+
+            // Spawn pager thread.
+            let pager_tid = syscall::thread_create(
+                pager_thread_entry as u64,
+                pager_stack_top as u64,
+                0,
+            );
+            if pager_tid == u64::MAX {
+                syscall::debug_puts(b"  FAIL: cannot create pager thread\n");
+                phase45_ok = false;
+            }
+
+            if phase45_ok {
+                // Create a file-backed mapping: 2 allocation pages, RW, file_handle=0x42, offset=0.
+                let mapped_va = syscall::mmap_file(0, 2, 1, 0x42, 0);
+                match mapped_va {
+                    Some(va) => {
+                        // Touch several locations to trigger page faults.
+                        // Pager fills each PAGE_SIZE page with a pattern: each byte = page_index.
+                        let ptr = va as *const u8;
+
+                        // Read from first page (offset 0).
+                        let b0 = unsafe { core::ptr::read_volatile(ptr) };
+                        if b0 != 0 {
+                            syscall::debug_puts(b"  FAIL: page 0 byte 0 mismatch\n");
+                            phase45_ok = false;
+                        }
+
+                        // Read from second allocation page (offset = PAGE_SIZE).
+                        // PAGE_SIZE = 64K = 0x10000. Page index = 1.
+                        let b1 = unsafe { core::ptr::read_volatile(ptr.add(0x10000)) };
+                        if b1 != 1 {
+                            syscall::debug_puts(b"  FAIL: page 1 byte 0 mismatch\n");
+                            phase45_ok = false;
+                        }
+
+                        // Read from middle of first page (offset 0x100).
+                        let b2 = unsafe { core::ptr::read_volatile(ptr.add(0x100)) };
+                        if b2 != 0 {
+                            syscall::debug_puts(b"  FAIL: page 0 byte 0x100 mismatch\n");
+                            phase45_ok = false;
+                        }
+
+                        // Read from second page at offset 0x200.
+                        let b3 = unsafe { core::ptr::read_volatile(ptr.add(0x10200)) };
+                        if b3 != 1 {
+                            syscall::debug_puts(b"  FAIL: page 1 byte 0x200 mismatch\n");
+                            phase45_ok = false;
+                        }
+
+                        // Unmap.
+                        syscall::munmap(va);
+                    }
+                    None => {
+                        syscall::debug_puts(b"  FAIL: mmap_file returned None\n");
+                        phase45_ok = false;
+                    }
+                }
+            }
+        }
+
+        if phase45_ok {
+            syscall::debug_puts(b"Phase 45 file-backed mmap: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 45 file-backed mmap: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
@@ -2843,6 +2925,44 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
 /// Child thread entry point for Phase 17 test.
 #[unsafe(no_mangle)]
+/// Pager thread for Phase 45 test.
+/// Loops on wait_fault(), fills each page with a byte pattern = page_index.
+extern "C" fn pager_thread_entry(_arg: u64) {
+    loop {
+        let (token, _fault_va, _file_handle, file_offset, page_size) = syscall::wait_fault();
+
+        // Fill a local buffer with pattern: each byte = page_index (offset / PAGE_SIZE).
+        // PAGE_SIZE = 64K = 0x10000.
+        let page_index = (file_offset / 0x10000) as u8;
+
+        // Allocate a temporary buffer (use stack — 4K at a time, fill PAGE_SIZE).
+        // Since PAGE_SIZE can be 64K, we fill via multiple 4K chunks.
+        let mut buf = [0u8; 4096];
+        for b in buf.iter_mut() {
+            *b = page_index;
+        }
+
+        // Call fault_complete for each 4K chunk.
+        // Actually, fault_complete copies PAGE_SIZE from the given VA.
+        // The kernel translate_va will translate our buf pointer.
+        // But buf is only 4K and the kernel copies page_size bytes...
+        // We need a full PAGE_SIZE buffer.
+        // Allocate one via mmap_anon.
+        let tmp = syscall::mmap_anon(0, 1, 1); // 1 page = PAGE_SIZE
+        if let Some(tmp_va) = tmp {
+            // Fill the entire page with the pattern.
+            let ptr = tmp_va as *mut u8;
+            for i in 0..page_size {
+                unsafe { core::ptr::write_volatile(ptr.add(i), page_index); }
+            }
+            syscall::fault_complete(token, unsafe {
+                core::slice::from_raw_parts(tmp_va as *const u8, page_size)
+            });
+            syscall::munmap(tmp_va);
+        }
+    }
+}
+
 extern "C" fn thread_child_entry(arg: u64) {
     let ptr = arg as *mut u64;
     unsafe { core::ptr::write_volatile(ptr, 0xCAFE); }

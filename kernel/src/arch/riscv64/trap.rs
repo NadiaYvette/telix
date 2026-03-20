@@ -239,14 +239,23 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                 loop { core::hint::spin_loop(); }
             }
             let result = crate::mm::fault::handle_page_fault(aspace_id, stval as usize, fault_type);
-            if result == crate::mm::fault::FaultResult::Failed {
-                crate::println!(
-                    "Unhandled page fault: cause={:#x} sepc={:#x} stval={:#x}",
-                    scause, frame.sepc, stval
-                );
-                loop { core::hint::spin_loop(); }
+            match result {
+                crate::mm::fault::FaultResult::NeedPager { token } => {
+                    crate::sched::scheduler::store_frame_sp(frame_sp);
+                    crate::mm::pager::initiate_fault(token);
+                    let pending = crate::sched::scheduler::take_pending_switch();
+                    if pending != 0 { return pending; }
+                    frame_sp
+                }
+                crate::mm::fault::FaultResult::Failed => {
+                    crate::println!(
+                        "Unhandled page fault: cause={:#x} sepc={:#x} stval={:#x}",
+                        scause, frame.sepc, stval
+                    );
+                    loop { core::hint::spin_loop(); }
+                }
+                _ => frame_sp,
             }
-            frame_sp
         }
 
         _ => {

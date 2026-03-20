@@ -750,6 +750,82 @@ pub fn alarm(initial_ns: u64, interval_ns: u64) -> u64 {
     unsafe { arch::syscall2(SYS_ALARM, initial_ns, interval_ns) }
 }
 
+const SYS_MMAP_FILE: u64 = 72;
+const SYS_WAIT_FAULT: u64 = 73;
+const SYS_FAULT_COMPLETE: u64 = 74;
+
+/// Map a file-backed region via the pager mechanism.
+/// Returns the VA on success, or None on failure.
+pub fn mmap_file(va: usize, pages: usize, prot: u8, file_handle: u32, file_offset: u64) -> Option<usize> {
+    let lo = file_offset & 0xFFFF_FFFF;
+    let hi = file_offset >> 32;
+    let r = unsafe {
+        arch::syscall6(SYS_MMAP_FILE, va as u64, pages as u64, prot as u64,
+                       file_handle as u64, lo, hi)
+    };
+    if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+/// Wait for a pager fault in the current address space.
+/// Returns (token, fault_va, file_handle, file_offset, page_size).
+pub fn wait_fault() -> (u32, usize, u32, u64, usize) {
+    let r0: u64;
+    let r1: u64;
+    let r2: u64;
+    let r3: u64;
+    let r4: u64;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_WAIT_FAULT,
+            lateout("x0") r0,
+            lateout("x1") r1,
+            lateout("x2") r2,
+            lateout("x3") r3,
+            lateout("x4") r4,
+        );
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SYS_WAIT_FAULT as u64,
+            lateout("a0") r0,
+            lateout("a1") r1,
+            lateout("a2") r2,
+            lateout("a3") r3,
+            lateout("a4") r4,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") SYS_WAIT_FAULT => r0,
+            lateout("rdi") r1,
+            lateout("rsi") r2,
+            lateout("rdx") r3,
+            lateout("r10") r4,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+
+    (r0 as u32, r1 as usize, r2 as u32, r3, r4 as usize)
+}
+
+/// Complete a pager fault by providing the page data.
+pub fn fault_complete(token: u32, data: &[u8]) -> bool {
+    let r = unsafe {
+        arch::syscall3(SYS_FAULT_COMPLETE, token as u64, data.as_ptr() as u64, data.len() as u64)
+    };
+    r == 0
+}
+
 /// Register a service with the name server.
 pub fn ns_register(name: &[u8], service_port: u32) -> bool {
     let nsrv = nsrv_port();

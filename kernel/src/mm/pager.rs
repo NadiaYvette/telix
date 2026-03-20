@@ -1,0 +1,287 @@
+//! Pager fault table — tracks pending page faults for pager-backed VMAs.
+//!
+//! When a page fault occurs on a pager-backed VMA, the kernel allocates the
+//! physical page, records the fault here, parks the faulting thread, and wakes
+//! the pager thread (if blocked in wait_fault). The pager thread fills the page
+//! and calls fault_complete to install the PTE and wake the faulting thread.
+
+use super::aspace::{self, MAX_ASPACES};
+use super::fault;
+use super::page::{PAGE_SIZE, MMUPAGE_SIZE};
+use super::stats;
+use crate::sched::scheduler;
+use crate::sched::thread::BlockReason;
+use crate::sync::SpinLock;
+use core::sync::atomic::Ordering;
+
+const MAX_PAGER_FAULTS: usize = 16;
+
+/// Information about a pending pager fault.
+pub struct PagerFaultInfo {
+    pub aspace_id: u32,
+    pub thread_id: u32,
+    pub fault_va: usize,
+    pub phys_addr: usize,
+    pub obj_page_idx: usize,
+    pub obj_id: u32,
+    pub mmu_idx: usize,
+    pub vma_va: usize,
+    pub file_handle: u32,
+    pub file_offset: u64,
+}
+
+struct PagerFaultEntry {
+    active: bool,
+    aspace_id: u32,
+    thread_id: u32,
+    fault_va: usize,
+    phys_addr: usize,
+    obj_page_idx: usize,
+    obj_id: u32,
+    mmu_idx: usize,
+    vma_va: usize,
+    file_handle: u32,
+    file_offset: u64,
+}
+
+impl PagerFaultEntry {
+    const fn empty() -> Self {
+        Self {
+            active: false, aspace_id: 0, thread_id: 0, fault_va: 0,
+            phys_addr: 0, obj_page_idx: 0, obj_id: 0, mmu_idx: 0,
+            vma_va: 0, file_handle: 0, file_offset: 0,
+        }
+    }
+}
+
+static PAGER_FAULTS: SpinLock<[PagerFaultEntry; MAX_PAGER_FAULTS]> = SpinLock::new({
+    const EMPTY: PagerFaultEntry = PagerFaultEntry::empty();
+    [EMPTY; MAX_PAGER_FAULTS]
+});
+
+/// Per-aspace pager thread ID. Slot = aspace_id % MAX_ASPACES. 0 = none waiting.
+static PAGER_WAITERS: SpinLock<[u32; MAX_ASPACES]> = SpinLock::new([0; MAX_ASPACES]);
+
+/// Record a pending pager fault. Returns a token (slot index) on success.
+/// Called from the fault handler inside with_aspace() — must not park.
+pub fn record_fault(info: PagerFaultInfo) -> Option<u32> {
+    let mut faults = PAGER_FAULTS.lock();
+    for (i, entry) in faults.iter_mut().enumerate() {
+        if !entry.active {
+            entry.active = true;
+            entry.aspace_id = info.aspace_id;
+            entry.thread_id = info.thread_id;
+            entry.fault_va = info.fault_va;
+            entry.phys_addr = info.phys_addr;
+            entry.obj_page_idx = info.obj_page_idx;
+            entry.obj_id = info.obj_id;
+            entry.mmu_idx = info.mmu_idx;
+            entry.vma_va = info.vma_va;
+            entry.file_handle = info.file_handle;
+            entry.file_offset = info.file_offset;
+            stats::PAGER_FAULTS.fetch_add(1, Ordering::Relaxed);
+            return Some(i as u32);
+        }
+    }
+    None
+}
+
+/// Park the faulting thread and wake the pager thread for this aspace.
+/// Called from the arch exception handler AFTER handle_page_fault returns
+/// (no aspace lock held). Must be called after store_frame_sp().
+pub fn initiate_fault(token: u32) {
+    let (aspace_id, fault_va, file_handle, file_offset) = {
+        let faults = PAGER_FAULTS.lock();
+        let e = &faults[token as usize];
+        (e.aspace_id, e.fault_va, e.file_handle, e.file_offset)
+    };
+
+    // Check if a pager thread is waiting and wake it.
+    let slot = (aspace_id as usize) % MAX_ASPACES;
+    let pager_tid = {
+        let mut waiters = PAGER_WAITERS.lock();
+        let tid = waiters[slot];
+        if tid != 0 {
+            waiters[slot] = 0;
+        }
+        tid
+    };
+    if pager_tid != 0 {
+        // Inject fault info into the pager's saved frame (like IPC recv injection).
+        inject_fault_into_frame(pager_tid, token, fault_va, file_handle, file_offset);
+        scheduler::wake_parked_thread(pager_tid);
+    }
+
+    // Park the faulting thread.
+    scheduler::park_current_for_ipc(BlockReason::PagerFault);
+}
+
+/// Inject fault info into a parked pager thread's saved exception frame.
+/// Sets: return reg (r0/a0) = token, r1/a1 = fault_va, r2/a2 = file_handle,
+///       r3/a3 = file_offset, r4/a4 = PAGE_SIZE.
+fn inject_fault_into_frame(pager_tid: u32, token: u32, fault_va: usize, file_handle: u32, file_offset: u64) {
+    use crate::syscall::handlers::{set_return, set_reg, ExceptionFrame};
+    let sp = scheduler::thread_saved_sp(pager_tid);
+    let frame = unsafe { &mut *(sp as *mut ExceptionFrame) };
+    set_return(frame, token as u64);
+    set_reg(frame, 1, fault_va as u64);
+    set_reg(frame, 2, file_handle as u64);
+    set_reg(frame, 3, file_offset);
+    set_reg(frame, 4, PAGE_SIZE as u64);
+}
+
+/// Wait for a pager fault in the current address space.
+/// If a fault is pending, returns Some((token, fault_va, file_handle, file_offset, page_size)).
+/// If none, parks the pager thread. When woken by initiate_fault, the fault info
+/// will be injected into the saved frame (like IPC recv).
+pub fn wait_fault(aspace_id: u32) -> Option<(u32, usize, u32, u64, usize)> {
+    let slot = (aspace_id as usize) % MAX_ASPACES;
+
+    // Check for pending faults first (lock order: FAULTS before WAITERS).
+    {
+        let faults = PAGER_FAULTS.lock();
+        for (i, entry) in faults.iter().enumerate() {
+            if entry.active && entry.aspace_id == aspace_id {
+                return Some((
+                    i as u32,
+                    entry.fault_va,
+                    entry.file_handle,
+                    entry.file_offset,
+                    PAGE_SIZE,
+                ));
+            }
+        }
+    }
+
+    // Register as waiter. initiate_fault checks this AFTER recording the fault.
+    {
+        let mut waiters = PAGER_WAITERS.lock();
+        let tid = scheduler::current_thread_id();
+        waiters[slot] = tid;
+    }
+
+    // Re-check for faults that may have arrived between our first check and
+    // registering as waiter. If a fault arrived, initiate_fault either:
+    // (a) saw our waiter registration and will inject+wake us, or
+    // (b) didn't see it yet (we weren't registered). Check again.
+    {
+        let faults = PAGER_FAULTS.lock();
+        for (i, entry) in faults.iter().enumerate() {
+            if entry.active && entry.aspace_id == aspace_id {
+                // Clear waiter registration.
+                let mut waiters = PAGER_WAITERS.lock();
+                waiters[slot] = 0;
+                return Some((
+                    i as u32,
+                    entry.fault_va,
+                    entry.file_handle,
+                    entry.file_offset,
+                    PAGE_SIZE,
+                ));
+            }
+        }
+    }
+
+    // No faults pending. Park. initiate_fault will see our waiter registration,
+    // inject fault data into our frame, and wake us.
+    scheduler::park_current_for_ipc(BlockReason::PagerWait);
+    None
+}
+
+/// Complete a pager fault: copy data from the caller's VA to the physical page,
+/// install the PTE, and wake the faulting thread.
+pub fn complete_fault(token: u32, data_va: usize, data_len: usize) -> bool {
+    if token as usize >= MAX_PAGER_FAULTS {
+        return false;
+    }
+
+    // Extract fault entry info.
+    let entry_info = {
+        let faults = PAGER_FAULTS.lock();
+        let entry = &faults[token as usize];
+        if !entry.active {
+            return false;
+        }
+        (
+            entry.aspace_id,
+            entry.thread_id,
+            entry.phys_addr,
+            entry.mmu_idx,
+            entry.vma_va,
+            entry.fault_va,
+        )
+    };
+    let (fault_aspace_id, fault_thread_id, phys_addr,
+         mmu_idx, vma_va, fault_va) = entry_info;
+
+    // Translate the caller's data_va to physical address.
+    let pt_root = scheduler::current_page_table_root();
+    let src_pa = match translate_va(pt_root, data_va) {
+        Some(pa) => pa,
+        None => return false,
+    };
+
+    // Copy data from source PA to target physical page.
+    let copy_len = data_len.min(PAGE_SIZE);
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            src_pa as *const u8,
+            phys_addr as *mut u8,
+            copy_len,
+        );
+        if copy_len < PAGE_SIZE {
+            core::ptr::write_bytes(
+                (phys_addr + copy_len) as *mut u8,
+                0,
+                PAGE_SIZE - copy_len,
+            );
+        }
+    }
+
+    // Install PTEs and mark pages in the VMA.
+    aspace::with_aspace(fault_aspace_id, |aspace| {
+        let pt_root = aspace.page_table_root;
+        if let Some(vma) = aspace.find_vma_mut(vma_va) {
+            // Mark all MMU sub-pages within this allocation page as zeroed (filled).
+            let (ap_start, ap_end) = vma.alloc_page_mmu_range(mmu_idx);
+            for i in ap_start..ap_end {
+                vma.set_zeroed(i);
+            }
+
+            // Install PTE for the faulted MMU page.
+            let mmu_pa = phys_addr + vma.mmu_offset_in_page(mmu_idx) * MMUPAGE_SIZE;
+            let flags = fault::pte_flags_for_vma_pub(vma);
+            install_pte(pt_root, fault_va, mmu_pa, flags);
+            vma.set_installed(mmu_idx);
+        }
+    });
+
+    // Wake the faulting thread.
+    scheduler::wake_parked_thread(fault_thread_id);
+
+    // Clear the entry.
+    {
+        let mut faults = PAGER_FAULTS.lock();
+        faults[token as usize].active = false;
+    }
+
+    true
+}
+
+fn translate_va(pt_root: usize, va: usize) -> Option<usize> {
+    #[cfg(target_arch = "aarch64")]
+    { crate::arch::aarch64::mm::translate_va(pt_root, va) }
+    #[cfg(target_arch = "riscv64")]
+    { crate::arch::riscv64::mm::translate_va(pt_root, va) }
+    #[cfg(target_arch = "x86_64")]
+    { crate::arch::x86_64::mm::translate_va(pt_root, va) }
+}
+
+fn install_pte(pt_root: usize, va: usize, pa: usize, flags: u64) {
+    #[cfg(target_arch = "aarch64")]
+    { crate::arch::aarch64::mm::map_single_mmupage(pt_root, va, pa, flags); }
+    #[cfg(target_arch = "riscv64")]
+    { crate::arch::riscv64::mm::map_single_mmupage(pt_root, va, pa, flags); }
+    #[cfg(target_arch = "x86_64")]
+    { crate::arch::x86_64::mm::map_single_mmupage(pt_root, va, pa, flags); }
+}
