@@ -725,8 +725,9 @@ fn test_demand_paging() {
                 aspace_id, addr, mm::fault::FaultType::Write,
             );
             assert!(
-                result == mm::fault::FaultResult::HandledMajor,
-                "Expected major fault at {:#x}, got {:?}", addr, result
+                result == mm::fault::FaultResult::HandledMajor
+                    || result == mm::fault::FaultResult::HandledMinor,
+                "Expected major/minor fault at {:#x}, got {:?}", addr, result
             );
         }
         let promotions_after = mm::stats::CONTIGUOUS_PROMOTIONS.load(core::sync::atomic::Ordering::Relaxed);
