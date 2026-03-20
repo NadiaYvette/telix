@@ -659,6 +659,9 @@ const SYS_GETSID: u64 = 65;
 const SYS_TCSETPGRP: u64 = 66;
 const SYS_TCGETPGRP: u64 = 67;
 const SYS_SET_CTTY: u64 = 68;
+const SYS_CLOCK_GETTIME: u64 = 69;
+const SYS_NANOSLEEP: u64 = 70;
+const SYS_ALARM: u64 = 71;
 
 /// Change the protection of a memory region.
 /// addr and len must be MMUPAGE_SIZE (4K) aligned.
@@ -720,6 +723,31 @@ pub fn set_ctty(port: u32) -> bool {
 pub fn kill_pgroup(pgid: u32, sig: u32) -> bool {
     let neg_pgid = (-(pgid as i64)) as u64;
     unsafe { arch::syscall2(SYS_KILL_SIG, neg_pgid, sig as u64) == 0 }
+}
+
+/// Read the monotonic clock (nanoseconds since boot).
+/// clock_id 0 = CLOCK_MONOTONIC (only supported clock).
+/// Returns nanoseconds, or u64::MAX on invalid clock_id.
+pub fn clock_gettime() -> u64 {
+    unsafe { arch::syscall1(SYS_CLOCK_GETTIME, 0) }
+}
+
+/// Sleep for `ns` nanoseconds. Returns 0.
+pub fn nanosleep(ns: u64) -> u64 {
+    unsafe { arch::syscall1(SYS_NANOSLEEP, ns) }
+}
+
+/// Sleep for `ms` milliseconds.
+pub fn sleep_ms(ms: u64) {
+    nanosleep(ms * 1_000_000);
+}
+
+/// Set or cancel an interval timer.
+/// initial_ns: first firing delay (0 = cancel).
+/// interval_ns: repeat interval (0 = one-shot).
+/// Returns the previous remaining time in nanoseconds.
+pub fn alarm(initial_ns: u64, interval_ns: u64) -> u64 {
+    unsafe { arch::syscall2(SYS_ALARM, initial_ns, interval_ns) }
 }
 
 /// Register a service with the name server.

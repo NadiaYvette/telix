@@ -1007,6 +1007,8 @@ pub fn current_page_table_root() -> usize {
 /// for restore_regs — either the same SP (no switch) or a different
 /// thread's SP (preemption).
 pub fn tick(current_sp: u64) -> u64 {
+    check_sleep_timers();
+    check_alarm_timers();
     SCHEDULER.lock().try_switch(current_sp)
 }
 
@@ -2067,6 +2069,174 @@ pub fn wake_parked_thread(tid: ThreadId) {
         sched.threads[tid as usize].state = ThreadState::Ready;
         sched.run_queues[prio as usize].push(tid);
     }
+}
+
+/// Get monotonic time in nanoseconds since boot.
+pub fn get_monotonic_ns() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let c = crate::arch::aarch64::timer::counter();
+        let f = crate::arch::aarch64::timer::cntfrq();
+        ((c as u128 * 1_000_000_000u128) / f as u128) as u64
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let c = crate::arch::riscv64::trap::read_time();
+        ((c as u128 * 1_000_000_000u128) / 10_000_000u128) as u64
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let c = crate::arch::x86_64::timer::rdtsc();
+        // QEMU RDTSC freq ~ 1 GHz, so ns ≈ cycles
+        ((c as u128 * 1_000_000_000u128) / 1_000_000_000u128) as u64
+    }
+}
+
+/// Wake threads whose sleep deadlines have passed.
+/// Called from tick() before try_switch.
+fn check_sleep_timers() {
+    let now_ns = get_monotonic_ns();
+    let mut sched = SCHEDULER.lock();
+    for i in 0..MAX_THREADS {
+        if sched.threads[i].state == ThreadState::Blocked
+            && matches!(sched.threads[i].blocked_on, BlockReason::Sleep)
+            && sched.threads[i].sleep_deadline_ns != 0
+            && sched.threads[i].sleep_deadline_ns <= now_ns
+        {
+            let prio = sched.threads[i].effective_priority;
+            sched.threads[i].state = ThreadState::Ready;
+            sched.threads[i].blocked_on = BlockReason::None;
+            sched.threads[i].sleep_deadline_ns = 0;
+            sched.run_queues[prio as usize].push(i as ThreadId);
+        }
+    }
+}
+
+/// Check per-task alarm timers and deliver SIGALRM.
+/// Called from tick() before try_switch.
+fn check_alarm_timers() {
+    let now_ns = get_monotonic_ns();
+    let mut fired = [0u32; super::task::MAX_TASKS];
+    let mut count = 0usize;
+
+    {
+        let mut sched = SCHEDULER.lock();
+        for i in 0..super::task::MAX_TASKS {
+            if sched.tasks[i].active
+                && sched.tasks[i].alarm_deadline_ns != 0
+                && sched.tasks[i].alarm_deadline_ns <= now_ns
+            {
+                if sched.tasks[i].alarm_interval_ns != 0 {
+                    sched.tasks[i].alarm_deadline_ns = now_ns + sched.tasks[i].alarm_interval_ns;
+                } else {
+                    sched.tasks[i].alarm_deadline_ns = 0;
+                }
+                if count < fired.len() {
+                    fired[count] = sched.tasks[i].id;
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    for i in 0..count {
+        send_signal_to_task(fired[i], super::task::SIGALRM);
+    }
+}
+
+/// Park the current thread for a timed sleep.
+/// Sets the deadline and blocks the thread (off-CPU).
+pub fn park_current_for_sleep(deadline_ns: u64) {
+    let cpu = smp::cpu_id() as usize;
+    let frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
+
+    let mut sched = SCHEDULER.lock();
+    let pcpu = smp::current();
+    let tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
+    let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
+
+    // Set deadline before marking Blocked.
+    sched.threads[tid].sleep_deadline_ns = deadline_ns;
+    sched.threads[tid].saved_sp = frame_sp;
+    sched.threads[tid].state = ThreadState::Blocked;
+    sched.threads[tid].blocked_on = BlockReason::Sleep;
+
+    // Pick next thread (don't re-enqueue current — it's Blocked).
+    let next_id = sched.pick_next(idle_id);
+
+    // Switch page tables if needed.
+    let prev_task = sched.threads[tid].task_id;
+    let next_task = sched.threads[next_id as usize].task_id;
+    if prev_task != next_task {
+        let next_root = sched.tasks[next_task as usize].page_table_root;
+        if next_root != 0 {
+            #[cfg(target_arch = "aarch64")]
+            crate::arch::aarch64::mm::switch_page_table(next_root);
+            #[cfg(target_arch = "riscv64")]
+            crate::arch::riscv64::mm::switch_page_table(next_root);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::mm::switch_page_table(next_root);
+        } else {
+            #[cfg(target_arch = "riscv64")]
+            {
+                let kern_root = crate::arch::riscv64::mm::kernel_pt_root();
+                if kern_root != 0 {
+                    crate::arch::riscv64::mm::switch_page_table(kern_root);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let next_kstack_top = sched.threads[next_id as usize].stack_base + PAGE_SIZE;
+        crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
+    }
+
+    sched.threads[next_id as usize].state = ThreadState::Running;
+    pcpu.current_thread.store(next_id, Ordering::Relaxed);
+    let next_sp = sched.threads[next_id as usize].saved_sp;
+
+    // SA notification for the parked thread.
+    let parked_task_id = sched.threads[tid].task_id;
+    let sa_enabled = sched.tasks[parked_task_id as usize].sa_enabled;
+    drop(sched);
+
+    if sa_enabled {
+        let waiter = SA_WAITER[parked_task_id as usize].load(Ordering::Acquire);
+        if waiter != u32::MAX && waiter as usize != tid {
+            SA_EVENT[parked_task_id as usize].store(tid as u64, Ordering::Release);
+            SA_PENDING[parked_task_id as usize].store(true, Ordering::Release);
+            wake_thread(waiter);
+        }
+    }
+
+    PENDING_SWITCH_SP[cpu].store(next_sp, Ordering::Release);
+}
+
+/// Set an alarm timer for the current task.
+/// Returns previous remaining time in nanoseconds.
+pub fn alarm(initial_ns: u64, interval_ns: u64) -> u64 {
+    let tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    let task_id = sched.threads[tid as usize].task_id;
+    let task = &mut sched.tasks[task_id as usize];
+
+    let now = get_monotonic_ns();
+    let prev_remaining = if task.alarm_deadline_ns > now {
+        task.alarm_deadline_ns - now
+    } else {
+        0
+    };
+
+    if initial_ns == 0 {
+        task.alarm_deadline_ns = 0;
+        task.alarm_interval_ns = 0;
+    } else {
+        task.alarm_deadline_ns = now + initial_ns;
+        task.alarm_interval_ns = interval_ns;
+    }
+    prev_remaining
 }
 
 /// L4-style direct handoff: sender donates its remaining quantum to receiver.

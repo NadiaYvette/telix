@@ -82,6 +82,9 @@ pub const SYS_GETSID: u64 = 65;
 pub const SYS_TCSETPGRP: u64 = 66;
 pub const SYS_TCGETPGRP: u64 = 67;
 pub const SYS_SET_CTTY: u64 = 68;
+pub const SYS_CLOCK_GETTIME: u64 = 69;
+pub const SYS_NANOSLEEP: u64 = 70;
+pub const SYS_ALARM: u64 = 71;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -261,6 +264,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_TCSETPGRP => crate::sched::tcsetpgrp(a0 as u32),
         SYS_TCGETPGRP => crate::sched::tcgetpgrp(),
         SYS_SET_CTTY => crate::sched::set_ctty(a0 as u32),
+        SYS_CLOCK_GETTIME => sys_clock_gettime(a0),
+        SYS_NANOSLEEP => sys_nanosleep(a0),
+        SYS_ALARM => crate::sched::alarm(a0, a1),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1567,6 +1573,18 @@ fn sys_sigprocmask(how: u64, new_set: u64) -> u64 {
 
 /// kill_sig(target, sig) -> 0 on success, u64::MAX on error.
 /// If target > 0: sends signal to the task containing thread `target`.
+fn sys_clock_gettime(clock_id: u64) -> u64 {
+    if clock_id != 0 { return u64::MAX; } // CLOCK_MONOTONIC only
+    crate::sched::get_monotonic_ns()
+}
+
+fn sys_nanosleep(ns: u64) -> u64 {
+    if ns == 0 { return 0; }
+    let deadline = crate::sched::get_monotonic_ns() + ns;
+    crate::sched::park_current_for_sleep(deadline);
+    0
+}
+
 /// If target is negative (high bit set): sends signal to process group |target|.
 fn sys_kill_sig(target: u64, sig: u64) -> u64 {
     let target_i64 = target as i64;

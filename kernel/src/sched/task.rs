@@ -116,6 +116,10 @@ pub struct Task {
     pub ctty_port: u32,
     /// Foreground process group (only meaningful on the session leader).
     pub fg_pgid: TaskId,
+    /// Alarm deadline in nanoseconds-since-boot (0 = no alarm).
+    pub alarm_deadline_ns: u64,
+    /// Alarm interval for repeating (0 = one-shot).
+    pub alarm_interval_ns: u64,
 }
 
 impl Task {
@@ -140,6 +144,8 @@ impl Task {
             sid: 0,
             ctty_port: 0,
             fg_pgid: 0,
+            alarm_deadline_ns: 0,
+            alarm_interval_ns: 0,
         }
     }
 }

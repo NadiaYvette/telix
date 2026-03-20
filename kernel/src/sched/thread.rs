@@ -23,6 +23,7 @@ pub enum BlockReason {
     FutexWait,
     ActivationWait,
     ZeroPool,
+    Sleep,
 }
 
 /// Maximum number of threads.
@@ -64,6 +65,8 @@ pub struct Thread {
     pub sig_mask: u64,
     /// Per-thread pending signal set.
     pub sig_pending: u64,
+    /// Absolute deadline in nanoseconds-since-boot for Sleep blocking (0 = none).
+    pub sleep_deadline_ns: u64,
 }
 
 impl Thread {
@@ -82,6 +85,7 @@ impl Thread {
             exit_code: 0,
             sig_mask: 0,
             sig_pending: 0,
+            sleep_deadline_ns: 0,
         }
     }
 }
