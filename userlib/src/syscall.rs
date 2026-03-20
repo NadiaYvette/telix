@@ -826,6 +826,115 @@ pub fn fault_complete(token: u32, data: &[u8]) -> bool {
     r == 0
 }
 
+// --- Shared memory (shm_srv) client wrappers ---
+
+// Protocol tags (must match shm_srv.rs).
+const SHM_CREATE_TAG: u64 = 0x5000;
+const SHM_OPEN_TAG: u64 = 0x5001;
+const SHM_MAP_TAG: u64 = 0x5002;
+const SHM_UNMAP_TAG: u64 = 0x5003;
+const SHM_UNLINK_TAG: u64 = 0x5004;
+const SHM_OK_TAG: u64 = 0x5100;
+const SHM_MAP_OK_TAG: u64 = 0x5102;
+
+/// Poll for a reply on a temporary port. The send+handoff path causes the
+/// server to run immediately (direct transfer), so the reply is usually
+/// queued before we even check. Use non-blocking recv to avoid a blocking
+/// recv bug where the receiver parks but the queued reply isn't visible.
+fn shm_poll_reply(reply_port: u32) -> Option<Message> {
+    for _ in 0..50000u32 {
+        if let Some(r) = recv_nb_msg(reply_port) {
+            return Some(r);
+        }
+        yield_now();
+    }
+    None
+}
+
+/// Create or open a named shared memory segment.
+/// Returns (handle, page_count, srv_aspace) on success.
+pub fn shm_create(shm_port: u32, name: &[u8], page_count: usize) -> Option<(u32, usize, u32)> {
+    let reply_port = port_create() as u32;
+    let (n0, n1, _) = pack_name(name);
+    let d2 = (name.len() as u64) | ((reply_port as u64) << 32);
+    send(shm_port, SHM_CREATE_TAG, n0, n1, d2, page_count as u64);
+    let result = if let Some(reply) = shm_poll_reply(reply_port) {
+        if reply.tag == SHM_OK_TAG {
+            Some((reply.data[0] as u32, reply.data[1] as usize, reply.data[2] as u32))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    port_destroy(reply_port);
+    result
+}
+
+/// Open an existing named shared memory segment.
+/// Returns (handle, page_count, srv_aspace) on success.
+pub fn shm_open(shm_port: u32, name: &[u8]) -> Option<(u32, usize, u32)> {
+    let reply_port = port_create() as u32;
+    let (n0, n1, _) = pack_name(name);
+    let d2 = (name.len() as u64) | ((reply_port as u64) << 32);
+    send(shm_port, SHM_OPEN_TAG, n0, n1, d2, 0);
+    let result = if let Some(reply) = shm_poll_reply(reply_port) {
+        if reply.tag == SHM_OK_TAG {
+            Some((reply.data[0] as u32, reply.data[1] as usize, reply.data[2] as u32))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    port_destroy(reply_port);
+    result
+}
+
+/// Map a shared memory segment into the caller's address space.
+/// The server grants pages to `client_aspace` at `dst_va`.
+/// Returns the number of pages mapped on success.
+pub fn shm_map(shm_port: u32, handle: u32, client_aspace: u32, dst_va: usize, readonly: bool) -> Option<usize> {
+    let reply_port = port_create() as u32;
+    let d2 = ((reply_port as u64) << 32) | (readonly as u64);
+    send(shm_port, SHM_MAP_TAG, handle as u64, client_aspace as u64, d2, dst_va as u64);
+    let result = if let Some(reply) = shm_poll_reply(reply_port) {
+        if reply.tag == SHM_MAP_OK_TAG {
+            Some(reply.data[1] as usize)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    port_destroy(reply_port);
+    result
+}
+
+/// Unmap a shared memory segment from the caller's address space.
+pub fn shm_unmap(shm_port: u32, handle: u32, client_aspace: u32, dst_va: usize) {
+    let reply_port = port_create() as u32;
+    let d2 = (reply_port as u64) << 32;
+    send(shm_port, SHM_UNMAP_TAG, handle as u64, client_aspace as u64, d2, dst_va as u64);
+    let _ = shm_poll_reply(reply_port);
+    port_destroy(reply_port);
+}
+
+/// Unlink (delete) a named shared memory segment.
+pub fn shm_unlink(shm_port: u32, name: &[u8]) -> bool {
+    let reply_port = port_create() as u32;
+    let (n0, n1, _) = pack_name(name);
+    let d2 = (name.len() as u64) | ((reply_port as u64) << 32);
+    send(shm_port, SHM_UNLINK_TAG, n0, n1, d2, 0);
+    let result = if let Some(reply) = shm_poll_reply(reply_port) {
+        reply.tag == SHM_OK_TAG
+    } else {
+        false
+    };
+    port_destroy(reply_port);
+    result
+}
+
 /// Register a service with the name server.
 pub fn ns_register(name: &[u8], service_port: u32) -> bool {
     let nsrv = nsrv_port();

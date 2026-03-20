@@ -86,3 +86,7 @@ path = "bin/security_srv.rs"
 [[bin]]
 name = "ext2_srv"
 path = "bin/ext2_srv.rs"
+
+[[bin]]
+name = "shm_srv"
+path = "bin/shm_srv.rs"

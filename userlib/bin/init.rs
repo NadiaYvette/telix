@@ -2883,6 +2883,142 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 46: POSIX shared memory ---
+    syscall::debug_puts(b"  init: testing POSIX shared memory...\n");
+    {
+        let mut phase46_ok = true;
+
+        // Spawn shm_srv with a pre-created port.
+        let shm_port = syscall::port_create() as u32;
+        let shm_tid = syscall::spawn_with_arg(b"shm_srv", 50, shm_port as u64);
+        if shm_tid == u64::MAX {
+            syscall::debug_puts(b"  FAIL: cannot spawn shm_srv\n");
+            phase46_ok = false;
+        }
+
+        if phase46_ok {
+            // Give shm_srv time to start.
+            for _ in 0..100 { syscall::yield_now(); }
+
+            let my_aspace = syscall::aspace_id();
+
+            // Create a shared segment "test_shm" with 1 page (64K).
+            let (handle, pages, _srv_aspace) = match syscall::shm_create(shm_port, b"test_shm", 1) {
+                Some(r) => r,
+                None => {
+                    syscall::debug_puts(b"  FAIL: shm_create returned None\n");
+                    phase46_ok = false;
+                    (0, 0, 0)
+                }
+            };
+
+            if phase46_ok {
+                if pages != 1 {
+                    syscall::debug_puts(b"  FAIL: shm_create page_count mismatch\n");
+                    phase46_ok = false;
+                }
+            }
+
+            // Map the segment at a known VA for first mapping.
+            let map_va1: usize = 0xA_0000_0000;
+            if phase46_ok {
+                match syscall::shm_map(shm_port, handle, my_aspace, map_va1, false) {
+                    Some(pc) => {
+                        if pc != 1 {
+                            syscall::debug_puts(b"  FAIL: shm_map returned wrong page count\n");
+                            phase46_ok = false;
+                        }
+                    }
+                    None => {
+                        syscall::debug_puts(b"  FAIL: shm_map #1 failed\n");
+                        phase46_ok = false;
+                    }
+                }
+            }
+
+            // Write a pattern through the first mapping.
+            if phase46_ok {
+                let ptr1 = map_va1 as *mut u8;
+                unsafe {
+                    core::ptr::write_volatile(ptr1, 0xAA);
+                    core::ptr::write_volatile(ptr1.add(1), 0xBB);
+                    core::ptr::write_volatile(ptr1.add(0x100), 0xCC);
+                    core::ptr::write_volatile(ptr1.add(0x1000), 0xDD);
+                }
+            }
+
+            // Map the same segment at a different VA (second mapping of same pages).
+            let map_va2: usize = 0xA_0001_0000;
+            if phase46_ok {
+                match syscall::shm_map(shm_port, handle, my_aspace, map_va2, false) {
+                    Some(_) => {}
+                    None => {
+                        syscall::debug_puts(b"  FAIL: shm_map #2 failed\n");
+                        phase46_ok = false;
+                    }
+                }
+            }
+
+            // Read through second mapping — should see the same data.
+            if phase46_ok {
+                let ptr2 = map_va2 as *const u8;
+                let b0 = unsafe { core::ptr::read_volatile(ptr2) };
+                let b1 = unsafe { core::ptr::read_volatile(ptr2.add(1)) };
+                let b2 = unsafe { core::ptr::read_volatile(ptr2.add(0x100)) };
+                let b3 = unsafe { core::ptr::read_volatile(ptr2.add(0x1000)) };
+
+                if b0 != 0xAA {
+                    syscall::debug_puts(b"  FAIL: shm byte 0 mismatch via second mapping\n");
+                    phase46_ok = false;
+                }
+                if b1 != 0xBB {
+                    syscall::debug_puts(b"  FAIL: shm byte 1 mismatch via second mapping\n");
+                    phase46_ok = false;
+                }
+                if b2 != 0xCC {
+                    syscall::debug_puts(b"  FAIL: shm byte 0x100 mismatch via second mapping\n");
+                    phase46_ok = false;
+                }
+                if b3 != 0xDD {
+                    syscall::debug_puts(b"  FAIL: shm byte 0x1000 mismatch via second mapping\n");
+                    phase46_ok = false;
+                }
+            }
+
+            // Also test shm_open: re-open the same segment by name.
+            if phase46_ok {
+                match syscall::shm_open(shm_port, b"test_shm") {
+                    Some((h2, pc2, _)) => {
+                        if h2 != handle || pc2 != 1 {
+                            syscall::debug_puts(b"  FAIL: shm_open returned wrong handle/pages\n");
+                            phase46_ok = false;
+                        }
+                    }
+                    None => {
+                        syscall::debug_puts(b"  FAIL: shm_open returned None\n");
+                        phase46_ok = false;
+                    }
+                }
+            }
+
+            // Clean up: unmap both, unlink.
+            if phase46_ok {
+                syscall::shm_unmap(shm_port, handle, my_aspace, map_va2);
+                syscall::shm_unmap(shm_port, handle, my_aspace, map_va1);
+                if !syscall::shm_unlink(shm_port, b"test_shm") {
+                    syscall::debug_puts(b"  FAIL: shm_unlink failed\n");
+                    phase46_ok = false;
+                }
+            }
+        }
+
+        if phase46_ok {
+            syscall::debug_puts(b"Phase 46 POSIX shared memory: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 46 POSIX shared memory: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
