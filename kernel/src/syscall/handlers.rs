@@ -1682,7 +1682,7 @@ fn deliver_pending_signals(frame: &mut ExceptionFrame) {
 
             // Get current user SP.
             #[cfg(target_arch = "aarch64")]
-            let user_sp = frame.regs[31] as usize;
+            let user_sp = frame.sp as usize;
             #[cfg(target_arch = "riscv64")]
             let user_sp = frame.regs[1] as usize;
             #[cfg(target_arch = "x86_64")]
@@ -1721,10 +1721,9 @@ fn deliver_pending_signals(frame: &mut ExceptionFrame) {
             {
                 frame.regs[0] = sig as u64;            // arg0 = signal number
                 frame.regs[1] = new_sp as u64;          // arg1 = signal frame address
-                frame.regs[31] = new_sp as u64;         // SP_EL0 = new stack
+                frame.sp = new_sp as u64;               // SP_EL0 = new stack
                 frame.regs[30] = 0;                     // LR = 0 (handler must sigreturn)
-                let fp = frame as *mut ExceptionFrame as *mut u64;
-                unsafe { *fp.add(32) = handler_addr; }
+                frame.elr = handler_addr;               // PC = handler entry
             }
 
             #[cfg(target_arch = "riscv64")]
