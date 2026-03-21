@@ -88,6 +88,14 @@ pub const SYS_ALARM: u64 = 71;
 pub const SYS_MMAP_FILE: u64 = 72;
 pub const SYS_WAIT_FAULT: u64 = 73;
 pub const SYS_FAULT_COMPLETE: u64 = 74;
+pub const SYS_GETUID: u64 = 75;
+pub const SYS_GETEUID: u64 = 76;
+pub const SYS_GETGID: u64 = 77;
+pub const SYS_GETEGID: u64 = 78;
+pub const SYS_SETUID: u64 = 79;
+pub const SYS_SETGID: u64 = 80;
+pub const SYS_SETGROUPS: u64 = 81;
+pub const SYS_GETGROUPS: u64 = 82;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -276,6 +284,14 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
             return;
         }
         SYS_FAULT_COMPLETE => sys_fault_complete(a0, a1, a2),
+        SYS_GETUID => sys_getuid(),
+        SYS_GETEUID => sys_geteuid(),
+        SYS_GETGID => sys_getgid(),
+        SYS_GETEGID => sys_getegid(),
+        SYS_SETUID => sys_setuid(a0),
+        SYS_SETGID => sys_setgid(a0),
+        SYS_SETGROUPS => sys_setgroups(a0, a1),
+        SYS_GETGROUPS => sys_getgroups(a0, a1),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1847,4 +1863,124 @@ fn deliver_pending_signals(frame: &mut ExceptionFrame) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Credential syscalls (Phase 48)
+// ---------------------------------------------------------------------------
+
+fn sys_getuid() -> u64 {
+    let sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    sched.tasks[task_id as usize].uid as u64
+}
+
+fn sys_geteuid() -> u64 {
+    let sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    sched.tasks[task_id as usize].euid as u64
+}
+
+fn sys_getgid() -> u64 {
+    let sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    sched.tasks[task_id as usize].gid as u64
+}
+
+fn sys_getegid() -> u64 {
+    let sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    sched.tasks[task_id as usize].egid as u64
+}
+
+/// setuid: only euid 0 (root) can set arbitrary uid.
+/// Non-root can only set uid to their real uid (no-op).
+fn sys_setuid(new_uid: u64) -> u64 {
+    let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    let task = &mut sched.tasks[task_id as usize];
+    if task.euid == 0 {
+        // Root: set both real and effective.
+        task.uid = new_uid as u32;
+        task.euid = new_uid as u32;
+        0
+    } else if new_uid as u32 == task.uid {
+        // Non-root: can set euid back to real uid.
+        task.euid = task.uid;
+        0
+    } else {
+        u64::MAX // EPERM
+    }
+}
+
+/// setgid: only euid 0 (root) can set arbitrary gid.
+fn sys_setgid(new_gid: u64) -> u64 {
+    let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    let task = &mut sched.tasks[task_id as usize];
+    if task.euid == 0 {
+        task.gid = new_gid as u32;
+        task.egid = new_gid as u32;
+        0
+    } else if new_gid as u32 == task.gid {
+        task.egid = task.gid;
+        0
+    } else {
+        u64::MAX // EPERM
+    }
+}
+
+/// setgroups: set supplementary group list. Only euid 0 can call.
+/// a0 = count, a1 = pointer to u32 array in user memory.
+fn sys_setgroups(count: u64, groups_ptr: u64) -> u64 {
+    let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    let task = &mut sched.tasks[task_id as usize];
+    if task.euid != 0 {
+        return u64::MAX; // EPERM
+    }
+    let n = count as usize;
+    if n > crate::sched::task::MAX_GROUPS {
+        return u64::MAX; // EINVAL
+    }
+    if n > 0 && groups_ptr == 0 {
+        return u64::MAX;
+    }
+    // Copy group IDs from user memory.
+    let src = groups_ptr as *const u32;
+    for i in 0..n {
+        task.groups[i] = unsafe { *src.add(i) };
+    }
+    task.ngroups = n as u32;
+    0
+}
+
+/// getgroups: get supplementary group list.
+/// a0 = max count (0 = just return count), a1 = pointer to u32 array.
+fn sys_getgroups(max_count: u64, groups_ptr: u64) -> u64 {
+    let sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    let task = &sched.tasks[task_id as usize];
+    let n = task.ngroups as usize;
+    if max_count == 0 {
+        return n as u64;
+    }
+    if (max_count as usize) < n {
+        return u64::MAX; // EINVAL — buffer too small
+    }
+    if groups_ptr != 0 {
+        let dst = groups_ptr as *mut u32;
+        for i in 0..n {
+            unsafe { *dst.add(i) = task.groups[i]; }
+        }
+    }
+    n as u64
 }

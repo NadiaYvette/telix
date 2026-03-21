@@ -367,15 +367,27 @@ impl Scheduler {
         // Record the parent task (caller's task) for waitpid.
         let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
         task.parent_task = self.threads[caller_tid as usize].task_id;
-        // Process group defaults to own task_id; session and ctty inherited from parent.
+        // Process group defaults to own task_id; session, ctty, credentials inherited from parent.
         let parent_tid = task.parent_task;
         let parent_sid = self.tasks[parent_tid as usize].sid;
         let parent_ctty = self.tasks[parent_tid as usize].ctty_port;
+        let parent_uid = self.tasks[parent_tid as usize].uid;
+        let parent_euid = self.tasks[parent_tid as usize].euid;
+        let parent_gid = self.tasks[parent_tid as usize].gid;
+        let parent_egid = self.tasks[parent_tid as usize].egid;
+        let parent_groups = self.tasks[parent_tid as usize].groups;
+        let parent_ngroups = self.tasks[parent_tid as usize].ngroups;
         let task = &mut self.tasks[task_id as usize];
         task.pgid = task_id;
         task.sid = parent_sid;
         task.ctty_port = parent_ctty;
         task.fg_pgid = 0;
+        task.uid = parent_uid;
+        task.euid = parent_euid;
+        task.gid = parent_gid;
+        task.egid = parent_egid;
+        task.groups = parent_groups;
+        task.ngroups = parent_ngroups;
 
         // Bootstrap capabilities: grant SEND caps for well-known kernel ports,
         // and full cap for arg0 if it's a valid active port (port passing on spawn).
@@ -1616,6 +1628,12 @@ pub fn fork_current() -> u64 {
         let parent_pgid = sched.tasks[parent_task_id as usize].pgid;
         let parent_sid = sched.tasks[parent_task_id as usize].sid;
         let parent_ctty = sched.tasks[parent_task_id as usize].ctty_port;
+        let parent_uid = sched.tasks[parent_task_id as usize].uid;
+        let parent_euid = sched.tasks[parent_task_id as usize].euid;
+        let parent_gid = sched.tasks[parent_task_id as usize].gid;
+        let parent_egid = sched.tasks[parent_task_id as usize].egid;
+        let parent_groups = sched.tasks[parent_task_id as usize].groups;
+        let parent_ngroups = sched.tasks[parent_task_id as usize].ngroups;
         let task = &mut sched.tasks[child_task_id as usize];
         task.id = child_task_id;
         task.active = true;
@@ -1625,11 +1643,17 @@ pub fn fork_current() -> u64 {
         task.exited = false;
         task.thread_count = 1;
         task.parent_task = parent_task_id;
-        // Fork inherits parent's process group, session, and ctty.
+        // Fork inherits parent's process group, session, ctty, and credentials.
         task.pgid = parent_pgid;
         task.sid = parent_sid;
         task.ctty_port = parent_ctty;
         task.fg_pgid = 0; // Only session leader tracks fg_pgid.
+        task.uid = parent_uid;
+        task.euid = parent_euid;
+        task.gid = parent_gid;
+        task.egid = parent_egid;
+        task.groups = parent_groups;
+        task.ngroups = parent_ngroups;
     }
 
     // Bootstrap capabilities: copy parent's SEND/RECV bitmaps and grant

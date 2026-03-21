@@ -3265,6 +3265,129 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 48: Credential syscalls ---
+    syscall::debug_puts(b"  init: testing credential syscalls...\n");
+    {
+        let mut phase48_ok = true;
+
+        // Init runs as root (uid=0, gid=0) by default.
+        if syscall::getuid() != 0 {
+            syscall::debug_puts(b"  FAIL: getuid() should be 0\n");
+            phase48_ok = false;
+        }
+        if syscall::geteuid() != 0 {
+            syscall::debug_puts(b"  FAIL: geteuid() should be 0\n");
+            phase48_ok = false;
+        }
+        if syscall::getgid() != 0 {
+            syscall::debug_puts(b"  FAIL: getgid() should be 0\n");
+            phase48_ok = false;
+        }
+        if syscall::getegid() != 0 {
+            syscall::debug_puts(b"  FAIL: getegid() should be 0\n");
+            phase48_ok = false;
+        }
+
+        // setgroups: set supplementary groups as root.
+        if phase48_ok {
+            let groups: [u32; 3] = [100, 200, 300];
+            if !syscall::setgroups(&groups) {
+                syscall::debug_puts(b"  FAIL: setgroups as root failed\n");
+                phase48_ok = false;
+            }
+            let mut buf = [0u32; 8];
+            let n = syscall::getgroups(&mut buf);
+            if n != 3 {
+                syscall::debug_puts(b"  FAIL: getgroups count mismatch\n");
+                phase48_ok = false;
+            } else if buf[0] != 100 || buf[1] != 200 || buf[2] != 300 {
+                syscall::debug_puts(b"  FAIL: getgroups values mismatch\n");
+                phase48_ok = false;
+            }
+        }
+
+        // setuid to non-root, then verify permissions are restricted.
+        if phase48_ok {
+            // Drop to uid 1000.
+            if !syscall::setuid(1000) {
+                syscall::debug_puts(b"  FAIL: setuid(1000) as root failed\n");
+                phase48_ok = false;
+            }
+            if syscall::getuid() != 1000 {
+                syscall::debug_puts(b"  FAIL: getuid() should be 1000 after setuid\n");
+                phase48_ok = false;
+            }
+            if syscall::geteuid() != 1000 {
+                syscall::debug_puts(b"  FAIL: geteuid() should be 1000 after setuid\n");
+                phase48_ok = false;
+            }
+        }
+
+        // As non-root, setuid to 0 should fail.
+        if phase48_ok {
+            if syscall::setuid(0) {
+                syscall::debug_puts(b"  FAIL: setuid(0) as non-root should fail\n");
+                phase48_ok = false;
+            }
+            // setuid to own real uid should succeed (no-op).
+            if !syscall::setuid(1000) {
+                syscall::debug_puts(b"  FAIL: setuid(own uid) should succeed\n");
+                phase48_ok = false;
+            }
+        }
+
+        // setgid as non-root should fail for arbitrary values.
+        if phase48_ok {
+            // First set gid while we still can (we changed uid but gid was never changed).
+            // Actually, setgid checks euid, and euid is now 1000.
+            if syscall::setgid(500) {
+                syscall::debug_puts(b"  FAIL: setgid(500) as non-root should fail\n");
+                phase48_ok = false;
+            }
+            // setgid to own real gid (0) should succeed.
+            if !syscall::setgid(0) {
+                syscall::debug_puts(b"  FAIL: setgid(own gid) should succeed\n");
+                phase48_ok = false;
+            }
+        }
+
+        // setgroups as non-root should fail.
+        if phase48_ok {
+            let groups: [u32; 1] = [999];
+            if syscall::setgroups(&groups) {
+                syscall::debug_puts(b"  FAIL: setgroups as non-root should fail\n");
+                phase48_ok = false;
+            }
+            // Previous groups should still be set.
+            let mut buf = [0u32; 8];
+            let n = syscall::getgroups(&mut buf);
+            if n != 3 {
+                syscall::debug_puts(b"  FAIL: groups should be unchanged after failed setgroups\n");
+                phase48_ok = false;
+            }
+        }
+
+        // Test credential inheritance via spawn.
+        if phase48_ok {
+            // Spawn a child — it should inherit uid=1000, gid=0.
+            // We can't easily read the child's credentials, but we can test
+            // that the child runs (proving spawn works with non-root creds).
+            let child = syscall::spawn(b"hello", 50);
+            if child != u64::MAX {
+                let _ = syscall::waitpid(child);
+            }
+        }
+
+        // Restore root for subsequent tests (we can't — we dropped privs).
+        // This is fine; Phase 48 test is last before benchmarks.
+
+        if phase48_ok {
+            syscall::debug_puts(b"Phase 48 credential syscalls: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 48 credential syscalls: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

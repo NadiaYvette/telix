@@ -753,6 +753,14 @@ pub fn alarm(initial_ns: u64, interval_ns: u64) -> u64 {
 const SYS_MMAP_FILE: u64 = 72;
 const SYS_WAIT_FAULT: u64 = 73;
 const SYS_FAULT_COMPLETE: u64 = 74;
+const SYS_GETUID: u64 = 75;
+const SYS_GETEUID: u64 = 76;
+const SYS_GETGID: u64 = 77;
+const SYS_GETEGID: u64 = 78;
+const SYS_SETUID: u64 = 79;
+const SYS_SETGID: u64 = 80;
+const SYS_SETGROUPS: u64 = 81;
+const SYS_GETGROUPS: u64 = 82;
 
 /// Map a file-backed region via the pager mechanism.
 /// Returns the VA on success, or None on failure.
@@ -824,6 +832,53 @@ pub fn fault_complete(token: u32, data: &[u8]) -> bool {
         arch::syscall3(SYS_FAULT_COMPLETE, token as u64, data.as_ptr() as u64, data.len() as u64)
     };
     r == 0
+}
+
+// --- Credential syscalls (Phase 48) ---
+
+pub fn getuid() -> u32 {
+    unsafe { arch::syscall0(SYS_GETUID) as u32 }
+}
+
+pub fn geteuid() -> u32 {
+    unsafe { arch::syscall0(SYS_GETEUID) as u32 }
+}
+
+pub fn getgid() -> u32 {
+    unsafe { arch::syscall0(SYS_GETGID) as u32 }
+}
+
+pub fn getegid() -> u32 {
+    unsafe { arch::syscall0(SYS_GETEGID) as u32 }
+}
+
+/// Set real and effective UID. Only euid 0 can set arbitrary values.
+/// Non-root can only set euid back to real uid.
+pub fn setuid(uid: u32) -> bool {
+    let r = unsafe { arch::syscall1(SYS_SETUID, uid as u64) };
+    r == 0
+}
+
+/// Set real and effective GID. Only euid 0 can set arbitrary values.
+pub fn setgid(gid: u32) -> bool {
+    let r = unsafe { arch::syscall1(SYS_SETGID, gid as u64) };
+    r == 0
+}
+
+/// Set supplementary group list. Only euid 0 can call.
+pub fn setgroups(groups: &[u32]) -> bool {
+    let r = unsafe {
+        arch::syscall2(SYS_SETGROUPS, groups.len() as u64, groups.as_ptr() as u64)
+    };
+    r == 0
+}
+
+/// Get supplementary group list. Returns count, fills `buf` up to its length.
+pub fn getgroups(buf: &mut [u32]) -> usize {
+    let r = unsafe {
+        arch::syscall2(SYS_GETGROUPS, buf.len() as u64, buf.as_mut_ptr() as u64)
+    };
+    if r == u64::MAX { 0 } else { r as usize }
 }
 
 // --- Shared memory (shm_srv) client wrappers ---

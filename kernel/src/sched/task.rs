@@ -120,7 +120,23 @@ pub struct Task {
     pub alarm_deadline_ns: u64,
     /// Alarm interval for repeating (0 = one-shot).
     pub alarm_interval_ns: u64,
+    // --- Credentials (Phase 48) ---
+    /// Real user ID.
+    pub uid: u32,
+    /// Effective user ID (may differ from uid for setuid binaries).
+    pub euid: u32,
+    /// Real group ID.
+    pub gid: u32,
+    /// Effective group ID.
+    pub egid: u32,
+    /// Supplementary group list.
+    pub groups: [u32; MAX_GROUPS],
+    /// Number of supplementary groups.
+    pub ngroups: u32,
 }
+
+/// Maximum supplementary groups per task.
+pub const MAX_GROUPS: usize = 32;
 
 impl Task {
     pub const fn empty() -> Self {
@@ -146,6 +162,12 @@ impl Task {
             fg_pgid: 0,
             alarm_deadline_ns: 0,
             alarm_interval_ns: 0,
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            groups: [0; MAX_GROUPS],
+            ngroups: 0,
         }
     }
 }
