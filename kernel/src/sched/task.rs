@@ -137,10 +137,47 @@ pub struct Task {
     pub groups: [u32; MAX_GROUPS],
     /// Number of supplementary groups.
     pub ngroups: u32,
+    // --- Resource limits (Phase 50) ---
+    pub rlimits: [Rlimit; RLIMIT_COUNT],
 }
 
 /// Maximum supplementary groups per task.
 pub const MAX_GROUPS: usize = 32;
+
+// --- Resource limits (Phase 50) ---
+
+/// POSIX resource limit types.
+pub const RLIMIT_STACK: u32 = 0;
+pub const RLIMIT_NOFILE: u32 = 1;
+pub const RLIMIT_AS: u32 = 2;
+pub const RLIMIT_NPROC: u32 = 3;
+pub const RLIMIT_COUNT: usize = 4;
+
+/// Unlimited resource value.
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// POSIX resource limit (soft + hard).
+#[derive(Clone, Copy)]
+pub struct Rlimit {
+    /// Soft limit (current enforced limit, can be raised up to hard).
+    pub cur: u64,
+    /// Hard limit (ceiling for soft limit; only root can raise).
+    pub max: u64,
+}
+
+impl Rlimit {
+    pub const fn new(cur: u64, max: u64) -> Self {
+        Self { cur, max }
+    }
+}
+
+/// Default resource limits for new tasks.
+pub const DEFAULT_RLIMITS: [Rlimit; RLIMIT_COUNT] = [
+    Rlimit::new(65536, 1048576),       // RLIMIT_STACK: 64K soft, 1M hard
+    Rlimit::new(64, 1024),             // RLIMIT_NOFILE: 64 soft, 1024 hard
+    Rlimit::new(RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_AS: unlimited
+    Rlimit::new(RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_NPROC: unlimited by default
+];
 
 impl Task {
     pub const fn empty() -> Self {
@@ -174,6 +211,7 @@ impl Task {
             egid: 0,
             groups: [0; MAX_GROUPS],
             ngroups: 0,
+            rlimits: DEFAULT_RLIMITS,
         }
     }
 }

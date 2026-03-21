@@ -97,6 +97,9 @@ pub const SYS_SETGID: u64 = 80;
 pub const SYS_SETGROUPS: u64 = 81;
 pub const SYS_GETGROUPS: u64 = 82;
 pub const SYS_WAIT4: u64 = 83;
+pub const SYS_GETRLIMIT: u64 = 84;
+pub const SYS_SETRLIMIT: u64 = 85;
+pub const SYS_PRLIMIT: u64 = 86;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -294,6 +297,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SETGROUPS => sys_setgroups(a0, a1),
         SYS_GETGROUPS => sys_getgroups(a0, a1),
         SYS_WAIT4 => sys_wait4(a0, a1, frame),
+        SYS_GETRLIMIT => sys_getrlimit(a0, frame),
+        SYS_SETRLIMIT => sys_setrlimit(a0, a1, a2),
+        SYS_PRLIMIT => sys_prlimit(a0, a1, a2, a3, frame),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -628,6 +634,26 @@ fn sys_get_timer_freq() -> u64 {
 }
 
 fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64, arg0: u64) -> u64 {
+    // Enforce RLIMIT_NPROC: count active tasks owned by the same uid.
+    {
+        let sched = crate::sched::scheduler::SCHEDULER.lock();
+        let task_id = crate::sched::current_task_id();
+        let uid = sched.tasks[task_id as usize].uid;
+        let nproc_limit = sched.tasks[task_id as usize]
+            .rlimits[crate::sched::task::RLIMIT_NPROC as usize].cur;
+        if nproc_limit != crate::sched::task::RLIM_INFINITY {
+            let mut count = 0u64;
+            for i in 1..crate::sched::task::MAX_TASKS {
+                if sched.tasks[i].active && sched.tasks[i].uid == uid {
+                    count += 1;
+                }
+            }
+            if count >= nproc_limit {
+                return u64::MAX;
+            }
+        }
+    }
+
     let pt_root = crate::sched::scheduler::current_page_table_root();
     let len = (name_len as usize).min(64);
 
@@ -671,12 +697,18 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64) -> u64 {
         return u64::MAX;
     }
 
-    // Check page quota.
+    // Check page quota and RLIMIT_AS.
     let task_id = crate::sched::current_task_id();
     if task_id != 0 {
         let sched = crate::sched::scheduler::SCHEDULER.lock();
         let task = &sched.tasks[task_id as usize];
         if task.cur_pages + pages as u32 > task.max_pages {
+            return u64::MAX;
+        }
+        // Enforce RLIMIT_AS: total virtual memory in bytes.
+        let new_bytes = (task.cur_pages as u64 + pages as u64) * PAGE_SIZE as u64;
+        let rlimit_as = task.rlimits[crate::sched::task::RLIMIT_AS as usize].cur;
+        if rlimit_as != crate::sched::task::RLIM_INFINITY && new_bytes > rlimit_as {
             return u64::MAX;
         }
         drop(sched);
@@ -1974,6 +2006,105 @@ fn sys_wait4(pid: u64, flags: u64, frame: &mut ExceptionFrame) -> u64 {
     } else {
         child_id as u64
     }
+}
+
+fn sys_getrlimit(resource: u64, frame: &mut ExceptionFrame) -> u64 {
+    use crate::sched::task::RLIMIT_COUNT;
+    if resource as usize >= RLIMIT_COUNT { return u64::MAX; }
+    let sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    let rl = &sched.tasks[task_id as usize].rlimits[resource as usize];
+    let cur = rl.cur;
+    let max = rl.max;
+    drop(sched);
+    // Return 0 for success, soft in a1, hard in a2.
+    set_reg(frame, 1, cur);
+    set_reg(frame, 2, max);
+    0
+}
+
+fn sys_setrlimit(resource: u64, new_cur: u64, new_max: u64) -> u64 {
+    use crate::sched::task::{RLIMIT_COUNT, RLIM_INFINITY};
+    if resource as usize >= RLIMIT_COUNT { return u64::MAX; }
+    let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    let euid = sched.tasks[task_id as usize].euid;
+    let rl = &sched.tasks[task_id as usize].rlimits[resource as usize];
+    let old_max = rl.max;
+
+    // Validate: soft <= hard (unless INFINITY).
+    if new_cur != RLIM_INFINITY && new_max != RLIM_INFINITY && new_cur > new_max {
+        return u64::MAX;
+    }
+
+    // Non-root: cannot raise hard limit.
+    if euid != 0 && new_max != RLIM_INFINITY && old_max != RLIM_INFINITY && new_max > old_max {
+        return u64::MAX;
+    }
+    // Non-root: cannot set soft above hard.
+    let effective_max = if new_max == RLIM_INFINITY { RLIM_INFINITY } else { new_max };
+    if new_cur != RLIM_INFINITY && effective_max != RLIM_INFINITY && new_cur > effective_max {
+        return u64::MAX;
+    }
+
+    sched.tasks[task_id as usize].rlimits[resource as usize].cur = new_cur;
+    sched.tasks[task_id as usize].rlimits[resource as usize].max = new_max;
+    0
+}
+
+fn sys_prlimit(pid: u64, resource: u64, new_cur: u64, new_max: u64, frame: &mut ExceptionFrame) -> u64 {
+    use crate::sched::task::{RLIMIT_COUNT, RLIM_INFINITY};
+    if resource as usize >= RLIMIT_COUNT { return u64::MAX; }
+
+    let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let caller_task_id = sched.threads[tid as usize].task_id;
+    let euid = sched.tasks[caller_task_id as usize].euid;
+
+    // Resolve target: pid=0 means self.
+    let target_task_id = if pid == 0 {
+        caller_task_id
+    } else {
+        let p = pid as u32;
+        if p as usize >= crate::sched::task::MAX_TASKS { return u64::MAX; }
+        if !sched.tasks[p as usize].active { return u64::MAX; }
+        // Only root or parent can prlimit another process.
+        if euid != 0 && sched.tasks[p as usize].parent_task != caller_task_id {
+            return u64::MAX;
+        }
+        p
+    };
+
+    // Read old values.
+    let rl = &sched.tasks[target_task_id as usize].rlimits[resource as usize];
+    let old_cur = rl.cur;
+    let old_max = rl.max;
+
+    // Set new values (if new_cur != RLIM_INFINITY-1, treat as "set").
+    // Convention: use RLIM_INFINITY-1 as "don't change" sentinel.
+    let sentinel = RLIM_INFINITY - 1;
+    if new_cur != sentinel || new_max != sentinel {
+        let set_cur = if new_cur == sentinel { old_cur } else { new_cur };
+        let set_max = if new_max == sentinel { old_max } else { new_max };
+
+        // Validate.
+        if set_cur != RLIM_INFINITY && set_max != RLIM_INFINITY && set_cur > set_max {
+            return u64::MAX;
+        }
+        if euid != 0 && set_max != RLIM_INFINITY && old_max != RLIM_INFINITY && set_max > old_max {
+            return u64::MAX;
+        }
+
+        sched.tasks[target_task_id as usize].rlimits[resource as usize].cur = set_cur;
+        sched.tasks[target_task_id as usize].rlimits[resource as usize].max = set_max;
+    }
+
+    // Return 0 for success, old soft in a1, old hard in a2.
+    set_reg(frame, 1, old_cur);
+    set_reg(frame, 2, old_max);
+    0
 }
 
 fn sys_getgroups(max_count: u64, groups_ptr: u64) -> u64 {

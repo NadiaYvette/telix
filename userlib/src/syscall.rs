@@ -762,6 +762,9 @@ const SYS_SETGID: u64 = 80;
 const SYS_SETGROUPS: u64 = 81;
 const SYS_GETGROUPS: u64 = 82;
 const SYS_WAIT4: u64 = 83;
+const SYS_GETRLIMIT: u64 = 84;
+const SYS_SETRLIMIT: u64 = 85;
+const SYS_PRLIMIT: u64 = 86;
 
 /// Map a file-backed region via the pager mechanism.
 /// Returns the VA on success, or None on failure.
@@ -951,6 +954,113 @@ pub fn wait4(pid: i64, flags: u32) -> Option<(u32, i32)> {
     } else {
         Some((r0 as u32, r1 as i32))
     }
+}
+
+// --- Resource limits (Phase 50) ---
+
+/// Resource limit types (must match kernel).
+pub const RLIMIT_STACK: u32 = 0;
+pub const RLIMIT_NOFILE: u32 = 1;
+pub const RLIMIT_AS: u32 = 2;
+pub const RLIMIT_NPROC: u32 = 3;
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// Get resource limit. Returns (soft, hard).
+pub fn getrlimit(resource: u32) -> Option<(u64, u64)> {
+    let r0: u64;
+    let r1: u64;
+    let r2: u64;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_GETRLIMIT,
+            inlateout("x0") resource as u64 => r0,
+            lateout("x1") r1,
+            lateout("x2") r2,
+        );
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SYS_GETRLIMIT as u64,
+            inlateout("a0") resource as u64 => r0,
+            lateout("a1") r1,
+            lateout("a2") r2,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") SYS_GETRLIMIT => r0,
+            inlateout("rdi") resource as u64 => r1,
+            lateout("rsi") r2,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+
+    if r0 == u64::MAX { None } else { Some((r1, r2)) }
+}
+
+/// Set resource limit. Returns true on success.
+pub fn setrlimit(resource: u32, soft: u64, hard: u64) -> bool {
+    let r = unsafe { arch::syscall3(SYS_SETRLIMIT, resource as u64, soft, hard) };
+    r == 0
+}
+
+/// Get and optionally set resource limits for a process.
+/// pid=0 means self. new_soft/new_hard = RLIM_INFINITY-1 means "don't change".
+/// Returns (old_soft, old_hard) or None on error.
+pub fn prlimit(pid: u32, resource: u32, new_soft: u64, new_hard: u64) -> Option<(u64, u64)> {
+    let r0: u64;
+    let r1: u64;
+    let r2: u64;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_PRLIMIT,
+            inlateout("x0") pid as u64 => r0,
+            inlateout("x1") resource as u64 => r1,
+            inlateout("x2") new_soft => r2,
+            in("x3") new_hard,
+        );
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SYS_PRLIMIT as u64,
+            inlateout("a0") pid as u64 => r0,
+            inlateout("a1") resource as u64 => r1,
+            inlateout("a2") new_soft => r2,
+            in("a3") new_hard,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") SYS_PRLIMIT => r0,
+            inlateout("rdi") pid as u64 => r1,
+            inlateout("rsi") resource as u64 => r2,
+            in("rdx") new_soft,
+            in("r10") new_hard,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+
+    if r0 == u64::MAX { None } else { Some((r1, r2)) }
 }
 
 // --- Shared memory (shm_srv) client wrappers ---

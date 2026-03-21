@@ -379,6 +379,7 @@ impl Scheduler {
         let parent_egid = self.tasks[parent_tid as usize].egid;
         let parent_groups = self.tasks[parent_tid as usize].groups;
         let parent_ngroups = self.tasks[parent_tid as usize].ngroups;
+        let parent_rlimits = self.tasks[parent_tid as usize].rlimits;
         let task = &mut self.tasks[task_id as usize];
         task.pgid = task_id;
         task.sid = parent_sid;
@@ -390,6 +391,7 @@ impl Scheduler {
         task.egid = parent_egid;
         task.groups = parent_groups;
         task.ngroups = parent_ngroups;
+        task.rlimits = parent_rlimits;
 
         // Bootstrap capabilities: grant SEND caps for well-known kernel ports,
         // and full cap for arg0 if it's a valid active port (port passing on spawn).
@@ -1601,6 +1603,27 @@ pub fn fork_current() -> u64 {
         return u64::MAX;
     }
 
+    // Enforce RLIMIT_NPROC.
+    {
+        let sched = SCHEDULER.lock();
+        let tid = smp::current().current_thread.load(Ordering::Relaxed);
+        let task_id = sched.threads[tid as usize].task_id;
+        let uid = sched.tasks[task_id as usize].uid;
+        let nproc_limit = sched.tasks[task_id as usize]
+            .rlimits[super::task::RLIMIT_NPROC as usize].cur;
+        if nproc_limit != super::task::RLIM_INFINITY {
+            let mut count = 0u64;
+            for i in 1..sched.next_task_id as usize {
+                if sched.tasks[i].active && sched.tasks[i].uid == uid {
+                    count += 1;
+                }
+            }
+            if count >= nproc_limit {
+                return u64::MAX;
+            }
+        }
+    }
+
     // Gather parent info.
     let (parent_tid, parent_task_id, parent_aspace_id, parent_priority, parent_quantum, parent_sig_mask) = {
         let tid = smp::current().current_thread.load(Ordering::Relaxed);
@@ -1636,6 +1659,7 @@ pub fn fork_current() -> u64 {
         let parent_egid = sched.tasks[parent_task_id as usize].egid;
         let parent_groups = sched.tasks[parent_task_id as usize].groups;
         let parent_ngroups = sched.tasks[parent_task_id as usize].ngroups;
+        let parent_rlimits = sched.tasks[parent_task_id as usize].rlimits;
         let task = &mut sched.tasks[child_task_id as usize];
         task.id = child_task_id;
         task.active = true;
@@ -1647,7 +1671,7 @@ pub fn fork_current() -> u64 {
         task.wait_status = 0;
         task.thread_count = 1;
         task.parent_task = parent_task_id;
-        // Fork inherits parent's process group, session, ctty, and credentials.
+        // Fork inherits parent's process group, session, ctty, credentials, and rlimits.
         task.pgid = parent_pgid;
         task.sid = parent_sid;
         task.ctty_port = parent_ctty;
@@ -1658,6 +1682,7 @@ pub fn fork_current() -> u64 {
         task.egid = parent_egid;
         task.groups = parent_groups;
         task.ngroups = parent_ngroups;
+        task.rlimits = parent_rlimits;
     }
 
     // Bootstrap capabilities: copy parent's SEND/RECV bitmaps and grant

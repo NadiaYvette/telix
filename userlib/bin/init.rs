@@ -3536,6 +3536,157 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 50: Resource limits ---
+    syscall::debug_puts(b"  init: testing resource limits...\n");
+    {
+        let mut phase50_ok = true;
+
+        // Test 1: getrlimit returns default values.
+        if let Some((cur, max)) = syscall::getrlimit(syscall::RLIMIT_NOFILE) {
+            if cur != 64 || max != 1024 {
+                syscall::debug_puts(b"  FAIL: RLIMIT_NOFILE defaults wrong\n");
+                phase50_ok = false;
+            }
+        } else {
+            syscall::debug_puts(b"  FAIL: getrlimit(RLIMIT_NOFILE) failed\n");
+            phase50_ok = false;
+        }
+
+        if phase50_ok {
+            if let Some((cur, max)) = syscall::getrlimit(syscall::RLIMIT_AS) {
+                if cur != syscall::RLIM_INFINITY || max != syscall::RLIM_INFINITY {
+                    syscall::debug_puts(b"  FAIL: RLIMIT_AS defaults wrong\n");
+                    phase50_ok = false;
+                }
+            } else {
+                syscall::debug_puts(b"  FAIL: getrlimit(RLIMIT_AS) failed\n");
+                phase50_ok = false;
+            }
+        }
+
+        if phase50_ok {
+            if let Some((cur, max)) = syscall::getrlimit(syscall::RLIMIT_NPROC) {
+                if cur != syscall::RLIM_INFINITY || max != syscall::RLIM_INFINITY {
+                    syscall::debug_puts(b"  FAIL: RLIMIT_NPROC defaults wrong\n");
+                    phase50_ok = false;
+                }
+            } else {
+                syscall::debug_puts(b"  FAIL: getrlimit(RLIMIT_NPROC) failed\n");
+                phase50_ok = false;
+            }
+        }
+
+        // Test 2: setrlimit to lower soft limit, then read back.
+        if phase50_ok {
+            if !syscall::setrlimit(syscall::RLIMIT_NOFILE, 32, 1024) {
+                syscall::debug_puts(b"  FAIL: setrlimit(NOFILE, 32, 1024) failed\n");
+                phase50_ok = false;
+            }
+            if let Some((cur, max)) = syscall::getrlimit(syscall::RLIMIT_NOFILE) {
+                if cur != 32 || max != 1024 {
+                    syscall::debug_puts(b"  FAIL: NOFILE after setrlimit wrong\n");
+                    phase50_ok = false;
+                }
+            }
+            // Restore.
+            syscall::setrlimit(syscall::RLIMIT_NOFILE, 64, 1024);
+        }
+
+        // Test 3: prlimit get+set atomically.
+        if phase50_ok {
+            let sentinel = syscall::RLIM_INFINITY - 1;
+            // Get current without changing (sentinel = don't change).
+            if let Some((old_cur, old_max)) = syscall::prlimit(0, syscall::RLIMIT_STACK, sentinel, sentinel) {
+                if old_cur != 65536 || old_max != 1048576 {
+                    syscall::debug_puts(b"  FAIL: prlimit RLIMIT_STACK defaults wrong\n");
+                    phase50_ok = false;
+                }
+            } else {
+                syscall::debug_puts(b"  FAIL: prlimit get failed\n");
+                phase50_ok = false;
+            }
+        }
+
+        // Test 4: prlimit to change soft, verify old returned.
+        if phase50_ok {
+            let sentinel = syscall::RLIM_INFINITY - 1;
+            if let Some((old_cur, _old_max)) = syscall::prlimit(0, syscall::RLIMIT_STACK, 32768, sentinel) {
+                if old_cur != 65536 {
+                    syscall::debug_puts(b"  FAIL: prlimit didn't return old soft\n");
+                    phase50_ok = false;
+                }
+            }
+            // Verify new value.
+            if let Some((cur, _)) = syscall::getrlimit(syscall::RLIMIT_STACK) {
+                if cur != 32768 {
+                    syscall::debug_puts(b"  FAIL: STACK soft not updated by prlimit\n");
+                    phase50_ok = false;
+                }
+            }
+            // Restore.
+            let sentinel = syscall::RLIM_INFINITY - 1;
+            syscall::prlimit(0, syscall::RLIMIT_STACK, 65536, sentinel);
+        }
+
+        // Test 5: RLIMIT_AS enforcement — set very small, then mmap should fail.
+        if phase50_ok {
+            // Save old.
+            let old = syscall::getrlimit(syscall::RLIMIT_AS);
+            // Set to a tiny value (1 byte — effectively zero new allocations).
+            if syscall::setrlimit(syscall::RLIMIT_AS, 1, syscall::RLIM_INFINITY) {
+                // Try mmap — should fail due to RLIMIT_AS.
+                let r = syscall::mmap_anon(0, 1, 1);
+                if r.is_some() {
+                    syscall::debug_puts(b"  FAIL: mmap should fail under RLIMIT_AS\n");
+                    phase50_ok = false;
+                    // Clean up the mapping.
+                    syscall::munmap(r.unwrap());
+                }
+            }
+            // Restore.
+            if let Some((cur, max)) = old {
+                syscall::setrlimit(syscall::RLIMIT_AS, cur, max);
+            }
+        }
+
+        // Test 6: RLIMIT_NPROC enforcement — set a low limit and try to spawn.
+        if phase50_ok {
+            // Set NPROC soft to 1 — should block new spawns since we already
+            // have more than 1 task with uid 0.
+            let old = syscall::getrlimit(syscall::RLIMIT_NPROC);
+            if syscall::setrlimit(syscall::RLIMIT_NPROC, 1, syscall::RLIM_INFINITY) {
+                let child = syscall::spawn(b"hello", 50);
+                if child != u64::MAX {
+                    syscall::debug_puts(b"  FAIL: spawn should fail under RLIMIT_NPROC\n");
+                    phase50_ok = false;
+                    // Still reap the child.
+                    loop {
+                        if let Some(_) = syscall::waitpid(child) { break; }
+                        syscall::yield_now();
+                    }
+                }
+            }
+            // Restore.
+            if let Some((cur, max)) = old {
+                syscall::setrlimit(syscall::RLIMIT_NPROC, cur, max);
+            }
+        }
+
+        // Test 7: Invalid resource should fail.
+        if phase50_ok {
+            if syscall::getrlimit(99).is_some() {
+                syscall::debug_puts(b"  FAIL: getrlimit(99) should fail\n");
+                phase50_ok = false;
+            }
+        }
+
+        if phase50_ok {
+            syscall::debug_puts(b"Phase 50 resource limits: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 50 resource limits: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
