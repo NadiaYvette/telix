@@ -3019,6 +3019,252 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 47: dup/dup2/fcntl/ioctl (userspace FD table) ---
+    syscall::debug_puts(b"  init: testing FD table (dup/dup2/fcntl/ioctl)...\n");
+    {
+        let mut phase47_ok = true;
+
+        // Initialize FD table with a dummy console port.
+        let dummy_console = syscall::port_create() as u32;
+        userlib::fd::fd_init(dummy_console);
+
+        // FDs 0, 1, 2 should be open after init.
+        if !userlib::fd::fd_is_valid(0) || !userlib::fd::fd_is_valid(1) || !userlib::fd::fd_is_valid(2) {
+            syscall::debug_puts(b"  FAIL: FDs 0/1/2 not valid after fd_init\n");
+            phase47_ok = false;
+        }
+        if userlib::fd::fd_is_valid(3) {
+            syscall::debug_puts(b"  FAIL: FD 3 should not be valid\n");
+            phase47_ok = false;
+        }
+        if phase47_ok && userlib::fd::fd_count() != 3 {
+            syscall::debug_puts(b"  FAIL: fd_count should be 3\n");
+            phase47_ok = false;
+        }
+
+        // --- dup ---
+        if phase47_ok {
+            match userlib::fd::dup(1) {
+                Some(new_fd) => {
+                    if new_fd != 3 {
+                        syscall::debug_puts(b"  FAIL: dup(1) should return 3\n");
+                        phase47_ok = false;
+                    }
+                    // New FD should have same port as FD 1.
+                    let e1 = userlib::fd::fd_get(1).unwrap();
+                    let e3 = userlib::fd::fd_get(new_fd).unwrap();
+                    if e1.port != e3.port || e1.fd_type as u8 != e3.fd_type as u8 {
+                        syscall::debug_puts(b"  FAIL: dup'd FD doesn't match original\n");
+                        phase47_ok = false;
+                    }
+                    // dup should clear FD_CLOEXEC.
+                    if e3.fd_flags != 0 {
+                        syscall::debug_puts(b"  FAIL: dup should clear FD_CLOEXEC\n");
+                        phase47_ok = false;
+                    }
+                }
+                None => {
+                    syscall::debug_puts(b"  FAIL: dup(1) returned None\n");
+                    phase47_ok = false;
+                }
+            }
+        }
+
+        // --- dup2 ---
+        if phase47_ok {
+            // dup2(0, 10) — duplicate stdin to FD 10.
+            match userlib::fd::dup2(0, 10) {
+                Some(fd) => {
+                    if fd != 10 {
+                        syscall::debug_puts(b"  FAIL: dup2(0,10) should return 10\n");
+                        phase47_ok = false;
+                    }
+                    let e0 = userlib::fd::fd_get(0).unwrap();
+                    let e10 = userlib::fd::fd_get(10).unwrap();
+                    if e0.port != e10.port {
+                        syscall::debug_puts(b"  FAIL: dup2 FD 10 port mismatch\n");
+                        phase47_ok = false;
+                    }
+                }
+                None => {
+                    syscall::debug_puts(b"  FAIL: dup2(0,10) returned None\n");
+                    phase47_ok = false;
+                }
+            }
+
+            // dup2 with same fd — should be a no-op if valid.
+            if userlib::fd::dup2(1, 1) != Some(1) {
+                syscall::debug_puts(b"  FAIL: dup2(1,1) should return 1\n");
+                phase47_ok = false;
+            }
+
+            // dup2 to an occupied FD — should close old and replace.
+            // Open a new FD at slot 5 first.
+            let test_port = syscall::port_create() as u32;
+            let _ = userlib::fd::fd_open(test_port, 42, userlib::fd::FdType::Port, 0);
+            // fd_open should have assigned FD 4 (lowest free).
+            if !userlib::fd::fd_is_valid(4) {
+                syscall::debug_puts(b"  FAIL: fd_open didn't allocate FD 4\n");
+                phase47_ok = false;
+            }
+            // dup2(0, 4) should replace FD 4 with a copy of FD 0.
+            userlib::fd::dup2(0, 4);
+            let e4 = userlib::fd::fd_get(4).unwrap();
+            if e4.port != dummy_console {
+                syscall::debug_puts(b"  FAIL: dup2 should have replaced FD 4\n");
+                phase47_ok = false;
+            }
+            syscall::port_destroy(test_port);
+        }
+
+        // --- fcntl ---
+        if phase47_ok {
+            // F_GETFD — FD 0 should have no flags.
+            if userlib::fd::fcntl(0, userlib::fd::F_GETFD, 0) != 0 {
+                syscall::debug_puts(b"  FAIL: F_GETFD(0) should be 0\n");
+                phase47_ok = false;
+            }
+
+            // F_SETFD — set FD_CLOEXEC on FD 3.
+            userlib::fd::fcntl(3, userlib::fd::F_SETFD, userlib::fd::FD_CLOEXEC as i32);
+            if userlib::fd::fcntl(3, userlib::fd::F_GETFD, 0) != userlib::fd::FD_CLOEXEC as i32 {
+                syscall::debug_puts(b"  FAIL: F_SETFD/F_GETFD cloexec\n");
+                phase47_ok = false;
+            }
+
+            // F_GETFL — FD 0 is O_RDONLY.
+            if userlib::fd::fcntl(0, userlib::fd::F_GETFL, 0) != userlib::fd::O_RDONLY as i32 {
+                syscall::debug_puts(b"  FAIL: F_GETFL(stdin) should be O_RDONLY\n");
+                phase47_ok = false;
+            }
+
+            // F_SETFL — set O_NONBLOCK on FD 1.
+            userlib::fd::fcntl(1, userlib::fd::F_SETFL, userlib::fd::O_NONBLOCK as i32);
+            let fl = userlib::fd::fcntl(1, userlib::fd::F_GETFL, 0) as u32;
+            if fl & userlib::fd::O_NONBLOCK == 0 {
+                syscall::debug_puts(b"  FAIL: F_SETFL O_NONBLOCK not set\n");
+                phase47_ok = false;
+            }
+            // Access mode should be preserved.
+            if fl & 3 != userlib::fd::O_WRONLY {
+                syscall::debug_puts(b"  FAIL: F_SETFL clobbered access mode\n");
+                phase47_ok = false;
+            }
+
+            // F_DUPFD — duplicate FD 0 to lowest >= 20.
+            let dup_fd = userlib::fd::fcntl(0, userlib::fd::F_DUPFD, 20);
+            if dup_fd != 20 {
+                syscall::debug_puts(b"  FAIL: F_DUPFD(0, 20) should return 20\n");
+                phase47_ok = false;
+            }
+            if !userlib::fd::fd_is_valid(20) {
+                syscall::debug_puts(b"  FAIL: F_DUPFD didn't create FD 20\n");
+                phase47_ok = false;
+            }
+
+            // F_DUPFD_CLOEXEC — duplicate with cloexec flag.
+            let dup_fd2 = userlib::fd::fcntl(0, userlib::fd::F_DUPFD_CLOEXEC, 30);
+            if dup_fd2 != 30 {
+                syscall::debug_puts(b"  FAIL: F_DUPFD_CLOEXEC should return 30\n");
+                phase47_ok = false;
+            }
+            if userlib::fd::fcntl(30, userlib::fd::F_GETFD, 0) != userlib::fd::FD_CLOEXEC as i32 {
+                syscall::debug_puts(b"  FAIL: F_DUPFD_CLOEXEC didn't set cloexec\n");
+                phase47_ok = false;
+            }
+
+            // Invalid FD — should return -1.
+            if userlib::fd::fcntl(99, userlib::fd::F_GETFD, 0) != -1 {
+                syscall::debug_puts(b"  FAIL: fcntl on invalid FD should return -1\n");
+                phase47_ok = false;
+            }
+        }
+
+        // --- ioctl (FIONBIO) ---
+        if phase47_ok {
+            // FIONBIO sets O_NONBLOCK.
+            // First clear O_NONBLOCK on FD 0.
+            userlib::fd::fcntl(0, userlib::fd::F_SETFL, 0);
+            let fl_before = userlib::fd::fcntl(0, userlib::fd::F_GETFL, 0) as u32;
+            if fl_before & userlib::fd::O_NONBLOCK != 0 {
+                syscall::debug_puts(b"  FAIL: O_NONBLOCK should be cleared\n");
+                phase47_ok = false;
+            }
+
+            // Set FIONBIO = 1.
+            if userlib::fd::ioctl(0, userlib::fd::FIONBIO, 1) != 0 {
+                syscall::debug_puts(b"  FAIL: ioctl FIONBIO returned error\n");
+                phase47_ok = false;
+            }
+            let fl_after = userlib::fd::fcntl(0, userlib::fd::F_GETFL, 0) as u32;
+            if fl_after & userlib::fd::O_NONBLOCK == 0 {
+                syscall::debug_puts(b"  FAIL: FIONBIO didn't set O_NONBLOCK\n");
+                phase47_ok = false;
+            }
+
+            // Clear FIONBIO = 0.
+            userlib::fd::ioctl(0, userlib::fd::FIONBIO, 0);
+            let fl_final = userlib::fd::fcntl(0, userlib::fd::F_GETFL, 0) as u32;
+            if fl_final & userlib::fd::O_NONBLOCK != 0 {
+                syscall::debug_puts(b"  FAIL: FIONBIO=0 didn't clear O_NONBLOCK\n");
+                phase47_ok = false;
+            }
+        }
+
+        // --- fd_close_on_exec ---
+        if phase47_ok {
+            // FD 3 has FD_CLOEXEC set (from fcntl test above), FD 30 has it too.
+            // FD 0,1,2,4,10,20 do not.
+            let count_before = userlib::fd::fd_count();
+            userlib::fd::fd_close_on_exec();
+            let count_after = userlib::fd::fd_count();
+            // Should have closed FD 3 and FD 30 (2 FDs).
+            if count_before - count_after != 2 {
+                syscall::debug_puts(b"  FAIL: fd_close_on_exec wrong count\n");
+                phase47_ok = false;
+            }
+            if userlib::fd::fd_is_valid(3) || userlib::fd::fd_is_valid(30) {
+                syscall::debug_puts(b"  FAIL: cloexec FDs still open\n");
+                phase47_ok = false;
+            }
+            // FDs without cloexec should survive.
+            if !userlib::fd::fd_is_valid(0) || !userlib::fd::fd_is_valid(1) {
+                syscall::debug_puts(b"  FAIL: non-cloexec FDs were closed\n");
+                phase47_ok = false;
+            }
+        }
+
+        // --- fd_close ---
+        if phase47_ok {
+            // Close FDs we opened during the test.
+            userlib::fd::fd_close(4);
+            userlib::fd::fd_close(10);
+            userlib::fd::fd_close(20);
+            // Double-close should return false.
+            if userlib::fd::fd_close(20) {
+                syscall::debug_puts(b"  FAIL: double close should return false\n");
+                phase47_ok = false;
+            }
+            // Close invalid FD should return false.
+            if userlib::fd::fd_close(-1) {
+                syscall::debug_puts(b"  FAIL: close(-1) should return false\n");
+                phase47_ok = false;
+            }
+        }
+
+        // Clean up remaining test FDs (0, 1, 2 are still open).
+        userlib::fd::fd_close(0);
+        userlib::fd::fd_close(1);
+        userlib::fd::fd_close(2);
+        syscall::port_destroy(dummy_console);
+
+        if phase47_ok {
+            syscall::debug_puts(b"Phase 47 dup/dup2/fcntl/ioctl: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 47 dup/dup2/fcntl/ioctl: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

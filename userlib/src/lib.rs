@@ -2,6 +2,7 @@
 
 pub mod aio;
 pub mod arch;
+pub mod fd;
 pub mod green;
 pub mod pipe;
 pub mod profile;
