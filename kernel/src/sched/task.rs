@@ -96,6 +96,10 @@ pub struct Task {
     pub parent_task: TaskId,
     /// True once exit cleanup is done.
     pub exited: bool,
+    /// True once a parent has reaped this task via wait4.
+    pub reaped: bool,
+    /// POSIX-encoded wait status (set on exit).
+    pub wait_status: i32,
     /// Number of live threads in this task.
     pub thread_count: u32,
     // --- Resource quotas ---
@@ -148,6 +152,8 @@ impl Task {
             exit_code: 0,
             parent_task: 0,
             exited: false,
+            reaped: true,
+            wait_status: 0,
             thread_count: 0,
             max_ports: 16,
             max_threads: 8,

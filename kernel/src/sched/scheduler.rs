@@ -221,7 +221,7 @@ impl Scheduler {
     fn alloc_task_id(&mut self) -> Option<TaskId> {
         // Skip task 0 (kernel task).
         for i in 1..self.next_task_id as usize {
-            if !self.tasks[i].active && self.tasks[i].exited {
+            if !self.tasks[i].active && self.tasks[i].exited && self.tasks[i].reaped {
                 return Some(i as TaskId);
             }
         }
@@ -363,6 +363,8 @@ impl Scheduler {
         task.page_table_root = pt_root;
         task.exit_code = 0;
         task.exited = false;
+        task.reaped = false;
+        task.wait_status = 0;
         task.thread_count = 1;
         // Record the parent task (caller's task) for waitpid.
         let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
@@ -1641,6 +1643,8 @@ pub fn fork_current() -> u64 {
         task.page_table_root = child_pt_root;
         task.exit_code = 0;
         task.exited = false;
+        task.reaped = false;
+        task.wait_status = 0;
         task.thread_count = 1;
         task.parent_task = parent_task_id;
         // Fork inherits parent's process group, session, ctty, and credentials.
@@ -1744,7 +1748,7 @@ pub fn fork_current() -> u64 {
 /// Terminate the current thread and destroy its task's resources.
 /// This function never returns.
 pub fn exit_current_thread(exit_code: i32) -> ! {
-    let (tid, is_last_thread, aspace_id, pt_root, kstack_base) = {
+    let (tid, is_last_thread, aspace_id, pt_root, kstack_base, parent_task_id) = {
         let pcpu = smp::current();
         let tid = pcpu.current_thread.load(Ordering::Relaxed);
         let mut sched = SCHEDULER.lock();
@@ -1761,15 +1765,26 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         let task = &mut sched.tasks[task_id as usize];
         task.thread_count -= 1;
         let is_last = task.thread_count == 0;
+        let parent_task_id = task.parent_task;
         if is_last {
             task.exit_code = exit_code;
             task.exited = true;
             task.active = false;
+            // Encode POSIX wait status: normal exit = (code & 0xFF) << 8.
+            task.wait_status = (exit_code & 0xFF) << 8;
         }
         let aspace_id = task.aspace_id;
         let pt_root = task.page_table_root;
-        (tid, is_last, aspace_id, pt_root, kstack_base)
+        (tid, is_last, aspace_id, pt_root, kstack_base, parent_task_id)
     }; // scheduler lock dropped here
+
+    // If this was the last thread (task became zombie), notify parent.
+    if is_last_thread {
+        // Send SIGCHLD to parent task.
+        send_signal_to_task(parent_task_id, super::task::SIGCHLD);
+        // Wake any parent threads blocked in WaitChild.
+        wake_wait_child_threads(parent_task_id);
+    }
 
     // Only destroy task resources when the last thread exits.
     if is_last_thread {
@@ -1805,6 +1820,21 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
             crate::arch::riscv64::mm::free_page_table_tree(pt_root);
             #[cfg(target_arch = "x86_64")]
             crate::arch::x86_64::mm::free_page_table_tree(pt_root);
+        }
+    }
+
+    // Auto-reap zombie children of this exiting task (prevent zombie leaks).
+    if is_last_thread {
+        let my_task_id = {
+            let sched = SCHEDULER.lock();
+            sched.threads[tid as usize].task_id
+        };
+        let mut sched = SCHEDULER.lock();
+        for i in 1..sched.next_task_id as usize {
+            let task = &sched.tasks[i];
+            if task.parent_task == my_task_id && task.exited && !task.reaped {
+                sched.tasks[i].reaped = true;
+            }
         }
     }
 
@@ -1941,17 +1971,116 @@ fn arch_send_event() {
 }
 
 /// Check if a child thread's task has exited. Returns exit code if so.
+/// Also reaps the child (marks reaped=true) so the task slot can be reused.
 pub fn waitpid(child_tid: ThreadId) -> Option<i32> {
-    let sched = SCHEDULER.lock();
+    let mut sched = SCHEDULER.lock();
     if child_tid as usize >= MAX_THREADS {
         return None;
     }
     let task_id = sched.threads[child_tid as usize].task_id;
-    let task = &sched.tasks[task_id as usize];
+    let task = &mut sched.tasks[task_id as usize];
     if task.exited {
+        task.reaped = true;
         Some(task.exit_code)
     } else {
         None
+    }
+}
+
+/// POSIX wait flags.
+pub const WNOHANG: u32 = 1;
+#[allow(dead_code)]
+pub const WUNTRACED: u32 = 2;
+#[allow(dead_code)]
+pub const WCONTINUED: u32 = 8;
+
+/// Wake all threads in a given task that are blocked in WaitChild.
+fn wake_wait_child_threads(task_id: TaskId) {
+    let sched = SCHEDULER.lock();
+    let mut to_wake = [0u32; MAX_THREADS];
+    let mut count = 0usize;
+    for i in 0..MAX_THREADS {
+        let t = &sched.threads[i];
+        if t.task_id == task_id && t.state != ThreadState::Dead
+            && t.stack_base != 0
+            && t.blocked_on == BlockReason::WaitChild
+        {
+            to_wake[count] = i as u32;
+            count += 1;
+        }
+    }
+    drop(sched);
+    for i in 0..count {
+        wake_thread(to_wake[i]);
+    }
+}
+
+/// Enhanced wait4: wait for child process exit with POSIX semantics.
+///
+/// `pid` semantics:
+///   - pid > 0: wait for child with task_id == pid
+///   - pid == -1: wait for any child
+///   - pid == 0: wait for any child in caller's process group
+///   - pid < -1: wait for any child in process group |pid|
+///
+/// Returns (child_task_id, wait_status) or (-1, 0) on error,
+/// or (0, 0) for WNOHANG with no exited child.
+pub fn wait4(pid: i64, flags: u32) -> (i32, i32) {
+    let tid = current_thread_id();
+
+    loop {
+        let result = {
+            let mut sched = SCHEDULER.lock();
+            let my_task_id = sched.threads[tid as usize].task_id;
+            let my_pgid = sched.tasks[my_task_id as usize].pgid;
+
+            // Scan for a matching exited (zombie) child.
+            let mut found: Option<(u32, i32)> = None;
+            let mut has_children = false;
+            for i in 1..sched.next_task_id as usize {
+                let task = &sched.tasks[i];
+                if task.parent_task != my_task_id { continue; }
+
+                // Check pid filter.
+                let matches = match pid {
+                    -1 => true,                    // any child
+                    0 => task.pgid == my_pgid,     // same pgroup
+                    p if p > 0 => i == p as usize, // specific task
+                    p => task.pgid == (-p) as TaskId, // specific pgroup
+                };
+                if !matches { continue; }
+                has_children = true;
+
+                if task.exited && !task.reaped {
+                    found = Some((i as u32, task.wait_status));
+                    // Reap the child.
+                    sched.tasks[i].reaped = true;
+                    break;
+                }
+            }
+
+            if let Some((child_id, status)) = found {
+                Some((child_id as i32, status))
+            } else if !has_children {
+                // No matching children at all — ECHILD.
+                Some((-1, 0))
+            } else if flags & WNOHANG != 0 {
+                Some((0, 0))
+            } else {
+                // Block: clear wakeup flag while holding the lock.
+                clear_wakeup_flag(tid);
+                sched.threads[tid as usize].blocked_on = BlockReason::WaitChild;
+                None
+            }
+        }; // scheduler lock dropped
+
+        match result {
+            Some(r) => return r,
+            None => {
+                // Spin until woken by a child exit.
+                block_current(BlockReason::WaitChild);
+            }
+        }
     }
 }
 

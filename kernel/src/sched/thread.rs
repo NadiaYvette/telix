@@ -26,6 +26,7 @@ pub enum BlockReason {
     Sleep,
     PagerFault,
     PagerWait,
+    WaitChild,
 }
 
 /// Maximum number of threads.

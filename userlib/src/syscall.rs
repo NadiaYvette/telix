@@ -761,6 +761,7 @@ const SYS_SETUID: u64 = 79;
 const SYS_SETGID: u64 = 80;
 const SYS_SETGROUPS: u64 = 81;
 const SYS_GETGROUPS: u64 = 82;
+const SYS_WAIT4: u64 = 83;
 
 /// Map a file-backed region via the pager mechanism.
 /// Returns the VA on success, or None on failure.
@@ -879,6 +880,77 @@ pub fn getgroups(buf: &mut [u32]) -> usize {
         arch::syscall2(SYS_GETGROUPS, buf.len() as u64, buf.as_mut_ptr() as u64)
     };
     if r == u64::MAX { 0 } else { r as usize }
+}
+
+// --- wait4 / waitpid improvements ---
+
+/// WNOHANG: return immediately if no child has exited.
+pub const WNOHANG: u32 = 1;
+/// WUNTRACED: also report stopped children.
+pub const WUNTRACED: u32 = 2;
+/// WCONTINUED: also report continued children.
+pub const WCONTINUED: u32 = 8;
+
+/// Extract exit status from wait status (valid if WIFEXITED).
+pub const fn wexitstatus(status: i32) -> i32 { (status >> 8) & 0xFF }
+/// True if child exited normally.
+pub const fn wifexited(status: i32) -> bool { (status & 0x7F) == 0 }
+/// True if child was killed by a signal.
+pub const fn wifsignaled(status: i32) -> bool { (status & 0x7F) != 0 && (status & 0x7F) != 0x7F }
+/// Get the signal that killed the child.
+pub const fn wtermsig(status: i32) -> i32 { status & 0x7F }
+
+/// Enhanced wait for child process.
+///
+/// `pid` semantics:
+///   -1: wait for any child
+///   >0: wait for specific child task_id
+///    0: wait for any child in caller's pgroup
+///   <-1: wait for child in pgroup |pid|
+///
+/// Returns (child_task_id, wait_status) or None on ECHILD.
+/// With WNOHANG: returns Some((0, 0)) if no child ready.
+pub fn wait4(pid: i64, flags: u32) -> Option<(u32, i32)> {
+    let r0: u64;
+    let r1: u64;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_WAIT4,
+            inlateout("x0") pid as u64 => r0,
+            inlateout("x1") flags as u64 => r1,
+        );
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SYS_WAIT4 as u64,
+            inlateout("a0") pid as u64 => r0,
+            inlateout("a1") flags as u64 => r1,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") SYS_WAIT4 => r0,
+            inlateout("rdi") pid as u64 => r1,
+            in("rsi") flags as u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+
+    if r0 == u64::MAX {
+        None // ECHILD
+    } else {
+        Some((r0 as u32, r1 as i32))
+    }
 }
 
 // --- Shared memory (shm_srv) client wrappers ---

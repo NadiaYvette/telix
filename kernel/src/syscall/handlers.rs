@@ -96,6 +96,7 @@ pub const SYS_SETUID: u64 = 79;
 pub const SYS_SETGID: u64 = 80;
 pub const SYS_SETGROUPS: u64 = 81;
 pub const SYS_GETGROUPS: u64 = 82;
+pub const SYS_WAIT4: u64 = 83;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -292,6 +293,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SETGID => sys_setgid(a0),
         SYS_SETGROUPS => sys_setgroups(a0, a1),
         SYS_GETGROUPS => sys_getgroups(a0, a1),
+        SYS_WAIT4 => sys_wait4(a0, a1, frame),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1964,6 +1966,16 @@ fn sys_setgroups(count: u64, groups_ptr: u64) -> u64 {
 
 /// getgroups: get supplementary group list.
 /// a0 = max count (0 = just return count), a1 = pointer to u32 array.
+fn sys_wait4(pid: u64, flags: u64, frame: &mut ExceptionFrame) -> u64 {
+    let (child_id, status) = crate::sched::scheduler::wait4(pid as i64, flags as u32);
+    set_reg(frame, 1, status as u64);
+    if child_id < 0 {
+        u64::MAX // ECHILD
+    } else {
+        child_id as u64
+    }
+}
+
 fn sys_getgroups(max_count: u64, groups_ptr: u64) -> u64 {
     let sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
