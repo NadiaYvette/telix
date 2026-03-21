@@ -90,3 +90,7 @@ path = "bin/ext2_srv.rs"
 [[bin]]
 name = "shm_srv"
 path = "bin/shm_srv.rs"
+
+[[bin]]
+name = "vfs_srv"
+path = "bin/vfs_srv.rs"

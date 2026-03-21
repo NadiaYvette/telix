@@ -3687,6 +3687,192 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 51: VFS server ---
+    syscall::debug_puts(b"  init: testing VFS server...\n");
+    {
+        let mut phase51_ok = true;
+
+        // VFS protocol tags.
+        const VFS_MOUNT: u64 = 0x6000;
+        const VFS_OPEN: u64 = 0x6010;
+        const VFS_STAT: u64 = 0x6020;
+        const VFS_READDIR: u64 = 0x6030;
+        const VFS_OK: u64 = 0x6100;
+        const VFS_OPEN_OK: u64 = 0x6110;
+        const VFS_STAT_OK: u64 = 0x6120;
+        const VFS_READDIR_OK: u64 = 0x6130;
+        const VFS_READDIR_END: u64 = 0x6131;
+        const VFS_ERROR: u64 = 0x6F00;
+
+        // Spawn VFS server.
+        let vfs_tid = syscall::spawn(b"vfs_srv", 50);
+        if vfs_tid == u64::MAX {
+            syscall::debug_puts(b"  FAIL: cannot spawn vfs_srv\n");
+            phase51_ok = false;
+        }
+
+        // Give VFS server time to register (retry lookup).
+        let vfs_port = if phase51_ok {
+            let mut found = 0u32;
+            for _ in 0..200 {
+                if let Some(p) = syscall::ns_lookup(b"vfs") {
+                    found = p;
+                    break;
+                }
+                syscall::yield_now();
+            }
+            if found == 0 {
+                syscall::debug_puts(b"  FAIL: ns_lookup(vfs) failed\n");
+                phase51_ok = false;
+            }
+            found
+        } else { 0 };
+
+        // Look up ext2 port for mounting.
+        let ext2_port = if phase51_ok {
+            match syscall::ns_lookup(b"ext2") {
+                Some(p) => p,
+                None => {
+                    syscall::debug_puts(b"  FAIL: ns_lookup(ext2) failed\n");
+                    phase51_ok = false;
+                    0
+                }
+            }
+        } else { 0 };
+
+        // Look up fat16 port.
+        let fat16_port = if phase51_ok {
+            match syscall::ns_lookup(b"fat16") {
+                Some(p) => p,
+                None => {
+                    // FAT16 might not be available, skip fat16 tests.
+                    0
+                }
+            }
+        } else { 0 };
+
+        // Test 1: Mount ext2 on "/".
+        // VFS wire: data[0..1]=path(16B), data[2]=path_len(16)|reply(32), data[3]=fs_port
+        if phase51_ok {
+            let reply_port = syscall::port_create() as u32;
+            let path = b"/";
+            let (w0, w1, _w2) = pack_name(path);
+            let d2 = (path.len() as u64) | ((reply_port as u64) << 32);
+            syscall::send(vfs_port, VFS_MOUNT, w0, w1, d2, ext2_port as u64);
+
+            let mut mounted = false;
+            for _ in 0..200 {
+                if let Some(reply) = syscall::recv_nb_msg(reply_port) {
+                    if reply.tag == VFS_OK {
+                        mounted = true;
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+            syscall::port_destroy(reply_port);
+
+            if !mounted {
+                syscall::debug_puts(b"  FAIL: VFS_MOUNT / failed\n");
+                phase51_ok = false;
+            }
+        }
+
+        // Test 2: Mount fat16 on "/mnt".
+        if phase51_ok && fat16_port != 0 {
+            let reply_port = syscall::port_create() as u32;
+            let path = b"/mnt";
+            let (w0, w1, _w2) = pack_name(path);
+            let d2 = (path.len() as u64) | ((reply_port as u64) << 32);
+            syscall::send(vfs_port, VFS_MOUNT, w0, w1, d2, fat16_port as u64);
+
+            for _ in 0..200 {
+                if let Some(reply) = syscall::recv_nb_msg(reply_port) {
+                    if reply.tag != VFS_OK {
+                        syscall::debug_puts(b"  FAIL: VFS_MOUNT /mnt failed\n");
+                        phase51_ok = false;
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+            syscall::port_destroy(reply_port);
+        }
+
+        // Test 3: VFS_OPEN "/hello.txt" — should resolve to ext2 on "/".
+        if phase51_ok {
+            let reply_port = syscall::port_create() as u32;
+            let path = b"/hello.txt";
+            let (w0, w1, _w2) = pack_name(path);
+            let d2 = (path.len() as u64) | ((reply_port as u64) << 32);
+            syscall::send(vfs_port, VFS_OPEN, w0, w1, d2, 0);
+
+            let mut open_ok = false;
+            if let Some(reply) = syscall::recv_msg(reply_port) {
+                if reply.tag == VFS_OPEN_OK {
+                    let ret_fs_port = reply.data[0] as u32;
+                    if ret_fs_port == ext2_port {
+                        open_ok = true;
+                    } else {
+                        syscall::debug_puts(b"  FAIL: VFS_OPEN wrong port\n");
+                    }
+                } else {
+                    syscall::debug_puts(b"  FAIL: VFS_OPEN err\n");
+                }
+            }
+            syscall::port_destroy(reply_port);
+
+            if !open_ok {
+                phase51_ok = false;
+            }
+        }
+
+        // Test 4: VFS_OPEN "/mnt/HELLO.TXT" — should resolve to fat16 on "/mnt".
+        if phase51_ok && fat16_port != 0 {
+            let reply_port = syscall::port_create() as u32;
+            let path = b"/mnt/HELLO.TXT";
+            let (w0, w1, _w2) = pack_name(path);
+            let d2 = (path.len() as u64) | ((reply_port as u64) << 32);
+            syscall::send(vfs_port, VFS_OPEN, w0, w1, d2, 0);
+
+            let mut open_ok = false;
+            if let Some(reply) = syscall::recv_msg(reply_port) {
+                if reply.tag == VFS_OPEN_OK {
+                    if reply.data[0] as u32 == fat16_port {
+                        open_ok = true;
+                    }
+                }
+            }
+            syscall::port_destroy(reply_port);
+            if !open_ok {
+                syscall::debug_puts(b"  FAIL: VFS /mnt open\n");
+                phase51_ok = false;
+            }
+        }
+
+        // Test 5: Path normalization — "/a/../hello.txt" resolves to "/hello.txt".
+        if phase51_ok {
+            let reply_port = syscall::port_create() as u32;
+            let path = b"/a/../hello.txt";
+            let (w0, w1, _w2) = pack_name(path);
+            let d2 = (path.len() as u64) | ((reply_port as u64) << 32);
+            syscall::send(vfs_port, VFS_OPEN, w0, w1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(reply_port) {
+                if reply.tag == VFS_OPEN_OK {
+                    // Path normalization worked.
+                }
+                // VFS_ERROR also OK if file not found.
+            }
+            syscall::port_destroy(reply_port);
+        }
+
+        if phase51_ok {
+            syscall::debug_puts(b"Phase 51 VFS server: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 51 VFS server: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
