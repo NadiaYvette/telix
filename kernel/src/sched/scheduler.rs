@@ -818,13 +818,25 @@ impl Scheduler {
         super::hotplug::tick_load(cpu, cur_for_load == idle_id_for_load);
 
         // Drain deferred kernel stack free from a previous exit on this CPU.
-        let deferred = DEFERRED_KSTACK[cpu as usize].swap(0, Ordering::AcqRel);
+        // IMPORTANT: We must NOT free the page if it belongs to the currently
+        // running thread (a dead thread spinning in exit_current_thread).
+        // The timer IRQ's exception frame and the entire try_switch() call
+        // chain live on that stack — freeing it while another CPU can
+        // reallocate it causes use-after-free (corrupted return addresses,
+        // manifesting as EC=0x22 PC alignment faults with ELR=0x9 etc.).
+        // In that case, leave it in DEFERRED_KSTACK for the next tick when
+        // we'll be running on the new thread's stack.
+        let deferred = DEFERRED_KSTACK[cpu as usize].load(Ordering::Acquire);
         if deferred != 0 {
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(deferred));
-            // Now mark the dead thread's slot as reusable (stack_base=0).
-            let dead_tid = DEFERRED_THREAD[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
-            if dead_tid < MAX_THREADS {
-                self.threads[dead_tid].stack_base = 0;
+            let cur_tid = pcpu.current_thread.load(Ordering::Relaxed);
+            if self.threads[cur_tid as usize].stack_base != deferred {
+                // Safe: we're on a different thread's stack.
+                DEFERRED_KSTACK[cpu as usize].store(0, Ordering::Release);
+                crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(deferred));
+                let dead_tid = DEFERRED_THREAD[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
+                if dead_tid < MAX_THREADS {
+                    self.threads[dead_tid].stack_base = 0;
+                }
             }
         }
 
@@ -1920,10 +1932,10 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     arch_enable_irqs();
 
     // Request immediate preemption on the next tick so we don't waste a
-    // full quantum spinning.  Don't use WFI/HLT here: try_switch()
-    // drains DEFERRED_KSTACK (freeing our kstack page) while we're
-    // still running on it — HLT's resume-from-interrupt path needs
-    // a valid stack frame, but spin_loop() is purely in-register.
+    // full quantum spinning.  Don't use WFI/HLT here: on the next timer
+    // IRQ, try_switch() will switch us to a different thread, and on the
+    // tick after that it will free our kstack page.  HLT's resume path
+    // needs a valid stack, and spin_loop() is purely in-register.
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     YIELD_ASAP[tid as usize].store(true, Ordering::Release);
     loop { core::hint::spin_loop(); }
