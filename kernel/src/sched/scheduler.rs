@@ -836,6 +836,14 @@ impl Scheduler {
             return current_sp; // No preemption needed.
         }
 
+        // The yield/block request has been honoured — clear the flag so the
+        // thread gets its full quantum next time it runs.  Without this,
+        // sys_yield()/sys_yield_block() leave YIELD_ASAP permanently set,
+        // causing the thread to be preempted on every single tick.  On
+        // QEMU TCG that maximises lock-holder preemption on userspace
+        // spinlocks and leads to intermittent hangs (Phase 30/31).
+        YIELD_ASAP[prev_id as usize].store(false, Ordering::Release);
+
         // Cosched-aware pick: if prev has a group, try to find a group mate
         // that can also run on this CPU.
         let cpu = smp::cpu_id();
@@ -1189,6 +1197,10 @@ pub fn block_current(_reason: BlockReason) {
         // starving QEMU's I/O thread from processing virtio requests.
         // WFI causes the vCPU to pause until an interrupt arrives.
         arch_wait_for_interrupt();
+        // Re-arm: try_switch() clears YIELD_ASAP when it preempts us,
+        // but we need it set again so the *next* tick also preempts
+        // immediately (we're still blocked, not doing useful work).
+        YIELD_ASAP[tid as usize].store(true, Ordering::Release);
     }
     YIELD_ASAP[tid as usize].store(false, Ordering::Release);
     arch_restore_irqs(saved);
@@ -1907,7 +1919,13 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     // handler where hardware masked IRQs on exception entry).
     arch_enable_irqs();
 
-    // Spin until preempted. The scheduler won't re-enqueue us (Dead state).
+    // Request immediate preemption on the next tick so we don't waste a
+    // full quantum spinning.  Don't use WFI/HLT here: try_switch()
+    // drains DEFERRED_KSTACK (freeing our kstack page) while we're
+    // still running on it — HLT's resume-from-interrupt path needs
+    // a valid stack frame, but spin_loop() is purely in-register.
+    let tid = smp::current().current_thread.load(Ordering::Relaxed);
+    YIELD_ASAP[tid as usize].store(true, Ordering::Release);
     loop { core::hint::spin_loop(); }
 }
 

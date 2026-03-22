@@ -1627,45 +1627,35 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Test 24: Phase 31 coscheduling ---
     syscall::debug_puts(b"  init: testing coscheduling...\n");
     {
-        let stacks = syscall::mmap_anon(0, 1, 1); // RW page for 4 stacks
+        // Need more threads than CPUs (4) to force run-queue contention.
+        // 6 threads (3 grouped + 3 ungrouped), 8 KiB stacks.
+        let stacks = syscall::mmap_anon(0, 1, 1);
 
         if let Some(sk) = stacks {
-            // Record cosched hits before test.
             let hits_before = syscall::vm_stats(4);
 
-            let stack_size: usize = 0x4000; // 16 KiB per stack
-            let tid_a = syscall::thread_create(
-                cosched_worker as u64,
-                (sk + stack_size) as u64,
-                1, // group_id = 1
-            );
-            let tid_b = syscall::thread_create(
-                cosched_worker as u64,
-                (sk + 2 * stack_size) as u64,
-                1, // group_id = 1
-            );
-            let tid_c1 = syscall::thread_create(
-                cosched_worker as u64,
-                (sk + 3 * stack_size) as u64,
-                0, // no group
-            );
-            let tid_c2 = syscall::thread_create(
-                cosched_worker as u64,
-                (sk + 4 * stack_size) as u64,
-                0, // no group
-            );
+            let stack_size: usize = 0x2000; // 8 KiB per stack
+            let mut tids = [u64::MAX; 6];
+            let mut ok = true;
+            // 3 threads in group 1, 3 threads ungrouped.
+            for i in 0..6u64 {
+                let group = if i < 3 { 1u64 } else { 0u64 };
+                let tid = syscall::thread_create(
+                    cosched_worker as u64,
+                    (sk + (i as usize + 1) * stack_size) as u64,
+                    group,
+                );
+                tids[i as usize] = tid;
+                if tid == u64::MAX { ok = false; }
+            }
 
-            if tid_a != u64::MAX && tid_b != u64::MAX && tid_c1 != u64::MAX && tid_c2 != u64::MAX {
-                // Wait for all 4 threads.
-                syscall::thread_join(tid_a as u32);
-                syscall::thread_join(tid_b as u32);
-                syscall::thread_join(tid_c1 as u32);
-                syscall::thread_join(tid_c2 as u32);
+            if ok {
+                for i in 0..6 {
+                    syscall::thread_join(tids[i] as u32);
+                }
 
                 let hits_after = syscall::vm_stats(4);
                 let cosched_hits = hits_after - hits_before;
-                // With 2 grouped threads doing busy work across many timer ticks,
-                // the scheduler should have picked cosched mates multiple times.
                 if cosched_hits > 0 {
                     syscall::debug_puts(b"Phase 31 coscheduling: PASSED (hits=");
                     print_num(cosched_hits);
@@ -4004,12 +3994,12 @@ extern "C" fn cosched_worker(group_id: u64) {
     }
 
     // Burn CPU across many timer ticks.
-    // Each yield_now sets YIELD_ASAP so next tick preempts us.
-    // The busy loop between yields ensures we survive at least one tick.
-    for _ in 0..20 {
+    // Each yield_now forces a preemption on the next tick, putting us
+    // in the run queue where the cosched logic can find group-mates.
+    // Short busy-spin between yields keeps us alive for one tick.
+    for _ in 0..50 {
         syscall::yield_now();
-        // Busy spin to ensure this iteration spans at least one timer tick.
-        for _ in 0..50_000 {
+        for _ in 0..5_000 {
             core::hint::spin_loop();
         }
     }

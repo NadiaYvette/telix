@@ -121,8 +121,16 @@ static mut WORKER_MAP: [i32; 64] = [-1; 64];
 // --- Spinlock ---
 
 fn spin_lock() {
+    let mut spins = 0u32;
     while LOCK.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        core::hint::spin_loop();
+        spins += 1;
+        if spins & 63 == 0 {
+            // On QEMU TCG the lock holder may be on a preempted vCPU.
+            // Yielding lets it run and release the lock.
+            syscall::yield_now();
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
 
