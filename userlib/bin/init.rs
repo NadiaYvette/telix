@@ -3873,6 +3873,32 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 52: musl-libc C binary test ---
+    syscall::debug_puts(b"  init: testing C binary (musl-telix)...\n");
+    {
+        let c_tid = syscall::spawn(b"hello_c", 50);
+        if c_tid != u64::MAX {
+            syscall::debug_puts(b"  init: spawned hello_c (tid=");
+            print_num(c_tid);
+            syscall::debug_puts(b")\n");
+            loop {
+                if let Some(code) = syscall::waitpid(c_tid) {
+                    if code == 0 {
+                        syscall::debug_puts(b"Phase 52 musl-libc C binary: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 52 musl-libc C binary: FAILED (exit=");
+                        print_num(code);
+                        syscall::debug_puts(b")\n");
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+        } else {
+            syscall::debug_puts(b"Phase 52 musl-libc C binary: SKIPPED (no hello_c in initramfs)\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

@@ -43,8 +43,15 @@ RUSTFLAGS="-C link-arg=-T$LINKER ${EXTRA_RUSTFLAGS:-}" \
 
 BINDIR="$ROOTDIR/target/$TARGET/release"
 
+# Build C userspace binaries (musl-telix) for x86_64.
+if [ "$ARCH" = "x86_64" ]; then
+    echo "Building C userspace (musl-telix) for x86_64..."
+    bash "$ROOTDIR/musl-telix/build-x86_64.sh"
+    cp "$ROOTDIR/musl-telix/out/hello_c" "$BINDIR/hello_c"
+fi
+
 # Copy ELF binaries to initramfs directory.
-for bin in init hello echo_client initramfs_srv ramdisk_srv blk_srv cache_srv fat16_srv ext2_srv console_srv shell net_srv pipe_upper spin bench pong grant_echo macro_bench cap_test security_srv shm_srv vfs_srv; do
+for bin in init hello echo_client initramfs_srv ramdisk_srv blk_srv cache_srv fat16_srv ext2_srv console_srv shell net_srv pipe_upper spin bench pong grant_echo macro_bench cap_test security_srv shm_srv vfs_srv hello_c; do
     if [ -f "$BINDIR/$bin" ]; then
         cp "$BINDIR/$bin" "$INITRAMFS_DIR/$bin"
         SIZE=$(wc -c < "$INITRAMFS_DIR/$bin")
