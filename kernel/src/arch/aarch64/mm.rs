@@ -458,6 +458,142 @@ pub fn update_pte_flags(l0: usize, va: usize, new_flags: u64) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// 2 MiB superpage (L2 block descriptor) operations
+// ---------------------------------------------------------------------------
+
+/// Install a 2 MiB block descriptor at L2 for the given VA.
+/// `flags` are L3-style PTE flags; bit 1 (PT_PAGE/PT_TABLE) is cleared
+/// for the block descriptor. If an L3 table currently occupies the slot,
+/// it is freed.
+pub fn install_superpage(l0: usize, va: usize, pa: usize, flags: u64) -> bool {
+    const SUPER_SIZE: usize = 2 * 1024 * 1024;
+    debug_assert!(va & (SUPER_SIZE - 1) == 0);
+    debug_assert!(pa & (SUPER_SIZE - 1) == 0);
+
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+
+    let l1 = match get_or_create_table(l0_table, l0_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l2 = match get_or_create_table(l1, l1_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let old_entry = unsafe { *l2.add(l2_idx) };
+
+    // If there was an L3 table (table descriptor), free it.
+    if old_entry & PT_VALID != 0 && old_entry & PT_TABLE != 0 {
+        let l3_addr = (old_entry & 0x0000_FFFF_FFFF_F000) as usize;
+        crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l3_addr));
+    }
+
+    // Block descriptor: bit[1:0] = 01 (valid, not table).
+    // Strip PT_PAGE/PT_TABLE (bit 1) from flags, keep everything else.
+    let block_flags = (flags & !0x2) | PT_VALID;
+    unsafe {
+        *l2.add(l2_idx) = (pa as u64 & !0x1FFFFF) | block_flags;
+    }
+
+    // TLB invalidate the entire 2 MiB range.
+    for i in 0..512 {
+        let entry_va = va + i * MMU_PAGE_SIZE;
+        unsafe {
+            let va_shifted = (entry_va >> 12) as u64;
+            core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+        }
+    }
+    unsafe {
+        core::arch::asm!("dsb ish", "isb");
+    }
+    true
+}
+
+/// Check if `va` is mapped as a 2 MiB block at L2.
+/// Returns the base physical address if so.
+pub fn is_superpage(l0: usize, va: usize) -> Option<usize> {
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+
+    let l1 = walk_table(l0_table, l0_idx)?;
+    let l2 = walk_table(l1, l1_idx)?;
+    let entry = unsafe { *l2.add(l2_idx) };
+    // Block descriptor: valid (bit 0) but NOT table (bit 1 clear).
+    if entry & PT_VALID != 0 && entry & PT_TABLE == 0 {
+        let pa = (entry & 0x0000_FFFF_FFE0_0000) as usize;
+        Some(pa)
+    } else {
+        None
+    }
+}
+
+/// Demote a 2 MiB block descriptor back to 512 individual 4K L3 PTEs.
+/// Allocates a new L3 table, fills it with page entries, and replaces
+/// the L2 block with a table descriptor.
+pub fn demote_superpage(l0: usize, va: usize, flags: u64) -> bool {
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+
+    let l1 = match walk_table(l0_table, l0_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+    let l2 = match walk_table(l1, l1_idx) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let entry = unsafe { *l2.add(l2_idx) };
+    // Must be a valid block (bit 0 set, bit 1 clear).
+    if entry & PT_VALID == 0 || entry & PT_TABLE != 0 {
+        return false;
+    }
+
+    let base_pa = (entry & 0x0000_FFFF_FFE0_0000) as usize;
+
+    // Allocate L3 table.
+    let l3 = match alloc_table() {
+        Some(t) => t,
+        None => return false,
+    };
+    let l3_table = l3 as *mut u64;
+
+    // Fill 512 × 4K page entries.
+    for i in 0..512 {
+        let pa = base_pa + i * MMU_PAGE_SIZE;
+        unsafe {
+            *l3_table.add(i) = (pa as u64) | flags;
+        }
+    }
+
+    // Replace L2 block with table descriptor pointing to L3.
+    unsafe {
+        *l2.add(l2_idx) = (l3 as u64) | PT_VALID | PT_TABLE;
+    }
+
+    // TLB invalidate the 2 MiB range.
+    for i in 0..512 {
+        let entry_va = va + i * MMU_PAGE_SIZE;
+        unsafe {
+            let va_shifted = (entry_va >> 12) as u64;
+            core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+        }
+    }
+    unsafe {
+        core::arch::asm!("dsb ish", "isb");
+    }
+    true
+}
+
 /// Return the kernel page table root (for switching back during exit).
 pub fn boot_page_table_root() -> usize {
     KERNEL_PT_ROOT.load(Ordering::Acquire)

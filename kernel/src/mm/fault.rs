@@ -250,13 +250,6 @@ fn try_superpage_promotion(
     obj_id: u32,
     mmu_idx: usize,
 ) {
-    // Only on x86_64 and riscv64 for now.
-    #[cfg(target_arch = "aarch64")]
-    {
-        let _ = (pt_root, vma, obj_id, mmu_idx);
-        return;
-    }
-
     // VMA must span at least SUPER_MMU_PAGES MMU pages.
     let mmu_count = vma.mmu_page_count();
     if mmu_count < SUPER_MMU_PAGES {
@@ -492,7 +485,7 @@ fn install_superpage(pt_root: usize, va: usize, pa: usize, flags: u64) -> bool {
     #[cfg(target_arch = "riscv64")]
     { crate::arch::riscv64::mm::install_superpage(pt_root, va, pa, flags) }
     #[cfg(target_arch = "aarch64")]
-    { let _ = (pt_root, va, pa, flags); false }
+    { crate::arch::aarch64::mm::install_superpage(pt_root, va, pa, flags) }
 }
 
 /// Check if a VA is mapped as a 2 MiB superpage (arch dispatch).
@@ -502,7 +495,7 @@ pub fn is_superpage_mapped(pt_root: usize, va: usize) -> Option<usize> {
     #[cfg(target_arch = "riscv64")]
     { crate::arch::riscv64::mm::is_superpage(pt_root, va) }
     #[cfg(target_arch = "aarch64")]
-    { let _ = (pt_root, va); None }
+    { crate::arch::aarch64::mm::is_superpage(pt_root, va) }
 }
 
 /// Demote a 2 MiB superpage back to 512 × 4K PTEs (arch dispatch).
@@ -512,7 +505,7 @@ pub fn demote_superpage(pt_root: usize, va: usize, flags: u64) -> bool {
     #[cfg(target_arch = "riscv64")]
     { crate::arch::riscv64::mm::demote_superpage(pt_root, va, flags) }
     #[cfg(target_arch = "aarch64")]
-    { let _ = (pt_root, va, flags); false }
+    { crate::arch::aarch64::mm::demote_superpage(pt_root, va, flags) }
 }
 
 /// Handle a COW (copy-on-write) fault.

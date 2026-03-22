@@ -661,6 +661,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                             unsafe {
                                 core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, bytes_read);
                             }
+                            // Ensure grant page writes are visible to the receiver
+                            // (on another CPU) before the IPC notification.
+                            #[cfg(target_arch = "aarch64")]
+                            unsafe { core::arch::asm!("dsb ish"); }
+                            #[cfg(target_arch = "riscv64")]
+                            unsafe { core::arch::asm!("fence rw, rw"); }
                             syscall::send_nb(reply_port, IO_READ_OK, bytes_read as u64, 0);
                         } else {
                             // Inline read.

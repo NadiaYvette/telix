@@ -10,7 +10,7 @@ use super::phys;
 use crate::sync::SpinLock;
 
 /// Maximum number of memory objects.
-pub const MAX_OBJECTS: usize = 64;
+pub const MAX_OBJECTS: usize = 96;
 
 /// Maximum mappings per object (address spaces that map this object).
 const MAX_MAPPINGS: usize = 8;

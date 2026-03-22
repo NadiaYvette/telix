@@ -52,10 +52,25 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
             }
             frame_sp
         }
+        // Data Abort from EL1 (e.g., kernel accessing unmapped address).
+        0x25 => {
+            let far: u64;
+            unsafe { core::arch::asm!("mrs {}, far_el1", out(reg) far); }
+            crate::println!(
+                "EL1 Data Abort: FAR={:#x} ESR={:#x} ELR={:#x}",
+                far, frame.esr, frame.elr
+            );
+            loop { core::hint::spin_loop(); }
+        }
         _ => {
             crate::println!(
-                "EL1 Sync exception: EC={:#x} ESR={:#x} ELR={:#x}",
-                ec, frame.esr, frame.elr
+                "EL1 Sync exception: EC={:#x} ESR={:#x} ELR={:#x} SP={:#x}",
+                ec, frame.esr, frame.elr, frame.sp
+            );
+            // Dump x29 (FP) and x30 (LR) for stack trace hints.
+            crate::println!(
+                "  x30(LR)={:#x} x29(FP)={:#x} x0={:#x}",
+                frame.regs[30], frame.regs[29], frame.regs[0]
             );
             loop {
                 core::hint::spin_loop();
@@ -110,12 +125,10 @@ extern "C" fn exception_sync_el0(frame_sp: u64) -> u64 {
         }
         _ => {
             crate::println!(
-                "EL0 Sync exception: EC={:#x} ESR={:#x} ELR={:#x}",
+                "EL0 Sync exception: EC={:#x} ESR={:#x} ELR={:#x} — killing thread",
                 ec, frame.esr, frame.elr
             );
-            loop {
-                core::hint::spin_loop();
-            }
+            crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
         }
     }
 }
@@ -156,10 +169,10 @@ fn handle_abort_el0(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
         }
         crate::mm::fault::FaultResult::Failed => {
             crate::println!(
-                "EL0 Abort: unhandled fault FAR={:#x} EC={:#x} ELR={:#x}",
+                "EL0 Abort: unhandled fault FAR={:#x} EC={:#x} ELR={:#x} — killing thread",
                 far, ec, frame.elr
             );
-            loop { core::hint::spin_loop(); }
+            crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
         }
         _ => frame_sp,
     }

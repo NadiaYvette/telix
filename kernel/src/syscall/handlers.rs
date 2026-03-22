@@ -1266,6 +1266,13 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         // (registers were zeroed above, so arg0 is already 0)
     }
 
+    // Flush icache again after frame rewrite, and add DSB to ensure
+    // all page table + data writes are complete before we return to userspace.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
+    }
+
     // dispatch() returns after this — the exception return path will
     // restore the rewritten frame and jump to the new program's entry point.
 }

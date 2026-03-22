@@ -3996,10 +3996,13 @@ extern "C" fn cosched_worker(group_id: u64) {
     // Burn CPU across many timer ticks.
     // Each yield_now forces a preemption on the next tick, putting us
     // in the run queue where the cosched logic can find group-mates.
-    // Short busy-spin between yields keeps us alive for one tick.
+    // The busy-spin must last longer than a timer interval (10ms) to
+    // ensure threads are preempted mid-work, creating run-queue diversity.
+    // At 62.5 MHz (aarch64 QEMU), 500K iterations ≈ 8ms; at ~1 GHz
+    // (x86 QEMU RDTSC rate), PAUSE is ~10-40ns so 500K ≈ 5-20ms.
     for _ in 0..50 {
         syscall::yield_now();
-        for _ in 0..5_000 {
+        for _ in 0..500_000 {
             core::hint::spin_loop();
         }
     }

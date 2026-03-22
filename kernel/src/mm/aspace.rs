@@ -9,7 +9,7 @@ use super::vmatree::{VmaCursor, VmaTree};
 use crate::sync::SpinLock;
 
 /// Maximum number of address spaces.
-pub const MAX_ASPACES: usize = 16;
+pub const MAX_ASPACES: usize = 32;
 
 /// Address space ID type.
 pub type ASpaceId = u32;

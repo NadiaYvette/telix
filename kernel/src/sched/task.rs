@@ -7,7 +7,7 @@
 pub type TaskId = u32;
 
 /// Maximum number of tasks.
-pub const MAX_TASKS: usize = 16;
+pub const MAX_TASKS: usize = 32;
 
 /// Maximum number of signals (1..=MAX_SIGNALS). Bit N in masks = signal N+1.
 pub const MAX_SIGNALS: usize = 32;
