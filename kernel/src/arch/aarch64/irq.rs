@@ -153,6 +153,10 @@ pub fn enable_interrupt(intid: u32) {
         unsafe {
             core::ptr::write_volatile(prio_reg, 0x80);
         }
+        // DSB+ISB: ensure the GIC distributor write is complete and visible
+        // before the CPU proceeds. Without this, an immediate irq_wait()
+        // can race with the GIC configuration, losing the first interrupt.
+        unsafe { core::arch::asm!("dsb sy", "isb"); }
         // Route to CPU 0 (GICD_IROUTER default is fine for GICv3 with ARE).
     }
 }

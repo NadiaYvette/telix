@@ -1002,6 +1002,34 @@ pub fn thread_join_poll(tid: ThreadId, caller_task: u32) -> Option<i32> {
     }
 }
 
+/// Blocking thread_join: if target is already dead return its exit code,
+/// otherwise register as waiter and block until it exits.
+pub fn thread_join_block(tid: ThreadId, caller_task: u32) -> u64 {
+    {
+        let mut sched = SCHEDULER.lock();
+        if (tid as usize) >= MAX_THREADS {
+            return u64::MAX;
+        }
+        let t = &sched.threads[tid as usize];
+        if t.task_id != caller_task {
+            return u64::MAX;
+        }
+        if t.state == ThreadState::Dead {
+            return t.exit_code as u64;
+        }
+        // Register ourselves as the join waiter.
+        let caller_tid = current_thread_id();
+        sched.threads[tid as usize].join_waiter = caller_tid;
+        // Clear wakeup flag before blocking.
+        WAKEUP_FLAGS[caller_tid as usize].store(false, Ordering::Release);
+    }
+    // Block until the target thread wakes us via exit_current_thread.
+    block_current(BlockReason::FutexWait);
+    // Re-read exit code.
+    let sched = SCHEDULER.lock();
+    sched.threads[tid as usize].exit_code as u64
+}
+
 /// Get the task ID of the current thread.
 #[allow(dead_code)]
 pub fn current_task_id() -> TaskId {
@@ -1780,6 +1808,12 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         let thread = &mut sched.threads[tid as usize];
         thread.state = ThreadState::Dead;
         thread.exit_code = exit_code;
+        // Wake any thread blocked in thread_join() on us.
+        let waiter = thread.join_waiter;
+        thread.join_waiter = u32::MAX;
+        if waiter != u32::MAX {
+            wake_thread(waiter);
+        }
         let task_id = thread.task_id;
         let kstack_base = thread.stack_base;
         // NOTE: Do NOT set stack_base=0 here. The thread is still running on
@@ -1895,6 +1929,13 @@ pub fn arch_irq_restore(saved: usize) {
     arch_restore_irqs(saved);
 }
 
+/// Wait for next interrupt (WFI/HLT). Public for sys_yield.
+#[inline(always)]
+#[allow(dead_code)]
+pub fn arch_wait_for_irq() {
+    arch_wait_for_interrupt();
+}
+
 #[inline(always)]
 fn arch_save_and_enable_irqs() -> usize {
     #[cfg(target_arch = "aarch64")]
@@ -1904,6 +1945,7 @@ fn arch_save_and_enable_irqs() -> usize {
             core::arch::asm!(
                 "mrs {0}, daif",
                 "msr daifclr, #2", // Clear IRQ mask → enable IRQs
+                "isb",             // Ensure unmask is visible before WFI
                 out(reg) daif,
             );
         }
@@ -1940,7 +1982,10 @@ fn arch_save_and_enable_irqs() -> usize {
 fn arch_restore_irqs(saved: usize) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        core::arch::asm!("msr daif, {0}", in(reg) saved as u64);
+        // ISB is required: MSR writes to DAIF are not self-synchronizing
+        // on AArch64.  Without it a subsequent WFI can execute before the
+        // IRQ-unmask takes effect, causing a deadlock.
+        core::arch::asm!("msr daif, {0}", "isb", in(reg) saved as u64);
     }
     #[cfg(target_arch = "riscv64")]
     {
@@ -1962,7 +2007,7 @@ fn arch_restore_irqs(saved: usize) {
 #[inline(always)]
 fn arch_enable_irqs() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("msr daifclr, #2"); }
+    unsafe { core::arch::asm!("msr daifclr, #2", "isb"); }
     #[cfg(target_arch = "riscv64")]
     unsafe { core::arch::asm!("csrsi sstatus, 0x2"); }
     #[cfg(target_arch = "x86_64")]

@@ -374,7 +374,10 @@ pub extern "C" fn green_worker_entry(worker_id: u64) {
             if COMPLETED.load(Ordering::Relaxed) >= unsafe { TOTAL_FIBERS } {
                 break;
             }
-            syscall::yield_now();
+            // Use yield_block (WFI/HLT) so we don't busy-loop on QEMU TCG.
+            // A tight yield_now() loop can starve the other worker from
+            // making progress.
+            syscall::yield_block();
             continue;
         }
 

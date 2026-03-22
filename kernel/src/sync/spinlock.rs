@@ -89,6 +89,7 @@ fn arch_restore_irqs(saved: usize) {
     unsafe {
         core::arch::asm!(
             "msr daif, {0}",
+            "isb",
             in(reg) saved as u64,
         );
     }

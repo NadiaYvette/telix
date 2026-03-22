@@ -3961,12 +3961,9 @@ extern "C" fn thread_child_entry(arg: u64) {
 
 /// Phase 30 green thread fiber entry. Increments counter 100 times with yields.
 fn green_fiber_entry(counter_addr: u64) {
-    let ptr = counter_addr as *mut u64;
+    let atom = unsafe { &*(counter_addr as *const core::sync::atomic::AtomicU64) };
     for _ in 0..100 {
-        // Atomic-style increment (only one fiber runs per worker at a time,
-        // and the spinlock in fiber_yield serializes access).
-        let val = unsafe { core::ptr::read_volatile(ptr) };
-        unsafe { core::ptr::write_volatile(ptr, val + 1); }
+        atom.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         userlib::green::fiber_yield();
     }
 }

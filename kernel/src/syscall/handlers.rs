@@ -100,6 +100,7 @@ pub const SYS_WAIT4: u64 = 83;
 pub const SYS_GETRLIMIT: u64 = 84;
 pub const SYS_SETRLIMIT: u64 = 85;
 pub const SYS_PRLIMIT: u64 = 86;
+pub const SYS_YIELD_BLOCK: u64 = 87;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -300,6 +301,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_GETRLIMIT => sys_getrlimit(a0, frame),
         SYS_SETRLIMIT => sys_setrlimit(a0, a1, a2),
         SYS_PRLIMIT => sys_prlimit(a0, a1, a2, a3, frame),
+        SYS_YIELD_BLOCK => sys_yield_block(),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -588,6 +590,17 @@ fn sys_yield() -> u64 {
     // Set YIELD_ASAP so the next timer tick will preempt us immediately.
     let tid = crate::sched::current_thread_id();
     crate::sched::scheduler::set_yield_asap(tid);
+    0
+}
+
+/// Like sys_yield but waits for the next interrupt (WFI/HLT).
+/// Use when the caller has no work and wants to sleep until preempted.
+fn sys_yield_block() -> u64 {
+    let tid = crate::sched::current_thread_id();
+    crate::sched::scheduler::set_yield_asap(tid);
+    let saved = crate::sched::scheduler::arch_irq_save_enable();
+    crate::sched::scheduler::arch_wait_for_irq();
+    crate::sched::scheduler::arch_irq_restore(saved);
     0
 }
 
@@ -1274,13 +1287,10 @@ fn sys_thread_create(entry: u64, stack_top: u64, arg: u64) -> u64 {
     }
 }
 
-/// Poll: returns exit code if target thread is dead and in same task, else u64::MAX.
+/// Block until target thread exits. Returns exit code, or u64::MAX on error.
 fn sys_thread_join(tid: u64) -> u64 {
     let caller_task = crate::sched::scheduler::current_task_id();
-    match crate::sched::thread_join_poll(tid as u32, caller_task) {
-        Some(exit_code) => exit_code as u64,
-        None => u64::MAX,
-    }
+    crate::sched::thread_join_block(tid as u32, caller_task)
 }
 
 fn sys_set_quota(child_tid: u64, resource_type: u64, limit: u64) -> u64 {

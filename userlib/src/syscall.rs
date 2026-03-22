@@ -87,6 +87,13 @@ pub fn yield_now() {
     unsafe { arch::syscall0(SYS_YIELD); }
 }
 
+/// Yield and wait for the next interrupt (WFI/HLT).
+/// Use when the caller has no work to do — more efficient than a
+/// tight yield_now() loop on QEMU TCG.
+pub fn yield_block() {
+    unsafe { arch::syscall0(SYS_YIELD_BLOCK); }
+}
+
 /// Get the current thread ID.
 pub fn thread_id() -> u64 {
     unsafe { arch::syscall0(SYS_THREAD_ID) }
@@ -165,13 +172,9 @@ pub fn thread_join_poll(tid: u32) -> Option<i64> {
 }
 
 /// Block until a thread exits. Returns its exit code.
+/// The kernel blocks the caller until the target thread exits.
 pub fn thread_join(tid: u32) -> i64 {
-    loop {
-        if let Some(code) = thread_join_poll(tid) {
-            return code;
-        }
-        yield_now();
-    }
+    unsafe { arch::syscall1(SYS_THREAD_JOIN, tid as u64) as i64 }
 }
 
 /// Block if the u32 at `addr` equals `expected`. Returns 0 on wake, 1 on value mismatch.
@@ -765,6 +768,7 @@ const SYS_WAIT4: u64 = 83;
 const SYS_GETRLIMIT: u64 = 84;
 const SYS_SETRLIMIT: u64 = 85;
 const SYS_PRLIMIT: u64 = 86;
+const SYS_YIELD_BLOCK: u64 = 87;
 
 /// Map a file-backed region via the pager mechanism.
 /// Returns the VA on success, or None on failure.
