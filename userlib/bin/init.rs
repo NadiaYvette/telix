@@ -3261,7 +3261,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let mut phase48_ok = true;
 
         // Init runs as root (uid=0, gid=0) by default.
-        if syscall::getuid() != 0 {
+        let uid_val = syscall::getuid();
+        if uid_val != 0 {
             syscall::debug_puts(b"  FAIL: getuid() should be 0\n");
             phase48_ok = false;
         }
@@ -3277,7 +3278,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"  FAIL: getegid() should be 0\n");
             phase48_ok = false;
         }
-
         // setgroups: set supplementary groups as root.
         if phase48_ok {
             let groups: [u32; 3] = [100, 200, 300];

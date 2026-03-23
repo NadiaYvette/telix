@@ -2038,13 +2038,6 @@ fn sys_setgid(new_gid: u64) -> u64 {
 /// setgroups: set supplementary group list. Only euid 0 can call.
 /// a0 = count, a1 = pointer to u32 array in user memory.
 fn sys_setgroups(count: u64, groups_ptr: u64) -> u64 {
-    let mut sched = crate::sched::scheduler::SCHEDULER.lock();
-    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    let task = &mut sched.tasks[task_id as usize];
-    if task.euid != 0 {
-        return u64::MAX; // EPERM
-    }
     let n = count as usize;
     if n > crate::sched::task::MAX_GROUPS {
         return u64::MAX; // EINVAL
@@ -2052,10 +2045,24 @@ fn sys_setgroups(count: u64, groups_ptr: u64) -> u64 {
     if n > 0 && groups_ptr == 0 {
         return u64::MAX;
     }
-    // Copy group IDs from user memory.
-    let src = groups_ptr as *const u32;
+    // Copy group IDs from user memory using safe copy_from_user.
+    let mut tmp = [0u8; crate::sched::task::MAX_GROUPS * 4];
+    if n > 0 {
+        let pt_root = crate::sched::scheduler::current_page_table_root();
+        if !copy_from_user(pt_root, groups_ptr as usize, &mut tmp[..n * 4]) {
+            return u64::MAX;
+        }
+    }
+    let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    let task = &mut sched.tasks[task_id as usize];
+    if task.euid != 0 {
+        return u64::MAX; // EPERM
+    }
     for i in 0..n {
-        task.groups[i] = unsafe { *src.add(i) };
+        let off = i * 4;
+        task.groups[i] = u32::from_le_bytes([tmp[off], tmp[off+1], tmp[off+2], tmp[off+3]]);
     }
     task.ngroups = n as u32;
     0
@@ -2184,10 +2191,19 @@ fn sys_getgroups(max_count: u64, groups_ptr: u64) -> u64 {
     if (max_count as usize) < n {
         return u64::MAX; // EINVAL — buffer too small
     }
-    if groups_ptr != 0 {
-        let dst = groups_ptr as *mut u32;
-        for i in 0..n {
-            unsafe { *dst.add(i) = task.groups[i]; }
+    // Serialize to temp buffer, then copy_to_user.
+    let mut tmp = [0u8; crate::sched::task::MAX_GROUPS * 4];
+    for i in 0..n {
+        let bytes = task.groups[i].to_le_bytes();
+        let off = i * 4;
+        tmp[off] = bytes[0]; tmp[off+1] = bytes[1];
+        tmp[off+2] = bytes[2]; tmp[off+3] = bytes[3];
+    }
+    let pt_root = task.page_table_root;
+    drop(sched);
+    if groups_ptr != 0 && n > 0 {
+        if !copy_to_user(pt_root, groups_ptr as usize, &tmp[..n * 4]) {
+            return u64::MAX;
         }
     }
     n as u64
