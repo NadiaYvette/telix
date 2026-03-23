@@ -94,3 +94,7 @@ path = "bin/shm_srv.rs"
 [[bin]]
 name = "vfs_srv"
 path = "bin/vfs_srv.rs"
+
+[[bin]]
+name = "tmpfs_srv"
+path = "bin/tmpfs_srv.rs"

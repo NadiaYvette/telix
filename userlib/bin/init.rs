@@ -4093,6 +4093,238 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 54: tmpfs server ---
+    syscall::debug_puts(b"  init: testing tmpfs...\n");
+    {
+        // Spawn tmpfs server.
+        let tmpfs_tid = syscall::spawn(b"tmpfs_srv", 50);
+        let mut phase54_ok = tmpfs_tid != u64::MAX;
+        if !phase54_ok {
+            syscall::debug_puts(b"  FAIL: cannot spawn tmpfs_srv\n");
+        }
+
+        // Look up tmpfs port.
+        let tmpfs_port = if phase54_ok {
+            let mut found = 0u32;
+            for _ in 0..100 {
+                if let Some(p) = syscall::ns_lookup(b"tmpfs") {
+                    found = p;
+                    break;
+                }
+                syscall::sleep_ms(10);
+            }
+            if found == 0 {
+                syscall::debug_puts(b"  FAIL: ns_lookup(tmpfs) failed\n");
+                phase54_ok = false;
+            }
+            found
+        } else { 0 };
+
+        let rp = if phase54_ok { syscall::port_create() as u32 } else { 0 };
+
+        // Step 1: FS_CREATE "test.txt"
+        let mut handle = 0u64;
+        let mut srv_aspace = 0u32;
+        if phase54_ok {
+            let fname = b"test.txt";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(tmpfs_port, 0x2500, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2501 {
+                    handle = reply.data[0];
+                    srv_aspace = reply.data[2] as u32;
+                } else {
+                    syscall::debug_puts(b"  FAIL: tmpfs CREATE failed\n");
+                    phase54_ok = false;
+                }
+            } else { phase54_ok = false; }
+        }
+
+        // Step 2: FS_WRITE 48 bytes of pattern
+        if phase54_ok {
+            if let Some(scratch) = syscall::mmap_anon(0, 1, 1) {
+                unsafe {
+                    let p = scratch as *mut u8;
+                    for i in 0..48 {
+                        *p.add(i) = ((i * 13 + 0x30) & 0xFF) as u8;
+                    }
+                }
+                let grant_dst: usize = 0x8_0000_0000;
+                if syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false) {
+                    let wd1 = 48u64 | ((rp as u64) << 32);
+                    syscall::send(tmpfs_port, 0x2600, handle, wd1, grant_dst as u64, 0);
+                    if let Some(wr) = syscall::recv_msg(rp) {
+                        if wr.tag != 0x2601 || wr.data[0] != 48 {
+                            syscall::debug_puts(b"  FAIL: tmpfs WRITE bad reply\n");
+                            phase54_ok = false;
+                        }
+                    } else { phase54_ok = false; }
+                    syscall::revoke(srv_aspace, grant_dst);
+                } else { phase54_ok = false; }
+                syscall::munmap(scratch);
+            } else { phase54_ok = false; }
+        }
+
+        // Step 3: FS_CLOSE
+        if phase54_ok {
+            syscall::send(tmpfs_port, 0x2400, handle, 0, 0, 0);
+        }
+
+        // Step 4: FS_OPEN "test.txt" and verify read-back
+        if phase54_ok {
+            let fname = b"test.txt";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(tmpfs_port, 0x2000, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2001 {
+                    let rh = reply.data[0];
+                    let rsize = reply.data[1];
+                    let r_aspace = reply.data[2] as u32;
+                    if rsize != 48 {
+                        syscall::debug_puts(b"  FAIL: tmpfs re-open size\n");
+                        phase54_ok = false;
+                    }
+                    // FS_READ via grant
+                    if phase54_ok {
+                        if let Some(scratch) = syscall::mmap_anon(0, 1, 1) {
+                            let grant_dst: usize = 0x8_0000_0000;
+                            if syscall::grant_pages(r_aspace, scratch, grant_dst, 1, false) {
+                                let rd2 = 48u64 | ((rp as u64) << 32);
+                                syscall::send(tmpfs_port, 0x2100, rh, 0, rd2, grant_dst as u64);
+                                if let Some(rd) = syscall::recv_msg(rp) {
+                                    if rd.tag == 0x2101 && rd.data[0] == 48 {
+                                        let p = scratch as *const u8;
+                                        for i in 0..48 {
+                                            let expected = ((i * 13 + 0x30) & 0xFF) as u8;
+                                            if unsafe { *p.add(i) } != expected {
+                                                syscall::debug_puts(b"  FAIL: tmpfs read mismatch\n");
+                                                phase54_ok = false;
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        syscall::debug_puts(b"  FAIL: tmpfs READ bad\n");
+                                        phase54_ok = false;
+                                    }
+                                } else { phase54_ok = false; }
+                                syscall::revoke(r_aspace, grant_dst);
+                            } else { phase54_ok = false; }
+                            syscall::munmap(scratch);
+                        } else { phase54_ok = false; }
+                    }
+                    syscall::send(tmpfs_port, 0x2400, rh, 0, 0, 0);
+                } else {
+                    syscall::debug_puts(b"  FAIL: tmpfs re-open not found\n");
+                    phase54_ok = false;
+                }
+            } else { phase54_ok = false; }
+        }
+
+        // Step 5: Create second file "other.txt"
+        if phase54_ok {
+            let fname = b"other.txt";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(tmpfs_port, 0x2500, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2501 {
+                    syscall::send(tmpfs_port, 0x2400, reply.data[0], 0, 0, 0);
+                } else {
+                    syscall::debug_puts(b"  FAIL: tmpfs CREATE other\n");
+                    phase54_ok = false;
+                }
+            } else { phase54_ok = false; }
+        }
+
+        // Step 6: FS_READDIR — verify both files appear
+        if phase54_ok {
+            let mut count = 0u32;
+            let mut next = 0u64;
+            for _ in 0..10 {
+                syscall::send(tmpfs_port, 0x2200, next, 0, rp as u64, 0);
+                if let Some(reply) = syscall::recv_msg(rp) {
+                    if reply.tag == 0x2201 {
+                        count += 1;
+                        next = reply.data[3]; // next_offset
+                    } else {
+                        break; // READDIR_END
+                    }
+                } else { break; }
+            }
+            if count != 2 {
+                syscall::debug_puts(b"  FAIL: tmpfs readdir count\n");
+                phase54_ok = false;
+            }
+        }
+
+        // Step 7: FS_DELETE "test.txt"
+        if phase54_ok {
+            let fname = b"test.txt";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(tmpfs_port, 0x2700, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag != 0x2701 {
+                    syscall::debug_puts(b"  FAIL: tmpfs DELETE failed\n");
+                    phase54_ok = false;
+                }
+            } else { phase54_ok = false; }
+        }
+
+        // Step 8: Verify "test.txt" is gone
+        if phase54_ok {
+            let fname = b"test.txt";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(tmpfs_port, 0x2000, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2001 {
+                    syscall::debug_puts(b"  FAIL: tmpfs file not deleted\n");
+                    syscall::send(tmpfs_port, 0x2400, reply.data[0], 0, 0, 0);
+                    phase54_ok = false;
+                }
+            }
+        }
+
+        // Step 9: FS_READDIR — verify only "other.txt"
+        if phase54_ok {
+            let mut count = 0u32;
+            let mut next = 0u64;
+            for _ in 0..10 {
+                syscall::send(tmpfs_port, 0x2200, next, 0, rp as u64, 0);
+                if let Some(reply) = syscall::recv_msg(rp) {
+                    if reply.tag == 0x2201 {
+                        count += 1;
+                        next = reply.data[3];
+                    } else { break; }
+                } else { break; }
+            }
+            if count != 1 {
+                syscall::debug_puts(b"  FAIL: tmpfs readdir after delete\n");
+                phase54_ok = false;
+            }
+        }
+
+        // Cleanup: delete "other.txt"
+        if phase54_ok {
+            let fname = b"other.txt";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(tmpfs_port, 0x2700, fn0, fn1, d2, 0);
+            syscall::recv_msg(rp);
+        }
+
+        if rp != 0 { syscall::port_destroy(rp); }
+
+        if phase54_ok {
+            syscall::debug_puts(b"Phase 54 tmpfs: PASSED\n");
+        } else if tmpfs_tid != u64::MAX {
+            syscall::debug_puts(b"Phase 54 tmpfs: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
