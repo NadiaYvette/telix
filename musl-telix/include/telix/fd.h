@@ -11,6 +11,7 @@
 #define FD_TYPE_CONSOLE 1
 #define FD_TYPE_SOCKET  2
 #define FD_TYPE_FILE    3
+#define FD_TYPE_PIPE    4
 
 struct telix_fd_entry {
     uint32_t server_port;  /* IPC port of the server owning this fd */

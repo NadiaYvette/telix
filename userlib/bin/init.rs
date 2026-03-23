@@ -5228,6 +5228,135 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 59: Pipe improvements (pipe server + FD-integrated API) ---
+    syscall::debug_puts(b"  init: testing pipe server...\n");
+    {
+        let pipe_tid = syscall::spawn(b"pipe_srv", 50);
+        if pipe_tid == u64::MAX {
+            syscall::debug_puts(b"Phase 59 pipe improvements: FAILED (spawn)\n");
+        } else {
+            // Wait for pipe server to register.
+            let mut pipe_port_found = false;
+            {
+                let mut tries = 0;
+                while tries < 200 {
+                    if syscall::ns_lookup(b"pipe").is_some() {
+                        pipe_port_found = true;
+                        break;
+                    }
+                    syscall::yield_now();
+                    tries += 1;
+                }
+            }
+
+            let mut phase59_ok = pipe_port_found;
+            if !pipe_port_found {
+                syscall::debug_puts(b"  FAIL: pipe_srv not found\n");
+            }
+
+            // 1. Create a pipe via the new API.
+            let mut read_fd = -1i32;
+            let mut write_fd = -1i32;
+            if phase59_ok {
+                if let Some((r, w)) = userlib::pipe::pipe() {
+                    read_fd = r;
+                    write_fd = w;
+                } else {
+                    syscall::debug_puts(b"  FAIL: pipe() returned None\n");
+                    phase59_ok = false;
+                }
+            }
+
+            // 2. Basic data test: write "hello pipe server", read back.
+            if phase59_ok {
+                let msg = b"hello pipe server";
+                userlib::pipe::pipe_write_fd(write_fd, msg);
+                let mut buf = [0u8; 32];
+                let mut total = 0usize;
+                while total < msg.len() {
+                    let n = userlib::pipe::pipe_read_fd(read_fd, &mut buf[total..]);
+                    if n <= 0 {
+                        syscall::debug_puts(b"  FAIL: read returned 0/err\n");
+                        phase59_ok = false;
+                        break;
+                    }
+                    total += n as usize;
+                }
+                if phase59_ok {
+                    if total != msg.len() {
+                        syscall::debug_puts(b"  FAIL: read len mismatch\n");
+                        phase59_ok = false;
+                    } else {
+                        let mut i = 0;
+                        while i < msg.len() {
+                            if buf[i] != msg[i] {
+                                syscall::debug_puts(b"  FAIL: data mismatch\n");
+                                phase59_ok = false;
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+            }
+
+            // 3. Large buffer test: write 256 bytes, read back.
+            if phase59_ok {
+                let mut pattern = [0u8; 256];
+                let mut i = 0;
+                while i < 256 {
+                    pattern[i] = (i % 251) as u8;
+                    i += 1;
+                }
+                userlib::pipe::pipe_write_fd(write_fd, &pattern);
+                let mut readback = [0u8; 256];
+                let mut total = 0usize;
+                while total < 256 {
+                    let n = userlib::pipe::pipe_read_fd(read_fd, &mut readback[total..]);
+                    if n <= 0 {
+                        syscall::debug_puts(b"  FAIL: read returned 0/err in large test\n");
+                        phase59_ok = false;
+                        break;
+                    }
+                    total += n as usize;
+                }
+                if phase59_ok {
+                    let mut i = 0;
+                    while i < 256 {
+                        if readback[i] != pattern[i] {
+                            syscall::debug_puts(b"  FAIL: large data mismatch\n");
+                            phase59_ok = false;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+            }
+
+            // 4. EOF test: close write end, read should return 0.
+            if phase59_ok {
+                userlib::pipe::pipe_close_fd(write_fd);
+                let mut buf = [0u8; 16];
+                let n = userlib::pipe::pipe_read_fd(read_fd, &mut buf);
+                if n != 0 {
+                    syscall::debug_puts(b"  FAIL: expected EOF after close\n");
+                    phase59_ok = false;
+                }
+                userlib::pipe::pipe_close_fd(read_fd);
+            } else {
+                // Clean up FDs on failure.
+                if write_fd >= 0 { userlib::pipe::pipe_close_fd(write_fd); }
+                if read_fd >= 0 { userlib::pipe::pipe_close_fd(read_fd); }
+            }
+
+            if phase59_ok {
+                syscall::debug_puts(b"Phase 59 pipe improvements: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 59 pipe improvements: FAILED\n");
+            }
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

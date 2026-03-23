@@ -46,6 +46,15 @@ struct telix_msg {
 #define NET_TCP_CLOSE      0x4500
 #define NET_TCP_CLOSE_OK   0x4501
 
+/* Pipe protocol tags (Phase 59). */
+#define PIPE_CREATE_TAG  0x5010
+#define PIPE_WRITE_TAG   0x5020
+#define PIPE_READ_TAG    0x5030
+#define PIPE_CLOSE_TAG   0x5040
+#define PIPE_OK_TAG      0x5100
+#define PIPE_EOF_TAG     0x51FF
+#define PIPE_ERROR_TAG   0x5F00
+
 /* IPC wrappers. */
 uint32_t telix_port_create(void);
 void     telix_port_destroy(uint32_t port);

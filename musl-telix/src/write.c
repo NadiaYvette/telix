@@ -50,12 +50,40 @@ static ssize_t write_console(struct telix_fd_entry *fde,
     return (ssize_t)written;
 }
 
+static ssize_t write_pipe(struct telix_fd_entry *fde,
+                           const unsigned char *p, size_t count) {
+    size_t remaining = count;
+    size_t written = 0;
+
+    while (remaining > 0) {
+        int chunk = (remaining > 16) ? 16 : (int)remaining;
+
+        uint64_t d0 = 0, d1 = 0;
+        if (chunk > 0)  d0 = pack_bytes(p, chunk > 8 ? 8 : chunk);
+        if (chunk > 8)  d1 = pack_bytes(p + 8, chunk - 8);
+
+        /* d2 = len | (reply_port << 32). Fire-and-forget. */
+        uint64_t d2 = (uint64_t)(uint32_t)chunk | ((uint64_t)0xFFFFFFFF << 32);
+
+        telix_send(fde->server_port, PIPE_WRITE_TAG,
+                   (uint64_t)fde->server_handle, d0, d2, d1);
+
+        p += chunk;
+        remaining -= chunk;
+        written += chunk;
+    }
+    return (ssize_t)written;
+}
+
 ssize_t write(int fd, const void *buf, size_t count) {
     struct telix_fd_entry *fde = telix_fd_get(fd);
     if (!fde) return -1;
 
     if (fde->fd_type == FD_TYPE_SOCKET)
         return send(fd, buf, count, 0);
+
+    if (fde->fd_type == FD_TYPE_PIPE)
+        return write_pipe(fde, (const unsigned char *)buf, count);
 
     /* Default: console write. */
     return write_console(fde, (const unsigned char *)buf, count);

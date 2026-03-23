@@ -110,3 +110,7 @@ path = "bin/procfs_srv.rs"
 [[bin]]
 name = "uds_srv"
 path = "bin/uds_srv.rs"
+
+[[bin]]
+name = "pipe_srv"
+path = "bin/pipe_srv.rs"
