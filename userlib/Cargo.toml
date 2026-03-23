@@ -106,3 +106,7 @@ path = "bin/devfs_srv.rs"
 [[bin]]
 name = "procfs_srv"
 path = "bin/procfs_srv.rs"
+
+[[bin]]
+name = "uds_srv"
+path = "bin/uds_srv.rs"

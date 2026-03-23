@@ -4717,6 +4717,267 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 57: Unix domain socket server ---
+    syscall::debug_puts(b"  init: testing uds...\n");
+    {
+        let uds_tid = syscall::spawn(b"uds_srv", 50);
+        if uds_tid == u64::MAX {
+            syscall::debug_puts(b"Phase 57 uds: FAILED (spawn)\n");
+        } else {
+            // Wait for server to register.
+            let mut uds_port = 0u32;
+            {
+                let mut tries = 0;
+                while tries < 200 {
+                    if let Some(p) = syscall::ns_lookup(b"uds") {
+                        uds_port = p;
+                        break;
+                    }
+                    syscall::yield_now();
+                    tries += 1;
+                }
+            }
+
+            let mut phase57_ok = uds_port != 0;
+            if !phase57_ok {
+                syscall::debug_puts(b"  FAIL: uds_srv not found\n");
+            }
+
+            // UDS protocol constants.
+            const UDS_SOCKET: u64 = 0x8000;
+            const UDS_BIND: u64 = 0x8010;
+            const UDS_LISTEN: u64 = 0x8020;
+            const UDS_CONNECT: u64 = 0x8030;
+            const UDS_ACCEPT: u64 = 0x8040;
+            const UDS_SEND: u64 = 0x8050;
+            const UDS_RECV: u64 = 0x8060;
+            const UDS_CLOSE: u64 = 0x8070;
+            const UDS_GETPEERCRED: u64 = 0x8080;
+            const UDS_OK: u64 = 0x8100;
+            #[allow(dead_code)]
+            const UDS_EOF: u64 = 0x81FF;
+
+            let reply_port = syscall::port_create() as u32;
+
+            // Helper: pack name into 2 u64 words.
+            let pack_name = |name: &[u8]| -> (u64, u64) {
+                let mut w0 = 0u64;
+                let mut w1 = 0u64;
+                let n = if name.len() < 16 { name.len() } else { 16 };
+                let mut i = 0;
+                while i < n && i < 8 {
+                    w0 |= (name[i] as u64) << (i * 8);
+                    i += 1;
+                }
+                while i < n {
+                    w1 |= (name[i] as u64) << ((i - 8) * 8);
+                    i += 1;
+                }
+                (w0, w1)
+            };
+
+            // 1. Create a server-side listening socket.
+            let mut srv_listen = u32::MAX;
+            if phase57_ok {
+                let d2 = (reply_port as u64) << 32;
+                syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0); // type=0 (STREAM)
+                if let Some(m) = syscall::recv_msg(reply_port) {
+                    if m.tag == UDS_OK {
+                        srv_listen = m.data[0] as u32;
+                    } else {
+                        syscall::debug_puts(b"  FAIL: UDS_SOCKET failed\n");
+                        phase57_ok = false;
+                    }
+                }
+            }
+
+            // 2. Bind to "test.sock".
+            if phase57_ok {
+                let (n0, n1) = pack_name(b"test.sock");
+                let name_len = 9u64;
+                let d2 = name_len | ((reply_port as u64) << 32);
+                syscall::send(uds_port, UDS_BIND, srv_listen as u64, n0, d2, n1);
+                if let Some(m) = syscall::recv_msg(reply_port) {
+                    if m.tag != UDS_OK {
+                        syscall::debug_puts(b"  FAIL: UDS_BIND failed\n");
+                        phase57_ok = false;
+                    }
+                }
+            }
+
+            // 3. Listen.
+            if phase57_ok {
+                let d2 = (reply_port as u64) << 32;
+                syscall::send(uds_port, UDS_LISTEN, srv_listen as u64, 4, d2, 0);
+                if let Some(m) = syscall::recv_msg(reply_port) {
+                    if m.tag != UDS_OK {
+                        syscall::debug_puts(b"  FAIL: UDS_LISTEN failed\n");
+                        phase57_ok = false;
+                    }
+                }
+            }
+
+            // 4. Connect (creates both endpoints, returns client-end).
+            let mut cli_end = u32::MAX;
+            if phase57_ok {
+                let (n0, n1) = pack_name(b"test.sock");
+                let name_len = 9u64;
+                let d2 = name_len | ((reply_port as u64) << 32);
+                let pid = syscall::getpid() as u64;
+                let uid = syscall::getuid() as u64;
+                let d3 = pid | (uid << 32);
+                syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, d3);
+                if let Some(m) = syscall::recv_msg(reply_port) {
+                    if m.tag == UDS_OK {
+                        cli_end = m.data[0] as u32;
+                    } else {
+                        syscall::debug_puts(b"  FAIL: UDS_CONNECT failed\n");
+                        phase57_ok = false;
+                    }
+                }
+            }
+
+            // 5. Accept (dequeues the server-end).
+            let mut srv_end = u32::MAX;
+            if phase57_ok {
+                let d2 = (reply_port as u64) << 32;
+                syscall::send(uds_port, UDS_ACCEPT, srv_listen as u64, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(reply_port) {
+                    if m.tag == UDS_OK {
+                        srv_end = m.data[0] as u32;
+                    } else {
+                        syscall::debug_puts(b"  FAIL: UDS_ACCEPT failed\n");
+                        phase57_ok = false;
+                    }
+                }
+            }
+
+            // 6. Client sends "hello" to server via cli_end.
+            if phase57_ok {
+                let (w0, w1) = pack_name(b"hello");
+                let d2 = 5u64 | ((reply_port as u64) << 32);
+                syscall::send(uds_port, UDS_SEND, cli_end as u64, w0, d2, w1);
+                if let Some(m) = syscall::recv_msg(reply_port) {
+                    if m.tag != UDS_OK || m.data[0] != 5 {
+                        syscall::debug_puts(b"  FAIL: UDS_SEND hello failed\n");
+                        phase57_ok = false;
+                    }
+                }
+            }
+
+            // 7. Server recvs on srv_end -> should get "hello".
+            if phase57_ok {
+                let d2 = (reply_port as u64) << 32;
+                syscall::send(uds_port, UDS_RECV, srv_end as u64, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(reply_port) {
+                    if m.tag != UDS_OK {
+                        syscall::debug_puts(b"  FAIL: UDS_RECV failed\n");
+                        phase57_ok = false;
+                    } else {
+                        let len = m.data[2] as usize;
+                        if len != 5 {
+                            syscall::debug_puts(b"  FAIL: recv len != 5\n");
+                            phase57_ok = false;
+                        } else {
+                            // Check first byte is 'h'.
+                            let b0 = (m.data[0] & 0xFF) as u8;
+                            if b0 != b'h' {
+                                syscall::debug_puts(b"  FAIL: recv data mismatch\n");
+                                phase57_ok = false;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 8. Server sends "world" back via srv_end.
+            if phase57_ok {
+                let (w0, w1) = pack_name(b"world");
+                let d2 = 5u64 | ((reply_port as u64) << 32);
+                syscall::send(uds_port, UDS_SEND, srv_end as u64, w0, d2, w1);
+                if let Some(m) = syscall::recv_msg(reply_port) {
+                    if m.tag != UDS_OK || m.data[0] != 5 {
+                        syscall::debug_puts(b"  FAIL: UDS_SEND world failed\n");
+                        phase57_ok = false;
+                    }
+                }
+            }
+
+            // 9. Client recvs on cli_end -> should get "world".
+            if phase57_ok {
+                let d2 = (reply_port as u64) << 32;
+                syscall::send(uds_port, UDS_RECV, cli_end as u64, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(reply_port) {
+                    if m.tag != UDS_OK {
+                        syscall::debug_puts(b"  FAIL: UDS_RECV world failed\n");
+                        phase57_ok = false;
+                    } else {
+                        let b0 = (m.data[0] & 0xFF) as u8;
+                        if b0 != b'w' {
+                            syscall::debug_puts(b"  FAIL: recv world mismatch\n");
+                            phase57_ok = false;
+                        }
+                    }
+                }
+            }
+
+            // 10. Getpeercred test on srv_end.
+            if phase57_ok {
+                let d2 = (reply_port as u64) << 32;
+                syscall::send(uds_port, UDS_GETPEERCRED, srv_end as u64, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(reply_port) {
+                    if m.tag != UDS_OK {
+                        syscall::debug_puts(b"  FAIL: UDS_GETPEERCRED failed\n");
+                        phase57_ok = false;
+                    } else {
+                        let pid = m.data[0] as u32;
+                        if pid == 0 {
+                            syscall::debug_puts(b"  FAIL: peercred pid=0\n");
+                            phase57_ok = false;
+                        }
+                    }
+                }
+            }
+
+            // 11. Close client end, verify server recv gets EOF.
+            if phase57_ok {
+                let d2 = (reply_port as u64) << 32;
+                syscall::send(uds_port, UDS_CLOSE, cli_end as u64, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(reply_port) {
+                    if m.tag != UDS_OK {
+                        syscall::debug_puts(b"  FAIL: UDS_CLOSE failed\n");
+                        phase57_ok = false;
+                    }
+                }
+            }
+            if phase57_ok {
+                let d2 = (reply_port as u64) << 32;
+                syscall::send(uds_port, UDS_RECV, srv_end as u64, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(reply_port) {
+                    if m.tag != UDS_EOF {
+                        syscall::debug_puts(b"  FAIL: expected EOF after close\n");
+                        phase57_ok = false;
+                    }
+                }
+            }
+
+            // Clean up.
+            if srv_end != u32::MAX {
+                let d2 = (reply_port as u64) << 32;
+                syscall::send(uds_port, UDS_CLOSE, srv_end as u64, 0, d2, 0);
+                let _ = syscall::recv_msg(reply_port);
+            }
+
+            syscall::port_destroy(reply_port);
+
+            if phase57_ok {
+                syscall::debug_puts(b"Phase 57 uds: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 57 uds: FAILED\n");
+            }
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
