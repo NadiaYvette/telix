@@ -49,14 +49,15 @@ $CC $CFLAGS -c "$MUSL/arch/$ARCH/crt_start.S" -o "$OUTDIR/crt_start.o"
 $CC $CFLAGS -c "$MUSL/arch/$ARCH/syscall.S"   -o "$OUTDIR/syscall.o"
 
 # Compile C sources.
-for src in ipc fd write read exit init socket pipe; do
+for src in ipc fd write read exit init socket pipe poll; do
     $CC $CFLAGS -c "$MUSL/src/$src.c" -o "$OUTDIR/$src.o"
 done
 
 # Common object files (runtime + library).
 COMMON_OBJS="$OUTDIR/crt_start.o $OUTDIR/syscall.o \
     $OUTDIR/ipc.o $OUTDIR/fd.o $OUTDIR/write.o $OUTDIR/read.o \
-    $OUTDIR/exit.o $OUTDIR/init.o $OUTDIR/socket.o $OUTDIR/pipe.o"
+    $OUTDIR/exit.o $OUTDIR/init.o $OUTDIR/socket.o $OUTDIR/pipe.o \
+    $OUTDIR/poll.o"
 
 # Link function — use ld.lld for cross-arch, clang for native.
 link_binary() {

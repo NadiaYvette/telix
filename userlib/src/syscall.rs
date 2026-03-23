@@ -305,6 +305,80 @@ pub fn port_set_add(set_id: u32, port_id: u32) -> bool {
     unsafe { arch::syscall2(SYS_PORT_SET_ADD, set_id as u64, port_id as u64) == 0 }
 }
 
+/// Blocking receive from any port in a port set.
+/// Returns (port_id, Message) on success, None if set is invalid.
+pub fn port_set_recv(set_id: u32) -> Option<(u32, Message)> {
+    let status: u64;
+    let r1: u64;
+    let r2: u64;
+    let r3: u64;
+    let r4: u64;
+    let r5: u64;
+    let r6: u64;
+    let r7: u64;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_PORT_SET_RECV,
+            inlateout("x0") set_id as u64 => status,
+            lateout("x1") r1,
+            lateout("x2") r2,
+            lateout("x3") r3,
+            lateout("x4") r4,
+            lateout("x5") r5,
+            lateout("x6") r6,
+            lateout("x7") r7,
+        );
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a7") SYS_PORT_SET_RECV as u64 => r7,
+            inlateout("a0") set_id as u64 => status,
+            lateout("a1") r1,
+            lateout("a2") r2,
+            lateout("a3") r3,
+            lateout("a4") r4,
+            lateout("a5") r5,
+            lateout("a6") r6,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "int 0x80",
+            "mov {r7}, rbx",
+            "pop rbx",
+            r7 = lateout(reg) r7,
+            inlateout("rax") SYS_PORT_SET_RECV => status,
+            inlateout("rdi") set_id as u64 => r1,
+            lateout("rsi") r2,
+            lateout("rdx") r3,
+            lateout("r10") r4,
+            lateout("r8") r5,
+            lateout("r9") r6,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+
+    // status: low bits = error code, high 32 bits = port_id on success.
+    if status & 0xFFFFFFFF == 1 {
+        return None; // invalid set
+    }
+    let port_id = (status >> 32) as u32;
+    Some((port_id, Message {
+        tag: r1,
+        data: [r2, r3, r4, r5, r6, r7],
+    }))
+}
+
 /// Pack a name (up to 24 bytes) into 3 u64 words.
 pub fn pack_name(name: &[u8]) -> (u64, u64, u64) {
     let mut words = [0u64; 3];

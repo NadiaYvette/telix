@@ -25,6 +25,8 @@
 #define SYS_NSRV_PORT       23
 #define SYS_GETPID          35
 #define SYS_EXECVE          54
+#define SYS_GET_CYCLES      36
+#define SYS_GET_TIMER_FREQ  37
 #define SYS_GETUID          75
 
 /* Raw syscall stubs (defined in arch/x86_64/syscall.S). */

@@ -53,7 +53,13 @@ struct telix_msg {
 #define PIPE_CLOSE_TAG   0x5040
 #define PIPE_OK_TAG      0x5100
 #define PIPE_EOF_TAG     0x51FF
+#define PIPE_POLL_TAG    0x5050
 #define PIPE_ERROR_TAG   0x5F00
+
+/* Poll protocol tags (Phase 60). */
+#define UDS_POLL_TAG     0x8090
+#define CON_POLL_TAG     0x3110
+#define CON_POLL_OK_TAG  0x3111
 
 /* IPC wrappers. */
 uint32_t telix_port_create(void);

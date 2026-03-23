@@ -21,6 +21,7 @@ const PIPE_CREATE: u64 = 0x5010;
 const PIPE_WRITE: u64 = 0x5020;
 const PIPE_READ: u64 = 0x5030;
 const PIPE_CLOSE: u64 = 0x5040;
+const PIPE_POLL: u64 = 0x5050;
 
 const PIPE_OK: u64 = 0x5100;
 const PIPE_EOF: u64 = 0x51FF;
@@ -268,6 +269,40 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 reply(reply_port, PIPE_OK, 0, 0, 0, 0);
+            }
+
+            PIPE_POLL => {
+                let handle = msg.data[0] as u32;
+                let events = (msg.data[2] & 0xFFFF) as u16;
+                let is_write = handle & 1 != 0;
+                let slot_idx = (handle / 2) as usize;
+
+                if slot_idx >= MAX_PIPES {
+                    reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
+                    continue;
+                }
+                let s = unsafe { &PIPES[slot_idx] };
+                if !s.active {
+                    reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
+                    continue;
+                }
+
+                let mut revents = 0u16;
+                if is_write {
+                    if s.reader_closed {
+                        revents |= 0x0008; // POLLERR
+                    } else if s.free() > 0 && (events & 0x0004 != 0) {
+                        revents |= 0x0004; // POLLOUT
+                    }
+                } else {
+                    if s.len() > 0 && (events & 0x0001 != 0) {
+                        revents |= 0x0001; // POLLIN
+                    }
+                    if s.writer_closed && s.len() == 0 {
+                        revents |= 0x0010; // POLLHUP
+                    }
+                }
+                reply(reply_port, PIPE_OK, revents as u64, 0, 0, 0);
             }
 
             _ => {

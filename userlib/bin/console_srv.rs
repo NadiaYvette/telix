@@ -15,6 +15,8 @@ const CON_READ: u64 = 0x3000;
 const CON_READ_OK: u64 = 0x3001;
 const CON_WRITE: u64 = 0x3100;
 const CON_WRITE_OK: u64 = 0x3101;
+const CON_POLL: u64 = 0x3110;
+const CON_POLL_OK: u64 = 0x3111;
 
 const MAX_LINE: usize = 64;
 
@@ -159,6 +161,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             match msg.tag {
                 CON_WRITE => srv.handle_write(&msg),
                 CON_READ => srv.handle_read(&msg),
+                CON_POLL => {
+                    let events = (msg.data[2] & 0xFFFF) as u16;
+                    let rp = (msg.data[2] >> 32) as u32;
+                    // Console is always writable. Not readable (yet).
+                    let mut revents = 0u16;
+                    if events & 0x0004 != 0 {
+                        revents |= 0x0004; // POLLOUT
+                    }
+                    syscall::send(rp, CON_POLL_OK, revents as u64, 0, 0, 0);
+                }
                 _ => {}
             }
         }

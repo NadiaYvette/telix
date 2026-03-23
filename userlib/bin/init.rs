@@ -5357,6 +5357,116 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 60: poll/select ---
+    syscall::debug_puts(b"  init: testing poll/select...\n");
+    {
+        // Reuse the pipe server from Phase 59 (already running).
+        let mut phase60_ok = true;
+
+        // 1. Create a fresh pipe for poll testing.
+        let (read_fd, write_fd) = match userlib::pipe::pipe() {
+            Some(p) => p,
+            None => {
+                syscall::debug_puts(b"  FAIL: pipe() returned None\n");
+                phase60_ok = false;
+                (-1, -1)
+            }
+        };
+
+        // 2. poll read end with no data, timeout=0 → should return 0 ready FDs.
+        if phase60_ok {
+            let mut fds = [userlib::poll::PollFd { fd: read_fd, events: userlib::poll::POLLIN, revents: 0 }];
+            let n = userlib::poll::poll(&mut fds, 0);
+            if n != 0 || fds[0].revents != 0 {
+                syscall::debug_puts(b"  FAIL: poll empty pipe returned ready\n");
+                phase60_ok = false;
+            }
+        }
+
+        // 3. Write data, poll read end → should return POLLIN.
+        if phase60_ok {
+            userlib::pipe::pipe_write_fd(write_fd, b"polltest");
+            let mut fds = [userlib::poll::PollFd { fd: read_fd, events: userlib::poll::POLLIN, revents: 0 }];
+            let n = userlib::poll::poll(&mut fds, 0);
+            if n != 1 || fds[0].revents & userlib::poll::POLLIN == 0 {
+                syscall::debug_puts(b"  FAIL: poll after write not POLLIN\n");
+                phase60_ok = false;
+            }
+        }
+
+        // 4. poll write end → should return POLLOUT (buffer has space).
+        if phase60_ok {
+            let mut fds = [userlib::poll::PollFd { fd: write_fd, events: userlib::poll::POLLOUT, revents: 0 }];
+            let n = userlib::poll::poll(&mut fds, 0);
+            if n != 1 || fds[0].revents & userlib::poll::POLLOUT == 0 {
+                syscall::debug_puts(b"  FAIL: poll write end not POLLOUT\n");
+                phase60_ok = false;
+            }
+        }
+
+        // 5. Close write end, drain remaining data, poll read end → should get POLLHUP.
+        if phase60_ok {
+            userlib::pipe::pipe_close_fd(write_fd);
+            // Drain remaining data (writer closed, so read won't block forever).
+            let mut buf = [0u8; 32];
+            while userlib::pipe::pipe_read_fd(read_fd, &mut buf) > 0 {}
+            let mut fds = [userlib::poll::PollFd { fd: read_fd, events: userlib::poll::POLLIN, revents: 0 }];
+            let n = userlib::poll::poll(&mut fds, 0);
+            if n != 1 || fds[0].revents & userlib::poll::POLLHUP == 0 {
+                syscall::debug_puts(b"  FAIL: poll after close not POLLHUP\n");
+                phase60_ok = false;
+            }
+            userlib::pipe::pipe_close_fd(read_fd);
+        } else {
+            if write_fd >= 0 { userlib::pipe::pipe_close_fd(write_fd); }
+            if read_fd >= 0 { userlib::pipe::pipe_close_fd(read_fd); }
+        }
+
+        // 6. poll with invalid FD → should get POLLNVAL.
+        if phase60_ok {
+            let mut fds = [userlib::poll::PollFd { fd: 62, events: userlib::poll::POLLIN, revents: 0 }];
+            let n = userlib::poll::poll(&mut fds, 0);
+            if n != 1 || fds[0].revents & userlib::poll::POLLNVAL == 0 {
+                syscall::debug_puts(b"  FAIL: poll invalid FD not POLLNVAL\n");
+                phase60_ok = false;
+            }
+        }
+
+        // 7. select() test: create pipe, check readfds/writefds.
+        if phase60_ok {
+            if let Some((r2, w2)) = userlib::pipe::pipe() {
+                userlib::pipe::pipe_write_fd(w2, b"sel");
+                let mut readfds: u64 = 1u64 << (r2 as u32);
+                let mut writefds: u64 = 1u64 << (w2 as u32);
+                let nfds = if r2 > w2 { r2 + 1 } else { w2 + 1 };
+                let n = userlib::poll::select(nfds, &mut readfds, &mut writefds, 0);
+                if n < 1 {
+                    syscall::debug_puts(b"  FAIL: select returned 0\n");
+                    phase60_ok = false;
+                }
+                if readfds & (1u64 << (r2 as u32)) == 0 {
+                    syscall::debug_puts(b"  FAIL: select readfds not set\n");
+                    phase60_ok = false;
+                }
+                if writefds & (1u64 << (w2 as u32)) == 0 {
+                    syscall::debug_puts(b"  FAIL: select writefds not set\n");
+                    phase60_ok = false;
+                }
+                userlib::pipe::pipe_close_fd(w2);
+                userlib::pipe::pipe_close_fd(r2);
+            } else {
+                syscall::debug_puts(b"  FAIL: pipe() for select test\n");
+                phase60_ok = false;
+            }
+        }
+
+        if phase60_ok {
+            syscall::debug_puts(b"Phase 60 poll/select: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 60 poll/select: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

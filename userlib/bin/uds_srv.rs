@@ -31,6 +31,7 @@ const UDS_SEND: u64 = 0x8050;
 const UDS_RECV: u64 = 0x8060;
 const UDS_CLOSE: u64 = 0x8070;
 const UDS_GETPEERCRED: u64 = 0x8080;
+const UDS_POLL: u64 = 0x8090;
 
 const UDS_OK: u64 = 0x8100;
 const UDS_EOF: u64 = 0x81FF;
@@ -517,6 +518,50 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     0,
                     0,
                 );
+            }
+
+            UDS_POLL => {
+                let handle = msg.data[0] as u32;
+                let events = (msg.data[2] & 0xFFFF) as u16;
+                if handle as usize >= MAX_SOCKETS {
+                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    continue;
+                }
+                let s = unsafe { &SOCKS[handle as usize] };
+                if s.state == SockState::Free {
+                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    continue;
+                }
+
+                let mut revents = 0u16;
+                match s.state {
+                    SockState::Listening => {
+                        // POLLIN if pending connections available.
+                        if s.pending_count > 0 && (events & 0x0001 != 0) {
+                            revents |= 0x0001; // POLLIN
+                        }
+                    }
+                    SockState::Connected => {
+                        // POLLIN if rx data or EOF.
+                        if (s.rx_len() > 0 || s.rx_eof) && (events & 0x0001 != 0) {
+                            revents |= 0x0001; // POLLIN
+                        }
+                        if s.rx_eof && s.rx_len() == 0 {
+                            revents |= 0x0010; // POLLHUP
+                        }
+                        // POLLOUT — always writable (ring buffer, fire-and-forget).
+                        if events & 0x0004 != 0 {
+                            revents |= 0x0004; // POLLOUT
+                        }
+                    }
+                    SockState::Closed => {
+                        revents |= 0x0010; // POLLHUP
+                    }
+                    _ => {
+                        revents |= 0x0020; // POLLNVAL
+                    }
+                }
+                reply(reply_port, UDS_OK, revents as u64, 0, 0, 0);
             }
 
             _ => {
