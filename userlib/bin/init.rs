@@ -3899,6 +3899,200 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 53: ext2 write support ---
+    syscall::debug_puts(b"  init: testing ext2 write...\n");
+    {
+        let ext2_port = match syscall::ns_lookup(b"ext2") {
+            Some(p) => p,
+            None => 0,
+        };
+        let mut phase53_ok = ext2_port != 0;
+        if !phase53_ok {
+            syscall::debug_puts(b"Phase 53 ext2 write: SKIPPED (no ext2)\n");
+        }
+
+        let reply_port = if phase53_ok { syscall::port_create() as u32 } else { 0 };
+
+        // Step 1: FS_CREATE "WTEST.TXT"
+        let mut handle = 0u64;
+        let mut srv_aspace = 0u32;
+        if phase53_ok {
+            let fname = b"WTEST.TXT";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((reply_port as u64) << 32);
+            syscall::send(ext2_port, 0x2500, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(reply_port) {
+                if reply.tag == 0x2501 {
+                    handle = reply.data[0];
+                    srv_aspace = reply.data[2] as u32;
+                } else {
+                    syscall::debug_puts(b"  FAIL: ext2 FS_CREATE failed\n");
+                    phase53_ok = false;
+                }
+            } else {
+                syscall::debug_puts(b"  FAIL: ext2 FS_CREATE no reply\n");
+                phase53_ok = false;
+            }
+        }
+
+        // Step 2: FS_WRITE 64 bytes of known pattern
+        if phase53_ok {
+            if let Some(scratch) = syscall::mmap_anon(0, 1, 1) {
+                // Fill with pattern: byte[i] = (i * 7 + 0x41) & 0xFF
+                unsafe {
+                    let p = scratch as *mut u8;
+                    for i in 0..64 {
+                        *p.add(i) = ((i * 7 + 0x41) & 0xFF) as u8;
+                    }
+                }
+                let grant_dst: usize = 0x8_0000_0000;
+                let grant_ok = syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false);
+                if grant_ok {
+                    let wd1 = 64u64 | ((reply_port as u64) << 32);
+                    syscall::send(ext2_port, 0x2600, handle, wd1, grant_dst as u64, 0);
+                    if let Some(wr) = syscall::recv_msg(reply_port) {
+                        if wr.tag != 0x2601 || wr.data[0] != 64 {
+                            syscall::debug_puts(b"  FAIL: ext2 FS_WRITE bad reply\n");
+                            phase53_ok = false;
+                        }
+                    } else {
+                        phase53_ok = false;
+                    }
+                    syscall::revoke(srv_aspace, grant_dst);
+                } else {
+                    syscall::debug_puts(b"  FAIL: ext2 grant failed\n");
+                    phase53_ok = false;
+                }
+                syscall::munmap(scratch);
+            } else {
+                phase53_ok = false;
+            }
+        }
+
+        // Step 3: FS_CLOSE (triggers inode flush)
+        if phase53_ok {
+            syscall::send(ext2_port, 0x2400, handle, 0, 0, 0);
+            syscall::sleep_ms(50); // Wait for disk I/O
+        }
+
+        // Step 4: Re-open and verify
+        if phase53_ok {
+            let fname = b"WTEST.TXT";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((reply_port as u64) << 32);
+            syscall::send(ext2_port, 0x2000, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(reply_port) {
+                if reply.tag == 0x2001 {
+                    let rh = reply.data[0];
+                    let rsize = reply.data[1];
+                    let r_aspace = reply.data[2] as u32;
+                    if rsize != 64 {
+                        syscall::debug_puts(b"  FAIL: ext2 re-open size mismatch\n");
+                        phase53_ok = false;
+                    }
+
+                    // FS_READ via grant
+                    if phase53_ok {
+                        if let Some(scratch) = syscall::mmap_anon(0, 1, 1) {
+                            let grant_dst: usize = 0x8_0000_0000;
+                            if syscall::grant_pages(r_aspace, scratch, grant_dst, 1, false) {
+                                let rd2 = 64u64 | ((reply_port as u64) << 32);
+                                syscall::send(ext2_port, 0x2100, rh, 0, rd2, grant_dst as u64);
+                                if let Some(rd) = syscall::recv_msg(reply_port) {
+                                    if rd.tag == 0x2101 && rd.data[0] == 64 {
+                                        // Verify pattern
+                                        let p = scratch as *const u8;
+                                        let mut mismatch = false;
+                                        for i in 0..64 {
+                                            let expected = ((i * 7 + 0x41) & 0xFF) as u8;
+                                            let got = unsafe { *p.add(i) };
+                                            if got != expected {
+                                                mismatch = true;
+                                                break;
+                                            }
+                                        }
+                                        if mismatch {
+                                            syscall::debug_puts(b"  FAIL: ext2 read-back mismatch\n");
+                                            phase53_ok = false;
+                                        }
+                                    } else {
+                                        syscall::debug_puts(b"  FAIL: ext2 FS_READ bad reply\n");
+                                        phase53_ok = false;
+                                    }
+                                } else { phase53_ok = false; }
+                                syscall::revoke(r_aspace, grant_dst);
+                            } else { phase53_ok = false; }
+                            syscall::munmap(scratch);
+                        } else { phase53_ok = false; }
+                    }
+
+                    // Close the re-opened file.
+                    syscall::send(ext2_port, 0x2400, rh, 0, 0, 0);
+                } else {
+                    syscall::debug_puts(b"  FAIL: ext2 re-open not found\n");
+                    phase53_ok = false;
+                }
+            } else { phase53_ok = false; }
+        }
+
+        // Step 5: FS_DELETE "WTEST.TXT"
+        if phase53_ok {
+            let fname = b"WTEST.TXT";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((reply_port as u64) << 32);
+            syscall::send(ext2_port, 0x2700, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(reply_port) {
+                if reply.tag != 0x2701 {
+                    syscall::debug_puts(b"  FAIL: ext2 FS_DELETE failed\n");
+                    phase53_ok = false;
+                }
+            } else { phase53_ok = false; }
+        }
+
+        // Step 6: Verify file is gone
+        if phase53_ok {
+            syscall::sleep_ms(20);
+            let fname = b"WTEST.TXT";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((reply_port as u64) << 32);
+            syscall::send(ext2_port, 0x2000, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(reply_port) {
+                if reply.tag == 0x2001 {
+                    // File still exists — fail.
+                    syscall::debug_puts(b"  FAIL: ext2 file not deleted\n");
+                    // Close the handle we got.
+                    syscall::send(ext2_port, 0x2400, reply.data[0], 0, 0, 0);
+                    phase53_ok = false;
+                }
+                // FS_ERROR (not found) is the expected response.
+            }
+        }
+
+        // Step 7: Verify pre-existing "hello.txt" still works
+        if phase53_ok {
+            let fname = b"hello.txt";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((reply_port as u64) << 32);
+            syscall::send(ext2_port, 0x2000, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(reply_port) {
+                if reply.tag == 0x2001 {
+                    syscall::send(ext2_port, 0x2400, reply.data[0], 0, 0, 0);
+                } else {
+                    syscall::debug_puts(b"  FAIL: ext2 hello.txt corrupted\n");
+                    phase53_ok = false;
+                }
+            } else { phase53_ok = false; }
+        }
+
+        if reply_port != 0 { syscall::port_destroy(reply_port); }
+
+        if phase53_ok {
+            syscall::debug_puts(b"Phase 53 ext2 write: PASSED\n");
+        } else if ext2_port != 0 {
+            syscall::debug_puts(b"Phase 53 ext2 write: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

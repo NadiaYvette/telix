@@ -16,6 +16,8 @@ const IO_CONNECT: u64 = 0x100;
 const IO_CONNECT_OK: u64 = 0x101;
 const IO_READ: u64 = 0x200;
 const IO_READ_OK: u64 = 0x201;
+const IO_WRITE: u64 = 0x300;
+const IO_WRITE_OK: u64 = 0x301;
 
 // --- FS protocol constants (served by this server) ---
 const FS_OPEN: u64 = 0x2000;
@@ -28,6 +30,12 @@ const FS_READDIR_END: u64 = 0x2202;
 const FS_STAT: u64 = 0x2300;
 const FS_STAT_OK: u64 = 0x2301;
 const FS_CLOSE: u64 = 0x2400;
+const FS_CREATE: u64 = 0x2500;
+const FS_CREATE_OK: u64 = 0x2501;
+const FS_WRITE: u64 = 0x2600;
+const FS_WRITE_OK: u64 = 0x2601;
+const FS_DELETE: u64 = 0x2700;
+const FS_DELETE_OK: u64 = 0x2701;
 const FS_ERROR: u64 = 0x2F00;
 
 const ERR_NOT_FOUND: u64 = 1;
@@ -94,6 +102,18 @@ fn read_u32(buf: &[u8], off: usize) -> u32 {
         | ((buf[off + 3] as u32) << 24)
 }
 
+fn write_u16(buf: &mut [u8], off: usize, val: u16) {
+    buf[off] = val as u8;
+    buf[off + 1] = (val >> 8) as u8;
+}
+
+fn write_u32(buf: &mut [u8], off: usize, val: u32) {
+    buf[off] = val as u8;
+    buf[off + 1] = (val >> 8) as u8;
+    buf[off + 2] = (val >> 16) as u8;
+    buf[off + 3] = (val >> 24) as u8;
+}
+
 fn pack_inline_data(data: &[u8]) -> [u64; 3] {
     let mut words = [0u64; 3];
     for (i, &b) in data.iter().enumerate().take(MAX_INLINE) {
@@ -116,6 +136,9 @@ fn unpack_name(d0: u64, d1: u64, len: usize) -> [u8; 24] {
 struct Superblock {
     inodes_count: u32,
     blocks_count: u32,
+    free_blocks_count: u32,
+    free_inodes_count: u32,
+    first_data_block: u32,
     block_size: u32,       // in bytes (1024 << s_log_block_size)
     blocks_per_group: u32,
     inodes_per_group: u32,
@@ -124,6 +147,8 @@ struct Superblock {
 }
 
 struct BlockGroupDesc {
+    block_bitmap: u32,     // block number of block bitmap
+    inode_bitmap: u32,     // block number of inode bitmap
     inode_table: u32,      // block number of inode table start
 }
 
@@ -136,6 +161,7 @@ struct OpenFile {
     gid: u16,
     block_ptrs: [u32; 15], // i_block[0..14]
     active: bool,
+    writable: bool,
 }
 
 impl OpenFile {
@@ -148,6 +174,7 @@ impl OpenFile {
             gid: 0,
             block_ptrs: [0; 15],
             active: false,
+            writable: false,
         }
     }
 }
@@ -250,6 +277,100 @@ impl BlkClient {
 
             syscall::revoke(self.blk_aspace, self.grant_va);
             if !ok { return false; }
+        }
+        true
+    }
+    /// Write a 512-byte sector at absolute byte offset.
+    fn write_sector(&self, abs_byte_off: u64, data: &[u8; 512]) -> bool {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.scratch_va as *mut u8,
+                512,
+            );
+        }
+        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
+            return false;
+        }
+        let d2 = 512u64 | ((self.reply_port as u64) << 32);
+        syscall::send(self.blk_port, IO_WRITE, 0, abs_byte_off, d2, self.grant_va as u64);
+        let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
+            rr.tag == IO_WRITE_OK
+        } else {
+            false
+        };
+        syscall::revoke(self.blk_aspace, self.grant_va);
+        ok
+    }
+
+    /// Read-modify-write: write `data` bytes at byte offset `off` (relative to partition).
+    /// Must fit within a single 512-byte sector.
+    fn write_bytes(&self, off: u64, data: &[u8]) -> bool {
+        let abs_off = self.partition_offset + off;
+        let sector_start = (abs_off / 512) * 512;
+        let offset_in_sector = (abs_off % 512) as usize;
+
+        // Read the existing sector.
+        let mut sec = [0u8; 512];
+        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
+            return false;
+        }
+        let d2 = 512u64 | ((self.reply_port as u64) << 32);
+        syscall::send(self.blk_port, IO_READ, 0, sector_start, d2, self.grant_va as u64);
+        let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
+            if rr.tag == IO_READ_OK {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        self.scratch_va as *const u8,
+                        sec.as_mut_ptr(),
+                        512,
+                    );
+                }
+                true
+            } else { false }
+        } else { false };
+        syscall::revoke(self.blk_aspace, self.grant_va);
+        if !ok { return false; }
+
+        // Patch in our data.
+        let copy_len = data.len().min(512 - offset_in_sector);
+        sec[offset_in_sector..offset_in_sector + copy_len].copy_from_slice(&data[..copy_len]);
+
+        // Write sector back.
+        self.write_sector(sector_start, &sec)
+    }
+
+    /// Write a full block from memory at `src` to disk.
+    fn write_block(&self, block_num: u32, block_size: u32, src: usize) -> bool {
+        let byte_off = (block_num as u64) * (block_size as u64);
+        let abs_off = self.partition_offset + byte_off;
+        let sectors = block_size / 512;
+        if sectors == 0 {
+            // block_size < 512
+            let mut sec = [0u8; 512];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src as *const u8,
+                    sec.as_mut_ptr(),
+                    block_size as usize,
+                );
+            }
+            return self.write_bytes(byte_off, &sec[..block_size as usize]);
+        }
+
+        for s in 0..sectors {
+            let mut sec = [0u8; 512];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (src + (s as usize) * 512) as *const u8,
+                    sec.as_mut_ptr(),
+                    512,
+                );
+            }
+            let sector_byte = abs_off + (s as u64) * 512;
+            if !self.write_sector(sector_byte, &sec) {
+                return false;
+            }
         }
         true
     }
@@ -470,6 +591,267 @@ fn dir_next_entry(
     None
 }
 
+// --- ext2 write support ---
+
+/// Allocate a block from the block bitmap. Returns block number or None.
+fn alloc_block(
+    blk: &BlkClient, sb: &mut Superblock, bgd: &BlockGroupDesc, bitmap_buf: usize,
+) -> Option<u32> {
+    if sb.free_blocks_count == 0 { return None; }
+    // Read block bitmap.
+    if !blk.read_block(bgd.block_bitmap, sb.block_size, bitmap_buf) { return None; }
+    let bitmap = unsafe {
+        core::slice::from_raw_parts_mut(bitmap_buf as *mut u8, sb.block_size as usize)
+    };
+    // Scan for first zero bit, starting after first_data_block.
+    let start = sb.first_data_block as usize;
+    for bit in start..sb.blocks_count as usize {
+        let byte = bit / 8;
+        let mask = 1u8 << (bit % 8);
+        if byte < bitmap.len() && bitmap[byte] & mask == 0 {
+            bitmap[byte] |= mask;
+            // Write bitmap back.
+            if !blk.write_block(bgd.block_bitmap, sb.block_size, bitmap_buf) { return None; }
+            sb.free_blocks_count -= 1;
+            return Some(bit as u32);
+        }
+    }
+    None
+}
+
+/// Free a block in the block bitmap.
+fn free_block(
+    blk: &BlkClient, sb: &mut Superblock, bgd: &BlockGroupDesc,
+    block_num: u32, bitmap_buf: usize,
+) {
+    if !blk.read_block(bgd.block_bitmap, sb.block_size, bitmap_buf) { return; }
+    let bitmap = unsafe {
+        core::slice::from_raw_parts_mut(bitmap_buf as *mut u8, sb.block_size as usize)
+    };
+    let byte = block_num as usize / 8;
+    let mask = 1u8 << (block_num as usize % 8);
+    if byte < bitmap.len() {
+        bitmap[byte] &= !mask;
+        blk.write_block(bgd.block_bitmap, sb.block_size, bitmap_buf);
+        sb.free_blocks_count += 1;
+    }
+}
+
+/// Allocate an inode from the inode bitmap. Returns 1-based inode number or None.
+fn alloc_inode(
+    blk: &BlkClient, sb: &mut Superblock, bgd: &BlockGroupDesc, bitmap_buf: usize,
+) -> Option<u32> {
+    if sb.free_inodes_count == 0 { return None; }
+    if !blk.read_block(bgd.inode_bitmap, sb.block_size, bitmap_buf) { return None; }
+    let bitmap = unsafe {
+        core::slice::from_raw_parts_mut(bitmap_buf as *mut u8, sb.block_size as usize)
+    };
+    // Inode bitmap bit 0 = inode 1. Skip reserved inodes (0..10 typically, but scan from 0).
+    // ext2 reserves inodes 1-10 by convention, but the bitmap should already mark them.
+    for bit in 0..sb.inodes_per_group as usize {
+        let byte = bit / 8;
+        let mask = 1u8 << (bit % 8);
+        if byte < bitmap.len() && bitmap[byte] & mask == 0 {
+            bitmap[byte] |= mask;
+            if !blk.write_block(bgd.inode_bitmap, sb.block_size, bitmap_buf) { return None; }
+            sb.free_inodes_count -= 1;
+            return Some(bit as u32 + 1); // 1-based
+        }
+    }
+    None
+}
+
+/// Free an inode in the inode bitmap.
+fn free_inode(
+    blk: &BlkClient, sb: &mut Superblock, bgd: &BlockGroupDesc,
+    inode_num: u32, bitmap_buf: usize,
+) {
+    let bit = (inode_num - 1) as usize;
+    if !blk.read_block(bgd.inode_bitmap, sb.block_size, bitmap_buf) { return; }
+    let bitmap = unsafe {
+        core::slice::from_raw_parts_mut(bitmap_buf as *mut u8, sb.block_size as usize)
+    };
+    let byte = bit / 8;
+    let mask = 1u8 << (bit % 8);
+    if byte < bitmap.len() {
+        bitmap[byte] &= !mask;
+        blk.write_block(bgd.inode_bitmap, sb.block_size, bitmap_buf);
+        sb.free_inodes_count += 1;
+    }
+}
+
+/// Write an inode to disk.
+fn write_inode(
+    blk: &BlkClient, sb: &Superblock, bgd: &BlockGroupDesc,
+    inode_num: u32, mode: u16, uid: u16, gid: u16, size: u32, block_ptrs: &[u32; 15],
+) -> bool {
+    let idx = inode_num - 1;
+    let inode_offset = (bgd.inode_table as u64) * (sb.block_size as u64)
+        + (idx as u64) * (sb.inode_size as u64);
+
+    // Read existing inode data to preserve fields we don't modify.
+    let mut inode_buf = [0u8; 128];
+    let sector_off = inode_offset % 512;
+    let bytes_in_first = (512 - sector_off as usize).min(128);
+    if !blk.read_bytes(inode_offset, &mut inode_buf[..bytes_in_first]) {
+        return false;
+    }
+    if bytes_in_first < 128 {
+        if !blk.read_bytes(inode_offset + bytes_in_first as u64,
+                           &mut inode_buf[bytes_in_first..128]) {
+            return false;
+        }
+    }
+
+    // Patch fields.
+    write_u16(&mut inode_buf, 0, mode);
+    write_u16(&mut inode_buf, 2, uid);
+    write_u32(&mut inode_buf, 4, size);
+    write_u16(&mut inode_buf, 24, gid);
+    // i_blocks: count of 512-byte blocks used by the file.
+    let used_blocks = block_ptrs.iter().filter(|&&b| b != 0).count() as u32;
+    write_u32(&mut inode_buf, 28, used_blocks * (sb.block_size / 512));
+    for i in 0..15 {
+        write_u32(&mut inode_buf, 40 + i * 4, block_ptrs[i]);
+    }
+
+    // Write back (may span sector boundary).
+    if !blk.write_bytes(inode_offset, &inode_buf[..bytes_in_first]) {
+        return false;
+    }
+    if bytes_in_first < 128 {
+        if !blk.write_bytes(inode_offset + bytes_in_first as u64,
+                            &inode_buf[bytes_in_first..128]) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Flush superblock free counts back to disk.
+fn flush_superblock(blk: &BlkClient, sb: &Superblock) {
+    // Superblock is at partition offset 1024. We need to update offsets 12 and 16.
+    let mut sb_buf = [0u8; 64];
+    if !blk.read_bytes(1024, &mut sb_buf) { return; }
+    write_u32(&mut sb_buf, 12, sb.free_blocks_count);
+    write_u32(&mut sb_buf, 16, sb.free_inodes_count);
+    blk.write_bytes(1024, &sb_buf);
+}
+
+/// Add a directory entry to the root directory.
+/// Returns true on success.
+fn dir_add_entry(
+    blk: &BlkClient, sb: &Superblock,
+    dir_block_ptrs: &[u32; 15], dir_size: u32,
+    name: &[u8], name_len: usize, inode_num: u32, file_type: u8,
+    scratch_page: usize, block_buf: usize,
+) -> bool {
+    let block_size = sb.block_size;
+    let num_blocks = (dir_size + block_size - 1) / block_size;
+    // Required space: 8 bytes header + name rounded up to 4-byte alignment.
+    let needed = 8 + ((name_len + 3) & !3);
+
+    for b in 0..num_blocks {
+        let phys = match resolve_block(blk, sb, dir_block_ptrs, b, scratch_page) {
+            Some(p) => p,
+            None => continue,
+        };
+        if !blk.read_block(phys, block_size, block_buf) { continue; }
+
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(block_buf as *mut u8, block_size as usize)
+        };
+        let mut off = 0usize;
+        while off < block_size as usize {
+            let ino = read_u32(buf, off);
+            let rec_len = read_u16(buf, off + 4) as usize;
+            if rec_len == 0 { break; }
+            let nlen = buf[off + 6] as usize;
+
+            if ino == 0 && rec_len >= needed {
+                // Free entry — reuse it.
+                write_u32(buf, off, inode_num);
+                write_u16(buf, off + 4, rec_len as u16);
+                buf[off + 6] = name_len as u8;
+                buf[off + 7] = file_type;
+                buf[off + 8..off + 8 + name_len].copy_from_slice(&name[..name_len]);
+                return blk.write_block(phys, block_size, block_buf);
+            }
+
+            // Check if current entry has slack space we can split.
+            let actual = 8 + ((nlen + 3) & !3);
+            if ino != 0 && rec_len >= actual + needed {
+                // Split: shrink current entry, create new entry in slack.
+                let new_off = off + actual;
+                let new_rec_len = rec_len - actual;
+                write_u16(buf, off + 4, actual as u16);
+                write_u32(buf, new_off, inode_num);
+                write_u16(buf, new_off + 4, new_rec_len as u16);
+                buf[new_off + 6] = name_len as u8;
+                buf[new_off + 7] = file_type;
+                buf[new_off + 8..new_off + 8 + name_len].copy_from_slice(&name[..name_len]);
+                return blk.write_block(phys, block_size, block_buf);
+            }
+
+            off += rec_len;
+        }
+    }
+    false
+}
+
+/// Remove a directory entry by name. Returns the removed inode number, or None.
+fn dir_remove_entry(
+    blk: &BlkClient, sb: &Superblock,
+    dir_block_ptrs: &[u32; 15], dir_size: u32,
+    name: &[u8], name_len: usize,
+    scratch_page: usize, block_buf: usize,
+) -> Option<u32> {
+    let block_size = sb.block_size;
+    let num_blocks = (dir_size + block_size - 1) / block_size;
+
+    for b in 0..num_blocks {
+        let phys = match resolve_block(blk, sb, dir_block_ptrs, b, scratch_page) {
+            Some(p) => p,
+            None => continue,
+        };
+        if !blk.read_block(phys, block_size, block_buf) { continue; }
+
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(block_buf as *mut u8, block_size as usize)
+        };
+        let mut off = 0usize;
+        let mut prev_off: Option<usize> = None;
+        while off < block_size as usize {
+            let ino = read_u32(buf, off);
+            let rec_len = read_u16(buf, off + 4) as usize;
+            if rec_len == 0 { break; }
+            let nlen = buf[off + 6] as usize;
+
+            if ino != 0 && nlen == name_len {
+                let mut matches = true;
+                for i in 0..name_len {
+                    if buf[off + 8 + i] != name[i] { matches = false; break; }
+                }
+                if matches {
+                    // Found it. Merge with previous entry or zero inode.
+                    if let Some(po) = prev_off {
+                        let prev_rec = read_u16(buf, po + 4) as usize;
+                        write_u16(buf, po + 4, (prev_rec + rec_len) as u16);
+                    } else {
+                        write_u32(buf, off, 0); // zero inode
+                    }
+                    blk.write_block(phys, block_size, block_buf);
+                    return Some(ino);
+                }
+            }
+
+            prev_off = Some(off);
+            off += rec_len;
+        }
+    }
+    None
+}
+
 #[unsafe(no_mangle)]
 fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  [ext2_srv] starting\n");
@@ -554,9 +936,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let log_block_size = read_u32(&sb_buf, 24);
     let block_size = 1024u32 << log_block_size;
 
-    let sb = Superblock {
+    let mut sb = Superblock {
         inodes_count: read_u32(&sb_buf, 0),
         blocks_count: read_u32(&sb_buf, 4),
+        free_blocks_count: read_u32(&sb_buf, 12),
+        free_inodes_count: read_u32(&sb_buf, 16),
+        first_data_block: read_u32(&sb_buf, 20),
         block_size,
         blocks_per_group: read_u32(&sb_buf, 32),
         inodes_per_group: read_u32(&sb_buf, 40),
@@ -587,6 +972,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
     // We only support a single block group for the 16 MiB partition.
     let bgd = BlockGroupDesc {
+        block_bitmap: read_u32(&bgd_buf, 0),
+        inode_bitmap: read_u32(&bgd_buf, 4),
         inode_table: read_u32(&bgd_buf, 8),
     };
 
@@ -823,8 +1210,309 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             FS_CLOSE => {
                 let handle = msg.data[0] as usize;
                 if handle < MAX_OPEN_FILES && open_files[handle].active {
+                    if open_files[handle].writable {
+                        // Flush inode with updated size and block pointers.
+                        let f = &open_files[handle];
+                        write_inode(&blk, &sb, &bgd, f.inode_num,
+                            f.mode, f.uid, f.gid, f.file_size, &f.block_ptrs);
+                        flush_superblock(&blk, &sb);
+                    }
                     open_files[handle].active = false;
+                    open_files[handle].writable = false;
                 }
+            }
+
+            FS_CREATE => {
+                let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
+                let reply_port = (msg.data[2] >> 32) as u32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                // Allocate inode.
+                let ino = match alloc_inode(&blk, &mut sb, &bgd, block_buf_va) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Allocate first data block.
+                let first_block = match alloc_block(&blk, &mut sb, &bgd, block_buf_va) {
+                    Some(b) => b,
+                    None => {
+                        // Roll back inode.
+                        free_inode(&blk, &mut sb, &bgd, ino, block_buf_va);
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Zero out the first data block.
+                unsafe {
+                    core::ptr::write_bytes(block_buf_va as *mut u8, 0, sb.block_size as usize);
+                }
+                blk.write_block(first_block, sb.block_size, block_buf_va);
+
+                // Initialize inode: regular file, mode 0644.
+                let mut block_ptrs = [0u32; 15];
+                block_ptrs[0] = first_block;
+                write_inode(&blk, &sb, &bgd, ino, 0o100644, 0, 0, 0, &block_ptrs);
+
+                // Add directory entry to root.
+                let root = match read_inode(&blk, &sb, &bgd, EXT2_ROOT_INO) {
+                    Some(r) => r,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+                let (_, _, _, root_size, root_blocks) = root;
+                if !dir_add_entry(&blk, &sb, &root_blocks, root_size,
+                    name, name_len.min(16), ino, 1, indirect_buf_va, block_buf_va) {
+                    syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                    continue;
+                }
+
+                flush_superblock(&blk, &sb);
+
+                // Allocate handle.
+                let mut handle = u64::MAX;
+                for (i, f) in open_files.iter_mut().enumerate() {
+                    if !f.active {
+                        f.active = true;
+                        f.writable = true;
+                        f.inode_num = ino;
+                        f.file_size = 0;
+                        f.mode = 0o100644;
+                        f.uid = 0;
+                        f.gid = 0;
+                        f.block_ptrs = block_ptrs;
+                        handle = i as u64;
+                        break;
+                    }
+                }
+                if handle == u64::MAX {
+                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                } else {
+                    syscall::send(reply_port, FS_CREATE_OK,
+                        handle, 0, my_aspace as u64, 0);
+                }
+            }
+
+            FS_WRITE => {
+                let handle = msg.data[0] as usize;
+                let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
+                let reply_port = (msg.data[1] >> 32) as u32;
+                let grant_va = msg.data[2] as usize;
+
+                if handle >= MAX_OPEN_FILES || !open_files[handle].active
+                    || !open_files[handle].writable
+                {
+                    if reply_port != 0 {
+                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    }
+                    continue;
+                }
+
+                let mut written = 0usize;
+                let mut offset = open_files[handle].file_size;
+
+                while written < length {
+                    let block_idx = offset / sb.block_size;
+                    let offset_in_block = (offset % sb.block_size) as usize;
+                    let space_in_block = (sb.block_size as usize) - offset_in_block;
+                    let chunk = (length - written).min(space_in_block);
+
+                    // Ensure we have a block allocated.
+                    if block_idx < 12 {
+                        if open_files[handle].block_ptrs[block_idx as usize] == 0 {
+                            match alloc_block(&blk, &mut sb, &bgd, block_buf_va) {
+                                Some(b) => {
+                                    open_files[handle].block_ptrs[block_idx as usize] = b;
+                                    // Zero the new block.
+                                    unsafe {
+                                        core::ptr::write_bytes(
+                                            block_buf_va as *mut u8, 0,
+                                            sb.block_size as usize,
+                                        );
+                                    }
+                                    blk.write_block(b, sb.block_size, block_buf_va);
+                                }
+                                None => break,
+                            }
+                        }
+                    } else {
+                        // Single indirect block support.
+                        let ind_idx = block_idx - 12;
+                        let ptrs_per_block = sb.block_size / 4;
+                        if ind_idx < ptrs_per_block {
+                            // Ensure indirect block exists.
+                            if open_files[handle].block_ptrs[12] == 0 {
+                                match alloc_block(&blk, &mut sb, &bgd, block_buf_va) {
+                                    Some(b) => {
+                                        open_files[handle].block_ptrs[12] = b;
+                                        unsafe {
+                                            core::ptr::write_bytes(
+                                                block_buf_va as *mut u8, 0,
+                                                sb.block_size as usize,
+                                            );
+                                        }
+                                        blk.write_block(b, sb.block_size, block_buf_va);
+                                    }
+                                    None => break,
+                                }
+                            }
+                            // Read indirect block.
+                            let ind_blk = open_files[handle].block_ptrs[12];
+                            if !blk.read_block(ind_blk, sb.block_size, indirect_buf_va) {
+                                break;
+                            }
+                            let ptr = unsafe {
+                                core::ptr::read(
+                                    (indirect_buf_va + (ind_idx as usize) * 4) as *const u32
+                                )
+                            };
+                            if ptr == 0 {
+                                match alloc_block(&blk, &mut sb, &bgd, block_buf_va) {
+                                    Some(b) => {
+                                        unsafe {
+                                            core::ptr::write(
+                                                (indirect_buf_va + (ind_idx as usize) * 4) as *mut u32,
+                                                b,
+                                            );
+                                        }
+                                        blk.write_block(ind_blk, sb.block_size, indirect_buf_va);
+                                        // Zero new data block.
+                                        unsafe {
+                                            core::ptr::write_bytes(
+                                                block_buf_va as *mut u8, 0,
+                                                sb.block_size as usize,
+                                            );
+                                        }
+                                        blk.write_block(b, sb.block_size, block_buf_va);
+                                    }
+                                    None => break,
+                                }
+                            }
+                        } else {
+                            break; // Beyond single indirect — not supported.
+                        }
+                    }
+
+                    // Resolve the physical block.
+                    let phys = match resolve_block(
+                        &blk, &sb, &open_files[handle].block_ptrs, block_idx, indirect_buf_va,
+                    ) {
+                        Some(b) => b,
+                        None => break,
+                    };
+
+                    // Read-modify-write if partial block.
+                    if offset_in_block != 0 || chunk < sb.block_size as usize {
+                        if !blk.read_block(phys, sb.block_size, block_buf_va) {
+                            break;
+                        }
+                    }
+
+                    // Copy data from grant page.
+                    if grant_va != 0 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                (grant_va + written) as *const u8,
+                                (block_buf_va + offset_in_block) as *mut u8,
+                                chunk,
+                            );
+                        }
+                    }
+
+                    if !blk.write_block(phys, sb.block_size, block_buf_va) {
+                        break;
+                    }
+
+                    written += chunk;
+                    offset += chunk as u32;
+                }
+
+                open_files[handle].file_size = offset;
+
+                if reply_port != 0 {
+                    syscall::send(reply_port, FS_WRITE_OK, written as u64, 0, 0, 0);
+                }
+            }
+
+            FS_DELETE => {
+                let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
+                let reply_port = (msg.data[2] >> 32) as u32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                // Look up file to get inode number.
+                let root = match read_inode(&blk, &sb, &bgd, EXT2_ROOT_INO) {
+                    Some(r) => r,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+                let (_, _, _, root_size, root_blocks) = root;
+
+                let ino = match dir_lookup(
+                    &blk, &sb, &bgd, &root_blocks, root_size, name,
+                    indirect_buf_va, block_buf_va,
+                ) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Read inode to get block pointers.
+                let (_, _, _, _size, block_ptrs) = match read_inode(&blk, &sb, &bgd, ino) {
+                    Some(r) => r,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Free direct blocks.
+                for i in 0..12 {
+                    if block_ptrs[i] != 0 {
+                        free_block(&blk, &mut sb, &bgd, block_ptrs[i], block_buf_va);
+                    }
+                }
+                // Free single indirect block and its children.
+                if block_ptrs[12] != 0 {
+                    if blk.read_block(block_ptrs[12], sb.block_size, block_buf_va) {
+                        let ptrs_per_block = sb.block_size / 4;
+                        for i in 0..ptrs_per_block as usize {
+                            let ptr = unsafe {
+                                core::ptr::read((block_buf_va + i * 4) as *const u32)
+                            };
+                            if ptr != 0 {
+                                free_block(&blk, &mut sb, &bgd, ptr, indirect_buf_va);
+                            }
+                        }
+                    }
+                    free_block(&blk, &mut sb, &bgd, block_ptrs[12], block_buf_va);
+                }
+
+                // Free inode.
+                free_inode(&blk, &mut sb, &bgd, ino, block_buf_va);
+
+                // Zero out the inode on disk.
+                let zero_ptrs = [0u32; 15];
+                write_inode(&blk, &sb, &bgd, ino, 0, 0, 0, 0, &zero_ptrs);
+
+                // Remove directory entry.
+                dir_remove_entry(&blk, &sb, &root_blocks, root_size,
+                    name, name_len.min(16), indirect_buf_va, block_buf_va);
+
+                flush_superblock(&blk, &sb);
+
+                syscall::send(reply_port, FS_DELETE_OK, 0, 0, 0, 0);
             }
 
             _ => {}
