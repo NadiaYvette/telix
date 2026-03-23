@@ -3,6 +3,7 @@
 #include <telix/ipc.h>
 #include <telix/fd.h>
 #include <telix/socket.h>
+#include <telix/vfs.h>
 
 /*
  * CON_WRITE protocol (from console_srv.rs):
@@ -75,6 +76,34 @@ static ssize_t write_pipe(struct telix_fd_entry *fde,
     return (ssize_t)written;
 }
 
+/* File write via FS_WRITE (0x2600).
+ * FS_WRITE: data[0] = handle, data[1] = offset | (len << 32),
+ *           data[2] = reply_port << 32, data[3] = inline bytes (up to 16)
+ *
+ * Actually, let's use the inline data approach:
+ * data[0] = handle, data[1] = bytes[0..7], data[2] = len | (reply_port << 32),
+ * data[3] = bytes[8..15], plus offset packed somewhere.
+ *
+ * Looking at ext2_srv FS_WRITE handler:
+ * data[0] = handle, data[1] = length(low32) | reply_port(high32),
+ * data[2] = grant_va, ... This is grant-based.
+ *
+ * For small inline writes, we'll use a simpler protocol:
+ * Send FS_WRITE with data[0]=handle, data[1]=offset,
+ * data[2]=len(low16)|reply(high32), data[3..5]=inline bytes.
+ *
+ * Actually, for v1 we'll just do fire-and-forget small writes to tmpfs.
+ * The tmpfs_srv and ext2_srv use grant-based writes which is complex.
+ * For now, implement inline console/pipe writes only for file writes.
+ */
+static ssize_t write_file(struct telix_fd_entry *fde,
+                           const unsigned char *p, size_t count) {
+    /* For now, file write is not implemented — files are read-only in C libc.
+     * The Rust userlib handles writes via grant pages. */
+    (void)fde; (void)p; (void)count;
+    return -1;
+}
+
 ssize_t write(int fd, const void *buf, size_t count) {
     struct telix_fd_entry *fde = telix_fd_get(fd);
     if (!fde) return -1;
@@ -84,6 +113,9 @@ ssize_t write(int fd, const void *buf, size_t count) {
 
     if (fde->fd_type == FD_TYPE_PIPE)
         return write_pipe(fde, (const unsigned char *)buf, count);
+
+    if (fde->fd_type == FD_TYPE_FILE)
+        return write_file(fde, (const unsigned char *)buf, count);
 
     /* Default: console write. */
     return write_console(fde, (const unsigned char *)buf, count);

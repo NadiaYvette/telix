@@ -5,10 +5,11 @@
 #include <telix/ipc.h>
 #include <telix/fd.h>
 
-/* Server ports (defined here, declared extern in socket.h / pipe headers). */
+/* Server ports (defined here, declared extern in various headers). */
 uint32_t __telix_uds_port = 0xFFFFFFFF;
 uint32_t __telix_net_port = 0xFFFFFFFF;
 uint32_t __telix_pipe_port = 0xFFFFFFFF;
+uint32_t __telix_vfs_port = 0xFFFFFFFF;
 
 /* Called from crt_start.S before main(). */
 void __telix_init(void) {
@@ -28,4 +29,7 @@ void __telix_init(void) {
 
     /* Look up pipe server. */
     __telix_pipe_port = telix_ns_lookup("pipe", 4);
+
+    /* Look up VFS server. */
+    __telix_vfs_port = telix_ns_lookup("vfs", 3);
 }

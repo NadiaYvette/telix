@@ -49,7 +49,8 @@ $CC $CFLAGS -c "$MUSL/arch/$ARCH/crt_start.S" -o "$OUTDIR/crt_start.o"
 $CC $CFLAGS -c "$MUSL/arch/$ARCH/syscall.S"   -o "$OUTDIR/syscall.o"
 
 # Compile C sources.
-for src in ipc fd write read exit init socket pipe poll; do
+for src in ipc fd write read exit init socket pipe poll \
+           string malloc printf file process signal dup env; do
     $CC $CFLAGS -c "$MUSL/src/$src.c" -o "$OUTDIR/$src.o"
 done
 
@@ -57,7 +58,9 @@ done
 COMMON_OBJS="$OUTDIR/crt_start.o $OUTDIR/syscall.o \
     $OUTDIR/ipc.o $OUTDIR/fd.o $OUTDIR/write.o $OUTDIR/read.o \
     $OUTDIR/exit.o $OUTDIR/init.o $OUTDIR/socket.o $OUTDIR/pipe.o \
-    $OUTDIR/poll.o"
+    $OUTDIR/poll.o \
+    $OUTDIR/string.o $OUTDIR/malloc.o $OUTDIR/printf.o $OUTDIR/file.o \
+    $OUTDIR/process.o $OUTDIR/signal.o $OUTDIR/dup.o $OUTDIR/env.o"
 
 # Link function — use ld.lld for cross-arch, clang for native.
 link_binary() {
@@ -88,5 +91,17 @@ $CC $CFLAGS -c "$MUSL/test/sock_test.c" -o "$OUTDIR/sock_test.o"
 link_binary "$OUTDIR/sock_test" $COMMON_OBJS "$OUTDIR/sock_test.o"
 SIZE=$(wc -c < "$OUTDIR/sock_test")
 echo "  sock_test: $SIZE bytes"
+
+# Build tsh (shell + coreutils).
+$CC $CFLAGS -c "$MUSL/test/tsh.c" -o "$OUTDIR/tsh.o"
+link_binary "$OUTDIR/tsh" $COMMON_OBJS "$OUTDIR/tsh.o"
+SIZE=$(wc -c < "$OUTDIR/tsh")
+echo "  tsh: $SIZE bytes"
+
+# Build getty_login.
+$CC $CFLAGS -c "$MUSL/test/getty_login.c" -o "$OUTDIR/getty_login.o"
+link_binary "$OUTDIR/getty_login" $COMMON_OBJS "$OUTDIR/getty_login.o"
+SIZE=$(wc -c < "$OUTDIR/getty_login")
+echo "  getty_login: $SIZE bytes"
 
 echo "Done."

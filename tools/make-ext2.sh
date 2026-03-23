@@ -37,12 +37,22 @@ python3 -c "import sys; sys.stdout.buffer.write(bytes(range(256)) * 4)" > "$TMPF
 TMPFILE3=$(mktemp)
 echo -n "File with restricted permissions" > "$TMPFILE3"
 
+# /etc/passwd and /etc/group for Phase 65 (getty/login).
+PASSWD_TMP=$(mktemp)
+printf 'root::0:0:root:/:/tsh\nuser:pass:1000:1000:user:/:/tsh\n' > "$PASSWD_TMP"
+
+GROUP_TMP=$(mktemp)
+printf 'root:x:0:\nusers:x:1000:\n' > "$GROUP_TMP"
+
 # Use debugfs to populate the filesystem.
 debugfs -w "$EXT2_TMP" <<DEBUGFS_EOF
 mkdir testdir
+mkdir etc
 write $TMPFILE hello.txt
 write $TMPFILE2 bench.dat
 write $TMPFILE3 secret.txt
+write $PASSWD_TMP etc/passwd
+write $GROUP_TMP etc/group
 set_inode_field hello.txt mode 0100644
 set_inode_field hello.txt uid 1000
 set_inode_field hello.txt gid 1000
@@ -55,9 +65,18 @@ set_inode_field secret.txt gid 0
 set_inode_field testdir mode 040755
 set_inode_field testdir uid 1000
 set_inode_field testdir gid 1000
+set_inode_field etc mode 040755
+set_inode_field etc uid 0
+set_inode_field etc gid 0
+set_inode_field etc/passwd mode 0100644
+set_inode_field etc/passwd uid 0
+set_inode_field etc/passwd gid 0
+set_inode_field etc/group mode 0100644
+set_inode_field etc/group uid 0
+set_inode_field etc/group gid 0
 DEBUGFS_EOF
 
-rm -f "$TMPFILE" "$TMPFILE2" "$TMPFILE3"
+rm -f "$TMPFILE" "$TMPFILE2" "$TMPFILE3" "$PASSWD_TMP" "$GROUP_TMP"
 
 # Splice the ext2 image into test.img at the FAT16 boundary.
 dd if="$EXT2_TMP" of="$DISK_IMG" bs=1M seek=16 conv=notrunc 2>/dev/null

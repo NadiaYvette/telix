@@ -14,11 +14,14 @@
 #define FD_TYPE_PIPE    4
 
 struct telix_fd_entry {
-    uint32_t server_port;  /* IPC port of the server owning this fd */
+    uint32_t server_port;   /* IPC port of the server owning this fd */
     uint32_t server_handle; /* server-side handle */
     int      active;
-    int      fd_type;      /* FD_TYPE_* */
-    int      domain;       /* AF_UNIX, AF_INET, etc. (sockets only) */
+    int      fd_type;       /* FD_TYPE_* */
+    int      domain;        /* AF_UNIX, AF_INET, etc. (sockets only) */
+    uint64_t file_offset;   /* current read/write position (files) */
+    uint64_t file_size;     /* total file size (files) */
+    uint32_t fs_aspace;     /* server address space ID (for grants) */
 };
 
 void     telix_fd_init(void);

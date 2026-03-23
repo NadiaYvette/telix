@@ -27,7 +27,24 @@
 #define SYS_EXECVE          54
 #define SYS_GET_CYCLES      36
 #define SYS_GET_TIMER_FREQ  37
+#define SYS_FORK            39
+#define SYS_KILL            34
+#define SYS_KILL_SIG        58
+#define SYS_SIGACTION       55
+#define SYS_SIGPROCMASK     56
+#define SYS_SIGRETURN       57
+#define SYS_SETPGID         62
+#define SYS_GETPGID         63
+#define SYS_SETSID          64
+#define SYS_CLOCK_GETTIME   69
+#define SYS_NANOSLEEP       70
 #define SYS_GETUID          75
+#define SYS_GETEUID         76
+#define SYS_GETGID          77
+#define SYS_GETEGID         78
+#define SYS_SETUID          79
+#define SYS_SETGID          80
+#define SYS_SETGROUPS       81
 
 /* Raw syscall stubs (defined in arch/x86_64/syscall.S). */
 uint64_t __telix_syscall0(uint64_t nr);

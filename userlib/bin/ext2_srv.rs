@@ -655,6 +655,60 @@ fn dir_lookup(
     None
 }
 
+/// Resolve a multi-component path (e.g. "etc/passwd") starting from root inode.
+/// Returns (inode_num, mode, uid, gid, size, block_ptrs) of the final component.
+fn path_resolve(
+    blk: &BlkClient,
+    sb: &Superblock,
+    bgd: &BlockGroupDesc,
+    name: &[u8],
+    scratch_page: usize,
+    block_buf: usize,
+) -> Option<(u32, u16, u16, u16, u32, [u32; 15])> {
+    // Start from root inode.
+    let mut ino = EXT2_ROOT_INO;
+    let (mut mode, mut uid, mut gid, mut size, mut blocks) =
+        read_inode(blk, sb, bgd, ino)?;
+
+    // If name is empty, return root.
+    if name.is_empty() {
+        return Some((ino, mode, uid, gid, size, blocks));
+    }
+
+    // Split by '/' and resolve each component.
+    let mut start = 0;
+    while start < name.len() {
+        // Skip leading slashes.
+        if name[start] == b'/' {
+            start += 1;
+            continue;
+        }
+        // Find end of component.
+        let mut end = start;
+        while end < name.len() && name[end] != b'/' {
+            end += 1;
+        }
+        let component = &name[start..end];
+
+        // Current inode must be a directory.
+        if mode & 0xF000 != 0x4000 {
+            return None; // not a directory
+        }
+
+        // Look up component in current directory.
+        ino = dir_lookup(blk, sb, bgd, &blocks, size, component, scratch_page, block_buf)?;
+        let result = read_inode(blk, sb, bgd, ino)?;
+        mode = result.0;
+        uid = result.1;
+        gid = result.2;
+        size = result.3;
+        blocks = result.4;
+
+        start = end;
+    }
+    Some((ino, mode, uid, gid, size, blocks))
+}
+
 /// Iterate directory entries. `start_index` is the byte offset to resume from.
 /// Returns (inode, name, name_len, next_offset) or None if end.
 fn dir_next_entry(
@@ -1160,49 +1214,31 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
 
-                // Read root directory inode.
-                let root = match read_inode(&blk, &sb, &bgd, EXT2_ROOT_INO) {
-                    Some(r) => r,
-                    None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
-                        continue;
+                // Resolve path (may be multi-component like "etc/passwd").
+                if let Some((ino, mode, uid, gid, size, blocks)) = path_resolve(
+                    &blk, &sb, &bgd, name, indirect_buf_va, block_buf_va,
+                ) {
+                    // Allocate a handle.
+                    let mut handle = u64::MAX;
+                    for (i, f) in open_files.iter_mut().enumerate() {
+                        if !f.active {
+                            f.active = true;
+                            f.inode_num = ino;
+                            f.file_size = size;
+                            f.mode = mode;
+                            f.uid = uid;
+                            f.gid = gid;
+                            f.block_ptrs = blocks;
+                            f.pid = caller_pid;
+                            handle = i as u64;
+                            break;
+                        }
                     }
-                };
-                let (_, _, _, root_size, root_blocks) = root;
-
-                // Look up the file in the root directory.
-                let inode_num = dir_lookup(
-                    &blk, &sb, &bgd, &root_blocks, root_size, name,
-                    indirect_buf_va, block_buf_va,
-                );
-
-                if let Some(ino) = inode_num {
-                    // Read the file's inode.
-                    if let Some((mode, uid, gid, size, blocks)) = read_inode(&blk, &sb, &bgd, ino) {
-                        // Allocate a handle.
-                        let mut handle = u64::MAX;
-                        for (i, f) in open_files.iter_mut().enumerate() {
-                            if !f.active {
-                                f.active = true;
-                                f.inode_num = ino;
-                                f.file_size = size;
-                                f.mode = mode;
-                                f.uid = uid;
-                                f.gid = gid;
-                                f.block_ptrs = blocks;
-                                f.pid = caller_pid;
-                                handle = i as u64;
-                                break;
-                            }
-                        }
-                        if handle == u64::MAX {
-                            syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
-                        } else {
-                            syscall::send(reply_port, FS_OPEN_OK,
-                                handle, size as u64, my_aspace as u64, 0);
-                        }
+                    if handle == u64::MAX {
+                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
                     } else {
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        syscall::send(reply_port, FS_OPEN_OK,
+                            handle, size as u64, my_aspace as u64, 0);
                     }
                 } else {
                     syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
@@ -1275,21 +1311,36 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             FS_READDIR => {
-                let start_offset = msg.data[0] as u32;
-                let reply_port = (msg.data[2] & 0xFFFF_FFFF) as u32;
+                // VFS sends: data[0]=name_lo, data[1]=name_hi,
+                // data[2]=name_len(low32)|reply_port(high32), data[3]=start_offset
+                let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
+                let reply_port = (msg.data[2] >> 32) as u32;
+                let start_offset = msg.data[3] as u32;
 
-                // Read root directory inode.
-                let root = match read_inode(&blk, &sb, &bgd, EXT2_ROOT_INO) {
-                    Some(r) => r,
-                    None => {
-                        syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
-                        continue;
+                // Resolve path to find the directory to list.
+                let (dir_size, dir_blocks) = if name_len == 0 {
+                    // Empty path = list root directory.
+                    match read_inode(&blk, &sb, &bgd, EXT2_ROOT_INO) {
+                        Some((_, _, _, size, blocks)) => (size, blocks),
+                        None => {
+                            syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
+                            continue;
+                        }
+                    }
+                } else {
+                    let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                    let name = &name_buf[..name_len.min(16)];
+                    match path_resolve(&blk, &sb, &bgd, name, indirect_buf_va, block_buf_va) {
+                        Some((_, _, _, _, size, blocks)) => (size, blocks),
+                        None => {
+                            syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
+                            continue;
+                        }
                     }
                 };
-                let (_, _, _, root_size, root_blocks) = root;
 
                 match dir_next_entry(
-                    &blk, &sb, &root_blocks, root_size, start_offset,
+                    &blk, &sb, &dir_blocks, dir_size, start_offset,
                     indirect_buf_va, block_buf_va,
                 ) {
                     Some((inode_num, name, name_len, next_offset)) => {
