@@ -4978,6 +4978,29 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 58: BSD socket API (C test) ---
+    syscall::debug_puts(b"  init: testing BSD socket API (C)...\n");
+    {
+        let sock_tid = syscall::spawn(b"sock_test", 50);
+        if sock_tid != u64::MAX {
+            loop {
+                if let Some(code) = syscall::waitpid(sock_tid) {
+                    if code == 0 {
+                        syscall::debug_puts(b"Phase 58 socket API: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 58 socket API: FAILED (exit=");
+                        print_num(code);
+                        syscall::debug_puts(b")\n");
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+        } else {
+            syscall::debug_puts(b"Phase 58 socket API: SKIPPED (no sock_test in initramfs)\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

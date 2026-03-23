@@ -23,7 +23,9 @@
 #define SYS_MMAP_ANON       16
 #define SYS_MUNMAP          17
 #define SYS_NSRV_PORT       23
+#define SYS_GETPID          35
 #define SYS_EXECVE          54
+#define SYS_GETUID          75
 
 /* Raw syscall stubs (defined in arch/x86_64/syscall.S). */
 uint64_t __telix_syscall0(uint64_t nr);

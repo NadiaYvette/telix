@@ -1,10 +1,8 @@
-/* POSIX write() for Telix — sends CON_WRITE IPC to console server. */
+/* POSIX write() for Telix — dispatches by fd type. */
 #include <telix/syscall.h>
 #include <telix/ipc.h>
 #include <telix/fd.h>
-
-typedef long ssize_t;
-typedef unsigned long size_t;
+#include <telix/socket.h>
 
 /*
  * CON_WRITE protocol (from console_srv.rs):
@@ -26,11 +24,8 @@ static uint64_t pack_bytes(const unsigned char *buf, int count) {
     return w;
 }
 
-ssize_t write(int fd, const void *buf, size_t count) {
-    struct telix_fd_entry *fde = telix_fd_get(fd);
-    if (!fde) return -1;
-
-    const unsigned char *p = (const unsigned char *)buf;
+static ssize_t write_console(struct telix_fd_entry *fde,
+                              const unsigned char *p, size_t count) {
     size_t remaining = count;
     size_t written = 0;
 
@@ -53,4 +48,15 @@ ssize_t write(int fd, const void *buf, size_t count) {
         written += chunk;
     }
     return (ssize_t)written;
+}
+
+ssize_t write(int fd, const void *buf, size_t count) {
+    struct telix_fd_entry *fde = telix_fd_get(fd);
+    if (!fde) return -1;
+
+    if (fde->fd_type == FD_TYPE_SOCKET)
+        return send(fd, buf, count, 0);
+
+    /* Default: console write. */
+    return write_console(fde, (const unsigned char *)buf, count);
 }
