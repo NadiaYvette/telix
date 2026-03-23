@@ -43,13 +43,15 @@ RUSTFLAGS="-C link-arg=-T$LINKER ${EXTRA_RUSTFLAGS:-}" \
 
 BINDIR="$ROOTDIR/target/$TARGET/release"
 
-# Build C userspace binaries (musl-telix) for x86_64.
-if [ "$ARCH" = "x86_64" ]; then
-    echo "Building C userspace (musl-telix) for x86_64..."
-    bash "$ROOTDIR/musl-telix/build-x86_64.sh"
-    cp "$ROOTDIR/musl-telix/out/hello_c" "$BINDIR/hello_c"
-    cp "$ROOTDIR/musl-telix/out/sock_test" "$BINDIR/sock_test"
-fi
+# Build C userspace binaries (musl-telix).
+echo "Building C userspace (musl-telix) for $ARCH..."
+bash "$ROOTDIR/musl-telix/build.sh" "$ARCH"
+MUSL_OUTDIR="$ROOTDIR/musl-telix/out/$ARCH"
+for cbin in hello_c sock_test; do
+    if [ -f "$MUSL_OUTDIR/$cbin" ]; then
+        cp "$MUSL_OUTDIR/$cbin" "$BINDIR/$cbin"
+    fi
+done
 
 # Copy ELF binaries to initramfs directory.
 for bin in init hello echo_client initramfs_srv ramdisk_srv blk_srv cache_srv fat16_srv ext2_srv console_srv shell net_srv pipe_upper spin bench pong grant_echo macro_bench cap_test security_srv shm_srv vfs_srv tmpfs_srv devfs_srv procfs_srv uds_srv hello_c sock_test; do
