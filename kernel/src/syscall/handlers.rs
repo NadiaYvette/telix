@@ -101,6 +101,8 @@ pub const SYS_GETRLIMIT: u64 = 84;
 pub const SYS_SETRLIMIT: u64 = 85;
 pub const SYS_PRLIMIT: u64 = 86;
 pub const SYS_YIELD_BLOCK: u64 = 87;
+pub const SYS_PROC_LIST: u64 = 88;
+pub const SYS_PROC_INFO: u64 = 89;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -302,6 +304,16 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SETRLIMIT => sys_setrlimit(a0, a1, a2),
         SYS_PRLIMIT => sys_prlimit(a0, a1, a2, a3, frame),
         SYS_YIELD_BLOCK => sys_yield_block(),
+        SYS_PROC_LIST => sys_proc_list(a0),
+        SYS_PROC_INFO => {
+            let result = sys_proc_info(a0, frame);
+            set_return(frame, result);
+            crate::trace::trace_event(crate::trace::EVT_SYSCALL_EXIT, nr as u32, result as u32);
+            if crate::sched::scheduler::current_aspace_id() != 0 {
+                deliver_pending_signals(frame);
+            }
+            return;
+        }
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1433,8 +1445,44 @@ fn sys_vm_stats(which: u64) -> u64 {
         15 => crate::sched::stats::IPC_SENDS.load(Ordering::Relaxed),
         16 => crate::sched::stats::IPC_RECVS.load(Ordering::Relaxed),
         17 => stats::PAGES_PREZEROED.load(Ordering::Relaxed),
+        18 => { let (total, _) = crate::mm::phys::stats(); total as u64 }
+        19 => { let (_, free) = crate::mm::phys::stats(); free as u64 }
         _ => u64::MAX,
     }
+}
+
+/// Enumerate active tasks. Returns task_id of tasks[index] if active, else 0.
+fn sys_proc_list(index: u64) -> u64 {
+    use crate::sched::task::MAX_TASKS;
+    if index as usize >= MAX_TASKS { return 0; }
+    let sched = crate::sched::scheduler::SCHEDULER.lock();
+    let task = &sched.tasks[index as usize];
+    if task.active { task.id as u64 } else { 0 }
+}
+
+/// Query process metadata. Returns packed info via multi-return registers.
+fn sys_proc_info(task_id: u64, frame: &mut ExceptionFrame) -> u64 {
+    use crate::sched::task::MAX_TASKS;
+    let tid = task_id as usize;
+    if tid >= MAX_TASKS { return u64::MAX; }
+    let sched = crate::sched::scheduler::SCHEDULER.lock();
+    let task = &sched.tasks[tid];
+    if !task.active && !task.exited { return u64::MAX; }
+
+    let r1 = (task.parent_task as u64) | ((task.thread_count as u64) << 32);
+    let r2 = (task.uid as u64) | ((task.gid as u64) << 32);
+    let r3 = (task.pgid as u64) | ((task.sid as u64) << 32);
+    let mut state: u32 = 0;
+    if task.active { state |= 1; }
+    if task.exited { state |= 2; }
+    let r4 = (task.cur_pages as u64) | ((state as u64) << 32);
+    drop(sched);
+
+    set_reg(frame, 1, r1);
+    set_reg(frame, 2, r2);
+    set_reg(frame, 3, r3);
+    set_reg(frame, 4, r4);
+    0
 }
 
 /// Copy `dst.len()` bytes from user virtual address `user_va` into `dst`,

@@ -4540,6 +4540,183 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 56: procfs server ---
+    syscall::debug_puts(b"  init: testing procfs...\n");
+    {
+        // Spawn procfs server.
+        let procfs_tid = syscall::spawn(b"procfs_srv", 50);
+        let mut phase56_ok = procfs_tid != u64::MAX;
+        if !phase56_ok {
+            syscall::debug_puts(b"  FAIL: cannot spawn procfs_srv\n");
+        }
+
+        // Look up procfs port.
+        let procfs_port = if phase56_ok {
+            let mut found = 0u32;
+            for _ in 0..100 {
+                if let Some(p) = syscall::ns_lookup(b"procfs") {
+                    found = p;
+                    break;
+                }
+                syscall::sleep_ms(10);
+            }
+            if found == 0 {
+                syscall::debug_puts(b"  FAIL: ns_lookup(procfs) failed\n");
+                phase56_ok = false;
+            }
+            found
+        } else { 0 };
+
+        let rp = if phase56_ok { syscall::port_create() as u32 } else { 0 };
+
+        // Test 1: open "meminfo", read, verify non-empty
+        if phase56_ok {
+            let fname = b"meminfo";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(procfs_port, 0x2000, fn0, fn1, d2, 0); // FS_OPEN
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2001 { // FS_OPEN_OK
+                    let h = reply.data[0];
+
+                    // Read inline.
+                    let rd2 = (24u64) | ((rp as u64) << 32);
+                    syscall::send(procfs_port, 0x2100, h, 0, rd2, 0); // FS_READ
+                    if let Some(rr) = syscall::recv_msg(rp) {
+                        if rr.tag == 0x2101 { // FS_READ_OK
+                            let len = rr.data[0] as usize;
+                            if len == 0 {
+                                syscall::debug_puts(b"  FAIL: procfs meminfo empty\n");
+                                phase56_ok = false;
+                            }
+                            // First bytes should start with 'T' from "Total:"
+                            if phase56_ok {
+                                let first = (rr.data[1] & 0xFF) as u8;
+                                if first != b'T' {
+                                    syscall::debug_puts(b"  FAIL: procfs meminfo bad content\n");
+                                    phase56_ok = false;
+                                }
+                            }
+                        } else { phase56_ok = false; }
+                    } else { phase56_ok = false; }
+
+                    syscall::send(procfs_port, 0x2400, h, 0, 0, 0); // FS_CLOSE
+                } else {
+                    syscall::debug_puts(b"  FAIL: procfs open meminfo\n");
+                    phase56_ok = false;
+                }
+            } else { phase56_ok = false; }
+        }
+
+        // Test 2: open "1/status" (task 1 = init), read, verify "Pid:" prefix
+        if phase56_ok {
+            let fname = b"1/status";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(procfs_port, 0x2000, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2001 {
+                    let h = reply.data[0];
+
+                    let rd2 = (24u64) | ((rp as u64) << 32);
+                    syscall::send(procfs_port, 0x2100, h, 0, rd2, 0);
+                    if let Some(rr) = syscall::recv_msg(rp) {
+                        if rr.tag == 0x2101 {
+                            let len = rr.data[0] as usize;
+                            if len < 5 {
+                                syscall::debug_puts(b"  FAIL: procfs status too short\n");
+                                phase56_ok = false;
+                            }
+                            // Check starts with "Pid: "
+                            if phase56_ok {
+                                let lo = rr.data[1];
+                                let b0 = (lo & 0xFF) as u8;
+                                let b1 = ((lo >> 8) & 0xFF) as u8;
+                                let b2 = ((lo >> 16) & 0xFF) as u8;
+                                let b3 = ((lo >> 24) & 0xFF) as u8;
+                                if b0 != b'P' || b1 != b'i' || b2 != b'd' || b3 != b':' {
+                                    syscall::debug_puts(b"  FAIL: procfs status no Pid:\n");
+                                    phase56_ok = false;
+                                }
+                            }
+                        } else { phase56_ok = false; }
+                    } else { phase56_ok = false; }
+
+                    syscall::send(procfs_port, 0x2400, h, 0, 0, 0);
+                } else {
+                    syscall::debug_puts(b"  FAIL: procfs open 1/status\n");
+                    phase56_ok = false;
+                }
+            } else { phase56_ok = false; }
+        }
+
+        // Test 3: open "uptime", read, verify non-zero
+        if phase56_ok {
+            let fname = b"uptime";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(procfs_port, 0x2000, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2001 {
+                    let h = reply.data[0];
+
+                    let rd2 = (24u64) | ((rp as u64) << 32);
+                    syscall::send(procfs_port, 0x2100, h, 0, rd2, 0);
+                    if let Some(rr) = syscall::recv_msg(rp) {
+                        if rr.tag == 0x2101 {
+                            let len = rr.data[0] as usize;
+                            if len == 0 {
+                                syscall::debug_puts(b"  FAIL: procfs uptime empty\n");
+                                phase56_ok = false;
+                            }
+                            // First byte should be a digit.
+                            if phase56_ok {
+                                let first = (rr.data[1] & 0xFF) as u8;
+                                if first < b'0' || first > b'9' {
+                                    syscall::debug_puts(b"  FAIL: procfs uptime bad\n");
+                                    phase56_ok = false;
+                                }
+                            }
+                        } else { phase56_ok = false; }
+                    } else { phase56_ok = false; }
+
+                    syscall::send(procfs_port, 0x2400, h, 0, 0, 0);
+                } else {
+                    syscall::debug_puts(b"  FAIL: procfs open uptime\n");
+                    phase56_ok = false;
+                }
+            } else { phase56_ok = false; }
+        }
+
+        // Test 4: READDIR — should see >= 3 entries (meminfo, uptime, at least 1 PID)
+        if phase56_ok {
+            let mut count = 0usize;
+            let mut next_off = 0u64;
+            for _ in 0..40 {
+                let d2 = rp as u64;
+                syscall::send(procfs_port, 0x2200, next_off, 0, d2, 0); // FS_READDIR
+                if let Some(rr) = syscall::recv_msg(rp) {
+                    if rr.tag == 0x2201 { // FS_READDIR_OK
+                        count += 1;
+                        next_off = rr.data[3]; // next offset
+                    } else {
+                        break; // FS_READDIR_END
+                    }
+                } else { break; }
+            }
+            if count < 3 {
+                syscall::debug_puts(b"  FAIL: procfs readdir < 3\n");
+                phase56_ok = false;
+            }
+        }
+
+        if phase56_ok {
+            syscall::debug_puts(b"Phase 56 procfs: PASSED\n");
+        } else if procfs_tid != u64::MAX {
+            syscall::debug_puts(b"Phase 56 procfs: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

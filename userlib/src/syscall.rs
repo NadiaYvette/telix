@@ -769,6 +769,8 @@ const SYS_GETRLIMIT: u64 = 84;
 const SYS_SETRLIMIT: u64 = 85;
 const SYS_PRLIMIT: u64 = 86;
 const SYS_YIELD_BLOCK: u64 = 87;
+const SYS_PROC_LIST: u64 = 88;
+const SYS_PROC_INFO: u64 = 89;
 
 /// Map a file-backed region via the pager mechanism.
 /// Returns the VA on success, or None on failure.
@@ -1065,6 +1067,65 @@ pub fn prlimit(pid: u32, resource: u32, new_soft: u64, new_hard: u64) -> Option<
     }
 
     if r0 == u64::MAX { None } else { Some((r1, r2)) }
+}
+
+// --- procfs support syscalls ---
+
+/// Enumerate active tasks. Returns task_id at slot `index`, or 0 if inactive/OOB.
+pub fn proc_list(index: u32) -> u32 {
+    unsafe { arch::syscall1(SYS_PROC_LIST, index as u64) as u32 }
+}
+
+/// Query process metadata. Returns (ppid_threads, uid_gid, pgid_sid, pages_state).
+/// Each u64 packs two u32 values: low 32 = first, high 32 = second.
+pub fn proc_info(task_id: u32) -> Option<(u64, u64, u64, u64)> {
+    let r0: u64;
+    let r1: u64;
+    let r2: u64;
+    let r3: u64;
+    let r4: u64;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_PROC_INFO,
+            inlateout("x0") task_id as u64 => r0,
+            lateout("x1") r1,
+            lateout("x2") r2,
+            lateout("x3") r3,
+            lateout("x4") r4,
+        );
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SYS_PROC_INFO as u64,
+            inlateout("a0") task_id as u64 => r0,
+            lateout("a1") r1,
+            lateout("a2") r2,
+            lateout("a3") r3,
+            lateout("a4") r4,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") SYS_PROC_INFO => r0,
+            inlateout("rdi") task_id as u64 => r1,
+            lateout("rsi") r2,
+            lateout("rdx") r3,
+            lateout("r10") r4,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+
+    if r0 == u64::MAX { None } else { Some((r1, r2, r3, r4)) }
 }
 
 // --- Shared memory (shm_srv) client wrappers ---

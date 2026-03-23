@@ -102,3 +102,7 @@ path = "bin/tmpfs_srv.rs"
 [[bin]]
 name = "devfs_srv"
 path = "bin/devfs_srv.rs"
+
+[[bin]]
+name = "procfs_srv"
+path = "bin/procfs_srv.rs"
