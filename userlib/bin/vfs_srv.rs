@@ -458,24 +458,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::ns_register(b"vfs", port32);
     syscall::debug_puts(b"  [vfs_srv] ready\n");
 
-    // Main message loop.
+    // Main message loop (blocking recv).
     loop {
-        if let Some(msg) = syscall::recv_nb_msg(port32) {
-            match msg.tag {
-                VFS_MOUNT => handle_mount(&msg.data),
-                VFS_UNMOUNT => handle_unmount(&msg.data),
-                VFS_OPEN => handle_open(&msg.data),
-                VFS_STAT => handle_stat(&msg.data),
-                VFS_READDIR => handle_readdir(&msg.data),
-                _ => {
-                    let reply_port = (msg.data[2] >> 32) as u32;
-                    if reply_port != 0 {
-                        syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-                    }
+        let msg = match syscall::recv_msg(port32) {
+            Some(m) => m,
+            None => break,
+        };
+        match msg.tag {
+            VFS_MOUNT => handle_mount(&msg.data),
+            VFS_UNMOUNT => handle_unmount(&msg.data),
+            VFS_OPEN => handle_open(&msg.data),
+            VFS_STAT => handle_stat(&msg.data),
+            VFS_READDIR => handle_readdir(&msg.data),
+            _ => {
+                let reply_port = (msg.data[2] >> 32) as u32;
+                if reply_port != 0 {
+                    syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
                 }
             }
-        } else {
-            syscall::yield_now();
         }
     }
 }

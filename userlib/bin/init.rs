@@ -3704,12 +3704,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Give VFS server time to register (retry lookup).
         let vfs_port = if phase51_ok {
             let mut found = 0u32;
-            for _ in 0..200 {
+            for _ in 0..100 {
                 if let Some(p) = syscall::ns_lookup(b"vfs") {
                     found = p;
                     break;
                 }
-                syscall::yield_now();
+                syscall::sleep_ms(10); // 10ms
             }
             if found == 0 {
                 syscall::debug_puts(b"  FAIL: ns_lookup(vfs) failed\n");
@@ -3751,14 +3751,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::send(vfs_port, VFS_MOUNT, w0, w1, d2, ext2_port as u64);
 
             let mut mounted = false;
-            for _ in 0..200 {
+            for _ in 0..100 {
                 if let Some(reply) = syscall::recv_nb_msg(reply_port) {
                     if reply.tag == VFS_OK {
                         mounted = true;
                     }
                     break;
                 }
-                syscall::yield_now();
+                syscall::sleep_ms(10); // 10ms
             }
             syscall::port_destroy(reply_port);
 
@@ -3776,18 +3776,28 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let d2 = (path.len() as u64) | ((reply_port as u64) << 32);
             syscall::send(vfs_port, VFS_MOUNT, w0, w1, d2, fat16_port as u64);
 
-            for _ in 0..200 {
+            let mut mnt_ok = false;
+            for _ in 0..100 {
                 if let Some(reply) = syscall::recv_nb_msg(reply_port) {
-                    if reply.tag != VFS_OK {
-                        syscall::debug_puts(b"  FAIL: VFS_MOUNT /mnt failed\n");
+                    if reply.tag == VFS_OK {
+                        mnt_ok = true;
+                    } else {
+                        syscall::debug_puts(b"  FAIL: VFS_MOUNT /mnt rejected\n");
                         phase51_ok = false;
                     }
                     break;
                 }
-                syscall::yield_now();
+                syscall::sleep_ms(10); // 10ms
+            }
+            if !mnt_ok && phase51_ok {
+                syscall::debug_puts(b"  FAIL: VFS_MOUNT /mnt timeout\n");
+                phase51_ok = false;
             }
             syscall::port_destroy(reply_port);
         }
+
+        // Brief pause to let VFS server process mount table updates.
+        syscall::sleep_ms(20);
 
         // Test 3: VFS_OPEN "/hello.txt" — should resolve to ext2 on "/".
         if phase51_ok {

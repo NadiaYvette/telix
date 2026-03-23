@@ -63,15 +63,58 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
             loop { core::hint::spin_loop(); }
         }
         _ => {
+            let tid = crate::sched::current_thread_id();
+            let kstack_base = {
+                let sched = crate::sched::scheduler::SCHEDULER.lock();
+                sched.threads[tid as usize].stack_base
+            };
             crate::println!(
-                "EL1 Sync exception: EC={:#x} ESR={:#x} ELR={:#x} SP={:#x}",
+                "EL1 Sync: EC={:#x} ESR={:#x} ELR={:#x} SP_EL0={:#x}",
                 ec, frame.esr, frame.elr, frame.sp
             );
-            // Dump x29 (FP) and x30 (LR) for stack trace hints.
             crate::println!(
                 "  x30(LR)={:#x} x29(FP)={:#x} x0={:#x}",
                 frame.regs[30], frame.regs[29], frame.regs[0]
             );
+            crate::println!(
+                "  tid={} kstack_base={:#x} frame_sp={:#x} kstack_end={:#x}",
+                tid, kstack_base, frame_sp, kstack_base + crate::mm::page::PAGE_SIZE
+            );
+            // Check if frame_sp is within the thread's kstack.
+            let page_size = crate::mm::page::PAGE_SIZE;
+            if kstack_base != 0 {
+                let kstack_end = kstack_base + page_size;
+                if (frame_sp as usize) < kstack_base || (frame_sp as usize) >= kstack_end {
+                    crate::println!("  BUG: frame_sp OUTSIDE kstack bounds!");
+                }
+            }
+            // Find which thread (if any) owns the page containing frame_sp.
+            let frame_page = (frame_sp as usize) & !(page_size - 1);
+            {
+                let sched = crate::sched::scheduler::SCHEDULER.lock();
+                let mut found = false;
+                for i in 0..64usize {
+                    if sched.threads[i].stack_base == frame_page {
+                        crate::println!(
+                            "  frame_sp page {:#x} belongs to tid={} state={:?} task={}",
+                            frame_page, i, sched.threads[i].state, sched.threads[i].task_id
+                        );
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    crate::println!("  frame_sp page {:#x} NOT found in any thread's kstack!", frame_page);
+                }
+            }
+            // Dump saved_sp of crashing thread.
+            {
+                let sched = crate::sched::scheduler::SCHEDULER.lock();
+                crate::println!(
+                    "  thread[{}].saved_sp={:#x} state={:?}",
+                    tid, sched.threads[tid as usize].saved_sp, sched.threads[tid as usize].state
+                );
+            }
             loop {
                 core::hint::spin_loop();
             }
@@ -99,7 +142,6 @@ extern "C" fn exception_serror_el1(frame: &ExceptionFrame) {
         core::hint::spin_loop();
     }
 }
-
 #[unsafe(no_mangle)]
 extern "C" fn exception_sync_el0(frame_sp: u64) -> u64 {
     let frame = unsafe { &mut *(frame_sp as *mut ExceptionFrame) };
