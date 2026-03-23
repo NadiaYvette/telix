@@ -4325,6 +4325,221 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 55: devfs server ---
+    syscall::debug_puts(b"  init: testing devfs...\n");
+    {
+        // Spawn devfs server.
+        let devfs_tid = syscall::spawn(b"devfs_srv", 50);
+        let mut phase55_ok = devfs_tid != u64::MAX;
+        if !phase55_ok {
+            syscall::debug_puts(b"  FAIL: cannot spawn devfs_srv\n");
+        }
+
+        // Look up devfs port.
+        let devfs_port = if phase55_ok {
+            let mut found = 0u32;
+            for _ in 0..100 {
+                if let Some(p) = syscall::ns_lookup(b"devfs") {
+                    found = p;
+                    break;
+                }
+                syscall::sleep_ms(10);
+            }
+            if found == 0 {
+                syscall::debug_puts(b"  FAIL: ns_lookup(devfs) failed\n");
+                phase55_ok = false;
+            }
+            found
+        } else { 0 };
+
+        let rp = if phase55_ok { syscall::port_create() as u32 } else { 0 };
+
+        // Test 1: /dev/null — write succeeds, read returns EOF
+        if phase55_ok {
+            let fname = b"null";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(devfs_port, 0x2000, fn0, fn1, d2, 0); // FS_OPEN
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2001 { // FS_OPEN_OK
+                    let h = reply.data[0];
+
+                    // Write 16 bytes — should succeed (discard).
+                    let wd1 = (16u64) | ((rp as u64) << 32);
+                    syscall::send(devfs_port, 0x2600, h, wd1, 0, 0); // FS_WRITE
+                    if let Some(wr) = syscall::recv_msg(rp) {
+                        if wr.tag != 0x2601 { // FS_WRITE_OK
+                            syscall::debug_puts(b"  FAIL: devfs null write\n");
+                            phase55_ok = false;
+                        }
+                    } else { phase55_ok = false; }
+
+                    // Read — should return 0 bytes (EOF).
+                    if phase55_ok {
+                        let rd2 = (8u64) | ((rp as u64) << 32);
+                        syscall::send(devfs_port, 0x2100, h, 0, rd2, 0); // FS_READ
+                        if let Some(rr) = syscall::recv_msg(rp) {
+                            if rr.tag == 0x2101 { // FS_READ_OK
+                                if rr.data[0] != 0 {
+                                    syscall::debug_puts(b"  FAIL: devfs null read not EOF\n");
+                                    phase55_ok = false;
+                                }
+                            } else { phase55_ok = false; }
+                        } else { phase55_ok = false; }
+                    }
+
+                    // Close.
+                    syscall::send(devfs_port, 0x2400, h, 0, 0, 0); // FS_CLOSE
+                } else {
+                    syscall::debug_puts(b"  FAIL: devfs open null\n");
+                    phase55_ok = false;
+                }
+            } else { phase55_ok = false; }
+        }
+
+        // Test 2: /dev/zero — read returns all zeros
+        if phase55_ok {
+            let fname = b"zero";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(devfs_port, 0x2000, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2001 {
+                    let h = reply.data[0];
+
+                    let rd2 = (8u64) | ((rp as u64) << 32);
+                    syscall::send(devfs_port, 0x2100, h, 0, rd2, 0);
+                    if let Some(rr) = syscall::recv_msg(rp) {
+                        if rr.tag == 0x2101 {
+                            let len = rr.data[0] as usize;
+                            if len == 0 {
+                                syscall::debug_puts(b"  FAIL: devfs zero read empty\n");
+                                phase55_ok = false;
+                            }
+                            // Inline data in data[1] should be all zeros.
+                            if phase55_ok && rr.data[1] != 0 {
+                                syscall::debug_puts(b"  FAIL: devfs zero not zeros\n");
+                                phase55_ok = false;
+                            }
+                        } else { phase55_ok = false; }
+                    } else { phase55_ok = false; }
+
+                    syscall::send(devfs_port, 0x2400, h, 0, 0, 0);
+                } else {
+                    syscall::debug_puts(b"  FAIL: devfs open zero\n");
+                    phase55_ok = false;
+                }
+            } else { phase55_ok = false; }
+        }
+
+        // Test 3: /dev/full — write returns error, read returns zeros
+        if phase55_ok {
+            let fname = b"full";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(devfs_port, 0x2000, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2001 {
+                    let h = reply.data[0];
+
+                    // Write should fail with FS_ERROR.
+                    let wd1 = (16u64) | ((rp as u64) << 32);
+                    syscall::send(devfs_port, 0x2600, h, wd1, 0, 0);
+                    if let Some(wr) = syscall::recv_msg(rp) {
+                        if wr.tag != 0x2F00 { // FS_ERROR
+                            syscall::debug_puts(b"  FAIL: devfs full write should fail\n");
+                            phase55_ok = false;
+                        }
+                    } else { phase55_ok = false; }
+
+                    // Read should return zeros.
+                    if phase55_ok {
+                        let rd2 = (8u64) | ((rp as u64) << 32);
+                        syscall::send(devfs_port, 0x2100, h, 0, rd2, 0);
+                        if let Some(rr) = syscall::recv_msg(rp) {
+                            if rr.tag == 0x2101 {
+                                if rr.data[0] == 0 {
+                                    // zero-length is acceptable (same as zero device inline)
+                                } else if rr.data[1] != 0 {
+                                    syscall::debug_puts(b"  FAIL: devfs full read not zeros\n");
+                                    phase55_ok = false;
+                                }
+                            } else { phase55_ok = false; }
+                        } else { phase55_ok = false; }
+                    }
+
+                    syscall::send(devfs_port, 0x2400, h, 0, 0, 0);
+                } else {
+                    syscall::debug_puts(b"  FAIL: devfs open full\n");
+                    phase55_ok = false;
+                }
+            } else { phase55_ok = false; }
+        }
+
+        // Test 4: /dev/random — read returns non-zero data
+        if phase55_ok {
+            let fname = b"random";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(devfs_port, 0x2000, fn0, fn1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2001 {
+                    let h = reply.data[0];
+
+                    let rd2 = (8u64) | ((rp as u64) << 32);
+                    syscall::send(devfs_port, 0x2100, h, 0, rd2, 0);
+                    if let Some(rr) = syscall::recv_msg(rp) {
+                        if rr.tag == 0x2101 {
+                            let len = rr.data[0] as usize;
+                            if len == 0 {
+                                syscall::debug_puts(b"  FAIL: devfs random empty\n");
+                                phase55_ok = false;
+                            }
+                            // At least some data should be non-zero.
+                            if phase55_ok && rr.data[1] == 0 && rr.data[2] == 0 && rr.data[3] == 0 {
+                                syscall::debug_puts(b"  FAIL: devfs random all zeros\n");
+                                phase55_ok = false;
+                            }
+                        } else { phase55_ok = false; }
+                    } else { phase55_ok = false; }
+
+                    syscall::send(devfs_port, 0x2400, h, 0, 0, 0);
+                } else {
+                    syscall::debug_puts(b"  FAIL: devfs open random\n");
+                    phase55_ok = false;
+                }
+            } else { phase55_ok = false; }
+        }
+
+        // Test 5: READDIR — should see >= 7 entries
+        if phase55_ok {
+            let mut count = 0usize;
+            let mut next_off = 0u64;
+            for _ in 0..20 {
+                let d2 = rp as u64;
+                syscall::send(devfs_port, 0x2200, next_off, 0, d2, 0); // FS_READDIR
+                if let Some(rr) = syscall::recv_msg(rp) {
+                    if rr.tag == 0x2201 { // FS_READDIR_OK
+                        count += 1;
+                        next_off = rr.data[3]; // next offset
+                    } else {
+                        break; // FS_READDIR_END
+                    }
+                } else { break; }
+            }
+            if count < 7 {
+                syscall::debug_puts(b"  FAIL: devfs readdir < 7\n");
+                phase55_ok = false;
+            }
+        }
+
+        if phase55_ok {
+            syscall::debug_puts(b"Phase 55 devfs: PASSED\n");
+        } else if devfs_tid != u64::MAX {
+            syscall::debug_puts(b"Phase 55 devfs: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
