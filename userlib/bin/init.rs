@@ -4978,17 +4978,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    // --- Phase 58: BSD socket API (C test) ---
-    syscall::debug_puts(b"  init: testing BSD socket API (C)...\n");
+    // --- Phase 58: BSD socket API ---
+    syscall::debug_puts(b"  init: testing BSD socket API...\n");
     {
+        // Try C binary first (x86_64 only); fall back to Rust inline test.
         let sock_tid = syscall::spawn(b"sock_test", 50);
         if sock_tid != u64::MAX {
             loop {
                 if let Some(code) = syscall::waitpid(sock_tid) {
                     if code == 0 {
-                        syscall::debug_puts(b"Phase 58 socket API: PASSED\n");
+                        syscall::debug_puts(b"Phase 58 socket API (C): PASSED\n");
                     } else {
-                        syscall::debug_puts(b"Phase 58 socket API: FAILED (exit=");
+                        syscall::debug_puts(b"Phase 58 socket API (C): FAILED (exit=");
                         print_num(code);
                         syscall::debug_puts(b")\n");
                     }
@@ -4996,8 +4997,234 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 syscall::yield_now();
             }
-        } else {
-            syscall::debug_puts(b"Phase 58 socket API: SKIPPED (no sock_test in initramfs)\n");
+        }
+
+        // Rust inline socket test (exercises UDS IPC directly, all arches).
+        {
+            const UDS_SOCKET: u64 = 0x8000;
+            const UDS_BIND: u64 = 0x8010;
+            const UDS_LISTEN: u64 = 0x8020;
+            const UDS_CONNECT: u64 = 0x8030;
+            const UDS_ACCEPT: u64 = 0x8040;
+            const UDS_SEND: u64 = 0x8050;
+            const UDS_RECV: u64 = 0x8060;
+            const UDS_CLOSE: u64 = 0x8070;
+            const UDS_OK: u64 = 0x8100;
+            const UDS_EOF: u64 = 0x81FF;
+
+            let mut ok = true;
+
+            // Look up uds server.
+            let uds_port = match syscall::ns_lookup(b"uds") {
+                Some(p) => p,
+                None => {
+                    syscall::debug_puts(b"  FAIL: uds_srv not found for Phase 58 Rust test\n");
+                    0
+                }
+            };
+            if uds_port == 0 { ok = false; }
+
+            let rp = syscall::port_create() as u32;
+
+            let pack_name = |name: &[u8]| -> (u64, u64) {
+                let mut w0 = 0u64;
+                let mut w1 = 0u64;
+                let n = if name.len() < 16 { name.len() } else { 16 };
+                let mut i = 0;
+                while i < n && i < 8 {
+                    w0 |= (name[i] as u64) << (i * 8);
+                    i += 1;
+                }
+                while i < n {
+                    w1 |= (name[i] as u64) << ((i - 8) * 8);
+                    i += 1;
+                }
+                (w0, w1)
+            };
+
+            // socket(STREAM)
+            let mut srv_h = u32::MAX;
+            if ok {
+                let d2 = (rp as u64) << 32;
+                syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag == UDS_OK { srv_h = m.data[0] as u32; }
+                    else { ok = false; syscall::debug_puts(b"  FAIL58: socket\n"); }
+                }
+            }
+
+            // bind("p58.sock")
+            if ok {
+                let (n0, n1) = pack_name(b"p58.sock");
+                let d2 = 8u64 | ((rp as u64) << 32);
+                syscall::send(uds_port, UDS_BIND, srv_h as u64, n0, d2, n1);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag != UDS_OK { ok = false; syscall::debug_puts(b"  FAIL58: bind\n"); }
+                }
+            }
+
+            // listen
+            if ok {
+                let d2 = (rp as u64) << 32;
+                syscall::send(uds_port, UDS_LISTEN, srv_h as u64, 4, d2, 0);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag != UDS_OK { ok = false; syscall::debug_puts(b"  FAIL58: listen\n"); }
+                }
+            }
+
+            // connect("p58.sock") — returns client-end handle
+            let mut cli_h = u32::MAX;
+            if ok {
+                let (n0, n1) = pack_name(b"p58.sock");
+                let d2 = 8u64 | ((rp as u64) << 32);
+                let pid = syscall::getpid() as u64;
+                let uid = syscall::getuid() as u64;
+                syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, pid | (uid << 32));
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag == UDS_OK { cli_h = m.data[0] as u32; }
+                    else { ok = false; syscall::debug_puts(b"  FAIL58: connect\n"); }
+                }
+            }
+
+            // accept — returns server-end handle
+            let mut acc_h = u32::MAX;
+            if ok {
+                let d2 = (rp as u64) << 32;
+                syscall::send(uds_port, UDS_ACCEPT, srv_h as u64, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag == UDS_OK { acc_h = m.data[0] as u32; }
+                    else { ok = false; syscall::debug_puts(b"  FAIL58: accept\n"); }
+                }
+            }
+
+            // send "Hi" on cli, recv on acc
+            if ok {
+                let (w0, w1) = pack_name(b"Hi");
+                let d2 = 2u64 | ((rp as u64) << 32);
+                syscall::send(uds_port, UDS_SEND, cli_h as u64, w0, d2, w1);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag != UDS_OK { ok = false; }
+                }
+            }
+            if ok {
+                let d2 = (rp as u64) << 32;
+                syscall::send(uds_port, UDS_RECV, acc_h as u64, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag != UDS_OK || m.data[2] != 2 || (m.data[0] & 0xFF) as u8 != b'H' {
+                        ok = false;
+                        syscall::debug_puts(b"  FAIL58: recv Hi\n");
+                    }
+                }
+            }
+
+            // send "Ok" on acc, recv on cli
+            if ok {
+                let (w0, w1) = pack_name(b"Ok");
+                let d2 = 2u64 | ((rp as u64) << 32);
+                syscall::send(uds_port, UDS_SEND, acc_h as u64, w0, d2, w1);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag != UDS_OK { ok = false; }
+                }
+            }
+            if ok {
+                let d2 = (rp as u64) << 32;
+                syscall::send(uds_port, UDS_RECV, cli_h as u64, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag != UDS_OK || (m.data[0] & 0xFF) as u8 != b'O' {
+                        ok = false;
+                        syscall::debug_puts(b"  FAIL58: recv Ok\n");
+                    }
+                }
+            }
+
+            // close client, verify EOF on server recv
+            if ok {
+                let d2 = (rp as u64) << 32;
+                syscall::send(uds_port, UDS_CLOSE, cli_h as u64, 0, d2, 0);
+                let _ = syscall::recv_msg(rp);
+                cli_h = u32::MAX;
+            }
+            if ok {
+                let d2 = (rp as u64) << 32;
+                syscall::send(uds_port, UDS_RECV, acc_h as u64, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag != UDS_EOF {
+                        ok = false;
+                        syscall::debug_puts(b"  FAIL58: expected EOF\n");
+                    }
+                }
+            }
+
+            // Larger data test: send 32 bytes in two chunks, recv both
+            // Re-create a fresh connection for this.
+            let mut cli2 = u32::MAX;
+            let mut acc2 = u32::MAX;
+            if ok {
+                let (n0, n1) = pack_name(b"p58.sock");
+                let d2 = 8u64 | ((rp as u64) << 32);
+                let pid = syscall::getpid() as u64;
+                syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, pid);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag == UDS_OK { cli2 = m.data[0] as u32; }
+                    else { ok = false; }
+                }
+            }
+            if ok {
+                let d2 = (rp as u64) << 32;
+                syscall::send(uds_port, UDS_ACCEPT, srv_h as u64, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag == UDS_OK { acc2 = m.data[0] as u32; }
+                    else { ok = false; }
+                }
+            }
+            // Send 16 bytes "ABCDEFGHIJKLMNOP"
+            if ok {
+                let (w0, w1) = pack_name(b"ABCDEFGHIJKLMNOP");
+                let d2 = 16u64 | ((rp as u64) << 32);
+                syscall::send(uds_port, UDS_SEND, cli2 as u64, w0, d2, w1);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag != UDS_OK || m.data[0] != 16 {
+                        ok = false;
+                        syscall::debug_puts(b"  FAIL58: send 16B\n");
+                    }
+                }
+            }
+            // Recv should get 16 bytes back
+            if ok {
+                let d2 = (rp as u64) << 32;
+                syscall::send(uds_port, UDS_RECV, acc2 as u64, 0, d2, 0);
+                if let Some(m) = syscall::recv_msg(rp) {
+                    if m.tag != UDS_OK || m.data[2] != 16 || (m.data[0] & 0xFF) as u8 != b'A' {
+                        ok = false;
+                        syscall::debug_puts(b"  FAIL58: recv 16B\n");
+                    }
+                }
+            }
+
+            // Clean up.
+            if cli2 != u32::MAX {
+                let d2 = (rp as u64) << 32;
+                syscall::send(uds_port, UDS_CLOSE, cli2 as u64, 0, d2, 0);
+                let _ = syscall::recv_msg(rp);
+            }
+            if acc2 != u32::MAX {
+                let d2 = (rp as u64) << 32;
+                syscall::send(uds_port, UDS_CLOSE, acc2 as u64, 0, d2, 0);
+                let _ = syscall::recv_msg(rp);
+            }
+            if acc_h != u32::MAX {
+                let d2 = (rp as u64) << 32;
+                syscall::send(uds_port, UDS_CLOSE, acc_h as u64, 0, d2, 0);
+                let _ = syscall::recv_msg(rp);
+            }
+
+            syscall::port_destroy(rp);
+
+            if ok {
+                syscall::debug_puts(b"Phase 58 socket API (Rust): PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 58 socket API (Rust): FAILED\n");
+            }
         }
     }
 
