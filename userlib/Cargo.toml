@@ -114,3 +114,7 @@ path = "bin/uds_srv.rs"
 [[bin]]
 name = "pipe_srv"
 path = "bin/pipe_srv.rs"
+
+[[bin]]
+name = "pty_srv"
+path = "bin/pty_srv.rs"

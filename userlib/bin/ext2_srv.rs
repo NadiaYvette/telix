@@ -38,9 +38,21 @@ const FS_DELETE: u64 = 0x2700;
 const FS_DELETE_OK: u64 = 0x2701;
 const FS_ERROR: u64 = 0x2F00;
 
+// File lock protocol.
+const FS_FLOCK: u64 = 0x2800;
+const FS_FLOCK_OK: u64 = 0x2801;
+const FS_GETLK: u64 = 0x2810;
+const FS_GETLK_OK: u64 = 0x2811;
+const FS_SETLK: u64 = 0x2820;
+const FS_SETLK_OK: u64 = 0x2821;
+const FS_SETLKW: u64 = 0x2830;
+const FS_SETLKW_OK: u64 = 0x2831;
+const FS_LOCK_ERR: u64 = 0x28FF;
+
 const ERR_NOT_FOUND: u64 = 1;
 const ERR_IO: u64 = 2;
 const ERR_INVALID: u64 = 3;
+const ERR_AGAIN: u64 = 11;
 
 const MAX_OPEN_FILES: usize = 8;
 const MAX_INLINE: usize = 24;
@@ -162,6 +174,7 @@ struct OpenFile {
     block_ptrs: [u32; 15], // i_block[0..14]
     active: bool,
     writable: bool,
+    pid: u32,
 }
 
 impl OpenFile {
@@ -175,6 +188,118 @@ impl OpenFile {
             block_ptrs: [0; 15],
             active: false,
             writable: false,
+            pid: 0,
+        }
+    }
+}
+
+// --- Advisory file lock table ---
+
+const MAX_LOCKS: usize = 32;
+const MAX_LOCK_WAITERS: usize = 8;
+const LK_RDLCK: u8 = 0;
+const LK_WRLCK: u8 = 1;
+const LK_UNLCK: u8 = 2;
+
+#[derive(Clone, Copy)]
+struct FileLock {
+    active: bool,
+    inode: u32,
+    pid: u32,
+    lock_type: u8,
+    start: u64,
+    len: u64,
+}
+
+impl FileLock {
+    const fn empty() -> Self {
+        Self { active: false, inode: 0, pid: 0, lock_type: 0, start: 0, len: 0 }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LockWaiter {
+    active: bool,
+    reply_port: u32,
+    inode: u32,
+    pid: u32,
+    lock_type: u8,
+    start: u64,
+    len: u64,
+}
+
+impl LockWaiter {
+    const fn empty() -> Self {
+        Self { active: false, reply_port: 0, inode: 0, pid: 0, lock_type: 0, start: 0, len: 0 }
+    }
+}
+
+fn ranges_overlap(s1: u64, l1: u64, s2: u64, l2: u64) -> bool {
+    let e1 = if l1 == 0 { u64::MAX } else { s1.saturating_add(l1) };
+    let e2 = if l2 == 0 { u64::MAX } else { s2.saturating_add(l2) };
+    s1 < e2 && s2 < e1
+}
+
+fn ext2_lock_conflicts(
+    locks: &[FileLock; MAX_LOCKS], inode: u32, pid: u32, lock_type: u8, start: u64, len: u64,
+) -> bool {
+    for lk in locks.iter() {
+        if !lk.active || lk.inode != inode || lk.pid == pid { continue; }
+        if lk.lock_type == LK_RDLCK && lock_type == LK_RDLCK { continue; }
+        if ranges_overlap(lk.start, lk.len, start, len) { return true; }
+    }
+    false
+}
+
+fn ext2_find_conflict(
+    locks: &[FileLock; MAX_LOCKS], inode: u32, pid: u32, lock_type: u8, start: u64, len: u64,
+) -> Option<usize> {
+    for (i, lk) in locks.iter().enumerate() {
+        if !lk.active || lk.inode != inode || lk.pid == pid { continue; }
+        if lk.lock_type == LK_RDLCK && lock_type == LK_RDLCK { continue; }
+        if ranges_overlap(lk.start, lk.len, start, len) { return Some(i); }
+    }
+    None
+}
+
+fn ext2_acquire_lock(
+    locks: &mut [FileLock; MAX_LOCKS], inode: u32, pid: u32, lock_type: u8, start: u64, len: u64,
+) -> bool {
+    for lk in locks.iter_mut() {
+        if lk.active && lk.inode == inode && lk.pid == pid
+            && ranges_overlap(lk.start, lk.len, start, len) { lk.active = false; }
+    }
+    for lk in locks.iter_mut() {
+        if !lk.active {
+            *lk = FileLock { active: true, inode, pid, lock_type, start, len };
+            return true;
+        }
+    }
+    false
+}
+
+fn ext2_release_locks(locks: &mut [FileLock; MAX_LOCKS], inode: u32, pid: u32, start: u64, len: u64) {
+    for lk in locks.iter_mut() {
+        if lk.active && lk.inode == inode && lk.pid == pid {
+            if (start == 0 && len == 0) || ranges_overlap(lk.start, lk.len, start, len) {
+                lk.active = false;
+            }
+        }
+    }
+}
+
+fn ext2_try_wake_waiters(
+    locks: &mut [FileLock; MAX_LOCKS], waiters: &mut [LockWaiter; MAX_LOCK_WAITERS], inode: u32,
+) {
+    for w in waiters.iter_mut() {
+        if !w.active || w.inode != inode { continue; }
+        if !ext2_lock_conflicts(locks, w.inode, w.pid, w.lock_type, w.start, w.len) {
+            if ext2_acquire_lock(locks, w.inode, w.pid, w.lock_type, w.start, w.len) {
+                syscall::send(w.reply_port, FS_FLOCK_OK, 0, 0, 0, 0);
+            } else {
+                syscall::send(w.reply_port, FS_LOCK_ERR, ERR_AGAIN as u64, 0, 0, 0);
+            }
+            w.active = false;
         }
     }
 }
@@ -1017,6 +1142,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
     // Open file table.
     let mut open_files = [OpenFile::empty(); MAX_OPEN_FILES];
+    let mut file_locks = [FileLock::empty(); MAX_LOCKS];
+    let mut lock_waiters = [LockWaiter::empty(); MAX_LOCK_WAITERS];
 
     // Server loop.
     loop {
@@ -1029,6 +1156,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             FS_OPEN => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
                 let reply_port = (msg.data[2] >> 32) as u32;
+                let caller_pid = msg.data[3] as u32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
 
@@ -1062,6 +1190,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                                 f.uid = uid;
                                 f.gid = gid;
                                 f.block_ptrs = blocks;
+                                f.pid = caller_pid;
                                 handle = i as u64;
                                 break;
                             }
@@ -1210,8 +1339,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             FS_CLOSE => {
                 let handle = msg.data[0] as usize;
                 if handle < MAX_OPEN_FILES && open_files[handle].active {
+                    let ino = open_files[handle].inode_num;
+                    let pid = open_files[handle].pid;
                     if open_files[handle].writable {
-                        // Flush inode with updated size and block pointers.
                         let f = &open_files[handle];
                         write_inode(&blk, &sb, &bgd, f.inode_num,
                             f.mode, f.uid, f.gid, f.file_size, &f.block_ptrs);
@@ -1219,12 +1349,25 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                     open_files[handle].active = false;
                     open_files[handle].writable = false;
+                    // Release locks if no other handles from same PID to same inode.
+                    let mut still_open = false;
+                    for f in open_files.iter() {
+                        if f.active && f.inode_num == ino && f.pid == pid {
+                            still_open = true;
+                            break;
+                        }
+                    }
+                    if !still_open {
+                        ext2_release_locks(&mut file_locks, ino, pid, 0, 0);
+                        ext2_try_wake_waiters(&mut file_locks, &mut lock_waiters, ino);
+                    }
                 }
             }
 
             FS_CREATE => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
                 let reply_port = (msg.data[2] >> 32) as u32;
+                let caller_pid = msg.data[3] as u32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
 
@@ -1288,6 +1431,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         f.uid = 0;
                         f.gid = 0;
                         f.block_ptrs = block_ptrs;
+                        f.pid = caller_pid;
                         handle = i as u64;
                         break;
                     }
@@ -1513,6 +1657,127 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 flush_superblock(&blk, &sb);
 
                 syscall::send(reply_port, FS_DELETE_OK, 0, 0, 0, 0);
+            }
+
+            FS_FLOCK => {
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
+                let operation = (msg.data[0] >> 32) as i32;
+                let pid = msg.data[1] as u32;
+                let reply_port = (msg.data[2] >> 32) as u32;
+
+                if handle >= MAX_OPEN_FILES || !open_files[handle].active {
+                    syscall::send(reply_port, FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0);
+                    continue;
+                }
+                let ino = open_files[handle].inode_num;
+                let is_unlock = operation & 8 != 0;
+                let is_nb = operation & 4 != 0;
+                let lock_type = if operation & 2 != 0 { LK_WRLCK }
+                                else if operation & 1 != 0 { LK_RDLCK }
+                                else { LK_UNLCK };
+
+                if is_unlock {
+                    ext2_release_locks(&mut file_locks, ino, pid, 0, 0);
+                    ext2_try_wake_waiters(&mut file_locks, &mut lock_waiters, ino);
+                    syscall::send(reply_port, FS_FLOCK_OK, 0, 0, 0, 0);
+                } else if !ext2_lock_conflicts(&file_locks, ino, pid, lock_type, 0, 0) {
+                    if ext2_acquire_lock(&mut file_locks, ino, pid, lock_type, 0, 0) {
+                        syscall::send(reply_port, FS_FLOCK_OK, 0, 0, 0, 0);
+                    } else {
+                        syscall::send(reply_port, FS_LOCK_ERR, ERR_AGAIN as u64, 0, 0, 0);
+                    }
+                } else if is_nb {
+                    syscall::send(reply_port, FS_LOCK_ERR, ERR_AGAIN as u64, 0, 0, 0);
+                } else {
+                    let mut queued = false;
+                    for w in lock_waiters.iter_mut() {
+                        if !w.active {
+                            *w = LockWaiter {
+                                active: true, reply_port, inode: ino,
+                                pid, lock_type, start: 0, len: 0,
+                            };
+                            queued = true;
+                            break;
+                        }
+                    }
+                    if !queued {
+                        syscall::send(reply_port, FS_LOCK_ERR, ERR_AGAIN as u64, 0, 0, 0);
+                    }
+                }
+            }
+
+            FS_SETLK | FS_SETLKW => {
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
+                let lock_type = ((msg.data[0] >> 32) & 0xFFFF) as u8;
+                let pid = msg.data[3] as u32;
+                let start = msg.data[1];
+                let len = (msg.data[2] & 0xFFFF_FFFF) as u64;
+                let reply_port = (msg.data[2] >> 32) as u32;
+                let blocking = msg.tag == FS_SETLKW;
+
+                if handle >= MAX_OPEN_FILES || !open_files[handle].active {
+                    syscall::send(reply_port, FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0);
+                    continue;
+                }
+                let ino = open_files[handle].inode_num;
+
+                if lock_type == LK_UNLCK {
+                    ext2_release_locks(&mut file_locks, ino, pid, start, len);
+                    ext2_try_wake_waiters(&mut file_locks, &mut lock_waiters, ino);
+                    let ok_tag = if blocking { FS_SETLKW_OK } else { FS_SETLK_OK };
+                    syscall::send(reply_port, ok_tag, 0, 0, 0, 0);
+                } else if !ext2_lock_conflicts(&file_locks, ino, pid, lock_type, start, len) {
+                    if ext2_acquire_lock(&mut file_locks, ino, pid, lock_type, start, len) {
+                        let ok_tag = if blocking { FS_SETLKW_OK } else { FS_SETLK_OK };
+                        syscall::send(reply_port, ok_tag, 0, 0, 0, 0);
+                    } else {
+                        syscall::send(reply_port, FS_LOCK_ERR, ERR_AGAIN as u64, 0, 0, 0);
+                    }
+                } else if !blocking {
+                    syscall::send(reply_port, FS_LOCK_ERR, ERR_AGAIN as u64, 0, 0, 0);
+                } else {
+                    let mut queued = false;
+                    for w in lock_waiters.iter_mut() {
+                        if !w.active {
+                            *w = LockWaiter {
+                                active: true, reply_port, inode: ino,
+                                pid, lock_type, start, len,
+                            };
+                            queued = true;
+                            break;
+                        }
+                    }
+                    if !queued {
+                        syscall::send(reply_port, FS_LOCK_ERR, ERR_AGAIN as u64, 0, 0, 0);
+                    }
+                }
+            }
+
+            FS_GETLK => {
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
+                let lock_type = ((msg.data[0] >> 32) & 0xFFFF) as u8;
+                let pid = msg.data[3] as u32;
+                let start = msg.data[1];
+                let len = (msg.data[2] & 0xFFFF_FFFF) as u64;
+                let reply_port = (msg.data[2] >> 32) as u32;
+
+                if handle >= MAX_OPEN_FILES || !open_files[handle].active {
+                    syscall::send(reply_port, FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0);
+                    continue;
+                }
+                let ino = open_files[handle].inode_num;
+
+                match ext2_find_conflict(&file_locks, ino, pid, lock_type, start, len) {
+                    Some(idx) => {
+                        let lk = &file_locks[idx];
+                        let d0 = (lk.lock_type as u64) | ((lk.pid as u64) << 32);
+                        syscall::send(reply_port, FS_GETLK_OK, d0, lk.start, lk.len, 0);
+                    }
+                    None => {
+                        let d0 = LK_UNLCK as u64;
+                        syscall::send(reply_port, FS_GETLK_OK, d0, 0, 0, 0);
+                    }
+                }
             }
 
             _ => {}

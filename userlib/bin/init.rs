@@ -5467,6 +5467,468 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 61: File locking ---
+    syscall::debug_puts(b"  init: testing file locking...\n");
+    {
+        let mut phase61_ok = true;
+
+        // Look up tmpfs port (already running from Phase 54).
+        let tmpfs_port = match syscall::ns_lookup(b"tmpfs") {
+            Some(p) => p,
+            None => {
+                syscall::debug_puts(b"  FAIL: ns_lookup(tmpfs) failed\n");
+                phase61_ok = false;
+                0
+            }
+        };
+
+        let rp = if phase61_ok { syscall::port_create() as u32 } else { 0 };
+
+        // Create a test file for locking.
+        let mut handle = 0u64;
+        if phase61_ok {
+            let fname = b"locktest";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            syscall::send(tmpfs_port, 0x2500, fn0, fn1, d2, 0); // FS_CREATE
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2501 {
+                    handle = reply.data[0];
+                } else {
+                    syscall::debug_puts(b"  FAIL: tmpfs CREATE locktest\n");
+                    phase61_ok = false;
+                }
+            } else { phase61_ok = false; }
+        }
+
+        // Test 1: flock(LOCK_EX) + flock(LOCK_UN) — basic acquire/release.
+        if phase61_ok {
+            let pid = syscall::getpid() as u32;
+            let d0 = handle | (2u64 << 32); // LOCK_EX = 2
+            let d1 = pid as u64;
+            let d2 = (rp as u64) << 32;
+            syscall::send(tmpfs_port, 0x2800, d0, d1, d2, 0); // FS_FLOCK
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag != 0x2801 {
+                    syscall::debug_puts(b"  FAIL: flock(EX) failed\n");
+                    phase61_ok = false;
+                }
+            } else { phase61_ok = false; }
+        }
+        if phase61_ok {
+            let pid = syscall::getpid() as u32;
+            let d0 = handle | (8u64 << 32); // LOCK_UN = 8
+            let d1 = pid as u64;
+            let d2 = (rp as u64) << 32;
+            syscall::send(tmpfs_port, 0x2800, d0, d1, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag != 0x2801 {
+                    syscall::debug_puts(b"  FAIL: flock(UN) failed\n");
+                    phase61_ok = false;
+                }
+            } else { phase61_ok = false; }
+        }
+
+        // Test 2: flock(LOCK_SH) from two "PIDs" — both should succeed.
+        if phase61_ok {
+            // PID 100: LOCK_SH
+            let d0 = handle | (1u64 << 32); // LOCK_SH = 1
+            let d2 = (rp as u64) << 32;
+            syscall::send(tmpfs_port, 0x2800, d0, 100u64, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag != 0x2801 {
+                    syscall::debug_puts(b"  FAIL: flock SH pid=100\n");
+                    phase61_ok = false;
+                }
+            } else { phase61_ok = false; }
+        }
+        if phase61_ok {
+            // PID 200: LOCK_SH — should also succeed (shared).
+            let d0 = handle | (1u64 << 32);
+            let d2 = (rp as u64) << 32;
+            syscall::send(tmpfs_port, 0x2800, d0, 200u64, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag != 0x2801 {
+                    syscall::debug_puts(b"  FAIL: flock SH pid=200\n");
+                    phase61_ok = false;
+                }
+            } else { phase61_ok = false; }
+        }
+
+        // Test 3: flock(LOCK_EX|LOCK_NB) with existing SH locks — should get EAGAIN.
+        if phase61_ok {
+            let d0 = handle | (6u64 << 32); // LOCK_EX|LOCK_NB = 2|4 = 6
+            let d2 = (rp as u64) << 32;
+            syscall::send(tmpfs_port, 0x2800, d0, 300u64, d2, 0);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag != 0x28FF { // FS_LOCK_ERR expected
+                    syscall::debug_puts(b"  FAIL: flock EX|NB no EAGAIN\n");
+                    phase61_ok = false;
+                }
+            } else { phase61_ok = false; }
+        }
+
+        // Cleanup: unlock both SH locks.
+        if phase61_ok {
+            let d0 = handle | (8u64 << 32);
+            let d2 = (rp as u64) << 32;
+            syscall::send(tmpfs_port, 0x2800, d0, 100u64, d2, 0);
+            let _ = syscall::recv_msg(rp);
+            syscall::send(tmpfs_port, 0x2800, d0, 200u64, d2, 0);
+            let _ = syscall::recv_msg(rp);
+        }
+
+        // Test 4: fcntl F_SETLK non-overlapping ranges — no conflict.
+        if phase61_ok {
+            // PID 100: write lock [0, 100)
+            let d0 = handle | (1u64 << 32); // lock_type=F_WRLCK(1) in bits 32..47
+            let d1 = 0u64; // start = 0
+            let d2 = 100u64 | ((rp as u64) << 32); // len = 100
+            let d3 = 100u64; // pid = 100
+            syscall::send(tmpfs_port, 0x2820, d0, d1, d2, d3); // FS_SETLK
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag != 0x2821 {
+                    syscall::debug_puts(b"  FAIL: SETLK [0,100)\n");
+                    phase61_ok = false;
+                }
+            } else { phase61_ok = false; }
+        }
+        if phase61_ok {
+            // PID 200: write lock [100, 200) — no overlap, should succeed.
+            let d0 = handle | (1u64 << 32);
+            let d1 = 100u64;
+            let d2 = 100u64 | ((rp as u64) << 32);
+            let d3 = 200u64;
+            syscall::send(tmpfs_port, 0x2820, d0, d1, d2, d3);
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag != 0x2821 {
+                    syscall::debug_puts(b"  FAIL: SETLK [100,200)\n");
+                    phase61_ok = false;
+                }
+            } else { phase61_ok = false; }
+        }
+
+        // Test 5: F_GETLK — query conflicting lock.
+        if phase61_ok {
+            // PID 300 queries write lock [0,100) — should see PID 100's lock.
+            let d0 = handle | (1u64 << 32); // F_WRLCK
+            let d1 = 0u64;
+            let d2 = 100u64 | ((rp as u64) << 32);
+            let d3 = 300u64;
+            syscall::send(tmpfs_port, 0x2810, d0, d1, d2, d3); // FS_GETLK
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2811 {
+                    let ret_type = (reply.data[0] & 0xFFFF) as u8;
+                    let ret_pid = (reply.data[0] >> 32) as u32;
+                    if ret_type == 2 { // F_UNLCK = no conflict?
+                        syscall::debug_puts(b"  FAIL: GETLK no conflict\n");
+                        phase61_ok = false;
+                    } else if ret_pid != 100 {
+                        syscall::debug_puts(b"  FAIL: GETLK wrong pid\n");
+                        phase61_ok = false;
+                    }
+                } else {
+                    syscall::debug_puts(b"  FAIL: GETLK error\n");
+                    phase61_ok = false;
+                }
+            } else { phase61_ok = false; }
+        }
+
+        // Cleanup: unlock range locks.
+        if phase61_ok {
+            // PID 100: F_UNLCK [0,100)
+            let d0 = handle | (2u64 << 32); // F_UNLCK=2
+            let d2 = 100u64 | ((rp as u64) << 32);
+            syscall::send(tmpfs_port, 0x2820, d0, 0u64, d2, 100u64);
+            let _ = syscall::recv_msg(rp);
+            // PID 200: F_UNLCK [100,200)
+            syscall::send(tmpfs_port, 0x2820, d0, 100u64, d2, 200u64);
+            let _ = syscall::recv_msg(rp);
+        }
+
+        // Test 6: Lock cleanup on close.
+        if phase61_ok {
+            // Open a second handle to the same file.
+            let fname = b"locktest";
+            let (fn0, fn1, _) = pack_name(fname);
+            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            // Pack PID=400 in d3.
+            syscall::send(tmpfs_port, 0x2000, fn0, fn1, d2, 400u64); // FS_OPEN
+            if let Some(reply) = syscall::recv_msg(rp) {
+                if reply.tag == 0x2001 {
+                    let h2 = reply.data[0];
+                    // Take exclusive lock with PID 400.
+                    let d0 = h2 | (2u64 << 32); // LOCK_EX
+                    let d2 = (rp as u64) << 32;
+                    syscall::send(tmpfs_port, 0x2800, d0, 400u64, d2, 0);
+                    if let Some(lr) = syscall::recv_msg(rp) {
+                        if lr.tag != 0x2801 {
+                            syscall::debug_puts(b"  FAIL: lock for close test\n");
+                            phase61_ok = false;
+                        }
+                    }
+                    // Close h2 — should release lock.
+                    syscall::send(tmpfs_port, 0x2400, h2, 0, 0, 0); // FS_CLOSE
+
+                    // Now PID 500 should be able to take EX lock.
+                    if phase61_ok {
+                        let d0 = handle | (6u64 << 32); // LOCK_EX|LOCK_NB
+                        let d2 = (rp as u64) << 32;
+                        syscall::send(tmpfs_port, 0x2800, d0, 500u64, d2, 0);
+                        if let Some(lr2) = syscall::recv_msg(rp) {
+                            if lr2.tag != 0x2801 {
+                                syscall::debug_puts(b"  FAIL: lock after close\n");
+                                phase61_ok = false;
+                            }
+                        }
+                        // Clean up: unlock.
+                        let d0 = handle | (8u64 << 32);
+                        let d2 = (rp as u64) << 32;
+                        syscall::send(tmpfs_port, 0x2800, d0, 500u64, d2, 0);
+                        let _ = syscall::recv_msg(rp);
+                    }
+                } else {
+                    syscall::debug_puts(b"  FAIL: open for close test\n");
+                    phase61_ok = false;
+                }
+            } else { phase61_ok = false; }
+        }
+
+        if rp != 0 { syscall::port_destroy(rp); }
+
+        if phase61_ok {
+            syscall::debug_puts(b"Phase 61 file locking: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 61 file locking: FAILED\n");
+        }
+    }
+
+    // --- Phase 62: PTY subsystem ---
+    syscall::debug_puts(b"  init: testing PTY subsystem...\n");
+    {
+        // Spawn pty_srv.
+        let pty_tid = syscall::spawn(b"pty_srv", 50);
+        let mut phase62_ok = pty_tid != u64::MAX;
+        if !phase62_ok {
+            syscall::debug_puts(b"  FAIL: cannot spawn pty_srv\n");
+        }
+
+        // Wait for pty server to register.
+        if phase62_ok {
+            let mut found = false;
+            for _ in 0..100 {
+                if syscall::ns_lookup(b"pty").is_some() {
+                    found = true;
+                    break;
+                }
+                syscall::sleep_ms(10);
+            }
+            if !found {
+                syscall::debug_puts(b"  FAIL: ns_lookup(pty) failed\n");
+                phase62_ok = false;
+            }
+        }
+
+        // Test 1: openpty() returns valid pair.
+        let (master_fd, slave_fd) = if phase62_ok {
+            match userlib::pty::openpty() {
+                Some(pair) => pair,
+                None => {
+                    syscall::debug_puts(b"  FAIL: openpty() returned None\n");
+                    phase62_ok = false;
+                    (-1, -1)
+                }
+            }
+        } else { (-1, -1) };
+
+        // Disable canonical mode for raw tests — set via ioctl.
+        // TCSETS: d1 = lflag(32) | oflag(32), d3 = cc bytes
+        if phase62_ok {
+            // Set raw mode: lflag = ECHO only (no ICANON, no ISIG), oflag = 0
+            let lflag = 0u32; // raw: no ECHO, no ICANON, no ISIG
+            let oflag = 0u32; // no OPOST
+            let arg0 = (lflag as u64) | ((oflag as u64) << 32);
+            // Default cc values.
+            let arg1 = 0x001A157F04030000u64; // packed cc bytes (doesn't matter in raw)
+            let _ = userlib::pty::pty_ioctl(slave_fd, 0x5402, arg0, arg1); // TCSETS
+        }
+
+        // Test 2: Raw mode — master write → slave read.
+        if phase62_ok {
+            let written = userlib::pty::pty_write_fd(master_fd, b"raw");
+            if written != 3 {
+                syscall::debug_puts(b"  FAIL: master write returned wrong len\n");
+                phase62_ok = false;
+            }
+        }
+        if phase62_ok {
+            let mut buf = [0u8; 16];
+            let n = userlib::pty::pty_read_fd(slave_fd, &mut buf);
+            if n != 3 || buf[0] != b'r' || buf[1] != b'a' || buf[2] != b'w' {
+                syscall::debug_puts(b"  FAIL: slave read mismatch\n");
+                phase62_ok = false;
+            }
+        }
+
+        // Test 3: Raw mode — slave write → master read.
+        if phase62_ok {
+            userlib::pty::pty_write_fd(slave_fd, b"slv");
+            let mut buf = [0u8; 16];
+            let n = userlib::pty::pty_read_fd(master_fd, &mut buf);
+            if n != 3 || buf[0] != b's' || buf[1] != b'l' || buf[2] != b'v' {
+                syscall::debug_puts(b"  FAIL: master read mismatch\n");
+                phase62_ok = false;
+            }
+        }
+
+        // Test 4: Canonical mode — write "abc\n" to master → slave reads "abc\n".
+        if phase62_ok {
+            // Enable canonical mode: lflag = ECHO | ICANON
+            let lflag = 0x000Au32; // ECHO(0x08) | ICANON(0x02)
+            let oflag = 0x0005u32; // OPOST(0x01) | ONLCR(0x04)
+            let arg0 = (lflag as u64) | ((oflag as u64) << 32);
+            let cc_packed = 0x0000001A157F0403u64;
+            let _ = userlib::pty::pty_ioctl(slave_fd, 0x5402, arg0, cc_packed);
+        }
+        if phase62_ok {
+            userlib::pty::pty_write_fd(master_fd, b"abc\n");
+            let mut buf = [0u8; 16];
+            let n = userlib::pty::pty_read_fd(slave_fd, &mut buf);
+            if n != 4 || buf[0] != b'a' || buf[1] != b'b' || buf[2] != b'c' || buf[3] != b'\n' {
+                syscall::debug_puts(b"  FAIL: canonical read mismatch\n");
+                phase62_ok = false;
+            }
+        }
+
+        // Test 5: Canonical echo — master should see echo back.
+        if phase62_ok {
+            // Drain any leftover echo from previous test.
+            // The "abc\n" write above would have echoed "abc\r\n" to s2m.
+            let mut drain = [0u8; 64];
+            // Non-blocking drain: use poll.
+            let mut fds = [userlib::poll::PollFd { fd: master_fd, events: userlib::poll::POLLIN, revents: 0 }];
+            while userlib::poll::poll(&mut fds, 0) > 0 && fds[0].revents & userlib::poll::POLLIN != 0 {
+                userlib::pty::pty_read_fd(master_fd, &mut drain);
+                fds[0].revents = 0;
+            }
+
+            // Now write "hi\n" and check echo.
+            userlib::pty::pty_write_fd(master_fd, b"hi\n");
+
+            // Read echo from master — should see "hi\r\n".
+            let mut echo_buf = [0u8; 16];
+            let n = userlib::pty::pty_read_fd(master_fd, &mut echo_buf);
+            // Echo: 'h', 'i', '\r', '\n'
+            if n < 4 || echo_buf[0] != b'h' || echo_buf[1] != b'i' {
+                syscall::debug_puts(b"  FAIL: echo mismatch\n");
+                phase62_ok = false;
+            }
+            // Also drain the slave so it doesn't block future tests.
+            let mut sbuf = [0u8; 16];
+            let _ = userlib::pty::pty_read_fd(slave_fd, &mut sbuf);
+        }
+
+        // Test 6: Line editing — write "ab<DEL>c\n" → slave gets "ac\n".
+        if phase62_ok {
+            // Drain master echo first.
+            let mut fds = [userlib::poll::PollFd { fd: master_fd, events: userlib::poll::POLLIN, revents: 0 }];
+            let mut drain = [0u8; 64];
+            while userlib::poll::poll(&mut fds, 0) > 0 && fds[0].revents & userlib::poll::POLLIN != 0 {
+                userlib::pty::pty_read_fd(master_fd, &mut drain);
+                fds[0].revents = 0;
+            }
+
+            userlib::pty::pty_write_fd(master_fd, b"ab\x7fc\n");
+            let mut buf = [0u8; 16];
+            let n = userlib::pty::pty_read_fd(slave_fd, &mut buf);
+            if n != 3 || buf[0] != b'a' || buf[1] != b'c' || buf[2] != b'\n' {
+                syscall::debug_puts(b"  FAIL: line edit mismatch\n");
+                phase62_ok = false;
+            }
+        }
+
+        // Test 7: Window size ioctl.
+        if phase62_ok {
+            // Set window size: 50 rows, 120 cols.
+            let arg0 = 50u64 | (120u64 << 16);
+            let _ = userlib::pty::pty_ioctl(slave_fd, 0x5414, arg0, 0); // TIOCSWINSZ
+            // Get window size.
+            if let Some((d0, _)) = userlib::pty::pty_ioctl(slave_fd, 0x5413, 0, 0) {
+                let rows = (d0 & 0xFFFF) as u16;
+                let cols = ((d0 >> 16) & 0xFFFF) as u16;
+                if rows != 50 || cols != 120 {
+                    syscall::debug_puts(b"  FAIL: winsize mismatch\n");
+                    phase62_ok = false;
+                }
+            } else {
+                syscall::debug_puts(b"  FAIL: TIOCGWINSZ failed\n");
+                phase62_ok = false;
+            }
+        }
+
+        // Test 8: Close master → slave gets EOF.
+        if phase62_ok {
+            // Drain any pending data first.
+            let mut fds = [userlib::poll::PollFd { fd: master_fd, events: userlib::poll::POLLIN, revents: 0 }];
+            let mut drain = [0u8; 64];
+            while userlib::poll::poll(&mut fds, 0) > 0 && fds[0].revents & userlib::poll::POLLIN != 0 {
+                userlib::pty::pty_read_fd(master_fd, &mut drain);
+                fds[0].revents = 0;
+            }
+
+            userlib::pty::pty_close_fd(master_fd);
+            let mut buf = [0u8; 16];
+            let n = userlib::pty::pty_read_fd(slave_fd, &mut buf);
+            if n != 0 {
+                syscall::debug_puts(b"  FAIL: slave read after master close not EOF\n");
+                phase62_ok = false;
+            }
+            userlib::pty::pty_close_fd(slave_fd);
+        } else {
+            if master_fd >= 0 { userlib::pty::pty_close_fd(master_fd); }
+            if slave_fd >= 0 { userlib::pty::pty_close_fd(slave_fd); }
+        }
+
+        // Test 9: Poll — master POLLIN after slave writes.
+        if phase62_ok {
+            if let Some((m2, s2)) = userlib::pty::openpty() {
+                // Disable canonical mode for clean poll test.
+                let _ = userlib::pty::pty_ioctl(s2, 0x5402, 0u64, 0u64);
+
+                // Poll master — should not be ready.
+                let mut fds = [userlib::poll::PollFd { fd: m2, events: userlib::poll::POLLIN, revents: 0 }];
+                let n = userlib::poll::poll(&mut fds, 0);
+                if n != 0 {
+                    syscall::debug_puts(b"  FAIL: poll master ready before write\n");
+                    phase62_ok = false;
+                }
+
+                // Slave writes, then poll master.
+                if phase62_ok {
+                    userlib::pty::pty_write_fd(s2, b"p");
+                    let mut fds = [userlib::poll::PollFd { fd: m2, events: userlib::poll::POLLIN, revents: 0 }];
+                    let n = userlib::poll::poll(&mut fds, 0);
+                    if n != 1 || fds[0].revents & userlib::poll::POLLIN == 0 {
+                        syscall::debug_puts(b"  FAIL: poll master not POLLIN\n");
+                        phase62_ok = false;
+                    }
+                }
+
+                userlib::pty::pty_close_fd(m2);
+                userlib::pty::pty_close_fd(s2);
+            } else {
+                syscall::debug_puts(b"  FAIL: openpty for poll test\n");
+                phase62_ok = false;
+            }
+        }
+
+        if phase62_ok {
+            syscall::debug_puts(b"Phase 62 PTY subsystem: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 62 PTY subsystem: FAILED\n");
+        }
+    }
+
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

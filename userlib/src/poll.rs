@@ -18,9 +18,11 @@ pub const POLLNVAL: u16 = 0x0020;
 const PIPE_POLL: u64 = 0x5050;
 const UDS_POLL: u64 = 0x8090;
 const CON_POLL: u64 = 0x3110;
+const PTY_POLL: u64 = 0x9050;
 const PIPE_OK: u64 = 0x5100;
 const UDS_OK: u64 = 0x8100;
 const CON_POLL_OK: u64 = 0x3111;
+const PTY_POLL_OK: u64 = 0x9051;
 
 #[derive(Clone, Copy)]
 pub struct PollFd {
@@ -77,6 +79,22 @@ fn poll_check_fd(entry: &fd::FdEntry, events: u16) -> u16 {
             let mut rev = 0u16;
             if events & POLLIN != 0 { rev |= POLLIN; }
             if events & POLLOUT != 0 { rev |= POLLOUT; }
+            rev
+        }
+        FdType::Pty => {
+            let reply_port = syscall::port_create() as u32;
+            let d2 = (events as u64) | ((reply_port as u64) << 32);
+            syscall::send(entry.port, PTY_POLL, entry.handle as u64, 0, d2, 0);
+            let rev = if let Some(msg) = syscall::recv_msg(reply_port) {
+                if msg.tag == PTY_POLL_OK {
+                    msg.data[0] as u16
+                } else {
+                    POLLERR
+                }
+            } else {
+                POLLERR
+            };
+            syscall::port_destroy(reply_port);
             rev
         }
         FdType::Port => {

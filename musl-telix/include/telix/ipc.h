@@ -56,6 +56,17 @@ struct telix_msg {
 #define PIPE_POLL_TAG    0x5050
 #define PIPE_ERROR_TAG   0x5F00
 
+/* File lock protocol tags (Phase 61). */
+#define FS_FLOCK_TAG     0x2800
+#define FS_FLOCK_OK_TAG  0x2801
+#define FS_GETLK_TAG     0x2810
+#define FS_GETLK_OK_TAG  0x2811
+#define FS_SETLK_TAG     0x2820
+#define FS_SETLK_OK_TAG  0x2821
+#define FS_SETLKW_TAG    0x2830
+#define FS_SETLKW_OK_TAG 0x2831
+#define FS_LOCK_ERR_TAG  0x28FF
+
 /* Poll protocol tags (Phase 60). */
 #define UDS_POLL_TAG     0x8090
 #define CON_POLL_TAG     0x3110

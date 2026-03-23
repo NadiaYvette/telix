@@ -25,6 +25,8 @@ pub enum FdType {
     Socket = 4,
     /// Generic port — raw IPC, no read/write translation.
     Port = 5,
+    /// PTY endpoint — reads/writes go to the PTY server.
+    Pty = 6,
 }
 
 /// Per-FD flags (stored alongside the entry, not the underlying object).
@@ -43,7 +45,43 @@ pub const F_GETFD: i32 = 1;
 pub const F_SETFD: i32 = 2;
 pub const F_GETFL: i32 = 3;
 pub const F_SETFL: i32 = 4;
+pub const F_GETLK: i32 = 5;
+pub const F_SETLK: i32 = 6;
+pub const F_SETLKW: i32 = 7;
 pub const F_DUPFD_CLOEXEC: i32 = 0x406;
+
+/// flock() operations.
+pub const LOCK_SH: i32 = 1;
+pub const LOCK_EX: i32 = 2;
+pub const LOCK_NB: i32 = 4;
+pub const LOCK_UN: i32 = 8;
+
+/// Lock types for struct Flock / fcntl.
+pub const F_RDLCK: i16 = 0;
+pub const F_WRLCK: i16 = 1;
+pub const F_UNLCK: i16 = 2;
+
+/// POSIX flock structure for fcntl byte-range locking.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Flock {
+    pub l_type: i16,
+    pub l_whence: i16,
+    pub l_start: i64,
+    pub l_len: i64,
+    pub l_pid: i32,
+}
+
+/// FS lock protocol tags.
+const FS_FLOCK: u64 = 0x2800;
+const FS_FLOCK_OK: u64 = 0x2801;
+const FS_GETLK: u64 = 0x2810;
+const FS_GETLK_OK: u64 = 0x2811;
+const FS_SETLK: u64 = 0x2820;
+const FS_SETLK_OK: u64 = 0x2821;
+const FS_SETLKW: u64 = 0x2830;
+const FS_SETLKW_OK: u64 = 0x2831;
+const FS_LOCK_ERR: u64 = 0x28FF;
 
 /// ioctl requests.
 pub const TIOCGWINSZ: u32 = 0x5413;
@@ -316,6 +354,87 @@ pub fn ioctl(fd: i32, request: u32, arg: u64) -> i32 {
             result
         }
     }
+}
+
+/// flock() — whole-file advisory lock.
+///
+/// `operation` is LOCK_SH, LOCK_EX, or LOCK_UN, optionally OR'd with LOCK_NB.
+/// Returns 0 on success, -1 on error (EAGAIN if LOCK_NB and would block).
+pub fn flock(fd: i32, operation: i32) -> i32 {
+    let entry = match fd_get(fd) {
+        Some(e) => e,
+        None => return -1,
+    };
+    // Only File FDs support locking.
+    if entry.fd_type != FdType::File {
+        return -1;
+    }
+    let reply_port = syscall::port_create() as u32;
+    let pid = syscall::getpid() as u32;
+    let d0 = (entry.handle as u64) | ((operation as u64) << 32);
+    let d1 = pid as u64;
+    let d2 = (reply_port as u64) << 32;
+    syscall::send(entry.port, FS_FLOCK, d0, d1, d2, 0);
+    let result = if let Some(reply) = syscall::recv_msg(reply_port) {
+        if reply.tag == FS_FLOCK_OK { 0 } else { -1 }
+    } else {
+        -1
+    };
+    syscall::port_destroy(reply_port);
+    result
+}
+
+/// fcntl with Flock argument for F_GETLK/F_SETLK/F_SETLKW.
+/// Returns 0 on success, -1 on error. For F_GETLK, `lock` is updated in place.
+pub fn fcntl_lock(fd: i32, cmd: i32, lock: &mut Flock) -> i32 {
+    let entry = match fd_get(fd) {
+        Some(e) => e,
+        None => return -1,
+    };
+    if entry.fd_type != FdType::File {
+        return -1;
+    }
+
+    let tag = match cmd {
+        F_GETLK => FS_GETLK,
+        F_SETLK => FS_SETLK,
+        F_SETLKW => FS_SETLKW,
+        _ => return -1,
+    };
+
+    let reply_port = syscall::port_create() as u32;
+    let pid = syscall::getpid() as u32;
+    let d0 = (entry.handle as u64) | ((lock.l_type as u16 as u64) << 32) | ((lock.l_whence as u16 as u64) << 48);
+    let d1 = lock.l_start as u64;
+    let d2 = (lock.l_len as u32 as u64) | ((reply_port as u64) << 32);
+    let d3 = pid as u64;
+    syscall::send(entry.port, tag, d0, d1, d2, d3);
+
+    let ok_tag = match cmd {
+        F_GETLK => FS_GETLK_OK,
+        F_SETLK => FS_SETLK_OK,
+        F_SETLKW => FS_SETLKW_OK,
+        _ => 0,
+    };
+
+    let result = if let Some(reply) = syscall::recv_msg(reply_port) {
+        if reply.tag == ok_tag {
+            if cmd == F_GETLK {
+                // Unpack result into lock struct.
+                lock.l_type = (reply.data[0] & 0xFFFF) as i16;
+                lock.l_pid = (reply.data[0] >> 32) as i32;
+                lock.l_start = reply.data[1] as i64;
+                lock.l_len = reply.data[2] as i64;
+            }
+            0
+        } else {
+            -1
+        }
+    } else {
+        -1
+    };
+    syscall::port_destroy(reply_port);
+    result
 }
 
 /// Check if an FD is valid (open).
