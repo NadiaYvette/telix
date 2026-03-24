@@ -23,6 +23,9 @@ const PTE_U: u64 = 1 << 4; // User-accessible
 const PTE_G: u64 = 1 << 5; // Global
 const PTE_A: u64 = 1 << 6; // Accessed
 const PTE_D: u64 = 1 << 7; // Dirty
+/// Software-defined bit: page content has been initialized (zeroed/filled).
+/// Bits [63:54] are reserved for supervisor software in Sv39.
+pub const PTE_SW_ZEROED: u64 = 1 << 54;
 
 const MMU_PAGE_SIZE: usize = 4096;
 
@@ -186,6 +189,59 @@ pub fn unmap_single_mmupage(root: usize, va: usize) -> usize {
         core::arch::asm!("sfence.vma {}, zero", in(reg) va);
     }
     pa
+}
+
+/// Read the raw leaf PTE for a VA. Returns 0 if any level is missing.
+pub fn read_pte(root: usize, va: usize) -> u64 {
+    let root_table = root as *mut u64;
+    let vpn2 = (va >> 30) & 0x1FF;
+    let vpn1 = (va >> 21) & 0x1FF;
+    let vpn0 = (va >> 12) & 0x1FF;
+    let l1 = match walk_table(root_table, vpn2) { Some(t) => t, None => return 0 };
+    let l2 = match walk_table(l1, vpn1) { Some(t) => t, None => return 0 };
+    unsafe { *l2.add(vpn0) }
+}
+
+/// Evict a 4K MMU page: clear Valid bit but preserve PTE_SW_ZEROED hint.
+/// Returns old PA, or 0. Used by WSCLOCK.
+pub fn evict_mmupage(root: usize, va: usize) -> usize {
+    let root_table = root as *mut u64;
+    let vpn2 = (va >> 30) & 0x1FF;
+    let vpn1 = (va >> 21) & 0x1FF;
+    let vpn0 = (va >> 12) & 0x1FF;
+
+    let l1 = match walk_table(root_table, vpn2) { Some(t) => t, None => return 0 };
+    let l2 = match walk_table(l1, vpn1) { Some(t) => t, None => return 0 };
+
+    let entry = unsafe { *l2.add(vpn0) };
+    if entry & PTE_V == 0 { return 0; }
+    let pa = ((entry >> 10) << 12) as usize;
+    unsafe {
+        *l2.add(vpn0) = entry & PTE_SW_ZEROED;
+    }
+    unsafe {
+        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
+    }
+    pa
+}
+
+/// Clear a PTE entirely (valid + SW bits). Used for madvise_dontneed and cleanup.
+pub fn clear_pte(root: usize, va: usize) {
+    let root_table = root as *mut u64;
+    let vpn2 = (va >> 30) & 0x1FF;
+    let vpn1 = (va >> 21) & 0x1FF;
+    let vpn0 = (va >> 12) & 0x1FF;
+
+    let l1 = match walk_table(root_table, vpn2) { Some(t) => t, None => return };
+    let l2 = match walk_table(l1, vpn1) { Some(t) => t, None => return };
+
+    let entry = unsafe { *l2.add(vpn0) };
+    if entry != 0 {
+        unsafe { *l2.add(vpn0) = 0; }
+        unsafe {
+            core::arch::asm!("sfence.vma {}, zero", in(reg) va);
+        }
+    }
 }
 
 /// Read and clear the Accessed bit for the PTE at `va`.

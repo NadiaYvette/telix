@@ -470,12 +470,13 @@ impl Scheduler {
             }
 
             // Map each MMU page.
+            let sw_z = crate::mm::fault::sw_zeroed_bit();
             #[cfg(target_arch = "aarch64")]
-            let pte_flags = crate::arch::aarch64::mm::USER_RW_FLAGS;
+            let pte_flags = crate::arch::aarch64::mm::USER_RW_FLAGS | sw_z;
             #[cfg(target_arch = "riscv64")]
-            let pte_flags = crate::arch::riscv64::mm::USER_RW_FLAGS;
+            let pte_flags = crate::arch::riscv64::mm::USER_RW_FLAGS | sw_z;
             #[cfg(target_arch = "x86_64")]
-            let pte_flags = crate::arch::x86_64::mm::USER_RW_FLAGS;
+            let pte_flags = crate::arch::x86_64::mm::USER_RW_FLAGS | sw_z;
 
             for mmu_idx in 0..mmu_count {
                 let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
@@ -489,16 +490,7 @@ impl Scheduler {
                 crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
             }
 
-            // Mark installed in VMA.
-            crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-                if let Some(vma) = aspace.find_vma_mut(page_va) {
-                    for mmu_idx in 0..mmu_count {
-                        let idx = vma.mmu_index_of(page_va + mmu_idx * MMUPAGE_SIZE);
-                        vma.set_installed(idx);
-                        vma.set_zeroed(idx);
-                    }
-                }
-            });
+            // PTE installation with SW_ZEROED is the authority — no bitmap update needed.
         }
 
         // Allocate kernel stack for this thread.
@@ -695,12 +687,13 @@ impl Scheduler {
             }).ok()?;
 
             let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
+            let sw_z = crate::mm::fault::sw_zeroed_bit();
             #[cfg(target_arch = "aarch64")]
-            let pte_flags = crate::arch::aarch64::mm::USER_RO_FLAGS;
+            let pte_flags = crate::arch::aarch64::mm::USER_RO_FLAGS | sw_z;
             #[cfg(target_arch = "riscv64")]
-            let pte_flags = crate::arch::riscv64::mm::USER_RO_FLAGS;
+            let pte_flags = crate::arch::riscv64::mm::USER_RO_FLAGS | sw_z;
             #[cfg(target_arch = "x86_64")]
-            let pte_flags = crate::arch::x86_64::mm::USER_RO_FLAGS;
+            let pte_flags = crate::arch::x86_64::mm::USER_RO_FLAGS | sw_z;
 
             for page_idx in 0..data_pages {
                 let page_va = data_va + page_idx * PAGE_SIZE;
@@ -734,15 +727,7 @@ impl Scheduler {
                     crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
                 }
 
-                crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-                    if let Some(vma) = aspace.find_vma_mut(page_va) {
-                        for mmu_idx in 0..mmu_count {
-                            let idx = vma.mmu_index_of(page_va + mmu_idx * MMUPAGE_SIZE);
-                            vma.set_installed(idx);
-                            vma.set_zeroed(idx);
-                        }
-                    }
-                });
+                // PTE installation with SW_ZEROED is the authority — no bitmap update needed.
             }
         }
 

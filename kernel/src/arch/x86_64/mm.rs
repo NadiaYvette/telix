@@ -13,6 +13,9 @@ const PTE_RW: u64 = 1 << 1;      // Read/Write
 const PTE_US: u64 = 1 << 2;      // User/Supervisor
 const PTE_PS: u64 = 1 << 7;      // Page Size (2M/1G large page)
 const PTE_NX: u64 = 1u64 << 63;  // No Execute
+/// Software-defined bit: page content has been initialized (zeroed/filled).
+/// AVL bit 9 (bits 9-11 are available to software in x86-64 PTEs).
+pub const PTE_SW_ZEROED: u64 = 1 << 9;
 
 const MMU_PAGE_SIZE: usize = 4096;
 
@@ -173,6 +176,66 @@ pub fn unmap_single_mmupage(pml4: usize, va: usize) -> usize {
         core::arch::asm!("invlpg [{}]", in(reg) va);
     }
     pa
+}
+
+/// Read the raw leaf PTE for a VA. Returns 0 if any level is missing.
+pub fn read_pte(pml4: usize, va: usize) -> u64 {
+    let pml4_table = pml4 as *mut u64;
+    let pml4_idx = (va >> 39) & 0x1FF;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pd_idx = (va >> 21) & 0x1FF;
+    let pt_idx = (va >> 12) & 0x1FF;
+
+    let pdpt = match walk_table(pml4_table, pml4_idx) { Some(t) => t, None => return 0 };
+    let pd = match walk_table(pdpt, pdpt_idx) { Some(t) => t, None => return 0 };
+    let pt = match walk_table(pd, pd_idx) { Some(t) => t, None => return 0 };
+    unsafe { *pt.add(pt_idx) }
+}
+
+/// Evict a 4K MMU page: clear Present bit but preserve PTE_SW_ZEROED hint.
+/// Returns old PA, or 0. Used by WSCLOCK.
+pub fn evict_mmupage(pml4: usize, va: usize) -> usize {
+    let pml4_table = pml4 as *mut u64;
+    let pml4_idx = (va >> 39) & 0x1FF;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pd_idx = (va >> 21) & 0x1FF;
+    let pt_idx = (va >> 12) & 0x1FF;
+
+    let pdpt = match walk_table(pml4_table, pml4_idx) { Some(t) => t, None => return 0 };
+    let pd = match walk_table(pdpt, pdpt_idx) { Some(t) => t, None => return 0 };
+    let pt = match walk_table(pd, pd_idx) { Some(t) => t, None => return 0 };
+
+    let entry = unsafe { *pt.add(pt_idx) };
+    if entry & PTE_P == 0 { return 0; }
+    let pa = (entry & 0x000F_FFFF_FFFF_F000) as usize;
+    unsafe {
+        *pt.add(pt_idx) = entry & PTE_SW_ZEROED;
+    }
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) va);
+    }
+    pa
+}
+
+/// Clear a PTE entirely (valid + SW bits). Used for madvise_dontneed and cleanup.
+pub fn clear_pte(pml4: usize, va: usize) {
+    let pml4_table = pml4 as *mut u64;
+    let pml4_idx = (va >> 39) & 0x1FF;
+    let pdpt_idx = (va >> 30) & 0x1FF;
+    let pd_idx = (va >> 21) & 0x1FF;
+    let pt_idx = (va >> 12) & 0x1FF;
+
+    let pdpt = match walk_table(pml4_table, pml4_idx) { Some(t) => t, None => return };
+    let pd = match walk_table(pdpt, pdpt_idx) { Some(t) => t, None => return };
+    let pt = match walk_table(pd, pd_idx) { Some(t) => t, None => return };
+
+    let entry = unsafe { *pt.add(pt_idx) };
+    if entry != 0 {
+        unsafe { *pt.add(pt_idx) = 0; }
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) va);
+        }
+    }
 }
 
 /// Read and clear the Accessed bit for the PTE at `va`.
@@ -426,9 +489,9 @@ pub fn update_pte_flags(pml4: usize, va: usize, new_flags: u64) -> bool {
     if entry & PTE_P == 0 {
         return false;
     }
-    let pa = entry & 0x000F_FFFF_FFFF_F000;
+    let pa_and_sw = entry & (0x000F_FFFF_FFFF_F000 | PTE_SW_ZEROED);
     unsafe {
-        *pt.add(pt_idx) = pa | new_flags;
+        *pt.add(pt_idx) = pa_and_sw | new_flags;
     }
     unsafe {
         core::arch::asm!("invlpg [{}]", in(reg) va);

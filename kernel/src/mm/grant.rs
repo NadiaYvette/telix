@@ -77,9 +77,7 @@ pub fn grant_pages(
                 let mmu_idx = page_i * PAGE_MMUCOUNT + mmu_i;
                 let va = dst_va + mmu_idx * MMUPAGE_SIZE;
                 let pa = pa_base + mmu_i * MMUPAGE_SIZE;
-                map_single_mmupage(pt_root, va, pa, flags);
-                vma.set_installed(mmu_idx);
-                vma.set_zeroed(mmu_idx);
+                map_single_mmupage(pt_root, va, pa, flags | sw_zeroed_bit());
             }
         }
 
@@ -95,12 +93,10 @@ pub fn revoke_grant(dst_aspace: ASpaceId, dst_va: usize) {
             let obj_id = vma.object_id;
             let mmu_count = vma.mmu_page_count();
             let va_start = vma.va_start;
-            // Unmap all installed PTEs.
+            // Unmap all PTEs.
             for mmu_idx in 0..mmu_count {
-                if vma.is_installed(mmu_idx) {
-                    let va = va_start + mmu_idx * MMUPAGE_SIZE;
-                    unmap_single_mmupage(pt_root, va);
-                }
+                let va = va_start + mmu_idx * MMUPAGE_SIZE;
+                clear_pte(pt_root, va);
             }
             // Remove the mapping record from the object.
             object::with_object(obj_id, |obj| {
@@ -123,13 +119,22 @@ fn map_single_mmupage(pt_root: usize, va: usize, pa: usize, flags: u64) -> bool 
     { crate::arch::x86_64::mm::map_single_mmupage(pt_root, va, pa, flags) }
 }
 
-fn unmap_single_mmupage(pt_root: usize, va: usize) {
+fn clear_pte(pt_root: usize, va: usize) {
     #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::unmap_single_mmupage(pt_root, va); }
+    { crate::arch::aarch64::mm::clear_pte(pt_root, va); }
     #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::unmap_single_mmupage(pt_root, va); }
+    { crate::arch::riscv64::mm::clear_pte(pt_root, va); }
     #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::unmap_single_mmupage(pt_root, va); }
+    { crate::arch::x86_64::mm::clear_pte(pt_root, va); }
+}
+
+fn sw_zeroed_bit() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    { crate::arch::aarch64::mm::PTE_SW_ZEROED }
+    #[cfg(target_arch = "riscv64")]
+    { crate::arch::riscv64::mm::PTE_SW_ZEROED }
+    #[cfg(target_arch = "x86_64")]
+    { crate::arch::x86_64::mm::PTE_SW_ZEROED }
 }
 
 fn user_ro_flags() -> u64 {

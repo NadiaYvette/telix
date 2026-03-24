@@ -238,21 +238,13 @@ pub fn complete_fault(token: u32, data_va: usize, data_len: usize) -> bool {
         }
     }
 
-    // Install PTEs and mark pages in the VMA.
+    // Install PTE with SW_ZEROED flag (page content has been filled by the pager).
     aspace::with_aspace(fault_aspace_id, |aspace| {
         let pt_root = aspace.page_table_root;
         if let Some(vma) = aspace.find_vma_mut(vma_va) {
-            // Mark all MMU sub-pages within this allocation page as zeroed (filled).
-            let (ap_start, ap_end) = vma.alloc_page_mmu_range(mmu_idx);
-            for i in ap_start..ap_end {
-                vma.set_zeroed(i);
-            }
-
-            // Install PTE for the faulted MMU page.
             let mmu_pa = phys_addr + vma.mmu_offset_in_page(mmu_idx) * MMUPAGE_SIZE;
             let flags = fault::pte_flags_for_vma_pub(vma);
             install_pte(pt_root, fault_va, mmu_pa, flags);
-            vma.set_installed(mmu_idx);
         }
     });
 

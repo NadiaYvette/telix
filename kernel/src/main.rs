@@ -654,7 +654,7 @@ fn test_demand_paging() {
             .expect("map_anon");
         println!("  Mapped {} pages at VA {:#x}", num_pages, test_va);
 
-        assert_eq!(vma.installed_count(), 0);
+        assert_eq!(mm::fault::count_installed_ptes(pt_root, vma), 0);
         assert_eq!(vma.page_count(), num_pages);
         assert_eq!(vma.mmu_page_count(), num_pages * PAGE_MMUCOUNT);
     });
@@ -683,24 +683,14 @@ fn test_demand_paging() {
     }
 
     mm::aspace::with_aspace(aspace_id, |aspace| {
-        let vma = aspace.find_vma_mut(test_va).unwrap();
-        assert_eq!(vma.installed_count(), test_addrs.len());
-        println!("  {} PTEs installed after {} major faults", vma.installed_count(), test_addrs.len());
+        let vma = aspace.find_vma(test_va).unwrap();
+        let count = mm::fault::count_installed_ptes(pt_root, vma);
+        assert_eq!(count, test_addrs.len());
+        println!("  {} PTEs installed after {} major faults", count, test_addrs.len());
     });
 
-    // Test minor fault: clear installed bit + unmap PTE, re-fault.
-    mm::aspace::with_aspace(aspace_id, |aspace| {
-        let vma = aspace.find_vma_mut(test_va).unwrap();
-        let mmu_idx = vma.mmu_index_of(test_va);
-        vma.clear_installed(mmu_idx);
-    });
-
-    #[cfg(target_arch = "aarch64")]
-    arch::aarch64::mm::unmap_single_mmupage(pt_root, test_va);
-    #[cfg(target_arch = "riscv64")]
-    arch::riscv64::mm::unmap_single_mmupage(pt_root, test_va);
-    #[cfg(target_arch = "x86_64")]
-    arch::x86_64::mm::unmap_single_mmupage(pt_root, test_va);
+    // Test minor fault: evict PTE (preserves SW_ZEROED), re-fault.
+    mm::fault::evict_mmupage_dispatch(pt_root, test_va);
 
     let result = mm::fault::handle_page_fault(
         aspace_id, test_va, mm::fault::FaultType::Read,
@@ -743,8 +733,8 @@ fn test_demand_paging() {
     // Running WSCLOCK should clear all unreferenced PTEs and free allocation pages.
     {
         let installed_before = mm::aspace::with_aspace(aspace_id, |aspace| {
-            let vma = aspace.find_vma_mut(test_va).unwrap();
-            vma.installed_count()
+            let vma = aspace.find_vma(test_va).unwrap();
+            mm::fault::count_installed_ptes(pt_root, vma)
         });
         println!("  WSCLOCK: {} PTEs installed before scan", installed_before);
 
@@ -759,8 +749,8 @@ fn test_demand_paging() {
             scan2.pages_scanned, scan2.ptes_cleared, scan2.pages_freed);
 
         let installed_after = mm::aspace::with_aspace(aspace_id, |aspace| {
-            let vma = aspace.find_vma_mut(test_va).unwrap();
-            vma.installed_count()
+            let vma = aspace.find_vma(test_va).unwrap();
+            mm::fault::count_installed_ptes(pt_root, vma)
         });
         println!("  WSCLOCK: {} PTEs installed after scan", installed_after);
         assert_eq!(installed_after, 0, "All PTEs should be cleared");

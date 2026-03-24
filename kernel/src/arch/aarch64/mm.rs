@@ -21,6 +21,9 @@ const PT_AP_RW_ALL: u64 = 1 << 6; // EL1 RW, EL0 RW
 const PT_UXN: u64 = 1 << 54;      // Unprivileged execute-never
 const PT_PXN: u64 = 1 << 53;      // Privileged execute-never
 const PT_CONTIGUOUS: u64 = 1 << 52; // Contiguous hint (16 × 4K = 64K group)
+/// Software-defined bit: page content has been initialized (zeroed/filled).
+/// Stored in bits [58:55] which are reserved for software use.
+pub const PTE_SW_ZEROED: u64 = 1 << 55;
 const PT_ATTR_IDX_0: u64 = 0 << 2; // MAIR index 0 (normal memory)
 const PT_ATTR_IDX_1: u64 = 1 << 2; // MAIR index 1 (device memory)
 
@@ -217,6 +220,58 @@ pub fn unmap_single_mmupage(l0: usize, va: usize) -> usize {
         core::arch::asm!("isb");
     }
     pa
+}
+
+/// Evict a 4K MMU page: clear valid bit but preserve PTE_SW_ZEROED hint.
+/// Returns the old physical address, or 0 if not mapped. Used by WSCLOCK.
+pub fn evict_mmupage(l0: usize, va: usize) -> usize {
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+
+    let l1 = match walk_table(l0_table, l0_idx) { Some(t) => t, None => return 0 };
+    let l2 = match walk_table(l1, l1_idx) { Some(t) => t, None => return 0 };
+    let l3 = match walk_table(l2, l2_idx) { Some(t) => t, None => return 0 };
+
+    let entry = unsafe { *l3.add(l3_idx) };
+    if entry & PT_VALID == 0 { return 0; }
+    let pa = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+    unsafe {
+        *l3.add(l3_idx) = entry & PTE_SW_ZEROED;
+    }
+    unsafe {
+        let va_shifted = (va >> 12) as u64;
+        core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+        core::arch::asm!("dsb ish");
+        core::arch::asm!("isb");
+    }
+    pa
+}
+
+/// Clear a PTE entirely (valid + SW bits). Used for madvise_dontneed and cleanup.
+pub fn clear_pte(l0: usize, va: usize) {
+    let l0_table = l0 as *mut u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+
+    let l1 = match walk_table(l0_table, l0_idx) { Some(t) => t, None => return };
+    let l2 = match walk_table(l1, l1_idx) { Some(t) => t, None => return };
+    let l3 = match walk_table(l2, l2_idx) { Some(t) => t, None => return };
+
+    let entry = unsafe { *l3.add(l3_idx) };
+    if entry != 0 {
+        unsafe { *l3.add(l3_idx) = 0; }
+        unsafe {
+            let va_shifted = (va >> 12) as u64;
+            core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+            core::arch::asm!("dsb ish");
+            core::arch::asm!("isb");
+        }
+    }
 }
 
 /// Read and clear the Access Flag (AF) for the PTE at `va`.
@@ -445,9 +500,9 @@ pub fn update_pte_flags(l0: usize, va: usize, new_flags: u64) -> bool {
     if entry & PT_VALID == 0 {
         return false;
     }
-    let pa = entry & 0x0000_FFFF_FFFF_F000;
+    let pa_and_sw = entry & (0x0000_FFFF_FFFF_F000 | PTE_SW_ZEROED);
     unsafe {
-        *l3.add(l3_idx) = pa | new_flags;
+        *l3.add(l3_idx) = pa_and_sw | new_flags;
     }
     unsafe {
         let va_shifted = (va >> 12) as u64;

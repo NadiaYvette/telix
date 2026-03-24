@@ -19,14 +19,13 @@ use core::ptr;
 /// With 8-byte keys + 8-byte pointers + header, fits in 512-byte slab.
 const ORDER: usize = 24;
 
-/// Maximum VMAs per leaf. Vma is large (~600 bytes with bitmaps), so we store
-/// pointers to slab-allocated Vmas rather than inlining them. With 8-byte
-/// keys + 8-byte pointers + header + sibling links, LEAF_CAP pointers fit
-/// comfortably in 512 bytes.
+/// Maximum VMAs per leaf. Vma is small (~40 bytes without bitmaps), so we store
+/// pointers to slab-allocated Vmas. With 8-byte keys + 8-byte pointers + header
+/// + sibling links, LEAF_CAP pointers fit comfortably in 512 bytes.
 const LEAF_CAP: usize = 24;
 
 const NODE_SLAB_SIZE: usize = 512;
-const VMA_SLAB_SIZE: usize = 2048; // Vma is ~1KB with bitmaps; uses 2048-byte slab cache
+const VMA_SLAB_SIZE: usize = 64; // Vma is ~40 bytes without bitmaps
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

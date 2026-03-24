@@ -800,28 +800,29 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     // Eagerly allocate physical pages and install PTEs.
     let pt_root = crate::sched::scheduler::current_page_table_root();
 
+    let sw_z = crate::mm::fault::sw_zeroed_bit();
     #[cfg(target_arch = "aarch64")]
     let pte_flags = match prot {
-        VmaProt::ReadOnly => crate::arch::aarch64::mm::USER_RO_FLAGS,
-        VmaProt::ReadWrite => crate::arch::aarch64::mm::USER_RW_FLAGS,
-        VmaProt::ReadExec => crate::arch::aarch64::mm::USER_RWX_FLAGS,
-        VmaProt::ReadWriteExec => crate::arch::aarch64::mm::USER_RWX_FLAGS,
+        VmaProt::ReadOnly => crate::arch::aarch64::mm::USER_RO_FLAGS | sw_z,
+        VmaProt::ReadWrite => crate::arch::aarch64::mm::USER_RW_FLAGS | sw_z,
+        VmaProt::ReadExec => crate::arch::aarch64::mm::USER_RWX_FLAGS | sw_z,
+        VmaProt::ReadWriteExec => crate::arch::aarch64::mm::USER_RWX_FLAGS | sw_z,
         VmaProt::None => 0,
     };
     #[cfg(target_arch = "riscv64")]
     let pte_flags = match prot {
-        VmaProt::ReadOnly => crate::arch::riscv64::mm::USER_RO_FLAGS,
-        VmaProt::ReadWrite => crate::arch::riscv64::mm::USER_RW_FLAGS,
-        VmaProt::ReadExec => crate::arch::riscv64::mm::USER_RWX_FLAGS,
-        VmaProt::ReadWriteExec => crate::arch::riscv64::mm::USER_RWX_FLAGS,
+        VmaProt::ReadOnly => crate::arch::riscv64::mm::USER_RO_FLAGS | sw_z,
+        VmaProt::ReadWrite => crate::arch::riscv64::mm::USER_RW_FLAGS | sw_z,
+        VmaProt::ReadExec => crate::arch::riscv64::mm::USER_RWX_FLAGS | sw_z,
+        VmaProt::ReadWriteExec => crate::arch::riscv64::mm::USER_RWX_FLAGS | sw_z,
         VmaProt::None => 0,
     };
     #[cfg(target_arch = "x86_64")]
     let pte_flags = match prot {
-        VmaProt::ReadOnly => crate::arch::x86_64::mm::USER_RO_FLAGS,
-        VmaProt::ReadWrite => crate::arch::x86_64::mm::USER_RW_FLAGS,
-        VmaProt::ReadExec => crate::arch::x86_64::mm::USER_RWX_FLAGS,
-        VmaProt::ReadWriteExec => crate::arch::x86_64::mm::USER_RWX_FLAGS,
+        VmaProt::ReadOnly => crate::arch::x86_64::mm::USER_RO_FLAGS | sw_z,
+        VmaProt::ReadWrite => crate::arch::x86_64::mm::USER_RW_FLAGS | sw_z,
+        VmaProt::ReadExec => crate::arch::x86_64::mm::USER_RWX_FLAGS | sw_z,
+        VmaProt::ReadWriteExec => crate::arch::x86_64::mm::USER_RWX_FLAGS | sw_z,
         VmaProt::None => 0,
     };
 
@@ -854,16 +855,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
             crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
         }
 
-        // Mark installed in VMA.
-        crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-            if let Some(vma) = aspace.find_vma_mut(page_va) {
-                for mmu_idx in 0..PAGE_MMUCOUNT {
-                    let idx = vma.mmu_index_of(page_va + mmu_idx * MMUPAGE_SIZE);
-                    vma.set_installed(idx);
-                    vma.set_zeroed(idx);
-                }
-            }
-        });
+        // PTE installation with SW_ZEROED is the authority — no bitmap update needed.
     }
 
     // Try superpage promotion for 2 MiB-aligned regions.
@@ -1337,12 +1329,13 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
             core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
         }
 
+        let sw_z = crate::mm::fault::sw_zeroed_bit();
         #[cfg(target_arch = "aarch64")]
-        let pte_flags = crate::arch::aarch64::mm::USER_RW_FLAGS;
+        let pte_flags = crate::arch::aarch64::mm::USER_RW_FLAGS | sw_z;
         #[cfg(target_arch = "riscv64")]
-        let pte_flags = crate::arch::riscv64::mm::USER_RW_FLAGS;
+        let pte_flags = crate::arch::riscv64::mm::USER_RW_FLAGS | sw_z;
         #[cfg(target_arch = "x86_64")]
-        let pte_flags = crate::arch::x86_64::mm::USER_RW_FLAGS;
+        let pte_flags = crate::arch::x86_64::mm::USER_RW_FLAGS | sw_z;
 
         for mmu_idx in 0..mmu_count {
             let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
@@ -1356,15 +1349,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
             crate::arch::x86_64::mm::map_single_mmupage(new_pt_root, mmu_va, mmu_pa, pte_flags);
         }
 
-        crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-            if let Some(vma) = aspace.find_vma_mut(page_va) {
-                for mmu_idx in 0..mmu_count {
-                    let idx = vma.mmu_index_of(page_va + mmu_idx * MMUPAGE_SIZE);
-                    vma.set_installed(idx);
-                    vma.set_zeroed(idx);
-                }
-            }
-        });
+        // PTE installation with SW_ZEROED is the authority — no bitmap update needed.
     }
 
     // Build the stack layout with argc/argv/envp/auxv.

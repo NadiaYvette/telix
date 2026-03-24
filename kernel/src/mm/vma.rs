@@ -7,15 +7,6 @@ use super::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE};
 #[allow(dead_code)]
 pub const MAX_VMAS: usize = 32;
 
-/// Maximum allocation pages per VMA. With 64K pages, 256 pages = 16 MiB.
-pub const MAX_VMA_PAGES: usize = 256;
-
-/// Maximum MMU pages tracked per VMA.
-pub const MAX_VMA_MMUPAGES: usize = MAX_VMA_PAGES * PAGE_MMUCOUNT;
-
-/// Number of u64 words needed to bitmap MAX_VMA_MMUPAGES.
-const BITMAP_WORDS: usize = (MAX_VMA_MMUPAGES + 63) / 64;
-
 /// VMA protection flags.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -51,10 +42,6 @@ pub struct Vma {
     pub object_id: u32,
     /// Offset into the memory object (in MMUPAGE_SIZE units).
     pub object_offset: u32,
-    /// Bitmap: which MMU pages have PTEs installed.
-    pub installed: [u64; BITMAP_WORDS],
-    /// Bitmap: which MMU pages have been zeroed.
-    pub zeroed: [u64; BITMAP_WORDS],
     /// Whether this VMA slot is in use.
     pub active: bool,
 }
@@ -67,8 +54,6 @@ impl Vma {
             prot: VmaProt::ReadWrite,
             object_id: 0,
             object_offset: 0,
-            installed: [0; BITMAP_WORDS],
-            zeroed: [0; BITMAP_WORDS],
             active: false,
         }
     }
@@ -81,57 +66,6 @@ impl Vma {
     /// Number of MMU pages in this VMA.
     pub fn mmu_page_count(&self) -> usize {
         self.va_len / MMUPAGE_SIZE
-    }
-
-    /// Check if MMU page at `mmu_idx` within this VMA has its PTE installed.
-    pub fn is_installed(&self, mmu_idx: usize) -> bool {
-        let word = mmu_idx / 64;
-        let bit = mmu_idx % 64;
-        (self.installed[word] & (1u64 << bit)) != 0
-    }
-
-    /// Mark MMU page at `mmu_idx` as having its PTE installed.
-    pub fn set_installed(&mut self, mmu_idx: usize) {
-        let word = mmu_idx / 64;
-        let bit = mmu_idx % 64;
-        self.installed[word] |= 1u64 << bit;
-    }
-
-    /// Clear the installed bit for MMU page at `mmu_idx`.
-    pub fn clear_installed(&mut self, mmu_idx: usize) {
-        let word = mmu_idx / 64;
-        let bit = mmu_idx % 64;
-        self.installed[word] &= !(1u64 << bit);
-    }
-
-    /// Check if MMU page at `mmu_idx` has been zeroed.
-    pub fn is_zeroed(&self, mmu_idx: usize) -> bool {
-        let word = mmu_idx / 64;
-        let bit = mmu_idx % 64;
-        (self.zeroed[word] & (1u64 << bit)) != 0
-    }
-
-    /// Mark MMU page at `mmu_idx` as zeroed.
-    pub fn set_zeroed(&mut self, mmu_idx: usize) {
-        let word = mmu_idx / 64;
-        let bit = mmu_idx % 64;
-        self.zeroed[word] |= 1u64 << bit;
-    }
-
-    /// Clear the zeroed bit for MMU page at `mmu_idx`.
-    pub fn clear_zeroed(&mut self, mmu_idx: usize) {
-        let word = mmu_idx / 64;
-        let bit = mmu_idx % 64;
-        self.zeroed[word] &= !(1u64 << bit);
-    }
-
-    /// Count how many MMU pages have their PTE installed.
-    pub fn installed_count(&self) -> usize {
-        let mut count = 0;
-        for &w in &self.installed {
-            count += w.count_ones() as usize;
-        }
-        count
     }
 
     /// Check if a virtual address falls within this VMA.

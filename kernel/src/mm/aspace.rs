@@ -130,22 +130,16 @@ impl AddressSpace {
         self.vmas.find(va)
     }
 
-    /// MADV_DONTNEED: clear installed PTEs in [va_start, va_end), free phys frames.
+    /// MADV_DONTNEED: clear PTEs in [va_start, va_end).
     /// VMAs stay mapped — next access triggers zero-fill page fault.
     pub fn madvise_dontneed(&mut self, va_start: usize, va_end: usize) {
         let pt_root = self.page_table_root;
         let mmu_size = super::page::MMUPAGE_SIZE;
-        // Walk each MMU page in the range and unmap if installed.
+        // Walk each MMU page and clear PTE (including SW_ZEROED) so re-fault re-zeros.
         let mut va = va_start & !(mmu_size - 1);
         while va < va_end {
-            if let Some(vma) = self.vmas.find_mut(va) {
-                let mmu_idx = (va - vma.va_start) / mmu_size;
-                if vma.is_installed(mmu_idx) {
-                    unmap_single_mmupage(pt_root, va);
-                    vma.clear_installed(mmu_idx);
-                }
-                // Clear zeroed so fault handler re-zeros the page.
-                vma.clear_zeroed(mmu_idx);
+            if self.vmas.find(va).is_some() {
+                super::fault::clear_pte_dispatch(pt_root, va);
             }
             va += mmu_size;
         }
@@ -282,12 +276,8 @@ pub fn reset(id: ASpaceId, new_pt_root: usize) {
                                 m = if next > m { next } else { m + (super_size / super::page::MMUPAGE_SIZE) };
                             }
                         }
-                        for mmu_idx in 0..mmu_count {
-                            if vma.is_installed(mmu_idx) {
-                                let mmu_va = vma.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
-                                unmap_single_mmupage(old_pt_root, mmu_va);
-                            }
-                        }
+                        // No need to unmap individual PTEs — the entire old page table
+                        // tree will be freed below and switch_page_table flushes TLB.
                         object::with_object(vma.object_id, |obj| {
                             obj.remove_mapping(id, vma.va_start);
                         });
@@ -340,12 +330,10 @@ pub fn unmap_anon(id: ASpaceId, va: usize) -> bool {
                         m = if next > m { next } else { m + (super_size / super::page::MMUPAGE_SIZE) };
                     }
                 }
-                // Unmap all installed PTEs.
+                // Unmap all PTEs (unconditional — page table is source of truth).
                 for mmu_idx in 0..mmu_count {
-                    if vma.is_installed(mmu_idx) {
-                        let mmu_va = va_start + mmu_idx * super::page::MMUPAGE_SIZE;
-                        unmap_single_mmupage(pt_root, mmu_va);
-                    }
+                    let mmu_va = va_start + mmu_idx * super::page::MMUPAGE_SIZE;
+                    super::fault::clear_pte_dispatch(pt_root, mmu_va);
                 }
                 // Remove object mapping record.
                 object::with_object(obj_id, |obj| {
@@ -371,6 +359,7 @@ pub fn unmap_anon(id: ASpaceId, va: usize) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn unmap_single_mmupage(pt_root: usize, va: usize) {
     #[cfg(target_arch = "aarch64")]
     { crate::arch::aarch64::mm::unmap_single_mmupage(pt_root, va); }
@@ -416,8 +405,6 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         prot: VmaProt,
         object_id: u32,
         object_offset: u32,
-        installed: [u64; 64],
-        zeroed: [u64; 64],
     }
     let mut vma_infos: [Option<VmaInfo>; 32] = {
         const NONE: Option<VmaInfo> = None;
@@ -430,21 +417,13 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         let mut it = parent.vmas.iter();
         while let Some(vma) = it.next() {
             if !vma.active || vma_count >= 32 { continue; }
-            let mut info = VmaInfo {
+            vma_infos[vma_count] = Some(VmaInfo {
                 va_start: vma.va_start,
                 va_len: vma.va_len,
                 prot: vma.prot,
                 object_id: vma.object_id,
                 object_offset: vma.object_offset,
-                installed: [0; 64],
-                zeroed: [0; 64],
-            };
-            let bitmap_words = (vma.mmu_page_count() + 63) / 64;
-            for i in 0..bitmap_words.min(64) {
-                info.installed[i] = vma.installed[i];
-                info.zeroed[i] = vma.zeroed[i];
-            }
-            vma_infos[vma_count] = Some(info);
+            });
             vma_count += 1;
         }
     }
@@ -488,17 +467,10 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         if let Some(ref info) = vma_infos[i] {
             // Insert VMA into child's tree.
             let child = &mut table.spaces[child_idx];
-            if let Some(child_vma) = child.vmas.insert(
+            child.vmas.insert(
                 info.va_start, info.va_len, info.prot,
                 new_obj_ids[i], info.object_offset,
-            ) {
-                // Copy bitmaps.
-                let bitmap_words = (child_vma.mmu_page_count() + 63) / 64;
-                for w in 0..bitmap_words.min(64) {
-                    child_vma.installed[w] = info.installed[w];
-                    child_vma.zeroed[w] = info.zeroed[w];
-                }
-            }
+            );
 
             // Downgrade writable PTEs in both parent and child.
             // First demote any superpages in the parent so individual PTEs can be downgraded.
@@ -523,25 +495,22 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
                     }
                 }
                 for mmu_idx in 0..mmu_count {
-                    let word = mmu_idx / 64;
-                    let bit = mmu_idx % 64;
-                    if word < 64 && (info.installed[word] & (1u64 << bit)) != 0 {
-                        let va = info.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
+                    let va = info.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
+                    let pte = super::fault::read_pte_dispatch(parent_pt, va);
+                    if super::fault::pte_is_present(pte) {
                         downgrade_pte_readonly(parent_pt, va);
                         downgrade_pte_readonly(child_pt, va);
                     }
                 }
             }
 
-            // For child: install PTEs for all installed MMU pages (copy from parent's mappings).
-            // We need to map the same physical addresses in the child's page table.
+            // For child: install PTEs for all present MMU pages (walk parent page table).
+            let sw_z = super::fault::sw_zeroed_bit();
             let mmu_count = info.va_len / super::page::MMUPAGE_SIZE;
             for mmu_idx in 0..mmu_count {
-                let word = mmu_idx / 64;
-                let bit = mmu_idx % 64;
-                if word < 64 && (info.installed[word] & (1u64 << bit)) != 0 {
-                    let va = info.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
-                    // Look up the PA via the parent's page table.
+                let va = info.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
+                let pte = super::fault::read_pte_dispatch(parent_pt, va);
+                if super::fault::pte_is_present(pte) {
                     if let Some(pa) = translate_va(parent_pt, va) {
                         let pa_page = pa & !(super::page::MMUPAGE_SIZE - 1);
                         // Use read-only flags for writable VMAs (COW), normal flags for others.
@@ -550,7 +519,7 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
                         } else {
                             rw_flags_for_prot(info.prot)
                         };
-                        map_single_mmupage(child_pt, va, pa_page, flags);
+                        map_single_mmupage(child_pt, va, pa_page, flags | sw_z);
                     }
                 }
             }
@@ -678,64 +647,21 @@ pub fn mprotect(id: ASpaceId, addr: usize, len: usize, new_prot: VmaProt) -> boo
                     let orig_prot = vma.prot;
                     let orig_obj = vma.object_id;
                     let orig_off = vma.object_offset;
-
-                    // Copy bitmaps for both halves.
                     let left_mmu = (split_at - orig_start) / MMUPAGE_SIZE;
-                    let total_mmu = orig_len / MMUPAGE_SIZE;
-
-                    let mut left_installed = [0u64; 64];
-                    let mut left_zeroed = [0u64; 64];
-                    let mut right_installed = [0u64; 64];
-                    let mut right_zeroed = [0u64; 64];
-
-                    for i in 0..total_mmu {
-                        let w = i / 64;
-                        let b = i % 64;
-                        if w >= 64 { break; }
-                        if i < left_mmu {
-                            left_installed[w] |= vma.installed[w] & (1u64 << b);
-                            left_zeroed[w] |= vma.zeroed[w] & (1u64 << b);
-                        } else {
-                            let ri = i - left_mmu;
-                            let rw = ri / 64;
-                            let rb = ri % 64;
-                            if rw < 64 {
-                                if (vma.installed[w] & (1u64 << b)) != 0 {
-                                    right_installed[rw] |= 1u64 << rb;
-                                }
-                                if (vma.zeroed[w] & (1u64 << b)) != 0 {
-                                    right_zeroed[rw] |= 1u64 << rb;
-                                }
-                            }
-                        }
-                    }
 
                     // Remove old VMA and insert two new ones.
+                    // No bitmap copying needed — page table is source of truth.
                     space.vmas.remove(orig_start);
                     let left_len = split_at - orig_start;
                     let right_len = orig_len - left_len;
                     let right_off = orig_off + (left_mmu as u32);
 
-                    // Add mapping record for the right half (same object, new VA).
                     super::object::with_object(orig_obj, |obj| {
                         obj.add_mapping(id, split_at);
                     });
 
-                    if let Some(lv) = space.vmas.insert(orig_start, left_len, orig_prot, orig_obj, orig_off) {
-                        let bw = (left_mmu + 63) / 64;
-                        for w in 0..bw.min(64) {
-                            lv.installed[w] = left_installed[w];
-                            lv.zeroed[w] = left_zeroed[w];
-                        }
-                    }
-                    if let Some(rv) = space.vmas.insert(split_at, right_len, orig_prot, orig_obj, right_off) {
-                        let rmmu = right_len / MMUPAGE_SIZE;
-                        let bw = (rmmu + 63) / 64;
-                        for w in 0..bw.min(64) {
-                            rv.installed[w] = right_installed[w];
-                            rv.zeroed[w] = right_zeroed[w];
-                        }
-                    }
+                    space.vmas.insert(orig_start, left_len, orig_prot, orig_obj, orig_off);
+                    space.vmas.insert(split_at, right_len, orig_prot, orig_obj, right_off);
                 }
             }
 
@@ -749,36 +675,7 @@ pub fn mprotect(id: ASpaceId, addr: usize, len: usize, new_prot: VmaProt) -> boo
                     let orig_prot = vma.prot;
                     let orig_obj = vma.object_id;
                     let orig_off = vma.object_offset;
-
                     let left_mmu = (split_at - orig_start) / MMUPAGE_SIZE;
-                    let total_mmu = orig_len / MMUPAGE_SIZE;
-
-                    let mut left_installed = [0u64; 64];
-                    let mut left_zeroed = [0u64; 64];
-                    let mut right_installed = [0u64; 64];
-                    let mut right_zeroed = [0u64; 64];
-
-                    for i in 0..total_mmu {
-                        let w = i / 64;
-                        let b = i % 64;
-                        if w >= 64 { break; }
-                        if i < left_mmu {
-                            left_installed[w] |= vma.installed[w] & (1u64 << b);
-                            left_zeroed[w] |= vma.zeroed[w] & (1u64 << b);
-                        } else {
-                            let ri = i - left_mmu;
-                            let rw = ri / 64;
-                            let rb = ri % 64;
-                            if rw < 64 {
-                                if (vma.installed[w] & (1u64 << b)) != 0 {
-                                    right_installed[rw] |= 1u64 << rb;
-                                }
-                                if (vma.zeroed[w] & (1u64 << b)) != 0 {
-                                    right_zeroed[rw] |= 1u64 << rb;
-                                }
-                            }
-                        }
-                    }
 
                     space.vmas.remove(orig_start);
                     let left_len = split_at - orig_start;
@@ -789,21 +686,8 @@ pub fn mprotect(id: ASpaceId, addr: usize, len: usize, new_prot: VmaProt) -> boo
                         obj.add_mapping(id, split_at);
                     });
 
-                    if let Some(lv) = space.vmas.insert(orig_start, left_len, orig_prot, orig_obj, orig_off) {
-                        let bw = (left_mmu + 63) / 64;
-                        for w in 0..bw.min(64) {
-                            lv.installed[w] = left_installed[w];
-                            lv.zeroed[w] = left_zeroed[w];
-                        }
-                    }
-                    if let Some(rv) = space.vmas.insert(split_at, right_len, orig_prot, orig_obj, right_off) {
-                        let rmmu = right_len / MMUPAGE_SIZE;
-                        let bw = (rmmu + 63) / 64;
-                        for w in 0..bw.min(64) {
-                            rv.installed[w] = right_installed[w];
-                            rv.zeroed[w] = right_zeroed[w];
-                        }
-                    }
+                    space.vmas.insert(orig_start, left_len, orig_prot, orig_obj, orig_off);
+                    space.vmas.insert(split_at, right_len, orig_prot, orig_obj, right_off);
                 }
             }
 
@@ -820,7 +704,7 @@ pub fn mprotect(id: ASpaceId, addr: usize, len: usize, new_prot: VmaProt) -> boo
                     let old_prot = vma.prot;
                     vma.prot = new_prot;
 
-                    // Update PTE flags for all installed MMU pages.
+                    // Update PTE flags for all present MMU pages.
                     if old_prot != new_prot {
                         let new_flags = rw_flags_for_prot(new_prot);
                         let mmu_count = vma.mmu_page_count();
@@ -842,8 +726,9 @@ pub fn mprotect(id: ASpaceId, addr: usize, len: usize, new_prot: VmaProt) -> boo
                         }
 
                         for mmu_idx in 0..mmu_count {
-                            if vma.is_installed(mmu_idx) {
-                                let mmu_va = vma.va_start + mmu_idx * MMUPAGE_SIZE;
+                            let mmu_va = vma.va_start + mmu_idx * MMUPAGE_SIZE;
+                            let pte = super::fault::read_pte_dispatch(pt_root, mmu_va);
+                            if super::fault::pte_is_present(pte) {
                                 update_pte_flags(pt_root, mmu_va, new_flags);
                             }
                         }
@@ -910,16 +795,10 @@ pub fn mremap(id: ASpaceId, old_addr: usize, old_len: usize, new_len: usize) -> 
                     }
                 }
 
-                // Unmap installed PTEs in the excess region.
+                // Clear all PTEs in the excess region.
                 for mmu_idx in new_mmu..old_mmu {
-                    if vma.is_installed(mmu_idx) {
-                        let mmu_va = old_addr + mmu_idx * MMUPAGE_SIZE;
-                        unmap_single_mmupage(pt_root, mmu_va);
-                        vma.clear_installed(mmu_idx);
-                    }
-                    if vma.is_zeroed(mmu_idx) {
-                        vma.clear_zeroed(mmu_idx);
-                    }
+                    let mmu_va = old_addr + mmu_idx * MMUPAGE_SIZE;
+                    super::fault::clear_pte_dispatch(pt_root, mmu_va);
                 }
 
                 vma.va_len = new_len;

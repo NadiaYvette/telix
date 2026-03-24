@@ -274,7 +274,8 @@ fn load_segment(
 
     // Determine protection.
     let prot = flags_to_prot(phdr.p_flags);
-    let pte_flags = prot_to_pte_flags(prot);
+    let sw_z = crate::mm::fault::sw_zeroed_bit();
+    let pte_flags = prot_to_pte_flags(prot) | sw_z;
 
     // For each page in this segment's range, either create a new mapping
     // or reuse an existing one (when multiple PT_LOAD segments share a page).
@@ -295,7 +296,7 @@ fn load_segment(
                 Ok((vma.object_id, false, pte_flags))
             }
         })?;
-        let effective_flags = if already_mapped { merged_flags } else { pte_flags };
+        let effective_flags = if already_mapped { merged_flags | sw_z } else { pte_flags };
 
         // Allocate or get existing physical page.
         let pa = object::with_object(obj_id, |obj| {
@@ -349,18 +350,7 @@ fn load_segment(
             crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, effective_flags);
         }
 
-        // Mark all MMU pages as installed in the VMA.
-        if !already_mapped {
-            aspace::with_aspace(aspace_id, |aspace| {
-                if let Some(vma) = aspace.find_vma_mut(page_va) {
-                    for mmu_idx in 0..mmu_count {
-                        let idx = vma.mmu_index_of(page_va + mmu_idx * MMUPAGE_SIZE);
-                        vma.set_installed(idx);
-                        vma.set_zeroed(idx);
-                    }
-                }
-            });
-        }
+        // PTE installation with SW_ZEROED is the authority — no bitmap update needed.
     }
 
     Ok(())
