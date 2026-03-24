@@ -186,10 +186,10 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
         }
         crate::mm::fault::FaultResult::Failed => {
             crate::println!(
-                "Unhandled #PF: CR2={:#x} RIP={:#x} error={:#x}",
+                "Unhandled #PF: CR2={:#x} RIP={:#x} error={:#x} — killing thread",
                 cr2, frame.rip(), error
             );
-            loop { core::hint::spin_loop(); }
+            crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
         }
         _ => {}
     }

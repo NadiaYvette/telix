@@ -28,9 +28,12 @@ pub fn kmain() -> ! {
     arch::platform::init();
 
     // Physical memory allocator.
-    let (ram_start, ram_end) = arch::platform::ram_range();
+    // Start managed RAM at kernel_end so the allocator never touches
+    // firmware (OpenSBI) or kernel image pages — its bitmap metadata
+    // is written into pages within the managed range, which must be free.
+    let (_ram_start, ram_end) = arch::platform::ram_range();
     let kernel_end = arch::platform::kernel_end_addr();
-    mm::phys::init(ram_start, ram_end, ram_start, kernel_end);
+    mm::phys::init(kernel_end, ram_end, kernel_end, kernel_end);
 
 
     // Enable MMU: set up kernel identity-mapped page tables.
@@ -622,17 +625,12 @@ fn test_demand_paging() {
     };
     #[cfg(target_arch = "riscv64")]
     let pt_root = {
-        let satp: u64;
-        unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp); }
-        let root = ((satp & 0x0FFF_FFFF_FFFF) << 12) as usize;
-        if root == 0 {
-            // MMU not yet enabled — allocate a fresh page table root for the test.
-            let pa = mm::phys::alloc_page().expect("alloc pt root");
-            unsafe { core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE); }
-            pa.as_usize()
-        } else {
-            root
-        }
+        // Always use a fresh page table root for user demand paging tests.
+        // The kernel root has gigapage leaves (device at root[0], RAM at root[2])
+        // which block get_or_create_table from subdividing into 4K page tables.
+        let pa = mm::phys::alloc_page().expect("alloc pt root");
+        unsafe { core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE); }
+        pa.as_usize()
     };
     #[cfg(target_arch = "x86_64")]
     let pt_root = {

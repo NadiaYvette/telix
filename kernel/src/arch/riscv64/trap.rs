@@ -249,10 +249,10 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                 }
                 crate::mm::fault::FaultResult::Failed => {
                     crate::println!(
-                        "Unhandled page fault: cause={:#x} sepc={:#x} stval={:#x}",
+                        "Unhandled page fault: cause={:#x} sepc={:#x} stval={:#x} — killing thread",
                         scause, frame.sepc, stval
                     );
-                    loop { core::hint::spin_loop(); }
+                    crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
                 }
                 _ => frame_sp,
             }

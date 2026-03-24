@@ -444,7 +444,7 @@ impl Scheduler {
         #[cfg(target_arch = "x86_64")]
         const USER_STACK_TOP: usize = 0x7FFF_FFFF_0000;
 
-        let stack_pages = 1; // One allocation page for user stack.
+        let stack_pages = 2; // Two allocation pages (128K) for user stack.
         let stack_va = USER_STACK_TOP - stack_pages * PAGE_SIZE;
 
         // Map the user stack in the address space.
