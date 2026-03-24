@@ -4,11 +4,17 @@
 //! (e.g., an anonymous demand-zero region or a cached file region).
 //! Objects track their physical backing (via PageVec) and the
 //! set of address spaces that map them.
+//!
+//! Each object is identified by a kernel-held port. The kernel handler
+//! intercepts sends synchronously, and per-object spinlocks replace the
+//! former global ObjectTable lock.
 
 use super::page::PhysAddr;
 use super::pagevec::PageVec;
 use super::phys;
+use crate::ipc::port::{self, PortId};
 use crate::sync::SpinLock;
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 /// Maximum number of memory objects.
 pub const MAX_OBJECTS: usize = 96;
@@ -143,150 +149,235 @@ impl MemObject {
     }
 }
 
-/// Object ID type.
+/// Object ID type (slot index into OBJECTS table).
 pub type ObjectId = u32;
 
-/// Global object table.
-static OBJECTS: SpinLock<ObjectTable> = SpinLock::new(ObjectTable::new());
+// --- Per-object locking: each slot has its own SpinLock ---
 
-struct ObjectTable {
-    objects: [MemObject; MAX_OBJECTS],
+/// A slot in the object table.
+struct ObjectSlot {
+    /// 0 = free, 1 = active. Read lock-free for scans.
+    active: AtomicU8,
+    /// Associated kernel port ID (0 = none).
+    port_id: AtomicU32,
+    /// Per-object lock protecting the MemObject.
+    inner: SpinLock<MemObject>,
 }
 
-impl ObjectTable {
+impl ObjectSlot {
     const fn new() -> Self {
         Self {
-            objects: {
-                const EMPTY: MemObject = MemObject::empty();
-                [EMPTY; MAX_OBJECTS]
-            },
+            active: AtomicU8::new(0),
+            port_id: AtomicU32::new(0),
+            inner: SpinLock::new(MemObject::empty()),
         }
     }
+}
+
+/// Global object table — per-slot locks, no global lock.
+static OBJECTS: [ObjectSlot; MAX_OBJECTS] = {
+    const SLOT: ObjectSlot = ObjectSlot::new();
+    [SLOT; MAX_OBJECTS]
+};
+
+/// Atomically claim a free slot. Uses compare_exchange so two concurrent
+/// creates never pick the same slot.
+fn claim_free_slot() -> Option<usize> {
+    for i in 0..MAX_OBJECTS {
+        if OBJECTS[i].active.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Release a claimed slot (on error paths before initialization completes).
+fn release_slot(slot: usize) {
+    OBJECTS[slot].active.store(0, Ordering::Release);
+}
+
+/// Kernel port handler for memory objects. `user_data` is the OBJECTS slot index.
+fn object_port_handler(_port_id: PortId, user_data: usize, msg: &crate::ipc::Message) -> crate::ipc::Message {
+    // Minimal handler. Phase 4 will add the full message-based API for
+    // external pagers. Currently, the primary access path is with_object().
+    let slot = user_data;
+    if slot >= MAX_OBJECTS {
+        return crate::ipc::Message::empty();
+    }
+    let _obj = OBJECTS[slot].inner.lock();
+    let _ = msg;
+    crate::ipc::Message::empty()
 }
 
 /// Create a new pager-backed memory object.
 /// Returns the object ID.
 pub fn create_pager(page_count: u16, file_handle: u32, file_base_offset: u64) -> Option<ObjectId> {
-    let mut table = OBJECTS.lock();
-    let slot = table.objects.iter().position(|o| o.obj_type == ObjectType::Free)?;
-    let pages = PageVec::with_capacity(page_count as usize)?;
-    let obj = &mut table.objects[slot];
-    obj.obj_type = ObjectType::Pager;
-    obj.page_count = page_count;
-    obj.pages = pages;
-    obj.file_handle = file_handle;
-    obj.file_base_offset = file_base_offset;
+    let slot = claim_free_slot()?;
+    let pages = match PageVec::with_capacity(page_count as usize) {
+        Some(p) => p,
+        None => { release_slot(slot); return None; }
+    };
+    let port = match port::create_kernel_port(object_port_handler, slot) {
+        Some(p) => p,
+        None => { release_slot(slot); return None; }
+    };
+
+    {
+        let mut obj = OBJECTS[slot].inner.lock();
+        obj.obj_type = ObjectType::Pager;
+        obj.page_count = page_count;
+        obj.pages = pages;
+        obj.file_handle = file_handle;
+        obj.file_base_offset = file_base_offset;
+    }
+    OBJECTS[slot].port_id.store(port, Ordering::Release);
     Some(slot as ObjectId)
 }
 
 /// Create a new anonymous memory object of `page_count` allocation pages.
 /// Returns the object ID.
 pub fn create_anon(page_count: u16) -> Option<ObjectId> {
-    let mut table = OBJECTS.lock();
-    let slot = table.objects.iter().position(|o| o.obj_type == ObjectType::Free)?;
-    let pages = PageVec::with_capacity(page_count as usize)?;
-    let obj = &mut table.objects[slot];
-    obj.obj_type = ObjectType::Anonymous;
-    obj.page_count = page_count;
-    obj.pages = pages;
+    let slot = claim_free_slot()?;
+    let pages = match PageVec::with_capacity(page_count as usize) {
+        Some(p) => p,
+        None => { release_slot(slot); return None; }
+    };
+    let port = match port::create_kernel_port(object_port_handler, slot) {
+        Some(p) => p,
+        None => { release_slot(slot); return None; }
+    };
+
+    {
+        let mut obj = OBJECTS[slot].inner.lock();
+        obj.obj_type = ObjectType::Anonymous;
+        obj.page_count = page_count;
+        obj.pages = pages;
+    }
+    OBJECTS[slot].port_id.store(port, Ordering::Release);
     Some(slot as ObjectId)
 }
 
 /// Next COW group ID counter.
-static NEXT_COW_GROUP: crate::sync::SpinLock<u16> = crate::sync::SpinLock::new(1);
+static NEXT_COW_GROUP: SpinLock<u16> = SpinLock::new(1);
 
 /// Clone a memory object for COW. Creates a new object that shares all
 /// physical pages with the original. Both objects are placed in the same
 /// COW sharing group so that page ownership can be determined by scanning
 /// siblings rather than maintaining per-PFN refcounts.
 pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
-    let mut table = OBJECTS.lock();
-    let page_count = table.objects[src_id as usize].page_count;
+    // Step 1: Lock source, read state, assign COW group, copy pages.
+    let (page_count, group, new_pages) = {
+        let mut src = OBJECTS[src_id as usize].inner.lock();
+        if src.cow_group == 0 {
+            let mut g = NEXT_COW_GROUP.lock();
+            src.cow_group = *g;
+            *g = g.wrapping_add(1);
+            if *g == 0 { *g = 1; }
+        }
+        let group = src.cow_group;
+        let page_count = src.page_count;
+        let mut new_pages = PageVec::with_capacity(page_count as usize)?;
+        new_pages.copy_from(&src.pages, page_count as usize);
+        (page_count, group, new_pages)
+    }; // Source lock released.
 
-    // Find a free slot.
-    let dst_idx = table.objects.iter().position(|o| o.obj_type == ObjectType::Free)?;
+    // Step 2: Claim free slot + create kernel port.
+    let dst_idx = claim_free_slot()?;
+    let port = match port::create_kernel_port(object_port_handler, dst_idx) {
+        Some(p) => p,
+        None => { release_slot(dst_idx); return None; }
+    };
 
-    // Allocate PageVec for the clone.
-    let mut new_pages = PageVec::with_capacity(page_count as usize)?;
-    new_pages.copy_from(&table.objects[src_id as usize].pages, page_count as usize);
-
-    // Assign a COW group if the source doesn't have one yet.
-    if table.objects[src_id as usize].cow_group == 0 {
-        let mut g = NEXT_COW_GROUP.lock();
-        table.objects[src_id as usize].cow_group = *g;
-        *g = g.wrapping_add(1);
-        if *g == 0 { *g = 1; } // skip 0
+    // Step 3: Initialize destination.
+    {
+        let mut dst = OBJECTS[dst_idx].inner.lock();
+        dst.obj_type = ObjectType::Anonymous;
+        dst.page_count = page_count;
+        dst.cow_group = group;
+        dst.pages = new_pages;
+        for m in &mut dst.mappings {
+            *m = Mapping::empty();
+        }
     }
-    let group = table.objects[src_id as usize].cow_group;
-
-    let obj = &mut table.objects[dst_idx];
-    obj.obj_type = ObjectType::Anonymous;
-    obj.page_count = page_count;
-    obj.cow_group = group;
-    obj.pages = new_pages;
-    // Clear mappings on the new object (caller will add its own).
-    for m in &mut obj.mappings {
-        *m = Mapping::empty();
-    }
-
+    OBJECTS[dst_idx].port_id.store(port, Ordering::Release);
     Some(dst_idx as ObjectId)
 }
 
 /// Destroy a memory object, freeing physical pages not shared with siblings.
 pub fn destroy(id: ObjectId) {
-    let mut table = OBJECTS.lock();
-    let group = table.objects[id as usize].cow_group;
-    let page_count = table.objects[id as usize].page_count as usize;
+    let idx = id as usize;
+    let (group, page_count) = {
+        let obj = OBJECTS[idx].inner.lock();
+        (obj.cow_group, obj.page_count as usize)
+    };
 
     // Free each page, checking siblings in the same COW group.
+    // Lock ordering: always ascending slot index, never two simultaneously.
     for p in 0..page_count {
-        let pa = table.objects[id as usize].pages.get(p);
-        if pa != 0 {
-            let shared = group != 0 && table.objects.iter().enumerate().any(|(i, obj)| {
-                i != id as usize
-                    && obj.obj_type != ObjectType::Free
-                    && obj.cow_group == group
-                    && obj.pages.contains(obj.page_count as usize, pa)
-            });
-            if !shared {
-                phys::free_page(PhysAddr::new(pa));
-            }
-            table.objects[id as usize].pages.set(p, 0);
+        let pa = OBJECTS[idx].inner.lock().pages.get(p);
+        if pa == 0 { continue; }
+
+        let shared = group != 0 && (0..MAX_OBJECTS).any(|i| {
+            if i == idx { return false; }
+            if OBJECTS[i].active.load(Ordering::Acquire) == 0 { return false; }
+            let sib = OBJECTS[i].inner.lock();
+            sib.obj_type != ObjectType::Free
+                && sib.cow_group == group
+                && sib.pages.contains(sib.page_count as usize, pa)
+        });
+        if !shared {
+            phys::free_page(PhysAddr::new(pa));
         }
+        OBJECTS[idx].inner.lock().pages.set(p, 0);
     }
 
-    // Free the PageVec heap buffer.
-    table.objects[id as usize].pages.free_heap();
-    table.objects[id as usize].obj_type = ObjectType::Free;
-    table.objects[id as usize].page_count = 0;
-    table.objects[id as usize].cow_group = 0;
+    // Free PageVec heap and mark slot inactive.
+    let port_id = OBJECTS[idx].port_id.load(Ordering::Acquire);
+    {
+        let mut obj = OBJECTS[idx].inner.lock();
+        obj.pages.free_heap();
+        obj.obj_type = ObjectType::Free;
+        obj.page_count = 0;
+        obj.cow_group = 0;
+    }
+    OBJECTS[idx].active.store(0, Ordering::Release);
+    OBJECTS[idx].port_id.store(0, Ordering::Release);
+    if port_id != 0 {
+        port::destroy(port_id);
+    }
 }
 
-/// Access an object by ID within a closure (while holding the lock).
+/// Access an object by ID within a closure (per-object lock only).
 pub fn with_object<F, R>(id: ObjectId, f: F) -> R
 where
     F: FnOnce(&mut MemObject) -> R,
 {
-    let mut table = OBJECTS.lock();
-    f(&mut table.objects[id as usize])
+    let mut obj = OBJECTS[id as usize].inner.lock();
+    f(&mut obj)
+}
+
+/// Get the kernel port ID for an object.
+#[allow(dead_code)]
+pub fn object_port(id: ObjectId) -> PortId {
+    OBJECTS[id as usize].port_id.load(Ordering::Acquire)
 }
 
 /// Check whether a physical page at `page_idx` in object `obj_id` is shared
 /// with any sibling in the same COW group.
 pub fn is_page_shared(obj_id: ObjectId, page_idx: usize) -> bool {
-    let table = OBJECTS.lock();
-    let obj = &table.objects[obj_id as usize];
-    let group = obj.cow_group;
-    if group == 0 {
+    let idx = obj_id as usize;
+    let (group, pa) = {
+        let obj = OBJECTS[idx].inner.lock();
+        (obj.cow_group, obj.pages.get(page_idx))
+    };
+    if group == 0 || pa == 0 {
         return false;
     }
-    let pa = obj.pages.get(page_idx);
-    if pa == 0 {
-        return false;
-    }
-    table.objects.iter().enumerate().any(|(i, sib)| {
-        i != obj_id as usize
-            && sib.obj_type != ObjectType::Free
+    (0..MAX_OBJECTS).any(|i| {
+        if i == idx { return false; }
+        if OBJECTS[i].active.load(Ordering::Acquire) == 0 { return false; }
+        let sib = OBJECTS[i].inner.lock();
+        sib.obj_type != ObjectType::Free
             && sib.cow_group == group
             && sib.pages.contains(sib.page_count as usize, pa)
     })
@@ -297,17 +388,20 @@ pub fn is_page_shared(obj_id: ObjectId, page_idx: usize) -> bool {
 /// Returns true if the physical page was freed, false if still shared.
 /// Clears the page entry in either case.
 pub fn release_page(obj_id: ObjectId, page_idx: usize) -> bool {
-    let mut table = OBJECTS.lock();
-    let group = table.objects[obj_id as usize].cow_group;
-    let pa = table.objects[obj_id as usize].pages.get(page_idx);
-    if pa == 0 {
-        return false;
-    }
-    table.objects[obj_id as usize].pages.set(page_idx, 0);
+    let idx = obj_id as usize;
+    let (group, pa) = {
+        let mut obj = OBJECTS[idx].inner.lock();
+        let pa = obj.pages.get(page_idx);
+        if pa == 0 { return false; }
+        obj.pages.set(page_idx, 0);
+        (obj.cow_group, pa)
+    };
 
-    let shared = group != 0 && table.objects.iter().enumerate().any(|(i, sib)| {
-        i != obj_id as usize
-            && sib.obj_type != ObjectType::Free
+    let shared = group != 0 && (0..MAX_OBJECTS).any(|i| {
+        if i == idx { return false; }
+        if OBJECTS[i].active.load(Ordering::Acquire) == 0 { return false; }
+        let sib = OBJECTS[i].inner.lock();
+        sib.obj_type != ObjectType::Free
             && sib.cow_group == group
             && sib.pages.contains(sib.page_count as usize, pa)
     });

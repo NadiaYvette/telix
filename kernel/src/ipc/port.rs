@@ -107,8 +107,9 @@ const MAX_WAITERS: usize = 8;
 pub const MAX_PORTS: usize = 256;
 
 /// Kernel receive handler type. Called synchronously when a message is
-/// sent to a kernel-held port. Returns a reply message.
-pub type KernelHandler = fn(PortId, &Message) -> Message;
+/// sent to a kernel-held port. `user_data` is an opaque value set at
+/// port creation (e.g., an object table index). Returns a reply message.
+pub type KernelHandler = fn(PortId, usize, &Message) -> Message;
 
 /// A port endpoint.
 pub struct Port {
@@ -123,6 +124,8 @@ pub struct Port {
     /// receive right: sends invoke this handler synchronously instead of
     /// queueing, and no user-space thread can recv on this port.
     kernel_handler: usize,
+    /// Opaque value passed to the kernel handler. Set at port creation.
+    kernel_user_data: usize,
     /// Threads blocked waiting to receive.
     recv_waiters: [ThreadId; MAX_WAITERS],
     recv_waiter_count: usize,
@@ -142,6 +145,7 @@ impl Port {
             active: true,
             queue_ptr: 0,
             kernel_handler: 0,
+            kernel_user_data: 0,
             recv_waiters: [0; MAX_WAITERS],
             recv_waiter_count: 0,
             send_waiters: [0; MAX_WAITERS],
@@ -161,7 +165,7 @@ impl Port {
     /// Port table lock must NOT be held when calling this (handler may take other locks).
     unsafe fn invoke_handler(&self, port_id: PortId, msg: &Message) -> Message {
         let handler: KernelHandler = core::mem::transmute(self.kernel_handler);
-        handler(port_id, msg)
+        handler(port_id, self.kernel_user_data, msg)
     }
 
     /// Ensure the message queue is allocated. Returns false on OOM.
@@ -353,9 +357,10 @@ pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {
     // Kernel-held port: invoke handler synchronously, no queue.
     if port.is_kernel_held() {
         let handler = port.kernel_handler;
+        let udata = port.kernel_user_data;
         drop(table);
         let handler_fn: KernelHandler = unsafe { core::mem::transmute(handler) };
-        let _reply = handler_fn(port_id, &msg);
+        let _reply = handler_fn(port_id, udata, &msg);
         return Ok(());
     }
     match port.try_send(msg) {
@@ -436,9 +441,10 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
         if !table.ports[local].active { return Err(()); }
         if table.ports[local].is_kernel_held() {
             let handler = table.ports[local].kernel_handler;
+            let udata = table.ports[local].kernel_user_data;
             drop(table);
             let handler_fn: KernelHandler = unsafe { core::mem::transmute(handler) };
-            let _reply = handler_fn(port_id, &msg);
+            let _reply = handler_fn(port_id, udata, &msg);
             return Ok(());
         }
     }
@@ -594,9 +600,10 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
     // Kernel-held port: invoke handler synchronously.
     if port.is_kernel_held() {
         let handler = port.kernel_handler;
+        let udata = port.kernel_user_data;
         drop(table);
         let handler_fn: KernelHandler = unsafe { core::mem::transmute(handler) };
-        let _reply = handler_fn(port_id, msg);
+        let _reply = handler_fn(port_id, udata, msg);
         return SendDirectResult::Queued;
     }
 
@@ -680,8 +687,7 @@ pub fn recv_or_park(port_id: PortId) -> Result<Message, ()> {
 /// The handler is called with (port_id, &message) and returns a reply Message.
 /// The PORT_TABLE lock is NOT held during the handler call, so the handler
 /// may safely take other kernel locks.
-#[allow(dead_code)]
-pub fn create_kernel_port(handler: KernelHandler) -> Option<PortId> {
+pub fn create_kernel_port(handler: KernelHandler, user_data: usize) -> Option<PortId> {
     let mut table = PORT_TABLE.lock();
     // Fast path.
     let id = table.next_id;
@@ -690,6 +696,7 @@ pub fn create_kernel_port(handler: KernelHandler) -> Option<PortId> {
         table.ports[id as usize] = Port::new(pid);
         table.ports[id as usize].creator_task = 0; // kernel
         table.ports[id as usize].kernel_handler = handler as usize;
+        table.ports[id as usize].kernel_user_data = user_data;
         table.next_id += 1;
         return Some(pid);
     }
@@ -700,6 +707,7 @@ pub fn create_kernel_port(handler: KernelHandler) -> Option<PortId> {
             table.ports[i] = Port::new(pid);
             table.ports[i].creator_task = 0;
             table.ports[i].kernel_handler = handler as usize;
+            table.ports[i].kernel_user_data = user_data;
             return Some(pid);
         }
     }
@@ -713,16 +721,16 @@ pub fn create_kernel_port(handler: KernelHandler) -> Option<PortId> {
 #[allow(dead_code)]
 pub fn call_kernel_handler(port_id: PortId, msg: &Message) -> Option<Message> {
     let local = port_local(port_id) as usize;
-    let handler = {
+    let (handler, udata) = {
         let table = PORT_TABLE.lock();
         if local >= MAX_PORTS { return None; }
         let port = &table.ports[local];
         if !port.active || !port.is_kernel_held() { return None; }
-        port.kernel_handler
+        (port.kernel_handler, port.kernel_user_data)
     };
     // Lock released — safe to call handler.
     let handler_fn: KernelHandler = unsafe { core::mem::transmute(handler) };
-    Some(handler_fn(port_id, msg))
+    Some(handler_fn(port_id, udata, msg))
 }
 
 /// Check if a port has a kernel receive handler.
