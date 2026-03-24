@@ -1728,14 +1728,16 @@ pub fn fork_current() -> u64 {
     // well-known port caps.
     {
         // Copy the fast-path bitmaps so child inherits parent's port access.
-        let parent_send = crate::cap::CAP_SEND[parent_task_id as usize]
-            .load(core::sync::atomic::Ordering::Relaxed);
-        let parent_recv = crate::cap::CAP_RECV[parent_task_id as usize]
-            .load(core::sync::atomic::Ordering::Relaxed);
-        crate::cap::CAP_SEND[child_task_id as usize]
-            .store(parent_send, core::sync::atomic::Ordering::Relaxed);
-        crate::cap::CAP_RECV[child_task_id as usize]
-            .store(parent_recv, core::sync::atomic::Ordering::Relaxed);
+        for w in 0..crate::cap::CAP_SEND[0].len() {
+            let ps = crate::cap::CAP_SEND[parent_task_id as usize][w]
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let pr = crate::cap::CAP_RECV[parent_task_id as usize][w]
+                .load(core::sync::atomic::Ordering::Relaxed);
+            crate::cap::CAP_SEND[child_task_id as usize][w]
+                .store(ps, core::sync::atomic::Ordering::Relaxed);
+            crate::cap::CAP_RECV[child_task_id as usize][w]
+                .store(pr, core::sync::atomic::Ordering::Relaxed);
+        }
 
         let mut caps = crate::cap::CAP_SYSTEM.lock();
         caps.spaces[child_task_id as usize] = crate::cap::CapSpace::new(child_task_id);

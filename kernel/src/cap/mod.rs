@@ -9,18 +9,24 @@ pub use space::CapSpace;
 
 use crate::sync::SpinLock;
 use crate::sched::task::MAX_TASKS;
+use crate::ipc::port::MAX_PORTS;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Number of u64 words needed to cover MAX_PORTS bits.
+const BITMAP_WORDS: usize = (MAX_PORTS + 63) / 64;
 
 /// Per-task lockless bitmaps for fast cap checks.
 /// Bit i is set if the task holds the corresponding right for port i.
 /// These are updated under CAP_SYSTEM lock but read locklessly.
-pub static CAP_SEND: [AtomicU64; MAX_TASKS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_TASKS]
+pub static CAP_SEND: [[AtomicU64; BITMAP_WORDS]; MAX_TASKS] = {
+    const WORD: AtomicU64 = AtomicU64::new(0);
+    const ROW: [AtomicU64; BITMAP_WORDS] = [WORD; BITMAP_WORDS];
+    [ROW; MAX_TASKS]
 };
-pub static CAP_RECV: [AtomicU64; MAX_TASKS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_TASKS]
+pub static CAP_RECV: [[AtomicU64; BITMAP_WORDS]; MAX_TASKS] = {
+    const WORD: AtomicU64 = AtomicU64::new(0);
+    const ROW: [AtomicU64; BITMAP_WORDS] = [WORD; BITMAP_WORDS];
+    [ROW; MAX_TASKS]
 };
 
 /// Fast lockless check: does task have SEND/RECV cap for this port?
@@ -28,12 +34,14 @@ pub static CAP_RECV: [AtomicU64; MAX_TASKS] = {
 pub fn has_port_cap_fast(task_id: u32, port_id: u32, needed: Rights) -> bool {
     if task_id == 0 { return true; }
     let pid = port_id as usize;
-    if pid >= 64 { return false; }
-    let mask = 1u64 << pid;
-    if needed.contains(Rights::SEND) && (CAP_SEND[task_id as usize].load(Ordering::Relaxed) & mask) == 0 {
+    if pid >= MAX_PORTS { return false; }
+    let word = pid / 64;
+    let bit = pid % 64;
+    let mask = 1u64 << bit;
+    if needed.contains(Rights::SEND) && (CAP_SEND[task_id as usize][word].load(Ordering::Relaxed) & mask) == 0 {
         return false;
     }
-    if needed.contains(Rights::RECV) && (CAP_RECV[task_id as usize].load(Ordering::Relaxed) & mask) == 0 {
+    if needed.contains(Rights::RECV) && (CAP_RECV[task_id as usize][word].load(Ordering::Relaxed) & mask) == 0 {
         return false;
     }
     true
@@ -42,29 +50,33 @@ pub fn has_port_cap_fast(task_id: u32, port_id: u32, needed: Rights) -> bool {
 /// Update bitmaps after granting a port cap. Call under CAP_SYSTEM lock.
 fn bitmap_grant(task_id: u32, port_id: u32, rights: Rights) {
     let pid = port_id as usize;
-    if pid >= 64 { return; }
-    let mask = 1u64 << pid;
+    if pid >= MAX_PORTS { return; }
+    let word = pid / 64;
+    let mask = 1u64 << (pid % 64);
     if rights.contains(Rights::SEND) {
-        CAP_SEND[task_id as usize].fetch_or(mask, Ordering::Relaxed);
+        CAP_SEND[task_id as usize][word].fetch_or(mask, Ordering::Relaxed);
     }
     if rights.contains(Rights::RECV) {
-        CAP_RECV[task_id as usize].fetch_or(mask, Ordering::Relaxed);
+        CAP_RECV[task_id as usize][word].fetch_or(mask, Ordering::Relaxed);
     }
 }
 
 /// Clear bitmap bits for a port. Call under CAP_SYSTEM lock after removing caps.
 fn bitmap_remove_port(task_id: u32, port_id: u32) {
     let pid = port_id as usize;
-    if pid >= 64 { return; }
-    let mask = !(1u64 << pid);
-    CAP_SEND[task_id as usize].fetch_and(mask, Ordering::Relaxed);
-    CAP_RECV[task_id as usize].fetch_and(mask, Ordering::Relaxed);
+    if pid >= MAX_PORTS { return; }
+    let word = pid / 64;
+    let mask = !(1u64 << (pid % 64));
+    CAP_SEND[task_id as usize][word].fetch_and(mask, Ordering::Relaxed);
+    CAP_RECV[task_id as usize][word].fetch_and(mask, Ordering::Relaxed);
 }
 
 /// Reset all bitmap bits for a task (on task reset).
 pub fn bitmap_reset(task_id: u32) {
-    CAP_SEND[task_id as usize].store(0, Ordering::Relaxed);
-    CAP_RECV[task_id as usize].store(0, Ordering::Relaxed);
+    for w in 0..BITMAP_WORDS {
+        CAP_SEND[task_id as usize][w].store(0, Ordering::Relaxed);
+        CAP_RECV[task_id as usize][w].store(0, Ordering::Relaxed);
+    }
 }
 
 /// Global capability system: per-task CapSpaces + the CDT.
@@ -138,11 +150,13 @@ impl CapSystem {
 
 /// Find the first task (other than `exclude_task`) that has RECV cap for `port_id`.
 pub fn find_recv_task(port_id: u32, exclude_task: u32) -> Option<u32> {
-    if port_id as usize >= 64 { return None; }
-    let mask = 1u64 << port_id;
+    let pid = port_id as usize;
+    if pid >= MAX_PORTS { return None; }
+    let word = pid / 64;
+    let mask = 1u64 << (pid % 64);
     for task_id in 0..MAX_TASKS as u32 {
         if task_id == exclude_task { continue; }
-        if CAP_RECV[task_id as usize].load(Ordering::Relaxed) & mask != 0 {
+        if CAP_RECV[task_id as usize][word].load(Ordering::Relaxed) & mask != 0 {
             return Some(task_id);
         }
     }

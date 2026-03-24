@@ -1,30 +1,120 @@
-//! Port: a kernel-managed message queue.
+//! Port: a kernel-managed message endpoint.
 //!
 //! A port can receive messages from any holder of a send capability.
 //! Messages are queued in a bounded buffer. Senders block if the queue
 //! is full; receivers block if the queue is empty.
+//!
+//! Port IDs are structured as `(node:16 | local:16)` to support future
+//! network-transparent IPC. For single-node operation, node is always 0
+//! and the PortId value equals the local index.
 
 use super::message::Message;
 use crate::sched::thread::ThreadId;
+use crate::mm::page::PhysAddr;
 
 pub type PortId = u32;
+
+// --- PortId structure: top 16 bits = node, bottom 16 = local index ---
+
+/// Extract the node portion of a PortId (top 16 bits). Currently always 0.
+#[inline]
+pub const fn port_node(id: PortId) -> u16 {
+    (id >> 16) as u16
+}
+
+/// Extract the local port index (bottom 16 bits).
+#[inline]
+pub const fn port_local(id: PortId) -> u16 {
+    id as u16
+}
+
+/// Construct a PortId from node and local index.
+#[inline]
+pub const fn make_port_id(node: u16, local: u16) -> PortId {
+    ((node as u32) << 16) | (local as u32)
+}
+
+// --- Port queue: slab-allocated on demand ---
 
 /// Maximum messages queued per port.
 const PORT_QUEUE_CAPACITY: usize = 16;
 
+/// Slab-allocated message queue. Size: 16 * 56 + 24 = 920 bytes → 2048-byte slab.
+struct PortQueue {
+    msgs: [Message; PORT_QUEUE_CAPACITY],
+    head: usize,
+    tail: usize,
+    len: usize,
+}
+
+const PORT_QUEUE_SLAB_SIZE: usize = 2048;
+
+impl PortQueue {
+    fn init(ptr: *mut PortQueue) {
+        unsafe {
+            core::ptr::write_bytes(ptr as *mut u8, 0, core::mem::size_of::<PortQueue>());
+        }
+    }
+
+    fn enqueue(&mut self, msg: Message) -> bool {
+        if self.len >= PORT_QUEUE_CAPACITY {
+            return false;
+        }
+        self.msgs[self.tail] = msg;
+        self.tail = (self.tail + 1) % PORT_QUEUE_CAPACITY;
+        self.len += 1;
+        true
+    }
+
+    fn dequeue(&mut self) -> Option<Message> {
+        if self.len == 0 {
+            return None;
+        }
+        let msg = self.msgs[self.head];
+        self.head = (self.head + 1) % PORT_QUEUE_CAPACITY;
+        self.len -= 1;
+        Some(msg)
+    }
+
+    fn is_full(&self) -> bool {
+        self.len >= PORT_QUEUE_CAPACITY
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Allocate a PortQueue from the slab allocator.
+fn alloc_queue() -> Option<*mut PortQueue> {
+    let pa = crate::mm::slab::alloc(PORT_QUEUE_SLAB_SIZE)?;
+    let ptr = pa.as_usize() as *mut PortQueue;
+    PortQueue::init(ptr);
+    Some(ptr)
+}
+
+/// Free a PortQueue back to the slab allocator.
+fn free_queue(ptr: *mut PortQueue) {
+    crate::mm::slab::free(PhysAddr::new(ptr as usize), PORT_QUEUE_SLAB_SIZE);
+}
+
+// --- Port structure ---
+
 /// Maximum threads that can be blocked waiting on a port.
 const MAX_WAITERS: usize = 8;
 
-/// A port's message queue.
+/// Maximum number of ports in the system.
+pub const MAX_PORTS: usize = 256;
+
+/// A port endpoint.
 pub struct Port {
     #[allow(dead_code)]
     pub id: PortId,
     pub active: bool,
-    /// Circular buffer of queued messages.
-    queue: [Message; PORT_QUEUE_CAPACITY],
-    head: usize,
-    tail: usize,
-    len: usize,
+    /// Pointer to slab-allocated message queue (0 = not yet allocated).
+    /// Queue is allocated on first send, so kernel-held ports that handle
+    /// faults synchronously never pay for the queue.
+    queue_ptr: usize,
     /// Threads blocked waiting to receive.
     recv_waiters: [ThreadId; MAX_WAITERS],
     recv_waiter_count: usize,
@@ -42,10 +132,7 @@ impl Port {
         Self {
             id,
             active: true,
-            queue: [Message::empty(); PORT_QUEUE_CAPACITY],
-            head: 0,
-            tail: 0,
-            len: 0,
+            queue_ptr: 0,
             recv_waiters: [0; MAX_WAITERS],
             recv_waiter_count: 0,
             send_waiters: [0; MAX_WAITERS],
@@ -55,17 +142,49 @@ impl Port {
         }
     }
 
+    /// Ensure the message queue is allocated. Returns false on OOM.
+    fn ensure_queue(&mut self) -> bool {
+        if self.queue_ptr != 0 {
+            return true;
+        }
+        match alloc_queue() {
+            Some(ptr) => {
+                self.queue_ptr = ptr as usize;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Get a reference to the queue, if allocated.
+    fn queue(&self) -> Option<&PortQueue> {
+        if self.queue_ptr == 0 { None } else { Some(unsafe { &*(self.queue_ptr as *const PortQueue) }) }
+    }
+
+    /// Get a mutable reference to the queue, if allocated.
+    fn queue_mut(&mut self) -> Option<&mut PortQueue> {
+        if self.queue_ptr == 0 { None } else { Some(unsafe { &mut *(self.queue_ptr as *mut PortQueue) }) }
+    }
+
+    /// Free the queue if allocated.
+    fn free_queue(&mut self) {
+        if self.queue_ptr != 0 {
+            free_queue(self.queue_ptr as *mut PortQueue);
+            self.queue_ptr = 0;
+        }
+    }
+
     /// Try to enqueue a message. Returns Ok((direct_wakeup, port_set_id)) where
     /// direct_wakeup is a receiver thread to wake, and port_set_id is the set
-    /// to notify if no direct receiver exists. Err(msg) if queue is full.
+    /// to notify if no direct receiver exists. Err(msg) if queue is full or OOM.
     pub fn try_send(&mut self, msg: Message) -> Result<(Option<ThreadId>, u32), Message> {
-        if self.len >= PORT_QUEUE_CAPACITY {
-            return Err(msg); // Queue full.
+        if !self.ensure_queue() {
+            return Err(msg);
         }
-
-        self.queue[self.tail] = msg;
-        self.tail = (self.tail + 1) % PORT_QUEUE_CAPACITY;
-        self.len += 1;
+        let q = self.queue_mut().unwrap();
+        if !q.enqueue(msg) {
+            return Err(msg);
+        }
 
         // Wake up a blocked receiver if any.
         if self.recv_waiter_count > 0 {
@@ -80,13 +199,14 @@ impl Port {
     /// Try to dequeue a message. Returns Ok(msg, Option<ThreadId>) where
     /// the Option is a sender to wake up, or Err(()) if the queue is empty.
     pub fn try_recv(&mut self) -> Result<(Message, Option<ThreadId>), ()> {
-        if self.len == 0 {
-            return Err(()); // Queue empty.
-        }
-
-        let msg = self.queue[self.head];
-        self.head = (self.head + 1) % PORT_QUEUE_CAPACITY;
-        self.len -= 1;
+        let q = match self.queue_mut() {
+            Some(q) => q,
+            None => return Err(()),
+        };
+        let msg = match q.dequeue() {
+            Some(m) => m,
+            None => return Err(()),
+        };
 
         // Wake up a blocked sender if any.
         let wakeup = if self.send_waiter_count > 0 {
@@ -124,12 +244,20 @@ impl Port {
     /// Number of queued messages.
     #[allow(dead_code)]
     pub fn queued(&self) -> usize {
-        self.len
+        match self.queue() {
+            Some(q) => q.len,
+            None => 0,
+        }
+    }
+
+    /// Whether the queue exists and is full.
+    pub fn is_queue_full(&self) -> bool {
+        match self.queue() {
+            Some(q) => q.is_full(),
+            None => false, // No queue yet — not full (first send will allocate)
+        }
     }
 }
-
-/// Maximum number of ports in the system.
-pub const MAX_PORTS: usize = 64;
 
 /// Global port table.
 use crate::sync::SpinLock;
@@ -150,24 +278,25 @@ impl PortTable {
 
 static PORT_TABLE: SpinLock<PortTable> = SpinLock::new(PortTable::new());
 
-/// Create a new port. Returns its ID.
+/// Create a new port. Returns its ID (node=0, local=index).
 pub fn create() -> Option<PortId> {
     let creator = crate::sched::current_task_id();
     let mut table = PORT_TABLE.lock();
     // First try the fast path: allocate from next_id.
     let id = table.next_id;
     if (id as usize) < MAX_PORTS {
-        table.ports[id as usize] = Port::new(id);
+        table.ports[id as usize] = Port::new(make_port_id(0, id as u16));
         table.ports[id as usize].creator_task = creator;
         table.next_id += 1;
-        return Some(id);
+        return Some(make_port_id(0, id as u16));
     }
     // Slow path: scan for a destroyed (inactive) port to reuse.
     for i in 0..MAX_PORTS {
         if !table.ports[i].active {
-            table.ports[i] = Port::new(i as u32);
+            let pid = make_port_id(0, i as u16);
+            table.ports[i] = Port::new(pid);
             table.ports[i].creator_task = creator;
-            return Some(i as u32);
+            return Some(pid);
         }
     }
     None
@@ -175,9 +304,10 @@ pub fn create() -> Option<PortId> {
 
 /// Get the creator task of a port, or None if port is inactive.
 pub fn port_creator(port_id: PortId) -> Option<u32> {
+    let local = port_local(port_id) as usize;
     let table = PORT_TABLE.lock();
-    if (port_id as usize) < MAX_PORTS && table.ports[port_id as usize].active {
-        Some(table.ports[port_id as usize].creator_task)
+    if local < MAX_PORTS && table.ports[local].active {
+        Some(table.ports[local].creator_task)
     } else {
         None
     }
@@ -189,11 +319,12 @@ pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {
     // Stamp sender priority for priority inheritance.
     let tid = crate::sched::current_thread_id();
     msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
+    let local = port_local(port_id) as usize;
     let mut table = PORT_TABLE.lock();
-    if (port_id as usize) >= MAX_PORTS {
+    if local >= MAX_PORTS {
         return Err(msg);
     }
-    let port = &mut table.ports[port_id as usize];
+    let port = &mut table.ports[local];
     if !port.active {
         return Err(msg);
     }
@@ -236,11 +367,12 @@ pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {
 /// Receive a message from a port (non-blocking).
 /// Returns Ok(msg) on success, Err(()) if empty.
 pub fn recv_nb(port_id: PortId) -> Result<Message, ()> {
+    let local = port_local(port_id) as usize;
     let mut table = PORT_TABLE.lock();
-    if (port_id as usize) >= MAX_PORTS {
+    if local >= MAX_PORTS {
         return Err(());
     }
-    let port = &mut table.ports[port_id as usize];
+    let port = &mut table.ports[local];
     if !port.active {
         return Err(());
     }
@@ -266,13 +398,14 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
     let tid = crate::sched::current_thread_id();
     msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
     crate::sched::stats::IPC_SENDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let local = port_local(port_id) as usize;
     let mut pending = msg;
     loop {
         let mut table = PORT_TABLE.lock();
-        if (port_id as usize) >= MAX_PORTS {
+        if local >= MAX_PORTS {
             return Err(());
         }
-        let port = &mut table.ports[port_id as usize];
+        let port = &mut table.ports[local];
         if !port.active {
             return Err(());
         }
@@ -320,15 +453,16 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
 /// Blocks if the queue is empty until a message arrives.
 pub fn recv(port_id: PortId) -> Result<Message, ()> {
     use crate::sched::thread::BlockReason;
+    let local = port_local(port_id) as usize;
     // Reset priority to base on recv entry (priority inheritance protocol).
     let my_tid = crate::sched::current_thread_id();
     crate::sched::reset_priority(my_tid);
     loop {
         let mut table = PORT_TABLE.lock();
-        if (port_id as usize) >= MAX_PORTS {
+        if local >= MAX_PORTS {
             return Err(());
         }
-        let port = &mut table.ports[port_id as usize];
+        let port = &mut table.ports[local];
         if !port.active {
             return Err(());
         }
@@ -355,24 +489,28 @@ pub fn recv(port_id: PortId) -> Result<Message, ()> {
 
 /// Set the port set membership for a port.
 pub fn set_port_set(port_id: PortId, set_id: u32) {
+    let local = port_local(port_id) as usize;
     let mut table = PORT_TABLE.lock();
-    if (port_id as usize) < MAX_PORTS {
-        table.ports[port_id as usize].port_set_id = set_id;
+    if local < MAX_PORTS {
+        table.ports[local].port_set_id = set_id;
     }
 }
 
 /// Check if a port is active (for auto-grant heuristics).
 pub fn port_is_active(port_id: PortId) -> bool {
+    let local = port_local(port_id) as usize;
     let table = PORT_TABLE.lock();
-    (port_id as usize) < MAX_PORTS && table.ports[port_id as usize].active
+    local < MAX_PORTS && table.ports[local].active
 }
 
-/// Destroy a port.
+/// Destroy a port, freeing its message queue.
 #[allow(dead_code)]
 pub fn destroy(port_id: PortId) {
+    let local = port_local(port_id) as usize;
     let mut table = PORT_TABLE.lock();
-    if (port_id as usize) < MAX_PORTS {
-        table.ports[port_id as usize].active = false;
+    if local < MAX_PORTS {
+        table.ports[local].active = false;
+        table.ports[local].free_queue();
     }
 }
 
@@ -392,9 +530,6 @@ pub enum SendDirectResult {
 /// If a receiver is parked (Blocked state, from recv_or_park) on this port,
 /// returns DirectTransfer(tid) without queueing the message. The caller is
 /// responsible for injecting the message and waking/handing off to the receiver.
-///
-/// For spin-blocked receivers (old block_current path, Running state),
-/// falls through to the normal try_send + wake_thread path.
 pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
     use crate::sched::thread::ThreadState;
 
@@ -403,11 +538,12 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
     crate::sched::stats::IPC_SENDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     crate::trace::trace_event(crate::trace::EVT_IPC_SEND, port_id, 0);
 
+    let local = port_local(port_id) as usize;
     let mut table = PORT_TABLE.lock();
-    if (port_id as usize) >= MAX_PORTS {
+    if local >= MAX_PORTS {
         return SendDirectResult::Error;
     }
-    let port = &mut table.ports[port_id as usize];
+    let port = &mut table.ports[local];
     if !port.active {
         return SendDirectResult::Error;
     }
@@ -449,14 +585,15 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
 /// Returns Err(()) if the thread was parked (message will be injected by sender).
 pub fn recv_or_park(port_id: PortId) -> Result<Message, ()> {
     use crate::sched::thread::BlockReason;
+    let local = port_local(port_id) as usize;
     let my_tid = crate::sched::current_thread_id();
     crate::sched::reset_priority(my_tid);
 
     let mut table = PORT_TABLE.lock();
-    if (port_id as usize) >= MAX_PORTS {
+    if local >= MAX_PORTS {
         return Err(());
     }
-    let port = &mut table.ports[port_id as usize];
+    let port = &mut table.ports[local];
     if !port.active {
         return Err(());
     }
