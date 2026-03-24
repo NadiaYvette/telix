@@ -112,6 +112,7 @@ pub const SYS_MMAP_GUARD: u64 = 95;
 pub const SYS_GETRANDOM: u64 = 96;
 pub const SYS_SIGSUSPEND: u64 = 97;
 pub const SYS_SIGALTSTACK: u64 = 98;
+pub const SYS_PROXY_REGISTER: u64 = 99;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -335,6 +336,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_GETRANDOM => sys_getrandom(a0, a1, a2),
         SYS_SIGSUSPEND => sys_sigsuspend(a0),
         SYS_SIGALTSTACK => sys_sigaltstack(a0, a1),
+        SYS_PROXY_REGISTER => sys_proxy_register(a0),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -502,6 +504,9 @@ fn sys_port_destroy(port_id: u64) -> u64 {
 }
 
 fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
+    if crate::ipc::port::port_node(port_id as u32) != 0 {
+        return sys_send_to_proxy(port_id as u32, tag, data, true);
+    }
     if !check_port_cap(port_id as u32, crate::cap::Rights::SEND) {
         return ECAP;
     }
@@ -531,6 +536,9 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
 }
 
 fn sys_send_nb(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
+    if crate::ipc::port::port_node(port_id as u32) != 0 {
+        return sys_send_to_proxy(port_id as u32, tag, data, false);
+    }
     if !check_port_cap(port_id as u32, crate::cap::Rights::SEND) {
         return ECAP;
     }
@@ -550,6 +558,64 @@ fn sys_send_nb(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
         crate::ipc::port::SendDirectResult::Full => 1,
         crate::ipc::port::SendDirectResult::Error => 1,
     }
+}
+
+/// Proxy marker: low 32 bits of the tag for proxy-redirected messages.
+const PROXY_MARKER: u64 = 0xFFFF_0001;
+
+/// Redirect a non-local send to the registered proxy port.
+/// `blocking`: true for sys_send (block on full), false for sys_send_nb.
+fn sys_send_to_proxy(target_port: u32, tag: u64, data: [u64; 6], blocking: bool) -> u64 {
+    let proxy_local = crate::ipc::port::PROXY_PORT.load(core::sync::atomic::Ordering::Acquire);
+    if proxy_local == 0 {
+        return 1; // No proxy registered.
+    }
+    // Auto-grant SEND cap on proxy port for transparency.
+    let task_id = crate::sched::current_task_id();
+    if task_id != 0 && !crate::cap::has_port_cap_fast(task_id, proxy_local, crate::cap::Rights::SEND) {
+        let mut caps = crate::cap::CAP_SYSTEM.lock();
+        caps.grant_send_cap(task_id, proxy_local);
+    }
+    // Pack: tag encodes PROXY_MARKER + target, data carries original msg.
+    let proxy_tag = PROXY_MARKER | ((target_port as u64) << 32);
+    let mut proxy_msg = crate::ipc::Message::new(proxy_tag, [tag, data[0], data[1], data[2], data[3], 0]);
+
+    match crate::ipc::port::send_direct(proxy_local, &mut proxy_msg) {
+        crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
+            let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
+            auto_grant_reply_caps(receiver_task, &proxy_msg);
+            inject_recv_into_frame(receiver_tid, &proxy_msg);
+            crate::sched::boost_priority(receiver_tid, proxy_msg.data[5] as u8);
+            if blocking {
+                crate::sched::scheduler::handoff_to(receiver_tid);
+            } else {
+                crate::sched::scheduler::wake_parked_thread(receiver_tid);
+            }
+            0
+        }
+        crate::ipc::port::SendDirectResult::Queued => 0,
+        crate::ipc::port::SendDirectResult::Full => {
+            if blocking {
+                match crate::ipc::port::send(proxy_local, proxy_msg) {
+                    Ok(()) => 0,
+                    Err(()) => 1,
+                }
+            } else {
+                1
+            }
+        }
+        crate::ipc::port::SendDirectResult::Error => 1,
+    }
+}
+
+/// Register the calling task's port as the network proxy endpoint.
+fn sys_proxy_register(port_id: u64) -> u64 {
+    let pid = port_id as u32;
+    if !check_port_cap(pid, crate::cap::Rights::RECV) {
+        return ECAP;
+    }
+    crate::ipc::port::PROXY_PORT.store(pid, core::sync::atomic::Ordering::Release);
+    0
 }
 
 fn sys_recv(port_id: u64, frame: &mut ExceptionFrame) -> u64 {

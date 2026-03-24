@@ -54,6 +54,13 @@ const SYS_TIMER_CREATE: u64 = 94;
 const SYS_MMAP_GUARD: u64 = 95;
 #[allow(dead_code)]
 const SYS_GETRANDOM: u64 = 96;
+#[allow(dead_code)]
+const SYS_PROXY_REGISTER: u64 = 99;
+
+/// Register a port as the network proxy endpoint for non-local sends.
+pub fn proxy_register(port: u32) -> u64 {
+    unsafe { arch::syscall1(SYS_PROXY_REGISTER, port as u64) }
+}
 
 /// Print a single character to the debug console.
 pub fn debug_putchar(ch: u8) {

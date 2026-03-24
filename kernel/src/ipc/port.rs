@@ -304,6 +304,10 @@ impl PortTable {
 
 static PORT_TABLE: SpinLock<PortTable> = SpinLock::new(PortTable::new());
 
+/// Registered proxy port for network-transparent IPC. Non-local sends are
+/// redirected to this port. 0 = no proxy registered.
+pub static PROXY_PORT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Create a new port. Returns its ID (node=0, local=index).
 pub fn create() -> Option<PortId> {
     let creator = crate::sched::current_task_id();

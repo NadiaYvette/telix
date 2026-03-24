@@ -7081,7 +7081,81 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    syscall::debug_puts(b"\n=== ALL 104 PHASES COMPLETE ===\n\n");
+    // --- Phase 105: network-transparent port proxy ---
+    syscall::debug_puts(b"  init: testing port proxy...\n");
+    {
+        let mut phase105_ok = true;
+
+        // Spawn proxy_srv.
+        let proxy_tid = syscall::spawn(b"proxy_srv", 50);
+        if proxy_tid == u64::MAX {
+            syscall::debug_puts(b"  FAIL: cannot spawn proxy_srv\n");
+            phase105_ok = false;
+        }
+
+        if phase105_ok {
+            // Wait for proxy_srv to register with name server.
+            let mut proxy_port = 0u32;
+            for _ in 0..200 {
+                if let Some(p) = syscall::ns_lookup(b"proxy") {
+                    proxy_port = p;
+                    break;
+                }
+                syscall::yield_now();
+            }
+            if proxy_port == 0 {
+                syscall::debug_puts(b"  FAIL: proxy_srv not found in name server\n");
+                phase105_ok = false;
+            }
+
+            if phase105_ok {
+                // Create a test port and a reply port.
+                let test_port = syscall::port_create() as u32;
+                let reply_port = syscall::port_create() as u32;
+
+                // Tell proxy_srv to add node 1 = 127.0.0.1:9100
+                // (Even though loopback won't connect, we test the kernel redirect.)
+                let ip_loopback: u64 = (127 << 24) | 1; // 127.0.0.1 in big-endian-ish
+                let d2 = (9100u64) | ((reply_port as u64) << 32);
+                syscall::send(proxy_port, 0x5000, 1, ip_loopback, d2, 0);
+
+                // Wait for add_node reply.
+                for _ in 0..100 {
+                    if let Some(reply) = syscall::recv_nb_msg(reply_port) {
+                        if reply.tag == 0x5001 {
+                            break;
+                        }
+                    }
+                    syscall::yield_now();
+                }
+
+                // Test: send a message to make_port_id(1, test_port).
+                // The kernel should redirect this to proxy_srv via PROXY_PORT.
+                // proxy_srv will try to forward via TCP (which may fail for loopback),
+                // but the test verifies the kernel redirect path works.
+                let remote_port = ((1u32) << 16) | (test_port & 0xFFFF);
+                let send_result = syscall::send_nb_4(remote_port, 0x1234, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD);
+
+                // A successful send means the kernel redirected to proxy_srv
+                // (return 0 = message delivered to proxy port queue or direct-transferred).
+                if send_result != 0 {
+                    syscall::debug_puts(b"  FAIL: send to remote port returned error\n");
+                    phase105_ok = false;
+                }
+
+                syscall::port_destroy(test_port);
+                syscall::port_destroy(reply_port);
+            }
+        }
+
+        if phase105_ok {
+            syscall::debug_puts(b"Phase 105 port proxy: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 105 port proxy: FAILED\n");
+        }
+    }
+
+    syscall::debug_puts(b"\n=== ALL 105 PHASES COMPLETE ===\n\n");
 
     // ============================================================
     // --- Test 23: Benchmark Suite ---
