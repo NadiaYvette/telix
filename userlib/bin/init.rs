@@ -7118,6 +7118,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // Spawn sshd (SSH server on port 22).
+    syscall::debug_puts(b"  init: spawning sshd...\n");
+    let sshd_tid = syscall::spawn(b"sshd", 50);
+    if sshd_tid != u64::MAX {
+        syscall::debug_puts(b"  init: sshd started (tid=");
+        print_num(sshd_tid);
+        syscall::debug_puts(b")\n");
+    } else {
+        syscall::debug_puts(b"  init: WARN: failed to spawn sshd\n");
+    }
+
     // Init loops forever, yielding.
     loop {
         syscall::yield_now();

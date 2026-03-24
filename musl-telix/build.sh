@@ -58,7 +58,10 @@ for src in ipc fd write read exit init socket pipe poll \
            string malloc printf file process signal dup env \
            syslog locale time_util mman pthread netdb epoll timer sysvipc \
            errno ctype strconv stdio_file assert \
-           dirent getopt select termios random pwgrp regex; do
+           dirent getopt select termios random pwgrp regex \
+           crypto_sha256 crypto_sha512 crypto_chacha20 \
+           crypto_curve25519 crypto_ed25519 crypto_csprng \
+           byteorder ssh_transport ssh_session; do
     $CC $CFLAGS -c "$MUSL/src/$src.c" -o "$OUTDIR/$src.o"
 done
 
@@ -75,7 +78,10 @@ COMMON_OBJS="$OUTDIR/crt_start.o $OUTDIR/syscall.o \
     $OUTDIR/errno.o $OUTDIR/ctype.o $OUTDIR/strconv.o \
     $OUTDIR/stdio_file.o $OUTDIR/assert.o \
     $OUTDIR/dirent.o $OUTDIR/getopt.o $OUTDIR/select.o \
-    $OUTDIR/termios.o $OUTDIR/random.o $OUTDIR/pwgrp.o $OUTDIR/regex.o"
+    $OUTDIR/termios.o $OUTDIR/random.o $OUTDIR/pwgrp.o $OUTDIR/regex.o \
+    $OUTDIR/crypto_sha256.o $OUTDIR/crypto_sha512.o $OUTDIR/crypto_chacha20.o \
+    $OUTDIR/crypto_curve25519.o $OUTDIR/crypto_ed25519.o $OUTDIR/crypto_csprng.o \
+    $OUTDIR/byteorder.o $OUTDIR/ssh_transport.o $OUTDIR/ssh_session.o"
 
 # Add setjmp.o if it exists for this arch.
 if [ -f "$OUTDIR/setjmp.o" ]; then
@@ -178,5 +184,11 @@ $CC $CFLAGS -c "$MUSL/test/stress_test.c" -o "$OUTDIR/stress_test.o"
 link_binary "$OUTDIR/stress_test" $COMMON_OBJS "$OUTDIR/stress_test.o"
 SIZE=$(wc -c < "$OUTDIR/stress_test")
 echo "  stress_test: $SIZE bytes"
+
+# Build sshd (SSH server).
+$CC $CFLAGS -c "$MUSL/test/sshd.c" -o "$OUTDIR/sshd.o"
+link_binary "$OUTDIR/sshd" $COMMON_OBJS "$OUTDIR/sshd.o"
+SIZE=$(wc -c < "$OUTDIR/sshd")
+echo "  sshd: $SIZE bytes"
 
 echo "Done."

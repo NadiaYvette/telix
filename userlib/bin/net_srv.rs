@@ -30,10 +30,19 @@ const NET_TCP_CLOSED: u64 = 0x44FF;
 const NET_TCP_CLOSE: u64 = 0x4500;
 const NET_TCP_CLOSE_OK: u64 = 0x4501;
 
-// TCP listen protocol.
+// TCP listen/accept protocol.
+const NET_TCP_BIND: u64 = 0x4600;
+const NET_TCP_BIND_OK: u64 = 0x4601;
 const NET_TCP_LISTEN: u64 = 0x4700;
 const NET_TCP_LISTEN_OK: u64 = 0x4701;
 const NET_TCP_LISTEN_FAIL: u64 = 0x47FF;
+const NET_TCP_ACCEPT: u64 = 0x4710;
+const NET_TCP_ACCEPT_OK: u64 = 0x4711;
+const NET_TCP_ACCEPT_FAIL: u64 = 0x47FE;
+
+// Non-blocking recv.
+const NET_TCP_RECV_NB: u64 = 0x4410;
+const NET_TCP_RECV_NONE: u64 = 0x4412;
 
 // TCP flags.
 const TCP_FIN: u8 = 0x01;
@@ -51,8 +60,23 @@ const TCP_FIN_WAIT_2: u8 = 4;
 const TCP_TIME_WAIT: u8 = 5;
 const TCP_CLOSE_WAIT: u8 = 6;
 const TCP_LAST_ACK: u8 = 7;
+const TCP_SYN_RECEIVED: u8 = 8;
 
-const MAX_TCP_CONNS: usize = 4;
+const MAX_TCP_CONNS: usize = 8;
+const MAX_LISTEN_SLOTS: usize = 4;
+
+// Listen slot: tracks a port in LISTEN state with pending accept.
+struct ListenSlot {
+    active: bool,
+    port: u16,
+    accept_reply_port: u32,  // 0 = no pending accept
+}
+
+impl ListenSlot {
+    const fn new() -> Self {
+        Self { active: false, port: 0, accept_reply_port: 0 }
+    }
+}
 const TCP_RX_BUF_SIZE: usize = 2048;
 const TCP_TIMEOUT: u32 = 10000;
 const TCP_TIME_WAIT_TIMEOUT: u32 = 5000;
@@ -398,6 +422,8 @@ struct NetDev {
     tcp: [TcpConn; MAX_TCP_CONNS],
     next_ephemeral_port: u16,
     tcp_isn: u32,
+    // TCP listen state.
+    listen: [ListenSlot; MAX_LISTEN_SLOTS],
 }
 
 impl NetDev {
@@ -421,6 +447,7 @@ impl NetDev {
             next_ephemeral_port: 49152,
             tcp_isn: (mac[0] as u32) << 24 | (mac[1] as u32) << 16
                    | (mac[2] as u32) << 8 | (mac[3] as u32),
+            listen: [const { ListenSlot::new() }; MAX_LISTEN_SLOTS],
         }
     }
 
@@ -1045,7 +1072,13 @@ impl NetDev {
         });
         let idx = match idx {
             Some(i) => i,
-            None => return, // No matching connection, drop.
+            None => {
+                // Check if this is a SYN for a listen port.
+                if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
+                    self.handle_incoming_syn(src_ip, src_port, dst_port, seq);
+                }
+                return;
+            }
         };
 
         if flags & TCP_RST != 0 {
@@ -1076,6 +1109,23 @@ impl NetDev {
                     syscall::debug_puts(b"  [net_srv] TCP ESTABLISHED slot=");
                     print_num(idx as u64);
                     syscall::debug_puts(b"\n");
+                }
+            }
+            TCP_SYN_RECEIVED => {
+                // Expect ACK completing 3-way handshake.
+                if flags & TCP_ACK != 0 {
+                    self.tcp[idx].snd_una = ack;
+                    self.tcp[idx].state = TCP_ESTABLISHED;
+                    self.tcp[idx].timeout = 0;
+                    syscall::debug_puts(b"  [net_srv] TCP accept ESTABLISHED slot=");
+                    print_num(idx as u64);
+                    syscall::debug_puts(b"\n");
+                    // Notify pending accept.
+                    let reply_port = self.tcp[idx].reply_port;
+                    if reply_port != 0 {
+                        self.tcp[idx].reply_port = 0;
+                        syscall::send_nb(reply_port, NET_TCP_ACCEPT_OK, idx as u64, 0);
+                    }
                 }
             }
             TCP_ESTABLISHED => {
@@ -1212,6 +1262,127 @@ impl NetDev {
         }
     }
 
+    fn handle_incoming_syn(&mut self, src_ip: [u8; 4], src_port: u16, dst_port: u16, seq: u32) {
+        // Check if we have a listen slot for this port.
+        let listen_idx = self.listen.iter().position(|l| l.active && l.port == dst_port);
+        if listen_idx.is_none() { return; }
+        let listen_idx = listen_idx.unwrap();
+
+        // Find free TCP conn slot.
+        let slot = self.tcp.iter().position(|c| c.state == TCP_CLOSED);
+        let slot = match slot {
+            Some(s) => s,
+            None => return, // No free slots.
+        };
+
+        let isn = self.tcp_isn;
+        self.tcp_isn = self.tcp_isn.wrapping_add(64000);
+
+        self.tcp[slot] = TcpConn {
+            state: TCP_SYN_RECEIVED,
+            local_port: dst_port,
+            remote_ip: src_ip,
+            remote_port: src_port,
+            snd_nxt: isn.wrapping_add(1), // SYN consumes 1 seq
+            snd_una: isn,
+            rcv_nxt: seq.wrapping_add(1),
+            reply_port: 0,
+            recv_reply_port: 0,
+            rx_buf: [0; TCP_RX_BUF_SIZE],
+            rx_head: 0,
+            rx_tail: 0,
+            timeout: 0,
+        };
+
+        // Send SYN-ACK.
+        if let Some(mac) = self.arp_lookup(src_ip) {
+            self.build_tcp_packet(
+                src_ip, mac, dst_port, src_port, isn, seq.wrapping_add(1),
+                TCP_SYN | TCP_ACK, &[],
+            );
+        } else {
+            // Need ARP first.
+            self.send_arp_request(src_ip);
+        }
+
+        syscall::debug_puts(b"  [net_srv] SYN-ACK sent slot=");
+        print_num(slot as u64);
+        syscall::debug_puts(b"\n");
+
+        // If there's a pending accept, wire it up.
+        let accept_rp = self.listen[listen_idx].accept_reply_port;
+        if accept_rp != 0 {
+            self.listen[listen_idx].accept_reply_port = 0;
+            self.tcp[slot].reply_port = accept_rp;
+            // The accept reply will be sent when SYN_RECEIVED -> ESTABLISHED.
+        }
+    }
+
+    fn handle_tcp_bind(&mut self, port: u16, reply_port: u32) {
+        // Just acknowledge. Actual listen state created in handle_tcp_listen.
+        syscall::send_nb(reply_port, NET_TCP_BIND_OK, port as u64, 0);
+    }
+
+    fn handle_tcp_listen_req(&mut self, port: u16, _backlog: u32, reply_port: u32) {
+        // Find free listen slot.
+        let slot = self.listen.iter().position(|l| !l.active);
+        match slot {
+            Some(s) => {
+                self.listen[s] = ListenSlot {
+                    active: true,
+                    port,
+                    accept_reply_port: 0,
+                };
+                syscall::debug_puts(b"  [net_srv] TCP LISTEN port=");
+                print_num(port as u64);
+                syscall::debug_puts(b"\n");
+                syscall::send_nb(reply_port, NET_TCP_LISTEN_OK, port as u64, 0);
+            }
+            None => {
+                syscall::send_nb(reply_port, NET_TCP_LISTEN_FAIL, 0, 0);
+            }
+        }
+    }
+
+    fn handle_tcp_accept(&mut self, port: u16, reply_port: u32) {
+        // Check if there's already an ESTABLISHED connection from a listen on this port.
+        // (SYN_RECEIVED that completed before accept was called.)
+        for i in 0..MAX_TCP_CONNS {
+            if self.tcp[i].state == TCP_ESTABLISHED
+                && self.tcp[i].local_port == port
+                && self.tcp[i].reply_port == 0
+            {
+                // This is a connection that completed via listen but hasn't been accepted yet.
+                // Actually we can't distinguish this reliably. Let's check for SYN_RECEIVED too.
+            }
+        }
+
+        // Check for already-established connections waiting to be accepted.
+        for i in 0..MAX_TCP_CONNS {
+            if (self.tcp[i].state == TCP_ESTABLISHED || self.tcp[i].state == TCP_SYN_RECEIVED)
+                && self.tcp[i].local_port == port
+            {
+                if self.tcp[i].state == TCP_ESTABLISHED {
+                    // Already established, return immediately.
+                    syscall::send_nb(reply_port, NET_TCP_ACCEPT_OK, i as u64, 0);
+                    return;
+                }
+                // SYN_RECEIVED — store reply port, will notify when handshake completes.
+                self.tcp[i].reply_port = reply_port;
+                return;
+            }
+        }
+
+        // No pending connections. Store accept reply port in listen slot for later.
+        for l in self.listen.iter_mut() {
+            if l.active && l.port == port {
+                l.accept_reply_port = reply_port;
+                return;
+            }
+        }
+        syscall::send_nb(reply_port, NET_TCP_ACCEPT_FAIL, 0, 0);
+    }
+
     fn tick_tcp(&mut self) {
         for i in 0..MAX_TCP_CONNS {
             match self.tcp[i].state {
@@ -1221,6 +1392,12 @@ impl NetDev {
                         let reply_port = self.tcp[i].reply_port;
                         self.tcp[i].state = TCP_CLOSED;
                         syscall::send_nb(reply_port, NET_TCP_FAIL, 3, 0);
+                    }
+                }
+                TCP_SYN_RECEIVED => {
+                    self.tcp[i].timeout += 1;
+                    if self.tcp[i].timeout >= TCP_TIMEOUT {
+                        self.tcp[i].state = TCP_CLOSED;
                     }
                 }
                 TCP_FIN_WAIT_1 | TCP_FIN_WAIT_2 | TCP_LAST_ACK => {
@@ -1336,12 +1513,34 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     let reply_port = msg.data[1] as u32;
                     dev.handle_tcp_close(conn_id, reply_port);
                 }
+                NET_TCP_BIND => {
+                    let port_num = msg.data[0] as u16;
+                    let reply_port = (msg.data[1] >> 32) as u32;
+                    dev.handle_tcp_bind(port_num, reply_port);
+                }
                 NET_TCP_LISTEN => {
-                    // data[0] = port, data[1] = backlog, data[2] = reply_port << 32
-                    let port = msg.data[0] as u16;
-                    let _backlog = msg.data[1] as u32;
+                    let port_num = msg.data[0] as u16;
+                    let backlog = msg.data[1] as u32;
                     let reply_port = (msg.data[2] >> 32) as u32;
-                    syscall::send_nb(reply_port, NET_TCP_LISTEN_OK, port as u64, 0);
+                    dev.handle_tcp_listen_req(port_num, backlog, reply_port);
+                }
+                NET_TCP_ACCEPT => {
+                    let port_num = msg.data[0] as u16;
+                    let reply_port = (msg.data[1] >> 32) as u32;
+                    dev.handle_tcp_accept(port_num, reply_port);
+                }
+                NET_TCP_RECV_NB => {
+                    let conn_id = msg.data[0] as usize;
+                    let reply_port = (msg.data[1] >> 16) as u32;
+                    if conn_id >= MAX_TCP_CONNS || dev.tcp[conn_id].state == TCP_CLOSED {
+                        syscall::send_nb(reply_port, NET_TCP_FAIL, 0, 0);
+                    } else if dev.tcp[conn_id].rx_len() > 0 {
+                        dev.deliver_tcp_data(conn_id, reply_port);
+                    } else if dev.tcp[conn_id].state != TCP_ESTABLISHED {
+                        syscall::send_nb(reply_port, NET_TCP_CLOSED, conn_id as u64, 0);
+                    } else {
+                        syscall::send_nb(reply_port, NET_TCP_RECV_NONE, 0, 0);
+                    }
                 }
                 _ => {}
             }

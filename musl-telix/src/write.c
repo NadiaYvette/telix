@@ -104,6 +104,36 @@ static ssize_t write_file(struct telix_fd_entry *fde,
     return -1;
 }
 
+/* PTY write: d0=handle, d1=bytes[0..7], d2=len|(reply_port<<32), d3=bytes[8..15].
+ * Max 16 bytes per message. */
+static ssize_t write_pty(struct telix_fd_entry *fde,
+                          const unsigned char *p, size_t count) {
+    size_t remaining = count;
+    size_t written = 0;
+
+    while (remaining > 0) {
+        int chunk = (remaining > 16) ? 16 : (int)remaining;
+        uint64_t d1 = pack_bytes(p, chunk > 8 ? 8 : chunk);
+        uint64_t d3 = 0;
+        if (chunk > 8) d3 = pack_bytes(p + 8, chunk - 8);
+
+        uint32_t rp = telix_port_create();
+        uint64_t d2 = (uint64_t)(uint32_t)chunk | ((uint64_t)rp << 32);
+        telix_send(fde->server_port, 0x9010 /* PTY_WRITE */,
+                   (uint64_t)fde->server_handle, d1, d2, d3);
+
+        struct telix_msg msg;
+        int ok = (telix_recv_msg(rp, &msg) >= 0 && msg.tag == 0x9011);
+        telix_port_destroy(rp);
+        if (!ok) break;
+
+        p += chunk;
+        remaining -= chunk;
+        written += chunk;
+    }
+    return (ssize_t)written;
+}
+
 ssize_t write(int fd, const void *buf, size_t count) {
     struct telix_fd_entry *fde = telix_fd_get(fd);
     if (!fde) return -1;
@@ -116,6 +146,9 @@ ssize_t write(int fd, const void *buf, size_t count) {
 
     if (fde->fd_type == FD_TYPE_FILE)
         return write_file(fde, (const unsigned char *)buf, count);
+
+    if (fde->fd_type == FD_TYPE_PTY)
+        return write_pty(fde, (const unsigned char *)buf, count);
 
     /* Default: console write. */
     return write_console(fde, (const unsigned char *)buf, count);

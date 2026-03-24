@@ -129,6 +129,42 @@ static ssize_t read_file(struct telix_fd_entry *fde,
     return (ssize_t)total_read;
 }
 
+/* PTY read: send PTY_READ(0x9020) to pty_srv.
+ * PTY_READ: d0=handle, d2=reply_port<<32
+ * PTY_READ_OK: d0=bytes[0..7], d1=bytes[8..15], d2=count */
+static ssize_t read_pty(struct telix_fd_entry *fde,
+                         unsigned char *p, size_t count) {
+    uint32_t reply_port = telix_port_create();
+    uint64_t d2 = (uint64_t)reply_port << 32;
+    telix_send(fde->server_port, 0x9020 /* PTY_READ */,
+               (uint64_t)fde->server_handle, 0, d2, 0);
+
+    struct telix_msg msg;
+    if (telix_recv_msg(reply_port, &msg) != 0) {
+        telix_port_destroy(reply_port);
+        return -1;
+    }
+    telix_port_destroy(reply_port);
+
+    if (msg.tag == 0x90FF /* PTY_EOF */)
+        return 0;
+    if (msg.tag != 0x9021 /* PTY_READ_OK */)
+        return -1;
+
+    int n = (int)(msg.data[2] & 0xFFFF);
+    if (n > 16) n = 16;
+    int copy = n;
+    if ((size_t)copy > count) copy = (int)count;
+
+    for (int i = 0; i < copy; i++) {
+        int wi = i / 8;
+        int bi = i % 8;
+        uint64_t word = (wi == 0) ? msg.data[0] : msg.data[1];
+        p[i] = (unsigned char)(word >> (bi * 8));
+    }
+    return (ssize_t)copy;
+}
+
 ssize_t read(int fd, void *buf, size_t count) {
     struct telix_fd_entry *fde = telix_fd_get(fd);
     if (!fde) return -1;
@@ -144,6 +180,9 @@ ssize_t read(int fd, void *buf, size_t count) {
 
     if (fde->fd_type == FD_TYPE_FILE)
         return read_file(fde, (unsigned char *)buf, count);
+
+    if (fde->fd_type == FD_TYPE_PTY)
+        return read_pty(fde, (unsigned char *)buf, count);
 
     return -1;
 }

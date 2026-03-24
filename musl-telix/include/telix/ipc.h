@@ -42,9 +42,19 @@ struct telix_msg {
 #define NET_TCP_SEND_OK    0x4301
 #define NET_TCP_RECV       0x4400
 #define NET_TCP_DATA       0x4401
+#define NET_TCP_RECV_NB    0x4410
+#define NET_TCP_RECV_NONE  0x4412
 #define NET_TCP_CLOSED     0x44FF
 #define NET_TCP_CLOSE      0x4500
 #define NET_TCP_CLOSE_OK   0x4501
+#define NET_TCP_BIND       0x4600
+#define NET_TCP_BIND_OK    0x4601
+#define NET_TCP_LISTEN     0x4700
+#define NET_TCP_LISTEN_OK  0x4701
+#define NET_TCP_LISTEN_FAIL 0x47FF
+#define NET_TCP_ACCEPT     0x4710
+#define NET_TCP_ACCEPT_OK  0x4711
+#define NET_TCP_ACCEPT_FAIL 0x47FE
 
 /* Pipe protocol tags (Phase 59). */
 #define PIPE_CREATE_TAG  0x5010
