@@ -278,7 +278,7 @@ fn try_superpage_promotion(
         }
     }
 
-    // Check: all allocation pages in the group must be allocated and refcount == 1.
+    // Check: all allocation pages in the group must be allocated and not COW-shared.
     let obj_page_base = vma.obj_page_index(group_mmu_start);
     let can_promote = object::with_object(obj_id, |obj| {
         for p in 0..SUPER_ALLOC_PAGES {
@@ -289,13 +289,17 @@ fn try_superpage_promotion(
             if obj.phys_pages[idx] == 0 {
                 return false;
             }
-            let pa = super::page::PhysAddr::new(obj.phys_pages[idx]);
-            if super::frame::get_ref(pa) != 1 {
-                return false; // Shared (COW) — can't promote.
-            }
         }
         true
     });
+    // Also verify none of these pages are COW-shared.
+    if can_promote {
+        for p in 0..SUPER_ALLOC_PAGES {
+            if object::is_page_shared(obj_id, obj_page_base + p) {
+                return;
+            }
+        }
+    }
     if !can_promote {
         return;
     }
@@ -346,13 +350,11 @@ fn try_superpage_promotion(
         }
     });
 
-    // Free old pages (dec refcount, free if 0).
+    // Free old pages (exclusively owned — verified by can_promote check above).
     object::with_object(obj_id, |obj| {
         for p in 0..SUPER_ALLOC_PAGES {
             let old_pa = super::page::PhysAddr::new(obj.phys_pages[obj_page_base + p]);
-            if super::frame::dec_ref(old_pa) == 0 {
-                super::phys::free_page(old_pa);
-            }
+            super::phys::free_page(old_pa);
         }
     });
 
@@ -361,7 +363,6 @@ fn try_superpage_promotion(
         for p in 0..SUPER_ALLOC_PAGES {
             let new_pa = new_block.as_usize() + p * PAGE_SIZE;
             obj.phys_pages[obj_page_base + p] = new_pa;
-            super::frame::set_ref(super::page::PhysAddr::new(new_pa), 1);
         }
     });
 
@@ -532,9 +533,9 @@ fn handle_cow_fault(
         None => return FaultResult::Failed,
     };
 
-    let refcount = super::frame::get_ref(old_pa);
+    let shared = object::is_page_shared(obj_id, obj_page_idx);
 
-    if refcount <= 1 {
+    if !shared {
         // Exclusively owned — just upgrade PTE to writable.
         let mmu_pa = old_pa.as_usize() + vma.mmu_offset_in_page(mmu_idx) * MMUPAGE_SIZE;
         let va_aligned = fault_addr & !(MMUPAGE_SIZE - 1);
@@ -549,7 +550,6 @@ fn handle_cow_fault(
         Some(pa) => pa,
         None => return FaultResult::Failed, // OOM
     };
-    super::frame::set_ref(new_pa, 1);
 
     // Copy the entire allocation page.
     unsafe {
@@ -560,12 +560,8 @@ fn handle_cow_fault(
         );
     }
 
-    // Decrement old page's refcount.
-    if super::frame::dec_ref(old_pa) == 0 {
-        super::phys::free_page(old_pa);
-    }
-
-    // Update the object to point to the new page.
+    // Update the object to point to the new (private) page.
+    // The old PA remains referenced by the sibling object(s).
     object::with_object(obj_id, |obj| {
         obj.phys_pages[obj_page_idx] = new_pa.as_usize();
     });

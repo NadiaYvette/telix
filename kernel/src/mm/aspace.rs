@@ -930,16 +930,10 @@ pub fn mremap(id: ASpaceId, old_addr: usize, old_len: usize, new_len: usize) -> 
                 let obj_id = vma.object_id;
 
                 if new_page_count < old_page_count {
+                    for p in new_page_count..old_page_count {
+                        super::object::release_page(obj_id, p);
+                    }
                     super::object::with_object(obj_id, |obj| {
-                        for p in new_page_count..old_page_count {
-                            if obj.phys_pages[p] != 0 {
-                                let pa = super::page::PhysAddr::new(obj.phys_pages[p]);
-                                if super::frame::dec_ref(pa) == 0 {
-                                    super::phys::free_page(pa);
-                                }
-                                obj.phys_pages[p] = 0;
-                            }
-                        }
                         obj.page_count = new_page_count as u16;
                     });
                 }

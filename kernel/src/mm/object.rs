@@ -47,6 +47,9 @@ pub struct MemObject {
     pub obj_type: ObjectType,
     /// Total size in allocation pages.
     pub page_count: u16,
+    /// COW sharing group ID. Objects forked from a common ancestor share
+    /// the same group ID. 0 means this object has never been COW-cloned.
+    pub cow_group: u16,
     /// Physical pages backing this object (indexed by page offset within object).
     /// 0 = not yet allocated.
     pub phys_pages: [usize; 256],
@@ -63,6 +66,7 @@ impl MemObject {
         Self {
             obj_type: ObjectType::Free,
             page_count: 0,
+            cow_group: 0,
             phys_pages: [0; 256],
             mappings: [Mapping::empty(); MAX_MAPPINGS],
             file_handle: 0,
@@ -87,7 +91,6 @@ impl MemObject {
             (phys::alloc_page()?, false)
         };
         self.phys_pages[page_idx] = pa.as_usize();
-        super::frame::set_ref(pa, 1);
         Some((pa, pre_zeroed))
     }
 
@@ -102,17 +105,11 @@ impl MemObject {
         Some(PhysAddr::new(self.phys_pages[page_idx]))
     }
 
-    /// Free all physical pages owned by this object.
-    /// Decrements reference counts; only frees the physical page when refcount hits 0.
-    pub fn free_pages(&mut self) {
+    /// Clear all page pointers without freeing. Used internally by destroy()
+    /// which handles the sharing-group check itself.
+    pub fn clear_pages(&mut self) {
         for i in 0..self.page_count as usize {
-            if self.phys_pages[i] != 0 {
-                let pa = PhysAddr::new(self.phys_pages[i]);
-                if super::frame::dec_ref(pa) == 0 {
-                    phys::free_page(pa);
-                }
-                self.phys_pages[i] = 0;
-            }
+            self.phys_pages[i] = 0;
         }
     }
 
@@ -197,9 +194,13 @@ pub fn create_anon(page_count: u16) -> Option<ObjectId> {
     None
 }
 
+/// Next COW group ID counter.
+static NEXT_COW_GROUP: crate::sync::SpinLock<u16> = crate::sync::SpinLock::new(1);
+
 /// Clone a memory object for COW. Creates a new object that shares all
-/// physical pages with the original (incrementing their refcounts).
-/// Returns the new object ID.
+/// physical pages with the original. Both objects are placed in the same
+/// COW sharing group so that page ownership can be determined by scanning
+/// siblings rather than maintaining per-PFN refcounts.
 pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
     let mut table = OBJECTS.lock();
     let page_count = table.objects[src_id as usize].page_count;
@@ -214,15 +215,21 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
     }
     let dst_idx = dst_slot?;
 
-    // Copy physical page pointers and increment refcounts.
+    // Assign a COW group if the source doesn't have one yet.
+    if table.objects[src_id as usize].cow_group == 0 {
+        let mut g = NEXT_COW_GROUP.lock();
+        table.objects[src_id as usize].cow_group = *g;
+        *g = g.wrapping_add(1);
+        if *g == 0 { *g = 1; } // skip 0
+    }
+    let group = table.objects[src_id as usize].cow_group;
+
+    // Copy physical page pointers (no per-PFN refcount needed).
     table.objects[dst_idx].obj_type = ObjectType::Anonymous;
     table.objects[dst_idx].page_count = page_count;
+    table.objects[dst_idx].cow_group = group;
     for i in 0..page_count as usize {
-        let pa = table.objects[src_id as usize].phys_pages[i];
-        table.objects[dst_idx].phys_pages[i] = pa;
-        if pa != 0 {
-            super::frame::inc_ref(super::page::PhysAddr::new(pa));
-        }
+        table.objects[dst_idx].phys_pages[i] = table.objects[src_id as usize].phys_pages[i];
     }
     // Clear mappings on the new object (caller will add its own).
     for m in &mut table.objects[dst_idx].mappings {
@@ -232,13 +239,32 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
     Some(dst_idx as ObjectId)
 }
 
-/// Destroy a memory object, freeing all its physical pages.
+/// Destroy a memory object, freeing physical pages not shared with siblings.
 pub fn destroy(id: ObjectId) {
     let mut table = OBJECTS.lock();
-    let obj = &mut table.objects[id as usize];
-    obj.free_pages();
-    obj.obj_type = ObjectType::Free;
-    obj.page_count = 0;
+    let group = table.objects[id as usize].cow_group;
+    let page_count = table.objects[id as usize].page_count as usize;
+
+    // Free each page, checking siblings in the same COW group.
+    for p in 0..page_count {
+        let pa = table.objects[id as usize].phys_pages[p];
+        if pa != 0 {
+            let shared = group != 0 && table.objects.iter().enumerate().any(|(i, obj)| {
+                i != id as usize
+                    && obj.obj_type != ObjectType::Free
+                    && obj.cow_group == group
+                    && obj.phys_pages[..obj.page_count as usize].contains(&pa)
+            });
+            if !shared {
+                phys::free_page(PhysAddr::new(pa));
+            }
+            table.objects[id as usize].phys_pages[p] = 0;
+        }
+    }
+
+    table.objects[id as usize].obj_type = ObjectType::Free;
+    table.objects[id as usize].page_count = 0;
+    table.objects[id as usize].cow_group = 0;
 }
 
 /// Access an object by ID within a closure (while holding the lock).
@@ -248,4 +274,53 @@ where
 {
     let mut table = OBJECTS.lock();
     f(&mut table.objects[id as usize])
+}
+
+/// Check whether a physical page at `page_idx` in object `obj_id` is shared
+/// with any sibling in the same COW group. Returns true if another live object
+/// in the group also references the same physical address.
+pub fn is_page_shared(obj_id: ObjectId, page_idx: usize) -> bool {
+    let table = OBJECTS.lock();
+    let obj = &table.objects[obj_id as usize];
+    let group = obj.cow_group;
+    if group == 0 {
+        return false;
+    }
+    let pa = obj.phys_pages[page_idx];
+    if pa == 0 {
+        return false;
+    }
+    table.objects.iter().enumerate().any(|(i, sib)| {
+        i != obj_id as usize
+            && sib.obj_type != ObjectType::Free
+            && sib.cow_group == group
+            && sib.phys_pages[..sib.page_count as usize].contains(&pa)
+    })
+}
+
+/// Release a physical page from object `obj_id` at `page_idx`.
+/// If no sibling in the COW group references the same PA, frees the page.
+/// Returns true if the physical page was freed, false if still shared.
+/// Clears the object's phys_pages entry in either case.
+pub fn release_page(obj_id: ObjectId, page_idx: usize) -> bool {
+    let mut table = OBJECTS.lock();
+    let group = table.objects[obj_id as usize].cow_group;
+    let pa = table.objects[obj_id as usize].phys_pages[page_idx];
+    if pa == 0 {
+        return false;
+    }
+    table.objects[obj_id as usize].phys_pages[page_idx] = 0;
+
+    let shared = group != 0 && table.objects.iter().enumerate().any(|(i, sib)| {
+        i != obj_id as usize
+            && sib.obj_type != ObjectType::Free
+            && sib.cow_group == group
+            && sib.phys_pages[..sib.page_count as usize].contains(&pa)
+    });
+    if !shared {
+        super::phys::free_page(PhysAddr::new(pa));
+        true
+    } else {
+        false
+    }
 }

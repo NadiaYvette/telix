@@ -88,14 +88,7 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
                     if all_unmapped {
                         let obj_page_idx = vma.obj_page_index(mmu_idx);
                         let obj_id = vma.object_id;
-                        object::with_object(obj_id, |obj| {
-                            if let Some(pa) = obj.get_page(obj_page_idx) {
-                                if super::frame::dec_ref(pa) == 0 {
-                                    super::phys::free_page(pa);
-                                }
-                                obj.phys_pages[obj_page_idx] = 0;
-                            }
-                        });
+                        object::release_page(obj_id, obj_page_idx);
                         for i in ap_start..ap_end {
                             vma.clear_zeroed(i);
                         }
