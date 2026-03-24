@@ -2,10 +2,11 @@
 //!
 //! Each memory object represents a logically contiguous region of memory
 //! (e.g., an anonymous demand-zero region or a cached file region).
-//! Objects track their physical backing (via the extent tree) and the
+//! Objects track their physical backing (via PageVec) and the
 //! set of address spaces that map them.
 
 use super::page::PhysAddr;
+use super::pagevec::PageVec;
 use super::phys;
 use crate::sync::SpinLock;
 
@@ -51,8 +52,9 @@ pub struct MemObject {
     /// the same group ID. 0 means this object has never been COW-cloned.
     pub cow_group: u16,
     /// Physical pages backing this object (indexed by page offset within object).
-    /// 0 = not yet allocated.
-    pub phys_pages: [usize; 256],
+    /// 0 = not yet allocated. Uses tiered storage: inline for <=4 pages,
+    /// slab-allocated for larger objects.
+    pub pages: PageVec,
     /// Mappings from address spaces.
     pub mappings: [Mapping; MAX_MAPPINGS],
     /// For Pager objects: file handle passed to the pager thread.
@@ -67,7 +69,7 @@ impl MemObject {
             obj_type: ObjectType::Free,
             page_count: 0,
             cow_group: 0,
-            phys_pages: [0; 256],
+            pages: PageVec::empty(),
             mappings: [Mapping::empty(); MAX_MAPPINGS],
             file_handle: 0,
             file_base_offset: 0,
@@ -81,8 +83,9 @@ impl MemObject {
         if page_idx >= self.page_count as usize {
             return None;
         }
-        if self.phys_pages[page_idx] != 0 {
-            return Some((PhysAddr::new(self.phys_pages[page_idx]), false));
+        let existing = self.pages.get(page_idx);
+        if existing != 0 {
+            return Some((PhysAddr::new(existing), false));
         }
         // Try pre-zeroed pool first, then dirty allocator.
         let (pa, pre_zeroed) = if let Some(pa) = super::zeropool::alloc_zeroed_page() {
@@ -90,7 +93,7 @@ impl MemObject {
         } else {
             (phys::alloc_page()?, false)
         };
-        self.phys_pages[page_idx] = pa.as_usize();
+        self.pages.set(page_idx, pa.as_usize());
         Some((pa, pre_zeroed))
     }
 
@@ -99,18 +102,16 @@ impl MemObject {
         if page_idx >= self.page_count as usize {
             return None;
         }
-        if self.phys_pages[page_idx] == 0 {
+        let pa = self.pages.get(page_idx);
+        if pa == 0 {
             return None;
         }
-        Some(PhysAddr::new(self.phys_pages[page_idx]))
+        Some(PhysAddr::new(pa))
     }
 
-    /// Clear all page pointers without freeing. Used internally by destroy()
-    /// which handles the sharing-group check itself.
+    /// Clear all page pointers without freeing.
     pub fn clear_pages(&mut self) {
-        for i in 0..self.page_count as usize {
-            self.phys_pages[i] = 0;
-        }
+        self.pages.clear(self.page_count as usize);
     }
 
     /// Add a mapping record.
@@ -154,7 +155,6 @@ struct ObjectTable {
 
 impl ObjectTable {
     const fn new() -> Self {
-        // Can't use array::from_fn in const. Repeat manually.
         Self {
             objects: {
                 const EMPTY: MemObject = MemObject::empty();
@@ -168,30 +168,28 @@ impl ObjectTable {
 /// Returns the object ID.
 pub fn create_pager(page_count: u16, file_handle: u32, file_base_offset: u64) -> Option<ObjectId> {
     let mut table = OBJECTS.lock();
-    for (i, obj) in table.objects.iter_mut().enumerate() {
-        if obj.obj_type == ObjectType::Free {
-            obj.obj_type = ObjectType::Pager;
-            obj.page_count = page_count;
-            obj.file_handle = file_handle;
-            obj.file_base_offset = file_base_offset;
-            return Some(i as ObjectId);
-        }
-    }
-    None
+    let slot = table.objects.iter().position(|o| o.obj_type == ObjectType::Free)?;
+    let pages = PageVec::with_capacity(page_count as usize)?;
+    let obj = &mut table.objects[slot];
+    obj.obj_type = ObjectType::Pager;
+    obj.page_count = page_count;
+    obj.pages = pages;
+    obj.file_handle = file_handle;
+    obj.file_base_offset = file_base_offset;
+    Some(slot as ObjectId)
 }
 
 /// Create a new anonymous memory object of `page_count` allocation pages.
 /// Returns the object ID.
 pub fn create_anon(page_count: u16) -> Option<ObjectId> {
     let mut table = OBJECTS.lock();
-    for (i, obj) in table.objects.iter_mut().enumerate() {
-        if obj.obj_type == ObjectType::Free {
-            obj.obj_type = ObjectType::Anonymous;
-            obj.page_count = page_count;
-            return Some(i as ObjectId);
-        }
-    }
-    None
+    let slot = table.objects.iter().position(|o| o.obj_type == ObjectType::Free)?;
+    let pages = PageVec::with_capacity(page_count as usize)?;
+    let obj = &mut table.objects[slot];
+    obj.obj_type = ObjectType::Anonymous;
+    obj.page_count = page_count;
+    obj.pages = pages;
+    Some(slot as ObjectId)
 }
 
 /// Next COW group ID counter.
@@ -206,14 +204,11 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
     let page_count = table.objects[src_id as usize].page_count;
 
     // Find a free slot.
-    let mut dst_slot = None;
-    for (i, obj) in table.objects.iter().enumerate() {
-        if obj.obj_type == ObjectType::Free {
-            dst_slot = Some(i);
-            break;
-        }
-    }
-    let dst_idx = dst_slot?;
+    let dst_idx = table.objects.iter().position(|o| o.obj_type == ObjectType::Free)?;
+
+    // Allocate PageVec for the clone.
+    let mut new_pages = PageVec::with_capacity(page_count as usize)?;
+    new_pages.copy_from(&table.objects[src_id as usize].pages, page_count as usize);
 
     // Assign a COW group if the source doesn't have one yet.
     if table.objects[src_id as usize].cow_group == 0 {
@@ -224,15 +219,13 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
     }
     let group = table.objects[src_id as usize].cow_group;
 
-    // Copy physical page pointers (no per-PFN refcount needed).
-    table.objects[dst_idx].obj_type = ObjectType::Anonymous;
-    table.objects[dst_idx].page_count = page_count;
-    table.objects[dst_idx].cow_group = group;
-    for i in 0..page_count as usize {
-        table.objects[dst_idx].phys_pages[i] = table.objects[src_id as usize].phys_pages[i];
-    }
+    let obj = &mut table.objects[dst_idx];
+    obj.obj_type = ObjectType::Anonymous;
+    obj.page_count = page_count;
+    obj.cow_group = group;
+    obj.pages = new_pages;
     // Clear mappings on the new object (caller will add its own).
-    for m in &mut table.objects[dst_idx].mappings {
+    for m in &mut obj.mappings {
         *m = Mapping::empty();
     }
 
@@ -247,21 +240,23 @@ pub fn destroy(id: ObjectId) {
 
     // Free each page, checking siblings in the same COW group.
     for p in 0..page_count {
-        let pa = table.objects[id as usize].phys_pages[p];
+        let pa = table.objects[id as usize].pages.get(p);
         if pa != 0 {
             let shared = group != 0 && table.objects.iter().enumerate().any(|(i, obj)| {
                 i != id as usize
                     && obj.obj_type != ObjectType::Free
                     && obj.cow_group == group
-                    && obj.phys_pages[..obj.page_count as usize].contains(&pa)
+                    && obj.pages.contains(obj.page_count as usize, pa)
             });
             if !shared {
                 phys::free_page(PhysAddr::new(pa));
             }
-            table.objects[id as usize].phys_pages[p] = 0;
+            table.objects[id as usize].pages.set(p, 0);
         }
     }
 
+    // Free the PageVec heap buffer.
+    table.objects[id as usize].pages.free_heap();
     table.objects[id as usize].obj_type = ObjectType::Free;
     table.objects[id as usize].page_count = 0;
     table.objects[id as usize].cow_group = 0;
@@ -277,8 +272,7 @@ where
 }
 
 /// Check whether a physical page at `page_idx` in object `obj_id` is shared
-/// with any sibling in the same COW group. Returns true if another live object
-/// in the group also references the same physical address.
+/// with any sibling in the same COW group.
 pub fn is_page_shared(obj_id: ObjectId, page_idx: usize) -> bool {
     let table = OBJECTS.lock();
     let obj = &table.objects[obj_id as usize];
@@ -286,7 +280,7 @@ pub fn is_page_shared(obj_id: ObjectId, page_idx: usize) -> bool {
     if group == 0 {
         return false;
     }
-    let pa = obj.phys_pages[page_idx];
+    let pa = obj.pages.get(page_idx);
     if pa == 0 {
         return false;
     }
@@ -294,28 +288,28 @@ pub fn is_page_shared(obj_id: ObjectId, page_idx: usize) -> bool {
         i != obj_id as usize
             && sib.obj_type != ObjectType::Free
             && sib.cow_group == group
-            && sib.phys_pages[..sib.page_count as usize].contains(&pa)
+            && sib.pages.contains(sib.page_count as usize, pa)
     })
 }
 
 /// Release a physical page from object `obj_id` at `page_idx`.
 /// If no sibling in the COW group references the same PA, frees the page.
 /// Returns true if the physical page was freed, false if still shared.
-/// Clears the object's phys_pages entry in either case.
+/// Clears the page entry in either case.
 pub fn release_page(obj_id: ObjectId, page_idx: usize) -> bool {
     let mut table = OBJECTS.lock();
     let group = table.objects[obj_id as usize].cow_group;
-    let pa = table.objects[obj_id as usize].phys_pages[page_idx];
+    let pa = table.objects[obj_id as usize].pages.get(page_idx);
     if pa == 0 {
         return false;
     }
-    table.objects[obj_id as usize].phys_pages[page_idx] = 0;
+    table.objects[obj_id as usize].pages.set(page_idx, 0);
 
     let shared = group != 0 && table.objects.iter().enumerate().any(|(i, sib)| {
         i != obj_id as usize
             && sib.obj_type != ObjectType::Free
             && sib.cow_group == group
-            && sib.phys_pages[..sib.page_count as usize].contains(&pa)
+            && sib.pages.contains(sib.page_count as usize, pa)
     });
     if !shared {
         super::phys::free_page(PhysAddr::new(pa));

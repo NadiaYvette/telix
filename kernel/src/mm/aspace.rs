@@ -709,7 +709,11 @@ pub fn mremap(id: ASpaceId, old_addr: usize, old_len: usize, new_len: usize) -> 
     let obj_id = vma.object_id;
 
     let can_grow = super::object::with_object(obj_id, |obj| {
-        new_page_count <= obj.phys_pages.len()
+        if new_page_count <= obj.pages.capacity() {
+            true
+        } else {
+            obj.pages.grow(new_page_count, obj.page_count as usize)
+        }
     });
     if !can_grow {
         return 0;

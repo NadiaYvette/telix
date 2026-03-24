@@ -364,7 +364,7 @@ fn try_superpage_promotion(
             if idx >= obj.page_count as usize {
                 return false;
             }
-            if obj.phys_pages[idx] == 0 {
+            if obj.pages.get(idx) == 0 {
                 return false;
             }
         }
@@ -382,12 +382,12 @@ fn try_superpage_promotion(
     }
 
     let already_contiguous = object::with_object(obj_id, |obj| {
-        let first_pa = obj.phys_pages[obj_page_base];
+        let first_pa = obj.pages.get(obj_page_base);
         if first_pa & 0x1FFFFF != 0 {
             return false;
         }
         for p in 1..SUPER_ALLOC_PAGES {
-            if obj.phys_pages[obj_page_base + p] != first_pa + p * PAGE_SIZE {
+            if obj.pages.get(obj_page_base + p) != first_pa + p * PAGE_SIZE {
                 return false;
             }
         }
@@ -395,7 +395,7 @@ fn try_superpage_promotion(
     });
 
     if already_contiguous {
-        let base_pa = object::with_object(obj_id, |obj| obj.phys_pages[obj_page_base]);
+        let base_pa = object::with_object(obj_id, |obj| obj.pages.get(obj_page_base));
         let flags = pte_flags_for_vma(vma) | sw_zeroed_bit();
 
         if install_superpage(pt_root, super_va, base_pa, flags) {
@@ -411,7 +411,7 @@ fn try_superpage_promotion(
 
     object::with_object(obj_id, |obj| {
         for p in 0..SUPER_ALLOC_PAGES {
-            let old_pa = obj.phys_pages[obj_page_base + p];
+            let old_pa = obj.pages.get(obj_page_base + p);
             let new_pa = new_block.as_usize() + p * PAGE_SIZE;
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -425,7 +425,7 @@ fn try_superpage_promotion(
 
     object::with_object(obj_id, |obj| {
         for p in 0..SUPER_ALLOC_PAGES {
-            let old_pa = super::page::PhysAddr::new(obj.phys_pages[obj_page_base + p]);
+            let old_pa = super::page::PhysAddr::new(obj.pages.get(obj_page_base + p));
             super::phys::free_page(old_pa);
         }
     });
@@ -433,7 +433,7 @@ fn try_superpage_promotion(
     object::with_object(obj_id, |obj| {
         for p in 0..SUPER_ALLOC_PAGES {
             let new_pa = new_block.as_usize() + p * PAGE_SIZE;
-            obj.phys_pages[obj_page_base + p] = new_pa;
+            obj.pages.set(obj_page_base + p, new_pa);
         }
     });
 
@@ -609,7 +609,7 @@ fn handle_cow_fault(
     }
 
     object::with_object(obj_id, |obj| {
-        obj.phys_pages[obj_page_idx] = new_pa.as_usize();
+        obj.pages.set(obj_page_idx, new_pa.as_usize());
     });
 
     // Reinstall PTEs for all present MMU pages in this allocation page.

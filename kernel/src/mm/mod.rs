@@ -5,6 +5,7 @@ pub mod fault;
 pub mod grant;
 pub mod object;
 pub mod page;
+pub mod pagevec;
 pub mod phys;
 pub mod slab;
 pub mod stats;
