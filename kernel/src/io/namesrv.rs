@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// Global port ID for the name server.
 pub static NAMESRV_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
 
-const MAX_SERVICES: usize = 16;
+const MAX_SERVICES: usize = 32;
 const MAX_SVC_NAME: usize = 24;
 
 struct ServiceEntry {

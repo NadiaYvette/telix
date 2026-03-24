@@ -36,6 +36,12 @@ const FS_WRITE: u64 = 0x2600;
 const FS_WRITE_OK: u64 = 0x2601;
 const FS_DELETE: u64 = 0x2700;
 const FS_DELETE_OK: u64 = 0x2701;
+const FS_MKDIR: u64 = 0x2A00;
+const FS_MKDIR_OK: u64 = 0x2A01;
+const FS_UNLINK: u64 = 0x2A20;
+const FS_UNLINK_OK: u64 = 0x2A21;
+const FS_FSYNC: u64 = 0x2B00;
+const FS_FSYNC_OK: u64 = 0x2B01;
 const FS_ERROR: u64 = 0x2F00;
 
 // File lock protocol.
@@ -1389,6 +1395,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_CLOSE => {
                 let handle = msg.data[0] as usize;
+                let reply_port = (msg.data[2] >> 32) as u32;
                 if handle < MAX_OPEN_FILES && open_files[handle].active {
                     let ino = open_files[handle].inode_num;
                     let pid = open_files[handle].pid;
@@ -1412,6 +1419,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         ext2_release_locks(&mut file_locks, ino, pid, 0, 0);
                         ext2_try_wake_waiters(&mut file_locks, &mut lock_waiters, ino);
                     }
+                }
+                if reply_port != 0 {
+                    syscall::send(reply_port, FS_CLOSE as u64, 0, 0, 0, 0);
                 }
             }
 
@@ -1828,6 +1838,154 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         let d0 = LK_UNLCK as u64;
                         syscall::send(reply_port, FS_GETLK_OK, d0, 0, 0, 0);
                     }
+                }
+            }
+
+            FS_MKDIR => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let mode = ((msg.data[2] >> 16) & 0xFFFF) as u16;
+                let reply_port = (msg.data[2] >> 32) as u32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                // Allocate inode.
+                let ino = match alloc_inode(&blk, &mut sb, &bgd, block_buf_va) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Allocate first data block for the directory.
+                let first_block = match alloc_block(&blk, &mut sb, &bgd, block_buf_va) {
+                    Some(b) => b,
+                    None => {
+                        free_inode(&blk, &mut sb, &bgd, ino, block_buf_va);
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Zero out the first data block.
+                unsafe {
+                    core::ptr::write_bytes(block_buf_va as *mut u8, 0, sb.block_size as usize);
+                }
+                blk.write_block(first_block, sb.block_size, block_buf_va);
+
+                // Initialize inode: directory mode (0o40000 | mode).
+                let mut block_ptrs = [0u32; 15];
+                block_ptrs[0] = first_block;
+                let dir_mode = 0o40000 | mode;
+                write_inode(&blk, &sb, &bgd, ino, dir_mode, 0, 0,
+                            sb.block_size, &block_ptrs);
+
+                // Add directory entry to root.
+                let root = match read_inode(&blk, &sb, &bgd, EXT2_ROOT_INO) {
+                    Some(r) => r,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+                let (_, _, _, root_size, root_blocks) = root;
+                // file_type 2 = directory
+                if !dir_add_entry(&blk, &sb, &root_blocks, root_size,
+                    name, name_len.min(16), ino, 2, indirect_buf_va, block_buf_va) {
+                    syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                    continue;
+                }
+
+                flush_superblock(&blk, &sb);
+                syscall::send(reply_port, FS_MKDIR_OK, 0, 0, 0, 0);
+            }
+
+            FS_UNLINK => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let reply_port = (msg.data[2] >> 32) as u32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                let root = match read_inode(&blk, &sb, &bgd, EXT2_ROOT_INO) {
+                    Some(r) => r,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+                let (_, _, _, root_size, root_blocks) = root;
+
+                let ino = match dir_lookup(
+                    &blk, &sb, &bgd, &root_blocks, root_size, name,
+                    indirect_buf_va, block_buf_va,
+                ) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Read inode to get block pointers.
+                let (_, _, _, _size, block_ptrs) = match read_inode(&blk, &sb, &bgd, ino) {
+                    Some(r) => r,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Free direct blocks.
+                for i in 0..12 {
+                    if block_ptrs[i] != 0 {
+                        free_block(&blk, &mut sb, &bgd, block_ptrs[i], block_buf_va);
+                    }
+                }
+                // Free single indirect block and its children.
+                if block_ptrs[12] != 0 {
+                    if blk.read_block(block_ptrs[12], sb.block_size, block_buf_va) {
+                        let ptrs_per_block = sb.block_size / 4;
+                        for i in 0..ptrs_per_block as usize {
+                            let ptr = unsafe {
+                                core::ptr::read((block_buf_va + i * 4) as *const u32)
+                            };
+                            if ptr != 0 {
+                                free_block(&blk, &mut sb, &bgd, ptr, indirect_buf_va);
+                            }
+                        }
+                    }
+                    free_block(&blk, &mut sb, &bgd, block_ptrs[12], block_buf_va);
+                }
+
+                // Free inode.
+                free_inode(&blk, &mut sb, &bgd, ino, block_buf_va);
+
+                // Zero out the inode on disk.
+                let zero_ptrs = [0u32; 15];
+                write_inode(&blk, &sb, &bgd, ino, 0, 0, 0, 0, &zero_ptrs);
+
+                // Remove directory entry.
+                dir_remove_entry(&blk, &sb, &root_blocks, root_size,
+                    name, name_len.min(16), indirect_buf_va, block_buf_va);
+
+                flush_superblock(&blk, &sb);
+                syscall::send(reply_port, FS_UNLINK_OK, 0, 0, 0, 0);
+            }
+
+            FS_FSYNC => {
+                let handle = msg.data[0] as usize;
+                let reply_port = (msg.data[2] >> 32) as u32;
+
+                if handle < MAX_OPEN_FILES && open_files[handle].active {
+                    // Flush the inode to disk.
+                    let f = &open_files[handle];
+                    write_inode(&blk, &sb, &bgd, f.inode_num,
+                                f.mode, f.uid, f.gid, f.file_size, &f.block_ptrs);
+                    flush_superblock(&blk, &sb);
+                }
+
+                if reply_port != 0 {
+                    syscall::send(reply_port, FS_FSYNC_OK, 0, 0, 0, 0);
                 }
             }
 

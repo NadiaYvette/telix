@@ -103,6 +103,12 @@ pub const SYS_PRLIMIT: u64 = 86;
 pub const SYS_YIELD_BLOCK: u64 = 87;
 pub const SYS_PROC_LIST: u64 = 88;
 pub const SYS_PROC_INFO: u64 = 89;
+pub const SYS_MADVISE: u64 = 90;
+pub const SYS_TLS_SET: u64 = 91;
+pub const SYS_TLS_GET: u64 = 92;
+pub const SYS_PORT_SET_RECV_TIMEOUT: u64 = 93;
+pub const SYS_TIMER_CREATE: u64 = 94;
+pub const SYS_MMAP_GUARD: u64 = 95;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -314,6 +320,15 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
             }
             return;
         }
+        SYS_MADVISE => sys_madvise(a0, a1, a2),
+        SYS_TLS_SET => sys_tls_set(a0),
+        SYS_TLS_GET => sys_tls_get(),
+        SYS_PORT_SET_RECV_TIMEOUT => {
+            sys_port_set_recv_timeout(a0, a1, frame);
+            return;
+        }
+        SYS_TIMER_CREATE => sys_timer_create(a0, a1),
+        SYS_MMAP_GUARD => sys_mmap_guard(a0, a1),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -785,6 +800,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
         VmaProt::ReadWrite => crate::arch::aarch64::mm::USER_RW_FLAGS,
         VmaProt::ReadExec => crate::arch::aarch64::mm::USER_RWX_FLAGS,
         VmaProt::ReadWriteExec => crate::arch::aarch64::mm::USER_RWX_FLAGS,
+        VmaProt::None => 0,
     };
     #[cfg(target_arch = "riscv64")]
     let pte_flags = match prot {
@@ -792,6 +808,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
         VmaProt::ReadWrite => crate::arch::riscv64::mm::USER_RW_FLAGS,
         VmaProt::ReadExec => crate::arch::riscv64::mm::USER_RWX_FLAGS,
         VmaProt::ReadWriteExec => crate::arch::riscv64::mm::USER_RWX_FLAGS,
+        VmaProt::None => 0,
     };
     #[cfg(target_arch = "x86_64")]
     let pte_flags = match prot {
@@ -799,6 +816,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
         VmaProt::ReadWrite => crate::arch::x86_64::mm::USER_RW_FLAGS,
         VmaProt::ReadExec => crate::arch::x86_64::mm::USER_RWX_FLAGS,
         VmaProt::ReadWriteExec => crate::arch::x86_64::mm::USER_RWX_FLAGS,
+        VmaProt::None => 0,
     };
 
     for page_idx in 0..pages {
@@ -2423,4 +2441,143 @@ fn sys_getgroups(max_count: u64, groups_ptr: u64) -> u64 {
         }
     }
     n as u64
+}
+
+// ============================================================
+// Phase 77: madvise
+// ============================================================
+
+fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
+    const MADV_DONTNEED: u64 = 4;
+
+    match advice {
+        MADV_DONTNEED => {
+            let va_start = addr as usize;
+            let va_end = va_start + len as usize;
+            let aspace_id = crate::sched::scheduler::current_aspace_id();
+            crate::mm::aspace::with_aspace_mut(aspace_id, |aspace| {
+                aspace.madvise_dontneed(va_start, va_end);
+            });
+            0
+        }
+        _ => 0, // MADV_NORMAL, MADV_WILLNEED: no-op
+    }
+}
+
+// ============================================================
+// Phase 74: TLS set/get
+// ============================================================
+
+fn sys_tls_set(base: u64) -> u64 {
+    let tid = crate::sched::scheduler::current_thread_id();
+    let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_mut(tid as usize) {
+        t.tls_base = base;
+    }
+    drop(sched);
+
+    // Set the architecture-specific TLS register.
+    #[cfg(target_arch = "aarch64")]
+    unsafe { core::arch::asm!("msr tpidr_el0, {}", in(reg) base); }
+    #[cfg(target_arch = "riscv64")]
+    unsafe { core::arch::asm!("mv tp, {}", in(reg) base); }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Write FS base via MSR.
+        let lo = base as u32;
+        let hi = (base >> 32) as u32;
+        unsafe { core::arch::asm!("wrmsr", in("ecx") 0xC0000100u32, in("eax") lo, in("edx") hi); }
+    }
+    0
+}
+
+fn sys_tls_get() -> u64 {
+    let tid = crate::sched::scheduler::current_thread_id();
+    let sched = crate::sched::scheduler::SCHEDULER.lock();
+    if let Some(t) = sched.threads.get(tid as usize) {
+        t.tls_base
+    } else {
+        0
+    }
+}
+
+// ============================================================
+// Phase 75: port_set_recv with timeout
+// ============================================================
+
+fn sys_port_set_recv_timeout(set_id: u64, timeout_us: u64, frame: &mut ExceptionFrame) {
+    // Try non-blocking port_set_recv from the set.
+    match crate::ipc::port_set::recv(set_id as u32) {
+        Some((port_id, msg)) => {
+            let task_id = crate::sched::current_task_id();
+            auto_grant_reply_caps(task_id, &msg);
+            set_reg(frame, 1, msg.tag);
+            set_reg(frame, 2, msg.data[0]);
+            set_reg(frame, 3, msg.data[1]);
+            set_reg(frame, 4, msg.data[2]);
+            set_reg(frame, 5, msg.data[3]);
+            set_reg(frame, 6, msg.data[4]);
+            set_reg(frame, 7, msg.data[5]);
+            let result = (port_id as u64) << 32;
+            set_return(frame, result);
+            let nr = SYS_PORT_SET_RECV_TIMEOUT;
+            crate::trace::trace_event(crate::trace::EVT_SYSCALL_EXIT, nr as u32, result as u32);
+            if crate::sched::scheduler::current_aspace_id() != 0 {
+                deliver_pending_signals(frame);
+            }
+        }
+        None => {
+            if timeout_us == 0xFFFFFFFFFFFFFFFF {
+                // Infinite timeout — use blocking recv.
+                let result = sys_port_set_recv(set_id, frame);
+                set_return(frame, result);
+                let nr = SYS_PORT_SET_RECV_TIMEOUT;
+                crate::trace::trace_event(crate::trace::EVT_SYSCALL_EXIT, nr as u32, result as u32);
+                if crate::sched::scheduler::current_aspace_id() != 0 {
+                    deliver_pending_signals(frame);
+                }
+            } else {
+                // Timeout (including 0) — return u64::MAX.
+                set_return(frame, u64::MAX);
+                let nr = SYS_PORT_SET_RECV_TIMEOUT;
+                crate::trace::trace_event(crate::trace::EVT_SYSCALL_EXIT, nr as u32, u64::MAX as u32);
+                if crate::sched::scheduler::current_aspace_id() != 0 {
+                    deliver_pending_signals(frame);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// Phase 76: timer_create and mmap_guard
+// ============================================================
+
+fn sys_timer_create(signal_num: u64, interval_ns: u64) -> u64 {
+    let tid = crate::sched::scheduler::current_thread_id();
+    let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+    if let Some(t) = sched.threads.get_mut(tid as usize) {
+        t.timer_signal = signal_num as u32;
+        t.timer_interval_ns = interval_ns;
+        if interval_ns > 0 {
+            t.timer_next_ns = crate::sched::get_monotonic_ns() + interval_ns;
+        } else {
+            t.timer_next_ns = 0;
+        }
+    }
+    0
+}
+
+fn sys_mmap_guard(addr: u64, pages: u64) -> u64 {
+    use crate::mm::vma::VmaProt;
+    // Map pages with no permissions — access triggers SIGSEGV.
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    let va = addr as usize;
+    let count = pages as usize;
+    match crate::mm::aspace::with_aspace_mut(aspace_id, |aspace| {
+        aspace.map_anon(va, count, VmaProt::None).map(|vma| vma.va_start)
+    }) {
+        Some(Some(va_start)) => va_start as u64,
+        _ => u64::MAX,
+    }
 }

@@ -19,7 +19,7 @@ pub static USER_INITRAMFS_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
 static INITRAMFS: &[u8] = include_bytes!("initramfs.cpio");
 
 /// Maximum files in the initramfs.
-const MAX_FILES: usize = 32;
+const MAX_FILES: usize = 64;
 /// Maximum filename length.
 const MAX_NAME: usize = 64;
 

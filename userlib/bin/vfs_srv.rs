@@ -32,6 +32,10 @@ const VFS_OPEN_OK: u64 = 0x6110;
 const VFS_STAT_OK: u64 = 0x6120;
 const VFS_READDIR_OK: u64 = 0x6130;
 const VFS_READDIR_END: u64 = 0x6131;
+const VFS_MKDIR: u64 = 0x6040;
+const VFS_MKDIR_OK: u64 = 0x6140;
+const VFS_UNLINK: u64 = 0x6050;
+const VFS_UNLINK_OK: u64 = 0x6150;
 const VFS_ERROR: u64 = 0x6F00;
 
 // FS protocol tags (forwarded to underlying FS servers).
@@ -42,6 +46,10 @@ const FS_STAT_OK: u64 = 0x2301;
 const FS_READDIR: u64 = 0x2200;
 const FS_READDIR_OK: u64 = 0x2201;
 const FS_READDIR_END: u64 = 0x2202;
+const FS_MKDIR: u64 = 0x2A00;
+const FS_MKDIR_OK: u64 = 0x2A01;
+const FS_UNLINK: u64 = 0x2A20;
+const FS_UNLINK_OK: u64 = 0x2A21;
 
 const ERR_NOT_FOUND: u64 = 1;
 const ERR_NO_MOUNT: u64 = 2;
@@ -467,6 +475,101 @@ fn handle_readdir(data: &[u64; 6]) {
     if reply_port != 0 { syscall::send(reply_port, VFS_READDIR_END, 0, 0, 0, 0); }
 }
 
+/// Handle VFS_MKDIR: resolve path, forward FS_MKDIR to FS server.
+/// data[2] = path_len(16) | mode(16) | reply_port(32)
+fn handle_mkdir(data: &[u64; 6]) {
+    let path_len = (data[2] & 0xFFFF) as usize;
+    let mode = ((data[2] >> 16) & 0xFFFF) as u32;
+    let reply_port = (data[2] >> 32) as u32;
+
+    let (mut path, plen) = unpack_path(data[0], data[1], path_len);
+    let plen = normalize_path(&mut path, plen);
+
+    if plen == 0 {
+        if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0); }
+        return;
+    }
+
+    let (mount_idx, prefix_end) = match find_mount(&path, plen) {
+        Some(r) => r,
+        None => {
+            if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0); }
+            return;
+        }
+    };
+
+    let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
+    let (rel, rel_len) = relative_path(&path, plen, prefix_end);
+
+    let my_reply = syscall::port_create() as u32;
+    let (n0, n1) = pack_name_2(rel, rel_len);
+    let d2 = (rel_len as u64) | ((mode as u64) << 16) | ((my_reply as u64) << 32);
+    syscall::send(fs_port, FS_MKDIR, n0, n1, d2, 0);
+
+    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+        if fs_reply.tag == FS_MKDIR_OK {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_MKDIR_OK, 0, 0, 0, 0);
+            }
+        } else {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+            }
+        }
+    } else if reply_port != 0 {
+        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    }
+
+    syscall::port_destroy(my_reply);
+}
+
+/// Handle VFS_UNLINK: resolve path, forward FS_UNLINK to FS server.
+/// data[2] = path_len(16) | reply_port(32)
+fn handle_unlink(data: &[u64; 6]) {
+    let path_len = (data[2] & 0xFFFF) as usize;
+    let reply_port = (data[2] >> 32) as u32;
+
+    let (mut path, plen) = unpack_path(data[0], data[1], path_len);
+    let plen = normalize_path(&mut path, plen);
+
+    if plen == 0 {
+        if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0); }
+        return;
+    }
+
+    let (mount_idx, prefix_end) = match find_mount(&path, plen) {
+        Some(r) => r,
+        None => {
+            if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0); }
+            return;
+        }
+    };
+
+    let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
+    let (rel, rel_len) = relative_path(&path, plen, prefix_end);
+
+    let my_reply = syscall::port_create() as u32;
+    let (n0, n1) = pack_name_2(rel, rel_len);
+    let d2 = (rel_len as u64) | ((my_reply as u64) << 32);
+    syscall::send(fs_port, FS_UNLINK, n0, n1, d2, 0);
+
+    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+        if fs_reply.tag == FS_UNLINK_OK {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_UNLINK_OK, 0, 0, 0, 0);
+            }
+        } else {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+            }
+        }
+    } else if reply_port != 0 {
+        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    }
+
+    syscall::port_destroy(my_reply);
+}
+
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  [vfs_srv] starting\n");
@@ -494,6 +597,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             VFS_OPEN => handle_open(&msg.data),
             VFS_STAT => handle_stat(&msg.data),
             VFS_READDIR => handle_readdir(&msg.data),
+            VFS_MKDIR => handle_mkdir(&msg.data),
+            VFS_UNLINK => handle_unlink(&msg.data),
             _ => {
                 let reply_port = (msg.data[2] >> 32) as u32;
                 if reply_port != 0 {

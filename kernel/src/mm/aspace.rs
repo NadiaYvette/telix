@@ -129,6 +129,27 @@ impl AddressSpace {
     pub fn find_vma(&self, va: usize) -> Option<&Vma> {
         self.vmas.find(va)
     }
+
+    /// MADV_DONTNEED: clear installed PTEs in [va_start, va_end), free phys frames.
+    /// VMAs stay mapped — next access triggers zero-fill page fault.
+    pub fn madvise_dontneed(&mut self, va_start: usize, va_end: usize) {
+        let pt_root = self.page_table_root;
+        let mmu_size = super::page::MMUPAGE_SIZE;
+        // Walk each MMU page in the range and unmap if installed.
+        let mut va = va_start & !(mmu_size - 1);
+        while va < va_end {
+            if let Some(vma) = self.vmas.find_mut(va) {
+                let mmu_idx = (va - vma.va_start) / mmu_size;
+                if vma.is_installed(mmu_idx) {
+                    unmap_single_mmupage(pt_root, va);
+                    vma.clear_installed(mmu_idx);
+                }
+                // Clear zeroed so fault handler re-zeros the page.
+                vma.clear_zeroed(mmu_idx);
+            }
+            va += mmu_size;
+        }
+    }
 }
 
 /// Global address space table.
@@ -149,6 +170,17 @@ impl ASpaceTable {
             next_id: 1,
         }
     }
+}
+
+/// Access an address space by ID with a mutable closure.
+pub fn with_aspace_mut<R>(id: ASpaceId, f: impl FnOnce(&mut AddressSpace) -> R) -> Option<R> {
+    let mut table = ASPACES.lock();
+    for space in table.spaces.iter_mut() {
+        if space.active && space.id == id {
+            return Some(f(space));
+        }
+    }
+    None
 }
 
 /// Read a timer/cycle counter for PRNG seeding.
@@ -547,6 +579,7 @@ fn rw_flags_for_prot(prot: VmaProt) -> u64 {
             VmaProt::ReadWrite => mm::USER_RW_FLAGS,
             VmaProt::ReadExec => mm::USER_RWX_FLAGS,
             VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
+            VmaProt::None => 0,
         }
     }
     #[cfg(target_arch = "riscv64")]
@@ -557,6 +590,7 @@ fn rw_flags_for_prot(prot: VmaProt) -> u64 {
             VmaProt::ReadWrite => mm::USER_RW_FLAGS,
             VmaProt::ReadExec => mm::USER_RWX_FLAGS,
             VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
+            VmaProt::None => 0,
         }
     }
     #[cfg(target_arch = "x86_64")]
@@ -567,6 +601,7 @@ fn rw_flags_for_prot(prot: VmaProt) -> u64 {
             VmaProt::ReadWrite => mm::USER_RW_FLAGS,
             VmaProt::ReadExec => mm::USER_RWX_FLAGS,
             VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
+            VmaProt::None => 0,
         }
     }
 }

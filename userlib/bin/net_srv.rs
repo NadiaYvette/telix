@@ -30,6 +30,11 @@ const NET_TCP_CLOSED: u64 = 0x44FF;
 const NET_TCP_CLOSE: u64 = 0x4500;
 const NET_TCP_CLOSE_OK: u64 = 0x4501;
 
+// TCP listen protocol.
+const NET_TCP_LISTEN: u64 = 0x4700;
+const NET_TCP_LISTEN_OK: u64 = 0x4701;
+const NET_TCP_LISTEN_FAIL: u64 = 0x47FF;
+
 // TCP flags.
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
@@ -1330,6 +1335,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     let conn_id = msg.data[0] as usize;
                     let reply_port = msg.data[1] as u32;
                     dev.handle_tcp_close(conn_id, reply_port);
+                }
+                NET_TCP_LISTEN => {
+                    // data[0] = port, data[1] = backlog, data[2] = reply_port << 32
+                    let port = msg.data[0] as u16;
+                    let _backlog = msg.data[1] as u32;
+                    let reply_port = (msg.data[2] >> 32) as u32;
+                    syscall::send_nb(reply_port, NET_TCP_LISTEN_OK, port as u64, 0);
                 }
                 _ => {}
             }

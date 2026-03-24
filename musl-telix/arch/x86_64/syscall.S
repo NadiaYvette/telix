@@ -49,6 +49,21 @@ __telix_syscall3:
     ret
     .size __telix_syscall3, . - __telix_syscall3
 
+/* uint64_t __telix_syscall4(uint64_t nr, uint64_t a0, ..., uint64_t a3)
+ * C calling convention: rdi=nr, rsi=a0, rdx=a1, rcx=a2, r8=a3
+ */
+    .global __telix_syscall4
+    .type __telix_syscall4, @function
+__telix_syscall4:
+    mov %rdi, %rax
+    mov %rsi, %rdi
+    mov %rdx, %rsi
+    mov %r8, %r10
+    mov %rcx, %rdx
+    int $0x80
+    ret
+    .size __telix_syscall4, . - __telix_syscall4
+
 /* uint64_t __telix_syscall6(uint64_t nr, uint64_t a0, ..., uint64_t a5)
  * C calling convention: rdi=nr, rsi=a0, rdx=a1, rcx=a2, r8=a3, r9=a4, 8(%rsp)=a5
  */

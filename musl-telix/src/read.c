@@ -14,7 +14,7 @@ static ssize_t read_pipe(struct telix_fd_entry *fde,
                (uint64_t)fde->server_handle, 0, d2, 0);
 
     struct telix_msg msg;
-    if (!telix_recv_msg(reply_port, &msg)) {
+    if (telix_recv_msg(reply_port, &msg) != 0) {
         telix_port_destroy(reply_port);
         return -1;
     }
@@ -50,7 +50,7 @@ static ssize_t read_console(struct telix_fd_entry *fde,
     telix_send(fde->server_port, CON_READ, d0, 0, 0, 0);
 
     struct telix_msg msg;
-    if (!telix_recv_msg(reply_port, &msg)) {
+    if (telix_recv_msg(reply_port, &msg) != 0) {
         telix_port_destroy(reply_port);
         return -1;
     }
@@ -101,7 +101,7 @@ static ssize_t read_file(struct telix_fd_entry *fde,
                    d2, 0);
 
         struct telix_msg msg;
-        if (!telix_recv_msg(reply_port, &msg)) {
+        if (telix_recv_msg(reply_port, &msg) != 0) {
             telix_port_destroy(reply_port);
             break;
         }

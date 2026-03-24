@@ -72,6 +72,14 @@ pub struct Thread {
     pub sleep_deadline_ns: u64,
     /// Thread blocked in thread_join() waiting for us to exit (u32::MAX = none).
     pub join_waiter: u32,
+    /// Thread-local storage base address (Phase 74).
+    pub tls_base: u64,
+    /// Per-thread interval timer signal number (Phase 76, 0 = disabled).
+    pub timer_signal: u32,
+    /// Per-thread timer interval in nanoseconds.
+    pub timer_interval_ns: u64,
+    /// Next expiry timestamp in nanoseconds-since-boot.
+    pub timer_next_ns: u64,
 }
 
 impl Thread {
@@ -92,6 +100,10 @@ impl Thread {
             sig_pending: 0,
             sleep_deadline_ns: 0,
             join_waiter: u32::MAX,
+            tls_base: 0,
+            timer_signal: 0,
+            timer_interval_ns: 0,
+            timer_next_ns: 0,
         }
     }
 }

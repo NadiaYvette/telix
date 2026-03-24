@@ -50,7 +50,8 @@ $CC $CFLAGS -c "$MUSL/arch/$ARCH/syscall.S"   -o "$OUTDIR/syscall.o"
 
 # Compile C sources.
 for src in ipc fd write read exit init socket pipe poll \
-           string malloc printf file process signal dup env; do
+           string malloc printf file process signal dup env \
+           syslog locale time_util mman pthread netdb epoll timer sysvipc; do
     $CC $CFLAGS -c "$MUSL/src/$src.c" -o "$OUTDIR/$src.o"
 done
 
@@ -60,7 +61,10 @@ COMMON_OBJS="$OUTDIR/crt_start.o $OUTDIR/syscall.o \
     $OUTDIR/exit.o $OUTDIR/init.o $OUTDIR/socket.o $OUTDIR/pipe.o \
     $OUTDIR/poll.o \
     $OUTDIR/string.o $OUTDIR/malloc.o $OUTDIR/printf.o $OUTDIR/file.o \
-    $OUTDIR/process.o $OUTDIR/signal.o $OUTDIR/dup.o $OUTDIR/env.o"
+    $OUTDIR/process.o $OUTDIR/signal.o $OUTDIR/dup.o $OUTDIR/env.o \
+    $OUTDIR/syslog.o $OUTDIR/locale.o $OUTDIR/time_util.o $OUTDIR/mman.o \
+    $OUTDIR/pthread.o $OUTDIR/netdb.o $OUTDIR/epoll.o $OUTDIR/timer.o \
+    $OUTDIR/sysvipc.o"
 
 # Link function — use ld.lld for cross-arch, clang for native.
 link_binary() {
@@ -110,5 +114,35 @@ $CC $CFLAGS -c "$MUSL/test/ld-telix.c" -o "$OUTDIR/ld-telix.o"
 link_binary "$OUTDIR/ld-telix" $COMMON_OBJS "$OUTDIR/ld-telix.o"
 SIZE=$(wc -c < "$OUTDIR/ld-telix")
 echo "  ld-telix: $SIZE bytes"
+
+# Build tz_test (Phase 72).
+$CC $CFLAGS -c "$MUSL/test/tz_test.c" -o "$OUTDIR/tz_test.o"
+link_binary "$OUTDIR/tz_test" $COMMON_OBJS "$OUTDIR/tz_test.o"
+SIZE=$(wc -c < "$OUTDIR/tz_test")
+echo "  tz_test: $SIZE bytes"
+
+# Build pthread_test (Phase 74).
+$CC $CFLAGS -c "$MUSL/test/pthread_test.c" -o "$OUTDIR/pthread_test.o"
+link_binary "$OUTDIR/pthread_test" $COMMON_OBJS "$OUTDIR/pthread_test.o"
+SIZE=$(wc -c < "$OUTDIR/pthread_test")
+echo "  pthread_test: $SIZE bytes"
+
+# Build initdb_test (Phase 80).
+$CC $CFLAGS -c "$MUSL/test/initdb_test.c" -o "$OUTDIR/initdb_test.o"
+link_binary "$OUTDIR/initdb_test" $COMMON_OBJS "$OUTDIR/initdb_test.o"
+SIZE=$(wc -c < "$OUTDIR/initdb_test")
+echo "  initdb_test: $SIZE bytes"
+
+# Build postmaster_test (Phase 81).
+$CC $CFLAGS -c "$MUSL/test/postmaster_test.c" -o "$OUTDIR/postmaster_test.o"
+link_binary "$OUTDIR/postmaster_test" $COMMON_OBJS "$OUTDIR/postmaster_test.o"
+SIZE=$(wc -c < "$OUTDIR/postmaster_test")
+echo "  postmaster_test: $SIZE bytes"
+
+# Build pg_full_test (Phase 82).
+$CC $CFLAGS -c "$MUSL/test/pg_full_test.c" -o "$OUTDIR/pg_full_test.o"
+link_binary "$OUTDIR/pg_full_test" $COMMON_OBJS "$OUTDIR/pg_full_test.o"
+SIZE=$(wc -c < "$OUTDIR/pg_full_test")
+echo "  pg_full_test: $SIZE bytes"
 
 echo "Done."

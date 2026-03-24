@@ -16,6 +16,12 @@
 #define VFS_STAT_OK     0x6120
 #define VFS_READDIR_OK  0x6130
 #define VFS_READDIR_END 0x6131
+#define VFS_MKDIR       0x6040
+#define VFS_MKDIR_OK    0x6140
+#define VFS_UNLINK      0x6050
+#define VFS_UNLINK_OK   0x6150
+#define VFS_RENAME      0x6060
+#define VFS_RENAME_OK   0x6160
 #define VFS_ERROR       0x6F00
 
 /* Underlying FS protocol tags. */
@@ -35,6 +41,12 @@
 #define FS_WRITE_OK     0x2601
 #define FS_DELETE        0x2700
 #define FS_DELETE_OK     0x2701
+#define FS_MKDIR        0x2A00
+#define FS_MKDIR_OK     0x2A01
+#define FS_UNLINK       0x2A20
+#define FS_UNLINK_OK    0x2A21
+#define FS_FSYNC        0x2B00
+#define FS_FSYNC_OK     0x2B01
 #define FS_ERROR        0x2F00
 
 /* Console read protocol. */
@@ -58,5 +70,10 @@ int     open(const char *path, int flags);
 int     close(int fd);
 int     stat(const char *path, struct stat *buf);
 off_t   lseek(int fd, off_t offset, int whence);
+int     mkdir(const char *path, int mode);
+int     unlink(const char *path);
+int     rename(const char *oldpath, const char *newpath);
+int     fsync(int fd);
+int     ftruncate(int fd, off_t length);
 
 #endif /* TELIX_VFS_H */

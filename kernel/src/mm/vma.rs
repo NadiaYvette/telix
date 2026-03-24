@@ -24,11 +24,12 @@ pub enum VmaProt {
     ReadWrite = 1,
     ReadExec = 2,
     ReadWriteExec = 3,
+    None = 4,
 }
 
 impl VmaProt {
     #[allow(dead_code)]
-    pub fn readable(self) -> bool { true }
+    pub fn readable(self) -> bool { !matches!(self, Self::None) }
     pub fn writable(self) -> bool { matches!(self, Self::ReadWrite | Self::ReadWriteExec) }
     pub fn executable(self) -> bool { matches!(self, Self::ReadExec | Self::ReadWriteExec) }
 }

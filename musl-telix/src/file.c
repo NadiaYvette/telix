@@ -136,3 +136,87 @@ off_t lseek(int fd, off_t offset, int whence) {
     fde->file_offset = (uint64_t)newoff;
     return (off_t)newoff;
 }
+
+int mkdir(const char *path, int mode) {
+    if (__telix_vfs_port == 0xFFFFFFFF)
+        return -1;
+
+    int pathlen = (int)strlen(path);
+    if (pathlen > 16) pathlen = 16;
+
+    uint64_t w0 = 0, w1 = 0;
+    for (int i = 0; i < pathlen && i < 8; i++)
+        w0 |= (uint64_t)(unsigned char)path[i] << (i * 8);
+    for (int i = 8; i < pathlen && i < 16; i++)
+        w1 |= (uint64_t)(unsigned char)path[i] << ((i - 8) * 8);
+
+    uint32_t reply = telix_port_create();
+    uint64_t d2 = (uint64_t)(uint32_t)pathlen
+                | ((uint64_t)(uint32_t)mode << 16)
+                | ((uint64_t)reply << 32);
+
+    telix_send(__telix_vfs_port, VFS_MKDIR, w0, w1, d2, 0);
+
+    struct telix_msg msg;
+    int ok = telix_recv_msg(reply, &msg);
+    telix_port_destroy(reply);
+
+    if (ok != 0 || msg.tag != VFS_MKDIR_OK)
+        return -1;
+    return 0;
+}
+
+int unlink(const char *path) {
+    if (__telix_vfs_port == 0xFFFFFFFF)
+        return -1;
+
+    int pathlen = (int)strlen(path);
+    if (pathlen > 16) pathlen = 16;
+
+    uint64_t w0 = 0, w1 = 0;
+    for (int i = 0; i < pathlen && i < 8; i++)
+        w0 |= (uint64_t)(unsigned char)path[i] << (i * 8);
+    for (int i = 8; i < pathlen && i < 16; i++)
+        w1 |= (uint64_t)(unsigned char)path[i] << ((i - 8) * 8);
+
+    uint32_t reply = telix_port_create();
+    uint64_t d2 = (uint64_t)(uint32_t)pathlen | ((uint64_t)reply << 32);
+
+    telix_send(__telix_vfs_port, VFS_UNLINK, w0, w1, d2, 0);
+
+    struct telix_msg msg;
+    int ok = telix_recv_msg(reply, &msg);
+    telix_port_destroy(reply);
+
+    if (ok != 0 || msg.tag != VFS_UNLINK_OK)
+        return -1;
+    return 0;
+}
+
+int rename(const char *oldpath, const char *newpath) {
+    (void)oldpath; (void)newpath;
+    return -1; /* Stub — rename not yet implemented in VFS. */
+}
+
+int fsync(int fd) {
+    struct telix_fd_entry *fde = telix_fd_get(fd);
+    if (!fde || fde->fd_type != FD_TYPE_FILE) return -1;
+
+    uint32_t reply = telix_port_create();
+    uint64_t d2 = (uint64_t)reply << 32;
+    telix_send(fde->server_port, FS_FSYNC,
+               (uint64_t)fde->server_handle, 0, d2, 0);
+
+    struct telix_msg msg;
+    int ok = telix_recv_msg(reply, &msg);
+    telix_port_destroy(reply);
+
+    if (ok != 0 || msg.tag != FS_FSYNC_OK)
+        return -1;
+    return 0;
+}
+
+int ftruncate(int fd, off_t length) {
+    (void)fd; (void)length;
+    return 0; /* Stub — no-op for now. */
+}

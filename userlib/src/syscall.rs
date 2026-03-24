@@ -41,6 +41,17 @@ const SYS_PORT_SET_ADD: u64 = 6;
 #[allow(dead_code)]
 const SYS_PORT_SET_RECV: u64 = 22;
 const SYS_NSRV_PORT: u64 = 23;
+const SYS_MADVISE: u64 = 90;
+#[allow(dead_code)]
+const SYS_TLS_SET: u64 = 91;
+#[allow(dead_code)]
+const SYS_TLS_GET: u64 = 92;
+#[allow(dead_code)]
+const SYS_PORT_SET_RECV_TIMEOUT: u64 = 93;
+#[allow(dead_code)]
+const SYS_TIMER_CREATE: u64 = 94;
+#[allow(dead_code)]
+const SYS_MMAP_GUARD: u64 = 95;
 
 /// Print a single character to the debug console.
 pub fn debug_putchar(ch: u8) {
@@ -1350,4 +1361,27 @@ pub fn ns_register(name: &[u8], service_port: u32) -> bool {
     };
     port_destroy(reply_port);
     result
+}
+
+/// madvise: advise kernel about memory usage patterns.
+pub fn madvise(addr: usize, len: usize, advice: u32) -> u64 {
+    unsafe { arch::syscall3(SYS_MADVISE, addr as u64, len as u64, advice as u64) }
+}
+
+/// mmap_guard: map pages with no permissions (guard page).
+pub fn mmap_guard(addr: usize, pages: usize) -> Option<usize> {
+    let r = unsafe { arch::syscall2(SYS_MMAP_GUARD, addr as u64, pages as u64) };
+    if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+/// port_set_recv_timeout: receive from port set with timeout in microseconds.
+/// Returns u64::MAX on timeout.
+pub fn port_set_recv_timeout(set_id: u32, timeout_us: u64) -> u64 {
+    unsafe { arch::syscall2(SYS_PORT_SET_RECV_TIMEOUT, set_id as u64, timeout_us) }
+}
+
+/// timer_create: set per-thread interval timer.
+/// signal=0 disables the timer.
+pub fn timer_create(signal: u32, interval_ns: u64) -> u64 {
+    unsafe { arch::syscall2(SYS_TIMER_CREATE, signal as u64, interval_ns) }
 }

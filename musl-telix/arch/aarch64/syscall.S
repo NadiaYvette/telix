@@ -48,6 +48,19 @@ __telix_syscall3:
     ret
     .size __telix_syscall3, . - __telix_syscall3
 
+/* uint64_t __telix_syscall4(uint64_t nr, uint64_t a0, ..., uint64_t a3) */
+    .global __telix_syscall4
+    .type __telix_syscall4, @function
+__telix_syscall4:
+    mov x8, x0
+    mov x0, x1
+    mov x1, x2
+    mov x2, x3
+    mov x3, x4
+    svc #0
+    ret
+    .size __telix_syscall4, . - __telix_syscall4
+
 /* uint64_t __telix_syscall6(uint64_t nr, uint64_t a0, ..., uint64_t a5)
  * C ABI: x0=nr, x1=a0, x2=a1, x3=a2, x4=a3, x5=a4, x6=a5
  */

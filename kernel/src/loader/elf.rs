@@ -399,6 +399,7 @@ fn prot_to_pte_flags(prot: VmaProt) -> u64 {
             VmaProt::ReadWrite => mm::USER_RW_FLAGS,
             VmaProt::ReadExec => mm::USER_RWX_FLAGS,
             VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
+            VmaProt::None => 0,
         }
     }
     #[cfg(target_arch = "riscv64")]
@@ -409,6 +410,7 @@ fn prot_to_pte_flags(prot: VmaProt) -> u64 {
             VmaProt::ReadWrite => mm::USER_RW_FLAGS,
             VmaProt::ReadExec => mm::USER_RWX_FLAGS,
             VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
+            VmaProt::None => 0,
         }
     }
     #[cfg(target_arch = "x86_64")]
@@ -419,6 +421,7 @@ fn prot_to_pte_flags(prot: VmaProt) -> u64 {
             VmaProt::ReadWrite => mm::USER_RW_FLAGS,
             VmaProt::ReadExec => mm::USER_RWX_FLAGS,
             VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
+            VmaProt::None => 0,
         }
     }
 }

@@ -183,6 +183,7 @@ fn pte_flags_for_vma(vma: &super::vma::Vma) -> u64 {
             VmaProt::ReadWrite => mm::USER_RW_FLAGS,
             VmaProt::ReadExec => mm::USER_RWX_FLAGS, // RX needs execute (no UXN)
             VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
+            VmaProt::None => 0,
         }
     }
     #[cfg(target_arch = "riscv64")]
@@ -193,6 +194,7 @@ fn pte_flags_for_vma(vma: &super::vma::Vma) -> u64 {
             VmaProt::ReadWrite => mm::USER_RW_FLAGS,
             VmaProt::ReadExec => mm::USER_RWX_FLAGS,
             VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
+            VmaProt::None => 0,
         }
     }
     #[cfg(target_arch = "x86_64")]
@@ -203,6 +205,7 @@ fn pte_flags_for_vma(vma: &super::vma::Vma) -> u64 {
             VmaProt::ReadWrite => mm::USER_RW_FLAGS,
             VmaProt::ReadExec => mm::USER_RWX_FLAGS,
             VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
+            VmaProt::None => 0,
         }
     }
 }

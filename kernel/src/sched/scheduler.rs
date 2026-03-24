@@ -1074,6 +1074,7 @@ pub fn current_page_table_root() -> usize {
 pub fn tick(current_sp: u64) -> u64 {
     check_sleep_timers();
     check_alarm_timers();
+    check_interval_timers();
     SCHEDULER.lock().try_switch(current_sp)
 }
 
@@ -2395,6 +2396,44 @@ fn check_alarm_timers() {
 
     for i in 0..count {
         send_signal_to_task(fired[i], super::task::SIGALRM);
+    }
+}
+
+/// Check per-thread interval timers and deliver signals when they fire.
+fn check_interval_timers() {
+    let now_ns = get_monotonic_ns();
+    let mut fired_tid: ThreadId = 0;
+    let mut fired_sig: u32 = 0;
+    let mut fired_interval: u64 = 0;
+    let mut found = false;
+
+    {
+        let mut sched = SCHEDULER.lock();
+        for i in 0..sched.threads.len() {
+            let t = &sched.threads[i];
+            if t.state != ThreadState::Dead
+                && t.stack_base != 0
+                && t.timer_signal != 0
+                && t.timer_next_ns != 0
+                && now_ns >= t.timer_next_ns
+            {
+                fired_tid = t.id;
+                fired_sig = t.timer_signal;
+                fired_interval = t.timer_interval_ns;
+                // Re-arm the timer while we hold the lock.
+                sched.threads[i].timer_next_ns = if fired_interval != 0 {
+                    now_ns + fired_interval
+                } else {
+                    0
+                };
+                found = true;
+                break; // Only fire one per tick to avoid re-lock issues.
+            }
+        }
+    }
+
+    if found {
+        send_signal_to_thread(fired_tid, fired_sig);
     }
 }
 

@@ -45,13 +45,34 @@
 #define SYS_SETUID          79
 #define SYS_SETGID          80
 #define SYS_SETGROUPS       81
+#define SYS_MPROTECT        60
+#define SYS_THREAD_CREATE   30
+#define SYS_THREAD_JOIN     31
+#define SYS_FUTEX_WAIT      32
+#define SYS_FUTEX_WAKE      33
+#define SYS_MADVISE         90
+#define SYS_TLS_SET         91
+#define SYS_TLS_GET         92
+#define SYS_PORT_SET_RECV_TIMEOUT 93
+#define SYS_TIMER_CREATE    94
+#define SYS_MMAP_GUARD      95
+#define SYS_PORT_SET_CREATE 5
+#define SYS_PORT_SET_ADD    6
+#define SYS_PORT_SET_RECV   22
 
-/* Raw syscall stubs (defined in arch/x86_64/syscall.S). */
+/* Raw syscall stubs (defined in arch/<ARCH>/syscall.S). */
 uint64_t __telix_syscall0(uint64_t nr);
 uint64_t __telix_syscall1(uint64_t nr, uint64_t a0);
 uint64_t __telix_syscall2(uint64_t nr, uint64_t a0, uint64_t a1);
 uint64_t __telix_syscall3(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2);
+uint64_t __telix_syscall4(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
+                           uint64_t a3);
 uint64_t __telix_syscall6(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
                            uint64_t a3, uint64_t a4, uint64_t a5);
+
+/* Convenience: clock_gettime returns nanoseconds since boot. */
+static inline uint64_t __telix_clock_gettime(void) {
+    return __telix_syscall0(SYS_CLOCK_GETTIME);
+}
 
 #endif /* TELIX_SYSCALL_H */
