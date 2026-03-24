@@ -2758,7 +2758,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             if phase45_ok {
                 // Create a file-backed mapping: 2 allocation pages, RW, file_handle=0x42, offset=0.
-                let mapped_va = syscall::mmap_file(0, 2, 1, 0x42, 0);
+                let mapped_va = syscall::mmap_file(0, 2, 1, 0x42, 0, 0);
                 match mapped_va {
                     Some(va) => {
                         // Touch several locations to trigger page faults.

@@ -86,17 +86,40 @@ pub fn record_fault(info: PagerFaultInfo) -> Option<u32> {
     None
 }
 
-/// Park the faulting thread and wake the pager thread for this aspace.
+/// IPC tag for pager fault notifications sent to object ports.
+pub const PAGER_FAULT_REQ: u64 = 0x8000;
+
+/// Park the faulting thread and notify the pager.
 /// Called from the arch exception handler AFTER handle_page_fault returns
 /// (no aspace lock held). Must be called after store_frame_sp().
+///
+/// Dual dispatch: sends an IPC message to the object's port (for external
+/// pagers using recv) AND wakes a per-aspace waiter (for same-process
+/// pagers using wait_fault). Both paths coexist harmlessly.
 pub fn initiate_fault(token: u32) {
-    let (aspace_id, fault_va, file_handle, file_offset) = {
+    let (aspace_id, obj_id, fault_va, file_handle, file_offset) = {
         let faults = PAGER_FAULTS.lock();
         let e = &faults[token as usize];
-        (e.aspace_id, e.fault_va, e.file_handle, e.file_offset)
+        (e.aspace_id, e.obj_id, e.fault_va, e.file_handle, e.file_offset)
     };
 
-    // Check if a pager thread is waiting and wake it.
+    // Path 1: Send fault notification IPC to the object's port.
+    // External pagers hold RECV on this port and get the notification.
+    let obj_port = super::object::object_port(obj_id);
+    if obj_port != 0 {
+        let msg = crate::ipc::Message::new(PAGER_FAULT_REQ, [
+            token as u64,
+            fault_va as u64,
+            file_handle as u64,
+            file_offset,
+            PAGE_SIZE as u64,
+            0,
+        ]);
+        // Kernel-initiated send — bypasses cap checks.
+        let _ = crate::ipc::port::send_nb(obj_port, msg);
+    }
+
+    // Path 2: Wake per-aspace pager waiter (backward compat with wait_fault).
     let slot = (aspace_id as usize) % MAX_ASPACES;
     let pager_tid = {
         let mut waiters = PAGER_WAITERS.lock();
@@ -107,7 +130,6 @@ pub fn initiate_fault(token: u32) {
         tid
     };
     if pager_tid != 0 {
-        // Inject fault info into the pager's saved frame (like IPC recv injection).
         inject_fault_into_frame(pager_tid, token, fault_va, file_handle, file_offset);
         scheduler::wake_parked_thread(pager_tid);
     }

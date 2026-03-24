@@ -210,14 +210,17 @@ fn object_port_handler(_port_id: PortId, user_data: usize, msg: &crate::ipc::Mes
 }
 
 /// Create a new pager-backed memory object.
-/// Returns the object ID.
+/// Returns the object ID. The object gets a normal (non-kernel-held) port
+/// so that an external pager can hold the receive right and get fault
+/// notifications via IPC.
 pub fn create_pager(page_count: u16, file_handle: u32, file_base_offset: u64) -> Option<ObjectId> {
     let slot = claim_free_slot()?;
     let pages = match PageVec::with_capacity(page_count as usize) {
         Some(p) => p,
         None => { release_slot(slot); return None; }
     };
-    let port = match port::create_kernel_port(object_port_handler, slot) {
+    // Normal port (not kernel-held) — pager task holds RECV right.
+    let port = match port::create() {
         Some(p) => p,
         None => { release_slot(slot); return None; }
     };
@@ -356,8 +359,7 @@ where
     f(&mut obj)
 }
 
-/// Get the kernel port ID for an object.
-#[allow(dead_code)]
+/// Get the port ID for an object.
 pub fn object_port(id: ObjectId) -> PortId {
     OBJECTS[id as usize].port_id.load(Ordering::Acquire)
 }

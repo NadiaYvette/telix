@@ -879,13 +879,12 @@ const SYS_PROC_LIST: u64 = 88;
 const SYS_PROC_INFO: u64 = 89;
 
 /// Map a file-backed region via the pager mechanism.
+/// `pager_task` is the task ID of the external pager (0 = same-process pager).
 /// Returns the VA on success, or None on failure.
-pub fn mmap_file(va: usize, pages: usize, prot: u8, file_handle: u32, file_offset: u64) -> Option<usize> {
-    let lo = file_offset & 0xFFFF_FFFF;
-    let hi = file_offset >> 32;
+pub fn mmap_file(va: usize, pages: usize, prot: u8, file_handle: u32, file_offset: u64, pager_task: u32) -> Option<usize> {
     let r = unsafe {
         arch::syscall6(SYS_MMAP_FILE, va as u64, pages as u64, prot as u64,
-                       file_handle as u64, lo, hi)
+                       file_handle as u64, file_offset, pager_task as u64)
     };
     if r == u64::MAX { None } else { Some(r as usize) }
 }

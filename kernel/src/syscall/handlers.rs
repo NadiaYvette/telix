@@ -1934,7 +1934,7 @@ fn sys_nanosleep(ns: u64) -> u64 {
     0
 }
 
-fn sys_mmap_file(va_hint: u64, page_count: u64, prot: u64, file_handle: u64, file_offset_lo: u64, file_offset_hi: u64) -> u64 {
+fn sys_mmap_file(va_hint: u64, page_count: u64, prot: u64, file_handle: u64, file_offset: u64, pager_task: u64) -> u64 {
     use crate::mm::page::PAGE_SIZE;
     use crate::mm::vma::VmaProt;
 
@@ -1952,8 +1952,6 @@ fn sys_mmap_file(va_hint: u64, page_count: u64, prot: u64, file_handle: u64, fil
         _ => return u64::MAX,
     };
 
-    let file_offset = file_offset_lo | (file_offset_hi << 32);
-
     // Determine VA.
     let va = if va_hint == 0 {
         crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(pages))
@@ -1961,11 +1959,26 @@ fn sys_mmap_file(va_hint: u64, page_count: u64, prot: u64, file_handle: u64, fil
         va_hint as usize
     };
 
-    // Create pager-backed object.
+    // Create pager-backed object (gets a normal port for fault IPC).
     let obj_id = match crate::mm::object::create_pager(pages as u16, file_handle as u32, file_offset) {
         Some(id) => id,
         None => return u64::MAX,
     };
+
+    // Grant RECV+SEND on the object port to the pager task.
+    let obj_port = crate::mm::object::object_port(obj_id);
+    if obj_port != 0 {
+        let task_id = crate::sched::current_task_id();
+        let rights = crate::cap::Rights::SEND.union(crate::cap::Rights::RECV);
+        // Grant to calling task (same-process pagers).
+        let mut caps = crate::cap::CAP_SYSTEM.lock();
+        caps.grant_port_cap(task_id, obj_port, rights);
+        // Grant to specified external pager task if different.
+        let pager = pager_task as u32;
+        if pager != 0 && pager != task_id {
+            caps.grant_port_cap(pager, obj_port, rights);
+        }
+    }
 
     // Register mapping and insert VMA.
     let ok = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
