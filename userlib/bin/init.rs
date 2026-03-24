@@ -678,6 +678,28 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"Phase 12 virtio-net ping: SKIPPED\n");
     }
 
+    // Spawn sshd + getty_login early (after console_srv + net_srv are up).
+    // These run concurrently with remaining test phases.
+    syscall::debug_puts(b"  init: spawning sshd...\n");
+    let sshd_tid = syscall::spawn(b"sshd", 50);
+    if sshd_tid != u64::MAX {
+        syscall::debug_puts(b"  init: sshd started (tid=");
+        print_num(sshd_tid);
+        syscall::debug_puts(b")\n");
+    } else {
+        syscall::debug_puts(b"  init: WARN: failed to spawn sshd\n");
+    }
+
+    syscall::debug_puts(b"  init: spawning getty_login...\n");
+    let getty_tid = syscall::spawn(b"getty_login", 50);
+    if getty_tid != u64::MAX {
+        syscall::debug_puts(b"  init: getty_login started (tid=");
+        print_num(getty_tid);
+        syscall::debug_puts(b")\n");
+    } else {
+        syscall::debug_puts(b"  init: WARN: failed to spawn getty_login\n");
+    }
+
     // --- Test 13: Execute ELF from FAT16 filesystem ---
     syscall::debug_puts(b"  init: testing exec from filesystem...\n");
 
@@ -7192,19 +7214,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    // Spawn sshd (SSH server on port 22).
-    syscall::debug_puts(b"  init: spawning sshd...\n");
-    let sshd_tid = syscall::spawn(b"sshd", 50);
-    if sshd_tid != u64::MAX {
-        syscall::debug_puts(b"  init: sshd started (tid=");
-        print_num(sshd_tid);
-        syscall::debug_puts(b")\n");
-    } else {
-        syscall::debug_puts(b"  init: WARN: failed to spawn sshd\n");
-    }
-
-    // Init loops forever, yielding.
+    // Init loops forever, reaping children and respawning getty_login.
     loop {
+        if getty_tid != u64::MAX {
+            if let Some(_code) = syscall::waitpid(getty_tid) {
+                syscall::debug_puts(b"  init: respawning getty_login\n");
+                let _new = syscall::spawn(b"getty_login", 50);
+            }
+        }
         syscall::yield_now();
     }
 }
