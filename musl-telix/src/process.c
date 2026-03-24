@@ -12,10 +12,10 @@ pid_t fork(void) {
 }
 
 int execve(const char *name, char *const argv[], char *const envp[]) {
-    (void)argv; (void)envp;
-    /* Telix execve takes name pointer and length. */
+    /* Telix execve: a0=name_ptr, a1=name_len, a2=argv, a3=envp. */
     size_t len = strlen(name);
-    uint64_t result = __telix_syscall2(SYS_EXECVE, (uint64_t)name, len);
+    uint64_t result = __telix_syscall6(SYS_EXECVE, (uint64_t)name, len,
+                                        (uint64_t)argv, (uint64_t)envp, 0, 0);
     /* execve only returns on failure. */
     (void)result;
     return -1;

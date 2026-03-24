@@ -207,7 +207,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SPAWN => sys_spawn(a0, a1, a2, a3),
         SYS_DEBUG_PUTS => sys_debug_puts(a0, a1),
         SYS_WAITPID => sys_waitpid(a0),
-        SYS_MMAP_ANON => sys_mmap_anon(a0, a1, a2),
+        SYS_MMAP_ANON => sys_mmap_anon(a0, a1, a2, a3),
         SYS_MUNMAP => sys_munmap(a0),
         SYS_GRANT_PAGES => sys_grant_pages(a0, a1, a2, a3, a4),
         SYS_REVOKE => sys_revoke(a0, a1),
@@ -708,7 +708,7 @@ fn sys_debug_puts(buf_ptr: u64, buf_len: u64) -> u64 {
     0
 }
 
-fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64) -> u64 {
+fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     use crate::mm::page::{PAGE_SIZE, MMUPAGE_SIZE, PAGE_MMUCOUNT};
     use crate::mm::vma::VmaProt;
 
@@ -721,6 +721,8 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64) -> u64 {
     if pages == 0 || pages > 256 {
         return u64::MAX;
     }
+
+    let noreplace = flags & crate::mm::aspace::MAP_FIXED_NOREPLACE != 0;
 
     // Check page quota and RLIMIT_AS.
     let task_id = crate::sched::current_task_id();
@@ -755,6 +757,16 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64) -> u64 {
     } else {
         va_hint as usize
     };
+
+    // MAP_FIXED_NOREPLACE: fail if overlapping existing VMA.
+    if noreplace {
+        let overlaps = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+            aspace.overlaps_vma(va, pages * PAGE_SIZE)
+        });
+        if overlaps {
+            return u64::MAX;
+        }
+    }
 
     // Create VMA + backing object.
     let obj_id = match crate::mm::aspace::with_aspace(aspace_id, |aspace| {
@@ -1112,6 +1124,10 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         return;
     }
 
+    // Read argv_ptr and envp_ptr from a2/a3 (may be 0 for backward compat).
+    let argv_ptr = syscall_arg(frame, 2) as usize;
+    let envp_ptr = syscall_arg(frame, 3) as usize;
+
     // Copy filename from user memory.
     let len = (name_len as usize).min(64);
     let mut name_buf = [0u8; 64];
@@ -1120,6 +1136,57 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         return;
     }
     let name = &name_buf[..len];
+
+    // Copy argv and envp strings from user memory (before point-of-no-return).
+    // Max 16 args, 64 bytes each. Store as flat buffer + lengths.
+    const MAX_ARGS: usize = 16;
+    const MAX_STR: usize = 64;
+    let mut argv_strs = [[0u8; MAX_STR]; MAX_ARGS];
+    let mut argv_lens = [0usize; MAX_ARGS];
+    let mut argc: usize = 0;
+    let mut envp_strs = [[0u8; MAX_STR]; MAX_ARGS];
+    let mut envp_lens = [0usize; MAX_ARGS];
+    let mut envc: usize = 0;
+
+    if argv_ptr != 0 {
+        for i in 0..MAX_ARGS {
+            let mut ptr_val = [0u8; 8];
+            if !copy_from_user(pt_root, argv_ptr + i * 8, &mut ptr_val) {
+                break;
+            }
+            let str_ptr = u64::from_le_bytes(ptr_val) as usize;
+            if str_ptr == 0 { break; }
+            // Copy up to MAX_STR bytes of the string.
+            let mut buf = [0u8; MAX_STR];
+            if !copy_from_user(pt_root, str_ptr, &mut buf) {
+                break;
+            }
+            // Find null terminator.
+            let slen = buf.iter().position(|&b| b == 0).unwrap_or(MAX_STR);
+            argv_strs[i][..slen].copy_from_slice(&buf[..slen]);
+            argv_lens[i] = slen;
+            argc = i + 1;
+        }
+    }
+
+    if envp_ptr != 0 {
+        for i in 0..MAX_ARGS {
+            let mut ptr_val = [0u8; 8];
+            if !copy_from_user(pt_root, envp_ptr + i * 8, &mut ptr_val) {
+                break;
+            }
+            let str_ptr = u64::from_le_bytes(ptr_val) as usize;
+            if str_ptr == 0 { break; }
+            let mut buf = [0u8; MAX_STR];
+            if !copy_from_user(pt_root, str_ptr, &mut buf) {
+                break;
+            }
+            let slen = buf.iter().position(|&b| b == 0).unwrap_or(MAX_STR);
+            envp_strs[i][..slen].copy_from_slice(&buf[..slen]);
+            envp_lens[i] = slen;
+            envc = i + 1;
+        }
+    }
 
     // Look up the ELF in initramfs (before point-of-no-return).
     let elf_data = match crate::io::initramfs::lookup_file(name) {
@@ -1164,13 +1231,46 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     crate::arch::x86_64::mm::switch_page_table(new_pt_root);
 
     // Load ELF segments into the fresh address space.
-    let entry = match crate::loader::elf::load_elf(elf_data, aspace_id, new_pt_root) {
+    let elf_info = match crate::loader::elf::load_elf(elf_data, aspace_id, new_pt_root) {
         Ok(e) => e,
         Err(_) => {
             // Past point-of-no-return, can't recover — exit.
             crate::println!("execve: ELF load failed for {:?}", core::str::from_utf8(name));
             crate::sched::scheduler::exit_current_thread(-1);
         }
+    };
+
+    // Phase 66: If PT_INTERP is present, load the interpreter ELF and
+    // redirect entry to the interpreter. Pass AT_BASE and AT_ENTRY in auxv.
+    let (entry, interp_base) = if elf_info.interp_len > 0 {
+        // Look up interpreter in initramfs (strip leading "/" if present).
+        let iname = &elf_info.interp[..elf_info.interp_len];
+        let iname = if iname.first() == Some(&b'/') { &iname[1..] } else { iname };
+
+        match crate::io::initramfs::lookup_file(iname) {
+            Some(interp_data) => {
+                // Load interpreter at a high base address (0x4_0000_0000).
+                // For ET_DYN interpreters, we need to add base offset.
+                const INTERP_BASE: usize = 0x4_0000_0000;
+
+                match crate::loader::elf::load_elf_at_base(interp_data, aspace_id, new_pt_root, INTERP_BASE) {
+                    Ok(interp_info) => {
+                        // Entry goes to interpreter; AT_ENTRY = original program entry.
+                        (interp_info.entry, INTERP_BASE)
+                    }
+                    Err(_) => {
+                        crate::println!("execve: interpreter load failed");
+                        (elf_info.entry, 0usize)
+                    }
+                }
+            }
+            None => {
+                crate::println!("execve: interpreter {:?} not found", core::str::from_utf8(iname));
+                (elf_info.entry, 0usize)
+            }
+        }
+    } else {
+        (elf_info.entry, 0usize)
     };
 
     // Flush instruction cache.
@@ -1191,7 +1291,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     #[cfg(target_arch = "x86_64")]
     const USER_STACK_TOP: usize = 0x7FFF_FFFF_0000;
 
-    let stack_pages = 1;
+    let stack_pages = 2; // 2 pages for stack (need room for argv/envp/auxv strings)
     let stack_va = USER_STACK_TOP - stack_pages * PAGE_SIZE;
 
     let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
@@ -1243,6 +1343,115 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         });
     }
 
+    // Build the stack layout with argc/argv/envp/auxv.
+    // Layout (growing downward from USER_STACK_TOP):
+    //   [strings area] — argv and envp string data (near top)
+    //   [padding to 16-byte align]
+    //   AT_NULL, 0
+    //   auxv pairs...
+    //   NULL (end of envp)
+    //   envp[envc-1] pointer
+    //   ...
+    //   envp[0] pointer
+    //   NULL (end of argv)
+    //   argv[argc-1] pointer
+    //   ...
+    //   argv[0] pointer
+    //   argc            <-- sp points here
+
+    // Write strings to top of stack, building pointer table.
+    let mut str_pos = USER_STACK_TOP; // grows downward
+    let mut argv_addrs = [0usize; MAX_ARGS];
+    let mut envp_addrs = [0usize; MAX_ARGS];
+
+    // Write argv strings (from top down).
+    for i in 0..argc {
+        let slen = argv_lens[i] + 1; // include null terminator
+        str_pos -= slen;
+        argv_addrs[i] = str_pos;
+        copy_to_user(new_pt_root, str_pos, &argv_strs[i][..argv_lens[i]]);
+        // null terminator is already there (stack was zeroed)
+    }
+
+    // Write envp strings.
+    for i in 0..envc {
+        let slen = envp_lens[i] + 1;
+        str_pos -= slen;
+        envp_addrs[i] = str_pos;
+        copy_to_user(new_pt_root, str_pos, &envp_strs[i][..envp_lens[i]]);
+    }
+
+    // Align str_pos down to 16 bytes.
+    str_pos &= !15;
+
+    // Auxv entries (6 pairs + AT_NULL = 7 pairs = 14 u64s).
+    const AT_NULL: u64 = 0;
+    const AT_PHDR: u64 = 3;
+    const AT_PHENT: u64 = 4;
+    const AT_PHNUM: u64 = 5;
+    const AT_PAGESZ: u64 = 6;
+    const AT_BASE: u64 = 7;
+    const AT_ENTRY: u64 = 9;
+
+    let auxv: [(u64, u64); 7] = [
+        (AT_PHDR, elf_info.phdr_vaddr as u64),
+        (AT_PHENT, elf_info.phentsize as u64),
+        (AT_PHNUM, elf_info.phnum as u64),
+        (AT_PAGESZ, PAGE_SIZE as u64),
+        (AT_ENTRY, elf_info.entry as u64),
+        (AT_BASE, interp_base as u64),
+        (AT_NULL, 0),
+    ];
+
+    // Calculate total size of pointer table below strings.
+    // Layout: argc(8) + argv ptrs(argc*8) + NULL(8) + envp ptrs(envc*8) + NULL(8) + auxv(14*8)
+    let table_words = 1 + argc + 1 + envc + 1 + auxv.len() * 2;
+    let table_size = table_words * 8;
+
+    // sp = str_pos - table_size, aligned to 16.
+    let sp = (str_pos - table_size) & !15;
+
+    // Write the table via copy_to_user.
+    let mut pos = sp;
+
+    // argc
+    let argc_bytes = (argc as u64).to_le_bytes();
+    copy_to_user(new_pt_root, pos, &argc_bytes);
+    pos += 8;
+
+    // argv pointers
+    for i in 0..argc {
+        let ptr_bytes = (argv_addrs[i] as u64).to_le_bytes();
+        copy_to_user(new_pt_root, pos, &ptr_bytes);
+        pos += 8;
+    }
+    // argv NULL terminator
+    copy_to_user(new_pt_root, pos, &0u64.to_le_bytes());
+    pos += 8;
+
+    // envp pointers
+    for i in 0..envc {
+        let ptr_bytes = (envp_addrs[i] as u64).to_le_bytes();
+        copy_to_user(new_pt_root, pos, &ptr_bytes);
+        pos += 8;
+    }
+    // envp NULL terminator
+    copy_to_user(new_pt_root, pos, &0u64.to_le_bytes());
+    pos += 8;
+
+    // auxv pairs
+    for &(key, val) in &auxv {
+        copy_to_user(new_pt_root, pos, &key.to_le_bytes());
+        pos += 8;
+        copy_to_user(new_pt_root, pos, &val.to_le_bytes());
+        pos += 8;
+    }
+
+    // argv pointer (for register passing) = sp + 8
+    let argv_base = sp + 8;
+    // envp pointer = sp + 8 + (argc + 1) * 8
+    let envp_base = sp + 8 + (argc + 1) * 8;
+
     // Rewrite the exception frame for the new program.
     unsafe {
         let frame_ptr = frame as *mut ExceptionFrame as *mut u64;
@@ -1253,16 +1462,22 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
 
         #[cfg(target_arch = "aarch64")]
         {
-            *frame_ptr.add(32) = entry as u64;          // ELR_EL1
-            *frame_ptr.add(33) = 0x0;                   // SPSR_EL1 = EL0t
-            *frame_ptr.add(31) = USER_STACK_TOP as u64; // SP_EL0
+            *frame_ptr.add(32) = entry as u64;   // ELR_EL1
+            *frame_ptr.add(33) = 0x0;            // SPSR_EL1 = EL0t
+            *frame_ptr.add(31) = sp as u64;      // SP_EL0
+            *frame_ptr.add(0) = argc as u64;     // x0 = argc
+            *frame_ptr.add(1) = argv_base as u64; // x1 = argv
+            *frame_ptr.add(2) = envp_base as u64; // x2 = envp
         }
 
         #[cfg(target_arch = "riscv64")]
         {
-            *frame_ptr.add(31) = entry as u64;           // sepc
-            *frame_ptr.add(32) = 1 << 5;                 // sstatus: SPIE=1, SPP=0
-            *frame_ptr.add(1) = USER_STACK_TOP as u64;   // sp (x2)
+            *frame_ptr.add(31) = entry as u64;    // sepc
+            *frame_ptr.add(32) = 1 << 5;          // sstatus: SPIE=1, SPP=0
+            *frame_ptr.add(1) = sp as u64;        // sp (x2)
+            *frame_ptr.add(9) = argc as u64;      // a0 = argc
+            *frame_ptr.add(10) = argv_base as u64; // a1 = argv
+            *frame_ptr.add(11) = envp_base as u64; // a2 = envp
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -1270,12 +1485,13 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
             *frame_ptr.add(17) = entry as u64;                                              // RIP
             *frame_ptr.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3;           // CS
             *frame_ptr.add(19) = 0x200;                                                      // RFLAGS = IF
-            *frame_ptr.add(20) = USER_STACK_TOP as u64;                                      // RSP
+            *frame_ptr.add(20) = sp as u64;                                                   // RSP
             *frame_ptr.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3;           // SS
+            // x86-64: rdi=argc, rsi=argv, rdx=envp
+            frame.set_rdi(argc as u64);
+            frame.set_rsi(argv_base as u64);
+            frame.set_rdx(envp_base as u64);
         }
-
-        // arg0 = 0 (no argument for execve'd process)
-        // (registers were zeroed above, so arg0 is already 0)
     }
 
     // Flush icache again after frame rewrite, and add DSB to ensure

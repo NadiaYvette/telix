@@ -118,3 +118,11 @@ path = "bin/pipe_srv.rs"
 [[bin]]
 name = "pty_srv"
 path = "bin/pty_srv.rs"
+
+[[bin]]
+name = "event_srv"
+path = "bin/event_srv.rs"
+
+[[bin]]
+name = "inotify_srv"
+path = "bin/inotify_srv.rs"

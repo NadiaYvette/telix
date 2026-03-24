@@ -104,4 +104,11 @@ link_binary "$OUTDIR/getty_login" $COMMON_OBJS "$OUTDIR/getty_login.o"
 SIZE=$(wc -c < "$OUTDIR/getty_login")
 echo "  getty_login: $SIZE bytes"
 
+# Build ld-telix (dynamic linker — built as regular static binary,
+# kernel loads it at INTERP_BASE via load_elf_at_base).
+$CC $CFLAGS -c "$MUSL/test/ld-telix.c" -o "$OUTDIR/ld-telix.o"
+link_binary "$OUTDIR/ld-telix" $COMMON_OBJS "$OUTDIR/ld-telix.o"
+SIZE=$(wc -c < "$OUTDIR/ld-telix")
+echo "  ld-telix: $SIZE bytes"
+
 echo "Done."

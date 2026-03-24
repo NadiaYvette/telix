@@ -1,4 +1,5 @@
-/* Phase 52 test: C program that writes to stdout via CON_WRITE IPC. */
+/* Phase 52 test: C program that writes to stdout via CON_WRITE IPC.
+ * Phase 67: also tests argc/argv passing — exits with argc as status. */
 #include <stdint.h>
 
 /* Provided by musl-telix. */
@@ -13,9 +14,10 @@ static int my_strlen(const char *s) {
     return n;
 }
 
-int main(uint64_t arg0, uint64_t arg1, uint64_t arg2) {
-    (void)arg0; (void)arg1; (void)arg2;
+int main(int argc, char **argv, char **envp) {
+    (void)argv; (void)envp;
     const char *msg = "Hello from C on Telix!\n";
     write(1, msg, my_strlen(msg));
-    return 0;
+    /* Exit with argc so the parent can verify argv was passed. */
+    return argc;
 }

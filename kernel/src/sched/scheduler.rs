@@ -420,10 +420,11 @@ impl Scheduler {
         }
 
         // Load ELF segments into the address space.
-        let entry = match crate::loader::elf::load_elf(elf_data, aspace_id, pt_root) {
+        let elf_info = match crate::loader::elf::load_elf(elf_data, aspace_id, pt_root) {
             Ok(e) => e,
             Err(_) => return None,
         };
+        let entry = elf_info.entry;
         // Flush instruction cache: code was written via identity-mapped VA
         // but will be executed via user VA.
         #[cfg(target_arch = "aarch64")]

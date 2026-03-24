@@ -49,6 +49,28 @@ const ERR_INVALID: u64 = 3;
 const ERR_FULL: u64 = 4;
 const ERR_IO: u64 = 5;
 
+// Inotify notification tag.
+const IN_NOTIFY: u64 = 0x7160;
+const IN_EVT_OPEN: u64 = 0x020;
+
+/// Inotify server port (looked up lazily, 0xFFFFFFFF = not found yet).
+static mut INOTIFY_PORT: u32 = 0xFFFFFFFF;
+
+fn notify_inotify(event_mask: u64, path_w0: u64, path_w1: u64) {
+    let port = unsafe { INOTIFY_PORT };
+    if port == 0xFFFFFFFF {
+        // Try to look up.
+        let p = match syscall::ns_lookup(b"inotify") {
+            Some(p) => p,
+            None => return,
+        };
+        unsafe { INOTIFY_PORT = p; }
+        syscall::send_nb_4(p, IN_NOTIFY, event_mask, path_w0, path_w1, 0);
+    } else {
+        syscall::send_nb_4(port, IN_NOTIFY, event_mask, path_w0, path_w1, 0);
+    }
+}
+
 const MAX_MOUNTS: usize = 8;
 const MAX_PATH: usize = 16; // fits in 2 data words
 
@@ -320,6 +342,8 @@ fn handle_open(data: &[u64; 6]) {
                 syscall::send(reply_port, VFS_OPEN_OK,
                     fs_port as u64, handle, size, fs_aspace);
             }
+            // Notify inotify server of file open.
+            notify_inotify(IN_EVT_OPEN, data[0], data[1]);
         } else {
             if reply_port != 0 {
                 syscall::send(reply_port, VFS_ERROR,

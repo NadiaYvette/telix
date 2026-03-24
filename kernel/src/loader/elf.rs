@@ -14,6 +14,8 @@ const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3; // PIE executables (x86-64 default)
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
+const PT_PHDR: u32 = 6;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 #[allow(dead_code)]
@@ -74,13 +76,25 @@ pub enum ElfError {
     AllocFailed,
 }
 
+/// Information returned by ELF loader for auxv construction.
+#[derive(Debug, Clone, Copy)]
+pub struct ElfInfo {
+    pub entry: usize,
+    pub phdr_vaddr: usize,
+    pub phentsize: usize,
+    pub phnum: usize,
+    /// Interpreter path from PT_INTERP (null-terminated, 0 length if none).
+    pub interp: [u8; 64],
+    pub interp_len: usize,
+}
+
 /// Load an ELF64 binary into the given address space.
-/// Returns the entry point virtual address on success.
+/// Returns ElfInfo with entry point, phdr location, and program header details.
 pub fn load_elf(
     data: &[u8],
     aspace_id: ASpaceId,
     pt_root: usize,
-) -> Result<usize, ElfError> {
+) -> Result<ElfInfo, ElfError> {
     if data.len() < 64 {
         return Err(ElfError::TooSmall);
     }
@@ -113,6 +127,38 @@ pub fn load_elf(
         return Err(ElfError::BadPhdr);
     }
 
+    // Find PT_PHDR, PT_INTERP, and compute phdr_vaddr.
+    let mut phdr_vaddr: usize = 0;
+    let mut interp = [0u8; 64];
+    let mut interp_len: usize = 0;
+    for i in 0..phnum {
+        let off = phoff + i * phentsize;
+        if off + 56 > data.len() { break; }
+        let phdr = unsafe {
+            core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr)
+        };
+        if phdr.p_type == PT_PHDR {
+            phdr_vaddr = phdr.p_vaddr as usize;
+        }
+        if phdr.p_type == PT_INTERP {
+            // Extract interpreter path from file data.
+            let ioff = phdr.p_offset as usize;
+            let ilen = (phdr.p_filesz as usize).min(63);
+            if ioff + ilen <= data.len() {
+                interp[..ilen].copy_from_slice(&data[ioff..ioff + ilen]);
+                // Strip null terminator if present.
+                interp_len = if ilen > 0 && interp[ilen - 1] == 0 { ilen - 1 } else { ilen };
+            }
+        }
+        // Fallback: if first PT_LOAD contains the phdrs, compute from file offset.
+        if phdr.p_type == PT_LOAD && phdr_vaddr == 0
+            && phdr.p_offset as usize <= phoff
+            && (phdr.p_offset as usize + phdr.p_filesz as usize) >= phoff + phnum * phentsize
+        {
+            phdr_vaddr = phdr.p_vaddr as usize + (phoff - phdr.p_offset as usize);
+        }
+    }
+
     // Process each PT_LOAD segment.
     for i in 0..phnum {
         let off = phoff + i * phentsize;
@@ -133,7 +179,81 @@ pub fn load_elf(
         load_segment(data, &phdr, aspace_id, pt_root)?;
     }
 
-    Ok(ehdr.e_entry as usize)
+    Ok(ElfInfo {
+        entry: ehdr.e_entry as usize,
+        phdr_vaddr,
+        phentsize,
+        phnum,
+        interp,
+        interp_len,
+    })
+}
+
+/// Load an ET_DYN ELF at a given base address (for dynamic linker loading).
+/// All PT_LOAD segment vaddrs are offset by `base`.
+pub fn load_elf_at_base(
+    data: &[u8],
+    aspace_id: ASpaceId,
+    pt_root: usize,
+    base: usize,
+) -> Result<ElfInfo, ElfError> {
+    if data.len() < 64 {
+        return Err(ElfError::TooSmall);
+    }
+
+    let ehdr = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const Elf64Ehdr) };
+
+    if ehdr.e_ident[0..4] != ELF_MAGIC { return Err(ElfError::BadMagic); }
+    if ehdr.e_ident[4] != ELFCLASS64 { return Err(ElfError::BadClass); }
+    if ehdr.e_ident[5] != ELFDATA2LSB { return Err(ElfError::BadEndian); }
+    if ehdr.e_type != ET_DYN && ehdr.e_type != ET_EXEC { return Err(ElfError::BadType); }
+    if ehdr.e_machine != EM_EXPECTED { return Err(ElfError::BadMachine); }
+
+    let phoff = ehdr.e_phoff as usize;
+    let phentsize = ehdr.e_phentsize as usize;
+    let phnum = ehdr.e_phnum as usize;
+
+    if phentsize < 56 { return Err(ElfError::BadPhdr); }
+
+    // For ET_DYN, find the lowest vaddr to compute the actual base offset.
+    let mut min_vaddr: usize = usize::MAX;
+    for i in 0..phnum {
+        let off = phoff + i * phentsize;
+        if off + 56 > data.len() { break; }
+        let phdr = unsafe {
+            core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr)
+        };
+        if phdr.p_type == PT_LOAD && (phdr.p_vaddr as usize) < min_vaddr {
+            min_vaddr = phdr.p_vaddr as usize;
+        }
+    }
+    if min_vaddr == usize::MAX { min_vaddr = 0; }
+    let offset = base.wrapping_sub(min_vaddr);
+
+    for i in 0..phnum {
+        let off = phoff + i * phentsize;
+        if off + 56 > data.len() { return Err(ElfError::BadPhdr); }
+        let mut phdr = unsafe {
+            core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr)
+        };
+
+        if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
+            continue;
+        }
+
+        // Offset the vaddr by base.
+        phdr.p_vaddr += offset as u64;
+        load_segment(data, &phdr, aspace_id, pt_root)?;
+    }
+
+    Ok(ElfInfo {
+        entry: (ehdr.e_entry as usize).wrapping_add(offset),
+        phdr_vaddr: base + phoff, // approximate
+        phentsize,
+        phnum,
+        interp: [0; 64],
+        interp_len: 0,
+    })
 }
 
 fn load_segment(

@@ -17,6 +17,19 @@ pub type ASpaceId = u32;
 /// Heap VA base: 8 GiB (above ELF load at 4 GiB, below stack).
 pub const HEAP_VA_BASE: usize = 0x2_0000_0000;
 
+/// MAP_FIXED_NOREPLACE: fail instead of replacing existing mappings.
+pub const MAP_FIXED_NOREPLACE: u64 = 0x100000;
+
+/// Simple xorshift64 PRNG for ASLR.
+fn xorshift64(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
 /// An address space.
 pub struct AddressSpace {
     /// Physical address of the page table root (L0/PML4/root table).
@@ -31,6 +44,8 @@ pub struct AddressSpace {
     pub id: ASpaceId,
     /// Bump pointer for heap VA allocation.
     pub heap_next: usize,
+    /// PRNG state for ASLR.
+    pub prng_state: u64,
 }
 
 impl AddressSpace {
@@ -42,6 +57,7 @@ impl AddressSpace {
             clock_hand: VmaCursor::new(),
             id: 0,
             heap_next: HEAP_VA_BASE,
+            prng_state: 0,
         }
     }
 
@@ -73,11 +89,35 @@ impl AddressSpace {
         }
     }
 
-    /// Allocate `page_count` pages of heap VA space (bump pointer).
+    /// Check if a VA range overlaps any existing VMA.
+    pub fn overlaps_vma(&self, va_start: usize, len: usize) -> bool {
+        // Check if any VMA overlaps [va_start, va_start + len).
+        let mut it = self.vmas.iter();
+        while let Some(vma) = it.next() {
+            if vma.active {
+                let vma_end = vma.va_start + vma.va_len;
+                let range_end = va_start + len;
+                if va_start < vma_end && range_end > vma.va_start {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Allocate `page_count` pages of heap VA space with ASLR.
     pub fn alloc_heap_va(&mut self, page_count: usize) -> usize {
         let va = self.heap_next;
         self.heap_next += page_count * super::page::PAGE_SIZE;
         va
+    }
+
+    /// Generate a random ASLR offset (in pages, 0..max_pages).
+    pub fn random_pages(&mut self, max_pages: usize) -> usize {
+        if self.prng_state == 0 || max_pages == 0 {
+            return 0;
+        }
+        (xorshift64(&mut self.prng_state) as usize) % max_pages
     }
 
     /// Find the VMA containing `va` and return a mutable reference.
@@ -111,6 +151,29 @@ impl ASpaceTable {
     }
 }
 
+/// Read a timer/cycle counter for PRNG seeding.
+fn seed_from_timer() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let val: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) val); }
+        val
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let val: u64;
+        unsafe { core::arch::asm!("rdcycle {}", out(reg) val); }
+        val
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let lo: u32;
+        let hi: u32;
+        unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi); }
+        ((hi as u64) << 32) | (lo as u64)
+    }
+}
+
 /// Create a new address space with the given page table root.
 /// Returns the address space ID.
 pub fn create(page_table_root: usize) -> Option<ASpaceId> {
@@ -122,7 +185,12 @@ pub fn create(page_table_root: usize) -> Option<ASpaceId> {
             space.id = id;
             space.page_table_root = page_table_root;
             space.clock_hand = VmaCursor::new();
-            space.heap_next = HEAP_VA_BASE;
+            // Seed PRNG and apply initial ASLR offset to heap base.
+            let seed = seed_from_timer() ^ (id as u64 * 0x9e3779b97f4a7c15);
+            space.prng_state = if seed == 0 { 1 } else { seed };
+            // Randomize heap start by 0-255 pages (0-1MB on 4K pages).
+            let offset_pages = (xorshift64(&mut space.prng_state) as usize) % 256;
+            space.heap_next = HEAP_VA_BASE + offset_pages * super::page::PAGE_SIZE;
             table.next_id = id + 1;
             return Some(id);
         }
@@ -197,7 +265,11 @@ pub fn reset(id: ASpaceId, new_pt_root: usize) {
             }
             space.vmas.clear();
             space.page_table_root = new_pt_root;
-            space.heap_next = HEAP_VA_BASE;
+            // Re-seed PRNG and randomize heap base for the new image.
+            let seed = seed_from_timer() ^ (space.id as u64 * 0x9e3779b97f4a7c15);
+            space.prng_state = if seed == 0 { 1 } else { seed };
+            let offset_pages = (xorshift64(&mut space.prng_state) as usize) % 256;
+            space.heap_next = HEAP_VA_BASE + offset_pages * super::page::PAGE_SIZE;
             space.clock_hand = VmaCursor::new();
 
             // Free old page table tree.

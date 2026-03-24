@@ -121,7 +121,13 @@ pub fn waitpid(child_tid: u64) -> Option<u64> {
 /// Allocate anonymous pages. va=0 for auto-pick. prot: 0=RO, 1=RW, 2=RX, 3=RWX.
 /// Returns mapped VA or None on error.
 pub fn mmap_anon(va: usize, page_count: usize, prot: u8) -> Option<usize> {
-    let r = unsafe { arch::syscall3(SYS_MMAP_ANON, va as u64, page_count as u64, prot as u64) };
+    let r = unsafe { arch::syscall4(SYS_MMAP_ANON, va as u64, page_count as u64, prot as u64, 0) };
+    if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+/// Map anonymous pages with flags (e.g. MAP_FIXED_NOREPLACE = 0x100000).
+pub fn mmap_anon_flags(va: usize, page_count: usize, prot: u8, flags: u64) -> Option<usize> {
+    let r = unsafe { arch::syscall4(SYS_MMAP_ANON, va as u64, page_count as u64, prot as u64, flags) };
     if r == u64::MAX { None } else { Some(r as usize) }
 }
 
@@ -569,6 +575,19 @@ pub fn fork() -> u64 {
 /// On success, this function never returns. On failure, returns u64::MAX.
 pub fn execve(name: &[u8]) -> u64 {
     unsafe { arch::syscall2(SYS_EXECVE, name.as_ptr() as u64, name.len() as u64) }
+}
+
+/// execve with argv and envp arrays (null-terminated pointer arrays).
+pub fn execve_with_args(name: &[u8], argv: *const *const u8, envp: *const *const u8) -> u64 {
+    unsafe {
+        arch::syscall4(
+            SYS_EXECVE,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            argv as u64,
+            envp as u64,
+        )
+    }
 }
 
 // Signal constants.
