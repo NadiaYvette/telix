@@ -80,6 +80,10 @@ pub struct Thread {
     pub timer_interval_ns: u64,
     /// Next expiry timestamp in nanoseconds-since-boot.
     pub timer_next_ns: u64,
+    /// Signal alternate stack base address (Phase 99).
+    pub sig_altstack_base: u64,
+    /// Signal alternate stack size in bytes (Phase 99).
+    pub sig_altstack_size: u64,
 }
 
 impl Thread {
@@ -104,6 +108,8 @@ impl Thread {
             timer_signal: 0,
             timer_interval_ns: 0,
             timer_next_ns: 0,
+            sig_altstack_base: 0,
+            sig_altstack_size: 0,
         }
     }
 }

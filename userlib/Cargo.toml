@@ -126,3 +126,11 @@ path = "bin/event_srv.rs"
 [[bin]]
 name = "inotify_srv"
 path = "bin/inotify_srv.rs"
+
+[[bin]]
+name = "syslog_srv"
+path = "bin/syslog_srv.rs"
+
+[[bin]]
+name = "sysv_srv"
+path = "bin/sysv_srv.rs"

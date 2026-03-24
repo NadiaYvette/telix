@@ -48,10 +48,17 @@ echo "Compiling musl-telix for $ARCH..."
 $CC $CFLAGS -c "$MUSL/arch/$ARCH/crt_start.S" -o "$OUTDIR/crt_start.o"
 $CC $CFLAGS -c "$MUSL/arch/$ARCH/syscall.S"   -o "$OUTDIR/syscall.o"
 
+# Assemble arch-specific sources (setjmp).
+if [ -f "$MUSL/arch/$ARCH/setjmp.S" ]; then
+    $CC $CFLAGS -c "$MUSL/arch/$ARCH/setjmp.S" -o "$OUTDIR/setjmp.o"
+fi
+
 # Compile C sources.
 for src in ipc fd write read exit init socket pipe poll \
            string malloc printf file process signal dup env \
-           syslog locale time_util mman pthread netdb epoll timer sysvipc; do
+           syslog locale time_util mman pthread netdb epoll timer sysvipc \
+           errno ctype strconv stdio_file assert \
+           dirent getopt select termios random pwgrp regex; do
     $CC $CFLAGS -c "$MUSL/src/$src.c" -o "$OUTDIR/$src.o"
 done
 
@@ -64,7 +71,16 @@ COMMON_OBJS="$OUTDIR/crt_start.o $OUTDIR/syscall.o \
     $OUTDIR/process.o $OUTDIR/signal.o $OUTDIR/dup.o $OUTDIR/env.o \
     $OUTDIR/syslog.o $OUTDIR/locale.o $OUTDIR/time_util.o $OUTDIR/mman.o \
     $OUTDIR/pthread.o $OUTDIR/netdb.o $OUTDIR/epoll.o $OUTDIR/timer.o \
-    $OUTDIR/sysvipc.o"
+    $OUTDIR/sysvipc.o \
+    $OUTDIR/errno.o $OUTDIR/ctype.o $OUTDIR/strconv.o \
+    $OUTDIR/stdio_file.o $OUTDIR/assert.o \
+    $OUTDIR/dirent.o $OUTDIR/getopt.o $OUTDIR/select.o \
+    $OUTDIR/termios.o $OUTDIR/random.o $OUTDIR/pwgrp.o $OUTDIR/regex.o"
+
+# Add setjmp.o if it exists for this arch.
+if [ -f "$OUTDIR/setjmp.o" ]; then
+    COMMON_OBJS="$COMMON_OBJS $OUTDIR/setjmp.o"
+fi
 
 # Link function — use ld.lld for cross-arch, clang for native.
 link_binary() {
@@ -144,5 +160,23 @@ $CC $CFLAGS -c "$MUSL/test/pg_full_test.c" -o "$OUTDIR/pg_full_test.o"
 link_binary "$OUTDIR/pg_full_test" $COMMON_OBJS "$OUTDIR/pg_full_test.o"
 SIZE=$(wc -c < "$OUTDIR/pg_full_test")
 echo "  pg_full_test: $SIZE bytes"
+
+# Build libc_test (Phase 102).
+$CC $CFLAGS -c "$MUSL/test/libc_test.c" -o "$OUTDIR/libc_test.o"
+link_binary "$OUTDIR/libc_test" $COMMON_OBJS "$OUTDIR/libc_test.o"
+SIZE=$(wc -c < "$OUTDIR/libc_test")
+echo "  libc_test: $SIZE bytes"
+
+# Build calc (Phase 103).
+$CC $CFLAGS -c "$MUSL/test/calc.c" -o "$OUTDIR/calc.o"
+link_binary "$OUTDIR/calc" $COMMON_OBJS "$OUTDIR/calc.o"
+SIZE=$(wc -c < "$OUTDIR/calc")
+echo "  calc: $SIZE bytes"
+
+# Build stress_test (Phase 104).
+$CC $CFLAGS -c "$MUSL/test/stress_test.c" -o "$OUTDIR/stress_test.o"
+link_binary "$OUTDIR/stress_test" $COMMON_OBJS "$OUTDIR/stress_test.o"
+SIZE=$(wc -c < "$OUTDIR/stress_test")
+echo "  stress_test: $SIZE bytes"
 
 echo "Done."

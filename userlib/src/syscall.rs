@@ -52,6 +52,8 @@ const SYS_PORT_SET_RECV_TIMEOUT: u64 = 93;
 const SYS_TIMER_CREATE: u64 = 94;
 #[allow(dead_code)]
 const SYS_MMAP_GUARD: u64 = 95;
+#[allow(dead_code)]
+const SYS_GETRANDOM: u64 = 96;
 
 /// Print a single character to the debug console.
 pub fn debug_putchar(ch: u8) {
@@ -1384,4 +1386,9 @@ pub fn port_set_recv_timeout(set_id: u32, timeout_us: u64) -> u64 {
 /// signal=0 disables the timer.
 pub fn timer_create(signal: u32, interval_ns: u64) -> u64 {
     unsafe { arch::syscall2(SYS_TIMER_CREATE, signal as u64, interval_ns) }
+}
+
+/// getrandom: fill buffer with random bytes. Returns number of bytes written.
+pub fn getrandom(buf: usize, len: usize) -> u64 {
+    unsafe { arch::syscall3(SYS_GETRANDOM, buf as u64, len as u64, 0) }
 }

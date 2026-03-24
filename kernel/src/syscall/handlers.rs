@@ -109,6 +109,9 @@ pub const SYS_TLS_GET: u64 = 92;
 pub const SYS_PORT_SET_RECV_TIMEOUT: u64 = 93;
 pub const SYS_TIMER_CREATE: u64 = 94;
 pub const SYS_MMAP_GUARD: u64 = 95;
+pub const SYS_GETRANDOM: u64 = 96;
+pub const SYS_SIGSUSPEND: u64 = 97;
+pub const SYS_SIGALTSTACK: u64 = 98;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -329,6 +332,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_TIMER_CREATE => sys_timer_create(a0, a1),
         SYS_MMAP_GUARD => sys_mmap_guard(a0, a1),
+        SYS_GETRANDOM => sys_getrandom(a0, a1, a2),
+        SYS_SIGSUSPEND => sys_sigsuspend(a0),
+        SYS_SIGALTSTACK => sys_sigaltstack(a0, a1),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -2580,4 +2586,135 @@ fn sys_mmap_guard(addr: u64, pages: u64) -> u64 {
         Some(Some(va_start)) => va_start as u64,
         _ => u64::MAX,
     }
+}
+
+// ============================================================
+// Phase 92: getrandom
+// ============================================================
+
+fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
+    use crate::sync::spinlock::SpinLock;
+
+    static PRNG_STATE: SpinLock<[u64; 4]> = SpinLock::new([0u64; 4]);
+
+    /// Xoshiro256** next — fast, decent quality PRNG.
+    fn xoshiro_next(s: &mut [u64; 4]) -> u64 {
+        let result = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+        let t = s[1] << 17;
+        s[2] ^= s[0];
+        s[3] ^= s[1];
+        s[1] ^= s[2];
+        s[0] ^= s[3];
+        s[2] ^= t;
+        s[3] = s[3].rotate_left(45);
+        result
+    }
+
+    let len = if buflen > 256 { 256 } else { buflen as usize };
+    if len == 0 || buf_ptr == 0 {
+        return 0;
+    }
+
+    // Generate random bytes into a stack buffer.
+    let mut tmp = [0u8; 256];
+    {
+        let mut state = PRNG_STATE.lock();
+        // Lazy seed from monotonic clock on first use.
+        if state[0] == 0 && state[1] == 0 && state[2] == 0 && state[3] == 0 {
+            let seed = crate::sched::get_monotonic_ns();
+            // Splitmix64 to expand a single seed into 4 state words.
+            let mut z = seed;
+            for s in state.iter_mut() {
+                z = z.wrapping_add(0x9e3779b97f4a7c15);
+                let mut v = z;
+                v = (v ^ (v >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                v = (v ^ (v >> 27)).wrapping_mul(0x94d049bb133111eb);
+                *s = v ^ (v >> 31);
+            }
+        }
+        let mut offset = 0;
+        while offset < len {
+            let val = xoshiro_next(&mut state);
+            let bytes = val.to_le_bytes();
+            let remaining = len - offset;
+            let n = if remaining < 8 { remaining } else { 8 };
+            tmp[offset..offset + n].copy_from_slice(&bytes[..n]);
+            offset += n;
+        }
+    }
+
+    // Copy to userspace.
+    let sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    let pt_root = sched.tasks[task_id as usize].page_table_root;
+    drop(sched);
+
+    if !copy_to_user(pt_root, buf_ptr as usize, &tmp[..len]) {
+        return u64::MAX;
+    }
+    len as u64
+}
+
+// ============================================================
+// Phase 99: sigsuspend and sigaltstack
+// ============================================================
+
+fn sys_sigsuspend(mask: u64) -> u64 {
+    // Save old mask, install new one, yield until an unmasked signal is pending.
+    let old_mask = crate::sched::get_signal_mask();
+    crate::sched::set_signal_mask(mask);
+
+    // Yield in a loop until a signal is pending that is not blocked by the new mask.
+    loop {
+        let pending = crate::sched::get_signal_pending();
+        if pending & !mask != 0 {
+            break;
+        }
+        // Yield to scheduler, waiting for a signal.
+        let tid = crate::sched::current_thread_id();
+        crate::sched::scheduler::set_yield_asap(tid);
+        let saved = crate::sched::scheduler::arch_irq_save_enable();
+        crate::sched::scheduler::arch_wait_for_irq();
+        crate::sched::scheduler::arch_irq_restore(saved);
+    }
+
+    // Restore old mask.
+    crate::sched::set_signal_mask(old_mask);
+    0
+}
+
+fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
+    let sched = crate::sched::scheduler::SCHEDULER.lock();
+    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = sched.threads[tid as usize].task_id;
+    let pt_root = sched.tasks[task_id as usize].page_table_root;
+    let old_base = sched.threads[tid as usize].sig_altstack_base;
+    let old_size = sched.threads[tid as usize].sig_altstack_size;
+    drop(sched);
+
+    // Write old stack info if requested.
+    if old_ss_ptr != 0 {
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&old_base.to_le_bytes());
+        buf[8..16].copy_from_slice(&old_size.to_le_bytes());
+        if !copy_to_user(pt_root, old_ss_ptr as usize, &buf) {
+            return u64::MAX;
+        }
+    }
+
+    // Read new stack info if requested.
+    if ss_ptr != 0 {
+        let mut buf = [0u8; 16];
+        if !copy_from_user(pt_root, ss_ptr as usize, &mut buf) {
+            return u64::MAX;
+        }
+        let new_base = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
+        let new_size = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
+        let mut sched = crate::sched::scheduler::SCHEDULER.lock();
+        let tid2 = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+        sched.threads[tid2 as usize].sig_altstack_base = new_base;
+        sched.threads[tid2 as usize].sig_altstack_size = new_size;
+    }
+    0
 }

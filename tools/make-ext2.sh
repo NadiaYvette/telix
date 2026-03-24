@@ -44,10 +44,42 @@ printf 'root::0:0:root:/:/tsh\nuser:pass:1000:1000:user:/:/tsh\n' > "$PASSWD_TMP
 GROUP_TMP=$(mktemp)
 printf 'root:x:0:\nusers:x:1000:\n' > "$GROUP_TMP"
 
+# /etc/localtime — minimal TZif v1 header for UTC (Phase 72).
+LOCALTIME_TMP=$(mktemp)
+python3 -c "
+import struct, sys
+# TZif v1 header: magic, version, reserved, counts, data
+magic = b'TZif'
+version = b' '  # v1
+reserved = b'\0' * 15
+# All counts zero (UTC, no transitions/types)
+tzh_ttisgmtcnt = 0
+tzh_ttisstdcnt = 0
+tzh_leapcnt = 0
+tzh_timecnt = 0
+tzh_typecnt = 1
+tzh_charcnt = 4
+hdr = struct.pack('>4s c 15s 6I', magic, version, reserved,
+    tzh_ttisgmtcnt, tzh_ttisstdcnt, tzh_leapcnt,
+    tzh_timecnt, tzh_typecnt, tzh_charcnt)
+# ttinfo: utoff=0, dst=0, idx=0
+ttinfo = struct.pack('>lBB', 0, 0, 0)
+# designation: 'UTC\0'
+desig = b'UTC\0'
+sys.stdout.buffer.write(hdr + ttinfo + desig)
+" > "$LOCALTIME_TMP"
+
+# /etc/resolv.conf (Phase 73).
+RESOLV_TMP=$(mktemp)
+printf 'nameserver 10.0.2.3\n' > "$RESOLV_TMP"
+
 # Use debugfs to populate the filesystem.
 debugfs -w "$EXT2_TMP" <<DEBUGFS_EOF
 mkdir testdir
 mkdir etc
+mkdir usr
+mkdir usr/share
+mkdir usr/share/zoneinfo
 write $TMPFILE hello.txt
 write $TMPFILE2 bench.dat
 write $TMPFILE3 secret.txt
@@ -74,9 +106,22 @@ set_inode_field etc/passwd gid 0
 set_inode_field etc/group mode 0100644
 set_inode_field etc/group uid 0
 set_inode_field etc/group gid 0
+write $LOCALTIME_TMP etc/localtime
+set_inode_field etc/localtime mode 0100644
+set_inode_field etc/localtime uid 0
+set_inode_field etc/localtime gid 0
+write $RESOLV_TMP etc/resolv.conf
+set_inode_field etc/resolv.conf mode 0100644
+set_inode_field etc/resolv.conf uid 0
+set_inode_field etc/resolv.conf gid 0
+write $LOCALTIME_TMP usr/share/zoneinfo/UTC
+set_inode_field usr/share/zoneinfo/UTC mode 0100644
+set_inode_field usr mode 040755
+set_inode_field usr/share mode 040755
+set_inode_field usr/share/zoneinfo mode 040755
 DEBUGFS_EOF
 
-rm -f "$TMPFILE" "$TMPFILE2" "$TMPFILE3" "$PASSWD_TMP" "$GROUP_TMP"
+rm -f "$TMPFILE" "$TMPFILE2" "$TMPFILE3" "$PASSWD_TMP" "$GROUP_TMP" "$LOCALTIME_TMP" "$RESOLV_TMP"
 
 # Splice the ext2 image into test.img at the FAT16 boundary.
 dd if="$EXT2_TMP" of="$DISK_IMG" bs=1M seek=16 conv=notrunc 2>/dev/null

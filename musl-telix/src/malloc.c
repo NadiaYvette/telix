@@ -5,7 +5,7 @@
 #include <telix/syscall.h>
 
 #define HEAP_BASE  0x400000000ULL
-#define PAGE_SIZE  4096
+#define PAGE_SIZE  65536  /* Must match kernel allocation page size */
 
 /* Each allocation has an 8-byte header storing the usable size. */
 #define HDR_SIZE 8
@@ -31,8 +31,8 @@ static size_t bucket_size(int b) {
 static void *alloc_pages(size_t bytes) {
     size_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t va = heap_top;
-    /* SYS_MMAP_ANON(16): args = va, page_count, prot(0x7=RWX) */
-    uint64_t result = __telix_syscall3(SYS_MMAP_ANON, va, pages, 0x7);
+    /* SYS_MMAP_ANON(16): args = va, page_count, prot(1=RW) */
+    uint64_t result = __telix_syscall3(SYS_MMAP_ANON, va, pages, 1);
     if (result == 0 || result == (uint64_t)-1)
         return NULL;
     heap_top += pages * PAGE_SIZE;
@@ -81,24 +81,5 @@ void *calloc(size_t nmemb, size_t size) {
     return p;
 }
 
-int atoi(const char *s) {
-    int neg = 0, val = 0;
-    while (*s == ' ' || *s == '\t') s++;
-    if (*s == '-') { neg = 1; s++; }
-    else if (*s == '+') s++;
-    while (*s >= '0' && *s <= '9')
-        val = val * 10 + (*s++ - '0');
-    return neg ? -val : val;
-}
-
-long atol(const char *s) {
-    long neg = 0, val = 0;
-    while (*s == ' ' || *s == '\t') s++;
-    if (*s == '-') { neg = 1; s++; }
-    else if (*s == '+') s++;
-    while (*s >= '0' && *s <= '9')
-        val = val * 10 + (*s++ - '0');
-    return neg ? -val : val;
-}
 
 int abs(int x) { return x < 0 ? -x : x; }
