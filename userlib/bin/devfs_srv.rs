@@ -136,13 +136,13 @@ fn pack_inline_data(data: &[u8]) -> [u64; 3] {
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  [devfs_srv] starting\n");
 
-    let port = syscall::port_create() as u32;
+    let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
     syscall::ns_register(b"devfs", port);
 
     // Look up console_srv for tty/console proxying.
     let console_port = {
-        let mut found = 0u32;
+        let mut found = 0u64;
         for _ in 0..50 {
             if let Some(p) = syscall::ns_lookup(b"console") {
                 found = p;
@@ -154,7 +154,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     };
 
     // Create a reply port for console IPC.
-    let con_reply = syscall::port_create() as u32;
+    let con_reply = syscall::port_create();
 
     // Seed RNG from clock.
     let mut rng = Rng::new(syscall::clock_gettime());
@@ -172,7 +172,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         match msg.tag {
             FS_OPEN => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
                 match find_device(&name, nlen) {
@@ -203,7 +203,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = msg.data[0] as usize;
                 let _offset = msg.data[1];
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
@@ -277,7 +277,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             FS_WRITE => {
                 let handle = msg.data[0] as usize;
                 let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[1] >> 32) as u32;
+                let reply_port = msg.data[1] >> 32;
                 let grant_va = msg.data[2] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
@@ -342,7 +342,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_STAT => {
                 let handle = msg.data[0] as usize;
-                let reply_port = (msg.data[2] & 0xFFFF_FFFF) as u32;
+                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
                     syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
@@ -357,7 +357,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_READDIR => {
                 let start_offset = msg.data[0] as usize;
-                let reply_port = (msg.data[2] & 0xFFFF_FFFF) as u32;
+                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 if start_offset < NUM_DEVICES {
                     let dev = &DEVICES[start_offset];

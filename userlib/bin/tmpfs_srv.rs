@@ -118,7 +118,7 @@ impl FileLock {
 #[derive(Clone, Copy)]
 struct LockWaiter {
     active: bool,
-    reply_port: u32,
+    reply_port: u64,
     file_idx: u32,
     pid: u32,
     lock_type: u8,
@@ -284,7 +284,7 @@ fn find_file(files: &[TmpfsFile; MAX_FILES], name: &[u8], name_len: usize) -> Op
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  [tmpfs_srv] starting\n");
 
-    let port = syscall::port_create() as u32;
+    let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
     syscall::ns_register(b"tmpfs", port);
     syscall::debug_puts(b"  [tmpfs_srv] ready\n");
@@ -303,7 +303,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         match msg.tag {
             FS_OPEN => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let caller_pid = msg.data[3] as u32; // PID from d3
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
@@ -338,7 +338,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = msg.data[0] as usize;
                 let offset = msg.data[1] as u32;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as u32;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
@@ -390,7 +390,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_READDIR => {
                 let start_offset = msg.data[0] as usize;
-                let reply_port = (msg.data[2] & 0xFFFF_FFFF) as u32;
+                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 // start_offset is used as an index into the files array.
                 let mut found = false;
@@ -419,7 +419,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_STAT => {
                 let handle = msg.data[0] as usize;
-                let reply_port = (msg.data[2] & 0xFFFF_FFFF) as u32;
+                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
                     syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
@@ -456,7 +456,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_CREATE => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let caller_pid = msg.data[3] as u32;
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
@@ -509,7 +509,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             FS_WRITE => {
                 let handle = msg.data[0] as usize;
                 let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[1] >> 32) as u32;
+                let reply_port = msg.data[1] >> 32;
                 let grant_va = msg.data[2] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active
@@ -572,7 +572,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_DELETE => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
                 match find_file(&files, &name, nlen) {
@@ -603,7 +603,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
                 let operation = (msg.data[0] >> 32) as i32;
                 let pid = msg.data[1] as u32;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
                     syscall::send(reply_port, FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0);
@@ -654,7 +654,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let pid = msg.data[3] as u32;
                 let start = msg.data[1];
                 let len = (msg.data[2] & 0xFFFF_FFFF) as u64;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let blocking = msg.tag == FS_SETLKW;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
@@ -702,7 +702,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let pid = msg.data[3] as u32;
                 let start = msg.data[1];
                 let len = (msg.data[2] & 0xFFFF_FFFF) as u64;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
                     syscall::send(reply_port, FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0);

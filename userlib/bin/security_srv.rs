@@ -25,7 +25,7 @@ const USERS: [(u64, u64, u64); 3] = [
 const MAX_CREDENTIALS: usize = 16;
 
 struct Credential {
-    port_id: u32,
+    port_id: u64,
     username_hash: u64,
     roles: u64,
 }
@@ -44,7 +44,7 @@ fn find_user(username_hash: u64, password_hash: u64) -> Option<u64> {
     None
 }
 
-fn find_credential(port_id: u32) -> Option<usize> {
+fn find_credential(port_id: u64) -> Option<usize> {
     for i in 0..MAX_CREDENTIALS {
         let slot = unsafe { &raw const CREDENTIALS };
         let entry = unsafe { &(*slot)[i] };
@@ -57,7 +57,7 @@ fn find_credential(port_id: u32) -> Option<usize> {
     None
 }
 
-fn alloc_credential(port_id: u32, username_hash: u64, roles: u64) -> bool {
+fn alloc_credential(port_id: u64, username_hash: u64, roles: u64) -> bool {
     for i in 0..MAX_CREDENTIALS {
         let slot = unsafe { &raw mut CREDENTIALS };
         let entry = unsafe { &mut (*slot)[i] };
@@ -76,9 +76,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     // If arg0 is a valid port, use it as our service port (passed from parent).
     // Otherwise, create our own and register with the name server.
     let svc_port = if arg0 > 0 && arg0 != u64::MAX {
-        arg0 as u32
+        arg0
     } else {
-        let p = syscall::port_create() as u32;
+        let p = syscall::port_create();
         if !syscall::ns_register(b"security", p) {
             syscall::debug_puts(b"[security_srv] ns_register failed\n");
             syscall::exit(1);
@@ -98,12 +98,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             SEC_LOGIN => {
                 let username_hash = msg.data[0];
                 let password_hash = msg.data[1];
-                let reply_port = msg.data[2] as u32;
+                let reply_port = msg.data[2];
 
                 if let Some(roles) = find_user(username_hash, password_hash) {
                     // Create credential port as token.
-                    let cred_port = syscall::port_create() as u32;
-                    if cred_port != u32::MAX && alloc_credential(cred_port, username_hash, roles) {
+                    let cred_port = syscall::port_create();
+                    if cred_port != u64::MAX && alloc_credential(cred_port, username_hash, roles) {
                         // Reply with credential port in data[0] — auto-grant
                         // gives client SEND cap to the credential port.
                         syscall::send(reply_port, SEC_LOGIN_OK, cred_port as u64, roles, 0, 0);
@@ -115,8 +115,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             }
             SEC_VERIFY => {
-                let cred_port = msg.data[0] as u32;
-                let reply_port = msg.data[2] as u32;
+                let cred_port = msg.data[0];
+                let reply_port = msg.data[2];
 
                 if let Some(idx) = find_credential(cred_port) {
                     let slot = unsafe { &raw const CREDENTIALS };
@@ -130,8 +130,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             }
             SEC_REVOKE => {
-                let cred_port = msg.data[0] as u32;
-                let reply_port = msg.data[2] as u32;
+                let cred_port = msg.data[0];
+                let reply_port = msg.data[2];
 
                 if let Some(idx) = find_credential(cred_port) {
                     syscall::port_destroy(cred_port);

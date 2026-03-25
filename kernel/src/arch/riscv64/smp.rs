@@ -80,11 +80,24 @@ pub fn start_secondary_cpus() {
         cpu_index += 1;
     }
 
-    // Wait for all successfully started secondaries.
+    if started == 0 {
+        crate::println!("  Single-CPU mode (no secondaries started)");
+        return;
+    }
+
+    // Wait for all successfully started secondaries, with timeout.
+    let mut timeout = 100_000_000u64;
     while AP_READY_COUNT.load(Ordering::Acquire) < started {
         core::hint::spin_loop();
+        timeout -= 1;
+        if timeout == 0 {
+            crate::println!("  SMP startup timeout ({}/{} harts ready)",
+                AP_READY_COUNT.load(Ordering::Relaxed) + 1, started + 1);
+            break;
+        }
     }
-    crate::println!("  All {} CPUs online", started + 1);
+    let online = AP_READY_COUNT.load(Ordering::Relaxed) + 1;
+    crate::println!("  All {} CPUs online", online);
 }
 
 /// Secondary hart Rust entry point.

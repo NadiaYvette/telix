@@ -67,7 +67,7 @@ fn print_num(n: u64) {
 }
 
 /// Write bytes to console_srv. Chunks into 24-byte messages.
-fn con_puts(con_port: u32, reply_port: u32, msg: &[u8]) {
+fn con_puts(con_port: u64, reply_port: u64, msg: &[u8]) {
     let mut offset = 0;
     while offset < msg.len() {
         let chunk_len = (msg.len() - offset).min(16); // Use first 2 words (16 bytes) for simplicity
@@ -88,7 +88,7 @@ fn con_puts(con_port: u32, reply_port: u32, msg: &[u8]) {
 }
 
 /// Read a line from console_srv. Returns length.
-fn con_readline(con_port: u32, reply_port: u32, buf: &mut [u8; 64]) -> usize {
+fn con_readline(con_port: u64, reply_port: u64, buf: &mut [u8; 64]) -> usize {
     let d0 = 64u64 | ((reply_port as u64) << 32);
     syscall::send(con_port, CON_READ, d0, 0, 0, 0);
 
@@ -144,7 +144,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         for _ in 0..50 { syscall::yield_now(); }
     };
 
-    let reply_port = syscall::port_create() as u32;
+    let reply_port = syscall::port_create();
 
     // Try to find fat16_srv (may not exist on x86_64).
     let fat16_port = syscall::ns_lookup(b"fat16");
@@ -217,7 +217,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 }
 
-fn cmd_ls(con_port: u32, reply_port: u32, fat16_port: Option<u32>) {
+fn cmd_ls(con_port: u64, reply_port: u64, fat16_port: Option<u64>) {
     let fp = match fat16_port {
         Some(p) => p,
         None => {
@@ -226,7 +226,7 @@ fn cmd_ls(con_port: u32, reply_port: u32, fat16_port: Option<u32>) {
         }
     };
 
-    let fs_reply = syscall::port_create() as u32;
+    let fs_reply = syscall::port_create();
     let mut idx = 0u64;
 
     loop {
@@ -279,7 +279,7 @@ fn cmd_ls(con_port: u32, reply_port: u32, fat16_port: Option<u32>) {
     }
 }
 
-fn cmd_cat(con_port: u32, reply_port: u32, fat16_port: Option<u32>, filename: &[u8]) {
+fn cmd_cat(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[u8]) {
     let fp = match fat16_port {
         Some(p) => p,
         None => {
@@ -288,7 +288,7 @@ fn cmd_cat(con_port: u32, reply_port: u32, fat16_port: Option<u32>, filename: &[
         }
     };
 
-    let fs_reply = syscall::port_create() as u32;
+    let fs_reply = syscall::port_create();
 
     // FS_OPEN.
     let (n0, n1, _) = pack_name(filename);
@@ -340,7 +340,7 @@ fn cmd_cat(con_port: u32, reply_port: u32, fat16_port: Option<u32>, filename: &[
     syscall::send_nb(fp, FS_CLOSE, handle, 0);
 }
 
-fn cmd_net(con_port: u32, reply_port: u32) {
+fn cmd_net(con_port: u64, reply_port: u64) {
     let np = match syscall::ns_lookup(b"net") {
         Some(p) => p,
         None => {
@@ -348,7 +348,7 @@ fn cmd_net(con_port: u32, reply_port: u32) {
             return;
         }
     };
-    let net_reply = syscall::port_create() as u32;
+    let net_reply = syscall::port_create();
     syscall::send(np, NET_STATUS, net_reply as u64, 0, 0, 0);
 
     if let Some(msg) = syscall::recv_msg(net_reply) {
@@ -409,7 +409,7 @@ fn parse_ip(s: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(octets))
 }
 
-fn cmd_ping(con_port: u32, reply_port: u32, target: &[u8]) {
+fn cmd_ping(con_port: u64, reply_port: u64, target: &[u8]) {
     let np = match syscall::ns_lookup(b"net") {
         Some(p) => p,
         None => {
@@ -426,7 +426,7 @@ fn cmd_ping(con_port: u32, reply_port: u32, target: &[u8]) {
         }
     };
 
-    let net_reply = syscall::port_create() as u32;
+    let net_reply = syscall::port_create();
     syscall::send(np, NET_PING, ip as u64, net_reply as u64, 0, 0);
 
     con_puts(con_port, reply_port, b"pinging...\r\n");
@@ -451,7 +451,7 @@ fn cmd_ping(con_port: u32, reply_port: u32, target: &[u8]) {
     syscall::port_destroy(net_reply);
 }
 
-fn cmd_run(con_port: u32, reply_port: u32, fat16_port: Option<u32>, filename: &[u8]) {
+fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[u8]) {
     let fp = match fat16_port {
         Some(p) => p,
         None => {
@@ -460,7 +460,7 @@ fn cmd_run(con_port: u32, reply_port: u32, fat16_port: Option<u32>, filename: &[
         }
     };
 
-    let fs_reply = syscall::port_create() as u32;
+    let fs_reply = syscall::port_create();
 
     // FS_OPEN.
     let (n0, n1, _) = pack_name(filename);
@@ -591,7 +591,7 @@ fn cmd_run(con_port: u32, reply_port: u32, fat16_port: Option<u32>, filename: &[
     syscall::port_destroy(fs_reply);
 }
 
-fn cmd_write(con_port: u32, reply_port: u32, fat16_port: Option<u32>, args: &[u8]) {
+fn cmd_write(con_port: u64, reply_port: u64, fat16_port: Option<u64>, args: &[u8]) {
     let fp = match fat16_port {
         Some(p) => p,
         None => {
@@ -616,7 +616,7 @@ fn cmd_write(con_port: u32, reply_port: u32, fat16_port: Option<u32>, args: &[u8
         return;
     }
 
-    let fs_reply = syscall::port_create() as u32;
+    let fs_reply = syscall::port_create();
 
     // FS_CREATE.
     let (n0, n1, _) = pack_name(filename);
@@ -692,7 +692,7 @@ fn cmd_write(con_port: u32, reply_port: u32, fat16_port: Option<u32>, args: &[u8
     con_puts(con_port, reply_port, b" bytes\r\n");
 }
 
-fn cmd_info(con_port: u32, reply_port: u32) {
+fn cmd_info(con_port: u64, reply_port: u64) {
     let tid = syscall::thread_id();
     let aspace = syscall::aspace_id();
 
@@ -722,8 +722,8 @@ fn trim_slice(s: &[u8]) -> &[u8] {
     &s[start..end]
 }
 
-fn cmd_pipe(con_port: u32, reply_port: u32, fat16_port: Option<u32>, left: &[u8], right: &[u8]) {
-    let pipe_port = syscall::port_create() as u32;
+fn cmd_pipe(con_port: u64, reply_port: u64, fat16_port: Option<u64>, left: &[u8], right: &[u8]) {
+    let pipe_port = syscall::port_create();
 
     // Extract right-side binary name (first word).
     let right_cmd = first_word(right);
@@ -761,13 +761,13 @@ fn cmd_pipe(con_port: u32, reply_port: u32, fat16_port: Option<u32>, left: &[u8]
 }
 
 /// Read a file and write its contents to a pipe port (instead of console).
-fn pipe_cat(pipe_port: u32, reply_port: u32, fat16_port: Option<u32>, filename: &[u8]) {
+fn pipe_cat(pipe_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[u8]) {
     let fp = match fat16_port {
         Some(p) => p,
         None => return,
     };
 
-    let fs_reply = syscall::port_create() as u32;
+    let fs_reply = syscall::port_create();
 
     // FS_OPEN.
     let (n0, n1, _) = pack_name(filename);

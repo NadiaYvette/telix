@@ -100,14 +100,38 @@ pub fn kmain() -> ! {
     println!("Testing demand-paged memory...");
     test_demand_paging();
 
+    // Phase 3+4 run in a dedicated kernel thread so the BSP can enter the idle
+    // loop immediately. On single-CPU, the idle loop is needed so the scheduler
+    // can preempt it to run the startup thread and other kernel threads.
+    // Priority 60 is lower than spawned servers (50) so they can run during waits.
+    sched::spawn(startup_thread, 60, 20).expect("spawn startup");
+
+    println!("Enabling interrupts");
+    arch::platform::enable_interrupts();
+
+    println!("Telix kernel initialized — entering idle loop");
+    arch::platform::idle_loop()
+}
+
+/// Kernel startup thread: spawns I/O servers and userspace processes.
+/// Runs as a normal kernel thread (not the idle thread) so the scheduler
+/// can preempt between it and the threads it spawns — critical for single-CPU.
+fn startup_thread() -> ! {
     // Phase 3: I/O server stack.
     println!("Phase 3: Starting I/O servers...");
 
     // Name server (kernel thread) — must start first for service registration.
     sched::spawn(io::namesrv::namesrv_server, 50, 20).expect("spawn namesrv");
-    // Wait for name server to be ready.
-    while io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire) == u32::MAX {
-        core::hint::spin_loop();
+    // Wait for name server to be ready. block_current demotes our priority
+    // to 254, so namesrv (prio 50) gets scheduled to complete initialization.
+    while io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire) == u64::MAX {
+        // Fake a block so we yield to namesrv. wake_thread won't be called
+        // for us, but we'll break out when NAMESRV_PORT changes.
+        // Use set_yield_asap + WFI instead of block_current to avoid needing
+        // a wakeup signal.
+        let my_tid = sched::current_thread_id();
+        sched::scheduler::set_yield_asap(my_tid);
+        sched::scheduler::arch_wait_for_irq();
     }
 
     sched::spawn(io::initramfs::initramfs_server, 50, 20).expect("spawn initramfs");
@@ -271,16 +295,14 @@ pub fn kmain() -> ! {
         None => println!("  ERROR: failed to spawn init"),
     }
 
-    println!("Enabling interrupts");
-    arch::platform::enable_interrupts();
-
-    println!("Telix kernel initialized — entering idle loop");
-    arch::platform::idle_loop()
+    println!("Startup complete");
+    // This thread has no more work — exit by spinning (will be preempted).
+    sched::scheduler::exit_current_thread(0);
 }
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 #[allow(dead_code)]
-static IPC_TEST_PORT: AtomicU32 = AtomicU32::new(0);
+static IPC_TEST_PORT: AtomicU64 = AtomicU64::new(0);
 
 #[allow(dead_code)]
 fn ipc_sender() -> ! {
@@ -781,7 +803,7 @@ fn test_io_client() -> ! {
     // Wait for initramfs server to be ready.
     let initramfs_port = loop {
         let p = io::initramfs::INITRAMFS_PORT.load(Ordering::Acquire);
-        if p != u32::MAX {
+        if p != u64::MAX {
             break p;
         }
         core::hint::spin_loop();
@@ -842,7 +864,7 @@ fn test_io_client() -> ! {
         let mut tries = 0u32;
         let blk_port = loop {
             let p = io::blk_server::BLK_PORT.load(Ordering::Acquire);
-            if p != u32::MAX {
+            if p != u64::MAX {
                 break Some(p);
             }
             tries += 1;

@@ -24,7 +24,7 @@ const PIPE_EOF_TAG: u64 = 0x51FF;
 // ── Legacy API (backward compat) ──────────────────────────────────
 
 /// Write `buf` into the pipe, chunking into 16-byte messages.
-pub fn pipe_write(pipe_port: u32, buf: &[u8]) {
+pub fn pipe_write(pipe_port: u64, buf: &[u8]) {
     let mut offset = 0;
     while offset < buf.len() {
         let chunk_len = (buf.len() - offset).min(16);
@@ -42,12 +42,12 @@ pub fn pipe_write(pipe_port: u32, buf: &[u8]) {
 }
 
 /// Signal end-of-stream on the pipe.
-pub fn pipe_close_writer(pipe_port: u32) {
+pub fn pipe_close_writer(pipe_port: u64) {
     syscall::send(pipe_port, PIPE_EOF_LEGACY, 0, 0, 0, 0);
 }
 
 /// Read from the pipe into `buf`. Returns bytes read (0 = EOF).
-pub fn pipe_read(pipe_port: u32, buf: &mut [u8]) -> usize {
+pub fn pipe_read(pipe_port: u64, buf: &mut [u8]) -> usize {
     if let Some(msg) = syscall::recv_msg(pipe_port) {
         match msg.tag {
             PIPE_DATA => {
@@ -71,7 +71,7 @@ pub fn pipe_read(pipe_port: u32, buf: &mut [u8]) -> usize {
 /// Requires the pipe server ("pipe") to be running.
 pub fn pipe() -> Option<(i32, i32)> {
     let pipe_port = syscall::ns_lookup(b"pipe")?;
-    let reply_port = syscall::port_create() as u32;
+    let reply_port = syscall::port_create();
     let d2 = (reply_port as u64) << 32;
     syscall::send(pipe_port, PIPE_CREATE, 0, 0, d2, 0);
     let msg = syscall::recv_msg(reply_port)?;
@@ -118,7 +118,7 @@ pub fn pipe_read_fd(fd_num: i32, buf: &mut [u8]) -> isize {
         Some(e) => e,
         None => return -1,
     };
-    let reply_port = syscall::port_create() as u32;
+    let reply_port = syscall::port_create();
     let d2 = (reply_port as u64) << 32;
     syscall::send(entry.port, PIPE_READ_TAG, entry.handle as u64, 0, d2, 0);
     let msg = match syscall::recv_msg(reply_port) {
@@ -152,7 +152,7 @@ pub fn pipe_close_fd(fd_num: i32) -> bool {
         Some(e) => e,
         None => return false,
     };
-    let reply_port = syscall::port_create() as u32;
+    let reply_port = syscall::port_create();
     let d2 = (reply_port as u64) << 32;
     syscall::send(entry.port, PIPE_CLOSE_TAG, entry.handle as u64, 0, d2, 0);
     let _ = syscall::recv_msg(reply_port);

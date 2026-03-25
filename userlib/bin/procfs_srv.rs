@@ -215,7 +215,7 @@ fn pack_name_lo(name: &[u8]) -> u64 {
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  [procfs_srv] starting\n");
 
-    let port = syscall::port_create() as u32;
+    let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
     syscall::ns_register(b"procfs", port);
     syscall::debug_puts(b"  [procfs_srv] ready\n");
@@ -231,7 +231,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         match msg.tag {
             FS_OPEN => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
                 // Determine virtual file type and generate content.
@@ -276,7 +276,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = msg.data[0] as usize;
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
@@ -310,7 +310,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_STAT => {
                 let handle = msg.data[0] as usize;
-                let reply_port = (msg.data[2] & 0xFFFF_FFFF) as u32;
+                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
                     syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
@@ -325,7 +325,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_READDIR => {
                 let start_offset = msg.data[0] as usize;
-                let reply_port = (msg.data[2] & 0xFFFF_FFFF) as u32;
+                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 // Virtual directory layout:
                 //   0 = "meminfo"

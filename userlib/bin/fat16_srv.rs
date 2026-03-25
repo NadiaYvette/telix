@@ -126,9 +126,9 @@ fn read_u32(buf: &[u8], off: usize) -> u32 {
 
 /// State for communicating with blk_srv.
 struct BlkClient {
-    blk_port: u32,
+    blk_port: u64,
     blk_aspace: u32,
-    reply_port: u32,
+    reply_port: u64,
     /// Scratch page VA for block reads (our local mapping).
     scratch_va: usize,
     /// Grant VA in blk_srv's address space.
@@ -344,7 +344,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  [fat16_srv] starting\n");
 
     // Create port and register with name server.
-    let port = syscall::port_create() as u32;
+    let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
     syscall::ns_register(b"fat16", port);
 
@@ -352,12 +352,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(port as u64);
     syscall::debug_puts(b"\n");
 
-    // Look up cache_blk (cache server proxy) with retry.
-    let blk_port = loop {
-        if let Some(p) = syscall::ns_lookup(b"cache_blk") {
-            break p;
+    // Look up cache_blk (cache server proxy) with bounded retry.
+    let blk_port = {
+        let mut retries = 2000;
+        loop {
+            if let Some(p) = syscall::ns_lookup(b"cache_blk") {
+                break p;
+            }
+            retries -= 1;
+            if retries == 0 {
+                syscall::debug_puts(b"  [fat16_srv] cache_blk not found, exiting\n");
+                syscall::exit(1);
+            }
+            for _ in 0..50 { syscall::yield_now(); }
         }
-        for _ in 0..50 { syscall::yield_now(); }
     };
 
     syscall::debug_puts(b"  [fat16_srv] cache_blk on port ");
@@ -365,7 +373,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"\n");
 
     // Connect to blk_srv.
-    let blk_reply = syscall::port_create() as u32;
+    let blk_reply = syscall::port_create();
     {
         let (n0, n1, _) = syscall::pack_name(b"blk");
         let d2 = 3u64 | ((blk_reply as u64) << 32);
@@ -503,7 +511,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             FS_OPEN => {
                 // data[0] = name_lo, data[1] = name_hi, data[2] = name_len|(reply<<32), data[3] = unused
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
 
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
@@ -582,7 +590,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = msg.data[0] as usize;
                 let offset = msg.data[1] as u32;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as u32;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active {
@@ -654,7 +662,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             FS_READDIR => {
                 // data[0] = entry_index, data[2] = reply_port (low 32)
                 let start_index = msg.data[0] as u32;
-                let reply_port = (msg.data[2] & 0xFFFF_FFFF) as u32;
+                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 // Iterate root directory from start_index.
                 let entries_per_sector = 16u32; // 512 / 32
@@ -739,7 +747,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             FS_CREATE => {
                 // data[0] = name_lo, data[1] = name_hi, data[2] = name_len|(reply<<32)
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
 
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
@@ -794,7 +802,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // data[0] = handle, data[1] = data_len|(reply<<32), data[2] = grant_va, data[3] = unused
                 let handle = msg.data[0] as usize;
                 let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[1] >> 32) as u32;
+                let reply_port = msg.data[1] >> 32;
                 let grant_va = msg.data[2] as usize;
 
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active || !open_files[handle].writable {
@@ -884,7 +892,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             FS_DELETE => {
                 // data[0] = name_lo, data[1] = name_hi, data[2] = name_len|(reply<<32)
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
 

@@ -43,7 +43,7 @@ fn poll_check_fd(entry: &fd::FdEntry, events: u16) -> u16 {
             rev
         }
         FdType::Pipe => {
-            let reply_port = syscall::port_create() as u32;
+            let reply_port = syscall::port_create();
             let d2 = (events as u64) | ((reply_port as u64) << 32);
             syscall::send(entry.port, PIPE_POLL, entry.handle as u64, 0, d2, 0);
             let rev = if let Some(msg) = syscall::recv_msg(reply_port) {
@@ -59,7 +59,7 @@ fn poll_check_fd(entry: &fd::FdEntry, events: u16) -> u16 {
             rev
         }
         FdType::Socket => {
-            let reply_port = syscall::port_create() as u32;
+            let reply_port = syscall::port_create();
             let d2 = (events as u64) | ((reply_port as u64) << 32);
             syscall::send(entry.port, UDS_POLL, entry.handle as u64, 0, d2, 0);
             let rev = if let Some(msg) = syscall::recv_msg(reply_port) {
@@ -82,7 +82,7 @@ fn poll_check_fd(entry: &fd::FdEntry, events: u16) -> u16 {
             rev
         }
         FdType::Pty => {
-            let reply_port = syscall::port_create() as u32;
+            let reply_port = syscall::port_create();
             let d2 = (events as u64) | ((reply_port as u64) << 32);
             syscall::send(entry.port, PTY_POLL, entry.handle as u64, 0, d2, 0);
             let rev = if let Some(msg) = syscall::recv_msg(reply_port) {

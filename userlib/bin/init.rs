@@ -148,7 +148,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let srv_port = match syscall::ns_lookup(b"initramfs") {
         Some(p) => {
             syscall::debug_puts(b"  init: ns_lookup(initramfs) = port ");
-            print_num(p as u64);
+            print_num(p);
             syscall::debug_puts(b"\n");
             p
         }
@@ -158,12 +158,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     };
 
-    let reply_port = syscall::port_create() as u32;
+    let reply_port = syscall::port_create();
 
     // IO_CONNECT to open hello.txt
     let name = b"hello.txt";
     let (w0, w1, _) = pack_name(name);
-    let d2 = (name.len() as u64) | ((reply_port as u64) << 32);
+    let d2 = (name.len() as u64) | (reply_port << 32);
     syscall::send(srv_port, 0x100, w0, w1, d2, 0);
 
     let (handle, size, srv_aspace) = if let Some(reply) = syscall::recv_msg(reply_port) {
@@ -185,7 +185,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"\n");
 
     // Inline read (up to 40 bytes)
-    let d2_read = size.min(40) | ((reply_port as u64) << 32);
+    let d2_read = size.min(40) | (reply_port << 32);
     syscall::send(srv_port, 0x200, handle, 0, d2_read, 0);
 
     for _ in 0..20 { syscall::yield_now(); }
@@ -222,7 +222,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // IO_READ with grant: data[0]=handle, data[1]=offset, data[2]=length|(reply<<32), data[3]=grant_va
     // Server detects grant mode by data[3] != 0.
-    let d2_grant = size | ((reply_port as u64) << 32);
+    let d2_grant = size | (reply_port << 32);
     syscall::send(srv_port, 0x200, handle, 0, d2_grant, grant_dst_va as u64);
 
     for _ in 0..20 { syscall::yield_now(); }
@@ -265,7 +265,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let rd_port = match syscall::ns_lookup(b"ramdisk") {
         Some(p) => {
             syscall::debug_puts(b"  init: ns_lookup(ramdisk) = port ");
-            print_num(p as u64);
+            print_num(p);
             syscall::debug_puts(b"\n");
             p
         }
@@ -276,12 +276,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     };
 
-    let rd_reply = syscall::port_create() as u32;
+    let rd_reply = syscall::port_create();
 
     // Connect to ramdisk.
     let rd_name = b"ramdisk";
     let (rn0, rn1, _) = pack_name(rd_name);
-    let rd_d2 = (rd_name.len() as u64) | ((rd_reply as u64) << 32);
+    let rd_d2 = (rd_name.len() as u64) | (rd_reply << 32);
     syscall::send(rd_port, 0x100, rn0, rn1, rd_d2, 0);
 
     let rd_aspace = if let Some(reply) = syscall::recv_msg(rd_reply) {
@@ -305,7 +305,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // Actually, we only have 4 data words via send(). For inline writes, just pack the data
     // into data[3] (the grant_va field is 0 for inline).
     let test_data: u64 = 0x0A_21_4B_4F_74_73_65_54; // "TestOK!\n" little-endian
-    let wr_d2 = 8u64 | ((rd_reply as u64) << 32);
+    let wr_d2 = 8u64 | (rd_reply << 32);
     syscall::send(rd_port, 0x300, 0, 0, wr_d2, test_data);
 
     for _ in 0..20 { syscall::yield_now(); }
@@ -319,7 +319,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // Inline read back: 8 bytes from offset 0.
-    let rd_d2_read = 8u64 | ((rd_reply as u64) << 32);
+    let rd_d2_read = 8u64 | (rd_reply << 32);
     syscall::send(rd_port, 0x200, 0, 0, rd_d2_read, 0);
 
     for _ in 0..20 { syscall::yield_now(); }
@@ -351,7 +351,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::grant_pages(rd_aspace, wr_buf, grant_wr_va, 1, false);
 
     // IO_WRITE: data[0]=handle=0, data[1]=offset=0, data[2]=256|(reply<<32), data[3]=grant_va
-    let wr_d2_g = 256u64 | ((rd_reply as u64) << 32);
+    let wr_d2_g = 256u64 | (rd_reply << 32);
     syscall::send(rd_port, 0x300, 0, 0, wr_d2_g, grant_wr_va as u64);
 
     for _ in 0..20 { syscall::yield_now(); }
@@ -376,7 +376,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let grant_rd_va: usize = 0x5_0000_0000;
     syscall::grant_pages(rd_aspace, rd_buf, grant_rd_va, 1, false);
 
-    let rd_d2_g = 256u64 | ((rd_reply as u64) << 32);
+    let rd_d2_g = 256u64 | (rd_reply << 32);
     syscall::send(rd_port, 0x200, 0, 0, rd_d2_g, grant_rd_va as u64);
 
     for _ in 0..20 { syscall::yield_now(); }
@@ -421,14 +421,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let blk_port = syscall::ns_lookup(b"blk");
     if let Some(bp) = blk_port {
         syscall::debug_puts(b"  init: ns_lookup(blk) = port ");
-        print_num(bp as u64);
+        print_num(bp);
         syscall::debug_puts(b"\n");
 
-        let blk_reply = syscall::port_create() as u32;
+        let blk_reply = syscall::port_create();
 
         // IO_CONNECT to blk server.
         let (bn0, bn1, _) = pack_name(b"blk");
-        let blk_d2 = 3u64 | ((blk_reply as u64) << 32);
+        let blk_d2 = 3u64 | (blk_reply << 32);
         syscall::send(bp, 0x100, bn0, bn1, blk_d2, 0);
 
         let blk_aspace = if let Some(reply) = syscall::recv_msg(blk_reply) {
@@ -461,7 +461,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::grant_pages(blk_aspace, blk_buf, blk_grant_va, 1, false);
 
             // IO_READ 512 bytes at offset 0 (sector 0 = boot sector).
-            let blk_rd_d2 = 512u64 | ((blk_reply as u64) << 32);
+            let blk_rd_d2 = 512u64 | (blk_reply << 32);
             syscall::send(bp, 0x200, 0, 0, blk_rd_d2, blk_grant_va as u64);
 
             if let Some(rr) = syscall::recv_msg(blk_reply) {
@@ -499,7 +499,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing FAT16 filesystem...\n");
 
     // Wait for fat16_srv to register.
-    let mut fat16_port: Option<u32> = None;
+    let mut fat16_port: Option<u64> = None;
     for _ in 0..500 {
         if let Some(p) = syscall::ns_lookup(b"fat16") {
             fat16_port = Some(p);
@@ -510,15 +510,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     if let Some(fp) = fat16_port {
         syscall::debug_puts(b"  init: ns_lookup(fat16) = port ");
-        print_num(fp as u64);
+        print_num(fp);
         syscall::debug_puts(b"\n");
 
-        let fs_reply = syscall::port_create() as u32;
+        let fs_reply = syscall::port_create();
 
         // FS_OPEN "HELLO.TXT"
         let fname = b"HELLO.TXT";
         let (fn0, fn1, _) = pack_name(fname);
-        let fs_d2 = (fname.len() as u64) | ((fs_reply as u64) << 32);
+        let fs_d2 = (fname.len() as u64) | (fs_reply << 32);
         syscall::send(fp, 0x2000, fn0, fn1, fs_d2, 0);
 
         let mut fs_ok = false;
@@ -534,7 +534,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 if file_size == 17 {
                     // FS_READ inline (17 bytes fits in 3 words = 24 bytes max)
-                    let rd_d2 = file_size | ((fs_reply as u64) << 32);
+                    let rd_d2 = file_size | (fs_reply << 32);
                     syscall::send(fp, 0x2100, handle, 0, rd_d2, 0);
 
                     if let Some(rr) = syscall::recv_msg(fs_reply) {
@@ -590,7 +590,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // Give console_srv time to start and register.
     for _ in 0..200 { syscall::yield_now(); }
 
-    let mut con_port: Option<u32> = None;
+    let mut con_port: Option<u64> = None;
     for _ in 0..500 {
         if let Some(p) = syscall::ns_lookup(b"console") {
             con_port = Some(p);
@@ -601,15 +601,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     if let Some(cp) = con_port {
         syscall::debug_puts(b"  init: ns_lookup(console) = port ");
-        print_num(cp as u64);
+        print_num(cp);
         syscall::debug_puts(b"\n");
 
-        let con_reply = syscall::port_create() as u32;
+        let con_reply = syscall::port_create();
 
         // CON_WRITE test: send a test string.
         let test_msg = b"Phase 11 OK\n";
         let (w0, w1, _) = pack_name(test_msg);
-        let d2 = (test_msg.len() as u64) | ((con_reply as u64) << 32);
+        let d2 = (test_msg.len() as u64) | (con_reply << 32);
         syscall::send(cp, 0x3100, w0, w1, d2, 0);
 
         if let Some(reply) = syscall::recv_msg(con_reply) {
@@ -640,7 +640,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // Give net_srv time to start and register.
     for _ in 0..200 { syscall::yield_now(); }
 
-    let mut net_port: Option<u32> = None;
+    let mut net_port: Option<u64> = None;
     for _ in 0..500 {
         if let Some(p) = syscall::ns_lookup(b"net") {
             net_port = Some(p);
@@ -651,14 +651,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     if let Some(np) = net_port {
         syscall::debug_puts(b"  init: ns_lookup(net) = port ");
-        print_num(np as u64);
+        print_num(np);
         syscall::debug_puts(b"\n");
 
-        let net_reply = syscall::port_create() as u32;
+        let net_reply = syscall::port_create();
 
         // NET_PING gateway (10.0.2.2).
         let target_ip: u64 = (10u64 << 24) | (0 << 16) | (2 << 8) | 2; // 0x0A000202
-        syscall::send(np, 0x4100, target_ip, net_reply as u64, 0, 0);
+        syscall::send(np, 0x4100, target_ip, net_reply, 0, 0);
 
         // Wait for reply (blocking — net_srv always replies with OK or FAIL).
         let mut ping_ok = false;
@@ -704,12 +704,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing exec from filesystem...\n");
 
     if let Some(fp) = fat16_port {
-        let exec_reply = syscall::port_create() as u32;
+        let exec_reply = syscall::port_create();
 
         // FS_OPEN "HELLO.ELF"
         let fname = b"HELLO.ELF";
         let (fn0, fn1, _) = pack_name(fname);
-        let fs_d2 = (fname.len() as u64) | ((exec_reply as u64) << 32);
+        let fs_d2 = (fname.len() as u64) | (exec_reply << 32);
         syscall::send(fp, 0x2000, fn0, fn1, fs_d2, 0);
 
         let mut exec_ok = false;
@@ -734,7 +734,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         while offset < file_size {
                             let remaining = file_size - offset;
                             let chunk = if remaining > 512 { 512 } else { remaining };
-                            let rd_d2 = (chunk as u64) | ((exec_reply as u64) << 32);
+                            let rd_d2 = (chunk as u64) | (exec_reply << 32);
                             syscall::send(fp, 0x2100, handle, offset as u64, rd_d2, grant_dst as u64);
 
                             if let Some(msg) = syscall::recv_msg(exec_reply) {
@@ -808,16 +808,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing writable FAT16...\n");
 
     if let Some(fp) = fat16_port {
-        let wr_reply = syscall::port_create() as u32;
+        let wr_reply = syscall::port_create();
 
         // FS_CREATE "TEST.TXT"
         let fname = b"TEST.TXT";
         let (fn0, fn1, _) = pack_name(fname);
-        let fs_d2 = (fname.len() as u64) | ((wr_reply as u64) << 32);
+        let fs_d2 = (fname.len() as u64) | (wr_reply << 32);
         syscall::debug_puts(b"  init: sending FS_CREATE to port ");
-        print_num(fp as u64);
+        print_num(fp);
         syscall::debug_puts(b" reply=");
-        print_num(wr_reply as u64);
+        print_num(wr_reply);
         syscall::debug_puts(b"\n");
         syscall::send(fp, 0x2500, fn0, fn1, fs_d2, 0);
         syscall::debug_puts(b"  init: FS_CREATE sent, waiting reply\n");
@@ -858,7 +858,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(if grant_ok { b"  init: grant ok\n" } else { b"  init: grant FAIL\n" });
                     if grant_ok {
                         // FS_WRITE: data[0]=handle, data[1]=length|(reply<<32), data[2]=grant_va
-                        let wd1 = (test_data.len() as u64) | ((wr_reply as u64) << 32);
+                        let wd1 = (test_data.len() as u64) | (wr_reply << 32);
                         syscall::send(fp, 0x2600, handle, wd1, grant_dst as u64, 0);
                         syscall::debug_puts(b"  init: FS_WRITE sent\n");
 
@@ -882,7 +882,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                                 // Now re-open and verify.
                                 let (fn0b, fn1b, _) = pack_name(fname);
-                                let fs_d2b = (fname.len() as u64) | ((wr_reply as u64) << 32);
+                                let fs_d2b = (fname.len() as u64) | (wr_reply << 32);
                                 syscall::send(fp, 0x2000, fn0b, fn1b, fs_d2b, 0);
 
                                 syscall::debug_puts(b"  init: re-opening\n");
@@ -905,7 +905,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                                 core::ptr::write_bytes(scratch as *mut u8, 0, 512);
                                             }
                                             if syscall::grant_pages(rsrv, scratch, grant_rd, 1, false) {
-                                                let rd_d2 = (rsize as u64) | ((wr_reply as u64) << 32);
+                                                let rd_d2 = (rsize as u64) | (wr_reply << 32);
                                                 syscall::send(fp, 0x2100, rh, 0, rd_d2, grant_rd as u64);
 
                                                 if let Some(rd_msg) = syscall::recv_msg(wr_reply) {
@@ -956,10 +956,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Test 15: Pipe IPC ---
     syscall::debug_puts(b"  init: testing pipe IPC...\n");
 
-    let pipe_port = syscall::port_create() as u32;
+    let pipe_port = syscall::port_create();
 
     // Spawn pipe_upper (reads from pipe_port, uppercases, prints via debug_puts).
-    let pipe_tid = syscall::spawn_with_arg(b"pipe_upper", 50, pipe_port as u64);
+    let pipe_tid = syscall::spawn_with_arg(b"pipe_upper", 50, pipe_port);
     if pipe_tid != u64::MAX {
         // Give reader a moment to start and block on recv.
         for _ in 0..10 { syscall::yield_now(); }
@@ -1081,11 +1081,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     });
 
     if tcp_net_port != 0 {
-        let tcp_reply = syscall::port_create() as u32;
+        let tcp_reply = syscall::port_create();
 
         // NET_TCP_CONNECT: data[0]=dst_ip (BE), data[1]= port | (reply_port << 16)
         let dst_ip: u64 = (10u64 << 24) | (0 << 16) | (2 << 8) | 100; // 10.0.2.100
-        let d1_connect = 1234u64 | ((tcp_reply as u64) << 16);
+        let d1_connect = 1234u64 | (tcp_reply << 16);
         syscall::send(tcp_net_port, 0x4200, dst_ip, d1_connect, 0, 0);
 
         let mut tcp_ok = false;
@@ -1109,14 +1109,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 for i in 0..test_str.len().saturating_sub(8).min(8) {
                     d3 |= (test_str[8 + i] as u64) << (i * 8);
                 }
-                let d1_send = (test_str.len() as u64) | ((tcp_reply as u64) << 16);
+                let d1_send = (test_str.len() as u64) | (tcp_reply << 16);
                 syscall::send(tcp_net_port, 0x4300, conn_id, d1_send, d2, d3);
 
                 // Wait for SEND_OK.
                 if let Some(sr) = syscall::recv_msg(tcp_reply) {
                     if sr.tag == 0x4301 {
                         // NET_TCP_RECV: data[0]=conn_id, data[1]=0|(reply<<16)
-                        let d1_recv = (tcp_reply as u64) << 16;
+                        let d1_recv = tcp_reply << 16;
                         syscall::send(tcp_net_port, 0x4400, conn_id, d1_recv, 0, 0);
 
                         // Wait for NET_TCP_DATA.
@@ -1147,7 +1147,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 // NET_TCP_CLOSE.
-                syscall::send(tcp_net_port, 0x4500, conn_id, tcp_reply as u64, 0, 0);
+                syscall::send(tcp_net_port, 0x4500, conn_id, tcp_reply, 0, 0);
                 // Wait for close OK (best effort).
                 let _ = syscall::recv_msg(tcp_reply);
             } else {
@@ -1205,7 +1205,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: running capability test...\n");
     {
         // Register a test service for ns_lookup cap brokering test.
-        let svc_port = syscall::port_create() as u32;
+        let svc_port = syscall::port_create();
         syscall::ns_register(b"cap_svc", svc_port);
 
         // Spawn cap_test (no special arg0 needed).
@@ -1246,11 +1246,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         if let Some(cache_port) = cache_port_opt {
-            let cache_reply = syscall::port_create() as u32;
+            let cache_reply = syscall::port_create();
 
             // IO_CONNECT to cache_srv.
             let (n0, n1, _) = syscall::pack_name(b"cache_blk");
-            let d2 = 9u64 | ((cache_reply as u64) << 32);
+            let d2 = 9u64 | (cache_reply << 32);
             syscall::send(cache_port, 0x100, n0, n1, d2, 0);
 
             if let Some(cr) = syscall::recv_msg(cache_reply) {
@@ -1259,7 +1259,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                     if let Some(scratch_va) = syscall::mmap_anon(0, 1, 1) {
                         let grant_va: usize = 0x7_0000_0000;
-                        let rd2 = 512u64 | ((cache_reply as u64) << 32);
+                        let rd2 = 512u64 | (cache_reply << 32);
                         let mut test_ok = true;
 
                         // Helper: read a sector via cache_srv grant.
@@ -1287,7 +1287,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if !cache_read(3584) { test_ok = false; }
 
                         // Query stats after read-ahead test.
-                        let sd0 = (cache_reply as u64) << 32;
+                        let sd0 = cache_reply << 32;
                         syscall::send(cache_port, 0xC100, sd0, 0, 0, 0);
                         let (hits_after_readahead, misses_after_readahead) =
                             if let Some(sr) = syscall::recv_msg(cache_reply) {
@@ -1348,8 +1348,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing L4 handoff IPC...\n");
     {
         // Test that blocking send/recv with parking works correctly.
-        let req_port = syscall::port_create() as u32;
-        let rply_port = syscall::port_create() as u32;
+        let req_port = syscall::port_create();
+        let rply_port = syscall::port_create();
         let mut handoff_ok = true;
 
         // Test 1: queue path — send then recv on same port.
@@ -1367,16 +1367,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test 2: cross-server IPC exercises park + wake + inject.
         // Send NS_LOOKUP to name server, recv reply on our reply port.
-        let nsrv = syscall::nsrv_port() as u32;
+        let nsrv = syscall::nsrv_port();
         let ns_tag: u64 = 0x1100; // NS_LOOKUP
         let name = b"blk\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
         let w0 = u64::from_le_bytes(name[0..8].try_into().unwrap());
         let w1 = u64::from_le_bytes(name[8..16].try_into().unwrap());
         let w2 = u64::from_le_bytes(name[16..24].try_into().unwrap());
-        let len_reply = 3u64 | ((rply_port as u64) << 32);
+        let len_reply = 3u64 | (rply_port << 32);
         syscall::send(nsrv, ns_tag, w0, w1, w2, len_reply);
         if let Some(reply) = syscall::recv_msg(rply_port) {
-            let port_id = reply.data[0] as u32;
+            let port_id = reply.data[0];
             if port_id == 0 || port_id > 63 {
                 syscall::debug_puts(b"  init: L4 ns_lookup got bad port\n");
                 handoff_ok = false;
@@ -1464,17 +1464,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing cap transfer via IPC...\n");
     {
         // Create a notification port that child will listen on.
-        let port_notify = syscall::port_create() as u32;
+        let port_notify = syscall::port_create();
 
         let pid = syscall::fork();
         if pid == 0 {
             // Child: create our own port and tell parent about it.
-            let port_child = syscall::port_create() as u32;
+            let port_child = syscall::port_create();
             syscall::send(port_notify, 0xAA, port_child as u64, 0, 0, 0);
 
             // Recv on our port — parent will send_cap granting us SEND on a new port.
             if let Some(msg) = syscall::recv_msg(port_child) {
-                let granted_port = msg.data[3] as u32; // data[3] = granted port ID
+                let granted_port = msg.data[3]; // data[3] = granted port ID
                 // Try to send on the granted port — this should work if cap transfer succeeded.
                 syscall::send(granted_port, 0xBB, 0xCAFE, 0, 0, 0);
                 syscall::exit(77); // success
@@ -1482,11 +1482,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::exit(99); // failure
         } else if pid > 0 {
             // Parent: create a new port AFTER fork — child doesn't have caps for it.
-            let port_secret = syscall::port_create() as u32;
+            let port_secret = syscall::port_create();
 
             // Recv child's port_child ID.
             if let Some(msg) = syscall::recv_msg(port_notify) {
-                let port_child = msg.data[0] as u32;
+                let port_child = msg.data[0];
 
                 // Transfer SEND cap for port_secret to child via port_child.
                 // Rights: 1 = SEND
@@ -1763,11 +1763,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         if let Some(cache_port) = cache_port_opt {
-            let reply_port = syscall::port_create() as u32;
+            let reply_port = syscall::port_create();
 
             // IO_CONNECT to cache_srv.
             let (n0, n1, _) = syscall::pack_name(b"cache_blk");
-            let d2 = 9u64 | ((reply_port as u64) << 32);
+            let d2 = 9u64 | (reply_port << 32);
             syscall::send(cache_port, 0x100, n0, n1, d2, 0);
 
             if let Some(cr) = syscall::recv_msg(reply_port) {
@@ -1853,7 +1853,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let recv_before = syscall::vm_stats(16); // IPC_RECVS
 
         // Do IPC work.
-        let tp = syscall::port_create() as u32;
+        let tp = syscall::port_create();
         syscall::send_nb(tp, 0xBEEF, 42, 0);
         let _ = syscall::recv_nb_msg(tp);
         syscall::port_destroy(tp);
@@ -1877,7 +1877,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         userlib::profile::trace_enable();
 
         // Do operations to generate trace events.
-        let tp2 = syscall::port_create() as u32;
+        let tp2 = syscall::port_create();
         syscall::send_nb(tp2, 0xAAAA, 1, 2);
         let _ = syscall::recv_nb_msg(tp2);
         syscall::port_destroy(tp2);
@@ -1939,10 +1939,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Create the service port here and pass it to security_srv via arg0.
         // This avoids ns_register timing issues during test.
-        let sec_port = syscall::port_create() as u32;
+        let sec_port = syscall::port_create();
 
         // Spawn security_srv with the pre-created port as arg0.
-        let sec_tid = syscall::spawn_with_arg(b"security_srv", 50, sec_port as u64);
+        let sec_tid = syscall::spawn_with_arg(b"security_srv", 50, sec_port);
         if sec_tid == u64::MAX {
             syscall::debug_puts(b"  init: security_srv spawn FAILED\n");
             sec_ok = false;
@@ -1952,7 +1952,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         for _ in 0..50 { syscall::yield_now(); }
 
         if sec_ok {
-            let reply = syscall::port_create() as u32;
+            let reply = syscall::port_create();
 
             // Part A: Login with valid credentials (root).
             // username_hash=0x0001_0001, password_hash=0x0001_0002
@@ -1961,7 +1961,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let cred_roles;
             if let Some(r) = syscall::recv_msg(reply) {
                 if r.tag == 0x701 { // SEC_LOGIN_OK
-                    cred_port = r.data[0] as u32;
+                    cred_port = r.data[0];
                     cred_roles = r.data[1];
                     if cred_roles != 0x03 { // ADMIN|USER
                         syscall::debug_puts(b"  init: login roles wrong\n");
@@ -1993,7 +1993,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             if sec_ok && cred_port != 0 {
                 // Part C: Verify credential.
-                syscall::send(sec_port, 0x703, cred_port as u64, 0, reply as u64, 0);
+                syscall::send(sec_port, 0x703, cred_port, 0, reply as u64, 0);
                 if let Some(r) = syscall::recv_msg(reply) {
                     if r.tag == 0x704 { // SEC_VERIFY_OK
                         if r.data[1] != cred_roles || r.data[2] != 0x0001_0001 {
@@ -2009,7 +2009,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 // Part D: Revoke credential.
-                syscall::send(sec_port, 0x706, cred_port as u64, 0, reply as u64, 0);
+                syscall::send(sec_port, 0x706, cred_port, 0, reply as u64, 0);
                 if let Some(r) = syscall::recv_msg(reply) {
                     if r.tag != 0x707 { // SEC_REVOKE_OK
                         syscall::debug_puts(b"  init: revoke failed\n");
@@ -2020,7 +2020,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 // Part E: Verify after revoke should fail.
-                syscall::send(sec_port, 0x703, cred_port as u64, 0, reply as u64, 0);
+                syscall::send(sec_port, 0x703, cred_port, 0, reply as u64, 0);
                 if let Some(r) = syscall::recv_msg(reply) {
                     if r.tag != 0x705 { // SEC_VERIFY_FAIL
                         syscall::debug_puts(b"  init: verify after revoke not denied\n");
@@ -2217,12 +2217,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         };
 
         if let Some(ext2_port) = ext2_port {
-            let reply_port = syscall::port_create() as u32;
+            let reply_port = syscall::port_create();
 
             // Step 2: Open hello.txt
             {
                 let (n0, n1, _) = pack_name(b"hello.txt");
-                let d2 = 9u64 | ((reply_port as u64) << 32);
+                let d2 = 9u64 | (reply_port << 32);
                 syscall::send(ext2_port, 0x2000, n0, n1, d2, 0);
             }
 
@@ -2249,7 +2249,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 // Step 3: Read hello.txt content (inline, small file).
                 {
-                    let d2 = file_size | ((reply_port as u64) << 32);
+                    let d2 = file_size | (reply_port << 32);
                     syscall::send(ext2_port, 0x2100, handle, 0, d2, 0);
                 }
 
@@ -2277,7 +2277,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 // Step 4: FS_STAT — verify Unix permissions.
                 {
-                    let d2 = reply_port as u64;
+                    let d2 = reply_port;
                     syscall::send(ext2_port, 0x2300, handle, 0, d2, 0);
                 }
 
@@ -2449,7 +2449,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         // Set a controlling terminal (use a dummy port).
-        let ctty_port = syscall::port_create() as u32;
+        let ctty_port = syscall::port_create();
         if !syscall::set_ctty(ctty_port) {
             syscall::debug_puts(b"  init: set_ctty failed\n");
             phase43_ok = false;
@@ -2840,8 +2840,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let mut phase46_ok = true;
 
         // Spawn shm_srv with a pre-created port.
-        let shm_port = syscall::port_create() as u32;
-        let shm_tid = syscall::spawn_with_arg(b"shm_srv", 50, shm_port as u64);
+        let shm_port = syscall::port_create();
+        let shm_tid = syscall::spawn_with_arg(b"shm_srv", 50, shm_port);
         if shm_tid == u64::MAX {
             syscall::debug_puts(b"  FAIL: cannot spawn shm_srv\n");
             phase46_ok = false;
@@ -2976,7 +2976,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let mut phase47_ok = true;
 
         // Initialize FD table with a dummy console port.
-        let dummy_console = syscall::port_create() as u32;
+        let dummy_console = syscall::port_create();
         userlib::fd::fd_init(dummy_console);
 
         // FDs 0, 1, 2 should be open after init.
@@ -3051,7 +3051,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // dup2 to an occupied FD — should close old and replace.
             // Open a new FD at slot 5 first.
-            let test_port = syscall::port_create() as u32;
+            let test_port = syscall::port_create();
             let _ = userlib::fd::fd_open(test_port, 42, userlib::fd::FdType::Port, 0);
             // fd_open should have assigned FD 4 (lowest free).
             if !userlib::fd::fd_is_valid(4) {
@@ -3664,7 +3664,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Give VFS server time to register (retry lookup).
         let vfs_port = if phase51_ok {
-            let mut found = 0u32;
+            let mut found = 0u64;
             for _ in 0..100 {
                 if let Some(p) = syscall::ns_lookup(b"vfs") {
                     found = p;
@@ -3705,11 +3705,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Test 1: Mount ext2 on "/".
         // VFS wire: data[0..1]=path(16B), data[2]=path_len(16)|reply(32), data[3]=fs_port
         if phase51_ok {
-            let reply_port = syscall::port_create() as u32;
+            let reply_port = syscall::port_create();
             let path = b"/";
             let (w0, w1, _w2) = pack_name(path);
-            let d2 = (path.len() as u64) | ((reply_port as u64) << 32);
-            syscall::send(vfs_port, VFS_MOUNT, w0, w1, d2, ext2_port as u64);
+            let d2 = (path.len() as u64) | (reply_port << 32);
+            syscall::send(vfs_port, VFS_MOUNT, w0, w1, d2, ext2_port);
 
             let mut mounted = false;
             for _ in 0..100 {
@@ -3731,11 +3731,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test 2: Mount fat16 on "/mnt".
         if phase51_ok && fat16_port != 0 {
-            let reply_port = syscall::port_create() as u32;
+            let reply_port = syscall::port_create();
             let path = b"/mnt";
             let (w0, w1, _w2) = pack_name(path);
-            let d2 = (path.len() as u64) | ((reply_port as u64) << 32);
-            syscall::send(vfs_port, VFS_MOUNT, w0, w1, d2, fat16_port as u64);
+            let d2 = (path.len() as u64) | (reply_port << 32);
+            syscall::send(vfs_port, VFS_MOUNT, w0, w1, d2, fat16_port);
 
             let mut mnt_ok = false;
             for _ in 0..100 {
@@ -3762,16 +3762,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test 3: VFS_OPEN "/hello.txt" — should resolve to ext2 on "/".
         if phase51_ok {
-            let reply_port = syscall::port_create() as u32;
+            let reply_port = syscall::port_create();
             let path = b"/hello.txt";
             let (w0, w1, _w2) = pack_name(path);
-            let d2 = (path.len() as u64) | ((reply_port as u64) << 32);
+            let d2 = (path.len() as u64) | (reply_port << 32);
             syscall::send(vfs_port, VFS_OPEN, w0, w1, d2, 0);
 
             let mut open_ok = false;
             if let Some(reply) = syscall::recv_msg(reply_port) {
                 if reply.tag == VFS_OPEN_OK {
-                    let ret_fs_port = reply.data[0] as u32;
+                    let ret_fs_port = reply.data[0];
                     if ret_fs_port == ext2_port {
                         open_ok = true;
                     } else {
@@ -3790,16 +3790,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test 4: VFS_OPEN "/mnt/HELLO.TXT" — should resolve to fat16 on "/mnt".
         if phase51_ok && fat16_port != 0 {
-            let reply_port = syscall::port_create() as u32;
+            let reply_port = syscall::port_create();
             let path = b"/mnt/HELLO.TXT";
             let (w0, w1, _w2) = pack_name(path);
-            let d2 = (path.len() as u64) | ((reply_port as u64) << 32);
+            let d2 = (path.len() as u64) | (reply_port << 32);
             syscall::send(vfs_port, VFS_OPEN, w0, w1, d2, 0);
 
             let mut open_ok = false;
             if let Some(reply) = syscall::recv_msg(reply_port) {
                 if reply.tag == VFS_OPEN_OK {
-                    if reply.data[0] as u32 == fat16_port {
+                    if reply.data[0] == fat16_port {
                         open_ok = true;
                     }
                 }
@@ -3813,10 +3813,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test 5: Path normalization — "/a/../hello.txt" resolves to "/hello.txt".
         if phase51_ok {
-            let reply_port = syscall::port_create() as u32;
+            let reply_port = syscall::port_create();
             let path = b"/a/../hello.txt";
             let (w0, w1, _w2) = pack_name(path);
-            let d2 = (path.len() as u64) | ((reply_port as u64) << 32);
+            let d2 = (path.len() as u64) | (reply_port << 32);
             syscall::send(vfs_port, VFS_OPEN, w0, w1, d2, 0);
             if let Some(reply) = syscall::recv_msg(reply_port) {
                 if reply.tag == VFS_OPEN_OK {
@@ -3872,7 +3872,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 53 ext2 write: SKIPPED (no ext2)\n");
         }
 
-        let reply_port = if phase53_ok { syscall::port_create() as u32 } else { 0 };
+        let reply_port = if phase53_ok { syscall::port_create() } else { 0 };
 
         // Step 1: FS_CREATE "WTEST.TXT"
         let mut handle = 0u64;
@@ -3880,7 +3880,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase53_ok {
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((reply_port as u64) << 32);
+            let d2 = (fname.len() as u64) | (reply_port << 32);
             syscall::send(ext2_port, 0x2500, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(reply_port) {
                 if reply.tag == 0x2501 {
@@ -3909,7 +3909,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let grant_dst: usize = 0x8_0000_0000;
                 let grant_ok = syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false);
                 if grant_ok {
-                    let wd1 = 64u64 | ((reply_port as u64) << 32);
+                    let wd1 = 64u64 | (reply_port << 32);
                     syscall::send(ext2_port, 0x2600, handle, wd1, grant_dst as u64, 0);
                     if let Some(wr) = syscall::recv_msg(reply_port) {
                         if wr.tag != 0x2601 || wr.data[0] != 64 {
@@ -3940,7 +3940,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase53_ok {
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((reply_port as u64) << 32);
+            let d2 = (fname.len() as u64) | (reply_port << 32);
             syscall::send(ext2_port, 0x2000, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(reply_port) {
                 if reply.tag == 0x2001 {
@@ -3957,7 +3957,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if let Some(scratch) = syscall::mmap_anon(0, 1, 1) {
                             let grant_dst: usize = 0x8_0000_0000;
                             if syscall::grant_pages(r_aspace, scratch, grant_dst, 1, false) {
-                                let rd2 = 64u64 | ((reply_port as u64) << 32);
+                                let rd2 = 64u64 | (reply_port << 32);
                                 syscall::send(ext2_port, 0x2100, rh, 0, rd2, grant_dst as u64);
                                 if let Some(rd) = syscall::recv_msg(reply_port) {
                                     if rd.tag == 0x2101 && rd.data[0] == 64 {
@@ -4000,7 +4000,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase53_ok {
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((reply_port as u64) << 32);
+            let d2 = (fname.len() as u64) | (reply_port << 32);
             syscall::send(ext2_port, 0x2700, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(reply_port) {
                 if reply.tag != 0x2701 {
@@ -4015,7 +4015,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::sleep_ms(20);
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((reply_port as u64) << 32);
+            let d2 = (fname.len() as u64) | (reply_port << 32);
             syscall::send(ext2_port, 0x2000, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(reply_port) {
                 if reply.tag == 0x2001 {
@@ -4033,7 +4033,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase53_ok {
             let fname = b"hello.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((reply_port as u64) << 32);
+            let d2 = (fname.len() as u64) | (reply_port << 32);
             syscall::send(ext2_port, 0x2000, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(reply_port) {
                 if reply.tag == 0x2001 {
@@ -4066,7 +4066,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Look up tmpfs port.
         let tmpfs_port = if phase54_ok {
-            let mut found = 0u32;
+            let mut found = 0u64;
             for _ in 0..100 {
                 if let Some(p) = syscall::ns_lookup(b"tmpfs") {
                     found = p;
@@ -4081,7 +4081,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             found
         } else { 0 };
 
-        let rp = if phase54_ok { syscall::port_create() as u32 } else { 0 };
+        let rp = if phase54_ok { syscall::port_create() } else { 0 };
 
         // Step 1: FS_CREATE "test.txt"
         let mut handle = 0u64;
@@ -4089,7 +4089,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase54_ok {
             let fname = b"test.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(tmpfs_port, 0x2500, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2501 {
@@ -4113,7 +4113,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 let grant_dst: usize = 0x8_0000_0000;
                 if syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false) {
-                    let wd1 = 48u64 | ((rp as u64) << 32);
+                    let wd1 = 48u64 | (rp << 32);
                     syscall::send(tmpfs_port, 0x2600, handle, wd1, grant_dst as u64, 0);
                     if let Some(wr) = syscall::recv_msg(rp) {
                         if wr.tag != 0x2601 || wr.data[0] != 48 {
@@ -4136,7 +4136,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase54_ok {
             let fname = b"test.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(tmpfs_port, 0x2000, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2001 {
@@ -4152,7 +4152,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if let Some(scratch) = syscall::mmap_anon(0, 1, 1) {
                             let grant_dst: usize = 0x8_0000_0000;
                             if syscall::grant_pages(r_aspace, scratch, grant_dst, 1, false) {
-                                let rd2 = 48u64 | ((rp as u64) << 32);
+                                let rd2 = 48u64 | (rp << 32);
                                 syscall::send(tmpfs_port, 0x2100, rh, 0, rd2, grant_dst as u64);
                                 if let Some(rd) = syscall::recv_msg(rp) {
                                     if rd.tag == 0x2101 && rd.data[0] == 48 {
@@ -4187,7 +4187,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase54_ok {
             let fname = b"other.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(tmpfs_port, 0x2500, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2501 {
@@ -4204,7 +4204,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let mut count = 0u32;
             let mut next = 0u64;
             for _ in 0..10 {
-                syscall::send(tmpfs_port, 0x2200, next, 0, rp as u64, 0);
+                syscall::send(tmpfs_port, 0x2200, next, 0, rp, 0);
                 if let Some(reply) = syscall::recv_msg(rp) {
                     if reply.tag == 0x2201 {
                         count += 1;
@@ -4224,7 +4224,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase54_ok {
             let fname = b"test.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(tmpfs_port, 0x2700, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag != 0x2701 {
@@ -4238,7 +4238,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase54_ok {
             let fname = b"test.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(tmpfs_port, 0x2000, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2001 {
@@ -4254,7 +4254,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let mut count = 0u32;
             let mut next = 0u64;
             for _ in 0..10 {
-                syscall::send(tmpfs_port, 0x2200, next, 0, rp as u64, 0);
+                syscall::send(tmpfs_port, 0x2200, next, 0, rp, 0);
                 if let Some(reply) = syscall::recv_msg(rp) {
                     if reply.tag == 0x2201 {
                         count += 1;
@@ -4272,7 +4272,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase54_ok {
             let fname = b"other.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(tmpfs_port, 0x2700, fn0, fn1, d2, 0);
             syscall::recv_msg(rp);
         }
@@ -4298,7 +4298,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Look up devfs port.
         let devfs_port = if phase55_ok {
-            let mut found = 0u32;
+            let mut found = 0u64;
             for _ in 0..100 {
                 if let Some(p) = syscall::ns_lookup(b"devfs") {
                     found = p;
@@ -4313,20 +4313,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             found
         } else { 0 };
 
-        let rp = if phase55_ok { syscall::port_create() as u32 } else { 0 };
+        let rp = if phase55_ok { syscall::port_create() } else { 0 };
 
         // Test 1: /dev/null — write succeeds, read returns EOF
         if phase55_ok {
             let fname = b"null";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(devfs_port, 0x2000, fn0, fn1, d2, 0); // FS_OPEN
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2001 { // FS_OPEN_OK
                     let h = reply.data[0];
 
                     // Write 16 bytes — should succeed (discard).
-                    let wd1 = (16u64) | ((rp as u64) << 32);
+                    let wd1 = (16u64) | (rp << 32);
                     syscall::send(devfs_port, 0x2600, h, wd1, 0, 0); // FS_WRITE
                     if let Some(wr) = syscall::recv_msg(rp) {
                         if wr.tag != 0x2601 { // FS_WRITE_OK
@@ -4337,7 +4337,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                     // Read — should return 0 bytes (EOF).
                     if phase55_ok {
-                        let rd2 = (8u64) | ((rp as u64) << 32);
+                        let rd2 = (8u64) | (rp << 32);
                         syscall::send(devfs_port, 0x2100, h, 0, rd2, 0); // FS_READ
                         if let Some(rr) = syscall::recv_msg(rp) {
                             if rr.tag == 0x2101 { // FS_READ_OK
@@ -4362,13 +4362,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase55_ok {
             let fname = b"zero";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(devfs_port, 0x2000, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2001 {
                     let h = reply.data[0];
 
-                    let rd2 = (8u64) | ((rp as u64) << 32);
+                    let rd2 = (8u64) | (rp << 32);
                     syscall::send(devfs_port, 0x2100, h, 0, rd2, 0);
                     if let Some(rr) = syscall::recv_msg(rp) {
                         if rr.tag == 0x2101 {
@@ -4397,14 +4397,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase55_ok {
             let fname = b"full";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(devfs_port, 0x2000, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2001 {
                     let h = reply.data[0];
 
                     // Write should fail with FS_ERROR.
-                    let wd1 = (16u64) | ((rp as u64) << 32);
+                    let wd1 = (16u64) | (rp << 32);
                     syscall::send(devfs_port, 0x2600, h, wd1, 0, 0);
                     if let Some(wr) = syscall::recv_msg(rp) {
                         if wr.tag != 0x2F00 { // FS_ERROR
@@ -4415,7 +4415,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                     // Read should return zeros.
                     if phase55_ok {
-                        let rd2 = (8u64) | ((rp as u64) << 32);
+                        let rd2 = (8u64) | (rp << 32);
                         syscall::send(devfs_port, 0x2100, h, 0, rd2, 0);
                         if let Some(rr) = syscall::recv_msg(rp) {
                             if rr.tag == 0x2101 {
@@ -4441,13 +4441,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase55_ok {
             let fname = b"random";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(devfs_port, 0x2000, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2001 {
                     let h = reply.data[0];
 
-                    let rd2 = (8u64) | ((rp as u64) << 32);
+                    let rd2 = (8u64) | (rp << 32);
                     syscall::send(devfs_port, 0x2100, h, 0, rd2, 0);
                     if let Some(rr) = syscall::recv_msg(rp) {
                         if rr.tag == 0x2101 {
@@ -4477,7 +4477,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let mut count = 0usize;
             let mut next_off = 0u64;
             for _ in 0..20 {
-                let d2 = rp as u64;
+                let d2 = rp;
                 syscall::send(devfs_port, 0x2200, next_off, 0, d2, 0); // FS_READDIR
                 if let Some(rr) = syscall::recv_msg(rp) {
                     if rr.tag == 0x2201 { // FS_READDIR_OK
@@ -4513,7 +4513,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Look up procfs port.
         let procfs_port = if phase56_ok {
-            let mut found = 0u32;
+            let mut found = 0u64;
             for _ in 0..100 {
                 if let Some(p) = syscall::ns_lookup(b"procfs") {
                     found = p;
@@ -4528,20 +4528,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             found
         } else { 0 };
 
-        let rp = if phase56_ok { syscall::port_create() as u32 } else { 0 };
+        let rp = if phase56_ok { syscall::port_create() } else { 0 };
 
         // Test 1: open "meminfo", read, verify non-empty
         if phase56_ok {
             let fname = b"meminfo";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(procfs_port, 0x2000, fn0, fn1, d2, 0); // FS_OPEN
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2001 { // FS_OPEN_OK
                     let h = reply.data[0];
 
                     // Read inline.
-                    let rd2 = (24u64) | ((rp as u64) << 32);
+                    let rd2 = (24u64) | (rp << 32);
                     syscall::send(procfs_port, 0x2100, h, 0, rd2, 0); // FS_READ
                     if let Some(rr) = syscall::recv_msg(rp) {
                         if rr.tag == 0x2101 { // FS_READ_OK
@@ -4573,13 +4573,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase56_ok {
             let fname = b"1/status";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(procfs_port, 0x2000, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2001 {
                     let h = reply.data[0];
 
-                    let rd2 = (24u64) | ((rp as u64) << 32);
+                    let rd2 = (24u64) | (rp << 32);
                     syscall::send(procfs_port, 0x2100, h, 0, rd2, 0);
                     if let Some(rr) = syscall::recv_msg(rp) {
                         if rr.tag == 0x2101 {
@@ -4615,13 +4615,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase56_ok {
             let fname = b"uptime";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(procfs_port, 0x2000, fn0, fn1, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2001 {
                     let h = reply.data[0];
 
-                    let rd2 = (24u64) | ((rp as u64) << 32);
+                    let rd2 = (24u64) | (rp << 32);
                     syscall::send(procfs_port, 0x2100, h, 0, rd2, 0);
                     if let Some(rr) = syscall::recv_msg(rp) {
                         if rr.tag == 0x2101 {
@@ -4654,7 +4654,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let mut count = 0usize;
             let mut next_off = 0u64;
             for _ in 0..40 {
-                let d2 = rp as u64;
+                let d2 = rp;
                 syscall::send(procfs_port, 0x2200, next_off, 0, d2, 0); // FS_READDIR
                 if let Some(rr) = syscall::recv_msg(rp) {
                     if rr.tag == 0x2201 { // FS_READDIR_OK
@@ -4686,7 +4686,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 57 uds: FAILED (spawn)\n");
         } else {
             // Wait for server to register.
-            let mut uds_port = 0u32;
+            let mut uds_port = 0u64;
             {
                 let mut tries = 0;
                 while tries < 200 {
@@ -4718,7 +4718,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             #[allow(dead_code)]
             const UDS_EOF: u64 = 0x81FF;
 
-            let reply_port = syscall::port_create() as u32;
+            let reply_port = syscall::port_create();
 
             // Helper: pack name into 2 u64 words.
             let pack_name = |name: &[u8]| -> (u64, u64) {
@@ -4738,13 +4738,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             };
 
             // 1. Create a server-side listening socket.
-            let mut srv_listen = u32::MAX;
+            let mut srv_listen = u64::MAX;
             if phase57_ok {
-                let d2 = (reply_port as u64) << 32;
+                let d2 = reply_port << 32;
                 syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0); // type=0 (STREAM)
                 if let Some(m) = syscall::recv_msg(reply_port) {
                     if m.tag == UDS_OK {
-                        srv_listen = m.data[0] as u32;
+                        srv_listen = m.data[0];
                     } else {
                         syscall::debug_puts(b"  FAIL: UDS_SOCKET failed\n");
                         phase57_ok = false;
@@ -4756,8 +4756,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if phase57_ok {
                 let (n0, n1) = pack_name(b"test.sock");
                 let name_len = 9u64;
-                let d2 = name_len | ((reply_port as u64) << 32);
-                syscall::send(uds_port, UDS_BIND, srv_listen as u64, n0, d2, n1);
+                let d2 = name_len | (reply_port << 32);
+                syscall::send(uds_port, UDS_BIND, srv_listen, n0, d2, n1);
                 if let Some(m) = syscall::recv_msg(reply_port) {
                     if m.tag != UDS_OK {
                         syscall::debug_puts(b"  FAIL: UDS_BIND failed\n");
@@ -4768,8 +4768,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // 3. Listen.
             if phase57_ok {
-                let d2 = (reply_port as u64) << 32;
-                syscall::send(uds_port, UDS_LISTEN, srv_listen as u64, 4, d2, 0);
+                let d2 = reply_port << 32;
+                syscall::send(uds_port, UDS_LISTEN, srv_listen, 4, d2, 0);
                 if let Some(m) = syscall::recv_msg(reply_port) {
                     if m.tag != UDS_OK {
                         syscall::debug_puts(b"  FAIL: UDS_LISTEN failed\n");
@@ -4779,18 +4779,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             // 4. Connect (creates both endpoints, returns client-end).
-            let mut cli_end = u32::MAX;
+            let mut cli_end = u64::MAX;
             if phase57_ok {
                 let (n0, n1) = pack_name(b"test.sock");
                 let name_len = 9u64;
-                let d2 = name_len | ((reply_port as u64) << 32);
+                let d2 = name_len | (reply_port << 32);
                 let pid = syscall::getpid() as u64;
                 let uid = syscall::getuid() as u64;
                 let d3 = pid | (uid << 32);
                 syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, d3);
                 if let Some(m) = syscall::recv_msg(reply_port) {
                     if m.tag == UDS_OK {
-                        cli_end = m.data[0] as u32;
+                        cli_end = m.data[0];
                     } else {
                         syscall::debug_puts(b"  FAIL: UDS_CONNECT failed\n");
                         phase57_ok = false;
@@ -4799,13 +4799,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             // 5. Accept (dequeues the server-end).
-            let mut srv_end = u32::MAX;
+            let mut srv_end = u64::MAX;
             if phase57_ok {
-                let d2 = (reply_port as u64) << 32;
-                syscall::send(uds_port, UDS_ACCEPT, srv_listen as u64, 0, d2, 0);
+                let d2 = reply_port << 32;
+                syscall::send(uds_port, UDS_ACCEPT, srv_listen, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(reply_port) {
                     if m.tag == UDS_OK {
-                        srv_end = m.data[0] as u32;
+                        srv_end = m.data[0];
                     } else {
                         syscall::debug_puts(b"  FAIL: UDS_ACCEPT failed\n");
                         phase57_ok = false;
@@ -4816,8 +4816,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // 6. Client sends "hello" to server via cli_end.
             if phase57_ok {
                 let (w0, w1) = pack_name(b"hello");
-                let d2 = 5u64 | ((reply_port as u64) << 32);
-                syscall::send(uds_port, UDS_SEND, cli_end as u64, w0, d2, w1);
+                let d2 = 5u64 | (reply_port << 32);
+                syscall::send(uds_port, UDS_SEND, cli_end, w0, d2, w1);
                 if let Some(m) = syscall::recv_msg(reply_port) {
                     if m.tag != UDS_OK || m.data[0] != 5 {
                         syscall::debug_puts(b"  FAIL: UDS_SEND hello failed\n");
@@ -4828,8 +4828,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // 7. Server recvs on srv_end -> should get "hello".
             if phase57_ok {
-                let d2 = (reply_port as u64) << 32;
-                syscall::send(uds_port, UDS_RECV, srv_end as u64, 0, d2, 0);
+                let d2 = reply_port << 32;
+                syscall::send(uds_port, UDS_RECV, srv_end, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(reply_port) {
                     if m.tag != UDS_OK {
                         syscall::debug_puts(b"  FAIL: UDS_RECV failed\n");
@@ -4854,8 +4854,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // 8. Server sends "world" back via srv_end.
             if phase57_ok {
                 let (w0, w1) = pack_name(b"world");
-                let d2 = 5u64 | ((reply_port as u64) << 32);
-                syscall::send(uds_port, UDS_SEND, srv_end as u64, w0, d2, w1);
+                let d2 = 5u64 | (reply_port << 32);
+                syscall::send(uds_port, UDS_SEND, srv_end, w0, d2, w1);
                 if let Some(m) = syscall::recv_msg(reply_port) {
                     if m.tag != UDS_OK || m.data[0] != 5 {
                         syscall::debug_puts(b"  FAIL: UDS_SEND world failed\n");
@@ -4866,8 +4866,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // 9. Client recvs on cli_end -> should get "world".
             if phase57_ok {
-                let d2 = (reply_port as u64) << 32;
-                syscall::send(uds_port, UDS_RECV, cli_end as u64, 0, d2, 0);
+                let d2 = reply_port << 32;
+                syscall::send(uds_port, UDS_RECV, cli_end, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(reply_port) {
                     if m.tag != UDS_OK {
                         syscall::debug_puts(b"  FAIL: UDS_RECV world failed\n");
@@ -4884,8 +4884,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // 10. Getpeercred test on srv_end.
             if phase57_ok {
-                let d2 = (reply_port as u64) << 32;
-                syscall::send(uds_port, UDS_GETPEERCRED, srv_end as u64, 0, d2, 0);
+                let d2 = reply_port << 32;
+                syscall::send(uds_port, UDS_GETPEERCRED, srv_end, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(reply_port) {
                     if m.tag != UDS_OK {
                         syscall::debug_puts(b"  FAIL: UDS_GETPEERCRED failed\n");
@@ -4902,8 +4902,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // 11. Close client end, verify server recv gets EOF.
             if phase57_ok {
-                let d2 = (reply_port as u64) << 32;
-                syscall::send(uds_port, UDS_CLOSE, cli_end as u64, 0, d2, 0);
+                let d2 = reply_port << 32;
+                syscall::send(uds_port, UDS_CLOSE, cli_end, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(reply_port) {
                     if m.tag != UDS_OK {
                         syscall::debug_puts(b"  FAIL: UDS_CLOSE failed\n");
@@ -4912,8 +4912,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             }
             if phase57_ok {
-                let d2 = (reply_port as u64) << 32;
-                syscall::send(uds_port, UDS_RECV, srv_end as u64, 0, d2, 0);
+                let d2 = reply_port << 32;
+                syscall::send(uds_port, UDS_RECV, srv_end, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(reply_port) {
                     if m.tag != UDS_EOF {
                         syscall::debug_puts(b"  FAIL: expected EOF after close\n");
@@ -4923,9 +4923,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             // Clean up.
-            if srv_end != u32::MAX {
-                let d2 = (reply_port as u64) << 32;
-                syscall::send(uds_port, UDS_CLOSE, srv_end as u64, 0, d2, 0);
+            if srv_end != u64::MAX {
+                let d2 = reply_port << 32;
+                syscall::send(uds_port, UDS_CLOSE, srv_end, 0, d2, 0);
                 let _ = syscall::recv_msg(reply_port);
             }
 
@@ -4985,7 +4985,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             };
             if uds_port == 0 { ok = false; }
 
-            let rp = syscall::port_create() as u32;
+            let rp = syscall::port_create();
 
             let pack_name = |name: &[u8]| -> (u64, u64) {
                 let mut w0 = 0u64;
@@ -5004,12 +5004,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             };
 
             // socket(STREAM)
-            let mut srv_h = u32::MAX;
+            let mut srv_h = u64::MAX;
             if ok {
-                let d2 = (rp as u64) << 32;
+                let d2 = rp << 32;
                 syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag == UDS_OK { srv_h = m.data[0] as u32; }
+                    if m.tag == UDS_OK { srv_h = m.data[0]; }
                     else { ok = false; syscall::debug_puts(b"  FAIL58: socket\n"); }
                 }
             }
@@ -5017,8 +5017,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // bind("p58.sock")
             if ok {
                 let (n0, n1) = pack_name(b"p58.sock");
-                let d2 = 8u64 | ((rp as u64) << 32);
-                syscall::send(uds_port, UDS_BIND, srv_h as u64, n0, d2, n1);
+                let d2 = 8u64 | (rp << 32);
+                syscall::send(uds_port, UDS_BIND, srv_h, n0, d2, n1);
                 if let Some(m) = syscall::recv_msg(rp) {
                     if m.tag != UDS_OK { ok = false; syscall::debug_puts(b"  FAIL58: bind\n"); }
                 }
@@ -5026,34 +5026,34 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // listen
             if ok {
-                let d2 = (rp as u64) << 32;
-                syscall::send(uds_port, UDS_LISTEN, srv_h as u64, 4, d2, 0);
+                let d2 = rp << 32;
+                syscall::send(uds_port, UDS_LISTEN, srv_h, 4, d2, 0);
                 if let Some(m) = syscall::recv_msg(rp) {
                     if m.tag != UDS_OK { ok = false; syscall::debug_puts(b"  FAIL58: listen\n"); }
                 }
             }
 
             // connect("p58.sock") — returns client-end handle
-            let mut cli_h = u32::MAX;
+            let mut cli_h = u64::MAX;
             if ok {
                 let (n0, n1) = pack_name(b"p58.sock");
-                let d2 = 8u64 | ((rp as u64) << 32);
+                let d2 = 8u64 | (rp << 32);
                 let pid = syscall::getpid() as u64;
                 let uid = syscall::getuid() as u64;
                 syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, pid | (uid << 32));
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag == UDS_OK { cli_h = m.data[0] as u32; }
+                    if m.tag == UDS_OK { cli_h = m.data[0]; }
                     else { ok = false; syscall::debug_puts(b"  FAIL58: connect\n"); }
                 }
             }
 
             // accept — returns server-end handle
-            let mut acc_h = u32::MAX;
+            let mut acc_h = u64::MAX;
             if ok {
-                let d2 = (rp as u64) << 32;
-                syscall::send(uds_port, UDS_ACCEPT, srv_h as u64, 0, d2, 0);
+                let d2 = rp << 32;
+                syscall::send(uds_port, UDS_ACCEPT, srv_h, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag == UDS_OK { acc_h = m.data[0] as u32; }
+                    if m.tag == UDS_OK { acc_h = m.data[0]; }
                     else { ok = false; syscall::debug_puts(b"  FAIL58: accept\n"); }
                 }
             }
@@ -5061,15 +5061,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // send "Hi" on cli, recv on acc
             if ok {
                 let (w0, w1) = pack_name(b"Hi");
-                let d2 = 2u64 | ((rp as u64) << 32);
-                syscall::send(uds_port, UDS_SEND, cli_h as u64, w0, d2, w1);
+                let d2 = 2u64 | (rp << 32);
+                syscall::send(uds_port, UDS_SEND, cli_h, w0, d2, w1);
                 if let Some(m) = syscall::recv_msg(rp) {
                     if m.tag != UDS_OK { ok = false; }
                 }
             }
             if ok {
-                let d2 = (rp as u64) << 32;
-                syscall::send(uds_port, UDS_RECV, acc_h as u64, 0, d2, 0);
+                let d2 = rp << 32;
+                syscall::send(uds_port, UDS_RECV, acc_h, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(rp) {
                     if m.tag != UDS_OK || m.data[2] != 2 || (m.data[0] & 0xFF) as u8 != b'H' {
                         ok = false;
@@ -5081,15 +5081,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // send "Ok" on acc, recv on cli
             if ok {
                 let (w0, w1) = pack_name(b"Ok");
-                let d2 = 2u64 | ((rp as u64) << 32);
-                syscall::send(uds_port, UDS_SEND, acc_h as u64, w0, d2, w1);
+                let d2 = 2u64 | (rp << 32);
+                syscall::send(uds_port, UDS_SEND, acc_h, w0, d2, w1);
                 if let Some(m) = syscall::recv_msg(rp) {
                     if m.tag != UDS_OK { ok = false; }
                 }
             }
             if ok {
-                let d2 = (rp as u64) << 32;
-                syscall::send(uds_port, UDS_RECV, cli_h as u64, 0, d2, 0);
+                let d2 = rp << 32;
+                syscall::send(uds_port, UDS_RECV, cli_h, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(rp) {
                     if m.tag != UDS_OK || (m.data[0] & 0xFF) as u8 != b'O' {
                         ok = false;
@@ -5100,14 +5100,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // close client, verify EOF on server recv
             if ok {
-                let d2 = (rp as u64) << 32;
-                syscall::send(uds_port, UDS_CLOSE, cli_h as u64, 0, d2, 0);
+                let d2 = rp << 32;
+                syscall::send(uds_port, UDS_CLOSE, cli_h, 0, d2, 0);
                 let _ = syscall::recv_msg(rp);
-                cli_h = u32::MAX;
+                cli_h = u64::MAX;
             }
             if ok {
-                let d2 = (rp as u64) << 32;
-                syscall::send(uds_port, UDS_RECV, acc_h as u64, 0, d2, 0);
+                let d2 = rp << 32;
+                syscall::send(uds_port, UDS_RECV, acc_h, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(rp) {
                     if m.tag != UDS_EOF {
                         ok = false;
@@ -5118,31 +5118,31 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // Larger data test: send 32 bytes in two chunks, recv both
             // Re-create a fresh connection for this.
-            let mut cli2 = u32::MAX;
-            let mut acc2 = u32::MAX;
+            let mut cli2 = u64::MAX;
+            let mut acc2 = u64::MAX;
             if ok {
                 let (n0, n1) = pack_name(b"p58.sock");
-                let d2 = 8u64 | ((rp as u64) << 32);
+                let d2 = 8u64 | (rp << 32);
                 let pid = syscall::getpid() as u64;
                 syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, pid);
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag == UDS_OK { cli2 = m.data[0] as u32; }
+                    if m.tag == UDS_OK { cli2 = m.data[0]; }
                     else { ok = false; }
                 }
             }
             if ok {
-                let d2 = (rp as u64) << 32;
-                syscall::send(uds_port, UDS_ACCEPT, srv_h as u64, 0, d2, 0);
+                let d2 = rp << 32;
+                syscall::send(uds_port, UDS_ACCEPT, srv_h, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag == UDS_OK { acc2 = m.data[0] as u32; }
+                    if m.tag == UDS_OK { acc2 = m.data[0]; }
                     else { ok = false; }
                 }
             }
             // Send 16 bytes "ABCDEFGHIJKLMNOP"
             if ok {
                 let (w0, w1) = pack_name(b"ABCDEFGHIJKLMNOP");
-                let d2 = 16u64 | ((rp as u64) << 32);
-                syscall::send(uds_port, UDS_SEND, cli2 as u64, w0, d2, w1);
+                let d2 = 16u64 | (rp << 32);
+                syscall::send(uds_port, UDS_SEND, cli2, w0, d2, w1);
                 if let Some(m) = syscall::recv_msg(rp) {
                     if m.tag != UDS_OK || m.data[0] != 16 {
                         ok = false;
@@ -5152,8 +5152,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
             // Recv should get 16 bytes back
             if ok {
-                let d2 = (rp as u64) << 32;
-                syscall::send(uds_port, UDS_RECV, acc2 as u64, 0, d2, 0);
+                let d2 = rp << 32;
+                syscall::send(uds_port, UDS_RECV, acc2, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(rp) {
                     if m.tag != UDS_OK || m.data[2] != 16 || (m.data[0] & 0xFF) as u8 != b'A' {
                         ok = false;
@@ -5163,19 +5163,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             // Clean up.
-            if cli2 != u32::MAX {
-                let d2 = (rp as u64) << 32;
-                syscall::send(uds_port, UDS_CLOSE, cli2 as u64, 0, d2, 0);
+            if cli2 != u64::MAX {
+                let d2 = rp << 32;
+                syscall::send(uds_port, UDS_CLOSE, cli2, 0, d2, 0);
                 let _ = syscall::recv_msg(rp);
             }
-            if acc2 != u32::MAX {
-                let d2 = (rp as u64) << 32;
-                syscall::send(uds_port, UDS_CLOSE, acc2 as u64, 0, d2, 0);
+            if acc2 != u64::MAX {
+                let d2 = rp << 32;
+                syscall::send(uds_port, UDS_CLOSE, acc2, 0, d2, 0);
                 let _ = syscall::recv_msg(rp);
             }
-            if acc_h != u32::MAX {
-                let d2 = (rp as u64) << 32;
-                syscall::send(uds_port, UDS_CLOSE, acc_h as u64, 0, d2, 0);
+            if acc_h != u64::MAX {
+                let d2 = rp << 32;
+                syscall::send(uds_port, UDS_CLOSE, acc_h, 0, d2, 0);
                 let _ = syscall::recv_msg(rp);
             }
 
@@ -5443,14 +5443,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         };
 
-        let rp = if phase61_ok { syscall::port_create() as u32 } else { 0 };
+        let rp = if phase61_ok { syscall::port_create() } else { 0 };
 
         // Create a test file for locking.
         let mut handle = 0u64;
         if phase61_ok {
             let fname = b"locktest";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(tmpfs_port, 0x2500, fn0, fn1, d2, 0); // FS_CREATE
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2501 {
@@ -5467,7 +5467,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let pid = syscall::getpid() as u32;
             let d0 = handle | (2u64 << 32); // LOCK_EX = 2
             let d1 = pid as u64;
-            let d2 = (rp as u64) << 32;
+            let d2 = rp << 32;
             syscall::send(tmpfs_port, 0x2800, d0, d1, d2, 0); // FS_FLOCK
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag != 0x2801 {
@@ -5480,7 +5480,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let pid = syscall::getpid() as u32;
             let d0 = handle | (8u64 << 32); // LOCK_UN = 8
             let d1 = pid as u64;
-            let d2 = (rp as u64) << 32;
+            let d2 = rp << 32;
             syscall::send(tmpfs_port, 0x2800, d0, d1, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag != 0x2801 {
@@ -5494,7 +5494,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase61_ok {
             // PID 100: LOCK_SH
             let d0 = handle | (1u64 << 32); // LOCK_SH = 1
-            let d2 = (rp as u64) << 32;
+            let d2 = rp << 32;
             syscall::send(tmpfs_port, 0x2800, d0, 100u64, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag != 0x2801 {
@@ -5506,7 +5506,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase61_ok {
             // PID 200: LOCK_SH — should also succeed (shared).
             let d0 = handle | (1u64 << 32);
-            let d2 = (rp as u64) << 32;
+            let d2 = rp << 32;
             syscall::send(tmpfs_port, 0x2800, d0, 200u64, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag != 0x2801 {
@@ -5519,7 +5519,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Test 3: flock(LOCK_EX|LOCK_NB) with existing SH locks — should get EAGAIN.
         if phase61_ok {
             let d0 = handle | (6u64 << 32); // LOCK_EX|LOCK_NB = 2|4 = 6
-            let d2 = (rp as u64) << 32;
+            let d2 = rp << 32;
             syscall::send(tmpfs_port, 0x2800, d0, 300u64, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag != 0x28FF { // FS_LOCK_ERR expected
@@ -5532,7 +5532,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Cleanup: unlock both SH locks.
         if phase61_ok {
             let d0 = handle | (8u64 << 32);
-            let d2 = (rp as u64) << 32;
+            let d2 = rp << 32;
             syscall::send(tmpfs_port, 0x2800, d0, 100u64, d2, 0);
             let _ = syscall::recv_msg(rp);
             syscall::send(tmpfs_port, 0x2800, d0, 200u64, d2, 0);
@@ -5544,7 +5544,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // PID 100: write lock [0, 100)
             let d0 = handle | (1u64 << 32); // lock_type=F_WRLCK(1) in bits 32..47
             let d1 = 0u64; // start = 0
-            let d2 = 100u64 | ((rp as u64) << 32); // len = 100
+            let d2 = 100u64 | (rp << 32); // len = 100
             let d3 = 100u64; // pid = 100
             syscall::send(tmpfs_port, 0x2820, d0, d1, d2, d3); // FS_SETLK
             if let Some(reply) = syscall::recv_msg(rp) {
@@ -5558,7 +5558,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // PID 200: write lock [100, 200) — no overlap, should succeed.
             let d0 = handle | (1u64 << 32);
             let d1 = 100u64;
-            let d2 = 100u64 | ((rp as u64) << 32);
+            let d2 = 100u64 | (rp << 32);
             let d3 = 200u64;
             syscall::send(tmpfs_port, 0x2820, d0, d1, d2, d3);
             if let Some(reply) = syscall::recv_msg(rp) {
@@ -5574,7 +5574,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // PID 300 queries write lock [0,100) — should see PID 100's lock.
             let d0 = handle | (1u64 << 32); // F_WRLCK
             let d1 = 0u64;
-            let d2 = 100u64 | ((rp as u64) << 32);
+            let d2 = 100u64 | (rp << 32);
             let d3 = 300u64;
             syscall::send(tmpfs_port, 0x2810, d0, d1, d2, d3); // FS_GETLK
             if let Some(reply) = syscall::recv_msg(rp) {
@@ -5599,7 +5599,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase61_ok {
             // PID 100: F_UNLCK [0,100)
             let d0 = handle | (2u64 << 32); // F_UNLCK=2
-            let d2 = 100u64 | ((rp as u64) << 32);
+            let d2 = 100u64 | (rp << 32);
             syscall::send(tmpfs_port, 0x2820, d0, 0u64, d2, 100u64);
             let _ = syscall::recv_msg(rp);
             // PID 200: F_UNLCK [100,200)
@@ -5612,7 +5612,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Open a second handle to the same file.
             let fname = b"locktest";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | ((rp as u64) << 32);
+            let d2 = (fname.len() as u64) | (rp << 32);
             // Pack PID=400 in d3.
             syscall::send(tmpfs_port, 0x2000, fn0, fn1, d2, 400u64); // FS_OPEN
             if let Some(reply) = syscall::recv_msg(rp) {
@@ -5620,7 +5620,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     let h2 = reply.data[0];
                     // Take exclusive lock with PID 400.
                     let d0 = h2 | (2u64 << 32); // LOCK_EX
-                    let d2 = (rp as u64) << 32;
+                    let d2 = rp << 32;
                     syscall::send(tmpfs_port, 0x2800, d0, 400u64, d2, 0);
                     if let Some(lr) = syscall::recv_msg(rp) {
                         if lr.tag != 0x2801 {
@@ -5634,7 +5634,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // Now PID 500 should be able to take EX lock.
                     if phase61_ok {
                         let d0 = handle | (6u64 << 32); // LOCK_EX|LOCK_NB
-                        let d2 = (rp as u64) << 32;
+                        let d2 = rp << 32;
                         syscall::send(tmpfs_port, 0x2800, d0, 500u64, d2, 0);
                         if let Some(lr2) = syscall::recv_msg(rp) {
                             if lr2.tag != 0x2801 {
@@ -5644,7 +5644,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         }
                         // Clean up: unlock.
                         let d0 = handle | (8u64 << 32);
-                        let d2 = (rp as u64) << 32;
+                        let d2 = rp << 32;
                         syscall::send(tmpfs_port, 0x2800, d0, 500u64, d2, 0);
                         let _ = syscall::recv_msg(rp);
                     }
@@ -5911,13 +5911,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 for i in 8..path_len.min(16) {
                     w1 |= (path[i] as u64) << ((i - 8) * 8);
                 }
-                let reply = syscall::port_create() as u32;
-                let d2 = (path_len as u64) | ((reply as u64) << 32);
+                let reply = syscall::port_create();
+                let d2 = (path_len as u64) | (reply << 32);
                 syscall::send(vp, 0x6010, w0, w1, d2, 0); // VFS_OPEN
 
                 if let Some(resp) = syscall::recv_msg(reply) {
                     if resp.tag == 0x6110 { // VFS_OPEN_OK
-                        let fs_port = resp.data[0] as u32;
+                        let fs_port = resp.data[0];
                         let handle = resp.data[1] as u32;
                         let size = resp.data[2];
                         syscall::debug_puts(b"      /etc/passwd opened, size=");
@@ -5928,8 +5928,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         }
 
                         // Read content to verify.
-                        let read_reply = syscall::port_create() as u32;
-                        let rd2 = 16u64 | ((read_reply as u64) << 32);
+                        let read_reply = syscall::port_create();
+                        let rd2 = 16u64 | ((read_reply) << 32);
                         syscall::send(fs_port, 0x2100, handle as u64, 0, rd2, 0); // FS_READ
                         if let Some(rr) = syscall::recv_msg(read_reply) {
                             if rr.tag == 0x2101 { // FS_READ_OK
@@ -5955,8 +5955,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         syscall::port_destroy(read_reply);
 
                         // Close.
-                        let close_reply = syscall::port_create() as u32;
-                        let cd2 = (close_reply as u64) << 32;
+                        let close_reply = syscall::port_create();
+                        let cd2 = (close_reply) << 32;
                         syscall::send(fs_port, 0x2400, handle as u64, 0, cd2, 0);
                         let _ = syscall::recv_msg(close_reply);
                         syscall::port_destroy(close_reply);
@@ -6009,8 +6009,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         {
             let pipe_port = syscall::ns_lookup(b"pipe");
             if let Some(pp) = pipe_port {
-                let reply = syscall::port_create() as u32;
-                let d2 = (reply as u64) << 32;
+                let reply = syscall::port_create();
+                let d2 = reply << 32;
                 syscall::send(pp, 0x5010, 0, 0, d2, 0); // PIPE_CREATE
                 if let Some(resp) = syscall::recv_msg(reply) {
                     if resp.tag == 0x5100 { // PIPE_OK
@@ -6022,8 +6022,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             let msg_bytes: u64 = 0x6F6C6C6568; // "hello" LE
                             let wd2 = 5u64 | (0xFFFFFFFF_u64 << 32);
                             syscall::send(pp, 0x5020, wh as u64, msg_bytes, wd2, 0);
-                            let cr = syscall::port_create() as u32;
-                            let cd = (cr as u64) << 32;
+                            let cr = syscall::port_create();
+                            let cd = cr << 32;
                             syscall::send(pp, 0x5040, wh as u64, 0, cd, 0);
                             let _ = syscall::recv_msg(cr);
                             syscall::port_destroy(cr);
@@ -6034,8 +6034,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             syscall::debug_puts(b"      pipe fork failed, skipping\n");
                             phase63_ok = false;
                         } else {
-                            let rr = syscall::port_create() as u32;
-                            let rd2 = (rr as u64) << 32;
+                            let rr = syscall::port_create();
+                            let rd2 = rr << 32;
                             syscall::send(pp, 0x5030, rh as u64, 0, rd2, 0); // PIPE_READ
                             if let Some(data) = syscall::recv_msg(rr) {
                                 if data.tag == 0x5100 { // PIPE_OK
@@ -6057,8 +6057,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             }
                         }
 
-                        let cr2 = syscall::port_create() as u32;
-                        let cd2 = (cr2 as u64) << 32;
+                        let cr2 = syscall::port_create();
+                        let cd2 = cr2 << 32;
                         syscall::send(pp, 0x5040, rh as u64, 0, cd2, 0);
                         let _ = syscall::recv_msg(cr2);
                         syscall::port_destroy(cr2);
@@ -6247,11 +6247,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             };
             if phase68_ok {
                 // Test 1: eventfd — create, write 5, read → expect 5.
-                let reply = syscall::port_create() as u32;
-                let d2 = (reply as u64) << 32; // flags=0, reply in high32
+                let reply = syscall::port_create();
+                let d2 = reply << 32; // flags=0, reply in high32
                 syscall::send(event_port, 0x7000, 0, 0, d2, 0); // EVT_EVENTFD=0, initval=0
                 let msg = syscall::recv_msg(reply).unwrap();
-                let efd_port = msg.data[0] as u32;
+                let efd_port = msg.data[0];
                 let efd_handle = msg.data[1] as u32;
 
                 if msg.tag != 0x7100 {
@@ -6259,8 +6259,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     phase68_ok = false;
                 } else {
                     // Write 5 to eventfd.
-                    let reply2 = syscall::port_create() as u32;
-                    let d2w = (reply2 as u64) << 32;
+                    let reply2 = syscall::port_create();
+                    let d2w = reply2 << 32;
                     syscall::send(efd_port, 0x7020, efd_handle as u64, 5, d2w, 0);
                     let wmsg = syscall::recv_msg(reply2).unwrap();
                     syscall::port_destroy(reply2);
@@ -6271,8 +6271,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
 
                     // Read from eventfd.
-                    let reply3 = syscall::port_create() as u32;
-                    let d2r = (reply3 as u64) << 32;
+                    let reply3 = syscall::port_create();
+                    let d2r = reply3 << 32;
                     syscall::send(efd_port, 0x7010, efd_handle as u64, 0, d2r, 0);
                     let rmsg = syscall::recv_msg(reply3).unwrap();
                     syscall::port_destroy(reply3);
@@ -6283,17 +6283,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
 
                     // Close eventfd.
-                    let reply4 = syscall::port_create() as u32;
-                    let d2c = (reply4 as u64) << 32;
+                    let reply4 = syscall::port_create();
+                    let d2c = reply4 << 32;
                     syscall::send(efd_port, 0x7030, efd_handle as u64, 0, d2c, 0);
                     let _cmsg = syscall::recv_msg(reply4);
                     syscall::port_destroy(reply4);
                 }
 
                 // Test 2: timerfd — create, set 10ms timer, busy wait, read.
-                let reply5 = syscall::port_create() as u32;
+                let reply5 = syscall::port_create();
                 // d0=type(2=timerfd), d1=initval(0), d2=flags(low32)|reply(high32)
-                syscall::send(event_port, 0x7000, 2, 0, (reply5 as u64) << 32, 0);
+                syscall::send(event_port, 0x7000, 2, 0, reply5 << 32, 0);
                 let tmsg = syscall::recv_msg(reply5).unwrap();
                 syscall::port_destroy(reply5);
 
@@ -6301,12 +6301,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"    FAIL: timerfd create\n");
                     phase68_ok = false;
                 } else {
-                    let tfd_port = tmsg.data[0] as u32;
+                    let tfd_port = tmsg.data[0];
                     let tfd_handle = tmsg.data[1] as u32;
 
                     // Set timer to 50ms (50_000_000 ns).
-                    let reply6 = syscall::port_create() as u32;
-                    syscall::send(tfd_port, 0x7040, tfd_handle as u64, 50_000_000, (reply6 as u64) << 32, 0);
+                    let reply6 = syscall::port_create();
+                    syscall::send(tfd_port, 0x7040, tfd_handle as u64, 50_000_000, reply6 << 32, 0);
                     let _smsg = syscall::recv_msg(reply6);
                     syscall::port_destroy(reply6);
 
@@ -6314,8 +6314,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::nanosleep(100_000_000);
 
                     // Read timerfd — should have at least 1 expiration.
-                    let reply7 = syscall::port_create() as u32;
-                    syscall::send(tfd_port, 0x7010, tfd_handle as u64, 0, (reply7 as u64) << 32, 0);
+                    let reply7 = syscall::port_create();
+                    syscall::send(tfd_port, 0x7010, tfd_handle as u64, 0, reply7 << 32, 0);
                     let trmsg = syscall::recv_msg(reply7).unwrap();
                     syscall::port_destroy(reply7);
 
@@ -6325,8 +6325,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
 
                     // Close timerfd.
-                    let reply8 = syscall::port_create() as u32;
-                    syscall::send(tfd_port, 0x7030, tfd_handle as u64, 0, (reply8 as u64) << 32, 0);
+                    let reply8 = syscall::port_create();
+                    syscall::send(tfd_port, 0x7030, tfd_handle as u64, 0, reply8 << 32, 0);
                     let _cmsg2 = syscall::recv_msg(reply8);
                     syscall::port_destroy(reply8);
                 }
@@ -6400,9 +6400,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             for _ in 0..500 { syscall::yield_now(); }
 
             if let Some(syslog_port) = syscall::ns_lookup(b"syslog") {
-                let reply = syscall::port_create() as u32;
+                let reply = syscall::port_create();
                 // SYSLOG_OPEN: d0=facility(0), d1=ident(0), d2=reply<<32
-                syscall::send(syslog_port, 0x9000, 0, 0, (reply as u64) << 32, 0);
+                syscall::send(syslog_port, 0x9000, 0, 0, reply << 32, 0);
                 if let Some(msg) = syscall::recv_msg(reply) {
                     if msg.tag != 0x9100 {
                         syscall::debug_puts(b"    FAIL: SYSLOG_OPEN bad reply\n");
@@ -6414,9 +6414,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 // SYSLOG_MSG: d0=priority(3=ERR), d1=msg_w0, d2=msg_w1, d3=len|reply<<32
-                let reply2 = syscall::port_create() as u32;
+                let reply2 = syscall::port_create();
                 let msg_w0 = 0x0074_7365_7400u64; // "test"
-                syscall::send(syslog_port, 0x9010, 3, msg_w0, 0, 4 | ((reply2 as u64) << 32));
+                syscall::send(syslog_port, 0x9010, 3, msg_w0, 0, 4 | (reply2 << 32));
                 if let Some(msg) = syscall::recv_msg(reply2) {
                     if msg.tag != 0x9100 {
                         syscall::debug_puts(b"    FAIL: SYSLOG_MSG bad reply\n");
@@ -6598,7 +6598,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             phase75_ok = false;
         } else {
             let ps_id = ps as u32;
-            let test_port = syscall::port_create() as u32;
+            let test_port = syscall::port_create();
             syscall::port_set_add(ps_id, test_port);
 
             // Timeout recv on empty port set — should return u64::MAX.
@@ -6679,8 +6679,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             if let Some(sysv_port) = syscall::ns_lookup(b"sysv") {
                 // SEM_GET: d0=key(0=IPC_PRIVATE), d1=nsems(1), d2=flags|reply<<32
-                let reply = syscall::port_create() as u32;
-                syscall::send(sysv_port, 0xA000, 0, 1, (reply as u64) << 32, 0);
+                let reply = syscall::port_create();
+                syscall::send(sysv_port, 0xA000, 0, 1, reply << 32, 0);
                 let mut semid = u64::MAX;
                 if let Some(msg) = syscall::recv_msg(reply) {
                     if msg.tag == 0xA100 {
@@ -6694,8 +6694,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 if semid != u64::MAX && phase79_ok {
                     // SEM_CTL SETVAL: d0=semid, d1=sem_num(0), d2=cmd(16=SETVAL)|reply<<32, d3=value(5)
-                    let reply2 = syscall::port_create() as u32;
-                    syscall::send(sysv_port, 0xA020, semid, 0, 16 | ((reply2 as u64) << 32), 5);
+                    let reply2 = syscall::port_create();
+                    syscall::send(sysv_port, 0xA020, semid, 0, 16 | (reply2 << 32), 5);
                     if let Some(msg) = syscall::recv_msg(reply2) {
                         if msg.tag != 0xA100 {
                             syscall::debug_puts(b"    FAIL: SEM_CTL SETVAL\n");
@@ -6705,8 +6705,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::port_destroy(reply2);
 
                     // SEM_CTL GETVAL: d0=semid, d1=sem_num(0), d2=cmd(12=GETVAL)|reply<<32
-                    let reply3 = syscall::port_create() as u32;
-                    syscall::send(sysv_port, 0xA020, semid, 0, 12 | ((reply3 as u64) << 32), 0);
+                    let reply3 = syscall::port_create();
+                    syscall::send(sysv_port, 0xA020, semid, 0, 12 | (reply3 << 32), 0);
                     if let Some(msg) = syscall::recv_msg(reply3) {
                         if msg.tag == 0xA110 {
                             if msg.data[0] != 5 {
@@ -6721,8 +6721,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::port_destroy(reply3);
 
                     // SEM_CTL IPC_RMID: d0=semid, d1=0, d2=cmd(0=IPC_RMID)|reply<<32
-                    let reply4 = syscall::port_create() as u32;
-                    syscall::send(sysv_port, 0xA020, semid, 0, 0 | ((reply4 as u64) << 32), 0);
+                    let reply4 = syscall::port_create();
+                    syscall::send(sysv_port, 0xA020, semid, 0, 0 | (reply4 << 32), 0);
                     if let Some(msg) = syscall::recv_msg(reply4) {
                         if msg.tag != 0xA100 {
                             syscall::debug_puts(b"    FAIL: IPC_RMID\n");
@@ -6755,11 +6755,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if let Some(vfs_port) = syscall::ns_lookup(b"vfs") {
             const VFS_MKDIR: u64 = 0x6040;
             const VFS_MKDIR_OK: u64 = 0x6140;
-            let reply = syscall::port_create() as u32;
+            let reply = syscall::port_create();
             // Pack path "pgdata" (6 bytes) into w0/w1.
             let w0: u64 = 0x617461646770; // "pgdata" LE
             let w1: u64 = 0;
-            let d2 = 6u64 | (0o755u64 << 16) | ((reply as u64) << 32);
+            let d2 = 6u64 | (0o755u64 << 16) | (reply << 32);
             syscall::send(vfs_port, VFS_MKDIR, w0, w1, d2, 0);
             if let Some(resp) = syscall::recv_msg(reply) {
                 if resp.tag == VFS_MKDIR_OK {
@@ -6781,16 +6781,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             const FS_READ: u64 = 0x2100;
             const FS_READ_OK: u64 = 0x2101;
             const FS_CLOSE: u64 = 0x2300;
-            let reply = syscall::port_create() as u32;
+            let reply = syscall::port_create();
             // Create "pg_ctl" (6 bytes).
             let n0: u64 = 0x6C74635F6770; // "pg_ctl" LE
-            let d2 = 6u64 | ((reply as u64) << 32);
+            let d2 = 6u64 | (reply << 32);
             syscall::send(ext2_port, FS_CREATE, n0, 0, d2, 0);
             if let Some(resp) = syscall::recv_msg(reply) {
                 if resp.tag == FS_CREATE_OK {
                     let handle = resp.data[0];
                     // Read back to verify handle is valid.
-                    let rd2 = 4u64 | ((reply as u64) << 32);
+                    let rd2 = 4u64 | (reply << 32);
                     syscall::send(ext2_port, FS_READ, handle, 0, rd2, 0);
                     if let Some(rd) = syscall::recv_msg(reply) {
                         if rd.tag == FS_READ_OK {
@@ -6823,10 +6823,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test POSIX shared memory via shm_srv.
         if let Some(shm_port) = syscall::ns_lookup(b"shm") {
-            let reply = syscall::port_create() as u32;
+            let reply = syscall::port_create();
             // SHM_OPEN: d0=name_w0, d1=oflag, d2=name_len|reply<<32
             let n0: u64 = 0x666275705F6770; // "pg_buf" + nul LE (7 bytes)
-            let d2 = 6u64 | (1u64 << 16) | ((reply as u64) << 32); // O_CREAT=1
+            let d2 = 6u64 | (1u64 << 16) | (reply << 32); // O_CREAT=1
             syscall::send(shm_port, 0x7010, n0, 0, d2, 0); // SHM_OPEN
             if let Some(resp) = syscall::recv_msg(reply) {
                 if resp.tag == 0x7100 { // SHM_OK
@@ -6857,9 +6857,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if let Some(net_port) = syscall::ns_lookup(b"net") {
             const NET_TCP_LISTEN: u64 = 0x4700;
             const NET_TCP_LISTEN_OK: u64 = 0x4701;
-            let reply = syscall::port_create() as u32;
+            let reply = syscall::port_create();
             // NET_TCP_LISTEN: d0=port(5432), d1=backlog(4), d2=reply<<32
-            syscall::send(net_port, NET_TCP_LISTEN, 5432, 4, (reply as u64) << 32, 0);
+            syscall::send(net_port, NET_TCP_LISTEN, 5432, 4, reply << 32, 0);
             if let Some(resp) = syscall::recv_msg(reply) {
                 if resp.tag == NET_TCP_LISTEN_OK {
                     syscall::debug_puts(b"    TCP listen 5432: OK\n");
@@ -7117,7 +7117,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         if phase105_ok {
             // Wait for proxy_srv to register with name server.
-            let mut proxy_port = 0u32;
+            let mut proxy_port = 0u64;
             for _ in 0..200 {
                 if let Some(p) = syscall::ns_lookup(b"proxy") {
                     proxy_port = p;
@@ -7132,13 +7132,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             if phase105_ok {
                 // Create a test port and a reply port.
-                let test_port = syscall::port_create() as u32;
-                let reply_port = syscall::port_create() as u32;
+                let test_port = syscall::port_create();
+                let reply_port = syscall::port_create();
 
                 // Tell proxy_srv to add node 1 = 127.0.0.1:9100
                 // (Even though loopback won't connect, we test the kernel redirect.)
                 let ip_loopback: u64 = (127 << 24) | 1; // 127.0.0.1 in big-endian-ish
-                let d2 = (9100u64) | ((reply_port as u64) << 32);
+                let d2 = (9100u64) | (reply_port << 32);
                 syscall::send(proxy_port, 0x5000, 1, ip_loopback, d2, 0);
 
                 // Wait for add_node reply.
@@ -7155,7 +7155,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // The kernel should redirect this to proxy_srv via PROXY_PORT.
                 // proxy_srv will try to forward via TCP (which may fail for loopback),
                 // but the test verifies the kernel redirect path works.
-                let remote_port = ((1u32) << 16) | (test_port & 0xFFFF);
+                let remote_port = ((1u64) << 16) | (test_port & 0xFFFF);
                 let send_result = syscall::send_nb_4(remote_port, 0x1234, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD);
 
                 // A successful send means the kernel redirected to proxy_srv

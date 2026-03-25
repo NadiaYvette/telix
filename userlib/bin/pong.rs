@@ -14,14 +14,14 @@ const BENCH_QUIT: u64 = 0x60FF;
 
 #[unsafe(no_mangle)]
 fn main(arg0: u64, _arg1: u64, _arg2: u64) {
-    let port = arg0 as u32;
+    let port = arg0;
     loop {
         if let Some(msg) = syscall::recv_msg(port) {
             if msg.tag == BENCH_QUIT {
                 break;
             }
             if msg.tag == BENCH_PING {
-                let reply_port = msg.data[0] as u32;
+                let reply_port = msg.data[0];
                 syscall::send_nb(reply_port, BENCH_PONG, 0, 0);
             }
         }

@@ -98,7 +98,7 @@ pub const IOCTL_ERR_TAG: u64 = 0x7F00;
 pub struct FdEntry {
     pub fd_type: FdType,
     /// IPC port for the backing server.
-    pub port: u32,
+    pub port: u64,
     /// Server-side handle (e.g., file handle, connection ID).
     pub handle: u32,
     /// Per-FD flags (FD_CLOEXEC).
@@ -126,7 +126,7 @@ static mut FD_TABLE: [FdEntry; MAX_FDS] = {
 
 /// Initialize the FD table. Call once at process start.
 /// Sets up FDs 0, 1, 2 pointing to the console server.
-pub fn fd_init(console_port: u32) {
+pub fn fd_init(console_port: u64) {
     unsafe {
         // stdin
         FD_TABLE[0] = FdEntry {
@@ -170,14 +170,14 @@ pub fn fd_get(fd: i32) -> Option<FdEntry> {
 
 /// Allocate the lowest available FD >= `min_fd` with the given parameters.
 /// Returns the FD number, or None if the table is full.
-pub fn fd_open(port: u32, handle: u32, fd_type: FdType, status_flags: u32) -> Option<i32> {
+pub fn fd_open(port: u64, handle: u32, fd_type: FdType, status_flags: u32) -> Option<i32> {
     fd_open_at_or_above(0, port, handle, fd_type, status_flags, 0)
 }
 
 /// Allocate the lowest available FD >= `min_fd`.
 fn fd_open_at_or_above(
     min_fd: i32,
-    port: u32,
+    port: u64,
     handle: u32,
     fd_type: FdType,
     status_flags: u32,
@@ -342,7 +342,7 @@ pub fn ioctl(fd: i32, request: u32, arg: u64) -> i32 {
         }
         _ => {
             // Route to server via IPC.
-            let reply_port = syscall::port_create() as u32;
+            let reply_port = syscall::port_create();
             let d2 = ((reply_port as u64) << 32) | (entry.handle as u64);
             syscall::send(entry.port, IOCTL_TAG, request as u64, arg, d2, 0);
             let result = if let Some(reply) = syscall::recv_msg(reply_port) {
@@ -369,7 +369,7 @@ pub fn flock(fd: i32, operation: i32) -> i32 {
     if entry.fd_type != FdType::File {
         return -1;
     }
-    let reply_port = syscall::port_create() as u32;
+    let reply_port = syscall::port_create();
     let pid = syscall::getpid() as u32;
     let d0 = (entry.handle as u64) | ((operation as u64) << 32);
     let d1 = pid as u64;
@@ -402,7 +402,7 @@ pub fn fcntl_lock(fd: i32, cmd: i32, lock: &mut Flock) -> i32 {
         _ => return -1,
     };
 
-    let reply_port = syscall::port_create() as u32;
+    let reply_port = syscall::port_create();
     let pid = syscall::getpid() as u32;
     let d0 = (entry.handle as u64) | ((lock.l_type as u16 as u64) << 32) | ((lock.l_whence as u16 as u64) << 48);
     let d1 = lock.l_start as u64;

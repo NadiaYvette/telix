@@ -327,7 +327,7 @@ impl Scheduler {
 struct SpawnParentInfo {
     parent_task: u32,
     sid: TaskId,
-    ctty_port: u32,
+    ctty_port: u64,
     uid: u32,
     euid: u32,
     gid: u32,
@@ -368,17 +368,17 @@ fn do_spawn_heavy_work(
         caps.spaces[task_id as usize] = crate::cap::CapSpace::new(task_id);
 
         let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
-        if nsrv != u32::MAX {
+        if nsrv != u64::MAX {
             caps.grant_send_cap(task_id, nsrv);
         }
 
         let iramfs = crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
-        if iramfs != u32::MAX {
+        if iramfs != u64::MAX {
             caps.grant_send_cap(task_id, iramfs);
         }
 
         if arg0_is_port {
-            caps.grant_full_port_cap(task_id, arg0 as u32);
+            caps.grant_full_port_cap(task_id, arg0);
         }
     }
 
@@ -886,7 +886,7 @@ pub fn spawn(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
 pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
     // Check port_is_active BEFORE locking SCHEDULER to avoid ABBA deadlock.
     let arg0_is_port = arg0 > 0 && (arg0 as usize) < crate::ipc::port::MAX_PORTS
-        && crate::ipc::port::port_is_active(arg0 as u32);
+        && crate::ipc::port::port_is_active(arg0);
 
     // Look up the ELF binary (no locks needed).
     let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
@@ -908,7 +908,7 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
 /// Spawn a new user-mode process from ELF data already in kernel memory.
 pub fn spawn_user_from_elf(elf_data: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
     let arg0_is_port = arg0 > 0 && (arg0 as usize) < crate::ipc::port::MAX_PORTS
-        && crate::ipc::port::port_is_active(arg0 as u32);
+        && crate::ipc::port::port_is_active(arg0);
 
     let (task_id, thread_id, parent) = SCHEDULER.lock().alloc_spawn_ids()?;
 
@@ -932,7 +932,7 @@ pub fn spawn_user_with_data(
     arg0: u64,
 ) -> Option<ThreadId> {
     let arg0_is_port = arg0 > 0 && (arg0 as usize) < crate::ipc::port::MAX_PORTS
-        && crate::ipc::port::port_is_active(arg0 as u32);
+        && crate::ipc::port::port_is_active(arg0);
 
     let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
 
@@ -1214,6 +1214,16 @@ pub fn clear_wakeup_flag(tid: ThreadId) {
 /// the relevant lock, BEFORE adding itself as a waiter and dropping the lock.
 pub fn block_current(_reason: BlockReason) {
     let tid = current_thread_id();
+    // Demote effective_priority to 254 (lowest non-idle) so try_switch
+    // re-enqueues us at the bottom. This prevents blocked-spinning threads
+    // from starving lower-priority threads on single-CPU.
+    let saved_prio = {
+        let mut sched = SCHEDULER.lock();
+        let orig = sched.threads[tid as usize].effective_priority;
+        sched.threads[tid as usize].effective_priority = 254;
+        orig
+    };
+    THREAD_PRIO[tid as usize].store(254, Ordering::Release);
     // Signal the scheduler to preempt us on the next timer tick instead of
     // waiting for the full quantum. This prevents spinning threads from
     // starving real work on SMP systems.
@@ -1242,6 +1252,12 @@ pub fn block_current(_reason: BlockReason) {
         YIELD_ASAP[tid as usize].store(true, Ordering::Release);
     }
     YIELD_ASAP[tid as usize].store(false, Ordering::Release);
+    // Restore effective priority.
+    {
+        let mut sched = SCHEDULER.lock();
+        sched.threads[tid as usize].effective_priority = saved_prio;
+    }
+    THREAD_PRIO[tid as usize].store(saved_prio, Ordering::Release);
     arch_restore_irqs(saved);
 }
 
@@ -1599,7 +1615,7 @@ pub fn send_signal_to_pgroup(pgid: u32, sig: u32) -> bool {
 
 /// Set the controlling terminal for the current session.
 /// Only the session leader can do this, and only if it has no ctty yet.
-pub fn set_ctty(port: u32) -> u64 {
+pub fn set_ctty(port: u64) -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
     let mut sched = SCHEDULER.lock();
     let my_task = sched.threads[my_tid as usize].task_id;
@@ -1764,31 +1780,21 @@ pub fn fork_current() -> u64 {
         task.rlimits = parent_rlimits;
     }
 
-    // Bootstrap capabilities: copy parent's SEND/RECV bitmaps and grant
-    // well-known port caps.
+    // Bootstrap capabilities: copy parent's capset and grant well-known port caps.
     {
-        // Copy the fast-path bitmaps so child inherits parent's port access.
-        for w in 0..crate::cap::CAP_SEND[0].len() {
-            let ps = crate::cap::CAP_SEND[parent_task_id as usize][w]
-                .load(core::sync::atomic::Ordering::Relaxed);
-            let pr = crate::cap::CAP_RECV[parent_task_id as usize][w]
-                .load(core::sync::atomic::Ordering::Relaxed);
-            crate::cap::CAP_SEND[child_task_id as usize][w]
-                .store(ps, core::sync::atomic::Ordering::Relaxed);
-            crate::cap::CAP_RECV[child_task_id as usize][w]
-                .store(pr, core::sync::atomic::Ordering::Relaxed);
-        }
+        // Copy the fast-path capset so child inherits parent's port access.
+        crate::cap::capset_copy(parent_task_id, child_task_id);
 
         let mut caps = crate::cap::CAP_SYSTEM.lock();
         caps.spaces[child_task_id as usize] = crate::cap::CapSpace::new(child_task_id);
 
         // Grant SEND caps for well-known kernel ports.
         let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
-        if nsrv != u32::MAX {
+        if nsrv != u64::MAX {
             caps.grant_send_cap(child_task_id, nsrv);
         }
         let iramfs = crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
-        if iramfs != u32::MAX {
+        if iramfs != u64::MAX {
             caps.grant_send_cap(child_task_id, iramfs);
         }
     }

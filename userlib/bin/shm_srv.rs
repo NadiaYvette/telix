@@ -105,9 +105,9 @@ fn alloc_segment_slot() -> Option<usize> {
 #[unsafe(no_mangle)]
 fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let svc_port = if arg0 > 0 && arg0 != u64::MAX {
-        arg0 as u32
+        arg0
     } else {
-        let p = syscall::port_create() as u32;
+        let p = syscall::port_create();
         syscall::ns_register(b"shm", p);
         p
     };
@@ -120,7 +120,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             None => continue,
         };
 
-        let reply_port = (msg.data[2] >> 32) as u32;
+        let reply_port = msg.data[2] >> 32;
 
         match msg.tag {
             SHM_CREATE => {

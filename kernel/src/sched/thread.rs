@@ -17,8 +17,8 @@ pub enum ThreadState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockReason {
     None,
-    PortRecv(u32),
-    PortSend(u32),
+    PortRecv(u64),
+    PortSend(u64),
     PortSetRecv(u32),
     FutexWait,
     ActivationWait,

@@ -10,7 +10,7 @@ use userlib::pipe;
 
 #[unsafe(no_mangle)]
 fn main(arg0: u64, _arg1: u64, _arg2: u64) {
-    let pipe_port = arg0 as u32;
+    let pipe_port = arg0;
     let mut buf = [0u8; 16];
     loop {
         let n = pipe::pipe_read(pipe_port, &mut buf);

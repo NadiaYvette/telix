@@ -38,7 +38,7 @@ struct PipeSlot {
     tail: usize,
     writer_closed: bool,
     reader_closed: bool,
-    recv_reply: u32, // blocked reader's reply port (0xFFFFFFFF = none)
+    recv_reply: u64, // blocked reader's reply port (u64::MAX = none)
 }
 
 impl PipeSlot {
@@ -50,7 +50,7 @@ impl PipeSlot {
             tail: 0,
             writer_closed: false,
             reader_closed: false,
-            recv_reply: 0xFFFFFFFF,
+            recv_reply: u64::MAX,
         }
     }
 
@@ -120,14 +120,14 @@ fn pack_bytes(data: &[u8], len: usize) -> (u64, u64) {
     (w0, w1)
 }
 
-fn reply(port: u32, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
+fn reply(port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
     syscall::send(port, tag, d0, d1, d2, d3);
 }
 
 /// Deliver data (or EOF) to a pipe that has a blocked reader.
 fn try_wake_reader(slot: u32) {
     let s = unsafe { &mut PIPES[slot as usize] };
-    if s.recv_reply == 0xFFFFFFFF {
+    if s.recv_reply == u64::MAX {
         return;
     }
     let rp = s.recv_reply;
@@ -135,17 +135,17 @@ fn try_wake_reader(slot: u32) {
         let mut tmp = [0u8; 16];
         let n = s.pop(&mut tmp);
         let (w0, w1) = pack_bytes(&tmp, n);
-        s.recv_reply = 0xFFFFFFFF;
+        s.recv_reply = u64::MAX;
         reply(rp, PIPE_OK, w0, w1, n as u64, 0);
     } else if s.writer_closed {
-        s.recv_reply = 0xFFFFFFFF;
+        s.recv_reply = u64::MAX;
         reply(rp, PIPE_EOF, 0, 0, 0, 0);
     }
 }
 
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
-    let svc_port = syscall::port_create() as u32;
+    let svc_port = syscall::port_create();
     syscall::ns_register(b"pipe", svc_port);
 
     loop {
@@ -155,7 +155,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         };
 
         let tag = msg.tag;
-        let reply_port = (msg.data[2] >> 32) as u32;
+        let reply_port = msg.data[2] >> 32;
 
         match tag {
             PIPE_CREATE => {
@@ -175,7 +175,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 // Must be a write handle (odd).
                 if handle & 1 == 0 || (handle / 2) as usize >= MAX_PIPES {
-                    if reply_port != 0xFFFFFFFF {
+                    if reply_port != u64::MAX {
                         reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
                     }
                     continue;
@@ -183,7 +183,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let slot = (handle / 2) as usize;
                 let s = unsafe { &mut PIPES[slot] };
                 if !s.active || s.reader_closed {
-                    if reply_port != 0xFFFFFFFF {
+                    if reply_port != u64::MAX {
                         reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
                     }
                     continue;
@@ -204,7 +204,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 let written = s.push(&tmp[..len]);
-                if reply_port != 0xFFFFFFFF {
+                if reply_port != u64::MAX {
                     reply(reply_port, PIPE_OK, written as u64, 0, 0, 0);
                 }
 
@@ -306,7 +306,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             _ => {
-                if reply_port != 0 && reply_port != 0xFFFFFFFF {
+                if reply_port != 0 && reply_port != u64::MAX {
                     reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
                 }
             }

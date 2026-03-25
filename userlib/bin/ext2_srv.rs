@@ -226,7 +226,7 @@ impl FileLock {
 #[derive(Clone, Copy)]
 struct LockWaiter {
     active: bool,
-    reply_port: u32,
+    reply_port: u64,
     inode: u32,
     pid: u32,
     lock_type: u8,
@@ -313,9 +313,9 @@ fn ext2_try_wake_waiters(
 // --- Block I/O client ---
 
 struct BlkClient {
-    blk_port: u32,
+    blk_port: u64,
     blk_aspace: u32,
-    reply_port: u32,
+    reply_port: u64,
     scratch_va: usize,
     grant_va: usize,
     /// Byte offset of the ext2 partition within the disk image.
@@ -1049,7 +1049,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"\n");
 
     // Create port and register with name server.
-    let port = syscall::port_create() as u32;
+    let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
     syscall::ns_register(b"ext2", port);
 
@@ -1057,16 +1057,24 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(port as u64);
     syscall::debug_puts(b"\n");
 
-    // Look up cache_blk with retry.
-    let blk_port = loop {
-        if let Some(p) = syscall::ns_lookup(b"cache_blk") {
-            break p;
+    // Look up cache_blk with bounded retry.
+    let blk_port = {
+        let mut retries = 2000;
+        loop {
+            if let Some(p) = syscall::ns_lookup(b"cache_blk") {
+                break p;
+            }
+            retries -= 1;
+            if retries == 0 {
+                syscall::debug_puts(b"  [ext2_srv] cache_blk not found, exiting\n");
+                syscall::exit(1);
+            }
+            for _ in 0..50 { syscall::yield_now(); }
         }
-        for _ in 0..50 { syscall::yield_now(); }
     };
 
     // Connect to blk_srv.
-    let blk_reply = syscall::port_create() as u32;
+    let blk_reply = syscall::port_create();
     {
         let (n0, n1, _) = syscall::pack_name(b"blk");
         let d2 = 3u64 | ((blk_reply as u64) << 32);
@@ -1215,7 +1223,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         match msg.tag {
             FS_OPEN => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let caller_pid = msg.data[3] as u32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
@@ -1255,7 +1263,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = msg.data[0] as usize;
                 let offset = msg.data[1] as u32;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as u32;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active {
@@ -1320,7 +1328,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 // VFS sends: data[0]=name_lo, data[1]=name_hi,
                 // data[2]=name_len(low32)|reply_port(high32), data[3]=start_offset
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let start_offset = msg.data[3] as u32;
 
                 // Resolve path to find the directory to list.
@@ -1379,7 +1387,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             FS_STAT => {
                 // data[0] = handle, data[2] = reply_port (low 32)
                 let handle = msg.data[0] as usize;
-                let reply_port = (msg.data[2] & 0xFFFF_FFFF) as u32;
+                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active {
                     syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
@@ -1395,7 +1403,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_CLOSE => {
                 let handle = msg.data[0] as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 if handle < MAX_OPEN_FILES && open_files[handle].active {
                     let ino = open_files[handle].inode_num;
                     let pid = open_files[handle].pid;
@@ -1427,7 +1435,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_CREATE => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let caller_pid = msg.data[3] as u32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
@@ -1508,7 +1516,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             FS_WRITE => {
                 let handle = msg.data[0] as usize;
                 let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[1] >> 32) as u32;
+                let reply_port = msg.data[1] >> 32;
                 let grant_va = msg.data[2] as usize;
 
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active
@@ -1648,7 +1656,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_DELETE => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
 
@@ -1724,7 +1732,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
                 let operation = (msg.data[0] >> 32) as i32;
                 let pid = msg.data[1] as u32;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
 
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active {
                     syscall::send(reply_port, FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0);
@@ -1773,7 +1781,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let pid = msg.data[3] as u32;
                 let start = msg.data[1];
                 let len = (msg.data[2] & 0xFFFF_FFFF) as u64;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let blocking = msg.tag == FS_SETLKW;
 
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active {
@@ -1820,7 +1828,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let pid = msg.data[3] as u32;
                 let start = msg.data[1];
                 let len = (msg.data[2] & 0xFFFF_FFFF) as u64;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
 
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active {
                     syscall::send(reply_port, FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0);
@@ -1844,7 +1852,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             FS_MKDIR => {
                 let name_len = (msg.data[2] & 0xFFFF) as usize;
                 let mode = ((msg.data[2] >> 16) & 0xFFFF) as u16;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
 
@@ -1902,7 +1910,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_UNLINK => {
                 let name_len = (msg.data[2] & 0xFFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
 
@@ -1974,7 +1982,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
             FS_FSYNC => {
                 let handle = msg.data[0] as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
 
                 if handle < MAX_OPEN_FILES && open_files[handle].active {
                     // Flush the inode to disk.

@@ -14,7 +14,7 @@ use super::pagevec::PageVec;
 use super::phys;
 use crate::ipc::port::{self, PortId};
 use crate::sync::SpinLock;
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Maximum number of memory objects.
 pub const MAX_OBJECTS: usize = 96;
@@ -159,7 +159,7 @@ struct ObjectSlot {
     /// 0 = free, 1 = active. Read lock-free for scans.
     active: AtomicU8,
     /// Associated kernel port ID (0 = none).
-    port_id: AtomicU32,
+    port_id: AtomicU64,
     /// Per-object lock protecting the MemObject.
     inner: SpinLock<MemObject>,
 }
@@ -168,7 +168,7 @@ impl ObjectSlot {
     const fn new() -> Self {
         Self {
             active: AtomicU8::new(0),
-            port_id: AtomicU32::new(0),
+            port_id: AtomicU64::new(0),
             inner: SpinLock::new(MemObject::empty()),
         }
     }

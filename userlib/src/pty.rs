@@ -35,9 +35,9 @@ pub const OPOST: u32 = 0x0001;
 pub const ONLCR: u32 = 0x0004;
 
 /// Look up the PTY server port (cached).
-static mut PTY_PORT: u32 = 0;
+static mut PTY_PORT: u64 = 0;
 
-fn pty_port() -> u32 {
+fn pty_port() -> u64 {
     unsafe {
         if PTY_PORT == 0 {
             if let Some(p) = syscall::ns_lookup(b"pty") {
@@ -55,7 +55,7 @@ pub fn openpty() -> Option<(i32, i32)> {
         return None;
     }
 
-    let reply_port = syscall::port_create() as u32;
+    let reply_port = syscall::port_create();
     let pid = syscall::getpid() as u32;
     let d2 = (reply_port as u64) << 32;
     syscall::send(port, PTY_OPEN, 0, 0, d2, pid as u64);
@@ -108,7 +108,7 @@ pub fn pty_write_fd(fd: i32, data: &[u8]) -> isize {
                 w1 |= (data[off + i] as u64) << ((i - 8) * 8);
             }
         }
-        let reply_port = syscall::port_create() as u32;
+        let reply_port = syscall::port_create();
         let d2 = (chunk as u64) | ((reply_port as u64) << 32);
         syscall::send(entry.port, PTY_WRITE, entry.handle as u64, w0, d2, w1);
         let ok = if let Some(msg) = syscall::recv_msg(reply_port) {
@@ -136,7 +136,7 @@ pub fn pty_read_fd(fd: i32, buf: &mut [u8]) -> isize {
         return -1;
     }
 
-    let reply_port = syscall::port_create() as u32;
+    let reply_port = syscall::port_create();
     let d2 = (reply_port as u64) << 32;
     syscall::send(entry.port, PTY_READ, entry.handle as u64, 0, d2, 0);
 
@@ -178,7 +178,7 @@ pub fn pty_close_fd(fd: i32) -> bool {
         return false;
     }
 
-    let reply_port = syscall::port_create() as u32;
+    let reply_port = syscall::port_create();
     let d2 = (reply_port as u64) << 32;
     syscall::send(entry.port, PTY_CLOSE, entry.handle as u64, 0, d2, 0);
     let _ = syscall::recv_msg(reply_port);
@@ -198,7 +198,7 @@ pub fn pty_ioctl(fd: i32, request: u32, arg0: u64, arg1: u64) -> Option<(u64, u6
         return None;
     }
 
-    let reply_port = syscall::port_create() as u32;
+    let reply_port = syscall::port_create();
     let d0 = (entry.handle as u64) | ((request as u64) << 32);
     let d2 = (reply_port as u64) << 32;
     syscall::send(entry.port, PTY_IOCTL, d0, arg0, d2, arg1);

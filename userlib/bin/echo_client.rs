@@ -39,14 +39,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // Send a message to our own port (non-blocking since queue is empty).
-    let status = syscall::send_nb(port as u32, 0xCAFE, 0xDEAD, 0xBEEF);
+    let status = syscall::send_nb(port, 0xCAFE, 0xDEAD, 0xBEEF);
     if status != 0 {
         syscall::debug_puts(b"  echo_client: send failed\n");
         return;
     }
 
     // Receive the message back.
-    let status = syscall::recv(port as u32);
+    let status = syscall::recv(port);
     if status != 0 {
         syscall::debug_puts(b"  echo_client: recv failed\n");
         return;

@@ -73,9 +73,9 @@ impl NodeEntry {
 }
 
 struct ProxySrv {
-    my_port: u32,
-    reply_port: u32,
-    net_port: u32,
+    my_port: u64,
+    reply_port: u64,
+    net_port: u64,
     my_node_id: u16,
     nodes: [NodeEntry; MAX_NODES],
     // Pending accept: true if we're waiting for incoming connections.
@@ -103,11 +103,11 @@ fn print_num(n: u64) {
 
 // --- Wire frame serialization ---
 
-fn serialize_frame(buf: &mut [u8; WIRE_FRAME_SIZE], target_port: u32, tag: u64, data: &[u64; 4], src_node: u16) {
+fn serialize_frame(buf: &mut [u8; WIRE_FRAME_SIZE], target_port: u64, tag: u64, data: &[u64; 4], src_node: u16) {
     // Bytes 0-3: magic
     buf[0..4].copy_from_slice(&WIRE_MAGIC.to_le_bytes());
     // Bytes 4-7: target_port (with node=0 for local delivery on remote side)
-    let local_port = target_port & 0xFFFF; // strip node, deliver locally on remote
+    let local_port = (target_port & 0xFFFF) as u32; // strip node, deliver locally on remote
     buf[4..8].copy_from_slice(&local_port.to_le_bytes());
     // Bytes 8-15: tag
     buf[8..16].copy_from_slice(&tag.to_le_bytes());
@@ -122,12 +122,12 @@ fn serialize_frame(buf: &mut [u8; WIRE_FRAME_SIZE], target_port: u32, tag: u64, 
     buf[50..64].fill(0);
 }
 
-fn deserialize_frame(buf: &[u8; WIRE_FRAME_SIZE]) -> Option<(u32, u64, [u64; 4], u16)> {
+fn deserialize_frame(buf: &[u8; WIRE_FRAME_SIZE]) -> Option<(u64, u64, [u64; 4], u16)> {
     let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     if magic != WIRE_MAGIC {
         return None;
     }
-    let target_port = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let target_port = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
     let tag = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
     let mut data = [0u64; 4];
     for i in 0..4 {
@@ -207,8 +207,8 @@ impl ProxySrv {
             return;
         }
         let ip = self.nodes[node_idx].ip_be32;
-        let port = self.nodes[node_idx].tcp_port as u32;
-        let d1 = (port as u64) | ((self.reply_port as u64) << 32);
+        let port = self.nodes[node_idx].tcp_port;
+        let d1 = (port as u64) | ((self.reply_port) << 32);
         syscall::send(self.net_port, NET_TCP_CONNECT, ip as u64, d1, 0, 0);
         self.nodes[node_idx].connecting = true;
 
@@ -244,10 +244,11 @@ impl ProxySrv {
 
     /// Handle outbound proxy message (kernel-redirected non-local send).
     fn handle_outbound(&mut self, msg: &Message) {
-        let target_port = (msg.tag >> 32) as u32;
-        let node_id = (target_port >> 16) as u16;
-        let original_tag = msg.data[0];
-        let original_data = [msg.data[1], msg.data[2], msg.data[3], msg.data[4]];
+        // New wire protocol: data[0] = target_port, data[1] = original_tag, data[2..4] = data[0..2]
+        let target_port = msg.data[0];
+        let node_id = (target_port >> 44) as u16;  // 20|44 split: node in top 20 bits
+        let original_tag = msg.data[1];
+        let original_data = [msg.data[2], msg.data[3], msg.data[4], 0];
 
         let node_idx = match self.find_node_by_id(node_id) {
             Some(i) => i,
@@ -345,7 +346,7 @@ impl ProxySrv {
         let node_id = msg.data[0] as u16;
         let ip_be32 = msg.data[1] as u32;
         let tcp_port = (msg.data[2] & 0xFFFF) as u16;
-        let reply_port = (msg.data[2] >> 32) as u32;
+        let reply_port = msg.data[2] >> 32;
 
         // Find a free slot or existing entry for this node_id.
         let slot = self.find_node_by_id(node_id).unwrap_or_else(|| {
@@ -412,8 +413,8 @@ impl ProxySrv {
 
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
-    let my_port = syscall::port_create() as u32;
-    let reply_port = syscall::port_create() as u32;
+    let my_port = syscall::port_create();
+    let reply_port = syscall::port_create();
 
     // Register as the kernel proxy endpoint.
     syscall::proxy_register(my_port);
@@ -430,16 +431,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::ns_register(b"proxy", my_port);
 
     syscall::debug_puts(b"  [proxy_srv] ready on port ");
-    print_num(my_port as u64);
+    print_num(my_port);
     syscall::debug_puts(b"\n");
 
     // Bind + listen on LISTEN_TCP_PORT for incoming proxy connections.
-    let d1_bind = (LISTEN_TCP_PORT as u64) | ((reply_port as u64) << 32);
+    let d1_bind = (LISTEN_TCP_PORT as u64) | ((reply_port) << 32);
     syscall::send(net_port, NET_TCP_BIND, LISTEN_TCP_PORT as u64, d1_bind, 0, 0);
     // Wait for bind reply.
     if let Some(reply) = syscall::recv_msg(reply_port) {
         if reply.tag == NET_TCP_BIND_OK {
-            let d2_listen = ((reply_port as u64) << 32);
+            let d2_listen = (reply_port << 32);
             syscall::send(net_port, NET_TCP_LISTEN, LISTEN_TCP_PORT as u64, 1, d2_listen, 0);
             let _ = syscall::recv_msg(reply_port); // LISTEN_OK
         }
@@ -466,9 +467,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     loop {
         // Try non-blocking port set recv first.
         if let Some((from_port, msg)) = syscall::port_set_recv(set_id) {
-            let tag_lo = msg.tag & 0xFFFF_FFFF;
-
-            if tag_lo == PROXY_MARKER_LO && from_port == my_port {
+            if msg.tag == PROXY_MARKER_LO && from_port == my_port {
                 // Outbound: kernel-redirected non-local send.
                 srv.handle_outbound(&msg);
             } else if msg.tag == PROXY_ADD_NODE {

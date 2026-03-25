@@ -117,7 +117,7 @@ pub struct Task {
     /// Session ID. Defaults to parent's sid, or task_id for setsid().
     pub sid: TaskId,
     /// Controlling terminal port (0 = no ctty).
-    pub ctty_port: u32,
+    pub ctty_port: u64,
     /// Foreground process group (only meaningful on the session leader).
     pub fg_pgid: TaskId,
     /// Alarm deadline in nanoseconds-since-boot (0 = no alarm).

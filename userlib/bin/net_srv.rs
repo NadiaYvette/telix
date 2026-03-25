@@ -69,7 +69,7 @@ const MAX_LISTEN_SLOTS: usize = 4;
 struct ListenSlot {
     active: bool,
     port: u16,
-    accept_reply_port: u32,  // 0 = no pending accept
+    accept_reply_port: u64,  // 0 = no pending accept
 }
 
 impl ListenSlot {
@@ -288,8 +288,8 @@ struct TcpConn {
     snd_nxt: u32,
     snd_una: u32,
     rcv_nxt: u32,
-    reply_port: u32,
-    recv_reply_port: u32,
+    reply_port: u64,
+    recv_reply_port: u64,
     rx_buf: [u8; TCP_RX_BUF_SIZE],
     rx_head: usize,
     rx_tail: usize,
@@ -413,7 +413,7 @@ struct NetDev {
     arp_next: usize,
     // Pending ping state.
     ping_target: [u8; 4],
-    ping_reply_port: u32,
+    ping_reply_port: u64,
     ping_seq: u16,
     ping_polls: u32,
     ping_active: bool,
@@ -890,7 +890,7 @@ impl NetDev {
 
     // --- Ping management ---
 
-    fn start_ping(&mut self, target_ip: [u8; 4], reply_port: u32) {
+    fn start_ping(&mut self, target_ip: [u8; 4], reply_port: u64) {
         if self.ping_active {
             syscall::send_nb(reply_port, NET_PING_FAIL, 2, 0);
             return;
@@ -985,7 +985,7 @@ impl NetDev {
         }
     }
 
-    fn handle_tcp_connect(&mut self, dst_ip_be: u32, dst_port: u16, reply_port: u32) {
+    fn handle_tcp_connect(&mut self, dst_ip_be: u32, dst_port: u16, reply_port: u64) {
         // Find free slot.
         let slot = self.tcp.iter().position(|c| c.state == TCP_CLOSED);
         let slot = match slot {
@@ -1190,7 +1190,7 @@ impl NetDev {
         }
     }
 
-    fn deliver_tcp_data(&mut self, idx: usize, reply_port: u32) {
+    fn deliver_tcp_data(&mut self, idx: usize, reply_port: u64) {
         let mut buf = [0u8; 24]; // max inline bytes in 3 IPC data words
         let n = self.tcp[idx].rx_pop(&mut buf);
         if n == 0 { return; }
@@ -1210,7 +1210,7 @@ impl NetDev {
         syscall::send_nb_4(reply_port, NET_TCP_DATA, n as u64, d1, d2, d3);
     }
 
-    fn handle_tcp_send(&mut self, conn_id: usize, payload: &[u8], reply_port: u32) {
+    fn handle_tcp_send(&mut self, conn_id: usize, payload: &[u8], reply_port: u64) {
         if conn_id >= MAX_TCP_CONNS || self.tcp[conn_id].state != TCP_ESTABLISHED {
             syscall::send_nb(reply_port, NET_TCP_FAIL, 0, 0);
             return;
@@ -1220,7 +1220,7 @@ impl NetDev {
         syscall::send_nb(reply_port, NET_TCP_SEND_OK, conn_id as u64, 0);
     }
 
-    fn handle_tcp_recv(&mut self, conn_id: usize, reply_port: u32) {
+    fn handle_tcp_recv(&mut self, conn_id: usize, reply_port: u64) {
         if conn_id >= MAX_TCP_CONNS || self.tcp[conn_id].state == TCP_CLOSED {
             syscall::send_nb(reply_port, NET_TCP_FAIL, 0, 0);
             return;
@@ -1236,7 +1236,7 @@ impl NetDev {
         }
     }
 
-    fn handle_tcp_close(&mut self, conn_id: usize, reply_port: u32) {
+    fn handle_tcp_close(&mut self, conn_id: usize, reply_port: u64) {
         if conn_id >= MAX_TCP_CONNS {
             syscall::send_nb(reply_port, NET_TCP_FAIL, 0, 0);
             return;
@@ -1318,12 +1318,12 @@ impl NetDev {
         }
     }
 
-    fn handle_tcp_bind(&mut self, port: u16, reply_port: u32) {
+    fn handle_tcp_bind(&mut self, port: u16, reply_port: u64) {
         // Just acknowledge. Actual listen state created in handle_tcp_listen.
         syscall::send_nb(reply_port, NET_TCP_BIND_OK, port as u64, 0);
     }
 
-    fn handle_tcp_listen_req(&mut self, port: u16, _backlog: u32, reply_port: u32) {
+    fn handle_tcp_listen_req(&mut self, port: u16, _backlog: u32, reply_port: u64) {
         // Find free listen slot.
         let slot = self.listen.iter().position(|l| !l.active);
         match slot {
@@ -1344,7 +1344,7 @@ impl NetDev {
         }
     }
 
-    fn handle_tcp_accept(&mut self, port: u16, reply_port: u32) {
+    fn handle_tcp_accept(&mut self, port: u16, reply_port: u64) {
         // Check if there's already an ESTABLISHED connection from a listen on this port.
         // (SYN_RECEIVED that completed before accept was called.)
         for i in 0..MAX_TCP_CONNS {
@@ -1448,7 +1448,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"\n");
 
     // Register with name server.
-    let port = syscall::port_create() as u32;
+    let port = syscall::port_create();
     syscall::ns_register(b"net", port);
 
     syscall::debug_puts(b"  [net_srv] registered on port ");
@@ -1467,7 +1467,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         if let Some(msg) = syscall::recv_nb_msg(port) {
             match msg.tag {
                 NET_STATUS => {
-                    let reply_port = msg.data[0] as u32;
+                    let reply_port = msg.data[0];
                     let mac_val = (dev.mac[0] as u64)
                         | ((dev.mac[1] as u64) << 8)
                         | ((dev.mac[2] as u64) << 16)
@@ -1479,7 +1479,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 NET_PING => {
                     let target = (msg.data[0] as u32).to_be_bytes();
-                    let reply_port = msg.data[1] as u32;
+                    let reply_port = msg.data[1];
                     syscall::debug_puts(b"  [net_srv] ping ");
                     print_ip(target);
                     syscall::debug_puts(b"\n");
@@ -1488,13 +1488,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 NET_TCP_CONNECT => {
                     let dst_ip_be = msg.data[0] as u32;
                     let dst_port = msg.data[1] as u16;
-                    let reply_port = (msg.data[1] >> 16) as u32;
+                    let reply_port = msg.data[1] >> 16;
                     dev.handle_tcp_connect(dst_ip_be, dst_port, reply_port);
                 }
                 NET_TCP_SEND => {
                     let conn_id = msg.data[0] as usize;
                     let len = (msg.data[1] & 0xFFFF) as usize;
-                    let reply_port = (msg.data[1] >> 16) as u32;
+                    let reply_port = msg.data[1] >> 16;
                     // Payload packed in data[2] and data[3] (up to 16 bytes).
                     let mut payload = [0u8; 16];
                     let d2 = msg.data[2];
@@ -1505,33 +1505,33 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 NET_TCP_RECV => {
                     let conn_id = msg.data[0] as usize;
-                    let reply_port = (msg.data[1] >> 16) as u32;
+                    let reply_port = msg.data[1] >> 16;
                     dev.handle_tcp_recv(conn_id, reply_port);
                 }
                 NET_TCP_CLOSE => {
                     let conn_id = msg.data[0] as usize;
-                    let reply_port = msg.data[1] as u32;
+                    let reply_port = msg.data[1];
                     dev.handle_tcp_close(conn_id, reply_port);
                 }
                 NET_TCP_BIND => {
                     let port_num = msg.data[0] as u16;
-                    let reply_port = (msg.data[1] >> 32) as u32;
+                    let reply_port = msg.data[1] >> 32;
                     dev.handle_tcp_bind(port_num, reply_port);
                 }
                 NET_TCP_LISTEN => {
                     let port_num = msg.data[0] as u16;
                     let backlog = msg.data[1] as u32;
-                    let reply_port = (msg.data[2] >> 32) as u32;
+                    let reply_port = msg.data[2] >> 32;
                     dev.handle_tcp_listen_req(port_num, backlog, reply_port);
                 }
                 NET_TCP_ACCEPT => {
                     let port_num = msg.data[0] as u16;
-                    let reply_port = (msg.data[1] >> 32) as u32;
+                    let reply_port = msg.data[1] >> 32;
                     dev.handle_tcp_accept(port_num, reply_port);
                 }
                 NET_TCP_RECV_NB => {
                     let conn_id = msg.data[0] as usize;
-                    let reply_port = (msg.data[1] >> 16) as u32;
+                    let reply_port = msg.data[1] >> 16;
                     if conn_id >= MAX_TCP_CONNS || dev.tcp[conn_id].state == TCP_CLOSED {
                         syscall::send_nb(reply_port, NET_TCP_FAIL, 0, 0);
                     } else if dev.tcp[conn_id].rx_len() > 0 {

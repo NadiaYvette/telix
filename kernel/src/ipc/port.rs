@@ -4,7 +4,7 @@
 //! Messages are queued in a bounded buffer. Senders block if the queue
 //! is full; receivers block if the queue is empty.
 //!
-//! Port IDs are structured as `(node:16 | local:16)` to support future
+//! Port IDs are structured as `(node:20 | local:44)` to support future
 //! network-transparent IPC. For single-node operation, node is always 0
 //! and the PortId value equals the local index.
 
@@ -12,26 +12,26 @@ use super::message::Message;
 use crate::sched::thread::ThreadId;
 use crate::mm::page::PhysAddr;
 
-pub type PortId = u32;
+pub type PortId = u64;
 
-// --- PortId structure: top 16 bits = node, bottom 16 = local index ---
+// --- PortId structure: top 20 bits = node, bottom 44 = local index ---
 
-/// Extract the node portion of a PortId (top 16 bits). Currently always 0.
+/// Extract the node portion of a PortId (top 20 bits). Currently always 0.
 #[inline]
-pub const fn port_node(id: PortId) -> u16 {
-    (id >> 16) as u16
+pub const fn port_node(id: PortId) -> u32 {
+    (id >> 44) as u32
 }
 
-/// Extract the local port index (bottom 16 bits).
+/// Extract the local port index (bottom 44 bits).
 #[inline]
-pub const fn port_local(id: PortId) -> u16 {
-    id as u16
+pub const fn port_local(id: PortId) -> u64 {
+    id & 0xFFF_FFFF_FFFF
 }
 
 /// Construct a PortId from node and local index.
 #[inline]
-pub const fn make_port_id(node: u16, local: u16) -> PortId {
-    ((node as u32) << 16) | (local as u32)
+pub const fn make_port_id(node: u32, local: u64) -> PortId {
+    ((node as u64) << 44) | (local & 0xFFF_FFFF_FFFF)
 }
 
 // --- Port queue: slab-allocated on demand ---
@@ -136,6 +136,8 @@ pub struct Port {
     pub port_set_id: u32,
     /// Task that created this port.
     pub creator_task: u32,
+    /// Task holding the RECV cap (u32::MAX = none). Maintained on RECV grant/revoke.
+    pub recv_holder: u32,
 }
 
 impl Port {
@@ -152,6 +154,7 @@ impl Port {
             send_waiter_count: 0,
             port_set_id: u32::MAX,
             creator_task: 0,
+            recv_holder: u32::MAX,
         }
     }
 
@@ -306,7 +309,7 @@ static PORT_TABLE: SpinLock<PortTable> = SpinLock::new(PortTable::new());
 
 /// Registered proxy port for network-transparent IPC. Non-local sends are
 /// redirected to this port. 0 = no proxy registered.
-pub static PROXY_PORT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static PROXY_PORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Create a new port. Returns its ID (node=0, local=index).
 pub fn create() -> Option<PortId> {
@@ -315,15 +318,15 @@ pub fn create() -> Option<PortId> {
     // First try the fast path: allocate from next_id.
     let id = table.next_id;
     if (id as usize) < MAX_PORTS {
-        table.ports[id as usize] = Port::new(make_port_id(0, id as u16));
+        table.ports[id as usize] = Port::new(make_port_id(0, id as u64));
         table.ports[id as usize].creator_task = creator;
         table.next_id += 1;
-        return Some(make_port_id(0, id as u16));
+        return Some(make_port_id(0, id as u64));
     }
     // Slow path: scan for a destroyed (inactive) port to reuse.
     for i in 0..MAX_PORTS {
         if !table.ports[i].active {
-            let pid = make_port_id(0, i as u16);
+            let pid = make_port_id(0, i as u64);
             table.ports[i] = Port::new(pid);
             table.ports[i].creator_task = creator;
             return Some(pid);
@@ -422,7 +425,7 @@ pub fn recv_nb(port_id: PortId) -> Result<Message, ()> {
                 crate::sched::wake_thread(tid);
             }
             crate::sched::stats::IPC_RECVS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            crate::trace::trace_event(crate::trace::EVT_IPC_RECV, port_id, 0);
+            crate::trace::trace_event(crate::trace::EVT_IPC_RECV, port_id as u32, 0);
             Ok(msg)
         }
         Err(()) => Err(()),
@@ -556,6 +559,26 @@ pub fn port_is_active(port_id: PortId) -> bool {
     local < MAX_PORTS && table.ports[local].active
 }
 
+/// Set the recv_holder for a port (task that holds the RECV cap).
+pub fn set_recv_holder(port_id: PortId, task_id: u32) {
+    let local = port_local(port_id) as usize;
+    let mut table = PORT_TABLE.lock();
+    if local < MAX_PORTS {
+        table.ports[local].recv_holder = task_id;
+    }
+}
+
+/// Get the recv_holder for a port. Returns u32::MAX if none.
+pub fn get_recv_holder(port_id: PortId) -> u32 {
+    let local = port_local(port_id) as usize;
+    let table = PORT_TABLE.lock();
+    if local < MAX_PORTS && table.ports[local].active {
+        table.ports[local].recv_holder
+    } else {
+        u32::MAX
+    }
+}
+
 /// Destroy a port, freeing its message queue.
 #[allow(dead_code)]
 pub fn destroy(port_id: PortId) {
@@ -589,7 +612,7 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
     let tid = crate::sched::current_thread_id();
     msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
     crate::sched::stats::IPC_SENDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    crate::trace::trace_event(crate::trace::EVT_IPC_SEND, port_id, 0);
+    crate::trace::trace_event(crate::trace::EVT_IPC_SEND, port_id as u32, 0);
 
     let local = port_local(port_id) as usize;
     let mut table = PORT_TABLE.lock();
@@ -696,7 +719,7 @@ pub fn create_kernel_port(handler: KernelHandler, user_data: usize) -> Option<Po
     // Fast path.
     let id = table.next_id;
     if (id as usize) < MAX_PORTS {
-        let pid = make_port_id(0, id as u16);
+        let pid = make_port_id(0, id as u64);
         table.ports[id as usize] = Port::new(pid);
         table.ports[id as usize].creator_task = 0; // kernel
         table.ports[id as usize].kernel_handler = handler as usize;
@@ -707,7 +730,7 @@ pub fn create_kernel_port(handler: KernelHandler, user_data: usize) -> Option<Po
     // Slow path: scan for a destroyed (inactive) port to reuse.
     for i in 0..MAX_PORTS {
         if !table.ports[i].active {
-            let pid = make_port_id(0, i as u16);
+            let pid = make_port_id(0, i as u64);
             table.ports[i] = Port::new(pid);
             table.ports[i].creator_task = 0;
             table.ports[i].kernel_handler = handler as usize;

@@ -67,14 +67,14 @@ struct UnixSocket {
     pending: [u32; MAX_PENDING],       // server-end socket indices
     pending_count: usize,
     // Blocked accept caller.
-    accept_reply: u32, // reply port (0 = none blocked)
+    accept_reply: u64, // reply port (0 = none blocked)
     // Receive buffer (ring buffer).
     rx_buf: [u8; RX_BUF_SIZE],
     rx_head: usize,
     rx_tail: usize,
     rx_eof: bool,
     // Blocked recv caller.
-    recv_reply: u32, // reply port (0 = none blocked)
+    recv_reply: u64, // reply port (0 = none blocked)
 }
 
 impl UnixSocket {
@@ -206,7 +206,7 @@ fn pack_bytes(data: &[u8], len: usize) -> (u64, u64) {
 }
 
 /// Send a reply with up to 4 data words.
-fn reply(port: u32, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
+fn reply(port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
     syscall::send(port, tag, d0, d1, d2, d3);
 }
 
@@ -233,7 +233,7 @@ fn try_wake_recv(sock_idx: u32) {
 
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
-    let svc_port = syscall::port_create() as u32;
+    let svc_port = syscall::port_create();
     syscall::ns_register(b"uds", svc_port);
 
     loop {
@@ -243,7 +243,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         };
 
         let tag = msg.tag;
-        let reply_port = (msg.data[2] >> 32) as u32;
+        let reply_port = msg.data[2] >> 32;
 
         match tag {
             UDS_SOCKET => {

@@ -58,7 +58,7 @@ const ONLCR: u32 = 0x0004;
 const MAX_PTYS: usize = 8;
 const BUF_SIZE: usize = 256;
 const CANON_SIZE: usize = 256;
-const NO_READER: u32 = 0xFFFFFFFF;
+const NO_READER: u64 = u64::MAX;
 
 // Control character indices.
 const VINTR: usize = 0;  // ^C
@@ -122,8 +122,8 @@ struct PtyPair {
     // Foreground process group.
     fg_pgrp: u32,
     // Blocked readers (deferred reply).
-    master_reader: u32,
-    slave_reader: u32,
+    master_reader: u64,
+    slave_reader: u64,
     // Close tracking.
     master_closed: bool,
     slave_closed: bool,
@@ -175,7 +175,7 @@ fn pack_bytes(data: &[u8], len: usize) -> (u64, u64) {
     (w0, w1)
 }
 
-fn reply(port: u32, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
+fn reply(port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
     syscall::send(port, tag, d0, d1, d2, d3);
 }
 
@@ -333,7 +333,7 @@ fn opost_output(slot: usize, b: u8) {
 
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
-    let svc_port = syscall::port_create() as u32;
+    let svc_port = syscall::port_create();
     syscall::ns_register(b"pty", svc_port);
 
     loop {
@@ -343,7 +343,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         };
 
         let tag = msg.tag;
-        let reply_port = (msg.data[2] >> 32) as u32;
+        let reply_port = msg.data[2] >> 32;
 
         match tag {
             PTY_OPEN => {

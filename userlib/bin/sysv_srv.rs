@@ -52,7 +52,7 @@ struct Waiter {
     semid: u32,
     sem_num: u16,
     op: i16,
-    reply: u32,
+    reply: u64,
 }
 
 impl Waiter {
@@ -97,7 +97,7 @@ fn try_wake_waiters() {
 
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
-    let port = syscall::port_create() as u32;
+    let port = syscall::port_create();
     syscall::ns_register(b"sysv", port);
 
     loop {
@@ -114,7 +114,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                 let key = msg.data[0] as i32;
                 let nsems = msg.data[1] as usize;
                 let _flags = (msg.data[2] & 0xFFFFFFFF) as u32;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 // IPC_PRIVATE (key=0): always create new.
                 // Otherwise, look for existing key.
@@ -160,7 +160,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                 let sem_num = (msg.data[1] & 0xFFFF) as u16;
                 let op_raw = ((msg.data[1] >> 16) & 0xFFFF) as u16;
                 let op = op_raw as i16;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 if semid as usize >= MAX_SEM_SETS {
                     syscall::send(reply, SEM_ERROR, 0, 0, 0, 0);
@@ -234,7 +234,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                 let semid = msg.data[0] as u32;
                 let sem_num = msg.data[1] as u32;
                 let cmd = (msg.data[2] & 0xFFFFFFFF) as u32;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
                 let value = msg.data[3] as i32;
 
                 if semid as usize >= MAX_SEM_SETS {

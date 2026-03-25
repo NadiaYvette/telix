@@ -58,7 +58,7 @@ fn print_num(n: u64) {
 
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
-    let port = syscall::port_create() as u32;
+    let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
 
     // Register with name server.
@@ -76,7 +76,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         match msg.tag {
             IO_CONNECT => {
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 // data[0]=handle(0), data[1]=size, data[2]=server_aspace_id
                 syscall::send(reply_port, IO_CONNECT_OK,
                     0, RAMDISK_SIZE as u64, my_aspace as u64, 0);
@@ -85,7 +85,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             IO_READ => {
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if offset >= RAMDISK_SIZE {
@@ -118,7 +118,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             IO_WRITE => {
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if offset >= RAMDISK_SIZE {
@@ -152,7 +152,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             IO_STAT => {
-                let reply_port = (msg.data[0] >> 32) as u32;
+                let reply_port = msg.data[0] >> 32;
                 syscall::send_nb(reply_port, IO_STAT_OK, RAMDISK_SIZE as u64, 0);
             }
 

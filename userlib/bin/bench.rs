@@ -79,7 +79,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Benchmark 2: IPC self round-trip (send_nb + recv_msg, same port) ---
     {
         const N: u64 = 10_000;
-        let port = syscall::port_create() as u32;
+        let port = syscall::port_create();
 
         // Warmup.
         for _ in 0..100 {
@@ -100,8 +100,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Benchmark 3: IPC cross-process ping-pong ---
     {
         const N: u64 = 1_000;
-        let pong_port = syscall::port_create() as u32;
-        let reply_port = syscall::port_create() as u32;
+        let pong_port = syscall::port_create();
+        let reply_port = syscall::port_create();
 
         let pong_tid = syscall::spawn_with_arg(b"pong", 50, pong_port as u64);
         if pong_tid != u64::MAX {
@@ -152,7 +152,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // --- Benchmark 5: Pipe throughput (64 KB) ---
     {
-        let pipe_port = syscall::port_create() as u32;
+        let pipe_port = syscall::port_create();
 
         // Spawn a reader that drains the pipe.
         let reader_tid = syscall::spawn_with_arg(b"pipe_upper", 50, pipe_port as u64);
@@ -252,7 +252,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if let Some(src_va) = syscall::mmap_anon(0, 1, 1) {
             unsafe { core::ptr::write_volatile(src_va as *mut u8, 0xAA); }
 
-            let coord_port = syscall::port_create() as u32;
+            let coord_port = syscall::port_create();
             let child_tid = syscall::spawn_with_arg(b"grant_echo", 50, coord_port as u64);
             if child_tid != u64::MAX {
                 // Receive child's aspace_id.
@@ -306,7 +306,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             }
 
-            let coord_port = syscall::port_create() as u32;
+            let coord_port = syscall::port_create();
             let child_tid = syscall::spawn_with_arg(b"grant_echo", 50, coord_port as u64);
             if child_tid != u64::MAX {
                 let child_aspace = if let Some(msg) = syscall::recv_msg(coord_port) {
@@ -347,8 +347,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Benchmark 10: Priority scheduling under load ---
     {
         const N: u64 = 500;
-        let pong_port = syscall::port_create() as u32;
-        let reply_port = syscall::port_create() as u32;
+        let pong_port = syscall::port_create();
+        let reply_port = syscall::port_create();
 
         // Spawn pong at high priority (10).
         let pong_tid = syscall::spawn_with_arg(b"pong", 10, pong_port as u64);
@@ -414,8 +414,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Benchmark 11: Server fault isolation + recovery ---
     {
         const N: u64 = 50;
-        let pong_port = syscall::port_create() as u32;
-        let reply_port = syscall::port_create() as u32;
+        let pong_port = syscall::port_create();
+        let reply_port = syscall::port_create();
 
         let mut pong_tid = syscall::spawn_with_arg(b"pong", 50, pong_port as u64);
         if pong_tid != u64::MAX {

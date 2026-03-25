@@ -173,7 +173,7 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
     print_num(port_id);
     syscall::debug_puts(b"\n");
 
-    let port = port_id as u32;
+    let port = port_id;
     let my_aspace = syscall::aspace_id();
 
     // Register with name server.
@@ -194,7 +194,7 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                 //   data[2] = name_len (low 32) | reply_port (high 32)
                 //   data[3] = unused
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], 0, name_len);
                 let name = &name_buf[..name_len.min(16)];
 
@@ -218,7 +218,7 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                 let file_handle = msg.data[0] as usize;
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if file_handle >= fs.count || !fs.files[file_handle].active {
@@ -251,7 +251,7 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
             IO_STAT => {
                 // data[0] = handle | (reply_port << 32)
                 let file_handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[0] >> 32) as u32;
+                let reply_port = msg.data[0] >> 32;
 
                 if file_handle >= fs.count || !fs.files[file_handle].active {
                     syscall::send_nb(reply_port, IO_ERROR, ERR_INVALID, 0);

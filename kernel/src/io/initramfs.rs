@@ -7,13 +7,13 @@
 use crate::ipc::port::{self};
 use crate::ipc::Message;
 use super::protocol::*;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Global port ID for the kernel initramfs server (u32::MAX = not yet ready).
-pub static INITRAMFS_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Global port ID for the kernel initramfs server (u64::MAX = not yet ready).
+pub static INITRAMFS_PORT: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Global port ID for the userspace initramfs server (u32::MAX = not yet ready).
-pub static USER_INITRAMFS_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Global port ID for the userspace initramfs server (u64::MAX = not yet ready).
+pub static USER_INITRAMFS_PORT: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Embedded CPIO archive.
 static INITRAMFS: &[u8] = include_bytes!("initramfs.cpio");
@@ -197,7 +197,7 @@ pub fn initramfs_server() -> ! {
                 let name_len = msg.data[3] as usize;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], msg.data[2], name_len);
                 let name = &name_buf[..name_len.min(24)];
-                let reply_port = msg.data[4] as u32;
+                let reply_port = msg.data[4];
                 match fs.find(name) {
                     Some(idx) => {
                         let reply = Message::new(IO_CONNECT_OK, [
@@ -218,7 +218,7 @@ pub fn initramfs_server() -> ! {
                 let file_handle = msg.data[0] as usize;
                 let offset = msg.data[1] as usize;
                 let length = msg.data[2] as usize;
-                let reply_port = msg.data[3] as u32;
+                let reply_port = msg.data[3];
 
                 if file_handle >= fs.count || !fs.files[file_handle].active {
                     let reply = Message::new(IO_ERROR, [ERR_INVALID, 0, 0, 0, 0, 0]);
@@ -251,7 +251,7 @@ pub fn initramfs_server() -> ! {
 
             IO_STAT => {
                 let file_handle = msg.data[0] as usize;
-                let reply_port = msg.data[1] as u32;
+                let reply_port = msg.data[1];
 
                 if file_handle >= fs.count || !fs.files[file_handle].active {
                     let reply = Message::new(IO_ERROR, [ERR_INVALID, 0, 0, 0, 0, 0]);
@@ -272,7 +272,7 @@ pub fn initramfs_server() -> ! {
             }
 
             _ => {
-                let reply_port = msg.data[3] as u32;
+                let reply_port = msg.data[3];
                 if reply_port != 0 {
                     let reply = Message::new(IO_ERROR, [ERR_INVALID, 0, 0, 0, 0, 0]);
                     let _ = port::send_nb(reply_port, reply);

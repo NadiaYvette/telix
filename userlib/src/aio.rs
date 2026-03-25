@@ -22,10 +22,10 @@ pub struct AioResult {
 /// Submit an async read request (non-blocking).
 /// Returns true if the message was queued, false if the port queue was full.
 pub fn aio_read(
-    port: u32,
+    port: u64,
     offset: u64,
     length: u32,
-    reply_port: u32,
+    reply_port: u64,
     grant_va: usize,
     request_id: u64,
 ) -> bool {
@@ -36,7 +36,7 @@ pub fn aio_read(
 
 /// Poll for an async I/O completion (non-blocking).
 /// Returns `Some(AioResult)` if a completion was available, `None` otherwise.
-pub fn aio_collect(reply_port: u32) -> Option<AioResult> {
+pub fn aio_collect(reply_port: u64) -> Option<AioResult> {
     let msg = syscall::recv_nb_msg(reply_port)?;
     match msg.tag {
         IO_READ_OK | IO_WRITE_OK => Some(AioResult {
@@ -58,7 +58,7 @@ pub fn aio_collect(reply_port: u32) -> Option<AioResult> {
 }
 
 /// Send a barrier and block until the server confirms all prior requests are complete.
-pub fn aio_barrier(port: u32, reply_port: u32) {
+pub fn aio_barrier(port: u64, reply_port: u64) {
     let d2 = (reply_port as u64) << 32;
     syscall::send(port, IO_BARRIER, 0, 0, d2, 0);
     // Block until IO_BARRIER_OK.

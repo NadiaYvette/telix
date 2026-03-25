@@ -5,10 +5,10 @@ use crate::drivers::virtio_mmio;
 use crate::ipc::port::{self};
 use crate::ipc::Message;
 use super::protocol::*;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Global port ID for the block device server.
-pub static BLK_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
+pub static BLK_PORT: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Ensure the kernel page table is active (for accessing grant VAs).
 /// On AArch64, kernel threads may run with a user process's page table
@@ -33,6 +33,41 @@ fn ensure_kernel_pt() {
     // x86-64: blk_server not used.
 }
 
+/// Stub server when no virtio-blk device is present.
+/// Registers with the name server so clients don't hang, then replies
+/// with IO_ERROR to all requests.
+fn blk_server_no_device() -> ! {
+    let port = port::create().expect("blk null port");
+    BLK_PORT.store(port, Ordering::Release);
+
+    // Register with name server so ns_lookup("blk") doesn't hang.
+    let nsrv = crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire);
+    if nsrv != u64::MAX {
+        let (n0, n1, _) = pack_name(b"blk");
+        let reply_port = port::create().expect("blk reg reply");
+        let d3 = 3u64 | ((reply_port as u64) << 32);
+        let msg = Message::new(NS_REGISTER, [n0, n1, port as u64, d3, 0, 0]);
+        let _ = crate::ipc::port::send(nsrv, msg);
+        let _ = crate::ipc::port::recv(reply_port);
+        crate::ipc::port::destroy(reply_port);
+    }
+
+    crate::println!("  [blk] no-device stub on port {}", port);
+
+    // Reply with IO_ERROR to every request.
+    loop {
+        let msg = match port::recv(port) {
+            Ok(m) => m,
+            Err(()) => break,
+        };
+        let reply_port = msg.data[2] >> 32;
+        if reply_port != 0 {
+            let _ = port::send_nb(reply_port, Message::new(IO_ERROR, [0, 0, 0, 0, 0, 0]));
+        }
+    }
+    loop { core::hint::spin_loop(); }
+}
+
 /// Block device server entry point.
 /// Only runs on AArch64 and RISC-V (x86-64 needs PCI, deferred).
 pub fn blk_server() -> ! {
@@ -41,8 +76,8 @@ pub fn blk_server() -> ! {
     let base = match virtio_mmio::find_device(virtio_mmio::DEVICE_BLK) {
         Some(b) => b,
         None => {
-            crate::println!("  [blk] no virtio-blk device found");
-            loop { core::hint::spin_loop(); }
+            crate::println!("  [blk] no virtio-blk device found — serving errors");
+            blk_server_no_device();
         }
     };
 
@@ -101,7 +136,7 @@ pub fn blk_server() -> ! {
     // Register with name server.
     {
         let nsrv = crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire);
-        if nsrv != u32::MAX {
+        if nsrv != u64::MAX {
             let (n0, n1, _n2) = pack_name(b"blk");
             let name_len = 3u64;
             let reply_port = port::create().expect("blk reg reply port");
@@ -125,7 +160,7 @@ pub fn blk_server() -> ! {
         match msg.tag {
             IO_CONNECT => {
                 // data[0..1] = name, data[2] = name_len | reply_port << 32, data[3] = unused
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 // Block device: handle=0, size=capacity*512
                 let reply = Message::new(IO_CONNECT_OK, [
                     0, // handle (always 0 for single block device)
@@ -142,7 +177,7 @@ pub fn blk_server() -> ! {
                 // data[3] = grant_dst_va (if grant)
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 let sector = (offset / 512) as u64;
@@ -184,7 +219,7 @@ pub fn blk_server() -> ! {
                 // data[3] = grant_src_va (if grant)
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 let sector = (offset / 512) as u64;
@@ -214,7 +249,7 @@ pub fn blk_server() -> ! {
 
             IO_STAT => {
                 // data[0] = handle | (reply_port << 32)
-                let reply_port = (msg.data[0] >> 32) as u32;
+                let reply_port = msg.data[0] >> 32;
                 let reply = Message::new(IO_STAT_OK, [capacity * 512, 0, 0, 0, 0, 0]);
                 let _ = port::send_nb(reply_port, reply);
             }

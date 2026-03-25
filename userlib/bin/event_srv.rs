@@ -57,8 +57,8 @@ struct EventSlot {
     timer_interval_ns: u64,
     timer_next_ns: u64,
     timer_expirations: u64,
-    // Blocked reader reply port (0xFFFFFFFF = none).
-    blocked_reader: u32,
+    // Blocked reader reply port (u64::MAX = none).
+    blocked_reader: u64,
 }
 
 impl EventSlot {
@@ -71,7 +71,7 @@ impl EventSlot {
             timer_interval_ns: 0,
             timer_next_ns: 0,
             timer_expirations: 0,
-            blocked_reader: 0xFFFFFFFF,
+            blocked_reader: u64::MAX,
         }
     }
 }
@@ -123,7 +123,7 @@ fn check_timers() {
             }
 
             // Wake blocked reader if any.
-            if slot.blocked_reader != 0xFFFFFFFF {
+            if slot.blocked_reader != u64::MAX {
                 let reply = slot.blocked_reader;
                 slot.blocked_reader = 0xFFFFFFFF;
                 let exp = slot.timer_expirations;
@@ -137,7 +137,7 @@ fn check_timers() {
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
     // Register with name server.
-    let port = syscall::port_create() as u32;
+    let port = syscall::port_create();
     syscall::ns_register(b"event", port);
 
     loop {
@@ -157,7 +157,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                 let etype_raw = msg.data[0];
                 let initval = msg.data[1];
                 let flags = msg.data[2] & 0xFFFFFFFF;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 let etype = match etype_raw {
                     EVT_EVENTFD => EventType::EventFd,
@@ -192,7 +192,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
 
             EVENT_READ => {
                 let handle = msg.data[0] as u32;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_EVENTS {
                     syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
@@ -246,7 +246,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
             EVENT_WRITE => {
                 let handle = msg.data[0] as u32;
                 let value = msg.data[1];
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_EVENTS {
                     syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
@@ -263,7 +263,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                     slot.counter = slot.counter.saturating_add(value);
 
                     // Wake blocked reader.
-                    if slot.blocked_reader != 0xFFFFFFFF && slot.counter > 0 {
+                    if slot.blocked_reader != u64::MAX && slot.counter > 0 {
                         let reader = slot.blocked_reader;
                         slot.blocked_reader = 0xFFFFFFFF;
                         let val = if slot.flags & EFD_SEMAPHORE != 0 {
@@ -284,7 +284,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
             EVENT_TIMER_SET => {
                 let handle = msg.data[0] as u32;
                 let interval_ns = msg.data[1];
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_EVENTS {
                     syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
@@ -308,7 +308,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
 
             EVENT_CLOSE => {
                 let handle = msg.data[0] as u32;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_EVENTS {
                     syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
@@ -328,7 +328,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
 
             EVENT_POLL => {
                 let handle = msg.data[0] as u32;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_EVENTS {
                     syscall::send(reply, EVENT_OK, 0, 0, 0, 0);

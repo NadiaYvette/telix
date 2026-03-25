@@ -58,8 +58,8 @@ const SYS_GETRANDOM: u64 = 96;
 const SYS_PROXY_REGISTER: u64 = 99;
 
 /// Register a port as the network proxy endpoint for non-local sends.
-pub fn proxy_register(port: u32) -> u64 {
-    unsafe { arch::syscall1(SYS_PROXY_REGISTER, port as u64) }
+pub fn proxy_register(port: u64) -> u64 {
+    unsafe { arch::syscall1(SYS_PROXY_REGISTER, port) }
 }
 
 /// Print a single character to the debug console.
@@ -78,28 +78,28 @@ pub fn port_create() -> u64 {
 }
 
 /// Destroy an IPC port, freeing the port ID for reuse.
-pub fn port_destroy(port: u32) {
-    unsafe { arch::syscall1(SYS_PORT_DESTROY, port as u64); }
+pub fn port_destroy(port: u64) {
+    unsafe { arch::syscall1(SYS_PORT_DESTROY, port); }
 }
 
 /// Non-blocking send on a port (2 data words, rest zeroed).
-pub fn send_nb(port: u32, tag: u64, d0: u64, d1: u64) -> u64 {
-    unsafe { arch::syscall6(SYS_SEND_NB, port as u64, tag, d0, d1, 0, 0) }
+pub fn send_nb(port: u64, tag: u64, d0: u64, d1: u64) -> u64 {
+    unsafe { arch::syscall6(SYS_SEND_NB, port, tag, d0, d1, 0, 0) }
 }
 
 /// Non-blocking send on a port with all 4 data words.
-pub fn send_nb_4(port: u32, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) -> u64 {
-    unsafe { arch::syscall6(SYS_SEND_NB, port as u64, tag, d0, d1, d2, d3) }
+pub fn send_nb_4(port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) -> u64 {
+    unsafe { arch::syscall6(SYS_SEND_NB, port, tag, d0, d1, d2, d3) }
 }
 
 /// Blocking send on a port.
-pub fn send(port: u32, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) -> u64 {
-    unsafe { arch::syscall6(SYS_SEND, port as u64, tag, d0, d1, d2, d3) }
+pub fn send(port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) -> u64 {
+    unsafe { arch::syscall6(SYS_SEND, port, tag, d0, d1, d2, d3) }
 }
 
 /// Blocking receive on a port. Returns status only.
-pub fn recv(port: u32) -> u64 {
-    unsafe { arch::syscall1(SYS_RECV, port as u64) }
+pub fn recv(port: u64) -> u64 {
+    unsafe { arch::syscall1(SYS_RECV, port) }
 }
 
 /// Yield the current time slice.
@@ -234,8 +234,8 @@ pub fn get_timer_freq() -> u64 {
 }
 
 /// Get the userspace initramfs server's port ID.
-pub fn get_initramfs_port() -> u32 {
-    unsafe { arch::syscall0(SYS_GET_INITRAMFS_PORT) as u32 }
+pub fn get_initramfs_port() -> u64 {
+    unsafe { arch::syscall0(SYS_GET_INITRAMFS_PORT) }
 }
 
 /// IPC message with tag + 6 data words.
@@ -245,7 +245,7 @@ pub struct Message {
 }
 
 /// Blocking receive that returns the full message (tag + data).
-pub fn recv_msg(port: u32) -> Option<Message> {
+pub fn recv_msg(port: u64) -> Option<Message> {
     let status: u64;
     let r1: u64;
     let r2: u64;
@@ -317,8 +317,8 @@ pub fn recv_msg(port: u32) -> Option<Message> {
 }
 
 /// Get the name server port.
-pub fn nsrv_port() -> u32 {
-    unsafe { arch::syscall0(SYS_NSRV_PORT) as u32 }
+pub fn nsrv_port() -> u64 {
+    unsafe { arch::syscall0(SYS_NSRV_PORT) }
 }
 
 /// Create a port set.
@@ -327,13 +327,13 @@ pub fn port_set_create() -> u64 {
 }
 
 /// Add a port to a port set.
-pub fn port_set_add(set_id: u32, port_id: u32) -> bool {
-    unsafe { arch::syscall2(SYS_PORT_SET_ADD, set_id as u64, port_id as u64) == 0 }
+pub fn port_set_add(set_id: u32, port_id: u64) -> bool {
+    unsafe { arch::syscall2(SYS_PORT_SET_ADD, set_id as u64, port_id) == 0 }
 }
 
 /// Blocking receive from any port in a port set.
 /// Returns (port_id, Message) on success, None if set is invalid.
-pub fn port_set_recv(set_id: u32) -> Option<(u32, Message)> {
+pub fn port_set_recv(set_id: u32) -> Option<(u64, Message)> {
     let status: u64;
     let r1: u64;
     let r2: u64;
@@ -394,11 +394,11 @@ pub fn port_set_recv(set_id: u32) -> Option<(u32, Message)> {
         );
     }
 
-    // status: low bits = error code, high 32 bits = port_id on success.
-    if status & 0xFFFFFFFF == 1 {
-        return None; // invalid set
+    // status: full 64-bit port ID on success, u64::MAX on error.
+    if status == u64::MAX {
+        return None;
     }
-    let port_id = (status >> 32) as u32;
+    let port_id = status;
     Some((port_id, Message {
         tag: r1,
         data: [r2, r3, r4, r5, r6, r7],
@@ -415,21 +415,21 @@ pub fn pack_name(name: &[u8]) -> (u64, u64, u64) {
 }
 
 /// Lookup a service by name via the name server. Returns port ID or None.
-pub fn ns_lookup(name: &[u8]) -> Option<u32> {
+pub fn ns_lookup(name: &[u8]) -> Option<u64> {
     let nsrv = nsrv_port();
-    if nsrv == u32::MAX { return None; }
+    if nsrv == u64::MAX { return None; }
 
-    let reply_port = port_create() as u32;
+    let reply_port = port_create();
     let (n0, n1, n2) = pack_name(name);
-    let d3 = (name.len() as u64) | ((reply_port as u64) << 32);
+    let d3 = (name.len() as u64) | (reply_port << 32);
 
     // NS_LOOKUP = 0x1100
     send(nsrv, 0x1100, n0, n1, n2, d3);
 
     let result = if let Some(reply) = recv_msg(reply_port) {
         if reply.tag == 0x1101 {
-            let port = reply.data[0] as u32;
-            if port != u32::MAX { Some(port) } else { None }
+            let port = reply.data[0];
+            if port != u64::MAX { Some(port) } else { None }
         } else {
             None
         }
@@ -465,7 +465,7 @@ pub fn getchar() -> Option<u8> {
 }
 
 /// Non-blocking receive that returns the full message, or None if queue is empty.
-pub fn recv_nb_msg(port: u32) -> Option<Message> {
+pub fn recv_nb_msg(port: u64) -> Option<Message> {
     let status: u64;
     let r1: u64;
     let r2: u64;
@@ -671,18 +671,18 @@ pub fn kill_sig(tid: u32, sig: u32) -> bool {
 /// receiver on dest_port. The receiver gets:
 ///   data[0] = d0, data[1] = d1, data[2] = receiver's new cap slot,
 ///   data[3] = granted port ID, data[4] = granted rights.
-pub fn send_cap(dest_port: u32, tag: u64, d0: u64, d1: u64, grant_port: u32, grant_rights: u32) -> bool {
+pub fn send_cap(dest_port: u64, tag: u64, d0: u64, d1: u64, grant_port: u64, grant_rights: u32) -> bool {
     unsafe {
-        arch::syscall6(SYS_SEND_CAP, dest_port as u64, tag, d0, d1,
-            grant_port as u64, grant_rights as u64) == 0
+        arch::syscall6(SYS_SEND_CAP, dest_port, tag, d0, d1,
+            grant_port, grant_rights as u64) == 0
     }
 }
 
 /// Revoke all derived capabilities for a port.
 /// Requires MANAGE right on the port. Returns number of caps revoked.
 #[allow(dead_code)]
-pub fn cap_revoke(port_id: u32) -> u64 {
-    unsafe { arch::syscall1(SYS_CAP_REVOKE, port_id as u64) }
+pub fn cap_revoke(port_id: u64) -> u64 {
+    unsafe { arch::syscall1(SYS_CAP_REVOKE, port_id) }
 }
 
 const SYS_VM_STATS: u64 = 42;
@@ -831,8 +831,8 @@ pub fn tcgetpgrp() -> u64 {
 
 /// Set the controlling terminal for the current session.
 /// Only the session leader can call this.
-pub fn set_ctty(port: u32) -> bool {
-    unsafe { arch::syscall1(SYS_SET_CTTY, port as u64) == 0 }
+pub fn set_ctty(port: u64) -> bool {
+    unsafe { arch::syscall1(SYS_SET_CTTY, port) == 0 }
 }
 
 /// Send a signal to a process group. Equivalent to kill(-pgid, sig).
@@ -1255,7 +1255,7 @@ const SHM_MAP_OK_TAG: u64 = 0x5102;
 /// server to run immediately (direct transfer), so the reply is usually
 /// queued before we even check. Use non-blocking recv to avoid a blocking
 /// recv bug where the receiver parks but the queued reply isn't visible.
-fn shm_poll_reply(reply_port: u32) -> Option<Message> {
+fn shm_poll_reply(reply_port: u64) -> Option<Message> {
     for _ in 0..50000u32 {
         if let Some(r) = recv_nb_msg(reply_port) {
             return Some(r);
@@ -1267,8 +1267,8 @@ fn shm_poll_reply(reply_port: u32) -> Option<Message> {
 
 /// Create or open a named shared memory segment.
 /// Returns (handle, page_count, srv_aspace) on success.
-pub fn shm_create(shm_port: u32, name: &[u8], page_count: usize) -> Option<(u32, usize, u32)> {
-    let reply_port = port_create() as u32;
+pub fn shm_create(shm_port: u64, name: &[u8], page_count: usize) -> Option<(u32, usize, u32)> {
+    let reply_port = port_create();
     let (n0, n1, _) = pack_name(name);
     let d2 = (name.len() as u64) | ((reply_port as u64) << 32);
     send(shm_port, SHM_CREATE_TAG, n0, n1, d2, page_count as u64);
@@ -1287,8 +1287,8 @@ pub fn shm_create(shm_port: u32, name: &[u8], page_count: usize) -> Option<(u32,
 
 /// Open an existing named shared memory segment.
 /// Returns (handle, page_count, srv_aspace) on success.
-pub fn shm_open(shm_port: u32, name: &[u8]) -> Option<(u32, usize, u32)> {
-    let reply_port = port_create() as u32;
+pub fn shm_open(shm_port: u64, name: &[u8]) -> Option<(u32, usize, u32)> {
+    let reply_port = port_create();
     let (n0, n1, _) = pack_name(name);
     let d2 = (name.len() as u64) | ((reply_port as u64) << 32);
     send(shm_port, SHM_OPEN_TAG, n0, n1, d2, 0);
@@ -1308,8 +1308,8 @@ pub fn shm_open(shm_port: u32, name: &[u8]) -> Option<(u32, usize, u32)> {
 /// Map a shared memory segment into the caller's address space.
 /// The server grants pages to `client_aspace` at `dst_va`.
 /// Returns the number of pages mapped on success.
-pub fn shm_map(shm_port: u32, handle: u32, client_aspace: u32, dst_va: usize, readonly: bool) -> Option<usize> {
-    let reply_port = port_create() as u32;
+pub fn shm_map(shm_port: u64, handle: u32, client_aspace: u32, dst_va: usize, readonly: bool) -> Option<usize> {
+    let reply_port = port_create();
     let d2 = ((reply_port as u64) << 32) | (readonly as u64);
     send(shm_port, SHM_MAP_TAG, handle as u64, client_aspace as u64, d2, dst_va as u64);
     let result = if let Some(reply) = shm_poll_reply(reply_port) {
@@ -1326,8 +1326,8 @@ pub fn shm_map(shm_port: u32, handle: u32, client_aspace: u32, dst_va: usize, re
 }
 
 /// Unmap a shared memory segment from the caller's address space.
-pub fn shm_unmap(shm_port: u32, handle: u32, client_aspace: u32, dst_va: usize) {
-    let reply_port = port_create() as u32;
+pub fn shm_unmap(shm_port: u64, handle: u32, client_aspace: u32, dst_va: usize) {
+    let reply_port = port_create();
     let d2 = (reply_port as u64) << 32;
     send(shm_port, SHM_UNMAP_TAG, handle as u64, client_aspace as u64, d2, dst_va as u64);
     let _ = shm_poll_reply(reply_port);
@@ -1335,8 +1335,8 @@ pub fn shm_unmap(shm_port: u32, handle: u32, client_aspace: u32, dst_va: usize) 
 }
 
 /// Unlink (delete) a named shared memory segment.
-pub fn shm_unlink(shm_port: u32, name: &[u8]) -> bool {
-    let reply_port = port_create() as u32;
+pub fn shm_unlink(shm_port: u64, name: &[u8]) -> bool {
+    let reply_port = port_create();
     let (n0, n1, _) = pack_name(name);
     let d2 = (name.len() as u64) | ((reply_port as u64) << 32);
     send(shm_port, SHM_UNLINK_TAG, n0, n1, d2, 0);
@@ -1350,17 +1350,17 @@ pub fn shm_unlink(shm_port: u32, name: &[u8]) -> bool {
 }
 
 /// Register a service with the name server.
-pub fn ns_register(name: &[u8], service_port: u32) -> bool {
+pub fn ns_register(name: &[u8], service_port: u64) -> bool {
     let nsrv = nsrv_port();
-    if nsrv == u32::MAX { return false; }
+    if nsrv == u64::MAX { return false; }
 
-    let reply_port = port_create() as u32;
+    let reply_port = port_create();
     let (n0, n1, _n2) = pack_name(name);
-    let d3 = (name.len() as u64) | ((reply_port as u64) << 32);
+    let d3 = (name.len() as u64) | (reply_port << 32);
 
     // NS_REGISTER = 0x1000
     // data[0..1] = name, data[2] = service_port, data[3] = name_len | reply_port
-    send(nsrv, 0x1000, n0, n1, service_port as u64, d3);
+    send(nsrv, 0x1000, n0, n1, service_port, d3);
 
     let result = if let Some(reply) = recv_msg(reply_port) {
         reply.tag == 0x1001

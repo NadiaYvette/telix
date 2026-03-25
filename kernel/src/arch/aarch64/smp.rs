@@ -45,6 +45,7 @@ pub fn start_secondary_cpus() {
     }
     let entry = _secondary_entry as *const () as u64;
 
+    let mut started = 0u32;
     for cpu in 1..MAX_CPUS {
         let target_mpidr = cpu as u64; // QEMU virt: MPIDR Aff0 = cpu index
         let stack_top = unsafe {
@@ -58,14 +59,27 @@ pub fn start_secondary_cpus() {
             crate::println!("  PSCI CPU_ON for CPU {} failed: {}", cpu, ret);
             continue;
         }
+        started += 1;
     }
 
-    // Wait for all secondaries to report ready.
-    let expected = (MAX_CPUS - 1) as u32;
-    while AP_READY_COUNT.load(Ordering::Acquire) < expected {
-        core::hint::spin_loop();
+    if started == 0 {
+        crate::println!("  Single-CPU mode (no secondaries started)");
+        return;
     }
-    crate::println!("  All {} CPUs online", MAX_CPUS);
+
+    // Wait for all successfully started secondaries, with timeout.
+    let mut timeout = 100_000_000u64;
+    while AP_READY_COUNT.load(Ordering::Acquire) < started {
+        core::hint::spin_loop();
+        timeout -= 1;
+        if timeout == 0 {
+            crate::println!("  SMP startup timeout ({}/{} CPUs ready)",
+                AP_READY_COUNT.load(Ordering::Relaxed) + 1, started + 1);
+            break;
+        }
+    }
+    let online = AP_READY_COUNT.load(Ordering::Relaxed) + 1;
+    crate::println!("  All {} CPUs online", online);
 }
 
 /// Secondary CPU Rust entry point. Called from _secondary_entry in boot.S.

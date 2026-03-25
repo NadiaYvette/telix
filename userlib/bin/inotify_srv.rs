@@ -74,7 +74,7 @@ struct InotifyInstance {
     events: [InotifyEvent; EVENT_QUEUE_SIZE],
     event_head: usize,
     event_tail: usize,
-    blocked_reader: u32,
+    blocked_reader: u64,
 }
 
 impl InotifyInstance {
@@ -86,7 +86,7 @@ impl InotifyInstance {
             events: [InotifyEvent::empty(); EVENT_QUEUE_SIZE],
             event_head: 0,
             event_tail: 0,
-            blocked_reader: 0xFFFFFFFF,
+            blocked_reader: u64::MAX,
         }
     }
 
@@ -149,7 +149,7 @@ fn path_matches(watch: &Watch, path_w0: u64, _path_w1: u64) -> bool {
 
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
-    let port = syscall::port_create() as u32;
+    let port = syscall::port_create();
     syscall::ns_register(b"inotify", port);
 
     loop {
@@ -163,7 +163,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
 
         match msg.tag {
             IN_CREATE_TAG => {
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
                 match alloc_instance() {
                     Some(handle) => {
                         syscall::send(reply, IN_OK, port as u64, handle as u64, 0, 0);
@@ -178,7 +178,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                 let handle = msg.data[0] as u32;
                 let path_w0 = msg.data[1];
                 let mask = (msg.data[2] & 0xFFFF) as u32;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
                 let path_w1 = msg.data[3];
 
                 if handle as usize >= MAX_INSTANCES {
@@ -217,7 +217,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
             IN_RM_WATCH => {
                 let handle = msg.data[0] as u32;
                 let wd = msg.data[1] as u32;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_INSTANCES {
                     syscall::send(reply, IN_ERROR, 0, 0, 0, 0);
@@ -236,7 +236,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
 
             IN_READ => {
                 let handle = msg.data[0] as u32;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_INSTANCES {
                     syscall::send(reply, IN_ERROR, 0, 0, 0, 0);
@@ -265,7 +265,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
 
             IN_CLOSE => {
                 let handle = msg.data[0] as u32;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_INSTANCES {
                     syscall::send(reply, IN_ERROR, 0, 0, 0, 0);
@@ -285,7 +285,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
 
             IN_POLL => {
                 let handle = msg.data[0] as u32;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 let ready = if handle as usize >= MAX_INSTANCES {
                     0u64
@@ -330,7 +330,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                             INSTANCES[i].push_event(evt);
 
                             // Wake blocked reader.
-                            if INSTANCES[i].blocked_reader != 0xFFFFFFFF {
+                            if INSTANCES[i].blocked_reader != u64::MAX {
                                 let reader = INSTANCES[i].blocked_reader;
                                 INSTANCES[i].blocked_reader = 0xFFFFFFFF;
                                 if let Some(e) = INSTANCES[i].pop_event() {

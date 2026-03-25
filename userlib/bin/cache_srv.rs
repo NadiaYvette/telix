@@ -272,9 +272,9 @@ impl PageCache {
 
 // --- Block client (for talking to blk_srv) ---
 struct BlkClient {
-    blk_port: u32,
+    blk_port: u64,
     blk_aspace: u32,
-    reply_port: u32,
+    reply_port: u64,
     scratch_va: usize,
 }
 
@@ -361,7 +361,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  [cache_srv] starting\n");
 
     // Create port and register as "cache_blk".
-    let port = syscall::port_create() as u32;
+    let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
     syscall::ns_register(b"cache_blk", port);
 
@@ -369,12 +369,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(port as u64);
     syscall::debug_puts(b"\n");
 
-    // Look up blk_srv with retry.
-    let blk_port = loop {
-        if let Some(p) = syscall::ns_lookup(b"blk") {
-            break p;
+    // Look up blk_srv with bounded retry.
+    let blk_port = {
+        let mut retries = 2000;
+        loop {
+            if let Some(p) = syscall::ns_lookup(b"blk") {
+                break p;
+            }
+            retries -= 1;
+            if retries == 0 {
+                syscall::debug_puts(b"  [cache_srv] blk_srv not found, serving without backing\n");
+                break u64::MAX;
+            }
+            for _ in 0..50 { syscall::yield_now(); }
         }
-        for _ in 0..50 { syscall::yield_now(); }
     };
 
     syscall::debug_puts(b"  [cache_srv] blk_srv on port ");
@@ -382,7 +390,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"\n");
 
     // Connect to blk_srv.
-    let blk_reply = syscall::port_create() as u32;
+    let blk_reply = syscall::port_create();
     {
         let (n0, n1, _) = syscall::pack_name(b"blk");
         let d2 = 3u64 | ((blk_reply as u64) << 32);
@@ -445,7 +453,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         match msg.tag {
             IO_CONNECT => {
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 syscall::send(reply_port, IO_CONNECT_OK,
                     0, disk_capacity, my_aspace as u64, 0);
             }
@@ -454,7 +462,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let request_id = msg.data[0];
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if let Some((ptr, bytes_read)) = cache.read(&blk, offset, length, max_sectors) {
@@ -483,7 +491,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let request_id = msg.data[0];
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 let sector = (offset / SECTOR_SIZE) as u64;
@@ -512,19 +520,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             IO_STAT => {
-                let reply_port = (msg.data[0] >> 32) as u32;
+                let reply_port = msg.data[0] >> 32;
                 syscall::send_nb(reply_port, IO_STAT_OK, disk_capacity, 0);
             }
 
             IO_CLOSE => {}
 
             IO_BARRIER => {
-                let reply_port = (msg.data[2] >> 32) as u32;
+                let reply_port = msg.data[2] >> 32;
                 syscall::send_nb(reply_port, IO_BARRIER_OK, 0, 0);
             }
 
             CACHE_STATS => {
-                let reply_port = (msg.data[0] >> 32) as u32;
+                let reply_port = msg.data[0] >> 32;
                 syscall::send(reply_port, CACHE_STATS_OK,
                     cache.hits, cache.misses, CACHE_ENTRIES as u64, cache.occupied as u64);
             }

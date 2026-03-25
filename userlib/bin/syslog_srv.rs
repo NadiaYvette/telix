@@ -123,7 +123,7 @@ fn maybe_forward(priority: u32, msg_w0: u64, msg_w1: u64) {
 
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
-    let port = syscall::port_create() as u32;
+    let port = syscall::port_create();
     syscall::ns_register(b"syslog", port);
 
     loop {
@@ -139,7 +139,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
             SYSLOG_OPEN => {
                 let facility = msg.data[0] as u32;
                 let ident_w0 = msg.data[1];
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 match alloc_handle() {
                     Some(handle) => {
@@ -159,7 +159,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                 let priority = msg.data[0] as u32;
                 let msg_w0 = msg.data[1];
                 let msg_w1 = msg.data[2];
-                let reply = (msg.data[3] >> 32) as u32;
+                let reply = msg.data[3] >> 32;
 
                 let entry = LogEntry {
                     timestamp_ns: syscall::clock_gettime(),
@@ -176,7 +176,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
 
             SYSLOG_CLOSE => {
                 let handle = msg.data[0] as u32;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 if (handle as usize) < MAX_HANDLES {
                     unsafe { HANDLES[handle as usize].active = false; }
@@ -186,7 +186,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
 
             SYSLOG_READ => {
                 let index = msg.data[0] as usize;
-                let reply = (msg.data[2] >> 32) as u32;
+                let reply = msg.data[2] >> 32;
 
                 match get_entry(index) {
                     Some(entry) => {

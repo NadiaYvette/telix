@@ -291,7 +291,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         },
         SYS_TCSETPGRP => crate::sched::tcsetpgrp(a0 as u32),
         SYS_TCGETPGRP => crate::sched::tcgetpgrp(),
-        SYS_SET_CTTY => crate::sched::set_ctty(a0 as u32),
+        SYS_SET_CTTY => crate::sched::set_ctty(a0),
         SYS_CLOCK_GETTIME => sys_clock_gettime(a0),
         SYS_NANOSLEEP => sys_nanosleep(a0),
         SYS_ALARM => crate::sched::alarm(a0, a1),
@@ -389,7 +389,7 @@ pub(crate) fn deliver_to_parked_receiver(receiver_tid: u32, msg: &crate::ipc::Me
 /// Falls back to CAP_SYSTEM lock for MANAGE checks.
 /// Task 0 (kernel) bypasses all checks.
 #[inline]
-fn check_port_cap(port_id: u32, needed: crate::cap::Rights) -> bool {
+fn check_port_cap(port_id: u64, needed: crate::cap::Rights) -> bool {
     let task_id = crate::sched::current_task_id();
     if task_id == 0 { return true; }
     // Fast path: SEND and RECV are tracked in lockless bitmaps.
@@ -407,44 +407,40 @@ fn check_port_cap(port_id: u32, needed: crate::cap::Rights) -> bool {
 /// Auto-grant SEND caps for active port IDs found in message data words
 /// to the receiving task. Only checks high-32 and low-32 of each word,
 /// plus bits 16-47 (for protocols that pack port IDs at offset 16).
+/// Auto-grant SEND caps for reply ports embedded in a received message.
+/// Checks each data word as a full 64-bit port ID. Only grants if the
+/// value is a valid active port and the receiver doesn't already hold
+/// a SEND cap for it.
 fn auto_grant_reply_caps(task_id: u32, msg: &crate::ipc::Message) {
     if task_id == 0 { return; }
-    let max = crate::ipc::port::MAX_PORTS as u32;
-    // Collect unique candidate port IDs that we don't already have SEND caps for.
-    let mut candidates = [u32::MAX; 18];
+    // Scan data words for port IDs. Protocols pack reply ports in various
+    // positions; check all 4 user-supplied data words (data[0..3]) plus
+    // any sub-word values that look like port IDs (for protocols that pack
+    // reply_port << 32 | other_value).
+    let mut candidates = [u64::MAX; 8];
     let mut count = 0usize;
-    for i in 0..6 {
+    for i in 0..4 {
         let word = msg.data[i];
-        for shift in [0u32, 16, 32] {
-            let val = (word >> shift) as u32;
-            if val > 0 && val < max {
-                // Fast bitmap check — skip if we already have SEND cap.
-                if crate::cap::has_port_cap_fast(task_id, val, crate::cap::Rights::SEND) {
-                    continue;
-                }
-                let mut dup = false;
-                for j in 0..count {
-                    if candidates[j] == val { dup = true; break; }
-                }
-                if !dup && count < 18 {
-                    candidates[count] = val;
-                    count += 1;
-                }
+        // Check full word as port ID.
+        for &val in &[word, word >> 32] {
+            if val == 0 || val == u64::MAX { continue; }
+            if !crate::ipc::port::port_is_active(val) { continue; }
+            if crate::cap::has_port_cap_fast(task_id, val, crate::cap::Rights::SEND) {
+                continue;
+            }
+            let mut dup = false;
+            for j in 0..count {
+                if candidates[j] == val { dup = true; break; }
+            }
+            if !dup && count < 8 {
+                candidates[count] = val;
+                count += 1;
             }
         }
     }
     if count == 0 { return; }
-    // Filter by port_is_active BEFORE locking CAP_SYSTEM (lock ordering).
-    let mut active_count = 0usize;
-    for i in 0..count {
-        if crate::ipc::port::port_is_active(candidates[i]) {
-            candidates[active_count] = candidates[i];
-            active_count += 1;
-        }
-    }
-    if active_count == 0 { return; }
     let mut caps = crate::cap::CAP_SYSTEM.lock();
-    for i in 0..active_count {
+    for i in 0..count {
         caps.grant_send_cap(task_id, candidates[i]);
     }
 }
@@ -484,15 +480,15 @@ fn sys_port_create() -> u64 {
 }
 
 fn sys_port_destroy(port_id: u64) -> u64 {
-    if !check_port_cap(port_id as u32, crate::cap::Rights::MANAGE) {
+    if !check_port_cap(port_id, crate::cap::Rights::MANAGE) {
         return ECAP;
     }
-    crate::ipc::port::destroy(port_id as u32);
+    crate::ipc::port::destroy(port_id);
     // Remove port caps from caller's CSpace.
     let task_id = crate::sched::current_task_id();
     if task_id != 0 {
         let mut caps = crate::cap::CAP_SYSTEM.lock();
-        caps.remove_port_caps(task_id, port_id as u32);
+        caps.remove_port_caps(task_id, port_id);
         drop(caps);
         // Decrement port quota counter.
         let mut sched = crate::sched::scheduler::SCHEDULER.lock();
@@ -504,15 +500,15 @@ fn sys_port_destroy(port_id: u64) -> u64 {
 }
 
 fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
-    if crate::ipc::port::port_node(port_id as u32) != 0 {
-        return sys_send_to_proxy(port_id as u32, tag, data, true);
+    if crate::ipc::port::port_node(port_id) != 0 {
+        return sys_send_to_proxy(port_id, tag, data, true);
     }
-    if !check_port_cap(port_id as u32, crate::cap::Rights::SEND) {
+    if !check_port_cap(port_id, crate::cap::Rights::SEND) {
         return ECAP;
     }
     let mut msg = crate::ipc::Message::new(tag, data);
 
-    match crate::ipc::port::send_direct(port_id as u32, &mut msg) {
+    match crate::ipc::port::send_direct(port_id, &mut msg) {
         crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
             // L4-style direct handoff: inject message and switch to receiver.
             let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
@@ -526,7 +522,7 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
         crate::ipc::port::SendDirectResult::Queued => 0,
         crate::ipc::port::SendDirectResult::Full => {
             // Queue full — fall back to blocking send (spin-blocks until space).
-            match crate::ipc::port::send(port_id as u32, msg) {
+            match crate::ipc::port::send(port_id, msg) {
                 Ok(()) => 0,
                 Err(()) => 1,
             }
@@ -536,15 +532,15 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
 }
 
 fn sys_send_nb(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
-    if crate::ipc::port::port_node(port_id as u32) != 0 {
-        return sys_send_to_proxy(port_id as u32, tag, data, false);
+    if crate::ipc::port::port_node(port_id) != 0 {
+        return sys_send_to_proxy(port_id, tag, data, false);
     }
-    if !check_port_cap(port_id as u32, crate::cap::Rights::SEND) {
+    if !check_port_cap(port_id, crate::cap::Rights::SEND) {
         return ECAP;
     }
     let mut msg = crate::ipc::Message::new(tag, data);
 
-    match crate::ipc::port::send_direct(port_id as u32, &mut msg) {
+    match crate::ipc::port::send_direct(port_id, &mut msg) {
         crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
             // Direct transfer: inject message into parked receiver's frame and wake.
             let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
@@ -565,7 +561,7 @@ const PROXY_MARKER: u64 = 0xFFFF_0001;
 
 /// Redirect a non-local send to the registered proxy port.
 /// `blocking`: true for sys_send (block on full), false for sys_send_nb.
-fn sys_send_to_proxy(target_port: u32, tag: u64, data: [u64; 6], blocking: bool) -> u64 {
+fn sys_send_to_proxy(target_port: u64, tag: u64, data: [u64; 6], blocking: bool) -> u64 {
     let proxy_local = crate::ipc::port::PROXY_PORT.load(core::sync::atomic::Ordering::Acquire);
     if proxy_local == 0 {
         return 1; // No proxy registered.
@@ -576,9 +572,10 @@ fn sys_send_to_proxy(target_port: u32, tag: u64, data: [u64; 6], blocking: bool)
         let mut caps = crate::cap::CAP_SYSTEM.lock();
         caps.grant_send_cap(task_id, proxy_local);
     }
-    // Pack: tag encodes PROXY_MARKER + target, data carries original msg.
-    let proxy_tag = PROXY_MARKER | ((target_port as u64) << 32);
-    let mut proxy_msg = crate::ipc::Message::new(proxy_tag, [tag, data[0], data[1], data[2], data[3], 0]);
+    // Pack: tag = PROXY_MARKER, data[0] = target_port (full 64-bit),
+    // data[1] = original_tag, data[2..4] = original_data[0..2].
+    let proxy_tag = PROXY_MARKER;
+    let mut proxy_msg = crate::ipc::Message::new(proxy_tag, [target_port, tag, data[0], data[1], data[2], 0]);
 
     match crate::ipc::port::send_direct(proxy_local, &mut proxy_msg) {
         crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
@@ -610,19 +607,18 @@ fn sys_send_to_proxy(target_port: u32, tag: u64, data: [u64; 6], blocking: bool)
 
 /// Register the calling task's port as the network proxy endpoint.
 fn sys_proxy_register(port_id: u64) -> u64 {
-    let pid = port_id as u32;
-    if !check_port_cap(pid, crate::cap::Rights::RECV) {
+    if !check_port_cap(port_id, crate::cap::Rights::RECV) {
         return ECAP;
     }
-    crate::ipc::port::PROXY_PORT.store(pid, core::sync::atomic::Ordering::Release);
+    crate::ipc::port::PROXY_PORT.store(port_id, core::sync::atomic::Ordering::Release);
     0
 }
 
 fn sys_recv(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
-    if !check_port_cap(port_id as u32, crate::cap::Rights::RECV) {
+    if !check_port_cap(port_id, crate::cap::Rights::RECV) {
         return ECAP;
     }
-    match crate::ipc::port::recv_or_park(port_id as u32) {
+    match crate::ipc::port::recv_or_park(port_id) {
         Ok(msg) => {
             // Message was immediately available from the queue.
             let task_id = crate::sched::current_task_id();
@@ -647,10 +643,10 @@ fn sys_recv(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
 }
 
 fn sys_recv_nb(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
-    if !check_port_cap(port_id as u32, crate::cap::Rights::RECV) {
+    if !check_port_cap(port_id, crate::cap::Rights::RECV) {
         return ECAP;
     }
-    match crate::ipc::port::recv_nb(port_id as u32) {
+    match crate::ipc::port::recv_nb(port_id) {
         Ok(msg) => {
             let task_id = crate::sched::current_task_id();
             auto_grant_reply_caps(task_id, &msg);
@@ -675,10 +671,10 @@ fn sys_port_set_create() -> u64 {
 }
 
 fn sys_port_set_add(set_id: u64, port_id: u64) -> u64 {
-    if !check_port_cap(port_id as u32, crate::cap::Rights::RECV) {
+    if !check_port_cap(port_id, crate::cap::Rights::RECV) {
         return ECAP;
     }
-    if crate::ipc::port_set::add_port(set_id as u32, port_id as u32) {
+    if crate::ipc::port_set::add_port(set_id as u32, port_id) {
         0
     } else {
         1
@@ -984,7 +980,7 @@ fn sys_aspace_id() -> u64 {
 fn sys_get_initramfs_port() -> u64 {
     use core::sync::atomic::Ordering;
     let port = crate::io::initramfs::USER_INITRAMFS_PORT.load(Ordering::Acquire);
-    port as u64
+    port
 }
 
 fn sys_port_set_recv(set_id: u64, frame: &mut ExceptionFrame) -> u64 {
@@ -999,15 +995,15 @@ fn sys_port_set_recv(set_id: u64, frame: &mut ExceptionFrame) -> u64 {
             set_reg(frame, 5, msg.data[3]);
             set_reg(frame, 6, msg.data[4]);
             set_reg(frame, 7, msg.data[5]);
-            (port_id as u64) << 32 // status=0, port_id in high bits
+            port_id as u64 // full 64-bit port ID in x0, u64::MAX = error
         }
-        None => 1,
+        None => u64::MAX,
     }
 }
 
 fn sys_nsrv_port() -> u64 {
     use core::sync::atomic::Ordering;
-    crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire) as u64
+    crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire)
 }
 
 fn sys_mmap_device(phys_addr: u64, page_count: u64) -> u64 {
@@ -1638,12 +1634,12 @@ fn sys_set_quota(child_tid: u64, resource_type: u64, limit: u64) -> u64 {
 ///   data[4] = granted rights
 fn sys_send_cap(dest_port: u64, tag: u64, d0: u64, d1: u64, grant_port: u64, grant_rights: u64) -> u64 {
     // Check sender has SEND on dest_port.
-    if !check_port_cap(dest_port as u32, crate::cap::Rights::SEND) {
+    if !check_port_cap(dest_port, crate::cap::Rights::SEND) {
         return ECAP;
     }
 
     let sender_task = crate::sched::current_task_id();
-    let grant_port_id = grant_port as u32;
+    let grant_port_id = grant_port;
     let rights = crate::cap::Rights::from_bits(grant_rights as u32);
 
     // Check sender has the cap for grant_port with the requested rights.
@@ -1652,7 +1648,7 @@ fn sys_send_cap(dest_port: u64, tag: u64, d0: u64, d1: u64, grant_port: u64, gra
     }
 
     // Find receiver task: first task (other than sender) with RECV on dest_port.
-    let receiver_task = match crate::cap::find_recv_task(dest_port as u32, sender_task) {
+    let receiver_task = match crate::cap::find_recv_task(dest_port, sender_task) {
         Some(t) => t,
         None => return u64::MAX, // No receiver found.
     };
@@ -1669,10 +1665,10 @@ fn sys_send_cap(dest_port: u64, tag: u64, d0: u64, d1: u64, grant_port: u64, gra
     // Build and send the message.
     let mut msg = crate::ipc::Message {
         tag,
-        data: [d0, d1, receiver_slot, grant_port_id as u64, rights.bits() as u64, 0],
+        data: [d0, d1, receiver_slot, grant_port_id, rights.bits() as u64, 0],
     };
 
-    match crate::ipc::port::send_direct(dest_port as u32, &mut msg) {
+    match crate::ipc::port::send_direct(dest_port, &mut msg) {
         crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
             let recv_task = crate::sched::scheduler::thread_task_id(receiver_tid);
             auto_grant_reply_caps(recv_task, &msg);
@@ -1683,7 +1679,7 @@ fn sys_send_cap(dest_port: u64, tag: u64, d0: u64, d1: u64, grant_port: u64, gra
         }
         crate::ipc::port::SendDirectResult::Queued => 0,
         crate::ipc::port::SendDirectResult::Full => {
-            match crate::ipc::port::send(dest_port as u32, msg) {
+            match crate::ipc::port::send(dest_port, msg) {
                 Ok(()) => 0,
                 Err(()) => u64::MAX,
             }
@@ -2588,7 +2584,7 @@ fn sys_port_set_recv_timeout(set_id: u64, timeout_us: u64, frame: &mut Exception
             set_reg(frame, 5, msg.data[3]);
             set_reg(frame, 6, msg.data[4]);
             set_reg(frame, 7, msg.data[5]);
-            let result = (port_id as u64) << 32;
+            let result = port_id as u64;
             set_return(frame, result);
             let nr = SYS_PORT_SET_RECV_TIMEOUT;
             crate::trace::trace_event(crate::trace::EVT_SYSCALL_EXIT, nr as u32, result as u32);
