@@ -885,8 +885,7 @@ pub fn spawn(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
 /// but phase 2 (ELF loading, page table setup) runs without it.
 pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
     // Check port_is_active BEFORE locking SCHEDULER to avoid ABBA deadlock.
-    let arg0_is_port = arg0 > 0 && (arg0 as usize) < crate::ipc::port::MAX_PORTS
-        && crate::ipc::port::port_is_active(arg0);
+    let arg0_is_port = arg0 > 0 && crate::ipc::port::port_is_active(arg0);
 
     // Look up the ELF binary (no locks needed).
     let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
@@ -907,8 +906,7 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
 
 /// Spawn a new user-mode process from ELF data already in kernel memory.
 pub fn spawn_user_from_elf(elf_data: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
-    let arg0_is_port = arg0 > 0 && (arg0 as usize) < crate::ipc::port::MAX_PORTS
-        && crate::ipc::port::port_is_active(arg0);
+    let arg0_is_port = arg0 > 0 && crate::ipc::port::port_is_active(arg0);
 
     let (task_id, thread_id, parent) = SCHEDULER.lock().alloc_spawn_ids()?;
 
@@ -931,8 +929,7 @@ pub fn spawn_user_with_data(
     data_va: usize,
     arg0: u64,
 ) -> Option<ThreadId> {
-    let arg0_is_port = arg0 > 0 && (arg0 as usize) < crate::ipc::port::MAX_PORTS
-        && crate::ipc::port::port_is_active(arg0);
+    let arg0_is_port = arg0 > 0 && crate::ipc::port::port_is_active(arg0);
 
     let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
 

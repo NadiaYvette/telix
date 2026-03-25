@@ -1,12 +1,13 @@
 //! Adaptive Radix Tree (ART) for the port table.
 //!
 //! Maps 48-bit keys (port local IDs, 44 bits used) to `usize` values.
-//! Three inner node sizes: Node4 (64B slab), Node16 (256B slab), Node256 (4096B slab).
+//! Three inner node sizes: Node4 (64B slab), Node16 (256B slab), Node256 (raw page).
 //! Path compression stores up to 6 prefix bytes per node.
 //! Leaves are slab-allocated (key, value) pairs tagged with LSB=1.
 
 use crate::mm::slab;
 use crate::mm::page::PhysAddr;
+use crate::mm::phys;
 
 /// Key length in bytes (48-bit key space, upper 4 bits always 0).
 const KEY_LEN: usize = 6;
@@ -144,19 +145,18 @@ fn alloc_node16(partial: &[u8]) -> Option<*mut Node16> {
 // ---------------------------------------------------------------------------
 // Layout: Header(9) + 7pad + children(2048) = 2064 bytes → 4096B slab
 
-const NODE256_SLAB: usize = 4096;
-
 #[repr(C)]
 struct Node256 {
     h: Header,
     children: [usize; 256],
 }
 
+/// Allocate a Node256 from a raw physical page (too large for slab).
 fn alloc_node256(partial: &[u8]) -> Option<*mut Node256> {
-    let pa = slab::alloc(NODE256_SLAB)?;
+    let pa = phys::alloc_page()?;
     let p = pa.as_usize() as *mut Node256;
     unsafe {
-        core::ptr::write_bytes(p as *mut u8, 0, NODE256_SLAB);
+        core::ptr::write_bytes(p as *mut u8, 0, crate::mm::page::PAGE_SIZE);
         (*p).h.node_type = NODE256;
         let plen = partial.len().min(MAX_PARTIAL);
         (*p).h.partial_len = plen as u8;
@@ -174,7 +174,7 @@ unsafe fn free_node(ptr: usize) {
     match h.node_type {
         NODE4 => slab::free(PhysAddr::new(ptr), NODE4_SLAB),
         NODE16 => slab::free(PhysAddr::new(ptr), NODE16_SLAB),
-        NODE256 => slab::free(PhysAddr::new(ptr), NODE256_SLAB),
+        NODE256 => phys::free_page(PhysAddr::new(ptr)),
         _ => {}
     }
 }

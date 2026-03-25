@@ -13,7 +13,7 @@ pub const PERM_RECV: u8 = 0b010;
 pub const PERM_MANAGE: u8 = 0b100;
 
 /// Maximum inline entries per task. 32 entries × 8 bytes = 256 bytes.
-/// Covers all practical cases (MAX_PORTS = 256, tasks typically hold 3-8 caps).
+/// Covers all practical cases (tasks typically hold 3-8 caps).
 const INLINE_CAP: usize = 32;
 
 /// Pack a port_local + perms into an entry.
@@ -80,7 +80,7 @@ impl CapSet {
                 return true;
             }
         }
-        false // Full — should not happen with INLINE_CAP=32 and MAX_PORTS=256.
+        false // Full — should not happen with INLINE_CAP=32 (tasks typically hold 3-8 caps).
     }
 
     /// Remove all permissions for a port. Call under CAP_SYSTEM lock.

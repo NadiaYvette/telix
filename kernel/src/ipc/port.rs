@@ -5,9 +5,11 @@
 //! is full; receivers block if the queue is empty.
 //!
 //! Port IDs are structured as `(node:20 | local:44)` to support future
-//! network-transparent IPC. For single-node operation, node is always 0
-//! and the PortId value equals the local index.
+//! network-transparent IPC. For single-node operation, node is always 0.
+//! Ports are dynamically allocated via an Adaptive Radix Tree (ART),
+//! with no fixed upper limit on the number of ports.
 
+use super::art::Art;
 use super::message::Message;
 use crate::sched::thread::ThreadId;
 use crate::mm::page::PhysAddr;
@@ -80,6 +82,7 @@ impl PortQueue {
         self.len >= PORT_QUEUE_CAPACITY
     }
 
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -103,8 +106,8 @@ fn free_queue(ptr: *mut PortQueue) {
 /// Maximum threads that can be blocked waiting on a port.
 const MAX_WAITERS: usize = 8;
 
-/// Maximum number of ports in the system.
-pub const MAX_PORTS: usize = 256;
+/// Slab size for Port allocation (~136 bytes, fits in 256-byte slab).
+const PORT_SLAB_SIZE: usize = 256;
 
 /// Kernel receive handler type. Called synchronously when a message is
 /// sent to a kernel-held port. `user_data` is an opaque value set at
@@ -115,7 +118,6 @@ pub type KernelHandler = fn(PortId, usize, &Message) -> Message;
 pub struct Port {
     #[allow(dead_code)]
     pub id: PortId,
-    pub active: bool,
     /// Pointer to slab-allocated message queue (0 = not yet allocated).
     /// Queue is allocated on first send, so kernel-held ports that handle
     /// faults synchronously never pay for the queue.
@@ -144,7 +146,6 @@ impl Port {
     pub const fn new(id: PortId) -> Self {
         Self {
             id,
-            active: true,
             queue_ptr: 0,
             kernel_handler: 0,
             kernel_user_data: 0,
@@ -164,13 +165,6 @@ impl Port {
         self.kernel_handler != 0
     }
 
-    /// Call the kernel handler synchronously. Caller must verify is_kernel_held() first.
-    /// Port table lock must NOT be held when calling this (handler may take other locks).
-    unsafe fn invoke_handler(&self, port_id: PortId, msg: &Message) -> Message {
-        let handler: KernelHandler = core::mem::transmute(self.kernel_handler);
-        handler(port_id, self.kernel_user_data, msg)
-    }
-
     /// Ensure the message queue is allocated. Returns false on OOM.
     fn ensure_queue(&mut self) -> bool {
         if self.queue_ptr != 0 {
@@ -186,6 +180,7 @@ impl Port {
     }
 
     /// Get a reference to the queue, if allocated.
+    #[allow(dead_code)]
     fn queue(&self) -> Option<&PortQueue> {
         if self.queue_ptr == 0 { None } else { Some(unsafe { &*(self.queue_ptr as *const PortQueue) }) }
     }
@@ -280,6 +275,7 @@ impl Port {
     }
 
     /// Whether the queue exists and is full.
+    #[allow(dead_code)]
     pub fn is_queue_full(&self) -> bool {
         match self.queue() {
             Some(q) => q.is_full(),
@@ -288,20 +284,51 @@ impl Port {
     }
 }
 
-/// Global port table.
+// --- Port slab allocation ---
+
+/// Allocate a Port from the slab allocator.
+fn alloc_port(id: PortId) -> Option<*mut Port> {
+    let pa = crate::mm::slab::alloc(PORT_SLAB_SIZE)?;
+    let ptr = pa.as_usize() as *mut Port;
+    unsafe { core::ptr::write(ptr, Port::new(id)); }
+    Some(ptr)
+}
+
+/// Free a Port and its queue back to the slab allocator.
+fn free_port(ptr: *mut Port) {
+    unsafe { (*ptr).free_queue(); }
+    crate::mm::slab::free(PhysAddr::new(ptr as usize), PORT_SLAB_SIZE);
+}
+
+// --- ART-backed port table ---
+
 use crate::sync::SpinLock;
 
 struct PortTable {
-    ports: [Port; MAX_PORTS],
-    next_id: PortId,
+    art: Art,
+    next_id: u64,
 }
 
 impl PortTable {
     const fn new() -> Self {
         Self {
-            ports: [const { Port::new(0) }; MAX_PORTS],
+            art: Art::new(),
             next_id: 0,
         }
+    }
+
+    /// Look up a port by local ID. Returns a reference valid while lock is held.
+    #[inline]
+    fn get(&self, local: u64) -> Option<&Port> {
+        let ptr = self.art.lookup(local)?;
+        Some(unsafe { &*(ptr as *const Port) })
+    }
+
+    /// Mutable lookup by local ID.
+    #[inline]
+    fn get_mut(&mut self, local: u64) -> Option<&mut Port> {
+        let ptr = self.art.lookup(local)?;
+        Some(unsafe { &mut *(ptr as *mut Port) })
     }
 }
 
@@ -311,39 +338,27 @@ static PORT_TABLE: SpinLock<PortTable> = SpinLock::new(PortTable::new());
 /// redirected to this port. 0 = no proxy registered.
 pub static PROXY_PORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Create a new port. Returns its ID (node=0, local=index).
+/// Create a new port. Returns its ID (node=0, local=monotonic_counter).
 pub fn create() -> Option<PortId> {
     let creator = crate::sched::current_task_id();
     let mut table = PORT_TABLE.lock();
-    // First try the fast path: allocate from next_id.
-    let id = table.next_id;
-    if (id as usize) < MAX_PORTS {
-        table.ports[id as usize] = Port::new(make_port_id(0, id as u64));
-        table.ports[id as usize].creator_task = creator;
-        table.next_id += 1;
-        return Some(make_port_id(0, id as u64));
+    let local = table.next_id;
+    table.next_id += 1;
+    let pid = make_port_id(0, local);
+    let ptr = alloc_port(pid)?;
+    unsafe { (*ptr).creator_task = creator; }
+    if !table.art.insert(local, ptr as usize) {
+        free_port(ptr);
+        return None;
     }
-    // Slow path: scan for a destroyed (inactive) port to reuse.
-    for i in 0..MAX_PORTS {
-        if !table.ports[i].active {
-            let pid = make_port_id(0, i as u64);
-            table.ports[i] = Port::new(pid);
-            table.ports[i].creator_task = creator;
-            return Some(pid);
-        }
-    }
-    None
+    Some(pid)
 }
 
-/// Get the creator task of a port, or None if port is inactive.
+/// Get the creator task of a port, or None if port doesn't exist.
 pub fn port_creator(port_id: PortId) -> Option<u32> {
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     let table = PORT_TABLE.lock();
-    if local < MAX_PORTS && table.ports[local].active {
-        Some(table.ports[local].creator_task)
-    } else {
-        None
-    }
+    table.get(local).map(|p| p.creator_task)
 }
 
 /// Send a message to a port (non-blocking).
@@ -352,15 +367,12 @@ pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {
     // Stamp sender priority for priority inheritance.
     let tid = crate::sched::current_thread_id();
     msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     let mut table = PORT_TABLE.lock();
-    if local >= MAX_PORTS {
-        return Err(msg);
-    }
-    let port = &mut table.ports[local];
-    if !port.active {
-        return Err(msg);
-    }
+    let port = match table.get_mut(local) {
+        Some(p) => p,
+        None => return Err(msg),
+    };
     // Kernel-held port: invoke handler synchronously, no queue.
     if port.is_kernel_held() {
         let handler = port.kernel_handler;
@@ -409,13 +421,13 @@ pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {
 /// Receive a message from a port (non-blocking).
 /// Returns Ok(msg) on success, Err(()) if empty or kernel-held.
 pub fn recv_nb(port_id: PortId) -> Result<Message, ()> {
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     let mut table = PORT_TABLE.lock();
-    if local >= MAX_PORTS {
-        return Err(());
-    }
-    let port = &mut table.ports[local];
-    if !port.active || port.is_kernel_held() {
+    let port = match table.get_mut(local) {
+        Some(p) => p,
+        None => return Err(()),
+    };
+    if port.is_kernel_held() {
         return Err(());
     }
     match port.try_recv() {
@@ -440,15 +452,17 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
     let tid = crate::sched::current_thread_id();
     msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
     crate::sched::stats::IPC_SENDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     // Check for kernel handler before entering the loop.
     {
         let table = PORT_TABLE.lock();
-        if local >= MAX_PORTS { return Err(()); }
-        if !table.ports[local].active { return Err(()); }
-        if table.ports[local].is_kernel_held() {
-            let handler = table.ports[local].kernel_handler;
-            let udata = table.ports[local].kernel_user_data;
+        let port = match table.get(local) {
+            Some(p) => p,
+            None => return Err(()),
+        };
+        if port.is_kernel_held() {
+            let handler = port.kernel_handler;
+            let udata = port.kernel_user_data;
             drop(table);
             let handler_fn: KernelHandler = unsafe { core::mem::transmute(handler) };
             let _reply = handler_fn(port_id, udata, &msg);
@@ -458,13 +472,10 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
     let mut pending = msg;
     loop {
         let mut table = PORT_TABLE.lock();
-        if local >= MAX_PORTS {
-            return Err(());
-        }
-        let port = &mut table.ports[local];
-        if !port.active {
-            return Err(());
-        }
+        let port = match table.get_mut(local) {
+            Some(p) => p,
+            None => return Err(()),
+        };
         match port.try_send(pending) {
             Ok((wakeup, set_id)) => {
                 if let Some(waiter_tid) = wakeup {
@@ -509,17 +520,17 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
 /// Blocks if the queue is empty until a message arrives.
 pub fn recv(port_id: PortId) -> Result<Message, ()> {
     use crate::sched::thread::BlockReason;
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     // Reset priority to base on recv entry (priority inheritance protocol).
     let my_tid = crate::sched::current_thread_id();
     crate::sched::reset_priority(my_tid);
     loop {
         let mut table = PORT_TABLE.lock();
-        if local >= MAX_PORTS {
-            return Err(());
-        }
-        let port = &mut table.ports[local];
-        if !port.active || port.is_kernel_held() {
+        let port = match table.get_mut(local) {
+            Some(p) => p,
+            None => return Err(()),
+        };
+        if port.is_kernel_held() {
             return Err(());
         }
         match port.try_recv() {
@@ -545,48 +556,47 @@ pub fn recv(port_id: PortId) -> Result<Message, ()> {
 
 /// Set the port set membership for a port.
 pub fn set_port_set(port_id: PortId, set_id: u32) {
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     let mut table = PORT_TABLE.lock();
-    if local < MAX_PORTS {
-        table.ports[local].port_set_id = set_id;
+    if let Some(port) = table.get_mut(local) {
+        port.port_set_id = set_id;
     }
 }
 
-/// Check if a port is active (for auto-grant heuristics).
+/// Check if a port exists (for auto-grant heuristics).
 pub fn port_is_active(port_id: PortId) -> bool {
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     let table = PORT_TABLE.lock();
-    local < MAX_PORTS && table.ports[local].active
+    table.get(local).is_some()
 }
 
 /// Set the recv_holder for a port (task that holds the RECV cap).
 pub fn set_recv_holder(port_id: PortId, task_id: u32) {
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     let mut table = PORT_TABLE.lock();
-    if local < MAX_PORTS {
-        table.ports[local].recv_holder = task_id;
+    if let Some(port) = table.get_mut(local) {
+        port.recv_holder = task_id;
     }
 }
 
 /// Get the recv_holder for a port. Returns u32::MAX if none.
 pub fn get_recv_holder(port_id: PortId) -> u32 {
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     let table = PORT_TABLE.lock();
-    if local < MAX_PORTS && table.ports[local].active {
-        table.ports[local].recv_holder
-    } else {
-        u32::MAX
+    match table.get(local) {
+        Some(port) => port.recv_holder,
+        None => u32::MAX,
     }
 }
 
-/// Destroy a port, freeing its message queue.
+/// Destroy a port, removing it from the table and freeing all resources.
 #[allow(dead_code)]
 pub fn destroy(port_id: PortId) {
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     let mut table = PORT_TABLE.lock();
-    if local < MAX_PORTS {
-        table.ports[local].active = false;
-        table.ports[local].free_queue();
+    if let Some(ptr) = table.art.remove(local) {
+        drop(table);
+        free_port(ptr as *mut Port);
     }
 }
 
@@ -614,15 +624,12 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
     crate::sched::stats::IPC_SENDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     crate::trace::trace_event(crate::trace::EVT_IPC_SEND, port_id as u32, 0);
 
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     let mut table = PORT_TABLE.lock();
-    if local >= MAX_PORTS {
-        return SendDirectResult::Error;
-    }
-    let port = &mut table.ports[local];
-    if !port.active {
-        return SendDirectResult::Error;
-    }
+    let port = match table.get_mut(local) {
+        Some(p) => p,
+        None => return SendDirectResult::Error,
+    };
 
     // Kernel-held port: invoke handler synchronously.
     if port.is_kernel_held() {
@@ -671,16 +678,16 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
 /// Returns Err(()) if the thread was parked (message will be injected by sender).
 pub fn recv_or_park(port_id: PortId) -> Result<Message, ()> {
     use crate::sched::thread::BlockReason;
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     let my_tid = crate::sched::current_thread_id();
     crate::sched::reset_priority(my_tid);
 
     let mut table = PORT_TABLE.lock();
-    if local >= MAX_PORTS {
-        return Err(());
-    }
-    let port = &mut table.ports[local];
-    if !port.active || port.is_kernel_held() {
+    let port = match table.get_mut(local) {
+        Some(p) => p,
+        None => return Err(()),
+    };
+    if port.is_kernel_held() {
         return Err(());
     }
 
@@ -710,49 +717,33 @@ pub fn recv_or_park(port_id: PortId) -> Result<Message, ()> {
 /// Create a port with a kernel receive handler. The kernel holds the receive
 /// right: sends invoke the handler synchronously, no message queue is allocated,
 /// and user-space threads cannot recv on this port.
-///
-/// The handler is called with (port_id, &message) and returns a reply Message.
-/// The PORT_TABLE lock is NOT held during the handler call, so the handler
-/// may safely take other kernel locks.
 pub fn create_kernel_port(handler: KernelHandler, user_data: usize) -> Option<PortId> {
     let mut table = PORT_TABLE.lock();
-    // Fast path.
-    let id = table.next_id;
-    if (id as usize) < MAX_PORTS {
-        let pid = make_port_id(0, id as u64);
-        table.ports[id as usize] = Port::new(pid);
-        table.ports[id as usize].creator_task = 0; // kernel
-        table.ports[id as usize].kernel_handler = handler as usize;
-        table.ports[id as usize].kernel_user_data = user_data;
-        table.next_id += 1;
-        return Some(pid);
+    let local = table.next_id;
+    table.next_id += 1;
+    let pid = make_port_id(0, local);
+    let ptr = alloc_port(pid)?;
+    unsafe {
+        (*ptr).creator_task = 0; // kernel
+        (*ptr).kernel_handler = handler as usize;
+        (*ptr).kernel_user_data = user_data;
     }
-    // Slow path: scan for a destroyed (inactive) port to reuse.
-    for i in 0..MAX_PORTS {
-        if !table.ports[i].active {
-            let pid = make_port_id(0, i as u64);
-            table.ports[i] = Port::new(pid);
-            table.ports[i].creator_task = 0;
-            table.ports[i].kernel_handler = handler as usize;
-            table.ports[i].kernel_user_data = user_data;
-            return Some(pid);
-        }
+    if !table.art.insert(local, ptr as usize) {
+        free_port(ptr);
+        return None;
     }
-    None
+    Some(pid)
 }
 
 /// Call a port's kernel handler directly (synchronous request-reply).
 /// Returns Some(reply) if the port has a kernel handler, None otherwise.
-/// This is the fast path for kernel code that needs to interact with a
-/// kernel-held port without constructing IPC send/recv pairs.
 #[allow(dead_code)]
 pub fn call_kernel_handler(port_id: PortId, msg: &Message) -> Option<Message> {
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     let (handler, udata) = {
         let table = PORT_TABLE.lock();
-        if local >= MAX_PORTS { return None; }
-        let port = &table.ports[local];
-        if !port.active || !port.is_kernel_held() { return None; }
+        let port = table.get(local)?;
+        if !port.is_kernel_held() { return None; }
         (port.kernel_handler, port.kernel_user_data)
     };
     // Lock released — safe to call handler.
@@ -763,7 +754,7 @@ pub fn call_kernel_handler(port_id: PortId, msg: &Message) -> Option<Message> {
 /// Check if a port has a kernel receive handler.
 #[allow(dead_code)]
 pub fn has_kernel_handler(port_id: PortId) -> bool {
-    let local = port_local(port_id) as usize;
+    let local = port_local(port_id);
     let table = PORT_TABLE.lock();
-    local < MAX_PORTS && table.ports[local].active && table.ports[local].is_kernel_held()
+    matches!(table.get(local), Some(p) if p.is_kernel_held())
 }
