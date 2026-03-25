@@ -506,7 +506,7 @@ struct SpawnParentInfo {
 fn do_spawn_heavy_work(
     task_id: u32,
     thread_id: ThreadId,
-    _parent: &SpawnParentInfo,
+    parent: &SpawnParentInfo,
     elf_data: &[u8],
     _priority: u8,
     _quantum: u32,
@@ -546,6 +546,16 @@ fn do_spawn_heavy_work(
         if arg0_is_port {
             caps.grant_full_port_cap(task_id, arg0);
         }
+
+        // Grant parent: SEND|RECV|MANAGE on child task port, SEND|MANAGE on child thread port.
+        use crate::cap::capability::Rights;
+        let srm = Rights::SEND.union(Rights::RECV).union(Rights::MANAGE);
+        let sm = Rights::SEND.union(Rights::MANAGE);
+        caps.grant_port_cap(parent.parent_task, task_port, srm);
+        caps.grant_port_cap(parent.parent_task, thread_port, sm);
+        // Grant child: SEND on own task port, SEND|RECV|MANAGE on own thread port.
+        caps.grant_send_cap(task_id, task_port);
+        caps.grant_port_cap(task_id, thread_port, srm);
     }
 
     // Load ELF segments into the address space.
@@ -1205,7 +1215,15 @@ pub fn thread_create(task_id: u32, entry: u64, stack_top: u64, arg: u64) -> Opti
     let thread_port = crate::ipc::port::create_kernel_port(thread_port_handler, thread_id as usize)?;
     // Finalize under SCHEDULER lock.
     let mut sched = SCHEDULER.lock();
-    sched.create_thread_in_task(task_id, thread_id, entry, stack_top, arg, priority, quantum, thread_port)
+    let result = sched.create_thread_in_task(task_id, thread_id, entry, stack_top, arg, priority, quantum, thread_port);
+    // Grant caps on the new thread's port.
+    if result.is_some() {
+        use crate::cap::capability::Rights;
+        let srm = Rights::SEND.union(Rights::RECV).union(Rights::MANAGE);
+        let mut caps = crate::cap::CAP_SYSTEM.lock();
+        caps.grant_port_cap(task_id, thread_port, srm);
+    }
+    result
 }
 
 /// Check if a thread has exited and return its exit code.
@@ -2018,6 +2036,12 @@ pub fn fork_current() -> u64 {
         if iramfs != u64::MAX {
             caps.grant_send_cap(child_task_id, iramfs);
         }
+
+        // Grant parent and child caps on the child's task port.
+        use crate::cap::capability::Rights;
+        let srm = Rights::SEND.union(Rights::RECV).union(Rights::MANAGE);
+        caps.grant_port_cap(parent_task_id, child_task_port, srm);
+        caps.grant_send_cap(child_task_id, child_task_port);
     }
 
     // Allocate kernel stack for child thread.
@@ -2079,6 +2103,16 @@ pub fn fork_current() -> u64 {
     thread.sig_pending = 0;
 
     sched.run_queues[parent_priority as usize].push(child_tid);
+
+    // Grant caps on the child's thread port.
+    {
+        use crate::cap::capability::Rights;
+        let srm = Rights::SEND.union(Rights::RECV).union(Rights::MANAGE);
+        let sm = Rights::SEND.union(Rights::MANAGE);
+        let mut caps = crate::cap::CAP_SYSTEM.lock();
+        caps.grant_port_cap(parent_task_id, child_thread_port, sm);
+        caps.grant_port_cap(child_task_id, child_thread_port, srm);
+    }
 
     // Return child thread ID to parent (nonzero = parent, 0 = child).
     // This matches the waitpid API which takes a thread ID.
