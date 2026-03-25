@@ -389,7 +389,7 @@ pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {
                 use crate::sched::thread::ThreadState;
                 let is_parked = {
                     let sched = crate::sched::scheduler::SCHEDULER.lock();
-                    sched.threads[waiter_tid as usize].state == ThreadState::Blocked
+                    sched.thread(waiter_tid).state == ThreadState::Blocked
                 };
                 if is_parked {
                     // Dequeue the message we just queued — we'll inject it directly.
@@ -482,7 +482,7 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
                     use crate::sched::thread::ThreadState;
                     let is_parked = {
                         let sched = crate::sched::scheduler::SCHEDULER.lock();
-                        sched.threads[waiter_tid as usize].state == ThreadState::Blocked
+                        sched.thread(waiter_tid).state == ThreadState::Blocked
                     };
                     if is_parked {
                         // Dequeue the message — inject directly into parked receiver.
@@ -646,7 +646,7 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
         let waiter = port.recv_waiters[port.recv_waiter_count - 1];
         let is_parked = {
             let sched = crate::sched::scheduler::SCHEDULER.lock();
-            sched.threads[waiter as usize].state == ThreadState::Blocked
+            sched.thread(waiter).state == ThreadState::Blocked
         };
         if is_parked {
             port.recv_waiter_count -= 1;

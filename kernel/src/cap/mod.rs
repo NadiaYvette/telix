@@ -10,12 +10,12 @@ pub use cdt::Cdt;
 pub use space::CapSpace;
 
 use crate::sync::SpinLock;
-use crate::sched::task::MAX_TASKS;
+use crate::sched::task::TASK_SLOTS;
 use crate::ipc::port::port_local;
 
 /// Per-task sparse capability sets for fast lockless cap checks.
 /// Updated under CAP_SYSTEM lock, read locklessly via AtomicU64.
-pub static CAPSETS: [CapSet; MAX_TASKS] = [const { CapSet::new() }; MAX_TASKS];
+pub static CAPSETS: [CapSet; TASK_SLOTS] = [const { CapSet::new() }; TASK_SLOTS];
 
 /// Convert Rights to capset permission bits.
 #[inline]
@@ -68,21 +68,21 @@ pub fn capset_copy(parent_task: u32, child_task: u32) {
 /// Global capability system: per-task CapSpaces + the CDT.
 pub struct CapSystem {
     pub cdt: Cdt,
-    pub spaces: [CapSpace; MAX_TASKS],
+    pub spaces: [CapSpace; TASK_SLOTS],
 }
 
 impl CapSystem {
     pub const fn new() -> Self {
         Self {
             cdt: Cdt::new(),
-            spaces: [const { CapSpace::new(0) }; MAX_TASKS],
+            spaces: [const { CapSpace::new(0) }; TASK_SLOTS],
         }
     }
 
     /// Initialize the CDT free list and reset all CapSpaces.
     pub fn init(&mut self) {
         self.cdt.init();
-        for i in 0..MAX_TASKS {
+        for i in 0..TASK_SLOTS {
             self.spaces[i] = CapSpace::new(i as u32);
             capset_reset(i as u32);
         }

@@ -66,7 +66,7 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
             let tid = crate::sched::current_thread_id();
             let kstack_base = {
                 let sched = crate::sched::scheduler::SCHEDULER.lock();
-                sched.threads[tid as usize].stack_base
+                sched.thread(tid).stack_base
             };
             crate::println!(
                 "EL1 Sync: EC={:#x} ESR={:#x} ELR={:#x} SP_EL0={:#x}",
@@ -93,16 +93,17 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
             {
                 let sched = crate::sched::scheduler::SCHEDULER.lock();
                 let mut found = false;
-                for i in 0..64usize {
-                    if sched.threads[i].stack_base == frame_page {
+                sched.thread_art.for_each(|key, val| {
+                    if found { return; }
+                    let t = unsafe { &*(val as *const crate::sched::thread::Thread) };
+                    if t.stack_base == frame_page {
                         crate::println!(
                             "  frame_sp page {:#x} belongs to tid={} state={:?} task={}",
-                            frame_page, i, sched.threads[i].state, sched.threads[i].task_id
+                            frame_page, key, t.state, t.task_id
                         );
                         found = true;
-                        break;
                     }
-                }
+                });
                 if !found {
                     crate::println!("  frame_sp page {:#x} NOT found in any thread's kstack!", frame_page);
                 }
@@ -112,7 +113,7 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
                 let sched = crate::sched::scheduler::SCHEDULER.lock();
                 crate::println!(
                     "  thread[{}].saved_sp={:#x} state={:?}",
-                    tid, sched.threads[tid as usize].saved_sp, sched.threads[tid as usize].state
+                    tid, sched.thread(tid).saved_sp, sched.thread(tid).state
                 );
             }
             loop {

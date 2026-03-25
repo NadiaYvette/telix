@@ -29,8 +29,9 @@ pub enum BlockReason {
     WaitChild,
 }
 
-/// Maximum number of threads.
-pub const MAX_THREADS: usize = 64;
+/// Maximum thread ID slot count for per-thread atomic arrays.
+/// Thread data itself is ART-backed; this bounds the lock-free flat arrays.
+pub const THREAD_SLOTS: usize = 256;
 
 /// Size of the exception frame saved by vectors.S.
 /// AArch64: 288 bytes = 36 x u64 (x0-x30, sp_el0, elr, spsr, esr).

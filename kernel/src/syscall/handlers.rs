@@ -455,7 +455,7 @@ fn sys_port_create() -> u64 {
     // Check resource quota.
     if task_id != 0 {
         let sched = crate::sched::scheduler::SCHEDULER.lock();
-        let task = &sched.tasks[task_id as usize];
+        let task = sched.task(task_id);
         if task.cur_ports >= task.max_ports {
             return u64::MAX;
         }
@@ -471,7 +471,7 @@ fn sys_port_create() -> u64 {
             // Increment port quota counter.
             if task_id != 0 {
                 let mut sched = crate::sched::scheduler::SCHEDULER.lock();
-                sched.tasks[task_id as usize].cur_ports += 1;
+                sched.task_mut(task_id).cur_ports += 1;
             }
             id as u64
         }
@@ -492,8 +492,8 @@ fn sys_port_destroy(port_id: u64) -> u64 {
         drop(caps);
         // Decrement port quota counter.
         let mut sched = crate::sched::scheduler::SCHEDULER.lock();
-        if sched.tasks[task_id as usize].cur_ports > 0 {
-            sched.tasks[task_id as usize].cur_ports -= 1;
+        if sched.task(task_id).cur_ports > 0 {
+            sched.task_mut(task_id).cur_ports -= 1;
         }
     }
     0
@@ -746,16 +746,18 @@ fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64, arg0: u64) -> u64 {
     {
         let sched = crate::sched::scheduler::SCHEDULER.lock();
         let task_id = crate::sched::current_task_id();
-        let uid = sched.tasks[task_id as usize].uid;
-        let nproc_limit = sched.tasks[task_id as usize]
+        let uid = sched.task(task_id).uid;
+        let nproc_limit = sched.task(task_id)
             .rlimits[crate::sched::task::RLIMIT_NPROC as usize].cur;
         if nproc_limit != crate::sched::task::RLIM_INFINITY {
             let mut count = 0u64;
-            for i in 1..crate::sched::task::MAX_TASKS {
-                if sched.tasks[i].active && sched.tasks[i].uid == uid {
+            sched.task_art.for_each(|key, val| {
+                if key == 0 { return; }
+                let t = unsafe { &*(val as *const crate::sched::task::Task) };
+                if t.active && t.uid == uid {
                     count += 1;
                 }
-            }
+            });
             if count >= nproc_limit {
                 return u64::MAX;
             }
@@ -811,7 +813,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     let task_id = crate::sched::current_task_id();
     if task_id != 0 {
         let sched = crate::sched::scheduler::SCHEDULER.lock();
-        let task = &sched.tasks[task_id as usize];
+        let task = sched.task(task_id);
         if task.cur_pages + pages as u32 > task.max_pages {
             return u64::MAX;
         }
@@ -932,7 +934,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     // Increment page quota counter.
     if task_id != 0 {
         let mut sched = crate::sched::scheduler::SCHEDULER.lock();
-        sched.tasks[task_id as usize].cur_pages += pages as u32;
+        sched.task_mut(task_id).cur_pages += pages as u32;
     }
 
     va as u64
@@ -1581,7 +1583,7 @@ fn sys_thread_create(entry: u64, stack_top: u64, arg: u64) -> u64 {
     // Check thread quota.
     if task_id != 0 {
         let sched = crate::sched::scheduler::SCHEDULER.lock();
-        let task = &sched.tasks[task_id as usize];
+        let task = sched.task(task_id);
         if task.thread_count >= task.max_threads {
             return u64::MAX;
         }
@@ -1603,19 +1605,19 @@ fn sys_set_quota(child_tid: u64, resource_type: u64, limit: u64) -> u64 {
     let caller = crate::sched::current_task_id();
     // Resolve thread_id to task_id.
     let child_task = crate::sched::thread_task_id(child_tid as u32);
-    if child_task as usize >= crate::sched::task::MAX_TASKS {
-        return u64::MAX;
-    }
     let mut sched = crate::sched::scheduler::SCHEDULER.lock();
-    let task = &sched.tasks[child_task as usize];
+    let task = match sched.task_get(child_task as u32) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
     if !task.active || task.parent_task != caller {
         return u64::MAX; // Only parent can set quotas.
     }
     let limit32 = limit as u32;
     match resource_type {
-        0 => sched.tasks[child_task as usize].max_ports = limit32,
-        1 => sched.tasks[child_task as usize].max_threads = limit32,
-        2 => sched.tasks[child_task as usize].max_pages = limit32,
+        0 => sched.task_mut(child_task as u32).max_ports = limit32,
+        1 => sched.task_mut(child_task as u32).max_threads = limit32,
+        2 => sched.task_mut(child_task as u32).max_pages = limit32,
         _ => return u64::MAX,
     }
     0
@@ -1738,22 +1740,30 @@ fn sys_vm_stats(which: u64) -> u64 {
     }
 }
 
-/// Enumerate active tasks. Returns task_id of tasks[index] if active, else 0.
+/// Enumerate active tasks. Returns task_id of the index-th active task, else 0.
 fn sys_proc_list(index: u64) -> u64 {
-    use crate::sched::task::MAX_TASKS;
-    if index as usize >= MAX_TASKS { return 0; }
     let sched = crate::sched::scheduler::SCHEDULER.lock();
-    let task = &sched.tasks[index as usize];
-    if task.active { task.id as u64 } else { 0 }
+    let mut i = 0u64;
+    let mut result = 0u64;
+    sched.task_art.for_each(|_key, val| {
+        let task = unsafe { &*(val as *const crate::sched::task::Task) };
+        if task.active {
+            if i == index {
+                result = task.id as u64;
+            }
+            i += 1;
+        }
+    });
+    result
 }
 
 /// Query process metadata. Returns packed info via multi-return registers.
 fn sys_proc_info(task_id: u64, frame: &mut ExceptionFrame) -> u64 {
-    use crate::sched::task::MAX_TASKS;
-    let tid = task_id as usize;
-    if tid >= MAX_TASKS { return u64::MAX; }
     let sched = crate::sched::scheduler::SCHEDULER.lock();
-    let task = &sched.tasks[tid];
+    let task = match sched.task_get(task_id as u32) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
     if !task.active && !task.exited { return u64::MAX; }
 
     let r1 = (task.parent_task as u64) | ((task.thread_count as u64) << 32);
@@ -2100,7 +2110,7 @@ fn sys_kill_sig(target: u64, sig: u64) -> u64 {
     if target_i64 < 0 {
         // Send to process group. User passes thread_id; convert to task_id for pgid.
         let raw = (-target_i64) as u32;
-        let pgid = if (raw as usize) < crate::sched::thread::MAX_THREADS {
+        let pgid = if (raw as usize) < crate::sched::thread::THREAD_SLOTS {
             crate::sched::thread_task_id(raw)
         } else {
             // Not a valid thread_id; treat as raw task_id (pgid).
@@ -2271,29 +2281,29 @@ fn deliver_pending_signals(frame: &mut ExceptionFrame) {
 fn sys_getuid() -> u64 {
     let sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    sched.tasks[task_id as usize].uid as u64
+    let task_id = sched.thread(tid).task_id;
+    sched.task(task_id).uid as u64
 }
 
 fn sys_geteuid() -> u64 {
     let sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    sched.tasks[task_id as usize].euid as u64
+    let task_id = sched.thread(tid).task_id;
+    sched.task(task_id).euid as u64
 }
 
 fn sys_getgid() -> u64 {
     let sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    sched.tasks[task_id as usize].gid as u64
+    let task_id = sched.thread(tid).task_id;
+    sched.task(task_id).gid as u64
 }
 
 fn sys_getegid() -> u64 {
     let sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    sched.tasks[task_id as usize].egid as u64
+    let task_id = sched.thread(tid).task_id;
+    sched.task(task_id).egid as u64
 }
 
 /// setuid: only euid 0 (root) can set arbitrary uid.
@@ -2301,8 +2311,8 @@ fn sys_getegid() -> u64 {
 fn sys_setuid(new_uid: u64) -> u64 {
     let mut sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    let task = &mut sched.tasks[task_id as usize];
+    let task_id = sched.thread(tid).task_id;
+    let task = sched.task_mut(task_id);
     if task.euid == 0 {
         // Root: set both real and effective.
         task.uid = new_uid as u32;
@@ -2321,8 +2331,8 @@ fn sys_setuid(new_uid: u64) -> u64 {
 fn sys_setgid(new_gid: u64) -> u64 {
     let mut sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    let task = &mut sched.tasks[task_id as usize];
+    let task_id = sched.thread(tid).task_id;
+    let task = sched.task_mut(task_id);
     if task.euid == 0 {
         task.gid = new_gid as u32;
         task.egid = new_gid as u32;
@@ -2355,8 +2365,8 @@ fn sys_setgroups(count: u64, groups_ptr: u64) -> u64 {
     }
     let mut sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    let task = &mut sched.tasks[task_id as usize];
+    let task_id = sched.thread(tid).task_id;
+    let task = sched.task_mut(task_id);
     if task.euid != 0 {
         return u64::MAX; // EPERM
     }
@@ -2385,8 +2395,8 @@ fn sys_getrlimit(resource: u64, frame: &mut ExceptionFrame) -> u64 {
     if resource as usize >= RLIMIT_COUNT { return u64::MAX; }
     let sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    let rl = &sched.tasks[task_id as usize].rlimits[resource as usize];
+    let task_id = sched.thread(tid).task_id;
+    let rl = &sched.task(task_id).rlimits[resource as usize];
     let cur = rl.cur;
     let max = rl.max;
     drop(sched);
@@ -2401,9 +2411,9 @@ fn sys_setrlimit(resource: u64, new_cur: u64, new_max: u64) -> u64 {
     if resource as usize >= RLIMIT_COUNT { return u64::MAX; }
     let mut sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    let euid = sched.tasks[task_id as usize].euid;
-    let rl = &sched.tasks[task_id as usize].rlimits[resource as usize];
+    let task_id = sched.thread(tid).task_id;
+    let euid = sched.task(task_id).euid;
+    let rl = &sched.task(task_id).rlimits[resource as usize];
     let old_max = rl.max;
 
     // Validate: soft <= hard (unless INFINITY).
@@ -2421,8 +2431,8 @@ fn sys_setrlimit(resource: u64, new_cur: u64, new_max: u64) -> u64 {
         return u64::MAX;
     }
 
-    sched.tasks[task_id as usize].rlimits[resource as usize].cur = new_cur;
-    sched.tasks[task_id as usize].rlimits[resource as usize].max = new_max;
+    sched.task_mut(task_id).rlimits[resource as usize].cur = new_cur;
+    sched.task_mut(task_id).rlimits[resource as usize].max = new_max;
     0
 }
 
@@ -2432,25 +2442,28 @@ fn sys_prlimit(pid: u64, resource: u64, new_cur: u64, new_max: u64, frame: &mut 
 
     let mut sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let caller_task_id = sched.threads[tid as usize].task_id;
-    let euid = sched.tasks[caller_task_id as usize].euid;
+    let caller_task_id = sched.thread(tid).task_id;
+    let euid = sched.task(caller_task_id).euid;
 
     // Resolve target: pid=0 means self.
     let target_task_id = if pid == 0 {
         caller_task_id
     } else {
         let p = pid as u32;
-        if p as usize >= crate::sched::task::MAX_TASKS { return u64::MAX; }
-        if !sched.tasks[p as usize].active { return u64::MAX; }
+        let target = match sched.task_get(p) {
+            Some(t) => t,
+            None => return u64::MAX,
+        };
+        if !target.active { return u64::MAX; }
         // Only root or parent can prlimit another process.
-        if euid != 0 && sched.tasks[p as usize].parent_task != caller_task_id {
+        if euid != 0 && target.parent_task != caller_task_id {
             return u64::MAX;
         }
         p
     };
 
     // Read old values.
-    let rl = &sched.tasks[target_task_id as usize].rlimits[resource as usize];
+    let rl = &sched.task(target_task_id).rlimits[resource as usize];
     let old_cur = rl.cur;
     let old_max = rl.max;
 
@@ -2469,8 +2482,8 @@ fn sys_prlimit(pid: u64, resource: u64, new_cur: u64, new_max: u64, frame: &mut 
             return u64::MAX;
         }
 
-        sched.tasks[target_task_id as usize].rlimits[resource as usize].cur = set_cur;
-        sched.tasks[target_task_id as usize].rlimits[resource as usize].max = set_max;
+        sched.task_mut(target_task_id).rlimits[resource as usize].cur = set_cur;
+        sched.task_mut(target_task_id).rlimits[resource as usize].max = set_max;
     }
 
     // Return 0 for success, old soft in a1, old hard in a2.
@@ -2482,8 +2495,8 @@ fn sys_prlimit(pid: u64, resource: u64, new_cur: u64, new_max: u64, frame: &mut 
 fn sys_getgroups(max_count: u64, groups_ptr: u64) -> u64 {
     let sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    let task = &sched.tasks[task_id as usize];
+    let task_id = sched.thread(tid).task_id;
+    let task = sched.task(task_id);
     let n = task.ngroups as usize;
     if max_count == 0 {
         return n as u64;
@@ -2537,7 +2550,7 @@ fn sys_madvise(addr: u64, len: u64, advice: u64) -> u64 {
 fn sys_tls_set(base: u64) -> u64 {
     let tid = crate::sched::scheduler::current_thread_id();
     let mut sched = crate::sched::scheduler::SCHEDULER.lock();
-    if let Some(t) = sched.threads.get_mut(tid as usize) {
+    if let Some(t) = sched.thread_get_mut(tid) {
         t.tls_base = base;
     }
     drop(sched);
@@ -2560,7 +2573,7 @@ fn sys_tls_set(base: u64) -> u64 {
 fn sys_tls_get() -> u64 {
     let tid = crate::sched::scheduler::current_thread_id();
     let sched = crate::sched::scheduler::SCHEDULER.lock();
-    if let Some(t) = sched.threads.get(tid as usize) {
+    if let Some(t) = sched.thread_get(tid) {
         t.tls_base
     } else {
         0
@@ -2622,7 +2635,7 @@ fn sys_port_set_recv_timeout(set_id: u64, timeout_us: u64, frame: &mut Exception
 fn sys_timer_create(signal_num: u64, interval_ns: u64) -> u64 {
     let tid = crate::sched::scheduler::current_thread_id();
     let mut sched = crate::sched::scheduler::SCHEDULER.lock();
-    if let Some(t) = sched.threads.get_mut(tid as usize) {
+    if let Some(t) = sched.thread_get_mut(tid) {
         t.timer_signal = signal_num as u32;
         t.timer_interval_ns = interval_ns;
         if interval_ns > 0 {
@@ -2706,8 +2719,8 @@ fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
     // Copy to userspace.
     let sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    let pt_root = sched.tasks[task_id as usize].page_table_root;
+    let task_id = sched.thread(tid).task_id;
+    let pt_root = sched.task(task_id).page_table_root;
     drop(sched);
 
     if !copy_to_user(pt_root, buf_ptr as usize, &tmp[..len]) {
@@ -2747,10 +2760,10 @@ fn sys_sigsuspend(mask: u64) -> u64 {
 fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
     let sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.threads[tid as usize].task_id;
-    let pt_root = sched.tasks[task_id as usize].page_table_root;
-    let old_base = sched.threads[tid as usize].sig_altstack_base;
-    let old_size = sched.threads[tid as usize].sig_altstack_size;
+    let task_id = sched.thread(tid).task_id;
+    let pt_root = sched.task(task_id).page_table_root;
+    let old_base = sched.thread(tid).sig_altstack_base;
+    let old_size = sched.thread(tid).sig_altstack_size;
     drop(sched);
 
     // Write old stack info if requested.
@@ -2773,8 +2786,8 @@ fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
         let new_size = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
         let mut sched = crate::sched::scheduler::SCHEDULER.lock();
         let tid2 = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-        sched.threads[tid2 as usize].sig_altstack_base = new_base;
-        sched.threads[tid2 as usize].sig_altstack_size = new_size;
+        sched.thread_mut(tid2).sig_altstack_base = new_base;
+        sched.thread_mut(tid2).sig_altstack_size = new_size;
     }
     0
 }

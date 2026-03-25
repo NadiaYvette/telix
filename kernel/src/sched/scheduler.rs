@@ -8,12 +8,19 @@
 //!
 //! SMP: Run queues are shared across all CPUs, protected by the scheduler
 //! spinlock. Each CPU tracks its own current/idle thread via smp::PerCpuData.
+//!
+//! Thread and Task data is stored in ART (Adaptive Radix Tree) keyed by ID,
+//! with Thread entries slab-allocated (256 bytes) and Task entries page-
+//! allocated (~1400 bytes). Per-thread/task atomic arrays remain flat for
+//! lock-free access, bounded by THREAD_SLOTS/TASK_SLOTS.
 
-use super::thread::{Thread, ThreadId, ThreadState, BlockReason, MAX_THREADS, EXCEPTION_FRAME_SIZE};
-use super::task::{Task, TaskId, MAX_TASKS, MAX_GROUPS, RLIMIT_COUNT, Rlimit};
+use super::thread::{Thread, ThreadId, ThreadState, BlockReason, THREAD_SLOTS, EXCEPTION_FRAME_SIZE};
+use super::task::{Task, TaskId, TASK_SLOTS, MAX_GROUPS, RLIMIT_COUNT, Rlimit};
 use super::smp;
+use crate::ipc::art::Art;
 use crate::sync::SpinLock;
-use crate::mm::page::{PAGE_SIZE, MMUPAGE_SIZE};
+use crate::mm::page::{PhysAddr, PAGE_SIZE, MMUPAGE_SIZE};
+use crate::mm::{slab, phys};
 use core::sync::atomic::{AtomicUsize, AtomicU32, AtomicU64, Ordering};
 
 /// Per-CPU saved frame SP. The exception handler stores the current frame_sp
@@ -51,7 +58,7 @@ static DEFERRED_THREAD: [AtomicUsize; smp::MAX_CPUS] = {
 };
 
 const NUM_PRIORITIES: usize = 256;
-const MAX_QUEUE_LEN: usize = MAX_THREADS;
+const MAX_QUEUE_LEN: usize = 128;
 
 struct RunQueue {
     entries: [ThreadId; MAX_QUEUE_LEN],
@@ -139,9 +146,49 @@ impl RunQueue {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Thread/Task slab/page allocation
+// ---------------------------------------------------------------------------
+
+/// Slab size for Thread entries (Thread is ~136 bytes, fits in 256-byte slab).
+const THREAD_SLAB_SIZE: usize = 256;
+
+fn alloc_thread_entry() -> Option<*mut Thread> {
+    let pa = slab::alloc(THREAD_SLAB_SIZE)?;
+    let p = pa.as_usize() as *mut Thread;
+    unsafe {
+        core::ptr::write_bytes(p as *mut u8, 0, THREAD_SLAB_SIZE);
+        core::ptr::write(p, Thread::empty());
+    }
+    Some(p)
+}
+
+fn free_thread_entry(p: *mut Thread) {
+    slab::free(PhysAddr::new(p as usize), THREAD_SLAB_SIZE);
+}
+
+fn alloc_task_entry() -> Option<*mut Task> {
+    // Task is ~1400 bytes — too large for any slab cache, use page allocation.
+    let pa = phys::alloc_page()?;
+    let p = pa.as_usize() as *mut Task;
+    unsafe {
+        core::ptr::write_bytes(p as *mut u8, 0, PAGE_SIZE);
+        core::ptr::write(p, Task::empty());
+    }
+    Some(p)
+}
+
+fn free_task_entry(p: *mut Task) {
+    phys::free_page(PhysAddr::new(p as usize));
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler struct
+// ---------------------------------------------------------------------------
+
 pub struct Scheduler {
-    pub(crate) threads: [Thread; MAX_THREADS],
-    pub tasks: [Task; MAX_TASKS],
+    pub(crate) thread_art: Art,
+    pub task_art: Art,
     run_queues: [RunQueue; NUM_PRIORITIES],
     next_thread_id: ThreadId,
     next_task_id: u32,
@@ -151,8 +198,8 @@ pub struct Scheduler {
 impl Scheduler {
     const fn new() -> Self {
         Self {
-            threads: [const { Thread::empty() }; MAX_THREADS],
-            tasks: [const { Task::empty() }; MAX_TASKS],
+            thread_art: Art::new(),
+            task_art: Art::new(),
             run_queues: [const { RunQueue::new() }; NUM_PRIORITIES],
             next_thread_id: 0,
             next_task_id: 0,
@@ -160,42 +207,117 @@ impl Scheduler {
         }
     }
 
+    // --- ART-based accessors ---
+
+    #[inline]
+    pub fn thread(&self, id: ThreadId) -> &Thread {
+        let val = self.thread_art.lookup(id as u64)
+            .expect("thread: invalid ThreadId");
+        unsafe { &*(val as *const Thread) }
+    }
+
+    #[inline]
+    pub fn thread_mut(&mut self, id: ThreadId) -> &mut Thread {
+        let val = self.thread_art.lookup(id as u64)
+            .expect("thread_mut: invalid ThreadId");
+        unsafe { &mut *(val as *mut Thread) }
+    }
+
+    /// Get a thread reference, returning None if not in ART.
+    #[inline]
+    pub fn thread_get(&self, id: ThreadId) -> Option<&Thread> {
+        let val = self.thread_art.lookup(id as u64)?;
+        Some(unsafe { &*(val as *const Thread) })
+    }
+
+    /// Get a mutable thread reference, returning None if not in ART.
+    #[inline]
+    pub fn thread_get_mut(&mut self, id: ThreadId) -> Option<&mut Thread> {
+        let val = self.thread_art.lookup(id as u64)?;
+        Some(unsafe { &mut *(val as *mut Thread) })
+    }
+
+    /// Get a mutable thread pointer from ART, or null.
+    #[inline]
+    pub fn thread_ptr(&self, id: ThreadId) -> *mut Thread {
+        match self.thread_art.lookup(id as u64) {
+            Some(val) => val as *mut Thread,
+            None => core::ptr::null_mut(),
+        }
+    }
+
+    #[inline]
+    pub fn task(&self, id: TaskId) -> &Task {
+        let val = self.task_art.lookup(id as u64)
+            .expect("task: invalid TaskId");
+        unsafe { &*(val as *const Task) }
+    }
+
+    #[inline]
+    pub fn task_mut(&mut self, id: TaskId) -> &mut Task {
+        let val = self.task_art.lookup(id as u64)
+            .expect("task_mut: invalid TaskId");
+        unsafe { &mut *(val as *mut Task) }
+    }
+
+    /// Get a task reference, returning None if not in ART.
+    #[inline]
+    pub fn task_get(&self, id: TaskId) -> Option<&Task> {
+        let val = self.task_art.lookup(id as u64)?;
+        Some(unsafe { &*(val as *const Task) })
+    }
+
+    // --- Initialization ---
+
     /// Initialize task 0 and the BSP's idle thread (thread 0).
     fn init(&mut self) {
-        self.tasks[0].id = 0;
-        self.tasks[0].active = true;
+        // Allocate and insert task 0 (kernel task).
+        let task_ptr = alloc_task_entry().expect("task 0 alloc");
+        unsafe {
+            (*task_ptr).id = 0;
+            (*task_ptr).active = true;
+        }
+        self.task_art.insert(0, task_ptr as usize);
         self.next_task_id = 1;
 
         // Thread 0 = BSP idle thread. Its saved_sp will be set on first preemption.
-        self.threads[0].id = 0;
-        self.threads[0].state = ThreadState::Running;
-        self.threads[0].task_id = 0;
-        self.threads[0].base_priority = 255;
-        self.threads[0].effective_priority = 255;
+        let thread_ptr = alloc_thread_entry().expect("thread 0 alloc");
+        unsafe {
+            (*thread_ptr).id = 0;
+            (*thread_ptr).state = ThreadState::Running;
+            (*thread_ptr).task_id = 0;
+            (*thread_ptr).base_priority = 255;
+            (*thread_ptr).effective_priority = 255;
+            (*thread_ptr).quantum = u32::MAX;
+            (*thread_ptr).default_quantum = u32::MAX;
+        }
         THREAD_PRIO[0].store(255, Ordering::Relaxed);
-        self.threads[0].quantum = u32::MAX;
-        self.threads[0].default_quantum = u32::MAX;
+        self.thread_art.insert(0, thread_ptr as usize);
         self.next_thread_id = 1;
     }
 
     /// Create an idle thread for a secondary CPU. Returns its ThreadId.
     fn create_idle_thread(&mut self) -> Option<ThreadId> {
         let id = self.next_thread_id;
-        if id as usize >= MAX_THREADS {
+        if id as usize >= THREAD_SLOTS {
             return None;
         }
         self.next_thread_id += 1;
 
-        let thread = &mut self.threads[id as usize];
-        thread.id = id;
-        thread.state = ThreadState::Running;
-        thread.task_id = 0;
-        thread.base_priority = 255;
-        thread.effective_priority = 255; // lowest
+        let ptr = alloc_thread_entry()?;
+        unsafe {
+            (*ptr).id = id;
+            (*ptr).state = ThreadState::Running;
+            (*ptr).task_id = 0;
+            (*ptr).base_priority = 255;
+            (*ptr).effective_priority = 255; // lowest
+            (*ptr).quantum = u32::MAX;
+            (*ptr).default_quantum = u32::MAX;
+        }
         THREAD_PRIO[id as usize].store(255, Ordering::Relaxed);
         THREAD_TASK[id as usize].store(0, Ordering::Relaxed);
-        thread.quantum = u32::MAX;
-        thread.default_quantum = u32::MAX;
+
+        self.thread_art.insert(id as u64, ptr as usize);
         // saved_sp will be set on first preemption
         Some(id)
     }
@@ -203,16 +325,26 @@ impl Scheduler {
     /// Find a reusable (Dead) thread slot, or allocate a new one.
     fn alloc_thread_id(&mut self) -> Option<ThreadId> {
         // First, scan for a Dead slot to reuse.
-        for i in 1..self.next_thread_id as usize {
-            if self.threads[i].state == ThreadState::Dead && self.threads[i].stack_base == 0 {
-                return Some(i as ThreadId);
+        let mut found_id: Option<ThreadId> = None;
+        self.thread_art.for_each(|key, val| {
+            if found_id.is_some() { return; }
+            if key == 0 { return; } // skip idle
+            let t = unsafe { &*(val as *const Thread) };
+            if t.state == ThreadState::Dead && t.stack_base == 0 {
+                found_id = Some(key as ThreadId);
             }
+        });
+        if let Some(id) = found_id {
+            return Some(id);
         }
         // Otherwise, allocate a new slot.
         let id = self.next_thread_id;
-        if id as usize >= MAX_THREADS {
+        if id as usize >= THREAD_SLOTS {
             return None;
         }
+        // Allocate entry and insert into ART.
+        let ptr = alloc_thread_entry()?;
+        self.thread_art.insert(id as u64, ptr as usize);
         self.next_thread_id += 1;
         Some(id)
     }
@@ -220,15 +352,24 @@ impl Scheduler {
     /// Find a reusable (inactive) task slot, or allocate a new one.
     fn alloc_task_id(&mut self) -> Option<TaskId> {
         // Skip task 0 (kernel task).
-        for i in 1..self.next_task_id as usize {
-            if !self.tasks[i].active && self.tasks[i].exited && self.tasks[i].reaped {
-                return Some(i as TaskId);
+        let mut found_id: Option<TaskId> = None;
+        self.task_art.for_each(|key, val| {
+            if found_id.is_some() { return; }
+            if key == 0 { return; }
+            let t = unsafe { &*(val as *const Task) };
+            if !t.active && t.exited && t.reaped {
+                found_id = Some(key as TaskId);
             }
+        });
+        if let Some(id) = found_id {
+            return Some(id);
         }
         let id = self.next_task_id;
-        if id as usize >= MAX_TASKS {
+        if id as usize >= TASK_SLOTS {
             return None;
         }
+        let ptr = alloc_task_entry()?;
+        self.task_art.insert(id as u64, ptr as usize);
         self.next_task_id += 1;
         Some(id)
     }
@@ -302,7 +443,7 @@ impl Scheduler {
         AFFINITY_MASK[id as usize].store(u64::MAX, Ordering::Relaxed);
         LAST_CPU[id as usize].store(smp::cpu_id(), Ordering::Relaxed);
 
-        let thread = &mut self.threads[id as usize];
+        let thread = self.thread_mut(id);
         thread.id = id;
         thread.state = ThreadState::Ready;
         thread.task_id = 0;
@@ -509,19 +650,20 @@ impl Scheduler {
         let thread_id = self.alloc_thread_id()?;
         // Read parent info while we have the lock.
         let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
-        let parent_task = self.threads[caller_tid as usize].task_id;
-        let pt = parent_task as usize;
+        let parent_task = self.thread(caller_tid).task_id;
+        let pt = parent_task;
+        let ptask = self.task(pt);
         let info = SpawnParentInfo {
             parent_task,
-            sid: self.tasks[pt].sid,
-            ctty_port: self.tasks[pt].ctty_port,
-            uid: self.tasks[pt].uid,
-            euid: self.tasks[pt].euid,
-            gid: self.tasks[pt].gid,
-            egid: self.tasks[pt].egid,
-            groups: self.tasks[pt].groups,
-            ngroups: self.tasks[pt].ngroups,
-            rlimits: self.tasks[pt].rlimits,
+            sid: ptask.sid,
+            ctty_port: ptask.ctty_port,
+            uid: ptask.uid,
+            euid: ptask.euid,
+            gid: ptask.gid,
+            egid: ptask.egid,
+            groups: ptask.groups,
+            ngroups: ptask.ngroups,
+            rlimits: ptask.rlimits,
         };
         Some((task_id, thread_id, info))
     }
@@ -540,7 +682,7 @@ impl Scheduler {
         frame_sp: u64,
         kstack_base: usize,
     ) {
-        let task = &mut self.tasks[task_id as usize];
+        let task = self.task_mut(task_id);
         task.id = task_id;
         task.active = true;
         task.aspace_id = aspace_id;
@@ -567,7 +709,7 @@ impl Scheduler {
         AFFINITY_MASK[thread_id as usize].store(u64::MAX, Ordering::Relaxed);
         LAST_CPU[thread_id as usize].store(smp::cpu_id(), Ordering::Relaxed);
 
-        let thread = &mut self.threads[thread_id as usize];
+        let thread = self.thread_mut(thread_id);
         thread.id = thread_id;
         thread.state = ThreadState::Ready;
         thread.task_id = task_id;
@@ -597,7 +739,7 @@ impl Scheduler {
         priority: u8,
         quantum: u32,
     ) -> Option<ThreadId> {
-        if !self.tasks[task_id as usize].active {
+        if !self.task(task_id).active {
             return None;
         }
 
@@ -653,7 +795,7 @@ impl Scheduler {
         AFFINITY_MASK[id as usize].store(u64::MAX, Ordering::Relaxed);
         LAST_CPU[id as usize].store(smp::cpu_id(), Ordering::Relaxed);
 
-        let thread = &mut self.threads[id as usize];
+        let thread = self.thread_mut(id);
         thread.id = id;
         thread.state = ThreadState::Ready;
         thread.task_id = task_id;
@@ -669,7 +811,7 @@ impl Scheduler {
         thread.sig_mask = 0;
         thread.sig_pending = 0;
 
-        self.tasks[task_id as usize].thread_count += 1;
+        self.task_mut(task_id).thread_count += 1;
         self.run_queues[priority as usize].push(id);
         Some(id)
     }
@@ -695,7 +837,7 @@ impl Scheduler {
         if YIELD_ASAP[current as usize].load(Ordering::Acquire) {
             return true;
         }
-        let thread = &mut self.threads[current as usize];
+        let thread = self.thread_mut(current);
         thread.quantum = thread.quantum.saturating_sub(1);
         if thread.quantum == 0 {
             thread.quantum = thread.default_quantum;
@@ -736,13 +878,15 @@ impl Scheduler {
         let deferred = DEFERRED_KSTACK[cpu as usize].load(Ordering::Acquire);
         if deferred != 0 {
             let cur_tid = pcpu.current_thread.load(Ordering::Relaxed);
-            if self.threads[cur_tid as usize].stack_base != deferred {
+            if self.thread(cur_tid).stack_base != deferred {
                 // Safe: we're on a different thread's stack.
                 DEFERRED_KSTACK[cpu as usize].store(0, Ordering::Release);
                 crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(deferred));
                 let dead_tid = DEFERRED_THREAD[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
-                if dead_tid < MAX_THREADS {
-                    self.threads[dead_tid].stack_base = 0;
+                if dead_tid < THREAD_SLOTS {
+                    if let Some(t) = self.thread_get_mut(dead_tid as ThreadId) {
+                        t.stack_base = 0;
+                    }
                 }
             }
         }
@@ -797,19 +941,19 @@ impl Scheduler {
         crate::trace::trace_event(crate::trace::EVT_CTX_SWITCH, prev_id, next_id);
 
         // Save current thread's SP.
-        self.threads[prev_id as usize].saved_sp = current_sp;
-        let prev_prio = self.threads[prev_id as usize].effective_priority;
+        self.thread_mut(prev_id).saved_sp = current_sp;
+        let prev_prio = self.thread(prev_id).effective_priority;
         // Don't re-enqueue Dead threads (they are exiting).
-        if prev_id != idle_id && self.threads[prev_id as usize].state != ThreadState::Dead {
-            self.threads[prev_id as usize].state = ThreadState::Ready;
+        if prev_id != idle_id && self.thread(prev_id).state != ThreadState::Dead {
+            self.thread_mut(prev_id).state = ThreadState::Ready;
             self.run_queues[prev_prio as usize].push(prev_id);
         }
 
         // Switch page tables if crossing task boundaries.
-        let prev_task = self.threads[prev_id as usize].task_id;
-        let next_task = self.threads[next_id as usize].task_id;
+        let prev_task = self.thread(prev_id).task_id;
+        let next_task = self.thread(next_id).task_id;
         if prev_task != next_task {
-            let next_root = self.tasks[next_task as usize].page_table_root;
+            let next_root = self.task(next_task).page_table_root;
             if next_root != 0 {
                 #[cfg(target_arch = "aarch64")]
                 crate::arch::aarch64::mm::switch_page_table(next_root);
@@ -832,15 +976,15 @@ impl Scheduler {
         // On x86-64, update TSS RSP0 for ring 3→0 transitions.
         #[cfg(target_arch = "x86_64")]
         {
-            let next_kstack_top = self.threads[next_id as usize].stack_base + PAGE_SIZE;
+            let next_kstack_top = self.thread(next_id).stack_base + PAGE_SIZE;
             crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
         }
 
         // Load next thread's SP.
-        self.threads[next_id as usize].state = ThreadState::Running;
+        self.thread_mut(next_id).state = ThreadState::Running;
         pcpu.current_thread.store(next_id, Ordering::Relaxed);
         LAST_CPU[next_id as usize].store(cpu, Ordering::Relaxed);
-        self.threads[next_id as usize].saved_sp
+        self.thread(next_id).saved_sp
     }
 }
 
@@ -870,7 +1014,7 @@ pub fn init_ap(cpu: u32) {
 
 /// Get the task ID for a given thread.
 pub fn thread_task_id(tid: ThreadId) -> u32 {
-    SCHEDULER.lock().threads[tid as usize].task_id
+    SCHEDULER.lock().thread(tid).task_id
 }
 
 pub fn spawn(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
@@ -1022,8 +1166,8 @@ pub fn thread_create(task_id: u32, entry: u64, stack_top: u64, arg: u64) -> Opti
     let mut sched = SCHEDULER.lock();
     // Inherit the caller's priority and quantum.
     let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let priority = sched.threads[caller_tid as usize].base_priority;
-    let quantum = sched.threads[caller_tid as usize].default_quantum;
+    let priority = sched.thread(caller_tid).base_priority;
+    let quantum = sched.thread(caller_tid).default_quantum;
     sched.create_thread_in_task(task_id, entry, stack_top, arg, priority, quantum)
 }
 
@@ -1031,10 +1175,7 @@ pub fn thread_create(task_id: u32, entry: u64, stack_top: u64, arg: u64) -> Opti
 /// Returns Some(exit_code) if dead and in the same task, None otherwise.
 pub fn thread_join_poll(tid: ThreadId, caller_task: u32) -> Option<i32> {
     let sched = SCHEDULER.lock();
-    if (tid as usize) >= MAX_THREADS {
-        return None;
-    }
-    let t = &sched.threads[tid as usize];
+    let t = sched.thread_get(tid)?;
     if t.task_id != caller_task {
         return None;
     }
@@ -1050,19 +1191,20 @@ pub fn thread_join_poll(tid: ThreadId, caller_task: u32) -> Option<i32> {
 pub fn thread_join_block(tid: ThreadId, caller_task: u32) -> u64 {
     {
         let mut sched = SCHEDULER.lock();
-        if (tid as usize) >= MAX_THREADS {
+        let t = match sched.thread_get(tid) {
+            Some(t) => t as *const Thread,
+            None => return u64::MAX,
+        };
+        let t_ref = unsafe { &*t };
+        if t_ref.task_id != caller_task {
             return u64::MAX;
         }
-        let t = &sched.threads[tid as usize];
-        if t.task_id != caller_task {
-            return u64::MAX;
-        }
-        if t.state == ThreadState::Dead {
-            return t.exit_code as u64;
+        if t_ref.state == ThreadState::Dead {
+            return t_ref.exit_code as u64;
         }
         // Register ourselves as the join waiter.
         let caller_tid = current_thread_id();
-        sched.threads[tid as usize].join_waiter = caller_tid;
+        sched.thread_mut(tid).join_waiter = caller_tid;
         // Clear wakeup flag before blocking.
         WAKEUP_FLAGS[caller_tid as usize].store(false, Ordering::Release);
     }
@@ -1070,7 +1212,7 @@ pub fn thread_join_block(tid: ThreadId, caller_task: u32) -> u64 {
     block_current(BlockReason::FutexWait);
     // Re-read exit code.
     let sched = SCHEDULER.lock();
-    sched.threads[tid as usize].exit_code as u64
+    sched.thread(tid).exit_code as u64
 }
 
 /// Get the task ID of the current thread.
@@ -1085,8 +1227,8 @@ pub fn current_task_id() -> TaskId {
 pub fn current_page_table_root() -> usize {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let sched = SCHEDULER.lock();
-    let task_id = sched.threads[tid as usize].task_id;
-    sched.tasks[task_id as usize].page_table_root
+    let task_id = sched.thread(tid).task_id;
+    sched.task(task_id).page_table_root
 }
 
 /// Called from the timer IRQ handler. Takes the current kernel SP
@@ -1109,47 +1251,47 @@ pub fn schedule() {
 
 /// Per-thread wakeup flags. Set by wake_thread(), checked by block_current().
 /// Using atomics avoids needing the scheduler lock in the spin loop.
-static WAKEUP_FLAGS: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS] = {
+static WAKEUP_FLAGS: [core::sync::atomic::AtomicBool; THREAD_SLOTS] = {
     const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    [INIT; super::thread::MAX_THREADS]
+    [INIT; THREAD_SLOTS]
 };
 
 /// Per-thread effective priority, readable without the scheduler lock.
 /// Updated by boost_priority/reset_priority and thread creation.
-static THREAD_PRIO: [core::sync::atomic::AtomicU8; super::thread::MAX_THREADS] = {
+static THREAD_PRIO: [core::sync::atomic::AtomicU8; THREAD_SLOTS] = {
     const INIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(255);
-    [INIT; super::thread::MAX_THREADS]
+    [INIT; THREAD_SLOTS]
 };
 
 /// Per-thread task_id, readable without the scheduler lock.
 /// Updated on thread creation.
-static THREAD_TASK: [core::sync::atomic::AtomicU32; super::thread::MAX_THREADS] = {
+static THREAD_TASK: [core::sync::atomic::AtomicU32; THREAD_SLOTS] = {
     const INIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    [INIT; super::thread::MAX_THREADS]
+    [INIT; THREAD_SLOTS]
 };
 
 /// Per-thread yield-ASAP flag. When set, `timer_tick_for` will force
 /// preemption on the very next timer tick instead of waiting for the
 /// full quantum to expire. This prevents spinning threads in
 /// `block_current` from starving real work on SMP.
-static YIELD_ASAP: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS] = {
+static YIELD_ASAP: [core::sync::atomic::AtomicBool; THREAD_SLOTS] = {
     const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    [INIT; super::thread::MAX_THREADS]
+    [INIT; THREAD_SLOTS]
 };
 
 /// Per-thread killed flag. When set, block_current() exits early and the
 /// syscall return path calls exit_current_thread(-9).
-static KILLED: [core::sync::atomic::AtomicBool; super::thread::MAX_THREADS] = {
+static KILLED: [core::sync::atomic::AtomicBool; THREAD_SLOTS] = {
     const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    [INIT; super::thread::MAX_THREADS]
+    [INIT; THREAD_SLOTS]
 };
 
 // --- Coscheduling ---
 
 /// Per-thread coscheduling group ID (0 = no group).
-static COSCHED_GROUP: [AtomicU32; MAX_THREADS] = {
+static COSCHED_GROUP: [AtomicU32; THREAD_SLOTS] = {
     const INIT: AtomicU32 = AtomicU32::new(0);
-    [INIT; MAX_THREADS]
+    [INIT; THREAD_SLOTS]
 };
 
 /// Maximum consecutive cosched picks before yielding to other threads.
@@ -1159,35 +1301,35 @@ const MAX_COSCHED_BURST: u32 = 4;
 pub static COSCHED_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Per-thread CPU affinity bitmask. Default u64::MAX = all CPUs allowed.
-static AFFINITY_MASK: [AtomicU64; MAX_THREADS] = {
+static AFFINITY_MASK: [AtomicU64; THREAD_SLOTS] = {
     const INIT: AtomicU64 = AtomicU64::new(u64::MAX);
-    [INIT; MAX_THREADS]
+    [INIT; THREAD_SLOTS]
 };
 
 /// Per-thread last CPU the thread ran on.
-static LAST_CPU: [AtomicU32; MAX_THREADS] = {
+static LAST_CPU: [AtomicU32; THREAD_SLOTS] = {
     const INIT: AtomicU32 = AtomicU32::new(0);
-    [INIT; MAX_THREADS]
+    [INIT; THREAD_SLOTS]
 };
 
 // --- Scheduler Activations ---
 
 /// Per-task SA pending flag: true when an activation event is ready.
-static SA_PENDING: [core::sync::atomic::AtomicBool; MAX_TASKS] = {
+static SA_PENDING: [core::sync::atomic::AtomicBool; TASK_SLOTS] = {
     const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    [INIT; MAX_TASKS]
+    [INIT; TASK_SLOTS]
 };
 
 /// Per-task SA event data: packed (blocked_tid as u64).
-static SA_EVENT: [AtomicU64; MAX_TASKS] = {
+static SA_EVENT: [AtomicU64; TASK_SLOTS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_TASKS]
+    [INIT; TASK_SLOTS]
 };
 
 /// Per-task SA waiter thread ID (u32::MAX = no waiter).
-static SA_WAITER: [core::sync::atomic::AtomicU32; MAX_TASKS] = {
+static SA_WAITER: [core::sync::atomic::AtomicU32; TASK_SLOTS] = {
     const INIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
-    [INIT; MAX_TASKS]
+    [INIT; TASK_SLOTS]
 };
 
 /// Set YIELD_ASAP for a thread, causing it to be preempted on the next timer tick.
@@ -1216,8 +1358,8 @@ pub fn block_current(_reason: BlockReason) {
     // from starving lower-priority threads on single-CPU.
     let saved_prio = {
         let mut sched = SCHEDULER.lock();
-        let orig = sched.threads[tid as usize].effective_priority;
-        sched.threads[tid as usize].effective_priority = 254;
+        let orig = sched.thread(tid).effective_priority;
+        sched.thread_mut(tid).effective_priority = 254;
         orig
     };
     THREAD_PRIO[tid as usize].store(254, Ordering::Release);
@@ -1252,7 +1394,7 @@ pub fn block_current(_reason: BlockReason) {
     // Restore effective priority.
     {
         let mut sched = SCHEDULER.lock();
-        sched.threads[tid as usize].effective_priority = saved_prio;
+        sched.thread_mut(tid).effective_priority = saved_prio;
     }
     THREAD_PRIO[tid as usize].store(saved_prio, Ordering::Release);
     arch_restore_irqs(saved);
@@ -1273,28 +1415,35 @@ pub fn is_killed(tid: ThreadId) -> bool {
 /// Kill all threads in the task that `tid` belongs to.
 /// Returns true if the thread was found and the kill signal was sent.
 pub fn kill_task(tid: ThreadId) -> bool {
-    if tid as usize >= MAX_THREADS {
+    if tid as usize >= THREAD_SLOTS {
         return false;
     }
     let sched = SCHEDULER.lock();
-    let target_thread = &sched.threads[tid as usize];
+    let target_thread = match sched.thread_get(tid) {
+        Some(t) => t,
+        None => return false,
+    };
     if target_thread.state == ThreadState::Dead && target_thread.stack_base == 0 {
         return false; // Slot not in use.
     }
     let task_id = target_thread.task_id;
     // Kill all non-dead threads in this task.
-    for i in 0..MAX_THREADS {
-        let t = &sched.threads[i];
+    let mut to_kill = [0u32; THREAD_SLOTS];
+    let mut kill_count = 0usize;
+    sched.thread_art.for_each(|key, val| {
+        let t = unsafe { &*(val as *const Thread) };
         if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
-            KILLED[i].store(true, Ordering::Release);
+            KILLED[key as usize].store(true, Ordering::Release);
+            if kill_count < THREAD_SLOTS {
+                to_kill[kill_count] = key as u32;
+                kill_count += 1;
+            }
         }
-    }
+    });
     drop(sched);
     // Wake all killed threads so they exit block_current spin loops.
-    for i in 0..MAX_THREADS {
-        if KILLED[i].load(Ordering::Relaxed) {
-            wake_thread(i as ThreadId);
-        }
+    for i in 0..kill_count {
+        wake_thread(to_kill[i] as ThreadId);
     }
     true
 }
@@ -1308,23 +1457,25 @@ pub fn send_signal_to_task(task_id: u32, sig: u32) -> bool {
     if sig == SIGKILL {
         // Use existing kill path for SIGKILL.
         let sched = SCHEDULER.lock();
-        // Find any thread in this task.
-        for i in 0..MAX_THREADS {
-            let t = &sched.threads[i];
+        let mut target_tid: Option<ThreadId> = None;
+        sched.thread_art.for_each(|key, val| {
+            if target_tid.is_some() { return; }
+            let t = unsafe { &*(val as *const Thread) };
             if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
-                drop(sched);
-                return kill_task(i as ThreadId);
+                target_tid = Some(key as ThreadId);
             }
-        }
-        return false;
+        });
+        return match target_tid {
+            Some(tid) => { drop(sched); kill_task(tid) }
+            None => false,
+        };
     }
 
     let bit = sig_bit(sig);
     let mut sched = SCHEDULER.lock();
 
     // Check handler disposition.
-    if (task_id as usize) < super::task::MAX_TASKS {
-        let task = &sched.tasks[task_id as usize];
+    if let Some(task) = sched.task_get(task_id) {
         if !task.active { return false; }
         let action = &task.sig_actions[(sig - 1) as usize];
         // If ignored (and not uncatchable), drop the signal.
@@ -1337,27 +1488,29 @@ pub fn send_signal_to_task(task_id: u32, sig: u32) -> bool {
         {
             return true;
         }
+    } else {
+        return false;
     }
 
     // Find a thread to receive: prefer one with signal unmasked.
-    let mut target: Option<usize> = None;
-    let mut any_thread: Option<usize> = None;
-    for i in 0..sched.next_thread_id as usize {
-        let t = &sched.threads[i];
+    let mut target: Option<u32> = None;
+    let mut any_thread: Option<u32> = None;
+    sched.thread_art.for_each(|key, val| {
+        if target.is_some() { return; }
+        let t = unsafe { &*(val as *const Thread) };
         if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
-            if any_thread.is_none() { any_thread = Some(i); }
+            if any_thread.is_none() { any_thread = Some(key as u32); }
             if t.sig_mask & bit == 0 {
-                target = Some(i);
-                break;
+                target = Some(key as u32);
             }
         }
-    }
+    });
     let tid = match target.or(any_thread) {
         Some(t) => t,
         None => return false,
     };
 
-    sched.threads[tid].sig_pending |= bit;
+    sched.thread_mut(tid).sig_pending |= bit;
     drop(sched);
 
     // Wake the target thread so it can deliver the signal.
@@ -1369,14 +1522,17 @@ pub fn send_signal_to_task(task_id: u32, sig: u32) -> bool {
 pub fn send_signal_to_thread(tid: ThreadId, sig: u32) -> bool {
     use super::task::{sig_bit, SIGKILL, MAX_SIGNALS};
     if sig < 1 || sig > MAX_SIGNALS as u32 { return false; }
-    if tid as usize >= MAX_THREADS { return false; }
+    if tid as usize >= THREAD_SLOTS { return false; }
     if sig == SIGKILL {
         return kill_task(tid);
     }
 
     let bit = sig_bit(sig);
     let mut sched = SCHEDULER.lock();
-    let t = &mut sched.threads[tid as usize];
+    let t = match sched.thread_get_mut(tid) {
+        Some(t) => t,
+        None => return false,
+    };
     if t.state == ThreadState::Dead || t.stack_base == 0 { return false; }
     t.sig_pending |= bit;
     drop(sched);
@@ -1389,7 +1545,7 @@ pub fn send_signal_to_thread(tid: ThreadId, sig: u32) -> bool {
 pub fn dequeue_signal() -> Option<u32> {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let mut sched = SCHEDULER.lock();
-    let t = &mut sched.threads[tid as usize];
+    let t = sched.thread_mut(tid);
     let deliverable = t.sig_pending & !t.sig_mask;
     if deliverable == 0 { return None; }
     // Find lowest-numbered signal.
@@ -1403,8 +1559,8 @@ pub fn dequeue_signal() -> Option<u32> {
 pub fn get_signal_action(sig: u32) -> Option<super::task::SignalAction> {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let sched = SCHEDULER.lock();
-    let task_id = sched.threads[tid as usize].task_id;
-    let task = &sched.tasks[task_id as usize];
+    let task_id = sched.thread(tid).task_id;
+    let task = sched.task(task_id);
     if sig < 1 || sig > super::task::MAX_SIGNALS as u32 { return None; }
     Some(task.sig_actions[(sig - 1) as usize])
 }
@@ -1416,9 +1572,9 @@ pub fn set_signal_action(sig: u32, action: super::task::SignalAction) -> Option<
     if sig_bit(sig) & UNCATCHABLE != 0 { return None; } // can't change SIGKILL/SIGSTOP
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let mut sched = SCHEDULER.lock();
-    let task_id = sched.threads[tid as usize].task_id;
-    let old = sched.tasks[task_id as usize].sig_actions[(sig - 1) as usize];
-    sched.tasks[task_id as usize].sig_actions[(sig - 1) as usize] = action;
+    let task_id = sched.thread(tid).task_id;
+    let old = sched.task(task_id).sig_actions[(sig - 1) as usize];
+    sched.task_mut(task_id).sig_actions[(sig - 1) as usize] = action;
     Some(old)
 }
 
@@ -1427,9 +1583,9 @@ pub fn set_signal_mask(new_mask: u64) -> u64 {
     use super::task::UNCATCHABLE;
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let mut sched = SCHEDULER.lock();
-    let old = sched.threads[tid as usize].sig_mask;
+    let old = sched.thread(tid).sig_mask;
     // Cannot mask SIGKILL or SIGSTOP.
-    sched.threads[tid as usize].sig_mask = new_mask & !UNCATCHABLE;
+    sched.thread_mut(tid).sig_mask = new_mask & !UNCATCHABLE;
     old
 }
 
@@ -1437,14 +1593,14 @@ pub fn set_signal_mask(new_mask: u64) -> u64 {
 pub fn get_signal_mask() -> u64 {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let sched = SCHEDULER.lock();
-    sched.threads[tid as usize].sig_mask
+    sched.thread(tid).sig_mask
 }
 
 /// Get the pending signal set for the current thread.
 pub fn get_signal_pending() -> u64 {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let sched = SCHEDULER.lock();
-    sched.threads[tid as usize].sig_pending
+    sched.thread(tid).sig_pending
 }
 
 // --- Phase 43: Process groups, sessions, controlling terminals ---
@@ -1455,31 +1611,34 @@ pub fn get_signal_pending() -> u64 {
 pub fn setpgid(pid: u32, pgid: u32) -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
     let mut sched = SCHEDULER.lock();
-    let my_task = sched.threads[my_tid as usize].task_id;
+    let my_task = sched.thread(my_tid).task_id;
 
     let target_task = if pid == 0 { my_task } else { pid };
 
-    if target_task as usize >= super::task::MAX_TASKS { return u64::MAX; }
-    if !sched.tasks[target_task as usize].active { return u64::MAX; }
-    if target_task != my_task && sched.tasks[target_task as usize].parent_task != my_task {
+    match sched.task_get(target_task) {
+        Some(t) if t.active => {},
+        _ => return u64::MAX,
+    }
+    if target_task != my_task && sched.task(target_task).parent_task != my_task {
         return u64::MAX;
     }
 
     let new_pgid = if pgid == 0 { target_task } else { pgid };
-    let target_sid = sched.tasks[target_task as usize].sid;
+    let target_sid = sched.task(target_task).sid;
 
     if new_pgid != target_task {
         let mut found = false;
-        for i in 0..super::task::MAX_TASKS {
-            if sched.tasks[i].active && sched.tasks[i].sid == target_sid && sched.tasks[i].pgid == new_pgid {
+        sched.task_art.for_each(|_key, val| {
+            if found { return; }
+            let t = unsafe { &*(val as *const Task) };
+            if t.active && t.sid == target_sid && t.pgid == new_pgid {
                 found = true;
-                break;
             }
-        }
+        });
         if !found { return u64::MAX; }
     }
 
-    sched.tasks[target_task as usize].pgid = new_pgid;
+    sched.task_mut(target_task).pgid = new_pgid;
     0
 }
 
@@ -1489,14 +1648,14 @@ pub fn getpgid(pid: u32) -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
     let sched = SCHEDULER.lock();
     let target_task = if pid == 0 {
-        sched.threads[my_tid as usize].task_id
+        sched.thread(my_tid).task_id
     } else {
         pid
     };
-    if target_task as usize >= super::task::MAX_TASKS { return u64::MAX; }
-    let task = &sched.tasks[target_task as usize];
-    if !task.active { return u64::MAX; }
-    task.pgid as u64
+    match sched.task_get(target_task) {
+        Some(t) if t.active => t.pgid as u64,
+        _ => u64::MAX,
+    }
 }
 
 /// Create a new session. The calling task becomes the session leader.
@@ -1504,20 +1663,24 @@ pub fn getpgid(pid: u32) -> u64 {
 pub fn setsid() -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
     let mut sched = SCHEDULER.lock();
-    let my_task = sched.threads[my_tid as usize].task_id;
+    let my_task = sched.thread(my_tid).task_id;
 
-    let current_pgid = sched.tasks[my_task as usize].pgid;
+    let current_pgid = sched.task(my_task).pgid;
     if current_pgid == my_task {
-        for i in 0..super::task::MAX_TASKS {
-            if sched.tasks[i].active && sched.tasks[i].id != my_task && sched.tasks[i].pgid == my_task {
-                return u64::MAX;
+        let mut conflict = false;
+        sched.task_art.for_each(|_key, val| {
+            if conflict { return; }
+            let t = unsafe { &*(val as *const Task) };
+            if t.active && t.id != my_task && t.pgid == my_task {
+                conflict = true;
             }
-        }
+        });
+        if conflict { return u64::MAX; }
     }
 
-    sched.tasks[my_task as usize].sid = my_task;
-    sched.tasks[my_task as usize].pgid = my_task;
-    sched.tasks[my_task as usize].ctty_port = 0;
+    sched.task_mut(my_task).sid = my_task;
+    sched.task_mut(my_task).pgid = my_task;
+    sched.task_mut(my_task).ctty_port = 0;
     my_task as u64
 }
 
@@ -1527,14 +1690,14 @@ pub fn getsid(pid: u32) -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
     let sched = SCHEDULER.lock();
     let target_task = if pid == 0 {
-        sched.threads[my_tid as usize].task_id
+        sched.thread(my_tid).task_id
     } else {
         pid
     };
-    if target_task as usize >= super::task::MAX_TASKS { return u64::MAX; }
-    let task = &sched.tasks[target_task as usize];
-    if !task.active { return u64::MAX; }
-    task.sid as u64
+    match sched.task_get(target_task) {
+        Some(t) if t.active => t.sid as u64,
+        _ => u64::MAX,
+    }
 }
 
 /// Set the foreground process group for the controlling terminal.
@@ -1542,45 +1705,52 @@ pub fn getsid(pid: u32) -> u64 {
 pub fn tcsetpgrp(pgid: u32) -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
     let mut sched = SCHEDULER.lock();
-    let my_task = sched.threads[my_tid as usize].task_id;
+    let my_task = sched.thread(my_tid).task_id;
 
-    if sched.tasks[my_task as usize].ctty_port == 0 { return u64::MAX; }
+    if sched.task(my_task).ctty_port == 0 { return u64::MAX; }
 
-    let my_sid = sched.tasks[my_task as usize].sid;
+    let my_sid = sched.task(my_task).sid;
     let mut found = false;
-    for i in 0..super::task::MAX_TASKS {
-        if sched.tasks[i].active && sched.tasks[i].sid == my_sid && sched.tasks[i].pgid == pgid {
+    sched.task_art.for_each(|_key, val| {
+        if found { return; }
+        let t = unsafe { &*(val as *const Task) };
+        if t.active && t.sid == my_sid && t.pgid == pgid {
             found = true;
-            break;
         }
-    }
+    });
     if !found { return u64::MAX; }
 
     // Store the foreground pgid in the session leader.
-    for i in 0..super::task::MAX_TASKS {
-        if sched.tasks[i].active && sched.tasks[i].id == my_sid {
-            sched.tasks[i].fg_pgid = pgid;
-            return 0;
+    let mut set = false;
+    sched.task_art.for_each(|_key, val| {
+        if set { return; }
+        let t = unsafe { &mut *(val as *mut Task) };
+        if t.active && t.id == my_sid {
+            t.fg_pgid = pgid;
+            set = true;
         }
-    }
-    u64::MAX
+    });
+    if set { 0 } else { u64::MAX }
 }
 
 /// Get the foreground process group for the controlling terminal.
 pub fn tcgetpgrp() -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
     let sched = SCHEDULER.lock();
-    let my_task = sched.threads[my_tid as usize].task_id;
+    let my_task = sched.thread(my_tid).task_id;
 
-    if sched.tasks[my_task as usize].ctty_port == 0 { return u64::MAX; }
+    if sched.task(my_task).ctty_port == 0 { return u64::MAX; }
 
-    let my_sid = sched.tasks[my_task as usize].sid;
-    for i in 0..super::task::MAX_TASKS {
-        if sched.tasks[i].active && sched.tasks[i].id == my_sid {
-            return sched.tasks[i].fg_pgid as u64;
+    let my_sid = sched.task(my_task).sid;
+    let mut result = u64::MAX;
+    sched.task_art.for_each(|_key, val| {
+        if result != u64::MAX { return; }
+        let t = unsafe { &*(val as *const Task) };
+        if t.active && t.id == my_sid {
+            result = t.fg_pgid as u64;
         }
-    }
-    u64::MAX
+    });
+    result
 }
 
 /// Send a signal to all tasks in a process group.
@@ -1589,14 +1759,15 @@ pub fn send_signal_to_pgroup(pgid: u32, sig: u32) -> bool {
     if sig < 1 || sig > MAX_SIGNALS as u32 { return false; }
 
     let sched = SCHEDULER.lock();
-    let mut task_ids = [0u32; super::task::MAX_TASKS];
-    let mut count = 0;
-    for i in 0..super::task::MAX_TASKS {
-        if sched.tasks[i].active && sched.tasks[i].pgid == pgid && count < task_ids.len() {
-            task_ids[count] = sched.tasks[i].id;
+    let mut task_ids = [0u32; TASK_SLOTS];
+    let mut count = 0usize;
+    sched.task_art.for_each(|_key, val| {
+        let t = unsafe { &*(val as *const Task) };
+        if t.active && t.pgid == pgid && count < TASK_SLOTS {
+            task_ids[count] = t.id;
             count += 1;
         }
-    }
+    });
     drop(sched);
 
     if count == 0 { return false; }
@@ -1615,26 +1786,27 @@ pub fn send_signal_to_pgroup(pgid: u32, sig: u32) -> bool {
 pub fn set_ctty(port: u64) -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
     let mut sched = SCHEDULER.lock();
-    let my_task = sched.threads[my_tid as usize].task_id;
+    let my_task = sched.thread(my_tid).task_id;
 
     // Must be session leader.
-    if sched.tasks[my_task as usize].sid != my_task {
+    if sched.task(my_task).sid != my_task {
         return u64::MAX;
     }
     // Must not already have a ctty.
-    if sched.tasks[my_task as usize].ctty_port != 0 {
+    if sched.task(my_task).ctty_port != 0 {
         return u64::MAX;
     }
 
-    sched.tasks[my_task as usize].ctty_port = port;
+    sched.task_mut(my_task).ctty_port = port;
 
     // Propagate ctty to all tasks in this session.
     let sid = my_task;
-    for i in 0..super::task::MAX_TASKS {
-        if sched.tasks[i].active && sched.tasks[i].sid == sid {
-            sched.tasks[i].ctty_port = port;
+    sched.task_art.for_each(|_key, val| {
+        let t = unsafe { &mut *(val as *mut Task) };
+        if t.active && t.sid == sid {
+            t.ctty_port = port;
         }
-    }
+    });
     0
 }
 
@@ -1648,22 +1820,22 @@ pub fn current_thread_id() -> ThreadId {
 pub fn kill_other_threads_in_task() -> usize {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
     let mut sched = SCHEDULER.lock();
-    let task_id = sched.threads[my_tid as usize].task_id;
+    let task_id = sched.thread(my_tid).task_id;
     let mut killed = 0;
 
-    for i in 0..sched.next_thread_id as usize {
-        if i == my_tid as usize { continue; }
-        let t = &mut sched.threads[i];
+    sched.thread_art.for_each(|key, val| {
+        if key == my_tid as u64 { return; }
+        let t = unsafe { &mut *(val as *mut Thread) };
         if t.task_id == task_id && t.state != ThreadState::Dead {
             t.state = ThreadState::Dead;
             t.exit_code = -9;
-            KILLED[i].store(true, Ordering::Release);
+            KILLED[key as usize].store(true, Ordering::Release);
             killed += 1;
         }
-    }
+    });
 
     // Set thread_count to 1 (just us).
-    sched.tasks[task_id as usize].thread_count = 1;
+    sched.task_mut(task_id).thread_count = 1;
     killed
 }
 
@@ -1671,8 +1843,8 @@ pub fn kill_other_threads_in_task() -> usize {
 pub fn update_task_page_table(new_pt_root: usize) {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
     let mut sched = SCHEDULER.lock();
-    let task_id = sched.threads[my_tid as usize].task_id;
-    sched.tasks[task_id as usize].page_table_root = new_pt_root;
+    let task_id = sched.thread(my_tid).task_id;
+    sched.task_mut(task_id).page_table_root = new_pt_root;
 }
 
 /// Get the address space ID of the current thread's task.
@@ -1680,8 +1852,8 @@ pub fn update_task_page_table(new_pt_root: usize) {
 pub fn current_aspace_id() -> u32 {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let sched = SCHEDULER.lock();
-    let thread = &sched.threads[tid as usize];
-    let task = &sched.tasks[thread.task_id as usize];
+    let thread = sched.thread(tid);
+    let task = sched.task(thread.task_id);
     task.aspace_id
 }
 
@@ -1699,17 +1871,19 @@ pub fn fork_current() -> u64 {
     {
         let sched = SCHEDULER.lock();
         let tid = smp::current().current_thread.load(Ordering::Relaxed);
-        let task_id = sched.threads[tid as usize].task_id;
-        let uid = sched.tasks[task_id as usize].uid;
-        let nproc_limit = sched.tasks[task_id as usize]
+        let task_id = sched.thread(tid).task_id;
+        let uid = sched.task(task_id).uid;
+        let nproc_limit = sched.task(task_id)
             .rlimits[super::task::RLIMIT_NPROC as usize].cur;
         if nproc_limit != super::task::RLIM_INFINITY {
             let mut count = 0u64;
-            for i in 1..sched.next_task_id as usize {
-                if sched.tasks[i].active && sched.tasks[i].uid == uid {
+            sched.task_art.for_each(|key, val| {
+                if key == 0 { return; }
+                let t = unsafe { &*(val as *const Task) };
+                if t.active && t.uid == uid {
                     count += 1;
                 }
-            }
+            });
             if count >= nproc_limit {
                 return u64::MAX;
             }
@@ -1720,8 +1894,8 @@ pub fn fork_current() -> u64 {
     let (parent_tid, parent_task_id, parent_aspace_id, parent_priority, parent_quantum, parent_sig_mask) = {
         let tid = smp::current().current_thread.load(Ordering::Relaxed);
         let sched = SCHEDULER.lock();
-        let thread = &sched.threads[tid as usize];
-        let task = &sched.tasks[thread.task_id as usize];
+        let thread = sched.thread(tid);
+        let task = sched.task(thread.task_id);
         (tid, thread.task_id, task.aspace_id, thread.base_priority, thread.default_quantum, thread.sig_mask)
     };
 
@@ -1742,17 +1916,17 @@ pub fn fork_current() -> u64 {
 
     // Set up child task.
     {
-        let parent_pgid = sched.tasks[parent_task_id as usize].pgid;
-        let parent_sid = sched.tasks[parent_task_id as usize].sid;
-        let parent_ctty = sched.tasks[parent_task_id as usize].ctty_port;
-        let parent_uid = sched.tasks[parent_task_id as usize].uid;
-        let parent_euid = sched.tasks[parent_task_id as usize].euid;
-        let parent_gid = sched.tasks[parent_task_id as usize].gid;
-        let parent_egid = sched.tasks[parent_task_id as usize].egid;
-        let parent_groups = sched.tasks[parent_task_id as usize].groups;
-        let parent_ngroups = sched.tasks[parent_task_id as usize].ngroups;
-        let parent_rlimits = sched.tasks[parent_task_id as usize].rlimits;
-        let task = &mut sched.tasks[child_task_id as usize];
+        let parent_pgid = sched.task(parent_task_id).pgid;
+        let parent_sid = sched.task(parent_task_id).sid;
+        let parent_ctty = sched.task(parent_task_id).ctty_port;
+        let parent_uid = sched.task(parent_task_id).uid;
+        let parent_euid = sched.task(parent_task_id).euid;
+        let parent_gid = sched.task(parent_task_id).gid;
+        let parent_egid = sched.task(parent_task_id).egid;
+        let parent_groups = sched.task(parent_task_id).groups;
+        let parent_ngroups = sched.task(parent_task_id).ngroups;
+        let parent_rlimits = sched.task(parent_task_id).rlimits;
+        let task = sched.task_mut(child_task_id);
         task.id = child_task_id;
         task.active = true;
         task.aspace_id = child_aspace_id;
@@ -1831,7 +2005,7 @@ pub fn fork_current() -> u64 {
     AFFINITY_MASK[child_tid as usize].store(u64::MAX, Ordering::Relaxed);
     LAST_CPU[child_tid as usize].store(smp::cpu_id(), Ordering::Relaxed);
 
-    let thread = &mut sched.threads[child_tid as usize];
+    let thread = sched.thread_mut(child_tid);
     thread.id = child_tid;
     thread.state = ThreadState::Ready;
     thread.task_id = child_task_id;
@@ -1861,7 +2035,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         let pcpu = smp::current();
         let tid = pcpu.current_thread.load(Ordering::Relaxed);
         let mut sched = SCHEDULER.lock();
-        let thread = &mut sched.threads[tid as usize];
+        let thread = sched.thread_mut(tid);
         thread.state = ThreadState::Dead;
         thread.exit_code = exit_code;
         // Wake any thread blocked in thread_join() on us.
@@ -1877,7 +2051,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         // slot before we're actually off the CPU. Instead, try_switch will set
         // stack_base=0 when it drains DEFERRED_KSTACK (proving the dead thread
         // has been context-switched away).
-        let task = &mut sched.tasks[task_id as usize];
+        let task = sched.task_mut(task_id);
         task.thread_count -= 1;
         let is_last = task.thread_count == 0;
         let parent_task_id = task.parent_task;
@@ -1942,15 +2116,16 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     if is_last_thread {
         let my_task_id = {
             let sched = SCHEDULER.lock();
-            sched.threads[tid as usize].task_id
+            sched.thread(tid).task_id
         };
         let mut sched = SCHEDULER.lock();
-        for i in 1..sched.next_task_id as usize {
-            let task = &sched.tasks[i];
+        sched.task_art.for_each(|key, val| {
+            if key == 0 { return; }
+            let task = unsafe { &mut *(val as *mut Task) };
             if task.parent_task == my_task_id && task.exited && !task.reaped {
-                sched.tasks[i].reaped = true;
+                task.reaped = true;
             }
-        }
+        });
     }
 
     // Defer freeing our own kernel stack — we're running on it.
@@ -2106,11 +2281,11 @@ fn arch_send_event() {
 /// Also reaps the child (marks reaped=true) so the task slot can be reused.
 pub fn waitpid(child_tid: ThreadId) -> Option<i32> {
     let mut sched = SCHEDULER.lock();
-    if child_tid as usize >= MAX_THREADS {
-        return None;
-    }
-    let task_id = sched.threads[child_tid as usize].task_id;
-    let task = &mut sched.tasks[task_id as usize];
+    let task_id = match sched.thread_get(child_tid) {
+        Some(t) => t.task_id,
+        None => return None,
+    };
+    let task = sched.task_mut(task_id);
     if task.exited {
         task.reaped = true;
         Some(task.exit_code)
@@ -2129,18 +2304,20 @@ pub const WCONTINUED: u32 = 8;
 /// Wake all threads in a given task that are blocked in WaitChild.
 fn wake_wait_child_threads(task_id: TaskId) {
     let sched = SCHEDULER.lock();
-    let mut to_wake = [0u32; MAX_THREADS];
+    let mut to_wake = [0u32; 64];
     let mut count = 0usize;
-    for i in 0..MAX_THREADS {
-        let t = &sched.threads[i];
+    sched.thread_art.for_each(|key, val| {
+        let t = unsafe { &*(val as *const Thread) };
         if t.task_id == task_id && t.state != ThreadState::Dead
             && t.stack_base != 0
             && t.blocked_on == BlockReason::WaitChild
         {
-            to_wake[count] = i as u32;
-            count += 1;
+            if count < 64 {
+                to_wake[count] = key as u32;
+                count += 1;
+            }
         }
-    }
+    });
     drop(sched);
     for i in 0..count {
         wake_thread(to_wake[i]);
@@ -2163,35 +2340,36 @@ pub fn wait4(pid: i64, flags: u32) -> (i32, i32) {
     loop {
         let result = {
             let mut sched = SCHEDULER.lock();
-            let my_task_id = sched.threads[tid as usize].task_id;
-            let my_pgid = sched.tasks[my_task_id as usize].pgid;
+            let my_task_id = sched.thread(tid).task_id;
+            let my_pgid = sched.task(my_task_id).pgid;
 
             // Scan for a matching exited (zombie) child.
             let mut found: Option<(u32, i32)> = None;
             let mut has_children = false;
-            for i in 1..sched.next_task_id as usize {
-                let task = &sched.tasks[i];
-                if task.parent_task != my_task_id { continue; }
+            sched.task_art.for_each(|key, val| {
+                if found.is_some() { return; }
+                if key == 0 { return; }
+                let task = unsafe { &*(val as *const Task) };
+                if task.parent_task != my_task_id { return; }
 
                 // Check pid filter.
                 let matches = match pid {
                     -1 => true,                    // any child
                     0 => task.pgid == my_pgid,     // same pgroup
-                    p if p > 0 => i == p as usize, // specific task
+                    p if p > 0 => task.id == p as TaskId, // specific task
                     p => task.pgid == (-p) as TaskId, // specific pgroup
                 };
-                if !matches { continue; }
+                if !matches { return; }
                 has_children = true;
 
                 if task.exited && !task.reaped {
-                    found = Some((i as u32, task.wait_status));
-                    // Reap the child.
-                    sched.tasks[i].reaped = true;
-                    break;
+                    found = Some((task.id, task.wait_status));
                 }
-            }
+            });
 
             if let Some((child_id, status)) = found {
+                // Reap the child.
+                sched.task_mut(child_id).reaped = true;
                 Some((child_id as i32, status))
             } else if !has_children {
                 // No matching children at all — ECHILD.
@@ -2201,7 +2379,7 @@ pub fn wait4(pid: i64, flags: u32) -> (i32, i32) {
             } else {
                 // Block: clear wakeup flag while holding the lock.
                 clear_wakeup_flag(tid);
-                sched.threads[tid as usize].blocked_on = BlockReason::WaitChild;
+                sched.thread_mut(tid).blocked_on = BlockReason::WaitChild;
                 None
             }
         }; // scheduler lock dropped
@@ -2219,8 +2397,7 @@ pub fn wait4(pid: i64, flags: u32) -> (i32, i32) {
 /// Boost a thread's effective priority if `to_prio` is higher (lower number).
 pub fn boost_priority(tid: ThreadId, to_prio: u8) {
     let mut sched = SCHEDULER.lock();
-    if (tid as usize) < MAX_THREADS {
-        let thread = &mut sched.threads[tid as usize];
+    if let Some(thread) = sched.thread_get_mut(tid) {
         if to_prio < thread.effective_priority {
             thread.effective_priority = to_prio;
             THREAD_PRIO[tid as usize].store(to_prio, Ordering::Release);
@@ -2231,8 +2408,7 @@ pub fn boost_priority(tid: ThreadId, to_prio: u8) {
 /// Reset a thread's effective priority back to its base priority.
 pub fn reset_priority(tid: ThreadId) {
     let mut sched = SCHEDULER.lock();
-    if (tid as usize) < MAX_THREADS {
-        let thread = &mut sched.threads[tid as usize];
+    if let Some(thread) = sched.thread_get_mut(tid) {
         thread.effective_priority = thread.base_priority;
         THREAD_PRIO[tid as usize].store(thread.base_priority, Ordering::Release);
     }
@@ -2240,7 +2416,7 @@ pub fn reset_priority(tid: ThreadId) {
 
 /// Get a thread's current effective priority (lock-free).
 pub fn thread_effective_priority(tid: ThreadId) -> u8 {
-    if (tid as usize) < MAX_THREADS {
+    if (tid as usize) < THREAD_SLOTS {
         THREAD_PRIO[tid as usize].load(Ordering::Acquire)
     } else {
         255
@@ -2267,7 +2443,7 @@ pub fn take_pending_switch() -> u64 {
 /// Get a thread's saved SP. Used by inject_recv_into_frame to write into
 /// a parked thread's exception frame.
 pub fn thread_saved_sp(tid: ThreadId) -> u64 {
-    SCHEDULER.lock().threads[tid as usize].saved_sp
+    SCHEDULER.lock().thread(tid).saved_sp
 }
 
 /// Park the current thread for IPC (true off-CPU park).
@@ -2287,18 +2463,18 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
 
     // Save current thread's state.
-    sched.threads[tid].saved_sp = frame_sp;
-    sched.threads[tid].state = ThreadState::Blocked;
-    sched.threads[tid].blocked_on = reason;
+    sched.thread_mut(tid as ThreadId).saved_sp = frame_sp;
+    sched.thread_mut(tid as ThreadId).state = ThreadState::Blocked;
+    sched.thread_mut(tid as ThreadId).blocked_on = reason;
 
     // Pick next thread (don't re-enqueue current — it's Blocked).
     let next_id = sched.pick_next(idle_id);
 
     // Switch page tables if needed.
-    let prev_task = sched.threads[tid].task_id;
-    let next_task = sched.threads[next_id as usize].task_id;
+    let prev_task = sched.thread(tid as ThreadId).task_id;
+    let next_task = sched.thread(next_id).task_id;
     if prev_task != next_task {
-        let next_root = sched.tasks[next_task as usize].page_table_root;
+        let next_root = sched.task(next_task).page_table_root;
         if next_root != 0 {
             #[cfg(target_arch = "aarch64")]
             crate::arch::aarch64::mm::switch_page_table(next_root);
@@ -2319,17 +2495,17 @@ pub fn park_current_for_ipc(reason: BlockReason) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        let next_kstack_top = sched.threads[next_id as usize].stack_base + PAGE_SIZE;
+        let next_kstack_top = sched.thread(next_id).stack_base + PAGE_SIZE;
         crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
     }
 
-    sched.threads[next_id as usize].state = ThreadState::Running;
+    sched.thread_mut(next_id).state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
-    let next_sp = sched.threads[next_id as usize].saved_sp;
+    let next_sp = sched.thread(next_id).saved_sp;
 
     // Read SA state while holding lock.
-    let parked_task_id = sched.threads[tid].task_id;
-    let sa_enabled = sched.tasks[parked_task_id as usize].sa_enabled;
+    let parked_task_id = sched.thread(tid as ThreadId).task_id;
+    let sa_enabled = sched.task(parked_task_id).sa_enabled;
     drop(sched);
 
     // Scheduler activation: notify userspace that a kthread blocked.
@@ -2349,10 +2525,12 @@ pub fn park_current_for_ipc(reason: BlockReason) {
 /// This is for threads parked via park_current_for_ipc (Blocked state).
 pub fn wake_parked_thread(tid: ThreadId) {
     let mut sched = SCHEDULER.lock();
-    if (tid as usize) < MAX_THREADS && sched.threads[tid as usize].state == ThreadState::Blocked {
-        let prio = sched.threads[tid as usize].effective_priority;
-        sched.threads[tid as usize].state = ThreadState::Ready;
-        sched.run_queues[prio as usize].push(tid);
+    if let Some(thread) = sched.thread_get_mut(tid) {
+        if thread.state == ThreadState::Blocked {
+            let prio = thread.effective_priority;
+            thread.state = ThreadState::Ready;
+            sched.run_queues[prio as usize].push(tid);
+        }
     }
 }
 
@@ -2382,18 +2560,28 @@ pub fn get_monotonic_ns() -> u64 {
 fn check_sleep_timers() {
     let now_ns = get_monotonic_ns();
     let mut sched = SCHEDULER.lock();
-    for i in 0..MAX_THREADS {
-        if sched.threads[i].state == ThreadState::Blocked
-            && matches!(sched.threads[i].blocked_on, BlockReason::Sleep)
-            && sched.threads[i].sleep_deadline_ns != 0
-            && sched.threads[i].sleep_deadline_ns <= now_ns
+    let mut to_wake: [(ThreadId, u8); 64] = [(0, 0); 64];
+    let mut count = 0usize;
+    sched.thread_art.for_each(|key, val| {
+        let t = unsafe { &*(val as *const Thread) };
+        if t.state == ThreadState::Blocked
+            && matches!(t.blocked_on, BlockReason::Sleep)
+            && t.sleep_deadline_ns != 0
+            && t.sleep_deadline_ns <= now_ns
         {
-            let prio = sched.threads[i].effective_priority;
-            sched.threads[i].state = ThreadState::Ready;
-            sched.threads[i].blocked_on = BlockReason::None;
-            sched.threads[i].sleep_deadline_ns = 0;
-            sched.run_queues[prio as usize].push(i as ThreadId);
+            if count < 64 {
+                to_wake[count] = (key as ThreadId, t.effective_priority);
+                count += 1;
+            }
         }
+    });
+    for i in 0..count {
+        let (tid, prio) = to_wake[i];
+        let t = sched.thread_mut(tid);
+        t.state = ThreadState::Ready;
+        t.blocked_on = BlockReason::None;
+        t.sleep_deadline_ns = 0;
+        sched.run_queues[prio as usize].push(tid);
     }
 }
 
@@ -2401,27 +2589,28 @@ fn check_sleep_timers() {
 /// Called from tick() before try_switch.
 fn check_alarm_timers() {
     let now_ns = get_monotonic_ns();
-    let mut fired = [0u32; super::task::MAX_TASKS];
+    let mut fired = [0u32; TASK_SLOTS];
     let mut count = 0usize;
 
     {
-        let mut sched = SCHEDULER.lock();
-        for i in 0..super::task::MAX_TASKS {
-            if sched.tasks[i].active
-                && sched.tasks[i].alarm_deadline_ns != 0
-                && sched.tasks[i].alarm_deadline_ns <= now_ns
+        let sched = SCHEDULER.lock();
+        sched.task_art.for_each(|_key, val| {
+            let task = unsafe { &mut *(val as *mut Task) };
+            if task.active
+                && task.alarm_deadline_ns != 0
+                && task.alarm_deadline_ns <= now_ns
             {
-                if sched.tasks[i].alarm_interval_ns != 0 {
-                    sched.tasks[i].alarm_deadline_ns = now_ns + sched.tasks[i].alarm_interval_ns;
+                if task.alarm_interval_ns != 0 {
+                    task.alarm_deadline_ns = now_ns + task.alarm_interval_ns;
                 } else {
-                    sched.tasks[i].alarm_deadline_ns = 0;
+                    task.alarm_deadline_ns = 0;
                 }
-                if count < fired.len() {
-                    fired[count] = sched.tasks[i].id;
+                if count < TASK_SLOTS {
+                    fired[count] = task.id;
                     count += 1;
                 }
             }
-        }
+        });
     }
 
     for i in 0..count {
@@ -2438,28 +2627,29 @@ fn check_interval_timers() {
     let mut found = false;
 
     {
-        let mut sched = SCHEDULER.lock();
-        for i in 0..sched.threads.len() {
-            let t = &sched.threads[i];
+        let sched = SCHEDULER.lock();
+        sched.thread_art.for_each(|key, val| {
+            if found { return; }
+            let t = unsafe { &*(val as *const Thread) };
             if t.state != ThreadState::Dead
                 && t.stack_base != 0
                 && t.timer_signal != 0
                 && t.timer_next_ns != 0
                 && now_ns >= t.timer_next_ns
             {
-                fired_tid = t.id;
+                fired_tid = key as ThreadId;
                 fired_sig = t.timer_signal;
                 fired_interval = t.timer_interval_ns;
-                // Re-arm the timer while we hold the lock.
-                sched.threads[i].timer_next_ns = if fired_interval != 0 {
+                // Re-arm the timer while we have the pointer.
+                let t_mut = unsafe { &mut *(val as *mut Thread) };
+                t_mut.timer_next_ns = if fired_interval != 0 {
                     now_ns + fired_interval
                 } else {
                     0
                 };
                 found = true;
-                break; // Only fire one per tick to avoid re-lock issues.
             }
-        }
+        });
     }
 
     if found {
@@ -2479,19 +2669,20 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
 
     // Set deadline before marking Blocked.
-    sched.threads[tid].sleep_deadline_ns = deadline_ns;
-    sched.threads[tid].saved_sp = frame_sp;
-    sched.threads[tid].state = ThreadState::Blocked;
-    sched.threads[tid].blocked_on = BlockReason::Sleep;
+    let thread = sched.thread_mut(tid as ThreadId);
+    thread.sleep_deadline_ns = deadline_ns;
+    thread.saved_sp = frame_sp;
+    thread.state = ThreadState::Blocked;
+    thread.blocked_on = BlockReason::Sleep;
 
     // Pick next thread (don't re-enqueue current — it's Blocked).
     let next_id = sched.pick_next(idle_id);
 
     // Switch page tables if needed.
-    let prev_task = sched.threads[tid].task_id;
-    let next_task = sched.threads[next_id as usize].task_id;
+    let prev_task = sched.thread(tid as ThreadId).task_id;
+    let next_task = sched.thread(next_id).task_id;
     if prev_task != next_task {
-        let next_root = sched.tasks[next_task as usize].page_table_root;
+        let next_root = sched.task(next_task).page_table_root;
         if next_root != 0 {
             #[cfg(target_arch = "aarch64")]
             crate::arch::aarch64::mm::switch_page_table(next_root);
@@ -2512,17 +2703,17 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        let next_kstack_top = sched.threads[next_id as usize].stack_base + PAGE_SIZE;
+        let next_kstack_top = sched.thread(next_id).stack_base + PAGE_SIZE;
         crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
     }
 
-    sched.threads[next_id as usize].state = ThreadState::Running;
+    sched.thread_mut(next_id).state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
-    let next_sp = sched.threads[next_id as usize].saved_sp;
+    let next_sp = sched.thread(next_id).saved_sp;
 
     // SA notification for the parked thread.
-    let parked_task_id = sched.threads[tid].task_id;
-    let sa_enabled = sched.tasks[parked_task_id as usize].sa_enabled;
+    let parked_task_id = sched.thread(tid as ThreadId).task_id;
+    let sa_enabled = sched.task(parked_task_id).sa_enabled;
     drop(sched);
 
     if sa_enabled {
@@ -2542,8 +2733,8 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
 pub fn alarm(initial_ns: u64, interval_ns: u64) -> u64 {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let mut sched = SCHEDULER.lock();
-    let task_id = sched.threads[tid as usize].task_id;
-    let task = &mut sched.tasks[task_id as usize];
+    let task_id = sched.thread(tid).task_id;
+    let task = sched.task_mut(task_id);
 
     let now = get_monotonic_ns();
     let prev_remaining = if task.alarm_deadline_ns > now {
@@ -2574,20 +2765,20 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     let sender_tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
 
     // Save sender: goes to Ready on run queue.
-    sched.threads[sender_tid].saved_sp = frame_sp;
-    let sender_prio = sched.threads[sender_tid].effective_priority;
-    sched.threads[sender_tid].state = ThreadState::Ready;
+    sched.thread_mut(sender_tid as ThreadId).saved_sp = frame_sp;
+    let sender_prio = sched.thread(sender_tid as ThreadId).effective_priority;
+    sched.thread_mut(sender_tid as ThreadId).state = ThreadState::Ready;
     sched.run_queues[sender_prio as usize].push(sender_tid as ThreadId);
 
     // Donate remaining quantum to receiver.
-    let remaining_quantum = sched.threads[sender_tid].quantum;
-    sched.threads[receiver_tid as usize].quantum = remaining_quantum;
+    let remaining_quantum = sched.thread(sender_tid as ThreadId).quantum;
+    sched.thread_mut(receiver_tid).quantum = remaining_quantum;
 
     // Switch page tables if needed.
-    let sender_task = sched.threads[sender_tid].task_id;
-    let recv_task = sched.threads[receiver_tid as usize].task_id;
+    let sender_task = sched.thread(sender_tid as ThreadId).task_id;
+    let recv_task = sched.thread(receiver_tid).task_id;
     if sender_task != recv_task {
-        let next_root = sched.tasks[recv_task as usize].page_table_root;
+        let next_root = sched.task(recv_task).page_table_root;
         if next_root != 0 {
             #[cfg(target_arch = "aarch64")]
             crate::arch::aarch64::mm::switch_page_table(next_root);
@@ -2608,14 +2799,14 @@ pub fn handoff_to(receiver_tid: ThreadId) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        let next_kstack_top = sched.threads[receiver_tid as usize].stack_base + PAGE_SIZE;
+        let next_kstack_top = sched.thread(receiver_tid).stack_base + PAGE_SIZE;
         crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
     }
 
     // Activate receiver.
-    sched.threads[receiver_tid as usize].state = ThreadState::Running;
+    sched.thread_mut(receiver_tid).state = ThreadState::Running;
     pcpu.current_thread.store(receiver_tid, Ordering::Relaxed);
-    let recv_sp = sched.threads[receiver_tid as usize].saved_sp;
+    let recv_sp = sched.thread(receiver_tid).saved_sp;
     drop(sched);
 
     PENDING_SWITCH_SP[cpu].store(recv_sp, Ordering::Release);
@@ -2628,7 +2819,7 @@ pub fn sa_register() {
     let task_id = current_task_id();
     if task_id == 0 { return; }
     let mut sched = SCHEDULER.lock();
-    sched.tasks[task_id as usize].sa_enabled = true;
+    sched.task_mut(task_id).sa_enabled = true;
 }
 
 /// Block until a scheduler activation event occurs.
@@ -2667,16 +2858,18 @@ pub fn sa_getid() -> u64 {
     let task_id = current_task_id();
     let sched = SCHEDULER.lock();
     let mut idx = 0u64;
-    for i in 0..MAX_THREADS {
-        let t = &sched.threads[i];
+    let mut found = false;
+    sched.thread_art.for_each(|key, val| {
+        if found { return; }
+        let t = unsafe { &*(val as *const Thread) };
         if t.task_id == task_id && t.state != ThreadState::Dead
-            && (t.stack_base != 0 || i == 0)
+            && (t.stack_base != 0 || key == 0)
         {
-            if i as u32 == tid { return idx; }
+            if key as u32 == tid { found = true; return; }
             idx += 1;
         }
-    }
-    u64::MAX
+    });
+    if found { idx } else { u64::MAX }
 }
 
 /// Set the coscheduling group for the current thread. group=0 removes from any group.
@@ -2687,7 +2880,7 @@ pub fn cosched_set(group: u32) {
 
 /// Set CPU affinity mask for a thread. Returns true on success.
 pub fn set_affinity(tid: u32, mask: u64) -> bool {
-    if (tid as usize) >= MAX_THREADS || mask == 0 {
+    if (tid as usize) >= THREAD_SLOTS || mask == 0 {
         return false;
     }
     AFFINITY_MASK[tid as usize].store(mask, Ordering::Relaxed);
@@ -2696,7 +2889,7 @@ pub fn set_affinity(tid: u32, mask: u64) -> bool {
 
 /// Get CPU affinity mask for a thread.
 pub fn get_affinity(tid: u32) -> u64 {
-    if (tid as usize) >= MAX_THREADS {
+    if (tid as usize) >= THREAD_SLOTS {
         return 0;
     }
     AFFINITY_MASK[tid as usize].load(Ordering::Relaxed)

@@ -1,7 +1,10 @@
 //! Kernel futex table — supports futex_wait / futex_wake syscalls.
 
 use super::SpinLock;
-use crate::sched::thread::{ThreadId, BlockReason, MAX_THREADS};
+use crate::sched::thread::{ThreadId, BlockReason};
+
+/// Fixed pool size for futex waiters (independent of thread slot count).
+const FUTEX_POOL_SIZE: usize = 128;
 
 struct FutexWaiter {
     active: bool,
@@ -16,8 +19,8 @@ impl FutexWaiter {
     }
 }
 
-static FUTEX_TABLE: SpinLock<[FutexWaiter; MAX_THREADS]> =
-    SpinLock::new([const { FutexWaiter::empty() }; MAX_THREADS]);
+static FUTEX_TABLE: SpinLock<[FutexWaiter; FUTEX_POOL_SIZE]> =
+    SpinLock::new([const { FutexWaiter::empty() }; FUTEX_POOL_SIZE]);
 
 /// Block the current thread if the u32 at user VA `addr` equals `expected`.
 /// Returns 0 on wake, 1 on value mismatch, u64::MAX on error.

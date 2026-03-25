@@ -6,8 +6,9 @@
 /// Task ID.
 pub type TaskId = u32;
 
-/// Maximum number of tasks.
-pub const MAX_TASKS: usize = 32;
+/// Maximum task ID slot count for per-task atomic arrays.
+/// Task data itself is ART-backed; this bounds the lock-free flat arrays.
+pub const TASK_SLOTS: usize = 128;
 
 /// Maximum number of signals (1..=MAX_SIGNALS). Bit N in masks = signal N+1.
 pub const MAX_SIGNALS: usize = 32;

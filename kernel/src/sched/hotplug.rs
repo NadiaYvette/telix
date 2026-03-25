@@ -11,7 +11,7 @@
 
 use super::smp::{self, MAX_CPUS};
 use super::scheduler::{SCHEDULER, set_affinity, get_affinity};
-use super::thread::MAX_THREADS;
+use super::thread::THREAD_SLOTS;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Per-CPU load: number of ticks in the last window where this CPU was
@@ -116,7 +116,7 @@ pub fn cpu_offline(cpu: u32) -> u64 {
     // Migrate all threads: clear the offlined CPU's bit from their
     // affinity masks. Threads currently on the run queue with affinity
     // only for this CPU get expanded to all remaining online CPUs.
-    for tid in 0..(MAX_THREADS as u32) {
+    for tid in 0..(THREAD_SLOTS as u32) {
         let old_affinity = get_affinity(tid);
         if old_affinity == 0 {
             continue; // Unused slot
