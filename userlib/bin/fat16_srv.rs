@@ -127,7 +127,7 @@ fn read_u32(buf: &[u8], off: usize) -> u32 {
 /// State for communicating with blk_srv.
 struct BlkClient {
     blk_port: u64,
-    blk_aspace: u32,
+    blk_aspace: u64,
     reply_port: u64,
     /// Scratch page VA for block reads (our local mapping).
     scratch_va: usize,
@@ -382,7 +382,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     let blk_aspace = if let Some(reply) = syscall::recv_msg(blk_reply) {
         if reply.tag == IO_CONNECT_OK {
-            reply.data[2] as u32
+            reply.data[2]
         } else {
             syscall::debug_puts(b"  [fat16_srv] blk connect FAILED\n");
             loop { core::hint::spin_loop(); }

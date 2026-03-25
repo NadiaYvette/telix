@@ -219,7 +219,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let warmup_tid = syscall::spawn(b"spin", 50);
         if warmup_tid != u64::MAX {
             for _ in 0..10 { syscall::yield_now(); }
-            syscall::kill(warmup_tid as u32);
+            syscall::kill(warmup_tid);
             loop {
                 if syscall::waitpid(warmup_tid).is_some() { break; }
                 syscall::yield_now();
@@ -231,7 +231,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let tid = syscall::spawn(b"spin", 50);
             if tid == u64::MAX { break; }
             for _ in 0..5 { syscall::yield_now(); }
-            syscall::kill(tid as u32);
+            syscall::kill(tid);
             loop {
                 if syscall::waitpid(tid).is_some() { break; }
                 syscall::yield_now();
@@ -257,7 +257,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if child_tid != u64::MAX {
                 // Receive child's aspace_id.
                 let child_aspace = if let Some(msg) = syscall::recv_msg(coord_port) {
-                    if msg.tag == GRANT_BENCH_ASPACE { msg.data[0] as u32 } else { 0 }
+                    if msg.tag == GRANT_BENCH_ASPACE { msg.data[0] } else { 0 }
                 } else { 0 };
 
                 if child_aspace != 0 {
@@ -310,7 +310,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let child_tid = syscall::spawn_with_arg(b"grant_echo", 50, coord_port as u64);
             if child_tid != u64::MAX {
                 let child_aspace = if let Some(msg) = syscall::recv_msg(coord_port) {
-                    if msg.tag == GRANT_BENCH_ASPACE { msg.data[0] as u32 } else { 0 }
+                    if msg.tag == GRANT_BENCH_ASPACE { msg.data[0] } else { 0 }
                 } else { 0 };
 
                 if child_aspace != 0 {
@@ -386,14 +386,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // Cleanup.
             if spin1 != u64::MAX {
-                syscall::kill(spin1 as u32);
+                syscall::kill(spin1);
                 loop {
                     if syscall::waitpid(spin1).is_some() { break; }
                     syscall::yield_now();
                 }
             }
             if spin2 != u64::MAX {
-                syscall::kill(spin2 as u32);
+                syscall::kill(spin2);
                 loop {
                     if syscall::waitpid(spin2).is_some() { break; }
                     syscall::yield_now();
@@ -430,7 +430,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let t0 = syscall::get_cycles();
             for _ in 0..N {
                 // Kill current server.
-                syscall::kill(pong_tid as u32);
+                syscall::kill(pong_tid);
                 loop {
                     if syscall::waitpid(pong_tid).is_some() { break; }
                     syscall::yield_now();

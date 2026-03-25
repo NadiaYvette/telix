@@ -469,7 +469,7 @@ fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
 
     let (handle, file_size, srv_aspace) = if let Some(msg) = syscall::recv_msg(fs_reply) {
         if msg.tag == FS_OPEN_OK {
-            (msg.data[0], msg.data[1] as usize, msg.data[2] as u32)
+            (msg.data[0], msg.data[1] as usize, msg.data[2])
         } else {
             con_puts(con_port, reply_port, b"file not found\r\n");
             syscall::port_destroy(fs_reply);
@@ -625,7 +625,7 @@ fn cmd_write(con_port: u64, reply_port: u64, fat16_port: Option<u64>, args: &[u8
 
     let (handle, srv_aspace) = if let Some(msg) = syscall::recv_msg(fs_reply) {
         if msg.tag == FS_CREATE_OK {
-            (msg.data[0], msg.data[2] as u32)
+            (msg.data[0], msg.data[2])
         } else {
             con_puts(con_port, reply_port, b"create failed\r\n");
             syscall::port_destroy(fs_reply);
@@ -702,7 +702,7 @@ fn cmd_info(con_port: u64, reply_port: u64) {
     let len = fmt_num(tid, &mut buf);
     con_puts(con_port, reply_port, &buf[..len]);
     con_puts(con_port, reply_port, b"\r\n  aspace: ");
-    let len = fmt_num(aspace as u64, &mut buf);
+    let len = fmt_num(aspace, &mut buf);
     con_puts(con_port, reply_port, &buf[..len]);
     con_puts(con_port, reply_port, b"\r\n");
 }

@@ -168,7 +168,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     let (handle, size, srv_aspace) = if let Some(reply) = syscall::recv_msg(reply_port) {
         if reply.tag == 0x101 {
-            (reply.data[0], reply.data[1], reply.data[2] as u32)
+            (reply.data[0], reply.data[1], reply.data[2])
         } else {
             syscall::debug_puts(b"  init: connect failed\n");
             loop { syscall::yield_now(); }
@@ -286,7 +286,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     let rd_aspace = if let Some(reply) = syscall::recv_msg(rd_reply) {
         if reply.tag == 0x101 {
-            reply.data[2] as u32
+            reply.data[2]
         } else {
             syscall::debug_puts(b"  init: ramdisk connect failed\n");
             loop { syscall::yield_now(); }
@@ -436,7 +436,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  init: blk connected, size=");
                 print_num(reply.data[1]);
                 syscall::debug_puts(b" bytes\n");
-                reply.data[2] as u32
+                reply.data[2]
             } else {
                 syscall::debug_puts(b"  init: blk connect failed\n");
                 0
@@ -717,7 +717,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if reply.tag == 0x2001 {
                 let handle = reply.data[0];
                 let file_size = reply.data[1] as usize;
-                let srv_aspace = reply.data[2] as u32;
+                let srv_aspace = reply.data[2];
 
                 // Allocate ELF buffer and scratch page.
                 let elf_pages = (file_size + 4095) / 4096;
@@ -834,11 +834,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
             if reply.tag == 0x2501 {
                 let handle = reply.data[0];
-                let srv_aspace = reply.data[2] as u32;
+                let srv_aspace = reply.data[2];
                 syscall::debug_puts(b"  init: FS_CREATE ok handle=");
                 print_num(handle);
                 syscall::debug_puts(b" aspace=");
-                print_num(srv_aspace as u64);
+                print_num(srv_aspace);
                 syscall::debug_puts(b"\n");
 
                 // Allocate scratch page for grant-based write.
@@ -895,7 +895,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     if open_msg.tag == 0x2001 {
                                         let rh = open_msg.data[0];
                                         let rsize = open_msg.data[1] as usize;
-                                        let rsrv = open_msg.data[2] as u32;
+                                        let rsrv = open_msg.data[2];
 
                                         if rsize == test_data.len() {
                                             // Grant-based read to verify.
@@ -1004,7 +1004,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 );
 
                 if child_tid != u64::MAX {
-                    let exit_code = syscall::thread_join(child_tid as u32);
+                    let exit_code = syscall::thread_join(child_tid);
                     let val = unsafe { core::ptr::read_volatile(shared_va as *const u64) };
 
                     if val == 0xCAFE && exit_code == 42 {
@@ -1047,8 +1047,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             );
 
             if t1 != u64::MAX && t2 != u64::MAX {
-                syscall::thread_join(t1 as u32);
-                syscall::thread_join(t2 as u32);
+                syscall::thread_join(t1);
+                syscall::thread_join(t2);
 
                 let counter = unsafe { MUTEX_TEST_COUNTER };
                 if counter == 2000 {
@@ -1177,7 +1177,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             for _ in 0..50 { syscall::yield_now(); }
 
             // Kill it.
-            let killed = syscall::kill(spin_tid as u32);
+            let killed = syscall::kill(spin_tid);
             if killed {
                 // Wait for the task to exit.
                 let mut exited = false;
@@ -1212,7 +1212,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let ct_tid = syscall::spawn(b"cap_test", 50);
         if ct_tid != u64::MAX {
             // Set child's port quota to 2 (kernel resolves tid -> task_id).
-            syscall::set_quota(ct_tid as u32, 0, 2); // max 2 ports
+            syscall::set_quota(ct_tid, 0, 2); // max 2 ports
 
             loop {
                 if let Some(code) = syscall::waitpid(ct_tid) {
@@ -1255,7 +1255,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             if let Some(cr) = syscall::recv_msg(cache_reply) {
                 if cr.tag == 0x101 {
-                    let cache_aspace = cr.data[2] as u32;
+                    let cache_aspace = cr.data[2];
 
                     if let Some(scratch_va) = syscall::mmap_anon(0, 1, 1) {
                         let grant_va: usize = 0x7_0000_0000;
@@ -1618,8 +1618,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 if t1 != u64::MAX && t2 != u64::MAX {
                     // Wait for both workers to complete.
-                    syscall::thread_join(t1 as u32);
-                    syscall::thread_join(t2 as u32);
+                    syscall::thread_join(t1);
+                    syscall::thread_join(t2);
 
                     let final_count = unsafe { core::ptr::read_volatile(counter_ptr) };
                     let completed = userlib::green::COMPLETED.load(core::sync::atomic::Ordering::Relaxed);
@@ -1673,7 +1673,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             if ok {
                 for i in 0..6 {
-                    syscall::thread_join(tids[i] as u32);
+                    syscall::thread_join(tids[i]);
                 }
 
                 let hits_after = syscall::vm_stats(4);
@@ -1713,7 +1713,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if total_cpus < 1 { topo_ok = false; }
 
         // Step 2: Test affinity - pin self to CPU 0.
-        let my_tid = syscall::thread_id() as u32;
+        let my_tid = syscall::thread_id();
         let old_mask = syscall::get_affinity(my_tid);
         let set_ok = syscall::set_affinity(my_tid, 1); // Only CPU 0
         if !set_ok { topo_ok = false; }
@@ -1733,8 +1733,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             );
             if child != u64::MAX {
                 // Pin child to CPU 0.
-                syscall::set_affinity(child as u32, 1);
-                syscall::thread_join(child as u32);
+                syscall::set_affinity(child, 1);
+                syscall::thread_join(child);
             } else {
                 topo_ok = false;
             }
@@ -1772,7 +1772,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             if let Some(cr) = syscall::recv_msg(reply_port) {
                 if cr.tag == 0x101 {
-                    let cache_aspace = cr.data[2] as u32;
+                    let cache_aspace = cr.data[2];
 
                     if let Some(scratch_va) = syscall::mmap_anon(0, 1, 1) {
                         let grant_va: usize = 0x9_0000_0000;
@@ -2179,7 +2179,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             // Step 9: Verify affinity was adjusted for init thread.
-            let my_tid = syscall::thread_id() as u32;
+            let my_tid = syscall::thread_id();
             let my_affinity = syscall::get_affinity(my_tid);
             if my_affinity == 0 {
                 syscall::debug_puts(b"    affinity is zero after hotplug\n");
@@ -2228,7 +2228,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             let (handle, file_size, fs_aspace) = if let Some(reply) = syscall::recv_msg(reply_port) {
                 if reply.tag == 0x2001 {
-                    (reply.data[0], reply.data[1], reply.data[2] as u32)
+                    (reply.data[0], reply.data[1], reply.data[2])
                 } else {
                     syscall::debug_puts(b"    ext2 open hello.txt FAILED tag=");
                     print_num(reply.tag);
@@ -2344,7 +2344,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let old = syscall::sigaction(syscall::SIGUSR1, handler_addr, 0, 0);
 
             // Send SIGUSR1 to ourselves.
-            let my_tid = syscall::thread_id() as u32;
+            let my_tid = syscall::thread_id();
             syscall::kill_sig(my_tid, syscall::SIGUSR1);
 
             // After signal delivery and handler execution, flag should be set.
@@ -2431,19 +2431,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if new_sid == u64::MAX {
             syscall::debug_puts(b"  init: setsid failed\n");
             phase43_ok = false;
-        } else if new_sid != my_pid as u64 {
+        } else if new_sid != my_pid {
             syscall::debug_puts(b"  init: setsid returned wrong sid\n");
             phase43_ok = false;
         }
 
         // After setsid: sid == pgid == my_pid.
         let sid = syscall::getsid(0);
-        if sid != my_pid as u64 {
+        if sid != my_pid {
             syscall::debug_puts(b"  init: getsid after setsid wrong\n");
             phase43_ok = false;
         }
         let pgid = syscall::getpgid(0);
-        if pgid != my_pid as u64 {
+        if pgid != my_pid {
             syscall::debug_puts(b"  init: pgid after setsid wrong\n");
             phase43_ok = false;
         }
@@ -2461,9 +2461,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Child: should inherit parent's pgid, sid, and ctty.
             let child_pgid = syscall::getpgid(0);
             let child_sid = syscall::getsid(0);
-            let parent_pgid = my_pid as u64;
+            let parent_pgid = my_pid;
 
-            if child_pgid != parent_pgid || child_sid != my_pid as u64 {
+            if child_pgid != parent_pgid || child_sid != my_pid {
                 syscall::exit(1); // Failed.
             }
 
@@ -2473,7 +2473,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::exit(2);
             }
             let new_pgid = syscall::getpgid(0);
-            if new_pgid != child_pid as u64 {
+            if new_pgid != child_pid {
                 syscall::exit(3);
             }
 
@@ -2503,7 +2503,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             phase43_ok = false;
         }
         let fg = syscall::tcgetpgrp();
-        if fg != my_pid as u64 {
+        if fg != my_pid {
             syscall::debug_puts(b"  init: tcgetpgrp wrong\n");
             phase43_ok = false;
         }
@@ -2521,12 +2521,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         if child1 > 0 && child1 != u64::MAX {
             // Put child in its own process group.
-            syscall::setpgid(child1 as u32, child1 as u32);
+            syscall::setpgid(child1, child1);
 
             for _ in 0..10 { syscall::yield_now(); }
 
             // Kill the group.
-            syscall::kill_pgroup(child1 as u32, syscall::SIGKILL);
+            syscall::kill_pgroup(child1, syscall::SIGKILL);
 
             let mut found = false;
             for _ in 0..500 {
@@ -3876,7 +3876,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Step 1: FS_CREATE "WTEST.TXT"
         let mut handle = 0u64;
-        let mut srv_aspace = 0u32;
+        let mut srv_aspace = 0u64;
         if phase53_ok {
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
@@ -3885,7 +3885,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if let Some(reply) = syscall::recv_msg(reply_port) {
                 if reply.tag == 0x2501 {
                     handle = reply.data[0];
-                    srv_aspace = reply.data[2] as u32;
+                    srv_aspace = reply.data[2];
                 } else {
                     syscall::debug_puts(b"  FAIL: ext2 FS_CREATE failed\n");
                     phase53_ok = false;
@@ -3946,7 +3946,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if reply.tag == 0x2001 {
                     let rh = reply.data[0];
                     let rsize = reply.data[1];
-                    let r_aspace = reply.data[2] as u32;
+                    let r_aspace = reply.data[2];
                     if rsize != 64 {
                         syscall::debug_puts(b"  FAIL: ext2 re-open size mismatch\n");
                         phase53_ok = false;
@@ -4085,7 +4085,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Step 1: FS_CREATE "test.txt"
         let mut handle = 0u64;
-        let mut srv_aspace = 0u32;
+        let mut srv_aspace = 0u64;
         if phase54_ok {
             let fname = b"test.txt";
             let (fn0, fn1, _) = pack_name(fname);
@@ -4094,7 +4094,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if let Some(reply) = syscall::recv_msg(rp) {
                 if reply.tag == 0x2501 {
                     handle = reply.data[0];
-                    srv_aspace = reply.data[2] as u32;
+                    srv_aspace = reply.data[2];
                 } else {
                     syscall::debug_puts(b"  FAIL: tmpfs CREATE failed\n");
                     phase54_ok = false;
@@ -4142,7 +4142,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if reply.tag == 0x2001 {
                     let rh = reply.data[0];
                     let rsize = reply.data[1];
-                    let r_aspace = reply.data[2] as u32;
+                    let r_aspace = reply.data[2];
                     if rsize != 48 {
                         syscall::debug_puts(b"  FAIL: tmpfs re-open size\n");
                         phase54_ok = false;
@@ -4784,7 +4784,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let (n0, n1) = pack_name(b"test.sock");
                 let name_len = 9u64;
                 let d2 = name_len | (reply_port << 32);
-                let pid = syscall::getpid() as u64;
+                let pid = syscall::getpid();
                 let uid = syscall::getuid() as u64;
                 let d3 = pid | (uid << 32);
                 syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, d3);
@@ -5038,7 +5038,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if ok {
                 let (n0, n1) = pack_name(b"p58.sock");
                 let d2 = 8u64 | (rp << 32);
-                let pid = syscall::getpid() as u64;
+                let pid = syscall::getpid();
                 let uid = syscall::getuid() as u64;
                 syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, pid | (uid << 32));
                 if let Some(m) = syscall::recv_msg(rp) {
@@ -5123,7 +5123,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if ok {
                 let (n0, n1) = pack_name(b"p58.sock");
                 let d2 = 8u64 | (rp << 32);
-                let pid = syscall::getpid() as u64;
+                let pid = syscall::getpid();
                 syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, pid);
                 if let Some(m) = syscall::recv_msg(rp) {
                     if m.tag == UDS_OK { cli2 = m.data[0]; }
@@ -5464,9 +5464,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test 1: flock(LOCK_EX) + flock(LOCK_UN) — basic acquire/release.
         if phase61_ok {
-            let pid = syscall::getpid() as u32;
+            let pid = syscall::getpid();
             let d0 = handle | (2u64 << 32); // LOCK_EX = 2
-            let d1 = pid as u64;
+            let d1 = pid;
             let d2 = rp << 32;
             syscall::send(tmpfs_port, 0x2800, d0, d1, d2, 0); // FS_FLOCK
             if let Some(reply) = syscall::recv_msg(rp) {
@@ -5477,9 +5477,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             } else { phase61_ok = false; }
         }
         if phase61_ok {
-            let pid = syscall::getpid() as u32;
+            let pid = syscall::getpid();
             let d0 = handle | (8u64 << 32); // LOCK_UN = 8
-            let d1 = pid as u64;
+            let d1 = pid;
             let d2 = rp << 32;
             syscall::send(tmpfs_port, 0x2800, d0, d1, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {

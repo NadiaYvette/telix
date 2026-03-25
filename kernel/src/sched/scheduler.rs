@@ -1708,7 +1708,10 @@ pub fn getpgid(pid: u32) -> u64 {
         pid
     };
     match sched.task_get(target_task) {
-        Some(t) if t.active => t.pgid as u64,
+        Some(t) if t.active => {
+            // Return group leader's task port_id (not raw task_id).
+            sched.task(t.pgid).port_id
+        }
         _ => u64::MAX,
     }
 }
@@ -1736,7 +1739,8 @@ pub fn setsid() -> u64 {
     sched.task_mut(my_task).sid = my_task;
     sched.task_mut(my_task).pgid = my_task;
     sched.task_mut(my_task).ctty_port = 0;
-    my_task as u64
+    // Return own task port_id as the new session ID.
+    sched.task(my_task).port_id
 }
 
 /// Get the session ID of a task.
@@ -1750,7 +1754,10 @@ pub fn getsid(pid: u32) -> u64 {
         pid
     };
     match sched.task_get(target_task) {
-        Some(t) if t.active => t.sid as u64,
+        Some(t) if t.active => {
+            // Return session leader's task port_id.
+            sched.task(t.sid).port_id
+        }
         _ => u64::MAX,
     }
 }
@@ -1797,15 +1804,20 @@ pub fn tcgetpgrp() -> u64 {
     if sched.task(my_task).ctty_port == 0 { return u64::MAX; }
 
     let my_sid = sched.task(my_task).sid;
-    let mut result = u64::MAX;
+    let mut raw_pgid = u32::MAX;
     sched.task_art.for_each(|_key, val| {
-        if result != u64::MAX { return; }
+        if raw_pgid != u32::MAX { return; }
         let t = unsafe { &*(val as *const Task) };
         if t.active && t.id == my_sid {
-            result = t.fg_pgid as u64;
+            raw_pgid = t.fg_pgid;
         }
     });
-    result
+    if raw_pgid == u32::MAX || raw_pgid == 0 {
+        u64::MAX
+    } else {
+        // Return group leader's task port_id.
+        sched.task(raw_pgid).port_id
+    }
 }
 
 /// Send a signal to all tasks in a process group.
@@ -2114,9 +2126,8 @@ pub fn fork_current() -> u64 {
         caps.grant_port_cap(child_task_id, child_thread_port, srm);
     }
 
-    // Return child thread ID to parent (nonzero = parent, 0 = child).
-    // This matches the waitpid API which takes a thread ID.
-    child_tid as u64
+    // Return child task port_id to parent (nonzero = parent, 0 = child).
+    child_task_port
 }
 
 /// Terminate the current thread and destroy its task's resources.
@@ -2210,10 +2221,9 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         }
     }
 
-    // Destroy the task's kernel-held port.
-    if is_last_thread && task_port != 0 {
-        crate::ipc::port::destroy(task_port);
-    }
+    // NOTE: Do NOT destroy the task port here — the parent still needs it
+    // to call waitpid/wait4 (which resolve port_id → task_id). The task
+    // port is destroyed when the zombie is reaped.
 
     // Auto-reap zombie children of this exiting task (prevent zombie leaks).
     if is_last_thread {
@@ -2221,14 +2231,26 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
             let sched = SCHEDULER.lock();
             sched.thread(tid).task_id
         };
-        let mut sched = SCHEDULER.lock();
-        sched.task_art.for_each(|key, val| {
-            if key == 0 { return; }
-            let task = unsafe { &mut *(val as *mut Task) };
-            if task.parent_task == my_task_id && task.exited && !task.reaped {
-                task.reaped = true;
-            }
-        });
+        let mut zombie_ports = [0u64; 32];
+        let mut nz = 0usize;
+        {
+            let mut sched = SCHEDULER.lock();
+            sched.task_art.for_each(|key, val| {
+                if key == 0 { return; }
+                let task = unsafe { &mut *(val as *mut Task) };
+                if task.parent_task == my_task_id && task.exited && !task.reaped {
+                    task.reaped = true;
+                    if task.port_id != 0 && nz < 32 {
+                        zombie_ports[nz] = task.port_id;
+                        task.port_id = 0;
+                        nz += 1;
+                    }
+                }
+            });
+        } // SCHEDULER dropped
+        for i in 0..nz {
+            crate::ipc::port::destroy(zombie_ports[i]);
+        }
     }
 
     // Defer freeing our own kernel stack — we're running on it.
@@ -2382,19 +2404,25 @@ fn arch_send_event() {
 
 /// Check if a child thread's task has exited. Returns exit code if so.
 /// Also reaps the child (marks reaped=true) so the task slot can be reused.
-pub fn waitpid(child_tid: ThreadId) -> Option<i32> {
-    let mut sched = SCHEDULER.lock();
-    let task_id = match sched.thread_get(child_tid) {
-        Some(t) => t.task_id,
-        None => return None,
-    };
-    let task = sched.task_mut(task_id);
-    if task.exited {
-        task.reaped = true;
-        Some(task.exit_code)
-    } else {
-        None
+pub fn waitpid(child_task_id: TaskId) -> Option<i32> {
+    let (code, port_id) = {
+        let mut sched = SCHEDULER.lock();
+        let task = match sched.task_get(child_task_id) {
+            Some(t) => t,
+            None => return None,
+        };
+        if !task.exited { return None; }
+        let port_id = task.port_id;
+        let code = task.exit_code;
+        let t = sched.task_mut(child_task_id);
+        t.reaped = true;
+        t.port_id = 0; // prevent double-destroy
+        (code, port_id)
+    }; // SCHEDULER dropped
+    if port_id != 0 {
+        crate::ipc::port::destroy(port_id);
     }
+    Some(code)
 }
 
 /// POSIX wait flags.
@@ -2435,9 +2463,9 @@ fn wake_wait_child_threads(task_id: TaskId) {
 ///   - pid == 0: wait for any child in caller's process group
 ///   - pid < -1: wait for any child in process group |pid|
 ///
-/// Returns (child_task_id, wait_status) or (-1, 0) on error,
-/// or (0, 0) for WNOHANG with no exited child.
-pub fn wait4(pid: i64, flags: u32) -> (i32, i32) {
+/// Returns (child_task_port_id, child_task_id, wait_status) or (0, -1, 0) on error,
+/// or (0, 0, 0) for WNOHANG with no exited child.
+pub fn wait4(pid: i64, flags: u32) -> (u64, i32, i32) {
     let tid = current_thread_id();
 
     loop {
@@ -2472,13 +2500,21 @@ pub fn wait4(pid: i64, flags: u32) -> (i32, i32) {
 
             if let Some((child_id, status)) = found {
                 // Reap the child.
-                sched.task_mut(child_id).reaped = true;
-                Some((child_id as i32, status))
+                let t = sched.task_mut(child_id);
+                t.reaped = true;
+                let port_id = t.port_id;
+                t.port_id = 0; // prevent double-destroy
+                // Destroy task port outside SCHEDULER lock.
+                drop(sched);
+                if port_id != 0 {
+                    crate::ipc::port::destroy(port_id);
+                }
+                Some((port_id, child_id as i32, status))
             } else if !has_children {
                 // No matching children at all — ECHILD.
-                Some((-1, 0))
+                Some((0, -1, 0))
             } else if flags & WNOHANG != 0 {
-                Some((0, 0))
+                Some((0, 0, 0))
             } else {
                 // Block: clear wakeup flag while holding the lock.
                 clear_wakeup_flag(tid);

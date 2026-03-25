@@ -36,7 +36,7 @@ const PAGE_SIZE: usize = 4096;
 enum VFile {
     Meminfo,
     Uptime,
-    Status(u32),
+    Status(u64),
 }
 
 #[derive(Clone, Copy)]
@@ -119,7 +119,7 @@ fn name_eq(name: &[u8], nlen: usize, s: &[u8]) -> bool {
 }
 
 /// Parse "N/status" where N is a decimal task ID. Returns Some(task_id) or None.
-fn parse_pid_status(name: &[u8], nlen: usize) -> Option<u32> {
+fn parse_pid_status(name: &[u8], nlen: usize) -> Option<u64> {
     // Find the '/' separator.
     let mut slash = usize::MAX;
     for i in 0..nlen {
@@ -134,11 +134,11 @@ fn parse_pid_status(name: &[u8], nlen: usize) -> Option<u32> {
         if name[slash + 1 + i] != status[i] { return None; }
     }
     // Parse decimal PID.
-    let mut pid: u32 = 0;
+    let mut pid: u64 = 0;
     for i in 0..slash {
         let ch = name[i];
         if ch < b'0' || ch > b'9' { return None; }
-        pid = pid.wrapping_mul(10).wrapping_add((ch - b'0') as u32);
+        pid = pid.wrapping_mul(10).wrapping_add((ch - b'0') as u64);
     }
     Some(pid)
 }
@@ -171,7 +171,7 @@ fn gen_uptime(buf: &mut [u8]) -> usize {
 }
 
 /// Generate per-process status content.
-fn gen_status(buf: &mut [u8], task_id: u32) -> usize {
+fn gen_status(buf: &mut [u8], task_id: u64) -> usize {
     match syscall::proc_info(task_id) {
         Some((ppid_threads, uid_gid, pgid_sid, pages_state)) => {
             let ppid = (ppid_threads & 0xFFFF_FFFF) as u32;
@@ -268,7 +268,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
                 } else {
                     syscall::send(reply_port, FS_OPEN_OK,
-                        h, handles[h as usize].buf_len as u64, my_aspace as u64, 0);
+                        h, handles[h as usize].buf_len as u64, my_aspace, 0);
                 }
             }
 
@@ -354,7 +354,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if tid != 0 {
                             // Format PID as name.
                             let mut nbuf = [0u8; 8];
-                            let nlen = u64_to_dec(tid as u64, &mut nbuf);
+                            let nlen = u64_to_dec(tid, &mut nbuf);
                             let name_lo = pack_name_lo(&nbuf[..nlen]);
                             syscall::send(reply_port, FS_READDIR_OK,
                                 0, name_lo, 0, (slot + 3) as u64);

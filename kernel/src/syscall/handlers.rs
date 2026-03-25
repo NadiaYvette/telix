@@ -117,6 +117,18 @@ pub const SYS_PROXY_REGISTER: u64 = 99;
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
 
+/// Resolve a task port_id to the internal task_id.
+fn resolve_task_port(port_id: u64) -> Option<u32> {
+    if port_id == 0 { return None; }
+    crate::sched::task_id_from_port(port_id)
+}
+
+/// Resolve a thread port_id to the internal thread_id.
+fn resolve_thread_port(port_id: u64) -> Option<u32> {
+    if port_id == 0 { return None; }
+    crate::sched::thread_id_from_port(port_id)
+}
+
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
 fn syscall_nr(frame: &ExceptionFrame) -> u64 {
@@ -249,7 +261,12 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SA_GETID => crate::sched::sa_getid(),
         SYS_COSCHED_SET => { crate::sched::cosched_set(a0 as u32); 0 }
         SYS_SET_AFFINITY => sys_set_affinity(a0, a1),
-        SYS_GET_AFFINITY => crate::sched::get_affinity(a0 as u32),
+        SYS_GET_AFFINITY => {
+            match resolve_thread_port(a0) {
+                Some(tid) => crate::sched::get_affinity(tid),
+                None => u64::MAX,
+            }
+        },
         SYS_CPU_TOPOLOGY => sys_cpu_topology(a0),
         SYS_TRACE_CTRL => crate::trace::trace_ctrl(a0),
         SYS_TRACE_READ => {
@@ -275,21 +292,24 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_MPROTECT => sys_mprotect(a0, a1, a2),
         SYS_MREMAP => sys_mremap(a0, a1, a2),
         SYS_SETPGID => {
-            // User passes thread_id (from fork); convert to task_id. 0 = self.
-            let pid = if a0 != 0 { crate::sched::thread_task_id(a0 as u32) } else { 0 };
-            let pgid = if a1 != 0 { crate::sched::thread_task_id(a1 as u32) } else { 0 };
+            // User passes task port_id. 0 = self.
+            let pid = if a0 != 0 { match resolve_task_port(a0) { Some(t) => t, None => { set_return(frame, u64::MAX); return; } } } else { 0 };
+            let pgid = if a1 != 0 { match resolve_task_port(a1) { Some(t) => t, None => { set_return(frame, u64::MAX); return; } } } else { 0 };
             crate::sched::setpgid(pid, pgid)
         },
         SYS_GETPGID => {
-            let pid = if a0 != 0 { crate::sched::thread_task_id(a0 as u32) } else { 0 };
+            let pid = if a0 != 0 { match resolve_task_port(a0) { Some(t) => t, None => { set_return(frame, u64::MAX); return; } } } else { 0 };
             crate::sched::getpgid(pid)
         },
         SYS_SETSID => crate::sched::setsid(),
         SYS_GETSID => {
-            let pid = if a0 != 0 { crate::sched::thread_task_id(a0 as u32) } else { 0 };
+            let pid = if a0 != 0 { match resolve_task_port(a0) { Some(t) => t, None => { set_return(frame, u64::MAX); return; } } } else { 0 };
             crate::sched::getsid(pid)
         },
-        SYS_TCSETPGRP => crate::sched::tcsetpgrp(a0 as u32),
+        SYS_TCSETPGRP => {
+            let pgid = match resolve_task_port(a0) { Some(t) => t, None => { set_return(frame, u64::MAX); return; } };
+            crate::sched::tcsetpgrp(pgid)
+        },
         SYS_TCGETPGRP => crate::sched::tcgetpgrp(),
         SYS_SET_CTTY => crate::sched::set_ctty(a0),
         SYS_CLOCK_GETTIME => sys_clock_gettime(a0),
@@ -700,7 +720,7 @@ fn sys_yield_block() -> u64 {
 }
 
 fn sys_thread_id() -> u64 {
-    crate::sched::scheduler::current_thread_id() as u64
+    crate::sched::thread_port_id(crate::sched::scheduler::current_thread_id())
 }
 
 fn sys_exit(code: u64) -> u64 {
@@ -708,19 +728,27 @@ fn sys_exit(code: u64) -> u64 {
     // unreachable
 }
 
-fn sys_waitpid(child_tid: u64) -> u64 {
-    match crate::sched::scheduler::waitpid(child_tid as u32) {
+fn sys_waitpid(child_port: u64) -> u64 {
+    let child_task = match resolve_task_port(child_port) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
+    match crate::sched::scheduler::waitpid(child_task) {
         Some(code) => code as u64,
         None => u64::MAX,
     }
 }
 
-fn sys_kill(tid: u64) -> u64 {
-    if crate::sched::scheduler::kill_task(tid as u32) { 0 } else { u64::MAX }
+fn sys_kill(port_id: u64) -> u64 {
+    let task_id = match resolve_task_port(port_id) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
+    if crate::sched::scheduler::kill_task(task_id) { 0 } else { u64::MAX }
 }
 
 fn sys_getpid() -> u64 {
-    crate::sched::scheduler::current_task_id() as u64
+    crate::sched::task_port_id(crate::sched::current_task_id())
 }
 
 fn sys_get_cycles() -> u64 {
@@ -775,7 +803,10 @@ fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64, arg0: u64) -> u64 {
 
     let name = &buf[..len];
     match crate::sched::scheduler::spawn_user(name, priority as u8, 20, arg0) {
-        Some(tid) => tid as u64,
+        Some(tid) => {
+            let task_id = crate::sched::thread_task_id(tid);
+            crate::sched::task_port_id(task_id)
+        }
         None => u64::MAX,
     }
 }
@@ -952,15 +983,24 @@ fn sys_munmap(va: u64) -> u64 {
     }
 }
 
-fn sys_grant_pages(dst_aspace: u64, src_va: u64, dst_va: u64, page_count: u64, readonly: u64) -> u64 {
+fn sys_grant_pages(dst_port: u64, src_va: u64, dst_va: u64, page_count: u64, readonly: u64) -> u64 {
     let my_aspace = crate::sched::scheduler::current_aspace_id();
     if my_aspace == 0 {
         return u64::MAX;
     }
+    // Resolve destination task port to its aspace_id.
+    let dst_task = match resolve_task_port(dst_port) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
+    let dst_aspace = {
+        let sched = crate::sched::scheduler::SCHEDULER.lock();
+        sched.task(dst_task).aspace_id
+    };
     match crate::mm::grant::grant_pages(
         my_aspace,
         src_va as usize,
-        dst_aspace as u32,
+        dst_aspace,
         dst_va as usize,
         page_count as usize,
         readonly != 0,
@@ -970,13 +1010,21 @@ fn sys_grant_pages(dst_aspace: u64, src_va: u64, dst_va: u64, page_count: u64, r
     }
 }
 
-fn sys_revoke(dst_aspace: u64, dst_va: u64) -> u64 {
-    crate::mm::grant::revoke_grant(dst_aspace as u32, dst_va as usize);
+fn sys_revoke(dst_port: u64, dst_va: u64) -> u64 {
+    let dst_task = match resolve_task_port(dst_port) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
+    let dst_aspace = {
+        let sched = crate::sched::scheduler::SCHEDULER.lock();
+        sched.task(dst_task).aspace_id
+    };
+    crate::mm::grant::revoke_grant(dst_aspace, dst_va as usize);
     0
 }
 
 fn sys_aspace_id() -> u64 {
-    crate::sched::scheduler::current_aspace_id() as u64
+    crate::sched::task_port_id(crate::sched::current_task_id())
 }
 
 fn sys_get_initramfs_port() -> u64 {
@@ -1185,7 +1233,10 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
     }
 
     match crate::sched::spawn_user_from_elf(buf, priority as u8, 20, arg0) {
-        Some(tid) => tid as u64,
+        Some(tid) => {
+            let task_id = crate::sched::thread_task_id(tid);
+            crate::sched::task_port_id(task_id)
+        }
         None => u64::MAX,
     }
 }
@@ -1590,23 +1641,29 @@ fn sys_thread_create(entry: u64, stack_top: u64, arg: u64) -> u64 {
         drop(sched);
     }
     match crate::sched::thread_create(task_id, entry, stack_top, arg) {
-        Some(child_tid) => child_tid as u64,
+        Some(child_tid) => crate::sched::thread_port_id(child_tid),
         None => u64::MAX,
     }
 }
 
 /// Block until target thread exits. Returns exit code, or u64::MAX on error.
-fn sys_thread_join(tid: u64) -> u64 {
+fn sys_thread_join(port_id: u64) -> u64 {
+    let tid = match resolve_thread_port(port_id) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
     let caller_task = crate::sched::scheduler::current_task_id();
-    crate::sched::thread_join_block(tid as u32, caller_task)
+    crate::sched::thread_join_block(tid, caller_task)
 }
 
-fn sys_set_quota(child_tid: u64, resource_type: u64, limit: u64) -> u64 {
+fn sys_set_quota(child_port: u64, resource_type: u64, limit: u64) -> u64 {
     let caller = crate::sched::current_task_id();
-    // Resolve thread_id to task_id.
-    let child_task = crate::sched::thread_task_id(child_tid as u32);
+    let child_task = match resolve_task_port(child_port) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
     let mut sched = crate::sched::scheduler::SCHEDULER.lock();
-    let task = match sched.task_get(child_task as u32) {
+    let task = match sched.task_get(child_task) {
         Some(t) => t,
         None => return u64::MAX,
     };
@@ -1615,9 +1672,9 @@ fn sys_set_quota(child_tid: u64, resource_type: u64, limit: u64) -> u64 {
     }
     let limit32 = limit as u32;
     match resource_type {
-        0 => sched.task_mut(child_task as u32).max_ports = limit32,
-        1 => sched.task_mut(child_task as u32).max_threads = limit32,
-        2 => sched.task_mut(child_task as u32).max_pages = limit32,
+        0 => sched.task_mut(child_task).max_ports = limit32,
+        1 => sched.task_mut(child_task).max_threads = limit32,
+        2 => sched.task_mut(child_task).max_pages = limit32,
         _ => return u64::MAX,
     }
     0
@@ -1749,7 +1806,7 @@ fn sys_proc_list(index: u64) -> u64 {
         let task = unsafe { &*(val as *const crate::sched::task::Task) };
         if task.active {
             if i == index {
-                result = task.id as u64;
+                result = task.port_id;
             }
             i += 1;
         }
@@ -1758,9 +1815,13 @@ fn sys_proc_list(index: u64) -> u64 {
 }
 
 /// Query process metadata. Returns packed info via multi-return registers.
-fn sys_proc_info(task_id: u64, frame: &mut ExceptionFrame) -> u64 {
+fn sys_proc_info(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
+    let task_id = match resolve_task_port(port_id) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
     let sched = crate::sched::scheduler::SCHEDULER.lock();
-    let task = match sched.task_get(task_id as u32) {
+    let task = match sched.task_get(task_id) {
         Some(t) => t,
         None => return u64::MAX,
     };
@@ -1869,13 +1930,17 @@ pub(crate) fn copy_to_user(pt_root: usize, user_va: usize, src: &[u8]) -> bool {
 // --- Phase 32: Topology-aware scheduling syscalls ---
 
 /// Set CPU affinity mask for a thread (must be in the same task).
-fn sys_set_affinity(tid: u64, mask: u64) -> u64 {
+fn sys_set_affinity(port_id: u64, mask: u64) -> u64 {
+    let tid = match resolve_thread_port(port_id) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
     let caller_task = crate::sched::current_task_id();
-    let target_task = crate::sched::thread_task_id(tid as u32);
+    let target_task = crate::sched::thread_task_id(tid);
     if target_task != caller_task {
         return u64::MAX;
     }
-    if crate::sched::set_affinity(tid as u32, mask) { 0 } else { u64::MAX }
+    if crate::sched::set_affinity(tid, mask) { 0 } else { u64::MAX }
 }
 
 /// Query CPU topology for a given CPU index.
@@ -2108,17 +2173,19 @@ fn sys_fault_complete(token: u64, data_va: u64, data_len: u64) -> u64 {
 fn sys_kill_sig(target: u64, sig: u64) -> u64 {
     let target_i64 = target as i64;
     if target_i64 < 0 {
-        // Send to process group. User passes thread_id; convert to task_id for pgid.
-        let raw = (-target_i64) as u32;
-        let pgid = if (raw as usize) < crate::sched::thread::THREAD_SLOTS {
-            crate::sched::thread_task_id(raw)
-        } else {
-            // Not a valid thread_id; treat as raw task_id (pgid).
-            raw
+        // Negative target: send to process group. Negate to get group leader's task port_id.
+        let leader_port = (-target_i64) as u64;
+        let leader_task = match resolve_task_port(leader_port) {
+            Some(t) => t,
+            None => return u64::MAX,
         };
-        if crate::sched::send_signal_to_pgroup(pgid, sig as u32) { 0 } else { u64::MAX }
+        // The leader's task_id is used as the pgid.
+        if crate::sched::send_signal_to_pgroup(leader_task, sig as u32) { 0 } else { u64::MAX }
     } else {
-        let task_id = crate::sched::thread_task_id(target as u32);
+        let task_id = match resolve_task_port(target) {
+            Some(t) => t,
+            None => return u64::MAX,
+        };
         if crate::sched::send_signal_to_task(task_id, sig as u32) { 0 } else { u64::MAX }
     }
 }
@@ -2381,12 +2448,33 @@ fn sys_setgroups(count: u64, groups_ptr: u64) -> u64 {
 /// getgroups: get supplementary group list.
 /// a0 = max count (0 = just return count), a1 = pointer to u32 array.
 fn sys_wait4(pid: u64, flags: u64, frame: &mut ExceptionFrame) -> u64 {
-    let (child_id, status) = crate::sched::scheduler::wait4(pid as i64, flags as u32);
+    // Convert port_id-based pid to internal task_id-based pid for wait4.
+    let internal_pid = if pid == u64::MAX || pid as i64 == -1 {
+        -1i64 // any child
+    } else if pid == 0 {
+        0i64 // same pgroup
+    } else if (pid as i64) < 0 {
+        // Negative port_id: specific pgroup leader
+        let leader_port = (-(pid as i64)) as u64;
+        match resolve_task_port(leader_port) {
+            Some(t) => -(t as i64),
+            None => { set_return(frame, u64::MAX); return u64::MAX; }
+        }
+    } else {
+        // Positive: specific child task port_id
+        match resolve_task_port(pid) {
+            Some(t) => t as i64,
+            None => { set_return(frame, u64::MAX); return u64::MAX; }
+        }
+    };
+    let (child_port, child_id, status) = crate::sched::scheduler::wait4(internal_pid, flags as u32);
     set_reg(frame, 1, status as u64);
     if child_id < 0 {
         u64::MAX // ECHILD
+    } else if child_id == 0 {
+        0 // WNOHANG, no child ready
     } else {
-        child_id as u64
+        child_port
     }
 }
 
@@ -2445,11 +2533,14 @@ fn sys_prlimit(pid: u64, resource: u64, new_cur: u64, new_max: u64, frame: &mut 
     let caller_task_id = sched.thread(tid).task_id;
     let euid = sched.task(caller_task_id).euid;
 
-    // Resolve target: pid=0 means self.
+    // Resolve target: pid=0 means self, otherwise it's a task port_id.
     let target_task_id = if pid == 0 {
         caller_task_id
     } else {
-        let p = pid as u32;
+        let p = match resolve_task_port(pid) {
+            Some(t) => t,
+            None => return u64::MAX,
+        };
         let target = match sched.task_get(p) {
             Some(t) => t,
             None => return u64::MAX,

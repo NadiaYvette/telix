@@ -120,7 +120,7 @@ struct PtyPair {
     ws_row: u16,
     ws_col: u16,
     // Foreground process group.
-    fg_pgrp: u32,
+    fg_pgrp: u64,
     // Blocked readers (deferred reply).
     master_reader: u64,
     slave_reader: u64,
@@ -544,7 +544,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         reply(reply_port, PTY_IOCTL_OK, p.fg_pgrp as u64, 0, 0, 0);
                     }
                     TIOCSPGRP => {
-                        p.fg_pgrp = msg.data[1] as u32;
+                        p.fg_pgrp = msg.data[1];
                         reply(reply_port, PTY_IOCTL_OK, 0, 0, 0, 0);
                     }
                     _ => {

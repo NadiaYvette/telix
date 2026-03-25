@@ -314,7 +314,7 @@ fn ext2_try_wake_waiters(
 
 struct BlkClient {
     blk_port: u64,
-    blk_aspace: u32,
+    blk_aspace: u64,
     reply_port: u64,
     scratch_va: usize,
     grant_va: usize,
@@ -1083,7 +1083,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
     let blk_aspace = if let Some(reply) = syscall::recv_msg(blk_reply) {
         if reply.tag == IO_CONNECT_OK {
-            reply.data[2] as u32
+            reply.data[2]
         } else {
             syscall::debug_puts(b"  [ext2_srv] blk connect FAILED\n");
             loop { core::hint::spin_loop(); }

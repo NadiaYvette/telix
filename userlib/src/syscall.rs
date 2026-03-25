@@ -132,9 +132,9 @@ pub fn spawn(name: &[u8], priority: u8) -> u64 {
     unsafe { arch::syscall4(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, priority as u64, 0) }
 }
 
-/// Wait for a child thread to exit. Returns Some(exit_code) or None.
-pub fn waitpid(child_tid: u64) -> Option<u64> {
-    let r = unsafe { arch::syscall1(SYS_WAITPID, child_tid) };
+/// Wait for a child task to exit (by task port_id). Returns Some(exit_code) or None.
+pub fn waitpid(child_port: u64) -> Option<u64> {
+    let r = unsafe { arch::syscall1(SYS_WAITPID, child_port) };
     if r == u64::MAX { None } else { Some(r) }
 }
 
@@ -157,21 +157,21 @@ pub fn munmap(va: usize) -> bool {
     r == 0
 }
 
-/// Grant pages from our address space to another.
-pub fn grant_pages(dst_aspace: u32, src_va: usize, dst_va: usize, page_count: usize, readonly: bool) -> bool {
-    let r = unsafe { arch::syscall5(SYS_GRANT_PAGES, dst_aspace as u64, src_va as u64, dst_va as u64, page_count as u64, readonly as u64) };
+/// Grant pages from our address space to another task (identified by task port_id).
+pub fn grant_pages(dst_task: u64, src_va: usize, dst_va: usize, page_count: usize, readonly: bool) -> bool {
+    let r = unsafe { arch::syscall5(SYS_GRANT_PAGES, dst_task, src_va as u64, dst_va as u64, page_count as u64, readonly as u64) };
     r == 0
 }
 
-/// Revoke a grant.
-pub fn revoke(dst_aspace: u32, dst_va: usize) -> bool {
-    let r = unsafe { arch::syscall2(SYS_REVOKE, dst_aspace as u64, dst_va as u64) };
+/// Revoke a grant to another task (identified by task port_id).
+pub fn revoke(dst_task: u64, dst_va: usize) -> bool {
+    let r = unsafe { arch::syscall2(SYS_REVOKE, dst_task, dst_va as u64) };
     r == 0
 }
 
-/// Get our address space ID.
-pub fn aspace_id() -> u32 {
-    unsafe { arch::syscall0(SYS_ASPACE_ID) as u32 }
+/// Get our task port_id (replaces aspace_id — aspace is accessed through the task).
+pub fn aspace_id() -> u64 {
+    unsafe { arch::syscall0(SYS_ASPACE_ID) }
 }
 
 /// Spawn a new process with an argument passed to main().
@@ -192,15 +192,15 @@ pub fn thread_create(entry: u64, stack_top: u64, arg: u64) -> u64 {
 }
 
 /// Poll: check if a thread has exited. Returns Some(exit_code) or None.
-pub fn thread_join_poll(tid: u32) -> Option<i64> {
-    let r = unsafe { arch::syscall1(SYS_THREAD_JOIN, tid as u64) };
+pub fn thread_join_poll(tid: u64) -> Option<i64> {
+    let r = unsafe { arch::syscall1(SYS_THREAD_JOIN, tid) };
     if r == u64::MAX { None } else { Some(r as i64) }
 }
 
-/// Block until a thread exits. Returns its exit code.
+/// Block until a thread exits (by thread port_id). Returns its exit code.
 /// The kernel blocks the caller until the target thread exits.
-pub fn thread_join(tid: u32) -> i64 {
-    unsafe { arch::syscall1(SYS_THREAD_JOIN, tid as u64) as i64 }
+pub fn thread_join(tid: u64) -> i64 {
+    unsafe { arch::syscall1(SYS_THREAD_JOIN, tid) as i64 }
 }
 
 /// Block if the u32 at `addr` equals `expected`. Returns 0 on wake, 1 on value mismatch.
@@ -213,14 +213,14 @@ pub fn futex_wake(addr: *const u32, count: u32) -> u64 {
     unsafe { arch::syscall2(SYS_FUTEX_WAKE, addr as u64, count as u64) }
 }
 
-/// Kill all threads in the task that `tid` belongs to. Returns true on success.
-pub fn kill(tid: u32) -> bool {
-    unsafe { arch::syscall1(SYS_KILL, tid as u64) == 0 }
+/// Kill all threads in a task (identified by task port_id). Returns true on success.
+pub fn kill(port_id: u64) -> bool {
+    unsafe { arch::syscall1(SYS_KILL, port_id) == 0 }
 }
 
-/// Get the current process (task) ID.
-pub fn getpid() -> u32 {
-    unsafe { arch::syscall0(SYS_GETPID) as u32 }
+/// Get the current task's port ID.
+pub fn getpid() -> u64 {
+    unsafe { arch::syscall0(SYS_GETPID) }
 }
 
 /// Read the hardware cycle/timer counter.
@@ -570,8 +570,8 @@ const SYS_SET_QUOTA: u64 = 38;
 
 /// Set a resource quota on a child task.
 /// resource_type: 0=ports, 1=threads, 2=pages. Returns true on success.
-pub fn set_quota(child_task: u32, resource_type: u32, limit: u32) -> bool {
-    unsafe { arch::syscall3(SYS_SET_QUOTA, child_task as u64, resource_type as u64, limit as u64) == 0 }
+pub fn set_quota(child_port: u64, resource_type: u32, limit: u32) -> bool {
+    unsafe { arch::syscall3(SYS_SET_QUOTA, child_port, resource_type as u64, limit as u64) == 0 }
 }
 
 const SYS_EXECVE: u64 = 54;
@@ -585,8 +585,8 @@ const SYS_SEND_CAP: u64 = 40;
 #[allow(dead_code)]
 const SYS_CAP_REVOKE: u64 = 41;
 
-/// Fork the current process. Returns child task ID to parent (>0),
-/// 0 to the child, or 0 on failure.
+/// Fork the current process. Returns child task port_id to parent (>0),
+/// 0 to the child, or u64::MAX on failure.
 pub fn fork() -> u64 {
     unsafe { arch::syscall0(SYS_FORK) }
 }
@@ -661,9 +661,10 @@ pub fn sigpending() -> u64 {
     unsafe { arch::syscall0(SYS_SIGPENDING) }
 }
 
-/// Send a specific signal to a task (identified by any thread ID in it).
-pub fn kill_sig(tid: u32, sig: u32) -> bool {
-    unsafe { arch::syscall2(SYS_KILL_SIG, tid as u64, sig as u64) == 0 }
+/// Send a specific signal to a task (identified by task port_id).
+/// Negative port_id targets a process group.
+pub fn kill_sig(port_id: u64, sig: u32) -> bool {
+    unsafe { arch::syscall2(SYS_KILL_SIG, port_id, sig as u64) == 0 }
 }
 
 /// Send a message with an attached capability transfer.
@@ -723,15 +724,15 @@ pub fn cosched_set(group: u32) {
     unsafe { arch::syscall1(SYS_COSCHED_SET, group as u64); }
 }
 
-/// Set CPU affinity mask for a thread. Returns true on success.
-pub fn set_affinity(tid: u32, mask: u64) -> bool {
-    let r = unsafe { arch::syscall2(SYS_SET_AFFINITY, tid as u64, mask) };
+/// Set CPU affinity mask for a thread (identified by thread port_id). Returns true on success.
+pub fn set_affinity(tid: u64, mask: u64) -> bool {
+    let r = unsafe { arch::syscall2(SYS_SET_AFFINITY, tid, mask) };
     r == 0
 }
 
-/// Get CPU affinity mask for a thread.
-pub fn get_affinity(tid: u32) -> u64 {
-    unsafe { arch::syscall1(SYS_GET_AFFINITY, tid as u64) }
+/// Get CPU affinity mask for a thread (identified by thread port_id).
+pub fn get_affinity(tid: u64) -> u64 {
+    unsafe { arch::syscall1(SYS_GET_AFFINITY, tid) }
 }
 
 /// Query CPU topology for a given CPU index.
@@ -798,15 +799,15 @@ pub fn mremap(old_addr: usize, old_len: usize, new_len: usize) -> Option<usize> 
 }
 
 /// Set the process group ID. pid=0 means self, pgid=0 means set pgid=pid.
-/// Returns true on success.
-pub fn setpgid(pid: u32, pgid: u32) -> bool {
-    unsafe { arch::syscall2(SYS_SETPGID, pid as u64, pgid as u64) == 0 }
+/// Both pid and pgid are task port_ids. Returns true on success.
+pub fn setpgid(pid: u64, pgid: u64) -> bool {
+    unsafe { arch::syscall2(SYS_SETPGID, pid, pgid) == 0 }
 }
 
-/// Get the process group ID. pid=0 means self.
-/// Returns the pgid, or u64::MAX on error.
-pub fn getpgid(pid: u32) -> u64 {
-    unsafe { arch::syscall1(SYS_GETPGID, pid as u64) }
+/// Get the process group ID (as task port_id of group leader). pid=0 means self.
+/// Returns the group leader's port_id, or u64::MAX on error.
+pub fn getpgid(pid: u64) -> u64 {
+    unsafe { arch::syscall1(SYS_GETPGID, pid) }
 }
 
 /// Create a new session. Returns the new session ID or u64::MAX on error.
@@ -814,14 +815,15 @@ pub fn setsid() -> u64 {
     unsafe { arch::syscall0(SYS_SETSID) }
 }
 
-/// Get the session ID. pid=0 means self.
-pub fn getsid(pid: u32) -> u64 {
-    unsafe { arch::syscall1(SYS_GETSID, pid as u64) }
+/// Get the session ID (as task port_id of session leader). pid=0 means self.
+pub fn getsid(pid: u64) -> u64 {
+    unsafe { arch::syscall1(SYS_GETSID, pid) }
 }
 
 /// Set the foreground process group for the controlling terminal.
-pub fn tcsetpgrp(pgid: u32) -> bool {
-    unsafe { arch::syscall1(SYS_TCSETPGRP, pgid as u64) == 0 }
+/// pgid is a task port_id of the group leader.
+pub fn tcsetpgrp(pgid: u64) -> bool {
+    unsafe { arch::syscall1(SYS_TCSETPGRP, pgid) == 0 }
 }
 
 /// Get the foreground process group for the controlling terminal.
@@ -836,7 +838,8 @@ pub fn set_ctty(port: u64) -> bool {
 }
 
 /// Send a signal to a process group. Equivalent to kill(-pgid, sig).
-pub fn kill_pgroup(pgid: u32, sig: u32) -> bool {
+/// pgid is the task port_id of the process group leader.
+pub fn kill_pgroup(pgid: u64, sig: u32) -> bool {
     let neg_pgid = (-(pgid as i64)) as u64;
     unsafe { arch::syscall2(SYS_KILL_SIG, neg_pgid, sig as u64) == 0 }
 }
@@ -1025,13 +1028,13 @@ pub const fn wtermsig(status: i32) -> i32 { status & 0x7F }
 ///
 /// `pid` semantics:
 ///   -1: wait for any child
-///   >0: wait for specific child task_id
+///   >0: wait for specific child (task port_id)
 ///    0: wait for any child in caller's pgroup
-///   <-1: wait for child in pgroup |pid|
+///   <-1: wait for child in pgroup with leader port_id |pid|
 ///
-/// Returns (child_task_id, wait_status) or None on ECHILD.
+/// Returns (child_task_port_id, wait_status) or None on ECHILD.
 /// With WNOHANG: returns Some((0, 0)) if no child ready.
-pub fn wait4(pid: i64, flags: u32) -> Option<(u32, i32)> {
+pub fn wait4(pid: i64, flags: u32) -> Option<(u64, i32)> {
     let r0: u64;
     let r1: u64;
 
@@ -1040,7 +1043,7 @@ pub fn wait4(pid: i64, flags: u32) -> Option<(u32, i32)> {
         core::arch::asm!(
             "svc #0",
             in("x8") SYS_WAIT4,
-            inlateout("x0") pid as u64 => r0,
+            inlateout("x0") pid => r0,
             inlateout("x1") flags as u64 => r1,
         );
     }
@@ -1070,7 +1073,7 @@ pub fn wait4(pid: i64, flags: u32) -> Option<(u32, i32)> {
     if r0 == u64::MAX {
         None // ECHILD
     } else {
-        Some((r0 as u32, r1 as i32))
+        Some((r0, r1 as i32))
     }
 }
 
@@ -1135,7 +1138,7 @@ pub fn setrlimit(resource: u32, soft: u64, hard: u64) -> bool {
 /// Get and optionally set resource limits for a process.
 /// pid=0 means self. new_soft/new_hard = RLIM_INFINITY-1 means "don't change".
 /// Returns (old_soft, old_hard) or None on error.
-pub fn prlimit(pid: u32, resource: u32, new_soft: u64, new_hard: u64) -> Option<(u64, u64)> {
+pub fn prlimit(pid: u64, resource: u32, new_soft: u64, new_hard: u64) -> Option<(u64, u64)> {
     let r0: u64;
     let r1: u64;
     let r2: u64;
@@ -1145,7 +1148,7 @@ pub fn prlimit(pid: u32, resource: u32, new_soft: u64, new_hard: u64) -> Option<
         core::arch::asm!(
             "svc #0",
             in("x8") SYS_PRLIMIT,
-            inlateout("x0") pid as u64 => r0,
+            inlateout("x0") pid => r0,
             inlateout("x1") resource as u64 => r1,
             inlateout("x2") new_soft => r2,
             in("x3") new_hard,
@@ -1183,14 +1186,14 @@ pub fn prlimit(pid: u32, resource: u32, new_soft: u64, new_hard: u64) -> Option<
 
 // --- procfs support syscalls ---
 
-/// Enumerate active tasks. Returns task_id at slot `index`, or 0 if inactive/OOB.
-pub fn proc_list(index: u32) -> u32 {
-    unsafe { arch::syscall1(SYS_PROC_LIST, index as u64) as u32 }
+/// Enumerate active tasks. Returns task port_id at slot `index`, or 0 if inactive/OOB.
+pub fn proc_list(index: u32) -> u64 {
+    unsafe { arch::syscall1(SYS_PROC_LIST, index as u64) }
 }
 
-/// Query process metadata. Returns (ppid_threads, uid_gid, pgid_sid, pages_state).
+/// Query process metadata (by task port_id). Returns (ppid_threads, uid_gid, pgid_sid, pages_state).
 /// Each u64 packs two u32 values: low 32 = first, high 32 = second.
-pub fn proc_info(task_id: u32) -> Option<(u64, u64, u64, u64)> {
+pub fn proc_info(port_id: u64) -> Option<(u64, u64, u64, u64)> {
     let r0: u64;
     let r1: u64;
     let r2: u64;
@@ -1202,7 +1205,7 @@ pub fn proc_info(task_id: u32) -> Option<(u64, u64, u64, u64)> {
         core::arch::asm!(
             "svc #0",
             in("x8") SYS_PROC_INFO,
-            inlateout("x0") task_id as u64 => r0,
+            inlateout("x0") port_id => r0,
             lateout("x1") r1,
             lateout("x2") r2,
             lateout("x3") r3,
@@ -1215,7 +1218,7 @@ pub fn proc_info(task_id: u32) -> Option<(u64, u64, u64, u64)> {
         core::arch::asm!(
             "ecall",
             in("a7") SYS_PROC_INFO as u64,
-            inlateout("a0") task_id as u64 => r0,
+            inlateout("a0") port_id => r0,
             lateout("a1") r1,
             lateout("a2") r2,
             lateout("a3") r3,
@@ -1228,7 +1231,7 @@ pub fn proc_info(task_id: u32) -> Option<(u64, u64, u64, u64)> {
         core::arch::asm!(
             "int 0x80",
             inlateout("rax") SYS_PROC_INFO => r0,
-            inlateout("rdi") task_id as u64 => r1,
+            inlateout("rdi") port_id => r1,
             lateout("rsi") r2,
             lateout("rdx") r3,
             lateout("r10") r4,
@@ -1267,14 +1270,14 @@ fn shm_poll_reply(reply_port: u64) -> Option<Message> {
 
 /// Create or open a named shared memory segment.
 /// Returns (handle, page_count, srv_aspace) on success.
-pub fn shm_create(shm_port: u64, name: &[u8], page_count: usize) -> Option<(u32, usize, u32)> {
+pub fn shm_create(shm_port: u64, name: &[u8], page_count: usize) -> Option<(u32, usize, u64)> {
     let reply_port = port_create();
     let (n0, n1, _) = pack_name(name);
     let d2 = (name.len() as u64) | ((reply_port as u64) << 32);
     send(shm_port, SHM_CREATE_TAG, n0, n1, d2, page_count as u64);
     let result = if let Some(reply) = shm_poll_reply(reply_port) {
         if reply.tag == SHM_OK_TAG {
-            Some((reply.data[0] as u32, reply.data[1] as usize, reply.data[2] as u32))
+            Some((reply.data[0] as u32, reply.data[1] as usize, reply.data[2]))
         } else {
             None
         }
@@ -1287,14 +1290,14 @@ pub fn shm_create(shm_port: u64, name: &[u8], page_count: usize) -> Option<(u32,
 
 /// Open an existing named shared memory segment.
 /// Returns (handle, page_count, srv_aspace) on success.
-pub fn shm_open(shm_port: u64, name: &[u8]) -> Option<(u32, usize, u32)> {
+pub fn shm_open(shm_port: u64, name: &[u8]) -> Option<(u32, usize, u64)> {
     let reply_port = port_create();
     let (n0, n1, _) = pack_name(name);
     let d2 = (name.len() as u64) | ((reply_port as u64) << 32);
     send(shm_port, SHM_OPEN_TAG, n0, n1, d2, 0);
     let result = if let Some(reply) = shm_poll_reply(reply_port) {
         if reply.tag == SHM_OK_TAG {
-            Some((reply.data[0] as u32, reply.data[1] as usize, reply.data[2] as u32))
+            Some((reply.data[0] as u32, reply.data[1] as usize, reply.data[2]))
         } else {
             None
         }
@@ -1308,10 +1311,10 @@ pub fn shm_open(shm_port: u64, name: &[u8]) -> Option<(u32, usize, u32)> {
 /// Map a shared memory segment into the caller's address space.
 /// The server grants pages to `client_aspace` at `dst_va`.
 /// Returns the number of pages mapped on success.
-pub fn shm_map(shm_port: u64, handle: u32, client_aspace: u32, dst_va: usize, readonly: bool) -> Option<usize> {
+pub fn shm_map(shm_port: u64, handle: u32, client_aspace: u64, dst_va: usize, readonly: bool) -> Option<usize> {
     let reply_port = port_create();
     let d2 = ((reply_port as u64) << 32) | (readonly as u64);
-    send(shm_port, SHM_MAP_TAG, handle as u64, client_aspace as u64, d2, dst_va as u64);
+    send(shm_port, SHM_MAP_TAG, handle as u64, client_aspace, d2, dst_va as u64);
     let result = if let Some(reply) = shm_poll_reply(reply_port) {
         if reply.tag == SHM_MAP_OK_TAG {
             Some(reply.data[1] as usize)
@@ -1326,10 +1329,10 @@ pub fn shm_map(shm_port: u64, handle: u32, client_aspace: u32, dst_va: usize, re
 }
 
 /// Unmap a shared memory segment from the caller's address space.
-pub fn shm_unmap(shm_port: u64, handle: u32, client_aspace: u32, dst_va: usize) {
+pub fn shm_unmap(shm_port: u64, handle: u32, client_aspace: u64, dst_va: usize) {
     let reply_port = port_create();
     let d2 = (reply_port as u64) << 32;
-    send(shm_port, SHM_UNMAP_TAG, handle as u64, client_aspace as u64, d2, dst_va as u64);
+    send(shm_port, SHM_UNMAP_TAG, handle as u64, client_aspace, d2, dst_va as u64);
     let _ = shm_poll_reply(reply_port);
     port_destroy(reply_port);
 }

@@ -200,7 +200,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             SHM_MAP => {
                 // d0=handle, d1=client_aspace, d2=(reply_port<<32 | readonly), d3=dst_va
                 let handle = msg.data[0] as usize;
-                let client_aspace = msg.data[1] as u32;
+                let client_aspace = msg.data[1];
                 let dst_va = msg.data[3] as usize;
                 let readonly = (msg.data[2] & 1) != 0;
 
@@ -227,7 +227,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
             SHM_UNMAP => {
                 let handle = msg.data[0] as usize;
-                let client_aspace = msg.data[1] as u32;
+                let client_aspace = msg.data[1];
                 let dst_va = msg.data[3] as usize;
 
                 if handle < MAX_SEGMENTS {
