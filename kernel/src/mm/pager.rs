@@ -5,7 +5,7 @@
 //! the pager thread (if blocked in wait_fault). The pager thread fills the page
 //! and calls fault_complete to install the PTE and wake the faulting thread.
 
-use super::aspace::{self, MAX_ASPACES};
+use super::aspace;
 use super::fault;
 use super::page::{PAGE_SIZE, MMUPAGE_SIZE};
 use super::stats;
@@ -58,9 +58,6 @@ static PAGER_FAULTS: SpinLock<[PagerFaultEntry; MAX_PAGER_FAULTS]> = SpinLock::n
     const EMPTY: PagerFaultEntry = PagerFaultEntry::empty();
     [EMPTY; MAX_PAGER_FAULTS]
 });
-
-/// Per-aspace pager thread ID. Slot = aspace_id % MAX_ASPACES. 0 = none waiting.
-static PAGER_WAITERS: SpinLock<[u32; MAX_ASPACES]> = SpinLock::new([0; MAX_ASPACES]);
 
 /// Record a pending pager fault. Returns a token (slot index) on success.
 /// Called from the fault handler inside with_aspace() — must not park.
@@ -120,15 +117,7 @@ pub fn initiate_fault(token: u32) {
     }
 
     // Path 2: Wake per-aspace pager waiter (backward compat with wait_fault).
-    let slot = (aspace_id as usize) % MAX_ASPACES;
-    let pager_tid = {
-        let mut waiters = PAGER_WAITERS.lock();
-        let tid = waiters[slot];
-        if tid != 0 {
-            waiters[slot] = 0;
-        }
-        tid
-    };
+    let pager_tid = aspace::take_pager_waiter(aspace_id);
     if pager_tid != 0 {
         inject_fault_into_frame(pager_tid, token, fault_va, file_handle, file_offset);
         scheduler::wake_parked_thread(pager_tid);
@@ -157,9 +146,7 @@ fn inject_fault_into_frame(pager_tid: u32, token: u32, fault_va: usize, file_han
 /// If none, parks the pager thread. When woken by initiate_fault, the fault info
 /// will be injected into the saved frame (like IPC recv).
 pub fn wait_fault(aspace_id: u32) -> Option<(u32, usize, u32, u64, usize)> {
-    let slot = (aspace_id as usize) % MAX_ASPACES;
-
-    // Check for pending faults first (lock order: FAULTS before WAITERS).
+    // Check for pending faults first (lock order: FAULTS before pager waiter).
     {
         let faults = PAGER_FAULTS.lock();
         for (i, entry) in faults.iter().enumerate() {
@@ -177,9 +164,8 @@ pub fn wait_fault(aspace_id: u32) -> Option<(u32, usize, u32, u64, usize)> {
 
     // Register as waiter. initiate_fault checks this AFTER recording the fault.
     {
-        let mut waiters = PAGER_WAITERS.lock();
         let tid = scheduler::current_thread_id();
-        waiters[slot] = tid;
+        aspace::set_pager_waiter(aspace_id, tid);
     }
 
     // Re-check for faults that may have arrived between our first check and
@@ -191,8 +177,7 @@ pub fn wait_fault(aspace_id: u32) -> Option<(u32, usize, u32, u64, usize)> {
         for (i, entry) in faults.iter().enumerate() {
             if entry.active && entry.aspace_id == aspace_id {
                 // Clear waiter registration.
-                let mut waiters = PAGER_WAITERS.lock();
-                waiters[slot] = 0;
+                aspace::clear_pager_waiter(aspace_id);
                 return Some((
                     i as u32,
                     entry.fault_va,

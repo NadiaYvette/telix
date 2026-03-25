@@ -3,18 +3,25 @@
 //! Each address space owns a page table root and a B+ tree of VMAs.
 //! The WSCLOCK clock hand (VmaCursor) is also stored here.
 //!
+//! The address space table is an ART (Adaptive Radix Tree) mapping monotonic
+//! ASpaceIds to slab-allocated entries, with no fixed upper limit.
+//!
 //! Locking: each address space has its own SpinLock, so operations on
-//! different address spaces never contend. A lightweight allocation lock
-//! (`NEXT_ID`) serializes only slot create/destroy.
+//! different address spaces never contend. The global ASPACE_TABLE lock
+//! serializes only entry creation, destruction, and lookup (held briefly).
+//! Lock ordering: ASPACE_TABLE → per-entry SpinLock.
 
 use super::object::{self};
+use super::page::PhysAddr;
 use super::vma::{Vma, VmaProt};
 use super::vmatree::{VmaCursor, VmaTree};
+use crate::ipc::art::Art;
+use crate::mm::slab;
 use crate::sync::SpinLock;
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Maximum number of address spaces.
-pub const MAX_ASPACES: usize = 32;
+/// Slab size for ASpaceEntry allocations.
+const ASPACE_SLAB_SIZE: usize = 128;
 
 /// Address space ID type.
 pub type ASpaceId = u32;
@@ -43,7 +50,7 @@ pub struct AddressSpace {
     pub vmas: VmaTree,
     /// WSCLOCK clock hand.
     pub clock_hand: VmaCursor,
-    /// Address space ID (matches the atomic in ASpaceSlot).
+    /// Address space ID.
     pub id: ASpaceId,
     /// Bump pointer for heap VA allocation.
     pub heap_next: usize,
@@ -147,57 +154,73 @@ impl AddressSpace {
 }
 
 // ---------------------------------------------------------------------------
-// Per-aspace locking
+// ART-backed address space table
 // ---------------------------------------------------------------------------
 
-/// A slot in the address space table. Each slot has its own spinlock so
-/// operations on different address spaces never contend.
-struct ASpaceSlot {
-    /// Lock-free active flag (0 = free, 1 = in use).
-    active: AtomicU8,
-    /// Lock-free ID for fast lookup without locking the slot.
-    id: AtomicU32,
-    /// The actual address space data, protected by a per-slot lock.
+/// A slab-allocated entry in the address space table.
+#[repr(C)]
+struct ASpaceEntry {
+    /// Per-aspace pager waiter thread ID (0 = none). Accessed atomically
+    /// without holding the per-aspace lock.
+    pager_waiter: AtomicU32,
+    /// The actual address space data, protected by a per-entry lock.
     inner: SpinLock<AddressSpace>,
 }
 
-impl ASpaceSlot {
-    const fn empty() -> Self {
+struct ASpaceTable {
+    art: Art,
+    next_id: ASpaceId,
+}
+
+impl ASpaceTable {
+    const fn new() -> Self {
         Self {
-            active: AtomicU8::new(0),
-            id: AtomicU32::new(0),
-            inner: SpinLock::new(AddressSpace::empty()),
+            art: Art::new(),
+            next_id: 1,
         }
+    }
+
+    fn get(&self, id: ASpaceId) -> Option<*const ASpaceEntry> {
+        let val = self.art.lookup(id as u64)?;
+        Some(val as *const ASpaceEntry)
     }
 }
 
-static ASPACES: [ASpaceSlot; MAX_ASPACES] = {
-    const EMPTY: ASpaceSlot = ASpaceSlot::empty();
-    [EMPTY; MAX_ASPACES]
-};
+static ASPACE_TABLE: SpinLock<ASpaceTable> = SpinLock::new(ASpaceTable::new());
 
-/// Lightweight lock protecting only the next-ID counter and slot allocation.
-static NEXT_ID: SpinLock<ASpaceId> = SpinLock::new(1);
-
-/// Find a slot by ID using lock-free atomics, then lock just that slot.
-/// Returns (slot_index, guard). Double-checks ID under the lock.
-fn lock_aspace_indexed(id: ASpaceId) -> Option<(usize, crate::sync::SpinLockGuard<'static, AddressSpace>)> {
-    for (i, slot) in ASPACES.iter().enumerate() {
-        if slot.active.load(Ordering::Acquire) != 0 && slot.id.load(Ordering::Relaxed) == id {
-            let guard = slot.inner.lock();
-            // Double-check under lock (slot could have been freed between check and lock).
-            if guard.id == id && slot.active.load(Ordering::Relaxed) != 0 {
-                return Some((i, guard));
-            }
-            // Mismatch — drop guard and keep searching.
-        }
+/// Allocate a new ASpaceEntry from slab.
+fn alloc_entry() -> Option<*mut ASpaceEntry> {
+    let pa = slab::alloc(ASPACE_SLAB_SIZE)?;
+    let p = pa.as_usize() as *mut ASpaceEntry;
+    unsafe {
+        core::ptr::write_bytes(p as *mut u8, 0, ASPACE_SLAB_SIZE);
     }
-    None
+    Some(p)
 }
 
-/// Lock an address space by ID. Returns a guard that auto-unlocks on drop.
+/// Free an ASpaceEntry back to slab.
+fn free_entry(ptr: *mut ASpaceEntry) {
+    slab::free(PhysAddr::new(ptr as usize), ASPACE_SLAB_SIZE);
+}
+
+// ---------------------------------------------------------------------------
+// Per-aspace locking
+// ---------------------------------------------------------------------------
+
+/// Lock an address space by ID. Acquires the table lock briefly to find the
+/// entry, then locks the per-entry SpinLock, then releases the table lock.
 fn lock_aspace(id: ASpaceId) -> Option<crate::sync::SpinLockGuard<'static, AddressSpace>> {
-    lock_aspace_indexed(id).map(|(_, g)| g)
+    let table = ASPACE_TABLE.lock();
+    let entry_ptr = table.get(id)?;
+    // SAFETY: entry is slab-allocated and valid as long as it's in the ART.
+    // We hold the table lock, so nobody can remove it from the ART yet.
+    let guard = unsafe { (*entry_ptr).inner.lock() };
+    drop(table);
+    // Double-check ID under lock (entry could have been recycled).
+    if guard.id != id {
+        return None;
+    }
+    Some(guard)
 }
 
 /// Access an address space by ID within a closure. Panics if not found.
@@ -213,6 +236,36 @@ where
 pub fn with_aspace_mut<R>(id: ASpaceId, f: impl FnOnce(&mut AddressSpace) -> R) -> Option<R> {
     let mut guard = lock_aspace(id)?;
     Some(f(&mut guard))
+}
+
+// ---------------------------------------------------------------------------
+// Pager waiter helpers (accessed without per-aspace lock)
+// ---------------------------------------------------------------------------
+
+/// Atomically take (read and clear) the pager waiter thread ID for an aspace.
+pub fn take_pager_waiter(id: ASpaceId) -> u32 {
+    let table = ASPACE_TABLE.lock();
+    match table.get(id) {
+        Some(entry_ptr) => {
+            let entry = unsafe { &*entry_ptr };
+            entry.pager_waiter.swap(0, Ordering::Relaxed)
+        }
+        None => 0,
+    }
+}
+
+/// Set the pager waiter thread ID for an aspace.
+pub fn set_pager_waiter(id: ASpaceId, tid: u32) {
+    let table = ASPACE_TABLE.lock();
+    if let Some(entry_ptr) = table.get(id) {
+        let entry = unsafe { &*entry_ptr };
+        entry.pager_waiter.store(tid, Ordering::Relaxed);
+    }
+}
+
+/// Clear the pager waiter thread ID for an aspace.
+pub fn clear_pager_waiter(id: ASpaceId) {
+    set_pager_waiter(id, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -251,38 +304,47 @@ fn seed_aspace(space: &mut AddressSpace) {
 
 /// Create a new address space with the given page table root.
 pub fn create(page_table_root: usize) -> Option<ASpaceId> {
-    let mut next = NEXT_ID.lock();
-    let id = *next;
+    let ptr = alloc_entry()?;
 
-    // Find a free slot.
-    for (i, slot) in ASPACES.iter().enumerate() {
-        if slot.active.load(Ordering::Relaxed) == 0 {
-            // Claim it: lock the slot, initialize, then publish via atomics.
-            let mut guard = slot.inner.lock();
-            guard.id = id;
-            guard.page_table_root = page_table_root;
-            guard.clock_hand = VmaCursor::new();
-            seed_aspace(&mut guard);
+    let mut table = ASPACE_TABLE.lock();
+    let id = table.next_id;
+    table.next_id += 1;
 
-            // Publish: set ID first, then active flag (readers check active first).
-            slot.id.store(id, Ordering::Relaxed);
-            slot.active.store(1, Ordering::Release);
-
-            *next = id + 1;
-            drop(guard);
-            drop(next);
-            return Some(id);
-        }
+    unsafe {
+        (*ptr).pager_waiter = AtomicU32::new(0);
+        let mut space = AddressSpace::empty();
+        space.id = id;
+        space.page_table_root = page_table_root;
+        space.clock_hand = VmaCursor::new();
+        seed_aspace(&mut space);
+        core::ptr::write(&mut (*ptr).inner, SpinLock::new(space));
     }
-    None
+
+    if !table.art.insert(id as u64, ptr as usize) {
+        drop(table);
+        free_entry(ptr);
+        return None;
+    }
+
+    Some(id)
 }
 
 /// Destroy an address space.
 pub fn destroy(id: ASpaceId) {
-    let (slot_idx, mut guard) = match lock_aspace_indexed(id) {
-        Some(sg) => sg,
-        None => return,
-    };
+    // Step 1: Remove from ART (holds table lock briefly).
+    let entry_ptr = {
+        let mut table = ASPACE_TABLE.lock();
+        let ptr = match table.get(id) {
+            Some(p) => p as *mut ASpaceEntry,
+            None => return,
+        };
+        table.art.remove(id as u64);
+        ptr
+    }; // table lock released
+
+    // Step 2: Lock entry and clean up. No new lookups can find this entry
+    // (removed from ART). Any existing holder must release before we proceed.
+    let mut guard = unsafe { (*entry_ptr).inner.lock() };
 
     // Destroy backing objects for all VMAs.
     {
@@ -294,14 +356,14 @@ pub fn destroy(id: ASpaceId) {
         }
     }
     guard.vmas.clear();
-
-    // Mark slot as free. Other threads will see active=0 and skip this slot.
-    ASPACES[slot_idx].active.store(0, Ordering::Release);
     drop(guard);
+
+    // Step 3: Free slab.
+    free_entry(entry_ptr);
 }
 
 /// Reset an address space for execve: destroy all VMAs and backing objects,
-/// install a fresh page table, re-seed PRNG. The slot stays active.
+/// install a fresh page table, re-seed PRNG. The entry stays in the ART.
 pub fn reset(id: ASpaceId, new_pt_root: usize) {
     let mut guard = match lock_aspace(id) {
         Some(g) => g,
@@ -424,36 +486,45 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         }
     } // parent lock dropped
 
-    // Step 2: Clone objects (no aspace lock held — only OBJECTS lock).
-    let mut new_obj_ids: [u32; 32] = [0; 32];
-
-    // Allocate child slot under NEXT_ID lock.
+    // Step 2: Create child entry in ART.
     let child_id;
-    let child_slot_idx;
+    let child_entry_ptr;
     {
-        let mut next = NEXT_ID.lock();
-        child_id = *next;
-        child_slot_idx = ASPACES.iter().position(|s| s.active.load(Ordering::Relaxed) == 0);
-        if child_slot_idx.is_none() {
-            drop(next);
+        let child_ptr = match alloc_entry() {
+            Some(p) => p,
+            None => {
+                free_page_table_tree(child_pt);
+                return None;
+            }
+        };
+
+        let mut table = ASPACE_TABLE.lock();
+        child_id = table.next_id;
+        table.next_id += 1;
+
+        unsafe {
+            (*child_ptr).pager_waiter = AtomicU32::new(0);
+            let mut space = AddressSpace::empty();
+            space.id = child_id;
+            space.page_table_root = child_pt;
+            space.clock_hand = VmaCursor::new();
+            seed_aspace(&mut space);
+            space.heap_next = parent_heap;
+            core::ptr::write(&mut (*child_ptr).inner, SpinLock::new(space));
+        }
+
+        if !table.art.insert(child_id as u64, child_ptr as usize) {
+            drop(table);
+            free_entry(child_ptr);
             free_page_table_tree(child_pt);
             return None;
         }
-        let ci = child_slot_idx.unwrap();
-        // Claim the slot.
-        let mut cg = ASPACES[ci].inner.lock();
-        cg.id = child_id;
-        cg.page_table_root = child_pt;
-        cg.clock_hand = VmaCursor::new();
-        cg.heap_next = parent_heap;
-        seed_aspace(&mut cg);
-        // Inherit parent's heap_next (overrides seed_aspace's randomized one).
-        cg.heap_next = parent_heap;
-        ASPACES[ci].id.store(child_id, Ordering::Relaxed);
-        ASPACES[ci].active.store(1, Ordering::Release);
-        *next += 1;
+
+        child_entry_ptr = child_ptr;
     }
-    let child_slot_idx = child_slot_idx.unwrap();
+
+    // Step 3: Clone objects (no aspace lock held — only OBJ_TABLE lock).
+    let mut new_obj_ids: [u32; 32] = [0; 32];
 
     for i in 0..vma_count {
         if let Some(ref info) = vma_infos[i] {
@@ -469,7 +540,12 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
                     for j in 0..i {
                         object::destroy(new_obj_ids[j]);
                     }
-                    ASPACES[child_slot_idx].active.store(0, Ordering::Release);
+                    // Remove child from ART and free.
+                    {
+                        let mut table = ASPACE_TABLE.lock();
+                        table.art.remove(child_id as u64);
+                    }
+                    free_entry(child_entry_ptr);
                     free_page_table_tree(child_pt);
                     return None;
                 }
@@ -477,9 +553,9 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         }
     }
 
-    // Step 3: Lock child, insert VMAs and install child PTEs.
+    // Step 4: Lock child, insert VMAs and install child PTEs.
     {
-        let mut child_guard = ASPACES[child_slot_idx].inner.lock();
+        let mut child_guard = unsafe { (*child_entry_ptr).inner.lock() };
         let sw_z = super::fault::sw_zeroed_bit();
 
         for i in 0..vma_count {
@@ -510,7 +586,7 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         }
     } // child lock dropped
 
-    // Step 4: Lock parent, downgrade writable PTEs.
+    // Step 5: Lock parent, downgrade writable PTEs.
     {
         let _parent_guard = lock_aspace(parent_id);
         for i in 0..vma_count {
