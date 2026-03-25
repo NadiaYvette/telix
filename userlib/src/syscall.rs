@@ -244,6 +244,15 @@ pub struct Message {
     pub data: [u64; 6],
 }
 
+impl Message {
+    /// Sender's task port_id, stamped by the kernel in data[4].
+    /// Servers can use this to identify the calling task.
+    #[inline]
+    pub fn sender(&self) -> u64 {
+        self.data[4]
+    }
+}
+
 /// Blocking receive that returns the full message (tag + data).
 pub fn recv_msg(port: u64) -> Option<Message> {
     let status: u64;

@@ -400,6 +400,7 @@ fn inject_recv_into_frame(receiver_tid: u32, msg: &crate::ipc::Message) {
 pub(crate) fn deliver_to_parked_receiver(receiver_tid: u32, msg: &crate::ipc::Message) {
     inject_recv_into_frame(receiver_tid, msg);
     let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
+    auto_grant_sender_identity(receiver_task, msg.data[4]);
     auto_grant_reply_caps(receiver_task, msg);
     crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
 }
@@ -465,6 +466,19 @@ fn auto_grant_reply_caps(task_id: u32, msg: &crate::ipc::Message) {
     }
 }
 
+/// Auto-grant SEND on the sender's task port to the receiver.
+/// This lets servers identify callers via the port_id in data[4].
+#[inline]
+fn auto_grant_sender_identity(receiver_task: u32, sender_port: u64) {
+    if receiver_task == 0 || sender_port == 0 { return; }
+    // Fast-path check: skip if receiver already has SEND on sender's port.
+    if crate::cap::has_port_cap_fast(receiver_task, sender_port, crate::cap::Rights::SEND) {
+        return;
+    }
+    let mut caps = crate::cap::CAP_SYSTEM.lock();
+    caps.grant_send_cap(receiver_task, sender_port);
+}
+
 fn sys_debug_putchar(ch: u64) -> u64 {
     crate::arch::platform::serial::putc(ch as u8);
     0
@@ -527,11 +541,15 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
         return ECAP;
     }
     let mut msg = crate::ipc::Message::new(tag, data);
+    // Stamp sender identity: data[4] = sender's task port_id.
+    let sender_task = crate::sched::current_task_id();
+    msg.data[4] = crate::sched::task_port_id(sender_task);
 
     match crate::ipc::port::send_direct(port_id, &mut msg) {
         crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
             // L4-style direct handoff: inject message and switch to receiver.
             let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
+            auto_grant_sender_identity(receiver_task, msg.data[4]);
             auto_grant_reply_caps(receiver_task, &msg);
             inject_recv_into_frame(receiver_tid, &msg);
             crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
@@ -559,11 +577,15 @@ fn sys_send_nb(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
         return ECAP;
     }
     let mut msg = crate::ipc::Message::new(tag, data);
+    // Stamp sender identity: data[4] = sender's task port_id.
+    let sender_task = crate::sched::current_task_id();
+    msg.data[4] = crate::sched::task_port_id(sender_task);
 
     match crate::ipc::port::send_direct(port_id, &mut msg) {
         crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
             // Direct transfer: inject message into parked receiver's frame and wake.
             let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
+            auto_grant_sender_identity(receiver_task, msg.data[4]);
             auto_grant_reply_caps(receiver_task, &msg);
             inject_recv_into_frame(receiver_tid, &msg);
             crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
@@ -642,6 +664,7 @@ fn sys_recv(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
         Ok(msg) => {
             // Message was immediately available from the queue.
             let task_id = crate::sched::current_task_id();
+            auto_grant_sender_identity(task_id, msg.data[4]);
             auto_grant_reply_caps(task_id, &msg);
             set_reg(frame, 1, msg.tag);
             set_reg(frame, 2, msg.data[0]);
@@ -669,6 +692,7 @@ fn sys_recv_nb(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
     match crate::ipc::port::recv_nb(port_id) {
         Ok(msg) => {
             let task_id = crate::sched::current_task_id();
+            auto_grant_sender_identity(task_id, msg.data[4]);
             auto_grant_reply_caps(task_id, &msg);
             set_reg(frame, 1, msg.tag);
             set_reg(frame, 2, msg.data[0]);
@@ -1037,6 +1061,7 @@ fn sys_port_set_recv(set_id: u64, frame: &mut ExceptionFrame) -> u64 {
     match crate::ipc::port_set::recv_blocking(set_id as u32) {
         Some((port_id, msg)) => {
             let task_id = crate::sched::current_task_id();
+            auto_grant_sender_identity(task_id, msg.data[4]);
             auto_grant_reply_caps(task_id, &msg);
             set_reg(frame, 1, msg.tag);
             set_reg(frame, 2, msg.data[0]);
@@ -2680,6 +2705,7 @@ fn sys_port_set_recv_timeout(set_id: u64, timeout_us: u64, frame: &mut Exception
     match crate::ipc::port_set::recv(set_id as u32) {
         Some((port_id, msg)) => {
             let task_id = crate::sched::current_task_id();
+            auto_grant_sender_identity(task_id, msg.data[4]);
             auto_grant_reply_caps(task_id, &msg);
             set_reg(frame, 1, msg.tag);
             set_reg(frame, 2, msg.data[0]);
