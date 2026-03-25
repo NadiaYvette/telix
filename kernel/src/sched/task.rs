@@ -86,6 +86,8 @@ pub fn sig_default_is_term(sig: u32) -> bool {
 pub struct Task {
     pub id: TaskId,
     pub active: bool,
+    /// Kernel-held port for this task. Userspace references this task by port_id.
+    pub port_id: u64,
     /// Address space ID (0 = kernel, uses identity mapping).
     pub aspace_id: u32,
     /// Physical address of the page table root for this task.
@@ -185,6 +187,7 @@ impl Task {
         Self {
             id: 0,
             active: false,
+            port_id: 0,
             aspace_id: 0,
             page_table_root: 0,
             exit_code: 0,

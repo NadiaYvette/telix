@@ -361,6 +361,14 @@ pub fn port_creator(port_id: PortId) -> Option<u32> {
     table.get(local).map(|p| p.creator_task)
 }
 
+/// Get the kernel_user_data of a kernel-held port, or None if not found / not kernel-held.
+pub fn port_kernel_data(port_id: PortId) -> Option<usize> {
+    let local = port_local(port_id);
+    let table = PORT_TABLE.lock();
+    let p = table.get(local)?;
+    if p.is_kernel_held() { Some(p.kernel_user_data) } else { None }
+}
+
 /// Send a message to a port (non-blocking).
 /// Returns Ok(()) on success, Err(msg) if the queue is full.
 pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {

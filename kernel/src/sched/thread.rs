@@ -49,6 +49,8 @@ pub struct Thread {
     pub id: ThreadId,
     pub state: ThreadState,
     pub task_id: u32,
+    /// Kernel-held port for this thread. Userspace references this thread by port_id.
+    pub port_id: u64,
     /// Base (static) priority assigned at creation.
     pub base_priority: u8,
     /// Effective priority — may be temporarily boosted by priority inheritance.
@@ -93,6 +95,7 @@ impl Thread {
             id: 0,
             state: ThreadState::Dead,
             task_id: 0,
+            port_id: 0,
             base_priority: 128,
             effective_priority: 128,
             quantum: 10,

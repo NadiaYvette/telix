@@ -147,6 +147,20 @@ impl RunQueue {
 }
 
 // ---------------------------------------------------------------------------
+// Kernel-held port handlers for task/thread ports
+// ---------------------------------------------------------------------------
+
+/// Kernel handler for task ports. Stub — returns empty reply.
+fn task_port_handler(_port_id: crate::ipc::port::PortId, _user_data: usize, _msg: &crate::ipc::Message) -> crate::ipc::Message {
+    crate::ipc::Message::empty()
+}
+
+/// Kernel handler for thread ports. Stub — returns empty reply.
+fn thread_port_handler(_port_id: crate::ipc::port::PortId, _user_data: usize, _msg: &crate::ipc::Message) -> crate::ipc::Message {
+    crate::ipc::Message::empty()
+}
+
+// ---------------------------------------------------------------------------
 // Thread/Task slab/page allocation
 // ---------------------------------------------------------------------------
 
@@ -273,19 +287,25 @@ impl Scheduler {
     fn init(&mut self) {
         // Allocate and insert task 0 (kernel task).
         let task_ptr = alloc_task_entry().expect("task 0 alloc");
+        let task0_port = crate::ipc::port::create_kernel_port(task_port_handler, 0)
+            .expect("task 0 port");
         unsafe {
             (*task_ptr).id = 0;
             (*task_ptr).active = true;
+            (*task_ptr).port_id = task0_port;
         }
         self.task_art.insert(0, task_ptr as usize);
         self.next_task_id = 1;
 
         // Thread 0 = BSP idle thread. Its saved_sp will be set on first preemption.
         let thread_ptr = alloc_thread_entry().expect("thread 0 alloc");
+        let thread0_port = crate::ipc::port::create_kernel_port(thread_port_handler, 0)
+            .expect("thread 0 port");
         unsafe {
             (*thread_ptr).id = 0;
             (*thread_ptr).state = ThreadState::Running;
             (*thread_ptr).task_id = 0;
+            (*thread_ptr).port_id = thread0_port;
             (*thread_ptr).base_priority = 255;
             (*thread_ptr).effective_priority = 255;
             (*thread_ptr).quantum = u32::MAX;
@@ -305,10 +325,12 @@ impl Scheduler {
         self.next_thread_id += 1;
 
         let ptr = alloc_thread_entry()?;
+        let idle_port = crate::ipc::port::create_kernel_port(thread_port_handler, id as usize)?;
         unsafe {
             (*ptr).id = id;
             (*ptr).state = ThreadState::Running;
             (*ptr).task_id = 0;
+            (*ptr).port_id = idle_port;
             (*ptr).base_priority = 255;
             (*ptr).effective_priority = 255; // lowest
             (*ptr).quantum = u32::MAX;
@@ -480,17 +502,20 @@ struct SpawnParentInfo {
 
 /// Phase 2: do all heavy work (page tables, address space, ELF load, stack,
 /// kstack, frame setup, capability grants) WITHOUT holding the SCHEDULER lock.
-/// Returns (aspace_id, pt_root, frame_sp, kstack_base) on success.
+/// Returns (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) on success.
 fn do_spawn_heavy_work(
     task_id: u32,
-    _thread_id: ThreadId,
+    thread_id: ThreadId,
     _parent: &SpawnParentInfo,
     elf_data: &[u8],
     _priority: u8,
     _quantum: u32,
     arg0: u64,
     arg0_is_port: bool,
-) -> Option<(u32, usize, u64, usize)> {
+) -> Option<(u32, usize, u64, usize, u64, u64)> {
+    // Create kernel-held ports for this task and its initial thread.
+    let task_port = crate::ipc::port::create_kernel_port(task_port_handler, task_id as usize)?;
+    let thread_port = crate::ipc::port::create_kernel_port(thread_port_handler, thread_id as usize)?;
     // Create a page table with kernel identity mapping.
     #[cfg(target_arch = "aarch64")]
     let pt_root = crate::arch::aarch64::mm::setup_tables()?;
@@ -637,7 +662,7 @@ fn do_spawn_heavy_work(
         { *frame.add(9) = arg0; }
     }
 
-    Some((aspace_id, pt_root, frame_sp as u64, kstack_base))
+    Some((aspace_id, pt_root, frame_sp as u64, kstack_base, task_port, thread_port))
 }
 
 impl Scheduler {
@@ -681,10 +706,13 @@ impl Scheduler {
         quantum: u32,
         frame_sp: u64,
         kstack_base: usize,
+        task_port: u64,
+        thread_port: u64,
     ) {
         let task = self.task_mut(task_id);
         task.id = task_id;
         task.active = true;
+        task.port_id = task_port;
         task.aspace_id = aspace_id;
         task.page_table_root = pt_root;
         task.exit_code = 0;
@@ -713,6 +741,7 @@ impl Scheduler {
         thread.id = thread_id;
         thread.state = ThreadState::Ready;
         thread.task_id = task_id;
+        thread.port_id = thread_port;
         thread.base_priority = priority;
         thread.effective_priority = priority;
         THREAD_PRIO[thread_id as usize].store(priority, Ordering::Relaxed);
@@ -730,14 +759,17 @@ impl Scheduler {
 
     /// Create a new thread in an existing task (shared address space).
     /// The caller provides the user entry point, stack top, and an argument.
+    /// Create a new thread in an existing task. Thread ID and port are pre-allocated.
     fn create_thread_in_task(
         &mut self,
         task_id: u32,
+        id: ThreadId,
         entry: u64,
         stack_top: u64,
         arg: u64,
         priority: u8,
         quantum: u32,
+        thread_port: u64,
     ) -> Option<ThreadId> {
         if !self.task(task_id).active {
             return None;
@@ -788,8 +820,6 @@ impl Scheduler {
             { *frame.add(9) = arg; } // rdi
         }
 
-        let id = self.alloc_thread_id()?;
-
         // Clear killed/affinity flags from any previous occupant of this slot.
         KILLED[id as usize].store(false, Ordering::Release);
         AFFINITY_MASK[id as usize].store(u64::MAX, Ordering::Relaxed);
@@ -799,6 +829,7 @@ impl Scheduler {
         thread.id = id;
         thread.state = ThreadState::Ready;
         thread.task_id = task_id;
+        thread.port_id = thread_port;
         thread.base_priority = priority;
         thread.effective_priority = priority;
         THREAD_PRIO[id as usize].store(priority, Ordering::Relaxed);
@@ -1038,12 +1069,12 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
     let (task_id, thread_id, parent) = SCHEDULER.lock().alloc_spawn_ids()?;
 
     // Phase 2: heavy work (page tables, ELF load, etc.) WITHOUT SCHEDULER lock.
-    let (aspace_id, pt_root, frame_sp, kstack_base) =
+    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
         do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
 
     // Phase 3: finalize task/thread state under SCHEDULER lock.
     SCHEDULER.lock().finalize_spawn(
-        task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base,
+        task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base, task_port, thread_port,
     );
     Some(thread_id)
 }
@@ -1054,11 +1085,11 @@ pub fn spawn_user_from_elf(elf_data: &[u8], priority: u8, quantum: u32, arg0: u6
 
     let (task_id, thread_id, parent) = SCHEDULER.lock().alloc_spawn_ids()?;
 
-    let (aspace_id, pt_root, frame_sp, kstack_base) =
+    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
         do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
 
     SCHEDULER.lock().finalize_spawn(
-        task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base,
+        task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base, task_port, thread_port,
     );
     Some(thread_id)
 }
@@ -1080,7 +1111,7 @@ pub fn spawn_user_with_data(
     let (task_id, thread_id, parent) = SCHEDULER.lock().alloc_spawn_ids()?;
 
     // Phase 2: ELF load + stack setup WITHOUT SCHEDULER lock.
-    let (aspace_id, pt_root, frame_sp, kstack_base) =
+    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
         do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
 
     // Map data pages into the child's address space (still no SCHEDULER lock).
@@ -1156,19 +1187,25 @@ pub fn spawn_user_with_data(
 
     // Phase 3: finalize under SCHEDULER lock.
     SCHEDULER.lock().finalize_spawn(
-        task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base,
+        task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base, task_port, thread_port,
     );
     Some(thread_id)
 }
 
 /// Create a new thread in the caller's task. Returns thread ID or None.
 pub fn thread_create(task_id: u32, entry: u64, stack_top: u64, arg: u64) -> Option<ThreadId> {
+    let (priority, quantum) = {
+        let sched = SCHEDULER.lock();
+        let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
+        (sched.thread(caller_tid).base_priority, sched.thread(caller_tid).default_quantum)
+    };
+    // Allocate thread ID under SCHEDULER lock, then drop.
+    let thread_id = SCHEDULER.lock().alloc_thread_id()?;
+    // Create kernel-held port for the new thread (no SCHEDULER lock — safe w.r.t. PORT_TABLE ordering).
+    let thread_port = crate::ipc::port::create_kernel_port(thread_port_handler, thread_id as usize)?;
+    // Finalize under SCHEDULER lock.
     let mut sched = SCHEDULER.lock();
-    // Inherit the caller's priority and quantum.
-    let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let priority = sched.thread(caller_tid).base_priority;
-    let quantum = sched.thread(caller_tid).default_quantum;
-    sched.create_thread_in_task(task_id, entry, stack_top, arg, priority, quantum)
+    sched.create_thread_in_task(task_id, thread_id, entry, stack_top, arg, priority, quantum, thread_port)
 }
 
 /// Check if a thread has exited and return its exit code.
@@ -1906,6 +1943,10 @@ pub fn fork_current() -> u64 {
         None => return u64::MAX,
     };
 
+    // Create kernel-held port for child task (outside scheduler lock).
+    // We don't know child_task_id yet, so use 0 temporarily — updated in finalize.
+    // Actually, we allocate task_id first, then create the port.
+
     // Create child task and thread under the scheduler lock.
     let mut sched = SCHEDULER.lock();
 
@@ -1913,6 +1954,14 @@ pub fn fork_current() -> u64 {
         Some(id) => id,
         None => return u64::MAX,
     };
+
+    // Drop lock briefly to create the task port (port creation takes PORT_TABLE lock).
+    drop(sched);
+    let child_task_port = match crate::ipc::port::create_kernel_port(task_port_handler, child_task_id as usize) {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
+    let mut sched = SCHEDULER.lock();
 
     // Set up child task.
     {
@@ -1929,6 +1978,7 @@ pub fn fork_current() -> u64 {
         let task = sched.task_mut(child_task_id);
         task.id = child_task_id;
         task.active = true;
+        task.port_id = child_task_port;
         task.aspace_id = child_aspace_id;
         task.page_table_root = child_pt_root;
         task.exit_code = 0;
@@ -1994,11 +2044,17 @@ pub fn fork_current() -> u64 {
         crate::syscall::handlers::set_return(child_frame, 0);
     }
 
-    // Allocate child thread.
+    // Allocate child thread ID, then drop lock to create thread port.
     let child_tid = match sched.alloc_thread_id() {
         Some(id) => id,
         None => return u64::MAX,
     };
+    drop(sched);
+    let child_thread_port = match crate::ipc::port::create_kernel_port(thread_port_handler, child_tid as usize) {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
+    let mut sched = SCHEDULER.lock();
 
     // Clear killed/affinity flags.
     KILLED[child_tid as usize].store(false, Ordering::Release);
@@ -2009,6 +2065,7 @@ pub fn fork_current() -> u64 {
     thread.id = child_tid;
     thread.state = ThreadState::Ready;
     thread.task_id = child_task_id;
+    thread.port_id = child_thread_port;
     thread.base_priority = parent_priority;
     thread.effective_priority = parent_priority;
     THREAD_PRIO[child_tid as usize].store(parent_priority, Ordering::Relaxed);
@@ -2031,13 +2088,14 @@ pub fn fork_current() -> u64 {
 /// Terminate the current thread and destroy its task's resources.
 /// This function never returns.
 pub fn exit_current_thread(exit_code: i32) -> ! {
-    let (tid, is_last_thread, aspace_id, pt_root, kstack_base, parent_task_id) = {
+    let (tid, is_last_thread, aspace_id, pt_root, kstack_base, parent_task_id, task_port, thread_port) = {
         let pcpu = smp::current();
         let tid = pcpu.current_thread.load(Ordering::Relaxed);
         let mut sched = SCHEDULER.lock();
         let thread = sched.thread_mut(tid);
         thread.state = ThreadState::Dead;
         thread.exit_code = exit_code;
+        let thread_port = thread.port_id;
         // Wake any thread blocked in thread_join() on us.
         let waiter = thread.join_waiter;
         thread.join_waiter = u32::MAX;
@@ -2055,6 +2113,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         task.thread_count -= 1;
         let is_last = task.thread_count == 0;
         let parent_task_id = task.parent_task;
+        let task_port = task.port_id;
         if is_last {
             task.exit_code = exit_code;
             task.exited = true;
@@ -2064,8 +2123,13 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         }
         let aspace_id = task.aspace_id;
         let pt_root = task.page_table_root;
-        (tid, is_last, aspace_id, pt_root, kstack_base, parent_task_id)
+        (tid, is_last, aspace_id, pt_root, kstack_base, parent_task_id, task_port, thread_port)
     }; // scheduler lock dropped here
+
+    // Destroy the thread's kernel-held port (outside SCHEDULER lock for lock ordering).
+    if thread_port != 0 {
+        crate::ipc::port::destroy(thread_port);
+    }
 
     // If this was the last thread (task became zombie), notify parent.
     if is_last_thread {
@@ -2110,6 +2174,11 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
             #[cfg(target_arch = "x86_64")]
             crate::arch::x86_64::mm::free_page_table_tree(pt_root);
         }
+    }
+
+    // Destroy the task's kernel-held port.
+    if is_last_thread && task_port != 0 {
+        crate::ipc::port::destroy(task_port);
     }
 
     // Auto-reap zombie children of this exiting task (prevent zombie leaks).
