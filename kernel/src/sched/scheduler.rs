@@ -10,7 +10,7 @@
 //! spinlock. Each CPU tracks its own current/idle thread via smp::PerCpuData.
 
 use super::thread::{Thread, ThreadId, ThreadState, BlockReason, MAX_THREADS, EXCEPTION_FRAME_SIZE};
-use super::task::{Task, TaskId, MAX_TASKS};
+use super::task::{Task, TaskId, MAX_TASKS, MAX_GROUPS, RLIMIT_COUNT, Rlimit};
 use super::smp;
 use crate::sync::SpinLock;
 use crate::mm::page::{PAGE_SIZE, MMUPAGE_SIZE};
@@ -320,42 +320,226 @@ impl Scheduler {
         Some(id)
     }
 
-    /// Create a user-mode thread in a new task, loading an ELF binary from initramfs.
-    fn create_user_thread(
-        &mut self,
-        elf_name: &[u8],
-        priority: u8,
-        quantum: u32,
-        arg0: u64,
-    ) -> Option<ThreadId> {
-        // Look up the ELF binary in the initramfs.
-        let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
-        self.create_user_thread_from_elf(elf_data, priority, quantum, arg0)
+}
+
+/// Parent task info snapshot, taken under SCHEDULER lock so that the heavy
+/// work phase (ELF loading, page table setup) can run without holding it.
+struct SpawnParentInfo {
+    parent_task: u32,
+    sid: TaskId,
+    ctty_port: u32,
+    uid: u32,
+    euid: u32,
+    gid: u32,
+    egid: u32,
+    groups: [u32; MAX_GROUPS],
+    ngroups: u32,
+    rlimits: [Rlimit; RLIMIT_COUNT],
+}
+
+/// Phase 2: do all heavy work (page tables, address space, ELF load, stack,
+/// kstack, frame setup, capability grants) WITHOUT holding the SCHEDULER lock.
+/// Returns (aspace_id, pt_root, frame_sp, kstack_base) on success.
+fn do_spawn_heavy_work(
+    task_id: u32,
+    _thread_id: ThreadId,
+    _parent: &SpawnParentInfo,
+    elf_data: &[u8],
+    _priority: u8,
+    _quantum: u32,
+    arg0: u64,
+    arg0_is_port: bool,
+) -> Option<(u32, usize, u64, usize)> {
+    // Create a page table with kernel identity mapping.
+    #[cfg(target_arch = "aarch64")]
+    let pt_root = crate::arch::aarch64::mm::setup_tables()?;
+    #[cfg(target_arch = "riscv64")]
+    let pt_root = crate::arch::riscv64::mm::setup_tables()?;
+    #[cfg(target_arch = "x86_64")]
+    let pt_root = crate::arch::x86_64::mm::create_user_page_table()?;
+
+    // Create address space.
+    let aspace_id = crate::mm::aspace::create(pt_root)?;
+
+    // Bootstrap capabilities: grant SEND caps for well-known kernel ports,
+    // and full cap for arg0 if it's a valid active port (port passing on spawn).
+    {
+        let mut caps = crate::cap::CAP_SYSTEM.lock();
+        caps.spaces[task_id as usize] = crate::cap::CapSpace::new(task_id);
+
+        let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
+        if nsrv != u32::MAX {
+            caps.grant_send_cap(task_id, nsrv);
+        }
+
+        let iramfs = crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
+        if iramfs != u32::MAX {
+            caps.grant_send_cap(task_id, iramfs);
+        }
+
+        if arg0_is_port {
+            caps.grant_full_port_cap(task_id, arg0 as u32);
+        }
     }
 
-    /// Create a user-mode thread in a new task from ELF data already in kernel memory.
-    fn create_user_thread_from_elf(
+    // Load ELF segments into the address space.
+    let elf_info = match crate::loader::elf::load_elf(elf_data, aspace_id, pt_root) {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+    let entry = elf_info.entry;
+
+    // Flush instruction cache.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
+    }
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence.i");
+    }
+
+    // Map user stack.
+    #[cfg(target_arch = "aarch64")]
+    const USER_STACK_TOP: usize = 0x7FFF_F000_0000;
+    #[cfg(target_arch = "riscv64")]
+    const USER_STACK_TOP: usize = 0x3F_F000_0000;
+    #[cfg(target_arch = "x86_64")]
+    const USER_STACK_TOP: usize = 0x7FFF_FFFF_0000;
+
+    let stack_pages = 2;
+    let stack_va = USER_STACK_TOP - stack_pages * PAGE_SIZE;
+
+    let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+        let vma = aspace.map_anon(stack_va, stack_pages, crate::mm::vma::VmaProt::ReadWrite)
+            .ok_or(())?;
+        Ok::<_, ()>(vma.object_id)
+    }).ok()?;
+
+    // Eagerly allocate and map stack pages.
+    let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
+    for page_idx in 0..stack_pages {
+        let page_va = stack_va + page_idx * PAGE_SIZE;
+
+        let pa = crate::mm::object::with_object(obj_id, |obj| {
+            obj.ensure_page(page_idx).map(|(pa, _)| pa)
+        })?;
+        let pa_usize = pa.as_usize();
+
+        unsafe {
+            core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
+        }
+
+        let sw_z = crate::mm::fault::sw_zeroed_bit();
+        #[cfg(target_arch = "aarch64")]
+        let pte_flags = crate::arch::aarch64::mm::USER_RW_FLAGS | sw_z;
+        #[cfg(target_arch = "riscv64")]
+        let pte_flags = crate::arch::riscv64::mm::USER_RW_FLAGS | sw_z;
+        #[cfg(target_arch = "x86_64")]
+        let pte_flags = crate::arch::x86_64::mm::USER_RW_FLAGS | sw_z;
+
+        for mmu_idx in 0..mmu_count {
+            let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
+            let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
+
+            #[cfg(target_arch = "aarch64")]
+            crate::arch::aarch64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+            #[cfg(target_arch = "riscv64")]
+            crate::arch::riscv64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+        }
+    }
+
+    // Allocate kernel stack for this thread.
+    let kstack_page = crate::mm::phys::alloc_page()?;
+    let kstack_base = kstack_page.as_usize();
+    let kstack_top = kstack_base + PAGE_SIZE;
+
+    // Build a fake exception frame for user-mode entry.
+    let frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
+    let frame = frame_sp as *mut u64;
+    unsafe {
+        for i in 0..(EXCEPTION_FRAME_SIZE / 8) {
+            *frame.add(i) = 0;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            *frame.add(32) = entry as u64;           // ELR_EL1
+            *frame.add(33) = 0x0;                     // SPSR_EL1 = EL0t
+            *frame.add(31) = USER_STACK_TOP as u64;   // SP_EL0
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            *frame.add(31) = entry as u64;            // sepc
+            *frame.add(32) = 1 << 5;                  // sstatus: SPIE=1, SPP=0
+            *frame.add(1) = USER_STACK_TOP as u64;    // sp (x2)
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            *frame.add(17) = entry as u64;                                              // RIP
+            *frame.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3;          // CS
+            *frame.add(19) = 0x200;                                                     // RFLAGS = IF
+            *frame.add(20) = USER_STACK_TOP as u64;                                     // RSP
+            *frame.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3;          // SS
+        }
+
+        // arg0 in first argument register
+        #[cfg(target_arch = "aarch64")]
+        { *frame.add(0) = arg0; }
+        #[cfg(target_arch = "riscv64")]
+        { *frame.add(9) = arg0; }
+        #[cfg(target_arch = "x86_64")]
+        { *frame.add(9) = arg0; }
+    }
+
+    Some((aspace_id, pt_root, frame_sp as u64, kstack_base))
+}
+
+impl Scheduler {
+    /// Phase 1 of user thread creation: allocate task/thread IDs and read parent info.
+    /// Must be called under SCHEDULER lock. Returns (task_id, thread_id, parent_info).
+    fn alloc_spawn_ids(
         &mut self,
-        elf_data: &[u8],
+    ) -> Option<(u32, ThreadId, SpawnParentInfo)> {
+        let task_id = self.alloc_task_id()?;
+        let thread_id = self.alloc_thread_id()?;
+        // Read parent info while we have the lock.
+        let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
+        let parent_task = self.threads[caller_tid as usize].task_id;
+        let pt = parent_task as usize;
+        let info = SpawnParentInfo {
+            parent_task,
+            sid: self.tasks[pt].sid,
+            ctty_port: self.tasks[pt].ctty_port,
+            uid: self.tasks[pt].uid,
+            euid: self.tasks[pt].euid,
+            gid: self.tasks[pt].gid,
+            egid: self.tasks[pt].egid,
+            groups: self.tasks[pt].groups,
+            ngroups: self.tasks[pt].ngroups,
+            rlimits: self.tasks[pt].rlimits,
+        };
+        Some((task_id, thread_id, info))
+    }
+
+    /// Phase 3 of user thread creation: populate task/thread state and add to run queue.
+    /// Must be called under SCHEDULER lock.
+    fn finalize_spawn(
+        &mut self,
+        task_id: u32,
+        thread_id: ThreadId,
+        parent: &SpawnParentInfo,
+        aspace_id: u32,
+        pt_root: usize,
         priority: u8,
         quantum: u32,
-        arg0: u64,
-    ) -> Option<ThreadId> {
-        // Allocate a task slot (may reuse an exited slot).
-        let task_id = self.alloc_task_id()?;
-
-        // Create a page table with kernel identity mapping.
-        #[cfg(target_arch = "aarch64")]
-        let pt_root = crate::arch::aarch64::mm::setup_tables()?;
-        #[cfg(target_arch = "riscv64")]
-        let pt_root = crate::arch::riscv64::mm::setup_tables()?;
-        #[cfg(target_arch = "x86_64")]
-        let pt_root = crate::arch::x86_64::mm::create_user_page_table()?;
-
-        // Create address space.
-        let aspace_id = crate::mm::aspace::create(pt_root)?;
-
-        // Set up the task.
+        frame_sp: u64,
+        kstack_base: usize,
+    ) {
         let task = &mut self.tasks[task_id as usize];
         task.id = task_id;
         task.active = true;
@@ -366,210 +550,41 @@ impl Scheduler {
         task.reaped = false;
         task.wait_status = 0;
         task.thread_count = 1;
-        // Record the parent task (caller's task) for waitpid.
-        let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
-        task.parent_task = self.threads[caller_tid as usize].task_id;
-        // Process group defaults to own task_id; session, ctty, credentials inherited from parent.
-        let parent_tid = task.parent_task;
-        let parent_sid = self.tasks[parent_tid as usize].sid;
-        let parent_ctty = self.tasks[parent_tid as usize].ctty_port;
-        let parent_uid = self.tasks[parent_tid as usize].uid;
-        let parent_euid = self.tasks[parent_tid as usize].euid;
-        let parent_gid = self.tasks[parent_tid as usize].gid;
-        let parent_egid = self.tasks[parent_tid as usize].egid;
-        let parent_groups = self.tasks[parent_tid as usize].groups;
-        let parent_ngroups = self.tasks[parent_tid as usize].ngroups;
-        let parent_rlimits = self.tasks[parent_tid as usize].rlimits;
-        let task = &mut self.tasks[task_id as usize];
+        task.parent_task = parent.parent_task;
         task.pgid = task_id;
-        task.sid = parent_sid;
-        task.ctty_port = parent_ctty;
+        task.sid = parent.sid;
+        task.ctty_port = parent.ctty_port;
         task.fg_pgid = 0;
-        task.uid = parent_uid;
-        task.euid = parent_euid;
-        task.gid = parent_gid;
-        task.egid = parent_egid;
-        task.groups = parent_groups;
-        task.ngroups = parent_ngroups;
-        task.rlimits = parent_rlimits;
+        task.uid = parent.uid;
+        task.euid = parent.euid;
+        task.gid = parent.gid;
+        task.egid = parent.egid;
+        task.groups = parent.groups;
+        task.ngroups = parent.ngroups;
+        task.rlimits = parent.rlimits;
 
-        // Bootstrap capabilities: grant SEND caps for well-known kernel ports,
-        // and full cap for arg0 if it's a valid active port (port passing on spawn).
-        {
-            let mut caps = crate::cap::CAP_SYSTEM.lock();
-            caps.spaces[task_id as usize] = crate::cap::CapSpace::new(task_id);
+        KILLED[thread_id as usize].store(false, Ordering::Release);
+        AFFINITY_MASK[thread_id as usize].store(u64::MAX, Ordering::Relaxed);
+        LAST_CPU[thread_id as usize].store(smp::cpu_id(), Ordering::Relaxed);
 
-            let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
-            if nsrv != u32::MAX {
-                caps.grant_send_cap(task_id, nsrv);
-            }
-
-            let iramfs = crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
-            if iramfs != u32::MAX {
-                caps.grant_send_cap(task_id, iramfs);
-            }
-
-            // If arg0 looks like a valid nonzero port, grant full cap for it.
-            // This enables the common pattern of parent creating a port and
-            // passing it to a child process. Skip arg0=0 (default/no arg).
-            if arg0 > 0 && (arg0 as usize) < crate::ipc::port::MAX_PORTS {
-                if crate::ipc::port::port_is_active(arg0 as u32) {
-                    caps.grant_full_port_cap(task_id, arg0 as u32);
-                }
-            }
-        }
-
-        // Load ELF segments into the address space.
-        let elf_info = match crate::loader::elf::load_elf(elf_data, aspace_id, pt_root) {
-            Ok(e) => e,
-            Err(_) => return None,
-        };
-        let entry = elf_info.entry;
-        // Flush instruction cache: code was written via identity-mapped VA
-        // but will be executed via user VA.
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
-        }
-        #[cfg(target_arch = "riscv64")]
-        unsafe {
-            core::arch::asm!("fence.i");
-        }
-
-        // Map user stack.
-        #[cfg(target_arch = "aarch64")]
-        const USER_STACK_TOP: usize = 0x7FFF_F000_0000;
-        #[cfg(target_arch = "riscv64")]
-        const USER_STACK_TOP: usize = 0x3F_F000_0000; // Below Sv39 256 GiB limit
-        #[cfg(target_arch = "x86_64")]
-        const USER_STACK_TOP: usize = 0x7FFF_FFFF_0000;
-
-        let stack_pages = 2; // Two allocation pages (128K) for user stack.
-        let stack_va = USER_STACK_TOP - stack_pages * PAGE_SIZE;
-
-        // Map the user stack in the address space.
-        let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-            let vma = aspace.map_anon(stack_va, stack_pages, crate::mm::vma::VmaProt::ReadWrite)
-                .ok_or(())?;
-            Ok::<_, ()>(vma.object_id)
-        }).ok()?;
-
-        // Eagerly allocate and map stack pages.
-        let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
-        for page_idx in 0..stack_pages {
-            let page_va = stack_va + page_idx * PAGE_SIZE;
-
-            let pa = crate::mm::object::with_object(obj_id, |obj| {
-                obj.ensure_page(page_idx).map(|(pa, _)| pa)
-            })?;
-            let pa_usize = pa.as_usize();
-
-            // Zero the page.
-            unsafe {
-                core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
-            }
-
-            // Map each MMU page.
-            let sw_z = crate::mm::fault::sw_zeroed_bit();
-            #[cfg(target_arch = "aarch64")]
-            let pte_flags = crate::arch::aarch64::mm::USER_RW_FLAGS | sw_z;
-            #[cfg(target_arch = "riscv64")]
-            let pte_flags = crate::arch::riscv64::mm::USER_RW_FLAGS | sw_z;
-            #[cfg(target_arch = "x86_64")]
-            let pte_flags = crate::arch::x86_64::mm::USER_RW_FLAGS | sw_z;
-
-            for mmu_idx in 0..mmu_count {
-                let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
-                let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
-
-                #[cfg(target_arch = "aarch64")]
-                crate::arch::aarch64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
-                #[cfg(target_arch = "riscv64")]
-                crate::arch::riscv64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
-                #[cfg(target_arch = "x86_64")]
-                crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
-            }
-
-            // PTE installation with SW_ZEROED is the authority — no bitmap update needed.
-        }
-
-        // Allocate kernel stack for this thread.
-        let kstack_page = crate::mm::phys::alloc_page()?;
-        let kstack_base = kstack_page.as_usize();
-        let kstack_top = kstack_base + PAGE_SIZE;
-
-        // Build a fake exception frame for user-mode entry.
-        let frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
-        let frame = frame_sp as *mut u64;
-        unsafe {
-            for i in 0..(EXCEPTION_FRAME_SIZE / 8) {
-                *frame.add(i) = 0;
-            }
-
-            #[cfg(target_arch = "aarch64")]
-            {
-                // ELR_EL1 = user entry point.
-                *frame.add(32) = entry as u64;
-                // SPSR_EL1 = EL0t (0x0), IRQs enabled.
-                *frame.add(33) = 0x0;
-                // SP_EL0 (frame offset 31) = user stack top.
-                *frame.add(31) = USER_STACK_TOP as u64;
-            }
-
-            #[cfg(target_arch = "riscv64")]
-            {
-                // sepc = user entry point.
-                *frame.add(31) = entry as u64;
-                // sstatus: SPP=0 (U-mode), SPIE=1 (enable IRQs on sret).
-                *frame.add(32) = 1 << 5; // SPIE only, SPP=0
-                // x2/sp (frame index 1) = user stack top.
-                *frame.add(1) = USER_STACK_TOP as u64;
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            {
-                *frame.add(17) = entry as u64;                            // RIP
-                *frame.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3; // CS = user code | RPL=3
-                *frame.add(19) = 0x200;                                    // RFLAGS = IF
-                *frame.add(20) = USER_STACK_TOP as u64;                    // RSP = user stack
-                *frame.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3; // SS = user data | RPL=3
-            }
-
-            // Write arg0 into the child's first argument register.
-            #[cfg(target_arch = "aarch64")]
-            { *frame.add(0) = arg0; } // x0
-            #[cfg(target_arch = "riscv64")]
-            { *frame.add(9) = arg0; } // a0 = x10 at frame index 9
-            #[cfg(target_arch = "x86_64")]
-            { *frame.add(9) = arg0; } // rdi at frame index 9
-        }
-
-        // Allocate thread (may reuse a Dead slot).
-        let id = self.alloc_thread_id()?;
-
-        // Clear killed/affinity flags from any previous occupant of this slot.
-        KILLED[id as usize].store(false, Ordering::Release);
-        AFFINITY_MASK[id as usize].store(u64::MAX, Ordering::Relaxed);
-        LAST_CPU[id as usize].store(smp::cpu_id(), Ordering::Relaxed);
-
-        let thread = &mut self.threads[id as usize];
-        thread.id = id;
+        let thread = &mut self.threads[thread_id as usize];
+        thread.id = thread_id;
         thread.state = ThreadState::Ready;
         thread.task_id = task_id;
         thread.base_priority = priority;
         thread.effective_priority = priority;
-        THREAD_PRIO[id as usize].store(priority, Ordering::Relaxed);
-        THREAD_TASK[id as usize].store(task_id, Ordering::Relaxed);
+        THREAD_PRIO[thread_id as usize].store(priority, Ordering::Relaxed);
+        THREAD_TASK[thread_id as usize].store(task_id, Ordering::Relaxed);
         thread.quantum = quantum;
         thread.default_quantum = quantum;
-        thread.saved_sp = frame_sp as u64;
+        thread.saved_sp = frame_sp;
         thread.stack_base = kstack_base;
         thread.sig_mask = 0;
         thread.sig_pending = 0;
 
-        self.run_queues[priority as usize].push(id);
-        Some(id)
+        self.run_queues[priority as usize].push(thread_id);
     }
+
 
     /// Create a new thread in an existing task (shared address space).
     /// The caller provides the user entry point, stack top, and an argument.
@@ -659,100 +674,6 @@ impl Scheduler {
         Some(id)
     }
 
-    /// Like create_user_thread, but also copies `data` into the child's address space
-    /// at `data_va`, and sets arg1=data_va, arg2=data_len in the initial frame.
-    fn create_user_thread_with_data(
-        &mut self,
-        elf_name: &[u8],
-        priority: u8,
-        quantum: u32,
-        arg0: u64,
-        data: &[u8],
-        data_va: usize,
-    ) -> Option<ThreadId> {
-        // First, create the thread normally.
-        let tid = self.create_user_thread(elf_name, priority, quantum, arg0)?;
-
-        let task_id = self.threads[tid as usize].task_id;
-        let aspace_id = self.tasks[task_id as usize].aspace_id;
-        let pt_root = self.tasks[task_id as usize].page_table_root;
-
-        // Map data pages into the child's address space.
-        let data_pages = (data.len() + PAGE_SIZE - 1) / PAGE_SIZE;
-        if data_pages > 0 {
-            let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-                let vma = aspace.map_anon(data_va, data_pages, crate::mm::vma::VmaProt::ReadOnly)
-                    .ok_or(())?;
-                Ok::<_, ()>(vma.object_id)
-            }).ok()?;
-
-            let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
-            let sw_z = crate::mm::fault::sw_zeroed_bit();
-            #[cfg(target_arch = "aarch64")]
-            let pte_flags = crate::arch::aarch64::mm::USER_RO_FLAGS | sw_z;
-            #[cfg(target_arch = "riscv64")]
-            let pte_flags = crate::arch::riscv64::mm::USER_RO_FLAGS | sw_z;
-            #[cfg(target_arch = "x86_64")]
-            let pte_flags = crate::arch::x86_64::mm::USER_RO_FLAGS | sw_z;
-
-            for page_idx in 0..data_pages {
-                let page_va = data_va + page_idx * PAGE_SIZE;
-                let pa = crate::mm::object::with_object(obj_id, |obj| {
-                    obj.ensure_page(page_idx).map(|(pa, _)| pa)
-                })?;
-                let pa_usize = pa.as_usize();
-
-                // Zero the page first, then copy data.
-                unsafe {
-                    core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
-                    let copy_start = page_idx * PAGE_SIZE;
-                    let copy_end = (copy_start + PAGE_SIZE).min(data.len());
-                    if copy_start < data.len() {
-                        core::ptr::copy_nonoverlapping(
-                            data[copy_start..copy_end].as_ptr(),
-                            pa_usize as *mut u8,
-                            copy_end - copy_start,
-                        );
-                    }
-                }
-
-                for mmu_idx in 0..mmu_count {
-                    let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
-                    let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
-                    #[cfg(target_arch = "aarch64")]
-                    crate::arch::aarch64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
-                    #[cfg(target_arch = "riscv64")]
-                    crate::arch::riscv64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
-                    #[cfg(target_arch = "x86_64")]
-                    crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
-                }
-
-                // PTE installation with SW_ZEROED is the authority — no bitmap update needed.
-            }
-        }
-
-        // Set arg1 = data_va, arg2 = data_len in the thread's exception frame.
-        let frame = self.threads[tid as usize].saved_sp as *mut u64;
-        unsafe {
-            #[cfg(target_arch = "aarch64")]
-            {
-                *frame.add(1) = data_va as u64; // x1
-                *frame.add(2) = data.len() as u64; // x2
-            }
-            #[cfg(target_arch = "riscv64")]
-            {
-                *frame.add(10) = data_va as u64; // a1 = x11 at frame index 10
-                *frame.add(11) = data.len() as u64; // a2 = x12 at frame index 11
-            }
-            #[cfg(target_arch = "x86_64")]
-            {
-                *frame.add(10) = data_va as u64; // rsi at frame index 10
-                *frame.add(11) = data.len() as u64; // rdx at frame index 11
-            }
-        }
-
-        Some(tid)
-    }
 
     fn pick_next(&mut self, idle_id: ThreadId) -> ThreadId {
         let cpu = smp::cpu_id();
@@ -958,13 +879,46 @@ pub fn spawn(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
 
 /// Spawn a new user-mode process from an ELF binary in the initramfs.
 /// Creates a new task with its own address space. `arg0` is passed to main().
+///
+/// Uses a 3-phase lock split to avoid ABBA deadlock between SCHEDULER and
+/// PORT_TABLE: phase 1 (alloc IDs) and phase 3 (finalize) hold SCHEDULER,
+/// but phase 2 (ELF loading, page table setup) runs without it.
 pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
-    SCHEDULER.lock().create_user_thread(elf_name, priority, quantum, arg0)
+    // Check port_is_active BEFORE locking SCHEDULER to avoid ABBA deadlock.
+    let arg0_is_port = arg0 > 0 && (arg0 as usize) < crate::ipc::port::MAX_PORTS
+        && crate::ipc::port::port_is_active(arg0 as u32);
+
+    // Look up the ELF binary (no locks needed).
+    let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
+
+    // Phase 1: allocate IDs under SCHEDULER lock.
+    let (task_id, thread_id, parent) = SCHEDULER.lock().alloc_spawn_ids()?;
+
+    // Phase 2: heavy work (page tables, ELF load, etc.) WITHOUT SCHEDULER lock.
+    let (aspace_id, pt_root, frame_sp, kstack_base) =
+        do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
+
+    // Phase 3: finalize task/thread state under SCHEDULER lock.
+    SCHEDULER.lock().finalize_spawn(
+        task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base,
+    );
+    Some(thread_id)
 }
 
 /// Spawn a new user-mode process from ELF data already in kernel memory.
 pub fn spawn_user_from_elf(elf_data: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
-    SCHEDULER.lock().create_user_thread_from_elf(elf_data, priority, quantum, arg0)
+    let arg0_is_port = arg0 > 0 && (arg0 as usize) < crate::ipc::port::MAX_PORTS
+        && crate::ipc::port::port_is_active(arg0 as u32);
+
+    let (task_id, thread_id, parent) = SCHEDULER.lock().alloc_spawn_ids()?;
+
+    let (aspace_id, pt_root, frame_sp, kstack_base) =
+        do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
+
+    SCHEDULER.lock().finalize_spawn(
+        task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base,
+    );
+    Some(thread_id)
 }
 
 /// Spawn a user-mode process with data mapped into its address space.
@@ -977,7 +931,93 @@ pub fn spawn_user_with_data(
     data_va: usize,
     arg0: u64,
 ) -> Option<ThreadId> {
-    SCHEDULER.lock().create_user_thread_with_data(elf_name, priority, quantum, arg0, data, data_va)
+    let arg0_is_port = arg0 > 0 && (arg0 as usize) < crate::ipc::port::MAX_PORTS
+        && crate::ipc::port::port_is_active(arg0 as u32);
+
+    let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
+
+    let (task_id, thread_id, parent) = SCHEDULER.lock().alloc_spawn_ids()?;
+
+    // Phase 2: ELF load + stack setup WITHOUT SCHEDULER lock.
+    let (aspace_id, pt_root, frame_sp, kstack_base) =
+        do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
+
+    // Map data pages into the child's address space (still no SCHEDULER lock).
+    let data_pages = (data.len() + PAGE_SIZE - 1) / PAGE_SIZE;
+    if data_pages > 0 {
+        let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+            let vma = aspace.map_anon(data_va, data_pages, crate::mm::vma::VmaProt::ReadOnly)
+                .ok_or(())?;
+            Ok::<_, ()>(vma.object_id)
+        }).ok()?;
+
+        let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
+        let sw_z = crate::mm::fault::sw_zeroed_bit();
+        #[cfg(target_arch = "aarch64")]
+        let pte_flags = crate::arch::aarch64::mm::USER_RO_FLAGS | sw_z;
+        #[cfg(target_arch = "riscv64")]
+        let pte_flags = crate::arch::riscv64::mm::USER_RO_FLAGS | sw_z;
+        #[cfg(target_arch = "x86_64")]
+        let pte_flags = crate::arch::x86_64::mm::USER_RO_FLAGS | sw_z;
+
+        for page_idx in 0..data_pages {
+            let page_va = data_va + page_idx * PAGE_SIZE;
+            let pa = crate::mm::object::with_object(obj_id, |obj| {
+                obj.ensure_page(page_idx).map(|(pa, _)| pa)
+            })?;
+            let pa_usize = pa.as_usize();
+
+            unsafe {
+                core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
+                let copy_start = page_idx * PAGE_SIZE;
+                let copy_end = (copy_start + PAGE_SIZE).min(data.len());
+                if copy_start < data.len() {
+                    core::ptr::copy_nonoverlapping(
+                        data[copy_start..copy_end].as_ptr(),
+                        pa_usize as *mut u8,
+                        copy_end - copy_start,
+                    );
+                }
+            }
+
+            for mmu_idx in 0..mmu_count {
+                let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
+                let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
+                #[cfg(target_arch = "aarch64")]
+                crate::arch::aarch64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+                #[cfg(target_arch = "riscv64")]
+                crate::arch::riscv64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+                #[cfg(target_arch = "x86_64")]
+                crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+            }
+        }
+    }
+
+    // Set arg1 = data_va, arg2 = data_len in the thread's exception frame.
+    let frame = frame_sp as *mut u64;
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        {
+            *frame.add(1) = data_va as u64;
+            *frame.add(2) = data.len() as u64;
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            *frame.add(10) = data_va as u64;
+            *frame.add(11) = data.len() as u64;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            *frame.add(10) = data_va as u64;
+            *frame.add(11) = data.len() as u64;
+        }
+    }
+
+    // Phase 3: finalize under SCHEDULER lock.
+    SCHEDULER.lock().finalize_spawn(
+        task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base,
+    );
+    Some(thread_id)
 }
 
 /// Create a new thread in the caller's task. Returns thread ID or None.
