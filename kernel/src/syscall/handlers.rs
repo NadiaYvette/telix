@@ -114,6 +114,8 @@ pub const SYS_SIGSUSPEND: u64 = 97;
 pub const SYS_SIGALTSTACK: u64 = 98;
 pub const SYS_PROXY_REGISTER: u64 = 99;
 pub const SYS_PORT_RESIZE: u64 = 100;
+pub const SYS_FUTEX_WAIT_PI: u64 = 101;
+pub const SYS_FUTEX_WAKE_PI: u64 = 102;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -359,6 +361,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SIGALTSTACK => sys_sigaltstack(a0, a1),
         SYS_PROXY_REGISTER => sys_proxy_register(a0),
         SYS_PORT_RESIZE => sys_port_resize(a0, a1),
+        SYS_FUTEX_WAIT_PI => crate::sync::turnstile::futex_wait_pi(a0 as usize, a1 as u32),
+        SYS_FUTEX_WAKE_PI => crate::sync::turnstile::futex_wake_pi(a0 as usize),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1206,7 +1210,9 @@ fn sys_irq_wait(irq_num: u64, mmio_base: u64) -> u64 {
 
     // Registration call: register mmio_base, enable IRQ, return immediately.
     if mmio_base != 0 {
-        crate::io::irq_dispatch::register(irq, mmio_base as usize);
+        if !crate::io::irq_dispatch::register(irq, mmio_base as usize) {
+            return u64::MAX;
+        }
         return 0;
     }
 

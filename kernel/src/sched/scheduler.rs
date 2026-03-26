@@ -966,6 +966,10 @@ impl Scheduler {
         thread.sig_mask = 0;
         thread.sig_pending = 0;
 
+        // Pre-allocate a turnstile for this thread (for futex PI lending).
+        let ts = crate::sync::turnstile::alloc_thread_turnstile();
+        thread.turnstile.store(ts, Ordering::Relaxed);
+
         percpu_enqueue(smp::cpu_id(), priority, thread_id);
     }
 
@@ -1054,6 +1058,10 @@ impl Scheduler {
         thread.exit_code = 0;
         thread.sig_mask = 0;
         thread.sig_pending = 0;
+
+        // Pre-allocate a turnstile for this thread (for futex PI lending).
+        let ts = crate::sync::turnstile::alloc_thread_turnstile();
+        thread.turnstile.store(ts, Ordering::Relaxed);
 
         self.task_mut(task_id).thread_count += 1;
         percpu_enqueue(smp::cpu_id(), priority, id);
@@ -2307,6 +2315,12 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         let pt_root = task.page_table_root;
         (tid, is_last, aspace_id, pt_root, kstack_base, parent_task_id, task_port, thread_port)
     }; // scheduler lock dropped here
+
+    // Clean up turnstile state: dequeue from any wait queue, free pre-allocated turnstile.
+    crate::sync::turnstile::cleanup_blocked(tid);
+    let tptr = THREAD_TABLE.get(tid) as *const super::thread::Thread;
+    let ts_addr = unsafe { (*tptr).turnstile.swap(0, Ordering::Relaxed) };
+    crate::sync::turnstile::free_thread_turnstile(ts_addr);
 
     // Destroy the thread's kernel-held port (outside SCHEDULER lock for lock ordering).
     if thread_port != 0 {

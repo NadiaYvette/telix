@@ -99,6 +99,15 @@ pub struct Thread {
     pub cosched_group: core::sync::atomic::AtomicU32,
     pub last_cpu: core::sync::atomic::AtomicU32,
     pub affinity_mask: super::cpumask::AtomicCpuMask,
+    // --- Turnstile futex support ---
+    /// Pre-allocated turnstile (phys addr as usize, 0 = none/lent).
+    pub turnstile: core::sync::atomic::AtomicUsize,
+    /// Next thread in turnstile wait queue (0 = end).
+    pub ts_next: core::sync::atomic::AtomicU32,
+    /// Previous thread in turnstile wait queue (0 = start).
+    pub ts_prev: core::sync::atomic::AtomicU32,
+    /// Turnstile pointer we're currently blocked on (0 = not blocked).
+    pub ts_blocked_on: core::sync::atomic::AtomicUsize,
 }
 
 impl Thread {
@@ -136,6 +145,10 @@ impl Thread {
             cosched_group: core::sync::atomic::AtomicU32::new(0),
             last_cpu: core::sync::atomic::AtomicU32::new(0),
             affinity_mask: super::cpumask::AtomicCpuMask::new_all(),
+            turnstile: core::sync::atomic::AtomicUsize::new(0),
+            ts_next: core::sync::atomic::AtomicU32::new(0),
+            ts_prev: core::sync::atomic::AtomicU32::new(0),
+            ts_blocked_on: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
