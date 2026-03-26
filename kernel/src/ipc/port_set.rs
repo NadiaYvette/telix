@@ -1,42 +1,72 @@
 //! Port set: multiplexed wait across multiple ports.
 //!
 //! A port set allows a server to wait for messages on any of several ports.
+//! Both the set table and per-set port lists grow dynamically — no compile-time caps.
 
 use super::message::Message;
 use super::port::{self, PortId};
+use crate::mm::paged_array::PagedArray;
+use crate::mm::page::PAGE_SIZE;
+use crate::mm::phys;
 use crate::sched::thread::ThreadId;
 
 pub type PortSetId = u32;
 
-/// Maximum ports in a single port set.
-const MAX_SET_PORTS: usize = 16;
+/// Ports per page in a port set's port list.
+const PORTS_PER_PAGE: usize = PAGE_SIZE / core::mem::size_of::<PortId>();
 
 /// A set of ports that can be waited on together.
 pub struct PortSet {
     #[allow(dead_code)]
     pub id: PortSetId,
     pub active: bool,
-    ports: [PortId; MAX_SET_PORTS],
+    /// Page-allocated port list (lazily allocated on first add).
+    ports: *mut PortId,
+    ports_cap: usize,
     count: usize,
     /// Thread blocked in recv_blocking (if any).
     waiter: Option<ThreadId>,
 }
+
+// Safety: ports pointer is accessed only under PORT_SET_TABLE lock.
+unsafe impl Send for PortSet {}
 
 impl PortSet {
     pub const fn new(id: PortSetId) -> Self {
         Self {
             id,
             active: true,
-            ports: [0; MAX_SET_PORTS],
+            ports: core::ptr::null_mut(),
+            ports_cap: 0,
             count: 0,
             waiter: None,
         }
     }
 
+    /// Ensure the port list backing page is allocated.
+    fn ensure_ports(&mut self) -> bool {
+        if !self.ports.is_null() {
+            return true;
+        }
+        let page = match phys::alloc_page() {
+            Some(pa) => pa.as_usize() as *mut PortId,
+            None => return false,
+        };
+        unsafe {
+            core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+        }
+        self.ports = page;
+        self.ports_cap = PORTS_PER_PAGE;
+        true
+    }
+
     /// Add a port to this set.
     pub fn add(&mut self, port_id: PortId) -> bool {
-        if self.count < MAX_SET_PORTS {
-            self.ports[self.count] = port_id;
+        if !self.ensure_ports() {
+            return false;
+        }
+        if self.count < self.ports_cap {
+            unsafe { *self.ports.add(self.count) = port_id; }
             self.count += 1;
             true
         } else {
@@ -48,7 +78,7 @@ impl PortSet {
     /// Returns (port_id, message) on success.
     pub fn try_recv(&self) -> Option<(PortId, Message)> {
         for i in 0..self.count {
-            let pid = self.ports[i];
+            let pid = unsafe { *self.ports.add(i) };
             if let Ok(msg) = port::recv_nb(pid) {
                 return Some((pid, msg));
             }
@@ -57,20 +87,17 @@ impl PortSet {
     }
 }
 
-/// Maximum number of port sets.
-pub const MAX_PORT_SETS: usize = 16;
-
 use crate::sync::SpinLock;
 
 struct PortSetTable {
-    sets: [PortSet; MAX_PORT_SETS],
+    sets: PagedArray<PortSet>,
     next_id: PortSetId,
 }
 
 impl PortSetTable {
     const fn new() -> Self {
         Self {
-            sets: [const { PortSet::new(0) }; MAX_PORT_SETS],
+            sets: PagedArray::new(),
             next_id: 0,
         }
     }
@@ -82,10 +109,10 @@ static PORT_SET_TABLE: SpinLock<PortSetTable> = SpinLock::new(PortSetTable::new(
 pub fn create() -> Option<PortSetId> {
     let mut table = PORT_SET_TABLE.lock();
     let id = table.next_id;
-    if id as usize >= MAX_PORT_SETS {
+    if !table.sets.ensure_capacity(id as usize + 1) {
         return None;
     }
-    table.sets[id as usize] = PortSet::new(id);
+    *table.sets.get_mut(id as usize) = PortSet::new(id);
     table.next_id += 1;
     Some(id)
 }
@@ -94,8 +121,8 @@ pub fn create() -> Option<PortSetId> {
 pub fn add_port(set_id: PortSetId, port_id: PortId) -> bool {
     let ok = {
         let mut table = PORT_SET_TABLE.lock();
-        if (set_id as usize) < MAX_PORT_SETS {
-            table.sets[set_id as usize].add(port_id)
+        if (set_id as usize) < table.next_id as usize {
+            table.sets.get_mut(set_id as usize).add(port_id)
         } else {
             false
         }
@@ -110,8 +137,8 @@ pub fn add_port(set_id: PortSetId, port_id: PortId) -> bool {
 #[allow(dead_code)]
 pub fn recv(set_id: PortSetId) -> Option<(PortId, Message)> {
     let table = PORT_SET_TABLE.lock();
-    if (set_id as usize) < MAX_PORT_SETS {
-        table.sets[set_id as usize].try_recv()
+    if (set_id as usize) < table.next_id as usize {
+        table.sets.get(set_id as usize).try_recv()
     } else {
         None
     }
@@ -128,10 +155,12 @@ pub fn recv_blocking(set_id: PortSetId) -> Option<(PortId, Message)> {
         // First try a non-blocking recv (PORT_SET_TABLE lock held briefly).
         {
             let table = PORT_SET_TABLE.lock();
-            if (set_id as usize) >= MAX_PORT_SETS || !table.sets[set_id as usize].active {
+            if (set_id as usize) >= table.next_id as usize
+                || !table.sets.get(set_id as usize).active
+            {
                 return None;
             }
-            if let Some((port_id, msg)) = table.sets[set_id as usize].try_recv() {
+            if let Some((port_id, msg)) = table.sets.get(set_id as usize).try_recv() {
                 // Boost to sender's priority (priority inheritance).
                 crate::sched::boost_priority(my_tid, msg.data[5] as u8);
                 return Some((port_id, msg));
@@ -142,13 +171,13 @@ pub fn recv_blocking(set_id: PortSetId) -> Option<(PortId, Message)> {
         {
             let mut table = PORT_SET_TABLE.lock();
             // Double-check: a message may have arrived between the two locks.
-            if let Some((port_id, msg)) = table.sets[set_id as usize].try_recv() {
+            if let Some((port_id, msg)) = table.sets.get(set_id as usize).try_recv() {
                 crate::sched::boost_priority(my_tid, msg.data[5] as u8);
                 return Some((port_id, msg));
             }
             let tid = crate::sched::current_thread_id();
             crate::sched::clear_wakeup_flag(tid);
-            table.sets[set_id as usize].waiter = Some(tid);
+            table.sets.get_mut(set_id as usize).waiter = Some(tid);
         }
 
         crate::sched::block_current(BlockReason::PortSetRecv(set_id));
@@ -160,8 +189,8 @@ pub fn recv_blocking(set_id: PortSetId) -> Option<(PortId, Message)> {
 pub fn wake_set_waiter(set_id: u32) {
     let waiter = {
         let mut table = PORT_SET_TABLE.lock();
-        if (set_id as usize) < MAX_PORT_SETS {
-            table.sets[set_id as usize].waiter.take()
+        if (set_id as usize) < table.next_id as usize {
+            table.sets.get_mut(set_id as usize).waiter.take()
         } else {
             None
         }

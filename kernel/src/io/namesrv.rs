@@ -1,15 +1,16 @@
 //! Name server — maps service names to IPC port IDs.
 //!
 //! Runs as a kernel thread. Clients register and look up services via IPC messages.
+//! The name table grows dynamically — no compile-time cap on registered services.
 
 use crate::ipc::{port, Message};
+use crate::mm::paged_array::PagedArray;
 use super::protocol::*;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Global port ID for the name server.
 pub static NAMESRV_PORT: AtomicU64 = AtomicU64::new(u64::MAX);
 
-const MAX_SERVICES: usize = 32;
 const MAX_SVC_NAME: usize = 24;
 
 struct ServiceEntry {
@@ -31,14 +32,14 @@ impl ServiceEntry {
 }
 
 struct NameTable {
-    entries: [ServiceEntry; MAX_SERVICES],
+    entries: PagedArray<ServiceEntry>,
     count: usize,
 }
 
 impl NameTable {
     const fn new() -> Self {
         Self {
-            entries: [const { ServiceEntry::empty() }; MAX_SERVICES],
+            entries: PagedArray::new(),
             count: 0,
         }
     }
@@ -46,17 +47,19 @@ impl NameTable {
     fn register(&mut self, name: &[u8], port_id: u64) -> bool {
         // Check for duplicate — update if exists.
         for i in 0..self.count {
-            if self.entries[i].active && self.entries[i].name_len == name.len()
-                && &self.entries[i].name[..name.len()] == name
+            let e = self.entries.get(i);
+            if e.active && e.name_len == name.len()
+                && &e.name[..name.len()] == name
             {
-                self.entries[i].port_id = port_id;
+                self.entries.get_mut(i).port_id = port_id;
                 return true;
             }
         }
-        if self.count >= MAX_SERVICES {
+        if !self.entries.ensure_capacity(self.count + 1) {
             return false;
         }
-        let e = &mut self.entries[self.count];
+        let e = self.entries.get_mut(self.count);
+        *e = ServiceEntry::empty();
         let len = name.len().min(MAX_SVC_NAME);
         e.name[..len].copy_from_slice(&name[..len]);
         e.name_len = len;
@@ -68,10 +71,11 @@ impl NameTable {
 
     fn lookup(&self, name: &[u8]) -> Option<u64> {
         for i in 0..self.count {
-            if self.entries[i].active && self.entries[i].name_len == name.len()
-                && &self.entries[i].name[..name.len()] == name
+            let e = self.entries.get(i);
+            if e.active && e.name_len == name.len()
+                && &e.name[..name.len()] == name
             {
-                return Some(self.entries[i].port_id);
+                return Some(e.port_id);
             }
         }
         None

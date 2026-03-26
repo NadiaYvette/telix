@@ -7,7 +7,7 @@
 
 use super::capability::{Capability, Rights};
 use super::cdt::Cdt;
-use super::cnode::{CNode, CNODE_SLOTS};
+use super::cnode::CNode;
 
 /// Per-task capability space: a root CNode plus a task ID for CDT tracking.
 pub struct CapSpace {
@@ -36,9 +36,8 @@ impl CapSpace {
     /// Insert a capability at a specific slot as a root capability.
     #[allow(dead_code)]
     pub fn insert_at(&mut self, slot: usize, mut cap: Capability, cdt: &mut Cdt) -> bool {
-        if slot >= CNODE_SLOTS {
-            return false;
-        }
+        // insert() handles lazy allocation; it will return None if slot is out of range.
+
         if let Some(cdt_idx) = cdt.insert_root(&cap, self.task_id, slot as u16) {
             cap.cdt_index = cdt_idx;
             self.root.insert(slot, cap);
@@ -90,7 +89,7 @@ impl CapSpace {
     /// Find a Port capability for the given port_id with at least `needed` rights.
     /// Returns the slot index, or None if not found.
     pub fn find_port_cap(&self, port_id: usize, needed: Rights) -> Option<usize> {
-        for i in 0..CNODE_SLOTS {
+        for i in 0..self.root.num_slots() {
             if let Some(cap) = self.root.get(i) {
                 if cap.cap_type as u8 == super::capability::CapType::Port as u8
                     && cap.object == port_id
@@ -105,7 +104,7 @@ impl CapSpace {
 
     /// Remove all capabilities referencing the given port_id.
     pub fn remove_port_caps(&mut self, port_id: usize) {
-        for i in 0..CNODE_SLOTS {
+        for i in 0..self.root.num_slots() {
             if let Some(cap) = self.root.get(i) {
                 if cap.cap_type as u8 == super::capability::CapType::Port as u8
                     && cap.object == port_id

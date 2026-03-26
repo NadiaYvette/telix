@@ -1,29 +1,56 @@
-//! CNode: capability storage node — an array of capability slots.
+//! CNode: capability storage node — a dynamically-sized array of capability slots.
 //!
-//! A task's capability space is a tree of CNodes. For the common single-level
-//! case, a task has a single root CNode and refers to capabilities by slot index.
+//! Slots are backed by a single physical page, allocated lazily on first use.
+//! At 64 KiB pages and 24-byte capabilities: ~2730 slots per CNode.
 
 use super::capability::Capability;
+use crate::mm::page::PAGE_SIZE;
+use crate::mm::phys;
 
-/// Number of slots in a CNode. Must be a power of 2.
-pub const CNODE_SLOTS: usize = 64;
+/// Number of capability slots that fit in one page.
+pub const CNODE_SLOTS: usize = PAGE_SIZE / core::mem::size_of::<Capability>();
 
-/// A capability storage node: a fixed-size array of capability slots.
+/// A capability storage node: a page-backed array of capability slots.
 pub struct CNode {
-    slots: [Capability; CNODE_SLOTS],
+    slots: *mut Capability,
+    num_slots: usize,
 }
+
+// Safety: the slots pointer is set once (on first use) and only accessed
+// under the CAP_SYSTEM lock.
+unsafe impl Send for CNode {}
+unsafe impl Sync for CNode {}
 
 impl CNode {
     pub const fn new() -> Self {
         Self {
-            slots: [Capability::null(); CNODE_SLOTS],
+            slots: core::ptr::null_mut(),
+            num_slots: 0,
         }
+    }
+
+    /// Ensure the backing page is allocated. Returns false on OOM.
+    fn ensure_slots(&mut self) -> bool {
+        if !self.slots.is_null() {
+            return true;
+        }
+        let page = match phys::alloc_page() {
+            Some(pa) => pa.as_usize() as *mut Capability,
+            None => return false,
+        };
+        // Zero-initialize — null capabilities have all zero bytes.
+        unsafe {
+            core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+        }
+        self.slots = page;
+        self.num_slots = CNODE_SLOTS;
+        true
     }
 
     /// Get a reference to a slot by index.
     pub fn get(&self, index: usize) -> Option<&Capability> {
-        if index < CNODE_SLOTS {
-            Some(&self.slots[index])
+        if index < self.num_slots {
+            Some(unsafe { &*self.slots.add(index) })
         } else {
             None
         }
@@ -32,8 +59,8 @@ impl CNode {
     /// Get a mutable reference to a slot by index.
     #[allow(dead_code)]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut Capability> {
-        if index < CNODE_SLOTS {
-            Some(&mut self.slots[index])
+        if index < self.num_slots {
+            Some(unsafe { &mut *self.slots.add(index) })
         } else {
             None
         }
@@ -42,9 +69,13 @@ impl CNode {
     /// Insert a capability at the given slot index.
     /// Returns the previous capability in that slot.
     pub fn insert(&mut self, index: usize, cap: Capability) -> Option<Capability> {
-        if index < CNODE_SLOTS {
-            let old = self.slots[index];
-            self.slots[index] = cap;
+        if !self.ensure_slots() {
+            return None;
+        }
+        if index < self.num_slots {
+            let slot = unsafe { &mut *self.slots.add(index) };
+            let old = *slot;
+            *slot = cap;
             Some(old)
         } else {
             None
@@ -55,9 +86,10 @@ impl CNode {
     /// Returns the removed capability.
     #[allow(dead_code)]
     pub fn remove(&mut self, index: usize) -> Option<Capability> {
-        if index < CNODE_SLOTS {
-            let old = self.slots[index];
-            self.slots[index] = Capability::null();
+        if index < self.num_slots {
+            let slot = unsafe { &mut *self.slots.add(index) };
+            let old = *slot;
+            *slot = Capability::null();
             Some(old)
         } else {
             None
@@ -65,18 +97,32 @@ impl CNode {
     }
 
     /// Find the first empty slot. Returns the index or None.
-    pub fn find_empty(&self) -> Option<usize> {
-        for i in 0..CNODE_SLOTS {
-            if self.slots[i].is_null() {
+    pub fn find_empty(&mut self) -> Option<usize> {
+        if !self.ensure_slots() {
+            return None;
+        }
+        for i in 0..self.num_slots {
+            if unsafe { (*self.slots.add(i)).is_null() } {
                 return Some(i);
             }
         }
         None
     }
 
+    /// Number of slots available.
+    pub fn num_slots(&self) -> usize {
+        self.num_slots
+    }
+
     /// Number of non-null capabilities.
     #[allow(dead_code)]
     pub fn count(&self) -> usize {
-        self.slots.iter().filter(|c| !c.is_null()).count()
+        let mut n = 0;
+        for i in 0..self.num_slots {
+            if !unsafe { (*self.slots.add(i)).is_null() } {
+                n += 1;
+            }
+        }
+        n
     }
 }

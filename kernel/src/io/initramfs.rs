@@ -2,10 +2,12 @@
 //!
 //! The CPIO newc-format archive is compiled into the kernel binary via
 //! `include_bytes!`. The server parses the archive at startup into a
-//! fixed-size file table, then handles I/O protocol messages.
+//! dynamically-grown file table, then handles I/O protocol messages.
+//! No compile-time cap on the number of files.
 
 use crate::ipc::port::{self};
 use crate::ipc::Message;
+use crate::mm::paged_array::PagedArray;
 use super::protocol::*;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,8 +20,6 @@ pub static USER_INITRAMFS_PORT: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Embedded CPIO archive.
 static INITRAMFS: &[u8] = include_bytes!("initramfs.cpio");
 
-/// Maximum files in the initramfs.
-const MAX_FILES: usize = 64;
 /// Maximum filename length.
 const MAX_NAME: usize = 64;
 
@@ -50,14 +50,14 @@ impl FileEntry {
 
 /// The initramfs file table.
 struct Initramfs {
-    files: [FileEntry; MAX_FILES],
+    files: PagedArray<FileEntry>,
     count: usize,
 }
 
 impl Initramfs {
     const fn new() -> Self {
         Self {
-            files: [const { FileEntry::empty() }; MAX_FILES],
+            files: PagedArray::new(),
             count: 0,
         }
     }
@@ -65,7 +65,7 @@ impl Initramfs {
     /// Parse the CPIO newc archive.
     fn parse(&mut self, data: &[u8]) {
         let mut pos = 0;
-        while pos + 110 <= data.len() && self.count < MAX_FILES {
+        while pos + 110 <= data.len() {
             // CPIO newc header: "070701" magic (6 bytes) + 13 × 8-char hex fields.
             if &data[pos..pos + 6] != b"070701" {
                 break;
@@ -95,7 +95,11 @@ impl Initramfs {
 
             // Skip directories (filesize == 0 and name ends with '/') and "." entry.
             if !(filesize == 0 || name == b".") {
-                let entry = &mut self.files[self.count];
+                if !self.files.ensure_capacity(self.count + 1) {
+                    break; // OOM
+                }
+                let entry = self.files.get_mut(self.count);
+                *entry = FileEntry::empty();
                 let copy_len = name.len().min(MAX_NAME);
                 entry.name[..copy_len].copy_from_slice(&name[..copy_len]);
                 entry.name_len = copy_len;
@@ -112,7 +116,8 @@ impl Initramfs {
     /// Find a file by name. Returns index or None.
     fn find(&self, name: &[u8]) -> Option<usize> {
         for i in 0..self.count {
-            if self.files[i].active && self.files[i].name_bytes() == name {
+            let f = self.files.get(i);
+            if f.active && f.name_bytes() == name {
                 return Some(i);
             }
         }
@@ -121,7 +126,7 @@ impl Initramfs {
 
     /// Read bytes from a file.
     fn read(&self, file_idx: usize, offset: usize, len: usize) -> &[u8] {
-        let f = &self.files[file_idx];
+        let f = self.files.get(file_idx);
         let start = f.data_offset + offset.min(f.data_len);
         let end = f.data_offset + (offset + len).min(f.data_len);
         &INITRAMFS[start..end]
@@ -162,7 +167,7 @@ pub fn lookup_file(name: &[u8]) -> Option<&'static [u8]> {
     }
     let fs = guard.as_ref().unwrap();
     let idx = fs.find(name)?;
-    let f = &fs.files[idx];
+    let f = fs.files.get(idx);
     Some(&INITRAMFS[f.data_offset..f.data_offset + f.data_len])
 }
 
@@ -174,7 +179,7 @@ pub fn initramfs_server() -> ! {
     crate::println!("  [initramfs] parsed {} files from {} byte archive",
         fs.count, INITRAMFS.len());
     for i in 0..fs.count {
-        let f = &fs.files[i];
+        let f = fs.files.get(i);
         // Convert name to str for printing.
         let name = core::str::from_utf8(f.name_bytes()).unwrap_or("?");
         crate::println!("  [initramfs]   {} ({} bytes)", name, f.data_len);
@@ -202,7 +207,7 @@ pub fn initramfs_server() -> ! {
                     Some(idx) => {
                         let reply = Message::new(IO_CONNECT_OK, [
                             idx as u64,
-                            fs.files[idx].data_len as u64,
+                            fs.files.get(idx).data_len as u64,
                             0, 0, 0, 0,
                         ]);
                         let _ = port::send_nb(reply_port, reply);
@@ -220,7 +225,7 @@ pub fn initramfs_server() -> ! {
                 let length = msg.data[2] as usize;
                 let reply_port = msg.data[3];
 
-                if file_handle >= fs.count || !fs.files[file_handle].active {
+                if file_handle >= fs.count || !fs.files.get(file_handle).active {
                     let reply = Message::new(IO_ERROR, [ERR_INVALID, 0, 0, 0, 0, 0]);
                     let _ = port::send_nb(reply_port, reply);
                     continue;
@@ -253,14 +258,14 @@ pub fn initramfs_server() -> ! {
                 let file_handle = msg.data[0] as usize;
                 let reply_port = msg.data[1];
 
-                if file_handle >= fs.count || !fs.files[file_handle].active {
+                if file_handle >= fs.count || !fs.files.get(file_handle).active {
                     let reply = Message::new(IO_ERROR, [ERR_INVALID, 0, 0, 0, 0, 0]);
                     let _ = port::send_nb(reply_port, reply);
                     continue;
                 }
 
                 let reply = Message::new(IO_STAT_OK, [
-                    fs.files[file_handle].data_len as u64,
+                    fs.files.get(file_handle).data_len as u64,
                     0, // type = regular file
                     0, 0, 0, 0,
                 ]);
