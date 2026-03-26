@@ -4,6 +4,9 @@
 //! physical page, records the fault here, parks the faulting thread, and wakes
 //! the pager thread (if blocked in wait_fault). The pager thread fills the page
 //! and calls fault_complete to install the PTE and wake the faulting thread.
+//!
+//! The fault table is page-allocated on first use — no fixed slot limit.
+//! Capacity = PAGE_SIZE / size_of::<PagerFaultEntry>() (e.g. 819 at 64 KiB pages).
 
 use super::aspace;
 use super::fault;
@@ -13,8 +16,6 @@ use crate::sched::scheduler;
 use crate::sched::thread::BlockReason;
 use crate::sync::SpinLock;
 use core::sync::atomic::Ordering;
-
-const MAX_PAGER_FAULTS: usize = 16;
 
 /// Information about a pending pager fault.
 pub struct PagerFaultInfo {
@@ -44,26 +45,61 @@ struct PagerFaultEntry {
     file_offset: u64,
 }
 
-impl PagerFaultEntry {
-    const fn empty() -> Self {
+/// Page-backed fault table with lazy allocation.
+struct PagerFaultTable {
+    entries: *mut PagerFaultEntry,
+    capacity: usize,
+}
+
+// Safety: entries pointer is a physical address, accessed only under SpinLock.
+unsafe impl Send for PagerFaultTable {}
+
+impl PagerFaultTable {
+    const fn new() -> Self {
         Self {
-            active: false, aspace_id: 0, thread_id: 0, fault_va: 0,
-            phys_addr: 0, obj_page_idx: 0, obj_id: 0, mmu_idx: 0,
-            vma_va: 0, file_handle: 0, file_offset: 0,
+            entries: core::ptr::null_mut(),
+            capacity: 0,
         }
+    }
+
+    /// Ensure the backing page is allocated. Returns false on OOM.
+    fn ensure_capacity(&mut self) -> bool {
+        if self.entries.is_null() {
+            let page = match super::phys::alloc_page() {
+                Some(pa) => pa.as_usize() as *mut PagerFaultEntry,
+                None => return false,
+            };
+            unsafe {
+                core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+            }
+            self.entries = page;
+            self.capacity = PAGE_SIZE / core::mem::size_of::<PagerFaultEntry>();
+        }
+        true
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> &PagerFaultEntry {
+        unsafe { &*self.entries.add(idx) }
+    }
+
+    #[inline]
+    fn get_mut(&mut self, idx: usize) -> &mut PagerFaultEntry {
+        unsafe { &mut *self.entries.add(idx) }
     }
 }
 
-static PAGER_FAULTS: SpinLock<[PagerFaultEntry; MAX_PAGER_FAULTS]> = SpinLock::new({
-    const EMPTY: PagerFaultEntry = PagerFaultEntry::empty();
-    [EMPTY; MAX_PAGER_FAULTS]
-});
+static PAGER_FAULTS: SpinLock<PagerFaultTable> = SpinLock::new(PagerFaultTable::new());
 
 /// Record a pending pager fault. Returns a token (slot index) on success.
 /// Called from the fault handler inside with_aspace() — must not park.
 pub fn record_fault(info: PagerFaultInfo) -> Option<u32> {
     let mut faults = PAGER_FAULTS.lock();
-    for (i, entry) in faults.iter_mut().enumerate() {
+    if !faults.ensure_capacity() {
+        return None;
+    }
+    for i in 0..faults.capacity {
+        let entry = faults.get_mut(i);
         if !entry.active {
             entry.active = true;
             entry.aspace_id = info.aspace_id;
@@ -96,7 +132,10 @@ pub const PAGER_FAULT_REQ: u64 = 0x8000;
 pub fn initiate_fault(token: u32) {
     let (aspace_id, obj_id, fault_va, file_handle, file_offset) = {
         let faults = PAGER_FAULTS.lock();
-        let e = &faults[token as usize];
+        if (token as usize) >= faults.capacity {
+            return;
+        }
+        let e = faults.get(token as usize);
         (e.aspace_id, e.obj_id, e.fault_va, e.file_handle, e.file_offset)
     };
 
@@ -149,7 +188,8 @@ pub fn wait_fault(aspace_id: u32) -> Option<(u32, usize, u32, u64, usize)> {
     // Check for pending faults first (lock order: FAULTS before pager waiter).
     {
         let faults = PAGER_FAULTS.lock();
-        for (i, entry) in faults.iter().enumerate() {
+        for i in 0..faults.capacity {
+            let entry = faults.get(i);
             if entry.active && entry.aspace_id == aspace_id {
                 return Some((
                     i as u32,
@@ -174,7 +214,8 @@ pub fn wait_fault(aspace_id: u32) -> Option<(u32, usize, u32, u64, usize)> {
     // (b) didn't see it yet (we weren't registered). Check again.
     {
         let faults = PAGER_FAULTS.lock();
-        for (i, entry) in faults.iter().enumerate() {
+        for i in 0..faults.capacity {
+            let entry = faults.get(i);
             if entry.active && entry.aspace_id == aspace_id {
                 // Clear waiter registration.
                 aspace::clear_pager_waiter(aspace_id);
@@ -198,14 +239,13 @@ pub fn wait_fault(aspace_id: u32) -> Option<(u32, usize, u32, u64, usize)> {
 /// Complete a pager fault: copy data from the caller's VA to the physical page,
 /// install the PTE, and wake the faulting thread.
 pub fn complete_fault(token: u32, data_va: usize, data_len: usize) -> bool {
-    if token as usize >= MAX_PAGER_FAULTS {
-        return false;
-    }
-
     // Extract fault entry info.
     let entry_info = {
         let faults = PAGER_FAULTS.lock();
-        let entry = &faults[token as usize];
+        if (token as usize) >= faults.capacity {
+            return false;
+        }
+        let entry = faults.get(token as usize);
         if !entry.active {
             return false;
         }
@@ -261,7 +301,9 @@ pub fn complete_fault(token: u32, data_va: usize, data_len: usize) -> bool {
     // Clear the entry.
     {
         let mut faults = PAGER_FAULTS.lock();
-        faults[token as usize].active = false;
+        if (token as usize) < faults.capacity {
+            faults.get_mut(token as usize).active = false;
+        }
     }
 
     true

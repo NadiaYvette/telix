@@ -1,8 +1,8 @@
 //! PagedArray<T>: a growable, page-backed array with O(1) indexed access.
 //!
 //! Storage is allocated one physical page at a time via `phys::alloc_page()`.
-//! The page directory is inline in the struct (512 bytes on 64-bit), so
-//! no heap allocation is needed for the directory itself.
+//! The page directory is itself page-allocated on first use, giving
+//! PAGE_SIZE / size_of::<*mut T>() directory slots — no fixed capacity constant.
 //!
 //! Items are zero-initialized when pages are allocated. Items are never
 //! moved once placed — growing adds new pages without disturbing existing ones.
@@ -10,16 +10,17 @@
 use super::page::PAGE_SIZE;
 use super::phys;
 
-/// Maximum number of backing pages in the directory.
-const DIR_CAPACITY: usize = 64;
-
 /// A growable array backed by physical pages.
 ///
-/// Capacity = DIR_CAPACITY × (PAGE_SIZE / size_of::<T>()).
-/// At 64 KiB pages and 32-byte items: 64 × 2048 = 131 072 items.
+/// Capacity = dir_capacity × ITEMS_PER_PAGE.
+/// At 64 KiB pages and 8-byte pointers the directory holds 8192 entries,
+/// giving 8192 × (PAGE_SIZE / size_of::<T>()) maximum items.
 pub struct PagedArray<T> {
-    /// Page directory: each non-null entry points to a page of T items.
-    dir: [*mut T; DIR_CAPACITY],
+    /// Page directory: page-allocated on first use. Each non-null entry
+    /// points to a page of T items.
+    dir: *mut *mut T,
+    /// Number of directory slots available (0 until first ensure_capacity).
+    dir_capacity: usize,
     /// Number of pages currently allocated.
     num_pages: usize,
     _marker: core::marker::PhantomData<T>,
@@ -34,10 +35,14 @@ impl<T> PagedArray<T> {
     /// Items that fit in a single page.
     pub const ITEMS_PER_PAGE: usize = PAGE_SIZE / core::mem::size_of::<T>();
 
+    /// Maximum directory slots per directory page.
+    const DIR_SLOTS: usize = PAGE_SIZE / core::mem::size_of::<*mut T>();
+
     /// Create an empty PagedArray. No pages are allocated until first use.
     pub const fn new() -> Self {
         Self {
-            dir: [core::ptr::null_mut(); DIR_CAPACITY],
+            dir: core::ptr::null_mut(),
+            dir_capacity: 0,
             num_pages: 0,
             _marker: core::marker::PhantomData,
         }
@@ -52,8 +57,21 @@ impl<T> PagedArray<T> {
     /// Ensure capacity for at least `needed` items. Allocates pages as needed.
     /// Returns false on OOM or directory full.
     pub fn ensure_capacity(&mut self, needed: usize) -> bool {
+        // Allocate directory page on first use.
+        if self.dir.is_null() && needed > 0 {
+            let page = match phys::alloc_page() {
+                Some(pa) => pa.as_usize() as *mut *mut T,
+                None => return false,
+            };
+            unsafe {
+                core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+            }
+            self.dir = page;
+            self.dir_capacity = Self::DIR_SLOTS;
+        }
+
         while self.capacity() < needed {
-            if self.num_pages >= DIR_CAPACITY {
+            if self.num_pages >= self.dir_capacity {
                 return false;
             }
             let page = match phys::alloc_page() {
@@ -63,8 +81,8 @@ impl<T> PagedArray<T> {
             // Zero-initialize the new page.
             unsafe {
                 core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+                *self.dir.add(self.num_pages) = page;
             }
-            self.dir[self.num_pages] = page;
             self.num_pages += 1;
         }
         true
@@ -78,7 +96,7 @@ impl<T> PagedArray<T> {
     pub fn get(&self, idx: usize) -> &T {
         let page = idx / Self::ITEMS_PER_PAGE;
         let offset = idx % Self::ITEMS_PER_PAGE;
-        unsafe { &*self.dir[page].add(offset) }
+        unsafe { &*(*self.dir.add(page)).add(offset) }
     }
 
     /// Get a mutable reference to item at `idx`.
@@ -89,6 +107,6 @@ impl<T> PagedArray<T> {
     pub fn get_mut(&mut self, idx: usize) -> &mut T {
         let page = idx / Self::ITEMS_PER_PAGE;
         let offset = idx % Self::ITEMS_PER_PAGE;
-        unsafe { &mut *self.dir[page].add(offset) }
+        unsafe { &mut *(*self.dir.add(page)).add(offset) }
     }
 }

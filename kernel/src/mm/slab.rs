@@ -6,14 +6,13 @@
 //! stores the index of the next free slot, or `NONE`).
 //!
 //! This is a simple single-page-per-slab design: each page is one slab.
+//! The slab page directory is itself page-allocated on first use, giving
+//! PAGE_SIZE / size_of::<usize>() directory slots — no fixed capacity constant.
 
 use super::page::{PhysAddr, PAGE_SIZE};
 use super::phys;
 
 const NONE: u16 = u16::MAX;
-
-/// Maximum number of pages (slabs) a single cache can use.
-const MAX_SLABS: usize = 64;
 
 /// Per-page slab header, stored at the start of each slab page.
 /// Must be kept small so it doesn't eat too much of the usable space.
@@ -30,11 +29,15 @@ pub struct SlabCache {
     obj_size: usize,        // Size of each object (rounded up to align)
     #[allow(dead_code)]
     obj_align: usize,       // Alignment of each object
-    slab_pages: [usize; MAX_SLABS], // Physical addresses of slab pages (0 = empty)
+    slab_dir: *mut usize,   // Page-allocated directory of slab page addresses (0 = empty slot)
+    slab_dir_cap: usize,    // Number of directory slots available
     slab_count: usize,      // Number of active slabs
     objs_per_slab: usize,   // Objects per slab page
     data_offset: usize,     // Byte offset from page start to first object
 }
+
+// Safety: slab_dir is a physical address pointer, accessed under SpinLock.
+unsafe impl Send for SlabCache {}
 
 impl SlabCache {
     /// Create a new slab cache for objects of `size` bytes with `align` alignment.
@@ -62,18 +65,49 @@ impl SlabCache {
         Self {
             obj_size,
             obj_align,
-            slab_pages: [0; MAX_SLABS],
+            slab_dir: core::ptr::null_mut(),
+            slab_dir_cap: 0,
             slab_count: 0,
             objs_per_slab,
             data_offset,
         }
     }
 
+    /// Ensure the slab directory page is allocated. Returns false on OOM.
+    fn ensure_dir(&mut self) -> bool {
+        if self.slab_dir.is_null() {
+            let page = match phys::alloc_page() {
+                Some(pa) => pa.as_usize() as *mut usize,
+                None => return false,
+            };
+            unsafe { core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE); }
+            self.slab_dir = page;
+            self.slab_dir_cap = PAGE_SIZE / core::mem::size_of::<usize>();
+        }
+        true
+    }
+
+    /// Read the slab page address at directory index `idx`.
+    #[inline]
+    fn slab_page(&self, idx: usize) -> usize {
+        unsafe { *self.slab_dir.add(idx) }
+    }
+
+    /// Write a slab page address at directory index `idx`.
+    #[inline]
+    fn set_slab_page(&mut self, idx: usize, addr: usize) {
+        unsafe { *self.slab_dir.add(idx) = addr; }
+    }
+
     /// Allocate one object from this cache. Returns a physical address, or None if OOM.
     pub fn alloc(&mut self) -> Option<PhysAddr> {
+        if !self.ensure_dir() {
+            return None;
+        }
+
         // Try existing slabs with free objects.
         for i in 0..self.slab_count {
-            let page_addr = self.slab_pages[i];
+            let page_addr = self.slab_page(i);
             let header = unsafe { &mut *(page_addr as *mut SlabHeader) };
             if header.free_head != NONE {
                 return Some(self.alloc_from_slab(page_addr, header));
@@ -81,12 +115,12 @@ impl SlabCache {
         }
 
         // All slabs full (or none exist) — allocate a new page.
-        if self.slab_count >= MAX_SLABS {
+        if self.slab_count >= self.slab_dir_cap {
             return None;
         }
         let page = phys::alloc_page()?;
         let page_addr = page.as_usize();
-        self.slab_pages[self.slab_count] = page_addr;
+        self.set_slab_page(self.slab_count, page_addr);
         self.slab_count += 1;
 
         // Initialize the slab.
@@ -103,7 +137,7 @@ impl SlabCache {
         let page_base = addr_val & !(PAGE_SIZE - 1);
 
         for i in 0..self.slab_count {
-            if self.slab_pages[i] == page_base {
+            if self.slab_page(i) == page_base {
                 let header = unsafe { &mut *(page_base as *mut SlabHeader) };
                 let obj_index = (addr_val - page_base - self.data_offset) / self.obj_size;
 
@@ -118,8 +152,9 @@ impl SlabCache {
                     phys::free_page(PhysAddr::new(page_base));
                     // Remove from slab list by swapping with last.
                     self.slab_count -= 1;
-                    self.slab_pages[i] = self.slab_pages[self.slab_count];
-                    self.slab_pages[self.slab_count] = 0;
+                    let last = self.slab_page(self.slab_count);
+                    self.set_slab_page(i, last);
+                    self.set_slab_page(self.slab_count, 0);
                 }
                 return;
             }
@@ -165,7 +200,7 @@ impl SlabCache {
     pub fn allocated(&self) -> usize {
         let mut total = 0;
         for i in 0..self.slab_count {
-            let header = unsafe { &*(self.slab_pages[i] as *const SlabHeader) };
+            let header = unsafe { &*(self.slab_page(i) as *const SlabHeader) };
             total += header.in_use as usize;
         }
         total
