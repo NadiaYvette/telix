@@ -20,8 +20,8 @@ use crate::sync::SpinLock;
 /// Slab size for ObjEntry allocations (must be a power of two ≥ actual size).
 const OBJ_SLAB_SIZE: usize = 256;
 
-/// Maximum mappings per object (address spaces that map this object).
-const MAX_MAPPINGS: usize = 8;
+/// Mappings per page in a MemObject's mapping list.
+const MAPPINGS_PER_PAGE: usize = super::page::PAGE_SIZE / core::mem::size_of::<Mapping>();
 
 /// Object type tag.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,8 +62,10 @@ pub struct MemObject {
     /// 0 = not yet allocated. Uses tiered storage: inline for <=4 pages,
     /// slab-allocated for larger objects.
     pub pages: PageVec,
-    /// Mappings from address spaces.
-    pub mappings: [Mapping; MAX_MAPPINGS],
+    /// Mappings from address spaces (page-allocated on first add_mapping).
+    mappings: *mut Mapping,
+    mappings_cap: u16,
+    mappings_count: u16,
     /// For Pager objects: file handle passed to the pager thread.
     pub file_handle: u32,
     /// For Pager objects: byte offset of this object's start within the file.
@@ -77,7 +79,9 @@ impl MemObject {
             page_count: 0,
             cow_group: 0,
             pages: PageVec::empty(),
-            mappings: [Mapping::empty(); MAX_MAPPINGS],
+            mappings: core::ptr::null_mut(),
+            mappings_cap: 0,
+            mappings_count: 0,
             file_handle: 0,
             file_base_offset: 0,
         }
@@ -121,9 +125,31 @@ impl MemObject {
         self.pages.clear(self.page_count as usize);
     }
 
+    /// Ensure the mapping list backing page is allocated.
+    fn ensure_mappings(&mut self) -> bool {
+        if !self.mappings.is_null() {
+            return true;
+        }
+        let page = match phys::alloc_page() {
+            Some(pa) => pa.as_usize() as *mut Mapping,
+            None => return false,
+        };
+        unsafe {
+            core::ptr::write_bytes(page as *mut u8, 0, super::page::PAGE_SIZE);
+        }
+        self.mappings = page;
+        self.mappings_cap = MAPPINGS_PER_PAGE as u16;
+        true
+    }
+
     /// Add a mapping record.
     pub fn add_mapping(&mut self, aspace_id: u32, va_start: usize) -> bool {
-        for m in &mut self.mappings {
+        if !self.ensure_mappings() {
+            return false;
+        }
+        // Reuse an inactive slot if available.
+        for i in 0..self.mappings_count as usize {
+            let m = unsafe { &mut *self.mappings.add(i) };
             if !m.active {
                 m.aspace_id = aspace_id;
                 m.va_start = va_start;
@@ -131,20 +157,48 @@ impl MemObject {
                 return true;
             }
         }
-        false
+        // Append.
+        if self.mappings_count < self.mappings_cap {
+            let m = unsafe { &mut *self.mappings.add(self.mappings_count as usize) };
+            m.aspace_id = aspace_id;
+            m.va_start = va_start;
+            m.active = true;
+            self.mappings_count += 1;
+            true
+        } else {
+            false // page full (4096 mappings)
+        }
     }
 
     /// Count active mappings.
     pub fn mapping_count(&self) -> usize {
-        self.mappings.iter().filter(|m| m.active).count()
+        let mut n = 0;
+        for i in 0..self.mappings_count as usize {
+            if unsafe { (*self.mappings.add(i)).active } {
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Remove a mapping record.
     pub fn remove_mapping(&mut self, aspace_id: u32, va_start: usize) {
-        for m in &mut self.mappings {
+        for i in 0..self.mappings_count as usize {
+            let m = unsafe { &mut *self.mappings.add(i) };
             if m.active && m.aspace_id == aspace_id && m.va_start == va_start {
                 m.active = false;
                 return;
+            }
+        }
+    }
+
+    /// Iterate over all active mappings, calling `f(aspace_id, va_start)` for each.
+    /// Useful for reverse-mapping walks (PTE shootdown, page invalidation).
+    pub fn for_each_mapping<F: FnMut(u32, usize)>(&self, mut f: F) {
+        for i in 0..self.mappings_count as usize {
+            let m = unsafe { &*self.mappings.add(i) };
+            if m.active {
+                f(m.aspace_id, m.va_start);
             }
         }
     }
