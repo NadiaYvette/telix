@@ -113,6 +113,7 @@ pub const SYS_GETRANDOM: u64 = 96;
 pub const SYS_SIGSUSPEND: u64 = 97;
 pub const SYS_SIGALTSTACK: u64 = 98;
 pub const SYS_PROXY_REGISTER: u64 = 99;
+pub const SYS_PORT_RESIZE: u64 = 100;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -357,6 +358,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SIGSUSPEND => sys_sigsuspend(a0),
         SYS_SIGALTSTACK => sys_sigaltstack(a0, a1),
         SYS_PROXY_REGISTER => sys_proxy_register(a0),
+        SYS_PORT_RESIZE => sys_port_resize(a0, a1),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -532,6 +534,17 @@ fn sys_port_destroy(port_id: u64) -> u64 {
         }
     }
     0
+}
+
+fn sys_port_resize(port_id: u64, new_capacity: u64) -> u64 {
+    if !check_port_cap(port_id, crate::cap::Rights::MANAGE) {
+        return ECAP;
+    }
+    if crate::ipc::port::resize(port_id, new_capacity as usize) {
+        0
+    } else {
+        u64::MAX
+    }
 }
 
 fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {

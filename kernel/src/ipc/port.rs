@@ -36,34 +36,46 @@ pub const fn make_port_id(node: u32, local: u64) -> PortId {
     ((node as u64) << 44) | (local & 0xFFF_FFFF_FFFF)
 }
 
-// --- Port queue: slab-allocated on demand ---
+// --- Port queue: variable-capacity circular buffer ---
+//
+// Default allocation uses a 2048-byte slab (16 messages). Servers that need
+// deeper queues call port::resize() which allocates a page-backed buffer and
+// migrates pending messages from the old queue.
 
-/// Maximum messages queued per port.
-const PORT_QUEUE_CAPACITY: usize = 16;
+/// Default queue capacity (messages) for the small slab-allocated queue.
+const DEFAULT_QUEUE_CAPACITY: usize = 16;
 
-/// Slab-allocated message queue. Size: 16 * 56 + 24 = 920 bytes → 2048-byte slab.
+/// Slab size for the default small queue.
+const PORT_QUEUE_SLAB_SIZE: usize = 2048;
+
+/// Messages per page when using a page-allocated queue.
+const MSGS_PER_PAGE: usize = crate::mm::page::PAGE_SIZE / core::mem::size_of::<Message>();
+
+/// Queue header stored at the start of the queue allocation.
+/// Followed immediately by `capacity` Message slots.
 struct PortQueue {
-    msgs: [Message; PORT_QUEUE_CAPACITY],
     head: usize,
     tail: usize,
     len: usize,
+    capacity: usize,
+    /// True if this queue was page-allocated (free via free_page).
+    /// False if slab-allocated (free via slab::free).
+    page_backed: bool,
 }
 
-const PORT_QUEUE_SLAB_SIZE: usize = 2048;
-
 impl PortQueue {
-    fn init(ptr: *mut PortQueue) {
-        unsafe {
-            core::ptr::write_bytes(ptr as *mut u8, 0, core::mem::size_of::<PortQueue>());
-        }
+    /// Get a pointer to the message array (immediately after the header).
+    #[inline]
+    fn msgs(&self) -> *mut Message {
+        unsafe { (self as *const Self as *mut Self).add(1) as *mut Message }
     }
 
     fn enqueue(&mut self, msg: Message) -> bool {
-        if self.len >= PORT_QUEUE_CAPACITY {
+        if self.len >= self.capacity {
             return false;
         }
-        self.msgs[self.tail] = msg;
-        self.tail = (self.tail + 1) % PORT_QUEUE_CAPACITY;
+        unsafe { *self.msgs().add(self.tail) = msg; }
+        self.tail = (self.tail + 1) % self.capacity;
         self.len += 1;
         true
     }
@@ -72,14 +84,14 @@ impl PortQueue {
         if self.len == 0 {
             return None;
         }
-        let msg = self.msgs[self.head];
-        self.head = (self.head + 1) % PORT_QUEUE_CAPACITY;
+        let msg = unsafe { *self.msgs().add(self.head) };
+        self.head = (self.head + 1) % self.capacity;
         self.len -= 1;
         Some(msg)
     }
 
     fn is_full(&self) -> bool {
-        self.len >= PORT_QUEUE_CAPACITY
+        self.len >= self.capacity
     }
 
     #[allow(dead_code)]
@@ -88,17 +100,51 @@ impl PortQueue {
     }
 }
 
-/// Allocate a PortQueue from the slab allocator.
+/// Compute how many messages fit in a slab queue (header + messages in 2048 bytes).
+const fn slab_queue_capacity() -> usize {
+    (PORT_QUEUE_SLAB_SIZE - core::mem::size_of::<PortQueue>()) / core::mem::size_of::<Message>()
+}
+
+/// Allocate the default small queue from the slab allocator.
 fn alloc_queue() -> Option<*mut PortQueue> {
     let pa = crate::mm::slab::alloc(PORT_QUEUE_SLAB_SIZE)?;
     let ptr = pa.as_usize() as *mut PortQueue;
-    PortQueue::init(ptr);
+    unsafe {
+        core::ptr::write_bytes(ptr as *mut u8, 0, PORT_QUEUE_SLAB_SIZE);
+        (*ptr).capacity = slab_queue_capacity();
+        (*ptr).page_backed = false;
+    }
     Some(ptr)
 }
 
-/// Free a PortQueue back to the slab allocator.
+/// Allocate a page-backed queue with capacity for `page_count` pages of messages.
+fn alloc_page_queue(page_count: usize) -> Option<*mut PortQueue> {
+    use crate::mm::phys;
+    use crate::mm::page::PAGE_SIZE;
+    // Allocate contiguous pages. For simplicity, use single page for now.
+    // The header lives at the start of the first page.
+    if page_count != 1 {
+        return None; // Only single-page queues supported currently.
+    }
+    let pa = phys::alloc_page()?;
+    let ptr = pa.as_usize() as *mut PortQueue;
+    unsafe {
+        core::ptr::write_bytes(ptr as *mut u8, 0, PAGE_SIZE);
+        let cap = (PAGE_SIZE - core::mem::size_of::<PortQueue>()) / core::mem::size_of::<Message>();
+        (*ptr).capacity = cap;
+        (*ptr).page_backed = true;
+    }
+    Some(ptr)
+}
+
+/// Free a queue (slab or page-backed).
 fn free_queue(ptr: *mut PortQueue) {
-    crate::mm::slab::free(PhysAddr::new(ptr as usize), PORT_QUEUE_SLAB_SIZE);
+    let page_backed = unsafe { (*ptr).page_backed };
+    if page_backed {
+        crate::mm::phys::free_page(PhysAddr::new(ptr as usize));
+    } else {
+        crate::mm::slab::free(PhysAddr::new(ptr as usize), PORT_QUEUE_SLAB_SIZE);
+    }
 }
 
 // --- Port structure ---
@@ -118,9 +164,9 @@ pub type KernelHandler = fn(PortId, usize, &Message) -> Message;
 pub struct Port {
     #[allow(dead_code)]
     pub id: PortId,
-    /// Pointer to slab-allocated message queue (0 = not yet allocated).
-    /// Queue is allocated on first send, so kernel-held ports that handle
-    /// faults synchronously never pay for the queue.
+    /// Pointer to message queue (0 = not yet allocated).
+    /// Default: slab-allocated on first send. Can be upgraded to a
+    /// page-backed queue via resize().
     queue_ptr: usize,
     /// Kernel receive handler (0 = none). When set, the kernel holds the
     /// receive right: sends invoke this handler synchronously instead of
@@ -281,6 +327,64 @@ impl Port {
             Some(q) => q.is_full(),
             None => false, // No queue yet — not full (first send will allocate)
         }
+    }
+
+    /// Current queue capacity (0 if no queue allocated yet).
+    pub fn queue_capacity(&self) -> usize {
+        match self.queue() {
+            Some(q) => q.capacity,
+            None => 0,
+        }
+    }
+
+    /// Resize the queue to hold at least `new_capacity` messages.
+    /// Migrates any pending messages from the old queue to the new one.
+    /// The new queue is page-backed. Returns false on OOM or if new_capacity
+    /// is smaller than the number of currently queued messages.
+    fn resize_queue(&mut self, new_capacity: usize) -> bool {
+        // Compute required pages. Currently we only support single-page queues.
+        let max_page_cap = (crate::mm::page::PAGE_SIZE - core::mem::size_of::<PortQueue>())
+            / core::mem::size_of::<Message>();
+        if new_capacity > max_page_cap {
+            return false; // Would require multi-page queue, not yet supported.
+        }
+
+        // Don't downsize below current pending count.
+        let pending = match self.queue() {
+            Some(q) => q.len,
+            None => 0,
+        };
+        if new_capacity < pending {
+            return false;
+        }
+
+        // If already page-backed with sufficient capacity, nothing to do.
+        if let Some(q) = self.queue() {
+            if q.page_backed && q.capacity >= new_capacity {
+                return true;
+            }
+        }
+
+        // Allocate the new page-backed queue.
+        let new_q = match alloc_page_queue(1) {
+            Some(q) => q,
+            None => return false,
+        };
+
+        // Migrate pending messages.
+        if let Some(old_q) = self.queue_mut() {
+            let new_ref = unsafe { &mut *new_q };
+            while let Some(msg) = old_q.dequeue() {
+                new_ref.enqueue(msg);
+            }
+        }
+
+        // Free old queue.
+        if self.queue_ptr != 0 {
+            free_queue(self.queue_ptr as *mut PortQueue);
+        }
+        self.queue_ptr = new_q as usize;
+        true
     }
 }
 
@@ -605,6 +709,18 @@ pub fn destroy(port_id: PortId) {
     if let Some(ptr) = table.art.remove(local) {
         drop(table);
         free_port(ptr as *mut Port);
+    }
+}
+
+/// Resize a port's message queue to hold at least `new_capacity` messages.
+/// The new queue is page-backed. Pending messages are migrated atomically
+/// (under PORT_TABLE lock). Returns true on success.
+pub fn resize(port_id: PortId, new_capacity: usize) -> bool {
+    let local = port_local(port_id);
+    let mut table = PORT_TABLE.lock();
+    match table.get_mut(local) {
+        Some(port) => port.resize_queue(new_capacity),
+        None => false,
     }
 }
 

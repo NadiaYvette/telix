@@ -56,6 +56,7 @@ const SYS_MMAP_GUARD: u64 = 95;
 const SYS_GETRANDOM: u64 = 96;
 #[allow(dead_code)]
 const SYS_PROXY_REGISTER: u64 = 99;
+const SYS_PORT_RESIZE: u64 = 100;
 
 /// Register a port as the network proxy endpoint for non-local sends.
 pub fn proxy_register(port: u64) -> u64 {
@@ -80,6 +81,12 @@ pub fn port_create() -> u64 {
 /// Destroy an IPC port, freeing the port ID for reuse.
 pub fn port_destroy(port: u64) {
     unsafe { arch::syscall1(SYS_PORT_DESTROY, port); }
+}
+
+/// Resize a port's message queue to hold at least `new_capacity` messages.
+/// Returns true on success, false on error (OOM, invalid port, insufficient cap).
+pub fn port_resize(port: u64, new_capacity: u64) -> bool {
+    unsafe { arch::syscall2(SYS_PORT_RESIZE, port, new_capacity) == 0 }
 }
 
 /// Non-blocking send on a port (2 data words, rest zeroed).
