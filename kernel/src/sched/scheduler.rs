@@ -78,7 +78,10 @@ static DEFERRED_THREAD: [AtomicUsize; smp::MAX_CPUS] = {
 const NUM_PRIORITIES: usize = 256;
 
 /// Sentinel value for empty linked-list pointers (head/tail/next/prev).
-const RQ_NIL: u32 = u32::MAX;
+/// Using 0 (idle thread ID) as sentinel so RunQueue/PerCpuRunQueues initialize
+/// to all-zero bytes and land in BSS rather than .data. Idle threads are never
+/// enqueued, so ID 0 is safe as "no thread".
+const RQ_NIL: u32 = 0;
 
 /// Per-priority run queue — a doubly-linked FIFO list threaded through
 /// Thread::run_next / run_prev. No fixed capacity limit.
@@ -178,6 +181,157 @@ impl RunQueue {
         }
         None
     }
+
+    /// Search for and remove a thread in the given coscheduling group (no CPU check).
+    /// Used by per-CPU queues where affinity is already guaranteed.
+    fn find_remove_by_group(&mut self, group: u32) -> Option<ThreadId> {
+        let mut cur = self.head;
+        while cur != RQ_NIL {
+            let t = thread_ref(cur);
+            if t.cosched_group.load(Ordering::Relaxed) == group {
+                self.unlink(cur);
+                return Some(cur);
+            }
+            cur = t.run_next.load(Ordering::Relaxed);
+        }
+        None
+    }
+
+    /// Search for and remove a thread whose affinity allows `cpu` (for work stealing).
+    fn find_remove_with_affinity(&mut self, cpu: u32) -> Option<ThreadId> {
+        let mut cur = self.head;
+        while cur != RQ_NIL {
+            let t = thread_ref(cur);
+            if t.affinity_mask.test(cpu) {
+                self.unlink(cur);
+                return Some(cur);
+            }
+            cur = t.run_next.load(Ordering::Relaxed);
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-CPU run queues with active priority bitmap
+// ---------------------------------------------------------------------------
+
+/// Per-CPU run queues: 256 linked-list heads + 256-bit active bitmap.
+/// Each CPU's instance is protected by its own SpinLock in PERCPU_RQ.
+struct PerCpuRunQueues {
+    queues: [RunQueue; NUM_PRIORITIES],
+    active: [u64; 4],
+    cosched_burst: u32,
+}
+
+impl PerCpuRunQueues {
+    const fn new() -> Self {
+        Self {
+            queues: [const { RunQueue::new() }; NUM_PRIORITIES],
+            active: [0; 4],
+            cosched_burst: 0,
+        }
+    }
+
+    /// Enqueue a thread at the given priority level.
+    fn push(&mut self, prio: u8, tid: ThreadId) {
+        self.queues[prio as usize].push(tid);
+        self.active[prio as usize / 64] |= 1u64 << (prio as usize % 64);
+    }
+
+    /// Dequeue the highest-priority (lowest numeric) thread. O(1) via bitmap.
+    fn pop_highest(&mut self) -> Option<ThreadId> {
+        for word in 0..4 {
+            if self.active[word] != 0 {
+                let bit = self.active[word].trailing_zeros() as usize;
+                let prio = word * 64 + bit;
+                let tid = self.queues[prio].pop()?;
+                if self.queues[prio].len == 0 {
+                    self.active[word] &= !(1u64 << bit);
+                }
+                return Some(tid);
+            }
+        }
+        None
+    }
+
+    /// Find and dequeue a thread in the given coscheduling group. Searches by priority.
+    fn pop_for_group(&mut self, group: u32) -> Option<ThreadId> {
+        for word in 0..4 {
+            if self.active[word] != 0 {
+                let mut bits = self.active[word];
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    let prio = word * 64 + bit;
+                    if let Some(tid) = self.queues[prio].find_remove_by_group(group) {
+                        if self.queues[prio].len == 0 {
+                            self.active[word] &= !(1u64 << bit);
+                        }
+                        return Some(tid);
+                    }
+                    bits &= !(1u64 << bit);
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if any threads are enqueued. O(1) via bitmap.
+    fn has_ready(&self) -> bool {
+        self.active[0] | self.active[1] | self.active[2] | self.active[3] != 0
+    }
+
+    /// Steal one thread for `thief_cpu` from lowest-priority queue with ≥2 threads.
+    fn steal_one(&mut self, thief_cpu: u32) -> Option<ThreadId> {
+        for word in (0..4).rev() {
+            if self.active[word] != 0 {
+                let mut bits = self.active[word];
+                while bits != 0 {
+                    // Highest set bit = lowest priority = best to steal
+                    let bit = 63 - bits.leading_zeros() as usize;
+                    let prio = word * 64 + bit;
+                    if self.queues[prio].len >= 2 {
+                        if let Some(tid) = self.queues[prio].find_remove_with_affinity(thief_cpu) {
+                            if self.queues[prio].len == 0 {
+                                self.active[word] &= !(1u64 << bit);
+                            }
+                            return Some(tid);
+                        }
+                    }
+                    bits &= !(1u64 << bit);
+                }
+            }
+        }
+        None
+    }
+}
+
+static PERCPU_RQ: [SpinLock<PerCpuRunQueues>; smp::MAX_CPUS] = {
+    const INIT: SpinLock<PerCpuRunQueues> = SpinLock::new(PerCpuRunQueues::new());
+    [INIT; smp::MAX_CPUS]
+};
+
+/// Enqueue a thread onto the per-CPU run queue for the given target CPU.
+/// The caller must ensure the thread's state is Ready before calling.
+fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
+    let mut rq = PERCPU_RQ[target_cpu as usize].lock();
+    rq.push(prio, tid);
+}
+
+/// Try to steal a thread from another CPU's run queue.
+/// Returns the stolen thread's ID, or None.
+fn try_steal(cpu: u32) -> Option<ThreadId> {
+    let online = smp::online_cpus() as usize;
+    if online <= 1 { return None; }
+    for i in 1..online {
+        let victim = ((cpu as usize + i) % online) as u32;
+        if let Some(mut rq) = PERCPU_RQ[victim as usize].try_lock() {
+            if let Some(tid) = rq.steal_one(cpu) {
+                return Some(tid);
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -237,10 +391,8 @@ fn free_task_entry(p: *mut Task) {
 pub struct Scheduler {
     pub(crate) thread_art: Art,
     pub task_art: Art,
-    run_queues: [RunQueue; NUM_PRIORITIES],
     next_thread_id: ThreadId,
     next_task_id: u32,
-    cosched_burst: u32,
 }
 
 impl Scheduler {
@@ -248,10 +400,8 @@ impl Scheduler {
         Self {
             thread_art: Art::new(),
             task_art: Art::new(),
-            run_queues: [const { RunQueue::new() }; NUM_PRIORITIES],
             next_thread_id: 0,
             next_task_id: 0,
-            cosched_burst: 0,
         }
     }
 
@@ -528,7 +678,7 @@ impl Scheduler {
         thread.sig_mask = 0;
         thread.sig_pending = 0;
 
-        self.run_queues[priority as usize].push(id);
+        percpu_enqueue(smp::cpu_id(), priority, id);
         Some(id)
     }
 
@@ -816,7 +966,7 @@ impl Scheduler {
         thread.sig_mask = 0;
         thread.sig_pending = 0;
 
-        self.run_queues[priority as usize].push(thread_id);
+        percpu_enqueue(smp::cpu_id(), priority, thread_id);
     }
 
 
@@ -906,180 +1056,58 @@ impl Scheduler {
         thread.sig_pending = 0;
 
         self.task_mut(task_id).thread_count += 1;
-        self.run_queues[priority as usize].push(id);
+        percpu_enqueue(smp::cpu_id(), priority, id);
         Some(id)
     }
 
 
-    fn pick_next(&mut self, idle_id: ThreadId) -> ThreadId {
-        let cpu = smp::cpu_id();
-        for prio in 0..NUM_PRIORITIES {
-            if let Some(id) = self.run_queues[prio].find_remove_for_cpu(cpu) {
-                return id;
-            }
-        }
-        idle_id
+}
+
+/// Get a mutable reference to a thread via its radix pointer.
+/// # Safety: Caller must ensure exclusive access (thread is owned by current CPU,
+/// or is Blocked/Dead and not accessible from any other path).
+#[inline]
+unsafe fn thread_mut_from_ref(tid: ThreadId) -> &'static mut Thread {
+    let p = THREAD_TABLE.get(tid) as *mut Thread;
+    unsafe { &mut *p }
+}
+
+/// Pick next thread from the current CPU's per-CPU run queue.
+/// Returns idle_id if nothing is ready.
+fn percpu_pick_next(cpu: u32, idle_id: ThreadId) -> ThreadId {
+    let mut rq = PERCPU_RQ[cpu as usize].lock();
+    // First try local queue.
+    if let Some(tid) = rq.pop_highest() {
+        return tid;
     }
-
-    fn timer_tick_for(&mut self, current: ThreadId, idle_id: ThreadId) -> bool {
-        if current == idle_id {
-            return self.has_ready_threads();
-        }
-        // If the thread is spinning in block_current, preempt immediately
-        // so other threads can run. Don't consume quantum — the thread
-        // will need it when it actually gets woken up.
-        if thread_ref(current).yield_asap.load(Ordering::Acquire) {
-            return true;
-        }
-        let thread = self.thread_mut(current);
-        thread.quantum = thread.quantum.saturating_sub(1);
-        if thread.quantum == 0 {
-            thread.quantum = thread.default_quantum;
-            return true;
-        }
-        false
+    drop(rq);
+    // Nothing local — try work stealing.
+    if let Some(tid) = try_steal(cpu) {
+        return tid;
     }
+    idle_id
+}
 
-    fn has_ready_threads(&self) -> bool {
-        for prio in 0..NUM_PRIORITIES {
-            if self.run_queues[prio].len > 0 {
-                return true;
-            }
+/// Pick next thread, preferring a cosched group mate on the current CPU.
+fn percpu_pick_next_cosched(cpu: u32, idle_id: ThreadId, prev_group: u32) -> (ThreadId, bool) {
+    let mut rq = PERCPU_RQ[cpu as usize].lock();
+    if prev_group != 0 && rq.cosched_burst < MAX_COSCHED_BURST {
+        if let Some(tid) = rq.pop_for_group(prev_group) {
+            rq.cosched_burst += 1;
+            COSCHED_HITS.fetch_add(1, Ordering::Relaxed);
+            return (tid, true);
         }
-        false
     }
-
-    /// Attempt to switch threads on the current CPU.
-    /// Called from IRQ handler with current SP.
-    /// Returns the new SP to use for restore_regs.
-    fn try_switch(&mut self, current_sp: u64) -> u64 {
-        // Update per-CPU load tracking for energy-aware scheduling.
-        let cpu = smp::cpu_id();
-        let pcpu = smp::get(cpu);
-        let idle_id_for_load = pcpu.idle_thread_id.load(Ordering::Relaxed);
-        let cur_for_load = pcpu.current_thread.load(Ordering::Relaxed);
-        super::hotplug::tick_load(cpu, cur_for_load == idle_id_for_load);
-
-        // Drain deferred kernel stack free from a previous exit on this CPU.
-        // IMPORTANT: We must NOT free the page if it belongs to the currently
-        // running thread (a dead thread spinning in exit_current_thread).
-        // The timer IRQ's exception frame and the entire try_switch() call
-        // chain live on that stack — freeing it while another CPU can
-        // reallocate it causes use-after-free (corrupted return addresses,
-        // manifesting as EC=0x22 PC alignment faults with ELR=0x9 etc.).
-        // In that case, leave it in DEFERRED_KSTACK for the next tick when
-        // we'll be running on the new thread's stack.
-        let deferred = DEFERRED_KSTACK[cpu as usize].load(Ordering::Acquire);
-        if deferred != 0 {
-            let cur_tid = pcpu.current_thread.load(Ordering::Relaxed);
-            if self.thread(cur_tid).stack_base != deferred {
-                // Safe: we're on a different thread's stack.
-                DEFERRED_KSTACK[cpu as usize].store(0, Ordering::Release);
-                crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(deferred));
-                let dead_tid = DEFERRED_THREAD[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
-                if dead_tid < RadixTable::capacity() {
-                    if let Some(t) = self.thread_get_mut(dead_tid as ThreadId) {
-                        t.stack_base = 0;
-                    }
-                }
-            }
-        }
-
-        let pcpu = smp::current();
-        let prev_id = pcpu.current_thread.load(Ordering::Relaxed);
-        let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
-
-        if !self.timer_tick_for(prev_id, idle_id) {
-            return current_sp; // No preemption needed.
-        }
-
-        // The yield/block request has been honoured — clear the flag so the
-        // thread gets its full quantum next time it runs.  Without this,
-        // sys_yield()/sys_yield_block() leave YIELD_ASAP permanently set,
-        // causing the thread to be preempted on every single tick.  On
-        // QEMU TCG that maximises lock-holder preemption on userspace
-        // spinlocks and leads to intermittent hangs (Phase 30/31).
-        thread_ref(prev_id).yield_asap.store(false, Ordering::Release);
-
-        // Cosched-aware pick: if prev has a group, try to find a group mate
-        // that can also run on this CPU.
-        let cpu = smp::cpu_id();
-        let prev_group = thread_ref(prev_id).cosched_group.load(Ordering::Relaxed);
-        let next_id = if prev_group != 0 && self.cosched_burst < MAX_COSCHED_BURST {
-            // Search all priority levels for a group mate eligible for this CPU.
-            let mut mate = None;
-            for prio in 0..NUM_PRIORITIES {
-                if let Some(id) = self.run_queues[prio].find_remove_by_group_for_cpu(prev_group, cpu) {
-                    mate = Some(id);
-                    break;
-                }
-            }
-            if let Some(id) = mate {
-                self.cosched_burst += 1;
-                COSCHED_HITS.fetch_add(1, Ordering::Relaxed);
-                id
-            } else {
-                self.cosched_burst = 0;
-                self.pick_next(idle_id)
-            }
-        } else {
-            self.cosched_burst = 0;
-            self.pick_next(idle_id)
-        };
-
-        if prev_id == next_id {
-            return current_sp;
-        }
-
-        crate::sched::stats::CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
-        crate::trace::trace_event(crate::trace::EVT_CTX_SWITCH, prev_id, next_id);
-
-        // Save current thread's SP.
-        self.thread_mut(prev_id).saved_sp = current_sp;
-        let prev_prio = self.thread(prev_id).effective_priority;
-        // Don't re-enqueue Dead threads (they are exiting).
-        if prev_id != idle_id && self.thread(prev_id).state != ThreadState::Dead {
-            self.thread_mut(prev_id).state = ThreadState::Ready;
-            self.run_queues[prev_prio as usize].push(prev_id);
-        }
-
-        // Switch page tables if crossing task boundaries.
-        let prev_task = self.thread(prev_id).task_id;
-        let next_task = self.thread(next_id).task_id;
-        if prev_task != next_task {
-            let next_root = self.task(next_task).page_table_root;
-            if next_root != 0 {
-                #[cfg(target_arch = "aarch64")]
-                crate::arch::aarch64::mm::switch_page_table(next_root);
-                #[cfg(target_arch = "riscv64")]
-                crate::arch::riscv64::mm::switch_page_table(next_root);
-                #[cfg(target_arch = "x86_64")]
-                crate::arch::x86_64::mm::switch_page_table(next_root);
-            } else {
-                // Switching to kernel task: restore kernel page table.
-                #[cfg(target_arch = "riscv64")]
-                {
-                    let kern_root = crate::arch::riscv64::mm::kernel_pt_root();
-                    if kern_root != 0 {
-                        crate::arch::riscv64::mm::switch_page_table(kern_root);
-                    }
-                }
-            }
-        }
-
-        // On x86-64, update TSS RSP0 for ring 3→0 transitions.
-        #[cfg(target_arch = "x86_64")]
-        {
-            let next_kstack_top = self.thread(next_id).stack_base + PAGE_SIZE;
-            crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
-        }
-
-        // Load next thread's SP.
-        self.thread_mut(next_id).state = ThreadState::Running;
-        pcpu.current_thread.store(next_id, Ordering::Relaxed);
-        thread_ref(next_id).last_cpu.store(cpu, Ordering::Relaxed);
-        self.thread(next_id).saved_sp
+    rq.cosched_burst = 0;
+    if let Some(tid) = rq.pop_highest() {
+        return (tid, false);
     }
+    drop(rq);
+    // Nothing local — try work stealing.
+    if let Some(tid) = try_steal(cpu) {
+        return (tid, false);
+    }
+    (idle_id, false)
 }
 
 pub static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
@@ -1347,7 +1375,129 @@ pub fn tick(current_sp: u64) -> u64 {
     check_sleep_timers();
     check_alarm_timers();
     check_interval_timers();
-    SCHEDULER.lock().try_switch(current_sp)
+    try_switch(current_sp)
+}
+
+/// Attempt to switch threads on the current CPU.
+/// Uses only per-CPU run queue locks — does NOT take the global SCHEDULER lock.
+fn try_switch(current_sp: u64) -> u64 {
+    let cpu = smp::cpu_id();
+    let pcpu = smp::get(cpu);
+    let idle_id_for_load = pcpu.idle_thread_id.load(Ordering::Relaxed);
+    let cur_for_load = pcpu.current_thread.load(Ordering::Relaxed);
+    super::hotplug::tick_load(cpu, cur_for_load == idle_id_for_load);
+
+    // Drain deferred kernel stack free from a previous exit on this CPU.
+    let deferred = DEFERRED_KSTACK[cpu as usize].load(Ordering::Acquire);
+    if deferred != 0 {
+        let cur_tid = pcpu.current_thread.load(Ordering::Relaxed);
+        // Safety: cur_tid is Running on this CPU, we own it.
+        let cur_stack = thread_ref(cur_tid).stack_base;
+        if cur_stack != deferred {
+            DEFERRED_KSTACK[cpu as usize].store(0, Ordering::Release);
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(deferred));
+            let dead_tid = DEFERRED_THREAD[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
+            if dead_tid < RadixTable::capacity() {
+                // Safety: dead thread is Dead, not on any queue or CPU.
+                let t = unsafe { thread_mut_from_ref(dead_tid as ThreadId) };
+                t.stack_base = 0;
+            }
+        }
+    }
+
+    let pcpu = smp::current();
+    let prev_id = pcpu.current_thread.load(Ordering::Relaxed);
+    let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
+
+    // Decide if preemption is needed (lockless — we own the running thread).
+    if prev_id == idle_id {
+        // Idle thread: preempt if local queue has work (steal happens in pick_next).
+        let rq = PERCPU_RQ[cpu as usize].lock();
+        let has_work = rq.has_ready();
+        drop(rq);
+        if !has_work {
+            return current_sp;
+        }
+    } else {
+        if thread_ref(prev_id).yield_asap.load(Ordering::Acquire) {
+            // Will preempt — continue below.
+        } else {
+            // Safety: prev_id is Running on this CPU, we own it.
+            let t = unsafe { thread_mut_from_ref(prev_id) };
+            t.quantum = t.quantum.saturating_sub(1);
+            if t.quantum != 0 {
+                return current_sp; // No preemption needed.
+            }
+            t.quantum = t.default_quantum;
+        }
+    }
+
+    // Clear yield_asap.
+    thread_ref(prev_id).yield_asap.store(false, Ordering::Release);
+
+    // Pick next thread from per-CPU queue.
+    let prev_group = thread_ref(prev_id).cosched_group.load(Ordering::Relaxed);
+    let (next_id, _cosched) = percpu_pick_next_cosched(cpu, idle_id, prev_group);
+
+    if prev_id == next_id {
+        return current_sp;
+    }
+
+    crate::sched::stats::CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
+    crate::trace::trace_event(crate::trace::EVT_CTX_SWITCH, prev_id, next_id);
+
+    // Save current thread's SP. Safety: we own the running thread.
+    let prev_task;
+    {
+        let prev_t = unsafe { thread_mut_from_ref(prev_id) };
+        prev_t.saved_sp = current_sp;
+        let prev_prio = prev_t.effective_priority;
+        prev_task = prev_t.task_id;
+        // Don't re-enqueue Dead threads (they are exiting).
+        if prev_id != idle_id && prev_t.state != ThreadState::Dead {
+            prev_t.state = ThreadState::Ready;
+            percpu_enqueue(cpu, prev_prio, prev_id);
+        }
+    }
+
+    // Switch page tables if crossing task boundaries.
+    let next_task = thread_ref(next_id).task_id;
+    if prev_task != next_task {
+        // Need task data — access via TASK_TABLE (lockless).
+        let next_root = {
+            let tptr = TASK_TABLE.get(next_task) as *const Task;
+            if !tptr.is_null() { unsafe { (*tptr).page_table_root } } else { 0 }
+        };
+        if next_root != 0 {
+            #[cfg(target_arch = "aarch64")]
+            crate::arch::aarch64::mm::switch_page_table(next_root);
+            #[cfg(target_arch = "riscv64")]
+            crate::arch::riscv64::mm::switch_page_table(next_root);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::mm::switch_page_table(next_root);
+        } else {
+            #[cfg(target_arch = "riscv64")]
+            {
+                let kern_root = crate::arch::riscv64::mm::kernel_pt_root();
+                if kern_root != 0 {
+                    crate::arch::riscv64::mm::switch_page_table(kern_root);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let next_kstack_top = thread_ref(next_id).stack_base + PAGE_SIZE;
+        crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
+    }
+
+    // Activate next thread. Safety: next_id was just dequeued, we own it.
+    let next_t = unsafe { thread_mut_from_ref(next_id) };
+    next_t.state = ThreadState::Running;
+    pcpu.current_thread.store(next_id, Ordering::Relaxed);
+    thread_ref(next_id).last_cpu.store(cpu, Ordering::Relaxed);
+    next_t.saved_sp
 }
 
 /// Voluntarily yield. Not usable from IRQ context.
@@ -2101,7 +2251,7 @@ pub fn fork_current() -> u64 {
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;
 
-    sched.run_queues[parent_priority as usize].push(child_tid);
+    percpu_enqueue(smp::cpu_id(), parent_priority, child_tid);
 
     // Grant caps on the child's thread port.
     {
@@ -2583,6 +2733,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     let cpu = smp::cpu_id() as usize;
     let frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
 
+    let cpu_idx = cpu as u32;
     let mut sched = SCHEDULER.lock();
     let pcpu = smp::current();
     let tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
@@ -2593,14 +2744,22 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     sched.thread_mut(tid as ThreadId).state = ThreadState::Blocked;
     sched.thread_mut(tid as ThreadId).blocked_on = reason;
 
-    // Pick next thread (don't re-enqueue current — it's Blocked).
-    let next_id = sched.pick_next(idle_id);
+    // Read SA state while holding lock.
+    let parked_task_id = sched.thread(tid as ThreadId).task_id;
+    let sa_enabled = sched.task(parked_task_id).sa_enabled;
+    drop(sched);
+
+    // Pick next thread from per-CPU queue (don't re-enqueue current — it's Blocked).
+    let next_id = percpu_pick_next(cpu_idx, idle_id);
 
     // Switch page tables if needed.
-    let prev_task = sched.thread(tid as ThreadId).task_id;
-    let next_task = sched.thread(next_id).task_id;
+    let prev_task = thread_ref(tid as ThreadId).task_id;
+    let next_task = thread_ref(next_id).task_id;
     if prev_task != next_task {
-        let next_root = sched.task(next_task).page_table_root;
+        let next_root = {
+            let tptr = TASK_TABLE.get(next_task) as *const Task;
+            if !tptr.is_null() { unsafe { (*tptr).page_table_root } } else { 0 }
+        };
         if next_root != 0 {
             #[cfg(target_arch = "aarch64")]
             crate::arch::aarch64::mm::switch_page_table(next_root);
@@ -2621,18 +2780,15 @@ pub fn park_current_for_ipc(reason: BlockReason) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        let next_kstack_top = sched.thread(next_id).stack_base + PAGE_SIZE;
+        let next_kstack_top = thread_ref(next_id).stack_base + PAGE_SIZE;
         crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
     }
 
-    sched.thread_mut(next_id).state = ThreadState::Running;
+    // Safety: next_id was just dequeued, we own it.
+    let next_t = unsafe { thread_mut_from_ref(next_id) };
+    next_t.state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
-    let next_sp = sched.thread(next_id).saved_sp;
-
-    // Read SA state while holding lock.
-    let parked_task_id = sched.thread(tid as ThreadId).task_id;
-    let sa_enabled = sched.task(parked_task_id).sa_enabled;
-    drop(sched);
+    let next_sp = next_t.saved_sp;
 
     // Scheduler activation: notify userspace that a kthread blocked.
     if sa_enabled {
@@ -2656,8 +2812,9 @@ pub fn wake_parked_thread(tid: ThreadId) {
     if let Some(thread) = sched.thread_get_mut(tid) {
         if thread.state == ThreadState::Blocked {
             let prio = thread.effective_priority;
+            let target = thread.last_cpu.load(Ordering::Relaxed);
             thread.state = ThreadState::Ready;
-            sched.run_queues[prio as usize].push(tid);
+            percpu_enqueue(target, prio, tid);
         }
     }
 }
@@ -2688,7 +2845,8 @@ pub fn get_monotonic_ns() -> u64 {
 fn check_sleep_timers() {
     let now_ns = get_monotonic_ns();
     let mut sched = SCHEDULER.lock();
-    let mut to_wake: [(ThreadId, u8); 64] = [(0, 0); 64];
+    // Collect (tid, prio, target_cpu) under global lock.
+    let mut to_wake: [(ThreadId, u8, u32); 64] = [(0, 0, 0); 64];
     let mut count = 0usize;
     sched.thread_art.for_each(|key, val| {
         let t = unsafe { &*(val as *const Thread) };
@@ -2698,18 +2856,20 @@ fn check_sleep_timers() {
             && t.sleep_deadline_ns <= now_ns
         {
             if count < 64 {
-                to_wake[count] = (key as ThreadId, t.effective_priority);
+                let target = t.last_cpu.load(Ordering::Relaxed);
+                to_wake[count] = (key as ThreadId, t.effective_priority, target);
                 count += 1;
             }
         }
     });
+    // Update thread state under global lock, then enqueue under per-CPU locks.
     for i in 0..count {
-        let (tid, prio) = to_wake[i];
+        let (tid, prio, target) = to_wake[i];
         let t = sched.thread_mut(tid);
         t.state = ThreadState::Ready;
         t.blocked_on = BlockReason::None;
         t.sleep_deadline_ns = 0;
-        sched.run_queues[prio as usize].push(tid);
+        percpu_enqueue(target, prio, tid);
     }
 }
 
@@ -2789,6 +2949,7 @@ fn check_interval_timers() {
 /// Sets the deadline and blocks the thread (off-CPU).
 pub fn park_current_for_sleep(deadline_ns: u64) {
     let cpu = smp::cpu_id() as usize;
+    let cpu_idx = cpu as u32;
     let frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
 
     let mut sched = SCHEDULER.lock();
@@ -2803,14 +2964,22 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     thread.state = ThreadState::Blocked;
     thread.blocked_on = BlockReason::Sleep;
 
-    // Pick next thread (don't re-enqueue current — it's Blocked).
-    let next_id = sched.pick_next(idle_id);
+    // SA notification for the parked thread.
+    let parked_task_id = sched.thread(tid as ThreadId).task_id;
+    let sa_enabled = sched.task(parked_task_id).sa_enabled;
+    drop(sched);
+
+    // Pick next thread from per-CPU queue.
+    let next_id = percpu_pick_next(cpu_idx, idle_id);
 
     // Switch page tables if needed.
-    let prev_task = sched.thread(tid as ThreadId).task_id;
-    let next_task = sched.thread(next_id).task_id;
+    let prev_task = thread_ref(tid as ThreadId).task_id;
+    let next_task = thread_ref(next_id).task_id;
     if prev_task != next_task {
-        let next_root = sched.task(next_task).page_table_root;
+        let next_root = {
+            let tptr = TASK_TABLE.get(next_task) as *const Task;
+            if !tptr.is_null() { unsafe { (*tptr).page_table_root } } else { 0 }
+        };
         if next_root != 0 {
             #[cfg(target_arch = "aarch64")]
             crate::arch::aarch64::mm::switch_page_table(next_root);
@@ -2831,18 +3000,15 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        let next_kstack_top = sched.thread(next_id).stack_base + PAGE_SIZE;
+        let next_kstack_top = thread_ref(next_id).stack_base + PAGE_SIZE;
         crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
     }
 
-    sched.thread_mut(next_id).state = ThreadState::Running;
+    // Safety: next_id was just dequeued, we own it.
+    let next_t = unsafe { thread_mut_from_ref(next_id) };
+    next_t.state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
-    let next_sp = sched.thread(next_id).saved_sp;
-
-    // SA notification for the parked thread.
-    let parked_task_id = sched.thread(tid as ThreadId).task_id;
-    let sa_enabled = sched.task(parked_task_id).sa_enabled;
-    drop(sched);
+    let next_sp = next_t.saved_sp;
 
     if sa_enabled {
         let tptr = TASK_TABLE.get(parked_task_id) as *mut Task;
@@ -2888,27 +3054,36 @@ pub fn alarm(initial_ns: u64, interval_ns: u64) -> u64 {
 /// in PENDING_SWITCH_SP. Receiver must already have its frame injected.
 pub fn handoff_to(receiver_tid: ThreadId) {
     let cpu = smp::cpu_id() as usize;
+    let cpu_id = cpu as u32;
     let frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
 
-    let mut sched = SCHEDULER.lock();
     let pcpu = smp::current();
     let sender_tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
 
-    // Save sender: goes to Ready on run queue.
-    sched.thread_mut(sender_tid as ThreadId).saved_sp = frame_sp;
-    let sender_prio = sched.thread(sender_tid as ThreadId).effective_priority;
-    sched.thread_mut(sender_tid as ThreadId).state = ThreadState::Ready;
-    sched.run_queues[sender_prio as usize].push(sender_tid as ThreadId);
+    // Safety: sender is Running on this CPU, we own it.
+    let (sender_prio, remaining_quantum, sender_task);
+    {
+        let sender = unsafe { thread_mut_from_ref(sender_tid as ThreadId) };
+        sender.saved_sp = frame_sp;
+        sender_prio = sender.effective_priority;
+        remaining_quantum = sender.quantum;
+        sender_task = sender.task_id;
+        sender.state = ThreadState::Ready;
+    }
+    percpu_enqueue(cpu_id, sender_prio, sender_tid as ThreadId);
 
     // Donate remaining quantum to receiver.
-    let remaining_quantum = sched.thread(sender_tid as ThreadId).quantum;
-    sched.thread_mut(receiver_tid).quantum = remaining_quantum;
+    // Safety: receiver was Blocked (parked), not on any queue or CPU.
+    let receiver = unsafe { thread_mut_from_ref(receiver_tid) };
+    receiver.quantum = remaining_quantum;
 
     // Switch page tables if needed.
-    let sender_task = sched.thread(sender_tid as ThreadId).task_id;
-    let recv_task = sched.thread(receiver_tid).task_id;
+    let recv_task = receiver.task_id;
     if sender_task != recv_task {
-        let next_root = sched.task(recv_task).page_table_root;
+        let next_root = {
+            let tptr = TASK_TABLE.get(recv_task) as *const Task;
+            if !tptr.is_null() { unsafe { (*tptr).page_table_root } } else { 0 }
+        };
         if next_root != 0 {
             #[cfg(target_arch = "aarch64")]
             crate::arch::aarch64::mm::switch_page_table(next_root);
@@ -2929,15 +3104,14 @@ pub fn handoff_to(receiver_tid: ThreadId) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        let next_kstack_top = sched.thread(receiver_tid).stack_base + PAGE_SIZE;
+        let next_kstack_top = receiver.stack_base + PAGE_SIZE;
         crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
     }
 
     // Activate receiver.
-    sched.thread_mut(receiver_tid).state = ThreadState::Running;
+    receiver.state = ThreadState::Running;
     pcpu.current_thread.store(receiver_tid, Ordering::Relaxed);
-    let recv_sp = sched.thread(receiver_tid).saved_sp;
-    drop(sched);
+    let recv_sp = receiver.saved_sp;
 
     PENDING_SWITCH_SP[cpu].store(recv_sp, Ordering::Release);
 }
