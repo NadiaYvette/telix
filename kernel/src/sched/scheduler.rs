@@ -76,73 +76,90 @@ static DEFERRED_THREAD: [AtomicUsize; smp::MAX_CPUS] = {
 };
 
 const NUM_PRIORITIES: usize = 256;
-const MAX_QUEUE_LEN: usize = 128;
 
+/// Sentinel value for empty linked-list pointers (head/tail/next/prev).
+const RQ_NIL: u32 = u32::MAX;
+
+/// Per-priority run queue — a doubly-linked FIFO list threaded through
+/// Thread::run_next / run_prev. No fixed capacity limit.
 struct RunQueue {
-    entries: [ThreadId; MAX_QUEUE_LEN],
-    head: usize,
-    tail: usize,
-    len: usize,
+    head: u32,   // First thread (RQ_NIL = empty)
+    tail: u32,   // Last thread (RQ_NIL = empty)
+    len: u32,    // Count of enqueued threads
 }
 
 impl RunQueue {
     const fn new() -> Self {
-        Self {
-            entries: [0; MAX_QUEUE_LEN],
-            head: 0,
-            tail: 0,
-            len: 0,
-        }
+        Self { head: RQ_NIL, tail: RQ_NIL, len: 0 }
     }
 
-    fn push(&mut self, id: ThreadId) {
-        if self.len < MAX_QUEUE_LEN {
-            self.entries[self.tail] = id;
-            self.tail = (self.tail + 1) % MAX_QUEUE_LEN;
-            self.len += 1;
+    /// Append a thread to the tail of the queue.
+    fn push(&mut self, tid: ThreadId) {
+        let t = thread_ref(tid);
+        t.run_next.store(RQ_NIL, Ordering::Relaxed);
+        t.run_prev.store(self.tail, Ordering::Relaxed);
+        if self.tail != RQ_NIL {
+            thread_ref(self.tail).run_next.store(tid, Ordering::Relaxed);
+        } else {
+            self.head = tid;
         }
+        self.tail = tid;
+        self.len += 1;
     }
 
+    /// Remove and return the head of the queue.
     fn pop(&mut self) -> Option<ThreadId> {
-        if self.len > 0 {
-            let id = self.entries[self.head];
-            self.head = (self.head + 1) % MAX_QUEUE_LEN;
-            self.len -= 1;
-            Some(id)
-        } else {
-            None
+        if self.head == RQ_NIL {
+            return None;
         }
+        let tid = self.head;
+        let t = thread_ref(tid);
+        let next = t.run_next.load(Ordering::Relaxed);
+        t.run_next.store(RQ_NIL, Ordering::Relaxed);
+        t.run_prev.store(RQ_NIL, Ordering::Relaxed);
+        self.head = next;
+        if next != RQ_NIL {
+            thread_ref(next).run_prev.store(RQ_NIL, Ordering::Relaxed);
+        } else {
+            self.tail = RQ_NIL;
+        }
+        self.len -= 1;
+        Some(tid)
     }
 
-    /// Remove the entry at position `i` (relative to head).
-    fn remove_at(&mut self, i: usize) {
-        if i == 0 {
-            // Fast path: same as pop — just advance head.
-            self.head = (self.head + 1) % MAX_QUEUE_LEN;
+    /// Unlink an arbitrary thread from the queue (O(1) given its linkage).
+    fn unlink(&mut self, tid: ThreadId) {
+        let t = thread_ref(tid);
+        let prev = t.run_prev.load(Ordering::Relaxed);
+        let next = t.run_next.load(Ordering::Relaxed);
+        if prev != RQ_NIL {
+            thread_ref(prev).run_next.store(next, Ordering::Relaxed);
         } else {
-            // Shift subsequent entries toward head.
-            for j in i..self.len - 1 {
-                let from = (self.head + j + 1) % MAX_QUEUE_LEN;
-                let to = (self.head + j) % MAX_QUEUE_LEN;
-                self.entries[to] = self.entries[from];
-            }
-            self.tail = if self.tail == 0 { MAX_QUEUE_LEN - 1 } else { self.tail - 1 };
+            self.head = next;
         }
+        if next != RQ_NIL {
+            thread_ref(next).run_prev.store(prev, Ordering::Relaxed);
+        } else {
+            self.tail = prev;
+        }
+        t.run_next.store(RQ_NIL, Ordering::Relaxed);
+        t.run_prev.store(RQ_NIL, Ordering::Relaxed);
         self.len -= 1;
     }
 
     /// Search for and remove a thread belonging to the given coscheduling group
     /// that can run on the given CPU.
     fn find_remove_by_group_for_cpu(&mut self, group: u32, cpu: u32) -> Option<ThreadId> {
-        for i in 0..self.len {
-            let idx = (self.head + i) % MAX_QUEUE_LEN;
-            let tid = self.entries[idx];
-            if thread_ref(tid).cosched_group.load(Ordering::Relaxed) == group
-                && thread_ref(tid).affinity_mask.test(cpu)
+        let mut cur = self.head;
+        while cur != RQ_NIL {
+            let t = thread_ref(cur);
+            if t.cosched_group.load(Ordering::Relaxed) == group
+                && t.affinity_mask.test(cpu)
             {
-                self.remove_at(i);
-                return Some(tid);
+                self.unlink(cur);
+                return Some(cur);
             }
+            cur = t.run_next.load(Ordering::Relaxed);
         }
         None
     }
@@ -150,13 +167,14 @@ impl RunQueue {
     /// Search for and remove the first thread whose affinity allows it to run
     /// on the given CPU.
     fn find_remove_for_cpu(&mut self, cpu: u32) -> Option<ThreadId> {
-        for i in 0..self.len {
-            let idx = (self.head + i) % MAX_QUEUE_LEN;
-            let tid = self.entries[idx];
-            if thread_ref(tid).affinity_mask.test(cpu) {
-                self.remove_at(i);
-                return Some(tid);
+        let mut cur = self.head;
+        while cur != RQ_NIL {
+            let t = thread_ref(cur);
+            if t.affinity_mask.test(cpu) {
+                self.unlink(cur);
+                return Some(cur);
             }
+            cur = t.run_next.load(Ordering::Relaxed);
         }
         None
     }

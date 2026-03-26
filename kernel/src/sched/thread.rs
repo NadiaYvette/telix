@@ -85,6 +85,11 @@ pub struct Thread {
     pub sig_altstack_base: u64,
     /// Signal alternate stack size in bytes (Phase 99).
     pub sig_altstack_size: u64,
+    // --- Run queue linkage (doubly-linked list per priority level) ---
+    /// Next thread in the same-priority run queue (u32::MAX = tail / not linked).
+    pub run_next: core::sync::atomic::AtomicU32,
+    /// Previous thread in the same-priority run queue (u32::MAX = head / not linked).
+    pub run_prev: core::sync::atomic::AtomicU32,
     // --- Lockless atomics (accessed via THREAD_TABLE radix lookup) ---
     pub wakeup: core::sync::atomic::AtomicBool,
     pub prio: core::sync::atomic::AtomicU8,
@@ -121,6 +126,8 @@ impl Thread {
             timer_next_ns: 0,
             sig_altstack_base: 0,
             sig_altstack_size: 0,
+            run_next: core::sync::atomic::AtomicU32::new(u32::MAX),
+            run_prev: core::sync::atomic::AtomicU32::new(u32::MAX),
             wakeup: core::sync::atomic::AtomicBool::new(false),
             prio: core::sync::atomic::AtomicU8::new(255),
             yield_asap: core::sync::atomic::AtomicBool::new(false),
