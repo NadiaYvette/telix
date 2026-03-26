@@ -149,10 +149,109 @@ fn free_queue(ptr: *mut PortQueue) {
 
 // --- Port structure ---
 
-/// Maximum threads that can be blocked waiting on a port.
-const MAX_WAITERS: usize = 8;
+// Waiter list: two-tier lazy allocation.
+// Tier 1: 64-byte slab → 16 ThreadIds.
+// Tier 2: page → PAGE_SIZE/4 ThreadIds (~16K at 64K pages).
 
-/// Slab size for Port allocation (~136 bytes, fits in 256-byte slab).
+/// Slab size for initial waiter list allocation.
+const WAITER_SLAB_SIZE: usize = 64;
+/// ThreadIds per slab-allocated waiter list.
+const WAITER_SLAB_CAP: usize = WAITER_SLAB_SIZE / core::mem::size_of::<ThreadId>();
+/// ThreadIds per page-allocated waiter list.
+const WAITER_PAGE_CAP: usize = crate::mm::page::PAGE_SIZE / core::mem::size_of::<ThreadId>();
+
+/// A dynamically-sized waiter list. Null until first waiter is added.
+struct WaiterList {
+    ptr: *mut ThreadId,
+    count: u16,
+    cap: u16,
+}
+
+impl WaiterList {
+    const fn new() -> Self {
+        Self { ptr: core::ptr::null_mut(), count: 0, cap: 0 }
+    }
+
+    /// Ensure there is room for at least one more waiter.
+    /// Allocates tier-1 slab on first call, grows to tier-2 page on overflow.
+    fn ensure_room(&mut self) -> bool {
+        if (self.count as usize) < (self.cap as usize) {
+            return true;
+        }
+        if self.ptr.is_null() {
+            // Tier 1: slab allocation.
+            let pa = match crate::mm::slab::alloc(WAITER_SLAB_SIZE) {
+                Some(pa) => pa,
+                None => return false,
+            };
+            let p = pa.as_usize() as *mut ThreadId;
+            unsafe { core::ptr::write_bytes(p as *mut u8, 0, WAITER_SLAB_SIZE); }
+            self.ptr = p;
+            self.cap = WAITER_SLAB_CAP as u16;
+            true
+        } else if (self.cap as usize) < WAITER_PAGE_CAP {
+            // Tier 2: grow from slab to page.
+            let pa = match crate::mm::phys::alloc_page() {
+                Some(pa) => pa,
+                None => return false,
+            };
+            let new_ptr = pa.as_usize() as *mut ThreadId;
+            unsafe {
+                core::ptr::write_bytes(new_ptr as *mut u8, 0, crate::mm::page::PAGE_SIZE);
+                core::ptr::copy_nonoverlapping(self.ptr, new_ptr, self.count as usize);
+            }
+            // Free old slab.
+            crate::mm::slab::free(PhysAddr::new(self.ptr as usize), WAITER_SLAB_SIZE);
+            self.ptr = new_ptr;
+            self.cap = WAITER_PAGE_CAP as u16;
+            true
+        } else {
+            false // page-tier full (~16K waiters)
+        }
+    }
+
+    /// Push a waiter (LIFO stack — last added is first woken).
+    fn push(&mut self, tid: ThreadId) -> bool {
+        if !self.ensure_room() {
+            return false;
+        }
+        unsafe { *self.ptr.add(self.count as usize) = tid; }
+        self.count += 1;
+        true
+    }
+
+    /// Pop the most recently added waiter.
+    fn pop(&mut self) -> Option<ThreadId> {
+        if self.count == 0 {
+            return None;
+        }
+        self.count -= 1;
+        Some(unsafe { *self.ptr.add(self.count as usize) })
+    }
+
+    /// Peek at the most recently added waiter without removing.
+    fn peek_last(&self) -> Option<ThreadId> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(unsafe { *self.ptr.add(self.count as usize - 1) })
+    }
+
+    /// Free backing memory.
+    fn free(&mut self) {
+        if self.ptr.is_null() { return; }
+        if (self.cap as usize) > WAITER_SLAB_CAP {
+            crate::mm::phys::free_page(PhysAddr::new(self.ptr as usize));
+        } else {
+            crate::mm::slab::free(PhysAddr::new(self.ptr as usize), WAITER_SLAB_SIZE);
+        }
+        self.ptr = core::ptr::null_mut();
+        self.count = 0;
+        self.cap = 0;
+    }
+}
+
+/// Slab size for Port allocation.
 const PORT_SLAB_SIZE: usize = 256;
 
 /// Kernel receive handler type. Called synchronously when a message is
@@ -174,12 +273,10 @@ pub struct Port {
     kernel_handler: usize,
     /// Opaque value passed to the kernel handler. Set at port creation.
     kernel_user_data: usize,
-    /// Threads blocked waiting to receive.
-    recv_waiters: [ThreadId; MAX_WAITERS],
-    recv_waiter_count: usize,
-    /// Threads blocked waiting to send (queue full).
-    send_waiters: [ThreadId; MAX_WAITERS],
-    send_waiter_count: usize,
+    /// Threads blocked waiting to receive (lazy two-tier allocation).
+    recv_waiters: WaiterList,
+    /// Threads blocked waiting to send (lazy two-tier allocation).
+    send_waiters: WaiterList,
     /// Port set this port belongs to (u32::MAX = none).
     pub port_set_id: u32,
     /// Task that created this port.
@@ -195,10 +292,8 @@ impl Port {
             queue_ptr: 0,
             kernel_handler: 0,
             kernel_user_data: 0,
-            recv_waiters: [0; MAX_WAITERS],
-            recv_waiter_count: 0,
-            send_waiters: [0; MAX_WAITERS],
-            send_waiter_count: 0,
+            recv_waiters: WaiterList::new(),
+            send_waiters: WaiterList::new(),
             port_set_id: u32::MAX,
             creator_task: 0,
             recv_holder: u32::MAX,
@@ -257,9 +352,8 @@ impl Port {
         }
 
         // Wake up a blocked receiver if any.
-        if self.recv_waiter_count > 0 {
-            self.recv_waiter_count -= 1;
-            Ok((Some(self.recv_waiters[self.recv_waiter_count]), u32::MAX))
+        if let Some(waiter) = self.recv_waiters.pop() {
+            Ok((Some(waiter), u32::MAX))
         } else {
             // No direct receiver — notify port set if this port belongs to one.
             Ok((None, self.port_set_id))
@@ -279,36 +373,19 @@ impl Port {
         };
 
         // Wake up a blocked sender if any.
-        let wakeup = if self.send_waiter_count > 0 {
-            self.send_waiter_count -= 1;
-            Some(self.send_waiters[self.send_waiter_count])
-        } else {
-            None
-        };
+        let wakeup = self.send_waiters.pop();
 
         Ok((msg, wakeup))
     }
 
     /// Add a thread to the receive wait list.
     pub fn add_recv_waiter(&mut self, tid: ThreadId) -> bool {
-        if self.recv_waiter_count < MAX_WAITERS {
-            self.recv_waiters[self.recv_waiter_count] = tid;
-            self.recv_waiter_count += 1;
-            true
-        } else {
-            false
-        }
+        self.recv_waiters.push(tid)
     }
 
     /// Add a thread to the send wait list.
     pub fn add_send_waiter(&mut self, tid: ThreadId) -> bool {
-        if self.send_waiter_count < MAX_WAITERS {
-            self.send_waiters[self.send_waiter_count] = tid;
-            self.send_waiter_count += 1;
-            true
-        } else {
-            false
-        }
+        self.send_waiters.push(tid)
     }
 
     /// Number of queued messages.
@@ -398,9 +475,13 @@ fn alloc_port(id: PortId) -> Option<*mut Port> {
     Some(ptr)
 }
 
-/// Free a Port and its queue back to the slab allocator.
+/// Free a Port, its queue, and waiter lists back to their allocators.
 fn free_port(ptr: *mut Port) {
-    unsafe { (*ptr).free_queue(); }
+    unsafe {
+        (*ptr).free_queue();
+        (*ptr).recv_waiters.free();
+        (*ptr).send_waiters.free();
+    }
     crate::mm::slab::free(PhysAddr::new(ptr as usize), PORT_SLAB_SIZE);
 }
 
@@ -766,14 +847,13 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
     }
 
     // Check for a parked (Blocked) receiver — direct transfer candidate.
-    if port.recv_waiter_count > 0 {
-        let waiter = port.recv_waiters[port.recv_waiter_count - 1];
+    if let Some(waiter) = port.recv_waiters.peek_last() {
         let is_parked = {
             let sched = crate::sched::scheduler::SCHEDULER.lock();
             sched.thread(waiter).state == ThreadState::Blocked
         };
         if is_parked {
-            port.recv_waiter_count -= 1;
+            port.recv_waiters.pop();
             drop(table);
             return SendDirectResult::DirectTransfer(waiter);
         }
