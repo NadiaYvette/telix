@@ -16,7 +16,7 @@
 //! page tables for lock-free lookup.
 
 use super::thread::{Thread, ThreadId, ThreadState, BlockReason, EXCEPTION_FRAME_SIZE};
-use super::task::{Task, TaskId, MAX_GROUPS, RLIMIT_COUNT, Rlimit};
+use super::task::{Task, TaskId, GROUPS_INLINE, RLIMIT_COUNT, Rlimit};
 use super::radix::RadixTable;
 use super::cpumask;
 use super::smp;
@@ -694,7 +694,8 @@ struct SpawnParentInfo {
     euid: u32,
     gid: u32,
     egid: u32,
-    groups: [u32; MAX_GROUPS],
+    groups_inline: [u32; GROUPS_INLINE],
+    groups_overflow: usize,
     ngroups: u32,
     rlimits: [Rlimit; RLIMIT_COUNT],
 }
@@ -899,7 +900,8 @@ impl Scheduler {
             euid: ptask.euid,
             gid: ptask.gid,
             egid: ptask.egid,
-            groups: ptask.groups,
+            groups_inline: ptask.groups_inline,
+            groups_overflow: ptask.groups_overflow,
             ngroups: ptask.ngroups,
             rlimits: ptask.rlimits,
         };
@@ -942,7 +944,8 @@ impl Scheduler {
         task.euid = parent.euid;
         task.gid = parent.gid;
         task.egid = parent.egid;
-        task.groups = parent.groups;
+        task.groups_inline = parent.groups_inline;
+        task.groups_overflow = parent.groups_overflow;
         task.ngroups = parent.ngroups;
         task.rlimits = parent.rlimits;
 
@@ -1154,6 +1157,29 @@ pub fn spawn(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
 /// Spawn a new user-mode process from an ELF binary in the initramfs.
 /// Creates a new task with its own address space. `arg0` is passed to main().
 ///
+/// Duplicate the parent's groups overflow page for a child task.
+/// Must be called outside SCHEDULER lock (allocates a physical page).
+/// On success, `parent.groups_overflow` is updated to the child's copy.
+/// On failure (OOM), returns false.
+fn dup_groups_overflow(parent: &mut SpawnParentInfo) -> bool {
+    if parent.ngroups as usize <= GROUPS_INLINE || parent.groups_overflow == 0 {
+        return true; // nothing to duplicate
+    }
+    let page = match crate::mm::phys::alloc_page() {
+        Some(p) => p,
+        None => return false,
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            parent.groups_overflow as *const u8,
+            page.as_usize() as *mut u8,
+            parent.ngroups as usize * core::mem::size_of::<u32>(),
+        );
+    }
+    parent.groups_overflow = page.as_usize();
+    true
+}
+
 /// Uses a 3-phase lock split to avoid ABBA deadlock between SCHEDULER and
 /// PORT_TABLE: phase 1 (alloc IDs) and phase 3 (finalize) hold SCHEDULER,
 /// but phase 2 (ELF loading, page table setup) runs without it.
@@ -1165,11 +1191,14 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
     let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
 
     // Phase 1: allocate IDs under SCHEDULER lock.
-    let (task_id, thread_id, parent) = SCHEDULER.lock().alloc_spawn_ids()?;
+    let (task_id, thread_id, mut parent) = SCHEDULER.lock().alloc_spawn_ids()?;
 
     // Phase 2: heavy work (page tables, ELF load, etc.) WITHOUT SCHEDULER lock.
     let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
         do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
+
+    // Duplicate groups overflow page for child (outside SCHEDULER lock).
+    if !dup_groups_overflow(&mut parent) { return None; }
 
     // Phase 3: finalize task/thread state under SCHEDULER lock.
     SCHEDULER.lock().finalize_spawn(
@@ -1182,10 +1211,12 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
 pub fn spawn_user_from_elf(elf_data: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
     let arg0_is_port = arg0 > 0 && crate::ipc::port::port_is_active(arg0);
 
-    let (task_id, thread_id, parent) = SCHEDULER.lock().alloc_spawn_ids()?;
+    let (task_id, thread_id, mut parent) = SCHEDULER.lock().alloc_spawn_ids()?;
 
     let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
         do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
+
+    if !dup_groups_overflow(&mut parent) { return None; }
 
     SCHEDULER.lock().finalize_spawn(
         task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base, task_port, thread_port,
@@ -1207,7 +1238,7 @@ pub fn spawn_user_with_data(
 
     let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
 
-    let (task_id, thread_id, parent) = SCHEDULER.lock().alloc_spawn_ids()?;
+    let (task_id, thread_id, mut parent) = SCHEDULER.lock().alloc_spawn_ids()?;
 
     // Phase 2: ELF load + stack setup WITHOUT SCHEDULER lock.
     let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
@@ -1283,6 +1314,8 @@ pub fn spawn_user_with_data(
             *frame.add(11) = data.len() as u64;
         }
     }
+
+    if !dup_groups_overflow(&mut parent) { return None; }
 
     // Phase 3: finalize under SCHEDULER lock.
     SCHEDULER.lock().finalize_spawn(
@@ -2119,33 +2152,49 @@ pub fn fork_current() -> u64 {
     // Actually, we allocate task_id first, then create the port.
 
     // Create child task and thread under the scheduler lock.
-    let mut sched = SCHEDULER.lock();
-
-    let child_task_id = match sched.alloc_task_id() {
-        Some(id) => id,
-        None => return u64::MAX,
+    // Snapshot parent groups + credentials while holding lock.
+    let (child_task_id, parent_pgid, parent_sid, parent_ctty,
+         parent_uid, parent_euid, parent_gid, parent_egid,
+         parent_groups_inline, parent_groups_overflow, parent_ngroups,
+         parent_rlimits) = {
+        let mut sched = SCHEDULER.lock();
+        let child_task_id = match sched.alloc_task_id() {
+            Some(id) => id,
+            None => return u64::MAX,
+        };
+        let ptask = sched.task(parent_task_id);
+        (child_task_id, ptask.pgid, ptask.sid, ptask.ctty_port,
+         ptask.uid, ptask.euid, ptask.gid, ptask.egid,
+         ptask.groups_inline, ptask.groups_overflow, ptask.ngroups,
+         ptask.rlimits)
     };
 
-    // Drop lock briefly to create the task port (port creation takes PORT_TABLE lock).
-    drop(sched);
+    // Outside SCHEDULER lock: create task port + duplicate groups overflow page.
     let child_task_port = match crate::ipc::port::create_kernel_port(task_port_handler, child_task_id as usize) {
         Some(p) => p,
         None => return u64::MAX,
+    };
+    let child_groups_overflow = if parent_ngroups as usize > GROUPS_INLINE && parent_groups_overflow != 0 {
+        match crate::mm::phys::alloc_page() {
+            Some(p) => {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        parent_groups_overflow as *const u8,
+                        p.as_usize() as *mut u8,
+                        parent_ngroups as usize * core::mem::size_of::<u32>(),
+                    );
+                }
+                p.as_usize()
+            }
+            None => return u64::MAX,
+        }
+    } else {
+        0
     };
     let mut sched = SCHEDULER.lock();
 
     // Set up child task.
     {
-        let parent_pgid = sched.task(parent_task_id).pgid;
-        let parent_sid = sched.task(parent_task_id).sid;
-        let parent_ctty = sched.task(parent_task_id).ctty_port;
-        let parent_uid = sched.task(parent_task_id).uid;
-        let parent_euid = sched.task(parent_task_id).euid;
-        let parent_gid = sched.task(parent_task_id).gid;
-        let parent_egid = sched.task(parent_task_id).egid;
-        let parent_groups = sched.task(parent_task_id).groups;
-        let parent_ngroups = sched.task(parent_task_id).ngroups;
-        let parent_rlimits = sched.task(parent_task_id).rlimits;
         let task = sched.task_mut(child_task_id);
         task.id = child_task_id;
         task.active = true;
@@ -2167,7 +2216,8 @@ pub fn fork_current() -> u64 {
         task.euid = parent_euid;
         task.gid = parent_gid;
         task.egid = parent_egid;
-        task.groups = parent_groups;
+        task.groups_inline = parent_groups_inline;
+        task.groups_overflow = child_groups_overflow;
         task.ngroups = parent_ngroups;
         task.rlimits = parent_rlimits;
     }
@@ -2354,6 +2404,16 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
                 let boot_root = crate::arch::x86_64::mm::boot_page_table_root();
                 crate::arch::x86_64::mm::switch_page_table(boot_root);
             }
+        }
+
+        // Free groups overflow page if allocated.
+        {
+            let exit_task_id = {
+                let sched = SCHEDULER.lock();
+                sched.thread(tid).task_id
+            };
+            let tptr = TASK_TABLE.get(exit_task_id) as *mut Task;
+            unsafe { (*tptr).free_groups_overflow(); }
         }
 
         // Destroy address space (frees VMAs and backing physical pages).

@@ -1256,34 +1256,143 @@ fn sys_getchar() -> u64 {
 }
 
 /// Maximum ELF size for spawn_elf (256 KiB).
-const SPAWN_ELF_MAX: usize = 256 * 1024;
-
-/// Static buffer for ELF data during spawn_elf. Protected by SPAWN_ELF_LOCK.
-static SPAWN_ELF_LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
-static mut SPAWN_ELF_BUF: [u8; SPAWN_ELF_MAX] = [0u8; SPAWN_ELF_MAX];
-
 fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
+    use crate::mm::page::PAGE_SIZE;
+
     let len = elf_len as usize;
-    if len == 0 || len > SPAWN_ELF_MAX {
+    if len < 64 { // Minimum ELF header size
         return u64::MAX;
     }
 
     let pt_root = crate::sched::scheduler::current_page_table_root();
-    let _guard = SPAWN_ELF_LOCK.lock();
 
-    // Copy ELF data from user memory into the static buffer.
-    let buf = unsafe { &mut SPAWN_ELF_BUF[..len] };
-    if !copy_from_user(pt_root, elf_ptr as usize, buf) {
+    // Phase A: Read ELF header + program headers into a scratch page.
+    let scratch = match crate::mm::phys::alloc_page() {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
+    let header_len = if len < PAGE_SIZE { len } else { PAGE_SIZE };
+    let scratch_slice = unsafe {
+        core::slice::from_raw_parts_mut(scratch.as_usize() as *mut u8, header_len)
+    };
+    if !copy_from_user(pt_root, elf_ptr as usize, scratch_slice) {
+        crate::mm::phys::free_page(scratch);
         return u64::MAX;
     }
 
-    match crate::sched::spawn_user_from_elf(buf, priority as u8, 20, arg0) {
+    // Parse ELF header to find maximum file extent needed.
+    let ehdr = unsafe { &*(scratch.as_usize() as *const u8 as *const [u8; 64]) };
+    if ehdr[0] != 0x7f || ehdr[1] != b'E' || ehdr[2] != b'L' || ehdr[3] != b'F' {
+        crate::mm::phys::free_page(scratch);
+        return u64::MAX;
+    }
+    let e_phoff = u64::from_le_bytes([ehdr[32], ehdr[33], ehdr[34], ehdr[35],
+                                       ehdr[36], ehdr[37], ehdr[38], ehdr[39]]) as usize;
+    let e_phentsize = u16::from_le_bytes([ehdr[54], ehdr[55]]) as usize;
+    let e_phnum = u16::from_le_bytes([ehdr[56], ehdr[57]]) as usize;
+
+    if e_phentsize < 56 || e_phnum == 0 {
+        crate::mm::phys::free_page(scratch);
+        return u64::MAX;
+    }
+
+    // Compute maximum file extent from PT_LOAD segments.
+    let phdrs_end = e_phoff + e_phnum * e_phentsize;
+    if phdrs_end > header_len {
+        // Program headers don't fit in the scratch page — need full copy anyway.
+        // Fall through to using `len` as the extent.
+    }
+    let mut max_file_end = 64usize; // at minimum, the ELF header
+    if phdrs_end <= header_len {
+        for i in 0..e_phnum {
+            let ph_base = scratch.as_usize() + e_phoff + i * e_phentsize;
+            let ph = unsafe { core::slice::from_raw_parts(ph_base as *const u8, 56) };
+            let p_type = u32::from_le_bytes([ph[0], ph[1], ph[2], ph[3]]);
+            if p_type == 1 { // PT_LOAD
+                let p_offset = u64::from_le_bytes([ph[8], ph[9], ph[10], ph[11],
+                                                    ph[12], ph[13], ph[14], ph[15]]) as usize;
+                let p_filesz = u64::from_le_bytes([ph[32], ph[33], ph[34], ph[35],
+                                                    ph[36], ph[37], ph[38], ph[39]]) as usize;
+                let end = p_offset.saturating_add(p_filesz);
+                if end > max_file_end {
+                    max_file_end = end;
+                }
+            }
+        }
+        // Also ensure we include the program headers themselves.
+        if phdrs_end > max_file_end {
+            max_file_end = phdrs_end;
+        }
+    } else {
+        max_file_end = len;
+    }
+    // Clamp to user-provided length.
+    if max_file_end > len {
+        max_file_end = len;
+    }
+
+    // Phase B: Allocate contiguous buffer and copy full ELF data.
+    let pages_needed = (max_file_end + PAGE_SIZE - 1) / PAGE_SIZE;
+    let order = if pages_needed <= 1 { 0 } else { (usize::BITS - (pages_needed - 1).leading_zeros()) as usize };
+    let (buf_addr, buf_order) = if order == 0 {
+        // Single page — reuse scratch if data already fits.
+        if max_file_end <= header_len {
+            (scratch, 0usize)
+        } else {
+            // Need to copy remaining data into scratch page.
+            let rest_start = header_len;
+            let rest_slice = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (scratch.as_usize() + rest_start) as *mut u8,
+                    max_file_end - rest_start,
+                )
+            };
+            if !copy_from_user(pt_root, elf_ptr as usize + rest_start, rest_slice) {
+                crate::mm::phys::free_page(scratch);
+                return u64::MAX;
+            }
+            (scratch, 0usize)
+        }
+    } else {
+        // Multi-page allocation.
+        let pages = match crate::mm::phys::alloc_pages(order) {
+            Some(p) => p,
+            None => {
+                crate::mm::phys::free_page(scratch);
+                return u64::MAX;
+            }
+        };
+        // Copy full ELF data from userspace.
+        let buf_slice = unsafe {
+            core::slice::from_raw_parts_mut(pages.as_usize() as *mut u8, max_file_end)
+        };
+        if !copy_from_user(pt_root, elf_ptr as usize, buf_slice) {
+            crate::mm::phys::free_pages(pages, order);
+            crate::mm::phys::free_page(scratch);
+            return u64::MAX;
+        }
+        // Free the scratch page (no longer needed).
+        crate::mm::phys::free_page(scratch);
+        (pages, order)
+    };
+
+    // Phase C: Spawn from the buffer, then free it.
+    let buf_slice = unsafe {
+        core::slice::from_raw_parts(buf_addr.as_usize() as *const u8, max_file_end)
+    };
+    let result = match crate::sched::spawn_user_from_elf(buf_slice, priority as u8, 20, arg0) {
         Some(tid) => {
             let task_id = crate::sched::thread_task_id(tid);
             crate::sched::task_port_id(task_id)
         }
         None => u64::MAX,
+    };
+    if buf_order == 0 {
+        crate::mm::phys::free_page(buf_addr);
+    } else {
+        crate::mm::phys::free_pages(buf_addr, buf_order);
     }
+    result
 }
 
 /// execve: replace current process image with a new ELF from initramfs.
@@ -1314,60 +1423,110 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     let name = &name_buf[..len];
 
     // Copy argv and envp strings from user memory (before point-of-no-return).
-    // Max 16 args, 64 bytes each. Store as flat buffer + lengths.
-    const MAX_ARGS: usize = 16;
-    const MAX_STR: usize = 64;
-    let mut argv_strs = [[0u8; MAX_STR]; MAX_ARGS];
-    let mut argv_lens = [0usize; MAX_ARGS];
+    // Page-allocated scratch buffers: metadata page (u16 lengths) + contiguous data pages.
+    const ARG_MAX_STRLEN: usize = 4096;
+    let arg_max_strings: usize = PAGE_SIZE / 8; // scales with page size
+    let arg_max_total: usize = 2 * PAGE_SIZE;   // max total string bytes
+    let data_order: usize = 1; // 2 contiguous pages for string data
+
+    // Allocate scratch pages.
+    let meta_page = match crate::mm::phys::alloc_page() {
+        Some(p) => p,
+        None => { set_return(frame, u64::MAX); return; }
+    };
+    let data_pages = match crate::mm::phys::alloc_pages(data_order) {
+        Some(p) => p,
+        None => {
+            crate::mm::phys::free_page(meta_page);
+            set_return(frame, u64::MAX); return;
+        }
+    };
+
+    // Metadata page: array of u16 string lengths.
+    let meta_lens = unsafe {
+        core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u16, PAGE_SIZE / 2)
+    };
+    let data_buf = unsafe {
+        core::slice::from_raw_parts_mut(data_pages.as_usize() as *mut u8, arg_max_total)
+    };
+
     let mut argc: usize = 0;
-    let mut envp_strs = [[0u8; MAX_STR]; MAX_ARGS];
-    let mut envp_lens = [0usize; MAX_ARGS];
     let mut envc: usize = 0;
+    let mut data_cursor: usize = 0;
+    let mut total_strings: usize = 0;
+
+    // Helper closure: copy a null-terminated string from userspace into data_buf.
+    // Returns string length (excluding null) or None on error/overflow.
+    let copy_str = |pt: usize, str_ptr: usize, buf: &mut [u8], cursor: &mut usize| -> Option<usize> {
+        // Copy in chunks, scanning for null terminator.
+        let mut total = 0usize;
+        let max = ARG_MAX_STRLEN.min(buf.len() - *cursor);
+        while total < max {
+            let chunk = 256.min(max - total);
+            let dst = &mut buf[*cursor + total .. *cursor + total + chunk];
+            if !copy_from_user(pt, str_ptr + total, dst) {
+                return None;
+            }
+            if let Some(pos) = dst.iter().position(|&b| b == 0) {
+                let slen = total + pos;
+                *cursor += slen;
+                return Some(slen);
+            }
+            total += chunk;
+        }
+        // No null found within limit — truncate.
+        *cursor += max;
+        Some(max)
+    };
 
     if argv_ptr != 0 {
-        for i in 0..MAX_ARGS {
+        loop {
+            if total_strings >= arg_max_strings { break; }
             let mut ptr_val = [0u8; 8];
-            if !copy_from_user(pt_root, argv_ptr + i * 8, &mut ptr_val) {
-                break;
-            }
+            if !copy_from_user(pt_root, argv_ptr + total_strings * 8, &mut ptr_val) { break; }
             let str_ptr = u64::from_le_bytes(ptr_val) as usize;
             if str_ptr == 0 { break; }
-            // Copy up to MAX_STR bytes of the string.
-            let mut buf = [0u8; MAX_STR];
-            if !copy_from_user(pt_root, str_ptr, &mut buf) {
-                break;
+            if data_cursor >= arg_max_total { break; }
+            match copy_str(pt_root, str_ptr, data_buf, &mut data_cursor) {
+                Some(slen) => {
+                    meta_lens[total_strings] = slen as u16;
+                    total_strings += 1;
+                    argc += 1;
+                }
+                None => break,
             }
-            // Find null terminator.
-            let slen = buf.iter().position(|&b| b == 0).unwrap_or(MAX_STR);
-            argv_strs[i][..slen].copy_from_slice(&buf[..slen]);
-            argv_lens[i] = slen;
-            argc = i + 1;
         }
     }
 
     if envp_ptr != 0 {
-        for i in 0..MAX_ARGS {
+        let mut ei = 0usize;
+        loop {
+            if total_strings >= arg_max_strings { break; }
             let mut ptr_val = [0u8; 8];
-            if !copy_from_user(pt_root, envp_ptr + i * 8, &mut ptr_val) {
-                break;
-            }
+            if !copy_from_user(pt_root, envp_ptr + ei * 8, &mut ptr_val) { break; }
             let str_ptr = u64::from_le_bytes(ptr_val) as usize;
             if str_ptr == 0 { break; }
-            let mut buf = [0u8; MAX_STR];
-            if !copy_from_user(pt_root, str_ptr, &mut buf) {
-                break;
+            if data_cursor >= arg_max_total { break; }
+            match copy_str(pt_root, str_ptr, data_buf, &mut data_cursor) {
+                Some(slen) => {
+                    meta_lens[total_strings] = slen as u16;
+                    total_strings += 1;
+                    envc += 1;
+                    ei += 1;
+                }
+                None => break,
             }
-            let slen = buf.iter().position(|&b| b == 0).unwrap_or(MAX_STR);
-            envp_strs[i][..slen].copy_from_slice(&buf[..slen]);
-            envp_lens[i] = slen;
-            envc = i + 1;
         }
     }
+
+    let string_total = data_cursor; // total bytes of string data (excluding null terminators)
 
     // Look up the ELF in initramfs (before point-of-no-return).
     let elf_data = match crate::io::initramfs::lookup_file(name) {
         Some(d) => d,
         None => {
+            crate::mm::phys::free_page(meta_page);
+            crate::mm::phys::free_pages(data_pages, data_order);
             set_return(frame, u64::MAX);
             return;
         }
@@ -1375,6 +1534,8 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
 
     // Validate ELF header (basic checks before we destroy anything).
     if elf_data.len() < 64 || elf_data[0..4] != [0x7f, b'E', b'L', b'F'] {
+        crate::mm::phys::free_page(meta_page);
+        crate::mm::phys::free_pages(data_pages, data_order);
         set_return(frame, u64::MAX);
         return;
     }
@@ -1467,7 +1628,11 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     #[cfg(target_arch = "x86_64")]
     const USER_STACK_TOP: usize = 0x7FFF_FFFF_0000;
 
-    let stack_pages = 2; // 2 pages for stack (need room for argv/envp/auxv strings)
+    // Compute stack size dynamically: strings + null terminators + pointer table + auxv + margin.
+    let strings_with_nulls = string_total + (argc + envc); // each string gets a null terminator
+    let ptr_table_size = (1 + argc + 1 + envc + 1 + 14) * 8; // argc + argv[] + NULL + envp[] + NULL + 7 auxv pairs
+    let stack_needed = strings_with_nulls + ptr_table_size + 256; // 256 bytes margin
+    let stack_pages = ((stack_needed + PAGE_SIZE - 1) / PAGE_SIZE).max(2);
     let stack_va = USER_STACK_TOP - stack_pages * PAGE_SIZE;
 
     let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
@@ -1528,26 +1693,36 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     //   argv[0] pointer
     //   argc            <-- sp points here
 
-    // Write strings to top of stack, building pointer table.
+    // Write strings from scratch pages to top of stack, building pointer table.
+    // Use the metadata page to store user-space addresses (reuse as u64 array).
     let mut str_pos = USER_STACK_TOP; // grows downward
-    let mut argv_addrs = [0usize; MAX_ARGS];
-    let mut envp_addrs = [0usize; MAX_ARGS];
+    let mut data_off: usize = 0;
+    // We store addresses in a temporary array on the metadata page (reinterpreted as u64).
+    // meta_page can hold PAGE_SIZE/8 u64 addresses.
+    let addr_buf = unsafe {
+        core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u64, PAGE_SIZE / 8)
+    };
+    let data_src = unsafe {
+        core::slice::from_raw_parts(data_pages.as_usize() as *const u8, arg_max_total)
+    };
 
     // Write argv strings (from top down).
     for i in 0..argc {
-        let slen = argv_lens[i] + 1; // include null terminator
-        str_pos -= slen;
-        argv_addrs[i] = str_pos;
-        copy_to_user(new_pt_root, str_pos, &argv_strs[i][..argv_lens[i]]);
+        let slen = meta_lens[i] as usize;
+        str_pos -= slen + 1; // include null terminator
+        addr_buf[i] = str_pos as u64;
+        copy_to_user(new_pt_root, str_pos, &data_src[data_off..data_off + slen]);
         // null terminator is already there (stack was zeroed)
+        data_off += slen;
     }
 
     // Write envp strings.
     for i in 0..envc {
-        let slen = envp_lens[i] + 1;
-        str_pos -= slen;
-        envp_addrs[i] = str_pos;
-        copy_to_user(new_pt_root, str_pos, &envp_strs[i][..envp_lens[i]]);
+        let slen = meta_lens[argc + i] as usize;
+        str_pos -= slen + 1;
+        addr_buf[argc + i] = str_pos as u64;
+        copy_to_user(new_pt_root, str_pos, &data_src[data_off..data_off + slen]);
+        data_off += slen;
     }
 
     // Align str_pos down to 16 bytes.
@@ -1584,14 +1759,12 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     let mut pos = sp;
 
     // argc
-    let argc_bytes = (argc as u64).to_le_bytes();
-    copy_to_user(new_pt_root, pos, &argc_bytes);
+    copy_to_user(new_pt_root, pos, &(argc as u64).to_le_bytes());
     pos += 8;
 
     // argv pointers
     for i in 0..argc {
-        let ptr_bytes = (argv_addrs[i] as u64).to_le_bytes();
-        copy_to_user(new_pt_root, pos, &ptr_bytes);
+        copy_to_user(new_pt_root, pos, &addr_buf[i].to_le_bytes());
         pos += 8;
     }
     // argv NULL terminator
@@ -1600,8 +1773,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
 
     // envp pointers
     for i in 0..envc {
-        let ptr_bytes = (envp_addrs[i] as u64).to_le_bytes();
-        copy_to_user(new_pt_root, pos, &ptr_bytes);
+        copy_to_user(new_pt_root, pos, &addr_buf[argc + i].to_le_bytes());
         pos += 8;
     }
     // envp NULL terminator
@@ -1615,6 +1787,10 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         copy_to_user(new_pt_root, pos, &val.to_le_bytes());
         pos += 8;
     }
+
+    // Free scratch pages (no longer needed).
+    crate::mm::phys::free_page(meta_page);
+    crate::mm::phys::free_pages(data_pages, data_order);
 
     // argv pointer (for register passing) = sp + 8
     let argv_base = sp + 8;
@@ -2462,33 +2638,79 @@ fn sys_setgid(new_gid: u64) -> u64 {
 /// setgroups: set supplementary group list. Only euid 0 can call.
 /// a0 = count, a1 = pointer to u32 array in user memory.
 fn sys_setgroups(count: u64, groups_ptr: u64) -> u64 {
+    use crate::sched::task::{MAX_GROUPS, GROUPS_INLINE};
     let n = count as usize;
-    if n > crate::sched::task::MAX_GROUPS {
+    if n > MAX_GROUPS {
         return u64::MAX; // EINVAL
     }
     if n > 0 && groups_ptr == 0 {
         return u64::MAX;
     }
-    // Copy group IDs from user memory using safe copy_from_user.
-    let mut tmp = [0u8; crate::sched::task::MAX_GROUPS * 4];
-    if n > 0 {
-        let pt_root = crate::sched::scheduler::current_page_table_root();
-        if !copy_from_user(pt_root, groups_ptr as usize, &mut tmp[..n * 4]) {
-            return u64::MAX;
+
+    // Check permission first (under SCHEDULER lock briefly).
+    {
+        let sched = crate::sched::scheduler::SCHEDULER.lock();
+        let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+        let task_id = sched.thread(tid).task_id;
+        if sched.task(task_id).euid != 0 {
+            return u64::MAX; // EPERM
         }
     }
+
+    // Allocate overflow page if needed (outside SCHEDULER lock).
+    let overflow_page = if n > GROUPS_INLINE {
+        match crate::mm::phys::alloc_page() {
+            Some(p) => p.as_usize(),
+            None => return u64::MAX, // ENOMEM
+        }
+    } else {
+        0
+    };
+
+    // Copy group IDs from user memory.
+    let pt_root = crate::sched::scheduler::current_page_table_root();
+    let mut inline_buf = [0u32; GROUPS_INLINE];
+    if n > 0 {
+        if n <= GROUPS_INLINE {
+            // Copy into stack buffer, then write to task inline.
+            let mut tmp = [0u8; GROUPS_INLINE * 4];
+            if !copy_from_user(pt_root, groups_ptr as usize, &mut tmp[..n * 4]) {
+                return u64::MAX;
+            }
+            for i in 0..n {
+                let off = i * 4;
+                inline_buf[i] = u32::from_le_bytes([tmp[off], tmp[off+1], tmp[off+2], tmp[off+3]]);
+            }
+        } else {
+            // Copy directly into the overflow page.
+            let dst = unsafe { core::slice::from_raw_parts_mut(overflow_page as *mut u8, n * 4) };
+            if !copy_from_user(pt_root, groups_ptr as usize, dst) {
+                crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(overflow_page));
+                return u64::MAX;
+            }
+        }
+    }
+
+    // Apply under SCHEDULER lock.
     let mut sched = crate::sched::scheduler::SCHEDULER.lock();
     let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
     let task_id = sched.thread(tid).task_id;
     let task = sched.task_mut(task_id);
-    if task.euid != 0 {
-        return u64::MAX; // EPERM
-    }
-    for i in 0..n {
-        let off = i * 4;
-        task.groups[i] = u32::from_le_bytes([tmp[off], tmp[off+1], tmp[off+2], tmp[off+3]]);
+    // Free old overflow page if present.
+    let old_overflow = task.groups_overflow;
+    if n <= GROUPS_INLINE {
+        task.groups_inline[..n].copy_from_slice(&inline_buf[..n]);
+        task.groups_overflow = 0;
+    } else {
+        task.groups_overflow = overflow_page;
     }
     task.ngroups = n as u32;
+    drop(sched);
+
+    // Free old overflow page outside lock.
+    if old_overflow != 0 {
+        crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(old_overflow));
+    }
     0
 }
 
@@ -2631,29 +2853,39 @@ fn sys_prlimit(pid: u64, resource: u64, new_cur: u64, new_max: u64, frame: &mut 
 }
 
 fn sys_getgroups(max_count: u64, groups_ptr: u64) -> u64 {
-    let sched = crate::sched::scheduler::SCHEDULER.lock();
-    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
-    let task_id = sched.thread(tid).task_id;
-    let task = sched.task(task_id);
-    let n = task.ngroups as usize;
+    use crate::sched::task::GROUPS_INLINE;
+    let (n, pt_root, inline_copy, overflow_addr) = {
+        let sched = crate::sched::scheduler::SCHEDULER.lock();
+        let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+        let task_id = sched.thread(tid).task_id;
+        let task = sched.task(task_id);
+        (task.ngroups as usize, task.page_table_root, task.groups_inline, task.groups_overflow)
+    };
     if max_count == 0 {
         return n as u64;
     }
     if (max_count as usize) < n {
         return u64::MAX; // EINVAL — buffer too small
     }
-    // Serialize to temp buffer, then copy_to_user.
-    let mut tmp = [0u8; crate::sched::task::MAX_GROUPS * 4];
-    for i in 0..n {
-        let bytes = task.groups[i].to_le_bytes();
-        let off = i * 4;
-        tmp[off] = bytes[0]; tmp[off+1] = bytes[1];
-        tmp[off+2] = bytes[2]; tmp[off+3] = bytes[3];
+    if groups_ptr == 0 || n == 0 {
+        return n as u64;
     }
-    let pt_root = task.page_table_root;
-    drop(sched);
-    if groups_ptr != 0 && n > 0 {
+    if n <= GROUPS_INLINE {
+        // Serialize inline groups to byte buffer, then copy_to_user.
+        let mut tmp = [0u8; GROUPS_INLINE * 4];
+        for i in 0..n {
+            let bytes = inline_copy[i].to_le_bytes();
+            let off = i * 4;
+            tmp[off] = bytes[0]; tmp[off+1] = bytes[1];
+            tmp[off+2] = bytes[2]; tmp[off+3] = bytes[3];
+        }
         if !copy_to_user(pt_root, groups_ptr as usize, &tmp[..n * 4]) {
+            return u64::MAX;
+        }
+    } else {
+        // Copy directly from overflow page to userspace.
+        let src = unsafe { core::slice::from_raw_parts(overflow_addr as *const u8, n * 4) };
+        if !copy_to_user(pt_root, groups_ptr as usize, src) {
             return u64::MAX;
         }
     }

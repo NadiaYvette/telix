@@ -134,8 +134,10 @@ pub struct Task {
     pub gid: u32,
     /// Effective group ID.
     pub egid: u32,
-    /// Supplementary group list.
-    pub groups: [u32; MAX_GROUPS],
+    /// Supplementary group list (inline storage for up to GROUPS_INLINE entries).
+    pub groups_inline: [u32; GROUPS_INLINE],
+    /// Overflow page for > GROUPS_INLINE groups (physical address, 0 = none).
+    pub groups_overflow: usize,
     /// Number of supplementary groups.
     pub ngroups: u32,
     // --- Resource limits (Phase 50) ---
@@ -151,8 +153,12 @@ pub struct Task {
     pub sa_waiter: core::sync::atomic::AtomicU32,
 }
 
-/// Maximum supplementary groups per task.
-pub const MAX_GROUPS: usize = 32;
+/// Supplementary groups stored inline in the Task struct (common case).
+pub const GROUPS_INLINE: usize = 32;
+
+/// Maximum supplementary groups per task (overflow page capacity).
+/// PAGE_SIZE / 4 gives e.g. 4096 at 16K pages, 16384 at 64K pages.
+pub const MAX_GROUPS: usize = crate::mm::page::PAGE_SIZE / core::mem::size_of::<u32>();
 
 // --- Resource limits (Phase 50) ---
 
@@ -220,7 +226,8 @@ impl Task {
             euid: 0,
             gid: 0,
             egid: 0,
-            groups: [0; MAX_GROUPS],
+            groups_inline: [0; GROUPS_INLINE],
+            groups_overflow: 0,
             ngroups: 0,
             rlimits: DEFAULT_RLIMITS,
             capset: crate::cap::capset::CapSet::new(),
@@ -228,6 +235,24 @@ impl Task {
             sa_pending: core::sync::atomic::AtomicBool::new(false),
             sa_event: core::sync::atomic::AtomicU64::new(0),
             sa_waiter: core::sync::atomic::AtomicU32::new(u32::MAX),
+        }
+    }
+
+    /// Get the supplementary groups slice (inline or overflow).
+    pub fn groups(&self) -> &[u32] {
+        let n = self.ngroups as usize;
+        if n <= GROUPS_INLINE {
+            &self.groups_inline[..n]
+        } else {
+            unsafe { core::slice::from_raw_parts(self.groups_overflow as *const u32, n) }
+        }
+    }
+
+    /// Free the overflow page if allocated. Called on last-thread exit.
+    pub fn free_groups_overflow(&mut self) {
+        if self.groups_overflow != 0 {
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(self.groups_overflow));
+            self.groups_overflow = 0;
         }
     }
 }
