@@ -3,9 +3,6 @@
 
 use super::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE};
 
-/// Maximum VMAs per address space.
-#[allow(dead_code)]
-pub const MAX_VMAS: usize = 32;
 
 /// VMA protection flags.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

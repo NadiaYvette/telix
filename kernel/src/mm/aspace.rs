@@ -452,19 +452,24 @@ pub fn unmap_anon(id: ASpaceId, va: usize) -> bool {
 pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
     let child_pt = create_user_page_table()?;
 
-    // Step 1: Lock parent, snapshot VMA info.
-    struct VmaInfo {
+    // Step 1: Lock parent, snapshot VMA info into a page-allocated buffer.
+    // Each entry holds the VMA snapshot plus the cloned object ID (filled in step 3).
+    #[repr(C)]
+    struct CowEntry {
         va_start: usize,
         va_len: usize,
         prot: VmaProt,
         object_id: u32,
         object_offset: u32,
+        new_obj_id: u32,
     }
-    let mut vma_infos: [Option<VmaInfo>; 32] = {
-        const NONE: Option<VmaInfo> = None;
-        [NONE; 32]
-    };
-    let mut vma_count = 0;
+    const ENTRIES_PER_PAGE: usize = super::page::PAGE_SIZE / core::mem::size_of::<CowEntry>();
+
+    let cow_page = super::phys::alloc_page()?;
+    let cow_buf = cow_page.as_usize() as *mut CowEntry;
+    unsafe { core::ptr::write_bytes(cow_buf as *mut u8, 0, super::page::PAGE_SIZE); }
+
+    let mut vma_count = 0usize;
     let parent_pt;
     let parent_heap;
 
@@ -474,14 +479,16 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         parent_heap = guard.heap_next;
         let mut it = guard.vmas.iter();
         while let Some(vma) = it.next() {
-            if !vma.active || vma_count >= 32 { continue; }
-            vma_infos[vma_count] = Some(VmaInfo {
-                va_start: vma.va_start,
-                va_len: vma.va_len,
-                prot: vma.prot,
-                object_id: vma.object_id,
-                object_offset: vma.object_offset,
-            });
+            if !vma.active || vma_count >= ENTRIES_PER_PAGE { continue; }
+            unsafe {
+                let e = &mut *cow_buf.add(vma_count);
+                e.va_start = vma.va_start;
+                e.va_len = vma.va_len;
+                e.prot = vma.prot;
+                e.object_id = vma.object_id;
+                e.object_offset = vma.object_offset;
+                e.new_obj_id = 0;
+            }
             vma_count += 1;
         }
     } // parent lock dropped
@@ -524,31 +531,30 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
     }
 
     // Step 3: Clone objects (no aspace lock held — only OBJ_TABLE lock).
-    let mut new_obj_ids: [u32; 32] = [0; 32];
-
     for i in 0..vma_count {
-        if let Some(ref info) = vma_infos[i] {
-            match object::clone_for_cow(info.object_id) {
-                Some(new_id) => {
-                    object::with_object(new_id, |obj| {
-                        obj.add_mapping(child_id, info.va_start);
-                    });
-                    new_obj_ids[i] = new_id;
+        let info = unsafe { &mut *cow_buf.add(i) };
+        match object::clone_for_cow(info.object_id) {
+            Some(new_id) => {
+                object::with_object(new_id, |obj| {
+                    obj.add_mapping(child_id, info.va_start);
+                });
+                info.new_obj_id = new_id;
+            }
+            None => {
+                // OOM — clean up.
+                for j in 0..i {
+                    let e = unsafe { &*cow_buf.add(j) };
+                    object::destroy(e.new_obj_id);
                 }
-                None => {
-                    // OOM — clean up.
-                    for j in 0..i {
-                        object::destroy(new_obj_ids[j]);
-                    }
-                    // Remove child from ART and free.
-                    {
-                        let mut table = ASPACE_TABLE.lock();
-                        table.art.remove(child_id as u64);
-                    }
-                    free_entry(child_entry_ptr);
-                    free_page_table_tree(child_pt);
-                    return None;
+                // Remove child from ART and free.
+                {
+                    let mut table = ASPACE_TABLE.lock();
+                    table.art.remove(child_id as u64);
                 }
+                free_entry(child_entry_ptr);
+                free_page_table_tree(child_pt);
+                super::phys::free_page(cow_page);
+                return None;
             }
         }
     }
@@ -559,27 +565,26 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         let sw_z = super::fault::sw_zeroed_bit();
 
         for i in 0..vma_count {
-            if let Some(ref info) = vma_infos[i] {
-                child_guard.vmas.insert(
-                    info.va_start, info.va_len, info.prot,
-                    new_obj_ids[i], info.object_offset,
-                );
+            let info = unsafe { &*cow_buf.add(i) };
+            child_guard.vmas.insert(
+                info.va_start, info.va_len, info.prot,
+                info.new_obj_id, info.object_offset,
+            );
 
-                // Install child PTEs by walking parent's page table.
-                let mmu_count = info.va_len / super::page::MMUPAGE_SIZE;
-                for mmu_idx in 0..mmu_count {
-                    let va = info.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
-                    let pte = super::fault::read_pte_dispatch(parent_pt, va);
-                    if super::fault::pte_is_present(pte) {
-                        if let Some(pa) = translate_va(parent_pt, va) {
-                            let pa_page = pa & !(super::page::MMUPAGE_SIZE - 1);
-                            let flags = if info.prot.writable() {
-                                ro_flags_for_prot(info.prot)
-                            } else {
-                                rw_flags_for_prot(info.prot)
-                            };
-                            map_single_mmupage(child_pt, va, pa_page, flags | sw_z);
-                        }
+            // Install child PTEs by walking parent's page table.
+            let mmu_count = info.va_len / super::page::MMUPAGE_SIZE;
+            for mmu_idx in 0..mmu_count {
+                let va = info.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
+                let pte = super::fault::read_pte_dispatch(parent_pt, va);
+                if super::fault::pte_is_present(pte) {
+                    if let Some(pa) = translate_va(parent_pt, va) {
+                        let pa_page = pa & !(super::page::MMUPAGE_SIZE - 1);
+                        let flags = if info.prot.writable() {
+                            ro_flags_for_prot(info.prot)
+                        } else {
+                            rw_flags_for_prot(info.prot)
+                        };
+                        map_single_mmupage(child_pt, va, pa_page, flags | sw_z);
                     }
                 }
             }
@@ -590,24 +595,26 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
     {
         let _parent_guard = lock_aspace(parent_id);
         for i in 0..vma_count {
-            if let Some(ref info) = vma_infos[i] {
-                if info.prot.writable() {
-                    let mmu_count = info.va_len / super::page::MMUPAGE_SIZE;
+            let info = unsafe { &*cow_buf.add(i) };
+            if info.prot.writable() {
+                let mmu_count = info.va_len / super::page::MMUPAGE_SIZE;
 
-                    demote_superpages_in_range(parent_pt, info.va_start, mmu_count, info.prot);
+                demote_superpages_in_range(parent_pt, info.va_start, mmu_count, info.prot);
 
-                    for mmu_idx in 0..mmu_count {
-                        let va = info.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
-                        let pte = super::fault::read_pte_dispatch(parent_pt, va);
-                        if super::fault::pte_is_present(pte) {
-                            downgrade_pte_readonly(parent_pt, va);
-                            downgrade_pte_readonly(child_pt, va);
-                        }
+                for mmu_idx in 0..mmu_count {
+                    let va = info.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
+                    let pte = super::fault::read_pte_dispatch(parent_pt, va);
+                    if super::fault::pte_is_present(pte) {
+                        downgrade_pte_readonly(parent_pt, va);
+                        downgrade_pte_readonly(child_pt, va);
                     }
                 }
             }
         }
     } // parent lock dropped
+
+    // Free the snapshot buffer.
+    super::phys::free_page(cow_page);
 
     Some((child_id, child_pt))
 }
