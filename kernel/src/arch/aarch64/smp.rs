@@ -56,8 +56,9 @@ pub fn start_secondary_cpus() {
         // The secondary reads its CPU ID from MPIDR_EL1.
         let ret = psci_cpu_on(target_mpidr, entry, stack_top);
         if ret != 0 {
-            crate::println!("  PSCI CPU_ON for CPU {} failed: {}", cpu, ret);
-            continue;
+            // PSCI returns -2 (INVALID_PARAMETERS) for non-existent CPUs.
+            // Stop probing once we hit the first failure.
+            break;
         }
         started += 1;
     }

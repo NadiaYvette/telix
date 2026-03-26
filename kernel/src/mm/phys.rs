@@ -26,11 +26,10 @@ const MAX_CHUNKS: usize = MAX_PAGES / CHUNK_PAGES; // 128
 const INLINE_K: u32 = 6;
 
 /// Sentinel values.
-const NO_CPU: u32 = 0xF;
+const NO_CPU: u32 = 0x7F;
 const NO_CHUNK: usize = 0xFF;
 
-/// Maximum CPUs (must match sched::smp::MAX_CPUS).
-const MAX_CPUS: usize = 4;
+use crate::sched::smp::MAX_CPUS;
 
 // ── ChunkNode ────────────────────────────────────────────────────────
 
@@ -38,10 +37,10 @@ const MAX_CPUS: usize = 4;
 ///
 /// Layout (64 bits):
 ///   [6:0]   free_count   (0..64; 64 = all-free, special-cased)
-///   [10:7]  owner_cpu    (0..3 = CPU, 0xF = unowned)
-///   [11]    has_bitmap   (1 = bitmap page materialized)
-///   [17:12] bitmap_page  (index within chunk when has_bitmap=1)
-///   [63:18] inline_data  (when has_bitmap=0 and free_count in 1..=INLINE_K:
+///   [13:7]  owner_cpu    (0..126 = CPU, 0x7F = unowned)
+///   [14]    has_bitmap   (1 = bitmap page materialized)
+///   [20:15] bitmap_page  (index within chunk when has_bitmap=1)
+///   [63:21] inline_data  (when has_bitmap=0 and free_count in 1..=INLINE_K:
 ///                          6 indices packed as 6 bits each, low-to-high)
 ///
 /// When free_count=0: chunk fully allocated, no metadata.
@@ -58,11 +57,11 @@ struct ChunkNode {
 // Bit-field accessors.
 const FREE_COUNT_MASK: u64 = 0x7F;          // bits [6:0]
 const OWNER_SHIFT: u32 = 7;
-const OWNER_MASK: u64 = 0xF << 7;           // bits [10:7]
-const HAS_BITMAP_BIT: u64 = 1 << 11;        // bit [11]
-const BMP_PAGE_SHIFT: u32 = 12;
-const BMP_PAGE_MASK: u64 = 0x3F << 12;      // bits [17:12]
-const INLINE_SHIFT: u32 = 18;
+const OWNER_MASK: u64 = 0x7F << 7;          // bits [13:7]  (7 bits → 0..126 + sentinel)
+const HAS_BITMAP_BIT: u64 = 1 << 14;        // bit [14]
+const BMP_PAGE_SHIFT: u32 = 15;
+const BMP_PAGE_MASK: u64 = 0x3F << 15;      // bits [20:15]
+const INLINE_SHIFT: u32 = 21;
 // Each inline index is 6 bits, starting at bit 18.
 const INLINE_IDX_BITS: u32 = 6;
 const INLINE_IDX_MASK: u64 = 0x3F;
@@ -599,9 +598,11 @@ pub fn alloc_page() -> Option<PhysAddr> {
     }
 
     let cpu = my_cpu();
+    // Owner field is 7 bits — CPUs >= NO_CPU skip per-CPU reservation.
+    let can_reserve = cpu < NO_CPU as usize;
 
     // Fast path: try the per-CPU reserved chunk.
-    let reserved = unsafe { CPU_RESERVATION[cpu] };
+    let reserved = if can_reserve { unsafe { CPU_RESERVATION[cpu] } } else { NO_CHUNK };
     if reserved != NO_CHUNK {
         if let Some(pi) = chunk_alloc_one(reserved) {
             let pa = page_pa(reserved, pi);
@@ -633,6 +634,14 @@ pub fn alloc_page() -> Option<PhysAddr> {
         let fc = free_count(s);
         if fc == 0 { continue; }
         if owner(s) != NO_CPU { continue; } // owned by another CPU
+
+        if !can_reserve {
+            // CPU ID doesn't fit in owner field — alloc without reservation.
+            if let Some(pi) = chunk_alloc_one(ci) {
+                return Some(PhysAddr::new(page_pa(ci, pi)));
+            }
+            continue;
+        }
 
         // Try to claim ownership.
         let new = (s & !OWNER_MASK) | ((cpu as u64) << OWNER_SHIFT);

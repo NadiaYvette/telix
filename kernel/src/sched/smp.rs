@@ -9,7 +9,18 @@
 use super::thread::ThreadId;
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
+/// Maximum CPUs supported (compile-time, selected via cargo feature).
+#[cfg(feature = "max_cpus_4")]
 pub const MAX_CPUS: usize = 4;
+#[cfg(feature = "max_cpus_256")]
+pub const MAX_CPUS: usize = 256;
+#[cfg(feature = "max_cpus_1024")]
+pub const MAX_CPUS: usize = 1024;
+#[cfg(feature = "max_cpus_4096")]
+pub const MAX_CPUS: usize = 4096;
+#[cfg(not(any(feature = "max_cpus_4", feature = "max_cpus_256",
+              feature = "max_cpus_1024", feature = "max_cpus_4096")))]
+pub const MAX_CPUS: usize = 64;
 
 /// Per-hart trap scratch data for RISC-V tp/sscratch swap convention.
 /// Accessed from vectors.S — layout and symbol name must stay in sync.
@@ -131,5 +142,5 @@ pub fn init_ap(cpu: u32, idle_thread: ThreadId) {
 #[allow(dead_code)]
 pub fn online_cpus() -> u32 {
     let mask = super::hotplug::online_mask();
-    mask.count_ones()
+    mask.count()
 }

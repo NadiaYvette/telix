@@ -10,7 +10,8 @@
 //! CPUs, leaving idle CPUs in low-power states.
 
 use super::smp::{self, MAX_CPUS};
-use super::scheduler::{SCHEDULER, set_affinity, get_affinity};
+use super::cpumask::{CpuMask, AtomicCpuMask};
+use super::scheduler::SCHEDULER;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Per-CPU load: number of ticks in the last window where this CPU was
@@ -41,16 +42,16 @@ pub static HOTPLUG_EVENTS: AtomicU64 = AtomicU64::new(0);
 /// Bitmask of CPUs that are currently online for scheduling.
 /// Bit i = CPU i is online. Initialized with all CPUs offline;
 /// set by init_bsp / init_ap via `mark_online`.
-static ONLINE_MASK: AtomicU64 = AtomicU64::new(0);
+static ONLINE_MASK: AtomicCpuMask = AtomicCpuMask::new();
 
 /// Mark a CPU as online (called during boot).
 pub fn mark_online(cpu: u32) {
-    ONLINE_MASK.fetch_or(1u64 << cpu, Ordering::Release);
+    ONLINE_MASK.set_with(cpu, Ordering::Release);
 }
 
 /// Get the current online CPU bitmask.
-pub fn online_mask() -> u64 {
-    ONLINE_MASK.load(Ordering::Acquire)
+pub fn online_mask() -> CpuMask {
+    ONLINE_MASK.load_mask(Ordering::Acquire)
 }
 
 /// Update per-CPU load counter. Called from tick() on each CPU.
@@ -91,22 +92,22 @@ pub fn cpu_offline(cpu: u32) -> u64 {
         return 1;
     }
 
-    let mask = ONLINE_MASK.load(Ordering::Acquire);
-    let cpu_bit = 1u64 << cpu;
+    let mask = ONLINE_MASK.load_mask(Ordering::Acquire);
 
     // Can't offline a CPU that's already offline.
-    if mask & cpu_bit == 0 {
+    if !mask.test(cpu) {
         return 1;
     }
 
     // Must keep at least one CPU online.
-    let remaining = mask & !cpu_bit;
-    if remaining == 0 {
+    let mut remaining = mask;
+    remaining.clear(cpu);
+    if remaining.is_empty() {
         return 1;
     }
 
     // Mark offline in all tracking structures.
-    ONLINE_MASK.fetch_and(!cpu_bit, Ordering::Release);
+    ONLINE_MASK.clear_with(cpu, Ordering::Release);
     smp::get(cpu).online.store(false, Ordering::Release);
     unsafe {
         super::topology::set_online(cpu as usize, false);
@@ -129,16 +130,18 @@ pub fn cpu_offline(cpu: u32) -> u64 {
     }
     for i in 0..count {
         let tid = tids[i];
-        let old_affinity = get_affinity(tid);
-        if old_affinity == 0 {
-            continue;
-        }
-        let new_affinity = old_affinity & !cpu_bit;
-        if new_affinity == 0 {
+        let tptr = super::scheduler::THREAD_TABLE.get(tid) as *const super::thread::Thread;
+        if tptr.is_null() { continue; }
+        let thread = unsafe { &*tptr };
+        let old = thread.affinity_mask.load_mask(Ordering::Relaxed);
+        if old.is_empty() { continue; }
+        let mut new = old;
+        new.clear(cpu);
+        if new.is_empty() {
             // Thread was pinned to only this CPU — expand to all online CPUs.
-            set_affinity(tid, remaining);
-        } else if new_affinity != old_affinity {
-            set_affinity(tid, new_affinity);
+            thread.affinity_mask.store_mask(&remaining, Ordering::Relaxed);
+        } else if new.as_u64() != old.as_u64() || CPUMASK_WORDS > 1 {
+            thread.affinity_mask.store_mask(&new, Ordering::Relaxed);
         }
     }
 
@@ -154,11 +157,10 @@ pub fn cpu_online(cpu: u32) -> u64 {
         return 1;
     }
 
-    let cpu_bit = 1u64 << cpu;
-    let mask = ONLINE_MASK.load(Ordering::Acquire);
+    let mask = ONLINE_MASK.load_mask(Ordering::Acquire);
 
     // Already online.
-    if mask & cpu_bit != 0 {
+    if mask.test(cpu) {
         return 1;
     }
 
@@ -169,7 +171,7 @@ pub fn cpu_online(cpu: u32) -> u64 {
     }
 
     // Mark online.
-    ONLINE_MASK.fetch_or(cpu_bit, Ordering::Release);
+    ONLINE_MASK.set_with(cpu, Ordering::Release);
     smp::get(cpu).online.store(true, Ordering::Release);
     unsafe {
         super::topology::set_online(cpu as usize, true);
@@ -184,33 +186,33 @@ pub fn cpu_online(cpu: u32) -> u64 {
     0
 }
 
+/// Number of CpuMask words (re-exported for conditional compilation).
+use super::cpumask::CPUMASK_WORDS;
+
 /// Energy-aware CPU selection for new thread placement.
 /// Returns the online CPU with the highest current load (bin-packing),
 /// so that idle CPUs can enter low-power states.
 ///
 /// If all CPUs have equal load, returns the CPU with the lowest ID.
 pub fn pick_packed_cpu() -> u32 {
-    let mask = ONLINE_MASK.load(Ordering::Acquire);
+    let mask = ONLINE_MASK.load_mask(Ordering::Acquire);
     let mut best_cpu: u32 = 0;
     let mut best_load: u32 = 0;
     let mut found = false;
 
-    for cpu in 0..MAX_CPUS as u32 {
-        if mask & (1u64 << cpu) == 0 {
-            continue;
-        }
+    mask.for_each(|cpu| {
         let load = CPU_LOAD[cpu as usize].load(Ordering::Relaxed);
         if !found || load > best_load {
             best_cpu = cpu;
             best_load = load;
             found = true;
         }
-    }
+    });
 
     best_cpu
 }
 
 /// Build an affinity mask containing only online CPUs.
-pub fn online_affinity_mask() -> u64 {
-    ONLINE_MASK.load(Ordering::Acquire)
+pub fn online_affinity_mask() -> CpuMask {
+    ONLINE_MASK.load_mask(Ordering::Acquire)
 }

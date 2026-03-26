@@ -2007,7 +2007,7 @@ fn sys_cpu_load(cpu_id: u64) -> u64 {
     let load = crate::sched::hotplug::cpu_load(cpu) as u64;
     let window = crate::sched::hotplug::load_window() as u64;
     let online = crate::sched::hotplug::online_mask();
-    load | (window << 32) | ((online & 0xFFFF) << 48)
+    load | (window << 32) | ((online.as_u64() & 0xFFFF) << 48)
 }
 
 // --- Phase 42: mprotect + mremap ---

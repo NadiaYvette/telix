@@ -18,6 +18,7 @@
 use super::thread::{Thread, ThreadId, ThreadState, BlockReason, EXCEPTION_FRAME_SIZE};
 use super::task::{Task, TaskId, MAX_GROUPS, RLIMIT_COUNT, Rlimit};
 use super::radix::RadixTable;
+use super::cpumask;
 use super::smp;
 use crate::ipc::art::Art;
 use crate::sync::SpinLock;
@@ -133,12 +134,11 @@ impl RunQueue {
     /// Search for and remove a thread belonging to the given coscheduling group
     /// that can run on the given CPU.
     fn find_remove_by_group_for_cpu(&mut self, group: u32, cpu: u32) -> Option<ThreadId> {
-        let cpu_bit = 1u64 << cpu;
         for i in 0..self.len {
             let idx = (self.head + i) % MAX_QUEUE_LEN;
             let tid = self.entries[idx];
             if thread_ref(tid).cosched_group.load(Ordering::Relaxed) == group
-                && thread_ref(tid).affinity_mask.load(Ordering::Relaxed) & cpu_bit != 0
+                && thread_ref(tid).affinity_mask.test(cpu)
             {
                 self.remove_at(i);
                 return Some(tid);
@@ -150,11 +150,10 @@ impl RunQueue {
     /// Search for and remove the first thread whose affinity allows it to run
     /// on the given CPU.
     fn find_remove_for_cpu(&mut self, cpu: u32) -> Option<ThreadId> {
-        let cpu_bit = 1u64 << cpu;
         for i in 0..self.len {
             let idx = (self.head + i) % MAX_QUEUE_LEN;
             let tid = self.entries[idx];
-            if thread_ref(tid).affinity_mask.load(Ordering::Relaxed) & cpu_bit != 0 {
+            if thread_ref(tid).affinity_mask.test(cpu) {
                 self.remove_at(i);
                 return Some(tid);
             }
@@ -495,7 +494,7 @@ impl Scheduler {
         // Clear killed/affinity flags from any previous occupant of this slot.
         let thread = self.thread_mut(id);
         thread.killed.store(false, Ordering::Release);
-        thread.affinity_mask.store(u64::MAX, Ordering::Relaxed);
+        thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
         thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
 
         thread.id = id;
@@ -781,7 +780,7 @@ impl Scheduler {
 
         let thread = self.thread_mut(thread_id);
         thread.killed.store(false, Ordering::Release);
-        thread.affinity_mask.store(u64::MAX, Ordering::Relaxed);
+        thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
         thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
 
         thread.id = thread_id;
@@ -869,7 +868,7 @@ impl Scheduler {
         // Clear killed/affinity flags from any previous occupant of this slot.
         let thread = self.thread_mut(id);
         thread.killed.store(false, Ordering::Release);
-        thread.affinity_mask.store(u64::MAX, Ordering::Relaxed);
+        thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
         thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
 
         thread.id = id;
@@ -2065,7 +2064,7 @@ pub fn fork_current() -> u64 {
     // Clear killed/affinity flags.
     let thread = sched.thread_mut(child_tid);
     thread.killed.store(false, Ordering::Release);
-    thread.affinity_mask.store(u64::MAX, Ordering::Relaxed);
+    thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
 
     thread.id = child_tid;
@@ -2996,18 +2995,20 @@ pub fn cosched_set(group: u32) {
 }
 
 /// Set CPU affinity mask for a thread. Returns true on success.
+/// Takes u64 at the syscall ABI boundary; internally converts to CpuMask.
 pub fn set_affinity(tid: u32, mask: u64) -> bool {
     if (tid as usize) >= RadixTable::capacity() || mask == 0 {
         return false;
     }
-    thread_ref(tid).affinity_mask.store(mask, Ordering::Relaxed);
+    thread_ref(tid).affinity_mask.store_mask(&cpumask::CpuMask::from_u64(mask), Ordering::Relaxed);
     true
 }
 
 /// Get CPU affinity mask for a thread.
+/// Returns u64 (low 64 bits) for syscall ABI compatibility.
 pub fn get_affinity(tid: u32) -> u64 {
     if (tid as usize) >= RadixTable::capacity() {
         return 0;
     }
-    thread_ref(tid).affinity_mask.load(Ordering::Relaxed)
+    thread_ref(tid).affinity_mask.load_mask(Ordering::Relaxed).as_u64()
 }

@@ -93,7 +93,7 @@ pub struct Thread {
     pub thread_task: core::sync::atomic::AtomicU32,
     pub cosched_group: core::sync::atomic::AtomicU32,
     pub last_cpu: core::sync::atomic::AtomicU32,
-    pub affinity_mask: core::sync::atomic::AtomicU64,
+    pub affinity_mask: super::cpumask::AtomicCpuMask,
 }
 
 impl Thread {
@@ -128,7 +128,7 @@ impl Thread {
             thread_task: core::sync::atomic::AtomicU32::new(0),
             cosched_group: core::sync::atomic::AtomicU32::new(0),
             last_cpu: core::sync::atomic::AtomicU32::new(0),
-            affinity_mask: core::sync::atomic::AtomicU64::new(u64::MAX),
+            affinity_mask: super::cpumask::AtomicCpuMask::new_all(),
         }
     }
 }
