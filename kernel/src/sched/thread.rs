@@ -29,9 +29,7 @@ pub enum BlockReason {
     WaitChild,
 }
 
-/// Maximum thread ID slot count for per-thread atomic arrays.
-/// Thread data itself is ART-backed; this bounds the lock-free flat arrays.
-pub const THREAD_SLOTS: usize = 256;
+// Thread ID capacity is determined by RadixTable::capacity() — no fixed constant needed.
 
 /// Size of the exception frame saved by vectors.S.
 /// AArch64: 288 bytes = 36 x u64 (x0-x30, sp_el0, elr, spsr, esr).
@@ -87,6 +85,15 @@ pub struct Thread {
     pub sig_altstack_base: u64,
     /// Signal alternate stack size in bytes (Phase 99).
     pub sig_altstack_size: u64,
+    // --- Lockless atomics (accessed via THREAD_TABLE radix lookup) ---
+    pub wakeup: core::sync::atomic::AtomicBool,
+    pub prio: core::sync::atomic::AtomicU8,
+    pub yield_asap: core::sync::atomic::AtomicBool,
+    pub killed: core::sync::atomic::AtomicBool,
+    pub thread_task: core::sync::atomic::AtomicU32,
+    pub cosched_group: core::sync::atomic::AtomicU32,
+    pub last_cpu: core::sync::atomic::AtomicU32,
+    pub affinity_mask: core::sync::atomic::AtomicU64,
 }
 
 impl Thread {
@@ -114,6 +121,14 @@ impl Thread {
             timer_next_ns: 0,
             sig_altstack_base: 0,
             sig_altstack_size: 0,
+            wakeup: core::sync::atomic::AtomicBool::new(false),
+            prio: core::sync::atomic::AtomicU8::new(255),
+            yield_asap: core::sync::atomic::AtomicBool::new(false),
+            killed: core::sync::atomic::AtomicBool::new(false),
+            thread_task: core::sync::atomic::AtomicU32::new(0),
+            cosched_group: core::sync::atomic::AtomicU32::new(0),
+            last_cpu: core::sync::atomic::AtomicU32::new(0),
+            affinity_mask: core::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 }

@@ -11,17 +11,34 @@
 //!
 //! Thread and Task data is stored in ART (Adaptive Radix Tree) keyed by ID,
 //! with Thread entries slab-allocated (256 bytes) and Task entries page-
-//! allocated (~1400 bytes). Per-thread/task atomic arrays remain flat for
-//! lock-free access, bounded by THREAD_SLOTS/TASK_SLOTS.
+//! allocated (~1400 bytes). Per-thread/task atomics are embedded in the
+//! Thread/Task structs and accessed via TASK_TABLE/THREAD_TABLE radix
+//! page tables for lock-free lookup.
 
-use super::thread::{Thread, ThreadId, ThreadState, BlockReason, THREAD_SLOTS, EXCEPTION_FRAME_SIZE};
-use super::task::{Task, TaskId, TASK_SLOTS, MAX_GROUPS, RLIMIT_COUNT, Rlimit};
+use super::thread::{Thread, ThreadId, ThreadState, BlockReason, EXCEPTION_FRAME_SIZE};
+use super::task::{Task, TaskId, MAX_GROUPS, RLIMIT_COUNT, Rlimit};
+use super::radix::RadixTable;
 use super::smp;
 use crate::ipc::art::Art;
 use crate::sync::SpinLock;
 use crate::mm::page::{PhysAddr, PAGE_SIZE, MMUPAGE_SIZE};
 use crate::mm::{slab, phys};
 use core::sync::atomic::{AtomicUsize, AtomicU32, AtomicU64, Ordering};
+
+/// Two-level radix table for lockless task pointer lookup.
+/// Used by has_port_cap_fast() and SA atomics on the hot path.
+pub static TASK_TABLE: RadixTable = RadixTable::new();
+
+/// Two-level radix table for lockless thread pointer lookup.
+/// Used by wake_thread(), is_killed(), current_task_id(), etc.
+pub static THREAD_TABLE: RadixTable = RadixTable::new();
+
+/// Get a thread reference by ID via radix lookup (lockless).
+#[inline]
+fn thread_ref(tid: u32) -> &'static Thread {
+    let p = THREAD_TABLE.get(tid) as *const Thread;
+    unsafe { &*p }
+}
 
 /// Per-CPU saved frame SP. The exception handler stores the current frame_sp
 /// here before calling syscall dispatch, so that park_current_for_ipc() can
@@ -120,8 +137,8 @@ impl RunQueue {
         for i in 0..self.len {
             let idx = (self.head + i) % MAX_QUEUE_LEN;
             let tid = self.entries[idx];
-            if COSCHED_GROUP[tid as usize].load(Ordering::Relaxed) == group
-                && AFFINITY_MASK[tid as usize].load(Ordering::Relaxed) & cpu_bit != 0
+            if thread_ref(tid).cosched_group.load(Ordering::Relaxed) == group
+                && thread_ref(tid).affinity_mask.load(Ordering::Relaxed) & cpu_bit != 0
             {
                 self.remove_at(i);
                 return Some(tid);
@@ -137,7 +154,7 @@ impl RunQueue {
         for i in 0..self.len {
             let idx = (self.head + i) % MAX_QUEUE_LEN;
             let tid = self.entries[idx];
-            if AFFINITY_MASK[tid as usize].load(Ordering::Relaxed) & cpu_bit != 0 {
+            if thread_ref(tid).affinity_mask.load(Ordering::Relaxed) & cpu_bit != 0 {
                 self.remove_at(i);
                 return Some(tid);
             }
@@ -285,6 +302,10 @@ impl Scheduler {
 
     /// Initialize task 0 and the BSP's idle thread (thread 0).
     fn init(&mut self) {
+        // Initialize radix page tables for lockless entity lookup.
+        TASK_TABLE.init();
+        THREAD_TABLE.init();
+
         // Allocate and insert task 0 (kernel task).
         let task_ptr = alloc_task_entry().expect("task 0 alloc");
         let task0_port = crate::ipc::port::create_kernel_port(task_port_handler, 0)
@@ -295,6 +316,8 @@ impl Scheduler {
             (*task_ptr).port_id = task0_port;
         }
         self.task_art.insert(0, task_ptr as usize);
+        TASK_TABLE.ensure_l1(0);
+        TASK_TABLE.set(0, task_ptr as *mut u8);
         self.next_task_id = 1;
 
         // Thread 0 = BSP idle thread. Its saved_sp will be set on first preemption.
@@ -311,15 +334,17 @@ impl Scheduler {
             (*thread_ptr).quantum = u32::MAX;
             (*thread_ptr).default_quantum = u32::MAX;
         }
-        THREAD_PRIO[0].store(255, Ordering::Relaxed);
+        unsafe { &*thread_ptr }.prio.store(255, Ordering::Relaxed);
         self.thread_art.insert(0, thread_ptr as usize);
+        THREAD_TABLE.ensure_l1(0);
+        THREAD_TABLE.set(0, thread_ptr as *mut u8);
         self.next_thread_id = 1;
     }
 
     /// Create an idle thread for a secondary CPU. Returns its ThreadId.
     fn create_idle_thread(&mut self) -> Option<ThreadId> {
         let id = self.next_thread_id;
-        if id as usize >= THREAD_SLOTS {
+        if id as usize >= RadixTable::capacity() {
             return None;
         }
         self.next_thread_id += 1;
@@ -336,10 +361,13 @@ impl Scheduler {
             (*ptr).quantum = u32::MAX;
             (*ptr).default_quantum = u32::MAX;
         }
-        THREAD_PRIO[id as usize].store(255, Ordering::Relaxed);
-        THREAD_TASK[id as usize].store(0, Ordering::Relaxed);
+        let t = unsafe { &*ptr };
+        t.prio.store(255, Ordering::Relaxed);
+        t.thread_task.store(0, Ordering::Relaxed);
 
         self.thread_art.insert(id as u64, ptr as usize);
+        if !THREAD_TABLE.ensure_l1(id) { return None; }
+        THREAD_TABLE.set(id, ptr as *mut u8);
         // saved_sp will be set on first preemption
         Some(id)
     }
@@ -361,12 +389,14 @@ impl Scheduler {
         }
         // Otherwise, allocate a new slot.
         let id = self.next_thread_id;
-        if id as usize >= THREAD_SLOTS {
+        if id as usize >= RadixTable::capacity() {
             return None;
         }
         // Allocate entry and insert into ART.
         let ptr = alloc_thread_entry()?;
         self.thread_art.insert(id as u64, ptr as usize);
+        if !THREAD_TABLE.ensure_l1(id) { return None; }
+        THREAD_TABLE.set(id, ptr as *mut u8);
         self.next_thread_id += 1;
         Some(id)
     }
@@ -387,11 +417,13 @@ impl Scheduler {
             return Some(id);
         }
         let id = self.next_task_id;
-        if id as usize >= TASK_SLOTS {
+        if id as usize >= RadixTable::capacity() {
             return None;
         }
         let ptr = alloc_task_entry()?;
         self.task_art.insert(id as u64, ptr as usize);
+        if !TASK_TABLE.ensure_l1(id) { return None; }
+        TASK_TABLE.set(id, ptr as *mut u8);
         self.next_task_id += 1;
         Some(id)
     }
@@ -461,17 +493,17 @@ impl Scheduler {
         }
 
         // Clear killed/affinity flags from any previous occupant of this slot.
-        KILLED[id as usize].store(false, Ordering::Release);
-        AFFINITY_MASK[id as usize].store(u64::MAX, Ordering::Relaxed);
-        LAST_CPU[id as usize].store(smp::cpu_id(), Ordering::Relaxed);
-
         let thread = self.thread_mut(id);
+        thread.killed.store(false, Ordering::Release);
+        thread.affinity_mask.store(u64::MAX, Ordering::Relaxed);
+        thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+
         thread.id = id;
         thread.state = ThreadState::Ready;
         thread.task_id = 0;
         thread.base_priority = priority;
         thread.effective_priority = priority;
-        THREAD_PRIO[id as usize].store(priority, Ordering::Relaxed);
+        thread.prio.store(priority, Ordering::Relaxed);
         thread.quantum = quantum;
         thread.default_quantum = quantum;
         thread.saved_sp = frame_sp as u64;
@@ -530,8 +562,12 @@ fn do_spawn_heavy_work(
     // Bootstrap capabilities: grant SEND caps for well-known kernel ports,
     // and full cap for arg0 if it's a valid active port (port passing on spawn).
     {
+        // Initialize this task's embedded capspace.
+        {
+            let tptr = TASK_TABLE.get(task_id) as *mut Task;
+            unsafe { (*tptr).capspace = crate::cap::CapSpace::new(task_id); }
+        }
         let mut caps = crate::cap::CAP_SYSTEM.lock();
-        caps.spaces[task_id as usize] = crate::cap::CapSpace::new(task_id);
 
         let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
         if nsrv != u64::MAX {
@@ -743,19 +779,19 @@ impl Scheduler {
         task.ngroups = parent.ngroups;
         task.rlimits = parent.rlimits;
 
-        KILLED[thread_id as usize].store(false, Ordering::Release);
-        AFFINITY_MASK[thread_id as usize].store(u64::MAX, Ordering::Relaxed);
-        LAST_CPU[thread_id as usize].store(smp::cpu_id(), Ordering::Relaxed);
-
         let thread = self.thread_mut(thread_id);
+        thread.killed.store(false, Ordering::Release);
+        thread.affinity_mask.store(u64::MAX, Ordering::Relaxed);
+        thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+
         thread.id = thread_id;
         thread.state = ThreadState::Ready;
         thread.task_id = task_id;
         thread.port_id = thread_port;
         thread.base_priority = priority;
         thread.effective_priority = priority;
-        THREAD_PRIO[thread_id as usize].store(priority, Ordering::Relaxed);
-        THREAD_TASK[thread_id as usize].store(task_id, Ordering::Relaxed);
+        thread.prio.store(priority, Ordering::Relaxed);
+        thread.thread_task.store(task_id, Ordering::Relaxed);
         thread.quantum = quantum;
         thread.default_quantum = quantum;
         thread.saved_sp = frame_sp;
@@ -831,19 +867,19 @@ impl Scheduler {
         }
 
         // Clear killed/affinity flags from any previous occupant of this slot.
-        KILLED[id as usize].store(false, Ordering::Release);
-        AFFINITY_MASK[id as usize].store(u64::MAX, Ordering::Relaxed);
-        LAST_CPU[id as usize].store(smp::cpu_id(), Ordering::Relaxed);
-
         let thread = self.thread_mut(id);
+        thread.killed.store(false, Ordering::Release);
+        thread.affinity_mask.store(u64::MAX, Ordering::Relaxed);
+        thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+
         thread.id = id;
         thread.state = ThreadState::Ready;
         thread.task_id = task_id;
         thread.port_id = thread_port;
         thread.base_priority = priority;
         thread.effective_priority = priority;
-        THREAD_PRIO[id as usize].store(priority, Ordering::Relaxed);
-        THREAD_TASK[id as usize].store(task_id, Ordering::Relaxed);
+        thread.prio.store(priority, Ordering::Relaxed);
+        thread.thread_task.store(task_id, Ordering::Relaxed);
         thread.quantum = quantum;
         thread.default_quantum = quantum;
         thread.saved_sp = frame_sp as u64;
@@ -875,7 +911,7 @@ impl Scheduler {
         // If the thread is spinning in block_current, preempt immediately
         // so other threads can run. Don't consume quantum — the thread
         // will need it when it actually gets woken up.
-        if YIELD_ASAP[current as usize].load(Ordering::Acquire) {
+        if thread_ref(current).yield_asap.load(Ordering::Acquire) {
             return true;
         }
         let thread = self.thread_mut(current);
@@ -924,7 +960,7 @@ impl Scheduler {
                 DEFERRED_KSTACK[cpu as usize].store(0, Ordering::Release);
                 crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(deferred));
                 let dead_tid = DEFERRED_THREAD[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
-                if dead_tid < THREAD_SLOTS {
+                if dead_tid < RadixTable::capacity() {
                     if let Some(t) = self.thread_get_mut(dead_tid as ThreadId) {
                         t.stack_base = 0;
                     }
@@ -946,12 +982,12 @@ impl Scheduler {
         // causing the thread to be preempted on every single tick.  On
         // QEMU TCG that maximises lock-holder preemption on userspace
         // spinlocks and leads to intermittent hangs (Phase 30/31).
-        YIELD_ASAP[prev_id as usize].store(false, Ordering::Release);
+        thread_ref(prev_id).yield_asap.store(false, Ordering::Release);
 
         // Cosched-aware pick: if prev has a group, try to find a group mate
         // that can also run on this CPU.
         let cpu = smp::cpu_id();
-        let prev_group = COSCHED_GROUP[prev_id as usize].load(Ordering::Relaxed);
+        let prev_group = thread_ref(prev_id).cosched_group.load(Ordering::Relaxed);
         let next_id = if prev_group != 0 && self.cosched_burst < MAX_COSCHED_BURST {
             // Search all priority levels for a group mate eligible for this CPU.
             let mut mate = None;
@@ -1024,7 +1060,7 @@ impl Scheduler {
         // Load next thread's SP.
         self.thread_mut(next_id).state = ThreadState::Running;
         pcpu.current_thread.store(next_id, Ordering::Relaxed);
-        LAST_CPU[next_id as usize].store(cpu, Ordering::Relaxed);
+        thread_ref(next_id).last_cpu.store(cpu, Ordering::Relaxed);
         self.thread(next_id).saved_sp
     }
 }
@@ -1261,7 +1297,7 @@ pub fn thread_join_block(tid: ThreadId, caller_task: u32) -> u64 {
         let caller_tid = current_thread_id();
         sched.thread_mut(tid).join_waiter = caller_tid;
         // Clear wakeup flag before blocking.
-        WAKEUP_FLAGS[caller_tid as usize].store(false, Ordering::Release);
+        thread_ref(caller_tid).wakeup.store(false, Ordering::Release);
     }
     // Block until the target thread wakes us via exit_current_thread.
     block_current(BlockReason::FutexWait);
@@ -1274,7 +1310,7 @@ pub fn thread_join_block(tid: ThreadId, caller_task: u32) -> u64 {
 #[allow(dead_code)]
 pub fn current_task_id() -> TaskId {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    THREAD_TASK[tid as usize].load(core::sync::atomic::Ordering::Relaxed)
+    thread_ref(tid).thread_task.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Get the page table root of the current thread's task.
@@ -1304,50 +1340,7 @@ pub fn schedule() {
     // This is more complex and will be implemented later.
 }
 
-/// Per-thread wakeup flags. Set by wake_thread(), checked by block_current().
-/// Using atomics avoids needing the scheduler lock in the spin loop.
-static WAKEUP_FLAGS: [core::sync::atomic::AtomicBool; THREAD_SLOTS] = {
-    const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    [INIT; THREAD_SLOTS]
-};
-
-/// Per-thread effective priority, readable without the scheduler lock.
-/// Updated by boost_priority/reset_priority and thread creation.
-static THREAD_PRIO: [core::sync::atomic::AtomicU8; THREAD_SLOTS] = {
-    const INIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(255);
-    [INIT; THREAD_SLOTS]
-};
-
-/// Per-thread task_id, readable without the scheduler lock.
-/// Updated on thread creation.
-static THREAD_TASK: [core::sync::atomic::AtomicU32; THREAD_SLOTS] = {
-    const INIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    [INIT; THREAD_SLOTS]
-};
-
-/// Per-thread yield-ASAP flag. When set, `timer_tick_for` will force
-/// preemption on the very next timer tick instead of waiting for the
-/// full quantum to expire. This prevents spinning threads in
-/// `block_current` from starving real work on SMP.
-static YIELD_ASAP: [core::sync::atomic::AtomicBool; THREAD_SLOTS] = {
-    const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    [INIT; THREAD_SLOTS]
-};
-
-/// Per-thread killed flag. When set, block_current() exits early and the
-/// syscall return path calls exit_current_thread(-9).
-static KILLED: [core::sync::atomic::AtomicBool; THREAD_SLOTS] = {
-    const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    [INIT; THREAD_SLOTS]
-};
-
 // --- Coscheduling ---
-
-/// Per-thread coscheduling group ID (0 = no group).
-static COSCHED_GROUP: [AtomicU32; THREAD_SLOTS] = {
-    const INIT: AtomicU32 = AtomicU32::new(0);
-    [INIT; THREAD_SLOTS]
-};
 
 /// Maximum consecutive cosched picks before yielding to other threads.
 const MAX_COSCHED_BURST: u32 = 4;
@@ -1355,41 +1348,13 @@ const MAX_COSCHED_BURST: u32 = 4;
 /// Count of coscheduling hits (for testing/diagnostics).
 pub static COSCHED_HITS: AtomicU64 = AtomicU64::new(0);
 
-/// Per-thread CPU affinity bitmask. Default u64::MAX = all CPUs allowed.
-static AFFINITY_MASK: [AtomicU64; THREAD_SLOTS] = {
-    const INIT: AtomicU64 = AtomicU64::new(u64::MAX);
-    [INIT; THREAD_SLOTS]
-};
-
-/// Per-thread last CPU the thread ran on.
-static LAST_CPU: [AtomicU32; THREAD_SLOTS] = {
-    const INIT: AtomicU32 = AtomicU32::new(0);
-    [INIT; THREAD_SLOTS]
-};
-
 // --- Scheduler Activations ---
-
-/// Per-task SA pending flag: true when an activation event is ready.
-static SA_PENDING: [core::sync::atomic::AtomicBool; TASK_SLOTS] = {
-    const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    [INIT; TASK_SLOTS]
-};
-
-/// Per-task SA event data: packed (blocked_tid as u64).
-static SA_EVENT: [AtomicU64; TASK_SLOTS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; TASK_SLOTS]
-};
-
-/// Per-task SA waiter thread ID (u32::MAX = no waiter).
-static SA_WAITER: [core::sync::atomic::AtomicU32; TASK_SLOTS] = {
-    const INIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
-    [INIT; TASK_SLOTS]
-};
+// SA_PENDING, SA_EVENT, SA_WAITER are now embedded in Task struct,
+// accessed via TASK_TABLE radix lookup for lockless access.
 
 /// Set YIELD_ASAP for a thread, causing it to be preempted on the next timer tick.
 pub fn set_yield_asap(tid: ThreadId) {
-    YIELD_ASAP[tid as usize].store(true, Ordering::Release);
+    thread_ref(tid).yield_asap.store(true, Ordering::Release);
 }
 
 /// Clear the wakeup flag for a thread. Must be called while holding the
@@ -1397,7 +1362,7 @@ pub fn set_yield_asap(tid: ThreadId) {
 /// to prevent a lost-wakeup race where wake_thread() sets the flag between
 /// the lock drop and block_current's flag clear.
 pub fn clear_wakeup_flag(tid: ThreadId) {
-    WAKEUP_FLAGS[tid as usize].store(false, Ordering::Release);
+    thread_ref(tid).wakeup.store(false, Ordering::Release);
 }
 
 /// Block the current thread with the given reason.
@@ -1417,11 +1382,12 @@ pub fn block_current(_reason: BlockReason) {
         sched.thread_mut(tid).effective_priority = 254;
         orig
     };
-    THREAD_PRIO[tid as usize].store(254, Ordering::Release);
+    let tref = thread_ref(tid);
+    tref.prio.store(254, Ordering::Release);
     // Signal the scheduler to preempt us on the next timer tick instead of
     // waiting for the full quantum. This prevents spinning threads from
     // starving real work on SMP systems.
-    YIELD_ASAP[tid as usize].store(true, Ordering::Release);
+    tref.yield_asap.store(true, Ordering::Release);
     // Enable interrupts so the timer can preempt us while we spin.
     // This is critical when called from a syscall handler (SVC/ecall/int),
     // because hardware masks IRQs on exception entry.
@@ -1430,9 +1396,9 @@ pub fn block_current(_reason: BlockReason) {
     // gets preempted normally by timer ticks (quantum-based). This avoids
     // a race where wake_thread() re-enqueues a Blocked thread that's still
     // executing on its CPU, causing double-scheduling on SMP.
-    while !WAKEUP_FLAGS[tid as usize].load(Ordering::Acquire) {
+    while !tref.wakeup.load(Ordering::Acquire) {
         // Check if this thread was killed — break out immediately.
-        if KILLED[tid as usize].load(Ordering::Acquire) {
+        if tref.killed.load(Ordering::Acquire) {
             break;
         }
         // Use WFI to wait for the next interrupt (timer tick or device IRQ).
@@ -1443,34 +1409,34 @@ pub fn block_current(_reason: BlockReason) {
         // Re-arm: try_switch() clears YIELD_ASAP when it preempts us,
         // but we need it set again so the *next* tick also preempts
         // immediately (we're still blocked, not doing useful work).
-        YIELD_ASAP[tid as usize].store(true, Ordering::Release);
+        tref.yield_asap.store(true, Ordering::Release);
     }
-    YIELD_ASAP[tid as usize].store(false, Ordering::Release);
+    tref.yield_asap.store(false, Ordering::Release);
     // Restore effective priority.
     {
         let mut sched = SCHEDULER.lock();
         sched.thread_mut(tid).effective_priority = saved_prio;
     }
-    THREAD_PRIO[tid as usize].store(saved_prio, Ordering::Release);
+    tref.prio.store(saved_prio, Ordering::Release);
     arch_restore_irqs(saved);
 }
 
 /// Wake a blocked thread, making it runnable.
 pub fn wake_thread(tid: ThreadId) {
-    WAKEUP_FLAGS[tid as usize].store(true, Ordering::Release);
+    thread_ref(tid).wakeup.store(true, Ordering::Release);
     // Signal all CPUs so any core spinning in block_current's WFE wakes immediately.
     arch_send_event();
 }
 
 /// Check if a thread has been marked for kill.
 pub fn is_killed(tid: ThreadId) -> bool {
-    KILLED[tid as usize].load(Ordering::Acquire)
+    thread_ref(tid).killed.load(Ordering::Acquire)
 }
 
 /// Kill all threads in the task that `tid` belongs to.
 /// Returns true if the thread was found and the kill signal was sent.
 pub fn kill_task(tid: ThreadId) -> bool {
-    if tid as usize >= THREAD_SLOTS {
+    if tid as usize >= RadixTable::capacity() {
         return false;
     }
     let sched = SCHEDULER.lock();
@@ -1483,13 +1449,13 @@ pub fn kill_task(tid: ThreadId) -> bool {
     }
     let task_id = target_thread.task_id;
     // Kill all non-dead threads in this task.
-    let mut to_kill = [0u32; THREAD_SLOTS];
+    let mut to_kill = [0u32; RadixTable::capacity()];
     let mut kill_count = 0usize;
     sched.thread_art.for_each(|key, val| {
         let t = unsafe { &*(val as *const Thread) };
         if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
-            KILLED[key as usize].store(true, Ordering::Release);
-            if kill_count < THREAD_SLOTS {
+            t.killed.store(true, Ordering::Release);
+            if kill_count < RadixTable::capacity() {
                 to_kill[kill_count] = key as u32;
                 kill_count += 1;
             }
@@ -1577,7 +1543,7 @@ pub fn send_signal_to_task(task_id: u32, sig: u32) -> bool {
 pub fn send_signal_to_thread(tid: ThreadId, sig: u32) -> bool {
     use super::task::{sig_bit, SIGKILL, MAX_SIGNALS};
     if sig < 1 || sig > MAX_SIGNALS as u32 { return false; }
-    if tid as usize >= THREAD_SLOTS { return false; }
+    if tid as usize >= RadixTable::capacity() { return false; }
     if sig == SIGKILL {
         return kill_task(tid);
     }
@@ -1826,11 +1792,11 @@ pub fn send_signal_to_pgroup(pgid: u32, sig: u32) -> bool {
     if sig < 1 || sig > MAX_SIGNALS as u32 { return false; }
 
     let sched = SCHEDULER.lock();
-    let mut task_ids = [0u32; TASK_SLOTS];
+    let mut task_ids = [0u32; 64];
     let mut count = 0usize;
     sched.task_art.for_each(|_key, val| {
         let t = unsafe { &*(val as *const Task) };
-        if t.active && t.pgid == pgid && count < TASK_SLOTS {
+        if t.active && t.pgid == pgid && count < 64 {
             task_ids[count] = t.id;
             count += 1;
         }
@@ -1896,7 +1862,7 @@ pub fn kill_other_threads_in_task() -> usize {
         if t.task_id == task_id && t.state != ThreadState::Dead {
             t.state = ThreadState::Dead;
             t.exit_code = -9;
-            KILLED[key as usize].store(true, Ordering::Release);
+            t.killed.store(true, Ordering::Release);
             killed += 1;
         }
     });
@@ -2036,8 +2002,12 @@ pub fn fork_current() -> u64 {
         // Copy the fast-path capset so child inherits parent's port access.
         crate::cap::capset_copy(parent_task_id, child_task_id);
 
+        // Initialize child's embedded capspace.
+        {
+            let tptr = TASK_TABLE.get(child_task_id) as *mut Task;
+            unsafe { (*tptr).capspace = crate::cap::CapSpace::new(child_task_id); }
+        }
         let mut caps = crate::cap::CAP_SYSTEM.lock();
-        caps.spaces[child_task_id as usize] = crate::cap::CapSpace::new(child_task_id);
 
         // Grant SEND caps for well-known kernel ports.
         let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
@@ -2093,19 +2063,19 @@ pub fn fork_current() -> u64 {
     let mut sched = SCHEDULER.lock();
 
     // Clear killed/affinity flags.
-    KILLED[child_tid as usize].store(false, Ordering::Release);
-    AFFINITY_MASK[child_tid as usize].store(u64::MAX, Ordering::Relaxed);
-    LAST_CPU[child_tid as usize].store(smp::cpu_id(), Ordering::Relaxed);
-
     let thread = sched.thread_mut(child_tid);
+    thread.killed.store(false, Ordering::Release);
+    thread.affinity_mask.store(u64::MAX, Ordering::Relaxed);
+    thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+
     thread.id = child_tid;
     thread.state = ThreadState::Ready;
     thread.task_id = child_task_id;
     thread.port_id = child_thread_port;
     thread.base_priority = parent_priority;
     thread.effective_priority = parent_priority;
-    THREAD_PRIO[child_tid as usize].store(parent_priority, Ordering::Relaxed);
-    THREAD_TASK[child_tid as usize].store(child_task_id, Ordering::Relaxed);
+    thread.prio.store(parent_priority, Ordering::Relaxed);
+    thread.thread_task.store(child_task_id, Ordering::Relaxed);
     thread.quantum = parent_quantum;
     thread.default_quantum = parent_quantum;
     thread.saved_sp = child_frame_sp as u64;
@@ -2269,7 +2239,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     // tick after that it will free our kstack page.  HLT's resume path
     // needs a valid stack, and spin_loop() is purely in-register.
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    YIELD_ASAP[tid as usize].store(true, Ordering::Release);
+    thread_ref(tid).yield_asap.store(true, Ordering::Release);
     loop { core::hint::spin_loop(); }
 }
 
@@ -2539,7 +2509,7 @@ pub fn boost_priority(tid: ThreadId, to_prio: u8) {
     if let Some(thread) = sched.thread_get_mut(tid) {
         if to_prio < thread.effective_priority {
             thread.effective_priority = to_prio;
-            THREAD_PRIO[tid as usize].store(to_prio, Ordering::Release);
+            thread.prio.store(to_prio, Ordering::Release);
         }
     }
 }
@@ -2549,14 +2519,14 @@ pub fn reset_priority(tid: ThreadId) {
     let mut sched = SCHEDULER.lock();
     if let Some(thread) = sched.thread_get_mut(tid) {
         thread.effective_priority = thread.base_priority;
-        THREAD_PRIO[tid as usize].store(thread.base_priority, Ordering::Release);
+        thread.prio.store(thread.base_priority, Ordering::Release);
     }
 }
 
 /// Get a thread's current effective priority (lock-free).
 pub fn thread_effective_priority(tid: ThreadId) -> u8 {
-    if (tid as usize) < THREAD_SLOTS {
-        THREAD_PRIO[tid as usize].load(Ordering::Acquire)
+    if (tid as usize) < RadixTable::capacity() {
+        thread_ref(tid).prio.load(Ordering::Acquire)
     } else {
         255
     }
@@ -2649,10 +2619,12 @@ pub fn park_current_for_ipc(reason: BlockReason) {
 
     // Scheduler activation: notify userspace that a kthread blocked.
     if sa_enabled {
-        let waiter = SA_WAITER[parked_task_id as usize].load(Ordering::Acquire);
+        let tptr = TASK_TABLE.get(parked_task_id) as *mut Task;
+        let task = unsafe { &*tptr };
+        let waiter = task.sa_waiter.load(Ordering::Acquire);
         if waiter != u32::MAX && waiter as usize != tid {
-            SA_EVENT[parked_task_id as usize].store(tid as u64, Ordering::Release);
-            SA_PENDING[parked_task_id as usize].store(true, Ordering::Release);
+            task.sa_event.store(tid as u64, Ordering::Release);
+            task.sa_pending.store(true, Ordering::Release);
             wake_thread(waiter);
         }
     }
@@ -2728,7 +2700,7 @@ fn check_sleep_timers() {
 /// Called from tick() before try_switch.
 fn check_alarm_timers() {
     let now_ns = get_monotonic_ns();
-    let mut fired = [0u32; TASK_SLOTS];
+    let mut fired = [0u32; 64];
     let mut count = 0usize;
 
     {
@@ -2744,7 +2716,7 @@ fn check_alarm_timers() {
                 } else {
                     task.alarm_deadline_ns = 0;
                 }
-                if count < TASK_SLOTS {
+                if count < 64 {
                     fired[count] = task.id;
                     count += 1;
                 }
@@ -2856,10 +2828,12 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     drop(sched);
 
     if sa_enabled {
-        let waiter = SA_WAITER[parked_task_id as usize].load(Ordering::Acquire);
+        let tptr = TASK_TABLE.get(parked_task_id) as *mut Task;
+        let task = unsafe { &*tptr };
+        let waiter = task.sa_waiter.load(Ordering::Acquire);
         if waiter != u32::MAX && waiter as usize != tid {
-            SA_EVENT[parked_task_id as usize].store(tid as u64, Ordering::Release);
-            SA_PENDING[parked_task_id as usize].store(true, Ordering::Release);
+            task.sa_event.store(tid as u64, Ordering::Release);
+            task.sa_pending.store(true, Ordering::Release);
             wake_thread(waiter);
         }
     }
@@ -2967,28 +2941,32 @@ pub fn sa_wait() -> u64 {
     let task_id = current_task_id();
     if task_id == 0 { return u64::MAX; }
 
+    let tptr = TASK_TABLE.get(task_id) as *mut Task;
+    if tptr.is_null() { return u64::MAX; }
+    let task = unsafe { &*tptr };
+
     // Fast path: event already pending.
-    if SA_PENDING[task_id as usize].swap(false, Ordering::SeqCst) {
-        SA_WAITER[task_id as usize].store(u32::MAX, Ordering::Relaxed);
-        return SA_EVENT[task_id as usize].load(Ordering::Relaxed);
+    if task.sa_pending.swap(false, Ordering::SeqCst) {
+        task.sa_waiter.store(u32::MAX, Ordering::Relaxed);
+        return task.sa_event.load(Ordering::Relaxed);
     }
 
     // Register as waiter.
     let tid = current_thread_id();
     clear_wakeup_flag(tid);
-    SA_WAITER[task_id as usize].store(tid, Ordering::Release);
+    task.sa_waiter.store(tid, Ordering::Release);
 
     // Double-check after registering (prevents lost wakeup).
-    if SA_PENDING[task_id as usize].swap(false, Ordering::SeqCst) {
-        SA_WAITER[task_id as usize].store(u32::MAX, Ordering::Relaxed);
-        return SA_EVENT[task_id as usize].load(Ordering::Relaxed);
+    if task.sa_pending.swap(false, Ordering::SeqCst) {
+        task.sa_waiter.store(u32::MAX, Ordering::Relaxed);
+        return task.sa_event.load(Ordering::Relaxed);
     }
 
     // Block until woken by SA notification.
     block_current(BlockReason::ActivationWait);
-    SA_WAITER[task_id as usize].store(u32::MAX, Ordering::Relaxed);
-    SA_PENDING[task_id as usize].store(false, Ordering::Relaxed);
-    SA_EVENT[task_id as usize].load(Ordering::Relaxed)
+    task.sa_waiter.store(u32::MAX, Ordering::Relaxed);
+    task.sa_pending.store(false, Ordering::Relaxed);
+    task.sa_event.load(Ordering::Relaxed)
 }
 
 /// Get the index (0-based) of the current kthread within its task.
@@ -3014,22 +2992,22 @@ pub fn sa_getid() -> u64 {
 /// Set the coscheduling group for the current thread. group=0 removes from any group.
 pub fn cosched_set(group: u32) {
     let tid = current_thread_id();
-    COSCHED_GROUP[tid as usize].store(group, Ordering::Relaxed);
+    thread_ref(tid).cosched_group.store(group, Ordering::Relaxed);
 }
 
 /// Set CPU affinity mask for a thread. Returns true on success.
 pub fn set_affinity(tid: u32, mask: u64) -> bool {
-    if (tid as usize) >= THREAD_SLOTS || mask == 0 {
+    if (tid as usize) >= RadixTable::capacity() || mask == 0 {
         return false;
     }
-    AFFINITY_MASK[tid as usize].store(mask, Ordering::Relaxed);
+    thread_ref(tid).affinity_mask.store(mask, Ordering::Relaxed);
     true
 }
 
 /// Get CPU affinity mask for a thread.
 pub fn get_affinity(tid: u32) -> u64 {
-    if (tid as usize) >= THREAD_SLOTS {
+    if (tid as usize) >= RadixTable::capacity() {
         return 0;
     }
-    AFFINITY_MASK[tid as usize].load(Ordering::Relaxed)
+    thread_ref(tid).affinity_mask.load(Ordering::Relaxed)
 }

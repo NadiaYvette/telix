@@ -419,8 +419,9 @@ fn check_port_cap(port_id: u64, needed: crate::cap::Rights) -> bool {
     }
     // MANAGE requires the slow path (rare — only port_destroy).
     if needed.contains(crate::cap::Rights::MANAGE) {
-        let caps = crate::cap::CAP_SYSTEM.lock();
-        return caps.spaces[task_id as usize].find_port_cap(port_id as usize, needed).is_some();
+        let ptr = crate::sched::scheduler::TASK_TABLE.get(task_id) as *mut crate::sched::task::Task;
+        if ptr.is_null() { return false; }
+        return unsafe { &*ptr }.capspace.find_port_cap(port_id as usize, needed).is_some();
     }
     true
 }
@@ -1778,18 +1779,20 @@ fn sys_cap_revoke(port_id: u64) -> u64 {
     let task_id = crate::sched::current_task_id();
     if task_id == 0 { return u64::MAX; }
 
-    let mut caps = crate::cap::CAP_SYSTEM.lock();
+    let ptr = crate::sched::scheduler::TASK_TABLE.get(task_id)
+        as *mut crate::sched::task::Task;
+    if ptr.is_null() { return u64::MAX; }
+    let space = unsafe { &mut (*ptr).capspace };
     // Find the slot containing a cap for this port.
-    let slot = match caps.spaces[task_id as usize].find_port_cap(
+    let slot = match space.find_port_cap(
         port_id as usize,
         crate::cap::Rights::MANAGE,
     ) {
         Some(s) => s,
         None => return u64::MAX,
     };
-    // Need to split the borrow: get cdt pointer first.
-    let cdt = &mut caps.cdt as *mut crate::cap::Cdt;
-    let count = caps.spaces[task_id as usize].revoke(slot, unsafe { &mut *cdt });
+    let mut caps = crate::cap::CAP_SYSTEM.lock();
+    let count = space.revoke(slot, &mut caps.cdt);
     count as u64
 }
 

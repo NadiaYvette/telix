@@ -6,9 +6,7 @@
 /// Task ID.
 pub type TaskId = u32;
 
-/// Maximum task ID slot count for per-task atomic arrays.
-/// Task data itself is ART-backed; this bounds the lock-free flat arrays.
-pub const TASK_SLOTS: usize = 128;
+// Task ID capacity is determined by RadixTable::capacity() — no fixed constant needed.
 
 /// Maximum number of signals (1..=MAX_SIGNALS). Bit N in masks = signal N+1.
 pub const MAX_SIGNALS: usize = 32;
@@ -142,6 +140,15 @@ pub struct Task {
     pub ngroups: u32,
     // --- Resource limits (Phase 50) ---
     pub rlimits: [Rlimit; RLIMIT_COUNT],
+    // --- Embedded capability data (lockless access via TASK_TABLE) ---
+    /// Per-task sparse capability set for lockless cap checks.
+    pub capset: crate::cap::capset::CapSet,
+    /// Per-task capability space (CNode + CDT tracking).
+    pub capspace: crate::cap::space::CapSpace,
+    // --- Scheduler activation atomics ---
+    pub sa_pending: core::sync::atomic::AtomicBool,
+    pub sa_event: core::sync::atomic::AtomicU64,
+    pub sa_waiter: core::sync::atomic::AtomicU32,
 }
 
 /// Maximum supplementary groups per task.
@@ -216,6 +223,11 @@ impl Task {
             groups: [0; MAX_GROUPS],
             ngroups: 0,
             rlimits: DEFAULT_RLIMITS,
+            capset: crate::cap::capset::CapSet::new(),
+            capspace: crate::cap::space::CapSpace::new(0),
+            sa_pending: core::sync::atomic::AtomicBool::new(false),
+            sa_event: core::sync::atomic::AtomicU64::new(0),
+            sa_waiter: core::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 }

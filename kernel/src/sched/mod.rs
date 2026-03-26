@@ -1,6 +1,7 @@
 pub mod thread;
 pub mod task;
 pub mod scheduler;
+pub mod radix;
 pub mod smp;
 pub mod stats;
 pub mod topology;
@@ -18,7 +19,9 @@ pub fn task_id_from_port(port_id: u64) -> Option<task::TaskId> {
 
 /// Get a task's kernel-held port ID from its internal task_id.
 pub fn task_port_id(task_id: task::TaskId) -> u64 {
-    scheduler::SCHEDULER.lock().task(task_id).port_id
+    let p = scheduler::TASK_TABLE.get(task_id) as *const task::Task;
+    if p.is_null() { return 0; }
+    unsafe { &*p }.port_id
 }
 
 /// Resolve a thread's kernel-held port ID to its internal thread_id.
@@ -28,5 +31,7 @@ pub fn thread_id_from_port(port_id: u64) -> Option<thread::ThreadId> {
 
 /// Get a thread's kernel-held port ID from its internal thread_id.
 pub fn thread_port_id(tid: thread::ThreadId) -> u64 {
-    scheduler::SCHEDULER.lock().thread(tid).port_id
+    let p = scheduler::THREAD_TABLE.get(tid) as *const thread::Thread;
+    if p.is_null() { return 0; }
+    unsafe { &*p }.port_id
 }
