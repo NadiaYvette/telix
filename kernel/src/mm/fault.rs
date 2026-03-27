@@ -356,27 +356,37 @@ fn try_superpage_promotion(
 
     // Check: all allocation pages must be allocated and not COW-shared.
     let obj_page_base = vma.obj_page_index(group_mmu_start);
-    let can_promote = object::with_object(obj_id, |obj| {
+    let (can_promote, cow_group_port) = object::with_object(obj_id, |obj| {
         for p in 0..SUPERPAGE_ALLOC_PAGES {
             let idx = obj_page_base + p;
             if idx >= obj.page_count as usize {
-                return false;
+                return (false, 0);
             }
             if obj.pages.get(idx) == 0 {
-                return false;
+                return (false, 0);
             }
         }
-        true
+        (true, obj.cow_group_port)
     });
-    if can_promote {
+    if !can_promote {
+        return;
+    }
+    // Check no page in the range is COW-shared.
+    if cow_group_port != 0 {
+        let super_base = obj_page_base as u32;
+        for p in 0..SUPERPAGE_ALLOC_PAGES {
+            if super::cowgroup::is_page_shared_in_group(
+                cow_group_port, obj_id, super_base, p,
+            ) {
+                return;
+            }
+        }
+    } else {
         for p in 0..SUPERPAGE_ALLOC_PAGES {
             if object::is_page_shared(obj_id, obj_page_base + p) {
                 return;
             }
         }
-    }
-    if !can_promote {
-        return;
     }
 
     let already_contiguous = object::with_object(obj_id, |obj| {
@@ -591,7 +601,13 @@ fn handle_cow_fault(
         None => return FaultResult::Failed,
     };
 
-    let shared = object::is_page_shared(obj_id, obj_page_idx);
+    let shared = if cow_group_port != 0 {
+        let super_base = (obj_page_idx & !(SUPERPAGE_ALLOC_PAGES - 1)) as u32;
+        let slot = obj_page_idx - super_base as usize;
+        super::cowgroup::is_page_shared_in_group(cow_group_port, obj_id, super_base, slot)
+    } else {
+        object::is_page_shared(obj_id, obj_page_idx)
+    };
 
     if !shared {
         // Exclusively owned — just upgrade PTE to writable.
