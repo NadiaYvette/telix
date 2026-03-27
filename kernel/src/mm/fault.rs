@@ -402,7 +402,7 @@ fn try_superpage_promotion(
         return;
     }
 
-    let new_block = match alloc_2m_aligned() {
+    let new_block = match alloc_superpage_aligned() {
         Some(pa) => pa,
         None => return,
     };
@@ -474,7 +474,10 @@ fn super_alloc_order() -> usize {
     order
 }
 
-fn alloc_2m_aligned() -> Option<super::page::PhysAddr> {
+/// Allocate a superpage-aligned contiguous physical region.
+/// Returns the base PhysAddr of SUPERPAGE_ALLOC_PAGES contiguous pages,
+/// aligned to SUPERPAGE_SIZE. Returns None on failure.
+pub fn alloc_superpage_aligned() -> Option<super::page::PhysAddr> {
     use super::page::PhysAddr;
 
     let order5 = super_alloc_order();
@@ -527,7 +530,8 @@ fn alloc_2m_aligned() -> Option<super::page::PhysAddr> {
     None
 }
 
-fn free_pages_range(pa: super::page::PhysAddr, count: usize) {
+/// Free `count` contiguous allocation pages starting at `pa`.
+pub fn free_pages_range(pa: super::page::PhysAddr, count: usize) {
     for i in 0..count {
         super::phys::free_page(super::page::PhysAddr::new(pa.as_usize() + i * PAGE_SIZE));
     }
