@@ -1746,18 +1746,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing coscheduling...\n");
     {
         // Need more threads than CPUs (4) to force run-queue contention.
-        // 6 threads (3 grouped + 3 ungrouped), 8 KiB stacks.
-        let stacks = syscall::mmap_anon(0, 1, 1);
+        // 12 threads (8 grouped + 4 ungrouped), 8 KiB stacks.
+        // With 12 threads on 4 CPUs, at least 8 threads are in run queues
+        // at any given time, maximizing coscheduling opportunities.
+        let stacks = syscall::mmap_anon(0, 2, 1);
 
         if let Some(sk) = stacks {
             let hits_before = syscall::vm_stats(4);
 
             let stack_size: usize = 0x2000; // 8 KiB per stack
-            let mut tids = [u64::MAX; 6];
+            let mut tids = [u64::MAX; 12];
             let mut ok = true;
-            // 3 threads in group 1, 3 threads ungrouped.
-            for i in 0..6u64 {
-                let group = if i < 3 { 1u64 } else { 0u64 };
+            // 8 threads in group 1, 4 threads ungrouped.
+            for i in 0..12u64 {
+                let group = if i < 8 { 1u64 } else { 0u64 };
                 let tid = syscall::thread_create(
                     cosched_worker as u64,
                     (sk + (i as usize + 1) * stack_size) as u64,
@@ -1768,7 +1770,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             if ok {
-                for i in 0..6 {
+                for i in 0..12 {
                     syscall::thread_join(tids[i]);
                 }
 
