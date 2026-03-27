@@ -665,3 +665,39 @@ pub fn is_reservation_complete(
 
     true
 }
+
+/// Reservation info returned by `get_reservation_info`.
+pub struct ReservationInfo {
+    /// Physical base of the reserved destination (superpage-aligned).
+    pub dest_pa: usize,
+    /// Bitmask of which slots have been COW-copied.
+    pub copied: u64,
+    /// Number of allocation pages in this extent.
+    pub page_count: u8,
+}
+
+/// Get the reservation info for a completed reservation. Returns the
+/// destination PA, copied bitmap, and page count. This is used by the
+/// consolidation path to relocate non-COW pages into the reservation
+/// destination for superpage promotion.
+///
+/// Returns None if the reservation doesn't exist or isn't complete.
+pub fn get_reservation_info(
+    group_id: CowGroupId,
+    obj_id: u64,
+    obj_page_base: u32,
+) -> Option<ReservationInfo> {
+    let entry_ptr = resolve_entry(group_id)?;
+    let guard = unsafe { (*entry_ptr).inner.lock() };
+
+    let ei = guard.find_extent(obj_page_base)?;
+    let ext = guard.extent(ei);
+    let ri = ext.find_reservation(obj_id)?;
+    let r = &ext.reservations[ri];
+
+    Some(ReservationInfo {
+        dest_pa: r.dest_pa,
+        copied: r.copied,
+        page_count: ext.page_count,
+    })
+}

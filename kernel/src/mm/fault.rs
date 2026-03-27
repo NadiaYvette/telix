@@ -706,7 +706,141 @@ fn handle_cow_fault(
 
     stats::COW_FAULTS.fetch_add(1, Ordering::Relaxed);
     stats::COW_PAGES_COPIED.fetch_add(1, Ordering::Relaxed);
+
+    // After a reservation-path COW break, check if the reservation is now
+    // complete (all shared pages in this superpage range are COW-broken).
+    // If so, consolidate non-reservation pages and attempt superpage promotion.
+    if cow_group_port != 0 {
+        let super_base = (obj_page_idx & !(SUPERPAGE_ALLOC_PAGES - 1)) as u32;
+        if cowgroup::is_reservation_complete(cow_group_port, obj_id, super_base) {
+            try_consolidate_reservation(pt_root, vma, obj_id, cow_group_port, super_base);
+        }
+    }
+
     FaultResult::HandledCOW
+}
+
+/// Consolidate a completed reservation: move non-reservation pages into
+/// the contiguous reservation destination, then attempt superpage promotion.
+///
+/// After all shared pages in a superpage-aligned range have been COW-broken
+/// into the reservation destination, there may still be pages in the object
+/// that are at scattered PAs — pages allocated after the fork (demand-zero)
+/// or pages that were private before the fork. This function relocates them
+/// into the reservation destination's empty slots so the entire range becomes
+/// physically contiguous, enabling superpage promotion.
+fn try_consolidate_reservation(
+    pt_root: usize,
+    vma: &mut super::vma::Vma,
+    obj_id: u64,
+    cow_group_port: u64,
+    obj_page_base: u32,
+) {
+    use super::cowgroup;
+    use super::page::PhysAddr;
+
+    let info = match cowgroup::get_reservation_info(cow_group_port, obj_id, obj_page_base) {
+        Some(i) => i,
+        None => return,
+    };
+
+    let page_count = info.page_count as usize;
+    if page_count < SUPERPAGE_ALLOC_PAGES {
+        // Partial extent at object tail — can't form a superpage.
+        return;
+    }
+
+    let base_idx = obj_page_base as usize;
+
+    // Check that the reservation destination is superpage-aligned.
+    if info.dest_pa & SUPERPAGE_ALIGN_MASK != 0 {
+        return;
+    }
+
+    // Relocate non-reservation pages into the destination's empty slots.
+    // Two-pass: first verify all pages are allocated, then relocate.
+    let can_consolidate = object::with_object(obj_id, |obj| -> bool {
+        for slot in 0..page_count {
+            let obj_idx = base_idx + slot;
+            if obj.pages.get(obj_idx) == 0 {
+                return false; // Unallocated page — can't form superpage yet.
+            }
+        }
+        true
+    });
+
+    if !can_consolidate {
+        return;
+    }
+
+    let relocated = object::with_object(obj_id, |obj| -> usize {
+        let mut count = 0;
+        for slot in 0..page_count {
+            let obj_idx = base_idx + slot;
+            let current_pa = obj.pages.get(obj_idx);
+            let dest_slot_pa = info.dest_pa + slot * PAGE_SIZE;
+
+            if current_pa == dest_slot_pa {
+                continue; // Already in place (COW-copied page).
+            }
+
+            // Copy scattered page into the reservation slot.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    current_pa as *const u8,
+                    dest_slot_pa as *mut u8,
+                    PAGE_SIZE,
+                );
+            }
+
+            // Free the old page.
+            let old_refcount = super::frame::dec_ref(PhysAddr::new(current_pa));
+            if old_refcount == 0 {
+                super::phys::free_page(PhysAddr::new(current_pa));
+            }
+
+            obj.pages.set(obj_idx, dest_slot_pa);
+            count += 1;
+        }
+        count
+    });
+
+    // Now update any installed PTEs to point to the new locations.
+    if relocated > 0 {
+        let flags = pte_flags_for_vma(vma) | sw_zeroed_bit();
+        // Convert object page base to VMA-local MMU index.
+        let obj_mmu_base = base_idx * PAGE_MMUCOUNT;
+        let vma_obj_offset = vma.object_offset as usize;
+        if obj_mmu_base < vma_obj_offset {
+            return; // Superpage range starts before this VMA's mapping.
+        }
+        let mmu_base = obj_mmu_base - vma_obj_offset;
+        for slot in 0..page_count {
+            let new_pa = info.dest_pa + slot * PAGE_SIZE;
+            for sub in 0..PAGE_MMUCOUNT {
+                let mi = mmu_base + slot * PAGE_MMUCOUNT + sub;
+                if mi >= vma.mmu_page_count() {
+                    break;
+                }
+                let va = vma.va_start + mi * MMUPAGE_SIZE;
+                if pte_is_present(read_pte_dispatch(pt_root, va)) {
+                    let mmu_pa = new_pa + sub * MMUPAGE_SIZE;
+                    install_pte(pt_root, va, mmu_pa, flags);
+                }
+            }
+        }
+        stats::RESERVATION_CONSOLIDATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Attempt superpage promotion — pages should now be contiguous.
+    let vma_obj_offset = vma.object_offset as usize;
+    let obj_mmu_base = base_idx * PAGE_MMUCOUNT;
+    if obj_mmu_base >= vma_obj_offset {
+        let group_mmu_start = obj_mmu_base - vma_obj_offset;
+        if group_mmu_start < vma.mmu_page_count() {
+            try_superpage_promotion(pt_root, vma, obj_id, group_mmu_start);
+        }
+    }
 }
 
 /// Install a PTE via the arch-specific function.
