@@ -569,8 +569,24 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         }
     }
 
-    // Step 4: Lock child, insert VMAs and install child PTEs.
+    // Step 4: Demote parent superpages, then install child PTEs and
+    // downgrade both parent and child to read-only for COW.
+    //
+    // Superpage demotion must happen BEFORE walking parent L3 PTEs,
+    // because translate_va/read_pte walk to L3 and return None/0 for
+    // superpage block descriptors (which live at L2, not L3).
     {
+        // First: demote all superpages in writable parent VMAs.
+        for i in 0..vma_count {
+            let info = unsafe { &*cow_buf.add(i) };
+            if info.prot.writable() {
+                let mmu_count = info.va_len / super::page::MMUPAGE_SIZE;
+                demote_superpages_in_range(parent_pt, info.va_start, mmu_count, info.prot);
+            }
+        }
+
+        // Now install child PTEs and downgrade parent PTEs — all L3 entries
+        // are accessible since superpages have been demoted.
         let mut child_guard = unsafe { (*child_entry_ptr).inner.lock() };
         let sw_z = super::fault::sw_zeroed_bit();
 
@@ -581,7 +597,6 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
                 info.new_obj_id, info.object_offset,
             );
 
-            // Install child PTEs by walking parent's page table.
             let mmu_count = info.va_len / super::page::MMUPAGE_SIZE;
             for mmu_idx in 0..mmu_count {
                 let va = info.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
@@ -595,33 +610,16 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
                             rw_flags_for_prot(info.prot)
                         };
                         map_single_mmupage(child_pt, va, pa_page, flags | sw_z);
+
+                        // Downgrade parent PTE to read-only for COW.
+                        if info.prot.writable() {
+                            downgrade_pte_readonly(parent_pt, va);
+                        }
                     }
                 }
             }
         }
     } // child lock dropped
-
-    // Step 5: Lock parent, downgrade writable PTEs.
-    {
-        let _parent_guard = lock_aspace(parent_id);
-        for i in 0..vma_count {
-            let info = unsafe { &*cow_buf.add(i) };
-            if info.prot.writable() {
-                let mmu_count = info.va_len / super::page::MMUPAGE_SIZE;
-
-                demote_superpages_in_range(parent_pt, info.va_start, mmu_count, info.prot);
-
-                for mmu_idx in 0..mmu_count {
-                    let va = info.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
-                    let pte = super::fault::read_pte_dispatch(parent_pt, va);
-                    if super::fault::pte_is_present(pte) {
-                        downgrade_pte_readonly(parent_pt, va);
-                        downgrade_pte_readonly(child_pt, va);
-                    }
-                }
-            }
-        }
-    } // parent lock dropped
 
     // Free the snapshot buffer.
     super::phys::free_page(cow_page);

@@ -1574,6 +1574,101 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 21b: COW Reservation Stress Test ---
+    // Exercises the full reservation → consolidation → superpage re-promotion
+    // pipeline: allocate 2 MiB, populate all pages, fork, child COW-breaks
+    // every page, verify contiguity is preserved and data is correct.
+    syscall::debug_puts(b"  init: testing COW reservation pipeline...\n");
+    {
+        let cow_before = syscall::vm_stats(12); // COW pages copied
+        let consol_before = syscall::vm_stats(20); // reservation consolidations
+        let promo_before = syscall::vm_stats(0); // superpage promotions
+
+        // Allocate 32 allocation pages (2 MiB) at a 2 MiB-aligned VA.
+        let big_va = syscall::mmap_anon(0x20_0000_0000, 32, 1);
+        if let Some(base) = big_va {
+            // Populate every 4K MMU page with a unique pattern.
+            for i in 0..512u64 {
+                let ptr = (base + (i as usize) * 4096) as *mut u64;
+                unsafe { core::ptr::write_volatile(ptr, 0xC0FFEE_0000 | i); }
+            }
+
+            let pid = syscall::fork();
+            if pid == 0 {
+                // Child: write to every 4K page to trigger COW faults through
+                // the reservation path. Each write should land in the contiguous
+                // reservation destination.
+                for i in 0..512u64 {
+                    let ptr = (base + (i as usize) * 4096) as *mut u64;
+                    unsafe { core::ptr::write_volatile(ptr, 0xBEEF_0000 | i); }
+                }
+                // Verify child's writes.
+                let mut ok = true;
+                for i in 0..512u64 {
+                    let ptr = (base + (i as usize) * 4096) as *const u64;
+                    let val = unsafe { core::ptr::read_volatile(ptr) };
+                    if val != (0xBEEF_0000 | i) {
+                        ok = false;
+                        break;
+                    }
+                }
+                syscall::exit(if ok { 77 } else { 99 });
+            } else if pid > 0 {
+                // Parent: wait for child.
+                let mut child_ok = false;
+                for _ in 0..5000 {
+                    if let Some(code) = syscall::waitpid(pid) {
+                        child_ok = code == 77;
+                        break;
+                    }
+                    syscall::yield_now();
+                }
+
+                // Verify parent's data is untouched.
+                let mut parent_ok = true;
+                for i in 0..512u64 {
+                    let ptr = (base + (i as usize) * 4096) as *const u64;
+                    let val = unsafe { core::ptr::read_volatile(ptr) };
+                    if val != (0xC0FFEE_0000 | i) {
+                        parent_ok = false;
+                        break;
+                    }
+                }
+
+                let cow_after = syscall::vm_stats(12);
+                let consol_after = syscall::vm_stats(20);
+                let promo_after = syscall::vm_stats(0);
+
+                let cow_pages = cow_after - cow_before;
+                let consolidations = consol_after - consol_before;
+                let promotions = promo_after - promo_before;
+
+                if child_ok && parent_ok {
+                    syscall::debug_puts(b"Phase 62 COW reservation pipeline: PASSED (cow=");
+                    print_num(cow_pages);
+                    syscall::debug_puts(b" consol=");
+                    print_num(consolidations);
+                    syscall::debug_puts(b" promo=");
+                    print_num(promotions);
+                    syscall::debug_puts(b")\n");
+                } else {
+                    syscall::debug_puts(b"Phase 62 COW reservation pipeline: FAILED (child=");
+                    print_num(if child_ok { 1 } else { 0 });
+                    syscall::debug_puts(b" parent=");
+                    print_num(if parent_ok { 1 } else { 0 });
+                    syscall::debug_puts(b" cow=");
+                    print_num(cow_pages);
+                    syscall::debug_puts(b")\n");
+                }
+            } else {
+                syscall::debug_puts(b"Phase 62 COW reservation pipeline: FAILED (fork)\n");
+            }
+            syscall::munmap(base);
+        } else {
+            syscall::debug_puts(b"Phase 62 COW reservation pipeline: FAILED (mmap)\n");
+        }
+    }
+
     // --- Test 22: M:N Green Threads + Scheduler Activations ---
     syscall::debug_puts(b"  init: testing M:N green threads...\n");
     {

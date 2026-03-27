@@ -7,9 +7,10 @@
 //! page are unmapped, the physical page is freed.
 
 use super::aspace::{self, ASpaceId};
+use super::cowgroup;
 use super::fault;
 use super::object;
-use super::page::MMUPAGE_SIZE;
+use super::page::{MMUPAGE_SIZE, SUPERPAGE_ALLOC_PAGES};
 use super::stats;
 use core::sync::atomic::Ordering;
 
@@ -73,33 +74,40 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
                     let referenced = read_and_clear_ref_bit(pt_root, va);
 
                     if !referenced {
-                        // Evict: clear valid bit but preserve SW_ZEROED hint.
-                        evict_mmupage(pt_root, va);
-                        result.ptes_cleared += 1;
-                        stats::PTES_REMOVED.fetch_add(1, Ordering::Relaxed);
+                        // Skip eviction if this page is in a superpage range
+                        // with an active COW reservation. Evicting would break
+                        // the contiguous destination that reservations preserve.
+                        let obj_id = vma.object_id;
+                        let obj_page_idx = vma.obj_page_index(mmu_idx);
+                        if has_active_reservation(obj_id, obj_page_idx) {
+                            stats::WSCLOCK_RESERVATION_SKIPS.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            // Evict: clear valid bit but preserve SW_ZEROED hint.
+                            evict_mmupage(pt_root, va);
+                            result.ptes_cleared += 1;
+                            stats::PTES_REMOVED.fetch_add(1, Ordering::Relaxed);
 
-                        // Check if all MMU pages in this allocation page are now unmapped.
-                        let (ap_start, ap_end) = vma.alloc_page_mmu_range(mmu_idx);
-                        let mut all_unmapped = true;
-                        for i in ap_start..ap_end {
-                            let check_va = vma.va_start + i * MMUPAGE_SIZE;
-                            if fault::pte_is_present(fault::read_pte_dispatch(pt_root, check_va)) {
-                                all_unmapped = false;
-                                break;
-                            }
-                        }
-
-                        if all_unmapped {
-                            let obj_page_idx = vma.obj_page_index(mmu_idx);
-                            let obj_id = vma.object_id;
-                            object::release_page(obj_id, obj_page_idx);
-                            // Clear SW_ZEROED hints since the physical page is freed.
+                            // Check if all MMU pages in this allocation page are now unmapped.
+                            let (ap_start, ap_end) = vma.alloc_page_mmu_range(mmu_idx);
+                            let mut all_unmapped = true;
                             for i in ap_start..ap_end {
-                                let clear_va = vma.va_start + i * MMUPAGE_SIZE;
-                                clear_pte(pt_root, clear_va);
+                                let check_va = vma.va_start + i * MMUPAGE_SIZE;
+                                if fault::pte_is_present(fault::read_pte_dispatch(pt_root, check_va)) {
+                                    all_unmapped = false;
+                                    break;
+                                }
                             }
-                            result.pages_freed += 1;
-                            stats::PAGES_RECLAIMED.fetch_add(1, Ordering::Relaxed);
+
+                            if all_unmapped {
+                                object::release_page(obj_id, obj_page_idx);
+                                // Clear SW_ZEROED hints since the physical page is freed.
+                                for i in ap_start..ap_end {
+                                    let clear_va = vma.va_start + i * MMUPAGE_SIZE;
+                                    clear_pte(pt_root, clear_va);
+                                }
+                                result.pages_freed += 1;
+                                stats::PAGES_RECLAIMED.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 } else {
@@ -119,6 +127,18 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
         aspace.clock_hand = hand;
         result
     })
+}
+
+/// Check if a page is in a superpage range with an active COW reservation.
+/// If so, WSCLOCK should skip eviction to preserve contiguity.
+fn has_active_reservation(obj_id: u64, obj_page_idx: usize) -> bool {
+    let cow_group_port = object::with_object(obj_id, |obj| obj.cow_group_port);
+    if cow_group_port == 0 {
+        return false;
+    }
+    let super_base = (obj_page_idx & !(SUPERPAGE_ALLOC_PAGES - 1)) as u32;
+    // If a reservation exists for this member in this range, skip eviction.
+    cowgroup::get_reservation_info(cow_group_port, obj_id, super_base).is_some()
 }
 
 // Architecture-specific wrappers.

@@ -1993,6 +1993,8 @@ fn sys_vm_stats(which: u64) -> u64 {
         17 => stats::PAGES_PREZEROED.load(Ordering::Relaxed),
         18 => { let (total, _) = crate::mm::phys::stats(); total as u64 }
         19 => { let (_, free) = crate::mm::phys::stats(); free as u64 }
+        20 => stats::RESERVATION_CONSOLIDATIONS.load(Ordering::Relaxed),
+        21 => stats::WSCLOCK_RESERVATION_SKIPS.load(Ordering::Relaxed),
         _ => u64::MAX,
     }
 }

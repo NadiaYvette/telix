@@ -17,6 +17,7 @@ pub static SUPERPAGE_DEMOTIONS: AtomicU64 = AtomicU64::new(0);
 pub static PAGES_PREZEROED: AtomicU64 = AtomicU64::new(0);
 pub static PAGER_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub static RESERVATION_CONSOLIDATIONS: AtomicU64 = AtomicU64::new(0);
+pub static WSCLOCK_RESERVATION_SKIPS: AtomicU64 = AtomicU64::new(0);
 
 pub fn print() {
     crate::println!("  VM stats:");
@@ -35,4 +36,5 @@ pub fn print() {
     crate::println!("    Pages pre-zeroed:  {}", PAGES_PREZEROED.load(Ordering::Relaxed));
     crate::println!("    Pager faults:  {}", PAGER_FAULTS.load(Ordering::Relaxed));
     crate::println!("    Reservation consolidations: {}", RESERVATION_CONSOLIDATIONS.load(Ordering::Relaxed));
+    crate::println!("    WSCLOCK reservation skips: {}", WSCLOCK_RESERVATION_SKIPS.load(Ordering::Relaxed));
 }
