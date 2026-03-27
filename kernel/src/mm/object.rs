@@ -427,9 +427,13 @@ pub fn destroy(id: ObjectId) {
     guard.cow_group_port = 0;
     drop(guard);
 
-    // Leave COW sharing group (destroys the group if last member).
+    // Leave COW sharing group.
     if cow_group_port != 0 {
-        super::cowgroup::remove_member(cow_group_port, id);
+        if let Some(survivor_id) = super::cowgroup::remove_member(cow_group_port, id) {
+            // Sole survivor — detach from group and clear stale refcounts.
+            // Pages with refcount 1 are exclusively owned; reset to 0 (untracked).
+            detach_sole_survivor(survivor_id);
+        }
     }
 
     // Destroy ports and defer-free the entry.
@@ -463,6 +467,29 @@ pub fn object_port(id: ObjectId) -> PortId {
             }
         }
         None => 0,
+    }
+}
+
+/// Detach the sole surviving member of a dissolved COW group.
+/// Clears its `cow_group_port` and resets stale frame refcounts (pages with
+/// refcount 1 are exclusively owned, normalize to 0 = untracked).
+fn detach_sole_survivor(survivor_id: ObjectId) {
+    let entry_ptr = match resolve_entry(survivor_id) {
+        Some(p) => p,
+        None => return,
+    };
+    let mut guard = unsafe { (*entry_ptr).inner.lock() };
+    guard.cow_group_port = 0;
+
+    // Reset stale refcounts: pages with refcount 1 are now exclusively owned.
+    for i in 0..guard.page_count as usize {
+        let pa = guard.pages.get(i);
+        if pa != 0 {
+            let rc = super::frame::get_ref(PhysAddr::new(pa));
+            if rc == 1 {
+                super::frame::set_ref(PhysAddr::new(pa), 0);
+            }
+        }
     }
 }
 

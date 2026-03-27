@@ -428,20 +428,39 @@ pub fn add_member(group_id: CowGroupId, obj_id: u64) -> bool {
 
 /// Remove a memory object from a COW group.
 /// Frees unclaimed reservation pages for this member.
-/// If this was the last member, the group is destroyed.
-pub fn remove_member(group_id: CowGroupId, obj_id: u64) {
+///
+/// Returns `Some(survivor_obj_id)` if this removal left exactly one member
+/// (the sole survivor now exclusively owns all its pages and should be
+/// detached from the group). Returns `None` otherwise.
+///
+/// If this was the last member, the group is destroyed automatically.
+pub fn remove_member(group_id: CowGroupId, obj_id: u64) -> Option<u64> {
     let entry_ptr = match resolve_entry(group_id) {
         Some(p) => p as *mut GroupEntry,
-        None => return,
+        None => return None,
     };
 
-    let remaining = {
+    let (remaining, survivor) = {
         let mut guard = unsafe { (*entry_ptr).inner.lock() };
-        guard.remove_member(obj_id)
+        let remaining = guard.remove_member(obj_id);
+        let survivor = if remaining == 1 {
+            Some(guard.members[0])
+        } else {
+            None
+        };
+        (remaining, survivor)
     };
 
     if remaining == 0 {
         destroy(group_id);
+        None
+    } else if remaining == 1 {
+        // Sole survivor — destroy the group (its reservations are no longer
+        // needed since there's no one left to share with).
+        destroy(group_id);
+        survivor
+    } else {
+        None
     }
 }
 
