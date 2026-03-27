@@ -53,7 +53,7 @@ const TS_SLAB_SIZE: usize = 64;    // Turnstile: ~48 bytes, 64B slab
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001b3;
 
-fn futex_hash(aspace_id: u32, va: usize) -> u64 {
+fn futex_hash(aspace_id: u64, va: usize) -> u64 {
     let mut h = FNV_OFFSET;
     for &b in &aspace_id.to_le_bytes() {
         h ^= b as u64;
@@ -144,7 +144,7 @@ static WAIT_HAMT: [SpinLock<HamtRoot>; NUM_BUCKETS] = {
 // HAMT operations (operate on locked HamtRoot)
 // ---------------------------------------------------------------------------
 
-fn hamt_lookup(root: &HamtRoot, hash: u64, key_type: u8, aspace_id: u32, va: usize) -> Option<*mut Turnstile> {
+fn hamt_lookup(root: &HamtRoot, hash: u64, key_type: u8, aspace_id: u64, va: usize) -> Option<*mut Turnstile> {
     let mut slot = root.children[nibble_at(hash, 0)];
     let mut level = 1usize;
     loop {
@@ -217,13 +217,13 @@ fn hamt_insert(root: &mut HamtRoot, hash: u64, ts_ptr: *mut Turnstile) -> bool {
 
 /// Remove a turnstile from the HAMT. Returns the pointer if found.
 /// Uses recursive descent for bottom-up node collapsing.
-fn hamt_remove(root: &mut HamtRoot, hash: u64, key_type: u8, aspace_id: u32, va: usize) -> Option<*mut Turnstile> {
+fn hamt_remove(root: &mut HamtRoot, hash: u64, key_type: u8, aspace_id: u64, va: usize) -> Option<*mut Turnstile> {
     let nibble0 = nibble_at(hash, 0);
     hamt_remove_at(&mut root.children[nibble0], hash, key_type, aspace_id, va, 1)
 }
 
 fn hamt_remove_at(
-    slot: &mut usize, hash: u64, key_type: u8, aspace_id: u32, va: usize, level: usize,
+    slot: &mut usize, hash: u64, key_type: u8, aspace_id: u64, va: usize, level: usize,
 ) -> Option<*mut Turnstile> {
     let val = *slot;
     if val == 0 { return None; }
@@ -247,7 +247,7 @@ fn hamt_remove_at(
     if result.is_some() {
         // Try to collapse: count remaining children.
         let node_ref = unsafe { &*node };
-        let mut count = 0u32;
+        let mut count = 0u64;
         let mut last_child = 0usize;
         for i in 0..HAMT_WIDTH {
             if node_ref.children[i] != 0 {
@@ -274,9 +274,9 @@ fn hamt_remove_at(
 
 #[repr(C)]
 struct Turnstile {
-    aspace_id: u32,
+    aspace_id: u64,
     key_type: u8,
-    _pad0: [u8; 3],
+    _pad0: [u8; 7],
     va: usize,           // futex: virtual address; port: port_id as usize
     hash: u64,
     head: u32,
@@ -299,7 +299,7 @@ fn free_turnstile(p: *mut Turnstile) {
     slab::free(PhysAddr::new(p as usize), TS_SLAB_SIZE);
 }
 
-fn init_turnstile(ts: *mut Turnstile, key_type: u8, aspace_id: u32, va: usize, hash: u64) {
+fn init_turnstile(ts: *mut Turnstile, key_type: u8, aspace_id: u64, va: usize, hash: u64) {
     let t = unsafe { &mut *ts };
     t.key_type = key_type;
     t.aspace_id = aspace_id;
@@ -497,7 +497,7 @@ pub fn futex_wake(addr: usize, count: u32) -> u64 {
     let aspace_id = crate::sched::current_aspace_id();
     let hash = futex_hash(aspace_id, addr);
     let bucket = bucket_index(hash);
-    let mut woken = 0u32;
+    let mut woken = 0u64;
 
     let mut root = WAIT_HAMT[bucket].lock();
     let ts_ptr = match hamt_lookup(&root, hash, KEY_FUTEX, aspace_id, addr) {
@@ -507,7 +507,7 @@ pub fn futex_wake(addr: usize, count: u32) -> u64 {
     let ts = unsafe { &mut *ts_ptr };
 
     let mut last_tid = TS_NIL;
-    while woken < count {
+    while woken < count as u64 {
         match ts_dequeue_head(ts) {
             Some(tid) => {
                 thread_ref(tid).ts_blocked_on.store(0, Ordering::Relaxed);
@@ -687,7 +687,7 @@ pub fn futex_wake_pi(addr: usize) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Clean up if a thread is still on a turnstile wait queue (killed case).
-fn cleanup_blocked_inner(tid: u32, ts_addr: usize, bucket: usize, hash: u64, key_type: u8, aspace_id: u32, va: usize) {
+fn cleanup_blocked_inner(tid: u32, ts_addr: usize, bucket: usize, hash: u64, key_type: u8, aspace_id: u64, va: usize) {
     let mut root = WAIT_HAMT[bucket].lock();
     if let Some(found_ts) = hamt_lookup(&root, hash, key_type, aspace_id, va) {
         if found_ts as usize == ts_addr {
@@ -761,7 +761,7 @@ pub fn port_enqueue_with_check<F: FnOnce() -> bool>(
     }
 
     // Port keys: aspace_id=0, va=port_id as usize.
-    let aspace_id = 0u32;
+    let aspace_id = 0u64;
     let va = port_id as usize;
 
     let ts_ptr = if let Some(ts) = hamt_lookup(&root, hash, key_type, aspace_id, va) {
@@ -792,7 +792,7 @@ pub fn port_enqueue_with_check<F: FnOnce() -> bool>(
 pub fn port_wake_one(port_id: u64, key_type: u8) -> Option<u32> {
     let hash = port_key_hash(port_id, key_type);
     let bucket = bucket_index(hash);
-    let aspace_id = 0u32;
+    let aspace_id = 0u64;
     let va = port_id as usize;
 
     let mut root = WAIT_HAMT[bucket].lock();
@@ -827,7 +827,7 @@ pub fn port_wake_one(port_id: u64, key_type: u8) -> Option<u32> {
 pub fn port_dequeue_one(port_id: u64, key_type: u8) -> Option<u32> {
     let hash = port_key_hash(port_id, key_type);
     let bucket = bucket_index(hash);
-    let aspace_id = 0u32;
+    let aspace_id = 0u64;
     let va = port_id as usize;
 
     let mut root = WAIT_HAMT[bucket].lock();
@@ -860,7 +860,7 @@ pub fn port_dequeue_one(port_id: u64, key_type: u8) -> Option<u32> {
 pub fn port_wake_all(port_id: u64, key_type: u8) -> u32 {
     let hash = port_key_hash(port_id, key_type);
     let bucket = bucket_index(hash);
-    let aspace_id = 0u32;
+    let aspace_id = 0u64;
     let va = port_id as usize;
 
     let mut root = WAIT_HAMT[bucket].lock();

@@ -724,7 +724,7 @@ fn do_spawn_heavy_work(
     _quantum: u32,
     arg0: u64,
     arg0_is_port: bool,
-) -> Option<(u32, usize, u64, usize, u64, u64)> {
+) -> Option<(u64, usize, u64, usize, u64, u64)> {
     // Create kernel-held ports for this task and its initial thread.
     let task_port = crate::ipc::port::create_kernel_port(task_port_handler, task_id as usize)?;
     let thread_port = crate::ipc::port::create_kernel_port(thread_port_handler, thread_id as usize)?;
@@ -747,31 +747,29 @@ fn do_spawn_heavy_work(
             let tptr = TASK_TABLE.get(task_id) as *mut Task;
             unsafe { (*tptr).capspace = crate::cap::CapSpace::new(task_id); }
         }
-        let mut caps = crate::cap::CAP_SYSTEM.lock();
-
         let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
         if nsrv != u64::MAX {
-            caps.grant_send_cap(task_id, nsrv);
+            crate::cap::grant_send_cap(task_id, nsrv);
         }
 
         let iramfs = crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
         if iramfs != u64::MAX {
-            caps.grant_send_cap(task_id, iramfs);
+            crate::cap::grant_send_cap(task_id, iramfs);
         }
 
         if arg0_is_port {
-            caps.grant_full_port_cap(task_id, arg0);
+            crate::cap::grant_full_port_cap(task_id, arg0);
         }
 
         // Grant parent: SEND|RECV|MANAGE on child task port, SEND|MANAGE on child thread port.
         use crate::cap::capability::Rights;
         let srm = Rights::SEND.union(Rights::RECV).union(Rights::MANAGE);
         let sm = Rights::SEND.union(Rights::MANAGE);
-        caps.grant_port_cap(parent.parent_task, task_port, srm);
-        caps.grant_port_cap(parent.parent_task, thread_port, sm);
+        crate::cap::grant_port_cap(parent.parent_task, task_port, srm);
+        crate::cap::grant_port_cap(parent.parent_task, thread_port, sm);
         // Grant child: SEND on own task port, SEND|RECV|MANAGE on own thread port.
-        caps.grant_send_cap(task_id, task_port);
-        caps.grant_port_cap(task_id, thread_port, srm);
+        crate::cap::grant_send_cap(task_id, task_port);
+        crate::cap::grant_port_cap(task_id, thread_port, srm);
     }
 
     // Load ELF segments into the address space.
@@ -920,7 +918,7 @@ fn finalize_spawn(
     task_id: u32,
     thread_id: ThreadId,
     parent: &SpawnParentInfo,
-    aspace_id: u32,
+    aspace_id: u64,
     pt_root: usize,
     priority: u8,
     quantum: u32,
@@ -1344,8 +1342,7 @@ pub fn thread_create(task_id: u32, entry: u64, stack_top: u64, arg: u64) -> Opti
     if result.is_some() {
         use crate::cap::capability::Rights;
         let srm = Rights::SEND.union(Rights::RECV).union(Rights::MANAGE);
-        let mut caps = crate::cap::CAP_SYSTEM.lock();
-        caps.grant_port_cap(task_id, thread_port, srm);
+        crate::cap::grant_port_cap(task_id, thread_port, srm);
     }
     result
 }
@@ -2125,7 +2122,7 @@ pub fn update_task_page_table(new_pt_root: usize) {
 
 /// Get the address space ID of the current thread's task.
 /// Returns 0 if the thread/task has no address space (kernel context).
-pub fn current_aspace_id() -> u32 {
+pub fn current_aspace_id() -> u64 {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let thread = thread_ref(tid);
     let task = task_ref(thread.task_id);
@@ -2262,23 +2259,21 @@ pub fn fork_current() -> u64 {
             let tptr = TASK_TABLE.get(child_task_id) as *mut Task;
             unsafe { (*tptr).capspace = crate::cap::CapSpace::new(child_task_id); }
         }
-        let mut caps = crate::cap::CAP_SYSTEM.lock();
-
         // Grant SEND caps for well-known kernel ports.
         let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
         if nsrv != u64::MAX {
-            caps.grant_send_cap(child_task_id, nsrv);
+            crate::cap::grant_send_cap(child_task_id, nsrv);
         }
         let iramfs = crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
         if iramfs != u64::MAX {
-            caps.grant_send_cap(child_task_id, iramfs);
+            crate::cap::grant_send_cap(child_task_id, iramfs);
         }
 
         // Grant parent and child caps on the child's task port.
         use crate::cap::capability::Rights;
         let srm = Rights::SEND.union(Rights::RECV).union(Rights::MANAGE);
-        caps.grant_port_cap(parent_task_id, child_task_port, srm);
-        caps.grant_send_cap(child_task_id, child_task_port);
+        crate::cap::grant_port_cap(parent_task_id, child_task_port, srm);
+        crate::cap::grant_send_cap(child_task_id, child_task_port);
     }
 
     // Allocate kernel stack for child thread.
@@ -2344,9 +2339,8 @@ pub fn fork_current() -> u64 {
         use crate::cap::capability::Rights;
         let srm = Rights::SEND.union(Rights::RECV).union(Rights::MANAGE);
         let sm = Rights::SEND.union(Rights::MANAGE);
-        let mut caps = crate::cap::CAP_SYSTEM.lock();
-        caps.grant_port_cap(parent_task_id, child_thread_port, sm);
-        caps.grant_port_cap(child_task_id, child_thread_port, srm);
+        crate::cap::grant_port_cap(parent_task_id, child_thread_port, sm);
+        crate::cap::grant_port_cap(child_task_id, child_thread_port, srm);
     }
 
     // Return child task port_id to parent (nonzero = parent, 0 = child).

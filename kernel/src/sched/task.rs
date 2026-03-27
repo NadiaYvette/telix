@@ -86,8 +86,8 @@ pub struct Task {
     pub active: bool,
     /// Kernel-held port for this task. Userspace references this task by port_id.
     pub port_id: u64,
-    /// Address space ID (0 = kernel, uses identity mapping).
-    pub aspace_id: u32,
+    /// Address space ID (port_id, 0 = kernel, uses identity mapping).
+    pub aspace_id: u64,
     /// Physical address of the page table root for this task.
     /// 0 = kernel task (uses boot page table, no switching needed).
     pub page_table_root: usize,
@@ -143,6 +143,8 @@ pub struct Task {
     // --- Resource limits (Phase 50) ---
     pub rlimits: [Rlimit; RLIMIT_COUNT],
     // --- Embedded capability data (lockless access via TASK_TABLE) ---
+    /// Per-task lock protecting CNode/CapSpace mutations.
+    pub cap_lock: crate::sync::SpinLock<()>,
     /// Per-task sparse capability set for lockless cap checks.
     pub capset: crate::cap::capset::CapSet,
     /// Per-task capability space (CNode + CDT tracking).
@@ -230,6 +232,7 @@ impl Task {
             groups_overflow: 0,
             ngroups: 0,
             rlimits: DEFAULT_RLIMITS,
+            cap_lock: crate::sync::SpinLock::new(()),
             capset: crate::cap::capset::CapSet::new(),
             capspace: crate::cap::space::CapSpace::new(0),
             sa_pending: core::sync::atomic::AtomicBool::new(false),

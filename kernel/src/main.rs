@@ -69,10 +69,7 @@ pub fn kmain() -> ! {
     mm::vmatree::run_tests();
 
     // Initialize capability system.
-    {
-        let mut caps = cap::CAP_SYSTEM.lock();
-        caps.init();
-    }
+    cap::init();
     println!("  Cap system initialized");
 
     // Capability system test (validates CDT/CNode logic).
@@ -251,9 +248,7 @@ fn startup_thread() -> ! {
             Some(tid) => {
                 // Grant SEND|RECV|MANAGE cap for the initramfs port to the new task.
                 let task_id = sched::thread_task_id(tid);
-                let mut caps = cap::CAP_SYSTEM.lock();
-                caps.grant_full_port_cap(task_id, srv_port);
-                drop(caps);
+                cap::grant_full_port_cap(task_id, srv_port);
                 println!("  initramfs_srv spawned (thread {}, port {})", tid, srv_port);
             }
             None => println!("  ERROR: failed to spawn initramfs_srv"),

@@ -17,7 +17,7 @@ pub struct CNode {
 }
 
 // Safety: the slots pointer is set once (on first use) and only accessed
-// under the CAP_SYSTEM lock.
+// under the per-task cap_lock.
 unsafe impl Send for CNode {}
 unsafe impl Sync for CNode {}
 

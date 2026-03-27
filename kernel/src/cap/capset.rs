@@ -3,7 +3,7 @@
 //!
 //! Uses an inline array of 32 AtomicU64 entries for lockless reads on the hot
 //! path. Each entry packs `port_local[63:8] | perms[7:0]`. An entry of 0 is
-//! empty. Mutations happen under the CAP_SYSTEM lock.
+//! empty. Mutations happen under the per-task cap_lock.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -80,7 +80,27 @@ impl CapSet {
                 return true;
             }
         }
-        false // Full — should not happen with INLINE_CAP=32 (tasks typically hold 3-8 caps).
+        // All slots occupied — evict stale entries (dead ports) and retry.
+        let mut evicted = false;
+        for i in 0..INLINE_CAP {
+            let e = self.entries[i].load(Ordering::Relaxed);
+            if e == 0 { continue; }
+            let pl = entry_port(e);
+            if !crate::ipc::port::port_is_active_local(pl) {
+                self.entries[i].store(0, Ordering::Relaxed);
+                evicted = true;
+            }
+        }
+        if evicted {
+            // Retry insertion after eviction.
+            for i in 0..INLINE_CAP {
+                if self.entries[i].load(Ordering::Relaxed) == 0 {
+                    self.entries[i].store(make_entry(port_local, perms), Ordering::Relaxed);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Remove all permissions for a port. Call under CAP_SYSTEM lock.

@@ -142,6 +142,9 @@ pub fn cpu_offline(cpu: u32) -> u64 {
         }
     }
 
+    // Drain slab magazines for this CPU back to global caches.
+    crate::mm::slab::drain_cpu(cpu);
+
     HOTPLUG_EVENTS.fetch_add(1, Ordering::Relaxed);
     0
 }

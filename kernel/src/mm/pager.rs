@@ -19,12 +19,12 @@ use core::sync::atomic::Ordering;
 
 /// Information about a pending pager fault.
 pub struct PagerFaultInfo {
-    pub aspace_id: u32,
+    pub aspace_id: u64,
     pub thread_id: u32,
     pub fault_va: usize,
     pub phys_addr: usize,
     pub obj_page_idx: usize,
-    pub obj_id: u32,
+    pub obj_id: u64,
     pub mmu_idx: usize,
     pub vma_va: usize,
     pub file_handle: u32,
@@ -33,12 +33,12 @@ pub struct PagerFaultInfo {
 
 struct PagerFaultEntry {
     active: bool,
-    aspace_id: u32,
+    aspace_id: u64,
     thread_id: u32,
     fault_va: usize,
     phys_addr: usize,
     obj_page_idx: usize,
-    obj_id: u32,
+    obj_id: u64,
     mmu_idx: usize,
     vma_va: usize,
     file_handle: u32,
@@ -184,7 +184,7 @@ fn inject_fault_into_frame(pager_tid: u32, token: u32, fault_va: usize, file_han
 /// If a fault is pending, returns Some((token, fault_va, file_handle, file_offset, page_size)).
 /// If none, parks the pager thread. When woken by initiate_fault, the fault info
 /// will be injected into the saved frame (like IPC recv).
-pub fn wait_fault(aspace_id: u32) -> Option<(u32, usize, u32, u64, usize)> {
+pub fn wait_fault(aspace_id: u64) -> Option<(u32, usize, u32, u64, usize)> {
     // Check for pending faults first (lock order: FAULTS before pager waiter).
     {
         let faults = PAGER_FAULTS.lock();

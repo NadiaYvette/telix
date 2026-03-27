@@ -216,7 +216,7 @@ impl VmaTree {
         va_start: usize,
         va_len: usize,
         prot: super::vma::VmaProt,
-        object_id: u32,
+        object_id: u64,
         object_offset: u32,
     ) -> Option<&mut Vma> {
         let vma_ptr = alloc_vma();
@@ -803,7 +803,7 @@ fn test_many_inserts() {
         let va = 0x1000_0000 + i * 0x10_0000;
         tree.insert(
             va, 0x10000,
-            super::vma::VmaProt::ReadWrite, (i + 1) as u32, 0,
+            super::vma::VmaProt::ReadWrite, (i + 1) as u64, 0,
         );
     }
     assert_eq!(tree.len(), n);
@@ -813,7 +813,7 @@ fn test_many_inserts() {
         let va = 0x1000_0000 + i * 0x10_0000 + 0x1000;
         let vma = tree.find(va);
         assert!(vma.is_some(), "Missing VMA at index {}", i);
-        assert_eq!(vma.unwrap().object_id, (i + 1) as u32);
+        assert_eq!(vma.unwrap().object_id, (i + 1) as u64);
     }
 
     // Remove all.

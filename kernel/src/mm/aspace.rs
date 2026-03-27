@@ -3,19 +3,17 @@
 //! Each address space owns a page table root and a B+ tree of VMAs.
 //! The WSCLOCK clock hand (VmaCursor) is also stored here.
 //!
-//! The address space table is an ART (Adaptive Radix Tree) mapping monotonic
-//! ASpaceIds to slab-allocated entries, with no fixed upper limit.
+//! Each address space is port-referenced: an `ASpaceId` is a kernel-held
+//! port ID (u64). Lookup is lock-free via `port_kernel_data()` → entry
+//! pointer through RCU-protected PORT_ART.
 //!
-//! Locking: each address space has its own SpinLock, so operations on
-//! different address spaces never contend. The global ASPACE_TABLE lock
-//! serializes only entry creation, destruction, and lookup (held briefly).
-//! Lock ordering: ASPACE_TABLE → per-entry SpinLock.
+//! Locking: each address space has its own SpinLock. Operations on
+//! different address spaces never contend. No global lock.
 
 use super::object::{self};
 use super::page::PhysAddr;
 use super::vma::{Vma, VmaProt};
 use super::vmatree::{VmaCursor, VmaTree};
-use crate::ipc::art::Art;
 use crate::mm::slab;
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -23,8 +21,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// Slab size for ASpaceEntry allocations.
 const ASPACE_SLAB_SIZE: usize = 128;
 
-/// Address space ID type.
-pub type ASpaceId = u32;
+/// Address space ID type — a kernel-held port ID (u64).
+/// Value 0 means "no address space" (kernel task).
+pub type ASpaceId = u64;
 
 /// Heap VA base: 8 GiB (above ELF load at 4 GiB, below stack).
 pub const HEAP_VA_BASE: usize = 0x2_0000_0000;
@@ -154,12 +153,14 @@ impl AddressSpace {
 }
 
 // ---------------------------------------------------------------------------
-// ART-backed address space table
+// Port-referenced address space entries
 // ---------------------------------------------------------------------------
 
 /// A slab-allocated entry in the address space table.
 #[repr(C)]
 struct ASpaceEntry {
+    /// Kernel-held port ID for this address space.
+    port_id: u64,
     /// Per-aspace pager waiter thread ID (0 = none). Accessed atomically
     /// without holding the per-aspace lock.
     pager_waiter: AtomicU32,
@@ -167,26 +168,8 @@ struct ASpaceEntry {
     inner: SpinLock<AddressSpace>,
 }
 
-struct ASpaceTable {
-    art: Art,
-    next_id: ASpaceId,
-}
-
-impl ASpaceTable {
-    const fn new() -> Self {
-        Self {
-            art: Art::new(),
-            next_id: 1,
-        }
-    }
-
-    fn get(&self, id: ASpaceId) -> Option<*const ASpaceEntry> {
-        let val = self.art.lookup(id as u64)?;
-        Some(val as *const ASpaceEntry)
-    }
-}
-
-static ASPACE_TABLE: SpinLock<ASpaceTable> = SpinLock::new(ASpaceTable::new());
+/// Monotonic ID counter for debugging (not used for lookup).
+static NEXT_ASPACE_SEQ: AtomicU32 = AtomicU32::new(1);
 
 /// Allocate a new ASpaceEntry from slab.
 fn alloc_entry() -> Option<*mut ASpaceEntry> {
@@ -203,21 +186,36 @@ fn free_entry(ptr: *mut ASpaceEntry) {
     slab::free(PhysAddr::new(ptr as usize), ASPACE_SLAB_SIZE);
 }
 
+/// Kernel port handler for address spaces (stub — not used for IPC).
+fn aspace_port_handler(
+    _port_id: crate::ipc::port::PortId,
+    _user_data: usize,
+    _msg: &crate::ipc::Message,
+) -> crate::ipc::Message {
+    crate::ipc::Message::empty()
+}
+
+/// Resolve an ASpaceId (port_id) to the entry pointer. Lock-free via RCU.
+#[inline]
+fn resolve_entry(id: ASpaceId) -> Option<*const ASpaceEntry> {
+    if id == 0 { return None; }
+    let ptr = crate::ipc::port::port_kernel_data(id)?;
+    Some(ptr as *const ASpaceEntry)
+}
+
 // ---------------------------------------------------------------------------
 // Per-aspace locking
 // ---------------------------------------------------------------------------
 
-/// Lock an address space by ID. Acquires the table lock briefly to find the
-/// entry, then locks the per-entry SpinLock, then releases the table lock.
+/// Lock an address space by port_id. Resolves via PORT_ART (lock-free RCU),
+/// then locks the per-entry SpinLock.
 fn lock_aspace(id: ASpaceId) -> Option<crate::sync::SpinLockGuard<'static, AddressSpace>> {
-    let table = ASPACE_TABLE.lock();
-    let entry_ptr = table.get(id)?;
-    // SAFETY: entry is slab-allocated and valid as long as it's in the ART.
-    // We hold the table lock, so nobody can remove it from the ART yet.
+    let entry_ptr = resolve_entry(id)?;
+    // SAFETY: entry is slab-allocated and valid as long as the port exists.
+    // Port destruction uses RCU deferred free, so in-flight lookups are safe.
     let guard = unsafe { (*entry_ptr).inner.lock() };
-    drop(table);
-    // Double-check ID under lock (entry could have been recycled).
-    if guard.id != id {
+    // Validate entry is still live (id != 0 after destruction).
+    if guard.id == 0 {
         return None;
     }
     Some(guard)
@@ -243,9 +241,9 @@ pub fn with_aspace_mut<R>(id: ASpaceId, f: impl FnOnce(&mut AddressSpace) -> R) 
 // ---------------------------------------------------------------------------
 
 /// Atomically take (read and clear) the pager waiter thread ID for an aspace.
+/// Fully lock-free: resolves via PORT_ART, accesses AtomicU32 directly.
 pub fn take_pager_waiter(id: ASpaceId) -> u32 {
-    let table = ASPACE_TABLE.lock();
-    match table.get(id) {
+    match resolve_entry(id) {
         Some(entry_ptr) => {
             let entry = unsafe { &*entry_ptr };
             entry.pager_waiter.swap(0, Ordering::Relaxed)
@@ -254,16 +252,15 @@ pub fn take_pager_waiter(id: ASpaceId) -> u32 {
     }
 }
 
-/// Set the pager waiter thread ID for an aspace.
+/// Set the pager waiter thread ID for an aspace. Lock-free.
 pub fn set_pager_waiter(id: ASpaceId, tid: u32) {
-    let table = ASPACE_TABLE.lock();
-    if let Some(entry_ptr) = table.get(id) {
+    if let Some(entry_ptr) = resolve_entry(id) {
         let entry = unsafe { &*entry_ptr };
         entry.pager_waiter.store(tid, Ordering::Relaxed);
     }
 }
 
-/// Clear the pager waiter thread ID for an aspace.
+/// Clear the pager waiter thread ID for an aspace. Lock-free.
 pub fn clear_pager_waiter(id: ASpaceId) {
     set_pager_waiter(id, 0);
 }
@@ -303,47 +300,48 @@ fn seed_aspace(space: &mut AddressSpace) {
 }
 
 /// Create a new address space with the given page table root.
+/// Returns the port_id (ASpaceId) for the new address space.
 pub fn create(page_table_root: usize) -> Option<ASpaceId> {
     let ptr = alloc_entry()?;
 
-    let mut table = ASPACE_TABLE.lock();
-    let id = table.next_id;
-    table.next_id += 1;
+    let seq = NEXT_ASPACE_SEQ.fetch_add(1, Ordering::Relaxed);
+
+    // Create a kernel-held port with user_data = entry pointer.
+    let port_id = match crate::ipc::port::create_kernel_port(
+        aspace_port_handler,
+        ptr as usize,
+    ) {
+        Some(p) => p,
+        None => {
+            free_entry(ptr);
+            return None;
+        }
+    };
 
     unsafe {
+        (*ptr).port_id = port_id;
         (*ptr).pager_waiter = AtomicU32::new(0);
         let mut space = AddressSpace::empty();
-        space.id = id;
+        space.id = port_id;
         space.page_table_root = page_table_root;
         space.clock_hand = VmaCursor::new();
         seed_aspace(&mut space);
         core::ptr::write(&mut (*ptr).inner, SpinLock::new(space));
     }
 
-    if !table.art.insert(id as u64, ptr as usize) {
-        drop(table);
-        free_entry(ptr);
-        return None;
-    }
-
-    Some(id)
+    let _ = seq; // debug sequence number, unused for now
+    Some(port_id)
 }
 
 /// Destroy an address space.
 pub fn destroy(id: ASpaceId) {
-    // Step 1: Remove from ART (holds table lock briefly).
-    let entry_ptr = {
-        let mut table = ASPACE_TABLE.lock();
-        let ptr = match table.get(id) {
-            Some(p) => p as *mut ASpaceEntry,
-            None => return,
-        };
-        table.art.remove(id as u64);
-        ptr
-    }; // table lock released
+    // Step 1: Resolve entry pointer.
+    let entry_ptr = match resolve_entry(id) {
+        Some(p) => p as *mut ASpaceEntry,
+        None => return,
+    };
 
-    // Step 2: Lock entry and clean up. No new lookups can find this entry
-    // (removed from ART). Any existing holder must release before we proceed.
+    // Step 2: Lock entry and clean up.
     let mut guard = unsafe { (*entry_ptr).inner.lock() };
 
     // Destroy backing objects for all VMAs.
@@ -356,10 +354,20 @@ pub fn destroy(id: ASpaceId) {
         }
     }
     guard.vmas.clear();
+    // Mark as dead so concurrent lock_aspace() sees id=0.
+    guard.id = 0;
     drop(guard);
 
-    // Step 3: Free slab.
-    free_entry(entry_ptr);
+    // Step 3: Destroy the port (removes from PORT_ART, wakes waiters).
+    crate::ipc::port::destroy(id);
+
+    // Step 4: Defer-free the slab entry after RCU grace period.
+    crate::sync::rcu::rcu_defer_free(entry_ptr as usize, rcu_free_aspace_callback);
+}
+
+/// RCU callback to free a slab-allocated ASpaceEntry.
+fn rcu_free_aspace_callback(ptr: usize) {
+    free_entry(ptr as *mut ASpaceEntry);
 }
 
 /// Reset an address space for execve: destroy all VMAs and backing objects,
@@ -459,9 +467,9 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         va_start: usize,
         va_len: usize,
         prot: VmaProt,
-        object_id: u32,
+        object_id: u64,
         object_offset: u32,
-        new_obj_id: u32,
+        new_obj_id: u64,
     }
     const ENTRIES_PER_PAGE: usize = super::page::PAGE_SIZE / core::mem::size_of::<CowEntry>();
 
@@ -493,7 +501,7 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         }
     } // parent lock dropped
 
-    // Step 2: Create child entry in ART.
+    // Step 2: Create child entry with port.
     let child_id;
     let child_entry_ptr;
     {
@@ -505,11 +513,22 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
             }
         };
 
-        let mut table = ASPACE_TABLE.lock();
-        child_id = table.next_id;
-        table.next_id += 1;
+        let port_id = match crate::ipc::port::create_kernel_port(
+            aspace_port_handler,
+            child_ptr as usize,
+        ) {
+            Some(p) => p,
+            None => {
+                free_entry(child_ptr);
+                free_page_table_tree(child_pt);
+                return None;
+            }
+        };
+
+        child_id = port_id;
 
         unsafe {
+            (*child_ptr).port_id = port_id;
             (*child_ptr).pager_waiter = AtomicU32::new(0);
             let mut space = AddressSpace::empty();
             space.id = child_id;
@@ -518,13 +537,6 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
             seed_aspace(&mut space);
             space.heap_next = parent_heap;
             core::ptr::write(&mut (*child_ptr).inner, SpinLock::new(space));
-        }
-
-        if !table.art.insert(child_id as u64, child_ptr as usize) {
-            drop(table);
-            free_entry(child_ptr);
-            free_page_table_tree(child_pt);
-            return None;
         }
 
         child_entry_ptr = child_ptr;
@@ -546,11 +558,9 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
                     let e = unsafe { &*cow_buf.add(j) };
                     object::destroy(e.new_obj_id);
                 }
-                // Remove child from ART and free.
-                {
-                    let mut table = ASPACE_TABLE.lock();
-                    table.art.remove(child_id as u64);
-                }
+                // Destroy child port and free entry.
+                crate::ipc::port::destroy(child_id);
+                crate::sync::rcu::synchronize_rcu();
                 free_entry(child_entry_ptr);
                 free_page_table_tree(child_pt);
                 super::phys::free_page(cow_page);

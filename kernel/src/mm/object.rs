@@ -5,14 +5,16 @@
 //! Objects track their physical backing (via PageVec) and the
 //! set of address spaces that map them.
 //!
-//! Each object is identified by a kernel-held port. The object table is
-//! an ART (Adaptive Radix Tree) mapping monotonic ObjectIds to slab-
-//! allocated entries, with no fixed upper limit.
+//! Objects are identified by kernel-held ports. Resolution is lock-free
+//! via `port_kernel_data(port_id) → *const ObjEntry`. Each entry has its
+//! own SpinLock<MemObject> for per-object serialization.
+//!
+//! COW page sharing uses atomic frame refcounts (mm::frame) instead of
+//! O(N) sibling scanning: `inc_ref` on clone, `dec_ref` on release.
 
 use super::page::PhysAddr;
 use super::pagevec::PageVec;
 use super::phys;
-use crate::ipc::art::Art;
 use crate::ipc::port::{self, PortId};
 use crate::mm::slab;
 use crate::sync::SpinLock;
@@ -35,7 +37,7 @@ pub enum ObjectType {
 /// A mapping record: which address space maps this object and where.
 #[derive(Clone, Copy)]
 pub struct Mapping {
-    pub aspace_id: u32,
+    pub aspace_id: u64,
     pub va_start: usize,
     pub active: bool,
 }
@@ -70,6 +72,9 @@ pub struct MemObject {
     pub file_handle: u32,
     /// For Pager objects: byte offset of this object's start within the file.
     pub file_base_offset: u64,
+    /// For Pager objects: user-facing IPC port for fault notifications.
+    /// 0 for anonymous objects.
+    pub pager_port: u64,
 }
 
 impl MemObject {
@@ -84,6 +89,7 @@ impl MemObject {
             mappings_count: 0,
             file_handle: 0,
             file_base_offset: 0,
+            pager_port: 0,
         }
     }
 
@@ -143,7 +149,7 @@ impl MemObject {
     }
 
     /// Add a mapping record.
-    pub fn add_mapping(&mut self, aspace_id: u32, va_start: usize) -> bool {
+    pub fn add_mapping(&mut self, aspace_id: u64, va_start: usize) -> bool {
         if !self.ensure_mappings() {
             return false;
         }
@@ -166,7 +172,7 @@ impl MemObject {
             self.mappings_count += 1;
             true
         } else {
-            false // page full (4096 mappings)
+            false // page full
         }
     }
 
@@ -182,7 +188,7 @@ impl MemObject {
     }
 
     /// Remove a mapping record.
-    pub fn remove_mapping(&mut self, aspace_id: u32, va_start: usize) {
+    pub fn remove_mapping(&mut self, aspace_id: u64, va_start: usize) {
         for i in 0..self.mappings_count as usize {
             let m = unsafe { &mut *self.mappings.add(i) };
             if m.active && m.aspace_id == aspace_id && m.va_start == va_start {
@@ -193,8 +199,7 @@ impl MemObject {
     }
 
     /// Iterate over all active mappings, calling `f(aspace_id, va_start)` for each.
-    /// Useful for reverse-mapping walks (PTE shootdown, page invalidation).
-    pub fn for_each_mapping<F: FnMut(u32, usize)>(&self, mut f: F) {
+    pub fn for_each_mapping<F: FnMut(u64, usize)>(&self, mut f: F) {
         for i in 0..self.mappings_count as usize {
             let m = unsafe { &*self.mappings.add(i) };
             if m.active {
@@ -204,45 +209,20 @@ impl MemObject {
     }
 }
 
-/// Object ID type (opaque handle, monotonically increasing).
-pub type ObjectId = u32;
+/// Object ID type — a port_id (u64) that identifies the object's kernel port.
+pub type ObjectId = u64;
 
 // ---------------------------------------------------------------------------
-// ART-backed object table
+// Port-referenced object entries
 // ---------------------------------------------------------------------------
 
-/// A slab-allocated entry in the object table.
-#[repr(C)]
+/// A slab-allocated entry, resolved lock-free via port_kernel_data.
 struct ObjEntry {
+    /// Kernel-held port for this object (used for resolution via PORT_ART).
     port_id: u64,
-    obj: MemObject,
+    /// Per-object lock protecting the MemObject.
+    inner: SpinLock<MemObject>,
 }
-
-struct ObjTable {
-    art: Art,
-    next_id: u32,
-}
-
-impl ObjTable {
-    const fn new() -> Self {
-        Self {
-            art: Art::new(),
-            next_id: 0,
-        }
-    }
-
-    fn get(&self, id: ObjectId) -> Option<&ObjEntry> {
-        let val = self.art.lookup(id as u64)?;
-        Some(unsafe { &*(val as *const ObjEntry) })
-    }
-
-    fn get_mut(&mut self, id: ObjectId) -> Option<&mut ObjEntry> {
-        let val = self.art.lookup(id as u64)?;
-        Some(unsafe { &mut *(val as *mut ObjEntry) })
-    }
-}
-
-static OBJ_TABLE: SpinLock<ObjTable> = SpinLock::new(ObjTable::new());
 
 /// Allocate a new ObjEntry from slab.
 fn alloc_entry() -> Option<*mut ObjEntry> {
@@ -259,16 +239,24 @@ fn free_entry(ptr: *mut ObjEntry) {
     slab::free(PhysAddr::new(ptr as usize), OBJ_SLAB_SIZE);
 }
 
+/// Resolve an ObjectId (port_id) to the ObjEntry pointer. Lock-free via RCU.
+#[inline]
+fn resolve_entry(id: ObjectId) -> Option<*const ObjEntry> {
+    let user_data = port::port_kernel_data(id)?;
+    Some(user_data as *const ObjEntry)
+}
+
 /// Next COW group ID counter.
 static NEXT_COW_GROUP: SpinLock<u16> = SpinLock::new(1);
 
-/// Kernel port handler for memory objects. `user_data` is the ObjectId.
-fn object_port_handler(_port_id: PortId, user_data: usize, msg: &crate::ipc::Message) -> crate::ipc::Message {
-    // Minimal handler. Phase 4 will add the full message-based API for
-    // external pagers. Currently, the primary access path is with_object().
-    let _id = user_data as ObjectId;
-    let _ = msg;
+/// Kernel port handler for memory objects (stub).
+fn object_port_handler(_port_id: PortId, _user_data: usize, _msg: &crate::ipc::Message) -> crate::ipc::Message {
     crate::ipc::Message::empty()
+}
+
+/// RCU callback to free a slab-allocated ObjEntry.
+fn rcu_free_obj_callback(ptr: usize) {
+    free_entry(ptr as *mut ObjEntry);
 }
 
 // ---------------------------------------------------------------------------
@@ -276,269 +264,229 @@ fn object_port_handler(_port_id: PortId, user_data: usize, msg: &crate::ipc::Mes
 // ---------------------------------------------------------------------------
 
 /// Create a new pager-backed memory object.
-/// Returns the object ID. The object gets a normal (non-kernel-held) port
-/// so that an external pager can hold the receive right and get fault
-/// notifications via IPC.
+/// Returns the object ID (kernel port_id). The pager thread communicates
+/// via a separate user-facing port stored in MemObject.pager_port.
 pub fn create_pager(page_count: u16, file_handle: u32, file_base_offset: u64) -> Option<ObjectId> {
     let pages = PageVec::with_capacity(page_count as usize)?;
-    // Normal port (not kernel-held) — pager task holds RECV right.
-    let port = port::create()?;
+    // User-facing port for external pager IPC.
+    let pager_port = port::create()?;
 
     let ptr = alloc_entry()?;
 
-    let mut table = OBJ_TABLE.lock();
-    let id = table.next_id;
-    table.next_id += 1;
-
-    unsafe {
-        (*ptr).port_id = port;
-        (*ptr).obj.obj_type = ObjectType::Pager;
-        (*ptr).obj.page_count = page_count;
-        (*ptr).obj.pages = pages;
-        (*ptr).obj.file_handle = file_handle;
-        (*ptr).obj.file_base_offset = file_base_offset;
-    }
-
-    if !table.art.insert(id as u64, ptr as usize) {
-        drop(table);
-        free_entry(ptr);
-        port::destroy(port);
-        return None;
-    }
-
-    Some(id)
-}
-
-/// Create a new anonymous memory object of `page_count` allocation pages.
-/// Returns the object ID.
-pub fn create_anon(page_count: u16) -> Option<ObjectId> {
-    let pages = PageVec::with_capacity(page_count as usize)?;
-
-    let mut table = OBJ_TABLE.lock();
-    let id = table.next_id;
-    table.next_id += 1;
-
-    let port = match port::create_kernel_port(object_port_handler, id as usize) {
-        Some(p) => p,
-        None => return None,
-    };
-
-    let ptr = match alloc_entry() {
+    // Kernel-held port for resolution: user_data = entry pointer.
+    let kernel_port = match port::create_kernel_port(object_port_handler, ptr as usize) {
         Some(p) => p,
         None => {
-            port::destroy(port);
+            free_entry(ptr);
+            port::destroy(pager_port);
             return None;
         }
     };
 
     unsafe {
-        (*ptr).port_id = port;
-        (*ptr).obj.obj_type = ObjectType::Anonymous;
-        (*ptr).obj.page_count = page_count;
-        (*ptr).obj.pages = pages;
+        (*ptr).port_id = kernel_port;
+        let mut obj = MemObject::empty();
+        obj.obj_type = ObjectType::Pager;
+        obj.page_count = page_count;
+        obj.pages = pages;
+        obj.file_handle = file_handle;
+        obj.file_base_offset = file_base_offset;
+        obj.pager_port = pager_port;
+        core::ptr::write(&mut (*ptr).inner, SpinLock::new(obj));
     }
 
-    if !table.art.insert(id as u64, ptr as usize) {
-        free_entry(ptr);
-        port::destroy(port);
-        return None;
+    Some(kernel_port)
+}
+
+/// Create a new anonymous memory object of `page_count` allocation pages.
+/// Returns the object ID (kernel port_id).
+pub fn create_anon(page_count: u16) -> Option<ObjectId> {
+    let pages = PageVec::with_capacity(page_count as usize)?;
+
+    let ptr = alloc_entry()?;
+
+    let kernel_port = match port::create_kernel_port(object_port_handler, ptr as usize) {
+        Some(p) => p,
+        None => {
+            free_entry(ptr);
+            return None;
+        }
+    };
+
+    unsafe {
+        (*ptr).port_id = kernel_port;
+        let mut obj = MemObject::empty();
+        obj.obj_type = ObjectType::Anonymous;
+        obj.page_count = page_count;
+        obj.pages = pages;
+        core::ptr::write(&mut (*ptr).inner, SpinLock::new(obj));
     }
 
-    Some(id)
+    Some(kernel_port)
 }
 
 /// Clone a memory object for COW. Creates a new object that shares all
-/// physical pages with the original. Both objects are placed in the same
-/// COW sharing group so that page ownership can be determined by scanning
-/// siblings rather than maintaining per-PFN refcounts.
+/// physical pages with the original. Uses frame refcounts for page sharing.
 pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
-    let mut table = OBJ_TABLE.lock();
+    let src_entry = resolve_entry(src_id)? as *mut ObjEntry;
 
-    // Step 1: read source state, assign COW group, copy pages.
+    // Step 1: lock source, read state, copy pages, bump refcounts.
     let (page_count, group, new_pages) = {
-        let src = table.get_mut(src_id)?;
-        if src.obj.cow_group == 0 {
+        let mut src = unsafe { (*src_entry).inner.lock() };
+        if src.cow_group == 0 {
             let mut g = NEXT_COW_GROUP.lock();
-            src.obj.cow_group = *g;
+            src.cow_group = *g;
             *g = g.wrapping_add(1);
             if *g == 0 { *g = 1; }
         }
-        let group = src.obj.cow_group;
-        let page_count = src.obj.page_count;
+        let group = src.cow_group;
+        let page_count = src.page_count;
         let mut new_pages = PageVec::with_capacity(page_count as usize)?;
-        new_pages.copy_from(&src.obj.pages, page_count as usize);
+        new_pages.copy_from(&src.pages, page_count as usize);
+
+        // Increment frame refcounts for all shared pages.
+        for i in 0..page_count as usize {
+            let pa = src.pages.get(i);
+            if pa != 0 {
+                let cur = super::frame::get_ref(PhysAddr::new(pa));
+                if cur == 0 {
+                    // First COW: parent owns it (1) + new clone (1) = 2
+                    super::frame::set_ref(PhysAddr::new(pa), 2);
+                } else {
+                    super::frame::inc_ref(PhysAddr::new(pa));
+                }
+            }
+        }
         (page_count, group, new_pages)
     };
 
     // Step 2: allocate entry + kernel port.
-    let id = table.next_id;
-    table.next_id += 1;
-
-    let port = port::create_kernel_port(object_port_handler, id as usize)?;
-    let ptr = match alloc_entry() {
+    let ptr = alloc_entry()?;
+    let kernel_port = match port::create_kernel_port(object_port_handler, ptr as usize) {
         Some(p) => p,
-        None => { port::destroy(port); return None; }
+        None => {
+            free_entry(ptr);
+            return None;
+        }
     };
 
     // Step 3: initialize destination.
     unsafe {
-        (*ptr).port_id = port;
-        (*ptr).obj.obj_type = ObjectType::Anonymous;
-        (*ptr).obj.page_count = page_count;
-        (*ptr).obj.cow_group = group;
-        (*ptr).obj.pages = new_pages;
+        (*ptr).port_id = kernel_port;
+        let mut obj = MemObject::empty();
+        obj.obj_type = ObjectType::Anonymous;
+        obj.page_count = page_count;
+        obj.cow_group = group;
+        obj.pages = new_pages;
+        core::ptr::write(&mut (*ptr).inner, SpinLock::new(obj));
     }
 
-    if !table.art.insert(id as u64, ptr as usize) {
-        free_entry(ptr);
-        port::destroy(port);
-        return None;
-    }
-
-    Some(id)
+    Some(kernel_port)
 }
 
-/// Destroy a memory object, freeing physical pages not shared with siblings.
+/// Destroy a memory object, freeing physical pages via frame refcounts.
 pub fn destroy(id: ObjectId) {
-    let mut table = OBJ_TABLE.lock();
-
-    let entry = match table.get(id) {
-        Some(e) => e as *const ObjEntry as *mut ObjEntry,
+    let entry_ptr = match resolve_entry(id) {
+        Some(p) => p as *mut ObjEntry,
         None => return,
     };
 
-    let (group, page_count, port_id) = unsafe {
-        ((*entry).obj.cow_group, (*entry).obj.page_count as usize, (*entry).port_id)
-    };
+    let mut guard = unsafe { (*entry_ptr).inner.lock() };
+    if guard.obj_type == ObjectType::Free {
+        return;
+    }
 
-    // Free each page, checking siblings in the same COW group.
+    let page_count = guard.page_count as usize;
+    let pager_port = guard.pager_port;
+
+    // Free each page using frame refcounts.
     for p in 0..page_count {
-        let pa = unsafe { (*entry).obj.pages.get(p) };
+        let pa = guard.pages.get(p);
         if pa == 0 { continue; }
+        guard.pages.set(p, 0);
 
-        let shared = group != 0 && {
-            let mut found = false;
-            table.art.for_each(|key, val| {
-                if found { return; }
-                if key == id as u64 { return; }
-                let sib = unsafe { &*(val as *const ObjEntry) };
-                if sib.obj.obj_type != ObjectType::Free
-                    && sib.obj.cow_group == group
-                    && sib.obj.pages.contains(sib.obj.page_count as usize, pa)
-                {
-                    found = true;
-                }
-            });
-            found
-        };
-        if !shared {
+        let remaining = super::frame::dec_ref(PhysAddr::new(pa));
+        if remaining == 0 {
             phys::free_page(PhysAddr::new(pa));
         }
-        unsafe { (*entry).obj.pages.set(p, 0); }
     }
 
-    // Free PageVec heap.
-    unsafe {
-        (*entry).obj.pages.free_heap();
-        (*entry).obj.obj_type = ObjectType::Free;
-        (*entry).obj.page_count = 0;
-        (*entry).obj.cow_group = 0;
+    // Free PageVec heap and mappings page.
+    guard.pages.free_heap();
+    if !guard.mappings.is_null() {
+        phys::free_page(PhysAddr::new(guard.mappings as usize));
+        guard.mappings = core::ptr::null_mut();
     }
+    guard.obj_type = ObjectType::Free;
+    guard.page_count = 0;
+    guard.cow_group = 0;
+    drop(guard);
 
-    // Remove from ART and free slab.
-    table.art.remove(id as u64);
-    free_entry(entry);
-    drop(table);
-
-    if port_id != 0 {
-        port::destroy(port_id);
+    // Destroy ports and defer-free the entry.
+    port::destroy(id);
+    if pager_port != 0 {
+        port::destroy(pager_port);
     }
+    crate::sync::rcu::rcu_defer_free(entry_ptr as usize, rcu_free_obj_callback);
 }
 
-/// Access an object by ID within a closure.
-/// All callers are serialized by the global object table lock.
+/// Access an object by ID within a closure, under per-object lock.
 pub fn with_object<F, R>(id: ObjectId, f: F) -> R
 where
     F: FnOnce(&mut MemObject) -> R,
 {
-    let mut table = OBJ_TABLE.lock();
-    let entry = table.get_mut(id).expect("with_object: invalid ObjectId");
-    f(&mut entry.obj)
+    let entry_ptr = resolve_entry(id).expect("with_object: invalid ObjectId");
+    let mut guard = unsafe { (*entry_ptr).inner.lock() };
+    f(&mut *guard)
 }
 
-/// Get the port ID for an object.
+/// Get the user-facing port ID for an object (pager port for Pager objects,
+/// kernel port for anonymous objects).
 pub fn object_port(id: ObjectId) -> PortId {
-    let table = OBJ_TABLE.lock();
-    match table.get(id) {
-        Some(e) => e.port_id,
+    match resolve_entry(id) {
+        Some(entry_ptr) => {
+            let guard = unsafe { (*entry_ptr).inner.lock() };
+            if guard.pager_port != 0 {
+                guard.pager_port
+            } else {
+                unsafe { (*entry_ptr).port_id }
+            }
+        }
         None => 0,
     }
 }
 
 /// Check whether a physical page at `page_idx` in object `obj_id` is shared
-/// with any sibling in the same COW group.
+/// with any other object via frame refcounts.
 pub fn is_page_shared(obj_id: ObjectId, page_idx: usize) -> bool {
-    let table = OBJ_TABLE.lock();
-    let entry = match table.get(obj_id) {
-        Some(e) => e,
+    let entry_ptr = match resolve_entry(obj_id) {
+        Some(p) => p,
         None => return false,
     };
-    let group = entry.obj.cow_group;
-    let pa = entry.obj.pages.get(page_idx);
-    if group == 0 || pa == 0 {
-        return false;
-    }
-
-    let mut shared = false;
-    table.art.for_each(|key, val| {
-        if shared { return; }
-        if key == obj_id as u64 { return; }
-        let sib = unsafe { &*(val as *const ObjEntry) };
-        if sib.obj.obj_type != ObjectType::Free
-            && sib.obj.cow_group == group
-            && sib.obj.pages.contains(sib.obj.page_count as usize, pa)
-        {
-            shared = true;
-        }
-    });
-    shared
+    let guard = unsafe { (*entry_ptr).inner.lock() };
+    let pa = guard.pages.get(page_idx);
+    if pa == 0 { return false; }
+    super::frame::get_ref(PhysAddr::new(pa)) > 1
 }
 
 /// Release a physical page from object `obj_id` at `page_idx`.
-/// If no sibling in the COW group references the same PA, frees the page.
+/// If no other object references the same PA (via frame refcounts), frees the page.
 /// Returns true if the physical page was freed, false if still shared.
 /// Clears the page entry in either case.
 pub fn release_page(obj_id: ObjectId, page_idx: usize) -> bool {
-    let mut table = OBJ_TABLE.lock();
-    let entry = match table.get_mut(obj_id) {
-        Some(e) => e as *mut ObjEntry,
+    let entry_ptr = match resolve_entry(obj_id) {
+        Some(p) => p as *mut ObjEntry,
         None => return false,
     };
 
-    let (group, pa) = unsafe {
-        let pa = (*entry).obj.pages.get(page_idx);
-        if pa == 0 { return false; }
-        (*entry).obj.pages.set(page_idx, 0);
-        ((*entry).obj.cow_group, pa)
-    };
+    let mut guard = unsafe { (*entry_ptr).inner.lock() };
+    let pa = guard.pages.get(page_idx);
+    if pa == 0 { return false; }
+    guard.pages.set(page_idx, 0);
+    drop(guard);
 
-    let shared = group != 0 && {
-        let mut found = false;
-        table.art.for_each(|key, val| {
-            if found { return; }
-            if key == obj_id as u64 { return; }
-            let sib = unsafe { &*(val as *const ObjEntry) };
-            if sib.obj.obj_type != ObjectType::Free
-                && sib.obj.cow_group == group
-                && sib.obj.pages.contains(sib.obj.page_count as usize, pa)
-            {
-                found = true;
-            }
-        });
-        found
-    };
-
-    if !shared {
+    let remaining = super::frame::dec_ref(PhysAddr::new(pa));
+    if remaining == 0 {
         phys::free_page(PhysAddr::new(pa));
         true
     } else {

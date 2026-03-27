@@ -466,6 +466,14 @@ pub fn port_is_active(port_id: PortId) -> bool {
     port_ref(port_id).is_some()
 }
 
+/// Check if a port is still alive, by local index (for CapSet eviction).
+pub fn port_is_active_local(local: u64) -> bool {
+    match PORT_ART.lookup(local) {
+        Some(p) => p.is_alive(),
+        None => false,
+    }
+}
+
 /// Check if a port has a kernel receive handler.
 #[allow(dead_code)]
 pub fn has_kernel_handler(port_id: PortId) -> bool {

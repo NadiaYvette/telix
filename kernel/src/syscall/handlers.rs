@@ -413,7 +413,7 @@ pub(crate) fn deliver_to_parked_receiver(receiver_tid: u32, msg: &crate::ipc::Me
 
 /// Check if the current task has a port capability with the needed rights.
 /// Uses lockless bitmap for SEND/RECV checks (fast path).
-/// Falls back to CAP_SYSTEM lock for MANAGE checks.
+/// Falls back to per-task cap_lock + CDT_LOCK for MANAGE checks.
 /// Task 0 (kernel) bypasses all checks.
 #[inline]
 fn check_port_cap(port_id: u64, needed: crate::cap::Rights) -> bool {
@@ -468,9 +468,8 @@ fn auto_grant_reply_caps(task_id: u32, msg: &crate::ipc::Message) {
         }
     }
     if count == 0 { return; }
-    let mut caps = crate::cap::CAP_SYSTEM.lock();
     for i in 0..count {
-        caps.grant_send_cap(task_id, candidates[i]);
+        crate::cap::grant_send_cap(task_id, candidates[i]);
     }
 }
 
@@ -483,8 +482,7 @@ fn auto_grant_sender_identity(receiver_task: u32, sender_port: u64) {
     if crate::cap::has_port_cap_fast(receiver_task, sender_port, crate::cap::Rights::SEND) {
         return;
     }
-    let mut caps = crate::cap::CAP_SYSTEM.lock();
-    caps.grant_send_cap(receiver_task, sender_port);
+    crate::cap::grant_send_cap(receiver_task, sender_port);
 }
 
 fn sys_debug_putchar(ch: u64) -> u64 {
@@ -505,8 +503,7 @@ fn sys_port_create() -> u64 {
         Some(id) => {
             // Grant full port cap (SEND|RECV|MANAGE) to creator.
             if task_id != 0 {
-                let mut caps = crate::cap::CAP_SYSTEM.lock();
-                caps.grant_full_port_cap(task_id, id);
+                crate::cap::grant_full_port_cap(task_id, id);
             }
             // Increment port quota counter.
             if task_id != 0 {
@@ -526,9 +523,7 @@ fn sys_port_destroy(port_id: u64) -> u64 {
     // Remove port caps from caller's CSpace.
     let task_id = crate::sched::current_task_id();
     if task_id != 0 {
-        let mut caps = crate::cap::CAP_SYSTEM.lock();
-        caps.remove_port_caps(task_id, port_id);
-        drop(caps);
+        crate::cap::remove_port_caps(task_id, port_id);
         // Decrement port quota counter.
         let task = unsafe { crate::sched::scheduler::task_mut_from_ref(task_id) };
         if task.cur_ports > 0 {
@@ -627,8 +622,7 @@ fn sys_send_to_proxy(target_port: u64, tag: u64, data: [u64; 6], blocking: bool)
     // Auto-grant SEND cap on proxy port for transparency.
     let task_id = crate::sched::current_task_id();
     if task_id != 0 && !crate::cap::has_port_cap_fast(task_id, proxy_local, crate::cap::Rights::SEND) {
-        let mut caps = crate::cap::CAP_SYSTEM.lock();
-        caps.grant_send_cap(task_id, proxy_local);
+        crate::cap::grant_send_cap(task_id, proxy_local);
     }
     // Pack: tag = PROXY_MARKER, data[0] = target_port (full 64-bit),
     // data[1] = original_tag, data[2..4] = original_data[0..2].
@@ -1921,12 +1915,9 @@ fn sys_send_cap(dest_port: u64, tag: u64, d0: u64, d1: u64, grant_port: u64, gra
     };
 
     // Grant the cap to receiver.
-    let receiver_slot = {
-        let mut caps = crate::cap::CAP_SYSTEM.lock();
-        match caps.grant_port_cap(receiver_task, grant_port_id, rights) {
-            Some(slot) => slot as u64,
-            None => return u64::MAX, // CSpace full.
-        }
+    let receiver_slot = match crate::cap::grant_port_cap(receiver_task, grant_port_id, rights) {
+        Some(slot) => slot as u64,
+        None => return u64::MAX, // CSpace full.
     };
 
     // Build and send the message.
@@ -1964,7 +1955,7 @@ fn sys_cap_revoke(port_id: u64) -> u64 {
     let ptr = crate::sched::scheduler::TASK_TABLE.get(task_id)
         as *mut crate::sched::task::Task;
     if ptr.is_null() { return u64::MAX; }
-    let space = unsafe { &mut (*ptr).capspace };
+    let space = unsafe { &(*ptr).capspace };
     // Find the slot containing a cap for this port.
     let slot = match space.find_port_cap(
         port_id as usize,
@@ -1973,8 +1964,7 @@ fn sys_cap_revoke(port_id: u64) -> u64 {
         Some(s) => s,
         None => return u64::MAX,
     };
-    let mut caps = crate::cap::CAP_SYSTEM.lock();
-    let count = space.revoke(slot, &mut caps.cdt);
+    let count = crate::cap::revoke_slot(task_id, slot);
     count as u64
 }
 
@@ -2315,12 +2305,11 @@ fn sys_mmap_file(va_hint: u64, page_count: u64, prot: u64, file_handle: u64, fil
         let task_id = crate::sched::current_task_id();
         let rights = crate::cap::Rights::SEND.union(crate::cap::Rights::RECV);
         // Grant to calling task (same-process pagers).
-        let mut caps = crate::cap::CAP_SYSTEM.lock();
-        caps.grant_port_cap(task_id, obj_port, rights);
+        crate::cap::grant_port_cap(task_id, obj_port, rights);
         // Grant to specified external pager task if different.
         let pager = pager_task as u32;
         if pager != 0 && pager != task_id {
-            caps.grant_port_cap(pager, obj_port, rights);
+            crate::cap::grant_port_cap(pager, obj_port, rights);
         }
     }
 

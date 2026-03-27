@@ -53,7 +53,7 @@ pub struct ExtentEntry {
     /// Reference count for this extent.
     pub refcount: u16,
     /// Owning memory object ID (0 = none).
-    pub object_id: u32,
+    pub object_id: u64,
     /// Offset within the memory object (in PAGE_SIZE units).
     pub object_offset: u32,
 }
@@ -86,8 +86,8 @@ impl ExtentEntry {
 /// pointers, plus a small header, this fits comfortably in a 512-byte slab
 /// object.
 const ORDER: usize = 24;
-/// Maximum entries in a leaf node (each ExtentEntry is 24 bytes).
-const LEAF_CAP: usize = 17;
+/// Maximum entries in a leaf node (each ExtentEntry is 32 bytes).
+const LEAF_CAP: usize = 15;
 
 /// Node tag stored in the first byte of every node.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -842,7 +842,7 @@ fn test_range_query() {
             page_count: 2,
             flags: ExtentFlags::ANON,
             refcount: 1,
-            object_id: i + 1,
+            object_id: (i + 1) as u64,
             object_offset: 0,
         });
     }
@@ -882,7 +882,7 @@ fn test_many_inserts() {
             page_count: 1,
             flags: ExtentFlags::ANON,
             refcount: 1,
-            object_id: (i + 1) as u32,
+            object_id: (i + 1) as u64,
             object_offset: 0,
         });
     }
@@ -893,7 +893,7 @@ fn test_many_inserts() {
         let addr = PhysAddr::new(0x100_0000 + i * ps);
         let found = tree.lookup(addr);
         assert!(found.is_some(), "Missing extent at index {}", i);
-        assert_eq!(found.unwrap().object_id, (i + 1) as u32);
+        assert_eq!(found.unwrap().object_id, (i + 1) as u64);
     }
 
     // Remove all.

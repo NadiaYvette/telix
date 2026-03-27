@@ -330,7 +330,7 @@ fn try_contiguous_promotion(pt_root: usize, vma: &super::vma::Vma, mmu_idx: usiz
 fn try_superpage_promotion(
     pt_root: usize,
     vma: &mut super::vma::Vma,
-    obj_id: u32,
+    obj_id: u64,
     mmu_idx: usize,
 ) {
     let mmu_count = vma.mmu_page_count();
@@ -447,7 +447,7 @@ fn try_superpage_promotion(
 pub fn try_superpage_promotion_eager(
     pt_root: usize,
     vma: &mut super::vma::Vma,
-    obj_id: u32,
+    obj_id: u64,
 ) {
     let mmu_count = vma.mmu_page_count();
     if mmu_count < SUPER_MMU_PAGES {
@@ -569,7 +569,7 @@ pub fn demote_superpage(pt_root: usize, va: usize, flags: u64) -> bool {
 fn handle_cow_fault(
     pt_root: usize,
     vma: &mut super::vma::Vma,
-    obj_id: u32,
+    obj_id: u64,
     obj_page_idx: usize,
     mmu_idx: usize,
     fault_addr: usize,

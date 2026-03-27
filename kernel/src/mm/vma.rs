@@ -35,8 +35,8 @@ pub struct Vma {
     pub va_len: usize,
     /// Protection.
     pub prot: VmaProt,
-    /// Backing memory object ID.
-    pub object_id: u32,
+    /// Backing memory object ID (port ID).
+    pub object_id: u64,
     /// Offset into the memory object (in MMUPAGE_SIZE units).
     pub object_offset: u32,
     /// Whether this VMA slot is in use.

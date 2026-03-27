@@ -119,8 +119,7 @@ pub fn namesrv_server() -> ! {
                 // Grant SEND cap for the looked-up service port to the client task.
                 if port_id != u64::MAX {
                     if let Some(client_task) = port::port_creator(reply_port) {
-                        let mut caps = crate::cap::CAP_SYSTEM.lock();
-                        caps.grant_send_cap(client_task, port_id);
+                        crate::cap::grant_send_cap(client_task, port_id);
                     }
                 }
 

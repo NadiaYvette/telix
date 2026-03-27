@@ -8,6 +8,11 @@
 //! This is a simple single-page-per-slab design: each page is one slab.
 //! The slab page directory is itself page-allocated on first use, giving
 //! PAGE_SIZE / size_of::<usize>() directory slots — no fixed capacity constant.
+//!
+//! A per-CPU magazine layer sits above the global caches to reduce lock
+//! contention. Each CPU has a pair of magazines (loaded + backup) per size
+//! class. The fast path (alloc/free) operates with IRQs disabled and no
+//! lock. The global lock is only touched every ~MAG_CAPACITY operations.
 
 use super::page::{PhysAddr, PAGE_SIZE};
 use super::phys;
@@ -207,6 +212,81 @@ impl SlabCache {
     }
 }
 
+// --- Per-CPU magazine layer ---
+
+use crate::sched::smp::MAX_CPUS;
+
+/// Magazine capacity. Reduced for very high CPU counts to limit .bss usage.
+#[cfg(any(feature = "max_cpus_1024", feature = "max_cpus_4096"))]
+const MAG_CAPACITY: usize = 16;
+#[cfg(not(any(feature = "max_cpus_1024", feature = "max_cpus_4096")))]
+const MAG_CAPACITY: usize = 32;
+
+const NUM_CACHES: usize = 5;
+
+/// A fixed-size stack of object physical addresses.
+#[repr(C)]
+struct Magazine {
+    count: u16,
+    objs: [usize; MAG_CAPACITY],
+}
+
+impl Magazine {
+    const fn empty() -> Self {
+        Self {
+            count: 0,
+            objs: [0; MAG_CAPACITY],
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, addr: usize) {
+        self.objs[self.count as usize] = addr;
+        self.count += 1;
+    }
+
+    #[inline]
+    fn pop(&mut self) -> usize {
+        self.count -= 1;
+        self.objs[self.count as usize]
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    #[inline]
+    fn is_full(&self) -> bool {
+        self.count as usize >= MAG_CAPACITY
+    }
+}
+
+/// A pair of magazines: loaded (primary) and backup (secondary).
+#[repr(C)]
+struct MagazinePair {
+    loaded: Magazine,
+    backup: Magazine,
+}
+
+impl MagazinePair {
+    const fn empty() -> Self {
+        Self {
+            loaded: Magazine::empty(),
+            backup: Magazine::empty(),
+        }
+    }
+}
+
+/// Per-CPU, per-cache magazine pairs.
+/// Indexed as CPU_MAGAZINES[cpu][cache_index].
+/// Safety: accessed only with IRQs disabled from the owning CPU.
+static mut CPU_MAGAZINES: [[MagazinePair; NUM_CACHES]; MAX_CPUS] = {
+    const PAIR: MagazinePair = MagazinePair::empty();
+    const ROW: [MagazinePair; NUM_CACHES] = [PAIR; NUM_CACHES];
+    [ROW; MAX_CPUS]
+};
+
 // --- Global slab caches for common kernel object sizes ---
 
 use crate::sync::SpinLock;
@@ -217,32 +297,165 @@ static CACHE_256: SpinLock<SlabCache> = SpinLock::new(SlabCache::new(256, 64));
 static CACHE_512: SpinLock<SlabCache> = SpinLock::new(SlabCache::new(512, 64));
 static CACHE_2048: SpinLock<SlabCache> = SpinLock::new(SlabCache::new(2048, 64));
 
-fn cache_for_size(size: usize) -> Option<&'static SpinLock<SlabCache>> {
+/// Map size → cache index (0..4).
+#[inline]
+fn cache_index(size: usize) -> Option<usize> {
     if size <= 64 {
-        Some(&CACHE_64)
+        Some(0)
     } else if size <= 128 {
-        Some(&CACHE_128)
+        Some(1)
     } else if size <= 256 {
-        Some(&CACHE_256)
+        Some(2)
     } else if size <= 512 {
-        Some(&CACHE_512)
+        Some(3)
     } else if size <= 2048 {
-        Some(&CACHE_2048)
+        Some(4)
     } else {
         None
     }
 }
 
+/// Map cache index → global SpinLock<SlabCache>.
+#[inline]
+fn cache_by_index(idx: usize) -> &'static SpinLock<SlabCache> {
+    match idx {
+        0 => &CACHE_64,
+        1 => &CACHE_128,
+        2 => &CACHE_256,
+        3 => &CACHE_512,
+        4 => &CACHE_2048,
+        _ => unreachable!(),
+    }
+}
+
+fn cache_for_size(size: usize) -> Option<&'static SpinLock<SlabCache>> {
+    cache_index(size).map(cache_by_index)
+}
+
 /// Allocate an object of `size` bytes from the appropriate slab cache.
+/// Uses per-CPU magazine fast path when possible.
 pub fn alloc(size: usize) -> Option<PhysAddr> {
-    let cache = cache_for_size(size)?;
-    cache.lock().alloc()
+    let idx = match cache_index(size) {
+        Some(i) => i,
+        None => return None,
+    };
+
+    // Disable IRQs for per-CPU magazine access.
+    let saved = crate::sync::spinlock::arch_disable_irqs();
+    let cpu = crate::sched::smp::cpu_id() as usize;
+
+    let mag = unsafe { &mut CPU_MAGAZINES[cpu][idx] };
+
+    // Fast path 1: pop from loaded magazine.
+    if !mag.loaded.is_empty() {
+        let addr = mag.loaded.pop();
+        crate::sync::spinlock::arch_restore_irqs(saved);
+        return Some(PhysAddr::new(addr));
+    }
+
+    // Fast path 2: swap loaded ↔ backup, then pop.
+    if !mag.backup.is_empty() {
+        core::mem::swap(&mut mag.loaded, &mut mag.backup);
+        let addr = mag.loaded.pop();
+        crate::sync::spinlock::arch_restore_irqs(saved);
+        return Some(PhysAddr::new(addr));
+    }
+
+    // Slow path: refill loaded magazine from global cache under lock.
+    crate::sync::spinlock::arch_restore_irqs(saved);
+
+    let cache = cache_by_index(idx);
+    let mut guard = cache.lock();
+    // Batch-allocate up to MAG_CAPACITY objects.
+    // Re-read cpu_id: we may have migrated while IRQs were enabled.
+    let saved2 = crate::sync::spinlock::arch_disable_irqs();
+    let cpu = crate::sched::smp::cpu_id() as usize;
+    let mag = unsafe { &mut CPU_MAGAZINES[cpu][idx] };
+    while (mag.loaded.count as usize) < MAG_CAPACITY {
+        match guard.alloc() {
+            Some(pa) => mag.loaded.push(pa.as_usize()),
+            None => break,
+        }
+    }
+    drop(guard);
+
+    if !mag.loaded.is_empty() {
+        let addr = mag.loaded.pop();
+        crate::sync::spinlock::arch_restore_irqs(saved2);
+        Some(PhysAddr::new(addr))
+    } else {
+        crate::sync::spinlock::arch_restore_irqs(saved2);
+        None
+    }
 }
 
 /// Free an object of `size` bytes back to the appropriate slab cache.
+/// Uses per-CPU magazine fast path when possible.
 pub fn free(addr: PhysAddr, size: usize) {
-    if let Some(cache) = cache_for_size(size) {
-        cache.lock().free(addr);
+    let idx = match cache_index(size) {
+        Some(i) => i,
+        None => return,
+    };
+
+    let saved = crate::sync::spinlock::arch_disable_irqs();
+    let cpu = crate::sched::smp::cpu_id() as usize;
+    let mag = unsafe { &mut CPU_MAGAZINES[cpu][idx] };
+
+    // Fast path 1: push to loaded magazine.
+    if !mag.loaded.is_full() {
+        mag.loaded.push(addr.as_usize());
+        crate::sync::spinlock::arch_restore_irqs(saved);
+        return;
+    }
+
+    // Fast path 2: swap loaded ↔ backup, then push.
+    if !mag.backup.is_full() {
+        core::mem::swap(&mut mag.loaded, &mut mag.backup);
+        mag.loaded.push(addr.as_usize());
+        crate::sync::spinlock::arch_restore_irqs(saved);
+        return;
+    }
+
+    // Slow path: flush backup to global cache, then swap and push.
+    // Collect backup contents while IRQs disabled, then release IRQs for lock.
+    let mut flush_buf = [0usize; MAG_CAPACITY];
+    let flush_count = mag.backup.count as usize;
+    flush_buf[..flush_count].copy_from_slice(&mag.backup.objs[..flush_count]);
+    mag.backup.count = 0;
+
+    // Swap: loaded (full) becomes backup, backup (now empty) becomes loaded.
+    core::mem::swap(&mut mag.loaded, &mut mag.backup);
+    mag.loaded.push(addr.as_usize());
+    crate::sync::spinlock::arch_restore_irqs(saved);
+
+    // Flush collected objects to global cache under lock.
+    let cache = cache_by_index(idx);
+    let mut guard = cache.lock();
+    for i in 0..flush_count {
+        guard.free(PhysAddr::new(flush_buf[i]));
+    }
+}
+
+/// Drain all magazines for a CPU (call on hotplug offline).
+pub fn drain_cpu(cpu: u32) {
+    let cpu = cpu as usize;
+    if cpu >= MAX_CPUS { return; }
+
+    for idx in 0..NUM_CACHES {
+        let cache = cache_by_index(idx);
+        let mut guard = cache.lock();
+
+        let mag = unsafe { &mut CPU_MAGAZINES[cpu][idx] };
+        // Drain loaded.
+        while !mag.loaded.is_empty() {
+            let addr = mag.loaded.pop();
+            guard.free(PhysAddr::new(addr));
+        }
+        // Drain backup.
+        while !mag.backup.is_empty() {
+            let addr = mag.backup.pop();
+            guard.free(PhysAddr::new(addr));
+        }
     }
 }
 
@@ -252,11 +465,17 @@ pub fn print_stats() {
     let caches: [&SpinLock<SlabCache>; 5] = [&CACHE_64, &CACHE_128, &CACHE_256, &CACHE_512, &CACHE_2048];
 
     crate::println!("  Slab allocator caches:");
-    for (size, cache) in sizes.iter().zip(caches.iter()) {
+    for (i, (size, cache)) in sizes.iter().zip(caches.iter()).enumerate() {
         let c = cache.lock();
+        // Count objects cached in magazines across all CPUs.
+        let mut mag_cached = 0usize;
+        for cpu in 0..MAX_CPUS {
+            let mag = unsafe { &CPU_MAGAZINES[cpu][i] };
+            mag_cached += mag.loaded.count as usize + mag.backup.count as usize;
+        }
         crate::println!(
-            "    {}-byte: {} slabs, {} objects/slab",
-            size, c.slab_count, c.objs_per_slab,
+            "    {}-byte: {} slabs, {} objects/slab, {} in magazines",
+            size, c.slab_count, c.objs_per_slab, mag_cached,
         );
     }
 }
