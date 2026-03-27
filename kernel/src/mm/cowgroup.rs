@@ -60,8 +60,6 @@ impl MemberReservation {
 }
 
 /// A superpage-aligned range within a COW group that has active reservations.
-///
-/// Size: 4 + 1 + 1 + 2(pad) + 4 * 24 = 104 bytes.
 #[derive(Clone, Copy)]
 struct GroupExtent {
     /// Object-page-offset base (superpage-aligned within the object).
@@ -71,6 +69,11 @@ struct GroupExtent {
     page_count: u8,
     /// Number of active reservations.
     reservation_count: u8,
+    /// Bitmask of pages that were allocated at fork time. Bit i set means
+    /// page i was present in the source PageVec when the COW clone happened.
+    /// Pages with this bit clear are post-fork private allocations (or never
+    /// allocated). Used to distinguish shared originals from private pages.
+    shared_mask: u64,
     /// Per-member reservations.
     reservations: [MemberReservation; MAX_RESERVATIONS],
 }
@@ -81,6 +84,7 @@ impl GroupExtent {
             obj_page_base: 0,
             page_count: 0,
             reservation_count: 0,
+            shared_mask: 0,
             reservations: [MemberReservation::empty(); MAX_RESERVATIONS],
         }
     }
@@ -122,13 +126,16 @@ impl GroupExtent {
             if self.reservations[i].obj_id == obj_id {
                 let r = &self.reservations[i];
                 // Free unclaimed pages in the reserved destination region.
+                // Skip if dest_pa is 0 (tracking-only reservation from mark_private).
                 let dest_pa = r.dest_pa;
                 let copied = r.copied;
-                for slot in 0..self.page_count as usize {
-                    if copied & (1u64 << slot) == 0 {
-                        super::phys::free_page(PhysAddr::new(
-                            dest_pa + slot * PAGE_SIZE,
-                        ));
+                if dest_pa != 0 {
+                    for slot in 0..self.page_count as usize {
+                        if copied & (1u64 << slot) == 0 {
+                            super::phys::free_page(PhysAddr::new(
+                                dest_pa + slot * PAGE_SIZE,
+                            ));
+                        }
                     }
                 }
                 // Swap-remove.
@@ -154,6 +161,11 @@ impl GroupExtent {
     /// Count how many members (other than `obj_id`) have NOT COW-broken
     /// page `slot`. These members still reference the original shared PA.
     fn other_sharers(&self, obj_id: u64, slot: usize, total_members: u8) -> u8 {
+        // If this page wasn't shared at fork time, no original PA exists
+        // to share. All pages at this slot are privately owned.
+        if self.shared_mask & (1u64 << slot) == 0 {
+            return 0;
+        }
         // Start with total members minus self.
         let mut sharers = total_members - 1;
         // Subtract members that have COW-broken this page (they no longer
@@ -186,6 +198,10 @@ struct CowGroup {
     member_count: u8,
     /// Number of active extents.
     extent_count: u8,
+    /// True if this group uses per-page frame refcounts for lifetime tracking.
+    /// Set when a cascading fork creates a 3+ member group. Groups created by
+    /// a first fork (2 members) use extent shared_mask + copied bits instead.
+    refcounted: bool,
     /// Page-allocated extent array (null until first reservation).
     extents: *mut GroupExtent,
     /// Capacity of the extent array.
@@ -201,6 +217,7 @@ impl CowGroup {
             members: [0; MAX_MEMBERS],
             member_count: 0,
             extent_count: 0,
+            refcounted: false,
             extents: core::ptr::null_mut(),
             extents_cap: 0,
         }
@@ -290,7 +307,7 @@ impl CowGroup {
     }
 
     /// Create a new extent. Returns the index, or None if full or OOM.
-    fn create_extent(&mut self, obj_page_base: u32, page_count: u8) -> Option<usize> {
+    fn create_extent(&mut self, obj_page_base: u32, page_count: u8, shared_mask: u64) -> Option<usize> {
         if !self.ensure_extents() {
             return None;
         }
@@ -303,6 +320,7 @@ impl CowGroup {
             *ext = GroupExtent::empty();
             ext.obj_page_base = obj_page_base;
             ext.page_count = page_count;
+            ext.shared_mask = shared_mask;
         }
         self.extent_count += 1;
         Some(idx)
@@ -324,6 +342,7 @@ impl CowGroup {
             let ext = unsafe { &*self.extents.add(ei) };
             for ri in 0..ext.reservation_count as usize {
                 let r = &ext.reservations[ri];
+                if r.dest_pa == 0 { continue; } // tracking-only reservation
                 for slot in 0..ext.page_count as usize {
                     if r.copied & (1u64 << slot) == 0 {
                         super::phys::free_page(PhysAddr::new(
@@ -426,18 +445,6 @@ pub fn add_member(group_id: CowGroupId, obj_id: u64) -> bool {
     guard.add_member(obj_id)
 }
 
-/// Query the number of active members in a COW group.
-/// Used for lazy refcount initialization: when a page is first COW-faulted,
-/// the refcount is initialized to the current member count.
-pub fn member_count(group_id: CowGroupId) -> u16 {
-    let entry_ptr = match resolve_entry(group_id) {
-        Some(p) => p,
-        None => return 0,
-    };
-    let guard = unsafe { (*entry_ptr).inner.lock() };
-    guard.member_count as u16
-}
-
 /// Remove a memory object from a COW group.
 /// Frees unclaimed reservation pages for this member.
 ///
@@ -531,7 +538,9 @@ pub fn find_or_create_reservation(
     let ei = match guard.find_extent(obj_page_base) {
         Some(i) => i,
         None => {
-            match guard.create_extent(obj_page_base, page_count) {
+            // Lazily-created extent during COW fault: default shared_mask
+            // to all-ones (conservative — page must have been shared).
+            match guard.create_extent(obj_page_base, page_count, !0u64) {
                 Some(i) => i,
                 None => return None,
             }
@@ -539,38 +548,59 @@ pub fn find_or_create_reservation(
     };
 
     // Find or create this member's reservation within the extent.
-    let ri = match guard.extent(ei).find_reservation(obj_id) {
-        Some(i) => i,
-        None => {
-            // Allocate a superpage-aligned destination for this member.
-            // Drop the lock during the potentially slow allocator path.
-            drop(guard);
+    // A reservation may exist with dest_pa=0 (tracking-only, from mark_private).
+    // In that case, allocate a real destination and upgrade it.
+    let needs_alloc = match guard.extent(ei).find_reservation(obj_id) {
+        Some(i) => guard.extent(ei).reservations[i].dest_pa == 0,
+        None => true,
+    };
 
-            let dest_pa = super::fault::alloc_superpage_aligned()?;
+    let ri = if needs_alloc {
+        // Allocate a superpage-aligned destination for this member.
+        // Drop the lock during the potentially slow allocator path.
+        drop(guard);
 
-            // Re-acquire and re-find (extent index may have shifted).
-            guard = unsafe { (*entry_ptr).inner.lock() };
-            let ei = match guard.find_extent(obj_page_base) {
-                Some(i) => i,
-                None => {
-                    // Extent was removed while unlocked — bail.
-                    super::fault::free_pages_range(dest_pa, SUPERPAGE_ALLOC_PAGES);
-                    return None;
-                }
-            };
+        let dest_pa = super::fault::alloc_superpage_aligned()?;
 
-            // Check if someone else created our reservation.
-            if let Some(i) = guard.extent(ei).find_reservation(obj_id) {
+        // Re-acquire and re-find (extent index may have shifted).
+        guard = unsafe { (*entry_ptr).inner.lock() };
+        let ei = match guard.find_extent(obj_page_base) {
+            Some(i) => i,
+            None => {
+                // Extent was removed while unlocked — bail.
                 super::fault::free_pages_range(dest_pa, SUPERPAGE_ALLOC_PAGES);
-                // Return the slot from the existing reservation.
+                return None;
+            }
+        };
+
+        // Check if someone else created/upgraded our reservation while unlocked.
+        if let Some(i) = guard.extent(ei).find_reservation(obj_id) {
+            if guard.extent(ei).reservations[i].dest_pa != 0 {
+                // Someone else allocated a destination — use theirs.
+                super::fault::free_pages_range(dest_pa, SUPERPAGE_ALLOC_PAGES);
                 let r = &guard.extent(ei).reservations[i];
                 let already_copied = r.copied & (1u64 << slot) != 0;
                 return Some(ReservationSlot {
                     dest_page_pa: r.dest_pa + slot * PAGE_SIZE,
                     already_copied,
                 });
+            } else {
+                // Upgrade tracking-only reservation with real destination.
+                // Slots already marked as "copied" (private allocations) have
+                // no corresponding page in the destination — free those dest slots.
+                let old_copied = guard.extent(ei).reservations[i].copied;
+                guard.extent_mut(ei).reservations[i].dest_pa = dest_pa.as_usize();
+                // Free destination pages for already-copied (private) slots.
+                for s in 0..guard.extent(ei).page_count as usize {
+                    if old_copied & (1u64 << s) != 0 {
+                        super::phys::free_page(PhysAddr::new(
+                            dest_pa.as_usize() + s * PAGE_SIZE,
+                        ));
+                    }
+                }
+                i
             }
-
+        } else {
             match guard.extent_mut(ei).add_reservation(obj_id, dest_pa.as_usize()) {
                 Some(i) => i,
                 None => {
@@ -579,6 +609,8 @@ pub fn find_or_create_reservation(
                 }
             }
         }
+    } else {
+        guard.extent(ei).find_reservation(obj_id).unwrap()
     };
 
     let r = &guard.extent(ei).reservations[ri];
@@ -586,28 +618,6 @@ pub fn find_or_create_reservation(
     let dest_page_pa = r.dest_pa + slot * PAGE_SIZE;
 
     Some(ReservationSlot { dest_page_pa, already_copied })
-}
-
-/// Mark a page slot as COW-copied in a member's reservation.
-pub fn mark_copied(
-    group_id: CowGroupId,
-    obj_id: u64,
-    obj_page_base: u32,
-    slot: usize,
-) {
-    let entry_ptr = match resolve_entry(group_id) {
-        Some(p) => p,
-        None => return,
-    };
-    let mut guard = unsafe { (*entry_ptr).inner.lock() };
-
-    let ei = match guard.find_extent(obj_page_base) {
-        Some(i) => i,
-        None => return,
-    };
-    if let Some(ri) = guard.extent(ei).find_reservation(obj_id) {
-        guard.extent_mut(ei).reservations[ri].copied |= 1u64 << slot;
-    }
 }
 
 /// Check whether a page is still shared from `obj_id`'s perspective.
@@ -733,14 +743,20 @@ pub fn get_reservation_info(
     })
 }
 
-/// Pre-populate extents for all full superpage-aligned ranges in an object.
-/// Called at fork time to eagerly create extent entries so the first COW fault
-/// in each range can skip extent creation and go straight to per-member
-/// reservation allocation.
+/// Pre-populate extents for all full superpage-aligned ranges, with shared_mask
+/// populated from the source object's page presence. Called at fork time.
+///
+/// `is_page_present(page_idx)` returns true if the source object has a physical
+/// page at `page_idx`. These bits become the extent's `shared_mask`, identifying
+/// pages that were shared at fork time vs. post-fork private allocations.
 ///
 /// Only creates extents (metadata), not reservations (physical destinations).
 /// Reservations are still created lazily on first COW fault per member.
-pub fn pre_populate_extents(group_id: CowGroupId, obj_page_count: u16) {
+pub fn pre_populate_extents_with_mask(
+    group_id: CowGroupId,
+    obj_page_count: u16,
+    is_page_present: impl Fn(usize) -> bool,
+) {
     let entry_ptr = match resolve_entry(group_id) {
         Some(p) => p,
         None => return,
@@ -751,10 +767,260 @@ pub fn pre_populate_extents(group_id: CowGroupId, obj_page_count: u16) {
     let mut base = 0;
     while base + SUPERPAGE_ALLOC_PAGES <= total {
         if guard.find_extent(base as u32).is_none() {
-            if guard.create_extent(base as u32, SUPERPAGE_ALLOC_PAGES as u8).is_none() {
+            // Build shared_mask: bit i set if page (base + i) is allocated.
+            let mut mask: u64 = 0;
+            for i in 0..SUPERPAGE_ALLOC_PAGES {
+                if is_page_present(base + i) {
+                    mask |= 1u64 << i;
+                }
+            }
+            if guard.create_extent(base as u32, SUPERPAGE_ALLOC_PAGES as u8, mask).is_none() {
                 break; // OOM or extent capacity — stop pre-populating.
             }
         }
         base += SUPERPAGE_ALLOC_PAGES;
     }
+}
+
+/// Query whether this group uses per-page frame refcounts for lifetime tracking.
+/// Returns true for cascading-fork groups (3+ members), false for first-fork
+/// groups (2 members) that use shared_mask + copied bits instead.
+pub fn is_refcounted(group_id: CowGroupId) -> bool {
+    let entry_ptr = match resolve_entry(group_id) {
+        Some(p) => p,
+        None => return false,
+    };
+    let guard = unsafe { (*entry_ptr).inner.lock() };
+    guard.refcounted
+}
+
+/// Mark a group as refcounted (transitioning from shared_mask-based tracking).
+/// Called when a cascading fork adds a 3rd+ member to an existing group.
+pub fn set_refcounted(group_id: CowGroupId) {
+    let entry_ptr = match resolve_entry(group_id) {
+        Some(p) => p,
+        None => return,
+    };
+    let mut guard = unsafe { (*entry_ptr).inner.lock() };
+    guard.refcounted = true;
+}
+
+/// Mark a page slot as COW-copied and release the original PA if orphaned.
+///
+/// Called after a COW fault copies a shared page. Sets the `copied` bit for
+/// `obj_id` at `slot`, then checks if all members have now COW-broken this
+/// page. If so, the original PA is orphaned (no references remain) and is
+/// freed.
+///
+/// Returns true if `old_pa` was freed (orphaned original).
+pub fn mark_copied_and_release(
+    group_id: CowGroupId,
+    obj_id: u64,
+    obj_page_base: u32,
+    slot: usize,
+    old_pa: super::page::PhysAddr,
+) -> bool {
+    let entry_ptr = match resolve_entry(group_id) {
+        Some(p) => p,
+        None => return false,
+    };
+    let mut guard = unsafe { (*entry_ptr).inner.lock() };
+
+    let ei = match guard.find_extent(obj_page_base) {
+        Some(i) => i,
+        None => return false,
+    };
+
+    // Set copied bit. Create tracking-only reservation if none exists.
+    let ri = match guard.extent(ei).find_reservation(obj_id) {
+        Some(i) => i,
+        None => {
+            match guard.extent_mut(ei).add_reservation(obj_id, 0) {
+                Some(i) => i,
+                None => {
+                    // Can't track — conservatively don't free.
+                    return false;
+                }
+            }
+        }
+    };
+    guard.extent_mut(ei).reservations[ri].copied |= 1u64 << slot;
+
+    // Check if the original PA is now orphaned.
+    let ext = guard.extent(ei);
+    if ext.other_sharers(obj_id, slot, guard.member_count) == 0 {
+        // All other members have also COW-broken this slot.
+        // The original PA is no longer referenced by anyone.
+        drop(guard);
+        super::phys::free_page(old_pa);
+        return true;
+    }
+
+    false
+}
+
+/// Mark a page slot as privately allocated (post-fork demand-zero).
+///
+/// Called when a COW object allocates a new page via ensure_page (not through
+/// a COW fault). Sets the `copied` bit so that `other_sharers` correctly
+/// excludes this member for this slot — the member doesn't reference the
+/// original shared PA.
+///
+/// Creates a tracking-only reservation (dest_pa=0) if the member has no
+/// reservation in this extent yet.
+pub fn mark_private(
+    group_id: CowGroupId,
+    obj_id: u64,
+    obj_page_base: u32,
+    slot: usize,
+) {
+    let entry_ptr = match resolve_entry(group_id) {
+        Some(p) => p,
+        None => return,
+    };
+    let mut guard = unsafe { (*entry_ptr).inner.lock() };
+
+    let ei = match guard.find_extent(obj_page_base) {
+        Some(i) => i,
+        None => return,
+    };
+
+    let ri = match guard.extent(ei).find_reservation(obj_id) {
+        Some(i) => i,
+        None => {
+            // Create tracking-only reservation (dest_pa=0).
+            match guard.extent_mut(ei).add_reservation(obj_id, 0) {
+                Some(i) => i,
+                None => return,
+            }
+        }
+    };
+
+    guard.extent_mut(ei).reservations[ri].copied |= 1u64 << slot;
+}
+
+/// For a member being destroyed, determine which pages in a superpage range
+/// should be freed. Returns a bitmask: bit i set = caller should free page i.
+///
+/// Classification per slot:
+/// - shared_mask clear → post-fork private allocation → free
+/// - shared_mask set, copied by this member → private COW copy → free
+/// - shared_mask set, not copied, other_sharers == 0 → last reference → free
+/// - shared_mask set, not copied, other_sharers > 0 → still referenced → keep
+pub fn pages_to_free_on_destroy(
+    group_id: CowGroupId,
+    obj_id: u64,
+    obj_page_base: u32,
+    page_count: u8,
+) -> u64 {
+    let entry_ptr = match resolve_entry(group_id) {
+        Some(p) => p,
+        None => {
+            // Group not found — treat all as exclusively owned.
+            return (1u64 << page_count) - 1;
+        }
+    };
+    let guard = unsafe { (*entry_ptr).inner.lock() };
+
+    let ei = match guard.find_extent(obj_page_base) {
+        Some(i) => i,
+        None => {
+            // No extent → pre-populate didn't cover this range or was never
+            // called. All pages in this range are shared originals with no
+            // per-page tracking. Conservatively don't free (other members
+            // may reference them).
+            return 0;
+        }
+    };
+    let ext = guard.extent(ei);
+
+    let mut free_mask: u64 = 0;
+    for slot in 0..page_count as usize {
+        if ext.shared_mask & (1u64 << slot) == 0 {
+            // Page wasn't shared at fork time → private allocation → free.
+            free_mask |= 1u64 << slot;
+        } else if ext.is_copied_by(obj_id, slot) {
+            // Member COW-broke this page → private copy → free.
+            free_mask |= 1u64 << slot;
+        } else {
+            // Member still references the original shared PA.
+            if ext.other_sharers(obj_id, slot, guard.member_count) == 0 {
+                // Last reference to the original → free.
+                free_mask |= 1u64 << slot;
+            }
+            // else: other members still reference it → keep.
+        }
+    }
+
+    free_mask
+}
+
+/// Release a shared page from a non-refcounted group. Called by release_page
+/// when a COW object's page is being unmapped/evicted.
+///
+/// Determines whether the PA is a private copy (free directly) or a shared
+/// original (mark departure, free if orphaned).
+///
+/// Returns true if the PA was freed.
+pub fn release_shared_page(
+    group_id: CowGroupId,
+    obj_id: u64,
+    obj_page_base: u32,
+    slot: usize,
+    pa: super::page::PhysAddr,
+) -> bool {
+    let entry_ptr = match resolve_entry(group_id) {
+        Some(p) => p,
+        None => {
+            super::phys::free_page(pa);
+            return true;
+        }
+    };
+    let mut guard = unsafe { (*entry_ptr).inner.lock() };
+
+    let ei = match guard.find_extent(obj_page_base) {
+        Some(i) => i,
+        None => {
+            // No extent → shared original with no tracking. Don't free.
+            return false;
+        }
+    };
+
+    let ext = guard.extent(ei);
+
+    if ext.shared_mask & (1u64 << slot) == 0 {
+        // Post-fork private allocation → free directly.
+        drop(guard);
+        super::phys::free_page(pa);
+        return true;
+    }
+
+    if ext.is_copied_by(obj_id, slot) {
+        // Private COW copy → free directly.
+        drop(guard);
+        super::phys::free_page(pa);
+        return true;
+    }
+
+    // Shared original — mark departure and check if orphaned.
+    let ri = match guard.extent(ei).find_reservation(obj_id) {
+        Some(i) => i,
+        None => {
+            match guard.extent_mut(ei).add_reservation(obj_id, 0) {
+                Some(i) => i,
+                None => return false, // Can't track departure — leak to be safe.
+            }
+        }
+    };
+    guard.extent_mut(ei).reservations[ri].copied |= 1u64 << slot;
+
+    // Re-read extent after mutation.
+    let ext = guard.extent(ei);
+    if ext.other_sharers(obj_id, slot, guard.member_count) == 0 {
+        drop(guard);
+        super::phys::free_page(pa);
+        return true;
+    }
+
+    false
 }

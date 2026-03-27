@@ -210,10 +210,25 @@ pub fn handle_page_fault(
         }
 
         // Major fault: need to allocate/zero the page.
-        let (pa, pre_zeroed) = match object::with_object(obj_id, |obj| obj.ensure_page(obj_page_idx)) {
-            Some(result) => result,
-            None => return FaultResult::Failed, // OOM
-        };
+        let (pa, pre_zeroed, newly_allocated, cow_group_port) =
+            match object::with_object(obj_id, |obj| {
+                let was_zero = obj.pages.get(obj_page_idx) == 0;
+                let cgp = obj.cow_group_port;
+                obj.ensure_page(obj_page_idx).map(|(pa, pz)| (pa, pz, was_zero, cgp))
+            }) {
+                Some(result) => result,
+                None => return FaultResult::Failed, // OOM
+            };
+
+        // If a COW object allocated a new page (demand-zero), mark it as private
+        // in the group extent so other_sharers correctly excludes this member.
+        if newly_allocated && cow_group_port != 0
+            && !super::cowgroup::is_refcounted(cow_group_port)
+        {
+            let super_base = (obj_page_idx & !(SUPERPAGE_ALLOC_PAGES - 1)) as u32;
+            let slot = obj_page_idx - super_base as usize;
+            super::cowgroup::mark_private(cow_group_port, obj_id, super_base, slot);
+        }
 
         // Zero just the specific 4K MMU sub-page within the allocation page.
         let mmu_pa = pa.as_usize() + vma.mmu_offset_in_page(mmu_idx) * MMUPAGE_SIZE;
@@ -638,7 +653,7 @@ fn handle_cow_fault(
                         PAGE_SIZE,
                     );
                 }
-                cowgroup::mark_copied(cow_group_port, obj_id, super_base, slot);
+                // mark_copied_and_release will be called below for all paths.
                 super::page::PhysAddr::new(dest)
             }
             Some(rs) => {
@@ -685,9 +700,19 @@ fn handle_cow_fault(
     });
 
     // Release old page's share — this object no longer references it.
-    let remaining = super::frame::dec_ref(old_pa);
-    if remaining == 0 {
-        super::phys::free_page(old_pa);
+    if cow_group_port != 0 && !cowgroup::is_refcounted(cow_group_port) {
+        // Non-refcounted group: use extent-based tracking.
+        let super_base = (obj_page_idx & !(SUPERPAGE_ALLOC_PAGES - 1)) as u32;
+        let slot = obj_page_idx - super_base as usize;
+        cowgroup::mark_copied_and_release(
+            cow_group_port, obj_id, super_base, slot, old_pa,
+        );
+    } else {
+        // Refcounted group or no group: use per-page dec_ref.
+        let remaining = super::frame::dec_ref(old_pa);
+        if remaining == 0 {
+            super::phys::free_page(old_pa);
+        }
     }
 
     // Reinstall PTEs for all present MMU pages in this allocation page.
@@ -790,11 +815,10 @@ fn try_consolidate_reservation(
                 );
             }
 
-            // Free the old page.
-            let old_refcount = super::frame::dec_ref(PhysAddr::new(current_pa));
-            if old_refcount == 0 {
-                super::phys::free_page(PhysAddr::new(current_pa));
-            }
+            // Free the old scattered page. Straggler pages in a completed
+            // reservation are exclusively owned: either post-fork demand-zero
+            // allocations or originals where all other members already departed.
+            super::phys::free_page(PhysAddr::new(current_pa));
 
             obj.pages.set(obj_idx, dest_slot_pa);
             count += 1;

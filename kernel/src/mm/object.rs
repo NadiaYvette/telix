@@ -9,9 +9,10 @@
 //! via `port_kernel_data(port_id) → *const ObjEntry`. Each entry has its
 //! own SpinLock<MemObject> for per-object serialization.
 //!
-//! COW page sharing uses atomic frame refcounts (mm::frame) instead of
-//! O(N) sibling scanning: `inc_ref` on clone, `dec_ref` on release.
-//! Non-COW objects (cow_group_port == 0) skip refcount ops entirely.
+//! COW page lifetime is managed via group extents (shared_mask + copied bits)
+//! for first-fork groups (2 members), eliminating per-page refcount work at
+//! fork time. Cascading forks (3+ members) fall back to per-page frame
+//! refcounts. Non-COW objects (cow_group_port == 0) skip all sharing ops.
 
 use super::page::PhysAddr;
 use super::pagevec::PageVec;
@@ -324,17 +325,23 @@ pub fn create_anon(page_count: u16) -> Option<ObjectId> {
 }
 
 /// Clone a memory object for COW. Creates a new object that shares all
-/// physical pages with the original. Uses frame refcounts for page sharing
-/// and registers both objects in a COW sharing group.
+/// physical pages with the original and registers both in a COW sharing group.
+///
+/// For first forks (source has no group), page lifetime is tracked via
+/// group extents with shared_mask — no per-page refcount bumps needed.
+/// For cascading forks (source already in a group), falls back to per-page
+/// refcounts for correctness with N>2 members.
 pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
     let src_entry = resolve_entry(src_id)? as *mut ObjEntry;
 
-    // Step 1: lock source, read state, copy pages, bump refcounts.
-    let (page_count, group_port, new_pages) = {
+    // Step 1: lock source, read state, copy pages.
+    let (page_count, group_port, new_pages, first_fork) = {
         let mut src = unsafe { (*src_entry).inner.lock() };
 
+        let first_fork = src.cow_group_port == 0;
+
         // Create or join a COW sharing group.
-        let group_port = if src.cow_group_port == 0 {
+        let group_port = if first_fork {
             let gp = super::cowgroup::create()?;
             super::cowgroup::add_member(gp, src_id);
             src.cow_group_port = gp;
@@ -347,23 +354,37 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
         let mut new_pages = PageVec::with_capacity(page_count as usize)?;
         new_pages.copy_from(&src.pages, page_count as usize);
 
-        // Increment frame refcounts for all shared pages.
-        for i in 0..page_count as usize {
-            let pa = src.pages.get(i);
-            if pa != 0 {
-                let cur = super::frame::get_ref(PhysAddr::new(pa));
-                if cur == 0 {
-                    // First COW: parent owns it (1) + new clone (1) = 2
-                    super::frame::set_ref(PhysAddr::new(pa), 2);
-                } else {
-                    super::frame::inc_ref(PhysAddr::new(pa));
+        if !first_fork {
+            // Cascading fork: group has 3+ members after this clone.
+            // Transition to refcount-based tracking and bump refcounts.
+            super::cowgroup::set_refcounted(group_port);
+            for i in 0..page_count as usize {
+                let pa = src.pages.get(i);
+                if pa != 0 {
+                    let cur = super::frame::get_ref(PhysAddr::new(pa));
+                    if cur == 0 {
+                        super::frame::set_ref(PhysAddr::new(pa), 2);
+                    } else {
+                        super::frame::inc_ref(PhysAddr::new(pa));
+                    }
                 }
             }
         }
-        (page_count, group_port, new_pages)
+        // First fork: no refcount bumps — shared_mask in extents tracks
+        // which pages were shared at fork time.
+
+        (page_count, group_port, new_pages, first_fork)
     };
 
-    // Step 2: allocate entry + kernel port.
+    // Step 2: pre-populate extents with shared_mask BEFORE moving new_pages.
+    // new_pages is a snapshot of the source's PageVec.
+    if first_fork {
+        super::cowgroup::pre_populate_extents_with_mask(group_port, page_count, |idx| {
+            new_pages.get(idx) != 0
+        });
+    }
+
+    // Step 3: allocate entry + kernel port.
     let ptr = alloc_entry()?;
     let kernel_port = match port::create_kernel_port(object_port_handler, ptr as usize) {
         Some(p) => p,
@@ -373,7 +394,7 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
         }
     };
 
-    // Step 3: initialize destination and register in group.
+    // Step 4: initialize destination and register in group.
     unsafe {
         (*ptr).port_id = kernel_port;
         let mut obj = MemObject::empty();
@@ -386,15 +407,21 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
 
     super::cowgroup::add_member(group_port, kernel_port);
 
-    // Eagerly pre-populate extents for all full superpage-aligned ranges.
-    // This lets the first COW fault in each range skip extent creation
-    // and go straight to per-member reservation allocation.
-    super::cowgroup::pre_populate_extents(group_port, page_count);
+    // For cascading forks, pre-populate extents without shared_mask
+    // (refcount-based tracking, shared_mask not needed).
+    if !first_fork {
+        super::cowgroup::pre_populate_extents_with_mask(group_port, page_count, |_| false);
+    }
 
     Some(kernel_port)
 }
 
-/// Destroy a memory object, freeing physical pages via frame refcounts.
+/// Destroy a memory object, freeing physical pages.
+///
+/// For non-COW objects: free all pages directly.
+/// For COW objects in non-refcounted groups: use extent-based classification
+///   to determine which pages are privately owned (free) vs still shared (keep).
+/// For COW objects in refcounted groups: use frame refcounts (dec_ref).
 pub fn destroy(id: ObjectId) {
     let entry_ptr = match resolve_entry(id) {
         Some(p) => p as *mut ObjEntry,
@@ -413,15 +440,14 @@ pub fn destroy(id: ObjectId) {
     // Free each page.
     if cow_group_port == 0 {
         // Fast path: no COW group — all pages are exclusively owned.
-        // Skip refcount ops entirely; just free directly.
         for p in 0..page_count {
             let pa = guard.pages.get(p);
             if pa == 0 { continue; }
             guard.pages.set(p, 0);
             phys::free_page(PhysAddr::new(pa));
         }
-    } else {
-        // Slow path: COW-shared pages need refcount-mediated freeing.
+    } else if super::cowgroup::is_refcounted(cow_group_port) {
+        // Refcounted group (cascading fork): use per-page dec_ref.
         for p in 0..page_count {
             let pa = guard.pages.get(p);
             if pa == 0 { continue; }
@@ -431,6 +457,34 @@ pub fn destroy(id: ObjectId) {
             if remaining == 0 {
                 phys::free_page(PhysAddr::new(pa));
             }
+        }
+    } else {
+        // Non-refcounted group (first fork): use extent-based classification.
+        // Process one superpage range at a time.
+        use super::page::SUPERPAGE_ALLOC_PAGES;
+        let mut base = 0;
+        while base < page_count {
+            let range_end = (base + SUPERPAGE_ALLOC_PAGES).min(page_count);
+            let range_count = range_end - base;
+
+            // Ask the group which pages in this range should be freed.
+            let free_mask = super::cowgroup::pages_to_free_on_destroy(
+                cow_group_port, id, base as u32, range_count as u8,
+            );
+
+            for slot in 0..range_count {
+                let p = base + slot;
+                let pa = guard.pages.get(p);
+                if pa == 0 { continue; }
+                guard.pages.set(p, 0);
+
+                if free_mask & (1u64 << slot) != 0 {
+                    phys::free_page(PhysAddr::new(pa));
+                }
+                // else: page is still referenced by other members — don't free.
+            }
+
+            base = range_end;
         }
     }
 
@@ -448,8 +502,8 @@ pub fn destroy(id: ObjectId) {
     // Leave COW sharing group.
     if cow_group_port != 0 {
         if let Some(survivor_id) = super::cowgroup::remove_member(cow_group_port, id) {
-            // Sole survivor — detach from group and clear stale refcounts.
-            // Pages with refcount 1 are exclusively owned; reset to 0 (untracked).
+            // Sole survivor — detach from group. Survivor's pages are all
+            // exclusively owned (either originals it never broke, or private copies).
             detach_sole_survivor(survivor_id);
         }
     }
@@ -502,7 +556,7 @@ fn detach_sole_survivor(survivor_id: ObjectId) {
 }
 
 /// Release a physical page from object `obj_id` at `page_idx`.
-/// If no other object references the same PA (via frame refcounts), frees the page.
+/// Frees the page if no other object references the same PA.
 /// Returns true if the physical page was freed, false if still shared.
 /// Clears the page entry in either case.
 pub fn release_page(obj_id: ObjectId, page_idx: usize) -> bool {
@@ -524,11 +578,22 @@ pub fn release_page(obj_id: ObjectId, page_idx: usize) -> bool {
         return true;
     }
 
-    let remaining = super::frame::dec_ref(PhysAddr::new(pa));
-    if remaining == 0 {
-        phys::free_page(PhysAddr::new(pa));
-        true
+    if super::cowgroup::is_refcounted(cow_group_port) {
+        // Refcounted group: use per-page dec_ref.
+        let remaining = super::frame::dec_ref(PhysAddr::new(pa));
+        if remaining == 0 {
+            phys::free_page(PhysAddr::new(pa));
+            true
+        } else {
+            false
+        }
     } else {
-        false
+        // Non-refcounted group: classify via extent and free if appropriate.
+        use super::page::SUPERPAGE_ALLOC_PAGES;
+        let super_base = (page_idx & !(SUPERPAGE_ALLOC_PAGES - 1)) as u32;
+        let slot = page_idx - super_base as usize;
+        super::cowgroup::release_shared_page(
+            cow_group_port, obj_id, super_base, slot, PhysAddr::new(pa),
+        )
     }
 }
