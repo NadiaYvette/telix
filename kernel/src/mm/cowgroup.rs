@@ -720,3 +720,29 @@ pub fn get_reservation_info(
         page_count: ext.page_count,
     })
 }
+
+/// Pre-populate extents for all full superpage-aligned ranges in an object.
+/// Called at fork time to eagerly create extent entries so the first COW fault
+/// in each range can skip extent creation and go straight to per-member
+/// reservation allocation.
+///
+/// Only creates extents (metadata), not reservations (physical destinations).
+/// Reservations are still created lazily on first COW fault per member.
+pub fn pre_populate_extents(group_id: CowGroupId, obj_page_count: u16) {
+    let entry_ptr = match resolve_entry(group_id) {
+        Some(p) => p,
+        None => return,
+    };
+    let mut guard = unsafe { (*entry_ptr).inner.lock() };
+
+    let total = obj_page_count as usize;
+    let mut base = 0;
+    while base + SUPERPAGE_ALLOC_PAGES <= total {
+        if guard.find_extent(base as u32).is_none() {
+            if guard.create_extent(base as u32, SUPERPAGE_ALLOC_PAGES as u8).is_none() {
+                break; // OOM or extent capacity — stop pre-populating.
+            }
+        }
+        base += SUPERPAGE_ALLOC_PAGES;
+    }
+}

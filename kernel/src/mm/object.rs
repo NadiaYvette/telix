@@ -385,6 +385,11 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
 
     super::cowgroup::add_member(group_port, kernel_port);
 
+    // Eagerly pre-populate extents for all full superpage-aligned ranges.
+    // This lets the first COW fault in each range skip extent creation
+    // and go straight to per-member reservation allocation.
+    super::cowgroup::pre_populate_extents(group_port, page_count);
+
     Some(kernel_port)
 }
 
