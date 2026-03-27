@@ -568,6 +568,10 @@ pub fn demote_superpage(pt_root: usize, va: usize, flags: u64) -> bool {
 }
 
 /// Handle a COW (copy-on-write) fault.
+///
+/// Tries the reservation path first (superpage-aligned contiguous destination)
+/// if the object is in a COW sharing group. Falls back to single-page
+/// allocation if the reservation cannot be created.
 fn handle_cow_fault(
     pt_root: usize,
     vma: &mut super::vma::Vma,
@@ -577,10 +581,13 @@ fn handle_cow_fault(
     fault_addr: usize,
 ) -> FaultResult {
     use super::page::{PAGE_SIZE, MMUPAGE_SIZE};
+    use super::cowgroup;
 
-    let pa = object::with_object(obj_id, |obj| obj.get_page(obj_page_idx));
-    let old_pa = match pa {
-        Some(pa) => pa,
+    // Read old PA and group port from the object.
+    let (old_pa, cow_group_port) = match object::with_object(obj_id, |obj| {
+        obj.get_page(obj_page_idx).map(|pa| (pa, obj.cow_group_port))
+    }) {
+        Some(pair) => pair,
         None => return FaultResult::Failed,
     };
 
@@ -596,20 +603,70 @@ fn handle_cow_fault(
         return FaultResult::HandledCOW;
     }
 
-    // Shared page — allocate a new page, copy, replace.
-    let new_pa = match super::phys::alloc_page() {
-        Some(pa) => pa,
-        None => return FaultResult::Failed,
+    // Shared page — need to copy. Try reservation path first.
+    let new_pa = if cow_group_port != 0 {
+        let super_base = (obj_page_idx & !(SUPERPAGE_ALLOC_PAGES - 1)) as u32;
+        let slot = obj_page_idx - super_base as usize;
+        // Compute page_count for this extent (may be smaller at object tail).
+        let obj_page_count = object::with_object(obj_id, |obj| obj.page_count as usize);
+        let extent_end = (super_base as usize + SUPERPAGE_ALLOC_PAGES).min(obj_page_count);
+        let page_count = (extent_end - super_base as usize) as u8;
+
+        match cowgroup::find_or_create_reservation(
+            cow_group_port, obj_id, super_base, page_count, slot,
+        ) {
+            Some(rs) if !rs.already_copied => {
+                // Copy into the reserved slot.
+                let dest = rs.dest_page_pa;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        old_pa.as_usize() as *const u8,
+                        dest as *mut u8,
+                        PAGE_SIZE,
+                    );
+                }
+                cowgroup::mark_copied(cow_group_port, obj_id, super_base, slot);
+                super::page::PhysAddr::new(dest)
+            }
+            Some(rs) => {
+                // Already copied (race or re-fault) — use existing destination.
+                super::page::PhysAddr::new(rs.dest_page_pa)
+            }
+            None => {
+                // Reservation failed — fall back to single-page allocation.
+                match super::phys::alloc_page() {
+                    Some(pa) => {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                old_pa.as_usize() as *const u8,
+                                pa.as_usize() as *mut u8,
+                                PAGE_SIZE,
+                            );
+                        }
+                        pa
+                    }
+                    None => return FaultResult::Failed,
+                }
+            }
+        }
+    } else {
+        // No COW group — single-page allocation (non-fork COW or pager).
+        match super::phys::alloc_page() {
+            Some(pa) => {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        old_pa.as_usize() as *const u8,
+                        pa.as_usize() as *mut u8,
+                        PAGE_SIZE,
+                    );
+                }
+                pa
+            }
+            None => return FaultResult::Failed,
+        }
     };
 
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            old_pa.as_usize() as *const u8,
-            new_pa.as_usize() as *mut u8,
-            PAGE_SIZE,
-        );
-    }
-
+    // Update object's page vector.
     object::with_object(obj_id, |obj| {
         obj.pages.set(obj_page_idx, new_pa.as_usize());
     });
