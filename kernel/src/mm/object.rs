@@ -11,6 +11,7 @@
 //!
 //! COW page sharing uses atomic frame refcounts (mm::frame) instead of
 //! O(N) sibling scanning: `inc_ref` on clone, `dec_ref` on release.
+//! Non-COW objects (cow_group_port == 0) skip refcount ops entirely.
 
 use super::page::PhysAddr;
 use super::pagevec::PageVec;
@@ -409,15 +410,27 @@ pub fn destroy(id: ObjectId) {
     let pager_port = guard.pager_port;
     let cow_group_port = guard.cow_group_port;
 
-    // Free each page using frame refcounts.
-    for p in 0..page_count {
-        let pa = guard.pages.get(p);
-        if pa == 0 { continue; }
-        guard.pages.set(p, 0);
-
-        let remaining = super::frame::dec_ref(PhysAddr::new(pa));
-        if remaining == 0 {
+    // Free each page.
+    if cow_group_port == 0 {
+        // Fast path: no COW group — all pages are exclusively owned.
+        // Skip refcount ops entirely; just free directly.
+        for p in 0..page_count {
+            let pa = guard.pages.get(p);
+            if pa == 0 { continue; }
+            guard.pages.set(p, 0);
             phys::free_page(PhysAddr::new(pa));
+        }
+    } else {
+        // Slow path: COW-shared pages need refcount-mediated freeing.
+        for p in 0..page_count {
+            let pa = guard.pages.get(p);
+            if pa == 0 { continue; }
+            guard.pages.set(p, 0);
+
+            let remaining = super::frame::dec_ref(PhysAddr::new(pa));
+            if remaining == 0 {
+                phys::free_page(PhysAddr::new(pa));
+            }
         }
     }
 
@@ -476,8 +489,9 @@ pub fn object_port(id: ObjectId) -> PortId {
 }
 
 /// Detach the sole surviving member of a dissolved COW group.
-/// Clears its `cow_group_port` and resets stale frame refcounts (pages with
-/// refcount 1 are exclusively owned, normalize to 0 = untracked).
+/// Clears its `cow_group_port` so future operations (destroy, fault) take
+/// the fast non-COW path. Stale frame refcounts are cleaned up by
+/// `phys::free_page` when pages are eventually freed.
 fn detach_sole_survivor(survivor_id: ObjectId) {
     let entry_ptr = match resolve_entry(survivor_id) {
         Some(p) => p,
@@ -485,30 +499,6 @@ fn detach_sole_survivor(survivor_id: ObjectId) {
     };
     let mut guard = unsafe { (*entry_ptr).inner.lock() };
     guard.cow_group_port = 0;
-
-    // Reset stale refcounts: pages with refcount 1 are now exclusively owned.
-    for i in 0..guard.page_count as usize {
-        let pa = guard.pages.get(i);
-        if pa != 0 {
-            let rc = super::frame::get_ref(PhysAddr::new(pa));
-            if rc == 1 {
-                super::frame::set_ref(PhysAddr::new(pa), 0);
-            }
-        }
-    }
-}
-
-/// Check whether a physical page at `page_idx` in object `obj_id` is shared
-/// with any other object via frame refcounts.
-pub fn is_page_shared(obj_id: ObjectId, page_idx: usize) -> bool {
-    let entry_ptr = match resolve_entry(obj_id) {
-        Some(p) => p,
-        None => return false,
-    };
-    let guard = unsafe { (*entry_ptr).inner.lock() };
-    let pa = guard.pages.get(page_idx);
-    if pa == 0 { return false; }
-    super::frame::get_ref(PhysAddr::new(pa)) > 1
 }
 
 /// Release a physical page from object `obj_id` at `page_idx`.
@@ -524,8 +514,15 @@ pub fn release_page(obj_id: ObjectId, page_idx: usize) -> bool {
     let mut guard = unsafe { (*entry_ptr).inner.lock() };
     let pa = guard.pages.get(page_idx);
     if pa == 0 { return false; }
+    let cow_group_port = guard.cow_group_port;
     guard.pages.set(page_idx, 0);
     drop(guard);
+
+    if cow_group_port == 0 {
+        // Fast path: not COW-shared, just free.
+        phys::free_page(PhysAddr::new(pa));
+        return true;
+    }
 
     let remaining = super::frame::dec_ref(PhysAddr::new(pa));
     if remaining == 0 {

@@ -89,6 +89,26 @@ pub fn dec_ref(pa: PhysAddr) -> u16 {
     }
 }
 
+/// Compare-and-swap the reference count. Returns Ok(old) on success,
+/// Err(actual) if the current value didn't match `expected`.
+/// Used for lazy refcount initialization at COW fault time.
+pub fn cas_ref(pa: PhysAddr, expected: u16, new: u16) -> Result<u16, u16> {
+    match slot(pa) {
+        Some(s) => {
+            match s.compare_exchange(
+                expected as u32,
+                new as u32,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(old) => Ok(old as u16),
+                Err(actual) => Err(actual as u16),
+            }
+        }
+        None => Err(0),
+    }
+}
+
 /// Get the current reference count.
 pub fn get_ref(pa: PhysAddr) -> u16 {
     match slot(pa) {

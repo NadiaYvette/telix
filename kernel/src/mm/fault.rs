@@ -381,13 +381,8 @@ fn try_superpage_promotion(
                 return;
             }
         }
-    } else {
-        for p in 0..SUPERPAGE_ALLOC_PAGES {
-            if object::is_page_shared(obj_id, obj_page_base + p) {
-                return;
-            }
-        }
     }
+    // If cow_group_port == 0, pages are exclusively owned — no sharing check needed.
 
     let already_contiguous = object::with_object(obj_id, |obj| {
         let first_pa = obj.pages.get(obj_page_base);
@@ -606,7 +601,9 @@ fn handle_cow_fault(
         let slot = obj_page_idx - super_base as usize;
         super::cowgroup::is_page_shared_in_group(cow_group_port, obj_id, super_base, slot)
     } else {
-        object::is_page_shared(obj_id, obj_page_idx)
+        // No COW group → page is exclusively owned (never forked, or
+        // sole-survivor already detached). Never shared.
+        false
     };
 
     if !shared {

@@ -706,9 +706,13 @@ pub fn alloc_page() -> Option<PhysAddr> {
 }
 
 /// Free a single page.
+/// Resets the frame refcount to 0 so newly-allocated pages always start
+/// untracked, regardless of stale COW refcounts from a prior lifetime.
 pub fn free_page(addr: PhysAddr) {
     let pa = addr.as_usize();
     if pa < ALLOC.base { return; }
+    // Clear any stale frame refcount before returning to the free pool.
+    super::frame::set_ref(addr, 0);
     let (ci, pi) = addr_to_chunk_page(pa);
     if ci >= ALLOC.total_chunks { return; }
     chunk_free_one(ci, pi);

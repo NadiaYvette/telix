@@ -426,6 +426,18 @@ pub fn add_member(group_id: CowGroupId, obj_id: u64) -> bool {
     guard.add_member(obj_id)
 }
 
+/// Query the number of active members in a COW group.
+/// Used for lazy refcount initialization: when a page is first COW-faulted,
+/// the refcount is initialized to the current member count.
+pub fn member_count(group_id: CowGroupId) -> u16 {
+    let entry_ptr = match resolve_entry(group_id) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let guard = unsafe { (*entry_ptr).inner.lock() };
+    guard.member_count as u16
+}
+
 /// Remove a memory object from a COW group.
 /// Frees unclaimed reservation pages for this member.
 ///
