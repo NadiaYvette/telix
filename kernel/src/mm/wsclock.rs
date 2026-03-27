@@ -63,7 +63,7 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
                     scanned += 1;
 
                     // If this VA is part of a superpage, demote it first.
-                    let super_va = va & !(0x1FFFFF); // 2 MiB-aligned
+                    let super_va = va & !super::page::SUPERPAGE_ALIGN_MASK;
                     if fault::is_superpage_mapped(pt_root, super_va).is_some() {
                         let flags = fault::pte_flags_for_vma_pub(vma);
                         fault::demote_superpage(pt_root, super_va, flags);

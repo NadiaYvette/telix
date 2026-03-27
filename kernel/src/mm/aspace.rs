@@ -849,53 +849,52 @@ pub fn mremap(id: ASpaceId, old_addr: usize, old_len: usize, new_len: usize) -> 
 
 /// Demote all superpages covering a VMA's range.
 fn demote_superpages_for_vma(pt_root: usize, vma: &Vma) {
+    use super::page::{MMUPAGE_SIZE, SUPERPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_MMU_PAGES};
     let mmu_count = vma.mmu_page_count();
-    let super_size = 2 * 1024 * 1024;
     let flags = super::fault::pte_flags_for_vma_pub(vma);
     let mut m = 0;
     while m < mmu_count {
-        let mmu_va = vma.va_start + m * super::page::MMUPAGE_SIZE;
-        let super_va = mmu_va & !(super_size - 1);
+        let mmu_va = vma.va_start + m * MMUPAGE_SIZE;
+        let super_va = mmu_va & !SUPERPAGE_ALIGN_MASK;
         if super::fault::is_superpage_mapped(pt_root, super_va).is_some() {
             super::fault::demote_superpage(pt_root, super_va, flags);
         }
-        let next = ((super_va + super_size) - vma.va_start) / super::page::MMUPAGE_SIZE;
-        m = if next > m { next } else { m + (super_size / super::page::MMUPAGE_SIZE) };
+        let next = ((super_va + SUPERPAGE_SIZE) - vma.va_start) / MMUPAGE_SIZE;
+        m = if next > m { next } else { m + SUPERPAGE_MMU_PAGES };
     }
 }
 
 /// Demote superpages in a sub-range of a VMA (for mremap shrink).
 fn demote_superpages_for_vma_range(pt_root: usize, vma: &Vma, start_mmu: usize, end_mmu: usize) {
-    let super_size = 2 * 1024 * 1024;
+    use super::page::{MMUPAGE_SIZE, SUPERPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_MMU_PAGES};
     let flags = super::fault::pte_flags_for_vma_pub(vma);
     let va_start = vma.va_start;
     let mut m = start_mmu;
     while m < end_mmu {
-        let mmu_va = va_start + m * super::page::MMUPAGE_SIZE;
-        let super_va = mmu_va & !(super_size - 1);
+        let mmu_va = va_start + m * MMUPAGE_SIZE;
+        let super_va = mmu_va & !SUPERPAGE_ALIGN_MASK;
         if super::fault::is_superpage_mapped(pt_root, super_va).is_some() {
             super::fault::demote_superpage(pt_root, super_va, flags);
         }
-        let next = ((super_va + super_size) - va_start) / super::page::MMUPAGE_SIZE;
-        m = if next > m { next } else { m + (super_size / super::page::MMUPAGE_SIZE) };
+        let next = ((super_va + SUPERPAGE_SIZE) - va_start) / MMUPAGE_SIZE;
+        m = if next > m { next } else { m + SUPERPAGE_MMU_PAGES };
     }
 }
 
 /// Demote superpages in a range given by (va_start, mmu_count, prot).
 fn demote_superpages_in_range(pt_root: usize, va_start: usize, mmu_count: usize, prot: VmaProt) {
-    let super_size = 2 * 1024 * 1024;
-    let super_mmu = super_size / super::page::MMUPAGE_SIZE;
+    use super::page::{MMUPAGE_SIZE, SUPERPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_MMU_PAGES};
     let flags = rw_flags_for_prot(prot);
     let mut m = 0;
     while m < mmu_count {
-        let va = va_start + m * super::page::MMUPAGE_SIZE;
-        let super_va = va & !(super_size - 1);
+        let va = va_start + m * MMUPAGE_SIZE;
+        let super_va = va & !SUPERPAGE_ALIGN_MASK;
         if super::fault::is_superpage_mapped(pt_root, super_va).is_some() {
             super::fault::demote_superpage(pt_root, super_va, flags);
             super::stats::SUPERPAGE_DEMOTIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
-        let next_super = ((super_va + super_size) - va_start) / super::page::MMUPAGE_SIZE;
-        m = if next_super > m { next_super } else { m + super_mmu };
+        let next_super = ((super_va + SUPERPAGE_SIZE) - va_start) / MMUPAGE_SIZE;
+        m = if next_super > m { next_super } else { m + SUPERPAGE_MMU_PAGES };
     }
 }
 

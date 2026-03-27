@@ -34,6 +34,23 @@ pub const PAGE_MMUCOUNT: usize = PAGE_SIZE / MMUPAGE_SIZE;
 #[allow(dead_code)]
 pub const PAGE_MMUSHIFT: usize = PAGE_SHIFT - MMUPAGE_SHIFT;
 
+// ---------------------------------------------------------------------------
+// Superpage (large page) constants — architecture-dependent
+// ---------------------------------------------------------------------------
+
+/// Smallest superpage size for this architecture (2 MiB on aarch64/x86_64/riscv64).
+pub const SUPERPAGE_SIZE: usize = 2 * 1024 * 1024;
+pub const SUPERPAGE_SHIFT: usize = 21;
+
+/// Number of allocation pages in one superpage.
+pub const SUPERPAGE_ALLOC_PAGES: usize = SUPERPAGE_SIZE / PAGE_SIZE;
+
+/// Number of MMU pages in one superpage.
+pub const SUPERPAGE_MMU_PAGES: usize = SUPERPAGE_SIZE / MMUPAGE_SIZE;
+
+/// Alignment mask: `addr & SUPERPAGE_ALIGN_MASK` gives the offset within a superpage.
+pub const SUPERPAGE_ALIGN_MASK: usize = SUPERPAGE_SIZE - 1;
+
 /// Physical address (wrapper for type safety).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]

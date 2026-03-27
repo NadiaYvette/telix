@@ -1,4 +1,5 @@
 pub mod aspace;
+pub mod cowgroup;
 pub mod extent;
 pub mod fault;
 pub mod frame;

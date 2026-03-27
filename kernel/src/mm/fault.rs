@@ -12,14 +12,12 @@
 
 use super::aspace::{self, ASpaceId};
 use super::object;
-use super::page::{MMUPAGE_SIZE, PAGE_SIZE, PAGE_MMUCOUNT};
+use super::page::{
+    MMUPAGE_SIZE, PAGE_SIZE, PAGE_MMUCOUNT,
+    SUPERPAGE_SIZE, SUPERPAGE_ALLOC_PAGES, SUPERPAGE_MMU_PAGES, SUPERPAGE_ALIGN_MASK,
+};
 use super::stats;
 use core::sync::atomic::Ordering;
-
-/// Number of allocation pages in a 2 MiB superpage.
-const SUPER_ALLOC_PAGES: usize = (2 * 1024 * 1024) / PAGE_SIZE;
-/// Number of MMU pages in a 2 MiB superpage.
-const SUPER_MMU_PAGES: usize = 512; // 2 MiB / 4 KiB
 
 /// Type of page fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,8 +323,8 @@ fn try_contiguous_promotion(pt_root: usize, vma: &super::vma::Vma, mmu_idx: usiz
     }
 }
 
-/// Try to promote a 2 MiB-aligned region to a superpage.
-/// Checks if all 512 MMU pages in the group have present PTEs.
+/// Try to promote a superpage-aligned region to a superpage.
+/// Checks if all MMU pages in the group have present PTEs.
 fn try_superpage_promotion(
     pt_root: usize,
     vma: &mut super::vma::Vma,
@@ -334,22 +332,22 @@ fn try_superpage_promotion(
     mmu_idx: usize,
 ) {
     let mmu_count = vma.mmu_page_count();
-    if mmu_count < SUPER_MMU_PAGES {
+    if mmu_count < SUPERPAGE_MMU_PAGES {
         return;
     }
 
     let va_offset_in_vma = mmu_idx * MMUPAGE_SIZE;
     let vma_base = vma.va_start;
     let abs_va = vma_base + va_offset_in_vma;
-    let super_va = abs_va & !(0x1FFFFF);
-    if super_va < vma_base || super_va + (SUPER_MMU_PAGES * MMUPAGE_SIZE) > vma_base + vma.va_len {
+    let super_va = abs_va & !(SUPERPAGE_ALIGN_MASK);
+    if super_va < vma_base || super_va + (SUPERPAGE_MMU_PAGES * MMUPAGE_SIZE) > vma_base + vma.va_len {
         return;
     }
 
     let group_mmu_start = (super_va - vma_base) / MMUPAGE_SIZE;
 
     // Check all MMU pages in the group are present by walking PTEs.
-    for i in 0..SUPER_MMU_PAGES {
+    for i in 0..SUPERPAGE_MMU_PAGES {
         let va = vma_base + (group_mmu_start + i) * MMUPAGE_SIZE;
         if !pte_is_present(read_pte_dispatch(pt_root, va)) {
             return;
@@ -359,7 +357,7 @@ fn try_superpage_promotion(
     // Check: all allocation pages must be allocated and not COW-shared.
     let obj_page_base = vma.obj_page_index(group_mmu_start);
     let can_promote = object::with_object(obj_id, |obj| {
-        for p in 0..SUPER_ALLOC_PAGES {
+        for p in 0..SUPERPAGE_ALLOC_PAGES {
             let idx = obj_page_base + p;
             if idx >= obj.page_count as usize {
                 return false;
@@ -371,7 +369,7 @@ fn try_superpage_promotion(
         true
     });
     if can_promote {
-        for p in 0..SUPER_ALLOC_PAGES {
+        for p in 0..SUPERPAGE_ALLOC_PAGES {
             if object::is_page_shared(obj_id, obj_page_base + p) {
                 return;
             }
@@ -383,10 +381,10 @@ fn try_superpage_promotion(
 
     let already_contiguous = object::with_object(obj_id, |obj| {
         let first_pa = obj.pages.get(obj_page_base);
-        if first_pa & 0x1FFFFF != 0 {
+        if first_pa & SUPERPAGE_ALIGN_MASK != 0 {
             return false;
         }
-        for p in 1..SUPER_ALLOC_PAGES {
+        for p in 1..SUPERPAGE_ALLOC_PAGES {
             if obj.pages.get(obj_page_base + p) != first_pa + p * PAGE_SIZE {
                 return false;
             }
@@ -410,7 +408,7 @@ fn try_superpage_promotion(
     };
 
     object::with_object(obj_id, |obj| {
-        for p in 0..SUPER_ALLOC_PAGES {
+        for p in 0..SUPERPAGE_ALLOC_PAGES {
             let old_pa = obj.pages.get(obj_page_base + p);
             let new_pa = new_block.as_usize() + p * PAGE_SIZE;
             unsafe {
@@ -424,14 +422,14 @@ fn try_superpage_promotion(
     });
 
     object::with_object(obj_id, |obj| {
-        for p in 0..SUPER_ALLOC_PAGES {
+        for p in 0..SUPERPAGE_ALLOC_PAGES {
             let old_pa = super::page::PhysAddr::new(obj.pages.get(obj_page_base + p));
             super::phys::free_page(old_pa);
         }
     });
 
     object::with_object(obj_id, |obj| {
-        for p in 0..SUPER_ALLOC_PAGES {
+        for p in 0..SUPERPAGE_ALLOC_PAGES {
             let new_pa = new_block.as_usize() + p * PAGE_SIZE;
             obj.pages.set(obj_page_base + p, new_pa);
         }
@@ -450,25 +448,25 @@ pub fn try_superpage_promotion_eager(
     obj_id: u64,
 ) {
     let mmu_count = vma.mmu_page_count();
-    if mmu_count < SUPER_MMU_PAGES {
+    if mmu_count < SUPERPAGE_MMU_PAGES {
         return;
     }
 
     let vma_base = vma.va_start;
-    let first_super = (vma_base + 0x1FFFFF) & !0x1FFFFF;
+    let first_super = (vma_base + SUPERPAGE_ALIGN_MASK) & !SUPERPAGE_ALIGN_MASK;
     let vma_end = vma_base + vma.va_len;
 
     let mut super_va = first_super;
-    while super_va + SUPER_MMU_PAGES * MMUPAGE_SIZE <= vma_end {
+    while super_va + SUPERPAGE_MMU_PAGES * MMUPAGE_SIZE <= vma_end {
         let group_mmu_start = (super_va - vma_base) / MMUPAGE_SIZE;
         try_superpage_promotion(pt_root, vma, obj_id, group_mmu_start);
-        super_va += SUPER_MMU_PAGES * MMUPAGE_SIZE;
+        super_va += SUPERPAGE_MMU_PAGES * MMUPAGE_SIZE;
     }
 }
 
 fn super_alloc_order() -> usize {
     let mut order = 0;
-    let mut n = SUPER_ALLOC_PAGES;
+    let mut n = SUPERPAGE_ALLOC_PAGES;
     while n > 1 {
         n >>= 1;
         order += 1;
@@ -482,7 +480,7 @@ fn alloc_2m_aligned() -> Option<super::page::PhysAddr> {
     let order5 = super_alloc_order();
 
     if let Some(pa) = super::phys::alloc_pages(order5) {
-        if pa.as_usize() & 0x1FFFFF == 0 {
+        if pa.as_usize() & SUPERPAGE_ALIGN_MASK == 0 {
             return Some(pa);
         }
         super::phys::free_pages(pa, order5);
@@ -496,12 +494,12 @@ fn alloc_2m_aligned() -> Option<super::page::PhysAddr> {
         let large_pa = large.as_usize();
         let large_pages = 1usize << order;
 
-        let aligned_pa = (large_pa + 0x1FFFFF) & !0x1FFFFF;
-        if aligned_pa == large_pa && large_pages >= SUPER_ALLOC_PAGES {
-            let excess = large_pages - SUPER_ALLOC_PAGES;
+        let aligned_pa = (large_pa + SUPERPAGE_ALIGN_MASK) & !SUPERPAGE_ALIGN_MASK;
+        if aligned_pa == large_pa && large_pages >= SUPERPAGE_ALLOC_PAGES {
+            let excess = large_pages - SUPERPAGE_ALLOC_PAGES;
             if excess > 0 {
                 free_pages_range(
-                    PhysAddr::new(large_pa + SUPER_ALLOC_PAGES * PAGE_SIZE),
+                    PhysAddr::new(large_pa + SUPERPAGE_ALLOC_PAGES * PAGE_SIZE),
                     excess,
                 );
             }
@@ -509,7 +507,7 @@ fn alloc_2m_aligned() -> Option<super::page::PhysAddr> {
         }
 
         let offset_pages = (aligned_pa - large_pa) / PAGE_SIZE;
-        let end_page = offset_pages + SUPER_ALLOC_PAGES;
+        let end_page = offset_pages + SUPERPAGE_ALLOC_PAGES;
         if end_page <= large_pages {
             if offset_pages > 0 {
                 free_pages_range(PhysAddr::new(large_pa), offset_pages);
@@ -517,7 +515,7 @@ fn alloc_2m_aligned() -> Option<super::page::PhysAddr> {
             let suffix = large_pages - end_page;
             if suffix > 0 {
                 free_pages_range(
-                    PhysAddr::new(aligned_pa + SUPER_ALLOC_PAGES * PAGE_SIZE),
+                    PhysAddr::new(aligned_pa + SUPERPAGE_ALLOC_PAGES * PAGE_SIZE),
                     suffix,
                 );
             }
@@ -544,7 +542,7 @@ fn install_superpage(pt_root: usize, va: usize, pa: usize, flags: u64) -> bool {
     { crate::arch::aarch64::mm::install_superpage(pt_root, va, pa, flags) }
 }
 
-/// Check if a VA is mapped as a 2 MiB superpage (arch dispatch).
+/// Check if a VA is mapped as a superpage (arch dispatch).
 pub fn is_superpage_mapped(pt_root: usize, va: usize) -> Option<usize> {
     #[cfg(target_arch = "x86_64")]
     { crate::arch::x86_64::mm::is_superpage(pt_root, va) }
@@ -554,7 +552,7 @@ pub fn is_superpage_mapped(pt_root: usize, va: usize) -> Option<usize> {
     { crate::arch::aarch64::mm::is_superpage(pt_root, va) }
 }
 
-/// Demote a 2 MiB superpage back to 512 × 4K PTEs (arch dispatch).
+/// Demote a superpage back to base PTEs (arch dispatch).
 /// Includes SW_ZEROED in the demoted PTEs since superpage pages are initialized.
 pub fn demote_superpage(pt_root: usize, va: usize, flags: u64) -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -611,6 +609,12 @@ fn handle_cow_fault(
     object::with_object(obj_id, |obj| {
         obj.pages.set(obj_page_idx, new_pa.as_usize());
     });
+
+    // Release old page's share — this object no longer references it.
+    let remaining = super::frame::dec_ref(old_pa);
+    if remaining == 0 {
+        super::phys::free_page(old_pa);
+    }
 
     // Reinstall PTEs for all present MMU pages in this allocation page.
     let (ap_start, ap_end) = vma.alloc_page_mmu_range(mmu_idx);
