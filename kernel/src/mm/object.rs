@@ -521,7 +521,10 @@ pub fn with_object<F, R>(id: ObjectId, f: F) -> R
 where
     F: FnOnce(&mut MemObject) -> R,
 {
-    let entry_ptr = resolve_entry(id).expect("with_object: invalid ObjectId");
+    let entry_ptr = match resolve_entry(id) {
+        Some(p) => p,
+        None => panic!("with_object: invalid ObjectId {}", id),
+    };
     let mut guard = unsafe { (*entry_ptr).inner.lock() };
     f(&mut *guard)
 }

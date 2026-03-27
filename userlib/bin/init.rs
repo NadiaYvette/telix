@@ -3167,8 +3167,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // --- fcntl ---
         if phase47_ok {
             // F_GETFD — FD 0 should have no flags.
-            if userlib::fd::fcntl(0, userlib::fd::F_GETFD, 0) != 0 {
-                syscall::debug_puts(b"  FAIL: F_GETFD(0) should be 0\n");
+            let getfd_val = userlib::fd::fcntl(0, userlib::fd::F_GETFD, 0);
+            if getfd_val != 0 {
+                syscall::debug_puts(b"  FAIL: F_GETFD(0) should be 0, got ");
+                print_num(getfd_val as u64);
+                syscall::debug_puts(b"\n");
                 phase47_ok = false;
             }
 

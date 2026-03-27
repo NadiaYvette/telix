@@ -368,7 +368,7 @@ pub fn spawn(entry: fn(u64), arg: u64) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn green_worker_entry(worker_id: u64) {
     let wid = worker_id as usize;
-    let tid = syscall::thread_id() as usize;
+    let tid = syscall::sa_getid() as usize;
     unsafe { WORKER_MAP[tid] = wid as i32; }
 
     loop {
@@ -408,7 +408,7 @@ pub extern "C" fn green_worker_entry(worker_id: u64) {
 /// Cooperatively yield the current fiber. Saves context, enqueues self,
 /// and switches back to the worker to pick the next fiber.
 pub fn fiber_yield() {
-    let tid = syscall::thread_id() as usize;
+    let tid = syscall::sa_getid() as usize;
     let wid = unsafe { WORKER_MAP[tid] } as usize;
     let fid = unsafe { WORKER_FIBER[wid] } as usize;
 
@@ -433,7 +433,7 @@ pub fn fiber_yield() {
 /// Called when a fiber's entry function returns. Marks the fiber done
 /// and switches back to the worker.
 extern "C" fn fiber_exit() -> ! {
-    let tid = syscall::thread_id() as usize;
+    let tid = syscall::sa_getid() as usize;
     let wid = unsafe { WORKER_MAP[tid] } as usize;
     let fid = unsafe { WORKER_FIBER[wid] } as usize;
 

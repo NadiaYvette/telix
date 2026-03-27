@@ -2380,7 +2380,8 @@ fn sys_kill_sig(target: u64, sig: u64) -> u64 {
         // The leader's task_id is used as the pgid.
         if crate::sched::send_signal_to_pgroup(leader_task, sig as u32) { 0 } else { u64::MAX }
     } else {
-        let task_id = match resolve_task_port(target) {
+        // Resolve task or thread port to a task_id (validated by port_id match).
+        let task_id = match crate::sched::task_id_from_any_port(target) {
             Some(t) => t,
             None => return u64::MAX,
         };

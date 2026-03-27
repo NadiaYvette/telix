@@ -95,6 +95,7 @@ pub const IOCTL_OK_TAG: u64 = 0x7100;
 pub const IOCTL_ERR_TAG: u64 = 0x7F00;
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct FdEntry {
     pub fd_type: FdType,
     /// IPC port for the backing server.
@@ -128,30 +129,29 @@ static mut FD_TABLE: [FdEntry; MAX_FDS] = {
 /// Sets up FDs 0, 1, 2 pointing to the console server.
 pub fn fd_init(console_port: u64) {
     unsafe {
-        // stdin
-        FD_TABLE[0] = FdEntry {
+        // Use volatile writes to avoid static-mut aliasing miscompilation.
+        let p = core::ptr::addr_of_mut!(FD_TABLE);
+        core::ptr::write_volatile(&mut (*p)[0], FdEntry {
             fd_type: FdType::Console,
             port: console_port,
             handle: 0,
             fd_flags: 0,
             status_flags: O_RDONLY,
-        };
-        // stdout
-        FD_TABLE[1] = FdEntry {
+        });
+        core::ptr::write_volatile(&mut (*p)[1], FdEntry {
             fd_type: FdType::Console,
             port: console_port,
             handle: 0,
             fd_flags: 0,
             status_flags: O_WRONLY,
-        };
-        // stderr
-        FD_TABLE[2] = FdEntry {
+        });
+        core::ptr::write_volatile(&mut (*p)[2], FdEntry {
             fd_type: FdType::Console,
             port: console_port,
             handle: 0,
             fd_flags: 0,
             status_flags: O_WRONLY,
-        };
+        });
     }
 }
 
@@ -160,7 +160,10 @@ pub fn fd_get(fd: i32) -> Option<FdEntry> {
     if fd < 0 || fd as usize >= MAX_FDS {
         return None;
     }
-    let entry = unsafe { FD_TABLE[fd as usize] };
+    let entry = unsafe {
+        let p = core::ptr::addr_of!(FD_TABLE);
+        core::ptr::read_volatile(core::ptr::addr_of!((*p)[fd as usize]))
+    };
     if entry.fd_type == FdType::Free {
         None
     } else {
@@ -185,15 +188,16 @@ fn fd_open_at_or_above(
 ) -> Option<i32> {
     let start = if min_fd < 0 { 0 } else { min_fd as usize };
     unsafe {
+        let p = core::ptr::addr_of_mut!(FD_TABLE);
         for i in start..MAX_FDS {
-            if FD_TABLE[i].fd_type == FdType::Free {
-                FD_TABLE[i] = FdEntry {
+            if core::ptr::read_volatile(core::ptr::addr_of!((*p)[i].fd_type)) == FdType::Free {
+                core::ptr::write_volatile(&mut (*p)[i], FdEntry {
                     fd_type,
                     port,
                     handle,
                     fd_flags,
                     status_flags,
-                };
+                });
                 return Some(i as i32);
             }
         }
@@ -207,10 +211,11 @@ pub fn fd_close(fd: i32) -> bool {
         return false;
     }
     unsafe {
-        if FD_TABLE[fd as usize].fd_type == FdType::Free {
+        let p = core::ptr::addr_of_mut!(FD_TABLE);
+        if core::ptr::read_volatile(core::ptr::addr_of!((*p)[fd as usize].fd_type)) == FdType::Free {
             return false;
         }
-        FD_TABLE[fd as usize] = FdEntry::empty();
+        core::ptr::write_volatile(&mut (*p)[fd as usize], FdEntry::empty());
     }
     true
 }
@@ -236,14 +241,14 @@ pub fn dup2(old_fd: i32, new_fd: i32) -> Option<i32> {
     }
     let entry = fd_get(old_fd)?;
     unsafe {
-        // Close new_fd if open (silently).
-        FD_TABLE[new_fd as usize] = FdEntry {
+        let p = core::ptr::addr_of_mut!(FD_TABLE);
+        core::ptr::write_volatile(&mut (*p)[new_fd as usize], FdEntry {
             fd_type: entry.fd_type,
             port: entry.port,
             handle: entry.handle,
             fd_flags: 0, // dup2 clears FD_CLOEXEC
             status_flags: entry.status_flags,
-        };
+        });
     }
     Some(new_fd)
 }
@@ -264,47 +269,48 @@ pub fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32 {
         return -1;
     }
     unsafe {
-        let entry = &mut FD_TABLE[fd as usize];
-        if entry.fd_type == FdType::Free {
+        // Use raw pointer to avoid &mut static UB (mutable reference to static mut
+        // is undefined behavior; the compiler may assume exclusive access and miscompile
+        // reads of fields that were written through a different reference).
+        let p = core::ptr::addr_of_mut!(FD_TABLE);
+        let entry = core::ptr::addr_of_mut!((*p)[fd as usize]);
+        if core::ptr::read_volatile(core::ptr::addr_of!((*entry).fd_type)) == FdType::Free {
             return -1;
         }
         match cmd {
             F_DUPFD => {
+                let snap = core::ptr::read_volatile(entry);
                 match fd_open_at_or_above(
-                    arg,
-                    entry.port,
-                    entry.handle,
-                    entry.fd_type,
-                    entry.status_flags,
-                    0,
+                    arg, snap.port, snap.handle, snap.fd_type, snap.status_flags, 0,
                 ) {
                     Some(new_fd) => new_fd,
                     None => -1,
                 }
             }
             F_DUPFD_CLOEXEC => {
+                let snap = core::ptr::read_volatile(entry);
                 match fd_open_at_or_above(
-                    arg,
-                    entry.port,
-                    entry.handle,
-                    entry.fd_type,
-                    entry.status_flags,
-                    FD_CLOEXEC,
+                    arg, snap.port, snap.handle, snap.fd_type, snap.status_flags, FD_CLOEXEC,
                 ) {
                     Some(new_fd) => new_fd,
                     None => -1,
                 }
             }
-            F_GETFD => entry.fd_flags as i32,
+            F_GETFD => {
+                core::ptr::read_volatile(core::ptr::addr_of!((*entry).fd_flags)) as i32
+            }
             F_SETFD => {
-                entry.fd_flags = arg as u32;
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*entry).fd_flags), arg as u32);
                 0
             }
-            F_GETFL => entry.status_flags as i32,
+            F_GETFL => {
+                core::ptr::read_volatile(core::ptr::addr_of!((*entry).status_flags)) as i32
+            }
             F_SETFL => {
-                // Only O_NONBLOCK and O_APPEND are modifiable; access mode bits are preserved.
                 let modifiable = O_NONBLOCK | O_APPEND;
-                entry.status_flags = (entry.status_flags & !modifiable) | (arg as u32 & modifiable);
+                let old = core::ptr::read_volatile(core::ptr::addr_of!((*entry).status_flags));
+                let new_val = (old & !modifiable) | (arg as u32 & modifiable);
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*entry).status_flags), new_val);
                 0
             }
             _ => -1,
@@ -332,10 +338,12 @@ pub fn ioctl(fd: i32, request: u32, arg: u64) -> i32 {
                 return -1;
             }
             unsafe {
+                let p = core::ptr::addr_of_mut!(FD_TABLE);
+                let sf = core::ptr::addr_of_mut!((*p)[fd as usize].status_flags);
                 if arg != 0 {
-                    FD_TABLE[fd as usize].status_flags |= O_NONBLOCK;
+                    core::ptr::write_volatile(sf, core::ptr::read_volatile(sf) | O_NONBLOCK);
                 } else {
-                    FD_TABLE[fd as usize].status_flags &= !O_NONBLOCK;
+                    core::ptr::write_volatile(sf, core::ptr::read_volatile(sf) & !O_NONBLOCK);
                 }
             }
             0
@@ -446,8 +454,9 @@ pub fn fd_is_valid(fd: i32) -> bool {
 pub fn fd_count() -> usize {
     let mut count = 0;
     unsafe {
+        let p = core::ptr::addr_of!(FD_TABLE);
         for i in 0..MAX_FDS {
-            if FD_TABLE[i].fd_type != FdType::Free {
+            if core::ptr::read_volatile(core::ptr::addr_of!((*p)[i].fd_type)) != FdType::Free {
                 count += 1;
             }
         }
@@ -458,9 +467,11 @@ pub fn fd_count() -> usize {
 /// Close all FDs with FD_CLOEXEC set. Called during execve.
 pub fn fd_close_on_exec() {
     unsafe {
+        let p = core::ptr::addr_of_mut!(FD_TABLE);
         for i in 0..MAX_FDS {
-            if FD_TABLE[i].fd_type != FdType::Free && FD_TABLE[i].fd_flags & FD_CLOEXEC != 0 {
-                FD_TABLE[i] = FdEntry::empty();
+            let e = core::ptr::read_volatile(&(*p)[i]);
+            if e.fd_type != FdType::Free && e.fd_flags & FD_CLOEXEC != 0 {
+                core::ptr::write_volatile(&mut (*p)[i], FdEntry::empty());
             }
         }
     }
