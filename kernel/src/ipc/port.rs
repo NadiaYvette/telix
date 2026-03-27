@@ -1,18 +1,26 @@
 //! Port: a kernel-managed message endpoint.
 //!
 //! A port can receive messages from any holder of a send capability.
-//! Messages are queued in a bounded buffer. Senders block if the queue
-//! is full; receivers block if the queue is empty.
+//! Messages are queued in a lock-free bounded MPSC buffer. Senders
+//! block (via turnstile) if the queue is full; receivers block if
+//! the queue is empty.
 //!
 //! Port IDs are structured as `(node:20 | local:44)` to support future
 //! network-transparent IPC. For single-node operation, node is always 0.
 //! Ports are dynamically allocated via an Adaptive Radix Tree (ART),
 //! with no fixed upper limit on the number of ports.
+//!
+//! Concurrency model:
+//!   - RCU-protected ART for lock-free port lookup (readers never block)
+//!   - Lock-free MPSC queue for send/recv fast path
+//!   - Turnstile HAMT for blocking waiters (lost-wakeup-free protocol)
+//!   - ART_WRITE_LOCK serializes structural mutations (create/destroy/resize)
 
-use super::art::Art;
+use super::art::{Art, ART_WRITE_LOCK};
 use super::message::Message;
-use crate::sched::thread::ThreadId;
 use crate::mm::page::PhysAddr;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 pub type PortId = u64;
 
@@ -36,109 +44,159 @@ pub const fn make_port_id(node: u32, local: u64) -> PortId {
     ((node as u64) << 44) | (local & 0xFFF_FFFF_FFFF)
 }
 
-// --- Port queue: variable-capacity circular buffer ---
+// ---------------------------------------------------------------------------
+// Lock-free MPSC message queue
+// ---------------------------------------------------------------------------
 //
-// Default allocation uses a 2048-byte slab (16 messages). Servers that need
-// deeper queues call port::resize() which allocates a page-backed buffer and
-// migrates pending messages from the old queue.
+// Bounded ring buffer with CAS-claimed tail (multi-producer) and single-
+// consumer head. Per-slot state byte (EMPTY/WRITING/READY) provides
+// publish/consume ordering without ABA.
+//
+// Layout in memory (single contiguous slab or page allocation):
+//   [MpscQueue header: 16 bytes]
+//   [Messages: Message[capacity], each 56 bytes]
+//   [Slot states: u8[capacity]]
 
-/// Default queue capacity (messages) for the small slab-allocated queue.
-const DEFAULT_QUEUE_CAPACITY: usize = 16;
+const SLOT_EMPTY: u8 = 0;
+const SLOT_READY: u8 = 2;
 
-/// Slab size for the default small queue.
+/// Default slab size for queue allocation.
 const PORT_QUEUE_SLAB_SIZE: usize = 2048;
 
-/// Messages per page when using a page-allocated queue.
-const MSGS_PER_PAGE: usize = crate::mm::page::PAGE_SIZE / core::mem::size_of::<Message>();
-
-/// Queue header stored at the start of the queue allocation.
-/// Followed immediately by `capacity` Message slots.
-struct PortQueue {
-    head: usize,
-    tail: usize,
-    len: usize,
-    capacity: usize,
-    /// True if this queue was page-allocated (free via free_page).
-    /// False if slab-allocated (free via slab::free).
+/// Lock-free bounded MPSC (multi-producer, single-consumer) message queue.
+#[repr(C)]
+struct MpscQueue {
+    head: AtomicU32,     // consumer read position (monotonically increasing)
+    tail: AtomicU32,     // producer claim position (CAS by senders)
+    capacity: u32,       // power-of-2 slot count
     page_backed: bool,
+    _pad: [u8; 3],
 }
 
-impl PortQueue {
-    /// Get a pointer to the message array (immediately after the header).
+impl MpscQueue {
+    /// Pointer to the message array (immediately after header).
     #[inline]
     fn msgs(&self) -> *mut Message {
-        unsafe { (self as *const Self as *mut Self).add(1) as *mut Message }
+        unsafe { (self as *const Self).add(1) as *mut Message }
     }
 
-    fn enqueue(&mut self, msg: Message) -> bool {
-        if self.len >= self.capacity {
-            return false;
+    /// Pointer to the slot state array (after messages).
+    #[inline]
+    fn slot_states(&self) -> *mut u8 {
+        unsafe { self.msgs().add(self.capacity as usize) as *mut u8 }
+    }
+
+    /// Get an atomic reference to the state of slot `idx`.
+    #[inline]
+    fn slot_state(&self, idx: usize) -> &AtomicU8 {
+        unsafe { &*(self.slot_states().add(idx) as *const AtomicU8) }
+    }
+
+    /// Enqueue a message (producer — multiple concurrent callers OK).
+    /// Returns true on success, false if the queue is full.
+    fn send(&self, msg: &Message) -> bool {
+        loop {
+            let t = self.tail.load(Ordering::Relaxed);
+            let h = self.head.load(Ordering::Acquire);
+            if t.wrapping_sub(h) >= self.capacity {
+                return false; // full
+            }
+            // CAS to claim slot `t`.
+            match self.tail.compare_exchange_weak(
+                t,
+                t.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    let idx = (t as usize) & (self.capacity as usize - 1);
+                    // Write message data.
+                    unsafe { core::ptr::write(self.msgs().add(idx), *msg); }
+                    // Publish: mark slot as READY (Release pairs with consumer's Acquire).
+                    self.slot_state(idx).store(SLOT_READY, Ordering::Release);
+                    return true;
+                }
+                Err(_) => continue, // another producer won, retry
+            }
         }
-        unsafe { *self.msgs().add(self.tail) = msg; }
-        self.tail = (self.tail + 1) % self.capacity;
-        self.len += 1;
-        true
     }
 
-    fn dequeue(&mut self) -> Option<Message> {
-        if self.len == 0 {
+    /// Dequeue a message (consumer — single caller only, the recv_holder).
+    /// Returns the message if one is ready, or None if the queue is empty.
+    fn recv(&self) -> Option<Message> {
+        let h = self.head.load(Ordering::Relaxed);
+        let idx = (h as usize) & (self.capacity as usize - 1);
+        // Check if slot is READY (Acquire pairs with producer's Release).
+        if self.slot_state(idx).load(Ordering::Acquire) != SLOT_READY {
             return None;
         }
-        let msg = unsafe { *self.msgs().add(self.head) };
-        self.head = (self.head + 1) % self.capacity;
-        self.len -= 1;
+        let msg = unsafe { core::ptr::read(self.msgs().add(idx)) };
+        // Mark slot as EMPTY (Release) so producers can reuse it.
+        self.slot_state(idx).store(SLOT_EMPTY, Ordering::Release);
+        // Advance head (Release so producers see the freed slot).
+        self.head.store(h.wrapping_add(1), Ordering::Release);
         Some(msg)
     }
 
+    /// Check if the queue is full.
     fn is_full(&self) -> bool {
-        self.len >= self.capacity
+        let t = self.tail.load(Ordering::Relaxed);
+        let h = self.head.load(Ordering::Acquire);
+        t.wrapping_sub(h) >= self.capacity
     }
 
-    #[allow(dead_code)]
+    /// Check if the queue has no ready messages.
     fn is_empty(&self) -> bool {
-        self.len == 0
+        let h = self.head.load(Ordering::Relaxed);
+        let idx = (h as usize) & (self.capacity as usize - 1);
+        self.slot_state(idx).load(Ordering::Acquire) != SLOT_READY
     }
 }
 
-/// Compute how many messages fit in a slab queue (header + messages in 2048 bytes).
-const fn slab_queue_capacity() -> usize {
-    (PORT_QUEUE_SLAB_SIZE - core::mem::size_of::<PortQueue>()) / core::mem::size_of::<Message>()
+/// Compute MPSC queue capacity for a given allocation size.
+/// Returns power-of-2 capacity, or 0 if too small.
+const fn mpsc_capacity_for_size(alloc_size: usize) -> u32 {
+    let header = core::mem::size_of::<MpscQueue>();
+    if alloc_size <= header {
+        return 0;
+    }
+    let remaining = alloc_size - header;
+    let raw_cap = remaining / (core::mem::size_of::<Message>() + 1);
+    if raw_cap == 0 {
+        return 0;
+    }
+    // Round down to power of 2.
+    1u32 << (31 - (raw_cap as u32).leading_zeros())
 }
 
-/// Allocate the default small queue from the slab allocator.
-fn alloc_queue() -> Option<*mut PortQueue> {
+/// Allocate a default MPSC queue from the slab allocator.
+fn alloc_mpsc_queue() -> Option<*mut MpscQueue> {
     let pa = crate::mm::slab::alloc(PORT_QUEUE_SLAB_SIZE)?;
-    let ptr = pa.as_usize() as *mut PortQueue;
+    let ptr = pa.as_usize() as *mut MpscQueue;
+    let cap = mpsc_capacity_for_size(PORT_QUEUE_SLAB_SIZE);
     unsafe {
         core::ptr::write_bytes(ptr as *mut u8, 0, PORT_QUEUE_SLAB_SIZE);
-        (*ptr).capacity = slab_queue_capacity();
+        (*ptr).capacity = cap;
         (*ptr).page_backed = false;
     }
     Some(ptr)
 }
 
-/// Allocate a page-backed queue with capacity for `page_count` pages of messages.
-fn alloc_page_queue(page_count: usize) -> Option<*mut PortQueue> {
-    use crate::mm::phys;
-    use crate::mm::page::PAGE_SIZE;
-    // Allocate contiguous pages. For simplicity, use single page for now.
-    // The header lives at the start of the first page.
-    if page_count != 1 {
-        return None; // Only single-page queues supported currently.
-    }
-    let pa = phys::alloc_page()?;
-    let ptr = pa.as_usize() as *mut PortQueue;
+/// Allocate a page-backed MPSC queue.
+fn alloc_mpsc_page_queue() -> Option<*mut MpscQueue> {
+    let pa = crate::mm::phys::alloc_page()?;
+    let ptr = pa.as_usize() as *mut MpscQueue;
+    let cap = mpsc_capacity_for_size(crate::mm::page::PAGE_SIZE);
     unsafe {
-        core::ptr::write_bytes(ptr as *mut u8, 0, PAGE_SIZE);
-        let cap = (PAGE_SIZE - core::mem::size_of::<PortQueue>()) / core::mem::size_of::<Message>();
+        core::ptr::write_bytes(ptr as *mut u8, 0, crate::mm::page::PAGE_SIZE);
         (*ptr).capacity = cap;
         (*ptr).page_backed = true;
     }
     Some(ptr)
 }
 
-/// Free a queue (slab or page-backed).
-fn free_queue(ptr: *mut PortQueue) {
+/// Free an MPSC queue (slab or page-backed).
+fn free_mpsc_queue(ptr: *mut MpscQueue) {
     let page_backed = unsafe { (*ptr).page_backed };
     if page_backed {
         crate::mm::phys::free_page(PhysAddr::new(ptr as usize));
@@ -147,669 +205,371 @@ fn free_queue(ptr: *mut PortQueue) {
     }
 }
 
-// --- Port structure ---
-
-// Waiter list: two-tier lazy allocation.
-// Tier 1: 64-byte slab → 16 ThreadIds.
-// Tier 2: page → PAGE_SIZE/4 ThreadIds (~16K at 64K pages).
-
-/// Slab size for initial waiter list allocation.
-const WAITER_SLAB_SIZE: usize = 64;
-/// ThreadIds per slab-allocated waiter list.
-const WAITER_SLAB_CAP: usize = WAITER_SLAB_SIZE / core::mem::size_of::<ThreadId>();
-/// ThreadIds per page-allocated waiter list.
-const WAITER_PAGE_CAP: usize = crate::mm::page::PAGE_SIZE / core::mem::size_of::<ThreadId>();
-
-/// A dynamically-sized waiter list. Null until first waiter is added.
-struct WaiterList {
-    ptr: *mut ThreadId,
-    count: u16,
-    cap: u16,
-}
-
-impl WaiterList {
-    const fn new() -> Self {
-        Self { ptr: core::ptr::null_mut(), count: 0, cap: 0 }
-    }
-
-    /// Ensure there is room for at least one more waiter.
-    /// Allocates tier-1 slab on first call, grows to tier-2 page on overflow.
-    fn ensure_room(&mut self) -> bool {
-        if (self.count as usize) < (self.cap as usize) {
-            return true;
-        }
-        if self.ptr.is_null() {
-            // Tier 1: slab allocation.
-            let pa = match crate::mm::slab::alloc(WAITER_SLAB_SIZE) {
-                Some(pa) => pa,
-                None => return false,
-            };
-            let p = pa.as_usize() as *mut ThreadId;
-            unsafe { core::ptr::write_bytes(p as *mut u8, 0, WAITER_SLAB_SIZE); }
-            self.ptr = p;
-            self.cap = WAITER_SLAB_CAP as u16;
-            true
-        } else if (self.cap as usize) < WAITER_PAGE_CAP {
-            // Tier 2: grow from slab to page.
-            let pa = match crate::mm::phys::alloc_page() {
-                Some(pa) => pa,
-                None => return false,
-            };
-            let new_ptr = pa.as_usize() as *mut ThreadId;
-            unsafe {
-                core::ptr::write_bytes(new_ptr as *mut u8, 0, crate::mm::page::PAGE_SIZE);
-                core::ptr::copy_nonoverlapping(self.ptr, new_ptr, self.count as usize);
-            }
-            // Free old slab.
-            crate::mm::slab::free(PhysAddr::new(self.ptr as usize), WAITER_SLAB_SIZE);
-            self.ptr = new_ptr;
-            self.cap = WAITER_PAGE_CAP as u16;
-            true
-        } else {
-            false // page-tier full (~16K waiters)
-        }
-    }
-
-    /// Push a waiter (LIFO stack — last added is first woken).
-    fn push(&mut self, tid: ThreadId) -> bool {
-        if !self.ensure_room() {
-            return false;
-        }
-        unsafe { *self.ptr.add(self.count as usize) = tid; }
-        self.count += 1;
-        true
-    }
-
-    /// Pop the most recently added waiter.
-    fn pop(&mut self) -> Option<ThreadId> {
-        if self.count == 0 {
-            return None;
-        }
-        self.count -= 1;
-        Some(unsafe { *self.ptr.add(self.count as usize) })
-    }
-
-    /// Peek at the most recently added waiter without removing.
-    fn peek_last(&self) -> Option<ThreadId> {
-        if self.count == 0 {
-            return None;
-        }
-        Some(unsafe { *self.ptr.add(self.count as usize - 1) })
-    }
-
-    /// Free backing memory.
-    fn free(&mut self) {
-        if self.ptr.is_null() { return; }
-        if (self.cap as usize) > WAITER_SLAB_CAP {
-            crate::mm::phys::free_page(PhysAddr::new(self.ptr as usize));
-        } else {
-            crate::mm::slab::free(PhysAddr::new(self.ptr as usize), WAITER_SLAB_SIZE);
-        }
-        self.ptr = core::ptr::null_mut();
-        self.count = 0;
-        self.cap = 0;
-    }
-}
+// ---------------------------------------------------------------------------
+// Port structure
+// ---------------------------------------------------------------------------
 
 /// Slab size for Port allocation.
 const PORT_SLAB_SIZE: usize = 256;
+
+/// Port ALIVE flag.
+const PORT_ALIVE: u32 = 1;
 
 /// Kernel receive handler type. Called synchronously when a message is
 /// sent to a kernel-held port. `user_data` is an opaque value set at
 /// port creation (e.g., an object table index). Returns a reply message.
 pub type KernelHandler = fn(PortId, usize, &Message) -> Message;
 
-/// A port endpoint.
+/// A port endpoint. Accessed via RCU (lock-free reads) after ART lookup.
+/// Fields that change concurrently use atomics; immutable-after-creation
+/// fields use plain types.
 pub struct Port {
     #[allow(dead_code)]
     pub id: PortId,
-    /// Pointer to message queue (0 = not yet allocated).
-    /// Default: slab-allocated on first send. Can be upgraded to a
-    /// page-backed queue via resize().
-    queue_ptr: usize,
-    /// Kernel receive handler (0 = none). When set, the kernel holds the
-    /// receive right: sends invoke this handler synchronously instead of
-    /// queueing, and no user-space thread can recv on this port.
+    /// MPSC queue pointer (0 for kernel-held ports).
+    mpsc_ptr: usize,
+    /// Kernel receive handler (0 = none).
     kernel_handler: usize,
-    /// Opaque value passed to the kernel handler. Set at port creation.
+    /// Opaque value passed to the kernel handler.
     kernel_user_data: usize,
-    /// Threads blocked waiting to receive (lazy two-tier allocation).
-    recv_waiters: WaiterList,
-    /// Threads blocked waiting to send (lazy two-tier allocation).
-    send_waiters: WaiterList,
     /// Port set this port belongs to (u32::MAX = none).
-    pub port_set_id: u32,
+    pub port_set_id: AtomicU32,
     /// Task that created this port.
     pub creator_task: u32,
-    /// Task holding the RECV cap (u32::MAX = none). Maintained on RECV grant/revoke.
-    pub recv_holder: u32,
+    /// Task holding the RECV cap (u32::MAX = none).
+    pub recv_holder: AtomicU32,
+    /// Port flags (PORT_ALIVE, etc.).
+    flags: AtomicU32,
 }
 
 impl Port {
-    pub const fn new(id: PortId) -> Self {
-        Self {
-            id,
-            queue_ptr: 0,
-            kernel_handler: 0,
-            kernel_user_data: 0,
-            recv_waiters: WaiterList::new(),
-            send_waiters: WaiterList::new(),
-            port_set_id: u32::MAX,
-            creator_task: 0,
-            recv_holder: u32::MAX,
-        }
-    }
-
     /// Whether this port has a kernel receive handler.
     #[inline]
     pub fn is_kernel_held(&self) -> bool {
         self.kernel_handler != 0
     }
 
-    /// Ensure the message queue is allocated. Returns false on OOM.
-    fn ensure_queue(&mut self) -> bool {
-        if self.queue_ptr != 0 {
-            return true;
-        }
-        match alloc_queue() {
-            Some(ptr) => {
-                self.queue_ptr = ptr as usize;
-                true
-            }
-            None => false,
-        }
+    /// Whether this port is alive (not destroyed).
+    #[inline]
+    fn is_alive(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & PORT_ALIVE != 0
     }
 
-    /// Get a reference to the queue, if allocated.
-    #[allow(dead_code)]
-    fn queue(&self) -> Option<&PortQueue> {
-        if self.queue_ptr == 0 { None } else { Some(unsafe { &*(self.queue_ptr as *const PortQueue) }) }
+    /// Get a reference to the MPSC queue, if allocated.
+    #[inline]
+    fn mpsc(&self) -> Option<&MpscQueue> {
+        if self.mpsc_ptr == 0 { None } else { Some(unsafe { &*(self.mpsc_ptr as *const MpscQueue) }) }
     }
 
-    /// Get a mutable reference to the queue, if allocated.
-    fn queue_mut(&mut self) -> Option<&mut PortQueue> {
-        if self.queue_ptr == 0 { None } else { Some(unsafe { &mut *(self.queue_ptr as *mut PortQueue) }) }
-    }
-
-    /// Free the queue if allocated.
-    fn free_queue(&mut self) {
-        if self.queue_ptr != 0 {
-            free_queue(self.queue_ptr as *mut PortQueue);
-            self.queue_ptr = 0;
-        }
-    }
-
-    /// Try to enqueue a message. Returns Ok((direct_wakeup, port_set_id)) where
-    /// direct_wakeup is a receiver thread to wake, and port_set_id is the set
-    /// to notify if no direct receiver exists. Err(msg) if queue is full or OOM.
-    pub fn try_send(&mut self, msg: Message) -> Result<(Option<ThreadId>, u32), Message> {
-        if !self.ensure_queue() {
-            return Err(msg);
-        }
-        let q = self.queue_mut().unwrap();
-        if !q.enqueue(msg) {
-            return Err(msg);
-        }
-
-        // Wake up a blocked receiver if any.
-        if let Some(waiter) = self.recv_waiters.pop() {
-            Ok((Some(waiter), u32::MAX))
-        } else {
-            // No direct receiver — notify port set if this port belongs to one.
-            Ok((None, self.port_set_id))
-        }
-    }
-
-    /// Try to dequeue a message. Returns Ok(msg, Option<ThreadId>) where
-    /// the Option is a sender to wake up, or Err(()) if the queue is empty.
-    pub fn try_recv(&mut self) -> Result<(Message, Option<ThreadId>), ()> {
-        let q = match self.queue_mut() {
-            Some(q) => q,
-            None => return Err(()),
-        };
-        let msg = match q.dequeue() {
-            Some(m) => m,
-            None => return Err(()),
-        };
-
-        // Wake up a blocked sender if any.
-        let wakeup = self.send_waiters.pop();
-
-        Ok((msg, wakeup))
-    }
-
-    /// Add a thread to the receive wait list.
-    pub fn add_recv_waiter(&mut self, tid: ThreadId) -> bool {
-        self.recv_waiters.push(tid)
-    }
-
-    /// Add a thread to the send wait list.
-    pub fn add_send_waiter(&mut self, tid: ThreadId) -> bool {
-        self.send_waiters.push(tid)
-    }
-
-    /// Number of queued messages.
-    #[allow(dead_code)]
-    pub fn queued(&self) -> usize {
-        match self.queue() {
-            Some(q) => q.len,
-            None => 0,
-        }
-    }
-
-    /// Whether the queue exists and is full.
-    #[allow(dead_code)]
-    pub fn is_queue_full(&self) -> bool {
-        match self.queue() {
-            Some(q) => q.is_full(),
-            None => false, // No queue yet — not full (first send will allocate)
-        }
-    }
-
-    /// Current queue capacity (0 if no queue allocated yet).
+    /// Current queue capacity (0 if no queue allocated).
     pub fn queue_capacity(&self) -> usize {
-        match self.queue() {
-            Some(q) => q.capacity,
+        match self.mpsc() {
+            Some(q) => q.capacity as usize,
             None => 0,
         }
-    }
-
-    /// Resize the queue to hold at least `new_capacity` messages.
-    /// Migrates any pending messages from the old queue to the new one.
-    /// The new queue is page-backed. Returns false on OOM or if new_capacity
-    /// is smaller than the number of currently queued messages.
-    fn resize_queue(&mut self, new_capacity: usize) -> bool {
-        // Compute required pages. Currently we only support single-page queues.
-        let max_page_cap = (crate::mm::page::PAGE_SIZE - core::mem::size_of::<PortQueue>())
-            / core::mem::size_of::<Message>();
-        if new_capacity > max_page_cap {
-            return false; // Would require multi-page queue, not yet supported.
-        }
-
-        // Don't downsize below current pending count.
-        let pending = match self.queue() {
-            Some(q) => q.len,
-            None => 0,
-        };
-        if new_capacity < pending {
-            return false;
-        }
-
-        // If already page-backed with sufficient capacity, nothing to do.
-        if let Some(q) = self.queue() {
-            if q.page_backed && q.capacity >= new_capacity {
-                return true;
-            }
-        }
-
-        // Allocate the new page-backed queue.
-        let new_q = match alloc_page_queue(1) {
-            Some(q) => q,
-            None => return false,
-        };
-
-        // Migrate pending messages.
-        if let Some(old_q) = self.queue_mut() {
-            let new_ref = unsafe { &mut *new_q };
-            while let Some(msg) = old_q.dequeue() {
-                new_ref.enqueue(msg);
-            }
-        }
-
-        // Free old queue.
-        if self.queue_ptr != 0 {
-            free_queue(self.queue_ptr as *mut PortQueue);
-        }
-        self.queue_ptr = new_q as usize;
-        true
     }
 }
 
-// --- Port slab allocation ---
-
-/// Allocate a Port from the slab allocator.
-fn alloc_port(id: PortId) -> Option<*mut Port> {
+/// Allocate a Port from the slab allocator with an MPSC queue.
+fn alloc_port(id: PortId, with_queue: bool) -> Option<*mut Port> {
     let pa = crate::mm::slab::alloc(PORT_SLAB_SIZE)?;
     let ptr = pa.as_usize() as *mut Port;
-    unsafe { core::ptr::write(ptr, Port::new(id)); }
+
+    let mpsc = if with_queue {
+        match alloc_mpsc_queue() {
+            Some(q) => q as usize,
+            None => {
+                crate::mm::slab::free(pa, PORT_SLAB_SIZE);
+                return None;
+            }
+        }
+    } else {
+        0
+    };
+
+    unsafe {
+        core::ptr::write_bytes(ptr as *mut u8, 0, PORT_SLAB_SIZE);
+        (*ptr).id = id;
+        (*ptr).mpsc_ptr = mpsc;
+        (*ptr).port_set_id = AtomicU32::new(u32::MAX);
+        (*ptr).recv_holder = AtomicU32::new(u32::MAX);
+        (*ptr).flags = AtomicU32::new(PORT_ALIVE);
+    }
     Some(ptr)
 }
 
-/// Free a Port, its queue, and waiter lists back to their allocators.
+/// Free a Port and its queue.
 fn free_port(ptr: *mut Port) {
-    unsafe {
-        (*ptr).free_queue();
-        (*ptr).recv_waiters.free();
-        (*ptr).send_waiters.free();
+    let mpsc = unsafe { (*ptr).mpsc_ptr };
+    if mpsc != 0 {
+        free_mpsc_queue(mpsc as *mut MpscQueue);
     }
     crate::mm::slab::free(PhysAddr::new(ptr as usize), PORT_SLAB_SIZE);
 }
 
-// --- ART-backed port table ---
+// ---------------------------------------------------------------------------
+// Global ART-backed port table (RCU-protected, lock-free reads)
+// ---------------------------------------------------------------------------
 
-use crate::sync::SpinLock;
-
-struct PortTable {
-    art: Art,
-    next_id: u64,
+/// Wrapper around Art providing interior mutability for global access.
+/// Reads are lock-free (RCU). Writes require ART_WRITE_LOCK.
+struct PortArt {
+    inner: UnsafeCell<Art>,
 }
 
-impl PortTable {
+unsafe impl Sync for PortArt {}
+
+impl PortArt {
     const fn new() -> Self {
-        Self {
-            art: Art::new(),
-            next_id: 0,
-        }
+        Self { inner: UnsafeCell::new(Art::new()) }
     }
 
-    /// Look up a port by local ID. Returns a reference valid while lock is held.
+    /// Lock-free lookup by local port ID. Safe to call without any lock.
     #[inline]
-    fn get(&self, local: u64) -> Option<&Port> {
-        let ptr = self.art.lookup(local)?;
+    fn lookup(&self, local: u64) -> Option<&Port> {
+        let ptr = unsafe { &*self.inner.get() }.lookup(local)?;
         Some(unsafe { &*(ptr as *const Port) })
     }
 
-    /// Mutable lookup by local ID.
-    #[inline]
-    fn get_mut(&mut self, local: u64) -> Option<&mut Port> {
-        let ptr = self.art.lookup(local)?;
-        Some(unsafe { &mut *(ptr as *mut Port) })
+    /// Insert a port. Must hold ART_WRITE_LOCK.
+    fn insert(&self, local: u64, ptr: *mut Port) -> bool {
+        unsafe { &mut *self.inner.get() }.insert(local, ptr as usize)
+    }
+
+    /// Lookup returning a raw mutable pointer. Must hold ART_WRITE_LOCK.
+    fn lookup_mut(&self, local: u64) -> Option<*mut Port> {
+        unsafe { &*self.inner.get() }.lookup(local).map(|p| p as *mut Port)
+    }
+
+    /// Remove a port. Must hold ART_WRITE_LOCK. Returns port pointer.
+    fn remove(&self, local: u64) -> Option<*mut Port> {
+        unsafe { &mut *self.inner.get() }.remove(local).map(|p| p as *mut Port)
     }
 }
 
-static PORT_TABLE: SpinLock<PortTable> = SpinLock::new(PortTable::new());
+static PORT_ART: PortArt = PortArt::new();
+
+/// Monotonically increasing port ID counter.
+static NEXT_PORT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Registered proxy port for network-transparent IPC. Non-local sends are
 /// redirected to this port. 0 = no proxy registered.
-pub static PROXY_PORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PROXY_PORT: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// Port lookup helper (RCU read, lock-free)
+// ---------------------------------------------------------------------------
+
+/// Look up a port by ID. Returns a reference valid for the current RCU
+/// read-side critical section (i.e. the current syscall).
+#[inline]
+fn port_ref(port_id: PortId) -> Option<&'static Port> {
+    let local = port_local(port_id);
+    let port = PORT_ART.lookup(local)?;
+    if port.is_alive() { Some(port) } else { None }
+}
+
+// ---------------------------------------------------------------------------
+// Create / Destroy
+// ---------------------------------------------------------------------------
 
 /// Create a new port. Returns its ID (node=0, local=monotonic_counter).
 pub fn create() -> Option<PortId> {
     let creator = crate::sched::current_task_id();
-    let mut table = PORT_TABLE.lock();
-    let local = table.next_id;
-    table.next_id += 1;
+    let local = NEXT_PORT_ID.fetch_add(1, Ordering::Relaxed);
     let pid = make_port_id(0, local);
-    let ptr = alloc_port(pid)?;
+    let ptr = alloc_port(pid, true)?;
     unsafe { (*ptr).creator_task = creator; }
-    if !table.art.insert(local, ptr as usize) {
+
+    let _wlock = ART_WRITE_LOCK.lock();
+    if !PORT_ART.insert(local, ptr) {
+        drop(_wlock);
         free_port(ptr);
         return None;
     }
     Some(pid)
 }
 
+/// Create a port with a kernel receive handler.
+pub fn create_kernel_port(handler: KernelHandler, user_data: usize) -> Option<PortId> {
+    let local = NEXT_PORT_ID.fetch_add(1, Ordering::Relaxed);
+    let pid = make_port_id(0, local);
+    // Kernel ports don't need a queue (handler invoked synchronously).
+    let ptr = alloc_port(pid, false)?;
+    unsafe {
+        (*ptr).creator_task = 0;
+        (*ptr).kernel_handler = handler as usize;
+        (*ptr).kernel_user_data = user_data;
+    }
+
+    let _wlock = ART_WRITE_LOCK.lock();
+    if !PORT_ART.insert(local, ptr) {
+        drop(_wlock);
+        free_port(ptr);
+        return None;
+    }
+    Some(pid)
+}
+
+/// RCU callback to free a port and its queue.
+fn rcu_free_port_callback(ptr: usize) {
+    free_port(ptr as *mut Port);
+}
+
+/// Destroy a port, removing it from the table and freeing all resources.
+/// Uses deferred free via RCU — the port memory is reclaimed after a grace
+/// period, so this never blocks (safe to call before interrupts are enabled).
+pub fn destroy(port_id: PortId) {
+    use crate::sync::turnstile::{KEY_PORT_RECV, KEY_PORT_SEND};
+
+    let local = port_local(port_id);
+
+    // Remove from ART under write lock — new lookups will return None.
+    let ptr = {
+        let _wlock = ART_WRITE_LOCK.lock();
+        match PORT_ART.remove(local) {
+            Some(p) => p,
+            None => return,
+        }
+    };
+
+    // Mark as dead so in-flight readers get clean errors.
+    unsafe { (*ptr).flags.store(0, Ordering::Release); }
+
+    // Wake all blocked waiters (they will retry lookup and get None → error).
+    crate::sync::turnstile::port_wake_all(port_id, KEY_PORT_RECV);
+    crate::sync::turnstile::port_wake_all(port_id, crate::sync::turnstile::KEY_PORT_RECV_PARK);
+    crate::sync::turnstile::port_wake_all(port_id, KEY_PORT_SEND);
+
+    // Defer free via RCU — the port and its queue are freed after all
+    // in-flight RCU readers have finished.
+    crate::sync::rcu::rcu_defer_free(ptr as usize, rcu_free_port_callback);
+}
+
+// ---------------------------------------------------------------------------
+// Read-only queries (lock-free via RCU)
+// ---------------------------------------------------------------------------
+
 /// Get the creator task of a port, or None if port doesn't exist.
 pub fn port_creator(port_id: PortId) -> Option<u32> {
-    let local = port_local(port_id);
-    let table = PORT_TABLE.lock();
-    table.get(local).map(|p| p.creator_task)
+    port_ref(port_id).map(|p| p.creator_task)
 }
 
-/// Get the kernel_user_data of a kernel-held port, or None if not found / not kernel-held.
+/// Get the kernel_user_data of a kernel-held port.
 pub fn port_kernel_data(port_id: PortId) -> Option<usize> {
-    let local = port_local(port_id);
-    let table = PORT_TABLE.lock();
-    let p = table.get(local)?;
+    let p = port_ref(port_id)?;
     if p.is_kernel_held() { Some(p.kernel_user_data) } else { None }
-}
-
-/// Send a message to a port (non-blocking).
-/// Returns Ok(()) on success, Err(msg) if the queue is full.
-pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {
-    // Stamp sender priority for priority inheritance.
-    let tid = crate::sched::current_thread_id();
-    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
-    let local = port_local(port_id);
-    let mut table = PORT_TABLE.lock();
-    let port = match table.get_mut(local) {
-        Some(p) => p,
-        None => return Err(msg),
-    };
-    // Kernel-held port: invoke handler synchronously, no queue.
-    if port.is_kernel_held() {
-        let handler = port.kernel_handler;
-        let udata = port.kernel_user_data;
-        drop(table);
-        let handler_fn: KernelHandler = unsafe { core::mem::transmute(handler) };
-        let _reply = handler_fn(port_id, udata, &msg);
-        return Ok(());
-    }
-    match port.try_send(msg) {
-        Ok((wakeup, set_id)) => {
-            if let Some(waiter_tid) = wakeup {
-                // Check if the waiter is parked (Blocked from recv_or_park).
-                use crate::sched::thread::ThreadState;
-                let is_parked = {
-                    let sched = crate::sched::scheduler::SCHEDULER.lock();
-                    sched.thread(waiter_tid).state == ThreadState::Blocked
-                };
-                if is_parked {
-                    // Dequeue the message we just queued — we'll inject it directly.
-                    let dequeued = port.try_recv();
-                    drop(table);
-                    if let Ok((queued_msg, _)) = dequeued {
-                        crate::syscall::handlers::deliver_to_parked_receiver(waiter_tid, &queued_msg);
-                    }
-                    crate::sched::scheduler::wake_parked_thread(waiter_tid);
-                } else {
-                    drop(table);
-                    crate::sched::wake_thread(waiter_tid);
-                }
-            } else {
-                drop(table);
-                if set_id != u32::MAX {
-                    super::port_set::wake_set_waiter(set_id);
-                }
-            }
-            Ok(())
-        }
-        Err(msg) => {
-            drop(table);
-            Err(msg)
-        },
-    }
-}
-
-/// Receive a message from a port (non-blocking).
-/// Returns Ok(msg) on success, Err(()) if empty or kernel-held.
-pub fn recv_nb(port_id: PortId) -> Result<Message, ()> {
-    let local = port_local(port_id);
-    let mut table = PORT_TABLE.lock();
-    let port = match table.get_mut(local) {
-        Some(p) => p,
-        None => return Err(()),
-    };
-    if port.is_kernel_held() {
-        return Err(());
-    }
-    match port.try_recv() {
-        Ok((msg, wakeup)) => {
-            drop(table);
-            if let Some(tid) = wakeup {
-                crate::sched::wake_thread(tid);
-            }
-            crate::sched::stats::IPC_RECVS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            crate::trace::trace_event(crate::trace::EVT_IPC_RECV, port_id as u32, 0);
-            Ok(msg)
-        }
-        Err(()) => Err(()),
-    }
-}
-
-/// Send a message to a port (blocking).
-/// Blocks if the queue is full until space is available.
-pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
-    use crate::sched::thread::BlockReason;
-    // Stamp sender priority for priority inheritance.
-    let tid = crate::sched::current_thread_id();
-    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
-    crate::sched::stats::IPC_SENDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let local = port_local(port_id);
-    // Check for kernel handler before entering the loop.
-    {
-        let table = PORT_TABLE.lock();
-        let port = match table.get(local) {
-            Some(p) => p,
-            None => return Err(()),
-        };
-        if port.is_kernel_held() {
-            let handler = port.kernel_handler;
-            let udata = port.kernel_user_data;
-            drop(table);
-            let handler_fn: KernelHandler = unsafe { core::mem::transmute(handler) };
-            let _reply = handler_fn(port_id, udata, &msg);
-            return Ok(());
-        }
-    }
-    let mut pending = msg;
-    loop {
-        let mut table = PORT_TABLE.lock();
-        let port = match table.get_mut(local) {
-            Some(p) => p,
-            None => return Err(()),
-        };
-        match port.try_send(pending) {
-            Ok((wakeup, set_id)) => {
-                if let Some(waiter_tid) = wakeup {
-                    use crate::sched::thread::ThreadState;
-                    let is_parked = {
-                        let sched = crate::sched::scheduler::SCHEDULER.lock();
-                        sched.thread(waiter_tid).state == ThreadState::Blocked
-                    };
-                    if is_parked {
-                        // Dequeue the message — inject directly into parked receiver.
-                        let dequeued = port.try_recv();
-                        drop(table);
-                        if let Ok((queued_msg, _)) = dequeued {
-                            crate::syscall::handlers::deliver_to_parked_receiver(waiter_tid, &queued_msg);
-                        }
-                        crate::sched::scheduler::wake_parked_thread(waiter_tid);
-                    } else {
-                        drop(table);
-                        crate::sched::wake_thread(waiter_tid);
-                    }
-                } else {
-                    drop(table);
-                    if set_id != u32::MAX {
-                        super::port_set::wake_set_waiter(set_id);
-                    }
-                }
-                return Ok(());
-            }
-            Err(returned_msg) => {
-                let tid = crate::sched::current_thread_id();
-                crate::sched::clear_wakeup_flag(tid);
-                port.add_send_waiter(tid);
-                pending = returned_msg;
-                drop(table);
-                crate::sched::block_current(BlockReason::PortSend(port_id));
-            }
-        }
-    }
-}
-
-/// Receive a message from a port (blocking).
-/// Blocks if the queue is empty until a message arrives.
-pub fn recv(port_id: PortId) -> Result<Message, ()> {
-    use crate::sched::thread::BlockReason;
-    let local = port_local(port_id);
-    // Reset priority to base on recv entry (priority inheritance protocol).
-    let my_tid = crate::sched::current_thread_id();
-    crate::sched::reset_priority(my_tid);
-    loop {
-        let mut table = PORT_TABLE.lock();
-        let port = match table.get_mut(local) {
-            Some(p) => p,
-            None => return Err(()),
-        };
-        if port.is_kernel_held() {
-            return Err(());
-        }
-        match port.try_recv() {
-            Ok((msg, wakeup)) => {
-                drop(table);
-                if let Some(tid) = wakeup {
-                    crate::sched::wake_thread(tid);
-                }
-                // Boost to sender's priority (priority inheritance).
-                crate::sched::boost_priority(my_tid, msg.data[5] as u8);
-                return Ok(msg);
-            }
-            Err(()) => {
-                let tid = crate::sched::current_thread_id();
-                crate::sched::clear_wakeup_flag(tid);
-                port.add_recv_waiter(tid);
-                drop(table);
-                crate::sched::block_current(BlockReason::PortRecv(port_id));
-            }
-        }
-    }
-}
-
-/// Set the port set membership for a port.
-pub fn set_port_set(port_id: PortId, set_id: u32) {
-    let local = port_local(port_id);
-    let mut table = PORT_TABLE.lock();
-    if let Some(port) = table.get_mut(local) {
-        port.port_set_id = set_id;
-    }
 }
 
 /// Check if a port exists (for auto-grant heuristics).
 pub fn port_is_active(port_id: PortId) -> bool {
-    let local = port_local(port_id);
-    let table = PORT_TABLE.lock();
-    table.get(local).is_some()
+    port_ref(port_id).is_some()
 }
 
-/// Set the recv_holder for a port (task that holds the RECV cap).
-pub fn set_recv_holder(port_id: PortId, task_id: u32) {
-    let local = port_local(port_id);
-    let mut table = PORT_TABLE.lock();
-    if let Some(port) = table.get_mut(local) {
-        port.recv_holder = task_id;
-    }
+/// Check if a port has a kernel receive handler.
+#[allow(dead_code)]
+pub fn has_kernel_handler(port_id: PortId) -> bool {
+    matches!(port_ref(port_id), Some(p) if p.is_kernel_held())
 }
 
 /// Get the recv_holder for a port. Returns u32::MAX if none.
 pub fn get_recv_holder(port_id: PortId) -> u32 {
-    let local = port_local(port_id);
-    let table = PORT_TABLE.lock();
-    match table.get(local) {
-        Some(port) => port.recv_holder,
+    match port_ref(port_id) {
+        Some(port) => port.recv_holder.load(Ordering::Relaxed),
         None => u32::MAX,
     }
 }
 
-/// Destroy a port, removing it from the table and freeing all resources.
-#[allow(dead_code)]
-pub fn destroy(port_id: PortId) {
-    let local = port_local(port_id);
-    let mut table = PORT_TABLE.lock();
-    if let Some(ptr) = table.art.remove(local) {
-        drop(table);
-        free_port(ptr as *mut Port);
+/// Current queue capacity (0 if no queue allocated).
+pub fn queue_capacity(port_id: PortId) -> usize {
+    match port_ref(port_id) {
+        Some(port) => port.queue_capacity(),
+        None => 0,
     }
 }
 
-/// Resize a port's message queue to hold at least `new_capacity` messages.
-/// The new queue is page-backed. Pending messages are migrated atomically
-/// (under PORT_TABLE lock). Returns true on success.
-pub fn resize(port_id: PortId, new_capacity: usize) -> bool {
-    let local = port_local(port_id);
-    let mut table = PORT_TABLE.lock();
-    match table.get_mut(local) {
-        Some(port) => port.resize_queue(new_capacity),
-        None => false,
+// ---------------------------------------------------------------------------
+// Mutation helpers (some need ART_WRITE_LOCK, some use atomics)
+// ---------------------------------------------------------------------------
+
+/// Set the port set membership for a port.
+pub fn set_port_set(port_id: PortId, set_id: u32) {
+    if let Some(port) = port_ref(port_id) {
+        port.port_set_id.store(set_id, Ordering::Release);
     }
 }
+
+/// Set the recv_holder for a port (task that holds the RECV cap).
+pub fn set_recv_holder(port_id: PortId, task_id: u32) {
+    if let Some(port) = port_ref(port_id) {
+        port.recv_holder.store(task_id, Ordering::Release);
+    }
+}
+
+/// Resize a port's message queue. Allocates a page-backed queue,
+/// drains old queue, swaps, waits for RCU grace period, frees old.
+/// Returns true on success.
+pub fn resize(port_id: PortId, new_capacity: usize) -> bool {
+    let local = port_local(port_id);
+    let max_page_cap = mpsc_capacity_for_size(crate::mm::page::PAGE_SIZE) as usize;
+    if new_capacity > max_page_cap {
+        return false;
+    }
+
+    let _wlock = ART_WRITE_LOCK.lock();
+    let port_ptr = match PORT_ART.lookup_mut(local) {
+        Some(p) => p,
+        None => return false,
+    };
+    let port = unsafe { &*port_ptr };
+    if !port.is_alive() || port.is_kernel_held() {
+        return false;
+    }
+
+    let old_mpsc = port.mpsc_ptr;
+    if old_mpsc != 0 {
+        let old_q = unsafe { &*(old_mpsc as *const MpscQueue) };
+        if old_q.page_backed && (old_q.capacity as usize) >= new_capacity {
+            return true; // already large enough
+        }
+    }
+
+    // Allocate new page-backed queue.
+    let new_q = match alloc_mpsc_page_queue() {
+        Some(q) => q,
+        None => return false,
+    };
+
+    // Swap the pointer. Under ART_WRITE_LOCK, so no concurrent resize.
+    unsafe { (*port_ptr).mpsc_ptr = new_q as usize; }
+
+    drop(_wlock);
+
+    // Wait for in-flight senders on the old queue to finish.
+    if old_mpsc != 0 {
+        crate::sync::rcu::synchronize_rcu();
+
+        // Drain remaining messages from old queue into new queue.
+        let old_q = unsafe { &*(old_mpsc as *const MpscQueue) };
+        let new_ref = unsafe { &*new_q };
+        while let Some(msg) = old_q.recv() {
+            new_ref.send(&msg);
+        }
+        free_mpsc_queue(old_mpsc as *mut MpscQueue);
+    }
+
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Send API
+// ---------------------------------------------------------------------------
 
 /// Result of a send with direct-transfer optimization.
 pub enum SendDirectResult {
-    /// Message was queued normally (or queued + spin-blocked waiter woken).
+    /// Message was queued normally (or queued + blocked waiter woken).
     Queued,
-    /// A receiver was parked (Blocked) — message NOT queued. Caller must inject + wake/handoff.
+    /// A receiver was parked (Blocked) — message NOT queued. Caller must inject + wake.
     DirectTransfer(crate::sched::thread::ThreadId),
     /// Queue is full.
     Full,
@@ -817,62 +577,263 @@ pub enum SendDirectResult {
     Error,
 }
 
-/// Try to send with direct-transfer optimization.
-/// If a receiver is parked (Blocked state, from recv_or_park) on this port,
-/// returns DirectTransfer(tid) without queueing the message. The caller is
-/// responsible for injecting the message and waking/handing off to the receiver.
-pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
-    use crate::sched::thread::ThreadState;
+/// Internal: stamp sender priority and do an MPSC send + wake receiver.
+/// Returns Ok(()) on success, Err(()) if queue full or port invalid.
+fn do_send(port: &Port, msg: &Message) -> Result<(), ()> {
+    use crate::sync::turnstile::{KEY_PORT_RECV, KEY_PORT_RECV_PARK};
+    let q = match port.mpsc() {
+        Some(q) => q,
+        None => return Err(()),
+    };
+    if !q.send(msg) {
+        return Err(());
+    }
+    // Wake a blocked receiver. Parked receivers (recv_or_park) need
+    // wake_parked_thread; normal recv blockers need wake_thread.
+    wake_recv_waiter(port.id);
+    // Also notify port set.
+    let set_id = port.port_set_id.load(Ordering::Relaxed);
+    if set_id != u32::MAX {
+        super::port_set::wake_set_waiter(set_id);
+    }
+    Ok(())
+}
+
+/// Wake one receiver blocked on a port. Uses the correct wake function
+/// depending on whether the receiver is parked (recv_or_park, needs
+/// wake_parked_thread + frame injection) or normally blocked (recv,
+/// needs wake_thread for spin-wait).
+fn wake_recv_waiter(port_id: PortId) {
+    use crate::sync::turnstile::{KEY_PORT_RECV, KEY_PORT_RECV_PARK};
+    // Try parked receivers first (they've been waiting longer / expect direct injection).
+    if let Some(tid) = crate::sync::turnstile::port_dequeue_one(port_id, KEY_PORT_RECV_PARK) {
+
+        // Parked receivers expect the message to be injected into their saved
+        // exception frame (just like DirectTransfer). Dequeue from the MPSC
+        // queue and inject before waking. The receiver is parked (not running),
+        // so we are the sole consumer of the MPSC queue right now.
+        if let Some(port) = port_ref(port_id) {
+            if let Some(q) = port.mpsc() {
+                if let Some(msg) = q.recv() {
+                    crate::syscall::handlers::deliver_to_parked_receiver(tid, &msg);
+                    // Wake a blocked sender now that we freed a queue slot.
+                    crate::sync::turnstile::port_wake_one(port_id, crate::sync::turnstile::KEY_PORT_SEND);
+                }
+            }
+        }
+        crate::sched::scheduler::wake_parked_thread(tid);
+        return;
+    }
+    // Then try normal recv blockers (spin-waiting via block_current).
+
+    crate::sync::turnstile::port_wake_one(port_id, KEY_PORT_RECV);
+}
+
+/// Send a message to a port (non-blocking).
+/// Returns Ok(()) on success, Err(msg) if the queue is full.
+pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {
+    let tid = crate::sched::current_thread_id();
+    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
+    let port = match port_ref(port_id) {
+        Some(p) => p,
+        None => return Err(msg),
+    };
+    // Kernel-held port: invoke handler synchronously.
+    if port.is_kernel_held() {
+        let handler_fn: KernelHandler = unsafe { core::mem::transmute(port.kernel_handler) };
+        let _reply = handler_fn(port_id, port.kernel_user_data, &msg);
+        return Ok(());
+    }
+    match do_send(port, &msg) {
+        Ok(()) => Ok(()),
+        Err(()) => Err(msg),
+    }
+}
+
+/// Send a message to a port (blocking).
+/// Blocks if the queue is full until space is available.
+pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
+    use crate::sched::thread::BlockReason;
+    use crate::sync::turnstile::KEY_PORT_SEND;
 
     let tid = crate::sched::current_thread_id();
     msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
-    crate::sched::stats::IPC_SENDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::sched::stats::IPC_SENDS.fetch_add(1, Ordering::Relaxed);
+
+    // Check for kernel handler.
+    {
+        let port = match port_ref(port_id) {
+            Some(p) => p,
+            None => return Err(()),
+        };
+        if port.is_kernel_held() {
+            let handler_fn: KernelHandler = unsafe { core::mem::transmute(port.kernel_handler) };
+            let _reply = handler_fn(port_id, port.kernel_user_data, &msg);
+            return Ok(());
+        }
+    }
+
+    loop {
+        let port = match port_ref(port_id) {
+            Some(p) => p,
+            None => return Err(()),
+        };
+        if do_send(port, &msg).is_ok() {
+            return Ok(());
+        }
+        // Queue full — block on turnstile with lost-wakeup prevention.
+        let enqueued = crate::sync::turnstile::port_enqueue_with_check(
+            port_id,
+            KEY_PORT_SEND,
+            tid,
+            || {
+                // Re-check under HAMT bucket lock: still full?
+                match port_ref(port_id) {
+                    Some(p) => match p.mpsc() {
+                        Some(q) => q.is_full(),
+                        None => false, // port destroyed, don't block
+                    },
+                    None => false, // port gone
+                }
+            },
+        );
+        if enqueued {
+            crate::sched::block_current(BlockReason::PortSend(port_id));
+        }
+        // Retry after wake.
+    }
+}
+
+/// Try to send with direct-transfer optimization.
+/// If a receiver is parked on this port, returns DirectTransfer(tid)
+/// without queueing the message.
+pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
+    use crate::sync::turnstile::{KEY_PORT_RECV, KEY_PORT_RECV_PARK};
+
+    let tid = crate::sched::current_thread_id();
+    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
+    crate::sched::stats::IPC_SENDS.fetch_add(1, Ordering::Relaxed);
     crate::trace::trace_event(crate::trace::EVT_IPC_SEND, port_id as u32, 0);
 
-    let local = port_local(port_id);
-    let mut table = PORT_TABLE.lock();
-    let port = match table.get_mut(local) {
+    let port = match port_ref(port_id) {
         Some(p) => p,
-        None => return SendDirectResult::Error,
+        None => {
+            return SendDirectResult::Error;
+        }
     };
 
     // Kernel-held port: invoke handler synchronously.
     if port.is_kernel_held() {
-        let handler = port.kernel_handler;
-        let udata = port.kernel_user_data;
-        drop(table);
-        let handler_fn: KernelHandler = unsafe { core::mem::transmute(handler) };
-        let _reply = handler_fn(port_id, udata, msg);
+        let handler_fn: KernelHandler = unsafe { core::mem::transmute(port.kernel_handler) };
+        let _reply = handler_fn(port_id, port.kernel_user_data, msg);
         return SendDirectResult::Queued;
     }
 
-    // Check for a parked (Blocked) receiver — direct transfer candidate.
-    if let Some(waiter) = port.recv_waiters.peek_last() {
-        let is_parked = {
-            let sched = crate::sched::scheduler::SCHEDULER.lock();
-            sched.thread(waiter).state == ThreadState::Blocked
-        };
-        if is_parked {
-            port.recv_waiters.pop();
-            drop(table);
-            return SendDirectResult::DirectTransfer(waiter);
-        }
+    // Try to dequeue a parked receiver (from recv_or_park) for direct transfer.
+    // Only KEY_PORT_RECV_PARK waiters are eligible — they expect message injection
+    // into their frame, not via the queue.
+    if let Some(waiter) = crate::sync::turnstile::port_dequeue_one(port_id, KEY_PORT_RECV_PARK) {
+
+        return SendDirectResult::DirectTransfer(waiter);
     }
 
     // No parked receiver — try to queue normally.
-    match port.try_send(*msg) {
-        Ok((wakeup, set_id)) => {
-            drop(table);
-            if let Some(waiter) = wakeup {
-                crate::sched::wake_thread(waiter);
-            } else if set_id != u32::MAX {
-                super::port_set::wake_set_waiter(set_id);
-            }
-            SendDirectResult::Queued
+    let q = match port.mpsc() {
+        Some(q) => q,
+        None => return SendDirectResult::Error,
+    };
+    if q.send(msg) {
+
+        // Wake a blocked receiver (parked or normal).
+        wake_recv_waiter(port_id);
+        let set_id = port.port_set_id.load(Ordering::Relaxed);
+        if set_id != u32::MAX {
+            super::port_set::wake_set_waiter(set_id);
         }
-        Err(_) => {
-            drop(table);
-            SendDirectResult::Full
+        SendDirectResult::Queued
+    } else {
+        SendDirectResult::Full
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recv API
+// ---------------------------------------------------------------------------
+
+/// Receive a message from a port (non-blocking).
+/// Returns Ok(msg) on success, Err(()) if empty or kernel-held.
+pub fn recv_nb(port_id: PortId) -> Result<Message, ()> {
+    let port = match port_ref(port_id) {
+        Some(p) => p,
+        None => return Err(()),
+    };
+    if port.is_kernel_held() {
+        return Err(());
+    }
+    let q = match port.mpsc() {
+        Some(q) => q,
+        None => return Err(()),
+    };
+    match q.recv() {
+        Some(msg) => {
+            // Wake a blocked sender (queue was full, now has space).
+            crate::sync::turnstile::port_wake_one(port_id, crate::sync::turnstile::KEY_PORT_SEND);
+            crate::sched::stats::IPC_RECVS.fetch_add(1, Ordering::Relaxed);
+            crate::trace::trace_event(crate::trace::EVT_IPC_RECV, port_id as u32, 0);
+            Ok(msg)
+        }
+        None => Err(()),
+    }
+}
+
+/// Receive a message from a port (blocking).
+/// Blocks if the queue is empty until a message arrives.
+pub fn recv(port_id: PortId) -> Result<Message, ()> {
+    use crate::sched::thread::BlockReason;
+    use crate::sync::turnstile::{KEY_PORT_RECV, KEY_PORT_SEND};
+
+    let my_tid = crate::sched::current_thread_id();
+    crate::sched::reset_priority(my_tid);
+
+    loop {
+        let port = match port_ref(port_id) {
+            Some(p) => p,
+            None => return Err(()),
+        };
+        if port.is_kernel_held() {
+            return Err(());
+        }
+        let q = match port.mpsc() {
+            Some(q) => q,
+            None => return Err(()),
+        };
+        if let Some(msg) = q.recv() {
+            // Wake a blocked sender.
+            crate::sync::turnstile::port_wake_one(port_id, KEY_PORT_SEND);
+            crate::sched::boost_priority(my_tid, msg.data[5] as u8);
+
+            return Ok(msg);
+        }
+
+        // Queue empty — block on turnstile with lost-wakeup prevention.
+        let enqueued = crate::sync::turnstile::port_enqueue_with_check(
+            port_id,
+            KEY_PORT_RECV,
+            my_tid,
+            || {
+                // Re-check under HAMT bucket lock: still empty?
+                match port_ref(port_id) {
+                    Some(p) => match p.mpsc() {
+                        Some(q2) => q2.is_empty(),
+                        None => false,
+                    },
+                    None => false,
+                }
+            },
+        );
+        if enqueued {
+            crate::sched::block_current(BlockReason::PortRecv(port_id));
+        } else {
         }
     }
 }
@@ -882,83 +843,72 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
 /// Returns Err(()) if the thread was parked (message will be injected by sender).
 pub fn recv_or_park(port_id: PortId) -> Result<Message, ()> {
     use crate::sched::thread::BlockReason;
-    let local = port_local(port_id);
+    use crate::sync::turnstile::{KEY_PORT_RECV_PARK, KEY_PORT_SEND};
+
     let my_tid = crate::sched::current_thread_id();
     crate::sched::reset_priority(my_tid);
 
-    let mut table = PORT_TABLE.lock();
-    let port = match table.get_mut(local) {
+    let port = match port_ref(port_id) {
         Some(p) => p,
         None => return Err(()),
     };
     if port.is_kernel_held() {
         return Err(());
     }
+    let q = match port.mpsc() {
+        Some(q) => q,
+        None => return Err(()),
+    };
+    if let Some(msg) = q.recv() {
+        crate::sync::turnstile::port_wake_one(port_id, KEY_PORT_SEND);
+        crate::sched::stats::IPC_RECVS.fetch_add(1, Ordering::Relaxed);
+        crate::sched::boost_priority(my_tid, msg.data[5] as u8);
+        return Ok(msg);
+    }
 
-    match port.try_recv() {
-        Ok((msg, wakeup)) => {
-            drop(table);
-            if let Some(tid) = wakeup {
-                crate::sched::wake_thread(tid);
+    // Park: enqueue as parked receiver with lost-wakeup check, then go off-CPU.
+    // Uses KEY_PORT_RECV_PARK so send_direct can distinguish parked receivers
+    // (eligible for direct message injection) from normal recv blockers.
+    let enqueued = crate::sync::turnstile::port_enqueue_with_check(
+        port_id,
+        KEY_PORT_RECV_PARK,
+        my_tid,
+        || {
+            // Re-check: still empty?
+            match port_ref(port_id) {
+                Some(p) => match p.mpsc() {
+                    Some(q2) => q2.is_empty(),
+                    None => false,
+                },
+                None => false,
             }
-            crate::sched::stats::IPC_RECVS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        },
+    );
+    if enqueued {
+        crate::sched::scheduler::park_current_for_ipc(BlockReason::PortRecv(port_id));
+        Err(())
+    } else {
+        // Condition changed (message arrived) — retry recv.
+        if let Some(msg) = q.recv() {
+            crate::sync::turnstile::port_wake_one(port_id, KEY_PORT_SEND);
+            crate::sched::stats::IPC_RECVS.fetch_add(1, Ordering::Relaxed);
             crate::sched::boost_priority(my_tid, msg.data[5] as u8);
             Ok(msg)
-        }
-        Err(()) => {
-            crate::sched::clear_wakeup_flag(my_tid);
-            port.add_recv_waiter(my_tid);
-            drop(table);
-            // Park: thread goes off-CPU. Sender will inject message into our frame.
-            crate::sched::scheduler::park_current_for_ipc(BlockReason::PortRecv(port_id));
+        } else {
             Err(())
         }
     }
 }
 
-// --- Kernel-held port API ---
-
-/// Create a port with a kernel receive handler. The kernel holds the receive
-/// right: sends invoke the handler synchronously, no message queue is allocated,
-/// and user-space threads cannot recv on this port.
-pub fn create_kernel_port(handler: KernelHandler, user_data: usize) -> Option<PortId> {
-    let mut table = PORT_TABLE.lock();
-    let local = table.next_id;
-    table.next_id += 1;
-    let pid = make_port_id(0, local);
-    let ptr = alloc_port(pid)?;
-    unsafe {
-        (*ptr).creator_task = 0; // kernel
-        (*ptr).kernel_handler = handler as usize;
-        (*ptr).kernel_user_data = user_data;
-    }
-    if !table.art.insert(local, ptr as usize) {
-        free_port(ptr);
-        return None;
-    }
-    Some(pid)
-}
+// ---------------------------------------------------------------------------
+// Kernel-held port API
+// ---------------------------------------------------------------------------
 
 /// Call a port's kernel handler directly (synchronous request-reply).
-/// Returns Some(reply) if the port has a kernel handler, None otherwise.
 #[allow(dead_code)]
 pub fn call_kernel_handler(port_id: PortId, msg: &Message) -> Option<Message> {
-    let local = port_local(port_id);
-    let (handler, udata) = {
-        let table = PORT_TABLE.lock();
-        let port = table.get(local)?;
-        if !port.is_kernel_held() { return None; }
-        (port.kernel_handler, port.kernel_user_data)
-    };
-    // Lock released — safe to call handler.
-    let handler_fn: KernelHandler = unsafe { core::mem::transmute(handler) };
-    Some(handler_fn(port_id, udata, msg))
-}
-
-/// Check if a port has a kernel receive handler.
-#[allow(dead_code)]
-pub fn has_kernel_handler(port_id: PortId) -> bool {
-    let local = port_local(port_id);
-    let table = PORT_TABLE.lock();
-    matches!(table.get(local), Some(p) if p.is_kernel_held())
+    let port = port_ref(port_id)?;
+    if !port.is_kernel_held() { return None; }
+    let handler_fn: KernelHandler = unsafe { core::mem::transmute(port.kernel_handler) };
+    Some(handler_fn(port_id, port.kernel_user_data, msg))
 }

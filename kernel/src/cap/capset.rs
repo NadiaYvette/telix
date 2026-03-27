@@ -12,9 +12,9 @@ pub const PERM_SEND: u8 = 0b001;
 pub const PERM_RECV: u8 = 0b010;
 pub const PERM_MANAGE: u8 = 0b100;
 
-/// Maximum inline entries per task. 32 entries × 8 bytes = 256 bytes.
-/// Covers all practical cases (tasks typically hold 3-8 caps).
-const INLINE_CAP: usize = 32;
+/// Maximum inline entries per task. 64 entries × 8 bytes = 512 bytes.
+/// Must be large enough for processes that hold many caps (servers, init).
+const INLINE_CAP: usize = 64;
 
 /// Pack a port_local + perms into an entry.
 #[inline]

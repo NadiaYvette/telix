@@ -1172,6 +1172,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing signal/kill...\n");
     {
         let spin_tid = syscall::spawn(b"spin", 50);
+        // spin_tid is the task port of the spawned process.
         if spin_tid != u64::MAX {
             // Let it run for a bit.
             for _ in 0..50 { syscall::yield_now(); }

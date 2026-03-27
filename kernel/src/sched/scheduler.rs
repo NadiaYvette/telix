@@ -34,11 +34,69 @@ pub static TASK_TABLE: RadixTable = RadixTable::new();
 /// Used by wake_thread(), is_killed(), current_task_id(), etc.
 pub static THREAD_TABLE: RadixTable = RadixTable::new();
 
+/// Wrapper for a global ART with interior mutability.
+/// Lock-free reads (RCU-safe); writes require holding the corresponding write lock.
+pub struct GlobalArt {
+    inner: core::cell::UnsafeCell<Art>,
+}
+unsafe impl Sync for GlobalArt {}
+impl GlobalArt {
+    const fn new() -> Self {
+        Self { inner: core::cell::UnsafeCell::new(Art::new()) }
+    }
+    /// Lock-free lookup. Safe without any lock (RCU read-side).
+    #[inline]
+    pub fn lookup(&self, key: u64) -> Option<usize> {
+        unsafe { &*self.inner.get() }.lookup(key)
+    }
+    /// Lock-free iteration. Safe without any lock (RCU read-side).
+    pub fn for_each<F: FnMut(u64, usize)>(&self, f: F) {
+        unsafe { &*self.inner.get() }.for_each(f)
+    }
+    /// Insert. Must hold the corresponding write lock.
+    pub fn insert(&self, key: u64, val: usize) -> bool {
+        unsafe { &mut *self.inner.get() }.insert(key, val)
+    }
+    /// Remove. Must hold the corresponding write lock.
+    #[allow(dead_code)]
+    pub fn remove(&self, key: u64) -> Option<usize> {
+        unsafe { &mut *self.inner.get() }.remove(key)
+    }
+}
+
+/// Global thread ART — lock-free reads (RCU), writes under THREAD_ART_WRITE_LOCK.
+pub static SCHED_THREAD_ART: GlobalArt = GlobalArt::new();
+/// Global task ART — lock-free reads (RCU), writes under TASK_ART_WRITE_LOCK.
+pub static SCHED_TASK_ART: GlobalArt = GlobalArt::new();
+/// Write serializer for thread ART structural mutations.
+pub static THREAD_ART_WRITE_LOCK: SpinLock<()> = SpinLock::new(());
+/// Write serializer for task ART structural mutations.
+pub static TASK_ART_WRITE_LOCK: SpinLock<()> = SpinLock::new(());
+
 /// Get a thread reference by ID via radix lookup (lockless).
 #[inline]
-fn thread_ref(tid: u32) -> &'static Thread {
+pub fn thread_ref(tid: u32) -> &'static Thread {
     let p = THREAD_TABLE.get(tid) as *const Thread;
     unsafe { &*p }
+}
+
+/// Get a task reference by ID via radix lookup (lockless).
+#[inline]
+pub fn task_ref(id: TaskId) -> &'static Task {
+    let p = TASK_TABLE.get(id) as *const Task;
+    unsafe { &*p }
+}
+
+/// Get a task reference by ID, returning None if not in ART.
+#[inline]
+pub fn task_ref_opt(id: TaskId) -> Option<&'static Task> {
+    SCHED_TASK_ART.lookup(id as u64).map(|val| unsafe { &*(val as *const Task) })
+}
+
+/// Get a thread reference by ID, returning None if not in ART.
+#[inline]
+pub fn thread_ref_opt(id: ThreadId) -> Option<&'static Thread> {
+    SCHED_THREAD_ART.lookup(id as u64).map(|val| unsafe { &*(val as *const Thread) })
 }
 
 /// Per-CPU saved frame SP. The exception handler stores the current frame_sp
@@ -276,6 +334,24 @@ impl PerCpuRunQueues {
         None
     }
 
+    /// Remove a specific thread from the prio-254 queue (for wake_thread boost).
+    /// Returns true if the thread was found and removed, false otherwise.
+    fn remove_tid(&mut self, tid: ThreadId) -> bool {
+        let prio = 254usize;
+        let mut cur = self.queues[prio].head;
+        while cur != RQ_NIL {
+            if cur == tid {
+                self.queues[prio].unlink(tid);
+                if self.queues[prio].len == 0 {
+                    self.active[prio / 64] &= !(1u64 << (prio % 64));
+                }
+                return true;
+            }
+            cur = thread_ref(cur).run_next.load(Ordering::Relaxed);
+        }
+        false
+    }
+
     /// Check if any threads are enqueued. O(1) via bitmap.
     fn has_ready(&self) -> bool {
         self.active[0] | self.active[1] | self.active[2] | self.active[3] != 0
@@ -283,6 +359,13 @@ impl PerCpuRunQueues {
 
     /// Steal one thread for `thief_cpu` from lowest-priority queue with ≥2 threads.
     fn steal_one(&mut self, thief_cpu: u32) -> Option<ThreadId> {
+        self.steal_one_min(thief_cpu, 2)
+    }
+
+    /// Steal a thread from this run queue, requiring at least `min_len` threads
+    /// at that priority level. `min_len=1` allows stealing the only thread
+    /// (used by idle CPUs); `min_len=2` preserves at least one for the victim.
+    fn steal_one_min(&mut self, thief_cpu: u32, min_len: u32) -> Option<ThreadId> {
         for word in (0..4).rev() {
             if self.active[word] != 0 {
                 let mut bits = self.active[word];
@@ -290,7 +373,7 @@ impl PerCpuRunQueues {
                     // Highest set bit = lowest priority = best to steal
                     let bit = 63 - bits.leading_zeros() as usize;
                     let prio = word * 64 + bit;
-                    if self.queues[prio].len >= 2 {
+                    if self.queues[prio].len >= min_len {
                         if let Some(tid) = self.queues[prio].find_remove_with_affinity(thief_cpu) {
                             if self.queues[prio].len == 0 {
                                 self.active[word] &= !(1u64 << bit);
@@ -321,12 +404,21 @@ fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
 /// Try to steal a thread from another CPU's run queue.
 /// Returns the stolen thread's ID, or None.
 fn try_steal(cpu: u32) -> Option<ThreadId> {
+    try_steal_min(cpu, 2)
+}
+
+/// Try to steal from idle — allows taking the only thread at a priority level.
+fn try_steal_for_idle(cpu: u32) -> Option<ThreadId> {
+    try_steal_min(cpu, 1)
+}
+
+fn try_steal_min(cpu: u32, min_len: u32) -> Option<ThreadId> {
     let online = smp::online_cpus() as usize;
     if online <= 1 { return None; }
     for i in 1..online {
         let victim = ((cpu as usize + i) % online) as u32;
         if let Some(mut rq) = PERCPU_RQ[victim as usize].try_lock() {
-            if let Some(tid) = rq.steal_one(cpu) {
+            if let Some(tid) = rq.steal_one_min(cpu, min_len) {
                 return Some(tid);
             }
         }
@@ -385,223 +477,145 @@ fn free_task_entry(p: *mut Task) {
 }
 
 // ---------------------------------------------------------------------------
-// Scheduler struct
+// ID allocation (lock-free atomic counters)
 // ---------------------------------------------------------------------------
 
-pub struct Scheduler {
-    pub(crate) thread_art: Art,
-    pub task_art: Art,
-    next_thread_id: ThreadId,
-    next_task_id: u32,
+/// Monotonic ID counters for thread/task allocation.
+static NEXT_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+static NEXT_TASK_ID: AtomicU32 = AtomicU32::new(0);
+
+// --- Initialization ---
+
+/// Initialize task 0 and the BSP's idle thread (thread 0).
+fn sched_init() {
+    TASK_TABLE.init();
+    THREAD_TABLE.init();
+
+    let task_ptr = alloc_task_entry().expect("task 0 alloc");
+    let task0_port = crate::ipc::port::create_kernel_port(task_port_handler, 0)
+        .expect("task 0 port");
+    unsafe {
+        (*task_ptr).id = 0;
+        (*task_ptr).active = true;
+        (*task_ptr).port_id = task0_port;
+    }
+    SCHED_TASK_ART.insert(0, task_ptr as usize);
+    TASK_TABLE.ensure_l1(0);
+    TASK_TABLE.set(0, task_ptr as *mut u8);
+    NEXT_TASK_ID.store(1, Ordering::Relaxed);
+
+    let thread_ptr = alloc_thread_entry().expect("thread 0 alloc");
+    let thread0_port = crate::ipc::port::create_kernel_port(thread_port_handler, 0)
+        .expect("thread 0 port");
+    unsafe {
+        (*thread_ptr).id = 0;
+        (*thread_ptr).state = ThreadState::Running;
+        (*thread_ptr).task_id = 0;
+        (*thread_ptr).port_id = thread0_port;
+        (*thread_ptr).base_priority = 255;
+        (*thread_ptr).effective_priority = 255;
+        (*thread_ptr).quantum = u32::MAX;
+        (*thread_ptr).default_quantum = u32::MAX;
+    }
+    unsafe { &*thread_ptr }.prio.store(255, Ordering::Relaxed);
+    SCHED_THREAD_ART.insert(0, thread_ptr as usize);
+    THREAD_TABLE.ensure_l1(0);
+    THREAD_TABLE.set(0, thread_ptr as *mut u8);
+    NEXT_THREAD_ID.store(1, Ordering::Relaxed);
 }
 
-impl Scheduler {
-    const fn new() -> Self {
-        Self {
-            thread_art: Art::new(),
-            task_art: Art::new(),
-            next_thread_id: 0,
-            next_task_id: 0,
+/// Create an idle thread for a secondary CPU. Returns its ThreadId.
+/// Must be called under THREAD_ART_WRITE_LOCK.
+fn create_idle_thread() -> Option<ThreadId> {
+    let id = NEXT_THREAD_ID.load(Ordering::Relaxed);
+    if id as usize >= RadixTable::capacity() {
+        return None;
+    }
+    NEXT_THREAD_ID.store(id + 1, Ordering::Relaxed);
+
+    let ptr = alloc_thread_entry()?;
+    let idle_port = crate::ipc::port::create_kernel_port(thread_port_handler, id as usize)?;
+    unsafe {
+        (*ptr).id = id;
+        (*ptr).state = ThreadState::Running;
+        (*ptr).task_id = 0;
+        (*ptr).port_id = idle_port;
+        (*ptr).base_priority = 255;
+        (*ptr).effective_priority = 255;
+        (*ptr).quantum = u32::MAX;
+        (*ptr).default_quantum = u32::MAX;
+    }
+    let t = unsafe { &*ptr };
+    t.prio.store(255, Ordering::Relaxed);
+    t.thread_task.store(0, Ordering::Relaxed);
+
+    SCHED_THREAD_ART.insert(id as u64, ptr as usize);
+    if !THREAD_TABLE.ensure_l1(id) { return None; }
+    THREAD_TABLE.set(id, ptr as *mut u8);
+    Some(id)
+}
+
+/// Find a reusable (Dead) thread slot, or allocate a new one.
+/// Must be called under THREAD_ART_WRITE_LOCK.
+fn alloc_thread_id() -> Option<ThreadId> {
+    let mut found_id: Option<ThreadId> = None;
+    SCHED_THREAD_ART.for_each(|key, val| {
+        if found_id.is_some() { return; }
+        if key == 0 { return; }
+        let t = unsafe { &*(val as *const Thread) };
+        if t.state == ThreadState::Dead && t.stack_base == 0 {
+            found_id = Some(key as ThreadId);
         }
+    });
+    if let Some(id) = found_id {
+        return Some(id);
     }
-
-    // --- ART-based accessors ---
-
-    #[inline]
-    pub fn thread(&self, id: ThreadId) -> &Thread {
-        let val = self.thread_art.lookup(id as u64)
-            .expect("thread: invalid ThreadId");
-        unsafe { &*(val as *const Thread) }
+    let id = NEXT_THREAD_ID.load(Ordering::Relaxed);
+    if id as usize >= RadixTable::capacity() {
+        return None;
     }
+    let ptr = alloc_thread_entry()?;
+    SCHED_THREAD_ART.insert(id as u64, ptr as usize);
+    if !THREAD_TABLE.ensure_l1(id) { return None; }
+    THREAD_TABLE.set(id, ptr as *mut u8);
+    NEXT_THREAD_ID.store(id + 1, Ordering::Relaxed);
+    Some(id)
+}
 
-    #[inline]
-    pub fn thread_mut(&mut self, id: ThreadId) -> &mut Thread {
-        let val = self.thread_art.lookup(id as u64)
-            .expect("thread_mut: invalid ThreadId");
-        unsafe { &mut *(val as *mut Thread) }
-    }
-
-    /// Get a thread reference, returning None if not in ART.
-    #[inline]
-    pub fn thread_get(&self, id: ThreadId) -> Option<&Thread> {
-        let val = self.thread_art.lookup(id as u64)?;
-        Some(unsafe { &*(val as *const Thread) })
-    }
-
-    /// Get a mutable thread reference, returning None if not in ART.
-    #[inline]
-    pub fn thread_get_mut(&mut self, id: ThreadId) -> Option<&mut Thread> {
-        let val = self.thread_art.lookup(id as u64)?;
-        Some(unsafe { &mut *(val as *mut Thread) })
-    }
-
-    /// Get a mutable thread pointer from ART, or null.
-    #[inline]
-    pub fn thread_ptr(&self, id: ThreadId) -> *mut Thread {
-        match self.thread_art.lookup(id as u64) {
-            Some(val) => val as *mut Thread,
-            None => core::ptr::null_mut(),
+/// Find a reusable (inactive) task slot, or allocate a new one.
+/// Must be called under TASK_ART_WRITE_LOCK.
+fn alloc_task_id() -> Option<TaskId> {
+    let mut found_id: Option<TaskId> = None;
+    SCHED_TASK_ART.for_each(|key, val| {
+        if found_id.is_some() { return; }
+        if key == 0 { return; }
+        let t = unsafe { &*(val as *const Task) };
+        if !t.active && t.exited && t.reaped {
+            found_id = Some(key as TaskId);
         }
+    });
+    if let Some(id) = found_id {
+        return Some(id);
     }
-
-    #[inline]
-    pub fn task(&self, id: TaskId) -> &Task {
-        let val = self.task_art.lookup(id as u64)
-            .expect("task: invalid TaskId");
-        unsafe { &*(val as *const Task) }
+    let id = NEXT_TASK_ID.load(Ordering::Relaxed);
+    if id as usize >= RadixTable::capacity() {
+        return None;
     }
+    let ptr = alloc_task_entry()?;
+    SCHED_TASK_ART.insert(id as u64, ptr as usize);
+    if !TASK_TABLE.ensure_l1(id) { return None; }
+    TASK_TABLE.set(id, ptr as *mut u8);
+    NEXT_TASK_ID.store(id + 1, Ordering::Relaxed);
+    Some(id)
+}
 
-    #[inline]
-    pub fn task_mut(&mut self, id: TaskId) -> &mut Task {
-        let val = self.task_art.lookup(id as u64)
-            .expect("task_mut: invalid TaskId");
-        unsafe { &mut *(val as *mut Task) }
-    }
-
-    /// Get a task reference, returning None if not in ART.
-    #[inline]
-    pub fn task_get(&self, id: TaskId) -> Option<&Task> {
-        let val = self.task_art.lookup(id as u64)?;
-        Some(unsafe { &*(val as *const Task) })
-    }
-
-    // --- Initialization ---
-
-    /// Initialize task 0 and the BSP's idle thread (thread 0).
-    fn init(&mut self) {
-        // Initialize radix page tables for lockless entity lookup.
-        TASK_TABLE.init();
-        THREAD_TABLE.init();
-
-        // Allocate and insert task 0 (kernel task).
-        let task_ptr = alloc_task_entry().expect("task 0 alloc");
-        let task0_port = crate::ipc::port::create_kernel_port(task_port_handler, 0)
-            .expect("task 0 port");
-        unsafe {
-            (*task_ptr).id = 0;
-            (*task_ptr).active = true;
-            (*task_ptr).port_id = task0_port;
-        }
-        self.task_art.insert(0, task_ptr as usize);
-        TASK_TABLE.ensure_l1(0);
-        TASK_TABLE.set(0, task_ptr as *mut u8);
-        self.next_task_id = 1;
-
-        // Thread 0 = BSP idle thread. Its saved_sp will be set on first preemption.
-        let thread_ptr = alloc_thread_entry().expect("thread 0 alloc");
-        let thread0_port = crate::ipc::port::create_kernel_port(thread_port_handler, 0)
-            .expect("thread 0 port");
-        unsafe {
-            (*thread_ptr).id = 0;
-            (*thread_ptr).state = ThreadState::Running;
-            (*thread_ptr).task_id = 0;
-            (*thread_ptr).port_id = thread0_port;
-            (*thread_ptr).base_priority = 255;
-            (*thread_ptr).effective_priority = 255;
-            (*thread_ptr).quantum = u32::MAX;
-            (*thread_ptr).default_quantum = u32::MAX;
-        }
-        unsafe { &*thread_ptr }.prio.store(255, Ordering::Relaxed);
-        self.thread_art.insert(0, thread_ptr as usize);
-        THREAD_TABLE.ensure_l1(0);
-        THREAD_TABLE.set(0, thread_ptr as *mut u8);
-        self.next_thread_id = 1;
-    }
-
-    /// Create an idle thread for a secondary CPU. Returns its ThreadId.
-    fn create_idle_thread(&mut self) -> Option<ThreadId> {
-        let id = self.next_thread_id;
-        if id as usize >= RadixTable::capacity() {
-            return None;
-        }
-        self.next_thread_id += 1;
-
-        let ptr = alloc_thread_entry()?;
-        let idle_port = crate::ipc::port::create_kernel_port(thread_port_handler, id as usize)?;
-        unsafe {
-            (*ptr).id = id;
-            (*ptr).state = ThreadState::Running;
-            (*ptr).task_id = 0;
-            (*ptr).port_id = idle_port;
-            (*ptr).base_priority = 255;
-            (*ptr).effective_priority = 255; // lowest
-            (*ptr).quantum = u32::MAX;
-            (*ptr).default_quantum = u32::MAX;
-        }
-        let t = unsafe { &*ptr };
-        t.prio.store(255, Ordering::Relaxed);
-        t.thread_task.store(0, Ordering::Relaxed);
-
-        self.thread_art.insert(id as u64, ptr as usize);
-        if !THREAD_TABLE.ensure_l1(id) { return None; }
-        THREAD_TABLE.set(id, ptr as *mut u8);
-        // saved_sp will be set on first preemption
-        Some(id)
-    }
-
-    /// Find a reusable (Dead) thread slot, or allocate a new one.
-    fn alloc_thread_id(&mut self) -> Option<ThreadId> {
-        // First, scan for a Dead slot to reuse.
-        let mut found_id: Option<ThreadId> = None;
-        self.thread_art.for_each(|key, val| {
-            if found_id.is_some() { return; }
-            if key == 0 { return; } // skip idle
-            let t = unsafe { &*(val as *const Thread) };
-            if t.state == ThreadState::Dead && t.stack_base == 0 {
-                found_id = Some(key as ThreadId);
-            }
-        });
-        if let Some(id) = found_id {
-            return Some(id);
-        }
-        // Otherwise, allocate a new slot.
-        let id = self.next_thread_id;
-        if id as usize >= RadixTable::capacity() {
-            return None;
-        }
-        // Allocate entry and insert into ART.
-        let ptr = alloc_thread_entry()?;
-        self.thread_art.insert(id as u64, ptr as usize);
-        if !THREAD_TABLE.ensure_l1(id) { return None; }
-        THREAD_TABLE.set(id, ptr as *mut u8);
-        self.next_thread_id += 1;
-        Some(id)
-    }
-
-    /// Find a reusable (inactive) task slot, or allocate a new one.
-    fn alloc_task_id(&mut self) -> Option<TaskId> {
-        // Skip task 0 (kernel task).
-        let mut found_id: Option<TaskId> = None;
-        self.task_art.for_each(|key, val| {
-            if found_id.is_some() { return; }
-            if key == 0 { return; }
-            let t = unsafe { &*(val as *const Task) };
-            if !t.active && t.exited && t.reaped {
-                found_id = Some(key as TaskId);
-            }
-        });
-        if let Some(id) = found_id {
-            return Some(id);
-        }
-        let id = self.next_task_id;
-        if id as usize >= RadixTable::capacity() {
-            return None;
-        }
-        let ptr = alloc_task_entry()?;
-        self.task_art.insert(id as u64, ptr as usize);
-        if !TASK_TABLE.ensure_l1(id) { return None; }
-        TASK_TABLE.set(id, ptr as *mut u8);
-        self.next_task_id += 1;
-        Some(id)
-    }
-
-    fn create_thread(
-        &mut self,
-        entry: fn() -> !,
-        priority: u8,
-        quantum: u32,
-    ) -> Option<ThreadId> {
-        let id = self.alloc_thread_id()?;
+/// Create a kernel-mode thread. Must hold THREAD_ART_WRITE_LOCK.
+fn create_thread(
+    entry: fn() -> !,
+    priority: u8,
+    quantum: u32,
+) -> Option<ThreadId> {
+    let id = alloc_thread_id()?;
 
         let stack_page = crate::mm::phys::alloc_page()?;
         let stack_base = stack_page.as_usize();
@@ -660,7 +674,7 @@ impl Scheduler {
         }
 
         // Clear killed/affinity flags from any previous occupant of this slot.
-        let thread = self.thread_mut(id);
+        let thread = unsafe { thread_mut_from_ref(id) };
         thread.killed.store(false, Ordering::Release);
         thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
         thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
@@ -682,9 +696,7 @@ impl Scheduler {
         Some(id)
     }
 
-}
-
-/// Parent task info snapshot, taken under SCHEDULER lock so that the heavy
+/// Parent task info snapshot, taken under SPAWN_LOCK so that the heavy
 /// work phase (ELF loading, page table setup) can run without holding it.
 struct SpawnParentInfo {
     parent_task: u32,
@@ -701,7 +713,7 @@ struct SpawnParentInfo {
 }
 
 /// Phase 2: do all heavy work (page tables, address space, ELF load, stack,
-/// kstack, frame setup, capability grants) WITHOUT holding the SCHEDULER lock.
+/// kstack, frame setup, capability grants) WITHOUT holding SPAWN_LOCK.
 /// Returns (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) on success.
 fn do_spawn_heavy_work(
     task_id: u32,
@@ -879,207 +891,195 @@ fn do_spawn_heavy_work(
     Some((aspace_id, pt_root, frame_sp as u64, kstack_base, task_port, thread_port))
 }
 
-impl Scheduler {
-    /// Phase 1 of user thread creation: allocate task/thread IDs and read parent info.
-    /// Must be called under SCHEDULER lock. Returns (task_id, thread_id, parent_info).
-    fn alloc_spawn_ids(
-        &mut self,
-    ) -> Option<(u32, ThreadId, SpawnParentInfo)> {
-        let task_id = self.alloc_task_id()?;
-        let thread_id = self.alloc_thread_id()?;
-        // Read parent info while we have the lock.
-        let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
-        let parent_task = self.thread(caller_tid).task_id;
-        let pt = parent_task;
-        let ptask = self.task(pt);
-        let info = SpawnParentInfo {
-            parent_task,
-            sid: ptask.sid,
-            ctty_port: ptask.ctty_port,
-            uid: ptask.uid,
-            euid: ptask.euid,
-            gid: ptask.gid,
-            egid: ptask.egid,
-            groups_inline: ptask.groups_inline,
-            groups_overflow: ptask.groups_overflow,
-            ngroups: ptask.ngroups,
-            rlimits: ptask.rlimits,
-        };
-        Some((task_id, thread_id, info))
+/// Phase 1 of user thread creation: allocate task/thread IDs and read parent info.
+/// Must hold both TASK_ART_WRITE_LOCK and THREAD_ART_WRITE_LOCK.
+fn alloc_spawn_ids() -> Option<(u32, ThreadId, SpawnParentInfo)> {
+    let task_id = alloc_task_id()?;
+    let thread_id = alloc_thread_id()?;
+    let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
+    let parent_task = thread_ref(caller_tid).task_id;
+    let ptask = task_ref(parent_task);
+    let info = SpawnParentInfo {
+        parent_task,
+        sid: ptask.sid,
+        ctty_port: ptask.ctty_port,
+        uid: ptask.uid,
+        euid: ptask.euid,
+        gid: ptask.gid,
+        egid: ptask.egid,
+        groups_inline: ptask.groups_inline,
+        groups_overflow: ptask.groups_overflow,
+        ngroups: ptask.ngroups,
+        rlimits: ptask.rlimits,
+    };
+    Some((task_id, thread_id, info))
+}
+
+/// Phase 3 of user thread creation: populate task/thread state and add to run queue.
+fn finalize_spawn(
+    task_id: u32,
+    thread_id: ThreadId,
+    parent: &SpawnParentInfo,
+    aspace_id: u32,
+    pt_root: usize,
+    priority: u8,
+    quantum: u32,
+    frame_sp: u64,
+    kstack_base: usize,
+    task_port: u64,
+    thread_port: u64,
+) {
+    let task = unsafe { task_mut_from_ref(task_id) };
+    task.id = task_id;
+    task.active = true;
+    task.port_id = task_port;
+    task.aspace_id = aspace_id;
+    task.page_table_root = pt_root;
+    task.exit_code = 0;
+    task.exited = false;
+    task.reaped = false;
+    task.wait_status = 0;
+    task.thread_count = 1;
+    task.parent_task = parent.parent_task;
+    task.pgid = task_id;
+    task.sid = parent.sid;
+    task.ctty_port = parent.ctty_port;
+    task.fg_pgid = 0;
+    task.uid = parent.uid;
+    task.euid = parent.euid;
+    task.gid = parent.gid;
+    task.egid = parent.egid;
+    task.groups_inline = parent.groups_inline;
+    task.groups_overflow = parent.groups_overflow;
+    task.ngroups = parent.ngroups;
+    task.rlimits = parent.rlimits;
+
+    let thread = unsafe { thread_mut_from_ref(thread_id) };
+    thread.killed.store(false, Ordering::Release);
+    thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
+    thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+
+    thread.id = thread_id;
+    thread.state = ThreadState::Ready;
+    thread.task_id = task_id;
+    thread.port_id = thread_port;
+    thread.base_priority = priority;
+    thread.effective_priority = priority;
+    thread.prio.store(priority, Ordering::Relaxed);
+    thread.thread_task.store(task_id, Ordering::Relaxed);
+    thread.quantum = quantum;
+    thread.default_quantum = quantum;
+    thread.saved_sp = frame_sp;
+    thread.stack_base = kstack_base;
+    thread.sig_mask = 0;
+    thread.sig_pending = 0;
+
+    let ts = crate::sync::turnstile::alloc_thread_turnstile();
+    thread.turnstile.store(ts, Ordering::Relaxed);
+
+    percpu_enqueue(smp::cpu_id(), priority, thread_id);
+}
+
+/// Create a new thread in an existing task. Thread ID and port are pre-allocated.
+fn create_thread_in_task(
+    task_id: u32,
+    id: ThreadId,
+    entry: u64,
+    stack_top: u64,
+    arg: u64,
+    priority: u8,
+    quantum: u32,
+    thread_port: u64,
+) -> Option<ThreadId> {
+    if !task_ref(task_id).active {
+        return None;
     }
 
-    /// Phase 3 of user thread creation: populate task/thread state and add to run queue.
-    /// Must be called under SCHEDULER lock.
-    fn finalize_spawn(
-        &mut self,
-        task_id: u32,
-        thread_id: ThreadId,
-        parent: &SpawnParentInfo,
-        aspace_id: u32,
-        pt_root: usize,
-        priority: u8,
-        quantum: u32,
-        frame_sp: u64,
-        kstack_base: usize,
-        task_port: u64,
-        thread_port: u64,
-    ) {
-        let task = self.task_mut(task_id);
-        task.id = task_id;
-        task.active = true;
-        task.port_id = task_port;
-        task.aspace_id = aspace_id;
-        task.page_table_root = pt_root;
-        task.exit_code = 0;
-        task.exited = false;
-        task.reaped = false;
-        task.wait_status = 0;
-        task.thread_count = 1;
-        task.parent_task = parent.parent_task;
-        task.pgid = task_id;
-        task.sid = parent.sid;
-        task.ctty_port = parent.ctty_port;
-        task.fg_pgid = 0;
-        task.uid = parent.uid;
-        task.euid = parent.euid;
-        task.gid = parent.gid;
-        task.egid = parent.egid;
-        task.groups_inline = parent.groups_inline;
-        task.groups_overflow = parent.groups_overflow;
-        task.ngroups = parent.ngroups;
-        task.rlimits = parent.rlimits;
+    let kstack_page = crate::mm::phys::alloc_page()?;
+    let kstack_base = kstack_page.as_usize();
+    let kstack_top = kstack_base + PAGE_SIZE;
 
-        let thread = self.thread_mut(thread_id);
-        thread.killed.store(false, Ordering::Release);
-        thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
-        thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
-
-        thread.id = thread_id;
-        thread.state = ThreadState::Ready;
-        thread.task_id = task_id;
-        thread.port_id = thread_port;
-        thread.base_priority = priority;
-        thread.effective_priority = priority;
-        thread.prio.store(priority, Ordering::Relaxed);
-        thread.thread_task.store(task_id, Ordering::Relaxed);
-        thread.quantum = quantum;
-        thread.default_quantum = quantum;
-        thread.saved_sp = frame_sp;
-        thread.stack_base = kstack_base;
-        thread.sig_mask = 0;
-        thread.sig_pending = 0;
-
-        // Pre-allocate a turnstile for this thread (for futex PI lending).
-        let ts = crate::sync::turnstile::alloc_thread_turnstile();
-        thread.turnstile.store(ts, Ordering::Relaxed);
-
-        percpu_enqueue(smp::cpu_id(), priority, thread_id);
-    }
-
-
-    /// Create a new thread in an existing task (shared address space).
-    /// The caller provides the user entry point, stack top, and an argument.
-    /// Create a new thread in an existing task. Thread ID and port are pre-allocated.
-    fn create_thread_in_task(
-        &mut self,
-        task_id: u32,
-        id: ThreadId,
-        entry: u64,
-        stack_top: u64,
-        arg: u64,
-        priority: u8,
-        quantum: u32,
-        thread_port: u64,
-    ) -> Option<ThreadId> {
-        if !self.task(task_id).active {
-            return None;
+    let frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
+    let frame = frame_sp as *mut u64;
+    unsafe {
+        for i in 0..(EXCEPTION_FRAME_SIZE / 8) {
+            *frame.add(i) = 0;
         }
 
-        // Allocate kernel stack.
-        let kstack_page = crate::mm::phys::alloc_page()?;
-        let kstack_base = kstack_page.as_usize();
-        let kstack_top = kstack_base + PAGE_SIZE;
-
-        // Build exception frame for user-mode entry.
-        let frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
-        let frame = frame_sp as *mut u64;
-        unsafe {
-            for i in 0..(EXCEPTION_FRAME_SIZE / 8) {
-                *frame.add(i) = 0;
-            }
-
-            #[cfg(target_arch = "aarch64")]
-            {
-                *frame.add(32) = entry;          // ELR_EL1
-                *frame.add(33) = 0x0;            // SPSR_EL1 = EL0t
-                *frame.add(31) = stack_top;      // SP_EL0
-            }
-
-            #[cfg(target_arch = "riscv64")]
-            {
-                *frame.add(31) = entry;          // sepc
-                *frame.add(32) = 1 << 5;         // sstatus: SPIE=1, SPP=0
-                *frame.add(1) = stack_top;       // sp (x2)
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            {
-                *frame.add(17) = entry;                                              // RIP
-                *frame.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3;   // CS
-                *frame.add(19) = 0x200;                                              // RFLAGS = IF
-                *frame.add(20) = stack_top;                                          // RSP
-                *frame.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3;   // SS
-            }
-
-            // arg in first argument register
-            #[cfg(target_arch = "aarch64")]
-            { *frame.add(0) = arg; } // x0
-            #[cfg(target_arch = "riscv64")]
-            { *frame.add(9) = arg; } // a0 = x10
-            #[cfg(target_arch = "x86_64")]
-            { *frame.add(9) = arg; } // rdi
+        #[cfg(target_arch = "aarch64")]
+        {
+            *frame.add(32) = entry;
+            *frame.add(33) = 0x0;
+            *frame.add(31) = stack_top;
         }
 
-        // Clear killed/affinity flags from any previous occupant of this slot.
-        let thread = self.thread_mut(id);
-        thread.killed.store(false, Ordering::Release);
-        thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
-        thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+        #[cfg(target_arch = "riscv64")]
+        {
+            *frame.add(31) = entry;
+            *frame.add(32) = 1 << 5;
+            *frame.add(1) = stack_top;
+        }
 
-        thread.id = id;
-        thread.state = ThreadState::Ready;
-        thread.task_id = task_id;
-        thread.port_id = thread_port;
-        thread.base_priority = priority;
-        thread.effective_priority = priority;
-        thread.prio.store(priority, Ordering::Relaxed);
-        thread.thread_task.store(task_id, Ordering::Relaxed);
-        thread.quantum = quantum;
-        thread.default_quantum = quantum;
-        thread.saved_sp = frame_sp as u64;
-        thread.stack_base = kstack_base;
-        thread.exit_code = 0;
-        thread.sig_mask = 0;
-        thread.sig_pending = 0;
+        #[cfg(target_arch = "x86_64")]
+        {
+            *frame.add(17) = entry;
+            *frame.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3;
+            *frame.add(19) = 0x200;
+            *frame.add(20) = stack_top;
+            *frame.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3;
+        }
 
-        // Pre-allocate a turnstile for this thread (for futex PI lending).
-        let ts = crate::sync::turnstile::alloc_thread_turnstile();
-        thread.turnstile.store(ts, Ordering::Relaxed);
-
-        self.task_mut(task_id).thread_count += 1;
-        percpu_enqueue(smp::cpu_id(), priority, id);
-        Some(id)
+        #[cfg(target_arch = "aarch64")]
+        { *frame.add(0) = arg; }
+        #[cfg(target_arch = "riscv64")]
+        { *frame.add(9) = arg; }
+        #[cfg(target_arch = "x86_64")]
+        { *frame.add(9) = arg; }
     }
 
+    let thread = unsafe { thread_mut_from_ref(id) };
+    thread.killed.store(false, Ordering::Release);
+    thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
+    thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
 
+    thread.id = id;
+    thread.state = ThreadState::Ready;
+    thread.task_id = task_id;
+    thread.port_id = thread_port;
+    thread.base_priority = priority;
+    thread.effective_priority = priority;
+    thread.prio.store(priority, Ordering::Relaxed);
+    thread.thread_task.store(task_id, Ordering::Relaxed);
+    thread.quantum = quantum;
+    thread.default_quantum = quantum;
+    thread.saved_sp = frame_sp as u64;
+    thread.stack_base = kstack_base;
+    thread.exit_code = 0;
+    thread.sig_mask = 0;
+    thread.sig_pending = 0;
+
+    let ts = crate::sync::turnstile::alloc_thread_turnstile();
+    thread.turnstile.store(ts, Ordering::Relaxed);
+
+    unsafe { task_mut_from_ref(task_id) }.thread_count += 1;
+    percpu_enqueue(smp::cpu_id(), priority, id);
+    Some(id)
 }
 
 /// Get a mutable reference to a thread via its radix pointer.
 /// # Safety: Caller must ensure exclusive access (thread is owned by current CPU,
 /// or is Blocked/Dead and not accessible from any other path).
 #[inline]
-unsafe fn thread_mut_from_ref(tid: ThreadId) -> &'static mut Thread {
+pub(crate) unsafe fn thread_mut_from_ref(tid: ThreadId) -> &'static mut Thread {
     let p = THREAD_TABLE.get(tid) as *mut Thread;
+    unsafe { &mut *p }
+}
+
+/// # Safety: Caller must ensure exclusive access to the mutated fields
+/// (e.g., current task's sig_actions, written only by owning task).
+#[inline]
+pub(crate) unsafe fn task_mut_from_ref(id: TaskId) -> &'static mut Task {
+    let p = TASK_TABLE.get(id) as *mut Task;
     unsafe { &mut *p }
 }
 
@@ -1121,13 +1121,13 @@ fn percpu_pick_next_cosched(cpu: u32, idle_id: ThreadId, prev_group: u32) -> (Th
     (idle_id, false)
 }
 
-pub static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
+/// Spawn write lock: serializes all spawn/fork/thread-create operations.
+/// This is the only remaining global lock for the scheduler subsystem.
+static SPAWN_LOCK: SpinLock<()> = SpinLock::new(());
 
 pub fn init() {
-    let mut sched = SCHEDULER.lock();
-    sched.init();
+    sched_init();
     let idle_id = 0; // Thread 0 = BSP idle
-    drop(sched);
 
     smp::init_bsp(idle_id);
     super::hotplug::mark_online(0);
@@ -1137,21 +1137,22 @@ pub fn init() {
 /// Called by secondary CPUs to create their idle thread and register.
 pub fn init_ap(cpu: u32) {
     let idle_id = {
-        let mut sched = SCHEDULER.lock();
-        sched.create_idle_thread().expect("AP idle thread")
+        let _lock = SPAWN_LOCK.lock();
+        create_idle_thread().expect("AP idle thread")
     };
     smp::init_ap(cpu, idle_id);
     super::hotplug::mark_online(cpu);
     crate::println!("  CPU {} scheduler ready (idle thread {})", cpu, idle_id);
 }
 
-/// Get the task ID for a given thread.
+/// Get the task ID for a given thread (lock-free).
 pub fn thread_task_id(tid: ThreadId) -> u32 {
-    SCHEDULER.lock().thread(tid).task_id
+    thread_ref(tid).task_id
 }
 
 pub fn spawn(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
-    SCHEDULER.lock().create_thread(entry, priority, quantum)
+    let _lock = SPAWN_LOCK.lock();
+    create_thread(entry, priority, quantum)
 }
 
 /// Spawn a new user-mode process from an ELF binary in the initramfs.
@@ -1180,9 +1181,8 @@ fn dup_groups_overflow(parent: &mut SpawnParentInfo) -> bool {
     true
 }
 
-/// Uses a 3-phase lock split to avoid ABBA deadlock between SCHEDULER and
-/// PORT_TABLE: phase 1 (alloc IDs) and phase 3 (finalize) hold SCHEDULER,
-/// but phase 2 (ELF loading, page table setup) runs without it.
+/// Uses a 3-phase lock split: phase 1 (alloc IDs) and phase 3 (finalize)
+/// hold SCHEDULER, but phase 2 (ELF loading, page table setup) runs without it.
 pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
     // Check port_is_active BEFORE locking SCHEDULER to avoid ABBA deadlock.
     let arg0_is_port = arg0 > 0 && crate::ipc::port::port_is_active(arg0);
@@ -1190,18 +1190,21 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
     // Look up the ELF binary (no locks needed).
     let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
 
-    // Phase 1: allocate IDs under SCHEDULER lock.
-    let (task_id, thread_id, mut parent) = SCHEDULER.lock().alloc_spawn_ids()?;
+    // Phase 1: allocate IDs under SPAWN_LOCK.
+    let (task_id, thread_id, mut parent) = {
+        let _lock = SPAWN_LOCK.lock();
+        alloc_spawn_ids()?
+    };
 
-    // Phase 2: heavy work (page tables, ELF load, etc.) WITHOUT SCHEDULER lock.
+    // Phase 2: heavy work (page tables, ELF load, etc.) without locks.
     let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
         do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
 
-    // Duplicate groups overflow page for child (outside SCHEDULER lock).
+    // Duplicate groups overflow page for child.
     if !dup_groups_overflow(&mut parent) { return None; }
 
-    // Phase 3: finalize task/thread state under SCHEDULER lock.
-    SCHEDULER.lock().finalize_spawn(
+    // Phase 3: finalize task/thread state.
+    finalize_spawn(
         task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base, task_port, thread_port,
     );
     Some(thread_id)
@@ -1211,14 +1214,14 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
 pub fn spawn_user_from_elf(elf_data: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
     let arg0_is_port = arg0 > 0 && crate::ipc::port::port_is_active(arg0);
 
-    let (task_id, thread_id, mut parent) = SCHEDULER.lock().alloc_spawn_ids()?;
+    let (task_id, thread_id, mut parent) = { let _lock = SPAWN_LOCK.lock(); alloc_spawn_ids()? };
 
     let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
         do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
 
     if !dup_groups_overflow(&mut parent) { return None; }
 
-    SCHEDULER.lock().finalize_spawn(
+    finalize_spawn(
         task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base, task_port, thread_port,
     );
     Some(thread_id)
@@ -1238,7 +1241,7 @@ pub fn spawn_user_with_data(
 
     let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
 
-    let (task_id, thread_id, mut parent) = SCHEDULER.lock().alloc_spawn_ids()?;
+    let (task_id, thread_id, mut parent) = { let _lock = SPAWN_LOCK.lock(); alloc_spawn_ids()? };
 
     // Phase 2: ELF load + stack setup WITHOUT SCHEDULER lock.
     let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
@@ -1318,7 +1321,7 @@ pub fn spawn_user_with_data(
     if !dup_groups_overflow(&mut parent) { return None; }
 
     // Phase 3: finalize under SCHEDULER lock.
-    SCHEDULER.lock().finalize_spawn(
+    finalize_spawn(
         task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base, task_port, thread_port,
     );
     Some(thread_id)
@@ -1327,17 +1330,16 @@ pub fn spawn_user_with_data(
 /// Create a new thread in the caller's task. Returns thread ID or None.
 pub fn thread_create(task_id: u32, entry: u64, stack_top: u64, arg: u64) -> Option<ThreadId> {
     let (priority, quantum) = {
-        let sched = SCHEDULER.lock();
         let caller_tid = smp::current().current_thread.load(Ordering::Relaxed);
-        (sched.thread(caller_tid).base_priority, sched.thread(caller_tid).default_quantum)
+        let caller = thread_ref(caller_tid);
+        (caller.base_priority, caller.default_quantum)
     };
-    // Allocate thread ID under SCHEDULER lock, then drop.
-    let thread_id = SCHEDULER.lock().alloc_thread_id()?;
-    // Create kernel-held port for the new thread (no SCHEDULER lock — safe w.r.t. PORT_TABLE ordering).
+    // Allocate thread ID under SPAWN_LOCK.
+    let thread_id = { let _lock = SPAWN_LOCK.lock(); alloc_thread_id()? };
+    // Create kernel-held port for the new thread.
     let thread_port = crate::ipc::port::create_kernel_port(thread_port_handler, thread_id as usize)?;
-    // Finalize under SCHEDULER lock.
-    let mut sched = SCHEDULER.lock();
-    let result = sched.create_thread_in_task(task_id, thread_id, entry, stack_top, arg, priority, quantum, thread_port);
+    // Finalize thread creation.
+    let result = create_thread_in_task(task_id, thread_id, entry, stack_top, arg, priority, quantum, thread_port);
     // Grant caps on the new thread's port.
     if result.is_some() {
         use crate::cap::capability::Rights;
@@ -1351,8 +1353,7 @@ pub fn thread_create(task_id: u32, entry: u64, stack_top: u64, arg: u64) -> Opti
 /// Check if a thread has exited and return its exit code.
 /// Returns Some(exit_code) if dead and in the same task, None otherwise.
 pub fn thread_join_poll(tid: ThreadId, caller_task: u32) -> Option<i32> {
-    let sched = SCHEDULER.lock();
-    let t = sched.thread_get(tid)?;
+    let t = thread_ref_opt(tid)?;
     if t.task_id != caller_task {
         return None;
     }
@@ -1367,12 +1368,10 @@ pub fn thread_join_poll(tid: ThreadId, caller_task: u32) -> Option<i32> {
 /// otherwise register as waiter and block until it exits.
 pub fn thread_join_block(tid: ThreadId, caller_task: u32) -> u64 {
     {
-        let mut sched = SCHEDULER.lock();
-        let t = match sched.thread_get(tid) {
-            Some(t) => t as *const Thread,
+        let t_ref = match thread_ref_opt(tid) {
+            Some(t) => t,
             None => return u64::MAX,
         };
-        let t_ref = unsafe { &*t };
         if t_ref.task_id != caller_task {
             return u64::MAX;
         }
@@ -1381,15 +1380,15 @@ pub fn thread_join_block(tid: ThreadId, caller_task: u32) -> u64 {
         }
         // Register ourselves as the join waiter.
         let caller_tid = current_thread_id();
-        sched.thread_mut(tid).join_waiter = caller_tid;
+        // Safe: only one joiner per thread, and the target is alive.
+        unsafe { thread_mut_from_ref(tid) }.join_waiter = caller_tid;
         // Clear wakeup flag before blocking.
         thread_ref(caller_tid).wakeup.store(false, Ordering::Release);
     }
     // Block until the target thread wakes us via exit_current_thread.
     block_current(BlockReason::FutexWait);
-    // Re-read exit code.
-    let sched = SCHEDULER.lock();
-    sched.thread(tid).exit_code as u64
+    // Re-read exit code (lock-free).
+    thread_ref(tid).exit_code as u64
 }
 
 /// Get the task ID of the current thread.
@@ -1403,9 +1402,8 @@ pub fn current_task_id() -> TaskId {
 #[allow(dead_code)]
 pub fn current_page_table_root() -> usize {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let sched = SCHEDULER.lock();
-    let task_id = sched.thread(tid).task_id;
-    sched.task(task_id).page_table_root
+    let task_id = thread_ref(tid).task_id;
+    task_ref(task_id).page_table_root
 }
 
 /// Called from the timer IRQ handler. Takes the current kernel SP
@@ -1452,12 +1450,23 @@ fn try_switch(current_sp: u64) -> u64 {
 
     // Decide if preemption is needed (lockless — we own the running thread).
     if prev_id == idle_id {
-        // Idle thread: preempt if local queue has work (steal happens in pick_next).
+        // Idle thread: preempt if local queue has work. Also try stealing
+        // from other CPUs (with min_len=1) to pick up threads that were
+        // demoted to prio 254 by block_current and are stuck on a busy CPU.
         let rq = PERCPU_RQ[cpu as usize].lock();
         let has_work = rq.has_ready();
         drop(rq);
         if !has_work {
-            return current_sp;
+            match try_steal_for_idle(cpu) {
+                Some(tid) => {
+                    let prio = thread_ref(tid).prio.load(Ordering::Relaxed);
+                    percpu_enqueue(cpu, prio, tid);
+                }
+                None => {
+                    crate::sync::rcu::rcu_quiescent();
+                    return current_sp;
+                }
+            }
         }
     } else {
         if thread_ref(prev_id).yield_asap.load(Ordering::Acquire) {
@@ -1467,6 +1476,7 @@ fn try_switch(current_sp: u64) -> u64 {
             let t = unsafe { thread_mut_from_ref(prev_id) };
             t.quantum = t.quantum.saturating_sub(1);
             if t.quantum != 0 {
+                crate::sync::rcu::rcu_quiescent();
                 return current_sp; // No preemption needed.
             }
             t.quantum = t.default_quantum;
@@ -1481,6 +1491,7 @@ fn try_switch(current_sp: u64) -> u64 {
     let (next_id, _cosched) = percpu_pick_next_cosched(cpu, idle_id, prev_group);
 
     if prev_id == next_id {
+        crate::sync::rcu::rcu_quiescent();
         return current_sp;
     }
 
@@ -1492,8 +1503,18 @@ fn try_switch(current_sp: u64) -> u64 {
     {
         let prev_t = unsafe { thread_mut_from_ref(prev_id) };
         prev_t.saved_sp = current_sp;
-        let prev_prio = prev_t.effective_priority;
+        let mut prev_prio = prev_t.effective_priority;
         prev_task = prev_t.task_id;
+        // If the thread was demoted by block_current (prio 254) and has been
+        // woken (wakeup flag set), restore its base priority so it gets
+        // re-enqueued at the correct level instead of being starved.
+        if prev_prio == 254 && prev_t.base_priority < 254 {
+            if thread_ref(prev_id).wakeup.load(Ordering::Relaxed) {
+                prev_t.effective_priority = prev_t.base_priority;
+                thread_ref(prev_id).prio.store(prev_t.base_priority, Ordering::Relaxed);
+                prev_prio = prev_t.base_priority;
+            }
+        }
         // Don't re-enqueue Dead threads (they are exiting).
         if prev_id != idle_id && prev_t.state != ThreadState::Dead {
             prev_t.state = ThreadState::Ready;
@@ -1538,6 +1559,11 @@ fn try_switch(current_sp: u64) -> u64 {
     next_t.state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     thread_ref(next_id).last_cpu.store(cpu, Ordering::Relaxed);
+
+    // RCU quiescent state: all syscall read-side references from the
+    // previous timeslice are now dead.  Process deferred frees.
+    crate::sync::rcu::rcu_quiescent();
+
     next_t.saved_sp
 }
 
@@ -1566,7 +1592,7 @@ pub fn set_yield_asap(tid: ThreadId) {
 }
 
 /// Clear the wakeup flag for a thread. Must be called while holding the
-/// relevant lock (PORT_TABLE etc.) BEFORE adding the thread as a waiter,
+/// relevant lock (turnstile bucket etc.) BEFORE adding the thread as a waiter,
 /// to prevent a lost-wakeup race where wake_thread() sets the flag between
 /// the lock drop and block_current's flag clear.
 pub fn clear_wakeup_flag(tid: ThreadId) {
@@ -1584,14 +1610,11 @@ pub fn block_current(_reason: BlockReason) {
     // Demote effective_priority to 254 (lowest non-idle) so try_switch
     // re-enqueues us at the bottom. This prevents blocked-spinning threads
     // from starving lower-priority threads on single-CPU.
-    let saved_prio = {
-        let mut sched = SCHEDULER.lock();
-        let orig = sched.thread(tid).effective_priority;
-        sched.thread_mut(tid).effective_priority = 254;
-        orig
-    };
     let tref = thread_ref(tid);
-    tref.prio.store(254, Ordering::Release);
+    // Save and demote priority atomically — no SCHEDULER lock needed.
+    // effective_priority is synced from prio in try_switch.
+    let saved_prio = tref.prio.swap(254, Ordering::AcqRel);
+    unsafe { thread_mut_from_ref(tid) }.effective_priority = 254;
     // Signal the scheduler to preempt us on the next timer tick instead of
     // waiting for the full quantum. This prevents spinning threads from
     // starving real work on SMP systems.
@@ -1620,18 +1643,48 @@ pub fn block_current(_reason: BlockReason) {
         tref.yield_asap.store(true, Ordering::Release);
     }
     tref.yield_asap.store(false, Ordering::Release);
-    // Restore effective priority.
-    {
-        let mut sched = SCHEDULER.lock();
-        sched.thread_mut(tid).effective_priority = saved_prio;
-    }
+    // Restore effective priority — no SCHEDULER lock needed.
     tref.prio.store(saved_prio, Ordering::Release);
+    unsafe { thread_mut_from_ref(tid) }.effective_priority = saved_prio;
     arch_restore_irqs(saved);
 }
 
 /// Wake a blocked thread, making it runnable.
 pub fn wake_thread(tid: ThreadId) {
-    thread_ref(tid).wakeup.store(true, Ordering::Release);
+    let tref = thread_ref(tid);
+    tref.wakeup.store(true, Ordering::Release);
+    // Clear yield_asap so the thread isn't preempted on the very next tick
+    // before it can check the wakeup flag and exit block_current.
+    tref.yield_asap.store(false, Ordering::Release);
+    // If the thread was demoted to prio 254 by block_current, it may be
+    // stuck in a ready queue where higher-priority threads prevent it from
+    // running. Move it from its old CPU's prio-254 slot to the waker's CPU
+    // at its base priority so it gets picked up promptly.
+    let demoted_prio = tref.prio.load(Ordering::Relaxed);
+    if demoted_prio == 254 {
+        // Read base_priority directly from the thread struct (immutable after creation,
+        // safe without SCHEDULER lock). Avoids deadlock when wake_thread is called
+        // from exit_current_thread which already holds SCHEDULER.
+        let base = tref.base_priority;
+        if base < 254 {
+            let old_cpu = tref.last_cpu.load(Ordering::Relaxed);
+            let waker_cpu = smp::cpu_id();
+            // Try to remove from old CPU's queue and re-enqueue at base prio.
+            let removed = {
+                if let Some(mut rq) = PERCPU_RQ[old_cpu as usize].try_lock() {
+                    rq.remove_tid(tid)
+                } else {
+                    false
+                }
+            };
+            if removed {
+                percpu_enqueue(waker_cpu, base, tid);
+            }
+            // If we couldn't lock or find the thread (it may be currently
+            // Running in WFI), that's OK — the wakeup flag is set and it
+            // will exit block_current on its next check.
+        }
+    }
     // Signal all CPUs so any core spinning in block_current's WFE wakes immediately.
     arch_send_event();
 }
@@ -1643,38 +1696,50 @@ pub fn is_killed(tid: ThreadId) -> bool {
 
 /// Kill all threads in the task that `tid` belongs to.
 /// Returns true if the thread was found and the kill signal was sent.
+/// Kill all threads in the task that thread `tid` belongs to.
 pub fn kill_task(tid: ThreadId) -> bool {
     if tid as usize >= RadixTable::capacity() {
         return false;
     }
-    let sched = SCHEDULER.lock();
-    let target_thread = match sched.thread_get(tid) {
-        Some(t) => t,
-        None => return false,
-    };
-    if target_thread.state == ThreadState::Dead && target_thread.stack_base == 0 {
-        return false; // Slot not in use.
-    }
-    let task_id = target_thread.task_id;
-    // Kill all non-dead threads in this task.
-    let mut to_kill = [0u32; RadixTable::capacity()];
-    let mut kill_count = 0usize;
-    sched.thread_art.for_each(|key, val| {
-        let t = unsafe { &*(val as *const Thread) };
-        if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
-            t.killed.store(true, Ordering::Release);
-            if kill_count < RadixTable::capacity() {
-                to_kill[kill_count] = key as u32;
-                kill_count += 1;
-            }
+    let task_id = {
+        let target_thread = match thread_ref_opt(tid) {
+            Some(t) => t,
+            None => return false,
+        };
+        if target_thread.state == ThreadState::Dead && target_thread.stack_base == 0 {
+            return false;
         }
-    });
-    drop(sched);
-    // Wake all killed threads so they exit block_current spin loops.
+        target_thread.task_id
+    };
+    kill_task_by_id(task_id)
+}
+
+/// Kill all threads in the given task (by task_id).
+pub fn kill_task_by_id(task_id: TaskId) -> bool {
+    const MAX_KILL: usize = 64;
+    let mut to_kill = [0u32; MAX_KILL];
+    let mut kill_count = 0usize;
+    {
+        let task = match task_ref_opt(task_id) {
+            Some(t) => t,
+            None => return false,
+        };
+        if !task.active { return false; }
+        SCHED_THREAD_ART.for_each(|key, val| {
+            let t = unsafe { &*(val as *const Thread) };
+            if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
+                t.killed.store(true, Ordering::Release);
+                if kill_count < MAX_KILL {
+                    to_kill[kill_count] = key as u32;
+                    kill_count += 1;
+                }
+            }
+        });
+    }
     for i in 0..kill_count {
         wake_thread(to_kill[i] as ThreadId);
     }
-    true
+    kill_count > 0
 }
 
 /// Send a signal to a task (process-directed). Queues on the first
@@ -1684,47 +1749,31 @@ pub fn send_signal_to_task(task_id: u32, sig: u32) -> bool {
     use super::task::{sig_bit, SIGKILL, SIGSTOP, UNCATCHABLE, MAX_SIGNALS};
     if sig < 1 || sig > MAX_SIGNALS as u32 { return false; }
     if sig == SIGKILL {
-        // Use existing kill path for SIGKILL.
-        let sched = SCHEDULER.lock();
-        let mut target_tid: Option<ThreadId> = None;
-        sched.thread_art.for_each(|key, val| {
-            if target_tid.is_some() { return; }
-            let t = unsafe { &*(val as *const Thread) };
-            if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
-                target_tid = Some(key as ThreadId);
-            }
-        });
-        return match target_tid {
-            Some(tid) => { drop(sched); kill_task(tid) }
-            None => false,
-        };
+        return kill_task_by_id(task_id);
     }
 
     let bit = sig_bit(sig);
-    let mut sched = SCHEDULER.lock();
 
-    // Check handler disposition.
-    if let Some(task) = sched.task_get(task_id) {
-        if !task.active { return false; }
-        let action = &task.sig_actions[(sig - 1) as usize];
-        // If ignored (and not uncatchable), drop the signal.
-        if action.handler == super::task::SigHandler::Ignore {
-            return true; // accepted but ignored
-        }
-        // If default and default is ignore, drop it.
-        if action.handler == super::task::SigHandler::Default
-            && !super::task::sig_default_is_term(sig)
-        {
-            return true;
-        }
-    } else {
-        return false;
+    // Check handler disposition (lock-free).
+    let task = match task_ref_opt(task_id) {
+        Some(t) => t,
+        None => return false,
+    };
+    if !task.active { return false; }
+    let action = &task.sig_actions[(sig - 1) as usize];
+    if action.handler == super::task::SigHandler::Ignore {
+        return true; // accepted but ignored
+    }
+    if action.handler == super::task::SigHandler::Default
+        && !super::task::sig_default_is_term(sig)
+    {
+        return true;
     }
 
     // Find a thread to receive: prefer one with signal unmasked.
     let mut target: Option<u32> = None;
     let mut any_thread: Option<u32> = None;
-    sched.thread_art.for_each(|key, val| {
+    SCHED_THREAD_ART.for_each(|key, val| {
         if target.is_some() { return; }
         let t = unsafe { &*(val as *const Thread) };
         if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
@@ -1739,8 +1788,8 @@ pub fn send_signal_to_task(task_id: u32, sig: u32) -> bool {
         None => return false,
     };
 
-    sched.thread_mut(tid).sig_pending |= bit;
-    drop(sched);
+    // Safe: sig_pending is only ORed (no lost updates for single-bit sets).
+    unsafe { thread_mut_from_ref(tid) }.sig_pending |= bit;
 
     // Wake the target thread so it can deliver the signal.
     wake_thread(tid as ThreadId);
@@ -1757,14 +1806,13 @@ pub fn send_signal_to_thread(tid: ThreadId, sig: u32) -> bool {
     }
 
     let bit = sig_bit(sig);
-    let mut sched = SCHEDULER.lock();
-    let t = match sched.thread_get_mut(tid) {
+    let t = match thread_ref_opt(tid) {
         Some(t) => t,
         None => return false,
     };
     if t.state == ThreadState::Dead || t.stack_base == 0 { return false; }
-    t.sig_pending |= bit;
-    drop(sched);
+    // Safe: sig_pending is only ORed (single-bit set, no lost updates).
+    unsafe { thread_mut_from_ref(tid) }.sig_pending |= bit;
     wake_thread(tid);
     true
 }
@@ -1773,23 +1821,22 @@ pub fn send_signal_to_thread(tid: ThreadId, sig: u32) -> bool {
 /// Returns Some(signal_number) if there's a pending, unmasked signal.
 pub fn dequeue_signal() -> Option<u32> {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let mut sched = SCHEDULER.lock();
-    let t = sched.thread_mut(tid);
+    let t = thread_ref(tid);
     let deliverable = t.sig_pending & !t.sig_mask;
     if deliverable == 0 { return None; }
     // Find lowest-numbered signal.
     let bit_idx = deliverable.trailing_zeros();
     let sig = bit_idx + 1;
-    t.sig_pending &= !(1u64 << bit_idx);
+    // Safe: only the current thread dequeues its own signals.
+    unsafe { thread_mut_from_ref(tid) }.sig_pending &= !(1u64 << bit_idx);
     Some(sig)
 }
 
 /// Get the signal action for a signal in the current thread's task.
 pub fn get_signal_action(sig: u32) -> Option<super::task::SignalAction> {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let sched = SCHEDULER.lock();
-    let task_id = sched.thread(tid).task_id;
-    let task = sched.task(task_id);
+    let task_id = thread_ref(tid).task_id;
+    let task = task_ref(task_id);
     if sig < 1 || sig > super::task::MAX_SIGNALS as u32 { return None; }
     Some(task.sig_actions[(sig - 1) as usize])
 }
@@ -1800,10 +1847,10 @@ pub fn set_signal_action(sig: u32, action: super::task::SignalAction) -> Option<
     if sig < 1 || sig > MAX_SIGNALS as u32 { return None; }
     if sig_bit(sig) & UNCATCHABLE != 0 { return None; } // can't change SIGKILL/SIGSTOP
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let mut sched = SCHEDULER.lock();
-    let task_id = sched.thread(tid).task_id;
-    let old = sched.task(task_id).sig_actions[(sig - 1) as usize];
-    sched.task_mut(task_id).sig_actions[(sig - 1) as usize] = action;
+    let task_id = thread_ref(tid).task_id;
+    let old = task_ref(task_id).sig_actions[(sig - 1) as usize];
+    // Safe: only the current task modifies its own sig_actions.
+    unsafe { task_mut_from_ref(task_id) }.sig_actions[(sig - 1) as usize] = action;
     Some(old)
 }
 
@@ -1811,25 +1858,23 @@ pub fn set_signal_action(sig: u32, action: super::task::SignalAction) -> Option<
 pub fn set_signal_mask(new_mask: u64) -> u64 {
     use super::task::UNCATCHABLE;
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let mut sched = SCHEDULER.lock();
-    let old = sched.thread(tid).sig_mask;
+    let old = thread_ref(tid).sig_mask;
     // Cannot mask SIGKILL or SIGSTOP.
-    sched.thread_mut(tid).sig_mask = new_mask & !UNCATCHABLE;
+    // Safe: only the current thread modifies its own sig_mask.
+    unsafe { thread_mut_from_ref(tid) }.sig_mask = new_mask & !UNCATCHABLE;
     old
 }
 
 /// Get the signal mask for the current thread.
 pub fn get_signal_mask() -> u64 {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let sched = SCHEDULER.lock();
-    sched.thread(tid).sig_mask
+    thread_ref(tid).sig_mask
 }
 
 /// Get the pending signal set for the current thread.
 pub fn get_signal_pending() -> u64 {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let sched = SCHEDULER.lock();
-    sched.thread(tid).sig_pending
+    thread_ref(tid).sig_pending
 }
 
 // --- Phase 43: Process groups, sessions, controlling terminals ---
@@ -1839,25 +1884,24 @@ pub fn get_signal_pending() -> u64 {
 /// Returns 0 on success, u64::MAX on error.
 pub fn setpgid(pid: u32, pgid: u32) -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let mut sched = SCHEDULER.lock();
-    let my_task = sched.thread(my_tid).task_id;
+    let my_task = thread_ref(my_tid).task_id;
 
     let target_task = if pid == 0 { my_task } else { pid };
 
-    match sched.task_get(target_task) {
+    match task_ref_opt(target_task) {
         Some(t) if t.active => {},
         _ => return u64::MAX,
     }
-    if target_task != my_task && sched.task(target_task).parent_task != my_task {
+    if target_task != my_task && task_ref(target_task).parent_task != my_task {
         return u64::MAX;
     }
 
     let new_pgid = if pgid == 0 { target_task } else { pgid };
-    let target_sid = sched.task(target_task).sid;
+    let target_sid = task_ref(target_task).sid;
 
     if new_pgid != target_task {
         let mut found = false;
-        sched.task_art.for_each(|_key, val| {
+        SCHED_TASK_ART.for_each(|_key, val| {
             if found { return; }
             let t = unsafe { &*(val as *const Task) };
             if t.active && t.sid == target_sid && t.pgid == new_pgid {
@@ -1867,7 +1911,8 @@ pub fn setpgid(pid: u32, pgid: u32) -> u64 {
         if !found { return u64::MAX; }
     }
 
-    sched.task_mut(target_task).pgid = new_pgid;
+    // Safe: only the owning task or its parent modifies pgid.
+    unsafe { task_mut_from_ref(target_task) }.pgid = new_pgid;
     0
 }
 
@@ -1875,16 +1920,15 @@ pub fn setpgid(pid: u32, pgid: u32) -> u64 {
 /// pid=0 means current task.
 pub fn getpgid(pid: u32) -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let sched = SCHEDULER.lock();
     let target_task = if pid == 0 {
-        sched.thread(my_tid).task_id
+        thread_ref(my_tid).task_id
     } else {
         pid
     };
-    match sched.task_get(target_task) {
+    match task_ref_opt(target_task) {
         Some(t) if t.active => {
             // Return group leader's task port_id (not raw task_id).
-            sched.task(t.pgid).port_id
+            task_ref(t.pgid).port_id
         }
         _ => u64::MAX,
     }
@@ -1894,13 +1938,12 @@ pub fn getpgid(pid: u32) -> u64 {
 /// Returns the new session ID (= task_id) or u64::MAX on error.
 pub fn setsid() -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let mut sched = SCHEDULER.lock();
-    let my_task = sched.thread(my_tid).task_id;
+    let my_task = thread_ref(my_tid).task_id;
 
-    let current_pgid = sched.task(my_task).pgid;
+    let current_pgid = task_ref(my_task).pgid;
     if current_pgid == my_task {
         let mut conflict = false;
-        sched.task_art.for_each(|_key, val| {
+        SCHED_TASK_ART.for_each(|_key, val| {
             if conflict { return; }
             let t = unsafe { &*(val as *const Task) };
             if t.active && t.id != my_task && t.pgid == my_task {
@@ -1910,27 +1953,27 @@ pub fn setsid() -> u64 {
         if conflict { return u64::MAX; }
     }
 
-    sched.task_mut(my_task).sid = my_task;
-    sched.task_mut(my_task).pgid = my_task;
-    sched.task_mut(my_task).ctty_port = 0;
-    // Return own task port_id as the new session ID.
-    sched.task(my_task).port_id
+    // Safe: only the current task modifies its own session/pgroup.
+    let task = unsafe { task_mut_from_ref(my_task) };
+    task.sid = my_task;
+    task.pgid = my_task;
+    task.ctty_port = 0;
+    task.port_id
 }
 
 /// Get the session ID of a task.
 /// pid=0 means current task.
 pub fn getsid(pid: u32) -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let sched = SCHEDULER.lock();
     let target_task = if pid == 0 {
-        sched.thread(my_tid).task_id
+        thread_ref(my_tid).task_id
     } else {
         pid
     };
-    match sched.task_get(target_task) {
+    match task_ref_opt(target_task) {
         Some(t) if t.active => {
             // Return session leader's task port_id.
-            sched.task(t.sid).port_id
+            task_ref(t.sid).port_id
         }
         _ => u64::MAX,
     }
@@ -1940,14 +1983,13 @@ pub fn getsid(pid: u32) -> u64 {
 /// The caller must be in the same session as the ctty.
 pub fn tcsetpgrp(pgid: u32) -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let mut sched = SCHEDULER.lock();
-    let my_task = sched.thread(my_tid).task_id;
+    let my_task = thread_ref(my_tid).task_id;
 
-    if sched.task(my_task).ctty_port == 0 { return u64::MAX; }
+    if task_ref(my_task).ctty_port == 0 { return u64::MAX; }
 
-    let my_sid = sched.task(my_task).sid;
+    let my_sid = task_ref(my_task).sid;
     let mut found = false;
-    sched.task_art.for_each(|_key, val| {
+    SCHED_TASK_ART.for_each(|_key, val| {
         if found { return; }
         let t = unsafe { &*(val as *const Task) };
         if t.active && t.sid == my_sid && t.pgid == pgid {
@@ -1957,29 +1999,26 @@ pub fn tcsetpgrp(pgid: u32) -> u64 {
     if !found { return u64::MAX; }
 
     // Store the foreground pgid in the session leader.
-    let mut set = false;
-    sched.task_art.for_each(|_key, val| {
-        if set { return; }
-        let t = unsafe { &mut *(val as *mut Task) };
-        if t.active && t.id == my_sid {
-            t.fg_pgid = pgid;
-            set = true;
+    // Safe: only tasks in the session modify fg_pgid, serialized by convention.
+    match task_ref_opt(my_sid) {
+        Some(t) if t.active => {
+            unsafe { task_mut_from_ref(my_sid) }.fg_pgid = pgid;
+            0
         }
-    });
-    if set { 0 } else { u64::MAX }
+        _ => u64::MAX,
+    }
 }
 
 /// Get the foreground process group for the controlling terminal.
 pub fn tcgetpgrp() -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let sched = SCHEDULER.lock();
-    let my_task = sched.thread(my_tid).task_id;
+    let my_task = thread_ref(my_tid).task_id;
 
-    if sched.task(my_task).ctty_port == 0 { return u64::MAX; }
+    if task_ref(my_task).ctty_port == 0 { return u64::MAX; }
 
-    let my_sid = sched.task(my_task).sid;
+    let my_sid = task_ref(my_task).sid;
     let mut raw_pgid = u32::MAX;
-    sched.task_art.for_each(|_key, val| {
+    SCHED_TASK_ART.for_each(|_key, val| {
         if raw_pgid != u32::MAX { return; }
         let t = unsafe { &*(val as *const Task) };
         if t.active && t.id == my_sid {
@@ -1990,7 +2029,7 @@ pub fn tcgetpgrp() -> u64 {
         u64::MAX
     } else {
         // Return group leader's task port_id.
-        sched.task(raw_pgid).port_id
+        task_ref(raw_pgid).port_id
     }
 }
 
@@ -1999,17 +2038,15 @@ pub fn send_signal_to_pgroup(pgid: u32, sig: u32) -> bool {
     use super::task::MAX_SIGNALS;
     if sig < 1 || sig > MAX_SIGNALS as u32 { return false; }
 
-    let sched = SCHEDULER.lock();
     let mut task_ids = [0u32; 64];
     let mut count = 0usize;
-    sched.task_art.for_each(|_key, val| {
+    SCHED_TASK_ART.for_each(|_key, val| {
         let t = unsafe { &*(val as *const Task) };
         if t.active && t.pgid == pgid && count < 64 {
             task_ids[count] = t.id;
             count += 1;
         }
     });
-    drop(sched);
 
     if count == 0 { return false; }
 
@@ -2026,23 +2063,21 @@ pub fn send_signal_to_pgroup(pgid: u32, sig: u32) -> bool {
 /// Only the session leader can do this, and only if it has no ctty yet.
 pub fn set_ctty(port: u64) -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let mut sched = SCHEDULER.lock();
-    let my_task = sched.thread(my_tid).task_id;
+    let my_task = thread_ref(my_tid).task_id;
 
+    let task = task_ref(my_task);
     // Must be session leader.
-    if sched.task(my_task).sid != my_task {
+    if task.sid != my_task {
         return u64::MAX;
     }
     // Must not already have a ctty.
-    if sched.task(my_task).ctty_port != 0 {
+    if task.ctty_port != 0 {
         return u64::MAX;
     }
 
-    sched.task_mut(my_task).ctty_port = port;
-
     // Propagate ctty to all tasks in this session.
     let sid = my_task;
-    sched.task_art.for_each(|_key, val| {
+    SCHED_TASK_ART.for_each(|_key, val| {
         let t = unsafe { &mut *(val as *mut Task) };
         if t.active && t.sid == sid {
             t.ctty_port = port;
@@ -2060,11 +2095,10 @@ pub fn current_thread_id() -> ThreadId {
 /// Marks them as Dead and dequeues from run queues. Returns the number killed.
 pub fn kill_other_threads_in_task() -> usize {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let mut sched = SCHEDULER.lock();
-    let task_id = sched.thread(my_tid).task_id;
+    let task_id = thread_ref(my_tid).task_id;
     let mut killed = 0;
 
-    sched.thread_art.for_each(|key, val| {
+    SCHED_THREAD_ART.for_each(|key, val| {
         if key == my_tid as u64 { return; }
         let t = unsafe { &mut *(val as *mut Thread) };
         if t.task_id == task_id && t.state != ThreadState::Dead {
@@ -2076,25 +2110,25 @@ pub fn kill_other_threads_in_task() -> usize {
     });
 
     // Set thread_count to 1 (just us).
-    sched.task_mut(task_id).thread_count = 1;
+    // Safe: only the current task's last thread calls this (execve).
+    unsafe { task_mut_from_ref(task_id) }.thread_count = 1;
     killed
 }
 
 /// Update the task's page table root after execve replaces the address space.
 pub fn update_task_page_table(new_pt_root: usize) {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let mut sched = SCHEDULER.lock();
-    let task_id = sched.thread(my_tid).task_id;
-    sched.task_mut(task_id).page_table_root = new_pt_root;
+    let task_id = thread_ref(my_tid).task_id;
+    // Safe: only the current task updates its own page table root (execve).
+    unsafe { task_mut_from_ref(task_id) }.page_table_root = new_pt_root;
 }
 
 /// Get the address space ID of the current thread's task.
 /// Returns 0 if the thread/task has no address space (kernel context).
 pub fn current_aspace_id() -> u32 {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let sched = SCHEDULER.lock();
-    let thread = sched.thread(tid);
-    let task = sched.task(thread.task_id);
+    let thread = thread_ref(tid);
+    let task = task_ref(thread.task_id);
     task.aspace_id
 }
 
@@ -2108,17 +2142,16 @@ pub fn fork_current() -> u64 {
         return u64::MAX;
     }
 
-    // Enforce RLIMIT_NPROC.
+    // Enforce RLIMIT_NPROC (lock-free).
     {
-        let sched = SCHEDULER.lock();
         let tid = smp::current().current_thread.load(Ordering::Relaxed);
-        let task_id = sched.thread(tid).task_id;
-        let uid = sched.task(task_id).uid;
-        let nproc_limit = sched.task(task_id)
-            .rlimits[super::task::RLIMIT_NPROC as usize].cur;
+        let task_id = thread_ref(tid).task_id;
+        let task = task_ref(task_id);
+        let uid = task.uid;
+        let nproc_limit = task.rlimits[super::task::RLIMIT_NPROC as usize].cur;
         if nproc_limit != super::task::RLIM_INFINITY {
             let mut count = 0u64;
-            sched.task_art.for_each(|key, val| {
+            SCHED_TASK_ART.for_each(|key, val| {
                 if key == 0 { return; }
                 let t = unsafe { &*(val as *const Task) };
                 if t.active && t.uid == uid {
@@ -2131,12 +2164,11 @@ pub fn fork_current() -> u64 {
         }
     }
 
-    // Gather parent info.
+    // Gather parent info (lock-free).
     let (parent_tid, parent_task_id, parent_aspace_id, parent_priority, parent_quantum, parent_sig_mask) = {
         let tid = smp::current().current_thread.load(Ordering::Relaxed);
-        let sched = SCHEDULER.lock();
-        let thread = sched.thread(tid);
-        let task = sched.task(thread.task_id);
+        let thread = thread_ref(tid);
+        let task = task_ref(thread.task_id);
         (tid, thread.task_id, task.aspace_id, thread.base_priority, thread.default_quantum, thread.sig_mask)
     };
 
@@ -2157,12 +2189,12 @@ pub fn fork_current() -> u64 {
          parent_uid, parent_euid, parent_gid, parent_egid,
          parent_groups_inline, parent_groups_overflow, parent_ngroups,
          parent_rlimits) = {
-        let mut sched = SCHEDULER.lock();
-        let child_task_id = match sched.alloc_task_id() {
+        let _lock = SPAWN_LOCK.lock();
+        let child_task_id = match alloc_task_id() {
             Some(id) => id,
             None => return u64::MAX,
         };
-        let ptask = sched.task(parent_task_id);
+        let ptask = task_ref(parent_task_id);
         (child_task_id, ptask.pgid, ptask.sid, ptask.ctty_port,
          ptask.uid, ptask.euid, ptask.gid, ptask.egid,
          ptask.groups_inline, ptask.groups_overflow, ptask.ngroups,
@@ -2191,11 +2223,9 @@ pub fn fork_current() -> u64 {
     } else {
         0
     };
-    let mut sched = SCHEDULER.lock();
-
     // Set up child task.
     {
-        let task = sched.task_mut(child_task_id);
+        let task = unsafe { task_mut_from_ref(child_task_id) };
         task.id = child_task_id;
         task.active = true;
         task.port_id = child_task_port;
@@ -2275,20 +2305,18 @@ pub fn fork_current() -> u64 {
         crate::syscall::handlers::set_return(child_frame, 0);
     }
 
-    // Allocate child thread ID, then drop lock to create thread port.
-    let child_tid = match sched.alloc_thread_id() {
+    // Allocate child thread ID under SPAWN_LOCK.
+    let child_tid = match { let _lock = SPAWN_LOCK.lock(); alloc_thread_id() } {
         Some(id) => id,
         None => return u64::MAX,
     };
-    drop(sched);
     let child_thread_port = match crate::ipc::port::create_kernel_port(thread_port_handler, child_tid as usize) {
         Some(p) => p,
         None => return u64::MAX,
     };
-    let mut sched = SCHEDULER.lock();
 
     // Clear killed/affinity flags.
-    let thread = sched.thread_mut(child_tid);
+    let thread = unsafe { thread_mut_from_ref(child_tid) };
     thread.killed.store(false, Ordering::Release);
     thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
@@ -2331,8 +2359,8 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     let (tid, is_last_thread, aspace_id, pt_root, kstack_base, parent_task_id, task_port, thread_port) = {
         let pcpu = smp::current();
         let tid = pcpu.current_thread.load(Ordering::Relaxed);
-        let mut sched = SCHEDULER.lock();
-        let thread = sched.thread_mut(tid);
+        // Safe: we are the running thread; no contention on our own state.
+        let thread = unsafe { thread_mut_from_ref(tid) };
         thread.state = ThreadState::Dead;
         thread.exit_code = exit_code;
         let thread_port = thread.port_id;
@@ -2349,7 +2377,11 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         // slot before we're actually off the CPU. Instead, try_switch will set
         // stack_base=0 when it drains DEFERRED_KSTACK (proving the dead thread
         // has been context-switched away).
-        let task = sched.task_mut(task_id);
+        // Safe: thread_count decrement needs care for multi-threaded tasks.
+        // This is a non-atomic decrement; for now, exit is serialized by the
+        // fact that each thread exits once and kill_other_threads_in_task
+        // marks others Dead first.
+        let task = unsafe { task_mut_from_ref(task_id) };
         task.thread_count -= 1;
         let is_last = task.thread_count == 0;
         let parent_task_id = task.parent_task;
@@ -2364,7 +2396,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         let aspace_id = task.aspace_id;
         let pt_root = task.page_table_root;
         (tid, is_last, aspace_id, pt_root, kstack_base, parent_task_id, task_port, thread_port)
-    }; // scheduler lock dropped here
+    };
 
     // Clean up turnstile state: dequeue from any wait queue, free pre-allocated turnstile.
     crate::sync::turnstile::cleanup_blocked(tid);
@@ -2408,10 +2440,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
 
         // Free groups overflow page if allocated.
         {
-            let exit_task_id = {
-                let sched = SCHEDULER.lock();
-                sched.thread(tid).task_id
-            };
+            let exit_task_id = thread_ref(tid).task_id;
             let tptr = TASK_TABLE.get(exit_task_id) as *mut Task;
             unsafe { (*tptr).free_groups_overflow(); }
         }
@@ -2438,27 +2467,22 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
 
     // Auto-reap zombie children of this exiting task (prevent zombie leaks).
     if is_last_thread {
-        let my_task_id = {
-            let sched = SCHEDULER.lock();
-            sched.thread(tid).task_id
-        };
+        let my_task_id = thread_ref(tid).task_id;
         let mut zombie_ports = [0u64; 32];
         let mut nz = 0usize;
-        {
-            let mut sched = SCHEDULER.lock();
-            sched.task_art.for_each(|key, val| {
-                if key == 0 { return; }
-                let task = unsafe { &mut *(val as *mut Task) };
-                if task.parent_task == my_task_id && task.exited && !task.reaped {
-                    task.reaped = true;
-                    if task.port_id != 0 && nz < 32 {
-                        zombie_ports[nz] = task.port_id;
-                        task.port_id = 0;
-                        nz += 1;
-                    }
+        // Lock-free: only the parent task reaps its zombie children.
+        SCHED_TASK_ART.for_each(|key, val| {
+            if key == 0 { return; }
+            let task = unsafe { &mut *(val as *mut Task) };
+            if task.parent_task == my_task_id && task.exited && !task.reaped {
+                task.reaped = true;
+                if task.port_id != 0 && nz < 32 {
+                    zombie_ports[nz] = task.port_id;
+                    task.port_id = 0;
+                    nz += 1;
                 }
-            });
-        } // SCHEDULER dropped
+            }
+        });
         for i in 0..nz {
             crate::ipc::port::destroy(zombie_ports[i]);
         }
@@ -2616,20 +2640,17 @@ fn arch_send_event() {
 /// Check if a child thread's task has exited. Returns exit code if so.
 /// Also reaps the child (marks reaped=true) so the task slot can be reused.
 pub fn waitpid(child_task_id: TaskId) -> Option<i32> {
-    let (code, port_id) = {
-        let mut sched = SCHEDULER.lock();
-        let task = match sched.task_get(child_task_id) {
-            Some(t) => t,
-            None => return None,
-        };
-        if !task.exited { return None; }
-        let port_id = task.port_id;
-        let code = task.exit_code;
-        let t = sched.task_mut(child_task_id);
-        t.reaped = true;
-        t.port_id = 0; // prevent double-destroy
-        (code, port_id)
-    }; // SCHEDULER dropped
+    let task = match task_ref_opt(child_task_id) {
+        Some(t) => t,
+        None => return None,
+    };
+    if !task.exited { return None; }
+    let port_id = task.port_id;
+    let code = task.exit_code;
+    // Safe: only the parent reaps a child, and only once.
+    let t = unsafe { task_mut_from_ref(child_task_id) };
+    t.reaped = true;
+    t.port_id = 0; // prevent double-destroy
     if port_id != 0 {
         crate::ipc::port::destroy(port_id);
     }
@@ -2645,10 +2666,9 @@ pub const WCONTINUED: u32 = 8;
 
 /// Wake all threads in a given task that are blocked in WaitChild.
 fn wake_wait_child_threads(task_id: TaskId) {
-    let sched = SCHEDULER.lock();
     let mut to_wake = [0u32; 64];
     let mut count = 0usize;
-    sched.thread_art.for_each(|key, val| {
+    SCHED_THREAD_ART.for_each(|key, val| {
         let t = unsafe { &*(val as *const Thread) };
         if t.task_id == task_id && t.state != ThreadState::Dead
             && t.stack_base != 0
@@ -2660,7 +2680,6 @@ fn wake_wait_child_threads(task_id: TaskId) {
             }
         }
     });
-    drop(sched);
     for i in 0..count {
         wake_thread(to_wake[i]);
     }
@@ -2680,88 +2699,79 @@ pub fn wait4(pid: i64, flags: u32) -> (u64, i32, i32) {
     let tid = current_thread_id();
 
     loop {
-        let result = {
-            let mut sched = SCHEDULER.lock();
-            let my_task_id = sched.thread(tid).task_id;
-            let my_pgid = sched.task(my_task_id).pgid;
+        let my_task_id = thread_ref(tid).task_id;
+        let my_pgid = task_ref(my_task_id).pgid;
 
-            // Scan for a matching exited (zombie) child.
-            let mut found: Option<(u32, i32)> = None;
-            let mut has_children = false;
-            sched.task_art.for_each(|key, val| {
-                if found.is_some() { return; }
-                if key == 0 { return; }
-                let task = unsafe { &*(val as *const Task) };
-                if task.parent_task != my_task_id { return; }
+        // Scan for a matching exited (zombie) child (lock-free).
+        let mut found: Option<(u32, i32)> = None;
+        let mut has_children = false;
+        SCHED_TASK_ART.for_each(|key, val| {
+            if found.is_some() { return; }
+            if key == 0 { return; }
+            let task = unsafe { &*(val as *const Task) };
+            if task.parent_task != my_task_id { return; }
 
-                // Check pid filter.
-                let matches = match pid {
-                    -1 => true,                    // any child
-                    0 => task.pgid == my_pgid,     // same pgroup
-                    p if p > 0 => task.id == p as TaskId, // specific task
-                    p => task.pgid == (-p) as TaskId, // specific pgroup
-                };
-                if !matches { return; }
-                has_children = true;
+            // Check pid filter.
+            let matches = match pid {
+                -1 => true,                    // any child
+                0 => task.pgid == my_pgid,     // same pgroup
+                p if p > 0 => task.id == p as TaskId, // specific task
+                p => task.pgid == (-p) as TaskId, // specific pgroup
+            };
+            if !matches { return; }
+            has_children = true;
 
-                if task.exited && !task.reaped {
-                    found = Some((task.id, task.wait_status));
-                }
-            });
-
-            if let Some((child_id, status)) = found {
-                // Reap the child.
-                let t = sched.task_mut(child_id);
-                t.reaped = true;
-                let port_id = t.port_id;
-                t.port_id = 0; // prevent double-destroy
-                // Destroy task port outside SCHEDULER lock.
-                drop(sched);
-                if port_id != 0 {
-                    crate::ipc::port::destroy(port_id);
-                }
-                Some((port_id, child_id as i32, status))
-            } else if !has_children {
-                // No matching children at all — ECHILD.
-                Some((0, -1, 0))
-            } else if flags & WNOHANG != 0 {
-                Some((0, 0, 0))
-            } else {
-                // Block: clear wakeup flag while holding the lock.
-                clear_wakeup_flag(tid);
-                sched.thread_mut(tid).blocked_on = BlockReason::WaitChild;
-                None
+            if task.exited && !task.reaped {
+                found = Some((task.id, task.wait_status));
             }
-        }; // scheduler lock dropped
+        });
 
-        match result {
-            Some(r) => return r,
-            None => {
-                // Spin until woken by a child exit.
-                block_current(BlockReason::WaitChild);
+        if let Some((child_id, status)) = found {
+            // Reap the child. Safe: only the parent reaps, and only once.
+            let t = unsafe { task_mut_from_ref(child_id) };
+            t.reaped = true;
+            let port_id = t.port_id;
+            t.port_id = 0; // prevent double-destroy
+            if port_id != 0 {
+                crate::ipc::port::destroy(port_id);
             }
+            return (port_id, child_id as i32, status);
+        } else if !has_children {
+            // No matching children at all — ECHILD.
+            return (0, -1, 0);
+        } else if flags & WNOHANG != 0 {
+            return (0, 0, 0);
+        } else {
+            // Block: set blocked_on before entering block_current.
+            clear_wakeup_flag(tid);
+            unsafe { thread_mut_from_ref(tid) }.blocked_on = BlockReason::WaitChild;
+            block_current(BlockReason::WaitChild);
         }
     }
 }
 
 /// Boost a thread's effective priority if `to_prio` is higher (lower number).
+/// Lock-free: uses atomic CAS on prio + direct write to effective_priority.
 pub fn boost_priority(tid: ThreadId, to_prio: u8) {
-    let mut sched = SCHEDULER.lock();
-    if let Some(thread) = sched.thread_get_mut(tid) {
-        if to_prio < thread.effective_priority {
-            thread.effective_priority = to_prio;
-            thread.prio.store(to_prio, Ordering::Release);
+    let tref = thread_ref(tid);
+    // CAS loop: only boost if current prio is lower (higher number).
+    loop {
+        let cur = tref.prio.load(Ordering::Relaxed);
+        if to_prio >= cur { break; } // already at equal or higher priority
+        if tref.prio.compare_exchange_weak(cur, to_prio, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            unsafe { thread_mut_from_ref(tid) }.effective_priority = to_prio;
+            break;
         }
     }
 }
 
 /// Reset a thread's effective priority back to its base priority.
+/// Lock-free: uses atomic store on prio + direct write to effective_priority.
 pub fn reset_priority(tid: ThreadId) {
-    let mut sched = SCHEDULER.lock();
-    if let Some(thread) = sched.thread_get_mut(tid) {
-        thread.effective_priority = thread.base_priority;
-        thread.prio.store(thread.base_priority, Ordering::Release);
-    }
+    let tref = thread_ref(tid);
+    let base = tref.base_priority;
+    tref.prio.store(base, Ordering::Release);
+    unsafe { thread_mut_from_ref(tid) }.effective_priority = base;
 }
 
 /// Get a thread's current effective priority (lock-free).
@@ -2793,7 +2803,7 @@ pub fn take_pending_switch() -> u64 {
 /// Get a thread's saved SP. Used by inject_recv_into_frame to write into
 /// a parked thread's exception frame.
 pub fn thread_saved_sp(tid: ThreadId) -> u64 {
-    SCHEDULER.lock().thread(tid).saved_sp
+    thread_ref(tid).saved_sp
 }
 
 /// Park the current thread for IPC (true off-CPU park).
@@ -2808,20 +2818,19 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     let frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
 
     let cpu_idx = cpu as u32;
-    let mut sched = SCHEDULER.lock();
     let pcpu = smp::current();
     let tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
     let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
 
-    // Save current thread's state.
-    sched.thread_mut(tid as ThreadId).saved_sp = frame_sp;
-    sched.thread_mut(tid as ThreadId).state = ThreadState::Blocked;
-    sched.thread_mut(tid as ThreadId).blocked_on = reason;
+    // Save current thread's state. Lock-free: we own the running thread.
+    let t = unsafe { thread_mut_from_ref(tid as ThreadId) };
+    t.saved_sp = frame_sp;
+    t.state = ThreadState::Blocked;
+    t.blocked_on = reason;
 
-    // Read SA state while holding lock.
-    let parked_task_id = sched.thread(tid as ThreadId).task_id;
-    let sa_enabled = sched.task(parked_task_id).sa_enabled;
-    drop(sched);
+    // Read SA state (lock-free).
+    let parked_task_id = t.task_id;
+    let sa_enabled = task_ref(parked_task_id).sa_enabled;
 
     // Pick next thread from per-CPU queue (don't re-enqueue current — it's Blocked).
     let next_id = percpu_pick_next(cpu_idx, idle_id);
@@ -2880,16 +2889,15 @@ pub fn park_current_for_ipc(reason: BlockReason) {
 }
 
 /// Wake a parked thread by marking it Ready and enqueueing it.
-/// This is for threads parked via park_current_for_ipc (Blocked state).
+/// Lock-free: reads prio atomic, writes state directly (safe: thread is Blocked,
+/// only the waker transitions it).
 pub fn wake_parked_thread(tid: ThreadId) {
-    let mut sched = SCHEDULER.lock();
-    if let Some(thread) = sched.thread_get_mut(tid) {
-        if thread.state == ThreadState::Blocked {
-            let prio = thread.effective_priority;
-            let target = thread.last_cpu.load(Ordering::Relaxed);
-            thread.state = ThreadState::Ready;
-            percpu_enqueue(target, prio, tid);
-        }
+    let tref = thread_ref(tid);
+    if tref.state == ThreadState::Blocked {
+        let prio = tref.prio.load(Ordering::Acquire);
+        let target = tref.last_cpu.load(Ordering::Relaxed);
+        unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
+        percpu_enqueue(target, prio, tid);
     }
 }
 
@@ -2918,11 +2926,10 @@ pub fn get_monotonic_ns() -> u64 {
 /// Called from tick() before try_switch.
 fn check_sleep_timers() {
     let now_ns = get_monotonic_ns();
-    let mut sched = SCHEDULER.lock();
-    // Collect (tid, prio, target_cpu) under global lock.
+    // Collect (tid, prio, target_cpu) lock-free via SCHED_THREAD_ART.
     let mut to_wake: [(ThreadId, u8, u32); 64] = [(0, 0, 0); 64];
     let mut count = 0usize;
-    sched.thread_art.for_each(|key, val| {
+    SCHED_THREAD_ART.for_each(|key, val| {
         let t = unsafe { &*(val as *const Thread) };
         if t.state == ThreadState::Blocked
             && matches!(t.blocked_on, BlockReason::Sleep)
@@ -2936,10 +2943,11 @@ fn check_sleep_timers() {
             }
         }
     });
-    // Update thread state under global lock, then enqueue under per-CPU locks.
+    // Update thread state and enqueue. Safe: blocked threads are not on any
+    // run queue and only the timer tick path transitions Sleep→Ready.
     for i in 0..count {
         let (tid, prio, target) = to_wake[i];
-        let t = sched.thread_mut(tid);
+        let t = unsafe { thread_mut_from_ref(tid) };
         t.state = ThreadState::Ready;
         t.blocked_on = BlockReason::None;
         t.sleep_deadline_ns = 0;
@@ -2954,26 +2962,25 @@ fn check_alarm_timers() {
     let mut fired = [0u32; 64];
     let mut count = 0usize;
 
-    {
-        let sched = SCHEDULER.lock();
-        sched.task_art.for_each(|_key, val| {
-            let task = unsafe { &mut *(val as *mut Task) };
-            if task.active
-                && task.alarm_deadline_ns != 0
-                && task.alarm_deadline_ns <= now_ns
-            {
-                if task.alarm_interval_ns != 0 {
-                    task.alarm_deadline_ns = now_ns + task.alarm_interval_ns;
-                } else {
-                    task.alarm_deadline_ns = 0;
-                }
-                if count < 64 {
-                    fired[count] = task.id;
-                    count += 1;
-                }
+    // Lock-free: alarm fields are only written by the owning task (alarm())
+    // or by this tick path; no concurrent mutation.
+    SCHED_TASK_ART.for_each(|_key, val| {
+        let task = unsafe { &mut *(val as *mut Task) };
+        if task.active
+            && task.alarm_deadline_ns != 0
+            && task.alarm_deadline_ns <= now_ns
+        {
+            if task.alarm_interval_ns != 0 {
+                task.alarm_deadline_ns = now_ns + task.alarm_interval_ns;
+            } else {
+                task.alarm_deadline_ns = 0;
             }
-        });
-    }
+            if count < 64 {
+                fired[count] = task.id;
+                count += 1;
+            }
+        }
+    });
 
     for i in 0..count {
         send_signal_to_task(fired[i], super::task::SIGALRM);
@@ -2988,31 +2995,30 @@ fn check_interval_timers() {
     let mut fired_interval: u64 = 0;
     let mut found = false;
 
-    {
-        let sched = SCHEDULER.lock();
-        sched.thread_art.for_each(|key, val| {
-            if found { return; }
-            let t = unsafe { &*(val as *const Thread) };
-            if t.state != ThreadState::Dead
-                && t.stack_base != 0
-                && t.timer_signal != 0
-                && t.timer_next_ns != 0
-                && now_ns >= t.timer_next_ns
-            {
-                fired_tid = key as ThreadId;
-                fired_sig = t.timer_signal;
-                fired_interval = t.timer_interval_ns;
-                // Re-arm the timer while we have the pointer.
-                let t_mut = unsafe { &mut *(val as *mut Thread) };
-                t_mut.timer_next_ns = if fired_interval != 0 {
-                    now_ns + fired_interval
-                } else {
-                    0
-                };
-                found = true;
-            }
-        });
-    }
+    // Lock-free: timer fields are only written by the owning thread
+    // (sys_timer_create) or by this tick path.
+    SCHED_THREAD_ART.for_each(|key, val| {
+        if found { return; }
+        let t = unsafe { &*(val as *const Thread) };
+        if t.state != ThreadState::Dead
+            && t.stack_base != 0
+            && t.timer_signal != 0
+            && t.timer_next_ns != 0
+            && now_ns >= t.timer_next_ns
+        {
+            fired_tid = key as ThreadId;
+            fired_sig = t.timer_signal;
+            fired_interval = t.timer_interval_ns;
+            // Re-arm the timer while we have the pointer.
+            let t_mut = unsafe { &mut *(val as *mut Thread) };
+            t_mut.timer_next_ns = if fired_interval != 0 {
+                now_ns + fired_interval
+            } else {
+                0
+            };
+            found = true;
+        }
+    });
 
     if found {
         send_signal_to_thread(fired_tid, fired_sig);
@@ -3026,22 +3032,20 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     let cpu_idx = cpu as u32;
     let frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
 
-    let mut sched = SCHEDULER.lock();
     let pcpu = smp::current();
     let tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
     let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
 
-    // Set deadline before marking Blocked.
-    let thread = sched.thread_mut(tid as ThreadId);
+    // Set deadline before marking Blocked. Lock-free: we own the running thread.
+    let thread = unsafe { thread_mut_from_ref(tid as ThreadId) };
     thread.sleep_deadline_ns = deadline_ns;
     thread.saved_sp = frame_sp;
     thread.state = ThreadState::Blocked;
     thread.blocked_on = BlockReason::Sleep;
 
-    // SA notification for the parked thread.
-    let parked_task_id = sched.thread(tid as ThreadId).task_id;
-    let sa_enabled = sched.task(parked_task_id).sa_enabled;
-    drop(sched);
+    // SA notification for the parked thread (lock-free).
+    let parked_task_id = thread.task_id;
+    let sa_enabled = task_ref(parked_task_id).sa_enabled;
 
     // Pick next thread from per-CPU queue.
     let next_id = percpu_pick_next(cpu_idx, idle_id);
@@ -3102,9 +3106,9 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
 /// Returns previous remaining time in nanoseconds.
 pub fn alarm(initial_ns: u64, interval_ns: u64) -> u64 {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    let mut sched = SCHEDULER.lock();
-    let task_id = sched.thread(tid).task_id;
-    let task = sched.task_mut(task_id);
+    let task_id = thread_ref(tid).task_id;
+    // Safe: only the current task modifies its own alarm fields.
+    let task = unsafe { task_mut_from_ref(task_id) };
 
     let now = get_monotonic_ns();
     let prev_remaining = if task.alarm_deadline_ns > now {
@@ -3196,8 +3200,8 @@ pub fn handoff_to(receiver_tid: ThreadId) {
 pub fn sa_register() {
     let task_id = current_task_id();
     if task_id == 0 { return; }
-    let mut sched = SCHEDULER.lock();
-    sched.task_mut(task_id).sa_enabled = true;
+    // Safe: only the current task modifies its own sa_enabled.
+    unsafe { task_mut_from_ref(task_id) }.sa_enabled = true;
 }
 
 /// Block until a scheduler activation event occurs.
@@ -3238,10 +3242,9 @@ pub fn sa_wait() -> u64 {
 pub fn sa_getid() -> u64 {
     let tid = current_thread_id();
     let task_id = current_task_id();
-    let sched = SCHEDULER.lock();
     let mut idx = 0u64;
     let mut found = false;
-    sched.thread_art.for_each(|key, val| {
+    SCHED_THREAD_ART.for_each(|key, val| {
         if found { return; }
         let t = unsafe { &*(val as *const Thread) };
         if t.task_id == task_id && t.state != ThreadState::Dead

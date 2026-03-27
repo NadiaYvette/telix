@@ -11,7 +11,6 @@
 
 use super::smp::{self, MAX_CPUS};
 use super::cpumask::{CpuMask, AtomicCpuMask};
-use super::scheduler::SCHEDULER;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Per-CPU load: number of ticks in the last window where this CPU was
@@ -119,15 +118,13 @@ pub fn cpu_offline(cpu: u32) -> u64 {
     // Collect thread IDs under the scheduler lock, then update locklessly.
     let mut tids = [0u32; 64];
     let mut count = 0usize;
-    {
-        let sched = SCHEDULER.lock();
-        sched.thread_art.for_each(|key, _val| {
-            if count < tids.len() {
-                tids[count] = key as u32;
-                count += 1;
-            }
-        });
-    }
+    // Lock-free: SCHED_THREAD_ART is safe for concurrent reads.
+    super::scheduler::SCHED_THREAD_ART.for_each(|key, _val| {
+        if count < tids.len() {
+            tids[count] = key as u32;
+            count += 1;
+        }
+    });
     for i in 0..count {
         let tid = tids[i];
         let tptr = super::scheduler::THREAD_TABLE.get(tid) as *const super::thread::Thread;

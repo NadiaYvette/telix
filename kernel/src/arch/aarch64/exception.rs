@@ -64,10 +64,7 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
         }
         _ => {
             let tid = crate::sched::current_thread_id();
-            let kstack_base = {
-                let sched = crate::sched::scheduler::SCHEDULER.lock();
-                sched.thread(tid).stack_base
-            };
+            let kstack_base = crate::sched::scheduler::thread_ref(tid).stack_base;
             crate::println!(
                 "EL1 Sync: EC={:#x} ESR={:#x} ELR={:#x} SP_EL0={:#x}",
                 ec, frame.esr, frame.elr, frame.sp
@@ -91,9 +88,8 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
             // Find which thread (if any) owns the page containing frame_sp.
             let frame_page = (frame_sp as usize) & !(page_size - 1);
             {
-                let sched = crate::sched::scheduler::SCHEDULER.lock();
                 let mut found = false;
-                sched.thread_art.for_each(|key, val| {
+                crate::sched::scheduler::SCHED_THREAD_ART.for_each(|key, val| {
                     if found { return; }
                     let t = unsafe { &*(val as *const crate::sched::thread::Thread) };
                     if t.stack_base == frame_page {
@@ -110,10 +106,10 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
             }
             // Dump saved_sp of crashing thread.
             {
-                let sched = crate::sched::scheduler::SCHEDULER.lock();
+                let t = crate::sched::scheduler::thread_ref(tid);
                 crate::println!(
                     "  thread[{}].saved_sp={:#x} state={:?}",
-                    tid, sched.thread(tid).saved_sp, sched.thread(tid).state
+                    tid, t.saved_sp, t.state
                 );
             }
             loop {

@@ -1,13 +1,15 @@
-//! HAMT-based turnstile futex subsystem.
+//! HAMT-based turnstile wait subsystem.
 //!
-//! Maps (aspace_id, va) to turnstiles via a Hash Array Mapped Trie (HAMT)
-//! with 16 root buckets (each independently locked). Turnstiles are
-//! pre-allocated per-thread and lent to the first waiter on an address
-//! (Solaris/FreeBSD turnstile lending protocol).
+//! Maps generic keys (futex addresses, port IDs) to turnstiles via a Hash
+//! Array Mapped Trie (HAMT) with 16 root buckets (each independently locked).
+//! Turnstiles are pre-allocated per-thread and lent to the first waiter on
+//! a key (Solaris/FreeBSD turnstile lending protocol).
 //!
 //! Supports both non-PI (futex_wait/wake) and PI (futex_wait_pi/wake_pi)
 //! variants. PI uses single-level priority inheritance matching the
 //! existing IPC port PI model.
+//!
+//! Port waiters use the same HAMT with key_type = KEY_PORT_RECV / KEY_PORT_SEND.
 
 use crate::mm::page::PhysAddr;
 use crate::mm::slab;
@@ -21,6 +23,13 @@ use core::sync::atomic::Ordering;
 
 /// Sentinel: idle thread (tid=0) never blocks on futex.
 const TS_NIL: u32 = 0;
+
+/// Key type discriminators for the generic HAMT.
+pub const KEY_FUTEX: u8 = 0;
+pub const KEY_PORT_RECV: u8 = 1;
+pub const KEY_PORT_SEND: u8 = 2;
+/// Parked receiver (recv_or_park) — eligible for direct-transfer injection.
+pub const KEY_PORT_RECV_PARK: u8 = 3;
 
 /// HAMT branching factor: 4 bits per level, 16 children per node.
 const HAMT_BITS: usize = 4;
@@ -51,6 +60,18 @@ fn futex_hash(aspace_id: u32, va: usize) -> u64 {
         h = h.wrapping_mul(FNV_PRIME);
     }
     for &b in &(va as u64).to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// Hash for port waiter keys (key_type discriminates recv vs send).
+fn port_key_hash(port_id: u64, key_type: u8) -> u64 {
+    let mut h = FNV_OFFSET;
+    h ^= key_type as u64;
+    h = h.wrapping_mul(FNV_PRIME);
+    for &b in &port_id.to_le_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(FNV_PRIME);
     }
@@ -114,7 +135,7 @@ impl HamtRoot {
     }
 }
 
-static FUTEX_HAMT: [SpinLock<HamtRoot>; NUM_BUCKETS] = {
+static WAIT_HAMT: [SpinLock<HamtRoot>; NUM_BUCKETS] = {
     const INIT: SpinLock<HamtRoot> = SpinLock::new(HamtRoot::new());
     [INIT; NUM_BUCKETS]
 };
@@ -123,7 +144,7 @@ static FUTEX_HAMT: [SpinLock<HamtRoot>; NUM_BUCKETS] = {
 // HAMT operations (operate on locked HamtRoot)
 // ---------------------------------------------------------------------------
 
-fn hamt_lookup(root: &HamtRoot, hash: u64, aspace_id: u32, va: usize) -> Option<*mut Turnstile> {
+fn hamt_lookup(root: &HamtRoot, hash: u64, key_type: u8, aspace_id: u32, va: usize) -> Option<*mut Turnstile> {
     let mut slot = root.children[nibble_at(hash, 0)];
     let mut level = 1usize;
     loop {
@@ -131,7 +152,7 @@ fn hamt_lookup(root: &HamtRoot, hash: u64, aspace_id: u32, va: usize) -> Option<
         if is_leaf(slot) {
             let ts = untag_leaf(slot);
             let t = unsafe { &*ts };
-            if t.aspace_id == aspace_id && t.va == va {
+            if t.key_type == key_type && t.aspace_id == aspace_id && t.va == va {
                 return Some(ts);
             }
             return None;
@@ -158,7 +179,7 @@ fn hamt_insert(root: &mut HamtRoot, hash: u64, ts_ptr: *mut Turnstile) -> bool {
             let existing = untag_leaf(val);
             let ex = unsafe { &*existing };
             let new_ts = unsafe { &*ts_ptr };
-            if ex.aspace_id == new_ts.aspace_id && ex.va == new_ts.va {
+            if ex.key_type == new_ts.key_type && ex.aspace_id == new_ts.aspace_id && ex.va == new_ts.va {
                 return false; // duplicate key
             }
             if level > MAX_LEVEL { return false; } // hash exhausted
@@ -196,13 +217,13 @@ fn hamt_insert(root: &mut HamtRoot, hash: u64, ts_ptr: *mut Turnstile) -> bool {
 
 /// Remove a turnstile from the HAMT. Returns the pointer if found.
 /// Uses recursive descent for bottom-up node collapsing.
-fn hamt_remove(root: &mut HamtRoot, hash: u64, aspace_id: u32, va: usize) -> Option<*mut Turnstile> {
+fn hamt_remove(root: &mut HamtRoot, hash: u64, key_type: u8, aspace_id: u32, va: usize) -> Option<*mut Turnstile> {
     let nibble0 = nibble_at(hash, 0);
-    hamt_remove_at(&mut root.children[nibble0], hash, aspace_id, va, 1)
+    hamt_remove_at(&mut root.children[nibble0], hash, key_type, aspace_id, va, 1)
 }
 
 fn hamt_remove_at(
-    slot: &mut usize, hash: u64, aspace_id: u32, va: usize, level: usize,
+    slot: &mut usize, hash: u64, key_type: u8, aspace_id: u32, va: usize, level: usize,
 ) -> Option<*mut Turnstile> {
     let val = *slot;
     if val == 0 { return None; }
@@ -210,7 +231,7 @@ fn hamt_remove_at(
     if is_leaf(val) {
         let ts = untag_leaf(val);
         let t = unsafe { &*ts };
-        if t.aspace_id == aspace_id && t.va == va {
+        if t.key_type == key_type && t.aspace_id == aspace_id && t.va == va {
             *slot = 0;
             return Some(ts);
         }
@@ -221,7 +242,7 @@ fn hamt_remove_at(
 
     let node = val as *mut HamtNode;
     let nibble = nibble_at(hash, level);
-    let result = hamt_remove_at(unsafe { &mut (*node).children[nibble] }, hash, aspace_id, va, level + 1);
+    let result = hamt_remove_at(unsafe { &mut (*node).children[nibble] }, hash, key_type, aspace_id, va, level + 1);
 
     if result.is_some() {
         // Try to collapse: count remaining children.
@@ -254,8 +275,9 @@ fn hamt_remove_at(
 #[repr(C)]
 struct Turnstile {
     aspace_id: u32,
-    _pad0: u32,
-    va: usize,
+    key_type: u8,
+    _pad0: [u8; 3],
+    va: usize,           // futex: virtual address; port: port_id as usize
     hash: u64,
     head: u32,
     tail: u32,
@@ -277,8 +299,9 @@ fn free_turnstile(p: *mut Turnstile) {
     slab::free(PhysAddr::new(p as usize), TS_SLAB_SIZE);
 }
 
-fn init_turnstile(ts: *mut Turnstile, aspace_id: u32, va: usize, hash: u64) {
+fn init_turnstile(ts: *mut Turnstile, key_type: u8, aspace_id: u32, va: usize, hash: u64) {
     let t = unsafe { &mut *ts };
+    t.key_type = key_type;
     t.aspace_id = aspace_id;
     t.va = va;
     t.hash = hash;
@@ -414,7 +437,7 @@ pub fn futex_wait(addr: usize, expected: u32) -> u64 {
     let bucket = bucket_index(hash);
 
     {
-        let mut root = FUTEX_HAMT[bucket].lock();
+        let mut root = WAIT_HAMT[bucket].lock();
 
         // Read current value from user memory while holding the lock.
         let mut buf = [0u8; 4];
@@ -429,14 +452,14 @@ pub fn futex_wait(addr: usize, expected: u32) -> u64 {
         crate::sched::clear_wakeup_flag(tid);
 
         // Find or create turnstile for this address.
-        let ts_ptr = if let Some(ts) = hamt_lookup(&root, hash, aspace_id, addr) {
+        let ts_ptr = if let Some(ts) = hamt_lookup(&root, hash, KEY_FUTEX, aspace_id, addr) {
             ts
         } else {
             let ts_ptr = match take_or_alloc_turnstile(tid) {
                 Some(p) => p,
                 None => return u64::MAX,
             };
-            init_turnstile(ts_ptr, aspace_id, addr, hash);
+            init_turnstile(ts_ptr, KEY_FUTEX, aspace_id, addr, hash);
             if !hamt_insert(&mut root, hash, ts_ptr) {
                 free_turnstile(ts_ptr);
                 return u64::MAX;
@@ -455,7 +478,7 @@ pub fn futex_wait(addr: usize, expected: u32) -> u64 {
     let tref = thread_ref(tid);
     let ts_addr = tref.ts_blocked_on.swap(0, Ordering::Acquire);
     if ts_addr != 0 {
-        cleanup_blocked_inner(tid, ts_addr, bucket, hash, aspace_id, addr);
+        cleanup_blocked_inner(tid, ts_addr, bucket, hash, KEY_FUTEX, aspace_id, addr);
     }
 
     // Ensure we have a turnstile for future use.
@@ -476,8 +499,8 @@ pub fn futex_wake(addr: usize, count: u32) -> u64 {
     let bucket = bucket_index(hash);
     let mut woken = 0u32;
 
-    let mut root = FUTEX_HAMT[bucket].lock();
-    let ts_ptr = match hamt_lookup(&root, hash, aspace_id, addr) {
+    let mut root = WAIT_HAMT[bucket].lock();
+    let ts_ptr = match hamt_lookup(&root, hash, KEY_FUTEX, aspace_id, addr) {
         Some(ts) => ts,
         None => return 0,
     };
@@ -497,7 +520,7 @@ pub fn futex_wake(addr: usize, count: u32) -> u64 {
     }
 
     if ts.waiter_count == 0 {
-        hamt_remove(&mut root, hash, aspace_id, addr);
+        hamt_remove(&mut root, hash, KEY_FUTEX, aspace_id, addr);
         // Return turnstile to the last woken thread if it needs one.
         if last_tid != TS_NIL {
             let tref = thread_ref(last_tid);
@@ -533,7 +556,7 @@ pub fn futex_wait_pi(addr: usize, expected_owner: u32) -> u64 {
     let bucket = bucket_index(hash);
 
     {
-        let mut root = FUTEX_HAMT[bucket].lock();
+        let mut root = WAIT_HAMT[bucket].lock();
 
         // Read and verify owner.
         let mut buf = [0u8; 4];
@@ -554,14 +577,14 @@ pub fn futex_wait_pi(addr: usize, expected_owner: u32) -> u64 {
         crate::sched::clear_wakeup_flag(tid);
 
         // Find or create turnstile.
-        let ts_ptr = if let Some(ts) = hamt_lookup(&root, hash, aspace_id, addr) {
+        let ts_ptr = if let Some(ts) = hamt_lookup(&root, hash, KEY_FUTEX, aspace_id, addr) {
             ts
         } else {
             let ts_ptr = match take_or_alloc_turnstile(tid) {
                 Some(p) => p,
                 None => return u64::MAX,
             };
-            init_turnstile(ts_ptr, aspace_id, addr, hash);
+            init_turnstile(ts_ptr, KEY_FUTEX, aspace_id, addr, hash);
             if !hamt_insert(&mut root, hash, ts_ptr) {
                 free_turnstile(ts_ptr);
                 return u64::MAX;
@@ -593,7 +616,7 @@ pub fn futex_wait_pi(addr: usize, expected_owner: u32) -> u64 {
     let tref = thread_ref(tid);
     let ts_addr = tref.ts_blocked_on.swap(0, Ordering::Acquire);
     if ts_addr != 0 {
-        cleanup_blocked_inner(tid, ts_addr, bucket, hash, aspace_id, addr);
+        cleanup_blocked_inner(tid, ts_addr, bucket, hash, KEY_FUTEX, aspace_id, addr);
     }
 
     if tref.turnstile.load(Ordering::Relaxed) == 0 {
@@ -614,8 +637,8 @@ pub fn futex_wake_pi(addr: usize) -> u64 {
     let hash = futex_hash(aspace_id, addr);
     let bucket = bucket_index(hash);
 
-    let mut root = FUTEX_HAMT[bucket].lock();
-    let ts_ptr = match hamt_lookup(&root, hash, aspace_id, addr) {
+    let mut root = WAIT_HAMT[bucket].lock();
+    let ts_ptr = match hamt_lookup(&root, hash, KEY_FUTEX, aspace_id, addr) {
         Some(ts) => ts,
         None => return 1,
     };
@@ -647,7 +670,7 @@ pub fn futex_wake_pi(addr: usize) -> u64 {
     }
 
     if ts.waiter_count == 0 {
-        hamt_remove(&mut root, hash, aspace_id, addr);
+        hamt_remove(&mut root, hash, KEY_FUTEX, aspace_id, addr);
         let tref = thread_ref(new_owner);
         if tref.turnstile.compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed).is_err() {
             free_turnstile(ts_ptr);
@@ -664,13 +687,13 @@ pub fn futex_wake_pi(addr: usize) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Clean up if a thread is still on a turnstile wait queue (killed case).
-fn cleanup_blocked_inner(tid: u32, ts_addr: usize, bucket: usize, hash: u64, aspace_id: u32, va: usize) {
-    let mut root = FUTEX_HAMT[bucket].lock();
-    if let Some(found_ts) = hamt_lookup(&root, hash, aspace_id, va) {
+fn cleanup_blocked_inner(tid: u32, ts_addr: usize, bucket: usize, hash: u64, key_type: u8, aspace_id: u32, va: usize) {
+    let mut root = WAIT_HAMT[bucket].lock();
+    if let Some(found_ts) = hamt_lookup(&root, hash, key_type, aspace_id, va) {
         if found_ts as usize == ts_addr {
             let ts = unsafe { &mut *found_ts };
             if ts_remove(ts, tid) && ts.waiter_count == 0 {
-                hamt_remove(&mut root, hash, aspace_id, va);
+                hamt_remove(&mut root, hash, key_type, aspace_id, va);
                 thread_ref(tid).turnstile.store(ts_addr, Ordering::Relaxed);
             }
         }
@@ -685,9 +708,10 @@ pub fn cleanup_blocked(tid: u32) {
     let ts = unsafe { &*(ts_addr as *const Turnstile) };
     let bucket = bucket_index(ts.hash);
     let hash = ts.hash;
+    let key_type = ts.key_type;
     let aspace_id = ts.aspace_id;
     let va = ts.va;
-    cleanup_blocked_inner(tid, ts_addr, bucket, hash, aspace_id, va);
+    cleanup_blocked_inner(tid, ts_addr, bucket, hash, key_type, aspace_id, va);
 }
 
 /// Allocate a turnstile for a new thread. Returns phys addr or 0 on OOM.
@@ -703,4 +727,169 @@ pub fn free_thread_turnstile(addr: usize) {
     if addr != 0 {
         free_turnstile(addr as *mut Turnstile);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Port wait/wake API
+// ---------------------------------------------------------------------------
+
+/// Enqueue the current thread on a port turnstile, but re-check `condition`
+/// under the HAMT bucket lock to prevent lost wakeups.
+///
+/// `condition` returns `true` if the thread should still block (e.g. queue
+/// still empty for recv, queue still full for send). If it returns `false`,
+/// the thread is NOT enqueued and this function returns `false`.
+///
+/// Returns `true` if the thread was enqueued (caller should then park).
+pub fn port_enqueue_with_check<F: FnOnce() -> bool>(
+    port_id: u64,
+    key_type: u8,
+    tid: u32,
+    condition: F,
+) -> bool {
+    let hash = port_key_hash(port_id, key_type);
+    let bucket = bucket_index(hash);
+
+    let mut root = WAIT_HAMT[bucket].lock();
+
+    // Clear wakeup flag under lock.
+    crate::sched::clear_wakeup_flag(tid);
+
+    // Re-check condition under the lock.
+    if !condition() {
+        return false;
+    }
+
+    // Port keys: aspace_id=0, va=port_id as usize.
+    let aspace_id = 0u32;
+    let va = port_id as usize;
+
+    let ts_ptr = if let Some(ts) = hamt_lookup(&root, hash, key_type, aspace_id, va) {
+        ts
+    } else {
+        let ts_ptr = match take_or_alloc_turnstile(tid) {
+            Some(p) => p,
+            None => return false,
+        };
+        init_turnstile(ts_ptr, key_type, aspace_id, va, hash);
+        if !hamt_insert(&mut root, hash, ts_ptr) {
+            free_turnstile(ts_ptr);
+            return false;
+        }
+        ts_ptr
+    };
+
+    let ts = unsafe { &mut *ts_ptr };
+    ts_enqueue(ts, tid);
+    thread_ref(tid).ts_blocked_on.store(ts_ptr as usize, Ordering::Relaxed);
+
+    drop(root);
+    true
+}
+
+/// Wake one thread waiting on a port turnstile.
+/// Returns the woken tid, or `None` if no waiters.
+pub fn port_wake_one(port_id: u64, key_type: u8) -> Option<u32> {
+    let hash = port_key_hash(port_id, key_type);
+    let bucket = bucket_index(hash);
+    let aspace_id = 0u32;
+    let va = port_id as usize;
+
+    let mut root = WAIT_HAMT[bucket].lock();
+    let ts_ptr = match hamt_lookup(&root, hash, key_type, aspace_id, va) {
+        Some(ts) => ts,
+        None => return None,
+    };
+    let ts = unsafe { &mut *ts_ptr };
+
+    let tid = match ts_dequeue_head(ts) {
+        Some(t) => t,
+        None => return None,
+    };
+    thread_ref(tid).ts_blocked_on.store(0, Ordering::Relaxed);
+
+    if ts.waiter_count == 0 {
+        hamt_remove(&mut root, hash, key_type, aspace_id, va);
+        let tref = thread_ref(tid);
+        if tref.turnstile.compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            free_turnstile(ts_ptr);
+        }
+    }
+
+    drop(root);
+    crate::sched::wake_thread(tid);
+    Some(tid)
+}
+
+/// Dequeue one waiter from a port turnstile WITHOUT waking it.
+/// Returns the dequeued tid, or `None` if no waiters.
+/// The caller is responsible for waking the thread (e.g. after injecting a message).
+pub fn port_dequeue_one(port_id: u64, key_type: u8) -> Option<u32> {
+    let hash = port_key_hash(port_id, key_type);
+    let bucket = bucket_index(hash);
+    let aspace_id = 0u32;
+    let va = port_id as usize;
+
+    let mut root = WAIT_HAMT[bucket].lock();
+    let ts_ptr = match hamt_lookup(&root, hash, key_type, aspace_id, va) {
+        Some(ts) => ts,
+        None => return None,
+    };
+    let ts = unsafe { &mut *ts_ptr };
+
+    let tid = match ts_dequeue_head(ts) {
+        Some(t) => t,
+        None => return None,
+    };
+    thread_ref(tid).ts_blocked_on.store(0, Ordering::Relaxed);
+
+    if ts.waiter_count == 0 {
+        hamt_remove(&mut root, hash, key_type, aspace_id, va);
+        let tref = thread_ref(tid);
+        if tref.turnstile.compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            free_turnstile(ts_ptr);
+        }
+    }
+
+    drop(root);
+    Some(tid)
+}
+
+/// Wake all threads waiting on a port turnstile.
+/// Returns the number of threads woken.
+pub fn port_wake_all(port_id: u64, key_type: u8) -> u32 {
+    let hash = port_key_hash(port_id, key_type);
+    let bucket = bucket_index(hash);
+    let aspace_id = 0u32;
+    let va = port_id as usize;
+
+    let mut root = WAIT_HAMT[bucket].lock();
+    let ts_ptr = match hamt_lookup(&root, hash, key_type, aspace_id, va) {
+        Some(ts) => ts,
+        None => return 0,
+    };
+    let ts = unsafe { &mut *ts_ptr };
+
+    let mut woken = 0u32;
+    let mut last_tid = TS_NIL;
+    while let Some(tid) = ts_dequeue_head(ts) {
+        thread_ref(tid).ts_blocked_on.store(0, Ordering::Relaxed);
+        crate::sched::wake_thread(tid);
+        last_tid = tid;
+        woken += 1;
+    }
+
+    // Turnstile is empty — remove from HAMT.
+    hamt_remove(&mut root, hash, key_type, aspace_id, va);
+    if last_tid != TS_NIL {
+        let tref = thread_ref(last_tid);
+        if tref.turnstile.compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            free_turnstile(ts_ptr);
+        }
+    } else {
+        free_turnstile(ts_ptr);
+    }
+
+    drop(root);
+    woken
 }
