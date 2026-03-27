@@ -57,9 +57,9 @@ pub struct MemObject {
     pub obj_type: ObjectType,
     /// Total size in allocation pages.
     pub page_count: u16,
-    /// COW sharing group ID. Objects forked from a common ancestor share
-    /// the same group ID. 0 means this object has never been COW-cloned.
-    pub cow_group: u16,
+    /// COW sharing group port ID. Objects forked from a common ancestor
+    /// share the same group. 0 means this object has never been COW-cloned.
+    pub cow_group_port: u64,
     /// Physical pages backing this object (indexed by page offset within object).
     /// 0 = not yet allocated. Uses tiered storage: inline for <=4 pages,
     /// slab-allocated for larger objects.
@@ -82,7 +82,7 @@ impl MemObject {
         Self {
             obj_type: ObjectType::Free,
             page_count: 0,
-            cow_group: 0,
+            cow_group_port: 0,
             pages: PageVec::empty(),
             mappings: core::ptr::null_mut(),
             mappings_cap: 0,
@@ -246,9 +246,6 @@ fn resolve_entry(id: ObjectId) -> Option<*const ObjEntry> {
     Some(user_data as *const ObjEntry)
 }
 
-/// Next COW group ID counter.
-static NEXT_COW_GROUP: SpinLock<u16> = SpinLock::new(1);
-
 /// Kernel port handler for memory objects (stub).
 fn object_port_handler(_port_id: PortId, _user_data: usize, _msg: &crate::ipc::Message) -> crate::ipc::Message {
     crate::ipc::Message::empty()
@@ -326,20 +323,25 @@ pub fn create_anon(page_count: u16) -> Option<ObjectId> {
 }
 
 /// Clone a memory object for COW. Creates a new object that shares all
-/// physical pages with the original. Uses frame refcounts for page sharing.
+/// physical pages with the original. Uses frame refcounts for page sharing
+/// and registers both objects in a COW sharing group.
 pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
     let src_entry = resolve_entry(src_id)? as *mut ObjEntry;
 
     // Step 1: lock source, read state, copy pages, bump refcounts.
-    let (page_count, group, new_pages) = {
+    let (page_count, group_port, new_pages) = {
         let mut src = unsafe { (*src_entry).inner.lock() };
-        if src.cow_group == 0 {
-            let mut g = NEXT_COW_GROUP.lock();
-            src.cow_group = *g;
-            *g = g.wrapping_add(1);
-            if *g == 0 { *g = 1; }
-        }
-        let group = src.cow_group;
+
+        // Create or join a COW sharing group.
+        let group_port = if src.cow_group_port == 0 {
+            let gp = super::cowgroup::create()?;
+            super::cowgroup::add_member(gp, src_id);
+            src.cow_group_port = gp;
+            gp
+        } else {
+            src.cow_group_port
+        };
+
         let page_count = src.page_count;
         let mut new_pages = PageVec::with_capacity(page_count as usize)?;
         new_pages.copy_from(&src.pages, page_count as usize);
@@ -357,7 +359,7 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
                 }
             }
         }
-        (page_count, group, new_pages)
+        (page_count, group_port, new_pages)
     };
 
     // Step 2: allocate entry + kernel port.
@@ -370,16 +372,18 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
         }
     };
 
-    // Step 3: initialize destination.
+    // Step 3: initialize destination and register in group.
     unsafe {
         (*ptr).port_id = kernel_port;
         let mut obj = MemObject::empty();
         obj.obj_type = ObjectType::Anonymous;
         obj.page_count = page_count;
-        obj.cow_group = group;
+        obj.cow_group_port = group_port;
         obj.pages = new_pages;
         core::ptr::write(&mut (*ptr).inner, SpinLock::new(obj));
     }
+
+    super::cowgroup::add_member(group_port, kernel_port);
 
     Some(kernel_port)
 }
@@ -398,6 +402,7 @@ pub fn destroy(id: ObjectId) {
 
     let page_count = guard.page_count as usize;
     let pager_port = guard.pager_port;
+    let cow_group_port = guard.cow_group_port;
 
     // Free each page using frame refcounts.
     for p in 0..page_count {
@@ -419,8 +424,13 @@ pub fn destroy(id: ObjectId) {
     }
     guard.obj_type = ObjectType::Free;
     guard.page_count = 0;
-    guard.cow_group = 0;
+    guard.cow_group_port = 0;
     drop(guard);
+
+    // Leave COW sharing group (destroys the group if last member).
+    if cow_group_port != 0 {
+        super::cowgroup::remove_member(cow_group_port, id);
+    }
 
     // Destroy ports and defer-free the entry.
     port::destroy(id);
