@@ -506,20 +506,14 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
 
     // Carve the chunk array from the start of usable RAM.
     let chunk_array_bytes = total_chunks * core::mem::size_of::<ChunkNode>();
-    // Carve the frame refcount array immediately after the chunk array.
-    let refcount_bytes = total_pages * core::mem::size_of::<core::sync::atomic::AtomicU32>();
-    let total_metadata_bytes = chunk_array_bytes + refcount_bytes;
+    let total_metadata_bytes = chunk_array_bytes;
     let metadata_pages = (total_metadata_bytes + PAGE_SIZE - 1) >> PAGE_SHIFT;
     let chunk_ptr = start as *mut ChunkNode;
-    let refcount_ptr = (start + chunk_array_bytes) as *mut u8;
 
-    // Zero the metadata region (both chunk array and refcount table).
+    // Zero the metadata region (chunk array).
     unsafe {
         core::ptr::write_bytes(start as *mut u8, 0, metadata_pages << PAGE_SHIFT);
     }
-
-    // Install the frame refcount table (lock-free AtomicU32 per page).
-    super::frame::init_table(refcount_ptr, total_pages, start);
 
     // Safety: single-threaded at boot; direct stores are fine.
     unsafe {
@@ -706,13 +700,9 @@ pub fn alloc_page() -> Option<PhysAddr> {
 }
 
 /// Free a single page.
-/// Resets the frame refcount to 0 so newly-allocated pages always start
-/// untracked, regardless of stale COW refcounts from a prior lifetime.
 pub fn free_page(addr: PhysAddr) {
     let pa = addr.as_usize();
     if pa < ALLOC.base { return; }
-    // Clear any stale frame refcount before returning to the free pool.
-    super::frame::set_ref(addr, 0);
     let (ci, pi) = addr_to_chunk_page(pa);
     if ci >= ALLOC.total_chunks { return; }
     chunk_free_one(ci, pi);

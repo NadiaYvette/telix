@@ -222,9 +222,7 @@ pub fn handle_page_fault(
 
         // If a COW object allocated a new page (demand-zero), mark it as private
         // in the group extent so other_sharers correctly excludes this member.
-        if newly_allocated && cow_group_port != 0
-            && !super::cowgroup::is_refcounted(cow_group_port)
-        {
+        if newly_allocated && cow_group_port != 0 {
             let super_base = (obj_page_idx & !(SUPERPAGE_ALLOC_PAGES - 1)) as u32;
             let slot = obj_page_idx - super_base as usize;
             super::cowgroup::mark_private(cow_group_port, obj_id, super_base, slot);
@@ -700,19 +698,16 @@ fn handle_cow_fault(
     });
 
     // Release old page's share — this object no longer references it.
-    if cow_group_port != 0 && !cowgroup::is_refcounted(cow_group_port) {
-        // Non-refcounted group: use extent-based tracking.
+    if cow_group_port != 0 {
+        // COW group: use epoch-based extent tracking.
         let super_base = (obj_page_idx & !(SUPERPAGE_ALLOC_PAGES - 1)) as u32;
         let slot = obj_page_idx - super_base as usize;
         cowgroup::mark_copied_and_release(
             cow_group_port, obj_id, super_base, slot, old_pa,
         );
     } else {
-        // Refcounted group or no group: use per-page dec_ref.
-        let remaining = super::frame::dec_ref(old_pa);
-        if remaining == 0 {
-            super::phys::free_page(old_pa);
-        }
+        // No COW group: page is exclusively owned, free directly.
+        super::phys::free_page(old_pa);
     }
 
     // Reinstall PTEs for all present MMU pages in this allocation page.
