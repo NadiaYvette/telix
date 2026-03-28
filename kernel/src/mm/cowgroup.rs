@@ -25,7 +25,7 @@
 //! slots in the reservation instead of allocating scattered single pages.
 //! This preserves physical contiguity for superpage re-promotion.
 
-use super::page::{PhysAddr, PAGE_SIZE, SUPERPAGE_ALLOC_PAGES};
+use super::page::{PAGE_SIZE, PhysAddr, SUPERPAGE_ALLOC_PAGES};
 use crate::ipc::port::{self, PortId};
 use crate::mm::slab;
 use crate::sync::SpinLock;
@@ -66,7 +66,11 @@ struct MemberReservation {
 
 impl MemberReservation {
     const fn empty() -> Self {
-        Self { obj_id: 0, dest_pa: 0, copied: 0 }
+        Self {
+            obj_id: 0,
+            dest_pa: 0,
+            copied: 0,
+        }
     }
 }
 
@@ -84,7 +88,11 @@ struct EpochBitmasks {
 
 impl EpochBitmasks {
     const fn empty() -> Self {
-        Self { shared_mask: 0, parent_copied_since: 0, child_copied_since: 0 }
+        Self {
+            shared_mask: 0,
+            parent_copied_since: 0,
+            child_copied_since: 0,
+        }
     }
 }
 
@@ -162,9 +170,7 @@ impl GroupExtent {
                 if dest_pa != 0 {
                     for slot in 0..self.page_count as usize {
                         if copied & (1u64 << slot) == 0 {
-                            super::phys::free_page(PhysAddr::new(
-                                dest_pa + slot * PAGE_SIZE,
-                            ));
+                            super::phys::free_page(PhysAddr::new(dest_pa + slot * PAGE_SIZE));
                         }
                     }
                 }
@@ -219,13 +225,18 @@ impl GroupExtent {
     /// - shared_mask has the bit set
     /// - NEITHER participant has COW-broken since that epoch
     fn is_shared_for_member(
-        &self, member_idx: u8, slot: usize,
-        fork_parent: &[u8; MAX_EPOCHS], fork_child: &[u8; MAX_EPOCHS],
+        &self,
+        member_idx: u8,
+        slot: usize,
+        fork_parent: &[u8; MAX_EPOCHS],
+        fork_child: &[u8; MAX_EPOCHS],
     ) -> bool {
         let bit = 1u64 << slot;
         for ei in 0..self.epoch_count as usize {
             let e = &self.epochs[ei];
-            if e.shared_mask & bit == 0 { continue; }
+            if e.shared_mask & bit == 0 {
+                continue;
+            }
             let pi = fork_parent[ei];
             let ci = fork_child[ei];
             if member_idx == pi || member_idx == ci {
@@ -240,13 +251,18 @@ impl GroupExtent {
     /// Mark member's COW-break at `slot` in all participating epochs.
     /// Sets the appropriate copied_since bit.
     fn mark_epoch_copied(
-        &mut self, member_idx: u8, slot: usize,
-        fork_parent: &[u8; MAX_EPOCHS], fork_child: &[u8; MAX_EPOCHS],
+        &mut self,
+        member_idx: u8,
+        slot: usize,
+        fork_parent: &[u8; MAX_EPOCHS],
+        fork_child: &[u8; MAX_EPOCHS],
     ) {
         let bit = 1u64 << slot;
         for ei in 0..self.epoch_count as usize {
             let e = &mut self.epochs[ei];
-            if e.shared_mask & bit == 0 { continue; }
+            if e.shared_mask & bit == 0 {
+                continue;
+            }
             let pi = fork_parent[ei];
             let ci = fork_child[ei];
             if member_idx == pi {
@@ -266,7 +282,9 @@ impl GroupExtent {
         let bit = 1u64 << slot;
         for ei in 0..self.epoch_count as usize {
             let e = &self.epochs[ei];
-            if e.shared_mask & bit == 0 { continue; }
+            if e.shared_mask & bit == 0 {
+                continue;
+            }
             if e.parent_copied_since & bit == 0 || e.child_copied_since & bit == 0 {
                 return false;
             }
@@ -276,8 +294,11 @@ impl GroupExtent {
 
     /// For destroy: classify which pages member at `member_idx` can free.
     fn pages_to_free(
-        &self, member_idx: u8, page_count: u8,
-        fork_parent: &[u8; MAX_EPOCHS], fork_child: &[u8; MAX_EPOCHS],
+        &self,
+        member_idx: u8,
+        page_count: u8,
+        fork_parent: &[u8; MAX_EPOCHS],
+        fork_child: &[u8; MAX_EPOCHS],
     ) -> u64 {
         let mut free_mask: u64 = 0;
         for slot in 0..page_count as usize {
@@ -287,7 +308,9 @@ impl GroupExtent {
             let mut all_copied = true; // member has COW-broken in all participating epochs
             for ei in 0..self.epoch_count as usize {
                 let e = &self.epochs[ei];
-                if e.shared_mask & bit == 0 { continue; }
+                if e.shared_mask & bit == 0 {
+                    continue;
+                }
                 let pi = fork_parent[ei];
                 let ci = fork_child[ei];
                 if member_idx == pi {
@@ -492,8 +515,11 @@ impl CowGroup {
                     unsafe {
                         let last_ext = *self.extents.add(last);
                         *self.extents.add(xi) = last_ext;
-                        core::ptr::write_bytes(self.extents.add(last) as *mut u8, 0,
-                            core::mem::size_of::<GroupExtent>());
+                        core::ptr::write_bytes(
+                            self.extents.add(last) as *mut u8,
+                            0,
+                            core::mem::size_of::<GroupExtent>(),
+                        );
                     }
                 }
                 self.extent_count -= 1;
@@ -552,12 +578,12 @@ impl CowGroup {
             let ext = unsafe { &*self.extents.add(ei) };
             for ri in 0..ext.reservation_count as usize {
                 let r = &ext.reservations[ri];
-                if r.dest_pa == 0 { continue; } // tracking-only reservation
+                if r.dest_pa == 0 {
+                    continue;
+                } // tracking-only reservation
                 for slot in 0..ext.page_count as usize {
                     if r.copied & (1u64 << slot) == 0 {
-                        super::phys::free_page(PhysAddr::new(
-                            r.dest_pa + slot * PAGE_SIZE,
-                        ));
+                        super::phys::free_page(PhysAddr::new(r.dest_pa + slot * PAGE_SIZE));
                     }
                 }
             }
@@ -601,7 +627,9 @@ fn free_entry(ptr: *mut GroupEntry) {
 /// Resolve a CowGroupId (port_id) to the GroupEntry pointer. Lock-free via RCU.
 #[inline]
 fn resolve_entry(id: CowGroupId) -> Option<*const GroupEntry> {
-    if id == 0 { return None; }
+    if id == 0 {
+        return None;
+    }
     let user_data = port::port_kernel_data(id)?;
     Some(user_data as *const GroupEntry)
 }
@@ -807,15 +835,16 @@ pub fn find_or_create_reservation(
                 // Free destination pages for already-copied (private) slots.
                 for s in 0..guard.extent(ei).page_count as usize {
                     if old_copied & (1u64 << s) != 0 {
-                        super::phys::free_page(PhysAddr::new(
-                            dest_pa.as_usize() + s * PAGE_SIZE,
-                        ));
+                        super::phys::free_page(PhysAddr::new(dest_pa.as_usize() + s * PAGE_SIZE));
                     }
                 }
                 i
             }
         } else {
-            match guard.extent_mut(ei).add_reservation(obj_id, dest_pa.as_usize()) {
+            match guard
+                .extent_mut(ei)
+                .add_reservation(obj_id, dest_pa.as_usize())
+            {
                 Some(i) => i,
                 None => {
                     super::fault::free_pages_range(dest_pa, SUPERPAGE_ALLOC_PAGES);
@@ -831,7 +860,10 @@ pub fn find_or_create_reservation(
     let already_copied = r.copied & (1u64 << slot) != 0;
     let dest_page_pa = r.dest_pa + slot * PAGE_SIZE;
 
-    Some(ReservationSlot { dest_page_pa, already_copied })
+    Some(ReservationSlot {
+        dest_page_pa,
+        already_copied,
+    })
 }
 
 /// Check whether a page is still shared from `obj_id`'s perspective.
@@ -871,18 +903,16 @@ pub fn is_page_shared_in_group(
         }
     };
 
-    guard.extent(ei).is_shared_for_member(mi, slot, &guard.fork_parent, &guard.fork_child)
+    guard
+        .extent(ei)
+        .is_shared_for_member(mi, slot, &guard.fork_parent, &guard.fork_child)
 }
 
 /// Check whether all originally-shared pages in a superpage range have
 /// been COW-broken by `obj_id` (reservation is complete). If so, the
 /// member's pages in this range are all contiguous in the reservation
 /// destination and may be eligible for superpage promotion.
-pub fn is_reservation_complete(
-    group_id: CowGroupId,
-    obj_id: u64,
-    obj_page_base: u32,
-) -> bool {
+pub fn is_reservation_complete(group_id: CowGroupId, obj_id: u64, obj_page_base: u32) -> bool {
     let entry_ptr = match resolve_entry(group_id) {
         Some(p) => p,
         None => return false,
@@ -1059,12 +1089,10 @@ pub fn mark_copied_and_release(
     // Set copied bit in reservation. Create tracking-only if none exists.
     let ri = match guard.extent(ei).find_reservation(obj_id) {
         Some(i) => i,
-        None => {
-            match guard.extent_mut(ei).add_reservation(obj_id, 0) {
-                Some(i) => i,
-                None => return false,
-            }
-        }
+        None => match guard.extent_mut(ei).add_reservation(obj_id, 0) {
+            Some(i) => i,
+            None => return false,
+        },
     };
     let fp = guard.fork_parent;
     let fc = guard.fork_child;
@@ -1089,12 +1117,7 @@ pub fn mark_copied_and_release(
 ///
 /// Creates a tracking-only reservation (dest_pa=0) if the member has no
 /// reservation in this extent yet.
-pub fn mark_private(
-    group_id: CowGroupId,
-    obj_id: u64,
-    obj_page_base: u32,
-    slot: usize,
-) {
+pub fn mark_private(group_id: CowGroupId, obj_id: u64, obj_page_base: u32, slot: usize) {
     let entry_ptr = match resolve_entry(group_id) {
         Some(p) => p,
         None => return,
@@ -1113,12 +1136,10 @@ pub fn mark_private(
 
     let ri = match guard.extent(ei).find_reservation(obj_id) {
         Some(i) => i,
-        None => {
-            match guard.extent_mut(ei).add_reservation(obj_id, 0) {
-                Some(i) => i,
-                None => return,
-            }
-        }
+        None => match guard.extent_mut(ei).add_reservation(obj_id, 0) {
+            Some(i) => i,
+            None => return,
+        },
     };
 
     let fp = guard.fork_parent;
@@ -1162,7 +1183,9 @@ pub fn pages_to_free_on_destroy(
         }
     };
 
-    guard.extent(ei).pages_to_free(mi, page_count, &guard.fork_parent, &guard.fork_child)
+    guard
+        .extent(ei)
+        .pages_to_free(mi, page_count, &guard.fork_parent, &guard.fork_child)
 }
 
 /// Release a shared page from a COW group. Called by release_page when a
@@ -1215,7 +1238,10 @@ pub fn release_shared_page(
     }
 
     // Check via epochs: is this slot shared for this member?
-    if !guard.extent(ei).is_shared_for_member(mi, slot, &guard.fork_parent, &guard.fork_child) {
+    if !guard
+        .extent(ei)
+        .is_shared_for_member(mi, slot, &guard.fork_parent, &guard.fork_child)
+    {
         // Not shared in any epoch → post-fork private allocation → free.
         drop(guard);
         super::phys::free_page(pa);
@@ -1225,12 +1251,10 @@ pub fn release_shared_page(
     // Shared original — mark departure in reservation + epoch tracking.
     let ri = match guard.extent(ei).find_reservation(obj_id) {
         Some(i) => i,
-        None => {
-            match guard.extent_mut(ei).add_reservation(obj_id, 0) {
-                Some(i) => i,
-                None => return false,
-            }
-        }
+        None => match guard.extent_mut(ei).add_reservation(obj_id, 0) {
+            Some(i) => i,
+            None => return false,
+        },
     };
     let fp = guard.fork_parent;
     let fc = guard.fork_child;

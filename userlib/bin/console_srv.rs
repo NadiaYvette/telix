@@ -108,8 +108,14 @@ impl ConsoleSrv {
         for i in 0..len {
             words[i / 8] |= (self.line_buf[i] as u64) << ((i % 8) * 8);
         }
-        syscall::send(reply_port, CON_READ_OK,
-            self.line_len as u64, words[0], words[1], words[2]);
+        syscall::send(
+            reply_port,
+            CON_READ_OK,
+            self.line_len as u64,
+            words[0],
+            words[1],
+            words[2],
+        );
         // Reset line buffer.
         self.line_len = 0;
         self.line_ready = false;

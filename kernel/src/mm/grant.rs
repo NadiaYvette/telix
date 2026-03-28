@@ -5,7 +5,7 @@
 
 use super::aspace::{self, ASpaceId};
 use super::object;
-use super::page::{PAGE_SIZE, PAGE_MMUCOUNT, MMUPAGE_SIZE};
+use super::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE};
 use super::vma::VmaProt;
 
 /// Error returned by grant operations.
@@ -59,14 +59,24 @@ pub fn grant_pages(
 
     // Step 3: Create a shared VMA in the destination address space.
     aspace::with_aspace(dst_aspace, |aspace| {
-        let prot = if readonly { VmaProt::ReadOnly } else { VmaProt::ReadWrite };
+        let prot = if readonly {
+            VmaProt::ReadOnly
+        } else {
+            VmaProt::ReadWrite
+        };
         let va_len = page_count * PAGE_SIZE;
-        let vma = aspace.vmas.insert(dst_va, va_len, prot, obj_id, obj_mmu_offset)
+        let vma = aspace
+            .vmas
+            .insert(dst_va, va_len, prot, obj_id, obj_mmu_offset)
             .ok_or(GrantError::DestMapFailed)?;
 
         // Step 4: Install PTEs for all MMU pages that have physical backing.
         let pt_root = aspace.page_table_root;
-        let flags = if readonly { user_ro_flags() } else { user_rw_flags() };
+        let flags = if readonly {
+            user_ro_flags()
+        } else {
+            user_rw_flags()
+        };
 
         for page_i in 0..page_count {
             let pa_base = phys_pages[page_i];

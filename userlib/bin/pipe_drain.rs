@@ -6,8 +6,8 @@
 
 extern crate userlib;
 
-use userlib::syscall;
 use userlib::pipe;
+use userlib::syscall;
 
 #[unsafe(no_mangle)]
 fn main(arg0: u64, _arg1: u64, _arg2: u64) {

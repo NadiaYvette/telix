@@ -3,7 +3,6 @@
 
 use super::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE};
 
-
 /// VMA protection flags.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -17,9 +16,15 @@ pub enum VmaProt {
 
 impl VmaProt {
     #[allow(dead_code)]
-    pub fn readable(self) -> bool { !matches!(self, Self::None) }
-    pub fn writable(self) -> bool { matches!(self, Self::ReadWrite | Self::ReadWriteExec) }
-    pub fn executable(self) -> bool { matches!(self, Self::ReadExec | Self::ReadWriteExec) }
+    pub fn readable(self) -> bool {
+        !matches!(self, Self::None)
+    }
+    pub fn writable(self) -> bool {
+        matches!(self, Self::ReadWrite | Self::ReadWriteExec)
+    }
+    pub fn executable(self) -> bool {
+        matches!(self, Self::ReadExec | Self::ReadWriteExec)
+    }
 }
 
 /// A virtual memory area within an address space.
@@ -101,8 +106,8 @@ impl Vma {
         let obj_mmu = self.object_offset as usize + mmu_idx;
         let page_base = obj_mmu - (obj_mmu % PAGE_MMUCOUNT);
         let start = page_base.saturating_sub(self.object_offset as usize);
-        let end = (page_base + PAGE_MMUCOUNT - self.object_offset as usize)
-            .min(self.mmu_page_count());
+        let end =
+            (page_base + PAGE_MMUCOUNT - self.object_offset as usize).min(self.mmu_page_count());
         (start, end)
     }
 }

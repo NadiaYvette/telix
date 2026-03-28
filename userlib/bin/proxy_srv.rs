@@ -103,7 +103,13 @@ fn print_num(n: u64) {
 
 // --- Wire frame serialization ---
 
-fn serialize_frame(buf: &mut [u8; WIRE_FRAME_SIZE], target_port: u64, tag: u64, data: &[u64; 4], src_node: u16) {
+fn serialize_frame(
+    buf: &mut [u8; WIRE_FRAME_SIZE],
+    target_port: u64,
+    tag: u64,
+    data: &[u64; 4],
+    src_node: u16,
+) {
     // Bytes 0-3: magic
     buf[0..4].copy_from_slice(&WIRE_MAGIC.to_le_bytes());
     // Bytes 4-7: target_port (with node=0 for local delivery on remote side)
@@ -128,13 +134,21 @@ fn deserialize_frame(buf: &[u8; WIRE_FRAME_SIZE]) -> Option<(u64, u64, [u64; 4],
         return None;
     }
     let target_port = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
-    let tag = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
+    let tag = u64::from_le_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+    ]);
     let mut data = [0u64; 4];
     for i in 0..4 {
         let off = 16 + i * 8;
         data[i] = u64::from_le_bytes([
-            buf[off], buf[off+1], buf[off+2], buf[off+3],
-            buf[off+4], buf[off+5], buf[off+6], buf[off+7],
+            buf[off],
+            buf[off + 1],
+            buf[off + 2],
+            buf[off + 3],
+            buf[off + 4],
+            buf[off + 5],
+            buf[off + 6],
+            buf[off + 7],
         ]);
     }
     let src_node = u16::from_le_bytes([buf[48], buf[49]]);
@@ -172,11 +186,15 @@ fn unpack24(d1: u64, d2: u64, d3: u64, out: &mut [u8], len: usize) {
 
 impl ProxySrv {
     fn find_node_by_id(&self, node_id: u16) -> Option<usize> {
-        self.nodes.iter().position(|n| n.active && n.node_id == node_id)
+        self.nodes
+            .iter()
+            .position(|n| n.active && n.node_id == node_id)
     }
 
     fn find_node_by_conn(&self, conn_id: usize) -> Option<usize> {
-        self.nodes.iter().position(|n| n.active && n.conn_id == conn_id)
+        self.nodes
+            .iter()
+            .position(|n| n.active && n.conn_id == conn_id)
     }
 
     /// Send a 64-byte wire frame as 4 × 16-byte TCP sends.
@@ -189,7 +207,10 @@ impl ProxySrv {
             // Wait for send_ok (consume reply).
             loop {
                 if let Some(reply) = syscall::recv_msg(self.reply_port) {
-                    if reply.tag == NET_TCP_SEND_OK || reply.tag == NET_TCP_FAIL || reply.tag == NET_TCP_CLOSED {
+                    if reply.tag == NET_TCP_SEND_OK
+                        || reply.tag == NET_TCP_FAIL
+                        || reply.tag == NET_TCP_CLOSED
+                    {
                         break;
                     }
                     // Unexpected message on reply port — might be from accept/connect.
@@ -246,7 +267,7 @@ impl ProxySrv {
     fn handle_outbound(&mut self, msg: &Message) {
         // New wire protocol: data[0] = target_port, data[1] = original_tag, data[2..4] = data[0..2]
         let target_port = msg.data[0];
-        let node_id = (target_port >> 44) as u16;  // 20|44 split: node in top 20 bits
+        let node_id = (target_port >> 44) as u16; // 20|44 split: node in top 20 bits
         let original_tag = msg.data[1];
         let original_data = [msg.data[2], msg.data[3], msg.data[4], 0];
 
@@ -266,7 +287,13 @@ impl ProxySrv {
         }
 
         let mut frame = [0u8; WIRE_FRAME_SIZE];
-        serialize_frame(&mut frame, target_port, original_tag, &original_data, self.my_node_id);
+        serialize_frame(
+            &mut frame,
+            target_port,
+            original_tag,
+            &original_data,
+            self.my_node_id,
+        );
         self.tcp_send_frame(self.nodes[node_idx].conn_id, &frame);
     }
 
@@ -326,7 +353,13 @@ impl ProxySrv {
                 match reply.tag {
                     NET_TCP_DATA => {
                         let len = reply.data[0] as usize;
-                        self.handle_inbound_data(conn_id, len, reply.data[1], reply.data[2], reply.data[3]);
+                        self.handle_inbound_data(
+                            conn_id,
+                            len,
+                            reply.data[1],
+                            reply.data[2],
+                            reply.data[3],
+                        );
                     }
                     NET_TCP_RECV_NONE => {} // No data.
                     NET_TCP_CLOSED => {
@@ -350,7 +383,10 @@ impl ProxySrv {
 
         // Find a free slot or existing entry for this node_id.
         let slot = self.find_node_by_id(node_id).unwrap_or_else(|| {
-            self.nodes.iter().position(|n| !n.active).unwrap_or(MAX_NODES)
+            self.nodes
+                .iter()
+                .position(|n| !n.active)
+                .unwrap_or(MAX_NODES)
         });
 
         if slot < MAX_NODES {
@@ -375,7 +411,9 @@ impl ProxySrv {
 
     /// Issue a non-blocking accept on the listen port.
     fn try_accept(&mut self) {
-        if self.accepting { return; }
+        if self.accepting {
+            return;
+        }
         let d1 = ((self.reply_port as u64) << 32) | (LISTEN_TCP_PORT as u64);
         // NET_TCP_ACCEPT: data[0]=port, data[1] has reply_port in upper 32 bits.
         syscall::send_nb(self.net_port, NET_TCP_ACCEPT, LISTEN_TCP_PORT as u64, d1);
@@ -436,12 +474,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // Bind + listen on LISTEN_TCP_PORT for incoming proxy connections.
     let d1_bind = (LISTEN_TCP_PORT as u64) | ((reply_port) << 32);
-    syscall::send(net_port, NET_TCP_BIND, LISTEN_TCP_PORT as u64, d1_bind, 0, 0);
+    syscall::send(
+        net_port,
+        NET_TCP_BIND,
+        LISTEN_TCP_PORT as u64,
+        d1_bind,
+        0,
+        0,
+    );
     // Wait for bind reply.
     if let Some(reply) = syscall::recv_msg(reply_port) {
         if reply.tag == NET_TCP_BIND_OK {
             let d2_listen = (reply_port << 32);
-            syscall::send(net_port, NET_TCP_LISTEN, LISTEN_TCP_PORT as u64, 1, d2_listen, 0);
+            syscall::send(
+                net_port,
+                NET_TCP_LISTEN,
+                LISTEN_TCP_PORT as u64,
+                1,
+                d2_listen,
+                0,
+            );
             let _ = syscall::recv_msg(reply_port); // LISTEN_OK
         }
     }
@@ -482,7 +534,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Try all active connections.
                 for i in 0..MAX_NODES {
                     if srv.nodes[i].active && srv.nodes[i].conn_id != NONE_CONN {
-                        srv.handle_inbound_data(srv.nodes[i].conn_id, len, msg.data[1], msg.data[2], msg.data[3]);
+                        srv.handle_inbound_data(
+                            srv.nodes[i].conn_id,
+                            len,
+                            msg.data[1],
+                            msg.data[2],
+                            msg.data[3],
+                        );
                         break;
                     }
                 }

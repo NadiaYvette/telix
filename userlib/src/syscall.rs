@@ -65,12 +65,16 @@ pub fn proxy_register(port: u64) -> u64 {
 
 /// Print a single character to the debug console.
 pub fn debug_putchar(ch: u8) {
-    unsafe { arch::syscall1(SYS_DEBUG_PUTCHAR, ch as u64); }
+    unsafe {
+        arch::syscall1(SYS_DEBUG_PUTCHAR, ch as u64);
+    }
 }
 
 /// Print a string to the debug console.
 pub fn debug_puts(s: &[u8]) {
-    unsafe { arch::syscall2(SYS_DEBUG_PUTS, s.as_ptr() as u64, s.len() as u64); }
+    unsafe {
+        arch::syscall2(SYS_DEBUG_PUTS, s.as_ptr() as u64, s.len() as u64);
+    }
 }
 
 /// Create a new IPC port. Returns port ID or u64::MAX on error.
@@ -80,7 +84,9 @@ pub fn port_create() -> u64 {
 
 /// Destroy an IPC port, freeing the port ID for reuse.
 pub fn port_destroy(port: u64) {
-    unsafe { arch::syscall1(SYS_PORT_DESTROY, port); }
+    unsafe {
+        arch::syscall1(SYS_PORT_DESTROY, port);
+    }
 }
 
 /// Resize a port's message queue to hold at least `new_capacity` messages.
@@ -111,14 +117,18 @@ pub fn recv(port: u64) -> u64 {
 
 /// Yield the current time slice.
 pub fn yield_now() {
-    unsafe { arch::syscall0(SYS_YIELD); }
+    unsafe {
+        arch::syscall0(SYS_YIELD);
+    }
 }
 
 /// Yield and wait for the next interrupt (WFI/HLT).
 /// Use when the caller has no work to do — more efficient than a
 /// tight yield_now() loop on QEMU TCG.
 pub fn yield_block() {
-    unsafe { arch::syscall0(SYS_YIELD_BLOCK); }
+    unsafe {
+        arch::syscall0(SYS_YIELD_BLOCK);
+    }
 }
 
 /// Get the current thread ID.
@@ -128,15 +138,27 @@ pub fn thread_id() -> u64 {
 
 /// Terminate the current thread/process.
 pub fn exit(code: u64) -> ! {
-    unsafe { arch::syscall1(SYS_EXIT, code); }
+    unsafe {
+        arch::syscall1(SYS_EXIT, code);
+    }
     // Should never return, but loop just in case.
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Spawn a new process from an ELF in initramfs.
 /// Returns thread ID or u64::MAX on error.
 pub fn spawn(name: &[u8], priority: u8) -> u64 {
-    unsafe { arch::syscall4(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, priority as u64, 0) }
+    unsafe {
+        arch::syscall4(
+            SYS_SPAWN,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            priority as u64,
+            0,
+        )
+    }
 }
 
 /// Wait for a child task to exit (by task port_id). Returns Some(exit_code) or None.
@@ -149,13 +171,29 @@ pub fn waitpid(child_port: u64) -> Option<u64> {
 /// Returns mapped VA or None on error.
 pub fn mmap_anon(va: usize, page_count: usize, prot: u8) -> Option<usize> {
     let r = unsafe { arch::syscall4(SYS_MMAP_ANON, va as u64, page_count as u64, prot as u64, 0) };
-    if r == u64::MAX { None } else { Some(r as usize) }
+    if r == u64::MAX {
+        None
+    } else {
+        Some(r as usize)
+    }
 }
 
 /// Map anonymous pages with flags (e.g. MAP_FIXED_NOREPLACE = 0x100000).
 pub fn mmap_anon_flags(va: usize, page_count: usize, prot: u8, flags: u64) -> Option<usize> {
-    let r = unsafe { arch::syscall4(SYS_MMAP_ANON, va as u64, page_count as u64, prot as u64, flags) };
-    if r == u64::MAX { None } else { Some(r as usize) }
+    let r = unsafe {
+        arch::syscall4(
+            SYS_MMAP_ANON,
+            va as u64,
+            page_count as u64,
+            prot as u64,
+            flags,
+        )
+    };
+    if r == u64::MAX {
+        None
+    } else {
+        Some(r as usize)
+    }
 }
 
 /// Unmap a previously mmap'd region. Returns true on success.
@@ -165,8 +203,23 @@ pub fn munmap(va: usize) -> bool {
 }
 
 /// Grant pages from our address space to another task (identified by task port_id).
-pub fn grant_pages(dst_task: u64, src_va: usize, dst_va: usize, page_count: usize, readonly: bool) -> bool {
-    let r = unsafe { arch::syscall5(SYS_GRANT_PAGES, dst_task, src_va as u64, dst_va as u64, page_count as u64, readonly as u64) };
+pub fn grant_pages(
+    dst_task: u64,
+    src_va: usize,
+    dst_va: usize,
+    page_count: usize,
+    readonly: bool,
+) -> bool {
+    let r = unsafe {
+        arch::syscall5(
+            SYS_GRANT_PAGES,
+            dst_task,
+            src_va as u64,
+            dst_va as u64,
+            page_count as u64,
+            readonly as u64,
+        )
+    };
     r == 0
 }
 
@@ -183,12 +236,28 @@ pub fn aspace_id() -> u64 {
 
 /// Spawn a new process with an argument passed to main().
 pub fn spawn_with_arg(name: &[u8], priority: u8, arg0: u64) -> u64 {
-    unsafe { arch::syscall4(SYS_SPAWN, name.as_ptr() as u64, name.len() as u64, priority as u64, arg0) }
+    unsafe {
+        arch::syscall4(
+            SYS_SPAWN,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            priority as u64,
+            arg0,
+        )
+    }
 }
 
 /// Spawn a new process from ELF data in memory. Returns thread ID or u64::MAX.
 pub fn spawn_elf(elf_data: &[u8], priority: u8, arg0: u64) -> u64 {
-    unsafe { arch::syscall4(SYS_SPAWN_ELF, elf_data.as_ptr() as u64, elf_data.len() as u64, priority as u64, arg0) }
+    unsafe {
+        arch::syscall4(
+            SYS_SPAWN_ELF,
+            elf_data.as_ptr() as u64,
+            elf_data.len() as u64,
+            priority as u64,
+            arg0,
+        )
+    }
 }
 
 /// Create a new thread in the current process. Returns thread ID or u64::MAX on error.
@@ -415,10 +484,13 @@ pub fn port_set_recv(set_id: u32) -> Option<(u64, Message)> {
         return None;
     }
     let port_id = status;
-    Some((port_id, Message {
-        tag: r1,
-        data: [r2, r3, r4, r5, r6, r7],
-    }))
+    Some((
+        port_id,
+        Message {
+            tag: r1,
+            data: [r2, r3, r4, r5, r6, r7],
+        },
+    ))
 }
 
 /// Pack a name (up to 24 bytes) into 3 u64 words.
@@ -433,7 +505,9 @@ pub fn pack_name(name: &[u8]) -> (u64, u64, u64) {
 /// Lookup a service by name via the name server. Returns port ID or None.
 pub fn ns_lookup(name: &[u8]) -> Option<u64> {
     let nsrv = nsrv_port();
-    if nsrv == u64::MAX { return None; }
+    if nsrv == u64::MAX {
+        return None;
+    }
 
     let reply_port = port_create();
     let (n0, n1, n2) = pack_name(name);
@@ -459,13 +533,21 @@ pub fn ns_lookup(name: &[u8]) -> Option<u64> {
 /// Map device MMIO registers into userspace. Returns VA or None.
 pub fn mmap_device(phys: usize, page_count: usize) -> Option<usize> {
     let r = unsafe { arch::syscall2(SYS_MMAP_DEVICE, phys as u64, page_count as u64) };
-    if r == u64::MAX { None } else { Some(r as usize) }
+    if r == u64::MAX {
+        None
+    } else {
+        Some(r as usize)
+    }
 }
 
 /// Translate a virtual address to physical. Returns PA or None.
 pub fn virt_to_phys(va: usize) -> Option<usize> {
     let r = unsafe { arch::syscall1(SYS_VIRT_TO_PHYS, va as u64) };
-    if r == u64::MAX { None } else { Some(r as usize) }
+    if r == u64::MAX {
+        None
+    } else {
+        Some(r as usize)
+    }
 }
 
 /// Wait for a device IRQ. On first call, pass mmio_base to register.
@@ -569,17 +651,23 @@ pub fn ioport_inl(port: u16) -> u32 {
 
 /// Write a byte to an I/O port (x86_64 only).
 pub fn ioport_outb(port: u16, val: u8) {
-    unsafe { arch::syscall3(SYS_IOPORT, 3, port as u64, val as u64); }
+    unsafe {
+        arch::syscall3(SYS_IOPORT, 3, port as u64, val as u64);
+    }
 }
 
 /// Write a 16-bit word to an I/O port (x86_64 only).
 pub fn ioport_outw(port: u16, val: u16) {
-    unsafe { arch::syscall3(SYS_IOPORT, 4, port as u64, val as u64); }
+    unsafe {
+        arch::syscall3(SYS_IOPORT, 4, port as u64, val as u64);
+    }
 }
 
 /// Write a 32-bit dword to an I/O port (x86_64 only).
 pub fn ioport_outl(port: u16, val: u32) {
-    unsafe { arch::syscall3(SYS_IOPORT, 5, port as u64, val as u64); }
+    unsafe {
+        arch::syscall3(SYS_IOPORT, 5, port as u64, val as u64);
+    }
 }
 
 const SYS_SET_QUOTA: u64 = 38;
@@ -587,7 +675,14 @@ const SYS_SET_QUOTA: u64 = 38;
 /// Set a resource quota on a child task.
 /// resource_type: 0=ports, 1=threads, 2=pages. Returns true on success.
 pub fn set_quota(child_port: u64, resource_type: u32, limit: u32) -> bool {
-    unsafe { arch::syscall3(SYS_SET_QUOTA, child_port, resource_type as u64, limit as u64) == 0 }
+    unsafe {
+        arch::syscall3(
+            SYS_SET_QUOTA,
+            child_port,
+            resource_type as u64,
+            limit as u64,
+        ) == 0
+    }
 }
 
 const SYS_EXECVE: u64 = 54;
@@ -649,7 +744,11 @@ pub const SIGSTOP: u32 = 19;
 
 /// Bitmask for a signal number (1-based).
 pub const fn sig_bit(sig: u32) -> u64 {
-    if sig >= 1 && sig <= 32 { 1u64 << (sig - 1) } else { 0 }
+    if sig >= 1 && sig <= 32 {
+        1u64 << (sig - 1)
+    } else {
+        0
+    }
 }
 
 /// Install a signal handler. handler: 0=SIG_DFL, 1=SIG_IGN, else=function pointer.
@@ -669,7 +768,9 @@ pub fn sigprocmask(how: u32, set: u64) -> u64 {
 /// Restore the pre-signal state after a signal handler completes.
 /// `frame_addr` is the signal frame address passed as the second argument to the handler.
 pub fn sigreturn(frame_addr: u64) {
-    unsafe { arch::syscall1(SYS_SIGRETURN, frame_addr); }
+    unsafe {
+        arch::syscall1(SYS_SIGRETURN, frame_addr);
+    }
 }
 
 /// Get the set of pending signals.
@@ -688,10 +789,24 @@ pub fn kill_sig(port_id: u64, sig: u32) -> bool {
 /// receiver on dest_port. The receiver gets:
 ///   data[0] = d0, data[1] = d1, data[2] = receiver's new cap slot,
 ///   data[3] = granted port ID, data[4] = granted rights.
-pub fn send_cap(dest_port: u64, tag: u64, d0: u64, d1: u64, grant_port: u64, grant_rights: u32) -> bool {
+pub fn send_cap(
+    dest_port: u64,
+    tag: u64,
+    d0: u64,
+    d1: u64,
+    grant_port: u64,
+    grant_rights: u32,
+) -> bool {
     unsafe {
-        arch::syscall6(SYS_SEND_CAP, dest_port, tag, d0, d1,
-            grant_port, grant_rights as u64) == 0
+        arch::syscall6(
+            SYS_SEND_CAP,
+            dest_port,
+            tag,
+            d0,
+            d1,
+            grant_port,
+            grant_rights as u64,
+        ) == 0
     }
 }
 
@@ -721,7 +836,9 @@ pub fn vm_stats(which: u32) -> u64 {
 
 /// Register the current task for scheduler activations.
 pub fn sa_register() {
-    unsafe { arch::syscall0(SYS_SA_REGISTER); }
+    unsafe {
+        arch::syscall0(SYS_SA_REGISTER);
+    }
 }
 
 /// Block until a scheduler activation event occurs.
@@ -737,7 +854,9 @@ pub fn sa_getid() -> u64 {
 
 /// Set the coscheduling group for the current thread. group=0 removes from any group.
 pub fn cosched_set(group: u32) {
-    unsafe { arch::syscall1(SYS_COSCHED_SET, group as u64); }
+    unsafe {
+        arch::syscall1(SYS_COSCHED_SET, group as u64);
+    }
 }
 
 /// Set CPU affinity mask for a thread (identified by thread port_id). Returns true on success.
@@ -755,7 +874,9 @@ pub fn get_affinity(tid: u64) -> u64 {
 /// Returns (package_id, core_id, smt_id, online, online_cpu_count), or None if invalid.
 pub fn cpu_topology(cpu_id: u32) -> Option<(u8, u8, u8, bool, u32)> {
     let r = unsafe { arch::syscall1(SYS_CPU_TOPOLOGY, cpu_id as u64) };
-    if r == u64::MAX { return None; }
+    if r == u64::MAX {
+        return None;
+    }
     let pkg = (r & 0xFF) as u8;
     let core = ((r >> 8) & 0xFF) as u8;
     let smt = ((r >> 16) & 0xFF) as u8;
@@ -776,7 +897,9 @@ pub fn cpu_hotplug(cpu_id: u32, action: u32) -> bool {
 #[allow(dead_code)]
 pub fn cpu_load(cpu_id: u32) -> Option<(u32, u32, u16)> {
     let r = unsafe { arch::syscall1(SYS_CPU_LOAD, cpu_id as u64) };
-    if r == u64::MAX { return None; }
+    if r == u64::MAX {
+        return None;
+    }
     let load = (r & 0xFFFF_FFFF) as u32;
     let window = ((r >> 32) & 0xFFFF) as u32;
     let online_mask = ((r >> 48) & 0xFFFF) as u16;
@@ -811,7 +934,11 @@ pub fn mprotect(addr: usize, len: usize, prot: u8) -> bool {
 /// Returns the new VA (same as old_addr) or None on error.
 pub fn mremap(old_addr: usize, old_len: usize, new_len: usize) -> Option<usize> {
     let r = unsafe { arch::syscall3(SYS_MREMAP, old_addr as u64, old_len as u64, new_len as u64) };
-    if r == u64::MAX { None } else { Some(r as usize) }
+    if r == u64::MAX {
+        None
+    } else {
+        Some(r as usize)
+    }
 }
 
 /// Set the process group ID. pid=0 means self, pgid=0 means set pgid=pid.
@@ -907,12 +1034,30 @@ const SYS_PROC_INFO: u64 = 89;
 /// Map a file-backed region via the pager mechanism.
 /// `pager_task` is the task ID of the external pager (0 = same-process pager).
 /// Returns the VA on success, or None on failure.
-pub fn mmap_file(va: usize, pages: usize, prot: u8, file_handle: u32, file_offset: u64, pager_task: u32) -> Option<usize> {
+pub fn mmap_file(
+    va: usize,
+    pages: usize,
+    prot: u8,
+    file_handle: u32,
+    file_offset: u64,
+    pager_task: u32,
+) -> Option<usize> {
     let r = unsafe {
-        arch::syscall6(SYS_MMAP_FILE, va as u64, pages as u64, prot as u64,
-                       file_handle as u64, file_offset, pager_task as u64)
+        arch::syscall6(
+            SYS_MMAP_FILE,
+            va as u64,
+            pages as u64,
+            prot as u64,
+            file_handle as u64,
+            file_offset,
+            pager_task as u64,
+        )
     };
-    if r == u64::MAX { None } else { Some(r as usize) }
+    if r == u64::MAX {
+        None
+    } else {
+        Some(r as usize)
+    }
 }
 
 /// Wait for a pager fault in the current address space.
@@ -970,7 +1115,12 @@ pub fn wait_fault() -> (u32, usize, u32, u64, usize) {
 /// Complete a pager fault by providing the page data.
 pub fn fault_complete(token: u32, data: &[u8]) -> bool {
     let r = unsafe {
-        arch::syscall3(SYS_FAULT_COMPLETE, token as u64, data.as_ptr() as u64, data.len() as u64)
+        arch::syscall3(
+            SYS_FAULT_COMPLETE,
+            token as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+        )
     };
     r == 0
 }
@@ -1008,17 +1158,13 @@ pub fn setgid(gid: u32) -> bool {
 
 /// Set supplementary group list. Only euid 0 can call.
 pub fn setgroups(groups: &[u32]) -> bool {
-    let r = unsafe {
-        arch::syscall2(SYS_SETGROUPS, groups.len() as u64, groups.as_ptr() as u64)
-    };
+    let r = unsafe { arch::syscall2(SYS_SETGROUPS, groups.len() as u64, groups.as_ptr() as u64) };
     r == 0
 }
 
 /// Get supplementary group list. Returns count, fills `buf` up to its length.
 pub fn getgroups(buf: &mut [u32]) -> usize {
-    let r = unsafe {
-        arch::syscall2(SYS_GETGROUPS, buf.len() as u64, buf.as_mut_ptr() as u64)
-    };
+    let r = unsafe { arch::syscall2(SYS_GETGROUPS, buf.len() as u64, buf.as_mut_ptr() as u64) };
     if r == u64::MAX { 0 } else { r as usize }
 }
 
@@ -1032,13 +1178,21 @@ pub const WUNTRACED: u32 = 2;
 pub const WCONTINUED: u32 = 8;
 
 /// Extract exit status from wait status (valid if WIFEXITED).
-pub const fn wexitstatus(status: i32) -> i32 { (status >> 8) & 0xFF }
+pub const fn wexitstatus(status: i32) -> i32 {
+    (status >> 8) & 0xFF
+}
 /// True if child exited normally.
-pub const fn wifexited(status: i32) -> bool { (status & 0x7F) == 0 }
+pub const fn wifexited(status: i32) -> bool {
+    (status & 0x7F) == 0
+}
 /// True if child was killed by a signal.
-pub const fn wifsignaled(status: i32) -> bool { (status & 0x7F) != 0 && (status & 0x7F) != 0x7F }
+pub const fn wifsignaled(status: i32) -> bool {
+    (status & 0x7F) != 0 && (status & 0x7F) != 0x7F
+}
 /// Get the signal that killed the child.
-pub const fn wtermsig(status: i32) -> i32 { status & 0x7F }
+pub const fn wtermsig(status: i32) -> i32 {
+    status & 0x7F
+}
 
 /// Enhanced wait for child process.
 ///
@@ -1256,7 +1410,11 @@ pub fn proc_info(port_id: u64) -> Option<(u64, u64, u64, u64)> {
         );
     }
 
-    if r0 == u64::MAX { None } else { Some((r1, r2, r3, r4)) }
+    if r0 == u64::MAX {
+        None
+    } else {
+        Some((r1, r2, r3, r4))
+    }
 }
 
 // --- Shared memory (shm_srv) client wrappers ---
@@ -1327,10 +1485,23 @@ pub fn shm_open(shm_port: u64, name: &[u8]) -> Option<(u32, usize, u64)> {
 /// Map a shared memory segment into the caller's address space.
 /// The server grants pages to `client_aspace` at `dst_va`.
 /// Returns the number of pages mapped on success.
-pub fn shm_map(shm_port: u64, handle: u32, client_aspace: u64, dst_va: usize, readonly: bool) -> Option<usize> {
+pub fn shm_map(
+    shm_port: u64,
+    handle: u32,
+    client_aspace: u64,
+    dst_va: usize,
+    readonly: bool,
+) -> Option<usize> {
     let reply_port = port_create();
     let d2 = ((reply_port as u64) << 32) | (readonly as u64);
-    send(shm_port, SHM_MAP_TAG, handle as u64, client_aspace, d2, dst_va as u64);
+    send(
+        shm_port,
+        SHM_MAP_TAG,
+        handle as u64,
+        client_aspace,
+        d2,
+        dst_va as u64,
+    );
     let result = if let Some(reply) = shm_poll_reply(reply_port) {
         if reply.tag == SHM_MAP_OK_TAG {
             Some(reply.data[1] as usize)
@@ -1348,7 +1519,14 @@ pub fn shm_map(shm_port: u64, handle: u32, client_aspace: u64, dst_va: usize, re
 pub fn shm_unmap(shm_port: u64, handle: u32, client_aspace: u64, dst_va: usize) {
     let reply_port = port_create();
     let d2 = (reply_port as u64) << 32;
-    send(shm_port, SHM_UNMAP_TAG, handle as u64, client_aspace, d2, dst_va as u64);
+    send(
+        shm_port,
+        SHM_UNMAP_TAG,
+        handle as u64,
+        client_aspace,
+        d2,
+        dst_va as u64,
+    );
     let _ = shm_poll_reply(reply_port);
     port_destroy(reply_port);
 }
@@ -1371,7 +1549,9 @@ pub fn shm_unlink(shm_port: u64, name: &[u8]) -> bool {
 /// Register a service with the name server.
 pub fn ns_register(name: &[u8], service_port: u64) -> bool {
     let nsrv = nsrv_port();
-    if nsrv == u64::MAX { return false; }
+    if nsrv == u64::MAX {
+        return false;
+    }
 
     let reply_port = port_create();
     let (n0, n1, _n2) = pack_name(name);
@@ -1398,7 +1578,11 @@ pub fn madvise(addr: usize, len: usize, advice: u32) -> u64 {
 /// mmap_guard: map pages with no permissions (guard page).
 pub fn mmap_guard(addr: usize, pages: usize) -> Option<usize> {
     let r = unsafe { arch::syscall2(SYS_MMAP_GUARD, addr as u64, pages as u64) };
-    if r == u64::MAX { None } else { Some(r as usize) }
+    if r == u64::MAX {
+        None
+    } else {
+        Some(r as usize)
+    }
 }
 
 /// port_set_recv_timeout: receive from port set with timeout in microseconds.

@@ -53,7 +53,10 @@ struct CacheEntry {
 
 impl CacheEntry {
     const fn empty() -> Self {
-        Self { page_number: INVALID, referenced: false }
+        Self {
+            page_number: INVALID,
+            referenced: false,
+        }
     }
 }
 
@@ -67,7 +70,11 @@ struct HashEntry {
 
 impl HashEntry {
     const fn empty() -> Self {
-        Self { page_number: 0, slot: 0, occupied: false }
+        Self {
+            page_number: 0,
+            slot: 0,
+            occupied: false,
+        }
     }
 }
 
@@ -249,7 +256,10 @@ impl PageCache {
             self.misses += 1;
             let slot = self.clock_evict();
             self.fill_page(blk, slot, page_number, max_sectors);
-            self.entries[slot] = CacheEntry { page_number, referenced: true };
+            self.entries[slot] = CacheEntry {
+                page_number,
+                referenced: true,
+            };
             self.hash_insert(page_number, slot);
             self.occupied += 1;
             let ptr = (self.data_va + slot * MMUPAGE_SIZE + off_in_page) as *const u8;
@@ -264,7 +274,9 @@ impl PageCache {
         if let Some(slot) = self.lookup(page_number) {
             let bytes = length.min(MMUPAGE_SIZE - off_in_page);
             let dst = (self.data_va + slot * MMUPAGE_SIZE + off_in_page) as *mut u8;
-            unsafe { core::ptr::copy_nonoverlapping(data, dst, bytes); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(data, dst, bytes);
+            }
             self.entries[slot].referenced = true;
         }
     }
@@ -311,11 +323,7 @@ impl BlkClient {
 
     fn write_sector(&self, sector: u64, data: &[u8; 512]) -> bool {
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                self.scratch_va as *mut u8,
-                512,
-            );
+            core::ptr::copy_nonoverlapping(data.as_ptr(), self.scratch_va as *mut u8, 512);
         }
 
         if !syscall::grant_pages(self.blk_aspace, self.scratch_va, BLK_GRANT_VA, 1, false) {
@@ -381,7 +389,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  [cache_srv] blk_srv not found, serving without backing\n");
                 break u64::MAX;
             }
-            for _ in 0..50 { syscall::yield_now(); }
+            for _ in 0..50 {
+                syscall::yield_now();
+            }
         }
     };
 
@@ -402,11 +412,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             (reply.data[2], reply.data[1])
         } else {
             syscall::debug_puts(b"  [cache_srv] blk connect FAILED\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     } else {
         syscall::debug_puts(b"  [cache_srv] blk no reply\n");
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     };
 
     let max_sectors = disk_capacity / SECTOR_SIZE as u64;
@@ -420,7 +434,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [cache_srv] scratch alloc FAILED\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     };
 
@@ -436,7 +452,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [cache_srv] data pool alloc FAILED\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     };
 
@@ -454,8 +472,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         match msg.tag {
             IO_CONNECT => {
                 let reply_port = msg.data[2] >> 32;
-                syscall::send(reply_port, IO_CONNECT_OK,
-                    0, disk_capacity, my_aspace as u64, 0);
+                syscall::send(
+                    reply_port,
+                    IO_CONNECT_OK,
+                    0,
+                    disk_capacity,
+                    my_aspace as u64,
+                    0,
+                );
             }
 
             IO_READ => {
@@ -468,9 +492,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if let Some((ptr, bytes_read)) = cache.read(&blk, offset, length, max_sectors) {
                     if grant_va != 0 {
                         let dst = grant_va as *mut u8;
-                        unsafe { core::ptr::copy_nonoverlapping(ptr, dst, bytes_read); }
-                        syscall::send_nb_4(reply_port, IO_READ_OK,
-                            bytes_read as u64, request_id, 0, 0);
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(ptr, dst, bytes_read);
+                        }
+                        syscall::send_nb_4(
+                            reply_port,
+                            IO_READ_OK,
+                            bytes_read as u64,
+                            request_id,
+                            0,
+                            0,
+                        );
                     } else {
                         // Inline read.
                         let inline_len = bytes_read.min(40);
@@ -479,8 +511,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), inline_len);
                         }
                         let packed = pack_inline_data(&buf[..inline_len]);
-                        syscall::send(reply_port, IO_READ_OK,
-                            inline_len as u64, request_id, packed[0], packed[1]);
+                        syscall::send(
+                            reply_port,
+                            IO_READ_OK,
+                            inline_len as u64,
+                            request_id,
+                            packed[0],
+                            packed[1],
+                        );
                     }
                 } else {
                     syscall::send_nb(reply_port, IO_ERROR, 1, 0);
@@ -512,8 +550,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if blk.write_sector(sector, &buf) {
                     // Update cache if page is present (write-no-allocate).
                     cache.write_update(offset, buf.as_ptr(), length.min(SECTOR_SIZE));
-                    syscall::send_nb_4(reply_port, IO_WRITE_OK,
-                        length.min(SECTOR_SIZE) as u64, request_id, 0, 0);
+                    syscall::send_nb_4(
+                        reply_port,
+                        IO_WRITE_OK,
+                        length.min(SECTOR_SIZE) as u64,
+                        request_id,
+                        0,
+                        0,
+                    );
                 } else {
                     syscall::send_nb(reply_port, IO_ERROR, 1, 0);
                 }
@@ -533,15 +577,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             CACHE_STATS => {
                 let reply_port = msg.data[0] >> 32;
-                syscall::send(reply_port, CACHE_STATS_OK,
-                    cache.hits, cache.misses, CACHE_ENTRIES as u64, cache.occupied as u64);
+                syscall::send(
+                    reply_port,
+                    CACHE_STATS_OK,
+                    cache.hits,
+                    cache.misses,
+                    CACHE_ENTRIES as u64,
+                    cache.occupied as u64,
+                );
             }
 
             _ => {}
         }
     }
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 fn pack_inline_data(data: &[u8]) -> [u64; 5] {

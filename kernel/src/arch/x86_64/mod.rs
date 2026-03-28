@@ -94,6 +94,8 @@ pub fn start_secondary_cpus() {
 /// Idle loop — HLT until interrupted.
 pub fn idle_loop() -> ! {
     loop {
-        unsafe { core::arch::asm!("hlt"); }
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
 }

@@ -10,13 +10,17 @@ pub fn cpu_id() -> u32 {
     #[cfg(target_arch = "aarch64")]
     {
         let id: u64;
-        unsafe { core::arch::asm!("mrs {}, tpidr_el1", out(reg) id); }
+        unsafe {
+            core::arch::asm!("mrs {}, tpidr_el1", out(reg) id);
+        }
         id as u32
     }
     #[cfg(target_arch = "riscv64")]
     {
         let id: u64;
-        unsafe { core::arch::asm!("mv {}, tp", out(reg) id); }
+        unsafe {
+            core::arch::asm!("mv {}, tp", out(reg) id);
+        }
         id as u32
     }
     #[cfg(target_arch = "x86_64")]
@@ -33,14 +37,20 @@ pub fn cpu_id() -> u32 {
 #[inline]
 pub fn set_tls(base: u64) {
     #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("msr tpidr_el0, {}", in(reg) base); }
+    unsafe {
+        core::arch::asm!("msr tpidr_el0, {}", in(reg) base);
+    }
     #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("mv tp, {}", in(reg) base); }
+    unsafe {
+        core::arch::asm!("mv tp, {}", in(reg) base);
+    }
     #[cfg(target_arch = "x86_64")]
     {
         let lo = base as u32;
         let hi = (base >> 32) as u32;
-        unsafe { core::arch::asm!("wrmsr", in("ecx") 0xC0000100u32, in("eax") lo, in("edx") hi); }
+        unsafe {
+            core::arch::asm!("wrmsr", in("ecx") 0xC0000100u32, in("eax") lo, in("edx") hi);
+        }
     }
 }
 
@@ -48,9 +58,13 @@ pub fn set_tls(base: u64) {
 #[inline]
 pub fn init_bsp_cpu_id() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("msr tpidr_el1, xzr"); }
+    unsafe {
+        core::arch::asm!("msr tpidr_el1, xzr");
+    }
     #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("mv tp, zero"); }
+    unsafe {
+        core::arch::asm!("mv tp, zero");
+    }
     // x86_64: LAPIC ID 0 is BSP on QEMU — no setup needed.
 }
 
@@ -58,8 +72,12 @@ pub fn init_bsp_cpu_id() {
 #[inline(always)]
 pub fn flush_icache() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb"); }
+    unsafe {
+        core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
+    }
     #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("fence.i"); }
+    unsafe {
+        core::arch::asm!("fence.i");
+    }
     // x86_64: instruction cache is coherent with data cache.
 }

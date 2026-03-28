@@ -99,7 +99,11 @@ fn print_hex(n: u64) {
     let mut i = 0;
     while val > 0 {
         let nibble = (val & 0xF) as u8;
-        buf[i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        buf[i] = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
         val >>= 4;
         i += 1;
     }
@@ -157,7 +161,7 @@ struct Superblock {
     free_blocks_count: u32,
     free_inodes_count: u32,
     first_data_block: u32,
-    block_size: u32,       // in bytes (1024 << s_log_block_size)
+    block_size: u32, // in bytes (1024 << s_log_block_size)
     blocks_per_group: u32,
     inodes_per_group: u32,
     inode_size: u16,
@@ -165,9 +169,9 @@ struct Superblock {
 }
 
 struct BlockGroupDesc {
-    block_bitmap: u32,     // block number of block bitmap
-    inode_bitmap: u32,     // block number of inode bitmap
-    inode_table: u32,      // block number of inode table start
+    block_bitmap: u32, // block number of block bitmap
+    inode_bitmap: u32, // block number of inode bitmap
+    inode_table: u32,  // block number of inode table start
 }
 
 #[derive(Clone, Copy)]
@@ -219,7 +223,14 @@ struct FileLock {
 
 impl FileLock {
     const fn empty() -> Self {
-        Self { active: false, inode: 0, pid: 0, lock_type: 0, start: 0, len: 0 }
+        Self {
+            active: false,
+            inode: 0,
+            pid: 0,
+            lock_type: 0,
+            start: 0,
+            len: 0,
+        }
     }
 }
 
@@ -236,55 +247,116 @@ struct LockWaiter {
 
 impl LockWaiter {
     const fn empty() -> Self {
-        Self { active: false, reply_port: 0, inode: 0, pid: 0, lock_type: 0, start: 0, len: 0 }
+        Self {
+            active: false,
+            reply_port: 0,
+            inode: 0,
+            pid: 0,
+            lock_type: 0,
+            start: 0,
+            len: 0,
+        }
     }
 }
 
 fn ranges_overlap(s1: u64, l1: u64, s2: u64, l2: u64) -> bool {
-    let e1 = if l1 == 0 { u64::MAX } else { s1.saturating_add(l1) };
-    let e2 = if l2 == 0 { u64::MAX } else { s2.saturating_add(l2) };
+    let e1 = if l1 == 0 {
+        u64::MAX
+    } else {
+        s1.saturating_add(l1)
+    };
+    let e2 = if l2 == 0 {
+        u64::MAX
+    } else {
+        s2.saturating_add(l2)
+    };
     s1 < e2 && s2 < e1
 }
 
 fn ext2_lock_conflicts(
-    locks: &[FileLock; MAX_LOCKS], inode: u32, pid: u32, lock_type: u8, start: u64, len: u64,
+    locks: &[FileLock; MAX_LOCKS],
+    inode: u32,
+    pid: u32,
+    lock_type: u8,
+    start: u64,
+    len: u64,
 ) -> bool {
     for lk in locks.iter() {
-        if !lk.active || lk.inode != inode || lk.pid == pid { continue; }
-        if lk.lock_type == LK_RDLCK && lock_type == LK_RDLCK { continue; }
-        if ranges_overlap(lk.start, lk.len, start, len) { return true; }
-    }
-    false
-}
-
-fn ext2_find_conflict(
-    locks: &[FileLock; MAX_LOCKS], inode: u32, pid: u32, lock_type: u8, start: u64, len: u64,
-) -> Option<usize> {
-    for (i, lk) in locks.iter().enumerate() {
-        if !lk.active || lk.inode != inode || lk.pid == pid { continue; }
-        if lk.lock_type == LK_RDLCK && lock_type == LK_RDLCK { continue; }
-        if ranges_overlap(lk.start, lk.len, start, len) { return Some(i); }
-    }
-    None
-}
-
-fn ext2_acquire_lock(
-    locks: &mut [FileLock; MAX_LOCKS], inode: u32, pid: u32, lock_type: u8, start: u64, len: u64,
-) -> bool {
-    for lk in locks.iter_mut() {
-        if lk.active && lk.inode == inode && lk.pid == pid
-            && ranges_overlap(lk.start, lk.len, start, len) { lk.active = false; }
-    }
-    for lk in locks.iter_mut() {
-        if !lk.active {
-            *lk = FileLock { active: true, inode, pid, lock_type, start, len };
+        if !lk.active || lk.inode != inode || lk.pid == pid {
+            continue;
+        }
+        if lk.lock_type == LK_RDLCK && lock_type == LK_RDLCK {
+            continue;
+        }
+        if ranges_overlap(lk.start, lk.len, start, len) {
             return true;
         }
     }
     false
 }
 
-fn ext2_release_locks(locks: &mut [FileLock; MAX_LOCKS], inode: u32, pid: u32, start: u64, len: u64) {
+fn ext2_find_conflict(
+    locks: &[FileLock; MAX_LOCKS],
+    inode: u32,
+    pid: u32,
+    lock_type: u8,
+    start: u64,
+    len: u64,
+) -> Option<usize> {
+    for (i, lk) in locks.iter().enumerate() {
+        if !lk.active || lk.inode != inode || lk.pid == pid {
+            continue;
+        }
+        if lk.lock_type == LK_RDLCK && lock_type == LK_RDLCK {
+            continue;
+        }
+        if ranges_overlap(lk.start, lk.len, start, len) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn ext2_acquire_lock(
+    locks: &mut [FileLock; MAX_LOCKS],
+    inode: u32,
+    pid: u32,
+    lock_type: u8,
+    start: u64,
+    len: u64,
+) -> bool {
+    for lk in locks.iter_mut() {
+        if lk.active
+            && lk.inode == inode
+            && lk.pid == pid
+            && ranges_overlap(lk.start, lk.len, start, len)
+        {
+            lk.active = false;
+        }
+    }
+    for lk in locks.iter_mut() {
+        if !lk.active {
+            *lk = FileLock {
+                active: true,
+                inode,
+                pid,
+                lock_type,
+                start,
+                len,
+            };
+            return true;
+        }
+    }
+    false
+}
+
+fn ext2_release_locks(
+    locks: &mut [FileLock; MAX_LOCKS],
+    inode: u32,
+    pid: u32,
+    start: u64,
+    len: u64,
+) {
     for lk in locks.iter_mut() {
         if lk.active && lk.inode == inode && lk.pid == pid {
             if (start == 0 && len == 0) || ranges_overlap(lk.start, lk.len, start, len) {
@@ -295,10 +367,14 @@ fn ext2_release_locks(locks: &mut [FileLock; MAX_LOCKS], inode: u32, pid: u32, s
 }
 
 fn ext2_try_wake_waiters(
-    locks: &mut [FileLock; MAX_LOCKS], waiters: &mut [LockWaiter; MAX_LOCK_WAITERS], inode: u32,
+    locks: &mut [FileLock; MAX_LOCKS],
+    waiters: &mut [LockWaiter; MAX_LOCK_WAITERS],
+    inode: u32,
 ) {
     for w in waiters.iter_mut() {
-        if !w.active || w.inode != inode { continue; }
+        if !w.active || w.inode != inode {
+            continue;
+        }
         if !ext2_lock_conflicts(locks, w.inode, w.pid, w.lock_type, w.start, w.len) {
             if ext2_acquire_lock(locks, w.inode, w.pid, w.lock_type, w.start, w.len) {
                 syscall::send(w.reply_port, FS_FLOCK_OK, 0, 0, 0, 0);
@@ -335,7 +411,14 @@ impl BlkClient {
         }
 
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
-        syscall::send(self.blk_port, IO_READ, 0, sector * 512, d2, self.grant_va as u64);
+        syscall::send(
+            self.blk_port,
+            IO_READ,
+            0,
+            sector * 512,
+            d2,
+            self.grant_va as u64,
+        );
 
         let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
@@ -372,11 +455,7 @@ impl BlkClient {
                 return false;
             }
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    sec.as_ptr(),
-                    dest as *mut u8,
-                    block_size as usize,
-                );
+                core::ptr::copy_nonoverlapping(sec.as_ptr(), dest as *mut u8, block_size as usize);
             }
             return true;
         }
@@ -387,7 +466,14 @@ impl BlkClient {
             }
             let sector_byte = abs_off + (s as u64) * 512;
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
-            syscall::send(self.blk_port, IO_READ, 0, sector_byte, d2, self.grant_va as u64);
+            syscall::send(
+                self.blk_port,
+                IO_READ,
+                0,
+                sector_byte,
+                d2,
+                self.grant_va as u64,
+            );
 
             let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
                 if rr.tag == IO_READ_OK && rr.data[0] == 512 {
@@ -407,24 +493,29 @@ impl BlkClient {
             };
 
             syscall::revoke(self.blk_aspace, self.grant_va);
-            if !ok { return false; }
+            if !ok {
+                return false;
+            }
         }
         true
     }
     /// Write a 512-byte sector at absolute byte offset.
     fn write_sector(&self, abs_byte_off: u64, data: &[u8; 512]) -> bool {
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                self.scratch_va as *mut u8,
-                512,
-            );
+            core::ptr::copy_nonoverlapping(data.as_ptr(), self.scratch_va as *mut u8, 512);
         }
         if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
             return false;
         }
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
-        syscall::send(self.blk_port, IO_WRITE, 0, abs_byte_off, d2, self.grant_va as u64);
+        syscall::send(
+            self.blk_port,
+            IO_WRITE,
+            0,
+            abs_byte_off,
+            d2,
+            self.grant_va as u64,
+        );
         let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
             rr.tag == IO_WRITE_OK
         } else {
@@ -447,7 +538,14 @@ impl BlkClient {
             return false;
         }
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
-        syscall::send(self.blk_port, IO_READ, 0, sector_start, d2, self.grant_va as u64);
+        syscall::send(
+            self.blk_port,
+            IO_READ,
+            0,
+            sector_start,
+            d2,
+            self.grant_va as u64,
+        );
         let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
             if rr.tag == IO_READ_OK {
                 unsafe {
@@ -458,10 +556,16 @@ impl BlkClient {
                     );
                 }
                 true
-            } else { false }
-        } else { false };
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         syscall::revoke(self.blk_aspace, self.grant_va);
-        if !ok { return false; }
+        if !ok {
+            return false;
+        }
 
         // Patch in our data.
         let copy_len = data.len().min(512 - offset_in_sector);
@@ -518,8 +622,8 @@ fn read_inode(
 ) -> Option<(u16, u16, u16, u32, [u32; 15])> {
     // Inode numbers are 1-based.
     let idx = inode_num - 1;
-    let inode_offset = (bgd.inode_table as u64) * (sb.block_size as u64)
-        + (idx as u64) * (sb.inode_size as u64);
+    let inode_offset =
+        (bgd.inode_table as u64) * (sb.block_size as u64) + (idx as u64) * (sb.inode_size as u64);
 
     // Read the inode (at least 128 bytes). We read in 512-byte sector chunks.
     let mut inode_buf = [0u8; 256];
@@ -533,8 +637,10 @@ fn read_inode(
         return None;
     }
     if bytes_in_first < read_len {
-        if !blk.read_bytes(inode_offset + bytes_in_first as u64,
-                           &mut inode_buf[bytes_in_first..read_len]) {
+        if !blk.read_bytes(
+            inode_offset + bytes_in_first as u64,
+            &mut inode_buf[bytes_in_first..read_len],
+        ) {
             return None;
         }
     }
@@ -565,7 +671,9 @@ fn resolve_block(
     if logical_block < 12 {
         // Direct blocks.
         let b = block_ptrs[logical_block as usize];
-        if b == 0 { return None; }
+        if b == 0 {
+            return None;
+        }
         return Some(b);
     }
 
@@ -573,14 +681,17 @@ fn resolve_block(
     if logical_block < ptrs_per_block {
         // Single indirect.
         let ind_block = block_ptrs[12];
-        if ind_block == 0 { return None; }
+        if ind_block == 0 {
+            return None;
+        }
         if !blk.read_block(ind_block, sb.block_size, scratch_page) {
             return None;
         }
-        let ptr = unsafe {
-            core::ptr::read((scratch_page + (logical_block as usize) * 4) as *const u32)
-        };
-        if ptr == 0 { return None; }
+        let ptr =
+            unsafe { core::ptr::read((scratch_page + (logical_block as usize) * 4) as *const u32) };
+        if ptr == 0 {
+            return None;
+        }
         return Some(ptr);
     }
 
@@ -588,23 +699,26 @@ fn resolve_block(
     if logical_block < ptrs_per_block * ptrs_per_block {
         // Double indirect.
         let dind_block = block_ptrs[13];
-        if dind_block == 0 { return None; }
+        if dind_block == 0 {
+            return None;
+        }
         if !blk.read_block(dind_block, sb.block_size, scratch_page) {
             return None;
         }
         let idx1 = logical_block / ptrs_per_block;
-        let ind_block = unsafe {
-            core::ptr::read((scratch_page + (idx1 as usize) * 4) as *const u32)
-        };
-        if ind_block == 0 { return None; }
+        let ind_block =
+            unsafe { core::ptr::read((scratch_page + (idx1 as usize) * 4) as *const u32) };
+        if ind_block == 0 {
+            return None;
+        }
         if !blk.read_block(ind_block, sb.block_size, scratch_page) {
             return None;
         }
         let idx2 = logical_block % ptrs_per_block;
-        let ptr = unsafe {
-            core::ptr::read((scratch_page + (idx2 as usize) * 4) as *const u32)
-        };
-        if ptr == 0 { return None; }
+        let ptr = unsafe { core::ptr::read((scratch_page + (idx2 as usize) * 4) as *const u32) };
+        if ptr == 0 {
+            return None;
+        }
         return Some(ptr);
     }
 
@@ -638,15 +752,19 @@ fn dir_lookup(
 
         let mut off = 0usize;
         while off + 8 <= block_size as usize {
-            let inode = read_u32(unsafe {
-                core::slice::from_raw_parts(block_buf as *const u8, block_size as usize)
-            }, off);
-            let rec_len = read_u16(unsafe {
-                core::slice::from_raw_parts(block_buf as *const u8, block_size as usize)
-            }, off + 4) as usize;
+            let inode = read_u32(
+                unsafe { core::slice::from_raw_parts(block_buf as *const u8, block_size as usize) },
+                off,
+            );
+            let rec_len = read_u16(
+                unsafe { core::slice::from_raw_parts(block_buf as *const u8, block_size as usize) },
+                off + 4,
+            ) as usize;
             let name_len = unsafe { *((block_buf + off + 6) as *const u8) } as usize;
 
-            if rec_len == 0 { break; }
+            if rec_len == 0 {
+                break;
+            }
             if inode != 0 && name_len == name.len() {
                 let entry_name = unsafe {
                     core::slice::from_raw_parts((block_buf + off + 8) as *const u8, name_len)
@@ -673,8 +791,7 @@ fn path_resolve(
 ) -> Option<(u32, u16, u16, u16, u32, [u32; 15])> {
     // Start from root inode.
     let mut ino = EXT2_ROOT_INO;
-    let (mut mode, mut uid, mut gid, mut size, mut blocks) =
-        read_inode(blk, sb, bgd, ino)?;
+    let (mut mode, mut uid, mut gid, mut size, mut blocks) = read_inode(blk, sb, bgd, ino)?;
 
     // If name is empty, return root.
     if name.is_empty() {
@@ -702,7 +819,16 @@ fn path_resolve(
         }
 
         // Look up component in current directory.
-        ino = dir_lookup(blk, sb, bgd, &blocks, size, component, scratch_page, block_buf)?;
+        ino = dir_lookup(
+            blk,
+            sb,
+            bgd,
+            &blocks,
+            size,
+            component,
+            scratch_page,
+            block_buf,
+        )?;
         let result = read_inode(blk, sb, bgd, ino)?;
         mode = result.0;
         uid = result.1;
@@ -738,9 +864,8 @@ fn dir_next_entry(
             return None;
         }
 
-        let buf = unsafe {
-            core::slice::from_raw_parts(block_buf as *const u8, block_size as usize)
-        };
+        let buf =
+            unsafe { core::slice::from_raw_parts(block_buf as *const u8, block_size as usize) };
 
         let mut off = off_in_block;
         while off + 8 <= block_size as usize {
@@ -748,7 +873,9 @@ fn dir_next_entry(
             let rec_len = read_u16(buf, off + 4) as usize;
             let name_len = buf[off + 6] as usize;
 
-            if rec_len == 0 { return None; }
+            if rec_len == 0 {
+                return None;
+            }
 
             let next = (byte_off - off_in_block as u32) + off as u32 + rec_len as u32;
 
@@ -780,14 +907,20 @@ fn dir_next_entry(
 
 /// Allocate a block from the block bitmap. Returns block number or None.
 fn alloc_block(
-    blk: &BlkClient, sb: &mut Superblock, bgd: &BlockGroupDesc, bitmap_buf: usize,
+    blk: &BlkClient,
+    sb: &mut Superblock,
+    bgd: &BlockGroupDesc,
+    bitmap_buf: usize,
 ) -> Option<u32> {
-    if sb.free_blocks_count == 0 { return None; }
+    if sb.free_blocks_count == 0 {
+        return None;
+    }
     // Read block bitmap.
-    if !blk.read_block(bgd.block_bitmap, sb.block_size, bitmap_buf) { return None; }
-    let bitmap = unsafe {
-        core::slice::from_raw_parts_mut(bitmap_buf as *mut u8, sb.block_size as usize)
-    };
+    if !blk.read_block(bgd.block_bitmap, sb.block_size, bitmap_buf) {
+        return None;
+    }
+    let bitmap =
+        unsafe { core::slice::from_raw_parts_mut(bitmap_buf as *mut u8, sb.block_size as usize) };
     // Scan for first zero bit, starting after first_data_block.
     let start = sb.first_data_block as usize;
     for bit in start..sb.blocks_count as usize {
@@ -796,7 +929,9 @@ fn alloc_block(
         if byte < bitmap.len() && bitmap[byte] & mask == 0 {
             bitmap[byte] |= mask;
             // Write bitmap back.
-            if !blk.write_block(bgd.block_bitmap, sb.block_size, bitmap_buf) { return None; }
+            if !blk.write_block(bgd.block_bitmap, sb.block_size, bitmap_buf) {
+                return None;
+            }
             sb.free_blocks_count -= 1;
             return Some(bit as u32);
         }
@@ -806,13 +941,17 @@ fn alloc_block(
 
 /// Free a block in the block bitmap.
 fn free_block(
-    blk: &BlkClient, sb: &mut Superblock, bgd: &BlockGroupDesc,
-    block_num: u32, bitmap_buf: usize,
+    blk: &BlkClient,
+    sb: &mut Superblock,
+    bgd: &BlockGroupDesc,
+    block_num: u32,
+    bitmap_buf: usize,
 ) {
-    if !blk.read_block(bgd.block_bitmap, sb.block_size, bitmap_buf) { return; }
-    let bitmap = unsafe {
-        core::slice::from_raw_parts_mut(bitmap_buf as *mut u8, sb.block_size as usize)
-    };
+    if !blk.read_block(bgd.block_bitmap, sb.block_size, bitmap_buf) {
+        return;
+    }
+    let bitmap =
+        unsafe { core::slice::from_raw_parts_mut(bitmap_buf as *mut u8, sb.block_size as usize) };
     let byte = block_num as usize / 8;
     let mask = 1u8 << (block_num as usize % 8);
     if byte < bitmap.len() {
@@ -824,13 +963,19 @@ fn free_block(
 
 /// Allocate an inode from the inode bitmap. Returns 1-based inode number or None.
 fn alloc_inode(
-    blk: &BlkClient, sb: &mut Superblock, bgd: &BlockGroupDesc, bitmap_buf: usize,
+    blk: &BlkClient,
+    sb: &mut Superblock,
+    bgd: &BlockGroupDesc,
+    bitmap_buf: usize,
 ) -> Option<u32> {
-    if sb.free_inodes_count == 0 { return None; }
-    if !blk.read_block(bgd.inode_bitmap, sb.block_size, bitmap_buf) { return None; }
-    let bitmap = unsafe {
-        core::slice::from_raw_parts_mut(bitmap_buf as *mut u8, sb.block_size as usize)
-    };
+    if sb.free_inodes_count == 0 {
+        return None;
+    }
+    if !blk.read_block(bgd.inode_bitmap, sb.block_size, bitmap_buf) {
+        return None;
+    }
+    let bitmap =
+        unsafe { core::slice::from_raw_parts_mut(bitmap_buf as *mut u8, sb.block_size as usize) };
     // Inode bitmap bit 0 = inode 1. Skip reserved inodes (0..10 typically, but scan from 0).
     // ext2 reserves inodes 1-10 by convention, but the bitmap should already mark them.
     for bit in 0..sb.inodes_per_group as usize {
@@ -838,7 +983,9 @@ fn alloc_inode(
         let mask = 1u8 << (bit % 8);
         if byte < bitmap.len() && bitmap[byte] & mask == 0 {
             bitmap[byte] |= mask;
-            if !blk.write_block(bgd.inode_bitmap, sb.block_size, bitmap_buf) { return None; }
+            if !blk.write_block(bgd.inode_bitmap, sb.block_size, bitmap_buf) {
+                return None;
+            }
             sb.free_inodes_count -= 1;
             return Some(bit as u32 + 1); // 1-based
         }
@@ -848,14 +995,18 @@ fn alloc_inode(
 
 /// Free an inode in the inode bitmap.
 fn free_inode(
-    blk: &BlkClient, sb: &mut Superblock, bgd: &BlockGroupDesc,
-    inode_num: u32, bitmap_buf: usize,
+    blk: &BlkClient,
+    sb: &mut Superblock,
+    bgd: &BlockGroupDesc,
+    inode_num: u32,
+    bitmap_buf: usize,
 ) {
     let bit = (inode_num - 1) as usize;
-    if !blk.read_block(bgd.inode_bitmap, sb.block_size, bitmap_buf) { return; }
-    let bitmap = unsafe {
-        core::slice::from_raw_parts_mut(bitmap_buf as *mut u8, sb.block_size as usize)
-    };
+    if !blk.read_block(bgd.inode_bitmap, sb.block_size, bitmap_buf) {
+        return;
+    }
+    let bitmap =
+        unsafe { core::slice::from_raw_parts_mut(bitmap_buf as *mut u8, sb.block_size as usize) };
     let byte = bit / 8;
     let mask = 1u8 << (bit % 8);
     if byte < bitmap.len() {
@@ -867,12 +1018,19 @@ fn free_inode(
 
 /// Write an inode to disk.
 fn write_inode(
-    blk: &BlkClient, sb: &Superblock, bgd: &BlockGroupDesc,
-    inode_num: u32, mode: u16, uid: u16, gid: u16, size: u32, block_ptrs: &[u32; 15],
+    blk: &BlkClient,
+    sb: &Superblock,
+    bgd: &BlockGroupDesc,
+    inode_num: u32,
+    mode: u16,
+    uid: u16,
+    gid: u16,
+    size: u32,
+    block_ptrs: &[u32; 15],
 ) -> bool {
     let idx = inode_num - 1;
-    let inode_offset = (bgd.inode_table as u64) * (sb.block_size as u64)
-        + (idx as u64) * (sb.inode_size as u64);
+    let inode_offset =
+        (bgd.inode_table as u64) * (sb.block_size as u64) + (idx as u64) * (sb.inode_size as u64);
 
     // Read existing inode data to preserve fields we don't modify.
     let mut inode_buf = [0u8; 128];
@@ -882,8 +1040,10 @@ fn write_inode(
         return false;
     }
     if bytes_in_first < 128 {
-        if !blk.read_bytes(inode_offset + bytes_in_first as u64,
-                           &mut inode_buf[bytes_in_first..128]) {
+        if !blk.read_bytes(
+            inode_offset + bytes_in_first as u64,
+            &mut inode_buf[bytes_in_first..128],
+        ) {
             return false;
         }
     }
@@ -905,8 +1065,10 @@ fn write_inode(
         return false;
     }
     if bytes_in_first < 128 {
-        if !blk.write_bytes(inode_offset + bytes_in_first as u64,
-                            &inode_buf[bytes_in_first..128]) {
+        if !blk.write_bytes(
+            inode_offset + bytes_in_first as u64,
+            &inode_buf[bytes_in_first..128],
+        ) {
             return false;
         }
     }
@@ -917,7 +1079,9 @@ fn write_inode(
 fn flush_superblock(blk: &BlkClient, sb: &Superblock) {
     // Superblock is at partition offset 1024. We need to update offsets 12 and 16.
     let mut sb_buf = [0u8; 64];
-    if !blk.read_bytes(1024, &mut sb_buf) { return; }
+    if !blk.read_bytes(1024, &mut sb_buf) {
+        return;
+    }
     write_u32(&mut sb_buf, 12, sb.free_blocks_count);
     write_u32(&mut sb_buf, 16, sb.free_inodes_count);
     blk.write_bytes(1024, &sb_buf);
@@ -926,10 +1090,16 @@ fn flush_superblock(blk: &BlkClient, sb: &Superblock) {
 /// Add a directory entry to the root directory.
 /// Returns true on success.
 fn dir_add_entry(
-    blk: &BlkClient, sb: &Superblock,
-    dir_block_ptrs: &[u32; 15], dir_size: u32,
-    name: &[u8], name_len: usize, inode_num: u32, file_type: u8,
-    scratch_page: usize, block_buf: usize,
+    blk: &BlkClient,
+    sb: &Superblock,
+    dir_block_ptrs: &[u32; 15],
+    dir_size: u32,
+    name: &[u8],
+    name_len: usize,
+    inode_num: u32,
+    file_type: u8,
+    scratch_page: usize,
+    block_buf: usize,
 ) -> bool {
     let block_size = sb.block_size;
     let num_blocks = (dir_size + block_size - 1) / block_size;
@@ -941,16 +1111,19 @@ fn dir_add_entry(
             Some(p) => p,
             None => continue,
         };
-        if !blk.read_block(phys, block_size, block_buf) { continue; }
+        if !blk.read_block(phys, block_size, block_buf) {
+            continue;
+        }
 
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(block_buf as *mut u8, block_size as usize)
-        };
+        let buf =
+            unsafe { core::slice::from_raw_parts_mut(block_buf as *mut u8, block_size as usize) };
         let mut off = 0usize;
         while off < block_size as usize {
             let ino = read_u32(buf, off);
             let rec_len = read_u16(buf, off + 4) as usize;
-            if rec_len == 0 { break; }
+            if rec_len == 0 {
+                break;
+            }
             let nlen = buf[off + 6] as usize;
 
             if ino == 0 && rec_len >= needed {
@@ -986,10 +1159,14 @@ fn dir_add_entry(
 
 /// Remove a directory entry by name. Returns the removed inode number, or None.
 fn dir_remove_entry(
-    blk: &BlkClient, sb: &Superblock,
-    dir_block_ptrs: &[u32; 15], dir_size: u32,
-    name: &[u8], name_len: usize,
-    scratch_page: usize, block_buf: usize,
+    blk: &BlkClient,
+    sb: &Superblock,
+    dir_block_ptrs: &[u32; 15],
+    dir_size: u32,
+    name: &[u8],
+    name_len: usize,
+    scratch_page: usize,
+    block_buf: usize,
 ) -> Option<u32> {
     let block_size = sb.block_size;
     let num_blocks = (dir_size + block_size - 1) / block_size;
@@ -999,23 +1176,29 @@ fn dir_remove_entry(
             Some(p) => p,
             None => continue,
         };
-        if !blk.read_block(phys, block_size, block_buf) { continue; }
+        if !blk.read_block(phys, block_size, block_buf) {
+            continue;
+        }
 
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(block_buf as *mut u8, block_size as usize)
-        };
+        let buf =
+            unsafe { core::slice::from_raw_parts_mut(block_buf as *mut u8, block_size as usize) };
         let mut off = 0usize;
         let mut prev_off: Option<usize> = None;
         while off < block_size as usize {
             let ino = read_u32(buf, off);
             let rec_len = read_u16(buf, off + 4) as usize;
-            if rec_len == 0 { break; }
+            if rec_len == 0 {
+                break;
+            }
             let nlen = buf[off + 6] as usize;
 
             if ino != 0 && nlen == name_len {
                 let mut matches = true;
                 for i in 0..name_len {
-                    if buf[off + 8 + i] != name[i] { matches = false; break; }
+                    if buf[off + 8 + i] != name[i] {
+                        matches = false;
+                        break;
+                    }
                 }
                 if matches {
                     // Found it. Merge with previous entry or zero inode.
@@ -1069,7 +1252,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  [ext2_srv] cache_blk not found, exiting\n");
                 syscall::exit(1);
             }
-            for _ in 0..50 { syscall::yield_now(); }
+            for _ in 0..50 {
+                syscall::yield_now();
+            }
         }
     };
 
@@ -1086,11 +1271,15 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             reply.data[2]
         } else {
             syscall::debug_puts(b"  [ext2_srv] blk connect FAILED\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     } else {
         syscall::debug_puts(b"  [ext2_srv] blk no reply\n");
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     };
 
     // Allocate scratch page for block reads.
@@ -1098,7 +1287,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [ext2_srv] scratch alloc FAILED\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     };
 
@@ -1115,7 +1306,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let mut sb_buf = [0u8; 512];
     if !blk.read_bytes(1024, &mut sb_buf) {
         syscall::debug_puts(b"  [ext2_srv] failed to read superblock\n");
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
     let magic = read_u16(&sb_buf, 56);
@@ -1123,7 +1316,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"  [ext2_srv] bad magic: ");
         print_hex(magic as u64);
         syscall::debug_puts(b"\n");
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
     let log_block_size = read_u32(&sb_buf, 24);
@@ -1160,7 +1355,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let bgd_byte_off = (bgd_block as u64) * (block_size as u64);
     if !blk.read_bytes(bgd_byte_off, &mut bgd_buf) {
         syscall::debug_puts(b"  [ext2_srv] failed to read BGD\n");
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
     // We only support a single block group for the 16 MiB partition.
@@ -1179,7 +1376,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [ext2_srv] block_buf alloc FAILED\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     };
 
@@ -1188,7 +1387,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [ext2_srv] indirect_buf alloc FAILED\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     };
 
@@ -1203,7 +1404,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"\n");
     } else {
         syscall::debug_puts(b"  [ext2_srv] failed to read root inode\n");
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
     syscall::debug_puts(b"  [ext2_srv] ready\n");
@@ -1229,9 +1432,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let name = &name_buf[..name_len.min(16)];
 
                 // Resolve path (may be multi-component like "etc/passwd").
-                if let Some((ino, mode, uid, gid, size, blocks)) = path_resolve(
-                    &blk, &sb, &bgd, name, indirect_buf_va, block_buf_va,
-                ) {
+                if let Some((ino, mode, uid, gid, size, blocks)) =
+                    path_resolve(&blk, &sb, &bgd, name, indirect_buf_va, block_buf_va)
+                {
                     // Allocate a handle.
                     let mut handle = u64::MAX;
                     for (i, f) in open_files.iter_mut().enumerate() {
@@ -1251,8 +1454,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     if handle == u64::MAX {
                         syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
                     } else {
-                        syscall::send(reply_port, FS_OPEN_OK,
-                            handle, size as u64, my_aspace as u64, 0);
+                        syscall::send(
+                            reply_port,
+                            FS_OPEN_OK,
+                            handle,
+                            size as u64,
+                            my_aspace as u64,
+                            0,
+                        );
                     }
                 } else {
                     syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
@@ -1284,22 +1493,22 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let block_idx = offset / sb.block_size;
                 let offset_in_block = (offset % sb.block_size) as usize;
 
-                let phys_block = match resolve_block(
-                    &blk, &sb, &file.block_ptrs, block_idx, indirect_buf_va,
-                ) {
-                    Some(b) => b,
-                    None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
-                        continue;
-                    }
-                };
+                let phys_block =
+                    match resolve_block(&blk, &sb, &file.block_ptrs, block_idx, indirect_buf_va) {
+                        Some(b) => b,
+                        None => {
+                            syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                            continue;
+                        }
+                    };
 
                 if !blk.read_block(phys_block, sb.block_size, block_buf_va) {
                     syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
                     continue;
                 }
 
-                let bytes_in_block = ((sb.block_size as usize) - offset_in_block).min(to_read as usize);
+                let bytes_in_block =
+                    ((sb.block_size as usize) - offset_in_block).min(to_read as usize);
 
                 if grant_va != 0 {
                     unsafe {
@@ -1319,8 +1528,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         )
                     };
                     let packed = pack_inline_data(data);
-                    syscall::send(reply_port, FS_READ_OK,
-                        inline_len as u64, packed[0], packed[1], packed[2]);
+                    syscall::send(
+                        reply_port,
+                        FS_READ_OK,
+                        inline_len as u64,
+                        packed[0],
+                        packed[1],
+                        packed[2],
+                    );
                 }
             }
 
@@ -1354,12 +1569,19 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 };
 
                 match dir_next_entry(
-                    &blk, &sb, &dir_blocks, dir_size, start_offset,
-                    indirect_buf_va, block_buf_va,
+                    &blk,
+                    &sb,
+                    &dir_blocks,
+                    dir_size,
+                    start_offset,
+                    indirect_buf_va,
+                    block_buf_va,
                 ) {
                     Some((inode_num, name, name_len, next_offset)) => {
                         // Get file size from inode.
-                        let file_size = if let Some((_, _, _, size, _)) = read_inode(&blk, &sb, &bgd, inode_num) {
+                        let file_size = if let Some((_, _, _, size, _)) =
+                            read_inode(&blk, &sb, &bgd, inode_num)
+                        {
                             size
                         } else {
                             0
@@ -1375,8 +1597,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                             name_hi |= (name[i] as u64) << ((i - 8) * 8);
                         }
 
-                        syscall::send(reply_port, FS_READDIR_OK,
-                            file_size as u64, name_lo, name_hi, next_offset as u64);
+                        syscall::send(
+                            reply_port,
+                            FS_READDIR_OK,
+                            file_size as u64,
+                            name_lo,
+                            name_hi,
+                            next_offset as u64,
+                        );
                     }
                     None => {
                         syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
@@ -1397,8 +1625,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let file = &open_files[handle];
                 // FS_STAT_OK: data[0] = size, data[1] = mode, data[2] = uid|(gid<<16), data[3] = inode
                 let uid_gid = (file.uid as u64) | ((file.gid as u64) << 16);
-                syscall::send(reply_port, FS_STAT_OK,
-                    file.file_size as u64, file.mode as u64, uid_gid, file.inode_num as u64);
+                syscall::send(
+                    reply_port,
+                    FS_STAT_OK,
+                    file.file_size as u64,
+                    file.mode as u64,
+                    uid_gid,
+                    file.inode_num as u64,
+                );
             }
 
             FS_CLOSE => {
@@ -1409,8 +1643,17 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     let pid = open_files[handle].pid;
                     if open_files[handle].writable {
                         let f = &open_files[handle];
-                        write_inode(&blk, &sb, &bgd, f.inode_num,
-                            f.mode, f.uid, f.gid, f.file_size, &f.block_ptrs);
+                        write_inode(
+                            &blk,
+                            &sb,
+                            &bgd,
+                            f.inode_num,
+                            f.mode,
+                            f.uid,
+                            f.gid,
+                            f.file_size,
+                            &f.block_ptrs,
+                        );
                         flush_superblock(&blk, &sb);
                     }
                     open_files[handle].active = false;
@@ -1480,8 +1723,18 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 };
                 let (_, _, _, root_size, root_blocks) = root;
-                if !dir_add_entry(&blk, &sb, &root_blocks, root_size,
-                    name, name_len.min(16), ino, 1, indirect_buf_va, block_buf_va) {
+                if !dir_add_entry(
+                    &blk,
+                    &sb,
+                    &root_blocks,
+                    root_size,
+                    name,
+                    name_len.min(16),
+                    ino,
+                    1,
+                    indirect_buf_va,
+                    block_buf_va,
+                ) {
                     syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
                     continue;
                 }
@@ -1508,8 +1761,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 if handle == u64::MAX {
                     syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
                 } else {
-                    syscall::send(reply_port, FS_CREATE_OK,
-                        handle, 0, my_aspace as u64, 0);
+                    syscall::send(reply_port, FS_CREATE_OK, handle, 0, my_aspace as u64, 0);
                 }
             }
 
@@ -1519,7 +1771,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let reply_port = msg.data[1] >> 32;
                 let grant_va = msg.data[2] as usize;
 
-                if handle >= MAX_OPEN_FILES || !open_files[handle].active
+                if handle >= MAX_OPEN_FILES
+                    || !open_files[handle].active
                     || !open_files[handle].writable
                 {
                     if reply_port != 0 {
@@ -1546,7 +1799,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                                     // Zero the new block.
                                     unsafe {
                                         core::ptr::write_bytes(
-                                            block_buf_va as *mut u8, 0,
+                                            block_buf_va as *mut u8,
+                                            0,
                                             sb.block_size as usize,
                                         );
                                     }
@@ -1567,7 +1821,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                                         open_files[handle].block_ptrs[12] = b;
                                         unsafe {
                                             core::ptr::write_bytes(
-                                                block_buf_va as *mut u8, 0,
+                                                block_buf_va as *mut u8,
+                                                0,
                                                 sb.block_size as usize,
                                             );
                                         }
@@ -1583,7 +1838,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                             }
                             let ptr = unsafe {
                                 core::ptr::read(
-                                    (indirect_buf_va + (ind_idx as usize) * 4) as *const u32
+                                    (indirect_buf_va + (ind_idx as usize) * 4) as *const u32,
                                 )
                             };
                             if ptr == 0 {
@@ -1591,7 +1846,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                                     Some(b) => {
                                         unsafe {
                                             core::ptr::write(
-                                                (indirect_buf_va + (ind_idx as usize) * 4) as *mut u32,
+                                                (indirect_buf_va + (ind_idx as usize) * 4)
+                                                    as *mut u32,
                                                 b,
                                             );
                                         }
@@ -1599,7 +1855,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                                         // Zero new data block.
                                         unsafe {
                                             core::ptr::write_bytes(
-                                                block_buf_va as *mut u8, 0,
+                                                block_buf_va as *mut u8,
+                                                0,
                                                 sb.block_size as usize,
                                             );
                                         }
@@ -1615,7 +1872,11 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
                     // Resolve the physical block.
                     let phys = match resolve_block(
-                        &blk, &sb, &open_files[handle].block_ptrs, block_idx, indirect_buf_va,
+                        &blk,
+                        &sb,
+                        &open_files[handle].block_ptrs,
+                        block_idx,
+                        indirect_buf_va,
                     ) {
                         Some(b) => b,
                         None => break,
@@ -1671,8 +1932,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let (_, _, _, root_size, root_blocks) = root;
 
                 let ino = match dir_lookup(
-                    &blk, &sb, &bgd, &root_blocks, root_size, name,
-                    indirect_buf_va, block_buf_va,
+                    &blk,
+                    &sb,
+                    &bgd,
+                    &root_blocks,
+                    root_size,
+                    name,
+                    indirect_buf_va,
+                    block_buf_va,
                 ) {
                     Some(i) => i,
                     None => {
@@ -1701,9 +1968,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     if blk.read_block(block_ptrs[12], sb.block_size, block_buf_va) {
                         let ptrs_per_block = sb.block_size / 4;
                         for i in 0..ptrs_per_block as usize {
-                            let ptr = unsafe {
-                                core::ptr::read((block_buf_va + i * 4) as *const u32)
-                            };
+                            let ptr =
+                                unsafe { core::ptr::read((block_buf_va + i * 4) as *const u32) };
                             if ptr != 0 {
                                 free_block(&blk, &mut sb, &bgd, ptr, indirect_buf_va);
                             }
@@ -1720,8 +1986,16 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 write_inode(&blk, &sb, &bgd, ino, 0, 0, 0, 0, &zero_ptrs);
 
                 // Remove directory entry.
-                dir_remove_entry(&blk, &sb, &root_blocks, root_size,
-                    name, name_len.min(16), indirect_buf_va, block_buf_va);
+                dir_remove_entry(
+                    &blk,
+                    &sb,
+                    &root_blocks,
+                    root_size,
+                    name,
+                    name_len.min(16),
+                    indirect_buf_va,
+                    block_buf_va,
+                );
 
                 flush_superblock(&blk, &sb);
 
@@ -1741,9 +2015,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let ino = open_files[handle].inode_num;
                 let is_unlock = operation & 8 != 0;
                 let is_nb = operation & 4 != 0;
-                let lock_type = if operation & 2 != 0 { LK_WRLCK }
-                                else if operation & 1 != 0 { LK_RDLCK }
-                                else { LK_UNLCK };
+                let lock_type = if operation & 2 != 0 {
+                    LK_WRLCK
+                } else if operation & 1 != 0 {
+                    LK_RDLCK
+                } else {
+                    LK_UNLCK
+                };
 
                 if is_unlock {
                     ext2_release_locks(&mut file_locks, ino, pid, 0, 0);
@@ -1762,8 +2040,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     for w in lock_waiters.iter_mut() {
                         if !w.active {
                             *w = LockWaiter {
-                                active: true, reply_port, inode: ino,
-                                pid, lock_type, start: 0, len: 0,
+                                active: true,
+                                reply_port,
+                                inode: ino,
+                                pid,
+                                lock_type,
+                                start: 0,
+                                len: 0,
                             };
                             queued = true;
                             break;
@@ -1809,8 +2092,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     for w in lock_waiters.iter_mut() {
                         if !w.active {
                             *w = LockWaiter {
-                                active: true, reply_port, inode: ino,
-                                pid, lock_type, start, len,
+                                active: true,
+                                reply_port,
+                                inode: ino,
+                                pid,
+                                lock_type,
+                                start,
+                                len,
                             };
                             queued = true;
                             break;
@@ -1885,8 +2173,17 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let mut block_ptrs = [0u32; 15];
                 block_ptrs[0] = first_block;
                 let dir_mode = 0o40000 | mode;
-                write_inode(&blk, &sb, &bgd, ino, dir_mode, 0, 0,
-                            sb.block_size, &block_ptrs);
+                write_inode(
+                    &blk,
+                    &sb,
+                    &bgd,
+                    ino,
+                    dir_mode,
+                    0,
+                    0,
+                    sb.block_size,
+                    &block_ptrs,
+                );
 
                 // Add directory entry to root.
                 let root = match read_inode(&blk, &sb, &bgd, EXT2_ROOT_INO) {
@@ -1898,8 +2195,18 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 };
                 let (_, _, _, root_size, root_blocks) = root;
                 // file_type 2 = directory
-                if !dir_add_entry(&blk, &sb, &root_blocks, root_size,
-                    name, name_len.min(16), ino, 2, indirect_buf_va, block_buf_va) {
+                if !dir_add_entry(
+                    &blk,
+                    &sb,
+                    &root_blocks,
+                    root_size,
+                    name,
+                    name_len.min(16),
+                    ino,
+                    2,
+                    indirect_buf_va,
+                    block_buf_va,
+                ) {
                     syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
                     continue;
                 }
@@ -1924,8 +2231,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let (_, _, _, root_size, root_blocks) = root;
 
                 let ino = match dir_lookup(
-                    &blk, &sb, &bgd, &root_blocks, root_size, name,
-                    indirect_buf_va, block_buf_va,
+                    &blk,
+                    &sb,
+                    &bgd,
+                    &root_blocks,
+                    root_size,
+                    name,
+                    indirect_buf_va,
+                    block_buf_va,
                 ) {
                     Some(i) => i,
                     None => {
@@ -1954,9 +2267,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     if blk.read_block(block_ptrs[12], sb.block_size, block_buf_va) {
                         let ptrs_per_block = sb.block_size / 4;
                         for i in 0..ptrs_per_block as usize {
-                            let ptr = unsafe {
-                                core::ptr::read((block_buf_va + i * 4) as *const u32)
-                            };
+                            let ptr =
+                                unsafe { core::ptr::read((block_buf_va + i * 4) as *const u32) };
                             if ptr != 0 {
                                 free_block(&blk, &mut sb, &bgd, ptr, indirect_buf_va);
                             }
@@ -1973,8 +2285,16 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 write_inode(&blk, &sb, &bgd, ino, 0, 0, 0, 0, &zero_ptrs);
 
                 // Remove directory entry.
-                dir_remove_entry(&blk, &sb, &root_blocks, root_size,
-                    name, name_len.min(16), indirect_buf_va, block_buf_va);
+                dir_remove_entry(
+                    &blk,
+                    &sb,
+                    &root_blocks,
+                    root_size,
+                    name,
+                    name_len.min(16),
+                    indirect_buf_va,
+                    block_buf_va,
+                );
 
                 flush_superblock(&blk, &sb);
                 syscall::send(reply_port, FS_UNLINK_OK, 0, 0, 0, 0);
@@ -1987,8 +2307,17 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 if handle < MAX_OPEN_FILES && open_files[handle].active {
                     // Flush the inode to disk.
                     let f = &open_files[handle];
-                    write_inode(&blk, &sb, &bgd, f.inode_num,
-                                f.mode, f.uid, f.gid, f.file_size, &f.block_ptrs);
+                    write_inode(
+                        &blk,
+                        &sb,
+                        &bgd,
+                        f.inode_num,
+                        f.mode,
+                        f.uid,
+                        f.gid,
+                        f.file_size,
+                        &f.block_ptrs,
+                    );
                     flush_superblock(&blk, &sb);
                 }
 
@@ -2001,5 +2330,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

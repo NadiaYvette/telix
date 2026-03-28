@@ -14,8 +14,8 @@ use super::aspace::{self, ASpaceId};
 use super::hat;
 use super::object;
 use super::page::{
-    MMUPAGE_SIZE, PAGE_SIZE, PAGE_MMUCOUNT,
-    SUPERPAGE_SIZE, SUPERPAGE_ALLOC_PAGES, SUPERPAGE_MMU_PAGES, SUPERPAGE_ALIGN_MASK,
+    MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_ALLOC_PAGES,
+    SUPERPAGE_MMU_PAGES, SUPERPAGE_SIZE,
 };
 use super::stats;
 use core::sync::atomic::Ordering;
@@ -52,12 +52,12 @@ pub enum FaultResult {
 // They delegate to mm::hat and will be removed once all callers migrate.
 // ---------------------------------------------------------------------------
 
-pub use hat::read_pte as read_pte_dispatch;
-pub use hat::pte_is_present;
-pub use hat::pte_has_sw_zeroed;
-pub use hat::sw_zeroed_bit;
-pub use hat::evict_mmupage as evict_mmupage_dispatch;
 pub use hat::clear_pte as clear_pte_dispatch;
+pub use hat::evict_mmupage as evict_mmupage_dispatch;
+pub use hat::pte_has_sw_zeroed;
+pub use hat::pte_is_present;
+pub use hat::read_pte as read_pte_dispatch;
+pub use hat::sw_zeroed_bit;
 
 /// Count installed (present) PTEs in a VMA by walking the page table.
 pub fn count_installed_ptes(pt_root: usize, vma: &super::vma::Vma) -> usize {
@@ -122,9 +122,8 @@ pub fn handle_page_fault(
                 Some(r) => r,
                 None => return FaultResult::Failed,
             };
-            let (file_handle, file_base) = object::with_object(obj_id, |obj| {
-                (obj.file_handle, obj.file_base_offset)
-            });
+            let (file_handle, file_base) =
+                object::with_object(obj_id, |obj| (obj.file_handle, obj.file_base_offset));
             let file_offset = file_base + (obj_page_idx as u64) * (PAGE_SIZE as u64);
             let fault_va = va_aligned;
             let token = match super::pager::record_fault(super::pager::PagerFaultInfo {
@@ -176,7 +175,8 @@ pub fn handle_page_fault(
             match object::try_with_object(obj_id, |obj| {
                 let was_zero = obj.pages.get(obj_page_idx) == 0;
                 let cgp = obj.cow_group_port;
-                obj.ensure_page(obj_page_idx).map(|(pa, pz)| (pa, pz, was_zero, cgp))
+                obj.ensure_page(obj_page_idx)
+                    .map(|(pa, pz)| (pa, pz, was_zero, cgp))
             }) {
                 Some(Some(result)) => result,
                 _ => return FaultResult::Failed, // OOM or stale object
@@ -260,12 +260,7 @@ fn try_contiguous_promotion(pt_root: usize, vma: &super::vma::Vma, mmu_idx: usiz
 
 /// Try to promote a superpage-aligned region to a superpage.
 /// Checks if all MMU pages in the group have present PTEs.
-fn try_superpage_promotion(
-    pt_root: usize,
-    vma: &mut super::vma::Vma,
-    obj_id: u64,
-    mmu_idx: usize,
-) {
+fn try_superpage_promotion(pt_root: usize, vma: &mut super::vma::Vma, obj_id: u64, mmu_idx: usize) {
     let mmu_count = vma.mmu_page_count();
     if mmu_count < SUPERPAGE_MMU_PAGES {
         return;
@@ -275,7 +270,9 @@ fn try_superpage_promotion(
     let vma_base = vma.va_start;
     let abs_va = vma_base + va_offset_in_vma;
     let super_va = abs_va & !(SUPERPAGE_ALIGN_MASK);
-    if super_va < vma_base || super_va + (SUPERPAGE_MMU_PAGES * MMUPAGE_SIZE) > vma_base + vma.va_len {
+    if super_va < vma_base
+        || super_va + (SUPERPAGE_MMU_PAGES * MMUPAGE_SIZE) > vma_base + vma.va_len
+    {
         return;
     }
 
@@ -310,9 +307,7 @@ fn try_superpage_promotion(
     if cow_group_port != 0 {
         let super_base = obj_page_base as u32;
         for p in 0..SUPERPAGE_ALLOC_PAGES {
-            if super::cowgroup::is_page_shared_in_group(
-                cow_group_port, obj_id, super_base, p,
-            ) {
+            if super::cowgroup::is_page_shared_in_group(cow_group_port, obj_id, super_base, p) {
                 return;
             }
         }
@@ -352,11 +347,7 @@ fn try_superpage_promotion(
             let old_pa = obj.pages.get(obj_page_base + p);
             let new_pa = new_block.as_usize() + p * PAGE_SIZE;
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    old_pa as *const u8,
-                    new_pa as *mut u8,
-                    PAGE_SIZE,
-                );
+                core::ptr::copy_nonoverlapping(old_pa as *const u8, new_pa as *mut u8, PAGE_SIZE);
             }
         }
     });
@@ -382,11 +373,7 @@ fn try_superpage_promotion(
 }
 
 /// Public entry point for superpage promotion after eager mapping.
-pub fn try_superpage_promotion_eager(
-    pt_root: usize,
-    vma: &mut super::vma::Vma,
-    obj_id: u64,
-) {
+pub fn try_superpage_promotion_eager(pt_root: usize, vma: &mut super::vma::Vma, obj_id: u64) {
     let mmu_count = vma.mmu_page_count();
     if mmu_count < SUPERPAGE_MMU_PAGES {
         return;
@@ -505,12 +492,13 @@ fn handle_cow_fault(
     mmu_idx: usize,
     fault_addr: usize,
 ) -> FaultResult {
-    use super::page::{PAGE_SIZE, MMUPAGE_SIZE};
     use super::cowgroup;
+    use super::page::{MMUPAGE_SIZE, PAGE_SIZE};
 
     // Read old PA and group port from the object.
     let (old_pa, cow_group_port) = match object::with_object(obj_id, |obj| {
-        obj.get_page(obj_page_idx).map(|pa| (pa, obj.cow_group_port))
+        obj.get_page(obj_page_idx)
+            .map(|pa| (pa, obj.cow_group_port))
     }) {
         Some(pair) => pair,
         None => return FaultResult::Failed,
@@ -546,7 +534,11 @@ fn handle_cow_fault(
         let page_count = (extent_end - super_base as usize) as u8;
 
         match cowgroup::find_or_create_reservation(
-            cow_group_port, obj_id, super_base, page_count, slot,
+            cow_group_port,
+            obj_id,
+            super_base,
+            page_count,
+            slot,
         ) {
             Some(rs) if !rs.already_copied => {
                 // Copy into the reserved slot.
@@ -609,9 +601,7 @@ fn handle_cow_fault(
         // COW group: use epoch-based extent tracking.
         let super_base = (obj_page_idx & !(SUPERPAGE_ALLOC_PAGES - 1)) as u32;
         let slot = obj_page_idx - super_base as usize;
-        cowgroup::mark_copied_and_release(
-            cow_group_port, obj_id, super_base, slot, old_pa,
-        );
+        cowgroup::mark_copied_and_release(cow_group_port, obj_id, super_base, slot, old_pa);
     } else {
         // No COW group: page is exclusively owned, free directly.
         super::phys::free_page(old_pa);

@@ -14,7 +14,7 @@
 //! class. The fast path (alloc/free) operates with IRQs disabled and no
 //! lock. The global lock is only touched every ~MAG_CAPACITY operations.
 
-use super::page::{PhysAddr, PAGE_SIZE};
+use super::page::{PAGE_SIZE, PhysAddr};
 use super::phys;
 
 const NONE: u16 = u16::MAX;
@@ -23,22 +23,22 @@ const NONE: u16 = u16::MAX;
 /// Must be kept small so it doesn't eat too much of the usable space.
 #[repr(C)]
 struct SlabHeader {
-    free_head: u16,  // Index of first free object, or NONE
-    in_use: u16,     // Number of allocated objects
-    capacity: u16,   // Total object slots in this slab
+    free_head: u16, // Index of first free object, or NONE
+    in_use: u16,    // Number of allocated objects
+    capacity: u16,  // Total object slots in this slab
     _pad: u16,
 }
 
 /// A cache of fixed-size objects.
 pub struct SlabCache {
-    obj_size: usize,        // Size of each object (rounded up to align)
+    obj_size: usize, // Size of each object (rounded up to align)
     #[allow(dead_code)]
-    obj_align: usize,       // Alignment of each object
-    slab_dir: *mut usize,   // Page-allocated directory of slab page addresses (0 = empty slot)
-    slab_dir_cap: usize,    // Number of directory slots available
-    slab_count: usize,      // Number of active slabs
-    objs_per_slab: usize,   // Objects per slab page
-    data_offset: usize,     // Byte offset from page start to first object
+    obj_align: usize, // Alignment of each object
+    slab_dir: *mut usize, // Page-allocated directory of slab page addresses (0 = empty slot)
+    slab_dir_cap: usize, // Number of directory slots available
+    slab_count: usize, // Number of active slabs
+    objs_per_slab: usize, // Objects per slab page
+    data_offset: usize, // Byte offset from page start to first object
 }
 
 // Safety: slab_dir is a physical address pointer, accessed under SpinLock.
@@ -85,7 +85,9 @@ impl SlabCache {
                 Some(pa) => pa.as_usize() as *mut usize,
                 None => return false,
             };
-            unsafe { core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE); }
+            unsafe {
+                core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+            }
             self.slab_dir = page;
             self.slab_dir_cap = PAGE_SIZE / core::mem::size_of::<usize>();
         }
@@ -101,7 +103,9 @@ impl SlabCache {
     /// Write a slab page address at directory index `idx`.
     #[inline]
     fn set_slab_page(&mut self, idx: usize, addr: usize) {
-        unsafe { *self.slab_dir.add(idx) = addr; }
+        unsafe {
+            *self.slab_dir.add(idx) = addr;
+        }
     }
 
     /// Allocate one object from this cache. Returns a physical address, or None if OOM.
@@ -147,7 +151,8 @@ impl SlabCache {
                 let obj_index = (addr_val - page_base - self.data_offset) / self.obj_size;
 
                 // Push onto free list.
-                let obj_ptr = (page_base + self.data_offset + obj_index * self.obj_size) as *mut u16;
+                let obj_ptr =
+                    (page_base + self.data_offset + obj_index * self.obj_size) as *mut u16;
                 unsafe { *obj_ptr = header.free_head };
                 header.free_head = obj_index as u16;
                 header.in_use -= 1;
@@ -439,7 +444,9 @@ pub fn free(addr: PhysAddr, size: usize) {
 /// Drain all magazines for a CPU (call on hotplug offline).
 pub fn drain_cpu(cpu: u32) {
     let cpu = cpu as usize;
-    if cpu >= MAX_CPUS { return; }
+    if cpu >= MAX_CPUS {
+        return;
+    }
 
     for idx in 0..NUM_CACHES {
         let cache = cache_by_index(idx);
@@ -462,7 +469,8 @@ pub fn drain_cpu(cpu: u32) {
 /// Print slab allocator statistics.
 pub fn print_stats() {
     let sizes = [64, 128, 256, 512, 2048];
-    let caches: [&SpinLock<SlabCache>; 5] = [&CACHE_64, &CACHE_128, &CACHE_256, &CACHE_512, &CACHE_2048];
+    let caches: [&SpinLock<SlabCache>; 5] =
+        [&CACHE_64, &CACHE_128, &CACHE_256, &CACHE_512, &CACHE_2048];
 
     crate::println!("  Slab allocator caches:");
     for (i, (size, cache)) in sizes.iter().zip(caches.iter()).enumerate() {
@@ -475,7 +483,10 @@ pub fn print_stats() {
         }
         crate::println!(
             "    {}-byte: {} slabs, {} objects/slab, {} in magazines",
-            size, c.slab_count, c.objs_per_slab, mag_cached,
+            size,
+            c.slab_count,
+            c.objs_per_slab,
+            mag_cached,
         );
     }
 }

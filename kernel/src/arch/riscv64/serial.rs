@@ -12,7 +12,7 @@ const THR: usize = 0x00; // Transmitter Holding Register (write)
 const LSR: usize = 0x05; // Line Status Register (read)
 
 // LSR bits.
-const LSR_DR: u8 = 1 << 0;   // Data Ready
+const LSR_DR: u8 = 1 << 0; // Data Ready
 const LSR_THRE: u8 = 1 << 5; // Transmit Holding Register Empty
 
 struct Uart16550;

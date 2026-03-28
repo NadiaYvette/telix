@@ -77,8 +77,12 @@ fn poll_check_fd(entry: &fd::FdEntry, events: u16) -> u16 {
         FdType::File => {
             // Files are always ready.
             let mut rev = 0u16;
-            if events & POLLIN != 0 { rev |= POLLIN; }
-            if events & POLLOUT != 0 { rev |= POLLOUT; }
+            if events & POLLIN != 0 {
+                rev |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                rev |= POLLOUT;
+            }
             rev
         }
         FdType::Pty => {
@@ -159,18 +163,17 @@ pub fn poll(fds: &mut [PollFd], timeout_ms: i32) -> i32 {
 /// `readfds`, `writefds`: bitmasks where bit N = FD N. Modified on return.
 /// `timeout_ms`: -1 = block forever, 0 = non-blocking, >0 = timeout in ms.
 /// Returns total number of ready FDs across all sets.
-pub fn select(
-    nfds: i32,
-    readfds: &mut u64,
-    writefds: &mut u64,
-    timeout_ms: i32,
-) -> i32 {
+pub fn select(nfds: i32, readfds: &mut u64, writefds: &mut u64, timeout_ms: i32) -> i32 {
     let n = if nfds > 64 { 64 } else { nfds as usize };
     let rfds = *readfds;
     let wfds = *writefds;
 
     // Build PollFd array from bitmasks.
-    let mut poll_fds = [PollFd { fd: -1, events: 0, revents: 0 }; 64];
+    let mut poll_fds = [PollFd {
+        fd: -1,
+        events: 0,
+        revents: 0,
+    }; 64];
     let mut count = 0usize;
     for i in 0..n {
         let mut events = 0u16;

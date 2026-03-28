@@ -36,38 +36,100 @@ pub struct ExceptionFrame {
 // Named indices into ExceptionFrame.regs for convenience.
 #[allow(dead_code)]
 impl ExceptionFrame {
-    pub fn rax(&self) -> u64 { self.regs[14] }
-    pub fn rbx(&self) -> u64 { self.regs[13] }
-    pub fn rcx(&self) -> u64 { self.regs[12] }
-    pub fn rdx(&self) -> u64 { self.regs[11] }
-    pub fn rsi(&self) -> u64 { self.regs[10] }
-    pub fn rdi(&self) -> u64 { self.regs[9] }
-    pub fn rbp(&self) -> u64 { self.regs[8] }
-    pub fn r8(&self) -> u64 { self.regs[7] }
-    pub fn r9(&self) -> u64 { self.regs[6] }
-    pub fn r10(&self) -> u64 { self.regs[5] }
-    pub fn r11(&self) -> u64 { self.regs[4] }
-    pub fn r12(&self) -> u64 { self.regs[3] }
-    pub fn r13(&self) -> u64 { self.regs[2] }
-    pub fn r14(&self) -> u64 { self.regs[1] }
-    pub fn r15(&self) -> u64 { self.regs[0] }
-    pub fn vector(&self) -> u64 { self.regs[15] }
-    pub fn error_code(&self) -> u64 { self.regs[16] }
-    pub fn rip(&self) -> u64 { self.regs[17] }
-    pub fn cs(&self) -> u64 { self.regs[18] }
-    pub fn rflags(&self) -> u64 { self.regs[19] }
-    pub fn rsp(&self) -> u64 { self.regs[20] }
-    pub fn ss(&self) -> u64 { self.regs[21] }
+    pub fn rax(&self) -> u64 {
+        self.regs[14]
+    }
+    pub fn rbx(&self) -> u64 {
+        self.regs[13]
+    }
+    pub fn rcx(&self) -> u64 {
+        self.regs[12]
+    }
+    pub fn rdx(&self) -> u64 {
+        self.regs[11]
+    }
+    pub fn rsi(&self) -> u64 {
+        self.regs[10]
+    }
+    pub fn rdi(&self) -> u64 {
+        self.regs[9]
+    }
+    pub fn rbp(&self) -> u64 {
+        self.regs[8]
+    }
+    pub fn r8(&self) -> u64 {
+        self.regs[7]
+    }
+    pub fn r9(&self) -> u64 {
+        self.regs[6]
+    }
+    pub fn r10(&self) -> u64 {
+        self.regs[5]
+    }
+    pub fn r11(&self) -> u64 {
+        self.regs[4]
+    }
+    pub fn r12(&self) -> u64 {
+        self.regs[3]
+    }
+    pub fn r13(&self) -> u64 {
+        self.regs[2]
+    }
+    pub fn r14(&self) -> u64 {
+        self.regs[1]
+    }
+    pub fn r15(&self) -> u64 {
+        self.regs[0]
+    }
+    pub fn vector(&self) -> u64 {
+        self.regs[15]
+    }
+    pub fn error_code(&self) -> u64 {
+        self.regs[16]
+    }
+    pub fn rip(&self) -> u64 {
+        self.regs[17]
+    }
+    pub fn cs(&self) -> u64 {
+        self.regs[18]
+    }
+    pub fn rflags(&self) -> u64 {
+        self.regs[19]
+    }
+    pub fn rsp(&self) -> u64 {
+        self.regs[20]
+    }
+    pub fn ss(&self) -> u64 {
+        self.regs[21]
+    }
 
-    pub fn set_rax(&mut self, v: u64) { self.regs[14] = v; }
-    pub fn set_rbx(&mut self, v: u64) { self.regs[13] = v; }
-    pub fn set_rcx(&mut self, v: u64) { self.regs[12] = v; }
-    pub fn set_rdx(&mut self, v: u64) { self.regs[11] = v; }
-    pub fn set_rsi(&mut self, v: u64) { self.regs[10] = v; }
-    pub fn set_rdi(&mut self, v: u64) { self.regs[9] = v; }
-    pub fn set_r8(&mut self, v: u64) { self.regs[7] = v; }
-    pub fn set_r9(&mut self, v: u64) { self.regs[6] = v; }
-    pub fn set_r10(&mut self, v: u64) { self.regs[5] = v; }
+    pub fn set_rax(&mut self, v: u64) {
+        self.regs[14] = v;
+    }
+    pub fn set_rbx(&mut self, v: u64) {
+        self.regs[13] = v;
+    }
+    pub fn set_rcx(&mut self, v: u64) {
+        self.regs[12] = v;
+    }
+    pub fn set_rdx(&mut self, v: u64) {
+        self.regs[11] = v;
+    }
+    pub fn set_rsi(&mut self, v: u64) {
+        self.regs[10] = v;
+    }
+    pub fn set_rdi(&mut self, v: u64) {
+        self.regs[9] = v;
+    }
+    pub fn set_r8(&mut self, v: u64) {
+        self.regs[7] = v;
+    }
+    pub fn set_r9(&mut self, v: u64) {
+        self.regs[6] = v;
+    }
+    pub fn set_r10(&mut self, v: u64) {
+        self.regs[5] = v;
+    }
 }
 
 /// Number of u64 values in the exception frame.
@@ -150,7 +212,9 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
 
 fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
     let cr2: u64;
-    unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2); }
+    unsafe {
+        core::arch::asm!("mov {}, cr2", out(reg) cr2);
+    }
     let error = frame.error_code();
     // Error code bits: bit 0 = P (present), bit 1 = W/R, bit 2 = U/S, bit 4 = I/D.
     let fault_type = if error & (1 << 4) != 0 {
@@ -164,17 +228,24 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
     if !is_user {
         crate::println!(
             "Kernel #PF at RIP={:#x} CR2={:#x} error={:#x}",
-            frame.rip(), cr2, error
+            frame.rip(),
+            cr2,
+            error
         );
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     }
     let aspace_id = crate::sched::current_aspace_id();
     if aspace_id == 0 {
         crate::println!(
             "User #PF with no address space: CR2={:#x} RIP={:#x}",
-            cr2, frame.rip()
+            cr2,
+            frame.rip()
         );
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     }
     let result = crate::mm::fault::handle_page_fault(aspace_id, cr2 as usize, fault_type);
     match result {
@@ -187,7 +258,9 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
         crate::mm::fault::FaultResult::Failed => {
             crate::println!(
                 "Unhandled #PF: CR2={:#x} RIP={:#x} error={:#x} — killing thread",
-                cr2, frame.rip(), error
+                cr2,
+                frame.rip(),
+                error
             );
             crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
         }
@@ -199,19 +272,29 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
 fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
     crate::println!(
         "EXCEPTION: {} at RIP={:#x} error_code={:#x}",
-        name, frame.rip(), frame.error_code()
+        name,
+        frame.rip(),
+        frame.error_code()
     );
     crate::println!(
         "  RAX={:#x} RBX={:#x} RCX={:#x} RDX={:#x}",
-        frame.rax(), frame.rbx(), frame.rcx(), frame.rdx()
+        frame.rax(),
+        frame.rbx(),
+        frame.rcx(),
+        frame.rdx()
     );
     crate::println!(
         "  RSP={:#x} RBP={:#x} RSI={:#x} RDI={:#x}",
-        frame.rsp(), frame.rbp(), frame.rsi(), frame.rdi()
+        frame.rsp(),
+        frame.rbp(),
+        frame.rsi(),
+        frame.rdi()
     );
     crate::println!(
         "  CS={:#x} RFLAGS={:#x} SS={:#x}",
-        frame.cs(), frame.rflags(), frame.ss()
+        frame.cs(),
+        frame.rflags(),
+        frame.ss()
     );
     loop {
         core::hint::spin_loop();

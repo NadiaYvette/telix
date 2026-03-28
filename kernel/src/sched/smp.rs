@@ -7,7 +7,7 @@
 //!   x86-64:  LAPIC ID register
 
 use super::thread::ThreadId;
-use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Maximum CPUs supported (compile-time, selected via cargo feature).
 #[cfg(feature = "max_cpus_4")]
@@ -18,8 +18,12 @@ pub const MAX_CPUS: usize = 256;
 pub const MAX_CPUS: usize = 1024;
 #[cfg(feature = "max_cpus_4096")]
 pub const MAX_CPUS: usize = 4096;
-#[cfg(not(any(feature = "max_cpus_4", feature = "max_cpus_256",
-              feature = "max_cpus_1024", feature = "max_cpus_4096")))]
+#[cfg(not(any(
+    feature = "max_cpus_4",
+    feature = "max_cpus_256",
+    feature = "max_cpus_1024",
+    feature = "max_cpus_4096"
+)))]
 pub const MAX_CPUS: usize = 64;
 
 /// Per-hart trap scratch data for RISC-V tp/sscratch swap convention.
@@ -27,16 +31,21 @@ pub const MAX_CPUS: usize = 64;
 #[cfg(target_arch = "riscv64")]
 #[repr(C, align(32))]
 pub struct TrapScratch {
-    pub kernel_sp: u64,   // offset 0: kernel stack pointer for user traps
-    pub cpu_id: u64,      // offset 8: this hart's CPU ID
-    pub user_sp: u64,     // offset 16: temporary save of user sp during trap entry
-    pub _pad: u64,        // offset 24: padding to 32 bytes
+    pub kernel_sp: u64, // offset 0: kernel stack pointer for user traps
+    pub cpu_id: u64,    // offset 8: this hart's CPU ID
+    pub user_sp: u64,   // offset 16: temporary save of user sp during trap entry
+    pub _pad: u64,      // offset 24: padding to 32 bytes
 }
 
 #[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
 pub static mut TRAP_SCRATCH_ARRAY: [TrapScratch; MAX_CPUS] = {
-    const INIT: TrapScratch = TrapScratch { kernel_sp: 0, cpu_id: 0, user_sp: 0, _pad: 0 };
+    const INIT: TrapScratch = TrapScratch {
+        kernel_sp: 0,
+        cpu_id: 0,
+        user_sp: 0,
+        _pad: 0,
+    };
     [INIT; MAX_CPUS]
 };
 

@@ -3,9 +3,9 @@
 //! Runs as a kernel thread. Clients register and look up services via IPC messages.
 //! The name table grows dynamically — no compile-time cap on registered services.
 
-use crate::ipc::{port, Message};
-use crate::mm::paged_array::PagedArray;
 use super::protocol::*;
+use crate::ipc::{Message, port};
+use crate::mm::paged_array::PagedArray;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Global port ID for the name server.
@@ -48,9 +48,7 @@ impl NameTable {
         // Check for duplicate — update if exists.
         for i in 0..self.count {
             let e = self.entries.get(i);
-            if e.active && e.name_len == name.len()
-                && &e.name[..name.len()] == name
-            {
+            if e.active && e.name_len == name.len() && &e.name[..name.len()] == name {
                 self.entries.get_mut(i).port_id = port_id;
                 return true;
             }
@@ -72,9 +70,7 @@ impl NameTable {
     fn lookup(&self, name: &[u8]) -> Option<u64> {
         for i in 0..self.count {
             let e = self.entries.get(i);
-            if e.active && e.name_len == name.len()
-                && &e.name[..name.len()] == name
-            {
+            if e.active && e.name_len == name.len() && &e.name[..name.len()] == name {
                 return Some(e.port_id);
             }
         }
@@ -123,12 +119,17 @@ pub fn namesrv_server() -> ! {
                     }
                 }
 
-                let _ = port::send_nb(reply_port, Message::new(NS_LOOKUP_OK, [port_id, 0, 0, 0, 0, 0]));
+                let _ = port::send_nb(
+                    reply_port,
+                    Message::new(NS_LOOKUP_OK, [port_id, 0, 0, 0, 0, 0]),
+                );
             }
 
             _ => {}
         }
     }
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

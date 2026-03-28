@@ -102,11 +102,15 @@ fn parse_madt(madt_addr: usize) {
                 // Byte 2: ACPI processor ID, byte 3: APIC ID, bytes 4-7: flags.
                 if entry_len >= 8 {
                     let apic_id = unsafe { *((madt_addr + offset + 3) as *const u8) } as u32;
-                    let flags =
-                        unsafe { core::ptr::read_unaligned((madt_addr + offset + 4) as *const u32) };
+                    let flags = unsafe {
+                        core::ptr::read_unaligned((madt_addr + offset + 4) as *const u32)
+                    };
                     // Bit 0 = processor enabled, bit 1 = online capable.
                     let enabled = if flags & 0x3 != 0 { 1u32 } else { 0 };
-                    super::push_cpu(super::CpuDesc { id: apic_id, flags: enabled });
+                    super::push_cpu(super::CpuDesc {
+                        id: apic_id,
+                        flags: enabled,
+                    });
                 }
             }
             1 => {

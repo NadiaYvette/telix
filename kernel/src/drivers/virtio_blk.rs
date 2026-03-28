@@ -9,7 +9,7 @@
 
 use super::virtio_mmio as mmio;
 use crate::mm::phys;
-use core::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// Virtqueue size (number of descriptors).
 const QUEUE_SIZE: usize = 16;
@@ -19,7 +19,7 @@ const VRING_DESC_F_NEXT: u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2;
 
 /// Virtio block request types.
-const VIRTIO_BLK_T_IN: u32 = 0;  // Read
+const VIRTIO_BLK_T_IN: u32 = 0; // Read
 const VIRTIO_BLK_T_OUT: u32 = 1; // Write
 
 /// Virtqueue descriptor (16 bytes).
@@ -160,7 +160,9 @@ impl VirtioBlk {
         // Allocate virtqueue memory — contiguous for all three rings.
         let vq_page = phys::alloc_page()?;
         let vq_base = vq_page.as_usize();
-        unsafe { core::ptr::write_bytes(vq_base as *mut u8, 0, 4096); }
+        unsafe {
+            core::ptr::write_bytes(vq_base as *mut u8, 0, 4096);
+        }
 
         let desc_pa = vq_base;
         let avail_pa = desc_pa + 16 * QUEUE_SIZE;
@@ -185,7 +187,9 @@ impl VirtioBlk {
             // Allocate a page for request headers and status bytes.
             let buf_page = phys::alloc_page()?;
             let buf_base = buf_page.as_usize();
-            unsafe { core::ptr::write_bytes(buf_base as *mut u8, 0, 4096); }
+            unsafe {
+                core::ptr::write_bytes(buf_base as *mut u8, 0, 4096);
+            }
 
             return Some(Self {
                 mmio_base: base,
@@ -217,7 +221,9 @@ impl VirtioBlk {
         // Allocate a page for request headers and status bytes.
         let buf_page = phys::alloc_page()?;
         let buf_base = buf_page.as_usize();
-        unsafe { core::ptr::write_bytes(buf_base as *mut u8, 0, 4096); }
+        unsafe {
+            core::ptr::write_bytes(buf_base as *mut u8, 0, 4096);
+        }
 
         Some(Self {
             mmio_base: base,
@@ -248,7 +254,9 @@ impl VirtioBlk {
 
         // Write status byte to 0xFF (will be overwritten by device).
         let status_ptr = self.status_pa as *mut u8;
-        unsafe { *status_ptr = 0xFF; }
+        unsafe {
+            *status_ptr = 0xFF;
+        }
 
         // Build 3-descriptor chain: header → data buffer → status.
         // We need the data buffer at a known physical address.
@@ -321,7 +329,9 @@ impl VirtioBlk {
         }
 
         let status_ptr = self.status_pa as *mut u8;
-        unsafe { *status_ptr = 0xFF; }
+        unsafe {
+            *status_ptr = 0xFF;
+        }
 
         let data_pa = self.req_hdr_pa + 32;
         unsafe {

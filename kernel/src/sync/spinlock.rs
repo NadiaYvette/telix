@@ -26,7 +26,11 @@ impl<T> SpinLock<T> {
     /// Try to acquire the lock without spinning. Returns None if already held.
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         let saved = arch_disable_irqs();
-        if self.lock.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        if self
+            .lock
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
             Some(SpinLockGuard { lock: self, saved })
         } else {
             arch_restore_irqs(saved);
@@ -45,10 +49,7 @@ impl<T> SpinLock<T> {
             core::hint::spin_loop();
         }
 
-        SpinLockGuard {
-            lock: self,
-            saved,
-        }
+        SpinLockGuard { lock: self, saved }
     }
 }
 

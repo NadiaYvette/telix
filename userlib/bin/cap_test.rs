@@ -73,8 +73,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::exit(1);
     }
 
-    if p1 != u64::MAX { syscall::port_destroy(p1); }
-    if p2 != u64::MAX { syscall::port_destroy(p2); }
+    if p1 != u64::MAX {
+        syscall::port_destroy(p1);
+    }
+    if p2 != u64::MAX {
+        syscall::port_destroy(p2);
+    }
 
     syscall::exit(0);
 }

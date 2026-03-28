@@ -14,7 +14,7 @@ impl Rights {
     pub const READ: Rights = Rights(1 << 3);
     pub const WRITE: Rights = Rights(1 << 4);
     pub const EXEC: Rights = Rights(1 << 5);
-    pub const MANAGE: Rights = Rights(1 << 6);  // Create/destroy child objects
+    pub const MANAGE: Rights = Rights(1 << 6); // Create/destroy child objects
 
     #[allow(dead_code)]
     pub const fn bits(self) -> u32 {

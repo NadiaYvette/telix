@@ -56,22 +56,26 @@ pub const EVT_PAGE_FAULT: u16 = 6;
 
 /// Enable kernel tracing.
 pub fn trace_enable() {
-    unsafe { arch::syscall1(SYS_TRACE_CTRL, 1); }
+    unsafe {
+        arch::syscall1(SYS_TRACE_CTRL, 1);
+    }
 }
 
 /// Disable kernel tracing.
 pub fn trace_disable() {
-    unsafe { arch::syscall1(SYS_TRACE_CTRL, 0); }
+    unsafe {
+        arch::syscall1(SYS_TRACE_CTRL, 0);
+    }
 }
 
 /// Clear the trace buffer and disable tracing.
 pub fn trace_clear() {
-    unsafe { arch::syscall1(SYS_TRACE_CTRL, 2); }
+    unsafe {
+        arch::syscall1(SYS_TRACE_CTRL, 2);
+    }
 }
 
 /// Read trace entries into the provided buffer. Returns entries read.
 pub fn trace_read(buf: &mut [TraceEntry]) -> usize {
-    unsafe {
-        arch::syscall2(SYS_TRACE_READ, buf.as_mut_ptr() as u64, buf.len() as u64) as usize
-    }
+    unsafe { arch::syscall2(SYS_TRACE_READ, buf.as_mut_ptr() as u64, buf.len() as u64) as usize }
 }

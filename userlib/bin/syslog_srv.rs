@@ -43,7 +43,13 @@ struct LogEntry {
 
 impl LogEntry {
     const fn empty() -> Self {
-        Self { timestamp_ns: 0, facility: 0, priority: 0, msg_w0: 0, msg_w1: 0 }
+        Self {
+            timestamp_ns: 0,
+            facility: 0,
+            priority: 0,
+            msg_w0: 0,
+            msg_w1: 0,
+        }
     }
 }
 
@@ -56,7 +62,11 @@ struct LogHandle {
 
 impl LogHandle {
     const fn empty() -> Self {
-        Self { active: false, facility: 0, ident_w0: 0 }
+        Self {
+            active: false,
+            facility: 0,
+            ident_w0: 0,
+        }
     }
 }
 
@@ -179,7 +189,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                 let reply = msg.data[2] >> 32;
 
                 if (handle as usize) < MAX_HANDLES {
-                    unsafe { HANDLES[handle as usize].active = false; }
+                    unsafe {
+                        HANDLES[handle as usize].active = false;
+                    }
                 }
                 syscall::send(reply, SYSLOG_OK, 0, 0, 0, 0);
             }
@@ -192,7 +204,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                     Some(entry) => {
                         // d0 = priority|facility<<16, d1 = msg_w0, d2 = msg_w1, d3 = timestamp
                         let info = (entry.priority as u64) | ((entry.facility as u64) << 16);
-                        syscall::send(reply, SYSLOG_OK, info, entry.msg_w0, entry.msg_w1, entry.timestamp_ns);
+                        syscall::send(
+                            reply,
+                            SYSLOG_OK,
+                            info,
+                            entry.msg_w0,
+                            entry.msg_w1,
+                            entry.timestamp_ns,
+                        );
                     }
                     None => {
                         syscall::send(reply, SYSLOG_ERROR, 0, 0, 0, 0);

@@ -17,7 +17,12 @@ pub struct CpuTopoEntry {
 
 impl CpuTopoEntry {
     const fn empty() -> Self {
-        Self { package_id: 0, core_id: 0, smt_id: 0, online: false }
+        Self {
+            package_id: 0,
+            core_id: 0,
+            smt_id: 0,
+            online: false,
+        }
     }
 }
 
@@ -47,7 +52,10 @@ fn cpuid(eax: u32, ecx: u32) -> (u32, u32, u32, u32) {
 pub fn init() {
     let entry = discover_local();
     unsafe {
-        CPU_TOPO[0] = CpuTopoEntry { online: true, ..entry };
+        CPU_TOPO[0] = CpuTopoEntry {
+            online: true,
+            ..entry
+        };
     }
 }
 
@@ -56,7 +64,10 @@ pub fn init_ap(cpu: u32) {
     if (cpu as usize) < MAX_CPUS {
         let entry = discover_local();
         unsafe {
-            CPU_TOPO[cpu as usize] = CpuTopoEntry { online: true, ..entry };
+            CPU_TOPO[cpu as usize] = CpuTopoEntry {
+                online: true,
+                ..entry
+            };
         }
     }
 }
@@ -76,7 +87,9 @@ pub fn get(cpu: usize) -> CpuTopoEntry {
 /// Caller must ensure `cpu < MAX_CPUS`.
 pub unsafe fn set_online(cpu: usize, online: bool) {
     if cpu < MAX_CPUS {
-        unsafe { CPU_TOPO[cpu].online = online; }
+        unsafe {
+            CPU_TOPO[cpu].online = online;
+        }
     }
 }
 
@@ -88,7 +101,10 @@ pub fn print() {
         if e.online {
             crate::println!(
                 "    CPU {}: package={} core={} smt={}",
-                i, e.package_id, e.core_id, e.smt_id
+                i,
+                e.package_id,
+                e.core_id,
+                e.smt_id
             );
         }
     }

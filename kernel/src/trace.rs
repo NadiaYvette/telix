@@ -34,7 +34,12 @@ static HEAD: AtomicUsize = AtomicUsize::new(0);
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 
 const EMPTY_ENTRY: TraceEntry = TraceEntry {
-    timestamp: 0, arg0: 0, arg1: 0, event_type: 0, cpu: 0, tid: 0,
+    timestamp: 0,
+    arg0: 0,
+    arg1: 0,
+    event_type: 0,
+    cpu: 0,
+    tid: 0,
 };
 static mut BUFFER: [TraceEntry; TRACE_BUF_SIZE] = [EMPTY_ENTRY; TRACE_BUF_SIZE];
 
@@ -57,7 +62,14 @@ fn trace_event_inner(event_type: u16, arg0: u32, arg1: u32) {
     COUNT.fetch_add(1, Ordering::Relaxed);
 
     unsafe {
-        BUFFER[idx] = TraceEntry { timestamp, arg0, arg1, event_type, cpu, tid };
+        BUFFER[idx] = TraceEntry {
+            timestamp,
+            arg0,
+            arg1,
+            event_type,
+            cpu,
+            tid,
+        };
     }
 }
 
@@ -68,8 +80,14 @@ fn read_cycles() -> u64 {
 /// Control tracing: 0=disable, 1=enable, 2=clear+disable.
 pub fn trace_ctrl(op: u64) -> u64 {
     match op {
-        0 => { ENABLED.store(false, Ordering::Release); 0 }
-        1 => { ENABLED.store(true, Ordering::Release); 0 }
+        0 => {
+            ENABLED.store(false, Ordering::Release);
+            0
+        }
+        1 => {
+            ENABLED.store(true, Ordering::Release);
+            0
+        }
         2 => {
             ENABLED.store(false, Ordering::Release);
             HEAD.store(0, Ordering::Release);
@@ -92,7 +110,9 @@ pub fn trace_read(pt_root: usize, user_buf: usize, max_entries: usize) -> u64 {
     let to_copy = available.min(max_entries);
 
     if to_copy == 0 {
-        if was_enabled { ENABLED.store(true, Ordering::Release); }
+        if was_enabled {
+            ENABLED.store(true, Ordering::Release);
+        }
         return 0;
     }
 
@@ -110,11 +130,15 @@ pub fn trace_read(pt_root: usize, user_buf: usize, max_entries: usize) -> u64 {
         let src_slice = unsafe { core::slice::from_raw_parts(src, entry_size) };
         let dst_va = user_buf + i * entry_size;
         if !crate::syscall::handlers::copy_to_user(pt_root, dst_va, src_slice) {
-            if was_enabled { ENABLED.store(true, Ordering::Release); }
+            if was_enabled {
+                ENABLED.store(true, Ordering::Release);
+            }
             return i as u64;
         }
     }
 
-    if was_enabled { ENABLED.store(true, Ordering::Release); }
+    if was_enabled {
+        ENABLED.store(true, Ordering::Release);
+    }
     to_copy as u64
 }

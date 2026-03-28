@@ -36,18 +36,16 @@ pub fn start_secondary_cpus() {
 
     // Copy trampoline to low memory.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            trampoline_src,
-            TRAMPOLINE_PHYS as *mut u8,
-            trampoline_size,
-        );
+        core::ptr::copy_nonoverlapping(trampoline_src, TRAMPOLINE_PHYS as *mut u8, trampoline_size);
     }
 
     let bsp_id = super::lapic::id();
 
     // Get PML4 from CR3 (BSP's page tables — identity mapped, shared with APs).
     let cr3: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3); }
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3);
+    }
     let pml4 = cr3 as u32; // PML4 physical address fits in 32 bits.
 
     // Get the GDT pointer that the APs should use (same as BSP).
@@ -94,9 +92,7 @@ pub fn start_secondary_cpus() {
     for i in 0..ap_count {
         let cpu = ap_ids[i];
 
-        let stack_top = unsafe {
-            AP_STACKS.0[cpu as usize].as_ptr().add(AP_STACK_SIZE) as u64
-        };
+        let stack_top = unsafe { AP_STACKS.0[cpu as usize].as_ptr().add(AP_STACK_SIZE) as u64 };
 
         // Write the data block at TRAMPOLINE_PHYS + DATA_OFFSET.
         let data_base = (TRAMPOLINE_PHYS + DATA_OFFSET) as *mut u8;
@@ -113,11 +109,7 @@ pub fn start_secondary_cpus() {
                 ap_rust_entry as *const () as u64,
             );
             // +0x20: 64-bit GDT pointer (10 bytes: 2-byte limit + 8-byte base).
-            core::ptr::copy_nonoverlapping(
-                gdt_ptr_bytes.as_ptr(),
-                data_base.add(0x20),
-                10,
-            );
+            core::ptr::copy_nonoverlapping(gdt_ptr_bytes.as_ptr(), data_base.add(0x20), 10);
             // +0x30: 32-bit GDT (3 descriptors x 8 bytes = 24 bytes).
             let gdt32_base = data_base.add(0x30) as *mut u64;
             core::ptr::write_unaligned(gdt32_base.add(0), 0x0000_0000_0000_0000); // null
@@ -126,8 +118,10 @@ pub fn start_secondary_cpus() {
             // +0x48: 32-bit GDT pointer (2-byte limit + 4-byte base).
             let gdt32_ptr = data_base.add(0x48);
             core::ptr::write_unaligned(gdt32_ptr as *mut u16, 23); // 3*8 - 1
-            core::ptr::write_unaligned(gdt32_ptr.add(2) as *mut u32,
-                (TRAMPOLINE_PHYS + DATA_OFFSET + 0x30) as u32); // base
+            core::ptr::write_unaligned(
+                gdt32_ptr.add(2) as *mut u32,
+                (TRAMPOLINE_PHYS + DATA_OFFSET + 0x30) as u32,
+            ); // base
         }
 
         // INIT-SIPI-SIPI sequence.
@@ -192,8 +186,12 @@ extern "C" fn ap_rust_entry(cpu_id: u32) {
     crate::println!("  CPU {} online (LAPIC ID {})", cpu_id, super::lapic::id());
 
     // Enable interrupts and idle.
-    unsafe { core::arch::asm!("sti"); }
+    unsafe {
+        core::arch::asm!("sti");
+    }
     loop {
-        unsafe { core::arch::asm!("hlt"); }
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
 }

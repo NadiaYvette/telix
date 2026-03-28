@@ -4,8 +4,8 @@
 //! Both kernel (identity-mapped) and user mappings go through TTBR0,
 //! since the kernel runs at 0x4008_0000 (low VA space).
 
-use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::mm::radix_pt::{self, PteFormat};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Kernel page table root (L0), set by BSP after enable_mmu.
 /// Used by secondary CPUs to enable their MMU with the same identity mapping.
@@ -13,14 +13,14 @@ static KERNEL_PT_ROOT: AtomicUsize = AtomicUsize::new(0);
 
 /// Page table entry flags.
 const PT_VALID: u64 = 1 << 0;
-const PT_TABLE: u64 = 1 << 1;     // Non-leaf: next-level table
-const PT_PAGE: u64 = 1 << 1;      // Level 3: 4K page
-const PT_AF: u64 = 1 << 10;       // Access flag
-const PT_SH_INNER: u64 = 3 << 8;  // Inner shareable
+const PT_TABLE: u64 = 1 << 1; // Non-leaf: next-level table
+const PT_PAGE: u64 = 1 << 1; // Level 3: 4K page
+const PT_AF: u64 = 1 << 10; // Access flag
+const PT_SH_INNER: u64 = 3 << 8; // Inner shareable
 const PT_AP_RW_EL1: u64 = 0 << 6; // EL1 RW, EL0 no access
 const PT_AP_RW_ALL: u64 = 1 << 6; // EL1 RW, EL0 RW
-const PT_UXN: u64 = 1 << 54;      // Unprivileged execute-never
-const PT_PXN: u64 = 1 << 53;      // Privileged execute-never
+const PT_UXN: u64 = 1 << 54; // Unprivileged execute-never
+const PT_PXN: u64 = 1 << 53; // Privileged execute-never
 const PT_CONTIGUOUS: u64 = 1 << 52; // Contiguous hint (16 × 4K = 64K group)
 /// Software-defined bit: page content has been initialized (zeroed/filled).
 /// Stored in bits [58:55] which are reserved for software use.
@@ -95,13 +95,7 @@ pub fn create_user_page_table() -> Option<usize> {
 
 /// Add user 4K page mappings to an existing L0 table.
 #[allow(dead_code)]
-pub fn map_user_pages(
-    l0: usize,
-    virt: usize,
-    phys: usize,
-    size: usize,
-    flags: u64,
-) -> Option<()> {
+pub fn map_user_pages(l0: usize, virt: usize, phys: usize, size: usize, flags: u64) -> Option<()> {
     let num_pages = (size + MMU_PAGE_SIZE - 1) / MMU_PAGE_SIZE;
 
     for i in 0..num_pages {
@@ -121,7 +115,8 @@ pub const USER_RWX_FLAGS: u64 = USER_PAGE;
 pub const USER_RW_FLAGS: u64 = USER_PAGE | PT_UXN;
 /// Read-only user page: AP = 11 (EL1 RO, EL0 RO), no execute.
 const PT_AP_RO_ALL: u64 = 3 << 6;
-pub const USER_RO_FLAGS: u64 = PT_VALID | PT_PAGE | PT_AF | PT_SH_INNER | PT_AP_RO_ALL | PT_ATTR_IDX_0 | PT_UXN;
+pub const USER_RO_FLAGS: u64 =
+    PT_VALID | PT_PAGE | PT_AF | PT_SH_INNER | PT_AP_RO_ALL | PT_ATTR_IDX_0 | PT_UXN;
 
 // ---------------------------------------------------------------------------
 // PteFormat implementation for the generic radix walker
@@ -218,7 +213,9 @@ pub fn evict_mmupage(l0: usize, va: usize) -> usize {
         None => return 0,
     };
     let entry = unsafe { *slot };
-    if entry & PT_VALID == 0 { return 0; }
+    if entry & PT_VALID == 0 {
+        return 0;
+    }
     let pa = (entry & PA_MASK) as usize;
     unsafe {
         *slot = entry & PTE_SW_ZEROED;
@@ -235,7 +232,9 @@ pub fn clear_pte(l0: usize, va: usize) {
     };
     let entry = unsafe { *slot };
     if entry != 0 {
-        unsafe { *slot = 0; }
+        unsafe {
+            *slot = 0;
+        }
         Aarch64Pte::tlb_invalidate(va);
     }
 }
@@ -581,7 +580,7 @@ pub fn enable_mmu(l0: usize) {
             | (0b01 << 8)              // IRGN0 = WB WA
             | (0b01 << 10)             // ORGN0 = WB WA
             | (0b11 << 12)             // SH0 = Inner shareable
-            | (1u64 << 23);            // EPD1 = 1 (disable TTBR1 walks)
+            | (1u64 << 23); // EPD1 = 1 (disable TTBR1 walks)
         core::arch::asm!("msr tcr_el1, {}", in(reg) tcr);
 
         // Set TTBR0_EL1.
@@ -594,9 +593,9 @@ pub fn enable_mmu(l0: usize) {
         // Enable MMU.
         let mut sctlr: u64;
         core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr);
-        sctlr |= 1 << 0;   // M: MMU enable
-        sctlr |= 1 << 2;   // C: data cache enable
-        sctlr |= 1 << 12;  // I: instruction cache enable
+        sctlr |= 1 << 0; // M: MMU enable
+        sctlr |= 1 << 2; // C: data cache enable
+        sctlr |= 1 << 12; // I: instruction cache enable
         core::arch::asm!("msr sctlr_el1, {}", in(reg) sctlr);
         core::arch::asm!("isb");
     }

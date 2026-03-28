@@ -55,7 +55,9 @@ pub fn read32(base: usize, offset: usize) -> u32 {
 
 /// MMIO write.
 pub fn write32(base: usize, offset: usize, val: u32) {
-    unsafe { core::ptr::write_volatile((base + offset) as *mut u32, val); }
+    unsafe {
+        core::ptr::write_volatile((base + offset) as *mut u32, val);
+    }
 }
 
 /// Probe a single MMIO address. Returns the device ID if the magic matches.
@@ -65,7 +67,9 @@ pub fn probe_device_id(base: usize) -> Option<u32> {
         return None;
     }
     let dev = read32(base, DEVICE_ID);
-    if dev == 0 { return None; }
+    if dev == 0 {
+        return None;
+    }
     Some(dev)
 }
 
@@ -87,7 +91,9 @@ fn fallback_irq(base: usize) -> u32 {
     // aarch64: 0x0a000000 + i*0x200 → SPI 16+i = INTID 48+i
     // riscv64: 0x10001000 + (i-1)*0x1000 → PLIC IRQ i (1..=8)
     for dev in FALLBACK_ADDRS {
-        if dev.0 == base { return dev.1; }
+        if dev.0 == base {
+            return dev.1;
+        }
     }
     0
 }
@@ -95,20 +101,50 @@ fn fallback_irq(base: usize) -> u32 {
 /// (base_address, irq) pairs for QEMU virt machines.
 #[cfg(target_arch = "aarch64")]
 const FALLBACK_ADDRS: &[(usize, u32)] = &[
-    (0x0a00_0000, 48), (0x0a00_0200, 49), (0x0a00_0400, 50), (0x0a00_0600, 51),
-    (0x0a00_0800, 52), (0x0a00_0a00, 53), (0x0a00_0c00, 54), (0x0a00_0e00, 55),
-    (0x0a00_1000, 56), (0x0a00_1200, 57), (0x0a00_1400, 58), (0x0a00_1600, 59),
-    (0x0a00_1800, 60), (0x0a00_1a00, 61), (0x0a00_1c00, 62), (0x0a00_1e00, 63),
-    (0x0a00_2000, 64), (0x0a00_2200, 65), (0x0a00_2400, 66), (0x0a00_2600, 67),
-    (0x0a00_2800, 68), (0x0a00_2a00, 69), (0x0a00_2c00, 70), (0x0a00_2e00, 71),
-    (0x0a00_3000, 72), (0x0a00_3200, 73), (0x0a00_3400, 74), (0x0a00_3600, 75),
-    (0x0a00_3800, 76), (0x0a00_3a00, 77), (0x0a00_3c00, 78), (0x0a00_3e00, 79),
+    (0x0a00_0000, 48),
+    (0x0a00_0200, 49),
+    (0x0a00_0400, 50),
+    (0x0a00_0600, 51),
+    (0x0a00_0800, 52),
+    (0x0a00_0a00, 53),
+    (0x0a00_0c00, 54),
+    (0x0a00_0e00, 55),
+    (0x0a00_1000, 56),
+    (0x0a00_1200, 57),
+    (0x0a00_1400, 58),
+    (0x0a00_1600, 59),
+    (0x0a00_1800, 60),
+    (0x0a00_1a00, 61),
+    (0x0a00_1c00, 62),
+    (0x0a00_1e00, 63),
+    (0x0a00_2000, 64),
+    (0x0a00_2200, 65),
+    (0x0a00_2400, 66),
+    (0x0a00_2600, 67),
+    (0x0a00_2800, 68),
+    (0x0a00_2a00, 69),
+    (0x0a00_2c00, 70),
+    (0x0a00_2e00, 71),
+    (0x0a00_3000, 72),
+    (0x0a00_3200, 73),
+    (0x0a00_3400, 74),
+    (0x0a00_3600, 75),
+    (0x0a00_3800, 76),
+    (0x0a00_3a00, 77),
+    (0x0a00_3c00, 78),
+    (0x0a00_3e00, 79),
 ];
 
 #[cfg(target_arch = "riscv64")]
 const FALLBACK_ADDRS: &[(usize, u32)] = &[
-    (0x1000_1000, 1), (0x1000_2000, 2), (0x1000_3000, 3), (0x1000_4000, 4),
-    (0x1000_5000, 5), (0x1000_6000, 6), (0x1000_7000, 7), (0x1000_8000, 8),
+    (0x1000_1000, 1),
+    (0x1000_2000, 2),
+    (0x1000_3000, 3),
+    (0x1000_4000, 4),
+    (0x1000_5000, 5),
+    (0x1000_6000, 6),
+    (0x1000_7000, 7),
+    (0x1000_8000, 8),
 ];
 
 #[cfg(target_arch = "x86_64")]

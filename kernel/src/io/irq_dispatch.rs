@@ -6,8 +6,8 @@
 //! The waiter table is page-allocated on first register() — no fixed IRQ limit.
 //! Capacity = PAGE_SIZE / size_of::<IrqWaiter>() (e.g. 2730 at 64 KiB pages).
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, AtomicBool, AtomicPtr, Ordering};
 use crate::mm::page::PAGE_SIZE;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 struct IrqWaiter {
     /// Thread ID waiting for this IRQ, or 0 if none (thread 0 = idle, never waits).
@@ -146,8 +146,15 @@ pub fn handle_irq(irq: u32) -> bool {
     // ACK the virtio interrupt (must happen in kernel/S-mode with identity map).
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let status = crate::drivers::virtio_mmio::read32(mmio_base, crate::drivers::virtio_mmio::INTERRUPT_STATUS);
-        crate::drivers::virtio_mmio::write32(mmio_base, crate::drivers::virtio_mmio::INTERRUPT_ACK, status);
+        let status = crate::drivers::virtio_mmio::read32(
+            mmio_base,
+            crate::drivers::virtio_mmio::INTERRUPT_STATUS,
+        );
+        crate::drivers::virtio_mmio::write32(
+            mmio_base,
+            crate::drivers::virtio_mmio::INTERRUPT_ACK,
+            status,
+        );
     }
 
     // Set pending and wake waiter.

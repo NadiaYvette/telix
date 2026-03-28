@@ -61,9 +61,7 @@ pub struct ExtentEntry {
 impl ExtentEntry {
     /// Physical address one past the end of this extent.
     pub fn end(&self) -> PhysAddr {
-        PhysAddr::new(
-            self.start.as_usize() + (self.page_count as usize) * super::page::PAGE_SIZE,
-        )
+        PhysAddr::new(self.start.as_usize() + (self.page_count as usize) * super::page::PAGE_SIZE)
     }
 
     /// Whether this extent can be coalesced with `other` (which must start
@@ -481,12 +479,7 @@ impl ExtentTree {
     }
 
     /// Split a full leaf and insert a new entry.
-    fn split_leaf_and_insert(
-        &mut self,
-        leaf_ptr: *mut LeafNode,
-        pos: usize,
-        entry: ExtentEntry,
-    ) {
+    fn split_leaf_and_insert(&mut self, leaf_ptr: *mut LeafNode, pos: usize, entry: ExtentEntry) {
         let new_ptr = alloc_node();
         if new_ptr.is_null() {
             return; // OOM — drop the insert
@@ -536,11 +529,7 @@ impl ExtentTree {
 
         // Promote the first key of the new leaf to the parent.
         let promote_key = new_leaf.entries[0].start.as_usize();
-        self.insert_into_parent(
-            leaf_ptr as *mut u8,
-            promote_key,
-            new_ptr as *mut u8,
-        );
+        self.insert_into_parent(leaf_ptr as *mut u8, promote_key, new_ptr as *mut u8);
     }
 
     /// Insert a new child pointer into the parent of `left`. If the parent
@@ -747,7 +736,9 @@ fn test_basic_insert_lookup() {
     assert_eq!(found.object_id, 1);
 
     // Lookup in the middle.
-    let found = tree.lookup(PhysAddr::new(0x10_0000 + super::page::PAGE_SIZE)).unwrap();
+    let found = tree
+        .lookup(PhysAddr::new(0x10_0000 + super::page::PAGE_SIZE))
+        .unwrap();
     assert_eq!(found.start, PhysAddr::new(0x10_0000));
 
     // Lookup outside.
@@ -849,10 +840,7 @@ fn test_range_query() {
     assert_eq!(tree.len(), 3);
 
     // Range query covering all three.
-    let mut iter = tree.range(
-        PhysAddr::new(0x10_0000),
-        PhysAddr::new(0x10_0000 + 12 * ps),
-    );
+    let mut iter = tree.range(PhysAddr::new(0x10_0000), PhysAddr::new(0x10_0000 + 12 * ps));
     let mut found = 0;
     while iter.next().is_some() {
         found += 1;

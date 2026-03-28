@@ -45,7 +45,9 @@ fn signal_handler_sigusr1(_sig: u64, frame_addr: u64) {
     }
     syscall::sigreturn(frame_addr);
     // sigreturn never returns, but just in case:
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -103,7 +105,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     if let Some(va) = syscall::mmap_anon(0, 1, 1) {
         // Write a pattern to the page.
         let ptr = va as *mut u64;
-        unsafe { core::ptr::write_volatile(ptr, 0xDEAD_BEEF_CAFE_1234); }
+        unsafe {
+            core::ptr::write_volatile(ptr, 0xDEAD_BEEF_CAFE_1234);
+        }
         // Read it back.
         let val = unsafe { core::ptr::read_volatile(ptr) };
         if val == 0xDEAD_BEEF_CAFE_1234 {
@@ -154,7 +158,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
         None => {
             syscall::debug_puts(b"  init: ns_lookup FAILED\n");
-            loop { syscall::yield_now(); }
+            loop {
+                syscall::yield_now();
+            }
         }
     };
 
@@ -171,11 +177,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             (reply.data[0], reply.data[1], reply.data[2])
         } else {
             syscall::debug_puts(b"  init: connect failed\n");
-            loop { syscall::yield_now(); }
+            loop {
+                syscall::yield_now();
+            }
         }
     } else {
         syscall::debug_puts(b"  init: no connect reply\n");
-        loop { syscall::yield_now(); }
+        loop {
+            syscall::yield_now();
+        }
     };
 
     syscall::debug_puts(b"  init: connected, handle=");
@@ -188,7 +198,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let d2_read = size.min(40) | (reply_port << 32);
     syscall::send(srv_port, 0x200, handle, 0, d2_read, 0);
 
-    for _ in 0..20 { syscall::yield_now(); }
+    for _ in 0..20 {
+        syscall::yield_now();
+    }
 
     if let Some(rr) = syscall::recv_msg(reply_port) {
         if rr.tag == 0x201 {
@@ -209,7 +221,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  init: mmap for grant buf FAILED\n");
-            loop { syscall::yield_now(); }
+            loop {
+                syscall::yield_now();
+            }
         }
     };
 
@@ -217,7 +231,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let grant_dst_va: usize = 0x5_0000_0000;
     if !syscall::grant_pages(srv_aspace, buf_va, grant_dst_va, 1, false) {
         syscall::debug_puts(b"  init: grant_pages FAILED\n");
-        loop { syscall::yield_now(); }
+        loop {
+            syscall::yield_now();
+        }
     }
 
     // IO_READ with grant: data[0]=handle, data[1]=offset, data[2]=length|(reply<<32), data[3]=grant_va
@@ -225,7 +241,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let d2_grant = size | (reply_port << 32);
     syscall::send(srv_port, 0x200, handle, 0, d2_grant, grant_dst_va as u64);
 
-    for _ in 0..20 { syscall::yield_now(); }
+    for _ in 0..20 {
+        syscall::yield_now();
+    }
 
     if let Some(rr) = syscall::recv_msg(reply_port) {
         if rr.tag == 0x201 {
@@ -260,7 +278,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing ramdisk...\n");
 
     // Give ramdisk_srv time to start and register.
-    for _ in 0..100 { syscall::yield_now(); }
+    for _ in 0..100 {
+        syscall::yield_now();
+    }
 
     let rd_port = match syscall::ns_lookup(b"ramdisk") {
         Some(p) => {
@@ -272,7 +292,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         None => {
             syscall::debug_puts(b"  init: ramdisk not found, skipping\n");
             syscall::debug_puts(b"Phase 7 zero-copy I/O test: PASSED (partial)\n");
-            loop { syscall::yield_now(); }
+            loop {
+                syscall::yield_now();
+            }
         }
     };
 
@@ -289,11 +311,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             reply.data[2]
         } else {
             syscall::debug_puts(b"  init: ramdisk connect failed\n");
-            loop { syscall::yield_now(); }
+            loop {
+                syscall::yield_now();
+            }
         }
     } else {
         syscall::debug_puts(b"  init: ramdisk no reply\n");
-        loop { syscall::yield_now(); }
+        loop {
+            syscall::yield_now();
+        }
     };
 
     // Inline write: 8 bytes "TestOK!\n" at offset 0.
@@ -308,7 +334,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let wr_d2 = 8u64 | (rd_reply << 32);
     syscall::send(rd_port, 0x300, 0, 0, wr_d2, test_data);
 
-    for _ in 0..20 { syscall::yield_now(); }
+    for _ in 0..20 {
+        syscall::yield_now();
+    }
 
     if let Some(rr) = syscall::recv_msg(rd_reply) {
         if rr.tag == 0x301 {
@@ -322,7 +350,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let rd_d2_read = 8u64 | (rd_reply << 32);
     syscall::send(rd_port, 0x200, 0, 0, rd_d2_read, 0);
 
-    for _ in 0..20 { syscall::yield_now(); }
+    for _ in 0..20 {
+        syscall::yield_now();
+    }
 
     if let Some(rr) = syscall::recv_msg(rd_reply) {
         if rr.tag == 0x201 {
@@ -340,11 +370,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // Grant-based write: 256 bytes of pattern.
     let wr_buf = match syscall::mmap_anon(0, 1, 1) {
         Some(va) => va,
-        None => loop { syscall::yield_now(); },
+        None => loop {
+            syscall::yield_now();
+        },
     };
     // Fill with pattern.
     for i in 0..256 {
-        unsafe { *((wr_buf + i) as *mut u8) = (i & 0xFF) as u8; }
+        unsafe {
+            *((wr_buf + i) as *mut u8) = (i & 0xFF) as u8;
+        }
     }
 
     let grant_wr_va: usize = 0x5_0000_0000;
@@ -354,7 +388,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let wr_d2_g = 256u64 | (rd_reply << 32);
     syscall::send(rd_port, 0x300, 0, 0, wr_d2_g, grant_wr_va as u64);
 
-    for _ in 0..20 { syscall::yield_now(); }
+    for _ in 0..20 {
+        syscall::yield_now();
+    }
 
     if let Some(rr) = syscall::recv_msg(rd_reply) {
         if rr.tag == 0x301 {
@@ -370,7 +406,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // Grant-based read back: 256 bytes.
     let rd_buf = match syscall::mmap_anon(0, 1, 1) {
         Some(va) => va,
-        None => loop { syscall::yield_now(); },
+        None => loop {
+            syscall::yield_now();
+        },
     };
 
     let grant_rd_va: usize = 0x5_0000_0000;
@@ -379,7 +417,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let rd_d2_g = 256u64 | (rd_reply << 32);
     syscall::send(rd_port, 0x200, 0, 0, rd_d2_g, grant_rd_va as u64);
 
-    for _ in 0..20 { syscall::yield_now(); }
+    for _ in 0..20 {
+        syscall::yield_now();
+    }
 
     let mut grant_read_ok = false;
     if let Some(rr) = syscall::recv_msg(rd_reply) {
@@ -416,7 +456,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing block device I/O...\n");
 
     // Give blk server time to start and register.
-    for _ in 0..200 { syscall::yield_now(); }
+    for _ in 0..200 {
+        syscall::yield_now();
+    }
 
     let blk_port = syscall::ns_lookup(b"blk");
     if let Some(bp) = blk_port {
@@ -452,7 +494,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 Some(va) => va,
                 None => {
                     syscall::debug_puts(b"  init: blk buf alloc FAILED\n");
-                    loop { syscall::yield_now(); }
+                    loop {
+                        syscall::yield_now();
+                    }
                 }
             };
 
@@ -588,7 +632,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing console server...\n");
 
     // Give console_srv time to start and register.
-    for _ in 0..200 { syscall::yield_now(); }
+    for _ in 0..200 {
+        syscall::yield_now();
+    }
 
     let mut con_port: Option<u64> = None;
     for _ in 0..500 {
@@ -633,7 +679,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing network...\n");
 
     // Give net_srv time to start and register.
-    for _ in 0..200 { syscall::yield_now(); }
+    for _ in 0..200 {
+        syscall::yield_now();
+    }
 
     let mut net_port: Option<u64> = None;
     for _ in 0..500 {
@@ -724,12 +772,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             let remaining = file_size - offset;
                             let chunk = if remaining > 512 { 512 } else { remaining };
                             let rd_d2 = (chunk as u64) | (exec_reply << 32);
-                            syscall::send(fp, 0x2100, handle, offset as u64, rd_d2, grant_dst as u64);
+                            syscall::send(
+                                fp,
+                                0x2100,
+                                handle,
+                                offset as u64,
+                                rd_d2,
+                                grant_dst as u64,
+                            );
 
                             if let Some(msg) = syscall::recv_msg(exec_reply) {
                                 if msg.tag == 0x2101 {
                                     let bytes_read = msg.data[0] as usize;
-                                    if bytes_read == 0 { break; }
+                                    if bytes_read == 0 {
+                                        break;
+                                    }
                                     unsafe {
                                         core::ptr::copy_nonoverlapping(
                                             scratch as *const u8,
@@ -844,7 +901,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // Grant scratch to fat16_srv.
                     let grant_dst: usize = 0x8_0000_0000;
                     let grant_ok = syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false);
-                    syscall::debug_puts(if grant_ok { b"  init: grant ok\n" } else { b"  init: grant FAIL\n" });
+                    syscall::debug_puts(if grant_ok {
+                        b"  init: grant ok\n"
+                    } else {
+                        b"  init: grant FAIL\n"
+                    });
                     if grant_ok {
                         // FS_WRITE: data[0]=handle, data[1]=length|(reply<<32), data[2]=grant_va
                         let wd1 = (test_data.len() as u64) | (wr_reply << 32);
@@ -867,7 +928,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 // Delay for close to complete (server processes close + disk flush).
                                 // Fat16_srv must: flush FAT sectors + write dir entry, each requiring
                                 // IPC round-trips to blk_srv + virtio disk I/O.
-                                for _ in 0..2000 { syscall::yield_now(); }
+                                for _ in 0..2000 {
+                                    syscall::yield_now();
+                                }
 
                                 // Now re-open and verify.
                                 let (fn0b, fn1b, _) = pack_name(fname);
@@ -893,17 +956,31 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                             unsafe {
                                                 core::ptr::write_bytes(scratch as *mut u8, 0, 512);
                                             }
-                                            if syscall::grant_pages(rsrv, scratch, grant_rd, 1, false) {
+                                            if syscall::grant_pages(
+                                                rsrv, scratch, grant_rd, 1, false,
+                                            ) {
                                                 let rd_d2 = (rsize as u64) | (wr_reply << 32);
-                                                syscall::send(fp, 0x2100, rh, 0, rd_d2, grant_rd as u64);
+                                                syscall::send(
+                                                    fp,
+                                                    0x2100,
+                                                    rh,
+                                                    0,
+                                                    rd_d2,
+                                                    grant_rd as u64,
+                                                );
 
                                                 if let Some(rd_msg) = syscall::recv_msg(wr_reply) {
                                                     if rd_msg.tag == 0x2101 {
                                                         let bytes_read = rd_msg.data[0] as usize;
                                                         let buf = unsafe {
-                                                            core::slice::from_raw_parts(scratch as *const u8, bytes_read)
+                                                            core::slice::from_raw_parts(
+                                                                scratch as *const u8,
+                                                                bytes_read,
+                                                            )
                                                         };
-                                                        if bytes_read == test_data.len() && buf == test_data {
+                                                        if bytes_read == test_data.len()
+                                                            && buf == test_data
+                                                        {
                                                             phase15_ok = true;
                                                         }
                                                     }
@@ -951,7 +1028,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let pipe_tid = syscall::spawn_with_arg(b"pipe_upper", 50, pipe_port);
     if pipe_tid != u64::MAX {
         // Give reader a moment to start and block on recv.
-        for _ in 0..10 { syscall::yield_now(); }
+        for _ in 0..10 {
+            syscall::yield_now();
+        }
 
         // Write test data to pipe.
         userlib::pipe::pipe_write(pipe_port, b"hello pipes");
@@ -979,7 +1058,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let shared_va = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
         if shared_va != 0 {
             // Clear shared memory.
-            unsafe { core::ptr::write_volatile(shared_va as *mut u64, 0); }
+            unsafe {
+                core::ptr::write_volatile(shared_va as *mut u64, 0);
+            }
 
             // Allocate stack for child thread.
             let child_stack_va = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
@@ -1019,21 +1100,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Test 18: Futex/Mutex ---
     {
         // Reset shared state.
-        unsafe { MUTEX_TEST_COUNTER = 0; }
+        unsafe {
+            MUTEX_TEST_COUNTER = 0;
+        }
 
         let stack1 = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
         let stack2 = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
         if stack1 != 0 && stack2 != 0 {
-            let t1 = syscall::thread_create(
-                mutex_test_thread as u64,
-                (stack1 + 0x4000) as u64,
-                0,
-            );
-            let t2 = syscall::thread_create(
-                mutex_test_thread as u64,
-                (stack2 + 0x4000) as u64,
-                0,
-            );
+            let t1 = syscall::thread_create(mutex_test_thread as u64, (stack1 + 0x4000) as u64, 0);
+            let t2 = syscall::thread_create(mutex_test_thread as u64, (stack2 + 0x4000) as u64, 0);
 
             if t1 != u64::MAX && t2 != u64::MAX {
                 syscall::thread_join(t1);
@@ -1119,9 +1194,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     recv_buf[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
                                 }
                                 // Compare with sent data.
-                                if recv_len == test_str.len()
-                                    && &recv_buf[..recv_len] == test_str
-                                {
+                                if recv_len == test_str.len() && &recv_buf[..recv_len] == test_str {
                                     tcp_ok = true;
                                 } else {
                                     syscall::debug_puts(b"  init: TCP echo mismatch, got ");
@@ -1164,7 +1237,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // spin_tid is the task port of the spawned process.
         if spin_tid != u64::MAX {
             // Let it run for a bit.
-            for _ in 0..50 { syscall::yield_now(); }
+            for _ in 0..50 {
+                syscall::yield_now();
+            }
 
             // Kill it.
             let killed = syscall::kill(spin_tid);
@@ -1231,7 +1306,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let mut cache_port_opt = None;
         for _ in 0..200 {
             cache_port_opt = syscall::ns_lookup(b"cache_blk");
-            if cache_port_opt.is_some() { break; }
+            if cache_port_opt.is_some() {
+                break;
+            }
             syscall::yield_now();
         }
 
@@ -1270,31 +1347,49 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                         // Step 1: Read sector 0 (offset 0) — cache miss, triggers read-ahead
                         // for the full 4K page (sectors 0-7).
-                        if !cache_read(0) { test_ok = false; }
+                        if !cache_read(0) {
+                            test_ok = false;
+                        }
 
                         // Step 2: Read sector 7 (offset 3584) — same 4K page, should hit
                         // due to read-ahead (tail packing).
-                        if !cache_read(3584) { test_ok = false; }
+                        if !cache_read(3584) {
+                            test_ok = false;
+                        }
 
                         // Query stats after read-ahead test.
                         let sd0 = cache_reply << 32;
                         syscall::send(cache_port, 0xC100, sd0, 0, 0, 0);
                         let (hits_after_readahead, misses_after_readahead) =
                             if let Some(sr) = syscall::recv_msg(cache_reply) {
-                                if sr.tag == 0xC101 { (sr.data[0], sr.data[1]) }
-                                else { test_ok = false; (0, 0) }
-                            } else { test_ok = false; (0, 0) };
+                                if sr.tag == 0xC101 {
+                                    (sr.data[0], sr.data[1])
+                                } else {
+                                    test_ok = false;
+                                    (0, 0)
+                                }
+                            } else {
+                                test_ok = false;
+                                (0, 0)
+                            };
 
                         // Read-ahead: first read = 1 miss, second read = 1 hit.
-                        if hits_after_readahead < 1 { test_ok = false; }
+                        if hits_after_readahead < 1 {
+                            test_ok = false;
+                        }
 
                         // Step 3: Read a few more distinct pages to verify
                         // page-level caching works across multiple entries.
                         for pg in 1..5u64 {
-                            if !cache_read(pg * 4096) { test_ok = false; break; }
+                            if !cache_read(pg * 4096) {
+                                test_ok = false;
+                                break;
+                            }
                         }
                         // Re-read page 1 — should hit.
-                        if !cache_read(4096) { test_ok = false; }
+                        if !cache_read(4096) {
+                            test_ok = false;
+                        }
 
                         // Query stats to get current counts.
                         syscall::send(cache_port, 0xC100, sd0, 0, 0, 0);
@@ -1302,11 +1397,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             if let Some(sr) = syscall::recv_msg(cache_reply) {
                                 if sr.tag == 0xC101 {
                                     (sr.data[0], sr.data[1], sr.data[2])
-                                } else { test_ok = false; (0, 0, 0) }
-                            } else { test_ok = false; (0, 0, 0) };
+                                } else {
+                                    test_ok = false;
+                                    (0, 0, 0)
+                                }
+                            } else {
+                                test_ok = false;
+                                (0, 0, 0)
+                            };
 
                         // Verify cache size = 128.
-                        if cache_size != 128 { test_ok = false; }
+                        if cache_size != 128 {
+                            test_ok = false;
+                        }
 
                         if test_ok {
                             cache_ok = true;
@@ -1385,7 +1488,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let t1 = syscall::get_cycles();
         let avg_cy = (t1 - t0) / 100;
         let freq = syscall::get_timer_freq();
-        let avg_us = if freq > 0 { avg_cy * 1_000_000 / freq } else { 0 };
+        let avg_us = if freq > 0 {
+            avg_cy * 1_000_000 / freq
+        } else {
+            0
+        };
         syscall::debug_puts(b"  init: L4 self-rtt: ");
         print_num(avg_cy);
         syscall::debug_puts(b" cy (~");
@@ -1409,7 +1516,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let cow_page = syscall::mmap_anon(0, 1, 1); // va=0 (kernel picks), 1 page, RW (prot=1)
         if let Some(cow_va) = cow_page {
             let ptr = cow_va as *mut u64;
-            unsafe { core::ptr::write_volatile(ptr, 0xDEAD_BEEF_CAFE_1234); }
+            unsafe {
+                core::ptr::write_volatile(ptr, 0xDEAD_BEEF_CAFE_1234);
+            }
 
             let pid = syscall::fork();
             if pid == 0 {
@@ -1417,7 +1526,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let val = unsafe { core::ptr::read_volatile(ptr) };
                 if val == 0xDEAD_BEEF_CAFE_1234 {
                     // Write to trigger COW fault — this should NOT affect parent.
-                    unsafe { core::ptr::write_volatile(ptr, 0x1111_2222_3333_4444); }
+                    unsafe {
+                        core::ptr::write_volatile(ptr, 0x1111_2222_3333_4444);
+                    }
                     // Verify our write took effect.
                     let val2 = unsafe { core::ptr::read_volatile(ptr) };
                     if val2 == 0x1111_2222_3333_4444 {
@@ -1530,7 +1641,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Touch every 4K page in the 2 MiB region to install all PTEs.
             for i in 0..512 {
                 let ptr = (base + i * 4096) as *mut u8;
-                unsafe { core::ptr::write_volatile(ptr, (i & 0xFF) as u8); }
+                unsafe {
+                    core::ptr::write_volatile(ptr, (i & 0xFF) as u8);
+                }
             }
 
             let promo_after = syscall::vm_stats(0);
@@ -1579,7 +1692,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Populate every 4K MMU page with a unique pattern.
             for i in 0..512u64 {
                 let ptr = (base + (i as usize) * 4096) as *mut u64;
-                unsafe { core::ptr::write_volatile(ptr, 0xC0FFEE_0000 | i); }
+                unsafe {
+                    core::ptr::write_volatile(ptr, 0xC0FFEE_0000 | i);
+                }
             }
 
             let pid = syscall::fork();
@@ -1589,7 +1704,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // reservation destination.
                 for i in 0..512u64 {
                     let ptr = (base + (i as usize) * 4096) as *mut u64;
-                    unsafe { core::ptr::write_volatile(ptr, 0xBEEF_0000 | i); }
+                    unsafe {
+                        core::ptr::write_volatile(ptr, 0xBEEF_0000 | i);
+                    }
                 }
                 // Verify child's writes.
                 let mut ok = true;
@@ -1669,7 +1786,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if let (Some(stacks), Some(cpage)) = (fiber_stacks, counter_page) {
             // Zero the counter.
             let counter_ptr = cpage as *mut u64;
-            unsafe { core::ptr::write_volatile(counter_ptr, 0); }
+            unsafe {
+                core::ptr::write_volatile(counter_ptr, 0);
+            }
 
             // Register scheduler activations.
             syscall::sa_register();
@@ -1707,7 +1826,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::thread_join(t2);
 
                     let final_count = unsafe { core::ptr::read_volatile(counter_ptr) };
-                    let completed = userlib::green::COMPLETED.load(core::sync::atomic::Ordering::Relaxed);
+                    let completed =
+                        userlib::green::COMPLETED.load(core::sync::atomic::Ordering::Relaxed);
 
                     if final_count == 800 && completed == 8 && main_sa_id != u64::MAX {
                         syscall::debug_puts(b"Phase 30 M:N green threads: PASSED\n");
@@ -1755,7 +1875,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     group,
                 );
                 tids[i as usize] = tid;
-                if tid == u64::MAX { ok = false; }
+                if tid == u64::MAX {
+                    ok = false;
+                }
             }
 
             if ok {
@@ -1789,35 +1911,42 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Step 1: Query topology for all CPUs.
         for cpu in 0..4u32 {
             if let Some((_pkg, _core, _smt, online, count)) = syscall::cpu_topology(cpu) {
-                if online { total_cpus += 1; }
-                if count < 1 { topo_ok = false; }
+                if online {
+                    total_cpus += 1;
+                }
+                if count < 1 {
+                    topo_ok = false;
+                }
             } else {
                 topo_ok = false;
             }
         }
 
         // Verify at least 1 CPU online.
-        if total_cpus < 1 { topo_ok = false; }
+        if total_cpus < 1 {
+            topo_ok = false;
+        }
 
         // Step 2: Test affinity - pin self to CPU 0.
         let my_tid = syscall::thread_id();
         let old_mask = syscall::get_affinity(my_tid);
         let set_ok = syscall::set_affinity(my_tid, 1); // Only CPU 0
-        if !set_ok { topo_ok = false; }
+        if !set_ok {
+            topo_ok = false;
+        }
 
         // Yield to let scheduler enforce.
-        for _ in 0..5 { syscall::yield_now(); }
+        for _ in 0..5 {
+            syscall::yield_now();
+        }
 
         // Restore full affinity.
         syscall::set_affinity(my_tid, old_mask);
 
         // Step 3: Test affinity on child thread.
         if let Some(stack_va) = syscall::mmap_anon(0, 1, 1) {
-            let child = syscall::thread_create(
-                affinity_test_worker as u64,
-                (stack_va + 0x4000) as u64,
-                0,
-            );
+            let child =
+                syscall::thread_create(affinity_test_worker as u64, (stack_va + 0x4000) as u64, 0);
             if child != u64::MAX {
                 // Pin child to CPU 0.
                 syscall::set_affinity(child, 1);
@@ -1845,7 +1974,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let mut cache_port_opt = None;
         for _ in 0..200 {
             cache_port_opt = syscall::ns_lookup(b"cache_blk");
-            if cache_port_opt.is_some() { break; }
+            if cache_port_opt.is_some() {
+                break;
+            }
             syscall::yield_now();
         }
 
@@ -1871,8 +2002,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             for i in 1..=4u64 {
                                 let offset = (i - 1) * 4096;
                                 if userlib::aio::aio_read(
-                                    cache_port, offset, 512, reply_port,
-                                    grant_va, i,
+                                    cache_port, offset, 512, reply_port, grant_va, i,
                                 ) {
                                     submitted += 1;
                                 }
@@ -1884,7 +2014,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             let mut attempts = 0u32;
                             while collected < submitted && attempts < 10000 {
                                 if let Some(result) = userlib::aio::aio_collect(reply_port) {
-                                    if result.tag == 0x201 && result.request_id >= 1
+                                    if result.tag == 0x201
+                                        && result.request_id >= 1
                                         && result.request_id <= 4
                                     {
                                         received[result.request_id as usize] = true;
@@ -1897,8 +2028,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             }
 
                             // Verify all 4 received.
-                            let all_received = received[1] && received[2]
-                                && received[3] && received[4];
+                            let all_received =
+                                received[1] && received[2] && received[3] && received[4];
 
                             // Barrier test.
                             let mut barrier_ok = false;
@@ -1949,14 +2080,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let send_after = syscall::vm_stats(15);
         let recv_after = syscall::vm_stats(16);
 
-        if sys_after <= sys_before { prof_ok = false; }
-        if send_after <= send_before { prof_ok = false; }
-        if recv_after <= recv_before { prof_ok = false; }
+        if sys_after <= sys_before {
+            prof_ok = false;
+        }
+        if send_after <= send_before {
+            prof_ok = false;
+        }
+        if recv_after <= recv_before {
+            prof_ok = false;
+        }
 
         // Verify newly exposed mm stats are accessible.
         let pages_zeroed = syscall::vm_stats(5);
         let ptes_installed = syscall::vm_stats(6);
-        if pages_zeroed == u64::MAX || ptes_installed == u64::MAX { prof_ok = false; }
+        if pages_zeroed == u64::MAX || ptes_installed == u64::MAX {
+            prof_ok = false;
+        }
 
         // Part B: Trace ring buffer.
         // Clear and enable.
@@ -1975,14 +2114,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Read trace entries.
         if let Some(trace_va) = syscall::mmap_anon(0, 1, 1) {
             let buf = unsafe {
-                core::slice::from_raw_parts_mut(
-                    trace_va as *mut userlib::profile::TraceEntry,
-                    64,
-                )
+                core::slice::from_raw_parts_mut(trace_va as *mut userlib::profile::TraceEntry, 64)
             };
             let count = userlib::profile::trace_read(buf);
 
-            if count == 0 { prof_ok = false; }
+            if count == 0 {
+                prof_ok = false;
+            }
 
             // Verify at least one SYSCALL_ENTER event.
             let mut found_syscall = false;
@@ -1992,7 +2130,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     break;
                 }
             }
-            if !found_syscall { prof_ok = false; }
+            if !found_syscall {
+                prof_ok = false;
+            }
 
             syscall::munmap(trace_va);
 
@@ -2036,7 +2176,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         // Give it time to start.
-        for _ in 0..50 { syscall::yield_now(); }
+        for _ in 0..50 {
+            syscall::yield_now();
+        }
 
         if sec_ok {
             let reply = syscall::port_create();
@@ -2047,10 +2189,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let cred_port;
             let cred_roles;
             if let Some(r) = syscall::recv_msg(reply) {
-                if r.tag == 0x701 { // SEC_LOGIN_OK
+                if r.tag == 0x701 {
+                    // SEC_LOGIN_OK
                     cred_port = r.data[0];
                     cred_roles = r.data[1];
-                    if cred_roles != 0x03 { // ADMIN|USER
+                    if cred_roles != 0x03 {
+                        // ADMIN|USER
                         syscall::debug_puts(b"  init: login roles wrong\n");
                         sec_ok = false;
                     }
@@ -2070,7 +2214,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Part B: Login with wrong password.
             syscall::send(sec_port, 0x700, 0x0001_0001, 0xBAD_0000, reply as u64, 0);
             if let Some(r) = syscall::recv_msg(reply) {
-                if r.tag != 0x702 { // SEC_LOGIN_FAIL
+                if r.tag != 0x702 {
+                    // SEC_LOGIN_FAIL
                     syscall::debug_puts(b"  init: bad login not rejected\n");
                     sec_ok = false;
                 }
@@ -2082,7 +2227,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Part C: Verify credential.
                 syscall::send(sec_port, 0x703, cred_port, 0, reply as u64, 0);
                 if let Some(r) = syscall::recv_msg(reply) {
-                    if r.tag == 0x704 { // SEC_VERIFY_OK
+                    if r.tag == 0x704 {
+                        // SEC_VERIFY_OK
                         if r.data[1] != cred_roles || r.data[2] != 0x0001_0001 {
                             syscall::debug_puts(b"  init: verify data mismatch\n");
                             sec_ok = false;
@@ -2098,7 +2244,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Part D: Revoke credential.
                 syscall::send(sec_port, 0x706, cred_port, 0, reply as u64, 0);
                 if let Some(r) = syscall::recv_msg(reply) {
-                    if r.tag != 0x707 { // SEC_REVOKE_OK
+                    if r.tag != 0x707 {
+                        // SEC_REVOKE_OK
                         syscall::debug_puts(b"  init: revoke failed\n");
                         sec_ok = false;
                     }
@@ -2109,7 +2256,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Part E: Verify after revoke should fail.
                 syscall::send(sec_port, 0x703, cred_port, 0, reply as u64, 0);
                 if let Some(r) = syscall::recv_msg(reply) {
-                    if r.tag != 0x705 { // SEC_VERIFY_FAIL
+                    if r.tag != 0x705 {
+                        // SEC_VERIFY_FAIL
                         syscall::debug_puts(b"  init: verify after revoke not denied\n");
                         sec_ok = false;
                     }
@@ -2139,12 +2287,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let va = syscall::mmap_anon(0, 1, 1);
         if let Some(va) = va {
             // Touch first sub-page (triggers major fault; may use pre-zeroed page).
-            unsafe { core::ptr::write_volatile(va as *mut u8, 0x42); }
+            unsafe {
+                core::ptr::write_volatile(va as *mut u8, 0x42);
+            }
 
             // Touch remaining 15 sub-pages.
             for i in 1..16u64 {
                 let ptr = (va + (i as usize) * 4096) as *mut u8;
-                unsafe { core::ptr::write_volatile(ptr, 0x42); }
+                unsafe {
+                    core::ptr::write_volatile(ptr, 0x42);
+                }
             }
 
             let prezeroed_after = syscall::vm_stats(17);
@@ -2186,7 +2338,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Step 1: Read initial topology — should have 4 online CPUs.
         let initial = syscall::cpu_topology(0);
-        let initial_count = if let Some((_, _, _, _, count)) = initial { count } else { 0 };
+        let initial_count = if let Some((_, _, _, _, count)) = initial {
+            count
+        } else {
+            0
+        };
 
         if initial_count < 2 {
             syscall::debug_puts(b"    need >= 2 CPUs, skipping\n");
@@ -2298,7 +2454,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     found = Some(p);
                     break;
                 }
-                for _ in 0..50 { syscall::yield_now(); }
+                for _ in 0..50 {
+                    syscall::yield_now();
+                }
             }
             found
         };
@@ -2313,7 +2471,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::send(ext2_port, 0x2000, n0, n1, d2, 0);
             }
 
-            let (handle, file_size, fs_aspace) = if let Some(reply) = syscall::recv_msg(reply_port) {
+            let (handle, file_size, fs_aspace) = if let Some(reply) = syscall::recv_msg(reply_port)
+            {
                 if reply.tag == 0x2001 {
                     (reply.data[0], reply.data[1], reply.data[2])
                 } else {
@@ -2351,7 +2510,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             content[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
                         }
                         if bytes_read == expected.len() && &content[..bytes_read] == expected {
-                            syscall::debug_puts(b"    ext2 read hello.txt: OK (\"Hello from ext2!\")\n");
+                            syscall::debug_puts(
+                                b"    ext2 read hello.txt: OK (\"Hello from ext2!\")\n",
+                            );
                         } else {
                             syscall::debug_puts(b"    ext2 read hello.txt: content mismatch\n");
                             ext2_ok = false;
@@ -2381,7 +2542,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             ext2_ok = false;
                         }
                         if mode != 0o100644 {
-                            syscall::debug_puts(b"    ext2 stat: mode mismatch (expected 0100644, got ");
+                            syscall::debug_puts(
+                                b"    ext2 stat: mode mismatch (expected 0100644, got ",
+                            );
                             print_num(mode as u64);
                             syscall::debug_puts(b")\n");
                             ext2_ok = false;
@@ -2597,20 +2760,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Yield to let any exited children fully clean up (aspace destruction
         // happens after task.exited is set, so waitpid returns before aspace is freed).
-        for _ in 0..50 { syscall::yield_now(); }
+        for _ in 0..50 {
+            syscall::yield_now();
+        }
 
         // Test pgroup kill: fork one child, put in own group, kill group.
         let child1 = syscall::fork();
         if child1 == 0 {
             // Child: spin.
-            loop { syscall::yield_now(); }
+            loop {
+                syscall::yield_now();
+            }
         }
 
         if child1 > 0 && child1 != u64::MAX {
             // Put child in its own process group.
             syscall::setpgid(child1, child1);
 
-            for _ in 0..10 { syscall::yield_now(); }
+            for _ in 0..10 {
+                syscall::yield_now();
+            }
 
             // Kill the group.
             syscall::kill_pgroup(child1, syscall::SIGKILL);
@@ -2647,12 +2816,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let mut phase42_ok = true;
 
         // Test mprotect: allocate RW page, write to it, change to RO, verify data survives.
-        if let Some(va) = syscall::mmap_anon(0, 1, 1) { // 1 page, RW
+        if let Some(va) = syscall::mmap_anon(0, 1, 1) {
+            // 1 page, RW
             let page_size = 0x10000usize; // PAGE_SIZE = 64K
-            let mmu_page = 0x1000usize;   // MMUPAGE_SIZE = 4K
+            let mmu_page = 0x1000usize; // MMUPAGE_SIZE = 4K
 
             // Write a known value.
-            unsafe { core::ptr::write_volatile(va as *mut u64, 0xDEAD_BEEF); }
+            unsafe {
+                core::ptr::write_volatile(va as *mut u64, 0xDEAD_BEEF);
+            }
 
             // Change protection to RO.
             if !syscall::mprotect(va, page_size, 0) {
@@ -2674,7 +2846,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             // Write after re-enabling RW.
-            unsafe { core::ptr::write_volatile(va as *mut u64, 0xCAFE_BABE); }
+            unsafe {
+                core::ptr::write_volatile(va as *mut u64, 0xCAFE_BABE);
+            }
             let val2 = unsafe { core::ptr::read_volatile(va as *const u64) };
             if val2 != 0xCAFE_BABE {
                 syscall::debug_puts(b"  init: mprotect write-after-RW failed\n");
@@ -2697,7 +2871,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // Write to second MMU page (still RW) should work.
             let second_page = (va + mmu_page) as *mut u64;
-            unsafe { core::ptr::write_volatile(second_page, 0x1234_5678); }
+            unsafe {
+                core::ptr::write_volatile(second_page, 0x1234_5678);
+            }
             let val4 = unsafe { core::ptr::read_volatile(second_page as *const u64) };
             if val4 != 0x1234_5678 {
                 syscall::debug_puts(b"  init: mprotect second page RW failed\n");
@@ -2716,7 +2892,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let page_size = 0x10000usize;
 
             // Write a sentinel.
-            unsafe { core::ptr::write_volatile(va as *mut u64, 0xAAAA_BBBB); }
+            unsafe {
+                core::ptr::write_volatile(va as *mut u64, 0xAAAA_BBBB);
+            }
 
             // Grow from 1 page to 2 pages.
             if let Some(new_va) = syscall::mremap(va, page_size, page_size * 2) {
@@ -2734,7 +2912,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 // Write to new region.
                 let new_region = (new_va + page_size) as *mut u64;
-                unsafe { core::ptr::write_volatile(new_region, 0xCCCC_DDDD); }
+                unsafe {
+                    core::ptr::write_volatile(new_region, 0xCCCC_DDDD);
+                }
                 let val2 = unsafe { core::ptr::read_volatile(new_region as *const u64) };
                 if val2 != 0xCCCC_DDDD {
                     syscall::debug_puts(b"  init: mremap new region write failed\n");
@@ -2783,7 +2963,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             phase44_ok = false;
         }
         // Burn a little time.
-        for _ in 0..10_000 { unsafe { core::arch::asm!(""); } }
+        for _ in 0..10_000 {
+            unsafe {
+                core::arch::asm!("");
+            }
+        }
         let t1 = syscall::clock_gettime();
         if t1 <= t0 {
             syscall::debug_puts(b"  init: clock not monotonic\n");
@@ -2855,11 +3039,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let pager_stack_top = pager_stack + 0x4000;
 
             // Spawn pager thread.
-            let pager_tid = syscall::thread_create(
-                pager_thread_entry as u64,
-                pager_stack_top as u64,
-                0,
-            );
+            let pager_tid =
+                syscall::thread_create(pager_thread_entry as u64, pager_stack_top as u64, 0);
             if pager_tid == u64::MAX {
                 syscall::debug_puts(b"  FAIL: cannot create pager thread\n");
                 phase45_ok = false;
@@ -2936,7 +3117,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         if phase46_ok {
             // Give shm_srv time to start.
-            for _ in 0..100 { syscall::yield_now(); }
+            for _ in 0..100 {
+                syscall::yield_now();
+            }
 
             let my_aspace = syscall::aspace_id();
 
@@ -3067,7 +3250,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         userlib::fd::fd_init(dummy_console);
 
         // FDs 0, 1, 2 should be open after init.
-        if !userlib::fd::fd_is_valid(0) || !userlib::fd::fd_is_valid(1) || !userlib::fd::fd_is_valid(2) {
+        if !userlib::fd::fd_is_valid(0)
+            || !userlib::fd::fd_is_valid(1)
+            || !userlib::fd::fd_is_valid(2)
+        {
             syscall::debug_puts(b"  FAIL: FDs 0/1/2 not valid after fd_init\n");
             phase47_ok = false;
         }
@@ -3524,7 +3710,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let child2 = syscall::spawn(b"hello", 50);
             if child2 != u64::MAX {
                 // Yield a few times to let child run and exit.
-                for _ in 0..20 { syscall::yield_now(); }
+                for _ in 0..20 {
+                    syscall::yield_now();
+                }
                 // The child_tid is a thread ID. We need the task ID for wait4.
                 // In our kernel, wait4 matches by task_id. The thread's task_id
                 // may differ from the thread_id. For spawned tasks, the task_id
@@ -3637,7 +3825,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase50_ok {
             let sentinel = syscall::RLIM_INFINITY - 1;
             // Get current without changing (sentinel = don't change).
-            if let Some((old_cur, old_max)) = syscall::prlimit(0, syscall::RLIMIT_STACK, sentinel, sentinel) {
+            if let Some((old_cur, old_max)) =
+                syscall::prlimit(0, syscall::RLIMIT_STACK, sentinel, sentinel)
+            {
                 if old_cur != 65536 || old_max != 1048576 {
                     syscall::debug_puts(b"  FAIL: prlimit RLIMIT_STACK defaults wrong\n");
                     phase50_ok = false;
@@ -3651,7 +3841,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Test 4: prlimit to change soft, verify old returned.
         if phase50_ok {
             let sentinel = syscall::RLIM_INFINITY - 1;
-            if let Some((old_cur, _old_max)) = syscall::prlimit(0, syscall::RLIMIT_STACK, 32768, sentinel) {
+            if let Some((old_cur, _old_max)) =
+                syscall::prlimit(0, syscall::RLIMIT_STACK, 32768, sentinel)
+            {
                 if old_cur != 65536 {
                     syscall::debug_puts(b"  FAIL: prlimit didn't return old soft\n");
                     phase50_ok = false;
@@ -3702,7 +3894,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     phase50_ok = false;
                     // Still reap the child.
                     loop {
-                        if let Some(_) = syscall::waitpid(child) { break; }
+                        if let Some(_) = syscall::waitpid(child) {
+                            break;
+                        }
                         syscall::yield_now();
                     }
                 }
@@ -3767,7 +3961,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 phase51_ok = false;
             }
             found
-        } else { 0 };
+        } else {
+            0
+        };
 
         // Look up ext2 port for mounting.
         let ext2_port = if phase51_ok {
@@ -3779,7 +3975,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     0
                 }
             }
-        } else { 0 };
+        } else {
+            0
+        };
 
         // Look up fat16 port.
         let fat16_port = if phase51_ok {
@@ -3790,7 +3988,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     0
                 }
             }
-        } else { 0 };
+        } else {
+            0
+        };
 
         // Test 1: Mount ext2 on "/".
         // VFS wire: data[0..1]=path(16B), data[2]=path_len(16)|reply(32), data[3]=fs_port
@@ -3946,7 +4146,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::yield_now();
             }
         } else {
-            syscall::debug_puts(b"Phase 52 musl-libc C binary: SKIPPED (no hello_c in initramfs)\n");
+            syscall::debug_puts(
+                b"Phase 52 musl-libc C binary: SKIPPED (no hello_c in initramfs)\n",
+            );
         }
     }
 
@@ -3962,7 +4164,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 53 ext2 write: SKIPPED (no ext2)\n");
         }
 
-        let reply_port = if phase53_ok { syscall::port_create() } else { 0 };
+        let reply_port = if phase53_ok {
+            syscall::port_create()
+        } else {
+            0
+        };
 
         // Step 1: FS_CREATE "WTEST.TXT"
         let mut handle = 0u64;
@@ -4063,18 +4269,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                             }
                                         }
                                         if mismatch {
-                                            syscall::debug_puts(b"  FAIL: ext2 read-back mismatch\n");
+                                            syscall::debug_puts(
+                                                b"  FAIL: ext2 read-back mismatch\n",
+                                            );
                                             phase53_ok = false;
                                         }
                                     } else {
                                         syscall::debug_puts(b"  FAIL: ext2 FS_READ bad reply\n");
                                         phase53_ok = false;
                                     }
-                                } else { phase53_ok = false; }
+                                } else {
+                                    phase53_ok = false;
+                                }
                                 syscall::revoke(r_aspace, grant_dst);
-                            } else { phase53_ok = false; }
+                            } else {
+                                phase53_ok = false;
+                            }
                             syscall::munmap(scratch);
-                        } else { phase53_ok = false; }
+                        } else {
+                            phase53_ok = false;
+                        }
                     }
 
                     // Close the re-opened file.
@@ -4083,7 +4297,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: ext2 re-open not found\n");
                     phase53_ok = false;
                 }
-            } else { phase53_ok = false; }
+            } else {
+                phase53_ok = false;
+            }
         }
 
         // Step 5: FS_DELETE "WTEST.TXT"
@@ -4097,7 +4313,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: ext2 FS_DELETE failed\n");
                     phase53_ok = false;
                 }
-            } else { phase53_ok = false; }
+            } else {
+                phase53_ok = false;
+            }
         }
 
         // Step 6: Verify file is gone
@@ -4132,10 +4350,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: ext2 hello.txt corrupted\n");
                     phase53_ok = false;
                 }
-            } else { phase53_ok = false; }
+            } else {
+                phase53_ok = false;
+            }
         }
 
-        if reply_port != 0 { syscall::port_destroy(reply_port); }
+        if reply_port != 0 {
+            syscall::port_destroy(reply_port);
+        }
 
         if phase53_ok {
             syscall::debug_puts(b"Phase 53 ext2 write: PASSED\n");
@@ -4169,9 +4391,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 phase54_ok = false;
             }
             found
-        } else { 0 };
+        } else {
+            0
+        };
 
-        let rp = if phase54_ok { syscall::port_create() } else { 0 };
+        let rp = if phase54_ok {
+            syscall::port_create()
+        } else {
+            0
+        };
 
         // Step 1: FS_CREATE "test.txt"
         let mut handle = 0u64;
@@ -4189,7 +4417,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: tmpfs CREATE failed\n");
                     phase54_ok = false;
                 }
-            } else { phase54_ok = false; }
+            } else {
+                phase54_ok = false;
+            }
         }
 
         // Step 2: FS_WRITE 48 bytes of pattern
@@ -4210,11 +4440,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             syscall::debug_puts(b"  FAIL: tmpfs WRITE bad reply\n");
                             phase54_ok = false;
                         }
-                    } else { phase54_ok = false; }
+                    } else {
+                        phase54_ok = false;
+                    }
                     syscall::revoke(srv_aspace, grant_dst);
-                } else { phase54_ok = false; }
+                } else {
+                    phase54_ok = false;
+                }
                 syscall::munmap(scratch);
-            } else { phase54_ok = false; }
+            } else {
+                phase54_ok = false;
+            }
         }
 
         // Step 3: FS_CLOSE
@@ -4250,7 +4486,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                         for i in 0..48 {
                                             let expected = ((i * 13 + 0x30) & 0xFF) as u8;
                                             if unsafe { *p.add(i) } != expected {
-                                                syscall::debug_puts(b"  FAIL: tmpfs read mismatch\n");
+                                                syscall::debug_puts(
+                                                    b"  FAIL: tmpfs read mismatch\n",
+                                                );
                                                 phase54_ok = false;
                                                 break;
                                             }
@@ -4259,18 +4497,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                         syscall::debug_puts(b"  FAIL: tmpfs READ bad\n");
                                         phase54_ok = false;
                                     }
-                                } else { phase54_ok = false; }
+                                } else {
+                                    phase54_ok = false;
+                                }
                                 syscall::revoke(r_aspace, grant_dst);
-                            } else { phase54_ok = false; }
+                            } else {
+                                phase54_ok = false;
+                            }
                             syscall::munmap(scratch);
-                        } else { phase54_ok = false; }
+                        } else {
+                            phase54_ok = false;
+                        }
                     }
                     syscall::send(tmpfs_port, 0x2400, rh, 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  FAIL: tmpfs re-open not found\n");
                     phase54_ok = false;
                 }
-            } else { phase54_ok = false; }
+            } else {
+                phase54_ok = false;
+            }
         }
 
         // Step 5: Create second file "other.txt"
@@ -4286,7 +4532,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: tmpfs CREATE other\n");
                     phase54_ok = false;
                 }
-            } else { phase54_ok = false; }
+            } else {
+                phase54_ok = false;
+            }
         }
 
         // Step 6: FS_READDIR — verify both files appear
@@ -4302,7 +4550,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     } else {
                         break; // READDIR_END
                     }
-                } else { break; }
+                } else {
+                    break;
+                }
             }
             if count != 2 {
                 syscall::debug_puts(b"  FAIL: tmpfs readdir count\n");
@@ -4321,7 +4571,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: tmpfs DELETE failed\n");
                     phase54_ok = false;
                 }
-            } else { phase54_ok = false; }
+            } else {
+                phase54_ok = false;
+            }
         }
 
         // Step 8: Verify "test.txt" is gone
@@ -4349,8 +4601,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     if reply.tag == 0x2201 {
                         count += 1;
                         next = reply.data[3];
-                    } else { break; }
-                } else { break; }
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
             if count != 1 {
                 syscall::debug_puts(b"  FAIL: tmpfs readdir after delete\n");
@@ -4367,7 +4623,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::recv_msg(rp);
         }
 
-        if rp != 0 { syscall::port_destroy(rp); }
+        if rp != 0 {
+            syscall::port_destroy(rp);
+        }
 
         if phase54_ok {
             syscall::debug_puts(b"Phase 54 tmpfs: PASSED\n");
@@ -4401,9 +4659,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 phase55_ok = false;
             }
             found
-        } else { 0 };
+        } else {
+            0
+        };
 
-        let rp = if phase55_ok { syscall::port_create() } else { 0 };
+        let rp = if phase55_ok {
+            syscall::port_create()
+        } else {
+            0
+        };
 
         // Test 1: /dev/null — write succeeds, read returns EOF
         if phase55_ok {
@@ -4412,31 +4676,40 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(devfs_port, 0x2000, fn0, fn1, d2, 0); // FS_OPEN
             if let Some(reply) = syscall::recv_msg(rp) {
-                if reply.tag == 0x2001 { // FS_OPEN_OK
+                if reply.tag == 0x2001 {
+                    // FS_OPEN_OK
                     let h = reply.data[0];
 
                     // Write 16 bytes — should succeed (discard).
                     let wd1 = (16u64) | (rp << 32);
                     syscall::send(devfs_port, 0x2600, h, wd1, 0, 0); // FS_WRITE
                     if let Some(wr) = syscall::recv_msg(rp) {
-                        if wr.tag != 0x2601 { // FS_WRITE_OK
+                        if wr.tag != 0x2601 {
+                            // FS_WRITE_OK
                             syscall::debug_puts(b"  FAIL: devfs null write\n");
                             phase55_ok = false;
                         }
-                    } else { phase55_ok = false; }
+                    } else {
+                        phase55_ok = false;
+                    }
 
                     // Read — should return 0 bytes (EOF).
                     if phase55_ok {
                         let rd2 = (8u64) | (rp << 32);
                         syscall::send(devfs_port, 0x2100, h, 0, rd2, 0); // FS_READ
                         if let Some(rr) = syscall::recv_msg(rp) {
-                            if rr.tag == 0x2101 { // FS_READ_OK
+                            if rr.tag == 0x2101 {
+                                // FS_READ_OK
                                 if rr.data[0] != 0 {
                                     syscall::debug_puts(b"  FAIL: devfs null read not EOF\n");
                                     phase55_ok = false;
                                 }
-                            } else { phase55_ok = false; }
-                        } else { phase55_ok = false; }
+                            } else {
+                                phase55_ok = false;
+                            }
+                        } else {
+                            phase55_ok = false;
+                        }
                     }
 
                     // Close.
@@ -4445,7 +4718,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: devfs open null\n");
                     phase55_ok = false;
                 }
-            } else { phase55_ok = false; }
+            } else {
+                phase55_ok = false;
+            }
         }
 
         // Test 2: /dev/zero — read returns all zeros
@@ -4472,15 +4747,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 syscall::debug_puts(b"  FAIL: devfs zero not zeros\n");
                                 phase55_ok = false;
                             }
-                        } else { phase55_ok = false; }
-                    } else { phase55_ok = false; }
+                        } else {
+                            phase55_ok = false;
+                        }
+                    } else {
+                        phase55_ok = false;
+                    }
 
                     syscall::send(devfs_port, 0x2400, h, 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  FAIL: devfs open zero\n");
                     phase55_ok = false;
                 }
-            } else { phase55_ok = false; }
+            } else {
+                phase55_ok = false;
+            }
         }
 
         // Test 3: /dev/full — write returns error, read returns zeros
@@ -4497,11 +4778,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     let wd1 = (16u64) | (rp << 32);
                     syscall::send(devfs_port, 0x2600, h, wd1, 0, 0);
                     if let Some(wr) = syscall::recv_msg(rp) {
-                        if wr.tag != 0x2F00 { // FS_ERROR
+                        if wr.tag != 0x2F00 {
+                            // FS_ERROR
                             syscall::debug_puts(b"  FAIL: devfs full write should fail\n");
                             phase55_ok = false;
                         }
-                    } else { phase55_ok = false; }
+                    } else {
+                        phase55_ok = false;
+                    }
 
                     // Read should return zeros.
                     if phase55_ok {
@@ -4515,8 +4799,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     syscall::debug_puts(b"  FAIL: devfs full read not zeros\n");
                                     phase55_ok = false;
                                 }
-                            } else { phase55_ok = false; }
-                        } else { phase55_ok = false; }
+                            } else {
+                                phase55_ok = false;
+                            }
+                        } else {
+                            phase55_ok = false;
+                        }
                     }
 
                     syscall::send(devfs_port, 0x2400, h, 0, 0, 0);
@@ -4524,7 +4812,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: devfs open full\n");
                     phase55_ok = false;
                 }
-            } else { phase55_ok = false; }
+            } else {
+                phase55_ok = false;
+            }
         }
 
         // Test 4: /dev/random — read returns non-zero data
@@ -4551,15 +4841,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 syscall::debug_puts(b"  FAIL: devfs random all zeros\n");
                                 phase55_ok = false;
                             }
-                        } else { phase55_ok = false; }
-                    } else { phase55_ok = false; }
+                        } else {
+                            phase55_ok = false;
+                        }
+                    } else {
+                        phase55_ok = false;
+                    }
 
                     syscall::send(devfs_port, 0x2400, h, 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  FAIL: devfs open random\n");
                     phase55_ok = false;
                 }
-            } else { phase55_ok = false; }
+            } else {
+                phase55_ok = false;
+            }
         }
 
         // Test 5: READDIR — should see >= 7 entries
@@ -4570,13 +4866,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let d2 = rp;
                 syscall::send(devfs_port, 0x2200, next_off, 0, d2, 0); // FS_READDIR
                 if let Some(rr) = syscall::recv_msg(rp) {
-                    if rr.tag == 0x2201 { // FS_READDIR_OK
+                    if rr.tag == 0x2201 {
+                        // FS_READDIR_OK
                         count += 1;
                         next_off = rr.data[3]; // next offset
                     } else {
                         break; // FS_READDIR_END
                     }
-                } else { break; }
+                } else {
+                    break;
+                }
             }
             if count < 7 {
                 syscall::debug_puts(b"  FAIL: devfs readdir < 7\n");
@@ -4616,9 +4915,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 phase56_ok = false;
             }
             found
-        } else { 0 };
+        } else {
+            0
+        };
 
-        let rp = if phase56_ok { syscall::port_create() } else { 0 };
+        let rp = if phase56_ok {
+            syscall::port_create()
+        } else {
+            0
+        };
 
         // Test 1: open "meminfo", read, verify non-empty
         if phase56_ok {
@@ -4627,14 +4932,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let d2 = (fname.len() as u64) | (rp << 32);
             syscall::send(procfs_port, 0x2000, fn0, fn1, d2, 0); // FS_OPEN
             if let Some(reply) = syscall::recv_msg(rp) {
-                if reply.tag == 0x2001 { // FS_OPEN_OK
+                if reply.tag == 0x2001 {
+                    // FS_OPEN_OK
                     let h = reply.data[0];
 
                     // Read inline.
                     let rd2 = (24u64) | (rp << 32);
                     syscall::send(procfs_port, 0x2100, h, 0, rd2, 0); // FS_READ
                     if let Some(rr) = syscall::recv_msg(rp) {
-                        if rr.tag == 0x2101 { // FS_READ_OK
+                        if rr.tag == 0x2101 {
+                            // FS_READ_OK
                             let len = rr.data[0] as usize;
                             if len == 0 {
                                 syscall::debug_puts(b"  FAIL: procfs meminfo empty\n");
@@ -4648,15 +4955,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     phase56_ok = false;
                                 }
                             }
-                        } else { phase56_ok = false; }
-                    } else { phase56_ok = false; }
+                        } else {
+                            phase56_ok = false;
+                        }
+                    } else {
+                        phase56_ok = false;
+                    }
 
                     syscall::send(procfs_port, 0x2400, h, 0, 0, 0); // FS_CLOSE
                 } else {
                     syscall::debug_puts(b"  FAIL: procfs open meminfo\n");
                     phase56_ok = false;
                 }
-            } else { phase56_ok = false; }
+            } else {
+                phase56_ok = false;
+            }
         }
 
         // Test 2: open "1/status" (task 1 = init), read, verify "Pid:" prefix
@@ -4690,15 +5003,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     phase56_ok = false;
                                 }
                             }
-                        } else { phase56_ok = false; }
-                    } else { phase56_ok = false; }
+                        } else {
+                            phase56_ok = false;
+                        }
+                    } else {
+                        phase56_ok = false;
+                    }
 
                     syscall::send(procfs_port, 0x2400, h, 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  FAIL: procfs open 1/status\n");
                     phase56_ok = false;
                 }
-            } else { phase56_ok = false; }
+            } else {
+                phase56_ok = false;
+            }
         }
 
         // Test 3: open "uptime", read, verify non-zero
@@ -4728,15 +5047,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     phase56_ok = false;
                                 }
                             }
-                        } else { phase56_ok = false; }
-                    } else { phase56_ok = false; }
+                        } else {
+                            phase56_ok = false;
+                        }
+                    } else {
+                        phase56_ok = false;
+                    }
 
                     syscall::send(procfs_port, 0x2400, h, 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  FAIL: procfs open uptime\n");
                     phase56_ok = false;
                 }
-            } else { phase56_ok = false; }
+            } else {
+                phase56_ok = false;
+            }
         }
 
         // Test 4: READDIR — should see >= 3 entries (meminfo, uptime, at least 1 PID)
@@ -4747,13 +5072,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let d2 = rp;
                 syscall::send(procfs_port, 0x2200, next_off, 0, d2, 0); // FS_READDIR
                 if let Some(rr) = syscall::recv_msg(rp) {
-                    if rr.tag == 0x2201 { // FS_READDIR_OK
+                    if rr.tag == 0x2201 {
+                        // FS_READDIR_OK
                         count += 1;
                         next_off = rr.data[3]; // next offset
                     } else {
                         break; // FS_READDIR_END
                     }
-                } else { break; }
+                } else {
+                    break;
+                }
             }
             if count < 3 {
                 syscall::debug_puts(b"  FAIL: procfs readdir < 3\n");
@@ -5073,7 +5401,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     0
                 }
             };
-            if uds_port == 0 { ok = false; }
+            if uds_port == 0 {
+                ok = false;
+            }
 
             let rp = syscall::port_create();
 
@@ -5099,8 +5429,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let d2 = rp << 32;
                 syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag == UDS_OK { srv_h = m.data[0]; }
-                    else { ok = false; syscall::debug_puts(b"  FAIL58: socket\n"); }
+                    if m.tag == UDS_OK {
+                        srv_h = m.data[0];
+                    } else {
+                        ok = false;
+                        syscall::debug_puts(b"  FAIL58: socket\n");
+                    }
                 }
             }
 
@@ -5110,7 +5444,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let d2 = 8u64 | (rp << 32);
                 syscall::send(uds_port, UDS_BIND, srv_h, n0, d2, n1);
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag != UDS_OK { ok = false; syscall::debug_puts(b"  FAIL58: bind\n"); }
+                    if m.tag != UDS_OK {
+                        ok = false;
+                        syscall::debug_puts(b"  FAIL58: bind\n");
+                    }
                 }
             }
 
@@ -5119,7 +5456,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let d2 = rp << 32;
                 syscall::send(uds_port, UDS_LISTEN, srv_h, 4, d2, 0);
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag != UDS_OK { ok = false; syscall::debug_puts(b"  FAIL58: listen\n"); }
+                    if m.tag != UDS_OK {
+                        ok = false;
+                        syscall::debug_puts(b"  FAIL58: listen\n");
+                    }
                 }
             }
 
@@ -5132,8 +5472,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let uid = syscall::getuid() as u64;
                 syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, pid | (uid << 32));
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag == UDS_OK { cli_h = m.data[0]; }
-                    else { ok = false; syscall::debug_puts(b"  FAIL58: connect\n"); }
+                    if m.tag == UDS_OK {
+                        cli_h = m.data[0];
+                    } else {
+                        ok = false;
+                        syscall::debug_puts(b"  FAIL58: connect\n");
+                    }
                 }
             }
 
@@ -5143,8 +5487,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let d2 = rp << 32;
                 syscall::send(uds_port, UDS_ACCEPT, srv_h, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag == UDS_OK { acc_h = m.data[0]; }
-                    else { ok = false; syscall::debug_puts(b"  FAIL58: accept\n"); }
+                    if m.tag == UDS_OK {
+                        acc_h = m.data[0];
+                    } else {
+                        ok = false;
+                        syscall::debug_puts(b"  FAIL58: accept\n");
+                    }
                 }
             }
 
@@ -5154,7 +5502,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let d2 = 2u64 | (rp << 32);
                 syscall::send(uds_port, UDS_SEND, cli_h, w0, d2, w1);
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag != UDS_OK { ok = false; }
+                    if m.tag != UDS_OK {
+                        ok = false;
+                    }
                 }
             }
             if ok {
@@ -5174,7 +5524,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let d2 = 2u64 | (rp << 32);
                 syscall::send(uds_port, UDS_SEND, acc_h, w0, d2, w1);
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag != UDS_OK { ok = false; }
+                    if m.tag != UDS_OK {
+                        ok = false;
+                    }
                 }
             }
             if ok {
@@ -5216,16 +5568,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let pid = syscall::getpid();
                 syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, pid);
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag == UDS_OK { cli2 = m.data[0]; }
-                    else { ok = false; }
+                    if m.tag == UDS_OK {
+                        cli2 = m.data[0];
+                    } else {
+                        ok = false;
+                    }
                 }
             }
             if ok {
                 let d2 = rp << 32;
                 syscall::send(uds_port, UDS_ACCEPT, srv_h, 0, d2, 0);
                 if let Some(m) = syscall::recv_msg(rp) {
-                    if m.tag == UDS_OK { acc2 = m.data[0]; }
-                    else { ok = false; }
+                    if m.tag == UDS_OK {
+                        acc2 = m.data[0];
+                    } else {
+                        ok = false;
+                    }
                 }
             }
             // Send 16 bytes "ABCDEFGHIJKLMNOP"
@@ -5396,8 +5754,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 userlib::pipe::pipe_close_fd(read_fd);
             } else {
                 // Clean up FDs on failure.
-                if write_fd >= 0 { userlib::pipe::pipe_close_fd(write_fd); }
-                if read_fd >= 0 { userlib::pipe::pipe_close_fd(read_fd); }
+                if write_fd >= 0 {
+                    userlib::pipe::pipe_close_fd(write_fd);
+                }
+                if read_fd >= 0 {
+                    userlib::pipe::pipe_close_fd(read_fd);
+                }
             }
 
             if phase59_ok {
@@ -5426,7 +5788,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // 2. poll read end with no data, timeout=0 → should return 0 ready FDs.
         if phase60_ok {
-            let mut fds = [userlib::poll::PollFd { fd: read_fd, events: userlib::poll::POLLIN, revents: 0 }];
+            let mut fds = [userlib::poll::PollFd {
+                fd: read_fd,
+                events: userlib::poll::POLLIN,
+                revents: 0,
+            }];
             let n = userlib::poll::poll(&mut fds, 0);
             if n != 0 || fds[0].revents != 0 {
                 syscall::debug_puts(b"  FAIL: poll empty pipe returned ready\n");
@@ -5437,7 +5803,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // 3. Write data, poll read end → should return POLLIN.
         if phase60_ok {
             userlib::pipe::pipe_write_fd(write_fd, b"polltest");
-            let mut fds = [userlib::poll::PollFd { fd: read_fd, events: userlib::poll::POLLIN, revents: 0 }];
+            let mut fds = [userlib::poll::PollFd {
+                fd: read_fd,
+                events: userlib::poll::POLLIN,
+                revents: 0,
+            }];
             let n = userlib::poll::poll(&mut fds, 0);
             if n != 1 || fds[0].revents & userlib::poll::POLLIN == 0 {
                 syscall::debug_puts(b"  FAIL: poll after write not POLLIN\n");
@@ -5447,7 +5817,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // 4. poll write end → should return POLLOUT (buffer has space).
         if phase60_ok {
-            let mut fds = [userlib::poll::PollFd { fd: write_fd, events: userlib::poll::POLLOUT, revents: 0 }];
+            let mut fds = [userlib::poll::PollFd {
+                fd: write_fd,
+                events: userlib::poll::POLLOUT,
+                revents: 0,
+            }];
             let n = userlib::poll::poll(&mut fds, 0);
             if n != 1 || fds[0].revents & userlib::poll::POLLOUT == 0 {
                 syscall::debug_puts(b"  FAIL: poll write end not POLLOUT\n");
@@ -5461,7 +5835,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Drain remaining data (writer closed, so read won't block forever).
             let mut buf = [0u8; 32];
             while userlib::pipe::pipe_read_fd(read_fd, &mut buf) > 0 {}
-            let mut fds = [userlib::poll::PollFd { fd: read_fd, events: userlib::poll::POLLIN, revents: 0 }];
+            let mut fds = [userlib::poll::PollFd {
+                fd: read_fd,
+                events: userlib::poll::POLLIN,
+                revents: 0,
+            }];
             let n = userlib::poll::poll(&mut fds, 0);
             if n != 1 || fds[0].revents & userlib::poll::POLLHUP == 0 {
                 syscall::debug_puts(b"  FAIL: poll after close not POLLHUP\n");
@@ -5469,13 +5847,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
             userlib::pipe::pipe_close_fd(read_fd);
         } else {
-            if write_fd >= 0 { userlib::pipe::pipe_close_fd(write_fd); }
-            if read_fd >= 0 { userlib::pipe::pipe_close_fd(read_fd); }
+            if write_fd >= 0 {
+                userlib::pipe::pipe_close_fd(write_fd);
+            }
+            if read_fd >= 0 {
+                userlib::pipe::pipe_close_fd(read_fd);
+            }
         }
 
         // 6. poll with invalid FD → should get POLLNVAL.
         if phase60_ok {
-            let mut fds = [userlib::poll::PollFd { fd: 62, events: userlib::poll::POLLIN, revents: 0 }];
+            let mut fds = [userlib::poll::PollFd {
+                fd: 62,
+                events: userlib::poll::POLLIN,
+                revents: 0,
+            }];
             let n = userlib::poll::poll(&mut fds, 0);
             if n != 1 || fds[0].revents & userlib::poll::POLLNVAL == 0 {
                 syscall::debug_puts(b"  FAIL: poll invalid FD not POLLNVAL\n");
@@ -5533,7 +5919,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         };
 
-        let rp = if phase61_ok { syscall::port_create() } else { 0 };
+        let rp = if phase61_ok {
+            syscall::port_create()
+        } else {
+            0
+        };
 
         // Create a test file for locking.
         let mut handle = 0u64;
@@ -5549,7 +5939,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: tmpfs CREATE locktest\n");
                     phase61_ok = false;
                 }
-            } else { phase61_ok = false; }
+            } else {
+                phase61_ok = false;
+            }
         }
 
         // Test 1: flock(LOCK_EX) + flock(LOCK_UN) — basic acquire/release.
@@ -5564,7 +5956,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: flock(EX) failed\n");
                     phase61_ok = false;
                 }
-            } else { phase61_ok = false; }
+            } else {
+                phase61_ok = false;
+            }
         }
         if phase61_ok {
             let pid = syscall::getpid();
@@ -5577,7 +5971,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: flock(UN) failed\n");
                     phase61_ok = false;
                 }
-            } else { phase61_ok = false; }
+            } else {
+                phase61_ok = false;
+            }
         }
 
         // Test 2: flock(LOCK_SH) from two "PIDs" — both should succeed.
@@ -5591,7 +5987,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: flock SH pid=100\n");
                     phase61_ok = false;
                 }
-            } else { phase61_ok = false; }
+            } else {
+                phase61_ok = false;
+            }
         }
         if phase61_ok {
             // PID 200: LOCK_SH — should also succeed (shared).
@@ -5603,7 +6001,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: flock SH pid=200\n");
                     phase61_ok = false;
                 }
-            } else { phase61_ok = false; }
+            } else {
+                phase61_ok = false;
+            }
         }
 
         // Test 3: flock(LOCK_EX|LOCK_NB) with existing SH locks — should get EAGAIN.
@@ -5612,11 +6012,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let d2 = rp << 32;
             syscall::send(tmpfs_port, 0x2800, d0, 300u64, d2, 0);
             if let Some(reply) = syscall::recv_msg(rp) {
-                if reply.tag != 0x28FF { // FS_LOCK_ERR expected
+                if reply.tag != 0x28FF {
+                    // FS_LOCK_ERR expected
                     syscall::debug_puts(b"  FAIL: flock EX|NB no EAGAIN\n");
                     phase61_ok = false;
                 }
-            } else { phase61_ok = false; }
+            } else {
+                phase61_ok = false;
+            }
         }
 
         // Cleanup: unlock both SH locks.
@@ -5642,7 +6045,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: SETLK [0,100)\n");
                     phase61_ok = false;
                 }
-            } else { phase61_ok = false; }
+            } else {
+                phase61_ok = false;
+            }
         }
         if phase61_ok {
             // PID 200: write lock [100, 200) — no overlap, should succeed.
@@ -5656,7 +6061,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: SETLK [100,200)\n");
                     phase61_ok = false;
                 }
-            } else { phase61_ok = false; }
+            } else {
+                phase61_ok = false;
+            }
         }
 
         // Test 5: F_GETLK — query conflicting lock.
@@ -5671,7 +6078,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if reply.tag == 0x2811 {
                     let ret_type = (reply.data[0] & 0xFFFF) as u8;
                     let ret_pid = (reply.data[0] >> 32) as u32;
-                    if ret_type == 2 { // F_UNLCK = no conflict?
+                    if ret_type == 2 {
+                        // F_UNLCK = no conflict?
                         syscall::debug_puts(b"  FAIL: GETLK no conflict\n");
                         phase61_ok = false;
                     } else if ret_pid != 100 {
@@ -5682,7 +6090,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: GETLK error\n");
                     phase61_ok = false;
                 }
-            } else { phase61_ok = false; }
+            } else {
+                phase61_ok = false;
+            }
         }
 
         // Cleanup: unlock range locks.
@@ -5742,10 +6152,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: open for close test\n");
                     phase61_ok = false;
                 }
-            } else { phase61_ok = false; }
+            } else {
+                phase61_ok = false;
+            }
         }
 
-        if rp != 0 { syscall::port_destroy(rp); }
+        if rp != 0 {
+            syscall::port_destroy(rp);
+        }
 
         if phase61_ok {
             syscall::debug_puts(b"Phase 61 file locking: PASSED\n");
@@ -5790,7 +6204,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     (-1, -1)
                 }
             }
-        } else { (-1, -1) };
+        } else {
+            (-1, -1)
+        };
 
         // Disable canonical mode for raw tests — set via ioctl.
         // TCSETS: d1 = lflag(32) | oflag(32), d3 = cc bytes
@@ -5857,8 +6273,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // The "abc\n" write above would have echoed "abc\r\n" to s2m.
             let mut drain = [0u8; 64];
             // Non-blocking drain: use poll.
-            let mut fds = [userlib::poll::PollFd { fd: master_fd, events: userlib::poll::POLLIN, revents: 0 }];
-            while userlib::poll::poll(&mut fds, 0) > 0 && fds[0].revents & userlib::poll::POLLIN != 0 {
+            let mut fds = [userlib::poll::PollFd {
+                fd: master_fd,
+                events: userlib::poll::POLLIN,
+                revents: 0,
+            }];
+            while userlib::poll::poll(&mut fds, 0) > 0
+                && fds[0].revents & userlib::poll::POLLIN != 0
+            {
                 userlib::pty::pty_read_fd(master_fd, &mut drain);
                 fds[0].revents = 0;
             }
@@ -5882,9 +6304,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Test 6: Line editing — write "ab<DEL>c\n" → slave gets "ac\n".
         if phase62_ok {
             // Drain master echo first.
-            let mut fds = [userlib::poll::PollFd { fd: master_fd, events: userlib::poll::POLLIN, revents: 0 }];
+            let mut fds = [userlib::poll::PollFd {
+                fd: master_fd,
+                events: userlib::poll::POLLIN,
+                revents: 0,
+            }];
             let mut drain = [0u8; 64];
-            while userlib::poll::poll(&mut fds, 0) > 0 && fds[0].revents & userlib::poll::POLLIN != 0 {
+            while userlib::poll::poll(&mut fds, 0) > 0
+                && fds[0].revents & userlib::poll::POLLIN != 0
+            {
                 userlib::pty::pty_read_fd(master_fd, &mut drain);
                 fds[0].revents = 0;
             }
@@ -5920,9 +6348,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Test 8: Close master → slave gets EOF.
         if phase62_ok {
             // Drain any pending data first.
-            let mut fds = [userlib::poll::PollFd { fd: master_fd, events: userlib::poll::POLLIN, revents: 0 }];
+            let mut fds = [userlib::poll::PollFd {
+                fd: master_fd,
+                events: userlib::poll::POLLIN,
+                revents: 0,
+            }];
             let mut drain = [0u8; 64];
-            while userlib::poll::poll(&mut fds, 0) > 0 && fds[0].revents & userlib::poll::POLLIN != 0 {
+            while userlib::poll::poll(&mut fds, 0) > 0
+                && fds[0].revents & userlib::poll::POLLIN != 0
+            {
                 userlib::pty::pty_read_fd(master_fd, &mut drain);
                 fds[0].revents = 0;
             }
@@ -5936,8 +6370,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
             userlib::pty::pty_close_fd(slave_fd);
         } else {
-            if master_fd >= 0 { userlib::pty::pty_close_fd(master_fd); }
-            if slave_fd >= 0 { userlib::pty::pty_close_fd(slave_fd); }
+            if master_fd >= 0 {
+                userlib::pty::pty_close_fd(master_fd);
+            }
+            if slave_fd >= 0 {
+                userlib::pty::pty_close_fd(slave_fd);
+            }
         }
 
         // Test 9: Poll — master POLLIN after slave writes.
@@ -5947,7 +6385,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let _ = userlib::pty::pty_ioctl(s2, 0x5402, 0u64, 0u64);
 
                 // Poll master — should not be ready.
-                let mut fds = [userlib::poll::PollFd { fd: m2, events: userlib::poll::POLLIN, revents: 0 }];
+                let mut fds = [userlib::poll::PollFd {
+                    fd: m2,
+                    events: userlib::poll::POLLIN,
+                    revents: 0,
+                }];
                 let n = userlib::poll::poll(&mut fds, 0);
                 if n != 0 {
                     syscall::debug_puts(b"  FAIL: poll master ready before write\n");
@@ -5957,7 +6399,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Slave writes, then poll master.
                 if phase62_ok {
                     userlib::pty::pty_write_fd(s2, b"p");
-                    let mut fds = [userlib::poll::PollFd { fd: m2, events: userlib::poll::POLLIN, revents: 0 }];
+                    let mut fds = [userlib::poll::PollFd {
+                        fd: m2,
+                        events: userlib::poll::POLLIN,
+                        revents: 0,
+                    }];
                     let n = userlib::poll::poll(&mut fds, 0);
                     if n != 1 || fds[0].revents & userlib::poll::POLLIN == 0 {
                         syscall::debug_puts(b"  FAIL: poll master not POLLIN\n");
@@ -6006,7 +6452,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::send(vp, 0x6010, w0, w1, d2, 0); // VFS_OPEN
 
                 if let Some(resp) = syscall::recv_msg(reply) {
-                    if resp.tag == 0x6110 { // VFS_OPEN_OK
+                    if resp.tag == 0x6110 {
+                        // VFS_OPEN_OK
                         let fs_port = resp.data[0];
                         let handle = resp.data[1] as u32;
                         let size = resp.data[2];
@@ -6022,7 +6469,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         let rd2 = 16u64 | ((read_reply) << 32);
                         syscall::send(fs_port, 0x2100, handle as u64, 0, rd2, 0); // FS_READ
                         if let Some(rr) = syscall::recv_msg(read_reply) {
-                            if rr.tag == 0x2101 { // FS_READ_OK
+                            if rr.tag == 0x2101 {
+                                // FS_READ_OK
                                 // ext2_srv inline reply: data[0]=len, data[1..2]=packed content
                                 let n = rr.data[0] as usize;
                                 let mut buf = [0u8; 16];
@@ -6032,7 +6480,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 for i in 8..n.min(16) {
                                     buf[i] = (rr.data[2] >> ((i - 8) * 8)) as u8;
                                 }
-                                if n >= 5 && buf[0] == b'r' && buf[1] == b'o' && buf[2] == b'o' && buf[3] == b't' {
+                                if n >= 5
+                                    && buf[0] == b'r'
+                                    && buf[1] == b'o'
+                                    && buf[2] == b'o'
+                                    && buf[3] == b't'
+                                {
                                     syscall::debug_puts(b"      Content starts with 'root' - OK\n");
                                 } else {
                                     syscall::debug_puts(b"      Unexpected content\n");
@@ -6104,7 +6557,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let d2 = reply << 32;
                 syscall::send(pp, 0x5010, 0, 0, d2, 0); // PIPE_CREATE
                 if let Some(resp) = syscall::recv_msg(reply) {
-                    if resp.tag == 0x5100 { // PIPE_OK
+                    if resp.tag == 0x5100 {
+                        // PIPE_OK
                         let rh = resp.data[0] as u32;
                         let wh = resp.data[1] as u32;
 
@@ -6129,7 +6583,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             let rd2 = rr << 32;
                             syscall::send(pp, 0x5030, rh as u64, 0, rd2, 0); // PIPE_READ
                             if let Some(data) = syscall::recv_msg(rr) {
-                                if data.tag == 0x5100 { // PIPE_OK
+                                if data.tag == 0x5100 {
+                                    // PIPE_OK
                                     let n = (data.data[2] & 0xFFFF) as usize;
                                     let b0 = (data.data[0] & 0xFF) as u8;
                                     if n == 5 && b0 == b'h' {
@@ -6143,7 +6598,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             syscall::port_destroy(rr);
 
                             loop {
-                                if syscall::waitpid(writer).is_some() { break; }
+                                if syscall::waitpid(writer).is_some() {
+                                    break;
+                                }
                                 syscall::yield_now();
                             }
                         }
@@ -6218,7 +6675,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 arg2.as_ptr(),
                 core::ptr::null(),
             ];
-            syscall::execve_with_args(b"hello_c", argv.as_ptr() as *const *const u8, core::ptr::null());
+            syscall::execve_with_args(
+                b"hello_c",
+                argv.as_ptr() as *const *const u8,
+                core::ptr::null(),
+            );
             syscall::exit(1);
         } else if fork_ret2 != u64::MAX {
             let mut ok = false;
@@ -6399,7 +6860,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                     // Set timer to 50ms (50_000_000 ns).
                     let reply6 = syscall::port_create();
-                    syscall::send(tfd_port, 0x7040, tfd_handle as u64, 50_000_000, reply6 << 32, 0);
+                    syscall::send(
+                        tfd_port,
+                        0x7040,
+                        tfd_handle as u64,
+                        50_000_000,
+                        reply6 << 32,
+                        0,
+                    );
                     let _smsg = syscall::recv_msg(reply6);
                     syscall::port_destroy(reply6);
 
@@ -6465,7 +6933,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::yield_now();
             }
             if !ok {
-                syscall::debug_puts(b"    WARN: ld-telix waitpid timeout (C binary may not exit cleanly)\n");
+                syscall::debug_puts(
+                    b"    WARN: ld-telix waitpid timeout (C binary may not exit cleanly)\n",
+                );
                 // Not a hard failure — the dynamic linker infrastructure is tested via PT_INTERP.
             }
         }
@@ -6593,7 +7063,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let base = addr as *mut u8;
             // Write pattern to all 4 pages.
             for i in 0..4 * 4096usize {
-                unsafe { base.add(i).write_volatile(0xABu8); }
+                unsafe {
+                    base.add(i).write_volatile(0xABu8);
+                }
             }
             // madvise(MADV_DONTNEED) on pages 1-2.
             let r = syscall::madvise(addr + 4096, 2 * 4096, 4);
@@ -6936,7 +7408,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let d2 = 6u64 | (1u64 << 16) | (reply << 32); // O_CREAT=1
             syscall::send(shm_port, 0x7010, n0, 0, d2, 0); // SHM_OPEN
             if let Some(resp) = syscall::recv_msg(reply) {
-                if resp.tag == 0x7100 { // SHM_OK
+                if resp.tag == 0x7100 {
+                    // SHM_OK
                     syscall::debug_puts(b"    shm_open pg_buf: OK\n");
                 } else {
                     syscall::debug_puts(b"    shm_open: error\n");
@@ -7123,7 +7596,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let mut tid = u64::MAX;
         for _ in 0..500 {
             tid = syscall::spawn(b"libc_test", 50);
-            if tid != u64::MAX { break; }
+            if tid != u64::MAX {
+                break;
+            }
             syscall::yield_now();
         }
         if tid != u64::MAX {
@@ -7133,7 +7608,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     if code == 0 {
                         syscall::debug_puts(b"Phase 102 libc integration test: PASSED\n");
                     } else {
-                        syscall::debug_puts(b"Phase 102 libc integration test: FAILED (nonzero exit)\n");
+                        syscall::debug_puts(
+                            b"Phase 102 libc integration test: FAILED (nonzero exit)\n",
+                        );
                     }
                     exited = true;
                     break;
@@ -7154,7 +7631,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let mut tid = u64::MAX;
         for _ in 0..500 {
             tid = syscall::spawn(b"calc", 50);
-            if tid != u64::MAX { break; }
+            if tid != u64::MAX {
+                break;
+            }
             syscall::yield_now();
         }
         if tid != u64::MAX {
@@ -7185,7 +7664,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let mut tid = u64::MAX;
         for _ in 0..500 {
             tid = syscall::spawn(b"stress_test", 50);
-            if tid != u64::MAX { break; }
+            if tid != u64::MAX {
+                break;
+            }
             syscall::yield_now();
         }
         if tid != u64::MAX {
@@ -7263,7 +7744,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // proxy_srv will try to forward via TCP (which may fail for loopback),
                 // but the test verifies the kernel redirect path works.
                 let remote_port = ((1u64) << 44) | (test_port & 0xFFF_FFFF_FFFF);
-                let send_result = syscall::send_nb_4(remote_port, 0x1234, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD);
+                let send_result =
+                    syscall::send_nb_4(remote_port, 0x1234, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD);
 
                 // A successful send means the kernel redirected to proxy_srv
                 // (return 0 = message delivered to proxy port queue or direct-transferred).
@@ -7374,7 +7856,9 @@ extern "C" fn pager_thread_entry(_arg: u64) {
             // Fill the entire page with the pattern.
             let ptr = tmp_va as *mut u8;
             for i in 0..page_size {
-                unsafe { core::ptr::write_volatile(ptr.add(i), page_index); }
+                unsafe {
+                    core::ptr::write_volatile(ptr.add(i), page_index);
+                }
             }
             syscall::fault_complete(token, unsafe {
                 core::slice::from_raw_parts(tmp_va as *const u8, page_size)
@@ -7386,7 +7870,9 @@ extern "C" fn pager_thread_entry(_arg: u64) {
 
 extern "C" fn thread_child_entry(arg: u64) {
     let ptr = arg as *mut u64;
-    unsafe { core::ptr::write_volatile(ptr, 0xCAFE); }
+    unsafe {
+        core::ptr::write_volatile(ptr, 0xCAFE);
+    }
     syscall::exit(42);
 }
 
@@ -7441,7 +7927,9 @@ static mut MUTEX_TEST_COUNTER: u64 = 0;
 extern "C" fn mutex_test_thread(_arg: u64) {
     for _ in 0..1000 {
         TEST_MUTEX.lock();
-        unsafe { MUTEX_TEST_COUNTER += 1; }
+        unsafe {
+            MUTEX_TEST_COUNTER += 1;
+        }
         TEST_MUTEX.unlock();
     }
     syscall::exit(0);

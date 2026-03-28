@@ -47,7 +47,11 @@ pub fn parse_firmware() {
     let nc = crate::firmware::cpu_count();
     let irq = crate::firmware::irq_controller();
     if nc > 0 {
-        crate::println!("  ACPI: {} CPUs, LAPIC at {:#x}, IO APIC at {:#x}",
-            nc, irq.base0, irq.base1);
+        crate::println!(
+            "  ACPI: {} CPUs, LAPIC at {:#x}, IO APIC at {:#x}",
+            nc,
+            irq.base0,
+            irq.base1
+        );
     }
 }

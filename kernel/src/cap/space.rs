@@ -118,10 +118,6 @@ impl CapSpace {
     /// Look up a capability by slot index.
     pub fn lookup(&self, slot: usize) -> Option<&Capability> {
         let cap = self.root.get(slot)?;
-        if cap.is_null() {
-            None
-        } else {
-            Some(cap)
-        }
+        if cap.is_null() { None } else { Some(cap) }
     }
 }

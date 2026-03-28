@@ -8,15 +8,15 @@
 //! All writes happen on the BSP before secondary CPUs start.
 //! All reads happen after a Release/Acquire pair on the counts.
 
-pub mod dtb;
 #[cfg(target_arch = "x86_64")]
 pub mod acpi;
+pub mod dtb;
 #[cfg(target_arch = "x86_64")]
 pub mod multiboot;
 
+use crate::sched::smp::MAX_CPUS;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use crate::sched::smp::MAX_CPUS;
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -98,8 +98,12 @@ impl<T: Copy + Default, const N: usize> FwArray<T, N> {
 
     fn push(&self, val: T) -> bool {
         let idx = self.count.load(Ordering::Relaxed) as usize;
-        if idx >= N { return false; }
-        unsafe { *self.data[idx].get() = val; }
+        if idx >= N {
+            return false;
+        }
+        unsafe {
+            *self.data[idx].get() = val;
+        }
         self.count.store((idx + 1) as u32, Ordering::Release);
         true
     }
@@ -125,7 +129,10 @@ struct IrqCtrlCell(UnsafeCell<IrqControllerInfo>);
 unsafe impl Sync for IrqCtrlCell {}
 
 static IRQ_CTRL: IrqCtrlCell = IrqCtrlCell(UnsafeCell::new(IrqControllerInfo {
-    kind: 0, _pad: 0, base0: 0, base1: 0,
+    kind: 0,
+    _pad: 0,
+    base0: 0,
+    base1: 0,
 }));
 
 static IRQ_CTRL_SET: AtomicU32 = AtomicU32::new(0);
@@ -186,7 +193,9 @@ pub(crate) fn push_virtio(d: VirtioMmioDesc) {
 }
 
 pub(crate) fn set_irq_controller(info: IrqControllerInfo) {
-    unsafe { *IRQ_CTRL.0.get() = info; }
+    unsafe {
+        *IRQ_CTRL.0.get() = info;
+    }
     IRQ_CTRL_SET.store(1, Ordering::Release);
 }
 

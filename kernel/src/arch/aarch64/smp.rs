@@ -51,15 +51,21 @@ pub fn start_secondary_cpus() {
     if fw_cpus.len() > 1 {
         // Use firmware-discovered CPU list (skip first = BSP).
         for (i, desc) in fw_cpus.iter().enumerate() {
-            if i == 0 { continue; } // BSP
-            if i >= MAX_CPUS { break; }
+            if i == 0 {
+                continue;
+            } // BSP
+            if i >= MAX_CPUS {
+                break;
+            }
             let target_mpidr = desc.id as u64;
-            let stack_top = unsafe {
-                AP_STACKS.0[i].as_ptr().add(AP_STACK_SIZE) as u64
-            };
+            let stack_top = unsafe { AP_STACKS.0[i].as_ptr().add(AP_STACK_SIZE) as u64 };
             let ret = psci_cpu_on(target_mpidr, entry, stack_top);
             if ret != 0 {
-                crate::println!("  PSCI CPU_ON for MPIDR {:#x} failed: {}", target_mpidr, ret);
+                crate::println!(
+                    "  PSCI CPU_ON for MPIDR {:#x} failed: {}",
+                    target_mpidr,
+                    ret
+                );
                 continue;
             }
             started += 1;
@@ -68,9 +74,7 @@ pub fn start_secondary_cpus() {
         // Fallback: probe sequentially (original behavior).
         for cpu in 1..MAX_CPUS {
             let target_mpidr = cpu as u64;
-            let stack_top = unsafe {
-                AP_STACKS.0[cpu].as_ptr().add(AP_STACK_SIZE) as u64
-            };
+            let stack_top = unsafe { AP_STACKS.0[cpu].as_ptr().add(AP_STACK_SIZE) as u64 };
             let ret = psci_cpu_on(target_mpidr, entry, stack_top);
             if ret != 0 {
                 break;
@@ -90,8 +94,11 @@ pub fn start_secondary_cpus() {
         core::hint::spin_loop();
         timeout -= 1;
         if timeout == 0 {
-            crate::println!("  SMP startup timeout ({}/{} CPUs ready)",
-                AP_READY_COUNT.load(Ordering::Relaxed) + 1, started + 1);
+            crate::println!(
+                "  SMP startup timeout ({}/{} CPUs ready)",
+                AP_READY_COUNT.load(Ordering::Relaxed) + 1,
+                started + 1
+            );
             break;
         }
     }
@@ -140,6 +147,8 @@ extern "C" fn secondary_rust_entry(cpu_id: u64) {
     super::timer::enable_interrupts();
     crate::println!("  CPU {} online", cpu);
     loop {
-        unsafe { core::arch::asm!("wfi"); }
+        unsafe {
+            core::arch::asm!("wfi");
+        }
     }
 }

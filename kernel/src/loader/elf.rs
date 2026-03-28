@@ -3,9 +3,12 @@
 //! Loads PT_LOAD segments into a user address space, eagerly mapping pages
 //! and copying file data. No dynamic linking, relocations, or TLS.
 
-use crate::mm::{aspace, object, page::{PAGE_SIZE, MMUPAGE_SIZE}};
 use crate::mm::aspace::ASpaceId;
 use crate::mm::vma::VmaProt;
+use crate::mm::{
+    aspace, object,
+    page::{MMUPAGE_SIZE, PAGE_SIZE},
+};
 
 // ELF64 constants.
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -84,11 +87,7 @@ pub struct ElfInfo {
 
 /// Load an ELF64 binary into the given address space.
 /// Returns ElfInfo with entry point, phdr location, and program header details.
-pub fn load_elf(
-    data: &[u8],
-    aspace_id: ASpaceId,
-    pt_root: usize,
-) -> Result<ElfInfo, ElfError> {
+pub fn load_elf(data: &[u8], aspace_id: ASpaceId, pt_root: usize) -> Result<ElfInfo, ElfError> {
     if data.len() < 64 {
         return Err(ElfError::TooSmall);
     }
@@ -127,10 +126,10 @@ pub fn load_elf(
     let mut interp_len: usize = 0;
     for i in 0..phnum {
         let off = phoff + i * phentsize;
-        if off + 56 > data.len() { break; }
-        let phdr = unsafe {
-            core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr)
-        };
+        if off + 56 > data.len() {
+            break;
+        }
+        let phdr = unsafe { core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr) };
         if phdr.p_type == PT_PHDR {
             phdr_vaddr = phdr.p_vaddr as usize;
         }
@@ -141,11 +140,16 @@ pub fn load_elf(
             if ioff + ilen <= data.len() {
                 interp[..ilen].copy_from_slice(&data[ioff..ioff + ilen]);
                 // Strip null terminator if present.
-                interp_len = if ilen > 0 && interp[ilen - 1] == 0 { ilen - 1 } else { ilen };
+                interp_len = if ilen > 0 && interp[ilen - 1] == 0 {
+                    ilen - 1
+                } else {
+                    ilen
+                };
             }
         }
         // Fallback: if first PT_LOAD contains the phdrs, compute from file offset.
-        if phdr.p_type == PT_LOAD && phdr_vaddr == 0
+        if phdr.p_type == PT_LOAD
+            && phdr_vaddr == 0
             && phdr.p_offset as usize <= phoff
             && (phdr.p_offset as usize + phdr.p_filesz as usize) >= phoff + phnum * phentsize
         {
@@ -159,9 +163,7 @@ pub fn load_elf(
         if off + 56 > data.len() {
             return Err(ElfError::BadPhdr);
         }
-        let phdr = unsafe {
-            core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr)
-        };
+        let phdr = unsafe { core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr) };
 
         if phdr.p_type != PT_LOAD {
             continue;
@@ -197,39 +199,54 @@ pub fn load_elf_at_base(
 
     let ehdr = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const Elf64Ehdr) };
 
-    if ehdr.e_ident[0..4] != ELF_MAGIC { return Err(ElfError::BadMagic); }
-    if ehdr.e_ident[4] != ELFCLASS64 { return Err(ElfError::BadClass); }
-    if ehdr.e_ident[5] != ELFDATA2LSB { return Err(ElfError::BadEndian); }
-    if ehdr.e_type != ET_DYN && ehdr.e_type != ET_EXEC { return Err(ElfError::BadType); }
-    if ehdr.e_machine != EM_EXPECTED { return Err(ElfError::BadMachine); }
+    if ehdr.e_ident[0..4] != ELF_MAGIC {
+        return Err(ElfError::BadMagic);
+    }
+    if ehdr.e_ident[4] != ELFCLASS64 {
+        return Err(ElfError::BadClass);
+    }
+    if ehdr.e_ident[5] != ELFDATA2LSB {
+        return Err(ElfError::BadEndian);
+    }
+    if ehdr.e_type != ET_DYN && ehdr.e_type != ET_EXEC {
+        return Err(ElfError::BadType);
+    }
+    if ehdr.e_machine != EM_EXPECTED {
+        return Err(ElfError::BadMachine);
+    }
 
     let phoff = ehdr.e_phoff as usize;
     let phentsize = ehdr.e_phentsize as usize;
     let phnum = ehdr.e_phnum as usize;
 
-    if phentsize < 56 { return Err(ElfError::BadPhdr); }
+    if phentsize < 56 {
+        return Err(ElfError::BadPhdr);
+    }
 
     // For ET_DYN, find the lowest vaddr to compute the actual base offset.
     let mut min_vaddr: usize = usize::MAX;
     for i in 0..phnum {
         let off = phoff + i * phentsize;
-        if off + 56 > data.len() { break; }
-        let phdr = unsafe {
-            core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr)
-        };
+        if off + 56 > data.len() {
+            break;
+        }
+        let phdr = unsafe { core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr) };
         if phdr.p_type == PT_LOAD && (phdr.p_vaddr as usize) < min_vaddr {
             min_vaddr = phdr.p_vaddr as usize;
         }
     }
-    if min_vaddr == usize::MAX { min_vaddr = 0; }
+    if min_vaddr == usize::MAX {
+        min_vaddr = 0;
+    }
     let offset = base.wrapping_sub(min_vaddr);
 
     for i in 0..phnum {
         let off = phoff + i * phentsize;
-        if off + 56 > data.len() { return Err(ElfError::BadPhdr); }
-        let mut phdr = unsafe {
-            core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr)
-        };
+        if off + 56 > data.len() {
+            return Err(ElfError::BadPhdr);
+        }
+        let mut phdr =
+            unsafe { core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr) };
 
         if phdr.p_type != PT_LOAD || phdr.p_memsz == 0 {
             continue;
@@ -285,17 +302,23 @@ fn load_segment(
                 Ok::<_, ElfError>((vma.object_id, true, prot_to_pte_flags(merged)))
             } else {
                 // Need to create a new single-page VMA.
-                let vma = aspace.map_anon(page_va, 1, prot)
+                let vma = aspace
+                    .map_anon(page_va, 1, prot)
                     .ok_or(ElfError::MapFailed)?;
                 Ok((vma.object_id, false, pte_flags))
             }
         })?;
-        let effective_flags = if already_mapped { merged_flags | sw_z } else { pte_flags };
+        let effective_flags = if already_mapped {
+            merged_flags | sw_z
+        } else {
+            pte_flags
+        };
 
         // Allocate or get existing physical page.
         let pa = object::with_object(obj_id, |obj| {
             obj.ensure_page(0).map(|(pa, _)| pa) // page_idx within this single-page object is always 0
-        }).ok_or(ElfError::AllocFailed)?;
+        })
+        .ok_or(ElfError::AllocFailed)?;
 
         let pa_usize = pa.as_usize();
 

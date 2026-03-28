@@ -5,10 +5,10 @@
 //! dynamically-grown file table, then handles I/O protocol messages.
 //! No compile-time cap on the number of files.
 
-use crate::ipc::port::{self};
-use crate::ipc::Message;
-use crate::mm::paged_array::PagedArray;
 use super::protocol::*;
+use crate::ipc::Message;
+use crate::ipc::port::{self};
+use crate::mm::paged_array::PagedArray;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Global port ID for the kernel initramfs server (u64::MAX = not yet ready).
@@ -176,8 +176,11 @@ pub fn initramfs_server() -> ! {
     // Parse the embedded archive.
     let mut fs = Initramfs::new();
     fs.parse(INITRAMFS);
-    crate::println!("  [initramfs] parsed {} files from {} byte archive",
-        fs.count, INITRAMFS.len());
+    crate::println!(
+        "  [initramfs] parsed {} files from {} byte archive",
+        fs.count,
+        INITRAMFS.len()
+    );
     for i in 0..fs.count {
         let f = fs.files.get(i);
         // Convert name to str for printing.
@@ -205,11 +208,10 @@ pub fn initramfs_server() -> ! {
                 let reply_port = msg.data[4];
                 match fs.find(name) {
                     Some(idx) => {
-                        let reply = Message::new(IO_CONNECT_OK, [
-                            idx as u64,
-                            fs.files.get(idx).data_len as u64,
-                            0, 0, 0, 0,
-                        ]);
+                        let reply = Message::new(
+                            IO_CONNECT_OK,
+                            [idx as u64, fs.files.get(idx).data_len as u64, 0, 0, 0, 0],
+                        );
                         let _ = port::send_nb(reply_port, reply);
                     }
                     None => {
@@ -237,19 +239,33 @@ pub fn initramfs_server() -> ! {
                 if bytes_read <= MAX_INLINE_READ {
                     // Inline read — pack data into message words.
                     let packed = pack_inline_data(data);
-                    let reply = Message::new(IO_READ_OK, [
-                        bytes_read as u64,
-                        packed[0], packed[1], packed[2], packed[3], packed[4],
-                    ]);
+                    let reply = Message::new(
+                        IO_READ_OK,
+                        [
+                            bytes_read as u64,
+                            packed[0],
+                            packed[1],
+                            packed[2],
+                            packed[3],
+                            packed[4],
+                        ],
+                    );
                     let _ = port::send_nb(reply_port, reply);
                 } else {
                     // For now, clamp to inline max. Grant-based reads added in M6.
                     let clamped = &data[..MAX_INLINE_READ];
                     let packed = pack_inline_data(clamped);
-                    let reply = Message::new(IO_READ_OK, [
-                        clamped.len() as u64,
-                        packed[0], packed[1], packed[2], packed[3], packed[4],
-                    ]);
+                    let reply = Message::new(
+                        IO_READ_OK,
+                        [
+                            clamped.len() as u64,
+                            packed[0],
+                            packed[1],
+                            packed[2],
+                            packed[3],
+                            packed[4],
+                        ],
+                    );
                     let _ = port::send_nb(reply_port, reply);
                 }
             }
@@ -264,11 +280,17 @@ pub fn initramfs_server() -> ! {
                     continue;
                 }
 
-                let reply = Message::new(IO_STAT_OK, [
-                    fs.files.get(file_handle).data_len as u64,
-                    0, // type = regular file
-                    0, 0, 0, 0,
-                ]);
+                let reply = Message::new(
+                    IO_STAT_OK,
+                    [
+                        fs.files.get(file_handle).data_len as u64,
+                        0, // type = regular file
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                );
                 let _ = port::send_nb(reply_port, reply);
             }
 
@@ -286,5 +308,7 @@ pub fn initramfs_server() -> ! {
         }
     }
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

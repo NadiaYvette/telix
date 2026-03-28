@@ -10,7 +10,7 @@
 
 use super::aspace;
 use super::fault;
-use super::page::{PAGE_SIZE, MMUPAGE_SIZE};
+use super::page::{MMUPAGE_SIZE, PAGE_SIZE};
 use super::stats;
 use crate::sched::scheduler;
 use crate::sched::thread::BlockReason;
@@ -136,21 +136,30 @@ pub fn initiate_fault(token: u32) {
             return;
         }
         let e = faults.get(token as usize);
-        (e.aspace_id, e.obj_id, e.fault_va, e.file_handle, e.file_offset)
+        (
+            e.aspace_id,
+            e.obj_id,
+            e.fault_va,
+            e.file_handle,
+            e.file_offset,
+        )
     };
 
     // Path 1: Send fault notification IPC to the object's port.
     // External pagers hold RECV on this port and get the notification.
     let obj_port = super::object::object_port(obj_id);
     if obj_port != 0 {
-        let msg = crate::ipc::Message::new(PAGER_FAULT_REQ, [
-            token as u64,
-            fault_va as u64,
-            file_handle as u64,
-            file_offset,
-            PAGE_SIZE as u64,
-            0,
-        ]);
+        let msg = crate::ipc::Message::new(
+            PAGER_FAULT_REQ,
+            [
+                token as u64,
+                fault_va as u64,
+                file_handle as u64,
+                file_offset,
+                PAGE_SIZE as u64,
+                0,
+            ],
+        );
         // Kernel-initiated send — bypasses cap checks.
         let _ = crate::ipc::port::send_nb(obj_port, msg);
     }
@@ -169,8 +178,14 @@ pub fn initiate_fault(token: u32) {
 /// Inject fault info into a parked pager thread's saved exception frame.
 /// Sets: return reg (r0/a0) = token, r1/a1 = fault_va, r2/a2 = file_handle,
 ///       r3/a3 = file_offset, r4/a4 = PAGE_SIZE.
-fn inject_fault_into_frame(pager_tid: u32, token: u32, fault_va: usize, file_handle: u32, file_offset: u64) {
-    use crate::syscall::handlers::{set_return, set_reg, ExceptionFrame};
+fn inject_fault_into_frame(
+    pager_tid: u32,
+    token: u32,
+    fault_va: usize,
+    file_handle: u32,
+    file_offset: u64,
+) {
+    use crate::syscall::handlers::{ExceptionFrame, set_reg, set_return};
     let sp = scheduler::thread_saved_sp(pager_tid);
     let frame = unsafe { &mut *(sp as *mut ExceptionFrame) };
     set_return(frame, token as u64);
@@ -258,8 +273,7 @@ pub fn complete_fault(token: u32, data_va: usize, data_len: usize) -> bool {
             entry.fault_va,
         )
     };
-    let (fault_aspace_id, fault_thread_id, phys_addr,
-         mmu_idx, vma_va, fault_va) = entry_info;
+    let (fault_aspace_id, fault_thread_id, phys_addr, mmu_idx, vma_va, fault_va) = entry_info;
 
     // Translate the caller's data_va to physical address.
     let pt_root = scheduler::current_page_table_root();
@@ -271,17 +285,9 @@ pub fn complete_fault(token: u32, data_va: usize, data_len: usize) -> bool {
     // Copy data from source PA to target physical page.
     let copy_len = data_len.min(PAGE_SIZE);
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            src_pa as *const u8,
-            phys_addr as *mut u8,
-            copy_len,
-        );
+        core::ptr::copy_nonoverlapping(src_pa as *const u8, phys_addr as *mut u8, copy_len);
         if copy_len < PAGE_SIZE {
-            core::ptr::write_bytes(
-                (phys_addr + copy_len) as *mut u8,
-                0,
-                PAGE_SIZE - copy_len,
-            );
+            core::ptr::write_bytes((phys_addr + copy_len) as *mut u8, 0, PAGE_SIZE - copy_len);
         }
     }
 

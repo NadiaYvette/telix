@@ -5,7 +5,7 @@
 //! the pool, allowing the fault handler to skip per-sub-page zeroing when
 //! the entire 64 KiB allocation page is already zero.
 
-use super::page::{PhysAddr, PAGE_SIZE};
+use super::page::{PAGE_SIZE, PhysAddr};
 use super::phys;
 use super::stats;
 use crate::sync::SpinLock;
@@ -87,9 +87,7 @@ pub fn zero_daemon() -> ! {
                 pool.count >= POOL_CAPACITY
             };
             if still_full {
-                crate::sched::block_current(
-                    crate::sched::thread::BlockReason::ZeroPool,
-                );
+                crate::sched::block_current(crate::sched::thread::BlockReason::ZeroPool);
             }
             continue;
         }
@@ -100,9 +98,7 @@ pub fn zero_daemon() -> ! {
             None => {
                 // OOM — block and retry later.
                 crate::sched::clear_wakeup_flag(tid);
-                crate::sched::block_current(
-                    crate::sched::thread::BlockReason::ZeroPool,
-                );
+                crate::sched::block_current(crate::sched::thread::BlockReason::ZeroPool);
                 continue;
             }
         };

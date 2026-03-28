@@ -11,8 +11,8 @@ use core::cell::UnsafeCell;
 pub struct IdtEntry {
     offset_low: u16,
     selector: u16,
-    ist: u8,        // bits 0-2: IST index, rest zero
-    type_attr: u8,  // type and attributes
+    ist: u8,       // bits 0-2: IST index, rest zero
+    type_attr: u8, // type and attributes
     offset_mid: u16,
     offset_high: u32,
     reserved: u32,

@@ -57,13 +57,34 @@ struct DeviceEntry {
 }
 
 static DEVICES: [DeviceEntry; NUM_DEVICES] = [
-    DeviceEntry { name: b"null",    dev_type: DeviceType::Null },
-    DeviceEntry { name: b"zero",    dev_type: DeviceType::Zero },
-    DeviceEntry { name: b"full",    dev_type: DeviceType::Full },
-    DeviceEntry { name: b"random",  dev_type: DeviceType::Random },
-    DeviceEntry { name: b"urandom", dev_type: DeviceType::Urandom },
-    DeviceEntry { name: b"console", dev_type: DeviceType::Console },
-    DeviceEntry { name: b"tty",     dev_type: DeviceType::Tty },
+    DeviceEntry {
+        name: b"null",
+        dev_type: DeviceType::Null,
+    },
+    DeviceEntry {
+        name: b"zero",
+        dev_type: DeviceType::Zero,
+    },
+    DeviceEntry {
+        name: b"full",
+        dev_type: DeviceType::Full,
+    },
+    DeviceEntry {
+        name: b"random",
+        dev_type: DeviceType::Random,
+    },
+    DeviceEntry {
+        name: b"urandom",
+        dev_type: DeviceType::Urandom,
+    },
+    DeviceEntry {
+        name: b"console",
+        dev_type: DeviceType::Console,
+    },
+    DeviceEntry {
+        name: b"tty",
+        dev_type: DeviceType::Tty,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -74,7 +95,10 @@ struct OpenHandle {
 
 impl OpenHandle {
     const fn empty() -> Self {
-        Self { dev_idx: 0, active: false }
+        Self {
+            dev_idx: 0,
+            active: false,
+        }
     }
 }
 
@@ -85,11 +109,20 @@ struct Rng {
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Self { state: if seed == 0 { 0xDEAD_BEEF_CAFE_1234 } else { seed } }
+        Self {
+            state: if seed == 0 {
+                0xDEAD_BEEF_CAFE_1234
+            } else {
+                seed
+            },
+        }
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.state
     }
 
@@ -116,9 +149,14 @@ fn find_device(name: &[u8], name_len: usize) -> Option<usize> {
         if dev.name.len() == name_len {
             let mut eq = true;
             for j in 0..name_len {
-                if dev.name[j] != name[j] { eq = false; break; }
+                if dev.name[j] != name[j] {
+                    eq = false;
+                    break;
+                }
             }
-            if eq { return Some(i); }
+            if eq {
+                return Some(i);
+            }
         }
     }
     None
@@ -189,8 +227,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if h == u64::MAX {
                             syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
                         } else {
-                            syscall::send(reply_port, FS_OPEN_OK,
-                                h, 0, my_aspace as u64, 0);
+                            syscall::send(reply_port, FS_OPEN_OK, h, 0, my_aspace as u64, 0);
                         }
                     }
                     None => {
@@ -236,7 +273,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             let actual = length.min(4096);
                             let p = grant_va as *mut u8;
                             for i in 0..actual {
-                                unsafe { *p.add(i) = rng.next_u8(); }
+                                unsafe {
+                                    *p.add(i) = rng.next_u8();
+                                }
                             }
                             syscall::send_nb(reply_port, FS_READ_OK, actual as u64, 0);
                         } else {
@@ -245,8 +284,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 buf[i] = rng.next_u8();
                             }
                             let packed = pack_inline_data(&buf[..to_read]);
-                            syscall::send(reply_port, FS_READ_OK,
-                                to_read as u64, packed[0], packed[1], packed[2]);
+                            syscall::send(
+                                reply_port,
+                                FS_READ_OK,
+                                to_read as u64,
+                                packed[0],
+                                packed[1],
+                                packed[2],
+                            );
                         }
                     }
                     DeviceType::Console | DeviceType::Tty => {
@@ -262,8 +307,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 let len = cr.data[0] as usize;
                                 let actual = len.min(length);
                                 // Forward inline data.
-                                syscall::send(reply_port, FS_READ_OK,
-                                    actual as u64, cr.data[1], cr.data[2], cr.data[3]);
+                                syscall::send(
+                                    reply_port,
+                                    FS_READ_OK,
+                                    actual as u64,
+                                    cr.data[1],
+                                    cr.data[2],
+                                    cr.data[3],
+                                );
                             } else {
                                 syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
                             }
@@ -296,7 +347,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             syscall::send(reply_port, FS_ERROR, ERR_NOSPC, 0, 0, 0);
                         }
                     }
-                    DeviceType::Null | DeviceType::Zero | DeviceType::Random | DeviceType::Urandom => {
+                    DeviceType::Null
+                    | DeviceType::Zero
+                    | DeviceType::Random
+                    | DeviceType::Urandom => {
                         // Discard.
                         if reply_port != 0 {
                             syscall::send(reply_port, FS_WRITE_OK, length as u64, 0, 0, 0);
@@ -351,8 +405,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 let di = handles[handle].dev_idx;
                 // mode = 0o020666 (char device, rw for all)
-                syscall::send(reply_port, FS_STAT_OK,
-                    0, 0o020666u64, 0, di as u64);
+                syscall::send(reply_port, FS_STAT_OK, 0, 0o020666u64, 0, di as u64);
             }
 
             FS_READDIR => {
@@ -370,8 +423,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     for j in 8..nlen.min(16) {
                         name_hi |= (dev.name[j] as u64) << ((j - 8) * 8);
                     }
-                    syscall::send(reply_port, FS_READDIR_OK,
-                        0, name_lo, name_hi, (start_offset + 1) as u64);
+                    syscall::send(
+                        reply_port,
+                        FS_READDIR_OK,
+                        0,
+                        name_lo,
+                        name_hi,
+                        (start_offset + 1) as u64,
+                    );
                 } else {
                     syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
                 }
@@ -388,5 +447,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

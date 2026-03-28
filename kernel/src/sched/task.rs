@@ -55,7 +55,11 @@ pub struct SignalAction {
 
 impl SignalAction {
     pub const fn default() -> Self {
-        Self { handler: SigHandler::Default, sa_mask: 0, restart: false }
+        Self {
+            handler: SigHandler::Default,
+            sa_mask: 0,
+            restart: false,
+        }
     }
 }
 
@@ -76,7 +80,7 @@ pub const UNCATCHABLE: u64 = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
 pub fn sig_default_is_term(sig: u32) -> bool {
     match sig {
         SIGCHLD | SIGCONT => false, // default ignore
-        _ => true, // default terminate
+        _ => true,                  // default terminate
     }
 }
 
@@ -191,8 +195,8 @@ impl Rlimit {
 
 /// Default resource limits for new tasks.
 pub const DEFAULT_RLIMITS: [Rlimit; RLIMIT_COUNT] = [
-    Rlimit::new(65536, 1048576),       // RLIMIT_STACK: 64K soft, 1M hard
-    Rlimit::new(64, 1024),             // RLIMIT_NOFILE: 64 soft, 1024 hard
+    Rlimit::new(65536, 1048576), // RLIMIT_STACK: 64K soft, 1M hard
+    Rlimit::new(64, 1024),       // RLIMIT_NOFILE: 64 soft, 1024 hard
     Rlimit::new(RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_AS: unlimited
     Rlimit::new(RLIM_INFINITY, RLIM_INFINITY), // RLIMIT_NPROC: unlimited by default
 ];

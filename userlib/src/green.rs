@@ -4,8 +4,8 @@
 //! Fibers are lightweight execution contexts with their own stacks that are
 //! scheduled entirely in userspace via context switching.
 
-use core::sync::atomic::{AtomicU32, Ordering};
 use crate::syscall;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 const MAX_FIBERS: usize = 16;
 const MAX_WORKERS: usize = 4;
@@ -73,11 +73,54 @@ pub struct FiberContext {
 impl FiberContext {
     const fn zero() -> Self {
         #[cfg(target_arch = "x86_64")]
-        { Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0 } }
+        {
+            Self {
+                rbx: 0,
+                rbp: 0,
+                r12: 0,
+                r13: 0,
+                r14: 0,
+                r15: 0,
+                rsp: 0,
+            }
+        }
         #[cfg(target_arch = "riscv64")]
-        { Self { ra: 0, sp: 0, s0: 0, s1: 0, s2: 0, s3: 0, s4: 0, s5: 0, s6: 0, s7: 0, s8: 0, s9: 0, s10: 0, s11: 0 } }
+        {
+            Self {
+                ra: 0,
+                sp: 0,
+                s0: 0,
+                s1: 0,
+                s2: 0,
+                s3: 0,
+                s4: 0,
+                s5: 0,
+                s6: 0,
+                s7: 0,
+                s8: 0,
+                s9: 0,
+                s10: 0,
+                s11: 0,
+            }
+        }
         #[cfg(target_arch = "aarch64")]
-        { Self { x19: 0, x20: 0, x21: 0, x22: 0, x23: 0, x24: 0, x25: 0, x26: 0, x27: 0, x28: 0, fp: 0, lr: 0, sp: 0 } }
+        {
+            Self {
+                x19: 0,
+                x20: 0,
+                x21: 0,
+                x22: 0,
+                x23: 0,
+                x24: 0,
+                x25: 0,
+                x26: 0,
+                x27: 0,
+                x28: 0,
+                fp: 0,
+                lr: 0,
+                sp: 0,
+            }
+        }
     }
 }
 
@@ -91,7 +134,10 @@ struct Fiber {
 
 impl Fiber {
     const fn new() -> Self {
-        Self { context: FiberContext::zero(), state: FIBER_FREE }
+        Self {
+            context: FiberContext::zero(),
+            state: FIBER_FREE,
+        }
     }
 }
 
@@ -122,7 +168,10 @@ static mut WORKER_MAP: [i32; 64] = [-1; 64];
 
 fn spin_lock() {
     let mut spins = 0u32;
-    while LOCK.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+    while LOCK
+        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
         spins += 1;
         if spins & 63 == 0 {
             // On QEMU TCG the lock holder may be on a preempted vCPU.
@@ -334,15 +383,15 @@ pub fn spawn(entry: fn(u64), arg: u64) -> i32 {
             core::ptr::write(ret_addr_slot, fiber_trampoline as u64);
             ctx.rsp = (stack_top - 8) as u64;
             ctx.r12 = entry as u64; // entry function
-            ctx.r13 = arg;          // argument
+            ctx.r13 = arg; // argument
         }
 
         #[cfg(target_arch = "riscv64")]
         {
             ctx.sp = stack_top as u64;
             ctx.ra = fiber_trampoline as u64;
-            ctx.s0 = entry as u64;  // entry function
-            ctx.s1 = arg;           // argument
+            ctx.s0 = entry as u64; // entry function
+            ctx.s1 = arg; // argument
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -350,7 +399,7 @@ pub fn spawn(entry: fn(u64), arg: u64) -> i32 {
             ctx.sp = stack_top as u64;
             ctx.lr = fiber_trampoline as u64;
             ctx.x19 = entry as u64; // entry function
-            ctx.x20 = arg;          // argument
+            ctx.x20 = arg; // argument
         }
 
         FIBERS[i].context = ctx;
@@ -369,7 +418,9 @@ pub fn spawn(entry: fn(u64), arg: u64) -> i32 {
 pub extern "C" fn green_worker_entry(worker_id: u64) {
     let wid = worker_id as usize;
     let tid = syscall::sa_getid() as usize;
-    unsafe { WORKER_MAP[tid] = wid as i32; }
+    unsafe {
+        WORKER_MAP[tid] = wid as i32;
+    }
 
     loop {
         // Try to dequeue a ready fiber.
@@ -437,7 +488,9 @@ extern "C" fn fiber_exit() -> ! {
     let wid = unsafe { WORKER_MAP[tid] } as usize;
     let fid = unsafe { WORKER_FIBER[wid] } as usize;
 
-    unsafe { FIBERS[fid].state = FIBER_DONE; }
+    unsafe {
+        FIBERS[fid].state = FIBER_DONE;
+    }
     COMPLETED.fetch_add(1, Ordering::Relaxed);
 
     // Switch back to worker (saves dead fiber context, restores worker).
@@ -449,5 +502,7 @@ extern "C" fn fiber_exit() -> ! {
     }
 
     // Unreachable: worker never switches back to a done fiber.
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

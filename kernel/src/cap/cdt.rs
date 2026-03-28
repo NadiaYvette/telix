@@ -80,12 +80,7 @@ impl Cdt {
 
     /// Allocate a CDT node for a root capability (no parent).
     /// Returns the CDT index, or None if full.
-    pub fn insert_root(
-        &mut self,
-        cap: &Capability,
-        task_id: u32,
-        slot_index: u16,
-    ) -> Option<u32> {
+    pub fn insert_root(&mut self, cap: &Capability, task_id: u32, slot_index: u16) -> Option<u32> {
         let idx = self.alloc_node()?;
         let node = self.nodes.get_mut(idx as usize);
         node.cap_type = cap.cap_type;
@@ -162,9 +157,7 @@ impl Cdt {
     /// Returns the number of nodes removed.
     #[allow(dead_code)]
     pub fn remove(&mut self, idx: u32) -> usize {
-        if (idx as usize) >= self.nodes.capacity()
-            || !self.nodes.get(idx as usize).active
-        {
+        if (idx as usize) >= self.nodes.capacity() || !self.nodes.get(idx as usize).active {
             return 0;
         }
 
@@ -180,9 +173,7 @@ impl Cdt {
     /// Get the task_id and slot_index for a CDT node (for revocation callbacks).
     #[allow(dead_code)]
     pub fn get_location(&self, idx: u32) -> Option<(u32, u16)> {
-        if (idx as usize) >= self.nodes.capacity()
-            || !self.nodes.get(idx as usize).active
-        {
+        if (idx as usize) >= self.nodes.capacity() || !self.nodes.get(idx as usize).active {
             return None;
         }
         let node = self.nodes.get(idx as usize);

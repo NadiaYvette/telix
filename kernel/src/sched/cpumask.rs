@@ -34,7 +34,9 @@ impl CpuMask {
     /// Empty mask (no CPUs).
     #[inline]
     pub const fn new() -> Self {
-        Self { bits: [0; CPUMASK_WORDS] }
+        Self {
+            bits: [0; CPUMASK_WORDS],
+        }
     }
 
     /// All valid CPUs set (0..MAX_CPUS).
@@ -71,7 +73,9 @@ impl CpuMask {
     /// Test if a CPU is in the set.
     #[inline]
     pub const fn test(&self, cpu: u32) -> bool {
-        if (cpu as usize) >= MAX_CPUS { return false; }
+        if (cpu as usize) >= MAX_CPUS {
+            return false;
+        }
         self.bits[cpu as usize / 64] & (1u64 << (cpu as usize % 64)) != 0
     }
 
@@ -132,7 +136,9 @@ impl CpuMask {
     pub const fn is_empty(&self) -> bool {
         let mut i = 0;
         while i < CPUMASK_WORDS {
-            if self.bits[i] != 0 { return false; }
+            if self.bits[i] != 0 {
+                return false;
+            }
             i += 1;
         }
         true
@@ -204,7 +210,9 @@ unsafe impl Sync for AtomicCpuMask {}
 impl AtomicCpuMask {
     /// All zeros (no CPUs).
     pub const fn new() -> Self {
-        Self { bits: [const { AtomicU64::new(0) }; CPUMASK_WORDS] }
+        Self {
+            bits: [const { AtomicU64::new(0) }; CPUMASK_WORDS],
+        }
     }
 
     /// All valid CPUs set (0..MAX_CPUS). Excess bits in last word are clear.
@@ -222,9 +230,10 @@ impl AtomicCpuMask {
     /// Test if a CPU is set. **Single-word Relaxed load — hot path safe.**
     #[inline]
     pub fn test(&self, cpu: u32) -> bool {
-        if (cpu as usize) >= MAX_CPUS { return false; }
-        self.bits[cpu as usize / 64].load(Ordering::Relaxed)
-            & (1u64 << (cpu as usize % 64)) != 0
+        if (cpu as usize) >= MAX_CPUS {
+            return false;
+        }
+        self.bits[cpu as usize / 64].load(Ordering::Relaxed) & (1u64 << (cpu as usize % 64)) != 0
     }
 
     /// Atomically set a CPU bit (fetch_or on one word).

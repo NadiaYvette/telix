@@ -46,6 +46,11 @@ pub fn parse_firmware() {
         let nr = crate::firmware::mem_regions().len();
         let nc = crate::firmware::cpu_count();
         let nd = crate::firmware::virtio_devices().len();
-        crate::println!("  Firmware: {} mem regions, {} CPUs, {} virtio devices", nr, nc, nd);
+        crate::println!(
+            "  Firmware: {} mem regions, {} CPUs, {} virtio devices",
+            nr,
+            nc,
+            nd
+        );
     }
 }

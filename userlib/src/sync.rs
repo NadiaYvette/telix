@@ -1,7 +1,7 @@
 //! Userspace synchronization primitives built on futex syscalls.
 
-use core::sync::atomic::{AtomicU32, Ordering};
 use crate::syscall;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// A mutual exclusion lock using futex for kernel-assisted blocking.
 ///
@@ -14,12 +14,18 @@ pub struct Mutex {
 
 impl Mutex {
     pub const fn new() -> Self {
-        Self { state: AtomicU32::new(0) }
+        Self {
+            state: AtomicU32::new(0),
+        }
     }
 
     pub fn lock(&self) {
         // Fast path: uncontended CAS 0 -> 1
-        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
             return;
         }
         self.lock_contended();
@@ -41,7 +47,11 @@ impl Mutex {
 
     pub fn unlock(&self) {
         // Fast path: CAS 1 -> 0 (no waiters)
-        if self.state.compare_exchange(1, 0, Ordering::Release, Ordering::Relaxed).is_ok() {
+        if self
+            .state
+            .compare_exchange(1, 0, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
             return;
         }
         // Slow path: there are waiters (state == 2)

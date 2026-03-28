@@ -715,10 +715,9 @@ fn test_basic_insert_find() {
     let mut tree = VmaTree::new();
     assert!(tree.is_empty());
 
-    let vma = tree.insert(
-        0x1000_0000, 0x10000,
-        super::vma::VmaProt::ReadWrite, 1, 0,
-    ).unwrap();
+    let vma = tree
+        .insert(0x1000_0000, 0x10000, super::vma::VmaProt::ReadWrite, 1, 0)
+        .unwrap();
     assert_eq!(vma.va_start, 0x1000_0000);
     assert_eq!(vma.va_len, 0x10000);
     assert_eq!(tree.len(), 1);
@@ -802,8 +801,11 @@ fn test_many_inserts() {
     for i in 0..n {
         let va = 0x1000_0000 + i * 0x10_0000;
         tree.insert(
-            va, 0x10000,
-            super::vma::VmaProt::ReadWrite, (i + 1) as u64, 0,
+            va,
+            0x10000,
+            super::vma::VmaProt::ReadWrite,
+            (i + 1) as u64,
+            0,
         );
     }
     assert_eq!(tree.len(), n);

@@ -5,8 +5,8 @@
 
 use super::message::Message;
 use super::port::{self, PortId};
-use crate::mm::paged_array::PagedArray;
 use crate::mm::page::PAGE_SIZE;
+use crate::mm::paged_array::PagedArray;
 use crate::mm::phys;
 use crate::sched::thread::ThreadId;
 
@@ -66,7 +66,9 @@ impl PortSet {
             return false;
         }
         if self.count < self.ports_cap {
-            unsafe { *self.ports.add(self.count) = port_id; }
+            unsafe {
+                *self.ports.add(self.count) = port_id;
+            }
             self.count += 1;
             true
         } else {

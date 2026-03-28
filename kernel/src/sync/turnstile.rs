@@ -44,7 +44,7 @@ const NUM_BUCKETS: usize = 16;
 
 /// Slab sizes.
 const NODE_SLAB_SIZE: usize = 128; // HamtNode: 16 * 8 = 128 bytes
-const TS_SLAB_SIZE: usize = 64;    // Turnstile: ~48 bytes, 64B slab
+const TS_SLAB_SIZE: usize = 64; // Turnstile: ~48 bytes, 64B slab
 
 // ---------------------------------------------------------------------------
 // FNV-1a hash
@@ -104,16 +104,24 @@ struct HamtNode {
 ///   ptr | 1    = leaf (Turnstile*)
 ///   ptr (even) = inner HamtNode*
 #[inline]
-fn is_leaf(tagged: usize) -> bool { tagged & 1 != 0 }
+fn is_leaf(tagged: usize) -> bool {
+    tagged & 1 != 0
+}
 #[inline]
-fn tag_leaf(ts: *mut Turnstile) -> usize { ts as usize | 1 }
+fn tag_leaf(ts: *mut Turnstile) -> usize {
+    ts as usize | 1
+}
 #[inline]
-fn untag_leaf(tagged: usize) -> *mut Turnstile { (tagged & !1) as *mut Turnstile }
+fn untag_leaf(tagged: usize) -> *mut Turnstile {
+    (tagged & !1) as *mut Turnstile
+}
 
 fn alloc_node() -> Option<*mut HamtNode> {
     let pa = slab::alloc(NODE_SLAB_SIZE)?;
     let p = pa.as_usize() as *mut HamtNode;
-    unsafe { core::ptr::write_bytes(p as *mut u8, 0, NODE_SLAB_SIZE); }
+    unsafe {
+        core::ptr::write_bytes(p as *mut u8, 0, NODE_SLAB_SIZE);
+    }
     Some(p)
 }
 
@@ -131,7 +139,9 @@ struct HamtRoot {
 
 impl HamtRoot {
     const fn new() -> Self {
-        Self { children: [0; HAMT_WIDTH] }
+        Self {
+            children: [0; HAMT_WIDTH],
+        }
     }
 }
 
@@ -144,11 +154,19 @@ static WAIT_HAMT: [SpinLock<HamtRoot>; NUM_BUCKETS] = {
 // HAMT operations (operate on locked HamtRoot)
 // ---------------------------------------------------------------------------
 
-fn hamt_lookup(root: &HamtRoot, hash: u64, key_type: u8, aspace_id: u64, va: usize) -> Option<*mut Turnstile> {
+fn hamt_lookup(
+    root: &HamtRoot,
+    hash: u64,
+    key_type: u8,
+    aspace_id: u64,
+    va: usize,
+) -> Option<*mut Turnstile> {
     let mut slot = root.children[nibble_at(hash, 0)];
     let mut level = 1usize;
     loop {
-        if slot == 0 { return None; }
+        if slot == 0 {
+            return None;
+        }
         if is_leaf(slot) {
             let ts = untag_leaf(slot);
             let t = unsafe { &*ts };
@@ -157,7 +175,9 @@ fn hamt_lookup(root: &HamtRoot, hash: u64, key_type: u8, aspace_id: u64, va: usi
             }
             return None;
         }
-        if level > MAX_LEVEL { return None; }
+        if level > MAX_LEVEL {
+            return None;
+        }
         let node = unsafe { &*(slot as *const HamtNode) };
         slot = node.children[nibble_at(hash, level)];
         level += 1;
@@ -172,17 +192,24 @@ fn hamt_insert(root: &mut HamtRoot, hash: u64, ts_ptr: *mut Turnstile) -> bool {
     loop {
         let val = unsafe { *slot };
         if val == 0 {
-            unsafe { *slot = tag_leaf(ts_ptr); }
+            unsafe {
+                *slot = tag_leaf(ts_ptr);
+            }
             return true;
         }
         if is_leaf(val) {
             let existing = untag_leaf(val);
             let ex = unsafe { &*existing };
             let new_ts = unsafe { &*ts_ptr };
-            if ex.key_type == new_ts.key_type && ex.aspace_id == new_ts.aspace_id && ex.va == new_ts.va {
+            if ex.key_type == new_ts.key_type
+                && ex.aspace_id == new_ts.aspace_id
+                && ex.va == new_ts.va
+            {
                 return false; // duplicate key
             }
-            if level > MAX_LEVEL { return false; } // hash exhausted
+            if level > MAX_LEVEL {
+                return false;
+            } // hash exhausted
             let node = match alloc_node() {
                 Some(n) => n,
                 None => return false,
@@ -207,7 +234,9 @@ fn hamt_insert(root: &mut HamtRoot, hash: u64, ts_ptr: *mut Turnstile) -> bool {
             continue;
         }
         // Inner node — descend.
-        if level > MAX_LEVEL { return false; }
+        if level > MAX_LEVEL {
+            return false;
+        }
         let node = val as *mut HamtNode;
         let nibble = nibble_at(hash, level);
         slot = unsafe { &mut (*node).children[nibble] };
@@ -217,16 +246,36 @@ fn hamt_insert(root: &mut HamtRoot, hash: u64, ts_ptr: *mut Turnstile) -> bool {
 
 /// Remove a turnstile from the HAMT. Returns the pointer if found.
 /// Uses recursive descent for bottom-up node collapsing.
-fn hamt_remove(root: &mut HamtRoot, hash: u64, key_type: u8, aspace_id: u64, va: usize) -> Option<*mut Turnstile> {
+fn hamt_remove(
+    root: &mut HamtRoot,
+    hash: u64,
+    key_type: u8,
+    aspace_id: u64,
+    va: usize,
+) -> Option<*mut Turnstile> {
     let nibble0 = nibble_at(hash, 0);
-    hamt_remove_at(&mut root.children[nibble0], hash, key_type, aspace_id, va, 1)
+    hamt_remove_at(
+        &mut root.children[nibble0],
+        hash,
+        key_type,
+        aspace_id,
+        va,
+        1,
+    )
 }
 
 fn hamt_remove_at(
-    slot: &mut usize, hash: u64, key_type: u8, aspace_id: u64, va: usize, level: usize,
+    slot: &mut usize,
+    hash: u64,
+    key_type: u8,
+    aspace_id: u64,
+    va: usize,
+    level: usize,
 ) -> Option<*mut Turnstile> {
     let val = *slot;
-    if val == 0 { return None; }
+    if val == 0 {
+        return None;
+    }
 
     if is_leaf(val) {
         let ts = untag_leaf(val);
@@ -238,11 +287,20 @@ fn hamt_remove_at(
         return None;
     }
 
-    if level > MAX_LEVEL { return None; }
+    if level > MAX_LEVEL {
+        return None;
+    }
 
     let node = val as *mut HamtNode;
     let nibble = nibble_at(hash, level);
-    let result = hamt_remove_at(unsafe { &mut (*node).children[nibble] }, hash, key_type, aspace_id, va, level + 1);
+    let result = hamt_remove_at(
+        unsafe { &mut (*node).children[nibble] },
+        hash,
+        key_type,
+        aspace_id,
+        va,
+        level + 1,
+    );
 
     if result.is_some() {
         // Try to collapse: count remaining children.
@@ -253,7 +311,9 @@ fn hamt_remove_at(
             if node_ref.children[i] != 0 {
                 count += 1;
                 last_child = node_ref.children[i];
-                if count > 1 { break; }
+                if count > 1 {
+                    break;
+                }
             }
         }
         if count == 0 {
@@ -277,7 +337,7 @@ struct Turnstile {
     aspace_id: u64,
     key_type: u8,
     _pad0: [u8; 7],
-    va: usize,           // futex: virtual address; port: port_id as usize
+    va: usize, // futex: virtual address; port: port_id as usize
     hash: u64,
     head: u32,
     tail: u32,
@@ -291,7 +351,9 @@ struct Turnstile {
 fn alloc_turnstile() -> Option<*mut Turnstile> {
     let pa = slab::alloc(TS_SLAB_SIZE)?;
     let p = pa.as_usize() as *mut Turnstile;
-    unsafe { core::ptr::write_bytes(p as *mut u8, 0, TS_SLAB_SIZE); }
+    unsafe {
+        core::ptr::write_bytes(p as *mut u8, 0, TS_SLAB_SIZE);
+    }
     Some(p)
 }
 
@@ -341,7 +403,9 @@ fn ts_enqueue(ts: &mut Turnstile, tid: u32) {
 
 fn ts_dequeue_head(ts: &mut Turnstile) -> Option<u32> {
     let head = ts.head;
-    if head == TS_NIL { return None; }
+    if head == TS_NIL {
+        return None;
+    }
     let head_ref = thread_ref(head);
     let next = head_ref.ts_next.load(Ordering::Relaxed);
     head_ref.ts_next.store(TS_NIL, Ordering::Relaxed);
@@ -469,7 +533,9 @@ pub fn futex_wait(addr: usize, expected: u32) -> u64 {
 
         let ts = unsafe { &mut *ts_ptr };
         ts_enqueue(ts, tid);
-        thread_ref(tid).ts_blocked_on.store(ts_ptr as usize, Ordering::Relaxed);
+        thread_ref(tid)
+            .ts_blocked_on
+            .store(ts_ptr as usize, Ordering::Relaxed);
     }
 
     crate::sched::block_current(BlockReason::FutexWait);
@@ -524,7 +590,11 @@ pub fn futex_wake(addr: usize, count: u32) -> u64 {
         // Return turnstile to the last woken thread if it needs one.
         if last_tid != TS_NIL {
             let tref = thread_ref(last_tid);
-            if tref.turnstile.compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            if tref
+                .turnstile
+                .compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+            {
                 free_turnstile(ts_ptr);
             }
         } else {
@@ -602,7 +672,9 @@ pub fn futex_wait_pi(addr: usize, expected_owner: u32) -> u64 {
             ts.max_waiter_prio = my_prio;
         }
 
-        thread_ref(tid).ts_blocked_on.store(ts_ptr as usize, Ordering::Relaxed);
+        thread_ref(tid)
+            .ts_blocked_on
+            .store(ts_ptr as usize, Ordering::Relaxed);
 
         // Boost the lock owner's priority.
         if expected_owner != 0 {
@@ -649,7 +721,9 @@ pub fn futex_wake_pi(addr: usize) -> u64 {
         Some(tid) => tid,
         None => return 1,
     };
-    thread_ref(new_owner).ts_blocked_on.store(0, Ordering::Relaxed);
+    thread_ref(new_owner)
+        .ts_blocked_on
+        .store(0, Ordering::Relaxed);
 
     // Transfer ownership.
     let has_more = ts.waiter_count > 0;
@@ -672,7 +746,11 @@ pub fn futex_wake_pi(addr: usize) -> u64 {
     if ts.waiter_count == 0 {
         hamt_remove(&mut root, hash, KEY_FUTEX, aspace_id, addr);
         let tref = thread_ref(new_owner);
-        if tref.turnstile.compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        if tref
+            .turnstile
+            .compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
             free_turnstile(ts_ptr);
         }
     }
@@ -687,7 +765,15 @@ pub fn futex_wake_pi(addr: usize) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Clean up if a thread is still on a turnstile wait queue (killed case).
-fn cleanup_blocked_inner(tid: u32, ts_addr: usize, bucket: usize, hash: u64, key_type: u8, aspace_id: u64, va: usize) {
+fn cleanup_blocked_inner(
+    tid: u32,
+    ts_addr: usize,
+    bucket: usize,
+    hash: u64,
+    key_type: u8,
+    aspace_id: u64,
+    va: usize,
+) {
     let mut root = WAIT_HAMT[bucket].lock();
     if let Some(found_ts) = hamt_lookup(&root, hash, key_type, aspace_id, va) {
         if found_ts as usize == ts_addr {
@@ -704,7 +790,9 @@ fn cleanup_blocked_inner(tid: u32, ts_addr: usize, bucket: usize, hash: u64, key
 pub fn cleanup_blocked(tid: u32) {
     let tref = thread_ref(tid);
     let ts_addr = tref.ts_blocked_on.swap(0, Ordering::Acquire);
-    if ts_addr == 0 { return; }
+    if ts_addr == 0 {
+        return;
+    }
     let ts = unsafe { &*(ts_addr as *const Turnstile) };
     let bucket = bucket_index(ts.hash);
     let hash = ts.hash;
@@ -781,7 +869,9 @@ pub fn port_enqueue_with_check<F: FnOnce() -> bool>(
 
     let ts = unsafe { &mut *ts_ptr };
     ts_enqueue(ts, tid);
-    thread_ref(tid).ts_blocked_on.store(ts_ptr as usize, Ordering::Relaxed);
+    thread_ref(tid)
+        .ts_blocked_on
+        .store(ts_ptr as usize, Ordering::Relaxed);
 
     drop(root);
     true
@@ -811,7 +901,11 @@ pub fn port_wake_one(port_id: u64, key_type: u8) -> Option<u32> {
     if ts.waiter_count == 0 {
         hamt_remove(&mut root, hash, key_type, aspace_id, va);
         let tref = thread_ref(tid);
-        if tref.turnstile.compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        if tref
+            .turnstile
+            .compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
             free_turnstile(ts_ptr);
         }
     }
@@ -846,7 +940,11 @@ pub fn port_dequeue_one(port_id: u64, key_type: u8) -> Option<u32> {
     if ts.waiter_count == 0 {
         hamt_remove(&mut root, hash, key_type, aspace_id, va);
         let tref = thread_ref(tid);
-        if tref.turnstile.compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        if tref
+            .turnstile
+            .compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
             free_turnstile(ts_ptr);
         }
     }
@@ -883,7 +981,11 @@ pub fn port_wake_all(port_id: u64, key_type: u8) -> u32 {
     hamt_remove(&mut root, hash, key_type, aspace_id, va);
     if last_tid != TS_NIL {
         let tref = thread_ref(last_tid);
-        if tref.turnstile.compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        if tref
+            .turnstile
+            .compare_exchange(0, ts_ptr as usize, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
             free_turnstile(ts_ptr);
         }
     } else {

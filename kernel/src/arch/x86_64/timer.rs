@@ -21,7 +21,9 @@ static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 unsafe fn outb(port: u16, val: u8) {
-    unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
+    }
 }
 
 /// Initialize the PIT channel 0 at ~100 Hz.
@@ -44,14 +46,15 @@ pub fn init() {
 /// Handle PIT timer interrupt (IRQ 0). Called from interrupt handler.
 pub fn handle_timer_irq() {
     let _ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-
 }
 
 /// Read the Time Stamp Counter (RDTSC).
 pub fn rdtsc() -> u64 {
     let lo: u32;
     let hi: u32;
-    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+    }
     ((hi as u64) << 32) | (lo as u64)
 }
 
@@ -61,4 +64,3 @@ pub fn enable_interrupts() {
         core::arch::asm!("sti", options(nomem, nostack));
     }
 }
-

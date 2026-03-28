@@ -92,7 +92,9 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
                             let mut all_unmapped = true;
                             for i in ap_start..ap_end {
                                 let check_va = vma.va_start + i * MMUPAGE_SIZE;
-                                if fault::pte_is_present(fault::read_pte_dispatch(pt_root, check_va)) {
+                                if fault::pte_is_present(fault::read_pte_dispatch(
+                                    pt_root, check_va,
+                                )) {
                                     all_unmapped = false;
                                     break;
                                 }

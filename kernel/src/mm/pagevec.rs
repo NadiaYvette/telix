@@ -13,7 +13,7 @@
 //! - Slab 2048: capacity 65..=256 (2048-byte slab allocation)
 //! - Full page: capacity > 256  (dedicated phys page, up to PAGE_SIZE/8 entries)
 
-use super::page::{PhysAddr, PAGE_SIZE};
+use super::page::{PAGE_SIZE, PhysAddr};
 
 /// Maximum entries stored directly in the struct.
 const INLINE_CAP: usize = 4;
@@ -93,7 +93,9 @@ impl PageVec {
         if self.heap_ptr == 0 {
             self.inline[idx] = val;
         } else {
-            unsafe { *((self.heap_ptr + idx * core::mem::size_of::<usize>()) as *mut usize) = val; }
+            unsafe {
+                *((self.heap_ptr + idx * core::mem::size_of::<usize>()) as *mut usize) = val;
+            }
         }
     }
 
@@ -182,12 +184,17 @@ impl PageVec {
 
 /// Round up to the next slab-aligned capacity.
 fn rounded_heap_cap(needed: usize) -> usize {
-    if needed <= 8 { 8 }
-    else if needed <= 16 { 16 }
-    else if needed <= 32 { 32 }
-    else if needed <= 64 { 64 }
-    else if needed <= 256 { 256 }
-    else {
+    if needed <= 8 {
+        8
+    } else if needed <= 16 {
+        16
+    } else if needed <= 32 {
+        32
+    } else if needed <= 64 {
+        64
+    } else if needed <= 256 {
+        256
+    } else {
         // Round up to PAGE_SIZE / sizeof(usize) = PAGE_SIZE / 8.
         let entries_per_page = PAGE_SIZE / core::mem::size_of::<usize>();
         ((needed + entries_per_page - 1) / entries_per_page) * entries_per_page

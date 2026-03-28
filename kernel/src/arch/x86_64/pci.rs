@@ -2,7 +2,7 @@
 //!
 //! Scans bus 0 for virtio devices and returns BAR0 + IRQ info.
 
-use super::serial::{inl, outl, inb, outb, inw, outw};
+use super::serial::{inb, inl, inw, outb, outl, outw};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -85,8 +85,13 @@ pub fn find_virtio_device(device_id: u16) -> Option<PciDevice> {
                 pci_config_write16(0, dev, 0, 0x04, cmd | 0x05); // IO space + bus master
             }
 
-            crate::println!("  PCI: found virtio dev={:#x} at slot {} BAR0={:#x} IRQ={}",
-                did, dev, bar0, irq);
+            crate::println!(
+                "  PCI: found virtio dev={:#x} at slot {} BAR0={:#x} IRQ={}",
+                did,
+                dev,
+                bar0,
+                irq
+            );
 
             return Some(PciDevice {
                 bus: 0,

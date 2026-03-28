@@ -73,7 +73,7 @@ pub fn init() {
     // Use DTB-discovered timebase frequency, fall back to 10 MHz (QEMU default).
     let fw_freq = crate::firmware::timebase_freq();
     let freq: u64 = if fw_freq != 0 { fw_freq } else { 10_000_000 };
-    let interval = freq / 100;  // 100 Hz
+    let interval = freq / 100; // 100 Hz
     TIMER_INTERVAL.store(interval, Ordering::Relaxed);
 
     // Set first timer deadline.
@@ -89,8 +89,12 @@ pub fn init() {
     // Initialize PLIC for hart 0.
     super::plic::init(0);
 
-    crate::println!("  Timer initialized: timebase={}Hz, interval={} ticks ({}ms)",
-        freq, interval, 1000 * interval / freq);
+    crate::println!(
+        "  Timer initialized: timebase={}Hz, interval={} ticks ({}ms)",
+        freq,
+        interval,
+        1000 * interval / freq
+    );
 }
 
 /// Initialize trap/timer on a secondary hart.
@@ -116,7 +120,9 @@ pub fn init_ap() {
 
     // Initialize PLIC for this hart.
     let hart: u32;
-    unsafe { core::arch::asm!("mv {0}, tp", out(reg) hart); }
+    unsafe {
+        core::arch::asm!("mv {0}, tp", out(reg) hart);
+    }
     super::plic::init(hart);
 }
 
@@ -131,7 +137,9 @@ pub fn enable_interrupts() {
 fn handle_external_irq() {
     // Determine hart ID from tp register.
     let hart: u32;
-    unsafe { core::arch::asm!("mv {0}, tp", out(reg) hart); }
+    unsafe {
+        core::arch::asm!("mv {0}, tp", out(reg) hart);
+    }
 
     let irq = super::plic::claim(hart);
     if irq == 0 {
@@ -165,7 +173,6 @@ fn handle_timer_irq() {
     let interval = TIMER_INTERVAL.load(Ordering::Relaxed);
     let now = read_time();
     sbi_set_timer(now + interval);
-
 }
 
 /// Main Rust trap handler. Called from vectors.S with current SP as argument.
@@ -216,9 +223,18 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                 let spp = (frame.sstatus >> 8) & 1;
                 crate::println!(
                     "Kernel page fault: cause={:#x} sepc={:#x} stval={:#x} cpu={} tid={} spp={} sstatus={:#x} sp(frame)={:#x}",
-                    scause, frame.sepc, stval, cpu, tid, spp, frame.sstatus, frame.regs[1]
+                    scause,
+                    frame.sepc,
+                    stval,
+                    cpu,
+                    tid,
+                    spp,
+                    frame.sstatus,
+                    frame.regs[1]
                 );
-                loop { core::hint::spin_loop(); }
+                loop {
+                    core::hint::spin_loop();
+                }
             }
             let result = crate::mm::fault::handle_page_fault(aspace_id, stval as usize, fault_type);
             match result {
@@ -226,13 +242,17 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                     crate::sched::scheduler::store_frame_sp(frame_sp);
                     crate::mm::pager::initiate_fault(token);
                     let pending = crate::sched::scheduler::take_pending_switch();
-                    if pending != 0 { return pending; }
+                    if pending != 0 {
+                        return pending;
+                    }
                     frame_sp
                 }
                 crate::mm::fault::FaultResult::Failed => {
                     crate::println!(
                         "Unhandled page fault: cause={:#x} sepc={:#x} stval={:#x} — killing thread",
-                        scause, frame.sepc, stval
+                        scause,
+                        frame.sepc,
+                        stval
                     );
                     crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
                 }
@@ -244,12 +264,15 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             if scause & SCAUSE_INTERRUPT_BIT != 0 {
                 crate::println!(
                     "Unhandled S-mode interrupt: cause={:#x} sepc={:#x}",
-                    scause & !SCAUSE_INTERRUPT_BIT, frame.sepc
+                    scause & !SCAUSE_INTERRUPT_BIT,
+                    frame.sepc
                 );
             } else {
                 crate::println!(
                     "Unhandled S-mode exception: cause={:#x} sepc={:#x} stval={:#x}",
-                    scause, frame.sepc, read_stval()
+                    scause,
+                    frame.sepc,
+                    read_stval()
                 );
                 loop {
                     core::hint::spin_loop();

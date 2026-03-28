@@ -52,7 +52,9 @@ impl CapSet {
     pub fn has(&self, port_local: u64, needed_perms: u8) -> bool {
         for i in 0..INLINE_CAP {
             let e = self.entries[i].load(Ordering::Relaxed);
-            if e == 0 { continue; }
+            if e == 0 {
+                continue;
+            }
             if entry_port(e) == port_local {
                 return (entry_perms(e) & needed_perms) == needed_perms;
             }
@@ -84,7 +86,9 @@ impl CapSet {
         let mut evicted = false;
         for i in 0..INLINE_CAP {
             let e = self.entries[i].load(Ordering::Relaxed);
-            if e == 0 { continue; }
+            if e == 0 {
+                continue;
+            }
             let pl = entry_port(e);
             if !crate::ipc::port::port_is_active_local(pl) {
                 self.entries[i].store(0, Ordering::Relaxed);

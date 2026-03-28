@@ -75,8 +75,13 @@ struct OpenFile {
 impl OpenFile {
     const fn empty() -> Self {
         Self {
-            first_cluster: 0, file_size: 0, active: false,
-            writable: false, dir_sector: 0, dir_offset: 0, last_cluster: 0,
+            first_cluster: 0,
+            file_size: 0,
+            active: false,
+            writable: false,
+            dir_sector: 0,
+            dir_offset: 0,
+            last_cluster: 0,
         }
     }
 }
@@ -101,7 +106,6 @@ fn print_num(n: u64) {
         syscall::debug_putchar(buf[i]);
     }
 }
-
 
 fn pack_inline_data(data: &[u8]) -> [u64; 3] {
     let mut words = [0u64; 3];
@@ -172,15 +176,12 @@ impl BlkClient {
     fn write_sector(&self, sector: u32, data: &[u8; 512]) -> bool {
         // Copy data into scratch page.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                self.scratch_va as *mut u8,
-                512,
-            );
+            core::ptr::copy_nonoverlapping(data.as_ptr(), self.scratch_va as *mut u8, 512);
         }
 
         // Grant our scratch page to blk_srv.
-        let grant_ok = syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false);
+        let grant_ok =
+            syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false);
         if !grant_ok {
             syscall::debug_puts(b"  [fat16_srv] GRANT FAILED for write\n");
             return false;
@@ -251,7 +252,9 @@ fn write_u32(buf: &mut [u8], off: usize, val: u32) {
 fn set_fat_entry(fat_va: usize, cluster: u16, value: u16) {
     let offset = (cluster as usize) * 2;
     let ptr = (fat_va + offset) as *mut u16;
-    unsafe { core::ptr::write(ptr, value); }
+    unsafe {
+        core::ptr::write(ptr, value);
+    }
 }
 
 /// Find first free cluster (FAT entry == 0x0000). Starts from cluster 2.
@@ -288,7 +291,11 @@ fn flush_fat(blk: &BlkClient, fat_va: usize, fat_start: u32, fat_sectors: u32) {
 }
 
 /// Find a free directory entry in the root directory. Returns (sector, byte_offset_in_sector).
-fn find_free_dir_entry(blk: &BlkClient, layout: &Fat16Layout, root_entry_count: u16) -> Option<(u32, usize)> {
+fn find_free_dir_entry(
+    blk: &BlkClient,
+    layout: &Fat16Layout,
+    root_entry_count: u16,
+) -> Option<(u32, usize)> {
     let entries_per_sector = 16usize; // 512 / 32
     let total_entries = root_entry_count as usize;
     let mut idx = 0;
@@ -299,7 +306,9 @@ fn find_free_dir_entry(blk: &BlkClient, layout: &Fat16Layout, root_entry_count: 
             return None;
         }
         for e in 0..entries_per_sector {
-            if idx + e >= total_entries { return None; }
+            if idx + e >= total_entries {
+                return None;
+            }
             let off = e * 32;
             let first_byte = sec[off];
             if first_byte == 0x00 || first_byte == 0xE5 {
@@ -312,12 +321,23 @@ fn find_free_dir_entry(blk: &BlkClient, layout: &Fat16Layout, root_entry_count: 
 }
 
 /// Write a 32-byte directory entry to a specific sector at a given offset.
-fn write_dir_entry(blk: &BlkClient, sector: u32, offset: usize, name: &[u8; 11], cluster: u16, size: u32) -> bool {
+fn write_dir_entry(
+    blk: &BlkClient,
+    sector: u32,
+    offset: usize,
+    name: &[u8; 11],
+    cluster: u16,
+    size: u32,
+) -> bool {
     let mut sec = [0u8; 512];
     let rd = blk.read_sector(sector, &mut sec);
-    if !rd { return false; }
+    if !rd {
+        return false;
+    }
     // Clear entry.
-    for i in 0..32 { sec[offset + i] = 0; }
+    for i in 0..32 {
+        sec[offset + i] = 0;
+    }
     // 8.3 name.
     sec[offset..offset + 11].copy_from_slice(name);
     // Attribute: normal file (0x20 = archive).
@@ -364,7 +384,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  [fat16_srv] cache_blk not found, exiting\n");
                 syscall::exit(1);
             }
-            for _ in 0..50 { syscall::yield_now(); }
+            for _ in 0..50 {
+                syscall::yield_now();
+            }
         }
     };
 
@@ -385,11 +407,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             reply.data[2]
         } else {
             syscall::debug_puts(b"  [fat16_srv] blk connect FAILED\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     } else {
         syscall::debug_puts(b"  [fat16_srv] blk no reply\n");
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     };
 
     // Allocate scratch page for block reads.
@@ -397,7 +423,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [fat16_srv] scratch alloc FAILED\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     };
 
@@ -413,13 +441,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let mut boot_sector = [0u8; 512];
     if !blk.read_sector(0, &mut boot_sector) {
         syscall::debug_puts(b"  [fat16_srv] failed to read boot sector\n");
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
     // Verify boot signature.
     if boot_sector[510] != 0x55 || boot_sector[511] != 0xAA {
         syscall::debug_puts(b"  [fat16_srv] bad boot signature\n");
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
     // Parse BPB.
@@ -472,7 +504,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [fat16_srv] fat alloc FAILED\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     };
     // Read FAT sectors (up to 8 sectors = 4096 bytes = 1 page).
@@ -481,7 +515,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let mut sec = [0u8; 512];
         if !blk.read_sector(layout.fat_start + i, &mut sec) {
             syscall::debug_puts(b"  [fat16_srv] failed to read FAT sector\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -577,8 +613,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     if handle == u64::MAX {
                         syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
                     } else {
-                        syscall::send(reply_port, FS_OPEN_OK,
-                            handle, file_size as u64, my_aspace as u64, 0);
+                        syscall::send(
+                            reply_port,
+                            FS_OPEN_OK,
+                            handle,
+                            file_size as u64,
+                            my_aspace as u64,
+                            0,
+                        );
                     }
                 } else {
                     syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
@@ -651,11 +693,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // Inline read.
                     let inline_len = (bytes_in_sector as usize).min(MAX_INLINE);
                     let packed = pack_inline_data(
-                        &sec[offset_in_sector as usize
-                            ..(offset_in_sector as usize + inline_len)],
+                        &sec[offset_in_sector as usize..(offset_in_sector as usize + inline_len)],
                     );
-                    syscall::send(reply_port, FS_READ_OK,
-                        inline_len as u64, packed[0], packed[1], packed[2]);
+                    syscall::send(
+                        reply_port,
+                        FS_READ_OK,
+                        inline_len as u64,
+                        packed[0],
+                        packed[1],
+                        packed[2],
+                    );
                 }
             }
 
@@ -733,8 +780,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
 
                     // FS_READDIR_OK: data[0]=file_size, data[1]=name_lo, data[2]=name_hi, data[3]=next_index
-                    syscall::send(reply_port, FS_READDIR_OK,
-                        file_size as u64, name_lo, name_hi, idx as u64);
+                    syscall::send(
+                        reply_port,
+                        FS_READDIR_OK,
+                        file_size as u64,
+                        name_lo,
+                        name_hi,
+                        idx as u64,
+                    );
                     found = true;
                     break;
                 }
@@ -793,8 +846,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if handle == u64::MAX {
                     syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
                 } else {
-                    syscall::send(reply_port, FS_CREATE_OK,
-                        handle, 0, my_aspace as u64, 0);
+                    syscall::send(reply_port, FS_CREATE_OK, handle, 0, my_aspace as u64, 0);
                 }
             }
 
@@ -805,7 +857,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let reply_port = msg.data[1] >> 32;
                 let grant_va = msg.data[2] as usize;
 
-                if handle >= MAX_OPEN_FILES || !open_files[handle].active || !open_files[handle].writable {
+                if handle >= MAX_OPEN_FILES
+                    || !open_files[handle].active
+                    || !open_files[handle].writable
+                {
                     syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
                     continue;
                 }
@@ -913,10 +968,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     for e in 0..16 {
                         let off = e * 32;
                         let first_byte = sec[off];
-                        if first_byte == 0x00 { break 'del_search; }
-                        if first_byte == 0xE5 { continue; }
+                        if first_byte == 0x00 {
+                            break 'del_search;
+                        }
+                        if first_byte == 0xE5 {
+                            continue;
+                        }
                         let attrs = sec[off + 11];
-                        if attrs & 0x18 != 0 { continue; } // Skip volume label + subdir
+                        if attrs & 0x18 != 0 {
+                            continue;
+                        } // Skip volume label + subdir
                         if &sec[off..off + 11] == &name83 {
                             first_cluster = read_u16(&sec, off + 26);
                             found_sector = layout.root_dir_start + s;
@@ -962,7 +1023,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Read a FAT16 entry for the given cluster number.

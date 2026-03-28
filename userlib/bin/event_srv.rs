@@ -340,10 +340,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                     } else {
                         match slot.etype {
                             EventType::EventFd => {
-                                if slot.counter > 0 { 1 } else { 0 }
+                                if slot.counter > 0 {
+                                    1
+                                } else {
+                                    0
+                                }
                             }
                             EventType::TimerFd => {
-                                if slot.timer_expirations > 0 { 1 } else { 0 }
+                                if slot.timer_expirations > 0 {
+                                    1
+                                } else {
+                                    0
+                                }
                             }
                             _ => 0,
                         }

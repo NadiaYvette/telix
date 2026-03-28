@@ -11,9 +11,9 @@
 //! - Mutations use COW for Node4/Node16 (no in-place shifts visible to
 //!   readers) and deferred free via RCU for replaced nodes.
 
-use crate::mm::slab;
 use crate::mm::page::PhysAddr;
 use crate::mm::phys;
+use crate::mm::slab;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Key length in bytes (48-bit key space, upper 4 bits always 0).
@@ -94,10 +94,7 @@ fn free_leaf(p: *mut Leaf) {
 
 /// Defer-free a published leaf (reclaimed after RCU grace period).
 fn rcu_defer_free_leaf(p: *mut Leaf) {
-    crate::sync::rcu::rcu_defer_free(
-        p as usize,
-        crate::sync::rcu::free_slab64_callback,
-    );
+    crate::sync::rcu::rcu_defer_free(p as usize, crate::sync::rcu::free_slab64_callback);
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +574,11 @@ impl Art {
             }
             if is_leaf(node) {
                 let leaf = unsafe { &*untag_leaf(node) };
-                return if leaf.key == key { Some(leaf.value) } else { None };
+                return if leaf.key == key {
+                    Some(leaf.value)
+                } else {
+                    None
+                };
             }
 
             let h = unsafe { &*(node as *const Header) };
@@ -612,7 +613,9 @@ impl Art {
         };
 
         if self.root == 0 {
-            unsafe { slot_store(&mut self.root, tag_leaf(leaf)); }
+            unsafe {
+                slot_store(&mut self.root, tag_leaf(leaf));
+            }
             self.len += 1;
             return true;
         }
@@ -806,14 +809,15 @@ unsafe fn split_node(
         shortened[i] = old_h.partial[match_len + 1 + i];
     }
 
-    let cloned = match clone_node_with_partial(old_node_ptr, &shortened[..remaining.min(MAX_PARTIAL)]) {
-        Some(c) => c,
-        None => {
-            // Free unpublished parent.
-            free_node(parent as usize);
-            return false;
-        }
-    };
+    let cloned =
+        match clone_node_with_partial(old_node_ptr, &shortened[..remaining.min(MAX_PARTIAL)]) {
+            Some(c) => c,
+            None => {
+                // Free unpublished parent.
+                free_node(parent as usize);
+                return false;
+            }
+        };
 
     if old_byte < new_byte {
         (*parent).keys[0] = old_byte;

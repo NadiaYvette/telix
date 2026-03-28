@@ -9,7 +9,11 @@
 const PLIC_FALLBACK: usize = 0x0C00_0000;
 fn plic_base() -> usize {
     let info = crate::firmware::irq_controller();
-    if info.kind != 0 { info.base0 as usize } else { PLIC_FALLBACK }
+    if info.kind != 0 {
+        info.base0 as usize
+    } else {
+        PLIC_FALLBACK
+    }
 }
 
 // Register offsets from PLIC base

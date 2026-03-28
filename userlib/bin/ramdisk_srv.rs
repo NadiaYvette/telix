@@ -78,8 +78,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             IO_CONNECT => {
                 let reply_port = msg.data[2] >> 32;
                 // data[0]=handle(0), data[1]=size, data[2]=server_aspace_id
-                syscall::send(reply_port, IO_CONNECT_OK,
-                    0, RAMDISK_SIZE as u64, my_aspace as u64, 0);
+                syscall::send(
+                    reply_port,
+                    IO_CONNECT_OK,
+                    0,
+                    RAMDISK_SIZE as u64,
+                    my_aspace as u64,
+                    0,
+                );
             }
 
             IO_READ => {
@@ -110,8 +116,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // Inline read.
                     let bytes_read = data.len().min(MAX_INLINE_READ);
                     let packed = pack_inline_data(&data[..bytes_read]);
-                    syscall::send(reply_port, IO_READ_OK,
-                        bytes_read as u64, packed[0], packed[1], packed[2]);
+                    syscall::send(
+                        reply_port,
+                        IO_READ_OK,
+                        bytes_read as u64,
+                        packed[0],
+                        packed[1],
+                        packed[2],
+                    );
                 }
             }
 
@@ -161,5 +173,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

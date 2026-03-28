@@ -8,11 +8,11 @@
 //! avoid conflicting with the kernel's 1 GiB page entries.
 
 /// x86-64 page table entry flags.
-const PTE_P: u64 = 1 << 0;       // Present
-const PTE_RW: u64 = 1 << 1;      // Read/Write
-const PTE_US: u64 = 1 << 2;      // User/Supervisor
-const PTE_PS: u64 = 1 << 7;      // Page Size (2M/1G large page)
-const PTE_NX: u64 = 1u64 << 63;  // No Execute
+const PTE_P: u64 = 1 << 0; // Present
+const PTE_RW: u64 = 1 << 1; // Read/Write
+const PTE_US: u64 = 1 << 2; // User/Supervisor
+const PTE_PS: u64 = 1 << 7; // Page Size (2M/1G large page)
+const PTE_NX: u64 = 1u64 << 63; // No Execute
 /// Software-defined bit: page content has been initialized (zeroed/filled).
 /// AVL bit 9 (bits 9-11 are available to software in x86-64 PTEs).
 pub const PTE_SW_ZEROED: u64 = 1 << 9;
@@ -45,7 +45,9 @@ fn alloc_table() -> Option<usize> {
 /// page tables set up by boot.S.
 pub fn setup_tables() -> Option<usize> {
     let cr3: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3); }
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3);
+    }
     let pml4 = (cr3 & !0xFFF) as usize;
     // Save boot PML4 for create_user_page_table.
     BOOT_PML4.store(pml4, core::sync::atomic::Ordering::Release);
@@ -158,7 +160,9 @@ pub fn unmap_single_mmupage(pml4: usize, va: usize) -> usize {
         return 0;
     }
     let pa = X86Pte::leaf_pa(entry);
-    unsafe { *slot = 0; }
+    unsafe {
+        *slot = 0;
+    }
     X86Pte::tlb_invalidate(va);
     pa
 }
@@ -179,9 +183,13 @@ pub fn evict_mmupage(pml4: usize, va: usize) -> usize {
         None => return 0,
     };
     let entry = unsafe { *slot };
-    if entry & PTE_P == 0 { return 0; }
+    if entry & PTE_P == 0 {
+        return 0;
+    }
     let pa = X86Pte::leaf_pa(entry);
-    unsafe { *slot = entry & PTE_SW_ZEROED; }
+    unsafe {
+        *slot = entry & PTE_SW_ZEROED;
+    }
     X86Pte::tlb_invalidate(va);
     pa
 }
@@ -194,7 +202,9 @@ pub fn clear_pte(pml4: usize, va: usize) {
     };
     let entry = unsafe { *slot };
     if entry != 0 {
-        unsafe { *slot = 0; }
+        unsafe {
+            *slot = 0;
+        }
         X86Pte::tlb_invalidate(va);
     }
 }
@@ -212,7 +222,9 @@ pub fn read_and_clear_ref_bit(pml4: usize, va: usize) -> bool {
     }
     let referenced = (entry & PTE_A) != 0;
     if referenced {
-        unsafe { *slot = entry & !PTE_A; }
+        unsafe {
+            *slot = entry & !PTE_A;
+        }
         X86Pte::tlb_invalidate(va);
     }
     referenced
@@ -258,11 +270,7 @@ pub fn create_user_page_table() -> Option<usize> {
         if boot_pml4_0 & PTE_P != 0 {
             let boot_pdpt = (boot_pml4_0 & 0x000F_FFFF_FFFF_F000) as usize;
             let new_pdpt = alloc_table()?;
-            core::ptr::copy_nonoverlapping(
-                boot_pdpt as *const u64,
-                new_pdpt as *mut u64,
-                512,
-            );
+            core::ptr::copy_nonoverlapping(boot_pdpt as *const u64, new_pdpt as *mut u64, 512);
             // Point new PML4[0] to the copied PDPT.
             // Add U/S so the CPU allows user-mode page table walks to the PDPT.
             // Kernel gigapages at PDPT[0-3] are safe: they lack U/S, so user
@@ -362,7 +370,9 @@ pub fn downgrade_pte_readonly(pml4: usize, va: usize) -> bool {
         return false;
     }
     // Clear the RW bit to make read-only.
-    unsafe { *slot = entry & !PTE_RW; }
+    unsafe {
+        *slot = entry & !PTE_RW;
+    }
     X86Pte::tlb_invalidate(va);
     true
 }
@@ -379,7 +389,9 @@ pub fn update_pte_flags(pml4: usize, va: usize, new_flags: u64) -> bool {
         return false;
     }
     let pa_and_sw = entry & (0x000F_FFFF_FFFF_F000 | PTE_SW_ZEROED);
-    unsafe { *slot = pa_and_sw | new_flags; }
+    unsafe {
+        *slot = pa_and_sw | new_flags;
+    }
     X86Pte::tlb_invalidate(va);
     true
 }
@@ -405,7 +417,9 @@ pub fn install_superpage(pml4: usize, va: usize, pa: usize, flags: u64) -> bool 
     }
 
     // Install 2 MiB large page entry.
-    unsafe { *slot = (pa as u64 & !0x1FFFFF) | flags | PTE_PS; }
+    unsafe {
+        *slot = (pa as u64 & !0x1FFFFF) | flags | PTE_PS;
+    }
     X86Pte::tlb_invalidate(va);
     true
 }
@@ -454,7 +468,9 @@ pub fn demote_superpage(pml4: usize, va: usize, flags: u64) -> bool {
     }
 
     // Replace PD entry with table pointer.
-    unsafe { *slot = X86Pte::make_table_entry(pt); }
+    unsafe {
+        *slot = X86Pte::make_table_entry(pt);
+    }
     X86Pte::tlb_invalidate(va);
     true
 }

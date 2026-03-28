@@ -160,9 +160,7 @@ fn print_num(n: u64) {
 /// Entry: arg0 = port ID, arg1 = CPIO data VA, arg2 = CPIO data length.
 #[unsafe(no_mangle)]
 fn main(port_id: u64, data_va: u64, data_len: u64) {
-    let cpio_data = unsafe {
-        core::slice::from_raw_parts(data_va as *const u8, data_len as usize)
-    };
+    let cpio_data = unsafe { core::slice::from_raw_parts(data_va as *const u8, data_len as usize) };
 
     let mut fs = Initramfs::new();
     fs.parse(cpio_data);
@@ -201,9 +199,14 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                 match fs.find(name) {
                     Some(idx) => {
                         // data[0]=handle, data[1]=size, data[2]=server_aspace_id
-                        syscall::send(reply_port, IO_CONNECT_OK,
-                            idx as u64, fs.files[idx].data_len as u64,
-                            my_aspace as u64, 0);
+                        syscall::send(
+                            reply_port,
+                            IO_CONNECT_OK,
+                            idx as u64,
+                            fs.files[idx].data_len as u64,
+                            my_aspace as u64,
+                            0,
+                        );
                     }
                     None => {
                         syscall::send_nb(reply_port, IO_ERROR, ERR_NOT_FOUND, 0);
@@ -243,8 +246,14 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                     // Inline read: pack into message words.
                     let bytes_read = data.len().min(MAX_INLINE_READ);
                     let packed = pack_inline_data(&data[..bytes_read]);
-                    syscall::send(reply_port, IO_READ_OK,
-                        bytes_read as u64, packed[0], packed[1], packed[2]);
+                    syscall::send(
+                        reply_port,
+                        IO_READ_OK,
+                        bytes_read as u64,
+                        packed[0],
+                        packed[1],
+                        packed[2],
+                    );
                 }
             }
 
@@ -258,7 +267,12 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                     continue;
                 }
 
-                syscall::send_nb(reply_port, IO_STAT_OK, fs.files[file_handle].data_len as u64, 0);
+                syscall::send_nb(
+                    reply_port,
+                    IO_STAT_OK,
+                    fs.files[file_handle].data_len as u64,
+                    0,
+                );
             }
 
             IO_CLOSE => {}
@@ -266,5 +280,7 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
         }
     }
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

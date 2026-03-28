@@ -61,11 +61,11 @@ const CANON_SIZE: usize = 256;
 const NO_READER: u64 = u64::MAX;
 
 // Control character indices.
-const VINTR: usize = 0;  // ^C
-const VEOF: usize = 1;   // ^D
+const VINTR: usize = 0; // ^C
+const VEOF: usize = 1; // ^D
 const VERASE: usize = 2; // Backspace
-const VKILL: usize = 3;  // ^U
-const VSUSP: usize = 4;  // ^Z
+const VKILL: usize = 3; // ^U
+const VSUSP: usize = 4; // ^Z
 
 struct RingBuf {
     buf: [u8; BUF_SIZE],
@@ -75,18 +75,29 @@ struct RingBuf {
 
 impl RingBuf {
     const fn new() -> Self {
-        Self { buf: [0; BUF_SIZE], head: 0, tail: 0 }
+        Self {
+            buf: [0; BUF_SIZE],
+            head: 0,
+            tail: 0,
+        }
     }
 
     fn len(&self) -> usize {
-        if self.head >= self.tail { self.head - self.tail }
-        else { BUF_SIZE - self.tail + self.head }
+        if self.head >= self.tail {
+            self.head - self.tail
+        } else {
+            BUF_SIZE - self.tail + self.head
+        }
     }
 
-    fn free(&self) -> usize { BUF_SIZE - 1 - self.len() }
+    fn free(&self) -> usize {
+        BUF_SIZE - 1 - self.len()
+    }
 
     fn push_byte(&mut self, b: u8) -> bool {
-        if self.free() == 0 { return false; }
+        if self.free() == 0 {
+            return false;
+        }
         self.buf[self.head] = b;
         self.head = (self.head + 1) % BUF_SIZE;
         true
@@ -169,8 +180,11 @@ fn pack_bytes(data: &[u8], len: usize) -> (u64, u64) {
     let mut w1 = 0u64;
     let n = if len > 16 { 16 } else { len };
     for i in 0..n {
-        if i < 8 { w0 |= (data[i] as u64) << (i * 8); }
-        else { w1 |= (data[i] as u64) << ((i - 8) * 8); }
+        if i < 8 {
+            w0 |= (data[i] as u64) << (i * 8);
+        } else {
+            w1 |= (data[i] as u64) << ((i - 8) * 8);
+        }
     }
     (w0, w1)
 }
@@ -182,7 +196,9 @@ fn reply(port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
 /// Try to deliver data to a blocked master reader.
 fn try_wake_master(slot: usize) {
     let p = unsafe { &mut PTYS[slot] };
-    if p.master_reader == NO_READER { return; }
+    if p.master_reader == NO_READER {
+        return;
+    }
     if p.s2m.len() > 0 {
         let rp = p.master_reader;
         let mut tmp = [0u8; 16];
@@ -200,7 +216,9 @@ fn try_wake_master(slot: usize) {
 /// Try to deliver data to a blocked slave reader.
 fn try_wake_slave(slot: usize) {
     let p = unsafe { &mut PTYS[slot] };
-    if p.slave_reader == NO_READER { return; }
+    if p.slave_reader == NO_READER {
+        return;
+    }
     if p.m2s.len() > 0 {
         let rp = p.slave_reader;
         let mut tmp = [0u8; 16];
@@ -258,9 +276,9 @@ fn ldisc_input(slot: usize, b: u8) {
             if p.canon_len > 0 {
                 p.canon_len -= 1;
                 if p.lflag & ECHO != 0 {
-                    p.s2m.push_byte(8);  // BS
+                    p.s2m.push_byte(8); // BS
                     p.s2m.push_byte(b' ');
-                    p.s2m.push_byte(8);  // BS
+                    p.s2m.push_byte(8); // BS
                 }
             }
         } else if b == p.cc[VKILL] {
@@ -396,8 +414,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let b0 = msg.data[1].to_le_bytes();
                 let b1 = msg.data[3].to_le_bytes();
                 let mut i = 0;
-                while i < len && i < 8 { tmp[i] = b0[i]; i += 1; }
-                while i < len && i < 16 { tmp[i] = b1[i - 8]; i += 1; }
+                while i < len && i < 8 {
+                    tmp[i] = b0[i];
+                    i += 1;
+                }
+                while i < len && i < 16 {
+                    tmp[i] = b1[i - 8];
+                    i += 1;
+                }
 
                 if is_slave {
                     // Slave writing → output processing → s2m buffer.
@@ -529,7 +553,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         // Pack lflag and oflag into d0, cc into d1.
                         let d0 = (p.lflag as u64) | ((p.oflag as u64) << 32);
                         let mut d1 = 0u64;
-                        for i in 0..8 { d1 |= (p.cc[i] as u64) << (i * 8); }
+                        for i in 0..8 {
+                            d1 |= (p.cc[i] as u64) << (i * 8);
+                        }
                         reply(reply_port, PTY_IOCTL_OK, d0, d1, 0, 0);
                     }
                     TCSETS => {
@@ -537,7 +563,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         p.lflag = (msg.data[1] & 0xFFFF_FFFF) as u32;
                         p.oflag = (msg.data[1] >> 32) as u32;
                         let cc_val = msg.data[3];
-                        for i in 0..8 { p.cc[i] = ((cc_val >> (i * 8)) & 0xFF) as u8; }
+                        for i in 0..8 {
+                            p.cc[i] = ((cc_val >> (i * 8)) & 0xFF) as u8;
+                        }
                         reply(reply_port, PTY_IOCTL_OK, 0, 0, 0, 0);
                     }
                     TIOCGPGRP => {

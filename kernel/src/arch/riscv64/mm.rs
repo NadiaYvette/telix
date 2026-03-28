@@ -4,8 +4,8 @@
 //! Kernel is identity-mapped via 1 GiB gigapages.
 //! User pages are mapped at arbitrary VAs via 4K leaf entries.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::mm::radix_pt::{self, PteFormat};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Kernel page table root, set by BSP after enable_mmu.
 static KERNEL_PT_ROOT: AtomicUsize = AtomicUsize::new(0);
@@ -210,7 +210,9 @@ pub fn evict_mmupage(root: usize, va: usize) -> usize {
         None => return 0,
     };
     let entry = unsafe { *slot };
-    if entry & PTE_V == 0 { return 0; }
+    if entry & PTE_V == 0 {
+        return 0;
+    }
     let pa = ((entry >> 10) << 12) as usize;
     unsafe {
         *slot = entry & PTE_SW_ZEROED;
@@ -227,7 +229,9 @@ pub fn clear_pte(root: usize, va: usize) {
     };
     let entry = unsafe { *slot };
     if entry != 0 {
-        unsafe { *slot = 0; }
+        unsafe {
+            *slot = 0;
+        }
         Sv39Pte::tlb_invalidate(va);
     }
 }

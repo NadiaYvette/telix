@@ -198,7 +198,9 @@ fn aspace_port_handler(
 /// Resolve an ASpaceId (port_id) to the entry pointer. Lock-free via RCU.
 #[inline]
 fn resolve_entry(id: ASpaceId) -> Option<*const ASpaceEntry> {
-    if id == 0 { return None; }
+    if id == 0 {
+        return None;
+    }
     let ptr = crate::ipc::port::port_kernel_data(id)?;
     Some(ptr as *const ASpaceEntry)
 }
@@ -289,10 +291,7 @@ pub fn create(page_table_root: usize) -> Option<ASpaceId> {
     let seq = NEXT_ASPACE_SEQ.fetch_add(1, Ordering::Relaxed);
 
     // Create a kernel-held port with user_data = entry pointer.
-    let port_id = match crate::ipc::port::create_kernel_port(
-        aspace_port_handler,
-        ptr as usize,
-    ) {
+    let port_id = match crate::ipc::port::create_kernel_port(aspace_port_handler, ptr as usize) {
         Some(p) => p,
         None => {
             free_entry(ptr);
@@ -424,8 +423,7 @@ pub fn unmap_anon(id: ASpaceId, va: usize) -> bool {
 
     if let Some((va_start, obj_id)) = info {
         space.vmas.remove(va_start);
-        let remaining = object::try_with_object(obj_id, |obj| obj.mapping_count())
-            .unwrap_or(0);
+        let remaining = object::try_with_object(obj_id, |obj| obj.mapping_count()).unwrap_or(0);
         if remaining == 0 {
             object::destroy(obj_id);
         }
@@ -460,7 +458,9 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
 
     let cow_page = super::phys::alloc_page()?;
     let cow_buf = cow_page.as_usize() as *mut CowEntry;
-    unsafe { core::ptr::write_bytes(cow_buf as *mut u8, 0, super::page::PAGE_SIZE); }
+    unsafe {
+        core::ptr::write_bytes(cow_buf as *mut u8, 0, super::page::PAGE_SIZE);
+    }
 
     let mut vma_count = 0usize;
     let parent_pt;
@@ -472,7 +472,9 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         parent_heap = guard.heap_next;
         let mut it = guard.vmas.iter();
         while let Some(vma) = it.next() {
-            if !vma.active || vma_count >= ENTRIES_PER_PAGE { continue; }
+            if !vma.active || vma_count >= ENTRIES_PER_PAGE {
+                continue;
+            }
             unsafe {
                 let e = &mut *cow_buf.add(vma_count);
                 e.va_start = vma.va_start;
@@ -498,17 +500,15 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
             }
         };
 
-        let port_id = match crate::ipc::port::create_kernel_port(
-            aspace_port_handler,
-            child_ptr as usize,
-        ) {
-            Some(p) => p,
-            None => {
-                free_entry(child_ptr);
-                free_page_table_tree(child_pt);
-                return None;
-            }
-        };
+        let port_id =
+            match crate::ipc::port::create_kernel_port(aspace_port_handler, child_ptr as usize) {
+                Some(p) => p,
+                None => {
+                    free_entry(child_ptr);
+                    free_page_table_tree(child_pt);
+                    return None;
+                }
+            };
 
         child_id = port_id;
 
@@ -578,8 +578,11 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         for i in 0..vma_count {
             let info = unsafe { &*cow_buf.add(i) };
             child_guard.vmas.insert(
-                info.va_start, info.va_len, info.prot,
-                info.new_obj_id, info.object_offset,
+                info.va_start,
+                info.va_len,
+                info.prot,
+                info.new_obj_id,
+                info.object_offset,
             );
 
             let mmu_count = info.va_len / super::page::MMUPAGE_SIZE;
@@ -653,8 +656,12 @@ pub fn mprotect(id: ASpaceId, addr: usize, len: usize, new_prot: VmaProt) -> boo
                 obj.add_mapping(id, split_at);
             });
 
-            space.vmas.insert(orig_start, left_len, orig_prot, orig_obj, orig_off);
-            space.vmas.insert(split_at, right_len, orig_prot, orig_obj, right_off);
+            space
+                .vmas
+                .insert(orig_start, left_len, orig_prot, orig_obj, orig_off);
+            space
+                .vmas
+                .insert(split_at, right_len, orig_prot, orig_obj, right_off);
         }
     }
 
@@ -679,18 +686,28 @@ pub fn mprotect(id: ASpaceId, addr: usize, len: usize, new_prot: VmaProt) -> boo
                 obj.add_mapping(id, split_at);
             });
 
-            space.vmas.insert(orig_start, left_len, orig_prot, orig_obj, orig_off);
-            space.vmas.insert(split_at, right_len, orig_prot, orig_obj, right_off);
+            space
+                .vmas
+                .insert(orig_start, left_len, orig_prot, orig_obj, orig_off);
+            space
+                .vmas
+                .insert(split_at, right_len, orig_prot, orig_obj, right_off);
         }
     }
 
     // Update protection on all VMAs fully within [addr, end).
     let mut it = space.vmas.iter();
     while let Some(vma) = it.next() {
-        if !vma.active { continue; }
-        if vma.va_start >= end { break; }
+        if !vma.active {
+            continue;
+        }
+        if vma.va_start >= end {
+            break;
+        }
         let vma_end = vma.va_start + vma.va_len;
-        if vma_end <= addr { continue; }
+        if vma_end <= addr {
+            continue;
+        }
 
         if vma.va_start >= addr && vma_end <= end {
             let old_prot = vma.prot;
@@ -724,8 +741,10 @@ pub fn mprotect(id: ASpaceId, addr: usize, len: usize, new_prot: VmaProt) -> boo
 pub fn mremap(id: ASpaceId, old_addr: usize, old_len: usize, new_len: usize) -> usize {
     use super::page::{MMUPAGE_SIZE, PAGE_SIZE};
 
-    if old_addr % MMUPAGE_SIZE != 0 || old_len % MMUPAGE_SIZE != 0
-        || new_len % MMUPAGE_SIZE != 0 || new_len == 0
+    if old_addr % MMUPAGE_SIZE != 0
+        || old_len % MMUPAGE_SIZE != 0
+        || new_len % MMUPAGE_SIZE != 0
+        || new_len == 0
     {
         return 0;
     }
@@ -802,8 +821,12 @@ pub fn mremap(id: ASpaceId, old_addr: usize, old_len: usize, new_len: usize) -> 
     {
         let mut it = space.vmas.iter();
         while let Some(v) = it.next() {
-            if !v.active { continue; }
-            if v.va_start == old_addr { continue; }
+            if !v.active {
+                continue;
+            }
+            if v.va_start == old_addr {
+                continue;
+            }
             let v_end = v.va_start + v.va_len;
             if v.va_start < growth_end && v_end > growth_start {
                 overlap = true;
@@ -832,7 +855,7 @@ pub fn mremap(id: ASpaceId, old_addr: usize, old_len: usize, new_len: usize) -> 
 
 /// Demote all superpages covering a VMA's range.
 fn demote_superpages_for_vma(pt_root: usize, vma: &Vma) {
-    use super::page::{MMUPAGE_SIZE, SUPERPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_MMU_PAGES};
+    use super::page::{MMUPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_MMU_PAGES, SUPERPAGE_SIZE};
     let mmu_count = vma.mmu_page_count();
     let flags = super::fault::pte_flags_for_vma_pub(vma);
     let mut m = 0;
@@ -843,13 +866,17 @@ fn demote_superpages_for_vma(pt_root: usize, vma: &Vma) {
             super::fault::demote_superpage(pt_root, super_va, flags);
         }
         let next = ((super_va + SUPERPAGE_SIZE) - vma.va_start) / MMUPAGE_SIZE;
-        m = if next > m { next } else { m + SUPERPAGE_MMU_PAGES };
+        m = if next > m {
+            next
+        } else {
+            m + SUPERPAGE_MMU_PAGES
+        };
     }
 }
 
 /// Demote superpages in a sub-range of a VMA (for mremap shrink).
 fn demote_superpages_for_vma_range(pt_root: usize, vma: &Vma, start_mmu: usize, end_mmu: usize) {
-    use super::page::{MMUPAGE_SIZE, SUPERPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_MMU_PAGES};
+    use super::page::{MMUPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_MMU_PAGES, SUPERPAGE_SIZE};
     let flags = super::fault::pte_flags_for_vma_pub(vma);
     let va_start = vma.va_start;
     let mut m = start_mmu;
@@ -860,13 +887,17 @@ fn demote_superpages_for_vma_range(pt_root: usize, vma: &Vma, start_mmu: usize, 
             super::fault::demote_superpage(pt_root, super_va, flags);
         }
         let next = ((super_va + SUPERPAGE_SIZE) - va_start) / MMUPAGE_SIZE;
-        m = if next > m { next } else { m + SUPERPAGE_MMU_PAGES };
+        m = if next > m {
+            next
+        } else {
+            m + SUPERPAGE_MMU_PAGES
+        };
     }
 }
 
 /// Demote superpages in a range given by (va_start, mmu_count, prot).
 fn demote_superpages_in_range(pt_root: usize, va_start: usize, mmu_count: usize, prot: VmaProt) {
-    use super::page::{MMUPAGE_SIZE, SUPERPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_MMU_PAGES};
+    use super::page::{MMUPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_MMU_PAGES, SUPERPAGE_SIZE};
     let flags = rw_flags_for_prot(prot);
     let mut m = 0;
     while m < mmu_count {
@@ -877,7 +908,11 @@ fn demote_superpages_in_range(pt_root: usize, va_start: usize, mmu_count: usize,
             super::stats::SUPERPAGE_DEMOTIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         let next_super = ((super_va + SUPERPAGE_SIZE) - va_start) / MMUPAGE_SIZE;
-        m = if next_super > m { next_super } else { m + SUPERPAGE_MMU_PAGES };
+        m = if next_super > m {
+            next_super
+        } else {
+            m + SUPERPAGE_MMU_PAGES
+        };
     }
 }
 

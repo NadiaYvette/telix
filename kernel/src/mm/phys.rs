@@ -10,7 +10,7 @@
 //! - Chunks with ≤ INLINE_K free pages encode indices directly in the parent node
 //! - Multi-page allocation uses a separate lock (rare path)
 
-use super::page::{PhysAddr, PAGE_SIZE, PAGE_SHIFT};
+use super::page::{PAGE_SHIFT, PAGE_SIZE, PhysAddr};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Pages per chunk — matches one u64 bitmap.
@@ -51,12 +51,12 @@ struct ChunkNode {
 }
 
 // Bit-field accessors.
-const FREE_COUNT_MASK: u64 = 0x7F;          // bits [6:0]
+const FREE_COUNT_MASK: u64 = 0x7F; // bits [6:0]
 const OWNER_SHIFT: u32 = 7;
-const OWNER_MASK: u64 = 0x7F << 7;          // bits [13:7]  (7 bits → 0..126 + sentinel)
-const HAS_BITMAP_BIT: u64 = 1 << 14;        // bit [14]
+const OWNER_MASK: u64 = 0x7F << 7; // bits [13:7]  (7 bits → 0..126 + sentinel)
+const HAS_BITMAP_BIT: u64 = 1 << 14; // bit [14]
 const BMP_PAGE_SHIFT: u32 = 15;
-const BMP_PAGE_MASK: u64 = 0x3F << 15;      // bits [20:15]
+const BMP_PAGE_MASK: u64 = 0x3F << 15; // bits [20:15]
 const INLINE_SHIFT: u32 = 21;
 // Each inline index is 6 bits, starting at bit 18.
 const INLINE_IDX_BITS: u32 = 6;
@@ -64,7 +64,9 @@ const INLINE_IDX_MASK: u64 = 0x3F;
 
 impl ChunkNode {
     const fn new() -> Self {
-        Self { state: AtomicU64::new(0) }
+        Self {
+            state: AtomicU64::new(0),
+        }
     }
 
     #[inline]
@@ -74,7 +76,8 @@ impl ChunkNode {
 
     #[inline]
     fn cas(&self, old: u64, new: u64) -> Result<u64, u64> {
-        self.state.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire)
+        self.state
+            .compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire)
     }
 
     fn store(&self, val: u64) {
@@ -241,7 +244,9 @@ fn chunk_alloc_one(chunk_idx: usize) -> Option<u32> {
             let bmp_pa = bitmap_pa(chunk_idx, 0);
             // bitmap: all free except page 0 (bitmap) and page 1 (allocated).
             let bmp: u64 = !0u64 & !1u64 & !(1u64 << 1);
-            unsafe { write_bitmap(bmp_pa, bmp); }
+            unsafe {
+                write_bitmap(bmp_pa, bmp);
+            }
             // New state: fc=62, has_bitmap=true, bmp_page=0, owner preserved.
             let new_s = make_state(62, owner(s), true, 0, 0);
             match node.cas(s, new_s) {
@@ -319,9 +324,13 @@ fn chunk_alloc_one(chunk_idx: usize) -> Option<u32> {
             loop {
                 let cur = node.load();
                 let cur_fc = free_count(cur);
-                if cur_fc == 0 { break; } // someone else already decremented
+                if cur_fc == 0 {
+                    break;
+                } // someone else already decremented
                 let upd = (cur & !FREE_COUNT_MASK) | ((cur_fc - 1) as u64);
-                if node.cas(cur, upd).is_ok() { break; }
+                if node.cas(cur, upd).is_ok() {
+                    break;
+                }
             }
 
             ALLOC.free_count_global.fetch_sub(1, Ordering::Relaxed);
@@ -413,7 +422,9 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
             loop {
                 let bmp = unsafe { read_bitmap(bpa) };
                 let new_bmp = bmp | (1u64 << page_idx);
-                if new_bmp == bmp { break; } // already set (double-free?)
+                if new_bmp == bmp {
+                    break;
+                } // already set (double-free?)
                 unsafe {
                     match cas_bitmap(bpa, bmp, new_bmp) {
                         Ok(_) => break,
@@ -427,7 +438,9 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
                 let cur = node.load();
                 let cur_fc = free_count(cur);
                 let upd = (cur & !FREE_COUNT_MASK) | ((cur_fc + 1) as u64);
-                if node.cas(cur, upd).is_ok() { break; }
+                if node.cas(cur, upd).is_ok() {
+                    break;
+                }
             }
 
             ALLOC.free_count_global.fetch_add(1, Ordering::Relaxed);
@@ -463,7 +476,9 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
 
         // Write bitmap to the freed page.
         let bpa = page_pa(chunk_idx, page_idx);
-        unsafe { write_bitmap(bpa, bmp); }
+        unsafe {
+            write_bitmap(bpa, bmp);
+        }
 
         let new_s = make_state(fc, owner(s), true, page_idx, 0);
         // Note: fc stays the same because the freed page becomes the bitmap
@@ -499,7 +514,9 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
 pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: usize) {
     let start = PhysAddr::new(ram_start).align_up(PAGE_SIZE).as_usize();
     let end = PhysAddr::new(ram_end).align_down(PAGE_SIZE).as_usize();
-    if end <= start { return; }
+    if end <= start {
+        return;
+    }
 
     let total_pages = (end - start) >> PAGE_SHIFT;
     let total_chunks = (total_pages + CHUNK_PAGES - 1) / CHUNK_PAGES;
@@ -532,7 +549,9 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
             (total_pages - ci * CHUNK_PAGES) as u32
         };
         // All-free: fc = pages_in_chunk, no owner, no bitmap.
-        ALLOC.chunk(ci).store(make_state(pages_in_chunk, NO_CPU, false, 0, 0));
+        ALLOC
+            .chunk(ci)
+            .store(make_state(pages_in_chunk, NO_CPU, false, 0, 0));
     }
 
     let mut total_free = total_pages;
@@ -571,7 +590,7 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
             // page) as the bitmap page.
             let bmp_pg = if pi == 0 { 1 } else { 0 };
             let mut bmp: u64 = !0u64; // all free
-            bmp &= !(1u64 << pi);     // mark reserved page allocated
+            bmp &= !(1u64 << pi); // mark reserved page allocated
             bmp &= !(1u64 << bmp_pg); // bitmap page not available
 
             let pages_in_chunk = if (ci + 1) * CHUNK_PAGES <= total_pages {
@@ -586,10 +605,14 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
             }
 
             let bpa = page_pa(ci, bmp_pg);
-            unsafe { write_bitmap(bpa, bmp); }
+            unsafe {
+                write_bitmap(bpa, bmp);
+            }
 
             let new_fc = bmp.count_ones();
-            ALLOC.chunk(ci).store(make_state(new_fc, NO_CPU, true, bmp_pg, 0));
+            ALLOC
+                .chunk(ci)
+                .store(make_state(new_fc, NO_CPU, true, bmp_pg, 0));
             total_free -= (pages_in_chunk - new_fc) as usize; // reserved page + bitmap page
         } else if has_bitmap(s) {
             // Already has a bitmap; clear the bit for this page.
@@ -597,12 +620,14 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
             let bpa = bitmap_pa(ci, bp);
             let bmp = unsafe { read_bitmap(bpa) };
             if bmp & (1u64 << pi) != 0 {
-                unsafe { write_bitmap(bpa, bmp & !(1u64 << pi)); }
+                unsafe {
+                    write_bitmap(bpa, bmp & !(1u64 << pi));
+                }
                 // Decrement free_count.
                 let new_fc = fc - 1;
-                ALLOC.chunk(ci).store(
-                    make_state(new_fc, NO_CPU, true, bp, 0)
-                );
+                ALLOC
+                    .chunk(ci)
+                    .store(make_state(new_fc, NO_CPU, true, bp, 0));
                 total_free -= 1;
             }
         }
@@ -614,7 +639,8 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
     let (total, free) = stats();
     crate::println!(
         "  Physical memory: {} pages total, {} pages free ({} KiB / {} KiB)",
-        total, free,
+        total,
+        free,
         free * (PAGE_SIZE / 1024),
         total * (PAGE_SIZE / 1024),
     );
@@ -631,29 +657,41 @@ pub fn alloc_page() -> Option<PhysAddr> {
     let can_reserve = cpu < NO_CPU as usize;
 
     // Fast path: try the per-CPU reserved chunk.
-    let reserved = if can_reserve { unsafe { CPU_RESERVATION[cpu] } } else { NO_CHUNK };
+    let reserved = if can_reserve {
+        unsafe { CPU_RESERVATION[cpu] }
+    } else {
+        NO_CHUNK
+    };
     if reserved != NO_CHUNK {
         if let Some(pi) = chunk_alloc_one(reserved) {
             let pa = page_pa(reserved, pi);
             // If chunk is now empty, release reservation.
             let s = ALLOC.chunk(reserved).load();
             if free_count(s) == 0 {
-                unsafe { CPU_RESERVATION[cpu] = NO_CHUNK; }
+                unsafe {
+                    CPU_RESERVATION[cpu] = NO_CHUNK;
+                }
                 // Clear owner in chunk node.
                 loop {
                     let cur = ALLOC.chunk(reserved).load();
                     let new = (cur & !OWNER_MASK) | ((NO_CPU as u64) << OWNER_SHIFT);
-                    if ALLOC.chunk(reserved).cas(cur, new).is_ok() { break; }
+                    if ALLOC.chunk(reserved).cas(cur, new).is_ok() {
+                        break;
+                    }
                 }
             }
             return Some(PhysAddr::new(pa));
         }
         // Reservation exhausted; release it.
-        unsafe { CPU_RESERVATION[cpu] = NO_CHUNK; }
+        unsafe {
+            CPU_RESERVATION[cpu] = NO_CHUNK;
+        }
         loop {
             let cur = ALLOC.chunk(reserved).load();
             let new = (cur & !OWNER_MASK) | ((NO_CPU as u64) << OWNER_SHIFT);
-            if ALLOC.chunk(reserved).cas(cur, new).is_ok() { break; }
+            if ALLOC.chunk(reserved).cas(cur, new).is_ok() {
+                break;
+            }
         }
     }
 
@@ -661,8 +699,12 @@ pub fn alloc_page() -> Option<PhysAddr> {
     for ci in 0..ALLOC.total_chunks {
         let s = ALLOC.chunk(ci).load();
         let fc = free_count(s);
-        if fc == 0 { continue; }
-        if owner(s) != NO_CPU { continue; } // owned by another CPU
+        if fc == 0 {
+            continue;
+        }
+        if owner(s) != NO_CPU {
+            continue;
+        } // owned by another CPU
 
         if !can_reserve {
             // CPU ID doesn't fit in owner field — alloc without reservation.
@@ -678,18 +720,24 @@ pub fn alloc_page() -> Option<PhysAddr> {
             continue; // someone else claimed it
         }
 
-        unsafe { CPU_RESERVATION[cpu] = ci; }
+        unsafe {
+            CPU_RESERVATION[cpu] = ci;
+        }
 
         if let Some(pi) = chunk_alloc_one(ci) {
             let pa = page_pa(ci, pi);
             // Check if exhausted.
             let s2 = ALLOC.chunk(ci).load();
             if free_count(s2) == 0 {
-                unsafe { CPU_RESERVATION[cpu] = NO_CHUNK; }
+                unsafe {
+                    CPU_RESERVATION[cpu] = NO_CHUNK;
+                }
                 loop {
                     let cur = ALLOC.chunk(ci).load();
                     let new = (cur & !OWNER_MASK) | ((NO_CPU as u64) << OWNER_SHIFT);
-                    if ALLOC.chunk(ci).cas(cur, new).is_ok() { break; }
+                    if ALLOC.chunk(ci).cas(cur, new).is_ok() {
+                        break;
+                    }
                 }
             }
             return Some(PhysAddr::new(pa));
@@ -702,9 +750,13 @@ pub fn alloc_page() -> Option<PhysAddr> {
 /// Free a single page.
 pub fn free_page(addr: PhysAddr) {
     let pa = addr.as_usize();
-    if pa < ALLOC.base { return; }
+    if pa < ALLOC.base {
+        return;
+    }
     let (ci, pi) = addr_to_chunk_page(pa);
-    if ci >= ALLOC.total_chunks { return; }
+    if ci >= ALLOC.total_chunks {
+        return;
+    }
     chunk_free_one(ci, pi);
 }
 
@@ -730,13 +782,17 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
         for ci in 0..ALLOC.total_chunks {
             let s = ALLOC.chunk(ci).load();
             let fc = free_count(s);
-            if (fc as usize) < need { continue; }
+            if (fc as usize) < need {
+                continue;
+            }
 
             if fc == 64 {
                 // All-free chunk. Allocate pages 0..need-1.
                 // Need to materialize bitmap with those pages marked allocated.
                 let bmp_pg: u32 = need as u32; // first page after the allocated block
-                if bmp_pg >= 64 { continue; } // shouldn't happen for need<=64
+                if bmp_pg >= 64 {
+                    continue;
+                } // shouldn't happen for need<=64
 
                 let mut bmp: u64 = !0u64;
                 // Mark pages 0..need-1 as allocated.
@@ -757,18 +813,26 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                 }
 
                 let bpa = page_pa(ci, bmp_pg);
-                unsafe { write_bitmap(bpa, bmp); }
+                unsafe {
+                    write_bitmap(bpa, bmp);
+                }
 
                 let new_fc = bmp.count_ones();
-                ALLOC.chunk(ci).store(make_state(new_fc, NO_CPU, true, bmp_pg, 0));
+                ALLOC
+                    .chunk(ci)
+                    .store(make_state(new_fc, NO_CPU, true, bmp_pg, 0));
                 // Subtract: need pages + 1 bitmap page from the 64 that were free.
                 let consumed = 64u32 - new_fc;
-                ALLOC.free_count_global.fetch_sub(consumed as usize, Ordering::Relaxed);
+                ALLOC
+                    .free_count_global
+                    .fetch_sub(consumed as usize, Ordering::Relaxed);
 
                 return Some(PhysAddr::new(page_pa(ci, 0)));
             }
 
-            if !has_bitmap(s) { continue; } // inline mode, too fragmented
+            if !has_bitmap(s) {
+                continue;
+            } // inline mode, too fragmented
 
             // Scan bitmap for a contiguous run of `need` set bits.
             let bp = bmp_page(s);
@@ -781,7 +845,9 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                 for b in start_bit..(start_bit + need) {
                     new_bmp &= !(1u64 << b);
                 }
-                unsafe { write_bitmap(bpa, new_bmp); }
+                unsafe {
+                    write_bitmap(bpa, new_bmp);
+                }
 
                 let new_fc = fc - need as u32;
                 // Possibly transition to inline mode.
@@ -800,7 +866,9 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                         count += 1;
                     }
                     let inline_bits = pack_inline(&indices[..count as usize]);
-                    ALLOC.chunk(ci).store(make_state(count, owner(s), false, 0, inline_bits));
+                    ALLOC
+                        .chunk(ci)
+                        .store(make_state(count, owner(s), false, 0, inline_bits));
                 } else if new_fc == 0 {
                     // Also free the bitmap page since chunk is now fully allocated.
                     ALLOC.chunk(ci).store(make_state(0, NO_CPU, false, 0, 0));
@@ -808,9 +876,9 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                     // Actually the bitmap page was already not counted in fc,
                     // and now fc=0, so nothing extra to do.
                 } else {
-                    ALLOC.chunk(ci).store(
-                        (s & !FREE_COUNT_MASK) | (new_fc as u64)
-                    );
+                    ALLOC
+                        .chunk(ci)
+                        .store((s & !FREE_COUNT_MASK) | (new_fc as u64));
                 }
 
                 ALLOC.free_count_global.fetch_sub(need, Ordering::Relaxed);
@@ -827,7 +895,9 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
     for ci in 0..ALLOC.total_chunks {
         let s = ALLOC.chunk(ci).load();
         if free_count(s) == 64 && owner(s) == NO_CPU {
-            if run_len == 0 { run_start = ci; }
+            if run_len == 0 {
+                run_start = ci;
+            }
             run_len += 1;
             if run_len >= chunks_needed {
                 // Found enough consecutive all-free chunks.
@@ -835,7 +905,9 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                 for c in run_start..(run_start + chunks_needed) {
                     ALLOC.chunk(c).store(make_state(0, NO_CPU, false, 0, 0));
                 }
-                ALLOC.free_count_global.fetch_sub(chunks_needed * CHUNK_PAGES, Ordering::Relaxed);
+                ALLOC
+                    .free_count_global
+                    .fetch_sub(chunks_needed * CHUNK_PAGES, Ordering::Relaxed);
                 return Some(PhysAddr::new(page_pa(run_start, 0)));
             }
         } else {
@@ -858,7 +930,10 @@ pub fn free_pages(addr: PhysAddr, order: usize) {
 
 /// Get (total_pages, free_pages).
 pub fn stats() -> (usize, usize) {
-    (ALLOC.total_pages, ALLOC.free_count_global.load(Ordering::Relaxed))
+    (
+        ALLOC.total_pages,
+        ALLOC.free_count_global.load(Ordering::Relaxed),
+    )
 }
 
 // ── Bitmap scanning ──────────────────────────────────────────────────
@@ -876,7 +951,9 @@ fn find_contiguous_bits(bmp: u64, need: usize, skip_bit: u32) -> Option<usize> {
     let mut run_len = 0;
     for bit in 0..64u32 {
         if avail & (1u64 << bit) != 0 {
-            if run_len == 0 { run_start = bit as usize; }
+            if run_len == 0 {
+                run_start = bit as usize;
+            }
             run_len += 1;
             if run_len >= need {
                 return Some(run_start);

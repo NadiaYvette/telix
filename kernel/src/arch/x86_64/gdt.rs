@@ -44,13 +44,13 @@ struct PerCpuGdt {
 static mut PER_CPU_GDT: [PerCpuGdt; MAX_CPUS] = {
     const INIT: PerCpuGdt = PerCpuGdt {
         entries: [
-            0x0000_0000_0000_0000,  // 0x00: Null
-            0x00AF_9A00_0000_FFFF,  // 0x08: Kernel code (64-bit, DPL=0)
-            0x00CF_9200_0000_FFFF,  // 0x10: Kernel data (DPL=0)
-            0x00CF_F200_0000_FFFF,  // 0x18: User data (DPL=3)
-            0x00AF_FA00_0000_FFFF,  // 0x20: User code (64-bit, DPL=3)
-            0,                       // 0x28: TSS low (filled at runtime)
-            0,                       // 0x30: TSS high (filled at runtime)
+            0x0000_0000_0000_0000, // 0x00: Null
+            0x00AF_9A00_0000_FFFF, // 0x08: Kernel code (64-bit, DPL=0)
+            0x00CF_9200_0000_FFFF, // 0x10: Kernel data (DPL=0)
+            0x00CF_F200_0000_FFFF, // 0x18: User data (DPL=3)
+            0x00AF_FA00_0000_FFFF, // 0x20: User code (64-bit, DPL=3)
+            0,                     // 0x28: TSS low (filled at runtime)
+            0,                     // 0x30: TSS high (filled at runtime)
         ],
     };
     [INIT; MAX_CPUS]

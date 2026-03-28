@@ -98,7 +98,11 @@ pub fn pty_write_fd(fd: i32, data: &[u8]) -> isize {
     let mut total = 0isize;
     let mut off = 0;
     while off < data.len() {
-        let chunk = if data.len() - off > 16 { 16 } else { data.len() - off };
+        let chunk = if data.len() - off > 16 {
+            16
+        } else {
+            data.len() - off
+        };
         let mut w0 = 0u64;
         let mut w1 = 0u64;
         for i in 0..chunk {

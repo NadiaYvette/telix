@@ -131,27 +131,36 @@ pub fn fd_init(console_port: u64) {
     unsafe {
         // Use volatile writes to avoid static-mut aliasing miscompilation.
         let p = core::ptr::addr_of_mut!(FD_TABLE);
-        core::ptr::write_volatile(&mut (*p)[0], FdEntry {
-            fd_type: FdType::Console,
-            port: console_port,
-            handle: 0,
-            fd_flags: 0,
-            status_flags: O_RDONLY,
-        });
-        core::ptr::write_volatile(&mut (*p)[1], FdEntry {
-            fd_type: FdType::Console,
-            port: console_port,
-            handle: 0,
-            fd_flags: 0,
-            status_flags: O_WRONLY,
-        });
-        core::ptr::write_volatile(&mut (*p)[2], FdEntry {
-            fd_type: FdType::Console,
-            port: console_port,
-            handle: 0,
-            fd_flags: 0,
-            status_flags: O_WRONLY,
-        });
+        core::ptr::write_volatile(
+            &mut (*p)[0],
+            FdEntry {
+                fd_type: FdType::Console,
+                port: console_port,
+                handle: 0,
+                fd_flags: 0,
+                status_flags: O_RDONLY,
+            },
+        );
+        core::ptr::write_volatile(
+            &mut (*p)[1],
+            FdEntry {
+                fd_type: FdType::Console,
+                port: console_port,
+                handle: 0,
+                fd_flags: 0,
+                status_flags: O_WRONLY,
+            },
+        );
+        core::ptr::write_volatile(
+            &mut (*p)[2],
+            FdEntry {
+                fd_type: FdType::Console,
+                port: console_port,
+                handle: 0,
+                fd_flags: 0,
+                status_flags: O_WRONLY,
+            },
+        );
     }
 }
 
@@ -191,13 +200,16 @@ fn fd_open_at_or_above(
         let p = core::ptr::addr_of_mut!(FD_TABLE);
         for i in start..MAX_FDS {
             if core::ptr::read_volatile(core::ptr::addr_of!((*p)[i].fd_type)) == FdType::Free {
-                core::ptr::write_volatile(&mut (*p)[i], FdEntry {
-                    fd_type,
-                    port,
-                    handle,
-                    fd_flags,
-                    status_flags,
-                });
+                core::ptr::write_volatile(
+                    &mut (*p)[i],
+                    FdEntry {
+                        fd_type,
+                        port,
+                        handle,
+                        fd_flags,
+                        status_flags,
+                    },
+                );
                 return Some(i as i32);
             }
         }
@@ -212,7 +224,8 @@ pub fn fd_close(fd: i32) -> bool {
     }
     unsafe {
         let p = core::ptr::addr_of_mut!(FD_TABLE);
-        if core::ptr::read_volatile(core::ptr::addr_of!((*p)[fd as usize].fd_type)) == FdType::Free {
+        if core::ptr::read_volatile(core::ptr::addr_of!((*p)[fd as usize].fd_type)) == FdType::Free
+        {
             return false;
         }
         core::ptr::write_volatile(&mut (*p)[fd as usize], FdEntry::empty());
@@ -224,7 +237,14 @@ pub fn fd_close(fd: i32) -> bool {
 /// Equivalent to POSIX dup(). The new FD has FD_CLOEXEC cleared.
 pub fn dup(old_fd: i32) -> Option<i32> {
     let entry = fd_get(old_fd)?;
-    fd_open_at_or_above(0, entry.port, entry.handle, entry.fd_type, entry.status_flags, 0)
+    fd_open_at_or_above(
+        0,
+        entry.port,
+        entry.handle,
+        entry.fd_type,
+        entry.status_flags,
+        0,
+    )
 }
 
 /// Duplicate `old_fd` to exactly `new_fd`.
@@ -242,13 +262,16 @@ pub fn dup2(old_fd: i32, new_fd: i32) -> Option<i32> {
     let entry = fd_get(old_fd)?;
     unsafe {
         let p = core::ptr::addr_of_mut!(FD_TABLE);
-        core::ptr::write_volatile(&mut (*p)[new_fd as usize], FdEntry {
-            fd_type: entry.fd_type,
-            port: entry.port,
-            handle: entry.handle,
-            fd_flags: 0, // dup2 clears FD_CLOEXEC
-            status_flags: entry.status_flags,
-        });
+        core::ptr::write_volatile(
+            &mut (*p)[new_fd as usize],
+            FdEntry {
+                fd_type: entry.fd_type,
+                port: entry.port,
+                handle: entry.handle,
+                fd_flags: 0, // dup2 clears FD_CLOEXEC
+                status_flags: entry.status_flags,
+            },
+        );
     }
     Some(new_fd)
 }
@@ -281,7 +304,12 @@ pub fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32 {
             F_DUPFD => {
                 let snap = core::ptr::read_volatile(entry);
                 match fd_open_at_or_above(
-                    arg, snap.port, snap.handle, snap.fd_type, snap.status_flags, 0,
+                    arg,
+                    snap.port,
+                    snap.handle,
+                    snap.fd_type,
+                    snap.status_flags,
+                    0,
                 ) {
                     Some(new_fd) => new_fd,
                     None => -1,
@@ -290,22 +318,23 @@ pub fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32 {
             F_DUPFD_CLOEXEC => {
                 let snap = core::ptr::read_volatile(entry);
                 match fd_open_at_or_above(
-                    arg, snap.port, snap.handle, snap.fd_type, snap.status_flags, FD_CLOEXEC,
+                    arg,
+                    snap.port,
+                    snap.handle,
+                    snap.fd_type,
+                    snap.status_flags,
+                    FD_CLOEXEC,
                 ) {
                     Some(new_fd) => new_fd,
                     None => -1,
                 }
             }
-            F_GETFD => {
-                core::ptr::read_volatile(core::ptr::addr_of!((*entry).fd_flags)) as i32
-            }
+            F_GETFD => core::ptr::read_volatile(core::ptr::addr_of!((*entry).fd_flags)) as i32,
             F_SETFD => {
                 core::ptr::write_volatile(core::ptr::addr_of_mut!((*entry).fd_flags), arg as u32);
                 0
             }
-            F_GETFL => {
-                core::ptr::read_volatile(core::ptr::addr_of!((*entry).status_flags)) as i32
-            }
+            F_GETFL => core::ptr::read_volatile(core::ptr::addr_of!((*entry).status_flags)) as i32,
             F_SETFL => {
                 let modifiable = O_NONBLOCK | O_APPEND;
                 let old = core::ptr::read_volatile(core::ptr::addr_of!((*entry).status_flags));
@@ -412,7 +441,9 @@ pub fn fcntl_lock(fd: i32, cmd: i32, lock: &mut Flock) -> i32 {
 
     let reply_port = syscall::port_create();
     let pid = syscall::getpid() as u32;
-    let d0 = (entry.handle as u64) | ((lock.l_type as u16 as u64) << 32) | ((lock.l_whence as u16 as u64) << 48);
+    let d0 = (entry.handle as u64)
+        | ((lock.l_type as u16 as u64) << 32)
+        | ((lock.l_whence as u16 as u64) << 48);
     let d1 = lock.l_start as u64;
     let d2 = (lock.l_len as u32 as u64) | ((reply_port as u64) << 32);
     let d3 = pid as u64;

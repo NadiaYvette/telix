@@ -1,10 +1,10 @@
 //! Block device server — wraps a virtio-blk device in the I/O message protocol.
 
+use super::protocol::*;
 use crate::drivers::virtio_blk::VirtioBlk;
 use crate::drivers::virtio_mmio;
-use crate::ipc::port::{self};
 use crate::ipc::Message;
-use super::protocol::*;
+use crate::ipc::port::{self};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Global port ID for the block device server.
@@ -18,7 +18,9 @@ fn ensure_kernel_pt() {
     crate::mm::hat::switch_page_table(kern_root);
     // RISC-V: Grant pages have PTE_U set. S-mode must set sstatus.SUM to access them.
     #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 18); }
+    unsafe {
+        core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 18);
+    }
 }
 
 /// Stub server when no virtio-blk device is present.
@@ -53,7 +55,9 @@ fn blk_server_no_device() -> ! {
             let _ = port::send_nb(reply_port, Message::new(IO_ERROR, [0, 0, 0, 0, 0, 0]));
         }
     }
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Block device server entry point.
@@ -74,12 +78,17 @@ pub fn blk_server() -> ! {
         Some(d) => d,
         None => {
             crate::println!("  [blk] failed to init virtio-blk");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     };
     let capacity = dev.capacity;
-    crate::println!("  [blk] virtio-blk ready: {} sectors ({} KiB)",
-        capacity, capacity / 2);
+    crate::println!(
+        "  [blk] virtio-blk ready: {} sectors ({} KiB)",
+        capacity,
+        capacity / 2
+    );
 
     // Enable virtio-blk interrupt for IRQ-driven I/O.
     {
@@ -127,12 +136,17 @@ pub fn blk_server() -> ! {
                 // data[0..1] = name, data[2] = name_len | reply_port << 32, data[3] = unused
                 let reply_port = msg.data[2] >> 32;
                 // Block device: handle=0, size=capacity*512
-                let reply = Message::new(IO_CONNECT_OK, [
-                    0, // handle (always 0 for single block device)
-                    capacity * 512, // total size in bytes
-                    my_aspace as u64, // server aspace ID
-                    0, 0, 0,
-                ]);
+                let reply = Message::new(
+                    IO_CONNECT_OK,
+                    [
+                        0,                // handle (always 0 for single block device)
+                        capacity * 512,   // total size in bytes
+                        my_aspace as u64, // server aspace ID
+                        0,
+                        0,
+                        0,
+                    ],
+                );
                 let _ = port::send_nb(reply_port, reply);
             }
 
@@ -158,16 +172,24 @@ pub fn blk_server() -> ! {
                             unsafe {
                                 core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, bytes_read);
                             }
-                            let reply = Message::new(IO_READ_OK, [bytes_read as u64, 0, 0, 0, 0, 0]);
+                            let reply =
+                                Message::new(IO_READ_OK, [bytes_read as u64, 0, 0, 0, 0, 0]);
                             let _ = port::send_nb(reply_port, reply);
                         } else {
                             // Inline read.
                             let inline_len = bytes_read.min(MAX_INLINE_READ);
                             let packed = pack_inline_data(&buf[..inline_len]);
-                            let reply = Message::new(IO_READ_OK, [
-                                inline_len as u64,
-                                packed[0], packed[1], packed[2], packed[3], packed[4],
-                            ]);
+                            let reply = Message::new(
+                                IO_READ_OK,
+                                [
+                                    inline_len as u64,
+                                    packed[0],
+                                    packed[1],
+                                    packed[2],
+                                    packed[3],
+                                    packed[4],
+                                ],
+                            );
                             let _ = port::send_nb(reply_port, reply);
                         }
                     }
@@ -202,7 +224,8 @@ pub fn blk_server() -> ! {
 
                 match dev.write_sector(sector, &buf) {
                     Ok(()) => {
-                        let reply = Message::new(IO_WRITE_OK, [length.min(512) as u64, 0, 0, 0, 0, 0]);
+                        let reply =
+                            Message::new(IO_WRITE_OK, [length.min(512) as u64, 0, 0, 0, 0, 0]);
                         let _ = port::send_nb(reply_port, reply);
                     }
                     Err(()) => {
@@ -224,5 +247,7 @@ pub fn blk_server() -> ! {
         }
     }
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

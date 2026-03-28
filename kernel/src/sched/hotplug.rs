@@ -9,8 +9,8 @@
 //! load counter. Spawn placement uses this to pack threads onto fewer
 //! CPUs, leaving idle CPUs in low-power states.
 
+use super::cpumask::{AtomicCpuMask, CpuMask};
 use super::smp::{self, MAX_CPUS};
-use super::cpumask::{CpuMask, AtomicCpuMask};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Per-CPU load: number of ticks in the last window where this CPU was
@@ -128,15 +128,21 @@ pub fn cpu_offline(cpu: u32) -> u64 {
     for i in 0..count {
         let tid = tids[i];
         let tptr = super::scheduler::THREAD_TABLE.get(tid) as *const super::thread::Thread;
-        if tptr.is_null() { continue; }
+        if tptr.is_null() {
+            continue;
+        }
         let thread = unsafe { &*tptr };
         let old = thread.affinity_mask.load_mask(Ordering::Relaxed);
-        if old.is_empty() { continue; }
+        if old.is_empty() {
+            continue;
+        }
         let mut new = old;
         new.clear(cpu);
         if new.is_empty() {
             // Thread was pinned to only this CPU — expand to all online CPUs.
-            thread.affinity_mask.store_mask(&remaining, Ordering::Relaxed);
+            thread
+                .affinity_mask
+                .store_mask(&remaining, Ordering::Relaxed);
         } else if new.as_u64() != old.as_u64() || CPUMASK_WORDS > 1 {
             thread.affinity_mask.store_mask(&new, Ordering::Relaxed);
         }

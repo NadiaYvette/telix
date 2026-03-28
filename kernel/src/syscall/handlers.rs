@@ -115,13 +115,17 @@ const ECAP: u64 = 2;
 
 /// Resolve a task port_id to the internal task_id.
 fn resolve_task_port(port_id: u64) -> Option<u32> {
-    if port_id == 0 { return None; }
+    if port_id == 0 {
+        return None;
+    }
     crate::sched::task_id_from_port(port_id)
 }
 
 /// Resolve a thread port_id to the internal thread_id.
 fn resolve_thread_port(port_id: u64) -> Option<u32> {
-    if port_id == 0 { return None; }
+    if port_id == 0 {
+        return None;
+    }
     crate::sched::thread_id_from_port(port_id)
 }
 
@@ -208,16 +212,20 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_SEND_CAP => sys_send_cap(a0, a1, a2, a3, a4, a5),
         SYS_CAP_REVOKE => sys_cap_revoke(a0),
         SYS_VM_STATS => sys_vm_stats(a0),
-        SYS_SA_REGISTER => { crate::sched::sa_register(); 0 }
+        SYS_SA_REGISTER => {
+            crate::sched::sa_register();
+            0
+        }
         SYS_SA_WAIT => crate::sched::sa_wait(),
         SYS_SA_GETID => crate::sched::sa_getid(),
-        SYS_COSCHED_SET => { crate::sched::cosched_set(a0 as u32); 0 }
+        SYS_COSCHED_SET => {
+            crate::sched::cosched_set(a0 as u32);
+            0
+        }
         SYS_SET_AFFINITY => sys_set_affinity(a0, a1),
-        SYS_GET_AFFINITY => {
-            match resolve_thread_port(a0) {
-                Some(tid) => crate::sched::get_affinity(tid),
-                None => u64::MAX,
-            }
+        SYS_GET_AFFINITY => match resolve_thread_port(a0) {
+            Some(tid) => crate::sched::get_affinity(tid),
+            None => u64::MAX,
         },
         SYS_CPU_TOPOLOGY => sys_cpu_topology(a0),
         SYS_TRACE_CTRL => crate::trace::trace_ctrl(a0),
@@ -245,23 +253,69 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_MREMAP => sys_mremap(a0, a1, a2),
         SYS_SETPGID => {
             // User passes task port_id. 0 = self.
-            let pid = if a0 != 0 { match resolve_task_port(a0) { Some(t) => t, None => { set_return(frame, u64::MAX); return; } } } else { 0 };
-            let pgid = if a1 != 0 { match resolve_task_port(a1) { Some(t) => t, None => { set_return(frame, u64::MAX); return; } } } else { 0 };
+            let pid = if a0 != 0 {
+                match resolve_task_port(a0) {
+                    Some(t) => t,
+                    None => {
+                        set_return(frame, u64::MAX);
+                        return;
+                    }
+                }
+            } else {
+                0
+            };
+            let pgid = if a1 != 0 {
+                match resolve_task_port(a1) {
+                    Some(t) => t,
+                    None => {
+                        set_return(frame, u64::MAX);
+                        return;
+                    }
+                }
+            } else {
+                0
+            };
             crate::sched::setpgid(pid, pgid)
-        },
+        }
         SYS_GETPGID => {
-            let pid = if a0 != 0 { match resolve_task_port(a0) { Some(t) => t, None => { set_return(frame, u64::MAX); return; } } } else { 0 };
+            let pid = if a0 != 0 {
+                match resolve_task_port(a0) {
+                    Some(t) => t,
+                    None => {
+                        set_return(frame, u64::MAX);
+                        return;
+                    }
+                }
+            } else {
+                0
+            };
             crate::sched::getpgid(pid)
-        },
+        }
         SYS_SETSID => crate::sched::setsid(),
         SYS_GETSID => {
-            let pid = if a0 != 0 { match resolve_task_port(a0) { Some(t) => t, None => { set_return(frame, u64::MAX); return; } } } else { 0 };
+            let pid = if a0 != 0 {
+                match resolve_task_port(a0) {
+                    Some(t) => t,
+                    None => {
+                        set_return(frame, u64::MAX);
+                        return;
+                    }
+                }
+            } else {
+                0
+            };
             crate::sched::getsid(pid)
-        },
+        }
         SYS_TCSETPGRP => {
-            let pgid = match resolve_task_port(a0) { Some(t) => t, None => { set_return(frame, u64::MAX); return; } };
+            let pgid = match resolve_task_port(a0) {
+                Some(t) => t,
+                None => {
+                    set_return(frame, u64::MAX);
+                    return;
+                }
+            };
             crate::sched::tcsetpgrp(pgid)
-        },
+        }
         SYS_TCGETPGRP => crate::sched::tcgetpgrp(),
         SYS_SET_CTTY => crate::sched::set_ctty(a0),
         SYS_CLOCK_GETTIME => sys_clock_gettime(a0),
@@ -367,7 +421,9 @@ pub(crate) fn deliver_to_parked_receiver(receiver_tid: u32, msg: &crate::ipc::Me
 #[inline]
 fn check_port_cap(port_id: u64, needed: crate::cap::Rights) -> bool {
     let task_id = crate::sched::current_task_id();
-    if task_id == 0 { return true; }
+    if task_id == 0 {
+        return true;
+    }
     // Fast path: SEND and RECV are tracked in lockless bitmaps.
     if !crate::cap::has_port_cap_fast(task_id, port_id, needed) {
         return false;
@@ -375,8 +431,13 @@ fn check_port_cap(port_id: u64, needed: crate::cap::Rights) -> bool {
     // MANAGE requires the slow path (rare — only port_destroy).
     if needed.contains(crate::cap::Rights::MANAGE) {
         let ptr = crate::sched::scheduler::TASK_TABLE.get(task_id) as *mut crate::sched::task::Task;
-        if ptr.is_null() { return false; }
-        return unsafe { &*ptr }.capspace.find_port_cap(port_id as usize, needed).is_some();
+        if ptr.is_null() {
+            return false;
+        }
+        return unsafe { &*ptr }
+            .capspace
+            .find_port_cap(port_id as usize, needed)
+            .is_some();
     }
     true
 }
@@ -389,7 +450,9 @@ fn check_port_cap(port_id: u64, needed: crate::cap::Rights) -> bool {
 /// value is a valid active port and the receiver doesn't already hold
 /// a SEND cap for it.
 fn auto_grant_reply_caps(task_id: u32, msg: &crate::ipc::Message) {
-    if task_id == 0 { return; }
+    if task_id == 0 {
+        return;
+    }
     // Scan data words for port IDs. Protocols pack reply ports in various
     // positions; check all 4 user-supplied data words (data[0..3]) plus
     // any sub-word values that look like port IDs (for protocols that pack
@@ -401,14 +464,21 @@ fn auto_grant_reply_caps(task_id: u32, msg: &crate::ipc::Message) {
         // Check full word, high 32 bits, and bits 16+ (for protocols that
         // pack reply_port << 16 | other_value, e.g. net_srv TCP IPC).
         for &val in &[word, word >> 16, word >> 32] {
-            if val == 0 || val == u64::MAX { continue; }
-            if !crate::ipc::port::port_is_active(val) { continue; }
+            if val == 0 || val == u64::MAX {
+                continue;
+            }
+            if !crate::ipc::port::port_is_active(val) {
+                continue;
+            }
             if crate::cap::has_port_cap_fast(task_id, val, crate::cap::Rights::SEND) {
                 continue;
             }
             let mut dup = false;
             for j in 0..count {
-                if candidates[j] == val { dup = true; break; }
+                if candidates[j] == val {
+                    dup = true;
+                    break;
+                }
             }
             if !dup && count < 8 {
                 candidates[count] = val;
@@ -416,7 +486,9 @@ fn auto_grant_reply_caps(task_id: u32, msg: &crate::ipc::Message) {
             }
         }
     }
-    if count == 0 { return; }
+    if count == 0 {
+        return;
+    }
     for i in 0..count {
         crate::cap::grant_send_cap(task_id, candidates[i]);
     }
@@ -426,7 +498,9 @@ fn auto_grant_reply_caps(task_id: u32, msg: &crate::ipc::Message) {
 /// This lets servers identify callers via the port_id in data[4].
 #[inline]
 fn auto_grant_sender_identity(receiver_task: u32, sender_port: u64) {
-    if receiver_task == 0 || sender_port == 0 { return; }
+    if receiver_task == 0 || sender_port == 0 {
+        return;
+    }
     // Fast-path check: skip if receiver already has SEND on sender's port.
     if crate::cap::has_port_cap_fast(receiver_task, sender_port, crate::cap::Rights::SEND) {
         return;
@@ -574,13 +648,16 @@ fn sys_send_to_proxy(target_port: u64, tag: u64, data: [u64; 6], blocking: bool)
     }
     // Auto-grant SEND cap on proxy port for transparency.
     let task_id = crate::sched::current_task_id();
-    if task_id != 0 && !crate::cap::has_port_cap_fast(task_id, proxy_local, crate::cap::Rights::SEND) {
+    if task_id != 0
+        && !crate::cap::has_port_cap_fast(task_id, proxy_local, crate::cap::Rights::SEND)
+    {
         crate::cap::grant_send_cap(task_id, proxy_local);
     }
     // Pack: tag = PROXY_MARKER, data[0] = target_port (full 64-bit),
     // data[1] = original_tag, data[2..4] = original_data[0..2].
     let proxy_tag = PROXY_MARKER;
-    let mut proxy_msg = crate::ipc::Message::new(proxy_tag, [target_port, tag, data[0], data[1], data[2], 0]);
+    let mut proxy_msg =
+        crate::ipc::Message::new(proxy_tag, [target_port, tag, data[0], data[1], data[2], 0]);
 
     match crate::ipc::port::send_direct(proxy_local, &mut proxy_msg) {
         crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
@@ -731,7 +808,11 @@ fn sys_kill(port_id: u64) -> u64 {
         Some(t) => t,
         None => return u64::MAX,
     };
-    if crate::sched::scheduler::kill_task_by_id(task_id) { 0 } else { u64::MAX }
+    if crate::sched::scheduler::kill_task_by_id(task_id) {
+        0
+    } else {
+        u64::MAX
+    }
 }
 
 fn sys_getpid() -> u64 {
@@ -756,7 +837,9 @@ fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64, arg0: u64) -> u64 {
         if nproc_limit != crate::sched::task::RLIM_INFINITY {
             let mut count = 0u64;
             crate::sched::scheduler::SCHED_TASK_ART.for_each(|key, val| {
-                if key == 0 { return; }
+                if key == 0 {
+                    return;
+                }
                 let t = unsafe { &*(val as *const crate::sched::task::Task) };
                 if t.active && t.uid == uid {
                     count += 1;
@@ -804,7 +887,7 @@ fn sys_debug_puts(buf_ptr: u64, buf_len: u64) -> u64 {
 }
 
 fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
-    use crate::mm::page::{PAGE_SIZE, MMUPAGE_SIZE, PAGE_MMUCOUNT};
+    use crate::mm::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE};
     use crate::mm::vma::VmaProt;
 
     let aspace_id = crate::sched::scheduler::current_aspace_id();
@@ -844,9 +927,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
 
     // Determine VA: auto-pick if hint is 0, otherwise use hint.
     let va = if va_hint == 0 {
-        crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-            aspace.alloc_heap_va(pages)
-        })
+        crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(pages))
     } else {
         va_hint as usize
     };
@@ -909,9 +990,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     // Try superpage promotion for 2 MiB-aligned regions.
     crate::mm::aspace::with_aspace(aspace_id, |aspace| {
         if let Some(vma) = aspace.find_vma_mut(va) {
-            crate::mm::fault::try_superpage_promotion_eager(
-                pt_root, vma, obj_id,
-            );
+            crate::mm::fault::try_superpage_promotion_eager(pt_root, vma, obj_id);
         }
     });
 
@@ -1030,9 +1109,7 @@ fn sys_mmap_device(phys_addr: u64, page_count: u64) -> u64 {
     }
 
     // Allocate VA in userspace heap.
-    let va = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-        aspace.alloc_heap_va(total_pages)
-    });
+    let va = crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(total_pages));
 
     let pt_root = crate::sched::scheduler::current_page_table_root();
     let pte_flags = trapframe::device_pte_flags();
@@ -1096,9 +1173,18 @@ fn sys_ioport(op: u64, port: u64, value: u64) -> u64 {
                 0 => serial::inb(port) as u64,
                 1 => serial::inw(port) as u64,
                 2 => serial::inl(port) as u64,
-                3 => { serial::outb(port, value as u8); 0 }
-                4 => { serial::outw(port, value as u16); 0 }
-                5 => { serial::outl(port, value as u32); 0 }
+                3 => {
+                    serial::outb(port, value as u8);
+                    0
+                }
+                4 => {
+                    serial::outw(port, value as u16);
+                    0
+                }
+                5 => {
+                    serial::outl(port, value as u32);
+                    0
+                }
                 _ => u64::MAX,
             }
         }
@@ -1122,7 +1208,8 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
     use crate::mm::page::PAGE_SIZE;
 
     let len = elf_len as usize;
-    if len < 64 { // Minimum ELF header size
+    if len < 64 {
+        // Minimum ELF header size
         return u64::MAX;
     }
 
@@ -1134,9 +1221,8 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
         None => return u64::MAX,
     };
     let header_len = if len < PAGE_SIZE { len } else { PAGE_SIZE };
-    let scratch_slice = unsafe {
-        core::slice::from_raw_parts_mut(scratch.as_usize() as *mut u8, header_len)
-    };
+    let scratch_slice =
+        unsafe { core::slice::from_raw_parts_mut(scratch.as_usize() as *mut u8, header_len) };
     if !copy_from_user(pt_root, elf_ptr as usize, scratch_slice) {
         crate::mm::phys::free_page(scratch);
         return u64::MAX;
@@ -1148,8 +1234,9 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
         crate::mm::phys::free_page(scratch);
         return u64::MAX;
     }
-    let e_phoff = u64::from_le_bytes([ehdr[32], ehdr[33], ehdr[34], ehdr[35],
-                                       ehdr[36], ehdr[37], ehdr[38], ehdr[39]]) as usize;
+    let e_phoff = u64::from_le_bytes([
+        ehdr[32], ehdr[33], ehdr[34], ehdr[35], ehdr[36], ehdr[37], ehdr[38], ehdr[39],
+    ]) as usize;
     let e_phentsize = u16::from_le_bytes([ehdr[54], ehdr[55]]) as usize;
     let e_phnum = u16::from_le_bytes([ehdr[56], ehdr[57]]) as usize;
 
@@ -1170,11 +1257,14 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
             let ph_base = scratch.as_usize() + e_phoff + i * e_phentsize;
             let ph = unsafe { core::slice::from_raw_parts(ph_base as *const u8, 56) };
             let p_type = u32::from_le_bytes([ph[0], ph[1], ph[2], ph[3]]);
-            if p_type == 1 { // PT_LOAD
-                let p_offset = u64::from_le_bytes([ph[8], ph[9], ph[10], ph[11],
-                                                    ph[12], ph[13], ph[14], ph[15]]) as usize;
-                let p_filesz = u64::from_le_bytes([ph[32], ph[33], ph[34], ph[35],
-                                                    ph[36], ph[37], ph[38], ph[39]]) as usize;
+            if p_type == 1 {
+                // PT_LOAD
+                let p_offset = u64::from_le_bytes([
+                    ph[8], ph[9], ph[10], ph[11], ph[12], ph[13], ph[14], ph[15],
+                ]) as usize;
+                let p_filesz = u64::from_le_bytes([
+                    ph[32], ph[33], ph[34], ph[35], ph[36], ph[37], ph[38], ph[39],
+                ]) as usize;
                 let end = p_offset.saturating_add(p_filesz);
                 if end > max_file_end {
                     max_file_end = end;
@@ -1195,7 +1285,11 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
 
     // Phase B: Allocate contiguous buffer and copy full ELF data.
     let pages_needed = (max_file_end + PAGE_SIZE - 1) / PAGE_SIZE;
-    let order = if pages_needed <= 1 { 0 } else { (usize::BITS - (pages_needed - 1).leading_zeros()) as usize };
+    let order = if pages_needed <= 1 {
+        0
+    } else {
+        (usize::BITS - (pages_needed - 1).leading_zeros()) as usize
+    };
     let (buf_addr, buf_order) = if order == 0 {
         // Single page — reuse scratch if data already fits.
         if max_file_end <= header_len {
@@ -1225,9 +1319,8 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
             }
         };
         // Copy full ELF data from userspace.
-        let buf_slice = unsafe {
-            core::slice::from_raw_parts_mut(pages.as_usize() as *mut u8, max_file_end)
-        };
+        let buf_slice =
+            unsafe { core::slice::from_raw_parts_mut(pages.as_usize() as *mut u8, max_file_end) };
         if !copy_from_user(pt_root, elf_ptr as usize, buf_slice) {
             crate::mm::phys::free_pages(pages, order);
             crate::mm::phys::free_page(scratch);
@@ -1239,9 +1332,8 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
     };
 
     // Phase C: Spawn from the buffer, then free it.
-    let buf_slice = unsafe {
-        core::slice::from_raw_parts(buf_addr.as_usize() as *const u8, max_file_end)
-    };
+    let buf_slice =
+        unsafe { core::slice::from_raw_parts(buf_addr.as_usize() as *const u8, max_file_end) };
     let result = match crate::sched::spawn_user_from_elf(buf_slice, priority as u8, 20, arg0) {
         Some(tid) => {
             let task_id = crate::sched::thread_task_id(tid);
@@ -1262,7 +1354,7 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
 /// On success, the frame is completely rewritten and we never return to the caller.
 /// On failure (before point-of-no-return), sets return value to u64::MAX.
 fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
-    use crate::mm::page::{PAGE_SIZE, MMUPAGE_SIZE};
+    use crate::mm::page::{MMUPAGE_SIZE, PAGE_SIZE};
 
     let pt_root = crate::sched::scheduler::current_page_table_root();
     let aspace_id = crate::sched::scheduler::current_aspace_id();
@@ -1288,29 +1380,31 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     // Page-allocated scratch buffers: metadata page (u16 lengths) + contiguous data pages.
     const ARG_MAX_STRLEN: usize = 4096;
     let arg_max_strings: usize = PAGE_SIZE / 8; // scales with page size
-    let arg_max_total: usize = 2 * PAGE_SIZE;   // max total string bytes
+    let arg_max_total: usize = 2 * PAGE_SIZE; // max total string bytes
     let data_order: usize = 1; // 2 contiguous pages for string data
 
     // Allocate scratch pages.
     let meta_page = match crate::mm::phys::alloc_page() {
         Some(p) => p,
-        None => { set_return(frame, u64::MAX); return; }
+        None => {
+            set_return(frame, u64::MAX);
+            return;
+        }
     };
     let data_pages = match crate::mm::phys::alloc_pages(data_order) {
         Some(p) => p,
         None => {
             crate::mm::phys::free_page(meta_page);
-            set_return(frame, u64::MAX); return;
+            set_return(frame, u64::MAX);
+            return;
         }
     };
 
     // Metadata page: array of u16 string lengths.
-    let meta_lens = unsafe {
-        core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u16, PAGE_SIZE / 2)
-    };
-    let data_buf = unsafe {
-        core::slice::from_raw_parts_mut(data_pages.as_usize() as *mut u8, arg_max_total)
-    };
+    let meta_lens =
+        unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u16, PAGE_SIZE / 2) };
+    let data_buf =
+        unsafe { core::slice::from_raw_parts_mut(data_pages.as_usize() as *mut u8, arg_max_total) };
 
     let mut argc: usize = 0;
     let mut envc: usize = 0;
@@ -1319,36 +1413,45 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
 
     // Helper closure: copy a null-terminated string from userspace into data_buf.
     // Returns string length (excluding null) or None on error/overflow.
-    let copy_str = |pt: usize, str_ptr: usize, buf: &mut [u8], cursor: &mut usize| -> Option<usize> {
-        // Copy in chunks, scanning for null terminator.
-        let mut total = 0usize;
-        let max = ARG_MAX_STRLEN.min(buf.len() - *cursor);
-        while total < max {
-            let chunk = 256.min(max - total);
-            let dst = &mut buf[*cursor + total .. *cursor + total + chunk];
-            if !copy_from_user(pt, str_ptr + total, dst) {
-                return None;
+    let copy_str =
+        |pt: usize, str_ptr: usize, buf: &mut [u8], cursor: &mut usize| -> Option<usize> {
+            // Copy in chunks, scanning for null terminator.
+            let mut total = 0usize;
+            let max = ARG_MAX_STRLEN.min(buf.len() - *cursor);
+            while total < max {
+                let chunk = 256.min(max - total);
+                let dst = &mut buf[*cursor + total..*cursor + total + chunk];
+                if !copy_from_user(pt, str_ptr + total, dst) {
+                    return None;
+                }
+                if let Some(pos) = dst.iter().position(|&b| b == 0) {
+                    let slen = total + pos;
+                    *cursor += slen;
+                    return Some(slen);
+                }
+                total += chunk;
             }
-            if let Some(pos) = dst.iter().position(|&b| b == 0) {
-                let slen = total + pos;
-                *cursor += slen;
-                return Some(slen);
-            }
-            total += chunk;
-        }
-        // No null found within limit — truncate.
-        *cursor += max;
-        Some(max)
-    };
+            // No null found within limit — truncate.
+            *cursor += max;
+            Some(max)
+        };
 
     if argv_ptr != 0 {
         loop {
-            if total_strings >= arg_max_strings { break; }
+            if total_strings >= arg_max_strings {
+                break;
+            }
             let mut ptr_val = [0u8; 8];
-            if !copy_from_user(pt_root, argv_ptr + total_strings * 8, &mut ptr_val) { break; }
+            if !copy_from_user(pt_root, argv_ptr + total_strings * 8, &mut ptr_val) {
+                break;
+            }
             let str_ptr = u64::from_le_bytes(ptr_val) as usize;
-            if str_ptr == 0 { break; }
-            if data_cursor >= arg_max_total { break; }
+            if str_ptr == 0 {
+                break;
+            }
+            if data_cursor >= arg_max_total {
+                break;
+            }
             match copy_str(pt_root, str_ptr, data_buf, &mut data_cursor) {
                 Some(slen) => {
                     meta_lens[total_strings] = slen as u16;
@@ -1363,12 +1466,20 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     if envp_ptr != 0 {
         let mut ei = 0usize;
         loop {
-            if total_strings >= arg_max_strings { break; }
+            if total_strings >= arg_max_strings {
+                break;
+            }
             let mut ptr_val = [0u8; 8];
-            if !copy_from_user(pt_root, envp_ptr + ei * 8, &mut ptr_val) { break; }
+            if !copy_from_user(pt_root, envp_ptr + ei * 8, &mut ptr_val) {
+                break;
+            }
             let str_ptr = u64::from_le_bytes(ptr_val) as usize;
-            if str_ptr == 0 { break; }
-            if data_cursor >= arg_max_total { break; }
+            if str_ptr == 0 {
+                break;
+            }
+            if data_cursor >= arg_max_total {
+                break;
+            }
             match copy_str(pt_root, str_ptr, data_buf, &mut data_cursor) {
                 Some(slen) => {
                     meta_lens[total_strings] = slen as u16;
@@ -1424,7 +1535,10 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         Ok(e) => e,
         Err(_) => {
             // Past point-of-no-return, can't recover — exit.
-            crate::println!("execve: ELF load failed for {:?}", core::str::from_utf8(name));
+            crate::println!(
+                "execve: ELF load failed for {:?}",
+                core::str::from_utf8(name)
+            );
             crate::sched::scheduler::exit_current_thread(-1);
         }
     };
@@ -1434,7 +1548,11 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     let (entry, interp_base) = if elf_info.interp_len > 0 {
         // Look up interpreter in initramfs (strip leading "/" if present).
         let iname = &elf_info.interp[..elf_info.interp_len];
-        let iname = if iname.first() == Some(&b'/') { &iname[1..] } else { iname };
+        let iname = if iname.first() == Some(&b'/') {
+            &iname[1..]
+        } else {
+            iname
+        };
 
         match crate::io::initramfs::lookup_file(iname) {
             Some(interp_data) => {
@@ -1442,7 +1560,12 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
                 // For ET_DYN interpreters, we need to add base offset.
                 const INTERP_BASE: usize = 0x4_0000_0000;
 
-                match crate::loader::elf::load_elf_at_base(interp_data, aspace_id, new_pt_root, INTERP_BASE) {
+                match crate::loader::elf::load_elf_at_base(
+                    interp_data,
+                    aspace_id,
+                    new_pt_root,
+                    INTERP_BASE,
+                ) {
                     Ok(interp_info) => {
                         // Entry goes to interpreter; AT_ENTRY = original program entry.
                         (interp_info.entry, INTERP_BASE)
@@ -1454,7 +1577,10 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
                 }
             }
             None => {
-                crate::println!("execve: interpreter {:?} not found", core::str::from_utf8(iname));
+                crate::println!(
+                    "execve: interpreter {:?} not found",
+                    core::str::from_utf8(iname)
+                );
                 (elf_info.entry, 0usize)
             }
         }
@@ -1476,9 +1602,11 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     let stack_va = USER_STACK_TOP - stack_pages * PAGE_SIZE;
 
     let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-        aspace.map_anon(stack_va, stack_pages, crate::mm::vma::VmaProt::ReadWrite)
+        aspace
+            .map_anon(stack_va, stack_pages, crate::mm::vma::VmaProt::ReadWrite)
             .map(|vma| vma.object_id)
-    }).expect("execve: stack map");
+    })
+    .expect("execve: stack map");
 
     // Eagerly allocate and map stack pages.
     let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
@@ -1487,7 +1615,8 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
 
         let pa = crate::mm::object::with_object(obj_id, |obj| {
             obj.ensure_page(page_idx).map(|(pa, _)| pa)
-        }).expect("execve: stack alloc");
+        })
+        .expect("execve: stack alloc");
         let pa_usize = pa.as_usize();
 
         unsafe {
@@ -1529,12 +1658,10 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     let mut data_off: usize = 0;
     // We store addresses in a temporary array on the metadata page (reinterpreted as u64).
     // meta_page can hold PAGE_SIZE/8 u64 addresses.
-    let addr_buf = unsafe {
-        core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u64, PAGE_SIZE / 8)
-    };
-    let data_src = unsafe {
-        core::slice::from_raw_parts(data_pages.as_usize() as *const u8, arg_max_total)
-    };
+    let addr_buf =
+        unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u64, PAGE_SIZE / 8) };
+    let data_src =
+        unsafe { core::slice::from_raw_parts(data_pages.as_usize() as *const u8, arg_max_total) };
 
     // Write argv strings (from top down).
     for i in 0..argc {
@@ -1636,7 +1763,9 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         }
 
         trapframe::init_user_frame(
-            frame_ptr, entry, sp,
+            frame_ptr,
+            entry,
+            sp,
             &[argc as u64, argv_base as u64, envp_base as u64],
         );
     }
@@ -1710,7 +1839,14 @@ fn sys_set_quota(child_port: u64, resource_type: u64, limit: u64) -> u64 {
 ///   data[2] = receiver's new cap slot index
 ///   data[3] = granted port ID
 ///   data[4] = granted rights
-fn sys_send_cap(dest_port: u64, tag: u64, d0: u64, d1: u64, grant_port: u64, grant_rights: u64) -> u64 {
+fn sys_send_cap(
+    dest_port: u64,
+    tag: u64,
+    d0: u64,
+    d1: u64,
+    grant_port: u64,
+    grant_rights: u64,
+) -> u64 {
     // Check sender has SEND on dest_port.
     if !check_port_cap(dest_port, crate::cap::Rights::SEND) {
         return ECAP;
@@ -1740,7 +1876,14 @@ fn sys_send_cap(dest_port: u64, tag: u64, d0: u64, d1: u64, grant_port: u64, gra
     // Build and send the message.
     let mut msg = crate::ipc::Message {
         tag,
-        data: [d0, d1, receiver_slot, grant_port_id, rights.bits() as u64, 0],
+        data: [
+            d0,
+            d1,
+            receiver_slot,
+            grant_port_id,
+            rights.bits() as u64,
+            0,
+        ],
     };
 
     match crate::ipc::port::send_direct(dest_port, &mut msg) {
@@ -1753,12 +1896,10 @@ fn sys_send_cap(dest_port: u64, tag: u64, d0: u64, d1: u64, grant_port: u64, gra
             0
         }
         crate::ipc::port::SendDirectResult::Queued => 0,
-        crate::ipc::port::SendDirectResult::Full => {
-            match crate::ipc::port::send(dest_port, msg) {
-                Ok(()) => 0,
-                Err(()) => u64::MAX,
-            }
-        }
+        crate::ipc::port::SendDirectResult::Full => match crate::ipc::port::send(dest_port, msg) {
+            Ok(()) => 0,
+            Err(()) => u64::MAX,
+        },
         crate::ipc::port::SendDirectResult::Error => u64::MAX,
     }
 }
@@ -1767,17 +1908,17 @@ fn sys_send_cap(dest_port: u64, tag: u64, d0: u64, d1: u64, grant_port: u64, gra
 /// Returns the number of capabilities revoked, or u64::MAX on error.
 fn sys_cap_revoke(port_id: u64) -> u64 {
     let task_id = crate::sched::current_task_id();
-    if task_id == 0 { return u64::MAX; }
+    if task_id == 0 {
+        return u64::MAX;
+    }
 
-    let ptr = crate::sched::scheduler::TASK_TABLE.get(task_id)
-        as *mut crate::sched::task::Task;
-    if ptr.is_null() { return u64::MAX; }
+    let ptr = crate::sched::scheduler::TASK_TABLE.get(task_id) as *mut crate::sched::task::Task;
+    if ptr.is_null() {
+        return u64::MAX;
+    }
     let space = unsafe { &(*ptr).capspace };
     // Find the slot containing a cap for this port.
-    let slot = match space.find_port_cap(
-        port_id as usize,
-        crate::cap::Rights::MANAGE,
-    ) {
+    let slot = match space.find_port_cap(port_id as usize, crate::cap::Rights::MANAGE) {
         Some(s) => s,
         None => return u64::MAX,
     };
@@ -1808,8 +1949,14 @@ fn sys_vm_stats(which: u64) -> u64 {
         15 => crate::sched::stats::IPC_SENDS.load(Ordering::Relaxed),
         16 => crate::sched::stats::IPC_RECVS.load(Ordering::Relaxed),
         17 => stats::PAGES_PREZEROED.load(Ordering::Relaxed),
-        18 => { let (total, _) = crate::mm::phys::stats(); total as u64 }
-        19 => { let (_, free) = crate::mm::phys::stats(); free as u64 }
+        18 => {
+            let (total, _) = crate::mm::phys::stats();
+            total as u64
+        }
+        19 => {
+            let (_, free) = crate::mm::phys::stats();
+            free as u64
+        }
         20 => stats::RESERVATION_CONSOLIDATIONS.load(Ordering::Relaxed),
         21 => stats::WSCLOCK_RESERVATION_SKIPS.load(Ordering::Relaxed),
         _ => u64::MAX,
@@ -1842,14 +1989,20 @@ fn sys_proc_info(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
         Some(t) => t,
         None => return u64::MAX,
     };
-    if !task.active && !task.exited { return u64::MAX; }
+    if !task.active && !task.exited {
+        return u64::MAX;
+    }
 
     let r1 = (task.parent_task as u64) | ((task.thread_count as u64) << 32);
     let r2 = (task.uid as u64) | ((task.gid as u64) << 32);
     let r3 = (task.pgid as u64) | ((task.sid as u64) << 32);
     let mut state: u32 = 0;
-    if task.active { state |= 1; }
-    if task.exited { state |= 2; }
+    if task.active {
+        state |= 1;
+    }
+    if task.exited {
+        state |= 2;
+    }
     let r4 = (task.cur_pages as u64) | ((state as u64) << 32);
 
     set_reg(frame, 1, r1);
@@ -1882,11 +2035,7 @@ pub(crate) fn copy_from_user(pt_root: usize, user_va: usize, dst: &mut [u8]) -> 
         let page_remaining = 4096 - (pa & 0xFFF);
         let to_copy = page_remaining.min(dst.len() - offset);
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                pa as *const u8,
-                dst.as_mut_ptr().add(offset),
-                to_copy,
-            );
+            core::ptr::copy_nonoverlapping(pa as *const u8, dst.as_mut_ptr().add(offset), to_copy);
         }
         offset += to_copy;
     }
@@ -1914,11 +2063,7 @@ pub(crate) fn copy_to_user(pt_root: usize, user_va: usize, src: &[u8]) -> bool {
         let page_remaining = 4096 - (pa & 0xFFF);
         let to_copy = page_remaining.min(src.len() - offset);
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                src.as_ptr().add(offset),
-                pa as *mut u8,
-                to_copy,
-            );
+            core::ptr::copy_nonoverlapping(src.as_ptr().add(offset), pa as *mut u8, to_copy);
         }
         offset += to_copy;
     }
@@ -1938,7 +2083,11 @@ fn sys_set_affinity(port_id: u64, mask: u64) -> u64 {
     if target_task != caller_task {
         return u64::MAX;
     }
-    if crate::sched::set_affinity(tid, mask) { 0 } else { u64::MAX }
+    if crate::sched::set_affinity(tid, mask) {
+        0
+    } else {
+        u64::MAX
+    }
 }
 
 /// Query CPU topology for a given CPU index.
@@ -1985,7 +2134,9 @@ fn sys_cpu_load(cpu_id: u64) -> u64 {
 /// mprotect(addr, len, prot) -> 0 on success, u64::MAX on error.
 fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     let aspace_id = crate::sched::scheduler::current_aspace_id();
-    if aspace_id == 0 { return u64::MAX; }
+    if aspace_id == 0 {
+        return u64::MAX;
+    }
 
     let new_prot = match prot {
         0 => crate::mm::vma::VmaProt::ReadOnly,
@@ -2005,9 +2156,16 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
 /// mremap(old_addr, old_len, new_len) -> new_addr on success, u64::MAX on error.
 fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64) -> u64 {
     let aspace_id = crate::sched::scheduler::current_aspace_id();
-    if aspace_id == 0 { return u64::MAX; }
+    if aspace_id == 0 {
+        return u64::MAX;
+    }
 
-    let result = crate::mm::aspace::mremap(aspace_id, old_addr as usize, old_len as usize, new_len as usize);
+    let result = crate::mm::aspace::mremap(
+        aspace_id,
+        old_addr as usize,
+        old_len as usize,
+        new_len as usize,
+    );
     if result == 0 { u64::MAX } else { result as u64 }
 }
 
@@ -2058,26 +2216,41 @@ fn sys_sigprocmask(how: u64, new_set: u64) -> u64 {
 /// kill_sig(target, sig) -> 0 on success, u64::MAX on error.
 /// If target > 0: sends signal to the task containing thread `target`.
 fn sys_clock_gettime(clock_id: u64) -> u64 {
-    if clock_id != 0 { return u64::MAX; } // CLOCK_MONOTONIC only
+    if clock_id != 0 {
+        return u64::MAX;
+    } // CLOCK_MONOTONIC only
     crate::sched::get_monotonic_ns()
 }
 
 fn sys_nanosleep(ns: u64) -> u64 {
-    if ns == 0 { return 0; }
+    if ns == 0 {
+        return 0;
+    }
     let deadline = crate::sched::get_monotonic_ns() + ns;
     crate::sched::park_current_for_sleep(deadline);
     0
 }
 
-fn sys_mmap_file(va_hint: u64, page_count: u64, prot: u64, file_handle: u64, file_offset: u64, pager_task: u64) -> u64 {
+fn sys_mmap_file(
+    va_hint: u64,
+    page_count: u64,
+    prot: u64,
+    file_handle: u64,
+    file_offset: u64,
+    pager_task: u64,
+) -> u64 {
     use crate::mm::page::PAGE_SIZE;
     use crate::mm::vma::VmaProt;
 
     let aspace_id = crate::sched::scheduler::current_aspace_id();
-    if aspace_id == 0 { return u64::MAX; }
+    if aspace_id == 0 {
+        return u64::MAX;
+    }
 
     let pages = page_count as usize;
-    if pages == 0 || pages > 256 { return u64::MAX; }
+    if pages == 0 || pages > 256 {
+        return u64::MAX;
+    }
 
     let prot = match prot {
         0 => VmaProt::ReadOnly,
@@ -2095,10 +2268,11 @@ fn sys_mmap_file(va_hint: u64, page_count: u64, prot: u64, file_handle: u64, fil
     };
 
     // Create pager-backed object (gets a normal port for fault IPC).
-    let obj_id = match crate::mm::object::create_pager(pages as u16, file_handle as u32, file_offset) {
-        Some(id) => id,
-        None => return u64::MAX,
-    };
+    let obj_id =
+        match crate::mm::object::create_pager(pages as u16, file_handle as u32, file_offset) {
+            Some(id) => id,
+            None => return u64::MAX,
+        };
 
     // Grant RECV+SEND on the object port to the pager task.
     let obj_port = crate::mm::object::object_port(obj_id);
@@ -2177,14 +2351,22 @@ fn sys_kill_sig(target: u64, sig: u64) -> u64 {
             None => return u64::MAX,
         };
         // The leader's task_id is used as the pgid.
-        if crate::sched::send_signal_to_pgroup(leader_task, sig as u32) { 0 } else { u64::MAX }
+        if crate::sched::send_signal_to_pgroup(leader_task, sig as u32) {
+            0
+        } else {
+            u64::MAX
+        }
     } else {
         // Resolve task or thread port to a task_id (validated by port_id match).
         let task_id = match crate::sched::task_id_from_any_port(target) {
             Some(t) => t,
             None => return u64::MAX,
         };
-        if crate::sched::send_signal_to_task(task_id, sig as u32) { 0 } else { u64::MAX }
+        if crate::sched::send_signal_to_task(task_id, sig as u32) {
+            0
+        } else {
+            u64::MAX
+        }
     }
 }
 
@@ -2212,10 +2394,7 @@ fn sys_sigreturn(frame: &mut ExceptionFrame) {
     // Restore exception frame.
     let frame_size = crate::arch::trapframe::EXCEPTION_FRAME_SIZE;
     let frame_bytes = unsafe {
-        core::slice::from_raw_parts_mut(
-            frame as *mut ExceptionFrame as *mut u8,
-            frame_size,
-        )
+        core::slice::from_raw_parts_mut(frame as *mut ExceptionFrame as *mut u8, frame_size)
     };
     copy_from_user(pt_root, saved_frame_va, frame_bytes);
     // frame is now restored — dispatch() returns and exception return
@@ -2279,10 +2458,7 @@ fn deliver_pending_signals(frame: &mut ExceptionFrame) {
 
             // Save current exception frame to signal frame.
             let frame_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    frame as *const ExceptionFrame as *const u8,
-                    frame_size,
-                )
+                core::slice::from_raw_parts(frame as *const ExceptionFrame as *const u8, frame_size)
             };
             if !copy_to_user(pt_root, new_sp + SIGFRAME_OVERHEAD, frame_bytes) {
                 crate::sched::scheduler::exit_current_thread(-(sig as i32));
@@ -2297,8 +2473,13 @@ fn deliver_pending_signals(frame: &mut ExceptionFrame) {
             // frame_addr is passed so the handler can call sigreturn(frame_addr).
 
             trapframe::setup_signal_entry(
-                frame, handler_addr, sig as u64, new_sp as u64, new_sp,
-                copy_to_user, pt_root,
+                frame,
+                handler_addr,
+                sig as u64,
+                new_sp as u64,
+                new_sp,
+                copy_to_user,
+                pt_root,
             );
         }
     }
@@ -2331,7 +2512,9 @@ fn sys_getegid() -> u64 {
 /// setuid: only euid 0 (root) can set arbitrary uid.
 /// Non-root can only set uid to their real uid (no-op).
 fn sys_setuid(new_uid: u64) -> u64 {
-    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let tid = crate::sched::smp::current()
+        .current_thread
+        .load(core::sync::atomic::Ordering::Relaxed);
     let task_id = crate::sched::scheduler::thread_ref(tid).task_id;
     // Safe: only the current task modifies its own credentials.
     let task = unsafe { crate::sched::scheduler::task_mut_from_ref(task_id) };
@@ -2349,7 +2532,9 @@ fn sys_setuid(new_uid: u64) -> u64 {
 
 /// setgid: only euid 0 (root) can set arbitrary gid.
 fn sys_setgid(new_gid: u64) -> u64 {
-    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let tid = crate::sched::smp::current()
+        .current_thread
+        .load(core::sync::atomic::Ordering::Relaxed);
     let task_id = crate::sched::scheduler::thread_ref(tid).task_id;
     let task = unsafe { crate::sched::scheduler::task_mut_from_ref(task_id) };
     if task.euid == 0 {
@@ -2367,7 +2552,7 @@ fn sys_setgid(new_gid: u64) -> u64 {
 /// setgroups: set supplementary group list. Only euid 0 can call.
 /// a0 = count, a1 = pointer to u32 array in user memory.
 fn sys_setgroups(count: u64, groups_ptr: u64) -> u64 {
-    use crate::sched::task::{MAX_GROUPS, GROUPS_INLINE};
+    use crate::sched::task::{GROUPS_INLINE, MAX_GROUPS};
     let n = count as usize;
     if n > MAX_GROUPS {
         return u64::MAX; // EINVAL
@@ -2406,7 +2591,8 @@ fn sys_setgroups(count: u64, groups_ptr: u64) -> u64 {
             }
             for i in 0..n {
                 let off = i * 4;
-                inline_buf[i] = u32::from_le_bytes([tmp[off], tmp[off+1], tmp[off+2], tmp[off+3]]);
+                inline_buf[i] =
+                    u32::from_le_bytes([tmp[off], tmp[off + 1], tmp[off + 2], tmp[off + 3]]);
             }
         } else {
             // Copy directly into the overflow page.
@@ -2419,7 +2605,9 @@ fn sys_setgroups(count: u64, groups_ptr: u64) -> u64 {
     }
 
     // Apply lock-free: only the current task modifies its own groups.
-    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let tid = crate::sched::smp::current()
+        .current_thread
+        .load(core::sync::atomic::Ordering::Relaxed);
     let task_id = crate::sched::scheduler::thread_ref(tid).task_id;
     let task = unsafe { crate::sched::scheduler::task_mut_from_ref(task_id) };
     // Free old overflow page if present.
@@ -2452,13 +2640,19 @@ fn sys_wait4(pid: u64, flags: u64, frame: &mut ExceptionFrame) -> u64 {
         let leader_port = (-(pid as i64)) as u64;
         match resolve_task_port(leader_port) {
             Some(t) => -(t as i64),
-            None => { set_return(frame, u64::MAX); return u64::MAX; }
+            None => {
+                set_return(frame, u64::MAX);
+                return u64::MAX;
+            }
         }
     } else {
         // Positive: specific child task port_id
         match resolve_task_port(pid) {
             Some(t) => t as i64,
-            None => { set_return(frame, u64::MAX); return u64::MAX; }
+            None => {
+                set_return(frame, u64::MAX);
+                return u64::MAX;
+            }
         }
     };
     let (child_port, child_id, status) = crate::sched::scheduler::wait4(internal_pid, flags as u32);
@@ -2474,7 +2668,9 @@ fn sys_wait4(pid: u64, flags: u64, frame: &mut ExceptionFrame) -> u64 {
 
 fn sys_getrlimit(resource: u64, frame: &mut ExceptionFrame) -> u64 {
     use crate::sched::task::RLIMIT_COUNT;
-    if resource as usize >= RLIMIT_COUNT { return u64::MAX; }
+    if resource as usize >= RLIMIT_COUNT {
+        return u64::MAX;
+    }
     let task_id = crate::sched::current_task_id();
     let rl = &crate::sched::scheduler::task_ref(task_id).rlimits[resource as usize];
     let cur = rl.cur;
@@ -2486,9 +2682,13 @@ fn sys_getrlimit(resource: u64, frame: &mut ExceptionFrame) -> u64 {
 }
 
 fn sys_setrlimit(resource: u64, new_cur: u64, new_max: u64) -> u64 {
-    use crate::sched::task::{RLIMIT_COUNT, RLIM_INFINITY};
-    if resource as usize >= RLIMIT_COUNT { return u64::MAX; }
-    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    use crate::sched::task::{RLIM_INFINITY, RLIMIT_COUNT};
+    if resource as usize >= RLIMIT_COUNT {
+        return u64::MAX;
+    }
+    let tid = crate::sched::smp::current()
+        .current_thread
+        .load(core::sync::atomic::Ordering::Relaxed);
     let task_id = crate::sched::scheduler::thread_ref(tid).task_id;
     let task = crate::sched::scheduler::task_ref(task_id);
     let euid = task.euid;
@@ -2504,7 +2704,11 @@ fn sys_setrlimit(resource: u64, new_cur: u64, new_max: u64) -> u64 {
         return u64::MAX;
     }
     // Non-root: cannot set soft above hard.
-    let effective_max = if new_max == RLIM_INFINITY { RLIM_INFINITY } else { new_max };
+    let effective_max = if new_max == RLIM_INFINITY {
+        RLIM_INFINITY
+    } else {
+        new_max
+    };
     if new_cur != RLIM_INFINITY && effective_max != RLIM_INFINITY && new_cur > effective_max {
         return u64::MAX;
     }
@@ -2516,11 +2720,21 @@ fn sys_setrlimit(resource: u64, new_cur: u64, new_max: u64) -> u64 {
     0
 }
 
-fn sys_prlimit(pid: u64, resource: u64, new_cur: u64, new_max: u64, frame: &mut ExceptionFrame) -> u64 {
-    use crate::sched::task::{RLIMIT_COUNT, RLIM_INFINITY};
-    if resource as usize >= RLIMIT_COUNT { return u64::MAX; }
+fn sys_prlimit(
+    pid: u64,
+    resource: u64,
+    new_cur: u64,
+    new_max: u64,
+    frame: &mut ExceptionFrame,
+) -> u64 {
+    use crate::sched::task::{RLIM_INFINITY, RLIMIT_COUNT};
+    if resource as usize >= RLIMIT_COUNT {
+        return u64::MAX;
+    }
 
-    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let tid = crate::sched::smp::current()
+        .current_thread
+        .load(core::sync::atomic::Ordering::Relaxed);
     let caller_task_id = crate::sched::scheduler::thread_ref(tid).task_id;
     let euid = crate::sched::scheduler::task_ref(caller_task_id).euid;
 
@@ -2536,7 +2750,9 @@ fn sys_prlimit(pid: u64, resource: u64, new_cur: u64, new_max: u64, frame: &mut 
             Some(t) => t,
             None => return u64::MAX,
         };
-        if !target.active { return u64::MAX; }
+        if !target.active {
+            return u64::MAX;
+        }
         if euid != 0 && target.parent_task != caller_task_id {
             return u64::MAX;
         }
@@ -2552,8 +2768,16 @@ fn sys_prlimit(pid: u64, resource: u64, new_cur: u64, new_max: u64, frame: &mut 
     // Set new values (if new_cur != RLIM_INFINITY-1, treat as "set").
     let sentinel = RLIM_INFINITY - 1;
     if new_cur != sentinel || new_max != sentinel {
-        let set_cur = if new_cur == sentinel { old_cur } else { new_cur };
-        let set_max = if new_max == sentinel { old_max } else { new_max };
+        let set_cur = if new_cur == sentinel {
+            old_cur
+        } else {
+            new_cur
+        };
+        let set_max = if new_max == sentinel {
+            old_max
+        } else {
+            new_max
+        };
 
         // Validate.
         if set_cur != RLIM_INFINITY && set_max != RLIM_INFINITY && set_cur > set_max {
@@ -2580,7 +2804,12 @@ fn sys_getgroups(max_count: u64, groups_ptr: u64) -> u64 {
     let (n, pt_root, inline_copy, overflow_addr) = {
         let task_id = crate::sched::current_task_id();
         let task = crate::sched::scheduler::task_ref(task_id);
-        (task.ngroups as usize, task.page_table_root, task.groups_inline, task.groups_overflow)
+        (
+            task.ngroups as usize,
+            task.page_table_root,
+            task.groups_inline,
+            task.groups_overflow,
+        )
     };
     if max_count == 0 {
         return n as u64;
@@ -2597,8 +2826,10 @@ fn sys_getgroups(max_count: u64, groups_ptr: u64) -> u64 {
         for i in 0..n {
             let bytes = inline_copy[i].to_le_bytes();
             let off = i * 4;
-            tmp[off] = bytes[0]; tmp[off+1] = bytes[1];
-            tmp[off+2] = bytes[2]; tmp[off+3] = bytes[3];
+            tmp[off] = bytes[0];
+            tmp[off + 1] = bytes[1];
+            tmp[off + 2] = bytes[2];
+            tmp[off + 3] = bytes[3];
         }
         if !copy_to_user(pt_root, groups_ptr as usize, &tmp[..n * 4]) {
             return u64::MAX;
@@ -2695,7 +2926,11 @@ fn sys_port_set_recv_timeout(set_id: u64, timeout_us: u64, frame: &mut Exception
                 // Timeout (including 0) — return u64::MAX.
                 set_return(frame, u64::MAX);
                 let nr = SYS_PORT_SET_RECV_TIMEOUT;
-                crate::trace::trace_event(crate::trace::EVT_SYSCALL_EXIT, nr as u32, u64::MAX as u32);
+                crate::trace::trace_event(
+                    crate::trace::EVT_SYSCALL_EXIT,
+                    nr as u32,
+                    u64::MAX as u32,
+                );
                 if crate::sched::scheduler::current_aspace_id() != 0 {
                     deliver_pending_signals(frame);
                 }
@@ -2729,7 +2964,9 @@ fn sys_mmap_guard(addr: u64, pages: u64) -> u64 {
     let va = addr as usize;
     let count = pages as usize;
     match crate::mm::aspace::with_aspace_mut(aspace_id, |aspace| {
-        aspace.map_anon(va, count, VmaProt::None).map(|vma| vma.va_start)
+        aspace
+            .map_anon(va, count, VmaProt::None)
+            .map(|vma| vma.va_start)
     }) {
         Some(Some(va_start)) => va_start as u64,
         _ => u64::MAX,
@@ -2829,7 +3066,9 @@ fn sys_sigsuspend(mask: u64) -> u64 {
 }
 
 fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
-    let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+    let tid = crate::sched::smp::current()
+        .current_thread
+        .load(core::sync::atomic::Ordering::Relaxed);
     let t = crate::sched::scheduler::thread_ref(tid);
     let task_id = t.task_id;
     let pt_root = crate::sched::scheduler::task_ref(task_id).page_table_root;
@@ -2852,9 +3091,15 @@ fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
         if !copy_from_user(pt_root, ss_ptr as usize, &mut buf) {
             return u64::MAX;
         }
-        let new_base = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-        let new_size = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
-        let tid2 = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed);
+        let new_base = u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        let new_size = u64::from_le_bytes([
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        ]);
+        let tid2 = crate::sched::smp::current()
+            .current_thread
+            .load(core::sync::atomic::Ordering::Relaxed);
         // Safe: only the current thread modifies its own sigaltstack.
         let t = unsafe { crate::sched::scheduler::thread_mut_from_ref(tid2) };
         t.sig_altstack_base = new_base;

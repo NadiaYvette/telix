@@ -86,7 +86,12 @@ struct OpenHandle {
 
 impl OpenHandle {
     const fn empty() -> Self {
-        Self { file_idx: 0, active: false, writable: false, pid: 0 }
+        Self {
+            file_idx: 0,
+            active: false,
+            writable: false,
+            pid: 0,
+        }
     }
 }
 
@@ -102,16 +107,23 @@ const F_UNLCK: u8 = 2;
 #[derive(Clone, Copy)]
 struct FileLock {
     active: bool,
-    file_idx: u32,      // index into files[] (inode equivalent)
+    file_idx: u32, // index into files[] (inode equivalent)
     pid: u32,
-    lock_type: u8,      // F_RDLCK or F_WRLCK
+    lock_type: u8, // F_RDLCK or F_WRLCK
     start: u64,
-    len: u64,           // 0 = to EOF
+    len: u64, // 0 = to EOF
 }
 
 impl FileLock {
     const fn empty() -> Self {
-        Self { active: false, file_idx: 0, pid: 0, lock_type: 0, start: 0, len: 0 }
+        Self {
+            active: false,
+            file_idx: 0,
+            pid: 0,
+            lock_type: 0,
+            start: 0,
+            len: 0,
+        }
     }
 }
 
@@ -128,14 +140,30 @@ struct LockWaiter {
 
 impl LockWaiter {
     const fn empty() -> Self {
-        Self { active: false, reply_port: 0, file_idx: 0, pid: 0, lock_type: 0, start: 0, len: 0 }
+        Self {
+            active: false,
+            reply_port: 0,
+            file_idx: 0,
+            pid: 0,
+            lock_type: 0,
+            start: 0,
+            len: 0,
+        }
     }
 }
 
 /// Check if two byte ranges overlap. len=0 means "to infinity".
 fn ranges_overlap(s1: u64, l1: u64, s2: u64, l2: u64) -> bool {
-    let e1 = if l1 == 0 { u64::MAX } else { s1.saturating_add(l1) };
-    let e2 = if l2 == 0 { u64::MAX } else { s2.saturating_add(l2) };
+    let e1 = if l1 == 0 {
+        u64::MAX
+    } else {
+        s1.saturating_add(l1)
+    };
+    let e2 = if l2 == 0 {
+        u64::MAX
+    } else {
+        s2.saturating_add(l2)
+    };
     s1 < e2 && s2 < e1
 }
 
@@ -143,7 +171,11 @@ fn ranges_overlap(s1: u64, l1: u64, s2: u64, l2: u64) -> bool {
 /// Returns true if there IS a conflict (cannot acquire).
 fn lock_conflicts(
     locks: &[FileLock; MAX_LOCKS],
-    file_idx: u32, pid: u32, lock_type: u8, start: u64, len: u64,
+    file_idx: u32,
+    pid: u32,
+    lock_type: u8,
+    start: u64,
+    len: u64,
 ) -> bool {
     for lk in locks.iter() {
         if !lk.active || lk.file_idx != file_idx {
@@ -168,7 +200,11 @@ fn lock_conflicts(
 /// Find the first conflicting lock (for F_GETLK).
 fn find_conflict(
     locks: &[FileLock; MAX_LOCKS],
-    file_idx: u32, pid: u32, lock_type: u8, start: u64, len: u64,
+    file_idx: u32,
+    pid: u32,
+    lock_type: u8,
+    start: u64,
+    len: u64,
 ) -> Option<usize> {
     for (i, lk) in locks.iter().enumerate() {
         if !lk.active || lk.file_idx != file_idx || lk.pid == pid {
@@ -187,11 +223,17 @@ fn find_conflict(
 /// Acquire a lock. Removes/replaces existing locks from same PID on overlapping range.
 fn acquire_lock(
     locks: &mut [FileLock; MAX_LOCKS],
-    file_idx: u32, pid: u32, lock_type: u8, start: u64, len: u64,
+    file_idx: u32,
+    pid: u32,
+    lock_type: u8,
+    start: u64,
+    len: u64,
 ) -> bool {
     // Remove existing locks from same PID on same file that overlap.
     for lk in locks.iter_mut() {
-        if lk.active && lk.file_idx == file_idx && lk.pid == pid
+        if lk.active
+            && lk.file_idx == file_idx
+            && lk.pid == pid
             && ranges_overlap(lk.start, lk.len, start, len)
         {
             lk.active = false;
@@ -200,7 +242,14 @@ fn acquire_lock(
     // Allocate new lock slot.
     for lk in locks.iter_mut() {
         if !lk.active {
-            *lk = FileLock { active: true, file_idx, pid, lock_type, start, len };
+            *lk = FileLock {
+                active: true,
+                file_idx,
+                pid,
+                lock_type,
+                start,
+                len,
+            };
             return true;
         }
     }
@@ -209,10 +258,7 @@ fn acquire_lock(
 
 /// Release all locks held by (pid, file_idx) on overlapping range.
 /// If start=0 and len=0, release all locks for this (pid, file_idx).
-fn release_locks(
-    locks: &mut [FileLock; MAX_LOCKS],
-    file_idx: u32, pid: u32, start: u64, len: u64,
-) {
+fn release_locks(locks: &mut [FileLock; MAX_LOCKS], file_idx: u32, pid: u32, start: u64, len: u64) {
     for lk in locks.iter_mut() {
         if lk.active && lk.file_idx == file_idx && lk.pid == pid {
             if start == 0 && len == 0 {
@@ -272,9 +318,14 @@ fn find_file(files: &[TmpfsFile; MAX_FILES], name: &[u8], name_len: usize) -> Op
         if f.active && f.name_len as usize == name_len {
             let mut eq = true;
             for j in 0..name_len {
-                if f.name[j] != name[j] { eq = false; break; }
+                if f.name[j] != name[j] {
+                    eq = false;
+                    break;
+                }
             }
-            if eq { return Some(i); }
+            if eq {
+                return Some(i);
+            }
         }
     }
     None
@@ -324,8 +375,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if h == u64::MAX {
                             syscall::send(reply_port, FS_ERROR, ERR_FULL, 0, 0, 0);
                         } else {
-                            syscall::send(reply_port, FS_OPEN_OK,
-                                h, files[fi].size as u64, my_aspace as u64, 0);
+                            syscall::send(
+                                reply_port,
+                                FS_OPEN_OK,
+                                h,
+                                files[fi].size as u64,
+                                my_aspace as u64,
+                                0,
+                            );
                         }
                     }
                     None => {
@@ -379,12 +436,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::send_nb(reply_port, FS_READ_OK, bytes_in_page as u64, 0);
                 } else {
                     let inline_len = bytes_in_page.min(MAX_INLINE);
-                    let data = unsafe {
-                        core::slice::from_raw_parts(src as *const u8, inline_len)
-                    };
+                    let data = unsafe { core::slice::from_raw_parts(src as *const u8, inline_len) };
                     let packed = pack_inline_data(data);
-                    syscall::send(reply_port, FS_READ_OK,
-                        inline_len as u64, packed[0], packed[1], packed[2]);
+                    syscall::send(
+                        reply_port,
+                        FS_READ_OK,
+                        inline_len as u64,
+                        packed[0],
+                        packed[1],
+                        packed[2],
+                    );
                 }
             }
 
@@ -406,8 +467,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         for j in 8..nlen.min(16) {
                             name_hi |= (f.name[j] as u64) << ((j - 8) * 8);
                         }
-                        syscall::send(reply_port, FS_READDIR_OK,
-                            f.size as u64, name_lo, name_hi, (i + 1) as u64);
+                        syscall::send(
+                            reply_port,
+                            FS_READDIR_OK,
+                            f.size as u64,
+                            name_lo,
+                            name_hi,
+                            (i + 1) as u64,
+                        );
                         found = true;
                         break;
                     }
@@ -428,8 +495,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 let fi = handles[handle].file_idx;
                 let f = &files[fi];
-                syscall::send(reply_port, FS_STAT_OK,
-                    f.size as u64, f.mode as u64, 0, fi as u64);
+                syscall::send(
+                    reply_port,
+                    FS_STAT_OK,
+                    f.size as u64,
+                    f.mode as u64,
+                    0,
+                    fi as u64,
+                );
             }
 
             FS_CLOSE => {
@@ -501,8 +574,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     files[fi].active = false;
                     syscall::send(reply_port, FS_ERROR, ERR_FULL, 0, 0, 0);
                 } else {
-                    syscall::send(reply_port, FS_CREATE_OK,
-                        h, 0, my_aspace as u64, 0);
+                    syscall::send(reply_port, FS_CREATE_OK, h, 0, my_aspace as u64, 0);
                 }
             }
 
@@ -512,9 +584,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let reply_port = msg.data[1] >> 32;
                 let grant_va = msg.data[2] as usize;
 
-                if handle >= MAX_OPEN || !handles[handle].active
-                    || !handles[handle].writable
-                {
+                if handle >= MAX_OPEN || !handles[handle].active || !handles[handle].writable {
                     if reply_port != 0 {
                         syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
                     }
@@ -611,11 +681,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 let fi = handles[handle].file_idx as u32;
                 let is_unlock = operation & 8 != 0; // LOCK_UN
-                let is_nb = operation & 4 != 0;      // LOCK_NB
-                let lock_type = if operation & 2 != 0 { F_WRLCK }
-                                else if operation & 1 != 0 { F_RDLCK }
-                                else if is_unlock { F_UNLCK }
-                                else { F_UNLCK };
+                let is_nb = operation & 4 != 0; // LOCK_NB
+                let lock_type = if operation & 2 != 0 {
+                    F_WRLCK
+                } else if operation & 1 != 0 {
+                    F_RDLCK
+                } else if is_unlock {
+                    F_UNLCK
+                } else {
+                    F_UNLCK
+                };
 
                 if is_unlock {
                     release_locks(&mut locks, fi, pid, 0, 0);
@@ -635,8 +710,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     for w in waiters.iter_mut() {
                         if !w.active {
                             *w = LockWaiter {
-                                active: true, reply_port, file_idx: fi,
-                                pid, lock_type, start: 0, len: 0,
+                                active: true,
+                                reply_port,
+                                file_idx: fi,
+                                pid,
+                                lock_type,
+                                start: 0,
+                                len: 0,
                             };
                             queued = true;
                             break;
@@ -683,8 +763,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     for w in waiters.iter_mut() {
                         if !w.active {
                             *w = LockWaiter {
-                                active: true, reply_port, file_idx: fi,
-                                pid, lock_type, start, len,
+                                active: true,
+                                reply_port,
+                                file_idx: fi,
+                                pid,
+                                lock_type,
+                                start,
+                                len,
                             };
                             queued = true;
                             break;
@@ -728,5 +813,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

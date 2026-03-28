@@ -10,7 +10,11 @@
 const GICD_FALLBACK: usize = 0x0800_0000;
 fn gicd_base() -> usize {
     let info = crate::firmware::irq_controller();
-    if info.kind != 0 { info.base0 as usize } else { GICD_FALLBACK }
+    if info.kind != 0 {
+        info.base0 as usize
+    } else {
+        GICD_FALLBACK
+    }
 }
 
 // GICD register offsets
@@ -22,13 +26,17 @@ const GICD_IPRIORITYR_OFF: usize = 0x400; // Array of 8-bit fields
 const GICR_FALLBACK: usize = 0x080A_0000;
 fn gicr_base() -> usize {
     let info = crate::firmware::irq_controller();
-    if info.kind != 0 { info.base1 as usize } else { GICR_FALLBACK }
+    if info.kind != 0 {
+        info.base1 as usize
+    } else {
+        GICR_FALLBACK
+    }
 }
 const GICR_STRIDE: usize = 0x20000; // 128 KiB per redistributor
 const GICR_WAKER_OFFSET: usize = 0x14;
 // SGI/PPI redistributor frame is at offset 0x10000 from the redistributor base
 const GICR_SGI_BASE_OFFSET: usize = 0x10000;
-const GICR_IGROUPR0_OFFSET: usize = 0x080;  // Interrupt Group Register 0 (SGIs/PPIs)
+const GICR_IGROUPR0_OFFSET: usize = 0x080; // Interrupt Group Register 0 (SGIs/PPIs)
 const GICR_ISENABLER0_OFFSET: usize = 0x100;
 const GICR_IPRIORITYR_OFFSET: usize = 0x400;
 
@@ -165,7 +173,9 @@ pub fn enable_interrupt(intid: u32) {
         // DSB+ISB: ensure the GIC distributor write is complete and visible
         // before the CPU proceeds. Without this, an immediate irq_wait()
         // can race with the GIC configuration, losing the first interrupt.
-        unsafe { core::arch::asm!("dsb sy", "isb"); }
+        unsafe {
+            core::arch::asm!("dsb sy", "isb");
+        }
         // Route to CPU 0 (GICD_IROUTER default is fine for GICv3 with ARE).
     }
 }

@@ -42,7 +42,12 @@ struct SemSet {
 
 impl SemSet {
     const fn empty() -> Self {
-        Self { active: false, key: 0, nsems: 0, vals: [0; MAX_SEMS_PER] }
+        Self {
+            active: false,
+            key: 0,
+            nsems: 0,
+            vals: [0; MAX_SEMS_PER],
+        }
     }
 }
 
@@ -57,7 +62,13 @@ struct Waiter {
 
 impl Waiter {
     const fn empty() -> Self {
-        Self { active: false, semid: 0, sem_num: 0, op: 0, reply: 0 }
+        Self {
+            active: false,
+            semid: 0,
+            sem_num: 0,
+            op: 0,
+            reply: 0,
+        }
     }
 }
 
@@ -68,13 +79,19 @@ static mut NEXT_KEY: i32 = 1;
 fn try_wake_waiters() {
     unsafe {
         for i in 0..MAX_WAITERS {
-            if !WAITERS[i].active { continue; }
+            if !WAITERS[i].active {
+                continue;
+            }
             let sid = WAITERS[i].semid as usize;
             let sn = WAITERS[i].sem_num as usize;
             let op = WAITERS[i].op;
 
-            if sid >= MAX_SEM_SETS || !SEM_SETS[sid].active { continue; }
-            if sn >= SEM_SETS[sid].nsems { continue; }
+            if sid >= MAX_SEM_SETS || !SEM_SETS[sid].active {
+                continue;
+            }
+            if sn >= SEM_SETS[sid].nsems {
+                continue;
+            }
 
             if op < 0 {
                 let needed = (-op) as i32;
@@ -140,8 +157,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                             if !SEM_SETS[i].active {
                                 SEM_SETS[i].active = true;
                                 SEM_SETS[i].key = if key == 0 { NEXT_KEY } else { key };
-                                if key == 0 { NEXT_KEY += 1; }
-                                SEM_SETS[i].nsems = if nsems > MAX_SEMS_PER { MAX_SEMS_PER } else { nsems };
+                                if key == 0 {
+                                    NEXT_KEY += 1;
+                                }
+                                SEM_SETS[i].nsems = if nsems > MAX_SEMS_PER {
+                                    MAX_SEMS_PER
+                                } else {
+                                    nsems
+                                };
                                 SEM_SETS[i].vals = [0; MAX_SEMS_PER];
                                 syscall::send(reply, SEM_OK, i as u64, 0, 0, 0);
                                 allocated = true;
@@ -168,7 +191,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                 }
 
                 unsafe {
-                    if !SEM_SETS[semid as usize].active || (sem_num as usize) >= SEM_SETS[semid as usize].nsems {
+                    if !SEM_SETS[semid as usize].active
+                        || (sem_num as usize) >= SEM_SETS[semid as usize].nsems
+                    {
                         syscall::send(reply, SEM_ERROR, 0, 0, 0, 0);
                         continue;
                     }

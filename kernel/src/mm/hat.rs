@@ -7,8 +7,8 @@
 //! All functions compile down to direct calls into the single active
 //! arch backend — no trait objects, no runtime dispatch.
 
-use crate::arch::platform::mm as arch_mm;
 use super::vma::{Vma, VmaProt};
+use crate::arch::platform::mm as arch_mm;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -52,9 +52,13 @@ pub fn boot_page_table_root() -> usize {
 #[inline]
 pub fn kernel_pt_root() -> usize {
     #[cfg(target_arch = "riscv64")]
-    { arch_mm::kernel_pt_root() }
+    {
+        arch_mm::kernel_pt_root()
+    }
     #[cfg(not(target_arch = "riscv64"))]
-    { boot_page_table_root() }
+    {
+        boot_page_table_root()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,9 +145,14 @@ pub fn demote_superpage(root: usize, va: usize, flags: u64) -> bool {
 #[inline]
 pub fn try_contiguous_promotion(root: usize, va: usize, group_count: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
-    { arch_mm::try_contiguous_promotion(root, va, group_count) }
+    {
+        arch_mm::try_contiguous_promotion(root, va, group_count)
+    }
     #[cfg(not(target_arch = "aarch64"))]
-    { let _ = (root, va, group_count); false }
+    {
+        let _ = (root, va, group_count);
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +162,13 @@ pub fn try_contiguous_promotion(root: usize, va: usize, group_count: usize) -> b
 /// Map a contiguous range of user pages.
 #[inline]
 #[allow(dead_code)]
-pub fn map_user_pages(root: usize, virt: usize, phys: usize, size: usize, flags: u64) -> Option<()> {
+pub fn map_user_pages(
+    root: usize,
+    virt: usize,
+    phys: usize,
+    size: usize,
+    flags: u64,
+) -> Option<()> {
     arch_mm::map_user_pages(root, virt, phys, size, flags)
 }
 

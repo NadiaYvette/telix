@@ -69,12 +69,16 @@ const MAX_LISTEN_SLOTS: usize = 4;
 struct ListenSlot {
     active: bool,
     port: u16,
-    accept_reply_port: u64,  // 0 = no pending accept
+    accept_reply_port: u64, // 0 = no pending accept
 }
 
 impl ListenSlot {
     const fn new() -> Self {
-        Self { active: false, port: 0, accept_reply_port: 0 }
+        Self {
+            active: false,
+            port: 0,
+            accept_reply_port: 0,
+        }
     }
 }
 const TCP_RX_BUF_SIZE: usize = 2048;
@@ -203,7 +207,9 @@ fn print_hex(n: u64) {
 
 fn print_mac(mac: [u8; 6]) {
     for i in 0..6 {
-        if i > 0 { syscall::debug_putchar(b':'); }
+        if i > 0 {
+            syscall::debug_putchar(b':');
+        }
         let hi = mac[i] >> 4;
         let lo = mac[i] & 0xF;
         syscall::debug_putchar(if hi < 10 { b'0' + hi } else { b'a' + hi - 10 });
@@ -213,7 +219,9 @@ fn print_mac(mac: [u8; 6]) {
 
 fn print_ip(ip: [u8; 4]) {
     for i in 0..4 {
-        if i > 0 { syscall::debug_putchar(b'.'); }
+        if i > 0 {
+            syscall::debug_putchar(b'.');
+        }
         print_num(ip[i] as u64);
     }
 }
@@ -244,15 +252,17 @@ fn get_u16_be(buf: &[u8], off: usize) -> u16 {
 }
 
 fn get_u32_be(buf: &[u8], off: usize) -> u32 {
-    ((buf[off] as u32) << 24) | ((buf[off+1] as u32) << 16)
-    | ((buf[off+2] as u32) << 8) | (buf[off+3] as u32)
+    ((buf[off] as u32) << 24)
+        | ((buf[off + 1] as u32) << 16)
+        | ((buf[off + 2] as u32) << 8)
+        | (buf[off + 3] as u32)
 }
 
 fn put_u32_be(buf: &mut [u8], off: usize, val: u32) {
     buf[off] = (val >> 24) as u8;
-    buf[off+1] = (val >> 16) as u8;
-    buf[off+2] = (val >> 8) as u8;
-    buf[off+3] = val as u8;
+    buf[off + 1] = (val >> 16) as u8;
+    buf[off + 2] = (val >> 8) as u8;
+    buf[off + 3] = val as u8;
 }
 
 /// TCP checksum with IP pseudo-header.
@@ -326,7 +336,9 @@ impl TcpConn {
     fn rx_push(&mut self, data: &[u8]) {
         for &b in data {
             let next = (self.rx_head + 1) % TCP_RX_BUF_SIZE;
-            if next == self.rx_tail { break; } // full
+            if next == self.rx_tail {
+                break;
+            } // full
             self.rx_buf[self.rx_head] = b;
             self.rx_head = next;
         }
@@ -369,7 +381,15 @@ impl Virtqueue {
     fn post_desc(&mut self, desc_idx: u16, addr: u64, len: u32, flags: u16) {
         let desc = (self.vq_va + desc_idx as usize * 16) as *mut VringDesc;
         unsafe {
-            core::ptr::write_volatile(desc, VringDesc { addr, len, flags, next: 0 });
+            core::ptr::write_volatile(
+                desc,
+                VringDesc {
+                    addr,
+                    len,
+                    flags,
+                    next: 0,
+                },
+            );
         }
         let avail = self.avail_va();
         let avail_idx_ptr = (avail + 2) as *mut u16;
@@ -445,8 +465,10 @@ impl NetDev {
             ping_sent_icmp: false,
             tcp: [const { TcpConn::new() }; MAX_TCP_CONNS],
             next_ephemeral_port: 49152,
-            tcp_isn: (mac[0] as u32) << 24 | (mac[1] as u32) << 16
-                   | (mac[2] as u32) << 8 | (mac[3] as u32),
+            tcp_isn: (mac[0] as u32) << 24
+                | (mac[1] as u32) << 16
+                | (mac[2] as u32) << 8
+                | (mac[3] as u32),
             listen: [const { ListenSlot::new() }; MAX_LISTEN_SLOTS],
         }
     }
@@ -529,17 +551,23 @@ impl NetDev {
     fn setup_queue_mmio(mmio_va: usize, queue_idx: u32, version: u32) -> Option<Virtqueue> {
         mmio_write32(mmio_va, MMIO_QUEUE_SEL, queue_idx);
         let max = mmio_read32(mmio_va, MMIO_QUEUE_NUM_MAX);
-        if max == 0 { return None; }
+        if max == 0 {
+            return None;
+        }
         let qsize = (QUEUE_SIZE as u32).min(max);
         mmio_write32(mmio_va, MMIO_QUEUE_NUM, qsize);
 
         let vq_va = syscall::mmap_anon(0, 1, 1)?;
         let vq_pa = syscall::virt_to_phys(vq_va)?;
-        unsafe { core::ptr::write_bytes(vq_va as *mut u8, 0, 4096); }
+        unsafe {
+            core::ptr::write_bytes(vq_va as *mut u8, 0, 4096);
+        }
 
         let buf_va = syscall::mmap_anon(0, 1, 1)?;
         let buf_pa = syscall::virt_to_phys(buf_va)?;
-        unsafe { core::ptr::write_bytes(buf_va as *mut u8, 0, 4096); }
+        unsafe {
+            core::ptr::write_bytes(buf_va as *mut u8, 0, 4096);
+        }
 
         let desc_pa = vq_pa;
         let avail_pa = desc_pa + 16 * QUEUE_SIZE;
@@ -589,8 +617,10 @@ impl NetDev {
 
         // ACK + DRIVER.
         syscall::ioport_outb(base + pci_regs::DEVICE_STATUS, STATUS_ACK as u8);
-        syscall::ioport_outb(base + pci_regs::DEVICE_STATUS,
-            (STATUS_ACK | STATUS_DRIVER) as u8);
+        syscall::ioport_outb(
+            base + pci_regs::DEVICE_STATUS,
+            (STATUS_ACK | STATUS_DRIVER) as u8,
+        );
 
         // Feature negotiation: accept MAC.
         let features = syscall::ioport_inl(base + pci_regs::DEVICE_FEATURES);
@@ -612,8 +642,10 @@ impl NetDev {
         let _ = irq;
 
         // DRIVER_OK.
-        syscall::ioport_outb(base + pci_regs::DEVICE_STATUS,
-            (STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK) as u8);
+        syscall::ioport_outb(
+            base + pci_regs::DEVICE_STATUS,
+            (STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK) as u8,
+        );
 
         let mut dev = Self::new_dev(base as usize, mac, rx, tx);
         dev.post_rx();
@@ -624,7 +656,9 @@ impl NetDev {
     fn setup_queue_pci(base: u16, queue_idx: u16) -> Option<Virtqueue> {
         syscall::ioport_outw(base + pci_regs::QUEUE_SELECT, queue_idx);
         let max = syscall::ioport_inw(base + pci_regs::QUEUE_SIZE);
-        if max == 0 { return None; }
+        if max == 0 {
+            return None;
+        }
 
         // Legacy PCI: queue size is fixed by the device (read-only).
         let qsz = max as usize;
@@ -632,11 +666,15 @@ impl NetDev {
         // Allocate virtqueue page (64K alloc page fits desc+avail+used with 4K alignment).
         let vq_va = syscall::mmap_anon(0, 1, 1)?;
         let vq_pa = syscall::virt_to_phys(vq_va)?;
-        unsafe { core::ptr::write_bytes(vq_va as *mut u8, 0, 4096 * 16); }
+        unsafe {
+            core::ptr::write_bytes(vq_va as *mut u8, 0, 4096 * 16);
+        }
 
         let buf_va = syscall::mmap_anon(0, 1, 1)?;
         let buf_pa = syscall::virt_to_phys(buf_va)?;
-        unsafe { core::ptr::write_bytes(buf_va as *mut u8, 0, 4096); }
+        unsafe {
+            core::ptr::write_bytes(buf_va as *mut u8, 0, 4096);
+        }
 
         let desc_pa = vq_pa;
         let avail_pa = desc_pa + 16 * qsz;
@@ -741,11 +779,11 @@ impl NetDev {
         frame[12] = 0x08;
         frame[13] = 0x06;
         // ARP request.
-        put_u16_be(&mut frame, 14, 1);      // hw type = ethernet
+        put_u16_be(&mut frame, 14, 1); // hw type = ethernet
         put_u16_be(&mut frame, 16, 0x0800); // proto = IPv4
         frame[18] = 6; // hw addr len
         frame[19] = 4; // proto addr len
-        put_u16_be(&mut frame, 20, 1);      // op = request
+        put_u16_be(&mut frame, 20, 1); // op = request
         frame[22..28].copy_from_slice(&self.mac);
         frame[28..32].copy_from_slice(&MY_IP);
         frame[32..38].copy_from_slice(&[0; 6]);
@@ -785,10 +823,10 @@ impl NetDev {
         let ip = &mut frame[14..34];
         ip[0] = 0x45; // v4, IHL=5
         put_u16_be(ip, 2, 60); // total len = 20 + 8 + 32
-        put_u16_be(ip, 4, 1);  // identification
+        put_u16_be(ip, 4, 1); // identification
         put_u16_be(ip, 6, 0x4000); // don't fragment
         ip[8] = 64; // TTL
-        ip[9] = 1;  // ICMP
+        ip[9] = 1; // ICMP
         ip[12..16].copy_from_slice(&MY_IP);
         ip[16..20].copy_from_slice(&dst_ip);
         let cksum = inet_checksum(ip);
@@ -812,12 +850,11 @@ impl NetDev {
 
     fn handle_rx_packet(&mut self, frame_len: usize) {
         let frame = unsafe {
-            core::slice::from_raw_parts(
-                (self.rx.buf_va + NET_HDR_SIZE) as *const u8,
-                frame_len,
-            )
+            core::slice::from_raw_parts((self.rx.buf_va + NET_HDR_SIZE) as *const u8, frame_len)
         };
-        if frame_len < 14 { return; }
+        if frame_len < 14 {
+            return;
+        }
         let ethertype = get_u16_be(frame, 12);
         match ethertype {
             0x0806 => self.handle_arp(&frame[14..frame_len]),
@@ -827,7 +864,9 @@ impl NetDev {
     }
 
     fn handle_arp(&mut self, data: &[u8]) {
-        if data.len() < 28 { return; }
+        if data.len() < 28 {
+            return;
+        }
         let op = get_u16_be(data, 6);
         if op == 2 {
             // ARP reply: cache it.
@@ -857,12 +896,16 @@ impl NetDev {
     }
 
     fn handle_ipv4(&mut self, data: &[u8]) {
-        if data.len() < 20 { return; }
+        if data.len() < 20 {
+            return;
+        }
         let ihl = (data[0] & 0x0F) as usize * 4;
         let total_len = get_u16_be(data, 2) as usize;
         let proto = data[9];
         let end = total_len.min(data.len());
-        if end <= ihl { return; }
+        if end <= ihl {
+            return;
+        }
         match proto {
             1 => self.handle_icmp(&data[ihl..end]),
             6 => {
@@ -874,7 +917,9 @@ impl NetDev {
     }
 
     fn handle_icmp(&mut self, data: &[u8]) {
-        if data.len() < 8 { return; }
+        if data.len() < 8 {
+            return;
+        }
         if data[0] == 0 {
             // Echo reply.
             let seq = get_u16_be(data, 6);
@@ -911,7 +956,9 @@ impl NetDev {
     }
 
     fn tick_ping(&mut self) {
-        if !self.ping_active { return; }
+        if !self.ping_active {
+            return;
+        }
         self.ping_polls += 1;
         if self.ping_polls >= PING_TIMEOUT {
             syscall::send_nb(self.ping_reply_port, NET_PING_FAIL, 1, 0);
@@ -948,7 +995,7 @@ impl NetDev {
         put_u16_be(ip, 4, 0); // identification
         put_u16_be(ip, 6, 0x4000); // don't fragment
         ip[8] = 64; // TTL
-        ip[9] = 6;  // TCP
+        ip[9] = 6; // TCP
         ip[12..16].copy_from_slice(&MY_IP);
         ip[16..20].copy_from_slice(&dst_ip);
         let cksum = inet_checksum(ip);
@@ -997,7 +1044,9 @@ impl NetDev {
         };
         let local_port = self.next_ephemeral_port;
         self.next_ephemeral_port = self.next_ephemeral_port.wrapping_add(1);
-        if self.next_ephemeral_port < 49152 { self.next_ephemeral_port = 49152; }
+        if self.next_ephemeral_port < 49152 {
+            self.next_ephemeral_port = 49152;
+        }
 
         let isn = self.tcp_isn;
         self.tcp_isn = self.tcp_isn.wrapping_add(64000);
@@ -1029,9 +1078,7 @@ impl NetDev {
 
         // ARP lookup — send SYN if cached, else ARP request.
         if let Some(mac) = self.arp_lookup(remote_ip) {
-            self.build_tcp_packet(
-                remote_ip, mac, local_port, dst_port, isn, 0, TCP_SYN, &[],
-            );
+            self.build_tcp_packet(remote_ip, mac, local_port, dst_port, isn, 0, TCP_SYN, &[]);
         } else {
             self.send_arp_request(remote_ip);
         }
@@ -1054,14 +1101,20 @@ impl NetDev {
     }
 
     fn handle_tcp_rx(&mut self, src_ip: [u8; 4], tcp_data: &[u8]) {
-        if tcp_data.len() < 20 { return; }
+        if tcp_data.len() < 20 {
+            return;
+        }
         let src_port = get_u16_be(tcp_data, 0);
         let dst_port = get_u16_be(tcp_data, 2);
         let seq = get_u32_be(tcp_data, 4);
         let ack = get_u32_be(tcp_data, 8);
         let data_off = ((tcp_data[12] >> 4) as usize) * 4;
         let flags = tcp_data[13];
-        let payload = if data_off < tcp_data.len() { &tcp_data[data_off..] } else { &[] };
+        let payload = if data_off < tcp_data.len() {
+            &tcp_data[data_off..]
+        } else {
+            &[]
+        };
 
         // Find matching connection.
         let idx = self.tcp.iter().position(|c| {
@@ -1193,7 +1246,9 @@ impl NetDev {
     fn deliver_tcp_data(&mut self, idx: usize, reply_port: u64) {
         let mut buf = [0u8; 24]; // max inline bytes in 3 IPC data words
         let n = self.tcp[idx].rx_pop(&mut buf);
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
         // Pack into IPC: data[0]=len, data[1..3]=bytes (up to 24 bytes in 3 words).
         let mut d1: u64 = 0;
         let mut d2: u64 = 0;
@@ -1264,8 +1319,13 @@ impl NetDev {
 
     fn handle_incoming_syn(&mut self, src_ip: [u8; 4], src_port: u16, dst_port: u16, seq: u32) {
         // Check if we have a listen slot for this port.
-        let listen_idx = self.listen.iter().position(|l| l.active && l.port == dst_port);
-        if listen_idx.is_none() { return; }
+        let listen_idx = self
+            .listen
+            .iter()
+            .position(|l| l.active && l.port == dst_port);
+        if listen_idx.is_none() {
+            return;
+        }
         let listen_idx = listen_idx.unwrap();
 
         // Find free TCP conn slot.
@@ -1297,8 +1357,14 @@ impl NetDev {
         // Send SYN-ACK.
         if let Some(mac) = self.arp_lookup(src_ip) {
             self.build_tcp_packet(
-                src_ip, mac, dst_port, src_port, isn, seq.wrapping_add(1),
-                TCP_SYN | TCP_ACK, &[],
+                src_ip,
+                mac,
+                dst_port,
+                src_port,
+                isn,
+                seq.wrapping_add(1),
+                TCP_SYN | TCP_ACK,
+                &[],
             );
         } else {
             // Need ARP first.
@@ -1437,7 +1503,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(d) => d,
         None => {
             syscall::debug_puts(b"  [net_srv] init failed\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     };
 
@@ -1499,8 +1567,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     let mut payload = [0u8; 16];
                     let d2 = msg.data[2];
                     let d3 = msg.data[3];
-                    for i in 0..8 { payload[i] = (d2 >> (i * 8)) as u8; }
-                    for i in 0..8 { payload[8 + i] = (d3 >> (i * 8)) as u8; }
+                    for i in 0..8 {
+                        payload[i] = (d2 >> (i * 8)) as u8;
+                    }
+                    for i in 0..8 {
+                        payload[8 + i] = (d3 >> (i * 8)) as u8;
+                    }
                     dev.handle_tcp_send(conn_id, &payload[..len.min(16)], reply_port);
                 }
                 NET_TCP_RECV => {

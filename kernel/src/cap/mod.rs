@@ -1,17 +1,17 @@
 pub mod capability;
 pub mod capset;
-pub mod cnode;
 pub mod cdt;
+pub mod cnode;
 pub mod space;
 
-pub use capability::{Capability, CapType, Rights};
+pub use capability::{CapType, Capability, Rights};
 pub use capset::CapSet;
 pub use cdt::Cdt;
 pub use space::CapSpace;
 
-use crate::sync::SpinLock;
 use crate::ipc::port::port_local;
 use crate::sched::task::Task;
+use crate::sync::SpinLock;
 
 /// Narrow lock protecting the global CDT (capability derivation tree).
 /// Only held during CDT node allocation/linkage/revocation — much shorter
@@ -47,18 +47,28 @@ fn task_capspace(task_id: u32) -> &'static mut CapSpace {
 #[inline]
 fn rights_to_perms(rights: Rights) -> u8 {
     let mut p: u8 = 0;
-    if rights.contains(Rights::SEND) { p |= capset::PERM_SEND; }
-    if rights.contains(Rights::RECV) { p |= capset::PERM_RECV; }
-    if rights.contains(Rights::MANAGE) { p |= capset::PERM_MANAGE; }
+    if rights.contains(Rights::SEND) {
+        p |= capset::PERM_SEND;
+    }
+    if rights.contains(Rights::RECV) {
+        p |= capset::PERM_RECV;
+    }
+    if rights.contains(Rights::MANAGE) {
+        p |= capset::PERM_MANAGE;
+    }
     p
 }
 
 /// Fast lockless check: does task have the needed rights for this port?
 #[inline]
 pub fn has_port_cap_fast(task_id: u32, port_id: u64, needed: Rights) -> bool {
-    if task_id == 0 { return true; }
+    if task_id == 0 {
+        return true;
+    }
     let ptr = task_ptr(task_id);
-    if ptr.is_null() { return false; }
+    if ptr.is_null() {
+        return false;
+    }
     let local = port_local(port_id);
     unsafe { &*ptr }.capset.has(local, rights_to_perms(needed))
 }
@@ -69,7 +79,9 @@ pub fn has_port_cap_fast(task_id: u32, port_id: u64, needed: Rights) -> bool {
 fn capset_grant(task_id: u32, port_id: u64, rights: Rights) {
     let ptr = task_ptr(task_id);
     let local = port_local(port_id);
-    unsafe { &*ptr }.capset.grant(local, rights_to_perms(rights));
+    unsafe { &*ptr }
+        .capset
+        .grant(local, rights_to_perms(rights));
     // Maintain recv_holder on the port.
     if rights.contains(Rights::RECV) {
         crate::ipc::port::set_recv_holder(port_id, task_id);
@@ -100,7 +112,9 @@ pub fn capset_reset(task_id: u32) {
 pub fn capset_copy(parent_task: u32, child_task: u32) {
     let parent_ptr = task_ptr(parent_task);
     let child_ptr = task_ptr(child_task);
-    unsafe { &*child_ptr }.capset.copy_from(&unsafe { &*parent_ptr }.capset);
+    unsafe { &*child_ptr }
+        .capset
+        .copy_from(&unsafe { &*parent_ptr }.capset);
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +135,10 @@ fn lock_task_caps(task_id: u32) -> crate::sync::spinlock::SpinLockGuard<'static,
 pub fn grant_send_cap(task_id: u32, port_id: u64) -> Option<usize> {
     let _task_guard = lock_task_caps(task_id);
     let space = task_capspace(task_id);
-    if space.find_port_cap(port_id as usize, Rights::SEND).is_some() {
+    if space
+        .find_port_cap(port_id as usize, Rights::SEND)
+        .is_some()
+    {
         return Some(0);
     }
     let cap = Capability::new(CapType::Port, Rights::SEND, port_id as usize);

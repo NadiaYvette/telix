@@ -8,7 +8,9 @@ unsafe extern "Rust" {
 /// Arguments are passed in registers (x0-x2 / a0-a2 / rdi,rsi,rdx) by the kernel.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(arg0: u64, arg1: u64, arg2: u64) -> ! {
-    unsafe { main(arg0, arg1, arg2); }
+    unsafe {
+        main(arg0, arg1, arg2);
+    }
     crate::syscall::exit(0);
 }
 

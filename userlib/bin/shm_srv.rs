@@ -138,7 +138,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 // Check if already exists — return existing handle.
                 if let Some(idx) = find_segment(name) {
                     let pc = unsafe { SEGMENTS[idx].page_count };
-                    syscall::send(reply_port, SHM_OK, idx as u64, pc as u64, my_aspace as u64, 0);
+                    syscall::send(
+                        reply_port,
+                        SHM_OK,
+                        idx as u64,
+                        pc as u64,
+                        my_aspace as u64,
+                        0,
+                    );
                     continue;
                 }
 
@@ -161,7 +168,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 // Touch pages to ensure physical backing (grants require it).
                 let ptr = va as *mut u8;
                 for p in 0..page_count {
-                    unsafe { core::ptr::write_volatile(ptr.add(p * 0x10000), 0); }
+                    unsafe {
+                        core::ptr::write_volatile(ptr.add(p * 0x10000), 0);
+                    }
                 }
 
                 unsafe {
@@ -172,7 +181,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     SEGMENTS[slot].va = va;
                 }
 
-                syscall::send(reply_port, SHM_OK, slot as u64, page_count as u64, my_aspace as u64, 0);
+                syscall::send(
+                    reply_port,
+                    SHM_OK,
+                    slot as u64,
+                    page_count as u64,
+                    my_aspace as u64,
+                    0,
+                );
             }
 
             SHM_OPEN => {
@@ -189,7 +205,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 match find_segment(name) {
                     Some(idx) => {
                         let pc = unsafe { SEGMENTS[idx].page_count };
-                        syscall::send(reply_port, SHM_OK, idx as u64, pc as u64, my_aspace as u64, 0);
+                        syscall::send(
+                            reply_port,
+                            SHM_OK,
+                            idx as u64,
+                            pc as u64,
+                            my_aspace as u64,
+                            0,
+                        );
                     }
                     None => {
                         syscall::send(reply_port, SHM_ERROR, 4, 0, 0, 0);
@@ -210,7 +233,11 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 let (active, src_va, page_count) = unsafe {
-                    (SEGMENTS[handle].active, SEGMENTS[handle].va, SEGMENTS[handle].page_count)
+                    (
+                        SEGMENTS[handle].active,
+                        SEGMENTS[handle].va,
+                        SEGMENTS[handle].page_count,
+                    )
                 };
 
                 if !active {
@@ -219,7 +246,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 if syscall::grant_pages(client_aspace, src_va, dst_va, page_count, readonly) {
-                    syscall::send(reply_port, SHM_MAP_OK, handle as u64, page_count as u64, 0, 0);
+                    syscall::send(
+                        reply_port,
+                        SHM_MAP_OK,
+                        handle as u64,
+                        page_count as u64,
+                        0,
+                        0,
+                    );
                 } else {
                     syscall::send(reply_port, SHM_ERROR, 7, 0, 0, 0);
                 }
@@ -255,7 +289,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     Some(idx) => {
                         let va = unsafe { SEGMENTS[idx].va };
                         syscall::munmap(va);
-                        unsafe { SEGMENTS[idx].active = false; }
+                        unsafe {
+                            SEGMENTS[idx].active = false;
+                        }
                         syscall::send(reply_port, SHM_OK, 0, 0, 0, 0);
                     }
                     None => {

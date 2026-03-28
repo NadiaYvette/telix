@@ -48,7 +48,11 @@ struct OpenHandle {
 
 impl OpenHandle {
     const fn empty() -> Self {
-        Self { active: false, buf: [0; MAX_BUF], buf_len: 0 }
+        Self {
+            active: false,
+            buf: [0; MAX_BUF],
+            buf_len: 0,
+        }
     }
 }
 
@@ -76,7 +80,9 @@ fn pack_inline_data(data: &[u8]) -> [u64; 3] {
 /// Format a u64 as decimal into buf. Returns number of bytes written.
 fn u64_to_dec(mut val: u64, buf: &mut [u8]) -> usize {
     if val == 0 {
-        if !buf.is_empty() { buf[0] = b'0'; }
+        if !buf.is_empty() {
+            buf[0] = b'0';
+        }
         return 1;
     }
     let mut tmp = [0u8; 20];
@@ -111,9 +117,13 @@ fn append_dec(buf: &mut [u8], off: usize, val: u64) -> usize {
 
 /// Check if name equals a static string.
 fn name_eq(name: &[u8], nlen: usize, s: &[u8]) -> bool {
-    if nlen != s.len() { return false; }
+    if nlen != s.len() {
+        return false;
+    }
     for i in 0..nlen {
-        if name[i] != s[i] { return false; }
+        if name[i] != s[i] {
+            return false;
+        }
     }
     true
 }
@@ -123,21 +133,32 @@ fn parse_pid_status(name: &[u8], nlen: usize) -> Option<u64> {
     // Find the '/' separator.
     let mut slash = usize::MAX;
     for i in 0..nlen {
-        if name[i] == b'/' { slash = i; break; }
+        if name[i] == b'/' {
+            slash = i;
+            break;
+        }
     }
-    if slash == usize::MAX || slash == 0 { return None; }
+    if slash == usize::MAX || slash == 0 {
+        return None;
+    }
     // Check suffix is "status".
     let suffix_len = nlen - slash - 1;
-    if suffix_len != 6 { return None; }
+    if suffix_len != 6 {
+        return None;
+    }
     let status = b"status";
     for i in 0..6 {
-        if name[slash + 1 + i] != status[i] { return None; }
+        if name[slash + 1 + i] != status[i] {
+            return None;
+        }
     }
     // Parse decimal PID.
     let mut pid: u64 = 0;
     for i in 0..slash {
         let ch = name[i];
-        if ch < b'0' || ch > b'9' { return None; }
+        if ch < b'0' || ch > b'9' {
+            return None;
+        }
         pid = pid.wrapping_mul(10).wrapping_add((ch - b'0') as u64);
     }
     Some(pid)
@@ -267,8 +288,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if h == u64::MAX {
                     syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
                 } else {
-                    syscall::send(reply_port, FS_OPEN_OK,
-                        h, handles[h as usize].buf_len as u64, my_aspace, 0);
+                    syscall::send(
+                        reply_port,
+                        FS_OPEN_OK,
+                        h,
+                        handles[h as usize].buf_len as u64,
+                        my_aspace,
+                        0,
+                    );
                 }
             }
 
@@ -297,14 +324,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     let actual = to_read.min(PAGE_SIZE);
                     let dst = grant_va as *mut u8;
                     for i in 0..actual {
-                        unsafe { *dst.add(i) = hnd.buf[offset + i]; }
+                        unsafe {
+                            *dst.add(i) = hnd.buf[offset + i];
+                        }
                     }
                     syscall::send_nb(reply_port, FS_READ_OK, actual as u64, 0);
                 } else {
                     let inline_len = to_read.min(MAX_INLINE);
                     let packed = pack_inline_data(&hnd.buf[offset..offset + inline_len]);
-                    syscall::send(reply_port, FS_READ_OK,
-                        inline_len as u64, packed[0], packed[1], packed[2]);
+                    syscall::send(
+                        reply_port,
+                        FS_READ_OK,
+                        inline_len as u64,
+                        packed[0],
+                        packed[1],
+                        packed[2],
+                    );
                 }
             }
 
@@ -319,8 +354,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 let size = handles[handle].buf_len;
                 // mode = 0o100444 (regular file, read-only)
-                syscall::send(reply_port, FS_STAT_OK,
-                    size as u64, 0o100444u64, 0, 0);
+                syscall::send(reply_port, FS_STAT_OK, size as u64, 0o100444u64, 0, 0);
             }
 
             FS_READDIR => {
@@ -338,13 +372,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 if idx == 0 {
                     let name_lo = pack_name_lo(b"meminfo");
-                    syscall::send(reply_port, FS_READDIR_OK,
-                        0, name_lo, 0, 1);
+                    syscall::send(reply_port, FS_READDIR_OK, 0, name_lo, 0, 1);
                     sent = true;
                 } else if idx == 1 {
                     let name_lo = pack_name_lo(b"uptime");
-                    syscall::send(reply_port, FS_READDIR_OK,
-                        0, name_lo, 0, 2);
+                    syscall::send(reply_port, FS_READDIR_OK, 0, name_lo, 0, 2);
                     sent = true;
                 } else {
                     // PID entries: idx 2 maps to task slot (idx-2).
@@ -356,8 +388,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             let mut nbuf = [0u8; 8];
                             let nlen = u64_to_dec(tid, &mut nbuf);
                             let name_lo = pack_name_lo(&nbuf[..nlen]);
-                            syscall::send(reply_port, FS_READDIR_OK,
-                                0, name_lo, 0, (slot + 3) as u64);
+                            syscall::send(
+                                reply_port,
+                                FS_READDIR_OK,
+                                0,
+                                name_lo,
+                                0,
+                                (slot + 3) as u64,
+                            );
                             sent = true;
                             break;
                         }
@@ -381,5 +419,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

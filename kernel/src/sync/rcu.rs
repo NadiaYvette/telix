@@ -17,8 +17,8 @@
 //! grace period has elapsed (useful for destroy paths that need
 //! synchronous cleanup).
 
-use crate::sched::smp::{self, MAX_CPUS};
 use crate::sched::hotplug;
+use crate::sched::smp::{self, MAX_CPUS};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -89,9 +89,8 @@ struct RcuCallback {
 }
 
 /// A batch of deferred callbacks, page-allocated.
-const BATCH_CAP: usize =
-    (crate::mm::page::PAGE_SIZE - 3 * core::mem::size_of::<usize>())
-        / core::mem::size_of::<RcuCallback>();
+const BATCH_CAP: usize = (crate::mm::page::PAGE_SIZE - 3 * core::mem::size_of::<usize>())
+    / core::mem::size_of::<RcuCallback>();
 
 #[repr(C)]
 struct RcuBatch {
@@ -179,7 +178,9 @@ pub fn rcu_defer_free(ptr: usize, free_fn: fn(usize)) {
     // If batch is full, move to pending list and start a new one.
     if batch.len >= BATCH_CAP {
         let full = state.current;
-        unsafe { (*full).next = state.pending_head; }
+        unsafe {
+            (*full).next = state.pending_head;
+        }
         state.pending_head = full;
         state.current = core::ptr::null_mut();
     }
@@ -229,7 +230,9 @@ fn rcu_process_callbacks(cpu: usize) {
             state.pending_count -= b.len;
 
             // Unlink and free the batch page.
-            unsafe { *prev = next; }
+            unsafe {
+                *prev = next;
+            }
             crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(batch as usize));
         } else {
             prev = unsafe { &mut (*batch).next };

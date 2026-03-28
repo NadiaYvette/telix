@@ -62,7 +62,11 @@ fn alloc_credential(port_id: u64, username_hash: u64, roles: u64) -> bool {
         let slot = unsafe { &raw mut CREDENTIALS };
         let entry = unsafe { &mut (*slot)[i] };
         if entry.is_none() {
-            *entry = Some(Credential { port_id, username_hash, roles });
+            *entry = Some(Credential {
+                port_id,
+                username_hash,
+                roles,
+            });
             return true;
         }
     }
@@ -122,8 +126,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     let slot = unsafe { &raw const CREDENTIALS };
                     let cred = unsafe { (*slot)[idx].as_ref().unwrap() };
                     syscall::send(
-                        reply_port, SEC_VERIFY_OK,
-                        cred_port as u64, cred.roles, cred.username_hash, 0,
+                        reply_port,
+                        SEC_VERIFY_OK,
+                        cred_port as u64,
+                        cred.roles,
+                        cred.username_hash,
+                        0,
                     );
                 } else {
                     syscall::send(reply_port, SEC_VERIFY_FAIL, 1, 0, 0, 0);
@@ -136,7 +144,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 if let Some(idx) = find_credential(cred_port) {
                     syscall::port_destroy(cred_port);
                     let slot = unsafe { &raw mut CREDENTIALS };
-                    unsafe { (*slot)[idx] = None; }
+                    unsafe {
+                        (*slot)[idx] = None;
+                    }
                 }
                 // Idempotent: always reply OK.
                 syscall::send(reply_port, SEC_REVOKE_OK, 0, 0, 0, 0);

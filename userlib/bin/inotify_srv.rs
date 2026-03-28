@@ -33,7 +33,8 @@ const IN_EVT_DELETE: u32 = 0x200;
 const IN_EVT_MODIFY: u32 = 0x002;
 const IN_EVT_OPEN: u32 = 0x020;
 const IN_EVT_CLOSE_WRITE: u32 = 0x008;
-const IN_EVT_ALL: u32 = IN_EVT_CREATE | IN_EVT_DELETE | IN_EVT_MODIFY | IN_EVT_OPEN | IN_EVT_CLOSE_WRITE;
+const IN_EVT_ALL: u32 =
+    IN_EVT_CREATE | IN_EVT_DELETE | IN_EVT_MODIFY | IN_EVT_OPEN | IN_EVT_CLOSE_WRITE;
 
 const MAX_INSTANCES: usize = 8;
 const MAX_WATCHES_PER: usize = 8;
@@ -49,7 +50,12 @@ struct InotifyEvent {
 
 impl InotifyEvent {
     const fn empty() -> Self {
-        Self { wd: 0, mask: 0, name_w0: 0, name_w1: 0 }
+        Self {
+            wd: 0,
+            mask: 0,
+            name_w0: 0,
+            name_w1: 0,
+        }
     }
 }
 
@@ -63,7 +69,12 @@ struct Watch {
 
 impl Watch {
     const fn empty() -> Self {
-        Self { active: false, path_w0: 0, path_w1: 0, mask: 0 }
+        Self {
+            active: false,
+            path_w0: 0,
+            path_w1: 0,
+            mask: 0,
+        }
     }
 }
 
@@ -253,7 +264,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                     match inst.pop_event() {
                         Some(evt) => {
                             // Reply: d0 = wd, d1 = mask, d2 = name_w0, d3 = name_w1
-                            syscall::send(reply, IN_OK, evt.wd as u64, evt.mask as u64, evt.name_w0, evt.name_w1);
+                            syscall::send(
+                                reply,
+                                IN_OK,
+                                evt.wd as u64,
+                                evt.mask as u64,
+                                evt.name_w0,
+                                evt.name_w1,
+                            );
                         }
                         None => {
                             // Block reader.
@@ -292,7 +310,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                 } else {
                     unsafe {
                         let inst = &INSTANCES[handle as usize];
-                        if inst.active && inst.event_count() > 0 { 1 } else { 0 }
+                        if inst.active && inst.event_count() > 0 {
+                            1
+                        } else {
+                            0
+                        }
                     }
                 };
                 syscall::send(reply, IN_OK, ready, 0, 0, 0);
@@ -308,19 +330,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                 // Dispatch to all matching watches across all instances.
                 unsafe {
                     for i in 0..MAX_INSTANCES {
-                        if !INSTANCES[i].active { continue; }
+                        if !INSTANCES[i].active {
+                            continue;
+                        }
 
                         // Collect matching watch indices first to avoid borrow conflict.
                         let mut matched = [false; MAX_WATCHES_PER];
                         for idx in 0..MAX_WATCHES_PER {
                             let w = &INSTANCES[i].watches[idx];
-                            if w.active && (w.mask & event_mask) != 0 && path_matches(w, path_w0, path_w1) {
+                            if w.active
+                                && (w.mask & event_mask) != 0
+                                && path_matches(w, path_w0, path_w1)
+                            {
                                 matched[idx] = true;
                             }
                         }
 
                         for idx in 0..MAX_WATCHES_PER {
-                            if !matched[idx] { continue; }
+                            if !matched[idx] {
+                                continue;
+                            }
                             let evt = InotifyEvent {
                                 wd: (idx + 1) as u32,
                                 mask: event_mask,
@@ -334,7 +363,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                                 let reader = INSTANCES[i].blocked_reader;
                                 INSTANCES[i].blocked_reader = 0xFFFFFFFF;
                                 if let Some(e) = INSTANCES[i].pop_event() {
-                                    syscall::send(reader, IN_OK, e.wd as u64, e.mask as u64, e.name_w0, e.name_w1);
+                                    syscall::send(
+                                        reader,
+                                        IN_OK,
+                                        e.wd as u64,
+                                        e.mask as u64,
+                                        e.name_w0,
+                                        e.name_w1,
+                                    );
                                 }
                             }
                         }

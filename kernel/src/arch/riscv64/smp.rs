@@ -67,11 +67,11 @@ pub fn start_secondary_cpus() {
             if hartid == boot_hart {
                 continue; // Skip the boot hart.
             }
-            if cpu_index >= MAX_CPUS { break; }
+            if cpu_index >= MAX_CPUS {
+                break;
+            }
 
-            let stack_top = unsafe {
-                AP_STACKS.0[cpu_index].as_ptr().add(AP_STACK_SIZE) as u64
-            };
+            let stack_top = unsafe { AP_STACKS.0[cpu_index].as_ptr().add(AP_STACK_SIZE) as u64 };
             AP_STACK_TOPS[cpu_index].store(stack_top, Ordering::Release);
 
             let ret = sbi_hart_start(hartid, entry, cpu_index as u64);
@@ -89,9 +89,7 @@ pub fn start_secondary_cpus() {
                 continue;
             }
 
-            let stack_top = unsafe {
-                AP_STACKS.0[cpu_index].as_ptr().add(AP_STACK_SIZE) as u64
-            };
+            let stack_top = unsafe { AP_STACKS.0[cpu_index].as_ptr().add(AP_STACK_SIZE) as u64 };
             AP_STACK_TOPS[cpu_index].store(stack_top, Ordering::Release);
 
             let ret = sbi_hart_start(hartid, entry, cpu_index as u64);
@@ -115,8 +113,11 @@ pub fn start_secondary_cpus() {
         core::hint::spin_loop();
         timeout -= 1;
         if timeout == 0 {
-            crate::println!("  SMP startup timeout ({}/{} harts ready)",
-                AP_READY_COUNT.load(Ordering::Relaxed) + 1, started + 1);
+            crate::println!(
+                "  SMP startup timeout ({}/{} harts ready)",
+                AP_READY_COUNT.load(Ordering::Relaxed) + 1,
+                started + 1
+            );
             break;
         }
     }
@@ -162,6 +163,8 @@ extern "C" fn secondary_hart_rust_entry(cpu_id: u64) {
     super::trap::enable_interrupts();
     crate::println!("  CPU {} (hart) online", cpu);
     loop {
-        unsafe { core::arch::asm!("wfi"); }
+        unsafe {
+            core::arch::asm!("wfi");
+        }
     }
 }

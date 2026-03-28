@@ -24,8 +24,14 @@ fn be32(data: &[u8], off: usize) -> u32 {
 #[inline]
 fn be64(data: &[u8], off: usize) -> u64 {
     u64::from_be_bytes([
-        data[off], data[off + 1], data[off + 2], data[off + 3],
-        data[off + 4], data[off + 5], data[off + 6], data[off + 7],
+        data[off],
+        data[off + 1],
+        data[off + 2],
+        data[off + 3],
+        data[off + 4],
+        data[off + 5],
+        data[off + 6],
+        data[off + 7],
     ])
 }
 
@@ -84,7 +90,12 @@ impl<'a> Fdt<'a> {
         let struct_off = be32(data, 8) as usize;
         let strings_off = be32(data, 0x0C) as usize;
         let struct_size = be32(data, 0x24) as usize;
-        Ok(Self { data, struct_off, struct_size, strings_off })
+        Ok(Self {
+            data,
+            struct_off,
+            struct_size,
+            strings_off,
+        })
     }
 
     /// Get the string at the given offset in the strings block.
@@ -98,7 +109,9 @@ impl<'a> Fdt<'a> {
     /// Read a token at the given byte offset within the structure block.
     fn token_at(&self, pos: usize) -> u32 {
         let abs = self.struct_off + pos;
-        if abs + 4 > self.data.len() { return FDT_END; }
+        if abs + 4 > self.data.len() {
+            return FDT_END;
+        }
         be32(self.data, abs)
     }
 
@@ -140,7 +153,9 @@ impl<'a> Fdt<'a> {
     /// Find a node by path. Supports 1- and 2-level paths like "/cpus" or "/soc/plic@c000000".
     /// For 2-level paths, the second component uses prefix matching (before '@').
     pub fn find_node(&self, path: &[u8]) -> Option<FdtNode<'a>> {
-        if path.is_empty() || path[0] != b'/' { return None; }
+        if path.is_empty() || path[0] != b'/' {
+            return None;
+        }
         let path = &path[1..]; // strip leading '/'
 
         // Split into components.
@@ -174,7 +189,9 @@ impl<'a> Fdt<'a> {
         // Position past root's BEGIN_NODE + name.
         let mut pos: usize = 0;
         // Expect BEGIN_NODE at pos 0.
-        if self.token_at(pos) != FDT_BEGIN_NODE { return NodeIter::empty(*self); }
+        if self.token_at(pos) != FDT_BEGIN_NODE {
+            return NodeIter::empty(*self);
+        }
         pos += 4;
         pos = self.skip_name(pos);
 
@@ -191,7 +208,9 @@ impl<'a> Fdt<'a> {
 /// Check if a DTB node name matches a query. The query can be a full name
 /// ("memory@40000000") or a prefix before '@' ("memory").
 fn node_name_matches(node_name: &[u8], query: &[u8]) -> bool {
-    if node_name == query { return true; }
+    if node_name == query {
+        return true;
+    }
     // Check prefix match: query matches the part before '@' in node_name.
     if let Some(at_pos) = node_name.iter().position(|&b| b == b'@') {
         &node_name[..at_pos] == query
@@ -229,7 +248,10 @@ impl<'a> FdtNode<'a> {
 
     /// Iterate properties of this node (stops at the first child node or END_NODE).
     pub fn properties(&self) -> PropIter<'a> {
-        PropIter { fdt: self.fdt, pos: self.content_pos }
+        PropIter {
+            fdt: self.fdt,
+            pos: self.content_pos,
+        }
     }
 
     /// Iterate direct children of this node.
@@ -244,7 +266,9 @@ impl<'a> FdtNode<'a> {
                     let len = be32(self.fdt.data, self.fdt.struct_off + pos + 4) as usize;
                     pos += 4 + 4 + 4 + align4(len);
                 }
-                FDT_NOP => { pos += 4; }
+                FDT_NOP => {
+                    pos += 4;
+                }
                 _ => break, // BEGIN_NODE (child) or END_NODE (no children)
             }
         }
@@ -271,13 +295,21 @@ pub struct FdtProp<'a> {
 impl<'a> FdtProp<'a> {
     /// Read as a single big-endian u32.
     pub fn as_u32(&self) -> Option<u32> {
-        if self.data.len() >= 4 { Some(be32(self.data, 0)) } else { None }
+        if self.data.len() >= 4 {
+            Some(be32(self.data, 0))
+        } else {
+            None
+        }
     }
 
     /// Read as a single big-endian u64 (or two concatenated u32s).
     #[allow(dead_code)]
     pub fn as_u64(&self) -> Option<u64> {
-        if self.data.len() >= 8 { Some(be64(self.data, 0)) } else { None }
+        if self.data.len() >= 8 {
+            Some(be64(self.data, 0))
+        } else {
+            None
+        }
     }
 
     /// Iterate (address, size) pairs from a `reg` property.
@@ -295,7 +327,9 @@ impl<'a> FdtProp<'a> {
     pub fn contains_string(&self, s: &[u8]) -> bool {
         let mut start = 0;
         while start < self.data.len() {
-            let end = self.data[start..].iter().position(|&b| b == 0)
+            let end = self.data[start..]
+                .iter()
+                .position(|&b| b == 0)
                 .map(|i| start + i)
                 .unwrap_or(self.data.len());
             if &self.data[start..end] == s {
@@ -322,7 +356,13 @@ pub struct NodeIter<'a> {
 
 impl<'a> NodeIter<'a> {
     fn empty(fdt: Fdt<'a>) -> Self {
-        Self { fdt, pos: 0, base_depth: 0, current_depth: 0, done: true }
+        Self {
+            fdt,
+            pos: 0,
+            base_depth: 0,
+            current_depth: 0,
+            done: true,
+        }
     }
 }
 
@@ -330,10 +370,15 @@ impl<'a> Iterator for NodeIter<'a> {
     type Item = FdtNode<'a>;
 
     fn next(&mut self) -> Option<FdtNode<'a>> {
-        if self.done { return None; }
+        if self.done {
+            return None;
+        }
 
         loop {
-            if self.pos + 4 > self.fdt.struct_size { self.done = true; return None; }
+            if self.pos + 4 > self.fdt.struct_size {
+                self.done = true;
+                return None;
+            }
             let tok = self.fdt.token_at(self.pos);
 
             match tok {
@@ -392,7 +437,10 @@ impl<'a> NodeIter<'a> {
     fn skip_subtree(&mut self) {
         let mut depth: u32 = 1;
         loop {
-            if self.pos + 4 > self.fdt.struct_size { self.done = true; return; }
+            if self.pos + 4 > self.fdt.struct_size {
+                self.done = true;
+                return;
+            }
             let tok = self.fdt.token_at(self.pos);
             match tok {
                 FDT_BEGIN_NODE => {
@@ -412,8 +460,13 @@ impl<'a> NodeIter<'a> {
                     let len = be32(self.fdt.data, self.fdt.struct_off + self.pos + 4) as usize;
                     self.pos += 4 + 4 + 4 + align4(len);
                 }
-                FDT_NOP => { self.pos += 4; }
-                _ => { self.done = true; return; }
+                FDT_NOP => {
+                    self.pos += 4;
+                }
+                _ => {
+                    self.done = true;
+                    return;
+                }
             }
         }
     }
@@ -441,7 +494,9 @@ impl<'a> Iterator for PropIter<'a> {
                     self.pos += 4 + 4 + 4 + align4(len);
                     return Some(FdtProp { name, data });
                 }
-                FDT_NOP => { self.pos += 4; }
+                FDT_NOP => {
+                    self.pos += 4;
+                }
                 _ => return None, // BEGIN_NODE or END_NODE = end of properties
             }
         }
@@ -461,9 +516,15 @@ impl<'a> Iterator for RegIter<'a> {
 
     fn next(&mut self) -> Option<(u64, u64)> {
         let entry_size = (self.addr_cells + self.size_cells) as usize * 4;
-        if self.pos + entry_size > self.data.len() { return None; }
+        if self.pos + entry_size > self.data.len() {
+            return None;
+        }
         let addr = read_cells(self.data, self.pos, self.addr_cells);
-        let size = read_cells(self.data, self.pos + self.addr_cells as usize * 4, self.size_cells);
+        let size = read_cells(
+            self.data,
+            self.pos + self.addr_cells as usize * 4,
+            self.size_cells,
+        );
         self.pos += entry_size;
         Some((addr, size))
     }
@@ -477,7 +538,9 @@ impl<'a> Iterator for RegIter<'a> {
 /// Extracts memory regions, CPUs, GIC info, and virtio-mmio devices.
 #[cfg(target_arch = "aarch64")]
 pub fn parse_aarch64(dtb_addr: usize) {
-    if dtb_addr == 0 { return; }
+    if dtb_addr == 0 {
+        return;
+    }
     let data = unsafe { dtb_slice(dtb_addr) };
     let fdt = match Fdt::new(data) {
         Ok(f) => f,
@@ -486,7 +549,9 @@ pub fn parse_aarch64(dtb_addr: usize) {
 
     // 1. Memory: find nodes with device_type = "memory".
     for node in fdt.root_children() {
-        if !node_name_starts_with(node.name, b"memory") { continue; }
+        if !node_name_starts_with(node.name, b"memory") {
+            continue;
+        }
         if let Some(reg) = node.property(b"reg") {
             for (base, size) in reg.reg_iter(2, 2) {
                 super::push_mem_region(super::MemRegion { base, size });
@@ -497,7 +562,9 @@ pub fn parse_aarch64(dtb_addr: usize) {
     // 2. CPUs: find /cpus, iterate cpu@N children.
     if let Some(cpus_node) = fdt.find_node(b"/cpus") {
         for child in cpus_node.children() {
-            if !node_name_starts_with(child.name, b"cpu@") { continue; }
+            if !node_name_starts_with(child.name, b"cpu@") {
+                continue;
+            }
             if let Some(reg) = child.property(b"reg") {
                 let id = reg.as_u32().unwrap_or(0);
                 super::push_cpu(super::CpuDesc { id, flags: 1 });
@@ -514,7 +581,10 @@ pub fn parse_aarch64(dtb_addr: usize) {
                     let dist = pairs.next().map(|(b, _)| b).unwrap_or(0);
                     let redist = pairs.next().map(|(b, _)| b).unwrap_or(0);
                     super::set_irq_controller(super::IrqControllerInfo {
-                        kind: 1, _pad: 0, base0: dist, base1: redist,
+                        kind: 1,
+                        _pad: 0,
+                        base0: dist,
+                        base1: redist,
                     });
                 }
                 break;
@@ -524,14 +594,20 @@ pub fn parse_aarch64(dtb_addr: usize) {
 
     // 4. Virtio-mmio devices at root level.
     for node in fdt.root_children() {
-        if !node_name_starts_with(node.name, b"virtio_mmio") { continue; }
-        let (base, size) = node.property(b"reg")
+        if !node_name_starts_with(node.name, b"virtio_mmio") {
+            continue;
+        }
+        let (base, size) = node
+            .property(b"reg")
             .and_then(|r| r.reg_iter(2, 2).next())
             .unwrap_or((0, 0));
-        if base == 0 { continue; }
+        if base == 0 {
+            continue;
+        }
         // GIC interrupt specifier: 3 cells <type irq_num flags>.
         // Type 0 = SPI, actual INTID = irq_num + 32.
-        let irq = node.property(b"interrupts")
+        let irq = node
+            .property(b"interrupts")
             .map(|p| {
                 if p.data.len() >= 8 {
                     let irq_num = be32(p.data, 4);
@@ -541,7 +617,12 @@ pub fn parse_aarch64(dtb_addr: usize) {
                 }
             })
             .unwrap_or(0);
-        super::push_virtio(super::VirtioMmioDesc { base, size, irq, _pad: 0 });
+        super::push_virtio(super::VirtioMmioDesc {
+            base,
+            size,
+            irq,
+            _pad: 0,
+        });
     }
 }
 
@@ -553,7 +634,9 @@ pub fn parse_aarch64(dtb_addr: usize) {
 /// Extracts memory regions, CPUs, timebase frequency, PLIC info, and virtio devices.
 #[cfg(target_arch = "riscv64")]
 pub fn parse_riscv64(dtb_addr: usize) {
-    if dtb_addr == 0 { return; }
+    if dtb_addr == 0 {
+        return;
+    }
     let data = unsafe { dtb_slice(dtb_addr) };
     let fdt = match Fdt::new(data) {
         Ok(f) => f,
@@ -562,7 +645,9 @@ pub fn parse_riscv64(dtb_addr: usize) {
 
     // 1. Memory: find nodes with device_type = "memory".
     for node in fdt.root_children() {
-        if !node_name_starts_with(node.name, b"memory") { continue; }
+        if !node_name_starts_with(node.name, b"memory") {
+            continue;
+        }
         if let Some(reg) = node.property(b"reg") {
             for (base, size) in reg.reg_iter(2, 2) {
                 super::push_mem_region(super::MemRegion { base, size });
@@ -578,12 +663,17 @@ pub fn parse_riscv64(dtb_addr: usize) {
             }
         }
         for child in cpus_node.children() {
-            if !node_name_starts_with(child.name, b"cpu@") { continue; }
+            if !node_name_starts_with(child.name, b"cpu@") {
+                continue;
+            }
             // Skip non-cpu nodes like cpu-map.
-            let is_cpu = child.property(b"device_type")
+            let is_cpu = child
+                .property(b"device_type")
                 .map(|p| p.data.starts_with(b"cpu"))
                 .unwrap_or(false);
-            if !is_cpu { continue; }
+            if !is_cpu {
+                continue;
+            }
             if let Some(reg) = child.property(b"reg") {
                 let id = reg.as_u32().unwrap_or(0);
                 super::push_cpu(super::CpuDesc { id, flags: 1 });
@@ -596,11 +686,16 @@ pub fn parse_riscv64(dtb_addr: usize) {
     if let Some(soc) = fdt.find_node(b"/soc") {
         for child in soc.children() {
             if let Some(compat) = child.property(b"compatible") {
-                if compat.contains_string(b"sifive,plic-1.0.0") || compat.contains_string(b"riscv,plic0") {
+                if compat.contains_string(b"sifive,plic-1.0.0")
+                    || compat.contains_string(b"riscv,plic0")
+                {
                     if let Some(reg) = child.property(b"reg") {
                         let (base, _size) = reg.reg_iter(2, 2).next().unwrap_or((0, 0));
                         super::set_irq_controller(super::IrqControllerInfo {
-                            kind: 2, _pad: 0, base0: base, base1: 0,
+                            kind: 2,
+                            _pad: 0,
+                            base0: base,
+                            base1: 0,
                         });
                     }
                     break;
@@ -610,16 +705,27 @@ pub fn parse_riscv64(dtb_addr: usize) {
 
         // 4. Virtio-mmio devices under /soc.
         for child in soc.children() {
-            if !node_name_starts_with(child.name, b"virtio_mmio") { continue; }
-            let (base, size) = child.property(b"reg")
+            if !node_name_starts_with(child.name, b"virtio_mmio") {
+                continue;
+            }
+            let (base, size) = child
+                .property(b"reg")
                 .and_then(|r| r.reg_iter(2, 2).next())
                 .unwrap_or((0, 0));
-            if base == 0 { continue; }
+            if base == 0 {
+                continue;
+            }
             // RISC-V interrupt specifier: 1 cell = PLIC IRQ number.
-            let irq = child.property(b"interrupts")
+            let irq = child
+                .property(b"interrupts")
                 .and_then(|p| p.as_u32())
                 .unwrap_or(0);
-            super::push_virtio(super::VirtioMmioDesc { base, size, irq, _pad: 0 });
+            super::push_virtio(super::VirtioMmioDesc {
+                base,
+                size,
+                irq,
+                _pad: 0,
+            });
         }
     }
 }

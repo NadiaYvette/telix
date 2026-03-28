@@ -141,7 +141,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if let Some(p) = syscall::ns_lookup(b"console") {
             break p;
         }
-        for _ in 0..50 { syscall::yield_now(); }
+        for _ in 0..50 {
+            syscall::yield_now();
+        }
     };
 
     let reply_port = syscall::port_create();
@@ -162,7 +164,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Trim trailing whitespace.
         let mut end = len;
-        while end > 0 && (line[end - 1] == b' ' || line[end - 1] == b'\n' || line[end - 1] == b'\r') {
+        while end > 0 && (line[end - 1] == b' ' || line[end - 1] == b'\n' || line[end - 1] == b'\r')
+        {
             end -= 1;
         }
         let line = &line_buf[..end];
@@ -245,13 +248,17 @@ fn cmd_ls(con_port: u64, reply_port: u64, fat16_port: Option<u64>) {
                 let mut name_len = 0;
                 for i in 0..8 {
                     let ch = (name_lo >> (i * 8)) as u8;
-                    if ch == 0 { break; }
+                    if ch == 0 {
+                        break;
+                    }
                     name[name_len] = ch;
                     name_len += 1;
                 }
                 for i in 0..8 {
                     let ch = (name_hi >> (i * 8)) as u8;
-                    if ch == 0 { break; }
+                    if ch == 0 {
+                        break;
+                    }
                     name[name_len] = ch;
                     name_len += 1;
                 }
@@ -316,7 +323,9 @@ fn cmd_cat(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
         if let Some(msg) = syscall::recv_msg(fs_reply) {
             if msg.tag == FS_READ_OK {
                 let bytes_read = msg.data[0] as usize;
-                if bytes_read == 0 { break; }
+                if bytes_read == 0 {
+                    break;
+                }
 
                 // Unpack inline data.
                 let words = [msg.data[1], msg.data[2], msg.data[3]];
@@ -365,7 +374,9 @@ fn cmd_net(con_port: u64, reply_port: u64) {
                 let lo = byte & 0xF;
                 mac_buf[i * 3] = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
                 mac_buf[i * 3 + 1] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
-                if i < 5 { mac_buf[i * 3 + 2] = b':'; }
+                if i < 5 {
+                    mac_buf[i * 3 + 2] = b':';
+                }
             }
             con_puts(con_port, reply_port, &mac_buf);
             con_puts(con_port, reply_port, b"\r\n  IP:  ");
@@ -373,7 +384,10 @@ fn cmd_net(con_port: u64, reply_port: u64) {
             let mut ip_buf = [0u8; 20];
             let mut pos = 0;
             for i in 0..4 {
-                if i > 0 { ip_buf[pos] = b'.'; pos += 1; }
+                if i > 0 {
+                    ip_buf[pos] = b'.';
+                    pos += 1;
+                }
                 let n = fmt_num(ip[i] as u64, &mut ip_buf[pos..]);
                 pos += n;
             }
@@ -391,8 +405,12 @@ fn parse_ip(s: &[u8]) -> Option<u32> {
     let mut has_digit = false;
     for &ch in s {
         if ch == b'.' {
-            if !has_digit || octet_idx >= 3 { return None; }
-            if val > 255 { return None; }
+            if !has_digit || octet_idx >= 3 {
+                return None;
+            }
+            if val > 255 {
+                return None;
+            }
             octets[octet_idx] = val as u8;
             octet_idx += 1;
             val = 0;
@@ -404,7 +422,9 @@ fn parse_ip(s: &[u8]) -> Option<u32> {
             return None;
         }
     }
-    if !has_digit || octet_idx != 3 || val > 255 { return None; }
+    if !has_digit || octet_idx != 3 || val > 255 {
+        return None;
+    }
     octets[3] = val as u8;
     Some(u32::from_be_bytes(octets))
 }
@@ -534,7 +554,9 @@ fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
         if let Some(msg) = syscall::recv_msg(fs_reply) {
             if msg.tag == FS_READ_OK {
                 let bytes_read = msg.data[0] as usize;
-                if bytes_read == 0 { break; }
+                if bytes_read == 0 {
+                    break;
+                }
                 // Copy from scratch into elf_buf at correct offset.
                 unsafe {
                     core::ptr::copy_nonoverlapping(
@@ -650,11 +672,7 @@ fn cmd_write(con_port: u64, reply_port: u64, fat16_port: Option<u64>, args: &[u8
     // Copy data into scratch page.
     let write_len = data.len().min(4096);
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            data.as_ptr(),
-            scratch_va as *mut u8,
-            write_len,
-        );
+        core::ptr::copy_nonoverlapping(data.as_ptr(), scratch_va as *mut u8, write_len);
     }
 
     // Grant scratch to fat16_srv.
@@ -709,16 +727,22 @@ fn cmd_info(con_port: u64, reply_port: u64) {
 
 fn find_byte(s: &[u8], b: u8) -> Option<usize> {
     for (i, &ch) in s.iter().enumerate() {
-        if ch == b { return Some(i); }
+        if ch == b {
+            return Some(i);
+        }
     }
     None
 }
 
 fn trim_slice(s: &[u8]) -> &[u8] {
     let mut start = 0;
-    while start < s.len() && s[start] == b' ' { start += 1; }
+    while start < s.len() && s[start] == b' ' {
+        start += 1;
+    }
     let mut end = s.len();
-    while end > start && s[end - 1] == b' ' { end -= 1; }
+    while end > start && s[end - 1] == b' ' {
+        end -= 1;
+    }
     &s[start..end]
 }
 
@@ -739,7 +763,9 @@ fn cmd_pipe(con_port: u64, reply_port: u64, fat16_port: Option<u64>, left: &[u8]
     }
 
     // Give reader time to start and block on recv.
-    for _ in 0..10 { syscall::yield_now(); }
+    for _ in 0..10 {
+        syscall::yield_now();
+    }
 
     // Execute left-side inline, writing to pipe instead of console.
     if starts_with(left, b"echo ") {
@@ -753,7 +779,9 @@ fn cmd_pipe(con_port: u64, reply_port: u64, fat16_port: Option<u64>, left: &[u8]
 
     // Wait for right-side child to exit.
     loop {
-        if let Some(_) = syscall::waitpid(tid) { break; }
+        if let Some(_) = syscall::waitpid(tid) {
+            break;
+        }
         syscall::yield_now();
     }
 
@@ -796,7 +824,9 @@ fn pipe_cat(pipe_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: 
         if let Some(msg) = syscall::recv_msg(fs_reply) {
             if msg.tag == FS_READ_OK {
                 let bytes_read = msg.data[0] as usize;
-                if bytes_read == 0 { break; }
+                if bytes_read == 0 {
+                    break;
+                }
 
                 // Unpack inline data.
                 let words = [msg.data[1], msg.data[2], msg.data[3]];
@@ -820,6 +850,8 @@ fn pipe_cat(pipe_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: 
 
 fn first_word(s: &[u8]) -> &[u8] {
     let mut end = 0;
-    while end < s.len() && s[end] != b' ' { end += 1; }
+    while end < s.len() && s[end] != b' ' {
+        end += 1;
+    }
     &s[..end]
 }

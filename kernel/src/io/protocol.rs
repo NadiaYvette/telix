@@ -3,7 +3,6 @@
 //! All I/O uses the kernel's fixed-size IPC messages (tag + 6 data words).
 //! Tags identify the operation; data words carry arguments/results.
 
-
 // --- Message tags ---
 
 /// Client → server: open a channel to a named resource.

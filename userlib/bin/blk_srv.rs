@@ -109,7 +109,9 @@ fn mmio_read32(base: usize, offset: usize) -> u32 {
 }
 
 fn mmio_write32(base: usize, offset: usize, val: u32) {
-    unsafe { core::ptr::write_volatile((base + offset) as *mut u32, val); }
+    unsafe {
+        core::ptr::write_volatile((base + offset) as *mut u32, val);
+    }
 }
 
 fn pack_inline_data(data: &[u8]) -> [u64; 5] {
@@ -190,17 +192,17 @@ struct BlkDev {
 // --- Legacy virtio-PCI BAR0 register offsets ---
 #[cfg(target_arch = "x86_64")]
 mod pci_regs {
-    pub const DEVICE_FEATURES: u16 = 0x00;  // 32-bit read
-    pub const DRIVER_FEATURES: u16 = 0x04;  // 32-bit write
-    pub const QUEUE_ADDRESS: u16 = 0x08;    // 32-bit write (PFN)
-    pub const QUEUE_SIZE: u16 = 0x0C;       // 16-bit read
-    pub const QUEUE_SELECT: u16 = 0x0E;     // 16-bit write
-    pub const QUEUE_NOTIFY: u16 = 0x10;     // 16-bit write
-    pub const DEVICE_STATUS: u16 = 0x12;    // 8-bit r/w
-    pub const ISR_STATUS: u16 = 0x13;       // 8-bit read
+    pub const DEVICE_FEATURES: u16 = 0x00; // 32-bit read
+    pub const DRIVER_FEATURES: u16 = 0x04; // 32-bit write
+    pub const QUEUE_ADDRESS: u16 = 0x08; // 32-bit write (PFN)
+    pub const QUEUE_SIZE: u16 = 0x0C; // 16-bit read
+    pub const QUEUE_SELECT: u16 = 0x0E; // 16-bit write
+    pub const QUEUE_NOTIFY: u16 = 0x10; // 16-bit write
+    pub const DEVICE_STATUS: u16 = 0x12; // 8-bit r/w
+    pub const ISR_STATUS: u16 = 0x13; // 8-bit read
     // Block device config starts at offset 0x14.
-    pub const BLK_CAPACITY_LO: u16 = 0x14;  // 32-bit
-    pub const BLK_CAPACITY_HI: u16 = 0x18;  // 32-bit
+    pub const BLK_CAPACITY_LO: u16 = 0x14; // 32-bit
+    pub const BLK_CAPACITY_HI: u16 = 0x18; // 32-bit
 }
 
 impl BlkDev {
@@ -268,7 +270,9 @@ impl BlkDev {
         let vq_pa = syscall::virt_to_phys(vq_va)?;
 
         // Zero it.
-        unsafe { core::ptr::write_bytes(vq_va as *mut u8, 0, 4096); }
+        unsafe {
+            core::ptr::write_bytes(vq_va as *mut u8, 0, 4096);
+        }
 
         let desc_pa = vq_pa;
         let avail_pa = desc_pa + 16 * QUEUE_SIZE; // 16 bytes per descriptor
@@ -276,11 +280,13 @@ impl BlkDev {
         // Allocate buffer page (header + status + 512-byte data).
         let buf_va = syscall::mmap_anon(0, 1, 1)?; // RW
         let buf_pa = syscall::virt_to_phys(buf_va)?;
-        unsafe { core::ptr::write_bytes(buf_va as *mut u8, 0, 4096); }
+        unsafe {
+            core::ptr::write_bytes(buf_va as *mut u8, 0, 4096);
+        }
 
         let req_hdr_pa = buf_pa;
         let status_pa = buf_pa + 16; // After 16-byte header
-        let data_pa = buf_pa + 32;   // After header + status gap
+        let data_pa = buf_pa + 32; // After header + status gap
 
         // Register IRQ for userspace dispatch (first irq_wait call with mmio_base).
         // We pass the *physical* MMIO base so the kernel can ACK the virtio interrupt.
@@ -362,8 +368,10 @@ impl BlkDev {
 
         // ACK + DRIVER.
         syscall::ioport_outb(base + pci_regs::DEVICE_STATUS, STATUS_ACK as u8);
-        syscall::ioport_outb(base + pci_regs::DEVICE_STATUS,
-            (STATUS_ACK | STATUS_DRIVER) as u8);
+        syscall::ioport_outb(
+            base + pci_regs::DEVICE_STATUS,
+            (STATUS_ACK | STATUS_DRIVER) as u8,
+        );
 
         // Feature negotiation.
         let _features = syscall::ioport_inl(base + pci_regs::DEVICE_FEATURES);
@@ -389,7 +397,9 @@ impl BlkDev {
         // Allocate virtqueue page (64K alloc page fits desc+avail+used with 4K alignment).
         let vq_va = syscall::mmap_anon(0, 1, 1)?;
         let vq_pa = syscall::virt_to_phys(vq_va)?;
-        unsafe { core::ptr::write_bytes(vq_va as *mut u8, 0, 4096 * 16); }
+        unsafe {
+            core::ptr::write_bytes(vq_va as *mut u8, 0, 4096 * 16);
+        }
 
         let desc_pa = vq_pa;
         let avail_pa = desc_pa + 16 * qsz;
@@ -405,15 +415,19 @@ impl BlkDev {
         // Allocate buffer page.
         let buf_va = syscall::mmap_anon(0, 1, 1)?;
         let buf_pa = syscall::virt_to_phys(buf_va)?;
-        unsafe { core::ptr::write_bytes(buf_va as *mut u8, 0, 4096); }
+        unsafe {
+            core::ptr::write_bytes(buf_va as *mut u8, 0, 4096);
+        }
 
         let req_hdr_pa = buf_pa;
         let status_pa = buf_pa + 16;
         let data_pa = buf_pa + 32;
 
         // DRIVER_OK.
-        syscall::ioport_outb(base + pci_regs::DEVICE_STATUS,
-            (STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK) as u8);
+        syscall::ioport_outb(
+            base + pci_regs::DEVICE_STATUS,
+            (STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK) as u8,
+        );
 
         // Store BAR0 base as mmio_va for notify/ISR access.
         Some(Self {
@@ -449,7 +463,9 @@ impl BlkDev {
 
         // Status byte.
         let status_va = self.buf_va + 16;
-        unsafe { core::ptr::write_volatile(status_va as *mut u8, 0xFF); }
+        unsafe {
+            core::ptr::write_volatile(status_va as *mut u8, 0xFF);
+        }
 
         self.build_chain(VRING_DESC_F_WRITE);
         self.submit(0);
@@ -486,7 +502,9 @@ impl BlkDev {
         }
 
         let status_va = self.buf_va + 16;
-        unsafe { core::ptr::write_volatile(status_va as *mut u8, 0xFF); }
+        unsafe {
+            core::ptr::write_volatile(status_va as *mut u8, 0xFF);
+        }
 
         // Copy data into DMA buffer using volatile writes.
         let data_va = self.buf_va + 32;
@@ -519,24 +537,33 @@ impl BlkDev {
 
         unsafe {
             // Use volatile writes — these are DMA structures read by the device.
-            core::ptr::write_volatile(descs.add(0), VringDesc {
-                addr: self.req_hdr_pa as u64,
-                len: 16,
-                flags: VRING_DESC_F_NEXT,
-                next: 1,
-            });
-            core::ptr::write_volatile(descs.add(1), VringDesc {
-                addr: self.data_pa as u64,
-                len: 512,
-                flags: data_flags | VRING_DESC_F_NEXT,
-                next: 2,
-            });
-            core::ptr::write_volatile(descs.add(2), VringDesc {
-                addr: self.status_pa as u64,
-                len: 1,
-                flags: VRING_DESC_F_WRITE,
-                next: 0,
-            });
+            core::ptr::write_volatile(
+                descs.add(0),
+                VringDesc {
+                    addr: self.req_hdr_pa as u64,
+                    len: 16,
+                    flags: VRING_DESC_F_NEXT,
+                    next: 1,
+                },
+            );
+            core::ptr::write_volatile(
+                descs.add(1),
+                VringDesc {
+                    addr: self.data_pa as u64,
+                    len: 512,
+                    flags: data_flags | VRING_DESC_F_NEXT,
+                    next: 2,
+                },
+            );
+            core::ptr::write_volatile(
+                descs.add(2),
+                VringDesc {
+                    addr: self.status_pa as u64,
+                    len: 1,
+                    flags: VRING_DESC_F_WRITE,
+                    next: 0,
+                },
+            );
         }
     }
 
@@ -557,9 +584,13 @@ impl BlkDev {
         // DMB ISH (from fence(Release)) only orders between CPUs; DSB SY / fence iorw,iorw
         // ensures completion for device-observable memory.
         #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("dsb sy"); }
+        unsafe {
+            core::arch::asm!("dsb sy");
+        }
         #[cfg(target_arch = "riscv64")]
-        unsafe { core::arch::asm!("fence iorw, iorw"); }
+        unsafe {
+            core::arch::asm!("fence iorw, iorw");
+        }
         // Notify device.
         #[cfg(not(target_arch = "x86_64"))]
         mmio_write32(self.mmio_va, MMIO_QUEUE_NOTIFY, 0);
@@ -576,9 +607,13 @@ impl BlkDev {
         loop {
             // DSB ensures device writes to the used ring are visible before we read.
             #[cfg(target_arch = "aarch64")]
-            unsafe { core::arch::asm!("dsb sy"); }
+            unsafe {
+                core::arch::asm!("dsb sy");
+            }
             #[cfg(target_arch = "riscv64")]
-            unsafe { core::arch::asm!("fence iorw, iorw"); }
+            unsafe {
+                core::arch::asm!("fence iorw, iorw");
+            }
             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             let idx = unsafe { core::ptr::read_volatile(used_idx_ptr) };
             if idx != self.last_used_idx {
@@ -608,7 +643,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(d) => d,
         None => {
             syscall::debug_puts(b"  [blk_srv] failed to init device\n");
-            loop { core::hint::spin_loop(); }
+            loop {
+                core::hint::spin_loop();
+            }
         }
     };
 
@@ -639,8 +676,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         match msg.tag {
             IO_CONNECT => {
                 let reply_port = msg.data[2] >> 32;
-                syscall::send(reply_port, IO_CONNECT_OK,
-                    0, capacity * 512, my_aspace as u64, 0);
+                syscall::send(
+                    reply_port,
+                    IO_CONNECT_OK,
+                    0,
+                    capacity * 512,
+                    my_aspace as u64,
+                    0,
+                );
             }
 
             IO_READ => {
@@ -664,16 +707,26 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                             // Ensure grant page writes are visible to the receiver
                             // (on another CPU) before the IPC notification.
                             #[cfg(target_arch = "aarch64")]
-                            unsafe { core::arch::asm!("dsb ish"); }
+                            unsafe {
+                                core::arch::asm!("dsb ish");
+                            }
                             #[cfg(target_arch = "riscv64")]
-                            unsafe { core::arch::asm!("fence rw, rw"); }
+                            unsafe {
+                                core::arch::asm!("fence rw, rw");
+                            }
                             syscall::send_nb(reply_port, IO_READ_OK, bytes_read as u64, 0);
                         } else {
                             // Inline read.
                             let inline_len = bytes_read.min(MAX_INLINE_READ);
                             let packed = pack_inline_data(&buf[..inline_len]);
-                            syscall::send(reply_port, IO_READ_OK,
-                                inline_len as u64, packed[0], packed[1], packed[2]);
+                            syscall::send(
+                                reply_port,
+                                IO_READ_OK,
+                                inline_len as u64,
+                                packed[0],
+                                packed[1],
+                                packed[2],
+                            );
                         }
                     }
                     Err(()) => {
@@ -719,5 +772,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

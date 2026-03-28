@@ -7,7 +7,11 @@
 const LAPIC_FALLBACK: usize = 0xFEE0_0000;
 fn lapic_base() -> usize {
     let info = crate::firmware::irq_controller();
-    if info.kind != 0 { info.base0 as usize } else { LAPIC_FALLBACK }
+    if info.kind != 0 {
+        info.base0 as usize
+    } else {
+        LAPIC_FALLBACK
+    }
 }
 
 // Register offsets.
@@ -29,7 +33,9 @@ fn read(offset: usize) -> u32 {
 
 #[inline]
 fn write(offset: usize, val: u32) {
-    unsafe { core::ptr::write_volatile((lapic_base() + offset) as *mut u32, val); }
+    unsafe {
+        core::ptr::write_volatile((lapic_base() + offset) as *mut u32, val);
+    }
 }
 
 /// Get the LAPIC ID of the current CPU.

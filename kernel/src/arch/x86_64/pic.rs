@@ -25,13 +25,17 @@ const EOI: u8 = 0x20;
 
 #[inline]
 unsafe fn outb(port: u16, val: u8) {
-    unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
+    }
 }
 
 #[inline]
 unsafe fn inb(port: u16) -> u8 {
     let val: u8;
-    unsafe { core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack));
+    }
     val
 }
 
@@ -39,7 +43,9 @@ unsafe fn inb(port: u16) -> u8 {
 #[inline]
 unsafe fn io_wait() {
     // Write to an unused port to create a short delay.
-    unsafe { outb(0x80, 0); }
+    unsafe {
+        outb(0x80, 0);
+    }
 }
 
 /// Initialize and remap both PICs.

@@ -65,7 +65,11 @@ fn print_throughput(name: &[u8], total_bytes: u64, total_cycles: u64, freq: u64,
 
 fn print_opsec(name: &[u8], total_cycles: u64, freq: u64, iters: u64) {
     let per_iter = if iters > 0 { total_cycles / iters } else { 0 };
-    let ops = if total_cycles > 0 { iters * freq / total_cycles } else { 0 };
+    let ops = if total_cycles > 0 {
+        iters * freq / total_cycles
+    } else {
+        0
+    };
     syscall::debug_puts(b"  macro: ");
     syscall::debug_puts(name);
     syscall::debug_puts(b": ");
@@ -100,8 +104,14 @@ fn fs_open(fat_port: u64, name: &[u8]) -> Option<(u64, u32, u64)> {
 
 /// Grant-based read: reads `length` bytes at `offset` from handle into scratch_va.
 /// Returns bytes read, or 0 on error.
-fn fs_read_grant(fat_port: u64, handle: u64, offset: u32, length: u32,
-                 srv_aspace: u64, scratch_va: usize) -> u32 {
+fn fs_read_grant(
+    fat_port: u64,
+    handle: u64,
+    offset: u32,
+    length: u32,
+    srv_aspace: u64,
+    scratch_va: usize,
+) -> u32 {
     let reply_port = syscall::port_create();
     // Grant our scratch page to fat16_srv.
     if !syscall::grant_pages(srv_aspace, scratch_va, GRANT_DST, 1, false) {
@@ -109,9 +119,20 @@ fn fs_read_grant(fat_port: u64, handle: u64, offset: u32, length: u32,
         return 0;
     }
     let d2 = (length as u64) | ((reply_port) << 32);
-    syscall::send(fat_port, FS_READ, handle, offset as u64, d2, GRANT_DST as u64);
+    syscall::send(
+        fat_port,
+        FS_READ,
+        handle,
+        offset as u64,
+        d2,
+        GRANT_DST as u64,
+    );
     let bytes = if let Some(msg) = syscall::recv_msg(reply_port) {
-        if msg.tag == FS_READ_OK { msg.data[0] as u32 } else { 0 }
+        if msg.tag == FS_READ_OK {
+            msg.data[0] as u32
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -141,8 +162,13 @@ fn fs_create(fat_port: u64, name: &[u8]) -> Option<(u64, u64)> {
 
 /// Grant-based write: writes `length` bytes from scratch_va to handle.
 /// Returns bytes written.
-fn fs_write_grant(fat_port: u64, handle: u64, length: u32,
-                  srv_aspace: u64, scratch_va: usize) -> u32 {
+fn fs_write_grant(
+    fat_port: u64,
+    handle: u64,
+    length: u32,
+    srv_aspace: u64,
+    scratch_va: usize,
+) -> u32 {
     let reply_port = syscall::port_create();
     if !syscall::grant_pages(srv_aspace, scratch_va, GRANT_DST, 1, false) {
         syscall::port_destroy(reply_port);
@@ -151,7 +177,11 @@ fn fs_write_grant(fat_port: u64, handle: u64, length: u32,
     let d1 = (length as u64) | ((reply_port) << 32);
     syscall::send(fat_port, FS_WRITE, handle, d1, GRANT_DST as u64, 0);
     let written = if let Some(msg) = syscall::recv_msg(reply_port) {
-        if msg.tag == FS_WRITE_OK { msg.data[0] as u32 } else { 0 }
+        if msg.tag == FS_WRITE_OK {
+            msg.data[0] as u32
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -164,7 +194,9 @@ fn fs_write_grant(fat_port: u64, handle: u64, length: u32,
 fn fs_close(fat_port: u64, handle: u64) {
     syscall::send_nb(fat_port, FS_CLOSE, handle, 0);
     // Give time for close + flush.
-    for _ in 0..500 { syscall::yield_now(); }
+    for _ in 0..500 {
+        syscall::yield_now();
+    }
 }
 
 /// Delete a file by name.
@@ -196,7 +228,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if let Some(p) = syscall::ns_lookup(b"fat16") {
             break p;
         }
-        for _ in 0..100 { syscall::yield_now(); }
+        for _ in 0..100 {
+            syscall::yield_now();
+        }
     };
 
     // Allocate scratch page for grant-based I/O.
@@ -225,8 +259,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     let mut offset: u32 = 0;
                     while offset < FILE_SIZE {
                         let to_read = 512u32.min(FILE_SIZE - offset);
-                        let got = fs_read_grant(fat_port, handle, offset, to_read, srv_aspace, scratch_va);
-                        if got == 0 { break; }
+                        let got = fs_read_grant(
+                            fat_port, handle, offset, to_read, srv_aspace, scratch_va,
+                        );
+                        if got == 0 {
+                            break;
+                        }
                         total_bytes += got as u64;
                         offset += got;
                     }
@@ -247,7 +285,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Fill scratch with pattern.
         for i in 0..WRITE_SIZE as usize {
-            unsafe { *((scratch_va + i) as *mut u8) = (i & 0xFF) as u8; }
+            unsafe {
+                *((scratch_va + i) as *mut u8) = (i & 0xFF) as u8;
+            }
         }
 
         // Use numbered filenames: BNCH00.DAT through BNCH09.DAT
@@ -293,8 +333,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let mut total_read: u64 = 0;
                 while offset < FILE_SIZE {
                     let to_read = 512u32.min(FILE_SIZE - offset);
-                    let got = fs_read_grant(fat_port, handle, offset, to_read, srv_aspace, scratch_va);
-                    if got == 0 { break; }
+                    let got =
+                        fs_read_grant(fat_port, handle, offset, to_read, srv_aspace, scratch_va);
+                    if got == 0 {
+                        break;
+                    }
                     // XOR all bytes.
                     for i in 0..got as usize {
                         xor ^= unsafe { *((scratch_va + i) as *const u8) };
@@ -324,7 +367,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 let kbs = if (t1 - t0) > 0 {
                     total_read * (freq / 1024) / (t1 - t0)
-                } else { 0 };
+                } else {
+                    0
+                };
                 print_num(t1 - t0);
                 syscall::debug_puts(b" cy (");
                 print_num(kbs);
@@ -383,7 +428,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                     syscall::kill(fat16_tid);
                     loop {
-                        if syscall::waitpid(fat16_tid).is_some() { break; }
+                        if syscall::waitpid(fat16_tid).is_some() {
+                            break;
+                        }
                         syscall::yield_now();
                     }
 
@@ -402,12 +449,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                         let mut match_ok = true;
                                         for i in 0..512 {
                                             let b = unsafe { *((scratch_va + i) as *const u8) };
-                                            if b != baseline[i] { match_ok = false; break; }
+                                            if b != baseline[i] {
+                                                match_ok = false;
+                                                break;
+                                            }
                                         }
-                                        if match_ok { recovery_ok = true; }
+                                        if match_ok {
+                                            recovery_ok = true;
+                                        }
                                     }
                                     fs_close(new_port, h);
-                                    if recovery_ok { break; }
+                                    if recovery_ok {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -417,20 +471,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if recovery_ok {
                             let us = if freq > 0 {
                                 (t1 - t0) / (freq / 1_000_000)
-                            } else { 0 };
+                            } else {
+                                0
+                            };
                             syscall::debug_puts(b"  macro: srv_recovery: ");
                             print_num(t1 - t0);
                             syscall::debug_puts(b" cy (~");
                             print_num(us);
                             syscall::debug_puts(b" us recovery window)\n");
                         } else {
-                            syscall::debug_puts(b"  macro: srv_recovery: FAILED (could not verify)\n");
+                            syscall::debug_puts(
+                                b"  macro: srv_recovery: FAILED (could not verify)\n",
+                            );
                         }
 
                         // Cleanup: kill our fat16_srv.
                         syscall::kill(fat16_tid);
                         loop {
-                            if syscall::waitpid(fat16_tid).is_some() { break; }
+                            if syscall::waitpid(fat16_tid).is_some() {
+                                break;
+                            }
                             syscall::yield_now();
                         }
                     } else {
@@ -440,7 +500,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  macro: srv_recovery: SKIP (baseline read failed)\n");
                     syscall::kill(fat16_tid);
                     loop {
-                        if syscall::waitpid(fat16_tid).is_some() { break; }
+                        if syscall::waitpid(fat16_tid).is_some() {
+                            break;
+                        }
                         syscall::yield_now();
                     }
                 }
@@ -448,7 +510,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  macro: srv_recovery: SKIP (fat16_srv not ready)\n");
                 syscall::kill(fat16_tid);
                 loop {
-                    if syscall::waitpid(fat16_tid).is_some() { break; }
+                    if syscall::waitpid(fat16_tid).is_some() {
+                        break;
+                    }
                     syscall::yield_now();
                 }
             }

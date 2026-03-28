@@ -13,8 +13,8 @@
 
 use crate::mm::page::PAGE_SIZE;
 use crate::mm::phys;
-use core::sync::atomic::{AtomicPtr, Ordering};
 use core::ptr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 /// Number of pointer entries per allocation page.
 pub const RADIX_FANOUT: usize = PAGE_SIZE / core::mem::size_of::<usize>();
@@ -30,7 +30,9 @@ pub struct RadixTable {
 impl RadixTable {
     /// Create an uninitialized table. Call `init()` before first use.
     pub const fn new() -> Self {
-        Self { l0: AtomicPtr::new(ptr::null_mut()) }
+        Self {
+            l0: AtomicPtr::new(ptr::null_mut()),
+        }
     }
 
     /// Allocate the L0 page. Must be called once during kernel init,
@@ -38,7 +40,9 @@ impl RadixTable {
     pub fn init(&self) {
         let pa = phys::alloc_page().expect("radix L0 alloc");
         let p = pa.as_usize() as *mut u8;
-        unsafe { ptr::write_bytes(p, 0, PAGE_SIZE); }
+        unsafe {
+            ptr::write_bytes(p, 0, PAGE_SIZE);
+        }
         self.l0.store(p as *mut AtomicPtr<u8>, Ordering::Release);
     }
 
@@ -47,16 +51,22 @@ impl RadixTable {
     #[inline]
     pub fn get(&self, id: u32) -> *mut u8 {
         let l0 = self.l0.load(Ordering::Acquire);
-        if l0.is_null() { return ptr::null_mut(); }
+        if l0.is_null() {
+            return ptr::null_mut();
+        }
 
         let l0_idx = (id as usize) / RADIX_FANOUT;
         let l1_idx = (id as usize) % RADIX_FANOUT;
 
-        if l0_idx >= RADIX_FANOUT { return ptr::null_mut(); }
+        if l0_idx >= RADIX_FANOUT {
+            return ptr::null_mut();
+        }
 
         // Load L1 page pointer from L0.
         let l1_page = unsafe { &*l0.add(l0_idx) }.load(Ordering::Acquire);
-        if l1_page.is_null() { return ptr::null_mut(); }
+        if l1_page.is_null() {
+            return ptr::null_mut();
+        }
 
         // Load entity pointer from L1.
         let l1 = l1_page as *const AtomicPtr<u8>;
@@ -81,10 +91,14 @@ impl RadixTable {
     /// Returns false if allocation fails or ID is out of range.
     pub fn ensure_l1(&self, id: u32) -> bool {
         let l0 = self.l0.load(Ordering::Relaxed);
-        if l0.is_null() { return false; }
+        if l0.is_null() {
+            return false;
+        }
 
         let l0_idx = (id as usize) / RADIX_FANOUT;
-        if l0_idx >= RADIX_FANOUT { return false; }
+        if l0_idx >= RADIX_FANOUT {
+            return false;
+        }
 
         let entry = unsafe { &*l0.add(l0_idx) };
         if !entry.load(Ordering::Relaxed).is_null() {
@@ -97,7 +111,9 @@ impl RadixTable {
             None => return false,
         };
         let p = pa.as_usize() as *mut u8;
-        unsafe { ptr::write_bytes(p, 0, PAGE_SIZE); }
+        unsafe {
+            ptr::write_bytes(p, 0, PAGE_SIZE);
+        }
         entry.store(p, Ordering::Release);
         true
     }

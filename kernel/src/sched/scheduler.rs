@@ -15,17 +15,17 @@
 //! Thread/Task structs and accessed via TASK_TABLE/THREAD_TABLE radix
 //! page tables for lock-free lookup.
 
-use super::thread::{Thread, ThreadId, ThreadState, BlockReason};
-use crate::arch::trapframe::EXCEPTION_FRAME_SIZE;
-use super::task::{Task, TaskId, GROUPS_INLINE, RLIMIT_COUNT, Rlimit};
-use super::radix::RadixTable;
 use super::cpumask;
+use super::radix::RadixTable;
 use super::smp;
+use super::task::{GROUPS_INLINE, RLIMIT_COUNT, Rlimit, Task, TaskId};
+use super::thread::{BlockReason, Thread, ThreadId, ThreadState};
+use crate::arch::trapframe::EXCEPTION_FRAME_SIZE;
 use crate::ipc::art::Art;
+use crate::mm::page::{MMUPAGE_SIZE, PAGE_SIZE, PhysAddr};
+use crate::mm::{phys, slab};
 use crate::sync::SpinLock;
-use crate::mm::page::{PhysAddr, PAGE_SIZE, MMUPAGE_SIZE};
-use crate::mm::{slab, phys};
-use core::sync::atomic::{AtomicUsize, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Two-level radix table for lockless task pointer lookup.
 /// Used by has_port_cap_fast() and SA atomics on the hot path.
@@ -43,7 +43,9 @@ pub struct GlobalArt {
 unsafe impl Sync for GlobalArt {}
 impl GlobalArt {
     const fn new() -> Self {
-        Self { inner: core::cell::UnsafeCell::new(Art::new()) }
+        Self {
+            inner: core::cell::UnsafeCell::new(Art::new()),
+        }
     }
     /// Lock-free lookup. Safe without any lock (RCU read-side).
     #[inline]
@@ -102,13 +104,17 @@ pub fn task_ref(id: TaskId) -> &'static Task {
 /// Get a task reference by ID, returning None if not in ART.
 #[inline]
 pub fn task_ref_opt(id: TaskId) -> Option<&'static Task> {
-    SCHED_TASK_ART.lookup(id as u64).map(|val| unsafe { &*(val as *const Task) })
+    SCHED_TASK_ART
+        .lookup(id as u64)
+        .map(|val| unsafe { &*(val as *const Task) })
 }
 
 /// Get a thread reference by ID, returning None if not in ART.
 #[inline]
 pub fn thread_ref_opt(id: ThreadId) -> Option<&'static Thread> {
-    SCHED_THREAD_ART.lookup(id as u64).map(|val| unsafe { &*(val as *const Thread) })
+    SCHED_THREAD_ART
+        .lookup(id as u64)
+        .map(|val| unsafe { &*(val as *const Thread) })
 }
 
 /// Per-CPU saved frame SP. The exception handler stores the current frame_sp
@@ -156,14 +162,18 @@ const RQ_NIL: u32 = 0;
 /// Per-priority run queue — a doubly-linked FIFO list threaded through
 /// Thread::run_next / run_prev. No fixed capacity limit.
 struct RunQueue {
-    head: u32,   // First thread (RQ_NIL = empty)
-    tail: u32,   // Last thread (RQ_NIL = empty)
-    len: u32,    // Count of enqueued threads
+    head: u32, // First thread (RQ_NIL = empty)
+    tail: u32, // Last thread (RQ_NIL = empty)
+    len: u32,  // Count of enqueued threads
 }
 
 impl RunQueue {
     const fn new() -> Self {
-        Self { head: RQ_NIL, tail: RQ_NIL, len: 0 }
+        Self {
+            head: RQ_NIL,
+            tail: RQ_NIL,
+            len: 0,
+        }
     }
 
     /// Append a thread to the tail of the queue.
@@ -226,9 +236,7 @@ impl RunQueue {
         let mut cur = self.head;
         while cur != RQ_NIL {
             let t = thread_ref(cur);
-            if t.cosched_group.load(Ordering::Relaxed) == group
-                && t.affinity_mask.test(cpu)
-            {
+            if t.cosched_group.load(Ordering::Relaxed) == group && t.affinity_mask.test(cpu) {
                 self.unlink(cur);
                 return Some(cur);
             }
@@ -426,7 +434,9 @@ fn try_steal_for_idle(cpu: u32) -> Option<ThreadId> {
 
 fn try_steal_min(cpu: u32, min_len: u32) -> Option<ThreadId> {
     let online = smp::online_cpus() as usize;
-    if online <= 1 { return None; }
+    if online <= 1 {
+        return None;
+    }
     for i in 1..online {
         let victim = ((cpu as usize + i) % online) as u32;
         if let Some(mut rq) = PERCPU_RQ[victim as usize].try_lock() {
@@ -443,12 +453,20 @@ fn try_steal_min(cpu: u32, min_len: u32) -> Option<ThreadId> {
 // ---------------------------------------------------------------------------
 
 /// Kernel handler for task ports. Stub — returns empty reply.
-fn task_port_handler(_port_id: crate::ipc::port::PortId, _user_data: usize, _msg: &crate::ipc::Message) -> crate::ipc::Message {
+fn task_port_handler(
+    _port_id: crate::ipc::port::PortId,
+    _user_data: usize,
+    _msg: &crate::ipc::Message,
+) -> crate::ipc::Message {
     crate::ipc::Message::empty()
 }
 
 /// Kernel handler for thread ports. Stub — returns empty reply.
-fn thread_port_handler(_port_id: crate::ipc::port::PortId, _user_data: usize, _msg: &crate::ipc::Message) -> crate::ipc::Message {
+fn thread_port_handler(
+    _port_id: crate::ipc::port::PortId,
+    _user_data: usize,
+    _msg: &crate::ipc::Message,
+) -> crate::ipc::Message {
     crate::ipc::Message::empty()
 }
 
@@ -504,8 +522,8 @@ fn sched_init() {
     THREAD_TABLE.init();
 
     let task_ptr = alloc_task_entry().expect("task 0 alloc");
-    let task0_port = crate::ipc::port::create_kernel_port(task_port_handler, 0)
-        .expect("task 0 port");
+    let task0_port =
+        crate::ipc::port::create_kernel_port(task_port_handler, 0).expect("task 0 port");
     unsafe {
         (*task_ptr).id = 0;
         (*task_ptr).active = true;
@@ -517,8 +535,8 @@ fn sched_init() {
     NEXT_TASK_ID.store(1, Ordering::Relaxed);
 
     let thread_ptr = alloc_thread_entry().expect("thread 0 alloc");
-    let thread0_port = crate::ipc::port::create_kernel_port(thread_port_handler, 0)
-        .expect("thread 0 port");
+    let thread0_port =
+        crate::ipc::port::create_kernel_port(thread_port_handler, 0).expect("thread 0 port");
     unsafe {
         (*thread_ptr).id = 0;
         (*thread_ptr).state = ThreadState::Running;
@@ -562,7 +580,9 @@ fn create_idle_thread() -> Option<ThreadId> {
     t.thread_task.store(0, Ordering::Relaxed);
 
     SCHED_THREAD_ART.insert(id as u64, ptr as usize);
-    if !THREAD_TABLE.ensure_l1(id) { return None; }
+    if !THREAD_TABLE.ensure_l1(id) {
+        return None;
+    }
     THREAD_TABLE.set(id, ptr as *mut u8);
     Some(id)
 }
@@ -572,8 +592,12 @@ fn create_idle_thread() -> Option<ThreadId> {
 fn alloc_thread_id() -> Option<ThreadId> {
     let mut found_id: Option<ThreadId> = None;
     SCHED_THREAD_ART.for_each(|key, val| {
-        if found_id.is_some() { return; }
-        if key == 0 { return; }
+        if found_id.is_some() {
+            return;
+        }
+        if key == 0 {
+            return;
+        }
         let t = unsafe { &*(val as *const Thread) };
         if t.state == ThreadState::Dead && t.stack_base == 0 {
             found_id = Some(key as ThreadId);
@@ -588,7 +612,9 @@ fn alloc_thread_id() -> Option<ThreadId> {
     }
     let ptr = alloc_thread_entry()?;
     SCHED_THREAD_ART.insert(id as u64, ptr as usize);
-    if !THREAD_TABLE.ensure_l1(id) { return None; }
+    if !THREAD_TABLE.ensure_l1(id) {
+        return None;
+    }
     THREAD_TABLE.set(id, ptr as *mut u8);
     NEXT_THREAD_ID.store(id + 1, Ordering::Relaxed);
     Some(id)
@@ -599,8 +625,12 @@ fn alloc_thread_id() -> Option<ThreadId> {
 fn alloc_task_id() -> Option<TaskId> {
     let mut found_id: Option<TaskId> = None;
     SCHED_TASK_ART.for_each(|key, val| {
-        if found_id.is_some() { return; }
-        if key == 0 { return; }
+        if found_id.is_some() {
+            return;
+        }
+        if key == 0 {
+            return;
+        }
         let t = unsafe { &*(val as *const Task) };
         if !t.active && t.exited && t.reaped {
             found_id = Some(key as TaskId);
@@ -615,62 +645,60 @@ fn alloc_task_id() -> Option<TaskId> {
     }
     let ptr = alloc_task_entry()?;
     SCHED_TASK_ART.insert(id as u64, ptr as usize);
-    if !TASK_TABLE.ensure_l1(id) { return None; }
+    if !TASK_TABLE.ensure_l1(id) {
+        return None;
+    }
     TASK_TABLE.set(id, ptr as *mut u8);
     NEXT_TASK_ID.store(id + 1, Ordering::Relaxed);
     Some(id)
 }
 
 /// Create a kernel-mode thread. Must hold THREAD_ART_WRITE_LOCK.
-fn create_thread(
-    entry: fn() -> !,
-    priority: u8,
-    quantum: u32,
-) -> Option<ThreadId> {
+fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
     let id = alloc_thread_id()?;
 
-        let stack_page = crate::mm::phys::alloc_page()?;
-        let stack_base = stack_page.as_usize();
-        let stack_top = stack_base + crate::mm::page::PAGE_SIZE;
+    let stack_page = crate::mm::phys::alloc_page()?;
+    let stack_base = stack_page.as_usize();
+    let stack_top = stack_base + crate::mm::page::PAGE_SIZE;
 
-        // Create a fake exception frame at the top of the stack.
-        // When we "return" from the IRQ handler with this thread's SP,
-        // restore_regs will load these values and eret/sret to the entry point.
-        let frame_sp = stack_top - EXCEPTION_FRAME_SIZE;
-        let frame = frame_sp as *mut u64;
-        unsafe {
-            // Zero the entire frame.
-            for i in 0..(EXCEPTION_FRAME_SIZE / 8) {
-                *frame.add(i) = 0;
-            }
-
-            crate::arch::trapframe::init_kernel_frame(
-                frame, entry as *const () as usize, stack_top,
-            );
+    // Create a fake exception frame at the top of the stack.
+    // When we "return" from the IRQ handler with this thread's SP,
+    // restore_regs will load these values and eret/sret to the entry point.
+    let frame_sp = stack_top - EXCEPTION_FRAME_SIZE;
+    let frame = frame_sp as *mut u64;
+    unsafe {
+        // Zero the entire frame.
+        for i in 0..(EXCEPTION_FRAME_SIZE / 8) {
+            *frame.add(i) = 0;
         }
 
-        // Clear killed/affinity flags from any previous occupant of this slot.
-        let thread = unsafe { thread_mut_from_ref(id) };
-        thread.killed.store(false, Ordering::Release);
-        thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
-        thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
-
-        thread.id = id;
-        thread.state = ThreadState::Ready;
-        thread.task_id = 0;
-        thread.base_priority = priority;
-        thread.effective_priority = priority;
-        thread.prio.store(priority, Ordering::Relaxed);
-        thread.quantum = quantum;
-        thread.default_quantum = quantum;
-        thread.saved_sp = frame_sp as u64;
-        thread.stack_base = stack_base;
-        thread.sig_mask = 0;
-        thread.sig_pending = 0;
-
-        percpu_enqueue(smp::cpu_id(), priority, id);
-        Some(id)
+        crate::arch::trapframe::init_kernel_frame(frame, entry as *const () as usize, stack_top);
     }
+
+    // Clear killed/affinity flags from any previous occupant of this slot.
+    let thread = unsafe { thread_mut_from_ref(id) };
+    thread.killed.store(false, Ordering::Release);
+    thread
+        .affinity_mask
+        .store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
+    thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+
+    thread.id = id;
+    thread.state = ThreadState::Ready;
+    thread.task_id = 0;
+    thread.base_priority = priority;
+    thread.effective_priority = priority;
+    thread.prio.store(priority, Ordering::Relaxed);
+    thread.quantum = quantum;
+    thread.default_quantum = quantum;
+    thread.saved_sp = frame_sp as u64;
+    thread.stack_base = stack_base;
+    thread.sig_mask = 0;
+    thread.sig_pending = 0;
+
+    percpu_enqueue(smp::cpu_id(), priority, id);
+    Some(id)
+}
 
 /// Parent task info snapshot, taken under SPAWN_LOCK so that the heavy
 /// work phase (ELF loading, page table setup) can run without holding it.
@@ -703,7 +731,8 @@ fn do_spawn_heavy_work(
 ) -> Option<(u64, usize, u64, usize, u64, u64)> {
     // Create kernel-held ports for this task and its initial thread.
     let task_port = crate::ipc::port::create_kernel_port(task_port_handler, task_id as usize)?;
-    let thread_port = crate::ipc::port::create_kernel_port(thread_port_handler, thread_id as usize)?;
+    let thread_port =
+        crate::ipc::port::create_kernel_port(thread_port_handler, thread_id as usize)?;
     // Create a page table with kernel identity mapping.
     let pt_root = crate::mm::hat::create_user_page_table()?;
 
@@ -716,14 +745,17 @@ fn do_spawn_heavy_work(
         // Initialize this task's embedded capspace.
         {
             let tptr = TASK_TABLE.get(task_id) as *mut Task;
-            unsafe { (*tptr).capspace = crate::cap::CapSpace::new(task_id); }
+            unsafe {
+                (*tptr).capspace = crate::cap::CapSpace::new(task_id);
+            }
         }
         let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
         if nsrv != u64::MAX {
             crate::cap::grant_send_cap(task_id, nsrv);
         }
 
-        let iramfs = crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
+        let iramfs =
+            crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
         if iramfs != u64::MAX {
             crate::cap::grant_send_cap(task_id, iramfs);
         }
@@ -760,10 +792,12 @@ fn do_spawn_heavy_work(
     let stack_va = USER_STACK_TOP - stack_pages * PAGE_SIZE;
 
     let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-        let vma = aspace.map_anon(stack_va, stack_pages, crate::mm::vma::VmaProt::ReadWrite)
+        let vma = aspace
+            .map_anon(stack_va, stack_pages, crate::mm::vma::VmaProt::ReadWrite)
             .ok_or(())?;
         Ok::<_, ()>(vma.object_id)
-    }).ok()?;
+    })
+    .ok()?;
 
     // Eagerly allocate and map stack pages.
     let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
@@ -806,7 +840,14 @@ fn do_spawn_heavy_work(
         crate::arch::trapframe::init_user_frame(frame, entry as usize, USER_STACK_TOP, &[arg0]);
     }
 
-    Some((aspace_id, pt_root, frame_sp as u64, kstack_base, task_port, thread_port))
+    Some((
+        aspace_id,
+        pt_root,
+        frame_sp as u64,
+        kstack_base,
+        task_port,
+        thread_port,
+    ))
 }
 
 /// Phase 1 of user thread creation: allocate task/thread IDs and read parent info.
@@ -874,7 +915,9 @@ fn finalize_spawn(
 
     let thread = unsafe { thread_mut_from_ref(thread_id) };
     thread.killed.store(false, Ordering::Release);
-    thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
+    thread
+        .affinity_mask
+        .store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
 
     thread.id = thread_id;
@@ -929,7 +972,9 @@ fn create_thread_in_task(
 
     let thread = unsafe { thread_mut_from_ref(id) };
     thread.killed.store(false, Ordering::Release);
-    thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
+    thread
+        .affinity_mask
+        .store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
 
     thread.id = id;
@@ -1087,32 +1132,80 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
     };
 
     // Phase 2: heavy work (page tables, ELF load, etc.) without locks.
-    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
-        do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
+    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) = do_spawn_heavy_work(
+        task_id,
+        thread_id,
+        &parent,
+        elf_data,
+        priority,
+        quantum,
+        arg0,
+        arg0_is_port,
+    )?;
 
     // Duplicate groups overflow page for child.
-    if !dup_groups_overflow(&mut parent) { return None; }
+    if !dup_groups_overflow(&mut parent) {
+        return None;
+    }
 
     // Phase 3: finalize task/thread state.
     finalize_spawn(
-        task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base, task_port, thread_port,
+        task_id,
+        thread_id,
+        &parent,
+        aspace_id,
+        pt_root,
+        priority,
+        quantum,
+        frame_sp,
+        kstack_base,
+        task_port,
+        thread_port,
     );
     Some(thread_id)
 }
 
 /// Spawn a new user-mode process from ELF data already in kernel memory.
-pub fn spawn_user_from_elf(elf_data: &[u8], priority: u8, quantum: u32, arg0: u64) -> Option<ThreadId> {
+pub fn spawn_user_from_elf(
+    elf_data: &[u8],
+    priority: u8,
+    quantum: u32,
+    arg0: u64,
+) -> Option<ThreadId> {
     let arg0_is_port = arg0 > 0 && crate::ipc::port::port_is_active(arg0);
 
-    let (task_id, thread_id, mut parent) = { let _lock = SPAWN_LOCK.lock(); alloc_spawn_ids()? };
+    let (task_id, thread_id, mut parent) = {
+        let _lock = SPAWN_LOCK.lock();
+        alloc_spawn_ids()?
+    };
 
-    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
-        do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
+    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) = do_spawn_heavy_work(
+        task_id,
+        thread_id,
+        &parent,
+        elf_data,
+        priority,
+        quantum,
+        arg0,
+        arg0_is_port,
+    )?;
 
-    if !dup_groups_overflow(&mut parent) { return None; }
+    if !dup_groups_overflow(&mut parent) {
+        return None;
+    }
 
     finalize_spawn(
-        task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base, task_port, thread_port,
+        task_id,
+        thread_id,
+        &parent,
+        aspace_id,
+        pt_root,
+        priority,
+        quantum,
+        frame_sp,
+        kstack_base,
+        task_port,
+        thread_port,
     );
     Some(thread_id)
 }
@@ -1131,20 +1224,33 @@ pub fn spawn_user_with_data(
 
     let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
 
-    let (task_id, thread_id, mut parent) = { let _lock = SPAWN_LOCK.lock(); alloc_spawn_ids()? };
+    let (task_id, thread_id, mut parent) = {
+        let _lock = SPAWN_LOCK.lock();
+        alloc_spawn_ids()?
+    };
 
     // Phase 2: ELF load + stack setup WITHOUT SCHEDULER lock.
-    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
-        do_spawn_heavy_work(task_id, thread_id, &parent, elf_data, priority, quantum, arg0, arg0_is_port)?;
+    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) = do_spawn_heavy_work(
+        task_id,
+        thread_id,
+        &parent,
+        elf_data,
+        priority,
+        quantum,
+        arg0,
+        arg0_is_port,
+    )?;
 
     // Map data pages into the child's address space (still no SCHEDULER lock).
     let data_pages = (data.len() + PAGE_SIZE - 1) / PAGE_SIZE;
     if data_pages > 0 {
         let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-            let vma = aspace.map_anon(data_va, data_pages, crate::mm::vma::VmaProt::ReadOnly)
+            let vma = aspace
+                .map_anon(data_va, data_pages, crate::mm::vma::VmaProt::ReadOnly)
                 .ok_or(())?;
             Ok::<_, ()>(vma.object_id)
-        }).ok()?;
+        })
+        .ok()?;
 
         let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
         let sw_z = crate::mm::fault::sw_zeroed_bit();
@@ -1185,11 +1291,23 @@ pub fn spawn_user_with_data(
         crate::arch::trapframe::set_frame_arg(frame, 2, data.len() as u64);
     }
 
-    if !dup_groups_overflow(&mut parent) { return None; }
+    if !dup_groups_overflow(&mut parent) {
+        return None;
+    }
 
     // Phase 3: finalize under SCHEDULER lock.
     finalize_spawn(
-        task_id, thread_id, &parent, aspace_id, pt_root, priority, quantum, frame_sp, kstack_base, task_port, thread_port,
+        task_id,
+        thread_id,
+        &parent,
+        aspace_id,
+        pt_root,
+        priority,
+        quantum,
+        frame_sp,
+        kstack_base,
+        task_port,
+        thread_port,
     );
     Some(thread_id)
 }
@@ -1202,11 +1320,24 @@ pub fn thread_create(task_id: u32, entry: u64, stack_top: u64, arg: u64) -> Opti
         (caller.base_priority, caller.default_quantum)
     };
     // Allocate thread ID under SPAWN_LOCK.
-    let thread_id = { let _lock = SPAWN_LOCK.lock(); alloc_thread_id()? };
+    let thread_id = {
+        let _lock = SPAWN_LOCK.lock();
+        alloc_thread_id()?
+    };
     // Create kernel-held port for the new thread.
-    let thread_port = crate::ipc::port::create_kernel_port(thread_port_handler, thread_id as usize)?;
+    let thread_port =
+        crate::ipc::port::create_kernel_port(thread_port_handler, thread_id as usize)?;
     // Finalize thread creation.
-    let result = create_thread_in_task(task_id, thread_id, entry, stack_top, arg, priority, quantum, thread_port);
+    let result = create_thread_in_task(
+        task_id,
+        thread_id,
+        entry,
+        stack_top,
+        arg,
+        priority,
+        quantum,
+        thread_port,
+    );
     // Grant caps on the new thread's port.
     if result.is_some() {
         use crate::cap::capability::Rights;
@@ -1249,7 +1380,9 @@ pub fn thread_join_block(tid: ThreadId, caller_task: u32) -> u64 {
         // Safe: only one joiner per thread, and the target is alive.
         unsafe { thread_mut_from_ref(tid) }.join_waiter = caller_tid;
         // Clear wakeup flag before blocking.
-        thread_ref(caller_tid).wakeup.store(false, Ordering::Release);
+        thread_ref(caller_tid)
+            .wakeup
+            .store(false, Ordering::Release);
     }
     // Block until the target thread wakes us via exit_current_thread.
     block_current(BlockReason::FutexWait);
@@ -1261,7 +1394,9 @@ pub fn thread_join_block(tid: ThreadId, caller_task: u32) -> u64 {
 #[allow(dead_code)]
 pub fn current_task_id() -> TaskId {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
-    thread_ref(tid).thread_task.load(core::sync::atomic::Ordering::Relaxed)
+    thread_ref(tid)
+        .thread_task
+        .load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Get the page table root of the current thread's task.
@@ -1350,7 +1485,9 @@ fn try_switch(current_sp: u64) -> u64 {
     }
 
     // Clear yield_asap.
-    thread_ref(prev_id).yield_asap.store(false, Ordering::Release);
+    thread_ref(prev_id)
+        .yield_asap
+        .store(false, Ordering::Release);
 
     // Pick next thread from per-CPU queue.
     let prev_group = thread_ref(prev_id).cosched_group.load(Ordering::Relaxed);
@@ -1377,7 +1514,9 @@ fn try_switch(current_sp: u64) -> u64 {
         if prev_prio == 254 && prev_t.base_priority < 254 {
             if thread_ref(prev_id).wakeup.load(Ordering::Relaxed) {
                 prev_t.effective_priority = prev_t.base_priority;
-                thread_ref(prev_id).prio.store(prev_t.base_priority, Ordering::Relaxed);
+                thread_ref(prev_id)
+                    .prio
+                    .store(prev_t.base_priority, Ordering::Relaxed);
                 prev_prio = prev_t.base_priority;
             }
         }
@@ -1394,7 +1533,11 @@ fn try_switch(current_sp: u64) -> u64 {
         // Need task data — access via TASK_TABLE (lockless).
         let next_root = {
             let tptr = TASK_TABLE.get(next_task) as *const Task;
-            if !tptr.is_null() { unsafe { (*tptr).page_table_root } } else { 0 }
+            if !tptr.is_null() {
+                unsafe { (*tptr).page_table_root }
+            } else {
+                0
+            }
         };
         if next_root != 0 {
             crate::mm::hat::switch_page_table(next_root);
@@ -1581,7 +1724,9 @@ pub fn kill_task_by_id(task_id: TaskId) -> bool {
             Some(t) => t,
             None => return false,
         };
-        if !task.active { return false; }
+        if !task.active {
+            return false;
+        }
         SCHED_THREAD_ART.for_each(|key, val| {
             let t = unsafe { &*(val as *const Thread) };
             if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
@@ -1616,8 +1761,10 @@ pub fn kill_task_by_id(task_id: TaskId) -> bool {
 /// thread in the task that has the signal unmasked, or the first thread.
 /// SIGKILL always uses the old kill path (immediate termination).
 pub fn send_signal_to_task(task_id: u32, sig: u32) -> bool {
-    use super::task::{sig_bit, SIGKILL, SIGSTOP, UNCATCHABLE, MAX_SIGNALS};
-    if sig < 1 || sig > MAX_SIGNALS as u32 { return false; }
+    use super::task::{MAX_SIGNALS, SIGKILL, SIGSTOP, UNCATCHABLE, sig_bit};
+    if sig < 1 || sig > MAX_SIGNALS as u32 {
+        return false;
+    }
     if sig == SIGKILL {
         return kill_task_by_id(task_id);
     }
@@ -1629,13 +1776,14 @@ pub fn send_signal_to_task(task_id: u32, sig: u32) -> bool {
         Some(t) => t,
         None => return false,
     };
-    if !task.active { return false; }
+    if !task.active {
+        return false;
+    }
     let action = &task.sig_actions[(sig - 1) as usize];
     if action.handler == super::task::SigHandler::Ignore {
         return true; // accepted but ignored
     }
-    if action.handler == super::task::SigHandler::Default
-        && !super::task::sig_default_is_term(sig)
+    if action.handler == super::task::SigHandler::Default && !super::task::sig_default_is_term(sig)
     {
         return true;
     }
@@ -1644,10 +1792,14 @@ pub fn send_signal_to_task(task_id: u32, sig: u32) -> bool {
     let mut target: Option<u32> = None;
     let mut any_thread: Option<u32> = None;
     SCHED_THREAD_ART.for_each(|key, val| {
-        if target.is_some() { return; }
+        if target.is_some() {
+            return;
+        }
         let t = unsafe { &*(val as *const Thread) };
         if t.task_id == task_id && t.state != ThreadState::Dead && t.stack_base != 0 {
-            if any_thread.is_none() { any_thread = Some(key as u32); }
+            if any_thread.is_none() {
+                any_thread = Some(key as u32);
+            }
             if t.sig_mask & bit == 0 {
                 target = Some(key as u32);
             }
@@ -1668,9 +1820,13 @@ pub fn send_signal_to_task(task_id: u32, sig: u32) -> bool {
 
 /// Send a signal to a specific thread.
 pub fn send_signal_to_thread(tid: ThreadId, sig: u32) -> bool {
-    use super::task::{sig_bit, SIGKILL, MAX_SIGNALS};
-    if sig < 1 || sig > MAX_SIGNALS as u32 { return false; }
-    if tid as usize >= RadixTable::capacity() { return false; }
+    use super::task::{MAX_SIGNALS, SIGKILL, sig_bit};
+    if sig < 1 || sig > MAX_SIGNALS as u32 {
+        return false;
+    }
+    if tid as usize >= RadixTable::capacity() {
+        return false;
+    }
     if sig == SIGKILL {
         return kill_task(tid);
     }
@@ -1680,7 +1836,9 @@ pub fn send_signal_to_thread(tid: ThreadId, sig: u32) -> bool {
         Some(t) => t,
         None => return false,
     };
-    if t.state == ThreadState::Dead || t.stack_base == 0 { return false; }
+    if t.state == ThreadState::Dead || t.stack_base == 0 {
+        return false;
+    }
     // Safe: sig_pending is only ORed (single-bit set, no lost updates).
     unsafe { thread_mut_from_ref(tid) }.sig_pending |= bit;
     wake_thread(tid);
@@ -1693,7 +1851,9 @@ pub fn dequeue_signal() -> Option<u32> {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let t = thread_ref(tid);
     let deliverable = t.sig_pending & !t.sig_mask;
-    if deliverable == 0 { return None; }
+    if deliverable == 0 {
+        return None;
+    }
     // Find lowest-numbered signal.
     let bit_idx = deliverable.trailing_zeros();
     let sig = bit_idx + 1;
@@ -1707,15 +1867,24 @@ pub fn get_signal_action(sig: u32) -> Option<super::task::SignalAction> {
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let task_id = thread_ref(tid).task_id;
     let task = task_ref(task_id);
-    if sig < 1 || sig > super::task::MAX_SIGNALS as u32 { return None; }
+    if sig < 1 || sig > super::task::MAX_SIGNALS as u32 {
+        return None;
+    }
     Some(task.sig_actions[(sig - 1) as usize])
 }
 
 /// Set signal action for the current task. Returns previous action.
-pub fn set_signal_action(sig: u32, action: super::task::SignalAction) -> Option<super::task::SignalAction> {
-    use super::task::{UNCATCHABLE, MAX_SIGNALS, sig_bit};
-    if sig < 1 || sig > MAX_SIGNALS as u32 { return None; }
-    if sig_bit(sig) & UNCATCHABLE != 0 { return None; } // can't change SIGKILL/SIGSTOP
+pub fn set_signal_action(
+    sig: u32,
+    action: super::task::SignalAction,
+) -> Option<super::task::SignalAction> {
+    use super::task::{MAX_SIGNALS, UNCATCHABLE, sig_bit};
+    if sig < 1 || sig > MAX_SIGNALS as u32 {
+        return None;
+    }
+    if sig_bit(sig) & UNCATCHABLE != 0 {
+        return None;
+    } // can't change SIGKILL/SIGSTOP
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     let task_id = thread_ref(tid).task_id;
     let old = task_ref(task_id).sig_actions[(sig - 1) as usize];
@@ -1759,7 +1928,7 @@ pub fn setpgid(pid: u32, pgid: u32) -> u64 {
     let target_task = if pid == 0 { my_task } else { pid };
 
     match task_ref_opt(target_task) {
-        Some(t) if t.active => {},
+        Some(t) if t.active => {}
         _ => return u64::MAX,
     }
     if target_task != my_task && task_ref(target_task).parent_task != my_task {
@@ -1772,13 +1941,17 @@ pub fn setpgid(pid: u32, pgid: u32) -> u64 {
     if new_pgid != target_task {
         let mut found = false;
         SCHED_TASK_ART.for_each(|_key, val| {
-            if found { return; }
+            if found {
+                return;
+            }
             let t = unsafe { &*(val as *const Task) };
             if t.active && t.sid == target_sid && t.pgid == new_pgid {
                 found = true;
             }
         });
-        if !found { return u64::MAX; }
+        if !found {
+            return u64::MAX;
+        }
     }
 
     // Safe: only the owning task or its parent modifies pgid.
@@ -1814,13 +1987,17 @@ pub fn setsid() -> u64 {
     if current_pgid == my_task {
         let mut conflict = false;
         SCHED_TASK_ART.for_each(|_key, val| {
-            if conflict { return; }
+            if conflict {
+                return;
+            }
             let t = unsafe { &*(val as *const Task) };
             if t.active && t.id != my_task && t.pgid == my_task {
                 conflict = true;
             }
         });
-        if conflict { return u64::MAX; }
+        if conflict {
+            return u64::MAX;
+        }
     }
 
     // Safe: only the current task modifies its own session/pgroup.
@@ -1855,18 +2032,24 @@ pub fn tcsetpgrp(pgid: u32) -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
     let my_task = thread_ref(my_tid).task_id;
 
-    if task_ref(my_task).ctty_port == 0 { return u64::MAX; }
+    if task_ref(my_task).ctty_port == 0 {
+        return u64::MAX;
+    }
 
     let my_sid = task_ref(my_task).sid;
     let mut found = false;
     SCHED_TASK_ART.for_each(|_key, val| {
-        if found { return; }
+        if found {
+            return;
+        }
         let t = unsafe { &*(val as *const Task) };
         if t.active && t.sid == my_sid && t.pgid == pgid {
             found = true;
         }
     });
-    if !found { return u64::MAX; }
+    if !found {
+        return u64::MAX;
+    }
 
     // Store the foreground pgid in the session leader.
     // Safe: only tasks in the session modify fg_pgid, serialized by convention.
@@ -1884,12 +2067,16 @@ pub fn tcgetpgrp() -> u64 {
     let my_tid = smp::current().current_thread.load(Ordering::Relaxed);
     let my_task = thread_ref(my_tid).task_id;
 
-    if task_ref(my_task).ctty_port == 0 { return u64::MAX; }
+    if task_ref(my_task).ctty_port == 0 {
+        return u64::MAX;
+    }
 
     let my_sid = task_ref(my_task).sid;
     let mut raw_pgid = u32::MAX;
     SCHED_TASK_ART.for_each(|_key, val| {
-        if raw_pgid != u32::MAX { return; }
+        if raw_pgid != u32::MAX {
+            return;
+        }
         let t = unsafe { &*(val as *const Task) };
         if t.active && t.id == my_sid {
             raw_pgid = t.fg_pgid;
@@ -1906,7 +2093,9 @@ pub fn tcgetpgrp() -> u64 {
 /// Send a signal to all tasks in a process group.
 pub fn send_signal_to_pgroup(pgid: u32, sig: u32) -> bool {
     use super::task::MAX_SIGNALS;
-    if sig < 1 || sig > MAX_SIGNALS as u32 { return false; }
+    if sig < 1 || sig > MAX_SIGNALS as u32 {
+        return false;
+    }
 
     let mut task_ids = [0u32; 64];
     let mut count = 0usize;
@@ -1918,7 +2107,9 @@ pub fn send_signal_to_pgroup(pgid: u32, sig: u32) -> bool {
         }
     });
 
-    if count == 0 { return false; }
+    if count == 0 {
+        return false;
+    }
 
     let mut any = false;
     for i in 0..count {
@@ -1969,7 +2160,9 @@ pub fn kill_other_threads_in_task() -> usize {
     let mut killed = 0;
 
     SCHED_THREAD_ART.for_each(|key, val| {
-        if key == my_tid as u64 { return; }
+        if key == my_tid as u64 {
+            return;
+        }
         let t = unsafe { &mut *(val as *mut Thread) };
         if t.task_id == task_id && t.state != ThreadState::Dead {
             t.state = ThreadState::Dead;
@@ -2022,7 +2215,9 @@ pub fn fork_current() -> u64 {
         if nproc_limit != super::task::RLIM_INFINITY {
             let mut count = 0u64;
             SCHED_TASK_ART.for_each(|key, val| {
-                if key == 0 { return; }
+                if key == 0 {
+                    return;
+                }
                 let t = unsafe { &*(val as *const Task) };
                 if t.active && t.uid == uid {
                     count += 1;
@@ -2035,16 +2230,31 @@ pub fn fork_current() -> u64 {
     }
 
     // Gather parent info (lock-free).
-    let (parent_tid, parent_task_id, parent_aspace_id, parent_priority, parent_quantum, parent_sig_mask) = {
+    let (
+        parent_tid,
+        parent_task_id,
+        parent_aspace_id,
+        parent_priority,
+        parent_quantum,
+        parent_sig_mask,
+    ) = {
         let tid = smp::current().current_thread.load(Ordering::Relaxed);
         let thread = thread_ref(tid);
         let task = task_ref(thread.task_id);
-        (tid, thread.task_id, task.aspace_id, thread.base_priority, thread.default_quantum, thread.sig_mask)
+        (
+            tid,
+            thread.task_id,
+            task.aspace_id,
+            thread.base_priority,
+            thread.default_quantum,
+            thread.sig_mask,
+        )
     };
 
     // Clone the address space (COW). This is done outside the scheduler lock
     // because it acquires ASPACES and OBJECTS locks.
-    let (child_aspace_id, child_pt_root) = match crate::mm::aspace::clone_for_cow(parent_aspace_id) {
+    let (child_aspace_id, child_pt_root) = match crate::mm::aspace::clone_for_cow(parent_aspace_id)
+    {
         Some(x) => x,
         None => return u64::MAX,
     };
@@ -2055,44 +2265,66 @@ pub fn fork_current() -> u64 {
 
     // Create child task and thread under the scheduler lock.
     // Snapshot parent groups + credentials while holding lock.
-    let (child_task_id, parent_pgid, parent_sid, parent_ctty,
-         parent_uid, parent_euid, parent_gid, parent_egid,
-         parent_groups_inline, parent_groups_overflow, parent_ngroups,
-         parent_rlimits) = {
+    let (
+        child_task_id,
+        parent_pgid,
+        parent_sid,
+        parent_ctty,
+        parent_uid,
+        parent_euid,
+        parent_gid,
+        parent_egid,
+        parent_groups_inline,
+        parent_groups_overflow,
+        parent_ngroups,
+        parent_rlimits,
+    ) = {
         let _lock = SPAWN_LOCK.lock();
         let child_task_id = match alloc_task_id() {
             Some(id) => id,
             None => return u64::MAX,
         };
         let ptask = task_ref(parent_task_id);
-        (child_task_id, ptask.pgid, ptask.sid, ptask.ctty_port,
-         ptask.uid, ptask.euid, ptask.gid, ptask.egid,
-         ptask.groups_inline, ptask.groups_overflow, ptask.ngroups,
-         ptask.rlimits)
+        (
+            child_task_id,
+            ptask.pgid,
+            ptask.sid,
+            ptask.ctty_port,
+            ptask.uid,
+            ptask.euid,
+            ptask.gid,
+            ptask.egid,
+            ptask.groups_inline,
+            ptask.groups_overflow,
+            ptask.ngroups,
+            ptask.rlimits,
+        )
     };
 
     // Outside SCHEDULER lock: create task port + duplicate groups overflow page.
-    let child_task_port = match crate::ipc::port::create_kernel_port(task_port_handler, child_task_id as usize) {
-        Some(p) => p,
-        None => return u64::MAX,
-    };
-    let child_groups_overflow = if parent_ngroups as usize > GROUPS_INLINE && parent_groups_overflow != 0 {
-        match crate::mm::phys::alloc_page() {
-            Some(p) => {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        parent_groups_overflow as *const u8,
-                        p.as_usize() as *mut u8,
-                        parent_ngroups as usize * core::mem::size_of::<u32>(),
-                    );
-                }
-                p.as_usize()
-            }
+    let child_task_port =
+        match crate::ipc::port::create_kernel_port(task_port_handler, child_task_id as usize) {
+            Some(p) => p,
             None => return u64::MAX,
-        }
-    } else {
-        0
-    };
+        };
+    let child_groups_overflow =
+        if parent_ngroups as usize > GROUPS_INLINE && parent_groups_overflow != 0 {
+            match crate::mm::phys::alloc_page() {
+                Some(p) => {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            parent_groups_overflow as *const u8,
+                            p.as_usize() as *mut u8,
+                            parent_ngroups as usize * core::mem::size_of::<u32>(),
+                        );
+                    }
+                    p.as_usize()
+                }
+                None => return u64::MAX,
+            }
+        } else {
+            0
+        };
     // Set up child task.
     {
         let task = unsafe { task_mut_from_ref(child_task_id) };
@@ -2130,14 +2362,17 @@ pub fn fork_current() -> u64 {
         // Initialize child's embedded capspace.
         {
             let tptr = TASK_TABLE.get(child_task_id) as *mut Task;
-            unsafe { (*tptr).capspace = crate::cap::CapSpace::new(child_task_id); }
+            unsafe {
+                (*tptr).capspace = crate::cap::CapSpace::new(child_task_id);
+            }
         }
         // Grant SEND caps for well-known kernel ports.
         let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
         if nsrv != u64::MAX {
             crate::cap::grant_send_cap(child_task_id, nsrv);
         }
-        let iramfs = crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
+        let iramfs =
+            crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
         if iramfs != u64::MAX {
             crate::cap::grant_send_cap(child_task_id, iramfs);
         }
@@ -2169,24 +2404,31 @@ pub fn fork_current() -> u64 {
 
     // Set child's return value to 0.
     {
-        let child_frame = unsafe { &mut *(child_frame_sp as *mut crate::syscall::handlers::ExceptionFrame) };
+        let child_frame =
+            unsafe { &mut *(child_frame_sp as *mut crate::syscall::handlers::ExceptionFrame) };
         crate::syscall::handlers::set_return(child_frame, 0);
     }
 
     // Allocate child thread ID under SPAWN_LOCK.
-    let child_tid = match { let _lock = SPAWN_LOCK.lock(); alloc_thread_id() } {
+    let child_tid = match {
+        let _lock = SPAWN_LOCK.lock();
+        alloc_thread_id()
+    } {
         Some(id) => id,
         None => return u64::MAX,
     };
-    let child_thread_port = match crate::ipc::port::create_kernel_port(thread_port_handler, child_tid as usize) {
-        Some(p) => p,
-        None => return u64::MAX,
-    };
+    let child_thread_port =
+        match crate::ipc::port::create_kernel_port(thread_port_handler, child_tid as usize) {
+            Some(p) => p,
+            None => return u64::MAX,
+        };
 
     // Clear killed/affinity flags.
     let thread = unsafe { thread_mut_from_ref(child_tid) };
     thread.killed.store(false, Ordering::Release);
-    thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
+    thread
+        .affinity_mask
+        .store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
 
     thread.id = child_tid;
@@ -2223,7 +2465,16 @@ pub fn fork_current() -> u64 {
 /// Terminate the current thread and destroy its task's resources.
 /// This function never returns.
 pub fn exit_current_thread(exit_code: i32) -> ! {
-    let (tid, is_last_thread, aspace_id, pt_root, kstack_base, parent_task_id, task_port, thread_port) = {
+    let (
+        tid,
+        is_last_thread,
+        aspace_id,
+        pt_root,
+        kstack_base,
+        parent_task_id,
+        task_port,
+        thread_port,
+    ) = {
         let pcpu = smp::current();
         let tid = pcpu.current_thread.load(Ordering::Relaxed);
         // Safe: we are the running thread; no contention on our own state.
@@ -2262,7 +2513,16 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         }
         let aspace_id = task.aspace_id;
         let pt_root = task.page_table_root;
-        (tid, is_last, aspace_id, pt_root, kstack_base, parent_task_id, task_port, thread_port)
+        (
+            tid,
+            is_last,
+            aspace_id,
+            pt_root,
+            kstack_base,
+            parent_task_id,
+            task_port,
+            thread_port,
+        )
     };
 
     // Clean up turnstile state: dequeue from any wait queue, free pre-allocated turnstile.
@@ -2298,7 +2558,9 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         {
             let exit_task_id = thread_ref(tid).task_id;
             let tptr = TASK_TABLE.get(exit_task_id) as *mut Task;
-            unsafe { (*tptr).free_groups_overflow(); }
+            unsafe {
+                (*tptr).free_groups_overflow();
+            }
         }
 
         // Destroy address space (frees VMAs and backing physical pages).
@@ -2323,7 +2585,9 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         let mut nz = 0usize;
         // Lock-free: only the parent task reaps its zombie children.
         SCHED_TASK_ART.for_each(|key, val| {
-            if key == 0 { return; }
+            if key == 0 {
+                return;
+            }
             let task = unsafe { &mut *(val as *mut Task) };
             if task.parent_task == my_task_id && task.exited && !task.reaped {
                 task.reaped = true;
@@ -2356,7 +2620,9 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     // needs a valid stack, and spin_loop() is purely in-register.
     let tid = smp::current().current_thread.load(Ordering::Relaxed);
     thread_ref(tid).yield_asap.store(true, Ordering::Release);
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 // --- IRQ helpers for blocking paths (delegate to arch::irq) ---
@@ -2391,7 +2657,9 @@ pub fn waitpid(child_task_id: TaskId) -> Option<i32> {
         Some(t) => t,
         None => return None,
     };
-    if !task.exited { return None; }
+    if !task.exited {
+        return None;
+    }
     let port_id = task.port_id;
     let code = task.exit_code;
     // Safe: only the parent reaps a child, and only once.
@@ -2417,7 +2685,8 @@ fn wake_wait_child_threads(task_id: TaskId) {
     let mut count = 0usize;
     SCHED_THREAD_ART.for_each(|key, val| {
         let t = unsafe { &*(val as *const Thread) };
-        if t.task_id == task_id && t.state != ThreadState::Dead
+        if t.task_id == task_id
+            && t.state != ThreadState::Dead
             && t.stack_base != 0
             && t.blocked_on == BlockReason::WaitChild
         {
@@ -2453,19 +2722,27 @@ pub fn wait4(pid: i64, flags: u32) -> (u64, i32, i32) {
         let mut found: Option<(u32, i32)> = None;
         let mut has_children = false;
         SCHED_TASK_ART.for_each(|key, val| {
-            if found.is_some() { return; }
-            if key == 0 { return; }
+            if found.is_some() {
+                return;
+            }
+            if key == 0 {
+                return;
+            }
             let task = unsafe { &*(val as *const Task) };
-            if task.parent_task != my_task_id { return; }
+            if task.parent_task != my_task_id {
+                return;
+            }
 
             // Check pid filter.
             let matches = match pid {
-                -1 => true,                    // any child
-                0 => task.pgid == my_pgid,     // same pgroup
+                -1 => true,                           // any child
+                0 => task.pgid == my_pgid,            // same pgroup
                 p if p > 0 => task.id == p as TaskId, // specific task
-                p => task.pgid == (-p) as TaskId, // specific pgroup
+                p => task.pgid == (-p) as TaskId,     // specific pgroup
             };
-            if !matches { return; }
+            if !matches {
+                return;
+            }
             has_children = true;
 
             if task.exited && !task.reaped {
@@ -2504,8 +2781,14 @@ pub fn boost_priority(tid: ThreadId, to_prio: u8) {
     // CAS loop: only boost if current prio is lower (higher number).
     loop {
         let cur = tref.prio.load(Ordering::Relaxed);
-        if to_prio >= cur { break; } // already at equal or higher priority
-        if tref.prio.compare_exchange_weak(cur, to_prio, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+        if to_prio >= cur {
+            break;
+        } // already at equal or higher priority
+        if tref
+            .prio
+            .compare_exchange_weak(cur, to_prio, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
             unsafe { thread_mut_from_ref(tid) }.effective_priority = to_prio;
             break;
         }
@@ -2588,7 +2871,11 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     if prev_task != next_task {
         let next_root = {
             let tptr = TASK_TABLE.get(next_task) as *const Task;
-            if !tptr.is_null() { unsafe { (*tptr).page_table_root } } else { 0 }
+            if !tptr.is_null() {
+                unsafe { (*tptr).page_table_root }
+            } else {
+                0
+            }
         };
         if next_root != 0 {
             crate::mm::hat::switch_page_table(next_root);
@@ -2681,7 +2968,9 @@ fn sleep_queue_insert(tid: ThreadId, deadline_ns: u64) {
 fn sleep_queue_remove(tid: ThreadId) {
     let _guard = SLEEP_QUEUE_LOCK.lock();
     let head = SLEEP_QUEUE_HEAD.load(Ordering::Relaxed);
-    if head == u32::MAX { return; }
+    if head == u32::MAX {
+        return;
+    }
 
     // Find and unlink.
     let mut prev: u32 = u32::MAX;
@@ -2714,9 +3003,13 @@ fn check_sleep_timers() {
     // Fast path: peek at the head without locking. If the earliest deadline
     // hasn't passed, no work to do.
     let head = SLEEP_QUEUE_HEAD.load(Ordering::Acquire);
-    if head == u32::MAX { return; }
+    if head == u32::MAX {
+        return;
+    }
     let head_deadline = unsafe { thread_mut_from_ref(head) }.sleep_deadline_ns;
-    if head_deadline > now_ns { return; }
+    if head_deadline > now_ns {
+        return;
+    }
 
     // Drain expired entries from the head of the sorted list.
     let mut to_wake: [(ThreadId, u8, u32); 64] = [(0, 0, 0); 64];
@@ -2726,7 +3019,9 @@ fn check_sleep_timers() {
         let mut cur = SLEEP_QUEUE_HEAD.load(Ordering::Relaxed);
         while cur != u32::MAX && count < 64 {
             let t = unsafe { thread_mut_from_ref(cur) };
-            if t.sleep_deadline_ns > now_ns { break; } // sorted: rest are later
+            if t.sleep_deadline_ns > now_ns {
+                break;
+            } // sorted: rest are later
             let next = t.sleep_next;
             let target = t.last_cpu.load(Ordering::Relaxed);
             to_wake[count] = (cur, t.effective_priority, target);
@@ -2759,10 +3054,7 @@ fn check_alarm_timers() {
     // or by this tick path; no concurrent mutation.
     SCHED_TASK_ART.for_each(|_key, val| {
         let task = unsafe { &mut *(val as *mut Task) };
-        if task.active
-            && task.alarm_deadline_ns != 0
-            && task.alarm_deadline_ns <= now_ns
-        {
+        if task.active && task.alarm_deadline_ns != 0 && task.alarm_deadline_ns <= now_ns {
             if task.alarm_interval_ns != 0 {
                 task.alarm_deadline_ns = now_ns + task.alarm_interval_ns;
             } else {
@@ -2791,7 +3083,9 @@ fn check_interval_timers() {
     // Lock-free: timer fields are only written by the owning thread
     // (sys_timer_create) or by this tick path.
     SCHED_THREAD_ART.for_each(|key, val| {
-        if found { return; }
+        if found {
+            return;
+        }
         let t = unsafe { &*(val as *const Thread) };
         if t.state != ThreadState::Dead
             && t.stack_base != 0
@@ -2852,7 +3146,11 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     if prev_task != next_task {
         let next_root = {
             let tptr = TASK_TABLE.get(next_task) as *const Task;
-            if !tptr.is_null() { unsafe { (*tptr).page_table_root } } else { 0 }
+            if !tptr.is_null() {
+                unsafe { (*tptr).page_table_root }
+            } else {
+                0
+            }
         };
         if next_root != 0 {
             crate::mm::hat::switch_page_table(next_root);
@@ -2947,7 +3245,11 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     if sender_task != recv_task {
         let next_root = {
             let tptr = TASK_TABLE.get(recv_task) as *const Task;
-            if !tptr.is_null() { unsafe { (*tptr).page_table_root } } else { 0 }
+            if !tptr.is_null() {
+                unsafe { (*tptr).page_table_root }
+            } else {
+                0
+            }
         };
         if next_root != 0 {
             crate::mm::hat::switch_page_table(next_root);
@@ -2977,7 +3279,9 @@ pub fn handoff_to(receiver_tid: ThreadId) {
 /// Register the current task for scheduler activations.
 pub fn sa_register() {
     let task_id = current_task_id();
-    if task_id == 0 { return; }
+    if task_id == 0 {
+        return;
+    }
     // Safe: only the current task modifies its own sa_enabled.
     unsafe { task_mut_from_ref(task_id) }.sa_enabled = true;
 }
@@ -2986,10 +3290,14 @@ pub fn sa_register() {
 /// Returns the blocked kthread's TID, or u64::MAX on error.
 pub fn sa_wait() -> u64 {
     let task_id = current_task_id();
-    if task_id == 0 { return u64::MAX; }
+    if task_id == 0 {
+        return u64::MAX;
+    }
 
     let tptr = TASK_TABLE.get(task_id) as *mut Task;
-    if tptr.is_null() { return u64::MAX; }
+    if tptr.is_null() {
+        return u64::MAX;
+    }
     let task = unsafe { &*tptr };
 
     // Fast path: event already pending.
@@ -3023,12 +3331,15 @@ pub fn sa_getid() -> u64 {
     let mut idx = 0u64;
     let mut found = false;
     SCHED_THREAD_ART.for_each(|key, val| {
-        if found { return; }
+        if found {
+            return;
+        }
         let t = unsafe { &*(val as *const Thread) };
-        if t.task_id == task_id && t.state != ThreadState::Dead
-            && (t.stack_base != 0 || key == 0)
-        {
-            if key as u32 == tid { found = true; return; }
+        if t.task_id == task_id && t.state != ThreadState::Dead && (t.stack_base != 0 || key == 0) {
+            if key as u32 == tid {
+                found = true;
+                return;
+            }
             idx += 1;
         }
     });
@@ -3038,7 +3349,9 @@ pub fn sa_getid() -> u64 {
 /// Set the coscheduling group for the current thread. group=0 removes from any group.
 pub fn cosched_set(group: u32) {
     let tid = current_thread_id();
-    thread_ref(tid).cosched_group.store(group, Ordering::Relaxed);
+    thread_ref(tid)
+        .cosched_group
+        .store(group, Ordering::Relaxed);
 }
 
 /// Set CPU affinity mask for a thread. Returns true on success.
@@ -3047,7 +3360,9 @@ pub fn set_affinity(tid: u32, mask: u64) -> bool {
     if (tid as usize) >= RadixTable::capacity() || mask == 0 {
         return false;
     }
-    thread_ref(tid).affinity_mask.store_mask(&cpumask::CpuMask::from_u64(mask), Ordering::Relaxed);
+    thread_ref(tid)
+        .affinity_mask
+        .store_mask(&cpumask::CpuMask::from_u64(mask), Ordering::Relaxed);
     true
 }
 
@@ -3057,5 +3372,8 @@ pub fn get_affinity(tid: u32) -> u64 {
     if (tid as usize) >= RadixTable::capacity() {
         return 0;
     }
-    thread_ref(tid).affinity_mask.load_mask(Ordering::Relaxed).as_u64()
+    thread_ref(tid)
+        .affinity_mask
+        .load_mask(Ordering::Relaxed)
+        .as_u64()
 }

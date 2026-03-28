@@ -55,13 +55,17 @@ pub fn restore(saved: usize) {
     #[cfg(target_arch = "riscv64")]
     {
         if saved & 0x2 != 0 {
-            unsafe { core::arch::asm!("csrsi sstatus, 0x2"); }
+            unsafe {
+                core::arch::asm!("csrsi sstatus, 0x2");
+            }
         }
     }
     #[cfg(target_arch = "x86_64")]
     {
         if saved & 0x200 != 0 {
-            unsafe { core::arch::asm!("sti"); }
+            unsafe {
+                core::arch::asm!("sti");
+            }
         }
     }
 }
@@ -70,11 +74,17 @@ pub fn restore(saved: usize) {
 #[inline(always)]
 pub fn enable() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("msr daifclr, #2", "isb"); }
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", "isb");
+    }
     #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("csrsi sstatus, 0x2"); }
+    unsafe {
+        core::arch::asm!("csrsi sstatus, 0x2");
+    }
     #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::asm!("sti"); }
+    unsafe {
+        core::arch::asm!("sti");
+    }
 }
 
 /// Save current interrupt state and enable IRQs. Returns opaque saved state.
@@ -123,18 +133,26 @@ pub fn save_and_enable() -> usize {
 #[inline(always)]
 pub fn wait_for_interrupt() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("wfi"); }
+    unsafe {
+        core::arch::asm!("wfi");
+    }
     #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("wfi"); }
+    unsafe {
+        core::arch::asm!("wfi");
+    }
     #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::asm!("hlt"); }
+    unsafe {
+        core::arch::asm!("hlt");
+    }
 }
 
 /// Send an event to all CPUs (SEV on AArch64, no-op elsewhere).
 #[inline(always)]
 pub fn send_event() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("sev"); }
+    unsafe {
+        core::arch::asm!("sev");
+    }
 }
 
 /// Enable a device IRQ in the platform interrupt controller (GIC/PLIC/PIC).
@@ -154,20 +172,32 @@ pub fn enable_device_irq(irq: u32) {
 #[inline]
 pub fn normalize_irq(irq: u32) -> usize {
     #[cfg(target_arch = "aarch64")]
-    { (irq - 48) as usize }
+    {
+        (irq - 48) as usize
+    }
     #[cfg(target_arch = "riscv64")]
-    { (irq - 1) as usize }
+    {
+        (irq - 1) as usize
+    }
     #[cfg(target_arch = "x86_64")]
-    { irq as usize }
+    {
+        irq as usize
+    }
 }
 
 /// Valid device IRQ range (inclusive) for userspace IRQ wait.
 #[inline]
 pub const fn valid_irq_range() -> (u32, u32) {
     #[cfg(target_arch = "aarch64")]
-    { (48, 79) }
+    {
+        (48, 79)
+    }
     #[cfg(target_arch = "riscv64")]
-    { (1, 8) }
+    {
+        (1, 8)
+    }
     #[cfg(target_arch = "x86_64")]
-    { (1, 15) }
+    {
+        (1, 15)
+    }
 }

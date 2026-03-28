@@ -249,7 +249,11 @@ fn resolve_entry(id: ObjectId) -> Option<*const ObjEntry> {
 }
 
 /// Kernel port handler for memory objects (stub).
-fn object_port_handler(_port_id: PortId, _user_data: usize, _msg: &crate::ipc::Message) -> crate::ipc::Message {
+fn object_port_handler(
+    _port_id: PortId,
+    _user_data: usize,
+    _msg: &crate::ipc::Message,
+) -> crate::ipc::Message {
     crate::ipc::Message::empty()
 }
 
@@ -386,9 +390,11 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
     {
         let src = unsafe { (*src_entry).inner.lock() };
         super::cowgroup::add_fork_epoch_to_extents(
-            group_port, src_id, kernel_port, page_count, |idx| {
-                src.pages.get(idx) != 0
-            },
+            group_port,
+            src_id,
+            kernel_port,
+            page_count,
+            |idx| src.pages.get(idx) != 0,
         );
     }
 
@@ -420,7 +426,9 @@ pub fn destroy(id: ObjectId) {
         // Fast path: no COW group — all pages are exclusively owned.
         for p in 0..page_count {
             let pa = guard.pages.get(p);
-            if pa == 0 { continue; }
+            if pa == 0 {
+                continue;
+            }
             guard.pages.set(p, 0);
             phys::free_page(PhysAddr::new(pa));
         }
@@ -435,13 +443,18 @@ pub fn destroy(id: ObjectId) {
 
             // Ask the group which pages in this range should be freed.
             let free_mask = super::cowgroup::pages_to_free_on_destroy(
-                cow_group_port, id, base as u32, range_count as u8,
+                cow_group_port,
+                id,
+                base as u32,
+                range_count as u8,
             );
 
             for slot in 0..range_count {
                 let p = base + slot;
                 let pa = guard.pages.get(p);
-                if pa == 0 { continue; }
+                if pa == 0 {
+                    continue;
+                }
                 guard.pages.set(p, 0);
 
                 if free_mask & (1u64 << slot) != 0 {
@@ -492,7 +505,12 @@ where
         Some(p) => p,
         None => {
             let caller = core::panic::Location::caller();
-            panic!("with_object: invalid ObjectId {} at {}:{}", id, caller.file(), caller.line());
+            panic!(
+                "with_object: invalid ObjectId {} at {}:{}",
+                id,
+                caller.file(),
+                caller.line()
+            );
         }
     };
     let mut guard = unsafe { (*entry_ptr).inner.lock() };
@@ -552,7 +570,9 @@ pub fn release_page(obj_id: ObjectId, page_idx: usize) -> bool {
 
     let mut guard = unsafe { (*entry_ptr).inner.lock() };
     let pa = guard.pages.get(page_idx);
-    if pa == 0 { return false; }
+    if pa == 0 {
+        return false;
+    }
     let cow_group_port = guard.cow_group_port;
     guard.pages.set(page_idx, 0);
     drop(guard);
@@ -568,6 +588,10 @@ pub fn release_page(obj_id: ObjectId, page_idx: usize) -> bool {
     let super_base = (page_idx & !(SUPERPAGE_ALLOC_PAGES - 1)) as u32;
     let slot = page_idx - super_base as usize;
     super::cowgroup::release_shared_page(
-        cow_group_port, obj_id, super_base, slot, PhysAddr::new(pa),
+        cow_group_port,
+        obj_id,
+        super_base,
+        slot,
+        PhysAddr::new(pa),
     )
 }

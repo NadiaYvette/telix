@@ -1,17 +1,29 @@
-pub mod thread;
-pub mod task;
-pub mod scheduler;
-pub mod radix;
 pub mod cpumask;
+pub mod hotplug;
+pub mod radix;
+pub mod scheduler;
 pub mod smp;
 pub mod stats;
+pub mod task;
+pub mod thread;
 pub mod topology;
-pub mod hotplug;
 
 #[allow(unused_imports)]
-pub use scheduler::{init, spawn, spawn_user, spawn_user_from_elf, spawn_user_with_data, tick, current_thread_id, current_aspace_id, clear_wakeup_flag, block_current, wake_thread, boost_priority, reset_priority, thread_effective_priority, arch_irq_save_enable, arch_irq_restore, thread_create, thread_join_poll, thread_join_block, is_killed, kill_task, current_task_id, thread_task_id, sa_register, sa_wait, sa_getid, cosched_set, set_affinity, get_affinity, send_signal_to_task, send_signal_to_thread, dequeue_signal, get_signal_action, set_signal_action, set_signal_mask, get_signal_mask, get_signal_pending, setpgid, getpgid, setsid, getsid, tcsetpgrp, tcgetpgrp, send_signal_to_pgroup, set_ctty, get_monotonic_ns, park_current_for_sleep, alarm};
+pub use hotplug::{
+    cpu_load, cpu_offline, cpu_online, online_affinity_mask, online_mask, pick_packed_cpu,
+};
 #[allow(unused_imports)]
-pub use hotplug::{cpu_offline, cpu_online, cpu_load, online_mask, pick_packed_cpu, online_affinity_mask};
+pub use scheduler::{
+    alarm, arch_irq_restore, arch_irq_save_enable, block_current, boost_priority,
+    clear_wakeup_flag, cosched_set, current_aspace_id, current_task_id, current_thread_id,
+    dequeue_signal, get_affinity, get_monotonic_ns, get_signal_action, get_signal_mask,
+    get_signal_pending, getpgid, getsid, init, is_killed, kill_task, park_current_for_sleep,
+    reset_priority, sa_getid, sa_register, sa_wait, send_signal_to_pgroup, send_signal_to_task,
+    send_signal_to_thread, set_affinity, set_ctty, set_signal_action, set_signal_mask, setpgid,
+    setsid, spawn, spawn_user, spawn_user_from_elf, spawn_user_with_data, tcgetpgrp, tcsetpgrp,
+    thread_create, thread_effective_priority, thread_join_block, thread_join_poll, thread_task_id,
+    tick, wake_thread,
+};
 
 /// Resolve a task's kernel-held port ID to its internal task_id.
 pub fn task_id_from_port(port_id: u64) -> Option<task::TaskId> {
@@ -53,7 +65,9 @@ pub fn validated_thread_from_port(port_id: u64) -> Option<thread::ThreadId> {
 /// Get a task's kernel-held port ID from its internal task_id.
 pub fn task_port_id(task_id: task::TaskId) -> u64 {
     let p = scheduler::TASK_TABLE.get(task_id) as *const task::Task;
-    if p.is_null() { return 0; }
+    if p.is_null() {
+        return 0;
+    }
     unsafe { &*p }.port_id
 }
 
@@ -65,6 +79,8 @@ pub fn thread_id_from_port(port_id: u64) -> Option<thread::ThreadId> {
 /// Get a thread's kernel-held port ID from its internal thread_id.
 pub fn thread_port_id(tid: thread::ThreadId) -> u64 {
     let p = scheduler::THREAD_TABLE.get(tid) as *const thread::Thread;
-    if p.is_null() { return 0; }
+    if p.is_null() {
+        return 0;
+    }
     unsafe { &*p }.port_id
 }

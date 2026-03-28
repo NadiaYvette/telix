@@ -27,7 +27,9 @@ pub fn kernel_end_addr() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn _rust_entry(dtb_ptr: usize, hart_id: usize) -> ! {
     // Set tp = 0 for BSP (CPU 0) — used by smp::cpu_id().
-    unsafe { core::arch::asm!("mv tp, zero"); }
+    unsafe {
+        core::arch::asm!("mv tp, zero");
+    }
 
     DTB_ADDR.store(dtb_ptr, Ordering::Relaxed);
     BOOT_HART_ID.store(hart_id, Ordering::Relaxed);
@@ -55,7 +57,12 @@ pub fn parse_firmware() {
         let nr = crate::firmware::mem_regions().len();
         let nc = crate::firmware::cpu_count();
         let nd = crate::firmware::virtio_devices().len();
-        crate::println!("  Firmware: {} mem regions, {} CPUs, {} virtio devices", nr, nc, nd);
+        crate::println!(
+            "  Firmware: {} mem regions, {} CPUs, {} virtio devices",
+            nr,
+            nc,
+            nd
+        );
     }
 }
 

@@ -41,7 +41,6 @@ pub fn kmain() -> ! {
     let kernel_end = arch::platform::kernel_end_addr();
     mm::phys::init(kernel_end, ram_end, kernel_end, kernel_end);
 
-
     // Enable MMU: set up kernel identity-mapped page tables.
     // Must happen before secondary CPU startup (they need the page table root).
     arch::platform::enable_mmu();
@@ -139,7 +138,10 @@ fn startup_thread() -> ! {
     if let Some(base) = drivers::virtio_mmio::find_device(drivers::virtio_mmio::DEVICE_BLK) {
         let irq = drivers::virtio_mmio::device_irq(base) as u64;
         let arg0 = (base as u64) | (irq << 48);
-        println!("  virtio-blk at {:#x}, irq {}, spawning blk_srv with arg0={:#x}", base, irq, arg0);
+        println!(
+            "  virtio-blk at {:#x}, irq {}, spawning blk_srv with arg0={:#x}",
+            base, irq, arg0
+        );
         match sched::spawn_user(b"blk_srv", 50, 20, arg0) {
             Some(tid) => println!("  blk_srv spawned (thread {})", tid),
             None => println!("  WARNING: blk_srv not found (ok if not yet built)"),
@@ -149,7 +151,10 @@ fn startup_thread() -> ! {
     if let Some(base) = drivers::virtio_mmio::find_device(drivers::virtio_mmio::DEVICE_NET) {
         let irq = drivers::virtio_mmio::device_irq(base) as u64;
         let arg0 = (base as u64) | (irq << 48);
-        println!("  virtio-net at {:#x}, irq {}, spawning net_srv with arg0={:#x}", base, irq, arg0);
+        println!(
+            "  virtio-net at {:#x}, irq {}, spawning net_srv with arg0={:#x}",
+            base, irq, arg0
+        );
         match sched::spawn_user(b"net_srv", 50, 20, arg0) {
             Some(tid) => println!("  net_srv spawned (thread {})", tid),
             None => println!("  WARNING: net_srv not found (ok if not yet built)"),
@@ -193,20 +198,31 @@ fn startup_thread() -> ! {
             let name_len = 9u64;
             let reply_port = ipc::port::create().expect("reg reply port");
             let d3 = name_len | ((reply_port as u64) << 32);
-            let msg = ipc::Message::new(io::protocol::NS_REGISTER, [n0, n1, srv_port as u64, d3, 0, 0]);
+            let msg = ipc::Message::new(
+                io::protocol::NS_REGISTER,
+                [n0, n1, srv_port as u64, d3, 0, 0],
+            );
             let _ = ipc::port::send(nsrv, msg);
             let _ = ipc::port::recv(reply_port); // wait for NS_REGISTER_OK
             ipc::port::destroy(reply_port);
         }
 
         match sched::spawn_user_with_data(
-            b"initramfs_srv", 50, 20, cpio_data, 0x3_0000_0000, srv_port as u64,
+            b"initramfs_srv",
+            50,
+            20,
+            cpio_data,
+            0x3_0000_0000,
+            srv_port as u64,
         ) {
             Some(tid) => {
                 // Grant SEND|RECV|MANAGE cap for the initramfs port to the new task.
                 let task_id = sched::thread_task_id(tid);
                 cap::grant_full_port_cap(task_id, srv_port);
-                println!("  initramfs_srv spawned (thread {}, port {})", tid, srv_port);
+                println!(
+                    "  initramfs_srv spawned (thread {}, port {})",
+                    tid, srv_port
+                );
             }
             None => println!("  ERROR: failed to spawn initramfs_srv"),
         }
@@ -253,7 +269,7 @@ fn startup_thread() -> ! {
 }
 
 fn test_capabilities() {
-    use cap::{Capability, CapType, Rights, CapSpace, Cdt};
+    use cap::{CapSpace, CapType, Capability, Cdt, Rights};
     use sync::SpinLock;
 
     static CDT_STORAGE: SpinLock<Cdt> = SpinLock::new(Cdt::new());
@@ -268,23 +284,43 @@ fn test_capabilities() {
             0xDEAD_0001,
         );
         let server_slot = server_space.insert(port_cap, &mut cdt).unwrap();
-        println!("  Cap test: server has {:?} at slot {}", server_space.lookup(server_slot).unwrap(), server_slot);
+        println!(
+            "  Cap test: server has {:?} at slot {}",
+            server_space.lookup(server_slot).unwrap(),
+            server_slot
+        );
 
         let mut client_space = CapSpace::new(1);
-        let client_slot = server_space.derive_to(
-            server_slot, Rights::SEND, &mut client_space, &mut cdt,
-        ).unwrap();
-        println!("  Cap test: client has {:?} at slot {}", client_space.lookup(client_slot).unwrap(), client_slot);
+        let client_slot = server_space
+            .derive_to(server_slot, Rights::SEND, &mut client_space, &mut cdt)
+            .unwrap();
+        println!(
+            "  Cap test: client has {:?} at slot {}",
+            client_space.lookup(client_slot).unwrap(),
+            client_slot
+        );
 
         let mut client2_space = CapSpace::new(2);
-        let client2_slot = server_space.derive_to(
-            server_slot, Rights::SEND.union(Rights::GRANT), &mut client2_space, &mut cdt,
-        ).unwrap();
-        println!("  Cap test: client2 has {:?} at slot {}", client2_space.lookup(client2_slot).unwrap(), client2_slot);
+        let client2_slot = server_space
+            .derive_to(
+                server_slot,
+                Rights::SEND.union(Rights::GRANT),
+                &mut client2_space,
+                &mut cdt,
+            )
+            .unwrap();
+        println!(
+            "  Cap test: client2 has {:?} at slot {}",
+            client2_space.lookup(client2_slot).unwrap(),
+            client2_slot
+        );
 
         let revoked = server_space.revoke(server_slot, &mut cdt);
         println!("  Cap test: revoked {} derived capabilities", revoked);
-        println!("  Cap test: server still has {:?}", server_space.lookup(server_slot).unwrap());
+        println!(
+            "  Cap test: server still has {:?}",
+            server_space.lookup(server_slot).unwrap()
+        );
     }
     println!("  Cap test: PASSED");
 }
@@ -292,19 +328,23 @@ fn test_capabilities() {
 // --- Phase 2: Demand paging test ---
 
 fn test_demand_paging() {
-    use mm::page::{PAGE_SIZE, MMUPAGE_SIZE, PAGE_MMUCOUNT};
+    use mm::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE};
     use mm::vma::VmaProt;
 
     // Get the current page table root.
     #[cfg(target_arch = "aarch64")]
     let pt_root = {
         let cr: u64;
-        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) cr); }
+        unsafe {
+            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) cr);
+        }
         let root = cr as usize;
         if root == 0 {
             // MMU not yet enabled — allocate a fresh page table root for the test.
             let pa = mm::phys::alloc_page().expect("alloc pt root");
-            unsafe { core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE); }
+            unsafe {
+                core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE);
+            }
             pa.as_usize()
         } else {
             root
@@ -316,13 +356,17 @@ fn test_demand_paging() {
         // The kernel root has gigapage leaves (device at root[0], RAM at root[2])
         // which block get_or_create_table from subdividing into 4K page tables.
         let pa = mm::phys::alloc_page().expect("alloc pt root");
-        unsafe { core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE); }
+        unsafe {
+            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE);
+        }
         pa.as_usize()
     };
     #[cfg(target_arch = "x86_64")]
     let pt_root = {
         let cr3: u64;
-        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3); }
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3);
+        }
         (cr3 & !0xFFF) as usize
     };
 
@@ -335,7 +379,8 @@ fn test_demand_paging() {
     let test_va = 0x80_0000_0000usize;
     let num_pages = 4;
     mm::aspace::with_aspace(aspace_id, |aspace| {
-        let vma = aspace.map_anon(test_va, num_pages, VmaProt::ReadWrite)
+        let vma = aspace
+            .map_anon(test_va, num_pages, VmaProt::ReadWrite)
             .expect("map_anon");
         println!("  Mapped {} pages at VA {:#x}", num_pages, test_va);
 
@@ -354,16 +399,16 @@ fn test_demand_paging() {
 
     for &addr in &test_addrs {
         println!("  Faulting at {:#x}...", addr);
-        let result = mm::fault::handle_page_fault(
-            aspace_id, addr, mm::fault::FaultType::Write,
-        );
+        let result = mm::fault::handle_page_fault(aspace_id, addr, mm::fault::FaultType::Write);
         println!("  Result: {:?}", result);
         // With background pre-zeroing, a sub-page in the same allocation page
         // as a prior major fault may be minor (already zeroed + resident).
         assert!(
             result == mm::fault::FaultResult::HandledMajor
                 || result == mm::fault::FaultResult::HandledMinor,
-            "Expected major or minor fault at {:#x}, got {:?}", addr, result
+            "Expected major or minor fault at {:#x}, got {:?}",
+            addr,
+            result
         );
     }
 
@@ -371,18 +416,21 @@ fn test_demand_paging() {
         let vma = aspace.find_vma(test_va).unwrap();
         let count = mm::fault::count_installed_ptes(pt_root, vma);
         assert_eq!(count, test_addrs.len());
-        println!("  {} PTEs installed after {} major faults", count, test_addrs.len());
+        println!(
+            "  {} PTEs installed after {} major faults",
+            count,
+            test_addrs.len()
+        );
     });
 
     // Test minor fault: evict PTE (preserves SW_ZEROED), re-fault.
     mm::fault::evict_mmupage_dispatch(pt_root, test_va);
 
-    let result = mm::fault::handle_page_fault(
-        aspace_id, test_va, mm::fault::FaultType::Read,
-    );
+    let result = mm::fault::handle_page_fault(aspace_id, test_va, mm::fault::FaultType::Read);
     assert!(
         result == mm::fault::FaultResult::HandledMinor,
-        "Expected minor fault, got {:?}", result
+        "Expected minor fault, got {:?}",
+        result
     );
     println!("  Minor fault test: PASSED");
 
@@ -392,23 +440,29 @@ fn test_demand_paging() {
     #[cfg(target_arch = "aarch64")]
     {
         const CONTIG_GROUP: usize = 16; // 16 × 4K = 64K, AArch64 architecture constant
-        let promotions_before = mm::stats::CONTIGUOUS_PROMOTIONS.load(core::sync::atomic::Ordering::Relaxed);
+        let promotions_before =
+            mm::stats::CONTIGUOUS_PROMOTIONS.load(core::sync::atomic::Ordering::Relaxed);
         // We already faulted mmu_idx 0 and 1 (test_va and test_va+4K). Fault the rest of the group.
         for i in 2..CONTIG_GROUP {
             let addr = test_va + i * MMUPAGE_SIZE;
-            let result = mm::fault::handle_page_fault(
-                aspace_id, addr, mm::fault::FaultType::Write,
-            );
+            let result = mm::fault::handle_page_fault(aspace_id, addr, mm::fault::FaultType::Write);
             assert!(
                 result == mm::fault::FaultResult::HandledMajor
                     || result == mm::fault::FaultResult::HandledMinor,
-                "Expected major/minor fault at {:#x}, got {:?}", addr, result
+                "Expected major/minor fault at {:#x}, got {:?}",
+                addr,
+                result
             );
         }
-        let promotions_after = mm::stats::CONTIGUOUS_PROMOTIONS.load(core::sync::atomic::Ordering::Relaxed);
+        let promotions_after =
+            mm::stats::CONTIGUOUS_PROMOTIONS.load(core::sync::atomic::Ordering::Relaxed);
         let promoted = promotions_after - promotions_before;
         println!("  Contiguous PTE promotions: {} (expected 1)", promoted);
-        assert!(promoted >= 1, "Expected at least 1 contiguous promotion, got {}", promoted);
+        assert!(
+            promoted >= 1,
+            "Expected at least 1 contiguous promotion, got {}",
+            promoted
+        );
         println!("  AArch64 contiguous PTE test: PASSED");
     }
 
@@ -425,13 +479,17 @@ fn test_demand_paging() {
 
         // Pass 1: clears reference bits on all referenced pages.
         let scan1 = mm::wsclock::scan(aspace_id, 100);
-        println!("  WSCLOCK pass 1: scanned={}, cleared={}, freed={}",
-            scan1.pages_scanned, scan1.ptes_cleared, scan1.pages_freed);
+        println!(
+            "  WSCLOCK pass 1: scanned={}, cleared={}, freed={}",
+            scan1.pages_scanned, scan1.ptes_cleared, scan1.pages_freed
+        );
 
         // Pass 2: pages not re-accessed since pass 1 have ref bit clear → evict.
         let scan2 = mm::wsclock::scan(aspace_id, 100);
-        println!("  WSCLOCK pass 2: scanned={}, cleared={}, freed={}",
-            scan2.pages_scanned, scan2.ptes_cleared, scan2.pages_freed);
+        println!(
+            "  WSCLOCK pass 2: scanned={}, cleared={}, freed={}",
+            scan2.pages_scanned, scan2.ptes_cleared, scan2.pages_freed
+        );
 
         let installed_after = mm::aspace::with_aspace(aspace_id, |aspace| {
             let vma = aspace.find_vma(test_va).unwrap();
@@ -440,15 +498,17 @@ fn test_demand_paging() {
         println!("  WSCLOCK: {} PTEs installed after scan", installed_after);
         assert_eq!(installed_after, 0, "All PTEs should be cleared");
         let total_freed = scan1.pages_freed + scan2.pages_freed;
-        assert!(total_freed > 0, "Should have freed at least 1 allocation page");
+        assert!(
+            total_freed > 0,
+            "Should have freed at least 1 allocation page"
+        );
 
         // Re-fault the first address — should be a major fault since the page was freed.
-        let result = mm::fault::handle_page_fault(
-            aspace_id, test_va, mm::fault::FaultType::Write,
-        );
+        let result = mm::fault::handle_page_fault(aspace_id, test_va, mm::fault::FaultType::Write);
         assert!(
             result == mm::fault::FaultResult::HandledMajor,
-            "Expected major fault after reclaim, got {:?}", result
+            "Expected major fault after reclaim, got {:?}",
+            result
         );
         println!("  WSCLOCK re-fault after reclaim: PASSED");
     }
@@ -458,4 +518,3 @@ fn test_demand_paging() {
     mm::aspace::destroy(aspace_id);
     println!("  Demand paging test: PASSED");
 }
-

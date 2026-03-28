@@ -37,8 +37,12 @@ pub fn init() {
     // Enable the timer interrupt in the GIC.
     super::irq::enable_interrupt(super::irq::INTID_TIMER_EL1_PHYS);
 
-    crate::println!("  Timer initialized: freq={} Hz, interval={} ticks ({}ms)",
-        freq, interval, 1000 * interval / freq);
+    crate::println!(
+        "  Timer initialized: freq={} Hz, interval={} ticks ({}ms)",
+        freq,
+        interval,
+        1000 * interval / freq
+    );
 }
 
 /// Initialize the timer on a secondary CPU. The timer interval is already
@@ -60,7 +64,6 @@ pub fn handle_timer_irq() {
     unsafe {
         core::arch::asm!("msr cntp_tval_el0, {}", in(reg) interval);
     }
-
 }
 
 /// Unmask IRQs (clear DAIF.I bit) to allow interrupts.
@@ -69,4 +72,3 @@ pub fn enable_interrupts() {
         core::arch::asm!("msr daifclr, #2"); // Clear IRQ mask
     }
 }
-

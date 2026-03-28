@@ -1,7 +1,7 @@
 //! Server event loop — blocking recv loop dispatching to a handler.
 
-use crate::ipc::port::{self, PortId};
 use crate::ipc::Message;
+use crate::ipc::port::{self, PortId};
 
 /// Run a server event loop: block on the given port and dispatch
 /// each message to the handler function.
@@ -17,5 +17,7 @@ pub fn server_loop(service_port: PortId, handler: fn(PortId, Message)) -> ! {
             }
         }
     }
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

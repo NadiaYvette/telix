@@ -72,7 +72,9 @@ fn notify_inotify(event_mask: u64, path_w0: u64, path_w1: u64) {
             Some(p) => p,
             None => return,
         };
-        unsafe { INOTIFY_PORT = p; }
+        unsafe {
+            INOTIFY_PORT = p;
+        }
         syscall::send_nb_4(p, IN_NOTIFY, event_mask, path_w0, path_w1, 0);
     } else {
         syscall::send_nb_4(port, IN_NOTIFY, event_mask, path_w0, path_w1, 0);
@@ -92,12 +94,16 @@ struct MountEntry {
 
 impl MountEntry {
     const fn empty() -> Self {
-        Self { prefix: [0; MAX_PATH], prefix_len: 0, fs_port: 0, active: false }
+        Self {
+            prefix: [0; MAX_PATH],
+            prefix_len: 0,
+            fs_port: 0,
+            active: false,
+        }
     }
 }
 
 static mut MOUNTS: [MountEntry; MAX_MOUNTS] = [const { MountEntry::empty() }; MAX_MOUNTS];
-
 
 /// Unpack a path from data[0..1] (up to 16 bytes).
 fn unpack_path(d0: u64, d1: u64, len: usize) -> ([u8; MAX_PATH], usize) {
@@ -131,7 +137,9 @@ fn pack_name_2(name: &[u8], name_len: usize) -> (u64, u64) {
 /// Normalize a path: resolve "." and ".." components.
 /// Returns the normalized length.
 fn normalize_path(buf: &mut [u8; MAX_PATH], len: usize) -> usize {
-    if len == 0 { return 0; }
+    if len == 0 {
+        return 0;
+    }
 
     // Work with components (at most 4 deep for 16-byte paths).
     let mut comp_start = [0usize; 4];
@@ -139,20 +147,30 @@ fn normalize_path(buf: &mut [u8; MAX_PATH], len: usize) -> usize {
     let mut ncomp = 0usize;
 
     let mut i = 0;
-    if buf[0] == b'/' { i = 1; }
+    if buf[0] == b'/' {
+        i = 1;
+    }
 
     while i < len && ncomp < 4 {
-        while i < len && buf[i] == b'/' { i += 1; }
-        if i >= len { break; }
+        while i < len && buf[i] == b'/' {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
 
         let start = i;
-        while i < len && buf[i] != b'/' { i += 1; }
+        while i < len && buf[i] != b'/' {
+            i += 1;
+        }
         let clen = i - start;
 
         if clen == 1 && buf[start] == b'.' {
             continue;
         } else if clen == 2 && buf[start] == b'.' && buf[start + 1] == b'.' {
-            if ncomp > 0 { ncomp -= 1; }
+            if ncomp > 0 {
+                ncomp -= 1;
+            }
         } else {
             comp_start[ncomp] = start;
             comp_len_arr[ncomp] = clen;
@@ -178,7 +196,9 @@ fn normalize_path(buf: &mut [u8; MAX_PATH], len: usize) -> usize {
         }
     }
     // Zero rest.
-    for k in pos..MAX_PATH { buf[k] = 0; }
+    for k in pos..MAX_PATH {
+        buf[k] = 0;
+    }
     pos
 }
 
@@ -190,7 +210,9 @@ fn find_mount(path: &[u8; MAX_PATH], path_len: usize) -> Option<(usize, usize)> 
     let mut best_len = 0usize;
 
     for i in 0..MAX_MOUNTS {
-        if !mounts[i].active { continue; }
+        if !mounts[i].active {
+            continue;
+        }
         let plen = mounts[i].prefix_len;
 
         // Root mount "/" matches everything.
@@ -228,7 +250,11 @@ fn find_mount(path: &[u8; MAX_PATH], path_len: usize) -> Option<(usize, usize)> 
 }
 
 /// Extract the relative path after the mount prefix.
-fn relative_path<'a>(path: &'a [u8; MAX_PATH], path_len: usize, prefix_end: usize) -> (&'a [u8], usize) {
+fn relative_path<'a>(
+    path: &'a [u8; MAX_PATH],
+    path_len: usize,
+    prefix_end: usize,
+) -> (&'a [u8], usize) {
     let mut start = prefix_end;
     while start < path_len && path[start] == b'/' {
         start += 1;
@@ -245,7 +271,9 @@ fn handle_mount(data: &[u64; 6]) {
     let (path, plen) = unpack_path(data[0], data[1], path_len);
 
     if plen == 0 || plen > MAX_PATH || fs_port == 0 {
-        if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0); }
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
         return;
     }
 
@@ -256,11 +284,16 @@ fn handle_mount(data: &[u64; 6]) {
         if mounts[i].active && mounts[i].prefix_len == plen {
             let mut same = true;
             for j in 0..plen {
-                if mounts[i].prefix[j] != path[j] { same = false; break; }
+                if mounts[i].prefix[j] != path[j] {
+                    same = false;
+                    break;
+                }
             }
             if same {
                 mounts[i].fs_port = fs_port;
-                if reply_port != 0 { syscall::send(reply_port, VFS_OK, 0, 0, 0, 0); }
+                if reply_port != 0 {
+                    syscall::send(reply_port, VFS_OK, 0, 0, 0, 0);
+                }
                 return;
             }
         }
@@ -273,12 +306,16 @@ fn handle_mount(data: &[u64; 6]) {
             mounts[i].prefix_len = plen;
             mounts[i].fs_port = fs_port;
             mounts[i].active = true;
-            if reply_port != 0 { syscall::send(reply_port, VFS_OK, 0, 0, 0, 0); }
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_OK, 0, 0, 0, 0);
+            }
             return;
         }
     }
 
-    if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_FULL, 0, 0, 0); }
+    if reply_port != 0 {
+        syscall::send(reply_port, VFS_ERROR, ERR_FULL, 0, 0, 0);
+    }
 }
 
 /// Handle VFS_UNMOUNT: remove a mount entry.
@@ -289,19 +326,30 @@ fn handle_unmount(data: &[u64; 6]) {
 
     let mounts = unsafe { &mut *core::ptr::addr_of_mut!(MOUNTS) };
     for i in 0..MAX_MOUNTS {
-        if !mounts[i].active { continue; }
-        if mounts[i].prefix_len != plen { continue; }
+        if !mounts[i].active {
+            continue;
+        }
+        if mounts[i].prefix_len != plen {
+            continue;
+        }
         let mut same = true;
         for j in 0..plen {
-            if mounts[i].prefix[j] != path[j] { same = false; break; }
+            if mounts[i].prefix[j] != path[j] {
+                same = false;
+                break;
+            }
         }
         if same {
             mounts[i].active = false;
-            if reply_port != 0 { syscall::send(reply_port, VFS_OK, 0, 0, 0, 0); }
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_OK, 0, 0, 0, 0);
+            }
             return;
         }
     }
-    if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_NOT_FOUND, 0, 0, 0); }
+    if reply_port != 0 {
+        syscall::send(reply_port, VFS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+    }
 }
 
 /// Handle VFS_OPEN: resolve path, forward FS_OPEN to FS server, return result.
@@ -315,7 +363,9 @@ fn handle_open(data: &[u64; 6]) {
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0); }
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
         return;
     }
 
@@ -323,7 +373,9 @@ fn handle_open(data: &[u64; 6]) {
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0); }
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
+            }
             return;
         }
     };
@@ -347,15 +399,20 @@ fn handle_open(data: &[u64; 6]) {
             let size = fs_reply.data[1];
             let fs_aspace = fs_reply.data[2];
             if reply_port != 0 {
-                syscall::send(reply_port, VFS_OPEN_OK,
-                    fs_port as u64, handle, size, fs_aspace);
+                syscall::send(
+                    reply_port,
+                    VFS_OPEN_OK,
+                    fs_port as u64,
+                    handle,
+                    size,
+                    fs_aspace,
+                );
             }
             // Notify inotify server of file open.
             notify_inotify(IN_EVT_OPEN, data[0], data[1]);
         } else {
             if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR,
-                    fs_reply.data[0], 0, 0, 0);
+                syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
             }
         }
     } else {
@@ -376,14 +433,18 @@ fn handle_stat(data: &[u64; 6]) {
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0); }
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
         return;
     }
 
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0); }
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
+            }
             return;
         }
     };
@@ -399,14 +460,18 @@ fn handle_stat(data: &[u64; 6]) {
     if let Some(fs_reply) = syscall::recv_msg(my_reply) {
         if fs_reply.tag == FS_STAT_OK {
             if reply_port != 0 {
-                syscall::send(reply_port, VFS_STAT_OK,
-                    fs_reply.data[0], fs_reply.data[1],
-                    fs_reply.data[2], fs_reply.data[3]);
+                syscall::send(
+                    reply_port,
+                    VFS_STAT_OK,
+                    fs_reply.data[0],
+                    fs_reply.data[1],
+                    fs_reply.data[2],
+                    fs_reply.data[3],
+                );
             }
         } else {
             if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR,
-                    fs_reply.data[0], 0, 0, 0);
+                syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
             }
         }
     } else if reply_port != 0 {
@@ -425,14 +490,18 @@ fn handle_readdir(data: &[u64; 6]) {
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0); }
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
         return;
     }
 
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0); }
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
+            }
             return;
         }
     };
@@ -450,18 +519,24 @@ fn handle_readdir(data: &[u64; 6]) {
         if let Some(fs_reply) = syscall::recv_msg(my_reply) {
             if fs_reply.tag == FS_READDIR_OK {
                 if reply_port != 0 {
-                    syscall::send(reply_port, VFS_READDIR_OK,
-                        fs_reply.data[0], fs_reply.data[1],
-                        fs_reply.data[2], fs_reply.data[3]);
+                    syscall::send(
+                        reply_port,
+                        VFS_READDIR_OK,
+                        fs_reply.data[0],
+                        fs_reply.data[1],
+                        fs_reply.data[2],
+                        fs_reply.data[3],
+                    );
                 }
             } else if fs_reply.tag == FS_READDIR_END {
-                if reply_port != 0 { syscall::send(reply_port, VFS_READDIR_END, 0, 0, 0, 0); }
+                if reply_port != 0 {
+                    syscall::send(reply_port, VFS_READDIR_END, 0, 0, 0, 0);
+                }
                 syscall::port_destroy(my_reply);
                 return;
             } else {
                 if reply_port != 0 {
-                    syscall::send(reply_port, VFS_ERROR,
-                        fs_reply.data[0], 0, 0, 0);
+                    syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
                 }
                 syscall::port_destroy(my_reply);
                 return;
@@ -472,7 +547,9 @@ fn handle_readdir(data: &[u64; 6]) {
     }
 
     syscall::port_destroy(my_reply);
-    if reply_port != 0 { syscall::send(reply_port, VFS_READDIR_END, 0, 0, 0, 0); }
+    if reply_port != 0 {
+        syscall::send(reply_port, VFS_READDIR_END, 0, 0, 0, 0);
+    }
 }
 
 /// Handle VFS_MKDIR: resolve path, forward FS_MKDIR to FS server.
@@ -486,14 +563,18 @@ fn handle_mkdir(data: &[u64; 6]) {
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0); }
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
         return;
     }
 
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0); }
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
+            }
             return;
         }
     };
@@ -533,14 +614,18 @@ fn handle_unlink(data: &[u64; 6]) {
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0); }
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
         return;
     }
 
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 { syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0); }
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
+            }
             return;
         }
     };

@@ -8,22 +8,34 @@
 #[inline(always)]
 pub fn read_cycles() -> u64 {
     #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::timer::counter() }
+    {
+        crate::arch::aarch64::timer::counter()
+    }
     #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::trap::read_time() }
+    {
+        crate::arch::riscv64::trap::read_time()
+    }
     #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::timer::rdtsc() }
+    {
+        crate::arch::x86_64::timer::rdtsc()
+    }
 }
 
 /// Return the timer/counter frequency in Hz.
 #[inline]
 pub fn timer_freq() -> u64 {
     #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::timer::cntfrq() }
+    {
+        crate::arch::aarch64::timer::cntfrq()
+    }
     #[cfg(target_arch = "riscv64")]
-    { 10_000_000 } // QEMU virt timebase
+    {
+        10_000_000
+    } // QEMU virt timebase
     #[cfg(target_arch = "x86_64")]
-    { 1_000_000_000 } // approximate RDTSC freq on QEMU
+    {
+        1_000_000_000
+    } // approximate RDTSC freq on QEMU
 }
 
 /// Get monotonic time in nanoseconds since boot.

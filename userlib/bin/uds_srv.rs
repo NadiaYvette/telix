@@ -64,7 +64,7 @@ struct UnixSocket {
     cred_uid: u32,
     cred_gid: u32,
     // Accept queue (for listening sockets).
-    pending: [u32; MAX_PENDING],       // server-end socket indices
+    pending: [u32; MAX_PENDING], // server-end socket indices
     pending_count: usize,
     // Blocked accept caller.
     accept_reply: u64, // reply port (0 = none blocked)
@@ -171,9 +171,7 @@ fn unpack_name(d0: u64, d1: u64, len: usize) -> ([u8; MAX_NAME], usize) {
 fn find_listening(name: &[u8], name_len: usize) -> Option<u32> {
     unsafe {
         for i in 0..MAX_SOCKETS {
-            if SOCKS[i].state == SockState::Listening
-                && SOCKS[i].name_len == name_len
-            {
+            if SOCKS[i].state == SockState::Listening && SOCKS[i].name_len == name_len {
                 let mut ok = true;
                 for j in 0..name_len {
                     if SOCKS[i].name[j] != name[j] {
@@ -249,7 +247,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             UDS_SOCKET => {
                 let sock_type = msg.data[0] as u8;
                 if let Some(h) = alloc_socket() {
-                    unsafe { SOCKS[h as usize].sock_type = sock_type; }
+                    unsafe {
+                        SOCKS[h as usize].sock_type = sock_type;
+                    }
                     reply(reply_port, UDS_OK, h as u64, 0, 0, 0);
                 } else {
                     reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
@@ -318,7 +318,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let cli_end = match alloc_socket() {
                     Some(h) => h,
                     None => {
-                        unsafe { SOCKS[srv_end as usize].state = SockState::Free; }
+                        unsafe {
+                            SOCKS[srv_end as usize].state = SockState::Free;
+                        }
                         reply(reply_port, UDS_ERROR, 2, 0, 0, 0);
                         continue;
                     }
@@ -345,7 +347,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let accept_rp = unsafe { SOCKS[listener as usize].accept_reply };
                 if accept_rp != 0 {
                     // Wake the blocked acceptor immediately.
-                    unsafe { SOCKS[listener as usize].accept_reply = 0; }
+                    unsafe {
+                        SOCKS[listener as usize].accept_reply = 0;
+                    }
                     reply(accept_rp, UDS_OK, srv_end as u64, 0, 0, 0);
                 } else {
                     // Queue server-end for later accept().

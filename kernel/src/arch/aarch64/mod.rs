@@ -63,6 +63,8 @@ pub fn start_secondary_cpus() {
 /// Idle loop — WFI until interrupted.
 pub fn idle_loop() -> ! {
     loop {
-        unsafe { core::arch::asm!("wfi"); }
+        unsafe {
+            core::arch::asm!("wfi");
+        }
     }
 }
