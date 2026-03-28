@@ -85,6 +85,55 @@ pub fn map_user_pages(
     Some(())
 }
 
+// ---------------------------------------------------------------------------
+// PteFormat implementation for the generic radix walker
+// ---------------------------------------------------------------------------
+
+pub struct X86Pte;
+
+impl crate::mm::radix_pt::PteFormat for X86Pte {
+    const LEVELS: usize = 4;
+
+    #[inline]
+    fn va_index(va: usize, level: usize) -> usize {
+        const SHIFTS: [usize; 4] = [39, 30, 21, 12];
+        (va >> SHIFTS[level]) & 0x1FF
+    }
+
+    #[inline]
+    fn is_valid(entry: u64) -> bool {
+        entry & PTE_P != 0
+    }
+
+    #[inline]
+    fn is_table(entry: u64) -> bool {
+        // In x86-64, a non-leaf entry has P=1 and PS=0.
+        entry & PTE_PS == 0
+    }
+
+    #[inline]
+    fn table_pa(entry: u64) -> usize {
+        (entry & 0x000F_FFFF_FFFF_F000) as usize
+    }
+
+    #[inline]
+    fn leaf_pa(entry: u64) -> usize {
+        (entry & 0x000F_FFFF_FFFF_F000) as usize
+    }
+
+    #[inline]
+    fn make_table_entry(table_pa: usize) -> u64 {
+        (table_pa as u64) | PTE_P | PTE_RW | PTE_US
+    }
+
+    #[inline]
+    fn tlb_invalidate(va: usize) {
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) va);
+        }
+    }
+}
+
 /// Get or create a next-level page table at the given index.
 fn get_or_create_table(table: *mut u64, index: usize) -> Option<*mut u64> {
     let entry = unsafe { *table.add(index) };

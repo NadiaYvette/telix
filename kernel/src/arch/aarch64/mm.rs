@@ -130,6 +130,57 @@ pub const USER_RW_FLAGS: u64 = USER_PAGE | PT_UXN;
 const PT_AP_RO_ALL: u64 = 3 << 6;
 pub const USER_RO_FLAGS: u64 = PT_VALID | PT_PAGE | PT_AF | PT_SH_INNER | PT_AP_RO_ALL | PT_ATTR_IDX_0 | PT_UXN;
 
+// ---------------------------------------------------------------------------
+// PteFormat implementation for the generic radix walker
+// ---------------------------------------------------------------------------
+
+pub struct Aarch64Pte;
+
+impl crate::mm::radix_pt::PteFormat for Aarch64Pte {
+    const LEVELS: usize = 4;
+
+    #[inline]
+    fn va_index(va: usize, level: usize) -> usize {
+        const SHIFTS: [usize; 4] = [39, 30, 21, 12];
+        (va >> SHIFTS[level]) & 0x1FF
+    }
+
+    #[inline]
+    fn is_valid(entry: u64) -> bool {
+        entry & PT_VALID != 0
+    }
+
+    #[inline]
+    fn is_table(entry: u64) -> bool {
+        entry & PT_TABLE != 0
+    }
+
+    #[inline]
+    fn table_pa(entry: u64) -> usize {
+        (entry & 0x0000_FFFF_FFFF_F000) as usize
+    }
+
+    #[inline]
+    fn leaf_pa(entry: u64) -> usize {
+        (entry & 0x0000_FFFF_FFFF_F000) as usize
+    }
+
+    #[inline]
+    fn make_table_entry(table_pa: usize) -> u64 {
+        (table_pa as u64) | PT_VALID | PT_TABLE
+    }
+
+    #[inline]
+    fn tlb_invalidate(va: usize) {
+        unsafe {
+            let va_shifted = (va >> 12) as u64;
+            core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+            core::arch::asm!("dsb ish");
+            core::arch::asm!("isb");
+        }
+    }
+}
+
 /// Get or create a next-level table at the given index.
 fn get_or_create_table(table: *mut u64, index: usize) -> Option<*mut u64> {
     let entry = unsafe { *table.add(index) };
