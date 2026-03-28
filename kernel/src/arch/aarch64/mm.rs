@@ -5,6 +5,7 @@
 //! since the kernel runs at 0x4008_0000 (low VA space).
 
 use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::mm::radix_pt::{self, PteFormat};
 
 /// Kernel page table root (L0), set by BSP after enable_mmu.
 /// Used by secondary CPUs to enable their MMU with the same identity mapping.
@@ -33,6 +34,7 @@ const DEV_BLOCK: u64 = PT_VALID | PT_AF | PT_AP_RW_EL1 | PT_ATTR_IDX_1 | PT_UXN 
 const USER_PAGE: u64 = PT_VALID | PT_PAGE | PT_AF | PT_SH_INNER | PT_AP_RW_ALL | PT_ATTR_IDX_0;
 
 const MMU_PAGE_SIZE: usize = 4096;
+const PA_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 /// Allocate a zero-filled 4K page for a page table from the buddy allocator.
 fn alloc_table() -> Option<usize> {
@@ -100,24 +102,15 @@ pub fn map_user_pages(
     size: usize,
     flags: u64,
 ) -> Option<()> {
-    let l0_table = l0 as *mut u64;
     let num_pages = (size + MMU_PAGE_SIZE - 1) / MMU_PAGE_SIZE;
 
     for i in 0..num_pages {
         let va = virt + i * MMU_PAGE_SIZE;
         let pa = phys + i * MMU_PAGE_SIZE;
 
-        let l0_idx = (va >> 39) & 0x1FF;
-        let l1_idx = (va >> 30) & 0x1FF;
-        let l2_idx = (va >> 21) & 0x1FF;
-        let l3_idx = (va >> 12) & 0x1FF;
-
-        let l1 = get_or_create_table(l0_table, l0_idx)?;
-        let l2 = get_or_create_table(l1, l1_idx)?;
-        let l3 = get_or_create_table(l2, l2_idx)?;
-
+        let slot = radix_pt::walk_or_create::<Aarch64Pte>(l0, va)?;
         unsafe {
-            *l3.add(l3_idx) = (pa as u64) | flags;
+            *slot = (pa as u64) | flags;
         }
     }
     Some(())
@@ -181,24 +174,6 @@ impl crate::mm::radix_pt::PteFormat for Aarch64Pte {
     }
 }
 
-/// Get or create a next-level table at the given index.
-fn get_or_create_table(table: *mut u64, index: usize) -> Option<*mut u64> {
-    let entry = unsafe { *table.add(index) };
-    if entry & PT_VALID != 0 && entry & PT_TABLE != 0 {
-        let next = (entry & 0x0000_FFFF_FFFF_F000) as usize;
-        Some(next as *mut u64)
-    } else if entry & PT_VALID != 0 {
-        // It's a block descriptor — can't create a table here.
-        None
-    } else {
-        let next = alloc_table()?;
-        unsafe {
-            *table.add(index) = (next as u64) | PT_VALID | PT_TABLE;
-        }
-        Some(next as *mut u64)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Per-MMU-page operations for demand paging
 // ---------------------------------------------------------------------------
@@ -206,215 +181,105 @@ fn get_or_create_table(table: *mut u64, index: usize) -> Option<*mut u64> {
 /// Map a single 4K MMU page at `va` to physical address `pa` with given flags.
 /// Creates intermediate table entries as needed. Invalidates TLB for the VA.
 pub fn map_single_mmupage(l0: usize, va: usize, pa: usize, flags: u64) -> bool {
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3_idx = (va >> 12) & 0x1FF;
-
-    let l1 = match get_or_create_table(l0_table, l0_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_or_create::<Aarch64Pte>(l0, va) {
+        Some(s) => s,
         None => return false,
     };
-    let l2 = match get_or_create_table(l1, l1_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let l3 = match get_or_create_table(l2, l2_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-
     unsafe {
-        *l3.add(l3_idx) = (pa as u64) | flags;
+        *slot = (pa as u64) | flags;
     }
-    // TLB invalidate for this VA (inner-shareable).
-    unsafe {
-        let va_shifted = (va >> 12) as u64;
-        core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("isb");
-    }
+    Aarch64Pte::tlb_invalidate(va);
     true
 }
 
 /// Unmap a single 4K MMU page at `va`. Returns the old physical address, or 0 if not mapped.
 pub fn unmap_single_mmupage(l0: usize, va: usize) -> usize {
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3_idx = (va >> 12) & 0x1FF;
-
-    // Walk down — if any level is missing, the page isn't mapped.
-    let l1 = match walk_table(l0_table, l0_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_leaf::<Aarch64Pte>(l0, va) {
+        Some(s) => s,
         None => return 0,
     };
-    let l2 = match walk_table(l1, l1_idx) {
-        Some(t) => t,
-        None => return 0,
-    };
-    let l3 = match walk_table(l2, l2_idx) {
-        Some(t) => t,
-        None => return 0,
-    };
-
-    let entry = unsafe { *l3.add(l3_idx) };
+    let entry = unsafe { *slot };
     if entry & PT_VALID == 0 {
         return 0;
     }
-    let pa = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+    let pa = (entry & PA_MASK) as usize;
     unsafe {
-        *l3.add(l3_idx) = 0;
+        *slot = 0;
     }
-    // TLB invalidate.
-    unsafe {
-        let va_shifted = (va >> 12) as u64;
-        core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("isb");
-    }
+    Aarch64Pte::tlb_invalidate(va);
     pa
 }
 
 /// Evict a 4K MMU page: clear valid bit but preserve PTE_SW_ZEROED hint.
 /// Returns the old physical address, or 0 if not mapped. Used by WSCLOCK.
 pub fn evict_mmupage(l0: usize, va: usize) -> usize {
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3_idx = (va >> 12) & 0x1FF;
-
-    let l1 = match walk_table(l0_table, l0_idx) { Some(t) => t, None => return 0 };
-    let l2 = match walk_table(l1, l1_idx) { Some(t) => t, None => return 0 };
-    let l3 = match walk_table(l2, l2_idx) { Some(t) => t, None => return 0 };
-
-    let entry = unsafe { *l3.add(l3_idx) };
+    let slot = match radix_pt::walk_to_leaf::<Aarch64Pte>(l0, va) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let entry = unsafe { *slot };
     if entry & PT_VALID == 0 { return 0; }
-    let pa = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+    let pa = (entry & PA_MASK) as usize;
     unsafe {
-        *l3.add(l3_idx) = entry & PTE_SW_ZEROED;
+        *slot = entry & PTE_SW_ZEROED;
     }
-    unsafe {
-        let va_shifted = (va >> 12) as u64;
-        core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("isb");
-    }
+    Aarch64Pte::tlb_invalidate(va);
     pa
 }
 
 /// Clear a PTE entirely (valid + SW bits). Used for madvise_dontneed and cleanup.
 pub fn clear_pte(l0: usize, va: usize) {
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3_idx = (va >> 12) & 0x1FF;
-
-    let l1 = match walk_table(l0_table, l0_idx) { Some(t) => t, None => return };
-    let l2 = match walk_table(l1, l1_idx) { Some(t) => t, None => return };
-    let l3 = match walk_table(l2, l2_idx) { Some(t) => t, None => return };
-
-    let entry = unsafe { *l3.add(l3_idx) };
+    let slot = match radix_pt::walk_to_leaf::<Aarch64Pte>(l0, va) {
+        Some(s) => s,
+        None => return,
+    };
+    let entry = unsafe { *slot };
     if entry != 0 {
-        unsafe { *l3.add(l3_idx) = 0; }
-        unsafe {
-            let va_shifted = (va >> 12) as u64;
-            core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
-            core::arch::asm!("dsb ish");
-            core::arch::asm!("isb");
-        }
+        unsafe { *slot = 0; }
+        Aarch64Pte::tlb_invalidate(va);
     }
 }
 
 /// Read and clear the Access Flag (AF) for the PTE at `va`.
 /// Returns true if AF was set (page was referenced).
 pub fn read_and_clear_ref_bit(l0: usize, va: usize) -> bool {
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3_idx = (va >> 12) & 0x1FF;
-
-    let l1 = match walk_table(l0_table, l0_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_leaf::<Aarch64Pte>(l0, va) {
+        Some(s) => s,
         None => return false,
     };
-    let l2 = match walk_table(l1, l1_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let l3 = match walk_table(l2, l2_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-
-    let entry = unsafe { *l3.add(l3_idx) };
+    let entry = unsafe { *slot };
     if entry & PT_VALID == 0 {
         return false;
     }
     let referenced = (entry & PT_AF) != 0;
     if referenced {
-        // Clear AF.
         unsafe {
-            *l3.add(l3_idx) = entry & !PT_AF;
+            *slot = entry & !PT_AF;
         }
-        // TLB invalidate so the CPU will set AF again on next access.
-        unsafe {
-            let va_shifted = (va >> 12) as u64;
-            core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
-            core::arch::asm!("dsb ish");
-            core::arch::asm!("isb");
-        }
+        Aarch64Pte::tlb_invalidate(va);
     }
     referenced
-}
-
-/// Walk an existing table entry (no creation). Returns next-level table pointer or None.
-fn walk_table(table: *mut u64, index: usize) -> Option<*mut u64> {
-    let entry = unsafe { *table.add(index) };
-    if entry & PT_VALID != 0 && entry & PT_TABLE != 0 {
-        let next = (entry & 0x0000_FFFF_FFFF_F000) as usize;
-        Some(next as *mut u64)
-    } else {
-        None
-    }
 }
 
 /// Translate a user VA to a physical address by walking the page table.
 /// Returns None if the page is not mapped.
 pub fn translate_va(l0: usize, va: usize) -> Option<usize> {
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1 = walk_table(l0_table, l0_idx)?;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2 = walk_table(l1, l1_idx)?;
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3 = walk_table(l2, l2_idx)?;
-    let l3_idx = (va >> 12) & 0x1FF;
-    let entry = unsafe { *l3.add(l3_idx) };
+    let slot = radix_pt::walk_to_leaf::<Aarch64Pte>(l0, va)?;
+    let entry = unsafe { *slot };
     if entry & PT_VALID == 0 {
         return None;
     }
-    let pa = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+    let pa = (entry & PA_MASK) as usize;
     Some(pa | (va & 0xFFF))
 }
 
 /// Read the raw L3 PTE for a VA. Returns 0 if any level is missing.
 #[allow(dead_code)]
 pub fn read_pte(l0: usize, va: usize) -> u64 {
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1 = match walk_table(l0_table, l0_idx) { Some(t) => t, None => return 0 };
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2 = match walk_table(l1, l1_idx) { Some(t) => t, None => return 0 };
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3 = match walk_table(l2, l2_idx) { Some(t) => t, None => return 0 };
-    let l3_idx = (va >> 12) & 0x1FF;
-    unsafe { *l3.add(l3_idx) }
+    match radix_pt::walk_to_leaf::<Aarch64Pte>(l0, va) {
+        Some(slot) => unsafe { *slot },
+        None => 0,
+    }
 }
 
 /// Number of contiguous L3 PTEs in a contiguous group (16 × 4K = 64K).
@@ -432,36 +297,22 @@ pub fn try_contiguous_promotion(l0: usize, va: usize, group_count: usize) -> boo
     // Align VA down to 64K boundary (the contiguous group boundary).
     let group_va = va & !(CONTIGUOUS_GROUP_SIZE * MMU_PAGE_SIZE - 1);
 
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (group_va >> 39) & 0x1FF;
-    let l1_idx = (group_va >> 30) & 0x1FF;
-    let l2_idx = (group_va >> 21) & 0x1FF;
-    let l3_base_idx = (group_va >> 12) & 0x1FF;
-
-    // Walk to L3 table (read-only, no creation).
-    let l1 = match walk_table(l0_table, l0_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let l2 = match walk_table(l1, l1_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let l3 = match walk_table(l2, l2_idx) {
-        Some(t) => t,
+    // Walk to the first slot in the L3 table for this group.
+    let first_slot = match radix_pt::walk_to_leaf::<Aarch64Pte>(l0, group_va) {
+        Some(s) => s,
         None => return false,
     };
 
     // Verify all 16 PTEs are valid and don't already have the contiguous bit.
     for i in 0..CONTIGUOUS_GROUP_SIZE {
-        let entry = unsafe { *l3.add(l3_base_idx + i) };
+        let entry = unsafe { *first_slot.add(i) };
         if entry & PT_VALID == 0 {
             return false;
         }
     }
 
     // Check if already promoted.
-    let first = unsafe { *l3.add(l3_base_idx) };
+    let first = unsafe { *first_slot };
     if first & PT_CONTIGUOUS != 0 {
         return false;
     }
@@ -469,8 +320,8 @@ pub fn try_contiguous_promotion(l0: usize, va: usize, group_count: usize) -> boo
     // Set the contiguous bit on all 16 PTEs.
     for i in 0..CONTIGUOUS_GROUP_SIZE {
         unsafe {
-            let entry = *l3.add(l3_base_idx + i);
-            *l3.add(l3_base_idx + i) = entry | PT_CONTIGUOUS;
+            let entry = *first_slot.add(i);
+            *first_slot.add(i) = entry | PT_CONTIGUOUS;
         }
     }
 
@@ -493,79 +344,38 @@ pub fn try_contiguous_promotion(l0: usize, va: usize, group_count: usize) -> boo
 /// Downgrade a single 4K PTE from writable to read-only (for COW).
 /// Returns true if the PTE was present and downgraded.
 pub fn downgrade_pte_readonly(l0: usize, va: usize) -> bool {
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3_idx = (va >> 12) & 0x1FF;
-
-    let l1 = match walk_table(l0_table, l0_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_leaf::<Aarch64Pte>(l0, va) {
+        Some(s) => s,
         None => return false,
     };
-    let l2 = match walk_table(l1, l1_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let l3 = match walk_table(l2, l2_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-
-    let entry = unsafe { *l3.add(l3_idx) };
+    let entry = unsafe { *slot };
     if entry & PT_VALID == 0 {
         return false;
     }
     // Set AP[2] (bit 7) to make read-only: AP=11 means EL1/EL0 read-only.
     unsafe {
-        *l3.add(l3_idx) = entry | (1 << 7);
+        *slot = entry | (1 << 7);
     }
-    // TLB invalidate.
-    unsafe {
-        let va_shifted = (va >> 12) as u64;
-        core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("isb");
-    }
+    Aarch64Pte::tlb_invalidate(va);
     true
 }
 
 /// Update the flags of an existing 4K PTE, keeping the physical address.
 /// Returns true if the PTE was present and updated.
 pub fn update_pte_flags(l0: usize, va: usize, new_flags: u64) -> bool {
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-    let l3_idx = (va >> 12) & 0x1FF;
-
-    let l1 = match walk_table(l0_table, l0_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_leaf::<Aarch64Pte>(l0, va) {
+        Some(s) => s,
         None => return false,
     };
-    let l2 = match walk_table(l1, l1_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let l3 = match walk_table(l2, l2_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-
-    let entry = unsafe { *l3.add(l3_idx) };
+    let entry = unsafe { *slot };
     if entry & PT_VALID == 0 {
         return false;
     }
-    let pa_and_sw = entry & (0x0000_FFFF_FFFF_F000 | PTE_SW_ZEROED);
+    let pa_and_sw = entry & (PA_MASK | PTE_SW_ZEROED);
     unsafe {
-        *l3.add(l3_idx) = pa_and_sw | new_flags;
+        *slot = pa_and_sw | new_flags;
     }
-    unsafe {
-        let va_shifted = (va >> 12) as u64;
-        core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
-        core::arch::asm!("dsb ish");
-        core::arch::asm!("isb");
-    }
+    Aarch64Pte::tlb_invalidate(va);
     true
 }
 
@@ -582,25 +392,16 @@ pub fn install_superpage(l0: usize, va: usize, pa: usize, flags: u64) -> bool {
     debug_assert!(va & (SUPER_SIZE - 1) == 0);
     debug_assert!(pa & (SUPER_SIZE - 1) == 0);
 
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-
-    let l1 = match get_or_create_table(l0_table, l0_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let l2 = match get_or_create_table(l1, l1_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_or_create_to_super::<Aarch64Pte>(l0, va) {
+        Some(s) => s,
         None => return false,
     };
 
-    let old_entry = unsafe { *l2.add(l2_idx) };
+    let old_entry = unsafe { *slot };
 
     // If there was an L3 table (table descriptor), free it.
     if old_entry & PT_VALID != 0 && old_entry & PT_TABLE != 0 {
-        let l3_addr = (old_entry & 0x0000_FFFF_FFFF_F000) as usize;
+        let l3_addr = (old_entry & PA_MASK) as usize;
         crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l3_addr));
     }
 
@@ -608,7 +409,7 @@ pub fn install_superpage(l0: usize, va: usize, pa: usize, flags: u64) -> bool {
     // Strip PT_PAGE/PT_TABLE (bit 1) from flags, keep everything else.
     let block_flags = (flags & !0x2) | PT_VALID;
     unsafe {
-        *l2.add(l2_idx) = (pa as u64 & !0x1FFFFF) | block_flags;
+        *slot = (pa as u64 & !0x1FFFFF) | block_flags;
     }
 
     // TLB invalidate the entire 2 MiB range.
@@ -628,14 +429,8 @@ pub fn install_superpage(l0: usize, va: usize, pa: usize, flags: u64) -> bool {
 /// Check if `va` is mapped as a 2 MiB block at L2.
 /// Returns the base physical address if so.
 pub fn is_superpage(l0: usize, va: usize) -> Option<usize> {
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-
-    let l1 = walk_table(l0_table, l0_idx)?;
-    let l2 = walk_table(l1, l1_idx)?;
-    let entry = unsafe { *l2.add(l2_idx) };
+    let slot = radix_pt::walk_to_super_slot::<Aarch64Pte>(l0, va)?;
+    let entry = unsafe { *slot };
     // Block descriptor: valid (bit 0) but NOT table (bit 1 clear).
     if entry & PT_VALID != 0 && entry & PT_TABLE == 0 {
         let pa = (entry & 0x0000_FFFF_FFE0_0000) as usize;
@@ -649,21 +444,12 @@ pub fn is_superpage(l0: usize, va: usize) -> Option<usize> {
 /// Allocates a new L3 table, fills it with page entries, and replaces
 /// the L2 block with a table descriptor.
 pub fn demote_superpage(l0: usize, va: usize, flags: u64) -> bool {
-    let l0_table = l0 as *mut u64;
-    let l0_idx = (va >> 39) & 0x1FF;
-    let l1_idx = (va >> 30) & 0x1FF;
-    let l2_idx = (va >> 21) & 0x1FF;
-
-    let l1 = match walk_table(l0_table, l0_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let l2 = match walk_table(l1, l1_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_super_slot::<Aarch64Pte>(l0, va) {
+        Some(s) => s,
         None => return false,
     };
 
-    let entry = unsafe { *l2.add(l2_idx) };
+    let entry = unsafe { *slot };
     // Must be a valid block (bit 0 set, bit 1 clear).
     if entry & PT_VALID == 0 || entry & PT_TABLE != 0 {
         return false;
@@ -688,7 +474,7 @@ pub fn demote_superpage(l0: usize, va: usize, flags: u64) -> bool {
 
     // Replace L2 block with table descriptor pointing to L3.
     unsafe {
-        *l2.add(l2_idx) = (l3 as u64) | PT_VALID | PT_TABLE;
+        *slot = (l3 as u64) | PT_VALID | PT_TABLE;
     }
 
     // TLB invalidate the 2 MiB range.

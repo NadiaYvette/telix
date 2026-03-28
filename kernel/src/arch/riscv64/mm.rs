@@ -5,6 +5,7 @@
 //! User pages are mapped at arbitrary VAs via 4K leaf entries.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::mm::radix_pt::{self, PteFormat};
 
 /// Kernel page table root, set by BSP after enable_mmu.
 static KERNEL_PT_ROOT: AtomicUsize = AtomicUsize::new(0);
@@ -95,22 +96,15 @@ pub fn map_user_pages(
     size: usize,
     flags: u64,
 ) -> Option<()> {
-    let root_table = root as *mut u64;
     let num_pages = (size + MMU_PAGE_SIZE - 1) / MMU_PAGE_SIZE;
 
     for i in 0..num_pages {
         let va = virt + i * MMU_PAGE_SIZE;
         let pa = phys + i * MMU_PAGE_SIZE;
 
-        let vpn2 = (va >> 30) & 0x1FF;
-        let vpn1 = (va >> 21) & 0x1FF;
-        let vpn0 = (va >> 12) & 0x1FF;
-
-        let l1 = get_or_create_table(root_table, vpn2)?;
-        let l2 = get_or_create_table(l1, vpn1)?;
-
+        let slot = radix_pt::walk_or_create::<Sv39Pte>(root, va)?;
         unsafe {
-            *l2.add(vpn0) = pte_leaf(pa, flags);
+            *slot = pte_leaf(pa, flags);
         }
     }
     Some(())
@@ -122,7 +116,7 @@ pub fn map_user_pages(
 
 pub struct Sv39Pte;
 
-impl crate::mm::radix_pt::PteFormat for Sv39Pte {
+impl PteFormat for Sv39Pte {
     const LEVELS: usize = 3;
 
     #[inline]
@@ -165,194 +159,105 @@ impl crate::mm::radix_pt::PteFormat for Sv39Pte {
     }
 }
 
-/// Get or create a next-level page table at the given index.
-fn get_or_create_table(table: *mut u64, index: usize) -> Option<*mut u64> {
-    let entry = unsafe { *table.add(index) };
-    if entry & PTE_V != 0 {
-        if entry & (PTE_R | PTE_W | PTE_X) != 0 {
-            // Leaf (superpage) — cannot subdivide.
-            return None;
-        }
-        // Non-leaf: extract physical address of next table.
-        let phys = ((entry >> 10) << 12) as usize;
-        Some(phys as *mut u64)
-    } else {
-        let next = alloc_table()?;
-        unsafe {
-            *table.add(index) = pte_table(next);
-        }
-        Some(next as *mut u64)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Per-MMU-page operations for demand paging
 // ---------------------------------------------------------------------------
 
 /// Map a single 4K MMU page at `va` to physical address `pa` with given flags.
 pub fn map_single_mmupage(root: usize, va: usize, pa: usize, flags: u64) -> bool {
-    let root_table = root as *mut u64;
-    let vpn2 = (va >> 30) & 0x1FF;
-    let vpn1 = (va >> 21) & 0x1FF;
-    let vpn0 = (va >> 12) & 0x1FF;
-
-    let l1 = match get_or_create_table(root_table, vpn2) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_or_create::<Sv39Pte>(root, va) {
+        Some(s) => s,
         None => return false,
     };
-    let l2 = match get_or_create_table(l1, vpn1) {
-        Some(t) => t,
-        None => return false,
-    };
-
     unsafe {
-        *l2.add(vpn0) = pte_leaf(pa, flags);
+        *slot = pte_leaf(pa, flags);
     }
-    // TLB invalidate.
-    unsafe {
-        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
-    }
+    Sv39Pte::tlb_invalidate(va);
     true
 }
 
 /// Unmap a single 4K MMU page at `va`. Returns the old physical address, or 0.
 pub fn unmap_single_mmupage(root: usize, va: usize) -> usize {
-    let root_table = root as *mut u64;
-    let vpn2 = (va >> 30) & 0x1FF;
-    let vpn1 = (va >> 21) & 0x1FF;
-    let vpn0 = (va >> 12) & 0x1FF;
-
-    let l1 = match walk_table(root_table, vpn2) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_leaf::<Sv39Pte>(root, va) {
+        Some(s) => s,
         None => return 0,
     };
-    let l2 = match walk_table(l1, vpn1) {
-        Some(t) => t,
-        None => return 0,
-    };
-
-    let entry = unsafe { *l2.add(vpn0) };
+    let entry = unsafe { *slot };
     if entry & PTE_V == 0 {
         return 0;
     }
     let pa = ((entry >> 10) << 12) as usize;
     unsafe {
-        *l2.add(vpn0) = 0;
+        *slot = 0;
     }
-    unsafe {
-        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
-    }
+    Sv39Pte::tlb_invalidate(va);
     pa
 }
 
 /// Read the raw leaf PTE for a VA. Returns 0 if any level is missing.
 pub fn read_pte(root: usize, va: usize) -> u64 {
-    let root_table = root as *mut u64;
-    let vpn2 = (va >> 30) & 0x1FF;
-    let vpn1 = (va >> 21) & 0x1FF;
-    let vpn0 = (va >> 12) & 0x1FF;
-    let l1 = match walk_table(root_table, vpn2) { Some(t) => t, None => return 0 };
-    let l2 = match walk_table(l1, vpn1) { Some(t) => t, None => return 0 };
-    unsafe { *l2.add(vpn0) }
+    match radix_pt::walk_to_leaf::<Sv39Pte>(root, va) {
+        Some(slot) => unsafe { *slot },
+        None => 0,
+    }
 }
 
 /// Evict a 4K MMU page: clear Valid bit but preserve PTE_SW_ZEROED hint.
 /// Returns old PA, or 0. Used by WSCLOCK.
 pub fn evict_mmupage(root: usize, va: usize) -> usize {
-    let root_table = root as *mut u64;
-    let vpn2 = (va >> 30) & 0x1FF;
-    let vpn1 = (va >> 21) & 0x1FF;
-    let vpn0 = (va >> 12) & 0x1FF;
-
-    let l1 = match walk_table(root_table, vpn2) { Some(t) => t, None => return 0 };
-    let l2 = match walk_table(l1, vpn1) { Some(t) => t, None => return 0 };
-
-    let entry = unsafe { *l2.add(vpn0) };
+    let slot = match radix_pt::walk_to_leaf::<Sv39Pte>(root, va) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let entry = unsafe { *slot };
     if entry & PTE_V == 0 { return 0; }
     let pa = ((entry >> 10) << 12) as usize;
     unsafe {
-        *l2.add(vpn0) = entry & PTE_SW_ZEROED;
+        *slot = entry & PTE_SW_ZEROED;
     }
-    unsafe {
-        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
-    }
+    Sv39Pte::tlb_invalidate(va);
     pa
 }
 
 /// Clear a PTE entirely (valid + SW bits). Used for madvise_dontneed and cleanup.
 pub fn clear_pte(root: usize, va: usize) {
-    let root_table = root as *mut u64;
-    let vpn2 = (va >> 30) & 0x1FF;
-    let vpn1 = (va >> 21) & 0x1FF;
-    let vpn0 = (va >> 12) & 0x1FF;
-
-    let l1 = match walk_table(root_table, vpn2) { Some(t) => t, None => return };
-    let l2 = match walk_table(l1, vpn1) { Some(t) => t, None => return };
-
-    let entry = unsafe { *l2.add(vpn0) };
+    let slot = match radix_pt::walk_to_leaf::<Sv39Pte>(root, va) {
+        Some(s) => s,
+        None => return,
+    };
+    let entry = unsafe { *slot };
     if entry != 0 {
-        unsafe { *l2.add(vpn0) = 0; }
-        unsafe {
-            core::arch::asm!("sfence.vma {}, zero", in(reg) va);
-        }
+        unsafe { *slot = 0; }
+        Sv39Pte::tlb_invalidate(va);
     }
 }
 
 /// Read and clear the Accessed bit for the PTE at `va`.
 /// Returns true if the page was referenced.
 pub fn read_and_clear_ref_bit(root: usize, va: usize) -> bool {
-    let root_table = root as *mut u64;
-    let vpn2 = (va >> 30) & 0x1FF;
-    let vpn1 = (va >> 21) & 0x1FF;
-    let vpn0 = (va >> 12) & 0x1FF;
-
-    let l1 = match walk_table(root_table, vpn2) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_leaf::<Sv39Pte>(root, va) {
+        Some(s) => s,
         None => return false,
     };
-    let l2 = match walk_table(l1, vpn1) {
-        Some(t) => t,
-        None => return false,
-    };
-
-    let entry = unsafe { *l2.add(vpn0) };
+    let entry = unsafe { *slot };
     if entry & PTE_V == 0 {
         return false;
     }
     let referenced = (entry & PTE_A) != 0;
     if referenced {
         unsafe {
-            *l2.add(vpn0) = entry & !PTE_A;
+            *slot = entry & !PTE_A;
         }
-        unsafe {
-            core::arch::asm!("sfence.vma {}, zero", in(reg) va);
-        }
+        Sv39Pte::tlb_invalidate(va);
     }
     referenced
-}
-
-/// Walk an existing non-leaf table entry. Returns next-level table pointer or None.
-fn walk_table(table: *mut u64, index: usize) -> Option<*mut u64> {
-    let entry = unsafe { *table.add(index) };
-    if entry & PTE_V != 0 && entry & (PTE_R | PTE_W | PTE_X) == 0 {
-        // Non-leaf: extract physical address.
-        let phys = ((entry >> 10) << 12) as usize;
-        Some(phys as *mut u64)
-    } else {
-        None
-    }
 }
 
 /// Translate a user VA to a physical address by walking the Sv39 page table.
 /// Returns None if the page is not mapped.
 pub fn translate_va(root: usize, va: usize) -> Option<usize> {
-    let root_table = root as *mut u64;
-    let vpn2 = (va >> 30) & 0x1FF;
-    let vpn1 = (va >> 21) & 0x1FF;
-    let vpn0 = (va >> 12) & 0x1FF;
-    let l1 = walk_table(root_table, vpn2)?;
-    let l2 = walk_table(l1, vpn1)?;
-    let entry = unsafe { *l2.add(vpn0) };
+    let slot = radix_pt::walk_to_leaf::<Sv39Pte>(root, va)?;
+    let entry = unsafe { *slot };
     if entry & PTE_V == 0 {
         return None;
     }
@@ -363,62 +268,37 @@ pub fn translate_va(root: usize, va: usize) -> Option<usize> {
 /// Downgrade a single 4K PTE from writable to read-only (for COW).
 /// Returns true if the PTE was present and downgraded.
 pub fn downgrade_pte_readonly(root: usize, va: usize) -> bool {
-    let root_table = root as *mut u64;
-    let vpn2 = (va >> 30) & 0x1FF;
-    let vpn1 = (va >> 21) & 0x1FF;
-    let vpn0 = (va >> 12) & 0x1FF;
-
-    let l1 = match walk_table(root_table, vpn2) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_leaf::<Sv39Pte>(root, va) {
+        Some(s) => s,
         None => return false,
     };
-    let l2 = match walk_table(l1, vpn1) {
-        Some(t) => t,
-        None => return false,
-    };
-
-    let entry = unsafe { *l2.add(vpn0) };
+    let entry = unsafe { *slot };
     if entry & PTE_V == 0 {
         return false;
     }
-    // Clear the W bit to make read-only.
     unsafe {
-        *l2.add(vpn0) = entry & !PTE_W;
+        *slot = entry & !PTE_W;
     }
-    unsafe {
-        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
-    }
+    Sv39Pte::tlb_invalidate(va);
     true
 }
 
 /// Update the flags of an existing 4K PTE, keeping the physical address.
 /// Returns true if the PTE was present and updated.
 pub fn update_pte_flags(root: usize, va: usize, new_flags: u64) -> bool {
-    let root_table = root as *mut u64;
-    let vpn2 = (va >> 30) & 0x1FF;
-    let vpn1 = (va >> 21) & 0x1FF;
-    let vpn0 = (va >> 12) & 0x1FF;
-
-    let l1 = match walk_table(root_table, vpn2) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_leaf::<Sv39Pte>(root, va) {
+        Some(s) => s,
         None => return false,
     };
-    let l2 = match walk_table(l1, vpn1) {
-        Some(t) => t,
-        None => return false,
-    };
-
-    let entry = unsafe { *l2.add(vpn0) };
+    let entry = unsafe { *slot };
     if entry & PTE_V == 0 {
         return false;
     }
     let ppn = entry & !0x3FF; // Keep PPN bits (10..53), clear flag bits (0..9)
     unsafe {
-        *l2.add(vpn0) = ppn | new_flags;
+        *slot = ppn | new_flags;
     }
-    unsafe {
-        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
-    }
+    Sv39Pte::tlb_invalidate(va);
     true
 }
 
@@ -429,16 +309,12 @@ pub fn install_superpage(root: usize, va: usize, pa: usize, flags: u64) -> bool 
     debug_assert!(va & (SUPER_SIZE - 1) == 0);
     debug_assert!(pa & (SUPER_SIZE - 1) == 0);
 
-    let root_table = root as *mut u64;
-    let vpn2 = (va >> 30) & 0x1FF;
-    let vpn1 = (va >> 21) & 0x1FF;
-
-    let l1 = match get_or_create_table(root_table, vpn2) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_or_create_to_super::<Sv39Pte>(root, va) {
+        Some(s) => s,
         None => return false,
     };
 
-    let old_entry = unsafe { *l1.add(vpn1) };
+    let old_entry = unsafe { *slot };
 
     // If there was an L0 table (non-leaf, valid), free it.
     if old_entry & PTE_V != 0 && old_entry & (PTE_R | PTE_W | PTE_X) == 0 {
@@ -448,23 +324,16 @@ pub fn install_superpage(root: usize, va: usize, pa: usize, flags: u64) -> bool 
 
     // Install megapage leaf entry at L1.
     unsafe {
-        *l1.add(vpn1) = pte_leaf(pa, flags);
+        *slot = pte_leaf(pa, flags);
     }
-    unsafe {
-        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
-    }
+    Sv39Pte::tlb_invalidate(va);
     true
 }
 
 /// Check if `va` is mapped as a 2 MiB megapage (leaf at L1 level).
 pub fn is_superpage(root: usize, va: usize) -> Option<usize> {
-    let root_table = root as *mut u64;
-    let vpn2 = (va >> 30) & 0x1FF;
-    let vpn1 = (va >> 21) & 0x1FF;
-
-    // Walk to L1 through root (non-leaf entry at root[vpn2]).
-    let l1 = walk_table(root_table, vpn2)?;
-    let entry = unsafe { *l1.add(vpn1) };
+    let slot = radix_pt::walk_to_super_slot::<Sv39Pte>(root, va)?;
+    let entry = unsafe { *slot };
     if entry & PTE_V != 0 && entry & (PTE_R | PTE_W | PTE_X) != 0 {
         // Leaf at L1 = megapage.
         let pa = ((entry >> 10) << 12) as usize;
@@ -477,16 +346,12 @@ pub fn is_superpage(root: usize, va: usize) -> Option<usize> {
 
 /// Demote a 2 MiB megapage back to 512 individual 4K PTEs.
 pub fn demote_superpage(root: usize, va: usize, flags: u64) -> bool {
-    let root_table = root as *mut u64;
-    let vpn2 = (va >> 30) & 0x1FF;
-    let vpn1 = (va >> 21) & 0x1FF;
-
-    let l1 = match walk_table(root_table, vpn2) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_super_slot::<Sv39Pte>(root, va) {
+        Some(s) => s,
         None => return false,
     };
 
-    let entry = unsafe { *l1.add(vpn1) };
+    let entry = unsafe { *slot };
     if entry & PTE_V == 0 || entry & (PTE_R | PTE_W | PTE_X) == 0 {
         return false; // Not a megapage leaf.
     }
@@ -510,11 +375,9 @@ pub fn demote_superpage(root: usize, va: usize, flags: u64) -> bool {
 
     // Replace L1 entry with non-leaf pointer to L0.
     unsafe {
-        *l1.add(vpn1) = pte_table(l0);
+        *slot = pte_table(l0);
     }
-    unsafe {
-        core::arch::asm!("sfence.vma {}, zero", in(reg) va);
-    }
+    Sv39Pte::tlb_invalidate(va);
     true
 }
 

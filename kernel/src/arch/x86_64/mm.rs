@@ -24,6 +24,8 @@ const MMU_PAGE_SIZE: usize = 4096;
 /// may be a user process's page table during sys_spawn).
 static BOOT_PML4: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+use crate::mm::radix_pt::{self, PteFormat};
+
 /// User page flags (public for main.rs).
 pub const USER_RWX_FLAGS: u64 = PTE_P | PTE_RW | PTE_US;
 pub const USER_RW_FLAGS: u64 = PTE_P | PTE_RW | PTE_US | PTE_NX;
@@ -62,24 +64,15 @@ pub fn map_user_pages(
     size: usize,
     flags: u64,
 ) -> Option<()> {
-    let pml4_table = pml4 as *mut u64;
     let num_pages = (size + MMU_PAGE_SIZE - 1) / MMU_PAGE_SIZE;
 
     for i in 0..num_pages {
         let va = virt + i * MMU_PAGE_SIZE;
         let pa = phys + i * MMU_PAGE_SIZE;
 
-        let pml4_idx = (va >> 39) & 0x1FF;
-        let pdpt_idx = (va >> 30) & 0x1FF;
-        let pd_idx = (va >> 21) & 0x1FF;
-        let pt_idx = (va >> 12) & 0x1FF;
-
-        let pdpt = get_or_create_table(pml4_table, pml4_idx)?;
-        let pd = get_or_create_table(pdpt, pdpt_idx)?;
-        let pt = get_or_create_table(pd, pd_idx)?;
-
+        let slot = radix_pt::walk_or_create::<X86Pte>(pml4, va)?;
         unsafe {
-            *pt.add(pt_idx) = (pa as u64 & !0xFFF) | flags;
+            *slot = (pa as u64 & !0xFFF) | flags;
         }
     }
     Some(())
@@ -134,26 +127,6 @@ impl crate::mm::radix_pt::PteFormat for X86Pte {
     }
 }
 
-/// Get or create a next-level page table at the given index.
-fn get_or_create_table(table: *mut u64, index: usize) -> Option<*mut u64> {
-    let entry = unsafe { *table.add(index) };
-    if entry & PTE_P != 0 {
-        if entry & PTE_PS != 0 {
-            // Large page — cannot subdivide.
-            return None;
-        }
-        let next = (entry & 0x000F_FFFF_FFFF_F000) as usize;
-        Some(next as *mut u64)
-    } else {
-        let next = alloc_table()?;
-        unsafe {
-            // Non-leaf entries need P + RW + US for user page walks.
-            *table.add(index) = (next as u64) | PTE_P | PTE_RW | PTE_US;
-        }
-        Some(next as *mut u64)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Per-MMU-page operations for demand paging
 // ---------------------------------------------------------------------------
@@ -163,196 +136,97 @@ const PTE_A: u64 = 1 << 5;
 
 /// Map a single 4K MMU page at `va` to physical address `pa` with given flags.
 pub fn map_single_mmupage(pml4: usize, va: usize, pa: usize, flags: u64) -> bool {
-    let pml4_table = pml4 as *mut u64;
-    let pml4_idx = (va >> 39) & 0x1FF;
-    let pdpt_idx = (va >> 30) & 0x1FF;
-    let pd_idx = (va >> 21) & 0x1FF;
-    let pt_idx = (va >> 12) & 0x1FF;
-
-    let pdpt = match get_or_create_table(pml4_table, pml4_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_or_create::<X86Pte>(pml4, va) {
+        Some(s) => s,
         None => return false,
     };
-    let pd = match get_or_create_table(pdpt, pdpt_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let pt = match get_or_create_table(pd, pd_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-
     unsafe {
-        *pt.add(pt_idx) = (pa as u64 & !0xFFF) | flags;
+        *slot = (pa as u64 & !0xFFF) | flags;
     }
-    // invlpg
-    unsafe {
-        core::arch::asm!("invlpg [{}]", in(reg) va);
-    }
+    X86Pte::tlb_invalidate(va);
     true
 }
 
 /// Unmap a single 4K MMU page at `va`. Returns the old physical address, or 0.
 pub fn unmap_single_mmupage(pml4: usize, va: usize) -> usize {
-    let pml4_table = pml4 as *mut u64;
-    let pml4_idx = (va >> 39) & 0x1FF;
-    let pdpt_idx = (va >> 30) & 0x1FF;
-    let pd_idx = (va >> 21) & 0x1FF;
-    let pt_idx = (va >> 12) & 0x1FF;
-
-    let pdpt = match walk_table(pml4_table, pml4_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_leaf::<X86Pte>(pml4, va) {
+        Some(s) => s,
         None => return 0,
     };
-    let pd = match walk_table(pdpt, pdpt_idx) {
-        Some(t) => t,
-        None => return 0,
-    };
-    let pt = match walk_table(pd, pd_idx) {
-        Some(t) => t,
-        None => return 0,
-    };
-
-    let entry = unsafe { *pt.add(pt_idx) };
+    let entry = unsafe { *slot };
     if entry & PTE_P == 0 {
         return 0;
     }
-    let pa = (entry & 0x000F_FFFF_FFFF_F000) as usize;
-    unsafe {
-        *pt.add(pt_idx) = 0;
-    }
-    unsafe {
-        core::arch::asm!("invlpg [{}]", in(reg) va);
-    }
+    let pa = X86Pte::leaf_pa(entry);
+    unsafe { *slot = 0; }
+    X86Pte::tlb_invalidate(va);
     pa
 }
 
 /// Read the raw leaf PTE for a VA. Returns 0 if any level is missing.
 pub fn read_pte(pml4: usize, va: usize) -> u64 {
-    let pml4_table = pml4 as *mut u64;
-    let pml4_idx = (va >> 39) & 0x1FF;
-    let pdpt_idx = (va >> 30) & 0x1FF;
-    let pd_idx = (va >> 21) & 0x1FF;
-    let pt_idx = (va >> 12) & 0x1FF;
-
-    let pdpt = match walk_table(pml4_table, pml4_idx) { Some(t) => t, None => return 0 };
-    let pd = match walk_table(pdpt, pdpt_idx) { Some(t) => t, None => return 0 };
-    let pt = match walk_table(pd, pd_idx) { Some(t) => t, None => return 0 };
-    unsafe { *pt.add(pt_idx) }
+    match radix_pt::walk_to_leaf::<X86Pte>(pml4, va) {
+        Some(slot) => unsafe { *slot },
+        None => 0,
+    }
 }
 
 /// Evict a 4K MMU page: clear Present bit but preserve PTE_SW_ZEROED hint.
 /// Returns old PA, or 0. Used by WSCLOCK.
 pub fn evict_mmupage(pml4: usize, va: usize) -> usize {
-    let pml4_table = pml4 as *mut u64;
-    let pml4_idx = (va >> 39) & 0x1FF;
-    let pdpt_idx = (va >> 30) & 0x1FF;
-    let pd_idx = (va >> 21) & 0x1FF;
-    let pt_idx = (va >> 12) & 0x1FF;
-
-    let pdpt = match walk_table(pml4_table, pml4_idx) { Some(t) => t, None => return 0 };
-    let pd = match walk_table(pdpt, pdpt_idx) { Some(t) => t, None => return 0 };
-    let pt = match walk_table(pd, pd_idx) { Some(t) => t, None => return 0 };
-
-    let entry = unsafe { *pt.add(pt_idx) };
+    let slot = match radix_pt::walk_to_leaf::<X86Pte>(pml4, va) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let entry = unsafe { *slot };
     if entry & PTE_P == 0 { return 0; }
-    let pa = (entry & 0x000F_FFFF_FFFF_F000) as usize;
-    unsafe {
-        *pt.add(pt_idx) = entry & PTE_SW_ZEROED;
-    }
-    unsafe {
-        core::arch::asm!("invlpg [{}]", in(reg) va);
-    }
+    let pa = X86Pte::leaf_pa(entry);
+    unsafe { *slot = entry & PTE_SW_ZEROED; }
+    X86Pte::tlb_invalidate(va);
     pa
 }
 
 /// Clear a PTE entirely (valid + SW bits). Used for madvise_dontneed and cleanup.
 pub fn clear_pte(pml4: usize, va: usize) {
-    let pml4_table = pml4 as *mut u64;
-    let pml4_idx = (va >> 39) & 0x1FF;
-    let pdpt_idx = (va >> 30) & 0x1FF;
-    let pd_idx = (va >> 21) & 0x1FF;
-    let pt_idx = (va >> 12) & 0x1FF;
-
-    let pdpt = match walk_table(pml4_table, pml4_idx) { Some(t) => t, None => return };
-    let pd = match walk_table(pdpt, pdpt_idx) { Some(t) => t, None => return };
-    let pt = match walk_table(pd, pd_idx) { Some(t) => t, None => return };
-
-    let entry = unsafe { *pt.add(pt_idx) };
+    let slot = match radix_pt::walk_to_leaf::<X86Pte>(pml4, va) {
+        Some(s) => s,
+        None => return,
+    };
+    let entry = unsafe { *slot };
     if entry != 0 {
-        unsafe { *pt.add(pt_idx) = 0; }
-        unsafe {
-            core::arch::asm!("invlpg [{}]", in(reg) va);
-        }
+        unsafe { *slot = 0; }
+        X86Pte::tlb_invalidate(va);
     }
 }
 
 /// Read and clear the Accessed bit for the PTE at `va`.
 /// Returns true if the page was referenced.
 pub fn read_and_clear_ref_bit(pml4: usize, va: usize) -> bool {
-    let pml4_table = pml4 as *mut u64;
-    let pml4_idx = (va >> 39) & 0x1FF;
-    let pdpt_idx = (va >> 30) & 0x1FF;
-    let pd_idx = (va >> 21) & 0x1FF;
-    let pt_idx = (va >> 12) & 0x1FF;
-
-    let pdpt = match walk_table(pml4_table, pml4_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_leaf::<X86Pte>(pml4, va) {
+        Some(s) => s,
         None => return false,
     };
-    let pd = match walk_table(pdpt, pdpt_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let pt = match walk_table(pd, pd_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-
-    let entry = unsafe { *pt.add(pt_idx) };
+    let entry = unsafe { *slot };
     if entry & PTE_P == 0 {
         return false;
     }
     let referenced = (entry & PTE_A) != 0;
     if referenced {
-        unsafe {
-            *pt.add(pt_idx) = entry & !PTE_A;
-        }
-        unsafe {
-            core::arch::asm!("invlpg [{}]", in(reg) va);
-        }
+        unsafe { *slot = entry & !PTE_A; }
+        X86Pte::tlb_invalidate(va);
     }
     referenced
-}
-
-/// Walk an existing non-leaf table entry. Returns next-level table pointer or None.
-fn walk_table(table: *mut u64, index: usize) -> Option<*mut u64> {
-    let entry = unsafe { *table.add(index) };
-    if entry & PTE_P != 0 && entry & PTE_PS == 0 {
-        let next = (entry & 0x000F_FFFF_FFFF_F000) as usize;
-        Some(next as *mut u64)
-    } else {
-        None
-    }
 }
 
 /// Translate a user VA to a physical address by walking the x86-64 page table.
 /// Returns None if the page is not mapped.
 pub fn translate_va(pml4: usize, va: usize) -> Option<usize> {
-    let pml4_table = pml4 as *mut u64;
-    let pml4_idx = (va >> 39) & 0x1FF;
-    let pdpt_idx = (va >> 30) & 0x1FF;
-    let pd_idx = (va >> 21) & 0x1FF;
-    let pt_idx = (va >> 12) & 0x1FF;
-
-    let pdpt = walk_table(pml4_table, pml4_idx)?;
-    let pd = walk_table(pdpt, pdpt_idx)?;
-    let pt = walk_table(pd, pd_idx)?;
-    let entry = unsafe { *pt.add(pt_idx) };
+    let slot = radix_pt::walk_to_leaf::<X86Pte>(pml4, va)?;
+    let entry = unsafe { *slot };
     if entry & PTE_P == 0 {
         return None;
     }
-    let pa = (entry & 0x000F_FFFF_FFFF_F000) as usize;
+    let pa = X86Pte::leaf_pa(entry);
     Some(pa | (va & 0xFFF))
 }
 
@@ -479,72 +353,34 @@ unsafe fn free_pd_user(pd: usize) {
 /// Downgrade a single 4K PTE from writable to read-only (for COW).
 /// Returns true if the PTE was present and downgraded.
 pub fn downgrade_pte_readonly(pml4: usize, va: usize) -> bool {
-    let pml4_table = pml4 as *mut u64;
-    let pml4_idx = (va >> 39) & 0x1FF;
-    let pdpt_idx = (va >> 30) & 0x1FF;
-    let pd_idx = (va >> 21) & 0x1FF;
-    let pt_idx = (va >> 12) & 0x1FF;
-
-    let pdpt = match walk_table(pml4_table, pml4_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_leaf::<X86Pte>(pml4, va) {
+        Some(s) => s,
         None => return false,
     };
-    let pd = match walk_table(pdpt, pdpt_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let pt = match walk_table(pd, pd_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-
-    let entry = unsafe { *pt.add(pt_idx) };
+    let entry = unsafe { *slot };
     if entry & PTE_P == 0 {
         return false;
     }
     // Clear the RW bit to make read-only.
-    unsafe {
-        *pt.add(pt_idx) = entry & !PTE_RW;
-    }
-    unsafe {
-        core::arch::asm!("invlpg [{}]", in(reg) va);
-    }
+    unsafe { *slot = entry & !PTE_RW; }
+    X86Pte::tlb_invalidate(va);
     true
 }
 
 /// Update the flags of an existing 4K PTE, keeping the physical address.
 /// Returns true if the PTE was present and updated.
 pub fn update_pte_flags(pml4: usize, va: usize, new_flags: u64) -> bool {
-    let pml4_table = pml4 as *mut u64;
-    let pml4_idx = (va >> 39) & 0x1FF;
-    let pdpt_idx = (va >> 30) & 0x1FF;
-    let pd_idx = (va >> 21) & 0x1FF;
-    let pt_idx = (va >> 12) & 0x1FF;
-
-    let pdpt = match walk_table(pml4_table, pml4_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_leaf::<X86Pte>(pml4, va) {
+        Some(s) => s,
         None => return false,
     };
-    let pd = match walk_table(pdpt, pdpt_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let pt = match walk_table(pd, pd_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-
-    let entry = unsafe { *pt.add(pt_idx) };
+    let entry = unsafe { *slot };
     if entry & PTE_P == 0 {
         return false;
     }
     let pa_and_sw = entry & (0x000F_FFFF_FFFF_F000 | PTE_SW_ZEROED);
-    unsafe {
-        *pt.add(pt_idx) = pa_and_sw | new_flags;
-    }
-    unsafe {
-        core::arch::asm!("invlpg [{}]", in(reg) va);
-    }
+    unsafe { *slot = pa_and_sw | new_flags; }
+    X86Pte::tlb_invalidate(va);
     true
 }
 
@@ -555,49 +391,29 @@ pub fn install_superpage(pml4: usize, va: usize, pa: usize, flags: u64) -> bool 
     debug_assert!(va & (SUPER_SIZE - 1) == 0);
     debug_assert!(pa & (SUPER_SIZE - 1) == 0);
 
-    let pml4_table = pml4 as *mut u64;
-    let pml4_idx = (va >> 39) & 0x1FF;
-    let pdpt_idx = (va >> 30) & 0x1FF;
-    let pd_idx = (va >> 21) & 0x1FF;
-
-    let pdpt = match get_or_create_table(pml4_table, pml4_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let pd = match get_or_create_table(pdpt, pdpt_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_or_create_to_super::<X86Pte>(pml4, va) {
+        Some(s) => s,
         None => return false,
     };
 
-    let old_entry = unsafe { *pd.add(pd_idx) };
+    let old_entry = unsafe { *slot };
 
     // If there was a PT (non-PS, present), free it.
     if old_entry & PTE_P != 0 && old_entry & PTE_PS == 0 {
-        let pt_addr = (old_entry & 0x000F_FFFF_FFFF_F000) as usize;
+        let pt_addr = X86Pte::table_pa(old_entry);
         crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(pt_addr));
     }
 
     // Install 2 MiB large page entry.
-    unsafe {
-        *pd.add(pd_idx) = (pa as u64 & !0x1FFFFF) | flags | PTE_PS;
-    }
-    // Flush TLB for entire 2 MiB range.
-    unsafe {
-        core::arch::asm!("invlpg [{}]", in(reg) va);
-    }
+    unsafe { *slot = (pa as u64 & !0x1FFFFF) | flags | PTE_PS; }
+    X86Pte::tlb_invalidate(va);
     true
 }
 
 /// Check if `va` is mapped as a 2 MiB superpage. Returns (is_super, pa) if so.
 pub fn is_superpage(pml4: usize, va: usize) -> Option<usize> {
-    let pml4_table = pml4 as *mut u64;
-    let pml4_idx = (va >> 39) & 0x1FF;
-    let pdpt_idx = (va >> 30) & 0x1FF;
-    let pd_idx = (va >> 21) & 0x1FF;
-
-    let pdpt = walk_table(pml4_table, pml4_idx)?;
-    let pd = walk_table(pdpt, pdpt_idx)?;
-    let entry = unsafe { *pd.add(pd_idx) };
+    let slot = radix_pt::walk_to_super_slot::<X86Pte>(pml4, va)?;
+    let entry = unsafe { *slot };
     if entry & PTE_P != 0 && entry & PTE_PS != 0 {
         let pa = (entry & 0x000F_FFFF_FFE0_0000) as usize; // Mask to 2 MiB alignment
         Some(pa)
@@ -610,21 +426,12 @@ pub fn is_superpage(pml4: usize, va: usize) -> Option<usize> {
 /// Allocates a new PT page, fills it with 512 entries pointing to the
 /// contiguous physical pages, and replaces the PD entry.
 pub fn demote_superpage(pml4: usize, va: usize, flags: u64) -> bool {
-    let pml4_table = pml4 as *mut u64;
-    let pml4_idx = (va >> 39) & 0x1FF;
-    let pdpt_idx = (va >> 30) & 0x1FF;
-    let pd_idx = (va >> 21) & 0x1FF;
-
-    let pdpt = match walk_table(pml4_table, pml4_idx) {
-        Some(t) => t,
-        None => return false,
-    };
-    let pd = match walk_table(pdpt, pdpt_idx) {
-        Some(t) => t,
+    let slot = match radix_pt::walk_to_super_slot::<X86Pte>(pml4, va) {
+        Some(s) => s,
         None => return false,
     };
 
-    let entry = unsafe { *pd.add(pd_idx) };
+    let entry = unsafe { *slot };
     if entry & PTE_P == 0 || entry & PTE_PS == 0 {
         return false; // Not a superpage.
     }
@@ -647,14 +454,8 @@ pub fn demote_superpage(pml4: usize, va: usize, flags: u64) -> bool {
     }
 
     // Replace PD entry with table pointer.
-    unsafe {
-        *pd.add(pd_idx) = (pt as u64) | PTE_P | PTE_RW | PTE_US;
-    }
-
-    // Flush TLB.
-    unsafe {
-        core::arch::asm!("invlpg [{}]", in(reg) va);
-    }
+    unsafe { *slot = X86Pte::make_table_entry(pt); }
+    X86Pte::tlb_invalidate(va);
     true
 }
 
