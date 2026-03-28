@@ -45,22 +45,38 @@ pub fn start_secondary_cpus() {
     }
     let entry = _secondary_entry as *const () as u64;
 
+    let fw_cpus = crate::firmware::cpus();
     let mut started = 0u32;
-    for cpu in 1..MAX_CPUS {
-        let target_mpidr = cpu as u64; // QEMU virt: MPIDR Aff0 = cpu index
-        let stack_top = unsafe {
-            AP_STACKS.0[cpu].as_ptr().add(AP_STACK_SIZE) as u64
-        };
 
-        // Pass stack_top as context_id (arrives in x0 on secondary).
-        // The secondary reads its CPU ID from MPIDR_EL1.
-        let ret = psci_cpu_on(target_mpidr, entry, stack_top);
-        if ret != 0 {
-            // PSCI returns -2 (INVALID_PARAMETERS) for non-existent CPUs.
-            // Stop probing once we hit the first failure.
-            break;
+    if fw_cpus.len() > 1 {
+        // Use firmware-discovered CPU list (skip first = BSP).
+        for (i, desc) in fw_cpus.iter().enumerate() {
+            if i == 0 { continue; } // BSP
+            if i >= MAX_CPUS { break; }
+            let target_mpidr = desc.id as u64;
+            let stack_top = unsafe {
+                AP_STACKS.0[i].as_ptr().add(AP_STACK_SIZE) as u64
+            };
+            let ret = psci_cpu_on(target_mpidr, entry, stack_top);
+            if ret != 0 {
+                crate::println!("  PSCI CPU_ON for MPIDR {:#x} failed: {}", target_mpidr, ret);
+                continue;
+            }
+            started += 1;
         }
-        started += 1;
+    } else {
+        // Fallback: probe sequentially (original behavior).
+        for cpu in 1..MAX_CPUS {
+            let target_mpidr = cpu as u64;
+            let stack_top = unsafe {
+                AP_STACKS.0[cpu].as_ptr().add(AP_STACK_SIZE) as u64
+            };
+            let ret = psci_cpu_on(target_mpidr, entry, stack_top);
+            if ret != 0 {
+                break;
+            }
+            started += 1;
+        }
     }
 
     if started == 0 {

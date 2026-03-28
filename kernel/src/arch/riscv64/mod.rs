@@ -17,10 +17,21 @@ pub fn init() {
     trap::init();
 }
 
+/// Parse firmware tables (DTB).
+/// Must be called before phys::init().
+pub fn parse_firmware() {
+    boot::parse_firmware();
+}
+
 /// RAM range for the physical allocator.
 pub fn ram_range() -> (usize, usize) {
+    let regions = crate::firmware::mem_regions();
+    if let Some(r) = regions.first() {
+        return (r.base as usize, (r.base + r.size) as usize);
+    }
+    // Fallback: hardcoded QEMU virt values.
     let start = boot::QEMU_VIRT_RAM_BASE;
-    let end = start + 256 * 1024 * 1024; // 256 MiB
+    let end = start + 256 * 1024 * 1024;
     (start, end)
 }
 

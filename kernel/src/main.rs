@@ -4,6 +4,7 @@
 mod arch;
 mod cap;
 mod drivers;
+mod firmware;
 mod io;
 mod ipc;
 mod loader;
@@ -26,6 +27,11 @@ pub fn kmain() -> ! {
 
     // Platform init: exceptions, interrupt controller, timer.
     arch::platform::init();
+
+    // Parse firmware tables (DTB / Multiboot+ACPI) to discover RAM, CPUs,
+    // devices. Must happen before phys::init() — firmware data lives in
+    // physical memory that the allocator could overwrite.
+    arch::platform::parse_firmware();
 
     // Physical memory allocator.
     // Start managed RAM at kernel_end so the allocator never touches

@@ -27,6 +27,10 @@ pub fn init() {
     lapic::init_bsp();
 }
 
+/// Parse firmware tables (Multiboot + ACPI).
+/// Stub — actual implementation in a later commit.
+pub fn parse_firmware() {}
+
 /// RAM range for the physical allocator.
 /// x86 QEMU: RAM starts at 1 MiB, we use 256 MiB total.
 pub fn ram_range() -> (usize, usize) {

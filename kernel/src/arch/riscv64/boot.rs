@@ -38,3 +38,39 @@ pub extern "C" fn _rust_entry(dtb_ptr: usize, hart_id: usize) -> ! {
 
     crate::kmain()
 }
+
+/// Parse firmware tables (DTB) to discover hardware.
+/// Must be called before phys::init() — the DTB blob lives in physical memory.
+pub fn parse_firmware() {
+    let mut dtb = DTB_ADDR.load(Ordering::Relaxed);
+
+    // If a1 didn't carry a valid DTB address, scan near the top of RAM.
+    if dtb == 0 {
+        dtb = scan_for_dtb(QEMU_VIRT_RAM_BASE, 256 * 1024 * 1024);
+    }
+
+    if dtb != 0 {
+        crate::println!("  Firmware: DTB at {:#x}", dtb);
+        crate::firmware::dtb::parse_riscv64(dtb);
+        let nr = crate::firmware::mem_regions().len();
+        let nc = crate::firmware::cpu_count();
+        let nd = crate::firmware::virtio_devices().len();
+        crate::println!("  Firmware: {} mem regions, {} CPUs, {} virtio devices", nr, nc, nd);
+    }
+}
+
+/// Scan for the FDT magic (0xd00dfeed big-endian) at page-aligned addresses.
+fn scan_for_dtb(ram_base: usize, ram_size: usize) -> usize {
+    let magic = [0xd0u8, 0x0d, 0xfe, 0xed];
+    let top = ram_base + ram_size;
+
+    let mut addr = ram_base;
+    while addr < top {
+        let p = addr as *const [u8; 4];
+        if unsafe { *p } == magic {
+            return addr;
+        }
+        addr += 0x1000;
+    }
+    0
+}

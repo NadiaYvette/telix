@@ -70,8 +70,9 @@ pub fn init() {
     crate::println!("  Trap vector installed");
 
     // Configure the timer.
-    // QEMU riscv virt timebase is 10 MHz. We want ~100 Hz.
-    let freq: u64 = 10_000_000; // 10 MHz timebase
+    // Use DTB-discovered timebase frequency, fall back to 10 MHz (QEMU default).
+    let fw_freq = crate::firmware::timebase_freq();
+    let freq: u64 = if fw_freq != 0 { fw_freq } else { 10_000_000 };
     let interval = freq / 100;  // 100 Hz
     TIMER_INTERVAL.store(interval, Ordering::Relaxed);
 

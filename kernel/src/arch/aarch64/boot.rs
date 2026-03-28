@@ -31,3 +31,21 @@ pub extern "C" fn _rust_entry(dtb_ptr: usize) -> ! {
 
     crate::kmain()
 }
+
+/// Parse firmware tables (DTB) to discover hardware.
+/// Must be called before phys::init() — the DTB blob lives in physical memory.
+pub fn parse_firmware() {
+    let dtb = DTB_ADDR.load(Ordering::Relaxed);
+
+    // TODO: QEMU 10.x aarch64 virt doesn't pass DTB address in x0 and
+    // doesn't place the DTB at a discoverable address in RAM. Once the
+    // bootloader protocol is sorted out, enable scanning here.
+    if dtb != 0 {
+        crate::println!("  Firmware: DTB at {:#x}", dtb);
+        crate::firmware::dtb::parse_aarch64(dtb);
+        let nr = crate::firmware::mem_regions().len();
+        let nc = crate::firmware::cpu_count();
+        let nd = crate::firmware::virtio_devices().len();
+        crate::println!("  Firmware: {} mem regions, {} CPUs, {} virtio devices", nr, nc, nd);
+    }
+}

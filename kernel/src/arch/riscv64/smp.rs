@@ -56,28 +56,52 @@ pub fn start_secondary_cpus() {
     let entry = _secondary_hart_entry as *const () as u64;
     let boot_hart = super::boot::BOOT_HART_ID.load(Ordering::Relaxed) as u64;
 
-    // Start all harts except the boot hart.
-    // Assign CPU indices 1, 2, 3 to the secondary harts.
+    let fw_cpus = crate::firmware::cpus();
     let mut cpu_index: usize = 1;
     let mut started = 0u32;
-    for hartid in 0..(MAX_CPUS as u64) {
-        if hartid == boot_hart {
-            continue; // Skip the boot hart (it's already CPU 0).
-        }
 
-        let stack_top = unsafe {
-            AP_STACKS.0[cpu_index].as_ptr().add(AP_STACK_SIZE) as u64
-        };
-        AP_STACK_TOPS[cpu_index].store(stack_top, Ordering::Release);
+    if fw_cpus.len() > 1 {
+        // Use firmware-discovered hart list.
+        for desc in fw_cpus.iter() {
+            let hartid = desc.id as u64;
+            if hartid == boot_hart {
+                continue; // Skip the boot hart.
+            }
+            if cpu_index >= MAX_CPUS { break; }
 
-        // opaque = cpu_index, so the hart knows its CPU ID.
-        let ret = sbi_hart_start(hartid, entry, cpu_index as u64);
-        if ret != 0 {
-            crate::println!("  SBI hart_start for hart {} failed: {}", hartid, ret);
-        } else {
-            started += 1;
+            let stack_top = unsafe {
+                AP_STACKS.0[cpu_index].as_ptr().add(AP_STACK_SIZE) as u64
+            };
+            AP_STACK_TOPS[cpu_index].store(stack_top, Ordering::Release);
+
+            let ret = sbi_hart_start(hartid, entry, cpu_index as u64);
+            if ret != 0 {
+                crate::println!("  SBI hart_start for hart {} failed: {}", hartid, ret);
+            } else {
+                started += 1;
+            }
+            cpu_index += 1;
         }
-        cpu_index += 1;
+    } else {
+        // Fallback: probe sequentially (original behavior).
+        for hartid in 0..(MAX_CPUS as u64) {
+            if hartid == boot_hart {
+                continue;
+            }
+
+            let stack_top = unsafe {
+                AP_STACKS.0[cpu_index].as_ptr().add(AP_STACK_SIZE) as u64
+            };
+            AP_STACK_TOPS[cpu_index].store(stack_top, Ordering::Release);
+
+            let ret = sbi_hart_start(hartid, entry, cpu_index as u64);
+            if ret != 0 {
+                crate::println!("  SBI hart_start for hart {} failed: {}", hartid, ret);
+            } else {
+                started += 1;
+            }
+            cpu_index += 1;
+        }
     }
 
     if started == 0 {

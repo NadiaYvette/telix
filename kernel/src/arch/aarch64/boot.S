@@ -10,6 +10,10 @@
 .global _start
 
 _start:
+    // Save DTB pointer (x0) into callee-saved register so it survives
+    // the EL2→EL1 transition and BSS zeroing.
+    mov     x19, x0
+
     // Check current exception level.
     mrs     x9, CurrentEL
     lsr     x9, x9, #2
@@ -81,7 +85,8 @@ _start:
     add     x9, x9, :lo12:__boot_stack_top
     mov     sp, x9
 
-    // x0 still holds the DTB pointer from firmware.
+    // Restore DTB pointer from x19.
+    mov     x0, x19
     bl      _rust_entry
 
     // Should not return; halt if it does.
