@@ -903,101 +903,36 @@ fn demote_superpages_in_range(pt_root: usize, va_start: usize, mmu_count: usize,
 // Architecture dispatch wrappers
 // ---------------------------------------------------------------------------
 
+use super::hat;
+
 fn ro_flags_for_prot(_prot: VmaProt) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::USER_RO_FLAGS }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::USER_RO_FLAGS }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::USER_RO_FLAGS }
+    hat::USER_RO_FLAGS
 }
 
 fn rw_flags_for_prot(prot: VmaProt) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        use crate::arch::aarch64::mm;
-        match prot {
-            VmaProt::ReadOnly => mm::USER_RO_FLAGS,
-            VmaProt::ReadWrite => mm::USER_RW_FLAGS,
-            VmaProt::ReadExec => mm::USER_RWX_FLAGS,
-            VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
-            VmaProt::None => 0,
-        }
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        use crate::arch::riscv64::mm;
-        match prot {
-            VmaProt::ReadOnly => mm::USER_RO_FLAGS,
-            VmaProt::ReadWrite => mm::USER_RW_FLAGS,
-            VmaProt::ReadExec => mm::USER_RWX_FLAGS,
-            VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
-            VmaProt::None => 0,
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        use crate::arch::x86_64::mm;
-        match prot {
-            VmaProt::ReadOnly => mm::USER_RO_FLAGS,
-            VmaProt::ReadWrite => mm::USER_RW_FLAGS,
-            VmaProt::ReadExec => mm::USER_RWX_FLAGS,
-            VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
-            VmaProt::None => 0,
-        }
-    }
+    hat::pte_flags_for_prot(prot)
 }
 
 fn create_user_page_table() -> Option<usize> {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::setup_tables() }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::setup_tables() }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::create_user_page_table() }
+    hat::create_user_page_table()
 }
 
 fn free_page_table_tree(root: usize) {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::free_page_table_tree(root); }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::free_page_table_tree(root); }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::free_page_table_tree(root); }
+    hat::free_page_table_tree(root);
 }
 
 fn downgrade_pte_readonly(pt_root: usize, va: usize) {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::downgrade_pte_readonly(pt_root, va); }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::downgrade_pte_readonly(pt_root, va); }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::downgrade_pte_readonly(pt_root, va); }
+    hat::downgrade_pte_readonly(pt_root, va);
 }
 
 fn translate_va(pt_root: usize, va: usize) -> Option<usize> {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::translate_va(pt_root, va) }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::translate_va(pt_root, va) }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::translate_va(pt_root, va) }
+    hat::translate_va(pt_root, va)
 }
 
 fn map_single_mmupage(pt_root: usize, va: usize, pa: usize, flags: u64) {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::map_single_mmupage(pt_root, va, pa, flags); }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::map_single_mmupage(pt_root, va, pa, flags); }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::map_single_mmupage(pt_root, va, pa, flags); }
+    hat::map_single_mmupage(pt_root, va, pa, flags);
 }
 
 fn update_pte_flags(pt_root: usize, va: usize, flags: u64) {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::update_pte_flags(pt_root, va, flags); }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::update_pte_flags(pt_root, va, flags); }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::update_pte_flags(pt_root, va, flags); }
+    hat::update_pte_flags(pt_root, va, flags);
 }

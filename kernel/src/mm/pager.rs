@@ -309,20 +309,12 @@ pub fn complete_fault(token: u32, data_va: usize, data_len: usize) -> bool {
     true
 }
 
+use super::hat;
+
 fn translate_va(pt_root: usize, va: usize) -> Option<usize> {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::translate_va(pt_root, va) }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::translate_va(pt_root, va) }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::translate_va(pt_root, va) }
+    hat::translate_va(pt_root, va)
 }
 
 fn install_pte(pt_root: usize, va: usize, pa: usize, flags: u64) {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::map_single_mmupage(pt_root, va, pa, flags); }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::map_single_mmupage(pt_root, va, pa, flags); }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::map_single_mmupage(pt_root, va, pa, flags); }
+    hat::map_single_mmupage(pt_root, va, pa, flags);
 }

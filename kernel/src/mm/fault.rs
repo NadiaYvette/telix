@@ -11,6 +11,7 @@
 //! These replace the per-VMA installed/zeroed bitmaps.
 
 use super::aspace::{self, ASpaceId};
+use super::hat;
 use super::object;
 use super::page::{
     MMUPAGE_SIZE, PAGE_SIZE, PAGE_MMUCOUNT,
@@ -47,63 +48,16 @@ pub enum FaultResult {
 }
 
 // ---------------------------------------------------------------------------
-// Architecture-dispatch PTE query helpers
+// Legacy re-exports — callers outside this module still use these names.
+// They delegate to mm::hat and will be removed once all callers migrate.
 // ---------------------------------------------------------------------------
 
-/// Read the raw leaf PTE for a VA.
-pub fn read_pte_dispatch(pt_root: usize, va: usize) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::read_pte(pt_root, va) }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::read_pte(pt_root, va) }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::read_pte(pt_root, va) }
-}
-
-/// Check if a PTE has the valid/present bit set.
-pub fn pte_is_present(pte: u64) -> bool {
-    pte & 1 != 0 // Bit 0 = Valid/Present on all three architectures
-}
-
-/// Check if a PTE has the SW_ZEROED hint bit set.
-pub fn pte_has_sw_zeroed(pte: u64) -> bool {
-    #[cfg(target_arch = "aarch64")]
-    { pte & crate::arch::aarch64::mm::PTE_SW_ZEROED != 0 }
-    #[cfg(target_arch = "riscv64")]
-    { pte & crate::arch::riscv64::mm::PTE_SW_ZEROED != 0 }
-    #[cfg(target_arch = "x86_64")]
-    { pte & crate::arch::x86_64::mm::PTE_SW_ZEROED != 0 }
-}
-
-/// Return the architecture-specific SW_ZEROED bit value.
-pub fn sw_zeroed_bit() -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::PTE_SW_ZEROED }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::PTE_SW_ZEROED }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::PTE_SW_ZEROED }
-}
-
-/// Evict a 4K MMU page: clear valid bit but preserve SW_ZEROED hint (arch dispatch).
-pub fn evict_mmupage_dispatch(pt_root: usize, va: usize) -> usize {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::evict_mmupage(pt_root, va) }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::evict_mmupage(pt_root, va) }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::evict_mmupage(pt_root, va) }
-}
-
-/// Clear a PTE entirely — both valid and SW bits (arch dispatch).
-pub fn clear_pte_dispatch(pt_root: usize, va: usize) {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::clear_pte(pt_root, va); }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::clear_pte(pt_root, va); }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::clear_pte(pt_root, va); }
-}
+pub use hat::read_pte as read_pte_dispatch;
+pub use hat::pte_is_present;
+pub use hat::pte_has_sw_zeroed;
+pub use hat::sw_zeroed_bit;
+pub use hat::evict_mmupage as evict_mmupage_dispatch;
+pub use hat::clear_pte as clear_pte_dispatch;
 
 /// Count installed (present) PTEs in a VMA by walking the page table.
 pub fn count_installed_ptes(pt_root: usize, vma: &super::vma::Vma) -> usize {
@@ -275,72 +229,32 @@ pub fn handle_page_fault(
 
 /// Public version of pte_flags_for_vma (for WSCLOCK demotion).
 pub fn pte_flags_for_vma_pub(vma: &super::vma::Vma) -> u64 {
-    pte_flags_for_vma(vma) | sw_zeroed_bit()
+    hat::pte_flags_for_vma_zeroed(vma)
 }
 
 /// Get architecture-specific PTE flags for a VMA (without SW_ZEROED).
 fn pte_flags_for_vma(vma: &super::vma::Vma) -> u64 {
-    use super::vma::VmaProt;
-    #[cfg(target_arch = "aarch64")]
-    {
-        use crate::arch::aarch64::mm;
-        match vma.prot {
-            VmaProt::ReadOnly => mm::USER_RO_FLAGS,
-            VmaProt::ReadWrite => mm::USER_RW_FLAGS,
-            VmaProt::ReadExec => mm::USER_RWX_FLAGS, // RX needs execute (no UXN)
-            VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
-            VmaProt::None => 0,
-        }
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        use crate::arch::riscv64::mm;
-        match vma.prot {
-            VmaProt::ReadOnly => mm::USER_RO_FLAGS,
-            VmaProt::ReadWrite => mm::USER_RW_FLAGS,
-            VmaProt::ReadExec => mm::USER_RWX_FLAGS,
-            VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
-            VmaProt::None => 0,
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        use crate::arch::x86_64::mm;
-        match vma.prot {
-            VmaProt::ReadOnly => mm::USER_RO_FLAGS,
-            VmaProt::ReadWrite => mm::USER_RW_FLAGS,
-            VmaProt::ReadExec => mm::USER_RWX_FLAGS,
-            VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
-            VmaProt::None => 0,
-        }
-    }
+    hat::pte_flags_for_vma(vma)
 }
 
 /// Try to promote a contiguous group of PTEs (AArch64 only).
 /// Checks if all 16 MMU pages in the 64K-aligned group have present PTEs.
 fn try_contiguous_promotion(pt_root: usize, vma: &super::vma::Vma, mmu_idx: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        const CONTIG_GROUP: usize = 16;
-        let group_start = mmu_idx - (mmu_idx % CONTIG_GROUP);
-        if group_start + CONTIG_GROUP > vma.mmu_page_count() {
-            return;
-        }
-        let mut count = 0;
-        for i in 0..CONTIG_GROUP {
-            let va = vma.va_start + (group_start + i) * MMUPAGE_SIZE;
-            if pte_is_present(read_pte_dispatch(pt_root, va)) {
-                count += 1;
-            }
-        }
-        let va_in_group = vma.va_start + group_start * MMUPAGE_SIZE;
-        if crate::arch::aarch64::mm::try_contiguous_promotion(pt_root, va_in_group, count) {
-            stats::CONTIGUOUS_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
+    const CONTIG_GROUP: usize = 16;
+    let group_start = mmu_idx - (mmu_idx % CONTIG_GROUP);
+    if group_start + CONTIG_GROUP > vma.mmu_page_count() {
+        return;
+    }
+    let mut count = 0;
+    for i in 0..CONTIG_GROUP {
+        let va = vma.va_start + (group_start + i) * MMUPAGE_SIZE;
+        if pte_is_present(read_pte_dispatch(pt_root, va)) {
+            count += 1;
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = (pt_root, vma, mmu_idx);
+    let va_in_group = vma.va_start + group_start * MMUPAGE_SIZE;
+    if hat::try_contiguous_promotion(pt_root, va_in_group, count) {
+        stats::CONTIGUOUS_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -564,33 +478,18 @@ pub fn free_pages_range(pa: super::page::PhysAddr, count: usize) {
 }
 
 fn install_superpage(pt_root: usize, va: usize, pa: usize, flags: u64) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::install_superpage(pt_root, va, pa, flags) }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::install_superpage(pt_root, va, pa, flags) }
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::install_superpage(pt_root, va, pa, flags) }
+    hat::install_superpage(pt_root, va, pa, flags)
 }
 
 /// Check if a VA is mapped as a superpage (arch dispatch).
 pub fn is_superpage_mapped(pt_root: usize, va: usize) -> Option<usize> {
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::is_superpage(pt_root, va) }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::is_superpage(pt_root, va) }
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::is_superpage(pt_root, va) }
+    hat::is_superpage(pt_root, va)
 }
 
 /// Demote a superpage back to base PTEs (arch dispatch).
 /// Includes SW_ZEROED in the demoted PTEs since superpage pages are initialized.
 pub fn demote_superpage(pt_root: usize, va: usize, flags: u64) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::demote_superpage(pt_root, va, flags) }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::demote_superpage(pt_root, va, flags) }
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::demote_superpage(pt_root, va, flags) }
+    hat::demote_superpage(pt_root, va, flags)
 }
 
 /// Handle a COW (copy-on-write) fault.
@@ -869,18 +768,7 @@ fn try_consolidate_reservation(
 
 /// Install a PTE via the arch-specific function.
 fn install_pte(pt_root: usize, va: usize, pa: usize, flags: u64) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::arch::aarch64::mm::map_single_mmupage(pt_root, va, pa, flags);
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        crate::arch::riscv64::mm::map_single_mmupage(pt_root, va, pa, flags);
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        crate::arch::x86_64::mm::map_single_mmupage(pt_root, va, pa, flags);
-    }
+    hat::map_single_mmupage(pt_root, va, pa, flags);
 }
 
 /// Set SW_ZEROED hint on a not-yet-installed PTE slot.

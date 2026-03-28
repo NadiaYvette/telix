@@ -740,12 +740,7 @@ fn do_spawn_heavy_work(
     let task_port = crate::ipc::port::create_kernel_port(task_port_handler, task_id as usize)?;
     let thread_port = crate::ipc::port::create_kernel_port(thread_port_handler, thread_id as usize)?;
     // Create a page table with kernel identity mapping.
-    #[cfg(target_arch = "aarch64")]
-    let pt_root = crate::arch::aarch64::mm::setup_tables()?;
-    #[cfg(target_arch = "riscv64")]
-    let pt_root = crate::arch::riscv64::mm::setup_tables()?;
-    #[cfg(target_arch = "x86_64")]
-    let pt_root = crate::arch::x86_64::mm::create_user_page_table()?;
+    let pt_root = crate::mm::hat::create_user_page_table()?;
 
     // Create address space.
     let aspace_id = crate::mm::aspace::create(pt_root)?;
@@ -832,23 +827,13 @@ fn do_spawn_heavy_work(
         }
 
         let sw_z = crate::mm::fault::sw_zeroed_bit();
-        #[cfg(target_arch = "aarch64")]
-        let pte_flags = crate::arch::aarch64::mm::USER_RW_FLAGS | sw_z;
-        #[cfg(target_arch = "riscv64")]
-        let pte_flags = crate::arch::riscv64::mm::USER_RW_FLAGS | sw_z;
-        #[cfg(target_arch = "x86_64")]
-        let pte_flags = crate::arch::x86_64::mm::USER_RW_FLAGS | sw_z;
+        let pte_flags = crate::mm::hat::USER_RW_FLAGS | sw_z;
 
         for mmu_idx in 0..mmu_count {
             let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
             let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
 
-            #[cfg(target_arch = "aarch64")]
-            crate::arch::aarch64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
-            #[cfg(target_arch = "riscv64")]
-            crate::arch::riscv64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+            crate::mm::hat::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
         }
     }
 
@@ -1267,12 +1252,7 @@ pub fn spawn_user_with_data(
 
         let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
         let sw_z = crate::mm::fault::sw_zeroed_bit();
-        #[cfg(target_arch = "aarch64")]
-        let pte_flags = crate::arch::aarch64::mm::USER_RO_FLAGS | sw_z;
-        #[cfg(target_arch = "riscv64")]
-        let pte_flags = crate::arch::riscv64::mm::USER_RO_FLAGS | sw_z;
-        #[cfg(target_arch = "x86_64")]
-        let pte_flags = crate::arch::x86_64::mm::USER_RO_FLAGS | sw_z;
+        let pte_flags = crate::mm::hat::USER_RO_FLAGS | sw_z;
 
         for page_idx in 0..data_pages {
             let page_va = data_va + page_idx * PAGE_SIZE;
@@ -1297,12 +1277,7 @@ pub fn spawn_user_with_data(
             for mmu_idx in 0..mmu_count {
                 let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
                 let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
-                #[cfg(target_arch = "aarch64")]
-                crate::arch::aarch64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
-                #[cfg(target_arch = "riscv64")]
-                crate::arch::riscv64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
-                #[cfg(target_arch = "x86_64")]
-                crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+                crate::mm::hat::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
             }
         }
     }
@@ -1539,18 +1514,13 @@ fn try_switch(current_sp: u64) -> u64 {
             if !tptr.is_null() { unsafe { (*tptr).page_table_root } } else { 0 }
         };
         if next_root != 0 {
-            #[cfg(target_arch = "aarch64")]
-            crate::arch::aarch64::mm::switch_page_table(next_root);
-            #[cfg(target_arch = "riscv64")]
-            crate::arch::riscv64::mm::switch_page_table(next_root);
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::mm::switch_page_table(next_root);
+            crate::mm::hat::switch_page_table(next_root);
         } else {
             #[cfg(target_arch = "riscv64")]
             {
-                let kern_root = crate::arch::riscv64::mm::kernel_pt_root();
+                let kern_root = crate::mm::hat::kernel_pt_root();
                 if kern_root != 0 {
-                    crate::arch::riscv64::mm::switch_page_table(kern_root);
+                    crate::mm::hat::switch_page_table(kern_root);
                 }
             }
         }
@@ -2439,20 +2409,9 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     if is_last_thread {
         // Switch to kernel/boot page table before freeing user page table.
         if pt_root != 0 {
-            #[cfg(target_arch = "aarch64")]
             {
-                let boot_root = crate::arch::aarch64::mm::boot_page_table_root();
-                crate::arch::aarch64::mm::switch_page_table(boot_root);
-            }
-            #[cfg(target_arch = "riscv64")]
-            {
-                let boot_root = crate::arch::riscv64::mm::boot_page_table_root();
-                crate::arch::riscv64::mm::switch_page_table(boot_root);
-            }
-            #[cfg(target_arch = "x86_64")]
-            {
-                let boot_root = crate::arch::x86_64::mm::boot_page_table_root();
-                crate::arch::x86_64::mm::switch_page_table(boot_root);
+                let boot_root = crate::mm::hat::boot_page_table_root();
+                crate::mm::hat::switch_page_table(boot_root);
             }
         }
 
@@ -2470,12 +2429,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
 
         // Free page table intermediate pages.
         if pt_root != 0 {
-            #[cfg(target_arch = "aarch64")]
-            crate::arch::aarch64::mm::free_page_table_tree(pt_root);
-            #[cfg(target_arch = "riscv64")]
-            crate::arch::riscv64::mm::free_page_table_tree(pt_root);
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::mm::free_page_table_tree(pt_root);
+            crate::mm::hat::free_page_table_tree(pt_root);
         }
     }
 
@@ -2862,18 +2816,13 @@ pub fn park_current_for_ipc(reason: BlockReason) {
             if !tptr.is_null() { unsafe { (*tptr).page_table_root } } else { 0 }
         };
         if next_root != 0 {
-            #[cfg(target_arch = "aarch64")]
-            crate::arch::aarch64::mm::switch_page_table(next_root);
-            #[cfg(target_arch = "riscv64")]
-            crate::arch::riscv64::mm::switch_page_table(next_root);
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::mm::switch_page_table(next_root);
+            crate::mm::hat::switch_page_table(next_root);
         } else {
             #[cfg(target_arch = "riscv64")]
             {
-                let kern_root = crate::arch::riscv64::mm::kernel_pt_root();
+                let kern_root = crate::mm::hat::kernel_pt_root();
                 if kern_root != 0 {
-                    crate::arch::riscv64::mm::switch_page_table(kern_root);
+                    crate::mm::hat::switch_page_table(kern_root);
                 }
             }
         }
@@ -3151,18 +3100,13 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
             if !tptr.is_null() { unsafe { (*tptr).page_table_root } } else { 0 }
         };
         if next_root != 0 {
-            #[cfg(target_arch = "aarch64")]
-            crate::arch::aarch64::mm::switch_page_table(next_root);
-            #[cfg(target_arch = "riscv64")]
-            crate::arch::riscv64::mm::switch_page_table(next_root);
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::mm::switch_page_table(next_root);
+            crate::mm::hat::switch_page_table(next_root);
         } else {
             #[cfg(target_arch = "riscv64")]
             {
-                let kern_root = crate::arch::riscv64::mm::kernel_pt_root();
+                let kern_root = crate::mm::hat::kernel_pt_root();
                 if kern_root != 0 {
-                    crate::arch::riscv64::mm::switch_page_table(kern_root);
+                    crate::mm::hat::switch_page_table(kern_root);
                 }
             }
         }
@@ -3255,18 +3199,13 @@ pub fn handoff_to(receiver_tid: ThreadId) {
             if !tptr.is_null() { unsafe { (*tptr).page_table_root } } else { 0 }
         };
         if next_root != 0 {
-            #[cfg(target_arch = "aarch64")]
-            crate::arch::aarch64::mm::switch_page_table(next_root);
-            #[cfg(target_arch = "riscv64")]
-            crate::arch::riscv64::mm::switch_page_table(next_root);
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::mm::switch_page_table(next_root);
+            crate::mm::hat::switch_page_table(next_root);
         } else {
             #[cfg(target_arch = "riscv64")]
             {
-                let kern_root = crate::arch::riscv64::mm::kernel_pt_root();
+                let kern_root = crate::mm::hat::kernel_pt_root();
                 if kern_root != 0 {
-                    crate::arch::riscv64::mm::switch_page_table(kern_root);
+                    crate::mm::hat::switch_page_table(kern_root);
                 }
             }
         }

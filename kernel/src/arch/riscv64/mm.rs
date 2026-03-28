@@ -81,6 +81,11 @@ pub fn setup_tables() -> Option<usize> {
     Some(root)
 }
 
+/// Allocate a fresh user page table (alias for setup_tables).
+pub fn create_user_page_table() -> Option<usize> {
+    setup_tables()
+}
+
 /// Add user 4K page mappings to an existing root table.
 #[allow(dead_code)]
 pub fn map_user_pages(

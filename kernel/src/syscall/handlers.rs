@@ -486,7 +486,11 @@ fn auto_grant_sender_identity(receiver_task: u32, sender_port: u64) {
 }
 
 fn sys_debug_putchar(ch: u64) -> u64 {
-    crate::arch::platform::serial::putc(ch as u8);
+    let c = ch as u8;
+    if c == b'\n' {
+        crate::arch::platform::serial::putc(b'\r');
+    }
+    crate::arch::platform::serial::putc(c);
     0
 }
 
@@ -852,6 +856,9 @@ fn sys_debug_puts(buf_ptr: u64, buf_len: u64) -> u64 {
         return u64::MAX;
     }
     for &ch in &buf[..len] {
+        if ch == b'\n' {
+            crate::arch::platform::serial::putc(b'\r');
+        }
         crate::arch::platform::serial::putc(ch);
     }
     0
@@ -927,29 +934,10 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     let pt_root = crate::sched::scheduler::current_page_table_root();
 
     let sw_z = crate::mm::fault::sw_zeroed_bit();
-    #[cfg(target_arch = "aarch64")]
-    let pte_flags = match prot {
-        VmaProt::ReadOnly => crate::arch::aarch64::mm::USER_RO_FLAGS | sw_z,
-        VmaProt::ReadWrite => crate::arch::aarch64::mm::USER_RW_FLAGS | sw_z,
-        VmaProt::ReadExec => crate::arch::aarch64::mm::USER_RWX_FLAGS | sw_z,
-        VmaProt::ReadWriteExec => crate::arch::aarch64::mm::USER_RWX_FLAGS | sw_z,
-        VmaProt::None => 0,
-    };
-    #[cfg(target_arch = "riscv64")]
-    let pte_flags = match prot {
-        VmaProt::ReadOnly => crate::arch::riscv64::mm::USER_RO_FLAGS | sw_z,
-        VmaProt::ReadWrite => crate::arch::riscv64::mm::USER_RW_FLAGS | sw_z,
-        VmaProt::ReadExec => crate::arch::riscv64::mm::USER_RWX_FLAGS | sw_z,
-        VmaProt::ReadWriteExec => crate::arch::riscv64::mm::USER_RWX_FLAGS | sw_z,
-        VmaProt::None => 0,
-    };
-    #[cfg(target_arch = "x86_64")]
-    let pte_flags = match prot {
-        VmaProt::ReadOnly => crate::arch::x86_64::mm::USER_RO_FLAGS | sw_z,
-        VmaProt::ReadWrite => crate::arch::x86_64::mm::USER_RW_FLAGS | sw_z,
-        VmaProt::ReadExec => crate::arch::x86_64::mm::USER_RWX_FLAGS | sw_z,
-        VmaProt::ReadWriteExec => crate::arch::x86_64::mm::USER_RWX_FLAGS | sw_z,
-        VmaProt::None => 0,
+    let pte_flags = if prot == VmaProt::None {
+        0
+    } else {
+        crate::mm::hat::pte_flags_for_prot(prot) | sw_z
     };
 
     for page_idx in 0..pages {
@@ -973,12 +961,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
             let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
             let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
 
-            #[cfg(target_arch = "aarch64")]
-            crate::arch::aarch64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
-            #[cfg(target_arch = "riscv64")]
-            crate::arch::riscv64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+            crate::mm::hat::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
         }
 
         // PTE installation with SW_ZEROED is the authority — no bitmap update needed.
@@ -1134,7 +1117,7 @@ fn sys_mmap_device(phys_addr: u64, page_count: u64) -> u64 {
         PT_VALID | PT_PAGE | PT_AF | PT_AP_RW_ALL | PT_ATTR_IDX_1 | PT_UXN | PT_PXN
     };
     #[cfg(target_arch = "riscv64")]
-    let pte_flags: u64 = crate::arch::riscv64::mm::USER_RW_FLAGS;
+    let pte_flags: u64 = crate::mm::hat::USER_RW_FLAGS;
     #[cfg(target_arch = "x86_64")]
     let pte_flags: u64 = 0; // unreachable
 
@@ -1142,10 +1125,8 @@ fn sys_mmap_device(phys_addr: u64, page_count: u64) -> u64 {
         let page_va = va + i * 4096;
         let page_pa = phys_aligned + i * 4096;
 
-        #[cfg(target_arch = "aarch64")]
-        crate::arch::aarch64::mm::map_single_mmupage(pt_root, page_va, page_pa, pte_flags);
-        #[cfg(target_arch = "riscv64")]
-        crate::arch::riscv64::mm::map_single_mmupage(pt_root, page_va, page_pa, pte_flags);
+        #[cfg(not(target_arch = "x86_64"))]
+        crate::mm::hat::map_single_mmupage(pt_root, page_va, page_pa, pte_flags);
         #[cfg(target_arch = "x86_64")]
         { let _ = (pt_root, page_va, page_pa, pte_flags); }
     }
@@ -1160,16 +1141,7 @@ fn sys_virt_to_phys(va: u64) -> u64 {
         return u64::MAX; // kernel context
     }
 
-    let pa = {
-        #[cfg(target_arch = "aarch64")]
-        { crate::arch::aarch64::mm::translate_va(pt_root, va as usize) }
-        #[cfg(target_arch = "riscv64")]
-        { crate::arch::riscv64::mm::translate_va(pt_root, va as usize) }
-        #[cfg(target_arch = "x86_64")]
-        { crate::arch::x86_64::mm::translate_va(pt_root, va as usize) }
-    };
-
-    match pa {
+    match crate::mm::hat::translate_va(pt_root, va as usize) {
         Some(pa) => pa as u64,
         None => u64::MAX,
     }
@@ -1528,12 +1500,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     crate::sched::scheduler::kill_other_threads_in_task();
 
     // Create a fresh page table for the new image.
-    #[cfg(target_arch = "aarch64")]
-    let new_pt_root = crate::arch::aarch64::mm::setup_tables().expect("execve: pt alloc");
-    #[cfg(target_arch = "riscv64")]
-    let new_pt_root = crate::arch::riscv64::mm::setup_tables().expect("execve: pt alloc");
-    #[cfg(target_arch = "x86_64")]
-    let new_pt_root = crate::arch::x86_64::mm::create_user_page_table().expect("execve: pt alloc");
+    let new_pt_root = crate::mm::hat::create_user_page_table().expect("execve: pt alloc");
 
     // Reset address space: destroy all VMAs/PTEs, free old page table, install new one.
     crate::mm::aspace::reset(aspace_id, new_pt_root);
@@ -1542,12 +1509,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     crate::sched::scheduler::update_task_page_table(new_pt_root);
 
     // Switch to new page table.
-    #[cfg(target_arch = "aarch64")]
-    crate::arch::aarch64::mm::switch_page_table(new_pt_root);
-    #[cfg(target_arch = "riscv64")]
-    crate::arch::riscv64::mm::switch_page_table(new_pt_root);
-    #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::mm::switch_page_table(new_pt_root);
+    crate::mm::hat::switch_page_table(new_pt_root);
 
     // Load ELF segments into the fresh address space.
     let elf_info = match crate::loader::elf::load_elf(elf_data, aspace_id, new_pt_root) {
@@ -1637,23 +1599,13 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         }
 
         let sw_z = crate::mm::fault::sw_zeroed_bit();
-        #[cfg(target_arch = "aarch64")]
-        let pte_flags = crate::arch::aarch64::mm::USER_RW_FLAGS | sw_z;
-        #[cfg(target_arch = "riscv64")]
-        let pte_flags = crate::arch::riscv64::mm::USER_RW_FLAGS | sw_z;
-        #[cfg(target_arch = "x86_64")]
-        let pte_flags = crate::arch::x86_64::mm::USER_RW_FLAGS | sw_z;
+        let pte_flags = crate::mm::hat::USER_RW_FLAGS | sw_z;
 
         for mmu_idx in 0..mmu_count {
             let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
             let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
 
-            #[cfg(target_arch = "aarch64")]
-            crate::arch::aarch64::mm::map_single_mmupage(new_pt_root, mmu_va, mmu_pa, pte_flags);
-            #[cfg(target_arch = "riscv64")]
-            crate::arch::riscv64::mm::map_single_mmupage(new_pt_root, mmu_va, mmu_pa, pte_flags);
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::mm::map_single_mmupage(new_pt_root, mmu_va, mmu_pa, pte_flags);
+            crate::mm::hat::map_single_mmupage(new_pt_root, mmu_va, mmu_pa, pte_flags);
         }
 
         // PTE installation with SW_ZEROED is the authority — no bitmap update needed.
@@ -2056,16 +2008,7 @@ pub(crate) fn copy_from_user(pt_root: usize, user_va: usize, dst: &mut [u8]) -> 
     let mut offset = 0;
     while offset < dst.len() {
         let va = user_va + offset;
-        let pa = {
-            #[cfg(target_arch = "aarch64")]
-            { crate::arch::aarch64::mm::translate_va(pt_root, va) }
-            #[cfg(target_arch = "riscv64")]
-            { crate::arch::riscv64::mm::translate_va(pt_root, va) }
-            #[cfg(target_arch = "x86_64")]
-            { crate::arch::x86_64::mm::translate_va(pt_root, va) }
-        };
-
-        let pa = match pa {
+        let pa = match crate::mm::hat::translate_va(pt_root, va) {
             Some(pa) => pa,
             None => return false,
         };
@@ -2098,16 +2041,7 @@ pub(crate) fn copy_to_user(pt_root: usize, user_va: usize, src: &[u8]) -> bool {
     let mut offset = 0;
     while offset < src.len() {
         let va = user_va + offset;
-        let pa = {
-            #[cfg(target_arch = "aarch64")]
-            { crate::arch::aarch64::mm::translate_va(pt_root, va) }
-            #[cfg(target_arch = "riscv64")]
-            { crate::arch::riscv64::mm::translate_va(pt_root, va) }
-            #[cfg(target_arch = "x86_64")]
-            { crate::arch::x86_64::mm::translate_va(pt_root, va) }
-        };
-
-        let pa = match pa {
+        let pa = match crate::mm::hat::translate_va(pt_root, va) {
             Some(pa) => pa,
             None => return false,
         };

@@ -144,31 +144,18 @@ fn has_active_reservation(obj_id: u64, obj_page_idx: usize) -> bool {
     cowgroup::get_reservation_info(cow_group_port, obj_id, super_base).is_some()
 }
 
-// Architecture-specific wrappers.
+// Architecture-specific wrappers — delegated to HAT.
+
+use super::hat;
 
 fn read_and_clear_ref_bit(pt_root: usize, va: usize) -> bool {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::read_and_clear_ref_bit(pt_root, va) }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::read_and_clear_ref_bit(pt_root, va) }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::read_and_clear_ref_bit(pt_root, va) }
+    hat::read_and_clear_ref_bit(pt_root, va)
 }
 
 fn evict_mmupage(pt_root: usize, va: usize) {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::evict_mmupage(pt_root, va); }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::evict_mmupage(pt_root, va); }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::evict_mmupage(pt_root, va); }
+    hat::evict_mmupage(pt_root, va);
 }
 
 fn clear_pte(pt_root: usize, va: usize) {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::clear_pte(pt_root, va); }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::clear_pte(pt_root, va); }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::clear_pte(pt_root, va); }
+    hat::clear_pte(pt_root, va);
 }

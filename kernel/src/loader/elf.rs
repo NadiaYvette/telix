@@ -342,12 +342,7 @@ fn load_segment(
             }
 
             // Install PTE with merged permissions (union of all overlapping segments).
-            #[cfg(target_arch = "aarch64")]
-            crate::arch::aarch64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, effective_flags);
-            #[cfg(target_arch = "riscv64")]
-            crate::arch::riscv64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, effective_flags);
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::mm::map_single_mmupage(pt_root, mmu_va, mmu_pa, effective_flags);
+            crate::mm::hat::map_single_mmupage(pt_root, mmu_va, mmu_pa, effective_flags);
         }
 
         // PTE installation with SW_ZEROED is the authority — no bitmap update needed.
@@ -381,37 +376,5 @@ fn flags_to_prot(p_flags: u32) -> VmaProt {
 }
 
 fn prot_to_pte_flags(prot: VmaProt) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        use crate::arch::aarch64::mm;
-        match prot {
-            VmaProt::ReadOnly => mm::USER_RO_FLAGS,
-            VmaProt::ReadWrite => mm::USER_RW_FLAGS,
-            VmaProt::ReadExec => mm::USER_RWX_FLAGS,
-            VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
-            VmaProt::None => 0,
-        }
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        use crate::arch::riscv64::mm;
-        match prot {
-            VmaProt::ReadOnly => mm::USER_RO_FLAGS,
-            VmaProt::ReadWrite => mm::USER_RW_FLAGS,
-            VmaProt::ReadExec => mm::USER_RWX_FLAGS,
-            VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
-            VmaProt::None => 0,
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        use crate::arch::x86_64::mm;
-        match prot {
-            VmaProt::ReadOnly => mm::USER_RO_FLAGS,
-            VmaProt::ReadWrite => mm::USER_RW_FLAGS,
-            VmaProt::ReadExec => mm::USER_RWX_FLAGS,
-            VmaProt::ReadWriteExec => mm::USER_RWX_FLAGS,
-            VmaProt::None => 0,
-        }
-    }
+    crate::mm::hat::pte_flags_for_prot(prot)
 }

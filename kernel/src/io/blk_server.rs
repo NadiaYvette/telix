@@ -13,24 +13,12 @@ pub static BLK_PORT: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Ensure the kernel page table is active (for accessing grant VAs).
 /// On AArch64, kernel threads may run with a user process's page table
 /// still in TTBR0. Grant mappings live in the kernel boot page table.
-#[cfg(target_arch = "aarch64")]
 fn ensure_kernel_pt() {
-    let kern_root = crate::arch::aarch64::mm::boot_page_table_root();
-    crate::arch::aarch64::mm::switch_page_table(kern_root);
-}
-
-#[cfg(target_arch = "riscv64")]
-fn ensure_kernel_pt() {
-    let kern_root = crate::arch::riscv64::mm::boot_page_table_root();
-    crate::arch::riscv64::mm::switch_page_table(kern_root);
-    // Grant pages have PTE_U set (they're mapped for userspace). S-mode must
-    // set sstatus.SUM (bit 18) to access U-flagged pages.
+    let kern_root = crate::mm::hat::boot_page_table_root();
+    crate::mm::hat::switch_page_table(kern_root);
+    // RISC-V: Grant pages have PTE_U set. S-mode must set sstatus.SUM to access them.
+    #[cfg(target_arch = "riscv64")]
     unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 18); }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn ensure_kernel_pt() {
-    // x86-64: blk_server not used.
 }
 
 /// Stub server when no virtio-blk device is present.
@@ -125,12 +113,7 @@ pub fn blk_server() -> ! {
     // Create an aspace for the blk server so userspace can grant pages to us.
     // Kernel threads have aspace_id=0 which doesn't exist in the aspace table,
     // so we create a real one wrapping the kernel page table.
-    #[cfg(target_arch = "aarch64")]
-    let pt_root = crate::arch::aarch64::mm::boot_page_table_root();
-    #[cfg(target_arch = "riscv64")]
-    let pt_root = crate::arch::riscv64::mm::boot_page_table_root();
-    #[cfg(target_arch = "x86_64")]
-    let pt_root = 0usize; // x86-64 blk_server not used
+    let pt_root = crate::mm::hat::boot_page_table_root();
     let my_aspace = crate::mm::aspace::create(pt_root).expect("blk aspace");
 
     // Register with name server.

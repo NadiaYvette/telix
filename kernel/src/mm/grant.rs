@@ -110,49 +110,26 @@ pub fn revoke_grant(dst_aspace: ASpaceId, dst_va: usize) {
     });
 }
 
-// Architecture-specific wrappers.
+// Architecture-specific wrappers — delegated to HAT.
+
+use super::hat;
 
 fn map_single_mmupage(pt_root: usize, va: usize, pa: usize, flags: u64) -> bool {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::map_single_mmupage(pt_root, va, pa, flags) }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::map_single_mmupage(pt_root, va, pa, flags) }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::map_single_mmupage(pt_root, va, pa, flags) }
+    hat::map_single_mmupage(pt_root, va, pa, flags)
 }
 
 fn clear_pte(pt_root: usize, va: usize) {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::clear_pte(pt_root, va); }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::clear_pte(pt_root, va); }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::clear_pte(pt_root, va); }
+    hat::clear_pte(pt_root, va);
 }
 
 fn sw_zeroed_bit() -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::PTE_SW_ZEROED }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::PTE_SW_ZEROED }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::PTE_SW_ZEROED }
+    hat::sw_zeroed_bit()
 }
 
 fn user_ro_flags() -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::USER_RO_FLAGS }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::USER_RO_FLAGS }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::USER_RO_FLAGS }
+    hat::USER_RO_FLAGS
 }
 
 fn user_rw_flags() -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::mm::USER_RW_FLAGS }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::mm::USER_RW_FLAGS }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::mm::USER_RW_FLAGS }
+    hat::USER_RW_FLAGS
 }
