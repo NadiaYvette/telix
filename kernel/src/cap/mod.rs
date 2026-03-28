@@ -5,7 +5,6 @@ pub mod cnode;
 pub mod space;
 
 pub use capability::{CapType, Capability, Rights};
-pub use capset::CapSet;
 pub use cdt::Cdt;
 pub use space::CapSpace;
 
@@ -32,7 +31,7 @@ fn task_ptr(task_id: u32) -> *mut Task {
 /// Get a reference to a task. Caller must ensure task_id is valid.
 #[inline]
 unsafe fn task_ref(task_id: u32) -> &'static Task {
-    &*task_ptr(task_id)
+    unsafe { &*task_ptr(task_id) }
 }
 
 /// Get a mutable reference to a task's CapSpace.
@@ -100,6 +99,7 @@ fn capset_remove_port(task_id: u32, port_id: u64) {
 }
 
 /// Reset all capset entries for a task (on task reset).
+#[allow(dead_code)]
 pub fn capset_reset(task_id: u32) {
     let ptr = task_ptr(task_id);
     if !ptr.is_null() {

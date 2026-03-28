@@ -65,7 +65,7 @@ pub fn grant_pages(
             VmaProt::ReadWrite
         };
         let va_len = page_count * PAGE_SIZE;
-        let vma = aspace
+        let _vma = aspace
             .vmas
             .insert(dst_va, va_len, prot, obj_id, obj_mmu_offset)
             .ok_or(GrantError::DestMapFailed)?;

@@ -52,6 +52,7 @@ pub fn task_id_from_any_port(port_id: u64) -> Option<task::TaskId> {
 
 /// Resolve a thread port to its internal thread_id.
 /// Validates by checking that the thread's stored port_id matches.
+#[allow(dead_code)]
 pub fn validated_thread_from_port(port_id: u64) -> Option<thread::ThreadId> {
     let data = crate::ipc::port::port_kernel_data(port_id)? as u32;
     if let Some(thread) = scheduler::thread_ref_opt(data) {

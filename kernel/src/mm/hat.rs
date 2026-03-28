@@ -49,6 +49,7 @@ pub fn boot_page_table_root() -> usize {
 
 /// Return the kernel page table root (differs from boot root on RISC-V;
 /// identical on other architectures).
+#[allow(dead_code)]
 #[inline]
 pub fn kernel_pt_root() -> usize {
     #[cfg(target_arch = "riscv64")]
@@ -72,6 +73,7 @@ pub fn map_single_mmupage(root: usize, va: usize, pa: usize, flags: u64) -> bool
 }
 
 /// Unmap a single 4K MMU page, returning the old physical address.
+#[allow(dead_code)]
 #[inline]
 pub fn unmap_single_mmupage(root: usize, va: usize) -> usize {
     arch_mm::unmap_single_mmupage(root, va)

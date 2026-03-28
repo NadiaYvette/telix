@@ -72,8 +72,10 @@ pub static SCHED_THREAD_ART: GlobalArt = GlobalArt::new();
 /// Global task ART — lock-free reads (RCU), writes under TASK_ART_WRITE_LOCK.
 pub static SCHED_TASK_ART: GlobalArt = GlobalArt::new();
 /// Write serializer for thread ART structural mutations.
+#[allow(dead_code)]
 pub static THREAD_ART_WRITE_LOCK: SpinLock<()> = SpinLock::new(());
 /// Write serializer for task ART structural mutations.
+#[allow(dead_code)]
 pub static TASK_ART_WRITE_LOCK: SpinLock<()> = SpinLock::new(());
 
 // ---------------------------------------------------------------------------
@@ -232,6 +234,7 @@ impl RunQueue {
 
     /// Search for and remove a thread belonging to the given coscheduling group
     /// that can run on the given CPU.
+    #[allow(dead_code)]
     fn find_remove_by_group_for_cpu(&mut self, group: u32, cpu: u32) -> Option<ThreadId> {
         let mut cur = self.head;
         while cur != RQ_NIL {
@@ -247,6 +250,7 @@ impl RunQueue {
 
     /// Search for and remove the first thread whose affinity allows it to run
     /// on the given CPU.
+    #[allow(dead_code)]
     fn find_remove_for_cpu(&mut self, cpu: u32) -> Option<ThreadId> {
         let mut cur = self.head;
         while cur != RQ_NIL {
@@ -378,6 +382,7 @@ impl PerCpuRunQueues {
     }
 
     /// Steal one thread for `thief_cpu` from lowest-priority queue with ≥2 threads.
+    #[allow(dead_code)]
     fn steal_one(&mut self, thief_cpu: u32) -> Option<ThreadId> {
         self.steal_one_min(thief_cpu, 2)
     }
@@ -487,6 +492,7 @@ fn alloc_thread_entry() -> Option<*mut Thread> {
     Some(p)
 }
 
+#[allow(dead_code)]
 fn free_thread_entry(p: *mut Thread) {
     slab::free(PhysAddr::new(p as usize), THREAD_SLAB_SIZE);
 }
@@ -502,6 +508,7 @@ fn alloc_task_entry() -> Option<*mut Task> {
     Some(p)
 }
 
+#[allow(dead_code)]
 fn free_task_entry(p: *mut Task) {
     phys::free_page(PhysAddr::new(p as usize));
 }
@@ -1349,6 +1356,7 @@ pub fn thread_create(task_id: u32, entry: u64, stack_top: u64, arg: u64) -> Opti
 
 /// Check if a thread has exited and return its exit code.
 /// Returns Some(exit_code) if dead and in the same task, None otherwise.
+#[allow(dead_code)]
 pub fn thread_join_poll(tid: ThreadId, caller_task: u32) -> Option<i32> {
     let t = thread_ref_opt(tid)?;
     if t.task_id != caller_task {
@@ -1761,7 +1769,7 @@ pub fn kill_task_by_id(task_id: TaskId) -> bool {
 /// thread in the task that has the signal unmasked, or the first thread.
 /// SIGKILL always uses the old kill path (immediate termination).
 pub fn send_signal_to_task(task_id: u32, sig: u32) -> bool {
-    use super::task::{MAX_SIGNALS, SIGKILL, SIGSTOP, UNCATCHABLE, sig_bit};
+    use super::task::{MAX_SIGNALS, SIGKILL, sig_bit};
     if sig < 1 || sig > MAX_SIGNALS as u32 {
         return false;
     }
@@ -2231,7 +2239,7 @@ pub fn fork_current() -> u64 {
 
     // Gather parent info (lock-free).
     let (
-        parent_tid,
+        _parent_tid,
         parent_task_id,
         parent_aspace_id,
         parent_priority,
@@ -2472,7 +2480,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         pt_root,
         kstack_base,
         parent_task_id,
-        task_port,
+        _task_port,
         thread_port,
     ) = {
         let pcpu = smp::current();

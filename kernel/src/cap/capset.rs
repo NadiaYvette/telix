@@ -119,6 +119,7 @@ impl CapSet {
     }
 
     /// Clear all entries. Call under CAP_SYSTEM lock.
+    #[allow(dead_code)]
     pub fn reset(&self) {
         for i in 0..INLINE_CAP {
             self.entries[i].store(0, Ordering::Relaxed);
@@ -126,6 +127,7 @@ impl CapSet {
     }
 
     /// Check if any entry has RECV permission for `port_local`.
+    #[allow(dead_code)]
     #[inline]
     pub fn has_recv(&self, port_local: u64) -> bool {
         self.has(port_local, PERM_RECV)

@@ -212,6 +212,7 @@ impl ExtentTree {
     }
 
     /// Number of extent entries in the tree.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.count
     }

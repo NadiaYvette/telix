@@ -145,6 +145,7 @@ impl VmaTree {
     }
 
     /// Number of VMAs in the tree.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.count
     }
@@ -585,6 +586,7 @@ impl VmaTree {
     }
 
     /// Free all VMAs and nodes. Resets the tree to empty.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         if !self.root.is_null() {
             self.free_tree(self.root);

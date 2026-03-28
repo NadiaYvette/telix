@@ -188,6 +188,7 @@ pub fn map_single_mmupage(l0: usize, va: usize, pa: usize, flags: u64) -> bool {
 }
 
 /// Unmap a single 4K MMU page at `va`. Returns the old physical address, or 0 if not mapped.
+#[allow(dead_code)]
 pub fn unmap_single_mmupage(l0: usize, va: usize) -> usize {
     let slot = match radix_pt::walk_to_leaf::<Aarch64Pte>(l0, va) {
         Some(s) => s,

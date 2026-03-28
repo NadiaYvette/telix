@@ -333,6 +333,7 @@ fn cache_by_index(idx: usize) -> &'static SpinLock<SlabCache> {
     }
 }
 
+#[allow(dead_code)]
 fn cache_for_size(size: usize) -> Option<&'static SpinLock<SlabCache>> {
     cache_index(size).map(cache_by_index)
 }

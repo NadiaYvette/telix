@@ -120,6 +120,7 @@ impl AddressSpace {
     }
 
     /// Generate a random ASLR offset (in pages, 0..max_pages).
+    #[allow(dead_code)]
     pub fn random_pages(&mut self, max_pages: usize) -> usize {
         if self.prng_state == 0 || max_pages == 0 {
             return 0;
@@ -353,6 +354,7 @@ fn rcu_free_aspace_callback(ptr: usize) {
 
 /// Reset an address space for execve: destroy all VMAs and backing objects,
 /// install a fresh page table, re-seed PRNG. The entry stays in the ART.
+#[allow(dead_code)]
 pub fn reset(id: ASpaceId, new_pt_root: usize) {
     let mut guard = match lock_aspace(id) {
         Some(g) => g,

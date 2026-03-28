@@ -63,9 +63,11 @@ pub const IO_CLOSE: u64 = 0x500;
 /// Client → server: I/O barrier (fence).
 ///   data[2] = (reply_port << 32)
 /// Server guarantees all prior requests are complete before replying.
+#[allow(dead_code)]
 pub const IO_BARRIER: u64 = 0x600;
 
 /// Server → client: barrier complete.
+#[allow(dead_code)]
 pub const IO_BARRIER_OK: u64 = 0x601;
 
 /// Server → client: error response.
@@ -93,33 +95,41 @@ pub const NS_LOOKUP_OK: u64 = 0x1101;
 
 /// Client → security_srv: authenticate.
 ///   data[0] = username_hash, data[1] = password_hash, data[2] = reply_port
+#[allow(dead_code)]
 pub const SEC_LOGIN: u64 = 0x700;
 
 /// security_srv → client: login succeeded.
 ///   data[0] = credential_port, data[1] = role_bits
+#[allow(dead_code)]
 pub const SEC_LOGIN_OK: u64 = 0x701;
 
 /// security_srv → client: login failed.
 ///   data[0] = error_code
+#[allow(dead_code)]
 pub const SEC_LOGIN_FAIL: u64 = 0x702;
 
 /// Server → security_srv: verify a credential.
 ///   data[0] = credential_port, data[2] = reply_port
+#[allow(dead_code)]
 pub const SEC_VERIFY: u64 = 0x703;
 
 /// security_srv → server: credential valid.
 ///   data[0] = credential_port, data[1] = role_bits, data[2] = username_hash
+#[allow(dead_code)]
 pub const SEC_VERIFY_OK: u64 = 0x704;
 
 /// security_srv → server: credential invalid.
 ///   data[0] = error_code
+#[allow(dead_code)]
 pub const SEC_VERIFY_FAIL: u64 = 0x705;
 
 /// Client → security_srv: revoke a credential.
 ///   data[0] = credential_port, data[2] = reply_port
+#[allow(dead_code)]
 pub const SEC_REVOKE: u64 = 0x706;
 
 /// security_srv → client: credential revoked.
+#[allow(dead_code)]
 pub const SEC_REVOKE_OK: u64 = 0x707;
 
 // Role constants for security policy.

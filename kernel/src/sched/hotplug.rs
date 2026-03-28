@@ -200,6 +200,7 @@ use super::cpumask::CPUMASK_WORDS;
 /// so that idle CPUs can enter low-power states.
 ///
 /// If all CPUs have equal load, returns the CPU with the lowest ID.
+#[allow(dead_code)]
 pub fn pick_packed_cpu() -> u32 {
     let mask = ONLINE_MASK.load_mask(Ordering::Acquire);
     let mut best_cpu: u32 = 0;
@@ -219,6 +220,7 @@ pub fn pick_packed_cpu() -> u32 {
 }
 
 /// Build an affinity mask containing only online CPUs.
+#[allow(dead_code)]
 pub fn online_affinity_mask() -> CpuMask {
     ONLINE_MASK.load_mask(Ordering::Acquire)
 }

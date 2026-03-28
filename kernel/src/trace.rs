@@ -25,6 +25,7 @@ pub const EVT_SYSCALL_ENTER: u16 = 2;
 pub const EVT_SYSCALL_EXIT: u16 = 3;
 pub const EVT_IPC_SEND: u16 = 4;
 pub const EVT_IPC_RECV: u16 = 5;
+#[allow(dead_code)]
 pub const EVT_PAGE_FAULT: u16 = 6;
 
 const TRACE_BUF_SIZE: usize = 4096;

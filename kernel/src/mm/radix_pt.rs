@@ -33,6 +33,7 @@ pub trait PteFormat {
     fn table_pa(entry: u64) -> usize;
 
     /// Extract the physical address from a leaf PTE (4K page).
+    #[allow(dead_code)]
     fn leaf_pa(entry: u64) -> usize;
 
     /// Construct a non-leaf (table pointer) PTE from a child table's PA.

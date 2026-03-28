@@ -63,6 +63,7 @@ const INLINE_IDX_BITS: u32 = 6;
 const INLINE_IDX_MASK: u64 = 0x3F;
 
 impl ChunkNode {
+    #[allow(dead_code)]
     const fn new() -> Self {
         Self {
             state: AtomicU64::new(0),
@@ -138,18 +139,24 @@ fn pack_inline(indices: &[u32]) -> u64 {
 /// Safety: `pa` must be a valid, identity-mapped physical address of a
 /// free page that is currently serving as a bitmap page.
 unsafe fn read_bitmap(pa: usize) -> u64 {
-    let ptr = pa as *const AtomicU64;
-    (*ptr).load(Ordering::Acquire)
+    unsafe {
+        let ptr = pa as *const AtomicU64;
+        (*ptr).load(Ordering::Acquire)
+    }
 }
 
 unsafe fn write_bitmap(pa: usize, val: u64) {
-    let ptr = pa as *const AtomicU64;
-    (*ptr).store(val, Ordering::Release);
+    unsafe {
+        let ptr = pa as *const AtomicU64;
+        (*ptr).store(val, Ordering::Release);
+    }
 }
 
 unsafe fn cas_bitmap(pa: usize, old: u64, new: u64) -> Result<u64, u64> {
-    let ptr = pa as *const AtomicU64;
-    (*ptr).compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire)
+    unsafe {
+        let ptr = pa as *const AtomicU64;
+        (*ptr).compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire)
+    }
 }
 
 // ── Per-CPU reservations ─────────────────────────────────────────────
@@ -560,7 +567,7 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
     let meta_end_pfn = metadata_pages;
 
     // Reserve kernel pages.
-    let kern_start_pfn = if kernel_start <= start {
+    let _kern_start_pfn = if kernel_start <= start {
         0
     } else {
         (kernel_start - start) >> PAGE_SHIFT

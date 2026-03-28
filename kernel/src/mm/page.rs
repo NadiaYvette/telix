@@ -40,6 +40,7 @@ pub const PAGE_MMUSHIFT: usize = PAGE_SHIFT - MMUPAGE_SHIFT;
 
 /// Smallest superpage size for this architecture (2 MiB on aarch64/x86_64/riscv64).
 pub const SUPERPAGE_SIZE: usize = 2 * 1024 * 1024;
+#[allow(dead_code)]
 pub const SUPERPAGE_SHIFT: usize = 21;
 
 /// Number of allocation pages in one superpage.

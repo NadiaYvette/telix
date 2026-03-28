@@ -3,6 +3,8 @@
 //! Operates in-place on a `&[u8]` slice of the raw DTB in physical memory.
 //! All FDT values are big-endian; this parser handles byte-swapping.
 
+#![allow(dead_code)]
+
 // FDT structure block tokens.
 const FDT_BEGIN_NODE: u32 = 0x0000_0001;
 const FDT_END_NODE: u32 = 0x0000_0002;
@@ -138,6 +140,7 @@ impl<'a> Fdt<'a> {
     }
 
     /// Iterate all nodes depth-first starting from the structure block root.
+    #[allow(dead_code)]
     pub fn all_nodes(&self) -> NodeIter<'a> {
         // Skip the root BEGIN_NODE + name to position at its contents.
         // But NodeIter will handle depth tracking from position 0.
@@ -741,11 +744,13 @@ pub fn parse_riscv64(dtb_addr: usize) {
 /// `addr` must point to a valid FDT blob that is identity-mapped and
 /// not concurrently modified.
 unsafe fn dtb_slice(addr: usize) -> &'static [u8] {
-    let ptr = addr as *const u8;
-    // Read totalsize from header offset 4.
-    let header = core::slice::from_raw_parts(ptr, 8);
-    let total_size = be32(header, 4) as usize;
-    core::slice::from_raw_parts(ptr, total_size)
+    unsafe {
+        let ptr = addr as *const u8;
+        // Read totalsize from header offset 4.
+        let header = core::slice::from_raw_parts(ptr, 8);
+        let total_size = be32(header, 4) as usize;
+        core::slice::from_raw_parts(ptr, total_size)
+    }
 }
 
 /// Check if a node name starts with a given prefix.

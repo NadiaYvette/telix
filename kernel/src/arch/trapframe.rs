@@ -193,26 +193,29 @@ pub fn user_sp(frame: &ExceptionFrame) -> usize {
 ///
 /// # Safety
 /// `frame` must point to a zeroed region of at least `EXCEPTION_FRAME_SIZE` bytes.
+#[allow(unused_variables)]
 #[inline]
 pub unsafe fn init_kernel_frame(frame: *mut u64, entry: usize, stack_top: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        *frame.add(32) = entry as u64; // ELR_EL1
-        *frame.add(33) = 0x5; // SPSR_EL1 = EL1h, IRQs unmasked
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        *frame.add(31) = entry as u64; // sepc
-        // sstatus: SPP=1 (S-mode), SPIE=1 (enable interrupts on sret)
-        *frame.add(32) = (1 << 8) | (1 << 5);
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        *frame.add(17) = entry as u64; // RIP
-        *frame.add(18) = 0x08; // CS = kernel code segment
-        *frame.add(19) = 0x200; // RFLAGS = IF (interrupts enabled)
-        *frame.add(20) = stack_top as u64; // RSP
-        *frame.add(21) = 0x10; // SS = kernel data segment
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        {
+            *frame.add(32) = entry as u64; // ELR_EL1
+            *frame.add(33) = 0x5; // SPSR_EL1 = EL1h, IRQs unmasked
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            *frame.add(31) = entry as u64; // sepc
+            // sstatus: SPP=1 (S-mode), SPIE=1 (enable interrupts on sret)
+            *frame.add(32) = (1 << 8) | (1 << 5);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            *frame.add(17) = entry as u64; // RIP
+            *frame.add(18) = 0x08; // CS = kernel code segment
+            *frame.add(19) = 0x200; // RFLAGS = IF (interrupts enabled)
+            *frame.add(20) = stack_top as u64; // RSP
+            *frame.add(21) = 0x10; // SS = kernel data segment
+        }
     }
 }
 
@@ -226,37 +229,39 @@ pub unsafe fn init_kernel_frame(frame: *mut u64, entry: usize, stack_top: usize)
 /// `frame` must point to a zeroed region of at least `EXCEPTION_FRAME_SIZE` bytes.
 #[inline]
 pub unsafe fn init_user_frame(frame: *mut u64, entry: usize, sp: usize, args: &[u64]) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        *frame.add(32) = entry as u64; // ELR_EL1
-        *frame.add(33) = 0x0; // SPSR_EL1 = EL0t (user mode)
-        *frame.add(31) = sp as u64; // SP_EL0
-        // args in x0, x1, x2
-        for (i, &val) in args.iter().enumerate().take(3) {
-            *frame.add(i) = val;
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        {
+            *frame.add(32) = entry as u64; // ELR_EL1
+            *frame.add(33) = 0x0; // SPSR_EL1 = EL0t (user mode)
+            *frame.add(31) = sp as u64; // SP_EL0
+            // args in x0, x1, x2
+            for (i, &val) in args.iter().enumerate().take(3) {
+                *frame.add(i) = val;
+            }
         }
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        *frame.add(31) = entry as u64; // sepc
-        *frame.add(32) = 1 << 5; // sstatus: SPIE=1, SPP=0 (user mode)
-        *frame.add(1) = sp as u64; // sp (x2)
-        // args in a0, a1, a2 = indices 9, 10, 11
-        for (i, &val) in args.iter().enumerate().take(3) {
-            *frame.add(9 + i) = val;
+        #[cfg(target_arch = "riscv64")]
+        {
+            *frame.add(31) = entry as u64; // sepc
+            *frame.add(32) = 1 << 5; // sstatus: SPIE=1, SPP=0 (user mode)
+            *frame.add(1) = sp as u64; // sp (x2)
+            // args in a0, a1, a2 = indices 9, 10, 11
+            for (i, &val) in args.iter().enumerate().take(3) {
+                *frame.add(9 + i) = val;
+            }
         }
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        *frame.add(17) = entry as u64; // RIP
-        *frame.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3; // CS
-        *frame.add(19) = 0x200; // RFLAGS = IF
-        *frame.add(20) = sp as u64; // RSP
-        *frame.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3; // SS
-        // args: rdi=args[0], rsi=args[1], rdx=args[2]
-        const ARG_INDICES: [usize; 3] = [9, 10, 11]; // rdi, rsi, rdx
-        for (i, &val) in args.iter().enumerate().take(3) {
-            *frame.add(ARG_INDICES[i]) = val;
+        #[cfg(target_arch = "x86_64")]
+        {
+            *frame.add(17) = entry as u64; // RIP
+            *frame.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3; // CS
+            *frame.add(19) = 0x200; // RFLAGS = IF
+            *frame.add(20) = sp as u64; // RSP
+            *frame.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3; // SS
+            // args: rdi=args[0], rsi=args[1], rdx=args[2]
+            const ARG_INDICES: [usize; 3] = [9, 10, 11]; // rdi, rsi, rdx
+            for (i, &val) in args.iter().enumerate().take(3) {
+                *frame.add(ARG_INDICES[i]) = val;
+            }
         }
     }
 }
@@ -267,18 +272,20 @@ pub unsafe fn init_user_frame(frame: *mut u64, entry: usize, sp: usize, args: &[
 /// `frame` must point to a valid exception frame.
 #[inline]
 pub unsafe fn set_frame_arg(frame: *mut u64, n: usize, val: u64) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        *frame.add(n) = val;
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        {
+            *frame.add(n) = val;
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            *frame.add(n + 9) = val;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            *frame.add(n + 9) = val;
+        } // rdi=9, rsi=10, rdx=11
     }
-    #[cfg(target_arch = "riscv64")]
-    {
-        *frame.add(n + 9) = val;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        *frame.add(n + 9) = val;
-    } // rdi=9, rsi=10, rdx=11
 }
 
 /// Rewrite an exception frame for signal delivery.

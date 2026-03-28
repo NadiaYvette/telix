@@ -100,6 +100,7 @@ impl PageVec {
     }
 
     /// Return a slice over the first `len` entries.
+    #[allow(dead_code)]
     pub fn as_slice(&self, len: usize) -> &[usize] {
         let actual = len.min(self.capacity as usize);
         if self.heap_ptr == 0 {
@@ -110,11 +111,13 @@ impl PageVec {
     }
 
     /// Check if any of the first `len` entries equals `val`.
+    #[allow(dead_code)]
     pub fn contains(&self, len: usize, val: usize) -> bool {
         self.as_slice(len).contains(&val)
     }
 
     /// Zero all entries up to `len`.
+    #[allow(dead_code)]
     pub fn clear(&mut self, len: usize) {
         let actual = len.min(self.capacity as usize);
         if self.heap_ptr == 0 {
@@ -142,6 +145,7 @@ impl PageVec {
 
     /// Clone this PageVec (allocate a new heap buffer if needed).
     /// Returns None if allocation fails.
+    #[allow(dead_code)]
     pub fn clone_with_len(&self, len: usize) -> Option<Self> {
         let mut new = Self::with_capacity(self.capacity as usize)?;
         new.copy_from(self, len);

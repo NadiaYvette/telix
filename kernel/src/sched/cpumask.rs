@@ -49,6 +49,7 @@ impl CpuMask {
     }
 
     /// Single CPU set.
+    #[allow(dead_code)]
     #[inline]
     pub const fn from_cpu(cpu: u32) -> Self {
         let mut m = Self::new();
@@ -80,6 +81,7 @@ impl CpuMask {
     }
 
     /// Set a CPU in the mask.
+    #[allow(dead_code)]
     #[inline]
     pub fn set(&mut self, cpu: u32) {
         if (cpu as usize) < MAX_CPUS {
@@ -88,6 +90,7 @@ impl CpuMask {
     }
 
     /// Clear a CPU from the mask.
+    #[allow(dead_code)]
     #[inline]
     pub fn clear(&mut self, cpu: u32) {
         if (cpu as usize) < MAX_CPUS {
@@ -96,6 +99,7 @@ impl CpuMask {
     }
 
     /// Bitwise AND.
+    #[allow(dead_code)]
     #[inline]
     pub const fn and(&self, other: &Self) -> Self {
         let mut r = Self::new();
@@ -108,6 +112,7 @@ impl CpuMask {
     }
 
     /// Bitwise OR.
+    #[allow(dead_code)]
     #[inline]
     pub const fn or(&self, other: &Self) -> Self {
         let mut r = Self::new();
@@ -120,6 +125,7 @@ impl CpuMask {
     }
 
     /// Bitwise AND-NOT: `self & !other`.
+    #[allow(dead_code)]
     #[inline]
     pub const fn andnot(&self, other: &Self) -> Self {
         let mut r = Self::new();
@@ -157,6 +163,7 @@ impl CpuMask {
     }
 
     /// First set CPU, or None.
+    #[allow(dead_code)]
     #[inline]
     pub const fn first_set(&self) -> Option<u32> {
         let mut i = 0;
@@ -237,6 +244,7 @@ impl AtomicCpuMask {
     }
 
     /// Atomically set a CPU bit (fetch_or on one word).
+    #[allow(dead_code)]
     #[inline]
     pub fn set(&self, cpu: u32) {
         self.set_with(cpu, Ordering::Relaxed);
@@ -251,6 +259,7 @@ impl AtomicCpuMask {
     }
 
     /// Atomically clear a CPU bit (fetch_and on one word).
+    #[allow(dead_code)]
     #[inline]
     pub fn clear(&self, cpu: u32) {
         self.clear_with(cpu, Ordering::Relaxed);
@@ -283,6 +292,7 @@ impl AtomicCpuMask {
     }
 
     /// Atomically OR a mask into this one (word-by-word fetch_or).
+    #[allow(dead_code)]
     #[inline]
     pub fn fetch_or_mask(&self, mask: &CpuMask, order: Ordering) {
         for i in 0..CPUMASK_WORDS {
@@ -293,6 +303,7 @@ impl AtomicCpuMask {
     }
 
     /// Atomically AND a mask into this one (word-by-word fetch_and).
+    #[allow(dead_code)]
     #[inline]
     pub fn fetch_and_mask(&self, mask: &CpuMask, order: Ordering) {
         for i in 0..CPUMASK_WORDS {

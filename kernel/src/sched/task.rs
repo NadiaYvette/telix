@@ -12,24 +12,38 @@ pub type TaskId = u32;
 pub const MAX_SIGNALS: usize = 32;
 
 // Standard POSIX signal numbers (0-indexed bit positions = signal_number - 1).
+#[allow(dead_code)]
 pub const SIGHUP: u32 = 1;
+#[allow(dead_code)]
 pub const SIGINT: u32 = 2;
+#[allow(dead_code)]
 pub const SIGQUIT: u32 = 3;
+#[allow(dead_code)]
 pub const SIGILL: u32 = 4;
+#[allow(dead_code)]
 pub const SIGTRAP: u32 = 5;
+#[allow(dead_code)]
 pub const SIGABRT: u32 = 6;
+#[allow(dead_code)]
 pub const SIGBUS: u32 = 7;
+#[allow(dead_code)]
 pub const SIGFPE: u32 = 8;
 pub const SIGKILL: u32 = 9;
+#[allow(dead_code)]
 pub const SIGUSR1: u32 = 10;
+#[allow(dead_code)]
 pub const SIGSEGV: u32 = 11;
+#[allow(dead_code)]
 pub const SIGUSR2: u32 = 12;
+#[allow(dead_code)]
 pub const SIGPIPE: u32 = 13;
 pub const SIGALRM: u32 = 14;
+#[allow(dead_code)]
 pub const SIGTERM: u32 = 15;
 pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
+#[allow(dead_code)]
 pub const SIGTSTP: u32 = 20;
 
 /// Signal handler disposition.
@@ -50,6 +64,7 @@ pub struct SignalAction {
     /// Signals to additionally mask while handler executes.
     pub sa_mask: u64,
     /// SA_RESTART flag (auto-restart interrupted syscalls).
+    #[allow(dead_code)]
     pub restart: bool,
 }
 
@@ -169,7 +184,9 @@ pub const MAX_GROUPS: usize = crate::mm::page::PAGE_SIZE / core::mem::size_of::<
 // --- Resource limits (Phase 50) ---
 
 /// POSIX resource limit types.
+#[allow(dead_code)]
 pub const RLIMIT_STACK: u32 = 0;
+#[allow(dead_code)]
 pub const RLIMIT_NOFILE: u32 = 1;
 pub const RLIMIT_AS: u32 = 2;
 pub const RLIMIT_NPROC: u32 = 3;
@@ -246,6 +263,7 @@ impl Task {
     }
 
     /// Get the supplementary groups slice (inline or overflow).
+    #[allow(dead_code)]
     pub fn groups(&self) -> &[u32] {
         let n = self.ngroups as usize;
         if n <= GROUPS_INLINE {

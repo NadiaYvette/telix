@@ -36,12 +36,12 @@ fn key_at(key: u64, depth: usize) -> u8 {
 
 #[inline]
 unsafe fn slot_load(p: *const usize) -> usize {
-    (*(p as *const AtomicUsize)).load(Ordering::Acquire)
+    unsafe { (*(p as *const AtomicUsize)).load(Ordering::Acquire) }
 }
 
 #[inline]
 unsafe fn slot_store(p: *mut usize, val: usize) {
-    (*(p as *mut AtomicUsize)).store(val, Ordering::Release)
+    unsafe { (*(p as *mut AtomicUsize)).store(val, Ordering::Release) }
 }
 
 // ---------------------------------------------------------------------------
@@ -200,12 +200,14 @@ fn alloc_node256(partial: &[u8]) -> Option<*mut Node256> {
 
 /// Free a node immediately (only for nodes that were never published to readers).
 unsafe fn free_node(ptr: usize) {
-    let h = &*(ptr as *const Header);
-    match h.node_type {
-        NODE4 => slab::free(PhysAddr::new(ptr), NODE4_SLAB),
-        NODE16 => slab::free(PhysAddr::new(ptr), NODE16_SLAB),
-        NODE256 => phys::free_page(PhysAddr::new(ptr)),
-        _ => {}
+    unsafe {
+        let h = &*(ptr as *const Header);
+        match h.node_type {
+            NODE4 => slab::free(PhysAddr::new(ptr), NODE4_SLAB),
+            NODE16 => slab::free(PhysAddr::new(ptr), NODE16_SLAB),
+            NODE256 => phys::free_page(PhysAddr::new(ptr)),
+            _ => {}
+        }
     }
 }
 
@@ -230,31 +232,33 @@ fn rcu_defer_free_node(ptr: usize) {
 /// Find the child pointer for `byte` in inner node at `node_ptr`.
 /// Returns 0 if absent. Uses atomic loads for RCU-safe reading.
 unsafe fn find_child(node_ptr: usize, byte: u8) -> usize {
-    let h = &*(node_ptr as *const Header);
-    match h.node_type {
-        NODE4 => {
-            let n = &*(node_ptr as *const Node4);
-            for i in 0..n.h.num_children as usize {
-                if n.keys[i] == byte {
-                    return slot_load(&n.children[i]);
+    unsafe {
+        let h = &*(node_ptr as *const Header);
+        match h.node_type {
+            NODE4 => {
+                let n = &*(node_ptr as *const Node4);
+                for i in 0..n.h.num_children as usize {
+                    if n.keys[i] == byte {
+                        return slot_load(&n.children[i]);
+                    }
                 }
+                0
             }
-            0
-        }
-        NODE16 => {
-            let n = &*(node_ptr as *const Node16);
-            for i in 0..n.h.num_children as usize {
-                if n.keys[i] == byte {
-                    return slot_load(&n.children[i]);
+            NODE16 => {
+                let n = &*(node_ptr as *const Node16);
+                for i in 0..n.h.num_children as usize {
+                    if n.keys[i] == byte {
+                        return slot_load(&n.children[i]);
+                    }
                 }
+                0
             }
-            0
+            NODE256 => {
+                let n = &*(node_ptr as *const Node256);
+                slot_load(&n.children[byte as usize])
+            }
+            _ => 0,
         }
-        NODE256 => {
-            let n = &*(node_ptr as *const Node256);
-            slot_load(&n.children[byte as usize])
-        }
-        _ => 0,
     }
 }
 
@@ -266,35 +270,37 @@ unsafe fn find_child(node_ptr: usize, byte: u8) -> usize {
 /// Writer-only: the returned pointer is used for atomic stores by recursive
 /// insert/remove operations.
 unsafe fn find_child_slot(node_ptr: usize, byte: u8) -> Option<*mut usize> {
-    let h = &*(node_ptr as *const Header);
-    match h.node_type {
-        NODE4 => {
-            let n = &mut *(node_ptr as *mut Node4);
-            for i in 0..n.h.num_children as usize {
-                if n.keys[i] == byte {
-                    return Some(&mut n.children[i] as *mut usize);
+    unsafe {
+        let h = &*(node_ptr as *const Header);
+        match h.node_type {
+            NODE4 => {
+                let n = &mut *(node_ptr as *mut Node4);
+                for i in 0..n.h.num_children as usize {
+                    if n.keys[i] == byte {
+                        return Some(&mut n.children[i] as *mut usize);
+                    }
                 }
-            }
-            None
-        }
-        NODE16 => {
-            let n = &mut *(node_ptr as *mut Node16);
-            for i in 0..n.h.num_children as usize {
-                if n.keys[i] == byte {
-                    return Some(&mut n.children[i] as *mut usize);
-                }
-            }
-            None
-        }
-        NODE256 => {
-            let n = &mut *(node_ptr as *mut Node256);
-            if n.children[byte as usize] != 0 {
-                Some(&mut n.children[byte as usize] as *mut usize)
-            } else {
                 None
             }
+            NODE16 => {
+                let n = &mut *(node_ptr as *mut Node16);
+                for i in 0..n.h.num_children as usize {
+                    if n.keys[i] == byte {
+                        return Some(&mut n.children[i] as *mut usize);
+                    }
+                }
+                None
+            }
+            NODE256 => {
+                let n = &mut *(node_ptr as *mut Node256);
+                if n.children[byte as usize] != 0 {
+                    Some(&mut n.children[byte as usize] as *mut usize)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
-        _ => None,
     }
 }
 
@@ -307,86 +313,88 @@ unsafe fn find_child_slot(node_ptr: usize, byte: u8) -> Option<*mut usize> {
 /// Uses COW for Node4/Node16 (allocate new, copy with insertion, publish).
 /// Node256 uses a single atomic store (no COW needed).
 unsafe fn add_child(node_slot: *mut usize, byte: u8, child: usize) -> bool {
-    let node_ptr = *node_slot;
-    let h = &*(node_ptr as *const Header);
-    match h.node_type {
-        NODE4 => {
-            let old = &*(node_ptr as *const Node4);
-            if (old.h.num_children as usize) < 4 {
-                let nc = old.h.num_children as usize;
-                let plen = old.h.partial_len as usize;
-                let new = match alloc_node4(&old.h.partial[..plen]) {
-                    Some(p) => p,
-                    None => return false,
-                };
-                let mut pos = nc;
-                for i in 0..nc {
-                    if byte < old.keys[i] {
-                        pos = i;
-                        break;
+    unsafe {
+        let node_ptr = *node_slot;
+        let h = &*(node_ptr as *const Header);
+        match h.node_type {
+            NODE4 => {
+                let old = &*(node_ptr as *const Node4);
+                if (old.h.num_children as usize) < 4 {
+                    let nc = old.h.num_children as usize;
+                    let plen = old.h.partial_len as usize;
+                    let new = match alloc_node4(&old.h.partial[..plen]) {
+                        Some(p) => p,
+                        None => return false,
+                    };
+                    let mut pos = nc;
+                    for i in 0..nc {
+                        if byte < old.keys[i] {
+                            pos = i;
+                            break;
+                        }
                     }
-                }
-                let n = &mut *new;
-                for i in 0..pos {
-                    n.keys[i] = old.keys[i];
-                    n.children[i] = old.children[i];
-                }
-                n.keys[pos] = byte;
-                n.children[pos] = child;
-                for i in pos..nc {
-                    n.keys[i + 1] = old.keys[i];
-                    n.children[i + 1] = old.children[i];
-                }
-                n.h.num_children = (nc + 1) as u8;
-                slot_store(node_slot, new as usize);
-                rcu_defer_free_node(node_ptr);
-                true
-            } else {
-                grow_to_16(node_slot, byte, child)
-            }
-        }
-        NODE16 => {
-            let old = &*(node_ptr as *const Node16);
-            if (old.h.num_children as usize) < 16 {
-                let nc = old.h.num_children as usize;
-                let plen = old.h.partial_len as usize;
-                let new = match alloc_node16(&old.h.partial[..plen]) {
-                    Some(p) => p,
-                    None => return false,
-                };
-                let mut pos = nc;
-                for i in 0..nc {
-                    if byte < old.keys[i] {
-                        pos = i;
-                        break;
+                    let n = &mut *new;
+                    for i in 0..pos {
+                        n.keys[i] = old.keys[i];
+                        n.children[i] = old.children[i];
                     }
+                    n.keys[pos] = byte;
+                    n.children[pos] = child;
+                    for i in pos..nc {
+                        n.keys[i + 1] = old.keys[i];
+                        n.children[i + 1] = old.children[i];
+                    }
+                    n.h.num_children = (nc + 1) as u8;
+                    slot_store(node_slot, new as usize);
+                    rcu_defer_free_node(node_ptr);
+                    true
+                } else {
+                    grow_to_16(node_slot, byte, child)
                 }
-                let n = &mut *new;
-                for i in 0..pos {
-                    n.keys[i] = old.keys[i];
-                    n.children[i] = old.children[i];
-                }
-                n.keys[pos] = byte;
-                n.children[pos] = child;
-                for i in pos..nc {
-                    n.keys[i + 1] = old.keys[i];
-                    n.children[i + 1] = old.children[i];
-                }
-                n.h.num_children = (nc + 1) as u8;
-                slot_store(node_slot, new as usize);
-                rcu_defer_free_node(node_ptr);
-                true
-            } else {
-                grow_to_256(node_slot, byte, child)
             }
+            NODE16 => {
+                let old = &*(node_ptr as *const Node16);
+                if (old.h.num_children as usize) < 16 {
+                    let nc = old.h.num_children as usize;
+                    let plen = old.h.partial_len as usize;
+                    let new = match alloc_node16(&old.h.partial[..plen]) {
+                        Some(p) => p,
+                        None => return false,
+                    };
+                    let mut pos = nc;
+                    for i in 0..nc {
+                        if byte < old.keys[i] {
+                            pos = i;
+                            break;
+                        }
+                    }
+                    let n = &mut *new;
+                    for i in 0..pos {
+                        n.keys[i] = old.keys[i];
+                        n.children[i] = old.children[i];
+                    }
+                    n.keys[pos] = byte;
+                    n.children[pos] = child;
+                    for i in pos..nc {
+                        n.keys[i + 1] = old.keys[i];
+                        n.children[i + 1] = old.children[i];
+                    }
+                    n.h.num_children = (nc + 1) as u8;
+                    slot_store(node_slot, new as usize);
+                    rcu_defer_free_node(node_ptr);
+                    true
+                } else {
+                    grow_to_256(node_slot, byte, child)
+                }
+            }
+            NODE256 => {
+                let n = &mut *(node_ptr as *mut Node256);
+                slot_store(&mut n.children[byte as usize], child);
+                n.h.num_children = n.h.num_children.saturating_add(1);
+                true
+            }
+            _ => false,
         }
-        NODE256 => {
-            let n = &mut *(node_ptr as *mut Node256);
-            slot_store(&mut n.children[byte as usize], child);
-            n.h.num_children = n.h.num_children.saturating_add(1);
-            true
-        }
-        _ => false,
     }
 }
 
@@ -396,58 +404,62 @@ unsafe fn add_child(node_slot: *mut usize, byte: u8, child: usize) -> bool {
 
 /// Grow Node4 → Node16. Adds the new (byte, child) entry.
 unsafe fn grow_to_16(node_slot: *mut usize, byte: u8, child: usize) -> bool {
-    let old_ptr = *node_slot;
-    let old = &*(old_ptr as *const Node4);
-    let plen = old.h.partial_len as usize;
-    let new = match alloc_node16(&old.h.partial[..plen]) {
-        Some(p) => p,
-        None => return false,
-    };
-    let nc = old.h.num_children as usize;
-    for i in 0..nc {
-        (*new).keys[i] = old.keys[i];
-        (*new).children[i] = old.children[i];
-    }
-    (*new).h.num_children = nc as u8;
-    // Insert the new child (sorted).
-    let n = &mut *new;
-    let mut pos = nc;
-    for i in 0..nc {
-        if byte < n.keys[i] {
-            pos = i;
-            break;
+    unsafe {
+        let old_ptr = *node_slot;
+        let old = &*(old_ptr as *const Node4);
+        let plen = old.h.partial_len as usize;
+        let new = match alloc_node16(&old.h.partial[..plen]) {
+            Some(p) => p,
+            None => return false,
+        };
+        let nc = old.h.num_children as usize;
+        for i in 0..nc {
+            (*new).keys[i] = old.keys[i];
+            (*new).children[i] = old.children[i];
         }
+        (*new).h.num_children = nc as u8;
+        // Insert the new child (sorted).
+        let n = &mut *new;
+        let mut pos = nc;
+        for i in 0..nc {
+            if byte < n.keys[i] {
+                pos = i;
+                break;
+            }
+        }
+        for i in (pos..nc).rev() {
+            n.keys[i + 1] = n.keys[i];
+            n.children[i + 1] = n.children[i];
+        }
+        n.keys[pos] = byte;
+        n.children[pos] = child;
+        n.h.num_children += 1;
+        slot_store(node_slot, new as usize);
+        rcu_defer_free_node(old_ptr);
+        true
     }
-    for i in (pos..nc).rev() {
-        n.keys[i + 1] = n.keys[i];
-        n.children[i + 1] = n.children[i];
-    }
-    n.keys[pos] = byte;
-    n.children[pos] = child;
-    n.h.num_children += 1;
-    slot_store(node_slot, new as usize);
-    rcu_defer_free_node(old_ptr);
-    true
 }
 
 /// Grow Node16 → Node256. Adds the new (byte, child) entry.
 unsafe fn grow_to_256(node_slot: *mut usize, byte: u8, child: usize) -> bool {
-    let old_ptr = *node_slot;
-    let old = &*(old_ptr as *const Node16);
-    let plen = old.h.partial_len as usize;
-    let new = match alloc_node256(&old.h.partial[..plen]) {
-        Some(p) => p,
-        None => return false,
-    };
-    let nc = old.h.num_children as usize;
-    for i in 0..nc {
-        (*new).children[old.keys[i] as usize] = old.children[i];
+    unsafe {
+        let old_ptr = *node_slot;
+        let old = &*(old_ptr as *const Node16);
+        let plen = old.h.partial_len as usize;
+        let new = match alloc_node256(&old.h.partial[..plen]) {
+            Some(p) => p,
+            None => return false,
+        };
+        let nc = old.h.num_children as usize;
+        for i in 0..nc {
+            (*new).children[old.keys[i] as usize] = old.children[i];
+        }
+        (*new).children[byte as usize] = child;
+        (*new).h.num_children = (nc + 1) as u8;
+        slot_store(node_slot, new as usize);
+        rcu_defer_free_node(old_ptr);
+        true
     }
-    (*new).children[byte as usize] = child;
-    (*new).h.num_children = (nc + 1) as u8;
-    slot_store(node_slot, new as usize);
-    rcu_defer_free_node(old_ptr);
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -456,43 +468,45 @@ unsafe fn grow_to_256(node_slot: *mut usize, byte: u8, child: usize) -> bool {
 
 /// Allocate a new node of the same type without the entry for `byte`.
 unsafe fn cow_node_remove_child(node_ptr: usize, byte: u8) -> Option<usize> {
-    let h = &*(node_ptr as *const Header);
-    match h.node_type {
-        NODE4 => {
-            let old = &*(node_ptr as *const Node4);
-            let nc = old.h.num_children as usize;
-            let plen = old.h.partial_len as usize;
-            let new = alloc_node4(&old.h.partial[..plen])?;
-            let n = &mut *new;
-            let mut j = 0;
-            for i in 0..nc {
-                if old.keys[i] != byte {
-                    n.keys[j] = old.keys[i];
-                    n.children[j] = old.children[i];
-                    j += 1;
+    unsafe {
+        let h = &*(node_ptr as *const Header);
+        match h.node_type {
+            NODE4 => {
+                let old = &*(node_ptr as *const Node4);
+                let nc = old.h.num_children as usize;
+                let plen = old.h.partial_len as usize;
+                let new = alloc_node4(&old.h.partial[..plen])?;
+                let n = &mut *new;
+                let mut j = 0;
+                for i in 0..nc {
+                    if old.keys[i] != byte {
+                        n.keys[j] = old.keys[i];
+                        n.children[j] = old.children[i];
+                        j += 1;
+                    }
                 }
+                n.h.num_children = j as u8;
+                Some(new as usize)
             }
-            n.h.num_children = j as u8;
-            Some(new as usize)
-        }
-        NODE16 => {
-            let old = &*(node_ptr as *const Node16);
-            let nc = old.h.num_children as usize;
-            let plen = old.h.partial_len as usize;
-            let new = alloc_node16(&old.h.partial[..plen])?;
-            let n = &mut *new;
-            let mut j = 0;
-            for i in 0..nc {
-                if old.keys[i] != byte {
-                    n.keys[j] = old.keys[i];
-                    n.children[j] = old.children[i];
-                    j += 1;
+            NODE16 => {
+                let old = &*(node_ptr as *const Node16);
+                let nc = old.h.num_children as usize;
+                let plen = old.h.partial_len as usize;
+                let new = alloc_node16(&old.h.partial[..plen])?;
+                let n = &mut *new;
+                let mut j = 0;
+                for i in 0..nc {
+                    if old.keys[i] != byte {
+                        n.keys[j] = old.keys[i];
+                        n.children[j] = old.children[i];
+                        j += 1;
+                    }
                 }
+                n.h.num_children = j as u8;
+                Some(new as usize)
             }
-            n.h.num_children = j as u8;
-            Some(new as usize)
+            _ => None,
         }
-        _ => None,
     }
 }
 
@@ -502,38 +516,40 @@ unsafe fn cow_node_remove_child(node_ptr: usize, byte: u8) -> Option<usize> {
 
 /// Clone an inner node with a new partial key. All children are copied.
 unsafe fn clone_node_with_partial(old_ptr: usize, new_partial: &[u8]) -> Option<usize> {
-    let h = &*(old_ptr as *const Header);
-    match h.node_type {
-        NODE4 => {
-            let old = &*(old_ptr as *const Node4);
-            let new = alloc_node4(new_partial)?;
-            (*new).h.num_children = old.h.num_children;
-            (*new).keys = old.keys;
-            (*new).children = old.children;
-            Some(new as usize)
+    unsafe {
+        let h = &*(old_ptr as *const Header);
+        match h.node_type {
+            NODE4 => {
+                let old = &*(old_ptr as *const Node4);
+                let new = alloc_node4(new_partial)?;
+                (*new).h.num_children = old.h.num_children;
+                (*new).keys = old.keys;
+                (*new).children = old.children;
+                Some(new as usize)
+            }
+            NODE16 => {
+                let old = &*(old_ptr as *const Node16);
+                let new = alloc_node16(new_partial)?;
+                (*new).h.num_children = old.h.num_children;
+                (*new).keys = old.keys;
+                (*new).children = old.children;
+                Some(new as usize)
+            }
+            NODE256 => {
+                let old = &*(old_ptr as *const Node256);
+                let new = alloc_node256(new_partial)?;
+                (*new).h.num_children = old.h.num_children;
+                (*new).children = old.children;
+                Some(new as usize)
+            }
+            _ => None,
         }
-        NODE16 => {
-            let old = &*(old_ptr as *const Node16);
-            let new = alloc_node16(new_partial)?;
-            (*new).h.num_children = old.h.num_children;
-            (*new).keys = old.keys;
-            (*new).children = old.children;
-            Some(new as usize)
-        }
-        NODE256 => {
-            let old = &*(old_ptr as *const Node256);
-            let new = alloc_node256(new_partial)?;
-            (*new).h.num_children = old.h.num_children;
-            (*new).children = old.children;
-            Some(new as usize)
-        }
-        _ => None,
     }
 }
 
 /// Number of children in a node.
 unsafe fn num_children(node_ptr: usize) -> u8 {
-    (*(node_ptr as *const Header)).num_children
+    unsafe { (*(node_ptr as *const Header)).num_children }
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +574,7 @@ impl Art {
     }
 
     /// Number of entries in the tree.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -663,56 +680,58 @@ unsafe fn insert_inner(
     new_leaf: *mut Leaf,
     depth: usize,
 ) -> bool {
-    let current = *slot;
+    unsafe {
+        let current = *slot;
 
-    if current == 0 {
-        slot_store(slot, tag_leaf(new_leaf));
-        *len_ptr += 1;
-        return true;
-    }
-
-    if is_leaf(current) {
-        let existing = &*untag_leaf(current);
-        if existing.key == key {
-            (*untag_leaf(current)).value = value;
-            free_leaf(new_leaf);
+        if current == 0 {
+            slot_store(slot, tag_leaf(new_leaf));
+            *len_ptr += 1;
             return true;
         }
-        return split_leaves(slot, len_ptr, current, new_leaf, key, depth);
-    }
 
-    let h = &*(current as *const Header);
-    let plen = h.partial_len as usize;
-
-    let mut match_len: usize = 0;
-    for i in 0..plen {
-        if depth + i >= KEY_LEN || h.partial[i] != key_at(key, depth + i) {
-            break;
+        if is_leaf(current) {
+            let existing = &*untag_leaf(current);
+            if existing.key == key {
+                (*untag_leaf(current)).value = value;
+                free_leaf(new_leaf);
+                return true;
+            }
+            return split_leaves(slot, len_ptr, current, new_leaf, key, depth);
         }
-        match_len += 1;
-    }
 
-    if match_len < plen {
-        return split_node(slot, len_ptr, new_leaf, key, depth, match_len);
-    }
+        let h = &*(current as *const Header);
+        let plen = h.partial_len as usize;
 
-    let new_depth = depth + plen;
-    if new_depth >= KEY_LEN {
-        free_leaf(new_leaf);
-        return false;
-    }
+        let mut match_len: usize = 0;
+        for i in 0..plen {
+            if depth + i >= KEY_LEN || h.partial[i] != key_at(key, depth + i) {
+                break;
+            }
+            match_len += 1;
+        }
 
-    let byte = key_at(key, new_depth);
+        if match_len < plen {
+            return split_node(slot, len_ptr, new_leaf, key, depth, match_len);
+        }
 
-    if let Some(child_slot) = find_child_slot(current, byte) {
-        return insert_inner(child_slot, len_ptr, key, value, new_leaf, new_depth + 1);
-    }
+        let new_depth = depth + plen;
+        if new_depth >= KEY_LEN {
+            free_leaf(new_leaf);
+            return false;
+        }
 
-    if add_child(slot, byte, tag_leaf(new_leaf)) {
-        *len_ptr += 1;
-        true
-    } else {
-        false
+        let byte = key_at(key, new_depth);
+
+        if let Some(child_slot) = find_child_slot(current, byte) {
+            return insert_inner(child_slot, len_ptr, key, value, new_leaf, new_depth + 1);
+        }
+
+        if add_child(slot, byte, tag_leaf(new_leaf)) {
+            *len_ptr += 1;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -725,52 +744,54 @@ unsafe fn split_leaves(
     new_key: u64,
     depth: usize,
 ) -> bool {
-    let existing = &*untag_leaf(existing_tagged);
-    let old_key = existing.key;
+    unsafe {
+        let existing = &*untag_leaf(existing_tagged);
+        let old_key = existing.key;
 
-    let mut prefix_len: usize = 0;
-    while depth + prefix_len < KEY_LEN
-        && key_at(old_key, depth + prefix_len) == key_at(new_key, depth + prefix_len)
-    {
-        prefix_len += 1;
+        let mut prefix_len: usize = 0;
+        while depth + prefix_len < KEY_LEN
+            && key_at(old_key, depth + prefix_len) == key_at(new_key, depth + prefix_len)
+        {
+            prefix_len += 1;
+        }
+
+        let mut partial = [0u8; MAX_PARTIAL];
+        let plen = prefix_len.min(MAX_PARTIAL);
+        for i in 0..plen {
+            partial[i] = key_at(old_key, depth + i);
+        }
+
+        let node = match alloc_node4(&partial[..plen]) {
+            Some(n) => n,
+            None => return false,
+        };
+
+        let diverge = depth + prefix_len;
+        if diverge >= KEY_LEN {
+            slab::free(PhysAddr::new(node as usize), NODE4_SLAB);
+            return false;
+        }
+
+        let old_byte = key_at(old_key, diverge);
+        let new_byte = key_at(new_key, diverge);
+
+        if old_byte < new_byte {
+            (*node).keys[0] = old_byte;
+            (*node).children[0] = existing_tagged;
+            (*node).keys[1] = new_byte;
+            (*node).children[1] = tag_leaf(new_leaf);
+        } else {
+            (*node).keys[0] = new_byte;
+            (*node).children[0] = tag_leaf(new_leaf);
+            (*node).keys[1] = old_byte;
+            (*node).children[1] = existing_tagged;
+        }
+        (*node).h.num_children = 2;
+
+        slot_store(slot, node as usize);
+        *len_ptr += 1;
+        true
     }
-
-    let mut partial = [0u8; MAX_PARTIAL];
-    let plen = prefix_len.min(MAX_PARTIAL);
-    for i in 0..plen {
-        partial[i] = key_at(old_key, depth + i);
-    }
-
-    let node = match alloc_node4(&partial[..plen]) {
-        Some(n) => n,
-        None => return false,
-    };
-
-    let diverge = depth + prefix_len;
-    if diverge >= KEY_LEN {
-        slab::free(PhysAddr::new(node as usize), NODE4_SLAB);
-        return false;
-    }
-
-    let old_byte = key_at(old_key, diverge);
-    let new_byte = key_at(new_key, diverge);
-
-    if old_byte < new_byte {
-        (*node).keys[0] = old_byte;
-        (*node).children[0] = existing_tagged;
-        (*node).keys[1] = new_byte;
-        (*node).children[1] = tag_leaf(new_leaf);
-    } else {
-        (*node).keys[0] = new_byte;
-        (*node).children[0] = tag_leaf(new_leaf);
-        (*node).keys[1] = old_byte;
-        (*node).children[1] = existing_tagged;
-    }
-    (*node).h.num_children = 2;
-
-    slot_store(slot, node as usize);
-    *len_ptr += 1;
-    true
 }
 
 /// Split an inner node whose partial key mismatches at position `match_len`.
@@ -783,59 +804,61 @@ unsafe fn split_node(
     depth: usize,
     match_len: usize,
 ) -> bool {
-    let old_node_ptr = *slot;
-    let old_h = &*(old_node_ptr as *const Header);
-    let old_plen = old_h.partial_len as usize;
+    unsafe {
+        let old_node_ptr = *slot;
+        let old_h = &*(old_node_ptr as *const Header);
+        let old_plen = old_h.partial_len as usize;
 
-    // Build the new parent's partial (the shared prefix up to mismatch).
-    let mut new_partial = [0u8; MAX_PARTIAL];
-    let nplen = match_len.min(MAX_PARTIAL);
-    for i in 0..nplen {
-        new_partial[i] = old_h.partial[i];
-    }
+        // Build the new parent's partial (the shared prefix up to mismatch).
+        let mut new_partial = [0u8; MAX_PARTIAL];
+        let nplen = match_len.min(MAX_PARTIAL);
+        for i in 0..nplen {
+            new_partial[i] = old_h.partial[i];
+        }
 
-    let parent = match alloc_node4(&new_partial[..nplen]) {
-        Some(n) => n,
-        None => return false,
-    };
-
-    let old_byte = old_h.partial[match_len];
-    let new_byte = key_at(new_key, depth + match_len);
-
-    // COW: clone old node with the remaining partial (after the mismatch byte).
-    let remaining = old_plen - match_len - 1;
-    let mut shortened = [0u8; MAX_PARTIAL];
-    for i in 0..remaining.min(MAX_PARTIAL) {
-        shortened[i] = old_h.partial[match_len + 1 + i];
-    }
-
-    let cloned =
-        match clone_node_with_partial(old_node_ptr, &shortened[..remaining.min(MAX_PARTIAL)]) {
-            Some(c) => c,
-            None => {
-                // Free unpublished parent.
-                free_node(parent as usize);
-                return false;
-            }
+        let parent = match alloc_node4(&new_partial[..nplen]) {
+            Some(n) => n,
+            None => return false,
         };
 
-    if old_byte < new_byte {
-        (*parent).keys[0] = old_byte;
-        (*parent).children[0] = cloned;
-        (*parent).keys[1] = new_byte;
-        (*parent).children[1] = tag_leaf(new_leaf);
-    } else {
-        (*parent).keys[0] = new_byte;
-        (*parent).children[0] = tag_leaf(new_leaf);
-        (*parent).keys[1] = old_byte;
-        (*parent).children[1] = cloned;
-    }
-    (*parent).h.num_children = 2;
+        let old_byte = old_h.partial[match_len];
+        let new_byte = key_at(new_key, depth + match_len);
 
-    slot_store(slot, parent as usize);
-    rcu_defer_free_node(old_node_ptr);
-    *len_ptr += 1;
-    true
+        // COW: clone old node with the remaining partial (after the mismatch byte).
+        let remaining = old_plen - match_len - 1;
+        let mut shortened = [0u8; MAX_PARTIAL];
+        for i in 0..remaining.min(MAX_PARTIAL) {
+            shortened[i] = old_h.partial[match_len + 1 + i];
+        }
+
+        let cloned =
+            match clone_node_with_partial(old_node_ptr, &shortened[..remaining.min(MAX_PARTIAL)]) {
+                Some(c) => c,
+                None => {
+                    // Free unpublished parent.
+                    free_node(parent as usize);
+                    return false;
+                }
+            };
+
+        if old_byte < new_byte {
+            (*parent).keys[0] = old_byte;
+            (*parent).children[0] = cloned;
+            (*parent).keys[1] = new_byte;
+            (*parent).children[1] = tag_leaf(new_leaf);
+        } else {
+            (*parent).keys[0] = new_byte;
+            (*parent).children[0] = tag_leaf(new_leaf);
+            (*parent).keys[1] = old_byte;
+            (*parent).children[1] = cloned;
+        }
+        (*parent).h.num_children = 2;
+
+        slot_store(slot, parent as usize);
+        rcu_defer_free_node(old_node_ptr);
+        *len_ptr += 1;
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -849,72 +872,74 @@ unsafe fn remove_inner(
     key: u64,
     depth: usize,
 ) -> Option<usize> {
-    let current = *slot;
-    if current == 0 {
-        return None;
-    }
-
-    if is_leaf(current) {
-        let leaf = &*untag_leaf(current);
-        if leaf.key == key {
-            let value = leaf.value;
-            slot_store(slot, 0);
-            rcu_defer_free_leaf(untag_leaf(current));
-            *len_ptr -= 1;
-            return Some(value);
-        }
-        return None;
-    }
-
-    let h = &*(current as *const Header);
-    let plen = h.partial_len as usize;
-
-    for i in 0..plen {
-        if depth + i >= KEY_LEN || h.partial[i] != key_at(key, depth + i) {
+    unsafe {
+        let current = *slot;
+        if current == 0 {
             return None;
         }
-    }
-    let new_depth = depth + plen;
-    if new_depth >= KEY_LEN {
-        return None;
-    }
 
-    let byte = key_at(key, new_depth);
-    let child_slot = find_child_slot(current, byte)?;
+        if is_leaf(current) {
+            let leaf = &*untag_leaf(current);
+            if leaf.key == key {
+                let value = leaf.value;
+                slot_store(slot, 0);
+                rcu_defer_free_leaf(untag_leaf(current));
+                *len_ptr -= 1;
+                return Some(value);
+            }
+            return None;
+        }
 
-    let result = remove_inner(child_slot, len_ptr, key, new_depth + 1);
-    if result.is_some() {
-        // Check if child was zeroed (leaf removed at deeper level).
-        if *child_slot == 0 {
-            let h = &*(current as *const Header);
-            match h.node_type {
-                NODE256 => {
-                    // Child already atomically zeroed; just update count.
-                    let n = &mut *(current as *mut Node256);
-                    n.h.num_children = n.h.num_children.saturating_sub(1);
-                    if n.h.num_children == 0 {
-                        slot_store(slot, 0);
-                        rcu_defer_free_node(current);
+        let h = &*(current as *const Header);
+        let plen = h.partial_len as usize;
+
+        for i in 0..plen {
+            if depth + i >= KEY_LEN || h.partial[i] != key_at(key, depth + i) {
+                return None;
+            }
+        }
+        let new_depth = depth + plen;
+        if new_depth >= KEY_LEN {
+            return None;
+        }
+
+        let byte = key_at(key, new_depth);
+        let child_slot = find_child_slot(current, byte)?;
+
+        let result = remove_inner(child_slot, len_ptr, key, new_depth + 1);
+        if result.is_some() {
+            // Check if child was zeroed (leaf removed at deeper level).
+            if *child_slot == 0 {
+                let h = &*(current as *const Header);
+                match h.node_type {
+                    NODE256 => {
+                        // Child already atomically zeroed; just update count.
+                        let n = &mut *(current as *mut Node256);
+                        n.h.num_children = n.h.num_children.saturating_sub(1);
+                        if n.h.num_children == 0 {
+                            slot_store(slot, 0);
+                            rcu_defer_free_node(current);
+                        }
                     }
-                }
-                _ => {
-                    // Node4 or Node16: COW without the removed child.
-                    let nc = num_children(current);
-                    if nc <= 1 {
-                        // Node becomes empty after removal — no COW needed.
-                        slot_store(slot, 0);
-                        rcu_defer_free_node(current);
-                    } else if let Some(new_ptr) = cow_node_remove_child(current, byte) {
-                        slot_store(slot, new_ptr);
-                        rcu_defer_free_node(current);
+                    _ => {
+                        // Node4 or Node16: COW without the removed child.
+                        let nc = num_children(current);
+                        if nc <= 1 {
+                            // Node becomes empty after removal — no COW needed.
+                            slot_store(slot, 0);
+                            rcu_defer_free_node(current);
+                        } else if let Some(new_ptr) = cow_node_remove_child(current, byte) {
+                            slot_store(slot, new_ptr);
+                            rcu_defer_free_node(current);
+                        }
+                        // On OOM: old node retains the key with zeroed child.
+                        // Readers see 0 = not found. Functionally correct.
                     }
-                    // On OOM: old node retains the key with zeroed child.
-                    // Readers see 0 = not found. Functionally correct.
                 }
             }
         }
+        result
     }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -922,39 +947,41 @@ unsafe fn remove_inner(
 // ---------------------------------------------------------------------------
 
 unsafe fn for_each_inner<F: FnMut(u64, usize)>(node: usize, f: &mut F) {
-    if node == 0 {
-        return;
-    }
-    if is_leaf(node) {
-        let leaf = &*untag_leaf(node);
-        f(leaf.key, leaf.value);
-        return;
-    }
-    let h = &*(node as *const Header);
-    match h.node_type {
-        NODE4 => {
-            let n = &*(node as *const Node4);
-            for i in 0..n.h.num_children as usize {
-                let child = slot_load(&n.children[i]);
-                for_each_inner(child, f);
-            }
+    unsafe {
+        if node == 0 {
+            return;
         }
-        NODE16 => {
-            let n = &*(node as *const Node16);
-            for i in 0..n.h.num_children as usize {
-                let child = slot_load(&n.children[i]);
-                for_each_inner(child, f);
-            }
+        if is_leaf(node) {
+            let leaf = &*untag_leaf(node);
+            f(leaf.key, leaf.value);
+            return;
         }
-        NODE256 => {
-            let n = &*(node as *const Node256);
-            for i in 0..256 {
-                let child = slot_load(&n.children[i]);
-                if child != 0 {
+        let h = &*(node as *const Header);
+        match h.node_type {
+            NODE4 => {
+                let n = &*(node as *const Node4);
+                for i in 0..n.h.num_children as usize {
+                    let child = slot_load(&n.children[i]);
                     for_each_inner(child, f);
                 }
             }
+            NODE16 => {
+                let n = &*(node as *const Node16);
+                for i in 0..n.h.num_children as usize {
+                    let child = slot_load(&n.children[i]);
+                    for_each_inner(child, f);
+                }
+            }
+            NODE256 => {
+                let n = &*(node as *const Node256);
+                for i in 0..256 {
+                    let child = slot_load(&n.children[i]);
+                    if child != 0 {
+                        for_each_inner(child, f);
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
 }

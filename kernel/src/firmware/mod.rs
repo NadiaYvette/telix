@@ -108,12 +108,14 @@ impl<T: Copy + Default, const N: usize> FwArray<T, N> {
         true
     }
 
+    #[allow(dead_code)]
     fn as_slice(&self) -> &[T] {
         let n = self.count.load(Ordering::Acquire) as usize;
         // SAFETY: elements 0..n were fully written before the Release store.
         unsafe { core::slice::from_raw_parts(self.data[0].get() as *const T, n) }
     }
 
+    #[allow(dead_code)]
     fn len(&self) -> u32 {
         self.count.load(Ordering::Acquire)
     }
@@ -136,6 +138,7 @@ static IRQ_CTRL: IrqCtrlCell = IrqCtrlCell(UnsafeCell::new(IrqControllerInfo {
 }));
 
 static IRQ_CTRL_SET: AtomicU32 = AtomicU32::new(0);
+#[allow(dead_code)]
 static TIMEBASE_FREQ: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
@@ -172,6 +175,7 @@ pub fn irq_controller() -> IrqControllerInfo {
 }
 
 /// RISC-V timebase frequency from DTB (0 if not set).
+#[allow(dead_code)]
 pub fn timebase_freq() -> u64 {
     TIMEBASE_FREQ.load(Ordering::Acquire)
 }
@@ -188,6 +192,7 @@ pub(crate) fn push_cpu(c: CpuDesc) {
     CPUS.push(c);
 }
 
+#[allow(dead_code)]
 pub(crate) fn push_virtio(d: VirtioMmioDesc) {
     VIRTIO_DEVICES.push(d);
 }
@@ -199,6 +204,7 @@ pub(crate) fn set_irq_controller(info: IrqControllerInfo) {
     IRQ_CTRL_SET.store(1, Ordering::Release);
 }
 
+#[allow(dead_code)]
 pub(crate) fn set_timebase_freq(freq: u64) {
     TIMEBASE_FREQ.store(freq, Ordering::Release);
 }

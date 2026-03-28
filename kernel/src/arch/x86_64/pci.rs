@@ -2,7 +2,7 @@
 //!
 //! Scans bus 0 for virtio devices and returns BAR0 + IRQ info.
 
-use super::serial::{inb, inl, inw, outb, outl, outw};
+use super::serial::{inl, inw, outl, outw};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -10,6 +10,7 @@ const CONFIG_DATA: u16 = 0xCFC;
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 
 /// A discovered PCI device.
+#[allow(dead_code)]
 pub struct PciDevice {
     pub bus: u8,
     pub device: u8,

@@ -15,7 +15,7 @@ use super::hat;
 use super::object;
 use super::page::{
     MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_ALLOC_PAGES,
-    SUPERPAGE_MMU_PAGES, SUPERPAGE_SIZE,
+    SUPERPAGE_MMU_PAGES,
 };
 use super::stats;
 use core::sync::atomic::Ordering;

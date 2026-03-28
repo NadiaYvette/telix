@@ -268,6 +268,7 @@ impl Port {
     }
 
     /// Current queue capacity (0 if no queue allocated).
+    #[allow(dead_code)]
     pub fn queue_capacity(&self) -> usize {
         match self.mpsc() {
             Some(q) => q.capacity as usize,
@@ -509,6 +510,7 @@ pub fn get_recv_holder(port_id: PortId) -> u32 {
 }
 
 /// Current queue capacity (0 if no queue allocated).
+#[allow(dead_code)]
 pub fn queue_capacity(port_id: PortId) -> usize {
     match port_ref(port_id) {
         Some(port) => port.queue_capacity(),
@@ -610,7 +612,6 @@ pub enum SendDirectResult {
 /// Internal: stamp sender priority and do an MPSC send + wake receiver.
 /// Returns Ok(()) on success, Err(()) if queue full or port invalid.
 fn do_send(port: &Port, msg: &Message) -> Result<(), ()> {
-    use crate::sync::turnstile::{KEY_PORT_RECV, KEY_PORT_RECV_PARK};
     let q = match port.mpsc() {
         Some(q) => q,
         None => return Err(()),
@@ -741,7 +742,7 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
 /// If a receiver is parked on this port, returns DirectTransfer(tid)
 /// without queueing the message.
 pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
-    use crate::sync::turnstile::{KEY_PORT_RECV, KEY_PORT_RECV_PARK};
+    use crate::sync::turnstile::KEY_PORT_RECV_PARK;
 
     let tid = crate::sched::current_thread_id();
     msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;

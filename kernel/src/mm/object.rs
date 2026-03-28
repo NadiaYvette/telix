@@ -45,6 +45,7 @@ pub struct Mapping {
 }
 
 impl Mapping {
+    #[allow(dead_code)]
     const fn empty() -> Self {
         Self {
             aspace_id: 0,
@@ -129,6 +130,7 @@ impl MemObject {
     }
 
     /// Clear all page pointers without freeing.
+    #[allow(dead_code)]
     pub fn clear_pages(&mut self) {
         self.pages.clear(self.page_count as usize);
     }
@@ -201,6 +203,7 @@ impl MemObject {
     }
 
     /// Iterate over all active mappings, calling `f(aspace_id, va_start)` for each.
+    #[allow(dead_code)]
     pub fn for_each_mapping<F: FnMut(u64, usize)>(&self, mut f: F) {
         for i in 0..self.mappings_count as usize {
             let m = unsafe { &*self.mappings.add(i) };

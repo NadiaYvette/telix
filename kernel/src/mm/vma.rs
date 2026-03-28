@@ -71,6 +71,7 @@ impl Vma {
     }
 
     /// Check if a virtual address falls within this VMA.
+    #[allow(dead_code)]
     pub fn contains(&self, va: usize) -> bool {
         va >= self.va_start && va < self.va_start + self.va_len
     }

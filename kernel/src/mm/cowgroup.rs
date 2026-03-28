@@ -128,6 +128,7 @@ impl GroupExtent {
         }
     }
 
+    #[allow(dead_code)]
     fn is_active(&self) -> bool {
         self.page_count > 0
     }
@@ -957,6 +958,7 @@ pub struct ReservationInfo {
     /// Physical base of the reserved destination (superpage-aligned).
     pub dest_pa: usize,
     /// Bitmask of which slots have been COW-copied.
+    #[allow(dead_code)]
     pub copied: u64,
     /// Number of allocation pages in this extent.
     pub page_count: u8,
