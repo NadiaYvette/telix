@@ -27,13 +27,43 @@ pub fn init() {
     lapic::init_bsp();
 }
 
-/// Parse firmware tables (Multiboot + ACPI).
-/// Stub — actual implementation in a later commit.
-pub fn parse_firmware() {}
+/// Parse firmware tables (Multiboot memory map + ACPI MADT).
+pub fn parse_firmware() {
+    boot::parse_firmware();
+}
 
 /// RAM range for the physical allocator.
-/// x86 QEMU: RAM starts at 1 MiB, we use 256 MiB total.
+/// Uses Multiboot memory map when available, falls back to hardcoded 256 MiB.
 pub fn ram_range() -> (usize, usize) {
+    let regions = crate::firmware::mem_regions();
+    let kernel_end = boot::kernel_end_addr();
+
+    // Find the region containing kernel_end (the main usable RAM).
+    for r in regions {
+        let base = r.base as usize;
+        let end = (r.base + r.size) as usize;
+        if base <= kernel_end && kernel_end < end {
+            return (base, end);
+        }
+    }
+
+    // Fallback: largest region at or above 1 MiB.
+    let mut best_start = 0usize;
+    let mut best_end = 0usize;
+    for r in regions {
+        if r.base >= 0x10_0000 {
+            let end = (r.base + r.size) as usize;
+            if end - r.base as usize > best_end - best_start {
+                best_start = r.base as usize;
+                best_end = end;
+            }
+        }
+    }
+    if best_end > best_start {
+        return (best_start, best_end);
+    }
+
+    // Hardcoded fallback.
     let start = boot::RAM_BASE;
     let end = start + 256 * 1024 * 1024;
     (start, end)

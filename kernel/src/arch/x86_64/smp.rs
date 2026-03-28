@@ -61,12 +61,38 @@ pub fn start_secondary_cpus() {
         );
     }
 
+    // Build list of APIC IDs to start. Use ACPI MADT if available,
+    // otherwise probe sequentially 0..MAX_CPUS.
+    let fw_cpus = crate::firmware::cpus();
+    let mut ap_ids = [0u32; MAX_CPUS];
+    let mut ap_count = 0usize;
+
+    if !fw_cpus.is_empty() {
+        for desc in fw_cpus {
+            if desc.id == bsp_id || desc.flags & 1 == 0 {
+                continue;
+            }
+            if ap_count < MAX_CPUS {
+                ap_ids[ap_count] = desc.id;
+                ap_count += 1;
+            }
+        }
+    } else {
+        // Fallback: probe sequential IDs.
+        for id in 0..(MAX_CPUS as u32) {
+            if id == bsp_id {
+                continue;
+            }
+            ap_ids[ap_count] = id;
+            ap_count += 1;
+        }
+    }
+
     // Start each AP one at a time.
     let mut expected_aps = 0u32;
-    for cpu in 0..(MAX_CPUS as u32) {
-        if cpu == bsp_id {
-            continue;
-        }
+    let mut consecutive_timeouts = 0u32;
+    for i in 0..ap_count {
+        let cpu = ap_ids[i];
 
         let stack_top = unsafe {
             AP_STACKS.0[cpu as usize].as_ptr().add(AP_STACK_SIZE) as u64
@@ -87,7 +113,6 @@ pub fn start_secondary_cpus() {
                 ap_rust_entry as *const () as u64,
             );
             // +0x20: 64-bit GDT pointer (10 bytes: 2-byte limit + 8-byte base).
-            // Copy the BSP's GDTR.
             core::ptr::copy_nonoverlapping(
                 gdt_ptr_bytes.as_ptr(),
                 data_base.add(0x20),
@@ -106,7 +131,6 @@ pub fn start_secondary_cpus() {
         }
 
         // INIT-SIPI-SIPI sequence.
-        // Delays are minimal — QEMU processes IPIs immediately.
         super::lapic::send_init(cpu);
         super::lapic::delay_us(200);
 
@@ -119,14 +143,24 @@ pub fn start_secondary_cpus() {
         // Wait for this AP to signal ready (with timeout).
         expected_aps += 1;
         let target_count = expected_aps;
-        let mut timeout = 100_000_000u64;
+        let mut timeout = 5_000_000u64;
         while AP_READY_COUNT.load(Ordering::Acquire) < target_count {
             core::hint::spin_loop();
             timeout -= 1;
             if timeout == 0 {
-                crate::println!("  CPU {} startup timeout", cpu);
+                crate::println!("  CPU {} (APIC {}) startup timeout", i + 1, cpu);
+                expected_aps -= 1;
+                consecutive_timeouts += 1;
                 break;
             }
+        }
+        if timeout > 0 {
+            consecutive_timeouts = 0;
+        }
+        // With MADT data, all CPUs should be present — but still stop
+        // after 2 consecutive timeouts as a safety net.
+        if consecutive_timeouts >= 2 && fw_cpus.is_empty() {
+            break;
         }
     }
 
