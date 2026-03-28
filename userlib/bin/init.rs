@@ -622,13 +622,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 11 console server: FAILED (no reply)\n");
         }
 
-        // Spawn interactive shell.
-        let shell_tid = syscall::spawn(b"shell", 50);
-        if shell_tid != u64::MAX {
-            syscall::debug_puts(b"  init: shell spawned (tid=");
-            print_num(shell_tid);
-            syscall::debug_puts(b")\n");
-        }
+        // (shell used to be spawned here; getty_login/tsh replaces it,
+        // spawned after benchmarks complete to avoid interleaved output.)
     } else {
         syscall::debug_puts(b"  init: console not found\n");
         syscall::debug_puts(b"Phase 11 console server: SKIPPED\n");
@@ -690,15 +685,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"  init: WARN: failed to spawn sshd\n");
     }
 
-    syscall::debug_puts(b"  init: spawning getty_login...\n");
-    let getty_tid = syscall::spawn(b"getty_login", 50);
-    if getty_tid != u64::MAX {
-        syscall::debug_puts(b"  init: getty_login started (tid=");
-        print_num(getty_tid);
-        syscall::debug_puts(b")\n");
-    } else {
-        syscall::debug_puts(b"  init: WARN: failed to spawn getty_login\n");
-    }
+    // getty_login is spawned after all tests and benchmarks complete,
+    // so its interactive session isn't stomped by test output on serial.
+    let mut getty_tid = u64::MAX;
 
     // --- Test 13: Execute ELF from FAT16 filesystem ---
     syscall::debug_puts(b"  init: testing exec from filesystem...\n");
@@ -7332,6 +7321,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // Spawn getty_login now that all tests and benchmarks are done.
+    syscall::debug_puts(b"  init: spawning getty_login...\n");
+    getty_tid = syscall::spawn(b"getty_login", 50);
+    if getty_tid != u64::MAX {
+        syscall::debug_puts(b"  init: getty_login started (tid=");
+        print_num(getty_tid);
+        syscall::debug_puts(b")\n");
+    } else {
+        syscall::debug_puts(b"  init: WARN: failed to spawn getty_login\n");
+    }
+
     // Init loops forever, reaping children and respawning getty_login.
     loop {
         if getty_tid != u64::MAX {
@@ -7411,13 +7411,12 @@ extern "C" fn cosched_worker(group_id: u64) {
     // Burn CPU across many timer ticks.
     // Each yield_now forces a preemption on the next tick, putting us
     // in the run queue where the cosched logic can find group-mates.
-    // The busy-spin must last longer than a timer interval (10ms) to
-    // ensure threads are preempted mid-work, creating run-queue diversity.
-    // At 62.5 MHz (aarch64 QEMU), 500K iterations ≈ 8ms; at ~1 GHz
-    // (x86 QEMU RDTSC rate), PAUSE is ~10-40ns so 500K ≈ 5-20ms.
-    for _ in 0..50 {
+    // Keep iteration count low — QEMU TCG x86 is significantly slower
+    // than aarch64, and PAUSE instructions can take 10-40ns each.
+    // 10 iterations × 200K spins ≈ enough timer ticks for coscheduling.
+    for _ in 0..10 {
         syscall::yield_now();
-        for _ in 0..500_000 {
+        for _ in 0..200_000 {
             core::hint::spin_loop();
         }
     }

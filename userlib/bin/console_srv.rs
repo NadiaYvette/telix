@@ -45,6 +45,8 @@ struct ConsoleSrv {
     line_ready: bool,
     /// Reply port of pending CON_READ client (at most one).
     pending_reader: u64,
+    /// Remaining bytes to skip in an escape sequence (e.g. \x1b[A).
+    esc_skip: u8,
 }
 
 impl ConsoleSrv {
@@ -54,10 +56,23 @@ impl ConsoleSrv {
             line_len: 0,
             line_ready: false,
             pending_reader: u64::MAX,
+            esc_skip: 0,
         }
     }
 
     fn handle_char(&mut self, ch: u8) {
+        // Consume escape sequences (e.g. \x1b[A for arrow keys) so they
+        // don't get echoed as literal characters on dumb terminals.
+        if self.esc_skip > 0 {
+            self.esc_skip -= 1;
+            return;
+        }
+        if ch == 0x1B {
+            // ESC: skip the next 2 bytes (CSI sequence like \x1b[A).
+            self.esc_skip = 2;
+            return;
+        }
+
         match ch {
             // Enter (CR or LF).
             0x0D | 0x0A => {

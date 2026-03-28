@@ -296,10 +296,19 @@ pub fn setup_signal_entry(
     }
 }
 
-/// Update the TSS RSP0 for the next thread on x86_64 context switches.
-/// No-op on other architectures.
+/// Update the kernel stack pointer for the next thread on context switches.
+/// x86_64: writes TSS RSP0 for ring 3→0 transitions.
+/// riscv64: writes TRAP_SCRATCH_ARRAY[cpu].kernel_sp for user ecall entry.
 #[inline]
 pub fn update_kernel_stack(_next_kstack_top: usize) {
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::gdt::set_rsp0(_next_kstack_top as u64);
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let cpu = crate::arch::cpu::cpu_id() as usize;
+        unsafe {
+            crate::sched::smp::TRAP_SCRATCH_ARRAY[cpu].kernel_sp = _next_kstack_top as u64;
+        }
+    }
 }

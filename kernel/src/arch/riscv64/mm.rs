@@ -25,8 +25,8 @@ const PTE_G: u64 = 1 << 5; // Global
 const PTE_A: u64 = 1 << 6; // Accessed
 const PTE_D: u64 = 1 << 7; // Dirty
 /// Software-defined bit: page content has been initialized (zeroed/filled).
-/// Bits [63:54] are reserved for supervisor software in Sv39.
-pub const PTE_SW_ZEROED: u64 = 1 << 54;
+/// Use RSW bit 9 (bits 9:8 are reserved for supervisor software in Sv39).
+pub const PTE_SW_ZEROED: u64 = 1 << 9;
 
 const MMU_PAGE_SIZE: usize = 4096;
 

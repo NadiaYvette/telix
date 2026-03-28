@@ -33,6 +33,7 @@ static int check_passwd(const char *user, const char *pass,
     buf[total] = '\0';
     close(fd);
 
+
     /* Parse lines. */
     char *line = buf;
     while (*line) {
@@ -74,6 +75,7 @@ int main(int arg0, int arg1, int arg2) {
     for (;;) {
         /* Read username. */
         printf("\nlogin: ");
+        fflush(stdout);
         char user[32];
         ssize_t n = read(STDIN_FILENO, user, sizeof(user) - 1);
         if (n <= 0) continue;
@@ -84,6 +86,7 @@ int main(int arg0, int arg1, int arg2) {
 
         /* Read password. */
         printf("password: ");
+        fflush(stdout);
         char pass[32];
         n = read(STDIN_FILENO, pass, sizeof(pass) - 1);
         if (n <= 0) { pass[0] = '\0'; n = 0; }

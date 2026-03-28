@@ -110,14 +110,15 @@ static ssize_t read_file(struct telix_fd_entry *fde,
         if (msg.tag != FS_READ_OK)
             break;
 
-        int n = (int)(msg.data[2] & 0xFFFF);
+        /* FS_READ_OK: data[0]=count, data[1]=bytes[0..7], data[2]=bytes[8..15] */
+        int n = (int)(msg.data[0] & 0xFFFF);
         if (n <= 0) break;
         if (n > 16) n = 16;
 
         for (int i = 0; i < n; i++) {
             int wi = i / 8;
             int bi = i % 8;
-            uint64_t word = (wi == 0) ? msg.data[0] : msg.data[1];
+            uint64_t word = (wi == 0) ? msg.data[1] : msg.data[2];
             p[total_read + i] = (unsigned char)(word >> (bi * 8));
         }
 

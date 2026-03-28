@@ -689,6 +689,11 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
         if do_send(port, &msg).is_ok() {
             return Ok(());
         }
+        // If this thread was killed, bail out.
+        if crate::sched::scheduler::is_killed(tid) {
+            return Err(());
+        }
+
         // Queue full — block on turnstile with lost-wakeup prevention.
         let enqueued = crate::sync::turnstile::port_enqueue_with_check(
             port_id,
@@ -821,6 +826,14 @@ pub fn recv(port_id: PortId) -> Result<Message, ()> {
             crate::sched::boost_priority(my_tid, msg.data[5] as u8);
 
             return Ok(msg);
+        }
+
+        // If this thread was killed, bail out so the syscall exit path
+        // can run exit_current_thread. Without this check the loop spins
+        // forever: block_current returns immediately (killed flag), but
+        // recv never returns to the syscall handler.
+        if crate::sched::scheduler::is_killed(my_tid) {
+            return Err(());
         }
 
         // Queue empty — block on turnstile with lost-wakeup prevention.

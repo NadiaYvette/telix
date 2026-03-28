@@ -616,6 +616,7 @@ int main(int arg0, int arg1, int arg2) {
         char cwdbuf[64];
         getcwd(cwdbuf, sizeof(cwdbuf));
         printf("%s$ ", cwdbuf);
+        fflush(stdout);
 
         /* Read line. */
         char line[MAX_LINE];
