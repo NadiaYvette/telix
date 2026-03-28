@@ -299,9 +299,9 @@ pub fn update_pte_flags(root: usize, va: usize, new_flags: u64) -> bool {
     if entry & PTE_V == 0 {
         return false;
     }
-    let ppn = entry & !0x3FF; // Keep PPN bits (10..53), clear flag bits (0..9)
+    let pa_and_sw = entry & (0x003F_FFFF_FFFF_FC00 | PTE_SW_ZEROED);
     unsafe {
-        *slot = ppn | new_flags;
+        *slot = pa_and_sw | new_flags;
     }
     Sv39Pte::tlb_invalidate(va);
     true
