@@ -786,14 +786,7 @@ fn do_spawn_heavy_work(
     let entry = elf_info.entry;
 
     // Flush instruction cache.
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
-    }
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        core::arch::asm!("fence.i");
-    }
+    crate::arch::cpu::flush_icache();
 
     // Map user stack.
     #[cfg(target_arch = "aarch64")]
@@ -1600,7 +1593,7 @@ pub fn block_current(_reason: BlockReason) {
     // Enable interrupts so the timer can preempt us while we spin.
     // This is critical when called from a syscall handler (SVC/ecall/int),
     // because hardware masks IRQs on exception entry.
-    let saved = arch_save_and_enable_irqs();
+    let saved = crate::arch::irq::save_and_enable();
     // Spin until the wakeup flag is set. The thread stays Running and
     // gets preempted normally by timer ticks (quantum-based). This avoids
     // a race where wake_thread() re-enqueues a Blocked thread that's still
@@ -1614,7 +1607,7 @@ pub fn block_current(_reason: BlockReason) {
         // This is critical on QEMU TCG: spin_loop() keeps the vCPU busy,
         // starving QEMU's I/O thread from processing virtio requests.
         // WFI causes the vCPU to pause until an interrupt arrives.
-        arch_wait_for_interrupt();
+        crate::arch::irq::wait_for_interrupt();
         // Re-arm: try_switch() clears YIELD_ASAP when it preempts us,
         // but we need it set again so the *next* tick also preempts
         // immediately (we're still blocked, not doing useful work).
@@ -1624,7 +1617,7 @@ pub fn block_current(_reason: BlockReason) {
     // Restore effective priority — no SCHEDULER lock needed.
     tref.prio.store(saved_prio, Ordering::Release);
     unsafe { thread_mut_from_ref(tid) }.effective_priority = saved_prio;
-    arch_restore_irqs(saved);
+    crate::arch::irq::restore(saved);
 }
 
 /// Wake a blocked thread, making it runnable.
@@ -1664,7 +1657,7 @@ pub fn wake_thread(tid: ThreadId) {
         }
     }
     // Signal all CPUs so any core spinning in block_current's WFE wakes immediately.
-    arch_send_event();
+    crate::arch::irq::send_event();
 }
 
 /// Check if a thread has been marked for kill.
@@ -2468,7 +2461,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
 
     // Enable interrupts so the timer can preempt us (we may be in a syscall
     // handler where hardware masked IRQs on exception entry).
-    arch_enable_irqs();
+    crate::arch::irq::enable();
 
     // Request immediate preemption on the next tick so we don't waste a
     // full quantum spinning.  Don't use WFI/HLT here: on the next timer
@@ -2480,14 +2473,14 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     loop { core::hint::spin_loop(); }
 }
 
-// --- Architecture-specific IRQ helpers for blocking paths ---
+// --- IRQ helpers for blocking paths (delegate to arch::irq) ---
 
 /// Save current interrupt state and enable IRQs. Returns saved state.
 /// Public so drivers (e.g. virtio_blk) can use polling with WFI.
 #[inline(always)]
 #[allow(dead_code)]
 pub fn arch_irq_save_enable() -> usize {
-    arch_save_and_enable_irqs()
+    crate::arch::irq::save_and_enable()
 }
 
 /// Restore interrupt state.
@@ -2495,118 +2488,14 @@ pub fn arch_irq_save_enable() -> usize {
 #[inline(always)]
 #[allow(dead_code)]
 pub fn arch_irq_restore(saved: usize) {
-    arch_restore_irqs(saved);
+    crate::arch::irq::restore(saved);
 }
 
 /// Wait for next interrupt (WFI/HLT). Public for sys_yield.
 #[inline(always)]
 #[allow(dead_code)]
 pub fn arch_wait_for_irq() {
-    arch_wait_for_interrupt();
-}
-
-#[inline(always)]
-fn arch_save_and_enable_irqs() -> usize {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let daif: u64;
-        unsafe {
-            core::arch::asm!(
-                "mrs {0}, daif",
-                "msr daifclr, #2", // Clear IRQ mask → enable IRQs
-                "isb",             // Ensure unmask is visible before WFI
-                out(reg) daif,
-            );
-        }
-        daif as usize
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let sstatus: usize;
-        unsafe {
-            core::arch::asm!(
-                "csrrsi {0}, sstatus, 0x2", // Set SIE bit, return old value
-                out(reg) sstatus,
-            );
-        }
-        sstatus
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let flags: u64;
-        unsafe {
-            core::arch::asm!(
-                "pushfq",
-                "pop {0}",
-                "sti",
-                out(reg) flags,
-            );
-        }
-        flags as usize
-    }
-}
-
-/// Restore interrupt state.
-#[inline(always)]
-fn arch_restore_irqs(saved: usize) {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        // ISB is required: MSR writes to DAIF are not self-synchronizing
-        // on AArch64.  Without it a subsequent WFI can execute before the
-        // IRQ-unmask takes effect, causing a deadlock.
-        core::arch::asm!("msr daif, {0}", "isb", in(reg) saved as u64);
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        if saved & 0x2 == 0 {
-            // SIE was clear before — restore it.
-            unsafe { core::arch::asm!("csrci sstatus, 0x2"); }
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if saved & 0x200 == 0 {
-            // IF was clear before — disable interrupts.
-            unsafe { core::arch::asm!("cli"); }
-        }
-    }
-}
-
-/// Unconditionally enable IRQs.
-#[inline(always)]
-fn arch_enable_irqs() {
-    #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("msr daifclr, #2", "isb"); }
-    #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("csrsi sstatus, 0x2"); }
-    #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::asm!("sti"); }
-}
-
-/// Wait for the next interrupt. Pauses the CPU until an interrupt arrives.
-/// On AArch64: WFI. On RISC-V: WFI. On x86-64: HLT.
-/// IRQs must be enabled before calling this.
-///
-/// Critical on QEMU TCG: without this, busy-looping vCPUs starve QEMU's
-/// I/O thread, preventing virtio request completion.
-#[inline(always)]
-fn arch_wait_for_interrupt() {
-    #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("wfi"); }
-    #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("wfi"); }
-    #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::asm!("hlt"); }
-}
-
-/// Send an event to all CPUs. On AArch64, SEV wakes WFE waiters.
-/// Currently a no-op since we use WFI (woken by interrupts) instead of WFE.
-#[inline(always)]
-fn arch_send_event() {
-    // WFI-based blocking is woken by interrupts, not events.
-    // SEV is unnecessary but harmless as a hint.
-    #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("sev"); }
+    crate::arch::irq::wait_for_interrupt();
 }
 
 /// Check if a child thread's task has exited. Returns exit code if so.
@@ -2870,23 +2759,7 @@ pub fn wake_parked_thread(tid: ThreadId) {
 
 /// Get monotonic time in nanoseconds since boot.
 pub fn get_monotonic_ns() -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let c = crate::arch::aarch64::timer::counter();
-        let f = crate::arch::aarch64::timer::cntfrq();
-        ((c as u128 * 1_000_000_000u128) / f as u128) as u64
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let c = crate::arch::riscv64::trap::read_time();
-        ((c as u128 * 1_000_000_000u128) / 10_000_000u128) as u64
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let c = crate::arch::x86_64::timer::rdtsc();
-        // QEMU RDTSC freq ~ 1 GHz, so ns ≈ cycles
-        ((c as u128 * 1_000_000_000u128) / 1_000_000_000u128) as u64
-    }
+    crate::arch::timer::monotonic_ns()
 }
 
 /// Insert a thread into the global sleep queue, sorted by deadline (earliest first).

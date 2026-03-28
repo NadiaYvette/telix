@@ -271,25 +271,7 @@ pub fn clear_pager_waiter(id: ASpaceId) {
 
 /// Read a timer/cycle counter for PRNG seeding.
 fn seed_from_timer() -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let val: u64;
-        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) val); }
-        val
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let val: u64;
-        unsafe { core::arch::asm!("rdcycle {}", out(reg) val); }
-        val
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let lo: u32;
-        let hi: u32;
-        unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi); }
-        ((hi as u64) << 32) | (lo as u64)
-    }
+    crate::arch::timer::read_cycles()
 }
 
 fn seed_aspace(space: &mut AddressSpace) {

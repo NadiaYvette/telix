@@ -72,14 +72,8 @@ fn slot(idx: usize) -> Option<&'static IrqWaiter> {
 }
 
 /// Normalize a platform IRQ number to a table index.
-/// AArch64: INTID 48..79 → index 0..31. RISC-V: IRQ 1..8 → index 0..7.
 fn normalize(irq: u32) -> usize {
-    #[cfg(target_arch = "aarch64")]
-    { (irq - 48) as usize }
-    #[cfg(target_arch = "riscv64")]
-    { (irq - 1) as usize }
-    #[cfg(target_arch = "x86_64")]
-    { irq as usize }
+    crate::arch::irq::normalize_irq(irq)
 }
 
 /// Register an IRQ for userspace dispatch (called from sys_irq_wait on first call).
@@ -98,20 +92,7 @@ pub fn register(irq: u32, mmio_base: usize) -> bool {
     slot.mmio_base.store(mmio_base, Ordering::Release);
 
     // Enable the IRQ in the platform interrupt controller.
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::arch::aarch64::irq::enable_interrupt(irq);
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let hart: u32;
-        unsafe { core::arch::asm!("mv {0}, tp", out(reg) hart); }
-        crate::arch::riscv64::plic::enable_irq(hart, irq);
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        crate::arch::x86_64::pic::unmask(irq as u8);
-    }
+    crate::arch::irq::enable_device_irq(irq);
     true
 }
 

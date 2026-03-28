@@ -409,12 +409,7 @@ impl VirtioBlk {
             }
             // Wait for next interrupt (timer or device). On QEMU TCG this
             // yields the vCPU, allowing the I/O thread to process virtio.
-            #[cfg(target_arch = "aarch64")]
-            unsafe { core::arch::asm!("wfi"); }
-            #[cfg(target_arch = "riscv64")]
-            unsafe { core::arch::asm!("wfi"); }
-            #[cfg(target_arch = "x86_64")]
-            unsafe { core::arch::asm!("hlt"); }
+            crate::arch::irq::wait_for_interrupt();
         }
     }
 }

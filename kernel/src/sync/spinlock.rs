@@ -80,76 +80,12 @@ impl<T> Drop for SpinLockGuard<'_, T> {
 
 // --- Architecture-specific interrupt save/restore ---
 
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn arch_disable_irqs() -> usize {
-    let daif: u64;
-    unsafe {
-        core::arch::asm!(
-            "mrs {0}, daif",
-            "msr daifset, #2",
-            out(reg) daif,
-        );
-    }
-    daif as usize
+    crate::arch::irq::disable()
 }
 
-#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn arch_restore_irqs(saved: usize) {
-    unsafe {
-        core::arch::asm!(
-            "msr daif, {0}",
-            "isb",
-            in(reg) saved as u64,
-        );
-    }
-}
-
-#[cfg(target_arch = "riscv64")]
-#[inline(always)]
-pub(crate) fn arch_disable_irqs() -> usize {
-    let sstatus: usize;
-    unsafe {
-        core::arch::asm!(
-            "csrrci {0}, sstatus, 0x2",  // Clear SIE bit, return old value
-            out(reg) sstatus,
-        );
-    }
-    sstatus
-}
-
-#[cfg(target_arch = "riscv64")]
-#[inline(always)]
-pub(crate) fn arch_restore_irqs(saved: usize) {
-    // Restore only the SIE bit from saved sstatus.
-    if saved & 0x2 != 0 {
-        unsafe {
-            core::arch::asm!("csrsi sstatus, 0x2"); // Set SIE
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub(crate) fn arch_disable_irqs() -> usize {
-    let flags: u64;
-    unsafe {
-        core::arch::asm!(
-            "pushfq",
-            "pop {0}",
-            "cli",
-            out(reg) flags,
-        );
-    }
-    flags as usize
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub(crate) fn arch_restore_irqs(saved: usize) {
-    if saved & 0x200 != 0 {
-        // IF was set — re-enable interrupts.
-        unsafe { core::arch::asm!("sti"); }
-    }
+    crate::arch::irq::restore(saved);
 }

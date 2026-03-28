@@ -62,12 +62,7 @@ fn trace_event_inner(event_type: u16, arg0: u32, arg1: u32) {
 }
 
 fn read_cycles() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::timer::rdtsc() }
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::timer::counter() }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::trap::read_time() }
+    crate::arch::timer::read_cycles()
 }
 
 /// Control tracing: 0=disable, 1=enable, 2=clear+disable.

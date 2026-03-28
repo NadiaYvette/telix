@@ -68,24 +68,7 @@ static ONLINE_CPUS: AtomicU32 = AtomicU32::new(0);
 /// Get the current CPU's ID (0-based index).
 #[inline]
 pub fn cpu_id() -> u32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let id: u64;
-        unsafe { core::arch::asm!("mrs {}, tpidr_el1", out(reg) id); }
-        id as u32
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let id: u64;
-        unsafe { core::arch::asm!("mv {}, tp", out(reg) id); }
-        id as u32
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Read LAPIC ID from xAPIC register at 0xFEE00020, bits [31:24].
-        let lapic_id = unsafe { core::ptr::read_volatile(0xFEE0_0020 as *const u32) };
-        (lapic_id >> 24) & 0xFF
-    }
+    crate::arch::cpu::cpu_id()
 }
 
 /// Get per-CPU data for the given CPU index.
@@ -102,20 +85,13 @@ pub fn current() -> &'static PerCpuData {
 
 /// Initialize BSP's per-CPU data. Called once during scheduler init.
 pub fn init_bsp(idle_thread: ThreadId) {
-    // AArch64: set TPIDR_EL1 = 0 for BSP
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("msr tpidr_el1, xzr");
-    }
+    crate::arch::cpu::init_bsp_cpu_id();
 
-    // RISC-V: set tp = 0 for boot hart (we renumber to 0)
+    // RISC-V: update trap scratch array for boot hart.
     #[cfg(target_arch = "riscv64")]
     unsafe {
-        core::arch::asm!("mv tp, zero");
         TRAP_SCRATCH_ARRAY[0].cpu_id = 0;
     }
-
-    // x86-64: LAPIC ID 0 is the BSP on QEMU — no setup needed.
 
     let pcpu = get(0);
     pcpu.current_thread.store(idle_thread, Ordering::Relaxed);

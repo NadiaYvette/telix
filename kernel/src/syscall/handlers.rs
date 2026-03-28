@@ -790,21 +790,11 @@ fn sys_getpid() -> u64 {
 }
 
 fn sys_get_cycles() -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::timer::counter() }
-    #[cfg(target_arch = "riscv64")]
-    { crate::arch::riscv64::trap::read_time() }
-    #[cfg(target_arch = "x86_64")]
-    { crate::arch::x86_64::timer::rdtsc() }
+    crate::arch::timer::read_cycles()
 }
 
 fn sys_get_timer_freq() -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    { crate::arch::aarch64::timer::cntfrq() }
-    #[cfg(target_arch = "riscv64")]
-    { 10_000_000 } // QEMU virt timebase
-    #[cfg(target_arch = "x86_64")]
-    { 1_000_000_000 } // approximate RDTSC freq on QEMU
+    crate::arch::timer::timer_freq()
 }
 
 fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64, arg0: u64) -> u64 {
@@ -1151,12 +1141,8 @@ fn sys_irq_wait(irq_num: u64, mmio_base: u64) -> u64 {
     let irq = irq_num as u32;
 
     // Validate IRQ is in device range.
-    #[cfg(target_arch = "aarch64")]
-    let valid = irq >= 48 && irq <= 79;
-    #[cfg(target_arch = "riscv64")]
-    let valid = irq >= 1 && irq <= 8;
-    #[cfg(target_arch = "x86_64")]
-    let valid = irq >= 1 && irq <= 15;
+    let (irq_lo, irq_hi) = crate::arch::irq::valid_irq_range();
+    let valid = irq >= irq_lo && irq <= irq_hi;
 
     if !valid {
         return u64::MAX;
@@ -1555,14 +1541,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     };
 
     // Flush instruction cache.
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
-    }
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        core::arch::asm!("fence.i");
-    }
+    crate::arch::cpu::flush_icache();
 
     // Map a fresh user stack.
     #[cfg(target_arch = "aarch64")]
@@ -1775,10 +1754,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
 
     // Flush icache again after frame rewrite, and add DSB to ensure
     // all page table + data writes are complete before we return to userspace.
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb");
-    }
+    crate::arch::cpu::flush_icache();
 
     // dispatch() returns after this — the exception return path will
     // restore the rewritten frame and jump to the new program's entry point.
@@ -2813,18 +2789,7 @@ fn sys_tls_set(base: u64) -> u64 {
     // Safe: only the current thread modifies its own tls_base.
     unsafe { crate::sched::scheduler::thread_mut_from_ref(tid) }.tls_base = base;
 
-    // Set the architecture-specific TLS register.
-    #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("msr tpidr_el0, {}", in(reg) base); }
-    #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("mv tp, {}", in(reg) base); }
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Write FS base via MSR.
-        let lo = base as u32;
-        let hi = (base >> 32) as u32;
-        unsafe { core::arch::asm!("wrmsr", in("ecx") 0xC0000100u32, in("eax") lo, in("edx") hi); }
-    }
+    crate::arch::cpu::set_tls(base);
     0
 }
 
