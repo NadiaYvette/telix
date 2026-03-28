@@ -643,45 +643,9 @@ fn create_thread(
                 *frame.add(i) = 0;
             }
 
-            #[cfg(target_arch = "aarch64")]
-            {
-                // ELR_EL1 = entry point (offset 256 / 8 = 32).
-                *frame.add(32) = entry as *const () as u64;
-                // SPSR_EL1 = EL1h (0x5), IRQs enabled (DAIF.I = 0).
-                // 0x5 = EL1h mode. We want PSTATE.I = 0 (IRQs unmasked).
-                *frame.add(33) = 0x5;
-                // ESR_EL1 = 0 (offset 34).
-            }
-
-            #[cfg(target_arch = "riscv64")]
-            {
-                // TrapFrame layout: x1-x31 (31 regs at indices 0..30),
-                // sepc at index 31, sstatus at index 32, scause at index 33.
-                // sepc = entry point.
-                *frame.add(31) = entry as *const () as u64;
-                // sstatus: SPP=1 (return to S-mode), SPIE=1 (enable interrupts on sret).
-                // SPP = bit 8, SPIE = bit 5.
-                *frame.add(32) = (1 << 8) | (1 << 5);
-                // scause = 0.
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            {
-                // ExceptionFrame layout (22 u64s):
-                //   [0..14]  = r15, r14, r13, r12, r11, r10, r9, r8, rbp, rdi, rsi, rdx, rcx, rbx, rax
-                //   [15]     = vector number
-                //   [16]     = error code (dummy)
-                //   [17]     = rip (entry point)
-                //   [18]     = cs (kernel code segment = 0x08)
-                //   [19]     = rflags (interrupts enabled = 0x200)
-                //   [20]     = rsp (doesn't matter for kernel threads, set to stack_top)
-                //   [21]     = ss (kernel data segment = 0x10)
-                *frame.add(17) = entry as *const () as u64;     // RIP
-                *frame.add(18) = 0x08;                           // CS = kernel code
-                *frame.add(19) = 0x200;                          // RFLAGS = IF (interrupts enabled)
-                *frame.add(20) = stack_top as u64;               // RSP
-                *frame.add(21) = 0x10;                           // SS = kernel data
-            }
+            crate::arch::trapframe::init_kernel_frame(
+                frame, entry as *const () as usize, stack_top,
+            );
         }
 
         // Clear killed/affinity flags from any previous occupant of this slot.
@@ -789,12 +753,7 @@ fn do_spawn_heavy_work(
     crate::arch::cpu::flush_icache();
 
     // Map user stack.
-    #[cfg(target_arch = "aarch64")]
-    const USER_STACK_TOP: usize = 0x7FFF_F000_0000;
-    #[cfg(target_arch = "riscv64")]
-    const USER_STACK_TOP: usize = 0x3F_F000_0000;
-    #[cfg(target_arch = "x86_64")]
-    const USER_STACK_TOP: usize = 0x7FFF_FFFF_0000;
+    const USER_STACK_TOP: usize = crate::arch::trapframe::USER_STACK_TOP;
 
     let stack_pages = 2;
     let stack_va = USER_STACK_TOP - stack_pages * PAGE_SIZE;
@@ -843,36 +802,7 @@ fn do_spawn_heavy_work(
             *frame.add(i) = 0;
         }
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            *frame.add(32) = entry as u64;           // ELR_EL1
-            *frame.add(33) = 0x0;                     // SPSR_EL1 = EL0t
-            *frame.add(31) = USER_STACK_TOP as u64;   // SP_EL0
-        }
-
-        #[cfg(target_arch = "riscv64")]
-        {
-            *frame.add(31) = entry as u64;            // sepc
-            *frame.add(32) = 1 << 5;                  // sstatus: SPIE=1, SPP=0
-            *frame.add(1) = USER_STACK_TOP as u64;    // sp (x2)
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            *frame.add(17) = entry as u64;                                              // RIP
-            *frame.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3;          // CS
-            *frame.add(19) = 0x200;                                                     // RFLAGS = IF
-            *frame.add(20) = USER_STACK_TOP as u64;                                     // RSP
-            *frame.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3;          // SS
-        }
-
-        // arg0 in first argument register
-        #[cfg(target_arch = "aarch64")]
-        { *frame.add(0) = arg0; }
-        #[cfg(target_arch = "riscv64")]
-        { *frame.add(9) = arg0; }
-        #[cfg(target_arch = "x86_64")]
-        { *frame.add(9) = arg0; }
+        crate::arch::trapframe::init_user_frame(frame, entry as usize, USER_STACK_TOP, &[arg0]);
     }
 
     Some((aspace_id, pt_root, frame_sp as u64, kstack_base, task_port, thread_port))
@@ -993,35 +923,7 @@ fn create_thread_in_task(
             *frame.add(i) = 0;
         }
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            *frame.add(32) = entry;
-            *frame.add(33) = 0x0;
-            *frame.add(31) = stack_top;
-        }
-
-        #[cfg(target_arch = "riscv64")]
-        {
-            *frame.add(31) = entry;
-            *frame.add(32) = 1 << 5;
-            *frame.add(1) = stack_top;
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            *frame.add(17) = entry;
-            *frame.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3;
-            *frame.add(19) = 0x200;
-            *frame.add(20) = stack_top;
-            *frame.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3;
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        { *frame.add(0) = arg; }
-        #[cfg(target_arch = "riscv64")]
-        { *frame.add(9) = arg; }
-        #[cfg(target_arch = "x86_64")]
-        { *frame.add(9) = arg; }
+        crate::arch::trapframe::init_user_frame(frame, entry as usize, stack_top as usize, &[arg]);
     }
 
     let thread = unsafe { thread_mut_from_ref(id) };
@@ -1278,21 +1180,8 @@ pub fn spawn_user_with_data(
     // Set arg1 = data_va, arg2 = data_len in the thread's exception frame.
     let frame = frame_sp as *mut u64;
     unsafe {
-        #[cfg(target_arch = "aarch64")]
-        {
-            *frame.add(1) = data_va as u64;
-            *frame.add(2) = data.len() as u64;
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            *frame.add(10) = data_va as u64;
-            *frame.add(11) = data.len() as u64;
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            *frame.add(10) = data_va as u64;
-            *frame.add(11) = data.len() as u64;
-        }
+        crate::arch::trapframe::set_frame_arg(frame, 1, data_va as u64);
+        crate::arch::trapframe::set_frame_arg(frame, 2, data.len() as u64);
     }
 
     if !dup_groups_overflow(&mut parent) { return None; }
@@ -1519,11 +1408,7 @@ fn try_switch(current_sp: u64) -> u64 {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        let next_kstack_top = thread_ref(next_id).stack_base + PAGE_SIZE;
-        crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
-    }
+    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + PAGE_SIZE);
 
     // Activate next thread. Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
@@ -2717,11 +2602,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        let next_kstack_top = thread_ref(next_id).stack_base + PAGE_SIZE;
-        crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
-    }
+    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + PAGE_SIZE);
 
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
@@ -2985,11 +2866,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        let next_kstack_top = thread_ref(next_id).stack_base + PAGE_SIZE;
-        crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
-    }
+    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + PAGE_SIZE);
 
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
@@ -3084,11 +2961,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        let next_kstack_top = receiver.stack_base + PAGE_SIZE;
-        crate::arch::x86_64::gdt::set_rsp0(next_kstack_top as u64);
-    }
+    crate::arch::trapframe::update_kernel_stack(receiver.stack_base + PAGE_SIZE);
 
     // Activate receiver.
     receiver.state = ThreadState::Running;

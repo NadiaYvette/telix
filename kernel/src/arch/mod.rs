@@ -17,3 +17,4 @@ pub use x86_64 as platform;
 pub mod cpu;
 pub mod irq;
 pub mod timer;
+pub mod trapframe;

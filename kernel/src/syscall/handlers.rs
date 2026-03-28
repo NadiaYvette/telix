@@ -4,14 +4,7 @@
 //!   AArch64: number in x8, args in x0-x5, return value in x0. Invoked via `svc #0`.
 //!   RISC-V:  number in a7, args in a0-a5, return value in a0. Invoked via `ecall`.
 
-#[cfg(target_arch = "aarch64")]
-pub(crate) use crate::arch::aarch64::exception::ExceptionFrame;
-
-#[cfg(target_arch = "riscv64")]
-pub(crate) use crate::arch::riscv64::trap::TrapFrame as ExceptionFrame;
-
-#[cfg(target_arch = "x86_64")]
-pub(crate) use crate::arch::x86_64::exception::ExceptionFrame;
+pub(crate) use crate::arch::trapframe::ExceptionFrame;
 
 // Syscall numbers.
 pub const SYS_DEBUG_PUTCHAR: u64 = 0;
@@ -132,74 +125,30 @@ fn resolve_thread_port(port_id: u64) -> Option<u32> {
     crate::sched::thread_id_from_port(port_id)
 }
 
+use crate::arch::trapframe;
+
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
 fn syscall_nr(frame: &ExceptionFrame) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    { frame.regs[8] } // x8
-    #[cfg(target_arch = "riscv64")]
-    { frame.regs[16] } // a7 = x17, stored at index 16 (x(i+1) where i=16 → x17)
-    #[cfg(target_arch = "x86_64")]
-    { frame.rax() } // rax = syscall number
+    trapframe::syscall_nr(frame)
 }
 
 /// Get syscall argument by index (0-5).
 #[inline]
 fn syscall_arg(frame: &ExceptionFrame, n: usize) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    { frame.regs[n] } // x0-x5
-    #[cfg(target_arch = "riscv64")]
-    { frame.regs[n + 9] } // a0-a5 = x10-x15, stored at indices 9..14 (x(i+1) where i=9 → x10)
-    #[cfg(target_arch = "x86_64")]
-    {
-        // x86-64 syscall args: rdi, rsi, rdx, r10, r8, r9
-        match n {
-            0 => frame.rdi(),
-            1 => frame.rsi(),
-            2 => frame.rdx(),
-            3 => frame.r10(),
-            4 => frame.r8(),
-            5 => frame.r9(),
-            _ => 0,
-        }
-    }
+    trapframe::syscall_arg(frame, n)
 }
 
 /// Set the return value in the frame.
 #[inline]
 pub(crate) fn set_return(frame: &mut ExceptionFrame, val: u64) {
-    #[cfg(target_arch = "aarch64")]
-    { frame.regs[0] = val; } // x0
-    #[cfg(target_arch = "riscv64")]
-    { frame.regs[9] = val; } // a0 = x10, stored at index 9
-    #[cfg(target_arch = "x86_64")]
-    { frame.set_rax(val); } // rax = return value
+    trapframe::set_return(frame, val);
 }
 
 /// Set additional return register (for recv).
 #[inline]
 pub(crate) fn set_reg(frame: &mut ExceptionFrame, reg: usize, val: u64) {
-    #[cfg(target_arch = "aarch64")]
-    { frame.regs[reg] = val; }
-    #[cfg(target_arch = "riscv64")]
-    {
-        // Map aarch64 x1-x7 to riscv a1-a7 (x11-x17) = indices 10-16
-        frame.regs[reg + 9] = val;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Map recv return registers: 1=rdi, 2=rsi, 3=rdx, 4=r10, 5=r8, 6=r9, 7=rbx
-        match reg {
-            1 => frame.set_rdi(val),
-            2 => frame.set_rsi(val),
-            3 => frame.set_rdx(val),
-            4 => frame.set_r10(val),
-            5 => frame.set_r8(val),
-            6 => frame.set_r9(val),
-            7 => frame.set_rbx(val),
-            _ => {}
-        }
-    }
+    trapframe::set_reg(frame, reg, val);
 }
 
 /// Dispatch a syscall from an exception frame.
@@ -1068,15 +1017,9 @@ fn sys_mmap_device(phys_addr: u64, page_count: u64) -> u64 {
     let total_pages = if page_offset > 0 { pages + 1 } else { pages };
 
     // Validate phys_addr is within approved device MMIO ranges.
+    let (mmio_start, mmio_end) = trapframe::DEVICE_MMIO_RANGE;
     let end = phys_aligned + total_pages * 4096;
-    let valid = {
-        #[cfg(target_arch = "aarch64")]
-        { phys_aligned >= 0x0a00_0000 && end <= 0x0a00_7000 }
-        #[cfg(target_arch = "riscv64")]
-        { phys_aligned >= 0x1000_1000 && end <= 0x1000_9000 }
-        #[cfg(target_arch = "x86_64")]
-        { let _ = end; false } // x86-64: no MMIO device mapping
-    };
+    let valid = mmio_start != 0 && phys_aligned >= mmio_start && end <= mmio_end;
     if !valid {
         return u64::MAX;
     }
@@ -1092,33 +1035,12 @@ fn sys_mmap_device(phys_addr: u64, page_count: u64) -> u64 {
     });
 
     let pt_root = crate::sched::scheduler::current_page_table_root();
-
-    // Device memory PTE flags (user-accessible).
-    #[cfg(target_arch = "aarch64")]
-    let pte_flags: u64 = {
-        // MAIR Attr1 = device-nGnRnE. User RW, no execute.
-        const PT_VALID: u64 = 1 << 0;
-        const PT_PAGE: u64 = 1 << 1;
-        const PT_AF: u64 = 1 << 10;
-        const PT_AP_RW_ALL: u64 = 1 << 6;
-        const PT_ATTR_IDX_1: u64 = 1 << 2;
-        const PT_UXN: u64 = 1 << 54;
-        const PT_PXN: u64 = 1 << 53;
-        PT_VALID | PT_PAGE | PT_AF | PT_AP_RW_ALL | PT_ATTR_IDX_1 | PT_UXN | PT_PXN
-    };
-    #[cfg(target_arch = "riscv64")]
-    let pte_flags: u64 = crate::mm::hat::USER_RW_FLAGS;
-    #[cfg(target_arch = "x86_64")]
-    let pte_flags: u64 = 0; // unreachable
+    let pte_flags = trapframe::device_pte_flags();
 
     for i in 0..total_pages {
         let page_va = va + i * 4096;
         let page_pa = phys_aligned + i * 4096;
-
-        #[cfg(not(target_arch = "x86_64"))]
         crate::mm::hat::map_single_mmupage(pt_root, page_va, page_pa, pte_flags);
-        #[cfg(target_arch = "x86_64")]
-        { let _ = (pt_root, page_va, page_pa, pte_flags); }
     }
 
     // Return VA + page_offset so caller gets pointer to exact MMIO base.
@@ -1544,12 +1466,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     crate::arch::cpu::flush_icache();
 
     // Map a fresh user stack.
-    #[cfg(target_arch = "aarch64")]
-    const USER_STACK_TOP: usize = 0x7FFF_F000_0000;
-    #[cfg(target_arch = "riscv64")]
-    const USER_STACK_TOP: usize = 0x3F_F000_0000;
-    #[cfg(target_arch = "x86_64")]
-    const USER_STACK_TOP: usize = 0x7FFF_FFFF_0000;
+    const USER_STACK_TOP: usize = trapframe::USER_STACK_TOP;
 
     // Compute stack size dynamically: strings + null terminators + pointer table + auxv + margin.
     let strings_with_nulls = string_total + (argc + envc); // each string gets a null terminator
@@ -1718,38 +1635,10 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
             *frame_ptr.add(i) = 0;
         }
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            *frame_ptr.add(32) = entry as u64;   // ELR_EL1
-            *frame_ptr.add(33) = 0x0;            // SPSR_EL1 = EL0t
-            *frame_ptr.add(31) = sp as u64;      // SP_EL0
-            *frame_ptr.add(0) = argc as u64;     // x0 = argc
-            *frame_ptr.add(1) = argv_base as u64; // x1 = argv
-            *frame_ptr.add(2) = envp_base as u64; // x2 = envp
-        }
-
-        #[cfg(target_arch = "riscv64")]
-        {
-            *frame_ptr.add(31) = entry as u64;    // sepc
-            *frame_ptr.add(32) = 1 << 5;          // sstatus: SPIE=1, SPP=0
-            *frame_ptr.add(1) = sp as u64;        // sp (x2)
-            *frame_ptr.add(9) = argc as u64;      // a0 = argc
-            *frame_ptr.add(10) = argv_base as u64; // a1 = argv
-            *frame_ptr.add(11) = envp_base as u64; // a2 = envp
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            *frame_ptr.add(17) = entry as u64;                                              // RIP
-            *frame_ptr.add(18) = (crate::arch::x86_64::gdt::USER_CS as u64) | 3;           // CS
-            *frame_ptr.add(19) = 0x200;                                                      // RFLAGS = IF
-            *frame_ptr.add(20) = sp as u64;                                                   // RSP
-            *frame_ptr.add(21) = (crate::arch::x86_64::gdt::USER_DS as u64) | 3;           // SS
-            // x86-64: rdi=argc, rsi=argv, rdx=envp
-            frame.set_rdi(argc as u64);
-            frame.set_rsi(argv_base as u64);
-            frame.set_rdx(envp_base as u64);
-        }
+        trapframe::init_user_frame(
+            frame_ptr, entry, sp,
+            &[argc as u64, argv_base as u64, envp_base as u64],
+        );
     }
 
     // Flush icache again after frame rewrite, and add DSB to ensure
@@ -2376,12 +2265,7 @@ fn deliver_pending_signals(frame: &mut ExceptionFrame) {
             let aligned_size = (total_frame + 15) & !15;
 
             // Get current user SP.
-            #[cfg(target_arch = "aarch64")]
-            let user_sp = frame.sp as usize;
-            #[cfg(target_arch = "riscv64")]
-            let user_sp = frame.regs[1] as usize;
-            #[cfg(target_arch = "x86_64")]
-            let user_sp = frame.rsp() as usize;
+            let user_sp = trapframe::user_sp(frame);
 
             let new_sp = user_sp - aligned_size;
 
@@ -2412,40 +2296,10 @@ fn deliver_pending_signals(frame: &mut ExceptionFrame) {
             // Handler signature: fn handler(sig: u64, frame_addr: u64)
             // frame_addr is passed so the handler can call sigreturn(frame_addr).
 
-            #[cfg(target_arch = "aarch64")]
-            {
-                frame.regs[0] = sig as u64;            // arg0 = signal number
-                frame.regs[1] = new_sp as u64;          // arg1 = signal frame address
-                frame.sp = new_sp as u64;               // SP_EL0 = new stack
-                frame.regs[30] = 0;                     // LR = 0 (handler must sigreturn)
-                frame.elr = handler_addr;               // PC = handler entry
-            }
-
-            #[cfg(target_arch = "riscv64")]
-            {
-                frame.regs[9] = sig as u64;             // a0 = signal number
-                frame.regs[10] = new_sp as u64;         // a1 = signal frame address
-                frame.regs[1] = new_sp as u64;          // sp = new stack
-                frame.regs[0] = 0;                      // ra = 0
-                let fp = frame as *mut ExceptionFrame as *mut u64;
-                unsafe { *fp.add(31) = handler_addr; }
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            {
-                // Push return address (0) on the new stack for x86 calling convention.
-                let call_sp = new_sp - 8;
-                let zero_bytes = 0u64.to_le_bytes();
-                let _ = copy_to_user(pt_root, call_sp, &zero_bytes);
-
-                let fp = frame as *mut ExceptionFrame as *mut u64;
-                unsafe {
-                    *fp.add(9) = sig as u64;             // rdi = signal number
-                    *fp.add(10) = new_sp as u64;          // rsi = signal frame address
-                    *fp.add(17) = handler_addr;           // RIP = handler
-                    *fp.add(20) = call_sp as u64;         // RSP = adjusted stack
-                }
-            }
+            trapframe::setup_signal_entry(
+                frame, handler_addr, sig as u64, new_sp as u64, new_sp,
+                copy_to_user, pt_root,
+            );
         }
     }
 }
