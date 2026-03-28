@@ -73,6 +73,17 @@ pub static THREAD_ART_WRITE_LOCK: SpinLock<()> = SpinLock::new(());
 /// Write serializer for task ART structural mutations.
 pub static TASK_ART_WRITE_LOCK: SpinLock<()> = SpinLock::new(());
 
+// ---------------------------------------------------------------------------
+// Sleep queue — sorted singly-linked list of sleeping threads by deadline.
+// Replaces O(N) full-ART scan with O(1) tick-check + O(K) wake for K expired.
+// Protected by SLEEP_QUEUE_LOCK. Head has the earliest deadline.
+// ---------------------------------------------------------------------------
+
+/// Head of the sleep queue (thread ID, u32::MAX = empty).
+static SLEEP_QUEUE_HEAD: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Lock protecting sleep queue mutations (insert / drain).
+static SLEEP_QUEUE_LOCK: SpinLock<()> = SpinLock::new(());
+
 /// Get a thread reference by ID via radix lookup (lockless).
 #[inline]
 pub fn thread_ref(tid: u32) -> &'static Thread {
@@ -1734,7 +1745,20 @@ pub fn kill_task_by_id(task_id: TaskId) -> bool {
         });
     }
     for i in 0..kill_count {
-        wake_thread(to_kill[i] as ThreadId);
+        let tid = to_kill[i] as ThreadId;
+        // If the thread is sleeping, remove from sleep queue and enqueue directly
+        // so it exits promptly instead of waiting for the deadline.
+        let t = unsafe { thread_mut_from_ref(tid) };
+        if t.state == ThreadState::Blocked && matches!(t.blocked_on, BlockReason::Sleep) {
+            sleep_queue_remove(tid);
+            t.state = ThreadState::Ready;
+            t.blocked_on = BlockReason::None;
+            t.sleep_deadline_ns = 0;
+            let target = t.last_cpu.load(Ordering::Relaxed);
+            percpu_enqueue(target, t.effective_priority, tid);
+        } else {
+            wake_thread(tid);
+        }
     }
     kill_count > 0
 }
@@ -2916,29 +2940,100 @@ pub fn get_monotonic_ns() -> u64 {
     }
 }
 
+/// Insert a thread into the global sleep queue, sorted by deadline (earliest first).
+/// Must be called with the thread already marked Blocked/Sleep and deadline set.
+/// Caller must NOT hold SLEEP_QUEUE_LOCK.
+fn sleep_queue_insert(tid: ThreadId, deadline_ns: u64) {
+    let _guard = SLEEP_QUEUE_LOCK.lock();
+    let head = SLEEP_QUEUE_HEAD.load(Ordering::Relaxed);
+
+    // Walk the list to find insertion point (sorted by deadline ascending).
+    let mut prev: u32 = u32::MAX; // u32::MAX = inserting at head
+    let mut cur = head;
+    while cur != u32::MAX {
+        let ct = unsafe { thread_mut_from_ref(cur) };
+        if ct.sleep_deadline_ns > deadline_ns {
+            break;
+        }
+        prev = cur;
+        cur = ct.sleep_next;
+    }
+
+    let t = unsafe { thread_mut_from_ref(tid) };
+    t.sleep_next = cur;
+
+    if prev == u32::MAX {
+        // Insert at head.
+        SLEEP_QUEUE_HEAD.store(tid, Ordering::Release);
+    } else {
+        let pt = unsafe { thread_mut_from_ref(prev) };
+        pt.sleep_next = tid;
+    }
+}
+
+/// Remove a thread from the sleep queue (e.g., on signal delivery or cancel).
+/// Safe to call even if the thread is not on the queue.
+/// Caller must NOT hold SLEEP_QUEUE_LOCK.
+fn sleep_queue_remove(tid: ThreadId) {
+    let _guard = SLEEP_QUEUE_LOCK.lock();
+    let head = SLEEP_QUEUE_HEAD.load(Ordering::Relaxed);
+    if head == u32::MAX { return; }
+
+    // Find and unlink.
+    let mut prev: u32 = u32::MAX;
+    let mut cur = head;
+    while cur != u32::MAX {
+        if cur == tid {
+            let ct = unsafe { thread_mut_from_ref(cur) };
+            let next = ct.sleep_next;
+            ct.sleep_next = u32::MAX;
+            if prev == u32::MAX {
+                SLEEP_QUEUE_HEAD.store(next, Ordering::Release);
+            } else {
+                let pt = unsafe { thread_mut_from_ref(prev) };
+                pt.sleep_next = next;
+            }
+            return;
+        }
+        let ct = unsafe { thread_mut_from_ref(cur) };
+        prev = cur;
+        cur = ct.sleep_next;
+    }
+}
+
 /// Wake threads whose sleep deadlines have passed.
-/// Called from tick() before try_switch.
+/// Called from tick() before try_switch. O(1) when no timers expired,
+/// O(K) for K expired threads. Only acquires the lock if the head has expired.
 fn check_sleep_timers() {
     let now_ns = get_monotonic_ns();
-    // Collect (tid, prio, target_cpu) lock-free via SCHED_THREAD_ART.
+
+    // Fast path: peek at the head without locking. If the earliest deadline
+    // hasn't passed, no work to do.
+    let head = SLEEP_QUEUE_HEAD.load(Ordering::Acquire);
+    if head == u32::MAX { return; }
+    let head_deadline = unsafe { thread_mut_from_ref(head) }.sleep_deadline_ns;
+    if head_deadline > now_ns { return; }
+
+    // Drain expired entries from the head of the sorted list.
     let mut to_wake: [(ThreadId, u8, u32); 64] = [(0, 0, 0); 64];
     let mut count = 0usize;
-    SCHED_THREAD_ART.for_each(|key, val| {
-        let t = unsafe { &*(val as *const Thread) };
-        if t.state == ThreadState::Blocked
-            && matches!(t.blocked_on, BlockReason::Sleep)
-            && t.sleep_deadline_ns != 0
-            && t.sleep_deadline_ns <= now_ns
-        {
-            if count < 64 {
-                let target = t.last_cpu.load(Ordering::Relaxed);
-                to_wake[count] = (key as ThreadId, t.effective_priority, target);
-                count += 1;
-            }
+    {
+        let _guard = SLEEP_QUEUE_LOCK.lock();
+        let mut cur = SLEEP_QUEUE_HEAD.load(Ordering::Relaxed);
+        while cur != u32::MAX && count < 64 {
+            let t = unsafe { thread_mut_from_ref(cur) };
+            if t.sleep_deadline_ns > now_ns { break; } // sorted: rest are later
+            let next = t.sleep_next;
+            let target = t.last_cpu.load(Ordering::Relaxed);
+            to_wake[count] = (cur, t.effective_priority, target);
+            t.sleep_next = u32::MAX;
+            count += 1;
+            cur = next;
         }
-    });
-    // Update thread state and enqueue. Safe: blocked threads are not on any
-    // run queue and only the timer tick path transitions Sleep→Ready.
+        SLEEP_QUEUE_HEAD.store(cur, Ordering::Release);
+    }
+
+    // Wake collected threads (outside the lock).
     for i in 0..count {
         let (tid, prio, target) = to_wake[i];
         let t = unsafe { thread_mut_from_ref(tid) };
@@ -3036,6 +3131,9 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     thread.saved_sp = frame_sp;
     thread.state = ThreadState::Blocked;
     thread.blocked_on = BlockReason::Sleep;
+
+    // Insert into sorted sleep queue so check_sleep_timers can find us.
+    sleep_queue_insert(tid as ThreadId, deadline_ns);
 
     // SA notification for the parked thread (lock-free).
     let parked_task_id = thread.task_id;

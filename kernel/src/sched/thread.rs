@@ -71,6 +71,8 @@ pub struct Thread {
     pub sig_pending: u64,
     /// Absolute deadline in nanoseconds-since-boot for Sleep blocking (0 = none).
     pub sleep_deadline_ns: u64,
+    /// Next thread in the global sorted sleep queue (u32::MAX = not linked / tail).
+    pub sleep_next: u32,
     /// Thread blocked in thread_join() waiting for us to exit (u32::MAX = none).
     pub join_waiter: u32,
     /// Thread-local storage base address (Phase 74).
@@ -128,6 +130,7 @@ impl Thread {
             sig_mask: 0,
             sig_pending: 0,
             sleep_deadline_ns: 0,
+            sleep_next: u32::MAX,
             join_waiter: u32::MAX,
             tls_base: 0,
             timer_signal: 0,
