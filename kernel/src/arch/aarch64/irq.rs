@@ -6,16 +6,24 @@
 //!
 //! We use system register access for the CPU interface (ICC_* registers).
 
-// GICD (Distributor) registers
-const GICD_BASE: usize = 0x0800_0000;
-const GICD_CTLR: usize = GICD_BASE + 0x000;
-const GICD_ISENABLER: usize = GICD_BASE + 0x100; // Array of 32-bit registers
-const GICD_IPRIORITYR: usize = GICD_BASE + 0x400; // Array of 8-bit fields
-#[allow(dead_code)]
-const GICD_ITARGETSR: usize = GICD_BASE + 0x800; // Array of 8-bit fields
+// GICD (Distributor) — base discovered from firmware (DTB), QEMU virt fallback.
+const GICD_FALLBACK: usize = 0x0800_0000;
+fn gicd_base() -> usize {
+    let info = crate::firmware::irq_controller();
+    if info.kind != 0 { info.base0 as usize } else { GICD_FALLBACK }
+}
 
-// GICR (Redistributor) registers — one per CPU, 128 KiB stride
-const GICR_BASE: usize = 0x080A_0000;
+// GICD register offsets
+const GICD_CTLR_OFF: usize = 0x000;
+const GICD_ISENABLER_OFF: usize = 0x100; // Array of 32-bit registers
+const GICD_IPRIORITYR_OFF: usize = 0x400; // Array of 8-bit fields
+
+// GICR (Redistributor) — base discovered from firmware, QEMU virt fallback.
+const GICR_FALLBACK: usize = 0x080A_0000;
+fn gicr_base() -> usize {
+    let info = crate::firmware::irq_controller();
+    if info.kind != 0 { info.base1 as usize } else { GICR_FALLBACK }
+}
 const GICR_STRIDE: usize = 0x20000; // 128 KiB per redistributor
 const GICR_WAKER_OFFSET: usize = 0x14;
 // SGI/PPI redistributor frame is at offset 0x10000 from the redistributor base
@@ -33,7 +41,7 @@ const INTID_SPURIOUS: u32 = 1023;
 /// Initialize the GICv3 redistributor for a specific CPU.
 /// Called by secondary CPUs during their init.
 pub fn init_cpu(cpu: u32) {
-    let gicr_base = GICR_BASE + (cpu as usize) * GICR_STRIDE;
+    let gicr_base = gicr_base() + (cpu as usize) * GICR_STRIDE;
 
     // Wake this CPU's redistributor.
     let waker = (gicr_base + GICR_WAKER_OFFSET) as *mut u32;
@@ -82,7 +90,7 @@ fn enable_interrupt_on_cpu(intid: u32, gicr_base: usize) {
 /// Initialize the GICv3 for the boot CPU (CPU 0).
 pub fn init() {
     // 1. Wake the redistributor for CPU 0.
-    let gicr_base = GICR_BASE;
+    let gicr_base = gicr_base();
     let waker = (gicr_base + GICR_WAKER_OFFSET) as *mut u32;
     unsafe {
         // Clear ProcessorSleep bit (bit 1).
@@ -117,7 +125,7 @@ pub fn init() {
 
     // 3. Enable the distributor (Group 1 non-secure).
     unsafe {
-        let ctlr = GICD_CTLR as *mut u32;
+        let ctlr = (gicd_base() + GICD_CTLR_OFF) as *mut u32;
         // Set EnableGrp1NS (bit 1) and ARE_NS (bit 4).
         core::ptr::write_volatile(ctlr, (1 << 1) | (1 << 4));
     }
@@ -129,7 +137,7 @@ pub fn init() {
 pub fn enable_interrupt(intid: u32) {
     if intid < 32 {
         // PPI/SGI: configure via redistributor for CPU 0.
-        let sgi_base = GICR_BASE + GICR_SGI_BASE_OFFSET;
+        let sgi_base = gicr_base() + GICR_SGI_BASE_OFFSET;
         let reg = (sgi_base + GICR_ISENABLER0_OFFSET) as *mut u32;
         unsafe {
             let val = core::ptr::read_volatile(reg);
@@ -142,14 +150,15 @@ pub fn enable_interrupt(intid: u32) {
         }
     } else {
         // SPI: configure via distributor.
+        let gicd = gicd_base();
         let reg_index = (intid / 32) as usize;
         let bit = intid % 32;
-        let reg = (GICD_ISENABLER + reg_index * 4) as *mut u32;
+        let reg = (gicd + GICD_ISENABLER_OFF + reg_index * 4) as *mut u32;
         unsafe {
             core::ptr::write_volatile(reg, 1 << bit);
         }
         // Set priority.
-        let prio_reg = (GICD_IPRIORITYR + intid as usize) as *mut u8;
+        let prio_reg = (gicd + GICD_IPRIORITYR_OFF + intid as usize) as *mut u8;
         unsafe {
             core::ptr::write_volatile(prio_reg, 0x80);
         }

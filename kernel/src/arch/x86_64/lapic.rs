@@ -3,7 +3,12 @@
 //! The LAPIC is memory-mapped at 0xFEE00000 (default base).
 //! Each CPU has its own LAPIC with the same base address (CPU-local view).
 
-const LAPIC_BASE: usize = 0xFEE0_0000;
+// LAPIC base discovered from firmware (ACPI MADT), default fallback.
+const LAPIC_FALLBACK: usize = 0xFEE0_0000;
+fn lapic_base() -> usize {
+    let info = crate::firmware::irq_controller();
+    if info.kind != 0 { info.base0 as usize } else { LAPIC_FALLBACK }
+}
 
 // Register offsets.
 const LAPIC_ID: usize = 0x020;
@@ -19,12 +24,12 @@ const LAPIC_TIMER_DIV: usize = 0x3E0;
 
 #[inline]
 fn read(offset: usize) -> u32 {
-    unsafe { core::ptr::read_volatile((LAPIC_BASE + offset) as *const u32) }
+    unsafe { core::ptr::read_volatile((lapic_base() + offset) as *const u32) }
 }
 
 #[inline]
 fn write(offset: usize, val: u32) {
-    unsafe { core::ptr::write_volatile((LAPIC_BASE + offset) as *mut u32, val); }
+    unsafe { core::ptr::write_volatile((lapic_base() + offset) as *mut u32, val); }
 }
 
 /// Get the LAPIC ID of the current CPU.

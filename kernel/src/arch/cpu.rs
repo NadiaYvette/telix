@@ -21,7 +21,10 @@ pub fn cpu_id() -> u32 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        let lapic_id = unsafe { core::ptr::read_volatile(0xFEE0_0020 as *const u32) };
+        // Read LAPIC ID register (offset 0x020) using firmware-discovered base.
+        let base = crate::firmware::irq_controller().base0 as usize;
+        let base = if base != 0 { base } else { 0xFEE0_0000 };
+        let lapic_id = unsafe { core::ptr::read_volatile((base + 0x020) as *const u32) };
         (lapic_id >> 24) & 0xFF
     }
 }
