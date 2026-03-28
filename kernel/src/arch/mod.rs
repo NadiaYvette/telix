@@ -15,6 +15,7 @@ pub use x86_64 as platform;
 
 // Architecture-independent abstraction layers.
 pub mod cpu;
+pub mod elf;
 pub mod irq;
 pub mod timer;
 pub mod trapframe;

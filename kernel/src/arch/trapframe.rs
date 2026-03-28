@@ -27,6 +27,17 @@ pub const USER_STACK_TOP: usize = 0x3F_F000_0000;
 #[cfg(target_arch = "x86_64")]
 pub const USER_STACK_TOP: usize = 0x7FFF_FFFF_0000;
 
+/// Size of the exception frame saved/restored by the trap entry/exit assembly.
+/// AArch64: 288 bytes = 36 x u64 (x0-x30, sp_el0, elr, spsr, esr, _pad).
+/// RISC-V:  272 bytes = 34 x u64 (x1-x31, sepc, sstatus, scause).
+/// x86-64:  176 bytes = 22 x u64 (r15-rax, vector, error_code, rip, cs, rflags, rsp, ss).
+#[cfg(target_arch = "aarch64")]
+pub const EXCEPTION_FRAME_SIZE: usize = 288;
+#[cfg(target_arch = "riscv64")]
+pub const EXCEPTION_FRAME_SIZE: usize = 272;
+#[cfg(target_arch = "x86_64")]
+pub const EXCEPTION_FRAME_SIZE: usize = 176;
+
 /// Approved device MMIO physical address range for sys_mmap_device (start, end).
 /// (0, 0) means MMIO device mapping is disabled on this platform.
 #[cfg(target_arch = "aarch64")]

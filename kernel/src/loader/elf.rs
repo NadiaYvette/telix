@@ -21,13 +21,7 @@ const PF_W: u32 = 2;
 #[allow(dead_code)]
 const PF_R: u32 = 4;
 
-// Per-architecture expected e_machine.
-#[cfg(target_arch = "aarch64")]
-const EM_EXPECTED: u16 = 183; // EM_AARCH64
-#[cfg(target_arch = "riscv64")]
-const EM_EXPECTED: u16 = 243; // EM_RISCV
-#[cfg(target_arch = "x86_64")]
-const EM_EXPECTED: u16 = 62;  // EM_X86_64
+use crate::arch::elf::EM_EXPECTED;
 
 /// ELF64 file header (first 64 bytes).
 #[repr(C)]

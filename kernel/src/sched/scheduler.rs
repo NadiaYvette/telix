@@ -15,7 +15,8 @@
 //! Thread/Task structs and accessed via TASK_TABLE/THREAD_TABLE radix
 //! page tables for lock-free lookup.
 
-use super::thread::{Thread, ThreadId, ThreadState, BlockReason, EXCEPTION_FRAME_SIZE};
+use super::thread::{Thread, ThreadId, ThreadState, BlockReason};
+use crate::arch::trapframe::EXCEPTION_FRAME_SIZE;
 use super::task::{Task, TaskId, GROUPS_INLINE, RLIMIT_COUNT, Rlimit};
 use super::radix::RadixTable;
 use super::cpumask;

@@ -1630,7 +1630,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     // Rewrite the exception frame for the new program.
     unsafe {
         let frame_ptr = frame as *mut ExceptionFrame as *mut u64;
-        let frame_words = crate::sched::thread::EXCEPTION_FRAME_SIZE / 8;
+        let frame_words = crate::arch::trapframe::EXCEPTION_FRAME_SIZE / 8;
         for i in 0..frame_words {
             *frame_ptr.add(i) = 0;
         }
@@ -2210,7 +2210,7 @@ fn sys_sigreturn(frame: &mut ExceptionFrame) {
     }
 
     // Restore exception frame.
-    let frame_size = crate::sched::thread::EXCEPTION_FRAME_SIZE;
+    let frame_size = crate::arch::trapframe::EXCEPTION_FRAME_SIZE;
     let frame_bytes = unsafe {
         core::slice::from_raw_parts_mut(
             frame as *mut ExceptionFrame as *mut u8,
@@ -2259,7 +2259,7 @@ fn deliver_pending_signals(frame: &mut ExceptionFrame) {
         SigHandler::User(handler_addr) => {
             // Push a signal frame and redirect execution to the handler.
             let pt_root = crate::sched::scheduler::current_page_table_root();
-            let frame_size = crate::sched::thread::EXCEPTION_FRAME_SIZE;
+            let frame_size = crate::arch::trapframe::EXCEPTION_FRAME_SIZE;
             let total_frame = SIGFRAME_OVERHEAD + frame_size;
             // Align to 16 bytes.
             let aligned_size = (total_frame + 15) & !15;
