@@ -157,7 +157,12 @@ pub fn handle_page_fault(
         let is_zeroed = pte_has_sw_zeroed(pte);
 
         // Pager-backed VMA: allocate page, record fault, return NeedPager.
-        let obj_type = object::with_object(obj_id, |obj| obj.obj_type);
+        // Use try_with_object: grant VMAs may reference objects destroyed
+        // by the source process exiting (stale ObjectId).
+        let obj_type = match object::try_with_object(obj_id, |obj| obj.obj_type) {
+            Some(t) => t,
+            None => return FaultResult::Failed,
+        };
         if obj_type == super::object::ObjectType::Pager {
             let (pa, _) = match object::with_object(obj_id, |obj| obj.ensure_page(obj_page_idx)) {
                 Some(r) => r,
@@ -196,7 +201,10 @@ pub fn handle_page_fault(
         if is_zeroed && !is_present {
             // SW_ZEROED hint is set but PTE not valid → page was evicted by WSCLOCK.
             // The underlying allocation page should still be resident.
-            let pa = object::with_object(obj_id, |obj| obj.get_page(obj_page_idx));
+            let pa = match object::try_with_object(obj_id, |obj| obj.get_page(obj_page_idx)) {
+                Some(p) => p,
+                None => return FaultResult::Failed,
+            };
             if let Some(pa) = pa {
                 let mmu_pa = pa.as_usize() + vma.mmu_offset_in_page(mmu_idx) * MMUPAGE_SIZE;
                 let flags = pte_flags_for_vma(vma) | sw_zeroed_bit();
@@ -211,13 +219,13 @@ pub fn handle_page_fault(
 
         // Major fault: need to allocate/zero the page.
         let (pa, pre_zeroed, newly_allocated, cow_group_port) =
-            match object::with_object(obj_id, |obj| {
+            match object::try_with_object(obj_id, |obj| {
                 let was_zero = obj.pages.get(obj_page_idx) == 0;
                 let cgp = obj.cow_group_port;
                 obj.ensure_page(obj_page_idx).map(|(pa, pz)| (pa, pz, was_zero, cgp))
             }) {
-                Some(result) => result,
-                None => return FaultResult::Failed, // OOM
+                Some(Some(result)) => result,
+                _ => return FaultResult::Failed, // OOM or stale object
             };
 
         // If a COW object allocated a new page (demand-zero), mark it as private

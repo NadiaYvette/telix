@@ -99,7 +99,9 @@ pub fn revoke_grant(dst_aspace: ASpaceId, dst_va: usize) {
                 clear_pte(pt_root, va);
             }
             // Remove the mapping record from the object.
-            object::with_object(obj_id, |obj| {
+            // Use try_with_object: the source may have already destroyed
+            // this object if the granting process exited first.
+            object::try_with_object(obj_id, |obj| {
                 obj.remove_mapping(dst_aspace, va_start);
             });
         }

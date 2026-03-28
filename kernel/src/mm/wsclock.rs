@@ -132,7 +132,10 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
 /// Check if a page is in a superpage range with an active COW reservation.
 /// If so, WSCLOCK should skip eviction to preserve contiguity.
 fn has_active_reservation(obj_id: u64, obj_page_idx: usize) -> bool {
-    let cow_group_port = object::with_object(obj_id, |obj| obj.cow_group_port);
+    let cow_group_port = match object::try_with_object(obj_id, |obj| obj.cow_group_port) {
+        Some(p) => p,
+        None => return false, // Object already destroyed (stale grant VMA).
+    };
     if cow_group_port == 0 {
         return false;
     }

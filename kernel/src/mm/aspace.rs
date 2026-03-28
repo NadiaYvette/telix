@@ -386,7 +386,9 @@ pub fn reset(id: ASpaceId, new_pt_root: usize) {
         let mut it = space.vmas.iter();
         while let Some(vma) = it.next() {
             if vma.active {
-                object::with_object(vma.object_id, |obj| {
+                // Use try_with_object: grant VMAs may reference objects
+                // owned by another process that already exited.
+                object::try_with_object(vma.object_id, |obj| {
                     obj.remove_mapping(id, vma.va_start);
                 });
                 object::destroy(vma.object_id);
@@ -430,7 +432,7 @@ pub fn unmap_anon(id: ASpaceId, va: usize) -> bool {
             let mmu_va = va_start + mmu_idx * super::page::MMUPAGE_SIZE;
             super::fault::clear_pte_dispatch(pt_root, mmu_va);
         }
-        object::with_object(obj_id, |obj| {
+        object::try_with_object(obj_id, |obj| {
             obj.remove_mapping(id, va_start);
         });
         Some((va_start, obj_id))
@@ -440,7 +442,8 @@ pub fn unmap_anon(id: ASpaceId, va: usize) -> bool {
 
     if let Some((va_start, obj_id)) = info {
         space.vmas.remove(va_start);
-        let remaining = object::with_object(obj_id, |obj| obj.mapping_count());
+        let remaining = object::try_with_object(obj_id, |obj| obj.mapping_count())
+            .unwrap_or(0);
         if remaining == 0 {
             object::destroy(obj_id);
         }

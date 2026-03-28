@@ -955,11 +955,11 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     for page_idx in 0..pages {
         let page_va = va + page_idx * PAGE_SIZE;
 
-        let pa = match crate::mm::object::with_object(obj_id, |obj| {
+        let pa = match crate::mm::object::try_with_object(obj_id, |obj| {
             obj.ensure_page(page_idx).map(|(pa, _)| pa)
         }) {
-            Some(pa) => pa,
-            None => return u64::MAX,
+            Some(Some(pa)) => pa,
+            _ => return u64::MAX,
         };
         let pa_usize = pa.as_usize();
 

@@ -483,16 +483,32 @@ pub fn destroy(id: ObjectId) {
 }
 
 /// Access an object by ID within a closure, under per-object lock.
+#[track_caller]
 pub fn with_object<F, R>(id: ObjectId, f: F) -> R
 where
     F: FnOnce(&mut MemObject) -> R,
 {
     let entry_ptr = match resolve_entry(id) {
         Some(p) => p,
-        None => panic!("with_object: invalid ObjectId {}", id),
+        None => {
+            let caller = core::panic::Location::caller();
+            panic!("with_object: invalid ObjectId {} at {}:{}", id, caller.file(), caller.line());
+        }
     };
     let mut guard = unsafe { (*entry_ptr).inner.lock() };
     f(&mut *guard)
+}
+
+/// Like `with_object`, but returns `None` if the object has been destroyed.
+/// Use for paths where a stale object ID is possible (e.g., grant revocation
+/// racing with source object destruction).
+pub fn try_with_object<F, R>(id: ObjectId, f: F) -> Option<R>
+where
+    F: FnOnce(&mut MemObject) -> R,
+{
+    let entry_ptr = resolve_entry(id)?;
+    let mut guard = unsafe { (*entry_ptr).inner.lock() };
+    Some(f(&mut *guard))
 }
 
 /// Get the user-facing port ID for an object (pager port for Pager objects,
