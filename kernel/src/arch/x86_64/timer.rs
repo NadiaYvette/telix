@@ -45,8 +45,6 @@ pub fn init() {
 pub fn handle_timer_irq() {
     let _ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
-    // Uncomment for debugging:
-    // if ticks % 100 == 0 { crate::println!("[tick {}]", ticks); }
 }
 
 /// Read the Time Stamp Counter (RDTSC).
@@ -64,10 +62,3 @@ pub fn enable_interrupts() {
     }
 }
 
-/// Disable interrupts (CLI).
-#[allow(dead_code)]
-pub fn disable_interrupts() {
-    unsafe {
-        core::arch::asm!("cli", options(nomem, nostack));
-    }
-}

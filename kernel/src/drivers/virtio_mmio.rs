@@ -70,69 +70,49 @@ pub fn probe_device_id(base: usize) -> Option<u32> {
 }
 
 /// Look up the platform IRQ number for a virtio-mmio device at the given base.
-/// Checks firmware-discovered data first, falls back to per-arch hardcoded formulas.
+/// Checks firmware-discovered data first, falls back to QEMU virt defaults.
 pub fn device_irq(base: usize) -> u32 {
     for dev in crate::firmware::virtio_devices() {
         if dev.base == base as u64 {
             return dev.irq;
         }
     }
-    // Fallback to hardcoded per-arch formulas (QEMU virt).
-    #[cfg(target_arch = "aarch64")]
-    {
-        // Device at 0x0a000000 + i*0x200 gets SPI 16+i = INTID 48+i.
-        let dev_index = (base - 0x0a00_0000) / 0x200;
-        return 48 + dev_index as u32;
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        return match base {
-            0x1000_8000 => 8,
-            0x1000_7000 => 7,
-            0x1000_6000 => 6,
-            0x1000_5000 => 5,
-            0x1000_4000 => 4,
-            0x1000_3000 => 3,
-            0x1000_2000 => 2,
-            0x1000_1000 => 1,
-            _ => 0,
-        };
-    }
-    #[cfg(target_arch = "x86_64")]
-    { 0 }
+    // Fallback: derive IRQ from base address (QEMU virt layout).
+    fallback_irq(base)
 }
 
-/// Known MMIO base addresses for QEMU virt machines (fallback when firmware
+/// Derive IRQ from MMIO base for QEMU virt machines (fallback when firmware
 /// data is unavailable).
-#[cfg(target_arch = "aarch64")]
-fn fallback_probe_addresses() -> &'static [usize] {
-    static ADDRS: [usize; 32] = {
-        let base = 0x0a00_0000usize;
-        let mut a = [0usize; 32];
-        let mut i = 0;
-        while i < 32 {
-            a[i] = base + i * 0x200;
-            i += 1;
-        }
-        a
-    };
-    ADDRS.as_slice()
+fn fallback_irq(base: usize) -> u32 {
+    // aarch64: 0x0a000000 + i*0x200 → SPI 16+i = INTID 48+i
+    // riscv64: 0x10001000 + (i-1)*0x1000 → PLIC IRQ i (1..=8)
+    for dev in FALLBACK_ADDRS {
+        if dev.0 == base { return dev.1; }
+    }
+    0
 }
+
+/// (base_address, irq) pairs for QEMU virt machines.
+#[cfg(target_arch = "aarch64")]
+const FALLBACK_ADDRS: &[(usize, u32)] = &[
+    (0x0a00_0000, 48), (0x0a00_0200, 49), (0x0a00_0400, 50), (0x0a00_0600, 51),
+    (0x0a00_0800, 52), (0x0a00_0a00, 53), (0x0a00_0c00, 54), (0x0a00_0e00, 55),
+    (0x0a00_1000, 56), (0x0a00_1200, 57), (0x0a00_1400, 58), (0x0a00_1600, 59),
+    (0x0a00_1800, 60), (0x0a00_1a00, 61), (0x0a00_1c00, 62), (0x0a00_1e00, 63),
+    (0x0a00_2000, 64), (0x0a00_2200, 65), (0x0a00_2400, 66), (0x0a00_2600, 67),
+    (0x0a00_2800, 68), (0x0a00_2a00, 69), (0x0a00_2c00, 70), (0x0a00_2e00, 71),
+    (0x0a00_3000, 72), (0x0a00_3200, 73), (0x0a00_3400, 74), (0x0a00_3600, 75),
+    (0x0a00_3800, 76), (0x0a00_3a00, 77), (0x0a00_3c00, 78), (0x0a00_3e00, 79),
+];
 
 #[cfg(target_arch = "riscv64")]
-fn fallback_probe_addresses() -> &'static [usize] {
-    static ADDRS: [usize; 8] = [
-        0x1000_1000, 0x1000_2000, 0x1000_3000, 0x1000_4000,
-        0x1000_5000, 0x1000_6000, 0x1000_7000, 0x1000_8000,
-    ];
-    &ADDRS
-}
+const FALLBACK_ADDRS: &[(usize, u32)] = &[
+    (0x1000_1000, 1), (0x1000_2000, 2), (0x1000_3000, 3), (0x1000_4000, 4),
+    (0x1000_5000, 5), (0x1000_6000, 6), (0x1000_7000, 7), (0x1000_8000, 8),
+];
 
 #[cfg(target_arch = "x86_64")]
-fn fallback_probe_addresses() -> &'static [usize] {
-    static ADDRS: [usize; 0] = [];
-    &ADDRS
-}
+const FALLBACK_ADDRS: &[(usize, u32)] = &[];
 
 /// Find the first virtio device of the given type.
 /// Returns the MMIO base address if found. Checks firmware-discovered
@@ -145,7 +125,7 @@ pub fn find_device(device_id: u32) -> Option<usize> {
         }
     }
     // Fallback: probe hardcoded addresses.
-    for &base in fallback_probe_addresses() {
+    for &(base, _) in FALLBACK_ADDRS {
         if probe_device_id(base) == Some(device_id) {
             return Some(base);
         }

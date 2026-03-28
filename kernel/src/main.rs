@@ -85,12 +85,6 @@ pub fn kmain() -> ! {
     sched::init();
     sched::topology::init();
 
-    // IPC test threads (Phase 1 — disabled for Phase 3 server testing).
-    // let port = ipc::port::create().expect("create IPC port");
-    // IPC_TEST_PORT.store(port, core::sync::atomic::Ordering::Relaxed);
-    // sched::spawn(ipc_sender, 100, 10).expect("spawn sender");
-    // sched::spawn(ipc_receiver, 100, 10).expect("spawn receiver");
-
     // Start secondary CPUs.
     println!("Starting secondary CPUs...");
     arch::platform::start_secondary_cpus();

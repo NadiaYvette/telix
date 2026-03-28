@@ -127,23 +127,6 @@ pub fn enable_interrupts() {
     }
 }
 
-/// Re-arm the timer so the next interrupt is one interval from now.
-/// Used before entering U-mode to prevent a stale timer firing immediately.
-#[allow(dead_code)]
-pub fn rearm_timer() {
-    let interval = TIMER_INTERVAL.load(Ordering::Relaxed);
-    let now = read_time();
-    sbi_set_timer(now + interval);
-}
-
-/// Disable S-mode interrupts (clear sstatus.SIE).
-#[allow(dead_code)]
-pub fn disable_interrupts() {
-    unsafe {
-        core::arch::asm!("csrc sstatus, {}", in(reg) 1u64 << 1);
-    }
-}
-
 /// Handle S-mode external interrupt via PLIC.
 fn handle_external_irq() {
     // Determine hart ID from tp register.
@@ -183,8 +166,6 @@ fn handle_timer_irq() {
     let now = read_time();
     sbi_set_timer(now + interval);
 
-    // Uncomment for debugging:
-    // if ticks % 100 == 0 { crate::println!("[tick {}]", ticks); }
 }
 
 /// Main Rust trap handler. Called from vectors.S with current SP as argument.

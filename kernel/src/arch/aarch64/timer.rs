@@ -15,7 +15,6 @@ pub fn cntfrq() -> u64 {
 }
 
 /// Read the current counter value.
-#[allow(dead_code)]
 pub fn counter() -> u64 {
     let cnt: u64;
     unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt) };
@@ -62,8 +61,6 @@ pub fn handle_timer_irq() {
         core::arch::asm!("msr cntp_tval_el0, {}", in(reg) interval);
     }
 
-    // Uncomment for debugging:
-    // if ticks % 100 == 0 { crate::println!("[tick {}]", ticks); }
 }
 
 /// Unmask IRQs (clear DAIF.I bit) to allow interrupts.
@@ -73,10 +70,3 @@ pub fn enable_interrupts() {
     }
 }
 
-/// Mask IRQs (set DAIF.I bit).
-#[allow(dead_code)]
-pub fn disable_interrupts() {
-    unsafe {
-        core::arch::asm!("msr daifset, #2"); // Set IRQ mask
-    }
-}
