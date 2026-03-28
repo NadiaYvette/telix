@@ -138,68 +138,27 @@ fn startup_thread() -> ! {
     }
 
     sched::spawn(io::initramfs::initramfs_server, 50, 20).expect("spawn initramfs");
-    // Virtio-blk driver — spawn as userspace process on AArch64 and RISC-V.
-    // Pack mmio_base | (irq << 48) into arg0 for the driver.
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    {
-        if let Some(base) = drivers::virtio_mmio::find_device(drivers::virtio_mmio::DEVICE_BLK) {
-            #[cfg(target_arch = "aarch64")]
-            let irq = {
-                let dev_index = (base - 0x0a00_0000) / 0x200;
-                48 + dev_index as u64 // GIC SPI INTID
-            };
-            #[cfg(target_arch = "riscv64")]
-            let irq = match base {
-                0x1000_8000 => 8u64,
-                0x1000_7000 => 7,
-                0x1000_6000 => 6,
-                0x1000_5000 => 5,
-                0x1000_4000 => 4,
-                0x1000_3000 => 3,
-                0x1000_2000 => 2,
-                0x1000_1000 => 1,
-                _ => 1,
-            };
-            let arg0 = (base as u64) | (irq << 48);
-            println!("  virtio-blk at {:#x}, irq {}, spawning blk_srv with arg0={:#x}", base, irq, arg0);
-            match sched::spawn_user(b"blk_srv", 50, 20, arg0) {
-                Some(tid) => println!("  blk_srv spawned (thread {})", tid),
-                None => println!("  WARNING: blk_srv not found (ok if not yet built)"),
-            }
-        } else {
-            println!("  no virtio-blk device found, skipping blk_srv");
+
+    // Discover and spawn virtio-mmio device servers.
+    // Uses firmware-discovered devices (from DTB) with hardcoded fallback.
+    // On x86_64 find_device returns None (no MMIO transport), so these are no-ops.
+    if let Some(base) = drivers::virtio_mmio::find_device(drivers::virtio_mmio::DEVICE_BLK) {
+        let irq = drivers::virtio_mmio::device_irq(base) as u64;
+        let arg0 = (base as u64) | (irq << 48);
+        println!("  virtio-blk at {:#x}, irq {}, spawning blk_srv with arg0={:#x}", base, irq, arg0);
+        match sched::spawn_user(b"blk_srv", 50, 20, arg0) {
+            Some(tid) => println!("  blk_srv spawned (thread {})", tid),
+            None => println!("  WARNING: blk_srv not found (ok if not yet built)"),
         }
     }
 
-    // Virtio-net driver — spawn as userspace process on AArch64 and RISC-V.
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    {
-        if let Some(base) = drivers::virtio_mmio::find_device(drivers::virtio_mmio::DEVICE_NET) {
-            #[cfg(target_arch = "aarch64")]
-            let irq = {
-                let dev_index = (base - 0x0a00_0000) / 0x200;
-                48 + dev_index as u64
-            };
-            #[cfg(target_arch = "riscv64")]
-            let irq = match base {
-                0x1000_8000 => 8u64,
-                0x1000_7000 => 7,
-                0x1000_6000 => 6,
-                0x1000_5000 => 5,
-                0x1000_4000 => 4,
-                0x1000_3000 => 3,
-                0x1000_2000 => 2,
-                0x1000_1000 => 1,
-                _ => 1,
-            };
-            let arg0 = (base as u64) | (irq << 48);
-            println!("  virtio-net at {:#x}, irq {}, spawning net_srv with arg0={:#x}", base, irq, arg0);
-            match sched::spawn_user(b"net_srv", 50, 20, arg0) {
-                Some(tid) => println!("  net_srv spawned (thread {})", tid),
-                None => println!("  WARNING: net_srv not found (ok if not yet built)"),
-            }
-        } else {
-            println!("  no virtio-net device found, skipping net_srv");
+    if let Some(base) = drivers::virtio_mmio::find_device(drivers::virtio_mmio::DEVICE_NET) {
+        let irq = drivers::virtio_mmio::device_irq(base) as u64;
+        let arg0 = (base as u64) | (irq << 48);
+        println!("  virtio-net at {:#x}, irq {}, spawning net_srv with arg0={:#x}", base, irq, arg0);
+        match sched::spawn_user(b"net_srv", 50, 20, arg0) {
+            Some(tid) => println!("  net_srv spawned (thread {})", tid),
+            None => println!("  WARNING: net_srv not found (ok if not yet built)"),
         }
     }
 
@@ -207,7 +166,6 @@ fn startup_thread() -> ! {
     #[cfg(target_arch = "x86_64")]
     {
         println!("  Scanning PCI bus for virtio devices...");
-        // virtio-blk-pci: device ID 0x1001
         if let Some(dev) = arch::x86_64::pci::find_virtio_device(0x1001) {
             let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
             match sched::spawn_user(b"blk_srv", 50, 20, arg0) {
@@ -215,7 +173,6 @@ fn startup_thread() -> ! {
                 None => println!("  WARNING: blk_srv not found (ok if not yet built)"),
             }
         }
-        // virtio-net-pci: device ID 0x1000
         if let Some(dev) = arch::x86_64::pci::find_virtio_device(0x1000) {
             let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
             match sched::spawn_user(b"net_srv", 50, 20, arg0) {
@@ -301,49 +258,6 @@ fn startup_thread() -> ! {
     sched::scheduler::exit_current_thread(0);
 }
 
-use core::sync::atomic::{AtomicU64, Ordering};
-#[allow(dead_code)]
-static IPC_TEST_PORT: AtomicU64 = AtomicU64::new(0);
-
-#[allow(dead_code)]
-fn ipc_sender() -> ! {
-    let port_id = IPC_TEST_PORT.load(Ordering::Relaxed);
-    let mut seq = 0u64;
-    loop {
-        let msg = ipc::Message::new(1, [seq, 0, 0, 0, 0, 0]);
-        // Blocking send — blocks if the queue is full.
-        match ipc::port::send(port_id, msg) {
-            Ok(()) => {
-                if seq % 10 == 0 {
-                    println!("[sender] sent seq={}", seq);
-                }
-                seq += 1;
-            }
-            Err(()) => break,
-        }
-    }
-    loop { core::hint::spin_loop(); }
-}
-
-#[allow(dead_code)]
-fn ipc_receiver() -> ! {
-    let port_id = IPC_TEST_PORT.load(Ordering::Relaxed);
-    let mut received = 0u64;
-    loop {
-        // Blocking recv — blocks until a message arrives.
-        match ipc::port::recv(port_id) {
-            Ok(msg) => {
-                if received % 10 == 0 {
-                    println!("[receiver] got tag={} seq={}", msg.tag, msg.data[0]);
-                }
-                received += 1;
-            }
-            Err(()) => break,
-        }
-    }
-    loop { core::hint::spin_loop(); }
-}
-
 fn test_capabilities() {
     use cap::{Capability, CapType, Rights, CapSpace, Cdt};
     use sync::SpinLock;
@@ -379,250 +293,6 @@ fn test_capabilities() {
         println!("  Cap test: server still has {:?}", server_space.lookup(server_slot).unwrap());
     }
     println!("  Cap test: PASSED");
-}
-
-// --- AArch64-specific tests ---
-
-#[cfg(target_arch = "aarch64")]
-#[allow(dead_code)]
-fn test_userspace_aarch64() {
-    use arch::aarch64::mm;
-    use arch::aarch64::usertest;
-
-    println!("  Setting up page tables...");
-
-    let l0 = mm::setup_tables().expect("page tables");
-    println!("  L0 table at {:#x}", l0);
-
-    let user_code_page = crate::mm::phys::alloc_page().expect("user code page");
-    let user_code_phys = user_code_page.as_usize();
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            usertest::USER_CODE.as_ptr(),
-            user_code_phys as *mut u8,
-            usertest::USER_CODE.len(),
-        );
-    }
-
-    let user_stack_page = crate::mm::phys::alloc_page().expect("user stack page");
-    let user_stack_phys = user_stack_page.as_usize();
-
-    let user_code_virt: usize = 0x8000_0000;
-    let user_stack_virt: usize = 0x8001_0000;
-
-    mm::map_user_pages(l0, user_code_virt, user_code_phys,
-        usertest::USER_CODE.len(), mm::USER_RWX_FLAGS).expect("map user code");
-    mm::map_user_pages(l0, user_stack_virt, user_stack_phys,
-        4096, mm::USER_RW_FLAGS).expect("map user stack");
-    println!("  User mappings: code at {:#x}, stack at {:#x}", user_code_virt, user_stack_virt);
-
-    println!("  Enabling MMU...");
-    mm::enable_mmu(l0);
-    println!("  MMU enabled — identity mapping active");
-
-    println!("  Jumping to EL0...");
-    let user_sp = user_stack_virt + 4096;
-    unsafe {
-        core::arch::asm!(
-            "msr sp_el0, {sp}",
-            "msr elr_el1, {pc}",
-            "mov x0, #0",
-            "msr spsr_el1, x0",
-            "eret",
-            sp = in(reg) user_sp as u64,
-            pc = in(reg) user_code_virt as u64,
-            options(noreturn),
-        );
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[allow(dead_code)]
-fn test_syscalls_aarch64() {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "mov x8, #0", "mov x0, #0x53", "svc #0",
-            out("x0") ret, out("x8") _,
-            out("x1") _, out("x2") _, out("x3") _,
-            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
-        );
-    }
-    println!("");
-    println!("  Syscall test: debug_putchar returned {}", ret);
-
-    let tid: u64;
-    unsafe {
-        core::arch::asm!(
-            "mov x8, #8", "svc #0",
-            out("x0") tid, out("x8") _,
-            out("x1") _, out("x2") _, out("x3") _,
-            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
-        );
-    }
-    println!("  Syscall test: thread_id={}", tid);
-    println!("  Syscall test: PASSED");
-}
-
-// --- RISC-V specific tests ---
-
-#[cfg(target_arch = "riscv64")]
-#[allow(dead_code)]
-fn test_userspace_riscv64() {
-    use arch::riscv64::mm;
-    use arch::riscv64::usertest;
-
-    println!("  Setting up Sv39 page tables...");
-
-    let root = mm::setup_tables().expect("page tables");
-    println!("  Root table at {:#x}", root);
-
-    let user_code = usertest::user_code();
-    let user_code_page = crate::mm::phys::alloc_page().expect("user code page");
-    let user_code_phys = user_code_page.as_usize();
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            user_code.as_ptr(),
-            user_code_phys as *mut u8,
-            user_code.len(),
-        );
-    }
-
-    let user_stack_page = crate::mm::phys::alloc_page().expect("user stack page");
-    let user_stack_phys = user_stack_page.as_usize();
-
-    // User virtual addresses (in VPN[2]=1 range, avoiding kernel gigapage regions).
-    let user_code_virt: usize = 0x4000_0000;
-    let user_stack_virt: usize = 0x4001_0000;
-
-    mm::map_user_pages(root, user_code_virt, user_code_phys,
-        user_code.len(), mm::USER_RWX_FLAGS).expect("map user code");
-    mm::map_user_pages(root, user_stack_virt, user_stack_phys,
-        4096, mm::USER_RW_FLAGS).expect("map user stack");
-    println!("  User mappings: code at {:#x}, stack at {:#x}", user_code_virt, user_stack_virt);
-
-    println!("  Enabling Sv39 MMU...");
-    mm::enable_mmu(root);
-    println!("  MMU enabled — identity mapping active");
-
-    // Re-arm timer so it doesn't fire immediately when SPIE enables interrupts.
-    arch::riscv64::trap::rearm_timer();
-
-    println!("  Jumping to U-mode...");
-    let user_sp = user_stack_virt + 4096;
-    unsafe {
-        core::arch::asm!(
-            // Set sstatus.SPP = 0 (return to U-mode), SPIE = 1.
-            "li t0, (1 << 8)",       // SPP bit
-            "csrc sstatus, t0",
-            "li t0, (1 << 5)",       // SPIE bit
-            "csrs sstatus, t0",
-            // Set sepc = user code entry point.
-            "csrw sepc, {pc}",
-            // Save kernel sp in sscratch for trap entry from U-mode.
-            "csrw sscratch, sp",
-            // Set user stack pointer.
-            "mv sp, {sp}",
-            "sret",
-            pc = in(reg) user_code_virt,
-            sp = in(reg) user_sp,
-            options(noreturn),
-        );
-    }
-}
-
-// --- x86-64 specific tests ---
-
-#[cfg(target_arch = "x86_64")]
-#[allow(dead_code)]
-fn test_syscalls_x86_64() {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "mov rax, 0", "mov rdi, 0x53", "int 0x80",
-            out("rax") ret,
-            out("rdi") _, out("rsi") _, out("rdx") _,
-            out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
-        );
-    }
-    println!("");
-    println!("  Syscall test: debug_putchar returned {}", ret);
-
-    let tid: u64;
-    unsafe {
-        core::arch::asm!(
-            "mov rax, 8", "int 0x80",
-            out("rax") tid,
-            out("rdi") _, out("rsi") _, out("rdx") _,
-            out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _,
-        );
-    }
-    println!("  Syscall test: thread_id={}", tid);
-    println!("  Syscall test: PASSED");
-}
-
-#[cfg(target_arch = "x86_64")]
-#[allow(dead_code)]
-fn test_userspace_x86_64() {
-    use arch::x86_64::{mm, usertest, gdt};
-
-    println!("  Setting up user page tables...");
-
-    let pml4 = mm::setup_tables().expect("page tables");
-    println!("  PML4 at {:#x}", pml4);
-
-    let user_code = usertest::user_code();
-    let user_code_page = crate::mm::phys::alloc_page().expect("user code page");
-    let user_code_phys = user_code_page.as_usize();
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            user_code.as_ptr(),
-            user_code_phys as *mut u8,
-            user_code.len(),
-        );
-    }
-
-    let user_stack_page = crate::mm::phys::alloc_page().expect("user stack page");
-    let user_stack_phys = user_stack_page.as_usize();
-
-    // User virtual addresses at PML4 index 1 (VA >= 0x80_0000_0000).
-    let user_code_virt: usize = 0x80_0000_0000;
-    let user_stack_virt: usize = 0x80_0001_0000;
-
-    mm::map_user_pages(pml4, user_code_virt, user_code_phys,
-        user_code.len(), mm::USER_RWX_FLAGS).expect("map user code");
-    mm::map_user_pages(pml4, user_stack_virt, user_stack_phys,
-        4096, mm::USER_RW_FLAGS).expect("map user stack");
-    println!("  User mappings: code at {:#x}, stack at {:#x}", user_code_virt, user_stack_virt);
-
-    // Flush TLB with the new mappings.
-    mm::enable_mmu(pml4);
-    println!("  Page tables updated");
-
-    // Set the kernel RSP0 in TSS for ring 3 → ring 0 transitions.
-    let kernel_rsp: u64;
-    unsafe { core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp); }
-    gdt::set_rsp0(kernel_rsp);
-
-    println!("  Jumping to ring 3...");
-    let user_sp = user_stack_virt + 4096;
-    let user_cs = (gdt::USER_CS as u64) | 3; // RPL = 3
-    let user_ss = (gdt::USER_DS as u64) | 3; // RPL = 3
-    unsafe {
-        core::arch::asm!(
-            "push {ss}",      // SS
-            "push {sp}",      // RSP
-            "pushfq",         // RFLAGS (with IF set)
-            "push {cs}",      // CS
-            "push {ip}",      // RIP
-            "iretq",
-            ss = in(reg) user_ss,
-            sp = in(reg) user_sp as u64,
-            cs = in(reg) user_cs,
-            ip = in(reg) user_code_virt as u64,
-            options(noreturn),
-        );
-    }
 }
 
 // --- Phase 2: Demand paging test ---
@@ -795,114 +465,3 @@ fn test_demand_paging() {
     println!("  Demand paging test: PASSED");
 }
 
-// --- Phase 3: I/O test client ---
-
-#[allow(dead_code)]
-fn test_io_client() -> ! {
-    use io::protocol::*;
-
-    // Wait for initramfs server to be ready.
-    let initramfs_port = loop {
-        let p = io::initramfs::INITRAMFS_PORT.load(Ordering::Acquire);
-        if p != u64::MAX {
-            break p;
-        }
-        core::hint::spin_loop();
-    };
-    println!("  [io-test] initramfs server on port {}", initramfs_port);
-
-    // Create a reply port for receiving responses.
-    let reply_port = ipc::port::create().expect("reply port");
-
-    // Step 1: Connect to open "hello.txt".
-    let filename = b"hello.txt";
-    let (n0, n1, n2) = pack_name(filename);
-    let connect_msg = ipc::Message::new(IO_CONNECT, [
-        n0, n1, n2,
-        filename.len() as u64,
-        reply_port as u64,
-        0,
-    ]);
-    ipc::port::send(initramfs_port, connect_msg).expect("send connect");
-
-    let reply = ipc::port::recv(reply_port).expect("recv connect reply");
-    assert!(reply.tag == IO_CONNECT_OK, "connect failed: tag={:#x}", reply.tag);
-    let file_handle = reply.data[0];
-    let file_size = reply.data[1];
-    println!("  [io-test] opened hello.txt: handle={}, size={} bytes", file_handle, file_size);
-
-    // Step 2: Read the file contents (inline, for small files).
-    let read_msg = ipc::Message::new(IO_READ, [
-        file_handle,
-        0,              // offset
-        file_size,      // length
-        reply_port as u64,
-        0, 0,
-    ]);
-    ipc::port::send(initramfs_port, read_msg).expect("send read");
-
-    let reply = ipc::port::recv(reply_port).expect("recv read reply");
-    assert!(reply.tag == IO_READ_OK, "read failed: tag={:#x}", reply.tag);
-    let bytes_read = reply.data[0] as usize;
-
-    // Unpack inline data from reply words.
-    let mut buf = [0u8; MAX_INLINE_READ];
-    let words = [reply.data[1], reply.data[2], reply.data[3], reply.data[4], reply.data[5]];
-    for i in 0..bytes_read.min(MAX_INLINE_READ) {
-        buf[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
-    }
-    let text = core::str::from_utf8(&buf[..bytes_read]).unwrap_or("<invalid utf8>");
-    println!("  [io-test] read {} bytes: {}", bytes_read, text);
-
-    // Step 3: Close.
-    let close_msg = ipc::Message::new(IO_CLOSE, [file_handle, 0, 0, 0, 0, 0]);
-    let _ = ipc::port::send_nb(initramfs_port, close_msg);
-
-    // Step 4: Test virtio-blk (AArch64/RISC-V only).
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    {
-        // Wait briefly for blk server. If no virtio device, skip.
-        let mut tries = 0u32;
-        let blk_port = loop {
-            let p = io::blk_server::BLK_PORT.load(Ordering::Acquire);
-            if p != u64::MAX {
-                break Some(p);
-            }
-            tries += 1;
-            if tries > 100_000 {
-                break None;
-            }
-            core::hint::spin_loop();
-        };
-        let blk_port = match blk_port {
-            Some(p) => p,
-            None => {
-                println!("  [io-test] no blk server, skipping block test");
-                println!("  Phase 3 I/O test: PASSED");
-                loop { core::hint::spin_loop(); }
-            }
-        };
-        println!("  [io-test] blk server on port {}", blk_port);
-
-        // Read sector 0.
-        let read_msg = ipc::Message::new(IO_READ, [
-            0,              // handle (unused for blk)
-            0,              // offset = sector 0
-            512,            // length
-            reply_port as u64,
-            0, 0,
-        ]);
-        ipc::port::send(blk_port, read_msg).expect("send blk read");
-
-        let reply = ipc::port::recv(reply_port).expect("recv blk reply");
-        if reply.tag == IO_READ_OK {
-            println!("  [io-test] blk read sector 0: {} bytes, first word = {:#x}",
-                reply.data[0], reply.data[1]);
-        } else {
-            println!("  [io-test] blk read error: tag={:#x} code={}", reply.tag, reply.data[0]);
-        }
-    }
-
-    println!("  Phase 3 I/O test: PASSED");
-    loop { core::hint::spin_loop(); }
-}

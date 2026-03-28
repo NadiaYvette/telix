@@ -82,29 +82,11 @@ pub fn blk_server() -> ! {
         capacity, capacity / 2);
 
     // Enable virtio-blk interrupt for IRQ-driven I/O.
-    #[cfg(target_arch = "aarch64")]
     {
-        // QEMU virt: device at 0x0a000000 + i*0x200 gets SPI 16+i = INTID 48+i
-        let dev_index = (base - 0x0a00_0000) / 0x200;
-        let intid = 48 + dev_index as u32;
-        crate::arch::aarch64::irq::enable_interrupt(intid);
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        let irq = match base {
-            0x1000_8000 => 8,
-            0x1000_7000 => 7,
-            0x1000_6000 => 6,
-            0x1000_5000 => 5,
-            0x1000_4000 => 4,
-            0x1000_3000 => 3,
-            0x1000_2000 => 2,
-            0x1000_1000 => 1,
-            _ => 1,
-        };
-        let hart: u32;
-        unsafe { core::arch::asm!("mv {0}, tp", out(reg) hart); }
-        crate::arch::riscv64::plic::enable_irq(hart, irq);
+        let irq = virtio_mmio::device_irq(base);
+        if irq != 0 {
+            crate::arch::irq::enable_device_irq(irq);
+        }
     }
 
     let port = port::create().expect("blk port");
