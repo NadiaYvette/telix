@@ -125,7 +125,7 @@ fn check_timers() {
             // Wake blocked reader if any.
             if slot.blocked_reader != u64::MAX {
                 let reply = slot.blocked_reader;
-                slot.blocked_reader = 0xFFFFFFFF;
+                slot.blocked_reader = u64::MAX;
                 let exp = slot.timer_expirations;
                 slot.timer_expirations = 0;
                 syscall::send(reply, EVENT_OK, exp, 0, 0, 0);
@@ -179,7 +179,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                             slot.timer_interval_ns = 0;
                             slot.timer_next_ns = 0;
                             slot.timer_expirations = 0;
-                            slot.blocked_reader = 0xFFFFFFFF;
+                            slot.blocked_reader = u64::MAX;
                         }
                         // Reply: d0 = server_port, d1 = handle
                         syscall::send(reply, EVENT_OK, port as u64, handle as u64, 0, 0);
@@ -219,7 +219,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                                 };
                                 syscall::send(reply, EVENT_OK, val, 0, 0, 0);
                             } else {
-                                // Block: save reply port.
                                 slot.blocked_reader = reply;
                             }
                         }
@@ -233,7 +232,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                             }
                         }
                         EventType::SignalFd => {
-                            // Stub: always block until signal delivered.
                             slot.blocked_reader = reply;
                         }
                         EventType::None => {
@@ -265,7 +263,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                     // Wake blocked reader.
                     if slot.blocked_reader != u64::MAX && slot.counter > 0 {
                         let reader = slot.blocked_reader;
-                        slot.blocked_reader = 0xFFFFFFFF;
+                        slot.blocked_reader = u64::MAX;
                         let val = if slot.flags & EFD_SEMAPHORE != 0 {
                             slot.counter -= 1;
                             1
@@ -320,7 +318,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                     slot.active = false;
                     slot.etype = EventType::None;
                     slot.counter = 0;
-                    slot.blocked_reader = 0xFFFFFFFF;
+                    slot.blocked_reader = u64::MAX;
                 }
 
                 syscall::send(reply, EVENT_OK, 0, 0, 0, 0);

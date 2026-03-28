@@ -6034,13 +6034,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         syscall::send(fs_port, 0x2100, handle as u64, 0, rd2, 0); // FS_READ
                         if let Some(rr) = syscall::recv_msg(read_reply) {
                             if rr.tag == 0x2101 { // FS_READ_OK
-                                let n = (rr.data[2] & 0xFFFF) as usize;
+                                // ext2_srv inline reply: data[0]=len, data[1..2]=packed content
+                                let n = rr.data[0] as usize;
                                 let mut buf = [0u8; 16];
                                 for i in 0..n.min(8) {
-                                    buf[i] = (rr.data[0] >> (i * 8)) as u8;
+                                    buf[i] = (rr.data[1] >> (i * 8)) as u8;
                                 }
                                 for i in 8..n.min(16) {
-                                    buf[i] = (rr.data[1] >> ((i - 8) * 8)) as u8;
+                                    buf[i] = (rr.data[2] >> ((i - 8) * 8)) as u8;
                                 }
                                 if n >= 5 && buf[0] == b'r' && buf[1] == b'o' && buf[2] == b'o' && buf[3] == b't' {
                                     syscall::debug_puts(b"      Content starts with 'root' - OK\n");
@@ -6335,17 +6336,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"    FAIL: cannot spawn event_srv\n");
             phase68_ok = false;
         } else {
-            // Wait for registration.
-            for _ in 0..500 { syscall::yield_now(); }
-
-            let event_port = match syscall::ns_lookup(b"event") {
-                Some(p) => p,
-                None => {
-                    syscall::debug_puts(b"    FAIL: event_srv not registered\n");
-                    phase68_ok = false;
-                    0 // dummy, won't be used
+            // Wait for registration with retry.
+            let mut event_port = 0u64;
+            for _ in 0..100 {
+                if let Some(p) = syscall::ns_lookup(b"event") {
+                    event_port = p;
+                    break;
                 }
-            };
+                syscall::sleep_ms(10);
+            }
+            if event_port == 0 {
+                syscall::debug_puts(b"    FAIL: event_srv not registered\n");
+                phase68_ok = false;
+            }
             if phase68_ok {
                 // Test 1: eventfd — create, write 5, read → expect 5.
                 let reply = syscall::port_create();
