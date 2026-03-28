@@ -6500,10 +6500,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"    SKIP: syslog_srv not in initramfs\n");
             phase71_ok = false;
         } else {
-            // Give it time to register.
-            for _ in 0..500 { syscall::yield_now(); }
+            // Wait for registration with retry.
+            let mut syslog_port_opt = None;
+            for _ in 0..100 {
+                if let Some(p) = syscall::ns_lookup(b"syslog") {
+                    syslog_port_opt = Some(p);
+                    break;
+                }
+                syscall::sleep_ms(10);
+            }
 
-            if let Some(syslog_port) = syscall::ns_lookup(b"syslog") {
+            if let Some(syslog_port) = syslog_port_opt {
                 let reply = syscall::port_create();
                 // SYSLOG_OPEN: d0=facility(0), d1=ident(0), d2=reply<<32
                 syscall::send(syslog_port, 0x9000, 0, 0, reply << 32, 0);
@@ -6557,7 +6564,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             phase72_ok = false;
         } else {
             let mut ok = false;
-            for _ in 0..10000 {
+            for _ in 0..200 {
                 if let Some(code) = syscall::waitpid(tz_tid) {
                     if code != 0 {
                         syscall::debug_puts(b"    FAIL: tz_test exit code != 0\n");
@@ -6566,7 +6573,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     ok = true;
                     break;
                 }
-                syscall::yield_now();
+                syscall::sleep_ms(10);
             }
             if !ok {
                 syscall::debug_puts(b"    FAIL: tz_test waitpid timeout\n");
@@ -6648,7 +6655,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             phase74_ok = false;
         } else {
             let mut ok = false;
-            for _ in 0..50000 {
+            for _ in 0..500 {
                 if let Some(code) = syscall::waitpid(pt_tid) {
                     if code != 0 {
                         syscall::debug_puts(b"    FAIL: pthread_test exit code != 0\n");
@@ -6657,7 +6664,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     ok = true;
                     break;
                 }
-                syscall::yield_now();
+                syscall::sleep_ms(10);
             }
             if !ok {
                 syscall::debug_puts(b"    FAIL: pthread_test waitpid timeout\n");
@@ -6779,9 +6786,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"    SKIP: sysv_srv not in initramfs\n");
             phase79_ok = false;
         } else {
-            for _ in 0..500 { syscall::yield_now(); }
+            let mut sysv_port_opt = None;
+            for _ in 0..100 {
+                if let Some(p) = syscall::ns_lookup(b"sysv") {
+                    sysv_port_opt = Some(p);
+                    break;
+                }
+                syscall::sleep_ms(10);
+            }
 
-            if let Some(sysv_port) = syscall::ns_lookup(b"sysv") {
+            if let Some(sysv_port) = sysv_port_opt {
                 // SEM_GET: d0=key(0=IPC_PRIVATE), d1=nsems(1), d2=flags|reply<<32
                 let reply = syscall::port_create();
                 syscall::send(sysv_port, 0xA000, 0, 1, reply << 32, 0);
@@ -7259,7 +7273,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // The kernel should redirect this to proxy_srv via PROXY_PORT.
                 // proxy_srv will try to forward via TCP (which may fail for loopback),
                 // but the test verifies the kernel redirect path works.
-                let remote_port = ((1u64) << 16) | (test_port & 0xFFFF);
+                let remote_port = ((1u64) << 44) | (test_port & 0xFFF_FFFF_FFFF);
                 let send_result = syscall::send_nb_4(remote_port, 0x1234, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD);
 
                 // A successful send means the kernel redirected to proxy_srv
