@@ -18,6 +18,8 @@ pub static PAGES_PREZEROED: AtomicU64 = AtomicU64::new(0);
 pub static PAGER_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub static RESERVATION_CONSOLIDATIONS: AtomicU64 = AtomicU64::new(0);
 pub static WSCLOCK_RESERVATION_SKIPS: AtomicU64 = AtomicU64::new(0);
+pub static POOL_ALLOCS: AtomicU64 = AtomicU64::new(0);
+pub static POOL_CREATES: AtomicU64 = AtomicU64::new(0);
 
 pub fn print() {
     crate::println!("  VM stats:");
@@ -81,5 +83,13 @@ pub fn print() {
     crate::println!(
         "    WSCLOCK reservation skips: {}",
         WSCLOCK_RESERVATION_SKIPS.load(Ordering::Relaxed)
+    );
+    crate::println!(
+        "    COW pool creates: {}",
+        POOL_CREATES.load(Ordering::Relaxed)
+    );
+    crate::println!(
+        "    COW pool allocs:  {}",
+        POOL_ALLOCS.load(Ordering::Relaxed)
     );
 }

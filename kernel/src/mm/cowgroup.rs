@@ -25,13 +25,19 @@
 //! slots in the reservation instead of allocating scattered single pages.
 //! This preserves physical contiguity for superpage re-promotion.
 
-use super::page::{PAGE_SIZE, PhysAddr, SUPERPAGE_ALLOC_PAGES};
+use super::page::{PAGE_SIZE, PhysAddr, SUPERPAGE_ALLOC_PAGES, SUPERPAGE_LEVELS};
+use super::stats;
+use core::sync::atomic::Ordering;
 use crate::ipc::port::{self, PortId};
 use crate::mm::slab;
 use crate::sync::SpinLock;
 
 /// Slab size for GroupEntry allocations (must be power of two ≥ actual size).
-const GROUP_SLAB_SIZE: usize = 128;
+const GROUP_SLAB_SIZE: usize = 256;
+
+/// Maximum sub-blocks in a higher-level reservation pool.
+/// 1 GiB / 2 MiB = 512 sub-blocks → 512 bits = [u64; 8].
+const POOL_BITMAP_WORDS: usize = 8;
 
 /// Maximum inline members per group.
 /// Covers parent + up to 7 children — sufficient for nearly all fork trees.
@@ -375,6 +381,25 @@ struct CowGroup {
     extents: *mut GroupExtent,
     /// Capacity of the extent array.
     extents_cap: u16,
+
+    // -- Higher-level reservation pool --
+    // When the first 2M reservation is allocated, we attempt to reserve an
+    // entire higher-level block (e.g., 1 GiB) so that subsequent 2M
+    // destinations for the same member land contiguously. This enables
+    // eventual promotion to the higher superpage level.
+
+    /// Physical base of the pool (higher-level-aligned), or 0 if none.
+    pool_pa: usize,
+    /// Object-page-aligned base of the higher-level region this pool covers.
+    pool_obj_base: u32,
+    /// Member obj_id that owns this pool.
+    pool_owner: u64,
+    /// Index into SUPERPAGE_LEVELS for the pool's level (e.g., 1 for 1 GiB).
+    pool_level_idx: u8,
+    /// Number of sub-blocks (level[idx-1].size) in this pool.
+    pool_sub_count: u16,
+    /// Bitmap of allocated sub-blocks.
+    pool_bitmap: [u64; POOL_BITMAP_WORDS],
 }
 
 // Safety: extents pointer is allocated/freed under the per-group lock.
@@ -391,6 +416,12 @@ impl CowGroup {
             fork_child: [0; MAX_EPOCHS],
             extents: core::ptr::null_mut(),
             extents_cap: 0,
+            pool_pa: 0,
+            pool_obj_base: 0,
+            pool_owner: 0,
+            pool_level_idx: 0,
+            pool_sub_count: 0,
+            pool_bitmap: [0u64; POOL_BITMAP_WORDS],
         }
     }
 
@@ -409,6 +440,73 @@ impl CowGroup {
         self.extents = page;
         self.extents_cap = EXTENTS_PER_PAGE as u16;
         true
+    }
+
+    // -- Pool helpers --
+
+    /// Check if the pool is active and covers the given 2M range for the given owner.
+    /// Returns the physical address for this sub-block if available.
+    fn try_alloc_from_pool(&mut self, obj_id: u64, obj_page_base: u32) -> Option<PhysAddr> {
+        if self.pool_pa == 0 || self.pool_owner != obj_id {
+            return None;
+        }
+        if SUPERPAGE_LEVELS.len() < 2 {
+            return None;
+        }
+        let sub_level = &SUPERPAGE_LEVELS[0]; // 2M sub-blocks
+        let sub_alloc_pages = sub_level.alloc_pages();
+        // Check that obj_page_base is within the pool's higher-level range.
+        if obj_page_base < self.pool_obj_base {
+            return None;
+        }
+        let offset_pages = (obj_page_base - self.pool_obj_base) as usize;
+        if offset_pages % sub_alloc_pages != 0 {
+            return None;
+        }
+        let sub_idx = offset_pages / sub_alloc_pages;
+        if sub_idx >= self.pool_sub_count as usize {
+            return None;
+        }
+        // Check bitmap: already allocated?
+        let word = sub_idx / 64;
+        let bit = sub_idx % 64;
+        if self.pool_bitmap[word] & (1u64 << bit) != 0 {
+            return None; // Already handed out.
+        }
+        // Mark as allocated.
+        self.pool_bitmap[word] |= 1u64 << bit;
+        let dest_pa = self.pool_pa + sub_idx * sub_level.size;
+        stats::POOL_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        Some(PhysAddr::new(dest_pa))
+    }
+
+    /// Free all unallocated sub-blocks in the pool back to the physical allocator.
+    fn free_pool(&mut self) {
+        if self.pool_pa == 0 {
+            return;
+        }
+        if SUPERPAGE_LEVELS.len() < 2 {
+            return;
+        }
+        let sub_size = SUPERPAGE_LEVELS[0].size;
+        for i in 0..self.pool_sub_count as usize {
+            let word = i / 64;
+            let bit = i % 64;
+            if self.pool_bitmap[word] & (1u64 << bit) == 0 {
+                // Not allocated — free this sub-block's pages.
+                let base = self.pool_pa + i * sub_size;
+                let pages = SUPERPAGE_LEVELS[0].alloc_pages();
+                for p in 0..pages {
+                    super::phys::free_page(PhysAddr::new(base + p * PAGE_SIZE));
+                }
+            }
+        }
+        self.pool_pa = 0;
+        self.pool_obj_base = 0;
+        self.pool_owner = 0;
+        self.pool_level_idx = 0;
+        self.pool_sub_count = 0;
+        self.pool_bitmap = [0u64; POOL_BITMAP_WORDS];
     }
 
     /// Find the member index for `obj_id`, or None.
@@ -439,6 +537,11 @@ impl CowGroup {
             Some(i) => i,
             None => return self.member_count,
         };
+
+        // Step 0: Free pool if this member owns it.
+        if self.pool_owner == obj_id {
+            self.free_pool();
+        }
 
         // Step 1: Mark departure in all epochs where this member participates.
         // Set the member's copied_since bits to all-ones in participating epochs
@@ -573,8 +676,9 @@ impl CowGroup {
         unsafe { &mut *self.extents.add(idx) }
     }
 
-    /// Free the extent backing page and all unclaimed reservation pages.
+    /// Free the extent backing page, all unclaimed reservation pages, and pool.
     fn free_all_extents(&mut self) {
+        self.free_pool();
         for ei in 0..self.extent_count as usize {
             let ext = unsafe { &*self.extents.add(ei) };
             for ri in 0..ext.reservation_count as usize {
@@ -799,57 +903,158 @@ pub fn find_or_create_reservation(
     };
 
     let ri = if needs_alloc {
-        // Allocate a superpage-aligned destination for this member.
-        // Drop the lock during the potentially slow allocator path.
-        drop(guard);
-
-        let dest_pa = super::fault::alloc_superpage_aligned()?;
-
-        // Re-acquire and re-find (extent index may have shifted).
-        guard = unsafe { (*entry_ptr).inner.lock() };
-        let ei = match guard.find_extent(obj_page_base) {
-            Some(i) => i,
-            None => {
-                // Extent was removed while unlocked — bail.
-                super::fault::free_pages_range(dest_pa, SUPERPAGE_ALLOC_PAGES);
-                return None;
-            }
-        };
-
-        // Check if someone else created/upgraded our reservation while unlocked.
-        if let Some(i) = guard.extent(ei).find_reservation(obj_id) {
-            if guard.extent(ei).reservations[i].dest_pa != 0 {
-                // Someone else allocated a destination — use theirs.
-                super::fault::free_pages_range(dest_pa, SUPERPAGE_ALLOC_PAGES);
-                let r = &guard.extent(ei).reservations[i];
-                let already_copied = r.copied & (1u64 << slot) != 0;
-                return Some(ReservationSlot {
-                    dest_page_pa: r.dest_pa + slot * PAGE_SIZE,
-                    already_copied,
-                });
-            } else {
-                // Upgrade tracking-only reservation with real destination.
-                // Slots already marked as "copied" (private allocations) have
-                // no corresponding page in the destination — free those dest slots.
+        // Try pool allocation first (lock held — no drop needed).
+        if let Some(pa) = guard.try_alloc_from_pool(obj_id, obj_page_base) {
+            // Pool hit — lock still held, proceed to reservation creation.
+            let dest_pa = pa;
+            if let Some(i) = guard.extent(ei).find_reservation(obj_id) {
+                if guard.extent(ei).reservations[i].dest_pa != 0 {
+                    // Race: someone else filled it — pool page is wasted but
+                    // bitmap already set, so it won't be double-freed.
+                    let r = &guard.extent(ei).reservations[i];
+                    let already_copied = r.copied & (1u64 << slot) != 0;
+                    return Some(ReservationSlot {
+                        dest_page_pa: r.dest_pa + slot * PAGE_SIZE,
+                        already_copied,
+                    });
+                }
+                // Upgrade tracking-only reservation.
                 let old_copied = guard.extent(ei).reservations[i].copied;
                 guard.extent_mut(ei).reservations[i].dest_pa = dest_pa.as_usize();
-                // Free destination pages for already-copied (private) slots.
                 for s in 0..guard.extent(ei).page_count as usize {
                     if old_copied & (1u64 << s) != 0 {
-                        super::phys::free_page(PhysAddr::new(dest_pa.as_usize() + s * PAGE_SIZE));
+                        super::phys::free_page(PhysAddr::new(
+                            dest_pa.as_usize() + s * PAGE_SIZE,
+                        ));
                     }
                 }
                 i
+            } else {
+                match guard
+                    .extent_mut(ei)
+                    .add_reservation(obj_id, dest_pa.as_usize())
+                {
+                    Some(i) => i,
+                    None => return None,
+                }
             }
         } else {
-            match guard
-                .extent_mut(ei)
-                .add_reservation(obj_id, dest_pa.as_usize())
-            {
+            // Pool miss — drop lock, allocate, re-acquire.
+            let want_pool = guard.pool_pa == 0 && SUPERPAGE_LEVELS.len() >= 2;
+            drop(guard);
+
+            // Phase 1: allocate outside the lock.
+            let pool_block = if want_pool {
+                super::fault::alloc_aligned_for_level(&SUPERPAGE_LEVELS[1])
+            } else {
+                None
+            };
+            // Always allocate a fallback 2M block if we couldn't get a pool block,
+            // or as the independent allocation path.
+            let independent = if pool_block.is_none() {
+                Some(super::fault::alloc_superpage_aligned()?)
+            } else {
+                None
+            };
+
+            // Phase 2: re-acquire lock and try to use pool.
+            guard = unsafe { (*entry_ptr).inner.lock() };
+
+            let (dest_pa, from_pool) = if let Some(pool_pa) = pool_block {
+                if guard.pool_pa == 0 {
+                    // Set up the pool.
+                    let sub_alloc = SUPERPAGE_LEVELS[0].alloc_pages();
+                    let hi_alloc = SUPERPAGE_LEVELS[1].alloc_pages();
+                    let hi_obj_base = obj_page_base & !((hi_alloc - 1) as u32);
+                    guard.pool_pa = pool_pa.as_usize();
+                    stats::POOL_CREATES.fetch_add(1, Ordering::Relaxed);
+                    guard.pool_obj_base = hi_obj_base;
+                    guard.pool_owner = obj_id;
+                    guard.pool_level_idx = 1;
+                    guard.pool_sub_count = (hi_alloc / sub_alloc) as u16;
+                    guard.pool_bitmap = [0u64; POOL_BITMAP_WORDS];
+                }
+                match guard.try_alloc_from_pool(obj_id, obj_page_base) {
+                    Some(pa) => {
+                        // Pool created/existing and sub-block carved.
+                        if guard.pool_pa != pool_pa.as_usize() {
+                            // We created a pool but someone else's was used —
+                            // free our block.
+                            super::fault::free_pages_range(
+                                pool_pa,
+                                SUPERPAGE_LEVELS[1].alloc_pages(),
+                            );
+                        }
+                        (pa, true)
+                    }
+                    None => {
+                        // Pool doesn't cover this range — free pool block if
+                        // we just created it (otherwise it was someone else's).
+                        if guard.pool_pa == pool_pa.as_usize() {
+                            guard.free_pool();
+                        } else {
+                            super::fault::free_pages_range(
+                                pool_pa,
+                                SUPERPAGE_LEVELS[1].alloc_pages(),
+                            );
+                        }
+                        // Fall back to independent allocation.
+                        drop(guard);
+                        let fallback = super::fault::alloc_superpage_aligned()?;
+                        guard = unsafe { (*entry_ptr).inner.lock() };
+                        (fallback, false)
+                    }
+                }
+            } else {
+                (independent.unwrap(), false)
+            };
+
+            let ei = match guard.find_extent(obj_page_base) {
                 Some(i) => i,
                 None => {
-                    super::fault::free_pages_range(dest_pa, SUPERPAGE_ALLOC_PAGES);
+                    if !from_pool {
+                        super::fault::free_pages_range(dest_pa, SUPERPAGE_ALLOC_PAGES);
+                    }
                     return None;
+                }
+            };
+
+            // Check if someone else created/upgraded our reservation while unlocked.
+            if let Some(i) = guard.extent(ei).find_reservation(obj_id) {
+                if guard.extent(ei).reservations[i].dest_pa != 0 {
+                    if !from_pool {
+                        super::fault::free_pages_range(dest_pa, SUPERPAGE_ALLOC_PAGES);
+                    }
+                    let r = &guard.extent(ei).reservations[i];
+                    let already_copied = r.copied & (1u64 << slot) != 0;
+                    return Some(ReservationSlot {
+                        dest_page_pa: r.dest_pa + slot * PAGE_SIZE,
+                        already_copied,
+                    });
+                } else {
+                    let old_copied = guard.extent(ei).reservations[i].copied;
+                    guard.extent_mut(ei).reservations[i].dest_pa = dest_pa.as_usize();
+                    for s in 0..guard.extent(ei).page_count as usize {
+                        if old_copied & (1u64 << s) != 0 {
+                            super::phys::free_page(PhysAddr::new(
+                                dest_pa.as_usize() + s * PAGE_SIZE,
+                            ));
+                        }
+                    }
+                    i
+                }
+            } else {
+                match guard
+                    .extent_mut(ei)
+                    .add_reservation(obj_id, dest_pa.as_usize())
+                {
+                    Some(i) => i,
+                    None => {
+                        if !from_pool {
+                            super::fault::free_pages_range(dest_pa, SUPERPAGE_ALLOC_PAGES);
+                        }
+                        return None;
+                    }
                 }
             }
         }
