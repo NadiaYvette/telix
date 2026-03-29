@@ -491,6 +491,148 @@ pub fn demote_superpage(l0: usize, va: usize, flags: u64) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// Level-parameterized superpage operations
+// ---------------------------------------------------------------------------
+
+use crate::mm::page::SuperpageLevel;
+
+/// Install a block descriptor at an arbitrary page table level.
+pub fn install_superpage_at_level(
+    l0: usize,
+    va: usize,
+    pa: usize,
+    flags: u64,
+    level: &SuperpageLevel,
+) -> bool {
+    debug_assert!(va & level.align_mask() == 0);
+    debug_assert!(pa & level.align_mask() == 0);
+
+    let slot = match radix_pt::walk_or_create_to_level::<Aarch64Pte>(
+        l0,
+        va,
+        level.pt_level as usize,
+    ) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let old_entry = unsafe { *slot };
+
+    // If the old entry was a table pointer, free the sub-table.
+    if old_entry & PT_VALID != 0 && old_entry & PT_TABLE != 0 {
+        let table_addr = (old_entry & PA_MASK) as usize;
+        crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(table_addr));
+    }
+
+    // Block descriptor: valid, NOT table (bit 1 clear).
+    let block_flags = (flags & !0x2) | PT_VALID;
+    let pa_mask = !(level.align_mask() as u64);
+    unsafe {
+        *slot = (pa as u64 & pa_mask) | block_flags;
+    }
+
+    // TLB invalidate — one per sub-page of the block.
+    let mmu_count = level.mmu_pages();
+    for i in 0..mmu_count {
+        let entry_va = va + i * MMU_PAGE_SIZE;
+        unsafe {
+            let va_shifted = (entry_va >> 12) as u64;
+            core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+        }
+    }
+    unsafe {
+        core::arch::asm!("dsb ish", "isb");
+    }
+    true
+}
+
+/// Check if `va` is mapped as a block descriptor at the given level.
+pub fn is_superpage_at_level(
+    l0: usize,
+    va: usize,
+    level: &SuperpageLevel,
+) -> Option<usize> {
+    let slot =
+        radix_pt::walk_to_level_slot::<Aarch64Pte>(l0, va, level.pt_level as usize)?;
+    let entry = unsafe { *slot };
+    if entry & PT_VALID != 0 && entry & PT_TABLE == 0 {
+        let pa = (entry & PA_MASK) as usize & !level.align_mask();
+        Some(pa)
+    } else {
+        None
+    }
+}
+
+/// Demote a block descriptor at the given level into 512 entries one level down.
+/// If demoting to L3 (leaf level), produces page entries (bit 1 set).
+/// Otherwise, produces block descriptors (bit 1 clear).
+pub fn demote_superpage_at_level(
+    l0: usize,
+    va: usize,
+    flags: u64,
+    level: &SuperpageLevel,
+) -> bool {
+    let slot = match radix_pt::walk_to_level_slot::<Aarch64Pte>(
+        l0,
+        va,
+        level.pt_level as usize,
+    ) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let entry = unsafe { *slot };
+    if entry & PT_VALID == 0 || entry & PT_TABLE != 0 {
+        return false;
+    }
+
+    let base_pa = (entry & PA_MASK) as usize & !level.align_mask();
+    let sub_size = level.size / 512;
+    let sub_is_leaf = (level.pt_level as usize + 1) == Aarch64Pte::LEVELS - 1;
+
+    let new_table = match alloc_table() {
+        Some(t) => t,
+        None => return false,
+    };
+    let table_ptr = new_table as *mut u64;
+
+    for i in 0..512usize {
+        let pa = base_pa + i * sub_size;
+        let sub_entry = if sub_is_leaf {
+            // L3 page entry: bit 1 (PT_PAGE) set.
+            (pa as u64) | flags
+        } else {
+            // Block descriptor: bit 1 clear.
+            let block_flags = (flags & !0x2) | PT_VALID;
+            let sub_mask = !(sub_size as u64 - 1);
+            (pa as u64 & sub_mask) | block_flags
+        };
+        unsafe {
+            *table_ptr.add(i) = sub_entry;
+        }
+    }
+
+    // Replace block with table pointer.
+    unsafe {
+        *slot = (new_table as u64) | PT_VALID | PT_TABLE;
+    }
+
+    // TLB invalidate the full range.
+    let mmu_count = level.mmu_pages();
+    for i in 0..mmu_count {
+        let entry_va = va + i * MMU_PAGE_SIZE;
+        unsafe {
+            let va_shifted = (entry_va >> 12) as u64;
+            core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
+        }
+    }
+    unsafe {
+        core::arch::asm!("dsb ish", "isb");
+    }
+    true
+}
+
 /// Return the kernel page table root (for switching back during exit).
 pub fn boot_page_table_root() -> usize {
     KERNEL_PT_ROOT.load(Ordering::Acquire)

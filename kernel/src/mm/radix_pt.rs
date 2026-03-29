@@ -70,18 +70,17 @@ pub fn walk_to_leaf<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> {
     Some(unsafe { table.add(leaf_idx) })
 }
 
-/// Walk to the PTE slot at the superpage level (level LEVELS-2) for `va`.
-/// Used for checking / installing superpages (2 MiB blocks).
-/// Returns `None` if intermediate levels above it are missing.
+/// Walk to the PTE slot at `target_level` for `va`.
+/// Returns `None` if any intermediate level above `target_level` is missing
+/// or occupied by a block descriptor.
 #[inline]
-pub fn walk_to_super_slot<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> {
-    if F::LEVELS < 2 {
-        return None;
-    }
+pub fn walk_to_level_slot<F: PteFormat>(
+    root: usize,
+    va: usize,
+    target_level: usize,
+) -> Option<*mut u64> {
     let mut table = root as *mut u64;
-    let super_level = F::LEVELS - 2;
-    // Walk through levels 0 .. LEVELS-3.
-    for level in 0..super_level {
+    for level in 0..target_level {
         let idx = F::va_index(va, level);
         let entry = unsafe { *table.add(idx) };
         if !F::is_valid(entry) {
@@ -92,8 +91,18 @@ pub fn walk_to_super_slot<F: PteFormat>(root: usize, va: usize) -> Option<*mut u
         }
         table = F::table_pa(entry) as *mut u64;
     }
-    let idx = F::va_index(va, super_level);
+    let idx = F::va_index(va, target_level);
     Some(unsafe { table.add(idx) })
+}
+
+/// Walk to the PTE slot at the smallest superpage level (LEVELS-2) for `va`.
+/// Backward-compatible wrapper around [`walk_to_level_slot`].
+#[inline]
+pub fn walk_to_super_slot<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> {
+    if F::LEVELS < 2 {
+        return None;
+    }
+    walk_to_level_slot::<F>(root, va, F::LEVELS - 2)
 }
 
 // -------------------------------------------------------------------------
@@ -127,16 +136,16 @@ pub fn walk_or_create<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> 
     Some(unsafe { table.add(leaf_idx) })
 }
 
-/// Walk to the superpage-level PTE slot, allocating intermediate tables.
+/// Walk to the PTE slot at `target_level`, allocating intermediate tables.
 /// Returns `None` only if allocation fails or a higher-level block exists.
 #[inline]
-pub fn walk_or_create_to_super<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> {
-    if F::LEVELS < 2 {
-        return None;
-    }
+pub fn walk_or_create_to_level<F: PteFormat>(
+    root: usize,
+    va: usize,
+    target_level: usize,
+) -> Option<*mut u64> {
     let mut table = root as *mut u64;
-    let super_level = F::LEVELS - 2;
-    for level in 0..super_level {
+    for level in 0..target_level {
         let idx = F::va_index(va, level);
         let entry = unsafe { *table.add(idx) };
         if F::is_valid(entry) {
@@ -152,8 +161,18 @@ pub fn walk_or_create_to_super<F: PteFormat>(root: usize, va: usize) -> Option<*
             table = new_table as *mut u64;
         }
     }
-    let idx = F::va_index(va, super_level);
+    let idx = F::va_index(va, target_level);
     Some(unsafe { table.add(idx) })
+}
+
+/// Walk to the smallest superpage level (LEVELS-2), allocating intermediate tables.
+/// Backward-compatible wrapper around [`walk_or_create_to_level`].
+#[inline]
+pub fn walk_or_create_to_super<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> {
+    if F::LEVELS < 2 {
+        return None;
+    }
+    walk_or_create_to_level::<F>(root, va, F::LEVELS - 2)
 }
 
 // -------------------------------------------------------------------------

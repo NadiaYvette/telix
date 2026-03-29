@@ -125,22 +125,55 @@ pub fn update_pte_flags(root: usize, va: usize, new_flags: u64) -> bool {
 // Superpage operations
 // ---------------------------------------------------------------------------
 
-/// Install a 2 MiB superpage mapping.
+/// Install a 2 MiB superpage mapping (backward-compatible).
 #[inline]
 pub fn install_superpage(root: usize, va: usize, pa: usize, flags: u64) -> bool {
     arch_mm::install_superpage(root, va, pa, flags)
 }
 
-/// Check if `va` is mapped as a superpage, returning the base PA if so.
+/// Check if `va` is mapped as a superpage, returning the base PA if so (backward-compatible).
 #[inline]
 pub fn is_superpage(root: usize, va: usize) -> Option<usize> {
     arch_mm::is_superpage(root, va)
 }
 
-/// Demote a superpage back to 512 individual 4K PTEs.
+/// Demote a superpage back to 512 individual 4K PTEs (backward-compatible).
 #[inline]
 pub fn demote_superpage(root: usize, va: usize, flags: u64) -> bool {
     arch_mm::demote_superpage(root, va, flags)
+}
+
+/// Install a superpage mapping at the given level.
+#[inline]
+pub fn install_superpage_at_level(
+    root: usize,
+    va: usize,
+    pa: usize,
+    flags: u64,
+    level: &super::page::SuperpageLevel,
+) -> bool {
+    arch_mm::install_superpage_at_level(root, va, pa, flags, level)
+}
+
+/// Check if `va` is mapped as a superpage at the given level, returning the base PA.
+#[inline]
+pub fn is_superpage_at_level(
+    root: usize,
+    va: usize,
+    level: &super::page::SuperpageLevel,
+) -> Option<usize> {
+    arch_mm::is_superpage_at_level(root, va, level)
+}
+
+/// Demote a superpage at the given level to the next smaller level's entries.
+#[inline]
+pub fn demote_superpage_at_level(
+    root: usize,
+    va: usize,
+    flags: u64,
+    level: &super::page::SuperpageLevel,
+) -> bool {
+    arch_mm::demote_superpage_at_level(root, va, flags, level)
 }
 
 /// Try AArch64 contiguous hint promotion (no-op on other architectures).

@@ -386,6 +386,112 @@ pub fn demote_superpage(root: usize, va: usize, flags: u64) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// Level-parameterized superpage operations
+// ---------------------------------------------------------------------------
+
+use crate::mm::page::SuperpageLevel;
+
+/// Install a leaf entry at an arbitrary page table level (superpage).
+pub fn install_superpage_at_level(
+    root: usize,
+    va: usize,
+    pa: usize,
+    flags: u64,
+    level: &SuperpageLevel,
+) -> bool {
+    debug_assert!(va & level.align_mask() == 0);
+    debug_assert!(pa & level.align_mask() == 0);
+
+    let slot = match radix_pt::walk_or_create_to_level::<Sv39Pte>(
+        root,
+        va,
+        level.pt_level as usize,
+    ) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let old_entry = unsafe { *slot };
+
+    // If the old entry was a table pointer (non-leaf, valid), free it.
+    if old_entry & PTE_V != 0 && old_entry & (PTE_R | PTE_W | PTE_X) == 0 {
+        let table_addr = ((old_entry >> 10) << 12) as usize;
+        crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(table_addr));
+    }
+
+    // Sv39 leaf entries look the same at every level.
+    unsafe {
+        *slot = pte_leaf(pa, flags);
+    }
+    Sv39Pte::tlb_invalidate(va);
+    true
+}
+
+/// Check if `va` is mapped as a leaf (superpage) at the given level.
+pub fn is_superpage_at_level(
+    root: usize,
+    va: usize,
+    level: &SuperpageLevel,
+) -> Option<usize> {
+    let slot =
+        radix_pt::walk_to_level_slot::<Sv39Pte>(root, va, level.pt_level as usize)?;
+    let entry = unsafe { *slot };
+    if entry & PTE_V != 0 && entry & (PTE_R | PTE_W | PTE_X) != 0 {
+        let pa = ((entry >> 10) << 12) as usize & !level.align_mask();
+        Some(pa)
+    } else {
+        None
+    }
+}
+
+/// Demote a superpage at the given level into 512 entries one level down.
+/// Sv39 leaf entries have the same format at every level, so sub-entries
+/// are always constructed with `pte_leaf`.
+pub fn demote_superpage_at_level(
+    root: usize,
+    va: usize,
+    flags: u64,
+    level: &SuperpageLevel,
+) -> bool {
+    let slot = match radix_pt::walk_to_level_slot::<Sv39Pte>(
+        root,
+        va,
+        level.pt_level as usize,
+    ) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let entry = unsafe { *slot };
+    if entry & PTE_V == 0 || entry & (PTE_R | PTE_W | PTE_X) == 0 {
+        return false;
+    }
+
+    let base_pa = ((entry >> 10) << 12) as usize & !level.align_mask();
+    let sub_size = level.size / 512;
+
+    let new_table = match alloc_table() {
+        Some(t) => t,
+        None => return false,
+    };
+    let table_ptr = new_table as *mut u64;
+
+    for i in 0..512usize {
+        let pa = base_pa + i * sub_size;
+        unsafe {
+            *table_ptr.add(i) = pte_leaf(pa, flags);
+        }
+    }
+
+    // Replace leaf entry with table pointer.
+    unsafe {
+        *slot = pte_table(new_table);
+    }
+    Sv39Pte::tlb_invalidate(va);
+    true
+}
+
 /// Return the kernel page table root (for switching back during exit).
 pub fn boot_page_table_root() -> usize {
     KERNEL_PT_ROOT.load(Ordering::Acquire)

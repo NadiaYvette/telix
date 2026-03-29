@@ -35,21 +35,79 @@ pub const PAGE_MMUCOUNT: usize = PAGE_SIZE / MMUPAGE_SIZE;
 pub const PAGE_MMUSHIFT: usize = PAGE_SHIFT - MMUPAGE_SHIFT;
 
 // ---------------------------------------------------------------------------
-// Superpage (large page) constants — architecture-dependent
+// Superpage (large page) level table — architecture-dependent
+// ---------------------------------------------------------------------------
+
+/// Description of a single hardware superpage size.
+#[derive(Clone, Copy)]
+pub struct SuperpageLevel {
+    /// Total size in bytes (e.g., 2 MiB = 0x20_0000).
+    pub size: usize,
+    /// log2(size).
+    pub shift: u32,
+    /// The radix page table level at which this superpage is installed.
+    pub pt_level: u32,
+}
+
+impl SuperpageLevel {
+    /// Number of allocation pages per superpage at this level.
+    pub const fn alloc_pages(&self) -> usize {
+        self.size / PAGE_SIZE
+    }
+
+    /// Number of MMU pages per superpage at this level.
+    pub const fn mmu_pages(&self) -> usize {
+        self.size / MMUPAGE_SIZE
+    }
+
+    /// Alignment mask: `addr & align_mask()` gives the offset within this superpage.
+    pub const fn align_mask(&self) -> usize {
+        self.size - 1
+    }
+
+    /// Align a virtual or physical address down to this superpage boundary.
+    pub const fn align_down(&self, addr: usize) -> usize {
+        addr & !self.align_mask()
+    }
+}
+
+/// Per-architecture superpage level table, ordered smallest to largest.
+/// Does not include the AArch64 contiguous hint (handled separately).
+#[cfg(target_arch = "x86_64")]
+pub const SUPERPAGE_LEVELS: &[SuperpageLevel] = &[
+    SuperpageLevel { size: 2 << 20, shift: 21, pt_level: 2 },        // 2 MiB (PD large page)
+    SuperpageLevel { size: 1 << 30, shift: 30, pt_level: 1 },        // 1 GiB (PDPT large page)
+];
+
+#[cfg(target_arch = "aarch64")]
+pub const SUPERPAGE_LEVELS: &[SuperpageLevel] = &[
+    SuperpageLevel { size: 2 << 20, shift: 21, pt_level: 2 },        // 2 MiB (L2 block)
+    SuperpageLevel { size: 1 << 30, shift: 30, pt_level: 1 },        // 1 GiB (L1 block)
+];
+
+#[cfg(target_arch = "riscv64")]
+pub const SUPERPAGE_LEVELS: &[SuperpageLevel] = &[
+    SuperpageLevel { size: 2 << 20, shift: 21, pt_level: 1 },        // 2 MiB (Sv39 megapage)
+    SuperpageLevel { size: 1 << 30, shift: 30, pt_level: 0 },        // 1 GiB (Sv39 gigapage)
+];
+
+// ---------------------------------------------------------------------------
+// Backward-compatible aliases — refer to smallest superpage level (index 0).
+// Existing code uses these; new code should prefer SUPERPAGE_LEVELS directly.
 // ---------------------------------------------------------------------------
 
 /// Smallest superpage size for this architecture (2 MiB on aarch64/x86_64/riscv64).
-pub const SUPERPAGE_SIZE: usize = 2 * 1024 * 1024;
+pub const SUPERPAGE_SIZE: usize = SUPERPAGE_LEVELS[0].size;
 #[allow(dead_code)]
-pub const SUPERPAGE_SHIFT: usize = 21;
+pub const SUPERPAGE_SHIFT: usize = SUPERPAGE_LEVELS[0].shift as usize;
 
-/// Number of allocation pages in one superpage.
+/// Number of allocation pages in one superpage (smallest level).
 pub const SUPERPAGE_ALLOC_PAGES: usize = SUPERPAGE_SIZE / PAGE_SIZE;
 
-/// Number of MMU pages in one superpage.
+/// Number of MMU pages in one superpage (smallest level).
 pub const SUPERPAGE_MMU_PAGES: usize = SUPERPAGE_SIZE / MMUPAGE_SIZE;
 
-/// Alignment mask: `addr & SUPERPAGE_ALIGN_MASK` gives the offset within a superpage.
+/// Alignment mask for the smallest superpage level.
 pub const SUPERPAGE_ALIGN_MASK: usize = SUPERPAGE_SIZE - 1;
 
 /// Physical address (wrapper for type safety).

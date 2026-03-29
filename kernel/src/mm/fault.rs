@@ -401,22 +401,42 @@ fn super_alloc_order() -> usize {
     order
 }
 
+/// Compute the allocation order (log2 of page count) for a superpage level.
+fn level_alloc_order(level: &super::page::SuperpageLevel) -> usize {
+    let mut order = 0;
+    let mut n = level.alloc_pages();
+    while n > 1 {
+        n >>= 1;
+        order += 1;
+    }
+    order
+}
+
 /// Allocate a superpage-aligned contiguous physical region.
 /// Returns the base PhysAddr of SUPERPAGE_ALLOC_PAGES contiguous pages,
 /// aligned to SUPERPAGE_SIZE. Returns None on failure.
 pub fn alloc_superpage_aligned() -> Option<super::page::PhysAddr> {
+    alloc_aligned_for_level(&super::page::SUPERPAGE_LEVELS[0])
+}
+
+/// Allocate contiguous physical pages aligned to the given superpage level.
+pub fn alloc_aligned_for_level(
+    level: &super::page::SuperpageLevel,
+) -> Option<super::page::PhysAddr> {
     use super::page::PhysAddr;
 
-    let order5 = super_alloc_order();
+    let alloc_pages = level.alloc_pages();
+    let align_mask = level.align_mask();
+    let order0 = level_alloc_order(level);
 
-    if let Some(pa) = super::phys::alloc_pages(order5) {
-        if pa.as_usize() & SUPERPAGE_ALIGN_MASK == 0 {
+    if let Some(pa) = super::phys::alloc_pages(order0) {
+        if pa.as_usize() & align_mask == 0 {
             return Some(pa);
         }
-        super::phys::free_pages(pa, order5);
+        super::phys::free_pages(pa, order0);
     }
 
-    for order in (order5 + 1)..=11 {
+    for order in (order0 + 1)..=11 {
         let large = match super::phys::alloc_pages(order) {
             Some(pa) => pa,
             None => continue,
@@ -424,12 +444,12 @@ pub fn alloc_superpage_aligned() -> Option<super::page::PhysAddr> {
         let large_pa = large.as_usize();
         let large_pages = 1usize << order;
 
-        let aligned_pa = (large_pa + SUPERPAGE_ALIGN_MASK) & !SUPERPAGE_ALIGN_MASK;
-        if aligned_pa == large_pa && large_pages >= SUPERPAGE_ALLOC_PAGES {
-            let excess = large_pages - SUPERPAGE_ALLOC_PAGES;
+        let aligned_pa = (large_pa + align_mask) & !align_mask;
+        if aligned_pa == large_pa && large_pages >= alloc_pages {
+            let excess = large_pages - alloc_pages;
             if excess > 0 {
                 free_pages_range(
-                    PhysAddr::new(large_pa + SUPERPAGE_ALLOC_PAGES * PAGE_SIZE),
+                    PhysAddr::new(large_pa + alloc_pages * PAGE_SIZE),
                     excess,
                 );
             }
@@ -437,7 +457,7 @@ pub fn alloc_superpage_aligned() -> Option<super::page::PhysAddr> {
         }
 
         let offset_pages = (aligned_pa - large_pa) / PAGE_SIZE;
-        let end_page = offset_pages + SUPERPAGE_ALLOC_PAGES;
+        let end_page = offset_pages + alloc_pages;
         if end_page <= large_pages {
             if offset_pages > 0 {
                 free_pages_range(PhysAddr::new(large_pa), offset_pages);
@@ -445,7 +465,7 @@ pub fn alloc_superpage_aligned() -> Option<super::page::PhysAddr> {
             let suffix = large_pages - end_page;
             if suffix > 0 {
                 free_pages_range(
-                    PhysAddr::new(aligned_pa + SUPERPAGE_ALLOC_PAGES * PAGE_SIZE),
+                    PhysAddr::new(aligned_pa + alloc_pages * PAGE_SIZE),
                     suffix,
                 );
             }
