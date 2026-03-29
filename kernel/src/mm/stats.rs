@@ -20,6 +20,8 @@ pub static RESERVATION_CONSOLIDATIONS: AtomicU64 = AtomicU64::new(0);
 pub static WSCLOCK_RESERVATION_SKIPS: AtomicU64 = AtomicU64::new(0);
 pub static POOL_ALLOCS: AtomicU64 = AtomicU64::new(0);
 pub static POOL_CREATES: AtomicU64 = AtomicU64::new(0);
+pub static PT_TABLES_SHARED: AtomicU64 = AtomicU64::new(0);
+pub static PT_COW_BREAKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn print() {
     crate::println!("  VM stats:");
@@ -91,5 +93,13 @@ pub fn print() {
     crate::println!(
         "    COW pool allocs:  {}",
         POOL_ALLOCS.load(Ordering::Relaxed)
+    );
+    crate::println!(
+        "    PT tables shared: {}",
+        PT_TABLES_SHARED.load(Ordering::Relaxed)
+    );
+    crate::println!(
+        "    PT COW breaks:    {}",
+        PT_COW_BREAKS.load(Ordering::Relaxed)
     );
 }

@@ -105,6 +105,12 @@ pub fn handle_page_fault(
         let obj_id = vma.object_id;
         let va_aligned = fault_addr & !(MMUPAGE_SIZE - 1);
 
+        // Break any shared page table nodes along the walk path.
+        // A shared marker (not-present) may have caused this fault itself.
+        if !hat::ensure_path_unshared(pt_root, va_aligned) {
+            return FaultResult::Failed; // OOM during COW-break
+        }
+
         // Read current PTE state.
         let pte = read_pte_dispatch(pt_root, va_aligned);
         let is_present = pte_is_present(pte);

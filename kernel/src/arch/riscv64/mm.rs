@@ -27,6 +27,9 @@ const PTE_D: u64 = 1 << 7; // Dirty
 /// Software-defined bit: page content has been initialized (zeroed/filled).
 /// Use RSW bit 9 (bits 9:8 are reserved for supervisor software in Sv39).
 pub const PTE_SW_ZEROED: u64 = 1 << 9;
+/// Software-defined bit: shared page table marker (not-present entry).
+/// Uses RSW bit 8 (below PPN range) to avoid overlapping with PPN encoding.
+const PTE_SHARED: u64 = 1 << 8;
 
 const MMU_PAGE_SIZE: usize = 4096;
 
@@ -155,6 +158,65 @@ impl PteFormat for Sv39Pte {
     fn tlb_invalidate(va: usize) {
         unsafe {
             core::arch::asm!("sfence.vma {}, zero", in(reg) va);
+        }
+    }
+
+    #[inline]
+    fn make_shared_entry(table_pa: usize) -> u64 {
+        (((table_pa >> 12) as u64) << 10) | PTE_SHARED
+    }
+
+    #[inline]
+    fn is_shared_entry(entry: u64) -> bool {
+        entry & PTE_V == 0 && entry & PTE_SHARED != 0
+    }
+
+    #[inline]
+    fn shared_entry_pa(entry: u64) -> usize {
+        ((entry >> 10) << 12) as usize
+    }
+
+    #[inline]
+    fn make_readonly(entry: u64) -> u64 {
+        entry & !PTE_W
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared page table support
+// ---------------------------------------------------------------------------
+
+/// Ensure the walk path for `va` contains no shared markers (COW-break).
+#[inline]
+pub fn ensure_path_unshared(root: usize, va: usize) -> bool {
+    radix_pt::ensure_path_unshared::<Sv39Pte>(root, va)
+}
+
+/// Recursively free a page table subtree, handling shared markers.
+pub fn free_shared_user_subtree(table_pa: usize, level: usize) {
+    radix_pt::free_shared_subtree::<Sv39Pte>(table_pa, level);
+}
+
+/// Share page table entries between parent and child at fork time.
+///
+/// On RISC-V Sv39: kernel entries are gigapages (leaf, is_table=false).
+/// Only table entries are user sub-trees — share those.
+pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
+    use crate::mm::ptshare;
+
+    let parent = parent_root as *mut u64;
+    let child = child_root as *mut u64;
+
+    for i in 0..512 {
+        let entry = unsafe { *parent.add(i) };
+        if Sv39Pte::is_valid(entry) && Sv39Pte::is_table(entry) {
+            let sub_pa = Sv39Pte::table_pa(entry);
+            ptshare::share(sub_pa);
+            let shared = Sv39Pte::make_shared_entry(sub_pa);
+            unsafe {
+                *parent.add(i) = shared;
+                *child.add(i) = shared;
+            }
         }
     }
 }
@@ -502,34 +564,29 @@ pub fn boot_page_table_root() -> usize {
 /// Sv39: root → L1 → L0 (leaf). Kernel gigapages at root[0] and root[2]
 /// are leaf entries (not tables), so they are automatically skipped.
 pub fn free_page_table_tree(root_addr: usize) {
+    use crate::mm::{ptshare, page::PhysAddr};
+
     let root = root_addr as *const u64;
     unsafe {
         for i in 0..512 {
             let entry = *root.add(i);
-            if entry & PTE_V != 0 && entry & (PTE_R | PTE_W | PTE_X) == 0 {
-                // Non-leaf: this is an L1 table pointer.
-                let l1 = ((entry >> 10) << 12) as usize;
-                free_sv39_l1(l1);
-                crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l1));
+            if Sv39Pte::is_shared_entry(entry) {
+                let sub_pa = Sv39Pte::shared_entry_pa(entry);
+                let rc = ptshare::unshare(sub_pa);
+                if rc == 0 {
+                    free_shared_user_subtree(sub_pa, 1);
+                    crate::mm::phys::free_page(PhysAddr::new(sub_pa));
+                }
+            } else if Sv39Pte::is_valid(entry) && Sv39Pte::is_table(entry) {
+                // Non-leaf user sub-table.
+                let l1 = Sv39Pte::table_pa(entry);
+                free_shared_user_subtree(l1, 1);
+                crate::mm::phys::free_page(PhysAddr::new(l1));
             }
-            // Leaf entries (gigapages) are kernel entries — skip.
+            // Leaf entries (kernel gigapages) — skip.
         }
     }
     crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(root_addr));
-}
-
-/// Free L0 (leaf) tables under an Sv39 L1 table.
-unsafe fn free_sv39_l1(l1: usize) {
-    let table = l1 as *const u64;
-    for i in 0..512 {
-        let entry = unsafe { *table.add(i) };
-        if entry & PTE_V != 0 && entry & (PTE_R | PTE_W | PTE_X) == 0 {
-            // Non-leaf: L0 table pointer.
-            let l0 = ((entry >> 10) << 12) as usize;
-            // L0 is a leaf table — just free it.
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l0));
-        }
-    }
 }
 
 /// Switch the page table to a different Sv39 root.

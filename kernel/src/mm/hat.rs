@@ -35,6 +35,20 @@ pub fn free_page_table_tree(root: usize) {
     arch_mm::free_page_table_tree(root);
 }
 
+/// Ensure the walk path for `va` contains no shared page table markers.
+/// COW-breaks shared nodes top-down. Returns `false` only on OOM.
+#[inline]
+pub fn ensure_path_unshared(root: usize, va: usize) -> bool {
+    arch_mm::ensure_path_unshared(root, va)
+}
+
+/// Share page table entries between parent and child at fork time.
+/// Converts shared entries to not-present markers in both roots.
+#[inline]
+pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
+    arch_mm::clone_shared_tables(parent_root, child_root);
+}
+
 /// Switch to a different page table (write CR3 / TTBR0 / satp).
 #[inline]
 pub fn switch_page_table(root: usize) {

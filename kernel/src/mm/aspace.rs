@@ -556,27 +556,24 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         }
     }
 
-    // Step 4: Demote parent superpages, then install child PTEs and
-    // downgrade both parent and child to read-only for COW.
+    // Step 4: Share page table entries between parent and child.
     //
-    // Superpage demotion must happen BEFORE walking parent L3 PTEs,
-    // because translate_va/read_pte walk to L3 and return None/0 for
-    // superpage block descriptors (which live at L2, not L3).
+    // Instead of copying every PTE, we share entire page table nodes via
+    // COW. The shared markers (not-present entries) trigger COW-break on
+    // the first fault in each region, which copies the table and downgrades
+    // leaf PTEs to read-only for per-page COW.
+    //
+    // Superpages survive fork undamaged — no demotion needed.
     {
-        // First: demote all superpages in writable parent VMAs.
-        for i in 0..vma_count {
-            let info = unsafe { &*cow_buf.add(i) };
-            if info.prot.writable() {
-                let mmu_count = info.va_len / super::page::MMUPAGE_SIZE;
-                demote_superpages_in_range(parent_pt, info.va_start, mmu_count, info.prot);
-            }
-        }
+        // Share page table entries at the appropriate arch-specific level.
+        super::hat::clone_shared_tables(parent_pt, child_pt);
 
-        // Now install child PTEs and downgrade parent PTEs — all L3 entries
-        // are accessible since superpages have been demoted.
+        // Flush parent TLB so stale translations don't bypass shared markers.
+        // Reloading the page table root flushes TLB on all architectures.
+        switch_page_table(parent_pt);
+
+        // Insert VMAs into the child address space.
         let mut child_guard = unsafe { (*child_entry_ptr).inner.lock() };
-        let sw_z = super::fault::sw_zeroed_bit();
-
         for i in 0..vma_count {
             let info = unsafe { &*cow_buf.add(i) };
             child_guard.vmas.insert(
@@ -586,28 +583,6 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
                 info.new_obj_id,
                 info.object_offset,
             );
-
-            let mmu_count = info.va_len / super::page::MMUPAGE_SIZE;
-            for mmu_idx in 0..mmu_count {
-                let va = info.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
-                let pte = super::fault::read_pte_dispatch(parent_pt, va);
-                if super::fault::pte_is_present(pte) {
-                    if let Some(pa) = translate_va(parent_pt, va) {
-                        let pa_page = pa & !(super::page::MMUPAGE_SIZE - 1);
-                        let flags = if info.prot.writable() {
-                            ro_flags_for_prot(info.prot)
-                        } else {
-                            rw_flags_for_prot(info.prot)
-                        };
-                        map_single_mmupage(child_pt, va, pa_page, flags | sw_z);
-
-                        // Downgrade parent PTE to read-only for COW.
-                        if info.prot.writable() {
-                            downgrade_pte_readonly(parent_pt, va);
-                        }
-                    }
-                }
-            }
         }
     } // child lock dropped
 
@@ -903,6 +878,7 @@ fn demote_superpages_in_range(pt_root: usize, va_start: usize, mmu_count: usize,
 
 use super::hat;
 
+#[allow(dead_code)]
 fn ro_flags_for_prot(_prot: VmaProt) -> u64 {
     hat::USER_RO_FLAGS
 }
@@ -919,14 +895,21 @@ fn free_page_table_tree(root: usize) {
     hat::free_page_table_tree(root);
 }
 
+fn switch_page_table(root: usize) {
+    hat::switch_page_table(root);
+}
+
+#[allow(dead_code)]
 fn downgrade_pte_readonly(pt_root: usize, va: usize) {
     hat::downgrade_pte_readonly(pt_root, va);
 }
 
+#[allow(dead_code)]
 fn translate_va(pt_root: usize, va: usize) -> Option<usize> {
     hat::translate_va(pt_root, va)
 }
 
+#[allow(dead_code)]
 fn map_single_mmupage(pt_root: usize, va: usize, pa: usize, flags: u64) {
     hat::map_single_mmupage(pt_root, va, pa, flags);
 }

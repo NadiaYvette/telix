@@ -27,6 +27,9 @@ const PFN_MASK: u64 = 0xFFFF_FFFF_FFFF_F000;
 
 /// Software-defined bit: page content has been initialized.
 pub const PTE_SW_ZEROED: u64 = 1 << 10;
+/// Software-defined bit: shared page table marker (not-present entry).
+/// Same bit as PTE_SW_REF but orthogonal — shared markers have V=0.
+const PTE_SHARED: u64 = 1 << 11;
 
 const MMU_PAGE_SIZE: usize = 4096;
 
@@ -107,6 +110,65 @@ impl PteFormat for Mips64Pte {
         // For correctness with stale TLB entries, do a full flush.
         // TODO: targeted invalidation.
     }
+
+    #[inline]
+    fn make_shared_entry(table_pa: usize) -> u64 {
+        (table_pa as u64 & PFN_MASK) | PTE_SHARED
+    }
+
+    #[inline]
+    fn is_shared_entry(entry: u64) -> bool {
+        entry & PTE_V == 0 && entry & PTE_SHARED != 0
+    }
+
+    #[inline]
+    fn shared_entry_pa(entry: u64) -> usize {
+        (entry & PFN_MASK) as usize
+    }
+
+    #[inline]
+    fn make_readonly(entry: u64) -> u64 {
+        entry & !PTE_D
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared page table support
+// ---------------------------------------------------------------------------
+
+/// Ensure the walk path for `va` contains no shared markers (COW-break).
+#[inline]
+pub fn ensure_path_unshared(root: usize, va: usize) -> bool {
+    radix_pt::ensure_path_unshared::<Mips64Pte>(root, va)
+}
+
+/// Recursively free a page table subtree, handling shared markers.
+pub fn free_shared_user_subtree(table_pa: usize, level: usize) {
+    radix_pt::free_shared_subtree::<Mips64Pte>(table_pa, level);
+}
+
+/// Share page table entries between parent and child at fork time.
+///
+/// On MIPS64: kernel uses KSEG0, no kernel entries in user PT.
+/// Share all valid table entries at root level.
+pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
+    use crate::mm::ptshare;
+
+    let parent = parent_root as *mut u64;
+    let child = child_root as *mut u64;
+
+    for i in 0..512 {
+        let entry = unsafe { *parent.add(i) };
+        if Mips64Pte::is_valid(entry) && Mips64Pte::is_table(entry) {
+            let sub_pa = Mips64Pte::table_pa(entry);
+            ptshare::share(sub_pa);
+            let shared = Mips64Pte::make_shared_entry(sub_pa);
+            unsafe {
+                *parent.add(i) = shared;
+                *child.add(i) = shared;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -144,30 +206,27 @@ pub fn switch_page_table(_root: usize) {
 
 /// Free all intermediate page table pages in the tree.
 pub fn free_page_table_tree(root_addr: usize) {
+    use crate::mm::{ptshare, page::PhysAddr};
+
     let root = root_addr as *const u64;
     unsafe {
         for i in 0..512 {
             let entry = *root.add(i);
-            if entry & PTE_V != 0 && Mips64Pte::is_table(entry) {
-                let l1 = (entry & PFN_MASK) as usize;
-                free_subtree_l1(l1);
-                crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l1));
+            if Mips64Pte::is_shared_entry(entry) {
+                let sub_pa = Mips64Pte::shared_entry_pa(entry);
+                let rc = ptshare::unshare(sub_pa);
+                if rc == 0 {
+                    free_shared_user_subtree(sub_pa, 1);
+                    crate::mm::phys::free_page(PhysAddr::new(sub_pa));
+                }
+            } else if Mips64Pte::is_valid(entry) && Mips64Pte::is_table(entry) {
+                let l1 = Mips64Pte::table_pa(entry);
+                free_shared_user_subtree(l1, 1);
+                crate::mm::phys::free_page(PhysAddr::new(l1));
             }
         }
     }
     crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(root_addr));
-}
-
-/// Free L2 (leaf) tables under an L1 table.
-unsafe fn free_subtree_l1(l1: usize) {
-    let table = l1 as *const u64;
-    for i in 0..512 {
-        let entry = unsafe { *table.add(i) };
-        if entry & PTE_V != 0 && Mips64Pte::is_table(entry) {
-            let l2 = (entry & PFN_MASK) as usize;
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l2));
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

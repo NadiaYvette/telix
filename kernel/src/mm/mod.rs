@@ -13,6 +13,7 @@ pub mod paged_array;
 pub mod pager;
 pub mod pagevec;
 pub mod phys;
+pub mod ptshare;
 pub mod slab;
 pub mod stats;
 pub mod vma;

@@ -16,6 +16,8 @@ const PTE_NX: u64 = 1u64 << 63; // No Execute
 /// Software-defined bit: page content has been initialized (zeroed/filled).
 /// AVL bit 9 (bits 9-11 are available to software in x86-64 PTEs).
 pub const PTE_SW_ZEROED: u64 = 1 << 9;
+/// Software-defined bit: shared page table marker (not-present entry).
+const PTE_SHARED: u64 = 1 << 11;
 
 const MMU_PAGE_SIZE: usize = 4096;
 
@@ -125,6 +127,92 @@ impl crate::mm::radix_pt::PteFormat for X86Pte {
     fn tlb_invalidate(va: usize) {
         unsafe {
             core::arch::asm!("invlpg [{}]", in(reg) va);
+        }
+    }
+
+    #[inline]
+    fn make_shared_entry(table_pa: usize) -> u64 {
+        // Not present (P=0), PTE_SHARED set, PA encoded.
+        (table_pa as u64 & 0x000F_FFFF_FFFF_F000) | PTE_SHARED
+    }
+
+    #[inline]
+    fn is_shared_entry(entry: u64) -> bool {
+        entry & PTE_P == 0 && entry & PTE_SHARED != 0
+    }
+
+    #[inline]
+    fn shared_entry_pa(entry: u64) -> usize {
+        (entry & 0x000F_FFFF_FFFF_F000) as usize
+    }
+
+    #[inline]
+    fn make_readonly(entry: u64) -> u64 {
+        entry & !PTE_RW
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared page table support
+// ---------------------------------------------------------------------------
+
+/// Ensure the walk path for `va` contains no shared markers (COW-break).
+#[inline]
+pub fn ensure_path_unshared(root: usize, va: usize) -> bool {
+    radix_pt::ensure_path_unshared::<X86Pte>(root, va)
+}
+
+/// Recursively free a page table subtree, handling shared markers.
+pub fn free_shared_user_subtree(table_pa: usize, level: usize) {
+    radix_pt::free_shared_subtree::<X86Pte>(table_pa, level);
+}
+
+/// Share page table entries between parent and child at fork time.
+///
+/// On x86-64:
+/// - PML4[0] → PDPT: entries 0-3 are kernel gigapages (skip), 4+ are user (share).
+/// - PML4[1..512]: share entire entries (all user).
+pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
+    use crate::mm::ptshare;
+
+    let parent_pml4 = parent_root as *mut u64;
+    let child_pml4 = child_root as *mut u64;
+
+    // PML4[0]: both have deep-copied PDPTs. Share PDPT[4+] (user entries).
+    let parent_e0 = unsafe { *parent_pml4 };
+    let child_e0 = unsafe { *child_pml4 };
+    if X86Pte::is_valid(parent_e0)
+        && X86Pte::is_table(parent_e0)
+        && X86Pte::is_valid(child_e0)
+        && X86Pte::is_table(child_e0)
+    {
+        let parent_pdpt = X86Pte::table_pa(parent_e0) as *mut u64;
+        let child_pdpt = X86Pte::table_pa(child_e0) as *mut u64;
+        for i in 4..512 {
+            let entry = unsafe { *parent_pdpt.add(i) };
+            if X86Pte::is_valid(entry) && X86Pte::is_table(entry) {
+                let sub_pa = X86Pte::table_pa(entry);
+                ptshare::share(sub_pa);
+                let shared = X86Pte::make_shared_entry(sub_pa);
+                unsafe {
+                    *parent_pdpt.add(i) = shared;
+                    *child_pdpt.add(i) = shared;
+                }
+            }
+        }
+    }
+
+    // PML4[1..512]: share directly (all user).
+    for i in 1..512 {
+        let entry = unsafe { *parent_pml4.add(i) };
+        if X86Pte::is_valid(entry) && X86Pte::is_table(entry) {
+            let sub_pa = X86Pte::table_pa(entry);
+            ptshare::share(sub_pa);
+            let shared = X86Pte::make_shared_entry(sub_pa);
+            unsafe {
+                *parent_pml4.add(i) = shared;
+                *child_pml4.add(i) = shared;
+            }
         }
     }
 }
@@ -307,55 +395,38 @@ pub fn boot_page_table_root() -> usize {
 /// Does NOT free leaf physical pages (those are freed by aspace::destroy).
 /// Skips kernel-range entries (PML4[1..3] point to shared boot tables).
 pub fn free_page_table_tree(root: usize) {
+    use crate::mm::{ptshare, page::PhysAddr};
+
     let pml4 = root as *const u64;
     unsafe {
-        // PML4[0] was deep-copied (its own PDPT). Recurse and free it.
+        // PML4[0] was deep-copied (its own PDPT). Free with shared-aware logic.
+        // Kernel gigapages at PDPT[0-3] are skipped (is_table = false).
         let entry0 = *pml4.add(0);
         if entry0 & PTE_P != 0 && entry0 & PTE_PS == 0 {
             let pdpt = (entry0 & 0x000F_FFFF_FFFF_F000) as usize;
-            free_pdpt_user(pdpt);
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(pdpt));
+            free_shared_user_subtree(pdpt, 1);
+            crate::mm::phys::free_page(PhysAddr::new(pdpt));
         }
         // PML4[1..3] are shared with boot — do NOT free.
-        // PML4[4..511]: user-range entries (if any).
+        // PML4[4..511]: user-range entries — may be shared markers.
         for i in 4..512 {
             let entry = *pml4.add(i);
-            if entry & PTE_P != 0 && entry & PTE_PS == 0 {
+            if X86Pte::is_shared_entry(entry) {
+                let sub_pa = X86Pte::shared_entry_pa(entry);
+                let rc = ptshare::unshare(sub_pa);
+                if rc == 0 {
+                    free_shared_user_subtree(sub_pa, 1);
+                    crate::mm::phys::free_page(PhysAddr::new(sub_pa));
+                }
+            } else if entry & PTE_P != 0 && entry & PTE_PS == 0 {
                 let pdpt = (entry & 0x000F_FFFF_FFFF_F000) as usize;
-                free_pdpt_user(pdpt);
-                crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(pdpt));
+                free_shared_user_subtree(pdpt, 1);
+                crate::mm::phys::free_page(PhysAddr::new(pdpt));
             }
         }
     }
     // Free the PML4 itself.
     crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(root));
-}
-
-/// Free all sub-tables under a PDPT, skipping gigapage (PS) entries.
-unsafe fn free_pdpt_user(pdpt: usize) {
-    let table = pdpt as *const u64;
-    for i in 0..512 {
-        let entry = unsafe { *table.add(i) };
-        if entry & PTE_P != 0 && entry & PTE_PS == 0 {
-            let pd = (entry & 0x000F_FFFF_FFFF_F000) as usize;
-            unsafe { free_pd_user(pd) };
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(pd));
-        }
-    }
-}
-
-/// Free all sub-tables under a PD, skipping large page (PS) entries.
-unsafe fn free_pd_user(pd: usize) {
-    let table = pd as *const u64;
-    for i in 0..512 {
-        let entry = unsafe { *table.add(i) };
-        if entry & PTE_P != 0 && entry & PTE_PS == 0 {
-            let pt = (entry & 0x000F_FFFF_FFFF_F000) as usize;
-            // PT is a leaf table — just free it (leaf PTEs point to user pages,
-            // which are freed by aspace::destroy, not here).
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(pt));
-        }
-    }
 }
 
 /// Downgrade a single 4K PTE from writable to read-only (for COW).

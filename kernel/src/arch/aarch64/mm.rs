@@ -25,6 +25,8 @@ const PT_CONTIGUOUS: u64 = 1 << 52; // Contiguous hint (16 × 4K = 64K group)
 /// Software-defined bit: page content has been initialized (zeroed/filled).
 /// Stored in bits [58:55] which are reserved for software use.
 pub const PTE_SW_ZEROED: u64 = 1 << 55;
+/// Software-defined bit: shared page table marker (not-present entry).
+const PTE_SHARED: u64 = 1 << 11;
 const PT_ATTR_IDX_0: u64 = 0 << 2; // MAIR index 0 (normal memory)
 const PT_ATTR_IDX_1: u64 = 1 << 2; // MAIR index 1 (device memory)
 
@@ -165,6 +167,78 @@ impl crate::mm::radix_pt::PteFormat for Aarch64Pte {
             core::arch::asm!("tlbi vale1is, {}", in(reg) va_shifted);
             core::arch::asm!("dsb ish");
             core::arch::asm!("isb");
+        }
+    }
+
+    #[inline]
+    fn make_shared_entry(table_pa: usize) -> u64 {
+        (table_pa as u64 & PA_MASK) | PTE_SHARED
+    }
+
+    #[inline]
+    fn is_shared_entry(entry: u64) -> bool {
+        entry & PT_VALID == 0 && entry & PTE_SHARED != 0
+    }
+
+    #[inline]
+    fn shared_entry_pa(entry: u64) -> usize {
+        (entry & PA_MASK) as usize
+    }
+
+    #[inline]
+    fn make_readonly(entry: u64) -> u64 {
+        // Set AP[2] (bit 7) — makes both EL1 and EL0 read-only.
+        entry | (1 << 7)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared page table support
+// ---------------------------------------------------------------------------
+
+/// Ensure the walk path for `va` contains no shared markers (COW-break).
+#[inline]
+pub fn ensure_path_unshared(root: usize, va: usize) -> bool {
+    radix_pt::ensure_path_unshared::<Aarch64Pte>(root, va)
+}
+
+/// Recursively free a page table subtree, handling shared markers.
+pub fn free_shared_user_subtree(table_pa: usize, level: usize) {
+    radix_pt::free_shared_subtree::<Aarch64Pte>(table_pa, level);
+}
+
+/// Share page table entries between parent and child at fork time.
+///
+/// On AArch64: L0[0] → L1 table has kernel/device blocks at L1[0-1]
+/// and user table entries at L1[2+]. Share L1[2+].
+pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
+    use crate::mm::ptshare;
+
+    let parent_l0_0 = unsafe { *(parent_root as *const u64) };
+    let child_l0_0 = unsafe { *(child_root as *const u64) };
+
+    if !Aarch64Pte::is_valid(parent_l0_0)
+        || !Aarch64Pte::is_table(parent_l0_0)
+        || !Aarch64Pte::is_valid(child_l0_0)
+        || !Aarch64Pte::is_table(child_l0_0)
+    {
+        return;
+    }
+
+    let parent_l1 = Aarch64Pte::table_pa(parent_l0_0) as *mut u64;
+    let child_l1 = Aarch64Pte::table_pa(child_l0_0) as *mut u64;
+
+    // L1[0-1] are kernel/device blocks. Share L1[2+] (user entries).
+    for i in 2..512 {
+        let entry = unsafe { *parent_l1.add(i) };
+        if Aarch64Pte::is_valid(entry) && Aarch64Pte::is_table(entry) {
+            let sub_pa = Aarch64Pte::table_pa(entry);
+            ptshare::share(sub_pa);
+            let shared = Aarch64Pte::make_shared_entry(sub_pa);
+            unsafe {
+                *parent_l1.add(i) = shared;
+                *child_l1.add(i) = shared;
+            }
         }
     }
 }
@@ -644,54 +718,29 @@ pub fn boot_page_table_root() -> usize {
 /// block entries (L1[0], L1[1]) and user table entries (L1[2+]).
 /// We only recurse into user table entries.
 pub fn free_page_table_tree(root: usize) {
+    use crate::mm::page::PhysAddr;
+
     let l0 = root as *const u64;
     unsafe {
+        // L0[0] → per-process L1 table. Free with shared-aware logic.
+        // Kernel/device blocks at L1[0-1] are skipped (is_table = false).
         let entry0 = *l0.add(0);
         if entry0 & PT_VALID != 0 && entry0 & PT_TABLE != 0 {
-            let l1 = (entry0 & 0x0000_FFFF_FFFF_F000) as usize;
-            free_l1_user(l1);
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l1));
+            let l1 = (entry0 & PA_MASK) as usize;
+            free_shared_user_subtree(l1, 1);
+            crate::mm::phys::free_page(PhysAddr::new(l1));
         }
-        // L0[1..511]: if any user tables exist at higher L0 indices, free them too.
+        // L0[1..511]: if any tables exist, free them too.
         for i in 1..512 {
             let entry = *l0.add(i);
             if entry & PT_VALID != 0 && entry & PT_TABLE != 0 {
-                let l1 = (entry & 0x0000_FFFF_FFFF_F000) as usize;
-                free_l1_user(l1);
-                crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l1));
+                let l1 = (entry & PA_MASK) as usize;
+                free_shared_user_subtree(l1, 1);
+                crate::mm::phys::free_page(PhysAddr::new(l1));
             }
         }
     }
     crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(root));
-}
-
-/// Free L2/L3 tables under an L1. Skip block descriptors (kernel entries).
-unsafe fn free_l1_user(l1: usize) {
-    let table = l1 as *const u64;
-    for i in 0..512 {
-        let entry = unsafe { *table.add(i) };
-        // Only recurse into table descriptors, not blocks.
-        if entry & PT_VALID != 0 && entry & PT_TABLE != 0 {
-            // Check if this is an L1 block (1 GiB) — block descriptors have bit 1 clear.
-            // Actually, for L1 entries, bit 1 == 1 means table, bit 1 == 0 means block.
-            let l2 = (entry & 0x0000_FFFF_FFFF_F000) as usize;
-            unsafe { free_l2_user(l2) };
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l2));
-        }
-    }
-}
-
-/// Free L3 tables under an L2. Skip block descriptors (2 MiB kernel entries).
-unsafe fn free_l2_user(l2: usize) {
-    let table = l2 as *const u64;
-    for i in 0..512 {
-        let entry = unsafe { *table.add(i) };
-        if entry & PT_VALID != 0 && entry & PT_TABLE != 0 {
-            let l3 = (entry & 0x0000_FFFF_FFFF_F000) as usize;
-            // L3 is a leaf table — just free it.
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l3));
-        }
-    }
 }
 
 /// Switch the user page table to a different L0 root.
