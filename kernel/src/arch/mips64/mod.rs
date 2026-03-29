@@ -19,9 +19,11 @@ pub fn parse_firmware() {
 }
 
 /// RAM range for the physical allocator.
+/// Returns KSEG0 virtual addresses so PA == VA throughout the kernel.
 pub fn ram_range() -> (usize, usize) {
-    // QEMU Malta: 256 MiB starting at 0x0
-    let start = 0x0;
+    // QEMU Malta: 256 MiB starting at PA 0x0.
+    // Map through KSEG0: VA = PA | 0xFFFF_FFFF_8000_0000.
+    let start: usize = 0xFFFF_FFFF_8000_0000;
     let end = start + 256 * 1024 * 1024;
     (start, end)
 }

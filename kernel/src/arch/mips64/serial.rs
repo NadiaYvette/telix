@@ -1,11 +1,12 @@
 //! MIPS64 UART (16550) serial output.
 //!
-//! QEMU Malta: UART at physical 0x1F000900.
-//! Accessed via KSEG1 unmapped uncached window at 0xFFFF_FFFF_BF00_0900.
+//! QEMU Malta: serial port at ISA I/O 0x3F8.
+//! GT-64120 maps PCI I/O base at physical 0x1800_0000.
+//! Accessed via KSEG1 uncached: 0xFFFF_FFFF_B800_03F8.
 
 use core::fmt;
 
-const UART_BASE: usize = 0xFFFF_FFFF_BF00_0900;
+const UART_BASE: usize = 0xFFFF_FFFF_B800_03F8;
 
 struct Uart16550;
 

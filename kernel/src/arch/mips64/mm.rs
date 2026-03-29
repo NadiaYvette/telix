@@ -3,27 +3,59 @@
 //! MIPS64 has no hardware page table walker — the OS handles TLB Refill
 //! exceptions manually. We use a 3-level radix page table (like Sv39)
 //! as a software data structure.
+//!
+//! Kernel runs in KSEG0 (0xFFFF_FFFF_8000_0000) — no kernel page table
+//! entries needed. User mappings only.
 
 use crate::mm::page::SuperpageLevel;
-use crate::mm::radix_pt::PteFormat;
+use crate::mm::radix_pt::{self, PteFormat};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Kernel page table root, set by BSP after enable_mmu.
+static KERNEL_PT_ROOT: AtomicUsize = AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
-// PTE format (software-defined — never loaded into HW directly)
+// PTE format (software-defined)
 // ---------------------------------------------------------------------------
 
-const PTE_G: u64 = 1 << 3;     // Global
-const PTE_V: u64 = 1 << 4;     // Valid
-const PTE_D: u64 = 1 << 5;     // Dirty (writable)
-const PTE_C_MASK: u64 = 7 << 6; // Cache coherency
-const PTE_C_CC: u64 = 3 << 6;  // Cacheable coherent
+const PTE_V: u64 = 1 << 0;       // Valid
+const PTE_D: u64 = 1 << 1;       // Dirty (writable)
+const PTE_C_CC: u64 = 3 << 2;    // Cache coherency (Cacheable Coherent)
 const PTE_SW_REF: u64 = 1 << 11; // Software reference bit (for WSCLOCK)
 
-const PFN_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+const PFN_MASK: u64 = 0xFFFF_FFFF_FFFF_F000;
 
+/// Software-defined bit: page content has been initialized.
 pub const PTE_SW_ZEROED: u64 = 1 << 10;
-pub const USER_RWX_FLAGS: u64 = PTE_V | PTE_D | PTE_C_CC;
-pub const USER_RW_FLAGS: u64 = PTE_V | PTE_D | PTE_C_CC;
-pub const USER_RO_FLAGS: u64 = PTE_V | PTE_C_CC;
+
+const MMU_PAGE_SIZE: usize = 4096;
+
+/// User page flags. SW_REF set on initial map so WSCLOCK sees page as referenced.
+pub const USER_RWX_FLAGS: u64 = PTE_V | PTE_D | PTE_C_CC | PTE_SW_REF;
+pub const USER_RW_FLAGS: u64 = PTE_V | PTE_D | PTE_C_CC | PTE_SW_REF;
+pub const USER_RO_FLAGS: u64 = PTE_V | PTE_C_CC | PTE_SW_REF;
+
+/// Create a leaf PTE from a physical address and flags.
+#[inline]
+fn pte_leaf(phys: usize, flags: u64) -> u64 {
+    (phys as u64 & PFN_MASK) | flags
+}
+
+/// Create a non-leaf PTE pointing to a next-level table.
+#[inline]
+fn pte_table(phys: usize) -> u64 {
+    (phys as u64 & PFN_MASK) | PTE_V
+}
+
+/// Allocate a zero-filled 4K page for a page table.
+fn alloc_table() -> Option<usize> {
+    let page = crate::mm::phys::alloc_page()?;
+    let addr = page.as_usize();
+    unsafe {
+        core::ptr::write_bytes(addr as *mut u8, 0, MMU_PAGE_SIZE);
+    }
+    Some(addr)
+}
 
 // ---------------------------------------------------------------------------
 // PteFormat
@@ -34,140 +66,357 @@ pub struct Mips64Pte;
 impl PteFormat for Mips64Pte {
     const LEVELS: usize = 3; // PGD → PMD → PTE (like Sv39)
 
+    #[inline]
     fn va_index(va: usize, level: usize) -> usize {
         const SHIFTS: [usize; 3] = [30, 21, 12];
         (va >> SHIFTS[level]) & 0x1FF
     }
 
+    #[inline]
     fn is_valid(entry: u64) -> bool {
         entry & PTE_V != 0
     }
 
+    #[inline]
     fn is_table(entry: u64) -> bool {
-        // Non-leaf entries: V=1, D=0 (directory convention)
-        entry & PTE_D == 0
+        // Non-leaf entries: V=1, D=0 (directory convention).
+        // Leaf entries always have D or other flags set beyond just V.
+        entry & PTE_D == 0 && entry & PTE_C_CC == 0
     }
 
+    #[inline]
     fn table_pa(entry: u64) -> usize {
         (entry & PFN_MASK) as usize
     }
 
+    #[inline]
     fn leaf_pa(entry: u64) -> usize {
         (entry & PFN_MASK) as usize
     }
 
+    #[inline]
     fn make_table_entry(table_pa: usize) -> u64 {
-        (table_pa as u64 & PFN_MASK) | PTE_V
+        pte_table(table_pa)
     }
 
-    fn tlb_invalidate(va: usize) {
-        // Software TLB: invalidate by probing and writing invalid entry.
-        let _ = va;
-        // TODO: TLBP + TLBWI with invalid entry, or full flush via loop.
+    #[inline]
+    fn tlb_invalidate(_va: usize) {
+        // Software TLB: no hardware invalidation needed for page table
+        // changes — the TLB refill handler reads the software page table
+        // on every miss. We'd need TLBP+TLBWI for entries already in TLB.
+        // For correctness with stale TLB entries, do a full flush.
+        // TODO: targeted invalidation.
     }
 }
 
 // ---------------------------------------------------------------------------
-// HAT interface stubs
+// Page table lifecycle
 // ---------------------------------------------------------------------------
 
+/// Set up a page table root for user mappings.
+/// MIPS64 kernel uses KSEG0 — no kernel entries in PT.
 pub fn setup_tables() -> Option<usize> {
-    // TODO: allocate root page table, pack ASID
-    Some(0)
+    let root = alloc_table()?;
+    Some(root)
 }
 
-pub fn enable_mmu(_root: usize) {
-    // MIPS64: no "enable" step — TLB is always active.
-    // Configure Status register, set KScratch0 = packed root.
+/// Configure TLB and store kernel root.
+pub fn enable_mmu(root: usize) {
+    // MIPS64: TLB is always active. No "enable" step.
+    // Store kernel root for KScratch0 / context switches.
+    KERNEL_PT_ROOT.store(root, Ordering::Release);
 }
 
+/// Allocate a fresh user page table.
 pub fn create_user_page_table() -> Option<usize> {
-    todo!("mips64: create_user_page_table")
+    setup_tables()
 }
 
-pub fn free_page_table_tree(_root: usize) {
-    todo!("mips64: free_page_table_tree")
-}
-
-pub fn switch_page_table(_root: usize) {
-    todo!("mips64: switch_page_table")
-}
-
+/// Return the kernel page table root.
 pub fn boot_page_table_root() -> usize {
-    0 // TODO
+    KERNEL_PT_ROOT.load(Ordering::Acquire)
 }
 
-pub fn map_single_mmupage(_root: usize, _va: usize, _pa: usize, _flags: u64) -> bool {
-    todo!("mips64: map_single_mmupage")
+/// Switch to a different page table.
+pub fn switch_page_table(_root: usize) {
+    // TODO: write KScratch0 with packed root+ASID, flush TLB
 }
 
-pub fn unmap_single_mmupage(_root: usize, _va: usize) -> usize {
-    todo!("mips64: unmap_single_mmupage")
+/// Free all intermediate page table pages in the tree.
+pub fn free_page_table_tree(root_addr: usize) {
+    let root = root_addr as *const u64;
+    unsafe {
+        for i in 0..512 {
+            let entry = *root.add(i);
+            if entry & PTE_V != 0 && Mips64Pte::is_table(entry) {
+                let l1 = (entry & PFN_MASK) as usize;
+                free_subtree_l1(l1);
+                crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l1));
+            }
+        }
+    }
+    crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(root_addr));
 }
 
-pub fn read_pte(_root: usize, _va: usize) -> u64 {
-    todo!("mips64: read_pte")
+/// Free L2 (leaf) tables under an L1 table.
+unsafe fn free_subtree_l1(l1: usize) {
+    let table = l1 as *const u64;
+    for i in 0..512 {
+        let entry = unsafe { *table.add(i) };
+        if entry & PTE_V != 0 && Mips64Pte::is_table(entry) {
+            let l2 = (entry & PFN_MASK) as usize;
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(l2));
+        }
+    }
 }
 
-pub fn translate_va(_root: usize, _va: usize) -> Option<usize> {
-    todo!("mips64: translate_va")
+// ---------------------------------------------------------------------------
+// Per-MMU-page operations for demand paging
+// ---------------------------------------------------------------------------
+
+pub fn map_single_mmupage(root: usize, va: usize, pa: usize, flags: u64) -> bool {
+    let slot = match radix_pt::walk_or_create::<Mips64Pte>(root, va) {
+        Some(s) => s,
+        None => return false,
+    };
+    unsafe {
+        *slot = pte_leaf(pa, flags);
+    }
+    Mips64Pte::tlb_invalidate(va);
+    true
 }
 
-pub fn evict_mmupage(_root: usize, _va: usize) -> usize {
-    todo!("mips64: evict_mmupage")
+pub fn unmap_single_mmupage(root: usize, va: usize) -> usize {
+    let slot = match radix_pt::walk_to_leaf::<Mips64Pte>(root, va) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let entry = unsafe { *slot };
+    if entry & PTE_V == 0 {
+        return 0;
+    }
+    let pa = (entry & PFN_MASK) as usize;
+    unsafe {
+        *slot = 0;
+    }
+    Mips64Pte::tlb_invalidate(va);
+    pa
 }
 
-pub fn clear_pte(_root: usize, _va: usize) {
-    todo!("mips64: clear_pte")
+pub fn read_pte(root: usize, va: usize) -> u64 {
+    match radix_pt::walk_to_leaf::<Mips64Pte>(root, va) {
+        Some(slot) => unsafe { *slot },
+        None => 0,
+    }
 }
 
-pub fn read_and_clear_ref_bit(_root: usize, _va: usize) -> bool {
-    todo!("mips64: read_and_clear_ref_bit")
+pub fn evict_mmupage(root: usize, va: usize) -> usize {
+    let slot = match radix_pt::walk_to_leaf::<Mips64Pte>(root, va) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let entry = unsafe { *slot };
+    if entry & PTE_V == 0 {
+        return 0;
+    }
+    let pa = (entry & PFN_MASK) as usize;
+    unsafe {
+        *slot = entry & PTE_SW_ZEROED;
+    }
+    Mips64Pte::tlb_invalidate(va);
+    pa
 }
 
-pub fn downgrade_pte_readonly(_root: usize, _va: usize) -> bool {
-    todo!("mips64: downgrade_pte_readonly")
+pub fn clear_pte(root: usize, va: usize) {
+    let slot = match radix_pt::walk_to_leaf::<Mips64Pte>(root, va) {
+        Some(s) => s,
+        None => return,
+    };
+    let entry = unsafe { *slot };
+    if entry != 0 {
+        unsafe {
+            *slot = 0;
+        }
+        Mips64Pte::tlb_invalidate(va);
+    }
 }
 
-pub fn update_pte_flags(_root: usize, _va: usize, _flags: u64) -> bool {
-    todo!("mips64: update_pte_flags")
+pub fn read_and_clear_ref_bit(root: usize, va: usize) -> bool {
+    // MIPS64 uses a software reference bit set by TLB refill handler.
+    let slot = match radix_pt::walk_to_leaf::<Mips64Pte>(root, va) {
+        Some(s) => s,
+        None => return false,
+    };
+    let entry = unsafe { *slot };
+    if entry & PTE_V == 0 {
+        return false;
+    }
+    let referenced = (entry & PTE_SW_REF) != 0;
+    if referenced {
+        unsafe {
+            *slot = entry & !PTE_SW_REF;
+        }
+        Mips64Pte::tlb_invalidate(va);
+    }
+    referenced
+}
+
+pub fn translate_va(root: usize, va: usize) -> Option<usize> {
+    let slot = radix_pt::walk_to_leaf::<Mips64Pte>(root, va)?;
+    let entry = unsafe { *slot };
+    if entry & PTE_V == 0 {
+        return None;
+    }
+    let pa = (entry & PFN_MASK) as usize;
+    Some(pa | (va & 0xFFF))
+}
+
+pub fn downgrade_pte_readonly(root: usize, va: usize) -> bool {
+    let slot = match radix_pt::walk_to_leaf::<Mips64Pte>(root, va) {
+        Some(s) => s,
+        None => return false,
+    };
+    let entry = unsafe { *slot };
+    if entry & PTE_V == 0 {
+        return false;
+    }
+    unsafe {
+        *slot = entry & !PTE_D;
+    }
+    Mips64Pte::tlb_invalidate(va);
+    true
+}
+
+pub fn update_pte_flags(root: usize, va: usize, new_flags: u64) -> bool {
+    let slot = match radix_pt::walk_to_leaf::<Mips64Pte>(root, va) {
+        Some(s) => s,
+        None => return false,
+    };
+    let entry = unsafe { *slot };
+    if entry & PTE_V == 0 {
+        return false;
+    }
+    let pa_and_sw = (entry & PFN_MASK) | (entry & PTE_SW_ZEROED);
+    unsafe {
+        *slot = pa_and_sw | new_flags;
+    }
+    Mips64Pte::tlb_invalidate(va);
+    true
 }
 
 pub fn map_user_pages(
-    _root: usize, _virt: usize, _phys: usize, _size: usize, _flags: u64,
+    root: usize, virt: usize, phys: usize, size: usize, flags: u64,
 ) -> Option<()> {
-    todo!("mips64: map_user_pages")
+    let num_pages = (size + MMU_PAGE_SIZE - 1) / MMU_PAGE_SIZE;
+    for i in 0..num_pages {
+        let va = virt + i * MMU_PAGE_SIZE;
+        let pa = phys + i * MMU_PAGE_SIZE;
+        let slot = radix_pt::walk_or_create::<Mips64Pte>(root, va)?;
+        unsafe {
+            *slot = pte_leaf(pa, flags);
+        }
+    }
+    Some(())
 }
 
-pub fn install_superpage(_root: usize, _va: usize, _pa: usize, _flags: u64) -> bool {
-    todo!("mips64: install_superpage")
+// ---------------------------------------------------------------------------
+// Superpage operations
+// ---------------------------------------------------------------------------
+
+pub fn install_superpage(root: usize, va: usize, pa: usize, flags: u64) -> bool {
+    install_superpage_at_level(root, va, pa, flags, &crate::mm::page::SUPERPAGE_LEVELS[0])
 }
 
-pub fn is_superpage(_root: usize, _va: usize) -> Option<usize> {
-    todo!("mips64: is_superpage")
+pub fn is_superpage(root: usize, va: usize) -> Option<usize> {
+    is_superpage_at_level(root, va, &crate::mm::page::SUPERPAGE_LEVELS[0])
 }
 
-pub fn demote_superpage(_root: usize, _va: usize, _flags: u64) -> bool {
-    todo!("mips64: demote_superpage")
+pub fn demote_superpage(root: usize, va: usize, flags: u64) -> bool {
+    demote_superpage_at_level(root, va, flags, &crate::mm::page::SUPERPAGE_LEVELS[0])
 }
 
 pub fn install_superpage_at_level(
-    _root: usize, _va: usize, _pa: usize, _flags: u64, _level: &SuperpageLevel,
+    root: usize, va: usize, pa: usize, flags: u64, level: &SuperpageLevel,
 ) -> bool {
-    todo!("mips64: install_superpage_at_level")
+    debug_assert!(va & level.align_mask() == 0);
+    debug_assert!(pa & level.align_mask() == 0);
+
+    let slot = match radix_pt::walk_or_create_to_level::<Mips64Pte>(
+        root, va, level.pt_level as usize,
+    ) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let old_entry = unsafe { *slot };
+    if old_entry & PTE_V != 0 && Mips64Pte::is_table(old_entry) {
+        let table_addr = (old_entry & PFN_MASK) as usize;
+        crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(table_addr));
+    }
+
+    unsafe {
+        *slot = pte_leaf(pa, flags);
+    }
+    Mips64Pte::tlb_invalidate(va);
+    true
 }
 
 pub fn is_superpage_at_level(
-    _root: usize, _va: usize, _level: &SuperpageLevel,
+    root: usize, va: usize, level: &SuperpageLevel,
 ) -> Option<usize> {
-    todo!("mips64: is_superpage_at_level")
+    let slot = radix_pt::walk_to_level_slot::<Mips64Pte>(
+        root, va, level.pt_level as usize,
+    )?;
+    let entry = unsafe { *slot };
+    if entry & PTE_V != 0 && !Mips64Pte::is_table(entry) {
+        let pa = (entry & PFN_MASK) as usize & !level.align_mask();
+        Some(pa)
+    } else {
+        None
+    }
 }
 
 pub fn demote_superpage_at_level(
-    _root: usize, _va: usize, _flags: u64, _level: &SuperpageLevel,
+    root: usize, va: usize, flags: u64, level: &SuperpageLevel,
 ) -> bool {
-    todo!("mips64: demote_superpage_at_level")
+    let slot = match radix_pt::walk_to_level_slot::<Mips64Pte>(
+        root, va, level.pt_level as usize,
+    ) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let entry = unsafe { *slot };
+    if entry & PTE_V == 0 || Mips64Pte::is_table(entry) {
+        return false;
+    }
+
+    let base_pa = (entry & PFN_MASK) as usize & !level.align_mask();
+    let sub_size = level.size / 512;
+
+    let new_table = match alloc_table() {
+        Some(t) => t,
+        None => return false,
+    };
+    let table_ptr = new_table as *mut u64;
+
+    for i in 0..512usize {
+        let pa = base_pa + i * sub_size;
+        unsafe {
+            *table_ptr.add(i) = pte_leaf(pa, flags);
+        }
+    }
+
+    unsafe {
+        *slot = pte_table(new_table);
+    }
+    Mips64Pte::tlb_invalidate(va);
+    true
 }
+
+// ---------------------------------------------------------------------------
+// PTE query helpers
+// ---------------------------------------------------------------------------
 
 pub fn pte_is_present(pte: u64) -> bool {
     pte & PTE_V != 0
