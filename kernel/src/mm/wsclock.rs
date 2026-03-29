@@ -10,7 +10,7 @@ use super::aspace::{self, ASpaceId};
 use super::cowgroup;
 use super::fault;
 use super::object;
-use super::page::{MMUPAGE_SIZE, SUPERPAGE_ALLOC_PAGES};
+use super::page::{MMUPAGE_SIZE, SUPERPAGE_ALLOC_PAGES, SUPERPAGE_LEVELS};
 use super::stats;
 use core::sync::atomic::Ordering;
 
@@ -63,12 +63,23 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
                     result.pages_scanned += 1;
                     scanned += 1;
 
-                    // If this VA is part of a superpage, demote it first.
-                    let super_va = va & !super::page::SUPERPAGE_ALIGN_MASK;
-                    if fault::is_superpage_mapped(pt_root, super_va).is_some() {
-                        let flags = fault::pte_flags_for_vma_pub(vma);
-                        fault::demote_superpage(pt_root, super_va, flags);
-                        stats::SUPERPAGE_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
+                    // Graduated demotion: if this VA is part of a superpage
+                    // at any level, demote one level at a time (highest first)
+                    // to preserve as much TLB benefit as possible.
+                    let flags = fault::pte_flags_for_vma_pub(vma);
+                    for level_idx in (0..SUPERPAGE_LEVELS.len()).rev() {
+                        let level = &SUPERPAGE_LEVELS[level_idx];
+                        let aligned_va = level.align_down(va);
+                        if super::hat::is_superpage_at_level(
+                            pt_root, aligned_va, level,
+                        )
+                        .is_some()
+                        {
+                            super::hat::demote_superpage_at_level(
+                                pt_root, aligned_va, flags, level,
+                            );
+                            stats::SUPERPAGE_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
 
                     let referenced = read_and_clear_ref_bit(pt_root, va);

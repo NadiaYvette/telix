@@ -333,6 +333,7 @@ fn try_superpage_promotion(pt_root: usize, vma: &mut super::vma::Vma, obj_id: u6
 
         if install_superpage(pt_root, super_va, base_pa, flags) {
             stats::SUPERPAGE_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
+            try_higher_level_promotions(pt_root, vma, super_va);
         }
         return;
     }
@@ -369,6 +370,67 @@ fn try_superpage_promotion(pt_root: usize, vma: &mut super::vma::Vma, obj_id: u6
     let flags = pte_flags_for_vma(vma) | sw_zeroed_bit();
     if install_superpage(pt_root, super_va, new_block.as_usize(), flags) {
         stats::SUPERPAGE_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
+        // After successful level-0 promotion, try coalescing into higher levels.
+        try_higher_level_promotions(pt_root, vma, super_va);
+    }
+}
+
+/// After a successful superpage promotion at level `SUPERPAGE_LEVELS[start]`,
+/// check whether the surrounding region at each higher level is now fully
+/// covered by contiguous superpages and can be coalesced.
+fn try_higher_level_promotions(
+    pt_root: usize,
+    vma: &super::vma::Vma,
+    super_va: usize,
+) {
+    use super::page::SUPERPAGE_LEVELS;
+
+    for level_idx in 1..SUPERPAGE_LEVELS.len() {
+        let level = &SUPERPAGE_LEVELS[level_idx];
+        let prev_level = &SUPERPAGE_LEVELS[level_idx - 1];
+
+        let aligned_va = level.align_down(super_va);
+        let vma_end = vma.va_start + vma.va_len;
+
+        // VMA must fully contain this level's range.
+        if aligned_va < vma.va_start || aligned_va + level.size > vma_end {
+            return;
+        }
+
+        // Check all sub-level superpages are present and physically contiguous.
+        let sub_count = level.size / prev_level.size;
+        let first_pa = match hat::is_superpage_at_level(
+            pt_root,
+            aligned_va,
+            prev_level,
+        ) {
+            Some(pa) if pa & level.align_mask() == 0 => pa,
+            _ => return,
+        };
+
+        let mut contiguous = true;
+        for i in 1..sub_count {
+            let sub_va = aligned_va + i * prev_level.size;
+            match hat::is_superpage_at_level(pt_root, sub_va, prev_level) {
+                Some(pa) if pa == first_pa + i * prev_level.size => {}
+                _ => {
+                    contiguous = false;
+                    break;
+                }
+            }
+        }
+        if !contiguous {
+            return;
+        }
+
+        // All sub-superpages present and contiguous — promote.
+        let flags = pte_flags_for_vma(vma) | sw_zeroed_bit();
+        if hat::install_superpage_at_level(pt_root, aligned_va, first_pa, flags, level) {
+            stats::SUPERPAGE_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
+            // Continue to check even higher levels.
+        } else {
+            return;
+        }
     }
 }
 

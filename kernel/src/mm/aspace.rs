@@ -855,67 +855,46 @@ pub fn mremap(id: ASpaceId, old_addr: usize, old_len: usize, new_len: usize) -> 
 // Helpers — superpage demotion
 // ---------------------------------------------------------------------------
 
+/// Demote all superpages overlapping a VA range, highest level first (graduated).
+fn demote_superpages_in_va_range(pt_root: usize, va_start: usize, va_end: usize, flags: u64) {
+    use super::page::SUPERPAGE_LEVELS;
+
+    // Graduated: demote from largest to smallest so 1G → 512×2M → 4K.
+    for level in SUPERPAGE_LEVELS.iter().rev() {
+        let mut va = level.align_down(va_start);
+        while va < va_end {
+            if super::hat::is_superpage_at_level(pt_root, va, level).is_some() {
+                super::hat::demote_superpage_at_level(pt_root, va, flags, level);
+                super::stats::SUPERPAGE_DEMOTIONS
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            va += level.size;
+        }
+    }
+}
+
 /// Demote all superpages covering a VMA's range.
 fn demote_superpages_for_vma(pt_root: usize, vma: &Vma) {
-    use super::page::{MMUPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_MMU_PAGES, SUPERPAGE_SIZE};
-    let mmu_count = vma.mmu_page_count();
     let flags = super::fault::pte_flags_for_vma_pub(vma);
-    let mut m = 0;
-    while m < mmu_count {
-        let mmu_va = vma.va_start + m * MMUPAGE_SIZE;
-        let super_va = mmu_va & !SUPERPAGE_ALIGN_MASK;
-        if super::fault::is_superpage_mapped(pt_root, super_va).is_some() {
-            super::fault::demote_superpage(pt_root, super_va, flags);
-        }
-        let next = ((super_va + SUPERPAGE_SIZE) - vma.va_start) / MMUPAGE_SIZE;
-        m = if next > m {
-            next
-        } else {
-            m + SUPERPAGE_MMU_PAGES
-        };
-    }
+    let va_end = vma.va_start + vma.va_len;
+    demote_superpages_in_va_range(pt_root, vma.va_start, va_end, flags);
 }
 
 /// Demote superpages in a sub-range of a VMA (for mremap shrink).
 fn demote_superpages_for_vma_range(pt_root: usize, vma: &Vma, start_mmu: usize, end_mmu: usize) {
-    use super::page::{MMUPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_MMU_PAGES, SUPERPAGE_SIZE};
+    use super::page::MMUPAGE_SIZE;
     let flags = super::fault::pte_flags_for_vma_pub(vma);
-    let va_start = vma.va_start;
-    let mut m = start_mmu;
-    while m < end_mmu {
-        let mmu_va = va_start + m * MMUPAGE_SIZE;
-        let super_va = mmu_va & !SUPERPAGE_ALIGN_MASK;
-        if super::fault::is_superpage_mapped(pt_root, super_va).is_some() {
-            super::fault::demote_superpage(pt_root, super_va, flags);
-        }
-        let next = ((super_va + SUPERPAGE_SIZE) - va_start) / MMUPAGE_SIZE;
-        m = if next > m {
-            next
-        } else {
-            m + SUPERPAGE_MMU_PAGES
-        };
-    }
+    let va_start = vma.va_start + start_mmu * MMUPAGE_SIZE;
+    let va_end = vma.va_start + end_mmu * MMUPAGE_SIZE;
+    demote_superpages_in_va_range(pt_root, va_start, va_end, flags);
 }
 
 /// Demote superpages in a range given by (va_start, mmu_count, prot).
 fn demote_superpages_in_range(pt_root: usize, va_start: usize, mmu_count: usize, prot: VmaProt) {
-    use super::page::{MMUPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_MMU_PAGES, SUPERPAGE_SIZE};
+    use super::page::MMUPAGE_SIZE;
     let flags = rw_flags_for_prot(prot);
-    let mut m = 0;
-    while m < mmu_count {
-        let va = va_start + m * MMUPAGE_SIZE;
-        let super_va = va & !SUPERPAGE_ALIGN_MASK;
-        if super::fault::is_superpage_mapped(pt_root, super_va).is_some() {
-            super::fault::demote_superpage(pt_root, super_va, flags);
-            super::stats::SUPERPAGE_DEMOTIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
-        let next_super = ((super_va + SUPERPAGE_SIZE) - va_start) / MMUPAGE_SIZE;
-        m = if next_super > m {
-            next_super
-        } else {
-            m + SUPERPAGE_MMU_PAGES
-        };
-    }
+    let va_end = va_start + mmu_count * MMUPAGE_SIZE;
+    demote_superpages_in_va_range(pt_root, va_start, va_end, flags);
 }
 
 // ---------------------------------------------------------------------------
