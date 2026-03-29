@@ -1,1 +1,4 @@
 target/
+initramfs/
+kernel/src/io/initramfs.cpio
+*.pdf
