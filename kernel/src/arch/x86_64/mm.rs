@@ -158,13 +158,13 @@ impl crate::mm::radix_pt::PteFormat for X86Pte {
 
 /// Ensure the walk path for `va` contains no shared markers (COW-break).
 #[inline]
-pub fn ensure_path_unshared(root: usize, va: usize) -> bool {
-    radix_pt::ensure_path_unshared::<X86Pte>(root, va)
+pub fn ensure_path_unshared(root: usize, va: usize, fg: *mut crate::mm::ptshare::ForkGroup) -> bool {
+    radix_pt::ensure_path_unshared::<X86Pte>(root, va, fg)
 }
 
 /// Recursively free a page table subtree, handling shared markers.
-pub fn free_shared_user_subtree(table_pa: usize, level: usize) {
-    radix_pt::free_shared_subtree::<X86Pte>(table_pa, level);
+pub fn free_shared_user_subtree(table_pa: usize, level: usize, fg: *mut crate::mm::ptshare::ForkGroup) {
+    radix_pt::free_shared_subtree::<X86Pte>(table_pa, level, fg);
 }
 
 /// Share page table entries between parent and child at fork time.
@@ -172,8 +172,8 @@ pub fn free_shared_user_subtree(table_pa: usize, level: usize) {
 /// On x86-64:
 /// - PML4[0] → PDPT: entries 0-3 are kernel gigapages (skip), 4+ are user (share).
 /// - PML4[1..512]: share entire entries (all user).
-pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
-    use crate::mm::ptshare;
+pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate::mm::ptshare::ForkGroup) {
+    use crate::mm::ptshare::ForkGroup;
 
     let parent_pml4 = parent_root as *mut u64;
     let child_pml4 = child_root as *mut u64;
@@ -192,7 +192,7 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
             let entry = unsafe { *parent_pdpt.add(i) };
             if X86Pte::is_valid(entry) && X86Pte::is_table(entry) {
                 let sub_pa = X86Pte::table_pa(entry);
-                ptshare::share(sub_pa);
+                ForkGroup::share(fg, sub_pa);
                 let shared = X86Pte::make_shared_entry(sub_pa);
                 unsafe {
                     *parent_pdpt.add(i) = shared;
@@ -207,7 +207,7 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
         let entry = unsafe { *parent_pml4.add(i) };
         if X86Pte::is_valid(entry) && X86Pte::is_table(entry) {
             let sub_pa = X86Pte::table_pa(entry);
-            ptshare::share(sub_pa);
+            ForkGroup::share(fg, sub_pa);
             let shared = X86Pte::make_shared_entry(sub_pa);
             unsafe {
                 *parent_pml4.add(i) = shared;
@@ -394,8 +394,8 @@ pub fn boot_page_table_root() -> usize {
 /// Free all intermediate page table pages for a user page table.
 /// Does NOT free leaf physical pages (those are freed by aspace::destroy).
 /// Skips kernel-range entries (PML4[1..3] point to shared boot tables).
-pub fn free_page_table_tree(root: usize) {
-    use crate::mm::{ptshare, page::PhysAddr};
+pub fn free_page_table_tree(root: usize, fg: *mut crate::mm::ptshare::ForkGroup) {
+    use crate::mm::{ptshare::ForkGroup, page::PhysAddr};
 
     let pml4 = root as *const u64;
     unsafe {
@@ -404,7 +404,7 @@ pub fn free_page_table_tree(root: usize) {
         let entry0 = *pml4.add(0);
         if entry0 & PTE_P != 0 && entry0 & PTE_PS == 0 {
             let pdpt = (entry0 & 0x000F_FFFF_FFFF_F000) as usize;
-            free_shared_user_subtree(pdpt, 1);
+            free_shared_user_subtree(pdpt, 1, fg);
             crate::mm::phys::free_page(PhysAddr::new(pdpt));
         }
         // PML4[1..3] are shared with boot — do NOT free.
@@ -413,14 +413,14 @@ pub fn free_page_table_tree(root: usize) {
             let entry = *pml4.add(i);
             if X86Pte::is_shared_entry(entry) {
                 let sub_pa = X86Pte::shared_entry_pa(entry);
-                let rc = ptshare::unshare(sub_pa);
+                let rc = ForkGroup::unshare(fg, sub_pa);
                 if rc == 0 {
-                    free_shared_user_subtree(sub_pa, 1);
+                    free_shared_user_subtree(sub_pa, 1, fg);
                     crate::mm::phys::free_page(PhysAddr::new(sub_pa));
                 }
             } else if entry & PTE_P != 0 && entry & PTE_PS == 0 {
                 let pdpt = (entry & 0x000F_FFFF_FFFF_F000) as usize;
-                free_shared_user_subtree(pdpt, 1);
+                free_shared_user_subtree(pdpt, 1, fg);
                 crate::mm::phys::free_page(PhysAddr::new(pdpt));
             }
         }

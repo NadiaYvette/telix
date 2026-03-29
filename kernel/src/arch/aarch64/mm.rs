@@ -198,21 +198,21 @@ impl crate::mm::radix_pt::PteFormat for Aarch64Pte {
 
 /// Ensure the walk path for `va` contains no shared markers (COW-break).
 #[inline]
-pub fn ensure_path_unshared(root: usize, va: usize) -> bool {
-    radix_pt::ensure_path_unshared::<Aarch64Pte>(root, va)
+pub fn ensure_path_unshared(root: usize, va: usize, fg: *mut crate::mm::ptshare::ForkGroup) -> bool {
+    radix_pt::ensure_path_unshared::<Aarch64Pte>(root, va, fg)
 }
 
 /// Recursively free a page table subtree, handling shared markers.
-pub fn free_shared_user_subtree(table_pa: usize, level: usize) {
-    radix_pt::free_shared_subtree::<Aarch64Pte>(table_pa, level);
+pub fn free_shared_user_subtree(table_pa: usize, level: usize, fg: *mut crate::mm::ptshare::ForkGroup) {
+    radix_pt::free_shared_subtree::<Aarch64Pte>(table_pa, level, fg);
 }
 
 /// Share page table entries between parent and child at fork time.
 ///
 /// On AArch64: L0[0] → L1 table has kernel/device blocks at L1[0-1]
 /// and user table entries at L1[2+]. Share L1[2+].
-pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
-    use crate::mm::ptshare;
+pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate::mm::ptshare::ForkGroup) {
+    use crate::mm::ptshare::ForkGroup;
 
     let parent_l0_0 = unsafe { *(parent_root as *const u64) };
     let child_l0_0 = unsafe { *(child_root as *const u64) };
@@ -233,7 +233,7 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
         let entry = unsafe { *parent_l1.add(i) };
         if Aarch64Pte::is_valid(entry) && Aarch64Pte::is_table(entry) {
             let sub_pa = Aarch64Pte::table_pa(entry);
-            ptshare::share(sub_pa);
+            ForkGroup::share(fg, sub_pa);
             let shared = Aarch64Pte::make_shared_entry(sub_pa);
             unsafe {
                 *parent_l1.add(i) = shared;
@@ -717,7 +717,7 @@ pub fn boot_page_table_root() -> usize {
 /// The L0 has one entry (L0[0]) pointing to an L1 that contains kernel
 /// block entries (L1[0], L1[1]) and user table entries (L1[2+]).
 /// We only recurse into user table entries.
-pub fn free_page_table_tree(root: usize) {
+pub fn free_page_table_tree(root: usize, fg: *mut crate::mm::ptshare::ForkGroup) {
     use crate::mm::page::PhysAddr;
 
     let l0 = root as *const u64;
@@ -727,7 +727,7 @@ pub fn free_page_table_tree(root: usize) {
         let entry0 = *l0.add(0);
         if entry0 & PT_VALID != 0 && entry0 & PT_TABLE != 0 {
             let l1 = (entry0 & PA_MASK) as usize;
-            free_shared_user_subtree(l1, 1);
+            free_shared_user_subtree(l1, 1, fg);
             crate::mm::phys::free_page(PhysAddr::new(l1));
         }
         // L0[1..511]: if any tables exist, free them too.
@@ -735,7 +735,7 @@ pub fn free_page_table_tree(root: usize) {
             let entry = *l0.add(i);
             if entry & PT_VALID != 0 && entry & PT_TABLE != 0 {
                 let l1 = (entry & PA_MASK) as usize;
-                free_shared_user_subtree(l1, 1);
+                free_shared_user_subtree(l1, 1, fg);
                 crate::mm::phys::free_page(PhysAddr::new(l1));
             }
         }

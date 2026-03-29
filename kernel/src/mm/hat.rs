@@ -7,6 +7,7 @@
 //! All functions compile down to direct calls into the single active
 //! arch backend — no trait objects, no runtime dispatch.
 
+use super::ptshare::ForkGroup;
 use super::vma::{Vma, VmaProt};
 use crate::arch::platform::mm as arch_mm;
 
@@ -30,23 +31,26 @@ pub fn create_user_page_table() -> Option<usize> {
 }
 
 /// Recursively free all page table pages in the tree rooted at `root`.
+/// `fg` is the ForkGroup for shared PT tracking (may be null).
 #[inline]
-pub fn free_page_table_tree(root: usize) {
-    arch_mm::free_page_table_tree(root);
+pub fn free_page_table_tree(root: usize, fg: *mut ForkGroup) {
+    arch_mm::free_page_table_tree(root, fg);
 }
 
 /// Ensure the walk path for `va` contains no shared page table markers.
 /// COW-breaks shared nodes top-down. Returns `false` only on OOM.
+/// `fg` is the ForkGroup owning the shared PT refcounts (may be null).
 #[inline]
-pub fn ensure_path_unshared(root: usize, va: usize) -> bool {
-    arch_mm::ensure_path_unshared(root, va)
+pub fn ensure_path_unshared(root: usize, va: usize, fg: *mut ForkGroup) -> bool {
+    arch_mm::ensure_path_unshared(root, va, fg)
 }
 
 /// Share page table entries between parent and child at fork time.
 /// Converts shared entries to not-present markers in both roots.
+/// `fg` is the ForkGroup that will track the shared PT refcounts.
 #[inline]
-pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
-    arch_mm::clone_shared_tables(parent_root, child_root);
+pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut ForkGroup) {
+    arch_mm::clone_shared_tables(parent_root, child_root, fg);
 }
 
 /// Switch to a different page table (write CR3 / TTBR0 / satp).

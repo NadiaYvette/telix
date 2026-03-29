@@ -2588,14 +2588,9 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
             }
         }
 
-        // Destroy address space (frees VMAs and backing physical pages).
+        // Destroy address space (frees VMAs, backing pages, and PT tree).
         if aspace_id != 0 {
             crate::mm::aspace::destroy(aspace_id);
-        }
-
-        // Free page table intermediate pages.
-        if pt_root != 0 {
-            crate::mm::hat::free_page_table_tree(pt_root);
         }
     }
 

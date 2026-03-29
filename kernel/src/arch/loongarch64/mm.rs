@@ -141,21 +141,21 @@ impl PteFormat for LoongArchPte {
 
 /// Ensure the walk path for `va` contains no shared markers (COW-break).
 #[inline]
-pub fn ensure_path_unshared(root: usize, va: usize) -> bool {
-    radix_pt::ensure_path_unshared::<LoongArchPte>(root, va)
+pub fn ensure_path_unshared(root: usize, va: usize, fg: *mut crate::mm::ptshare::ForkGroup) -> bool {
+    radix_pt::ensure_path_unshared::<LoongArchPte>(root, va, fg)
 }
 
 /// Recursively free a page table subtree, handling shared markers.
-pub fn free_shared_user_subtree(table_pa: usize, level: usize) {
-    radix_pt::free_shared_subtree::<LoongArchPte>(table_pa, level);
+pub fn free_shared_user_subtree(table_pa: usize, level: usize, fg: *mut crate::mm::ptshare::ForkGroup) {
+    radix_pt::free_shared_subtree::<LoongArchPte>(table_pa, level, fg);
 }
 
 /// Share page table entries between parent and child at fork time.
 ///
 /// On LoongArch64: kernel uses DMW, no kernel entries in user PT.
 /// Share all valid table entries at root level.
-pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
-    use crate::mm::ptshare;
+pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate::mm::ptshare::ForkGroup) {
+    use crate::mm::ptshare::ForkGroup;
 
     let parent = parent_root as *mut u64;
     let child = child_root as *mut u64;
@@ -164,7 +164,7 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
         let entry = unsafe { *parent.add(i) };
         if LoongArchPte::is_valid(entry) && LoongArchPte::is_table(entry) {
             let sub_pa = LoongArchPte::table_pa(entry);
-            ptshare::share(sub_pa);
+            ForkGroup::share(fg, sub_pa);
             let shared = LoongArchPte::make_shared_entry(sub_pa);
             unsafe {
                 *parent.add(i) = shared;
@@ -210,8 +210,8 @@ pub fn switch_page_table(_root: usize) {
 }
 
 /// Free all intermediate page table pages in the tree rooted at `root`.
-pub fn free_page_table_tree(root_addr: usize) {
-    use crate::mm::{ptshare, page::PhysAddr};
+pub fn free_page_table_tree(root_addr: usize, fg: *mut crate::mm::ptshare::ForkGroup) {
+    use crate::mm::{ptshare::ForkGroup, page::PhysAddr};
 
     let root = root_addr as *const u64;
     unsafe {
@@ -219,14 +219,14 @@ pub fn free_page_table_tree(root_addr: usize) {
             let entry = *root.add(i);
             if LoongArchPte::is_shared_entry(entry) {
                 let sub_pa = LoongArchPte::shared_entry_pa(entry);
-                let rc = ptshare::unshare(sub_pa);
+                let rc = ForkGroup::unshare(fg, sub_pa);
                 if rc == 0 {
-                    free_shared_user_subtree(sub_pa, 1);
+                    free_shared_user_subtree(sub_pa, 1, fg);
                     crate::mm::phys::free_page(PhysAddr::new(sub_pa));
                 }
             } else if LoongArchPte::is_valid(entry) && LoongArchPte::is_table(entry) {
                 let l1 = LoongArchPte::table_pa(entry);
-                free_shared_user_subtree(l1, 1);
+                free_shared_user_subtree(l1, 1, fg);
                 crate::mm::phys::free_page(PhysAddr::new(l1));
             }
         }

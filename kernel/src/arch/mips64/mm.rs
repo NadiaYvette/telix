@@ -8,6 +8,7 @@
 //! entries needed. User mappings only.
 
 use crate::mm::page::SuperpageLevel;
+use crate::mm::ptshare::ForkGroup;
 use crate::mm::radix_pt::{self, PteFormat};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -138,22 +139,20 @@ impl PteFormat for Mips64Pte {
 
 /// Ensure the walk path for `va` contains no shared markers (COW-break).
 #[inline]
-pub fn ensure_path_unshared(root: usize, va: usize) -> bool {
-    radix_pt::ensure_path_unshared::<Mips64Pte>(root, va)
+pub fn ensure_path_unshared(root: usize, va: usize, fg: *mut ForkGroup) -> bool {
+    radix_pt::ensure_path_unshared::<Mips64Pte>(root, va, fg)
 }
 
 /// Recursively free a page table subtree, handling shared markers.
-pub fn free_shared_user_subtree(table_pa: usize, level: usize) {
-    radix_pt::free_shared_subtree::<Mips64Pte>(table_pa, level);
+pub fn free_shared_user_subtree(table_pa: usize, level: usize, fg: *mut ForkGroup) {
+    radix_pt::free_shared_subtree::<Mips64Pte>(table_pa, level, fg);
 }
 
 /// Share page table entries between parent and child at fork time.
 ///
 /// On MIPS64: kernel uses KSEG0, no kernel entries in user PT.
 /// Share all valid table entries at root level.
-pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
-    use crate::mm::ptshare;
-
+pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut ForkGroup) {
     let parent = parent_root as *mut u64;
     let child = child_root as *mut u64;
 
@@ -161,7 +160,7 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize) {
         let entry = unsafe { *parent.add(i) };
         if Mips64Pte::is_valid(entry) && Mips64Pte::is_table(entry) {
             let sub_pa = Mips64Pte::table_pa(entry);
-            ptshare::share(sub_pa);
+            unsafe { ForkGroup::share(fg, sub_pa); }
             let shared = Mips64Pte::make_shared_entry(sub_pa);
             unsafe {
                 *parent.add(i) = shared;
@@ -205,8 +204,8 @@ pub fn switch_page_table(_root: usize) {
 }
 
 /// Free all intermediate page table pages in the tree.
-pub fn free_page_table_tree(root_addr: usize) {
-    use crate::mm::{ptshare, page::PhysAddr};
+pub fn free_page_table_tree(root_addr: usize, fg: *mut ForkGroup) {
+    use crate::mm::page::PhysAddr;
 
     let root = root_addr as *const u64;
     unsafe {
@@ -214,14 +213,14 @@ pub fn free_page_table_tree(root_addr: usize) {
             let entry = *root.add(i);
             if Mips64Pte::is_shared_entry(entry) {
                 let sub_pa = Mips64Pte::shared_entry_pa(entry);
-                let rc = ptshare::unshare(sub_pa);
+                let rc = ForkGroup::unshare(fg, sub_pa);
                 if rc == 0 {
-                    free_shared_user_subtree(sub_pa, 1);
+                    free_shared_user_subtree(sub_pa, 1, fg);
                     crate::mm::phys::free_page(PhysAddr::new(sub_pa));
                 }
             } else if Mips64Pte::is_valid(entry) && Mips64Pte::is_table(entry) {
                 let l1 = Mips64Pte::table_pa(entry);
-                free_shared_user_subtree(l1, 1);
+                free_shared_user_subtree(l1, 1, fg);
                 crate::mm::phys::free_page(PhysAddr::new(l1));
             }
         }

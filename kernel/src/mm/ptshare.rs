@@ -1,16 +1,16 @@
-//! Shared page table tracking — slab-allocated hash table.
+//! Shared page table tracking — per-ForkGroup hash tables.
 //!
 //! When page table nodes are shared between address spaces (via COW fork),
-//! this module tracks refcounts so we know when a shared table page can be
-//! freed. Only PT pages with refcount ≥ 2 have entries.
+//! refcounts are tracked per-ForkGroup (not globally). Each ForkGroup owns
+//! a slab-allocated PtShareTable mapping PT page PA → refcount.
 //!
-//! The hash table is lazily allocated on first use (first fork) and grows
-//! by doubling when load factor exceeds 75%.
+//! ForkGroup is reference-counted: created at first fork, shared by all
+//! members of the fork family, freed when the last member exits.
 
 use crate::sync::SpinLock;
 use super::page::{PAGE_SIZE, PhysAddr};
 use super::stats;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // ---------------------------------------------------------------------------
 // Bucket layout
@@ -54,7 +54,7 @@ pub struct PtShareTable {
     count: usize,
 }
 
-// Safety: buckets pointer is only accessed under the PT_SHARE lock.
+// Safety: buckets pointer is only accessed under the owning ForkGroup's lock.
 unsafe impl Send for PtShareTable {}
 
 impl PtShareTable {
@@ -218,7 +218,7 @@ impl PtShareTable {
     /// Insert or increment refcount for a PT page.
     /// If the page has no entry, creates one with refcount = 2.
     /// If it already has an entry, increments refcount.
-    fn share_inner(&mut self, pa: usize) -> u16 {
+    pub fn share(&mut self, pa: usize) -> u16 {
         if !self.ensure_allocated() {
             return 0; // OOM
         }
@@ -245,7 +245,7 @@ impl PtShareTable {
 
     /// Decrement refcount. Returns new refcount.
     /// Removes the entry when refcount drops to 1 (no longer shared).
-    fn unshare_inner(&mut self, pa: usize) -> u16 {
+    pub fn unshare(&mut self, pa: usize) -> u16 {
         let idx = match self.find(pa) {
             Some(i) => i,
             None => return 0, // not tracked
@@ -297,38 +297,126 @@ impl PtShareTable {
     }
 
     /// Check if a PT page is shared (refcount > 1).
-    fn is_shared_inner(&self, pa: usize) -> bool {
+    #[allow(dead_code)]
+    pub fn is_shared(&self, pa: usize) -> bool {
         match self.find(pa) {
             Some(idx) => unsafe { (*self.buckets.add(idx)).refcount > 1 },
             None => false,
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Global instance + public API
-// ---------------------------------------------------------------------------
-
-static PT_SHARE: SpinLock<PtShareTable> = SpinLock::new(PtShareTable::new());
-
-/// Mark a PT page as shared. Sets refcount to 2 on first share, increments after.
-pub fn share(pa: usize) -> u16 {
-    let rc = PT_SHARE.lock().share_inner(pa);
-    if rc == 2 {
-        stats::PT_TABLES_SHARED.fetch_add(1, Ordering::Relaxed);
+    /// Free the hash table's backing pages.
+    fn drop_backing(&mut self) {
+        if self.buckets.is_null() {
+            return;
+        }
+        let pages = (self.capacity * BUCKET_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+        if pages == 1 {
+            super::phys::free_page(PhysAddr::new(self.buckets as usize));
+        } else {
+            let order = {
+                let mut o = 0;
+                let mut n = pages;
+                while n > 1 {
+                    n >>= 1;
+                    o += 1;
+                }
+                o
+            };
+            super::phys::free_pages(PhysAddr::new(self.buckets as usize), order);
+        }
+        self.buckets = core::ptr::null_mut();
+        self.capacity = 0;
+        self.count = 0;
     }
-    rc
 }
 
-/// Decrement a shared PT page's refcount. Returns new refcount.
-/// Entry is removed when refcount drops to 1 (exclusively owned).
-/// Returns 0 if the page was not tracked.
-pub fn unshare(pa: usize) -> u16 {
-    PT_SHARE.lock().unshare_inner(pa)
+// ---------------------------------------------------------------------------
+// ForkGroup — per-fork-family PT sharing scope
+// ---------------------------------------------------------------------------
+
+/// Slab size for ForkGroup allocations (fits SpinLock<PtShareTable> + refcount).
+const FORK_GROUP_SLAB_SIZE: usize = 64;
+
+/// A fork group tracks shared page table nodes among a family of address spaces
+/// created by fork(). Each member references the same ForkGroup. The hash table
+/// inside tracks PA → refcount for shared PT pages.
+///
+/// Slab-allocated, reference-counted. Created on first fork, freed when the
+/// last member exits.
+#[repr(C)]
+pub struct ForkGroup {
+    table: SpinLock<PtShareTable>,
+    refcount: AtomicU32,
 }
 
-/// Check if a PT page is currently shared (refcount > 1).
-#[allow(dead_code)]
-pub fn is_shared(pa: usize) -> bool {
-    PT_SHARE.lock().is_shared_inner(pa)
+// Safety: ForkGroup is accessed via raw pointer, protected by its internal lock.
+unsafe impl Send for ForkGroup {}
+unsafe impl Sync for ForkGroup {}
+
+impl ForkGroup {
+    /// Allocate a new ForkGroup with refcount = 1.
+    pub fn create() -> *mut ForkGroup {
+        let pa = match super::slab::alloc(FORK_GROUP_SLAB_SIZE) {
+            Some(p) => p,
+            None => return core::ptr::null_mut(),
+        };
+        let ptr = pa.as_usize() as *mut ForkGroup;
+        unsafe {
+            core::ptr::write(
+                ptr,
+                ForkGroup {
+                    table: SpinLock::new(PtShareTable::new()),
+                    refcount: AtomicU32::new(1),
+                },
+            );
+        }
+        ptr
+    }
+
+    /// Increment the reference count (new fork member joins).
+    #[inline]
+    pub fn acquire(fg: *mut ForkGroup) {
+        debug_assert!(!fg.is_null());
+        unsafe {
+            (*fg).refcount.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Decrement the reference count. Frees backing when it reaches 0.
+    pub fn release(fg: *mut ForkGroup) {
+        if fg.is_null() {
+            return;
+        }
+        let old = unsafe { (*fg).refcount.fetch_sub(1, Ordering::Release) };
+        if old == 1 {
+            // Last reference — free hash table backing and slab entry.
+            core::sync::atomic::fence(Ordering::Acquire);
+            unsafe {
+                (*fg).table.lock().drop_backing();
+            }
+            super::slab::free(PhysAddr::new(fg as usize), FORK_GROUP_SLAB_SIZE);
+        }
+    }
+
+    /// Mark a PT page as shared within this fork group.
+    /// Sets refcount to 2 on first share, increments after.
+    #[inline]
+    pub fn share(fg: *mut ForkGroup, pa: usize) -> u16 {
+        debug_assert!(!fg.is_null());
+        let rc = unsafe { (*fg).table.lock().share(pa) };
+        if rc == 2 {
+            stats::PT_TABLES_SHARED.fetch_add(1, Ordering::Relaxed);
+        }
+        rc
+    }
+
+    /// Decrement a shared PT page's refcount within this fork group.
+    /// Entry is removed when refcount drops to 1 (exclusively owned).
+    /// Returns 0 if the page was not tracked.
+    #[inline]
+    pub fn unshare(fg: *mut ForkGroup, pa: usize) -> u16 {
+        debug_assert!(!fg.is_null());
+        unsafe { (*fg).table.lock().unshare(pa) }
+    }
 }

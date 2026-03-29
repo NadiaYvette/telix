@@ -12,6 +12,7 @@
 
 use super::object::{self};
 use super::page::PhysAddr;
+use super::ptshare::ForkGroup;
 use super::vma::{Vma, VmaProt};
 use super::vmatree::{VmaCursor, VmaTree};
 use crate::mm::slab;
@@ -55,6 +56,8 @@ pub struct AddressSpace {
     pub heap_next: usize,
     /// PRNG state for ASLR.
     pub prng_state: u64,
+    /// Fork group for shared page table tracking (null if never forked).
+    pub fork_group: *mut ForkGroup,
 }
 
 impl AddressSpace {
@@ -66,6 +69,7 @@ impl AddressSpace {
             id: 0,
             heap_next: HEAP_VA_BASE,
             prng_state: 0,
+            fork_group: core::ptr::null_mut(),
         }
     }
 
@@ -315,7 +319,9 @@ pub fn create(page_table_root: usize) -> Option<ASpaceId> {
     Some(port_id)
 }
 
-/// Destroy an address space.
+/// Destroy an address space, including its page table tree.
+/// The caller must have already switched to the boot page table if this
+/// aspace was active on the current CPU.
 pub fn destroy(id: ASpaceId) {
     // Step 1: Resolve entry pointer.
     let entry_ptr = match resolve_entry(id) {
@@ -325,6 +331,10 @@ pub fn destroy(id: ASpaceId) {
 
     // Step 2: Lock entry and clean up.
     let mut guard = unsafe { (*entry_ptr).inner.lock() };
+
+    let pt_root = guard.page_table_root;
+    let fg = guard.fork_group;
+    guard.fork_group = core::ptr::null_mut();
 
     // Destroy backing objects for all VMAs.
     {
@@ -338,12 +348,21 @@ pub fn destroy(id: ASpaceId) {
     guard.vmas.clear();
     // Mark as dead so concurrent lock_aspace() sees id=0.
     guard.id = 0;
+    guard.page_table_root = 0;
     drop(guard);
 
-    // Step 3: Destroy the port (removes from PORT_ART, wakes waiters).
+    // Step 3: Free page table tree (uses ForkGroup for shared markers).
+    if pt_root != 0 {
+        free_page_table_tree(pt_root, fg);
+    }
+
+    // Step 4: Release ForkGroup reference.
+    ForkGroup::release(fg);
+
+    // Step 5: Destroy the port (removes from PORT_ART, wakes waiters).
     crate::ipc::port::destroy(id);
 
-    // Step 4: Defer-free the slab entry after RCU grace period.
+    // Step 6: Defer-free the slab entry after RCU grace period.
     crate::sync::rcu::rcu_defer_free(entry_ptr as usize, rcu_free_aspace_callback);
 }
 
@@ -362,6 +381,8 @@ pub fn reset(id: ASpaceId, new_pt_root: usize) {
     };
     let space = &mut *guard;
     let old_pt_root = space.page_table_root;
+    let fg = space.fork_group;
+    space.fork_group = core::ptr::null_mut();
 
     // Destroy backing objects. No need to unmap individual PTEs — the entire
     // old page table tree will be freed below and switch_page_table flushes TLB.
@@ -386,8 +407,9 @@ pub fn reset(id: ASpaceId, new_pt_root: usize) {
     drop(guard);
 
     if old_pt_root != 0 {
-        free_page_table_tree(old_pt_root);
+        free_page_table_tree(old_pt_root, fg);
     }
+    ForkGroup::release(fg);
 }
 
 // ---------------------------------------------------------------------------
@@ -497,7 +519,7 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         let child_ptr = match alloc_entry() {
             Some(p) => p,
             None => {
-                free_page_table_tree(child_pt);
+                free_page_table_tree(child_pt, core::ptr::null_mut());
                 return None;
             }
         };
@@ -507,7 +529,7 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
                 Some(p) => p,
                 None => {
                     free_entry(child_ptr);
-                    free_page_table_tree(child_pt);
+                    free_page_table_tree(child_pt, core::ptr::null_mut());
                     return None;
                 }
             };
@@ -549,7 +571,7 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
                 crate::ipc::port::destroy(child_id);
                 crate::sync::rcu::synchronize_rcu();
                 free_entry(child_entry_ptr);
-                free_page_table_tree(child_pt);
+                free_page_table_tree(child_pt, core::ptr::null_mut());
                 super::phys::free_page(cow_page);
                 return None;
             }
@@ -565,8 +587,39 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
     //
     // Superpages survive fork undamaged — no demotion needed.
     {
+        // Create or reuse a ForkGroup for shared PT tracking.
+        let fg = {
+            let mut parent_guard = lock_aspace(parent_id).unwrap();
+            if parent_guard.fork_group.is_null() {
+                let new_fg = ForkGroup::create();
+                if new_fg.is_null() {
+                    // OOM — clean up.
+                    drop(parent_guard);
+                    for i in 0..vma_count {
+                        let e = unsafe { &*cow_buf.add(i) };
+                        object::destroy(e.new_obj_id);
+                    }
+                    crate::ipc::port::destroy(child_id);
+                    crate::sync::rcu::synchronize_rcu();
+                    free_entry(child_entry_ptr);
+                    free_page_table_tree(child_pt, core::ptr::null_mut());
+                    super::phys::free_page(cow_page);
+                    return None;
+                }
+                parent_guard.fork_group = new_fg;
+                new_fg
+            } else {
+                parent_guard.fork_group
+            }
+        };
+        // Child gets a reference to the same ForkGroup.
+        ForkGroup::acquire(fg);
+        unsafe {
+            (*child_entry_ptr).inner.lock().fork_group = fg;
+        }
+
         // Share page table entries at the appropriate arch-specific level.
-        super::hat::clone_shared_tables(parent_pt, child_pt);
+        super::hat::clone_shared_tables(parent_pt, child_pt, fg);
 
         // Flush parent TLB so stale translations don't bypass shared markers.
         // Reloading the page table root flushes TLB on all architectures.
@@ -693,11 +746,20 @@ pub fn mprotect(id: ASpaceId, addr: usize, len: usize, new_prot: VmaProt) -> boo
             if old_prot != new_prot {
                 let new_flags = rw_flags_for_prot(new_prot);
                 let mmu_count = vma.mmu_page_count();
+                let fg = space.fork_group;
+
+                // Break shared page table paths before modifying PTEs.
+                if !fg.is_null() {
+                    for mmu_idx in 0..mmu_count {
+                        let mmu_va = vma.va_start + mmu_idx * MMUPAGE_SIZE;
+                        hat::ensure_path_unshared(pt_root, mmu_va, fg);
+                    }
+                }
 
                 demote_superpages_in_range(pt_root, vma.va_start, mmu_count, old_prot);
 
                 for mmu_idx in 0..mmu_count {
-                    let mmu_va = vma.va_start + mmu_idx * super::page::MMUPAGE_SIZE;
+                    let mmu_va = vma.va_start + mmu_idx * MMUPAGE_SIZE;
                     let pte = super::fault::read_pte_dispatch(pt_root, mmu_va);
                     if super::fault::pte_is_present(pte) {
                         update_pte_flags(pt_root, mmu_va, new_flags);
@@ -891,8 +953,8 @@ fn create_user_page_table() -> Option<usize> {
     hat::create_user_page_table()
 }
 
-fn free_page_table_tree(root: usize) {
-    hat::free_page_table_tree(root);
+fn free_page_table_tree(root: usize, fg: *mut ForkGroup) {
+    hat::free_page_table_tree(root, fg);
 }
 
 fn switch_page_table(root: usize) {

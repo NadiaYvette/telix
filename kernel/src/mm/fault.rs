@@ -85,6 +85,7 @@ pub fn handle_page_fault(
 ) -> FaultResult {
     aspace::with_aspace(aspace_id, |aspace| {
         let pt_root = aspace.page_table_root;
+        let fork_group = aspace.fork_group;
 
         // Find the VMA containing the faulting address.
         let vma = match aspace.find_vma_mut(fault_addr) {
@@ -107,7 +108,7 @@ pub fn handle_page_fault(
 
         // Break any shared page table nodes along the walk path.
         // A shared marker (not-present) may have caused this fault itself.
-        if !hat::ensure_path_unshared(pt_root, va_aligned) {
+        if !hat::ensure_path_unshared(pt_root, va_aligned, fork_group) {
             return FaultResult::Failed; // OOM during COW-break
         }
 

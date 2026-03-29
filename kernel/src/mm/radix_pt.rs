@@ -9,6 +9,8 @@
 //! Architectures with inverted page tables or software-managed TLBs can
 //! implement the HAT API directly without using this library.
 
+use crate::mm::ptshare::ForkGroup;
+
 /// Trait describing one architecture's radix page table entry format.
 ///
 /// Implementors provide constants and methods that parameterize the
@@ -132,8 +134,8 @@ pub fn walk_to_super_slot<F: PteFormat>(root: usize, va: usize) -> Option<*mut u
 // -------------------------------------------------------------------------
 
 /// Walk to the leaf PTE slot, allocating intermediate table pages as needed.
-/// COW-breaks any shared markers encountered along the path.
-/// Returns `None` only if allocation fails or a superpage blocks the path.
+/// Returns `None` if allocation fails, a superpage blocks the path, or a
+/// shared marker is encountered (caller must `ensure_path_unshared` first).
 #[inline]
 pub fn walk_or_create<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> {
     let mut table = root as *mut u64;
@@ -147,12 +149,8 @@ pub fn walk_or_create<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> 
             }
             table = F::table_pa(entry) as *mut u64;
         } else if F::is_shared_entry(entry) {
-            let old_pa = F::shared_entry_pa(entry);
-            let new_pa = cow_break_table::<F>(old_pa, level)?;
-            unsafe {
-                *table.add(idx) = F::make_table_entry(new_pa);
-            }
-            table = new_pa as *mut u64;
+            // Shared marker — caller should have called ensure_path_unshared.
+            return None;
         } else {
             // Allocate a new table page.
             let new_table = alloc_table()?;
@@ -167,8 +165,8 @@ pub fn walk_or_create<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> 
 }
 
 /// Walk to the PTE slot at `target_level`, allocating intermediate tables.
-/// COW-breaks any shared markers encountered along the path.
-/// Returns `None` only if allocation fails or a higher-level block exists.
+/// Returns `None` if allocation fails, a higher-level block exists, or a
+/// shared marker is encountered (caller must `ensure_path_unshared` first).
 #[inline]
 pub fn walk_or_create_to_level<F: PteFormat>(
     root: usize,
@@ -185,12 +183,8 @@ pub fn walk_or_create_to_level<F: PteFormat>(
             }
             table = F::table_pa(entry) as *mut u64;
         } else if F::is_shared_entry(entry) {
-            let old_pa = F::shared_entry_pa(entry);
-            let new_pa = cow_break_table::<F>(old_pa, level)?;
-            unsafe {
-                *table.add(idx) = F::make_table_entry(new_pa);
-            }
-            table = new_pa as *mut u64;
+            // Shared marker — caller should have called ensure_path_unshared.
+            return None;
         } else {
             let new_table = alloc_table()?;
             unsafe {
@@ -219,19 +213,24 @@ pub fn walk_or_create_to_super<F: PteFormat>(root: usize, va: usize) -> Option<*
 
 /// COW-break a shared page table node.
 ///
-/// Decrements the refcount on `old_pa`. If it was the last shared reference
-/// (refcount drops to 0 / not tracked), returns `old_pa` for re-adoption
-/// without copying. Otherwise, allocates a copy and processes sub-entries:
+/// Decrements the refcount on `old_pa` via the ForkGroup. If it was the last
+/// shared reference (refcount drops to 0 / not tracked), returns `old_pa` for
+/// re-adoption without copying. Otherwise, allocates a copy and processes
+/// sub-entries:
 /// - Intermediate tables: share sub-table PAs and convert to shared markers
 /// - Leaf tables: downgrade writable PTEs to read-only for per-page COW
 ///
 /// `level` is the level of the entry pointing to `old_pa` (i.e., entries
 /// inside `old_pa` are at level+1).
-fn cow_break_table<F: PteFormat>(old_pa: usize, level: usize) -> Option<usize> {
-    use crate::mm::{ptshare, stats};
+fn cow_break_table<F: PteFormat>(
+    old_pa: usize,
+    level: usize,
+    fg: *mut ForkGroup,
+) -> Option<usize> {
+    use crate::mm::stats;
     use core::sync::atomic::Ordering;
 
-    let remaining = ptshare::unshare(old_pa);
+    let remaining = ForkGroup::unshare(fg, old_pa);
     if remaining == 0 {
         // Exclusively ours (or untracked). Re-adopt without copying.
         return Some(old_pa);
@@ -260,7 +259,7 @@ fn cow_break_table<F: PteFormat>(old_pa: usize, level: usize) -> Option<usize> {
                 if F::is_table(entry) {
                     // Sub-table referenced by both old and new copies.
                     let sub_pa = F::table_pa(entry);
-                    ptshare::share(sub_pa);
+                    ForkGroup::share(fg, sub_pa);
                     unsafe {
                         *new_table.add(i) = F::make_shared_entry(sub_pa);
                     }
@@ -290,15 +289,24 @@ fn cow_break_table<F: PteFormat>(old_pa: usize, level: usize) -> Option<usize> {
 
 /// Ensure the entire walk path from root to the leaf level for `va` contains
 /// no shared markers. COW-breaks each shared node encountered top-down.
+/// `fg` is the ForkGroup owning the shared PT refcounts (may be null if the
+/// address space has never forked — in that case, no shared markers exist).
 /// Returns `false` only on OOM.
-pub fn ensure_path_unshared<F: PteFormat>(root: usize, va: usize) -> bool {
+pub fn ensure_path_unshared<F: PteFormat>(
+    root: usize,
+    va: usize,
+    fg: *mut ForkGroup,
+) -> bool {
+    if fg.is_null() {
+        return true; // Never forked, no shared markers possible.
+    }
     let mut table = root as *mut u64;
     for level in 0..F::LEVELS - 1 {
         let idx = F::va_index(va, level);
         let entry = unsafe { *table.add(idx) };
         if F::is_shared_entry(entry) {
             let old_pa = F::shared_entry_pa(entry);
-            let new_pa = match cow_break_table::<F>(old_pa, level) {
+            let new_pa = match cow_break_table::<F>(old_pa, level, fg) {
                 Some(pa) => pa,
                 None => return false,
             };
@@ -322,15 +330,18 @@ pub fn ensure_path_unshared<F: PteFormat>(root: usize, va: usize) -> bool {
 
 /// Recursively free a page table subtree, handling shared markers.
 ///
-/// For shared markers: decrements refcount. Only recurses + frees when the
-/// last reference is dropped.
+/// For shared markers: decrements refcount via the ForkGroup. Only recurses
+/// + frees when the last reference is dropped.
 /// For non-shared sub-tables: recurses and frees unconditionally.
 /// Leaf-level data pages are NOT freed here (aspace::destroy handles those).
 ///
 /// `level` is the level of `table_pa` itself (entries inside are at level+1).
-pub fn free_shared_subtree<F: PteFormat>(table_pa: usize, level: usize) {
-    use crate::mm::{ptshare, page::PhysAddr};
-
+/// `fg` may be null if the address space was never forked.
+pub fn free_shared_subtree<F: PteFormat>(
+    table_pa: usize,
+    level: usize,
+    fg: *mut ForkGroup,
+) {
     let child_level = level + 1;
     if child_level >= F::LEVELS {
         // At or past leaf level — data pages freed elsewhere.
@@ -343,21 +354,21 @@ pub fn free_shared_subtree<F: PteFormat>(table_pa: usize, level: usize) {
         let entry = unsafe { *table.add(i) };
         if F::is_shared_entry(entry) {
             let sub_pa = F::shared_entry_pa(entry);
-            let rc = ptshare::unshare(sub_pa);
+            let rc = if fg.is_null() { 0 } else { ForkGroup::unshare(fg, sub_pa) };
             if rc == 0 {
                 // Last reference — recursively free sub-entries, then the page.
                 if child_level < F::LEVELS - 1 {
-                    free_shared_subtree::<F>(sub_pa, child_level);
+                    free_shared_subtree::<F>(sub_pa, child_level, fg);
                 }
-                crate::mm::phys::free_page(PhysAddr::new(sub_pa));
+                crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(sub_pa));
             }
         } else if F::is_valid(entry) && F::is_table(entry) {
             // Non-shared sub-table — recurse into intermediates, then free.
             let sub_pa = F::table_pa(entry);
             if child_level < F::LEVELS - 1 {
-                free_shared_subtree::<F>(sub_pa, child_level);
+                free_shared_subtree::<F>(sub_pa, child_level, fg);
             }
-            crate::mm::phys::free_page(PhysAddr::new(sub_pa));
+            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(sub_pa));
         }
         // Leaf PTEs (data pages) and empty entries: skip.
     }
