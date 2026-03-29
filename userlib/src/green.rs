@@ -70,6 +70,42 @@ pub struct FiberContext {
     sp: u64,
 }
 
+#[cfg(target_arch = "loongarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FiberContext {
+    ra: u64,
+    sp: u64,
+    fp: u64,  // $r22
+    s0: u64,  // $r23
+    s1: u64,  // $r24
+    s2: u64,  // $r25
+    s3: u64,  // $r26
+    s4: u64,  // $r27
+    s5: u64,  // $r28
+    s6: u64,  // $r29
+    s7: u64,  // $r30
+    s8: u64,  // $r31
+}
+
+#[cfg(target_arch = "mips64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FiberContext {
+    ra: u64,
+    sp: u64,
+    fp: u64,  // $30
+    gp: u64,  // $28
+    s0: u64,  // $16
+    s1: u64,  // $17
+    s2: u64,  // $18
+    s3: u64,  // $19
+    s4: u64,  // $20
+    s5: u64,  // $21
+    s6: u64,  // $22
+    s7: u64,  // $23
+}
+
 impl FiberContext {
     const fn zero() -> Self {
         #[cfg(target_arch = "x86_64")]
@@ -119,6 +155,22 @@ impl FiberContext {
                 fp: 0,
                 lr: 0,
                 sp: 0,
+            }
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            Self {
+                ra: 0, sp: 0, fp: 0,
+                s0: 0, s1: 0, s2: 0, s3: 0,
+                s4: 0, s5: 0, s6: 0, s7: 0, s8: 0,
+            }
+        }
+        #[cfg(target_arch = "mips64")]
+        {
+            Self {
+                ra: 0, sp: 0, fp: 0, gp: 0,
+                s0: 0, s1: 0, s2: 0, s3: 0,
+                s4: 0, s5: 0, s6: 0, s7: 0,
             }
         }
     }
@@ -289,6 +341,75 @@ unsafe extern "C" fn switch_context(_old: *mut FiberContext, _new: *const FiberC
     );
 }
 
+#[cfg(target_arch = "loongarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(_old: *mut FiberContext, _new: *const FiberContext) {
+    // LoongArch64 ABI: $a0=$r4, $a1=$r5. Callee-saved: $s0-$s8 ($r23-$r31),
+    // $fp ($r22), $ra ($r1), $sp ($r3).
+    core::arch::naked_asm!(
+        "st.d $ra,  $a0, 0",
+        "st.d $sp,  $a0, 8",
+        "st.d $fp,  $a0, 16",
+        "st.d $s0,  $a0, 24",
+        "st.d $s1,  $a0, 32",
+        "st.d $s2,  $a0, 40",
+        "st.d $s3,  $a0, 48",
+        "st.d $s4,  $a0, 56",
+        "st.d $s5,  $a0, 64",
+        "st.d $s6,  $a0, 72",
+        "st.d $s7,  $a0, 80",
+        "st.d $s8,  $a0, 88",
+        "ld.d $ra,  $a1, 0",
+        "ld.d $sp,  $a1, 8",
+        "ld.d $fp,  $a1, 16",
+        "ld.d $s0,  $a1, 24",
+        "ld.d $s1,  $a1, 32",
+        "ld.d $s2,  $a1, 40",
+        "ld.d $s3,  $a1, 48",
+        "ld.d $s4,  $a1, 56",
+        "ld.d $s5,  $a1, 64",
+        "ld.d $s6,  $a1, 72",
+        "ld.d $s7,  $a1, 80",
+        "ld.d $s8,  $a1, 88",
+        "jr $ra",
+    );
+}
+
+#[cfg(target_arch = "mips64")]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(_old: *mut FiberContext, _new: *const FiberContext) {
+    // MIPS64 N64 ABI: $a0=$4, $a1=$5. Callee-saved: $s0-$s7 ($16-$23),
+    // $gp ($28), $fp ($30), $ra ($31), $sp ($29).
+    core::arch::naked_asm!(
+        "sd $ra,  0($a0)",
+        "sd $sp,  8($a0)",
+        "sd $fp, 16($a0)",
+        "sd $gp, 24($a0)",
+        "sd $s0, 32($a0)",
+        "sd $s1, 40($a0)",
+        "sd $s2, 48($a0)",
+        "sd $s3, 56($a0)",
+        "sd $s4, 64($a0)",
+        "sd $s5, 72($a0)",
+        "sd $s6, 80($a0)",
+        "sd $s7, 88($a0)",
+        "ld $ra,  0($a1)",
+        "ld $sp,  8($a1)",
+        "ld $fp, 16($a1)",
+        "ld $gp, 24($a1)",
+        "ld $s0, 32($a1)",
+        "ld $s1, 40($a1)",
+        "ld $s2, 48($a1)",
+        "ld $s3, 56($a1)",
+        "ld $s4, 64($a1)",
+        "ld $s5, 72($a1)",
+        "ld $s6, 80($a1)",
+        "ld $s7, 88($a1)",
+        "jr $ra",
+        "nop",
+    );
+}
+
 // --- Fiber entry trampoline ---
 
 /// Called when a new fiber starts. Callee-saved registers contain entry/arg.
@@ -324,6 +445,32 @@ unsafe extern "C" fn fiber_trampoline() {
         "blr x19",           // call entry(arg)
         "bl {exit}",         // fiber_exit()
         "brk #0",            // unreachable
+        exit = sym fiber_exit,
+    );
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn fiber_trampoline() {
+    core::arch::naked_asm!(
+        "move $a0, $s1",     // arg → first function argument
+        "jirl $ra, $s0, 0",  // call entry(arg)
+        "bl {exit}",         // fiber_exit()
+        "break 0",           // unreachable
+        exit = sym fiber_exit,
+    );
+}
+
+#[cfg(target_arch = "mips64")]
+#[unsafe(naked)]
+unsafe extern "C" fn fiber_trampoline() {
+    core::arch::naked_asm!(
+        "move $a0, $s1",     // arg → first function argument
+        "jalr $s0",          // call entry(arg)
+        "nop",               // branch delay slot
+        "jal {exit}",        // fiber_exit()
+        "nop",               // branch delay slot
+        "break",             // unreachable
         exit = sym fiber_exit,
     );
 }
@@ -400,6 +547,22 @@ pub fn spawn(entry: fn(u64), arg: u64) -> i32 {
             ctx.lr = fiber_trampoline as u64;
             ctx.x19 = entry as u64; // entry function
             ctx.x20 = arg; // argument
+        }
+
+        #[cfg(target_arch = "loongarch64")]
+        {
+            ctx.sp = stack_top as u64;
+            ctx.ra = fiber_trampoline as u64;
+            ctx.s0 = entry as u64; // entry function
+            ctx.s1 = arg; // argument
+        }
+
+        #[cfg(target_arch = "mips64")]
+        {
+            ctx.sp = stack_top as u64;
+            ctx.ra = fiber_trampoline as u64;
+            ctx.s0 = entry as u64; // entry function
+            ctx.s1 = arg; // argument
         }
 
         FIBERS[i].context = ctx;

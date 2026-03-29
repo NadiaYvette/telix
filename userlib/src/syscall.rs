@@ -391,6 +391,37 @@ pub fn recv_msg(port: u64) -> Option<Message> {
         );
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall 0",
+            inlateout("$r11") SYS_RECV as u64 => r7,
+            inlateout("$r4") port as u64 => status,
+            lateout("$r5") r1,
+            lateout("$r6") r2,
+            lateout("$r7") r3,
+            lateout("$r8") r4,
+            lateout("$r9") r5,
+            lateout("$r10") r6,
+        );
+    }
+
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("$2") SYS_RECV as u64 => status,
+            inlateout("$4") port as u64 => _,
+            lateout("$5") r1,
+            lateout("$6") r2,
+            lateout("$7") r3,
+            lateout("$8") r4,
+            lateout("$9") r5,
+            lateout("$10") r6,
+            lateout("$11") r7,
+        );
+    }
+
     if status != 0 {
         return None;
     }
@@ -476,6 +507,37 @@ pub fn port_set_recv(set_id: u32) -> Option<(u64, Message)> {
             lateout("r9") r6,
             lateout("rcx") _,
             lateout("r11") _,
+        );
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall 0",
+            inlateout("$r11") SYS_PORT_SET_RECV as u64 => r7,
+            inlateout("$r4") set_id as u64 => status,
+            lateout("$r5") r1,
+            lateout("$r6") r2,
+            lateout("$r7") r3,
+            lateout("$r8") r4,
+            lateout("$r9") r5,
+            lateout("$r10") r6,
+        );
+    }
+
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("$2") SYS_PORT_SET_RECV as u64 => status,
+            inlateout("$4") set_id as u64 => _,
+            lateout("$5") r1,
+            lateout("$6") r2,
+            lateout("$7") r3,
+            lateout("$8") r4,
+            lateout("$9") r5,
+            lateout("$10") r6,
+            lateout("$11") r7,
         );
     }
 
@@ -621,6 +683,37 @@ pub fn recv_nb_msg(port: u64) -> Option<Message> {
             lateout("r9") r6,
             lateout("rcx") _,
             lateout("r11") _,
+        );
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall 0",
+            inlateout("$r11") SYS_RECV_NB as u64 => r7,
+            inlateout("$r4") port as u64 => status,
+            lateout("$r5") r1,
+            lateout("$r6") r2,
+            lateout("$r7") r3,
+            lateout("$r8") r4,
+            lateout("$r9") r5,
+            lateout("$r10") r6,
+        );
+    }
+
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("$2") SYS_RECV_NB as u64 => status,
+            inlateout("$4") port as u64 => _,
+            lateout("$5") r1,
+            lateout("$6") r2,
+            lateout("$7") r3,
+            lateout("$8") r4,
+            lateout("$9") r5,
+            lateout("$10") r6,
+            lateout("$11") r7,
         );
     }
 
@@ -1109,6 +1202,32 @@ pub fn wait_fault() -> (u32, usize, u32, u64, usize) {
         );
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall 0",
+            in("$r11") SYS_WAIT_FAULT as u64,
+            lateout("$r4") r0,
+            lateout("$r5") r1,
+            lateout("$r6") r2,
+            lateout("$r7") r3,
+            lateout("$r8") r4,
+        );
+    }
+
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("$2") SYS_WAIT_FAULT as u64 => r0,
+            lateout("$4") _,
+            lateout("$5") r1,
+            lateout("$6") r2,
+            lateout("$7") r3,
+            lateout("$8") r4,
+        );
+    }
+
     (r0 as u32, r1 as usize, r2 as u32, r3, r4 as usize)
 }
 
@@ -1240,6 +1359,26 @@ pub fn wait4(pid: i64, flags: u32) -> Option<(u64, i32)> {
         );
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall 0",
+            in("$r11") SYS_WAIT4 as u64,
+            inlateout("$r4") pid as u64 => r0,
+            inlateout("$r5") flags as u64 => r1,
+        );
+    }
+
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("$2") SYS_WAIT4 as u64 => r0,
+            inlateout("$4") pid as u64 => _,
+            inlateout("$5") flags as u64 => r1,
+        );
+    }
+
     if r0 == u64::MAX {
         None // ECHILD
     } else {
@@ -1296,6 +1435,28 @@ pub fn getrlimit(resource: u32) -> Option<(u64, u64)> {
         );
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall 0",
+            in("$r11") SYS_GETRLIMIT as u64,
+            inlateout("$r4") resource as u64 => r0,
+            lateout("$r5") r1,
+            lateout("$r6") r2,
+        );
+    }
+
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("$2") SYS_GETRLIMIT as u64 => r0,
+            inlateout("$4") resource as u64 => _,
+            lateout("$5") r1,
+            lateout("$6") r2,
+        );
+    }
+
     if r0 == u64::MAX { None } else { Some((r1, r2)) }
 }
 
@@ -1348,6 +1509,30 @@ pub fn prlimit(pid: u64, resource: u32, new_soft: u64, new_hard: u64) -> Option<
             in("r10") new_hard,
             lateout("rcx") _,
             lateout("r11") _,
+        );
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall 0",
+            in("$r11") SYS_PRLIMIT as u64,
+            inlateout("$r4") pid => r0,
+            inlateout("$r5") resource as u64 => r1,
+            inlateout("$r6") new_soft => r2,
+            in("$r7") new_hard,
+        );
+    }
+
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("$2") SYS_PRLIMIT as u64 => r0,
+            inlateout("$4") pid => _,
+            inlateout("$5") resource as u64 => r1,
+            inlateout("$6") new_soft => r2,
+            in("$7") new_hard,
         );
     }
 
@@ -1407,6 +1592,32 @@ pub fn proc_info(port_id: u64) -> Option<(u64, u64, u64, u64)> {
             lateout("r10") r4,
             lateout("rcx") _,
             lateout("r11") _,
+        );
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall 0",
+            in("$r11") SYS_PROC_INFO as u64,
+            inlateout("$r4") port_id => r0,
+            lateout("$r5") r1,
+            lateout("$r6") r2,
+            lateout("$r7") r3,
+            lateout("$r8") r4,
+        );
+    }
+
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("$2") SYS_PROC_INFO as u64 => r0,
+            inlateout("$4") port_id => _,
+            lateout("$5") r1,
+            lateout("$6") r2,
+            lateout("$7") r3,
+            lateout("$8") r4,
         );
     }
 

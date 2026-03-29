@@ -24,8 +24,17 @@ case "$ARCH" in
         LINKER="$USERLIB/link-x86_64.ld"
         EXTRA_RUSTFLAGS="-C relocation-model=static -C code-model=large"
         ;;
+    loongarch64)
+        TARGET="loongarch64-unknown-none"
+        LINKER="$USERLIB/link-loongarch64.ld"
+        ;;
+    mips64)
+        TARGET="$ROOTDIR/targets/mips64el-telix-none.json"
+        LINKER="$USERLIB/link-mips64.ld"
+        EXTRA_BUILD_FLAGS="-Z build-std=core -Z build-std-features=compiler-builtins-mem -Z json-target-spec"
+        ;;
     *)
-        echo "Unknown arch: $ARCH (expected aarch64, riscv64, x86_64)"
+        echo "Unknown arch: $ARCH (expected aarch64, riscv64, x86_64, loongarch64, mips64)"
         exit 1
         ;;
 esac
@@ -33,13 +42,23 @@ esac
 echo "Building userspace binaries for $ARCH ($TARGET)..."
 
 # Build with user linker script, overriding workspace rustflags.
-RUSTFLAGS="-C link-arg=-T$LINKER ${EXTRA_RUSTFLAGS:-}" \
-    RUSTC="$RUSTC" "$CARGO" build \
-    --target "$TARGET" \
-    -p telix-userlib \
-    --release \
-    --config "unstable.build-std=[\"core\"]" \
-    --config "unstable.build-std-features=[\"compiler-builtins-mem\"]"
+if [ -n "${EXTRA_BUILD_FLAGS:-}" ]; then
+    # Custom target (e.g. mips64) — use -Z flags directly.
+    RUSTFLAGS="-C link-arg=-T$LINKER ${EXTRA_RUSTFLAGS:-}" \
+        RUSTC="$RUSTC" "$CARGO" build \
+        --target "$TARGET" \
+        -p telix-userlib \
+        --release \
+        $EXTRA_BUILD_FLAGS
+else
+    RUSTFLAGS="-C link-arg=-T$LINKER ${EXTRA_RUSTFLAGS:-}" \
+        RUSTC="$RUSTC" "$CARGO" build \
+        --target "$TARGET" \
+        -p telix-userlib \
+        --release \
+        --config "unstable.build-std=[\"core\"]" \
+        --config "unstable.build-std-features=[\"compiler-builtins-mem\"]"
+fi
 
 BINDIR="$ROOTDIR/target/$TARGET/release"
 

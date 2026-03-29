@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
 
 extern crate userlib;
 

@@ -117,6 +117,36 @@ pub fn handle_page_fault(
         let is_present = pte_is_present(pte);
         let is_zeroed = pte_has_sw_zeroed(pte);
 
+        // If the fault was caused solely by a shared marker (not the leaf PTE),
+        // the path is now valid after COW-break. For read/exec faults on a
+        // present R/O page, just return — hardware will retry successfully.
+        // Write faults on present pages still need COW handling below.
+        if is_present && fault_type != FaultType::Write {
+            stats::MINOR_FAULTS.fetch_add(1, Ordering::Relaxed);
+            return FaultResult::HandledMinor;
+        }
+
+        // After COW-break, a R/O superpage may block the leaf walk (no leaf
+        // table exists for superpages). Demote it so the 4K COW fault path
+        // can proceed. Use R/O flags so per-page COW still applies.
+        let (pte, is_present, is_zeroed) = if pte == 0 && !fork_group.is_null() {
+            let ro_flags = hat::pte_flags_for_prot(super::vma::VmaProt::ReadOnly)
+                | sw_zeroed_bit();
+            if demote_superpage(pt_root, va_aligned, ro_flags) {
+                stats::SUPERPAGE_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
+            }
+            let pte2 = read_pte_dispatch(pt_root, va_aligned);
+            let present2 = pte_is_present(pte2);
+            // Read/exec faults on the now-demoted R/O page: just return.
+            if present2 && fault_type != FaultType::Write {
+                stats::MINOR_FAULTS.fetch_add(1, Ordering::Relaxed);
+                return FaultResult::HandledMinor;
+            }
+            (pte2, present2, pte_has_sw_zeroed(pte2))
+        } else {
+            (pte, is_present, is_zeroed)
+        };
+
         // Pager-backed VMA: allocate page, record fault, return NeedPager.
         // Use try_with_object: grant VMAs may reference objects destroyed
         // by the source process exiting (stale ObjectId).

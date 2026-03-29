@@ -160,11 +160,17 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut ForkG
         let entry = unsafe { *parent.add(i) };
         if Mips64Pte::is_valid(entry) && Mips64Pte::is_table(entry) {
             let sub_pa = Mips64Pte::table_pa(entry);
-            unsafe { ForkGroup::share(fg, sub_pa); }
+            ForkGroup::share(fg, sub_pa);
             let shared = Mips64Pte::make_shared_entry(sub_pa);
             unsafe {
                 *parent.add(i) = shared;
                 *child.add(i) = shared;
+            }
+        } else if Mips64Pte::is_shared_entry(entry) {
+            let sub_pa = Mips64Pte::shared_entry_pa(entry);
+            ForkGroup::share(fg, sub_pa);
+            unsafe {
+                *child.add(i) = entry;
             }
         }
     }

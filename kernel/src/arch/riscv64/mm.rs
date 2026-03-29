@@ -216,6 +216,12 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut ForkG
                 *parent.add(i) = shared;
                 *child.add(i) = shared;
             }
+        } else if Sv39Pte::is_shared_entry(entry) {
+            let sub_pa = Sv39Pte::shared_entry_pa(entry);
+            ForkGroup::share(fg, sub_pa);
+            unsafe {
+                *child.add(i) = entry;
+            }
         }
     }
 }

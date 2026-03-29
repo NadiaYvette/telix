@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
 
 pub mod aio;
 pub mod arch;

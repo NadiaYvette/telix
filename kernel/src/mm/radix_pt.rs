@@ -231,60 +231,80 @@ fn cow_break_table<F: PteFormat>(
     use core::sync::atomic::Ordering;
 
     let remaining = ForkGroup::unshare(fg, old_pa);
-    if remaining == 0 {
-        // Exclusively ours (or untracked). Re-adopt without copying.
-        return Some(old_pa);
-    }
 
-    // Still shared by others — must copy.
-    let new_pa = alloc_table()?;
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            old_pa as *const u8,
-            new_pa as *mut u8,
-            MMU_PAGE_SIZE,
-        );
+    let (result_pa, is_copy);
+    if remaining == 0 {
+        // Exclusively ours — re-adopt in place. Still need to process
+        // entries: leaf PTEs must be downgraded to read-only for per-page
+        // COW, and intermediate sub-table entries may have been shared by
+        // a prior sibling's cow_break and need shared-marker encoding.
+        result_pa = old_pa;
+        is_copy = false;
+    } else {
+        // Still shared by others — must copy.
+        result_pa = match alloc_table() {
+            Some(pa) => pa,
+            None => {
+                // Failed alloc — re-share so the entry remains valid.
+                ForkGroup::share(fg, old_pa);
+                return None;
+            }
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                old_pa as *const u8,
+                result_pa as *mut u8,
+                MMU_PAGE_SIZE,
+            );
+        }
+        is_copy = true;
     }
 
     stats::PT_COW_BREAKS.fetch_add(1, Ordering::Relaxed);
 
-    let new_table = new_pa as *mut u64;
+    let table = result_pa as *mut u64;
     let child_level = level + 1;
 
     if child_level < F::LEVELS - 1 {
-        // Broken table is intermediate — entries point to further tables.
+        // Table is intermediate — entries point to further tables.
         for i in 0..ENTRIES_PER_TABLE {
-            let entry = unsafe { *new_table.add(i) };
+            let entry = unsafe { *table.add(i) };
             if F::is_valid(entry) {
                 if F::is_table(entry) {
-                    // Sub-table referenced by both old and new copies.
                     let sub_pa = F::table_pa(entry);
-                    ForkGroup::share(fg, sub_pa);
+                    if is_copy {
+                        // Sub-table referenced by both old and new copies.
+                        ForkGroup::share(fg, sub_pa);
+                    }
+                    // Both copy and re-adopt: encode as shared marker.
+                    // For re-adopt: the prior sibling's cow_break already
+                    // called share() on these sub-PAs; convert our valid
+                    // entry to a shared marker so future walks COW-break.
                     unsafe {
-                        *new_table.add(i) = F::make_shared_entry(sub_pa);
+                        *table.add(i) = F::make_shared_entry(sub_pa);
                     }
                 } else {
                     // Superpage/block: downgrade to read-only for COW.
                     unsafe {
-                        *new_table.add(i) = F::make_readonly(entry);
+                        *table.add(i) = F::make_readonly(entry);
                     }
                 }
             }
             // Shared markers and empty entries: unchanged.
         }
     } else {
-        // Broken table is a leaf — entries are data page PTEs.
+        // Table is a leaf — entries are data page PTEs.
         for i in 0..ENTRIES_PER_TABLE {
-            let entry = unsafe { *new_table.add(i) };
+            let entry = unsafe { *table.add(i) };
             if F::is_valid(entry) {
                 unsafe {
-                    *new_table.add(i) = F::make_readonly(entry);
+                    *table.add(i) = F::make_readonly(entry);
                 }
             }
         }
     }
 
-    Some(new_pa)
+    Some(result_pa)
 }
 
 /// Ensure the entire walk path from root to the leaf level for `va` contains

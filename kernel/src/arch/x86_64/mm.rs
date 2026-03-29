@@ -181,6 +181,7 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate
     // PML4[0]: both have deep-copied PDPTs. Share PDPT[4+] (user entries).
     let parent_e0 = unsafe { *parent_pml4 };
     let child_e0 = unsafe { *child_pml4 };
+
     if X86Pte::is_valid(parent_e0)
         && X86Pte::is_table(parent_e0)
         && X86Pte::is_valid(child_e0)
@@ -198,6 +199,13 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate
                     *parent_pdpt.add(i) = shared;
                     *child_pdpt.add(i) = shared;
                 }
+            } else if X86Pte::is_shared_entry(entry) {
+                // Already shared from a prior fork — include in child and bump refcount.
+                let sub_pa = X86Pte::shared_entry_pa(entry);
+                ForkGroup::share(fg, sub_pa);
+                unsafe {
+                    *child_pdpt.add(i) = entry;
+                }
             }
         }
     }
@@ -212,6 +220,12 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate
             unsafe {
                 *parent_pml4.add(i) = shared;
                 *child_pml4.add(i) = shared;
+            }
+        } else if X86Pte::is_shared_entry(entry) {
+            let sub_pa = X86Pte::shared_entry_pa(entry);
+            ForkGroup::share(fg, sub_pa);
+            unsafe {
+                *child_pml4.add(i) = entry;
             }
         }
     }

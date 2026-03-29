@@ -170,6 +170,12 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate
                 *parent.add(i) = shared;
                 *child.add(i) = shared;
             }
+        } else if LoongArchPte::is_shared_entry(entry) {
+            let sub_pa = LoongArchPte::shared_entry_pa(entry);
+            ForkGroup::share(fg, sub_pa);
+            unsafe {
+                *child.add(i) = entry;
+            }
         }
     }
 }
