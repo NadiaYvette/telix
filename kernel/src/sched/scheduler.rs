@@ -895,6 +895,10 @@ fn finalize_spawn(
     task_port: u64,
     thread_port: u64,
 ) {
+    // Initialize task fields for a newly spawned process.
+    // NOTE: do NOT use `*task = Task::empty()` here — do_spawn_heavy_work() has
+    // already set up capset/capspace/cur_ports before this function runs.
+    // Only reset fields that could be stale from a reused task slot.
     let task = unsafe { task_mut_from_ref(task_id) };
     task.id = task_id;
     task.active = true;
@@ -919,6 +923,17 @@ fn finalize_spawn(
     task.groups_overflow = parent.groups_overflow;
     task.ngroups = parent.ngroups;
     task.rlimits = parent.rlimits;
+    // Reset fields that finalize_spawn doesn't set but could be stale from slot reuse.
+    task.max_ports = 128;
+    task.max_threads = 32;
+    task.max_pages = 256;
+    task.sa_enabled = false;
+    task.sig_actions = [const { super::task::SignalAction::default() }; super::task::MAX_SIGNALS];
+    task.alarm_deadline_ns = 0;
+    task.alarm_interval_ns = 0;
+    task.sa_pending.store(false, core::sync::atomic::Ordering::Relaxed);
+    task.sa_event.store(0, core::sync::atomic::Ordering::Relaxed);
+    task.sa_waiter.store(u32::MAX, core::sync::atomic::Ordering::Relaxed);
 
     let thread = unsafe { thread_mut_from_ref(thread_id) };
     thread.killed.store(false, Ordering::Release);
@@ -2333,9 +2348,11 @@ pub fn fork_current() -> u64 {
         } else {
             0
         };
-    // Set up child task.
+    // Set up child task. Re-initialize to empty first to avoid stale fields
+    // from a reused task slot (e.g., max_ports from a previous SYS_SET_RLIMIT).
     {
         let task = unsafe { task_mut_from_ref(child_task_id) };
+        *task = Task::empty();
         task.id = child_task_id;
         task.active = true;
         task.port_id = child_task_port;
@@ -2838,6 +2855,15 @@ pub fn take_pending_switch() -> u64 {
     PENDING_SWITCH_SP[cpu].swap(0, Ordering::AcqRel)
 }
 
+/// Check if a pending context switch is queued on this CPU.
+/// Used by syscall dispatch to detect that park_current_for_ipc or handoff_to
+/// changed `current_thread` — callers must skip thread-specific epilogue
+/// (signal delivery, is_killed) since those queries would use the wrong thread.
+pub fn has_pending_switch() -> bool {
+    let cpu = smp::cpu_id() as usize;
+    PENDING_SWITCH_SP[cpu].load(Ordering::Acquire) != 0
+}
+
 /// Get a thread's saved SP. Used by inject_recv_into_frame to write into
 /// a parked thread's exception frame.
 pub fn thread_saved_sp(tid: ThreadId) -> u64 {
@@ -2849,22 +2875,61 @@ pub fn thread_saved_sp(tid: ThreadId) -> u64 {
 /// picks the next runnable thread, and stores its SP in PENDING_SWITCH_SP.
 /// The exception handler will complete the switch on return.
 ///
-/// Unlike block_current() which spins on-CPU, this truly takes the thread
-/// off the run queue and saves its frame for later injection by a sender.
-pub fn park_current_for_ipc(reason: BlockReason) {
+/// Park state constants for the IPC park protocol.
+/// See `park_current_for_ipc` and `wake_parked_thread`.
+pub const PARK_NONE: u8 = 0;
+pub const PARK_ENQUEUED: u8 = 1;
+pub const PARK_COMMITTED: u8 = 2;
+
+/// Pre-save the current exception frame pointer into the thread's `saved_sp`
+/// and set park_state to PARK_ENQUEUED.
+///
+/// Must be called BEFORE the thread becomes visible in a HAMT turnstile
+/// (via `port_enqueue_with_check`), so that if a sender dequeues the thread
+/// and calls `inject_recv_into_frame` before `park_current_for_ipc` runs,
+/// the injection writes to the correct frame.
+pub fn pre_save_frame(tid: ThreadId) {
     let cpu = smp::cpu_id() as usize;
     let frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
+    let t = unsafe { thread_mut_from_ref(tid) };
+    t.saved_sp = frame_sp;
+    // Publish saved_sp before becoming visible. The Release on park_state
+    // ensures saved_sp is visible to any thread that reads park_state ≥ 1.
+    thread_ref(tid).park_state.store(PARK_ENQUEUED, Ordering::Release);
+}
+
+/// Unlike block_current() which spins on-CPU, this truly takes the thread
+/// off the run queue and saves its frame for later injection by a sender.
+///
+/// Uses a CAS-based state machine with `wake_parked_thread` to handle the
+/// race where a sender dequeues and wakes us between HAMT enqueue and this
+/// function. The caller must have already called `pre_save_frame()` (which
+/// sets park_state = PARK_ENQUEUED) and `port_enqueue_with_check()`.
+pub fn park_current_for_ipc(reason: BlockReason) {
+    let cpu = smp::cpu_id() as usize;
 
     let cpu_idx = cpu as u32;
     let pcpu = smp::current();
     let tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
     let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
 
-    // Save current thread's state. Lock-free: we own the running thread.
+    // saved_sp was already set by pre_save_frame(). Set Blocked + reason.
     let t = unsafe { thread_mut_from_ref(tid as ThreadId) };
-    t.saved_sp = frame_sp;
     t.state = ThreadState::Blocked;
     t.blocked_on = reason;
+
+    // Try to commit the park: CAS PARK_ENQUEUED → PARK_COMMITTED.
+    // If this fails, wake_parked_thread already CAS'd PARK_ENQUEUED → PARK_NONE,
+    // meaning a sender woke us before we could switch out. The message is
+    // already injected into our saved frame — just undo Blocked and return.
+    if thread_ref(tid as ThreadId)
+        .park_state
+        .compare_exchange(PARK_ENQUEUED, PARK_COMMITTED, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        t.state = ThreadState::Running;
+        return;
+    }
 
     // Read SA state (lock-free).
     let parked_task_id = t.task_id;
@@ -2922,16 +2987,52 @@ pub fn park_current_for_ipc(reason: BlockReason) {
 }
 
 /// Wake a parked thread by marking it Ready and enqueueing it.
-/// Lock-free: reads prio atomic, writes state directly (safe: thread is Blocked,
-/// only the waker transitions it).
+///
+/// Uses a CAS-based state machine with `park_current_for_ipc`:
+/// - CAS PARK_ENQUEUED → PARK_NONE: early wake (thread not yet off-CPU).
+///   The thread is still running; park_current_for_ipc's CAS will fail and
+///   it will skip the context switch. We must NOT enqueue (thread is running).
+/// - CAS PARK_COMMITTED → PARK_NONE: normal wake (thread is off-CPU).
+///   Set state = Ready and enqueue on a run queue.
 pub fn wake_parked_thread(tid: ThreadId) {
     let tref = thread_ref(tid);
-    if tref.state == ThreadState::Blocked {
+
+    // Try early wake: CAS PARK_ENQUEUED → PARK_NONE.
+    // If the thread hasn't committed to parking yet, just prevent the park.
+    // park_current_for_ipc's CAS(ENQUEUED→COMMITTED) will fail and it will
+    // undo its Blocked state and continue running.
+    if tref
+        .park_state
+        .compare_exchange(PARK_ENQUEUED, PARK_NONE, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        return;
+    }
+
+    // Try normal wake: CAS PARK_COMMITTED → PARK_NONE.
+    // Thread is off-CPU — enqueue it on a run queue.
+    if tref
+        .park_state
+        .compare_exchange(PARK_COMMITTED, PARK_NONE, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        // park_current_for_ipc used a deferred context switch: it set
+        // PENDING_SWITCH_SP on the parking CPU but continued running on the
+        // thread's kernel stack until the exception handler consumed the
+        // pending switch.  We must wait for that consumption before
+        // enqueueing, otherwise the scheduler on another CPU could start
+        // executing on the same kernel stack concurrently.
+        let parked_cpu = tref.last_cpu.load(Ordering::Relaxed) as usize;
+        while PENDING_SWITCH_SP[parked_cpu].load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+        }
+
         let prio = tref.prio.load(Ordering::Acquire);
         let target = tref.last_cpu.load(Ordering::Relaxed);
         unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
         percpu_enqueue(target, prio, tid);
     }
+    // If park_state is PARK_NONE, thread was already woken or never parked. No-op.
 }
 
 /// Get monotonic time in nanoseconds since boot.

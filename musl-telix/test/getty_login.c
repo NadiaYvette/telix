@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <telix/syscall.h>
 #include <telix/vfs.h>
 
 /* Parse /etc/passwd and find a matching user.
@@ -108,6 +109,10 @@ int main(int arg0, int arg1, int arg2) {
             setenv("SHELL", "/tsh", 1);
 
             /* Exec the shell. */
+            {
+                const char *m = "[getty] execve(tsh)...\n";
+                __telix_syscall2(14, (uint64_t)(unsigned long)m, 22);
+            }
             execve("tsh", NULL, NULL);
 
             /* If execve fails, print error and loop. */

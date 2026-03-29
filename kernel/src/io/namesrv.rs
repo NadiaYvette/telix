@@ -89,7 +89,10 @@ pub fn namesrv_server() -> ! {
     loop {
         let msg = match port::recv(srv_port) {
             Ok(m) => m,
-            Err(()) => break,
+            Err(()) => {
+                crate::println!("[namesrv] recv returned Err — exiting loop!");
+                break;
+            }
         };
 
         match msg.tag {
@@ -119,10 +122,11 @@ pub fn namesrv_server() -> ! {
                     }
                 }
 
-                let _ = port::send_nb(
+                let result = port::send_nb(
                     reply_port,
                     Message::new(NS_LOOKUP_OK, [port_id, 0, 0, 0, 0, 0]),
                 );
+                let _ = result;
             }
 
             _ => {}

@@ -606,6 +606,12 @@ static int execute_line(char **tokens, int ntokens) {
 int main(int arg0, int arg1, int arg2) {
     (void)arg0; (void)arg1; (void)arg2;
 
+    /* Debug: confirm tsh reached main (after __telix_init). */
+    {
+        const char *m = "[tsh] main() entered\n";
+        __telix_syscall2(14, (uint64_t)(unsigned long)m, 21);
+    }
+
     /* Ignore SIGINT in the shell process. */
     signal(SIGINT, SIG_IGN);
 

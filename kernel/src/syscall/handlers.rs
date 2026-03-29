@@ -375,6 +375,14 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
     crate::trace::trace_event(crate::trace::EVT_SYSCALL_EXIT, nr as u32, result as u32);
     set_return(frame, result);
 
+    // If park_current_for_ipc or handoff_to ran, current_thread now points to
+    // a DIFFERENT thread. The is_killed and signal delivery checks below would
+    // query the wrong thread — skip them. The exception handler will consume
+    // PENDING_SWITCH_SP and switch to the new thread's frame.
+    if crate::sched::scheduler::has_pending_switch() {
+        return;
+    }
+
     // Check if this thread was killed — terminate before returning to userspace.
     let tid = crate::sched::scheduler::current_thread_id();
     if crate::sched::scheduler::is_killed(tid) {
@@ -591,8 +599,28 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
             auto_grant_reply_caps(receiver_task, &msg);
             inject_recv_into_frame(receiver_tid, &msg);
             crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
-            // Handoff: donate our quantum to receiver, switch immediately.
-            crate::sched::scheduler::handoff_to(receiver_tid);
+            // CAS park_state COMMITTED → NONE: receiver is off-CPU, handoff.
+            // If it's still ENQUEUED (hasn't called park_current_for_ipc yet),
+            // CAS ENQUEUED → NONE so it skips the park. Message is already in
+            // its frame; it will continue on its own CPU.
+            let tref = crate::sched::scheduler::thread_ref(receiver_tid);
+            if tref.park_state.compare_exchange(
+                crate::sched::scheduler::PARK_COMMITTED,
+                crate::sched::scheduler::PARK_NONE,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            ).is_ok() {
+                // Receiver is off-CPU — direct handoff (L4 style).
+                crate::sched::scheduler::handoff_to(receiver_tid);
+            } else {
+                // Receiver hasn't fully parked yet. Prevent it from parking.
+                let _ = tref.park_state.compare_exchange(
+                    crate::sched::scheduler::PARK_ENQUEUED,
+                    crate::sched::scheduler::PARK_NONE,
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Acquire,
+                );
+            }
             0
         }
         crate::ipc::port::SendDirectResult::Queued => 0,
@@ -666,7 +694,22 @@ fn sys_send_to_proxy(target_port: u64, tag: u64, data: [u64; 6], blocking: bool)
             inject_recv_into_frame(receiver_tid, &proxy_msg);
             crate::sched::boost_priority(receiver_tid, proxy_msg.data[5] as u8);
             if blocking {
-                crate::sched::scheduler::handoff_to(receiver_tid);
+                let tref = crate::sched::scheduler::thread_ref(receiver_tid);
+                if tref.park_state.compare_exchange(
+                    crate::sched::scheduler::PARK_COMMITTED,
+                    crate::sched::scheduler::PARK_NONE,
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Acquire,
+                ).is_ok() {
+                    crate::sched::scheduler::handoff_to(receiver_tid);
+                } else {
+                    let _ = tref.park_state.compare_exchange(
+                        crate::sched::scheduler::PARK_ENQUEUED,
+                        crate::sched::scheduler::PARK_NONE,
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Acquire,
+                    );
+                }
             } else {
                 crate::sched::scheduler::wake_parked_thread(receiver_tid);
             }
@@ -1892,7 +1935,22 @@ fn sys_send_cap(
             auto_grant_reply_caps(recv_task, &msg);
             inject_recv_into_frame(receiver_tid, &msg);
             crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
-            crate::sched::scheduler::handoff_to(receiver_tid);
+            let tref = crate::sched::scheduler::thread_ref(receiver_tid);
+            if tref.park_state.compare_exchange(
+                crate::sched::scheduler::PARK_COMMITTED,
+                crate::sched::scheduler::PARK_NONE,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            ).is_ok() {
+                crate::sched::scheduler::handoff_to(receiver_tid);
+            } else {
+                let _ = tref.park_state.compare_exchange(
+                    crate::sched::scheduler::PARK_ENQUEUED,
+                    crate::sched::scheduler::PARK_NONE,
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Acquire,
+                );
+            }
             0
         }
         crate::ipc::port::SendDirectResult::Queued => 0,

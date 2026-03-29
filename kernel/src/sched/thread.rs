@@ -90,6 +90,13 @@ pub struct Thread {
     pub cosched_group: core::sync::atomic::AtomicU32,
     pub last_cpu: core::sync::atomic::AtomicU32,
     pub affinity_mask: super::cpumask::AtomicCpuMask,
+    // --- IPC park state machine (recv_or_park / park_current_for_ipc) ---
+    /// Atomic park state for the Dekker-safe park protocol.
+    /// 0 = PARK_NONE (not parking), 1 = PARK_ENQUEUED (in HAMT, saved_sp set,
+    /// not yet off-CPU), 2 = PARK_COMMITTED (off-CPU, context switch done).
+    /// Transitions: recv_or_park sets 0→1, park_current_for_ipc CAS 1→2,
+    /// wake_parked_thread CAS 1→0 (early) or CAS 2→0 (normal).
+    pub park_state: core::sync::atomic::AtomicU8,
     // --- Turnstile futex support ---
     /// Pre-allocated turnstile (phys addr as usize, 0 = none/lent).
     pub turnstile: core::sync::atomic::AtomicUsize,
@@ -129,6 +136,7 @@ impl Thread {
             sig_altstack_size: 0,
             run_next: core::sync::atomic::AtomicU32::new(0),
             run_prev: core::sync::atomic::AtomicU32::new(0),
+            park_state: core::sync::atomic::AtomicU8::new(0),
             wakeup: core::sync::atomic::AtomicBool::new(false),
             prio: core::sync::atomic::AtomicU8::new(255),
             yield_asap: core::sync::atomic::AtomicBool::new(false),

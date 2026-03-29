@@ -171,6 +171,8 @@ pub fn initiate_fault(token: u32) {
         scheduler::wake_parked_thread(pager_tid);
     }
 
+    // Pre-save frame pointer before parking (Dekker protocol — see park_current_for_ipc).
+    scheduler::pre_save_frame(scheduler::current_thread_id());
     // Park the faulting thread.
     scheduler::park_current_for_ipc(BlockReason::PagerFault);
 }
@@ -245,6 +247,8 @@ pub fn wait_fault(aspace_id: u64) -> Option<(u32, usize, u32, u64, usize)> {
         }
     }
 
+    // Pre-save frame pointer before parking (Dekker protocol — see park_current_for_ipc).
+    scheduler::pre_save_frame(scheduler::current_thread_id());
     // No faults pending. Park. initiate_fault will see our waiter registration,
     // inject fault data into our frame, and wake us.
     scheduler::park_current_for_ipc(BlockReason::PagerWait);

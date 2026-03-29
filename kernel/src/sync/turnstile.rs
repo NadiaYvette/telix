@@ -915,6 +915,39 @@ pub fn port_wake_one(port_id: u64, key_type: u8) -> Option<u32> {
     Some(tid)
 }
 
+/// Unconditionally enqueue a thread on a port turnstile.
+/// Used to re-enqueue a parked receiver that was dequeued but could not be
+/// woken (e.g. because no message was available to inject).
+pub fn port_enqueue_raw(port_id: u64, key_type: u8, tid: u32) {
+    let hash = port_key_hash(port_id, key_type);
+    let bucket = bucket_index(hash);
+    let aspace_id = 0u64;
+    let va = port_id as usize;
+
+    let mut root = WAIT_HAMT[bucket].lock();
+
+    let ts_ptr = if let Some(ts) = hamt_lookup(&root, hash, key_type, aspace_id, va) {
+        ts
+    } else {
+        let ts_ptr = match take_or_alloc_turnstile(tid) {
+            Some(p) => p,
+            None => return,
+        };
+        init_turnstile(ts_ptr, key_type, aspace_id, va, hash);
+        if !hamt_insert(&mut root, hash, ts_ptr) {
+            free_turnstile(ts_ptr);
+            return;
+        }
+        ts_ptr
+    };
+
+    let ts = unsafe { &mut *ts_ptr };
+    ts_enqueue(ts, tid);
+    thread_ref(tid)
+        .ts_blocked_on
+        .store(ts_ptr as usize, Ordering::Relaxed);
+}
+
 /// Dequeue one waiter from a port turnstile WITHOUT waking it.
 /// Returns the dequeued tid, or `None` if no waiters.
 /// The caller is responsible for waking the thread (e.g. after injecting a message).

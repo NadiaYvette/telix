@@ -642,6 +642,7 @@ fn wake_recv_waiter(port_id: PortId) {
         // exception frame (just like DirectTransfer). Dequeue from the MPSC
         // queue and inject before waking. The receiver is parked (not running),
         // so we are the sole consumer of the MPSC queue right now.
+        let mut injected = false;
         if let Some(port) = port_ref(port_id) {
             if let Some(q) = port.mpsc() {
                 if let Some(msg) = q.recv() {
@@ -651,14 +652,25 @@ fn wake_recv_waiter(port_id: PortId) {
                         port_id,
                         crate::sync::turnstile::KEY_PORT_SEND,
                     );
+                    injected = true;
                 }
             }
         }
-        crate::sched::scheduler::wake_parked_thread(tid);
+        // Only wake if we actually injected a message. Without injection the
+        // receiver's frame still has stale syscall args — waking it would
+        // return garbage to userspace.  If no message was available (rare
+        // concurrent-consume race), the message is already in the queue and a
+        // future recv_or_park will pick it up; re-enqueue the thread so the
+        // next send can wake it.
+        if injected {
+            crate::sched::scheduler::wake_parked_thread(tid);
+        } else {
+            // Re-enqueue on turnstile so a future send finds this waiter.
+            crate::sync::turnstile::port_enqueue_raw(port_id, KEY_PORT_RECV_PARK, tid);
+        }
         return;
     }
     // Then try normal recv blockers (spin-waiting via block_current).
-
     crate::sync::turnstile::port_wake_one(port_id, KEY_PORT_RECV);
 }
 
@@ -902,6 +914,11 @@ pub fn recv_or_park(port_id: PortId) -> Result<Message, ()> {
         return Ok(msg);
     }
 
+    // Pre-save the exception frame pointer BEFORE becoming visible in the HAMT.
+    // This ensures that if a sender dequeues us and calls inject_recv_into_frame
+    // before park_current_for_ipc runs, it writes to the correct frame.
+    crate::sched::scheduler::pre_save_frame(my_tid);
+
     // Park: enqueue as parked receiver with lost-wakeup check, then go off-CPU.
     // Uses KEY_PORT_RECV_PARK so send_direct can distinguish parked receivers
     // (eligible for direct message injection) from normal recv blockers.
@@ -924,14 +941,20 @@ pub fn recv_or_park(port_id: PortId) -> Result<Message, ()> {
         crate::sched::scheduler::park_current_for_ipc(BlockReason::PortRecv(port_id));
         Err(())
     } else {
-        // Condition changed (message arrived) — retry recv.
+        // Condition changed (message arrived) — reset park_state and retry recv.
+        crate::sched::scheduler::thread_ref(my_tid)
+            .park_state
+            .store(crate::sched::scheduler::PARK_NONE, Ordering::Release);
         if let Some(msg) = q.recv() {
             crate::sync::turnstile::port_wake_one(port_id, KEY_PORT_SEND);
             crate::sched::stats::IPC_RECVS.fetch_add(1, Ordering::Relaxed);
             crate::sched::boost_priority(my_tid, msg.data[5] as u8);
             Ok(msg)
         } else {
-            Err(())
+            // Lost message: port_enqueue_with_check said non-empty, but q.recv() returned None.
+            // Concurrent wake_recv_waiter consumed the message. Retry.
+            // Retry from the top.
+            return recv_or_park(port_id);
         }
     }
 }
