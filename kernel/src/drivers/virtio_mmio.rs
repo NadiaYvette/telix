@@ -150,6 +150,12 @@ const FALLBACK_ADDRS: &[(usize, u32)] = &[
 #[cfg(target_arch = "x86_64")]
 const FALLBACK_ADDRS: &[(usize, u32)] = &[];
 
+#[cfg(target_arch = "loongarch64")]
+const FALLBACK_ADDRS: &[(usize, u32)] = &[]; // TODO: QEMU virt virtio addresses
+
+#[cfg(target_arch = "mips64")]
+const FALLBACK_ADDRS: &[(usize, u32)] = &[]; // Malta has no virtio
+
 /// Find the first virtio device of the given type.
 /// Returns the MMIO base address if found. Checks firmware-discovered
 /// devices first, then falls back to probing hardcoded addresses.

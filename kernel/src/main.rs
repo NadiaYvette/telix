@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
 
 mod arch;
 mod cap;
@@ -368,6 +369,22 @@ fn test_demand_paging() {
             core::arch::asm!("mov {}, cr3", out(reg) cr3);
         }
         (cr3 & !0xFFF) as usize
+    };
+    #[cfg(target_arch = "loongarch64")]
+    let pt_root = {
+        let pa = mm::phys::alloc_page().expect("alloc pt root");
+        unsafe {
+            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE);
+        }
+        pa.as_usize()
+    };
+    #[cfg(target_arch = "mips64")]
+    let pt_root = {
+        let pa = mm::phys::alloc_page().expect("alloc pt root");
+        unsafe {
+            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE);
+        }
+        pa.as_usize()
     };
 
     let aspace_id = mm::aspace::create(pt_root).expect("create aspace");

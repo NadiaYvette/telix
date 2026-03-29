@@ -91,6 +91,18 @@ pub const SUPERPAGE_LEVELS: &[SuperpageLevel] = &[
     SuperpageLevel { size: 1 << 30, shift: 30, pt_level: 0 },        // 1 GiB (Sv39 gigapage)
 ];
 
+#[cfg(target_arch = "loongarch64")]
+pub const SUPERPAGE_LEVELS: &[SuperpageLevel] = &[
+    SuperpageLevel { size: 2 << 20, shift: 21, pt_level: 2 },        // 2 MiB (PMD huge page)
+    SuperpageLevel { size: 1 << 30, shift: 30, pt_level: 1 },        // 1 GiB (PUD huge page)
+];
+
+#[cfg(target_arch = "mips64")]
+pub const SUPERPAGE_LEVELS: &[SuperpageLevel] = &[
+    SuperpageLevel { size: 2 << 20, shift: 21, pt_level: 1 },        // 2 MiB (PMD superpage)
+    SuperpageLevel { size: 1 << 30, shift: 30, pt_level: 0 },        // 1 GiB (PGD superpage)
+];
+
 // ---------------------------------------------------------------------------
 // Backward-compatible aliases — refer to smallest superpage level (index 0).
 // Existing code uses these; new code should prefer SUPERPAGE_LEVELS directly.

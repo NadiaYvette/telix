@@ -13,6 +13,12 @@ rustflags = ["-C", "link-arg=-Tkernel/src/arch/riscv64/linker.ld"]
 runner = "tools/run-qemu-x86.sh"
 rustflags = ["-C", "link-arg=-Tkernel/src/arch/x86_64/linker.ld", "-C", "code-model=small", "-C", "relocation-model=static"]
 
+[target.loongarch64-unknown-none]
+rustflags = ["-C", "link-arg=-Tkernel/src/arch/loongarch64/linker.ld"]
+
+[target.mips64el-telix-none]
+rustflags = ["-C", "link-arg=-Tkernel/src/arch/mips64/linker.ld"]
+
 [unstable]
 build-std = ["core"]
 build-std-features = ["compiler-builtins-mem"]

@@ -14,7 +14,9 @@ ROOTDIR="$(cd "$(dirname "$0")/.." && pwd)"
 case "$ARCH" in
     aarch64) TARGET="aarch64-unknown-none" ;;
     riscv64) TARGET="riscv64gc-unknown-none-elf" ;;
-    x86_64)  TARGET="x86_64-unknown-none" ;;
+    x86_64)      TARGET="x86_64-unknown-none" ;;
+    loongarch64) TARGET="loongarch64-unknown-none" ;;
+    mips64)      TARGET="targets/mips64el-telix-none.json" ;;
     *)
         echo "Unknown arch: $ARCH"
         exit 1
@@ -27,12 +29,16 @@ echo "=== Building userspace for $ARCH ==="
 
 # Step 2: Build kernel.
 echo "=== Building kernel for $ARCH ($TARGET) ==="
+EXTRA_FLAGS=""
+if [ "$ARCH" = "mips64" ]; then
+    EXTRA_FLAGS="-Z build-std=core -Z build-std-features=compiler-builtins-mem -Z json-target-spec"
+fi
 RUSTUP_TOOLCHAIN=nightly \
     RUSTC="${RUSTC:-$HOME/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc}" \
     "$HOME/.cargo/bin/cargo" build \
     --target "$TARGET" \
     -p telix-kernel \
-    $RELEASE_FLAG
+    $RELEASE_FLAG $EXTRA_FLAGS
 
 echo "=== Build complete ==="
 echo "Kernel: $ROOTDIR/target/$TARGET/${2:+release}${2:-debug}/telix-kernel"

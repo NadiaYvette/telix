@@ -43,6 +43,33 @@ pub fn disable() -> usize {
         }
         flags as usize
     }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let crmd: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrrd {out}, 0x0",    // read CRMD
+                "li.w {tmp}, 0x4",     // IE bit = bit 2
+                "csrxchg $zero, {tmp}, 0x0", // clear IE
+                out = out(reg) crmd,
+                tmp = out(reg) _,
+            );
+        }
+        crmd
+    }
+    #[cfg(target_arch = "mips64")]
+    {
+        let status: usize;
+        unsafe {
+            core::arch::asm!(
+                "mfc0 {0}, $12",   // read CP0.Status
+                "di",              // disable interrupts
+                "ehb",             // execution hazard barrier
+                out(reg) status,
+            );
+        }
+        status
+    }
 }
 
 /// Restore interrupt state from a previous `disable()` call.
@@ -68,6 +95,27 @@ pub fn restore(saved: usize) {
             }
         }
     }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        if saved & 0x4 != 0 {
+            // IE was set — restore it.
+            unsafe {
+                core::arch::asm!(
+                    "li.w {tmp}, 0x4",
+                    "csrxchg {tmp}, {tmp}, 0x0", // set IE in CRMD
+                    tmp = out(reg) _,
+                );
+            }
+        }
+    }
+    #[cfg(target_arch = "mips64")]
+    {
+        if saved & 0x1 != 0 {
+            unsafe {
+                core::arch::asm!("ei", "ehb");
+            }
+        }
+    }
 }
 
 /// Unconditionally enable IRQs.
@@ -84,6 +132,18 @@ pub fn enable() {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!("sti");
+    }
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!(
+            "li.w {tmp}, 0x4",
+            "csrxchg {tmp}, {tmp}, 0x0",
+            tmp = out(reg) _,
+        );
+    }
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        core::arch::asm!("ei", "ehb");
     }
 }
 
@@ -127,6 +187,33 @@ pub fn save_and_enable() -> usize {
         }
         flags as usize
     }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let crmd: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrrd {out}, 0x0",
+                "li.w {tmp}, 0x4",
+                "csrxchg {tmp}, {tmp}, 0x0",
+                out = out(reg) crmd,
+                tmp = out(reg) _,
+            );
+        }
+        crmd
+    }
+    #[cfg(target_arch = "mips64")]
+    {
+        let status: usize;
+        unsafe {
+            core::arch::asm!(
+                "mfc0 {0}, $12",
+                "ei",
+                "ehb",
+                out(reg) status,
+            );
+        }
+        status
+    }
 }
 
 /// Wait for the next interrupt (WFI/HLT).
@@ -143,6 +230,14 @@ pub fn wait_for_interrupt() {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!("hlt");
+    }
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!("idle 0");
+    }
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        core::arch::asm!("wait");
     }
 }
 
@@ -166,6 +261,14 @@ pub fn enable_device_irq(irq: u32) {
     }
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::pic::unmask(irq as u8);
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let _ = irq; // TODO: EIOINTC enable
+    }
+    #[cfg(target_arch = "mips64")]
+    {
+        let _ = irq; // TODO: CP0 Status IM bits
+    }
 }
 
 /// Normalize a platform IRQ number to a dispatch table index.
@@ -180,6 +283,14 @@ pub fn normalize_irq(irq: u32) -> usize {
         (irq - 1) as usize
     }
     #[cfg(target_arch = "x86_64")]
+    {
+        irq as usize
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        irq as usize
+    }
+    #[cfg(target_arch = "mips64")]
     {
         irq as usize
     }
@@ -199,5 +310,13 @@ pub const fn valid_irq_range() -> (u32, u32) {
     #[cfg(target_arch = "x86_64")]
     {
         (1, 15)
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        (1, 15) // TODO: EIOINTC IRQ range
+    }
+    #[cfg(target_arch = "mips64")]
+    {
+        (1, 7) // CP0 Cause IP bits
     }
 }

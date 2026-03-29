@@ -31,6 +31,22 @@ pub fn cpu_id() -> u32 {
         let lapic_id = unsafe { core::ptr::read_volatile((base + 0x020) as *const u32) };
         (lapic_id >> 24) & 0xFF
     }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let id: u64;
+        unsafe {
+            core::arch::asm!("csrrd {}, 0x20", out(reg) id); // CSR.CPUID
+        }
+        id as u32
+    }
+    #[cfg(target_arch = "mips64")]
+    {
+        let id: u64;
+        unsafe {
+            core::arch::asm!("mfc0 {}, $15, 1", out(reg) id); // CP0 EBase
+        }
+        (id & 0x3FF) as u32 // CPUNum field
+    }
 }
 
 /// Set the user-space TLS base register.
@@ -52,6 +68,16 @@ pub fn set_tls(base: u64) {
             core::arch::asm!("wrmsr", in("ecx") 0xC0000100u32, in("eax") lo, in("edx") hi);
         }
     }
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        // LoongArch: tp register ($r2) is the TLS base.
+        core::arch::asm!("move $r2, {}", in(reg) base);
+    }
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        // MIPS: UserLocal CP0 register for TLS.
+        core::arch::asm!("dmtc0 {}, $4, 2", in(reg) base); // CP0.UserLocal
+    }
 }
 
 /// Initialize the BSP's CPU ID register.
@@ -66,6 +92,8 @@ pub fn init_bsp_cpu_id() {
         core::arch::asm!("mv tp, zero");
     }
     // x86_64: LAPIC ID 0 is BSP on QEMU — no setup needed.
+    // loongarch64: CSR.CPUID is read-only, returns 0 for BSP.
+    // mips64: EBase.CPUNum is read-only, 0 for BSP.
 }
 
 /// Flush the instruction cache. No-op on x86_64 (coherent i-cache).
@@ -80,4 +108,14 @@ pub fn flush_icache() {
         core::arch::asm!("fence.i");
     }
     // x86_64: instruction cache is coherent with data cache.
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!("ibar 0");
+    }
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        // MIPS: SYNCI instruction per cache line, or use CACHE op.
+        // For now, full pipeline sync.
+        core::arch::asm!("sync", ".set push", ".set mips64r2", "synci 0($zero)", ".set pop");
+    }
 }

@@ -13,6 +13,16 @@ pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64 as platform;
 
+#[cfg(target_arch = "loongarch64")]
+pub mod loongarch64;
+#[cfg(target_arch = "loongarch64")]
+pub use loongarch64 as platform;
+
+#[cfg(target_arch = "mips64")]
+pub mod mips64;
+#[cfg(target_arch = "mips64")]
+pub use mips64 as platform;
+
 // Architecture-independent abstraction layers.
 pub mod cpu;
 pub mod elf;

@@ -19,6 +19,22 @@ pub fn read_cycles() -> u64 {
     {
         crate::arch::x86_64::timer::rdtsc()
     }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let val: u64;
+        unsafe {
+            core::arch::asm!("rdtime.d {0}, $zero", out(reg) val);
+        }
+        val
+    }
+    #[cfg(target_arch = "mips64")]
+    {
+        let val: u64;
+        unsafe {
+            core::arch::asm!("dmfc0 {0}, $9", out(reg) val); // CP0.Count
+        }
+        val
+    }
 }
 
 /// Return the timer/counter frequency in Hz.
@@ -36,6 +52,14 @@ pub fn timer_freq() -> u64 {
     {
         1_000_000_000
     } // approximate RDTSC freq on QEMU
+    #[cfg(target_arch = "loongarch64")]
+    {
+        100_000_000
+    } // QEMU virt Stable Counter = 100 MHz
+    #[cfg(target_arch = "mips64")]
+    {
+        100_000_000
+    } // QEMU Malta CP0.Count = 100 MHz
 }
 
 /// Get monotonic time in nanoseconds since boot.

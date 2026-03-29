@@ -14,6 +14,10 @@ pub use crate::arch::aarch64::exception::ExceptionFrame;
 pub use crate::arch::riscv64::trap::TrapFrame as ExceptionFrame;
 #[cfg(target_arch = "x86_64")]
 pub use crate::arch::x86_64::exception::ExceptionFrame;
+#[cfg(target_arch = "loongarch64")]
+pub use crate::arch::loongarch64::trap::TrapFrame as ExceptionFrame;
+#[cfg(target_arch = "mips64")]
+pub use crate::arch::mips64::trap::TrapFrame as ExceptionFrame;
 
 // ---------------------------------------------------------------------------
 // Platform constants
@@ -26,17 +30,27 @@ pub const USER_STACK_TOP: usize = 0x7FFF_F000_0000;
 pub const USER_STACK_TOP: usize = 0x3F_F000_0000;
 #[cfg(target_arch = "x86_64")]
 pub const USER_STACK_TOP: usize = 0x7FFF_FFFF_0000;
+#[cfg(target_arch = "loongarch64")]
+pub const USER_STACK_TOP: usize = 0x7FFF_F000_0000;
+#[cfg(target_arch = "mips64")]
+pub const USER_STACK_TOP: usize = 0x0000_007F_F000_0000;
 
 /// Size of the exception frame saved/restored by the trap entry/exit assembly.
 /// AArch64: 288 bytes = 36 x u64 (x0-x30, sp_el0, elr, spsr, esr, _pad).
 /// RISC-V:  272 bytes = 34 x u64 (x1-x31, sepc, sstatus, scause).
 /// x86-64:  176 bytes = 22 x u64 (r15-rax, vector, error_code, rip, cs, rflags, rsp, ss).
+/// LoongArch64: 280 bytes = 35 x u64 (r0-r31, era, prmd, estat).
+/// MIPS64:  288 bytes = 36 x u64 (r0-r31, epc, status, cause, badvaddr).
 #[cfg(target_arch = "aarch64")]
 pub const EXCEPTION_FRAME_SIZE: usize = 288;
 #[cfg(target_arch = "riscv64")]
 pub const EXCEPTION_FRAME_SIZE: usize = 272;
 #[cfg(target_arch = "x86_64")]
 pub const EXCEPTION_FRAME_SIZE: usize = 176;
+#[cfg(target_arch = "loongarch64")]
+pub const EXCEPTION_FRAME_SIZE: usize = 280;
+#[cfg(target_arch = "mips64")]
+pub const EXCEPTION_FRAME_SIZE: usize = 288;
 
 /// Approved device MMIO physical address range for sys_mmap_device (start, end).
 /// (0, 0) means MMIO device mapping is disabled on this platform.
@@ -46,6 +60,10 @@ pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x0a00_0000, 0x0a00_7000);
 pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x1000_1000, 0x1000_9000);
 #[cfg(target_arch = "x86_64")]
 pub const DEVICE_MMIO_RANGE: (usize, usize) = (0, 0);
+#[cfg(target_arch = "loongarch64")]
+pub const DEVICE_MMIO_RANGE: (usize, usize) = (0, 0); // TODO: EIOINTC MMIO range
+#[cfg(target_arch = "mips64")]
+pub const DEVICE_MMIO_RANGE: (usize, usize) = (0, 0); // TODO: Malta PCI MMIO range
 
 /// PTE flags for device memory mapping (user-accessible, device-nGnRnE on AArch64).
 #[inline]
@@ -69,6 +87,14 @@ pub fn device_pte_flags() -> u64 {
     {
         0
     } // unreachable — DEVICE_MMIO_RANGE is (0,0)
+    #[cfg(target_arch = "loongarch64")]
+    {
+        0
+    }
+    #[cfg(target_arch = "mips64")]
+    {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +116,14 @@ pub fn syscall_nr(frame: &ExceptionFrame) -> u64 {
     {
         frame.rax()
     }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        frame.regs[11]
+    } // a7 = $r11
+    #[cfg(target_arch = "mips64")]
+    {
+        frame.regs[2]
+    } // v0 = $2
 }
 
 /// Get syscall argument by index (0-5).
@@ -115,6 +149,14 @@ pub fn syscall_arg(frame: &ExceptionFrame, n: usize) -> u64 {
             _ => 0,
         }
     }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        frame.regs[4 + n]
+    } // a0-a5 = $r4-$r9
+    #[cfg(target_arch = "mips64")]
+    {
+        frame.regs[4 + n]
+    } // a0-a5 = $4-$9
 }
 
 /// Set the syscall return value in the frame.
@@ -132,6 +174,14 @@ pub fn set_return(frame: &mut ExceptionFrame, val: u64) {
     {
         frame.set_rax(val);
     }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        frame.regs[4] = val;
+    } // a0 = $r4
+    #[cfg(target_arch = "mips64")]
+    {
+        frame.regs[2] = val;
+    } // v0 = $2
 }
 
 /// Set additional return register by index (for recv multi-register return).
@@ -159,6 +209,14 @@ pub fn set_reg(frame: &mut ExceptionFrame, reg: usize, val: u64) {
             _ => {}
         }
     }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        frame.regs[4 + reg] = val;
+    } // a0-a7 = $r4-$r11
+    #[cfg(target_arch = "mips64")]
+    {
+        frame.regs[4 + reg] = val;
+    } // a0-a7 = $4-$11
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +238,14 @@ pub fn user_sp(frame: &ExceptionFrame) -> usize {
     {
         frame.rsp() as usize
     }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        frame.regs[3] as usize
+    } // sp = $r3
+    #[cfg(target_arch = "mips64")]
+    {
+        frame.regs[29] as usize
+    } // sp = $29
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +281,18 @@ pub unsafe fn init_kernel_frame(frame: *mut u64, entry: usize, stack_top: usize)
             *frame.add(19) = 0x200; // RFLAGS = IF (interrupts enabled)
             *frame.add(20) = stack_top as u64; // RSP
             *frame.add(21) = 0x10; // SS = kernel data segment
+        }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            *frame.add(32) = entry as u64; // ERA
+            // PRMD: PLV=0 (kernel), PIE=1 (enable interrupts on ertn)
+            *frame.add(33) = 1 << 2;
+        }
+        #[cfg(target_arch = "mips64")]
+        {
+            *frame.add(32) = entry as u64; // EPC
+            // Status: KSU=0 (kernel), EXL=0, IE=1 (interrupts enabled)
+            *frame.add(33) = 1;
         }
     }
 }
@@ -263,6 +341,28 @@ pub unsafe fn init_user_frame(frame: *mut u64, entry: usize, sp: usize, args: &[
                 *frame.add(ARG_INDICES[i]) = val;
             }
         }
+        #[cfg(target_arch = "loongarch64")]
+        {
+            *frame.add(32) = entry as u64; // ERA
+            // PRMD: PLV=3 (user), PIE=1
+            *frame.add(33) = (3 << 0) | (1 << 2);
+            *frame.add(3) = sp as u64; // sp = $r3
+            // args in a0-a2 = $r4-$r6
+            for (i, &val) in args.iter().enumerate().take(3) {
+                *frame.add(4 + i) = val;
+            }
+        }
+        #[cfg(target_arch = "mips64")]
+        {
+            *frame.add(32) = entry as u64; // EPC
+            // Status: KSU=2 (user), EXL=0, IE=1
+            *frame.add(33) = (2 << 3) | 1;
+            *frame.add(29) = sp as u64; // sp = $29
+            // args in a0-a2 = $4-$6
+            for (i, &val) in args.iter().enumerate().take(3) {
+                *frame.add(4 + i) = val;
+            }
+        }
     }
 }
 
@@ -285,6 +385,14 @@ pub unsafe fn set_frame_arg(frame: *mut u64, n: usize, val: u64) {
         {
             *frame.add(n + 9) = val;
         } // rdi=9, rsi=10, rdx=11
+        #[cfg(target_arch = "loongarch64")]
+        {
+            *frame.add(n + 4) = val;
+        } // a0=4, a1=5, a2=6
+        #[cfg(target_arch = "mips64")]
+        {
+            *frame.add(n + 4) = val;
+        } // a0=4, a1=5, a2=6
     }
 }
 
@@ -339,6 +447,24 @@ pub fn setup_signal_entry(
             *fp.add(20) = call_sp as u64; // RSP = adjusted stack
         }
     }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let _ = (copy_to_user_fn, pt_root);
+        frame.regs[4] = sig;        // a0 = signal number
+        frame.regs[5] = frame_addr; // a1 = signal frame address
+        frame.regs[3] = new_sp as u64; // sp
+        frame.regs[1] = 0;          // ra = 0
+        frame.era = handler;        // PC = handler
+    }
+    #[cfg(target_arch = "mips64")]
+    {
+        let _ = (copy_to_user_fn, pt_root);
+        frame.regs[4] = sig;        // a0 = signal number
+        frame.regs[5] = frame_addr; // a1 = signal frame address
+        frame.regs[29] = new_sp as u64; // sp
+        frame.regs[31] = 0;         // ra = 0
+        frame.epc = handler;        // PC = handler
+    }
 }
 
 /// Update the kernel stack pointer for the next thread on context switches.
@@ -356,4 +482,7 @@ pub fn update_kernel_stack(_next_kstack_top: usize) {
             crate::sched::smp::TRAP_SCRATCH_ARRAY[cpu].kernel_sp = _next_kstack_top as u64;
         }
     }
+
+    // LoongArch64: TODO — write to CSR.SAVE0 or scratch array
+    // MIPS64: TODO — write to KScratch or scratch array
 }
