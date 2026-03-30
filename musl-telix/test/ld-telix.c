@@ -37,6 +37,8 @@
 #define R_RELATIVE 3      /* R_RISCV_RELATIVE */
 #elif defined(__x86_64__)
 #define R_RELATIVE 8      /* R_X86_64_RELATIVE */
+#elif defined(__mips__) || defined(__mips64)
+#define R_RELATIVE 128    /* R_MIPS_REL32 — closest equivalent */
 #else
 #error "Unsupported architecture"
 #endif

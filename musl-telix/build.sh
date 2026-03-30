@@ -29,8 +29,14 @@ case "$ARCH" in
         ARCHFLAGS="-target x86_64-unknown-none -mcmodel=large -mno-red-zone -mno-sse -mno-sse2 -mno-mmx"
         LINKSCRIPT="$MUSL/link-x86_64.ld"
         ;;
+    mips64)
+        CC="${CC:-clang}"
+        TARGET="mips64el-unknown-none"
+        ARCHFLAGS="--target=mips64el-unknown-elf -march=mips64r2 -mabi=64 -mno-abicalls -fno-pic -G0"
+        LINKSCRIPT="$MUSL/link-mips64.ld"
+        ;;
     *)
-        echo "Unknown arch: $ARCH (expected aarch64, riscv64, x86_64)"
+        echo "Unknown arch: $ARCH (expected aarch64, riscv64, x86_64, mips64)"
         exit 1
         ;;
 esac
@@ -101,6 +107,9 @@ link_binary() {
             ld.lld -T "$LINKSCRIPT" --static "$@" -o "$OUTPUT"
             ;;
         riscv64)
+            ld.lld -T "$LINKSCRIPT" --static "$@" -o "$OUTPUT"
+            ;;
+        mips64)
             ld.lld -T "$LINKSCRIPT" --static "$@" -o "$OUTPUT"
             ;;
     esac

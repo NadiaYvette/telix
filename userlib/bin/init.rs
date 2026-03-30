@@ -7220,21 +7220,39 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             let ps_id = ps as u32;
             let test_port = syscall::port_create();
-            syscall::port_set_add(ps_id, test_port);
-
-            // Timeout recv on empty port set — should return u64::MAX.
-            let r = syscall::port_set_recv_timeout(ps_id, 1000);
-            if r != u64::MAX {
-                syscall::debug_puts(b"    FAIL: port_set_recv_timeout should timeout\n");
+            if !syscall::port_set_add(ps_id, test_port) {
+                syscall::debug_puts(b"    FAIL: port_set_add\n");
                 phase75_ok = false;
             }
 
-            // Send a message then recv — should succeed.
-            syscall::send_nb(test_port, 0xBEEF, 42, 0);
-            let r2 = syscall::port_set_recv_timeout(ps_id, 1_000_000);
-            if r2 == u64::MAX {
-                syscall::debug_puts(b"    FAIL: port_set_recv_timeout should have data\n");
-                phase75_ok = false;
+            if phase75_ok {
+                // Timeout recv on empty port set — should return u64::MAX.
+                let r = syscall::port_set_recv_timeout(ps_id, 1000);
+                if r != u64::MAX {
+                    syscall::debug_puts(b"    FAIL: timeout recv returned ");
+                    print_num(r);
+                    syscall::debug_puts(b" (expected MAX)\n");
+                    phase75_ok = false;
+                }
+            }
+
+            if phase75_ok {
+                // Send a message then recv — should succeed.
+                let sr = syscall::send_nb(test_port, 0xBEEF, 42, 0);
+                if sr != 0 {
+                    syscall::debug_puts(b"    FAIL: send_nb returned ");
+                    print_num(sr);
+                    syscall::debug_puts(b"\n");
+                    phase75_ok = false;
+                }
+            }
+
+            if phase75_ok {
+                let r2 = syscall::port_set_recv_timeout(ps_id, 1_000_000);
+                if r2 == u64::MAX {
+                    syscall::debug_puts(b"    FAIL: recv_timeout returned MAX (no data)\n");
+                    phase75_ok = false;
+                }
             }
 
             syscall::port_destroy(test_port);
