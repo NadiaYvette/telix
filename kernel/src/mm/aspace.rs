@@ -78,19 +78,23 @@ impl AddressSpace {
     pub fn map_anon(
         &mut self,
         va_start: usize,
-        page_count: usize,
+        mmu_page_count: usize,
         prot: VmaProt,
     ) -> Option<&mut Vma> {
+        // Convert MMUPAGE_SIZE units to allocation page count.
+        let mc = page::page_mmucount();
+        let alloc_pages = (mmu_page_count + mc - 1) / mc;
+
         // Create the backing memory object.
-        let obj_id = object::create_anon(page_count as u16)?;
+        let obj_id = object::create_anon(alloc_pages as u16)?;
 
         // Register the mapping in the object.
         object::with_object(obj_id, |obj| {
             obj.add_mapping(self.id, va_start);
         });
 
-        // Insert into the VMA tree.
-        let va_len = page_count * page::page_size();
+        // Insert into the VMA tree (va_len in bytes, using MMUPAGE_SIZE units).
+        let va_len = mmu_page_count * page::MMUPAGE_SIZE;
         match self.vmas.insert(va_start, va_len, prot, obj_id, 0) {
             Some(vma) => Some(vma),
             None => {
@@ -116,10 +120,10 @@ impl AddressSpace {
         false
     }
 
-    /// Allocate `page_count` pages of heap VA space with ASLR.
-    pub fn alloc_heap_va(&mut self, page_count: usize) -> usize {
+    /// Allocate `byte_len` bytes of heap VA space.
+    pub fn alloc_heap_va(&mut self, byte_len: usize) -> usize {
         let va = self.heap_next;
-        self.heap_next += page_count * page::page_size();
+        self.heap_next += byte_len;
         va
     }
 

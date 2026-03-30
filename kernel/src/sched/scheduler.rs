@@ -796,20 +796,21 @@ fn do_spawn_heavy_work(
     const USER_STACK_TOP: usize = crate::arch::trapframe::USER_STACK_TOP;
 
     let ps = page::page_size();
-    let stack_pages = 2;
-    let stack_va = USER_STACK_TOP - stack_pages * ps;
+    let stack_alloc_pages = 2;
+    let stack_mmu_pages = stack_alloc_pages * page::page_mmucount();
+    let stack_va = USER_STACK_TOP - stack_alloc_pages * ps;
 
     let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
         let vma = aspace
-            .map_anon(stack_va, stack_pages, crate::mm::vma::VmaProt::ReadWrite)
+            .map_anon(stack_va, stack_mmu_pages, crate::mm::vma::VmaProt::ReadWrite)
             .ok_or(())?;
         Ok::<_, ()>(vma.object_id)
     })
     .ok()?;
 
     // Eagerly allocate and map stack pages.
-    let mmu_count = ps / MMUPAGE_SIZE;
-    for page_idx in 0..stack_pages {
+    let mmu_count = page::page_mmucount();
+    for page_idx in 0..stack_alloc_pages {
         let page_va = stack_va + page_idx * ps;
 
         let pa = crate::mm::object::with_object(obj_id, |obj| {
@@ -1266,21 +1267,22 @@ pub fn spawn_user_with_data(
 
     // Map data pages into the child's address space (still no SCHEDULER lock).
     let ps = page::page_size();
-    let data_pages = (data.len() + ps - 1) / ps;
-    if data_pages > 0 {
+    let data_alloc_pages = (data.len() + ps - 1) / ps;
+    let data_mmu_pages = data_alloc_pages * page::page_mmucount();
+    if data_alloc_pages > 0 {
         let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
             let vma = aspace
-                .map_anon(data_va, data_pages, crate::mm::vma::VmaProt::ReadOnly)
+                .map_anon(data_va, data_mmu_pages, crate::mm::vma::VmaProt::ReadOnly)
                 .ok_or(())?;
             Ok::<_, ()>(vma.object_id)
         })
         .ok()?;
 
-        let mmu_count = ps / MMUPAGE_SIZE;
+        let mmu_count = page::page_mmucount();
         let sw_z = crate::mm::fault::sw_zeroed_bit();
         let pte_flags = crate::mm::hat::USER_RO_FLAGS | sw_z;
 
-        for page_idx in 0..data_pages {
+        for page_idx in 0..data_alloc_pages {
             let page_va = data_va + page_idx * ps;
             let pa = crate::mm::object::with_object(obj_id, |obj| {
                 obj.ensure_page(page_idx).map(|(pa, _)| pa)

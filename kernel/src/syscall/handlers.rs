@@ -367,7 +367,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_PORT_RESIZE => sys_port_resize(a0, a1),
         SYS_FUTEX_WAIT_PI => crate::sync::turnstile::futex_wait_pi(a0 as usize, a1 as u32),
         SYS_FUTEX_WAKE_PI => crate::sync::turnstile::futex_wake_pi(a0 as usize),
-        SYS_PAGE_SIZE => crate::mm::page::page_size() as u64,
+        SYS_PAGE_SIZE => crate::mm::page::MMUPAGE_SIZE as u64,
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -936,15 +936,18 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     use crate::mm::vma::VmaProt;
 
     let ps = page::page_size();
+    let mmu_count = page::page_mmucount();
     let aspace_id = crate::sched::scheduler::current_aspace_id();
     if aspace_id == 0 {
         return u64::MAX; // kernel context
     }
 
-    let pages = page_count as usize;
-    if pages == 0 || pages > 256 {
+    // page_count from userspace is in MMUPAGE_SIZE (4K) units.
+    let mmu_pages = page_count as usize;
+    if mmu_pages == 0 || mmu_pages > 256 * mmu_count {
         return u64::MAX;
     }
+    let alloc_pages = (mmu_pages + mmu_count - 1) / mmu_count;
 
     let noreplace = flags & crate::mm::aspace::MAP_FIXED_NOREPLACE != 0;
 
@@ -952,11 +955,11 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     let task_id = crate::sched::current_task_id();
     if task_id != 0 {
         let task = crate::sched::scheduler::task_ref(task_id);
-        if task.cur_pages + pages as u32 > task.max_pages {
+        if task.cur_pages + alloc_pages as u32 > task.max_pages {
             return u64::MAX;
         }
         // Enforce RLIMIT_AS: total virtual memory in bytes.
-        let new_bytes = (task.cur_pages as u64 + pages as u64) * ps as u64;
+        let new_bytes = (task.cur_pages as u64 + alloc_pages as u64) * ps as u64;
         let rlimit_as = task.rlimits[crate::sched::task::RLIMIT_AS as usize].cur;
         if rlimit_as != crate::sched::task::RLIM_INFINITY && new_bytes > rlimit_as {
             return u64::MAX;
@@ -971,9 +974,12 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
         _ => return u64::MAX,
     };
 
+    // VA length in bytes (MMUPAGE_SIZE units).
+    let va_len = mmu_pages * MMUPAGE_SIZE;
+
     // Determine VA: auto-pick if hint is 0, otherwise use hint.
     let va = if va_hint == 0 {
-        crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(pages))
+        crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(va_len))
     } else {
         va_hint as usize
     };
@@ -981,16 +987,16 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     // MAP_FIXED_NOREPLACE: fail if overlapping existing VMA.
     if noreplace {
         let overlaps = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-            aspace.overlaps_vma(va, pages * ps)
+            aspace.overlaps_vma(va, va_len)
         });
         if overlaps {
             return u64::MAX;
         }
     }
 
-    // Create VMA + backing object.
+    // Create VMA + backing object (map_anon takes mmu_page_count).
     let obj_id = match crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-        aspace.map_anon(va, pages, prot).map(|vma| vma.object_id)
+        aspace.map_anon(va, mmu_pages, prot).map(|vma| vma.object_id)
     }) {
         Some(id) => id,
         None => return u64::MAX,
@@ -1006,7 +1012,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
         crate::mm::hat::pte_flags_for_prot(prot) | sw_z
     };
 
-    for page_idx in 0..pages {
+    for page_idx in 0..alloc_pages {
         let page_va = va + page_idx * ps;
 
         let pa = match crate::mm::object::try_with_object(obj_id, |obj| {
@@ -1022,10 +1028,12 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
             core::ptr::write_bytes(pa_usize as *mut u8, 0, ps);
         }
 
-        // Map each MMU page.
-        for mmu_idx in 0..page::page_mmucount() {
-            let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
-            let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
+        // Map each MMU page within this alloc page, but only up to mmu_pages total.
+        let mmu_start = page_idx * mmu_count;
+        let mmu_end = core::cmp::min(mmu_start + mmu_count, mmu_pages);
+        for mmu_idx in mmu_start..mmu_end {
+            let mmu_va = va + mmu_idx * MMUPAGE_SIZE;
+            let mmu_pa = pa_usize + (mmu_idx - mmu_start) * MMUPAGE_SIZE;
 
             crate::mm::hat::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
         }
@@ -1042,7 +1050,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
 
     // Increment page quota counter.
     if task_id != 0 {
-        unsafe { crate::sched::scheduler::task_mut_from_ref(task_id) }.cur_pages += pages as u32;
+        unsafe { crate::sched::scheduler::task_mut_from_ref(task_id) }.cur_pages += alloc_pages as u32;
     }
 
     va as u64
@@ -1155,7 +1163,7 @@ fn sys_mmap_device(phys_addr: u64, page_count: u64) -> u64 {
     }
 
     // Allocate VA in userspace heap.
-    let va = crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(total_pages));
+    let va = crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(total_pages * 4096));
 
     let pt_root = crate::sched::scheduler::current_page_table_root();
     let pte_flags = trapframe::device_pte_flags();
@@ -1698,19 +1706,20 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     let strings_with_nulls = string_total + (argc + envc); // each string gets a null terminator
     let ptr_table_size = (1 + argc + 1 + envc + 1 + 14) * 8; // argc + argv[] + NULL + envp[] + NULL + 7 auxv pairs
     let stack_needed = strings_with_nulls + ptr_table_size + 256; // 256 bytes margin
-    let stack_pages = ((stack_needed + ps - 1) / ps).max(2);
-    let stack_va = USER_STACK_TOP - stack_pages * ps;
+    let stack_alloc_pages = ((stack_needed + ps - 1) / ps).max(2);
+    let stack_mmu_pages = stack_alloc_pages * page::page_mmucount();
+    let stack_va = USER_STACK_TOP - stack_alloc_pages * ps;
 
     let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
         aspace
-            .map_anon(stack_va, stack_pages, crate::mm::vma::VmaProt::ReadWrite)
+            .map_anon(stack_va, stack_mmu_pages, crate::mm::vma::VmaProt::ReadWrite)
             .map(|vma| vma.object_id)
     })
     .expect("execve: stack map");
 
     // Eagerly allocate and map stack pages.
-    let mmu_count = ps / MMUPAGE_SIZE;
-    for page_idx in 0..stack_pages {
+    let mmu_count = page::page_mmucount();
+    for page_idx in 0..stack_alloc_pages {
         let page_va = stack_va + page_idx * ps;
 
         let pa = crate::mm::object::with_object(obj_id, |obj| {
@@ -2363,10 +2372,13 @@ fn sys_mmap_file(
         return u64::MAX;
     }
 
-    let pages = page_count as usize;
-    if pages == 0 || pages > 256 {
+    // page_count from userspace is in MMUPAGE_SIZE (4K) units.
+    let mmu_pages = page_count as usize;
+    let mmu_count = page::page_mmucount();
+    if mmu_pages == 0 || mmu_pages > 256 * mmu_count {
         return u64::MAX;
     }
+    let alloc_pages = (mmu_pages + mmu_count - 1) / mmu_count;
 
     let prot = match prot {
         0 => VmaProt::ReadOnly,
@@ -2376,16 +2388,19 @@ fn sys_mmap_file(
         _ => return u64::MAX,
     };
 
+    // VA length in bytes (MMUPAGE_SIZE units).
+    let va_len = mmu_pages * page::MMUPAGE_SIZE;
+
     // Determine VA.
     let va = if va_hint == 0 {
-        crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(pages))
+        crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(va_len))
     } else {
         va_hint as usize
     };
 
     // Create pager-backed object (gets a normal port for fault IPC).
     let obj_id =
-        match crate::mm::object::create_pager(pages as u16, file_handle as u32, file_offset) {
+        match crate::mm::object::create_pager(alloc_pages as u16, file_handle as u32, file_offset) {
             Some(id) => id,
             None => return u64::MAX,
         };
@@ -2409,7 +2424,6 @@ fn sys_mmap_file(
         crate::mm::object::with_object(obj_id, |obj| {
             obj.add_mapping(aspace_id, va);
         });
-        let va_len = pages * ps;
         aspace.vmas.insert(va, va_len, prot, obj_id, 0).is_some()
     });
 

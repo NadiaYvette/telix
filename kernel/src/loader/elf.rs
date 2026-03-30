@@ -304,7 +304,7 @@ fn load_segment(
             } else {
                 // Need to create a new single-page VMA.
                 let vma = aspace
-                    .map_anon(page_va, 1, prot)
+                    .map_anon(page_va, page::page_mmucount(), prot)
                     .ok_or(ElfError::MapFailed)?;
                 Ok((vma.object_id, false, pte_flags))
             }

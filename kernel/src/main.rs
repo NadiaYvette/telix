@@ -466,16 +466,17 @@ fn test_demand_paging() {
     // Use a high VA to avoid conflicting with kernel identity mapping.
     // L0 index 1 = VA 0x80_0000_0000 onwards (not used by kernel).
     let test_va = 0x80_0000_0000usize;
-    let num_pages = 4;
+    let num_alloc_pages = 4;
+    let num_mmu_pages = num_alloc_pages * page::page_mmucount();
     mm::aspace::with_aspace(aspace_id, |aspace| {
         let vma = aspace
-            .map_anon(test_va, num_pages, VmaProt::ReadWrite)
+            .map_anon(test_va, num_mmu_pages, VmaProt::ReadWrite)
             .expect("map_anon");
-        println!("  Mapped {} pages at VA {:#x}", num_pages, test_va);
+        println!("  Mapped {} pages at VA {:#x}", num_alloc_pages, test_va);
 
         assert_eq!(mm::fault::count_installed_ptes(pt_root, vma), 0);
-        assert_eq!(vma.page_count(), num_pages);
-        assert_eq!(vma.mmu_page_count(), num_pages * page::page_mmucount());
+        assert_eq!(vma.page_count(), num_alloc_pages);
+        assert_eq!(vma.mmu_page_count(), num_alloc_pages * page::page_mmucount());
     });
 
     // Simulate demand faults by calling handle_page_fault directly.
