@@ -1,12 +1,24 @@
 //! Page size constants and address types.
+//!
+//! PAGE_SIZE/PAGE_SHIFT are compile-time constants (needed for array sizes, const fns).
+//! For boot-time configurable page size, use `page_size()` / `page_shift()` which
+//! read from boot configuration when `page_mmushift` was set on the command line.
+
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Hardware MMU page size (4 KiB on all supported architectures).
 pub const MMUPAGE_SIZE: usize = 4096;
 #[allow(dead_code)]
 pub const MMUPAGE_SHIFT: usize = 12;
 
-/// Allocation page size: configurable multiple of MMUPAGE_SIZE.
-/// Selected at compile time via cargo features.
+/// Maximum allocation page size (256 KiB). Used for array sizing so that a
+/// single binary can handle any boot-time page_mmushift value (0–6).
+pub const MAX_PAGE_SIZE: usize = 262144;
+pub const MAX_PAGE_SHIFT: usize = 18;
+
+/// Compile-time default allocation page size (selected via cargo features).
+/// Used for array sizing and const contexts. Runtime code should prefer
+/// `page_size()` / `page_shift()` which respect the boot-time configuration.
 #[cfg(feature = "page_size_16k")]
 pub const PAGE_SIZE: usize = 16384;
 #[cfg(feature = "page_size_16k")]
@@ -27,12 +39,55 @@ pub const PAGE_SIZE: usize = 262144;
 #[cfg(feature = "page_size_256k")]
 pub const PAGE_SHIFT: usize = 18;
 
-/// Number of MMU pages per allocation page.
+/// Number of MMU pages per allocation page (compile-time default).
 pub const PAGE_MMUCOUNT: usize = PAGE_SIZE / MMUPAGE_SIZE;
 
-/// Shift from MMU-page index to allocation-page index (log2(PAGE_MMUCOUNT)).
+/// Shift from MMU-page index to allocation-page index (compile-time default).
 #[allow(dead_code)]
 pub const PAGE_MMUSHIFT: usize = PAGE_SHIFT - MMUPAGE_SHIFT;
+
+// ---------------------------------------------------------------------------
+// Runtime page size (boot-time configurable)
+// ---------------------------------------------------------------------------
+
+/// Runtime page size, initialized from boot command line before phys::init().
+/// Zero means "not yet initialized" — page_size() falls back to compile-time default.
+static RUNTIME_PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
+static RUNTIME_PAGE_SHIFT: AtomicUsize = AtomicUsize::new(0);
+static RUNTIME_PAGE_MMUCOUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Initialize runtime page size from boot-configured mmushift.
+/// Called once during early boot, after command line parsing, before phys::init().
+pub fn init_runtime_page_size(mmushift: u8) {
+    let shift = MMUPAGE_SHIFT + mmushift as usize;
+    let size = MMUPAGE_SIZE << mmushift;
+    let mmucount = 1usize << mmushift;
+    RUNTIME_PAGE_SIZE.store(size, Ordering::Release);
+    RUNTIME_PAGE_SHIFT.store(shift, Ordering::Release);
+    RUNTIME_PAGE_MMUCOUNT.store(mmucount, Ordering::Release);
+}
+
+/// Runtime allocation page size. Returns the boot-configured value if set,
+/// otherwise falls back to the compile-time default.
+#[inline]
+pub fn page_size() -> usize {
+    let v = RUNTIME_PAGE_SIZE.load(Ordering::Relaxed);
+    if v != 0 { v } else { PAGE_SIZE }
+}
+
+/// Runtime allocation page shift (log2 of page_size()).
+#[inline]
+pub fn page_shift() -> usize {
+    let v = RUNTIME_PAGE_SHIFT.load(Ordering::Relaxed);
+    if v != 0 { v } else { PAGE_SHIFT }
+}
+
+/// Runtime MMU pages per allocation page.
+#[inline]
+pub fn page_mmucount() -> usize {
+    let v = RUNTIME_PAGE_MMUCOUNT.load(Ordering::Relaxed);
+    if v != 0 { v } else { PAGE_MMUCOUNT }
+}
 
 // ---------------------------------------------------------------------------
 // Superpage (large page) level table — architecture-dependent

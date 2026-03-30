@@ -185,7 +185,7 @@ fn alloc_node256(partial: &[u8]) -> Option<*mut Node256> {
     let pa = phys::alloc_page()?;
     let p = pa.as_usize() as *mut Node256;
     unsafe {
-        core::ptr::write_bytes(p as *mut u8, 0, crate::mm::page::PAGE_SIZE);
+        core::ptr::write_bytes(p as *mut u8, 0, crate::mm::page::page_size());
         (*p).h.node_type = NODE256;
         let plen = partial.len().min(MAX_PARTIAL);
         (*p).h.partial_len = plen as u8;

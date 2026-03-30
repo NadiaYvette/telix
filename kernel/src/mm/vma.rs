@@ -1,7 +1,7 @@
 //! Virtual Memory Area (VMA) — describes a contiguous virtual address range
 //! within an address space, backed by a memory object.
 
-use super::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE};
+use super::page::{self, MMUPAGE_SIZE};
 
 /// VMA protection flags.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,7 +62,8 @@ impl Vma {
 
     /// Number of allocation pages spanned by this VMA (ceiling).
     pub fn page_count(&self) -> usize {
-        (self.va_len + PAGE_SIZE - 1) / PAGE_SIZE
+        let ps = page::page_size();
+        (self.va_len + ps - 1) / ps
     }
 
     /// Number of MMU pages in this VMA.
@@ -84,7 +85,7 @@ impl Vma {
     /// Compute the VMA-local allocation page index for a virtual address.
     #[allow(dead_code)]
     pub fn page_index_of(&self, va: usize) -> usize {
-        (va - self.va_start) / PAGE_SIZE
+        (va - self.va_start) / page::page_size()
     }
 
     // --- Object-space helpers ---
@@ -93,22 +94,23 @@ impl Vma {
 
     /// Allocation page index in the backing object for a VMA-local `mmu_idx`.
     pub fn obj_page_index(&self, mmu_idx: usize) -> usize {
-        (self.object_offset as usize + mmu_idx) / PAGE_MMUCOUNT
+        (self.object_offset as usize + mmu_idx) / page::page_mmucount()
     }
 
     /// MMU page offset within the allocation page for a VMA-local `mmu_idx`.
     pub fn mmu_offset_in_page(&self, mmu_idx: usize) -> usize {
-        (self.object_offset as usize + mmu_idx) % PAGE_MMUCOUNT
+        (self.object_offset as usize + mmu_idx) % page::page_mmucount()
     }
 
     /// Range of VMA-local MMU indices that share the same allocation page
     /// as `mmu_idx`. Returns `(start, end)` where the range is `[start, end)`.
     pub fn alloc_page_mmu_range(&self, mmu_idx: usize) -> (usize, usize) {
+        let pmc = page::page_mmucount();
         let obj_mmu = self.object_offset as usize + mmu_idx;
-        let page_base = obj_mmu - (obj_mmu % PAGE_MMUCOUNT);
+        let page_base = obj_mmu - (obj_mmu % pmc);
         let start = page_base.saturating_sub(self.object_offset as usize);
         let end =
-            (page_base + PAGE_MMUCOUNT - self.object_offset as usize).min(self.mmu_page_count());
+            (page_base + pmc - self.object_offset as usize).min(self.mmu_page_count());
         (start, end)
     }
 }

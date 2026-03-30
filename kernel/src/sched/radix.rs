@@ -11,13 +11,20 @@
 //! are cache-hot on active CPUs. Growth is append-only: L1 pages are
 //! allocated under the caller's serializing lock and never freed.
 
-use crate::mm::page::PAGE_SIZE;
+use crate::mm::page;
 use crate::mm::phys;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-/// Number of pointer entries per allocation page.
-pub const RADIX_FANOUT: usize = PAGE_SIZE / core::mem::size_of::<usize>();
+/// Maximum pointer entries per allocation page (upper bound for const contexts).
+#[allow(dead_code)]
+pub const RADIX_FANOUT: usize = page::MAX_PAGE_SIZE / core::mem::size_of::<usize>();
+
+/// Runtime pointer entries per allocation page.
+#[inline]
+fn radix_fanout() -> usize {
+    page::page_size() / core::mem::size_of::<usize>()
+}
 
 /// Two-level radix page table. Type-erased (stores `*mut u8`).
 /// Callers cast to/from the concrete entity type.
@@ -41,7 +48,7 @@ impl RadixTable {
         let pa = phys::alloc_page().expect("radix L0 alloc");
         let p = pa.as_usize() as *mut u8;
         unsafe {
-            ptr::write_bytes(p, 0, PAGE_SIZE);
+            ptr::write_bytes(p, 0, page::page_size());
         }
         self.l0.store(p as *mut AtomicPtr<u8>, Ordering::Release);
     }
@@ -55,10 +62,11 @@ impl RadixTable {
             return ptr::null_mut();
         }
 
-        let l0_idx = (id as usize) / RADIX_FANOUT;
-        let l1_idx = (id as usize) % RADIX_FANOUT;
+        let fanout = radix_fanout();
+        let l0_idx = (id as usize) / fanout;
+        let l1_idx = (id as usize) % fanout;
 
-        if l0_idx >= RADIX_FANOUT {
+        if l0_idx >= fanout {
             return ptr::null_mut();
         }
 
@@ -78,8 +86,9 @@ impl RadixTable {
     #[inline]
     pub fn set(&self, id: u32, val: *mut u8) {
         let l0 = self.l0.load(Ordering::Relaxed);
-        let l0_idx = (id as usize) / RADIX_FANOUT;
-        let l1_idx = (id as usize) % RADIX_FANOUT;
+        let fanout = radix_fanout();
+        let l0_idx = (id as usize) / fanout;
+        let l1_idx = (id as usize) % fanout;
 
         let l1_page = unsafe { &*l0.add(l0_idx) }.load(Ordering::Relaxed);
         let l1 = l1_page as *const AtomicPtr<u8>;
@@ -95,8 +104,9 @@ impl RadixTable {
             return false;
         }
 
-        let l0_idx = (id as usize) / RADIX_FANOUT;
-        if l0_idx >= RADIX_FANOUT {
+        let fanout = radix_fanout();
+        let l0_idx = (id as usize) / fanout;
+        if l0_idx >= fanout {
             return false;
         }
 
@@ -112,7 +122,7 @@ impl RadixTable {
         };
         let p = pa.as_usize() as *mut u8;
         unsafe {
-            ptr::write_bytes(p, 0, PAGE_SIZE);
+            ptr::write_bytes(p, 0, page::page_size());
         }
         entry.store(p, Ordering::Release);
         true
@@ -120,8 +130,9 @@ impl RadixTable {
 
     /// Maximum entity ID supported by this two-level table.
     #[inline]
-    pub const fn capacity() -> usize {
-        RADIX_FANOUT * RADIX_FANOUT
+    pub fn capacity() -> usize {
+        let f = radix_fanout();
+        f * f
     }
 }
 

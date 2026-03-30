@@ -5,7 +5,7 @@
 //! the pool, allowing the fault handler to skip per-sub-page zeroing when
 //! the entire 64 KiB allocation page is already zero.
 
-use super::page::{PAGE_SIZE, PhysAddr};
+use super::page::{self, PhysAddr};
 use super::phys;
 use super::stats;
 use crate::sync::SpinLock;
@@ -103,10 +103,10 @@ pub fn zero_daemon() -> ! {
             }
         };
 
-        // Zero the full PAGE_SIZE page. This is the expensive part and
+        // Zero the full page. This is the expensive part and
         // happens WITHOUT holding any lock.
         unsafe {
-            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, page::page_size());
         }
 
         // Push the zeroed page into the pool.

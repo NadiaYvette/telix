@@ -4,6 +4,7 @@
 //! x0 contains the physical address of the device tree blob (DTB).
 
 use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::firmware::dtb::Fdt;
 
 /// DTB pointer saved from boot for later parsing.
 pub static DTB_ADDR: AtomicUsize = AtomicUsize::new(0);
@@ -52,5 +53,36 @@ pub fn parse_firmware() {
             nc,
             nd
         );
+
+        // Extract kernel command line from /chosen/bootargs.
+        extract_bootargs(dtb);
+    }
+}
+
+/// Extract bootargs from DTB /chosen node and save as kernel command line.
+fn extract_bootargs(dtb_addr: usize) {
+    let data = unsafe {
+        let ptr = dtb_addr as *const u8;
+        let header = core::slice::from_raw_parts(ptr, 8);
+        let total_size = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        core::slice::from_raw_parts(ptr, total_size)
+    };
+    let fdt = match Fdt::new(data) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    if let Some(chosen) = fdt.find_node(b"/chosen") {
+        if let Some(bootargs) = chosen.property(b"bootargs") {
+            // bootargs data may include a trailing null — strip it.
+            let mut cmdline = bootargs.data;
+            if cmdline.last() == Some(&0) {
+                cmdline = &cmdline[..cmdline.len() - 1];
+            }
+            if !cmdline.is_empty() {
+                crate::boot::cmdline::save_cmdline(cmdline);
+                crate::println!("  DTB: bootargs \"{}\"",
+                    core::str::from_utf8(cmdline).unwrap_or("?"));
+            }
+        }
     }
 }

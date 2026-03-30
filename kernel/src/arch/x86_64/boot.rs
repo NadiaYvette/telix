@@ -41,6 +41,31 @@ pub fn parse_firmware() {
         crate::firmware::multiboot::parse(info);
         let nr = crate::firmware::mem_regions().len();
         crate::println!("  Multiboot: {} memory regions", nr);
+
+        // Extract kernel command line (flags bit 2 → cmdline at offset 16).
+        let info_ptr = info as *const u8;
+        let flags = unsafe { core::ptr::read_unaligned(info_ptr as *const u32) };
+        if flags & (1 << 2) != 0 {
+            let cmdline_addr =
+                unsafe { core::ptr::read_unaligned(info_ptr.add(16) as *const u32) } as usize;
+            if cmdline_addr != 0 {
+                // Find null terminator (C string).
+                let ptr = cmdline_addr as *const u8;
+                let mut len = 0usize;
+                while len < 1024 {
+                    if unsafe { *ptr.add(len) } == 0 {
+                        break;
+                    }
+                    len += 1;
+                }
+                if len > 0 {
+                    let cmdline = unsafe { core::slice::from_raw_parts(ptr, len) };
+                    crate::boot::cmdline::save_cmdline(cmdline);
+                    crate::println!("  Multiboot: cmdline \"{}\"",
+                        core::str::from_utf8(cmdline).unwrap_or("?"));
+                }
+            }
+        }
     }
 
     crate::firmware::acpi::find_and_parse();

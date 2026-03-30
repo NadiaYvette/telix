@@ -25,7 +25,7 @@ use crate::sync::SpinLock;
 const OBJ_SLAB_SIZE: usize = 256;
 
 /// Mappings per page in a MemObject's mapping list.
-const MAPPINGS_PER_PAGE: usize = super::page::PAGE_SIZE / core::mem::size_of::<Mapping>();
+const MAPPINGS_PER_PAGE: usize = super::page::MAX_PAGE_SIZE / core::mem::size_of::<Mapping>();
 
 /// Object type tag.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -145,7 +145,7 @@ impl MemObject {
             None => return false,
         };
         unsafe {
-            core::ptr::write_bytes(page as *mut u8, 0, super::page::PAGE_SIZE);
+            core::ptr::write_bytes(page as *mut u8, 0, super::page::page_size());
         }
         self.mappings = page;
         self.mappings_cap = MAPPINGS_PER_PAGE as u16;

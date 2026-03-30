@@ -3,6 +3,7 @@
 #![cfg_attr(target_arch = "mips64", feature(asm_experimental_arch))]
 
 mod arch;
+mod boot;
 mod cap;
 mod drivers;
 mod firmware;
@@ -33,6 +34,13 @@ pub fn kmain() -> ! {
     // devices. Must happen before phys::init() — firmware data lives in
     // physical memory that the allocator could overwrite.
     arch::platform::parse_firmware();
+
+    // Parse kernel command line (extracted from firmware by parse_firmware).
+    // Must happen before phys::init() since page_mmushift affects allocation.
+    boot::cmdline::parse();
+    let mmushift = boot::cmdline::page_mmushift();
+    mm::page::init_runtime_page_size(mmushift);
+    println!("  Page size: {} bytes (mmushift={})", mm::page::page_size(), mmushift);
 
     // Physical memory allocator.
     // Start managed RAM at kernel_end so the allocator never touches
@@ -391,8 +399,9 @@ fn test_capabilities() {
 // --- Phase 2: Demand paging test ---
 
 fn test_demand_paging() {
-    use mm::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE};
+    use mm::page::{self, MMUPAGE_SIZE};
     use mm::vma::VmaProt;
+    let ps = page::page_size();
 
     // Get the current page table root.
     #[cfg(target_arch = "aarch64")]
@@ -465,15 +474,15 @@ fn test_demand_paging() {
 
         assert_eq!(mm::fault::count_installed_ptes(pt_root, vma), 0);
         assert_eq!(vma.page_count(), num_pages);
-        assert_eq!(vma.mmu_page_count(), num_pages * PAGE_MMUCOUNT);
+        assert_eq!(vma.mmu_page_count(), num_pages * page::page_mmucount());
     });
 
     // Simulate demand faults by calling handle_page_fault directly.
     let test_addrs = [
         test_va,
         test_va + MMUPAGE_SIZE,
-        test_va + PAGE_SIZE,
-        test_va + 2 * PAGE_SIZE + 3 * MMUPAGE_SIZE,
+        test_va + ps,
+        test_va + 2 * ps + 3 * MMUPAGE_SIZE,
     ];
 
     for &addr in &test_addrs {

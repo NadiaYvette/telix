@@ -25,7 +25,7 @@
 //! slots in the reservation instead of allocating scattered single pages.
 //! This preserves physical contiguity for superpage re-promotion.
 
-use super::page::{PAGE_SIZE, PhysAddr, SUPERPAGE_ALLOC_PAGES, SUPERPAGE_LEVELS};
+use super::page::{self, PhysAddr, SUPERPAGE_ALLOC_PAGES, SUPERPAGE_LEVELS};
 use super::stats;
 use core::sync::atomic::Ordering;
 use crate::ipc::port::{self, PortId};
@@ -177,7 +177,7 @@ impl GroupExtent {
                 if dest_pa != 0 {
                     for slot in 0..self.page_count as usize {
                         if copied & (1u64 << slot) == 0 {
-                            super::phys::free_page(PhysAddr::new(dest_pa + slot * PAGE_SIZE));
+                            super::phys::free_page(PhysAddr::new(dest_pa + slot * page::page_size()));
                         }
                     }
                 }
@@ -351,7 +351,9 @@ impl GroupExtent {
 }
 
 /// Extents per page of the page-allocated extent array.
-const EXTENTS_PER_PAGE: usize = PAGE_SIZE / core::mem::size_of::<GroupExtent>();
+fn extents_per_page() -> usize {
+    page::page_size() / core::mem::size_of::<GroupExtent>()
+}
 
 // ---------------------------------------------------------------------------
 // Per-group state
@@ -435,10 +437,10 @@ impl CowGroup {
             None => return false,
         };
         unsafe {
-            core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(page as *mut u8, 0, page::page_size());
         }
         self.extents = page;
-        self.extents_cap = EXTENTS_PER_PAGE as u16;
+        self.extents_cap = extents_per_page() as u16;
         true
     }
 
@@ -497,7 +499,7 @@ impl CowGroup {
                 let base = self.pool_pa + i * sub_size;
                 let pages = SUPERPAGE_LEVELS[0].alloc_pages();
                 for p in 0..pages {
-                    super::phys::free_page(PhysAddr::new(base + p * PAGE_SIZE));
+                    super::phys::free_page(PhysAddr::new(base + p * page::page_size()));
                 }
             }
         }
@@ -688,7 +690,7 @@ impl CowGroup {
                 } // tracking-only reservation
                 for slot in 0..ext.page_count as usize {
                     if r.copied & (1u64 << slot) == 0 {
-                        super::phys::free_page(PhysAddr::new(r.dest_pa + slot * PAGE_SIZE));
+                        super::phys::free_page(PhysAddr::new(r.dest_pa + slot * page::page_size()));
                     }
                 }
             }
@@ -914,7 +916,7 @@ pub fn find_or_create_reservation(
                     let r = &guard.extent(ei).reservations[i];
                     let already_copied = r.copied & (1u64 << slot) != 0;
                     return Some(ReservationSlot {
-                        dest_page_pa: r.dest_pa + slot * PAGE_SIZE,
+                        dest_page_pa: r.dest_pa + slot * page::page_size(),
                         already_copied,
                     });
                 }
@@ -924,7 +926,7 @@ pub fn find_or_create_reservation(
                 for s in 0..guard.extent(ei).page_count as usize {
                     if old_copied & (1u64 << s) != 0 {
                         super::phys::free_page(PhysAddr::new(
-                            dest_pa.as_usize() + s * PAGE_SIZE,
+                            dest_pa.as_usize() + s * page::page_size(),
                         ));
                     }
                 }
@@ -1028,7 +1030,7 @@ pub fn find_or_create_reservation(
                     let r = &guard.extent(ei).reservations[i];
                     let already_copied = r.copied & (1u64 << slot) != 0;
                     return Some(ReservationSlot {
-                        dest_page_pa: r.dest_pa + slot * PAGE_SIZE,
+                        dest_page_pa: r.dest_pa + slot * page::page_size(),
                         already_copied,
                     });
                 } else {
@@ -1037,7 +1039,7 @@ pub fn find_or_create_reservation(
                     for s in 0..guard.extent(ei).page_count as usize {
                         if old_copied & (1u64 << s) != 0 {
                             super::phys::free_page(PhysAddr::new(
-                                dest_pa.as_usize() + s * PAGE_SIZE,
+                                dest_pa.as_usize() + s * page::page_size(),
                             ));
                         }
                     }
@@ -1064,7 +1066,7 @@ pub fn find_or_create_reservation(
 
     let r = &guard.extent(ei).reservations[ri];
     let already_copied = r.copied & (1u64 << slot) != 0;
-    let dest_page_pa = r.dest_pa + slot * PAGE_SIZE;
+    let dest_page_pa = r.dest_pa + slot * page::page_size();
 
     Some(ReservationSlot {
         dest_page_pa,

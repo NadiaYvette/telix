@@ -10,7 +10,7 @@
 //! - Automatic coalescing of adjacent extents with identical properties
 //! - Splitting extents on partial remove
 
-use super::page::PhysAddr;
+use super::page::{self, PhysAddr};
 use super::slab;
 use core::ptr;
 
@@ -61,7 +61,7 @@ pub struct ExtentEntry {
 impl ExtentEntry {
     /// Physical address one past the end of this extent.
     pub fn end(&self) -> PhysAddr {
-        PhysAddr::new(self.start.as_usize() + (self.page_count as usize) * super::page::PAGE_SIZE)
+        PhysAddr::new(self.start.as_usize() + (self.page_count as usize) * page::page_size())
     }
 
     /// Whether this extent can be coalesced with `other` (which must start
@@ -399,7 +399,7 @@ impl ExtentTree {
             if addr >= e.start && addr < e.end() && split_at > e.start && split_at < e.end() {
                 let orig_end_pages = e.page_count;
                 let pages_before =
-                    ((split_at.as_usize() - e.start.as_usize()) / super::page::PAGE_SIZE) as u16;
+                    ((split_at.as_usize() - e.start.as_usize()) / page::page_size()) as u16;
                 let pages_after = orig_end_pages - pages_before;
                 let new_entry = ExtentEntry {
                     start: split_at,
@@ -738,7 +738,7 @@ fn test_basic_insert_lookup() {
 
     // Lookup in the middle.
     let found = tree
-        .lookup(PhysAddr::new(0x10_0000 + super::page::PAGE_SIZE))
+        .lookup(PhysAddr::new(0x10_0000 + page::page_size()))
         .unwrap();
     assert_eq!(found.start, PhysAddr::new(0x10_0000));
 
@@ -753,7 +753,7 @@ fn test_basic_insert_lookup() {
 
 fn test_coalesce() {
     let mut tree = ExtentTree::new();
-    let ps = super::page::PAGE_SIZE;
+    let ps = page::page_size();
 
     // Insert two adjacent extents with matching properties — should coalesce.
     let e1 = ExtentEntry {
@@ -795,7 +795,7 @@ fn test_coalesce() {
 
 fn test_split() {
     let mut tree = ExtentTree::new();
-    let ps = super::page::PAGE_SIZE;
+    let ps = page::page_size();
 
     let e = ExtentEntry {
         start: PhysAddr::new(0x10_0000),
@@ -825,7 +825,7 @@ fn test_split() {
 
 fn test_range_query() {
     let mut tree = ExtentTree::new();
-    let ps = super::page::PAGE_SIZE;
+    let ps = page::page_size();
 
     // Insert 3 non-coalescing extents (different object_ids).
     for i in 0..3u32 {
@@ -860,7 +860,7 @@ fn test_range_query() {
 
 fn test_many_inserts() {
     let mut tree = ExtentTree::new();
-    let ps = super::page::PAGE_SIZE;
+    let ps = page::page_size();
 
     // Insert enough extents to trigger leaf splits.
     // Use different object IDs to prevent coalescing.

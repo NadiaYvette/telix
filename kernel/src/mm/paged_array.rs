@@ -7,7 +7,7 @@
 //! Items are zero-initialized when pages are allocated. Items are never
 //! moved once placed — growing adds new pages without disturbing existing ones.
 
-use super::page::PAGE_SIZE;
+use super::page::{self, MAX_PAGE_SIZE};
 use super::phys;
 
 /// A growable array backed by physical pages.
@@ -33,10 +33,17 @@ unsafe impl<T: Send> Sync for PagedArray<T> {}
 
 impl<T> PagedArray<T> {
     /// Items that fit in a single page.
-    pub const ITEMS_PER_PAGE: usize = PAGE_SIZE / core::mem::size_of::<T>();
+    /// Items per page (runtime, based on boot-configured page size).
+    #[inline]
+    pub fn items_per_page() -> usize {
+        page::page_size() / core::mem::size_of::<T>()
+    }
 
-    /// Maximum directory slots per directory page.
-    const DIR_SLOTS: usize = PAGE_SIZE / core::mem::size_of::<*mut T>();
+    /// Directory slots per directory page (runtime).
+    #[inline]
+    fn dir_slots() -> usize {
+        page::page_size() / core::mem::size_of::<*mut T>()
+    }
 
     /// Create an empty PagedArray. No pages are allocated until first use.
     pub const fn new() -> Self {
@@ -51,7 +58,7 @@ impl<T> PagedArray<T> {
     /// Current capacity (items addressable without growing).
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.num_pages * Self::ITEMS_PER_PAGE
+        self.num_pages * Self::items_per_page()
     }
 
     /// Ensure capacity for at least `needed` items. Allocates pages as needed.
@@ -64,10 +71,10 @@ impl<T> PagedArray<T> {
                 None => return false,
             };
             unsafe {
-                core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+                core::ptr::write_bytes(page as *mut u8, 0, page::page_size());
             }
             self.dir = page;
-            self.dir_capacity = Self::DIR_SLOTS;
+            self.dir_capacity = Self::dir_slots();
         }
 
         while self.capacity() < needed {
@@ -80,7 +87,7 @@ impl<T> PagedArray<T> {
             };
             // Zero-initialize the new page.
             unsafe {
-                core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+                core::ptr::write_bytes(page as *mut u8, 0, page::page_size());
                 *self.dir.add(self.num_pages) = page;
             }
             self.num_pages += 1;
@@ -94,8 +101,9 @@ impl<T> PagedArray<T> {
     /// Caller must ensure `idx < capacity()`.
     #[inline]
     pub fn get(&self, idx: usize) -> &T {
-        let page = idx / Self::ITEMS_PER_PAGE;
-        let offset = idx % Self::ITEMS_PER_PAGE;
+        let ipp = Self::items_per_page();
+        let page = idx / ipp;
+        let offset = idx % ipp;
         unsafe { &*(*self.dir.add(page)).add(offset) }
     }
 
@@ -105,8 +113,9 @@ impl<T> PagedArray<T> {
     /// Caller must ensure `idx < capacity()`.
     #[inline]
     pub fn get_mut(&mut self, idx: usize) -> &mut T {
-        let page = idx / Self::ITEMS_PER_PAGE;
-        let offset = idx % Self::ITEMS_PER_PAGE;
+        let ipp = Self::items_per_page();
+        let page = idx / ipp;
+        let offset = idx % ipp;
         unsafe { &mut *(*self.dir.add(page)).add(offset) }
     }
 }

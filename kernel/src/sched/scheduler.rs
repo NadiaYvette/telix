@@ -22,7 +22,7 @@ use super::task::{GROUPS_INLINE, RLIMIT_COUNT, Rlimit, Task, TaskId};
 use super::thread::{BlockReason, Thread, ThreadId, ThreadState};
 use crate::arch::trapframe::EXCEPTION_FRAME_SIZE;
 use crate::ipc::art::Art;
-use crate::mm::page::{MMUPAGE_SIZE, PAGE_SIZE, PhysAddr};
+use crate::mm::page::{self, MMUPAGE_SIZE, PhysAddr};
 use crate::mm::{phys, slab};
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -502,7 +502,7 @@ fn alloc_task_entry() -> Option<*mut Task> {
     let pa = phys::alloc_page()?;
     let p = pa.as_usize() as *mut Task;
     unsafe {
-        core::ptr::write_bytes(p as *mut u8, 0, PAGE_SIZE);
+        core::ptr::write_bytes(p as *mut u8, 0, page::page_size());
         core::ptr::write(p, Task::empty());
     }
     Some(p)
@@ -666,7 +666,7 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
 
     let stack_page = crate::mm::phys::alloc_page()?;
     let stack_base = stack_page.as_usize();
-    let stack_top = stack_base + crate::mm::page::PAGE_SIZE;
+    let stack_top = stack_base + crate::mm::page::page_size();
 
     // Create a fake exception frame at the top of the stack.
     // When we "return" from the IRQ handler with this thread's SP,
@@ -795,8 +795,9 @@ fn do_spawn_heavy_work(
     // Map user stack.
     const USER_STACK_TOP: usize = crate::arch::trapframe::USER_STACK_TOP;
 
+    let ps = page::page_size();
     let stack_pages = 2;
-    let stack_va = USER_STACK_TOP - stack_pages * PAGE_SIZE;
+    let stack_va = USER_STACK_TOP - stack_pages * ps;
 
     let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
         let vma = aspace
@@ -807,9 +808,9 @@ fn do_spawn_heavy_work(
     .ok()?;
 
     // Eagerly allocate and map stack pages.
-    let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
+    let mmu_count = ps / MMUPAGE_SIZE;
     for page_idx in 0..stack_pages {
-        let page_va = stack_va + page_idx * PAGE_SIZE;
+        let page_va = stack_va + page_idx * ps;
 
         let pa = crate::mm::object::with_object(obj_id, |obj| {
             obj.ensure_page(page_idx).map(|(pa, _)| pa)
@@ -817,7 +818,7 @@ fn do_spawn_heavy_work(
         let pa_usize = pa.as_usize();
 
         unsafe {
-            core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(pa_usize as *mut u8, 0, ps);
         }
 
         let sw_z = crate::mm::fault::sw_zeroed_bit();
@@ -834,7 +835,7 @@ fn do_spawn_heavy_work(
     // Allocate kernel stack for this thread.
     let kstack_page = crate::mm::phys::alloc_page()?;
     let kstack_base = kstack_page.as_usize();
-    let kstack_top = kstack_base + PAGE_SIZE;
+    let kstack_top = kstack_base + ps;
 
     // Build a fake exception frame for user-mode entry.
     let frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
@@ -980,7 +981,7 @@ fn create_thread_in_task(
 
     let kstack_page = crate::mm::phys::alloc_page()?;
     let kstack_base = kstack_page.as_usize();
-    let kstack_top = kstack_base + PAGE_SIZE;
+    let kstack_top = kstack_base + page::page_size();
 
     let frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
     let frame = frame_sp as *mut u64;
@@ -1264,7 +1265,8 @@ pub fn spawn_user_with_data(
     )?;
 
     // Map data pages into the child's address space (still no SCHEDULER lock).
-    let data_pages = (data.len() + PAGE_SIZE - 1) / PAGE_SIZE;
+    let ps = page::page_size();
+    let data_pages = (data.len() + ps - 1) / ps;
     if data_pages > 0 {
         let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
             let vma = aspace
@@ -1274,21 +1276,21 @@ pub fn spawn_user_with_data(
         })
         .ok()?;
 
-        let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
+        let mmu_count = ps / MMUPAGE_SIZE;
         let sw_z = crate::mm::fault::sw_zeroed_bit();
         let pte_flags = crate::mm::hat::USER_RO_FLAGS | sw_z;
 
         for page_idx in 0..data_pages {
-            let page_va = data_va + page_idx * PAGE_SIZE;
+            let page_va = data_va + page_idx * ps;
             let pa = crate::mm::object::with_object(obj_id, |obj| {
                 obj.ensure_page(page_idx).map(|(pa, _)| pa)
             })?;
             let pa_usize = pa.as_usize();
 
             unsafe {
-                core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
-                let copy_start = page_idx * PAGE_SIZE;
-                let copy_end = (copy_start + PAGE_SIZE).min(data.len());
+                core::ptr::write_bytes(pa_usize as *mut u8, 0, ps);
+                let copy_start = page_idx * ps;
+                let copy_end = (copy_start + ps).min(data.len());
                 if copy_start < data.len() {
                     core::ptr::copy_nonoverlapping(
                         data[copy_start..copy_end].as_ptr(),
@@ -1575,7 +1577,7 @@ fn try_switch(current_sp: u64) -> u64 {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + PAGE_SIZE);
+    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + page::page_size());
 
     // Activate next thread. Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
@@ -2415,7 +2417,7 @@ pub fn fork_current() -> u64 {
         None => return u64::MAX,
     };
     let kstack_base = kstack_page.as_usize();
-    let kstack_top = kstack_base + PAGE_SIZE;
+    let kstack_top = kstack_base + page::page_size();
 
     // Copy parent's exception frame to child's kernel stack.
     let child_frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
@@ -2964,7 +2966,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + PAGE_SIZE);
+    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + page::page_size());
 
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
@@ -3278,7 +3280,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + PAGE_SIZE);
+    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + page::page_size());
 
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
@@ -3380,7 +3382,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(receiver.stack_base + PAGE_SIZE);
+    crate::arch::trapframe::update_kernel_stack(receiver.stack_base + page::page_size());
 
     // Activate receiver.
     receiver.state = ThreadState::Running;

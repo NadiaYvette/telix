@@ -91,10 +91,10 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
                 tid,
                 kstack_base,
                 frame_sp,
-                kstack_base + crate::mm::page::PAGE_SIZE
+                kstack_base + crate::mm::page::page_size()
             );
             // Check if frame_sp is within the thread's kstack.
-            let page_size = crate::mm::page::PAGE_SIZE;
+            let page_size = crate::mm::page::page_size();
             if kstack_base != 0 {
                 let kstack_end = kstack_base + page_size;
                 if (frame_sp as usize) < kstack_base || (frame_sp as usize) >= kstack_end {

@@ -13,7 +13,7 @@
 //! - Slab 2048: capacity 65..=256 (2048-byte slab allocation)
 //! - Full page: capacity > 256  (dedicated phys page, up to PAGE_SIZE/8 entries)
 
-use super::page::{PAGE_SIZE, PhysAddr};
+use super::page::{self, PhysAddr};
 
 /// Maximum entries stored directly in the struct.
 const INLINE_CAP: usize = 4;
@@ -60,7 +60,7 @@ impl PageVec {
 
         // Zero the buffer.
         unsafe {
-            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, slab_size.min(PAGE_SIZE));
+            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, slab_size.min(page::page_size()));
         }
 
         Some(Self {
@@ -161,7 +161,7 @@ impl PageVec {
                 super::slab::free(PhysAddr::new(self.heap_ptr), slab_size);
             } else {
                 // Full page — free to phys allocator.
-                let page_base = self.heap_ptr & !(PAGE_SIZE - 1);
+                let page_base = self.heap_ptr & !(page::page_size() - 1);
                 super::phys::free_page(PhysAddr::new(page_base));
             }
             self.heap_ptr = 0;
@@ -199,8 +199,8 @@ fn rounded_heap_cap(needed: usize) -> usize {
     } else if needed <= 256 {
         256
     } else {
-        // Round up to PAGE_SIZE / sizeof(usize) = PAGE_SIZE / 8.
-        let entries_per_page = PAGE_SIZE / core::mem::size_of::<usize>();
+        // Round up to page_size / sizeof(usize).
+        let entries_per_page = page::page_size() / core::mem::size_of::<usize>();
         ((needed + entries_per_page - 1) / entries_per_page) * entries_per_page
     }
 }

@@ -178,8 +178,8 @@ pub struct Task {
 pub const GROUPS_INLINE: usize = 32;
 
 /// Maximum supplementary groups per task (overflow page capacity).
-/// PAGE_SIZE / 4 gives e.g. 4096 at 16K pages, 16384 at 64K pages.
-pub const MAX_GROUPS: usize = crate::mm::page::PAGE_SIZE / core::mem::size_of::<u32>();
+/// Uses MAX_PAGE_SIZE for const context; runtime capacity may be smaller.
+pub const MAX_GROUPS: usize = crate::mm::page::MAX_PAGE_SIZE / core::mem::size_of::<u32>();
 
 // --- Resource limits (Phase 50) ---
 

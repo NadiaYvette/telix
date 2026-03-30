@@ -10,7 +10,7 @@
 
 use super::aspace;
 use super::fault;
-use super::page::{MMUPAGE_SIZE, PAGE_SIZE};
+use super::page::{self, MMUPAGE_SIZE};
 use super::stats;
 use crate::sched::scheduler;
 use crate::sched::thread::BlockReason;
@@ -65,15 +65,16 @@ impl PagerFaultTable {
     /// Ensure the backing page is allocated. Returns false on OOM.
     fn ensure_capacity(&mut self) -> bool {
         if self.entries.is_null() {
+            let ps = page::page_size();
             let page = match super::phys::alloc_page() {
                 Some(pa) => pa.as_usize() as *mut PagerFaultEntry,
                 None => return false,
             };
             unsafe {
-                core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+                core::ptr::write_bytes(page as *mut u8, 0, ps);
             }
             self.entries = page;
-            self.capacity = PAGE_SIZE / core::mem::size_of::<PagerFaultEntry>();
+            self.capacity = ps / core::mem::size_of::<PagerFaultEntry>();
         }
         true
     }
@@ -156,7 +157,7 @@ pub fn initiate_fault(token: u32) {
                 fault_va as u64,
                 file_handle as u64,
                 file_offset,
-                PAGE_SIZE as u64,
+                page::page_size() as u64,
                 0,
             ],
         );
@@ -194,7 +195,7 @@ fn inject_fault_into_frame(
     set_reg(frame, 1, fault_va as u64);
     set_reg(frame, 2, file_handle as u64);
     set_reg(frame, 3, file_offset);
-    set_reg(frame, 4, PAGE_SIZE as u64);
+    set_reg(frame, 4, page::page_size() as u64);
 }
 
 /// Wait for a pager fault in the current address space.
@@ -213,7 +214,7 @@ pub fn wait_fault(aspace_id: u64) -> Option<(u32, usize, u32, u64, usize)> {
                     entry.fault_va,
                     entry.file_handle,
                     entry.file_offset,
-                    PAGE_SIZE,
+                    page::page_size(),
                 ));
             }
         }
@@ -241,7 +242,7 @@ pub fn wait_fault(aspace_id: u64) -> Option<(u32, usize, u32, u64, usize)> {
                     entry.fault_va,
                     entry.file_handle,
                     entry.file_offset,
-                    PAGE_SIZE,
+                    page::page_size(),
                 ));
             }
         }
@@ -287,11 +288,12 @@ pub fn complete_fault(token: u32, data_va: usize, data_len: usize) -> bool {
     };
 
     // Copy data from source PA to target physical page.
-    let copy_len = data_len.min(PAGE_SIZE);
+    let ps = page::page_size();
+    let copy_len = data_len.min(ps);
     unsafe {
         core::ptr::copy_nonoverlapping(src_pa as *const u8, phys_addr as *mut u8, copy_len);
-        if copy_len < PAGE_SIZE {
-            core::ptr::write_bytes((phys_addr + copy_len) as *mut u8, 0, PAGE_SIZE - copy_len);
+        if copy_len < ps {
+            core::ptr::write_bytes((phys_addr + copy_len) as *mut u8, 0, ps - copy_len);
         }
     }
 

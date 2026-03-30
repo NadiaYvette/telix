@@ -11,7 +11,7 @@
 //! different address spaces never contend. No global lock.
 
 use super::object::{self};
-use super::page::PhysAddr;
+use super::page::{self, PhysAddr};
 use super::ptshare::ForkGroup;
 use super::vma::{Vma, VmaProt};
 use super::vmatree::{VmaCursor, VmaTree};
@@ -90,7 +90,7 @@ impl AddressSpace {
         });
 
         // Insert into the VMA tree.
-        let va_len = page_count * super::page::PAGE_SIZE;
+        let va_len = page_count * page::page_size();
         match self.vmas.insert(va_start, va_len, prot, obj_id, 0) {
             Some(vma) => Some(vma),
             None => {
@@ -119,7 +119,7 @@ impl AddressSpace {
     /// Allocate `page_count` pages of heap VA space with ASLR.
     pub fn alloc_heap_va(&mut self, page_count: usize) -> usize {
         let va = self.heap_next;
-        self.heap_next += page_count * super::page::PAGE_SIZE;
+        self.heap_next += page_count * page::page_size();
         va
     }
 
@@ -285,7 +285,7 @@ fn seed_aspace(space: &mut AddressSpace) {
     let seed = seed_from_timer() ^ (space.id as u64).wrapping_mul(0x9e3779b97f4a7c15);
     space.prng_state = if seed == 0 { 1 } else { seed };
     let offset_pages = (xorshift64(&mut space.prng_state) as usize) % 256;
-    space.heap_next = HEAP_VA_BASE + offset_pages * super::page::PAGE_SIZE;
+    space.heap_next = HEAP_VA_BASE + offset_pages * page::page_size();
 }
 
 /// Create a new address space with the given page table root.
@@ -478,12 +478,12 @@ pub fn clone_for_cow(parent_id: ASpaceId) -> Option<(ASpaceId, usize)> {
         object_offset: u32,
         new_obj_id: u64,
     }
-    const ENTRIES_PER_PAGE: usize = super::page::PAGE_SIZE / core::mem::size_of::<CowEntry>();
+    const ENTRIES_PER_PAGE: usize = page::MAX_PAGE_SIZE / core::mem::size_of::<CowEntry>();
 
     let cow_page = super::phys::alloc_page()?;
     let cow_buf = cow_page.as_usize() as *mut CowEntry;
     unsafe {
-        core::ptr::write_bytes(cow_buf as *mut u8, 0, super::page::PAGE_SIZE);
+        core::ptr::write_bytes(cow_buf as *mut u8, 0, page::page_size());
     }
 
     let mut vma_count = 0usize;
@@ -778,7 +778,7 @@ pub fn mprotect(id: ASpaceId, addr: usize, len: usize, new_prot: VmaProt) -> boo
 
 /// Remap (resize) an anonymous mapping. Supports grow and shrink.
 pub fn mremap(id: ASpaceId, old_addr: usize, old_len: usize, new_len: usize) -> usize {
-    use super::page::{MMUPAGE_SIZE, PAGE_SIZE};
+    use super::page::MMUPAGE_SIZE;
 
     if old_addr % MMUPAGE_SIZE != 0
         || old_len % MMUPAGE_SIZE != 0
@@ -822,8 +822,9 @@ pub fn mremap(id: ASpaceId, old_addr: usize, old_len: usize, new_len: usize) -> 
 
         vma.va_len = new_len;
 
-        let new_page_count = (new_len + PAGE_SIZE - 1) / PAGE_SIZE;
-        let old_page_count = (old_len + PAGE_SIZE - 1) / PAGE_SIZE;
+        let ps = page::page_size();
+        let new_page_count = (new_len + ps - 1) / ps;
+        let old_page_count = (old_len + ps - 1) / ps;
         let obj_id = vma.object_id;
 
         if new_page_count < old_page_count {
@@ -839,7 +840,7 @@ pub fn mremap(id: ASpaceId, old_addr: usize, old_len: usize, new_len: usize) -> 
     }
 
     // Grow.
-    let new_page_count = (new_len + super::page::PAGE_SIZE - 1) / super::page::PAGE_SIZE;
+    let new_page_count = (new_len + page::page_size() - 1) / page::page_size();
     let obj_id = vma.object_id;
 
     let can_grow = super::object::with_object(obj_id, |obj| {

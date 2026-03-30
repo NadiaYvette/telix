@@ -188,9 +188,10 @@ fn alloc_mpsc_queue() -> Option<*mut MpscQueue> {
 fn alloc_mpsc_page_queue() -> Option<*mut MpscQueue> {
     let pa = crate::mm::phys::alloc_page()?;
     let ptr = pa.as_usize() as *mut MpscQueue;
-    let cap = mpsc_capacity_for_size(crate::mm::page::PAGE_SIZE);
+    let ps = crate::mm::page::page_size();
+    let cap = mpsc_capacity_for_size(ps);
     unsafe {
-        core::ptr::write_bytes(ptr as *mut u8, 0, crate::mm::page::PAGE_SIZE);
+        core::ptr::write_bytes(ptr as *mut u8, 0, ps);
         (*ptr).capacity = cap;
         (*ptr).page_backed = true;
     }
@@ -541,7 +542,7 @@ pub fn set_recv_holder(port_id: PortId, task_id: u32) {
 /// Returns true on success.
 pub fn resize(port_id: PortId, new_capacity: usize) -> bool {
     let local = port_local(port_id);
-    let max_page_cap = mpsc_capacity_for_size(crate::mm::page::PAGE_SIZE) as usize;
+    let max_page_cap = mpsc_capacity_for_size(crate::mm::page::page_size()) as usize;
     if new_capacity > max_page_cap {
         return false;
     }

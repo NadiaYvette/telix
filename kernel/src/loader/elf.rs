@@ -7,7 +7,7 @@ use crate::mm::aspace::ASpaceId;
 use crate::mm::vma::VmaProt;
 use crate::mm::{
     aspace, object,
-    page::{MMUPAGE_SIZE, PAGE_SIZE},
+    page::{self, MMUPAGE_SIZE},
 };
 
 // ELF64 constants.
@@ -278,10 +278,11 @@ fn load_segment(
     let filesz = phdr.p_filesz as usize;
     let file_off = phdr.p_offset as usize;
 
-    // Align VA range to PAGE_SIZE.
-    let va_start = vaddr & !(PAGE_SIZE - 1);
-    let va_end = (vaddr + memsz + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let page_count = (va_end - va_start) / PAGE_SIZE;
+    // Align VA range to page_size().
+    let ps = page::page_size();
+    let va_start = vaddr & !(ps - 1);
+    let va_end = (vaddr + memsz + ps - 1) & !(ps - 1);
+    let page_count = (va_end - va_start) / ps;
 
     // Determine protection.
     let prot = flags_to_prot(phdr.p_flags);
@@ -291,7 +292,7 @@ fn load_segment(
     // For each page in this segment's range, either create a new mapping
     // or reuse an existing one (when multiple PT_LOAD segments share a page).
     for page_idx in 0..page_count {
-        let page_va = va_start + page_idx * PAGE_SIZE;
+        let page_va = va_start + page_idx * ps;
 
         // Check if this page is already mapped by a previous segment.
         // If so, merge permissions (take the union) so we don't narrow earlier flags.
@@ -325,12 +326,12 @@ fn load_segment(
         // Zero the page only if we just created it.
         if !already_mapped {
             unsafe {
-                core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
+                core::ptr::write_bytes(pa_usize as *mut u8, 0, ps);
             }
         }
 
         // Copy file data for each MMU page in this allocation page.
-        let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
+        let mmu_count = ps / MMUPAGE_SIZE;
         for mmu_idx in 0..mmu_count {
             let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
             let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;

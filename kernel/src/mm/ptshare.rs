@@ -8,7 +8,7 @@
 //! members of the fork family, freed when the last member exits.
 
 use crate::sync::SpinLock;
-use super::page::{PAGE_SIZE, PhysAddr};
+use super::page::{self, PhysAddr};
 use super::stats;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -27,7 +27,11 @@ struct Bucket {
 }
 
 const BUCKET_SIZE: usize = core::mem::size_of::<Bucket>(); // 16 bytes
-const BUCKETS_PER_PAGE: usize = PAGE_SIZE / BUCKET_SIZE;
+
+#[inline]
+fn buckets_per_page() -> usize {
+    page::page_size() / BUCKET_SIZE
+}
 
 impl Bucket {
     const fn empty() -> Self {
@@ -76,10 +80,10 @@ impl PtShareTable {
             None => return false,
         };
         unsafe {
-            core::ptr::write_bytes(page.as_usize() as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(page.as_usize() as *mut u8, 0, page::page_size());
         }
         self.buckets = page.as_usize() as *mut Bucket;
-        self.capacity = BUCKETS_PER_PAGE;
+        self.capacity = buckets_per_page();
         true
     }
 
@@ -125,12 +129,13 @@ impl PtShareTable {
 
     /// Grow the table by doubling capacity and rehashing.
     fn grow(&mut self) -> bool {
+        let ps = page::page_size();
         let new_cap = if self.capacity == 0 {
-            BUCKETS_PER_PAGE
+            buckets_per_page()
         } else {
             self.capacity * 2
         };
-        let new_pages = (new_cap * BUCKET_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+        let new_pages = (new_cap * BUCKET_SIZE + ps - 1) / ps;
 
         // Allocate new backing pages.
         let first_page = match super::phys::alloc_page() {
@@ -138,7 +143,7 @@ impl PtShareTable {
             None => return false,
         };
         unsafe {
-            core::ptr::write_bytes(first_page as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(first_page as *mut u8, 0, ps);
         }
 
         // For multi-page tables, allocate contiguous pages.
@@ -160,7 +165,7 @@ impl PtShareTable {
                 None => return false,
             };
             unsafe {
-                core::ptr::write_bytes(block as *mut u8, 0, new_pages * PAGE_SIZE);
+                core::ptr::write_bytes(block as *mut u8, 0, new_pages * ps);
             }
             let new_buckets = block as *mut Bucket;
             self.rehash_into(new_buckets, new_cap);
@@ -194,7 +199,8 @@ impl PtShareTable {
 
         // Free old backing.
         if !old_buckets.is_null() {
-            let old_pages = (old_cap * BUCKET_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+            let ps = page::page_size();
+            let old_pages = (old_cap * BUCKET_SIZE + ps - 1) / ps;
             if old_pages == 1 {
                 super::phys::free_page(PhysAddr::new(old_buckets as usize));
             } else {
@@ -310,7 +316,8 @@ impl PtShareTable {
         if self.buckets.is_null() {
             return;
         }
-        let pages = (self.capacity * BUCKET_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+        let ps = page::page_size();
+        let pages = (self.capacity * BUCKET_SIZE + ps - 1) / ps;
         if pages == 1 {
             super::phys::free_page(PhysAddr::new(self.buckets as usize));
         } else {

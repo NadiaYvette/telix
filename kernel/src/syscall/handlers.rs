@@ -930,9 +930,10 @@ fn sys_debug_puts(buf_ptr: u64, buf_len: u64) -> u64 {
 }
 
 fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
-    use crate::mm::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE};
+    use crate::mm::page::{self, MMUPAGE_SIZE};
     use crate::mm::vma::VmaProt;
 
+    let ps = page::page_size();
     let aspace_id = crate::sched::scheduler::current_aspace_id();
     if aspace_id == 0 {
         return u64::MAX; // kernel context
@@ -953,7 +954,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
             return u64::MAX;
         }
         // Enforce RLIMIT_AS: total virtual memory in bytes.
-        let new_bytes = (task.cur_pages as u64 + pages as u64) * PAGE_SIZE as u64;
+        let new_bytes = (task.cur_pages as u64 + pages as u64) * ps as u64;
         let rlimit_as = task.rlimits[crate::sched::task::RLIMIT_AS as usize].cur;
         if rlimit_as != crate::sched::task::RLIM_INFINITY && new_bytes > rlimit_as {
             return u64::MAX;
@@ -978,7 +979,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     // MAP_FIXED_NOREPLACE: fail if overlapping existing VMA.
     if noreplace {
         let overlaps = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
-            aspace.overlaps_vma(va, pages * PAGE_SIZE)
+            aspace.overlaps_vma(va, pages * ps)
         });
         if overlaps {
             return u64::MAX;
@@ -1004,7 +1005,7 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
     };
 
     for page_idx in 0..pages {
-        let page_va = va + page_idx * PAGE_SIZE;
+        let page_va = va + page_idx * ps;
 
         let pa = match crate::mm::object::try_with_object(obj_id, |obj| {
             obj.ensure_page(page_idx).map(|(pa, _)| pa)
@@ -1016,11 +1017,11 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
 
         // Zero the page.
         unsafe {
-            core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(pa_usize as *mut u8, 0, ps);
         }
 
         // Map each MMU page.
-        for mmu_idx in 0..PAGE_MMUCOUNT {
+        for mmu_idx in 0..page::page_mmucount() {
             let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
             let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
 
@@ -1289,8 +1290,9 @@ fn sys_getchar() -> u64 {
 
 /// Maximum ELF size for spawn_elf (256 KiB).
 fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
-    use crate::mm::page::PAGE_SIZE;
+    use crate::mm::page;
 
+    let ps = page::page_size();
     let len = elf_len as usize;
     if len < 64 {
         // Minimum ELF header size
@@ -1304,7 +1306,7 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
         Some(p) => p,
         None => return u64::MAX,
     };
-    let header_len = if len < PAGE_SIZE { len } else { PAGE_SIZE };
+    let header_len = if len < ps { len } else { ps };
     let scratch_slice =
         unsafe { core::slice::from_raw_parts_mut(scratch.as_usize() as *mut u8, header_len) };
     if !copy_from_user(pt_root, elf_ptr as usize, scratch_slice) {
@@ -1368,7 +1370,7 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
     }
 
     // Phase B: Allocate contiguous buffer and copy full ELF data.
-    let pages_needed = (max_file_end + PAGE_SIZE - 1) / PAGE_SIZE;
+    let pages_needed = (max_file_end + ps - 1) / ps;
     let order = if pages_needed <= 1 {
         0
     } else {
@@ -1438,8 +1440,9 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
 /// On success, the frame is completely rewritten and we never return to the caller.
 /// On failure (before point-of-no-return), sets return value to u64::MAX.
 fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
-    use crate::mm::page::{MMUPAGE_SIZE, PAGE_SIZE};
+    use crate::mm::page::{self, MMUPAGE_SIZE};
 
+    let ps = page::page_size();
     let pt_root = crate::sched::scheduler::current_page_table_root();
     let aspace_id = crate::sched::scheduler::current_aspace_id();
     if aspace_id == 0 {
@@ -1463,8 +1466,8 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     // Copy argv and envp strings from user memory (before point-of-no-return).
     // Page-allocated scratch buffers: metadata page (u16 lengths) + contiguous data pages.
     const ARG_MAX_STRLEN: usize = 4096;
-    let arg_max_strings: usize = PAGE_SIZE / 8; // scales with page size
-    let arg_max_total: usize = 2 * PAGE_SIZE; // max total string bytes
+    let arg_max_strings: usize = ps / 8; // scales with page size
+    let arg_max_total: usize = 2 * ps; // max total string bytes
     let data_order: usize = 1; // 2 contiguous pages for string data
 
     // Allocate scratch pages.
@@ -1486,7 +1489,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
 
     // Metadata page: array of u16 string lengths.
     let meta_lens =
-        unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u16, PAGE_SIZE / 2) };
+        unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u16, ps / 2) };
     let data_buf =
         unsafe { core::slice::from_raw_parts_mut(data_pages.as_usize() as *mut u8, arg_max_total) };
 
@@ -1687,8 +1690,8 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     let strings_with_nulls = string_total + (argc + envc); // each string gets a null terminator
     let ptr_table_size = (1 + argc + 1 + envc + 1 + 14) * 8; // argc + argv[] + NULL + envp[] + NULL + 7 auxv pairs
     let stack_needed = strings_with_nulls + ptr_table_size + 256; // 256 bytes margin
-    let stack_pages = ((stack_needed + PAGE_SIZE - 1) / PAGE_SIZE).max(2);
-    let stack_va = USER_STACK_TOP - stack_pages * PAGE_SIZE;
+    let stack_pages = ((stack_needed + ps - 1) / ps).max(2);
+    let stack_va = USER_STACK_TOP - stack_pages * ps;
 
     let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
         aspace
@@ -1698,9 +1701,9 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     .expect("execve: stack map");
 
     // Eagerly allocate and map stack pages.
-    let mmu_count = PAGE_SIZE / MMUPAGE_SIZE;
+    let mmu_count = ps / MMUPAGE_SIZE;
     for page_idx in 0..stack_pages {
-        let page_va = stack_va + page_idx * PAGE_SIZE;
+        let page_va = stack_va + page_idx * ps;
 
         let pa = crate::mm::object::with_object(obj_id, |obj| {
             obj.ensure_page(page_idx).map(|(pa, _)| pa)
@@ -1709,7 +1712,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         let pa_usize = pa.as_usize();
 
         unsafe {
-            core::ptr::write_bytes(pa_usize as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(pa_usize as *mut u8, 0, ps);
         }
 
         let sw_z = crate::mm::fault::sw_zeroed_bit();
@@ -1746,9 +1749,9 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     let mut str_pos = USER_STACK_TOP; // grows downward
     let mut data_off: usize = 0;
     // We store addresses in a temporary array on the metadata page (reinterpreted as u64).
-    // meta_page can hold PAGE_SIZE/8 u64 addresses.
+    // meta_page can hold ps/8 u64 addresses.
     let addr_buf =
-        unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u64, PAGE_SIZE / 8) };
+        unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u64, ps / 8) };
     let data_src =
         unsafe { core::slice::from_raw_parts(data_pages.as_usize() as *const u8, arg_max_total) };
 
@@ -1787,7 +1790,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         (AT_PHDR, elf_info.phdr_vaddr as u64),
         (AT_PHENT, elf_info.phentsize as u64),
         (AT_PHNUM, elf_info.phnum as u64),
-        (AT_PAGESZ, PAGE_SIZE as u64),
+        (AT_PAGESZ, ps as u64),
         (AT_ENTRY, elf_info.entry as u64),
         (AT_BASE, interp_base as u64),
         (AT_NULL, 0),
@@ -2343,9 +2346,10 @@ fn sys_mmap_file(
     file_offset: u64,
     pager_task: u64,
 ) -> u64 {
-    use crate::mm::page::PAGE_SIZE;
+    use crate::mm::page;
     use crate::mm::vma::VmaProt;
 
+    let ps = page::page_size();
     let aspace_id = crate::sched::scheduler::current_aspace_id();
     if aspace_id == 0 {
         return u64::MAX;
@@ -2397,7 +2401,7 @@ fn sys_mmap_file(
         crate::mm::object::with_object(obj_id, |obj| {
             obj.add_mapping(aspace_id, va);
         });
-        let va_len = pages * PAGE_SIZE;
+        let va_len = pages * ps;
         aspace.vmas.insert(va, va_len, prot, obj_id, 0).is_some()
     });
 

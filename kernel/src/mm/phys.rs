@@ -10,7 +10,7 @@
 //! - Chunks with ≤ INLINE_K free pages encode indices directly in the parent node
 //! - Multi-page allocation uses a separate lock (rare path)
 
-use super::page::{PAGE_SHIFT, PAGE_SIZE, PhysAddr};
+use super::page::{self, PhysAddr};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Pages per chunk — matches one u64 bitmap.
@@ -216,7 +216,7 @@ static BULK_LOCK: SpinLock<()> = SpinLock::new(());
 /// Physical address of page `page_idx` within chunk `chunk_idx`.
 #[inline]
 fn page_pa(chunk_idx: usize, page_idx: u32) -> usize {
-    ALLOC.base + ((chunk_idx * CHUNK_PAGES + page_idx as usize) << PAGE_SHIFT)
+    ALLOC.base + ((chunk_idx * CHUNK_PAGES + page_idx as usize) << page::page_shift())
 }
 
 /// Physical address of the bitmap page for a chunk.
@@ -228,7 +228,7 @@ fn bitmap_pa(chunk_idx: usize, bmp_pg: u32) -> usize {
 /// Convert a physical address to (chunk_idx, page_idx).
 #[inline]
 fn addr_to_chunk_page(pa: usize) -> (usize, u32) {
-    let pfn = (pa - ALLOC.base) >> PAGE_SHIFT;
+    let pfn = (pa - ALLOC.base) >> page::page_shift();
     (pfn >> CHUNK_SHIFT, (pfn & (CHUNK_PAGES - 1)) as u32)
 }
 
@@ -519,24 +519,26 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
 /// Metadata (chunk array) is carved from the start of usable RAM at boot,
 /// so there is no compile-time cap on managed memory.
 pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: usize) {
-    let start = PhysAddr::new(ram_start).align_up(PAGE_SIZE).as_usize();
-    let end = PhysAddr::new(ram_end).align_down(PAGE_SIZE).as_usize();
+    let ps = page::page_size();
+    let pshift = page::page_shift();
+    let start = PhysAddr::new(ram_start).align_up(ps).as_usize();
+    let end = PhysAddr::new(ram_end).align_down(ps).as_usize();
     if end <= start {
         return;
     }
 
-    let total_pages = (end - start) >> PAGE_SHIFT;
+    let total_pages = (end - start) >> pshift;
     let total_chunks = (total_pages + CHUNK_PAGES - 1) / CHUNK_PAGES;
 
     // Carve the chunk array from the start of usable RAM.
     let chunk_array_bytes = total_chunks * core::mem::size_of::<ChunkNode>();
     let total_metadata_bytes = chunk_array_bytes;
-    let metadata_pages = (total_metadata_bytes + PAGE_SIZE - 1) >> PAGE_SHIFT;
+    let metadata_pages = (total_metadata_bytes + ps - 1) >> pshift;
     let chunk_ptr = start as *mut ChunkNode;
 
     // Zero the metadata region (chunk array).
     unsafe {
-        core::ptr::write_bytes(start as *mut u8, 0, metadata_pages << PAGE_SHIFT);
+        core::ptr::write_bytes(start as *mut u8, 0, metadata_pages << pshift);
     }
 
     // Safety: single-threaded at boot; direct stores are fine.
@@ -570,12 +572,12 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
     let _kern_start_pfn = if kernel_start <= start {
         0
     } else {
-        (kernel_start - start) >> PAGE_SHIFT
+        (kernel_start - start) >> pshift
     };
     let kern_end_pfn = if kernel_end <= start {
         0
     } else {
-        ((kernel_end - start + PAGE_SIZE - 1) >> PAGE_SHIFT).min(total_pages)
+        ((kernel_end - start + ps - 1) >> pshift).min(total_pages)
     };
 
     // Merge metadata and kernel reservations into a single range
@@ -648,8 +650,8 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
         "  Physical memory: {} pages total, {} pages free ({} KiB / {} KiB)",
         total,
         free,
-        free * (PAGE_SIZE / 1024),
-        total * (PAGE_SIZE / 1024),
+        free * (page::page_size() / 1024),
+        total * (page::page_size() / 1024),
     );
 }
 
@@ -931,7 +933,7 @@ pub fn free_pages(addr: PhysAddr, order: usize) {
     let base = addr.as_usize();
     let count = 1usize << order;
     for i in 0..count {
-        free_page(PhysAddr::new(base + (i << PAGE_SHIFT)));
+        free_page(PhysAddr::new(base + (i << page::page_shift())));
     }
 }
 

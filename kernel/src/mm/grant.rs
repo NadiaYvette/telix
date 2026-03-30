@@ -5,7 +5,7 @@
 
 use super::aspace::{self, ASpaceId};
 use super::object;
-use super::page::{MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE};
+use super::page::{self, MMUPAGE_SIZE};
 use super::vma::VmaProt;
 
 /// Error returned by grant operations.
@@ -41,7 +41,7 @@ pub fn grant_pages(
         let mmu_idx_start = vma.mmu_index_of(src_va);
         let mut pages = [0usize; 256];
         for i in 0..page_count {
-            let obj_page = vma.obj_page_index(mmu_idx_start + i * PAGE_MMUCOUNT);
+            let obj_page = vma.obj_page_index(mmu_idx_start + i * page::page_mmucount());
             let pa = object::with_object(vma.object_id, |obj| {
                 obj.get_page(obj_page).map(|p| p.as_usize())
             });
@@ -64,7 +64,7 @@ pub fn grant_pages(
         } else {
             VmaProt::ReadWrite
         };
-        let va_len = page_count * PAGE_SIZE;
+        let va_len = page_count * page::page_size();
         let _vma = aspace
             .vmas
             .insert(dst_va, va_len, prot, obj_id, obj_mmu_offset)
@@ -78,13 +78,14 @@ pub fn grant_pages(
             user_rw_flags()
         };
 
+        let pmc = page::page_mmucount();
         for page_i in 0..page_count {
             let pa_base = phys_pages[page_i];
             if pa_base == 0 {
                 continue;
             }
-            for mmu_i in 0..PAGE_MMUCOUNT {
-                let mmu_idx = page_i * PAGE_MMUCOUNT + mmu_i;
+            for mmu_i in 0..pmc {
+                let mmu_idx = page_i * pmc + mmu_i;
                 let va = dst_va + mmu_idx * MMUPAGE_SIZE;
                 let pa = pa_base + mmu_i * MMUPAGE_SIZE;
                 map_single_mmupage(pt_root, va, pa, flags | sw_zeroed_bit());

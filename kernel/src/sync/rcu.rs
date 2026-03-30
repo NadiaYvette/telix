@@ -89,7 +89,7 @@ struct RcuCallback {
 }
 
 /// A batch of deferred callbacks, page-allocated.
-const BATCH_CAP: usize = (crate::mm::page::PAGE_SIZE - 3 * core::mem::size_of::<usize>())
+const BATCH_CAP: usize = (crate::mm::page::MAX_PAGE_SIZE - 3 * core::mem::size_of::<usize>())
     / core::mem::size_of::<RcuCallback>();
 
 #[repr(C)]

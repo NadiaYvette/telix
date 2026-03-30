@@ -4,11 +4,13 @@
 //! At 64 KiB pages and 24-byte capabilities: ~2730 slots per CNode.
 
 use super::capability::Capability;
-use crate::mm::page::PAGE_SIZE;
+use crate::mm::page;
 use crate::mm::phys;
 
 /// Number of capability slots that fit in one page.
-pub const CNODE_SLOTS: usize = PAGE_SIZE / core::mem::size_of::<Capability>();
+pub fn cnode_slots() -> usize {
+    page::page_size() / core::mem::size_of::<Capability>()
+}
 
 /// A capability storage node: a page-backed array of capability slots.
 pub struct CNode {
@@ -40,10 +42,10 @@ impl CNode {
         };
         // Zero-initialize — null capabilities have all zero bytes.
         unsafe {
-            core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(page as *mut u8, 0, page::page_size());
         }
         self.slots = page;
-        self.num_slots = CNODE_SLOTS;
+        self.num_slots = cnode_slots();
         true
     }
 

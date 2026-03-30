@@ -14,7 +14,7 @@
 //! class. The fast path (alloc/free) operates with IRQs disabled and no
 //! lock. The global lock is only touched every ~MAG_CAPACITY operations.
 
-use super::page::{PAGE_SIZE, PhysAddr};
+use super::page::{self, PAGE_SIZE, PhysAddr};
 use super::phys;
 
 const NONE: u16 = u16::MAX;
@@ -86,10 +86,10 @@ impl SlabCache {
                 None => return false,
             };
             unsafe {
-                core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+                core::ptr::write_bytes(page as *mut u8, 0, page::page_size());
             }
             self.slab_dir = page;
-            self.slab_dir_cap = PAGE_SIZE / core::mem::size_of::<usize>();
+            self.slab_dir_cap = page::page_size() / core::mem::size_of::<usize>();
         }
         true
     }
@@ -143,7 +143,7 @@ impl SlabCache {
     pub fn free(&mut self, addr: PhysAddr) {
         let addr_val = addr.as_usize();
         // Find which slab this object belongs to.
-        let page_base = addr_val & !(PAGE_SIZE - 1);
+        let page_base = addr_val & !(page::page_size() - 1);
 
         for i in 0..self.slab_count {
             if self.slab_page(i) == page_base {

@@ -14,7 +14,7 @@ use super::aspace::{self, ASpaceId};
 use super::hat;
 use super::object;
 use super::page::{
-    MMUPAGE_SIZE, PAGE_MMUCOUNT, PAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_ALLOC_PAGES,
+    self, MMUPAGE_SIZE, SUPERPAGE_ALIGN_MASK, SUPERPAGE_ALLOC_PAGES,
     SUPERPAGE_MMU_PAGES,
 };
 use super::stats;
@@ -161,7 +161,7 @@ pub fn handle_page_fault(
             };
             let (file_handle, file_base) =
                 object::with_object(obj_id, |obj| (obj.file_handle, obj.file_base_offset));
-            let file_offset = file_base + (obj_page_idx as u64) * (PAGE_SIZE as u64);
+            let file_offset = file_base + (obj_page_idx as u64) * (page::page_size() as u64);
             let fault_va = va_aligned;
             let token = match super::pager::record_fault(super::pager::PagerFaultInfo {
                 aspace_id,
@@ -352,12 +352,13 @@ fn try_superpage_promotion(pt_root: usize, vma: &mut super::vma::Vma, obj_id: u6
     // If cow_group_port == 0, pages are exclusively owned — no sharing check needed.
 
     let already_contiguous = object::with_object(obj_id, |obj| {
+        let ps = page::page_size();
         let first_pa = obj.pages.get(obj_page_base);
         if first_pa & SUPERPAGE_ALIGN_MASK != 0 {
             return false;
         }
         for p in 1..SUPERPAGE_ALLOC_PAGES {
-            if obj.pages.get(obj_page_base + p) != first_pa + p * PAGE_SIZE {
+            if obj.pages.get(obj_page_base + p) != first_pa + p * ps {
                 return false;
             }
         }
@@ -380,12 +381,13 @@ fn try_superpage_promotion(pt_root: usize, vma: &mut super::vma::Vma, obj_id: u6
         None => return,
     };
 
+    let ps = page::page_size();
     object::with_object(obj_id, |obj| {
         for p in 0..SUPERPAGE_ALLOC_PAGES {
             let old_pa = obj.pages.get(obj_page_base + p);
-            let new_pa = new_block.as_usize() + p * PAGE_SIZE;
+            let new_pa = new_block.as_usize() + p * ps;
             unsafe {
-                core::ptr::copy_nonoverlapping(old_pa as *const u8, new_pa as *mut u8, PAGE_SIZE);
+                core::ptr::copy_nonoverlapping(old_pa as *const u8, new_pa as *mut u8, ps);
             }
         }
     });
@@ -399,7 +401,7 @@ fn try_superpage_promotion(pt_root: usize, vma: &mut super::vma::Vma, obj_id: u6
 
     object::with_object(obj_id, |obj| {
         for p in 0..SUPERPAGE_ALLOC_PAGES {
-            let new_pa = new_block.as_usize() + p * PAGE_SIZE;
+            let new_pa = new_block.as_usize() + p * ps;
             obj.pages.set(obj_page_base + p, new_pa);
         }
     });
@@ -524,6 +526,7 @@ pub fn alloc_aligned_for_level(
 ) -> Option<super::page::PhysAddr> {
     use super::page::PhysAddr;
 
+    let ps = page::page_size();
     let alloc_pages = level.alloc_pages();
     let align_mask = level.align_mask();
     let order0 = level_alloc_order(level);
@@ -548,14 +551,14 @@ pub fn alloc_aligned_for_level(
             let excess = large_pages - alloc_pages;
             if excess > 0 {
                 free_pages_range(
-                    PhysAddr::new(large_pa + alloc_pages * PAGE_SIZE),
+                    PhysAddr::new(large_pa + alloc_pages * ps),
                     excess,
                 );
             }
             return Some(PhysAddr::new(large_pa));
         }
 
-        let offset_pages = (aligned_pa - large_pa) / PAGE_SIZE;
+        let offset_pages = (aligned_pa - large_pa) / ps;
         let end_page = offset_pages + alloc_pages;
         if end_page <= large_pages {
             if offset_pages > 0 {
@@ -564,7 +567,7 @@ pub fn alloc_aligned_for_level(
             let suffix = large_pages - end_page;
             if suffix > 0 {
                 free_pages_range(
-                    PhysAddr::new(aligned_pa + alloc_pages * PAGE_SIZE),
+                    PhysAddr::new(aligned_pa + alloc_pages * ps),
                     suffix,
                 );
             }
@@ -578,8 +581,9 @@ pub fn alloc_aligned_for_level(
 
 /// Free `count` contiguous allocation pages starting at `pa`.
 pub fn free_pages_range(pa: super::page::PhysAddr, count: usize) {
+    let ps = page::page_size();
     for i in 0..count {
-        super::phys::free_page(super::page::PhysAddr::new(pa.as_usize() + i * PAGE_SIZE));
+        super::phys::free_page(super::page::PhysAddr::new(pa.as_usize() + i * ps));
     }
 }
 
@@ -612,7 +616,8 @@ fn handle_cow_fault(
     fault_addr: usize,
 ) -> FaultResult {
     use super::cowgroup;
-    use super::page::{MMUPAGE_SIZE, PAGE_SIZE};
+    use super::page::MMUPAGE_SIZE;
+    let ps = page::page_size();
 
     // Read old PA and group port from the object.
     let (old_pa, cow_group_port) = match object::with_object(obj_id, |obj| {
@@ -666,7 +671,7 @@ fn handle_cow_fault(
                     core::ptr::copy_nonoverlapping(
                         old_pa.as_usize() as *const u8,
                         dest as *mut u8,
-                        PAGE_SIZE,
+                        ps,
                     );
                 }
                 // mark_copied_and_release will be called below for all paths.
@@ -684,7 +689,7 @@ fn handle_cow_fault(
                             core::ptr::copy_nonoverlapping(
                                 old_pa.as_usize() as *const u8,
                                 pa.as_usize() as *mut u8,
-                                PAGE_SIZE,
+                                ps,
                             );
                         }
                         pa
@@ -701,7 +706,7 @@ fn handle_cow_fault(
                     core::ptr::copy_nonoverlapping(
                         old_pa.as_usize() as *const u8,
                         pa.as_usize() as *mut u8,
-                        PAGE_SIZE,
+                        ps,
                     );
                 }
                 pa
@@ -771,6 +776,8 @@ fn try_consolidate_reservation(
 ) {
     use super::cowgroup;
     use super::page::PhysAddr;
+    let ps = page::page_size();
+    let pmc = page::page_mmucount();
 
     let info = match cowgroup::get_reservation_info(cow_group_port, obj_id, obj_page_base) {
         Some(i) => i,
@@ -811,7 +818,7 @@ fn try_consolidate_reservation(
         for slot in 0..page_count {
             let obj_idx = base_idx + slot;
             let current_pa = obj.pages.get(obj_idx);
-            let dest_slot_pa = info.dest_pa + slot * PAGE_SIZE;
+            let dest_slot_pa = info.dest_pa + slot * ps;
 
             if current_pa == dest_slot_pa {
                 continue; // Already in place (COW-copied page).
@@ -822,7 +829,7 @@ fn try_consolidate_reservation(
                 core::ptr::copy_nonoverlapping(
                     current_pa as *const u8,
                     dest_slot_pa as *mut u8,
-                    PAGE_SIZE,
+                    ps,
                 );
             }
 
@@ -841,16 +848,16 @@ fn try_consolidate_reservation(
     if relocated > 0 {
         let flags = pte_flags_for_vma(vma) | sw_zeroed_bit();
         // Convert object page base to VMA-local MMU index.
-        let obj_mmu_base = base_idx * PAGE_MMUCOUNT;
+        let obj_mmu_base = base_idx * pmc;
         let vma_obj_offset = vma.object_offset as usize;
         if obj_mmu_base < vma_obj_offset {
             return; // Superpage range starts before this VMA's mapping.
         }
         let mmu_base = obj_mmu_base - vma_obj_offset;
         for slot in 0..page_count {
-            let new_pa = info.dest_pa + slot * PAGE_SIZE;
-            for sub in 0..PAGE_MMUCOUNT {
-                let mi = mmu_base + slot * PAGE_MMUCOUNT + sub;
+            let new_pa = info.dest_pa + slot * ps;
+            for sub in 0..pmc {
+                let mi = mmu_base + slot * pmc + sub;
                 if mi >= vma.mmu_page_count() {
                     break;
                 }
@@ -866,7 +873,7 @@ fn try_consolidate_reservation(
 
     // Attempt superpage promotion — pages should now be contiguous.
     let vma_obj_offset = vma.object_offset as usize;
-    let obj_mmu_base = base_idx * PAGE_MMUCOUNT;
+    let obj_mmu_base = base_idx * pmc;
     if obj_mmu_base >= vma_obj_offset {
         let group_mmu_start = obj_mmu_base - vma_obj_offset;
         if group_mmu_start < vma.mmu_page_count() {

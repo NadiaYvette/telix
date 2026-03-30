@@ -5,7 +5,7 @@
 
 use super::message::Message;
 use super::port::{self, PortId};
-use crate::mm::page::PAGE_SIZE;
+use crate::mm::page;
 use crate::mm::paged_array::PagedArray;
 use crate::mm::phys;
 use crate::sched::thread::ThreadId;
@@ -13,7 +13,9 @@ use crate::sched::thread::ThreadId;
 pub type PortSetId = u32;
 
 /// Ports per page in a port set's port list.
-const PORTS_PER_PAGE: usize = PAGE_SIZE / core::mem::size_of::<PortId>();
+fn ports_per_page() -> usize {
+    page::page_size() / core::mem::size_of::<PortId>()
+}
 
 /// A set of ports that can be waited on together.
 pub struct PortSet {
@@ -53,10 +55,10 @@ impl PortSet {
             None => return false,
         };
         unsafe {
-            core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(page as *mut u8, 0, page::page_size());
         }
         self.ports = page;
-        self.ports_cap = PORTS_PER_PAGE;
+        self.ports_cap = ports_per_page();
         true
     }
 

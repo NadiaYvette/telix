@@ -4,9 +4,9 @@
 //! The kernel IRQ handler ACKs the virtio interrupt and wakes the waiting thread.
 //!
 //! The waiter table is page-allocated on first register() — no fixed IRQ limit.
-//! Capacity = PAGE_SIZE / size_of::<IrqWaiter>() (e.g. 2730 at 64 KiB pages).
+//! Capacity = page_size() / size_of::<IrqWaiter>() (e.g. 2730 at 64 KiB pages).
 
-use crate::mm::page::PAGE_SIZE;
+use crate::mm::page;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 struct IrqWaiter {
@@ -23,8 +23,8 @@ struct IrqWaiter {
 static IRQ_PAGE: AtomicPtr<IrqWaiter> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Number of IrqWaiter slots that fit in one page.
-const fn irq_capacity() -> usize {
-    PAGE_SIZE / core::mem::size_of::<IrqWaiter>()
+fn irq_capacity() -> usize {
+    page::page_size() / core::mem::size_of::<IrqWaiter>()
 }
 
 /// Allocate and zero-initialize the IRQ waiter page if not yet done.
@@ -42,7 +42,7 @@ fn ensure_init() -> *mut IrqWaiter {
         None => return core::ptr::null_mut(),
     };
     unsafe {
-        core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+        core::ptr::write_bytes(page as *mut u8, 0, page::page_size());
     }
 
     // CAS: first writer wins, loser frees their page.
@@ -54,7 +54,7 @@ fn ensure_init() -> *mut IrqWaiter {
     ) {
         Ok(_) => page,
         Err(winner) => {
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(page as usize));
+            crate::mm::phys::free_page(page::PhysAddr::new(page as usize));
             winner
         }
     }
