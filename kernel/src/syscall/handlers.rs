@@ -1174,7 +1174,19 @@ fn sys_virt_to_phys(va: u64) -> u64 {
     }
 
     match crate::mm::hat::translate_va(pt_root, va as usize) {
-        Some(pa) => pa as u64,
+        Some(pa) => {
+            // On MIPS64, the kernel uses KSEG0-mapped addresses internally
+            // (PA | 0xFFFF_FFFF_8000_0000). Strip the prefix to return a
+            // raw physical address suitable for DMA.
+            #[cfg(target_arch = "mips64")]
+            {
+                const KSEG0: usize = 0xFFFF_FFFF_8000_0000;
+                if pa >= KSEG0 {
+                    return (pa - KSEG0) as u64;
+                }
+            }
+            pa as u64
+        }
         None => u64::MAX,
     }
 }
@@ -1232,7 +1244,36 @@ fn sys_ioport(op: u64, port: u64, value: u64) -> u64 {
             }
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "mips64")]
+    {
+        let port = port as u16;
+        // Only allow ports >= 0x1000 (avoids system ports like UART at 0x3F8).
+        if port < 0x1000 {
+            return u64::MAX;
+        }
+        use crate::arch::mips64::pci;
+        unsafe {
+            match op {
+                0 => pci::ioport_read8(port) as u64,
+                1 => pci::ioport_read16(port) as u64,
+                2 => pci::ioport_read32(port) as u64,
+                3 => {
+                    pci::ioport_write8(port, value as u8);
+                    0
+                }
+                4 => {
+                    pci::ioport_write16(port, value as u16);
+                    0
+                }
+                5 => {
+                    pci::ioport_write32(port, value as u32);
+                    0
+                }
+                _ => u64::MAX,
+            }
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
     {
         let _ = (op, port, value);
         u64::MAX

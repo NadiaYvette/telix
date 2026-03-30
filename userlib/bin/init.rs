@@ -3949,7 +3949,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Phase 51: VFS server ---
     syscall::debug_puts(b"  init: testing VFS server...\n");
     {
-        let mut phase51_ok = has_blk; // VFS needs ext2 which needs block device
+        let mut phase51_ok = true;
 
         // VFS protocol tags.
         const VFS_MOUNT: u64 = 0x6000;
@@ -3964,7 +3964,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         const VFS_ERROR: u64 = 0x6F00;
 
         // Spawn VFS server.
-        let vfs_tid = if phase51_ok { syscall::spawn(b"vfs_srv", 50) } else { u64::MAX };
+        let vfs_tid = syscall::spawn(b"vfs_srv", 50);
         if vfs_tid == u64::MAX {
             syscall::debug_puts(b"  FAIL: cannot spawn vfs_srv\n");
             phase51_ok = false;
@@ -3978,7 +3978,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     found = p;
                     break;
                 }
-                syscall::sleep_ms(10); // 10ms
+                syscall::sleep_ms(10);
             }
             if found == 0 {
                 syscall::debug_puts(b"  FAIL: ns_lookup(vfs) failed\n");
@@ -3989,41 +3989,62 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             0
         };
 
-        // Look up ext2 port for mounting.
-        let ext2_port = if phase51_ok {
-            match syscall::ns_lookup(b"ext2") {
-                Some(p) => p,
-                None => {
-                    syscall::debug_puts(b"  FAIL: ns_lookup(ext2) failed\n");
-                    phase51_ok = false;
-                    0
+        // Determine root FS: ext2 if block device present, rootfs otherwise.
+        let root_fs_port;
+        let root_fs_name: &[u8];
+        if has_blk {
+            root_fs_port = if phase51_ok {
+                match syscall::ns_lookup(b"ext2") {
+                    Some(p) => p,
+                    None => {
+                        syscall::debug_puts(b"  FAIL: ns_lookup(ext2) failed\n");
+                        phase51_ok = false;
+                        0
+                    }
                 }
-            }
+            } else {
+                0
+            };
+            root_fs_name = b"ext2";
         } else {
-            0
-        };
+            // No block device — use rootfs (CPIO-backed writable tmpfs).
+            root_fs_port = if phase51_ok {
+                let mut found = 0u64;
+                for _ in 0..100 {
+                    if let Some(p) = syscall::ns_lookup(b"rootfs") {
+                        found = p;
+                        break;
+                    }
+                    syscall::sleep_ms(10);
+                }
+                if found == 0 {
+                    syscall::debug_puts(b"  FAIL: ns_lookup(rootfs) failed\n");
+                    phase51_ok = false;
+                }
+                found
+            } else {
+                0
+            };
+            root_fs_name = b"rootfs";
+        }
 
-        // Look up fat16 port.
-        let fat16_port = if phase51_ok {
+        // Look up fat16 port (only if block device).
+        let fat16_port = if phase51_ok && has_blk {
             match syscall::ns_lookup(b"fat16") {
                 Some(p) => p,
-                None => {
-                    // FAT16 might not be available, skip fat16 tests.
-                    0
-                }
+                None => 0,
             }
         } else {
             0
         };
 
-        // Test 1: Mount ext2 on "/".
-        // VFS wire: data[0..1]=path(16B), data[2]=path_len(16)|reply(32), data[3]=fs_port
+        // Test 1: Mount root FS on "/".
         if phase51_ok {
             let reply_port = syscall::port_create();
             let path = b"/";
             let (w0, w1, _w2) = pack_name(path);
             let d2 = (path.len() as u64) | (reply_port << 32);
-            syscall::send(vfs_port, VFS_MOUNT, w0, w1, d2, ext2_port);
+            syscall::send(vfs_port, VFS_MOUNT, w0, w1, d2, root_fs_port);
 
             let mut mounted = false;
             for _ in 0..100 {
@@ -4033,17 +4054,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                     break;
                 }
-                syscall::sleep_ms(10); // 10ms
+                syscall::sleep_ms(10);
             }
             syscall::port_destroy(reply_port);
 
             if !mounted {
-                syscall::debug_puts(b"  FAIL: VFS_MOUNT / failed\n");
+                syscall::debug_puts(b"  FAIL: VFS_MOUNT / failed (");
+                syscall::debug_puts(root_fs_name);
+                syscall::debug_puts(b")\n");
                 phase51_ok = false;
             }
         }
 
-        // Test 2: Mount fat16 on "/mnt".
+        // Test 2: Mount fat16 on "/mnt" (only with block device).
         if phase51_ok && fat16_port != 0 {
             let reply_port = syscall::port_create();
             let path = b"/mnt";
@@ -4062,7 +4085,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                     break;
                 }
-                syscall::sleep_ms(10); // 10ms
+                syscall::sleep_ms(10);
             }
             if !mnt_ok && phase51_ok {
                 syscall::debug_puts(b"  FAIL: VFS_MOUNT /mnt timeout\n");
@@ -4074,7 +4097,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Brief pause to let VFS server process mount table updates.
         syscall::sleep_ms(20);
 
-        // Test 3: VFS_OPEN "/hello.txt" — should resolve to ext2 on "/".
+        // Test 3: VFS_OPEN "/hello.txt" — should resolve to root FS on "/".
         if phase51_ok {
             let reply_port = syscall::port_create();
             let path = b"/hello.txt";
@@ -4086,7 +4109,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if let Some(reply) = syscall::recv_msg(reply_port) {
                 if reply.tag == VFS_OPEN_OK {
                     let ret_fs_port = reply.data[0];
-                    if ret_fs_port == ext2_port {
+                    if ret_fs_port == root_fs_port {
                         open_ok = true;
                     } else {
                         syscall::debug_puts(b"  FAIL: VFS_OPEN wrong port\n");
@@ -4143,8 +4166,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         if phase51_ok {
             syscall::debug_puts(b"Phase 51 VFS server: PASSED\n");
-        } else if !has_blk {
-            syscall::debug_puts(b"Phase 51 VFS server: SKIPPED (no blk device)\n");
         } else {
             syscall::debug_puts(b"Phase 51 VFS server: FAILED\n");
         }
@@ -7420,9 +7441,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             phase80_ok = false;
         }
 
-        // Test ext2 FS_CREATE + FS_READ via IPC (like Phase 53).
-        // ext2 requires block device — skip lookup if none found.
-        if let Some(ext2_port) = if has_blk { syscall::ns_lookup(b"ext2") } else { None } {
+        // Test FS_CREATE + FS_READ via IPC (like Phase 53).
+        // Use ext2 if block device present, otherwise rootfs.
+        let fs_port_80 = if has_blk {
+            syscall::ns_lookup(b"ext2")
+        } else {
+            syscall::ns_lookup(b"rootfs")
+        };
+        if let Some(fs_port) = fs_port_80 {
             const FS_CREATE: u64 = 0x2500;
             const FS_CREATE_OK: u64 = 0x2501;
             const FS_READ: u64 = 0x2100;
@@ -7432,13 +7458,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Create "pg_ctl" (6 bytes).
             let n0: u64 = 0x6C74635F6770; // "pg_ctl" LE
             let d2 = 6u64 | (reply << 32);
-            syscall::send(ext2_port, FS_CREATE, n0, 0, d2, 0);
+            syscall::send(fs_port, FS_CREATE, n0, 0, d2, 0);
             if let Some(resp) = syscall::recv_msg(reply) {
                 if resp.tag == FS_CREATE_OK {
                     let handle = resp.data[0];
                     // Read back to verify handle is valid.
                     let rd2 = 4u64 | (reply << 32);
-                    syscall::send(ext2_port, FS_READ, handle, 0, rd2, 0);
+                    syscall::send(fs_port, FS_READ, handle, 0, rd2, 0);
                     if let Some(rd) = syscall::recv_msg(reply) {
                         if rd.tag == FS_READ_OK {
                             syscall::debug_puts(b"    create+read pg_ctl: OK\n");

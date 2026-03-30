@@ -119,8 +119,8 @@ const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 const QUEUE_SIZE: usize = 16;
 const VRING_DESC_F_WRITE: u16 = 2;
 
-// --- Legacy virtio-PCI BAR0 register offsets (x86_64 only) ---
-#[cfg(target_arch = "x86_64")]
+// --- Legacy virtio-PCI BAR0 register offsets ---
+#[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
 mod pci_regs {
     pub const DEVICE_FEATURES: u16 = 0x00;
     pub const DRIVER_FEATURES: u16 = 0x04;
@@ -473,7 +473,7 @@ impl NetDev {
         }
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
     fn init(mmio_phys: usize, irq: u32) -> Option<Self> {
         let mmio_va = syscall::mmap_device(mmio_phys, 1)?;
 
@@ -547,7 +547,7 @@ impl NetDev {
         Some(dev)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
     fn setup_queue_mmio(mmio_va: usize, queue_idx: u32, version: u32) -> Option<Virtqueue> {
         mmio_write32(mmio_va, MMIO_QUEUE_SEL, queue_idx);
         let max = mmio_read32(mmio_va, MMIO_QUEUE_NUM_MAX);
@@ -603,8 +603,8 @@ impl NetDev {
         })
     }
 
-    /// PCI transport init for x86_64.
-    #[cfg(target_arch = "x86_64")]
+    /// PCI transport init for x86_64 / mips64.
+    #[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
     fn init(bar0_port: usize, irq: u32) -> Option<Self> {
         let base = bar0_port as u16;
 
@@ -652,7 +652,7 @@ impl NetDev {
         Some(dev)
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
     fn setup_queue_pci(base: u16, queue_idx: u16) -> Option<Virtqueue> {
         syscall::ioport_outw(base + pci_regs::QUEUE_SELECT, queue_idx);
         let max = syscall::ioport_inw(base + pci_regs::QUEUE_SIZE);
@@ -699,9 +699,9 @@ impl NetDev {
     }
 
     fn notify_queue(&self, queue_idx: u16) {
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
         mmio_write32(self.base, MMIO_QUEUE_NOTIFY, queue_idx as u32);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
         syscall::ioport_outw(self.base as u16 + pci_regs::QUEUE_NOTIFY, queue_idx);
     }
 

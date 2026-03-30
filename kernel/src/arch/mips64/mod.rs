@@ -1,5 +1,6 @@
 pub mod boot;
 pub mod mm;
+pub mod pci;
 pub mod serial;
 pub mod trap;
 

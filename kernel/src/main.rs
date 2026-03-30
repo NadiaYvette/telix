@@ -182,6 +182,26 @@ fn startup_thread() -> ! {
         }
     }
 
+    // MIPS64 Malta: Discover virtio devices via GT-64120 PCI bus scan.
+    #[cfg(target_arch = "mips64")]
+    {
+        println!("  Scanning PCI bus for virtio devices (Malta GT-64120)...");
+        if let Some(dev) = arch::mips64::pci::find_virtio_device(0x1001) {
+            let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
+            match sched::spawn_user(b"blk_srv", 50, 20, arg0) {
+                Some(tid) => println!("  blk_srv spawned (thread {})", tid),
+                None => println!("  WARNING: blk_srv not found (ok if not yet built)"),
+            }
+        }
+        if let Some(dev) = arch::mips64::pci::find_virtio_device(0x1000) {
+            let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
+            match sched::spawn_user(b"net_srv", 50, 20, arg0) {
+                Some(tid) => println!("  net_srv spawned (thread {})", tid),
+                None => println!("  WARNING: net_srv not found (ok if not yet built)"),
+            }
+        }
+    }
+
     // Phase 4: Spawning init process...
     println!("Phase 4: Spawning init process...");
 
@@ -226,6 +246,48 @@ fn startup_thread() -> ! {
                 );
             }
             None => println!("  ERROR: failed to spawn initramfs_srv"),
+        }
+    }
+
+    // Spawn rootfs server (CPIO-backed writable FS, mountable at "/").
+    {
+        use core::sync::atomic::Ordering;
+        let cpio_data: &[u8] = include_bytes!("io/initramfs.cpio");
+        let srv_port = ipc::port::create().expect("rootfs_srv port");
+
+        // Register rootfs with name server.
+        {
+            let nsrv = io::namesrv::NAMESRV_PORT.load(Ordering::Acquire);
+            let (n0, n1, _n2) = io::protocol::pack_name(b"rootfs");
+            let name_len = 6u64;
+            let reply_port = ipc::port::create().expect("reg reply port");
+            let d3 = name_len | ((reply_port as u64) << 32);
+            let msg = ipc::Message::new(
+                io::protocol::NS_REGISTER,
+                [n0, n1, srv_port as u64, d3, 0, 0],
+            );
+            let _ = ipc::port::send(nsrv, msg);
+            let _ = ipc::port::recv(reply_port); // wait for NS_REGISTER_OK
+            ipc::port::destroy(reply_port);
+        }
+
+        match sched::spawn_user_with_data(
+            b"rootfs_srv",
+            50,
+            20,
+            cpio_data,
+            0x4_0000_0000, // different VA from initramfs_srv (0x3_0000_0000)
+            srv_port as u64,
+        ) {
+            Some(tid) => {
+                let task_id = sched::thread_task_id(tid);
+                cap::grant_full_port_cap(task_id, srv_port);
+                println!(
+                    "  rootfs_srv spawned (thread {}, port {})",
+                    tid, srv_port
+                );
+            }
+            None => println!("  WARNING: rootfs_srv not found (ok if not yet built)"),
         }
     }
 

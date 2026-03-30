@@ -190,7 +190,7 @@ struct BlkDev {
 }
 
 // --- Legacy virtio-PCI BAR0 register offsets ---
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
 mod pci_regs {
     pub const DEVICE_FEATURES: u16 = 0x00; // 32-bit read
     pub const DRIVER_FEATURES: u16 = 0x04; // 32-bit write
@@ -206,7 +206,7 @@ mod pci_regs {
 }
 
 impl BlkDev {
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
     fn init(mmio_phys: usize, irq: u32) -> Option<Self> {
         // Map MMIO registers into our address space.
         let mmio_va = syscall::mmap_device(mmio_phys, 1)?;
@@ -354,8 +354,8 @@ impl BlkDev {
         })
     }
 
-    /// PCI transport init for x86_64.
-    #[cfg(target_arch = "x86_64")]
+    /// PCI transport init for x86_64 / mips64.
+    #[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
     fn init(bar0_port: usize, irq: u32) -> Option<Self> {
         let base = bar0_port as u16;
 
@@ -591,10 +591,12 @@ impl BlkDev {
         unsafe {
             core::arch::asm!("fence iorw, iorw");
         }
+        #[cfg(target_arch = "mips64")]
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         // Notify device.
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
         mmio_write32(self.mmio_va, MMIO_QUEUE_NOTIFY, 0);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
         syscall::ioport_outw(self.mmio_va as u16 + pci_regs::QUEUE_NOTIFY, 0);
     }
 
