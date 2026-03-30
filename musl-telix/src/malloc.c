@@ -5,7 +5,6 @@
 #include <telix/syscall.h>
 
 #define HEAP_BASE  0x400000000ULL
-#define PAGE_SIZE  65536  /* Must match kernel allocation page size */
 
 /* Each allocation has an 8-byte header storing the usable size. */
 #define HDR_SIZE 8
@@ -15,7 +14,13 @@
 
 static void *free_lists[NUM_BUCKETS];
 static uint64_t heap_top = HEAP_BASE;
-static int heap_inited = 0;
+static uint64_t cached_page_size = 0;
+
+static uint64_t get_page_size(void) {
+    if (cached_page_size == 0)
+        cached_page_size = __telix_syscall0(SYS_PAGE_SIZE);
+    return cached_page_size;
+}
 
 static int bucket_for(size_t sz) {
     int b = 0;
@@ -29,13 +34,14 @@ static size_t bucket_size(int b) {
 }
 
 static void *alloc_pages(size_t bytes) {
-    size_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t ps = get_page_size();
+    size_t pages = (bytes + ps - 1) / ps;
     uint64_t va = heap_top;
     /* SYS_MMAP_ANON(16): args = va, page_count, prot(1=RW) */
     uint64_t result = __telix_syscall3(SYS_MMAP_ANON, va, pages, 1);
     if (result == 0 || result == (uint64_t)-1)
         return NULL;
-    heap_top += pages * PAGE_SIZE;
+    heap_top += pages * ps;
     return (void *)va;
 }
 

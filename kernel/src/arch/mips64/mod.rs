@@ -14,9 +14,9 @@ pub fn init() {
     trap::init();
 }
 
-/// Parse firmware tables.
+/// Parse firmware tables (YAMON argv).
 pub fn parse_firmware() {
-    // MIPS64 Malta: no DTB, hardcoded values.
+    boot::parse_firmware();
 }
 
 /// RAM range for the physical allocator.

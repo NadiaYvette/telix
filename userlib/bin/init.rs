@@ -1071,7 +1071,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Allocate stack for child thread.
             let child_stack_va = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
             if child_stack_va != 0 {
-                let stack_top = child_stack_va + 0x4000; // 16 KiB, safe on all PAGE_SIZE configs
+                let stack_top = child_stack_va + syscall::page_size();
 
                 let child_tid = syscall::thread_create(
                     thread_child_entry as u64,
@@ -1113,8 +1113,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let stack1 = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
         let stack2 = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
         if stack1 != 0 && stack2 != 0 {
-            let t1 = syscall::thread_create(mutex_test_thread as u64, (stack1 + 0x4000) as u64, 0);
-            let t2 = syscall::thread_create(mutex_test_thread as u64, (stack2 + 0x4000) as u64, 0);
+            let ps = syscall::page_size();
+            let t1 = syscall::thread_create(mutex_test_thread as u64, (stack1 + ps) as u64, 0);
+            let t2 = syscall::thread_create(mutex_test_thread as u64, (stack2 + ps) as u64, 0);
 
             if t1 != u64::MAX && t2 != u64::MAX {
                 syscall::thread_join(t1);
@@ -1642,14 +1643,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Test 21: Superpage Promotion ---
     syscall::debug_puts(b"  init: testing superpage promotion...\n");
     {
-        // Allocate 32 allocation pages = 2 MiB at 64K PAGE_SIZE.
+        // Allocate 2 MiB at a 2 MiB-aligned VA.
         // Touch all 512 MMU pages (4K each) to trigger faults, then check if
         // the kernel promoted the region to a single 2 MiB superpage.
         let promo_before = syscall::vm_stats(0); // superpage promotions before
 
-        // Allocate 32 pages (2 MiB) at a 2 MiB-aligned VA.
-        // VA must be 2 MiB-aligned so the kernel can install a superpage PTE.
-        let big_va = syscall::mmap_anon(0x10_0000_0000, 32, 1); // 64 GiB, 2 MiB-aligned
+        let ps = syscall::page_size();
+        let two_mib: usize = 2 * 1024 * 1024;
+        let npages = two_mib / ps;
+        let big_va = syscall::mmap_anon(0x10_0000_0000, npages, 1);
         if let Some(base) = big_va {
             // Touch every 4K page in the 2 MiB region to install all PTEs.
             for i in 0..512 {
@@ -1699,8 +1701,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let consol_before = syscall::vm_stats(20); // reservation consolidations
         let promo_before = syscall::vm_stats(0); // superpage promotions
 
-        // Allocate 32 allocation pages (2 MiB) at a 2 MiB-aligned VA.
-        let big_va = syscall::mmap_anon(0x20_0000_0000, 32, 1);
+        // Allocate 2 MiB at a 2 MiB-aligned VA.
+        let ps = syscall::page_size();
+        let two_mib: usize = 2 * 1024 * 1024;
+        let npages = two_mib / ps;
+        let big_va = syscall::mmap_anon(0x20_0000_0000, npages, 1);
         if let Some(base) = big_va {
             // Populate every 4K MMU page with a unique pattern.
             for i in 0..512u64 {
@@ -1822,14 +1827,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let ws2 = syscall::mmap_anon(0, 1, 1).unwrap_or(0);
 
             if ws1 != 0 && ws2 != 0 {
+                let ps = syscall::page_size();
                 let t1 = syscall::thread_create(
                     userlib::green::green_worker_entry as u64,
-                    (ws1 + 0x4000) as u64,
+                    (ws1 + ps) as u64,
                     0, // worker_id = 0
                 );
                 let t2 = syscall::thread_create(
                     userlib::green::green_worker_entry as u64,
-                    (ws2 + 0x4000) as u64,
+                    (ws2 + ps) as u64,
                     1, // worker_id = 1
                 );
 
@@ -1875,12 +1881,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // 12 threads (8 grouped + 4 ungrouped), 8 KiB stacks.
         // With 12 threads on 4 CPUs, at least 8 threads are in run queues
         // at any given time, maximizing coscheduling opportunities.
-        let stacks = syscall::mmap_anon(0, 2, 1);
+        let stack_size: usize = 0x2000; // 8 KiB per stack
+        let total_bytes = 13 * stack_size; // 12 threads + 1 guard
+        let ps = syscall::page_size();
+        let npages = (total_bytes + ps - 1) / ps;
+        let stacks = syscall::mmap_anon(0, npages, 1);
 
         if let Some(sk) = stacks {
             let hits_before = syscall::vm_stats(4);
-
-            let stack_size: usize = 0x2000; // 8 KiB per stack
             let mut tids = [u64::MAX; 12];
             let mut ok = true;
             // 8 threads in group 1, 4 threads ungrouped.
@@ -1964,7 +1972,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Step 3: Test affinity on child thread.
         if let Some(stack_va) = syscall::mmap_anon(0, 1, 1) {
             let child =
-                syscall::thread_create(affinity_test_worker as u64, (stack_va + 0x4000) as u64, 0);
+                syscall::thread_create(affinity_test_worker as u64, (stack_va + syscall::page_size()) as u64, 0);
             if child != u64::MAX {
                 // Pin child to CPU 0.
                 syscall::set_affinity(child, 1);
@@ -2308,14 +2316,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Allocate 1 allocation page (64 KiB = 16 MMU pages), RW.
         let va = syscall::mmap_anon(0, 1, 1);
         if let Some(va) = va {
+            let ps = syscall::page_size();
+            let sub_pages = ps / 4096;
             // Touch first sub-page (triggers major fault; may use pre-zeroed page).
             unsafe {
                 core::ptr::write_volatile(va as *mut u8, 0x42);
             }
 
-            // Touch remaining 15 sub-pages.
-            for i in 1..16u64 {
-                let ptr = (va + (i as usize) * 4096) as *mut u8;
+            // Touch remaining sub-pages.
+            for i in 1..sub_pages {
+                let ptr = (va + i * 4096) as *mut u8;
                 unsafe {
                     core::ptr::write_volatile(ptr, 0x42);
                 }
@@ -2337,12 +2347,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             print_num(minor_delta);
             syscall::debug_puts(b"\n");
 
-            // If pre-zeroing was active: expect ~1 major + ~15 minor.
-            // If pool was empty: expect ~16 major + ~0 minor.
+            // If pre-zeroing was active: expect ~1 major + remaining minor.
+            // If pool was empty: expect all major + ~0 minor.
             // Both paths are correct; pre-zeroing is opportunistic.
-            if prezeroed_delta > 0 && minor_delta >= 10 {
+            let threshold = if sub_pages > 2 { sub_pages * 2 / 3 } else { 1 };
+            if prezeroed_delta > 0 && minor_delta >= threshold as u64 {
                 syscall::debug_puts(b"    pre-zeroed path: OK\n");
-            } else if major_delta >= 10 {
+            } else if major_delta >= threshold as u64 {
                 syscall::debug_puts(b"    on-demand path (pool empty): OK\n");
             }
 
@@ -2842,7 +2853,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Test mprotect: allocate RW page, write to it, change to RO, verify data survives.
         if let Some(va) = syscall::mmap_anon(0, 1, 1) {
             // 1 page, RW
-            let page_size = 0x10000usize; // PAGE_SIZE = 64K
+            let page_size = syscall::page_size();
             let mmu_page = 0x1000usize; // MMUPAGE_SIZE = 4K
 
             // Write a known value.
@@ -2913,7 +2924,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Test mremap grow: allocate 1 page, write data, grow to 2 pages,
         // verify original data survives and new region is accessible.
         if let Some(va) = syscall::mmap_anon(0, 1, 1) {
-            let page_size = 0x10000usize;
+            let page_size = syscall::page_size();
 
             // Write a sentinel.
             unsafe {
@@ -3060,7 +3071,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         if phase45_ok {
-            let pager_stack_top = pager_stack + 0x4000;
+            let pager_stack_top = pager_stack + syscall::page_size();
 
             // Spawn pager thread.
             let pager_tid =
@@ -3086,9 +3097,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             phase45_ok = false;
                         }
 
-                        // Read from second allocation page (offset = PAGE_SIZE).
-                        // PAGE_SIZE = 64K = 0x10000. Page index = 1.
-                        let b1 = unsafe { core::ptr::read_volatile(ptr.add(0x10000)) };
+                        // Read from second allocation page (offset = PAGE_SIZE). Page index = 1.
+                        let ps = syscall::page_size();
+                        let b1 = unsafe { core::ptr::read_volatile(ptr.add(ps)) };
                         if b1 != 1 {
                             syscall::debug_puts(b"  FAIL: page 1 byte 0 mismatch\n");
                             phase45_ok = false;
@@ -3102,7 +3113,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         }
 
                         // Read from second page at offset 0x200.
-                        let b3 = unsafe { core::ptr::read_volatile(ptr.add(0x10200)) };
+                        let b3 = unsafe { core::ptr::read_volatile(ptr.add(ps + 0x200)) };
                         if b3 != 1 {
                             syscall::debug_puts(b"  FAIL: page 1 byte 0x200 mismatch\n");
                             phase45_ok = false;
@@ -7928,7 +7939,7 @@ extern "C" fn pager_thread_entry(_arg: u64) {
 
         // Fill a local buffer with pattern: each byte = page_index (offset / PAGE_SIZE).
         // PAGE_SIZE = 64K = 0x10000.
-        let page_index = (file_offset / 0x10000) as u8;
+        let page_index = (file_offset / page_size as u64) as u8;
 
         // Allocate a temporary buffer (use stack — 4K at a time, fill PAGE_SIZE).
         // Since PAGE_SIZE can be 64K, we fill via multiple 4K chunks.

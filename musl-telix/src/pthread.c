@@ -70,7 +70,8 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     spinlock_release(&thread_arg_lock);
 
     /* SYS_THREAD_CREATE: a0=entry, a1=stack_top, a2=arg, a3=priority */
-    uint64_t stack_top = stack + stack_pages * 0x10000;
+    uint64_t page_size = __telix_syscall0(SYS_PAGE_SIZE);
+    uint64_t stack_top = stack + stack_pages * page_size;
     uint64_t tid = __telix_syscall4(SYS_THREAD_CREATE,
         (uint64_t)(uintptr_t)thread_trampoline, stack_top,
         (uint64_t)slot, 10);

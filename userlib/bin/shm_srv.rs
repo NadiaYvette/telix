@@ -167,9 +167,10 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
                 // Touch pages to ensure physical backing (grants require it).
                 let ptr = va as *mut u8;
+                let ps = syscall::page_size();
                 for p in 0..page_count {
                     unsafe {
-                        core::ptr::write_volatile(ptr.add(p * 0x10000), 0);
+                        core::ptr::write_volatile(ptr.add(p * ps), 0);
                     }
                 }
 

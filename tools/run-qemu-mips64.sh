@@ -19,6 +19,11 @@ QEMU_ARGS=(
     -kernel "$KERNEL"
 )
 
+# Pass kernel command line via YAMON -append if TELIX_CMDLINE is set.
+if [ -n "${TELIX_CMDLINE:-}" ]; then
+    QEMU_ARGS+=(-append "$TELIX_CMDLINE")
+fi
+
 # Add virtio-blk-pci disk if test.img exists.
 if [ -f "$DISK_IMG" ]; then
     QEMU_ARGS+=(

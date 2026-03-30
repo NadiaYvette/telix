@@ -59,6 +59,7 @@
 #define SYS_PORT_SET_CREATE 5
 #define SYS_PORT_SET_ADD    6
 #define SYS_PORT_SET_RECV   22
+#define SYS_PAGE_SIZE       103
 
 /* Raw syscall stubs (defined in arch/<ARCH>/syscall.S). */
 uint64_t __telix_syscall0(uint64_t nr);

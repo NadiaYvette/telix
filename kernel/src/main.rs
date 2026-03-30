@@ -40,6 +40,7 @@ pub fn kmain() -> ! {
     boot::cmdline::parse();
     let mmushift = boot::cmdline::page_mmushift();
     mm::page::init_runtime_page_size(mmushift);
+    mm::slab::reinit_for_page_size();
     println!("  Page size: {} bytes (mmushift={})", mm::page::page_size(), mmushift);
 
     // Physical memory allocator.

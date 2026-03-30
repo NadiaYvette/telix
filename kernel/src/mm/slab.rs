@@ -78,6 +78,15 @@ impl SlabCache {
         }
     }
 
+    /// Recalculate objs_per_slab based on the runtime page size.
+    /// Must be called after `page::init_runtime_page_size()` if the runtime
+    /// page size differs from the compile-time default.
+    pub fn reinit_for_page_size(&mut self) {
+        let ps = page::page_size();
+        let usable = ps - self.data_offset;
+        self.objs_per_slab = usable / self.obj_size;
+    }
+
     /// Ensure the slab directory page is allocated. Returns false on OOM.
     fn ensure_dir(&mut self) -> bool {
         if self.slab_dir.is_null() {
@@ -301,6 +310,17 @@ static CACHE_128: SpinLock<SlabCache> = SpinLock::new(SlabCache::new(128, 64));
 static CACHE_256: SpinLock<SlabCache> = SpinLock::new(SlabCache::new(256, 64));
 static CACHE_512: SpinLock<SlabCache> = SpinLock::new(SlabCache::new(512, 64));
 static CACHE_2048: SpinLock<SlabCache> = SpinLock::new(SlabCache::new(2048, 64));
+
+/// Reinitialize all slab caches for the runtime page size.
+/// Must be called once after `page::init_runtime_page_size()` and before
+/// any slab allocations, if the runtime page size differs from compile-time.
+pub fn reinit_for_page_size() {
+    CACHE_64.lock().reinit_for_page_size();
+    CACHE_128.lock().reinit_for_page_size();
+    CACHE_256.lock().reinit_for_page_size();
+    CACHE_512.lock().reinit_for_page_size();
+    CACHE_2048.lock().reinit_for_page_size();
+}
 
 /// Map size → cache index (0..4).
 #[inline]

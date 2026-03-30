@@ -57,6 +57,7 @@ const SYS_GETRANDOM: u64 = 96;
 #[allow(dead_code)]
 const SYS_PROXY_REGISTER: u64 = 99;
 const SYS_PORT_RESIZE: u64 = 100;
+const SYS_PAGE_SIZE: u64 = 103;
 
 /// Register a port as the network proxy endpoint for non-local sends.
 pub fn proxy_register(port: u64) -> u64 {
@@ -165,6 +166,19 @@ pub fn spawn(name: &[u8], priority: u8) -> u64 {
 pub fn waitpid(child_port: u64) -> Option<u64> {
     let r = unsafe { arch::syscall1(SYS_WAITPID, child_port) };
     if r == u64::MAX { None } else { Some(r) }
+}
+
+/// Query the kernel's allocation page size in bytes.
+pub fn page_size() -> usize {
+    unsafe { arch::syscall0(SYS_PAGE_SIZE) as usize }
+}
+
+/// Allocate `byte_count` bytes (rounded up to pages). Returns (VA, actual_pages).
+pub fn mmap_anon_bytes(byte_count: usize, prot: u8) -> Option<(usize, usize)> {
+    let ps = page_size();
+    let pages = (byte_count + ps - 1) / ps;
+    let va = mmap_anon(0, pages, prot)?;
+    Some((va, pages))
 }
 
 /// Allocate anonymous pages. va=0 for auto-pick. prot: 0=RO, 1=RW, 2=RX, 3=RWX.

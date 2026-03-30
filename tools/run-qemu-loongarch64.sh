@@ -17,6 +17,14 @@ QEMU_ARGS=(
     -smp 4
 )
 
+# LoongArch64 virt doesn't pass -append via DTB/FW_CFG standard items.
+# Use a custom fw_cfg file to pass the kernel command line.
+if [ -n "${TELIX_CMDLINE:-}" ]; then
+    TMPFILE=$(mktemp)
+    printf '%s' "$TELIX_CMDLINE" > "$TMPFILE"
+    QEMU_ARGS+=(-fw_cfg "name=opt/telix/cmdline,file=$TMPFILE")
+fi
+
 # Add debug flags if requested.
 if [ "${1:-}" = "--debug" ]; then
     QEMU_ARGS+=(-S -s)

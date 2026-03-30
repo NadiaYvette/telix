@@ -109,6 +109,7 @@ pub const SYS_PROXY_REGISTER: u64 = 99;
 pub const SYS_PORT_RESIZE: u64 = 100;
 pub const SYS_FUTEX_WAIT_PI: u64 = 101;
 pub const SYS_FUTEX_WAKE_PI: u64 = 102;
+pub const SYS_PAGE_SIZE: u64 = 103;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -366,6 +367,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_PORT_RESIZE => sys_port_resize(a0, a1),
         SYS_FUTEX_WAIT_PI => crate::sync::turnstile::futex_wait_pi(a0 as usize, a1 as u32),
         SYS_FUTEX_WAKE_PI => crate::sync::turnstile::futex_wake_pi(a0 as usize),
+        SYS_PAGE_SIZE => crate::mm::page::page_size() as u64,
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1467,8 +1469,14 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     // Page-allocated scratch buffers: metadata page (u16 lengths) + contiguous data pages.
     const ARG_MAX_STRLEN: usize = 4096;
     let arg_max_strings: usize = ps / 8; // scales with page size
-    let arg_max_total: usize = 2 * ps; // max total string bytes
-    let data_order: usize = 1; // 2 contiguous pages for string data
+    // Ensure at least 128K for arg data regardless of page size.
+    let min_arg_bytes: usize = 128 * 1024;
+    let data_order: usize = {
+        let mut order = 0usize;
+        while (ps << (order + 1)) < min_arg_bytes { order += 1; }
+        order + 1 // allocate 2^(order+1) pages
+    };
+    let arg_max_total: usize = ps << data_order;
 
     // Allocate scratch pages.
     let meta_page = match crate::mm::phys::alloc_page() {

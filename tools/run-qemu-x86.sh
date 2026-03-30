@@ -27,6 +27,11 @@ QEMU_ARGS=(
     -smp 4
 )
 
+# Pass kernel command line if TELIX_CMDLINE is set.
+if [ -n "${TELIX_CMDLINE:-}" ]; then
+    QEMU_ARGS+=(-append "$TELIX_CMDLINE")
+fi
+
 # Add virtio-blk disk if test.img exists.
 if [ -f "$DISK_IMG" ]; then
     QEMU_ARGS+=(

@@ -16,8 +16,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) 
     if (prot & PROT_WRITE) telix_prot |= 1;
     if (prot & PROT_EXEC)  telix_prot |= 2;
 
-    /* Page count: Telix pages are 64K. */
-    size_t page_size = 0x10000;
+    size_t page_size = (size_t)__telix_syscall0(SYS_PAGE_SIZE);
     size_t pages = (length + page_size - 1) / page_size;
 
     uint64_t result = __telix_syscall4(SYS_MMAP_ANON,

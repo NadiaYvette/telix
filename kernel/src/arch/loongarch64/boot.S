@@ -31,8 +31,9 @@ _start:
     // Set up boot stack.
     la.pcrel  $sp, __boot_stack_top
 
-    // Call Rust entry. a0 = core_id.
+    // Call Rust entry. a0 = core_id, a1 = fw_cfg pointer.
     move      $a0, $s0
+    move      $a1, $s1
     bl        _rust_entry
 
     // Should not return.

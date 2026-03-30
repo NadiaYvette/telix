@@ -13,9 +13,9 @@ pub fn init() {
     trap::init();
 }
 
-/// Parse firmware tables (DTB).
+/// Parse firmware tables (scan for DTB bootargs).
 pub fn parse_firmware() {
-    // TODO: DTB parsing for LoongArch64 QEMU virt
+    boot::parse_firmware();
 }
 
 /// RAM range for the physical allocator.

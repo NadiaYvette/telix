@@ -23,6 +23,10 @@ _start:
     mtc0    $t0, $12
     ehb
 
+    // Save YAMON arguments (a0=argc, a1=argv) before BSS clear.
+    move    $s0, $a0
+    move    $s1, $a1
+
     // Zero BSS.
     dla     $t0, __bss_start
     dla     $t1, __bss_end
@@ -38,7 +42,9 @@ _start:
     // Set up boot stack.
     dla     $sp, __boot_stack_top
 
-    // Call Rust entry.
+    // Call Rust entry. a0 = argc, a1 = argv (preserved from QEMU YAMON).
+    move    $a0, $s0
+    move    $a1, $s1
     dla     $t0, _rust_entry
     jalr    $t0
     nop

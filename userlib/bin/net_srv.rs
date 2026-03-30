@@ -557,16 +557,17 @@ impl NetDev {
         let qsize = (QUEUE_SIZE as u32).min(max);
         mmio_write32(mmio_va, MMIO_QUEUE_NUM, qsize);
 
+        let ps = syscall::page_size();
         let vq_va = syscall::mmap_anon(0, 1, 1)?;
         let vq_pa = syscall::virt_to_phys(vq_va)?;
         unsafe {
-            core::ptr::write_bytes(vq_va as *mut u8, 0, 4096);
+            core::ptr::write_bytes(vq_va as *mut u8, 0, ps);
         }
 
         let buf_va = syscall::mmap_anon(0, 1, 1)?;
         let buf_pa = syscall::virt_to_phys(buf_va)?;
         unsafe {
-            core::ptr::write_bytes(buf_va as *mut u8, 0, 4096);
+            core::ptr::write_bytes(buf_va as *mut u8, 0, ps);
         }
 
         let desc_pa = vq_pa;
@@ -663,17 +664,20 @@ impl NetDev {
         // Legacy PCI: queue size is fixed by the device (read-only).
         let qsz = max as usize;
 
-        // Allocate virtqueue page (64K alloc page fits desc+avail+used with 4K alignment).
-        let vq_va = syscall::mmap_anon(0, 1, 1)?;
+        // Allocate virtqueue memory (desc+avail+used with 4K alignment).
+        let ps = syscall::page_size();
+        let vq_bytes = 16 * qsz + (6 + 2 * qsz) + 4096 + (8 * qsz + 6);
+        let vq_pages = (vq_bytes + ps - 1) / ps;
+        let vq_va = syscall::mmap_anon(0, vq_pages, 1)?;
         let vq_pa = syscall::virt_to_phys(vq_va)?;
         unsafe {
-            core::ptr::write_bytes(vq_va as *mut u8, 0, 4096 * 16);
+            core::ptr::write_bytes(vq_va as *mut u8, 0, vq_pages * ps);
         }
 
         let buf_va = syscall::mmap_anon(0, 1, 1)?;
         let buf_pa = syscall::virt_to_phys(buf_va)?;
         unsafe {
-            core::ptr::write_bytes(buf_va as *mut u8, 0, 4096);
+            core::ptr::write_bytes(buf_va as *mut u8, 0, ps);
         }
 
         let desc_pa = vq_pa;
