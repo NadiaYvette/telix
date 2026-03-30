@@ -2934,6 +2934,12 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     let next_id = percpu_pick_next(cpu_idx, idle_id);
 
     // Switch page tables if needed.
+    // Disable interrupts across the page-table switch + current_thread update
+    // to prevent a timer from seeing TLB_PT_ROOT pointing to the new task
+    // while current_thread still identifies the old task (which would cause
+    // a subsequent tick() to restore the old task's root, leaving the new
+    // task running with the wrong page table).
+    let irq_saved = crate::arch::irq::disable();
     let prev_task = thread_ref(tid as ThreadId).task_id;
     let next_task = thread_ref(next_id).task_id;
     if prev_task != next_task {
@@ -2965,6 +2971,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     next_t.state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     let next_sp = next_t.saved_sp;
+    crate::arch::irq::restore(irq_saved);
 
     // Scheduler activation: notify userspace that a kthread blocked.
     if sa_enabled {
@@ -3244,7 +3251,9 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     // Pick next thread from per-CPU queue.
     let next_id = percpu_pick_next(cpu_idx, idle_id);
 
-    // Switch page tables if needed.
+    // Disable interrupts across page-table switch + current_thread update
+    // (same race as park_current_for_ipc — see comment there).
+    let irq_saved = crate::arch::irq::disable();
     let prev_task = thread_ref(tid as ThreadId).task_id;
     let next_task = thread_ref(next_id).task_id;
     if prev_task != next_task {
@@ -3276,6 +3285,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     next_t.state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     let next_sp = next_t.saved_sp;
+    crate::arch::irq::restore(irq_saved);
 
     if sa_enabled {
         let tptr = TASK_TABLE.get(parked_task_id) as *mut Task;
@@ -3344,7 +3354,9 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     let receiver = unsafe { thread_mut_from_ref(receiver_tid) };
     receiver.quantum = remaining_quantum;
 
-    // Switch page tables if needed.
+    // Disable interrupts across page-table switch + current_thread update
+    // (same race as park_current_for_ipc — see comment there).
+    let irq_saved = crate::arch::irq::disable();
     let recv_task = receiver.task_id;
     if sender_task != recv_task {
         let next_root = {
@@ -3374,6 +3386,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     receiver.state = ThreadState::Running;
     pcpu.current_thread.store(receiver_tid, Ordering::Relaxed);
     let recv_sp = receiver.saved_sp;
+    crate::arch::irq::restore(irq_saved);
 
     PENDING_SWITCH_SP[cpu].store(recv_sp, Ordering::Release);
 }

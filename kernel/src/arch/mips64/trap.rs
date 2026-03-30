@@ -250,11 +250,11 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                     let ksu = (frame.status >> 3) & 0x3;
                     crate::println!(
                         "Unhandled page fault: exccode={:#x} epc={:#x} badvaddr={:#x} tid={} ksu={} — killing thread",
-                        exccode,
-                        frame.epc,
-                        badvaddr,
-                        tid,
-                        ksu,
+                        exccode, frame.epc, badvaddr, tid, ksu,
+                    );
+                    crate::println!(
+                        "  ra={:#x} sp={:#x} v0={:#x}",
+                        frame.regs[31], frame.regs[29], frame.regs[2]
                     );
                     crate::sched::scheduler::exit_current_thread(-11) // SIGSEGV
                 }

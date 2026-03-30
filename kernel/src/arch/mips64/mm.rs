@@ -259,11 +259,6 @@ pub fn boot_page_table_root() -> usize {
     KERNEL_PT_ROOT.load(Ordering::Acquire)
 }
 
-/// Read the current TLB_PT_ROOT value (for debug).
-pub fn read_tlb_pt_root() -> u64 {
-    TLB_PT_ROOT.load(Ordering::Relaxed)
-}
-
 /// Switch to a different page table.
 pub fn switch_page_table(root: usize) {
     TLB_PT_ROOT.store(root as u64, Ordering::Release);

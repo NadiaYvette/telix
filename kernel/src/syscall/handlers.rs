@@ -1567,11 +1567,16 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     // Reset address space: destroy all VMAs/PTEs, free old page table, install new one.
     crate::mm::aspace::reset(aspace_id, new_pt_root);
 
-    // Update task's page table root.
-    crate::sched::scheduler::update_task_page_table(new_pt_root);
-
-    // Switch to new page table.
-    crate::mm::hat::switch_page_table(new_pt_root);
+    // Update task's page table root and TLB_PT_ROOT atomically w.r.t. timer
+    // interrupts. Without this, a timer between update_task_page_table and
+    // switch_page_table could see the old (freed) root in TLB_PT_ROOT and
+    // context-switch using it.
+    {
+        let irq_saved = crate::arch::irq::disable();
+        crate::sched::scheduler::update_task_page_table(new_pt_root);
+        crate::mm::hat::switch_page_table(new_pt_root);
+        crate::arch::irq::restore(irq_saved);
+    }
 
     // Load ELF segments into the fresh address space.
     let elf_info = match crate::loader::elf::load_elf(elf_data, aspace_id, new_pt_root) {
