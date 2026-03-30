@@ -183,6 +183,22 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
         EXC_SYS => {
             // Syscall — advance EPC past the syscall instruction (4 bytes).
             frame.epc += 4;
+
+            // Clear EXL so timer interrupts can preempt blocking syscalls
+            // (exit, park_current_for_ipc, etc.). EXL=1 masks all interrupts
+            // on MIPS regardless of IE. Must also set KSU=0 (kernel mode)
+            // since EXL was the only thing keeping us in kernel mode — the
+            // saved Status has KSU=2 (user) from the syscall entry.
+            unsafe {
+                core::arch::asm!(
+                    "mfc0 {tmp}, $12",
+                    "ins  {tmp}, $zero, 1, 4",  // clear bits 4:1 (KSU + EXL)
+                    "mtc0 {tmp}, $12",
+                    "ehb",
+                    tmp = out(reg) _,
+                );
+            }
+
             crate::sched::scheduler::store_frame_sp(frame_sp);
             crate::syscall::dispatch(frame);
             let pending = crate::sched::scheduler::take_pending_switch();

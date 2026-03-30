@@ -162,9 +162,9 @@ _trap_entry:
     dmfc0   $t0, $8                 // BadVAddr
     sd      $t0, 35*8($sp)
 
-    // Keep EXL=1 during the handler — all kernel data is in KSEG0 (no TLB
-    // misses), and leaving EXL=1 prevents pending interrupts from re-entering
-    // before the handler has acknowledged them.
+    // Keep EXL=1 during the handler. For syscalls that need timer preemption
+    // (exit_current_thread, park_current_for_ipc), the Rust handler clears
+    // EXL before calling the blocking path.
 
     // Call Rust trap handler: a0 = sp (pointer to TrapFrame).
     move    $a0, $sp
@@ -174,6 +174,13 @@ _trap_entry:
     // Return value in v0 ($2) = (potentially new) sp.
 
     move    $sp, $v0
+
+    // Disable interrupts before restore to prevent timer re-entry during
+    // the critical window between loading EPC/Status and eret. The syscall
+    // handler may have cleared EXL to allow preemption, so IE could still
+    // be set with EXL=0. "di" clears IE atomically.
+    di
+    ehb
 
     // Restore EPC and Status.
     ld      $t0, 32*8($sp)
