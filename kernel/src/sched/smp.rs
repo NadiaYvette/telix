@@ -49,6 +49,54 @@ pub static mut TRAP_SCRATCH_ARRAY: [TrapScratch; MAX_CPUS] = {
     [INIT; MAX_CPUS]
 };
 
+/// Per-CPU trap scratch data for LoongArch64.
+/// CSR.SAVE0 points to &TRAP_SCRATCH_ARRAY[cpu] when in user mode (0 in kernel mode).
+/// Accessed from vectors.S — layout and symbol name must stay in sync.
+#[cfg(target_arch = "loongarch64")]
+#[repr(C, align(32))]
+pub struct TrapScratch {
+    pub kernel_sp: u64, // offset 0
+    pub cpu_id: u64,    // offset 8
+    pub user_sp: u64,   // offset 16
+    pub _pad: u64,      // offset 24
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[unsafe(no_mangle)]
+pub static mut TRAP_SCRATCH_ARRAY: [TrapScratch; MAX_CPUS] = {
+    const INIT: TrapScratch = TrapScratch {
+        kernel_sp: 0,
+        cpu_id: 0,
+        user_sp: 0,
+        _pad: 0,
+    };
+    [INIT; MAX_CPUS]
+};
+
+/// Per-CPU trap scratch data for MIPS64.
+/// KScratch0 (CP0 $31 sel 2) points to &TRAP_SCRATCH_ARRAY[cpu] when in user mode (0 in kernel).
+/// Accessed from vectors.S — layout and symbol name must stay in sync.
+#[cfg(target_arch = "mips64")]
+#[repr(C, align(32))]
+pub struct TrapScratch {
+    pub kernel_sp: u64, // offset 0
+    pub cpu_id: u64,    // offset 8
+    pub user_sp: u64,   // offset 16
+    pub _pad: u64,      // offset 24
+}
+
+#[cfg(target_arch = "mips64")]
+#[unsafe(no_mangle)]
+pub static mut TRAP_SCRATCH_ARRAY: [TrapScratch; MAX_CPUS] = {
+    const INIT: TrapScratch = TrapScratch {
+        kernel_sp: 0,
+        cpu_id: 0,
+        user_sp: 0,
+        _pad: 0,
+    };
+    [INIT; MAX_CPUS]
+};
+
 /// Per-CPU data. Each CPU has its own instance, accessed lock-free by cpu_id().
 pub struct PerCpuData {
     /// Currently running thread on this CPU.
@@ -96,8 +144,8 @@ pub fn current() -> &'static PerCpuData {
 pub fn init_bsp(idle_thread: ThreadId) {
     crate::arch::cpu::init_bsp_cpu_id();
 
-    // RISC-V: update trap scratch array for boot hart.
-    #[cfg(target_arch = "riscv64")]
+    // Update trap scratch array for boot CPU.
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
     unsafe {
         TRAP_SCRATCH_ARRAY[0].cpu_id = 0;
     }
@@ -111,7 +159,7 @@ pub fn init_bsp(idle_thread: ThreadId) {
 
 /// Called by each secondary CPU after it finishes local init.
 pub fn init_ap(cpu: u32, idle_thread: ThreadId) {
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
     unsafe {
         TRAP_SCRATCH_ARRAY[cpu as usize].cpu_id = cpu as u64;
     }

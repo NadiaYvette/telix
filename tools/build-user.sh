@@ -60,11 +60,18 @@ else
         --config "unstable.build-std-features=[\"compiler-builtins-mem\"]"
 fi
 
-BINDIR="$ROOTDIR/target/$TARGET/release"
+case "$ARCH" in
+    mips64)
+        BINDIR="$ROOTDIR/target/mips64el-telix-none/release"
+        ;;
+    *)
+        BINDIR="$ROOTDIR/target/$TARGET/release"
+        ;;
+esac
 
-# Build C userspace binaries (musl-telix).
+# Build C userspace binaries (musl-telix) — skip for arches musl doesn't support.
 echo "Building C userspace (musl-telix) for $ARCH..."
-bash "$ROOTDIR/musl-telix/build.sh" "$ARCH"
+bash "$ROOTDIR/musl-telix/build.sh" "$ARCH" || echo "  (musl-telix not available for $ARCH, skipping)"
 MUSL_OUTDIR="$ROOTDIR/musl-telix/out/$ARCH"
 for cbin in hello_c sock_test tsh getty_login ld-telix tz_test pthread_test initdb_test postmaster_test pg_full_test libc_test calc stress_test sshd; do
     if [ -f "$MUSL_OUTDIR/$cbin" ]; then

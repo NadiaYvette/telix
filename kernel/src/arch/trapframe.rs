@@ -291,8 +291,8 @@ pub unsafe fn init_kernel_frame(frame: *mut u64, entry: usize, stack_top: usize)
         #[cfg(target_arch = "mips64")]
         {
             *frame.add(32) = entry as u64; // EPC
-            // Status: KSU=0 (kernel), EXL=0, IE=1 (interrupts enabled)
-            *frame.add(33) = 1;
+            // Status: KSU=0 (kernel), IE=1, IM7=1 (timer), KX=SX=UX=1
+            *frame.add(33) = (1 << 15) | 0xe0 | 1;
         }
     }
 }
@@ -355,8 +355,8 @@ pub unsafe fn init_user_frame(frame: *mut u64, entry: usize, sp: usize, args: &[
         #[cfg(target_arch = "mips64")]
         {
             *frame.add(32) = entry as u64; // EPC
-            // Status: KSU=2 (user), EXL=0, IE=1
-            *frame.add(33) = (2 << 3) | 1;
+            // Status: KSU=2 (user), IE=1, IM7=1 (timer), KX=SX=UX=1
+            *frame.add(33) = (2 << 3) | (1 << 15) | 0xe0 | 1;
             *frame.add(29) = sp as u64; // sp = $29
             // args in a0-a2 = $4-$6
             for (i, &val) in args.iter().enumerate().take(3) {
@@ -483,6 +483,19 @@ pub fn update_kernel_stack(_next_kstack_top: usize) {
         }
     }
 
-    // LoongArch64: TODO — write to CSR.SAVE0 or scratch array
-    // MIPS64: TODO — write to KScratch or scratch array
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let cpu = crate::arch::cpu::cpu_id() as usize;
+        unsafe {
+            crate::sched::smp::TRAP_SCRATCH_ARRAY[cpu].kernel_sp = _next_kstack_top as u64;
+        }
+    }
+
+    #[cfg(target_arch = "mips64")]
+    {
+        let cpu = crate::arch::cpu::cpu_id() as usize;
+        unsafe {
+            crate::sched::smp::TRAP_SCRATCH_ARRAY[cpu].kernel_sp = _next_kstack_top as u64;
+        }
+    }
 }

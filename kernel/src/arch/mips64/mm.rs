@@ -10,10 +10,16 @@
 use crate::mm::page::SuperpageLevel;
 use crate::mm::ptshare::ForkGroup;
 use crate::mm::radix_pt::{self, PteFormat};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Kernel page table root, set by BSP after enable_mmu.
 static KERNEL_PT_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+/// Page table root used by the TLB refill handler in vectors.S.
+/// Defined here so both Rust code and assembly share the same symbol.
+#[unsafe(no_mangle)]
+#[used]
+static TLB_PT_ROOT: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // PTE format (software-defined)
@@ -104,12 +110,37 @@ impl PteFormat for Mips64Pte {
     }
 
     #[inline]
-    fn tlb_invalidate(_va: usize) {
-        // Software TLB: no hardware invalidation needed for page table
-        // changes — the TLB refill handler reads the software page table
-        // on every miss. We'd need TLBP+TLBWI for entries already in TLB.
-        // For correctness with stale TLB entries, do a full flush.
-        // TODO: targeted invalidation.
+    fn tlb_invalidate(va: usize) {
+        // Probe the TLB for a matching entry and invalidate it.
+        // Without this, stale entries cause infinite TLB Modified loops
+        // after COW breaks or permission changes.
+        unsafe {
+            core::arch::asm!(
+                ".set push",
+                ".set mips64r2",
+                // Set EntryHi = VPN2 from va (aligned to 8K pair), ASID=0
+                "dsrl {tmp}, {va}, 13",
+                "dsll {tmp}, {tmp}, 13",
+                "dmtc0 {tmp}, $10",     // EntryHi
+                "ehb",
+                "tlbp",                  // probe → Index (P bit set if no match)
+                "ehb",
+                "mfc0 {tmp}, $0",       // read Index register
+                "bltz {tmp}, 1f",        // if P bit (bit 31) set → no match, done
+                "nop",
+                // Found match — overwrite with invalid entry
+                "dmtc0 $zero, $10",     // EntryHi = 0
+                "dmtc0 $zero, $2",      // EntryLo0 = 0
+                "dmtc0 $zero, $3",      // EntryLo1 = 0
+                "mtc0 $zero, $5",       // PageMask = 0
+                "ehb",
+                "tlbwi",                 // write indexed
+                "1:",
+                ".set pop",
+                va = in(reg) va as u64,
+                tmp = out(reg) _,
+            );
+        }
     }
 
     #[inline]
@@ -189,9 +220,33 @@ pub fn setup_tables() -> Option<usize> {
 
 /// Configure TLB and store kernel root.
 pub fn enable_mmu(root: usize) {
-    // MIPS64: TLB is always active. No "enable" step.
-    // Store kernel root for KScratch0 / context switches.
+    // MIPS64: TLB is always active. No "enable" step needed.
+    // Store kernel root for context switches.
     KERNEL_PT_ROOT.store(root, Ordering::Release);
+
+    // Store root in the global TLB_PT_ROOT (used by TLB refill handler).
+    TLB_PT_ROOT.store(root as u64, Ordering::Release);
+
+    unsafe {
+        // Flush TLB: write all entries with invalid G=1 to clear.
+        // MIPS64R2: PageMask=0 (4K pages), EntryHi=invalid, EntryLo0=EntryLo1=0.
+        for i in 0..64u64 {
+            core::arch::asm!(
+                ".set push",
+                ".set mips64r2",
+                "mtc0 {idx}, $0",       // CP0.Index = i
+                "dmtc0 $zero, $10",     // EntryHi = 0
+                "dmtc0 $zero, $2",      // EntryLo0 = 0
+                "dmtc0 $zero, $3",      // EntryLo1 = 0
+                "mtc0 $zero, $5",       // PageMask = 0
+                "ehb",
+                "tlbwi",                // write indexed
+                ".set pop",
+                idx = in(reg) i,
+            );
+        }
+    }
+    crate::println!("  TLB flushed, root stored in TLB_PT_ROOT");
 }
 
 /// Allocate a fresh user page table.
@@ -204,9 +259,34 @@ pub fn boot_page_table_root() -> usize {
     KERNEL_PT_ROOT.load(Ordering::Acquire)
 }
 
+/// Read the current TLB_PT_ROOT value (for debug).
+pub fn read_tlb_pt_root() -> u64 {
+    TLB_PT_ROOT.load(Ordering::Relaxed)
+}
+
 /// Switch to a different page table.
-pub fn switch_page_table(_root: usize) {
-    // TODO: write KScratch0 with packed root+ASID, flush TLB
+pub fn switch_page_table(root: usize) {
+    TLB_PT_ROOT.store(root as u64, Ordering::Release);
+
+    unsafe {
+        // Flush all TLB entries for user pages.
+        // Simple approach: overwrite all TLB entries with invalid.
+        for i in 0..64u64 {
+            core::arch::asm!(
+                ".set push",
+                ".set mips64r2",
+                "mtc0 {idx}, $0",       // CP0.Index = i
+                "dmtc0 $zero, $10",     // EntryHi = 0
+                "dmtc0 $zero, $2",      // EntryLo0 = 0
+                "dmtc0 $zero, $3",      // EntryLo1 = 0
+                "mtc0 $zero, $5",       // PageMask = 0
+                "ehb",
+                "tlbwi",
+                ".set pop",
+                idx = in(reg) i,
+            );
+        }
+    }
 }
 
 /// Free all intermediate page table pages in the tree.

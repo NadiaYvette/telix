@@ -191,13 +191,79 @@ pub fn setup_tables() -> Option<usize> {
     Some(root)
 }
 
-/// Configure DMW windows and enable paging.
+/// Configure DMW windows, page walk controller, TLB refill, and enable paging.
 pub fn enable_mmu(root: usize) {
-    // DMW0: cached window 0x9000... → PA (for kernel code/data)
-    // DMW1: uncached window 0x8000... → PA (for MMIO)
-    // TODO: actually configure CSR.DMW0/DMW1, CRMD.PG=1, PGDL, PWCL/PWCH
-    // For now this is a stub — tests run with direct PA access.
     KERNEL_PT_ROOT.store(root, Ordering::Release);
+
+    // Read current CRMD for diagnostics.
+    let crmd: u64;
+    unsafe { core::arch::asm!("csrrd {}, 0x0", out(reg) crmd) };
+    crate::println!(
+        "  CRMD at enable_mmu: {:#x} (DA={}, PG={}, PLV={})",
+        crmd,
+        (crmd >> 3) & 1,
+        (crmd >> 4) & 1,
+        crmd & 3
+    );
+
+    unsafe {
+        // Configure DMW0: 0x9000_xxxx → PA, cached (MAT=1), PLV0 only.
+        let dmw0: u64 = (0x9000u64 << 48) | (1u64 << 4) | 1;
+        core::arch::asm!("csrwr {}, 0x180", in(reg) dmw0);
+
+        // Configure DMW1: 0x8000_xxxx → PA, uncached (MAT=0), PLV0 only.
+        let dmw1: u64 = (0x8000u64 << 48) | 1;
+        core::arch::asm!("csrwr {}, 0x181", in(reg) dmw1);
+
+        // Configure page walk controller for 4-level 4K page tables.
+        // PWCL: PTbase=12, PTwidth=9, Dir1base=21, Dir1width=9
+        let pwcl: u64 = 12 | (9 << 5) | (21 << 10) | (9 << 15);
+        core::arch::asm!("csrwr {}, 0x1C", in(reg) pwcl);
+
+        // PWCH: Dir2base=30, Dir2width=9, Dir3base=39, Dir3width=9
+        let pwch: u64 = 30 | (9 << 6) | (39 << 12) | (9 << 18);
+        core::arch::asm!("csrwr {}, 0x1D", in(reg) pwch);
+
+        // STLBPS = 12 (4K page size, log2).
+        core::arch::asm!("csrwr {}, 0x1E", in(reg) 12u64);
+
+        // Set PGDL (user page table root — low VA region).
+        core::arch::asm!("csrwr {}, 0x19", in(reg) root as u64);
+        // Set PGDH (kernel PT — not used with DMW, but set for completeness).
+        core::arch::asm!("csrwr {}, 0x1A", in(reg) root as u64);
+
+        // Install TLB refill handler.
+        core::arch::asm!(
+            "la.pcrel {tmp}, _tlb_refill",
+            "csrwr {tmp}, 0x88",  // CSR.TLBRENTRY
+            tmp = out(reg) _,
+        );
+
+        // Configure DMW2: identity-map low PAs (VSEG=0x0), cached, PLV0 only.
+        // The kernel binary is linked at 0x9000... but QEMU loads it at low PAs
+        // and all runtime addresses (PC-relative) resolve to low PAs. DMW2 keeps
+        // these accessible after the DA→PG switch. PLV0-only so it doesn't
+        // interfere with user-space TLB lookups.
+        let dmw2: u64 = (0x0000u64 << 48) | (1u64 << 4) | 1; // MAT=CC, PLV0
+        core::arch::asm!("csrwr {}, 0x182", in(reg) dmw2); // CSR.DMW2
+
+        // If already in PG mode (firmware set it up), just flush TLB.
+        if crmd & (1 << 4) != 0 {
+            core::arch::asm!("invtlb 0, $zero, $zero");
+            return;
+        }
+
+        // Switch from DA mode to PG mode.
+        // After this write, instruction fetch and data access use DMW/TLB.
+        // DMW2 (VSEG=0) covers our current low-PA code and stack, so
+        // execution continues seamlessly — no jump or SP rebase needed.
+        let new_crmd: u64 = (1 << 4)  // PG=1
+                          | (crmd & (1 << 2)); // preserve IE
+        core::arch::asm!("csrwr {}, 0x0", in(reg) new_crmd);
+
+        // Flush any stale TLB entries from firmware.
+        core::arch::asm!("invtlb 0, $r0, $r0");
+    }
 }
 
 /// Allocate a fresh user page table.
@@ -211,8 +277,12 @@ pub fn boot_page_table_root() -> usize {
 }
 
 /// Switch to a different page table.
-pub fn switch_page_table(_root: usize) {
-    // TODO: write CSR.PGDL, invtlb
+pub fn switch_page_table(root: usize) {
+    unsafe {
+        core::arch::asm!("csrwr {}, 0x19", in(reg) root as u64); // CSR.PGDL
+        // Flush user TLB entries (type 4 = flush non-global entries).
+        core::arch::asm!("invtlb 4, $zero, $zero");
+    }
 }
 
 /// Free all intermediate page table pages in the tree rooted at `root`.
