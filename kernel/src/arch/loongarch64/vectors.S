@@ -154,11 +154,10 @@ _trap_entry:
     ld.d    $t0, $sp, 32*8
     csrwr   $t0, 0x6                // ERA
     ld.d    $t0, $sp, 33*8
-    csrwr   $t0, 0x1                // PRMD
-
-    // Check PRMD.PPLV (bits 1:0): 0 = kernel, 3 = user.
-    andi    $t0, $t0, 0x3
-    beqz    $t0, .restore_to_kernel
+    // Check PRMD.PPLV BEFORE csrwr (csrwr swaps: returns old value in rd).
+    andi    $t1, $t0, 0x3
+    csrwr   $t0, 0x1                // PRMD (t0 now has old PRMD, don't use)
+    beqz    $t1, .restore_to_kernel
 
 .restore_to_user:
     // Returning to user mode: set SAVE0 = &TRAP_SCRATCH_ARRAY[cpu_id].

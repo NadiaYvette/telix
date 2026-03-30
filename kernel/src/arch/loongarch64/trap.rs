@@ -242,6 +242,14 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             }
         }
 
+        ECODE_INE => {
+            let badv = read_badv();
+            crate::println!(
+                "Unhandled INE: era={:#x} badv={:#x} prmd={:#x} ra={:#x} sp={:#x}",
+                frame.era, badv, frame.prmd, frame.regs[1], frame.regs[3]
+            );
+            crate::sched::scheduler::exit_current_thread(-4) // SIGILL
+        }
         _ => {
             crate::println!(
                 "Unhandled exception: ecode={:#x} estat={:#x} era={:#x} badv={:#x}",

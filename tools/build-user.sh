@@ -27,6 +27,7 @@ case "$ARCH" in
     loongarch64)
         TARGET="loongarch64-unknown-none"
         LINKER="$USERLIB/link-loongarch64.ld"
+        EXTRA_RUSTFLAGS="-C relocation-model=static"
         ;;
     mips64)
         TARGET="$ROOTDIR/targets/mips64el-telix-none.json"

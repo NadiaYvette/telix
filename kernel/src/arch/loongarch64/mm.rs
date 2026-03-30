@@ -46,9 +46,11 @@ fn pte_leaf(phys: usize, flags: u64) -> u64 {
 }
 
 /// Create a non-leaf PTE pointing to a next-level table.
+/// On LoongArch, directory entries must NOT have bit 0 set — the hardware
+/// `lddir` instruction interprets bit 0 as the huge-page marker.
 #[inline]
 fn pte_table(phys: usize) -> u64 {
-    (phys as u64 & PFN_MASK) | PTE_V
+    phys as u64 & PFN_MASK
 }
 
 /// Allocate a zero-filled 4K page for a page table.
@@ -78,15 +80,19 @@ impl PteFormat for LoongArchPte {
 
     #[inline]
     fn is_valid(entry: u64) -> bool {
-        entry & PTE_V != 0
+        // LoongArch uses bit 0 for V (leaf) but also HUGE (directory).
+        // Directory entries don't set bit 0 (to avoid confusing the hardware
+        // lddir instruction which treats bit 0 as the huge-page marker).
+        // So validity = either PTE_V set (leaf) OR non-zero PA (directory).
+        entry != 0
     }
 
     #[inline]
     fn is_table(entry: u64) -> bool {
-        // Directory entries pointing to sub-tables: V=1, HUGE=0
-        // At leaf level, entries have HUGE=0 too but that's fine — the
-        // generic walker only calls is_table at non-leaf levels.
-        entry & PTE_HUGE == 0
+        // Directory entries: non-zero, bit 0 (HUGE) = 0.
+        // Leaf entries also have HUGE=0, but the generic walker only calls
+        // is_table at non-leaf levels.
+        entry != 0 && entry & PTE_HUGE == 0
     }
 
     #[inline]
@@ -216,12 +222,13 @@ pub fn enable_mmu(root: usize) {
         core::arch::asm!("csrwr {}, 0x181", in(reg) dmw1);
 
         // Configure page walk controller for 4-level 4K page tables.
-        // PWCL: PTbase=12, PTwidth=9, Dir1base=21, Dir1width=9
-        let pwcl: u64 = 12 | (9 << 5) | (21 << 10) | (9 << 15);
+        // PWCL layout: PTbase[4:0], PTwidth[9:5], Dir1base[14:10], Dir1width[19:15],
+        //              Dir2base[24:20], Dir2width[29:25]
+        // PWCH layout: Dir3base[5:0], Dir3width[11:6]
+        let pwcl: u64 = 12 | (9 << 5) | (21 << 10) | (9 << 15) | (30 << 20) | (9 << 25);
         core::arch::asm!("csrwr {}, 0x1C", in(reg) pwcl);
 
-        // PWCH: Dir2base=30, Dir2width=9, Dir3base=39, Dir3width=9
-        let pwch: u64 = 30 | (9 << 6) | (39 << 12) | (9 << 18);
+        let pwch: u64 = 39 | (9 << 6);
         core::arch::asm!("csrwr {}, 0x1D", in(reg) pwch);
 
         // STLBPS = 12 (4K page size, log2).
