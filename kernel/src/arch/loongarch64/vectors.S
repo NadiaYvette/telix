@@ -82,8 +82,9 @@ _trap_entry:
 .from_user:
     // ===== User-mode entry =====
     // r1 = &TrapScratch[cpu] (from SAVE0).
-    // Save user sp to TrapScratch.user_sp.
+    // Save user sp and r12 to TrapScratch (r12 will be used as scratch).
     st.d    $sp, $r1, 16            // TrapScratch.user_sp = user sp
+    st.d    $r12, $r1, 24           // TrapScratch.padding = user r12 (save before clobber)
     // Load kernel sp.
     ld.d    $sp, $r1, 0             // sp = TrapScratch.kernel_sp
     // Allocate trap frame.
@@ -96,6 +97,9 @@ _trap_entry:
     // Save user sp from TrapScratch.
     ld.d    $r12, $r1, 16           // r12 = user sp
     st.d    $r12, $sp, 3*8          // frame.regs[3] = user sp
+
+    // Restore original user r12 from TrapScratch before .save_common.
+    ld.d    $r12, $r1, 24           // r12 = original user r12
 
     // Clear SAVE0 (now in kernel mode).
     csrwr   $zero, 0x30             // SAVE0 = 0
