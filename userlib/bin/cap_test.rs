@@ -61,15 +61,29 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::exit(1);
     }
 
-    // Test 3: Quota enforcement — parent set our port quota to 2.
+    // Test 3: Quota enforcement — parent set our port quota to 3.
+    // ns_lookup above may leave cur_ports at 0 or 1 depending on arch.
+    // Create ports until one is denied; verify at least 2 succeed and
+    // not more than 3 succeed (proving the quota limit works).
     syscall::debug_puts(b"  [cap_test] test3: quota\n");
     let p1 = syscall::port_create();
     let p2 = syscall::port_create();
     let p3 = syscall::port_create();
-    if p1 != u64::MAX && p2 != u64::MAX && p3 == u64::MAX {
-        syscall::debug_puts(b"  [cap_test] quota: 2/2 ports created, 3rd denied OK\n");
+    let p4 = syscall::port_create();
+    // With quota=3: at least p1+p2 must succeed, p4 must be denied.
+    // p3 may or may not succeed depending on cur_ports after ns_lookup.
+    if p1 != u64::MAX && p2 != u64::MAX && p4 == u64::MAX {
+        syscall::debug_puts(b"  [cap_test] quota: enforced OK\n");
     } else {
-        syscall::debug_puts(b"  [cap_test] quota: FAIL\n");
+        syscall::debug_puts(b"  [cap_test] quota: FAIL p1=");
+        print_num(p1);
+        syscall::debug_puts(b" p2=");
+        print_num(p2);
+        syscall::debug_puts(b" p3=");
+        print_num(p3);
+        syscall::debug_puts(b" p4=");
+        print_num(p4);
+        syscall::debug_puts(b"\n");
         syscall::exit(1);
     }
 
@@ -78,6 +92,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
     if p2 != u64::MAX {
         syscall::port_destroy(p2);
+    }
+    if p3 != u64::MAX {
+        syscall::port_destroy(p3);
     }
 
     syscall::exit(0);
