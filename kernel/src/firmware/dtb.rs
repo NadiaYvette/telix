@@ -411,8 +411,12 @@ impl<'a> Iterator for NodeIter<'a> {
                     }
                 }
                 FDT_END_NODE => {
-                    self.current_depth -= 1;
                     self.pos += 4;
+                    if self.current_depth == 0 || self.current_depth <= self.base_depth {
+                        self.done = true;
+                        return None;
+                    }
+                    self.current_depth -= 1;
                     if self.current_depth < self.base_depth {
                         // We've exited the parent — done iterating.
                         self.done = true;

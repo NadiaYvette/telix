@@ -153,6 +153,14 @@ static DEFERRED_THREAD: [AtomicUsize; smp::MAX_CPUS] = {
     [INIT; smp::MAX_CPUS]
 };
 
+/// Per-CPU deferred killed-thread cleanup. When try_switch preempts a
+/// killed user thread, it marks it Dead and stores the thread ID here.
+/// The next tick() call drains this and does full cleanup (aspace destroy, etc.).
+static DEFERRED_KILL: [AtomicUsize; smp::MAX_CPUS] = {
+    const INIT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    [INIT; smp::MAX_CPUS]
+};
+
 const NUM_PRIORITIES: usize = 256;
 
 /// Sentinel value for empty linked-list pointers (head/tail/next/prev).
@@ -1435,6 +1443,85 @@ pub fn current_page_table_root() -> usize {
 }
 
 /// Called from the timer IRQ handler. Takes the current kernel SP
+/// Drain deferred killed-thread cleanup on this CPU.
+/// Called at the start of each tick, while running on a live thread's stack.
+fn drain_deferred_kills() {
+    let cpu = smp::cpu_id() as usize;
+    let tid = DEFERRED_KILL[cpu].swap(usize::MAX, Ordering::AcqRel);
+    if tid == usize::MAX || tid >= RadixTable::capacity() {
+        return;
+    }
+    let tid = tid as ThreadId;
+    let thread = thread_ref(tid);
+    let task_id = thread.task_id;
+
+    // Clean up turnstile state.
+    crate::sync::turnstile::cleanup_blocked(tid);
+    let tptr = THREAD_TABLE.get(tid) as *const super::thread::Thread;
+    let ts_addr = unsafe { (*tptr).turnstile.swap(0, Ordering::Relaxed) };
+    crate::sync::turnstile::free_thread_turnstile(ts_addr);
+
+    // Destroy the thread's port.
+    let thread_port = thread.port_id;
+    if thread_port != 0 {
+        crate::ipc::port::destroy(thread_port);
+    }
+
+    // Check if this was the last thread in its task.
+    let task = unsafe { &*(TASK_TABLE.get(task_id) as *const Task) };
+    if task.exited {
+        // Switch to boot page table before freeing user page tables.
+        let pt_root = task.page_table_root;
+        if pt_root != 0 {
+            let boot_root = crate::mm::hat::boot_page_table_root();
+            crate::mm::hat::switch_page_table(boot_root);
+        }
+
+        // Free groups overflow.
+        let tptr = TASK_TABLE.get(task_id) as *mut Task;
+        unsafe {
+            (*tptr).free_groups_overflow();
+        }
+
+        // Destroy address space.
+        let aspace_id = task.aspace_id;
+        if aspace_id != 0 {
+            crate::mm::aspace::destroy(aspace_id);
+        }
+
+        // Restore current thread's page table (we switched to boot PT above).
+        if pt_root != 0 {
+            let cur_tid = smp::current().current_thread.load(Ordering::Relaxed);
+            let cur_task = thread_ref(cur_tid).task_id;
+            let cur_root = unsafe { (*(TASK_TABLE.get(cur_task) as *const Task)).page_table_root };
+            if cur_root != 0 {
+                crate::mm::hat::switch_page_table(cur_root);
+            }
+        }
+
+        // Auto-reap zombie children.
+        let mut zombie_ports = [0u64; 32];
+        let mut nz = 0usize;
+        SCHED_TASK_ART.for_each(|key, val| {
+            if key == 0 {
+                return;
+            }
+            let child = unsafe { &mut *(val as *mut Task) };
+            if child.parent_task == task_id && child.exited && !child.reaped {
+                child.reaped = true;
+                if child.port_id != 0 && nz < 32 {
+                    zombie_ports[nz] = child.port_id;
+                    child.port_id = 0;
+                    nz += 1;
+                }
+            }
+        });
+        for i in 0..nz {
+            crate::ipc::port::destroy(zombie_ports[i]);
+        }
+    }
+}
+
 /// (pointing to the saved exception frame). Returns the SP to use
 /// for restore_regs — either the same SP (no switch) or a different
 /// thread's SP (preemption).
@@ -1442,6 +1529,10 @@ pub fn tick(current_sp: u64) -> u64 {
     check_sleep_timers();
     check_alarm_timers();
     check_interval_timers();
+
+    // Drain deferred killed-thread cleanup from the previous tick.
+    drain_deferred_kills();
+
     try_switch(current_sp)
 }
 
@@ -1549,8 +1640,37 @@ fn try_switch(current_sp: u64) -> u64 {
         }
         // Don't re-enqueue Dead threads (they are exiting).
         if prev_id != idle_id && prev_t.state != ThreadState::Dead {
-            prev_t.state = ThreadState::Ready;
-            percpu_enqueue(cpu, prev_prio, prev_id);
+            // If the thread was killed, mark Dead + defer full cleanup
+            // so it doesn't keep getting scheduled.
+            if thread_ref(prev_id).killed.load(Ordering::Relaxed) {
+                prev_t.state = ThreadState::Dead;
+                prev_t.exit_code = -9;
+                let waiter = prev_t.join_waiter;
+                prev_t.join_waiter = u32::MAX;
+                if waiter != u32::MAX {
+                    wake_thread(waiter);
+                }
+                let task_id = prev_t.task_id;
+                let task = unsafe { task_mut_from_ref(task_id) };
+                task.thread_count -= 1;
+                if task.thread_count == 0 {
+                    task.exit_code = -9;
+                    task.exited = true;
+                    task.active = false;
+                    task.wait_status = ((-9i32 & 0xFF) << 8) | 9; // killed by signal 9
+                    send_signal_to_task(task.parent_task, super::task::SIGCHLD);
+                    wake_wait_child_threads(task.parent_task);
+                }
+                // Queue for deferred resource cleanup on next tick.
+                DEFERRED_KILL[cpu as usize].store(prev_id as usize, Ordering::Release);
+                // Also defer kstack free.
+                let kstack_base = prev_t.stack_base;
+                DEFERRED_THREAD[cpu as usize].store(prev_id as usize, Ordering::Release);
+                DEFERRED_KSTACK[cpu as usize].store(kstack_base, Ordering::Release);
+            } else {
+                prev_t.state = ThreadState::Ready;
+                percpu_enqueue(cpu, prev_prio, prev_id);
+            }
         }
     }
 
@@ -1569,12 +1689,9 @@ fn try_switch(current_sp: u64) -> u64 {
         if next_root != 0 {
             crate::mm::hat::switch_page_table(next_root);
         } else {
-            #[cfg(target_arch = "riscv64")]
-            {
-                let kern_root = crate::mm::hat::kernel_pt_root();
-                if kern_root != 0 {
-                    crate::mm::hat::switch_page_table(kern_root);
-                }
+            let kern_root = crate::mm::hat::kernel_pt_root();
+            if kern_root != 0 {
+                crate::mm::hat::switch_page_table(kern_root);
             }
         }
     }
@@ -1594,11 +1711,74 @@ fn try_switch(current_sp: u64) -> u64 {
     next_t.saved_sp
 }
 
-/// Voluntarily yield. Not usable from IRQ context.
-#[allow(dead_code)]
-pub fn schedule() {
-    // For voluntary yield, we would need to save our own context and switch.
-    // This is more complex and will be implemented later.
+/// Voluntarily reschedule from syscall context.
+/// The trap handler must have already called `store_frame_sp()`.
+/// If another thread is runnable, sets PENDING_SWITCH_SP so the trap
+/// handler performs the context switch on return.
+pub fn voluntary_reschedule() {
+    let cpu = smp::cpu_id();
+    let pcpu = smp::current();
+    let cur_id = pcpu.current_thread.load(Ordering::Relaxed);
+    let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
+
+    // Save frame SP into thread struct.
+    let frame_sp = CURRENT_FRAME_SP[cpu as usize].load(Ordering::Acquire);
+    let cur_prio;
+    let cur_task;
+    {
+        let t = unsafe { thread_mut_from_ref(cur_id) };
+        t.saved_sp = frame_sp;
+        cur_prio = t.effective_priority;
+        cur_task = t.task_id;
+        t.state = ThreadState::Ready;
+    }
+
+    // Re-enqueue current thread.
+    if cur_id != idle_id {
+        percpu_enqueue(cpu, cur_prio, cur_id);
+    }
+
+    // Pick next.
+    let next_id = percpu_pick_next(cpu, idle_id);
+
+    if cur_id == next_id {
+        // No other thread to run — undo Ready, stay Running.
+        let t = unsafe { thread_mut_from_ref(cur_id) };
+        t.state = ThreadState::Running;
+        return;
+    }
+
+    crate::sched::stats::CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
+
+    // Switch page tables if crossing task boundaries.
+    let next_task = thread_ref(next_id).task_id;
+    if cur_task != next_task {
+        let next_root = {
+            let tptr = TASK_TABLE.get(next_task) as *const Task;
+            if !tptr.is_null() {
+                unsafe { (*tptr).page_table_root }
+            } else {
+                0
+            }
+        };
+        if next_root != 0 {
+            crate::mm::hat::switch_page_table(next_root);
+        } else {
+            let kern_root = crate::mm::hat::kernel_pt_root();
+            if kern_root != 0 {
+                crate::mm::hat::switch_page_table(kern_root);
+            }
+        }
+    }
+
+    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + page::page_size());
+
+    let next_t = unsafe { thread_mut_from_ref(next_id) };
+    next_t.state = ThreadState::Running;
+    pcpu.current_thread.store(next_id, Ordering::Relaxed);
+    let next_sp = next_t.saved_sp;
+
+    PENDING_SWITCH_SP[cpu as usize].store(next_sp, Ordering::Release);
 }
 
 // --- Coscheduling ---
@@ -1719,6 +1899,11 @@ pub fn wake_thread(tid: ThreadId) {
 /// Check if a thread has been marked for kill.
 pub fn is_killed(tid: ThreadId) -> bool {
     thread_ref(tid).killed.load(Ordering::Acquire)
+}
+
+/// Check if a thread is in Dead state (already exiting/exited).
+pub fn is_dead(tid: ThreadId) -> bool {
+    thread_ref(tid).state == ThreadState::Dead
 }
 
 /// Kill all threads in the task that `tid` belongs to.
@@ -2525,11 +2710,10 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         // stack_base=0 when it drains DEFERRED_KSTACK (proving the dead thread
         // has been context-switched away).
         // Safe: thread_count decrement needs care for multi-threaded tasks.
-        // This is a non-atomic decrement; for now, exit is serialized by the
-        // fact that each thread exits once and kill_other_threads_in_task
-        // marks others Dead first.
+        // Use saturating_sub: if a killed thread was already decremented by
+        // the scheduler's killed-thread path (try_switch), avoid underflow.
         let task = unsafe { task_mut_from_ref(task_id) };
-        task.thread_count -= 1;
+        task.thread_count = task.thread_count.saturating_sub(1);
         let is_last = task.thread_count == 0;
         let parent_task_id = task.parent_task;
         let task_port = task.port_id;
@@ -2958,12 +3142,9 @@ pub fn park_current_for_ipc(reason: BlockReason) {
         if next_root != 0 {
             crate::mm::hat::switch_page_table(next_root);
         } else {
-            #[cfg(target_arch = "riscv64")]
-            {
-                let kern_root = crate::mm::hat::kernel_pt_root();
-                if kern_root != 0 {
-                    crate::mm::hat::switch_page_table(kern_root);
-                }
+            let kern_root = crate::mm::hat::kernel_pt_root();
+            if kern_root != 0 {
+                crate::mm::hat::switch_page_table(kern_root);
             }
         }
     }
@@ -3272,12 +3453,9 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
         if next_root != 0 {
             crate::mm::hat::switch_page_table(next_root);
         } else {
-            #[cfg(target_arch = "riscv64")]
-            {
-                let kern_root = crate::mm::hat::kernel_pt_root();
-                if kern_root != 0 {
-                    crate::mm::hat::switch_page_table(kern_root);
-                }
+            let kern_root = crate::mm::hat::kernel_pt_root();
+            if kern_root != 0 {
+                crate::mm::hat::switch_page_table(kern_root);
             }
         }
     }
@@ -3374,12 +3552,9 @@ pub fn handoff_to(receiver_tid: ThreadId) {
         if next_root != 0 {
             crate::mm::hat::switch_page_table(next_root);
         } else {
-            #[cfg(target_arch = "riscv64")]
-            {
-                let kern_root = crate::mm::hat::kernel_pt_root();
-                if kern_root != 0 {
-                    crate::mm::hat::switch_page_table(kern_root);
-                }
+            let kern_root = crate::mm::hat::kernel_pt_root();
+            if kern_root != 0 {
+                crate::mm::hat::switch_page_table(kern_root);
             }
         }
     }

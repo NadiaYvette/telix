@@ -10,7 +10,10 @@
 use crate::mm::page::SuperpageLevel;
 use crate::mm::ptshare::ForkGroup;
 use crate::mm::radix_pt::{self, PteFormat};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU32, AtomicUsize, Ordering};
+
+/// Number of TLB entries, detected from Config1.MMUSize at boot.
+static TLB_SIZE: AtomicU32 = AtomicU32::new(64);
 
 /// Kernel page table root, set by BSP after enable_mmu.
 static KERNEL_PT_ROOT: AtomicUsize = AtomicUsize::new(0);
@@ -128,17 +131,25 @@ impl PteFormat for Mips64Pte {
                 "mfc0 {tmp}, $0",       // read Index register
                 "bltz {tmp}, 1f",        // if P bit (bit 31) set → no match, done
                 "nop",
-                // Found match — overwrite with invalid entry
-                "dmtc0 $zero, $10",     // EntryHi = 0
-                "dmtc0 $zero, $2",      // EntryLo0 = 0
-                "dmtc0 $zero, $3",      // EntryLo1 = 0
-                "mtc0 $zero, $5",       // PageMask = 0
+                // Found match — overwrite with invalid entry.
+                // Use a unique KSEG0 EntryHi (based on Index) to avoid
+                // multiple-match undefined behavior.
+                "mfc0 {tmp2}, $0",       // get Index again
+                "andi {tmp2}, {tmp2}, 0x3f",
+                "dsll {tmp2}, {tmp2}, 13", // index * 8K
+                "dli  {tmp}, 0xFFFFFFFFC0000000",
+                "daddu {tmp}, {tmp}, {tmp2}",
+                "dmtc0 {tmp}, $10",      // EntryHi = unique KSEG0 addr
+                "dmtc0 $zero, $2",       // EntryLo0 = 0
+                "dmtc0 $zero, $3",       // EntryLo1 = 0
+                "mtc0 $zero, $5",        // PageMask = 0
                 "ehb",
-                "tlbwi",                 // write indexed
+                "tlbwi",                  // write indexed
                 "1:",
                 ".set pop",
                 va = in(reg) va as u64,
                 tmp = out(reg) _,
+                tmp2 = out(reg) _,
             );
         }
     }
@@ -218,6 +229,54 @@ pub fn setup_tables() -> Option<usize> {
     Some(root)
 }
 
+/// Flush all TLB entries using unique KSEG0 EntryHi values per slot.
+///
+/// Each invalidated entry gets a distinct EntryHi pointing into KSEG0
+/// (unmapped by TLB) to avoid the MIPS "multiple TLB match" undefined
+/// behavior that occurs when several entries share the same VPN2+ASID.
+/// Flush all TLB entries. Must be called with interrupts disabled.
+unsafe fn flush_tlb_inner() {
+    let n = TLB_SIZE.load(Ordering::Relaxed) as u64;
+    for i in 0..n {
+        // Each TLB entry covers a VPN2 pair (2 × 4K = 8K). Use KSEG0
+        // addresses (0xFFFF_FFFF_8000_0000+) which never go through TLB,
+        // so these entries can never match a real access.
+        let hi = 0xFFFF_FFFF_C000_0000u64 + i * 0x2000;
+        core::arch::asm!(
+            ".set push",
+            ".set mips64r2",
+            "mtc0 {idx}, $0",       // CP0.Index = i
+            "dmtc0 {hi}, $10",      // EntryHi = unique KSEG0 addr
+            "dmtc0 $zero, $2",      // EntryLo0 = 0 (V=0)
+            "dmtc0 $zero, $3",      // EntryLo1 = 0 (V=0)
+            "mtc0 $zero, $5",       // PageMask = 0
+            "ehb",
+            "tlbwi",
+            ".set pop",
+            idx = in(reg) i,
+            hi = in(reg) hi,
+        );
+    }
+}
+
+/// Flush all TLB entries with interrupts disabled.
+/// Used during early boot (enable_mmu) when switch_page_table isn't appropriate.
+unsafe fn flush_tlb() {
+    let saved_status: u64;
+    core::arch::asm!(
+        "mfc0 {s}, $12",
+        "di",
+        "ehb",
+        s = out(reg) saved_status,
+    );
+    flush_tlb_inner();
+    core::arch::asm!(
+        "mtc0 {s}, $12",
+        "ehb",
+        s = in(reg) saved_status,
+    );
+}
+
 /// Configure TLB and store kernel root.
 pub fn enable_mmu(root: usize) {
     // MIPS64: TLB is always active. No "enable" step needed.
@@ -227,25 +286,23 @@ pub fn enable_mmu(root: usize) {
     // Store root in the global TLB_PT_ROOT (used by TLB refill handler).
     TLB_PT_ROOT.store(root as u64, Ordering::Release);
 
+    // Detect TLB size from Config1.MMUSize-1 (bits [30:25]).
+    let config1: u32;
     unsafe {
-        // Flush TLB: write all entries with invalid G=1 to clear.
-        // MIPS64R2: PageMask=0 (4K pages), EntryHi=invalid, EntryLo0=EntryLo1=0.
-        for i in 0..64u64 {
-            core::arch::asm!(
-                ".set push",
-                ".set mips64r2",
-                "mtc0 {idx}, $0",       // CP0.Index = i
-                "dmtc0 $zero, $10",     // EntryHi = 0
-                "dmtc0 $zero, $2",      // EntryLo0 = 0
-                "dmtc0 $zero, $3",      // EntryLo1 = 0
-                "mtc0 $zero, $5",       // PageMask = 0
-                "ehb",
-                "tlbwi",                // write indexed
-                ".set pop",
-                idx = in(reg) i,
-            );
-        }
+        core::arch::asm!(
+            ".set push",
+            ".set mips64r2",
+            "mfc0 {val}, $16, 1",   // Config1
+            ".set pop",
+            val = out(reg) config1,
+        );
     }
+    let mmu_size = ((config1 >> 25) & 0x3F) + 1;
+    TLB_SIZE.store(mmu_size, Ordering::Release);
+    crate::println!("  TLB: {} entries (Config1={:#x})", mmu_size, config1);
+
+    unsafe { flush_tlb(); }
+
     crate::println!("  TLB flushed, root stored in TLB_PT_ROOT");
 }
 
@@ -260,27 +317,26 @@ pub fn boot_page_table_root() -> usize {
 }
 
 /// Switch to a different page table.
+///
+/// The store + flush must be atomic with respect to interrupts. If a timer
+/// fires between the store and the flush, a nested context switch could
+/// overwrite TLB_PT_ROOT, leaving the TLB populated for the wrong process.
 pub fn switch_page_table(root: usize) {
-    TLB_PT_ROOT.store(root as u64, Ordering::Release);
-
     unsafe {
-        // Flush all TLB entries for user pages.
-        // Simple approach: overwrite all TLB entries with invalid.
-        for i in 0..64u64 {
-            core::arch::asm!(
-                ".set push",
-                ".set mips64r2",
-                "mtc0 {idx}, $0",       // CP0.Index = i
-                "dmtc0 $zero, $10",     // EntryHi = 0
-                "dmtc0 $zero, $2",      // EntryLo0 = 0
-                "dmtc0 $zero, $3",      // EntryLo1 = 0
-                "mtc0 $zero, $5",       // PageMask = 0
-                "ehb",
-                "tlbwi",
-                ".set pop",
-                idx = in(reg) i,
-            );
-        }
+        let saved_status: u64;
+        core::arch::asm!(
+            "mfc0 {s}, $12",
+            "di",
+            "ehb",
+            s = out(reg) saved_status,
+        );
+        TLB_PT_ROOT.store(root as u64, Ordering::Release);
+        flush_tlb_inner();
+        core::arch::asm!(
+            "mtc0 {s}, $12",
+            "ehb",
+            s = in(reg) saved_status,
+        );
     }
 }
 

@@ -537,7 +537,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let mut open_files = [OpenFile::empty(); MAX_OPEN_FILES];
 
     // Server loop.
-    loop {
+    'msg_loop: loop {
         let msg = match syscall::recv_msg(port) {
             Some(m) => m,
             None => break,
@@ -634,7 +634,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let length = (msg.data[2] & 0xFFFF_FFFF) as u32;
                 let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
-
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active {
                     syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
                     continue;
@@ -660,7 +659,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     cluster = fat_entry(fat_va, cluster);
                     if cluster >= 0xFFF8 {
                         syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
-                        continue;
+                        continue 'msg_loop;
                     }
                 }
 
@@ -688,7 +687,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             bytes_in_sector as usize,
                         );
                     }
-                    syscall::send_nb(reply_port, FS_READ_OK, bytes_in_sector as u64, 0);
+                    syscall::send(reply_port, FS_READ_OK, bytes_in_sector as u64, 0, 0, 0);
                 } else {
                     // Inline read.
                     let inline_len = (bytes_in_sector as usize).min(MAX_INLINE);

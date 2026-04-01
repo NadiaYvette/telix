@@ -55,13 +55,13 @@ pub const EXCEPTION_FRAME_SIZE: usize = 288;
 /// Approved device MMIO physical address range for sys_mmap_device (start, end).
 /// (0, 0) means MMIO device mapping is disabled on this platform.
 #[cfg(target_arch = "aarch64")]
-pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x0a00_0000, 0x0a00_7000);
+pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x0a00_0000, 0x0a01_0000);
 #[cfg(target_arch = "riscv64")]
-pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x1000_1000, 0x1000_9000);
+pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x1000_0000, 0x1001_0000);
 #[cfg(target_arch = "x86_64")]
 pub const DEVICE_MMIO_RANGE: (usize, usize) = (0, 0);
 #[cfg(target_arch = "loongarch64")]
-pub const DEVICE_MMIO_RANGE: (usize, usize) = (0, 0); // TODO: EIOINTC MMIO range
+pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x1800_0000, 0x8000_0000); // PCI I/O window + MEM region
 #[cfg(target_arch = "mips64")]
 pub const DEVICE_MMIO_RANGE: (usize, usize) = (0, 0); // TODO: Malta PCI MMIO range
 
@@ -89,7 +89,12 @@ pub fn device_pte_flags() -> u64 {
     } // unreachable — DEVICE_MMIO_RANGE is (0,0)
     #[cfg(target_arch = "loongarch64")]
     {
-        0
+        // Uncached device memory: MAT=0 (SUC), valid, dirty, user-accessible.
+        const PTE_V: u64 = 1 << 0;
+        const PTE_D: u64 = 1 << 1;
+        const PTE_PLV_USER: u64 = 3 << 2;
+        const PTE_SW_REF: u64 = 1 << 8;
+        PTE_V | PTE_D | PTE_PLV_USER | PTE_SW_REF // No PTE_MAT_CC → MAT=0 (SUC/uncached)
     }
     #[cfg(target_arch = "mips64")]
     {

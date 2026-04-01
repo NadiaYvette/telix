@@ -811,9 +811,7 @@ fn sys_port_set_add(set_id: u64, port_id: u64) -> u64 {
 }
 
 fn sys_yield() -> u64 {
-    // Set YIELD_ASAP so the next timer tick will preempt us immediately.
-    let tid = crate::sched::current_thread_id();
-    crate::sched::scheduler::set_yield_asap(tid);
+    crate::sched::scheduler::voluntary_reschedule();
     0
 }
 

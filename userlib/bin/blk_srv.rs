@@ -190,7 +190,7 @@ struct BlkDev {
 }
 
 // --- Legacy virtio-PCI BAR0 register offsets ---
-#[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64"))]
 mod pci_regs {
     pub const DEVICE_FEATURES: u16 = 0x00; // 32-bit read
     pub const DRIVER_FEATURES: u16 = 0x04; // 32-bit write
@@ -205,8 +205,37 @@ mod pci_regs {
     pub const BLK_CAPACITY_HI: u16 = 0x18; // 32-bit
 }
 
+/// PCI MMIO helpers for LoongArch64 (memory-mapped BAR0).
+#[cfg(target_arch = "loongarch64")]
+mod pci_mmio {
+    #[inline]
+    pub fn read8(base: usize, offset: u16) -> u8 {
+        unsafe { core::ptr::read_volatile((base + offset as usize) as *const u8) }
+    }
+    #[inline]
+    pub fn read16(base: usize, offset: u16) -> u16 {
+        unsafe { core::ptr::read_volatile((base + offset as usize) as *const u16) }
+    }
+    #[inline]
+    pub fn read32(base: usize, offset: u16) -> u32 {
+        unsafe { core::ptr::read_volatile((base + offset as usize) as *const u32) }
+    }
+    #[inline]
+    pub fn write8(base: usize, offset: u16, val: u8) {
+        unsafe { core::ptr::write_volatile((base + offset as usize) as *mut u8, val) }
+    }
+    #[inline]
+    pub fn write16(base: usize, offset: u16, val: u16) {
+        unsafe { core::ptr::write_volatile((base + offset as usize) as *mut u16, val) }
+    }
+    #[inline]
+    pub fn write32(base: usize, offset: u16, val: u32) {
+        unsafe { core::ptr::write_volatile((base + offset as usize) as *mut u32, val) }
+    }
+}
+
 impl BlkDev {
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64")))]
     fn init(mmio_phys: usize, irq: u32) -> Option<Self> {
         // Map MMIO registers into our address space.
         let mmio_va = syscall::mmap_device(mmio_phys, 1)?;
@@ -216,16 +245,25 @@ impl BlkDev {
         syscall::debug_puts(b"\n");
 
         // Verify magic and device ID.
-        if mmio_read32(mmio_va, MMIO_MAGIC_VALUE) != VIRTIO_MAGIC {
-            syscall::debug_puts(b"  [blk_srv] bad magic\n");
+        let magic = mmio_read32(mmio_va, MMIO_MAGIC_VALUE);
+        if magic != VIRTIO_MAGIC {
+            syscall::debug_puts(b"  [blk_srv] bad magic: ");
+            print_hex(magic as u64);
+            syscall::debug_puts(b"\n");
             return None;
         }
-        if mmio_read32(mmio_va, MMIO_DEVICE_ID) != DEVICE_BLK {
-            syscall::debug_puts(b"  [blk_srv] not a block device\n");
+        let devid = mmio_read32(mmio_va, MMIO_DEVICE_ID);
+        if devid != DEVICE_BLK {
+            syscall::debug_puts(b"  [blk_srv] not a block device, id=");
+            print_num(devid as u64);
+            syscall::debug_puts(b"\n");
             return None;
         }
 
         let version = mmio_read32(mmio_va, MMIO_VERSION);
+        syscall::debug_puts(b"  [blk_srv] virtio version ");
+        print_num(version as u64);
+        syscall::debug_puts(b"\n");
 
         // Reset device.
         mmio_write32(mmio_va, MMIO_STATUS, 0);
@@ -245,8 +283,11 @@ impl BlkDev {
         if version >= 2 {
             status |= STATUS_FEATURES_OK;
             mmio_write32(mmio_va, MMIO_STATUS, status);
-            if mmio_read32(mmio_va, MMIO_STATUS) & STATUS_FEATURES_OK == 0 {
-                syscall::debug_puts(b"  [blk_srv] FEATURES_OK failed\n");
+            let st = mmio_read32(mmio_va, MMIO_STATUS);
+            if st & STATUS_FEATURES_OK == 0 {
+                syscall::debug_puts(b"  [blk_srv] FEATURES_OK failed, status=");
+                print_hex(st as u64);
+                syscall::debug_puts(b"\n");
                 return None;
             }
         }
@@ -255,24 +296,30 @@ impl BlkDev {
         let cap_lo = mmio_read32(mmio_va, 0x100) as u64;
         let cap_hi = mmio_read32(mmio_va, 0x104) as u64;
         let capacity = cap_lo | (cap_hi << 32);
+        syscall::debug_puts(b"  [blk_srv] capacity=");
+        print_num(capacity);
+        syscall::debug_puts(b"\n");
 
         // Select queue 0.
         mmio_write32(mmio_va, MMIO_QUEUE_SEL, 0);
         let max_size = mmio_read32(mmio_va, MMIO_QUEUE_NUM_MAX);
         if max_size == 0 {
+            syscall::debug_puts(b"  [blk_srv] queue max_size=0\n");
             return None;
         }
         let qsize = (QUEUE_SIZE as u32).min(max_size);
         mmio_write32(mmio_va, MMIO_QUEUE_NUM, qsize);
 
-        // Allocate virtqueue page.
+        // Allocate virtqueue pages. Legacy (v1) virtio places the used ring
+        // at a page-aligned offset (4096), so we need at least 2 × 4K pages.
         let ps = syscall::page_size();
-        let vq_va = syscall::mmap_anon(0, 1, 1)?; // RW
+        let vq_pages = 2;
+        let vq_va = syscall::mmap_anon(0, vq_pages, 1)?; // RW
         let vq_pa = syscall::virt_to_phys(vq_va)?;
 
         // Zero it.
         unsafe {
-            core::ptr::write_bytes(vq_va as *mut u8, 0, ps);
+            core::ptr::write_bytes(vq_va as *mut u8, 0, vq_pages * ps);
         }
 
         let desc_pa = vq_pa;
@@ -452,6 +499,103 @@ impl BlkDev {
         })
     }
 
+    /// PCI MMIO transport init for LoongArch64 (memory-mapped BAR0).
+    #[cfg(target_arch = "loongarch64")]
+    fn init(bar0_phys: usize, irq: u32) -> Option<Self> {
+        // Map BAR0 into userspace via mmap_device.
+        let mmio_va = syscall::mmap_device(bar0_phys, 1)?;
+
+        syscall::debug_puts(b"  [blk_srv] PCI BAR0 mapped at VA ");
+        print_hex(mmio_va as u64);
+        syscall::debug_puts(b" (phys ");
+        print_hex(bar0_phys as u64);
+        syscall::debug_puts(b")\n");
+
+        // Reset.
+        pci_mmio::write8(mmio_va, pci_regs::DEVICE_STATUS, 0);
+
+        // ACK + DRIVER.
+        pci_mmio::write8(mmio_va, pci_regs::DEVICE_STATUS, STATUS_ACK as u8);
+        pci_mmio::write8(
+            mmio_va,
+            pci_regs::DEVICE_STATUS,
+            (STATUS_ACK | STATUS_DRIVER) as u8,
+        );
+
+        // Feature negotiation.
+        let _features = pci_mmio::read32(mmio_va, pci_regs::DEVICE_FEATURES);
+        pci_mmio::write32(mmio_va, pci_regs::DRIVER_FEATURES, 0);
+
+        // Read capacity from device config (BAR0 + 0x14).
+        let cap_lo = pci_mmio::read32(mmio_va, pci_regs::BLK_CAPACITY_LO) as u64;
+        let cap_hi = pci_mmio::read32(mmio_va, pci_regs::BLK_CAPACITY_HI) as u64;
+        let capacity = cap_lo | (cap_hi << 32);
+
+        // Select queue 0.
+        pci_mmio::write16(mmio_va, pci_regs::QUEUE_SELECT, 0);
+        let max_size = pci_mmio::read16(mmio_va, pci_regs::QUEUE_SIZE);
+        if max_size == 0 {
+            syscall::debug_puts(b"  [blk_srv] queue size 0\n");
+            return None;
+        }
+
+        let qsz = max_size as usize;
+
+        // Allocate virtqueue memory (desc+avail+used with 4K alignment).
+        let ps = syscall::page_size();
+        let vq_bytes = 16 * qsz + (6 + 2 * qsz) + 4096 + (8 * qsz + 6);
+        let vq_pages = (vq_bytes + ps - 1) / ps;
+        let vq_va = syscall::mmap_anon(0, vq_pages, 1)?;
+        let vq_pa = syscall::virt_to_phys(vq_va)?;
+        unsafe {
+            core::ptr::write_bytes(vq_va as *mut u8, 0, vq_pages * ps);
+        }
+
+        let desc_pa = vq_pa;
+        let avail_pa = desc_pa + 16 * qsz;
+        let avail_end = avail_pa + 6 + 2 * qsz;
+        let used_pa = (avail_end + 4095) & !4095;
+
+        // Write queue PFN.
+        let pfn = (vq_pa / 4096) as u32;
+        pci_mmio::write32(mmio_va, pci_regs::QUEUE_ADDRESS, pfn);
+
+        // Allocate buffer page.
+        let buf_va = syscall::mmap_anon(0, 1, 1)?;
+        let buf_pa = syscall::virt_to_phys(buf_va)?;
+        unsafe {
+            core::ptr::write_bytes(buf_va as *mut u8, 0, ps);
+        }
+
+        let req_hdr_pa = buf_pa;
+        let status_pa = buf_pa + 16;
+        let data_pa = buf_pa + 32;
+
+        // DRIVER_OK.
+        pci_mmio::write8(
+            mmio_va,
+            pci_regs::DEVICE_STATUS,
+            (STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK) as u8,
+        );
+
+        Some(Self {
+            mmio_va,
+            irq,
+            vq_va,
+            buf_va,
+            desc_pa,
+            avail_pa,
+            used_pa,
+            req_hdr_pa,
+            status_pa,
+            data_pa,
+            next_desc: 0,
+            last_used_idx: 0,
+            capacity,
+            queue_size: qsz,
+        })
+    }
+
     fn read_sector(&mut self, sector: u64, out: &mut [u8; 512]) -> Result<(), ()> {
         if sector >= self.capacity {
             return Err(());
@@ -597,9 +741,15 @@ impl BlkDev {
         }
         #[cfg(target_arch = "mips64")]
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            core::arch::asm!("dbar 0");
+        }
         // Notify device.
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64")))]
         mmio_write32(self.mmio_va, MMIO_QUEUE_NOTIFY, 0);
+        #[cfg(target_arch = "loongarch64")]
+        pci_mmio::write16(self.mmio_va, pci_regs::QUEUE_NOTIFY, 0);
         #[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
         syscall::ioport_outw(self.mmio_va as u16 + pci_regs::QUEUE_NOTIFY, 0);
     }
@@ -619,6 +769,10 @@ impl BlkDev {
             #[cfg(target_arch = "riscv64")]
             unsafe {
                 core::arch::asm!("fence iorw, iorw");
+            }
+            #[cfg(target_arch = "loongarch64")]
+            unsafe {
+                core::arch::asm!("dbar 0");
             }
             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             let idx = unsafe { core::ptr::read_volatile(used_idx_ptr) };
@@ -719,6 +873,10 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                             #[cfg(target_arch = "riscv64")]
                             unsafe {
                                 core::arch::asm!("fence rw, rw");
+                            }
+                            #[cfg(target_arch = "loongarch64")]
+                            unsafe {
+                                core::arch::asm!("dbar 0");
                             }
                             syscall::send_nb(reply_port, IO_READ_OK, bytes_read as u64, 0);
                         } else {

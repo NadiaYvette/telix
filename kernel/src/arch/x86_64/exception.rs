@@ -257,10 +257,11 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
         }
         crate::mm::fault::FaultResult::Failed => {
             crate::println!(
-                "Unhandled #PF: CR2={:#x} RIP={:#x} error={:#x} — killing thread",
+                "Unhandled #PF: CR2={:#x} RIP={:#x} error={:#x} tid={} — killing thread",
                 cr2,
                 frame.rip(),
-                error
+                error,
+                crate::sched::scheduler::current_thread_id()
             );
             crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
         }

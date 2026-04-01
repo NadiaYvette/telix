@@ -216,7 +216,11 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             };
 
             let aspace_id = crate::sched::current_aspace_id();
-            if aspace_id == 0 {
+            // Detect kernel-mode faults: either no aspace (idle/kernel thread)
+            // or EPC is in kernel address space (syscall handler crashed).
+            let is_kernel_fault = aspace_id == 0
+                || (frame.epc & 0xFFFF_FFFF_8000_0000) == 0xFFFF_FFFF_8000_0000;
+            if is_kernel_fault {
                 let cpu = crate::sched::smp::cpu_id();
                 let tid = crate::sched::current_thread_id();
                 let ksu = (frame.status >> 3) & 0x3;
@@ -229,9 +233,15 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                     tid,
                     ksu,
                 );
-                loop {
-                    core::hint::spin_loop();
-                }
+                crate::println!(
+                    "  ra={:#x} sp={:#x} v0={:#x} a0={:#x} a1={:#x}",
+                    frame.regs[31], frame.regs[29], frame.regs[2],
+                    frame.regs[4], frame.regs[5]
+                );
+                panic!(
+                    "kernel null pointer dereference at epc={:#x} badvaddr={:#x}",
+                    frame.epc, badvaddr
+                );
             }
             let result =
                 crate::mm::fault::handle_page_fault(aspace_id, badvaddr as usize, fault_type);
@@ -253,8 +263,19 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
                         exccode, frame.epc, badvaddr, tid, ksu,
                     );
                     crate::println!(
-                        "  ra={:#x} sp={:#x} v0={:#x}",
-                        frame.regs[31], frame.regs[29], frame.regs[2]
+                        "  ra={:#x} sp={:#x} v0={:#x} a0={:#x} a1={:#x}",
+                        frame.regs[31], frame.regs[29], frame.regs[2],
+                        frame.regs[4], frame.regs[5]
+                    );
+                    crate::println!(
+                        "  at={:#x} t0={:#x} t1={:#x} t2={:#x} t3={:#x}",
+                        frame.regs[1], frame.regs[8], frame.regs[9],
+                        frame.regs[10], frame.regs[11]
+                    );
+                    crate::println!(
+                        "  s0={:#x} s1={:#x} s2={:#x} s3={:#x} gp={:#x}",
+                        frame.regs[16], frame.regs[17], frame.regs[18],
+                        frame.regs[19], frame.regs[28]
                     );
                     crate::sched::scheduler::exit_current_thread(-11) // SIGSEGV
                 }

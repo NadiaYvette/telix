@@ -771,6 +771,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // Grant scratch to fat16_srv.
                     let grant_dst: usize = 0x7_0000_0000;
                     if syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false) {
+                        syscall::debug_puts(b"  init: grant ok, reading HELLO.ELF...\n");
                         // Read entire file via grant-based FS_READ.
                         let mut offset = 0usize;
                         let mut read_ok = true;
@@ -814,13 +815,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         syscall::revoke(srv_aspace, grant_dst);
 
                         if read_ok && offset == file_size {
+                            syscall::debug_puts(b"  init: ELF read complete, spawning...\n");
                             // Spawn from ELF data.
                             let elf_data = unsafe {
                                 core::slice::from_raw_parts(elf_buf as *const u8, file_size)
                             };
                             let tid = syscall::spawn_elf(elf_data, 50, 0);
+                            syscall::debug_puts(b"  init: spawn_elf returned\n");
                             if tid != u64::MAX {
                                 // Wait for child to exit.
+                                syscall::debug_puts(b"  init: waiting for child exit\n");
                                 loop {
                                     if let Some(_code) = syscall::waitpid(tid) {
                                         exec_ok = true;
@@ -1251,14 +1255,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Kill it.
             let killed = syscall::kill(spin_tid);
             if killed {
-                // Wait for the task to exit.
+                // Wait for the task to exit. Use yield_block() so we
+                // actually wait for a timer tick, giving spin a chance to
+                // be scheduled and catch its killed flag.
                 let mut exited = false;
-                for _ in 0..1000 {
+                for _ in 0..100 {
                     if let Some(_code) = syscall::waitpid(spin_tid) {
                         exited = true;
                         break;
                     }
-                    syscall::yield_now();
+                    syscall::yield_block();
                 }
                 if exited {
                     syscall::debug_puts(b"Phase 20 signal/kill: PASSED\n");
@@ -1796,8 +1802,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Test 22: M:N Green Threads + Scheduler Activations ---
     syscall::debug_puts(b"  init: testing M:N green threads...\n");
     {
-        // Allocate a page for fiber stacks (64 KiB = 16 fibers * 4 KiB each).
-        let fiber_stacks = syscall::mmap_anon(0, 1, 1);
+        // Allocate pages for fiber stacks (8 fibers * 4 KiB each = 32 KiB).
+        let fiber_stacks = syscall::mmap_anon(0, 8, 1);
         // Allocate shared counter page.
         let counter_page = syscall::mmap_anon(0, 1, 1);
 
@@ -2802,9 +2808,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Test pgroup kill: fork one child, put in own group, kill group.
         let child1 = syscall::fork();
         if child1 == 0 {
-            // Child: spin.
+            // Child: spin (yield_block so we actually WFI between iterations).
             loop {
-                syscall::yield_now();
+                syscall::yield_block();
             }
         }
 
@@ -2813,19 +2819,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::setpgid(child1, child1);
 
             for _ in 0..10 {
-                syscall::yield_now();
+                syscall::yield_block();
             }
 
             // Kill the group.
             syscall::kill_pgroup(child1, syscall::SIGKILL);
 
             let mut found = false;
-            for _ in 0..500 {
+            for _ in 0..100 {
                 if let Some(_) = syscall::waitpid(child1) {
                     found = true;
                     break;
                 }
-                syscall::yield_now();
+                syscall::yield_block();
             }
             if !found {
                 syscall::debug_puts(b"  init: pgroup kill failed\n");
@@ -2850,9 +2856,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     {
         let mut phase42_ok = true;
 
-        // Test mprotect: allocate RW page, write to it, change to RO, verify data survives.
-        if let Some(va) = syscall::mmap_anon(0, 1, 1) {
-            // 1 page, RW
+        // Test mprotect: allocate RW pages, write to it, change to RO, verify data survives.
+        if let Some(va) = syscall::mmap_anon(0, 2, 1) {
+            // 2 pages, RW (need 2 for sub-range mprotect test)
             let page_size = syscall::page_size();
             let mmu_page = 0x1000usize; // MMUPAGE_SIZE = 4K
 

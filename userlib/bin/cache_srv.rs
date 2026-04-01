@@ -37,7 +37,7 @@ const SECTORS_PER_PAGE: usize = MMUPAGE_SIZE / SECTOR_SIZE; // 8
 const CACHE_ENTRIES: usize = 128;
 const HASH_SIZE: usize = 256;
 const INVALID: u64 = u64::MAX;
-const DATA_ALLOC_PAGES: usize = 8; // 128 * 4096 / 65536 = 8
+const DATA_ALLOC_PAGES: usize = CACHE_ENTRIES; // 128 pages × MMUPAGE_SIZE (4096) = 512 KiB
 
 /// Grant VA where clients (fat16_srv) grant their scratch pages to us.
 const CLIENT_GRANT_VA: usize = 0x6_0000_0000;

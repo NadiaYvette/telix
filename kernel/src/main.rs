@@ -211,6 +211,26 @@ fn startup_thread() -> ! {
         }
     }
 
+    // LoongArch64: Discover virtio devices via PCI ECAM scan.
+    #[cfg(target_arch = "loongarch64")]
+    {
+        println!("  Scanning PCI bus for virtio devices (ECAM)...");
+        if let Some(dev) = arch::loongarch64::pci::find_virtio_device(0x1001) {
+            let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
+            match sched::spawn_user(b"blk_srv", 50, 20, arg0) {
+                Some(tid) => println!("  blk_srv spawned (thread {})", tid),
+                None => println!("  WARNING: blk_srv not found (ok if not yet built)"),
+            }
+        }
+        if let Some(dev) = arch::loongarch64::pci::find_virtio_device(0x1000) {
+            let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
+            match sched::spawn_user(b"net_srv", 50, 20, arg0) {
+                Some(tid) => println!("  net_srv spawned (thread {})", tid),
+                None => println!("  WARNING: net_srv not found (ok if not yet built)"),
+            }
+        }
+    }
+
     // Phase 4: Spawning init process...
     println!("Phase 4: Spawning init process...");
 
@@ -404,53 +424,9 @@ fn test_demand_paging() {
     use mm::vma::VmaProt;
     let ps = page::page_size();
 
-    // Get the current page table root.
-    #[cfg(target_arch = "aarch64")]
-    let pt_root = {
-        let cr: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) cr);
-        }
-        let root = cr as usize;
-        if root == 0 {
-            // MMU not yet enabled — allocate a fresh page table root for the test.
-            let pa = mm::phys::alloc_page().expect("alloc pt root");
-            unsafe {
-                core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE);
-            }
-            pa.as_usize()
-        } else {
-            root
-        }
-    };
-    #[cfg(target_arch = "riscv64")]
-    let pt_root = {
-        // Always use a fresh page table root for user demand paging tests.
-        // The kernel root has gigapage leaves (device at root[0], RAM at root[2])
-        // which block get_or_create_table from subdividing into 4K page tables.
-        let pa = mm::phys::alloc_page().expect("alloc pt root");
-        unsafe {
-            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE);
-        }
-        pa.as_usize()
-    };
-    #[cfg(target_arch = "x86_64")]
-    let pt_root = {
-        let cr3: u64;
-        unsafe {
-            core::arch::asm!("mov {}, cr3", out(reg) cr3);
-        }
-        (cr3 & !0xFFF) as usize
-    };
-    #[cfg(target_arch = "loongarch64")]
-    let pt_root = {
-        let pa = mm::phys::alloc_page().expect("alloc pt root");
-        unsafe {
-            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, mm::page::MMUPAGE_SIZE);
-        }
-        pa.as_usize()
-    };
-    #[cfg(target_arch = "mips64")]
+    // Always use a fresh page table root for demand paging tests.
+    // Using the boot root is wrong: destroy() frees its page table pages,
+    // corrupting the live kernel identity mapping.
     let pt_root = {
         let pa = mm::phys::alloc_page().expect("alloc pt root");
         unsafe {

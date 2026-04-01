@@ -120,7 +120,7 @@ const QUEUE_SIZE: usize = 16;
 const VRING_DESC_F_WRITE: u16 = 2;
 
 // --- Legacy virtio-PCI BAR0 register offsets ---
-#[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64"))]
 mod pci_regs {
     pub const DEVICE_FEATURES: u16 = 0x00;
     pub const DRIVER_FEATURES: u16 = 0x04;
@@ -417,6 +417,35 @@ impl Virtqueue {
     }
 }
 
+/// PCI MMIO helpers for LoongArch64 (memory-mapped BAR0).
+#[cfg(target_arch = "loongarch64")]
+mod pci_mmio {
+    #[inline]
+    pub fn read8(base: usize, offset: u16) -> u8 {
+        unsafe { core::ptr::read_volatile((base + offset as usize) as *const u8) }
+    }
+    #[inline]
+    pub fn read16(base: usize, offset: u16) -> u16 {
+        unsafe { core::ptr::read_volatile((base + offset as usize) as *const u16) }
+    }
+    #[inline]
+    pub fn read32(base: usize, offset: u16) -> u32 {
+        unsafe { core::ptr::read_volatile((base + offset as usize) as *const u32) }
+    }
+    #[inline]
+    pub fn write8(base: usize, offset: u16, val: u8) {
+        unsafe { core::ptr::write_volatile((base + offset as usize) as *mut u8, val) }
+    }
+    #[inline]
+    pub fn write16(base: usize, offset: u16, val: u16) {
+        unsafe { core::ptr::write_volatile((base + offset as usize) as *mut u16, val) }
+    }
+    #[inline]
+    pub fn write32(base: usize, offset: u16, val: u32) {
+        unsafe { core::ptr::write_volatile((base + offset as usize) as *mut u32, val) }
+    }
+}
+
 // --- Network device ---
 
 struct NetDev {
@@ -473,7 +502,7 @@ impl NetDev {
         }
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64")))]
     fn init(mmio_phys: usize, irq: u32) -> Option<Self> {
         let mmio_va = syscall::mmap_device(mmio_phys, 1)?;
 
@@ -547,7 +576,7 @@ impl NetDev {
         Some(dev)
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64")))]
     fn setup_queue_mmio(mmio_va: usize, queue_idx: u32, version: u32) -> Option<Virtqueue> {
         mmio_write32(mmio_va, MMIO_QUEUE_SEL, queue_idx);
         let max = mmio_read32(mmio_va, MMIO_QUEUE_NUM_MAX);
@@ -702,9 +731,109 @@ impl NetDev {
         })
     }
 
+    /// PCI MMIO transport init for LoongArch64 (memory-mapped BAR0).
+    #[cfg(target_arch = "loongarch64")]
+    fn init(bar0_phys: usize, irq: u32) -> Option<Self> {
+        let mmio_va = syscall::mmap_device(bar0_phys, 1)?;
+
+        syscall::debug_puts(b"  [net_srv] PCI BAR0 mapped at VA ");
+        print_hex(mmio_va as u64);
+        syscall::debug_puts(b"\n");
+
+        // Reset.
+        pci_mmio::write8(mmio_va, pci_regs::DEVICE_STATUS, 0);
+
+        // ACK + DRIVER.
+        pci_mmio::write8(mmio_va, pci_regs::DEVICE_STATUS, STATUS_ACK as u8);
+        pci_mmio::write8(
+            mmio_va,
+            pci_regs::DEVICE_STATUS,
+            (STATUS_ACK | STATUS_DRIVER) as u8,
+        );
+
+        // Feature negotiation: accept MAC.
+        let features = pci_mmio::read32(mmio_va, pci_regs::DEVICE_FEATURES);
+        let accept = features & VIRTIO_NET_F_MAC;
+        pci_mmio::write32(mmio_va, pci_regs::DRIVER_FEATURES, accept);
+
+        // Read MAC from device config (BAR0 + 0x14).
+        let mut mac = [0u8; 6];
+        if features & VIRTIO_NET_F_MAC != 0 {
+            for i in 0..6 {
+                mac[i] = pci_mmio::read8(mmio_va, pci_regs::NET_MAC + i as u16);
+            }
+        }
+
+        // Set up RX queue (0) and TX queue (1).
+        let rx = Self::setup_queue_pci_mmio(mmio_va, 0)?;
+        let tx = Self::setup_queue_pci_mmio(mmio_va, 1)?;
+
+        let _ = irq;
+
+        // DRIVER_OK.
+        pci_mmio::write8(
+            mmio_va,
+            pci_regs::DEVICE_STATUS,
+            (STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK) as u8,
+        );
+
+        let mut dev = Self::new_dev(mmio_va, mac, rx, tx);
+        dev.post_rx();
+        Some(dev)
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    fn setup_queue_pci_mmio(base: usize, queue_idx: u16) -> Option<Virtqueue> {
+        pci_mmio::write16(base, pci_regs::QUEUE_SELECT, queue_idx);
+        let max = pci_mmio::read16(base, pci_regs::QUEUE_SIZE);
+        if max == 0 {
+            return None;
+        }
+
+        let qsz = max as usize;
+
+        let ps = syscall::page_size();
+        let vq_bytes = 16 * qsz + (6 + 2 * qsz) + 4096 + (8 * qsz + 6);
+        let vq_pages = (vq_bytes + ps - 1) / ps;
+        let vq_va = syscall::mmap_anon(0, vq_pages, 1)?;
+        let vq_pa = syscall::virt_to_phys(vq_va)?;
+        unsafe {
+            core::ptr::write_bytes(vq_va as *mut u8, 0, vq_pages * ps);
+        }
+
+        let buf_va = syscall::mmap_anon(0, 1, 1)?;
+        let buf_pa = syscall::virt_to_phys(buf_va)?;
+        unsafe {
+            core::ptr::write_bytes(buf_va as *mut u8, 0, ps);
+        }
+
+        let desc_pa = vq_pa;
+        let avail_pa = desc_pa + 16 * qsz;
+        let avail_end = avail_pa + 6 + 2 * qsz;
+        let used_pa = (avail_end + 4095) & !4095;
+        let avail_offset = avail_pa - desc_pa;
+        let used_offset = used_pa - desc_pa;
+
+        // Write queue PFN.
+        pci_mmio::write32(base, pci_regs::QUEUE_ADDRESS, (vq_pa / 4096) as u32);
+
+        Some(Virtqueue {
+            vq_va,
+            buf_va,
+            desc_pa,
+            buf_pa,
+            avail_offset,
+            used_offset,
+            last_used: 0,
+            queue_size: qsz,
+        })
+    }
+
     fn notify_queue(&self, queue_idx: u16) {
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64")))]
         mmio_write32(self.base, MMIO_QUEUE_NOTIFY, queue_idx as u32);
+        #[cfg(target_arch = "loongarch64")]
+        pci_mmio::write16(self.base, pci_regs::QUEUE_NOTIFY, queue_idx);
         #[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
         syscall::ioport_outw(self.base as u16 + pci_regs::QUEUE_NOTIFY, queue_idx);
     }

@@ -67,7 +67,6 @@ pub fn boot_page_table_root() -> usize {
 
 /// Return the kernel page table root (differs from boot root on RISC-V;
 /// identical on other architectures).
-#[allow(dead_code)]
 #[inline]
 pub fn kernel_pt_root() -> usize {
     #[cfg(target_arch = "riscv64")]
