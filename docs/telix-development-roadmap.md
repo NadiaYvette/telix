@@ -244,15 +244,15 @@ Telix's message-passing architecture makes the simulation boundary **cleaner** t
 
 ## 5. Cross-Cutting Concerns
 
-### 5.1 Current Architecture Test Results (2026-03-30)
+### 5.1 Current Architecture Test Results (2026-04-01)
 
-| Architecture | Phases Passing | Notable Issues |
-|-------------|---------------|----------------|
-| x86_64 | 105/105 | Clean; reference platform |
-| aarch64 | 105/105 | Clean; primary development target |
-| mips64el | 104/105 | Phase 14 expected fail (wrong-arch ELF on disk); intermittent timing flakes |
-| riscv64 | Boots | Full test suite not yet validated post-recent changes |
-| loongarch64 | Boots | Partial userland; needs same treatment as MIPS64 |
+| Architecture | Passed | Failed | Skipped | Notable Issues |
+|-------------|--------|--------|---------|----------------|
+| x86_64 | 105 | 0 | 0 | Clean; reference platform |
+| aarch64 | 105 | 0 | 0 | Clean; primary development target |
+| riscv64 | 105 | 0 | 0 | Clean |
+| loongarch64 | 88 | 3 | 7 | Failures are missing C cross-binaries only (Phase 66/72/74); remaining phases not yet reached (timeout). `#[inline(never)]` on `send()` works around LLVM release codegen bug; `ibar` after `tlbfill`/`invtlb` fixes intermittent INE. |
+| mips64el | ~10 | crashes | — | Crashes ~Phase 12; preexisting TLB/stack issues partially fixed but intermittent faults remain |
 
 ### 5.2 Development Environment
 
@@ -466,11 +466,11 @@ Each personality is a separate userspace server. Multiple personalities can coex
 
 | Architecture | Kernel | Userland | QEMU Machine | Test Status |
 |-------------|--------|----------|--------------|-------------|
-| aarch64 | Full | Full | virt | 105/105 phases pass |
-| x86_64 | Full | Full | q35 | 105/105 phases pass |
-| riscv64 | Full | Full | virt | Boots, phases pass |
-| loongarch64 | Full | Partial | virt | Boots |
-| mips64el | Full | Full | malta | 104/105 phases pass (Phase 14 expected fail) |
+| aarch64 | Full | Full | virt | 105/105 pass |
+| x86_64 | Full | Full | q35 | 105/105 pass |
+| riscv64 | Full | Full | virt | 105/105 pass |
+| loongarch64 | Full | Full (Rust) | virt | 88 pass, 3 fail (missing C bins), 7 skip |
+| mips64el | Full | Full | malta | ~10 pass, crashes ~Phase 12 |
 
 ### 8.2 Expansion Plan — 64-bit Architectures
 
@@ -718,13 +718,122 @@ With boot-time configurable PAGE_MMUSHIFT:
 
 ---
 
-## 13. Version History
+## 13. Driver Model
+
+Telix drivers are userspace servers accessing hardware via capabilities and communicating through standard IPC. The full design is in [`docs/driver_model.md`](driver_model.md).
+
+**Key points:**
+- Hardware access via typed capabilities: MMIO regions, port I/O ranges, interrupt lines, DMA-capable buffers
+- Device manager server handles lifecycle, driver matching, capability distribution, power state, hotplug
+- Bus servers (PCI, Platform/Devicetree, USB) enumerate devices and create sub-device capabilities
+- Layered composition: multi-layer driver stacks (e.g., USB HCI → USB bus → class driver) via message forwarding
+- Phased introduction: Phase 1 (kernel primitives) → Phase 2 (bus enumeration) → Phase 3 (driver library) → Phase 4 (hotplug/power)
+- Retrenchment strategies available if IPC overhead is unacceptable: polling, co-location, kernel migration
+
+---
+
+## 14. OS Personality Servers
+
+Userspace servers that emulate other OS's syscall semantics atop Telix's native IPC. The full design is in [`docs/personality_servers.md`](personality_servers.md).
+
+**Priority ordering:**
+1. **POSIX** — Foundational; testable via Sortix os-test and LTP
+2. **Linux syscall compat** — Highest practical value; LTP as validation target
+3. **Plan 9** — Smallest surface; intellectually aligned with message-passing
+4. **Haiku/BeOS** — Non-Unix personality with structured kit-based API
+5. **BSD** — Incremental over POSIX (kqueue, jails, Capsicum)
+6. **Windows/NT** — Highest ecosystem impact via Wine model
+7. **Redox** — Small Rust-typed API; limited incremental value
+
+**Cross-cutting:** Personalities are distinct from ABIs (calling conventions) and ISA variants (32-bit compat). Multiple personalities coexist — different processes can use different personalities simultaneously.
+
+---
+
+## 15. Tracing Infrastructure
+
+Native tracing with kernel probe engine and userspace tracing server. The full design is in [`docs/tracing_infrastructure.md`](tracing_infrastructure.md).
+
+**Architecture:**
+- **Kernel-side:** Minimal per-architecture probe engine (~200 LoC/ISA) for breakpoint insertion, context capture, single-stepping
+- **Userspace:** Tracing server handles filtering, aggregation, output formatting, script/policy language
+- **Probe providers:** Syscall, IPC, scheduler, VM, and server-side probe points
+- **Interaction with microkernel:** Probe events flow through standard IPC; subject to port capacity backpressure
+- **Evaluation use:** IPC overhead attribution, server profiling, VM subsystem analysis for the paper
+
+---
+
+## 16. Network & Storage I/O Architecture
+
+Unified I/O model decomposing network and storage stacks into layered servers. The full design is in [`docs/network_storage_io.md`](network_storage_io.md).
+
+**Three standardized interface boundaries:**
+1. **Block device interface** — between filesystem/application servers and block device drivers
+2. **Transport interface** — between applications and transport protocols (TCP, UDP, SCTP, RDMA)
+3. **Link/network interface** — between transport layer and link-layer drivers
+
+**Key subsystems:**
+- Network stack: NIC drivers → Ethernet server → IP server → TCP/UDP/SCTP/RDMA servers
+- Storage-over-network: iSCSI, NVMe-oF, Fibre Channel, AoE as layered protocol servers
+- Multipath I/O: distribution server with pluggable algorithms (round-robin, active/passive, queue-depth)
+- Zero-copy: capability-threaded DMA buffers; simplified single-copy initial approach
+- Protocol composition without cross-layer coupling
+
+---
+
+## 17. Graphics Architecture
+
+Graphics stack from QEMU virtio-gpu through real hardware. The full design is in [`docs/graphics_architecture.md`](graphics_architecture.md).
+
+**Phased approach:**
+- **Phase A:** QEMU virtio-gpu — 2D framebuffer (A.1), VirGL OpenGL acceleration (A.2), Venus Vulkan (A.3)
+- **Phase B:** Intel Iris Xe on real hardware via DRM compatibility layer
+- **Phase C:** Discrete GPUs (AMD Radeon, NVIDIA) via same DRM compat approach
+
+**Architecture:**
+- Display server (KMS equivalent): CRTCs, encoders, connectors, planes, framebuffers
+- GPU server: command buffer submission, synchronization, memory management
+- DRM compatibility layer: translates Linux DRM ioctls to GPU/display server messages, enabling reuse of Mesa's existing drivers
+- Software rendering fallback: LLVMpipe (OpenGL) and Lavapipe (Vulkan)
+- Path: framebuffer console → Wayland compositor → Xwayland + GTK → GNOME Shell + Firefox
+
+---
+
+## 18. 32-bit Compatibility & Superpages
+
+Analysis of how 32-bit process compat interacts with the VM superpage machinery. The full analysis is in [`docs/32bit_compat_superpages.md`](32bit_compat_superpages.md).
+
+**Summary:** Minimal impact. PAGE_SIZE is system-wide (unaffected by process bitness). The existing per-memory-object alignment class mechanism already handles mapping heterogeneity across different page table formats. Per-architecture notes:
+- **x86-64/i386:** 4K/2M/1G vs 4K/2M(PAE) — minimal impact
+- **ARM64/AArch32:** Different superpage spectrums; 32-bit case easier than 64-bit
+- **MIPS64:** Identical TLB/superpage behavior regardless of address width
+- **RISC-V:** No native 32-bit execution mode on 64-bit; does not arise
+
+**Recommendation:** Defer 32-bit compat to Phase 4+; keep PAGE_SIZE system-wide; implement per-page-table-format superpage size tables when needed.
+
+---
+
+## 19. Detailed Phase Roadmap (Phases 40–104)
+
+The full phase-by-phase roadmap with dependencies is in [`docs/roadmap.md`](roadmap.md), organized into 9 streams:
+
+| Stream | Phases | Scope |
+|--------|--------|-------|
+| A: Kernel Primitives | 40–50 | execve, signals, mprotect, process groups, timers, mmap, shm, FDs, creds, wait, rlimits |
+| B: Userspace POSIX | 51–62 | VFS, musl, ext2-write, tmpfs, devfs, procfs, UDS, sockets, pipes, poll, flock, PTY |
+| C: Application Infrastructure | 63–73 | Shell, coreutils, login, dynamic linker, eventfd, inotify, ASLR, syslog, locale, DNS |
+| D: GHC Runtime | 74–78 | RTS threading, I/O manager, signals, memory management, cross-compiler bootstrap |
+| E: PostgreSQL | 79–82 | Static build, initdb, single-user, full network server |
+| F: Graphics | 83–90 | Framebuffer, input, DRM/KMS, Wayland, libwayland, Mesa, fonts, Cairo |
+| G: Desktop | 91–97 | D-Bus, GLib/GTK 4, terminal, audio, accessibility, system services |
+| H: Firefox | 98–101 | NSS/NSPR, Rust toolchain, Firefox build, multi-process |
+| I: GNOME | 102–104 | Shell/Mutter, core apps, session startup |
+
+---
+
+## 20. Version History
 
 | Date | Change |
 |------|--------|
+| 2026-04-01 | Integrated specialized design docs (driver model, personality servers, tracing, network/storage I/O, graphics, 32-bit compat) as Sections 13–18; added detailed phase roadmap cross-reference (Section 19); updated test results to current state (LoongArch64 88/3/7, RISC-V 105/105) |
 | 2026-03-30 | Expanded roadmap: boot-time PAGE_MMUSHIFT, Linux personality + LTP, multi-architecture plan (s390x, ppc64, sparc64, 32-bit targets), swap subsystem, graphical desktop (Xwayland + GNOME + Firefox), kernel command line parsing, prioritized development order |
-| 2026-03-30 | Initial roadmap created from extended design discussion covering filesystems (ZFS, btrfs, NTFS, bcachefs, APFS, ReFS), networking (eBPF, XDP, io_uring, Homa, QUIC), and SmartNIC/DPU offloading with QEMU simulation strategy |
-
-| Date | Change |
-|------|--------|
 | 2026-03-30 | Initial roadmap created from extended design discussion covering filesystems (ZFS, btrfs, NTFS, bcachefs, APFS, ReFS), networking (eBPF, XDP, io_uring, Homa, QUIC), and SmartNIC/DPU offloading with QEMU simulation strategy |
