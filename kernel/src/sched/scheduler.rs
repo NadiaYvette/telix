@@ -27,6 +27,17 @@ use crate::mm::{phys, slab};
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+/// Kernel stack allocation order (0 = 1 page, 1 = 2 pages).
+/// 2 pages (8 KiB) provides headroom for nested interrupts during syscalls,
+/// especially on MIPS64 where EXL clearing enables timer preemption.
+const KSTACK_ORDER: usize = 1;
+
+/// Kernel stack size in bytes (2^KSTACK_ORDER pages).
+#[inline]
+fn kstack_size() -> usize {
+    page::page_size() << KSTACK_ORDER
+}
+
 /// Two-level radix table for lockless task pointer lookup.
 /// Used by has_port_cap_fast() and SA atomics on the hot path.
 pub static TASK_TABLE: RadixTable = RadixTable::new();
@@ -672,9 +683,9 @@ fn alloc_task_id() -> Option<TaskId> {
 fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
     let id = alloc_thread_id()?;
 
-    let stack_page = crate::mm::phys::alloc_page()?;
+    let stack_page = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
     let stack_base = stack_page.as_usize();
-    let stack_top = stack_base + crate::mm::page::page_size();
+    let stack_top = stack_base + kstack_size();
 
     // Create a fake exception frame at the top of the stack.
     // When we "return" from the IRQ handler with this thread's SP,
@@ -842,9 +853,9 @@ fn do_spawn_heavy_work(
     }
 
     // Allocate kernel stack for this thread.
-    let kstack_page = crate::mm::phys::alloc_page()?;
+    let kstack_page = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
     let kstack_base = kstack_page.as_usize();
-    let kstack_top = kstack_base + ps;
+    let kstack_top = kstack_base + kstack_size();
 
     // Build a fake exception frame for user-mode entry.
     let frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
@@ -988,9 +999,9 @@ fn create_thread_in_task(
         return None;
     }
 
-    let kstack_page = crate::mm::phys::alloc_page()?;
+    let kstack_page = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
     let kstack_base = kstack_page.as_usize();
-    let kstack_top = kstack_base + page::page_size();
+    let kstack_top = kstack_base + kstack_size();
 
     let frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
     let frame = frame_sp as *mut u64;
@@ -1553,7 +1564,7 @@ fn try_switch(current_sp: u64) -> u64 {
         let cur_stack = thread_ref(cur_tid).stack_base;
         if cur_stack != deferred {
             DEFERRED_KSTACK[cpu as usize].store(0, Ordering::Release);
-            crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(deferred));
+            crate::mm::phys::free_pages(crate::mm::page::PhysAddr::new(deferred), KSTACK_ORDER);
             let dead_tid = DEFERRED_THREAD[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
             if dead_tid < RadixTable::capacity() {
                 // Safety: dead thread is Dead, not on any queue or CPU.
@@ -1696,7 +1707,7 @@ fn try_switch(current_sp: u64) -> u64 {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + page::page_size());
+    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
 
     // Activate next thread. Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
@@ -1771,7 +1782,7 @@ pub fn voluntary_reschedule() {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + page::page_size());
+    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
 
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     next_t.state = ThreadState::Running;
@@ -2599,12 +2610,12 @@ pub fn fork_current() -> u64 {
     }
 
     // Allocate kernel stack for child thread.
-    let kstack_page = match crate::mm::phys::alloc_page() {
+    let kstack_page = match crate::mm::phys::alloc_pages(KSTACK_ORDER) {
         Some(p) => p,
         None => return u64::MAX,
     };
     let kstack_base = kstack_page.as_usize();
-    let kstack_top = kstack_base + page::page_size();
+    let kstack_top = kstack_base + kstack_size();
 
     // Copy parent's exception frame to child's kernel stack.
     let child_frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
@@ -3149,7 +3160,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + page::page_size());
+    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
 
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
@@ -3460,7 +3471,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + page::page_size());
+    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
 
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
@@ -3559,7 +3570,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(receiver.stack_base + page::page_size());
+    crate::arch::trapframe::update_kernel_stack(receiver.stack_base + kstack_size());
 
     // Activate receiver.
     receiver.state = ThreadState::Running;

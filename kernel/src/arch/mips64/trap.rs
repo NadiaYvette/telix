@@ -3,12 +3,12 @@
 //! MIPS64 uses a single general exception vector (EBase + 0x180).
 //! The trap entry/exit assembly is in vectors.S.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Timer interval in CP0 Count ticks (set during init).
-static TIMER_INTERVAL: AtomicU64 = AtomicU64::new(0);
+/// Timer interval in CP0 Count ticks (32-bit, set during init).
+static TIMER_INTERVAL: AtomicU32 = AtomicU32::new(0);
 
 /// Trap frame saved/restored by vectors.S.
 #[repr(C)]
@@ -34,23 +34,23 @@ const EXC_ADEL: u64 = 4;  // Address error (load/fetch)
 const EXC_ADES: u64 = 5;  // Address error (store)
 const EXC_SYS: u64 = 8;   // Syscall
 
-/// Read CP0 Count register.
-pub fn read_count() -> u64 {
+/// Read CP0 Count register (32-bit counter, masked to avoid sign-extension).
+pub fn read_count() -> u32 {
     let val: u64;
     unsafe { core::arch::asm!("mfc0 {}, $9", out(reg) val) };
-    val
+    val as u32
 }
 
 /// Write CP0 Compare register (clears timer interrupt).
-fn write_compare(val: u64) {
-    unsafe { core::arch::asm!("mtc0 {}, $11", in(reg) val) };
+fn write_compare(val: u32) {
+    unsafe { core::arch::asm!("mtc0 {}, $11", in(reg) val as u64) };
 }
 
-/// Read CP0 Compare register.
-fn read_compare() -> u64 {
+/// Read CP0 Compare register (32-bit, masked to avoid sign-extension).
+fn read_compare() -> u32 {
     let val: u64;
     unsafe { core::arch::asm!("mfc0 {}, $11", out(reg) val) };
-    val
+    val as u32
 }
 
 /// Initialize trap handling: set EBase, configure Status, install timer.
@@ -97,13 +97,13 @@ pub fn init() {
     // Configure the timer.
     // MIPS CP0 Count increments at half the pipeline clock.
     // QEMU Malta: ~100 MHz pipeline → Count at ~50 MHz. Use 100 MHz estimate.
-    let freq: u64 = 100_000_000;
+    let freq: u32 = 100_000_000;
     let interval = freq / 100; // 100 Hz
     TIMER_INTERVAL.store(interval, Ordering::Relaxed);
 
     // Set first timer deadline.
     let now = read_count();
-    write_compare(now + interval);
+    write_compare(now.wrapping_add(interval));
 
     crate::println!(
         "  Timer initialized: freq={}Hz, interval={} ticks ({}ms)",
@@ -140,10 +140,12 @@ fn handle_timer_irq() {
 
     let interval = TIMER_INTERVAL.load(Ordering::Relaxed);
     let now = read_count();
-    let mut next = read_compare() + interval;
+    let mut next = read_compare().wrapping_add(interval);
     // Skip ahead if Compare is still in the past.
-    while next <= now {
-        next += interval;
+    // Use signed comparison to handle 32-bit counter wraparound correctly:
+    // if (next - now) is negative (as i32), next is in the past.
+    while (next.wrapping_sub(now) as i32) <= 0 {
+        next = next.wrapping_add(interval);
     }
     write_compare(next);
 }
@@ -184,15 +186,17 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             // Syscall — advance EPC past the syscall instruction (4 bytes).
             frame.epc += 4;
 
-            // Clear EXL so timer interrupts can preempt blocking syscalls
-            // (exit, park_current_for_ipc, etc.). EXL=1 masks all interrupts
-            // on MIPS regardless of IE. Must also set KSU=0 (kernel mode)
-            // since EXL was the only thing keeping us in kernel mode — the
-            // saved Status has KSU=2 (user) from the syscall entry.
+            // Clear EXL (to leave exception context) and KSU (to stay in
+            // kernel mode), but ALSO clear IE to keep interrupts disabled.
+            // The scheduler explicitly calls irq::enable() when it needs
+            // timer preemption (park, exit_current_thread). This avoids the
+            // register corruption caused by timer preempting mid-dispatch.
             unsafe {
                 core::arch::asm!(
+                    "di",                            // clear IE first
+                    "ehb",
                     "mfc0 {tmp}, $12",
-                    "ins  {tmp}, $zero, 1, 4",  // clear bits 4:1 (KSU + EXL)
+                    "ins  {tmp}, $zero, 0, 5",       // clear bits 4:0 (KSU+EXL+IE)
                     "mtc0 {tmp}, $12",
                     "ehb",
                     tmp = out(reg) _,
