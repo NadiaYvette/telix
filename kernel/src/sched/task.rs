@@ -234,7 +234,7 @@ impl Task {
             thread_count: 0,
             max_ports: 128,
             max_threads: 32,
-            max_pages: 256,
+            max_pages: 512,
             cur_ports: 0,
             cur_pages: 0,
             sa_enabled: false,

@@ -936,7 +936,7 @@ fn finalize_spawn(
     // Reset fields that finalize_spawn doesn't set but could be stale from slot reuse.
     task.max_ports = 128;
     task.max_threads = 32;
-    task.max_pages = 256;
+    task.max_pages = 512;
     task.sa_enabled = false;
     task.sig_actions = [const { super::task::SignalAction::default() }; super::task::MAX_SIGNALS];
     task.alarm_deadline_ns = 0;

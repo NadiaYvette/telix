@@ -61,6 +61,53 @@ pub trait PteFormat {
 }
 
 // -------------------------------------------------------------------------
+// Volatile helpers — page table entries are hardware-visible (TLB refill
+// reads them), so all accesses must use volatile semantics to prevent
+// the compiler from reordering, merging, or eliminating stores.
+// -------------------------------------------------------------------------
+
+/// Read a page table entry.
+///
+/// On LoongArch64, uses inline asm to prevent miscompilation of volatile
+/// reads at higher optimization levels.
+#[inline(always)]
+unsafe fn pt_read(ptr: *const u64) -> u64 {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let val: u64;
+        core::arch::asm!(
+            "ld.d {val}, {ptr}, 0",
+            ptr = in(reg) ptr,
+            val = out(reg) val,
+            options(nostack, preserves_flags, readonly),
+        );
+        val
+    }
+    #[cfg(not(target_arch = "loongarch64"))]
+    core::ptr::read_volatile(ptr)
+}
+
+/// Write a page table entry.
+///
+/// On LoongArch64, uses inline asm to perform the store + data barrier.
+/// This works around a compiler backend issue where `write_volatile` at
+/// optimization levels >= 1 can be miscompiled, causing page table entries
+/// to appear zeroed to the hardware TLB walker.
+#[inline(always)]
+unsafe fn pt_write(ptr: *mut u64, val: u64) {
+    #[cfg(target_arch = "loongarch64")]
+    core::arch::asm!(
+        "st.d {val}, {ptr}, 0",
+        "dbar 0",
+        ptr = in(reg) ptr,
+        val = in(reg) val,
+        options(nostack, preserves_flags),
+    );
+    #[cfg(not(target_arch = "loongarch64"))]
+    core::ptr::write_volatile(ptr, val);
+}
+
+// -------------------------------------------------------------------------
 // Read-only walkers
 // -------------------------------------------------------------------------
 
@@ -74,7 +121,7 @@ pub fn walk_to_leaf<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> {
     // Walk through non-leaf levels (0 .. LEVELS-2).
     for level in 0..F::LEVELS - 1 {
         let idx = F::va_index(va, level);
-        let entry = unsafe { *table.add(idx) };
+        let entry = unsafe { pt_read(table.add(idx)) };
         if F::is_valid(entry) {
             if !F::is_table(entry) {
                 // Block/superpage at this level — no leaf-level PTE exists.
@@ -103,7 +150,7 @@ pub fn walk_to_level_slot<F: PteFormat>(
     let mut table = root as *mut u64;
     for level in 0..target_level {
         let idx = F::va_index(va, level);
-        let entry = unsafe { *table.add(idx) };
+        let entry = unsafe { pt_read(table.add(idx)) };
         if F::is_valid(entry) {
             if !F::is_table(entry) {
                 return None;
@@ -141,7 +188,7 @@ pub fn walk_or_create<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> 
     let mut table = root as *mut u64;
     for level in 0..F::LEVELS - 1 {
         let idx = F::va_index(va, level);
-        let entry = unsafe { *table.add(idx) };
+        let entry = unsafe { pt_read(table.add(idx)) };
         if F::is_valid(entry) {
             if !F::is_table(entry) {
                 // Block descriptor — cannot subdivide.
@@ -155,7 +202,7 @@ pub fn walk_or_create<F: PteFormat>(root: usize, va: usize) -> Option<*mut u64> 
             // Allocate a new table page.
             let new_table = alloc_table()?;
             unsafe {
-                *table.add(idx) = F::make_table_entry(new_table);
+                pt_write(table.add(idx), F::make_table_entry(new_table));
             }
             table = new_table as *mut u64;
         }
@@ -176,7 +223,7 @@ pub fn walk_or_create_to_level<F: PteFormat>(
     let mut table = root as *mut u64;
     for level in 0..target_level {
         let idx = F::va_index(va, level);
-        let entry = unsafe { *table.add(idx) };
+        let entry = unsafe { pt_read(table.add(idx)) };
         if F::is_valid(entry) {
             if !F::is_table(entry) {
                 return None;
@@ -188,7 +235,7 @@ pub fn walk_or_create_to_level<F: PteFormat>(
         } else {
             let new_table = alloc_table()?;
             unsafe {
-                *table.add(idx) = F::make_table_entry(new_table);
+                pt_write(table.add(idx), F::make_table_entry(new_table));
             }
             table = new_table as *mut u64;
         }
@@ -268,7 +315,7 @@ fn cow_break_table<F: PteFormat>(
     if child_level < F::LEVELS - 1 {
         // Table is intermediate — entries point to further tables.
         for i in 0..ENTRIES_PER_TABLE {
-            let entry = unsafe { *table.add(i) };
+            let entry = unsafe { pt_read(table.add(i)) };
             if F::is_valid(entry) {
                 if F::is_table(entry) {
                     let sub_pa = F::table_pa(entry);
@@ -281,12 +328,12 @@ fn cow_break_table<F: PteFormat>(
                     // called share() on these sub-PAs; convert our valid
                     // entry to a shared marker so future walks COW-break.
                     unsafe {
-                        *table.add(i) = F::make_shared_entry(sub_pa);
+                        pt_write(table.add(i), F::make_shared_entry(sub_pa));
                     }
                 } else {
                     // Superpage/block: downgrade to read-only for COW.
                     unsafe {
-                        *table.add(i) = F::make_readonly(entry);
+                        pt_write(table.add(i), F::make_readonly(entry));
                     }
                 }
             }
@@ -295,10 +342,10 @@ fn cow_break_table<F: PteFormat>(
     } else {
         // Table is a leaf — entries are data page PTEs.
         for i in 0..ENTRIES_PER_TABLE {
-            let entry = unsafe { *table.add(i) };
+            let entry = unsafe { pt_read(table.add(i)) };
             if F::is_valid(entry) {
                 unsafe {
-                    *table.add(i) = F::make_readonly(entry);
+                    pt_write(table.add(i), F::make_readonly(entry));
                 }
             }
         }
@@ -323,7 +370,7 @@ pub fn ensure_path_unshared<F: PteFormat>(
     let mut table = root as *mut u64;
     for level in 0..F::LEVELS - 1 {
         let idx = F::va_index(va, level);
-        let entry = unsafe { *table.add(idx) };
+        let entry = unsafe { pt_read(table.add(idx)) };
         if F::is_shared_entry(entry) {
             let old_pa = F::shared_entry_pa(entry);
             let new_pa = match cow_break_table::<F>(old_pa, level, fg) {
@@ -331,7 +378,7 @@ pub fn ensure_path_unshared<F: PteFormat>(
                 None => return false,
             };
             unsafe {
-                *table.add(idx) = F::make_table_entry(new_pa);
+                pt_write(table.add(idx), F::make_table_entry(new_pa));
             }
             table = new_pa as *mut u64;
         } else if F::is_valid(entry) {
@@ -371,7 +418,7 @@ pub fn free_shared_subtree<F: PteFormat>(
     let table = table_pa as *const u64;
 
     for i in 0..ENTRIES_PER_TABLE {
-        let entry = unsafe { *table.add(i) };
+        let entry = unsafe { pt_read(table.add(i) as *mut u64) };
         if F::is_shared_entry(entry) {
             let sub_pa = F::shared_entry_pa(entry);
             let rc = if fg.is_null() { 0 } else { ForkGroup::unshare(fg, sub_pa) };

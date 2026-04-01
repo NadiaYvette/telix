@@ -34,6 +34,31 @@ const PTE_SHARED: u64 = 1 << 11;
 
 const MMU_PAGE_SIZE: usize = 4096;
 
+/// Read a page table entry via inline asm to prevent miscompilation.
+#[inline(always)]
+unsafe fn pte_read(ptr: *const u64) -> u64 {
+    let val: u64;
+    core::arch::asm!(
+        "ld.d {val}, {ptr}, 0",
+        ptr = in(reg) ptr,
+        val = out(reg) val,
+        options(nostack, preserves_flags, readonly),
+    );
+    val
+}
+
+/// Write a page table entry via inline asm + dbar to prevent miscompilation.
+#[inline(always)]
+unsafe fn pte_write(ptr: *mut u64, val: u64) {
+    core::arch::asm!(
+        "st.d {val}, {ptr}, 0",
+        "dbar 0",
+        ptr = in(reg) ptr,
+        val = in(reg) val,
+        options(nostack, preserves_flags),
+    );
+}
+
 /// User page flags. SW_REF set on initial map so WSCLOCK sees page as referenced.
 pub const USER_RWX_FLAGS: u64 = PTE_V | PTE_D | PTE_PLV_USER | PTE_MAT_CC | PTE_SW_REF;
 pub const USER_RW_FLAGS: u64 = PTE_V | PTE_D | PTE_PLV_USER | PTE_MAT_CC | PTE_NR | PTE_SW_REF;
@@ -116,7 +141,9 @@ impl PteFormat for LoongArchPte {
         // TODO: use targeted invalidation (op=0x5 by VA).
         let _ = va;
         unsafe {
-            core::arch::asm!("invtlb 0, $zero, $zero");
+            // dbar ensures all prior stores (page table writes) are globally
+            // visible before flushing TLB, so the hardware walker sees them.
+            core::arch::asm!("dbar 0", "invtlb 0, $zero, $zero");
         }
     }
 
@@ -167,20 +194,20 @@ pub fn clone_shared_tables(parent_root: usize, child_root: usize, fg: *mut crate
     let child = child_root as *mut u64;
 
     for i in 0..512 {
-        let entry = unsafe { *parent.add(i) };
+        let entry = unsafe { pte_read(parent.add(i)) };
         if LoongArchPte::is_valid(entry) && LoongArchPte::is_table(entry) {
             let sub_pa = LoongArchPte::table_pa(entry);
             ForkGroup::share(fg, sub_pa);
             let shared = LoongArchPte::make_shared_entry(sub_pa);
             unsafe {
-                *parent.add(i) = shared;
-                *child.add(i) = shared;
+                pte_write(parent.add(i), shared);
+                pte_write(child.add(i), shared);
             }
         } else if LoongArchPte::is_shared_entry(entry) {
             let sub_pa = LoongArchPte::shared_entry_pa(entry);
             ForkGroup::share(fg, sub_pa);
             unsafe {
-                *child.add(i) = entry;
+                pte_write(child.add(i), entry);
             }
         }
     }
@@ -286,6 +313,8 @@ pub fn boot_page_table_root() -> usize {
 /// Switch to a different page table.
 pub fn switch_page_table(root: usize) {
     unsafe {
+        // dbar ensures all prior stores are visible before switching PT root.
+        core::arch::asm!("dbar 0");
         core::arch::asm!("csrwr {}, 0x19", in(reg) root as u64); // CSR.PGDL
         // Flush user TLB entries (type 4 = flush non-global entries).
         core::arch::asm!("invtlb 4, $zero, $zero");
@@ -327,7 +356,7 @@ pub fn map_single_mmupage(root: usize, va: usize, pa: usize, flags: u64) -> bool
         None => return false,
     };
     unsafe {
-        *slot = pte_leaf(pa, flags);
+        pte_write(slot, pte_leaf(pa, flags));
     }
     LoongArchPte::tlb_invalidate(va);
     true
@@ -338,13 +367,13 @@ pub fn unmap_single_mmupage(root: usize, va: usize) -> usize {
         Some(s) => s,
         None => return 0,
     };
-    let entry = unsafe { *slot };
+    let entry = unsafe { pte_read(slot) };
     if entry & PTE_V == 0 {
         return 0;
     }
     let pa = (entry & PFN_MASK) as usize;
     unsafe {
-        *slot = 0;
+        pte_write(slot, 0);
     }
     LoongArchPte::tlb_invalidate(va);
     pa
@@ -352,7 +381,7 @@ pub fn unmap_single_mmupage(root: usize, va: usize) -> usize {
 
 pub fn read_pte(root: usize, va: usize) -> u64 {
     match radix_pt::walk_to_leaf::<LoongArchPte>(root, va) {
-        Some(slot) => unsafe { *slot },
+        Some(slot) => unsafe { pte_read(slot) },
         None => 0,
     }
 }
@@ -362,13 +391,13 @@ pub fn evict_mmupage(root: usize, va: usize) -> usize {
         Some(s) => s,
         None => return 0,
     };
-    let entry = unsafe { *slot };
+    let entry = unsafe { pte_read(slot) };
     if entry & PTE_V == 0 {
         return 0;
     }
     let pa = (entry & PFN_MASK) as usize;
     unsafe {
-        *slot = entry & PTE_SW_ZEROED;
+        pte_write(slot, entry & PTE_SW_ZEROED);
     }
     LoongArchPte::tlb_invalidate(va);
     pa
@@ -379,31 +408,28 @@ pub fn clear_pte(root: usize, va: usize) {
         Some(s) => s,
         None => return,
     };
-    let entry = unsafe { *slot };
+    let entry = unsafe { pte_read(slot) };
     if entry != 0 {
         unsafe {
-            *slot = 0;
+            pte_write(slot, 0);
         }
         LoongArchPte::tlb_invalidate(va);
     }
 }
 
 pub fn read_and_clear_ref_bit(root: usize, va: usize) -> bool {
-    // LoongArch: use software reference bit (PTE_SW_REF).
-    // Set on initial map and by TLB refill handler (future).
-    // WSCLOCK clears it; if still clear on next scan, page is unreferenced.
     let slot = match radix_pt::walk_to_leaf::<LoongArchPte>(root, va) {
         Some(s) => s,
         None => return false,
     };
-    let entry = unsafe { *slot };
+    let entry = unsafe { pte_read(slot) };
     if entry & PTE_V == 0 {
         return false;
     }
     let referenced = (entry & PTE_SW_REF) != 0;
     if referenced {
         unsafe {
-            *slot = entry & !PTE_SW_REF;
+            pte_write(slot, entry & !PTE_SW_REF);
         }
         LoongArchPte::tlb_invalidate(va);
     }
@@ -412,7 +438,7 @@ pub fn read_and_clear_ref_bit(root: usize, va: usize) -> bool {
 
 pub fn translate_va(root: usize, va: usize) -> Option<usize> {
     let slot = radix_pt::walk_to_leaf::<LoongArchPte>(root, va)?;
-    let entry = unsafe { *slot };
+    let entry = unsafe { pte_read(slot) };
     if entry & PTE_V == 0 {
         return None;
     }
@@ -425,13 +451,12 @@ pub fn downgrade_pte_readonly(root: usize, va: usize) -> bool {
         Some(s) => s,
         None => return false,
     };
-    let entry = unsafe { *slot };
+    let entry = unsafe { pte_read(slot) };
     if entry & PTE_V == 0 {
         return false;
     }
-    // Clear Dirty bit to make read-only.
     unsafe {
-        *slot = entry & !PTE_D;
+        pte_write(slot, entry & !PTE_D);
     }
     LoongArchPte::tlb_invalidate(va);
     true
@@ -442,13 +467,13 @@ pub fn update_pte_flags(root: usize, va: usize, new_flags: u64) -> bool {
         Some(s) => s,
         None => return false,
     };
-    let entry = unsafe { *slot };
+    let entry = unsafe { pte_read(slot) };
     if entry & PTE_V == 0 {
         return false;
     }
     let pa_and_sw = (entry & PFN_MASK) | (entry & PTE_SW_ZEROED);
     unsafe {
-        *slot = pa_and_sw | new_flags;
+        pte_write(slot, pa_and_sw | new_flags);
     }
     LoongArchPte::tlb_invalidate(va);
     true
@@ -463,7 +488,7 @@ pub fn map_user_pages(
         let pa = phys + i * MMU_PAGE_SIZE;
         let slot = radix_pt::walk_or_create::<LoongArchPte>(root, va)?;
         unsafe {
-            *slot = pte_leaf(pa, flags);
+            pte_write(slot, pte_leaf(pa, flags));
         }
     }
     Some(())
@@ -498,14 +523,14 @@ pub fn install_superpage_at_level(
         None => return false,
     };
 
-    let old_entry = unsafe { *slot };
+    let old_entry = unsafe { pte_read(slot) };
     if old_entry & PTE_V != 0 && LoongArchPte::is_table(old_entry) {
         let table_addr = (old_entry & PFN_MASK) as usize;
         crate::mm::phys::free_page(crate::mm::page::PhysAddr::new(table_addr));
     }
 
     unsafe {
-        *slot = pte_leaf(pa, flags | PTE_HUGE);
+        pte_write(slot, pte_leaf(pa, flags | PTE_HUGE));
     }
     LoongArchPte::tlb_invalidate(va);
     true
@@ -517,7 +542,7 @@ pub fn is_superpage_at_level(
     let slot = radix_pt::walk_to_level_slot::<LoongArchPte>(
         root, va, level.pt_level as usize,
     )?;
-    let entry = unsafe { *slot };
+    let entry = unsafe { pte_read(slot) };
     if entry & PTE_V != 0 && !LoongArchPte::is_table(entry) {
         let pa = (entry & PFN_MASK) as usize & !level.align_mask();
         Some(pa)
@@ -536,7 +561,7 @@ pub fn demote_superpage_at_level(
         None => return false,
     };
 
-    let entry = unsafe { *slot };
+    let entry = unsafe { pte_read(slot) };
     if entry & PTE_V == 0 || LoongArchPte::is_table(entry) {
         return false;
     }
@@ -553,12 +578,12 @@ pub fn demote_superpage_at_level(
     for i in 0..512usize {
         let pa = base_pa + i * sub_size;
         unsafe {
-            *table_ptr.add(i) = pte_leaf(pa, flags);
+            pte_write(table_ptr.add(i), pte_leaf(pa, flags));
         }
     }
 
     unsafe {
-        *slot = pte_table(new_table);
+        pte_write(slot, pte_table(new_table));
     }
     LoongArchPte::tlb_invalidate(va);
     true

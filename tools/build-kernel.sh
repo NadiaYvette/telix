@@ -27,6 +27,18 @@ esac
 echo "=== Building userspace for $ARCH ==="
 "$ROOTDIR/tools/build-user.sh" "$ARCH"
 
+# Step 1b: Update HELLO.ELF in test.img for the target architecture.
+# For mips64, the target path strips "targets/" prefix and ".json" suffix.
+HELLO_TARGET="${TARGET#targets/}"
+HELLO_TARGET="${HELLO_TARGET%.json}"
+HELLO_BIN="$ROOTDIR/target/$HELLO_TARGET/release/hello"
+DISK_IMG="$ROOTDIR/test.img"
+if [ -f "$HELLO_BIN" ] && [ -f "$DISK_IMG" ] && command -v mcopy >/dev/null 2>&1; then
+    mdel -i "$DISK_IMG" ::HELLO.ELF 2>/dev/null || true
+    mcopy -i "$DISK_IMG" "$HELLO_BIN" ::HELLO.ELF 2>/dev/null && \
+        echo "  Updated HELLO.ELF in test.img for $ARCH" || true
+fi
+
 # Step 2: Build kernel.
 echo "=== Building kernel for $ARCH ($TARGET) ==="
 EXTRA_FLAGS=""

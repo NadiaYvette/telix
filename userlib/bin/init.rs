@@ -3088,25 +3088,27 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             if phase45_ok {
-                // Create a file-backed mapping: 2 allocation pages, RW, file_handle=0x42, offset=0.
+                // Create a file-backed mapping: 2 MMU pages, RW, file_handle=0x42, offset=0.
+                // The pager fills each allocation page with a pattern byte = page_index
+                // (file_offset / alloc_page_size). Both MMU pages may be in the same
+                // allocation page, so both get pattern 0.
                 let mapped_va = syscall::mmap_file(0, 2, 1, 0x42, 0, 0);
                 match mapped_va {
                     Some(va) => {
-                        // Touch several locations to trigger page faults.
-                        // Pager fills each PAGE_SIZE page with a pattern: each byte = page_index.
                         let ptr = va as *const u8;
 
-                        // Read from first page (offset 0).
+                        // Read from first page (offset 0). Pattern = 0.
                         let b0 = unsafe { core::ptr::read_volatile(ptr) };
                         if b0 != 0 {
                             syscall::debug_puts(b"  FAIL: page 0 byte 0 mismatch\n");
                             phase45_ok = false;
                         }
 
-                        // Read from second allocation page (offset = PAGE_SIZE). Page index = 1.
+                        // Read from second MMU page (offset = MMU_PAGE_SIZE).
+                        // May be same allocation page as first → pattern 0.
                         let ps = syscall::page_size();
                         let b1 = unsafe { core::ptr::read_volatile(ptr.add(ps)) };
-                        if b1 != 1 {
+                        if b1 != 0 {
                             syscall::debug_puts(b"  FAIL: page 1 byte 0 mismatch\n");
                             phase45_ok = false;
                         }
@@ -3120,7 +3122,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                         // Read from second page at offset 0x200.
                         let b3 = unsafe { core::ptr::read_volatile(ptr.add(ps + 0x200)) };
-                        if b3 != 1 {
+                        if b3 != 0 {
                             syscall::debug_puts(b"  FAIL: page 1 byte 0x200 mismatch\n");
                             phase45_ok = false;
                         }
@@ -7954,13 +7956,11 @@ extern "C" fn pager_thread_entry(_arg: u64) {
             *b = page_index;
         }
 
-        // Call fault_complete for each 4K chunk.
-        // Actually, fault_complete copies PAGE_SIZE from the given VA.
-        // The kernel translate_va will translate our buf pointer.
-        // But buf is only 4K and the kernel copies page_size bytes...
-        // We need a full PAGE_SIZE buffer.
-        // Allocate one via mmap_anon.
-        let tmp = syscall::mmap_anon(0, 1, 1); // 1 page = PAGE_SIZE
+        // fault_complete copies page_size bytes from our buffer.
+        // Allocate a buffer covering the full allocation page (page_size bytes).
+        let mmu_page_size = syscall::page_size(); // 4K MMU page
+        let mmu_pages_needed = (page_size + mmu_page_size - 1) / mmu_page_size;
+        let tmp = syscall::mmap_anon(0, mmu_pages_needed, 1);
         if let Some(tmp_va) = tmp {
             // Fill the entire page with the pattern.
             let ptr = tmp_va as *mut u8;

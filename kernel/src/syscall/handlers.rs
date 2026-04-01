@@ -997,7 +997,9 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
         aspace.map_anon(va, mmu_pages, prot).map(|vma| vma.object_id)
     }) {
         Some(id) => id,
-        None => return u64::MAX,
+        None => {
+            return u64::MAX;
+        }
     };
 
     // Eagerly allocate physical pages and install PTEs.
@@ -1017,7 +1019,9 @@ fn sys_mmap_anon(va_hint: u64, page_count: u64, prot: u64, flags: u64) -> u64 {
             obj.ensure_page(page_idx).map(|(pa, _)| pa)
         }) {
             Some(Some(pa)) => pa,
-            _ => return u64::MAX,
+            _ => {
+                return u64::MAX;
+            }
         };
         let pa_usize = pa.as_usize();
 
@@ -1636,6 +1640,8 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         crate::arch::irq::restore(irq_saved);
     }
 
+    // (irq guard removed — not a race issue)
+
     // Load ELF segments into the fresh address space.
     let elf_info = match crate::loader::elf::load_elf(elf_data, aspace_id, new_pt_root) {
         Ok(e) => e,
@@ -1880,6 +1886,11 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     // Flush icache again after frame rewrite, and add DSB to ensure
     // all page table + data writes are complete before we return to userspace.
     crate::arch::cpu::flush_icache();
+
+    // Re-install the page table root and flush TLB one final time.
+    // This ensures the hardware TLB walker sees all page table writes
+    // made during ELF loading and stack setup.
+    crate::mm::hat::switch_page_table(new_pt_root);
 
     // dispatch() returns after this — the exception return path will
     // restore the rewritten frame and jump to the new program's entry point.

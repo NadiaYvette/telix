@@ -110,7 +110,7 @@ pub fn flush_icache() {
     // x86_64: instruction cache is coherent with data cache.
     #[cfg(target_arch = "loongarch64")]
     unsafe {
-        core::arch::asm!("ibar 0");
+        core::arch::asm!("dbar 0", "ibar 0");
     }
     #[cfg(target_arch = "mips64")]
     unsafe {
