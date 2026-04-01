@@ -587,10 +587,13 @@ impl NetDev {
         mmio_write32(mmio_va, MMIO_QUEUE_NUM, qsize);
 
         let ps = syscall::page_size();
-        let vq_va = syscall::mmap_anon(0, 1, 1)?;
+        // Virtio v1 split virtqueue: desc + avail in first page, used ring
+        // starts at the next page boundary. Allocate 2 pages to cover both.
+        let vq_pages = if version == 1 { 2 } else { 1 };
+        let vq_va = syscall::mmap_anon(0, vq_pages, 1)?;
         let vq_pa = syscall::virt_to_phys(vq_va)?;
         unsafe {
-            core::ptr::write_bytes(vq_va as *mut u8, 0, ps);
+            core::ptr::write_bytes(vq_va as *mut u8, 0, vq_pages * ps);
         }
 
         let buf_va = syscall::mmap_anon(0, 1, 1)?;
@@ -867,6 +870,9 @@ impl NetDev {
                 frame.len(),
             );
         }
+        // Ensure buffer writes are globally visible before posting the
+        // descriptor — required on weakly-ordered architectures (aarch64).
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         self.tx.post_desc(0, self.tx.buf_pa as u64, total as u32, 0);
         self.notify_queue(1);
 
