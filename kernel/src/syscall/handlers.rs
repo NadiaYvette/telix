@@ -625,7 +625,9 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
             }
             0
         }
-        crate::ipc::port::SendDirectResult::Queued => 0,
+        crate::ipc::port::SendDirectResult::Queued => {
+            0
+        }
         crate::ipc::port::SendDirectResult::Full => {
             // Queue full — fall back to blocking send (spin-blocks until space).
             match crate::ipc::port::send(port_id, msg) {

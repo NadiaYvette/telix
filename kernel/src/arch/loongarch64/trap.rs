@@ -244,8 +244,9 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
 
         ECODE_INE => {
             crate::println!(
-                "INE: era={:#x} badv={:#x} prmd={:#x}",
-                frame.era, read_badv(), frame.prmd
+                "INE: era={:#x} badv={:#x} prmd={:#x} tid={}",
+                frame.era, read_badv(), frame.prmd,
+                crate::sched::current_thread_id()
             );
             crate::sched::scheduler::exit_current_thread(-4) // SIGILL
         }

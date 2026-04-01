@@ -107,6 +107,9 @@ pub fn send_nb_4(port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) -> u64
 }
 
 /// Blocking send on a port.
+// inline(never): work around LoongArch64 release-mode miscompile that loses
+// the `tag` argument when the caller has many live values across the call.
+#[inline(never)]
 pub fn send(port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) -> u64 {
     unsafe { arch::syscall6(SYS_SEND, port, tag, d0, d1, d2, d3) }
 }

@@ -318,6 +318,8 @@ pub fn switch_page_table(root: usize) {
         core::arch::asm!("csrwr {}, 0x19", in(reg) root as u64); // CSR.PGDL
         // Flush user TLB entries (type 4 = flush non-global entries).
         core::arch::asm!("invtlb 4, $zero, $zero");
+        // ibar synchronizes the instruction fetch pipeline after TLB change.
+        core::arch::asm!("ibar 0");
     }
 }
 

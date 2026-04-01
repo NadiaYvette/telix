@@ -45,6 +45,9 @@ _tlb_refill:
     ldpte   $t0, 0                  // load even PTE → TLBRELO0
     ldpte   $t0, 1                  // load odd PTE → TLBRELO1
     tlbfill                          // fill TLB with the entry
+    // ibar synchronizes instruction pipeline after TLB fill, preventing
+    // stale instruction fetch from triggering spurious INE exceptions.
+    ibar    0
 
     csrrd   $t0, 0x32               // restore t0
     csrrd   $t1, 0x33               // restore t1
