@@ -1,8 +1,12 @@
 //! B+ tree of physical memory extents.
 //!
-//! Replaces the traditional per-page struct array (PFN database) with an
-//! extent-based data structure. Each entry describes a contiguous range of
-//! physical memory with uniform properties.
+//! Replaces the traditional per-page `struct page` array (PFN database /
+//! resident page table) with an extent-based data structure. Power-of-2-sized
+//! and -aligned contiguous ranges of physical memory appear as single entries
+//! instead of individual per-page records corresponding to the minimum TLB
+//! mapping granularity. This gives a sublinear reserved memory footprint —
+//! metadata grows with fragmentation and the number of active mappings rather
+//! than total physical RAM.
 //!
 //! The B+ tree provides:
 //! - O(log n) point lookup and insert/remove

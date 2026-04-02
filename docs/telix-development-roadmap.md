@@ -21,7 +21,7 @@ This document is a structured development roadmap for **Telix**, a from-scratch 
 | Process model | Mach-style task/thread, M:N threading with scheduler activations |
 | Security | seL4-derived capability-based security |
 | I/O architecture | Fully asynchronous, message-passing IPC; no synchronous Unix VFS call stack |
-| VM subsystem | Coremap-free, extent-based (B+ trees of intervals or adaptive radix trees) |
+| VM subsystem | Extent-based (no per-page struct array); B+ trees of intervals or adaptive radix trees |
 | Page size | Configurable via `PAGE_MMUSHIFT`/`PAGE_MMUCOUNT`; subpage superpages by construction |
 | Implementation language | Rust |
 | Primary target | ARM64 (secondary: x86-64, RISC-V, LoongArch64, MIPS64) |

@@ -66,7 +66,7 @@ The cost of this scheme is **internal fragmentation**: memory within an allocati
 
 Architectures such as ARM64 (4 KiB to 2 MiB, a 512× gap) and x86-64 (4 KiB to 2 MiB, same) suffer from a very large gap between the base MMU page size and the first superpage size. At the base 4 KiB page size, assembling a 2 MiB superpage requires finding or maintaining contiguity across 512 page frames — a fragile proposition under memory pressure.
 
-Page clustering bridges this gap in two ways. First, by guaranteeing subpage superpages (e.g. 64 KiB contiguous PTEs on ARM64 with `PAGE_SIZE` ≥ 64 KiB), it provides an intermediate TLB efficiency benefit that is unconditionally available. Second, by reducing the piece count for the 2 MiB superpage (32 pieces at 64 KiB, 8 at 256 KiB), it makes active contiguity management in the allocator substantially more effective. ARM64 is the greatest beneficiary, as it has hardware support for the intermediate 64 KiB contiguous PTE hint that x86-64 lacks.
+Page clustering bridges this gap in two ways. First, by guaranteeing subpage superpages (e.g. 64 KiB contiguous PTEs on ARM64 with `PAGE_SIZE` ≥ 64 KiB), it shifts the failure mode from external fragmentation to outright memory exhaustion — these superpage sizes cannot fail when memory is available. Second, by reducing the assembly ratio for the 2 MiB superpage (32 pieces at 64 KiB, 8 at 256 KiB), it makes active contiguity management in the allocator substantially more effective. The superpages enabled by these guarantees are what deliver TLB efficiency; page clustering itself provides the proportionality constants and fragmentation-shifting that make them reliably obtainable. ARM64 is the greatest beneficiary, as it has hardware support for the intermediate 64 KiB contiguous PTE hint that x86-64 lacks.
 
 > **Novelty assessment:** Novel combination. McKusick–Dickins page clustering applied to guarantee Navarro-style subpage superpage sizes and improve superpage assembly. Not previously published in this specific form; the closest prior work is Linux multi-size THP (6.8), which attacks the same gap from the allocator side rather than by construction.
 
@@ -86,7 +86,7 @@ Traditional BSD and Linux kernels maintain a per-page metadata array: a flat arr
 
 #### 4.3.2. Extent-Based Metadata Structures
 
-Physical memory metadata is represented by extent-based data structures — each entry describes a contiguous range of physical memory with uniform properties, rather than a single frame. Candidate data structures include:
+Physical memory metadata is represented by extent-based data structures — power-of-2-sized and -aligned contiguous ranges of physical memory with uniform properties appear as single entries, rather than one record per page at the minimum TLB mapping granularity. This yields a sublinear reserved memory footprint: metadata grows with fragmentation and the number of active mappings rather than total physical RAM. Candidate data structures include:
 
 **B+ trees of intervals:** Leaf-level sibling pointers provide cache-friendly sequential access for range scans. Interior nodes pack many keys per cache line, minimising pointer-chasing. Well-suited to range queries ("find all extents in this physical address range") and bulk operations.
 
@@ -96,7 +96,7 @@ Both structures avoid the back-pointers that complicate lock-free algorithms and
 
 > **Design status:** Open question: final data structure selection. B+ trees and ARTs are both viable; the choice may depend on workload-specific access pattern benchmarks. Hybrid approaches are not excluded.
 
-#### 4.3.3. What Replaces Coremap Functions
+#### 4.3.3. What Replaces Per-Page Struct Array Functions
 
 **Reverse mapping:** Object-based. Page cache objects and anonymous memory objects track their own mappings. To unmap a physical extent for reclaim or migration, the system identifies the owning object, queries it for its mapping list, and walks the relevant page tables. This is the sole reverse mapping path — there is no per-physical-page rmap.
 
