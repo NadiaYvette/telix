@@ -1139,12 +1139,16 @@ fn sys_grant_pages(dst_port: u64, src_va: u64, dst_va: u64, page_count: u64, rea
         None => return u64::MAX,
     };
     let dst_aspace = crate::sched::scheduler::task_ref(dst_task).aspace_id;
+    // page_count from userspace is in MMU pages (matching mmap_anon convention).
+    // Convert to allocation pages for grant::grant_pages.
+    let mmu_count = crate::mm::page::page_mmucount();
+    let alloc_pages = (page_count as usize + mmu_count - 1) / mmu_count;
     match crate::mm::grant::grant_pages(
         my_aspace,
         src_va as usize,
         dst_aspace,
         dst_va as usize,
-        page_count as usize,
+        alloc_pages,
         readonly != 0,
     ) {
         Ok(()) => 0,

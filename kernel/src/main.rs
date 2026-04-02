@@ -201,6 +201,11 @@ fn startup_thread() -> ! {
             Some(tid) => println!("  input_srv spawned (thread {})", tid),
             None => println!("  WARNING: input_srv not found (ok if not yet built)"),
         }
+        // Spawn compositor_srv: window compositor (connects to fb_srv + input_srv).
+        match sched::spawn_user(b"compositor_srv", 50, 20, 0) {
+            Some(tid) => println!("  compositor_srv spawned (thread {})", tid),
+            None => println!("  WARNING: compositor_srv not found (ok if not yet built)"),
+        }
     }
 
     // MIPS64 Malta: Discover virtio devices via GT-64120 PCI bus scan.

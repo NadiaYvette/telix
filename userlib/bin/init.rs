@@ -8042,6 +8042,102 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 109: Window compositor ---
+    syscall::debug_puts(b"  init: Phase 109 compositor...\n");
+    {
+        let comp_port = syscall::ns_lookup(b"compositor");
+        if let Some(comp_port) = comp_port {
+            let reply_port = syscall::port_create();
+            let event_port = syscall::port_create();
+
+            // 1. Get compositor info.
+            syscall::send(comp_port, 0xA008, 0, 0, reply_port << 32, 0);
+            let mut got_info = false;
+            for _ in 0..200 {
+                if let Some(msg) = syscall::recv_nb_msg(reply_port) {
+                    if msg.tag == 0xA009 {
+                        got_info = true;
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+
+            if got_info {
+                // 2. Create a 64x64 window at (50, 50).
+                let desired_va: u64 = 0x6_0000_0000; // well above kernel 4GB identity map
+                syscall::send(
+                    comp_port,
+                    0xA000, // COMP_CREATE_WINDOW
+                    50 | (50 << 32),            // x=50, y=50
+                    64 | (64 << 32),            // w=64, h=64
+                    (event_port as u64) | (reply_port << 32),
+                    desired_va,
+                );
+
+                let mut win_id = u64::MAX;
+                let mut buf_va = 0usize;
+                for _ in 0..200 {
+                    if let Some(msg) = syscall::recv_nb_msg(reply_port) {
+                        if msg.tag == 0xA001 && msg.data[0] != u64::MAX {
+                            win_id = msg.data[0];
+                            buf_va = msg.data[1] as usize;
+                        }
+                        break;
+                    }
+                    syscall::yield_now();
+                }
+
+                if win_id != u64::MAX && buf_va != 0 {
+                    // 3. Write red pixels to the buffer.
+                    let buf = buf_va as *mut u32;
+                    for i in 0..(64 * 64) {
+                        unsafe {
+                            core::ptr::write_volatile(buf.add(i), 0x00FF0000);
+                        }
+                    }
+
+                    // 4. Commit.
+                    syscall::send(comp_port, 0xA004, win_id, 0, reply_port << 32, 0);
+                    let mut commit_ok = false;
+                    for _ in 0..200 {
+                        if let Some(msg) = syscall::recv_nb_msg(reply_port) {
+                            if msg.tag == 0xA005 && msg.data[0] == 0 {
+                                commit_ok = true;
+                            }
+                            break;
+                        }
+                        syscall::yield_now();
+                    }
+
+                    // 5. Destroy window.
+                    syscall::send(comp_port, 0xA002, win_id, 0, reply_port << 32, 0);
+                    for _ in 0..200 {
+                        if syscall::recv_nb_msg(reply_port).is_some() {
+                            break;
+                        }
+                        syscall::yield_now();
+                    }
+
+                    if commit_ok {
+                        syscall::debug_puts(b"Phase 109 compositor: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 109 compositor: FAILED (commit)\n");
+                    }
+                } else {
+                    syscall::debug_puts(b"Phase 109 compositor: FAILED (create window)\n");
+                }
+            } else {
+                syscall::debug_puts(b"Phase 109 compositor: FAILED (no info reply)\n");
+            }
+
+            syscall::port_destroy(event_port);
+            syscall::port_destroy(reply_port);
+        } else {
+            syscall::debug_puts(b"Phase 109 compositor: SKIPPED (no compositor)\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

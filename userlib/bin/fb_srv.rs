@@ -173,6 +173,7 @@ struct FbState {
     bpp: u8,
     fb_va: usize,
     fb_pages: usize,
+    fb_phys: u64, // physical address of framebuffer (for mmap_device by clients)
     gpu: Option<GpuDev>,
 }
 
@@ -670,6 +671,7 @@ fn try_vbe() -> Option<FbState> {
         bpp,
         fb_va,
         fb_pages,
+        fb_phys: addr,
         gpu: None,
     })
 }
@@ -704,6 +706,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                             bpp: 32,
                             fb_va,
                             fb_pages,
+                            fb_phys: 0,
                             gpu: Some(gpu),
                         })
                     }
@@ -769,30 +772,34 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 // data[2] = format (0 = XRGB8888).
                 let wh = (fb.width as u64) | ((fb.height as u64) << 32);
                 let pb = (fb.pitch as u64) | ((fb.bpp as u64) << 32);
-                syscall::send(reply_port, FB_GET_INFO_OK, wh, pb, 0, 0);
+                syscall::send(reply_port, FB_GET_INFO_OK, wh, pb, fb.fb_phys, 0);
             }
 
             FB_MAP => {
                 let reply_port = msg.data[2] >> 32;
                 let dst_aspace = msg.data[3];
-                let _desired_va = msg.data[0] as usize;
+                let desired_va = msg.data[0] as usize;
+                // Use client-specified VA, or default to fb_srv's VA if 0.
+                let dst_va = if desired_va != 0 { desired_va } else { fb.fb_va };
 
                 // Grant framebuffer pages to the requesting task.
                 let fb_bytes = fb.pitch as usize * fb.height as usize;
+                let mut granted_va = 0u64;
                 if dst_aspace != 0 {
-                    let _ = syscall::grant_pages(
+                    if syscall::grant_pages(
                         dst_aspace,
                         fb.fb_va,
-                        0, // let kernel choose destination VA
+                        dst_va,
                         fb.fb_pages,
                         false,
-                    );
+                    ) {
+                        granted_va = dst_va as u64;
+                    }
                 }
-                // Reply with the granted VA and size (client will get it from the grant).
                 syscall::send(
                     reply_port,
                     FB_MAP_OK,
-                    fb.fb_va as u64,
+                    granted_va,
                     fb_bytes as u64,
                     0,
                     0,
