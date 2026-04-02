@@ -52,9 +52,162 @@ const BORDER_WIDTH: i32 = 2;
 const BG_COLOR: u32 = 0x00303030;
 const BORDER_COLOR: u32 = 0x00808080;
 const BORDER_FOCUSED_COLOR: u32 = 0x004488FF;
+const TITLEBAR_H: i32 = 20;
+const TITLEBAR_BG: u32 = 0x00404060;
+const TITLEBAR_FOCUSED_BG: u32 = 0x003355AA;
+const TITLEBAR_TEXT_COLOR: u32 = 0x00FFFFFF;
 
 // Page size for mmap_anon (allocation pages).
 const PAGE_SIZE: usize = 4096;
+
+// --- Mouse cursor bitmap (12x19 arrow) ---
+// Each entry: bit 11 = leftmost pixel. CURSOR_MASK = opaque, CURSOR_FILL = white.
+const CURSOR_W: usize = 12;
+const CURSOR_H: usize = 19;
+#[rustfmt::skip]
+const CURSOR_MASK: [u16; 19] = [
+    0b1000_0000_0000, // X...........
+    0b1100_0000_0000, // XX..........
+    0b1110_0000_0000, // XXX.........
+    0b1111_0000_0000, // XXXX........
+    0b1111_1000_0000, // XXXXX.......
+    0b1111_1100_0000, // XXXXXX......
+    0b1111_1110_0000, // XXXXXXX.....
+    0b1111_1111_0000, // XXXXXXXX....
+    0b1111_1111_1000, // XXXXXXXXX...
+    0b1111_1111_1100, // XXXXXXXXXX..
+    0b1111_1111_1110, // XXXXXXXXXXX.
+    0b1111_1110_0000, // XXXXXXX.....
+    0b1110_1111_0000, // XXX.XXXX....
+    0b1100_1111_0000, // XX..XXXX....
+    0b1000_0111_1000, // X....XXXX...
+    0b0000_0111_1000, // .....XXXX...
+    0b0000_0011_1100, // ......XXXX..
+    0b0000_0011_1100, // ......XXXX..
+    0b0000_0001_1000, // .......XX...
+];
+#[rustfmt::skip]
+const CURSOR_FILL: [u16; 19] = [
+    0b0000_0000_0000, // ............
+    0b0000_0000_0000, // ............
+    0b0100_0000_0000, // .#..........
+    0b0110_0000_0000, // .##.........
+    0b0111_0000_0000, // .###........
+    0b0111_1000_0000, // .####.......
+    0b0111_1100_0000, // .#####......
+    0b0111_1110_0000, // .######.....
+    0b0111_1111_0000, // .#######....
+    0b0111_1111_1000, // .########...
+    0b0111_1100_0000, // .#####......
+    0b0110_1100_0000, // .##.##......
+    0b0100_0110_0000, // .#...##.....
+    0b0000_0110_0000, // .....##.....
+    0b0000_0011_0000, // ......##....
+    0b0000_0011_0000, // ......##....
+    0b0000_0001_1000, // .......##...
+    0b0000_0001_1000, // .......##...
+    0b0000_0000_0000, // ............
+];
+
+// --- 8x8 bitmap font (ASCII 32..126) for title bar text ---
+#[rustfmt::skip]
+const FONT_8X8: [[u8; 8]; 95] = [
+    [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00], // 32 ' '
+    [0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00], // 33 '!'
+    [0x36,0x36,0x14,0x00,0x00,0x00,0x00,0x00], // 34 '"'
+    [0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00], // 35 '#'
+    [0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00], // 36 '$'
+    [0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00], // 37 '%'
+    [0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00], // 38 '&'
+    [0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00], // 39 '\''
+    [0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00], // 40 '('
+    [0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00], // 41 ')'
+    [0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00], // 42 '*'
+    [0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00], // 43 '+'
+    [0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06], // 44 ','
+    [0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00], // 45 '-'
+    [0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00], // 46 '.'
+    [0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00], // 47 '/'
+    [0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00], // 48 '0'
+    [0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00], // 49 '1'
+    [0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00], // 50 '2'
+    [0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00], // 51 '3'
+    [0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00], // 52 '4'
+    [0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00], // 53 '5'
+    [0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00], // 54 '6'
+    [0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00], // 55 '7'
+    [0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00], // 56 '8'
+    [0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00], // 57 '9'
+    [0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00], // 58 ':'
+    [0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06], // 59 ';'
+    [0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00], // 60 '<'
+    [0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00], // 61 '='
+    [0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00], // 62 '>'
+    [0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00], // 63 '?'
+    [0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00], // 64 '@'
+    [0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00], // 65 'A'
+    [0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00], // 66 'B'
+    [0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00], // 67 'C'
+    [0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00], // 68 'D'
+    [0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00], // 69 'E'
+    [0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00], // 70 'F'
+    [0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00], // 71 'G'
+    [0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00], // 72 'H'
+    [0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00], // 73 'I'
+    [0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00], // 74 'J'
+    [0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00], // 75 'K'
+    [0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00], // 76 'L'
+    [0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00], // 77 'M'
+    [0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00], // 78 'N'
+    [0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00], // 79 'O'
+    [0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00], // 80 'P'
+    [0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00], // 81 'Q'
+    [0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00], // 82 'R'
+    [0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00], // 83 'S'
+    [0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00], // 84 'T'
+    [0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00], // 85 'U'
+    [0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00], // 86 'V'
+    [0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00], // 87 'W'
+    [0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00], // 88 'X'
+    [0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00], // 89 'Y'
+    [0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00], // 90 'Z'
+    [0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0x00], // 91 '['
+    [0x03,0x06,0x0C,0x18,0x30,0x60,0x40,0x00], // 92 '\\'
+    [0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0x00], // 93 ']'
+    [0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00], // 94 '^'
+    [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF], // 95 '_'
+    [0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00], // 96 '`'
+    [0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00], // 97 'a'
+    [0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00], // 98 'b'
+    [0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00], // 99 'c'
+    [0x38,0x30,0x30,0x3E,0x33,0x33,0x6E,0x00], // 100 'd'
+    [0x00,0x00,0x1E,0x33,0x3F,0x03,0x1E,0x00], // 101 'e'
+    [0x1C,0x36,0x06,0x0F,0x06,0x06,0x0F,0x00], // 102 'f'
+    [0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F], // 103 'g'
+    [0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00], // 104 'h'
+    [0x0C,0x00,0x0E,0x0C,0x0C,0x0C,0x1E,0x00], // 105 'i'
+    [0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E], // 106 'j'
+    [0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00], // 107 'k'
+    [0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00], // 108 'l'
+    [0x00,0x00,0x33,0x7F,0x7F,0x6B,0x63,0x00], // 109 'm'
+    [0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x00], // 110 'n'
+    [0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00], // 111 'o'
+    [0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F], // 112 'p'
+    [0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78], // 113 'q'
+    [0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00], // 114 'r'
+    [0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00], // 115 's'
+    [0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00], // 116 't'
+    [0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00], // 117 'u'
+    [0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00], // 118 'v'
+    [0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00], // 119 'w'
+    [0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00], // 120 'x'
+    [0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F], // 121 'y'
+    [0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00], // 122 'z'
+    [0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00], // 123 '{'
+    [0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00], // 124 '|'
+    [0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00], // 125 '}'
+    [0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00], // 126 '~'
+];
 
 struct Window {
     active: bool,
@@ -68,6 +221,8 @@ struct Window {
     event_port: u64,  // port to send input/focus events to client
     granted_va: usize, // VA in client's address space
     z_order: u16,
+    title: [u8; 16],
+    title_len: u8,
 }
 
 impl Window {
@@ -78,6 +233,7 @@ impl Window {
             buf_va: 0, buf_pages: 0,
             owner_task: 0, event_port: 0,
             granted_va: 0, z_order: 0,
+            title: [0; 16], title_len: 0,
         }
     }
 }
@@ -96,6 +252,9 @@ struct Compositor {
     mouse_y: i32,
     flip_reply: u64,
     dirty: bool,
+    dragging: i8,    // -1 = not dragging, else window index
+    drag_off_x: i32, // offset from window origin to grab point
+    drag_off_y: i32,
 }
 
 fn print_num(n: u64) {
@@ -215,6 +374,9 @@ impl Compositor {
             mouse_y: (fb_h / 2) as i32,
             flip_reply: syscall::port_create(),
             dirty: false,
+            dragging: -1,
+            drag_off_x: 0,
+            drag_off_y: 0,
         }
     }
 
@@ -284,6 +446,17 @@ impl Compositor {
             return;
         }
 
+        // Generate default title "Window N".
+        let mut title = [0u8; 16];
+        let prefix = b"Window ";
+        let mut ti = 0;
+        while ti < prefix.len() {
+            title[ti] = prefix[ti];
+            ti += 1;
+        }
+        title[ti] = b'0' + (slot as u8);
+        let title_len = (ti + 1) as u8;
+
         self.windows[slot] = Window {
             active: true,
             x, y,
@@ -294,6 +467,8 @@ impl Compositor {
             event_port,
             granted_va: dst_va,
             z_order: self.next_z,
+            title,
+            title_len,
         };
         self.next_z += 1;
         self.focus = slot as i8;
@@ -393,15 +568,15 @@ impl Compositor {
         }
     }
 
-    /// Draw a border around a window.
+    /// Draw a border around a window (including title bar area).
     fn draw_border(&self, win: &Window, color: u32) {
         let fb = self.fb_va as *mut u32;
         let stride = self.fb_pitch as usize / 4;
         let bw = BORDER_WIDTH;
 
-        // Border extends outside the window content area.
+        // Border extends around content + title bar.
         let bx0 = win.x - bw;
-        let by0 = win.y - bw;
+        let by0 = win.y - TITLEBAR_H - bw;
         let bx1 = win.x + win.w as i32 + bw;
         let by1 = win.y + win.h as i32 + bw;
 
@@ -409,15 +584,91 @@ impl Compositor {
             if sy < 0 || sy >= self.fb_h as i32 { continue; }
             for sx in bx0..bx1 {
                 if sx < 0 || sx >= self.fb_w as i32 { continue; }
-                // Only draw if in the border region (not the content area).
+                // Only draw if in the border region (not content or titlebar).
                 let in_content = sx >= win.x && sx < win.x + win.w as i32
                     && sy >= win.y && sy < win.y + win.h as i32;
-                if !in_content {
+                let in_titlebar = sx >= win.x && sx < win.x + win.w as i32
+                    && sy >= win.y - TITLEBAR_H && sy < win.y;
+                if !in_content && !in_titlebar {
                     unsafe {
                         ptr::write_volatile(
                             fb.add(sy as usize * stride + sx as usize),
                             color,
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draw title bar above a window.
+    fn draw_titlebar(&self, win: &Window, focused: bool) {
+        let fb = self.fb_va as *mut u32;
+        let stride = self.fb_pitch as usize / 4;
+        let bg = if focused { TITLEBAR_FOCUSED_BG } else { TITLEBAR_BG };
+
+        // Title bar region: win.x .. win.x+win.w, win.y-TITLEBAR_H .. win.y
+        for sy in (win.y - TITLEBAR_H)..win.y {
+            if sy < 0 || sy >= self.fb_h as i32 { continue; }
+            for sx in win.x..(win.x + win.w as i32) {
+                if sx < 0 || sx >= self.fb_w as i32 { continue; }
+                unsafe {
+                    ptr::write_volatile(fb.add(sy as usize * stride + sx as usize), bg);
+                }
+            }
+        }
+
+        // Draw title text centered vertically in title bar.
+        let text_y = win.y - TITLEBAR_H + (TITLEBAR_H - 8) / 2;
+        let text_x = win.x + 4; // small left padding
+        self.draw_text(text_x, text_y, &win.title[..win.title_len as usize], TITLEBAR_TEXT_COLOR);
+    }
+
+    /// Draw text using the embedded 8x8 font.
+    fn draw_text(&self, x: i32, y: i32, text: &[u8], color: u32) {
+        let fb = self.fb_va as *mut u32;
+        let stride = self.fb_pitch as usize / 4;
+
+        for (i, &ch) in text.iter().enumerate() {
+            let gx = x + (i as i32) * 8;
+            let glyph_idx = if ch >= 32 && ch <= 126 { (ch - 32) as usize } else { 0 };
+            let glyph = &FONT_8X8[glyph_idx];
+
+            for row in 0..8 {
+                let sy = y + row as i32;
+                if sy < 0 || sy >= self.fb_h as i32 { continue; }
+                let bits = glyph[row];
+                for col in 0..8 {
+                    let sx = gx + col as i32;
+                    if sx < 0 || sx >= self.fb_w as i32 { continue; }
+                    if bits & (0x80 >> col) != 0 {
+                        unsafe {
+                            ptr::write_volatile(fb.add(sy as usize * stride + sx as usize), color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draw the software mouse cursor on the framebuffer.
+    fn draw_cursor(&self) {
+        let fb = self.fb_va as *mut u32;
+        let stride = self.fb_pitch as usize / 4;
+
+        for cy in 0..CURSOR_H {
+            let sy = self.mouse_y + cy as i32;
+            if sy < 0 || sy >= self.fb_h as i32 { continue; }
+            let mask_bits = CURSOR_MASK[cy];
+            let fill_bits = CURSOR_FILL[cy];
+            for cx in 0..CURSOR_W {
+                let sx = self.mouse_x + cx as i32;
+                if sx < 0 || sx >= self.fb_w as i32 { continue; }
+                let bit = 1u16 << (CURSOR_W - 1 - cx);
+                if mask_bits & bit != 0 {
+                    let color = if fill_bits & bit != 0 { 0x00FFFFFFu32 } else { 0x00000000u32 };
+                    unsafe {
+                        ptr::write_volatile(fb.add(sy as usize * stride + sx as usize), color);
                     }
                 }
             }
@@ -477,14 +728,19 @@ impl Compositor {
         for i in 0..count {
             let idx = order[i] as usize;
             let win = &self.windows[idx];
-            let border_color = if self.focus == idx as i8 {
+            let focused = self.focus == idx as i8;
+            let border_color = if focused {
                 BORDER_FOCUSED_COLOR
             } else {
                 BORDER_COLOR
             };
             self.draw_border(win, border_color);
+            self.draw_titlebar(win, focused);
             self.blit_window(win);
         }
+
+        // Draw mouse cursor on top of everything.
+        self.draw_cursor();
     }
 
     /// Send FB_FLIP to fb_srv.
@@ -516,10 +772,48 @@ impl Compositor {
                 self.mouse_y = (self.mouse_y + dy as i32)
                     .max(0)
                     .min(self.fb_h as i32 - 1);
+                self.dirty = true;
+
+                // Update drag position if dragging.
+                if self.dragging >= 0 {
+                    let idx = self.dragging as usize;
+                    if idx < MAX_WINDOWS && self.windows[idx].active {
+                        self.windows[idx].x = self.mouse_x - self.drag_off_x;
+                        self.windows[idx].y = self.mouse_y - self.drag_off_y;
+                    }
+                }
             }
             EVENT_MOUSE_BUTTON => {
-                // Click-to-focus: find topmost window under cursor.
-                self.handle_click();
+                let left_pressed = extra & 1 != 0;
+                if left_pressed {
+                    // Check if click is in a title bar → start drag.
+                    let mut drag_target: i8 = -1;
+                    let mut best_z: u16 = 0;
+                    for i in 0..MAX_WINDOWS {
+                        let win = &self.windows[i];
+                        if !win.active { continue; }
+                        if self.mouse_x >= win.x && self.mouse_x < win.x + win.w as i32
+                            && self.mouse_y >= win.y - TITLEBAR_H && self.mouse_y < win.y
+                        {
+                            if drag_target == -1 || win.z_order > best_z {
+                                drag_target = i as i8;
+                                best_z = win.z_order;
+                            }
+                        }
+                    }
+                    if drag_target >= 0 {
+                        self.dragging = drag_target;
+                        let win = &self.windows[drag_target as usize];
+                        self.drag_off_x = self.mouse_x - win.x;
+                        self.drag_off_y = self.mouse_y - win.y;
+                    }
+
+                    // Click-to-focus (title bar or content).
+                    self.handle_click();
+                } else {
+                    // Button release → end drag.
+                    self.dragging = -1;
+                }
             }
             _ => {}
         }
@@ -534,19 +828,19 @@ impl Compositor {
         }
     }
 
-    /// Click-to-focus: find topmost window under mouse cursor.
+    /// Click-to-focus: find topmost window under mouse cursor (content or title bar).
     fn handle_click(&mut self) {
         let mx = self.mouse_x;
         let my = self.mouse_y;
 
-        // Find window with highest z_order that contains (mx, my).
+        // Find window with highest z_order that contains (mx, my) in content or title bar.
         let mut best: i8 = -1;
         let mut best_z: u16 = 0;
         for i in 0..MAX_WINDOWS {
             let win = &self.windows[i];
             if !win.active { continue; }
             if mx >= win.x && mx < win.x + win.w as i32
-                && my >= win.y && my < win.y + win.h as i32
+                && my >= win.y - TITLEBAR_H && my < win.y + win.h as i32
             {
                 if best == -1 || win.z_order > best_z {
                     best = i as i8;

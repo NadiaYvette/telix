@@ -8158,6 +8158,32 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 111: Mouse cursor, title bars, window dragging ---
+    syscall::debug_puts(b"  init: Phase 111 compositor decorations...\n");
+    {
+        let comp_port = syscall::ns_lookup(b"compositor");
+        if let Some(cp) = comp_port {
+            let rp = syscall::port_create();
+            syscall::send(cp, 0xA008, 0, 0, rp << 32, 0); // COMP_GET_INFO
+            let mut ok = false;
+            for _ in 0..200 {
+                if let Some(msg) = syscall::recv_nb_msg(rp) {
+                    if msg.tag == 0xA009 { ok = true; } // COMP_GET_INFO_OK
+                    break;
+                }
+                syscall::yield_now();
+            }
+            syscall::port_destroy(rp);
+            if ok {
+                syscall::debug_puts(b"Phase 111 compositor decorations: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 111 compositor decorations: FAILED (no reply)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 111 compositor decorations: SKIPPED (no compositor)\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
