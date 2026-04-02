@@ -8,9 +8,9 @@
 
 ## 1. Overview and Goals
 
-This document describes the design of Telix, a ground-up operating system kernel whose primary architectural contributions lie in two areas: a coremap-free virtual memory subsystem built around configurable page clustering, and a network-unified I/O architecture that eliminates the impedance mismatch between synchronous Unix VFS conventions and asynchronous I/O. The name derives from Latin *tela* (web, fabric, the warp on a loom), evoking the message-passing fabric that weaves the kernel's components together.
+This document describes the design of Telix, a ground-up operating system kernel whose primary architectural contributions lie in two areas: a virtual memory subsystem with sublinear reserved memory footprint built around configurable page clustering, and a network-unified I/O architecture that eliminates the impedance mismatch between synchronous Unix VFS conventions and asynchronous I/O. The name derives from Latin *tela* (web, fabric, the warp on a loom), evoking the message-passing fabric that weaves the kernel's components together.
 
-The kernel's virtual memory subsystem eliminates the traditional coremap (per-physical-frame metadata array) in favour of extent-based data structures. Physical memory is managed at a configurable allocation page size (`PAGE_SIZE`), a compile-time or boot-time chosen multiple of the hardware MMU page size (`MMUPAGE_SIZE`). This guarantees that superpage sizes at or below `PAGE_SIZE` succeed unconditionally by construction, while dramatically improving the probability of assembling superpages above `PAGE_SIZE` by reducing the number of contiguous pieces required.
+The kernel's virtual memory subsystem eliminates the traditional per-page `struct page` array (also known as the PFN database or resident page table) in favour of extent-based data structures. Physical memory is managed at a configurable allocation page size (`PAGE_SIZE`), a compile-time or boot-time chosen multiple of the hardware MMU page size (`MMUPAGE_SIZE`). This guarantees that superpage sizes at or below `PAGE_SIZE` succeed unconditionally by construction, while dramatically improving the probability of assembling superpages above `PAGE_SIZE` by reducing the number of contiguous pieces required.
 
 The I/O architecture treats all I/O — file, block, and device — as asynchronous message-passing to endpoints, analogous to a network protocol. This eliminates the fundamental tension in legacy kernels where a synchronous Unix VFS call stack must be retrofitted for asynchronous operation, avoiding the engineering burden and architectural compromises seen in facilities such as Linux's `io_uring` worker thread fallback.
 
@@ -70,19 +70,19 @@ Page clustering bridges this gap in two ways. First, by guaranteeing subpage sup
 
 > **Novelty assessment:** Novel combination. McKusick–Dickins page clustering applied to guarantee Navarro-style subpage superpage sizes and improve superpage assembly. Not previously published in this specific form; the closest prior work is Linux multi-size THP (6.8), which attacks the same gap from the allocator side rather than by construction.
 
-### 4.3. Coremap-Free VM Architecture
+### 4.3. VM Architecture with Sublinear Reserved Memory Footprint
 
-Traditional BSD and Linux kernels maintain a *coremap*: a flat array indexed by physical page frame number containing per-page metadata (reference counts, flags, reverse mapping back-pointers, LRU list linkage, page cache membership). In Linux, this is the `struct page` array (partially superseded by `struct folio`). This design document describes an architecture that eliminates the coremap entirely.
+Traditional BSD and Linux kernels maintain a per-page metadata array: a flat array indexed by physical page frame number (PFN) containing per-page metadata (reference counts, flags, reverse mapping back-pointers, LRU list linkage, page cache membership). In Linux, this is the `struct page` array (partially superseded by `struct folio`), also known as the PFN database or resident page table. This design document describes an architecture that eliminates this per-page array entirely.
 
 #### 4.3.1. Motivations
 
-**Historical:** On large-memory 32-bit systems, the coremap overran kernel virtual address space — a direct and fatal scaling limitation. While 64-bit systems have abundant virtual space, the remaining problems are not resolved by the address space expansion.
+**Historical:** On large-memory 32-bit systems, the per-page struct array overran kernel virtual address space — a direct and fatal scaling limitation. While 64-bit systems have abundant virtual space, the remaining problems are not resolved by the address space expansion.
 
 **Cache footprint:** Traversing millions of per-page structures during reclaim, migration, or writeback pollutes the data cache with metadata that has poor spatial locality relative to the operations being performed.
 
 **LRU list pathology:** Traditional LRU reclaim walks linked lists threaded through per-page structures in effectively random physical memory order, resulting in catastrophic cache line and TLB utilisation during scans.
 
-**Algorithmic incompatibility:** The coremap is an inherently pointwise data structure. It represents per-frame state and can only be iterated frame by frame. Modern memory management increasingly needs to reason about *extents* — contiguous physical ranges with uniform properties. Operations like superpage promotion, contiguity assessment, memory tiering decisions, and range-based writeback are naturally extent-oriented. A coremap forces pointwise iteration over what should be a single range query or update, imposing ceilings on algorithmic efficiency that cannot be overcome by coarsening granularity alone.
+**Algorithmic incompatibility:** The per-page struct array is an inherently pointwise data structure. It represents per-frame state and can only be iterated frame by frame. Modern memory management increasingly needs to reason about *extents* — contiguous physical ranges with uniform properties. Operations like superpage promotion, contiguity assessment, memory tiering decisions, and range-based writeback are naturally extent-oriented. A per-page array forces pointwise iteration over what should be a single range query or update, imposing ceilings on algorithmic efficiency that cannot be overcome by coarsening granularity alone.
 
 #### 4.3.2. Extent-Based Metadata Structures
 
@@ -296,7 +296,7 @@ The I/O and VM subsystems are coupled through two primary mechanisms:
 
 **Zero-copy memory grants:** The cache server's grant/map of page cache allocation pages into client address spaces means that page cache memory appears in client page tables, participates in page table sharing, and is visible to WSCLOCK reclaim. The VM subsystem's reclaim decisions and the cache server's caching decisions must be coordinated: when the VM reclaims a page cache page, the cache server must be notified (or must be the entity that initiated reclaim); when the cache server evicts a cached page, client mappings must be torn down via the object-based reverse mapping path.
 
-**Cache server as VM participant:** The cache server is a privileged server with a close relationship to the kernel's physical memory allocator. It requests allocation pages from the allocator, manages their contents (tail packing, caching, writeback scheduling), and releases them under memory pressure. It is, in effect, the primary consumer of the physical memory allocator outside of anonymous memory allocation for processes. The extent-based metadata structures that replace the coremap (§4.3.2) must be accessible to the cache server, either through shared memory or through a kernel interface that the cache server uses as a privileged client.
+**Cache server as VM participant:** The cache server is a privileged server with a close relationship to the kernel's physical memory allocator. It requests allocation pages from the allocator, manages their contents (tail packing, caching, writeback scheduling), and releases them under memory pressure. It is, in effect, the primary consumer of the physical memory allocator outside of anonymous memory allocation for processes. The extent-based metadata structures that replace the per-page struct array (§4.3.2) must be accessible to the cache server, either through shared memory or through a kernel interface that the cache server uses as a privileged client.
 
 > **Design status:** Open question: the precise interface between the cache server and the kernel's physical memory allocator requires detailed design. Whether the cache server operates as a true userspace server with kernel-mediated memory allocation, or as a quasi-kernel component with direct allocator access, is an architectural decision with significant implications for fault isolation and complexity.
 
@@ -518,9 +518,9 @@ At the end of Phase 1, the kernel can create tasks, send and receive messages, a
 
 #### 8.3.2. Phase 2: VM Subsystem Novelties
 
-The VM subsystem is developed to the point where the novel contributions can be demonstrated: extent-based metadata replacing the coremap, configurable `PAGE_SIZE` with subpage superpage guarantees, incremental page zeroing, and WSCLOCK reclaim. The VM subsystem is more self-contained than the I/O architecture and can be tested with synthetic memory allocation and access workloads without requiring a full server stack.
+The VM subsystem is developed to the point where the novel contributions can be demonstrated: extent-based metadata replacing the per-page struct array, configurable `PAGE_SIZE` with subpage superpage guarantees, incremental page zeroing, and WSCLOCK reclaim. The VM subsystem is more self-contained than the I/O architecture and can be tested with synthetic memory allocation and access workloads without requiring a full server stack.
 
-At the end of Phase 2, the system can demonstrate: superpage allocation success rates at various `PAGE_SIZE` configurations, TLB miss rates under controlled workloads, the extent-based metadata operating correctly (coalescing, splitting, range queries), and WSCLOCK reclaim functioning without a coremap.
+At the end of Phase 2, the system can demonstrate: superpage allocation success rates at various `PAGE_SIZE` configurations, TLB miss rates under controlled workloads, the extent-based metadata operating correctly (coalescing, splitting, range queries), and WSCLOCK reclaim functioning without a per-page struct array.
 
 #### 8.3.3. Phase 3: I/O Server Stack
 
@@ -566,9 +566,9 @@ A ground-up kernel design involves significant architectural risk. Several desig
 
 ### 9.2. Coremap-Free VM: Hybrid Extent/Flat Metadata
 
-**Risk:** Extent fragmentation under adversarial or pathological workloads causes the extent tree to degenerate toward one entry per physical page, losing the efficiency advantage and adding tree traversal overhead on top of what a flat coremap would cost.
+**Risk:** Extent fragmentation under adversarial or pathological workloads causes the extent tree to degenerate toward one entry per physical page, losing the efficiency advantage and adding tree traversal overhead on top of what a flat per-page struct array would cost.
 
-**Retrenchment:** Introduce a hybrid scheme: use a flat per-page array (coremap) for physical regions where extent coalescing consistently fails, while retaining extent-based tracking for regions where it works well. This can be partitioned per zone or per NUMA node — heavily fragmented zones fall back to coremap metadata while well-coalesced zones continue to benefit from extent-based structures. The extent-based path remains the default; the coremap is a localised fallback, not a wholesale reversion.
+**Retrenchment:** Introduce a hybrid scheme: use a flat per-page struct array for physical regions where extent coalescing consistently fails, while retaining extent-based tracking for regions where it works well. This can be partitioned per zone or per NUMA node — heavily fragmented zones fall back to per-page metadata while well-coalesced zones continue to benefit from extent-based structures. The extent-based path remains the default; the per-page array is a localised fallback, not a wholesale reversion.
 
 ### 9.3. Microkernel IPC Overhead: Server Co-location
 
@@ -608,7 +608,7 @@ The primary evaluation goal is to demonstrate that the kernel's novel mechanisms
 
 **TLB miss rates:** Measure TLB miss rates (via hardware performance counters where available, or via instrumentation under emulation) to verify that superpage usage translates into the expected TLB efficiency improvement.
 
-**Extent metadata efficiency:** Measure the number of extent entries versus the equivalent number of coremap entries for representative physical memory states. Demonstrate that the extent-based representation is compact for typical workloads and characterise the workloads that cause degeneration.
+**Extent metadata efficiency:** Measure the number of extent entries versus the equivalent number of per-page struct array entries for representative physical memory states. Demonstrate that the extent-based representation is compact for typical workloads and characterise the workloads that cause degeneration.
 
 **Asynchronous I/O path:** Demonstrate that I/O operations complete asynchronously through the message-passing path without worker thread fallbacks. Measure I/O completion latency distribution and verify the absence of the tail-latency pathologies caused by synchronous-to-async conversion in conventional kernels.
 
@@ -646,7 +646,7 @@ The message-passing I/O architecture (§5) already abstracts I/O endpoints in a 
 
 The capability model (§7) provides a natural mechanism for distributed resource naming: capabilities can refer to remote objects if the kernel's capability resolution can be extended to span nodes.
 
-The extent-based VM metadata (§4.3) could potentially describe remote memory (CXL-attached, RDMA-accessible) alongside local memory, enabling transparent remote memory access at the VM level without a coremap's assumption of a single flat physical address space.
+The extent-based VM metadata (§4.3) could potentially describe remote memory (CXL-attached, RDMA-accessible) alongside local memory, enabling transparent remote memory access at the VM level without the per-page struct array's assumption of a single flat physical address space.
 
 A prudent approach would not attempt full SSI but would identify specific SSI capabilities (transparent remote IPC, remote memory mapping, process migration for specific resource types) that can be added incrementally without the all-or-nothing coherence burden that killed earlier SSI projects. This is an explicitly long-term goal.
 

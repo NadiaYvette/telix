@@ -1,6 +1,6 @@
 //! B+ tree of physical memory extents.
 //!
-//! Replaces the traditional coremap (per-frame metadata array) with an
+//! Replaces the traditional per-page struct array (PFN database) with an
 //! extent-based data structure. Each entry describes a contiguous range of
 //! physical memory with uniform properties.
 //!
