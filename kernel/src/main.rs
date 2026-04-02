@@ -189,6 +189,13 @@ fn startup_thread() -> ! {
                 None => println!("  WARNING: net_srv not found (ok if not yet built)"),
             }
         }
+        // Probe BochsVBE (QEMU -vga std) and set up framebuffer info.
+        arch::x86_64::pci::probe_bochs_vbe();
+        // Spawn fb_srv: arg0=0 means no virtio-gpu, use VBE fallback.
+        match sched::spawn_user(b"fb_srv", 50, 20, 0) {
+            Some(tid) => println!("  fb_srv spawned (thread {})", tid),
+            None => println!("  WARNING: fb_srv not found (ok if not yet built)"),
+        }
     }
 
     // MIPS64 Malta: Discover virtio devices via GT-64120 PCI bus scan.

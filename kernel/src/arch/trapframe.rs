@@ -59,7 +59,7 @@ pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x0a00_0000, 0x0a01_0000);
 #[cfg(target_arch = "riscv64")]
 pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x1000_0000, 0x1001_0000);
 #[cfg(target_arch = "x86_64")]
-pub const DEVICE_MMIO_RANGE: (usize, usize) = (0, 0);
+pub const DEVICE_MMIO_RANGE: (usize, usize) = (0xC000_0000, 0x1_0000_0000);
 #[cfg(target_arch = "loongarch64")]
 pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x1800_0000, 0x8000_0000); // PCI I/O window + MEM region
 #[cfg(target_arch = "mips64")]
@@ -85,8 +85,9 @@ pub fn device_pte_flags() -> u64 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        0
-    } // unreachable — DEVICE_MMIO_RANGE is (0,0)
+        // Present | Read/Write | User | Write-Through (for framebuffer/MMIO).
+        0x01 | 0x02 | 0x04 | 0x08
+    }
     #[cfg(target_arch = "loongarch64")]
     {
         // Uncached device memory: MAT=0 (SUC), valid, dirty, user-accessible.

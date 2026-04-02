@@ -28,11 +28,22 @@ QEMU_ARGS=(
     -machine q35
     -cpu qemu64
     -m 256M
-    -nographic
-    -serial mon:stdio
     -kernel "$KERNEL32"
     -smp 4
 )
+
+# Display mode: TELIX_DISPLAY=gpu|vbe (default: none/nographic).
+case "${TELIX_DISPLAY:-}" in
+    gpu)
+        QEMU_ARGS+=(-device virtio-gpu-pci -display gtk -serial mon:stdio)
+        ;;
+    vbe)
+        QEMU_ARGS+=(-vga std -display gtk -serial mon:stdio)
+        ;;
+    *)
+        QEMU_ARGS+=(-nographic -serial mon:stdio)
+        ;;
+esac
 
 # Pass kernel command line if TELIX_CMDLINE is set.
 if [ -n "${TELIX_CMDLINE:-}" ]; then

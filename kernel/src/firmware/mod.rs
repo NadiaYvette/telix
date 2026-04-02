@@ -57,6 +57,25 @@ pub struct VirtioMmioDesc {
     pub _pad: u32,
 }
 
+/// Framebuffer info from bootloader (Multiboot VBE, UEFI GOP, etc.).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct FramebufferInfo {
+    /// Physical address of the linear framebuffer.
+    pub addr: u64,
+    /// Bytes per scanline.
+    pub pitch: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Bits per pixel (typically 32).
+    pub bpp: u8,
+    /// Framebuffer type (1 = direct RGB).
+    pub fb_type: u8,
+    pub _pad: [u8; 2],
+}
+
 /// Interrupt controller info (stored for future use).
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -130,6 +149,13 @@ struct IrqCtrlCell(UnsafeCell<IrqControllerInfo>);
 // SAFETY: same single-writer (BSP) / post-boot-read pattern as FwArray.
 unsafe impl Sync for IrqCtrlCell {}
 
+struct FbCell(UnsafeCell<FramebufferInfo>);
+unsafe impl Sync for FbCell {}
+static FB_INFO: FbCell = FbCell(UnsafeCell::new(FramebufferInfo {
+    addr: 0, pitch: 0, width: 0, height: 0, bpp: 0, fb_type: 0, _pad: [0; 2],
+}));
+static FB_INFO_SET: AtomicU32 = AtomicU32::new(0);
+
 static IRQ_CTRL: IrqCtrlCell = IrqCtrlCell(UnsafeCell::new(IrqControllerInfo {
     kind: 0,
     _pad: 0,
@@ -174,6 +200,15 @@ pub fn irq_controller() -> IrqControllerInfo {
     }
 }
 
+/// Framebuffer info from bootloader (if available).
+pub fn framebuffer_info() -> Option<FramebufferInfo> {
+    if FB_INFO_SET.load(Ordering::Acquire) != 0 {
+        Some(unsafe { *FB_INFO.0.get() })
+    } else {
+        None
+    }
+}
+
 /// RISC-V timebase frequency from DTB (0 if not set).
 #[allow(dead_code)]
 pub fn timebase_freq() -> u64 {
@@ -202,6 +237,13 @@ pub(crate) fn set_irq_controller(info: IrqControllerInfo) {
         *IRQ_CTRL.0.get() = info;
     }
     IRQ_CTRL_SET.store(1, Ordering::Release);
+}
+
+pub(crate) fn set_framebuffer(info: FramebufferInfo) {
+    unsafe {
+        *FB_INFO.0.get() = info;
+    }
+    FB_INFO_SET.store(1, Ordering::Release);
 }
 
 #[allow(dead_code)]

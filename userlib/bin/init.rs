@@ -7971,6 +7971,43 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // ============================================================
+    // --- Phase 107: Framebuffer display ---
+    // Query the fb name server to verify the framebuffer server is running.
+    syscall::debug_puts(b"  init: Phase 107 framebuffer...\n");
+    {
+        let fb_port = syscall::ns_lookup(b"fb");
+        if let Some(fb_port) = fb_port {
+            // Query framebuffer info via IPC.
+            let reply_port = syscall::port_create();
+            // FB_GET_INFO = 0x8000, reply_port goes in data[2] upper 32 bits.
+            syscall::send(fb_port, 0x8000, 0, 0, reply_port << 32, 0);
+            let mut got_info = false;
+            for _ in 0..100 {
+                if let Some(msg) = syscall::recv_nb_msg(reply_port) {
+                    if msg.tag == 0x8001 {
+                        let w = msg.data[0] as u32;
+                        let h = (msg.data[0] >> 32) as u32;
+                        syscall::debug_puts(b"Phase 107 framebuffer: PASSED (fb: ");
+                        print_num(w as u64);
+                        syscall::debug_puts(b"x");
+                        print_num(h as u64);
+                        syscall::debug_puts(b")\n");
+                        got_info = true;
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+            syscall::port_destroy(reply_port);
+            if !got_info {
+                syscall::debug_puts(b"Phase 107 framebuffer: FAILED (no response)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 107 framebuffer: SKIPPED (no fb server)\n");
+        }
+    }
+
+    // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {

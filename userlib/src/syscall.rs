@@ -63,6 +63,7 @@ const SYS_PERSONALITY_SET: u64 = 105;
 const SYS_PERSONALITY_GET: u64 = 106;
 const SYS_PERSONALITY_REPLY: u64 = 107;
 const SYS_PERSONALITY_READ_ARGS: u64 = 108;
+const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Register a personality server for a given personality ID.
 /// Only root (euid 0) can call this.
@@ -652,6 +653,21 @@ pub fn ns_lookup(name: &[u8]) -> Option<u64> {
     };
     port_destroy(reply_port);
     result
+}
+
+/// Query the bootloader-provided framebuffer info.
+/// Returns None if no framebuffer is available.
+/// On success: (addr, width, height, pitch, bpp).
+pub fn framebuffer_info() -> Option<(u64, u32, u32, u32, u8)> {
+    let (addr, wh, pb) = unsafe { arch::syscall0_3ret(SYS_FRAMEBUFFER_INFO) };
+    if addr == u64::MAX {
+        return None;
+    }
+    let width = wh as u32;
+    let height = (wh >> 32) as u32;
+    let pitch = pb as u32;
+    let bpp = (pb >> 32) as u8;
+    Some((addr, width, height, pitch, bpp))
 }
 
 /// Map device MMIO registers into userspace. Returns VA or None.

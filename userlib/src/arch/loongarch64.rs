@@ -23,6 +23,23 @@ pub unsafe fn syscall0(nr: u64) -> u64 {
 }
 
 #[inline(never)]
+pub unsafe fn syscall0_3ret(nr: u64) -> (u64, u64, u64) {
+    let ret: u64;
+    let r1: u64;
+    let r2: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall 0",
+            in("$r11") nr,
+            lateout("$r4") ret,
+            lateout("$r5") r1,
+            lateout("$r6") r2,
+        );
+    }
+    (ret, r1, r2)
+}
+
+#[inline(never)]
 pub unsafe fn syscall1(nr: u64, a0: u64) -> u64 {
     let ret: u64;
     unsafe {

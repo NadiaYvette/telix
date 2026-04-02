@@ -115,6 +115,7 @@ pub const SYS_PERSONALITY_SET: u64 = 105;
 pub const SYS_PERSONALITY_GET: u64 = 106;
 pub const SYS_PERSONALITY_REPLY: u64 = 107;
 pub const SYS_PERSONALITY_READ_ARGS: u64 = 108;
+pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -412,6 +413,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_PERSONALITY_READ_ARGS => {
             crate::syscall::personality::personality_read_args(a0, frame)
         }
+        SYS_FRAMEBUFFER_INFO => sys_framebuffer_info(frame),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -1197,7 +1199,7 @@ fn sys_nsrv_port() -> u64 {
 fn sys_mmap_device(phys_addr: u64, page_count: u64) -> u64 {
     let phys = phys_addr as usize;
     let pages = page_count as usize;
-    if pages == 0 || pages > 16 {
+    if pages == 0 || pages > 4096 {
         return u64::MAX;
     }
 
@@ -3301,4 +3303,20 @@ fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
         t.sig_altstack_size = new_size;
     }
     0
+}
+
+/// Return bootloader-provided framebuffer info.
+/// Returns addr as primary result. Packs width|height into reg1, pitch|bpp into reg2.
+/// Returns u64::MAX if no framebuffer.
+fn sys_framebuffer_info(frame: &mut ExceptionFrame) -> u64 {
+    match crate::firmware::framebuffer_info() {
+        Some(fb) => {
+            let wh = (fb.width as u64) | ((fb.height as u64) << 32);
+            let pb = (fb.pitch as u64) | ((fb.bpp as u64) << 32);
+            crate::arch::trapframe::set_reg(frame, 1, wh);
+            crate::arch::trapframe::set_reg(frame, 2, pb);
+            fb.addr
+        }
+        None => u64::MAX,
+    }
 }
