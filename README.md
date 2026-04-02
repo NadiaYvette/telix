@@ -4,11 +4,30 @@ A from-scratch microkernel operating system written in Rust, targeting five 64-b
 
 ## What is Telix?
 
-Telix (from Latin *tela*, web/fabric) is a capability-based microkernel inspired by L4/seL4 and Mach. It is a research and portfolio project exploring two architectural ideas:
+Telix (from Latin *tela*, web/fabric) is a capability-based microkernel inspired by L4/seL4 and Mach. It is primarily a vehicle for demonstrating a virtual memory technique and secondarily an exploration of network-unified I/O.
 
-- **Coremap-free virtual memory with configurable page clustering.** Telix uses extent-based VM management (B+ trees of intervals) instead of the traditional per-page coremap array. The allocation page size is a configurable multiple of the hardware 4 KiB MMU page, with subpage superpages constructed by composing contiguous MMU pages.
+### Page Clustering for Superpaging
 
-- **Network-unified asynchronous I/O.** All I/O is message-passing: filesystem drivers, device drivers, and network services are userspace servers communicating via L4-style synchronous IPC. There is no synchronous VFS call stack in the kernel. This maps naturally to both local and remote operation.
+Telix's central research contribution is **page clustering** — using [Babaoğlu-Joy](https://doi.org/10.1145/800217.806663) large kernel allocation pages (a configurable multiple of the hardware MMU page) to enable [Navarro-Iyer-Druschel-Cox](https://www.usenix.org/legacy/events/osdi02/tech/full_papers/navarro/navarro.pdf) superpage promotion. This solves two problems:
+
+1. **Eliminating external fragmentation for small superpages.** When the kernel allocation unit is larger than the MMU page, superpages up to the allocation unit size are guaranteed to succeed whenever memory is available at all — failures are due to exhaustion, not fragmentation. For example, MIPS with a 1 KiB minimum TLB mapping granularity and a 256 KiB kernel allocation unit guarantees that 4 KiB, 16 KiB, 64 KiB, and 256 KiB superpage allocations cannot fail due to fragmentation.
+
+2. **Reducing the assembly ratio for larger superpages.** The *assembly ratio* is the number of contiguous, aligned pieces of one size needed to construct a single piece of a larger size. Without page clustering, bridging from the MMU page to the first hardware superpage size can require assembling hundreds of pages. Page clustering dramatically reduces this:
+
+   | Configuration | Assembly ratio to 2 MiB superpage |
+   |--------------|----------------------------------|
+   | x86 4 KiB pages (no clustering) | 512 |
+   | 64 KiB kernel allocation unit | 32 |
+   | 128 KiB kernel allocation unit | 16 |
+   | 256 KiB kernel allocation unit | 8 |
+
+A correct implementation of page clustering is **strictly ABI-compatible** with kernels that do not distinguish between the MMU page size and the kernel allocation unit — userspace observes no difference in behavior, only in TLB efficiency. Telix enforces this: the `mmap` interface, page protection granularity, and fault behavior are all defined in terms of the MMU page size, not the kernel allocation unit.
+
+The VM subsystem itself is coremap-free, using extent-based management (B+ trees of intervals) instead of the traditional per-page `struct page` / coremap array.
+
+### Network-Unified Asynchronous I/O
+
+All I/O is message-passing: filesystem drivers, device drivers, and network services are userspace servers communicating via L4-style synchronous IPC. There is no synchronous VFS call stack in the kernel. This maps naturally to both local and remote operation.
 
 ## Architecture
 
