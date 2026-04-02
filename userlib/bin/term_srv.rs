@@ -46,6 +46,24 @@ const FG_COLOR: u32 = 0x00C0C0C0; // light gray
 const BG_COLOR: u32 = 0x00000000; // black
 const CURSOR_COLOR: u32 = 0x00808080; // gray cursor block
 
+// Standard ANSI 16-color palette (8 normal + 8 bright).
+#[rustfmt::skip]
+const ANSI_COLORS: [u32; 16] = [
+    0x00000000, 0x00AA0000, 0x0000AA00, 0x00AA5500, // black, red, green, yellow
+    0x000000AA, 0x00AA00AA, 0x0000AAAA, 0x00AAAAAA, // blue, magenta, cyan, white
+    0x00555555, 0x00FF5555, 0x0055FF55, 0x00FFFF55, // bright: black, red, green, yellow
+    0x005555FF, 0x00FF55FF, 0x0055FFFF, 0x00FFFFFF, // bright: blue, magenta, cyan, white
+];
+
+#[derive(Copy, Clone)]
+struct Cell {
+    ch: u8,
+    fg: u32,
+    bg: u32,
+}
+
+const DEFAULT_CELL: Cell = Cell { ch: b' ', fg: FG_COLOR, bg: BG_COLOR };
+
 // Desired VA for compositor window buffer grant.
 const TERM_BUF_VA: usize = 0x7_0000_0000;
 
@@ -161,14 +179,77 @@ struct Terminal {
     pty_reply: u64,
     master_h: u32,
 
-    cells: [[u8; TERM_COLS]; TERM_ROWS],
+    cells: [[Cell; TERM_COLS]; TERM_ROWS],
     cursor_col: usize,
     cursor_row: usize,
     dirty: bool,
+
+    // Current text attributes (applied to new characters).
+    cur_fg: u32,
+    cur_bg: u32,
+    bold: bool,
+
+    // ANSI escape sequence parser state.
+    esc_state: u8,          // 0=Normal, 1=ESC seen, 2=CSI collecting
+    esc_params: [u16; 8],
+    esc_param_count: u8,
+    esc_intermediate: u8,   // '?' for DEC private sequences
+
+    // Saved cursor position.
+    saved_col: usize,
+    saved_row: usize,
 }
 
 impl Terminal {
     fn put_char(&mut self, ch: u8) {
+        match self.esc_state {
+            1 => {
+                // ESC seen — waiting for '[' or other.
+                if ch == b'[' {
+                    self.esc_state = 2;
+                    self.esc_params = [0; 8];
+                    self.esc_param_count = 0;
+                    self.esc_intermediate = 0;
+                } else {
+                    self.esc_state = 0; // unrecognized, reset
+                }
+                return;
+            }
+            2 => {
+                // CSI: collecting parameters.
+                if ch >= b'0' && ch <= b'9' {
+                    let idx = self.esc_param_count as usize;
+                    if idx < 8 {
+                        self.esc_params[idx] = self.esc_params[idx]
+                            .wrapping_mul(10)
+                            .wrapping_add((ch - b'0') as u16);
+                    }
+                } else if ch == b';' {
+                    if self.esc_param_count < 7 {
+                        self.esc_param_count += 1;
+                    }
+                } else if ch == b'?' {
+                    self.esc_intermediate = b'?';
+                } else if ch >= 0x40 && ch <= 0x7E {
+                    // Final byte — dispatch command.
+                    let count = self.esc_param_count as usize + 1;
+                    self.dispatch_csi(ch, count);
+                    self.esc_state = 0;
+                } else {
+                    self.esc_state = 0; // unexpected, reset
+                }
+                self.dirty = true;
+                return;
+            }
+            _ => {}
+        }
+
+        // Normal mode.
+        if ch == 0x1B {
+            self.esc_state = 1;
+            return;
+        }
+
         match ch {
             b'\n' => {
                 self.cursor_col = 0;
@@ -182,25 +263,26 @@ impl Terminal {
                 self.cursor_col = 0;
             }
             0x08 => {
-                // Backspace.
                 if self.cursor_col > 0 {
                     self.cursor_col -= 1;
                 }
             }
             0x7F => {
-                // DEL — treat as backspace + clear.
                 if self.cursor_col > 0 {
                     self.cursor_col -= 1;
-                    self.cells[self.cursor_row][self.cursor_col] = b' ';
+                    self.cells[self.cursor_row][self.cursor_col] = DEFAULT_CELL;
                 }
             }
             0x09 => {
-                // Tab — advance to next 8-column boundary.
                 let next = (self.cursor_col + 8) & !7;
                 self.cursor_col = if next < TERM_COLS { next } else { TERM_COLS - 1 };
             }
             ch if ch >= 32 && ch < 127 => {
-                self.cells[self.cursor_row][self.cursor_col] = ch;
+                self.cells[self.cursor_row][self.cursor_col] = Cell {
+                    ch,
+                    fg: self.cur_fg,
+                    bg: self.cur_bg,
+                };
                 self.cursor_col += 1;
                 if self.cursor_col >= TERM_COLS {
                     self.cursor_col = 0;
@@ -211,33 +293,197 @@ impl Terminal {
                     }
                 }
             }
-            _ => {} // ignore other control chars
+            _ => {}
         }
         self.dirty = true;
+    }
+
+    fn dispatch_csi(&mut self, cmd: u8, count: usize) {
+        let p0 = self.esc_params[0] as usize;
+        let p1 = if count > 1 { self.esc_params[1] as usize } else { 0 };
+
+        match cmd {
+            b'A' => { // CUU — cursor up
+                let n = if p0 == 0 { 1 } else { p0 };
+                self.cursor_row = self.cursor_row.saturating_sub(n);
+            }
+            b'B' => { // CUD — cursor down
+                let n = if p0 == 0 { 1 } else { p0 };
+                self.cursor_row = (self.cursor_row + n).min(TERM_ROWS - 1);
+            }
+            b'C' => { // CUF — cursor forward
+                let n = if p0 == 0 { 1 } else { p0 };
+                self.cursor_col = (self.cursor_col + n).min(TERM_COLS - 1);
+            }
+            b'D' => { // CUB — cursor back
+                let n = if p0 == 0 { 1 } else { p0 };
+                self.cursor_col = self.cursor_col.saturating_sub(n);
+            }
+            b'H' | b'f' => { // CUP — cursor position (1-based)
+                let row = if p0 == 0 { 1 } else { p0 };
+                let col = if p1 == 0 { 1 } else { p1 };
+                self.cursor_row = (row - 1).min(TERM_ROWS - 1);
+                self.cursor_col = (col - 1).min(TERM_COLS - 1);
+            }
+            b'J' => { // ED — erase display
+                self.erase_display(p0);
+            }
+            b'K' => { // EL — erase line
+                self.erase_line(p0);
+            }
+            b'm' => { // SGR — set graphic rendition
+                self.handle_sgr(count);
+            }
+            b's' => { // SCP — save cursor position
+                self.saved_col = self.cursor_col;
+                self.saved_row = self.cursor_row;
+            }
+            b'u' => { // RCP — restore cursor position
+                self.cursor_col = self.saved_col.min(TERM_COLS - 1);
+                self.cursor_row = self.saved_row.min(TERM_ROWS - 1);
+            }
+            b'h' | b'l' => {
+                // DEC private modes (CSI ? n h/l) — ignore silently.
+            }
+            _ => {} // unrecognized
+        }
+    }
+
+    fn handle_sgr(&mut self, count: usize) {
+        if count == 1 && self.esc_params[0] == 0 {
+            // CSI m with no params → reset.
+            self.cur_fg = FG_COLOR;
+            self.cur_bg = BG_COLOR;
+            self.bold = false;
+            return;
+        }
+        let mut i = 0;
+        while i < count {
+            let p = self.esc_params[i] as usize;
+            match p {
+                0 => {
+                    self.cur_fg = FG_COLOR;
+                    self.cur_bg = BG_COLOR;
+                    self.bold = false;
+                }
+                1 => {
+                    self.bold = true;
+                    // If current fg is a basic ANSI color, upgrade to bright.
+                    for c in 0..8 {
+                        if self.cur_fg == ANSI_COLORS[c] {
+                            self.cur_fg = ANSI_COLORS[c + 8];
+                            break;
+                        }
+                    }
+                }
+                22 => {
+                    self.bold = false;
+                }
+                30..=37 => {
+                    let idx = p - 30;
+                    self.cur_fg = if self.bold { ANSI_COLORS[idx + 8] } else { ANSI_COLORS[idx] };
+                }
+                39 => {
+                    self.cur_fg = FG_COLOR;
+                }
+                40..=47 => {
+                    self.cur_bg = ANSI_COLORS[p - 40];
+                }
+                49 => {
+                    self.cur_bg = BG_COLOR;
+                }
+                90..=97 => {
+                    self.cur_fg = ANSI_COLORS[p - 90 + 8];
+                }
+                100..=107 => {
+                    self.cur_bg = ANSI_COLORS[p - 100 + 8];
+                }
+                _ => {} // unrecognized SGR param
+            }
+            i += 1;
+        }
+    }
+
+    fn erase_display(&mut self, mode: usize) {
+        let blank = Cell { ch: b' ', fg: self.cur_fg, bg: self.cur_bg };
+        match mode {
+            0 => {
+                // Erase from cursor to end.
+                for col in self.cursor_col..TERM_COLS {
+                    self.cells[self.cursor_row][col] = blank;
+                }
+                for row in (self.cursor_row + 1)..TERM_ROWS {
+                    for col in 0..TERM_COLS {
+                        self.cells[row][col] = blank;
+                    }
+                }
+            }
+            1 => {
+                // Erase from start to cursor.
+                for row in 0..self.cursor_row {
+                    for col in 0..TERM_COLS {
+                        self.cells[row][col] = blank;
+                    }
+                }
+                for col in 0..=self.cursor_col.min(TERM_COLS - 1) {
+                    self.cells[self.cursor_row][col] = blank;
+                }
+            }
+            2 | 3 => {
+                // Erase entire display.
+                for row in 0..TERM_ROWS {
+                    for col in 0..TERM_COLS {
+                        self.cells[row][col] = blank;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn erase_line(&mut self, mode: usize) {
+        let blank = Cell { ch: b' ', fg: self.cur_fg, bg: self.cur_bg };
+        match mode {
+            0 => {
+                for col in self.cursor_col..TERM_COLS {
+                    self.cells[self.cursor_row][col] = blank;
+                }
+            }
+            1 => {
+                for col in 0..=self.cursor_col.min(TERM_COLS - 1) {
+                    self.cells[self.cursor_row][col] = blank;
+                }
+            }
+            2 => {
+                for col in 0..TERM_COLS {
+                    self.cells[self.cursor_row][col] = blank;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn scroll_up(&mut self) {
         for row in 1..TERM_ROWS {
             self.cells[row - 1] = self.cells[row];
         }
-        self.cells[TERM_ROWS - 1] = [b' '; TERM_COLS];
+        self.cells[TERM_ROWS - 1] = [DEFAULT_CELL; TERM_COLS];
     }
 
     fn render(&self) {
         let fb = self.buf_va as *mut u32;
         for row in 0..TERM_ROWS {
             for col in 0..TERM_COLS {
-                let ch = self.cells[row][col];
-                let glyph_idx = if ch >= 32 && ch <= 126 {
-                    (ch - 32) as usize
+                let cell = &self.cells[row][col];
+                let glyph_idx = if cell.ch >= 32 && cell.ch <= 126 {
+                    (cell.ch - 32) as usize
                 } else {
-                    0 // space for unprintable
+                    0
                 };
                 let glyph = &FONT_8X8[glyph_idx];
                 let base_x = col * 8;
                 let base_y = row * 8;
 
-                // Is this the cursor cell?
                 let is_cursor = row == self.cursor_row && col == self.cursor_col;
 
                 for gy in 0..8 {
@@ -245,9 +491,9 @@ impl Terminal {
                     for gx in 0..8 {
                         let on = (bits >> (7 - gx)) & 1 != 0;
                         let color = if is_cursor {
-                            if on { BG_COLOR } else { CURSOR_COLOR }
+                            if on { cell.bg } else { CURSOR_COLOR }
                         } else {
-                            if on { FG_COLOR } else { BG_COLOR }
+                            if on { cell.fg } else { cell.bg }
                         };
                         let px = base_x + gx;
                         let py = base_y + gy;
@@ -471,10 +717,19 @@ pub extern "C" fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         pty_port,
         pty_reply,
         master_h,
-        cells: [[b' '; TERM_COLS]; TERM_ROWS],
+        cells: [[DEFAULT_CELL; TERM_COLS]; TERM_ROWS],
         cursor_col: 0,
         cursor_row: 0,
         dirty: true,
+        cur_fg: FG_COLOR,
+        cur_bg: BG_COLOR,
+        bold: false,
+        esc_state: 0,
+        esc_params: [0; 8],
+        esc_param_count: 0,
+        esc_intermediate: 0,
+        saved_col: 0,
+        saved_row: 0,
     };
 
     // Initial render (blank screen with cursor).

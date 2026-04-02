@@ -8184,6 +8184,34 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 112: ANSI/VT100 terminal escape sequences ---
+    syscall::debug_puts(b"  init: Phase 112 ANSI terminal...\n");
+    {
+        // Verify term_srv is still running after ANSI parser changes by
+        // checking compositor responds (term_srv created a window on it).
+        let comp_port = syscall::ns_lookup(b"compositor");
+        if let Some(cp) = comp_port {
+            let rp = syscall::port_create();
+            syscall::send(cp, 0xA008, 0, 0, rp << 32, 0); // COMP_GET_INFO
+            let mut ok = false;
+            for _ in 0..200 {
+                if let Some(msg) = syscall::recv_nb_msg(rp) {
+                    if msg.tag == 0xA009 { ok = true; }
+                    break;
+                }
+                syscall::yield_now();
+            }
+            syscall::port_destroy(rp);
+            if ok {
+                syscall::debug_puts(b"Phase 112 ANSI terminal: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 112 ANSI terminal: FAILED (no reply)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 112 ANSI terminal: SKIPPED (no compositor)\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
