@@ -146,3 +146,7 @@ path = "bin/sysv_srv.rs"
 [[bin]]
 name = "proxy_srv"
 path = "bin/proxy_srv.rs"
+
+[[bin]]
+name = "linux_srv"
+path = "bin/linux_srv.rs"

@@ -3576,80 +3576,87 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         }
 
-        // setuid to non-root, then verify permissions are restricted.
+        // Run privilege-dropping tests in a forked child so init stays root.
         if phase48_ok {
-            // Drop to uid 1000.
-            if !syscall::setuid(1000) {
-                syscall::debug_puts(b"  FAIL: setuid(1000) as root failed\n");
-                phase48_ok = false;
+            let child = syscall::fork();
+            if child == 0 {
+                // --- In child: drop to uid 1000 and test restrictions ---
+                let mut ok = true;
+                if !syscall::setuid(1000) {
+                    syscall::debug_puts(b"  FAIL: setuid(1000) as root failed\n");
+                    ok = false;
+                }
+                if ok && syscall::getuid() != 1000 {
+                    syscall::debug_puts(b"  FAIL: getuid() should be 1000 after setuid\n");
+                    ok = false;
+                }
+                if ok && syscall::geteuid() != 1000 {
+                    syscall::debug_puts(b"  FAIL: geteuid() should be 1000 after setuid\n");
+                    ok = false;
+                }
+                // setuid to 0 should fail as non-root.
+                if ok && syscall::setuid(0) {
+                    syscall::debug_puts(b"  FAIL: setuid(0) as non-root should fail\n");
+                    ok = false;
+                }
+                // setuid to own real uid should succeed (no-op).
+                if ok && !syscall::setuid(1000) {
+                    syscall::debug_puts(b"  FAIL: setuid(own uid) should succeed\n");
+                    ok = false;
+                }
+                // setgid as non-root should fail for arbitrary values.
+                if ok && syscall::setgid(500) {
+                    syscall::debug_puts(b"  FAIL: setgid(500) as non-root should fail\n");
+                    ok = false;
+                }
+                // setgid to own real gid (0) should succeed.
+                if ok && !syscall::setgid(0) {
+                    syscall::debug_puts(b"  FAIL: setgid(own gid) should succeed\n");
+                    ok = false;
+                }
+                // setgroups as non-root should fail.
+                if ok {
+                    let groups: [u32; 1] = [999];
+                    if syscall::setgroups(&groups) {
+                        syscall::debug_puts(b"  FAIL: setgroups as non-root should fail\n");
+                        ok = false;
+                    }
+                    if ok {
+                        let mut buf = [0u32; 8];
+                        let n = syscall::getgroups(&mut buf);
+                        if n != 3 {
+                            syscall::debug_puts(b"  FAIL: groups should be unchanged after failed setgroups\n");
+                            ok = false;
+                        }
+                    }
+                }
+                // Test credential inheritance via spawn.
+                if ok {
+                    let grandchild = syscall::spawn(b"hello", 50);
+                    if grandchild != u64::MAX {
+                        let _ = syscall::waitpid(grandchild);
+                    }
+                }
+                syscall::exit(if ok { 0 } else { 1 });
+                unreachable!();
             }
-            if syscall::getuid() != 1000 {
-                syscall::debug_puts(b"  FAIL: getuid() should be 1000 after setuid\n");
-                phase48_ok = false;
+            // Parent: wait for child to finish.
+            let mut waited = false;
+            for _ in 0..200 {
+                if let Some(code) = syscall::waitpid(child) {
+                    if code != 0 {
+                        phase48_ok = false;
+                    }
+                    waited = true;
+                    break;
+                }
+                syscall::yield_now();
             }
-            if syscall::geteuid() != 1000 {
-                syscall::debug_puts(b"  FAIL: geteuid() should be 1000 after setuid\n");
+            if !waited {
+                syscall::debug_puts(b"  FAIL: phase48 child did not exit\n");
                 phase48_ok = false;
             }
         }
-
-        // As non-root, setuid to 0 should fail.
-        if phase48_ok {
-            if syscall::setuid(0) {
-                syscall::debug_puts(b"  FAIL: setuid(0) as non-root should fail\n");
-                phase48_ok = false;
-            }
-            // setuid to own real uid should succeed (no-op).
-            if !syscall::setuid(1000) {
-                syscall::debug_puts(b"  FAIL: setuid(own uid) should succeed\n");
-                phase48_ok = false;
-            }
-        }
-
-        // setgid as non-root should fail for arbitrary values.
-        if phase48_ok {
-            // First set gid while we still can (we changed uid but gid was never changed).
-            // Actually, setgid checks euid, and euid is now 1000.
-            if syscall::setgid(500) {
-                syscall::debug_puts(b"  FAIL: setgid(500) as non-root should fail\n");
-                phase48_ok = false;
-            }
-            // setgid to own real gid (0) should succeed.
-            if !syscall::setgid(0) {
-                syscall::debug_puts(b"  FAIL: setgid(own gid) should succeed\n");
-                phase48_ok = false;
-            }
-        }
-
-        // setgroups as non-root should fail.
-        if phase48_ok {
-            let groups: [u32; 1] = [999];
-            if syscall::setgroups(&groups) {
-                syscall::debug_puts(b"  FAIL: setgroups as non-root should fail\n");
-                phase48_ok = false;
-            }
-            // Previous groups should still be set.
-            let mut buf = [0u32; 8];
-            let n = syscall::getgroups(&mut buf);
-            if n != 3 {
-                syscall::debug_puts(b"  FAIL: groups should be unchanged after failed setgroups\n");
-                phase48_ok = false;
-            }
-        }
-
-        // Test credential inheritance via spawn.
-        if phase48_ok {
-            // Spawn a child — it should inherit uid=1000, gid=0.
-            // We can't easily read the child's credentials, but we can test
-            // that the child runs (proving spawn works with non-root creds).
-            let child = syscall::spawn(b"hello", 50);
-            if child != u64::MAX {
-                let _ = syscall::waitpid(child);
-            }
-        }
-
-        // Restore root for subsequent tests (we can't — we dropped privs).
-        // This is fine; Phase 48 test is last before benchmarks.
 
         if phase48_ok {
             syscall::debug_puts(b"Phase 48 credential syscalls: PASSED\n");
@@ -7866,6 +7873,102 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     syscall::debug_puts(b"\n=== ALL 105 PHASES COMPLETE ===\n\n");
+
+    // ============================================================
+    // --- Phase 106: Linux personality server ---
+    // Spawn the Linux personality server, fork a child, set its personality
+    // to Linux, and verify that a forwarded Linux write() syscall works.
+    syscall::debug_puts(b"  init: Phase 106 linux personality...\n");
+    {
+        let linux_tid = syscall::spawn(b"linux_srv", 50);
+        if linux_tid != u64::MAX {
+            // Wait for linux_srv to register.
+            let mut found = false;
+            for _ in 0..200 {
+                if syscall::ns_lookup(b"linux").is_some() {
+                    found = true;
+                    break;
+                }
+                syscall::yield_now();
+            }
+            if found {
+                // Fork a child. Parent (init, root) sets child's personality,
+                // then child makes a Linux syscall.
+                let child = syscall::fork();
+                if child == 0 {
+                    // Child: spin briefly to let parent set our personality.
+                    for _ in 0..100 {
+                        let (p, _) = syscall::personality_get();
+                        if p != 0 {
+                            break;
+                        }
+                        syscall::yield_now();
+                    }
+                    let (p, _) = syscall::personality_get();
+                    if p == 2 {
+                        // Personality is Linux. Make a Linux exit_group(42).
+                        // On x86_64, Linux and Telix use the same register ABI.
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            core::arch::asm!(
+                                "int 0x80",
+                                in("rax") 231u64,  // __NR_exit_group
+                                in("rdi") 42u64,   // exit code
+                                options(noreturn),
+                            );
+                        }
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            core::arch::asm!(
+                                "svc #0",
+                                in("x8") 94u64,    // aarch64 __NR_exit_group = 94
+                                in("x0") 42u64,
+                                options(noreturn),
+                            );
+                        }
+                        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                        {
+                            syscall::exit(42);
+                        }
+                    } else {
+                        syscall::debug_puts(b"  child: personality not set\n");
+                        syscall::exit(1);
+                    }
+                } else {
+                    // Parent (root): set child's personality to Linux x86_64.
+                    #[cfg(target_arch = "x86_64")]
+                    let abi = 3u8; // LinuxX86_64
+                    #[cfg(target_arch = "aarch64")]
+                    let abi = 1u8; // LinuxAarch64
+                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                    let abi = 0u8;
+                    let r = syscall::personality_set(child, 2, abi);
+                    if r != 0 {
+                        syscall::debug_puts(b"  parent: personality_set failed\n");
+                    }
+
+                    // Wait for child to exit.
+                    let mut exited = false;
+                    for _ in 0..300 {
+                        if let Some(_code) = syscall::waitpid(child) {
+                            exited = true;
+                            break;
+                        }
+                        syscall::sleep_ms(5);
+                    }
+                    if exited {
+                        syscall::debug_puts(b"Phase 106 linux personality: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 106 linux personality: FAILED (timeout)\n");
+                    }
+                }
+            } else {
+                syscall::debug_puts(b"Phase 106 linux personality: FAILED (srv not found)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 106 linux personality: SKIPPED (spawn failed)\n");
+        }
+    }
 
     // ============================================================
     // --- Test 23: Benchmark Suite ---

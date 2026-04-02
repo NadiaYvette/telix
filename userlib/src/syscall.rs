@@ -61,6 +61,8 @@ const SYS_PAGE_SIZE: u64 = 103;
 const SYS_PERSONALITY_REGISTER: u64 = 104;
 const SYS_PERSONALITY_SET: u64 = 105;
 const SYS_PERSONALITY_GET: u64 = 106;
+const SYS_PERSONALITY_REPLY: u64 = 107;
+const SYS_PERSONALITY_READ_ARGS: u64 = 108;
 
 /// Register a personality server for a given personality ID.
 /// Only root (euid 0) can call this.
@@ -79,6 +81,27 @@ pub fn personality_set(target_port: u64, personality: u8, abi: u8) -> u64 {
 pub fn personality_get() -> (u8, u8) {
     let r = unsafe { arch::syscall0(SYS_PERSONALITY_GET) };
     (r as u8, (r >> 8) as u8)
+}
+
+/// Reply to a forwarded personality syscall, unblocking the caller.
+/// Only callable by a registered personality server.
+/// target_task_port: the blocked task's port_id (from message data[4]).
+/// result: the return value to deliver to the blocked task.
+pub fn personality_reply(target_task_port: u64, result: u64) -> u64 {
+    unsafe { arch::syscall2(SYS_PERSONALITY_REPLY, target_task_port, result) }
+}
+
+/// Read args[4] and args[5] from a blocked personality-wait task.
+/// Only callable by a registered personality server.
+/// Returns (arg4, arg5).
+pub fn personality_read_args(target_task_port: u64) -> (u64, u64) {
+    let (r0, r1) = unsafe {
+        let r0 = arch::syscall1(SYS_PERSONALITY_READ_ARGS, target_task_port);
+        // arg5 is returned in the second register — we need syscall1_2ret.
+        // For now, just return r0 as arg4; arg5 support needs arch work.
+        (r0, 0)
+    };
+    (r0, r1)
 }
 
 /// Register a port as the network proxy endpoint for non-local sends.

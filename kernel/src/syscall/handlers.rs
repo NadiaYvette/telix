@@ -113,6 +113,8 @@ pub const SYS_PAGE_SIZE: u64 = 103;
 pub const SYS_PERSONALITY_REGISTER: u64 = 104;
 pub const SYS_PERSONALITY_SET: u64 = 105;
 pub const SYS_PERSONALITY_GET: u64 = 106;
+pub const SYS_PERSONALITY_REPLY: u64 = 107;
+pub const SYS_PERSONALITY_READ_ARGS: u64 = 108;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -177,7 +179,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
     // If this task has a non-native personality, forward the syscall to the
     // personality server — unless it's a personality management syscall which
     // is always handled natively.
-    if nr != SYS_PERSONALITY_REGISTER && nr != SYS_PERSONALITY_SET && nr != SYS_PERSONALITY_GET {
+    if nr != SYS_PERSONALITY_REGISTER && nr != SYS_PERSONALITY_SET && nr != SYS_PERSONALITY_GET
+        && nr != SYS_PERSONALITY_REPLY && nr != SYS_PERSONALITY_READ_ARGS {
         let tid = crate::sched::smp::current()
             .current_thread
             .load(core::sync::atomic::Ordering::Relaxed);
@@ -190,6 +193,10 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
             );
             crate::trace::trace_event(crate::trace::EVT_SYSCALL_EXIT, nr as u32, result as u32);
             set_return(frame, result);
+            // Check if killed while blocked in the personality server.
+            if crate::sched::scheduler::is_killed(tid) {
+                crate::sched::scheduler::exit_current_thread(-9);
+            }
             return;
         }
     }
@@ -399,6 +406,12 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
             crate::syscall::personality::set_personality(a0, a1 as u8, a2 as u8)
         }
         SYS_PERSONALITY_GET => sys_personality_get(),
+        SYS_PERSONALITY_REPLY => {
+            crate::syscall::personality::personality_reply(a0, a1)
+        }
+        SYS_PERSONALITY_READ_ARGS => {
+            crate::syscall::personality::personality_read_args(a0, frame)
+        }
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error

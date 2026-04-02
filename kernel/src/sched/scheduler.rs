@@ -955,6 +955,11 @@ fn finalize_spawn(
     task.sa_pending.store(false, core::sync::atomic::Ordering::Relaxed);
     task.sa_event.store(0, core::sync::atomic::Ordering::Relaxed);
     task.sa_waiter.store(u32::MAX, core::sync::atomic::Ordering::Relaxed);
+    // Spawned processes always start with native personality (not inherited).
+    // Fork inherits personality; spawn does not.
+    task.personality = super::task::PersonalityId::TelixNative;
+    task.syscall_abi = super::task::SyscallAbi::TelixNative;
+    task.personality_port = 0;
 
     let thread = unsafe { thread_mut_from_ref(thread_id) };
     thread.killed.store(false, Ordering::Release);
@@ -2399,6 +2404,23 @@ pub fn kill_other_threads_in_task() -> usize {
     // Safe: only the current task's last thread calls this (execve).
     unsafe { task_mut_from_ref(task_id) }.thread_count = 1;
     killed
+}
+
+/// Find a thread in the given task that is blocked on PersonalityWait.
+/// Returns the ThreadId, or u32::MAX if none found.
+pub fn find_personality_waiter(task_id: u32) -> ThreadId {
+    use super::thread::BlockReason;
+    let mut found: ThreadId = u32::MAX;
+    SCHED_THREAD_ART.for_each(|_key, val| {
+        if found != u32::MAX {
+            return;
+        }
+        let t = unsafe { &*(val as *const Thread) };
+        if t.task_id == task_id && t.blocked_on == BlockReason::PersonalityWait {
+            found = t.id;
+        }
+    });
+    found
 }
 
 /// Update the task's page table root after execve replaces the address space.

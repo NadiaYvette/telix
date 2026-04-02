@@ -105,7 +105,12 @@ pub fn set_personality(target_port: u64, personality_id: u8, abi_id: u8) -> u64 
     } else {
         match crate::sched::task_id_from_port(target_port) {
             Some(id) => id,
-            None => return u64::MAX,
+            None => {
+                match crate::sched::task_id_from_any_port(target_port) {
+                    Some(id) => id,
+                    None => return u64::MAX,
+                }
+            }
         }
     };
 
@@ -127,25 +132,195 @@ pub fn set_personality(target_port: u64, personality_id: u8, abi_id: u8) -> u64 
     }
 
     // Apply personality.
+    let srv = server_port(personality);
     let task = unsafe { crate::sched::scheduler::task_mut_from_ref(task_id) };
     task.personality = personality;
     task.syscall_abi = abi;
-    task.personality_port = server_port(personality);
+    task.personality_port = srv;
     0
 }
 
 /// Forward a foreign syscall to the personality server via IPC.
 ///
-/// Packages nr + 6 args into a message, sends to the personality server port,
-/// parks the calling thread, and returns the reply.
+/// Packages nr + args into a message, sends to the personality server port,
+/// blocks the calling thread, and returns the reply set by SYS_PERSONALITY_REPLY.
 ///
-/// TODO: Implement send-and-receive-reply IPC pattern for personality forwarding.
-/// For now returns ENOSYS — no foreign personalities are active yet.
+/// Message format:
+///   tag     = foreign syscall number
+///   data[0] = args[0]
+///   data[1] = args[1]
+///   data[2] = args[2]
+///   data[3] = args[3]
+///   data[4] = caller's task port_id (stamped here, NOT by port::send)
+///   data[5] = overwritten with sender priority by port::send internals
+///
+/// args[4-5] are available to the personality server via SYS_PERSONALITY_READ_ARGS.
 pub fn forward_to_server(
-    _personality_port: u64,
+    personality_port: u64,
     nr: u64,
-    _args: [u64; 6],
+    args: [u64; 6],
 ) -> u64 {
-    crate::println!("personality: foreign syscall nr={} — not yet implemented", nr);
-    u64::MAX // ENOSYS
+    use crate::ipc::message::Message;
+    use crate::sched::thread::BlockReason;
+
+    if personality_port == 0 {
+        return u64::MAX;
+    }
+
+    // Identify the calling thread/task.
+    let tid = crate::sched::current_thread_id();
+    let task_id = crate::sched::scheduler::thread_ref(tid).task_id;
+    let caller_port = crate::sched::scheduler::task_ref(task_id).port_id;
+
+    // Build the forwarded message.
+    let msg = Message {
+        tag: nr,
+        data: [args[0], args[1], args[2], args[3], caller_port, 0],
+    };
+
+    // Clear the result field and set blocked_on before sending, so the
+    // personality server can find us even if it replies before we block.
+    {
+        let tref = crate::sched::scheduler::thread_ref(tid);
+        tref.personality_result.store(u64::MAX, Ordering::Release);
+        tref.wakeup.store(false, Ordering::Release);
+    }
+    // Safety: single writer (current thread setting its own state).
+    unsafe {
+        crate::sched::scheduler::thread_mut_from_ref(tid).blocked_on =
+            BlockReason::PersonalityWait;
+    }
+
+    // Send to the personality server.
+    if crate::ipc::port::send(personality_port, msg).is_err() {
+        unsafe {
+            crate::sched::scheduler::thread_mut_from_ref(tid).blocked_on =
+                BlockReason::None;
+        }
+        return u64::MAX;
+    }
+
+    // Block until the personality server calls SYS_PERSONALITY_REPLY.
+    crate::sched::block_current(BlockReason::PersonalityWait);
+
+    // Clear blocked_on now that we're awake.
+    unsafe {
+        crate::sched::scheduler::thread_mut_from_ref(tid).blocked_on =
+            BlockReason::None;
+    }
+
+    // Read the result deposited by personality_reply().
+    crate::sched::scheduler::thread_ref(tid)
+        .personality_result
+        .load(Ordering::Acquire)
+}
+
+/// Reply to a forwarded personality syscall, unblocking the caller.
+///
+/// Called by the personality server via SYS_PERSONALITY_REPLY.
+/// `target_task_port` identifies the blocked task; `result` is the return value.
+pub fn personality_reply(target_task_port: u64, result: u64) -> u64 {
+    // Permission check: caller must be the registered personality server.
+    let caller_task_id = {
+        let tid = crate::sched::smp::current()
+            .current_thread
+            .load(Ordering::Relaxed);
+        crate::sched::scheduler::thread_ref(tid).task_id
+    };
+    let caller_port = crate::sched::scheduler::task_ref(caller_task_id).port_id;
+
+    // Check that caller is a registered personality server.
+    let mut is_server = false;
+    for i in 1..SERVERS.len() {
+        if SERVERS[i].port.load(Ordering::Acquire) == caller_port {
+            is_server = true;
+            break;
+        }
+    }
+    if !is_server {
+        let caller_euid = crate::sched::scheduler::task_ref(caller_task_id).euid;
+        if caller_euid != 0 {
+            return u64::MAX;
+        }
+    }
+
+    // Find the target task.
+    let target_task_id = match crate::sched::task_id_from_port(target_task_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    // Find a thread in the target task that is blocked on PersonalityWait.
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return u64::MAX;
+    }
+
+    // Deliver the result and wake.
+    crate::sched::scheduler::thread_ref(target_tid)
+        .personality_result
+        .store(result, Ordering::Release);
+    crate::sched::wake_thread(target_tid);
+    0
+}
+
+/// Read args[4] and args[5] from a blocked personality-wait task's saved frame.
+///
+/// Returns (arg4, arg5) packed as: arg4 in the return register, arg5 in the
+/// second return register (arch-specific, delivered via frame).
+pub fn personality_read_args(
+    target_task_port: u64,
+    frame: &mut crate::arch::trapframe::ExceptionFrame,
+) -> u64 {
+    // Permission check (same as personality_reply).
+    let caller_task_id = {
+        let tid = crate::sched::smp::current()
+            .current_thread
+            .load(Ordering::Relaxed);
+        crate::sched::scheduler::thread_ref(tid).task_id
+    };
+    let caller_port = crate::sched::scheduler::task_ref(caller_task_id).port_id;
+
+    let mut is_server = false;
+    for i in 1..SERVERS.len() {
+        if SERVERS[i].port.load(Ordering::Acquire) == caller_port {
+            is_server = true;
+            break;
+        }
+    }
+    if !is_server {
+        let caller_euid = crate::sched::scheduler::task_ref(caller_task_id).euid;
+        if caller_euid != 0 {
+            return u64::MAX;
+        }
+    }
+
+    // Find the target task and its personality-waiting thread.
+    let target_task_id = match crate::sched::task_id_from_port(target_task_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return u64::MAX;
+    }
+
+    // Read args[4] and args[5] from the target's saved exception frame.
+    let target_sp = crate::sched::scheduler::thread_ref(target_tid).saved_sp;
+    if target_sp == 0 {
+        return u64::MAX;
+    }
+    let target_frame = unsafe { &*(target_sp as *const crate::arch::trapframe::ExceptionFrame) };
+    let arg4 = crate::arch::trapframe::syscall_arg(target_frame, 4);
+    let arg5 = crate::arch::trapframe::syscall_arg(target_frame, 5);
+
+    // Return arg4 as the primary return value, arg5 in the second register.
+    crate::arch::trapframe::set_reg(frame, 1, arg5);
+    arg4
+}
+
+/// Find a thread in `task_id` that is blocked on PersonalityWait.
+/// Returns the ThreadId, or u32::MAX if none found.
+fn find_personality_waiter(task_id: u32) -> u32 {
+    crate::sched::scheduler::find_personality_waiter(task_id)
 }

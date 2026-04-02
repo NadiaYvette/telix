@@ -27,6 +27,7 @@ pub enum BlockReason {
     PagerFault,
     PagerWait,
     WaitChild,
+    PersonalityWait,
 }
 
 // Thread ID capacity is determined by RadixTable::capacity() — no fixed constant needed.
@@ -106,6 +107,9 @@ pub struct Thread {
     pub ts_prev: core::sync::atomic::AtomicU32,
     /// Turnstile pointer we're currently blocked on (0 = not blocked).
     pub ts_blocked_on: core::sync::atomic::AtomicUsize,
+    // --- Personality forwarding ---
+    /// Result value from personality server reply (written by SYS_PERSONALITY_REPLY).
+    pub personality_result: core::sync::atomic::AtomicU64,
 }
 
 impl Thread {
@@ -149,6 +153,7 @@ impl Thread {
             ts_next: core::sync::atomic::AtomicU32::new(0),
             ts_prev: core::sync::atomic::AtomicU32::new(0),
             ts_blocked_on: core::sync::atomic::AtomicUsize::new(0),
+            personality_result: core::sync::atomic::AtomicU64::new(0),
         }
     }
 }
