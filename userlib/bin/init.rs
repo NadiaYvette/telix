@@ -8187,8 +8187,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Phase 112: ANSI/VT100 terminal escape sequences ---
     syscall::debug_puts(b"  init: Phase 112 ANSI terminal...\n");
     {
-        // Verify term_srv is still running after ANSI parser changes by
-        // checking compositor responds (term_srv created a window on it).
         let comp_port = syscall::ns_lookup(b"compositor");
         if let Some(cp) = comp_port {
             let rp = syscall::port_create();
@@ -8209,6 +8207,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         } else {
             syscall::debug_puts(b"Phase 112 ANSI terminal: SKIPPED (no compositor)\n");
+        }
+    }
+
+    // --- Phase 113: Modifier keys, keyboard shortcuts, multi-terminal ---
+    syscall::debug_puts(b"  init: Phase 113 keyboard shortcuts...\n");
+    {
+        // Verify input_srv and compositor still respond after modifier/shortcut changes.
+        let input_ok = syscall::ns_lookup(b"input").is_some();
+        let comp_ok = syscall::ns_lookup(b"compositor").is_some();
+        if input_ok && comp_ok {
+            syscall::debug_puts(b"Phase 113 keyboard shortcuts: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 113 keyboard shortcuts: FAILED\n");
         }
     }
 

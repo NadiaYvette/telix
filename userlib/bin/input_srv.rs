@@ -37,49 +37,73 @@ const PS2_STATUS_MOUSE_DATA: u8 = 0x20;
 
 // --- Scancode Set 1 to ASCII/keycode translation ---
 
-/// Translate scancode set 1 to (ascii, keycode).
-/// Returns (0, 0) for unknown/modifier-only keys.
-fn scancode_to_key(code: u8) -> (u8, u8) {
-    // Scancode set 1: make codes (key down). Break = make | 0x80.
-    static MAP: [u8; 128] = [
-        0, 27, // 0x00=none, 0x01=Esc
-        b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', // 0x02-0x0B
-        b'-', b'=', 8,   // 0x0C=-, 0x0D==, 0x0E=Backspace
-        b'\t',            // 0x0F=Tab
-        b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', // 0x10-0x19
-        b'[', b']', b'\n', // 0x1A=[, 0x1B=], 0x1C=Enter
-        0,                // 0x1D=LCtrl (modifier)
-        b'a', b's', b'd', b'f', b'g', b'h', b'j', b'k', b'l', // 0x1E-0x26
-        b';', b'\'', b'`', // 0x27=;, 0x28=', 0x29=`
-        0,                // 0x2A=LShift
-        b'\\',            // 0x2B=backslash
-        b'z', b'x', b'c', b'v', b'b', b'n', b'm', // 0x2C-0x32
-        b',', b'.', b'/', // 0x33=,, 0x34=., 0x35=/
-        0,                // 0x36=RShift
-        b'*',             // 0x37=KP*
-        0,                // 0x38=LAlt
-        b' ',             // 0x39=Space
-        0,                // 0x3A=CapsLock
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x3B-0x44=F1-F10
-        0, 0,             // 0x45=NumLock, 0x46=ScrollLock
-        b'7', b'8', b'9', b'-', // 0x47-0x4A=KP7,8,9,-
-        b'4', b'5', b'6', b'+', // 0x4B-0x4E=KP4,5,6,+
-        b'1', b'2', b'3',       // 0x4F-0x51=KP1,2,3
-        b'0', b'.',             // 0x52=KP0, 0x53=KP.
-        0, 0, 0,                // 0x54-0x56
-        0, 0,                   // 0x57=F11, 0x58=F12
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x59-0x68
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x69-0x78
-        0, 0, 0, 0, 0, 0, 0,    // 0x79-0x7F
-    ];
+/// Unshifted scancode set 1 to ASCII translation.
+#[rustfmt::skip]
+static KEY_MAP: [u8; 128] = [
+    0, 27, // 0x00=none, 0x01=Esc
+    b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', // 0x02-0x0B
+    b'-', b'=', 8,   // 0x0C=-, 0x0D==, 0x0E=Backspace
+    b'\t',            // 0x0F=Tab
+    b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', // 0x10-0x19
+    b'[', b']', b'\n', // 0x1A=[, 0x1B=], 0x1C=Enter
+    0,                // 0x1D=LCtrl
+    b'a', b's', b'd', b'f', b'g', b'h', b'j', b'k', b'l', // 0x1E-0x26
+    b';', b'\'', b'`', // 0x27=;, 0x28=', 0x29=`
+    0,                // 0x2A=LShift
+    b'\\',            // 0x2B=backslash
+    b'z', b'x', b'c', b'v', b'b', b'n', b'm', // 0x2C-0x32
+    b',', b'.', b'/', // 0x33=,, 0x34=., 0x35=/
+    0,                // 0x36=RShift
+    b'*',             // 0x37=KP*
+    0,                // 0x38=LAlt
+    b' ',             // 0x39=Space
+    0,                // 0x3A=CapsLock
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x3B-0x44=F1-F10
+    0, 0,             // 0x45=NumLock, 0x46=ScrollLock
+    b'7', b'8', b'9', b'-', // 0x47-0x4A=KP7,8,9,-
+    b'4', b'5', b'6', b'+', // 0x4B-0x4E=KP4,5,6,+
+    b'1', b'2', b'3',       // 0x4F-0x51=KP1,2,3
+    b'0', b'.',             // 0x52=KP0, 0x53=KP.
+    0, 0, 0,                // 0x54-0x56
+    0, 0,                   // 0x57=F11, 0x58=F12
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x59-0x68
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x69-0x78
+    0, 0, 0, 0, 0, 0, 0,    // 0x79-0x7F
+];
 
-    let make = code & 0x7F;
-    if (make as usize) < MAP.len() {
-        (MAP[make as usize], make)
-    } else {
-        (0, make)
-    }
-}
+/// Shifted scancode set 1 to ASCII translation.
+#[rustfmt::skip]
+static SHIFT_MAP: [u8; 128] = [
+    0, 27, // 0x00=none, 0x01=Esc
+    b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', // 0x02-0x0B
+    b'_', b'+', 8,   // 0x0C, 0x0D, 0x0E=Backspace
+    b'\t',            // 0x0F=Tab
+    b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', // 0x10-0x19
+    b'{', b'}', b'\n', // 0x1A, 0x1B, 0x1C=Enter
+    0,                // 0x1D=LCtrl
+    b'A', b'S', b'D', b'F', b'G', b'H', b'J', b'K', b'L', // 0x1E-0x26
+    b':', b'"', b'~', // 0x27, 0x28, 0x29
+    0,                // 0x2A=LShift
+    b'|',             // 0x2B
+    b'Z', b'X', b'C', b'V', b'B', b'N', b'M', // 0x2C-0x32
+    b'<', b'>', b'?', // 0x33, 0x34, 0x35
+    0,                // 0x36=RShift
+    b'*',             // 0x37=KP*
+    0,                // 0x38=LAlt
+    b' ',             // 0x39=Space
+    0,                // 0x3A=CapsLock
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x3B-0x44=F1-F10
+    0, 0,             // 0x45=NumLock, 0x46=ScrollLock
+    b'7', b'8', b'9', b'-', // 0x47-0x4A=KP7,8,9,-
+    b'4', b'5', b'6', b'+', // 0x4B-0x4E=KP4,5,6,+
+    b'1', b'2', b'3',       // 0x4F-0x51=KP1,2,3
+    b'0', b'.',             // 0x52=KP0, 0x53=KP.
+    0, 0, 0,                // 0x54-0x56
+    0, 0,                   // 0x57=F11, 0x58=F12
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x59-0x68
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x69-0x78
+    0, 0, 0, 0, 0, 0, 0,    // 0x79-0x7F
+];
 
 fn print_num(n: u64) {
     if n == 0 {
@@ -106,6 +130,12 @@ struct InputServer {
     // Mouse state for 3-byte PS/2 mouse packets.
     mouse_byte: u8,
     mouse_packet: [u8; 3],
+    prev_buttons: u8,
+    // Modifier key state.
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    caps: bool,
 }
 
 impl InputServer {
@@ -115,6 +145,11 @@ impl InputServer {
             num_subscribers: 0,
             mouse_byte: 0,
             mouse_packet: [0; 3],
+            prev_buttons: 0,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            caps: false,
         }
     }
 
@@ -144,22 +179,54 @@ impl InputServer {
     }
 
     /// Broadcast an input event to all subscribers.
+    /// d0 encoding: [0:8]=event_type [8:16]=keycode [16:24]=ascii [24]=shift [25]=ctrl [26]=alt [27]=caps
     fn broadcast(&self, event_type: u8, keycode: u8, ascii: u8, extra: u64) {
+        let mods = (self.shift as u64) << 24
+            | (self.ctrl as u64) << 25
+            | (self.alt as u64) << 26
+            | (self.caps as u64) << 27;
         let d0 = (event_type as u64)
             | ((keycode as u64) << 8)
-            | ((ascii as u64) << 16);
+            | ((ascii as u64) << 16)
+            | mods;
         for i in 0..self.num_subscribers {
             syscall::send(self.subscribers[i], INPUT_EVENT, d0, extra, 0, 0);
         }
     }
 
     /// Process a keyboard scancode.
-    fn handle_keyboard(&self, scancode: u8) {
+    fn handle_keyboard(&mut self, scancode: u8) {
         let is_release = scancode & 0x80 != 0;
-        let (ascii, keycode) = scancode_to_key(scancode);
+        let make = scancode & 0x7F;
+
+        // Update modifier state.
+        match make {
+            0x2A | 0x36 => { self.shift = !is_release; }  // LShift / RShift
+            0x1D => { self.ctrl = !is_release; }           // LCtrl
+            0x38 => { self.alt = !is_release; }            // LAlt
+            0x3A => { if !is_release { self.caps = !self.caps; } } // CapsLock toggle
+            _ => {}
+        }
+
+        // Look up ASCII from appropriate map.
+        let raw_ascii = if (make as usize) < 128 {
+            let use_shift = self.shift ^ self.caps;
+            if use_shift { SHIFT_MAP[make as usize] } else { KEY_MAP[make as usize] }
+        } else {
+            0
+        };
+
+        // Apply Ctrl: letter → control code (0x01-0x1A).
+        let ascii = if self.ctrl && raw_ascii >= b'a' && raw_ascii <= b'z' {
+            raw_ascii - b'a' + 1
+        } else if self.ctrl && raw_ascii >= b'A' && raw_ascii <= b'Z' {
+            raw_ascii - b'A' + 1
+        } else {
+            raw_ascii
+        };
 
         let event_type = if is_release { EVENT_KEY_UP } else { EVENT_KEY_DOWN };
-        self.broadcast(event_type, keycode, ascii, 0);
+        self.broadcast(event_type, make, ascii, 0);
     }
 
     /// Process a mouse data byte (PS/2 3-byte protocol).
@@ -185,9 +252,10 @@ impl InputServer {
             let extra = (dx as u16 as u64) | ((dy as u16 as u64) << 16);
             self.broadcast(EVENT_MOUSE_MOVE, 0, 0, extra);
         }
-        // Mouse button event.
-        if buttons != 0 {
-            self.broadcast(EVENT_MOUSE_BUTTON, buttons as u8, 0, 0);
+        // Mouse button event on state change — send current button state in extra.
+        if buttons != self.prev_buttons {
+            self.broadcast(EVENT_MOUSE_BUTTON, 0, 0, buttons as u64);
+            self.prev_buttons = buttons;
         }
     }
 }

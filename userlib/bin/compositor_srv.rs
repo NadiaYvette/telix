@@ -763,6 +763,25 @@ impl Compositor {
         let extra = msg.data[1];
 
         match event_type {
+            EVENT_KEY_DOWN => {
+                let keycode = ((d0 >> 8) & 0xFF) as u8;
+                let alt = (d0 >> 26) & 1 != 0;
+
+                if alt {
+                    match keycode {
+                        0x0F => { // Alt+Tab: cycle focus
+                            self.cycle_focus();
+                            self.dirty = true;
+                            return;
+                        }
+                        0x1C => { // Alt+Enter: spawn new terminal
+                            self.spawn_terminal();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             EVENT_MOUSE_MOVE => {
                 let dx = extra as u16 as i16;
                 let dy = (extra >> 16) as u16 as i16;
@@ -825,6 +844,41 @@ impl Compositor {
                 let abs = (self.mouse_x as u32 as u64) | ((self.mouse_y as u32 as u64) << 32);
                 syscall::send_nb_4(win.event_port, COMP_INPUT_EVENT, d0, extra, abs, 0);
             }
+        }
+    }
+
+    /// Cycle focus to next active window (Alt+Tab).
+    fn cycle_focus(&mut self) {
+        let start = if self.focus >= 0 { self.focus as usize } else { 0 };
+        for offset in 1..=MAX_WINDOWS {
+            let idx = (start + offset) % MAX_WINDOWS;
+            if self.windows[idx].active {
+                let old_focus = self.focus;
+                self.focus = idx as i8;
+                // Raise to top.
+                self.windows[idx].z_order = self.next_z;
+                self.next_z += 1;
+                // Send focus events.
+                if old_focus >= 0 && old_focus != idx as i8 {
+                    let old = &self.windows[old_focus as usize];
+                    if old.active && old.event_port != 0 {
+                        syscall::send_nb_4(old.event_port, COMP_FOCUS_EVENT, 0, 0, 0, 0);
+                    }
+                }
+                let new_win = &self.windows[idx];
+                if new_win.event_port != 0 {
+                    syscall::send_nb_4(new_win.event_port, COMP_FOCUS_EVENT, 1, 0, 0, 0);
+                }
+                return;
+            }
+        }
+    }
+
+    /// Spawn a new terminal emulator window (Alt+Enter).
+    fn spawn_terminal(&self) {
+        let tid = syscall::spawn(b"term_srv", 50);
+        if tid == u64::MAX {
+            syscall::debug_puts(b"  [compositor] spawn term_srv failed\n");
         }
     }
 
