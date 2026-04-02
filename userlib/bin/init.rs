@@ -8138,6 +8138,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 110: Graphical terminal emulator ---
+    syscall::debug_puts(b"  init: Phase 110 terminal emulator...\n");
+    {
+        let comp_ok = syscall::ns_lookup(b"compositor").is_some();
+        let pty_ok = syscall::ns_lookup(b"pty").is_some();
+
+        if comp_ok && pty_ok {
+            let term_tid = syscall::spawn(b"term_srv", 50);
+            if term_tid != u64::MAX {
+                // Give term_srv time to create window, open PTY, spawn shell.
+                syscall::sleep_ms(100);
+                syscall::debug_puts(b"Phase 110 terminal emulator: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 110 terminal emulator: FAILED (spawn)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 110 terminal emulator: SKIPPED (no compositor/pty)\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

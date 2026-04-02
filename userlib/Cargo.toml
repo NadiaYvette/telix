@@ -162,3 +162,7 @@ path = "bin/input_srv.rs"
 [[bin]]
 name = "compositor_srv"
 path = "bin/compositor_srv.rs"
+
+[[bin]]
+name = "term_srv"
+path = "bin/term_srv.rs"

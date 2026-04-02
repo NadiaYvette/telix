@@ -17,6 +17,16 @@ const CON_WRITE: u64 = 0x3100;
 #[allow(dead_code)]
 const CON_WRITE_OK: u64 = 0x3101;
 
+// PTY protocol.
+const PTY_WRITE: u64 = 0x9010;
+const PTY_WRITE_OK: u64 = 0x9011;
+const PTY_READ: u64 = 0x9020;
+const PTY_READ_OK: u64 = 0x9021;
+
+// I/O mode: 0 = console, 1 = PTY.
+static mut IO_MODE: u8 = 0;
+static mut PTY_HANDLE: u32 = 0;
+
 // Net protocol.
 const NET_STATUS: u64 = 0x4000;
 const NET_STATUS_OK: u64 = 0x4001;
@@ -66,43 +76,100 @@ fn print_num(n: u64) {
     }
 }
 
-/// Write bytes to console_srv. Chunks into 24-byte messages.
+/// Write bytes to console_srv or PTY. Chunks into 16-byte messages.
 fn con_puts(con_port: u64, reply_port: u64, msg: &[u8]) {
+    let mode = unsafe { IO_MODE };
     let mut offset = 0;
     while offset < msg.len() {
-        let chunk_len = (msg.len() - offset).min(16); // Use first 2 words (16 bytes) for simplicity
-        let mut w0 = 0u64;
-        let mut w1 = 0u64;
+        let chunk_len = (msg.len() - offset).min(16);
+        let mut b0 = [0u8; 8];
+        let mut b1 = [0u8; 8];
         for i in 0..chunk_len.min(8) {
-            w0 |= (msg[offset + i] as u64) << (i * 8);
+            b0[i] = msg[offset + i];
         }
         for i in 8..chunk_len.min(16) {
-            w1 |= (msg[offset + i] as u64) << ((i - 8) * 8);
+            b1[i - 8] = msg[offset + i];
         }
-        let d2 = (chunk_len as u64) | ((reply_port as u64) << 32);
-        syscall::send(con_port, CON_WRITE, w0, w1, d2, 0);
-        // Wait for CON_WRITE_OK.
-        let _ = syscall::recv_msg(reply_port);
+        let w0 = u64::from_le_bytes(b0);
+        let w1 = u64::from_le_bytes(b1);
+
+        if mode == 1 {
+            // PTY mode: write to slave handle.
+            let handle = unsafe { PTY_HANDLE } as u64;
+            let d2 = (chunk_len as u64) | (reply_port << 32);
+            syscall::send(con_port, PTY_WRITE, handle, w0, d2, w1);
+            let _ = syscall::recv_msg(reply_port);
+        } else {
+            // Console mode.
+            let d2 = (chunk_len as u64) | (reply_port << 32);
+            syscall::send(con_port, CON_WRITE, w0, w1, d2, 0);
+            let _ = syscall::recv_msg(reply_port);
+        }
         offset += chunk_len;
     }
 }
 
-/// Read a line from console_srv. Returns length.
+/// Read a line from console_srv or PTY. Returns length.
 fn con_readline(con_port: u64, reply_port: u64, buf: &mut [u8; 64]) -> usize {
-    let d0 = 64u64 | ((reply_port as u64) << 32);
-    syscall::send(con_port, CON_READ, d0, 0, 0, 0);
+    let mode = unsafe { IO_MODE };
 
-    if let Some(msg) = syscall::recv_msg(reply_port) {
-        if msg.tag == CON_READ_OK {
-            let len = (msg.data[0] as usize).min(24).min(64);
-            let words = [msg.data[1], msg.data[2], msg.data[3]];
-            for i in 0..len {
-                buf[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
+    if mode == 1 {
+        // PTY mode: read from slave handle (line-buffered by PTY ldisc).
+        let handle = unsafe { PTY_HANDLE } as u64;
+        let mut total = 0usize;
+        loop {
+            let d2 = reply_port << 32;
+            syscall::send(con_port, PTY_READ, handle, 0, d2, 0);
+            if let Some(msg) = syscall::recv_msg(reply_port) {
+                if msg.tag == PTY_READ_OK {
+                    let n = (msg.data[2] & 0xFFFF) as usize;
+                    let b0 = msg.data[0].to_le_bytes();
+                    let b1 = msg.data[1].to_le_bytes();
+                    let mut i = 0;
+                    while i < n && i < 8 && total < 64 {
+                        buf[total] = b0[i];
+                        total += 1;
+                        i += 1;
+                    }
+                    while i < n && i < 16 && total < 64 {
+                        buf[total] = b1[i - 8];
+                        total += 1;
+                        i += 1;
+                    }
+                    // Check if we got a newline (line complete).
+                    for j in 0..total {
+                        if buf[j] == b'\n' || buf[j] == b'\r' {
+                            return total;
+                        }
+                    }
+                    if total >= 64 {
+                        return total;
+                    }
+                    // Keep reading until newline.
+                } else {
+                    return total;
+                }
+            } else {
+                return total;
             }
-            return len;
         }
+    } else {
+        // Console mode (original).
+        let d0 = 64u64 | (reply_port << 32);
+        syscall::send(con_port, CON_READ, d0, 0, 0, 0);
+
+        if let Some(msg) = syscall::recv_msg(reply_port) {
+            if msg.tag == CON_READ_OK {
+                let len = (msg.data[0] as usize).min(24).min(64);
+                let words = [msg.data[1], msg.data[2], msg.data[3]];
+                for i in 0..len {
+                    buf[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
+                }
+                return len;
+            }
+        }
+        0
     }
-    0
 }
 
 /// Check if `line` starts with `prefix`.
@@ -135,14 +202,25 @@ fn fmt_num(n: u64, buf: &mut [u8]) -> usize {
 }
 
 #[unsafe(no_mangle)]
-fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
-    // Wait for console_srv.
-    let con_port = loop {
-        if let Some(p) = syscall::ns_lookup(b"console") {
-            break p;
+fn main(arg0: u64, _arg1: u64, _arg2: u64) {
+    // If arg0 != 0, we're in PTY mode: arg0 = (pty_port << 32) | slave_handle.
+    let con_port = if arg0 != 0 {
+        let pty_port = arg0 >> 32;
+        let slave_h = (arg0 & 0xFFFFFFFF) as u32;
+        unsafe {
+            IO_MODE = 1;
+            PTY_HANDLE = slave_h;
         }
-        for _ in 0..50 {
-            syscall::yield_now();
+        pty_port
+    } else {
+        // Wait for console_srv.
+        loop {
+            if let Some(p) = syscall::ns_lookup(b"console") {
+                break p;
+            }
+            for _ in 0..50 {
+                syscall::yield_now();
+            }
         }
     };
 
