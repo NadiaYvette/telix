@@ -236,7 +236,7 @@ source and reusable form.
 //                        support variable sizes. In practice: 1 base + 1 huge.
 //       Enterprise:      IBM POWER: 4K/64K base, 2M, 1G (irregular)
 //       MIPS64 with 1K pages is only 2× the VAX 512B page that
-//       motivated McKusick's original clustering code.
+//       motivated Babaoğlu and Joy's original clustering work.
 //     NOTE: The LoongArch STLB limitation is a cautionary example —
 //     encoding support ≠ practical support. MIPS64's fully-associative
 //     TLB with per-entry PageMask is genuinely flexible.
@@ -376,7 +376,7 @@ dense spectrum exists in the ISA and the MTLB, but the STLB design
 reflects the expectation that one base size is enough.
 
 MIPS64's 1~KiB minimum page size --- only twice the 512-byte
-VAX page that motivated McKusick's original page clustering code ---
+VAX page that motivated Babaoğlu and Joy's original page clustering work ---
 is a striking illustration of the same underlying pressure that
 originally drove page clustering.
 
@@ -414,9 +414,9 @@ expensive. Their system also targeted a single superpage size.
 //
 //   - History: 4.4BSD and FreeBSD VM used clustering for I/O coalescing
 //     (multiple MMU pages per VM page object)
-//   - McKusick's work (cite appropriately) — you coined
-//     "McKusick-Dickins page clustering" informally ~2003 because no
-//     published name seemed to exist
+//   - Babaoğlu and Joy's original work in 4.2BSD (cite appropriately)
+//     — previously informally called "McKusick-Dickins page clustering"
+//     (~2003), but the technique originates with Babaoğlu-Joy
 //   - The kernel allocates and frees memory in units of PAGE_SIZE
 //     (a multiple of MMUPAGE_SIZE), even though PTEs are installed
 //     at MMUPAGE_SIZE granularity
@@ -1627,11 +1627,11 @@ full design:
   in _Proc. 24th ASPLOS_, 2019, pp. 347--360.
   #label("panwar2019")
 
-  // >>> ADD: Whatever the actual McKusick/Dickins page clustering
-  // reference turns out to be. Check:
-  // - Cranor & Parulkar, "The UVM Virtual Memory System" (1999)
-  // - Tulloch & Robinson, "FreeBSD VM system" (various)
-  // - If no published name, define the concept and cite McKusick 1996/2004.
+  // >>> ADD: Babaoğlu-Joy page clustering reference:
+  // - Ö. Babaoğlu and W. N. Joy, "Converting a swap-based system to do
+  //   paging in an architecture lacking page-referenced bits," Proc. 8th
+  //   SOSP, 1981. DOI: 10.1145/800217.806663
+  // The McKusick 1996/2004 BSD books describe the descendants of this work.
   //
   // >>> ALSO CONSIDER:
   // - Linux multi-size THP (mTHP) patches, LWN coverage ~2023-2024

@@ -68,7 +68,7 @@ Architectures such as ARM64 (4 KiB to 2 MiB, a 512× gap) and x86-64 (4 KiB to 2
 
 Page clustering bridges this gap in two ways. First, by guaranteeing subpage superpages (e.g. 64 KiB contiguous PTEs on ARM64 with `PAGE_SIZE` ≥ 64 KiB), it shifts the failure mode from external fragmentation to outright memory exhaustion — these superpage sizes cannot fail when memory is available. Second, by reducing the assembly ratio for the 2 MiB superpage (32 pieces at 64 KiB, 8 at 256 KiB), it makes active contiguity management in the allocator substantially more effective. The superpages enabled by these guarantees are what deliver TLB efficiency; page clustering itself provides the proportionality constants and fragmentation-shifting that make them reliably obtainable. ARM64 is the greatest beneficiary, as it has hardware support for the intermediate 64 KiB contiguous PTE hint that x86-64 lacks.
 
-> **Novelty assessment:** Novel combination. McKusick–Dickins page clustering applied to guarantee Navarro-style subpage superpage sizes and improve superpage assembly. Not previously published in this specific form; the closest prior work is Linux multi-size THP (6.8), which attacks the same gap from the allocator side rather than by construction.
+> **Novelty assessment:** Novel combination. Babaoğlu-Joy page clustering applied to guarantee Navarro-style subpage superpage sizes and improve superpage assembly. Not previously published in this specific form; the closest prior work is Linux multi-size THP (6.8), which attacks the same gap from the allocator side rather than by construction.
 
 ### 4.3. VM Architecture with Sublinear Reserved Memory Footprint
 
@@ -542,9 +542,9 @@ Performance evaluation under emulation is indicative but not definitive. QEMU do
 
 This design draws on a broad body of prior work across its subsystems. The following summarises the principal influences beyond those already cited in individual sections:
 
-**Page clustering:** The pgcl (page clustering) patches for Linux, originally developed in the early 2000s and forward-ported to modern Linux by the author (NadiaYvette/linux on GitHub). Hugh Dickins' original page clustering work for Linux. The SGI IRIX variable page size support exploiting MIPS R4000 TLB capabilities. IBM AIX's aggressive use of multiple page sizes on POWER.
+**Page clustering:** Babaoğlu and Joy's original work on large kernel allocation pages in 4.2BSD. The pgcl (page clustering) patches for Linux, originally developed in the early 2000s and forward-ported to modern Linux by the author (NadiaYvette/linux on GitHub). Hugh Dickins' page clustering work for Linux. The SGI IRIX variable page size support exploiting MIPS R4000 TLB capabilities. IBM AIX's aggressive use of multiple page sizes on POWER.
 
-**Coremap-free design:** The Linux folio conversion (Matthew Wilcox) as an incremental step away from per-page metadata. The Mach VM object/memory map architecture, which separated virtual memory description from physical page tracking.
+**Sublinear memory footprint:** The Linux folio conversion (Matthew Wilcox) as an incremental step away from per-page metadata. The Mach VM object/memory map architecture, which separated virtual memory description from physical page tracking.
 
 **Network-unified I/O:** Plan 9 (Bell Labs) and its 9P protocol for uniform resource access. QNX's resource manager model for userspace filesystem and device servers accessed via message passing. The Spring OS (Sun Microsystems) uniform object interface.
 
@@ -564,7 +564,7 @@ A ground-up kernel design involves significant architectural risk. Several desig
 
 **Retrenchment:** Reduce `PAGE_SIZE` at compile time. The design supports a configurable `PAGE_SIZE` as a first-class feature, so this is not a retrofit but a tuning decision. At 64 KiB, the internal fragmentation is one-quarter of the 256 KiB case, while the superpage gap-bridging benefit is retained (32-way assembly for 2 MiB instead of 512-way). Dropping to `MMUPAGE_SIZE` (4 KiB) recovers entirely conventional behaviour: no subpage superpage guarantees, no gap-bridging benefit, but also no internal fragmentation penalty. The system degrades gracefully along a continuum rather than failing abruptly.
 
-### 9.2. Coremap-Free VM: Hybrid Extent/Flat Metadata
+### 9.2. Sublinear-Footprint VM: Hybrid Extent/Flat Metadata
 
 **Risk:** Extent fragmentation under adversarial or pathological workloads causes the extent tree to degenerate toward one entry per physical page, losing the efficiency advantage and adding tree traversal overhead on top of what a flat per-page struct array would cost.
 
@@ -680,9 +680,11 @@ Bonwick, J. and Adams, J. "Magazines and vmem: extending the slab allocator to m
 
 Boos, K., Liber, N., and Zhong, L. "Theseus: an experiment in operating system structure and state management." OSDI 2020.
 
+Babaoğlu, Ö. and Joy, W.N. "Converting a swap-based system to do paging in an architecture lacking page-referenced bits." SOSP 1981. (Origin of page clustering.)
+
 Carr, R. and Hennessy, J. "WSCLOCK — a simple and effective algorithm for virtual memory management." SOSP 1981.
 
-Dickins, H. Page clustering patches for the Linux kernel.
+Dickins, H. Page clustering patches for the Linux kernel. (Descendant of the Babaoğlu-Joy technique for Linux.)
 
 Hamilton, G. and Kougiouris, P. "The Spring nucleus: a microkernel for objects." USENIX Summer 1993.
 
