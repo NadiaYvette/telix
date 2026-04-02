@@ -154,3 +154,7 @@ path = "bin/linux_srv.rs"
 [[bin]]
 name = "fb_srv"
 path = "bin/fb_srv.rs"
+
+[[bin]]
+name = "input_srv"
+path = "bin/input_srv.rs"

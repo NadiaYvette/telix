@@ -1289,8 +1289,11 @@ fn sys_ioport(op: u64, port: u64, value: u64) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
         let port = port as u16;
-        // Only allow ports >= 0x1000 (avoids system ports like PIC/PIT/COM1).
-        if port < 0x1000 {
+        // Allow PS/2 keyboard/mouse ports + high-numbered device ports.
+        // Block system-critical ports (PIC, PIT, COM1, DMA, etc.).
+        let allowed = (port == 0x60 || port == 0x64) // PS/2 i8042
+            || port >= 0x1000;                        // PCI device I/O
+        if !allowed {
             return u64::MAX;
         }
         use crate::arch::x86_64::serial;

@@ -196,6 +196,11 @@ fn startup_thread() -> ! {
             Some(tid) => println!("  fb_srv spawned (thread {})", tid),
             None => println!("  WARNING: fb_srv not found (ok if not yet built)"),
         }
+        // Spawn input_srv: PS/2 keyboard + mouse (always present on x86_64).
+        match sched::spawn_user(b"input_srv", 50, 20, 0) {
+            Some(tid) => println!("  input_srv spawned (thread {})", tid),
+            None => println!("  WARNING: input_srv not found (ok if not yet built)"),
+        }
     }
 
     // MIPS64 Malta: Discover virtio devices via GT-64120 PCI bus scan.

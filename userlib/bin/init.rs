@@ -8007,6 +8007,41 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 108: Input events (PS/2 keyboard + mouse) ---
+    // Verify input_srv registered with name server and responds to subscribe.
+    syscall::debug_puts(b"  init: Phase 108 input events...\n");
+    {
+        let input_port = syscall::ns_lookup(b"input");
+        if let Some(input_port) = input_port {
+            // Subscribe to input events.
+            let event_port = syscall::port_create();
+            let reply_port = syscall::port_create();
+            // INPUT_SUBSCRIBE = 0x9000: data[0] = subscriber port, data[2] upper 32 = reply port.
+            syscall::send(input_port, 0x9000, event_port, 0, reply_port << 32, 0);
+            let mut got_reply = false;
+            for _ in 0..100 {
+                if let Some(msg) = syscall::recv_nb_msg(reply_port) {
+                    if msg.tag == 0x9001 && msg.data[0] == 0 {
+                        got_reply = true;
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+            // Unsubscribe.
+            syscall::send(input_port, 0x9003, event_port, 0, 0, 0);
+            syscall::port_destroy(event_port);
+            syscall::port_destroy(reply_port);
+            if got_reply {
+                syscall::debug_puts(b"Phase 108 input events: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 108 input events: FAILED (no subscribe reply)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 108 input events: SKIPPED (no input server)\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
