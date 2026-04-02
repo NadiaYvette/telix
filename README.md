@@ -23,7 +23,7 @@ Telix's central research contribution is **page clustering** — using [Babaoğl
 
 A correct implementation of page clustering is **strictly ABI-compatible** with kernels that do not distinguish between the MMU page size and the kernel allocation unit — userspace observes no difference in behavior, only in TLB efficiency. Telix enforces this: the `mmap` interface, page protection granularity, and fault behavior are all defined in terms of the MMU page size, not the kernel allocation unit.
 
-The VM subsystem itself is coremap-free, using extent-based management (B+ trees of intervals) instead of the traditional per-page `struct page` / coremap array.
+The VM subsystem uses extent-based management (B+ trees of intervals) instead of the traditional per-page `struct page` array (also known as the PFN database or resident page table). This gives a **sublinear reserved memory footprint** — metadata grows with the number of active mappings rather than total physical RAM.
 
 ### Network-Unified Asynchronous I/O
 
@@ -37,7 +37,7 @@ All I/O is message-passing: filesystem drivers, device drivers, and network serv
 | IPC model | L4-style synchronous, register-passed messages |
 | Process model | Mach-style tasks + threads, M:N threading with scheduler activations |
 | Security | seL4-derived capability-based access control |
-| VM subsystem | Coremap-free, extent-based, COW with group tracking |
+| VM subsystem | Extent-based (no per-page struct array), COW with group tracking |
 | Supported architectures | aarch64, x86-64, riscv64, loongarch64, mips64el |
 | Development platform | QEMU (all targets), Fedora x86-64 host |
 
