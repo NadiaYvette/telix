@@ -35,8 +35,14 @@ case "$ARCH" in
         ARCHFLAGS="--target=mips64el-unknown-elf -march=mips64r2 -mabi=64 -mno-abicalls -fno-pic -G0"
         LINKSCRIPT="$MUSL/link-mips64.ld"
         ;;
+    loongarch64)
+        CC="${CC:-clang}"
+        TARGET="loongarch64-unknown-none"
+        ARCHFLAGS="--target=loongarch64-unknown-linux-gnu -mabi=lp64d -mno-lsx -mno-lasx"
+        LINKSCRIPT="$MUSL/link-loongarch64.ld"
+        ;;
     *)
-        echo "Unknown arch: $ARCH (expected aarch64, riscv64, x86_64, mips64)"
+        echo "Unknown arch: $ARCH (expected aarch64, riscv64, x86_64, mips64, loongarch64)"
         exit 1
         ;;
 esac
@@ -110,6 +116,9 @@ link_binary() {
             ld.lld -T "$LINKSCRIPT" --static "$@" -o "$OUTPUT"
             ;;
         mips64)
+            ld.lld -T "$LINKSCRIPT" --static "$@" -o "$OUTPUT"
+            ;;
+        loongarch64)
             ld.lld -T "$LINKSCRIPT" --static "$@" -o "$OUTPUT"
             ;;
     esac

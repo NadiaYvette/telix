@@ -39,6 +39,8 @@
 #define R_RELATIVE 8      /* R_X86_64_RELATIVE */
 #elif defined(__mips__) || defined(__mips64)
 #define R_RELATIVE 128    /* R_MIPS_REL32 — closest equivalent */
+#elif defined(__loongarch__)
+#define R_RELATIVE 3      /* R_LARCH_RELATIVE */
 #else
 #error "Unsupported architecture"
 #endif
