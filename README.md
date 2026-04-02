@@ -21,9 +21,9 @@ Telix's central research contribution is **page clustering** — using [Babaoğl
    | 128 KiB kernel allocation unit | 16 |
    | 256 KiB kernel allocation unit | 8 |
 
-A correct implementation of page clustering is **strictly ABI-compatible** with kernels that do not distinguish between the MMU page size and the kernel allocation unit — userspace observes no difference in behavior, only in TLB efficiency. Telix enforces this: the `mmap` interface, page protection granularity, and fault behavior are all defined in terms of the MMU page size, not the kernel allocation unit.
+A correct implementation of page clustering is **strictly ABI-compatible** with kernels that do not distinguish between the MMU page size and the kernel allocation unit — userspace observes no difference in behavior, only in memory fragmentation and proportionality constants of performance. Telix enforces this: the `mmap` interface, page protection granularity, and fault behavior are all defined in terms of the MMU page size, not the kernel allocation unit.
 
-The VM subsystem uses extent-based management (B+ trees of intervals) instead of the traditional per-page `struct page` array (also known as the PFN database or resident page table). This gives a **sublinear reserved memory footprint** — metadata grows with the number of active mappings rather than total physical RAM.
+The VM subsystem uses extent-based management where power of 2 -sized and -aligned contiguous ranges of memory appear in data structures instead of individual members of the traditional per-page `struct page` array (also known as the PFN database or resident page table) corresponding to the minimum TLB mapping granularity. This gives a **sublinear reserved memory footprint** — metadata grows with fragmentation and the number of active mappings rather than total physical RAM.
 
 ### Network-Unified Asynchronous I/O
 
