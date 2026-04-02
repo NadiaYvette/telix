@@ -99,6 +99,68 @@ pub fn sig_default_is_term(sig: u32) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Personality and syscall ABI types
+// ---------------------------------------------------------------------------
+
+/// OS personality — determines what syscall numbers mean.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PersonalityId {
+    /// Direct kernel dispatch (current behavior — native Telix syscalls).
+    TelixNative = 0,
+    /// Minimal POSIX.1 without OS-specific extensions.
+    Posix       = 1,
+    /// Linux personality (syscall numbers, /proc, signals, etc.).
+    Linux       = 2,
+    /// Darwin/macOS (Mach traps + BSD syscalls).
+    Darwin      = 3,
+    /// Windows NT (NtXxx syscall interface).
+    WindowsNt   = 4,
+    /// FreeBSD.
+    FreeBsd     = 5,
+    /// Plan 9 from Bell Labs.
+    Plan9       = 6,
+    /// Haiku (BeOS-compatible).
+    Haiku       = 7,
+}
+
+/// Syscall ABI — determines which registers hold nr, args, and return value.
+/// Each variant is a (personality, architecture, bitness) tuple.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SyscallAbi {
+    // --- Native Telix (current behavior, all arches) ---
+    TelixNative    = 0,
+
+    // --- Linux ABIs (one per arch × bitness) ---
+    LinuxAarch64   = 1,   // nr=x8, args=x0-x5, ret=x0
+    LinuxAarch32   = 2,   // nr=r7, args=r0-r5, ret=r0
+    LinuxX86_64    = 3,   // nr=rax, args=rdi/rsi/rdx/r10/r8/r9, ret=rax
+    LinuxI386      = 4,   // nr=eax, args=ebx/ecx/edx/esi/edi/ebp, ret=eax
+    LinuxRv64      = 5,   // nr=a7, args=a0-a5, ret=a0
+    LinuxMipsN64   = 6,   // nr=v0 (5000+), args=a0-a5, ret=v0
+    LinuxMipsO32   = 7,   // nr=v0 (4000+), args=a0-a3 (+stack), ret=v0
+    LinuxMipsN32   = 8,   // nr=v0 (6000+), args=a0-a5, ret=v0
+    LinuxLa64      = 9,   // nr=a7, args=a0-a5, ret=a0
+
+    // --- Windows NT ABIs ---
+    NtX86_64       = 16,  // nr=rax, args=rcx/rdx/r8/r9 (+stack), ret=rax
+    NtAarch64      = 17,  // nr=x8(?), args=x0-x7, ret=x0
+    NtI386         = 18,  // nr=eax, args on stack (stdcall), ret=eax
+
+    // --- Darwin ABIs ---
+    DarwinX86_64   = 32,  // nr=rax (class in high bits), args=rdi/rsi/rdx/r10/r8/r9
+    DarwinAarch64  = 33,  // nr=x16, args=x0-x5, ret=x0 (carry=error)
+
+    // --- Other personalities ---
+    Plan9Amd64     = 48,
+    HaikuX86_64    = 64,
+}
+
+/// Maximum personality ID (for fast-path table sizing).
+pub const PERSONALITY_ID_MAX: u8 = 7;
+
 /// Task structure.
 pub struct Task {
     pub id: TaskId,
@@ -161,6 +223,13 @@ pub struct Task {
     pub ngroups: u32,
     // --- Resource limits (Phase 50) ---
     pub rlimits: [Rlimit; RLIMIT_COUNT],
+    // --- Personality (foreign OS emulation) ---
+    /// OS personality for this task (determines syscall semantics).
+    pub personality: PersonalityId,
+    /// Syscall ABI (determines register extraction for nr/args/return).
+    pub syscall_abi: SyscallAbi,
+    /// Port of the personality server handling this task (0 = none/native).
+    pub personality_port: u64,
     // --- Embedded capability data (lockless access via TASK_TABLE) ---
     /// Per-task lock protecting CNode/CapSpace mutations.
     pub cap_lock: crate::sync::SpinLock<()>,
@@ -253,6 +322,9 @@ impl Task {
             groups_overflow: 0,
             ngroups: 0,
             rlimits: DEFAULT_RLIMITS,
+            personality: PersonalityId::TelixNative,
+            syscall_abi: SyscallAbi::TelixNative,
+            personality_port: 0,
             cap_lock: crate::sync::SpinLock::new(()),
             capset: crate::cap::capset::CapSet::new(),
             capspace: crate::cap::space::CapSpace::new(0),

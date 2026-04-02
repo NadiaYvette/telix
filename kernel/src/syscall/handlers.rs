@@ -110,6 +110,9 @@ pub const SYS_PORT_RESIZE: u64 = 100;
 pub const SYS_FUTEX_WAIT_PI: u64 = 101;
 pub const SYS_FUTEX_WAKE_PI: u64 = 102;
 pub const SYS_PAGE_SIZE: u64 = 103;
+pub const SYS_PERSONALITY_REGISTER: u64 = 104;
+pub const SYS_PERSONALITY_SET: u64 = 105;
+pub const SYS_PERSONALITY_GET: u64 = 106;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -169,6 +172,27 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
 
     crate::sched::stats::SYSCALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     crate::trace::trace_event(crate::trace::EVT_SYSCALL_ENTER, nr as u32, 0);
+
+    // --- Personality routing ---
+    // If this task has a non-native personality, forward the syscall to the
+    // personality server — unless it's a personality management syscall which
+    // is always handled natively.
+    if nr != SYS_PERSONALITY_REGISTER && nr != SYS_PERSONALITY_SET && nr != SYS_PERSONALITY_GET {
+        let tid = crate::sched::smp::current()
+            .current_thread
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let task_id = crate::sched::scheduler::thread_ref(tid).task_id;
+        let task = crate::sched::scheduler::task_ref(task_id);
+        if task.personality as u8 != 0 {
+            let port = task.personality_port;
+            let result = crate::syscall::personality::forward_to_server(
+                port, nr, [a0, a1, a2, a3, a4, a5],
+            );
+            crate::trace::trace_event(crate::trace::EVT_SYSCALL_EXIT, nr as u32, result as u32);
+            set_return(frame, result);
+            return;
+        }
+    }
 
     let result = match nr {
         SYS_DEBUG_PUTCHAR => sys_debug_putchar(a0),
@@ -368,6 +392,13 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_FUTEX_WAIT_PI => crate::sync::turnstile::futex_wait_pi(a0 as usize, a1 as u32),
         SYS_FUTEX_WAKE_PI => crate::sync::turnstile::futex_wake_pi(a0 as usize),
         SYS_PAGE_SIZE => crate::mm::page::MMUPAGE_SIZE as u64,
+        SYS_PERSONALITY_REGISTER => {
+            crate::syscall::personality::register_server(a0 as u8, a1)
+        }
+        SYS_PERSONALITY_SET => {
+            crate::syscall::personality::set_personality(a0, a1 as u8, a2 as u8)
+        }
+        SYS_PERSONALITY_GET => sys_personality_get(),
         _ => {
             crate::println!("Unknown syscall: {}", nr);
             u64::MAX // -1 as error
@@ -741,6 +772,16 @@ fn sys_proxy_register(port_id: u64) -> u64 {
     }
     crate::ipc::port::PROXY_PORT.store(port_id, core::sync::atomic::Ordering::Release);
     0
+}
+
+/// Return the current task's personality (low byte) and syscall ABI (next byte).
+fn sys_personality_get() -> u64 {
+    let tid = crate::sched::smp::current()
+        .current_thread
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let task_id = crate::sched::scheduler::thread_ref(tid).task_id;
+    let task = crate::sched::scheduler::task_ref(task_id);
+    (task.personality as u8 as u64) | ((task.syscall_abi as u8 as u64) << 8)
 }
 
 fn sys_recv(port_id: u64, frame: &mut ExceptionFrame) -> u64 {

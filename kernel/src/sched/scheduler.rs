@@ -2501,6 +2501,9 @@ pub fn fork_current() -> u64 {
         parent_groups_overflow,
         parent_ngroups,
         parent_rlimits,
+        parent_personality,
+        parent_syscall_abi,
+        parent_personality_port,
     ) = {
         let _lock = SPAWN_LOCK.lock();
         let child_task_id = match alloc_task_id() {
@@ -2521,6 +2524,9 @@ pub fn fork_current() -> u64 {
             ptask.groups_overflow,
             ptask.ngroups,
             ptask.rlimits,
+            ptask.personality,
+            ptask.syscall_abi,
+            ptask.personality_port,
         )
     };
 
@@ -2577,6 +2583,10 @@ pub fn fork_current() -> u64 {
         task.groups_overflow = child_groups_overflow;
         task.ngroups = parent_ngroups;
         task.rlimits = parent_rlimits;
+        // Fork inherits parent's personality (foreign OS emulation state).
+        task.personality = parent_personality;
+        task.syscall_abi = parent_syscall_abi;
+        task.personality_port = parent_personality_port;
     }
 
     // Bootstrap capabilities: copy parent's capset and grant well-known port caps.

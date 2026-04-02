@@ -58,6 +58,28 @@ const SYS_GETRANDOM: u64 = 96;
 const SYS_PROXY_REGISTER: u64 = 99;
 const SYS_PORT_RESIZE: u64 = 100;
 const SYS_PAGE_SIZE: u64 = 103;
+const SYS_PERSONALITY_REGISTER: u64 = 104;
+const SYS_PERSONALITY_SET: u64 = 105;
+const SYS_PERSONALITY_GET: u64 = 106;
+
+/// Register a personality server for a given personality ID.
+/// Only root (euid 0) can call this.
+/// personality: 1=Posix, 2=Linux, 3=Darwin, 4=WindowsNt, 5=FreeBsd, 6=Plan9, 7=Haiku.
+pub fn personality_register(personality: u8, port: u64) -> u64 {
+    unsafe { arch::syscall2(SYS_PERSONALITY_REGISTER, personality as u64, port) }
+}
+
+/// Set a task's personality and syscall ABI.
+/// target_port: task port (0 = self). personality/abi: enum values.
+pub fn personality_set(target_port: u64, personality: u8, abi: u8) -> u64 {
+    unsafe { arch::syscall3(SYS_PERSONALITY_SET, target_port, personality as u64, abi as u64) }
+}
+
+/// Get the current task's personality (low byte) and syscall ABI (byte 1).
+pub fn personality_get() -> (u8, u8) {
+    let r = unsafe { arch::syscall0(SYS_PERSONALITY_GET) };
+    (r as u8, (r >> 8) as u8)
+}
 
 /// Register a port as the network proxy endpoint for non-local sends.
 pub fn proxy_register(port: u64) -> u64 {
