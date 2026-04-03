@@ -60,8 +60,16 @@ const __NR_SET_ROBUST_LIST: u64 = 273;
 const __NR_DUP3: u64 = 292;
 const __NR_PIPE2: u64 = 293;
 const __NR_PRLIMIT64: u64 = 302;
+const __NR_GETDENTS64: u64 = 217;
 const __NR_GETRANDOM: u64 = 318;
 const __NR_RSEQ: u64 = 334;
+const __NR_CHDIR: u64 = 80;
+const __NR_FCHDIR: u64 = 81;
+const __NR_MKDIR: u64 = 83;
+const __NR_RMDIR: u64 = 84;
+const __NR_UNLINK: u64 = 87;
+const __NR_UNLINKAT: u64 = 263;
+const __NR_MKDIRAT: u64 = 258;
 
 // arch_prctl subcodes
 const ARCH_SET_FS: u64 = 0x1002;
@@ -80,6 +88,8 @@ const EMFILE: u64 = 24;
 const ESPIPE: u64 = 29;
 const ERANGE: u64 = 34;
 const ENOSYS: u64 = 38;
+const ENOTEMPTY: u64 = 39;
+const EEXIST: u64 = 17;
 
 /// Return negated errno as u64 (Linux convention).
 fn linux_err(e: u64) -> u64 {
@@ -91,11 +101,21 @@ const VFS_OPEN: u64 = 0x6010;
 const VFS_OPEN_OK: u64 = 0x6110;
 const VFS_STAT: u64 = 0x6020;
 const VFS_STAT_OK: u64 = 0x6120;
+const VFS_MKDIR: u64 = 0x6040;
+const VFS_MKDIR_OK: u64 = 0x6140;
+const VFS_UNLINK: u64 = 0x6050;
+const VFS_UNLINK_OK: u64 = 0x6150;
+const VFS_READDIR: u64 = 0x6030;
+const VFS_READDIR_OK: u64 = 0x6130;
+const VFS_READDIR_END: u64 = 0x6131;
 const VFS_ERROR: u64 = 0x6F00;
 
 // FS server protocol tags
 const FS_READ: u64 = 0x2100;
 const FS_READ_OK: u64 = 0x2101;
+const FS_READDIR: u64 = 0x2200;
+const FS_READDIR_OK: u64 = 0x2201;
+const FS_READDIR_END: u64 = 0x2202;
 const FS_CLOSE: u64 = 0x2400;
 
 // Linux AT_FDCWD
@@ -121,6 +141,7 @@ enum FdKind {
     None,
     File,
     Pipe,
+    Dir,
 }
 
 struct FdEntry {
@@ -128,15 +149,18 @@ struct FdEntry {
     kind: FdKind,
     // File: fs_port = FS server port, handle = FS handle
     // Pipe: fs_port = pipe_srv port, handle = pipe handle
+    // Dir: dir_path/dir_path_len store the absolute path for VFS_READDIR
     fs_port: u64,
     handle: u64,
     file_size: u64,
     offset: u64,
+    dir_path: [u8; 16],
+    dir_path_len: u8,
 }
 
 impl FdEntry {
     const fn empty() -> Self {
-        Self { in_use: false, kind: FdKind::None, fs_port: 0, handle: 0, file_size: 0, offset: 0 }
+        Self { in_use: false, kind: FdKind::None, fs_port: 0, handle: 0, file_size: 0, offset: 0, dir_path: [0; 16], dir_path_len: 0 }
     }
 }
 
@@ -144,6 +168,10 @@ static mut FD_TABLE: [FdEntry; MAX_FDS] = [const { FdEntry::empty() }; MAX_FDS];
 static mut VFS_PORT: u64 = 0;
 static mut REPLY_PORT: u64 = 0;
 static mut PIPE_PORT: u64 = 0;
+
+// Per-process current working directory.
+static mut CWD: [u8; 64] = [0u8; 64];
+static mut CWD_LEN: usize = 0;
 
 fn alloc_fd() -> Option<usize> {
     unsafe {
@@ -371,11 +399,34 @@ fn do_open(caller_port: u64, path_va: usize, flags: u64) -> u64 {
         None => return linux_err(ENOENT),
     };
 
-    if resp.tag == VFS_ERROR {
-        return linux_err(ENOENT);
-    }
-    if resp.tag != VFS_OPEN_OK {
-        return linux_err(ENOENT);
+    if resp.tag == VFS_ERROR || resp.tag != VFS_OPEN_OK {
+        // VFS_OPEN failed — this might be a directory (FS servers don't open dirs).
+        // Create a Dir FD so getdents64 can enumerate via VFS_READDIR later.
+        // Resolve relative paths by prepending CWD.
+        let (dir_path, dir_len) = if path[0] == b'/' {
+            (path, pathlen)
+        } else {
+            unsafe {
+                let clen = CWD_LEN;
+                let mut buf = [0u8; 16];
+                let mut pos = 0;
+                for i in 0..clen { if pos < 16 { buf[pos] = CWD[i]; pos += 1; } }
+                if pos > 0 && buf[pos - 1] != b'/' { if pos < 16 { buf[pos] = b'/'; pos += 1; } }
+                for i in 0..pathlen { if pos < 16 { buf[pos] = path[i]; pos += 1; } }
+                (buf, pos)
+            }
+        };
+        let fd = match alloc_fd() {
+            Some(f) => f,
+            None => return linux_err(EBADF),
+        };
+        unsafe {
+            FD_TABLE[fd].kind = FdKind::Dir;
+            FD_TABLE[fd].offset = 0;
+            FD_TABLE[fd].dir_path_len = dir_len as u8;
+            for i in 0..dir_len.min(16) { FD_TABLE[fd].dir_path[i] = dir_path[i]; }
+        }
+        return fd as u64;
     }
 
     let fd = match alloc_fd() {
@@ -431,6 +482,7 @@ fn do_close(fd: usize) {
                 let _ = syscall::recv_msg(rp);
                 syscall::port_destroy(rp);
             }
+            FdKind::Dir => {} // No server handle to close.
             FdKind::None => {}
         }
         FD_TABLE[fd] = FdEntry::empty();
@@ -1035,6 +1087,365 @@ fn handle_execve(caller_port: u64, args: &[u64; 6]) -> Option<u64> {
     None
 }
 
+/// Resolve a path from caller's address space. If relative, prepend CWD.
+/// Returns (absolute_path_buf, path_len).
+fn resolve_path(caller_port: u64, path_va: usize) -> ([u8; 64], usize) {
+    let mut raw = [0u8; 64];
+    let copied = syscall::personality_copy_in(caller_port, path_va, &mut raw);
+    if copied == 0 {
+        return ([0u8; 64], 0);
+    }
+    let raw_len = raw[..copied].iter().position(|&b| b == 0).unwrap_or(copied);
+    if raw_len == 0 {
+        return ([0u8; 64], 0);
+    }
+
+    if raw[0] == b'/' {
+        // Absolute path — use as-is.
+        return (raw, raw_len);
+    }
+
+    // Relative path — prepend CWD.
+    unsafe {
+        let clen = CWD_LEN;
+        let mut buf = [0u8; 64];
+        let mut pos = 0;
+        // Copy CWD.
+        for i in 0..clen {
+            if pos < 64 { buf[pos] = CWD[i]; pos += 1; }
+        }
+        // Add separator if CWD doesn't end with '/'.
+        if pos > 0 && buf[pos - 1] != b'/' {
+            if pos < 64 { buf[pos] = b'/'; pos += 1; }
+        }
+        // Copy relative path.
+        for i in 0..raw_len {
+            if pos < 64 { buf[pos] = raw[i]; pos += 1; }
+        }
+        (buf, pos)
+    }
+}
+
+/// Pack a path into VFS protocol format (two u64 words, max 16 bytes).
+fn pack_path_vfs(path: &[u8], pathlen: usize) -> (u64, u64, u64) {
+    let mut w0 = 0u64;
+    let mut w1 = 0u64;
+    let len = pathlen.min(16);
+    for i in 0..len.min(8) {
+        w0 |= (path[i] as u64) << (i * 8);
+    }
+    for i in 8..len {
+        w1 |= (path[i] as u64) << ((i - 8) * 8);
+    }
+    (w0, w1, len as u64)
+}
+
+/// Handle Linux mkdir(path, mode).
+fn handle_mkdir(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let path_va = args[0] as usize;
+    let mode = args[1] as u32;
+
+    let vfs_port = unsafe { VFS_PORT };
+    let reply_port = unsafe { REPLY_PORT };
+    if vfs_port == 0 { return linux_err(ENOSYS); }
+
+    let (path, pathlen) = resolve_path(caller_port, path_va);
+    if pathlen == 0 { return linux_err(EFAULT); }
+
+    let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
+    let d2 = plen | (((mode & 0xFFFF) as u64) << 16) | ((reply_port) << 32);
+    syscall::send(vfs_port, VFS_MKDIR, w0, w1, d2, 0);
+
+    match syscall::recv_msg(reply_port) {
+        Some(resp) if resp.tag == VFS_MKDIR_OK => 0,
+        _ => linux_err(EEXIST),
+    }
+}
+
+/// Handle Linux mkdirat(dirfd, path, mode).
+fn handle_mkdirat(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let dirfd = args[0];
+    if dirfd != AT_FDCWD && (dirfd as i64) >= 0 { return linux_err(ENOSYS); }
+    let shifted: [u64; 6] = [args[1], args[2], args[3], 0, args[4], args[5]];
+    handle_mkdir(caller_port, &shifted)
+}
+
+/// Handle Linux unlink(path) / rmdir(path).
+fn handle_unlink_impl(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let path_va = args[0] as usize;
+
+    let vfs_port = unsafe { VFS_PORT };
+    let reply_port = unsafe { REPLY_PORT };
+    if vfs_port == 0 { return linux_err(ENOSYS); }
+
+    let (path, pathlen) = resolve_path(caller_port, path_va);
+    if pathlen == 0 { return linux_err(EFAULT); }
+
+    let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
+    let d2 = plen | ((reply_port) << 32);
+    syscall::send(vfs_port, VFS_UNLINK, w0, w1, d2, 0);
+
+    match syscall::recv_msg(reply_port) {
+        Some(resp) if resp.tag == VFS_UNLINK_OK => 0,
+        _ => linux_err(ENOENT),
+    }
+}
+
+/// Handle Linux unlinkat(dirfd, path, flags).
+fn handle_unlinkat(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let dirfd = args[0];
+    if dirfd != AT_FDCWD && (dirfd as i64) >= 0 { return linux_err(ENOSYS); }
+    let shifted: [u64; 6] = [args[1], args[2], args[3], 0, args[4], args[5]];
+    handle_unlink_impl(caller_port, &shifted)
+}
+
+/// Handle Linux chdir(path).
+fn handle_chdir(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let path_va = args[0] as usize;
+
+    let (path, pathlen) = resolve_path(caller_port, path_va);
+    if pathlen == 0 { return linux_err(EFAULT); }
+
+    // Verify directory exists via VFS_STAT.
+    let vfs_port = unsafe { VFS_PORT };
+    let reply_port = unsafe { REPLY_PORT };
+    if vfs_port == 0 { return linux_err(ENOSYS); }
+
+    let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
+    let d2 = plen | ((reply_port) << 32);
+    syscall::send(vfs_port, VFS_STAT, w0, w1, d2, 0);
+
+    match syscall::recv_msg(reply_port) {
+        Some(resp) if resp.tag == VFS_STAT_OK => {
+            // Update CWD.
+            unsafe {
+                for i in 0..pathlen.min(64) {
+                    CWD[i] = path[i];
+                }
+                CWD_LEN = pathlen.min(64);
+            }
+            0
+        }
+        _ => linux_err(ENOENT),
+    }
+}
+
+/// Handle Linux getdents64(fd, dirp, count).
+///
+/// For simplicity, we use the path stored in the FD entry to do path-based
+/// directory listing via the FS server's FS_READDIR protocol (one entry
+/// at a time with offset-based pagination).
+///
+/// Since linux_srv FD entries for directories store the FS server port and
+/// a handle, we iterate FS_READDIR on that handle.
+///
+/// Linux dirent64 layout (x86_64):
+/// getdents64 on a Dir FD: use VFS_READDIR (path-based) to enumerate entries.
+/// VFS_READDIR: data[0]=path_lo, data[1]=path_hi, data[2]=path_len(16)|reply_port(32)
+/// VFS_READDIR_OK: data[0]=size, data[1]=name_lo, data[2]=name_hi, data[3]=next_offset
+fn handle_getdents64_dir(caller_port: u64, fd: usize, dirp_va: usize, count: usize) -> u64 {
+    let vfs_port = unsafe { VFS_PORT };
+    if vfs_port == 0 { return 0; }
+
+    let (path, plen) = unsafe {
+        let plen = FD_TABLE[fd].dir_path_len as usize;
+        (FD_TABLE[fd].dir_path, plen)
+    };
+
+    // Pack path for VFS.
+    let mut w0 = 0u64;
+    let mut w1 = 0u64;
+    for i in 0..plen.min(8) { w0 |= (path[i] as u64) << (i * 8); }
+    for i in 8..plen.min(16) { w1 |= (path[i] as u64) << ((i - 8) * 8); }
+
+    let rp = syscall::port_create();
+    let d2 = (plen as u64) | ((rp as u64) << 32);
+    syscall::send(vfs_port, VFS_READDIR, w0, w1, d2, 0);
+
+    // VFS streams entries back: VFS_READDIR_OK* then VFS_READDIR_END.
+    let mut buf = [0u8; 2048];
+    let mut buf_pos = 0usize;
+    let mut entry_idx = 0u64;
+
+    for _ in 0..200 {
+        if buf_pos + 280 > count.min(2048) { break; }
+
+        let resp = match syscall::recv_msg(rp) {
+            Some(m) => m,
+            None => break,
+        };
+
+        if resp.tag == VFS_READDIR_END { break; }
+        if resp.tag != VFS_READDIR_OK { break; }
+
+        let name_lo = resp.data[1];
+        let name_hi = resp.data[2];
+
+        // Unpack filename.
+        let mut name = [0u8; 16];
+        let mut name_len = 0usize;
+        for i in 0..8 {
+            let b = ((name_lo >> (i * 8)) & 0xFF) as u8;
+            if b == 0 { break; }
+            name[name_len] = b;
+            name_len += 1;
+        }
+        if name_len == 8 {
+            for i in 0..8 {
+                let b = ((name_hi >> (i * 8)) & 0xFF) as u8;
+                if b == 0 { break; }
+                name[name_len] = b;
+                name_len += 1;
+            }
+        }
+
+        entry_idx += 1;
+        let reclen = ((19 + name_len + 1) + 7) & !7;
+        if buf_pos + reclen > count.min(2048) { break; }
+
+        let d_ino = entry_idx;
+        let d_off = entry_idx as i64;
+        buf[buf_pos..buf_pos+8].copy_from_slice(&d_ino.to_le_bytes());
+        buf[buf_pos+8..buf_pos+16].copy_from_slice(&d_off.to_le_bytes());
+        buf[buf_pos+16..buf_pos+18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        buf[buf_pos+18] = 0; // DT_UNKNOWN
+        for i in 0..name_len { buf[buf_pos + 19 + i] = name[i]; }
+        buf[buf_pos + 19 + name_len] = 0;
+        for i in (19 + name_len + 1)..reclen { buf[buf_pos + i] = 0; }
+        buf_pos += reclen;
+    }
+
+    syscall::port_destroy(rp);
+
+    if buf_pos > 0 {
+        let written = syscall::personality_copy_out(caller_port, dirp_va, &buf[..buf_pos]);
+        if written == 0 { return linux_err(EFAULT); }
+        buf_pos as u64
+    } else {
+        0
+    }
+}
+
+/// Linux dirent64 layout:
+///   u64 d_ino
+///   i64 d_off
+///   u16 d_reclen
+///   u8  d_type
+///   char d_name[] (null-terminated, padded to alignment)
+fn handle_getdents64(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let dirp_va = args[1] as usize;
+    let count = args[2] as usize;
+
+    // For fd == 3+ use FD table. For raw directory reads,
+    // the directory must have been opened first.
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+
+    unsafe {
+        if !FD_TABLE[fd].in_use { return linux_err(EBADF); }
+    }
+
+    // Handle Dir FDs via VFS_READDIR (path-based).
+    let is_dir = unsafe { matches!(FD_TABLE[fd].kind, FdKind::Dir) };
+    if is_dir {
+        return handle_getdents64_dir(caller_port, fd, dirp_va, count);
+    }
+
+    let (fs_port, _handle) = unsafe {
+        if FD_TABLE[fd].kind != FdKind::File { return linux_err(ENOTDIR); }
+        (FD_TABLE[fd].fs_port, FD_TABLE[fd].handle)
+    };
+
+    // Use the FD's offset as the readdir pagination cursor.
+    let start_offset = unsafe { FD_TABLE[fd].offset } as u64;
+
+    let rp = syscall::port_create();
+    let mut buf = [0u8; 2048];
+    let mut buf_pos = 0usize;
+    let mut next_off = start_offset;
+
+    // Read entries one at a time from FS server.
+    for _ in 0..200 {
+        if buf_pos + 280 > count.min(2048) { break; } // Leave room for next entry
+
+        let d2 = (rp as u64) & 0xFFFF_FFFF;
+        syscall::send(fs_port, FS_READDIR, next_off, 0, d2, 0);
+
+        let resp = match syscall::recv_msg(rp) {
+            Some(m) => m,
+            None => break,
+        };
+
+        if resp.tag == FS_READDIR_END { break; }
+        if resp.tag != FS_READDIR_OK { break; }
+
+        // FS_READDIR_OK: data[0]=size, data[1]=name_lo, data[2]=name_hi, data[3]=next_offset
+        let name_lo = resp.data[1];
+        let name_hi = resp.data[2];
+        next_off = resp.data[3];
+
+        // Unpack filename (up to 16 bytes).
+        let mut name = [0u8; 16];
+        let mut name_len = 0usize;
+        for i in 0..8 {
+            let b = ((name_lo >> (i * 8)) & 0xFF) as u8;
+            if b == 0 { break; }
+            name[name_len] = b;
+            name_len += 1;
+        }
+        if name_len == 8 {
+            for i in 0..8 {
+                let b = ((name_hi >> (i * 8)) & 0xFF) as u8;
+                if b == 0 { break; }
+                name[name_len] = b;
+                name_len += 1;
+            }
+        }
+
+        // Build a Linux dirent64 entry.
+        // d_reclen = 8(ino) + 8(off) + 2(reclen) + 1(type) + name_len + 1(null), rounded up to 8.
+        let reclen = ((19 + name_len + 1) + 7) & !7;
+        if buf_pos + reclen > count.min(2048) { break; }
+
+        let d_ino = next_off as u64 + 1; // Fake inode
+        let d_off = next_off as i64;
+        let d_type = 0u8; // DT_UNKNOWN
+
+        // d_ino at offset 0
+        buf[buf_pos..buf_pos+8].copy_from_slice(&d_ino.to_le_bytes());
+        // d_off at offset 8
+        buf[buf_pos+8..buf_pos+16].copy_from_slice(&d_off.to_le_bytes());
+        // d_reclen at offset 16
+        buf[buf_pos+16..buf_pos+18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        // d_type at offset 18
+        buf[buf_pos+18] = d_type;
+        // d_name at offset 19
+        for i in 0..name_len {
+            buf[buf_pos + 19 + i] = name[i];
+        }
+        buf[buf_pos + 19 + name_len] = 0; // null terminate
+        // Zero pad to reclen
+        for i in (19 + name_len + 1)..reclen {
+            buf[buf_pos + i] = 0;
+        }
+
+        buf_pos += reclen;
+    }
+
+    syscall::port_destroy(rp);
+
+    // Update FD offset for next call.
+    unsafe { FD_TABLE[fd].offset = next_off; }
+
+    if buf_pos > 0 {
+        let written = syscall::personality_copy_out(caller_port, dirp_va, &buf[..buf_pos]);
+        if written == 0 { return linux_err(EFAULT); }
+        buf_pos as u64
+    } else {
+        0 // EOF
+    }
+}
+
 /// Handle Linux getpid/gettid/getuid/geteuid/getgid/getegid.
 fn handle_getid(nr: u64) -> u64 {
     match nr {
@@ -1058,6 +1469,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         REPLY_PORT = syscall::port_create();
         VFS_PORT = syscall::ns_lookup(b"vfs").unwrap_or(0);
         PIPE_PORT = syscall::ns_lookup(b"pipe").unwrap_or(0);
+        // Initialize CWD to "/".
+        CWD[0] = b'/';
+        CWD_LEN = 1;
     }
 
     syscall::debug_puts(b"[linux_srv] ready on port ");
@@ -1088,6 +1502,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_GETCWD => handle_getcwd(caller_port, &msg.data),
             __NR_READLINK => handle_readlink(caller_port, &msg.data),
             __NR_OPENAT => handle_openat(caller_port, &msg.data),
+            __NR_MKDIR => handle_mkdir(caller_port, &msg.data),
+            __NR_MKDIRAT => handle_mkdirat(caller_port, &msg.data),
+            __NR_RMDIR | __NR_UNLINK => handle_unlink_impl(caller_port, &msg.data),
+            __NR_UNLINKAT => handle_unlinkat(caller_port, &msg.data),
+            __NR_CHDIR => handle_chdir(caller_port, &msg.data),
+            __NR_FCHDIR => 0, // stub
+            __NR_GETDENTS64 => handle_getdents64(caller_port, &msg.data),
             __NR_DUP3 => handle_dup3(&msg.data),
             __NR_PIPE2 => handle_pipe2(caller_port, &msg.data),
             __NR_FORK | __NR_VFORK => handle_fork(caller_port),

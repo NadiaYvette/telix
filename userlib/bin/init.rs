@@ -8750,6 +8750,128 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 126: Linux personality directory operations ---
+    syscall::debug_puts(b"  init: Phase 126 linux dir ops...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                // Child: wait for personality to be set.
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        // Step 1: mkdir("/p126dir", 0755) — Linux NR=83
+                        let dir_path = b"/p126dir\0";
+                        let ret: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 83u64 => ret,
+                            in("rdi") dir_path.as_ptr() as u64,
+                            in("rsi") 0o755u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if (ret as i64) < 0 {
+                            // mkdir failed
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
+                        }
+
+                        // Step 2: rmdir("/p126dir") — Linux NR=84
+                        let ret2: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 84u64 => ret2,
+                            in("rdi") dir_path.as_ptr() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if (ret2 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 20u64, options(noreturn));
+                        }
+
+                        // Step 3: mkdir + getcwd to test CWD reporting
+                        // mkdir("/p126b", 0755)
+                        let dir2 = b"/p126b\0";
+                        let ret3a: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 83u64 => ret3a,
+                            in("rdi") dir2.as_ptr() as u64,
+                            in("rsi") 0o755u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if (ret3a as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 30u64, options(noreturn));
+                        }
+                        // rmdir("/p126b")
+                        let ret3b: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 84u64 => ret3b,
+                            in("rdi") dir2.as_ptr() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if (ret3b as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 31u64, options(noreturn));
+                        }
+
+                        // All passed — exit 0 via Linux exit_group
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                // Parent: set child's personality to Linux.
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 126 linux dir ops: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 126 linux dir ops: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 126 linux dir ops: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 126 linux dir ops: SKIPPED (linux_srv not found)\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
