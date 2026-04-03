@@ -117,6 +117,8 @@ pub const SYS_PERSONALITY_REPLY: u64 = 107;
 pub const SYS_PERSONALITY_READ_ARGS: u64 = 108;
 pub const SYS_PERSONALITY_COPY_IN: u64 = 110;
 pub const SYS_PERSONALITY_COPY_OUT: u64 = 111;
+pub const SYS_PERSONALITY_FORK: u64 = 112;
+pub const SYS_PERSONALITY_WAIT4: u64 = 113;
 pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Error code: capability check failed.
@@ -184,13 +186,24 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
     // is always handled natively.
     if nr != SYS_PERSONALITY_REGISTER && nr != SYS_PERSONALITY_SET && nr != SYS_PERSONALITY_GET
         && nr != SYS_PERSONALITY_REPLY && nr != SYS_PERSONALITY_READ_ARGS
-        && nr != SYS_PERSONALITY_COPY_IN && nr != SYS_PERSONALITY_COPY_OUT {
+        && nr != SYS_PERSONALITY_COPY_IN && nr != SYS_PERSONALITY_COPY_OUT
+        && nr != SYS_PERSONALITY_FORK && nr != SYS_PERSONALITY_WAIT4 {
         let tid = crate::sched::smp::current()
             .current_thread
             .load(core::sync::atomic::Ordering::Relaxed);
         let task_id = crate::sched::scheduler::thread_ref(tid).task_id;
         let task = crate::sched::scheduler::task_ref(task_id);
         if task.personality as u8 != 0 {
+            // Handle exit syscalls natively to avoid deadlock: if the
+            // personality server is processing a blocking wait4, it can't
+            // drain exit messages from its port queue.
+            let is_native_exit = match task.syscall_abi as u8 {
+                3 => nr == 60 || nr == 231, // LinuxX86_64: exit / exit_group
+                _ => false,
+            };
+            if is_native_exit {
+                crate::sched::scheduler::exit_current_thread(a0 as i32);
+            }
             let port = task.personality_port;
             let result = crate::syscall::personality::forward_to_server(
                 port, nr, [a0, a1, a2, a3, a4, a5],
@@ -421,6 +434,12 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_PERSONALITY_COPY_OUT => {
             crate::syscall::personality::personality_copy_out(a0, a1 as usize, a2 as usize, a3 as usize)
+        }
+        SYS_PERSONALITY_FORK => {
+            crate::syscall::personality::personality_fork(a0)
+        }
+        SYS_PERSONALITY_WAIT4 => {
+            crate::syscall::personality::personality_wait4(a0, a1, a2, frame)
         }
         SYS_FRAMEBUFFER_INFO => sys_framebuffer_info(frame),
         _ => {

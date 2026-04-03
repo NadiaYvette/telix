@@ -65,6 +65,8 @@ const SYS_PERSONALITY_REPLY: u64 = 107;
 const SYS_PERSONALITY_READ_ARGS: u64 = 108;
 const SYS_PERSONALITY_COPY_IN: u64 = 110;
 const SYS_PERSONALITY_COPY_OUT: u64 = 111;
+const SYS_PERSONALITY_FORK: u64 = 112;
+const SYS_PERSONALITY_WAIT4: u64 = 113;
 const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Register a personality server for a given personality ID.
@@ -135,6 +137,20 @@ pub fn personality_copy_out(target_port: u64, dst_va: usize, src: &[u8]) -> usiz
             src.len() as u64,
         ) as usize
     }
+}
+
+/// Fork a target task on behalf of a personality server.
+/// Returns the child task's port_id, or u64::MAX on error.
+pub fn personality_fork(target_port: u64) -> u64 {
+    unsafe { arch::syscall1(SYS_PERSONALITY_FORK, target_port) }
+}
+
+/// Wait for a child of the target task (non-blocking, personality server only).
+/// Returns child_port (0 = no child ready, u64::MAX = error/ECHILD).
+/// Wait status is returned in the second register (r1/rdi) — currently
+/// not captured by the syscall ABI. Use 0 as placeholder.
+pub fn personality_wait4(target_port: u64, pid: i64, flags: u32) -> u64 {
+    unsafe { arch::syscall3(SYS_PERSONALITY_WAIT4, target_port, pid as u64, flags as u64) }
 }
 
 /// Register a port as the network proxy endpoint for non-local sends.

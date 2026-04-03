@@ -2719,6 +2719,282 @@ pub fn fork_current() -> u64 {
     child_task_port
 }
 
+/// Fork a target task on behalf of a personality server.
+///
+/// Same semantics as `fork_current()` but operates on `target_task_id` / `target_tid`
+/// instead of the calling thread. The target must be blocked in PersonalityWait.
+/// Returns the child task's port_id, or u64::MAX on error.
+pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
+    // Read target's personality exception frame (not saved_sp, which gets
+    // overwritten by context switches during block_current spin-wait).
+    let parent_frame_sp = thread_ref(target_tid).personality_frame_sp as usize;
+    if parent_frame_sp == 0 {
+        return u64::MAX;
+    }
+
+    // Gather parent info from target task/thread (lock-free).
+    let parent_task_id = target_task_id;
+    let parent_aspace_id;
+    let parent_priority;
+    let parent_quantum;
+    let parent_sig_mask;
+    {
+        let thread = thread_ref(target_tid);
+        let task = task_ref(target_task_id);
+        parent_aspace_id = task.aspace_id;
+        parent_priority = thread.base_priority;
+        parent_quantum = thread.default_quantum;
+        parent_sig_mask = thread.sig_mask;
+
+        // RLIMIT_NPROC check.
+        let uid = task.uid;
+        let nproc_limit = task.rlimits[super::task::RLIMIT_NPROC as usize].cur;
+        if nproc_limit != super::task::RLIM_INFINITY {
+            let mut count = 0u64;
+            SCHED_TASK_ART.for_each(|key, val| {
+                if key == 0 { return; }
+                let t = unsafe { &*(val as *const Task) };
+                if t.active && t.uid == uid { count += 1; }
+            });
+            if count >= nproc_limit {
+                return u64::MAX;
+            }
+        }
+    }
+
+    // Clone the address space (COW).
+    let (child_aspace_id, child_pt_root) = match crate::mm::aspace::clone_for_cow(parent_aspace_id)
+    {
+        Some(x) => x,
+        None => return u64::MAX,
+    };
+
+    // Snapshot parent credentials/groups under SPAWN_LOCK.
+    let (
+        child_task_id,
+        parent_pgid, parent_sid, parent_ctty,
+        parent_uid, parent_euid, parent_gid, parent_egid,
+        parent_groups_inline, parent_groups_overflow, parent_ngroups,
+        parent_rlimits,
+        parent_personality, parent_syscall_abi, parent_personality_port,
+    ) = {
+        let _lock = SPAWN_LOCK.lock();
+        let child_task_id = match alloc_task_id() {
+            Some(id) => id,
+            None => return u64::MAX,
+        };
+        let ptask = task_ref(parent_task_id);
+        (
+            child_task_id,
+            ptask.pgid, ptask.sid, ptask.ctty_port,
+            ptask.uid, ptask.euid, ptask.gid, ptask.egid,
+            ptask.groups_inline, ptask.groups_overflow, ptask.ngroups,
+            ptask.rlimits,
+            ptask.personality, ptask.syscall_abi, ptask.personality_port,
+        )
+    };
+
+    // Create child task port.
+    let child_task_port =
+        match crate::ipc::port::create_kernel_port(task_port_handler, child_task_id as usize) {
+            Some(p) => p,
+            None => return u64::MAX,
+        };
+
+    // Duplicate groups overflow page if needed.
+    let child_groups_overflow =
+        if parent_ngroups as usize > GROUPS_INLINE && parent_groups_overflow != 0 {
+            match crate::mm::phys::alloc_page() {
+                Some(p) => {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            parent_groups_overflow as *const u8,
+                            p.as_usize() as *mut u8,
+                            parent_ngroups as usize * core::mem::size_of::<u32>(),
+                        );
+                    }
+                    p.as_usize()
+                }
+                None => return u64::MAX,
+            }
+        } else {
+            0
+        };
+
+    // Initialize child task struct.
+    {
+        let task = unsafe { task_mut_from_ref(child_task_id) };
+        *task = Task::empty();
+        task.id = child_task_id;
+        task.active = true;
+        task.port_id = child_task_port;
+        task.aspace_id = child_aspace_id;
+        task.page_table_root = child_pt_root;
+        task.exit_code = 0;
+        task.exited = false;
+        task.reaped = false;
+        task.wait_status = 0;
+        task.thread_count = 1;
+        task.parent_task = parent_task_id;
+        task.pgid = parent_pgid;
+        task.sid = parent_sid;
+        task.ctty_port = parent_ctty;
+        task.fg_pgid = 0;
+        task.uid = parent_uid;
+        task.euid = parent_euid;
+        task.gid = parent_gid;
+        task.egid = parent_egid;
+        task.groups_inline = parent_groups_inline;
+        task.groups_overflow = child_groups_overflow;
+        task.ngroups = parent_ngroups;
+        task.rlimits = parent_rlimits;
+        task.personality = parent_personality;
+        task.syscall_abi = parent_syscall_abi;
+        task.personality_port = parent_personality_port;
+    }
+
+    // Bootstrap capabilities.
+    {
+        crate::cap::capset_copy(parent_task_id, child_task_id);
+        {
+            let tptr = TASK_TABLE.get(child_task_id) as *mut Task;
+            unsafe { (*tptr).capspace = crate::cap::CapSpace::new(child_task_id); }
+        }
+        let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
+        if nsrv != u64::MAX {
+            crate::cap::grant_send_cap(child_task_id, nsrv);
+        }
+        let iramfs =
+            crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
+        if iramfs != u64::MAX {
+            crate::cap::grant_send_cap(child_task_id, iramfs);
+        }
+        use crate::cap::capability::Rights;
+        let srm = Rights::SEND.union(Rights::RECV).union(Rights::MANAGE);
+        crate::cap::grant_port_cap(parent_task_id, child_task_port, srm);
+        crate::cap::grant_send_cap(child_task_id, child_task_port);
+    }
+
+    // Allocate kernel stack for child thread.
+    let kstack_page = match crate::mm::phys::alloc_pages(KSTACK_ORDER) {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
+    let kstack_base = kstack_page.as_usize();
+    let kstack_top = kstack_base + kstack_size();
+
+    // Copy target's exception frame to child's kernel stack.
+    let child_frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            parent_frame_sp as *const u8,
+            child_frame_sp as *mut u8,
+            EXCEPTION_FRAME_SIZE,
+        );
+    }
+
+    // Set child's return value to 0.
+    {
+        let child_frame =
+            unsafe { &mut *(child_frame_sp as *mut crate::syscall::handlers::ExceptionFrame) };
+        crate::syscall::handlers::set_return(child_frame, 0);
+    }
+
+    // Allocate child thread ID.
+    let child_tid = match {
+        let _lock = SPAWN_LOCK.lock();
+        alloc_thread_id()
+    } {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let child_thread_port =
+        match crate::ipc::port::create_kernel_port(thread_port_handler, child_tid as usize) {
+            Some(p) => p,
+            None => return u64::MAX,
+        };
+
+    // Initialize child thread.
+    let thread = unsafe { thread_mut_from_ref(child_tid) };
+    thread.killed.store(false, Ordering::Release);
+    thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
+    thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+
+    thread.id = child_tid;
+    thread.state = ThreadState::Ready;
+    thread.task_id = child_task_id;
+    thread.port_id = child_thread_port;
+    thread.base_priority = parent_priority;
+    thread.effective_priority = parent_priority;
+    thread.prio.store(parent_priority, Ordering::Relaxed);
+    thread.thread_task.store(child_task_id, Ordering::Relaxed);
+    thread.quantum = parent_quantum;
+    thread.default_quantum = parent_quantum;
+    thread.saved_sp = child_frame_sp as u64;
+    thread.stack_base = kstack_base;
+    thread.exit_code = 0;
+    thread.sig_mask = parent_sig_mask;
+    thread.sig_pending = 0;
+
+    percpu_enqueue(smp::cpu_id(), parent_priority, child_tid);
+
+    // Grant caps on child's thread port.
+    {
+        use crate::cap::capability::Rights;
+        let srm = Rights::SEND.union(Rights::RECV).union(Rights::MANAGE);
+        let sm = Rights::SEND.union(Rights::MANAGE);
+        crate::cap::grant_port_cap(parent_task_id, child_thread_port, sm);
+        crate::cap::grant_port_cap(child_task_id, child_thread_port, srm);
+    }
+
+    child_task_port
+}
+
+/// Wait for a child of the given target task (non-blocking).
+///
+/// Like `wait4()` but scans children of `target_task_id` instead of the calling
+/// task. Always returns immediately (like WNOHANG behavior).
+/// Returns (child_port, child_id, wait_status) or (0, -1, 0) for ECHILD.
+pub fn wait4_for_task(target_task_id: u32, pid: i64, flags: u32) -> (u64, i32, i32) {
+    let my_pgid = task_ref(target_task_id).pgid;
+
+    let mut found: Option<(u32, i32)> = None;
+    let mut has_children = false;
+    SCHED_TASK_ART.for_each(|key, val| {
+        if found.is_some() || key == 0 { return; }
+        let task = unsafe { &*(val as *const Task) };
+        if task.parent_task != target_task_id { return; }
+
+        let matches = match pid {
+            -1 => true,
+            0 => task.pgid == my_pgid,
+            p if p > 0 => task.id == p as TaskId,
+            p => task.pgid == (-p) as TaskId,
+        };
+        if !matches { return; }
+        has_children = true;
+
+        if task.exited && !task.reaped {
+            found = Some((task.id, task.wait_status));
+        }
+    });
+
+    if let Some((child_id, status)) = found {
+        let t = unsafe { task_mut_from_ref(child_id) };
+        t.reaped = true;
+        let port_id = t.port_id;
+        t.port_id = 0;
+        if port_id != 0 {
+            crate::ipc::port::destroy(port_id);
+        }
+        (port_id, child_id as i32, status)
+    } else if !has_children {
+        (0, -1, 0)
+    } else {
+        (0, 0, 0)
+    }
+}
+
 /// Terminate the current thread and destroy its task's resources.
 /// This function never returns.
 pub fn exit_current_thread(exit_code: i32) -> ! {
@@ -3071,6 +3347,11 @@ pub fn thread_effective_priority(tid: ThreadId) -> u8 {
 pub fn store_frame_sp(sp: u64) {
     let cpu = smp::cpu_id() as usize;
     CURRENT_FRAME_SP[cpu].store(sp, Ordering::Release);
+}
+
+/// Read the current exception frame SP for a given CPU.
+pub fn current_frame_sp(cpu: usize) -> u64 {
+    CURRENT_FRAME_SP[cpu].load(Ordering::Acquire)
 }
 
 /// Take (read and clear) any pending context switch SP.

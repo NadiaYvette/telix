@@ -191,6 +191,17 @@ pub fn forward_to_server(
             BlockReason::PersonalityWait;
     }
 
+    // Save the exception frame pointer into personality_frame_sp so the
+    // personality server can read it reliably (for personality_read_args,
+    // personality_copy_in/out, personality_fork). We cannot use saved_sp
+    // because block_current's spin-wait gets preempted by the scheduler,
+    // which overwrites saved_sp with the kernel context (not the exception frame).
+    {
+        let cpu = crate::sched::smp::cpu_id() as usize;
+        let frame_sp = crate::sched::scheduler::current_frame_sp(cpu);
+        unsafe { crate::sched::scheduler::thread_mut_from_ref(tid) }.personality_frame_sp = frame_sp;
+    }
+
     // Send to the personality server.
     if crate::ipc::port::send(personality_port, msg).is_err() {
         unsafe {
@@ -305,8 +316,8 @@ pub fn personality_read_args(
         return u64::MAX;
     }
 
-    // Read args[4] and args[5] from the target's saved exception frame.
-    let target_sp = crate::sched::scheduler::thread_ref(target_tid).saved_sp;
+    // Read args[4] and args[5] from the target's personality exception frame.
+    let target_sp = crate::sched::scheduler::thread_ref(target_tid).personality_frame_sp;
     if target_sp == 0 {
         return u64::MAX;
     }
@@ -427,6 +438,59 @@ pub fn personality_copy_out(target_port: u64, dst_va: usize, src_va: usize, len:
         offset += chunk;
     }
     offset as u64
+}
+
+/// Fork a target task on behalf of a personality server.
+///
+/// Returns the child task's port_id, or u64::MAX on error.
+pub fn personality_fork(target_port: u64) -> u64 {
+    let _caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return u64::MAX;
+    }
+
+    crate::sched::scheduler::fork_for_task(target_task_id, target_tid)
+}
+
+/// Wait for a child of the target task on behalf of a personality server.
+///
+/// Returns child_port in r0, status in r1 (via frame). Always non-blocking.
+pub fn personality_wait4(
+    target_port: u64,
+    pid: u64,
+    flags: u64,
+    frame: &mut crate::arch::trapframe::ExceptionFrame,
+) -> u64 {
+    let _caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    // Note: target does NOT need to be in PersonalityWait for wait4,
+    // but it should be blocked (it's waiting for linux_srv to reply).
+    // Actually, the target IS blocked in PersonalityWait since it called
+    // Linux wait4 which got forwarded to us.
+
+    let (child_port, _child_id, status) =
+        crate::sched::scheduler::wait4_for_task(target_task_id, pid as i64, flags as u32);
+
+    // Pack: child_port in low 32 bits of r1, status in high 32 bits.
+    let packed_status = (status as u32) as u64;
+    crate::arch::trapframe::set_reg(frame, 1, packed_status);
+    child_port
 }
 
 /// Find a thread in `task_id` that is blocked on PersonalityWait.

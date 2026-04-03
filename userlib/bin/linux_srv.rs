@@ -34,7 +34,11 @@ const __NR_IOCTL: u64 = 16;
 const __NR_ACCESS: u64 = 21;
 const __NR_WRITEV: u64 = 20;
 const __NR_GETPID: u64 = 39;
+const __NR_CLONE: u64 = 56;
+const __NR_FORK: u64 = 57;
+const __NR_VFORK: u64 = 58;
 const __NR_EXIT: u64 = 60;
+const __NR_WAIT4: u64 = 61;
 const __NR_UNAME: u64 = 63;
 const __NR_GETCWD: u64 = 79;
 const __NR_READLINK: u64 = 89;
@@ -65,6 +69,8 @@ const EBADF: u64 = 9;
 const EFAULT: u64 = 14;
 const ENOTDIR: u64 = 20;
 const EINVAL: u64 = 22;
+const EAGAIN: u64 = 11;
+const ECHILD: u64 = 10;
 const ENOSYS: u64 = 38;
 const ERANGE: u64 = 34;
 
@@ -652,8 +658,50 @@ fn handle_access(caller_port: u64, args: &[u64; 6]) -> u64 {
 
 /// Handle Linux readlink(path, buf, bufsiz).
 fn handle_readlink(_caller_port: u64, _args: &[u64; 6]) -> u64 {
-    // We don't support symlinks yet. Return EINVAL.
     linux_err(EINVAL)
+}
+
+/// Handle Linux fork() / vfork() / clone() (basic).
+fn handle_fork(caller_port: u64) -> u64 {
+    let child_port = syscall::personality_fork(caller_port);
+    if child_port == u64::MAX {
+        return linux_err(EAGAIN);
+    }
+    child_port
+}
+
+/// Handle Linux wait4(pid, wstatus, options, rusage).
+fn handle_wait4(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let pid = args[0] as i64;
+    let wstatus_va = args[1] as usize;
+    let options = args[2] as u32;
+    let wnohang = options & 1; // WNOHANG = 1
+
+    // Poll loop for blocking wait.
+    for _ in 0..5000 {
+        let child_port = syscall::personality_wait4(caller_port, pid, 1); // always WNOHANG
+        if child_port == u64::MAX {
+            // No children at all → ECHILD
+            return linux_err(ECHILD);
+        }
+        if child_port != 0 {
+            // Found an exited child. Write status to caller if requested.
+            if wstatus_va != 0 {
+                // Normal exit status: (exit_code << 8) & 0xFF00
+                // For now, write 0 (exited with code 0).
+                let status: u32 = 0;
+                let status_bytes = status.to_le_bytes();
+                syscall::personality_copy_out(caller_port, wstatus_va, &status_bytes);
+            }
+            return child_port;
+        }
+        if wnohang != 0 {
+            return 0; // No child ready, WNOHANG.
+        }
+        syscall::yield_now();
+    }
+    // Timeout — return 0 (no child ready).
+    0
 }
 
 /// Handle Linux brk(addr).
@@ -765,6 +813,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_GETCWD => handle_getcwd(caller_port, &msg.data),
             __NR_READLINK => handle_readlink(caller_port, &msg.data),
             __NR_OPENAT => handle_openat(caller_port, &msg.data),
+            __NR_FORK | __NR_VFORK => handle_fork(caller_port),
+            __NR_CLONE => handle_fork(caller_port), // basic clone = fork
+            __NR_WAIT4 => handle_wait4(caller_port, &msg.data),
             __NR_BRK => handle_brk(&msg.data),
             __NR_ARCH_PRCTL => handle_arch_prctl(&msg.data),
             __NR_SET_TID_ADDRESS => handle_set_tid_address(caller_port),

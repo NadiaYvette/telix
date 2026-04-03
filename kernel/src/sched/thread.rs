@@ -110,6 +110,11 @@ pub struct Thread {
     // --- Personality forwarding ---
     /// Result value from personality server reply (written by SYS_PERSONALITY_REPLY).
     pub personality_result: core::sync::atomic::AtomicU64,
+    /// Saved exception frame pointer for personality-blocked threads.
+    /// Unlike saved_sp (which gets overwritten by context switches during
+    /// block_current spin-wait), this field preserves the original exception
+    /// frame so personality_fork/personality_read_args can read it reliably.
+    pub personality_frame_sp: u64,
 }
 
 impl Thread {
@@ -154,6 +159,7 @@ impl Thread {
             ts_prev: core::sync::atomic::AtomicU32::new(0),
             ts_blocked_on: core::sync::atomic::AtomicUsize::new(0),
             personality_result: core::sync::atomic::AtomicU64::new(0),
+            personality_frame_sp: 0,
         }
     }
 }

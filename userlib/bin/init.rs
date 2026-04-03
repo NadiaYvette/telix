@@ -8388,6 +8388,121 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 123: Linux personality fork + wait4 ---
+    syscall::debug_puts(b"  init: Phase 123 linux fork+wait4...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            // Fork a child that will be switched to Linux personality.
+            // The child will then do a Linux fork() itself (delegated via linux_srv)
+            // and wait for its grandchild.
+            let child = syscall::fork();
+            if child == 0 {
+                // Child: wait for personality to be set.
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    // Linux personality set. Now do a Linux fork().
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        let child_pid: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 57u64 => child_pid, // __NR_fork
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if child_pid == 0 {
+                            // Grandchild: write a message and exit.
+                            let msg = b"[linux grandchild] hello from fork!\n";
+                            core::arch::asm!(
+                                "int 0x80",
+                                inlateout("rax") 1u64 => _, // __NR_write
+                                in("rdi") 1u64,
+                                in("rsi") msg.as_ptr() as u64,
+                                in("rdx") msg.len() as u64,
+                                lateout("rcx") _,
+                                lateout("r11") _,
+                            );
+                            core::arch::asm!(
+                                "int 0x80",
+                                in("rax") 231u64, // __NR_exit_group
+                                in("rdi") 0u64,
+                                options(noreturn),
+                            );
+                        } else {
+                            // Parent (child of init): wait for grandchild.
+                            // Linux wait4(-1, NULL, 0, NULL)
+                            let _waited: u64;
+                            core::arch::asm!(
+                                "int 0x80",
+                                inlateout("rax") 61u64 => _waited, // __NR_wait4
+                                in("rdi") (-1i64) as u64,          // pid = -1 (any)
+                                in("rsi") 0u64,                     // wstatus = NULL
+                                in("rdx") 0u64,                     // options = 0
+                                lateout("rcx") _,
+                                lateout("r11") _,
+                            );
+                            // Write success message.
+                            let msg2 = b"[linux child] fork+wait4 OK\n";
+                            core::arch::asm!(
+                                "int 0x80",
+                                inlateout("rax") 1u64 => _, // __NR_write
+                                in("rdi") 1u64,
+                                in("rsi") msg2.as_ptr() as u64,
+                                in("rdx") msg2.len() as u64,
+                                lateout("rcx") _,
+                                lateout("r11") _,
+                            );
+                            // Exit.
+                            core::arch::asm!(
+                                "int 0x80",
+                                in("rax") 231u64,
+                                in("rdi") 0u64,
+                                options(noreturn),
+                            );
+                        }
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                // Parent (init): set child's personality to Linux.
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exited = false;
+                for _ in 0..500 {
+                    if let Some(_code) = syscall::waitpid(child) {
+                        exited = true;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exited {
+                    syscall::debug_puts(b"Phase 123 linux fork+wait4: PASSED\n");
+                } else {
+                    syscall::debug_puts(b"Phase 123 linux fork+wait4: FAILED (timeout)\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 123 linux fork+wait4: SKIPPED (linux_srv not found)\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
