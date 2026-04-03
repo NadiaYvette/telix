@@ -8673,6 +8673,83 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 125: Linux personality execve ---
+    syscall::debug_puts(b"  init: Phase 125 linux execve...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                // Child: wait for personality to be set.
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        // execve("/linux_exit42", NULL, NULL) → syscall 59
+                        let filename = b"/linux_exit42\0";
+                        let exec_ret: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => exec_ret,
+                            in("rdi") filename.as_ptr() as u64,
+                            in("rsi") 0u64,
+                            in("rdx") 0u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        // If we get here, execve failed.
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 99u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(99);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                // Parent: set child's personality to Linux.
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 42 {
+                    syscall::debug_puts(b"Phase 125 linux execve: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 125 linux execve: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 125 linux execve: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 125 linux execve: SKIPPED (linux_srv not found)\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

@@ -67,6 +67,7 @@ const SYS_PERSONALITY_COPY_IN: u64 = 110;
 const SYS_PERSONALITY_COPY_OUT: u64 = 111;
 const SYS_PERSONALITY_FORK: u64 = 112;
 const SYS_PERSONALITY_WAIT4: u64 = 113;
+const SYS_PERSONALITY_EXECVE: u64 = 114;
 const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Register a personality server for a given personality ID.
@@ -151,6 +152,21 @@ pub fn personality_fork(target_port: u64) -> u64 {
 /// not captured by the syscall ABI. Use 0 as placeholder.
 pub fn personality_wait4(target_port: u64, pid: i64, flags: u32) -> u64 {
     unsafe { arch::syscall3(SYS_PERSONALITY_WAIT4, target_port, pid as u64, flags as u64) }
+}
+
+/// Execve on a target task (personality server only).
+/// Replaces the target's process image with the named ELF from initramfs.
+/// On success, the target is woken directly — do NOT call personality_reply.
+/// Returns 0 on success, u64::MAX on error.
+pub fn personality_execve(target_port: u64, name: &[u8]) -> u64 {
+    unsafe {
+        arch::syscall3(
+            SYS_PERSONALITY_EXECVE,
+            target_port,
+            name.as_ptr() as u64,
+            name.len() as u64,
+        )
+    }
 }
 
 /// Register a port as the network proxy endpoint for non-local sends.

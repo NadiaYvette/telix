@@ -39,6 +39,7 @@ const __NR_DUP2: u64 = 33;
 const __NR_CLONE: u64 = 56;
 const __NR_FORK: u64 = 57;
 const __NR_VFORK: u64 = 58;
+const __NR_EXECVE: u64 = 59;
 const __NR_EXIT: u64 = 60;
 const __NR_WAIT4: u64 = 61;
 const __NR_UNAME: u64 = 63;
@@ -1001,6 +1002,39 @@ fn handle_exit(caller_port: u64, args: &[u64; 6]) -> u64 {
     0
 }
 
+/// Handle Linux execve(filename, argv, envp).
+/// Copies the filename from the client, calls personality_execve.
+/// On success, does NOT reply — the kernel wakes the target directly.
+/// On failure, returns -ENOENT.
+fn handle_execve(caller_port: u64, args: &[u64; 6]) -> Option<u64> {
+    let filename_va = args[0] as usize;
+    let _argv_va = args[1] as usize;
+    let _envp_va = args[2] as usize;
+
+    // Copy filename from the client's address space (null-terminated).
+    let mut name_buf = [0u8; 64];
+    let copied = syscall::personality_copy_in(caller_port, filename_va, &mut name_buf);
+    if copied == 0 {
+        return Some(linux_err(EFAULT));
+    }
+
+    // Find null terminator.
+    let name_len = name_buf[..copied].iter().position(|&b| b == 0).unwrap_or(copied);
+    let name = &name_buf[..name_len];
+
+    // Strip leading "/" for initramfs lookup.
+    let lookup_name = if name.first() == Some(&b'/') { &name[1..] } else { name };
+
+    let result = syscall::personality_execve(caller_port, lookup_name);
+    if result == u64::MAX {
+        return Some(linux_err(ENOENT));
+    }
+
+    // Success: the kernel has already woken the target with its new image.
+    // Do NOT call personality_reply — return None to signal the main loop to skip reply.
+    None
+}
+
 /// Handle Linux getpid/gettid/getuid/geteuid/getgid/getegid.
 fn handle_getid(nr: u64) -> u64 {
     match nr {
@@ -1058,6 +1092,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_PIPE2 => handle_pipe2(caller_port, &msg.data),
             __NR_FORK | __NR_VFORK => handle_fork(caller_port),
             __NR_CLONE => handle_fork(caller_port), // basic clone = fork
+            __NR_EXECVE => {
+                match handle_execve(caller_port, &msg.data) {
+                    Some(err) => err,
+                    None => continue, // Success: kernel woke target directly, skip reply.
+                }
+            }
             __NR_WAIT4 => handle_wait4(caller_port, &msg.data),
             __NR_BRK => handle_brk(&msg.data),
             __NR_ARCH_PRCTL => handle_arch_prctl(&msg.data),

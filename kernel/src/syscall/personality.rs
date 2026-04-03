@@ -493,6 +493,51 @@ pub fn personality_wait4(
     child_port
 }
 
+/// Personality-delegated execve: replace a blocked target task's image.
+/// Args: target_port, name_ptr (in caller's address space), name_len.
+/// On success, wakes the target directly (personality server should NOT
+/// call personality_reply). Returns 0 on success, u64::MAX on failure.
+pub fn personality_execve(target_port: u64, name_ptr: u64, name_len: u64) -> u64 {
+    let _caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return u64::MAX;
+    }
+
+    // Read filename from caller's (personality server's) address space.
+    // Since we're running on the personality server's thread, we can read directly.
+    let len = (name_len as usize).min(64);
+    let name = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, len) };
+
+    // Delegate to exec_for_task which handles the heavy lifting.
+    let result = crate::syscall::handlers::exec_for_task(target_task_id, target_tid, name);
+    if result != 0 {
+        return u64::MAX;
+    }
+
+    // Wake the target thread. Its exception frame has been rewritten to
+    // point at the new binary's entry. When it returns through
+    // forward_to_server → dispatch → set_return, the set_return writes
+    // to rax which is harmless for a freshly exec'd binary.
+    // Must use wake_thread() (not raw wakeup.store) so that the thread's
+    // priority is restored and yield_asap is cleared, allowing it to
+    // actually be scheduled.
+    crate::sched::scheduler::thread_ref(target_tid)
+        .personality_result
+        .store(0, core::sync::atomic::Ordering::Release);
+    crate::sched::wake_thread(target_tid);
+
+    0
+}
+
 /// Find a thread in `task_id` that is blocked on PersonalityWait.
 /// Returns the ThreadId, or u32::MAX if none found.
 fn find_personality_waiter(task_id: u32) -> u32 {

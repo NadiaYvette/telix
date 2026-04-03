@@ -152,6 +152,10 @@ name = "linux_srv"
 path = "bin/linux_srv.rs"
 
 [[bin]]
+name = "linux_exit42"
+path = "bin/linux_exit42.rs"
+
+[[bin]]
 name = "fb_srv"
 path = "bin/fb_srv.rs"
 

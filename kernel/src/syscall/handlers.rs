@@ -119,6 +119,7 @@ pub const SYS_PERSONALITY_COPY_IN: u64 = 110;
 pub const SYS_PERSONALITY_COPY_OUT: u64 = 111;
 pub const SYS_PERSONALITY_FORK: u64 = 112;
 pub const SYS_PERSONALITY_WAIT4: u64 = 113;
+pub const SYS_PERSONALITY_EXECVE: u64 = 114;
 pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Error code: capability check failed.
@@ -187,7 +188,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
     if nr != SYS_PERSONALITY_REGISTER && nr != SYS_PERSONALITY_SET && nr != SYS_PERSONALITY_GET
         && nr != SYS_PERSONALITY_REPLY && nr != SYS_PERSONALITY_READ_ARGS
         && nr != SYS_PERSONALITY_COPY_IN && nr != SYS_PERSONALITY_COPY_OUT
-        && nr != SYS_PERSONALITY_FORK && nr != SYS_PERSONALITY_WAIT4 {
+        && nr != SYS_PERSONALITY_FORK && nr != SYS_PERSONALITY_WAIT4
+        && nr != SYS_PERSONALITY_EXECVE {
         let tid = crate::sched::smp::current()
             .current_thread
             .load(core::sync::atomic::Ordering::Relaxed);
@@ -440,6 +442,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_PERSONALITY_WAIT4 => {
             crate::syscall::personality::personality_wait4(a0, a1, a2, frame)
+        }
+        SYS_PERSONALITY_EXECVE => {
+            crate::syscall::personality::personality_execve(a0, a1, a2)
         }
         SYS_FRAMEBUFFER_INFO => sys_framebuffer_info(frame),
         _ => {
@@ -1987,6 +1992,191 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
 
     // dispatch() returns after this — the exception return path will
     // restore the rewritten frame and jump to the new program's entry point.
+}
+
+/// Personality-delegated execve: replace a blocked target task's image with a new ELF.
+/// Called by the personality server on behalf of a Linux client.
+/// The name is in the *caller's* (personality server's) address space.
+/// Returns 0 on success, u64::MAX on failure.
+pub(crate) fn exec_for_task(
+    target_task_id: u32,
+    target_tid: u32,
+    name: &[u8],
+) -> u64 {
+    use crate::mm::page::{self, MMUPAGE_SIZE};
+
+    let ps = page::page_size();
+    let task = crate::sched::scheduler::task_ref(target_task_id);
+    let aspace_id = task.aspace_id;
+    if aspace_id == 0 {
+        return u64::MAX;
+    }
+
+    // Look up the ELF in initramfs.
+    let elf_data = match crate::io::initramfs::lookup_file(name) {
+        Some(d) => d,
+        None => return u64::MAX,
+    };
+
+    // Validate ELF header.
+    if elf_data.len() < 64 || elf_data[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return u64::MAX;
+    }
+
+    // === POINT OF NO RETURN ===
+
+    // Kill sibling threads of the target.
+    crate::sched::scheduler::kill_other_threads_for_task(target_task_id, target_tid);
+
+    // Create a fresh page table for the new image.
+    let new_pt_root = crate::mm::hat::create_user_page_table().expect("exec_for_task: pt alloc");
+
+    // Update task's page_table_root BEFORE aspace::reset, so the scheduler
+    // won't load the old (about-to-be-freed) PT if it context-switches
+    // to the target thread during the reset.
+    unsafe {
+        crate::sched::scheduler::task_mut_from_ref(target_task_id).page_table_root = new_pt_root;
+    }
+
+    // Reset address space: destroy all VMAs/PTEs, free old page table, install new one.
+    crate::mm::aspace::reset(aspace_id, new_pt_root);
+
+    // Load ELF segments into the fresh address space.
+    let elf_info = match crate::loader::elf::load_elf(elf_data, aspace_id, new_pt_root) {
+        Ok(e) => e,
+        Err(_) => {
+            crate::println!(
+                "exec_for_task: ELF load failed for {:?}",
+                core::str::from_utf8(name)
+            );
+            return u64::MAX; // past point-of-no-return but we can't kill target here
+        }
+    };
+
+    // Handle PT_INTERP (dynamic linker).
+    let (entry, interp_base) = if elf_info.interp_len > 0 {
+        let iname = &elf_info.interp[..elf_info.interp_len];
+        let iname = if iname.first() == Some(&b'/') { &iname[1..] } else { iname };
+
+        match crate::io::initramfs::lookup_file(iname) {
+            Some(interp_data) => {
+                const INTERP_BASE: usize = 0x4_0000_0000;
+                match crate::loader::elf::load_elf_at_base(interp_data, aspace_id, new_pt_root, INTERP_BASE) {
+                    Ok(interp_info) => (interp_info.entry, INTERP_BASE),
+                    Err(_) => (elf_info.entry, 0usize),
+                }
+            }
+            None => (elf_info.entry, 0usize),
+        }
+    } else {
+        (elf_info.entry, 0usize)
+    };
+
+    crate::arch::cpu::flush_icache();
+
+    // Map a fresh user stack.
+    const USER_STACK_TOP: usize = trapframe::USER_STACK_TOP;
+    let stack_alloc_pages = 64usize; // 256KB on 4K pages
+    let stack_mmu_pages = stack_alloc_pages * page::page_mmucount();
+    let stack_va = USER_STACK_TOP - stack_alloc_pages * ps;
+
+    let obj_id = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+        aspace
+            .map_anon(stack_va, stack_mmu_pages, crate::mm::vma::VmaProt::ReadWrite)
+            .map(|vma| vma.object_id)
+    })
+    .expect("exec_for_task: stack map");
+
+    // Eagerly allocate and map stack pages.
+    let mmu_count = page::page_mmucount();
+    for page_idx in 0..stack_alloc_pages {
+        let page_va = stack_va + page_idx * ps;
+        let pa = crate::mm::object::with_object(obj_id, |obj| {
+            obj.ensure_page(page_idx).map(|(pa, _)| pa)
+        })
+        .expect("exec_for_task: stack alloc");
+        let pa_usize = pa.as_usize();
+
+        unsafe { core::ptr::write_bytes(pa_usize as *mut u8, 0, ps); }
+
+        let sw_z = crate::mm::fault::sw_zeroed_bit();
+        let pte_flags = crate::mm::hat::USER_RW_FLAGS | sw_z;
+
+        for mmu_idx in 0..mmu_count {
+            let mmu_va = page_va + mmu_idx * MMUPAGE_SIZE;
+            let mmu_pa = pa_usize + mmu_idx * MMUPAGE_SIZE;
+            crate::mm::hat::map_single_mmupage(new_pt_root, mmu_va, mmu_pa, pte_flags);
+        }
+    }
+
+    // Build minimal stack: argc=0, argv=NULL, envp=NULL, auxv.
+    let argc: usize = 0;
+
+    const AT_NULL: u64 = 0;
+    const AT_PHDR: u64 = 3;
+    const AT_PHENT: u64 = 4;
+    const AT_PHNUM: u64 = 5;
+    const AT_PAGESZ: u64 = 6;
+    const AT_BASE: u64 = 7;
+    const AT_ENTRY: u64 = 9;
+
+    let auxv: [(u64, u64); 7] = [
+        (AT_PHDR, elf_info.phdr_vaddr as u64),
+        (AT_PHENT, elf_info.phentsize as u64),
+        (AT_PHNUM, elf_info.phnum as u64),
+        (AT_PAGESZ, ps as u64),
+        (AT_ENTRY, elf_info.entry as u64),
+        (AT_BASE, interp_base as u64),
+        (AT_NULL, 0),
+    ];
+
+    // Layout: argc(8) + NULL(argv, 8) + NULL(envp, 8) + auxv(14*8) = 136 bytes
+    let table_words = 1 + 1 + 1 + auxv.len() * 2; // argc + argv_null + envp_null + auxv pairs
+    let table_size = table_words * 8;
+    let sp = (USER_STACK_TOP - table_size) & !15;
+
+    let mut pos = sp;
+    // argc = 0
+    copy_to_user(new_pt_root, pos, &(argc as u64).to_le_bytes());
+    pos += 8;
+    // argv NULL terminator
+    copy_to_user(new_pt_root, pos, &0u64.to_le_bytes());
+    pos += 8;
+    // envp NULL terminator
+    copy_to_user(new_pt_root, pos, &0u64.to_le_bytes());
+    pos += 8;
+    // auxv pairs
+    for &(key, val) in &auxv {
+        copy_to_user(new_pt_root, pos, &key.to_le_bytes());
+        pos += 8;
+        copy_to_user(new_pt_root, pos, &val.to_le_bytes());
+        pos += 8;
+    }
+
+    let argv_base = sp + 8; // points to argv NULL
+    let envp_base = sp + 16; // points to envp NULL
+
+    // Rewrite the target thread's exception frame.
+    let frame_sp = crate::sched::scheduler::thread_ref(target_tid).personality_frame_sp as usize;
+    if frame_sp == 0 {
+        return u64::MAX;
+    }
+    unsafe {
+        let frame_ptr = frame_sp as *mut u64;
+        let frame_words = crate::arch::trapframe::EXCEPTION_FRAME_SIZE / 8;
+        for i in 0..frame_words {
+            *frame_ptr.add(i) = 0;
+        }
+        trapframe::init_user_frame(
+            frame_ptr,
+            entry,
+            sp,
+            &[argc as u64, argv_base as u64, envp_base as u64],
+        );
+    }
+
+    crate::arch::cpu::flush_icache();
+    0
 }
 
 fn sys_thread_create(entry: u64, stack_top: u64, arg: u64) -> u64 {

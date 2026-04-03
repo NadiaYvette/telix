@@ -2406,6 +2406,30 @@ pub fn kill_other_threads_in_task() -> usize {
     killed
 }
 
+/// Kill all other threads in a specific task (for personality-delegated execve).
+/// Keeps `keep_tid` alive, kills everything else in the task.
+pub fn kill_other_threads_for_task(task_id: u32, keep_tid: u32) -> usize {
+    let mut killed = 0;
+
+    SCHED_THREAD_ART.for_each(|key, val| {
+        if key == keep_tid as u64 {
+            return;
+        }
+        let t = unsafe { &mut *(val as *mut Thread) };
+        if t.task_id == task_id && t.state != ThreadState::Dead {
+            t.state = ThreadState::Dead;
+            t.exit_code = -9;
+            t.killed.store(true, Ordering::Release);
+            killed += 1;
+        }
+    });
+
+    if killed > 0 {
+        unsafe { task_mut_from_ref(task_id) }.thread_count = 1;
+    }
+    killed
+}
+
 /// Find a thread in the given task that is blocked on PersonalityWait.
 /// Returns the ThreadId, or u32::MAX if none found.
 pub fn find_personality_waiter(task_id: u32) -> ThreadId {
