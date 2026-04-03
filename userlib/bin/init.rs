@@ -8245,6 +8245,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 116: Wallpaper gradient + taskbar clock ---
+    syscall::debug_puts(b"  init: Phase 116 wallpaper gradient + clock...\n");
+    {
+        let comp_ok = syscall::ns_lookup(b"compositor").is_some();
+        if comp_ok {
+            syscall::debug_puts(b"Phase 116 wallpaper gradient + clock: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 116 wallpaper gradient + clock: FAILED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

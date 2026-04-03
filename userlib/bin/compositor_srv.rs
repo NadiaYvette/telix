@@ -565,15 +565,19 @@ impl Compositor {
         syscall::send(reply_port, COMP_GET_INFO_OK, wh, mw_bpp, 0, 0);
     }
 
-    /// Fill the entire framebuffer with the background color.
+    /// Fill the entire framebuffer with a vertical gradient background.
     fn fill_background(&self) {
         let fb = self.fb_va as *mut u32;
-        let stride = self.fb_pitch as usize / 4; // pixels per row
-        for y in 0..self.fb_h as usize {
+        let stride = self.fb_pitch as usize / 4;
+        let h = self.fb_h as usize;
+        // Top: dark teal-blue (0x1a2a3a), bottom: dark gray (0x303030).
+        for y in 0..h {
+            let r = (0x1ai32 + (0x30i32 - 0x1ai32) * y as i32 / h as i32) as u32;
+            let g = (0x2ai32 + (0x30i32 - 0x2ai32) * y as i32 / h as i32) as u32;
+            let b = (0x3ai32 + (0x30i32 - 0x3ai32) * y as i32 / h as i32) as u32;
+            let color = (r << 16) | (g << 8) | b;
             for x in 0..self.fb_w as usize {
-                unsafe {
-                    ptr::write_volatile(fb.add(y * stride + x), BG_COLOR);
-                }
+                unsafe { ptr::write_volatile(fb.add(y * stride + x), color); }
             }
         }
     }
@@ -743,6 +747,21 @@ impl Compositor {
                 self.draw_text(btn_x + 4, text_y, &win.title[..text_len], TITLEBAR_TEXT_COLOR);
             }
         }
+
+        // Draw clock (uptime) on right side of taskbar.
+        let ns = syscall::clock_gettime();
+        let total_secs = (ns / 1_000_000_000) as u32;
+        let hrs = (total_secs / 3600) % 100;
+        let mins = (total_secs / 60) % 60;
+        let secs = total_secs % 60;
+        let clock: [u8; 8] = [
+            b'0' + (hrs / 10) as u8, b'0' + (hrs % 10) as u8, b':',
+            b'0' + (mins / 10) as u8, b'0' + (mins % 10) as u8, b':',
+            b'0' + (secs / 10) as u8, b'0' + (secs % 10) as u8,
+        ];
+        let clock_x = self.fb_w as i32 - 8 * 8 - 8;
+        let clock_y = bar_y + (TASKBAR_H - 8) / 2;
+        self.draw_text(clock_x, clock_y, &clock, 0x00CCCCCC);
     }
 
     fn draw_cursor(&self) {
