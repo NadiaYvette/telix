@@ -60,6 +60,12 @@ const TITLEBAR_TEXT_COLOR: u32 = 0x00FFFFFF;
 const CLOSE_BTN_SIZE: i32 = 14;
 const CLOSE_BTN_COLOR: u32 = 0x00CC4444;
 const CLOSE_BTN_X_COLOR: u32 = 0x00FFFFFF;
+const TASKBAR_H: i32 = 24;
+const TASKBAR_BG: u32 = 0x00202020;
+const TASKBAR_BTN_BG: u32 = 0x00404040;
+const TASKBAR_BTN_FOCUSED: u32 = 0x003355AA;
+const TASKBAR_BTN_H: i32 = 18;
+const TASKBAR_BTN_GAP: i32 = 4;
 
 // Page size for mmap_anon (allocation pages).
 const PAGE_SIZE: usize = 4096;
@@ -677,6 +683,68 @@ impl Compositor {
     }
 
     /// Draw the software mouse cursor on the framebuffer.
+    /// Draw the taskbar at the bottom of the screen.
+    fn draw_taskbar(&self) {
+        let fb = self.fb_va as *mut u32;
+        let stride = self.fb_pitch as usize / 4;
+        let bar_y = self.fb_h as i32 - TASKBAR_H;
+
+        // Fill taskbar background.
+        for sy in bar_y..(self.fb_h as i32) {
+            if sy < 0 { continue; }
+            for sx in 0..self.fb_w as i32 {
+                unsafe {
+                    ptr::write_volatile(fb.add(sy as usize * stride + sx as usize), TASKBAR_BG);
+                }
+            }
+        }
+
+        // Collect active windows.
+        let mut active = [0u8; MAX_WINDOWS];
+        let mut count = 0usize;
+        for i in 0..MAX_WINDOWS {
+            if self.windows[i].active {
+                active[count] = i as u8;
+                count += 1;
+            }
+        }
+        if count == 0 { return; }
+
+        let max_btn_w: i32 = 150;
+        let total_gap = TASKBAR_BTN_GAP * (count as i32 + 1);
+        let avail = self.fb_w as i32 - total_gap;
+        let btn_w = (avail / count as i32).min(max_btn_w);
+        let btn_y = bar_y + 3;
+
+        for i in 0..count {
+            let idx = active[i] as usize;
+            let btn_x = TASKBAR_BTN_GAP + i as i32 * (btn_w + TASKBAR_BTN_GAP);
+            let focused = self.focus == idx as i8;
+            let bg = if focused { TASKBAR_BTN_FOCUSED } else { TASKBAR_BTN_BG };
+
+            // Draw button rectangle.
+            for sy in btn_y..(btn_y + TASKBAR_BTN_H) {
+                if sy < 0 || sy >= self.fb_h as i32 { continue; }
+                for sx in btn_x..(btn_x + btn_w) {
+                    if sx >= 0 && sx < self.fb_w as i32 {
+                        unsafe {
+                            ptr::write_volatile(fb.add(sy as usize * stride + sx as usize), bg);
+                        }
+                    }
+                }
+            }
+
+            // Draw title text (truncated to fit button).
+            let win = &self.windows[idx];
+            let max_chars = if btn_w > 8 { ((btn_w - 8) / 8) as usize } else { 0 };
+            let text_len = (win.title_len as usize).min(max_chars);
+            if text_len > 0 {
+                let text_y = btn_y + (TASKBAR_BTN_H - 8) / 2;
+                self.draw_text(btn_x + 4, text_y, &win.title[..text_len], TITLEBAR_TEXT_COLOR);
+            }
+        }
+    }
+
     fn draw_cursor(&self) {
         let fb = self.fb_va as *mut u32;
         let stride = self.fb_pitch as usize / 4;
@@ -763,6 +831,9 @@ impl Compositor {
             self.draw_titlebar(win, focused);
             self.blit_window(win);
         }
+
+        // Draw taskbar at bottom of screen.
+        self.draw_taskbar();
 
         // Draw mouse cursor on top of everything.
         self.draw_cursor();
@@ -959,6 +1030,49 @@ impl Compositor {
     fn handle_click(&mut self) {
         let mx = self.mouse_x;
         let my = self.mouse_y;
+
+        // Check for taskbar click.
+        if my >= self.fb_h as i32 - TASKBAR_H {
+            // Determine which button was clicked using the same layout as draw_taskbar.
+            let mut active = [0u8; MAX_WINDOWS];
+            let mut count = 0usize;
+            for i in 0..MAX_WINDOWS {
+                if self.windows[i].active {
+                    active[count] = i as u8;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                let max_btn_w: i32 = 150;
+                let total_gap = TASKBAR_BTN_GAP * (count as i32 + 1);
+                let avail = self.fb_w as i32 - total_gap;
+                let btn_w = (avail / count as i32).min(max_btn_w);
+
+                for i in 0..count {
+                    let btn_x = TASKBAR_BTN_GAP + i as i32 * (btn_w + TASKBAR_BTN_GAP);
+                    if mx >= btn_x && mx < btn_x + btn_w {
+                        let idx = active[i] as usize;
+                        let old_focus = self.focus;
+                        self.focus = idx as i8;
+                        self.windows[idx].z_order = self.next_z;
+                        self.next_z += 1;
+                        if old_focus >= 0 && old_focus != idx as i8 {
+                            let old = &self.windows[old_focus as usize];
+                            if old.active && old.event_port != 0 {
+                                syscall::send_nb_4(old.event_port, COMP_FOCUS_EVENT, 0, 0, 0, 0);
+                            }
+                        }
+                        let new_win = &self.windows[idx];
+                        if new_win.event_port != 0 {
+                            syscall::send_nb_4(new_win.event_port, COMP_FOCUS_EVENT, 1, 0, 0, 0);
+                        }
+                        self.dirty = true;
+                        return;
+                    }
+                }
+            }
+            return;
+        }
 
         // Find window with highest z_order that contains (mx, my) in content or title bar.
         let mut best: i8 = -1;
