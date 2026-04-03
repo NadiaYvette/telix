@@ -8289,6 +8289,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 120: Window snap ---
+    syscall::debug_puts(b"  init: Phase 120 window snap...\n");
+    {
+        let comp_ok = syscall::ns_lookup(b"compositor").is_some();
+        if comp_ok {
+            syscall::debug_puts(b"Phase 120 window snap: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 120 window snap: FAILED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

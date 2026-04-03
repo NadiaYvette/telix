@@ -71,6 +71,7 @@ const CASCADE_MAX: u8 = 8;
 const RESIZE_MARGIN: i32 = 5;
 const MIN_WIN_W: i32 = 160;
 const MIN_WIN_H: i32 = 80;
+const SNAP_THRESHOLD: i32 = 20;
 
 // Page size for mmap_anon (allocation pages).
 const PAGE_SIZE: usize = 4096;
@@ -1121,7 +1122,40 @@ impl Compositor {
                     // Click-to-focus (title bar or content).
                     self.handle_click();
                 } else {
-                    // Button release → end drag/resize.
+                    // Button release → check snap, then end drag/resize.
+                    if self.dragging >= 0 {
+                        let idx = self.dragging as usize;
+                        if idx < MAX_WINDOWS && self.windows[idx].active {
+                            let usable_h = self.fb_h as i32 - TASKBAR_H - TITLEBAR_H - BORDER_WIDTH * 2;
+                            let snap_y = TITLEBAR_H + BORDER_WIDTH;
+                            if self.mouse_x < SNAP_THRESHOLD {
+                                // Snap left half.
+                                let win = &mut self.windows[idx];
+                                win.saved_x = win.x; win.saved_y = win.y;
+                                win.saved_w = win.w; win.saved_h = win.h;
+                                win.x = 0; win.y = snap_y;
+                                win.w = self.fb_w / 2;
+                                win.h = usable_h as u32;
+                                win.maximized = false;
+                                self.dirty = true;
+                            } else if self.mouse_x >= self.fb_w as i32 - SNAP_THRESHOLD {
+                                // Snap right half.
+                                let win = &mut self.windows[idx];
+                                win.saved_x = win.x; win.saved_y = win.y;
+                                win.saved_w = win.w; win.saved_h = win.h;
+                                win.x = self.fb_w as i32 / 2; win.y = snap_y;
+                                win.w = self.fb_w / 2;
+                                win.h = usable_h as u32;
+                                win.maximized = false;
+                                self.dirty = true;
+                            } else if self.mouse_y < SNAP_THRESHOLD {
+                                // Snap maximize.
+                                if !self.windows[idx].maximized {
+                                    self.toggle_maximize(idx);
+                                }
+                            }
+                        }
+                    }
                     self.dragging = -1;
                     self.resizing = -1;
                 }
