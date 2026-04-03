@@ -319,6 +319,116 @@ pub fn personality_read_args(
     arg4
 }
 
+/// Check that the caller is a registered personality server.
+/// Returns the caller's task_id, or None if not authorized.
+fn check_personality_server() -> Option<u32> {
+    let caller_task_id = {
+        let tid = crate::sched::smp::current()
+            .current_thread
+            .load(Ordering::Relaxed);
+        crate::sched::scheduler::thread_ref(tid).task_id
+    };
+    let caller_port = crate::sched::scheduler::task_ref(caller_task_id).port_id;
+
+    let mut is_server = false;
+    for i in 1..SERVERS.len() {
+        if SERVERS[i].port.load(Ordering::Acquire) == caller_port {
+            is_server = true;
+            break;
+        }
+    }
+    if !is_server {
+        let caller_euid = crate::sched::scheduler::task_ref(caller_task_id).euid;
+        if caller_euid != 0 {
+            return None;
+        }
+    }
+    Some(caller_task_id)
+}
+
+/// Copy bytes from a blocked personality-wait task's address space into the
+/// caller (personality server)'s buffer.
+///
+/// Args: target_task_port, src_va (in target), dst_va (in caller), len.
+/// Returns bytes copied, or u64::MAX on error.
+pub fn personality_copy_in(target_port: u64, src_va: usize, dst_va: usize, len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return u64::MAX;
+    }
+
+    let target_pt = crate::sched::scheduler::task_ref(target_task_id).page_table_root;
+    let caller_pt = crate::sched::scheduler::task_ref(caller_task_id).page_table_root;
+
+    // Copy in chunks through a kernel-side buffer to avoid mapping issues.
+    let mut offset = 0;
+    let mut tmp = [0u8; 4096];
+    while offset < len {
+        let chunk = (len - offset).min(4096);
+        if !crate::syscall::handlers::copy_from_user(target_pt, src_va + offset, &mut tmp[..chunk]) {
+            break;
+        }
+        if !crate::syscall::handlers::copy_to_user(caller_pt, dst_va + offset, &tmp[..chunk]) {
+            break;
+        }
+        offset += chunk;
+    }
+    offset as u64
+}
+
+/// Copy bytes from the caller (personality server)'s buffer into a blocked
+/// personality-wait task's address space.
+///
+/// Args: target_task_port, dst_va (in target), src_va (in caller), len.
+/// Returns bytes copied, or u64::MAX on error.
+pub fn personality_copy_out(target_port: u64, dst_va: usize, src_va: usize, len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return u64::MAX;
+    }
+
+    let caller_pt = crate::sched::scheduler::task_ref(caller_task_id).page_table_root;
+    let target_pt = crate::sched::scheduler::task_ref(target_task_id).page_table_root;
+
+    let mut offset = 0;
+    let mut tmp = [0u8; 4096];
+    while offset < len {
+        let chunk = (len - offset).min(4096);
+        if !crate::syscall::handlers::copy_from_user(caller_pt, src_va + offset, &mut tmp[..chunk]) {
+            break;
+        }
+        if !crate::syscall::handlers::copy_to_user(target_pt, dst_va + offset, &tmp[..chunk]) {
+            break;
+        }
+        offset += chunk;
+    }
+    offset as u64
+}
+
 /// Find a thread in `task_id` that is blocked on PersonalityWait.
 /// Returns the ThreadId, or u32::MAX if none found.
 fn find_personality_waiter(task_id: u32) -> u32 {

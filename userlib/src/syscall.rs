@@ -63,6 +63,8 @@ const SYS_PERSONALITY_SET: u64 = 105;
 const SYS_PERSONALITY_GET: u64 = 106;
 const SYS_PERSONALITY_REPLY: u64 = 107;
 const SYS_PERSONALITY_READ_ARGS: u64 = 108;
+const SYS_PERSONALITY_COPY_IN: u64 = 110;
+const SYS_PERSONALITY_COPY_OUT: u64 = 111;
 const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Register a personality server for a given personality ID.
@@ -103,6 +105,36 @@ pub fn personality_read_args(target_task_port: u64) -> (u64, u64) {
         (r0, 0)
     };
     (r0, r1)
+}
+
+/// Copy bytes from a blocked personality-wait task's address space into
+/// the caller's buffer. Only callable by personality servers.
+/// Returns number of bytes copied.
+pub fn personality_copy_in(target_port: u64, src_va: usize, dst: &mut [u8]) -> usize {
+    unsafe {
+        arch::syscall4(
+            SYS_PERSONALITY_COPY_IN,
+            target_port,
+            src_va as u64,
+            dst.as_mut_ptr() as u64,
+            dst.len() as u64,
+        ) as usize
+    }
+}
+
+/// Copy bytes from the caller's buffer into a blocked personality-wait
+/// task's address space. Only callable by personality servers.
+/// Returns number of bytes copied.
+pub fn personality_copy_out(target_port: u64, dst_va: usize, src: &[u8]) -> usize {
+    unsafe {
+        arch::syscall4(
+            SYS_PERSONALITY_COPY_OUT,
+            target_port,
+            dst_va as u64,
+            src.as_ptr() as u64,
+            src.len() as u64,
+        ) as usize
+    }
 }
 
 /// Register a port as the network proxy endpoint for non-local sends.

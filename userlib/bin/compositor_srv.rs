@@ -26,6 +26,7 @@ const COMP_GET_INFO: u64 = 0xA008;
 const COMP_GET_INFO_OK: u64 = 0xA009;
 const COMP_INPUT_EVENT: u64 = 0xA00A;
 const COMP_FOCUS_EVENT: u64 = 0xA00C;
+const COMP_RESIZE_EVENT: u64 = 0xA00B;
 const COMP_CLOSE_EVENT: u64 = 0xA00E;
 
 // fb_srv protocol.
@@ -1026,6 +1027,7 @@ impl Compositor {
                             let new_h = (self.resize_orig_h as i32 + dy).max(MIN_WIN_H);
                             self.windows[idx].h = new_h as u32;
                         }
+                        self.send_resize_event(idx);
                     }
                 }
             }
@@ -1138,6 +1140,7 @@ impl Compositor {
                                 win.h = usable_h as u32;
                                 win.maximized = false;
                                 self.dirty = true;
+                                self.send_resize_event(idx);
                             } else if self.mouse_x >= self.fb_w as i32 - SNAP_THRESHOLD {
                                 // Snap right half.
                                 let win = &mut self.windows[idx];
@@ -1148,8 +1151,9 @@ impl Compositor {
                                 win.h = usable_h as u32;
                                 win.maximized = false;
                                 self.dirty = true;
+                                self.send_resize_event(idx);
                             } else if self.mouse_y < SNAP_THRESHOLD {
-                                // Snap maximize.
+                                // Snap maximize (toggle_maximize sends resize).
                                 if !self.windows[idx].maximized {
                                     self.toggle_maximize(idx);
                                 }
@@ -1263,6 +1267,15 @@ impl Compositor {
             win.maximized = true;
         }
         self.dirty = true;
+        self.send_resize_event(idx);
+    }
+
+    fn send_resize_event(&self, idx: usize) {
+        let win = &self.windows[idx];
+        if win.active && win.event_port != 0 {
+            let wh = (win.w as u64) | ((win.h as u64) << 32);
+            syscall::send_nb_4(win.event_port, COMP_RESIZE_EVENT, wh, 0, 0, 0);
+        }
     }
 
     /// Click-to-focus: find topmost window under mouse cursor (content or title bar).

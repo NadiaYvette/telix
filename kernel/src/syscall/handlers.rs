@@ -115,6 +115,8 @@ pub const SYS_PERSONALITY_SET: u64 = 105;
 pub const SYS_PERSONALITY_GET: u64 = 106;
 pub const SYS_PERSONALITY_REPLY: u64 = 107;
 pub const SYS_PERSONALITY_READ_ARGS: u64 = 108;
+pub const SYS_PERSONALITY_COPY_IN: u64 = 110;
+pub const SYS_PERSONALITY_COPY_OUT: u64 = 111;
 pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Error code: capability check failed.
@@ -181,7 +183,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
     // personality server — unless it's a personality management syscall which
     // is always handled natively.
     if nr != SYS_PERSONALITY_REGISTER && nr != SYS_PERSONALITY_SET && nr != SYS_PERSONALITY_GET
-        && nr != SYS_PERSONALITY_REPLY && nr != SYS_PERSONALITY_READ_ARGS {
+        && nr != SYS_PERSONALITY_REPLY && nr != SYS_PERSONALITY_READ_ARGS
+        && nr != SYS_PERSONALITY_COPY_IN && nr != SYS_PERSONALITY_COPY_OUT {
         let tid = crate::sched::smp::current()
             .current_thread
             .load(core::sync::atomic::Ordering::Relaxed);
@@ -412,6 +415,12 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_PERSONALITY_READ_ARGS => {
             crate::syscall::personality::personality_read_args(a0, frame)
+        }
+        SYS_PERSONALITY_COPY_IN => {
+            crate::syscall::personality::personality_copy_in(a0, a1 as usize, a2 as usize, a3 as usize)
+        }
+        SYS_PERSONALITY_COPY_OUT => {
+            crate::syscall::personality::personality_copy_out(a0, a1 as usize, a2 as usize, a3 as usize)
         }
         SYS_FRAMEBUFFER_INFO => sys_framebuffer_info(frame),
         _ => {

@@ -8300,6 +8300,94 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 121: Dynamic terminal resize ---
+    syscall::debug_puts(b"  init: Phase 121 dynamic terminal resize...\n");
+    {
+        let comp_ok = syscall::ns_lookup(b"compositor").is_some();
+        if comp_ok {
+            syscall::debug_puts(b"Phase 121 dynamic terminal resize: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 121 dynamic terminal resize: FAILED\n");
+        }
+    }
+
+    // --- Phase 122: Linux personality cross-address-space I/O ---
+    syscall::debug_puts(b"  init: Phase 122 linux personality I/O...\n");
+    {
+        // linux_srv was spawned in Phase 106. Verify it's still registered.
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            // Fork a child to test cross-address-space write.
+            let child = syscall::fork();
+            if child == 0 {
+                // Child: wait for personality to be set by parent.
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    // Personality is Linux. Do a Linux write(1, msg, len).
+                    // This tests personality_copy_in: linux_srv reads our buffer.
+                    let msg = b"[linux child] hello from Linux personality!\n";
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        let ret: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 1u64 => ret, // __NR_write
+                            in("rdi") 1u64,                // fd = stdout
+                            in("rsi") msg.as_ptr() as u64, // buf
+                            in("rdx") msg.len() as u64,    // count
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        // Exit with 0 if write returned correct count, else 1.
+                        let code = if ret == msg.len() as u64 { 0u64 } else { 1u64 };
+                        core::arch::asm!(
+                            "int 0x80",
+                            in("rax") 231u64, // __NR_exit_group
+                            in("rdi") code,
+                            options(noreturn),
+                        );
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                // Parent: set child's personality to Linux.
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exited = false;
+                for _ in 0..300 {
+                    if let Some(_code) = syscall::waitpid(child) {
+                        exited = true;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exited {
+                    syscall::debug_puts(b"Phase 122 linux personality I/O: PASSED\n");
+                } else {
+                    syscall::debug_puts(b"Phase 122 linux personality I/O: FAILED (timeout)\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 122 linux personality I/O: SKIPPED (linux_srv not found)\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

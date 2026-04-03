@@ -22,6 +22,7 @@ const COMP_GET_INFO: u64 = 0xA008;
 #[allow(dead_code)]
 const COMP_GET_INFO_OK: u64 = 0xA009;
 const COMP_INPUT_EVENT: u64 = 0xA00A;
+const COMP_RESIZE_EVENT: u64 = 0xA00B;
 const COMP_CLOSE_EVENT: u64 = 0xA00E;
 
 // --- PTY IPC (0x90xx) ---
@@ -37,11 +38,13 @@ const PTY_POLL_OK: u64 = 0x9051;
 // Input event types.
 const EVENT_KEY_DOWN: u8 = 1;
 
-// Terminal dimensions.
+// Terminal dimensions (initial and maximum).
 const TERM_COLS: usize = 80;
 const TERM_ROWS: usize = 25;
 const WIN_W: usize = TERM_COLS * 8;  // 640
 const WIN_H: usize = TERM_ROWS * 8;  // 200
+const MAX_TERM_COLS: usize = 128;    // up to 1024px wide
+const MAX_TERM_ROWS: usize = 96;     // up to 768px tall
 
 const FG_COLOR: u32 = 0x00C0C0C0; // light gray
 const BG_COLOR: u32 = 0x00000000; // black
@@ -180,7 +183,12 @@ struct Terminal {
     pty_reply: u64,
     master_h: u32,
 
-    cells: [[Cell; TERM_COLS]; TERM_ROWS],
+    cols: usize,   // active columns (dynamic, initially TERM_COLS)
+    rows: usize,   // active rows (dynamic, initially TERM_ROWS)
+    buf_w: usize,  // pixel buffer width/stride (fixed at WIN_W)
+    buf_h: usize,  // pixel buffer height (fixed at WIN_H)
+
+    cells: [[Cell; MAX_TERM_COLS]; MAX_TERM_ROWS],
     cursor_col: usize,
     cursor_row: usize,
     dirty: bool,
@@ -255,9 +263,9 @@ impl Terminal {
             b'\n' => {
                 self.cursor_col = 0;
                 self.cursor_row += 1;
-                if self.cursor_row >= TERM_ROWS {
+                if self.cursor_row >= self.rows {
                     self.scroll_up();
-                    self.cursor_row = TERM_ROWS - 1;
+                    self.cursor_row = self.rows - 1;
                 }
             }
             b'\r' => {
@@ -276,7 +284,7 @@ impl Terminal {
             }
             0x09 => {
                 let next = (self.cursor_col + 8) & !7;
-                self.cursor_col = if next < TERM_COLS { next } else { TERM_COLS - 1 };
+                self.cursor_col = if next < self.cols { next } else { self.cols - 1 };
             }
             ch if ch >= 32 && ch < 127 => {
                 self.cells[self.cursor_row][self.cursor_col] = Cell {
@@ -285,12 +293,12 @@ impl Terminal {
                     bg: self.cur_bg,
                 };
                 self.cursor_col += 1;
-                if self.cursor_col >= TERM_COLS {
+                if self.cursor_col >= self.cols {
                     self.cursor_col = 0;
                     self.cursor_row += 1;
-                    if self.cursor_row >= TERM_ROWS {
+                    if self.cursor_row >= self.rows {
                         self.scroll_up();
-                        self.cursor_row = TERM_ROWS - 1;
+                        self.cursor_row = self.rows - 1;
                     }
                 }
             }
@@ -310,11 +318,11 @@ impl Terminal {
             }
             b'B' => { // CUD — cursor down
                 let n = if p0 == 0 { 1 } else { p0 };
-                self.cursor_row = (self.cursor_row + n).min(TERM_ROWS - 1);
+                self.cursor_row = (self.cursor_row + n).min(self.rows - 1);
             }
             b'C' => { // CUF — cursor forward
                 let n = if p0 == 0 { 1 } else { p0 };
-                self.cursor_col = (self.cursor_col + n).min(TERM_COLS - 1);
+                self.cursor_col = (self.cursor_col + n).min(self.cols - 1);
             }
             b'D' => { // CUB — cursor back
                 let n = if p0 == 0 { 1 } else { p0 };
@@ -323,8 +331,8 @@ impl Terminal {
             b'H' | b'f' => { // CUP — cursor position (1-based)
                 let row = if p0 == 0 { 1 } else { p0 };
                 let col = if p1 == 0 { 1 } else { p1 };
-                self.cursor_row = (row - 1).min(TERM_ROWS - 1);
-                self.cursor_col = (col - 1).min(TERM_COLS - 1);
+                self.cursor_row = (row - 1).min(self.rows - 1);
+                self.cursor_col = (col - 1).min(self.cols - 1);
             }
             b'J' => { // ED — erase display
                 self.erase_display(p0);
@@ -340,8 +348,8 @@ impl Terminal {
                 self.saved_row = self.cursor_row;
             }
             b'u' => { // RCP — restore cursor position
-                self.cursor_col = self.saved_col.min(TERM_COLS - 1);
-                self.cursor_row = self.saved_row.min(TERM_ROWS - 1);
+                self.cursor_col = self.saved_col.min(self.cols - 1);
+                self.cursor_row = self.saved_row.min(self.rows - 1);
             }
             b'h' | b'l' => {
                 // DEC private modes (CSI ? n h/l) — ignore silently.
@@ -409,31 +417,28 @@ impl Terminal {
         let blank = Cell { ch: b' ', fg: self.cur_fg, bg: self.cur_bg };
         match mode {
             0 => {
-                // Erase from cursor to end.
-                for col in self.cursor_col..TERM_COLS {
+                for col in self.cursor_col..self.cols {
                     self.cells[self.cursor_row][col] = blank;
                 }
-                for row in (self.cursor_row + 1)..TERM_ROWS {
-                    for col in 0..TERM_COLS {
+                for row in (self.cursor_row + 1)..self.rows {
+                    for col in 0..self.cols {
                         self.cells[row][col] = blank;
                     }
                 }
             }
             1 => {
-                // Erase from start to cursor.
                 for row in 0..self.cursor_row {
-                    for col in 0..TERM_COLS {
+                    for col in 0..self.cols {
                         self.cells[row][col] = blank;
                     }
                 }
-                for col in 0..=self.cursor_col.min(TERM_COLS - 1) {
+                for col in 0..=self.cursor_col.min(self.cols - 1) {
                     self.cells[self.cursor_row][col] = blank;
                 }
             }
             2 | 3 => {
-                // Erase entire display.
-                for row in 0..TERM_ROWS {
-                    for col in 0..TERM_COLS {
+                for row in 0..self.rows {
+                    for col in 0..self.cols {
                         self.cells[row][col] = blank;
                     }
                 }
@@ -446,17 +451,17 @@ impl Terminal {
         let blank = Cell { ch: b' ', fg: self.cur_fg, bg: self.cur_bg };
         match mode {
             0 => {
-                for col in self.cursor_col..TERM_COLS {
+                for col in self.cursor_col..self.cols {
                     self.cells[self.cursor_row][col] = blank;
                 }
             }
             1 => {
-                for col in 0..=self.cursor_col.min(TERM_COLS - 1) {
+                for col in 0..=self.cursor_col.min(self.cols - 1) {
                     self.cells[self.cursor_row][col] = blank;
                 }
             }
             2 => {
-                for col in 0..TERM_COLS {
+                for col in 0..self.cols {
                     self.cells[self.cursor_row][col] = blank;
                 }
             }
@@ -465,16 +470,16 @@ impl Terminal {
     }
 
     fn scroll_up(&mut self) {
-        for row in 1..TERM_ROWS {
+        for row in 1..self.rows {
             self.cells[row - 1] = self.cells[row];
         }
-        self.cells[TERM_ROWS - 1] = [DEFAULT_CELL; TERM_COLS];
+        self.cells[self.rows - 1] = [DEFAULT_CELL; MAX_TERM_COLS];
     }
 
     fn render(&self) {
         let fb = self.buf_va as *mut u32;
-        for row in 0..TERM_ROWS {
-            for col in 0..TERM_COLS {
+        for row in 0..self.rows {
+            for col in 0..self.cols {
                 let cell = &self.cells[row][col];
                 let glyph_idx = if cell.ch >= 32 && cell.ch <= 126 {
                     (cell.ch - 32) as usize
@@ -499,7 +504,7 @@ impl Terminal {
                         let px = base_x + gx;
                         let py = base_y + gy;
                         unsafe {
-                            ptr::write_volatile(fb.add(py * WIN_W + px), color);
+                            ptr::write_volatile(fb.add(py * self.buf_w + px), color);
                         }
                     }
                 }
@@ -718,7 +723,11 @@ pub extern "C" fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         pty_port,
         pty_reply,
         master_h,
-        cells: [[DEFAULT_CELL; TERM_COLS]; TERM_ROWS],
+        cols: TERM_COLS,
+        rows: TERM_ROWS,
+        buf_w: WIN_W,
+        buf_h: WIN_H,
+        cells: [[DEFAULT_CELL; MAX_TERM_COLS]; MAX_TERM_ROWS],
         cursor_col: 0,
         cursor_row: 0,
         dirty: true,
@@ -755,6 +764,21 @@ pub extern "C" fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         let ascii = ((d0 >> 16) & 0xFF) as u8;
                         if event_type == EVENT_KEY_DOWN && ascii != 0 {
                             term.pty_write_master(&[ascii]);
+                        }
+                    }
+                    if msg.tag == COMP_RESIZE_EVENT {
+                        let new_w = msg.data[0] as u32;
+                        let new_h = (msg.data[0] >> 32) as u32;
+                        let nc = ((new_w as usize) / 8).min(term.buf_w / 8).min(MAX_TERM_COLS);
+                        let nr = ((new_h as usize) / 8).min(term.buf_h / 8).min(MAX_TERM_ROWS);
+                        let nc = if nc == 0 { 1 } else { nc };
+                        let nr = if nr == 0 { 1 } else { nr };
+                        if nc != term.cols || nr != term.rows {
+                            term.cols = nc;
+                            term.rows = nr;
+                            if term.cursor_col >= nc { term.cursor_col = nc - 1; }
+                            if term.cursor_row >= nr { term.cursor_row = nr - 1; }
+                            term.dirty = true;
                         }
                     }
                 }
