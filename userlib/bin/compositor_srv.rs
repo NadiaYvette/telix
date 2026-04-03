@@ -68,6 +68,9 @@ const TASKBAR_BTN_H: i32 = 18;
 const TASKBAR_BTN_GAP: i32 = 4;
 const CASCADE_STEP: i32 = 30;
 const CASCADE_MAX: u8 = 8;
+const RESIZE_MARGIN: i32 = 5;
+const MIN_WIN_W: i32 = 160;
+const MIN_WIN_H: i32 = 80;
 
 // Page size for mmap_anon (allocation pages).
 const PAGE_SIZE: usize = 4096;
@@ -233,6 +236,8 @@ struct Window {
     event_port: u64,  // port to send input/focus events to client
     granted_va: usize, // VA in client's address space
     z_order: u16,
+    buf_w: u32,       // original buffer width (never changes after creation)
+    buf_h: u32,       // original buffer height
     title: [u8; 16],
     title_len: u8,
 }
@@ -245,6 +250,7 @@ impl Window {
             buf_va: 0, buf_pages: 0,
             owner_task: 0, event_port: 0,
             granted_va: 0, z_order: 0,
+            buf_w: 0, buf_h: 0,
             title: [0; 16], title_len: 0,
         }
     }
@@ -268,6 +274,12 @@ struct Compositor {
     drag_off_x: i32, // offset from window origin to grab point
     drag_off_y: i32,
     next_cascade: u8, // 0..CASCADE_MAX, cycles through cascade positions
+    resizing: i8,        // -1 = not resizing, else window index
+    resize_edge: u8,     // bit 0=right, bit 1=bottom
+    resize_start_x: i32,
+    resize_start_y: i32,
+    resize_orig_w: u32,
+    resize_orig_h: u32,
 }
 
 fn print_num(n: u64) {
@@ -391,6 +403,12 @@ impl Compositor {
             drag_off_x: 0,
             drag_off_y: 0,
             next_cascade: 0,
+            resizing: -1,
+            resize_edge: 0,
+            resize_start_x: 0,
+            resize_start_y: 0,
+            resize_orig_w: 0,
+            resize_orig_h: 0,
         }
     }
 
@@ -484,6 +502,8 @@ impl Compositor {
             event_port,
             granted_va: dst_va,
             z_order: self.next_z,
+            buf_w: w,
+            buf_h: h,
             title,
             title_len,
         };
@@ -799,7 +819,8 @@ impl Compositor {
         let fb = self.fb_va as *mut u32;
         let stride = self.fb_pitch as usize / 4;
         let src = win.buf_va as *const u32;
-        let sw = win.w as usize;
+        let buf_w = win.buf_w as usize;
+        let buf_h = win.buf_h as usize;
 
         for row in 0..win.h as usize {
             let sy = win.y + row as i32;
@@ -807,7 +828,12 @@ impl Compositor {
             for col in 0..win.w as usize {
                 let sx = win.x + col as i32;
                 if sx < 0 || sx >= self.fb_w as i32 { continue; }
-                let pixel = unsafe { ptr::read_volatile(src.add(row * sw + col)) };
+                // Clip to buffer: read from buffer if in range, else fill dark.
+                let pixel = if row < buf_h && col < buf_w {
+                    unsafe { ptr::read_volatile(src.add(row * buf_w + col)) }
+                } else {
+                    0x00202020 // dark fill for excess area
+                };
                 unsafe {
                     ptr::write_volatile(
                         fb.add(sy as usize * stride + sx as usize),
@@ -930,10 +956,59 @@ impl Compositor {
                         self.windows[idx].y = self.mouse_y - self.drag_off_y;
                     }
                 }
+
+                // Update resize if resizing.
+                if self.resizing >= 0 {
+                    let idx = self.resizing as usize;
+                    if idx < MAX_WINDOWS && self.windows[idx].active {
+                        let dx = self.mouse_x - self.resize_start_x;
+                        let dy = self.mouse_y - self.resize_start_y;
+                        if self.resize_edge & 1 != 0 {
+                            let new_w = (self.resize_orig_w as i32 + dx).max(MIN_WIN_W);
+                            self.windows[idx].w = new_w as u32;
+                        }
+                        if self.resize_edge & 2 != 0 {
+                            let new_h = (self.resize_orig_h as i32 + dy).max(MIN_WIN_H);
+                            self.windows[idx].h = new_h as u32;
+                        }
+                    }
+                }
             }
             EVENT_MOUSE_BUTTON => {
                 let left_pressed = extra & 1 != 0;
                 if left_pressed {
+                    // First check for resize edges (right/bottom/corner).
+                    let mut resize_target: i8 = -1;
+                    let mut resize_best_z: u16 = 0;
+                    let mut edge: u8 = 0;
+                    for i in 0..MAX_WINDOWS {
+                        let win = &self.windows[i];
+                        if !win.active { continue; }
+                        let near_right = self.mouse_x >= win.x + win.w as i32 - RESIZE_MARGIN
+                            && self.mouse_x < win.x + win.w as i32 + BORDER_WIDTH
+                            && self.mouse_y >= win.y
+                            && self.mouse_y < win.y + win.h as i32 + BORDER_WIDTH;
+                        let near_bottom = self.mouse_y >= win.y + win.h as i32 - RESIZE_MARGIN
+                            && self.mouse_y < win.y + win.h as i32 + BORDER_WIDTH
+                            && self.mouse_x >= win.x
+                            && self.mouse_x < win.x + win.w as i32 + BORDER_WIDTH;
+                        let mut e = 0u8;
+                        if near_right { e |= 1; }
+                        if near_bottom { e |= 2; }
+                        if e != 0 && (resize_target == -1 || win.z_order > resize_best_z) {
+                            resize_target = i as i8;
+                            resize_best_z = win.z_order;
+                            edge = e;
+                        }
+                    }
+                    if resize_target >= 0 {
+                        self.resizing = resize_target;
+                        self.resize_edge = edge;
+                        self.resize_start_x = self.mouse_x;
+                        self.resize_start_y = self.mouse_y;
+                        self.resize_orig_w = self.windows[resize_target as usize].w;
+                        self.resize_orig_h = self.windows[resize_target as usize].h;
+                    } else {
                     // Check if click is in a title bar → start drag.
                     let mut drag_target: i8 = -1;
                     let mut best_z: u16 = 0;
@@ -964,12 +1039,14 @@ impl Compositor {
                             self.drag_off_y = self.mouse_y - win.y;
                         }
                     }
+                    } // end else (not resize)
 
                     // Click-to-focus (title bar or content).
                     self.handle_click();
                 } else {
-                    // Button release → end drag.
+                    // Button release → end drag/resize.
                     self.dragging = -1;
+                    self.resizing = -1;
                 }
             }
             _ => {}
