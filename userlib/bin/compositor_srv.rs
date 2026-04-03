@@ -238,6 +238,12 @@ struct Window {
     z_order: u16,
     buf_w: u32,       // original buffer width (never changes after creation)
     buf_h: u32,       // original buffer height
+    minimized: bool,
+    maximized: bool,
+    saved_x: i32,     // saved position/size for restore from maximize
+    saved_y: i32,
+    saved_w: u32,
+    saved_h: u32,
     title: [u8; 16],
     title_len: u8,
 }
@@ -251,6 +257,8 @@ impl Window {
             owner_task: 0, event_port: 0,
             granted_va: 0, z_order: 0,
             buf_w: 0, buf_h: 0,
+            minimized: false, maximized: false,
+            saved_x: 0, saved_y: 0, saved_w: 0, saved_h: 0,
             title: [0; 16], title_len: 0,
         }
     }
@@ -504,6 +512,9 @@ impl Compositor {
             z_order: self.next_z,
             buf_w: w,
             buf_h: h,
+            minimized: false,
+            maximized: false,
+            saved_x: 0, saved_y: 0, saved_w: 0, saved_h: 0,
             title,
             title_len,
         };
@@ -664,21 +675,63 @@ impl Compositor {
         let text_x = win.x + 4; // small left padding
         self.draw_text(text_x, text_y, &win.title[..win.title_len as usize], TITLEBAR_TEXT_COLOR);
 
-        // Draw close button (14x14 red square with white X) in top-right.
-        let btn_x = win.x + win.w as i32 - CLOSE_BTN_SIZE - 3;
+        // Draw title bar buttons (right to left): close, maximize, minimize.
         let btn_y = win.y - TITLEBAR_H + 3;
+
+        // Close button (14x14 red square with white X).
+        let close_x = win.x + win.w as i32 - CLOSE_BTN_SIZE - 3;
         for cy in 0..CLOSE_BTN_SIZE {
             let sy = btn_y + cy;
             if sy < 0 || sy >= self.fb_h as i32 { continue; }
             for cx in 0..CLOSE_BTN_SIZE {
-                let sx = btn_x + cx;
+                let sx = close_x + cx;
                 if sx < 0 || sx >= self.fb_w as i32 { continue; }
-                // Draw X: two diagonals in the inner 8x8 region (offset 3..11).
                 let ix = cx - 3;
                 let iy = cy - 3;
                 let on_x = ix >= 0 && ix < 8 && iy >= 0 && iy < 8
                     && ((ix - iy).abs() <= 1 || (ix - (7 - iy)).abs() <= 1);
                 let color = if on_x { CLOSE_BTN_X_COLOR } else { CLOSE_BTN_COLOR };
+                unsafe {
+                    ptr::write_volatile(fb.add(sy as usize * stride + sx as usize), color);
+                }
+            }
+        }
+
+        // Maximize button (14x14 gray square with white square outline icon).
+        let max_x = win.x + win.w as i32 - 2 * CLOSE_BTN_SIZE - 7;
+        let max_bg: u32 = 0x00555555;
+        for cy in 0..CLOSE_BTN_SIZE {
+            let sy = btn_y + cy;
+            if sy < 0 || sy >= self.fb_h as i32 { continue; }
+            for cx in 0..CLOSE_BTN_SIZE {
+                let sx = max_x + cx;
+                if sx < 0 || sx >= self.fb_w as i32 { continue; }
+                let ix = cx - 3;
+                let iy = cy - 3;
+                // Square outline: top/bottom row or left/right col of 8x8 area.
+                let on_icon = ix >= 0 && ix < 8 && iy >= 0 && iy < 8
+                    && (iy == 0 || iy == 7 || ix == 0 || ix == 7);
+                let color = if on_icon { 0x00FFFFFF } else { max_bg };
+                unsafe {
+                    ptr::write_volatile(fb.add(sy as usize * stride + sx as usize), color);
+                }
+            }
+        }
+
+        // Minimize button (14x14 gray square with white underscore icon).
+        let min_x = win.x + win.w as i32 - 3 * CLOSE_BTN_SIZE - 11;
+        let min_bg: u32 = 0x00555555;
+        for cy in 0..CLOSE_BTN_SIZE {
+            let sy = btn_y + cy;
+            if sy < 0 || sy >= self.fb_h as i32 { continue; }
+            for cx in 0..CLOSE_BTN_SIZE {
+                let sx = min_x + cx;
+                if sx < 0 || sx >= self.fb_w as i32 { continue; }
+                let ix = cx - 3;
+                let iy = cy - 3;
+                // Underscore: bottom row of 8x8 area.
+                let on_icon = ix >= 0 && ix < 8 && iy == 7;
+                let color = if on_icon { 0x00FFFFFF } else { min_bg };
                 unsafe {
                     ptr::write_volatile(fb.add(sy as usize * stride + sx as usize), color);
                 }
@@ -869,10 +922,11 @@ impl Compositor {
             }
         }
 
-        // Draw back to front.
+        // Draw back to front (skip minimized windows).
         for i in 0..count {
             let idx = order[i] as usize;
             let win = &self.windows[idx];
+            if win.minimized { continue; }
             let focused = self.focus == idx as i8;
             let border_color = if focused {
                 BORDER_FOCUSED_COLOR
@@ -1025,19 +1079,42 @@ impl Compositor {
                         }
                     }
                     if drag_target >= 0 {
-                        // Check if click is on the close button.
-                        let win = &self.windows[drag_target as usize];
-                        let btn_x = win.x + win.w as i32 - CLOSE_BTN_SIZE - 3;
+                        let idx = drag_target as usize;
+                        let win = &self.windows[idx];
                         let btn_y = win.y - TITLEBAR_H + 3;
-                        if self.mouse_x >= btn_x && self.mouse_x < btn_x + CLOSE_BTN_SIZE
-                            && self.mouse_y >= btn_y && self.mouse_y < btn_y + CLOSE_BTN_SIZE
+                        let in_btn_y = self.mouse_y >= btn_y
+                            && self.mouse_y < btn_y + CLOSE_BTN_SIZE;
+
+                        // Check close button.
+                        let close_x = win.x + win.w as i32 - CLOSE_BTN_SIZE - 3;
+                        if in_btn_y && self.mouse_x >= close_x
+                            && self.mouse_x < close_x + CLOSE_BTN_SIZE
                         {
-                            self.close_window(drag_target as usize);
+                            self.close_window(idx);
+                        }
+                        // Check maximize button.
+                        else {
+                        let max_x = win.x + win.w as i32 - 2 * CLOSE_BTN_SIZE - 7;
+                        if in_btn_y && self.mouse_x >= max_x
+                            && self.mouse_x < max_x + CLOSE_BTN_SIZE
+                        {
+                            self.toggle_maximize(idx);
+                        }
+                        // Check minimize button.
+                        else {
+                        let min_x = win.x + win.w as i32 - 3 * CLOSE_BTN_SIZE - 11;
+                        if in_btn_y && self.mouse_x >= min_x
+                            && self.mouse_x < min_x + CLOSE_BTN_SIZE
+                        {
+                            self.windows[idx].minimized = true;
+                            self.dirty = true;
                         } else {
                             self.dragging = drag_target;
                             self.drag_off_x = self.mouse_x - win.x;
                             self.drag_off_y = self.mouse_y - win.y;
                         }
+                        } // end maximize else
+                        } // end close else
                     }
                     } // end else (not resize)
 
@@ -1129,6 +1206,31 @@ impl Compositor {
         self.dirty = true;
     }
 
+    fn toggle_maximize(&mut self, idx: usize) {
+        if idx >= MAX_WINDOWS || !self.windows[idx].active { return; }
+        let win = &mut self.windows[idx];
+        if win.maximized {
+            // Restore saved position/size.
+            win.x = win.saved_x;
+            win.y = win.saved_y;
+            win.w = win.saved_w;
+            win.h = win.saved_h;
+            win.maximized = false;
+        } else {
+            // Save current position/size, then maximize.
+            win.saved_x = win.x;
+            win.saved_y = win.y;
+            win.saved_w = win.w;
+            win.saved_h = win.h;
+            win.x = 0;
+            win.y = TITLEBAR_H + BORDER_WIDTH;
+            win.w = self.fb_w;
+            win.h = (self.fb_h as i32 - TASKBAR_H - TITLEBAR_H - BORDER_WIDTH * 2) as u32;
+            win.maximized = true;
+        }
+        self.dirty = true;
+    }
+
     /// Click-to-focus: find topmost window under mouse cursor (content or title bar).
     fn handle_click(&mut self) {
         let mx = self.mouse_x;
@@ -1155,6 +1257,10 @@ impl Compositor {
                     let btn_x = TASKBAR_BTN_GAP + i as i32 * (btn_w + TASKBAR_BTN_GAP);
                     if mx >= btn_x && mx < btn_x + btn_w {
                         let idx = active[i] as usize;
+                        // Restore if minimized.
+                        if self.windows[idx].minimized {
+                            self.windows[idx].minimized = false;
+                        }
                         let old_focus = self.focus;
                         self.focus = idx as i8;
                         self.windows[idx].z_order = self.next_z;
