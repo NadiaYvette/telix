@@ -71,6 +71,42 @@ const __NR_UNLINK: u64 = 87;
 const __NR_UNLINKAT: u64 = 263;
 const __NR_MKDIRAT: u64 = 258;
 
+// Phase 127: additional syscall numbers
+const __NR_RT_SIGACTION: u64 = 13;
+const __NR_RT_SIGPROCMASK: u64 = 14;
+const __NR_RT_SIGRETURN: u64 = 15;
+const __NR_POLL: u64 = 7;
+const __NR_SCHED_YIELD: u64 = 24;
+const __NR_MADVISE: u64 = 28;
+const __NR_NANOSLEEP: u64 = 35;
+const __NR_GETPPID: u64 = 110;
+const __NR_SETSID: u64 = 112;
+const __NR_GETPGRP: u64 = 111;
+const __NR_SETPGID: u64 = 109;
+const __NR_GETPGID: u64 = 121;
+const __NR_GETSID: u64 = 124;
+const __NR_FCNTL: u64 = 72;
+const __NR_FTRUNCATE: u64 = 77;
+const __NR_GETTIMEOFDAY: u64 = 96;
+const __NR_GETRLIMIT: u64 = 97;
+const __NR_GETRUSAGE: u64 = 98;
+const __NR_PRCTL: u64 = 157;
+const __NR_GETTID2: u64 = 186; // alias, already handled above
+const __NR_FUTEX: u64 = 202;
+const __NR_SCHED_GETAFFINITY: u64 = 204;
+const __NR_EPOLL_CREATE: u64 = 213;
+const __NR_EPOLL_CTL: u64 = 233;
+const __NR_EPOLL_WAIT: u64 = 232;
+const __NR_CLOCK_GETRES: u64 = 229;
+const __NR_CLOCK_NANOSLEEP: u64 = 230;
+const __NR_TGKILL: u64 = 234;
+const __NR_PPOLL: u64 = 271;
+const __NR_EPOLL_CREATE1: u64 = 291;
+const __NR_EPOLL_PWAIT: u64 = 281;
+const __NR_MEMFD_CREATE: u64 = 319;
+const __NR_STATX: u64 = 332;
+const __NR_CLONE3: u64 = 435;
+
 // arch_prctl subcodes
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
@@ -90,6 +126,26 @@ const ERANGE: u64 = 34;
 const ENOSYS: u64 = 38;
 const ENOTEMPTY: u64 = 39;
 const EEXIST: u64 = 17;
+const ENOMEM: u64 = 12;
+const ENOTTY: u64 = 25;
+const ETIMEDOUT: u64 = 110;
+
+// fcntl commands
+const F_DUPFD: u64 = 0;
+const F_GETFD: u64 = 1;
+const F_SETFD: u64 = 2;
+const F_GETFL: u64 = 3;
+const F_SETFL: u64 = 4;
+const F_DUPFD_CLOEXEC: u64 = 1030;
+
+// File descriptor flags
+const FD_CLOEXEC: u32 = 1;
+
+// O_* flags for F_GETFL/F_SETFL
+const O_NONBLOCK: u64 = 0x800;
+const O_RDONLY: u64 = 0;
+const O_WRONLY: u64 = 1;
+const O_RDWR: u64 = 2;
 
 /// Return negated errno as u64 (Linux convention).
 fn linux_err(e: u64) -> u64 {
@@ -144,6 +200,7 @@ enum FdKind {
     Dir,
 }
 
+#[derive(Clone, Copy)]
 struct FdEntry {
     in_use: bool,
     kind: FdKind,
@@ -156,11 +213,13 @@ struct FdEntry {
     offset: u64,
     dir_path: [u8; 16],
     dir_path_len: u8,
+    fd_flags: u32,    // FD_CLOEXEC etc.
+    status_flags: u32, // O_NONBLOCK etc.
 }
 
 impl FdEntry {
     const fn empty() -> Self {
-        Self { in_use: false, kind: FdKind::None, fs_port: 0, handle: 0, file_size: 0, offset: 0, dir_path: [0; 16], dir_path_len: 0 }
+        Self { in_use: false, kind: FdKind::None, fs_port: 0, handle: 0, file_size: 0, offset: 0, dir_path: [0; 16], dir_path_len: 0, fd_flags: 0, status_flags: 0 }
     }
 }
 
@@ -1447,6 +1506,244 @@ fn handle_getdents64(caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux getpid/gettid/getuid/geteuid/getgid/getegid.
+// ---- Phase 127 handlers ----
+
+/// Handle Linux fcntl(fd, cmd, arg).
+fn handle_fcntl(args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let cmd = args[1];
+    let arg = args[2];
+
+    if fd >= MAX_FDS {
+        return linux_err(EBADF);
+    }
+    // fds 0-2 (stdin/stdout/stderr) are implicit and always valid.
+    if fd >= 3 {
+        unsafe {
+            if !FD_TABLE[fd].in_use {
+                return linux_err(EBADF);
+            }
+        }
+    }
+
+    match cmd {
+        F_GETFD => unsafe { FD_TABLE[fd].fd_flags as u64 },
+        F_SETFD => unsafe {
+            FD_TABLE[fd].fd_flags = arg as u32;
+            0
+        },
+        F_GETFL => unsafe { FD_TABLE[fd].status_flags as u64 },
+        F_SETFL => unsafe {
+            // Only O_NONBLOCK and a few flags are settable via F_SETFL.
+            FD_TABLE[fd].status_flags = (FD_TABLE[fd].status_flags & 0x3) | (arg as u32 & !0x3);
+            0
+        },
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let min_fd = arg as usize;
+            let new_fd = unsafe {
+                let mut found = None;
+                for i in min_fd.max(3)..MAX_FDS {
+                    if !FD_TABLE[i].in_use {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                found
+            };
+            match new_fd {
+                Some(nfd) => unsafe {
+                    FD_TABLE[nfd] = FD_TABLE[fd];
+                    FD_TABLE[nfd].fd_flags = if cmd == F_DUPFD_CLOEXEC { FD_CLOEXEC } else { 0 };
+                    nfd as u64
+                },
+                None => linux_err(EMFILE),
+            }
+        }
+        _ => linux_err(EINVAL),
+    }
+}
+
+/// Handle Linux ioctl(fd, request, arg).
+fn handle_ioctl(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let request = args[1];
+
+    // fds 0-2 are always valid (stdin/stdout/stderr).
+    if fd >= 3 && fd < MAX_FDS {
+        unsafe { if !FD_TABLE[fd].in_use { return linux_err(EBADF); } }
+    } else if fd >= MAX_FDS {
+        return linux_err(EBADF);
+    }
+
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSWINSZ: u64 = 0x5414;
+    const FIONBIO: u64 = 0x5421;
+    const TCGETS: u64 = 0x5401;
+    const TCSETS: u64 = 0x5402;
+
+    match request {
+        TIOCGWINSZ => {
+            // Return 80x24 default terminal size.
+            // struct winsize { rows(u16), cols(u16), xpixel(u16), ypixel(u16) }
+            let buf: [u8; 8] = [
+                24, 0,  // rows = 24
+                80, 0,  // cols = 80
+                0, 0,   // xpixel
+                0, 0,   // ypixel
+            ];
+            let out_va = args[2] as usize;
+            if out_va != 0 {
+                syscall::personality_copy_out(caller_port, out_va, &buf);
+            }
+            0
+        }
+        TIOCSWINSZ => 0, // Ignore set window size.
+        FIONBIO => {
+            // Set/clear non-blocking on fd.
+            if fd < MAX_FDS {
+                unsafe {
+                    if args[2] != 0 {
+                        FD_TABLE[fd].status_flags |= O_NONBLOCK as u32;
+                    } else {
+                        FD_TABLE[fd].status_flags &= !(O_NONBLOCK as u32);
+                    }
+                }
+            }
+            0
+        }
+        TCGETS | TCSETS => linux_err(ENOTTY), // Not a real terminal.
+        _ => linux_err(ENOTTY),
+    }
+}
+
+/// Handle Linux gettimeofday(tv, tz).
+fn handle_gettimeofday(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let tv_va = args[0] as usize;
+    let ns = syscall::clock_gettime();
+    let secs = ns / 1_000_000_000;
+    let usecs = (ns % 1_000_000_000) / 1_000;
+
+    if tv_va != 0 {
+        // struct timeval { tv_sec: i64, tv_usec: i64 }
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&(secs as i64).to_le_bytes());
+        buf[8..16].copy_from_slice(&(usecs as i64).to_le_bytes());
+        syscall::personality_copy_out(caller_port, tv_va, &buf);
+    }
+    0
+}
+
+/// Handle Linux nanosleep(req, rem) / clock_nanosleep.
+fn handle_nanosleep(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let req_va = args[0] as usize;
+    if req_va == 0 { return linux_err(EFAULT); }
+
+    // Read struct timespec { tv_sec: i64, tv_nsec: i64 } from caller.
+    let mut buf = [0u8; 16];
+    let copied = syscall::personality_copy_in(caller_port, req_va, &mut buf);
+    if copied < 16 { return linux_err(EFAULT); }
+
+    let secs = i64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]));
+    let nsecs = i64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8]));
+    let total_ns = (secs as u64).saturating_mul(1_000_000_000).saturating_add(nsecs as u64);
+
+    if total_ns > 0 {
+        syscall::nanosleep(total_ns);
+    }
+    0
+}
+
+/// Handle Linux poll(fds, nfds, timeout) — basic stub.
+/// Returns 0 (timeout) for non-zero timeouts, or nfds with POLLNVAL for unknown fds.
+fn handle_poll(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let _fds_va = args[0] as usize;
+    let nfds = args[1] as usize;
+    let timeout_ms = args[2] as i32;
+
+    if nfds == 0 {
+        // Pure sleep via poll(NULL, 0, timeout).
+        if timeout_ms > 0 {
+            let ns = (timeout_ms as u64) * 1_000_000;
+            syscall::nanosleep(ns);
+        }
+        return 0;
+    }
+
+    // For non-trivial poll, sleep for the timeout and return 0.
+    // This is a simplistic stub that prevents infinite busy-loops.
+    if timeout_ms > 0 {
+        let ns = (timeout_ms as u64).min(100) * 1_000_000;
+        syscall::nanosleep(ns);
+    } else if timeout_ms == 0 {
+        // Non-blocking poll — return immediately.
+    } else {
+        // Infinite timeout — yield a few times then return 0.
+        for _ in 0..10 { syscall::yield_now(); }
+    }
+    0 // No events ready.
+}
+
+/// Handle Linux prctl(option, arg2, arg3, arg4, arg5).
+fn handle_prctl(args: &[u64; 6]) -> u64 {
+    let option = args[0];
+    const PR_SET_NAME: u64 = 15;
+    const PR_GET_NAME: u64 = 16;
+    const PR_GET_DUMPABLE: u64 = 3;
+    const PR_SET_DUMPABLE: u64 = 4;
+    const PR_SET_PDEATHSIG: u64 = 1;
+    const PR_GET_PDEATHSIG: u64 = 2;
+
+    match option {
+        PR_GET_DUMPABLE => 1, // Always dumpable.
+        PR_SET_DUMPABLE => 0, // Ignore, return success.
+        PR_SET_PDEATHSIG | PR_GET_PDEATHSIG => 0, // Stub.
+        PR_SET_NAME | PR_GET_NAME => 0, // Stub.
+        _ => linux_err(EINVAL),
+    }
+}
+
+/// Handle Linux futex(uaddr, op, val, timeout, uaddr2, val3).
+/// Stub: FUTEX_WAIT yields, FUTEX_WAKE returns 0.
+fn handle_futex(args: &[u64; 6]) -> u64 {
+    let _uaddr = args[0];
+    let op = args[1] & 0x7F; // Mask out FUTEX_PRIVATE_FLAG
+    let _val = args[2];
+
+    const FUTEX_WAIT: u64 = 0;
+    const FUTEX_WAKE: u64 = 1;
+    const FUTEX_WAIT_BITSET: u64 = 9;
+    const FUTEX_WAKE_BITSET: u64 = 10;
+
+    match op {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+            // Can't implement proper futex without kernel delegation.
+            // Yield a few times and return ETIMEDOUT.
+            for _ in 0..5 { syscall::yield_now(); }
+            linux_err(ETIMEDOUT)
+        }
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => 0, // No waiters.
+        _ => linux_err(ENOSYS),
+    }
+}
+
+/// Handle Linux clock_getres(clockid, res).
+fn handle_clock_getres(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let res_va = args[1] as usize;
+    if res_va != 0 {
+        // 1ns resolution.
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&0i64.to_le_bytes()); // tv_sec = 0
+        buf[8..16].copy_from_slice(&1i64.to_le_bytes()); // tv_nsec = 1
+        syscall::personality_copy_out(caller_port, res_va, &buf);
+    }
+    0
+}
+
+/// Handle Linux getppid — return 1 (init).
+fn handle_getppid() -> u64 {
+    1
+}
+
 fn handle_getid(nr: u64) -> u64 {
     match nr {
         __NR_GETPID | __NR_GETTID => syscall::getpid(),
@@ -1533,10 +1830,55 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_UNAME => handle_uname(caller_port, &msg.data),
             __NR_GETRANDOM => handle_getrandom(caller_port, &msg.data),
 
+            // Phase 127: fcntl, ioctl, time, signals, process control.
+            __NR_FCNTL => handle_fcntl(&msg.data),
+            __NR_IOCTL => handle_ioctl(caller_port, &msg.data),
+            __NR_GETTIMEOFDAY => handle_gettimeofday(caller_port, &msg.data),
+            __NR_NANOSLEEP => handle_nanosleep(caller_port, &msg.data),
+            __NR_CLOCK_NANOSLEEP => {
+                // clock_nanosleep(clockid, flags, req, rem): shift args.
+                let shifted: [u64; 6] = [msg.data[2], msg.data[3], 0, 0, msg.data[4], 0];
+                handle_nanosleep(caller_port, &shifted)
+            }
+            __NR_CLOCK_GETRES => handle_clock_getres(caller_port, &msg.data),
+            __NR_POLL | __NR_PPOLL => handle_poll(caller_port, &msg.data),
+            __NR_PRCTL => handle_prctl(&msg.data),
+            __NR_FUTEX => handle_futex(&msg.data),
+            __NR_GETPPID => handle_getppid(),
+            __NR_SCHED_YIELD => { syscall::yield_now(); 0 }
+            __NR_GETPGRP => syscall::getpgid(0),
+            __NR_SETPGID => {
+                if syscall::setpgid(msg.data[0], msg.data[1]) { 0 } else { linux_err(EPERM) }
+            }
+            __NR_GETPGID => syscall::getpgid(msg.data[0]),
+            __NR_SETSID => {
+                let r = syscall::setsid();
+                if r == u64::MAX { linux_err(EPERM) } else { r }
+            }
+            __NR_GETSID => syscall::getsid(msg.data[0]),
+
+            // Signal stubs (real delegation requires kernel support).
+            __NR_RT_SIGACTION => 0,    // Pretend success.
+            __NR_RT_SIGPROCMASK => 0,  // Pretend success.
+            __NR_RT_SIGRETURN => 0,
+            __NR_TGKILL => 0,         // Ignore for now.
+
             // Stubs that return success (0) to avoid crashing callers.
             __NR_SET_ROBUST_LIST | __NR_RSEQ => 0,
             __NR_PRLIMIT64 => 0,
-            __NR_IOCTL => linux_err(ENOSYS),
+            __NR_MADVISE => 0,
+            __NR_SCHED_GETAFFINITY => linux_err(ENOSYS),
+            __NR_GETRLIMIT | __NR_GETRUSAGE => 0,
+            __NR_FTRUNCATE => 0,
+            __NR_STATX => linux_err(ENOSYS),
+
+            // epoll stubs — return ENOSYS until real implementation.
+            __NR_EPOLL_CREATE | __NR_EPOLL_CREATE1 => linux_err(ENOSYS),
+            __NR_EPOLL_CTL => linux_err(ENOSYS),
+            __NR_EPOLL_WAIT | __NR_EPOLL_PWAIT => linux_err(ENOSYS),
+
+            __NR_MEMFD_CREATE => linux_err(ENOSYS),
+            __NR_CLONE3 => linux_err(ENOSYS),
 
             // Anonymous mmap: forward to Telix mmap_anon.
             __NR_MMAP => {

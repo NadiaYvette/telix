@@ -110,16 +110,20 @@ pub const SYS_PORT_RESIZE: u64 = 100;
 pub const SYS_FUTEX_WAIT_PI: u64 = 101;
 pub const SYS_FUTEX_WAKE_PI: u64 = 102;
 pub const SYS_PAGE_SIZE: u64 = 103;
-pub const SYS_PERSONALITY_REGISTER: u64 = 104;
-pub const SYS_PERSONALITY_SET: u64 = 105;
-pub const SYS_PERSONALITY_GET: u64 = 106;
-pub const SYS_PERSONALITY_REPLY: u64 = 107;
-pub const SYS_PERSONALITY_READ_ARGS: u64 = 108;
-pub const SYS_PERSONALITY_COPY_IN: u64 = 110;
-pub const SYS_PERSONALITY_COPY_OUT: u64 = 111;
-pub const SYS_PERSONALITY_FORK: u64 = 112;
-pub const SYS_PERSONALITY_WAIT4: u64 = 113;
-pub const SYS_PERSONALITY_EXECVE: u64 = 114;
+// Personality syscalls live in the 0xF000 range to avoid collisions with
+// Linux x86_64 syscall numbers (which go up to ~450). Previously these were
+// 104-114 which collided with Linux getgid, setuid, setgid, geteuid, getegid,
+// getppid, getpgrp, setsid, setreuid, setregid.
+pub const SYS_PERSONALITY_REGISTER: u64 = 0xF000;
+pub const SYS_PERSONALITY_SET: u64 = 0xF001;
+pub const SYS_PERSONALITY_GET: u64 = 0xF002;
+pub const SYS_PERSONALITY_REPLY: u64 = 0xF003;
+pub const SYS_PERSONALITY_READ_ARGS: u64 = 0xF004;
+pub const SYS_PERSONALITY_COPY_IN: u64 = 0xF005;
+pub const SYS_PERSONALITY_COPY_OUT: u64 = 0xF006;
+pub const SYS_PERSONALITY_FORK: u64 = 0xF007;
+pub const SYS_PERSONALITY_WAIT4: u64 = 0xF008;
+pub const SYS_PERSONALITY_EXECVE: u64 = 0xF009;
 pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Error code: capability check failed.

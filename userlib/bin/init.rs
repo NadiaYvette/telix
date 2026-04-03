@@ -8872,6 +8872,167 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 127: Linux personality syscall coverage ---
+    syscall::debug_puts(b"  init: Phase 127 linux syscall coverage...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                // Child: wait for personality to be set.
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        // Step 1: fcntl(0, F_GETFD) — Linux NR=72
+                        let ret1: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 72u64 => ret1,
+                            in("rdi") 0u64,    // fd=0 (stdin)
+                            in("rsi") 1u64,    // F_GETFD
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        // F_GETFD should return >= 0 (the flags).
+                        if (ret1 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
+                        }
+
+                        // Step 2: gettimeofday(&tv, NULL) — Linux NR=96
+                        let mut tv = [0u8; 16]; // struct timeval
+                        let ret2: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 96u64 => ret2,
+                            in("rdi") tv.as_mut_ptr() as u64,
+                            in("rsi") 0u64, // tz = NULL
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if (ret2 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 20u64, options(noreturn));
+                        }
+                        // tv_sec should be > 0.
+                        let secs = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+                        if secs == 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 21u64, options(noreturn));
+                        }
+
+                        // Step 3: rt_sigaction(SIGUSR1, ...) — Linux NR=13 (stub returns 0)
+                        let ret3: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 13u64 => ret3,
+                            in("rdi") 10u64, // SIGUSR1
+                            in("rsi") 0u64,  // NULL new action
+                            in("rdx") 0u64,  // NULL old action
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if (ret3 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 30u64, options(noreturn));
+                        }
+
+                        // Step 4: prctl(PR_GET_DUMPABLE) — Linux NR=157
+                        let ret4: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 157u64 => ret4,
+                            in("rdi") 3u64, // PR_GET_DUMPABLE
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if ret4 != 1 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 40u64, options(noreturn));
+                        }
+
+                        // Step 5: getppid() — Linux NR=110
+                        let ret5: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 110u64 => ret5,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if ret5 == 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 50u64, options(noreturn));
+                        }
+
+                        // Step 6: ioctl(1, TIOCGWINSZ, &ws) — Linux NR=16
+                        let mut ws = [0u8; 8]; // struct winsize
+                        let ret6: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 16u64 => ret6,
+                            in("rdi") 1u64,     // fd=1 (stdout)
+                            in("rsi") 0x5413u64, // TIOCGWINSZ
+                            in("rdx") ws.as_mut_ptr() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if (ret6 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 60u64, options(noreturn));
+                        }
+                        // Check cols = 80
+                        let cols = u16::from_le_bytes([ws[2], ws[3]]);
+                        if cols != 80 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 61u64, options(noreturn));
+                        }
+
+                        // All passed — exit 0
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                // Parent: set child's personality to Linux.
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 127 linux syscall coverage: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 127 linux syscall coverage: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 127 linux syscall coverage: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 127 linux syscall coverage: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
