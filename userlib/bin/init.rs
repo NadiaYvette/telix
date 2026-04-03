@@ -8503,6 +8503,176 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 124: Linux personality pipe2 + dup2 ---
+    syscall::debug_puts(b"  init: Phase 124 linux pipe2+dup2...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                // Child: wait for personality to be set.
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        // 1. pipe2(pipefd, 0) → syscall 293
+                        let mut pipefd = [0u8; 8];
+                        let pipe_ret: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 293u64 => pipe_ret,
+                            in("rdi") pipefd.as_mut_ptr() as u64,
+                            in("rsi") 0u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if (pipe_ret as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 1u64, options(noreturn));
+                        }
+                        let read_fd = i32::from_le_bytes([pipefd[0], pipefd[1], pipefd[2], pipefd[3]]);
+                        let write_fd = i32::from_le_bytes([pipefd[4], pipefd[5], pipefd[6], pipefd[7]]);
+
+                        // 2. write(write_fd, "hello pipe\n", 11)
+                        let msg = b"hello pipe\n";
+                        let _: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 1u64 => _,
+                            in("rdi") write_fd as u64,
+                            in("rsi") msg.as_ptr() as u64,
+                            in("rdx") msg.len() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+
+                        // 3. read(read_fd, buf, 64)
+                        let mut rbuf = [0u8; 64];
+                        let nread: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 0u64 => nread,
+                            in("rdi") read_fd as u64,
+                            in("rsi") rbuf.as_mut_ptr() as u64,
+                            in("rdx") 64u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+
+                        // 4. Verify: nread == 11 and data matches
+                        if nread != 11 || rbuf[0] != b'h' || rbuf[6] != b'p' {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
+                        }
+
+                        // 5. Test dup2: dup2(write_fd, 10)
+                        let dup_ret: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 33u64 => dup_ret,
+                            in("rdi") write_fd as u64,
+                            in("rsi") 10u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if dup_ret != 10 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 20u64, options(noreturn));
+                        }
+
+                        // 6. write(10, "dup2 ok\n", 8)
+                        let msg2 = b"dup2 ok\n";
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 1u64 => _,
+                            in("rdi") 10u64,
+                            in("rsi") msg2.as_ptr() as u64,
+                            in("rdx") msg2.len() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+
+                        // 7. read(read_fd, buf, 64)
+                        let nread2: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 0u64 => nread2,
+                            in("rdi") read_fd as u64,
+                            in("rsi") rbuf.as_mut_ptr() as u64,
+                            in("rdx") 64u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if nread2 != 8 || rbuf[0] != b'd' {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 30u64, options(noreturn));
+                        }
+
+                        // 8. close fds
+                        core::arch::asm!("int 0x80", inlateout("rax") 3u64 => _, in("rdi") read_fd as u64, lateout("rcx") _, lateout("r11") _);
+                        core::arch::asm!("int 0x80", inlateout("rax") 3u64 => _, in("rdi") write_fd as u64, lateout("rcx") _, lateout("r11") _);
+                        core::arch::asm!("int 0x80", inlateout("rax") 3u64 => _, in("rdi") 10u64, lateout("rcx") _, lateout("r11") _);
+
+                        // 9. Print success and exit
+                        let ok_msg = b"[linux] pipe2+dup2 OK\n";
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 1u64 => _,
+                            in("rdi") 1u64,
+                            in("rsi") ok_msg.as_ptr() as u64,
+                            in("rdx") ok_msg.len() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                // Parent: set child's personality to Linux.
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 124 linux pipe2+dup2: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 124 linux pipe2+dup2: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 124 linux pipe2+dup2: FAILED (exit=");
+                    // Print exit code as decimal.
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 124 linux pipe2+dup2: SKIPPED (linux_srv not found)\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

@@ -34,6 +34,8 @@ const __NR_IOCTL: u64 = 16;
 const __NR_ACCESS: u64 = 21;
 const __NR_WRITEV: u64 = 20;
 const __NR_GETPID: u64 = 39;
+const __NR_DUP: u64 = 32;
+const __NR_DUP2: u64 = 33;
 const __NR_CLONE: u64 = 56;
 const __NR_FORK: u64 = 57;
 const __NR_VFORK: u64 = 58;
@@ -54,6 +56,8 @@ const __NR_EXIT_GROUP: u64 = 231;
 const __NR_OPENAT: u64 = 257;
 const __NR_NEWFSTATAT: u64 = 262;
 const __NR_SET_ROBUST_LIST: u64 = 273;
+const __NR_DUP3: u64 = 292;
+const __NR_PIPE2: u64 = 293;
 const __NR_PRLIMIT64: u64 = 302;
 const __NR_GETRANDOM: u64 = 318;
 const __NR_RSEQ: u64 = 334;
@@ -71,8 +75,10 @@ const ENOTDIR: u64 = 20;
 const EINVAL: u64 = 22;
 const EAGAIN: u64 = 11;
 const ECHILD: u64 = 10;
-const ENOSYS: u64 = 38;
+const EMFILE: u64 = 24;
+const ESPIPE: u64 = 29;
 const ERANGE: u64 = 34;
+const ENOSYS: u64 = 38;
 
 /// Return negated errno as u64 (Linux convention).
 fn linux_err(e: u64) -> u64 {
@@ -98,10 +104,29 @@ const AT_FDCWD: u64 = 0xFFFF_FFFF_FFFF_FF9C; // -100 as u64
 static mut BRK_BASE: usize = 0;
 static mut BRK_CURRENT: usize = 0;
 
+// Pipe server protocol tags
+const PIPE_CREATE: u64 = 0x5010;
+const PIPE_WRITE_TAG: u64 = 0x5020;
+const PIPE_READ_TAG: u64 = 0x5030;
+const PIPE_CLOSE_TAG: u64 = 0x5040;
+const PIPE_OK: u64 = 0x5100;
+const PIPE_EOF_TAG: u64 = 0x51FF;
+
 // Simple fd table (single-client).
 const MAX_FDS: usize = 64;
+
+#[derive(Clone, Copy, PartialEq)]
+enum FdKind {
+    None,
+    File,
+    Pipe,
+}
+
 struct FdEntry {
     in_use: bool,
+    kind: FdKind,
+    // File: fs_port = FS server port, handle = FS handle
+    // Pipe: fs_port = pipe_srv port, handle = pipe handle
     fs_port: u64,
     handle: u64,
     file_size: u64,
@@ -110,13 +135,14 @@ struct FdEntry {
 
 impl FdEntry {
     const fn empty() -> Self {
-        Self { in_use: false, fs_port: 0, handle: 0, file_size: 0, offset: 0 }
+        Self { in_use: false, kind: FdKind::None, fs_port: 0, handle: 0, file_size: 0, offset: 0 }
     }
 }
 
 static mut FD_TABLE: [FdEntry; MAX_FDS] = [const { FdEntry::empty() }; MAX_FDS];
 static mut VFS_PORT: u64 = 0;
 static mut REPLY_PORT: u64 = 0;
+static mut PIPE_PORT: u64 = 0;
 
 fn alloc_fd() -> Option<usize> {
     unsafe {
@@ -173,7 +199,20 @@ fn handle_write(caller_port: u64, args: &[u64; 6]) -> u64 {
         return total as u64;
     }
 
-    // File FDs: write through VFS (not yet implemented).
+    // Check FD table for pipe writes.
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return linux_err(EBADF);
+    }
+    unsafe {
+        if !FD_TABLE[fd_idx].in_use {
+            return linux_err(EBADF);
+        }
+        if FD_TABLE[fd_idx].kind == FdKind::Pipe {
+            return write_pipe(caller_port, FD_TABLE[fd_idx].fs_port,
+                              FD_TABLE[fd_idx].handle, buf_va, count);
+        }
+    }
     linux_err(EBADF)
 }
 
@@ -234,12 +273,17 @@ fn handle_read(caller_port: u64, args: &[u64; 6]) -> u64 {
         return linux_err(EBADF);
     }
 
-    let (fs_port, handle, offset, file_size) = unsafe {
+    let (kind, fs_port, handle, offset, file_size) = unsafe {
         if !FD_TABLE[fd].in_use {
             return linux_err(EBADF);
         }
-        (FD_TABLE[fd].fs_port, FD_TABLE[fd].handle, FD_TABLE[fd].offset, FD_TABLE[fd].file_size)
+        (FD_TABLE[fd].kind, FD_TABLE[fd].fs_port, FD_TABLE[fd].handle,
+         FD_TABLE[fd].offset, FD_TABLE[fd].file_size)
     };
+
+    if kind == FdKind::Pipe {
+        return read_pipe(caller_port, fs_port, handle, buf_va, count);
+    }
 
     if offset >= file_size {
         return 0; // EOF
@@ -339,6 +383,7 @@ fn do_open(caller_port: u64, path_va: usize, flags: u64) -> u64 {
     };
 
     unsafe {
+        FD_TABLE[fd].kind = FdKind::File;
         FD_TABLE[fd].fs_port = resp.data[0];
         FD_TABLE[fd].handle = resp.data[1];
         FD_TABLE[fd].file_size = resp.data[2];
@@ -365,6 +410,32 @@ fn handle_openat(caller_port: u64, args: &[u64; 6]) -> u64 {
     do_open(caller_port, path_va, flags)
 }
 
+/// Internal close logic for any FD kind.
+fn do_close(fd: usize) {
+    unsafe {
+        if fd >= MAX_FDS || !FD_TABLE[fd].in_use {
+            return;
+        }
+        match FD_TABLE[fd].kind {
+            FdKind::File => {
+                let rp = REPLY_PORT;
+                let d3 = rp << 32;
+                syscall::send(FD_TABLE[fd].fs_port, FS_CLOSE, FD_TABLE[fd].handle, 0, 0, d3);
+                let _ = syscall::recv_msg(rp);
+            }
+            FdKind::Pipe => {
+                let rp = syscall::port_create();
+                let d2 = (rp as u64) << 32;
+                syscall::send(FD_TABLE[fd].fs_port, PIPE_CLOSE_TAG, FD_TABLE[fd].handle, 0, d2, 0);
+                let _ = syscall::recv_msg(rp);
+                syscall::port_destroy(rp);
+            }
+            FdKind::None => {}
+        }
+        FD_TABLE[fd] = FdEntry::empty();
+    }
+}
+
 /// Handle Linux close(fd).
 fn handle_close(args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
@@ -378,14 +449,8 @@ fn handle_close(args: &[u64; 6]) -> u64 {
         if !FD_TABLE[fd].in_use {
             return linux_err(EBADF);
         }
-        // Send FS_CLOSE to the filesystem server.
-        let rp = REPLY_PORT;
-        let d3 = rp << 32;
-        syscall::send(FD_TABLE[fd].fs_port, FS_CLOSE, FD_TABLE[fd].handle, 0, 0, d3);
-        // Wait for reply (best-effort).
-        let _ = syscall::recv_msg(rp);
-        FD_TABLE[fd] = FdEntry::empty();
     }
+    do_close(fd);
     0
 }
 
@@ -401,6 +466,9 @@ fn handle_lseek(args: &[u64; 6]) -> u64 {
     unsafe {
         if !FD_TABLE[fd].in_use {
             return linux_err(EBADF);
+        }
+        if FD_TABLE[fd].kind == FdKind::Pipe {
+            return linux_err(ESPIPE);
         }
         let new_off = match whence {
             0 => offset, // SEEK_SET
@@ -504,6 +572,15 @@ fn handle_fstat(caller_port: u64, args: &[u64; 6]) -> u64 {
     unsafe {
         if !FD_TABLE[fd].in_use {
             return linux_err(EBADF);
+        }
+        if FD_TABLE[fd].kind == FdKind::Pipe {
+            let mut stat_buf = [0u8; 144];
+            let mode: u32 = 0o010600; // S_IFIFO | 0600
+            stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
+            stat_buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+            let written = syscall::personality_copy_out(caller_port, statbuf_va, &stat_buf);
+            if written < 144 { return linux_err(EFAULT); }
+            return 0;
         }
         let file_size = FD_TABLE[fd].file_size;
         let mut stat_buf = [0u8; 144];
@@ -661,6 +738,167 @@ fn handle_readlink(_caller_port: u64, _args: &[u64; 6]) -> u64 {
     linux_err(EINVAL)
 }
 
+/// Read from a pipe FD into the caller's buffer via personality_copy_out.
+fn read_pipe(caller_port: u64, pipe_port: u64, handle: u64, buf_va: usize, count: usize) -> u64 {
+    let rp = syscall::port_create();
+    let d2 = (rp as u64) << 32;
+    syscall::send(pipe_port, PIPE_READ_TAG, handle, 0, d2, 0);
+    let msg = match syscall::recv_msg(rp) {
+        Some(m) => m,
+        None => {
+            syscall::debug_puts(b"[linux_srv] read_pipe: no reply\n");
+            syscall::port_destroy(rp);
+            return linux_err(EBADF);
+        }
+    };
+    syscall::port_destroy(rp);
+
+    if msg.tag == PIPE_EOF_TAG {
+        return 0;
+    }
+    if msg.tag != PIPE_OK {
+        syscall::debug_puts(b"[linux_srv] read_pipe: bad tag=");
+        print_num(msg.tag);
+        syscall::debug_puts(b"\n");
+        return linux_err(EBADF);
+    }
+
+    let n = (msg.data[2] as usize).min(16).min(count);
+    let mut tmp = [0u8; 16];
+    let b0 = msg.data[0].to_le_bytes();
+    let b1 = msg.data[1].to_le_bytes();
+    tmp[..8].copy_from_slice(&b0);
+    tmp[8..16].copy_from_slice(&b1);
+    let written = syscall::personality_copy_out(caller_port, buf_va, &tmp[..n]);
+    if written == 0 {
+        return linux_err(EFAULT);
+    }
+    written as u64
+}
+
+/// Write from the caller's buffer to a pipe FD via personality_copy_in.
+fn write_pipe(caller_port: u64, pipe_port: u64, handle: u64, buf_va: usize, count: usize) -> u64 {
+    let mut offset = 0usize;
+    while offset < count {
+        let chunk_len = (count - offset).min(16);
+        let mut tmp = [0u8; 16];
+        let copied = syscall::personality_copy_in(caller_port, buf_va + offset, &mut tmp[..chunk_len]);
+        if copied == 0 {
+            syscall::debug_puts(b"[linux_srv] write_pipe: copy_in failed\n");
+            return if offset > 0 { offset as u64 } else { linux_err(EFAULT) };
+        }
+        let mut w0 = 0u64;
+        let mut w1 = 0u64;
+        for i in 0..copied.min(8) { w0 |= (tmp[i] as u64) << (i * 8); }
+        for i in 8..copied { w1 |= (tmp[i] as u64) << ((i - 8) * 8); }
+        // Fire-and-forget: d2 low16 = len, high32 = 0xFFFFFFFF (no reply).
+        let d2 = (copied as u64) | (0xFFFFFFFF_u64 << 32);
+        syscall::send(pipe_port, PIPE_WRITE_TAG, handle, w0, d2, w1);
+        offset += copied;
+    }
+    offset as u64
+}
+
+/// Handle Linux pipe2(pipefd, flags).
+fn handle_pipe2(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let pipefd_va = args[0] as usize;
+    let _flags = args[1]; // O_CLOEXEC/O_NONBLOCK ignored for now
+
+    let pipe_port = unsafe { PIPE_PORT };
+    if pipe_port == 0 { return linux_err(ENOSYS); }
+
+    // Create a pipe via pipe_srv.
+    let rp = syscall::port_create();
+    let d2 = (rp as u64) << 32;
+    syscall::send(pipe_port, PIPE_CREATE, 0, 0, d2, 0);
+    let msg = match syscall::recv_msg(rp) {
+        Some(m) => m,
+        None => { syscall::port_destroy(rp); return linux_err(ENOSYS); }
+    };
+    syscall::port_destroy(rp);
+    if msg.tag != PIPE_OK { return linux_err(ENOSYS); }
+
+    let read_handle = msg.data[0];
+    let write_handle = msg.data[1];
+
+    // Allocate two FDs.
+    let read_fd = match alloc_fd() {
+        Some(f) => f,
+        None => return linux_err(EMFILE),
+    };
+    let write_fd = match alloc_fd() {
+        Some(f) => f,
+        None => {
+            unsafe { FD_TABLE[read_fd] = FdEntry::empty(); }
+            return linux_err(EMFILE);
+        }
+    };
+
+    unsafe {
+        FD_TABLE[read_fd].kind = FdKind::Pipe;
+        FD_TABLE[read_fd].fs_port = pipe_port;
+        FD_TABLE[read_fd].handle = read_handle;
+        FD_TABLE[write_fd].kind = FdKind::Pipe;
+        FD_TABLE[write_fd].fs_port = pipe_port;
+        FD_TABLE[write_fd].handle = write_handle;
+    }
+
+    // Write [read_fd, write_fd] as two i32s to the caller.
+    let fds: [i32; 2] = [read_fd as i32, write_fd as i32];
+    let fds_bytes: [u8; 8] = unsafe { core::mem::transmute(fds) };
+    let written = syscall::personality_copy_out(caller_port, pipefd_va, &fds_bytes);
+    if written < 8 { return linux_err(EFAULT); }
+    0
+}
+
+/// Handle Linux dup(oldfd).
+fn handle_dup(args: &[u64; 6]) -> u64 {
+    let oldfd = args[0] as usize;
+    if oldfd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !FD_TABLE[oldfd].in_use { return linux_err(EBADF); }
+        let newfd = match alloc_fd() {
+            Some(f) => f,
+            None => return linux_err(EMFILE),
+        };
+        FD_TABLE[newfd].kind = FD_TABLE[oldfd].kind;
+        FD_TABLE[newfd].fs_port = FD_TABLE[oldfd].fs_port;
+        FD_TABLE[newfd].handle = FD_TABLE[oldfd].handle;
+        FD_TABLE[newfd].file_size = FD_TABLE[oldfd].file_size;
+        FD_TABLE[newfd].offset = FD_TABLE[oldfd].offset;
+        newfd as u64
+    }
+}
+
+/// Handle Linux dup2(oldfd, newfd).
+fn handle_dup2(args: &[u64; 6]) -> u64 {
+    let oldfd = args[0] as usize;
+    let newfd = args[1] as usize;
+    if oldfd >= MAX_FDS || newfd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !FD_TABLE[oldfd].in_use { return linux_err(EBADF); }
+        if oldfd == newfd { return newfd as u64; }
+        // Close newfd if open.
+        if FD_TABLE[newfd].in_use { do_close(newfd); }
+        FD_TABLE[newfd].in_use = true;
+        FD_TABLE[newfd].kind = FD_TABLE[oldfd].kind;
+        FD_TABLE[newfd].fs_port = FD_TABLE[oldfd].fs_port;
+        FD_TABLE[newfd].handle = FD_TABLE[oldfd].handle;
+        FD_TABLE[newfd].file_size = FD_TABLE[oldfd].file_size;
+        FD_TABLE[newfd].offset = FD_TABLE[oldfd].offset;
+        newfd as u64
+    }
+}
+
+/// Handle Linux dup3(oldfd, newfd, flags).
+fn handle_dup3(args: &[u64; 6]) -> u64 {
+    let oldfd = args[0] as usize;
+    let newfd = args[1] as usize;
+    if oldfd == newfd { return linux_err(EINVAL); }
+    // Reuse dup2 logic.
+    handle_dup2(args)
+}
+
 /// Handle Linux fork() / vfork() / clone() (basic).
 fn handle_fork(caller_port: u64) -> u64 {
     let child_port = syscall::personality_fork(caller_port);
@@ -781,10 +1019,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::personality_register(2, port); // 2 = Linux
     syscall::ns_register(b"linux", port);
 
-    // Set up VFS client port for file operations.
+    // Set up VFS and pipe client ports.
     unsafe {
         REPLY_PORT = syscall::port_create();
         VFS_PORT = syscall::ns_lookup(b"vfs").unwrap_or(0);
+        PIPE_PORT = syscall::ns_lookup(b"pipe").unwrap_or(0);
     }
 
     syscall::debug_puts(b"[linux_srv] ready on port ");
@@ -810,9 +1049,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_LSEEK => handle_lseek(&msg.data),
             __NR_WRITEV => handle_writev(caller_port, &msg.data),
             __NR_ACCESS => handle_access(caller_port, &msg.data),
+            __NR_DUP => handle_dup(&msg.data),
+            __NR_DUP2 => handle_dup2(&msg.data),
             __NR_GETCWD => handle_getcwd(caller_port, &msg.data),
             __NR_READLINK => handle_readlink(caller_port, &msg.data),
             __NR_OPENAT => handle_openat(caller_port, &msg.data),
+            __NR_DUP3 => handle_dup3(&msg.data),
+            __NR_PIPE2 => handle_pipe2(caller_port, &msg.data),
             __NR_FORK | __NR_VFORK => handle_fork(caller_port),
             __NR_CLONE => handle_fork(caller_port), // basic clone = fork
             __NR_WAIT4 => handle_wait4(caller_port, &msg.data),
