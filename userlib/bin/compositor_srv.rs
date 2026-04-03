@@ -66,6 +66,8 @@ const TASKBAR_BTN_BG: u32 = 0x00404040;
 const TASKBAR_BTN_FOCUSED: u32 = 0x003355AA;
 const TASKBAR_BTN_H: i32 = 18;
 const TASKBAR_BTN_GAP: i32 = 4;
+const CASCADE_STEP: i32 = 30;
+const CASCADE_MAX: u8 = 8;
 
 // Page size for mmap_anon (allocation pages).
 const PAGE_SIZE: usize = 4096;
@@ -265,6 +267,7 @@ struct Compositor {
     dragging: i8,    // -1 = not dragging, else window index
     drag_off_x: i32, // offset from window origin to grab point
     drag_off_y: i32,
+    next_cascade: u8, // 0..CASCADE_MAX, cycles through cascade positions
 }
 
 fn print_num(n: u64) {
@@ -387,6 +390,7 @@ impl Compositor {
             dragging: -1,
             drag_off_x: 0,
             drag_off_y: 0,
+            next_cascade: 0,
         }
     }
 
@@ -400,8 +404,11 @@ impl Compositor {
     }
 
     fn handle_create_window(&mut self, msg: &syscall::Message) {
-        let x = msg.data[0] as i32;
-        let y = (msg.data[0] >> 32) as i32;
+        // Cascade placement: override client-requested position.
+        let cas = self.next_cascade as i32;
+        let x = 40 + cas * CASCADE_STEP;
+        let y = 40 + cas * CASCADE_STEP;
+        self.next_cascade = (self.next_cascade + 1) % CASCADE_MAX;
         let w = msg.data[1] as u32;
         let h = (msg.data[1] >> 32) as u32;
         let event_port = msg.data[2] as u32 as u64;
