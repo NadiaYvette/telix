@@ -22,6 +22,7 @@ const COMP_GET_INFO: u64 = 0xA008;
 #[allow(dead_code)]
 const COMP_GET_INFO_OK: u64 = 0xA009;
 const COMP_INPUT_EVENT: u64 = 0xA00A;
+const COMP_CLOSE_EVENT: u64 = 0xA00E;
 
 // --- PTY IPC (0x90xx) ---
 const PTY_OPEN: u64 = 0x9000;
@@ -738,11 +739,16 @@ pub extern "C" fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     term.dirty = false;
 
     // 7. Main loop.
-    loop {
+    let mut running = true;
+    while running {
         // Drain keyboard events from compositor.
         loop {
             match syscall::recv_nb_msg(event_port) {
                 Some(msg) => {
+                    if msg.tag == COMP_CLOSE_EVENT {
+                        running = false;
+                        break;
+                    }
                     if msg.tag == COMP_INPUT_EVENT {
                         let d0 = msg.data[0];
                         let event_type = (d0 & 0xFF) as u8;
@@ -755,6 +761,7 @@ pub extern "C" fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 None => break,
             }
         }
+        if !running { break; }
 
         // Poll PTY master for shell output (drain all available).
         let mut read_any = false;

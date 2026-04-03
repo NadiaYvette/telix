@@ -26,6 +26,7 @@ const COMP_GET_INFO: u64 = 0xA008;
 const COMP_GET_INFO_OK: u64 = 0xA009;
 const COMP_INPUT_EVENT: u64 = 0xA00A;
 const COMP_FOCUS_EVENT: u64 = 0xA00C;
+const COMP_CLOSE_EVENT: u64 = 0xA00E;
 
 // fb_srv protocol.
 const FB_GET_INFO: u64 = 0x8000;
@@ -56,6 +57,9 @@ const TITLEBAR_H: i32 = 20;
 const TITLEBAR_BG: u32 = 0x00404060;
 const TITLEBAR_FOCUSED_BG: u32 = 0x003355AA;
 const TITLEBAR_TEXT_COLOR: u32 = 0x00FFFFFF;
+const CLOSE_BTN_SIZE: i32 = 14;
+const CLOSE_BTN_COLOR: u32 = 0x00CC4444;
+const CLOSE_BTN_X_COLOR: u32 = 0x00FFFFFF;
 
 // Page size for mmap_anon (allocation pages).
 const PAGE_SIZE: usize = 4096;
@@ -622,6 +626,27 @@ impl Compositor {
         let text_y = win.y - TITLEBAR_H + (TITLEBAR_H - 8) / 2;
         let text_x = win.x + 4; // small left padding
         self.draw_text(text_x, text_y, &win.title[..win.title_len as usize], TITLEBAR_TEXT_COLOR);
+
+        // Draw close button (14x14 red square with white X) in top-right.
+        let btn_x = win.x + win.w as i32 - CLOSE_BTN_SIZE - 3;
+        let btn_y = win.y - TITLEBAR_H + 3;
+        for cy in 0..CLOSE_BTN_SIZE {
+            let sy = btn_y + cy;
+            if sy < 0 || sy >= self.fb_h as i32 { continue; }
+            for cx in 0..CLOSE_BTN_SIZE {
+                let sx = btn_x + cx;
+                if sx < 0 || sx >= self.fb_w as i32 { continue; }
+                // Draw X: two diagonals in the inner 8x8 region (offset 3..11).
+                let ix = cx - 3;
+                let iy = cy - 3;
+                let on_x = ix >= 0 && ix < 8 && iy >= 0 && iy < 8
+                    && ((ix - iy).abs() <= 1 || (ix - (7 - iy)).abs() <= 1);
+                let color = if on_x { CLOSE_BTN_X_COLOR } else { CLOSE_BTN_COLOR };
+                unsafe {
+                    ptr::write_volatile(fb.add(sy as usize * stride + sx as usize), color);
+                }
+            }
+        }
     }
 
     /// Draw text using the embedded 8x8 font.
@@ -778,6 +803,13 @@ impl Compositor {
                             self.spawn_terminal();
                             return;
                         }
+                        0x3E => { // Alt+F4: close focused window
+                            if self.focus >= 0 {
+                                let idx = self.focus as usize;
+                                self.close_window(idx);
+                            }
+                            return;
+                        }
                         _ => {}
                     }
                 }
@@ -821,10 +853,19 @@ impl Compositor {
                         }
                     }
                     if drag_target >= 0 {
-                        self.dragging = drag_target;
+                        // Check if click is on the close button.
                         let win = &self.windows[drag_target as usize];
-                        self.drag_off_x = self.mouse_x - win.x;
-                        self.drag_off_y = self.mouse_y - win.y;
+                        let btn_x = win.x + win.w as i32 - CLOSE_BTN_SIZE - 3;
+                        let btn_y = win.y - TITLEBAR_H + 3;
+                        if self.mouse_x >= btn_x && self.mouse_x < btn_x + CLOSE_BTN_SIZE
+                            && self.mouse_y >= btn_y && self.mouse_y < btn_y + CLOSE_BTN_SIZE
+                        {
+                            self.close_window(drag_target as usize);
+                        } else {
+                            self.dragging = drag_target;
+                            self.drag_off_x = self.mouse_x - win.x;
+                            self.drag_off_y = self.mouse_y - win.y;
+                        }
                     }
 
                     // Click-to-focus (title bar or content).
@@ -880,6 +921,38 @@ impl Compositor {
         if tid == u64::MAX {
             syscall::debug_puts(b"  [compositor] spawn term_srv failed\n");
         }
+    }
+
+    /// Close a window: notify client, then destroy.
+    fn close_window(&mut self, idx: usize) {
+        if idx >= MAX_WINDOWS || !self.windows[idx].active {
+            return;
+        }
+        // Notify client of impending close.
+        let win = &self.windows[idx];
+        if win.event_port != 0 {
+            syscall::send_nb_4(win.event_port, COMP_CLOSE_EVENT, 0, 0, 0, 0);
+        }
+        // Destroy: revoke, munmap, clear slot.
+        let _ = syscall::revoke(win.owner_task, win.granted_va);
+        syscall::munmap(win.buf_va);
+        self.windows[idx] = Window::empty();
+
+        if self.focus == idx as i8 {
+            self.focus = -1;
+            let mut best_z = 0u16;
+            for i in 0..MAX_WINDOWS {
+                if self.windows[i].active && self.windows[i].z_order >= best_z {
+                    best_z = self.windows[i].z_order;
+                    self.focus = i as i8;
+                }
+            }
+        }
+        // End any drag on this window.
+        if self.dragging == idx as i8 {
+            self.dragging = -1;
+        }
+        self.dirty = true;
     }
 
     /// Click-to-focus: find topmost window under mouse cursor (content or title bar).

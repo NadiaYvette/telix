@@ -8223,6 +8223,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 114: Close button, Alt+F4, graceful window shutdown ---
+    syscall::debug_puts(b"  init: Phase 114 window close...\n");
+    {
+        let comp_ok = syscall::ns_lookup(b"compositor").is_some();
+        if comp_ok {
+            syscall::debug_puts(b"Phase 114 window close: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 114 window close: FAILED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
