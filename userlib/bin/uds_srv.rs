@@ -16,6 +16,7 @@
 //!   UDS_RECV(0x8060)    — recv data, d0=handle
 //!   UDS_CLOSE(0x8070)   — close socket, d0=handle
 //!   UDS_GETPEERCRED(0x8080) — get peer creds, d0=handle
+//!   UDS_GETPEER(0x80A0)    — get peer handle, d0=handle
 
 extern crate userlib;
 
@@ -32,6 +33,7 @@ const UDS_RECV: u64 = 0x8060;
 const UDS_CLOSE: u64 = 0x8070;
 const UDS_GETPEERCRED: u64 = 0x8080;
 const UDS_POLL: u64 = 0x8090;
+const UDS_GETPEER: u64 = 0x80A0;
 
 const UDS_OK: u64 = 0x8100;
 const UDS_EOF: u64 = 0x81FF;
@@ -566,6 +568,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
                 reply(reply_port, UDS_OK, revents as u64, 0, 0, 0);
+            }
+
+            UDS_GETPEER => {
+                let handle = msg.data[0] as u32;
+                if handle as usize >= MAX_SOCKETS {
+                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    continue;
+                }
+                let s = unsafe { &SOCKS[handle as usize] };
+                if s.state != SockState::Connected || s.peer == u32::MAX {
+                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    continue;
+                }
+                reply(reply_port, UDS_OK, s.peer as u64, 0, 0, 0);
             }
 
             _ => {

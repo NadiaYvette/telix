@@ -146,15 +146,13 @@ pub fn set_personality(target_port: u64, personality_id: u8, abi_id: u8) -> u64 
 /// blocks the calling thread, and returns the reply set by SYS_PERSONALITY_REPLY.
 ///
 /// Message format:
-///   tag     = foreign syscall number
+///   tag     = (syscall_nr & 0xFFFFFFFF) | (caller_port << 32)
 ///   data[0] = args[0]
 ///   data[1] = args[1]
 ///   data[2] = args[2]
 ///   data[3] = args[3]
-///   data[4] = caller's task port_id (stamped here, NOT by port::send)
-///   data[5] = overwritten with sender priority by port::send internals
-///
-/// args[4-5] are available to the personality server via SYS_PERSONALITY_READ_ARGS.
+///   data[4] = args[4]
+///   data[5] = overwritten with sender priority by port::send internals (args[5] lost)
 pub fn forward_to_server(
     personality_port: u64,
     nr: u64,

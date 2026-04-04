@@ -228,6 +228,7 @@ const UDS_RECV: u64 = 0x8060;
 const UDS_CLOSE: u64 = 0x8070;
 const UDS_GETPEERCRED: u64 = 0x8080;
 const UDS_POLL_TAG: u64 = 0x8090;
+const UDS_GETPEER: u64 = 0x80A0;
 const UDS_OK: u64 = 0x8100;
 const UDS_EOF: u64 = 0x81FF;
 const _UDS_ERROR: u64 = 0x8F00;
@@ -415,6 +416,28 @@ impl MemFdSlot {
 }
 
 static mut MEMFD_TABLE: [MemFdSlot; MAX_MEMFD_INSTANCES] = [const { MemFdSlot::empty() }; MAX_MEMFD_INSTANCES];
+
+// SCM_RIGHTS: pending FD transfers over UDS
+const MAX_PENDING_FD_TRANSFERS: usize = 16;
+const MAX_FDS_PER_TRANSFER: usize = 4;
+const SOL_SOCKET: u32 = 1;
+const SCM_RIGHTS: u32 = 1;
+
+#[derive(Clone, Copy)]
+struct PendingFdTransfer {
+    active: bool,
+    receiver_uds_handle: u64,
+    fd_count: usize,
+    entries: [FdEntry; MAX_FDS_PER_TRANSFER],
+}
+
+impl PendingFdTransfer {
+    const fn empty() -> Self {
+        Self { active: false, receiver_uds_handle: 0, fd_count: 0, entries: [const { FdEntry::empty() }; MAX_FDS_PER_TRANSFER] }
+    }
+}
+
+static mut PENDING_FD_TRANSFERS: [PendingFdTransfer; MAX_PENDING_FD_TRANSFERS] = [const { PendingFdTransfer::empty() }; MAX_PENDING_FD_TRANSFERS];
 
 /// Find a process slot by caller_port.
 fn find_proc(port: u64) -> Option<usize> {
@@ -2805,6 +2828,7 @@ fn handle_recvfrom(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
 /// Handle Linux sendmsg(fd, msg, flags).
 /// Reads msghdr from caller, gathers iovecs, sends via write_socket.
+/// Supports SCM_RIGHTS ancillary data for passing FDs over AF_UNIX sockets.
 fn handle_sendmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
     let msghdr_va = args[1] as usize;
@@ -2827,6 +2851,78 @@ fn handle_sendmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                            hdr[20], hdr[21], hdr[22], hdr[23]]) as usize;
         let iov_len = u64::from_le_bytes([hdr[24], hdr[25], hdr[26], hdr[27],
                                            hdr[28], hdr[29], hdr[30], hdr[31]]) as usize;
+
+        // Parse SCM_RIGHTS ancillary data if present.
+        let msg_control = u64::from_le_bytes([hdr[32], hdr[33], hdr[34], hdr[35],
+                                               hdr[36], hdr[37], hdr[38], hdr[39]]) as usize;
+        let msg_controllen = u64::from_le_bytes([hdr[40], hdr[41], hdr[42], hdr[43],
+                                                  hdr[44], hdr[45], hdr[46], hdr[47]]) as usize;
+
+        if msg_control != 0 && msg_controllen >= 20
+            && PROC_TABLE[pi].fds[fd].sock_domain == AF_UNIX as u8
+        {
+            // Read cmsg header: cmsg_len(8) + cmsg_level(4) + cmsg_type(4) = 16 bytes
+            let mut cmsg_hdr = [0u8; 16];
+            let ch = syscall::personality_copy_in(caller_port, msg_control, &mut cmsg_hdr);
+            if ch >= 16 {
+                let cmsg_len = u64::from_le_bytes([cmsg_hdr[0], cmsg_hdr[1], cmsg_hdr[2], cmsg_hdr[3],
+                                                    cmsg_hdr[4], cmsg_hdr[5], cmsg_hdr[6], cmsg_hdr[7]]) as usize;
+                let cmsg_level = u32::from_le_bytes([cmsg_hdr[8], cmsg_hdr[9], cmsg_hdr[10], cmsg_hdr[11]]);
+                let cmsg_type = u32::from_le_bytes([cmsg_hdr[12], cmsg_hdr[13], cmsg_hdr[14], cmsg_hdr[15]]);
+
+                if cmsg_level == SOL_SOCKET && cmsg_type == SCM_RIGHTS && cmsg_len > 16 {
+                    let payload_len = cmsg_len - 16;
+                    let fd_count = payload_len / 4;
+                    let fd_count = if fd_count > MAX_FDS_PER_TRANSFER { MAX_FDS_PER_TRANSFER } else { fd_count };
+
+                    if fd_count > 0 {
+                        // Read FD array from cmsg data (int32[])
+                        let mut fd_buf = [0u8; 16]; // max 4 FDs * 4 bytes
+                        let fb = syscall::personality_copy_in(caller_port, msg_control + 16, &mut fd_buf[..fd_count * 4]);
+                        if fb >= fd_count * 4 {
+                            // Validate FDs and copy entries
+                            let mut entries = [FdEntry::empty(); MAX_FDS_PER_TRANSFER];
+                            let mut valid = true;
+                            for i in 0..fd_count {
+                                let src_fd = u32::from_le_bytes([fd_buf[i*4], fd_buf[i*4+1], fd_buf[i*4+2], fd_buf[i*4+3]]) as usize;
+                                if src_fd >= MAX_FDS || !PROC_TABLE[pi].fds[src_fd].in_use {
+                                    valid = false;
+                                    break;
+                                }
+                                entries[i] = PROC_TABLE[pi].fds[src_fd];
+                            }
+
+                            if valid {
+                                // Query UDS_GETPEER to find receiver's handle
+                                let sender_handle = PROC_TABLE[pi].fds[fd].handle;
+                                let uds_port = PROC_TABLE[pi].fds[fd].fs_port;
+                                let rp = syscall::port_create();
+                                let d2 = (rp as u64) << 32;
+                                syscall::send(uds_port, UDS_GETPEER, sender_handle, 0, d2, 0);
+                                if let Some(resp) = syscall::recv_msg(rp) {
+                                    syscall::port_destroy(rp);
+                                    if resp.tag == UDS_OK {
+                                        let peer_handle = resp.data[0];
+                                        // Find free transfer slot
+                                        for s in 0..MAX_PENDING_FD_TRANSFERS {
+                                            if !PENDING_FD_TRANSFERS[s].active {
+                                                PENDING_FD_TRANSFERS[s].active = true;
+                                                PENDING_FD_TRANSFERS[s].receiver_uds_handle = peer_handle;
+                                                PENDING_FD_TRANSFERS[s].fd_count = fd_count;
+                                                PENDING_FD_TRANSFERS[s].entries = entries;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    syscall::port_destroy(rp);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         if iov_ptr == 0 || iov_len == 0 { return 0; }
 
@@ -2869,11 +2965,6 @@ fn handle_sendmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
         if total == 0 { return 0; }
 
-        // Write gathered data to the socket.
-        // We need to copy from our local buffer to the caller's address space temporarily,
-        // then call write_socket. But write_socket reads from caller's VA. Instead, we'll
-        // write directly to the UDS/NET server using the same IPC pattern as write_socket
-        // but with our local buffer.
         let dom = PROC_TABLE[pi].fds[fd].sock_domain;
         let srv_port = PROC_TABLE[pi].fds[fd].fs_port;
         let handle = PROC_TABLE[pi].fds[fd].handle;
@@ -2881,8 +2972,87 @@ fn handle_sendmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     }
 }
 
+/// Deliver pending SCM_RIGHTS FDs to a recvmsg caller.
+/// Checks PENDING_FD_TRANSFERS for the given UDS handle, installs FDs in
+/// receiver's process, writes cmsg to caller's msg_control buffer.
+/// If no pending FDs, zeroes msg_controllen.
+unsafe fn deliver_scm_rights(pi: usize, caller_port: u64, msghdr_va: usize,
+                              hdr: &[u8; 56], my_uds_handle: u64, is_af_unix: bool) {
+    let msg_control = u64::from_le_bytes([hdr[32], hdr[33], hdr[34], hdr[35],
+                                           hdr[36], hdr[37], hdr[38], hdr[39]]) as usize;
+    let msg_controllen = u64::from_le_bytes([hdr[40], hdr[41], hdr[42], hdr[43],
+                                              hdr[44], hdr[45], hdr[46], hdr[47]]) as usize;
+
+    // Look for pending FD transfers for this socket
+    if is_af_unix && msg_control != 0 && msg_controllen >= 20 {
+        for s in 0..MAX_PENDING_FD_TRANSFERS {
+            if PENDING_FD_TRANSFERS[s].active
+                && PENDING_FD_TRANSFERS[s].receiver_uds_handle == my_uds_handle
+            {
+                let fd_count = PENDING_FD_TRANSFERS[s].fd_count;
+                let cmsg_len = 16 + fd_count * 4;
+                // CMSG_SPACE: align to 8 bytes
+                let cmsg_space = (cmsg_len + 7) & !7;
+
+                if msg_controllen >= cmsg_space {
+                    // Allocate FDs in receiver's process and build cmsg
+                    let mut new_fds = [0i32; MAX_FDS_PER_TRANSFER];
+                    let mut ok = true;
+                    for i in 0..fd_count {
+                        match alloc_fd(pi) {
+                            Some(nfd) => {
+                                PROC_TABLE[pi].fds[nfd] = PENDING_FD_TRANSFERS[s].entries[i];
+                                new_fds[i] = nfd as i32;
+                            }
+                            None => { ok = false; break; }
+                        }
+                    }
+
+                    if ok {
+                        // Build cmsg: cmsghdr (16 bytes) + int32[] FDs
+                        let mut cmsg = [0u8; 32]; // max 16 + 4*4 = 32
+                        let len_bytes = (cmsg_len as u64).to_le_bytes();
+                        cmsg[0..8].copy_from_slice(&len_bytes);
+                        let level_bytes = SOL_SOCKET.to_le_bytes();
+                        cmsg[8..12].copy_from_slice(&level_bytes);
+                        let type_bytes = SCM_RIGHTS.to_le_bytes();
+                        cmsg[12..16].copy_from_slice(&type_bytes);
+                        for i in 0..fd_count {
+                            let fb = new_fds[i].to_le_bytes();
+                            cmsg[16 + i*4..16 + i*4 + 4].copy_from_slice(&fb);
+                        }
+                        syscall::personality_copy_out(caller_port, msg_control, &cmsg[..cmsg_space]);
+
+                        // Update msg_controllen to actual size
+                        let clen_bytes = (cmsg_space as u64).to_le_bytes();
+                        syscall::personality_copy_out(caller_port, msghdr_va + 40, &clen_bytes);
+
+                        PENDING_FD_TRANSFERS[s].active = false;
+                        return;
+                    }
+                    // If alloc_fd failed, free any we already allocated
+                    for i in 0..fd_count {
+                        if new_fds[i] > 0 {
+                            PROC_TABLE[pi].fds[new_fds[i] as usize] = FdEntry::empty();
+                        }
+                    }
+                }
+
+                // Couldn't deliver — mark consumed anyway to avoid stale entries
+                PENDING_FD_TRANSFERS[s].active = false;
+                break;
+            }
+        }
+    }
+
+    // No pending FDs or not AF_UNIX: zero msg_controllen
+    let zero8 = [0u8; 8];
+    syscall::personality_copy_out(caller_port, msghdr_va + 40, &zero8);
+}
+
 /// Handle Linux recvmsg(fd, msg, flags).
 /// Receives data, scatters into iovecs described by msghdr.
+/// Delivers SCM_RIGHTS ancillary data if pending.
 fn handle_recvmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
     let msghdr_va = args[1] as usize;
@@ -2906,6 +3076,9 @@ fn handle_recvmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                            hdr[28], hdr[29], hdr[30], hdr[31]]) as usize;
 
         if iov_ptr == 0 || iov_len == 0 { return 0; }
+
+        let my_handle = PROC_TABLE[pi].fds[fd].handle;
+        let is_af_unix = PROC_TABLE[pi].fds[fd].sock_domain == AF_UNIX as u8;
 
         // Calculate total iovec capacity
         let max_iovs = if iov_len > 8 { 8 } else { iov_len };
@@ -2932,9 +3105,7 @@ fn handle_recvmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             let dom = PROC_TABLE[pi].fds[fd].sock_domain;
             let result = read_socket(caller_port, PROC_TABLE[pi].fds[fd].fs_port,
                                      PROC_TABLE[pi].fds[fd].handle, dom, iov_bases[0], iov_lens[0]);
-            // Zero out msg_controllen to indicate no ancillary data
-            let zero8 = [0u8; 8];
-            syscall::personality_copy_out(caller_port, msghdr_va + 40, &zero8);
+            deliver_scm_rights(pi, caller_port, msghdr_va, &hdr, my_handle, is_af_unix);
             return result;
         }
 
@@ -2958,9 +3129,7 @@ fn handle_recvmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             offset += chunk;
         }
 
-        // Zero out msg_controllen
-        let zero8 = [0u8; 8];
-        syscall::personality_copy_out(caller_port, msghdr_va + 40, &zero8);
+        deliver_scm_rights(pi, caller_port, msghdr_va, &hdr, my_handle, is_af_unix);
 
         got as u64
     }

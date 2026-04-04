@@ -10215,6 +10215,252 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 136: SCM_RIGHTS (fd passing over UDS) ---
+    syscall::debug_puts(b"  init: Phase 136 linux SCM_RIGHTS...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+
+                        // 1. socketpair(AF_UNIX=1, SOCK_STREAM=1, 0, sv) — NR 53
+                        let mut sv: [i32; 2] = [0; 2];
+                        let r = linux!(53u64, 1u64, 1u64, 0u64, sv.as_mut_ptr() as u64);
+                        if r > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
+                        }
+                        let s0 = core::ptr::read_volatile(&sv[0]) as u64;
+                        let s1 = core::ptr::read_volatile(&sv[1]) as u64;
+
+                        // 2. memfd_create("test", 0) — NR 319
+                        let mfd_name = *b"test\0";
+                        let mfd = linux!(319u64, mfd_name.as_ptr() as u64, 0u64);
+                        if mfd > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 11u64, options(noreturn));
+                        }
+
+                        // 3. ftruncate(mfd, 64) — NR 77
+                        let r = linux!(77u64, mfd, 64u64);
+                        if r > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 12u64, options(noreturn));
+                        }
+
+                        // 4. write(mfd, "SCM_RIGHTS!", 11) — NR 1
+                        let scm_data = *b"SCM_RIGHTS!";
+                        let r = linux!(1u64, mfd, scm_data.as_ptr() as u64, 11u64);
+                        if r != 11 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 13u64, options(noreturn));
+                        }
+
+                        // 5. lseek(mfd, 0, SEEK_SET) — NR 8
+                        let r = linux!(8u64, mfd, 0u64, 0u64);
+                        if r > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 14u64, options(noreturn));
+                        }
+
+                        // 6. sendmsg(s0, &msghdr, 0) with SCM_RIGHTS carrying mfd — NR 46
+                        #[repr(C)]
+                        struct Iovec { iov_base: u64, iov_len: u64 }
+                        #[repr(C)]
+                        struct Msghdr {
+                            msg_name: u64, msg_namelen: u64,
+                            msg_iov: u64, msg_iovlen: u64,
+                            msg_control: u64, msg_controllen: u64,
+                            msg_flags: u64,
+                        }
+
+                        // Build cmsg: cmsghdr (16 bytes) + 1 int32 fd = 20 bytes, CMSG_SPACE=24
+                        #[repr(C, align(8))]
+                        struct CmsgBuf { data: [u8; 24] }
+                        let mut cmsg = CmsgBuf { data: [0u8; 24] };
+                        // cmsg_len = 20 (16 header + 4 for one int)
+                        let cmsg_len: u64 = 20;
+                        let cmsg_ptr = cmsg.data.as_mut_ptr();
+                        core::ptr::copy_nonoverlapping(cmsg_len.to_le_bytes().as_ptr(), cmsg_ptr, 8);
+                        // cmsg_level = SOL_SOCKET = 1
+                        let sol: u32 = 1;
+                        core::ptr::copy_nonoverlapping(sol.to_le_bytes().as_ptr(), cmsg_ptr.add(8), 4);
+                        // cmsg_type = SCM_RIGHTS = 1
+                        let scm: u32 = 1;
+                        core::ptr::copy_nonoverlapping(scm.to_le_bytes().as_ptr(), cmsg_ptr.add(12), 4);
+                        // FD payload: mfd as i32
+                        let mfd_i32 = mfd as i32;
+                        core::ptr::copy_nonoverlapping(mfd_i32.to_le_bytes().as_ptr(), cmsg_ptr.add(16), 4);
+
+                        let send_payload = *b"hi";
+                        let send_iov = Iovec {
+                            iov_base: send_payload.as_ptr() as u64,
+                            iov_len: 2,
+                        };
+                        let send_hdr = Msghdr {
+                            msg_name: 0, msg_namelen: 0,
+                            msg_iov: &send_iov as *const Iovec as u64, msg_iovlen: 1,
+                            msg_control: cmsg.data.as_ptr() as u64, msg_controllen: 24,
+                            msg_flags: 0,
+                        };
+                        let sent = linux!(46u64, s0, &send_hdr as *const Msghdr as u64, 0u64);
+                        if sent != 2 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 15u64, options(noreturn));
+                        }
+
+                        // 7. recvmsg(s1, &msghdr, 0) — NR 47
+                        let mut recv_buf = [0u8; 16];
+                        let recv_iov = Iovec {
+                            iov_base: recv_buf.as_mut_ptr() as u64,
+                            iov_len: 16,
+                        };
+                        let mut recv_cmsg = CmsgBuf { data: [0u8; 24] };
+                        let mut recv_hdr = Msghdr {
+                            msg_name: 0, msg_namelen: 0,
+                            msg_iov: &recv_iov as *const Iovec as u64, msg_iovlen: 1,
+                            msg_control: recv_cmsg.data.as_mut_ptr() as u64, msg_controllen: 24,
+                            msg_flags: 0,
+                        };
+                        let got = linux!(47u64, s1, &mut recv_hdr as *mut Msghdr as u64, 0u64);
+                        if got != 2 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 16u64, options(noreturn));
+                        }
+
+                        // Verify data == "hi"
+                        if core::ptr::read_volatile(&recv_buf[0]) != b'h'
+                            || core::ptr::read_volatile(&recv_buf[1]) != b'i' {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 17u64, options(noreturn));
+                        }
+
+                        // 8. Parse cmsg to get new FD
+                        let recv_cmsg_ptr = recv_cmsg.data.as_ptr();
+                        let mut cl_buf = [0u8; 8];
+                        core::ptr::copy_nonoverlapping(recv_cmsg_ptr, cl_buf.as_mut_ptr(), 8);
+                        let recv_cmsg_len = u64::from_le_bytes(cl_buf);
+                        if recv_cmsg_len < 20 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 18u64, options(noreturn));
+                        }
+                        let mut lv_buf = [0u8; 4];
+                        core::ptr::copy_nonoverlapping(recv_cmsg_ptr.add(8), lv_buf.as_mut_ptr(), 4);
+                        let recv_level = u32::from_le_bytes(lv_buf);
+                        let mut ty_buf = [0u8; 4];
+                        core::ptr::copy_nonoverlapping(recv_cmsg_ptr.add(12), ty_buf.as_mut_ptr(), 4);
+                        let recv_type = u32::from_le_bytes(ty_buf);
+                        if recv_level != 1 || recv_type != 1 {
+                            // Not SOL_SOCKET / SCM_RIGHTS
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 19u64, options(noreturn));
+                        }
+                        let mut fd_buf = [0u8; 4];
+                        core::ptr::copy_nonoverlapping(recv_cmsg_ptr.add(16), fd_buf.as_mut_ptr(), 4);
+                        let new_fd = i32::from_le_bytes(fd_buf) as u64;
+
+                        // 9. read(new_fd, buf, 11) — NR 0 — should read "SCM_RIGHTS!"
+                        let mut read_buf = [0u8; 16];
+                        let r = linux!(0u64, new_fd, read_buf.as_mut_ptr() as u64, 11u64);
+                        if r != 11 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 20u64, options(noreturn));
+                        }
+                        let expected = b"SCM_RIGHTS!";
+                        let mut ok = true;
+                        for i in 0..11 {
+                            if core::ptr::read_volatile(&read_buf[i]) != expected[i] {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if !ok {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 21u64, options(noreturn));
+                        }
+
+                        // 10. Close all, exit(0)
+                        linux!(3u64, s0);
+                        linux!(3u64, s1);
+                        linux!(3u64, mfd);
+                        linux!(3u64, new_fd);
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 136 linux SCM_RIGHTS: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 136 linux SCM_RIGHTS: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 136 linux SCM_RIGHTS: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 136 linux SCM_RIGHTS: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
