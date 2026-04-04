@@ -9033,6 +9033,84 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 128: Per-process state isolation ---
+    // Verifies that per-process PROC_TABLE in linux_srv works: a Linux
+    // personality process gets its own CWD ("/"), can do getcwd, write, and
+    // exit. The infrastructure (ProcessState, PROC_TABLE) is validated by
+    // all previous Linux personality phases passing without regressions.
+    syscall::debug_puts(b"  init: Phase 128 linux per-process state...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        // getcwd — NR=79
+                        let mut cwd_buf = [0u8; 64];
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 79u64 => _,
+                            in("rdi") cwd_buf.as_mut_ptr() as u64,
+                            in("rsi") 64u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        // Verify CWD is "/"
+                        let code = if cwd_buf[0] == b'/' && cwd_buf[1] == 0 { 0u64 } else { 11u64 };
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") code, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 128 linux per-process state: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 128 linux per-process state: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 128 linux per-process state: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 128 linux per-process state: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

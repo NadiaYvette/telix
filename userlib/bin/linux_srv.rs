@@ -177,10 +177,6 @@ const FS_CLOSE: u64 = 0x2400;
 // Linux AT_FDCWD
 const AT_FDCWD: u64 = 0xFFFF_FFFF_FFFF_FF9C; // -100 as u64
 
-// Per-task state for brk emulation (single-client for now).
-static mut BRK_BASE: usize = 0;
-static mut BRK_CURRENT: usize = 0;
-
 // Pipe server protocol tags
 const PIPE_CREATE: u64 = 0x5010;
 const PIPE_WRITE_TAG: u64 = 0x5020;
@@ -189,8 +185,8 @@ const PIPE_CLOSE_TAG: u64 = 0x5040;
 const PIPE_OK: u64 = 0x5100;
 const PIPE_EOF_TAG: u64 = 0x51FF;
 
-// Simple fd table (single-client).
 const MAX_FDS: usize = 64;
+const MAX_PROCS: usize = 16;
 
 #[derive(Clone, Copy, PartialEq)]
 enum FdKind {
@@ -223,21 +219,75 @@ impl FdEntry {
     }
 }
 
-static mut FD_TABLE: [FdEntry; MAX_FDS] = [const { FdEntry::empty() }; MAX_FDS];
+/// Per-process state, keyed by caller_port (unique per Linux task).
+#[derive(Clone, Copy)]
+struct ProcessState {
+    active: bool,
+    port: u64,
+    fds: [FdEntry; MAX_FDS],
+    brk_base: usize,
+    brk_current: usize,
+    cwd: [u8; 64],
+    cwd_len: usize,
+}
+
+impl ProcessState {
+    const fn empty() -> Self {
+        Self {
+            active: false,
+            port: 0,
+            fds: [const { FdEntry::empty() }; MAX_FDS],
+            brk_base: 0,
+            brk_current: 0,
+            cwd: [0u8; 64],
+            cwd_len: 0,
+        }
+    }
+}
+
+static mut PROC_TABLE: [ProcessState; MAX_PROCS] = [const { ProcessState::empty() }; MAX_PROCS];
 static mut VFS_PORT: u64 = 0;
 static mut REPLY_PORT: u64 = 0;
 static mut PIPE_PORT: u64 = 0;
 
-// Per-process current working directory.
-static mut CWD: [u8; 64] = [0u8; 64];
-static mut CWD_LEN: usize = 0;
+/// Find a process slot by caller_port.
+fn find_proc(port: u64) -> Option<usize> {
+    unsafe {
+        for i in 0..MAX_PROCS {
+            if PROC_TABLE[i].active && PROC_TABLE[i].port == port {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
 
-fn alloc_fd() -> Option<usize> {
+/// Find or create a process slot for the given caller_port.
+fn get_or_init_proc(port: u64) -> Option<usize> {
+    if let Some(i) = find_proc(port) {
+        return Some(i);
+    }
+    unsafe {
+        for i in 0..MAX_PROCS {
+            if !PROC_TABLE[i].active {
+                PROC_TABLE[i] = ProcessState::empty();
+                PROC_TABLE[i].active = true;
+                PROC_TABLE[i].port = port;
+                PROC_TABLE[i].cwd[0] = b'/';
+                PROC_TABLE[i].cwd_len = 1;
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn alloc_fd(pi: usize) -> Option<usize> {
     unsafe {
         // Skip fds 0-2 (stdin/stdout/stderr are special).
         for i in 3..MAX_FDS {
-            if !FD_TABLE[i].in_use {
-                FD_TABLE[i].in_use = true;
+            if !PROC_TABLE[pi].fds[i].in_use {
+                PROC_TABLE[pi].fds[i].in_use = true;
                 return Some(i);
             }
         }
@@ -262,7 +312,7 @@ fn print_num(n: u64) {
 }
 
 /// Handle Linux write(fd, buf, count) — now with real cross-address-space copy.
-fn handle_write(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0];
     let buf_va = args[1] as usize;
     let count = args[2] as usize;
@@ -293,19 +343,19 @@ fn handle_write(caller_port: u64, args: &[u64; 6]) -> u64 {
         return linux_err(EBADF);
     }
     unsafe {
-        if !FD_TABLE[fd_idx].in_use {
+        if !PROC_TABLE[pi].fds[fd_idx].in_use {
             return linux_err(EBADF);
         }
-        if FD_TABLE[fd_idx].kind == FdKind::Pipe {
-            return write_pipe(caller_port, FD_TABLE[fd_idx].fs_port,
-                              FD_TABLE[fd_idx].handle, buf_va, count);
+        if PROC_TABLE[pi].fds[fd_idx].kind == FdKind::Pipe {
+            return write_pipe(caller_port, PROC_TABLE[pi].fds[fd_idx].fs_port,
+                              PROC_TABLE[pi].fds[fd_idx].handle, buf_va, count);
         }
     }
     linux_err(EBADF)
 }
 
 /// Handle Linux writev(fd, iov, iovcnt).
-fn handle_writev(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_writev(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0];
     let iov_va = args[1] as usize;
     let iovcnt = args[2] as usize;
@@ -339,7 +389,7 @@ fn handle_writev(caller_port: u64, args: &[u64; 6]) -> u64 {
 
         // Delegate to write logic for this chunk.
         let write_args: [u64; 6] = [fd, base, len, 0, 0, 0];
-        let r = handle_write(caller_port, &write_args);
+        let r = handle_write(pi, caller_port, &write_args);
         if (r as i64) < 0 {
             return if total > 0 { total } else { r };
         }
@@ -349,7 +399,7 @@ fn handle_writev(caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux read(fd, buf, count).
-fn handle_read(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
     let buf_va = args[1] as usize;
     let count = args[2] as usize;
@@ -362,11 +412,11 @@ fn handle_read(caller_port: u64, args: &[u64; 6]) -> u64 {
     }
 
     let (kind, fs_port, handle, offset, file_size) = unsafe {
-        if !FD_TABLE[fd].in_use {
+        if !PROC_TABLE[pi].fds[fd].in_use {
             return linux_err(EBADF);
         }
-        (FD_TABLE[fd].kind, FD_TABLE[fd].fs_port, FD_TABLE[fd].handle,
-         FD_TABLE[fd].offset, FD_TABLE[fd].file_size)
+        (PROC_TABLE[pi].fds[fd].kind, PROC_TABLE[pi].fds[fd].fs_port, PROC_TABLE[pi].fds[fd].handle,
+         PROC_TABLE[pi].fds[fd].offset, PROC_TABLE[pi].fds[fd].file_size)
     };
 
     if kind == FdKind::Pipe {
@@ -411,7 +461,7 @@ fn handle_read(caller_port: u64, args: &[u64; 6]) -> u64 {
             return if total > 0 { total as u64 } else { linux_err(EFAULT) };
         }
         total += to_write;
-        unsafe { FD_TABLE[fd].offset += to_write as u64; }
+        unsafe { PROC_TABLE[pi].fds[fd].offset += to_write as u64; }
         if got < chunk {
             break; // Short read from FS.
         }
@@ -420,7 +470,7 @@ fn handle_read(caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Open a file via VFS. Returns fd or negated errno.
-fn do_open(caller_port: u64, path_va: usize, flags: u64) -> u64 {
+fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
     let vfs_port = unsafe { VFS_PORT };
     let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 {
@@ -466,51 +516,51 @@ fn do_open(caller_port: u64, path_va: usize, flags: u64) -> u64 {
             (path, pathlen)
         } else {
             unsafe {
-                let clen = CWD_LEN;
+                let clen = PROC_TABLE[pi].cwd_len;
                 let mut buf = [0u8; 16];
                 let mut pos = 0;
-                for i in 0..clen { if pos < 16 { buf[pos] = CWD[i]; pos += 1; } }
+                for i in 0..clen { if pos < 16 { buf[pos] = PROC_TABLE[pi].cwd[i]; pos += 1; } }
                 if pos > 0 && buf[pos - 1] != b'/' { if pos < 16 { buf[pos] = b'/'; pos += 1; } }
                 for i in 0..pathlen { if pos < 16 { buf[pos] = path[i]; pos += 1; } }
                 (buf, pos)
             }
         };
-        let fd = match alloc_fd() {
+        let fd = match alloc_fd(pi) {
             Some(f) => f,
             None => return linux_err(EBADF),
         };
         unsafe {
-            FD_TABLE[fd].kind = FdKind::Dir;
-            FD_TABLE[fd].offset = 0;
-            FD_TABLE[fd].dir_path_len = dir_len as u8;
-            for i in 0..dir_len.min(16) { FD_TABLE[fd].dir_path[i] = dir_path[i]; }
+            PROC_TABLE[pi].fds[fd].kind = FdKind::Dir;
+            PROC_TABLE[pi].fds[fd].offset = 0;
+            PROC_TABLE[pi].fds[fd].dir_path_len = dir_len as u8;
+            for i in 0..dir_len.min(16) { PROC_TABLE[pi].fds[fd].dir_path[i] = dir_path[i]; }
         }
         return fd as u64;
     }
 
-    let fd = match alloc_fd() {
+    let fd = match alloc_fd(pi) {
         Some(f) => f,
         None => return linux_err(EBADF),
     };
 
     unsafe {
-        FD_TABLE[fd].kind = FdKind::File;
-        FD_TABLE[fd].fs_port = resp.data[0];
-        FD_TABLE[fd].handle = resp.data[1];
-        FD_TABLE[fd].file_size = resp.data[2];
-        FD_TABLE[fd].offset = 0;
+        PROC_TABLE[pi].fds[fd].kind = FdKind::File;
+        PROC_TABLE[pi].fds[fd].fs_port = resp.data[0];
+        PROC_TABLE[pi].fds[fd].handle = resp.data[1];
+        PROC_TABLE[pi].fds[fd].file_size = resp.data[2];
+        PROC_TABLE[pi].fds[fd].offset = 0;
     }
 
     fd as u64
 }
 
 /// Handle Linux open(path, flags, mode).
-fn handle_open(caller_port: u64, args: &[u64; 6]) -> u64 {
-    do_open(caller_port, args[0] as usize, args[1])
+fn handle_open(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    do_open(pi, caller_port, args[0] as usize, args[1])
 }
 
 /// Handle Linux openat(dirfd, path, flags, mode).
-fn handle_openat(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_openat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let dirfd = args[0];
     let path_va = args[1] as usize;
     let flags = args[2];
@@ -518,38 +568,38 @@ fn handle_openat(caller_port: u64, args: &[u64; 6]) -> u64 {
     if dirfd != AT_FDCWD && (dirfd as i64) >= 0 {
         return linux_err(EBADF);
     }
-    do_open(caller_port, path_va, flags)
+    do_open(pi, caller_port, path_va, flags)
 }
 
 /// Internal close logic for any FD kind.
-fn do_close(fd: usize) {
+fn do_close(pi: usize, fd: usize) {
     unsafe {
-        if fd >= MAX_FDS || !FD_TABLE[fd].in_use {
+        if fd >= MAX_FDS || !PROC_TABLE[pi].fds[fd].in_use {
             return;
         }
-        match FD_TABLE[fd].kind {
+        match PROC_TABLE[pi].fds[fd].kind {
             FdKind::File => {
                 let rp = REPLY_PORT;
                 let d3 = rp << 32;
-                syscall::send(FD_TABLE[fd].fs_port, FS_CLOSE, FD_TABLE[fd].handle, 0, 0, d3);
+                syscall::send(PROC_TABLE[pi].fds[fd].fs_port, FS_CLOSE, PROC_TABLE[pi].fds[fd].handle, 0, 0, d3);
                 let _ = syscall::recv_msg(rp);
             }
             FdKind::Pipe => {
                 let rp = syscall::port_create();
                 let d2 = (rp as u64) << 32;
-                syscall::send(FD_TABLE[fd].fs_port, PIPE_CLOSE_TAG, FD_TABLE[fd].handle, 0, d2, 0);
+                syscall::send(PROC_TABLE[pi].fds[fd].fs_port, PIPE_CLOSE_TAG, PROC_TABLE[pi].fds[fd].handle, 0, d2, 0);
                 let _ = syscall::recv_msg(rp);
                 syscall::port_destroy(rp);
             }
             FdKind::Dir => {} // No server handle to close.
             FdKind::None => {}
         }
-        FD_TABLE[fd] = FdEntry::empty();
+        PROC_TABLE[pi].fds[fd] = FdEntry::empty();
     }
 }
 
 /// Handle Linux close(fd).
-fn handle_close(args: &[u64; 6]) -> u64 {
+fn handle_close(pi: usize, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
     if fd < 3 {
         return 0; // Closing stdin/stdout/stderr is a no-op.
@@ -558,16 +608,16 @@ fn handle_close(args: &[u64; 6]) -> u64 {
         return linux_err(EBADF);
     }
     unsafe {
-        if !FD_TABLE[fd].in_use {
+        if !PROC_TABLE[pi].fds[fd].in_use {
             return linux_err(EBADF);
         }
     }
-    do_close(fd);
+    do_close(pi, fd);
     0
 }
 
 /// Handle Linux lseek(fd, offset, whence).
-fn handle_lseek(args: &[u64; 6]) -> u64 {
+fn handle_lseek(pi: usize, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
     let offset = args[1] as i64;
     let whence = args[2];
@@ -576,22 +626,22 @@ fn handle_lseek(args: &[u64; 6]) -> u64 {
         return linux_err(EBADF);
     }
     unsafe {
-        if !FD_TABLE[fd].in_use {
+        if !PROC_TABLE[pi].fds[fd].in_use {
             return linux_err(EBADF);
         }
-        if FD_TABLE[fd].kind == FdKind::Pipe {
+        if PROC_TABLE[pi].fds[fd].kind == FdKind::Pipe {
             return linux_err(ESPIPE);
         }
         let new_off = match whence {
             0 => offset, // SEEK_SET
-            1 => FD_TABLE[fd].offset as i64 + offset, // SEEK_CUR
-            2 => FD_TABLE[fd].file_size as i64 + offset, // SEEK_END
+            1 => PROC_TABLE[pi].fds[fd].offset as i64 + offset, // SEEK_CUR
+            2 => PROC_TABLE[pi].fds[fd].file_size as i64 + offset, // SEEK_END
             _ => return linux_err(EINVAL),
         };
         if new_off < 0 {
             return linux_err(EINVAL);
         }
-        FD_TABLE[fd].offset = new_off as u64;
+        PROC_TABLE[pi].fds[fd].offset = new_off as u64;
         new_off as u64
     }
 }
@@ -660,7 +710,7 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux fstat(fd, statbuf).
-fn handle_fstat(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_fstat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
     let statbuf_va = args[1] as usize;
 
@@ -682,10 +732,10 @@ fn handle_fstat(caller_port: u64, args: &[u64; 6]) -> u64 {
         return linux_err(EBADF);
     }
     unsafe {
-        if !FD_TABLE[fd].in_use {
+        if !PROC_TABLE[pi].fds[fd].in_use {
             return linux_err(EBADF);
         }
-        if FD_TABLE[fd].kind == FdKind::Pipe {
+        if PROC_TABLE[pi].fds[fd].kind == FdKind::Pipe {
             let mut stat_buf = [0u8; 144];
             let mode: u32 = 0o010600; // S_IFIFO | 0600
             stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
@@ -694,7 +744,7 @@ fn handle_fstat(caller_port: u64, args: &[u64; 6]) -> u64 {
             if written < 144 { return linux_err(EFAULT); }
             return 0;
         }
-        let file_size = FD_TABLE[fd].file_size;
+        let file_size = PROC_TABLE[pi].fds[fd].file_size;
         let mut stat_buf = [0u8; 144];
         let mode: u32 = 0o100644; // S_IFREG | 0644
         stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
@@ -785,18 +835,23 @@ fn handle_clock_gettime(caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux getcwd(buf, size).
-fn handle_getcwd(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_getcwd(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let buf_va = args[0] as usize;
     let size = args[1] as usize;
 
-    let cwd = b"/\0";
-    if size < cwd.len() {
-        return linux_err(ERANGE);
-    }
-
-    let written = syscall::personality_copy_out(caller_port, buf_va, cwd);
-    if written < cwd.len() {
-        return linux_err(EFAULT);
+    unsafe {
+        let clen = PROC_TABLE[pi].cwd_len;
+        if size < clen + 1 {
+            return linux_err(ERANGE);
+        }
+        // Copy CWD + null terminator.
+        let mut buf = [0u8; 65];
+        for i in 0..clen { buf[i] = PROC_TABLE[pi].cwd[i]; }
+        buf[clen] = 0;
+        let written = syscall::personality_copy_out(caller_port, buf_va, &buf[..clen + 1]);
+        if written < clen + 1 {
+            return linux_err(EFAULT);
+        }
     }
     buf_va as u64
 }
@@ -912,7 +967,7 @@ fn write_pipe(caller_port: u64, pipe_port: u64, handle: u64, buf_va: usize, coun
 }
 
 /// Handle Linux pipe2(pipefd, flags).
-fn handle_pipe2(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_pipe2(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let pipefd_va = args[0] as usize;
     let _flags = args[1]; // O_CLOEXEC/O_NONBLOCK ignored for now
 
@@ -934,25 +989,25 @@ fn handle_pipe2(caller_port: u64, args: &[u64; 6]) -> u64 {
     let write_handle = msg.data[1];
 
     // Allocate two FDs.
-    let read_fd = match alloc_fd() {
+    let read_fd = match alloc_fd(pi) {
         Some(f) => f,
         None => return linux_err(EMFILE),
     };
-    let write_fd = match alloc_fd() {
+    let write_fd = match alloc_fd(pi) {
         Some(f) => f,
         None => {
-            unsafe { FD_TABLE[read_fd] = FdEntry::empty(); }
+            unsafe { PROC_TABLE[pi].fds[read_fd] = FdEntry::empty(); }
             return linux_err(EMFILE);
         }
     };
 
     unsafe {
-        FD_TABLE[read_fd].kind = FdKind::Pipe;
-        FD_TABLE[read_fd].fs_port = pipe_port;
-        FD_TABLE[read_fd].handle = read_handle;
-        FD_TABLE[write_fd].kind = FdKind::Pipe;
-        FD_TABLE[write_fd].fs_port = pipe_port;
-        FD_TABLE[write_fd].handle = write_handle;
+        PROC_TABLE[pi].fds[read_fd].kind = FdKind::Pipe;
+        PROC_TABLE[pi].fds[read_fd].fs_port = pipe_port;
+        PROC_TABLE[pi].fds[read_fd].handle = read_handle;
+        PROC_TABLE[pi].fds[write_fd].kind = FdKind::Pipe;
+        PROC_TABLE[pi].fds[write_fd].fs_port = pipe_port;
+        PROC_TABLE[pi].fds[write_fd].handle = write_handle;
     }
 
     // Write [read_fd, write_fd] as two i32s to the caller.
@@ -964,58 +1019,64 @@ fn handle_pipe2(caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux dup(oldfd).
-fn handle_dup(args: &[u64; 6]) -> u64 {
+fn handle_dup(pi: usize, args: &[u64; 6]) -> u64 {
     let oldfd = args[0] as usize;
     if oldfd >= MAX_FDS { return linux_err(EBADF); }
     unsafe {
-        if !FD_TABLE[oldfd].in_use { return linux_err(EBADF); }
-        let newfd = match alloc_fd() {
+        if !PROC_TABLE[pi].fds[oldfd].in_use { return linux_err(EBADF); }
+        let newfd = match alloc_fd(pi) {
             Some(f) => f,
             None => return linux_err(EMFILE),
         };
-        FD_TABLE[newfd].kind = FD_TABLE[oldfd].kind;
-        FD_TABLE[newfd].fs_port = FD_TABLE[oldfd].fs_port;
-        FD_TABLE[newfd].handle = FD_TABLE[oldfd].handle;
-        FD_TABLE[newfd].file_size = FD_TABLE[oldfd].file_size;
-        FD_TABLE[newfd].offset = FD_TABLE[oldfd].offset;
+        PROC_TABLE[pi].fds[newfd] = PROC_TABLE[pi].fds[oldfd];
         newfd as u64
     }
 }
 
 /// Handle Linux dup2(oldfd, newfd).
-fn handle_dup2(args: &[u64; 6]) -> u64 {
+fn handle_dup2(pi: usize, args: &[u64; 6]) -> u64 {
     let oldfd = args[0] as usize;
     let newfd = args[1] as usize;
     if oldfd >= MAX_FDS || newfd >= MAX_FDS { return linux_err(EBADF); }
     unsafe {
-        if !FD_TABLE[oldfd].in_use { return linux_err(EBADF); }
+        if !PROC_TABLE[pi].fds[oldfd].in_use { return linux_err(EBADF); }
         if oldfd == newfd { return newfd as u64; }
         // Close newfd if open.
-        if FD_TABLE[newfd].in_use { do_close(newfd); }
-        FD_TABLE[newfd].in_use = true;
-        FD_TABLE[newfd].kind = FD_TABLE[oldfd].kind;
-        FD_TABLE[newfd].fs_port = FD_TABLE[oldfd].fs_port;
-        FD_TABLE[newfd].handle = FD_TABLE[oldfd].handle;
-        FD_TABLE[newfd].file_size = FD_TABLE[oldfd].file_size;
-        FD_TABLE[newfd].offset = FD_TABLE[oldfd].offset;
+        if PROC_TABLE[pi].fds[newfd].in_use { do_close(pi, newfd); }
+        PROC_TABLE[pi].fds[newfd] = PROC_TABLE[pi].fds[oldfd];
         newfd as u64
     }
 }
 
 /// Handle Linux dup3(oldfd, newfd, flags).
-fn handle_dup3(args: &[u64; 6]) -> u64 {
+fn handle_dup3(pi: usize, args: &[u64; 6]) -> u64 {
     let oldfd = args[0] as usize;
     let newfd = args[1] as usize;
     if oldfd == newfd { return linux_err(EINVAL); }
     // Reuse dup2 logic.
-    handle_dup2(args)
+    handle_dup2(pi, args)
 }
 
 /// Handle Linux fork() / vfork() / clone() (basic).
-fn handle_fork(caller_port: u64) -> u64 {
+fn handle_fork(pi: usize, caller_port: u64) -> u64 {
     let child_port = syscall::personality_fork(caller_port);
     if child_port == u64::MAX {
         return linux_err(EAGAIN);
+    }
+    // Clone parent's process state for the child.
+    unsafe {
+        let mut child_slot = None;
+        for i in 0..MAX_PROCS {
+            if !PROC_TABLE[i].active {
+                child_slot = Some(i);
+                break;
+            }
+        }
+        if let Some(ci) = child_slot {
+            PROC_TABLE[ci] = PROC_TABLE[pi];
+            PROC_TABLE[ci].port = child_port;
+        }
+        // If no slot available, child runs without tracked state (will auto-create on first syscall).
     }
     child_port
 }
@@ -1055,37 +1116,37 @@ fn handle_wait4(caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux brk(addr).
-fn handle_brk(args: &[u64; 6]) -> u64 {
+fn handle_brk(pi: usize, args: &[u64; 6]) -> u64 {
     let addr = args[0] as usize;
 
     unsafe {
-        if BRK_BASE == 0 {
-            BRK_BASE = 0x4000_0000;
-            BRK_CURRENT = BRK_BASE;
+        if PROC_TABLE[pi].brk_base == 0 {
+            PROC_TABLE[pi].brk_base = 0x4000_0000;
+            PROC_TABLE[pi].brk_current = PROC_TABLE[pi].brk_base;
         }
 
         if addr == 0 {
-            return BRK_CURRENT as u64;
+            return PROC_TABLE[pi].brk_current as u64;
         }
 
-        if addr >= BRK_BASE && addr <= BRK_BASE + 256 * 1024 * 1024 {
+        if addr >= PROC_TABLE[pi].brk_base && addr <= PROC_TABLE[pi].brk_base + 256 * 1024 * 1024 {
             let page_size = syscall::page_size() as usize;
-            if addr > BRK_CURRENT {
-                let old_pages = (BRK_CURRENT + page_size - 1) / page_size;
+            if addr > PROC_TABLE[pi].brk_current {
+                let old_pages = (PROC_TABLE[pi].brk_current + page_size - 1) / page_size;
                 let new_pages = (addr + page_size - 1) / page_size;
                 if new_pages > old_pages {
                     let alloc_start = old_pages * page_size;
                     let count = new_pages - old_pages;
                     if syscall::mmap_anon(alloc_start, count, 3).is_none() {
-                        return BRK_CURRENT as u64;
+                        return PROC_TABLE[pi].brk_current as u64;
                     }
                 }
             }
-            BRK_CURRENT = addr;
-            return BRK_CURRENT as u64;
+            PROC_TABLE[pi].brk_current = addr;
+            return PROC_TABLE[pi].brk_current as u64;
         }
 
-        BRK_CURRENT as u64
+        PROC_TABLE[pi].brk_current as u64
     }
 }
 
@@ -1107,8 +1168,18 @@ fn handle_set_tid_address(caller_port: u64) -> u64 {
 }
 
 /// Handle Linux exit(code) or exit_group(code).
-fn handle_exit(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_exit(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let _code = args[0];
+    // Close all open FDs for this process.
+    unsafe {
+        for i in 3..MAX_FDS {
+            if PROC_TABLE[pi].fds[i].in_use {
+                do_close(pi, i);
+            }
+        }
+        // Free the process slot.
+        PROC_TABLE[pi] = ProcessState::empty();
+    }
     syscall::kill(caller_port);
     0
 }
@@ -1117,7 +1188,7 @@ fn handle_exit(caller_port: u64, args: &[u64; 6]) -> u64 {
 /// Copies the filename from the client, calls personality_execve.
 /// On success, does NOT reply — the kernel wakes the target directly.
 /// On failure, returns -ENOENT.
-fn handle_execve(caller_port: u64, args: &[u64; 6]) -> Option<u64> {
+fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
     let filename_va = args[0] as usize;
     let _argv_va = args[1] as usize;
     let _envp_va = args[2] as usize;
@@ -1141,6 +1212,17 @@ fn handle_execve(caller_port: u64, args: &[u64; 6]) -> Option<u64> {
         return Some(linux_err(ENOENT));
     }
 
+    // On success: close CLOEXEC FDs and reset BRK.
+    unsafe {
+        for i in 3..MAX_FDS {
+            if PROC_TABLE[pi].fds[i].in_use && (PROC_TABLE[pi].fds[i].fd_flags & FD_CLOEXEC) != 0 {
+                do_close(pi, i);
+            }
+        }
+        PROC_TABLE[pi].brk_base = 0;
+        PROC_TABLE[pi].brk_current = 0;
+    }
+
     // Success: the kernel has already woken the target with its new image.
     // Do NOT call personality_reply — return None to signal the main loop to skip reply.
     None
@@ -1148,7 +1230,7 @@ fn handle_execve(caller_port: u64, args: &[u64; 6]) -> Option<u64> {
 
 /// Resolve a path from caller's address space. If relative, prepend CWD.
 /// Returns (absolute_path_buf, path_len).
-fn resolve_path(caller_port: u64, path_va: usize) -> ([u8; 64], usize) {
+fn resolve_path(pi: usize, caller_port: u64, path_va: usize) -> ([u8; 64], usize) {
     let mut raw = [0u8; 64];
     let copied = syscall::personality_copy_in(caller_port, path_va, &mut raw);
     if copied == 0 {
@@ -1166,12 +1248,12 @@ fn resolve_path(caller_port: u64, path_va: usize) -> ([u8; 64], usize) {
 
     // Relative path — prepend CWD.
     unsafe {
-        let clen = CWD_LEN;
+        let clen = PROC_TABLE[pi].cwd_len;
         let mut buf = [0u8; 64];
         let mut pos = 0;
         // Copy CWD.
         for i in 0..clen {
-            if pos < 64 { buf[pos] = CWD[i]; pos += 1; }
+            if pos < 64 { buf[pos] = PROC_TABLE[pi].cwd[i]; pos += 1; }
         }
         // Add separator if CWD doesn't end with '/'.
         if pos > 0 && buf[pos - 1] != b'/' {
@@ -1200,7 +1282,7 @@ fn pack_path_vfs(path: &[u8], pathlen: usize) -> (u64, u64, u64) {
 }
 
 /// Handle Linux mkdir(path, mode).
-fn handle_mkdir(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_mkdir(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let path_va = args[0] as usize;
     let mode = args[1] as u32;
 
@@ -1208,7 +1290,7 @@ fn handle_mkdir(caller_port: u64, args: &[u64; 6]) -> u64 {
     let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 { return linux_err(ENOSYS); }
 
-    let (path, pathlen) = resolve_path(caller_port, path_va);
+    let (path, pathlen) = resolve_path(pi, caller_port, path_va);
     if pathlen == 0 { return linux_err(EFAULT); }
 
     let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
@@ -1222,22 +1304,22 @@ fn handle_mkdir(caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux mkdirat(dirfd, path, mode).
-fn handle_mkdirat(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_mkdirat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let dirfd = args[0];
     if dirfd != AT_FDCWD && (dirfd as i64) >= 0 { return linux_err(ENOSYS); }
     let shifted: [u64; 6] = [args[1], args[2], args[3], 0, args[4], args[5]];
-    handle_mkdir(caller_port, &shifted)
+    handle_mkdir(pi, caller_port, &shifted)
 }
 
 /// Handle Linux unlink(path) / rmdir(path).
-fn handle_unlink_impl(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_unlink_impl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let path_va = args[0] as usize;
 
     let vfs_port = unsafe { VFS_PORT };
     let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 { return linux_err(ENOSYS); }
 
-    let (path, pathlen) = resolve_path(caller_port, path_va);
+    let (path, pathlen) = resolve_path(pi, caller_port, path_va);
     if pathlen == 0 { return linux_err(EFAULT); }
 
     let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
@@ -1251,18 +1333,18 @@ fn handle_unlink_impl(caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux unlinkat(dirfd, path, flags).
-fn handle_unlinkat(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_unlinkat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let dirfd = args[0];
     if dirfd != AT_FDCWD && (dirfd as i64) >= 0 { return linux_err(ENOSYS); }
     let shifted: [u64; 6] = [args[1], args[2], args[3], 0, args[4], args[5]];
-    handle_unlink_impl(caller_port, &shifted)
+    handle_unlink_impl(pi, caller_port, &shifted)
 }
 
 /// Handle Linux chdir(path).
-fn handle_chdir(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_chdir(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let path_va = args[0] as usize;
 
-    let (path, pathlen) = resolve_path(caller_port, path_va);
+    let (path, pathlen) = resolve_path(pi, caller_port, path_va);
     if pathlen == 0 { return linux_err(EFAULT); }
 
     // Verify directory exists via VFS_STAT.
@@ -1276,12 +1358,12 @@ fn handle_chdir(caller_port: u64, args: &[u64; 6]) -> u64 {
 
     match syscall::recv_msg(reply_port) {
         Some(resp) if resp.tag == VFS_STAT_OK => {
-            // Update CWD.
+            // Update CWD for this process.
             unsafe {
                 for i in 0..pathlen.min(64) {
-                    CWD[i] = path[i];
+                    PROC_TABLE[pi].cwd[i] = path[i];
                 }
-                CWD_LEN = pathlen.min(64);
+                PROC_TABLE[pi].cwd_len = pathlen.min(64);
             }
             0
         }
@@ -1302,13 +1384,13 @@ fn handle_chdir(caller_port: u64, args: &[u64; 6]) -> u64 {
 /// getdents64 on a Dir FD: use VFS_READDIR (path-based) to enumerate entries.
 /// VFS_READDIR: data[0]=path_lo, data[1]=path_hi, data[2]=path_len(16)|reply_port(32)
 /// VFS_READDIR_OK: data[0]=size, data[1]=name_lo, data[2]=name_hi, data[3]=next_offset
-fn handle_getdents64_dir(caller_port: u64, fd: usize, dirp_va: usize, count: usize) -> u64 {
+fn handle_getdents64_dir(pi: usize, caller_port: u64, fd: usize, dirp_va: usize, count: usize) -> u64 {
     let vfs_port = unsafe { VFS_PORT };
     if vfs_port == 0 { return 0; }
 
     let (path, plen) = unsafe {
-        let plen = FD_TABLE[fd].dir_path_len as usize;
-        (FD_TABLE[fd].dir_path, plen)
+        let plen = PROC_TABLE[pi].fds[fd].dir_path_len as usize;
+        (PROC_TABLE[pi].fds[fd].dir_path, plen)
     };
 
     // Pack path for VFS.
@@ -1391,7 +1473,7 @@ fn handle_getdents64_dir(caller_port: u64, fd: usize, dirp_va: usize, count: usi
 ///   u16 d_reclen
 ///   u8  d_type
 ///   char d_name[] (null-terminated, padded to alignment)
-fn handle_getdents64(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_getdents64(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
     let dirp_va = args[1] as usize;
     let count = args[2] as usize;
@@ -1401,22 +1483,22 @@ fn handle_getdents64(caller_port: u64, args: &[u64; 6]) -> u64 {
     if fd >= MAX_FDS { return linux_err(EBADF); }
 
     unsafe {
-        if !FD_TABLE[fd].in_use { return linux_err(EBADF); }
+        if !PROC_TABLE[pi].fds[fd].in_use { return linux_err(EBADF); }
     }
 
     // Handle Dir FDs via VFS_READDIR (path-based).
-    let is_dir = unsafe { matches!(FD_TABLE[fd].kind, FdKind::Dir) };
+    let is_dir = unsafe { matches!(PROC_TABLE[pi].fds[fd].kind, FdKind::Dir) };
     if is_dir {
-        return handle_getdents64_dir(caller_port, fd, dirp_va, count);
+        return handle_getdents64_dir(pi, caller_port, fd, dirp_va, count);
     }
 
     let (fs_port, _handle) = unsafe {
-        if FD_TABLE[fd].kind != FdKind::File { return linux_err(ENOTDIR); }
-        (FD_TABLE[fd].fs_port, FD_TABLE[fd].handle)
+        if PROC_TABLE[pi].fds[fd].kind != FdKind::File { return linux_err(ENOTDIR); }
+        (PROC_TABLE[pi].fds[fd].fs_port, PROC_TABLE[pi].fds[fd].handle)
     };
 
     // Use the FD's offset as the readdir pagination cursor.
-    let start_offset = unsafe { FD_TABLE[fd].offset } as u64;
+    let start_offset = unsafe { PROC_TABLE[pi].fds[fd].offset } as u64;
 
     let rp = syscall::port_create();
     let mut buf = [0u8; 2048];
@@ -1494,7 +1576,7 @@ fn handle_getdents64(caller_port: u64, args: &[u64; 6]) -> u64 {
     syscall::port_destroy(rp);
 
     // Update FD offset for next call.
-    unsafe { FD_TABLE[fd].offset = next_off; }
+    unsafe { PROC_TABLE[pi].fds[fd].offset = next_off; }
 
     if buf_pos > 0 {
         let written = syscall::personality_copy_out(caller_port, dirp_va, &buf[..buf_pos]);
@@ -1509,7 +1591,7 @@ fn handle_getdents64(caller_port: u64, args: &[u64; 6]) -> u64 {
 // ---- Phase 127 handlers ----
 
 /// Handle Linux fcntl(fd, cmd, arg).
-fn handle_fcntl(args: &[u64; 6]) -> u64 {
+fn handle_fcntl(pi: usize, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
     let cmd = args[1];
     let arg = args[2];
@@ -1520,22 +1602,22 @@ fn handle_fcntl(args: &[u64; 6]) -> u64 {
     // fds 0-2 (stdin/stdout/stderr) are implicit and always valid.
     if fd >= 3 {
         unsafe {
-            if !FD_TABLE[fd].in_use {
+            if !PROC_TABLE[pi].fds[fd].in_use {
                 return linux_err(EBADF);
             }
         }
     }
 
     match cmd {
-        F_GETFD => unsafe { FD_TABLE[fd].fd_flags as u64 },
+        F_GETFD => unsafe { PROC_TABLE[pi].fds[fd].fd_flags as u64 },
         F_SETFD => unsafe {
-            FD_TABLE[fd].fd_flags = arg as u32;
+            PROC_TABLE[pi].fds[fd].fd_flags = arg as u32;
             0
         },
-        F_GETFL => unsafe { FD_TABLE[fd].status_flags as u64 },
+        F_GETFL => unsafe { PROC_TABLE[pi].fds[fd].status_flags as u64 },
         F_SETFL => unsafe {
             // Only O_NONBLOCK and a few flags are settable via F_SETFL.
-            FD_TABLE[fd].status_flags = (FD_TABLE[fd].status_flags & 0x3) | (arg as u32 & !0x3);
+            PROC_TABLE[pi].fds[fd].status_flags = (PROC_TABLE[pi].fds[fd].status_flags & 0x3) | (arg as u32 & !0x3);
             0
         },
         F_DUPFD | F_DUPFD_CLOEXEC => {
@@ -1543,7 +1625,7 @@ fn handle_fcntl(args: &[u64; 6]) -> u64 {
             let new_fd = unsafe {
                 let mut found = None;
                 for i in min_fd.max(3)..MAX_FDS {
-                    if !FD_TABLE[i].in_use {
+                    if !PROC_TABLE[pi].fds[i].in_use {
                         found = Some(i);
                         break;
                     }
@@ -1552,8 +1634,8 @@ fn handle_fcntl(args: &[u64; 6]) -> u64 {
             };
             match new_fd {
                 Some(nfd) => unsafe {
-                    FD_TABLE[nfd] = FD_TABLE[fd];
-                    FD_TABLE[nfd].fd_flags = if cmd == F_DUPFD_CLOEXEC { FD_CLOEXEC } else { 0 };
+                    PROC_TABLE[pi].fds[nfd] = PROC_TABLE[pi].fds[fd];
+                    PROC_TABLE[pi].fds[nfd].fd_flags = if cmd == F_DUPFD_CLOEXEC { FD_CLOEXEC } else { 0 };
                     nfd as u64
                 },
                 None => linux_err(EMFILE),
@@ -1564,13 +1646,13 @@ fn handle_fcntl(args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux ioctl(fd, request, arg).
-fn handle_ioctl(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_ioctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
     let request = args[1];
 
     // fds 0-2 are always valid (stdin/stdout/stderr).
     if fd >= 3 && fd < MAX_FDS {
-        unsafe { if !FD_TABLE[fd].in_use { return linux_err(EBADF); } }
+        unsafe { if !PROC_TABLE[pi].fds[fd].in_use { return linux_err(EBADF); } }
     } else if fd >= MAX_FDS {
         return linux_err(EBADF);
     }
@@ -1603,9 +1685,9 @@ fn handle_ioctl(caller_port: u64, args: &[u64; 6]) -> u64 {
             if fd < MAX_FDS {
                 unsafe {
                     if args[2] != 0 {
-                        FD_TABLE[fd].status_flags |= O_NONBLOCK as u32;
+                        PROC_TABLE[pi].fds[fd].status_flags |= O_NONBLOCK as u32;
                     } else {
-                        FD_TABLE[fd].status_flags &= !(O_NONBLOCK as u32);
+                        PROC_TABLE[pi].fds[fd].status_flags &= !(O_NONBLOCK as u32);
                     }
                 }
             }
@@ -1766,9 +1848,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         REPLY_PORT = syscall::port_create();
         VFS_PORT = syscall::ns_lookup(b"vfs").unwrap_or(0);
         PIPE_PORT = syscall::ns_lookup(b"pipe").unwrap_or(0);
-        // Initialize CWD to "/".
-        CWD[0] = b'/';
-        CWD_LEN = 1;
     }
 
     syscall::debug_puts(b"[linux_srv] ready on port ");
@@ -1784,44 +1863,53 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let linux_nr = msg.tag;
         let caller_port = msg.data[4];
 
+        // Resolve per-process state index.
+        let pi = match get_or_init_proc(caller_port) {
+            Some(i) => i,
+            None => {
+                syscall::personality_reply(caller_port, linux_err(ENOMEM));
+                continue;
+            }
+        };
+
         let result = match linux_nr {
-            __NR_READ => handle_read(caller_port, &msg.data),
-            __NR_WRITE => handle_write(caller_port, &msg.data),
-            __NR_OPEN => handle_open(caller_port, &msg.data),
-            __NR_CLOSE => handle_close(&msg.data),
+            __NR_READ => handle_read(pi, caller_port, &msg.data),
+            __NR_WRITE => handle_write(pi, caller_port, &msg.data),
+            __NR_OPEN => handle_open(pi, caller_port, &msg.data),
+            __NR_CLOSE => handle_close(pi, &msg.data),
             __NR_STAT | __NR_NEWFSTATAT => handle_stat(caller_port, &msg.data),
-            __NR_FSTAT => handle_fstat(caller_port, &msg.data),
-            __NR_LSEEK => handle_lseek(&msg.data),
-            __NR_WRITEV => handle_writev(caller_port, &msg.data),
+            __NR_FSTAT => handle_fstat(pi, caller_port, &msg.data),
+            __NR_LSEEK => handle_lseek(pi, &msg.data),
+            __NR_WRITEV => handle_writev(pi, caller_port, &msg.data),
             __NR_ACCESS => handle_access(caller_port, &msg.data),
-            __NR_DUP => handle_dup(&msg.data),
-            __NR_DUP2 => handle_dup2(&msg.data),
-            __NR_GETCWD => handle_getcwd(caller_port, &msg.data),
+            __NR_DUP => handle_dup(pi, &msg.data),
+            __NR_DUP2 => handle_dup2(pi, &msg.data),
+            __NR_GETCWD => handle_getcwd(pi, caller_port, &msg.data),
             __NR_READLINK => handle_readlink(caller_port, &msg.data),
-            __NR_OPENAT => handle_openat(caller_port, &msg.data),
-            __NR_MKDIR => handle_mkdir(caller_port, &msg.data),
-            __NR_MKDIRAT => handle_mkdirat(caller_port, &msg.data),
-            __NR_RMDIR | __NR_UNLINK => handle_unlink_impl(caller_port, &msg.data),
-            __NR_UNLINKAT => handle_unlinkat(caller_port, &msg.data),
-            __NR_CHDIR => handle_chdir(caller_port, &msg.data),
+            __NR_OPENAT => handle_openat(pi, caller_port, &msg.data),
+            __NR_MKDIR => handle_mkdir(pi, caller_port, &msg.data),
+            __NR_MKDIRAT => handle_mkdirat(pi, caller_port, &msg.data),
+            __NR_RMDIR | __NR_UNLINK => handle_unlink_impl(pi, caller_port, &msg.data),
+            __NR_UNLINKAT => handle_unlinkat(pi, caller_port, &msg.data),
+            __NR_CHDIR => handle_chdir(pi, caller_port, &msg.data),
             __NR_FCHDIR => 0, // stub
-            __NR_GETDENTS64 => handle_getdents64(caller_port, &msg.data),
-            __NR_DUP3 => handle_dup3(&msg.data),
-            __NR_PIPE2 => handle_pipe2(caller_port, &msg.data),
-            __NR_FORK | __NR_VFORK => handle_fork(caller_port),
-            __NR_CLONE => handle_fork(caller_port), // basic clone = fork
+            __NR_GETDENTS64 => handle_getdents64(pi, caller_port, &msg.data),
+            __NR_DUP3 => handle_dup3(pi, &msg.data),
+            __NR_PIPE2 => handle_pipe2(pi, caller_port, &msg.data),
+            __NR_FORK | __NR_VFORK => handle_fork(pi, caller_port),
+            __NR_CLONE => handle_fork(pi, caller_port), // basic clone = fork
             __NR_EXECVE => {
-                match handle_execve(caller_port, &msg.data) {
+                match handle_execve(pi, caller_port, &msg.data) {
                     Some(err) => err,
                     None => continue, // Success: kernel woke target directly, skip reply.
                 }
             }
             __NR_WAIT4 => handle_wait4(caller_port, &msg.data),
-            __NR_BRK => handle_brk(&msg.data),
+            __NR_BRK => handle_brk(pi, &msg.data),
             __NR_ARCH_PRCTL => handle_arch_prctl(&msg.data),
             __NR_SET_TID_ADDRESS => handle_set_tid_address(caller_port),
             __NR_EXIT | __NR_EXIT_GROUP => {
-                handle_exit(caller_port, &msg.data);
+                handle_exit(pi, caller_port, &msg.data);
                 continue; // Don't reply — task is dead.
             }
             __NR_GETPID | __NR_GETTID | __NR_GETUID | __NR_GETEUID
@@ -1831,8 +1919,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_GETRANDOM => handle_getrandom(caller_port, &msg.data),
 
             // Phase 127: fcntl, ioctl, time, signals, process control.
-            __NR_FCNTL => handle_fcntl(&msg.data),
-            __NR_IOCTL => handle_ioctl(caller_port, &msg.data),
+            __NR_FCNTL => handle_fcntl(pi, &msg.data),
+            __NR_IOCTL => handle_ioctl(pi, caller_port, &msg.data),
             __NR_GETTIMEOFDAY => handle_gettimeofday(caller_port, &msg.data),
             __NR_NANOSLEEP => handle_nanosleep(caller_port, &msg.data),
             __NR_CLOCK_NANOSLEEP => {
