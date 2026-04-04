@@ -2670,6 +2670,269 @@ fn handle_recvfrom(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     }
 }
 
+/// Handle Linux sendmsg(fd, msg, flags).
+/// Reads msghdr from caller, gathers iovecs, sends via write_socket.
+fn handle_sendmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let msghdr_va = args[1] as usize;
+    // args[2] = flags (ignored)
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    if msghdr_va == 0 { return linux_err(EFAULT); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
+            return linux_err(ENOTSOCK);
+        }
+
+        // Read msghdr (56 bytes on x86_64): msg_name(8), msg_namelen(8 padded),
+        // msg_iov(8), msg_iovlen(8), msg_control(8), msg_controllen(8), msg_flags(4+pad)
+        let mut hdr = [0u8; 56];
+        let n = syscall::personality_copy_in(caller_port, msghdr_va, &mut hdr);
+        if n < 48 { return linux_err(EFAULT); }
+
+        let iov_ptr = u64::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19],
+                                           hdr[20], hdr[21], hdr[22], hdr[23]]) as usize;
+        let iov_len = u64::from_le_bytes([hdr[24], hdr[25], hdr[26], hdr[27],
+                                           hdr[28], hdr[29], hdr[30], hdr[31]]) as usize;
+
+        if iov_ptr == 0 || iov_len == 0 { return 0; }
+
+        // Fast path: single iovec — delegate directly to write_socket
+        if iov_len == 1 {
+            let mut iov_buf = [0u8; 16];
+            let ic = syscall::personality_copy_in(caller_port, iov_ptr, &mut iov_buf);
+            if ic < 16 { return linux_err(EFAULT); }
+            let base = u64::from_le_bytes([iov_buf[0], iov_buf[1], iov_buf[2], iov_buf[3],
+                                            iov_buf[4], iov_buf[5], iov_buf[6], iov_buf[7]]) as usize;
+            let len = u64::from_le_bytes([iov_buf[8], iov_buf[9], iov_buf[10], iov_buf[11],
+                                           iov_buf[12], iov_buf[13], iov_buf[14], iov_buf[15]]) as usize;
+            if base == 0 || len == 0 { return 0; }
+            let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+            return write_socket(caller_port, PROC_TABLE[pi].fds[fd].fs_port,
+                                PROC_TABLE[pi].fds[fd].handle, dom, base, len);
+        }
+
+        // Multi-iovec: gather into temporary buffer (max 4096 bytes)
+        let max_iovs = if iov_len > 8 { 8 } else { iov_len };
+        let mut gather_buf = [0u8; 4096];
+        let mut total = 0usize;
+
+        for i in 0..max_iovs {
+            let mut iov_buf = [0u8; 16];
+            let ic = syscall::personality_copy_in(caller_port, iov_ptr + i * 16, &mut iov_buf);
+            if ic < 16 { break; }
+            let base = u64::from_le_bytes([iov_buf[0], iov_buf[1], iov_buf[2], iov_buf[3],
+                                            iov_buf[4], iov_buf[5], iov_buf[6], iov_buf[7]]) as usize;
+            let len = u64::from_le_bytes([iov_buf[8], iov_buf[9], iov_buf[10], iov_buf[11],
+                                           iov_buf[12], iov_buf[13], iov_buf[14], iov_buf[15]]) as usize;
+            if base == 0 || len == 0 { continue; }
+            let avail = 4096 - total;
+            let chunk = if len < avail { len } else { avail };
+            if chunk == 0 { break; }
+            let copied = syscall::personality_copy_in(caller_port, base, &mut gather_buf[total..total + chunk]);
+            total += copied;
+            if copied < chunk { break; }
+        }
+
+        if total == 0 { return 0; }
+
+        // Write gathered data to the socket.
+        // We need to copy from our local buffer to the caller's address space temporarily,
+        // then call write_socket. But write_socket reads from caller's VA. Instead, we'll
+        // write directly to the UDS/NET server using the same IPC pattern as write_socket
+        // but with our local buffer.
+        let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+        let srv_port = PROC_TABLE[pi].fds[fd].fs_port;
+        let handle = PROC_TABLE[pi].fds[fd].handle;
+        send_socket_data(srv_port, handle, dom, &gather_buf[..total])
+    }
+}
+
+/// Handle Linux recvmsg(fd, msg, flags).
+/// Receives data, scatters into iovecs described by msghdr.
+fn handle_recvmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let msghdr_va = args[1] as usize;
+    // args[2] = flags (ignored)
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    if msghdr_va == 0 { return linux_err(EFAULT); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
+            return linux_err(ENOTSOCK);
+        }
+
+        // Read msghdr
+        let mut hdr = [0u8; 56];
+        let n = syscall::personality_copy_in(caller_port, msghdr_va, &mut hdr);
+        if n < 48 { return linux_err(EFAULT); }
+
+        let iov_ptr = u64::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19],
+                                           hdr[20], hdr[21], hdr[22], hdr[23]]) as usize;
+        let iov_len = u64::from_le_bytes([hdr[24], hdr[25], hdr[26], hdr[27],
+                                           hdr[28], hdr[29], hdr[30], hdr[31]]) as usize;
+
+        if iov_ptr == 0 || iov_len == 0 { return 0; }
+
+        // Calculate total iovec capacity
+        let max_iovs = if iov_len > 8 { 8 } else { iov_len };
+        let mut iov_bases = [0usize; 8];
+        let mut iov_lens = [0usize; 8];
+        let mut total_cap = 0usize;
+
+        for i in 0..max_iovs {
+            let mut iov_buf = [0u8; 16];
+            let ic = syscall::personality_copy_in(caller_port, iov_ptr + i * 16, &mut iov_buf);
+            if ic < 16 { break; }
+            iov_bases[i] = u64::from_le_bytes([iov_buf[0], iov_buf[1], iov_buf[2], iov_buf[3],
+                                                iov_buf[4], iov_buf[5], iov_buf[6], iov_buf[7]]) as usize;
+            iov_lens[i] = u64::from_le_bytes([iov_buf[8], iov_buf[9], iov_buf[10], iov_buf[11],
+                                               iov_buf[12], iov_buf[13], iov_buf[14], iov_buf[15]]) as usize;
+            total_cap += iov_lens[i];
+        }
+
+        if total_cap == 0 { return 0; }
+
+        // Fast path: single iovec — delegate directly to read_socket
+        if max_iovs == 1 || (max_iovs > 1 && iov_lens[1] == 0) {
+            if iov_bases[0] == 0 || iov_lens[0] == 0 { return 0; }
+            let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+            let result = read_socket(caller_port, PROC_TABLE[pi].fds[fd].fs_port,
+                                     PROC_TABLE[pi].fds[fd].handle, dom, iov_bases[0], iov_lens[0]);
+            // Zero out msg_controllen to indicate no ancillary data
+            let zero8 = [0u8; 8];
+            syscall::personality_copy_out(caller_port, msghdr_va + 40, &zero8);
+            return result;
+        }
+
+        // Multi-iovec: receive into local buffer, then scatter
+        let recv_cap = if total_cap > 4096 { 4096 } else { total_cap };
+        let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+        let srv_port = PROC_TABLE[pi].fds[fd].fs_port;
+        let handle = PROC_TABLE[pi].fds[fd].handle;
+        let mut recv_buf = [0u8; 4096];
+        let got = recv_socket_data(srv_port, handle, dom, &mut recv_buf[..recv_cap]);
+        if got == 0 || (got as i64) < 0 { return got; }
+        let got = got as usize;
+
+        // Scatter into iovecs
+        let mut offset = 0usize;
+        for i in 0..max_iovs {
+            if offset >= got { break; }
+            if iov_bases[i] == 0 || iov_lens[i] == 0 { continue; }
+            let chunk = if got - offset < iov_lens[i] { got - offset } else { iov_lens[i] };
+            syscall::personality_copy_out(caller_port, iov_bases[i], &recv_buf[offset..offset + chunk]);
+            offset += chunk;
+        }
+
+        // Zero out msg_controllen
+        let zero8 = [0u8; 8];
+        syscall::personality_copy_out(caller_port, msghdr_va + 40, &zero8);
+
+        got as u64
+    }
+}
+
+/// Send data from a local buffer to a socket (bypassing caller VA).
+/// Uses the same inline IPC protocol as write_socket but from local memory.
+fn send_socket_data(srv_port: u64, handle: u64, domain: u8, data: &[u8]) -> u64 {
+    let mut total = 0usize;
+    if domain == AF_UNIX as u8 {
+        while total < data.len() {
+            let chunk = (data.len() - total).min(16);
+            let mut tmp = [0u8; 16];
+            tmp[..chunk].copy_from_slice(&data[total..total + chunk]);
+            let w0 = u64::from_le_bytes([tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]]);
+            let w1 = u64::from_le_bytes([tmp[8], tmp[9], tmp[10], tmp[11], tmp[12], tmp[13], tmp[14], tmp[15]]);
+            let rp = syscall::port_create();
+            let d2 = (chunk as u64) | ((rp as u64) << 32);
+            syscall::send(srv_port, UDS_SEND, handle, w0, d2, w1);
+            let resp = match syscall::recv_msg(rp) {
+                Some(m) => m,
+                None => { syscall::port_destroy(rp); break; }
+            };
+            syscall::port_destroy(rp);
+            if resp.tag != UDS_OK { break; }
+            let sent = (resp.data[0] & 0xFFFF) as usize;
+            total += sent;
+            if sent == 0 { break; }
+        }
+    } else if domain == AF_INET as u8 {
+        while total < data.len() {
+            let chunk = (data.len() - total).min(16);
+            let mut tmp = [0u8; 16];
+            tmp[..chunk].copy_from_slice(&data[total..total + chunk]);
+            let w0 = u64::from_le_bytes([tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]]);
+            let w1 = u64::from_le_bytes([tmp[8], tmp[9], tmp[10], tmp[11], tmp[12], tmp[13], tmp[14], tmp[15]]);
+            let rp = syscall::port_create();
+            let d1 = (chunk as u64) | ((rp as u64) << 16);
+            syscall::send(srv_port, NET_TCP_SEND, handle, d1, w0, w1);
+            let resp = match syscall::recv_msg(rp) {
+                Some(m) => m,
+                None => { syscall::port_destroy(rp); break; }
+            };
+            syscall::port_destroy(rp);
+            if resp.tag != NET_TCP_SEND_OK { break; }
+            total += chunk;
+        }
+    } else {
+        return linux_err(EAFNOSUPPORT);
+    }
+    if total == 0 && data.len() > 0 { linux_err(EFAULT) } else { total as u64 }
+}
+
+/// Receive data from a socket into a local buffer (bypassing caller VA).
+/// Uses the same inline IPC protocol as read_socket but to local memory.
+fn recv_socket_data(srv_port: u64, handle: u64, domain: u8, buf: &mut [u8]) -> u64 {
+    if domain == AF_UNIX as u8 {
+        let rp = syscall::port_create();
+        let d2 = (rp as u64) << 32;
+        syscall::send(srv_port, UDS_RECV, handle, 0, d2, 0);
+        let resp = match syscall::recv_msg(rp) {
+            Some(m) => m,
+            None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+        };
+        syscall::port_destroy(rp);
+        if resp.tag == UDS_EOF { return 0; }
+        if resp.tag != UDS_OK { return linux_err(ECONNREFUSED); }
+        let len = (resp.data[2] & 0xFFFF) as usize;
+        let got = len.min(buf.len());
+        if got == 0 { return 0; }
+        let mut tmp = [0u8; 16];
+        let b0 = resp.data[0].to_le_bytes();
+        let b1 = resp.data[1].to_le_bytes();
+        tmp[..8].copy_from_slice(&b0);
+        tmp[8..16].copy_from_slice(&b1);
+        buf[..got].copy_from_slice(&tmp[..got]);
+        got as u64
+    } else if domain == AF_INET as u8 {
+        let rp = syscall::port_create();
+        let d1 = (rp as u64) << 16;
+        syscall::send(srv_port, NET_TCP_RECV, handle, d1, 0, 0);
+        let resp = match syscall::recv_msg(rp) {
+            Some(m) => m,
+            None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+        };
+        syscall::port_destroy(rp);
+        if resp.tag == NET_TCP_CLOSED { return 0; }
+        if resp.tag != NET_TCP_DATA { return linux_err(ECONNREFUSED); }
+        let len = (resp.data[0] & 0xFFFF) as usize;
+        let got = len.min(buf.len());
+        if got == 0 { return 0; }
+        let mut tmp = [0u8; 24];
+        let b1 = resp.data[1].to_le_bytes();
+        let b2 = resp.data[2].to_le_bytes();
+        let b3 = resp.data[3].to_le_bytes();
+        tmp[..8].copy_from_slice(&b1);
+        tmp[8..16].copy_from_slice(&b2);
+        tmp[16..24].copy_from_slice(&b3);
+        buf[..got].copy_from_slice(&tmp[..got]);
+        got as u64
+    } else {
+        linux_err(EAFNOSUPPORT)
+    }
+}
+
 /// Handle Linux socketpair(domain, type, protocol, sv[2]).
 /// Creates two connected AF_UNIX sockets via bind/listen/connect/accept on a synthetic name.
 fn handle_socketpair(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
@@ -3621,8 +3884,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_ACCEPT => handle_accept_inner(pi, caller_port, &msg.data, 0),
             __NR_SENDTO => handle_sendto(pi, caller_port, &msg.data),
             __NR_RECVFROM => handle_recvfrom(pi, caller_port, &msg.data),
-            __NR_SENDMSG => linux_err(ENOSYS),
-            __NR_RECVMSG => linux_err(ENOSYS),
+            __NR_SENDMSG => handle_sendmsg(pi, caller_port, &msg.data),
+            __NR_RECVMSG => handle_recvmsg(pi, caller_port, &msg.data),
             __NR_SHUTDOWN => 0, // stub
             __NR_BIND => handle_bind(pi, caller_port, &msg.data),
             __NR_LISTEN => handle_listen(pi, caller_port, &msg.data),

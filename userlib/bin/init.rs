@@ -9763,6 +9763,196 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 133: Linux sendmsg/recvmsg ---
+    syscall::debug_puts(b"  init: Phase 133 linux sendmsg/recvmsg...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") 0u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+
+                        // 1. socketpair(AF_UNIX=1, SOCK_STREAM=1, 0, sv) — NR 53
+                        let mut sv: [i32; 2] = [0; 2];
+                        let r = linux!(53u64, 1u64, 1u64, 0u64, sv.as_mut_ptr() as u64);
+                        if r > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
+                        }
+                        let s0 = core::ptr::read_volatile(&sv[0]) as u64;
+                        let s1 = core::ptr::read_volatile(&sv[1]) as u64;
+
+                        // 2. sendmsg(s0, &msghdr, 0) — NR 46
+                        //    msghdr with one iovec pointing to "Hello msg!"
+                        let payload = *b"Hello msg!";
+
+                        // iovec: { iov_base: *const u8, iov_len: usize }
+                        #[repr(C)]
+                        struct Iovec {
+                            iov_base: u64,
+                            iov_len: u64,
+                        }
+                        let send_iov = Iovec {
+                            iov_base: payload.as_ptr() as u64,
+                            iov_len: 10,
+                        };
+
+                        // msghdr: { msg_name, msg_namelen, msg_iov, msg_iovlen,
+                        //            msg_control, msg_controllen, msg_flags }
+                        #[repr(C)]
+                        struct Msghdr {
+                            msg_name: u64,
+                            msg_namelen: u64,    // actually u32 + padding
+                            msg_iov: u64,
+                            msg_iovlen: u64,
+                            msg_control: u64,
+                            msg_controllen: u64,
+                            msg_flags: u64,      // actually i32 + padding
+                        }
+                        let send_hdr = Msghdr {
+                            msg_name: 0,
+                            msg_namelen: 0,
+                            msg_iov: &send_iov as *const Iovec as u64,
+                            msg_iovlen: 1,
+                            msg_control: 0,
+                            msg_controllen: 0,
+                            msg_flags: 0,
+                        };
+                        let sent = linux!(46u64, s0, &send_hdr as *const Msghdr as u64, 0u64);
+                        if sent != 10 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 11u64, options(noreturn));
+                        }
+
+                        // 3. recvmsg(s1, &msghdr, 0) — NR 47
+                        let mut recv_buf = [0u8; 16];
+                        let recv_iov = Iovec {
+                            iov_base: recv_buf.as_mut_ptr() as u64,
+                            iov_len: 16,
+                        };
+                        let mut recv_hdr = Msghdr {
+                            msg_name: 0,
+                            msg_namelen: 0,
+                            msg_iov: &recv_iov as *const Iovec as u64,
+                            msg_iovlen: 1,
+                            msg_control: 0,
+                            msg_controllen: 0,
+                            msg_flags: 0,
+                        };
+                        let got = linux!(47u64, s1, &mut recv_hdr as *mut Msghdr as u64, 0u64);
+                        if got != 10 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 12u64, options(noreturn));
+                        }
+
+                        // 4. Verify received data == "Hello msg!"
+                        let mut ok = true;
+                        for i in 0..10 {
+                            if core::ptr::read_volatile(&recv_buf[i]) != payload[i] {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if !ok {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 13u64, options(noreturn));
+                        }
+
+                        // 5. close both, exit(0)
+                        linux!(3u64, s0);
+                        linux!(3u64, s1);
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 133 linux sendmsg/recvmsg: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 133 linux sendmsg/recvmsg: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 133 linux sendmsg/recvmsg: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 133 linux sendmsg/recvmsg: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
