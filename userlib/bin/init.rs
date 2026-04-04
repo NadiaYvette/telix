@@ -9280,6 +9280,162 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 130: Linux epoll ---
+    syscall::debug_puts(b"  init: Phase 130 linux epoll...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                // Wait for personality to be set.
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") 0u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+
+                        // 1. pipe2(pipefd, 0) — NR 293
+                        let mut pipefd: [i32; 2] = [0; 2];
+                        let r = linux!(293u64, pipefd.as_mut_ptr() as u64, 0u64);
+                        if r > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
+                        }
+                        let rd = core::ptr::read_volatile(&pipefd[0]) as u64;
+                        let wr = core::ptr::read_volatile(&pipefd[1]) as u64;
+
+                        // 2. epoll_create1(0) — NR 291
+                        let epfd = linux!(291u64, 0u64);
+                        if epfd > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 11u64, options(noreturn));
+                        }
+
+                        // 3. epoll_ctl(epfd, EPOLL_CTL_ADD=1, wr, &event) — NR 233
+                        //    epoll_event is packed 12 bytes: u32 events + u64 data
+                        #[repr(C, packed)]
+                        struct EpollEvent { events: u32, data: u64 }
+                        let ev = EpollEvent { events: 0x004 /* EPOLLOUT */, data: 42 };
+                        let r = linux!(233u64, epfd, 1u64 /* ADD */, wr, &ev as *const EpollEvent as u64);
+                        if r > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 12u64, options(noreturn));
+                        }
+
+                        // 4. epoll_wait(epfd, events, 1, 0) — NR 232
+                        let mut out_ev = EpollEvent { events: 0, data: 0 };
+                        let r = linux!(232u64, epfd, &mut out_ev as *mut EpollEvent as u64, 1u64, 0u64);
+                        if r != 1 {
+                            // exit with 13 + low byte of r for debugging
+                            let code = if r > 0xFFFF_FFFF_FFFF_FF00 { 13u64 } else { 14u64 };
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") code, options(noreturn));
+                        }
+
+                        // 5. Verify event
+                        let got_events = core::ptr::read_volatile(core::ptr::addr_of!(out_ev.events));
+                        let got_data = core::ptr::read_volatile(core::ptr::addr_of!(out_ev.data));
+                        if got_events & 0x004 == 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 15u64, options(noreturn));
+                        }
+                        if got_data != 42 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 16u64, options(noreturn));
+                        }
+
+                        // Clean up
+                        linux!(3u64, epfd);
+                        linux!(3u64, rd);
+                        linux!(3u64, wr);
+
+                        // Success
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 130 linux epoll: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 130 linux epoll: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 130 linux epoll: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 130 linux epoll: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

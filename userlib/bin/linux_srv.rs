@@ -213,6 +213,7 @@ const PIPE_CREATE: u64 = 0x5010;
 const PIPE_WRITE_TAG: u64 = 0x5020;
 const PIPE_READ_TAG: u64 = 0x5030;
 const PIPE_CLOSE_TAG: u64 = 0x5040;
+const PIPE_POLL_TAG: u64 = 0x5050;
 const PIPE_OK: u64 = 0x5100;
 const PIPE_EOF_TAG: u64 = 0x51FF;
 
@@ -226,6 +227,7 @@ const UDS_SEND: u64 = 0x8050;
 const UDS_RECV: u64 = 0x8060;
 const UDS_CLOSE: u64 = 0x8070;
 const UDS_GETPEERCRED: u64 = 0x8080;
+const UDS_POLL_TAG: u64 = 0x8090;
 const UDS_OK: u64 = 0x8100;
 const UDS_EOF: u64 = 0x81FF;
 const _UDS_ERROR: u64 = 0x8F00;
@@ -247,8 +249,20 @@ const NET_TCP_LISTEN_OK: u64 = 0x4701;
 const NET_TCP_ACCEPT: u64 = 0x4710;
 const NET_TCP_ACCEPT_OK: u64 = 0x4711;
 
+// Epoll constants
+const EPOLLIN: u32 = 0x001;
+const EPOLLOUT: u32 = 0x004;
+const EPOLLERR: u32 = 0x008;
+const EPOLLHUP: u32 = 0x010;
+const EPOLL_CTL_ADD: u64 = 1;
+const EPOLL_CTL_DEL: u64 = 2;
+const EPOLL_CTL_MOD: u64 = 3;
+const _EPOLL_CLOEXEC: u64 = 0x80000;
+
 const MAX_FDS: usize = 64;
 const MAX_PROCS: usize = 16;
+const MAX_EPOLL_INSTANCES: usize = 16;
+const MAX_EPOLL_WATCHES: usize = 16;
 
 #[derive(Clone, Copy, PartialEq)]
 enum FdKind {
@@ -257,6 +271,7 @@ enum FdKind {
     Pipe,
     Dir,
     Socket,
+    Epoll,
 }
 
 #[derive(Clone, Copy)]
@@ -322,6 +337,34 @@ static mut PIPE_PORT: u64 = 0;
 static mut UDS_PORT: u64 = 0;
 static mut NET_PORT: u64 = 0;
 static mut SOCKETPAIR_SEQ: u32 = 0;
+
+// Epoll subsystem
+#[derive(Clone, Copy)]
+struct EpollWatch {
+    active: bool,
+    fd: u8,
+    events: u32,
+    data: u64,
+}
+
+impl EpollWatch {
+    const fn empty() -> Self { Self { active: false, fd: 0, events: 0, data: 0 } }
+}
+
+#[derive(Clone, Copy)]
+struct EpollInstance {
+    active: bool,
+    owner_port: u64,
+    watches: [EpollWatch; MAX_EPOLL_WATCHES],
+}
+
+impl EpollInstance {
+    const fn empty() -> Self {
+        Self { active: false, owner_port: 0, watches: [const { EpollWatch::empty() }; MAX_EPOLL_WATCHES] }
+    }
+}
+
+static mut EPOLL_TABLE: [EpollInstance; MAX_EPOLL_INSTANCES] = [const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES];
 
 /// Find a process slot by caller_port.
 fn find_proc(port: u64) -> Option<usize> {
@@ -688,6 +731,12 @@ fn do_close(pi: usize, fd: usize) {
                 syscall::port_destroy(rp);
             }
             FdKind::Dir => {} // No server handle to close.
+            FdKind::Epoll => {
+                let idx = PROC_TABLE[pi].fds[fd].handle as usize;
+                if idx < MAX_EPOLL_INSTANCES {
+                    EPOLL_TABLE[idx] = EpollInstance::empty();
+                }
+            }
             FdKind::None => {}
         }
         PROC_TABLE[pi].fds[fd] = FdEntry::empty();
@@ -725,7 +774,7 @@ fn handle_lseek(pi: usize, args: &[u64; 6]) -> u64 {
         if !PROC_TABLE[pi].fds[fd].in_use {
             return linux_err(EBADF);
         }
-        if PROC_TABLE[pi].fds[fd].kind == FdKind::Pipe || PROC_TABLE[pi].fds[fd].kind == FdKind::Socket {
+        if PROC_TABLE[pi].fds[fd].kind == FdKind::Pipe || PROC_TABLE[pi].fds[fd].kind == FdKind::Socket || PROC_TABLE[pi].fds[fd].kind == FdKind::Epoll {
             return linux_err(ESPIPE);
         }
         let new_off = match whence {
@@ -2661,6 +2710,227 @@ fn handle_getsockopt(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     0 // Default: silently succeed.
 }
 
+// ---- Epoll handlers ----
+
+/// Poll a single FD for readiness without blocking.
+fn poll_single_fd(pi: usize, fd: usize) -> u32 {
+    unsafe {
+        let entry = &PROC_TABLE[pi].fds[fd];
+        match entry.kind {
+            FdKind::Pipe => {
+                let rp = syscall::port_create();
+                let events: u16 = 0x0015; // POLLIN|POLLOUT|POLLHUP
+                let d2 = ((rp as u64) << 32) | (events as u64);
+                syscall::send(entry.fs_port, PIPE_POLL_TAG, entry.handle, 0, d2, 0);
+                let resp = syscall::recv_msg(rp);
+                syscall::port_destroy(rp);
+                match resp {
+                    Some(m) if m.tag == PIPE_OK => m.data[0] as u32,
+                    _ => EPOLLERR,
+                }
+            }
+            FdKind::Socket => {
+                let dom = entry.sock_domain;
+                if dom == AF_UNIX as u8 {
+                    let rp = syscall::port_create();
+                    let events: u16 = 0x0015; // POLLIN|POLLOUT|POLLHUP
+                    let d2 = ((rp as u64) << 32) | (events as u64);
+                    syscall::send(entry.fs_port, UDS_POLL_TAG, entry.handle, 0, d2, 0);
+                    let resp = syscall::recv_msg(rp);
+                    syscall::port_destroy(rp);
+                    match resp {
+                        Some(m) if m.tag == UDS_OK => m.data[0] as u32,
+                        _ => EPOLLERR,
+                    }
+                } else {
+                    // AF_INET: no poll opcode — report writable by default.
+                    EPOLLOUT
+                }
+            }
+            FdKind::File | FdKind::Dir => EPOLLIN | EPOLLOUT,
+            _ => EPOLLERR,
+        }
+    }
+}
+
+/// Handle epoll_create(size) / epoll_create1(flags).
+fn handle_epoll_create1(pi: usize, flags: u64) -> u64 {
+    // Allocate an epoll instance.
+    let ep_idx = unsafe {
+        let mut found = None;
+        for i in 0..MAX_EPOLL_INSTANCES {
+            if !EPOLL_TABLE[i].active {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(i) => i,
+            None => return linux_err(EMFILE),
+        }
+    };
+
+    let fd = match alloc_fd(pi) {
+        Some(f) => f,
+        None => return linux_err(EMFILE),
+    };
+
+    unsafe {
+        EPOLL_TABLE[ep_idx].active = true;
+        EPOLL_TABLE[ep_idx].owner_port = PROC_TABLE[pi].port;
+        EPOLL_TABLE[ep_idx].watches = [const { EpollWatch::empty() }; MAX_EPOLL_WATCHES];
+
+        PROC_TABLE[pi].fds[fd].kind = FdKind::Epoll;
+        PROC_TABLE[pi].fds[fd].handle = ep_idx as u64;
+        if flags & _EPOLL_CLOEXEC != 0 {
+            PROC_TABLE[pi].fds[fd].fd_flags |= FD_CLOEXEC;
+        }
+    }
+    fd as u64
+}
+
+/// Handle epoll_ctl(epfd, op, fd, event_ptr).
+fn handle_epoll_ctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let epfd = args[0] as usize;
+    let op = args[1];
+    let target_fd = args[2] as usize;
+    let event_va = args[3] as usize;
+
+    if epfd >= MAX_FDS || target_fd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[epfd].in_use || PROC_TABLE[pi].fds[epfd].kind != FdKind::Epoll {
+            return linux_err(EBADF);
+        }
+        if !PROC_TABLE[pi].fds[target_fd].in_use {
+            return linux_err(EBADF);
+        }
+
+        let ep_idx = PROC_TABLE[pi].fds[epfd].handle as usize;
+        if ep_idx >= MAX_EPOLL_INSTANCES || !EPOLL_TABLE[ep_idx].active {
+            return linux_err(EBADF);
+        }
+
+        match op {
+            EPOLL_CTL_ADD => {
+                // Check for duplicate.
+                for w in 0..MAX_EPOLL_WATCHES {
+                    if EPOLL_TABLE[ep_idx].watches[w].active && EPOLL_TABLE[ep_idx].watches[w].fd == target_fd as u8 {
+                        return linux_err(EEXIST);
+                    }
+                }
+                // Read epoll_event from caller: { u32 events, u64 data } = 12 bytes
+                let mut ev_buf = [0u8; 12];
+                let copied = syscall::personality_copy_in(caller_port, event_va, &mut ev_buf);
+                if copied < 12 { return linux_err(EFAULT); }
+                let events = u32::from_le_bytes([ev_buf[0], ev_buf[1], ev_buf[2], ev_buf[3]]);
+                let data = u64::from_le_bytes([ev_buf[4], ev_buf[5], ev_buf[6], ev_buf[7], ev_buf[8], ev_buf[9], ev_buf[10], ev_buf[11]]);
+                // Find empty watch slot.
+                for w in 0..MAX_EPOLL_WATCHES {
+                    if !EPOLL_TABLE[ep_idx].watches[w].active {
+                        EPOLL_TABLE[ep_idx].watches[w] = EpollWatch { active: true, fd: target_fd as u8, events, data };
+                        return 0;
+                    }
+                }
+                linux_err(ENOMEM) // No space
+            }
+            EPOLL_CTL_MOD => {
+                let mut ev_buf = [0u8; 12];
+                let copied = syscall::personality_copy_in(caller_port, event_va, &mut ev_buf);
+                if copied < 12 { return linux_err(EFAULT); }
+                let events = u32::from_le_bytes([ev_buf[0], ev_buf[1], ev_buf[2], ev_buf[3]]);
+                let data = u64::from_le_bytes([ev_buf[4], ev_buf[5], ev_buf[6], ev_buf[7], ev_buf[8], ev_buf[9], ev_buf[10], ev_buf[11]]);
+                for w in 0..MAX_EPOLL_WATCHES {
+                    if EPOLL_TABLE[ep_idx].watches[w].active && EPOLL_TABLE[ep_idx].watches[w].fd == target_fd as u8 {
+                        EPOLL_TABLE[ep_idx].watches[w].events = events;
+                        EPOLL_TABLE[ep_idx].watches[w].data = data;
+                        return 0;
+                    }
+                }
+                linux_err(ENOENT)
+            }
+            EPOLL_CTL_DEL => {
+                for w in 0..MAX_EPOLL_WATCHES {
+                    if EPOLL_TABLE[ep_idx].watches[w].active && EPOLL_TABLE[ep_idx].watches[w].fd == target_fd as u8 {
+                        EPOLL_TABLE[ep_idx].watches[w] = EpollWatch::empty();
+                        return 0;
+                    }
+                }
+                linux_err(ENOENT)
+            }
+            _ => linux_err(EINVAL),
+        }
+    }
+}
+
+/// Handle epoll_wait(epfd, events, maxevents, timeout).
+fn handle_epoll_wait(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let epfd = args[0] as usize;
+    let events_va = args[1] as usize;
+    let maxevents = args[2] as usize;
+    let timeout_ms = args[3] as i32;
+
+    if epfd >= MAX_FDS { return linux_err(EBADF); }
+    if maxevents == 0 || maxevents > 64 { return linux_err(EINVAL); }
+
+    let ep_idx = unsafe {
+        if !PROC_TABLE[pi].fds[epfd].in_use || PROC_TABLE[pi].fds[epfd].kind != FdKind::Epoll {
+            return linux_err(EBADF);
+        }
+        let idx = PROC_TABLE[pi].fds[epfd].handle as usize;
+        if idx >= MAX_EPOLL_INSTANCES || !EPOLL_TABLE[idx].active {
+            return linux_err(EBADF);
+        }
+        idx
+    };
+
+    let max_iters: u32 = if timeout_ms == 0 {
+        1
+    } else if timeout_ms > 0 {
+        ((timeout_ms as u32) / 5).max(1).min(200)
+    } else {
+        400 // ~2s for infinite timeout
+    };
+
+    for iter in 0..max_iters {
+        let mut out_count = 0usize;
+        let mut out_buf = [0u8; 12 * 16]; // max 16 events at a time
+
+        let cap = maxevents.min(16);
+        unsafe {
+            for w in 0..MAX_EPOLL_WATCHES {
+                if out_count >= cap { break; }
+                if !EPOLL_TABLE[ep_idx].watches[w].active { continue; }
+
+                let fd = EPOLL_TABLE[ep_idx].watches[w].fd as usize;
+                if fd >= MAX_FDS || !PROC_TABLE[pi].fds[fd].in_use { continue; }
+
+                let revents = poll_single_fd(pi, fd);
+                let matched = (revents & EPOLL_TABLE[ep_idx].watches[w].events)
+                    | (revents & (EPOLLERR | EPOLLHUP));
+
+                if matched != 0 {
+                    let off = out_count * 12;
+                    out_buf[off..off + 4].copy_from_slice(&matched.to_le_bytes());
+                    let data = EPOLL_TABLE[ep_idx].watches[w].data;
+                    out_buf[off + 4..off + 12].copy_from_slice(&data.to_le_bytes());
+                    out_count += 1;
+                }
+            }
+        }
+
+        if out_count > 0 {
+            syscall::personality_copy_out(caller_port, events_va, &out_buf[..out_count * 12]);
+            return out_count as u64;
+        }
+
+        if iter + 1 < max_iters {
+            syscall::sleep_ms(5);
+        }
+    }
+
+    0 // timeout, no events
+}
+
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let port = syscall::port_create();
@@ -2786,10 +3056,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_FTRUNCATE => 0,
             __NR_STATX => linux_err(ENOSYS),
 
-            // epoll stubs — return ENOSYS until real implementation.
-            __NR_EPOLL_CREATE | __NR_EPOLL_CREATE1 => linux_err(ENOSYS),
-            __NR_EPOLL_CTL => linux_err(ENOSYS),
-            __NR_EPOLL_WAIT | __NR_EPOLL_PWAIT => linux_err(ENOSYS),
+            // epoll
+            __NR_EPOLL_CREATE => handle_epoll_create1(pi, 0),
+            __NR_EPOLL_CREATE1 => handle_epoll_create1(pi, msg.data[0]),
+            __NR_EPOLL_CTL => handle_epoll_ctl(pi, caller_port, &msg.data),
+            __NR_EPOLL_WAIT | __NR_EPOLL_PWAIT => handle_epoll_wait(pi, caller_port, &msg.data),
 
             __NR_MEMFD_CREATE => linux_err(ENOSYS),
             __NR_CLONE3 => linux_err(ENOSYS),
