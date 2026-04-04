@@ -119,6 +119,10 @@ const __NR_SOCKETPAIR: u64 = 53;
 const __NR_SETSOCKOPT: u64 = 54;
 const __NR_GETSOCKOPT: u64 = 55;
 const __NR_ACCEPT4: u64 = 288;
+const __NR_TIMERFD_CREATE: u64 = 283;
+const __NR_TIMERFD_SETTIME: u64 = 286;
+const __NR_TIMERFD_GETTIME: u64 = 287;
+const __NR_EVENTFD2: u64 = 290;
 const __NR_MEMFD_CREATE: u64 = 319;
 const __NR_STATX: u64 = 332;
 const __NR_CLONE3: u64 = 435;
@@ -272,6 +276,8 @@ enum FdKind {
     Dir,
     Socket,
     Epoll,
+    EventFd,
+    TimerFd,
 }
 
 #[derive(Clone, Copy)]
@@ -365,6 +371,36 @@ impl EpollInstance {
 }
 
 static mut EPOLL_TABLE: [EpollInstance; MAX_EPOLL_INSTANCES] = [const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES];
+
+// EventFd / TimerFd subsystem
+const MAX_EVENT_INSTANCES: usize = 32;
+const EFD_SEMAPHORE: u32 = 1;
+
+#[derive(Clone, Copy)]
+struct EventFdSlot {
+    active: bool,
+    counter: u64,
+    flags: u32,  // EFD_SEMAPHORE etc.
+}
+
+impl EventFdSlot {
+    const fn empty() -> Self { Self { active: false, counter: 0, flags: 0 } }
+}
+
+#[derive(Clone, Copy)]
+struct TimerFdSlot {
+    active: bool,
+    interval_ns: u64,
+    next_expiry_ns: u64,
+    expirations: u64,
+}
+
+impl TimerFdSlot {
+    const fn empty() -> Self { Self { active: false, interval_ns: 0, next_expiry_ns: 0, expirations: 0 } }
+}
+
+static mut EVENTFD_TABLE: [EventFdSlot; MAX_EVENT_INSTANCES] = [const { EventFdSlot::empty() }; MAX_EVENT_INSTANCES];
+static mut TIMERFD_TABLE: [TimerFdSlot; MAX_EVENT_INSTANCES] = [const { TimerFdSlot::empty() }; MAX_EVENT_INSTANCES];
 
 /// Find a process slot by caller_port.
 fn find_proc(port: u64) -> Option<usize> {
@@ -471,6 +507,19 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             return write_socket(caller_port, PROC_TABLE[pi].fds[fd_idx].fs_port,
                                 PROC_TABLE[pi].fds[fd_idx].handle, dom, buf_va, count);
         }
+        if PROC_TABLE[pi].fds[fd_idx].kind == FdKind::EventFd {
+            if count < 8 { return linux_err(EINVAL); }
+            let idx = PROC_TABLE[pi].fds[fd_idx].handle as usize;
+            if idx >= MAX_EVENT_INSTANCES || !EVENTFD_TABLE[idx].active {
+                return linux_err(EBADF);
+            }
+            let mut tmp = [0u8; 8];
+            let copied = syscall::personality_copy_in(caller_port, buf_va, &mut tmp);
+            if copied < 8 { return linux_err(EFAULT); }
+            let val = u64::from_le_bytes(tmp);
+            EVENTFD_TABLE[idx].counter = EVENTFD_TABLE[idx].counter.saturating_add(val);
+            return 8;
+        }
     }
     linux_err(EBADF)
 }
@@ -547,6 +596,49 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     if kind == FdKind::Socket {
         let dom = unsafe { PROC_TABLE[pi].fds[fd].sock_domain };
         return read_socket(caller_port, fs_port, handle, dom, buf_va, count);
+    }
+
+    if kind == FdKind::EventFd {
+        if count < 8 { return linux_err(EINVAL); }
+        let idx = handle as usize;
+        unsafe {
+            if idx >= MAX_EVENT_INSTANCES || !EVENTFD_TABLE[idx].active {
+                return linux_err(EBADF);
+            }
+            if EVENTFD_TABLE[idx].counter == 0 {
+                return linux_err(EAGAIN);
+            }
+            let val = if EVENTFD_TABLE[idx].flags & EFD_SEMAPHORE != 0 {
+                EVENTFD_TABLE[idx].counter -= 1;
+                1u64
+            } else {
+                let v = EVENTFD_TABLE[idx].counter;
+                EVENTFD_TABLE[idx].counter = 0;
+                v
+            };
+            let bytes = val.to_le_bytes();
+            syscall::personality_copy_out(caller_port, buf_va, &bytes);
+        }
+        return 8;
+    }
+
+    if kind == FdKind::TimerFd {
+        if count < 8 { return linux_err(EINVAL); }
+        let idx = handle as usize;
+        unsafe {
+            if idx >= MAX_EVENT_INSTANCES || !TIMERFD_TABLE[idx].active {
+                return linux_err(EBADF);
+            }
+            check_timerfd_expiry(idx);
+            if TIMERFD_TABLE[idx].expirations == 0 {
+                return linux_err(EAGAIN);
+            }
+            let exp = TIMERFD_TABLE[idx].expirations;
+            TIMERFD_TABLE[idx].expirations = 0;
+            let bytes = exp.to_le_bytes();
+            syscall::personality_copy_out(caller_port, buf_va, &bytes);
+        }
+        return 8;
     }
 
     if offset >= file_size {
@@ -737,6 +829,18 @@ fn do_close(pi: usize, fd: usize) {
                     EPOLL_TABLE[idx] = EpollInstance::empty();
                 }
             }
+            FdKind::EventFd => {
+                let idx = PROC_TABLE[pi].fds[fd].handle as usize;
+                if idx < MAX_EVENT_INSTANCES {
+                    EVENTFD_TABLE[idx] = EventFdSlot::empty();
+                }
+            }
+            FdKind::TimerFd => {
+                let idx = PROC_TABLE[pi].fds[fd].handle as usize;
+                if idx < MAX_EVENT_INSTANCES {
+                    TIMERFD_TABLE[idx] = TimerFdSlot::empty();
+                }
+            }
             FdKind::None => {}
         }
         PROC_TABLE[pi].fds[fd] = FdEntry::empty();
@@ -774,7 +878,7 @@ fn handle_lseek(pi: usize, args: &[u64; 6]) -> u64 {
         if !PROC_TABLE[pi].fds[fd].in_use {
             return linux_err(EBADF);
         }
-        if PROC_TABLE[pi].fds[fd].kind == FdKind::Pipe || PROC_TABLE[pi].fds[fd].kind == FdKind::Socket || PROC_TABLE[pi].fds[fd].kind == FdKind::Epoll {
+        if matches!(PROC_TABLE[pi].fds[fd].kind, FdKind::Pipe | FdKind::Socket | FdKind::Epoll | FdKind::EventFd | FdKind::TimerFd) {
             return linux_err(ESPIPE);
         }
         let new_off = match whence {
@@ -2747,6 +2851,23 @@ fn poll_single_fd(pi: usize, fd: usize) -> u32 {
                     EPOLLOUT
                 }
             }
+            FdKind::EventFd => {
+                let idx = entry.handle as usize;
+                let mut revents = EPOLLOUT;
+                if idx < MAX_EVENT_INSTANCES && EVENTFD_TABLE[idx].active && EVENTFD_TABLE[idx].counter > 0 {
+                    revents |= EPOLLIN;
+                }
+                revents
+            }
+            FdKind::TimerFd => {
+                let idx = entry.handle as usize;
+                if idx < MAX_EVENT_INSTANCES && TIMERFD_TABLE[idx].active {
+                    check_timerfd_expiry(idx);
+                    if TIMERFD_TABLE[idx].expirations > 0 { EPOLLIN } else { 0 }
+                } else {
+                    EPOLLERR
+                }
+            }
             FdKind::File | FdKind::Dir => EPOLLIN | EPOLLOUT,
             _ => EPOLLERR,
         }
@@ -2931,6 +3052,208 @@ fn handle_epoll_wait(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     0 // timeout, no events
 }
 
+// ---- EventFd / TimerFd handlers ----
+
+fn check_timerfd_expiry(idx: usize) {
+    unsafe {
+        let slot = &mut TIMERFD_TABLE[idx];
+        if slot.next_expiry_ns == 0 { return; }
+        let now = syscall::clock_gettime();
+        if now < slot.next_expiry_ns { return; }
+        slot.expirations += 1;
+        if slot.interval_ns > 0 {
+            slot.next_expiry_ns += slot.interval_ns;
+            if slot.next_expiry_ns <= now {
+                slot.next_expiry_ns = now + slot.interval_ns;
+            }
+        } else {
+            slot.next_expiry_ns = 0; // one-shot: disarm
+        }
+    }
+}
+
+/// eventfd2(initval, flags)
+fn handle_eventfd2(pi: usize, args: &[u64; 6]) -> u64 {
+    let initval = args[0] as u32;
+    let flags = args[1] as u32;
+
+    // Allocate table slot.
+    let slot_idx = unsafe {
+        let mut found = None;
+        for i in 0..MAX_EVENT_INSTANCES {
+            if !EVENTFD_TABLE[i].active {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(i) => i,
+            None => return linux_err(EMFILE),
+        }
+    };
+
+    // Allocate FD.
+    let fd = unsafe {
+        let mut found = None;
+        for i in 3..MAX_FDS {
+            if !PROC_TABLE[pi].fds[i].in_use {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(i) => i,
+            None => return linux_err(EMFILE),
+        }
+    };
+
+    unsafe {
+        EVENTFD_TABLE[slot_idx].active = true;
+        EVENTFD_TABLE[slot_idx].counter = initval as u64;
+        EVENTFD_TABLE[slot_idx].flags = flags;
+
+        PROC_TABLE[pi].fds[fd] = FdEntry::empty();
+        PROC_TABLE[pi].fds[fd].in_use = true;
+        PROC_TABLE[pi].fds[fd].kind = FdKind::EventFd;
+        PROC_TABLE[pi].fds[fd].handle = slot_idx as u64;
+    }
+
+    fd as u64
+}
+
+/// timerfd_create(clockid, flags)
+fn handle_timerfd_create(pi: usize, _args: &[u64; 6]) -> u64 {
+    // Allocate table slot.
+    let slot_idx = unsafe {
+        let mut found = None;
+        for i in 0..MAX_EVENT_INSTANCES {
+            if !TIMERFD_TABLE[i].active {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(i) => i,
+            None => return linux_err(EMFILE),
+        }
+    };
+
+    // Allocate FD.
+    let fd = unsafe {
+        let mut found = None;
+        for i in 3..MAX_FDS {
+            if !PROC_TABLE[pi].fds[i].in_use {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(i) => i,
+            None => return linux_err(EMFILE),
+        }
+    };
+
+    unsafe {
+        TIMERFD_TABLE[slot_idx] = TimerFdSlot::empty();
+        TIMERFD_TABLE[slot_idx].active = true;
+
+        PROC_TABLE[pi].fds[fd] = FdEntry::empty();
+        PROC_TABLE[pi].fds[fd].in_use = true;
+        PROC_TABLE[pi].fds[fd].kind = FdKind::TimerFd;
+        PROC_TABLE[pi].fds[fd].handle = slot_idx as u64;
+    }
+
+    fd as u64
+}
+
+/// timerfd_settime(fd, flags, new_value, old_value)
+/// new_value points to struct itimerspec { timespec it_interval; timespec it_value; }
+/// Each timespec is { i64 tv_sec, i64 tv_nsec } = 16 bytes. Total 32 bytes.
+fn handle_timerfd_settime(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let _flags = args[1]; // TFD_TIMER_ABSTIME etc. — ignored for now (relative only)
+    let new_va = args[2] as usize;
+    // args[3] = old_value pointer — ignored (would need copy_out)
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::TimerFd {
+            return linux_err(EBADF);
+        }
+        let idx = PROC_TABLE[pi].fds[fd].handle as usize;
+        if idx >= MAX_EVENT_INSTANCES || !TIMERFD_TABLE[idx].active {
+            return linux_err(EBADF);
+        }
+
+        if new_va == 0 { return linux_err(EFAULT); }
+
+        // Read itimerspec (32 bytes): it_interval (tv_sec, tv_nsec), it_value (tv_sec, tv_nsec)
+        let mut buf = [0u8; 32];
+        let copied = syscall::personality_copy_in(caller_port, new_va, &mut buf);
+        if copied < 32 { return linux_err(EFAULT); }
+
+        let interval_sec = i64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
+        let interval_nsec = i64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
+        let value_sec = i64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
+        let value_nsec = i64::from_le_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]);
+
+        let interval_ns = (interval_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(interval_nsec as u64);
+        let value_ns = (value_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(value_nsec as u64);
+
+        TIMERFD_TABLE[idx].interval_ns = interval_ns;
+        TIMERFD_TABLE[idx].expirations = 0;
+        if value_ns == 0 {
+            // Disarm timer.
+            TIMERFD_TABLE[idx].next_expiry_ns = 0;
+        } else {
+            // Relative: set expiry to now + value.
+            TIMERFD_TABLE[idx].next_expiry_ns = syscall::clock_gettime() + value_ns;
+        }
+    }
+    0
+}
+
+/// timerfd_gettime(fd, curr_value)
+fn handle_timerfd_gettime(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let curr_va = args[1] as usize;
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::TimerFd {
+            return linux_err(EBADF);
+        }
+        let idx = PROC_TABLE[pi].fds[fd].handle as usize;
+        if idx >= MAX_EVENT_INSTANCES || !TIMERFD_TABLE[idx].active {
+            return linux_err(EBADF);
+        }
+        if curr_va == 0 { return linux_err(EFAULT); }
+
+        check_timerfd_expiry(idx);
+
+        let interval_ns = TIMERFD_TABLE[idx].interval_ns;
+        let remaining_ns = if TIMERFD_TABLE[idx].next_expiry_ns == 0 {
+            0u64
+        } else {
+            let now = syscall::clock_gettime();
+            if now >= TIMERFD_TABLE[idx].next_expiry_ns { 0 } else { TIMERFD_TABLE[idx].next_expiry_ns - now }
+        };
+
+        // Write itimerspec: it_interval then it_value
+        let mut buf = [0u8; 32];
+        let i_sec = (interval_ns / 1_000_000_000) as i64;
+        let i_nsec = (interval_ns % 1_000_000_000) as i64;
+        let v_sec = (remaining_ns / 1_000_000_000) as i64;
+        let v_nsec = (remaining_ns % 1_000_000_000) as i64;
+        buf[0..8].copy_from_slice(&i_sec.to_le_bytes());
+        buf[8..16].copy_from_slice(&i_nsec.to_le_bytes());
+        buf[16..24].copy_from_slice(&v_sec.to_le_bytes());
+        buf[24..32].copy_from_slice(&v_nsec.to_le_bytes());
+        syscall::personality_copy_out(caller_port, curr_va, &buf);
+    }
+    0
+}
+
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let port = syscall::port_create();
@@ -3061,6 +3384,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_EPOLL_CREATE1 => handle_epoll_create1(pi, msg.data[0]),
             __NR_EPOLL_CTL => handle_epoll_ctl(pi, caller_port, &msg.data),
             __NR_EPOLL_WAIT | __NR_EPOLL_PWAIT => handle_epoll_wait(pi, caller_port, &msg.data),
+
+            // eventfd / timerfd
+            __NR_EVENTFD2 => handle_eventfd2(pi, &msg.data),
+            __NR_TIMERFD_CREATE => handle_timerfd_create(pi, &msg.data),
+            __NR_TIMERFD_SETTIME => handle_timerfd_settime(pi, caller_port, &msg.data),
+            __NR_TIMERFD_GETTIME => handle_timerfd_gettime(pi, caller_port, &msg.data),
 
             __NR_MEMFD_CREATE => linux_err(ENOSYS),
             __NR_CLONE3 => linux_err(ENOSYS),

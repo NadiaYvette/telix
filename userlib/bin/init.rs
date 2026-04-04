@@ -9436,6 +9436,181 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 131: Linux eventfd2 + timerfd ---
+    syscall::debug_puts(b"  init: Phase 131 linux eventfd/timerfd...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") 0u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+
+                        // --- Test A: eventfd2 ---
+                        // eventfd2(initval=0, flags=0) — NR 290
+                        let efd = linux!(290u64, 0u64, 0u64);
+                        if efd > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
+                        }
+
+                        // write(efd, &5u64, 8) — NR 1
+                        let val: u64 = 5;
+                        let wr = linux!(1u64, efd, &val as *const u64 as u64, 8u64);
+                        if wr != 8 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 11u64, options(noreturn));
+                        }
+
+                        // read(efd, &out, 8) — NR 0
+                        let mut out: u64 = 0;
+                        let rd = linux!(0u64, efd, &mut out as *mut u64 as u64, 8u64);
+                        if rd != 8 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 12u64, options(noreturn));
+                        }
+                        let got = core::ptr::read_volatile(&out);
+                        if got != 5 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 13u64, options(noreturn));
+                        }
+
+                        // close eventfd
+                        linux!(3u64, efd);
+
+                        // --- Test B: timerfd ---
+                        // timerfd_create(CLOCK_MONOTONIC=1, 0) — NR 283
+                        let tfd = linux!(283u64, 1u64, 0u64);
+                        if tfd > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 20u64, options(noreturn));
+                        }
+
+                        // timerfd_settime(tfd, 0, &itimerspec, NULL) — NR 286
+                        // itimerspec: it_interval={0,0}, it_value={0, 50_000_000} (50ms one-shot)
+                        #[repr(C)]
+                        struct Timespec { tv_sec: i64, tv_nsec: i64 }
+                        #[repr(C)]
+                        struct Itimerspec { it_interval: Timespec, it_value: Timespec }
+                        let its = Itimerspec {
+                            it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+                            it_value: Timespec { tv_sec: 0, tv_nsec: 50_000_000 },
+                        };
+                        let sr = linux!(286u64, tfd, 0u64, &its as *const Itimerspec as u64, 0u64);
+                        if sr > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 21u64, options(noreturn));
+                        }
+
+                        // Sleep ~80ms to let timer expire.
+                        // nanosleep({0, 80_000_000}, NULL) — NR 35
+                        let sleep_ts = Timespec { tv_sec: 0, tv_nsec: 80_000_000 };
+                        linux!(35u64, &sleep_ts as *const Timespec as u64, 0u64);
+
+                        // read(tfd, &exp, 8) — NR 0
+                        let mut exp: u64 = 0;
+                        let rd2 = linux!(0u64, tfd, &mut exp as *mut u64 as u64, 8u64);
+                        if rd2 != 8 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 22u64, options(noreturn));
+                        }
+                        let got_exp = core::ptr::read_volatile(&exp);
+                        if got_exp < 1 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 23u64, options(noreturn));
+                        }
+
+                        // close timerfd
+                        linux!(3u64, tfd);
+
+                        // Success
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 131 linux eventfd/timerfd: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 131 linux eventfd/timerfd: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 131 linux eventfd/timerfd: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 131 linux eventfd/timerfd: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
