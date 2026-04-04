@@ -278,6 +278,7 @@ enum FdKind {
     Epoll,
     EventFd,
     TimerFd,
+    MemFd,
 }
 
 #[derive(Clone, Copy)]
@@ -402,6 +403,23 @@ impl TimerFdSlot {
 static mut EVENTFD_TABLE: [EventFdSlot; MAX_EVENT_INSTANCES] = [const { EventFdSlot::empty() }; MAX_EVENT_INSTANCES];
 static mut TIMERFD_TABLE: [TimerFdSlot; MAX_EVENT_INSTANCES] = [const { TimerFdSlot::empty() }; MAX_EVENT_INSTANCES];
 
+// MemFd subsystem
+const MAX_MEMFD_INSTANCES: usize = 16;
+
+#[derive(Clone, Copy)]
+struct MemFdSlot {
+    active: bool,
+    va: usize,        // backing memory VA (0 = not allocated)
+    capacity: usize,  // allocated bytes (page-aligned)
+    size: usize,      // logical file size
+}
+
+impl MemFdSlot {
+    const fn empty() -> Self { Self { active: false, va: 0, capacity: 0, size: 0 } }
+}
+
+static mut MEMFD_TABLE: [MemFdSlot; MAX_MEMFD_INSTANCES] = [const { MemFdSlot::empty() }; MAX_MEMFD_INSTANCES];
+
 /// Find a process slot by caller_port.
 fn find_proc(port: u64) -> Option<usize> {
     unsafe {
@@ -519,6 +537,51 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             let val = u64::from_le_bytes(tmp);
             EVENTFD_TABLE[idx].counter = EVENTFD_TABLE[idx].counter.saturating_add(val);
             return 8;
+        }
+        if PROC_TABLE[pi].fds[fd_idx].kind == FdKind::MemFd {
+            let idx = PROC_TABLE[pi].fds[fd_idx].handle as usize;
+            if idx >= MAX_MEMFD_INSTANCES || !MEMFD_TABLE[idx].active {
+                return linux_err(EBADF);
+            }
+            let off = PROC_TABLE[pi].fds[fd_idx].offset as usize;
+            let needed = off + count;
+            // Grow backing memory if needed.
+            if needed > MEMFD_TABLE[idx].capacity {
+                let ps = syscall::page_size();
+                let new_pages = (needed + ps - 1) / ps;
+                let new_cap = new_pages * ps;
+                match syscall::mmap_anon(0, new_pages, 1 /* RW */) {
+                    Some(new_va) => {
+                        // Copy old data if any.
+                        if MEMFD_TABLE[idx].va != 0 && MEMFD_TABLE[idx].size > 0 {
+                            let old_ptr = MEMFD_TABLE[idx].va as *const u8;
+                            let new_ptr = new_va as *mut u8;
+                            core::ptr::copy_nonoverlapping(old_ptr, new_ptr, MEMFD_TABLE[idx].size);
+                            syscall::munmap(MEMFD_TABLE[idx].va);
+                        }
+                        MEMFD_TABLE[idx].va = new_va;
+                        MEMFD_TABLE[idx].capacity = new_cap;
+                    }
+                    None => return linux_err(ENOMEM),
+                }
+            }
+            // Copy from caller to our buffer.
+            let base = MEMFD_TABLE[idx].va;
+            let mut total = 0usize;
+            while total < count {
+                let chunk = (count - total).min(512);
+                let dst = core::slice::from_raw_parts_mut((base + off + total) as *mut u8, chunk);
+                let copied = syscall::personality_copy_in(caller_port, buf_va + total, dst);
+                if copied == 0 { break; }
+                total += copied;
+            }
+            let new_end = off + total;
+            if new_end > MEMFD_TABLE[idx].size {
+                MEMFD_TABLE[idx].size = new_end;
+                PROC_TABLE[pi].fds[fd_idx].file_size = new_end as u64;
+            }
+            PROC_TABLE[pi].fds[fd_idx].offset = new_end as u64;
+            return total as u64;
         }
     }
     linux_err(EBADF)
@@ -639,6 +702,36 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             syscall::personality_copy_out(caller_port, buf_va, &bytes);
         }
         return 8;
+    }
+
+    if kind == FdKind::MemFd {
+        let idx = handle as usize;
+        unsafe {
+            if idx >= MAX_MEMFD_INSTANCES || !MEMFD_TABLE[idx].active {
+                return linux_err(EBADF);
+            }
+            let sz = MEMFD_TABLE[idx].size;
+            if offset as usize >= sz {
+                return 0; // EOF
+            }
+            let avail = sz - offset as usize;
+            let want = count.min(avail);
+            if MEMFD_TABLE[idx].va == 0 || want == 0 {
+                return 0;
+            }
+            // Copy from our buffer to caller's address space in chunks.
+            let base = MEMFD_TABLE[idx].va;
+            let mut total = 0usize;
+            while total < want {
+                let chunk = (want - total).min(512);
+                let src = core::slice::from_raw_parts((base + offset as usize + total) as *const u8, chunk);
+                let written = syscall::personality_copy_out(caller_port, buf_va + total, src);
+                if written == 0 { break; }
+                total += written;
+            }
+            PROC_TABLE[pi].fds[fd].offset += total as u64;
+            return total as u64;
+        }
     }
 
     if offset >= file_size {
@@ -839,6 +932,15 @@ fn do_close(pi: usize, fd: usize) {
                 let idx = PROC_TABLE[pi].fds[fd].handle as usize;
                 if idx < MAX_EVENT_INSTANCES {
                     TIMERFD_TABLE[idx] = TimerFdSlot::empty();
+                }
+            }
+            FdKind::MemFd => {
+                let idx = PROC_TABLE[pi].fds[fd].handle as usize;
+                if idx < MAX_MEMFD_INSTANCES {
+                    if MEMFD_TABLE[idx].va != 0 {
+                        syscall::munmap(MEMFD_TABLE[idx].va);
+                    }
+                    MEMFD_TABLE[idx] = MemFdSlot::empty();
                 }
             }
             FdKind::None => {}
@@ -2868,7 +2970,7 @@ fn poll_single_fd(pi: usize, fd: usize) -> u32 {
                     EPOLLERR
                 }
             }
-            FdKind::File | FdKind::Dir => EPOLLIN | EPOLLOUT,
+            FdKind::MemFd | FdKind::File | FdKind::Dir => EPOLLIN | EPOLLOUT,
             _ => EPOLLERR,
         }
     }
@@ -3254,6 +3356,101 @@ fn handle_timerfd_gettime(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     0
 }
 
+// ---- MemFd handlers ----
+
+/// memfd_create(name, flags) — NR 319
+fn handle_memfd_create(pi: usize, _caller_port: u64, _args: &[u64; 6]) -> u64 {
+    // Allocate table slot.
+    let slot_idx = unsafe {
+        let mut found = None;
+        for i in 0..MAX_MEMFD_INSTANCES {
+            if !MEMFD_TABLE[i].active {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(i) => i,
+            None => return linux_err(EMFILE),
+        }
+    };
+
+    // Allocate FD.
+    let fd = unsafe {
+        let mut found = None;
+        for i in 3..MAX_FDS {
+            if !PROC_TABLE[pi].fds[i].in_use {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(i) => i,
+            None => return linux_err(EMFILE),
+        }
+    };
+
+    unsafe {
+        MEMFD_TABLE[slot_idx] = MemFdSlot::empty();
+        MEMFD_TABLE[slot_idx].active = true;
+
+        PROC_TABLE[pi].fds[fd] = FdEntry::empty();
+        PROC_TABLE[pi].fds[fd].in_use = true;
+        PROC_TABLE[pi].fds[fd].kind = FdKind::MemFd;
+        PROC_TABLE[pi].fds[fd].handle = slot_idx as u64;
+        PROC_TABLE[pi].fds[fd].file_size = 0;
+        PROC_TABLE[pi].fds[fd].offset = 0;
+    }
+
+    fd as u64
+}
+
+/// ftruncate(fd, length) — NR 77
+fn handle_ftruncate(pi: usize, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let length = args[1] as usize;
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use {
+            return linux_err(EBADF);
+        }
+        if PROC_TABLE[pi].fds[fd].kind != FdKind::MemFd {
+            return 0; // Stub for non-MemFd (keep existing behavior)
+        }
+        let idx = PROC_TABLE[pi].fds[fd].handle as usize;
+        if idx >= MAX_MEMFD_INSTANCES || !MEMFD_TABLE[idx].active {
+            return linux_err(EBADF);
+        }
+
+        // Grow backing memory if needed.
+        if length > MEMFD_TABLE[idx].capacity {
+            let ps = syscall::page_size();
+            let new_pages = (length + ps - 1) / ps;
+            let new_cap = new_pages * ps;
+            match syscall::mmap_anon(0, new_pages, 1 /* RW */) {
+                Some(new_va) => {
+                    // Zero-init: mmap_anon returns zeroed pages.
+                    // Copy old data if any.
+                    if MEMFD_TABLE[idx].va != 0 && MEMFD_TABLE[idx].size > 0 {
+                        let copy_len = MEMFD_TABLE[idx].size.min(length);
+                        let old_ptr = MEMFD_TABLE[idx].va as *const u8;
+                        let new_ptr = new_va as *mut u8;
+                        core::ptr::copy_nonoverlapping(old_ptr, new_ptr, copy_len);
+                        syscall::munmap(MEMFD_TABLE[idx].va);
+                    }
+                    MEMFD_TABLE[idx].va = new_va;
+                    MEMFD_TABLE[idx].capacity = new_cap;
+                }
+                None => return linux_err(ENOMEM),
+            }
+        }
+        MEMFD_TABLE[idx].size = length;
+        PROC_TABLE[pi].fds[fd].file_size = length as u64;
+    }
+    0
+}
+
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let port = syscall::port_create();
@@ -3376,7 +3573,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_MADVISE => 0,
             __NR_SCHED_GETAFFINITY => linux_err(ENOSYS),
             __NR_GETRLIMIT | __NR_GETRUSAGE => 0,
-            __NR_FTRUNCATE => 0,
+            __NR_FTRUNCATE => handle_ftruncate(pi, &msg.data),
             __NR_STATX => linux_err(ENOSYS),
 
             // epoll
@@ -3391,7 +3588,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_TIMERFD_SETTIME => handle_timerfd_settime(pi, caller_port, &msg.data),
             __NR_TIMERFD_GETTIME => handle_timerfd_gettime(pi, caller_port, &msg.data),
 
-            __NR_MEMFD_CREATE => linux_err(ENOSYS),
+            __NR_MEMFD_CREATE => handle_memfd_create(pi, caller_port, &msg.data),
             __NR_CLONE3 => linux_err(ENOSYS),
 
             // Anonymous mmap: forward to Telix mmap_anon.
