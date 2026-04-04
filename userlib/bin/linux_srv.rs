@@ -103,6 +103,22 @@ const __NR_TGKILL: u64 = 234;
 const __NR_PPOLL: u64 = 271;
 const __NR_EPOLL_CREATE1: u64 = 291;
 const __NR_EPOLL_PWAIT: u64 = 281;
+const __NR_SOCKET: u64 = 41;
+const __NR_CONNECT: u64 = 42;
+const __NR_ACCEPT: u64 = 43;
+const __NR_SENDTO: u64 = 44;
+const __NR_RECVFROM: u64 = 45;
+const __NR_SENDMSG: u64 = 46;
+const __NR_RECVMSG: u64 = 47;
+const __NR_SHUTDOWN: u64 = 48;
+const __NR_BIND: u64 = 49;
+const __NR_LISTEN: u64 = 50;
+const __NR_GETSOCKNAME: u64 = 51;
+const __NR_GETPEERNAME: u64 = 52;
+const __NR_SOCKETPAIR: u64 = 53;
+const __NR_SETSOCKOPT: u64 = 54;
+const __NR_GETSOCKOPT: u64 = 55;
+const __NR_ACCEPT4: u64 = 288;
 const __NR_MEMFD_CREATE: u64 = 319;
 const __NR_STATX: u64 = 332;
 const __NR_CLONE3: u64 = 435;
@@ -129,6 +145,21 @@ const EEXIST: u64 = 17;
 const ENOMEM: u64 = 12;
 const ENOTTY: u64 = 25;
 const ETIMEDOUT: u64 = 110;
+const ENOTSOCK: u64 = 88;
+const EAFNOSUPPORT: u64 = 97;
+const ENOTCONN: u64 = 107;
+const ECONNREFUSED: u64 = 111;
+const EOPNOTSUPP: u64 = 95;
+
+// Socket address families
+const AF_UNIX: u64 = 1;
+const AF_INET: u64 = 2;
+
+// Socket types
+const SOCK_STREAM: u64 = 1;
+const _SOCK_DGRAM: u64 = 2;
+const SOCK_NONBLOCK: u64 = 0x800;
+const SOCK_CLOEXEC: u64 = 0x80000;
 
 // fcntl commands
 const F_DUPFD: u64 = 0;
@@ -185,6 +216,37 @@ const PIPE_CLOSE_TAG: u64 = 0x5040;
 const PIPE_OK: u64 = 0x5100;
 const PIPE_EOF_TAG: u64 = 0x51FF;
 
+// UDS server protocol tags
+const UDS_SOCKET: u64 = 0x8000;
+const UDS_BIND: u64 = 0x8010;
+const UDS_LISTEN: u64 = 0x8020;
+const UDS_CONNECT: u64 = 0x8030;
+const UDS_ACCEPT: u64 = 0x8040;
+const UDS_SEND: u64 = 0x8050;
+const UDS_RECV: u64 = 0x8060;
+const UDS_CLOSE: u64 = 0x8070;
+const UDS_GETPEERCRED: u64 = 0x8080;
+const UDS_OK: u64 = 0x8100;
+const UDS_EOF: u64 = 0x81FF;
+const _UDS_ERROR: u64 = 0x8F00;
+
+// NET server TCP protocol tags
+const NET_TCP_CONNECT: u64 = 0x4200;
+const NET_TCP_CONNECTED: u64 = 0x4201;
+const NET_TCP_SEND: u64 = 0x4300;
+const NET_TCP_SEND_OK: u64 = 0x4301;
+const NET_TCP_RECV: u64 = 0x4400;
+const NET_TCP_DATA: u64 = 0x4401;
+const NET_TCP_RECV_NB: u64 = 0x4410;
+const NET_TCP_RECV_NONE: u64 = 0x4412;
+const NET_TCP_CLOSED: u64 = 0x44FF;
+const NET_TCP_CLOSE: u64 = 0x4500;
+const NET_TCP_BIND: u64 = 0x4600;
+const NET_TCP_LISTEN: u64 = 0x4700;
+const NET_TCP_LISTEN_OK: u64 = 0x4701;
+const NET_TCP_ACCEPT: u64 = 0x4710;
+const NET_TCP_ACCEPT_OK: u64 = 0x4711;
+
 const MAX_FDS: usize = 64;
 const MAX_PROCS: usize = 16;
 
@@ -194,6 +256,7 @@ enum FdKind {
     File,
     Pipe,
     Dir,
+    Socket,
 }
 
 #[derive(Clone, Copy)]
@@ -202,6 +265,7 @@ struct FdEntry {
     kind: FdKind,
     // File: fs_port = FS server port, handle = FS handle
     // Pipe: fs_port = pipe_srv port, handle = pipe handle
+    // Socket: fs_port = uds_srv/net_srv port, handle = server handle/conn_id
     // Dir: dir_path/dir_path_len store the absolute path for VFS_READDIR
     fs_port: u64,
     handle: u64,
@@ -211,11 +275,17 @@ struct FdEntry {
     dir_path_len: u8,
     fd_flags: u32,    // FD_CLOEXEC etc.
     status_flags: u32, // O_NONBLOCK etc.
+    // Socket-specific metadata:
+    sock_domain: u8,  // AF_UNIX=1, AF_INET=2
+    sock_type: u8,    // SOCK_STREAM=1, SOCK_DGRAM=2
+    sock_state: u8,   // 0=created, 1=bound, 2=listening, 3=connected
+    sock_port: u16,   // AF_INET: port number
+    sock_ip: u32,     // AF_INET: IP (network byte order)
 }
 
 impl FdEntry {
     const fn empty() -> Self {
-        Self { in_use: false, kind: FdKind::None, fs_port: 0, handle: 0, file_size: 0, offset: 0, dir_path: [0; 16], dir_path_len: 0, fd_flags: 0, status_flags: 0 }
+        Self { in_use: false, kind: FdKind::None, fs_port: 0, handle: 0, file_size: 0, offset: 0, dir_path: [0; 16], dir_path_len: 0, fd_flags: 0, status_flags: 0, sock_domain: 0, sock_type: 0, sock_state: 0, sock_port: 0, sock_ip: 0 }
     }
 }
 
@@ -249,6 +319,9 @@ static mut PROC_TABLE: [ProcessState; MAX_PROCS] = [const { ProcessState::empty(
 static mut VFS_PORT: u64 = 0;
 static mut REPLY_PORT: u64 = 0;
 static mut PIPE_PORT: u64 = 0;
+static mut UDS_PORT: u64 = 0;
+static mut NET_PORT: u64 = 0;
+static mut SOCKETPAIR_SEQ: u32 = 0;
 
 /// Find a process slot by caller_port.
 fn find_proc(port: u64) -> Option<usize> {
@@ -350,6 +423,11 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             return write_pipe(caller_port, PROC_TABLE[pi].fds[fd_idx].fs_port,
                               PROC_TABLE[pi].fds[fd_idx].handle, buf_va, count);
         }
+        if PROC_TABLE[pi].fds[fd_idx].kind == FdKind::Socket {
+            let dom = PROC_TABLE[pi].fds[fd_idx].sock_domain;
+            return write_socket(caller_port, PROC_TABLE[pi].fds[fd_idx].fs_port,
+                                PROC_TABLE[pi].fds[fd_idx].handle, dom, buf_va, count);
+        }
     }
     linux_err(EBADF)
 }
@@ -421,6 +499,11 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     if kind == FdKind::Pipe {
         return read_pipe(caller_port, fs_port, handle, buf_va, count);
+    }
+
+    if kind == FdKind::Socket {
+        let dom = unsafe { PROC_TABLE[pi].fds[fd].sock_domain };
+        return read_socket(caller_port, fs_port, handle, dom, buf_va, count);
     }
 
     if offset >= file_size {
@@ -591,6 +674,19 @@ fn do_close(pi: usize, fd: usize) {
                 let _ = syscall::recv_msg(rp);
                 syscall::port_destroy(rp);
             }
+            FdKind::Socket => {
+                let rp = syscall::port_create();
+                let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+                if dom == AF_UNIX as u8 {
+                    let d2 = (rp as u64) << 32;
+                    syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_CLOSE, PROC_TABLE[pi].fds[fd].handle, 0, d2, 0);
+                    let _ = syscall::recv_msg(rp);
+                } else if dom == AF_INET as u8 && PROC_TABLE[pi].fds[fd].handle != u64::MAX {
+                    syscall::send(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_CLOSE, PROC_TABLE[pi].fds[fd].handle, rp, 0, 0);
+                    let _ = syscall::recv_msg(rp);
+                }
+                syscall::port_destroy(rp);
+            }
             FdKind::Dir => {} // No server handle to close.
             FdKind::None => {}
         }
@@ -629,7 +725,7 @@ fn handle_lseek(pi: usize, args: &[u64; 6]) -> u64 {
         if !PROC_TABLE[pi].fds[fd].in_use {
             return linux_err(EBADF);
         }
-        if PROC_TABLE[pi].fds[fd].kind == FdKind::Pipe {
+        if PROC_TABLE[pi].fds[fd].kind == FdKind::Pipe || PROC_TABLE[pi].fds[fd].kind == FdKind::Socket {
             return linux_err(ESPIPE);
         }
         let new_off = match whence {
@@ -1837,6 +1933,734 @@ fn handle_getid(nr: u64) -> u64 {
     }
 }
 
+// =============================================================================
+// Phase 129: Socket syscall handlers
+// =============================================================================
+
+/// Read from a socket FD (UDS or TCP).
+fn read_socket(caller_port: u64, srv_port: u64, handle: u64, domain: u8, buf_va: usize, count: usize) -> u64 {
+    if domain == AF_UNIX as u8 {
+        let rp = syscall::port_create();
+        let d2 = (rp as u64) << 32;
+        syscall::send(srv_port, UDS_RECV, handle, 0, d2, 0);
+        let resp = match syscall::recv_msg(rp) {
+            Some(m) => m,
+            None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+        };
+        syscall::port_destroy(rp);
+        if resp.tag == UDS_EOF { return 0; }
+        if resp.tag != UDS_OK { return linux_err(ECONNREFUSED); }
+        let len = (resp.data[2] & 0xFFFF) as usize;
+        let got = len.min(count);
+        if got == 0 { return 0; }
+        let mut tmp = [0u8; 16];
+        let b0 = resp.data[0].to_le_bytes();
+        let b1 = resp.data[1].to_le_bytes();
+        tmp[..8].copy_from_slice(&b0);
+        tmp[8..16].copy_from_slice(&b1);
+        let written = syscall::personality_copy_out(caller_port, buf_va, &tmp[..got]);
+        written as u64
+    } else if domain == AF_INET as u8 {
+        if handle == u64::MAX { return linux_err(ENOTCONN); }
+        let rp = syscall::port_create();
+        let d1 = (rp as u64) << 16;
+        syscall::send(srv_port, NET_TCP_RECV, handle, d1, 0, 0);
+        let resp = match syscall::recv_msg(rp) {
+            Some(m) => m,
+            None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+        };
+        syscall::port_destroy(rp);
+        if resp.tag == NET_TCP_CLOSED { return 0; }
+        if resp.tag != NET_TCP_DATA { return linux_err(ECONNREFUSED); }
+        let len = (resp.data[0] & 0xFFFF) as usize;
+        let got = len.min(count);
+        if got == 0 { return 0; }
+        // TCP data in d1/d2/d3 (up to 24 bytes)
+        let mut tmp = [0u8; 24];
+        let b1 = resp.data[1].to_le_bytes();
+        let b2 = resp.data[2].to_le_bytes();
+        let b3 = resp.data[3].to_le_bytes();
+        tmp[..8].copy_from_slice(&b1);
+        tmp[8..16].copy_from_slice(&b2);
+        tmp[16..24].copy_from_slice(&b3);
+        let written = syscall::personality_copy_out(caller_port, buf_va, &tmp[..got]);
+        written as u64
+    } else {
+        linux_err(EAFNOSUPPORT)
+    }
+}
+
+/// Write to a socket FD (UDS or TCP).
+fn write_socket(caller_port: u64, srv_port: u64, handle: u64, domain: u8, buf_va: usize, count: usize) -> u64 {
+    let mut total = 0usize;
+    if domain == AF_UNIX as u8 {
+        while total < count {
+            let chunk = (count - total).min(16);
+            let mut tmp = [0u8; 16];
+            let copied = syscall::personality_copy_in(caller_port, buf_va + total, &mut tmp[..chunk]);
+            if copied == 0 { break; }
+            let w0 = u64::from_le_bytes([tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]]);
+            let w1 = u64::from_le_bytes([tmp[8], tmp[9], tmp[10], tmp[11], tmp[12], tmp[13], tmp[14], tmp[15]]);
+            let rp = syscall::port_create();
+            let d2 = (copied as u64) | ((rp as u64) << 32);
+            syscall::send(srv_port, UDS_SEND, handle, w0, d2, w1);
+            let resp = match syscall::recv_msg(rp) {
+                Some(m) => m,
+                None => { syscall::port_destroy(rp); break; }
+            };
+            syscall::port_destroy(rp);
+            if resp.tag != UDS_OK { break; }
+            let sent = (resp.data[0] & 0xFFFF) as usize;
+            total += sent;
+            if sent == 0 { break; }
+        }
+    } else if domain == AF_INET as u8 {
+        if handle == u64::MAX { return linux_err(ENOTCONN); }
+        while total < count {
+            let chunk = (count - total).min(16);
+            let mut tmp = [0u8; 16];
+            let copied = syscall::personality_copy_in(caller_port, buf_va + total, &mut tmp[..chunk]);
+            if copied == 0 { break; }
+            let w0 = u64::from_le_bytes([tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]]);
+            let w1 = u64::from_le_bytes([tmp[8], tmp[9], tmp[10], tmp[11], tmp[12], tmp[13], tmp[14], tmp[15]]);
+            let rp = syscall::port_create();
+            let d1 = (copied as u64) | ((rp as u64) << 16);
+            syscall::send(srv_port, NET_TCP_SEND, handle, d1, w0, w1);
+            let resp = match syscall::recv_msg(rp) {
+                Some(m) => m,
+                None => { syscall::port_destroy(rp); break; }
+            };
+            syscall::port_destroy(rp);
+            if resp.tag != NET_TCP_SEND_OK { break; }
+            total += copied;
+        }
+    } else {
+        return linux_err(EAFNOSUPPORT);
+    }
+    if total == 0 && count > 0 { linux_err(EFAULT) } else { total as u64 }
+}
+
+/// Handle Linux socket(domain, type, protocol).
+fn handle_socket(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
+    let domain = args[0];
+    let type_raw = args[1];
+    let _protocol = args[2];
+
+    let base_type = type_raw & 0xF;
+    let flags = type_raw & !0xF;
+
+    if base_type != SOCK_STREAM {
+        return linux_err(EOPNOTSUPP);
+    }
+
+    let fd = match alloc_fd(pi) {
+        Some(f) => f,
+        None => return linux_err(EMFILE),
+    };
+
+    if domain == AF_UNIX {
+        let uds_port = unsafe { UDS_PORT };
+        if uds_port == 0 { unsafe { PROC_TABLE[pi].fds[fd] = FdEntry::empty(); } return linux_err(EAFNOSUPPORT); }
+        // Create UDS socket via uds_srv.
+        let rp = syscall::port_create();
+        let d2 = (rp as u64) << 32;
+        syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0);
+        let resp = match syscall::recv_msg(rp) {
+            Some(m) => m,
+            None => { syscall::port_destroy(rp); unsafe { PROC_TABLE[pi].fds[fd] = FdEntry::empty(); } return linux_err(EAFNOSUPPORT); }
+        };
+        syscall::port_destroy(rp);
+        if resp.tag != UDS_OK {
+            unsafe { PROC_TABLE[pi].fds[fd] = FdEntry::empty(); }
+            return linux_err(ENOMEM);
+        }
+        let handle = resp.data[0];
+        unsafe {
+            PROC_TABLE[pi].fds[fd].kind = FdKind::Socket;
+            PROC_TABLE[pi].fds[fd].fs_port = uds_port;
+            PROC_TABLE[pi].fds[fd].handle = handle;
+            PROC_TABLE[pi].fds[fd].sock_domain = AF_UNIX as u8;
+            PROC_TABLE[pi].fds[fd].sock_type = base_type as u8;
+            PROC_TABLE[pi].fds[fd].sock_state = 0;
+        }
+    } else if domain == AF_INET {
+        let net_port = unsafe { NET_PORT };
+        if net_port == 0 { unsafe { PROC_TABLE[pi].fds[fd] = FdEntry::empty(); } return linux_err(EAFNOSUPPORT); }
+        // AF_INET: no IPC yet — handle allocated on connect/accept.
+        unsafe {
+            PROC_TABLE[pi].fds[fd].kind = FdKind::Socket;
+            PROC_TABLE[pi].fds[fd].fs_port = net_port;
+            PROC_TABLE[pi].fds[fd].handle = u64::MAX; // placeholder
+            PROC_TABLE[pi].fds[fd].sock_domain = AF_INET as u8;
+            PROC_TABLE[pi].fds[fd].sock_type = base_type as u8;
+            PROC_TABLE[pi].fds[fd].sock_state = 0;
+        }
+    } else {
+        unsafe { PROC_TABLE[pi].fds[fd] = FdEntry::empty(); }
+        return linux_err(EAFNOSUPPORT);
+    }
+
+    // Apply SOCK_NONBLOCK / SOCK_CLOEXEC flags.
+    unsafe {
+        if flags & SOCK_NONBLOCK != 0 {
+            PROC_TABLE[pi].fds[fd].status_flags |= O_NONBLOCK as u32;
+        }
+        if flags & SOCK_CLOEXEC != 0 {
+            PROC_TABLE[pi].fds[fd].fd_flags |= FD_CLOEXEC;
+        }
+    }
+
+    fd as u64
+}
+
+/// Parse a Linux sockaddr_un from caller memory. Returns (name, name_len).
+fn parse_sockaddr_un(caller_port: u64, addr_va: usize, addrlen: usize) -> ([u8; 16], usize) {
+    let mut buf = [0u8; 110]; // sa_family(2) + sun_path(108)
+    let to_read = addrlen.min(110);
+    let copied = syscall::personality_copy_in(caller_port, addr_va, &mut buf[..to_read]);
+    if copied < 3 {
+        return ([0; 16], 0);
+    }
+    // sun_path starts at offset 2
+    let path_len = (copied - 2).min(16);
+    let mut name = [0u8; 16];
+    for i in 0..path_len {
+        name[i] = buf[2 + i];
+    }
+    (name, path_len)
+}
+
+/// Parse a Linux sockaddr_in from caller memory. Returns (ip_be32, port_be16).
+fn parse_sockaddr_in(caller_port: u64, addr_va: usize, addrlen: usize) -> (u32, u16) {
+    let mut buf = [0u8; 16]; // sockaddr_in is 16 bytes
+    let to_read = addrlen.min(16);
+    let copied = syscall::personality_copy_in(caller_port, addr_va, &mut buf[..to_read]);
+    if copied < 8 {
+        return (0, 0);
+    }
+    // sin_port at offset 2 (big-endian u16)
+    let port = u16::from_be_bytes([buf[2], buf[3]]);
+    // sin_addr at offset 4 (big-endian u32)
+    let ip = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    (ip, port)
+}
+
+/// Pack a name into UDS IPC format words (d0=name[0..8], d3=name[8..16]).
+fn pack_uds_name(name: &[u8; 16], len: usize) -> (u64, u64) {
+    let mut w0 = [0u8; 8];
+    let mut w1 = [0u8; 8];
+    for i in 0..len.min(8) { w0[i] = name[i]; }
+    for i in 8..len.min(16) { w1[i - 8] = name[i]; }
+    (u64::from_le_bytes(w0), u64::from_le_bytes(w1))
+}
+
+/// Handle Linux bind(fd, addr, addrlen).
+fn handle_bind(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let addr_va = args[1] as usize;
+    let addrlen = args[2] as usize;
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
+            return linux_err(ENOTSOCK);
+        }
+        let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+        if dom == AF_UNIX as u8 {
+            let (name, nlen) = parse_sockaddr_un(caller_port, addr_va, addrlen);
+            if nlen == 0 { return linux_err(EINVAL); }
+            let (w0, w1) = pack_uds_name(&name, nlen);
+            let rp = syscall::port_create();
+            let d2 = (nlen as u64) | ((rp as u64) << 32);
+            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_BIND, PROC_TABLE[pi].fds[fd].handle, w0, d2, w1);
+            let resp = match syscall::recv_msg(rp) {
+                Some(m) => m,
+                None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+            };
+            syscall::port_destroy(rp);
+            if resp.tag != UDS_OK { return linux_err(EINVAL); }
+            PROC_TABLE[pi].fds[fd].sock_state = 1;
+            0
+        } else if dom == AF_INET as u8 {
+            let (ip, port) = parse_sockaddr_in(caller_port, addr_va, addrlen);
+            let _ = ip; // net_srv bind only cares about port
+            let rp = syscall::port_create();
+            let d1 = (rp as u64) << 32;
+            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_BIND, port as u64, d1, 0, 0);
+            let resp = match syscall::recv_msg(rp) {
+                Some(m) => m,
+                None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+            };
+            syscall::port_destroy(rp);
+            if resp.tag == 0x4601 { // NET_TCP_BIND_OK
+                PROC_TABLE[pi].fds[fd].sock_port = port;
+                PROC_TABLE[pi].fds[fd].sock_ip = ip;
+                PROC_TABLE[pi].fds[fd].sock_state = 1;
+                0
+            } else {
+                linux_err(EINVAL)
+            }
+        } else {
+            linux_err(EAFNOSUPPORT)
+        }
+    }
+}
+
+/// Handle Linux listen(fd, backlog).
+fn handle_listen(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let backlog = args[1];
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
+            return linux_err(ENOTSOCK);
+        }
+        let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+        if dom == AF_UNIX as u8 {
+            let rp = syscall::port_create();
+            let d2 = (rp as u64) << 32;
+            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_LISTEN, PROC_TABLE[pi].fds[fd].handle, backlog, d2, 0);
+            let resp = match syscall::recv_msg(rp) {
+                Some(m) => m,
+                None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+            };
+            syscall::port_destroy(rp);
+            if resp.tag != UDS_OK { return linux_err(EINVAL); }
+            PROC_TABLE[pi].fds[fd].sock_state = 2;
+            0
+        } else if dom == AF_INET as u8 {
+            let port = PROC_TABLE[pi].fds[fd].sock_port;
+            let rp = syscall::port_create();
+            let d2 = (rp as u64) << 32;
+            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_LISTEN, port as u64, backlog, d2, 0);
+            let resp = match syscall::recv_msg(rp) {
+                Some(m) => m,
+                None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+            };
+            syscall::port_destroy(rp);
+            if resp.tag != NET_TCP_LISTEN_OK { return linux_err(EINVAL); }
+            PROC_TABLE[pi].fds[fd].sock_state = 2;
+            0
+        } else {
+            linux_err(EAFNOSUPPORT)
+        }
+    }
+}
+
+/// Handle Linux connect(fd, addr, addrlen).
+fn handle_connect(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let addr_va = args[1] as usize;
+    let addrlen = args[2] as usize;
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
+            return linux_err(ENOTSOCK);
+        }
+        let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+        if dom == AF_UNIX as u8 {
+            let (name, nlen) = parse_sockaddr_un(caller_port, addr_va, addrlen);
+            if nlen == 0 { return linux_err(EINVAL); }
+            let (w0, w1) = pack_uds_name(&name, nlen);
+            let rp = syscall::port_create();
+            let d2 = (nlen as u64) | ((rp as u64) << 32);
+            let pid = syscall::getpid();
+            let uid = syscall::getuid() as u64;
+            let d3 = pid | (uid << 32);
+            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_CONNECT, w0, w1, d2, d3);
+            let resp = match syscall::recv_msg(rp) {
+                Some(m) => m,
+                None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+            };
+            syscall::port_destroy(rp);
+            if resp.tag != UDS_OK { return linux_err(ECONNREFUSED); }
+            // UDS_CONNECT reply: data[0] = client-end handle
+            PROC_TABLE[pi].fds[fd].handle = resp.data[0];
+            PROC_TABLE[pi].fds[fd].sock_state = 3;
+            0
+        } else if dom == AF_INET as u8 {
+            let (ip, port) = parse_sockaddr_in(caller_port, addr_va, addrlen);
+            let rp = syscall::port_create();
+            let d1 = (port as u64) | ((rp as u64) << 16);
+            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_CONNECT, ip as u64, d1, 0, 0);
+            let resp = match syscall::recv_msg(rp) {
+                Some(m) => m,
+                None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+            };
+            syscall::port_destroy(rp);
+            if resp.tag != NET_TCP_CONNECTED { return linux_err(ECONNREFUSED); }
+            PROC_TABLE[pi].fds[fd].handle = resp.data[0]; // conn_id
+            PROC_TABLE[pi].fds[fd].sock_port = port;
+            PROC_TABLE[pi].fds[fd].sock_ip = ip;
+            PROC_TABLE[pi].fds[fd].sock_state = 3;
+            0
+        } else {
+            linux_err(EAFNOSUPPORT)
+        }
+    }
+}
+
+/// Handle Linux accept(fd, addr, addrlen) / accept4(fd, addr, addrlen, flags).
+fn handle_accept_inner(pi: usize, caller_port: u64, args: &[u64; 6], flags: u64) -> u64 {
+    let fd = args[0] as usize;
+    let _addr_va = args[1] as usize;
+    let _addrlen_va = args[2] as usize;
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
+            return linux_err(ENOTSOCK);
+        }
+        if PROC_TABLE[pi].fds[fd].sock_state != 2 { return linux_err(EINVAL); }
+
+        let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+        let new_fd = match alloc_fd(pi) {
+            Some(f) => f,
+            None => return linux_err(EMFILE),
+        };
+
+        if dom == AF_UNIX as u8 {
+            let rp = syscall::port_create();
+            let d2 = (rp as u64) << 32;
+            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_ACCEPT, PROC_TABLE[pi].fds[fd].handle, 0, d2, 0);
+            let resp = match syscall::recv_msg(rp) {
+                Some(m) => m,
+                None => { syscall::port_destroy(rp); PROC_TABLE[pi].fds[new_fd] = FdEntry::empty(); return linux_err(ECONNREFUSED); }
+            };
+            syscall::port_destroy(rp);
+            if resp.tag != UDS_OK {
+                PROC_TABLE[pi].fds[new_fd] = FdEntry::empty();
+                return linux_err(ECONNREFUSED);
+            }
+            PROC_TABLE[pi].fds[new_fd].kind = FdKind::Socket;
+            PROC_TABLE[pi].fds[new_fd].fs_port = PROC_TABLE[pi].fds[fd].fs_port;
+            PROC_TABLE[pi].fds[new_fd].handle = resp.data[0]; // accepted handle
+            PROC_TABLE[pi].fds[new_fd].sock_domain = AF_UNIX as u8;
+            PROC_TABLE[pi].fds[new_fd].sock_type = SOCK_STREAM as u8;
+            PROC_TABLE[pi].fds[new_fd].sock_state = 3;
+        } else if dom == AF_INET as u8 {
+            let port = PROC_TABLE[pi].fds[fd].sock_port;
+            let rp = syscall::port_create();
+            let d1 = (rp as u64) << 32;
+            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_ACCEPT, port as u64, d1, 0, 0);
+            let resp = match syscall::recv_msg(rp) {
+                Some(m) => m,
+                None => { syscall::port_destroy(rp); PROC_TABLE[pi].fds[new_fd] = FdEntry::empty(); return linux_err(ECONNREFUSED); }
+            };
+            syscall::port_destroy(rp);
+            if resp.tag != NET_TCP_ACCEPT_OK {
+                PROC_TABLE[pi].fds[new_fd] = FdEntry::empty();
+                return linux_err(ECONNREFUSED);
+            }
+            PROC_TABLE[pi].fds[new_fd].kind = FdKind::Socket;
+            PROC_TABLE[pi].fds[new_fd].fs_port = PROC_TABLE[pi].fds[fd].fs_port;
+            PROC_TABLE[pi].fds[new_fd].handle = resp.data[0]; // conn_id
+            PROC_TABLE[pi].fds[new_fd].sock_domain = AF_INET as u8;
+            PROC_TABLE[pi].fds[new_fd].sock_type = SOCK_STREAM as u8;
+            PROC_TABLE[pi].fds[new_fd].sock_state = 3;
+        } else {
+            PROC_TABLE[pi].fds[new_fd] = FdEntry::empty();
+            return linux_err(EAFNOSUPPORT);
+        }
+
+        // Apply accept4 flags.
+        if flags & SOCK_NONBLOCK != 0 {
+            PROC_TABLE[pi].fds[new_fd].status_flags |= O_NONBLOCK as u32;
+        }
+        if flags & SOCK_CLOEXEC != 0 {
+            PROC_TABLE[pi].fds[new_fd].fd_flags |= FD_CLOEXEC;
+        }
+
+        // TODO: write sockaddr back to caller if addr_va != 0
+
+        new_fd as u64
+    }
+}
+
+/// Handle Linux sendto(fd, buf, len, flags, dest_addr, addrlen).
+fn handle_sendto(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let buf_va = args[1] as usize;
+    let count = args[2] as usize;
+    // args[3] = flags (ignored), args[4]/args[5] = dest_addr/addrlen (ignored for STREAM)
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    if buf_va == 0 || count == 0 { return 0; }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
+            return linux_err(ENOTSOCK);
+        }
+        let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+        write_socket(caller_port, PROC_TABLE[pi].fds[fd].fs_port, PROC_TABLE[pi].fds[fd].handle, dom, buf_va, count)
+    }
+}
+
+/// Handle Linux recvfrom(fd, buf, len, flags, src_addr, addrlen).
+fn handle_recvfrom(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let buf_va = args[1] as usize;
+    let count = args[2] as usize;
+    // args[3] = flags, args[4]/args[5] = src_addr/addrlen (ignored for STREAM)
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    if buf_va == 0 || count == 0 { return 0; }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
+            return linux_err(ENOTSOCK);
+        }
+        let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+        read_socket(caller_port, PROC_TABLE[pi].fds[fd].fs_port, PROC_TABLE[pi].fds[fd].handle, dom, buf_va, count)
+    }
+}
+
+/// Handle Linux socketpair(domain, type, protocol, sv[2]).
+/// Creates two connected AF_UNIX sockets via bind/listen/connect/accept on a synthetic name.
+fn handle_socketpair(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let domain = args[0];
+    let type_raw = args[1];
+    let _protocol = args[2];
+    let sv_va = args[3] as usize; // note: socketpair arg3 is r10 = sv
+
+    if domain != AF_UNIX { return linux_err(EOPNOTSUPP); }
+    let base_type = type_raw & 0xF;
+    if base_type != SOCK_STREAM { return linux_err(EOPNOTSUPP); }
+
+    let uds_port = unsafe { UDS_PORT };
+    if uds_port == 0 { return linux_err(EAFNOSUPPORT); }
+
+    // Allocate two FDs.
+    let fd0 = match alloc_fd(pi) {
+        Some(f) => f,
+        None => return linux_err(EMFILE),
+    };
+    let fd1 = match alloc_fd(pi) {
+        Some(f) => f,
+        None => { unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); } return linux_err(EMFILE); }
+    };
+
+    // Create two UDS sockets.
+    let rp = syscall::port_create();
+    let d2 = (rp as u64) << 32;
+
+    // Socket A (will be server side).
+    syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0);
+    let resp_a = match syscall::recv_msg(rp) {
+        Some(m) if m.tag == UDS_OK => m,
+        _ => { syscall::port_destroy(rp); unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); } return linux_err(ENOMEM); }
+    };
+    let handle_a = resp_a.data[0];
+
+    // Socket B (will be client side).
+    syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0);
+    let resp_b = match syscall::recv_msg(rp) {
+        Some(m) if m.tag == UDS_OK => m,
+        _ => { syscall::port_destroy(rp); unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); } return linux_err(ENOMEM); }
+    };
+    let _handle_b = resp_b.data[0];
+
+    // Generate unique synthetic name for binding.
+    let seq = unsafe { SOCKETPAIR_SEQ += 1; SOCKETPAIR_SEQ };
+    let mut name = [0u8; 16];
+    name[0] = b'_'; name[1] = b's'; name[2] = b'p';
+    // Encode seq as decimal.
+    let mut val = seq;
+    let mut pos = 3usize;
+    let mut tmp = [0u8; 10];
+    let mut ti = 10;
+    if val == 0 { ti -= 1; tmp[ti] = b'0'; }
+    while val > 0 && ti > 0 { ti -= 1; tmp[ti] = b'0' + (val % 10) as u8; val /= 10; }
+    while ti < 10 && pos < 16 { name[pos] = tmp[ti]; pos += 1; ti += 1; }
+    let nlen = pos;
+
+    // Bind socket A.
+    let (w0, w1) = pack_uds_name(&name, nlen);
+    let d2_bind = (nlen as u64) | ((rp as u64) << 32);
+    syscall::send(uds_port, UDS_BIND, handle_a, w0, d2_bind, w1);
+    let bind_resp = syscall::recv_msg(rp);
+    if bind_resp.is_none() || bind_resp.unwrap().tag != UDS_OK {
+        syscall::port_destroy(rp);
+        unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); }
+        return linux_err(EINVAL);
+    }
+
+    // Listen socket A.
+    let d2_listen = (rp as u64) << 32;
+    syscall::send(uds_port, UDS_LISTEN, handle_a, 1, d2_listen, 0);
+    let listen_resp = syscall::recv_msg(rp);
+    if listen_resp.is_none() || listen_resp.unwrap().tag != UDS_OK {
+        syscall::port_destroy(rp);
+        unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); }
+        return linux_err(EINVAL);
+    }
+
+    // Connect socket B to socket A's name.
+    let d2_conn = (nlen as u64) | ((rp as u64) << 32);
+    let pid = syscall::getpid();
+    let uid = syscall::getuid() as u64;
+    let d3_conn = pid | (uid << 32);
+    syscall::send(uds_port, UDS_CONNECT, w0, w1, d2_conn, d3_conn);
+    let conn_resp = match syscall::recv_msg(rp) {
+        Some(m) => m,
+        None => { syscall::port_destroy(rp); unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); } return linux_err(ECONNREFUSED); }
+    };
+    if conn_resp.tag != UDS_OK {
+        syscall::port_destroy(rp);
+        unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); }
+        return linux_err(ECONNREFUSED);
+    }
+    let client_handle = conn_resp.data[0];
+
+    // Accept on socket A.
+    let d2_acc = (rp as u64) << 32;
+    syscall::send(uds_port, UDS_ACCEPT, handle_a, 0, d2_acc, 0);
+    let acc_resp = match syscall::recv_msg(rp) {
+        Some(m) => m,
+        None => { syscall::port_destroy(rp); unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); } return linux_err(ECONNREFUSED); }
+    };
+    syscall::port_destroy(rp);
+    if acc_resp.tag != UDS_OK {
+        unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); }
+        return linux_err(ECONNREFUSED);
+    }
+    let server_handle = acc_resp.data[0];
+
+    // Set up FD entries: fd0 = server-accepted end, fd1 = client-connected end.
+    let flags = type_raw & !0xF;
+    unsafe {
+        PROC_TABLE[pi].fds[fd0].kind = FdKind::Socket;
+        PROC_TABLE[pi].fds[fd0].fs_port = uds_port;
+        PROC_TABLE[pi].fds[fd0].handle = server_handle;
+        PROC_TABLE[pi].fds[fd0].sock_domain = AF_UNIX as u8;
+        PROC_TABLE[pi].fds[fd0].sock_type = SOCK_STREAM as u8;
+        PROC_TABLE[pi].fds[fd0].sock_state = 3;
+        if flags & SOCK_NONBLOCK != 0 { PROC_TABLE[pi].fds[fd0].status_flags |= O_NONBLOCK as u32; }
+        if flags & SOCK_CLOEXEC != 0 { PROC_TABLE[pi].fds[fd0].fd_flags |= FD_CLOEXEC; }
+
+        PROC_TABLE[pi].fds[fd1].kind = FdKind::Socket;
+        PROC_TABLE[pi].fds[fd1].fs_port = uds_port;
+        PROC_TABLE[pi].fds[fd1].handle = client_handle;
+        PROC_TABLE[pi].fds[fd1].sock_domain = AF_UNIX as u8;
+        PROC_TABLE[pi].fds[fd1].sock_type = SOCK_STREAM as u8;
+        PROC_TABLE[pi].fds[fd1].sock_state = 3;
+        if flags & SOCK_NONBLOCK != 0 { PROC_TABLE[pi].fds[fd1].status_flags |= O_NONBLOCK as u32; }
+        if flags & SOCK_CLOEXEC != 0 { PROC_TABLE[pi].fds[fd1].fd_flags |= FD_CLOEXEC; }
+    }
+
+    // Write [fd0, fd1] back to caller.
+    let sv = [fd0 as u32, fd1 as u32];
+    let sv_bytes: [u8; 8] = unsafe { core::mem::transmute(sv) };
+    let written = syscall::personality_copy_out(caller_port, sv_va, &sv_bytes);
+    if written < 8 {
+        unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); }
+        return linux_err(EFAULT);
+    }
+    0
+}
+
+/// Handle Linux getsockname(fd, addr, addrlen).
+fn handle_getsockname(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let addr_va = args[1] as usize;
+    let addrlen_va = args[2] as usize;
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
+            return linux_err(ENOTSOCK);
+        }
+        let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+        if addr_va != 0 && addrlen_va != 0 {
+            if dom == AF_UNIX as u8 {
+                // Write minimal sockaddr_un (family=AF_UNIX, empty path).
+                let mut sa = [0u8; 4];
+                sa[0] = AF_UNIX as u8;
+                let _ = syscall::personality_copy_out(caller_port, addr_va, &sa);
+                let len_bytes = (4u32).to_le_bytes();
+                let _ = syscall::personality_copy_out(caller_port, addrlen_va, &len_bytes);
+            } else if dom == AF_INET as u8 {
+                let mut sa = [0u8; 16];
+                sa[0] = AF_INET as u8; sa[1] = 0; // sa_family
+                let port_be = PROC_TABLE[pi].fds[fd].sock_port.to_be_bytes();
+                sa[2] = port_be[0]; sa[3] = port_be[1];
+                let ip_be = PROC_TABLE[pi].fds[fd].sock_ip.to_be_bytes();
+                sa[4] = ip_be[0]; sa[5] = ip_be[1]; sa[6] = ip_be[2]; sa[7] = ip_be[3];
+                let _ = syscall::personality_copy_out(caller_port, addr_va, &sa);
+                let len_bytes = (16u32).to_le_bytes();
+                let _ = syscall::personality_copy_out(caller_port, addrlen_va, &len_bytes);
+            }
+        }
+    }
+    0
+}
+
+/// Handle Linux getpeername(fd, addr, addrlen).
+fn handle_getpeername(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
+            return linux_err(ENOTSOCK);
+        }
+        if PROC_TABLE[pi].fds[fd].sock_state != 3 {
+            return linux_err(ENOTCONN);
+        }
+    }
+    // Stub: return success without filling addr (caller often checks just for ENOTCONN).
+    0
+}
+
+/// Handle Linux setsockopt — stub that returns 0.
+fn handle_setsockopt(_pi: usize, _caller_port: u64, _args: &[u64; 6]) -> u64 {
+    0
+}
+
+/// Handle Linux getsockopt — stub, with SO_PEERCRED special case.
+fn handle_getsockopt(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let level = args[1];
+    let optname = args[2];
+    let optval_va = args[3] as usize; // note: getsockopt arg3 is r10
+    // args[4] = optlen ptr
+
+    const SOL_SOCKET: u64 = 1;
+    const SO_PEERCRED: u64 = 17;
+
+    if level == SOL_SOCKET && optname == SO_PEERCRED {
+        if fd >= MAX_FDS { return linux_err(EBADF); }
+        unsafe {
+            if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
+                return linux_err(ENOTSOCK);
+            }
+            if PROC_TABLE[pi].fds[fd].sock_domain == AF_UNIX as u8 {
+                let rp = syscall::port_create();
+                let d2 = (rp as u64) << 32;
+                syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_GETPEERCRED, PROC_TABLE[pi].fds[fd].handle, 0, d2, 0);
+                let resp = match syscall::recv_msg(rp) {
+                    Some(m) => m,
+                    None => { syscall::port_destroy(rp); return linux_err(ENOTCONN); }
+                };
+                syscall::port_destroy(rp);
+                if resp.tag == UDS_OK && optval_va != 0 {
+                    // struct ucred: pid(i32) + uid(u32) + gid(u32) = 12 bytes
+                    let pid = resp.data[0] as u32;
+                    let uid_gid = resp.data[1];
+                    let uid = uid_gid as u32;
+                    let gid = (uid_gid >> 32) as u32;
+                    let mut ucred = [0u8; 12];
+                    ucred[0..4].copy_from_slice(&pid.to_le_bytes());
+                    ucred[4..8].copy_from_slice(&uid.to_le_bytes());
+                    ucred[8..12].copy_from_slice(&gid.to_le_bytes());
+                    let _ = syscall::personality_copy_out(caller_port, optval_va, &ucred);
+                }
+                return 0;
+            }
+        }
+    }
+    0 // Default: silently succeed.
+}
+
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let port = syscall::port_create();
@@ -1848,6 +2672,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         REPLY_PORT = syscall::port_create();
         VFS_PORT = syscall::ns_lookup(b"vfs").unwrap_or(0);
         PIPE_PORT = syscall::ns_lookup(b"pipe").unwrap_or(0);
+        UDS_PORT = syscall::ns_lookup(b"uds").unwrap_or(0);
+        NET_PORT = syscall::ns_lookup(b"net").unwrap_or(0);
     }
 
     syscall::debug_puts(b"[linux_srv] ready on port ");
@@ -1990,6 +2816,27 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_MUNMAP => {
                 let addr = msg.data[0] as usize;
                 if syscall::munmap(addr) { 0 } else { linux_err(ENOSYS) }
+            }
+
+            // Phase 129: Socket syscalls.
+            __NR_SOCKET => handle_socket(pi, caller_port, &msg.data),
+            __NR_CONNECT => handle_connect(pi, caller_port, &msg.data),
+            __NR_ACCEPT => handle_accept_inner(pi, caller_port, &msg.data, 0),
+            __NR_SENDTO => handle_sendto(pi, caller_port, &msg.data),
+            __NR_RECVFROM => handle_recvfrom(pi, caller_port, &msg.data),
+            __NR_SENDMSG => linux_err(ENOSYS),
+            __NR_RECVMSG => linux_err(ENOSYS),
+            __NR_SHUTDOWN => 0, // stub
+            __NR_BIND => handle_bind(pi, caller_port, &msg.data),
+            __NR_LISTEN => handle_listen(pi, caller_port, &msg.data),
+            __NR_GETSOCKNAME => handle_getsockname(pi, caller_port, &msg.data),
+            __NR_GETPEERNAME => handle_getpeername(pi, caller_port, &msg.data),
+            __NR_SOCKETPAIR => handle_socketpair(pi, caller_port, &msg.data),
+            __NR_SETSOCKOPT => handle_setsockopt(pi, caller_port, &msg.data),
+            __NR_GETSOCKOPT => handle_getsockopt(pi, caller_port, &msg.data),
+            __NR_ACCEPT4 => {
+                let flags = msg.data[3];
+                handle_accept_inner(pi, caller_port, &msg.data, flags)
             }
 
             _ => {
