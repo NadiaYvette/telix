@@ -173,9 +173,11 @@ pub fn forward_to_server(
     let caller_port = crate::sched::scheduler::task_ref(task_id).port_id;
 
     // Build the forwarded message.
+    // Pack syscall number (low 32 bits) and caller port (high 32 bits) into tag,
+    // so all 6 data slots carry syscall arguments.
     let msg = Message {
-        tag: nr,
-        data: [args[0], args[1], args[2], args[3], caller_port, 0],
+        tag: (nr & 0xFFFF_FFFF) | (caller_port << 32),
+        data: [args[0], args[1], args[2], args[3], args[4], args[5]],
     };
 
     // Clear the result field and set blocked_on before sending, so the

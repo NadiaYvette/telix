@@ -7,12 +7,8 @@
 //! layer and translates them into Telix-native operations.
 //!
 //! Message format (from kernel/src/syscall/personality.rs):
-//!   tag     = Linux syscall number (x86_64 numbering)
-//!   data[0] = arg0
-//!   data[1] = arg1
-//!   data[2] = arg2
-//!   data[3] = arg3
-//!   data[4] = caller's task port_id
+//!   tag     = (syscall_nr & 0xFFFFFFFF) | (caller_port << 32)
+//!   data[0..5] = arg0..arg5 (all 6 syscall arguments)
 
 extern crate userlib;
 
@@ -1126,6 +1122,84 @@ fn handle_sched_getaffinity(caller_port: u64, args: &[u64; 6]) -> u64 {
     let written = syscall::personality_copy_out(caller_port, mask_va, &mask[..size]);
     if written < size { return linux_err(EFAULT); }
     size as u64 // returns number of bytes written
+}
+
+/// Handle Linux statx(dirfd, pathname, flags, mask, statxbuf).
+/// Delegates to VFS_STAT, then converts struct stat → struct statx.
+/// NOTE: currently disabled in dispatch (VFS recv hangs — needs debugging).
+#[allow(dead_code)]
+fn handle_statx(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let dirfd = args[0];
+    let path_va = args[1] as usize;
+    let _flags = args[2];
+    let _mask = args[3];
+    let statxbuf_va = args[4] as usize;
+
+    if statxbuf_va == 0 { return linux_err(EFAULT); }
+
+    // First, do a stat() by redirecting to handle_stat with rearranged args.
+    // handle_stat expects: args[0] = path_va, args[1] = statbuf_va.
+    // We'll call it with a temporary stat buffer, then convert to statx.
+    //
+    // But we can't easily use a stack buffer as statbuf_va because
+    // personality_copy_out writes to the *caller's* address space.
+    // Instead, we directly call VFS_STAT ourselves.
+
+    let vfs_port = unsafe { VFS_PORT };
+    if vfs_port == 0 { return linux_err(ENOSYS); }
+    if dirfd != AT_FDCWD && (dirfd as i64) >= 0 { return linux_err(ENOSYS); }
+
+    let mut path = [0u8; 16];
+    let copied = syscall::personality_copy_in(caller_port, path_va, &mut path);
+    if copied == 0 { return linux_err(EFAULT); }
+    let pathlen = path.iter().position(|&b| b == 0).unwrap_or(copied);
+
+    let mut w0 = 0u64;
+    let mut w1 = 0u64;
+    for i in 0..pathlen.min(8) {
+        w0 |= (path[i] as u64) << (i * 8);
+    }
+    for i in 8..pathlen.min(16) {
+        w1 |= (path[i] as u64) << ((i - 8) * 8);
+    }
+
+    let reply_port = unsafe { REPLY_PORT };
+    let d2 = (pathlen as u64) | (reply_port << 32);
+    syscall::send(vfs_port, VFS_STAT, w0, w1, d2, 0);
+
+    let resp = match syscall::recv_msg(reply_port) {
+        Some(m) => m,
+        None => return linux_err(ENOENT),
+    };
+    if resp.tag == VFS_ERROR || resp.tag != VFS_STAT_OK {
+        return linux_err(ENOENT);
+    }
+
+    let file_size = resp.data[0];
+    let mode = resp.data[1] as u32;
+    let ino = resp.data[3];
+
+    // Build struct statx (256 bytes).
+    let mut sx = [0u8; 256];
+    // stx_mask: STATX_BASIC_STATS = 0x07FF
+    sx[0..4].copy_from_slice(&0x07FFu32.to_le_bytes());
+    // stx_blksize
+    sx[4..8].copy_from_slice(&4096u32.to_le_bytes());
+    // stx_nlink
+    sx[16..20].copy_from_slice(&1u32.to_le_bytes());
+    // stx_mode (u16 at offset 28)
+    sx[28..30].copy_from_slice(&(mode as u16).to_le_bytes());
+    // stx_ino
+    sx[32..40].copy_from_slice(&ino.to_le_bytes());
+    // stx_size
+    sx[40..48].copy_from_slice(&file_size.to_le_bytes());
+    // stx_blocks
+    let blocks = (file_size + 511) / 512;
+    sx[48..56].copy_from_slice(&blocks.to_le_bytes());
+
+    let written = syscall::personality_copy_out(caller_port, statxbuf_va, &sx);
+    if written < 256 { return linux_err(EFAULT); }
+    0
 }
 
 // Linux resource limit constants
@@ -3798,8 +3872,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             None => continue,
         };
 
-        let linux_nr = msg.tag;
-        let caller_port = msg.data[4];
+        let linux_nr = msg.tag & 0xFFFF_FFFF;
+        let caller_port = msg.tag >> 32;
 
         // Resolve per-process state index.
         let pi = match get_or_init_proc(caller_port) {
@@ -3896,7 +3970,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_SCHED_GETAFFINITY => handle_sched_getaffinity(caller_port, &msg.data),
             __NR_GETRLIMIT | __NR_GETRUSAGE => 0,
             __NR_FTRUNCATE => handle_ftruncate(pi, &msg.data),
-            __NR_STATX => linux_err(ENOSYS),
+            __NR_STATX => linux_err(ENOSYS), // TODO: statx hangs on VFS recv; needs debugging
 
             // epoll
             __NR_EPOLL_CREATE => handle_epoll_create1(pi, 0),

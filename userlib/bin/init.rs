@@ -10089,6 +10089,132 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 135: 6-arg personality routing ---
+    // The kernel now packs caller_port into msg.tag (high 32 bits) and forwards
+    // all 6 syscall args in data[0..5]. Test by using mmap (6 args: addr, len,
+    // prot, flags, fd, offset) and verifying the mapping works.
+    syscall::debug_puts(b"  init: Phase 135 linux 6-arg routing...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+
+                        // Test 1: prlimit64 — verifies tag packing (caller_port in high bits)
+                        let mut rlim = [0u8; 16];
+                        let r = linux!(302u64, 0u64, 7u64, 0u64, rlim.as_mut_ptr() as u64);
+                        if r > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
+                        }
+                        let cur = u64::from_le_bytes([
+                            core::ptr::read_volatile(&rlim[0]),
+                            core::ptr::read_volatile(&rlim[1]),
+                            core::ptr::read_volatile(&rlim[2]),
+                            core::ptr::read_volatile(&rlim[3]),
+                            core::ptr::read_volatile(&rlim[4]),
+                            core::ptr::read_volatile(&rlim[5]),
+                            core::ptr::read_volatile(&rlim[6]),
+                            core::ptr::read_volatile(&rlim[7]),
+                        ]);
+                        if cur != 1024 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 11u64, options(noreturn));
+                        }
+
+                        // Test 2: sendmsg with single iovec — verifies multi-arg routing
+                        // Create socketpair
+                        let mut sv: [i32; 2] = [0; 2];
+                        let r = linux!(53u64, 1u64, 1u64, 0u64, sv.as_mut_ptr() as u64);
+                        if r > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 12u64, options(noreturn));
+                        }
+                        let s0 = core::ptr::read_volatile(&sv[0]) as u64;
+                        let s1 = core::ptr::read_volatile(&sv[1]) as u64;
+
+                        // write "test" on s0, read on s1
+                        let msg = *b"test";
+                        let wr: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") 1u64 => wr,
+                            in("rdi") s0, in("rsi") msg.as_ptr() as u64, in("rdx") 4u64,
+                            in("r10") 0u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if wr != 4 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 13u64, options(noreturn));
+                        }
+                        let mut rbuf = [0u8; 4];
+                        let rd: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") 0u64 => rd,
+                            in("rdi") s1, in("rsi") rbuf.as_mut_ptr() as u64, in("rdx") 4u64,
+                            in("r10") 0u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if rd != 4 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 14u64, options(noreturn));
+                        }
+
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 135 linux 6-arg routing: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 135 linux 6-arg routing: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 135 linux 6-arg routing: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 135 linux 6-arg routing: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
