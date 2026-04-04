@@ -1109,6 +1109,65 @@ fn handle_fstat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     0
 }
 
+/// Handle Linux sched_getaffinity(pid, cpusetsize, mask).
+/// Returns a single-CPU affinity mask (CPU 0 only).
+fn handle_sched_getaffinity(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let _pid = args[0]; // 0 = current
+    let cpusetsize = args[1] as usize;
+    let mask_va = args[2] as usize;
+
+    if mask_va == 0 { return linux_err(EFAULT); }
+    if cpusetsize == 0 { return linux_err(EINVAL); }
+
+    // Fill mask with CPU 0 set (byte 0 = 0x01, rest = 0x00).
+    let size = cpusetsize.min(128); // cap at 1024 CPUs
+    let mut mask = [0u8; 128];
+    mask[0] = 1; // CPU 0
+    let written = syscall::personality_copy_out(caller_port, mask_va, &mask[..size]);
+    if written < size { return linux_err(EFAULT); }
+    size as u64 // returns number of bytes written
+}
+
+// Linux resource limit constants
+const RLIMIT_CPU: u64 = 0;
+const RLIMIT_FSIZE: u64 = 1;
+const RLIMIT_DATA: u64 = 2;
+const RLIMIT_STACK: u64 = 3;
+const RLIMIT_CORE: u64 = 4;
+const RLIMIT_NOFILE: u64 = 7;
+const RLIMIT_AS: u64 = 9;
+const RLIMIT_NPROC: u64 = 6;
+const RLIM_INFINITY: u64 = u64::MAX;
+
+/// Handle Linux prlimit64(pid, resource, new_rlim, old_rlim).
+/// Returns sensible defaults for common resource limits.
+fn handle_prlimit64(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let _pid = args[0]; // 0 = current (only supported value)
+    let resource = args[1];
+    let _new_rlim_va = args[2] as usize; // ignored (read-only)
+    let old_rlim_va = args[3] as usize;
+
+    // struct rlimit { rlim_cur: u64, rlim_max: u64 } = 16 bytes
+    let (cur, max) = match resource {
+        RLIMIT_NOFILE => (1024u64, 4096u64),
+        RLIMIT_STACK => (8 * 1024 * 1024, RLIM_INFINITY), // 8 MB default
+        RLIMIT_AS | RLIMIT_DATA | RLIMIT_FSIZE => (RLIM_INFINITY, RLIM_INFINITY),
+        RLIMIT_CORE => (0, RLIM_INFINITY),
+        RLIMIT_CPU => (RLIM_INFINITY, RLIM_INFINITY),
+        RLIMIT_NPROC => (4096, 4096),
+        _ => (RLIM_INFINITY, RLIM_INFINITY),
+    };
+
+    if old_rlim_va != 0 {
+        let mut rlim = [0u8; 16];
+        rlim[0..8].copy_from_slice(&cur.to_le_bytes());
+        rlim[8..16].copy_from_slice(&max.to_le_bytes());
+        let written = syscall::personality_copy_out(caller_port, old_rlim_va, &rlim);
+        if written < 16 { return linux_err(EFAULT); }
+    }
+    0
+}
+
 /// Handle Linux uname(buf).
 fn handle_uname(caller_port: u64, args: &[u64; 6]) -> u64 {
     let buf_va = args[0] as usize;
@@ -3832,9 +3891,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // Stubs that return success (0) to avoid crashing callers.
             __NR_SET_ROBUST_LIST | __NR_RSEQ => 0,
-            __NR_PRLIMIT64 => 0,
+            __NR_PRLIMIT64 => handle_prlimit64(caller_port, &msg.data),
             __NR_MADVISE => 0,
-            __NR_SCHED_GETAFFINITY => linux_err(ENOSYS),
+            __NR_SCHED_GETAFFINITY => handle_sched_getaffinity(caller_port, &msg.data),
             __NR_GETRLIMIT | __NR_GETRUSAGE => 0,
             __NR_FTRUNCATE => handle_ftruncate(pi, &msg.data),
             __NR_STATX => linux_err(ENOSYS),

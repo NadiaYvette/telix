@@ -9953,6 +9953,142 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 134: Linux sched_getaffinity + prlimit64 ---
+    syscall::debug_puts(b"  init: Phase 134 linux sched/prlimit...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+
+                        // 1. sched_getaffinity(0, 8, &mask) — NR 204
+                        let mut mask = [0u8; 8];
+                        let r = linux!(204u64, 0u64, 8u64, mask.as_mut_ptr() as u64);
+                        // Should return number of bytes (8)
+                        if r == 0 || r > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
+                        }
+                        // CPU 0 should be set
+                        if core::ptr::read_volatile(&mask[0]) & 1 == 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 11u64, options(noreturn));
+                        }
+
+                        // 2. prlimit64(0, RLIMIT_NOFILE=7, NULL, &old) — NR 302
+                        let mut rlim = [0u8; 16];
+                        let r = linux!(302u64, 0u64, 7u64, 0u64, rlim.as_mut_ptr() as u64);
+                        if r > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 12u64, options(noreturn));
+                        }
+                        // rlim_cur should be 1024
+                        let cur = u64::from_le_bytes([
+                            core::ptr::read_volatile(&rlim[0]),
+                            core::ptr::read_volatile(&rlim[1]),
+                            core::ptr::read_volatile(&rlim[2]),
+                            core::ptr::read_volatile(&rlim[3]),
+                            core::ptr::read_volatile(&rlim[4]),
+                            core::ptr::read_volatile(&rlim[5]),
+                            core::ptr::read_volatile(&rlim[6]),
+                            core::ptr::read_volatile(&rlim[7]),
+                        ]);
+                        if cur != 1024 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 13u64, options(noreturn));
+                        }
+
+                        // 3. prlimit64(0, RLIMIT_STACK=3, NULL, &old) — NR 302
+                        let mut rlim2 = [0u8; 16];
+                        let r = linux!(302u64, 0u64, 3u64, 0u64, rlim2.as_mut_ptr() as u64);
+                        if r > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 14u64, options(noreturn));
+                        }
+                        // rlim_cur should be 8MB = 8388608
+                        let cur2 = u64::from_le_bytes([
+                            core::ptr::read_volatile(&rlim2[0]),
+                            core::ptr::read_volatile(&rlim2[1]),
+                            core::ptr::read_volatile(&rlim2[2]),
+                            core::ptr::read_volatile(&rlim2[3]),
+                            core::ptr::read_volatile(&rlim2[4]),
+                            core::ptr::read_volatile(&rlim2[5]),
+                            core::ptr::read_volatile(&rlim2[6]),
+                            core::ptr::read_volatile(&rlim2[7]),
+                        ]);
+                        if cur2 != 8 * 1024 * 1024 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 15u64, options(noreturn));
+                        }
+
+                        // All passed
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 134 linux sched/prlimit: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 134 linux sched/prlimit: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 134 linux sched/prlimit: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 134 linux sched/prlimit: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
