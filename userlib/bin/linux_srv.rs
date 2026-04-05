@@ -41,6 +41,7 @@ const __NR_WAIT4: u64 = 61;
 const __NR_UNAME: u64 = 63;
 const __NR_GETCWD: u64 = 79;
 const __NR_READLINK: u64 = 89;
+const __NR_UMASK: u64 = 95;
 const __NR_GETUID: u64 = 102;
 const __NR_GETGID: u64 = 104;
 const __NR_GETEUID: u64 = 107;
@@ -65,6 +66,8 @@ const __NR_MKDIR: u64 = 83;
 const __NR_RMDIR: u64 = 84;
 const __NR_UNLINK: u64 = 87;
 const __NR_UNLINKAT: u64 = 263;
+const __NR_FACCESSAT: u64 = 269;
+const __NR_READLINKAT: u64 = 267;
 const __NR_MKDIRAT: u64 = 258;
 
 // Phase 127: additional syscall numbers
@@ -318,6 +321,7 @@ struct ProcessState {
     brk_current: usize,
     cwd: [u8; 64],
     cwd_len: usize,
+    umask: u32,
 }
 
 impl ProcessState {
@@ -330,6 +334,7 @@ impl ProcessState {
             brk_current: 0,
             cwd: [0u8; 64],
             cwd_len: 0,
+            umask: 0,
         }
     }
 }
@@ -464,6 +469,7 @@ fn get_or_init_proc(port: u64) -> Option<usize> {
                 PROC_TABLE[i].port = port;
                 PROC_TABLE[i].cwd[0] = b'/';
                 PROC_TABLE[i].cwd_len = 1;
+                PROC_TABLE[i].umask = 0o022;
                 return Some(i);
             }
         }
@@ -1363,37 +1369,36 @@ fn handle_getcwd(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     buf_va as u64
 }
 
-/// Handle Linux access(path, mode).
-fn handle_access(caller_port: u64, args: &[u64; 6]) -> u64 {
-    let path_va = args[0] as usize;
-    let _mode = args[1];
+/// Handle Linux umask(mask).
+fn handle_umask(pi: usize, args: &[u64; 6]) -> u64 {
+    let new_mask = (args[0] & 0o777) as u32;
+    let old = unsafe { PROC_TABLE[pi].umask };
+    unsafe { PROC_TABLE[pi].umask = new_mask; }
+    old as u64
+}
 
-    // Check if path exists via VFS stat.
-    let stat_args: [u64; 6] = [path_va as u64, 0, 0, 0, 0, 0];
-    // We can't call handle_stat without a statbuf, so just try VFS_STAT.
+/// Handle Linux access(path, mode) — existence check via VFS_STAT.
+fn handle_access(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let path_va = args[0] as usize;
+
     let vfs_port = unsafe { VFS_PORT };
     let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
 
-    let mut path = [0u8; 16];
-    let copied = syscall::personality_copy_in(caller_port, path_va, &mut path);
-    if copied == 0 {
+    let (path, pathlen) = resolve_path(pi, caller_port, path_va);
+    if pathlen == 0 {
         return linux_err(EFAULT);
     }
-    let pathlen = path.iter().position(|&b| b == 0).unwrap_or(copied);
 
-    let mut w0 = 0u64;
-    let mut w1 = 0u64;
-    for i in 0..pathlen.min(8) {
-        w0 |= (path[i] as u64) << (i * 8);
-    }
-    for i in 8..pathlen.min(16) {
-        w1 |= (path[i] as u64) << ((i - 8) * 8);
+    // Root "/" and other well-known dirs always exist — skip VFS round-trip.
+    if pathlen == 1 && path[0] == b'/' {
+        return 0;
     }
 
-    let d2 = (pathlen as u64) | ((reply_port) << 32);
+    let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
+    let d2 = plen | ((reply_port) << 32);
     syscall::send(vfs_port, VFS_STAT, w0, w1, d2, 0);
 
     let resp = match syscall::recv_msg(reply_port) {
@@ -1407,9 +1412,88 @@ fn handle_access(caller_port: u64, args: &[u64; 6]) -> u64 {
     0
 }
 
-/// Handle Linux readlink(path, buf, bufsiz).
-fn handle_readlink(_caller_port: u64, _args: &[u64; 6]) -> u64 {
+/// Handle Linux faccessat(dirfd, path, mode, flags).
+fn handle_faccessat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let dirfd = args[0] as i64;
+    const AT_FDCWD: i64 = -100;
+    if dirfd != AT_FDCWD && dirfd >= 0 {
+        return linux_err(ENOSYS);
+    }
+    // Shift args so path is in [0], mode in [1].
+    let shifted: [u64; 6] = [args[1], args[2], args[3], 0, 0, 0];
+    handle_access(pi, caller_port, &shifted)
+}
+
+/// Handle Linux readlinkat(dirfd, path, buf, bufsiz).
+fn handle_readlinkat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let dirfd = args[0] as i64;
+    let path_va = args[1] as usize;
+    let buf_va = args[2] as usize;
+    let bufsiz = args[3] as usize;
+    const AT_FDCWD: i64 = -100;
+
+    if dirfd != AT_FDCWD && dirfd >= 0 {
+        return linux_err(ENOSYS);
+    }
+    if bufsiz == 0 {
+        return linux_err(EINVAL);
+    }
+
+    // Read the path from caller.
+    let mut raw = [0u8; 64];
+    let copied = syscall::personality_copy_in(caller_port, path_va, &mut raw);
+    if copied == 0 {
+        return linux_err(EFAULT);
+    }
+    let raw_len = raw[..copied].iter().position(|&b| b == 0).unwrap_or(copied);
+
+    // Check for /proc/self/exe
+    let proc_self_exe = b"/proc/self/exe";
+    if raw_len == proc_self_exe.len() && raw[..raw_len] == proc_self_exe[..] {
+        let result = b"/bin/unknown";
+        let out_len = result.len().min(bufsiz);
+        syscall::personality_copy_out(caller_port, buf_va, &result[..out_len]);
+        return out_len as u64;
+    }
+
+    // Check for /proc/self/fd/N
+    let proc_self_fd = b"/proc/self/fd/";
+    if raw_len > proc_self_fd.len() && raw[..proc_self_fd.len()] == proc_self_fd[..] {
+        // Parse FD number.
+        let mut fd_num: usize = 0;
+        for i in proc_self_fd.len()..raw_len {
+            let c = raw[i];
+            if c < b'0' || c > b'9' {
+                return linux_err(EINVAL);
+            }
+            fd_num = fd_num * 10 + (c - b'0') as usize;
+        }
+        if fd_num >= MAX_FDS {
+            return linux_err(EBADF);
+        }
+        let entry = unsafe { &PROC_TABLE[pi].fds[fd_num] };
+        if !entry.in_use {
+            return linux_err(EBADF);
+        }
+        // Return a synthetic path based on FD kind.
+        let result: &[u8] = match entry.kind {
+            FdKind::Pipe => b"/dev/pipe",
+            FdKind::Socket => b"/dev/socket",
+            _ => b"/dev/fd",
+        };
+        let out_len = result.len().min(bufsiz);
+        syscall::personality_copy_out(caller_port, buf_va, &result[..out_len]);
+        return out_len as u64;
+    }
+
     linux_err(EINVAL)
+}
+
+/// Handle Linux readlink(path, buf, bufsiz).
+fn handle_readlink(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    const AT_FDCWD_U64: u64 = (-100i64) as u64;
+    let shifted: [u64; 6] = [AT_FDCWD_U64, args[0], args[1], args[2], 0, 0];
+    handle_readlinkat(pi, caller_port, &shifted)
 }
 
 /// Read from a pipe FD into the caller's buffer via personality_copy_out.
@@ -4062,11 +4146,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_FSTAT => handle_fstat(pi, caller_port, &msg.data),
             __NR_LSEEK => handle_lseek(pi, &msg.data),
             __NR_WRITEV => handle_writev(pi, caller_port, &msg.data),
-            __NR_ACCESS => handle_access(caller_port, &msg.data),
+            __NR_ACCESS => handle_access(pi, caller_port, &msg.data),
             __NR_DUP => handle_dup(pi, &msg.data),
             __NR_DUP2 => handle_dup2(pi, &msg.data),
             __NR_GETCWD => handle_getcwd(pi, caller_port, &msg.data),
-            __NR_READLINK => handle_readlink(caller_port, &msg.data),
+            __NR_READLINK => handle_readlink(pi, caller_port, &msg.data),
+            __NR_READLINKAT => handle_readlinkat(pi, caller_port, &msg.data),
+            __NR_UMASK => handle_umask(pi, &msg.data),
+            __NR_FACCESSAT => handle_faccessat(pi, caller_port, &msg.data),
             __NR_OPENAT => handle_openat(pi, caller_port, &msg.data),
             __NR_MKDIR => handle_mkdir(pi, caller_port, &msg.data),
             __NR_MKDIRAT => handle_mkdirat(pi, caller_port, &msg.data),
