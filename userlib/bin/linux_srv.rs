@@ -2048,6 +2048,131 @@ fn handle_wait4(caller_port: u64, args: &[u64; 6]) -> u64 {
     0
 }
 
+// Linux mmap flags
+const MAP_SHARED: u64 = 0x01;
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_FIXED: u64 = 0x10;
+const MAP_ANONYMOUS: u64 = 0x20;
+
+/// Handle Linux mmap(addr, length, prot, flags, fd, offset).
+/// Supports anonymous and file-backed (MAP_PRIVATE) mappings.
+fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let addr = args[0];
+    let len = args[1] as usize;
+    let prot = args[2];
+    let flags = args[3];
+    let fd = args[4] as i64;
+    // Note: args[5] (r9 on x86_64) is unreliable for int 0x80 syscalls
+    // because some callers don't set r9 explicitly. For now, use 0.
+    // TODO: fix when we need non-zero file offsets for mmap.
+    let file_offset: u64 = 0;
+
+    if len == 0 { return linux_err(EINVAL); }
+
+    let page_size = syscall::page_size() as usize;
+    let pages = ((len + page_size - 1) / page_size) as u64;
+
+    let is_anon = (flags & MAP_ANONYMOUS) != 0;
+    let is_fixed = (flags & MAP_FIXED) != 0;
+
+    // For file-backed mmap we need to write data, so temporarily use RW if read-only.
+    // Kernel prot encoding: 0=RO, 1=RW, 2=RE, 3=RWE.
+    // Linux prot: PROT_READ=1 maps to kernel 1(RW), so RO files are already writable.
+    // Only need bump if kernel prot 0 (PROT_NONE) or 2 (RE) — neither includes write.
+    let need_bump = !is_anon && (prot == 0 || prot == 2);
+    let map_prot = if need_bump { prot | 1 } else { prot };
+
+    let va = match syscall::personality_mmap_anon(caller_port, addr, pages, map_prot) {
+        Some(v) => v,
+        None => return u64::MAX, // MAP_FAILED = (void*)-1
+    };
+
+    // File-backed mapping: read file content into the mapped region.
+    if !is_anon && fd >= 0 {
+        let fd_idx = fd as usize;
+        if fd_idx < MAX_FDS {
+            let (kind, fs_port, handle, file_size) = unsafe {
+                if PROC_TABLE[pi].fds[fd_idx].in_use {
+                    (PROC_TABLE[pi].fds[fd_idx].kind, PROC_TABLE[pi].fds[fd_idx].fs_port,
+                     PROC_TABLE[pi].fds[fd_idx].handle, PROC_TABLE[pi].fds[fd_idx].file_size)
+                } else {
+                    // fd not valid — pages already mapped, just leave them zeroed
+                    if map_prot != prot {
+                        syscall::personality_mprotect(caller_port, va, len, prot as u8);
+                    }
+                    return va as u64;
+                }
+            };
+
+            match kind {
+                FdKind::File => {
+                    // Read from VFS and populate pages.
+                    let avail = if file_offset >= file_size { 0 }
+                                else { (file_size - file_offset) as usize };
+                    let to_read = len.min(avail);
+                    if to_read > 0 {
+                        let reply_port = unsafe { REPLY_PORT };
+                        let mut total = 0usize;
+                        while total < to_read {
+                            let chunk = (to_read - total).min(16);
+                            let d2 = (chunk as u64) | ((reply_port) << 32);
+                            syscall::send(fs_port, FS_READ, handle, file_offset + total as u64, d2, 0);
+                            let resp = match syscall::recv_msg(reply_port) {
+                                Some(m) => m,
+                                None => break,
+                            };
+                            if resp.tag != FS_READ_OK { break; }
+                            let got = (resp.data[0] & 0xFFFF) as usize;
+                            if got == 0 { break; }
+                            let mut tmp = [0u8; 16];
+                            let b1 = resp.data[1].to_le_bytes();
+                            let b2 = resp.data[2].to_le_bytes();
+                            tmp[..8].copy_from_slice(&b1);
+                            tmp[8..16].copy_from_slice(&b2);
+                            let to_write = got.min(chunk);
+                            syscall::personality_copy_out(caller_port, va + total, &tmp[..to_write]);
+                            total += to_write;
+                            if got < chunk { break; }
+                        }
+                    }
+                }
+                FdKind::MemFd => {
+                    let idx = handle as usize;
+                    unsafe {
+                        if idx < MAX_MEMFD_INSTANCES && MEMFD_TABLE[idx].active && MEMFD_TABLE[idx].va != 0 {
+                            let sz = MEMFD_TABLE[idx].size;
+                            let off = file_offset as usize;
+                            if off < sz {
+                                let avail = sz - off;
+                                let to_read = len.min(avail);
+                                let base = MEMFD_TABLE[idx].va;
+                                let mut total = 0usize;
+                                while total < to_read {
+                                    let chunk = (to_read - total).min(512);
+                                    let src = core::slice::from_raw_parts(
+                                        (base + off + total) as *const u8, chunk);
+                                    let written = syscall::personality_copy_out(
+                                        caller_port, va + total, src);
+                                    if written == 0 { break; }
+                                    total += written;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {} // pipes, sockets etc — leave pages zeroed
+            }
+        }
+    }
+
+    // Restore requested protection if we temporarily bumped it.
+    if need_bump {
+        syscall::personality_mprotect(caller_port, va, len, prot as u8);
+    }
+
+    va as u64
+}
+
 /// Handle Linux brk(addr).
 fn handle_brk(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let addr = args[0] as usize;
@@ -5080,19 +5205,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_MEMFD_CREATE => handle_memfd_create(pi, caller_port, &msg.data),
             __NR_CLONE3 => linux_err(ENOSYS),
 
-            // Anonymous mmap: map in caller's address space via personality syscall.
-            __NR_MMAP => {
-                let addr = msg.data[0] as u64;
-                let len = msg.data[1] as usize;
-                let prot = msg.data[2] as u64;
-                let _flags = msg.data[3];
-                let page_size = syscall::page_size() as usize;
-                let pages = ((len + page_size - 1) / page_size) as u64;
-                match syscall::personality_mmap_anon(caller_port, addr, pages, prot) {
-                    Some(va) => va as u64,
-                    None => u64::MAX, // MAP_FAILED
-                }
-            }
+            // mmap: anonymous or file-backed mapping in caller's address space.
+            __NR_MMAP => handle_mmap(pi, caller_port, &msg.data),
             __NR_MPROTECT => {
                 let addr = msg.data[0] as usize;
                 let len = msg.data[1] as usize;

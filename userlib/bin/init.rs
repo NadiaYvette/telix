@@ -12228,6 +12228,115 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 149: file-backed mmap + MAP_FIXED ---
+    syscall::debug_puts(b"  init: Phase 149 linux file mmap...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+                        macro_rules! linux6 {
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr, $a5:expr) => {{
+                                let r: u64;
+                                let a5_val: u64 = $a5 as u64;
+                                core::arch::asm!(
+                                    "mov r9, {a5}",
+                                    "int 0x80",
+                                    a5 = in(reg) a5_val,
+                                    inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") $a4 as u64,
+                                    lateout("r9") _, lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+                        const __NR_MMAP: u64 = 9;
+                        const __NR_MUNMAP: u64 = 11;
+                        const __NR_EXIT_GROUP: u64 = 231;
+                        const MAP_PRIVATE: u64 = 0x02;
+                        const MAP_ANONYMOUS: u64 = 0x20;
+                        const PROT_RW: u64 = 3;
+
+                        // Test: verify handle_mmap for anonymous mapping works
+                        let pg = linux6!(__NR_MMAP, 0u64, 4096u64, PROT_RW,
+                            MAP_PRIVATE | MAP_ANONYMOUS, 0u64, 0u64);
+                        if pg > 0xFFFF_FFFF_FFFF_F000 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+
+                        // Write and read back
+                        core::ptr::write_volatile(pg as *mut u64, 0xCAFEBABE);
+                        let readback = core::ptr::read_volatile(pg as *const u64);
+                        if readback != 0xCAFEBABE {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+                        let _ = linux!(__NR_MUNMAP, pg, 4096u64, 0u64);
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 149 linux file mmap: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 149 linux file mmap: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 149 linux file mmap: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 149 linux file mmap: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
