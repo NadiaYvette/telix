@@ -172,6 +172,7 @@ const ENOTCONN: u64 = 107;
 const ESRCH: u64 = 3;
 const ECONNREFUSED: u64 = 111;
 const EOPNOTSUPP: u64 = 95;
+const ENOPROTOOPT: u64 = 92;
 
 // Socket address families
 const AF_UNIX: u64 = 1;
@@ -4217,53 +4218,172 @@ fn handle_getpeername(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux setsockopt — stub that returns 0.
-fn handle_setsockopt(_pi: usize, _caller_port: u64, _args: &[u64; 6]) -> u64 {
-    0
-}
-
-/// Handle Linux getsockopt — stub, with SO_PEERCRED special case.
-fn handle_getsockopt(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+/// Handle Linux setsockopt(fd, level, optname, optval, optlen).
+/// Validates common options and returns success for known-safe ones.
+fn handle_setsockopt(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
     let level = args[1];
     let optname = args[2];
-    let optval_va = args[3] as usize; // note: getsockopt arg3 is r10
-    // args[4] = optlen ptr
+    let optval_va = args[3] as usize;
+    let optlen = args[4] as usize;
 
-    const SOL_SOCKET: u64 = 1;
-    const SO_PEERCRED: u64 = 17;
-
-    if level == SOL_SOCKET && optname == SO_PEERCRED {
-        if fd >= MAX_FDS { return linux_err(EBADF); }
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    if fd >= 3 {
         unsafe {
             if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
                 return linux_err(ENOTSOCK);
             }
-            if PROC_TABLE[pi].fds[fd].sock_domain == AF_UNIX as u8 {
-                let rp = syscall::port_create();
-                let d2 = (rp as u64) << 32;
-                syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_GETPEERCRED, PROC_TABLE[pi].fds[fd].handle, 0, d2, 0);
-                let resp = match syscall::recv_msg(rp) {
-                    Some(m) => m,
-                    None => { syscall::port_destroy(rp); return linux_err(ENOTCONN); }
-                };
-                syscall::port_destroy(rp);
-                if resp.tag == UDS_OK && optval_va != 0 {
-                    // struct ucred: pid(i32) + uid(u32) + gid(u32) = 12 bytes
-                    let pid = resp.data[0] as u32;
-                    let uid_gid = resp.data[1];
-                    let uid = uid_gid as u32;
-                    let gid = (uid_gid >> 32) as u32;
-                    let mut ucred = [0u8; 12];
-                    ucred[0..4].copy_from_slice(&pid.to_le_bytes());
-                    ucred[4..8].copy_from_slice(&uid.to_le_bytes());
-                    ucred[8..12].copy_from_slice(&gid.to_le_bytes());
-                    let _ = syscall::personality_copy_out(caller_port, optval_va, &ucred);
-                }
-                return 0;
+        }
+    }
+
+    const SOL_SOCKET_L: u64 = 1;
+    const SOL_TCP: u64 = 6;
+    const SOL_IPV6: u64 = 41;
+    const SO_REUSEADDR: u64 = 2;
+    const SO_KEEPALIVE: u64 = 9;
+    const SO_REUSEPORT: u64 = 15;
+    const SO_RCVBUF: u64 = 8;
+    const SO_SNDBUF: u64 = 7;
+    const SO_LINGER: u64 = 13;
+    const SO_PASSCRED: u64 = 16;
+    const TCP_NODELAY: u64 = 1;
+    const IPV6_V6ONLY: u64 = 26;
+
+    // Read option value if provided (most are int-sized).
+    let mut val: u32 = 0;
+    if optval_va != 0 && optlen >= 4 {
+        let mut buf = [0u8; 4];
+        if syscall::personality_copy_in(caller_port, optval_va, &mut buf) >= 4 {
+            val = u32::from_le_bytes(buf);
+        }
+    }
+    let _ = val; // Options are accepted but not acted upon yet.
+
+    match level {
+        SOL_SOCKET_L => match optname {
+            SO_REUSEADDR | SO_REUSEPORT | SO_KEEPALIVE | SO_RCVBUF |
+            SO_SNDBUF | SO_LINGER | SO_PASSCRED => 0,
+            _ => 0, // Accept unknown socket options silently.
+        },
+        SOL_TCP => match optname {
+            TCP_NODELAY => 0,
+            _ => 0,
+        },
+        SOL_IPV6 => match optname {
+            IPV6_V6ONLY => 0,
+            _ => 0,
+        },
+        _ => 0, // Accept all levels silently.
+    }
+}
+
+/// Handle Linux getsockopt(fd, level, optname, optval, optlen).
+fn handle_getsockopt(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let level = args[1];
+    let optname = args[2];
+    let optval_va = args[3] as usize;
+    let optlen_va = args[4] as usize;
+
+    const SOL_SOCKET_L: u64 = 1;
+    const SO_PEERCRED: u64 = 17;
+    const SO_ERROR: u64 = 4;
+    const SO_TYPE: u64 = 3;
+    const SO_REUSEADDR: u64 = 2;
+    const SO_KEEPALIVE: u64 = 9;
+    const SO_SNDBUF: u64 = 7;
+    const SO_RCVBUF: u64 = 8;
+
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    if fd >= 3 {
+        unsafe {
+            if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
+                return linux_err(ENOTSOCK);
             }
         }
     }
-    0 // Default: silently succeed.
+
+    if level == SOL_SOCKET_L {
+        match optname {
+            SO_PEERCRED => {
+                unsafe {
+                    if PROC_TABLE[pi].fds[fd].sock_domain == AF_UNIX as u8 {
+                        let rp = syscall::port_create();
+                        let d2 = (rp as u64) << 32;
+                        syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_GETPEERCRED, PROC_TABLE[pi].fds[fd].handle, 0, d2, 0);
+                        let resp = match syscall::recv_msg(rp) {
+                            Some(m) => m,
+                            None => { syscall::port_destroy(rp); return linux_err(ENOTCONN); }
+                        };
+                        syscall::port_destroy(rp);
+                        if resp.tag == UDS_OK && optval_va != 0 {
+                            let pid = resp.data[0] as u32;
+                            let uid_gid = resp.data[1];
+                            let uid = uid_gid as u32;
+                            let gid = (uid_gid >> 32) as u32;
+                            let mut ucred = [0u8; 12];
+                            ucred[0..4].copy_from_slice(&pid.to_le_bytes());
+                            ucred[4..8].copy_from_slice(&uid.to_le_bytes());
+                            ucred[8..12].copy_from_slice(&gid.to_le_bytes());
+                            syscall::personality_copy_out(caller_port, optval_va, &ucred);
+                            if optlen_va != 0 {
+                                syscall::personality_copy_out(caller_port, optlen_va, &12u32.to_le_bytes());
+                            }
+                        }
+                        return 0;
+                    }
+                }
+                linux_err(ENOPROTOOPT)
+            }
+            SO_ERROR => {
+                // Return 0 (no pending error).
+                if optval_va != 0 {
+                    syscall::personality_copy_out(caller_port, optval_va, &0u32.to_le_bytes());
+                    if optlen_va != 0 {
+                        syscall::personality_copy_out(caller_port, optlen_va, &4u32.to_le_bytes());
+                    }
+                }
+                0
+            }
+            SO_TYPE => {
+                // Return SOCK_STREAM (1) or SOCK_DGRAM (2).
+                let stype: u32 = unsafe {
+                    if PROC_TABLE[pi].fds[fd].sock_type == 2 { 2 } else { 1 }
+                };
+                if optval_va != 0 {
+                    syscall::personality_copy_out(caller_port, optval_va, &stype.to_le_bytes());
+                    if optlen_va != 0 {
+                        syscall::personality_copy_out(caller_port, optlen_va, &4u32.to_le_bytes());
+                    }
+                }
+                0
+            }
+            SO_REUSEADDR | SO_KEEPALIVE => {
+                // Return 0 (not set).
+                if optval_va != 0 {
+                    syscall::personality_copy_out(caller_port, optval_va, &0u32.to_le_bytes());
+                    if optlen_va != 0 {
+                        syscall::personality_copy_out(caller_port, optlen_va, &4u32.to_le_bytes());
+                    }
+                }
+                0
+            }
+            SO_SNDBUF | SO_RCVBUF => {
+                // Return 128KB default.
+                let val: u32 = 131072;
+                if optval_va != 0 {
+                    syscall::personality_copy_out(caller_port, optval_va, &val.to_le_bytes());
+                    if optlen_va != 0 {
+                        syscall::personality_copy_out(caller_port, optlen_va, &4u32.to_le_bytes());
+                    }
+                }
+                0
+            }
+            _ => 0, // Unknown: silently succeed.
+        }
+    } else {
+        0 // Non-SOL_SOCKET: silently succeed.
+    }
 }
 
 // ---- Epoll handlers ----
