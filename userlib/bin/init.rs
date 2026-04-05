@@ -10606,6 +10606,193 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 138: pread64, pwrite64, readv, lstat, sigaltstack ---
+    syscall::debug_puts(b"  init: Phase 138 linux positional I/O...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") 0u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+
+                        // 1. memfd_create("test", 0) to get a writable fd — NR 319
+                        let name = *b"test\0";
+                        let mfd = linux!(319u64, name.as_ptr() as u64, 0u64);
+                        if mfd > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
+                        }
+
+                        // 2. write(mfd, "Hello pread!", 12) — NR 1
+                        let msg = *b"Hello pread!";
+                        let wr = linux!(1u64, mfd, msg.as_ptr() as u64, 12u64);
+                        if wr != 12 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 11u64, options(noreturn));
+                        }
+
+                        // 3. pread64(mfd, buf, 5, 6) — NR 17 — read "pread" at offset 6
+                        let mut pbuf = [0u8; 8];
+                        let pr = linux!(17u64, mfd, pbuf.as_mut_ptr() as u64, 5u64, 6u64);
+                        if pr != 5 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 12u64, options(noreturn));
+                        }
+                        // Verify contents: "pread"
+                        if core::ptr::read_volatile(&pbuf[0]) != b'p'
+                            || core::ptr::read_volatile(&pbuf[1]) != b'r'
+                            || core::ptr::read_volatile(&pbuf[2]) != b'e'
+                            || core::ptr::read_volatile(&pbuf[3]) != b'a'
+                            || core::ptr::read_volatile(&pbuf[4]) != b'd' {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 13u64, options(noreturn));
+                        }
+
+                        // 4. Verify fd offset unchanged: read(mfd, buf, 1) should return 0
+                        //    (offset is still at 12 from the write, which is EOF)
+                        let mut rbuf = [0u8; 1];
+                        let rr = linux!(0u64, mfd, rbuf.as_mut_ptr() as u64, 1u64);
+                        if rr != 0 {
+                            // Not EOF — pread64 must have advanced the offset.
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 14u64, options(noreturn));
+                        }
+
+                        // 5. pwrite64(mfd, "XY", 2, 0) — NR 18 — overwrite first 2 bytes
+                        let ow = *b"XY";
+                        let pw = linux!(18u64, mfd, ow.as_ptr() as u64, 2u64, 0u64);
+                        if pw != 2 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 15u64, options(noreturn));
+                        }
+
+                        // 6. pread64 at offset 0 to verify "XY"
+                        let mut vbuf = [0u8; 2];
+                        let vr = linux!(17u64, mfd, vbuf.as_mut_ptr() as u64, 2u64, 0u64);
+                        if vr != 2 || core::ptr::read_volatile(&vbuf[0]) != b'X'
+                                   || core::ptr::read_volatile(&vbuf[1]) != b'Y' {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 16u64, options(noreturn));
+                        }
+
+                        // 7. readv(mfd, iov, 2) — NR 19 — scatter read from offset 12 (EOF)
+                        //    First lseek back to 0.
+                        linux!(8u64, mfd, 0u64, 0u64); // lseek(mfd, 0, SEEK_SET)
+                        let mut b1 = [0u8; 4];
+                        let mut b2 = [0u8; 4];
+                        #[repr(C)]
+                        struct Iov { base: u64, len: u64 }
+                        let iovs = [
+                            Iov { base: b1.as_mut_ptr() as u64, len: 4 },
+                            Iov { base: b2.as_mut_ptr() as u64, len: 4 },
+                        ];
+                        let rv = linux!(19u64, mfd, iovs.as_ptr() as u64, 2u64);
+                        if rv != 8 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 17u64, options(noreturn));
+                        }
+                        // b1 should be "XYll" (we wrote "XY" over "He"), b2 should be "o pr"
+                        if core::ptr::read_volatile(&b1[0]) != b'X'
+                            || core::ptr::read_volatile(&b1[1]) != b'Y' {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 18u64, options(noreturn));
+                        }
+
+                        // 8. sigaltstack(NULL, NULL) — NR 131 — should return 0
+                        let sa = linux!(131u64, 0u64, 0u64);
+                        if sa > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 19u64, options(noreturn));
+                        }
+
+                        // 9. close + exit 0
+                        linux!(3u64, mfd);
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 138 linux positional I/O: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 138 linux positional I/O: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 138 linux positional I/O: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 138 linux positional I/O: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

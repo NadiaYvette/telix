@@ -123,6 +123,11 @@ const __NR_TIMERFD_SETTIME: u64 = 286;
 const __NR_TIMERFD_GETTIME: u64 = 287;
 const __NR_EVENTFD2: u64 = 290;
 const __NR_MEMFD_CREATE: u64 = 319;
+const __NR_LSTAT: u64 = 6;
+const __NR_PREAD64: u64 = 17;
+const __NR_PWRITE64: u64 = 18;
+const __NR_READV: u64 = 19;
+const __NR_SIGALTSTACK: u64 = 131;
 const __NR_STATX: u64 = 332;
 const __NR_CLONE3: u64 = 435;
 
@@ -264,7 +269,7 @@ const EPOLL_CTL_MOD: u64 = 3;
 const _EPOLL_CLOEXEC: u64 = 0x80000;
 
 const MAX_FDS: usize = 64;
-const MAX_PROCS: usize = 16;
+const MAX_PROCS: usize = 32;
 const MAX_EPOLL_INSTANCES: usize = 16;
 const MAX_EPOLL_WATCHES: usize = 16;
 
@@ -803,6 +808,192 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         }
     }
     total as u64
+}
+
+/// Handle Linux pread64(fd, buf, count, offset).
+/// Like read() but uses caller-supplied offset and does NOT update the fd offset.
+fn handle_pread64(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let buf_va = args[1] as usize;
+    let count = args[2] as usize;
+    let offset = args[3];
+
+    if buf_va == 0 || count == 0 { return 0; }
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+
+    let (kind, fs_port, handle, file_size) = unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use { return linux_err(EBADF); }
+        (PROC_TABLE[pi].fds[fd].kind, PROC_TABLE[pi].fds[fd].fs_port,
+         PROC_TABLE[pi].fds[fd].handle, PROC_TABLE[pi].fds[fd].file_size)
+    };
+
+    // pread64 is not valid on pipes, sockets, eventfds, timerfds.
+    match kind {
+        FdKind::Pipe | FdKind::Socket | FdKind::EventFd | FdKind::TimerFd | FdKind::Epoll => {
+            return linux_err(ESPIPE);
+        }
+        _ => {}
+    }
+
+    if kind == FdKind::MemFd {
+        let idx = handle as usize;
+        unsafe {
+            if idx >= MAX_MEMFD_INSTANCES || !MEMFD_TABLE[idx].active {
+                return linux_err(EBADF);
+            }
+            let sz = MEMFD_TABLE[idx].size;
+            if offset as usize >= sz { return 0; }
+            let avail = sz - offset as usize;
+            let want = count.min(avail);
+            if MEMFD_TABLE[idx].va == 0 || want == 0 { return 0; }
+            let base = MEMFD_TABLE[idx].va;
+            let mut total = 0usize;
+            while total < want {
+                let chunk = (want - total).min(512);
+                let src = core::slice::from_raw_parts((base + offset as usize + total) as *const u8, chunk);
+                let written = syscall::personality_copy_out(caller_port, buf_va + total, src);
+                if written == 0 { break; }
+                total += written;
+            }
+            // Do NOT update fd offset.
+            return total as u64;
+        }
+    }
+
+    // Regular file via FS server.
+    if offset >= file_size { return 0; }
+    let reply_port = unsafe { REPLY_PORT };
+    let remaining = (file_size - offset) as usize;
+    let want = count.min(remaining);
+    let mut total = 0usize;
+
+    while total < want {
+        let chunk = (want - total).min(16);
+        let d2 = (chunk as u64) | ((reply_port) << 32);
+        syscall::send(fs_port, FS_READ, handle, offset + total as u64, d2, 0);
+        let resp = match syscall::recv_msg(reply_port) {
+            Some(m) => m,
+            None => break,
+        };
+        if resp.tag != FS_READ_OK { break; }
+        let got = (resp.data[0] & 0xFFFF) as usize;
+        if got == 0 { break; }
+        let mut tmp = [0u8; 16];
+        let b1 = resp.data[1].to_le_bytes();
+        let b2 = resp.data[2].to_le_bytes();
+        tmp[..8].copy_from_slice(&b1);
+        tmp[8..16].copy_from_slice(&b2);
+        let to_write = got.min(chunk);
+        let written = syscall::personality_copy_out(caller_port, buf_va + total, &tmp[..to_write]);
+        if written == 0 { return if total > 0 { total as u64 } else { linux_err(EFAULT) }; }
+        total += to_write;
+        // Do NOT update fd offset.
+        if got < chunk { break; }
+    }
+    total as u64
+}
+
+/// Handle Linux pwrite64(fd, buf, count, offset).
+/// Like write() but uses caller-supplied offset and does NOT update the fd offset.
+fn handle_pwrite64(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd_idx = args[0] as usize;
+    let buf_va = args[1] as usize;
+    let count = args[2] as usize;
+    let offset = args[3] as usize;
+
+    if buf_va == 0 || count == 0 { return 0; }
+    if fd_idx >= MAX_FDS { return linux_err(EBADF); }
+
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd_idx].in_use { return linux_err(EBADF); }
+        let kind = PROC_TABLE[pi].fds[fd_idx].kind;
+
+        match kind {
+            FdKind::Pipe | FdKind::Socket | FdKind::EventFd | FdKind::TimerFd | FdKind::Epoll => {
+                return linux_err(ESPIPE);
+            }
+            _ => {}
+        }
+
+        if kind == FdKind::MemFd {
+            let idx = PROC_TABLE[pi].fds[fd_idx].handle as usize;
+            if idx >= MAX_MEMFD_INSTANCES || !MEMFD_TABLE[idx].active {
+                return linux_err(EBADF);
+            }
+            let needed = offset + count;
+            if needed > MEMFD_TABLE[idx].capacity {
+                let ps = syscall::page_size();
+                let new_pages = (needed + ps - 1) / ps;
+                let new_cap = new_pages * ps;
+                match syscall::mmap_anon(0, new_pages, 1) {
+                    Some(new_va) => {
+                        if MEMFD_TABLE[idx].va != 0 && MEMFD_TABLE[idx].size > 0 {
+                            let old_ptr = MEMFD_TABLE[idx].va as *const u8;
+                            let new_ptr = new_va as *mut u8;
+                            core::ptr::copy_nonoverlapping(old_ptr, new_ptr, MEMFD_TABLE[idx].size);
+                            syscall::munmap(MEMFD_TABLE[idx].va);
+                        }
+                        MEMFD_TABLE[idx].va = new_va;
+                        MEMFD_TABLE[idx].capacity = new_cap;
+                    }
+                    None => return linux_err(ENOMEM),
+                }
+            }
+            let base = MEMFD_TABLE[idx].va;
+            let mut total = 0usize;
+            while total < count {
+                let chunk = (count - total).min(512);
+                let dst = core::slice::from_raw_parts_mut((base + offset + total) as *mut u8, chunk);
+                let copied = syscall::personality_copy_in(caller_port, buf_va + total, dst);
+                if copied == 0 { break; }
+                total += copied;
+            }
+            let new_end = offset + total;
+            if new_end > MEMFD_TABLE[idx].size {
+                MEMFD_TABLE[idx].size = new_end;
+                PROC_TABLE[pi].fds[fd_idx].file_size = new_end as u64;
+            }
+            // Do NOT update fd offset.
+            return total as u64;
+        }
+
+        // Regular file write via FS: not supported yet.
+        linux_err(EBADF)
+    }
+}
+
+/// Handle Linux readv(fd, iov, iovcnt).
+fn handle_readv(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0];
+    let iov_va = args[1] as usize;
+    let iovcnt = args[2] as usize;
+
+    if iovcnt == 0 { return 0; }
+    if iov_va == 0 || iovcnt > 1024 { return linux_err(EINVAL); }
+
+    let mut total = 0u64;
+    for i in 0..iovcnt {
+        let mut iov_buf = [0u8; 16];
+        let copied = syscall::personality_copy_in(caller_port, iov_va + i * 16, &mut iov_buf);
+        if copied < 16 {
+            return if total > 0 { total } else { linux_err(EFAULT) };
+        }
+        let base = u64::from_le_bytes([iov_buf[0], iov_buf[1], iov_buf[2], iov_buf[3],
+                                        iov_buf[4], iov_buf[5], iov_buf[6], iov_buf[7]]);
+        let len = u64::from_le_bytes([iov_buf[8], iov_buf[9], iov_buf[10], iov_buf[11],
+                                       iov_buf[12], iov_buf[13], iov_buf[14], iov_buf[15]]);
+        if len == 0 { continue; }
+        if base == 0 { return if total > 0 { total } else { linux_err(EFAULT) }; }
+
+        let read_args: [u64; 6] = [fd, base, len, 0, 0, 0];
+        let r = handle_read(pi, caller_port, &read_args);
+        if (r as i64) < 0 {
+            return if total > 0 { total } else { r };
+        }
+        total += r;
+        if r < len { break; } // Short read — don't continue to next iovec.
+    }
+    total
 }
 
 /// Open a file via VFS. Returns fd or negated errno.
@@ -4139,10 +4330,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         let result = match linux_nr {
             __NR_READ => handle_read(pi, caller_port, &msg.data),
+            __NR_PREAD64 => handle_pread64(pi, caller_port, &msg.data),
+            __NR_PWRITE64 => handle_pwrite64(pi, caller_port, &msg.data),
+            __NR_READV => handle_readv(pi, caller_port, &msg.data),
             __NR_WRITE => handle_write(pi, caller_port, &msg.data),
             __NR_OPEN => handle_open(pi, caller_port, &msg.data),
             __NR_CLOSE => handle_close(pi, &msg.data),
-            __NR_STAT | __NR_NEWFSTATAT => handle_stat(caller_port, &msg.data),
+            __NR_STAT | __NR_LSTAT | __NR_NEWFSTATAT => handle_stat(caller_port, &msg.data),
             __NR_FSTAT => handle_fstat(pi, caller_port, &msg.data),
             __NR_LSEEK => handle_lseek(pi, &msg.data),
             __NR_WRITEV => handle_writev(pi, caller_port, &msg.data),
@@ -4217,6 +4411,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_RT_SIGACTION => 0,    // Pretend success.
             __NR_RT_SIGPROCMASK => 0,  // Pretend success.
             __NR_RT_SIGRETURN => 0,
+            __NR_SIGALTSTACK => 0,  // stub — no alternate signal stack yet
             __NR_TGKILL => 0,         // Ignore for now.
 
             // Stubs that return success (0) to avoid crashing callers.
