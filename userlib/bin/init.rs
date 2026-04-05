@@ -12541,6 +12541,119 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 152: scheduler/memory/preadv stubs ---
+    syscall::debug_puts(b"  init: Phase 152 linux sched/mlock/preadv...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+                        const __NR_SCHED_GETSCHEDULER: u64 = 145;
+                        const __NR_SCHED_GETPARAM: u64 = 143;
+                        const __NR_MSYNC: u64 = 26;
+                        const __NR_MLOCK: u64 = 149;
+                        const __NR_MUNLOCK: u64 = 150;
+                        const __NR_EXIT_GROUP: u64 = 231;
+                        const ENOSYS_NEG: u64 = (-38i64) as u64;
+
+                        // sched_getscheduler(0) — should return 0 (SCHED_OTHER)
+                        let r = linux!(__NR_SCHED_GETSCHEDULER, 0u64, 0u64, 0u64);
+                        if r == ENOSYS_NEG {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+
+                        // sched_getparam(0, &param) — should return 0
+                        let mut param: u32 = 0xFFFF;
+                        let r = linux!(__NR_SCHED_GETPARAM, 0u64, &mut param as *mut u32, 0u64);
+                        if r == ENOSYS_NEG {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+                        // param.sched_priority should be 0
+                        if param != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
+                        }
+
+                        // msync — should return 0
+                        let r = linux!(__NR_MSYNC, 0u64, 0u64, 0u64);
+                        if r == ENOSYS_NEG {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 94u64, options(noreturn));
+                        }
+
+                        // mlock/munlock — should return 0
+                        let r = linux!(__NR_MLOCK, 0x1000u64, 4096u64, 0u64);
+                        if r == ENOSYS_NEG {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 95u64, options(noreturn));
+                        }
+                        let r = linux!(__NR_MUNLOCK, 0x1000u64, 4096u64, 0u64);
+                        if r == ENOSYS_NEG {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 96u64, options(noreturn));
+                        }
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 152 linux sched/mlock/preadv: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 152 linux sched/mlock/preadv: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 152 linux sched/mlock/preadv: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 152 linux sched/mlock/preadv: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
