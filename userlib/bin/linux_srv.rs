@@ -1966,12 +1966,12 @@ fn handle_wait4(caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux brk(addr).
-fn handle_brk(pi: usize, args: &[u64; 6]) -> u64 {
+fn handle_brk(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let addr = args[0] as usize;
 
     unsafe {
         if PROC_TABLE[pi].brk_base == 0 {
-            PROC_TABLE[pi].brk_base = 0x4000_0000;
+            PROC_TABLE[pi].brk_base = 0x10_0000_0000;
             PROC_TABLE[pi].brk_current = PROC_TABLE[pi].brk_base;
         }
 
@@ -1987,7 +1987,7 @@ fn handle_brk(pi: usize, args: &[u64; 6]) -> u64 {
                 if new_pages > old_pages {
                     let alloc_start = old_pages * page_size;
                     let count = new_pages - old_pages;
-                    if syscall::mmap_anon(alloc_start, count, 3).is_none() {
+                    if syscall::personality_mmap_anon(caller_port, alloc_start as u64, count as u64, 3).is_none() {
                         return PROC_TABLE[pi].brk_current as u64;
                     }
                 }
@@ -4435,7 +4435,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             }
             __NR_WAIT4 => handle_wait4(caller_port, &msg.data),
-            __NR_BRK => handle_brk(pi, &msg.data),
+            __NR_BRK => handle_brk(pi, caller_port, &msg.data),
             __NR_ARCH_PRCTL => handle_arch_prctl(&msg.data),
             __NR_SET_TID_ADDRESS => handle_set_tid_address(caller_port),
             __NR_EXIT | __NR_EXIT_GROUP => {
@@ -4509,15 +4509,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_MEMFD_CREATE => handle_memfd_create(pi, caller_port, &msg.data),
             __NR_CLONE3 => linux_err(ENOSYS),
 
-            // Anonymous mmap: forward to Telix mmap_anon.
+            // Anonymous mmap: map in caller's address space via personality syscall.
             __NR_MMAP => {
-                let addr = msg.data[0] as usize;
+                let addr = msg.data[0] as u64;
                 let len = msg.data[1] as usize;
-                let prot = msg.data[2] as u8;
+                let prot = msg.data[2] as u64;
                 let _flags = msg.data[3];
                 let page_size = syscall::page_size() as usize;
-                let pages = (len + page_size - 1) / page_size;
-                match syscall::mmap_anon(addr, pages, prot) {
+                let pages = ((len + page_size - 1) / page_size) as u64;
+                match syscall::personality_mmap_anon(caller_port, addr, pages, prot) {
                     Some(va) => va as u64,
                     None => u64::MAX, // MAP_FAILED
                 }
@@ -4526,11 +4526,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let addr = msg.data[0] as usize;
                 let len = msg.data[1] as usize;
                 let prot = msg.data[2] as u8;
-                if syscall::mprotect(addr, len, prot) { 0 } else { linux_err(ENOSYS) }
+                if syscall::personality_mprotect(caller_port, addr, len, prot) { 0 } else { linux_err(ENOSYS) }
             }
             __NR_MUNMAP => {
                 let addr = msg.data[0] as usize;
-                if syscall::munmap(addr) { 0 } else { linux_err(ENOSYS) }
+                if syscall::personality_munmap(caller_port, addr) { 0 } else { linux_err(ENOSYS) }
             }
             __NR_MREMAP => {
                 let old_addr = msg.data[0] as usize;
@@ -4539,7 +4539,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let page_size = syscall::page_size() as usize;
                 let aligned_old = (old_len + page_size - 1) & !(page_size - 1);
                 let aligned_new = (new_len + page_size - 1) & !(page_size - 1);
-                match syscall::mremap(old_addr, aligned_old, aligned_new) {
+                match syscall::personality_mremap(caller_port, old_addr, aligned_old, aligned_new) {
                     Some(va) => va as u64,
                     None => linux_err(ENOMEM),
                 }

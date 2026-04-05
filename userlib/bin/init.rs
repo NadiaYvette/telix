@@ -11097,6 +11097,150 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 141: cross-address-space mmap/mremap/brk ---
+    syscall::debug_puts(b"  init: Phase 141 linux mmap/mremap/brk...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") 0u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+
+                        let page_sz = 4096u64;
+
+                        // 1. mmap anonymous page
+                        let addr = linux!(9u64, 0u64, page_sz, 3u64, 0x22u64);
+                        if addr > 0xFFFF_FFFF_FFFF_F000 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
+                        }
+                        // 2. write marker + verify readback
+                        core::ptr::write_volatile(addr as *mut u8, 0xAB);
+                        if core::ptr::read_volatile(addr as *const u8) != 0xAB {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 11u64, options(noreturn));
+                        }
+                        // 3. mremap: expand 4K → 8K (MREMAP_MAYMOVE=1)
+                        let new_addr = linux!(25u64, addr, page_sz, 2u64 * page_sz, 1u64);
+                        if new_addr > 0xFFFF_FFFF_FFFF_F000 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 12u64, options(noreturn));
+                        }
+                        // 4. verify marker survived mremap
+                        if core::ptr::read_volatile(new_addr as *const u8) != 0xAB {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 13u64, options(noreturn));
+                        }
+                        // 5. munmap the remapped region
+                        let mun = linux!(11u64, new_addr, 2u64 * page_sz);
+                        if mun != 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 14u64, options(noreturn));
+                        }
+                        // 6. brk(0) → get current brk
+                        let brk0 = linux!(12u64, 0u64);
+                        // 7. brk(+4K) → extend heap
+                        let brk1 = linux!(12u64, brk0 + page_sz);
+                        if brk1 <= brk0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 15u64, options(noreturn));
+                        }
+                        // 8. write to brk area + verify
+                        core::ptr::write_volatile(brk0 as *mut u8, 0xCD);
+                        if core::ptr::read_volatile(brk0 as *const u8) != 0xCD {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 16u64, options(noreturn));
+                        }
+                        // exit 0 — all tests passed
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 141 linux mmap/mremap/brk: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 141 linux mmap/mremap/brk: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 141 linux mmap/mremap/brk: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 141 linux mmap/mremap/brk: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

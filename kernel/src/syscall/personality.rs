@@ -543,3 +543,170 @@ pub fn personality_execve(target_port: u64, name_ptr: u64, name_len: u64) -> u64
 fn find_personality_waiter(task_id: u32) -> u32 {
     crate::sched::scheduler::find_personality_waiter(task_id)
 }
+
+// =============================================================================
+// Cross-address-space memory operations for personality servers
+// =============================================================================
+
+/// Resolve target task for a personality memory operation.
+/// Returns (target_task_id, target_aspace_id) or None.
+fn resolve_personality_target(target_port: u64) -> Option<(u32, u64)> {
+    let _caller_task_id = check_personality_server()?;
+    let target_task_id = crate::sched::task_id_from_port(target_port)?;
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return None;
+    }
+    let task = crate::sched::scheduler::task_ref(target_task_id);
+    let aspace_id = task.aspace_id;
+    if aspace_id == 0 {
+        return None;
+    }
+    Some((target_task_id, aspace_id))
+}
+
+/// Map anonymous pages in a target task's address space.
+/// Equivalent to sys_mmap_anon but targeting a specified task.
+pub fn personality_mmap_anon(target_port: u64, va_hint: u64, page_count: u64, prot: u64) -> u64 {
+    use crate::mm::page::{self, MMUPAGE_SIZE};
+    use crate::mm::vma::VmaProt;
+
+    let (target_task_id, aspace_id) = match resolve_personality_target(target_port) {
+        Some(v) => v,
+        None => return u64::MAX,
+    };
+
+    let ps = page::page_size();
+    let mmu_count = page::page_mmucount();
+
+    let mmu_pages = page_count as usize;
+    if mmu_pages == 0 || mmu_pages > 256 * mmu_count {
+        return u64::MAX;
+    }
+    let alloc_pages = (mmu_pages + mmu_count - 1) / mmu_count;
+
+    // Check page quota.
+    let task = crate::sched::scheduler::task_ref(target_task_id);
+    if task.cur_pages + alloc_pages as u32 > task.max_pages {
+        return u64::MAX;
+    }
+    let new_bytes = (task.cur_pages as u64 + alloc_pages as u64) * ps as u64;
+    let rlimit_as = task.rlimits[crate::sched::task::RLIMIT_AS as usize].cur;
+    if rlimit_as != crate::sched::task::RLIM_INFINITY && new_bytes > rlimit_as {
+        return u64::MAX;
+    }
+
+    let prot = match prot {
+        0 => VmaProt::ReadOnly,
+        1 => VmaProt::ReadWrite,
+        2 => VmaProt::ReadExec,
+        3 => VmaProt::ReadWriteExec,
+        _ => return u64::MAX,
+    };
+
+    let va_len = mmu_pages * MMUPAGE_SIZE;
+
+    let va = if va_hint == 0 {
+        crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(va_len))
+    } else {
+        va_hint as usize
+    };
+
+    // Create VMA + backing object.
+    let obj_id = match crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+        aspace.map_anon(va, mmu_pages, prot).map(|vma| vma.object_id)
+    }) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    // Eagerly allocate physical pages and install PTEs in target's page table.
+    let pt_root = crate::sched::scheduler::task_ref(target_task_id).page_table_root;
+
+    // After fork, the target's page table may have shared COW markers at
+    // intermediate levels.  walk_or_create (used by map_single_mmupage)
+    // returns None when it hits a shared marker, silently failing the PTE
+    // install.  Break shared markers for the entire VA range first.
+    let fork_group = crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.fork_group);
+    for mmu_idx in 0..mmu_pages {
+        let mmu_va = va + mmu_idx * MMUPAGE_SIZE;
+        crate::mm::hat::ensure_path_unshared(pt_root, mmu_va, fork_group);
+    }
+
+    let sw_z = crate::mm::fault::sw_zeroed_bit();
+    let pte_flags = if prot == VmaProt::None {
+        0
+    } else {
+        crate::mm::hat::pte_flags_for_prot(prot) | sw_z
+    };
+
+    for page_idx in 0..alloc_pages {
+        let pa = match crate::mm::object::try_with_object(obj_id, |obj| {
+            obj.ensure_page(page_idx).map(|(pa, _)| pa)
+        }) {
+            Some(Some(pa)) => pa,
+            _ => return u64::MAX,
+        };
+        let pa_usize = pa.as_usize();
+
+        // Zero the page.
+        unsafe { core::ptr::write_bytes(pa_usize as *mut u8, 0, ps); }
+
+        let mmu_start = page_idx * mmu_count;
+        let mmu_end = core::cmp::min(mmu_start + mmu_count, mmu_pages);
+        for mmu_idx in mmu_start..mmu_end {
+            let mmu_va = va + mmu_idx * MMUPAGE_SIZE;
+            let mmu_pa = pa_usize + (mmu_idx - mmu_start) * MMUPAGE_SIZE;
+            crate::mm::hat::map_single_mmupage(pt_root, mmu_va, mmu_pa, pte_flags);
+        }
+    }
+
+    // Superpage promotion.
+    crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+        if let Some(vma) = aspace.find_vma_mut(va) {
+            crate::mm::fault::try_superpage_promotion_eager(pt_root, vma, obj_id);
+        }
+    });
+
+    // Increment page quota counter.
+    unsafe { crate::sched::scheduler::task_mut_from_ref(target_task_id) }.cur_pages += alloc_pages as u32;
+
+    va as u64
+}
+
+/// Unmap a VMA in a target task's address space.
+pub fn personality_munmap(target_port: u64, va: u64) -> u64 {
+    let (_target_task_id, aspace_id) = match resolve_personality_target(target_port) {
+        Some(v) => v,
+        None => return u64::MAX,
+    };
+    if crate::mm::aspace::unmap_anon(aspace_id, va as usize) { 0 } else { u64::MAX }
+}
+
+/// Change protection on a mapping in a target task's address space.
+pub fn personality_mprotect(target_port: u64, addr: u64, len: u64, prot: u64) -> u64 {
+    use crate::mm::vma::VmaProt;
+
+    let (_target_task_id, aspace_id) = match resolve_personality_target(target_port) {
+        Some(v) => v,
+        None => return u64::MAX,
+    };
+    let new_prot = match prot {
+        0 => VmaProt::ReadOnly,
+        1 => VmaProt::ReadWrite,
+        2 => VmaProt::ReadExec,
+        3 => VmaProt::ReadWriteExec,
+        _ => return u64::MAX,
+    };
+    if crate::mm::aspace::mprotect(aspace_id, addr as usize, len as usize, new_prot) { 0 } else { u64::MAX }
+}
+
+/// Resize a mapping in a target task's address space.
+pub fn personality_mremap(target_port: u64, old_addr: u64, old_len: u64, new_len: u64) -> u64 {
+    let (_target_task_id, aspace_id) = match resolve_personality_target(target_port) {
+        Some(v) => v,
+        None => return u64::MAX,
+    };
+    let result = crate::mm::aspace::mremap(aspace_id, old_addr as usize, old_len as usize, new_len as usize);
+    if result == 0 { u64::MAX } else { result as u64 }
+}

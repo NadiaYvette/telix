@@ -68,6 +68,10 @@ const SYS_PERSONALITY_COPY_OUT: u64 = 0xF006;
 const SYS_PERSONALITY_FORK: u64 = 0xF007;
 const SYS_PERSONALITY_WAIT4: u64 = 0xF008;
 const SYS_PERSONALITY_EXECVE: u64 = 0xF009;
+const SYS_PERSONALITY_MMAP_ANON: u64 = 0xF00A;
+const SYS_PERSONALITY_MUNMAP: u64 = 0xF00B;
+const SYS_PERSONALITY_MPROTECT: u64 = 0xF00C;
+const SYS_PERSONALITY_MREMAP: u64 = 0xF00D;
 const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Register a personality server for a given personality ID.
@@ -167,6 +171,35 @@ pub fn personality_execve(target_port: u64, name: &[u8]) -> u64 {
             name.len() as u64,
         )
     }
+}
+
+/// Map anonymous pages in a target task's address space (personality server only).
+/// page_count is in MMUPAGE_SIZE (4K) units.  prot: 0=RO, 1=RW, 2=RX, 3=RWX.
+pub fn personality_mmap_anon(target_port: u64, va_hint: u64, page_count: u64, prot: u64) -> Option<usize> {
+    let r = unsafe {
+        arch::syscall4(SYS_PERSONALITY_MMAP_ANON, target_port, va_hint, page_count, prot)
+    };
+    if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+/// Unmap a VMA in a target task's address space (personality server only).
+pub fn personality_munmap(target_port: u64, va: usize) -> bool {
+    unsafe { arch::syscall2(SYS_PERSONALITY_MUNMAP, target_port, va as u64) == 0 }
+}
+
+/// Change protection on a mapping in a target task's address space.
+pub fn personality_mprotect(target_port: u64, addr: usize, len: usize, prot: u8) -> bool {
+    unsafe {
+        arch::syscall4(SYS_PERSONALITY_MPROTECT, target_port, addr as u64, len as u64, prot as u64) == 0
+    }
+}
+
+/// Resize a mapping in a target task's address space (personality server only).
+pub fn personality_mremap(target_port: u64, old_addr: usize, old_len: usize, new_len: usize) -> Option<usize> {
+    let r = unsafe {
+        arch::syscall4(SYS_PERSONALITY_MREMAP, target_port, old_addr as u64, old_len as u64, new_len as u64)
+    };
+    if r == u64::MAX { None } else { Some(r as usize) }
 }
 
 /// Register a port as the network proxy endpoint for non-local sends.

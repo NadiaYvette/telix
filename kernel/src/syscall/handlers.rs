@@ -124,6 +124,10 @@ pub const SYS_PERSONALITY_COPY_OUT: u64 = 0xF006;
 pub const SYS_PERSONALITY_FORK: u64 = 0xF007;
 pub const SYS_PERSONALITY_WAIT4: u64 = 0xF008;
 pub const SYS_PERSONALITY_EXECVE: u64 = 0xF009;
+pub const SYS_PERSONALITY_MMAP_ANON: u64 = 0xF00A;
+pub const SYS_PERSONALITY_MUNMAP: u64 = 0xF00B;
+pub const SYS_PERSONALITY_MPROTECT: u64 = 0xF00C;
+pub const SYS_PERSONALITY_MREMAP: u64 = 0xF00D;
 pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Error code: capability check failed.
@@ -193,7 +197,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         && nr != SYS_PERSONALITY_REPLY && nr != SYS_PERSONALITY_READ_ARGS
         && nr != SYS_PERSONALITY_COPY_IN && nr != SYS_PERSONALITY_COPY_OUT
         && nr != SYS_PERSONALITY_FORK && nr != SYS_PERSONALITY_WAIT4
-        && nr != SYS_PERSONALITY_EXECVE {
+        && nr != SYS_PERSONALITY_EXECVE
+        && nr != SYS_PERSONALITY_MMAP_ANON && nr != SYS_PERSONALITY_MUNMAP
+        && nr != SYS_PERSONALITY_MPROTECT && nr != SYS_PERSONALITY_MREMAP {
         let tid = crate::sched::smp::current()
             .current_thread
             .load(core::sync::atomic::Ordering::Relaxed);
@@ -449,6 +455,18 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_PERSONALITY_EXECVE => {
             crate::syscall::personality::personality_execve(a0, a1, a2)
+        }
+        SYS_PERSONALITY_MMAP_ANON => {
+            crate::syscall::personality::personality_mmap_anon(a0, a1, a2, a3)
+        }
+        SYS_PERSONALITY_MUNMAP => {
+            crate::syscall::personality::personality_munmap(a0, a1)
+        }
+        SYS_PERSONALITY_MPROTECT => {
+            crate::syscall::personality::personality_mprotect(a0, a1, a2, a3)
+        }
+        SYS_PERSONALITY_MREMAP => {
+            crate::syscall::personality::personality_mremap(a0, a1, a2, a3)
         }
         SYS_FRAMEBUFFER_INFO => sys_framebuffer_info(frame),
         _ => {
