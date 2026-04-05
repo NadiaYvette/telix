@@ -3395,7 +3395,9 @@ fn handle_rt_sigaction(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     // Validate signal number (1-based, 1..=64, SIGKILL=9 and SIGSTOP=19 can't be caught).
     if signum == 0 || signum > NUM_SIGNALS { return linux_err(EINVAL); }
-    if sigsetsize != 8 { return linux_err(EINVAL); }
+    // sigsetsize must be 8 when actually reading/writing actions.
+    // When both act and oldact are NULL, sigsetsize is irrelevant.
+    if (act_va != 0 || oldact_va != 0) && sigsetsize != 8 { return linux_err(EINVAL); }
     let idx = signum - 1;
 
     // Return old action if requested.
@@ -3442,7 +3444,7 @@ fn handle_rt_sigprocmask(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let oldset_va = args[2] as usize;
     let sigsetsize = args[3] as usize;
 
-    if sigsetsize != 8 { return linux_err(EINVAL); }
+    if (set_va != 0 || oldset_va != 0) && sigsetsize != 8 { return linux_err(EINVAL); }
 
     const SIG_BLOCK: u64 = 0;
     const SIG_UNBLOCK: u64 = 1;
