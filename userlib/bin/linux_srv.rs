@@ -132,6 +132,13 @@ const __NR_FCHOWN: u64 = 93;
 const __NR_SIGALTSTACK: u64 = 131;
 const __NR_FCHOWNAT: u64 = 260;
 const __NR_FCHMODAT: u64 = 268;
+const __NR_MREMAP: u64 = 25;
+const __NR_KILL: u64 = 62;
+const __NR_RENAME: u64 = 82;
+const __NR_FLOCK: u64 = 73;
+const __NR_TRUNCATE: u64 = 76;
+const __NR_RENAMEAT: u64 = 264;
+const __NR_RENAMEAT2: u64 = 316;
 const __NR_STATX: u64 = 332;
 const __NR_CLONE3: u64 = 435;
 
@@ -160,6 +167,7 @@ const ETIMEDOUT: u64 = 110;
 const ENOTSOCK: u64 = 88;
 const EAFNOSUPPORT: u64 = 97;
 const ENOTCONN: u64 = 107;
+const ESRCH: u64 = 3;
 const ECONNREFUSED: u64 = 111;
 const EOPNOTSUPP: u64 = 95;
 
@@ -1689,6 +1697,64 @@ fn handle_readlink(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     handle_readlinkat(pi, caller_port, &shifted)
 }
 
+/// Handle Linux kill(pid, sig).
+fn handle_kill(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let pid = args[0] as i64;
+    let sig = args[1] as u32;
+
+    if sig == 0 {
+        // Signal 0: check if process exists.
+        if pid > 0 {
+            // Check if we have a proc entry for this pid/port.
+            let found = unsafe {
+                let mut f = false;
+                for i in 0..MAX_PROCS {
+                    if PROC_TABLE[i].active && PROC_TABLE[i].port == pid as u64 {
+                        f = true;
+                        break;
+                    }
+                }
+                f
+            };
+            return if found { 0 } else { linux_err(ESRCH) };
+        }
+        return 0; // Signal 0 to self or group — always succeeds.
+    }
+
+    if pid > 0 {
+        // Send signal to specific process.
+        if syscall::kill_sig(pid as u64, sig) { 0 } else { linux_err(ESRCH) }
+    } else if pid == 0 {
+        // Send to caller's process group.
+        let pgid = syscall::getpgid(0);
+        if pgid == 0 || pgid == u64::MAX {
+            // No group, send to self.
+            syscall::kill_sig(caller_port, sig);
+            0
+        } else {
+            if syscall::kill_pgroup(pgid, sig) { 0 } else { linux_err(ESRCH) }
+        }
+    } else if pid == -1 {
+        // Send to all processes — not supported, just send to self.
+        syscall::kill_sig(caller_port, sig);
+        0
+    } else {
+        // pid < -1: send to process group -pid.
+        let pgid = (-pid) as u64;
+        if syscall::kill_pgroup(pgid, sig) { 0 } else { linux_err(ESRCH) }
+    }
+}
+
+/// Handle Linux tgkill(tgid, tid, sig).
+fn handle_tgkill(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let _tgid = args[0];
+    let tid = args[1];
+    let sig = args[2] as u32;
+    if sig == 0 { return 0; }
+    // Map tid to port — in Telix, tid IS the port for personality tasks.
+    if syscall::kill_sig(tid, sig) { 0 } else { linux_err(ESRCH) }
+}
+
 /// Read from a pipe FD into the caller's buffer via personality_copy_out.
 fn read_pipe(caller_port: u64, pipe_port: u64, handle: u64, buf_va: usize, count: usize) -> u64 {
     let rp = syscall::port_create();
@@ -2610,9 +2676,9 @@ fn handle_getppid() -> u64 {
     1
 }
 
-fn handle_getid(nr: u64) -> u64 {
+fn handle_getid(nr: u64, caller_port: u64) -> u64 {
     match nr {
-        __NR_GETPID | __NR_GETTID => syscall::getpid(),
+        __NR_GETPID | __NR_GETTID => caller_port, // return *client's* port, not linux_srv's
         __NR_GETUID => syscall::getuid() as u64,
         __NR_GETEUID => syscall::geteuid() as u64,
         __NR_GETGID => syscall::getgid() as u64,
@@ -4377,7 +4443,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 continue; // Don't reply — task is dead.
             }
             __NR_GETPID | __NR_GETTID | __NR_GETUID | __NR_GETEUID
-            | __NR_GETGID | __NR_GETEGID => handle_getid(linux_nr),
+            | __NR_GETGID | __NR_GETEGID => handle_getid(linux_nr, caller_port),
             __NR_CLOCK_GETTIME => handle_clock_gettime(caller_port, &msg.data),
             __NR_UNAME => handle_uname(caller_port, &msg.data),
             __NR_GETRANDOM => handle_getrandom(caller_port, &msg.data),
@@ -4414,7 +4480,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_RT_SIGPROCMASK => 0,  // Pretend success.
             __NR_RT_SIGRETURN => 0,
             __NR_SIGALTSTACK => 0,  // stub — no alternate signal stack yet
-            __NR_TGKILL => 0,         // Ignore for now.
+            __NR_TGKILL => handle_tgkill(caller_port, &msg.data),
+            __NR_KILL => handle_kill(pi, caller_port, &msg.data),
 
             // Stubs that return success (0) to avoid crashing callers.
             __NR_SET_ROBUST_LIST | __NR_RSEQ => 0,
@@ -4465,6 +4532,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let addr = msg.data[0] as usize;
                 if syscall::munmap(addr) { 0 } else { linux_err(ENOSYS) }
             }
+            __NR_MREMAP => {
+                let old_addr = msg.data[0] as usize;
+                let old_len = msg.data[1] as usize;
+                let new_len = msg.data[2] as usize;
+                let page_size = syscall::page_size() as usize;
+                let aligned_old = (old_len + page_size - 1) & !(page_size - 1);
+                let aligned_new = (new_len + page_size - 1) & !(page_size - 1);
+                match syscall::mremap(old_addr, aligned_old, aligned_new) {
+                    Some(va) => va as u64,
+                    None => linux_err(ENOMEM),
+                }
+            }
+
+            // Stubs: file ops that need VFS extensions.
+            __NR_RENAME | __NR_RENAMEAT | __NR_RENAMEAT2 => linux_err(ENOSYS),
+            __NR_FLOCK => 0, // stub: no mandatory locking
+            __NR_TRUNCATE => linux_err(ENOSYS), // needs VFS_TRUNCATE
 
             // Phase 129: Socket syscalls.
             __NR_SOCKET => handle_socket(pi, caller_port, &msg.data),
