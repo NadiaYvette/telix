@@ -11351,6 +11351,163 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 143: poll/ppoll implementation ---
+    syscall::debug_puts(b"  init: Phase 143 linux poll...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") 0u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+                        const __NR_PIPE2: u64 = 293;
+                        const __NR_POLL: u64 = 7;
+                        const __NR_WRITE: u64 = 1;
+                        const __NR_CLOSE: u64 = 3;
+                        const __NR_EXIT_GROUP: u64 = 231;
+                        const POLLIN: u16 = 0x0001;
+
+                        // 1. mmap a page for pipe fds and pollfd struct
+                        let pg: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") 9u64 => pg,
+                            in("rdi") 0u64, in("rsi") 4096u64, in("rdx") 3u64,
+                            in("r10") 0x22u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if pg > 0xFFFF_FFFF_FFFF_F000 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 30u64, options(noreturn));
+                        }
+
+                        // 2. pipe2(pipefd, 0) — pipefd at pg
+                        let ret = linux!(__NR_PIPE2, pg, 0u64);
+                        if ret != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 31u64, options(noreturn));
+                        }
+                        let read_fd = core::ptr::read_volatile(pg as *const i32);
+                        let write_fd = core::ptr::read_volatile((pg + 4) as *const i32);
+
+                        // 3. Build pollfd struct at pg+64: { int fd=read_fd, short events=POLLIN, short revents=0 }
+                        let pollfd_va = pg + 64;
+                        core::ptr::write_volatile(pollfd_va as *mut i32, read_fd);
+                        core::ptr::write_volatile((pollfd_va + 4) as *mut u16, POLLIN);
+                        core::ptr::write_volatile((pollfd_va + 6) as *mut u16, 0);
+
+                        // 4. poll with 0ms timeout — pipe empty, should return 0
+                        let n = linux!(__NR_POLL, pollfd_va, 1u64, 0u64);
+                        if n != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 32u64, options(noreturn));
+                        }
+
+                        // 5. Write 1 byte to the pipe
+                        let data_buf = pg + 128;
+                        core::ptr::write_volatile(data_buf as *mut u8, 0x42);
+                        let wr = linux!(__NR_WRITE, write_fd as u64, data_buf, 1u64);
+                        if wr != 1 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 33u64, options(noreturn));
+                        }
+
+                        // 6. Reset revents, poll again with 0ms — should return 1, revents has POLLIN
+                        core::ptr::write_volatile((pollfd_va + 6) as *mut u16, 0);
+                        let n2 = linux!(__NR_POLL, pollfd_va, 1u64, 0u64);
+                        if n2 != 1 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 34u64, options(noreturn));
+                        }
+                        let revents = core::ptr::read_volatile((pollfd_va + 6) as *const u16);
+                        if revents & POLLIN == 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 35u64, options(noreturn));
+                        }
+
+                        // 7. Close both ends
+                        linux!(__NR_CLOSE, read_fd as u64);
+                        linux!(__NR_CLOSE, write_fd as u64);
+
+                        // exit 0 — all poll tests passed
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 143 linux poll: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 143 linux poll: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 143 linux poll: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 143 linux poll: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

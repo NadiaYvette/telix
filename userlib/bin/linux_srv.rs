@@ -2595,8 +2595,8 @@ fn handle_nanosleep(caller_port: u64, args: &[u64; 6]) -> u64 {
 
 /// Handle Linux poll(fds, nfds, timeout) — basic stub.
 /// Returns 0 (timeout) for non-zero timeouts, or nfds with POLLNVAL for unknown fds.
-fn handle_poll(caller_port: u64, args: &[u64; 6]) -> u64 {
-    let _fds_va = args[0] as usize;
+fn handle_poll(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fds_va = args[0] as usize;
     let nfds = args[1] as usize;
     let timeout_ms = args[2] as i32;
 
@@ -2609,18 +2609,70 @@ fn handle_poll(caller_port: u64, args: &[u64; 6]) -> u64 {
         return 0;
     }
 
-    // For non-trivial poll, sleep for the timeout and return 0.
-    // This is a simplistic stub that prevents infinite busy-loops.
-    if timeout_ms > 0 {
-        let ns = (timeout_ms as u64).min(100) * 1_000_000;
-        syscall::nanosleep(ns);
-    } else if timeout_ms == 0 {
-        // Non-blocking poll — return immediately.
+    // Cap nfds to prevent huge reads.
+    if nfds > 64 { return linux_err(EINVAL); }
+
+    // Read pollfd array from caller: each entry is 8 bytes { i32 fd, i16 events, i16 revents }.
+    let byte_len = nfds * 8;
+    let mut buf = [0u8; 64 * 8]; // max 64 entries
+    let copied = syscall::personality_copy_in(caller_port, fds_va, &mut buf[..byte_len]);
+    if copied < byte_len { return linux_err(EFAULT); }
+
+    let max_iters: u32 = if timeout_ms == 0 {
+        1
+    } else if timeout_ms > 0 {
+        ((timeout_ms as u32) / 5).max(1).min(200)
     } else {
-        // Infinite timeout — yield a few times then return 0.
-        for _ in 0..10 { syscall::yield_now(); }
+        400 // ~2s for infinite timeout
+    };
+
+    for iter in 0..max_iters {
+        let mut ready_count = 0u32;
+
+        for i in 0..nfds {
+            let off = i * 8;
+            let fd = i32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]);
+            let events = u16::from_le_bytes([buf[off+4], buf[off+5]]);
+
+            // Clear revents.
+            buf[off+6] = 0;
+            buf[off+7] = 0;
+
+            if fd < 0 { continue; } // Negative fd → skip, revents=0.
+            let ufd = fd as usize;
+
+            if ufd >= MAX_FDS || unsafe { !PROC_TABLE[pi].fds[ufd].in_use } {
+                // Invalid fd → POLLNVAL.
+                let nval: u16 = 0x0020; // POLLNVAL
+                buf[off+6..off+8].copy_from_slice(&nval.to_le_bytes());
+                ready_count += 1;
+                continue;
+            }
+
+            let revents_u32 = poll_single_fd(pi, ufd);
+            // Mask: only report events the caller asked for, plus error/hangup.
+            let revents = (revents_u32 as u16 & events)
+                | (revents_u32 as u16 & (EPOLLERR as u16 | EPOLLHUP as u16));
+            if revents != 0 {
+                buf[off+6..off+8].copy_from_slice(&revents.to_le_bytes());
+                ready_count += 1;
+            }
+        }
+
+        if ready_count > 0 {
+            // Write back pollfd array with revents filled in.
+            syscall::personality_copy_out(caller_port, fds_va, &buf[..byte_len]);
+            return ready_count as u64;
+        }
+
+        if iter + 1 < max_iters {
+            syscall::sleep_ms(5);
+        }
     }
-    0 // No events ready.
+
+    // Timeout, no events — still write back zeroed revents.
+    syscall::personality_copy_out(caller_port, fds_va, &buf[..byte_len]);
+    0
 }
 
 /// Handle Linux prctl(option, arg2, arg3, arg4, arg5).
@@ -4467,7 +4519,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 handle_nanosleep(caller_port, &shifted)
             }
             __NR_CLOCK_GETRES => handle_clock_getres(caller_port, &msg.data),
-            __NR_POLL | __NR_PPOLL => handle_poll(caller_port, &msg.data),
+            __NR_POLL | __NR_PPOLL => handle_poll(pi, caller_port, &msg.data),
             __NR_PRCTL => handle_prctl(&msg.data),
             __NR_FUTEX => handle_futex(&msg.data),
             __NR_GETPPID => handle_getppid(),
