@@ -11894,6 +11894,179 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 147: select/pselect6 ---
+    syscall::debug_puts(b"  init: Phase 147 linux select...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr, $a0:expr, $a1:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+                        macro_rules! linux5 {
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") $a4 as u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+                        const __NR_PIPE2: u64 = 293;
+                        const __NR_WRITE: u64 = 1;
+                        const __NR_CLOSE: u64 = 3;
+                        const __NR_SELECT: u64 = 23;
+                        const __NR_EXIT_GROUP: u64 = 231;
+
+                        // mmap a page for buffers
+                        let pg: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") 9u64 => pg,
+                            in("rdi") 0u64, in("rsi") 4096u64, in("rdx") 3u64,
+                            in("r10") 0x22u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if pg > 0xFFFF_FFFF_FFFF_F000 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 80u64, options(noreturn));
+                        }
+
+                        // 1. pipe2(pipefd, 0)
+                        let ret = linux!(__NR_PIPE2, pg, 0u64);
+                        if ret != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 81u64, options(noreturn));
+                        }
+                        let read_fd = core::ptr::read_volatile(pg as *const i32);
+                        let write_fd = core::ptr::read_volatile((pg + 4) as *const i32);
+
+                        // 2. select(read_fd+1, &readfds, NULL, NULL, &{0,0}) — timeout=0, empty pipe → 0
+                        let rfds_va = pg + 64;
+                        let tv_va = pg + 128;
+                        // Set bit for read_fd in fd_set
+                        core::ptr::write_volatile(rfds_va as *mut u64, 1u64 << read_fd);
+                        // timeval = {0, 0} = immediate
+                        core::ptr::write_volatile(tv_va as *mut i64, 0);
+                        core::ptr::write_volatile((tv_va + 8) as *mut i64, 0);
+
+                        let n = linux5!(__NR_SELECT, (read_fd + 1) as u64, rfds_va, 0u64, 0u64, tv_va);
+                        if n != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 82u64, options(noreturn));
+                        }
+
+                        // 3. Write a byte to the pipe
+                        let data_va = pg + 192;
+                        core::ptr::write_volatile(data_va as *mut u8, 0x55);
+                        let wr = linux!(__NR_WRITE, write_fd as u64, data_va);
+                        // write needs 3 args but our macro only does 2; let me use linux5 with extras
+                        // Actually the 2-arg macro sets rdx=0 → count=0. Need a 3-arg version.
+                        // Let me just inline the asm.
+                        let wr2: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") 1u64 => wr2,
+                            in("rdi") write_fd as u64, in("rsi") data_va, in("rdx") 1u64,
+                            in("r10") 0u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        let _ = wr; // suppress unused
+                        if wr2 != 1 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 83u64, options(noreturn));
+                        }
+
+                        // 4. select again — should return 1, read_fd bit set
+                        core::ptr::write_volatile(rfds_va as *mut u64, 1u64 << read_fd);
+                        core::ptr::write_volatile(tv_va as *mut i64, 0);
+                        core::ptr::write_volatile((tv_va + 8) as *mut i64, 0);
+
+                        let n2 = linux5!(__NR_SELECT, (read_fd + 1) as u64, rfds_va, 0u64, 0u64, tv_va);
+                        if n2 != 1 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 84u64, options(noreturn));
+                        }
+                        // Verify read_fd bit is set in readfds
+                        let result_bits = core::ptr::read_volatile(rfds_va as *const u64);
+                        if result_bits & (1u64 << read_fd) == 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 85u64, options(noreturn));
+                        }
+
+                        // 5. select on write_fd for writability — pipe should be writable
+                        let wfds_va = pg + 256;
+                        core::ptr::write_volatile(wfds_va as *mut u64, 1u64 << write_fd);
+                        core::ptr::write_volatile(tv_va as *mut i64, 0);
+                        core::ptr::write_volatile((tv_va + 8) as *mut i64, 0);
+
+                        let n3 = linux5!(__NR_SELECT, (write_fd + 1) as u64, 0u64, wfds_va, 0u64, tv_va);
+                        if n3 != 1 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 86u64, options(noreturn));
+                        }
+
+                        // Close pipe
+                        let _: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _,
+                            in("rdi") read_fd as u64, in("rsi") 0u64, in("rdx") 0u64,
+                            in("r10") 0u64, in("r8") 0u64, lateout("rcx") _, lateout("r11") _);
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _,
+                            in("rdi") write_fd as u64, in("rsi") 0u64, in("rdx") 0u64,
+                            in("r10") 0u64, in("r8") 0u64, lateout("rcx") _, lateout("r11") _);
+
+                        // exit 0
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 147 linux select: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 147 linux select: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 147 linux select: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 147 linux select: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

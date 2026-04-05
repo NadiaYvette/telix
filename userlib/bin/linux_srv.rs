@@ -100,6 +100,8 @@ const __NR_CLOCK_GETRES: u64 = 229;
 const __NR_CLOCK_NANOSLEEP: u64 = 230;
 const __NR_TGKILL: u64 = 234;
 const __NR_PPOLL: u64 = 271;
+const __NR_SELECT: u64 = 23;
+const __NR_PSELECT6: u64 = 270;
 const __NR_EPOLL_CREATE1: u64 = 291;
 const __NR_EPOLL_PWAIT: u64 = 281;
 const __NR_SOCKET: u64 = 41;
@@ -2759,6 +2761,114 @@ fn handle_poll(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     0
 }
 
+/// Handle Linux select(nfds, readfds, writefds, exceptfds, timeout) and pselect6.
+fn handle_select(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let nfds = (args[0] as usize).min(MAX_FDS);
+    let readfds_va = args[1] as usize;
+    let writefds_va = args[2] as usize;
+    let exceptfds_va = args[3] as usize;
+    let timeout_va = args[4] as usize;
+
+    // Parse timeout.
+    let timeout_ms: i32 = if timeout_va != 0 {
+        let mut tbuf = [0u8; 16]; // struct timeval { tv_sec(8), tv_usec(8) }
+        if syscall::personality_copy_in(caller_port, timeout_va, &mut tbuf) >= 16 {
+            let sec = i64::from_le_bytes([tbuf[0], tbuf[1], tbuf[2], tbuf[3],
+                                           tbuf[4], tbuf[5], tbuf[6], tbuf[7]]);
+            let usec = i64::from_le_bytes([tbuf[8], tbuf[9], tbuf[10], tbuf[11],
+                                            tbuf[12], tbuf[13], tbuf[14], tbuf[15]]);
+            ((sec * 1000 + usec / 1000) as i32).max(0)
+        } else {
+            0
+        }
+    } else {
+        -1 // Infinite timeout
+    };
+
+    // Read fd_sets from caller (first 8 bytes = 64 bits, enough for MAX_FDS=64).
+    let mut rfds: u64 = 0;
+    let mut wfds: u64 = 0;
+    let mut efds: u64 = 0;
+    let mut tmp = [0u8; 8];
+
+    if readfds_va != 0 {
+        if syscall::personality_copy_in(caller_port, readfds_va, &mut tmp) >= 8 {
+            rfds = u64::from_le_bytes(tmp);
+        }
+    }
+    if writefds_va != 0 {
+        if syscall::personality_copy_in(caller_port, writefds_va, &mut tmp) >= 8 {
+            wfds = u64::from_le_bytes(tmp);
+        }
+    }
+    if exceptfds_va != 0 {
+        if syscall::personality_copy_in(caller_port, exceptfds_va, &mut tmp) >= 8 {
+            efds = u64::from_le_bytes(tmp);
+        }
+    }
+
+    let max_iters: u32 = if timeout_ms == 0 {
+        1
+    } else if timeout_ms > 0 {
+        ((timeout_ms as u32) / 5).max(1).min(200)
+    } else {
+        400
+    };
+
+    for iter in 0..max_iters {
+        let mut out_r: u64 = 0;
+        let mut out_w: u64 = 0;
+        let mut out_e: u64 = 0;
+        let mut total = 0u32;
+
+        for fd in 0..nfds {
+            let bit = 1u64 << fd;
+            let want_r = rfds & bit != 0;
+            let want_w = wfds & bit != 0;
+            let want_e = efds & bit != 0;
+            if !want_r && !want_w && !want_e { continue; }
+
+            if fd >= MAX_FDS || (fd >= 3 && unsafe { !PROC_TABLE[pi].fds[fd].in_use }) {
+                // Bad FD — report as exception.
+                if want_e { out_e |= bit; total += 1; }
+                continue;
+            }
+
+            let revents = poll_single_fd(pi, fd);
+            if want_r && (revents & (EPOLLIN | EPOLLERR | EPOLLHUP)) != 0 {
+                out_r |= bit;
+                total += 1;
+            }
+            if want_w && (revents & (EPOLLOUT | EPOLLERR)) != 0 {
+                out_w |= bit;
+                total += 1;
+            }
+            if want_e && (revents & EPOLLERR) != 0 {
+                out_e |= bit;
+                total += 1;
+            }
+        }
+
+        if total > 0 {
+            if readfds_va != 0 { syscall::personality_copy_out(caller_port, readfds_va, &out_r.to_le_bytes()); }
+            if writefds_va != 0 { syscall::personality_copy_out(caller_port, writefds_va, &out_w.to_le_bytes()); }
+            if exceptfds_va != 0 { syscall::personality_copy_out(caller_port, exceptfds_va, &out_e.to_le_bytes()); }
+            return total as u64;
+        }
+
+        if iter + 1 < max_iters {
+            syscall::sleep_ms(5);
+        }
+    }
+
+    // Timeout — clear all fd_sets.
+    let zero = 0u64.to_le_bytes();
+    if readfds_va != 0 { syscall::personality_copy_out(caller_port, readfds_va, &zero); }
+    if writefds_va != 0 { syscall::personality_copy_out(caller_port, writefds_va, &zero); }
+    if exceptfds_va != 0 { syscall::personality_copy_out(caller_port, exceptfds_va, &zero); }
+    0
+}
+
 /// Handle Linux prctl(option, arg2, arg3, arg4, arg5).
 fn handle_prctl(args: &[u64; 6]) -> u64 {
     let option = args[0];
@@ -4794,6 +4904,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
             __NR_CLOCK_GETRES => handle_clock_getres(caller_port, &msg.data),
             __NR_POLL | __NR_PPOLL => handle_poll(pi, caller_port, &msg.data),
+            __NR_SELECT | __NR_PSELECT6 => handle_select(pi, caller_port, &msg.data),
             __NR_PRCTL => handle_prctl(&msg.data),
             __NR_FUTEX => {
                 match handle_futex(pi, caller_port, &msg.data) {
