@@ -1714,6 +1714,12 @@ fn try_switch(current_sp: u64) -> u64 {
 
     crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
 
+    // Restore TLS base register for the next thread.
+    let next_tls = thread_ref(next_id).tls_base;
+    if next_tls != 0 {
+        crate::arch::cpu::set_tls(next_tls);
+    }
+
     // Activate next thread. Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     next_t.state = ThreadState::Running;

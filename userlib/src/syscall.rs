@@ -72,6 +72,7 @@ const SYS_PERSONALITY_MMAP_ANON: u64 = 0xF00A;
 const SYS_PERSONALITY_MUNMAP: u64 = 0xF00B;
 const SYS_PERSONALITY_MPROTECT: u64 = 0xF00C;
 const SYS_PERSONALITY_MREMAP: u64 = 0xF00D;
+const SYS_PERSONALITY_SET_TLS: u64 = 0xF00E;
 const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Register a personality server for a given personality ID.
@@ -200,6 +201,13 @@ pub fn personality_mremap(target_port: u64, old_addr: usize, old_len: usize, new
         arch::syscall4(SYS_PERSONALITY_MREMAP, target_port, old_addr as u64, old_len as u64, new_len as u64)
     };
     if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+/// Set the TLS base register for a target task (personality server only).
+pub fn personality_set_tls(target_port: u64, tls_base: u64) -> bool {
+    unsafe {
+        arch::syscall2(SYS_PERSONALITY_SET_TLS, target_port, tls_base) == 0
+    }
 }
 
 /// Register a port as the network proxy endpoint for non-local sends.

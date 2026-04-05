@@ -339,6 +339,7 @@ struct ProcessState {
     cwd: [u8; 64],
     cwd_len: usize,
     umask: u32,
+    tls_base: u64,
 }
 
 impl ProcessState {
@@ -352,6 +353,7 @@ impl ProcessState {
             cwd: [0u8; 64],
             cwd_len: 0,
             umask: 0,
+            tls_base: 0,
         }
     }
 }
@@ -2001,13 +2003,19 @@ fn handle_brk(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux arch_prctl(code, addr).
-fn handle_arch_prctl(args: &[u64; 6]) -> u64 {
+fn handle_arch_prctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let code = args[0];
-    let _addr = args[1];
+    let addr = args[1];
 
     match code {
-        ARCH_SET_FS => 0,
-        ARCH_GET_FS => 0,
+        ARCH_SET_FS => {
+            if !syscall::personality_set_tls(caller_port, addr) {
+                return linux_err(EINVAL);
+            }
+            unsafe { PROC_TABLE[pi].tls_base = addr; }
+            0
+        }
+        ARCH_GET_FS => unsafe { PROC_TABLE[pi].tls_base },
         _ => linux_err(ENOSYS),
     }
 }
@@ -4436,7 +4444,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
             __NR_WAIT4 => handle_wait4(caller_port, &msg.data),
             __NR_BRK => handle_brk(pi, caller_port, &msg.data),
-            __NR_ARCH_PRCTL => handle_arch_prctl(&msg.data),
+            __NR_ARCH_PRCTL => handle_arch_prctl(pi, caller_port, &msg.data),
             __NR_SET_TID_ADDRESS => handle_set_tid_address(caller_port),
             __NR_EXIT | __NR_EXIT_GROUP => {
                 handle_exit(pi, caller_port, &msg.data);

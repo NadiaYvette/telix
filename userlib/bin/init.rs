@@ -11241,6 +11241,116 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 142: TLS support (arch_prctl SET_FS / GET_FS) ---
+    syscall::debug_puts(b"  init: Phase 142 linux TLS arch_prctl...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr, $a0:expr, $a1:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+                        const __NR_ARCH_PRCTL: u64 = 158;
+                        const __NR_EXIT_GROUP: u64 = 231;
+                        const ARCH_SET_FS: u64 = 0x1002;
+                        const ARCH_GET_FS: u64 = 0x1003;
+
+                        // 1. Allocate a page via mmap for TLS area
+                        let tls_area: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") 9u64 => tls_area,
+                            in("rdi") 0u64, in("rsi") 4096u64, in("rdx") 3u64,
+                            in("r10") 0x22u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if tls_area > 0xFFFF_FFFF_FFFF_F000 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 20u64, options(noreturn));
+                        }
+
+                        // 2. Write a marker value at offset 0 in TLS area
+                        core::ptr::write_volatile(tls_area as *mut u64, 0xDEAD_BEEF_CAFE_1234u64);
+
+                        // 3. arch_prctl(ARCH_SET_FS, tls_area)
+                        let ret = linux!(__NR_ARCH_PRCTL, ARCH_SET_FS, tls_area);
+                        if ret != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 21u64, options(noreturn));
+                        }
+
+                        // 4. Read back via FS-relative access: mov rax, fs:[0]
+                        let tls_val: u64;
+                        core::arch::asm!("mov {}, fs:[0]", out(reg) tls_val);
+                        if tls_val != 0xDEAD_BEEF_CAFE_1234u64 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 22u64, options(noreturn));
+                        }
+
+                        // 5. arch_prctl(ARCH_GET_FS) should return tls_area
+                        let fs_val = linux!(__NR_ARCH_PRCTL, ARCH_GET_FS, 0u64);
+                        if fs_val != tls_area {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 23u64, options(noreturn));
+                        }
+
+                        // exit 0 — all TLS tests passed
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 142 linux TLS arch_prctl: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 142 linux TLS arch_prctl: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 142 linux TLS arch_prctl: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 142 linux TLS arch_prctl: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

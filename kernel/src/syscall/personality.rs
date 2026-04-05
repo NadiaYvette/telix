@@ -710,3 +710,20 @@ pub fn personality_mremap(target_port: u64, old_addr: u64, old_len: u64, new_len
     let result = crate::mm::aspace::mremap(aspace_id, old_addr as usize, old_len as usize, new_len as usize);
     if result == 0 { u64::MAX } else { result as u64 }
 }
+
+/// Set the TLS base register for a target task's thread.
+pub fn personality_set_tls(target_port: u64, tls_base: u64) -> u64 {
+    let (target_task_id, _aspace_id) = match resolve_personality_target(target_port) {
+        Some(v) => v,
+        None => return u64::MAX,
+    };
+    // Find the thread belonging to this task and set its tls_base.
+    // For single-threaded personality tasks, the waiter thread is the one
+    // we want. Use find_personality_waiter to get the blocked thread.
+    let thread_id = find_personality_waiter(target_task_id);
+    if thread_id == 0 {
+        return u64::MAX;
+    }
+    unsafe { crate::sched::scheduler::thread_mut_from_ref(thread_id) }.tls_base = tls_base;
+    0
+}
