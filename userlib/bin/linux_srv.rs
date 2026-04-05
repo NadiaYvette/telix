@@ -55,6 +55,7 @@ const __NR_OPENAT: u64 = 257;
 const __NR_NEWFSTATAT: u64 = 262;
 const __NR_SET_ROBUST_LIST: u64 = 273;
 const __NR_DUP3: u64 = 292;
+const __NR_PIPE: u64 = 22;
 const __NR_PIPE2: u64 = 293;
 const __NR_PRLIMIT64: u64 = 302;
 const __NR_GETDENTS64: u64 = 217;
@@ -2441,6 +2442,25 @@ fn handle_chdir(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     }
 }
 
+/// Handle Linux fchdir(fd) — change CWD to the directory referenced by an open fd.
+fn handle_fchdir(pi: usize, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use { return linux_err(EBADF); }
+        if PROC_TABLE[pi].fds[fd].kind != FdKind::Dir {
+            return linux_err(ENOTDIR);
+        }
+        let dlen = PROC_TABLE[pi].fds[fd].dir_path_len as usize;
+        if dlen == 0 { return linux_err(ENOENT); }
+        for i in 0..dlen.min(64) {
+            PROC_TABLE[pi].cwd[i] = PROC_TABLE[pi].fds[fd].dir_path[i.min(15)];
+        }
+        PROC_TABLE[pi].cwd_len = dlen.min(64);
+    }
+    0
+}
+
 /// Handle Linux getdents64(fd, dirp, count).
 ///
 /// For simplicity, we use the path stored in the FD entry to do path-based
@@ -4345,6 +4365,21 @@ fn handle_getpeername(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 /// Handle Linux setsockopt — stub that returns 0.
 /// Handle Linux setsockopt(fd, level, optname, optval, optlen).
 /// Validates common options and returns success for known-safe ones.
+/// Handle Linux shutdown(fd, how).
+/// SHUT_RD=0, SHUT_WR=1, SHUT_RDWR=2.
+fn handle_shutdown(pi: usize, args: &[u64; 6]) -> u64 {
+    let fd = args[0] as usize;
+    let _how = args[1]; // 0=SHUT_RD, 1=SHUT_WR, 2=SHUT_RDWR
+    if fd >= MAX_FDS { return linux_err(EBADF); }
+    unsafe {
+        if !PROC_TABLE[pi].fds[fd].in_use { return linux_err(EBADF); }
+        if PROC_TABLE[pi].fds[fd].kind != FdKind::Socket { return linux_err(ENOTSOCK); }
+    }
+    // For now, shutdown is a no-op that returns success.
+    // Full half-close semantics would require server-side support.
+    0
+}
+
 fn handle_setsockopt(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
     let level = args[1];
@@ -5111,10 +5146,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_RMDIR | __NR_UNLINK => handle_unlink_impl(pi, caller_port, &msg.data),
             __NR_UNLINKAT => handle_unlinkat(pi, caller_port, &msg.data),
             __NR_CHDIR => handle_chdir(pi, caller_port, &msg.data),
-            __NR_FCHDIR => 0, // stub
+            __NR_FCHDIR => handle_fchdir(pi, &msg.data),
             __NR_GETDENTS64 => handle_getdents64(pi, caller_port, &msg.data),
             __NR_DUP3 => handle_dup3(pi, &msg.data),
-            __NR_PIPE2 => handle_pipe2(pi, caller_port, &msg.data),
+            __NR_PIPE | __NR_PIPE2 => handle_pipe2(pi, caller_port, &msg.data),
             __NR_FORK | __NR_VFORK => handle_fork(pi, caller_port),
             __NR_CLONE => handle_fork(pi, caller_port), // basic clone = fork
             __NR_EXECVE => {
@@ -5243,7 +5278,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_RECVFROM => handle_recvfrom(pi, caller_port, &msg.data),
             __NR_SENDMSG => handle_sendmsg(pi, caller_port, &msg.data),
             __NR_RECVMSG => handle_recvmsg(pi, caller_port, &msg.data),
-            __NR_SHUTDOWN => 0, // stub
+            __NR_SHUTDOWN => handle_shutdown(pi, &msg.data),
             __NR_BIND => handle_bind(pi, caller_port, &msg.data),
             __NR_LISTEN => handle_listen(pi, caller_port, &msg.data),
             __NR_GETSOCKNAME => handle_getsockname(pi, caller_port, &msg.data),

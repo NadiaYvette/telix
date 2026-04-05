@@ -12337,6 +12337,113 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 150: pipe, fchdir, shutdown ---
+    syscall::debug_puts(b"  init: Phase 150 linux pipe/fchdir/shutdown...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+                        const __NR_PIPE: u64 = 22;
+                        const __NR_WRITE: u64 = 1;
+                        const __NR_READ: u64 = 0;
+                        const __NR_CLOSE: u64 = 3;
+                        const __NR_EXIT_GROUP: u64 = 231;
+
+                        // Test pipe: create pipe, write data, read it back
+                        let mut fds: [i32; 2] = [0; 2];
+                        let ret = linux!(__NR_PIPE, fds.as_mut_ptr(), 0u64, 0u64);
+                        if ret != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+                        let read_fd = fds[0] as u64;
+                        let write_fd = fds[1] as u64;
+
+                        // Write 8 bytes
+                        let data: u64 = 0xDEAD_BEEF_CAFE_1234;
+                        let wret = linux!(__NR_WRITE, write_fd, &data as *const u64, 8u64);
+                        if wret != 8 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+
+                        // Read back
+                        let mut rbuf: u64 = 0;
+                        let rret = linux!(__NR_READ, read_fd, &mut rbuf as *mut u64, 8u64);
+                        if rret != 8 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
+                        }
+                        if rbuf != 0xDEAD_BEEF_CAFE_1234 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 94u64, options(noreturn));
+                        }
+
+                        let _ = linux!(__NR_CLOSE, read_fd, 0u64, 0u64);
+                        let _ = linux!(__NR_CLOSE, write_fd, 0u64, 0u64);
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 150 linux pipe/fchdir/shutdown: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 150 linux pipe/fchdir/shutdown: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 150 linux pipe/fchdir/shutdown: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 150 linux pipe/fchdir/shutdown: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
