@@ -463,6 +463,26 @@ impl PendingFdTransfer {
 
 static mut PENDING_FD_TRANSFERS: [PendingFdTransfer; MAX_PENDING_FD_TRANSFERS] = [const { PendingFdTransfer::empty() }; MAX_PENDING_FD_TRANSFERS];
 
+// ---- Futex wait queue ----
+const MAX_FUTEX_WAITERS: usize = 32;
+
+#[derive(Clone, Copy)]
+struct FutexWaiter {
+    active: bool,
+    caller_port: u64,
+    uaddr: u64,       // Virtual address in caller's address space
+    pi: usize,        // Process index (for address-space scoping)
+    deadline_ns: u64,  // 0 = no timeout
+}
+
+impl FutexWaiter {
+    const fn empty() -> Self {
+        Self { active: false, caller_port: 0, uaddr: 0, pi: 0, deadline_ns: 0 }
+    }
+}
+
+static mut FUTEX_TABLE: [FutexWaiter; MAX_FUTEX_WAITERS] = [const { FutexWaiter::empty() }; MAX_FUTEX_WAITERS];
+
 /// Find a process slot by caller_port.
 fn find_proc(port: u64) -> Option<usize> {
     unsafe {
@@ -2035,6 +2055,12 @@ fn handle_exit(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                 do_close(pi, i);
             }
         }
+        // Cancel any pending futex waiters for this process.
+        for i in 0..MAX_FUTEX_WAITERS {
+            if FUTEX_TABLE[i].active && FUTEX_TABLE[i].pi == pi {
+                FUTEX_TABLE[i].active = false;
+            }
+        }
         // Free the process slot.
         PROC_TABLE[pi] = ProcessState::empty();
     }
@@ -2696,10 +2722,12 @@ fn handle_prctl(args: &[u64; 6]) -> u64 {
 
 /// Handle Linux futex(uaddr, op, val, timeout, uaddr2, val3).
 /// Stub: FUTEX_WAIT yields, FUTEX_WAKE returns 0.
-fn handle_futex(args: &[u64; 6]) -> u64 {
-    let _uaddr = args[0];
+/// Handle futex. Returns None to defer reply (WAIT queued), Some(val) for immediate reply.
+fn handle_futex(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
+    let uaddr = args[0];
     let op = args[1] & 0x7F; // Mask out FUTEX_PRIVATE_FLAG
-    let _val = args[2];
+    let val = args[2];
+    let timeout_va = args[3] as usize; // struct timespec* for WAIT
 
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
@@ -2708,13 +2736,78 @@ fn handle_futex(args: &[u64; 6]) -> u64 {
 
     match op {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-            // Can't implement proper futex without kernel delegation.
-            // Yield a few times and return ETIMEDOUT.
-            for _ in 0..5 { syscall::yield_now(); }
-            linux_err(ETIMEDOUT)
+            // Read current value at uaddr in caller's address space.
+            let mut valbuf = [0u8; 4];
+            let copied = syscall::personality_copy_in(caller_port, uaddr as usize, &mut valbuf);
+            if copied < 4 { return Some(linux_err(EFAULT)); }
+            let cur = u32::from_le_bytes(valbuf);
+
+            // If value changed, return EAGAIN immediately.
+            if cur != val as u32 {
+                return Some(linux_err(EAGAIN));
+            }
+
+            // Parse timeout if provided.
+            let mut deadline_ns: u64 = 0;
+            if timeout_va != 0 {
+                let mut tbuf = [0u8; 16];
+                if syscall::personality_copy_in(caller_port, timeout_va, &mut tbuf) >= 16 {
+                    let sec = i64::from_le_bytes([tbuf[0], tbuf[1], tbuf[2], tbuf[3],
+                                                   tbuf[4], tbuf[5], tbuf[6], tbuf[7]]);
+                    let nsec = i64::from_le_bytes([tbuf[8], tbuf[9], tbuf[10], tbuf[11],
+                                                    tbuf[12], tbuf[13], tbuf[14], tbuf[15]]);
+                    let now = syscall::clock_gettime();
+                    deadline_ns = now + (sec as u64) * 1_000_000_000 + (nsec as u64);
+                }
+            }
+
+            // Find a free waiter slot.
+            unsafe {
+                for i in 0..MAX_FUTEX_WAITERS {
+                    if !FUTEX_TABLE[i].active {
+                        FUTEX_TABLE[i] = FutexWaiter {
+                            active: true,
+                            caller_port,
+                            uaddr,
+                            pi,
+                            deadline_ns,
+                        };
+                        return None; // Defer reply.
+                    }
+                }
+            }
+            // No slots — fall back to EAGAIN.
+            Some(linux_err(EAGAIN))
         }
-        FUTEX_WAKE | FUTEX_WAKE_BITSET => 0, // No waiters.
-        _ => linux_err(ENOSYS),
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            let max_wake = val as usize;
+            let mut woken = 0usize;
+            unsafe {
+                for i in 0..MAX_FUTEX_WAITERS {
+                    if woken >= max_wake { break; }
+                    if FUTEX_TABLE[i].active && FUTEX_TABLE[i].uaddr == uaddr && FUTEX_TABLE[i].pi == pi {
+                        syscall::personality_reply(FUTEX_TABLE[i].caller_port, 0);
+                        FUTEX_TABLE[i].active = false;
+                        woken += 1;
+                    }
+                }
+            }
+            Some(woken as u64)
+        }
+        _ => Some(linux_err(ENOSYS)),
+    }
+}
+
+/// Expire timed-out futex waiters. Call once per main loop iteration.
+fn expire_futex_waiters() {
+    let now = syscall::clock_gettime();
+    unsafe {
+        for i in 0..MAX_FUTEX_WAITERS {
+            if FUTEX_TABLE[i].active && FUTEX_TABLE[i].deadline_ns != 0 && now >= FUTEX_TABLE[i].deadline_ns {
+                syscall::personality_reply(FUTEX_TABLE[i].caller_port, linux_err(ETIMEDOUT));
+                FUTEX_TABLE[i].active = false;
+            }
+        }
     }
 }
 
@@ -4439,6 +4532,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"\n");
 
     loop {
+        expire_futex_waiters();
+
         let msg = match syscall::recv_msg(port) {
             Some(m) => m,
             None => continue,
@@ -4521,7 +4616,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_CLOCK_GETRES => handle_clock_getres(caller_port, &msg.data),
             __NR_POLL | __NR_PPOLL => handle_poll(pi, caller_port, &msg.data),
             __NR_PRCTL => handle_prctl(&msg.data),
-            __NR_FUTEX => handle_futex(&msg.data),
+            __NR_FUTEX => {
+                match handle_futex(pi, caller_port, &msg.data) {
+                    Some(v) => v,
+                    None => continue, // WAIT queued, defer reply.
+                }
+            }
             __NR_GETPPID => handle_getppid(),
             __NR_SCHED_YIELD => { syscall::yield_now(); 0 }
             __NR_GETPGRP => syscall::getpgid(0),

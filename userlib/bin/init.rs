@@ -11508,6 +11508,115 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 144: futex WAIT/WAKE ---
+    syscall::debug_puts(b"  init: Phase 144 linux futex...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+                        const __NR_FUTEX: u64 = 202;
+                        const __NR_EXIT_GROUP: u64 = 231;
+                        const FUTEX_WAIT: u64 = 0;
+                        const FUTEX_WAKE: u64 = 1;
+                        const EAGAIN: u64 = 11;
+
+                        // 1. mmap a page for the futex word
+                        let pg: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") 9u64 => pg,
+                            in("rdi") 0u64, in("rsi") 4096u64, in("rdx") 3u64,
+                            in("r10") 0x22u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if pg > 0xFFFF_FFFF_FFFF_F000 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 40u64, options(noreturn));
+                        }
+
+                        // Write initial value 42 to the futex word.
+                        core::ptr::write_volatile(pg as *mut u32, 42);
+
+                        // 2. FUTEX_WAIT with wrong expected value (99) → should return -EAGAIN
+                        let ret = linux!(
+                            __NR_FUTEX, pg, FUTEX_WAIT, 99u64
+                        );
+                        // ret should be -EAGAIN (0xFFFF...FFF5 in two's complement)
+                        if ret != (-(EAGAIN as i64)) as u64 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 41u64, options(noreturn));
+                        }
+
+                        // 3. FUTEX_WAKE with no waiters → should return 0
+                        let woken = linux!(
+                            __NR_FUTEX, pg, FUTEX_WAKE, 1u64
+                        );
+                        if woken != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 42u64, options(noreturn));
+                        }
+
+                        // exit 0 — all futex tests passed
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 144 linux futex: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 144 linux futex: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 144 linux futex: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 144 linux futex: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
