@@ -1486,6 +1486,43 @@ const RLIMIT_AS: u64 = 9;
 const RLIMIT_NPROC: u64 = 6;
 const RLIM_INFINITY: u64 = u64::MAX;
 
+/// Handle Linux getrlimit(resource, rlim).
+fn handle_getrlimit(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let resource = args[0];
+    let rlim_va = args[1] as usize;
+
+    let (cur, max) = match resource {
+        RLIMIT_NOFILE => (1024u64, 4096u64),
+        RLIMIT_STACK => (8 * 1024 * 1024, RLIM_INFINITY),
+        RLIMIT_AS | RLIMIT_DATA | RLIMIT_FSIZE => (RLIM_INFINITY, RLIM_INFINITY),
+        RLIMIT_CORE => (0, RLIM_INFINITY),
+        RLIMIT_CPU => (RLIM_INFINITY, RLIM_INFINITY),
+        RLIMIT_NPROC => (4096, 4096),
+        _ => (RLIM_INFINITY, RLIM_INFINITY),
+    };
+
+    if rlim_va != 0 {
+        let mut rlim = [0u8; 16];
+        rlim[0..8].copy_from_slice(&cur.to_le_bytes());
+        rlim[8..16].copy_from_slice(&max.to_le_bytes());
+        syscall::personality_copy_out(caller_port, rlim_va, &rlim);
+    }
+    0
+}
+
+/// Handle Linux getrusage(who, usage).
+fn handle_getrusage(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let _who = args[0] as i32; // RUSAGE_SELF=0, RUSAGE_CHILDREN=-1
+    let usage_va = args[1] as usize;
+
+    // struct rusage is 144 bytes on x86_64. Zero it out (no resource tracking).
+    if usage_va != 0 {
+        let buf = [0u8; 144];
+        syscall::personality_copy_out(caller_port, usage_va, &buf);
+    }
+    0
+}
+
 /// Handle Linux prlimit64(pid, resource, new_rlim, old_rlim).
 /// Returns sensible defaults for common resource limits.
 fn handle_prlimit64(caller_port: u64, args: &[u64; 6]) -> u64 {
@@ -2821,6 +2858,18 @@ fn handle_futex(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
 
 /// Expire timed-out futex waiters. Call once per main loop iteration.
 fn expire_futex_waiters() {
+    // Quick scan: any active waiters with deadlines?
+    let mut has_deadlines = false;
+    unsafe {
+        for i in 0..MAX_FUTEX_WAITERS {
+            if FUTEX_TABLE[i].active && FUTEX_TABLE[i].deadline_ns != 0 {
+                has_deadlines = true;
+                break;
+            }
+        }
+    }
+    if !has_deadlines { return; }
+
     let now = syscall::clock_gettime();
     unsafe {
         for i in 0..MAX_FUTEX_WAITERS {
@@ -4024,8 +4073,11 @@ fn handle_getsockname(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux getpeername(fd, addr, addrlen).
-fn handle_getpeername(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_getpeername(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
+    let addr_va = args[1] as usize;
+    let addrlen_va = args[2] as usize;
+
     if fd >= MAX_FDS { return linux_err(EBADF); }
     unsafe {
         if !PROC_TABLE[pi].fds[fd].in_use || PROC_TABLE[pi].fds[fd].kind != FdKind::Socket {
@@ -4034,8 +4086,23 @@ fn handle_getpeername(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
         if PROC_TABLE[pi].fds[fd].sock_state != 3 {
             return linux_err(ENOTCONN);
         }
+        let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+        if addr_va != 0 && addrlen_va != 0 {
+            if dom == AF_UNIX as u8 {
+                let mut sa = [0u8; 4];
+                sa[0] = AF_UNIX as u8;
+                syscall::personality_copy_out(caller_port, addr_va, &sa);
+                let len_bytes = (4u32).to_le_bytes();
+                syscall::personality_copy_out(caller_port, addrlen_va, &len_bytes);
+            } else if dom == AF_INET as u8 {
+                let mut sa = [0u8; 16]; // sockaddr_in zeroed (peer unknown)
+                sa[0] = AF_INET as u8;
+                syscall::personality_copy_out(caller_port, addr_va, &sa);
+                let len_bytes = (16u32).to_le_bytes();
+                syscall::personality_copy_out(caller_port, addrlen_va, &len_bytes);
+            }
+        }
     }
-    // Stub: return success without filling addr (caller often checks just for ENOTCONN).
     0
 }
 
@@ -4760,7 +4827,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_PRLIMIT64 => handle_prlimit64(caller_port, &msg.data),
             __NR_MADVISE => 0,
             __NR_SCHED_GETAFFINITY => handle_sched_getaffinity(caller_port, &msg.data),
-            __NR_GETRLIMIT | __NR_GETRUSAGE => 0,
+            __NR_GETRLIMIT => handle_getrlimit(caller_port, &msg.data),
+            __NR_GETRUSAGE => handle_getrusage(caller_port, &msg.data),
             __NR_FTRUNCATE => handle_ftruncate(pi, &msg.data),
             __NR_STATX => handle_statx(pi, caller_port, &msg.data),
             __NR_FCHMOD | __NR_FCHMODAT => 0, // stub: single-user, no permission enforcement

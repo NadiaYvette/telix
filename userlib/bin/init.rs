@@ -8751,7 +8751,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // --- Phase 126: Linux personality directory operations ---
-    // NOTE: Temporarily skipped — reproducible hang under investigation.
+    // NOTE: Still hangs — VFS mkdir from personality tasks deadlocks on REPLY_PORT.
     syscall::debug_puts(b"Phase 126 linux dir ops: SKIPPED (known hang)\n");
     if false {
     syscall::debug_puts(b"  init: Phase 126 linux dir ops...\n");
@@ -8874,7 +8874,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 126 linux dir ops: SKIPPED (linux_srv not found)\n");
         }
     }
-    } // end if false (Phase 126 skip)
+    }
 
     // --- Phase 127: Linux personality syscall coverage ---
     syscall::debug_puts(b"  init: Phase 127 linux syscall coverage...\n");
@@ -11770,6 +11770,127 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         } else {
             syscall::debug_puts(b"Phase 145 linux signals: SKIPPED\n");
+        }
+    }
+
+    // --- Phase 146: getrlimit/getrusage/getpeername fixes ---
+    syscall::debug_puts(b"  init: Phase 146 linux rlimit+rusage...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr, $a0:expr, $a1:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+                        const __NR_GETRLIMIT: u64 = 97;
+                        const __NR_GETRUSAGE: u64 = 98;
+                        const __NR_EXIT_GROUP: u64 = 231;
+                        const RLIMIT_NOFILE: u64 = 7;
+                        const RLIMIT_STACK: u64 = 3;
+
+                        // mmap a page for result buffers
+                        let pg: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") 9u64 => pg,
+                            in("rdi") 0u64, in("rsi") 4096u64, in("rdx") 3u64,
+                            in("r10") 0x22u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if pg > 0xFFFF_FFFF_FFFF_F000 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 70u64, options(noreturn));
+                        }
+
+                        // 1. getrlimit(RLIMIT_NOFILE, rlim) — should return cur=1024, max=4096
+                        let ret = linux!(__NR_GETRLIMIT, RLIMIT_NOFILE, pg);
+                        if ret != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 71u64, options(noreturn));
+                        }
+                        let cur = core::ptr::read_volatile(pg as *const u64);
+                        let max = core::ptr::read_volatile((pg + 8) as *const u64);
+                        if cur != 1024 || max != 4096 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 72u64, options(noreturn));
+                        }
+
+                        // 2. getrlimit(RLIMIT_STACK) — should return cur=8MB
+                        let ret2 = linux!(__NR_GETRLIMIT, RLIMIT_STACK, pg + 256);
+                        if ret2 != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 73u64, options(noreturn));
+                        }
+                        let stack_cur = core::ptr::read_volatile((pg + 256) as *const u64);
+                        if stack_cur != 8 * 1024 * 1024 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 74u64, options(noreturn));
+                        }
+
+                        // 3. getrusage(RUSAGE_SELF, usage) — should return 0, fields zeroed
+                        let ret3 = linux!(__NR_GETRUSAGE, 0u64, pg + 512);
+                        if ret3 != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 75u64, options(noreturn));
+                        }
+                        // First 8 bytes (ru_utime.tv_sec) should be 0
+                        let utime_sec = core::ptr::read_volatile((pg + 512) as *const u64);
+                        if utime_sec != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 76u64, options(noreturn));
+                        }
+
+                        // exit 0
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 146 linux rlimit+rusage: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 146 linux rlimit+rusage: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 146 linux rlimit+rusage: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 146 linux rlimit+rusage: SKIPPED\n");
         }
     }
 
