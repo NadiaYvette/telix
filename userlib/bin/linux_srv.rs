@@ -166,6 +166,27 @@ const __NR_MINCORE: u64 = 27;
 const __NR_PREADV: u64 = 295;
 const __NR_PWRITEV: u64 = 296;
 const __NR_SENDFILE: u64 = 40;
+const __NR_GETXATTR: u64 = 191;
+const __NR_LGETXATTR: u64 = 192;
+const __NR_FGETXATTR: u64 = 193;
+const __NR_SETXATTR: u64 = 188;
+const __NR_LSETXATTR: u64 = 189;
+const __NR_FSETXATTR: u64 = 190;
+const __NR_LISTXATTR: u64 = 194;
+const __NR_LLISTXATTR: u64 = 195;
+const __NR_FLISTXATTR: u64 = 196;
+const __NR_REMOVEXATTR: u64 = 197;
+const __NR_LREMOVEXATTR: u64 = 198;
+const __NR_FREMOVEXATTR: u64 = 199;
+const __NR_INOTIFY_INIT1: u64 = 294;
+const __NR_INOTIFY_ADD_WATCH: u64 = 254;
+const __NR_INOTIFY_RM_WATCH: u64 = 255;
+const __NR_SCHED_SET_ATTR: u64 = 314;
+const __NR_SCHED_GET_ATTR: u64 = 315;
+const __NR_COPY_FILE_RANGE: u64 = 326;
+const __NR_SPLICE: u64 = 275;
+const __NR_TEE: u64 = 276;
+const __NR_VMSPLICE: u64 = 278;
 
 // arch_prctl subcodes
 const ARCH_SET_FS: u64 = 0x1002;
@@ -189,6 +210,7 @@ const EEXIST: u64 = 17;
 const ENOMEM: u64 = 12;
 const ENOTTY: u64 = 25;
 const ETIMEDOUT: u64 = 110;
+const ENODATA: u64 = 61;
 const ENOTSOCK: u64 = 88;
 const EAFNOSUPPORT: u64 = 97;
 const ENOTCONN: u64 = 107;
@@ -5522,6 +5544,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_MUNLOCK | __NR_MUNLOCKALL => 0,
             __NR_MINCORE => handle_mincore(caller_port, &msg.data),
             __NR_SENDFILE => handle_sendfile(pi, caller_port, &msg.data),
+
+            // Phase 153: xattr, inotify, splice stubs.
+            __NR_GETXATTR | __NR_LGETXATTR | __NR_FGETXATTR => linux_err(ENODATA),
+            __NR_SETXATTR | __NR_LSETXATTR | __NR_FSETXATTR => linux_err(ENOSYS), // no xattr support
+            __NR_LISTXATTR | __NR_LLISTXATTR | __NR_FLISTXATTR => 0, // empty list, 0 bytes
+            __NR_REMOVEXATTR | __NR_LREMOVEXATTR | __NR_FREMOVEXATTR => linux_err(ENODATA),
+            __NR_INOTIFY_INIT1 => linux_err(ENOSYS), // no inotify support
+            __NR_INOTIFY_ADD_WATCH | __NR_INOTIFY_RM_WATCH => linux_err(EBADF),
+            __NR_SCHED_SET_ATTR => 0, // ignore scheduling attributes
+            __NR_SCHED_GET_ATTR => linux_err(EINVAL), // unsupported, force fallback to getparam
+            __NR_COPY_FILE_RANGE => linux_err(ENOSYS), // not supported yet
+            __NR_SPLICE | __NR_TEE | __NR_VMSPLICE => linux_err(ENOSYS), // no pipe splice support
 
             // Phase 129: Socket syscalls.
             __NR_SOCKET => handle_socket(pi, caller_port, &msg.data),
