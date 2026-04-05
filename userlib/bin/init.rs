@@ -10793,6 +10793,185 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 139: statx, fchmod, fchown ---
+    syscall::debug_puts(b"  init: Phase 139 linux file metadata...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") 0u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") 0u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+                        // statx uses 5 args — need a 5-arg macro
+                        macro_rules! linux5 {
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") $a4 as u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+
+                        // 1. memfd_create for a test fd
+                        let name = *b"test\0";
+                        let mfd = linux!(319u64, name.as_ptr() as u64, 0u64);
+                        if mfd > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
+                        }
+                        // Write some data so file_size > 0
+                        let data = *b"statx test data!";
+                        linux!(1u64, mfd, data.as_ptr() as u64, 16u64);
+
+                        // 2. statx(fd, "", AT_EMPTY_PATH=0x1000, STATX_ALL=0xFFF, buf) — NR 332
+                        let empty = *b"\0";
+                        let mut sxbuf = [0u8; 256];
+                        let sr = linux5!(332u64, mfd, empty.as_ptr() as u64,
+                                         0x1000u64, 0xFFFu64, sxbuf.as_mut_ptr() as u64);
+                        if sr > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 11u64, options(noreturn));
+                        }
+                        // Check stx_size at offset 40: should be 16
+                        let stx_size = u64::from_le_bytes([
+                            core::ptr::read_volatile(&sxbuf[40]),
+                            core::ptr::read_volatile(&sxbuf[41]),
+                            core::ptr::read_volatile(&sxbuf[42]),
+                            core::ptr::read_volatile(&sxbuf[43]),
+                            core::ptr::read_volatile(&sxbuf[44]),
+                            core::ptr::read_volatile(&sxbuf[45]),
+                            core::ptr::read_volatile(&sxbuf[46]),
+                            core::ptr::read_volatile(&sxbuf[47]),
+                        ]);
+                        if stx_size != 16 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 12u64, options(noreturn));
+                        }
+
+                        // 3. statx(AT_FDCWD, "/", 0, STATX_ALL, buf) — path-based
+                        let root = *b"/\0";
+                        let sr2 = linux5!(332u64, (-100i64) as u64, root.as_ptr() as u64,
+                                          0u64, 0xFFFu64, sxbuf.as_mut_ptr() as u64);
+                        if sr2 > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 13u64, options(noreturn));
+                        }
+                        // stx_mode at offset 28 (u16) should have S_IFDIR bit (0o040000)
+                        let stx_mode = u16::from_le_bytes([
+                            core::ptr::read_volatile(&sxbuf[28]),
+                            core::ptr::read_volatile(&sxbuf[29]),
+                        ]);
+                        if stx_mode & 0o040000 == 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 14u64, options(noreturn));
+                        }
+
+                        // 4. fchmod(mfd, 0o755) — NR 91 — stub returns 0
+                        let fm = linux!(91u64, mfd, 0o755u64);
+                        if fm > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 15u64, options(noreturn));
+                        }
+
+                        // 5. fchown(mfd, 0, 0) — NR 93 — stub returns 0
+                        let fo = linux!(93u64, mfd, 0u64, 0u64);
+                        if fo > 0xFFFF_FFFF_FFFF_FF00 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 16u64, options(noreturn));
+                        }
+
+                        // 6. close + exit 0
+                        linux!(3u64, mfd);
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..500 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 139 linux file metadata: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 139 linux file metadata: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 139 linux file metadata: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 139 linux file metadata: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
