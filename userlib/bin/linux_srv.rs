@@ -144,6 +144,14 @@ const __NR_RENAMEAT: u64 = 264;
 const __NR_RENAMEAT2: u64 = 316;
 const __NR_STATX: u64 = 332;
 const __NR_CLONE3: u64 = 435;
+const __NR_FSYNC: u64 = 74;
+const __NR_FDATASYNC: u64 = 75;
+const __NR_SYMLINK: u64 = 88;
+const __NR_LINK: u64 = 86;
+const __NR_SYMLINKAT: u64 = 266;
+const __NR_LINKAT: u64 = 265;
+const __NR_UTIMENSAT: u64 = 280;
+const __NR_FALLOCATE: u64 = 285;
 
 // arch_prctl subcodes
 const ARCH_SET_FS: u64 = 0x1002;
@@ -5238,7 +5246,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_TIMERFD_GETTIME => handle_timerfd_gettime(pi, caller_port, &msg.data),
 
             __NR_MEMFD_CREATE => handle_memfd_create(pi, caller_port, &msg.data),
-            __NR_CLONE3 => linux_err(ENOSYS),
+            __NR_CLONE3 => handle_fork(pi, caller_port), // basic clone3 → fork fallback
 
             // mmap: anonymous or file-backed mapping in caller's address space.
             __NR_MMAP => handle_mmap(pi, caller_port, &msg.data),
@@ -5269,6 +5277,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_RENAME | __NR_RENAMEAT | __NR_RENAMEAT2 => linux_err(ENOSYS),
             __NR_FLOCK => 0, // stub: no mandatory locking
             __NR_TRUNCATE => linux_err(ENOSYS), // needs VFS_TRUNCATE
+
+            // Phase 151: sync/persistence stubs + misc.
+            __NR_FSYNC | __NR_FDATASYNC => 0, // no durable storage, always "synced"
+            __NR_FALLOCATE => 0, // no-op: space is allocated on write
+            __NR_UTIMENSAT => 0, // stub: timestamp changes ignored
+            __NR_SYMLINK | __NR_SYMLINKAT => linux_err(ENOSYS), // no symlink support
+            __NR_LINK | __NR_LINKAT => linux_err(ENOSYS), // no hard link support
 
             // Phase 129: Socket syscalls.
             __NR_SOCKET => handle_socket(pi, caller_port, &msg.data),
