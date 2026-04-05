@@ -329,6 +329,23 @@ impl FdEntry {
 }
 
 /// Per-process state, keyed by caller_port (unique per Linux task).
+const NUM_SIGNALS: usize = 64;
+
+/// Per-signal handler entry (mirrors kernel struct sigaction layout).
+#[derive(Clone, Copy)]
+struct SigAction {
+    handler: u64,   // sa_handler / sa_sigaction
+    flags: u64,     // sa_flags
+    restorer: u64,  // sa_restorer
+    mask: u64,      // sa_mask (first 64 signals)
+}
+
+impl SigAction {
+    const fn default() -> Self {
+        Self { handler: 0, flags: 0, restorer: 0, mask: 0 } // SIG_DFL = 0
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ProcessState {
     active: bool,
@@ -340,6 +357,8 @@ struct ProcessState {
     cwd_len: usize,
     umask: u32,
     tls_base: u64,
+    sig_actions: [SigAction; NUM_SIGNALS],
+    sig_mask: u64,    // blocked signal mask
 }
 
 impl ProcessState {
@@ -354,6 +373,8 @@ impl ProcessState {
             cwd_len: 0,
             umask: 0,
             tls_base: 0,
+            sig_actions: [const { SigAction::default() }; NUM_SIGNALS],
+            sig_mask: 0,
         }
     }
 }
@@ -2811,6 +2832,97 @@ fn expire_futex_waiters() {
     }
 }
 
+/// Handle rt_sigaction(signum, act, oldact, sigsetsize).
+/// Saves/retrieves per-process signal handlers (no kernel delivery yet).
+fn handle_rt_sigaction(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let signum = args[0] as usize;
+    let act_va = args[1] as usize;
+    let oldact_va = args[2] as usize;
+    let sigsetsize = args[3] as usize;
+
+    // Validate signal number (1-based, 1..=64, SIGKILL=9 and SIGSTOP=19 can't be caught).
+    if signum == 0 || signum > NUM_SIGNALS { return linux_err(EINVAL); }
+    if sigsetsize != 8 { return linux_err(EINVAL); }
+    let idx = signum - 1;
+
+    // Return old action if requested.
+    if oldact_va != 0 {
+        let sa = unsafe { &PROC_TABLE[pi].sig_actions[idx] };
+        let mut buf = [0u8; 32]; // handler(8) + flags(8) + restorer(8) + mask(8)
+        buf[0..8].copy_from_slice(&sa.handler.to_le_bytes());
+        buf[8..16].copy_from_slice(&sa.flags.to_le_bytes());
+        buf[16..24].copy_from_slice(&sa.restorer.to_le_bytes());
+        buf[24..32].copy_from_slice(&sa.mask.to_le_bytes());
+        syscall::personality_copy_out(caller_port, oldact_va, &buf);
+    }
+
+    // Set new action if provided.
+    if act_va != 0 {
+        // SIGKILL(9) and SIGSTOP(19) cannot be caught.
+        if signum == 9 || signum == 19 { return linux_err(EINVAL); }
+
+        let mut buf = [0u8; 32];
+        let copied = syscall::personality_copy_in(caller_port, act_va, &mut buf);
+        if copied < 32 { return linux_err(EFAULT); }
+
+        unsafe {
+            PROC_TABLE[pi].sig_actions[idx] = SigAction {
+                handler: u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3],
+                                              buf[4], buf[5], buf[6], buf[7]]),
+                flags: u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11],
+                                            buf[12], buf[13], buf[14], buf[15]]),
+                restorer: u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19],
+                                               buf[20], buf[21], buf[22], buf[23]]),
+                mask: u64::from_le_bytes([buf[24], buf[25], buf[26], buf[27],
+                                           buf[28], buf[29], buf[30], buf[31]]),
+            };
+        }
+    }
+
+    0
+}
+
+/// Handle rt_sigprocmask(how, set, oldset, sigsetsize).
+fn handle_rt_sigprocmask(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let how = args[0];
+    let set_va = args[1] as usize;
+    let oldset_va = args[2] as usize;
+    let sigsetsize = args[3] as usize;
+
+    if sigsetsize != 8 { return linux_err(EINVAL); }
+
+    const SIG_BLOCK: u64 = 0;
+    const SIG_UNBLOCK: u64 = 1;
+    const SIG_SETMASK: u64 = 2;
+
+    // Return old mask if requested.
+    if oldset_va != 0 {
+        let mask = unsafe { PROC_TABLE[pi].sig_mask };
+        syscall::personality_copy_out(caller_port, oldset_va, &mask.to_le_bytes());
+    }
+
+    // Apply new mask if provided.
+    if set_va != 0 {
+        let mut buf = [0u8; 8];
+        let copied = syscall::personality_copy_in(caller_port, set_va, &mut buf);
+        if copied < 8 { return linux_err(EFAULT); }
+        let new_set = u64::from_le_bytes(buf);
+
+        // SIGKILL(9) and SIGSTOP(19) cannot be blocked.
+        let unblockable = (1u64 << 8) | (1u64 << 18); // bits for signals 9 and 19 (1-indexed)
+        unsafe {
+            match how {
+                SIG_BLOCK => PROC_TABLE[pi].sig_mask |= new_set & !unblockable,
+                SIG_UNBLOCK => PROC_TABLE[pi].sig_mask &= !new_set,
+                SIG_SETMASK => PROC_TABLE[pi].sig_mask = new_set & !unblockable,
+                _ => return linux_err(EINVAL),
+            }
+        }
+    }
+
+    0
+}
+
 /// Handle Linux clock_getres(clockid, res).
 fn handle_clock_getres(caller_port: u64, args: &[u64; 6]) -> u64 {
     let res_va = args[1] as usize;
@@ -4635,9 +4747,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
             __NR_GETSID => syscall::getsid(msg.data[0]),
 
-            // Signal stubs (real delegation requires kernel support).
-            __NR_RT_SIGACTION => 0,    // Pretend success.
-            __NR_RT_SIGPROCMASK => 0,  // Pretend success.
+            // Signal handling (state tracked, no delivery yet).
+            __NR_RT_SIGACTION => handle_rt_sigaction(pi, caller_port, &msg.data),
+            __NR_RT_SIGPROCMASK => handle_rt_sigprocmask(pi, caller_port, &msg.data),
             __NR_RT_SIGRETURN => 0,
             __NR_SIGALTSTACK => 0,  // stub — no alternate signal stack yet
             __NR_TGKILL => handle_tgkill(caller_port, &msg.data),
