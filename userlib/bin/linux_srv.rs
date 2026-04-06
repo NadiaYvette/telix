@@ -375,6 +375,9 @@ enum FdKind {
     EventFd,
     TimerFd,
     MemFd,
+    DevNull,
+    DevZero,
+    DevUrandom,
 }
 
 #[derive(Clone, Copy)]
@@ -765,6 +768,11 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             PROC_TABLE[pi].fds[fd_idx].offset = new_end as u64;
             return total as u64;
         }
+        // Virtual device writes — all discard data, report success.
+        let dk = PROC_TABLE[pi].fds[fd_idx].kind;
+        if dk == FdKind::DevNull || dk == FdKind::DevZero || dk == FdKind::DevUrandom {
+            return count as u64;
+        }
     }
     linux_err(EBADF)
 }
@@ -914,6 +922,36 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             PROC_TABLE[pi].fds[fd].offset += total as u64;
             return total as u64;
         }
+    }
+
+    // Virtual device reads.
+    if kind == FdKind::DevNull {
+        return 0; // /dev/null always returns EOF
+    }
+    if kind == FdKind::DevZero {
+        // Fill caller's buffer with zeros.
+        let mut zeros = [0u8; 512];
+        let mut total = 0usize;
+        while total < count {
+            let chunk = (count - total).min(512);
+            let written = syscall::personality_copy_out(caller_port, buf_va + total, &zeros[..chunk]);
+            if written == 0 { break; }
+            total += written;
+        }
+        return total as u64;
+    }
+    if kind == FdKind::DevUrandom {
+        // Fill caller's buffer with random bytes from getrandom.
+        let mut rbuf = [0u8; 512];
+        let mut total = 0usize;
+        while total < count {
+            let chunk = (count - total).min(512);
+            syscall::getrandom(rbuf.as_mut_ptr() as usize, chunk);
+            let written = syscall::personality_copy_out(caller_port, buf_va + total, &rbuf[..chunk]);
+            if written == 0 { break; }
+            total += written;
+        }
+        return total as u64;
     }
 
     if offset >= file_size {
@@ -1373,6 +1411,27 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         return linux_err(ENOENT);
     }
 
+    // Virtual device files — intercept before going to VFS.
+    let dev_kind = match &path[..pathlen] {
+        b"/dev/null" => Some(FdKind::DevNull),
+        b"/dev/zero" => Some(FdKind::DevZero),
+        b"/dev/urandom" | b"/dev/random" => Some(FdKind::DevUrandom),
+        _ => None,
+    };
+    if let Some(kind) = dev_kind {
+        let fd = match alloc_fd(pi) {
+            Some(f) => f,
+            None => return linux_err(EMFILE),
+        };
+        unsafe {
+            PROC_TABLE[pi].fds[fd].kind = kind;
+            if flags & 0x80000 != 0 { // O_CLOEXEC
+                PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+            }
+        }
+        return fd as u64;
+    }
+
     // Pack path into two u64 words (little-endian).
     let mut w0 = 0u64;
     let mut w1 = 0u64;
@@ -1515,6 +1574,7 @@ fn do_close(pi: usize, fd: usize) {
                     MEMFD_TABLE[idx] = MemFdSlot::empty();
                 }
             }
+            FdKind::DevNull | FdKind::DevZero | FdKind::DevUrandom => {} // No resources to free.
             FdKind::None => {}
         }
         PROC_TABLE[pi].fds[fd] = FdEntry::empty();
@@ -1587,6 +1647,24 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         return linux_err(EFAULT);
     }
     let pathlen = path.iter().position(|&b| b == 0).unwrap_or(copied);
+
+    // Virtual device stat — return char device for /dev/*.
+    let dev_rdev: Option<u64> = match &path[..pathlen] {
+        b"/dev/null" => Some((1 << 8) | 3),
+        b"/dev/zero" => Some((1 << 8) | 5),
+        b"/dev/urandom" | b"/dev/random" => Some((1 << 8) | 9),
+        _ => None,
+    };
+    if let Some(rdev) = dev_rdev {
+        let mut stat_buf = [0u8; 144];
+        let mode: u32 = 0o020666; // S_IFCHR | 0666
+        stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
+        stat_buf[40..48].copy_from_slice(&rdev.to_le_bytes());
+        stat_buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+        let written = syscall::personality_copy_out(caller_port, statbuf_va, &stat_buf);
+        if written < 144 { return linux_err(EFAULT); }
+        return 0;
+    }
 
     let mut w0 = 0u64;
     let mut w1 = 0u64;
@@ -1667,6 +1745,26 @@ fn handle_fstat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             if written < 144 { return linux_err(EFAULT); }
             return 0;
         }
+        // Virtual device fstat — report as character device.
+        let dk = PROC_TABLE[pi].fds[fd].kind;
+        if dk == FdKind::DevNull || dk == FdKind::DevZero || dk == FdKind::DevUrandom {
+            let mut stat_buf = [0u8; 144];
+            let mode: u32 = 0o020666; // S_IFCHR | 0666
+            stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
+            // st_rdev: /dev/null=1:3, /dev/zero=1:5, /dev/urandom=1:9
+            let rdev: u64 = match dk {
+                FdKind::DevNull => (1 << 8) | 3,
+                FdKind::DevZero => (1 << 8) | 5,
+                FdKind::DevUrandom => (1 << 8) | 9,
+                _ => 0,
+            };
+            stat_buf[40..48].copy_from_slice(&rdev.to_le_bytes());
+            stat_buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+            let written = syscall::personality_copy_out(caller_port, statbuf_va, &stat_buf);
+            if written < 144 { return linux_err(EFAULT); }
+            return 0;
+        }
+
         let file_size = PROC_TABLE[pi].fds[fd].file_size;
         let mut stat_buf = [0u8; 144];
         let mode: u32 = 0o100644; // S_IFREG | 0644
@@ -4985,6 +5083,8 @@ fn poll_single_fd(pi: usize, fd: usize) -> u32 {
                 }
             }
             FdKind::MemFd | FdKind::File | FdKind::Dir => EPOLLIN | EPOLLOUT,
+            FdKind::DevNull => EPOLLOUT, // writable sink
+            FdKind::DevZero | FdKind::DevUrandom => EPOLLIN | EPOLLOUT, // always readable
             _ => EPOLLERR,
         }
     }
