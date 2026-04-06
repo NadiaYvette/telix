@@ -1702,6 +1702,28 @@ fn open_proc_file(pi: usize, _caller_port: u64, path: &[u8], flags: u64) -> u64 
         let n = content.len().min(PROCBUF_SIZE);
         buf[..n].copy_from_slice(&content[..n]);
         len = n;
+    } else if path == b"/proc/cpuinfo" {
+        // Minimal /proc/cpuinfo — single core.
+        let content = b"processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 142\nmodel name\t: QEMU Virtual CPU\nstepping\t: 1\ncpu MHz\t\t: 2000.000\ncache size\t: 4096 KB\nphysical id\t: 0\ncpu cores\t: 1\nflags\t\t: fpu sse sse2 sse3 ssse3 sse4_1 sse4_2\nbogomips\t: 4000.00\n\n";
+        let n = content.len().min(PROCBUF_SIZE);
+        buf[..n].copy_from_slice(&content[..n]);
+        len = n;
+    } else if path == b"/proc/meminfo" {
+        // Minimal /proc/meminfo — 256MB QEMU.
+        let content = b"MemTotal:         262144 kB\nMemFree:          200000 kB\nMemAvailable:     220000 kB\nBuffers:               0 kB\nCached:            32768 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\n";
+        let n = content.len().min(PROCBUF_SIZE);
+        buf[..n].copy_from_slice(&content[..n]);
+        len = n;
+    } else if path == b"/proc/sys/kernel/osrelease" {
+        let content = b"6.1.0-telix\n";
+        let n = content.len().min(PROCBUF_SIZE);
+        buf[..n].copy_from_slice(&content[..n]);
+        len = n;
+    } else if path == b"/proc/sys/kernel/version" {
+        let content = b"#1 SMP Telix\n";
+        let n = content.len().min(PROCBUF_SIZE);
+        buf[..n].copy_from_slice(&content[..n]);
+        len = n;
     } else {
         return linux_err(ENOENT);
     }
@@ -1907,7 +1929,9 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
 
     // /proc pseudo-filesystem stat — return directory or regular file.
     let is_proc_dir = match &path[..pathlen] {
-        b"/proc" | b"/proc/" | b"/proc/self" | b"/proc/self/" | b"/dev" | b"/dev/" => true,
+        b"/proc" | b"/proc/" | b"/proc/self" | b"/proc/self/"
+        | b"/proc/sys" | b"/proc/sys/" | b"/proc/sys/kernel" | b"/proc/sys/kernel/"
+        | b"/dev" | b"/dev/" => true,
         _ => false,
     };
     if is_proc_dir {
@@ -1919,8 +1943,12 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         if written < 144 { return linux_err(EFAULT); }
         return 0;
     }
-    // /proc/self/* regular files.
-    if pathlen >= 11 && &path[..11] == b"/proc/self/" {
+    // /proc/* regular files (cpuinfo, meminfo, sys/..., self/*).
+    let is_proc_file = (pathlen >= 11 && &path[..11] == b"/proc/self/")
+        || path[..pathlen] == *b"/proc/cpuinfo"
+        || path[..pathlen] == *b"/proc/meminfo"
+        || (pathlen >= 17 && &path[..17] == b"/proc/sys/kernel/");
+    if is_proc_file {
         let mut stat_buf = [0u8; 144];
         let mode: u32 = 0o100444; // S_IFREG | 0444
         stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());

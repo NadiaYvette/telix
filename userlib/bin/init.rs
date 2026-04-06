@@ -13720,6 +13720,157 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 164: /proc/cpuinfo + /proc/meminfo + /proc/sys ---
+    syscall::debug_puts(b"  init: Phase 164 linux procfs+sysfs...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_OPEN: u64 = 2;
+                        const __NR_READ: u64 = 0;
+                        const __NR_CLOSE: u64 = 3;
+                        const __NR_EXIT_GROUP: u64 = 231;
+
+                        // Test 1: open + read /proc/cpuinfo — should contain "processor".
+                        let r: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_OPEN => r,
+                            in("rdi") b"/proc/cpuinfo\0".as_ptr() as u64,
+                            in("rsi") 0u64, in("rdx") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+                        let fd1 = r;
+                        let mut buf1 = [0u8; 256];
+                        let r2: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_READ => r2,
+                            in("rdi") fd1, in("rsi") buf1.as_mut_ptr() as u64, in("rdx") 256u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r2 as i64) <= 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+                        // Verify it starts with "processor".
+                        let n = r2 as usize;
+                        if n < 9 || buf1[0] != b'p' || buf1[1] != b'r' || buf1[2] != b'o' {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
+                        }
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _, in("rdi") fd1,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        // Test 2: open + read /proc/meminfo — should contain "MemTotal".
+                        let r3: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_OPEN => r3,
+                            in("rdi") b"/proc/meminfo\0".as_ptr() as u64,
+                            in("rsi") 0u64, in("rdx") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r3 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 94u64, options(noreturn));
+                        }
+                        let fd2 = r3;
+                        let mut buf2 = [0u8; 256];
+                        let r4: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_READ => r4,
+                            in("rdi") fd2, in("rsi") buf2.as_mut_ptr() as u64, in("rdx") 256u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r4 as i64) <= 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 95u64, options(noreturn));
+                        }
+                        // Verify starts with "Mem".
+                        if buf2[0] != b'M' || buf2[1] != b'e' || buf2[2] != b'm' {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 96u64, options(noreturn));
+                        }
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _, in("rdi") fd2,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        // Test 3: open /proc/sys/kernel/osrelease — should contain "telix".
+                        let r5: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_OPEN => r5,
+                            in("rdi") b"/proc/sys/kernel/osrelease\0".as_ptr() as u64,
+                            in("rsi") 0u64, in("rdx") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r5 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 97u64, options(noreturn));
+                        }
+                        let fd3 = r5;
+                        let mut buf3 = [0u8; 64];
+                        let r6: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_READ => r6,
+                            in("rdi") fd3, in("rsi") buf3.as_mut_ptr() as u64, in("rdx") 64u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r6 as i64) <= 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 98u64, options(noreturn));
+                        }
+                        // Verify it contains "telix".
+                        let n3 = r6 as usize;
+                        let mut found_telix = false;
+                        if n3 >= 5 {
+                            for i in 0..n3 - 4 {
+                                if buf3[i] == b't' && buf3[i+1] == b'e' && buf3[i+2] == b'l'
+                                    && buf3[i+3] == b'i' && buf3[i+4] == b'x' {
+                                    found_telix = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !found_telix {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 99u64, options(noreturn));
+                        }
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _, in("rdi") fd3,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 164 linux procfs+sysfs: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 164 linux procfs+sysfs: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 164 linux procfs+sysfs: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 164 linux procfs+sysfs: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
