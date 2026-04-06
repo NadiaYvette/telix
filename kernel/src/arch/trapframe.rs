@@ -254,6 +254,31 @@ pub fn user_sp(frame: &ExceptionFrame) -> usize {
     } // sp = $29
 }
 
+/// Set the user-mode stack pointer in an exception frame.
+#[inline]
+pub fn set_user_sp(frame: &mut ExceptionFrame, sp: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        frame.sp = sp as u64;
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        frame.regs[1] = sp as u64;
+    } // sp = x2, stored at index 1
+    #[cfg(target_arch = "x86_64")]
+    {
+        frame.set_rsp(sp as u64);
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        frame.regs[3] = sp as u64;
+    } // sp = $r3
+    #[cfg(target_arch = "mips64")]
+    {
+        frame.regs[29] = sp as u64;
+    } // sp = $29
+}
+
 // ---------------------------------------------------------------------------
 // Frame initialization (raw pointer access for stack setup)
 // ---------------------------------------------------------------------------

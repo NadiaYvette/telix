@@ -2980,6 +2980,111 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     child_task_port
 }
 
+/// Clone a new thread within the same task (CLONE_VM | CLONE_THREAD semantics).
+///
+/// Copies the parent thread's exception frame, sets return value to 0, applies
+/// the new stack pointer and TLS base.  The new thread resumes at the same IP
+/// as the parent — exactly what Linux clone(CLONE_VM|CLONE_THREAD) expects.
+///
+/// Returns the new thread's port_id, or u64::MAX on error.
+pub fn clone_thread_in_task(
+    task_id: u32,
+    parent_tid: u32,
+    child_stack: u64,
+    tls_base: u64,
+) -> u64 {
+    // Read parent's saved personality exception frame.
+    let parent_frame_sp = thread_ref(parent_tid).personality_frame_sp as usize;
+    if parent_frame_sp == 0 {
+        return u64::MAX;
+    }
+
+    let parent_priority = thread_ref(parent_tid).base_priority;
+    let parent_quantum = thread_ref(parent_tid).default_quantum;
+    let parent_sig_mask = thread_ref(parent_tid).sig_mask;
+
+    // Allocate kernel stack for the new thread.
+    let kstack_page = match crate::mm::phys::alloc_pages(KSTACK_ORDER) {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
+    let kstack_base = kstack_page.as_usize();
+    let kstack_top = kstack_base + kstack_size();
+
+    // Copy parent's exception frame to the new thread's kernel stack.
+    let child_frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            parent_frame_sp as *const u8,
+            child_frame_sp as *mut u8,
+            EXCEPTION_FRAME_SIZE,
+        );
+    }
+
+    // Set return value to 0 (child sees clone() return 0).
+    {
+        let child_frame =
+            unsafe { &mut *(child_frame_sp as *mut crate::syscall::handlers::ExceptionFrame) };
+        crate::syscall::handlers::set_return(child_frame, 0);
+        // Set child's user stack pointer.
+        if child_stack != 0 {
+            crate::arch::trapframe::set_user_sp(child_frame, child_stack as usize);
+        }
+    }
+
+    // Allocate thread ID and port.
+    let child_tid = match {
+        let _lock = SPAWN_LOCK.lock();
+        alloc_thread_id()
+    } {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let child_thread_port =
+        match crate::ipc::port::create_kernel_port(thread_port_handler, child_tid as usize) {
+            Some(p) => p,
+            None => return u64::MAX,
+        };
+
+    // Initialize the new thread — same task, shared address space.
+    let thread = unsafe { thread_mut_from_ref(child_tid) };
+    thread.killed.store(false, Ordering::Release);
+    thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
+    thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+
+    thread.id = child_tid;
+    thread.state = ThreadState::Ready;
+    thread.task_id = task_id;
+    thread.port_id = child_thread_port;
+    thread.base_priority = parent_priority;
+    thread.effective_priority = parent_priority;
+    thread.prio.store(parent_priority, Ordering::Relaxed);
+    thread.thread_task.store(task_id, Ordering::Relaxed);
+    thread.quantum = parent_quantum;
+    thread.default_quantum = parent_quantum;
+    thread.saved_sp = child_frame_sp as u64;
+    thread.stack_base = kstack_base;
+    thread.exit_code = 0;
+    thread.sig_mask = parent_sig_mask;
+    thread.sig_pending = 0;
+    thread.tls_base = tls_base;
+
+    let ts = crate::sync::turnstile::alloc_thread_turnstile();
+    thread.turnstile.store(ts, Ordering::Relaxed);
+
+    unsafe { task_mut_from_ref(task_id) }.thread_count += 1;
+    percpu_enqueue(smp::cpu_id(), parent_priority, child_tid);
+
+    // Grant caps on the new thread's port.
+    {
+        use crate::cap::capability::Rights;
+        let srm = Rights::SEND.union(Rights::RECV).union(Rights::MANAGE);
+        crate::cap::grant_port_cap(task_id, child_thread_port, srm);
+    }
+
+    child_thread_port
+}
+
 /// Wait for a child of the given target task (non-blocking).
 ///
 /// Like `wait4()` but scans children of `target_task_id` instead of the calling

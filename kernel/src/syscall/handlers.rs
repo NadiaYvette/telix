@@ -129,6 +129,7 @@ pub const SYS_PERSONALITY_MUNMAP: u64 = 0xF00B;
 pub const SYS_PERSONALITY_MPROTECT: u64 = 0xF00C;
 pub const SYS_PERSONALITY_MREMAP: u64 = 0xF00D;
 pub const SYS_PERSONALITY_SET_TLS: u64 = 0xF00E;
+pub const SYS_PERSONALITY_THREAD_CREATE: u64 = 0xF00F;
 pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 pub const SYS_PORT_ALIVE: u64 = 110;
 
@@ -202,7 +203,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         && nr != SYS_PERSONALITY_EXECVE
         && nr != SYS_PERSONALITY_MMAP_ANON && nr != SYS_PERSONALITY_MUNMAP
         && nr != SYS_PERSONALITY_MPROTECT && nr != SYS_PERSONALITY_MREMAP
-        && nr != SYS_PERSONALITY_SET_TLS {
+        && nr != SYS_PERSONALITY_SET_TLS
+        && nr != SYS_PERSONALITY_THREAD_CREATE {
         let tid = crate::sched::smp::current()
             .current_thread
             .load(core::sync::atomic::Ordering::Relaxed);
@@ -476,6 +478,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_PERSONALITY_SET_TLS => {
             crate::syscall::personality::personality_set_tls(a0, a1)
+        }
+        SYS_PERSONALITY_THREAD_CREATE => {
+            crate::syscall::personality::personality_thread_create(a0, a1, a2, a3, a4)
         }
         SYS_FRAMEBUFFER_INFO => sys_framebuffer_info(frame),
         _ => {

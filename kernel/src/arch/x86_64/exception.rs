@@ -130,6 +130,9 @@ impl ExceptionFrame {
     pub fn set_r10(&mut self, v: u64) {
         self.regs[5] = v;
     }
+    pub fn set_rsp(&mut self, v: u64) {
+        self.regs[20] = v;
+    }
 }
 
 /// Number of u64 values in the exception frame.

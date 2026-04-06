@@ -2948,7 +2948,7 @@ fn handle_close_range(pi: usize, args: &[u64; 6]) -> u64 {
     0
 }
 
-/// Handle Linux fork() / vfork() / clone() (basic).
+/// Handle Linux fork() / vfork() / clone() (basic — no CLONE_VM).
 fn handle_fork(pi: usize, caller_port: u64) -> u64 {
     let child_port = syscall::personality_fork(caller_port);
     if child_port == u64::MAX {
@@ -2970,6 +2970,68 @@ fn handle_fork(pi: usize, caller_port: u64) -> u64 {
         // If no slot available, child runs without tracked state (will auto-create on first syscall).
     }
     child_port
+}
+
+// Linux clone flags.
+const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_SETTLS: u64 = 0x0008_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+const CLONE_SIGHAND: u64 = 0x0000_0800;
+
+/// Handle Linux clone() with thread support.
+///
+/// clone(flags, child_stack, parent_tid_ptr, child_tid_ptr, tls)
+///
+/// If CLONE_VM | CLONE_THREAD are set, creates a new thread in the caller's
+/// address space using personality_thread_create.  Otherwise falls back to fork.
+fn handle_clone(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let flags = args[0];
+    let child_stack = args[1];
+    let parent_tid_ptr = args[2] as usize;
+    let child_tid_ptr = args[3] as usize;
+    let tls = args[4];
+
+    // If not requesting shared address space, fall back to fork.
+    if flags & CLONE_VM == 0 {
+        return handle_fork(pi, caller_port);
+    }
+
+    // Thread creation: CLONE_VM is set.
+    // The kernel will copy the parent's exception frame, set return value to 0,
+    // and apply the new stack pointer + TLS base.
+    let tls_base = if flags & CLONE_SETTLS != 0 { tls } else { 0 };
+
+    let thread_port = syscall::personality_thread_create(
+        caller_port,
+        child_stack,
+        tls_base,
+        0, // flags (reserved)
+        0, // ctid_va (reserved)
+    );
+    if thread_port == u64::MAX {
+        return linux_err(EAGAIN);
+    }
+
+    // Write the new thread's TID to parent_tid_ptr if CLONE_PARENT_SETTID.
+    if flags & CLONE_PARENT_SETTID != 0 && parent_tid_ptr != 0 {
+        let tid_bytes = (thread_port as u32).to_ne_bytes();
+        syscall::personality_copy_out(caller_port, parent_tid_ptr, &tid_bytes);
+    }
+
+    // Write the new thread's TID to child_tid_ptr if CLONE_CHILD_CLEARTID.
+    // (The actual clear-on-exit + futex wake is not yet implemented, but
+    // writing the tid now is required for pthread_create to work.)
+    if flags & CLONE_CHILD_CLEARTID != 0 && child_tid_ptr != 0 {
+        let tid_bytes = (thread_port as u32).to_ne_bytes();
+        // Write into the *child's* address space — but since CLONE_VM, it's
+        // the same address space as the parent, so writing via caller_port works.
+        syscall::personality_copy_out(caller_port, child_tid_ptr, &tid_bytes);
+    }
+
+    // Return the new thread's port as the "child pid" to the parent.
+    thread_port
 }
 
 /// Handle Linux wait4(pid, wstatus, options, rusage).
@@ -6292,7 +6354,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_DUP3 => handle_dup3(pi, &msg.data),
             __NR_PIPE | __NR_PIPE2 => handle_pipe2(pi, caller_port, &msg.data),
             __NR_FORK | __NR_VFORK => handle_fork(pi, caller_port),
-            __NR_CLONE => handle_fork(pi, caller_port), // basic clone = fork
+            __NR_CLONE => handle_clone(pi, caller_port, &msg.data),
             __NR_EXECVE => {
                 match handle_execve(pi, caller_port, &msg.data) {
                     Some(err) => err,
@@ -6379,7 +6441,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_TIMERFD_GETTIME => handle_timerfd_gettime(pi, caller_port, &msg.data),
 
             __NR_MEMFD_CREATE => handle_memfd_create(pi, caller_port, &msg.data),
-            __NR_CLONE3 => handle_fork(pi, caller_port), // basic clone3 → fork fallback
+            __NR_CLONE3 => handle_fork(pi, caller_port), // clone3 uses struct; fork fallback for now
 
             // mmap: anonymous or file-backed mapping in caller's address space.
             __NR_MMAP => handle_mmap(pi, caller_port, &msg.data),

@@ -14244,6 +14244,161 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 168: Linux clone() with CLONE_VM (threading) ---
+    syscall::debug_puts(b"  init: Phase 168 linux clone CLONE_VM...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_MMAP: u64 = 9;
+                        const __NR_CLONE: u64 = 56;
+                        const __NR_EXIT: u64 = 60;
+                        const __NR_EXIT_GROUP: u64 = 231;
+                        const PROT_READ_WRITE: u64 = 3;
+                        const MAP_PRIVATE_ANON: u64 = 0x22; // MAP_PRIVATE|MAP_ANONYMOUS
+                        const CLONE_VM: u64 = 0x100;
+                        const CLONE_THREAD: u64 = 0x10000;
+                        const CLONE_SIGHAND: u64 = 0x800;
+                        const CLONE_SETTLS: u64 = 0x80000;
+
+                        // Step 1: mmap a shared data page.
+                        let shared: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_MMAP => shared,
+                            in("rdi") 0u64,     // addr hint
+                            in("rsi") 4096u64,  // length
+                            in("rdx") PROT_READ_WRITE,
+                            in("r10") MAP_PRIVATE_ANON,
+                            in("r8") !0u64,     // fd = -1
+                            in("r9") 0u64,      // offset
+                            lateout("rcx") _, lateout("r11") _);
+                        if (shared as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 81u64, options(noreturn));
+                        }
+                        // Initialize shared marker to 0.
+                        core::ptr::write_volatile(shared as *mut u64, 0);
+
+                        // Step 2: mmap a stack page for the child thread.
+                        let stack_base: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_MMAP => stack_base,
+                            in("rdi") 0u64,
+                            in("rsi") 4096u64,
+                            in("rdx") PROT_READ_WRITE,
+                            in("r10") MAP_PRIVATE_ANON,
+                            in("r8") !0u64,
+                            in("r9") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (stack_base as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 82u64, options(noreturn));
+                        }
+                        let stack_top = stack_base + 4096;
+
+                        // Write the shared-page address to the top of the child stack
+                        // so the child thread can find it (stack grows down, push it).
+                        let child_sp = stack_top - 8;
+                        core::ptr::write_volatile(child_sp as *mut u64, shared);
+
+                        // Step 3: clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND|CLONE_SETTLS,
+                        //               child_sp, NULL, NULL, 0)
+                        let flags = CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_SETTLS;
+                        let r: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLONE => r,
+                            in("rdi") flags,
+                            in("rsi") child_sp,
+                            in("rdx") 0u64,     // parent_tid_ptr
+                            in("r10") 0u64,     // child_tid_ptr
+                            in("r8") 0u64,      // tls
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 0 {
+                            // clone failed
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 83u64, options(noreturn));
+                        }
+
+                        if r == 0 {
+                            // === CHILD THREAD ===
+                            // Pop the shared-page address from our stack.
+                            let my_sp: u64;
+                            core::arch::asm!("mov {}, rsp", out(reg) my_sp);
+                            // The shared addr was written at (stack_top - 8), and the
+                            // kernel set our RSP to child_sp = stack_top - 8.
+                            // Read it from (RSP).
+                            let shared_addr = core::ptr::read_volatile(my_sp as *const u64);
+                            // Write the marker.
+                            core::ptr::write_volatile(shared_addr as *mut u64, 0xCAFE_BABE_DEAD_BEEFu64);
+                            // Exit this thread only (not exit_group).
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT, in("rdi") 0u64, options(noreturn));
+                        }
+
+                        // === PARENT THREAD ===
+                        // Spin-wait for child thread to write the marker.
+                        let mut ok = false;
+                        for _ in 0..100_000 {
+                            let val = core::ptr::read_volatile(shared as *const u64);
+                            if val == 0xCAFE_BABE_DEAD_BEEFu64 {
+                                ok = true;
+                                break;
+                            }
+                            // yield via syscall to give the child a chance
+                            core::arch::asm!("int 0x80", inlateout("rax") 24u64 => _, // sched_yield
+                                lateout("rcx") _, lateout("r11") _, lateout("rdi") _);
+                        }
+                        if !ok {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 84u64, options(noreturn));
+                        }
+
+                        // Success!
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..3000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 168 linux clone CLONE_VM: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 168 linux clone CLONE_VM: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 168 linux clone CLONE_VM: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 168 linux clone CLONE_VM: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

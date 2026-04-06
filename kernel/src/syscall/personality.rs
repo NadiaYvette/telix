@@ -727,3 +727,45 @@ pub fn personality_set_tls(target_port: u64, tls_base: u64) -> u64 {
     unsafe { crate::sched::scheduler::thread_mut_from_ref(thread_id) }.tls_base = tls_base;
     0
 }
+
+/// Create a new thread in a target task on behalf of a personality server.
+///
+/// This is the CLONE_VM | CLONE_THREAD equivalent for personality tasks.
+/// The new thread shares the target task's address space and resumes at the
+/// same instruction as the parent (clone semantics), with a new stack and
+/// return value 0.
+///
+/// Args: target_port, child_stack, tls_base, flags (reserved), ctid_va.
+/// Returns the new thread's port_id, or u64::MAX on error.
+pub fn personality_thread_create(
+    target_port: u64,
+    child_stack: u64,
+    tls_base: u64,
+    _flags: u64,
+    _ctid_va: u64,
+) -> u64 {
+    let _caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return u64::MAX;
+    }
+
+    // Check thread quota.
+    let task = crate::sched::scheduler::task_ref(target_task_id);
+    if task.thread_count >= task.max_threads {
+        return u64::MAX;
+    }
+
+    crate::sched::scheduler::clone_thread_in_task(
+        target_task_id, target_tid, child_stack, tls_base,
+    )
+}

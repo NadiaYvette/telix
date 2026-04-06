@@ -74,6 +74,7 @@ const SYS_PERSONALITY_MUNMAP: u64 = 0xF00B;
 const SYS_PERSONALITY_MPROTECT: u64 = 0xF00C;
 const SYS_PERSONALITY_MREMAP: u64 = 0xF00D;
 const SYS_PERSONALITY_SET_TLS: u64 = 0xF00E;
+const SYS_PERSONALITY_THREAD_CREATE: u64 = 0xF00F;
 const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Register a personality server for a given personality ID.
@@ -208,6 +209,29 @@ pub fn personality_mremap(target_port: u64, old_addr: usize, old_len: usize, new
 pub fn personality_set_tls(target_port: u64, tls_base: u64) -> bool {
     unsafe {
         arch::syscall2(SYS_PERSONALITY_SET_TLS, target_port, tls_base) == 0
+    }
+}
+
+/// Create a new thread in a target task (personality server only).
+/// Clones the caller's exception frame with a new stack and TLS base.
+/// The thread shares the target's address space (CLONE_VM semantics).
+/// Returns the new thread's port_id, or u64::MAX on error.
+pub fn personality_thread_create(
+    target_port: u64,
+    child_stack: u64,
+    tls_base: u64,
+    flags: u64,
+    ctid_va: u64,
+) -> u64 {
+    unsafe {
+        arch::syscall5(
+            SYS_PERSONALITY_THREAD_CREATE,
+            target_port,
+            child_stack,
+            tls_base,
+            flags,
+            ctid_va,
+        )
     }
 }
 
