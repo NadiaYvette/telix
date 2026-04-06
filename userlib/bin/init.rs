@@ -13205,6 +13205,161 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 160: /proc pseudo-filesystem + /dev/tty ---
+    syscall::debug_puts(b"  init: Phase 160 linux proc+devtty...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_OPEN: u64 = 2;
+                        const __NR_READ: u64 = 0;
+                        const __NR_WRITE: u64 = 1;
+                        const __NR_CLOSE: u64 = 3;
+                        const __NR_FSTAT: u64 = 5;
+                        const __NR_ACCESS: u64 = 21;
+                        const __NR_EXIT_GROUP: u64 = 231;
+
+                        // Test 1: open /proc/self/status, read some content.
+                        let path_status = b"/proc/self/status\0";
+                        let fd_status: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_OPEN => fd_status,
+                            in("rdi") path_status.as_ptr() as u64,
+                            in("rsi") 0u64, // O_RDONLY
+                            lateout("rcx") _, lateout("r11") _);
+                        if (fd_status as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+                        let mut sbuf = [0u8; 128];
+                        let rd: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_READ => rd,
+                            in("rdi") fd_status,
+                            in("rsi") sbuf.as_mut_ptr() as u64,
+                            in("rdx") 128u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if rd == 0 || (rd as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+                        // Verify content starts with "Name:\t"
+                        if sbuf[0] != b'N' || sbuf[1] != b'a' || sbuf[2] != b'm' || sbuf[3] != b'e' {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
+                        }
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _,
+                            in("rdi") fd_status, lateout("rcx") _, lateout("r11") _);
+
+                        // Test 2: open /proc/self/cmdline, verify non-empty.
+                        let path_cmd = b"/proc/self/cmdline\0";
+                        let fd_cmd: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_OPEN => fd_cmd,
+                            in("rdi") path_cmd.as_ptr() as u64,
+                            in("rsi") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (fd_cmd as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 94u64, options(noreturn));
+                        }
+                        let mut cbuf = [0u8; 32];
+                        let rd2: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_READ => rd2,
+                            in("rdi") fd_cmd,
+                            in("rsi") cbuf.as_mut_ptr() as u64,
+                            in("rdx") 32u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if rd2 == 0 || (rd2 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 95u64, options(noreturn));
+                        }
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _,
+                            in("rdi") fd_cmd, lateout("rcx") _, lateout("r11") _);
+
+                        // Test 3: open /dev/tty, write to it.
+                        let path_tty = b"/dev/tty\0";
+                        let fd_tty: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_OPEN => fd_tty,
+                            in("rdi") path_tty.as_ptr() as u64,
+                            in("rsi") 1u64, // O_WRONLY
+                            lateout("rcx") _, lateout("r11") _);
+                        if (fd_tty as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 96u64, options(noreturn));
+                        }
+                        // fstat /dev/tty — should be S_IFCHR.
+                        let mut tstat = [0u8; 144];
+                        let fs: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_FSTAT => fs,
+                            in("rdi") fd_tty,
+                            in("rsi") tstat.as_mut_ptr() as u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (fs as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 97u64, options(noreturn));
+                        }
+                        let mode = u32::from_le_bytes([tstat[24], tstat[25], tstat[26], tstat[27]]);
+                        if mode & 0o170000 != 0o020000 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 98u64, options(noreturn));
+                        }
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _,
+                            in("rdi") fd_tty, lateout("rcx") _, lateout("r11") _);
+
+                        // Test 4: access("/proc/self/maps", F_OK) → 0.
+                        let path_maps = b"/proc/self/maps\0";
+                        let acc: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_ACCESS => acc,
+                            in("rdi") path_maps.as_ptr() as u64,
+                            in("rsi") 0u64, // F_OK
+                            lateout("rcx") _, lateout("r11") _);
+                        if (acc as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 99u64, options(noreturn));
+                        }
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 160 linux proc+devtty: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 160 linux proc+devtty: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 160 linux proc+devtty: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 160 linux proc+devtty: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

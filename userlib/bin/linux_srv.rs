@@ -378,6 +378,8 @@ enum FdKind {
     DevNull,
     DevZero,
     DevUrandom,
+    DevTty,
+    ProcBuf, // /proc pseudo-file with content in PROCBUF_TABLE
 }
 
 #[derive(Clone, Copy)]
@@ -543,6 +545,23 @@ impl MemFdSlot {
 }
 
 static mut MEMFD_TABLE: [MemFdSlot; MAX_MEMFD_INSTANCES] = [const { MemFdSlot::empty() }; MAX_MEMFD_INSTANCES];
+
+// ProcBuf: synthetic /proc pseudo-file content
+const MAX_PROCBUF_INSTANCES: usize = 8;
+const PROCBUF_SIZE: usize = 512;
+
+#[derive(Clone, Copy)]
+struct ProcBufSlot {
+    active: bool,
+    len: usize,
+    data: [u8; PROCBUF_SIZE],
+}
+
+impl ProcBufSlot {
+    const fn empty() -> Self { Self { active: false, len: 0, data: [0; PROCBUF_SIZE] } }
+}
+
+static mut PROCBUF_TABLE: [ProcBufSlot; MAX_PROCBUF_INSTANCES] = [const { ProcBufSlot::empty() }; MAX_PROCBUF_INSTANCES];
 
 // SCM_RIGHTS: pending FD transfers over UDS
 const MAX_PENDING_FD_TRANSFERS: usize = 16;
@@ -773,6 +792,22 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         if dk == FdKind::DevNull || dk == FdKind::DevZero || dk == FdKind::DevUrandom {
             return count as u64;
         }
+        if dk == FdKind::DevTty {
+            // /dev/tty writes go to debug console.
+            let mut total = 0usize;
+            while total < count {
+                let mut tmp = [0u8; 512];
+                let chunk = (count - total).min(512);
+                let copied = syscall::personality_copy_in(caller_port, buf_va + total, &mut tmp[..chunk]);
+                if copied == 0 { break; }
+                syscall::debug_puts(&tmp[..copied]);
+                total += copied;
+            }
+            return total as u64;
+        }
+        if dk == FdKind::ProcBuf {
+            return linux_err(EBADF); // /proc files are read-only
+        }
     }
     linux_err(EBADF)
 }
@@ -952,6 +987,32 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             total += written;
         }
         return total as u64;
+    }
+    if kind == FdKind::DevTty {
+        return linux_err(EAGAIN); // /dev/tty read with no terminal input
+    }
+    if kind == FdKind::ProcBuf {
+        let idx = handle as usize;
+        unsafe {
+            if idx >= MAX_PROCBUF_INSTANCES || !PROCBUF_TABLE[idx].active {
+                return linux_err(EBADF);
+            }
+            let sz = PROCBUF_TABLE[idx].len;
+            let off = offset as usize;
+            if off >= sz { return 0; } // EOF
+            let avail = sz - off;
+            let want = count.min(avail);
+            let mut total = 0usize;
+            while total < want {
+                let chunk = (want - total).min(512);
+                let written = syscall::personality_copy_out(
+                    caller_port, buf_va + total, &PROCBUF_TABLE[idx].data[off + total..off + total + chunk]);
+                if written == 0 { break; }
+                total += written;
+            }
+            PROC_TABLE[pi].fds[fd].offset += total as u64;
+            return total as u64;
+        }
     }
 
     if offset >= file_size {
@@ -1398,8 +1459,9 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         return linux_err(ENOSYS);
     }
 
-    // Copy path from caller (max 16 bytes for VFS protocol).
-    let mut path = [0u8; 16];
+    // Copy path from caller — use 32 bytes for virtual path matching,
+    // then truncate to 16 for VFS protocol.
+    let mut path = [0u8; 32];
     let copied = syscall::personality_copy_in(caller_port, path_va, &mut path);
     if copied == 0 {
         return linux_err(EFAULT);
@@ -1416,6 +1478,7 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         b"/dev/null" => Some(FdKind::DevNull),
         b"/dev/zero" => Some(FdKind::DevZero),
         b"/dev/urandom" | b"/dev/random" => Some(FdKind::DevUrandom),
+        b"/dev/tty" | b"/dev/console" => Some(FdKind::DevTty),
         _ => None,
     };
     if let Some(kind) = dev_kind {
@@ -1430,6 +1493,11 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
             }
         }
         return fd as u64;
+    }
+
+    // /proc pseudo-filesystem — generate content on open.
+    if pathlen >= 6 && &path[..6] == b"/proc/" {
+        return open_proc_file(pi, caller_port, &path[..pathlen], flags);
     }
 
     // Pack path into two u64 words (little-endian).
@@ -1454,8 +1522,11 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         // VFS_OPEN failed — this might be a directory (FS servers don't open dirs).
         // Create a Dir FD so getdents64 can enumerate via VFS_READDIR later.
         // Resolve relative paths by prepending CWD.
+        // Truncate path to 16 bytes for Dir FD storage.
+        let mut path16 = [0u8; 16];
+        for i in 0..pathlen.min(16) { path16[i] = path[i]; }
         let (dir_path, dir_len) = if path[0] == b'/' {
-            (path, pathlen)
+            (path16, pathlen.min(16))
         } else {
             unsafe {
                 let clen = PROC_TABLE[pi].cwd_len;
@@ -1491,6 +1562,81 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         PROC_TABLE[pi].fds[fd].handle = resp.data[1];
         PROC_TABLE[pi].fds[fd].file_size = resp.data[2];
         PROC_TABLE[pi].fds[fd].offset = 0;
+    }
+
+    fd as u64
+}
+
+/// Open a /proc pseudo-file by generating content into a ProcBuf slot.
+fn open_proc_file(pi: usize, _caller_port: u64, path: &[u8], flags: u64) -> u64 {
+    // Find a free ProcBuf slot.
+    let slot = unsafe {
+        let mut found = None;
+        for i in 0..MAX_PROCBUF_INSTANCES {
+            if !PROCBUF_TABLE[i].active { found = Some(i); break; }
+        }
+        match found {
+            Some(s) => s,
+            None => return linux_err(ENOMEM),
+        }
+    };
+
+    let mut buf = [0u8; PROCBUF_SIZE];
+    let len: usize;
+
+    if path == b"/proc/self/maps" {
+        // Minimal maps entry — just report a placeholder text region.
+        let content = b"00400000-00401000 r-xp 00000000 00:00 0  [text]\n";
+        let n = content.len().min(PROCBUF_SIZE);
+        buf[..n].copy_from_slice(&content[..n]);
+        len = n;
+    } else if path == b"/proc/self/status" {
+        // Minimal /proc/self/status with fields glibc checks.
+        let content = b"Name:\tunknown\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\nVmPeak:\t    4096 kB\nVmSize:\t    4096 kB\nVmRSS:\t    4096 kB\nThreads:\t1\n";
+        let n = content.len().min(PROCBUF_SIZE);
+        buf[..n].copy_from_slice(&content[..n]);
+        len = n;
+    } else if path == b"/proc/self/cmdline" {
+        // NUL-separated argv: just the binary name.
+        let content = b"unknown\0";
+        let n = content.len().min(PROCBUF_SIZE);
+        buf[..n].copy_from_slice(&content[..n]);
+        len = n;
+    } else if path == b"/proc/self/comm" {
+        let content = b"unknown\n";
+        let n = content.len().min(PROCBUF_SIZE);
+        buf[..n].copy_from_slice(&content[..n]);
+        len = n;
+    } else if path == b"/proc/self/auxv" {
+        // Empty auxv — zero-length file.
+        len = 0;
+    } else if path == b"/proc/self/stat" {
+        // Minimal /proc/self/stat: pid (comm) state ppid pgrp session tty_nr ...
+        let content = b"1 (unknown) R 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+        let n = content.len().min(PROCBUF_SIZE);
+        buf[..n].copy_from_slice(&content[..n]);
+        len = n;
+    } else {
+        return linux_err(ENOENT);
+    }
+
+    let fd = match alloc_fd(pi) {
+        Some(f) => f,
+        None => return linux_err(EMFILE),
+    };
+
+    unsafe {
+        PROCBUF_TABLE[slot].active = true;
+        PROCBUF_TABLE[slot].len = len;
+        PROCBUF_TABLE[slot].data[..len].copy_from_slice(&buf[..len]);
+
+        PROC_TABLE[pi].fds[fd].kind = FdKind::ProcBuf;
+        PROC_TABLE[pi].fds[fd].handle = slot as u64;
+        PROC_TABLE[pi].fds[fd].file_size = len as u64;
+        PROC_TABLE[pi].fds[fd].offset = 0;
+        if flags & 0x80000 != 0 { // O_CLOEXEC
+            PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+        }
     }
 
     fd as u64
@@ -1574,7 +1720,13 @@ fn do_close(pi: usize, fd: usize) {
                     MEMFD_TABLE[idx] = MemFdSlot::empty();
                 }
             }
-            FdKind::DevNull | FdKind::DevZero | FdKind::DevUrandom => {} // No resources to free.
+            FdKind::DevNull | FdKind::DevZero | FdKind::DevUrandom | FdKind::DevTty => {}
+            FdKind::ProcBuf => {
+                let idx = PROC_TABLE[pi].fds[fd].handle as usize;
+                if idx < MAX_PROCBUF_INSTANCES {
+                    PROCBUF_TABLE[idx] = ProcBufSlot::empty();
+                }
+            }
             FdKind::None => {}
         }
         PROC_TABLE[pi].fds[fd] = FdEntry::empty();
@@ -1640,8 +1792,8 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         return linux_err(ENOSYS);
     }
 
-    // Copy path from caller.
-    let mut path = [0u8; 16];
+    // Copy path from caller — use 32 bytes for virtual path matching.
+    let mut path = [0u8; 32];
     let copied = syscall::personality_copy_in(caller_port, path_va, &mut path);
     if copied == 0 {
         return linux_err(EFAULT);
@@ -1653,6 +1805,7 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         b"/dev/null" => Some((1 << 8) | 3),
         b"/dev/zero" => Some((1 << 8) | 5),
         b"/dev/urandom" | b"/dev/random" => Some((1 << 8) | 9),
+        b"/dev/tty" | b"/dev/console" => Some((5 << 8) | 0),
         _ => None,
     };
     if let Some(rdev) = dev_rdev {
@@ -1660,6 +1813,31 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         let mode: u32 = 0o020666; // S_IFCHR | 0666
         stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
         stat_buf[40..48].copy_from_slice(&rdev.to_le_bytes());
+        stat_buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+        let written = syscall::personality_copy_out(caller_port, statbuf_va, &stat_buf);
+        if written < 144 { return linux_err(EFAULT); }
+        return 0;
+    }
+
+    // /proc pseudo-filesystem stat — return directory or regular file.
+    let is_proc_dir = match &path[..pathlen] {
+        b"/proc" | b"/proc/" | b"/proc/self" | b"/proc/self/" | b"/dev" | b"/dev/" => true,
+        _ => false,
+    };
+    if is_proc_dir {
+        let mut stat_buf = [0u8; 144];
+        let mode: u32 = 0o040755; // S_IFDIR | 0755
+        stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
+        stat_buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+        let written = syscall::personality_copy_out(caller_port, statbuf_va, &stat_buf);
+        if written < 144 { return linux_err(EFAULT); }
+        return 0;
+    }
+    // /proc/self/* regular files.
+    if pathlen >= 11 && &path[..11] == b"/proc/self/" {
+        let mut stat_buf = [0u8; 144];
+        let mode: u32 = 0o100444; // S_IFREG | 0444
+        stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
         stat_buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
         let written = syscall::personality_copy_out(caller_port, statbuf_va, &stat_buf);
         if written < 144 { return linux_err(EFAULT); }
@@ -1747,18 +1925,30 @@ fn handle_fstat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         }
         // Virtual device fstat — report as character device.
         let dk = PROC_TABLE[pi].fds[fd].kind;
-        if dk == FdKind::DevNull || dk == FdKind::DevZero || dk == FdKind::DevUrandom {
+        if dk == FdKind::DevNull || dk == FdKind::DevZero || dk == FdKind::DevUrandom
+            || dk == FdKind::DevTty {
             let mut stat_buf = [0u8; 144];
             let mode: u32 = 0o020666; // S_IFCHR | 0666
             stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
-            // st_rdev: /dev/null=1:3, /dev/zero=1:5, /dev/urandom=1:9
             let rdev: u64 = match dk {
                 FdKind::DevNull => (1 << 8) | 3,
                 FdKind::DevZero => (1 << 8) | 5,
                 FdKind::DevUrandom => (1 << 8) | 9,
+                FdKind::DevTty => (5 << 8) | 0, // /dev/tty = 5:0
                 _ => 0,
             };
             stat_buf[40..48].copy_from_slice(&rdev.to_le_bytes());
+            stat_buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+            let written = syscall::personality_copy_out(caller_port, statbuf_va, &stat_buf);
+            if written < 144 { return linux_err(EFAULT); }
+            return 0;
+        }
+        if dk == FdKind::ProcBuf {
+            let mut stat_buf = [0u8; 144];
+            let mode: u32 = 0o100444; // S_IFREG | 0444
+            stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
+            let sz = PROC_TABLE[pi].fds[fd].file_size;
+            stat_buf[48..56].copy_from_slice(&sz.to_le_bytes());
             stat_buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
             let written = syscall::personality_copy_out(caller_port, statbuf_va, &stat_buf);
             if written < 144 { return linux_err(EFAULT); }
@@ -2159,6 +2349,10 @@ fn handle_access(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     // Root "/" and other well-known dirs always exist — skip VFS round-trip.
     if pathlen == 1 && path[0] == b'/' {
+        return 0;
+    }
+    // Virtual paths always exist.
+    if (pathlen >= 5 && &path[..5] == b"/proc") || (pathlen >= 4 && &path[..4] == b"/dev/") {
         return 0;
     }
 
@@ -5084,7 +5278,9 @@ fn poll_single_fd(pi: usize, fd: usize) -> u32 {
             }
             FdKind::MemFd | FdKind::File | FdKind::Dir => EPOLLIN | EPOLLOUT,
             FdKind::DevNull => EPOLLOUT, // writable sink
-            FdKind::DevZero | FdKind::DevUrandom => EPOLLIN | EPOLLOUT, // always readable
+            FdKind::DevZero | FdKind::DevUrandom => EPOLLIN | EPOLLOUT,
+            FdKind::DevTty => EPOLLOUT, // writable, reads would block
+            FdKind::ProcBuf => EPOLLIN, // readable synthetic file
             _ => EPOLLERR,
         }
     }
