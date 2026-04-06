@@ -13466,6 +13466,137 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 162: close_range, FIONREAD, TIOCGPGRP, faccessat2 ---
+    syscall::debug_puts(b"  init: Phase 162 linux ioctl+close_range...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_IOCTL: u64 = 16;
+                        const __NR_READLINK: u64 = 89;
+                        const __NR_FACCESSAT2: u64 = 439;
+                        const __NR_EXIT_GROUP: u64 = 231;
+                        const __NR_CLOSE_RANGE: u64 = 436;
+
+                        // Test 1: close_range(100, 200, 0) — should return 0.
+                        let r: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE_RANGE => r,
+                            in("rdi") 100u64,
+                            in("rsi") 200u64,
+                            in("rdx") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+
+                        // Test 2: ioctl(0, FIONREAD, &avail) — should return 0 (success).
+                        let mut avail: i32 = -1;
+                        let r2: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_IOCTL => r2,
+                            in("rdi") 0u64,      // stdin
+                            in("rsi") 0x541Bu64,  // FIONREAD
+                            in("rdx") &mut avail as *mut i32 as u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r2 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+                        // avail should be >= 0 (0 for stdin with no input).
+                        if avail < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
+                        }
+
+                        // Test 3: ioctl(1, TIOCGPGRP, &pgrp) — should return 0, pgrp=1.
+                        let mut pgrp: i32 = 0;
+                        let r3: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_IOCTL => r3,
+                            in("rdi") 1u64,       // stdout
+                            in("rsi") 0x540Fu64,  // TIOCGPGRP
+                            in("rdx") &mut pgrp as *mut i32 as u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r3 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 94u64, options(noreturn));
+                        }
+                        if pgrp != 1 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 95u64, options(noreturn));
+                        }
+
+                        // Test 4: readlink("/proc/self/exe") — should return > 0 bytes.
+                        let mut linkbuf = [0u8; 64];
+                        let r4: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_READLINK => r4,
+                            in("rdi") b"/proc/self/exe\0".as_ptr() as u64,
+                            in("rsi") linkbuf.as_mut_ptr() as u64,
+                            in("rdx") 64u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r4 as i64) <= 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 96u64, options(noreturn));
+                        }
+
+                        // Test 5: faccessat2(AT_FDCWD, "/proc/self/maps", F_OK, 0).
+                        let r5: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_FACCESSAT2 => r5,
+                            in("rdi") (-100i64 as u64),  // AT_FDCWD
+                            in("rsi") b"/proc/self/maps\0".as_ptr() as u64,
+                            in("rdx") 0u64,   // F_OK
+                            in("r10") 0u64,   // flags
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r5 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 97u64, options(noreturn));
+                        }
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 162 linux ioctl+close_range: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 162 linux ioctl+close_range: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 162 linux ioctl+close_range: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 162 linux ioctl+close_range: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

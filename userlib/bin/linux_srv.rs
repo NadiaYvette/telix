@@ -214,6 +214,8 @@ const __NR_TKILL: u64 = 200;
 const __NR_TIME: u64 = 201;
 const __NR_SYNC: u64 = 162;
 const __NR_SYNCFS: u64 = 306;
+const __NR_CLOSE_RANGE: u64 = 436;
+const __NR_FACCESSAT2: u64 = 439;
 const __NR_CHROOT: u64 = 161;
 const __NR_PIVOT_ROOT: u64 = 155;
 const __NR_MOUNT: u64 = 165;
@@ -443,6 +445,8 @@ struct ProcessState {
     tls_base: u64,
     sig_actions: [SigAction; NUM_SIGNALS],
     sig_mask: u64,    // blocked signal mask
+    exe_name: [u8; 16],  // binary name for /proc/self/exe
+    exe_name_len: u8,
 }
 
 impl ProcessState {
@@ -459,6 +463,8 @@ impl ProcessState {
             tls_base: 0,
             sig_actions: [const { SigAction::default() }; NUM_SIGNALS],
             sig_mask: 0,
+            exe_name: [0u8; 16],
+            exe_name_len: 0,
         }
     }
 }
@@ -1597,16 +1603,39 @@ fn open_proc_file(pi: usize, _caller_port: u64, path: &[u8], flags: u64) -> u64 
         buf[..n].copy_from_slice(&content[..n]);
         len = n;
     } else if path == b"/proc/self/cmdline" {
-        // NUL-separated argv: just the binary name.
-        let content = b"unknown\0";
-        let n = content.len().min(PROCBUF_SIZE);
-        buf[..n].copy_from_slice(&content[..n]);
-        len = n;
+        // NUL-separated argv: use stored exe name if available.
+        let elen = unsafe { PROC_TABLE[pi].exe_name_len as usize };
+        if elen > 0 {
+            let n = elen.min(PROCBUF_SIZE - 1);
+            unsafe { buf[..n].copy_from_slice(&PROC_TABLE[pi].exe_name[..n]); }
+            buf[n] = 0; // NUL terminator
+            len = n + 1;
+        } else {
+            let content = b"unknown\0";
+            let n = content.len().min(PROCBUF_SIZE);
+            buf[..n].copy_from_slice(&content[..n]);
+            len = n;
+        }
     } else if path == b"/proc/self/comm" {
-        let content = b"unknown\n";
-        let n = content.len().min(PROCBUF_SIZE);
-        buf[..n].copy_from_slice(&content[..n]);
-        len = n;
+        let elen = unsafe { PROC_TABLE[pi].exe_name_len as usize };
+        if elen > 0 {
+            // Extract basename: find last '/'.
+            let name = unsafe { &PROC_TABLE[pi].exe_name[..elen] };
+            let base_start = match name.iter().rposition(|&b| b == b'/') {
+                Some(pos) => pos + 1,
+                None => 0,
+            };
+            let base = &name[base_start..];
+            let n = base.len().min(PROCBUF_SIZE - 1);
+            buf[..n].copy_from_slice(&base[..n]);
+            buf[n] = b'\n';
+            len = n + 1;
+        } else {
+            let content = b"unknown\n";
+            let n = content.len().min(PROCBUF_SIZE);
+            buf[..n].copy_from_slice(&content[..n]);
+            len = n;
+        }
     } else if path == b"/proc/self/auxv" {
         // Empty auxv — zero-length file.
         len = 0;
@@ -2409,10 +2438,17 @@ fn handle_readlinkat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     // Check for /proc/self/exe
     let proc_self_exe = b"/proc/self/exe";
     if raw_len == proc_self_exe.len() && raw[..raw_len] == proc_self_exe[..] {
-        let result = b"/bin/unknown";
-        let out_len = result.len().min(bufsiz);
-        syscall::personality_copy_out(caller_port, buf_va, &result[..out_len]);
-        return out_len as u64;
+        let elen = unsafe { PROC_TABLE[pi].exe_name_len as usize };
+        if elen > 0 {
+            let out_len = elen.min(bufsiz);
+            unsafe { syscall::personality_copy_out(caller_port, buf_va, &PROC_TABLE[pi].exe_name[..out_len]); }
+        } else {
+            let fallback = b"/bin/unknown";
+            let out_len = fallback.len().min(bufsiz);
+            syscall::personality_copy_out(caller_port, buf_va, &fallback[..out_len]);
+            return out_len as u64;
+        }
+        return elen.min(bufsiz) as u64;
     }
 
     // Check for /proc/self/fd/N
@@ -2663,6 +2699,31 @@ fn handle_dup3(pi: usize, args: &[u64; 6]) -> u64 {
     if oldfd == newfd { return linux_err(EINVAL); }
     // Reuse dup2 logic.
     handle_dup2(pi, args)
+}
+
+/// Handle Linux close_range(first, last, flags).
+/// CLOSE_RANGE_CLOEXEC (4) = set CLOEXEC instead of closing.
+fn handle_close_range(pi: usize, args: &[u64; 6]) -> u64 {
+    let first = args[0] as usize;
+    let last = args[1] as usize;
+    let flags = args[2] as u32;
+    const CLOSE_RANGE_CLOEXEC: u32 = 4;
+    let set_cloexec = (flags & CLOSE_RANGE_CLOEXEC) != 0;
+
+    let end = last.min(MAX_FDS - 1);
+    let start = first.max(3); // never close stdin/stdout/stderr
+    unsafe {
+        for fd in start..=end {
+            if PROC_TABLE[pi].fds[fd].in_use {
+                if set_cloexec {
+                    PROC_TABLE[pi].fds[fd].fd_flags |= FD_CLOEXEC;
+                } else {
+                    do_close(pi, fd);
+                }
+            }
+        }
+    }
+    0
 }
 
 /// Handle Linux fork() / vfork() / clone() (basic).
@@ -2968,6 +3029,11 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
         }
         PROC_TABLE[pi].brk_base = 0;
         PROC_TABLE[pi].brk_current = 0;
+        // Store exe name for /proc/self/exe.
+        let elen = name_len.min(16);
+        PROC_TABLE[pi].exe_name = [0u8; 16];
+        for j in 0..elen { PROC_TABLE[pi].exe_name[j] = name_buf[j]; }
+        PROC_TABLE[pi].exe_name_len = elen as u8;
     }
 
     // Success: the kernel has already woken the target with its new image.
@@ -3425,9 +3491,16 @@ fn handle_ioctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     const TIOCGWINSZ: u64 = 0x5413;
     const TIOCSWINSZ: u64 = 0x5414;
+    const TIOCGPGRP: u64 = 0x540F;
+    const TIOCSPGRP: u64 = 0x5410;
     const FIONBIO: u64 = 0x5421;
+    const FIONREAD: u64 = 0x541B;
     const TCGETS: u64 = 0x5401;
     const TCSETS: u64 = 0x5402;
+    const TCSETSW: u64 = 0x5403;
+    const TCSETSF: u64 = 0x5404;
+    const TCSBRK: u64 = 0x5409;
+    const TCFLSH: u64 = 0x540B;
 
     match request {
         TIOCGWINSZ => {
@@ -3482,7 +3555,47 @@ fn handle_ioctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                 linux_err(ENOTTY)
             }
         }
-        TCSETS => 0, // Ignore terminal setting changes.
+        TCSETS | TCSETSW | TCSETSF => 0, // Ignore terminal setting changes.
+        TCSBRK | TCFLSH => 0, // No-op: no real terminal to drain/flush.
+        TIOCGPGRP => {
+            // Return foreground process group = 1.
+            let out_va = args[2] as usize;
+            if out_va != 0 {
+                let pgrp = 1i32.to_le_bytes();
+                syscall::personality_copy_out(caller_port, out_va, &pgrp);
+            }
+            0
+        }
+        TIOCSPGRP => 0, // Ignore set foreground pgrp.
+        FIONREAD => {
+            // Return bytes available to read.
+            let out_va = args[2] as usize;
+            let avail: i32 = if fd < MAX_FDS {
+                unsafe {
+                    match PROC_TABLE[pi].fds[fd].kind {
+                        FdKind::ProcBuf => {
+                            let pb_idx = PROC_TABLE[pi].fds[fd].handle as usize;
+                            if pb_idx < MAX_PROCBUF_INSTANCES && PROCBUF_TABLE[pb_idx].active {
+                                let off = PROC_TABLE[pi].fds[fd].offset as usize;
+                                let total = PROCBUF_TABLE[pb_idx].len;
+                                if off < total { (total - off) as i32 } else { 0 }
+                            } else { 0 }
+                        }
+                        FdKind::MemFd => {
+                            let off = PROC_TABLE[pi].fds[fd].offset as usize;
+                            let total = PROC_TABLE[pi].fds[fd].file_size as usize;
+                            if off < total { (total - off) as i32 } else { 0 }
+                        }
+                        FdKind::DevZero | FdKind::DevUrandom => 0x7FFF_FFFF, // "infinite" data
+                        _ => 0,
+                    }
+                }
+            } else { 0 };
+            if out_va != 0 {
+                syscall::personality_copy_out(caller_port, out_va, &avail.to_le_bytes());
+            }
+            0
+        }
         _ => linux_err(ENOTTY),
     }
 }
@@ -6078,6 +6191,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_SCHED_YIELD => { syscall::yield_now(); 0 }
             __NR_SYNC | __NR_SYNCFS => 0, // no durable storage
             __NR_CHROOT | __NR_PIVOT_ROOT | __NR_MOUNT | __NR_UMOUNT2 => linux_err(EPERM),
+
+            // Phase 162: close_range, faccessat2.
+            __NR_CLOSE_RANGE => handle_close_range(pi, &msg.data),
+            __NR_FACCESSAT2 => handle_faccessat(pi, caller_port, &msg.data),
 
             // Phase 129: Socket syscalls.
             __NR_SOCKET => handle_socket(pi, caller_port, &msg.data),
