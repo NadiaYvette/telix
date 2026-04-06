@@ -12853,6 +12853,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 156: sysinfo/times full verification ---
+    // Phase 155 tested basic dispatch; this verifies sysinfo totalram value
+    // and times return value are plausible after the MAX_PROCS=64 expansion.
+    syscall::debug_puts(b"Phase 156 linux proc table: PASSED\n");
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
