@@ -1527,6 +1527,22 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         return open_proc_file(pi, caller_port, &path[..pathlen], flags);
     }
 
+    // Virtual /etc files — synthetic content for common config files.
+    let etc_content: Option<&[u8]> = match &path[..pathlen] {
+        b"/etc/passwd" => Some(b"root:x:0:0:root:/root:/bin/sh\n"),
+        b"/etc/group" => Some(b"root:x:0:\n"),
+        b"/etc/hosts" => Some(b"127.0.0.1\tlocalhost\n::1\t\tlocalhost\n"),
+        b"/etc/resolv.conf" => Some(b"nameserver 10.0.2.3\n"),
+        b"/etc/hostname" => Some(b"telix\n"),
+        b"/etc/nsswitch.conf" => Some(b"passwd: files\ngroup: files\nhosts: files dns\n"),
+        b"/etc/localtime" => None, // let VFS handle this (real zoneinfo file)
+        b"/etc/ld.so.cache" => Some(b""), // empty — no shared library cache
+        _ => None,
+    };
+    if let Some(content) = etc_content {
+        return open_virtual_file(pi, content, flags);
+    }
+
     // Pack path into two u64 words (little-endian).
     let mut w0 = 0u64;
     let mut w1 = 0u64;
@@ -1591,6 +1607,43 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         PROC_TABLE[pi].fds[fd].offset = 0;
     }
 
+    fd as u64
+}
+
+/// Open a virtual file with fixed content, using ProcBuf storage.
+fn open_virtual_file(pi: usize, content: &[u8], flags: u64) -> u64 {
+    let slot = unsafe {
+        let mut found = None;
+        for i in 0..MAX_PROCBUF_INSTANCES {
+            if !PROCBUF_TABLE[i].active { found = Some(i); break; }
+        }
+        match found {
+            Some(i) => i,
+            None => return linux_err(EMFILE),
+        }
+    };
+    let n = content.len().min(PROCBUF_SIZE);
+    unsafe {
+        PROCBUF_TABLE[slot].active = true;
+        PROCBUF_TABLE[slot].data[..n].copy_from_slice(&content[..n]);
+        PROCBUF_TABLE[slot].len = n;
+    }
+    let fd = match alloc_fd(pi) {
+        Some(f) => f,
+        None => {
+            unsafe { PROCBUF_TABLE[slot].active = false; }
+            return linux_err(EMFILE);
+        }
+    };
+    unsafe {
+        PROC_TABLE[pi].fds[fd].kind = FdKind::ProcBuf;
+        PROC_TABLE[pi].fds[fd].handle = slot as u64;
+        PROC_TABLE[pi].fds[fd].offset = 0;
+        PROC_TABLE[pi].fds[fd].file_size = n as u64;
+        if flags & 0x80000 != 0 { // O_CLOEXEC
+            PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+        }
+    }
     fd as u64
 }
 
@@ -1961,12 +2014,19 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         if written < 144 { return linux_err(EFAULT); }
         return 0;
     }
-    // /proc/* regular files (cpuinfo, meminfo, sys/..., self/*).
-    let is_proc_file = (pathlen >= 11 && &path[..11] == b"/proc/self/")
+    // /proc/* and /etc/* virtual regular files.
+    let is_virtual_file = (pathlen >= 11 && &path[..11] == b"/proc/self/")
         || path[..pathlen] == *b"/proc/cpuinfo"
         || path[..pathlen] == *b"/proc/meminfo"
-        || (pathlen >= 17 && &path[..17] == b"/proc/sys/kernel/");
-    if is_proc_file {
+        || (pathlen >= 17 && &path[..17] == b"/proc/sys/kernel/")
+        || path[..pathlen] == *b"/etc/passwd"
+        || path[..pathlen] == *b"/etc/group"
+        || path[..pathlen] == *b"/etc/hosts"
+        || path[..pathlen] == *b"/etc/resolv.conf"
+        || path[..pathlen] == *b"/etc/hostname"
+        || path[..pathlen] == *b"/etc/nsswitch.conf"
+        || path[..pathlen] == *b"/etc/ld.so.cache";
+    if is_virtual_file {
         let mut stat_buf = [0u8; 144];
         let mode: u32 = 0o100444; // S_IFREG | 0444
         stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
@@ -2484,7 +2544,11 @@ fn handle_access(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         return 0;
     }
     // Virtual paths always exist.
-    if (pathlen >= 5 && &path[..5] == b"/proc") || (pathlen >= 4 && &path[..4] == b"/dev/") {
+    if (pathlen >= 5 && &path[..5] == b"/proc") || (pathlen >= 4 && &path[..4] == b"/dev/")
+        || path[..pathlen] == *b"/etc/passwd" || path[..pathlen] == *b"/etc/group"
+        || path[..pathlen] == *b"/etc/hosts" || path[..pathlen] == *b"/etc/resolv.conf"
+        || path[..pathlen] == *b"/etc/hostname" || path[..pathlen] == *b"/etc/nsswitch.conf"
+    {
         return 0;
     }
 

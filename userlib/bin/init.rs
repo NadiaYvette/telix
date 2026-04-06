@@ -13980,6 +13980,143 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // ============================================================
     // --- Test 23: Benchmark Suite ---
+    // --- Phase 166: /etc virtual files ---
+    syscall::debug_puts(b"  init: Phase 166 linux etc+virtual files...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_OPEN: u64 = 2;
+                        const __NR_READ: u64 = 0;
+                        const __NR_CLOSE: u64 = 3;
+                        const __NR_ACCESS: u64 = 21;
+                        const __NR_EXIT_GROUP: u64 = 231;
+
+                        // Test 1: open + read /etc/passwd — should contain "root".
+                        let r: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_OPEN => r,
+                            in("rdi") b"/etc/passwd\0".as_ptr() as u64,
+                            in("rsi") 0u64, in("rdx") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+                        let fd1 = r;
+                        let mut buf1 = [0u8; 64];
+                        let r2: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_READ => r2,
+                            in("rdi") fd1, in("rsi") buf1.as_mut_ptr() as u64, in("rdx") 64u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r2 as i64) <= 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+                        // Verify starts with "root".
+                        if buf1[0] != b'r' || buf1[1] != b'o' || buf1[2] != b'o' || buf1[3] != b't' {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
+                        }
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _, in("rdi") fd1,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        // Test 2: open /etc/hosts — should contain "localhost".
+                        let r3: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_OPEN => r3,
+                            in("rdi") b"/etc/hosts\0".as_ptr() as u64,
+                            in("rsi") 0u64, in("rdx") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r3 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 94u64, options(noreturn));
+                        }
+                        let fd2 = r3;
+                        let mut buf2 = [0u8; 64];
+                        let r4: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_READ => r4,
+                            in("rdi") fd2, in("rsi") buf2.as_mut_ptr() as u64, in("rdx") 64u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r4 as i64) <= 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 95u64, options(noreturn));
+                        }
+                        // Check contains "localhost".
+                        let n2 = r4 as usize;
+                        let mut found = false;
+                        if n2 >= 9 {
+                            for i in 0..n2 - 8 {
+                                if buf2[i] == b'l' && buf2[i+4] == b'l' && buf2[i+8] == b't' {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !found {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 96u64, options(noreturn));
+                        }
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _, in("rdi") fd2,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        // Test 3: access("/etc/resolv.conf", F_OK) → 0.
+                        let r5: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_ACCESS => r5,
+                            in("rdi") b"/etc/resolv.conf\0".as_ptr() as u64,
+                            in("rsi") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r5 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 97u64, options(noreturn));
+                        }
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 166 linux etc+virtual files: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 166 linux etc+virtual files: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 166 linux etc+virtual files: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 166 linux etc+virtual files: SKIPPED\n");
+        }
+    }
+
+    // ============================================================
+    // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
         let bench_tid = syscall::spawn(b"bench", 50);
