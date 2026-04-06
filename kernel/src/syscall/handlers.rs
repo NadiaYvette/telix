@@ -1842,7 +1842,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
 
     // Compute stack size dynamically: strings + null terminators + pointer table + auxv + margin.
     let strings_with_nulls = string_total + (argc + envc); // each string gets a null terminator
-    let ptr_table_size = (1 + argc + 1 + envc + 1 + 14) * 8; // argc + argv[] + NULL + envp[] + NULL + 7 auxv pairs
+    let ptr_table_size = (1 + argc + 1 + envc + 1 + 24) * 8; // argc + argv[] + NULL + envp[] + NULL + 12 auxv pairs
     let stack_needed = strings_with_nulls + ptr_table_size + 256; // 256 bytes margin
     let stack_alloc_pages = ((stack_needed + ps - 1) / ps).max(2);
     let stack_mmu_pages = stack_alloc_pages * page::page_mmucount();
@@ -1932,7 +1932,22 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     // Align str_pos down to 16 bytes.
     str_pos &= !15;
 
-    // Auxv entries (6 pairs + AT_NULL = 7 pairs = 14 u64s).
+    // Place 16 bytes of pseudo-random data on the stack for AT_RANDOM.
+    str_pos -= 16;
+    let at_random_addr = str_pos;
+    {
+        // Use cycle counter + task_id as entropy source.
+        let cycles = crate::sched::scheduler::get_monotonic_ns() as u64;
+        let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed) as u64;
+        let r0 = cycles.wrapping_mul(0x517cc1b727220a95).wrapping_add(tid);
+        let r1 = r0.wrapping_mul(0x6c62272e07bb0142).wrapping_add(cycles);
+        let random_bytes: [u8; 16] = unsafe {
+            core::mem::transmute([r0, r1])
+        };
+        copy_to_user(new_pt_root, at_random_addr, &random_bytes);
+    }
+
+    // Auxv entries.
     const AT_NULL: u64 = 0;
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
@@ -1940,19 +1955,31 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     const AT_PAGESZ: u64 = 6;
     const AT_BASE: u64 = 7;
     const AT_ENTRY: u64 = 9;
+    const AT_UID: u64 = 11;
+    const AT_EUID: u64 = 12;
+    const AT_GID: u64 = 13;
+    const AT_EGID: u64 = 14;
+    const AT_RANDOM: u64 = 25;
 
-    let auxv: [(u64, u64); 7] = [
+    let cur_task_id = crate::sched::current_task_id();
+    let cur_task = crate::sched::scheduler::task_ref(cur_task_id);
+    let auxv: [(u64, u64); 12] = [
         (AT_PHDR, elf_info.phdr_vaddr as u64),
         (AT_PHENT, elf_info.phentsize as u64),
         (AT_PHNUM, elf_info.phnum as u64),
         (AT_PAGESZ, ps as u64),
         (AT_ENTRY, elf_info.entry as u64),
         (AT_BASE, interp_base as u64),
+        (AT_UID, cur_task.uid as u64),
+        (AT_EUID, cur_task.euid as u64),
+        (AT_GID, cur_task.gid as u64),
+        (AT_EGID, cur_task.egid as u64),
+        (AT_RANDOM, at_random_addr as u64),
         (AT_NULL, 0),
     ];
 
     // Calculate total size of pointer table below strings.
-    // Layout: argc(8) + argv ptrs(argc*8) + NULL(8) + envp ptrs(envc*8) + NULL(8) + auxv(14*8)
+    // Layout: argc(8) + argv ptrs(argc*8) + NULL(8) + envp ptrs(envc*8) + NULL(8) + auxv
     let table_words = 1 + argc + 1 + envc + 1 + auxv.len() * 2;
     let table_size = table_words * 8;
 
@@ -2148,6 +2175,17 @@ pub(crate) fn exec_for_task(
     // Build minimal stack: argc=0, argv=NULL, envp=NULL, auxv.
     let argc: usize = 0;
 
+    // Place 16 random bytes on stack for AT_RANDOM.
+    let random_pos = (USER_STACK_TOP - 16) & !15;
+    {
+        let cycles = crate::sched::scheduler::get_monotonic_ns() as u64;
+        let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed) as u64;
+        let r0 = cycles.wrapping_mul(0x517cc1b727220a95).wrapping_add(tid);
+        let r1 = r0.wrapping_mul(0x6c62272e07bb0142).wrapping_add(cycles);
+        let rb: [u8; 16] = unsafe { core::mem::transmute([r0, r1]) };
+        copy_to_user(new_pt_root, random_pos, &rb);
+    }
+
     const AT_NULL: u64 = 0;
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
@@ -2155,21 +2193,32 @@ pub(crate) fn exec_for_task(
     const AT_PAGESZ: u64 = 6;
     const AT_BASE: u64 = 7;
     const AT_ENTRY: u64 = 9;
+    const AT_UID: u64 = 11;
+    const AT_EUID: u64 = 12;
+    const AT_GID: u64 = 13;
+    const AT_EGID: u64 = 14;
+    const AT_RANDOM: u64 = 25;
 
-    let auxv: [(u64, u64); 7] = [
+    let cur_task = crate::sched::scheduler::task_ref(target_task_id);
+    let auxv: [(u64, u64); 12] = [
         (AT_PHDR, elf_info.phdr_vaddr as u64),
         (AT_PHENT, elf_info.phentsize as u64),
         (AT_PHNUM, elf_info.phnum as u64),
         (AT_PAGESZ, ps as u64),
         (AT_ENTRY, elf_info.entry as u64),
         (AT_BASE, interp_base as u64),
+        (AT_UID, cur_task.uid as u64),
+        (AT_EUID, cur_task.euid as u64),
+        (AT_GID, cur_task.gid as u64),
+        (AT_EGID, cur_task.egid as u64),
+        (AT_RANDOM, random_pos as u64),
         (AT_NULL, 0),
     ];
 
-    // Layout: argc(8) + NULL(argv, 8) + NULL(envp, 8) + auxv(14*8) = 136 bytes
+    // Layout: argc(8) + NULL(argv, 8) + NULL(envp, 8) + auxv pairs
     let table_words = 1 + 1 + 1 + auxv.len() * 2; // argc + argv_null + envp_null + auxv pairs
     let table_size = table_words * 8;
-    let sp = (USER_STACK_TOP - table_size) & !15;
+    let sp = (random_pos - table_size) & !15;
 
     let mut pos = sp;
     // argc = 0

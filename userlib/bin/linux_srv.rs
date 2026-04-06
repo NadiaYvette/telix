@@ -468,6 +468,7 @@ struct ProcessState {
     sig_mask: u64,    // blocked signal mask
     exe_name: [u8; 16],  // binary name for /proc/self/exe
     exe_name_len: u8,
+    clear_child_tid: usize,  // CLONE_CHILD_CLEARTID / set_tid_address: futex-wake on exit
 }
 
 impl ProcessState {
@@ -486,6 +487,7 @@ impl ProcessState {
             sig_mask: 0,
             exe_name: [0u8; 16],
             exe_name_len: 0,
+            clear_child_tid: 0,
         }
     }
 }
@@ -3121,12 +3123,25 @@ const MAP_PRIVATE: u64 = 0x02;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 
+/// Translate Linux prot flags (PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4)
+/// to kernel prot encoding (0=RO, 1=RW, 2=RE, 3=RWE).
+fn linux_prot_to_kernel(lprot: u64) -> u64 {
+    let r = lprot & 1;       // PROT_READ
+    let w = (lprot >> 1) & 1; // PROT_WRITE
+    let x = (lprot >> 2) & 1; // PROT_EXEC
+    if w != 0 && x != 0 { return 3; } // RWE
+    if x != 0 { return 2; }            // RE
+    if w != 0 { return 1; }            // RW
+    if r != 0 { return 0; }            // RO
+    0 // PROT_NONE → RO (kernel doesn't have PROT_NONE, use RO as fallback)
+}
+
 /// Handle Linux mmap(addr, length, prot, flags, fd, offset).
 /// Supports anonymous and file-backed (MAP_PRIVATE) mappings.
 fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let addr = args[0];
     let len = args[1] as usize;
-    let prot = args[2];
+    let linux_prot = args[2];
     let flags = args[3];
     let fd = args[4] as i64;
     let file_offset = args[5];
@@ -3139,17 +3154,18 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let is_anon = (flags & MAP_ANONYMOUS) != 0;
     let is_fixed = (flags & MAP_FIXED) != 0;
 
+    // Translate Linux prot to kernel prot encoding.
+    let kern_prot = linux_prot_to_kernel(linux_prot);
+
     // MAP_FIXED: unmap any existing pages at the target address first.
     if is_fixed && addr != 0 {
         syscall::personality_munmap(caller_port, addr as usize);
     }
 
-    // For file-backed mmap we need to write data, so temporarily use RW if read-only.
+    // For file-backed mmap we need to write data, so temporarily use RW.
     // Kernel prot encoding: 0=RO, 1=RW, 2=RE, 3=RWE.
-    // Linux prot: PROT_READ=1 maps to kernel 1(RW), so RO files are already writable.
-    // Only need bump if kernel prot 0 (PROT_NONE) or 2 (RE) — neither includes write.
-    let need_bump = !is_anon && (prot == 0 || prot == 2);
-    let map_prot = if need_bump { prot | 1 } else { prot };
+    let need_bump = !is_anon && kern_prot != 1 && kern_prot != 3;
+    let map_prot = if need_bump { 1 } else { kern_prot }; // RW for file data copy
 
     let va = match syscall::personality_mmap_anon(caller_port, addr, pages, map_prot) {
         Some(v) => v,
@@ -3165,9 +3181,8 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                     (PROC_TABLE[pi].fds[fd_idx].kind, PROC_TABLE[pi].fds[fd_idx].fs_port,
                      PROC_TABLE[pi].fds[fd_idx].handle, PROC_TABLE[pi].fds[fd_idx].file_size)
                 } else {
-                    // fd not valid — pages already mapped, just leave them zeroed
-                    if map_prot != prot {
-                        syscall::personality_mprotect(caller_port, va, len, prot as u8);
+                    if need_bump {
+                        syscall::personality_mprotect(caller_port, va, len, kern_prot as u8);
                     }
                     return va as u64;
                 }
@@ -3175,13 +3190,18 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
             match kind {
                 FdKind::File => {
-                    // Read from VFS and populate pages.
+                    // Read from VFS and populate pages via batched IPC reads.
+                    // Accumulate 16-byte IPC reads into a local buffer, then
+                    // copy out in bulk via personality_copy_out (up to 4096 bytes
+                    // per kernel crossing instead of 16).
                     let avail = if file_offset >= file_size { 0 }
                                 else { (file_size - file_offset) as usize };
                     let to_read = len.min(avail);
                     if to_read > 0 {
                         let reply_port = unsafe { REPLY_PORT };
                         let mut total = 0usize;
+                        let mut buf = [0u8; 4096];
+                        let mut buf_used = 0usize;
                         while total < to_read {
                             let chunk = (to_read - total).min(16);
                             let d2 = (chunk as u64) | ((reply_port) << 32);
@@ -3193,15 +3213,27 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                             if resp.tag != FS_READ_OK { break; }
                             let got = (resp.data[0] & 0xFFFF) as usize;
                             if got == 0 { break; }
-                            let mut tmp = [0u8; 16];
                             let b1 = resp.data[1].to_le_bytes();
                             let b2 = resp.data[2].to_le_bytes();
-                            tmp[..8].copy_from_slice(&b1);
-                            tmp[8..16].copy_from_slice(&b2);
-                            let to_write = got.min(chunk);
-                            syscall::personality_copy_out(caller_port, va + total, &tmp[..to_write]);
-                            total += to_write;
+                            let to_copy = got.min(chunk);
+                            for i in 0..to_copy {
+                                if i < 8 { buf[buf_used] = b1[i]; }
+                                else { buf[buf_used] = b2[i - 8]; }
+                                buf_used += 1;
+                            }
+                            total += to_copy;
+                            // Flush buffer when full or done.
+                            if buf_used >= 4096 || total >= to_read {
+                                let flush_va = va + total - buf_used;
+                                syscall::personality_copy_out(caller_port, flush_va, &buf[..buf_used]);
+                                buf_used = 0;
+                            }
                             if got < chunk { break; }
+                        }
+                        // Flush remaining.
+                        if buf_used > 0 {
+                            let flush_va = va + total - buf_used;
+                            syscall::personality_copy_out(caller_port, flush_va, &buf[..buf_used]);
                         }
                     }
                 }
@@ -3217,7 +3249,7 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                 let base = MEMFD_TABLE[idx].va;
                                 let mut total = 0usize;
                                 while total < to_read {
-                                    let chunk = (to_read - total).min(512);
+                                    let chunk = (to_read - total).min(4096);
                                     let src = core::slice::from_raw_parts(
                                         (base + off + total) as *const u8, chunk);
                                     let written = syscall::personality_copy_out(
@@ -3236,7 +3268,7 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     // Restore requested protection if we temporarily bumped it.
     if need_bump {
-        syscall::personality_mprotect(caller_port, va, len, prot as u8);
+        syscall::personality_mprotect(caller_port, va, len, kern_prot as u8);
     }
 
     va as u64
@@ -3296,7 +3328,11 @@ fn handle_arch_prctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux set_tid_address(tidptr).
-fn handle_set_tid_address(caller_port: u64) -> u64 {
+/// Stores tidptr for CLONE_CHILD_CLEARTID futex wake on thread exit.
+/// Returns the caller's "tid" (we use the port_id).
+fn handle_set_tid_address(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let tidptr = args[0] as usize;
+    unsafe { PROC_TABLE[pi].clear_child_tid = tidptr; }
     caller_port
 }
 
@@ -6364,7 +6400,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_WAIT4 => handle_wait4(caller_port, &msg.data),
             __NR_BRK => handle_brk(pi, caller_port, &msg.data),
             __NR_ARCH_PRCTL => handle_arch_prctl(pi, caller_port, &msg.data),
-            __NR_SET_TID_ADDRESS => handle_set_tid_address(caller_port),
+            __NR_SET_TID_ADDRESS => handle_set_tid_address(pi, caller_port, &msg.data),
             __NR_EXIT | __NR_EXIT_GROUP => {
                 handle_exit(pi, caller_port, &msg.data);
                 continue; // Don't reply — task is dead.
@@ -6448,8 +6484,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_MPROTECT => {
                 let addr = msg.data[0] as usize;
                 let len = msg.data[1] as usize;
-                let prot = msg.data[2] as u8;
-                if syscall::personality_mprotect(caller_port, addr, len, prot) { 0 } else { linux_err(ENOSYS) }
+                let kprot = linux_prot_to_kernel(msg.data[2]) as u8;
+                if syscall::personality_mprotect(caller_port, addr, len, kprot) { 0 } else { linux_err(ENOSYS) }
             }
             __NR_MUNMAP => {
                 let addr = msg.data[0] as usize;
