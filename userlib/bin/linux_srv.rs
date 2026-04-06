@@ -187,6 +187,14 @@ const __NR_COPY_FILE_RANGE: u64 = 326;
 const __NR_SPLICE: u64 = 275;
 const __NR_TEE: u64 = 276;
 const __NR_VMSPLICE: u64 = 278;
+const __NR_SYSINFO: u64 = 99;
+const __NR_GETITIMER: u64 = 36;
+const __NR_SETITIMER: u64 = 38;
+const __NR_TIMES: u64 = 100;
+const __NR_SYSLOG: u64 = 103;
+const __NR_PTRACE: u64 = 101;
+const __NR_CAPGET: u64 = 125;
+const __NR_CAPSET: u64 = 126;
 
 // arch_prctl subcodes
 const ARCH_SET_FS: u64 = 0x1002;
@@ -329,7 +337,7 @@ const EPOLL_CTL_MOD: u64 = 3;
 const _EPOLL_CLOEXEC: u64 = 0x80000;
 
 const MAX_FDS: usize = 64;
-const MAX_PROCS: usize = 32;
+const MAX_PROCS: usize = 64;
 const MAX_EPOLL_INSTANCES: usize = 16;
 const MAX_EPOLL_WATCHES: usize = 16;
 
@@ -1827,6 +1835,57 @@ fn handle_uname(caller_port: u64, args: &[u64; 6]) -> u64 {
         return linux_err(EFAULT);
     }
     0
+}
+
+/// Handle Linux sysinfo(info).
+/// Returns basic memory and uptime information.
+fn handle_sysinfo(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let buf_va = args[0] as usize;
+    if buf_va == 0 { return linux_err(EFAULT); }
+
+    // struct sysinfo is 112 bytes on x86_64.
+    // Layout: uptime(8), loads[3](24), totalram(8), freeram(8), sharedram(8),
+    //   bufferram(8), totalswap(8), freeswap(8), procs(2), pad(2), totalhigh(4),
+    //   freehigh(4), mem_unit(4), padding(variable)
+    let mut info = [0u8; 112];
+
+    // uptime: approximate from clock_gettime (returns ns)
+    let ns = syscall::clock_gettime();
+    let sec = ns / 1_000_000_000;
+    info[0..8].copy_from_slice(&sec.to_le_bytes());
+
+    // totalram: 256MB (QEMU default)
+    let total: u64 = 256 * 1024 * 1024;
+    info[32..40].copy_from_slice(&total.to_le_bytes());
+
+    // freeram: ~128MB (rough estimate)
+    let free: u64 = 128 * 1024 * 1024;
+    info[40..48].copy_from_slice(&free.to_le_bytes());
+
+    // procs: 16 (approximate)
+    info[80..82].copy_from_slice(&16u16.to_le_bytes());
+
+    // mem_unit: 1 (sizes in bytes)
+    info[88..92].copy_from_slice(&1u32.to_le_bytes());
+
+    let written = syscall::personality_copy_out(caller_port, buf_va, &info);
+    if written < 112 { return linux_err(EFAULT); }
+    0
+}
+
+/// Handle Linux times(buf).
+/// Returns process times (all zeros — no per-process accounting).
+fn handle_times(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let buf_va = args[0] as usize;
+    if buf_va != 0 {
+        // struct tms: 4 fields of clock_t (8 bytes each on x86_64) = 32 bytes
+        let tms = [0u8; 32];
+        syscall::personality_copy_out(caller_port, buf_va, &tms);
+    }
+    // Return clock ticks since boot (approximate).
+    let ns = syscall::clock_gettime();
+    let sec = ns / 1_000_000_000;
+    sec * 100 // Assume HZ=100
 }
 
 /// Handle Linux getrandom(buf, buflen, flags).
@@ -5558,6 +5617,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_SCHED_GET_ATTR => linux_err(EINVAL), // unsupported, force fallback to getparam
             __NR_COPY_FILE_RANGE => linux_err(ENOSYS), // not supported yet
             __NR_SPLICE | __NR_TEE | __NR_VMSPLICE => linux_err(ENOSYS), // no pipe splice support
+
+            // Phase 155: sysinfo, times, itimer, capabilities.
+            __NR_SYSINFO => handle_sysinfo(caller_port, &msg.data),
+            __NR_TIMES => handle_times(caller_port, &msg.data),
+            __NR_GETITIMER => {
+                // Write zeroed itimerval (32 bytes) to user buffer.
+                let buf_va = msg.data[1] as usize;
+                if buf_va != 0 {
+                    let zero = [0u8; 32];
+                    syscall::personality_copy_out(caller_port, buf_va, &zero);
+                }
+                0
+            }
+            __NR_SETITIMER => 0, // stub: no interval timers via setitimer yet
+            __NR_SYSLOG => linux_err(EPERM), // no kernel log access
+            __NR_PTRACE => linux_err(EPERM), // no tracing support
+            __NR_CAPGET => linux_err(EPERM), // no capabilities support
+            __NR_CAPSET => linux_err(EPERM),
 
             // Phase 129: Socket syscalls.
             __NR_SOCKET => handle_socket(pi, caller_port, &msg.data),

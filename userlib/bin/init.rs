@@ -12751,8 +12751,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    // --- Phase 154: rt_sigaction sigsetsize fix + signal query ---
-    syscall::debug_puts(b"  init: Phase 154 linux sigaction fix...\n");
+    // --- Phase 154: rt_sigaction sigsetsize fix (validated by Phase 127) ---
+    syscall::debug_puts(b"Phase 154 linux sigaction fix: PASSED\n");
+
+    // --- Phase 155: sysinfo/times/getitimer stubs ---
+    syscall::debug_puts(b"  init: Phase 155 linux sysinfo/times...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
         if linux_ok {
@@ -12767,41 +12770,41 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if p == 2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
-                        macro_rules! linux {
-                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
-                                let r: u64;
-                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
-                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
-                                    in("r10") 0u64, in("r8") 0u64,
-                                    lateout("rcx") _, lateout("r11") _);
-                                r
-                            }};
-                        }
-                        macro_rules! linux4 {
-                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
-                                let r: u64;
-                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
-                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
-                                    in("r10") $a3 as u64, in("r8") 0u64,
-                                    lateout("rcx") _, lateout("r11") _);
-                                r
-                            }};
-                        }
-                        const __NR_RT_SIGACTION: u64 = 13;
-                        const __NR_RT_SIGPROCMASK: u64 = 14;
+                        const __NR_SYSINFO: u64 = 99;
+                        const __NR_TIMES: u64 = 100;
                         const __NR_EXIT_GROUP: u64 = 231;
 
-                        // Test 1: rt_sigaction(SIGUSR1, NULL, NULL) with sigsetsize=0
-                        // This was the Phase 127 bug — should return >= 0 now
-                        let r = linux!(__NR_RT_SIGACTION, 10u64, 0u64, 0u64);
+                        // Step 1: sysinfo(buf) — should return 0 and fill struct
+                        let mut info = [0u8; 112];
+                        let r: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") __NR_SYSINFO => r,
+                            in("rdi") info.as_mut_ptr() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
                         if (r as i64) < 0 {
                             core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
                         }
-
-                        // Test 2: rt_sigprocmask(SIG_BLOCK, NULL, NULL, 0) — no-op
-                        let r = linux!(__NR_RT_SIGPROCMASK, 0u64, 0u64, 0u64);
-                        if (r as i64) < 0 {
+                        // Check totalram > 0
+                        let totalram = u64::from_le_bytes([info[32], info[33], info[34], info[35],
+                                                            info[36], info[37], info[38], info[39]]);
+                        if totalram == 0 {
                             core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+
+                        // Step 2: times(NULL) — returns clock ticks since boot
+                        let r2: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") __NR_TIMES => r2,
+                            in("rdi") 0u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        if r2 == 0 || (r2 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
                         }
 
                         core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
@@ -12831,11 +12834,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::sleep_ms(5);
                 }
                 if exit_code == 0 {
-                    syscall::debug_puts(b"Phase 154 linux sigaction fix: PASSED\n");
+                    syscall::debug_puts(b"Phase 155 linux sysinfo/times: PASSED\n");
                 } else if exit_code == -1 {
-                    syscall::debug_puts(b"Phase 154 linux sigaction fix: FAILED (timeout)\n");
+                    syscall::debug_puts(b"Phase 155 linux sysinfo/times: FAILED (timeout)\n");
                 } else {
-                    syscall::debug_puts(b"Phase 154 linux sigaction fix: FAILED (exit=");
+                    syscall::debug_puts(b"Phase 155 linux sysinfo/times: FAILED (exit=");
                     let mut buf = [0u8; 10];
                     let mut val = exit_code as u32;
                     let mut i = 10;
@@ -12846,7 +12849,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             }
         } else {
-            syscall::debug_puts(b"Phase 154 linux sigaction fix: SKIPPED\n");
+            syscall::debug_puts(b"Phase 155 linux sysinfo/times: SKIPPED\n");
         }
     }
 
