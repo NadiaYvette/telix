@@ -13597,6 +13597,129 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 163: waitid, getcpu, /proc/self/maps content ---
+    syscall::debug_puts(b"  init: Phase 163 linux waitid+getcpu+maps...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_OPEN: u64 = 2;
+                        const __NR_READ: u64 = 0;
+                        const __NR_CLOSE: u64 = 3;
+                        const __NR_GETCPU: u64 = 309;
+                        const __NR_EXIT_GROUP: u64 = 231;
+
+                        // Test 1: getcpu(&cpu, &node) should return 0.
+                        let mut cpu: u32 = 0xFFFF;
+                        let mut node: u32 = 0xFFFF;
+                        let r: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_GETCPU => r,
+                            in("rdi") &mut cpu as *mut u32 as u64,
+                            in("rsi") &mut node as *mut u32 as u64,
+                            in("rdx") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+                        // cpu should be a small number (< 256).
+                        if cpu > 255 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+
+                        // Test 2: open + read /proc/self/maps — should contain "[text]".
+                        let r2: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_OPEN => r2,
+                            in("rdi") b"/proc/self/maps\0".as_ptr() as u64,
+                            in("rsi") 0u64,   // O_RDONLY
+                            in("rdx") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r2 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
+                        }
+                        let maps_fd = r2;
+                        let mut maps_buf = [0u8; 256];
+                        let r3: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_READ => r3,
+                            in("rdi") maps_fd,
+                            in("rsi") maps_buf.as_mut_ptr() as u64,
+                            in("rdx") 256u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r3 as i64) <= 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 94u64, options(noreturn));
+                        }
+                        // Check that output contains "[text]".
+                        let read_len = r3 as usize;
+                        let mut found_text = false;
+                        if read_len >= 6 {
+                            for i in 0..read_len - 5 {
+                                if maps_buf[i] == b'[' && maps_buf[i+1] == b't' && maps_buf[i+2] == b'e'
+                                    && maps_buf[i+3] == b'x' && maps_buf[i+4] == b't' && maps_buf[i+5] == b']' {
+                                    found_text = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !found_text {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 95u64, options(noreturn));
+                        }
+                        // Close maps fd.
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _,
+                            in("rdi") maps_fd,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 163 linux waitid+getcpu+maps: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 163 linux waitid+getcpu+maps: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 163 linux waitid+getcpu+maps: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 163 linux waitid+getcpu+maps: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

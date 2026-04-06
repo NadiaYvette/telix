@@ -216,6 +216,9 @@ const __NR_SYNC: u64 = 162;
 const __NR_SYNCFS: u64 = 306;
 const __NR_CLOSE_RANGE: u64 = 436;
 const __NR_FACCESSAT2: u64 = 439;
+const __NR_WAITID: u64 = 247;
+const __NR_GETCPU: u64 = 309;
+const __NR_GETDENTS: u64 = 78;
 const __NR_CHROOT: u64 = 161;
 const __NR_PIVOT_ROOT: u64 = 155;
 const __NR_MOUNT: u64 = 165;
@@ -1591,17 +1594,71 @@ fn open_proc_file(pi: usize, _caller_port: u64, path: &[u8], flags: u64) -> u64 
     let len: usize;
 
     if path == b"/proc/self/maps" {
-        // Minimal maps entry — just report a placeholder text region.
-        let content = b"00400000-00401000 r-xp 00000000 00:00 0  [text]\n";
-        let n = content.len().min(PROCBUF_SIZE);
-        buf[..n].copy_from_slice(&content[..n]);
-        len = n;
+        // Generate maps with text region + heap (if brk is set).
+        let mut pos = 0;
+        // Text segment placeholder.
+        let line1 = b"00400000-00401000 r-xp 00000000 00:00 0  [text]\n";
+        let n1 = line1.len().min(PROCBUF_SIZE - pos);
+        buf[pos..pos + n1].copy_from_slice(&line1[..n1]);
+        pos += n1;
+        // Heap region if brk is active.
+        unsafe {
+            let brk_base = PROC_TABLE[pi].brk_base;
+            let brk_cur = PROC_TABLE[pi].brk_current;
+            if brk_base != 0 && brk_cur > brk_base && pos + 60 < PROCBUF_SIZE {
+                // Format: "XXXXXXXX-YYYYYYYY rw-p 00000000 00:00 0  [heap]\n"
+                fn hex8(val: usize, out: &mut [u8]) {
+                    for i in 0..8 {
+                        let nib = (val >> (28 - i * 4)) & 0xF;
+                        out[i] = if nib < 10 { b'0' + nib as u8 } else { b'a' + (nib - 10) as u8 };
+                    }
+                }
+                hex8(brk_base, &mut buf[pos..]);
+                pos += 8;
+                buf[pos] = b'-'; pos += 1;
+                hex8(brk_cur, &mut buf[pos..]);
+                pos += 8;
+                let suffix = b" rw-p 00000000 00:00 0  [heap]\n";
+                let n2 = suffix.len().min(PROCBUF_SIZE - pos);
+                buf[pos..pos + n2].copy_from_slice(&suffix[..n2]);
+                pos += n2;
+            }
+        }
+        // Stack placeholder.
+        if pos + 60 < PROCBUF_SIZE {
+            let stack = b"7fff00000000-7fff00010000 rw-p 00000000 00:00 0  [stack]\n";
+            let n3 = stack.len().min(PROCBUF_SIZE - pos);
+            buf[pos..pos + n3].copy_from_slice(&stack[..n3]);
+            pos += n3;
+        }
+        len = pos;
     } else if path == b"/proc/self/status" {
         // Minimal /proc/self/status with fields glibc checks.
-        let content = b"Name:\tunknown\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\nVmPeak:\t    4096 kB\nVmSize:\t    4096 kB\nVmRSS:\t    4096 kB\nThreads:\t1\n";
-        let n = content.len().min(PROCBUF_SIZE);
-        buf[..n].copy_from_slice(&content[..n]);
-        len = n;
+        // Use stored exe name for the Name: field.
+        let elen = unsafe { PROC_TABLE[pi].exe_name_len as usize };
+        let mut pos = 0;
+        buf[pos..pos + 6].copy_from_slice(b"Name:\t");
+        pos += 6;
+        if elen > 0 {
+            // Use basename of exe_name.
+            let name = unsafe { &PROC_TABLE[pi].exe_name[..elen] };
+            let base_start = match name.iter().rposition(|&b| b == b'/') {
+                Some(p) => p + 1,
+                None => 0,
+            };
+            let base = &name[base_start..];
+            let n = base.len().min(PROCBUF_SIZE - pos);
+            buf[pos..pos + n].copy_from_slice(&base[..n]);
+            pos += n;
+        } else {
+            buf[pos..pos + 7].copy_from_slice(b"unknown");
+            pos += 7;
+        }
+        let rest = b"\nUmask:\t0022\nState:\tR (running)\nTgid:\t1\nNgid:\t0\nPid:\t1\nPPid:\t0\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\nVmPeak:\t    4096 kB\nVmSize:\t    4096 kB\nVmRSS:\t    4096 kB\nThreads:\t1\n";
+        let nr = rest.len().min(PROCBUF_SIZE - pos);
+        buf[pos..pos + nr].copy_from_slice(&rest[..nr]);
+        pos += nr;
+        len = pos;
     } else if path == b"/proc/self/cmdline" {
         // NUL-separated argv: use stored exe name if available.
         let elen = unsafe { PROC_TABLE[pi].exe_name_len as usize };
@@ -2781,6 +2838,53 @@ fn handle_wait4(caller_port: u64, args: &[u64; 6]) -> u64 {
         syscall::yield_now();
     }
     // Timeout — return 0 (no child ready).
+    0
+}
+
+/// Handle Linux waitid(idtype, id, infop, options).
+/// idtype: P_ALL=0, P_PID=1, P_PGID=2.
+fn handle_waitid(caller_port: u64, args: &[u64; 6]) -> u64 {
+    let _idtype = args[0];
+    let id = args[1] as i64;
+    let infop_va = args[2] as usize;
+    let options = args[3] as u32;
+    const WNOHANG: u32 = 1;
+    const WEXITED: u32 = 4;
+
+    // Only handle WEXITED; treat P_ALL as pid=-1.
+    let wait_pid = if _idtype == 0 { -1i64 } else { id };
+    let wnohang = (options & WNOHANG) != 0;
+
+    for _ in 0..5000 {
+        let child_port = syscall::personality_wait4(caller_port, wait_pid, 1);
+        if child_port == u64::MAX {
+            return linux_err(ECHILD);
+        }
+        if child_port != 0 {
+            // Fill siginfo_t if requested (128 bytes on x86_64).
+            if infop_va != 0 && (options & WEXITED) != 0 {
+                let mut si = [0u8; 128];
+                // si_signo = SIGCHLD (17) at offset 0.
+                si[0..4].copy_from_slice(&17u32.to_le_bytes());
+                // si_code = CLD_EXITED (1) at offset 8.
+                si[8..12].copy_from_slice(&1u32.to_le_bytes());
+                // si_pid at offset 16.
+                si[16..20].copy_from_slice(&(child_port as u32).to_le_bytes());
+                // si_status at offset 24 = 0 (exit code).
+                syscall::personality_copy_out(caller_port, infop_va, &si);
+            }
+            return 0; // Success (waitid returns 0 on success).
+        }
+        if wnohang {
+            // Zero out siginfo to indicate no child collected.
+            if infop_va != 0 {
+                let zero = [0u8; 128];
+                syscall::personality_copy_out(caller_port, infop_va, &zero);
+            }
+            return 0;
+        }
+        syscall::yield_now();
+    }
     0
 }
 
@@ -6195,6 +6299,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Phase 162: close_range, faccessat2.
             __NR_CLOSE_RANGE => handle_close_range(pi, &msg.data),
             __NR_FACCESSAT2 => handle_faccessat(pi, caller_port, &msg.data),
+
+            // Phase 163: waitid, getcpu, getdents (old).
+            __NR_WAITID => handle_waitid(caller_port, &msg.data),
+            __NR_GETCPU => {
+                // getcpu(cpu, node, unused): write cpu=0, node=0.
+                let cpu_va = msg.data[0] as usize;
+                let node_va = msg.data[1] as usize;
+                let zero4 = 0u32.to_le_bytes();
+                if cpu_va != 0 { syscall::personality_copy_out(caller_port, cpu_va, &zero4); }
+                if node_va != 0 { syscall::personality_copy_out(caller_port, node_va, &zero4); }
+                0
+            }
+            __NR_GETDENTS => handle_getdents64(pi, caller_port, &msg.data), // reuse getdents64 (compat)
 
             // Phase 129: Socket syscalls.
             __NR_SOCKET => handle_socket(pi, caller_port, &msg.data),
