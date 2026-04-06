@@ -14117,6 +14117,135 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // ============================================================
     // --- Test 23: Benchmark Suite ---
+    // --- Phase 167: dup stdin/stdout + openat absolute ---
+    syscall::debug_puts(b"  init: Phase 167 linux dup+openat...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_DUP: u64 = 32;
+                        const __NR_DUP2: u64 = 33;
+                        const __NR_IOCTL: u64 = 16;
+                        const __NR_CLOSE: u64 = 3;
+                        const __NR_OPENAT: u64 = 257;
+                        const __NR_READ: u64 = 0;
+                        const __NR_EXIT_GROUP: u64 = 231;
+
+                        // Test 1: dup(1) — dup stdout → new fd, should be ≥ 3.
+                        let r: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_DUP => r,
+                            in("rdi") 1u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 3 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+                        let duped_fd = r;
+                        // The duped fd should be a tty — TCGETS should succeed.
+                        let mut termios = [0u8; 60];
+                        let r2: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_IOCTL => r2,
+                            in("rdi") duped_fd,
+                            in("rsi") 0x5401u64,  // TCGETS
+                            in("rdx") termios.as_mut_ptr() as u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r2 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _, in("rdi") duped_fd,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        // Test 2: dup2(0, 10) — dup stdin to fd 10.
+                        let r3: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_DUP2 => r3,
+                            in("rdi") 0u64, in("rsi") 10u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if r3 != 10 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
+                        }
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _, in("rdi") 10u64,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        // Test 3: openat(AT_FDCWD, "/etc/hostname", O_RDONLY) — absolute path.
+                        let r4: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_OPENAT => r4,
+                            in("rdi") (-100i64 as u64),  // AT_FDCWD
+                            in("rsi") b"/etc/hostname\0".as_ptr() as u64,
+                            in("rdx") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r4 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 94u64, options(noreturn));
+                        }
+                        let fd = r4;
+                        let mut buf = [0u8; 32];
+                        let r5: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_READ => r5,
+                            in("rdi") fd, in("rsi") buf.as_mut_ptr() as u64, in("rdx") 32u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r5 as i64) <= 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 95u64, options(noreturn));
+                        }
+                        // Should contain "telix".
+                        if buf[0] != b't' || buf[1] != b'e' {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 96u64, options(noreturn));
+                        }
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_CLOSE => _, in("rdi") fd,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 167 linux dup+openat: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 167 linux dup+openat: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 167 linux dup+openat: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 167 linux dup+openat: SKIPPED\n");
+        }
+    }
+
+    // ============================================================
+    // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
     {
         let bench_tid = syscall::spawn(b"bench", 50);
