@@ -219,6 +219,24 @@ const __NR_FACCESSAT2: u64 = 439;
 const __NR_WAITID: u64 = 247;
 const __NR_GETCPU: u64 = 309;
 const __NR_GETDENTS: u64 = 78;
+// Phase 165: batch stubs.
+const __NR_SCHED_SETAFFINITY: u64 = 203;
+const __NR_IO_SETUP: u64 = 206;
+const __NR_IO_DESTROY: u64 = 207;
+const __NR_IO_GETEVENTS: u64 = 208;
+const __NR_IO_SUBMIT: u64 = 209;
+const __NR_MKNOD: u64 = 133;
+const __NR_MKNODAT: u64 = 259;
+const __NR_SIGNALFD4: u64 = 289;
+const __NR_PERF_EVENT_OPEN: u64 = 298;
+const __NR_RECVMMSG: u64 = 299;
+const __NR_SENDMMSG: u64 = 307;
+const __NR_SECCOMP: u64 = 317;
+const __NR_IO_URING_SETUP: u64 = 425;
+const __NR_IO_URING_ENTER: u64 = 426;
+const __NR_IO_URING_REGISTER: u64 = 427;
+const __NR_NAME_TO_HANDLE_AT: u64 = 303;
+const __NR_OPEN_BY_HANDLE_AT: u64 = 304;
 const __NR_CHROOT: u64 = 161;
 const __NR_PIVOT_ROOT: u64 = 155;
 const __NR_MOUNT: u64 = 165;
@@ -4688,6 +4706,58 @@ fn handle_recvfrom(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 /// Handle Linux sendmsg(fd, msg, flags).
 /// Reads msghdr from caller, gathers iovecs, sends via write_socket.
 /// Supports SCM_RIGHTS ancillary data for passing FDs over AF_UNIX sockets.
+/// Handle Linux sendmmsg(fd, msgvec, vlen, flags).
+/// Each mmsghdr = { msghdr (56 bytes), msg_len (u32) }, total 64 bytes.
+fn handle_sendmmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0];
+    let msgvec_va = args[1] as usize;
+    let vlen = args[2] as usize;
+    let flags = args[3];
+
+    let mut sent = 0u32;
+    for i in 0..vlen {
+        // Each mmsghdr is 64 bytes: msghdr(56) + msg_len(u32) + pad(4).
+        let mhdr_va = msgvec_va + i * 64;
+        let sub_args: [u64; 6] = [fd, mhdr_va as u64, flags, 0, 0, 0];
+        let r = handle_sendmsg(pi, caller_port, &sub_args);
+        if (r as i64) < 0 {
+            if sent > 0 { break; } // partial success
+            return r; // first message failed
+        }
+        // Write msg_len at offset 56 in the mmsghdr.
+        let len_bytes = (r as u32).to_le_bytes();
+        syscall::personality_copy_out(caller_port, mhdr_va + 56, &len_bytes);
+        sent += 1;
+    }
+    sent as u64
+}
+
+/// Handle Linux recvmmsg(fd, msgvec, vlen, flags, timeout).
+fn handle_recvmmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let fd = args[0];
+    let msgvec_va = args[1] as usize;
+    let vlen = args[2] as usize;
+    let flags = args[3];
+
+    let mut recvd = 0u32;
+    for i in 0..vlen {
+        let mhdr_va = msgvec_va + i * 64;
+        let sub_args: [u64; 6] = [fd, mhdr_va as u64, flags, 0, 0, 0];
+        let r = handle_recvmsg(pi, caller_port, &sub_args);
+        if (r as i64) < 0 {
+            if recvd > 0 { break; }
+            return r;
+        }
+        let len_bytes = (r as u32).to_le_bytes();
+        syscall::personality_copy_out(caller_port, mhdr_va + 56, &len_bytes);
+        recvd += 1;
+        // Unlike sendmmsg, recvmmsg doesn't keep blocking for more messages.
+        // Return after first successful recv unless MSG_WAITFORONE.
+        break;
+    }
+    recvd as u64
+}
+
 fn handle_sendmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
     let msghdr_va = args[1] as usize;
@@ -6361,6 +6431,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let flags = msg.data[3];
                 handle_accept_inner(pi, caller_port, &msg.data, flags)
             }
+
+            // Phase 165: batch stubs for common glibc/musl syscalls.
+            __NR_SCHED_SETAFFINITY => 0, // pretend success, single-CPU
+            __NR_MKNOD | __NR_MKNODAT => linux_err(EPERM), // no device node creation
+            __NR_SECCOMP => linux_err(EINVAL), // no sandboxing
+            __NR_PERF_EVENT_OPEN => linux_err(ENOSYS), // no perf support
+            __NR_IO_SETUP | __NR_IO_DESTROY | __NR_IO_SUBMIT | __NR_IO_GETEVENTS => linux_err(ENOSYS),
+            __NR_IO_URING_SETUP | __NR_IO_URING_ENTER | __NR_IO_URING_REGISTER => linux_err(ENOSYS),
+            __NR_SIGNALFD4 => linux_err(ENOSYS), // no signalfd yet
+            __NR_NAME_TO_HANDLE_AT | __NR_OPEN_BY_HANDLE_AT => linux_err(ENOSYS),
+            __NR_SENDMMSG => handle_sendmmsg(pi, caller_port, &msg.data),
+            __NR_RECVMMSG => handle_recvmmsg(pi, caller_port, &msg.data),
 
             _ => {
                 syscall::debug_puts(b"[linux_srv] unhandled nr=");

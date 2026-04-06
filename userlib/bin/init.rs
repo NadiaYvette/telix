@@ -13871,6 +13871,113 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 165: batch syscall stubs ---
+    syscall::debug_puts(b"  init: Phase 165 linux batch stubs...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_SCHED_SETAFFINITY: u64 = 203;
+                        const __NR_MKNOD: u64 = 133;
+                        const __NR_SECCOMP: u64 = 317;
+                        const __NR_IO_URING_SETUP: u64 = 425;
+                        const __NR_EXIT_GROUP: u64 = 231;
+
+                        // Test 1: sched_setaffinity(0, 8, &mask) → should return 0.
+                        let mask: u64 = 1; // CPU 0
+                        let r: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_SCHED_SETAFFINITY => r,
+                            in("rdi") 0u64,  // pid=0 (self)
+                            in("rsi") 8u64,  // cpusetsize
+                            in("rdx") &mask as *const u64 as u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+
+                        // Test 2: mknod("/dev/test", 0, 0) → should return -EPERM (not crash).
+                        let r2: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_MKNOD => r2,
+                            in("rdi") b"/dev/test\0".as_ptr() as u64,
+                            in("rsi") 0u64, in("rdx") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        // Should be -EPERM (4294967295 - 1 + 1 = -1) or specifically -1.
+                        // We just check it didn't crash — negative return is expected.
+                        if (r2 as i64) >= 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+
+                        // Test 3: seccomp(0, 0, NULL) → should return -EINVAL (not crash).
+                        let r3: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_SECCOMP => r3,
+                            in("rdi") 0u64, in("rsi") 0u64, in("rdx") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r3 as i64) >= 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
+                        }
+
+                        // Test 4: io_uring_setup(1, NULL) → should return -ENOSYS.
+                        let r4: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_IO_URING_SETUP => r4,
+                            in("rdi") 1u64, in("rsi") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r4 as i64) >= 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 94u64, options(noreturn));
+                        }
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 165 linux batch stubs: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 165 linux batch stubs: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 165 linux batch stubs: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 165 linux batch stubs: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
