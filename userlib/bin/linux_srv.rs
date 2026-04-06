@@ -578,19 +578,37 @@ fn get_or_init_proc(port: u64) -> Option<usize> {
         return Some(i);
     }
     unsafe {
+        // First pass: find a free slot.
         for i in 0..MAX_PROCS {
             if !PROC_TABLE[i].active {
+                return Some(init_proc_slot(i, port));
+            }
+        }
+        // No free slot — reclaim entries whose ports are dead (task exited).
+        for i in 0..MAX_PROCS {
+            if PROC_TABLE[i].active && !syscall::port_alive(PROC_TABLE[i].port) {
+                // Close open FDs for the dead process.
+                for fd in 3..MAX_FDS {
+                    if PROC_TABLE[i].fds[fd].in_use {
+                        do_close(i, fd);
+                    }
+                }
                 PROC_TABLE[i] = ProcessState::empty();
-                PROC_TABLE[i].active = true;
-                PROC_TABLE[i].port = port;
-                PROC_TABLE[i].cwd[0] = b'/';
-                PROC_TABLE[i].cwd_len = 1;
-                PROC_TABLE[i].umask = 0o022;
-                return Some(i);
+                return Some(init_proc_slot(i, port));
             }
         }
     }
     None
+}
+
+unsafe fn init_proc_slot(i: usize, port: u64) -> usize {
+    PROC_TABLE[i] = ProcessState::empty();
+    PROC_TABLE[i].active = true;
+    PROC_TABLE[i].port = port;
+    PROC_TABLE[i].cwd[0] = b'/';
+    PROC_TABLE[i].cwd_len = 1;
+    PROC_TABLE[i].umask = 0o022;
+    i
 }
 
 fn alloc_fd(pi: usize) -> Option<usize> {

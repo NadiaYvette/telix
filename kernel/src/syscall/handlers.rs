@@ -130,6 +130,7 @@ pub const SYS_PERSONALITY_MPROTECT: u64 = 0xF00C;
 pub const SYS_PERSONALITY_MREMAP: u64 = 0xF00D;
 pub const SYS_PERSONALITY_SET_TLS: u64 = 0xF00E;
 pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
+pub const SYS_PORT_ALIVE: u64 = 110;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -430,6 +431,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_FUTEX_WAIT_PI => crate::sync::turnstile::futex_wait_pi(a0 as usize, a1 as u32),
         SYS_FUTEX_WAKE_PI => crate::sync::turnstile::futex_wake_pi(a0 as usize),
         SYS_PAGE_SIZE => crate::mm::page::MMUPAGE_SIZE as u64,
+        SYS_PORT_ALIVE => {
+            if crate::ipc::port::port_ref(a0).is_some() { 1 } else { 0 }
+        }
         SYS_PERSONALITY_REGISTER => {
             crate::syscall::personality::register_server(a0 as u8, a1)
         }

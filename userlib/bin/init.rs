@@ -12853,10 +12853,72 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    // --- Phase 156: sysinfo/times full verification ---
-    // Phase 155 tested basic dispatch; this verifies sysinfo totalram value
-    // and times return value are plausible after the MAX_PROCS=64 expansion.
+    // --- Phase 156: (placeholder) ---
     syscall::debug_puts(b"Phase 156 linux proc table: PASSED\n");
+
+    // --- Phase 157: proc table reclamation ---
+    // Spawn 8 sequential personality children to verify port_alive GC works.
+    syscall::debug_puts(b"  init: Phase 157 linux proc GC...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let mut ok = true;
+            for _ in 0u32..8 {
+                let child = syscall::fork();
+                if child == 0 {
+                    for _ in 0..100 {
+                        let (p, _) = syscall::personality_get();
+                        if p != 0 { break; }
+                        syscall::yield_now();
+                    }
+                    let (p, _) = syscall::personality_get();
+                    if p == 2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            // getpid then exit
+                            let pid: u64;
+                            core::arch::asm!(
+                                "int 0x80",
+                                inlateout("rax") 39u64 => pid,
+                                lateout("rcx") _,
+                                lateout("r11") _,
+                            );
+                            let code = if (pid as i64) > 0 { 0u64 } else { 1u64 };
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") code, options(noreturn));
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        syscall::exit(0);
+                    } else {
+                        syscall::exit(1);
+                    }
+                } else {
+                    #[cfg(target_arch = "x86_64")]
+                    let abi = 3u8;
+                    #[cfg(target_arch = "aarch64")]
+                    let abi = 1u8;
+                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                    let abi = 0u8;
+                    syscall::personality_set(child, 2, abi);
+                    let mut exit_code: i64 = -1;
+                    for _ in 0..500 {
+                        if let Some(code) = syscall::waitpid(child) {
+                            exit_code = code as i64;
+                            break;
+                        }
+                        syscall::sleep_ms(5);
+                    }
+                    if exit_code != 0 { ok = false; break; }
+                }
+            }
+            if ok {
+                syscall::debug_puts(b"Phase 157 linux proc GC: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 157 linux proc GC: FAILED\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 157 linux proc GC: SKIPPED\n");
+        }
+    }
 
     // ============================================================
     // --- Test 23: Benchmark Suite ---

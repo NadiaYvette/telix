@@ -377,7 +377,7 @@ pub static PROXY_PORT: AtomicU64 = AtomicU64::new(0);
 /// Look up a port by ID. Returns a reference valid for the current RCU
 /// read-side critical section (i.e. the current syscall).
 #[inline]
-fn port_ref(port_id: PortId) -> Option<&'static Port> {
+pub(crate) fn port_ref(port_id: PortId) -> Option<&'static Port> {
     let local = port_local(port_id);
     let port = PORT_ART.lookup(local)?;
     if port.is_alive() { Some(port) } else { None }

@@ -58,6 +58,7 @@ const SYS_GETRANDOM: u64 = 96;
 const SYS_PROXY_REGISTER: u64 = 99;
 const SYS_PORT_RESIZE: u64 = 100;
 const SYS_PAGE_SIZE: u64 = 103;
+const SYS_PORT_ALIVE: u64 = 110;
 const SYS_PERSONALITY_REGISTER: u64 = 0xF000;
 const SYS_PERSONALITY_SET: u64 = 0xF001;
 const SYS_PERSONALITY_GET: u64 = 0xF002;
@@ -325,6 +326,11 @@ pub fn waitpid(child_port: u64) -> Option<u64> {
 /// Query the kernel's allocation page size in bytes.
 pub fn page_size() -> usize {
     unsafe { arch::syscall0(SYS_PAGE_SIZE) as usize }
+}
+
+/// Check if a port ID is still valid (its owning task is alive).
+pub fn port_alive(port: u64) -> bool {
+    unsafe { arch::syscall1(SYS_PORT_ALIVE, port) != 0 }
 }
 
 /// Allocate `byte_count` bytes (rounded up to pages). Returns (VA, actual_pages).
