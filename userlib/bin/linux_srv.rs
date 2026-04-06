@@ -2737,10 +2737,7 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let prot = args[2];
     let flags = args[3];
     let fd = args[4] as i64;
-    // Note: args[5] (r9 on x86_64) is unreliable for int 0x80 syscalls
-    // because some callers don't set r9 explicitly. For now, use 0.
-    // TODO: fix when we need non-zero file offsets for mmap.
-    let file_offset: u64 = 0;
+    let file_offset = args[5];
 
     if len == 0 { return linux_err(EINVAL); }
 
@@ -2749,6 +2746,11 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     let is_anon = (flags & MAP_ANONYMOUS) != 0;
     let is_fixed = (flags & MAP_FIXED) != 0;
+
+    // MAP_FIXED: unmap any existing pages at the target address first.
+    if is_fixed && addr != 0 {
+        syscall::personality_munmap(caller_port, addr as usize);
+    }
 
     // For file-backed mmap we need to write data, so temporarily use RW if read-only.
     // Kernel prot encoding: 0=RO, 1=RW, 2=RE, 3=RWE.
@@ -3457,7 +3459,30 @@ fn handle_ioctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             }
             0
         }
-        TCGETS | TCSETS => linux_err(ENOTTY), // Not a real terminal.
+        TCGETS => {
+            // isatty() check: return success for stdin/stdout/stderr and /dev/tty.
+            let is_tty = fd < 3 || (fd < MAX_FDS && unsafe { PROC_TABLE[pi].fds[fd].kind == FdKind::DevTty });
+            if is_tty {
+                // Write a minimal struct termios (60 bytes).
+                let out_va = args[2] as usize;
+                if out_va != 0 {
+                    let mut termios = [0u8; 60];
+                    // c_iflag = ICRNL (0x100)
+                    termios[0..4].copy_from_slice(&0x100u32.to_le_bytes());
+                    // c_oflag = OPOST|ONLCR (0x5)
+                    termios[4..8].copy_from_slice(&0x5u32.to_le_bytes());
+                    // c_cflag = CS8|CREAD|HUPCL (0xBF)
+                    termios[8..12].copy_from_slice(&0xBFu32.to_le_bytes());
+                    // c_lflag = ECHO|ICANON|ISIG|IEXTEN (0x8A3B)
+                    termios[12..16].copy_from_slice(&0x8A3Bu32.to_le_bytes());
+                    syscall::personality_copy_out(caller_port, out_va, &termios);
+                }
+                0
+            } else {
+                linux_err(ENOTTY)
+            }
+        }
+        TCSETS => 0, // Ignore terminal setting changes.
         _ => linux_err(ENOTTY),
     }
 }

@@ -13360,6 +13360,112 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 161: MAP_FIXED mmap, file offset, isatty ---
+    syscall::debug_puts(b"  init: Phase 161 linux mmap+isatty...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_MMAP: u64 = 9;
+                        const __NR_MUNMAP: u64 = 11;
+                        const __NR_IOCTL: u64 = 16;
+                        const __NR_EXIT_GROUP: u64 = 231;
+
+                        // Test 1: MAP_FIXED mmap at a chosen address.
+                        let fixed_addr: u64 = 0x2_0000_0000; // 8 GiB — above normal heap
+                        let r: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_MMAP => r,
+                            in("rdi") fixed_addr,
+                            in("rsi") 4096u64,
+                            in("rdx") 3u64,   // PROT_READ|PROT_WRITE
+                            in("r10") 0x22u64, // MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED
+                            in("r8") !0u64,    // fd = -1
+                            in("r9") 0u64,     // offset = 0
+                            lateout("rcx") _, lateout("r11") _);
+                        if r == u64::MAX || r != fixed_addr {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+                        // Write and read back from the fixed address.
+                        core::ptr::write_volatile(r as *mut u64, 0xDEAD_BEEF_CAFE_BABEu64);
+                        let val = core::ptr::read_volatile(r as *const u64);
+                        if val != 0xDEAD_BEEF_CAFE_BABEu64 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+                        // Unmap it.
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_MUNMAP => _,
+                            in("rdi") fixed_addr, in("rsi") 4096u64,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        // Test 2: isatty(1) — ioctl(1, TCGETS, &termios) should return 0.
+                        let mut termios = [0u8; 60];
+                        let r2: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_IOCTL => r2,
+                            in("rdi") 1u64,     // stdout
+                            in("rsi") 0x5401u64, // TCGETS
+                            in("rdx") termios.as_mut_ptr() as u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r2 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
+                        }
+                        // Verify c_cflag is non-zero (termios was populated).
+                        let cflag = u32::from_le_bytes([termios[8], termios[9], termios[10], termios[11]]);
+                        if cflag == 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 94u64, options(noreturn));
+                        }
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 161 linux mmap+isatty: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 161 linux mmap+isatty: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 161 linux mmap+isatty: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 161 linux mmap+isatty: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
