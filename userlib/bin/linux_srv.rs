@@ -195,6 +195,29 @@ const __NR_SYSLOG: u64 = 103;
 const __NR_PTRACE: u64 = 101;
 const __NR_CAPGET: u64 = 125;
 const __NR_CAPSET: u64 = 126;
+// Phase 158: credential, resource, filesystem stubs.
+const __NR_SETUID: u64 = 105;
+const __NR_SETGID: u64 = 106;
+const __NR_SETRESUID: u64 = 117;
+const __NR_SETRESGID: u64 = 119;
+const __NR_GETRESUID: u64 = 118;
+const __NR_GETRESGID: u64 = 120;
+const __NR_SETREUID: u64 = 113;
+const __NR_SETREGID: u64 = 114;
+const __NR_GETGROUPS: u64 = 115;
+const __NR_SETGROUPS: u64 = 116;
+const __NR_SETRLIMIT: u64 = 160;
+const __NR_PERSONALITY: u64 = 135;
+const __NR_STATFS: u64 = 137;
+const __NR_FSTATFS: u64 = 138;
+const __NR_TKILL: u64 = 200;
+const __NR_TIME: u64 = 201;
+const __NR_SYNC: u64 = 162;
+const __NR_SYNCFS: u64 = 306;
+const __NR_CHROOT: u64 = 161;
+const __NR_PIVOT_ROOT: u64 = 155;
+const __NR_MOUNT: u64 = 165;
+const __NR_UMOUNT2: u64 = 166;
 
 // arch_prctl subcodes
 const ARCH_SET_FS: u64 = 0x1002;
@@ -1904,6 +1927,40 @@ fn handle_times(caller_port: u64, args: &[u64; 6]) -> u64 {
     let ns = syscall::clock_gettime();
     let sec = ns / 1_000_000_000;
     sec * 100 // Assume HZ=100
+}
+
+/// Handle Linux statfs/fstatfs — return a plausible tmpfs-like struct.
+fn handle_statfs(caller_port: u64, args: &[u64; 6]) -> u64 {
+    // struct statfs on x86_64: 120 bytes.
+    // f_type(8), f_bsize(8), f_blocks(8), f_bfree(8), f_bavail(8),
+    // f_files(8), f_ffree(8), f_fsid(8), f_namelen(8), f_frsize(8),
+    // f_flags(8), f_spare[4](32)
+    let mut buf = [0u8; 120];
+    // f_type: TMPFS_MAGIC = 0x01021994
+    buf[0..8].copy_from_slice(&0x01021994u64.to_le_bytes());
+    // f_bsize: 4096
+    buf[8..16].copy_from_slice(&4096u64.to_le_bytes());
+    // f_blocks: 65536 (256MB / 4K)
+    buf[16..24].copy_from_slice(&65536u64.to_le_bytes());
+    // f_bfree: 32768
+    buf[24..32].copy_from_slice(&32768u64.to_le_bytes());
+    // f_bavail: 32768
+    buf[32..40].copy_from_slice(&32768u64.to_le_bytes());
+    // f_files: 65536
+    buf[40..48].copy_from_slice(&65536u64.to_le_bytes());
+    // f_ffree: 60000
+    buf[48..56].copy_from_slice(&60000u64.to_le_bytes());
+    // f_namelen: 255
+    buf[64..72].copy_from_slice(&255u64.to_le_bytes());
+    // f_frsize: 4096
+    buf[72..80].copy_from_slice(&4096u64.to_le_bytes());
+
+    // For statfs, buf_va is arg[1]; for fstatfs, buf_va is arg[1] too.
+    let buf_va = args[1] as usize;
+    if buf_va == 0 { return linux_err(EFAULT); }
+    let written = syscall::personality_copy_out(caller_port, buf_va, &buf);
+    if written < 120 { return linux_err(EFAULT); }
+    0
 }
 
 /// Handle Linux getrandom(buf, buflen, flags).
@@ -5653,6 +5710,53 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_PTRACE => linux_err(EPERM), // no tracing support
             __NR_CAPGET => linux_err(EPERM), // no capabilities support
             __NR_CAPSET => linux_err(EPERM),
+
+            // Phase 158: credential, resource, filesystem stubs.
+            __NR_SETUID | __NR_SETGID | __NR_SETREUID | __NR_SETREGID
+                | __NR_SETRESUID | __NR_SETRESGID | __NR_SETGROUPS => 0, // single-user, always succeed
+            __NR_GETRESUID => {
+                // Write uid/euid/suid (all 0) to three user pointers.
+                let zero4 = 0u32.to_le_bytes();
+                for arg_idx in 0..3 {
+                    let va = msg.data[arg_idx] as usize;
+                    if va != 0 { syscall::personality_copy_out(caller_port, va, &zero4); }
+                }
+                0
+            }
+            __NR_GETRESGID => {
+                let zero4 = 0u32.to_le_bytes();
+                for arg_idx in 0..3 {
+                    let va = msg.data[arg_idx] as usize;
+                    if va != 0 { syscall::personality_copy_out(caller_port, va, &zero4); }
+                }
+                0
+            }
+            __NR_GETGROUPS => {
+                // getgroups(size, list): return 0 (no supplementary groups).
+                0
+            }
+            __NR_SETRLIMIT => 0, // stub: ignore resource limit changes
+            __NR_PERSONALITY => {
+                // personality(persona): return current personality.
+                // 0 = PER_LINUX (default). If setting, accept and return old.
+                let persona = msg.data[0];
+                if persona == 0xFFFF_FFFF { 0 } else { 0 } // always PER_LINUX
+            }
+            __NR_STATFS | __NR_FSTATFS => handle_statfs(caller_port, &msg.data),
+            __NR_TKILL => 0, // stub: no intra-process signal delivery yet
+            __NR_TIME => {
+                // time(tloc): return seconds since epoch.
+                let ns = syscall::clock_gettime();
+                let sec = ns / 1_000_000_000;
+                let tloc = msg.data[0] as usize;
+                if tloc != 0 {
+                    syscall::personality_copy_out(caller_port, tloc, &sec.to_le_bytes());
+                }
+                sec
+            }
+            __NR_SCHED_YIELD => { syscall::yield_now(); 0 }
+            __NR_SYNC | __NR_SYNCFS => 0, // no durable storage
+            __NR_CHROOT | __NR_PIVOT_ROOT | __NR_MOUNT | __NR_UMOUNT2 => linux_err(EPERM),
 
             // Phase 129: Socket syscalls.
             __NR_SOCKET => handle_socket(pi, caller_port, &msg.data),

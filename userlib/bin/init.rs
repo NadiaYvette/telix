@@ -12920,6 +12920,123 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 158: credential/resource/fs stubs ---
+    syscall::debug_puts(b"  init: Phase 158 linux cred/fs stubs...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_PERSONALITY: u64 = 135;
+                        const __NR_GETGROUPS: u64 = 115;
+                        const __NR_UMASK: u64 = 95;
+                        const __NR_STATFS: u64 = 137;
+                        const __NR_TIME: u64 = 201;
+                        const __NR_EXIT_GROUP: u64 = 231;
+
+                        // personality(0xFFFFFFFF) = query: should return 0 (PER_LINUX)
+                        let r: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_PERSONALITY => r,
+                            in("rdi") 0xFFFF_FFFFu64, lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+
+                        // getgroups(0, NULL) = return 0 (no supplementary groups)
+                        let r2: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_GETGROUPS => r2,
+                            in("rdi") 0u64, in("rsi") 0u64, lateout("rcx") _, lateout("r11") _);
+                        if (r2 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                        }
+
+                        // umask(0o022) = should return old umask
+                        let r3: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_UMASK => r3,
+                            in("rdi") 0o022u64, lateout("rcx") _, lateout("r11") _);
+                        // Just check it didn't error
+                        if (r3 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
+                        }
+
+                        // statfs("/", buf) — should return 0
+                        let path = [b'/' as u8, 0u8];
+                        let mut sbuf = [0u8; 120];
+                        let r4: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_STATFS => r4,
+                            in("rdi") path.as_ptr() as u64,
+                            in("rsi") sbuf.as_mut_ptr() as u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r4 as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 94u64, options(noreturn));
+                        }
+                        // Check f_bsize > 0
+                        let bsize = u64::from_le_bytes([sbuf[8], sbuf[9], sbuf[10], sbuf[11],
+                                                         sbuf[12], sbuf[13], sbuf[14], sbuf[15]]);
+                        if bsize == 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 95u64, options(noreturn));
+                        }
+
+                        // time(NULL) — should return > 0
+                        let r5: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_TIME => r5,
+                            in("rdi") 0u64, lateout("rcx") _, lateout("r11") _);
+                        if r5 == 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 96u64, options(noreturn));
+                        }
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 158 linux cred/fs stubs: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 158 linux cred/fs stubs: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 158 linux cred/fs stubs: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 158 linux cred/fs stubs: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");
