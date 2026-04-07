@@ -1871,11 +1871,11 @@ fn handle_openat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         // Instead, create the path in our space and call do_open_path directly.
         // For now, just prepend CWD and call do_open.
         // Actually, simplest: write null-terminated path back and call do_open.
-        full[pos.min(63)] = 0;
-        // We can't easily rewrite the user's memory. Instead, handle the
-        // common case: dirfd-relative opens are rare in our test environment.
-        // Fall back to ENOSYS for unsupported relative dirfd opens.
-        return linux_err(ENOSYS);
+        let pathlen = pos.min(63);
+        full[pathlen] = 0;
+        // Write the resolved absolute path back to the user's buffer and call do_open.
+        syscall::personality_copy_out(caller_port, path_va, &full[..pathlen + 1]);
+        return do_open(pi, caller_port, path_va, flags);
     }
 }
 
@@ -3343,8 +3343,23 @@ fn handle_set_tid_address(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 /// Handle Linux exit(code) or exit_group(code).
 fn handle_exit(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let _code = args[0];
-    // Close all open FDs for this process.
     unsafe {
+        // CLONE_CHILD_CLEARTID: write 0 to clear_child_tid and futex-wake one waiter.
+        let ctid = PROC_TABLE[pi].clear_child_tid;
+        if ctid != 0 {
+            let zero = 0u32.to_ne_bytes();
+            syscall::personality_copy_out(caller_port, ctid, &zero);
+            // Wake one futex waiter on this address.
+            for i in 0..MAX_FUTEX_WAITERS {
+                if FUTEX_TABLE[i].active && FUTEX_TABLE[i].uaddr == ctid as u64 && FUTEX_TABLE[i].pi == pi {
+                    syscall::personality_reply(FUTEX_TABLE[i].caller_port, 0);
+                    FUTEX_TABLE[i].active = false;
+                    break;
+                }
+            }
+            PROC_TABLE[pi].clear_child_tid = 0;
+        }
+        // Close all open FDs for this process.
         for i in 3..MAX_FDS {
             if PROC_TABLE[pi].fds[i].in_use {
                 do_close(pi, i);
