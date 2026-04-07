@@ -2443,10 +2443,15 @@ pub(crate) fn exec_for_task(
     crate::mm::phys::free_page(meta_page);
     crate::mm::phys::free_pages(data_pages, data_order);
 
-    let argv_base = sp + 8;
-    let envp_base = sp + 8 + (argc + 1) * 8;
-
     // Rewrite the target thread's exception frame.
+    //
+    // Linux ABI x86_64 _start: argc/argv/envp/auxv are read from the stack
+    // (starting at *rsp); registers are not used to pass them.  Crucially,
+    // Linux's _start expects %rdx == 0 for static binaries — it copies %rdx
+    // to %r9 (rtld_fini) before overwriting %rdx with the argv base, and
+    // __libc_start_main blindly calls __cxa_atexit(rtld_fini) when r9 != 0.
+    // Passing any non-zero value in %rdx therefore registers garbage as an
+    // atexit handler, which fires (and crashes) after main returns.
     let frame_sp = crate::sched::scheduler::thread_ref(target_tid).personality_frame_sp as usize;
     if frame_sp == 0 {
         return u64::MAX;
@@ -2457,12 +2462,7 @@ pub(crate) fn exec_for_task(
         for i in 0..frame_words {
             *frame_ptr.add(i) = 0;
         }
-        trapframe::init_user_frame(
-            frame_ptr,
-            entry,
-            sp,
-            &[argc as u64, argv_base as u64, envp_base as u64],
-        );
+        trapframe::init_user_frame(frame_ptr, entry, sp, &[0, 0, 0]);
     }
 
     crate::arch::cpu::flush_icache();
