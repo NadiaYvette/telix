@@ -14399,6 +14399,127 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 169: MAP_FIXED with VMA splitting ---
+    syscall::debug_puts(b"  init: Phase 169 linux MAP_FIXED...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                // Child: wait for personality to be set.
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        macro_rules! linux {
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                            ($nr:expr, $a0:expr, $a1:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") 0u64,
+                                    in("r10") 0u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+
+                        // Step 1: Reserve 4 pages (16K) anon — mmap(0, 16384, RW, MAP_PRIVATE|MAP_ANON)
+                        let base = linux!(9u64, 0u64, 16384u64, 3u64, 0x22u64);
+                        if base > 0xFFFF_FFFF_FFFF_F000 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 1u64, options(noreturn));
+                        }
+
+                        // Step 2: Write marker to page 0 and page 1.
+                        core::ptr::write_volatile(base as *mut u32, 0xDEAD_BEEF);
+                        core::ptr::write_volatile((base + 4096) as *mut u32, 0xCAFE);
+
+                        // Step 3: MAP_FIXED replace page 1 — mmap(base+4096, 4096, RW, MAP_FIXED|MAP_PRIVATE|MAP_ANON)
+                        let fixed = linux!(9u64, base + 4096, 4096u64, 3u64, 0x32u64);
+                        if fixed != base + 4096 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 2u64, options(noreturn));
+                        }
+
+                        // Step 4: Verify page 0 marker survived (VMA split preserved it).
+                        let v0 = core::ptr::read_volatile(base as *const u32);
+                        if v0 != 0xDEAD_BEEF {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 3u64, options(noreturn));
+                        }
+
+                        // Step 5: Verify page 1 is zeroed (new mapping replaced old).
+                        let v1 = core::ptr::read_volatile((base + 4096) as *const u32);
+                        if v1 != 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 4u64, options(noreturn));
+                        }
+
+                        // Step 6: Verify page 2 is still accessible (split tail VMA).
+                        core::ptr::write_volatile((base + 8192) as *mut u32, 0x1234);
+                        let v2 = core::ptr::read_volatile((base + 8192) as *const u32);
+                        if v2 != 0x1234 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 5u64, options(noreturn));
+                        }
+
+                        // Step 7: munmap everything.
+                        linux!(11u64, base, 16384u64);
+
+                        // exit 0 — all passed.
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 169 linux MAP_FIXED: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 169 linux MAP_FIXED: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 169 linux MAP_FIXED: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 169 linux MAP_FIXED: SKIPPED\n");
+        }
+    }
+
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

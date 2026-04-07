@@ -75,6 +75,7 @@ const SYS_PERSONALITY_MPROTECT: u64 = 0xF00C;
 const SYS_PERSONALITY_MREMAP: u64 = 0xF00D;
 const SYS_PERSONALITY_SET_TLS: u64 = 0xF00E;
 const SYS_PERSONALITY_THREAD_CREATE: u64 = 0xF00F;
+const SYS_PERSONALITY_MMAP_FIXED: u64 = 0xF010;
 const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Register a personality server for a given personality ID.
@@ -181,6 +182,16 @@ pub fn personality_execve(target_port: u64, name: &[u8]) -> u64 {
 pub fn personality_mmap_anon(target_port: u64, va_hint: u64, page_count: u64, prot: u64) -> Option<usize> {
     let r = unsafe {
         arch::syscall4(SYS_PERSONALITY_MMAP_ANON, target_port, va_hint, page_count, prot)
+    };
+    if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+/// Map anonymous pages at a fixed VA in a target task's address space.
+/// Properly splits and unmaps any overlapping existing VMAs.
+/// page_count is in MMUPAGE_SIZE (4K) units.  prot: 0=RO, 1=RW, 2=RX, 3=RWX.
+pub fn personality_mmap_fixed(target_port: u64, va: u64, page_count: u64, prot: u64) -> Option<usize> {
+    let r = unsafe {
+        arch::syscall4(SYS_PERSONALITY_MMAP_FIXED, target_port, va, page_count, prot)
     };
     if r == u64::MAX { None } else { Some(r as usize) }
 }

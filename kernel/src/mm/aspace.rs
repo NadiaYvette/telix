@@ -460,6 +460,131 @@ pub fn unmap_anon(id: ASpaceId, va: usize) -> bool {
     false
 }
 
+/// Unmap all pages in a VA range, splitting VMAs at boundaries.
+/// Used by MAP_FIXED to replace a sub-region of an existing mapping.
+/// Returns the number of allocation pages freed (for quota adjustment).
+pub fn unmap_range(id: ASpaceId, va_start: usize, va_len: usize) -> u32 {
+    use super::page::MMUPAGE_SIZE;
+
+    if va_start % MMUPAGE_SIZE != 0 || va_len % MMUPAGE_SIZE != 0 || va_len == 0 {
+        return 0;
+    }
+
+    let mut guard = match lock_aspace(id) {
+        Some(g) => g,
+        None => return 0,
+    };
+    let space = &mut *guard;
+    let pt_root = space.page_table_root;
+    let end = va_start + va_len;
+
+    // Split at `va_start` if it falls in the middle of a VMA.
+    if let Some(vma) = space.vmas.find(va_start) {
+        if vma.va_start < va_start {
+            let orig_start = vma.va_start;
+            let orig_len = vma.va_len;
+            let orig_prot = vma.prot;
+            let orig_obj = vma.object_id;
+            let orig_off = vma.object_offset;
+            let left_mmu = (va_start - orig_start) / MMUPAGE_SIZE;
+
+            space.vmas.remove(orig_start);
+            let left_len = va_start - orig_start;
+            let right_len = orig_len - left_len;
+            let right_off = orig_off + left_mmu as u32;
+
+            super::object::with_object(orig_obj, |obj| {
+                obj.add_mapping(id, va_start);
+            });
+
+            space.vmas.insert(orig_start, left_len, orig_prot, orig_obj, orig_off);
+            space.vmas.insert(va_start, right_len, orig_prot, orig_obj, right_off);
+        }
+    }
+
+    // Split at `end` if it falls in the middle of a VMA.
+    if let Some(vma) = space.vmas.find(end.saturating_sub(1)) {
+        let vma_end = vma.va_start + vma.va_len;
+        if end < vma_end && end > vma.va_start {
+            let orig_start = vma.va_start;
+            let orig_len = vma.va_len;
+            let orig_prot = vma.prot;
+            let orig_obj = vma.object_id;
+            let orig_off = vma.object_offset;
+            let left_mmu = (end - orig_start) / MMUPAGE_SIZE;
+
+            space.vmas.remove(orig_start);
+            let left_len = end - orig_start;
+            let right_len = orig_len - left_len;
+            let right_off = orig_off + left_mmu as u32;
+
+            super::object::with_object(orig_obj, |obj| {
+                obj.add_mapping(id, end);
+            });
+
+            space.vmas.insert(orig_start, left_len, orig_prot, orig_obj, orig_off);
+            space.vmas.insert(end, right_len, orig_prot, orig_obj, right_off);
+        }
+    }
+
+    // Collect VMAs fully within [va_start, end) and remove them.
+    // We collect first to avoid mutating the tree while iterating.
+    let mut to_remove: [(usize, u64, usize); 32] = [(0, 0, 0); 32];
+    let mut nr = 0;
+    {
+        let mut it = space.vmas.iter();
+        while let Some(vma) = it.next() {
+            if !vma.active { continue; }
+            if vma.va_start >= end { break; }
+            let vma_end = vma.va_start + vma.va_len;
+            if vma_end <= va_start { continue; }
+            if vma.va_start >= va_start && vma_end <= end {
+                if nr < 32 {
+                    to_remove[nr] = (vma.va_start, vma.object_id, vma.mmu_page_count());
+                    nr += 1;
+                }
+            }
+        }
+    }
+
+    let mut freed_alloc_pages = 0u32;
+    let mmu_count_per = super::page::page_mmucount();
+
+    for i in 0..nr {
+        let (rm_va, obj_id, mmu_count) = to_remove[i];
+
+        // Demote superpages before clearing PTEs.
+        if let Some(vma) = space.vmas.find_mut(rm_va) {
+            demote_superpages_for_vma(pt_root, vma);
+        }
+
+        // Clear PTEs.
+        for mmu_idx in 0..mmu_count {
+            let mmu_va = rm_va + mmu_idx * MMUPAGE_SIZE;
+            super::fault::clear_pte_dispatch(pt_root, mmu_va);
+        }
+
+        // Remove mapping from backing object.
+        object::try_with_object(obj_id, |obj| {
+            obj.remove_mapping(id, rm_va);
+        });
+
+        // Remove VMA from tree.
+        space.vmas.remove(rm_va);
+
+        // Destroy object if no more mappings.
+        let remaining = object::try_with_object(obj_id, |obj| obj.mapping_count()).unwrap_or(0);
+        if remaining == 0 {
+            object::destroy(obj_id);
+        }
+
+        let alloc_pages = (mmu_count + mmu_count_per - 1) / mmu_count_per;
+        freed_alloc_pages += alloc_pages as u32;
+    }
+
+    freed_alloc_pages
+}
+
 // ---------------------------------------------------------------------------
 // COW Fork
 // ---------------------------------------------------------------------------

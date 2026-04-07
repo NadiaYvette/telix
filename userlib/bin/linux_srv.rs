@@ -3157,19 +3157,23 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     // Translate Linux prot to kernel prot encoding.
     let kern_prot = linux_prot_to_kernel(linux_prot);
 
-    // MAP_FIXED: unmap any existing pages at the target address first.
-    if is_fixed && addr != 0 {
-        syscall::personality_munmap(caller_port, addr as usize);
-    }
-
     // For file-backed mmap we need to write data, so temporarily use RW.
     // Kernel prot encoding: 0=RO, 1=RW, 2=RE, 3=RWE.
     let need_bump = !is_anon && kern_prot != 1 && kern_prot != 3;
     let map_prot = if need_bump { 1 } else { kern_prot }; // RW for file data copy
 
-    let va = match syscall::personality_mmap_anon(caller_port, addr, pages, map_prot) {
-        Some(v) => v,
-        None => return u64::MAX, // MAP_FAILED = (void*)-1
+    // MAP_FIXED: use personality_mmap_fixed which properly splits overlapping
+    // VMAs (required for ld.so's reserve-then-replace pattern).
+    let va = if is_fixed && addr != 0 {
+        match syscall::personality_mmap_fixed(caller_port, addr, pages, map_prot) {
+            Some(v) => v,
+            None => return u64::MAX,
+        }
+    } else {
+        match syscall::personality_mmap_anon(caller_port, addr, pages, map_prot) {
+            Some(v) => v,
+            None => return u64::MAX,
+        }
     };
 
     // File-backed mapping: read file content into the mapped region.
