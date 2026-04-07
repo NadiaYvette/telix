@@ -76,6 +76,10 @@ const SYS_PERSONALITY_MREMAP: u64 = 0xF00D;
 const SYS_PERSONALITY_SET_TLS: u64 = 0xF00E;
 const SYS_PERSONALITY_THREAD_CREATE: u64 = 0xF00F;
 const SYS_PERSONALITY_MMAP_FIXED: u64 = 0xF010;
+const SYS_PERSONALITY_DEQUEUE_SIGNAL: u64 = 0xF011;
+const SYS_PERSONALITY_READ_FRAME: u64 = 0xF012;
+const SYS_PERSONALITY_WRITE_FRAME: u64 = 0xF013;
+const SYS_PERSONALITY_MAP_SHARED: u64 = 0xF014;
 const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Register a personality server for a given personality ID.
@@ -166,13 +170,20 @@ pub fn personality_wait4(target_port: u64, pid: i64, flags: u32) -> u64 {
 /// Replaces the target's process image with the named ELF from initramfs.
 /// On success, the target is woken directly — do NOT call personality_reply.
 /// Returns 0 on success, u64::MAX on error.
-pub fn personality_execve(target_port: u64, name: &[u8]) -> u64 {
+pub fn personality_execve(
+    target_port: u64,
+    name: &[u8],
+    argv_va: u64,
+    envp_va: u64,
+) -> u64 {
     unsafe {
-        arch::syscall3(
+        arch::syscall5(
             SYS_PERSONALITY_EXECVE,
             target_port,
             name.as_ptr() as u64,
             name.len() as u64,
+            argv_va,
+            envp_va,
         )
     }
 }
@@ -244,6 +255,64 @@ pub fn personality_thread_create(
             ctid_va,
         )
     }
+}
+
+/// Dequeue one pending signal from a target task (personality server only).
+/// `mask` is the signal mask to apply (signals with bits set are blocked).
+/// Returns the 1-based signal number, 0 if none, or u64::MAX on error.
+pub fn personality_dequeue_signal(target_port: u64, mask: u64) -> u64 {
+    unsafe { arch::syscall2(SYS_PERSONALITY_DEQUEUE_SIGNAL, target_port, mask) }
+}
+
+/// Read the exception frame of a target task into the caller's buffer.
+/// Returns bytes copied, or u64::MAX on error.
+pub fn personality_read_frame(target_port: u64, buf: &mut [u8]) -> u64 {
+    unsafe {
+        arch::syscall3(
+            SYS_PERSONALITY_READ_FRAME,
+            target_port,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+}
+
+/// Write the caller's buffer to the target task's exception frame.
+/// Returns bytes copied, or u64::MAX on error.
+pub fn personality_write_frame(target_port: u64, buf: &[u8]) -> u64 {
+    unsafe {
+        arch::syscall3(
+            SYS_PERSONALITY_WRITE_FRAME,
+            target_port,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+}
+
+/// Map shared memory pages from the caller's address space into a target task.
+/// `caller_va` is the source range in the caller (linux_srv).
+/// `target_va_hint` may be 0 to let the kernel choose.
+/// `page_count` is in MMUPAGE_SIZE (4K) units. `prot`: 0=RO, 1=RW, 2=RX, 3=RWX.
+/// Returns the target VA, or None on error.
+pub fn personality_map_shared(
+    target_port: u64,
+    caller_va: u64,
+    target_va_hint: u64,
+    page_count: u64,
+    prot: u64,
+) -> Option<usize> {
+    let r = unsafe {
+        arch::syscall5(
+            SYS_PERSONALITY_MAP_SHARED,
+            target_port,
+            caller_va,
+            target_va_hint,
+            page_count,
+            prot,
+        )
+    };
+    if r == u64::MAX { None } else { Some(r as usize) }
 }
 
 /// Register a port as the network proxy endpoint for non-local sends.

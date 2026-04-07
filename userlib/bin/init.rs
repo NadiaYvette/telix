@@ -14520,6 +14520,222 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 170: Linux signal delivery (SIGUSR1 handler) ---
+    syscall::debug_puts(b"  init: Phase 170 linux signal delivery...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        // SIG_HIT is set by the handler. Used to verify
+                        // delivery happened.
+                        static mut SIG_HIT: u64 = 0;
+
+                        // Naked function — no prologue/epilogue. Sets SIG_HIT
+                        // and then performs rt_sigreturn (Linux nr 15) which
+                        // does not return normally.
+                        #[unsafe(naked)]
+                        unsafe extern "C" fn sigusr1_handler() {
+                            core::arch::naked_asm!(
+                                "lea {sig_hit}(%rip), %rax",
+                                "movq $1, (%rax)",
+                                "movq $15, %rax",
+                                "int $0x80",
+                                "ud2",
+                                sig_hit = sym SIG_HIT,
+                                options(att_syntax),
+                            );
+                        }
+
+                        // Build sigaction struct: handler, flags, restorer, mask.
+                        let act: [u64; 4] = [
+                            sigusr1_handler as usize as u64,
+                            0u64,
+                            0u64,
+                            0u64,
+                        ];
+
+                        // rt_sigaction(SIGUSR1=10, &act, NULL, 8)
+                        let r: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") 13u64 => r,
+                            in("rdi") 10u64, in("rsi") &act as *const _ as u64,
+                            in("rdx") 0u64, in("r10") 8u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if r != 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 1u64, options(noreturn));
+                        }
+
+                        // getpid (39) — Linux personality returns the caller's
+                        // port, which is what handle_kill matches against.
+                        let pid: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") 39u64 => pid,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        // kill(pid, SIGUSR1=10) — signal queued, delivered on
+                        // return from this syscall.
+                        let kr: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") 62u64 => kr,
+                            in("rdi") pid, in("rsi") 10u64,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        // Verify SIG_HIT == 1 (handler ran).
+                        if SIG_HIT != 1 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 2u64, options(noreturn));
+                        }
+                        // Verify kill returned 0 (preserved across signal).
+                        if kr != 0 {
+                            core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 3u64, options(noreturn));
+                        }
+
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(0);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 170 linux signal delivery: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 170 linux signal delivery: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 170 linux signal delivery: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 170 linux signal delivery: SKIPPED\n");
+        }
+    }
+
+    // --- Phase 171: real host-glibc binary execution (Gap A) ---
+    //
+    // Forks a child, switches it to the Linux personality, then execve()s
+    // a real host-compiled static-glibc binary (gcc -static -O2 hello.c)
+    // with a 4-element argv.  glibc_hello.c does `return argc;`, so success
+    // is exit code 4 — proving argv survived the trip from the client, into
+    // linux_srv, into the kernel, across an aspace tear-down, and onto the
+    // freshly-built user stack of the new program image.
+    syscall::debug_puts(b"  init: Phase 171 real glibc binary...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            syscall::debug_puts(b"  [171] forking child\n");
+            let child = syscall::fork();
+            if child == 0 {
+                // Child: wait for personality to be set, then execve.
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    syscall::debug_puts(b"  [171 child] personality set, execve...\n");
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        static PATH: &[u8] = b"/glibc_hello\0";
+                        static A0: &[u8] = b"glibc_hello\0";
+                        static A1: &[u8] = b"a\0";
+                        static A2: &[u8] = b"b\0";
+                        static A3: &[u8] = b"c\0";
+                        let argv: [u64; 5] = [
+                            A0.as_ptr() as u64,
+                            A1.as_ptr() as u64,
+                            A2.as_ptr() as u64,
+                            A3.as_ptr() as u64,
+                            0,
+                        ];
+                        let _: u64;
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => _,
+                            in("rdi") PATH.as_ptr() as u64,
+                            in("rsi") argv.as_ptr() as u64,
+                            in("rdx") 0u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        // execve only returns on failure.
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 99u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(99);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..1000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(10);
+                }
+                if exit_code == 4 {
+                    syscall::debug_puts(b"Phase 171 real glibc binary: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 171 real glibc binary: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 171 real glibc binary: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 171 real glibc binary: SKIPPED\n");
+        }
+    }
     // ============================================================
     // --- Test 23: Benchmark Suite ---
     syscall::debug_puts(b"  init: running benchmark suite...\n");

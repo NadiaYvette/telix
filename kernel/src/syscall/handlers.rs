@@ -131,6 +131,10 @@ pub const SYS_PERSONALITY_MREMAP: u64 = 0xF00D;
 pub const SYS_PERSONALITY_SET_TLS: u64 = 0xF00E;
 pub const SYS_PERSONALITY_THREAD_CREATE: u64 = 0xF00F;
 pub const SYS_PERSONALITY_MMAP_FIXED: u64 = 0xF010;
+pub const SYS_PERSONALITY_DEQUEUE_SIGNAL: u64 = 0xF011;
+pub const SYS_PERSONALITY_READ_FRAME: u64 = 0xF012;
+pub const SYS_PERSONALITY_WRITE_FRAME: u64 = 0xF013;
+pub const SYS_PERSONALITY_MAP_SHARED: u64 = 0xF014;
 pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 pub const SYS_PORT_ALIVE: u64 = 110;
 
@@ -154,6 +158,8 @@ fn resolve_thread_port(port_id: u64) -> Option<u32> {
 }
 
 use crate::arch::trapframe;
+
+// Phase 171 debug: task id to trace (set by exec_for_task for glibc_hello).
 
 /// Get syscall number from the frame (arch-specific register).
 #[inline]
@@ -206,7 +212,11 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         && nr != SYS_PERSONALITY_MPROTECT && nr != SYS_PERSONALITY_MREMAP
         && nr != SYS_PERSONALITY_SET_TLS
         && nr != SYS_PERSONALITY_THREAD_CREATE
-        && nr != SYS_PERSONALITY_MMAP_FIXED {
+        && nr != SYS_PERSONALITY_MMAP_FIXED
+        && nr != SYS_PERSONALITY_DEQUEUE_SIGNAL
+        && nr != SYS_PERSONALITY_READ_FRAME
+        && nr != SYS_PERSONALITY_WRITE_FRAME
+        && nr != SYS_PERSONALITY_MAP_SHARED {
         let tid = crate::sched::smp::current()
             .current_thread
             .load(core::sync::atomic::Ordering::Relaxed);
@@ -464,7 +474,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
             crate::syscall::personality::personality_wait4(a0, a1, a2, frame)
         }
         SYS_PERSONALITY_EXECVE => {
-            crate::syscall::personality::personality_execve(a0, a1, a2)
+            crate::syscall::personality::personality_execve(a0, a1, a2, a3, a4)
         }
         SYS_PERSONALITY_MMAP_ANON => {
             crate::syscall::personality::personality_mmap_anon(a0, a1, a2, a3)
@@ -486,6 +496,18 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_PERSONALITY_MMAP_FIXED => {
             crate::syscall::personality::personality_mmap_fixed(a0, a1, a2, a3)
+        }
+        SYS_PERSONALITY_DEQUEUE_SIGNAL => {
+            crate::syscall::personality::personality_dequeue_signal(a0, a1)
+        }
+        SYS_PERSONALITY_READ_FRAME => {
+            crate::syscall::personality::personality_read_frame(a0, a1 as usize, a2 as usize)
+        }
+        SYS_PERSONALITY_WRITE_FRAME => {
+            crate::syscall::personality::personality_write_frame(a0, a1 as usize, a2 as usize)
+        }
+        SYS_PERSONALITY_MAP_SHARED => {
+            crate::syscall::personality::personality_map_shared(a0, a1, a2, a3, a4)
         }
         SYS_FRAMEBUFFER_INFO => sys_framebuffer_info(frame),
         _ => {
@@ -2070,6 +2092,8 @@ pub(crate) fn exec_for_task(
     target_task_id: u32,
     target_tid: u32,
     name: &[u8],
+    argv_ptr: usize,
+    envp_ptr: usize,
 ) -> u64 {
     use crate::mm::page::{self, MMUPAGE_SIZE};
 
@@ -2079,7 +2103,11 @@ pub(crate) fn exec_for_task(
     if aspace_id == 0 {
         return u64::MAX;
     }
-
+    // Snapshot the client's old page table root BEFORE we destroy it.  We
+    // run on the personality server's thread, so the client's userspace is
+    // not in our CR3 — copy_from_user(client_pt_root, ...) is the only way
+    // to read its argv/envp strings.
+    let client_pt_root = task.page_table_root;
     // Look up the ELF in initramfs.
     let elf_data = match crate::io::initramfs::lookup_file(name) {
         Some(d) => d,
@@ -2090,6 +2118,110 @@ pub(crate) fn exec_for_task(
     if elf_data.len() < 64 || elf_data[0..4] != [0x7f, b'E', b'L', b'F'] {
         return u64::MAX;
     }
+
+    // -------- Read argv/envp from the client's old address space --------
+    //
+    // Same scratch-page pattern sys_execve uses: a metadata page of u16
+    // string lengths plus a contiguous data region holding the bytes.  This
+    // MUST happen before the point-of-no-return: once we reset the aspace
+    // and free the old page table, the strings are gone.
+    const ARG_MAX_STRLEN: usize = 4096;
+    let arg_max_strings: usize = ps / 8;
+    let min_arg_bytes: usize = 128 * 1024;
+    let data_order: usize = {
+        let mut order = 0usize;
+        while (ps << (order + 1)) < min_arg_bytes { order += 1; }
+        order + 1
+    };
+    let arg_max_total: usize = ps << data_order;
+
+    let meta_page = match crate::mm::phys::alloc_page() {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
+    let data_pages = match crate::mm::phys::alloc_pages(data_order) {
+        Some(p) => p,
+        None => {
+            crate::mm::phys::free_page(meta_page);
+            return u64::MAX;
+        }
+    };
+
+    let meta_lens =
+        unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u16, ps / 2) };
+    let data_buf = unsafe {
+        core::slice::from_raw_parts_mut(data_pages.as_usize() as *mut u8, arg_max_total)
+    };
+
+    let mut argc: usize = 0;
+    let mut envc: usize = 0;
+    let mut data_cursor: usize = 0;
+    let mut total_strings: usize = 0;
+
+    let copy_str =
+        |pt: usize, str_ptr: usize, buf: &mut [u8], cursor: &mut usize| -> Option<usize> {
+            let mut total = 0usize;
+            let max = ARG_MAX_STRLEN.min(buf.len() - *cursor);
+            while total < max {
+                let chunk = 256.min(max - total);
+                let dst = &mut buf[*cursor + total..*cursor + total + chunk];
+                if !copy_from_user(pt, str_ptr + total, dst) {
+                    return None;
+                }
+                if let Some(pos) = dst.iter().position(|&b| b == 0) {
+                    let slen = total + pos;
+                    *cursor += slen;
+                    return Some(slen);
+                }
+                total += chunk;
+            }
+            *cursor += max;
+            Some(max)
+        };
+
+    if argv_ptr != 0 {
+        loop {
+            if total_strings >= arg_max_strings { break; }
+            let mut ptr_val = [0u8; 8];
+            if !copy_from_user(client_pt_root, argv_ptr + total_strings * 8, &mut ptr_val) {
+                break;
+            }
+            let str_ptr = u64::from_le_bytes(ptr_val) as usize;
+            if str_ptr == 0 { break; }
+            if data_cursor >= arg_max_total { break; }
+            match copy_str(client_pt_root, str_ptr, data_buf, &mut data_cursor) {
+                Some(slen) => {
+                    meta_lens[total_strings] = slen as u16;
+                    total_strings += 1;
+                    argc += 1;
+                }
+                None => break,
+            }
+        }
+    }
+    if envp_ptr != 0 {
+        let mut ei = 0usize;
+        loop {
+            if total_strings >= arg_max_strings { break; }
+            let mut ptr_val = [0u8; 8];
+            if !copy_from_user(client_pt_root, envp_ptr + ei * 8, &mut ptr_val) {
+                break;
+            }
+            let str_ptr = u64::from_le_bytes(ptr_val) as usize;
+            if str_ptr == 0 { break; }
+            if data_cursor >= arg_max_total { break; }
+            match copy_str(client_pt_root, str_ptr, data_buf, &mut data_cursor) {
+                Some(slen) => {
+                    meta_lens[total_strings] = slen as u16;
+                    total_strings += 1;
+                    envc += 1;
+                    ei += 1;
+                }
+                None => break,
+            }
+        }
+    }
+    let string_total = data_cursor;
 
     // === POINT OF NO RETURN ===
 
@@ -2110,15 +2242,33 @@ pub(crate) fn exec_for_task(
     crate::mm::aspace::reset(aspace_id, new_pt_root);
 
     // Load ELF segments into the fresh address space.
-    let elf_info = match crate::loader::elf::load_elf(elf_data, aspace_id, new_pt_root) {
-        Ok(e) => e,
-        Err(_) => {
-            crate::println!(
-                "exec_for_task: ELF load failed for {:?}",
-                core::str::from_utf8(name)
-            );
-            return u64::MAX; // past point-of-no-return but we can't kill target here
+    // ET_DYN binaries (static-PIE, shared objects) are loaded at a high base
+    // address to avoid colliding with the kernel identity gigapages at 0-4GB.
+    // ET_EXEC binaries are loaded at their fixed vaddrs (callers must place
+    // them above 4 GB to avoid the kernel gigapage collision).
+    let etype = u16::from_le_bytes(elf_data[16..18].try_into().unwrap());
+    const ET_EXEC: u16 = 2;
+    const ET_DYN: u16 = 3;
+    const EXEC_DYN_BASE: usize = 0x2_0000_0000; // 8 GB, well above kernel gigapages
+    let elf_info = if etype == ET_DYN {
+        match crate::loader::elf::load_elf_at_base(elf_data, aspace_id, new_pt_root, EXEC_DYN_BASE) {
+            Ok(e) => e,
+            Err(_) => {
+                crate::println!("exec_for_task: ET_DYN load failed for {:?}", core::str::from_utf8(name));
+                return u64::MAX;
+            }
         }
+    } else if etype == ET_EXEC {
+        match crate::loader::elf::load_elf(elf_data, aspace_id, new_pt_root) {
+            Ok(e) => e,
+            Err(_) => {
+                crate::println!("exec_for_task: ET_EXEC load failed for {:?}", core::str::from_utf8(name));
+                return u64::MAX;
+            }
+        }
+    } else {
+        crate::println!("exec_for_task: bad e_type={} for {:?}", etype, core::str::from_utf8(name));
+        return u64::MAX;
     };
 
     // Handle PT_INTERP (dynamic linker).
@@ -2142,9 +2292,12 @@ pub(crate) fn exec_for_task(
 
     crate::arch::cpu::flush_icache();
 
-    // Map a fresh user stack.
+    // Map a fresh user stack — sized to fit argv+envp strings + table.
     const USER_STACK_TOP: usize = trapframe::USER_STACK_TOP;
-    let stack_alloc_pages = 64usize; // 256KB on 4K pages
+    let strings_with_nulls = string_total + (argc + envc);
+    let ptr_table_size = (1 + argc + 1 + envc + 1 + 24) * 8;
+    let stack_needed = strings_with_nulls + ptr_table_size + 256;
+    let stack_alloc_pages = ((stack_needed + ps - 1) / ps).max(64);
     let stack_mmu_pages = stack_alloc_pages * page::page_mmucount();
     let stack_va = USER_STACK_TOP - stack_alloc_pages * ps;
 
@@ -2177,18 +2330,53 @@ pub(crate) fn exec_for_task(
         }
     }
 
-    // Build minimal stack: argc=0, argv=NULL, envp=NULL, auxv.
-    let argc: usize = 0;
+    // Stack layout (growing downward from USER_STACK_TOP):
+    //   [argv/envp string data]
+    //   [16 bytes AT_RANDOM]
+    //   [auxv NULL]
+    //   [auxv pairs]
+    //   NULL (envp end)
+    //   envp[envc-1] ... envp[0]
+    //   NULL (argv end)
+    //   argv[argc-1] ... argv[0]
+    //   argc          <-- sp
+    let mut str_pos = USER_STACK_TOP;
+    let mut data_off: usize = 0;
+    let addr_buf =
+        unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u64, ps / 8) };
+    let data_src =
+        unsafe { core::slice::from_raw_parts(data_pages.as_usize() as *const u8, arg_max_total) };
 
-    // Place 16 random bytes on stack for AT_RANDOM.
-    let random_pos = (USER_STACK_TOP - 16) & !15;
+    // argv strings (top down).
+    for i in 0..argc {
+        let slen = meta_lens[i] as usize;
+        str_pos -= slen + 1;
+        addr_buf[i] = str_pos as u64;
+        copy_to_user(new_pt_root, str_pos, &data_src[data_off..data_off + slen]);
+        data_off += slen;
+    }
+    // envp strings.
+    for i in 0..envc {
+        let slen = meta_lens[argc + i] as usize;
+        str_pos -= slen + 1;
+        addr_buf[argc + i] = str_pos as u64;
+        copy_to_user(new_pt_root, str_pos, &data_src[data_off..data_off + slen]);
+        data_off += slen;
+    }
+
+    // 16-byte align.
+    str_pos &= !15;
+
+    // 16 random bytes on stack for AT_RANDOM.
+    str_pos -= 16;
+    let at_random_addr = str_pos;
     {
         let cycles = crate::sched::scheduler::get_monotonic_ns() as u64;
         let tid = crate::sched::smp::current().current_thread.load(core::sync::atomic::Ordering::Relaxed) as u64;
         let r0 = cycles.wrapping_mul(0x517cc1b727220a95).wrapping_add(tid);
         let r1 = r0.wrapping_mul(0x6c62272e07bb0142).wrapping_add(cycles);
         let rb: [u8; 16] = unsafe { core::mem::transmute([r0, r1]) };
-        copy_to_user(new_pt_root, random_pos, &rb);
+        copy_to_user(new_pt_root, at_random_addr, &rb);
     }
 
     const AT_NULL: u64 = 0;
@@ -2216,23 +2404,31 @@ pub(crate) fn exec_for_task(
         (AT_EUID, cur_task.euid as u64),
         (AT_GID, cur_task.gid as u64),
         (AT_EGID, cur_task.egid as u64),
-        (AT_RANDOM, random_pos as u64),
+        (AT_RANDOM, at_random_addr as u64),
         (AT_NULL, 0),
     ];
 
-    // Layout: argc(8) + NULL(argv, 8) + NULL(envp, 8) + auxv pairs
-    let table_words = 1 + 1 + 1 + auxv.len() * 2; // argc + argv_null + envp_null + auxv pairs
+    // Pointer table size: argc + argv*(argc+1) + envp*(envc+1) + auxv*2
+    let table_words = 1 + argc + 1 + envc + 1 + auxv.len() * 2;
     let table_size = table_words * 8;
-    let sp = (random_pos - table_size) & !15;
+    let sp = (str_pos - table_size) & !15;
 
     let mut pos = sp;
-    // argc = 0
+    // argc
     copy_to_user(new_pt_root, pos, &(argc as u64).to_le_bytes());
     pos += 8;
-    // argv NULL terminator
+    // argv pointers
+    for i in 0..argc {
+        copy_to_user(new_pt_root, pos, &addr_buf[i].to_le_bytes());
+        pos += 8;
+    }
     copy_to_user(new_pt_root, pos, &0u64.to_le_bytes());
     pos += 8;
-    // envp NULL terminator
+    // envp pointers
+    for i in 0..envc {
+        copy_to_user(new_pt_root, pos, &addr_buf[argc + i].to_le_bytes());
+        pos += 8;
+    }
     copy_to_user(new_pt_root, pos, &0u64.to_le_bytes());
     pos += 8;
     // auxv pairs
@@ -2243,8 +2439,12 @@ pub(crate) fn exec_for_task(
         pos += 8;
     }
 
-    let argv_base = sp + 8; // points to argv NULL
-    let envp_base = sp + 16; // points to envp NULL
+    // Free scratch pages — we're done copying argv/envp into the new stack.
+    crate::mm::phys::free_page(meta_page);
+    crate::mm::phys::free_pages(data_pages, data_order);
+
+    let argv_base = sp + 8;
+    let envp_base = sp + 8 + (argc + 1) * 8;
 
     // Rewrite the target thread's exception frame.
     let frame_sp = crate::sched::scheduler::thread_ref(target_tid).personality_frame_sp as usize;

@@ -133,6 +133,9 @@ impl ExceptionFrame {
     pub fn set_rsp(&mut self, v: u64) {
         self.regs[20] = v;
     }
+    pub fn set_rip(&mut self, v: u64) {
+        self.regs[17] = v;
+    }
 }
 
 /// Number of u64 values in the exception frame.
@@ -158,7 +161,32 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         3 => exception_fault("Breakpoint (#BP)", frame),
         4 => exception_fault("Overflow (#OF)", frame),
         5 => exception_fault("Bound Range (#BR)", frame),
-        6 => exception_fault("Invalid Opcode (#UD)", frame),
+        6 => {
+            // #UD handling: if the faulting instruction in userspace is
+            // `syscall` (0x0f 0x05) — used by glibc and other Linux binaries —
+            // emulate it by dispatching through the normal int 0x80 path.
+            // The x86_64 syscall ABI (rax=nr, rdi/rsi/rdx/r10/r8/r9=args)
+            // already matches the Telix trapframe accessors.
+            let cs = frame.cs();
+            let from_user = (cs & 3) == 3;
+            if from_user {
+                let rip = frame.rip() as *const u8;
+                let (b0, b1) = unsafe { (*rip, *rip.add(1)) };
+                if b0 == 0x0f && b1 == 0x05 {
+                    // Advance past `syscall` (2 bytes) so iretq returns to
+                    // the instruction after it.
+                    frame.set_rip(frame.rip() + 2);
+                    crate::sched::scheduler::store_frame_sp(frame_sp);
+                    crate::syscall::dispatch(frame);
+                    let pending = crate::sched::scheduler::take_pending_switch();
+                    if pending != 0 {
+                        return pending;
+                    }
+                    return frame_sp;
+                }
+            }
+            exception_fault("Invalid Opcode (#UD)", frame)
+        }
         7 => exception_fault("Device Not Available (#NM)", frame),
         8 => exception_fault("Double Fault (#DF)", frame),
         10 => exception_fault("Invalid TSS (#TS)", frame),

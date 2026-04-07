@@ -1715,10 +1715,8 @@ fn try_switch(current_sp: u64) -> u64 {
     crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
 
     // Restore TLS base register for the next thread.
-    let next_tls = thread_ref(next_id).tls_base;
-    if next_tls != 0 {
-        crate::arch::cpu::set_tls(next_tls);
-    }
+    // Always write FSBASE so stale values from another thread don't leak.
+    crate::arch::cpu::set_tls(thread_ref(next_id).tls_base);
 
     // Activate next thread. Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
@@ -1875,6 +1873,11 @@ pub fn block_current(_reason: BlockReason) {
     // Restore effective priority — no SCHEDULER lock needed.
     tref.prio.store(saved_prio, Ordering::Release);
     unsafe { thread_mut_from_ref(tid) }.effective_priority = saved_prio;
+    // Re-apply this thread's TLS base in case it was modified while blocked
+    // (e.g. by personality_set_tls from the personality server). block_current
+    // is a spin-wait — the thread never goes through try_switch on wake-up,
+    // so FSBASE would otherwise stay stale until a context switch.
+    crate::arch::cpu::set_tls(tref.tls_base);
     crate::arch::irq::restore(saved);
 }
 

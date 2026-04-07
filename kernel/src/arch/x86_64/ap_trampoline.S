@@ -52,10 +52,15 @@ ap_pm32:
     mov     es, ax
     mov     ss, ax
 
-    // Enable PAE.
+    // Enable PAE + SSE (OSFXSR, OSXMMEXCPT).
     mov     eax, cr4
-    or      eax, (1 << 5)
+    or      eax, (1 << 5) | (1 << 9) | (1 << 10)
     mov     cr4, eax
+    // Clear CR0.EM, set CR0.MP.
+    mov     eax, cr0
+    and     eax, ~(1 << 2)
+    or      eax, (1 << 1)
+    mov     cr0, eax
 
     // Load PML4 from data block.
     mov     eax, [0x8F00]

@@ -497,7 +497,13 @@ pub fn personality_wait4(
 /// Args: target_port, name_ptr (in caller's address space), name_len.
 /// On success, wakes the target directly (personality server should NOT
 /// call personality_reply). Returns 0 on success, u64::MAX on failure.
-pub fn personality_execve(target_port: u64, name_ptr: u64, name_len: u64) -> u64 {
+pub fn personality_execve(
+    target_port: u64,
+    name_ptr: u64,
+    name_len: u64,
+    argv_va: u64,
+    envp_va: u64,
+) -> u64 {
     let _caller_task_id = match check_personality_server() {
         Some(id) => id,
         None => return u64::MAX,
@@ -517,8 +523,16 @@ pub fn personality_execve(target_port: u64, name_ptr: u64, name_len: u64) -> u64
     let len = (name_len as usize).min(64);
     let name = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, len) };
 
-    // Delegate to exec_for_task which handles the heavy lifting.
-    let result = crate::syscall::handlers::exec_for_task(target_task_id, target_tid, name);
+    // argv_va / envp_va are virtual addresses in the **client's** old aspace.
+    // exec_for_task reads them via copy_from_user against the client pt_root
+    // before tearing down the old address space.
+    let result = crate::syscall::handlers::exec_for_task(
+        target_task_id,
+        target_tid,
+        name,
+        argv_va as usize,
+        envp_va as usize,
+    );
     if result != 0 {
         return u64::MAX;
     }
@@ -830,7 +844,7 @@ pub fn personality_set_tls(target_port: u64, tls_base: u64) -> u64 {
     // For single-threaded personality tasks, the waiter thread is the one
     // we want. Use find_personality_waiter to get the blocked thread.
     let thread_id = find_personality_waiter(target_task_id);
-    if thread_id == 0 {
+    if thread_id == 0 || thread_id == u32::MAX {
         return u64::MAX;
     }
     unsafe { crate::sched::scheduler::thread_mut_from_ref(thread_id) }.tls_base = tls_base;
@@ -877,4 +891,222 @@ pub fn personality_thread_create(
     crate::sched::scheduler::clone_thread_in_task(
         target_task_id, target_tid, child_stack, tls_base,
     )
+}
+
+// =============================================================================
+// Signal delivery helpers for personality servers
+// =============================================================================
+
+/// Dequeue one pending signal from a target task's personality-waiting thread.
+///
+/// Args: target_port, mask (the signal mask to apply — signals with
+/// corresponding bits set in `mask` are blocked and will NOT be dequeued).
+/// Returns the 1-based signal number, or 0 if no deliverable signal is pending.
+pub fn personality_dequeue_signal(target_port: u64, mask: u64) -> u64 {
+    let _caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return u64::MAX;
+    }
+
+    let t = crate::sched::scheduler::thread_ref(target_tid);
+    let deliverable = t.sig_pending & !mask;
+    if deliverable == 0 {
+        return 0;
+    }
+    let bit_idx = deliverable.trailing_zeros();
+    let sig = bit_idx + 1;
+    // Clear the pending bit.
+    unsafe { crate::sched::scheduler::thread_mut_from_ref(target_tid) }.sig_pending &= !(1u64 << bit_idx);
+    sig as u64
+}
+
+/// Read the exception frame of a target task's personality-waiting thread.
+///
+/// Copies the raw exception frame bytes into the caller's buffer at `dst_va`.
+/// `len` is the buffer size; at most EXCEPTION_FRAME_SIZE bytes are copied.
+/// Returns bytes copied, or u64::MAX on error.
+pub fn personality_read_frame(target_port: u64, dst_va: usize, len: usize) -> u64 {
+    let caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return u64::MAX;
+    }
+
+    let frame_sp = crate::sched::scheduler::thread_ref(target_tid).personality_frame_sp;
+    if frame_sp == 0 {
+        return u64::MAX;
+    }
+
+    let frame_size = crate::arch::trapframe::EXCEPTION_FRAME_SIZE;
+    let copy_len = len.min(frame_size);
+    if copy_len == 0 {
+        return 0;
+    }
+
+    let frame_bytes = unsafe {
+        core::slice::from_raw_parts(frame_sp as *const u8, frame_size)
+    };
+
+    let caller_pt = crate::sched::scheduler::task_ref(caller_task_id).page_table_root;
+    if crate::syscall::handlers::copy_to_user(caller_pt, dst_va, &frame_bytes[..copy_len]) {
+        copy_len as u64
+    } else {
+        u64::MAX
+    }
+}
+
+/// Write to the exception frame of a target task's personality-waiting thread.
+///
+/// Copies bytes from the caller's buffer at `src_va` into the target's
+/// exception frame. `len` is the buffer size; at most EXCEPTION_FRAME_SIZE
+/// bytes are copied. Returns bytes copied, or u64::MAX on error.
+pub fn personality_write_frame(target_port: u64, src_va: usize, len: usize) -> u64 {
+    let caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return u64::MAX;
+    }
+
+    let frame_sp = crate::sched::scheduler::thread_ref(target_tid).personality_frame_sp;
+    if frame_sp == 0 {
+        return u64::MAX;
+    }
+
+    let frame_size = crate::arch::trapframe::EXCEPTION_FRAME_SIZE;
+    let copy_len = len.min(frame_size);
+    if copy_len == 0 {
+        return 0;
+    }
+
+    let caller_pt = crate::sched::scheduler::task_ref(caller_task_id).page_table_root;
+    let frame_bytes = unsafe {
+        core::slice::from_raw_parts_mut(frame_sp as *mut u8, frame_size)
+    };
+
+    if crate::syscall::handlers::copy_from_user(caller_pt, src_va, &mut frame_bytes[..copy_len]) {
+        copy_len as u64
+    } else {
+        u64::MAX
+    }
+}
+
+// =============================================================================
+// MAP_SHARED: map physical pages from caller into target's address space
+// =============================================================================
+
+/// Map physical pages from the caller's address space into a target task's
+/// address space. Used for MAP_SHARED semantics where linux_srv holds the
+/// backing memory (e.g. memfd) and needs the client to see the same pages.
+///
+/// Args: target_port, caller_va (source pages in caller), target_va_hint (0=auto),
+///       page_count (in MMUPAGE_SIZE units), prot (0=RO, 1=RW, 2=RX, 3=RWX).
+/// Returns the target VA on success, or u64::MAX on error.
+pub fn personality_map_shared(
+    target_port: u64,
+    caller_va: u64,
+    target_va_hint: u64,
+    page_count: u64,
+    prot: u64,
+) -> u64 {
+    use crate::mm::page::{self, MMUPAGE_SIZE};
+    use crate::mm::vma::VmaProt;
+
+    let caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    let (target_task_id, aspace_id) = match resolve_personality_target(target_port) {
+        Some(v) => v,
+        None => return u64::MAX,
+    };
+
+    let mmu_pages = page_count as usize;
+    if mmu_pages == 0 || mmu_pages > 256 * page::page_mmucount() {
+        return u64::MAX;
+    }
+    let va_len = mmu_pages * MMUPAGE_SIZE;
+
+    let prot_enum = match prot {
+        0 => VmaProt::ReadOnly,
+        1 => VmaProt::ReadWrite,
+        2 => VmaProt::ReadExec,
+        3 => VmaProt::ReadWriteExec,
+        _ => return u64::MAX,
+    };
+
+    // Allocate VA in target's address space.
+    let target_va = if target_va_hint == 0 {
+        crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(va_len))
+    } else {
+        target_va_hint as usize
+    };
+
+    // Create a VMA in the target (map_anon creates the VMA structure).
+    // We won't use its backing object — we'll install PTEs pointing to
+    // the caller's physical pages instead.
+    let _obj_id = match crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+        aspace.map_anon(target_va, mmu_pages, prot_enum).map(|vma| vma.object_id)
+    }) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+
+    // Walk the caller's page table to find physical addresses and install
+    // them in the target's page table.
+    let caller_pt = crate::sched::scheduler::task_ref(caller_task_id).page_table_root;
+    let target_pt = crate::sched::scheduler::task_ref(target_task_id).page_table_root;
+
+    let fork_group = crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.fork_group);
+
+    let sw_z = crate::mm::fault::sw_zeroed_bit();
+    let pte_flags = if prot_enum == VmaProt::None {
+        0
+    } else {
+        crate::mm::hat::pte_flags_for_prot(prot_enum) | sw_z
+    };
+
+    for mmu_idx in 0..mmu_pages {
+        let src_va = caller_va as usize + mmu_idx * MMUPAGE_SIZE;
+        let dst_va = target_va + mmu_idx * MMUPAGE_SIZE;
+
+        // Look up the physical address in the caller's page table.
+        let pa = match crate::mm::hat::translate_va(caller_pt, src_va) {
+            Some(pa) => pa,
+            None => return u64::MAX,
+        };
+
+        // Ensure the target's page table path is unshared (post-fork).
+        crate::mm::hat::ensure_path_unshared(target_pt, dst_va, fork_group);
+
+        // Map the caller's physical page into the target's page table.
+        crate::mm::hat::map_single_mmupage(target_pt, dst_va, pa, pte_flags);
+    }
+
+    target_va as u64
 }

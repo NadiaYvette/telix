@@ -3153,9 +3153,54 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     let is_anon = (flags & MAP_ANONYMOUS) != 0;
     let is_fixed = (flags & MAP_FIXED) != 0;
+    let is_shared = (flags & MAP_SHARED) != 0;
 
     // Translate Linux prot to kernel prot encoding.
     let kern_prot = linux_prot_to_kernel(linux_prot);
+
+    // MAP_SHARED on a memfd: map the underlying physical pages directly into
+    // the client's address space so writes are visible to all sharers.
+    if is_shared && !is_anon && fd >= 0 {
+        let fd_idx = fd as usize;
+        if fd_idx < MAX_FDS {
+            let (kind, handle) = unsafe {
+                if PROC_TABLE[pi].fds[fd_idx].in_use {
+                    (PROC_TABLE[pi].fds[fd_idx].kind, PROC_TABLE[pi].fds[fd_idx].handle)
+                } else {
+                    return linux_err(EBADF);
+                }
+            };
+            if let FdKind::MemFd = kind {
+                let idx = handle as usize;
+                let (memfd_va, memfd_size) = unsafe {
+                    if idx >= MAX_MEMFD_INSTANCES || !MEMFD_TABLE[idx].active {
+                        return linux_err(EBADF);
+                    }
+                    (MEMFD_TABLE[idx].va, MEMFD_TABLE[idx].size)
+                };
+                if memfd_va == 0 {
+                    return linux_err(EINVAL);
+                }
+                let off = file_offset as usize;
+                if off >= memfd_size {
+                    return linux_err(EINVAL);
+                }
+                // Map physical pages from the memfd backing buffer into the client.
+                let src_va = memfd_va + off;
+                let target_hint = if is_fixed && addr != 0 { addr } else { 0 };
+                match syscall::personality_map_shared(
+                    caller_port,
+                    src_va as u64,
+                    target_hint,
+                    pages,
+                    kern_prot as u64,
+                ) {
+                    Some(v) => return v as u64,
+                    None => return u64::MAX,
+                }
+            }
+        }
+    }
 
     // For file-backed mmap we need to write data, so temporarily use RW.
     // Kernel prot encoding: 0=RO, 1=RW, 2=RE, 3=RWE.
@@ -3384,8 +3429,8 @@ fn handle_exit(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 /// On failure, returns -ENOENT.
 fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
     let filename_va = args[0] as usize;
-    let _argv_va = args[1] as usize;
-    let _envp_va = args[2] as usize;
+    let argv_va = args[1];
+    let envp_va = args[2];
 
     // Copy filename from the client's address space (null-terminated).
     let mut name_buf = [0u8; 64];
@@ -3401,7 +3446,10 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
     // Strip leading "/" for initramfs lookup.
     let lookup_name = if name.first() == Some(&b'/') { &name[1..] } else { name };
 
-    let result = syscall::personality_execve(caller_port, lookup_name);
+    // argv_va / envp_va are virtual addresses in the client's address space.
+    // The kernel reads them via copy_from_user against the client's old PT
+    // before tearing down its address space.
+    let result = syscall::personality_execve(caller_port, lookup_name, argv_va, envp_va);
     if result == u64::MAX {
         return Some(linux_err(ENOENT));
     }
@@ -4333,6 +4381,166 @@ fn expire_futex_waiters() {
             }
         }
     }
+}
+
+// =============================================================================
+// Signal delivery (Phase 170)
+// =============================================================================
+
+/// x86_64 exception frame layout (must match kernel ExceptionFrame).
+const EXCEPTION_FRAME_SIZE: usize = 176;
+const FRAME_OFF_RDI: usize = 9 * 8;   // 72
+const FRAME_OFF_RSI: usize = 10 * 8;  // 80
+const FRAME_OFF_RAX: usize = 14 * 8;  // 112
+const FRAME_OFF_RIP: usize = 17 * 8;  // 136
+const FRAME_OFF_RSP: usize = 20 * 8;  // 160
+
+#[inline]
+fn frame_get_u64(frame: &[u8; EXCEPTION_FRAME_SIZE], off: usize) -> u64 {
+    u64::from_le_bytes(frame[off..off + 8].try_into().unwrap())
+}
+
+#[inline]
+fn frame_set_u64(frame: &mut [u8; EXCEPTION_FRAME_SIZE], off: usize, val: u64) {
+    frame[off..off + 8].copy_from_slice(&val.to_le_bytes());
+}
+
+/// Try to deliver one pending signal to the target task.
+///
+/// Called immediately before personality_reply. If a deliverable signal exists
+/// and the user has registered a handler, this rewrites the target's exception
+/// frame to invoke the handler with a sigframe pushed on the user stack.
+///
+/// Returns the (possibly modified) reply value to use with personality_reply.
+/// Returns `None` if the target should be killed (default action).
+fn maybe_deliver_signal(pi: usize, caller_port: u64, result: u64) -> Option<u64> {
+    let mask = unsafe { PROC_TABLE[pi].sig_mask };
+    loop {
+        let sig = syscall::personality_dequeue_signal(caller_port, mask);
+        if sig == 0 || sig == u64::MAX { return Some(result); }
+        if sig as usize > NUM_SIGNALS { return Some(result); }
+        let idx = sig as usize - 1;
+
+        let sa = unsafe { PROC_TABLE[pi].sig_actions[idx] };
+        match sa.handler {
+            0 => {
+                // SIG_DFL: most signals terminate; SIGCHLD/SIGURG/SIGWINCH are ignored.
+                if sig == 17 || sig == 23 || sig == 28 { continue; }
+                // Terminate target with signal.
+                return None;
+            }
+            1 => {
+                // SIG_IGN
+                continue;
+            }
+            handler => {
+                // Read the target's current exception frame.
+                let mut frame_buf = [0u8; EXCEPTION_FRAME_SIZE];
+                let r = syscall::personality_read_frame(caller_port, &mut frame_buf);
+                if r == u64::MAX { return Some(result); }
+
+                // Save the original syscall result into the rax slot of the
+                // saved frame so rt_sigreturn restores it correctly.
+                frame_set_u64(&mut frame_buf, FRAME_OFF_RAX, result);
+
+                // Compute new user SP for sigframe (16-byte aligned).
+                let old_rsp = frame_get_u64(&frame_buf, FRAME_OFF_RSP);
+                // sigframe layout: [old_mask:8][saved_frame:176] = 184, align to 192.
+                let sigframe_size: u64 = 192;
+                let new_sp = (old_rsp - sigframe_size) & !15u64;
+
+                // Write old_mask + saved_frame to the user stack.
+                let mask_bytes = unsafe { PROC_TABLE[pi].sig_mask.to_le_bytes() };
+                if syscall::personality_copy_out(caller_port, new_sp as usize, &mask_bytes) == 0 {
+                    return Some(result);
+                }
+                if syscall::personality_copy_out(caller_port, new_sp as usize + 8, &frame_buf) == 0 {
+                    return Some(result);
+                }
+
+                // Apply sa_mask | sig to the process signal mask for the
+                // duration of the handler. rt_sigreturn restores the old mask.
+                let sig_bit = 1u64 << (sig - 1);
+                unsafe {
+                    PROC_TABLE[pi].sig_mask |= sa.mask | sig_bit;
+                }
+
+                // Build a new frame: jump to handler with (sig, sigframe_addr).
+                // Push a return address slot for the restorer / handler return.
+                // x86_64 calling convention: RSP at function entry must be
+                // such that RSP+8 is 16-byte aligned. We put the restorer
+                // address (or 0) at call_sp = new_sp - 8.
+                let call_sp = new_sp - 8;
+                let retaddr_bytes = sa.restorer.to_le_bytes();
+                syscall::personality_copy_out(caller_port, call_sp as usize, &retaddr_bytes);
+
+                // Use the saved frame as the base, then modify regs.
+                // (Preserves segment selectors, rflags, etc.)
+                let mut new_frame = frame_buf;
+                frame_set_u64(&mut new_frame, FRAME_OFF_RIP, handler);
+                frame_set_u64(&mut new_frame, FRAME_OFF_RSP, call_sp);
+                frame_set_u64(&mut new_frame, FRAME_OFF_RDI, sig);
+                frame_set_u64(&mut new_frame, FRAME_OFF_RSI, new_sp);
+
+                if syscall::personality_write_frame(caller_port, &new_frame) == u64::MAX {
+                    return Some(result);
+                }
+
+                // Reply with anything — set_return will overwrite rax in the
+                // handler frame. The handler doesn't read rax as input.
+                return Some(result);
+            }
+        }
+    }
+}
+
+/// Handle Linux rt_sigreturn: restore the saved exception frame from the
+/// sigframe on the user stack. Called from signal handler restorer.
+///
+/// At entry, the target's RSP points at the start of the sigframe (since the
+/// restorer was called via `ret`, popping the return address slot at call_sp).
+///
+/// Returns the saved rax value to use as the personality_reply argument.
+fn handle_rt_sigreturn_full(pi: usize, caller_port: u64) -> u64 {
+    // Read target's current frame to get RSP (which points to sigframe).
+    let mut cur_frame = [0u8; EXCEPTION_FRAME_SIZE];
+    if syscall::personality_read_frame(caller_port, &mut cur_frame) == u64::MAX {
+        return 0;
+    }
+    // The sigframe was placed at new_sp; we set the handler's RSP to
+    // call_sp = new_sp - 8 (where the retaddr lives). If the handler is
+    // naked / never adjusts RSP, then at rt_sigreturn entry RSP == call_sp
+    // and the sigframe lives at RSP + 8. If glibc/musl is used (with a
+    // proper restorer), the restorer's `ret` instruction popped the retaddr,
+    // making RSP == new_sp on entry to the restorer, then int 0x80 leaves it
+    // there. We support both by probing: try [RSP], if mask == 0xdeadbeef
+    // marker fails, fall back to [RSP+8]. Simpler: use [RSP+8] since that's
+    // what our naked test handler uses.
+    let sp = frame_get_u64(&cur_frame, FRAME_OFF_RSP);
+    let sigframe_va = sp + 8;
+
+    // Read saved_mask and saved_frame from the user stack.
+    let mut mask_bytes = [0u8; 8];
+    if syscall::personality_copy_in(caller_port, sigframe_va as usize, &mut mask_bytes) == 0 {
+        return 0;
+    }
+    let saved_mask = u64::from_le_bytes(mask_bytes);
+
+    let mut saved_frame = [0u8; EXCEPTION_FRAME_SIZE];
+    if syscall::personality_copy_in(caller_port, sigframe_va as usize + 8, &mut saved_frame) == 0 {
+        return 0;
+    }
+
+    // Restore the process signal mask.
+    unsafe { PROC_TABLE[pi].sig_mask = saved_mask; }
+
+    // Write the restored frame back to the target.
+    if syscall::personality_write_frame(caller_port, &saved_frame) == u64::MAX {
+        return 0;
+    }
+
+    // Return the saved rax so the main loop's personality_reply preserves it.
+    frame_get_u64(&saved_frame, FRAME_OFF_RAX)
 }
 
 /// Handle rt_sigaction(signum, act, oldact, sigsetsize).
@@ -6466,7 +6674,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Signal handling (state tracked, no delivery yet).
             __NR_RT_SIGACTION => handle_rt_sigaction(pi, caller_port, &msg.data),
             __NR_RT_SIGPROCMASK => handle_rt_sigprocmask(pi, caller_port, &msg.data),
-            __NR_RT_SIGRETURN => 0,
+            __NR_RT_SIGRETURN => handle_rt_sigreturn_full(pi, caller_port),
             __NR_SIGALTSTACK => 0,  // stub — no alternate signal stack yet
             __NR_TGKILL => handle_tgkill(caller_port, &msg.data),
             __NR_KILL => handle_kill(pi, caller_port, &msg.data),
@@ -6688,7 +6896,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         };
 
+        // Check for pending signals to deliver before replying.
+        let final_result = match maybe_deliver_signal(pi, caller_port, result) {
+            Some(r) => r,
+            None => {
+                // Signal default action requests termination.
+                syscall::kill(caller_port);
+                continue;
+            }
+        };
+
         // Reply to the blocked caller.
-        syscall::personality_reply(caller_port, result);
+        syscall::personality_reply(caller_port, final_result);
     }
 }

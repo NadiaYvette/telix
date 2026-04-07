@@ -80,8 +80,19 @@ for cbin in hello_c sock_test tsh getty_login ld-telix tz_test pthread_test init
     fi
 done
 
+# Phase 171: build a real host-glibc static binary so the Linux personality
+# can prove it executes upstream binaries (Gap A).  x86_64 only for now.
+if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
+    echo "Building host-glibc test binary (Phase 171)..."
+    if gcc -static-pie -fPIE -O2 -fno-stack-protector -s -o "$BINDIR/glibc_hello" "$ROOTDIR/tools/glibc_hello.c" 2>&1; then
+        echo "  glibc_hello: $(wc -c < "$BINDIR/glibc_hello") bytes"
+    else
+        echo "  WARNING: glibc_hello build failed"
+    fi
+fi
+
 # Copy ELF binaries to initramfs directory.
-for bin in init hello echo_client initramfs_srv rootfs_srv ramdisk_srv blk_srv cache_srv fat16_srv ext2_srv console_srv shell net_srv pipe_upper pipe_drain spin bench pong grant_echo macro_bench cap_test security_srv shm_srv vfs_srv tmpfs_srv devfs_srv procfs_srv uds_srv pipe_srv pty_srv event_srv inotify_srv syslog_srv sysv_srv hello_c sock_test tsh getty_login ld-telix tz_test pthread_test initdb_test postmaster_test pg_full_test libc_test calc stress_test sshd proxy_srv linux_srv linux_exit42 fb_srv input_srv compositor_srv term_srv; do
+for bin in init hello echo_client initramfs_srv rootfs_srv ramdisk_srv blk_srv cache_srv fat16_srv ext2_srv console_srv shell net_srv pipe_upper pipe_drain spin bench pong grant_echo macro_bench cap_test security_srv shm_srv vfs_srv tmpfs_srv devfs_srv procfs_srv uds_srv pipe_srv pty_srv event_srv inotify_srv syslog_srv sysv_srv hello_c sock_test tsh getty_login ld-telix tz_test pthread_test initdb_test postmaster_test pg_full_test libc_test calc stress_test sshd proxy_srv linux_srv linux_exit42 glibc_hello fb_srv input_srv compositor_srv term_srv; do
     if [ -f "$BINDIR/$bin" ]; then
         cp "$BINDIR/$bin" "$INITRAMFS_DIR/$bin"
         SIZE=$(wc -c < "$INITRAMFS_DIR/$bin")

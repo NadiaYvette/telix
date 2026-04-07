@@ -71,10 +71,15 @@ _start:
     mov     dword ptr [ebx + 0x18], 0xC0000083     // 3 GiB (includes LAPIC)
     mov     dword ptr [ebx + 0x1C], 0x00000000
 
-    // --- Enable PAE ---
+    // --- Enable PAE + SSE (OSFXSR, OSXMMEXCPT) ---
     mov     eax, cr4
-    or      eax, (1 << 5)   // CR4.PAE
+    or      eax, (1 << 5) | (1 << 9) | (1 << 10)   // CR4.PAE | CR4.OSFXSR | CR4.OSXMMEXCPT
     mov     cr4, eax
+    // --- Clear CR0.EM, set CR0.MP so SSE instructions work ---
+    mov     eax, cr0
+    and     eax, ~(1 << 2)  // clear CR0.EM (emulation)
+    or      eax, (1 << 1)   // set CR0.MP (monitor coprocessor)
+    mov     cr0, eax
 
     // --- Load PML4 into CR3 ---
     lea     eax, [boot_pml4]
