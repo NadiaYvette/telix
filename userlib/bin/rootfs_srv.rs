@@ -15,6 +15,7 @@ use userlib::syscall;
 // FS protocol constants.
 const FS_OPEN: u64 = 0x2000;
 const FS_OPEN_OK: u64 = 0x2001;
+const FS_OPEN_LONG: u64 = 0x2002;
 const FS_READ: u64 = 0x2100;
 const FS_READ_OK: u64 = 0x2101;
 const FS_READDIR: u64 = 0x2200;
@@ -22,6 +23,11 @@ const FS_READDIR_OK: u64 = 0x2201;
 const FS_READDIR_END: u64 = 0x2202;
 const FS_STAT: u64 = 0x2300;
 const FS_STAT_OK: u64 = 0x2301;
+const FS_STAT_LONG: u64 = 0x2302;
+
+/// VA at which VFS grants its scratch page into our aspace for long-path forwarding.
+const FS_SCRATCH_VA: usize = 0x5_0000_0000;
+const MAX_LONG_PATH: usize = 4096;
 const FS_CLOSE: u64 = 0x2400;
 const FS_CREATE: u64 = 0x2500;
 const FS_CREATE_OK: u64 = 0x2501;
@@ -39,8 +45,8 @@ const ERR_NOT_FOUND: u64 = 1;
 const ERR_INVALID: u64 = 3;
 const ERR_FULL: u64 = 4;
 
-const MAX_FILES: usize = 64;
-const MAX_NAME: usize = 16;
+const MAX_FILES: usize = 256;
+const MAX_NAME: usize = 64;
 const MAX_OPEN: usize = 32;
 const PAGE_SIZE: usize = 4096;
 const MAX_INLINE: usize = 24;
@@ -273,13 +279,17 @@ fn print_num(n: u64) {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// File table is large (MAX_FILES * MAX_NAME ≈ 24 KiB) so it lives in BSS,
+/// not on the (small) userspace stack.
+static mut FILES: [RootfsFile; MAX_FILES] = [const { RootfsFile::empty() }; MAX_FILES];
+
 /// Entry: arg0 = port ID, arg1 = CPIO data VA, arg2 = CPIO data length.
 #[unsafe(no_mangle)]
 fn main(port_id: u64, data_va: u64, data_len: u64) {
     let cpio_data = unsafe { core::slice::from_raw_parts(data_va as *const u8, data_len as usize) };
 
-    let mut files = [RootfsFile::empty(); MAX_FILES];
-    let file_count = parse_cpio(cpio_data, &mut files);
+    let files = unsafe { &mut *core::ptr::addr_of_mut!(FILES) };
+    let file_count = parse_cpio(cpio_data, files);
 
     syscall::debug_puts(b"  [rootfs_srv] parsed ");
     print_num(file_count as u64);
@@ -292,6 +302,8 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
 
     // Register with name server.
     syscall::ns_register(b"rootfs", port);
+    // Publish task port so VFS can grant_pages to us for long-path scratch.
+    syscall::ns_register(b"rootfs_task", syscall::aspace_id());
 
     let mut handles = [OpenHandle::empty(); MAX_OPEN];
 
@@ -334,6 +346,84 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                                 0,
                             );
                         }
+                    }
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    }
+                }
+            }
+
+            FS_OPEN_LONG => {
+                // Wire: data[0] = name_len(16) | flags(16) | reply_port(32).
+                // Path bytes live at FS_SCRATCH_VA in our aspace (granted by VFS).
+                let name_len = (msg.data[0] & 0xFFFF) as usize;
+                let _flags = ((msg.data[0] >> 16) & 0xFFFF) as u32;
+                let reply_port = msg.data[0] >> 32;
+                let caller_pid = msg.data[1] as u32;
+
+                let mut name = [0u8; MAX_NAME];
+                let nlen = name_len.min(MAX_NAME);
+                let src = FS_SCRATCH_VA as *const u8;
+                for i in 0..nlen {
+                    name[i] = unsafe { *src.add(i) };
+                }
+
+                match find_file(&files, &name, nlen) {
+                    Some(fi) => {
+                        let mut h = u64::MAX;
+                        for (i, hnd) in handles.iter_mut().enumerate() {
+                            if !hnd.active {
+                                hnd.active = true;
+                                hnd.writable = false;
+                                hnd.file_idx = fi;
+                                hnd.pid = caller_pid;
+                                h = i as u64;
+                                break;
+                            }
+                        }
+                        if h == u64::MAX {
+                            syscall::send(reply_port, FS_ERROR, ERR_FULL, 0, 0, 0);
+                        } else {
+                            syscall::send(
+                                reply_port,
+                                FS_OPEN_OK,
+                                h,
+                                files[fi].size as u64,
+                                my_aspace as u64,
+                                0,
+                            );
+                        }
+                    }
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    }
+                }
+            }
+
+            FS_STAT_LONG => {
+                // Stat by long path (no handle). data[0] = name_len(16)|0|reply_port(32).
+                let name_len = (msg.data[0] & 0xFFFF) as usize;
+                let reply_port = msg.data[0] >> 32;
+
+                let mut name = [0u8; MAX_NAME];
+                let nlen = name_len.min(MAX_NAME);
+                let src = FS_SCRATCH_VA as *const u8;
+                for i in 0..nlen {
+                    name[i] = unsafe { *src.add(i) };
+                }
+
+                match find_file(&files, &name, nlen) {
+                    Some(fi) => {
+                        let f = &files[fi];
+                        let ftype = if f.is_dir { 1u64 } else { 0u64 };
+                        syscall::send(
+                            reply_port,
+                            FS_STAT_OK,
+                            f.size as u64,
+                            f.mode as u64 | (ftype << 16),
+                            0,
+                            fi as u64,
+                        );
                     }
                     None => {
                         syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);

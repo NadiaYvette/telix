@@ -24,7 +24,9 @@ use userlib::syscall;
 const VFS_MOUNT: u64 = 0x6000;
 const VFS_UNMOUNT: u64 = 0x6001;
 const VFS_OPEN: u64 = 0x6010;
+const VFS_OPEN_LONG: u64 = 0x6011;
 const VFS_STAT: u64 = 0x6020;
+const VFS_STAT_LONG: u64 = 0x6021;
 const VFS_READDIR: u64 = 0x6030;
 
 const VFS_OK: u64 = 0x6100;
@@ -41,8 +43,35 @@ const VFS_ERROR: u64 = 0x6F00;
 // FS protocol tags (forwarded to underlying FS servers).
 const FS_OPEN: u64 = 0x2000;
 const FS_OPEN_OK: u64 = 0x2001;
+const FS_OPEN_LONG: u64 = 0x2002;
 const FS_STAT: u64 = 0x2300;
 const FS_STAT_OK: u64 = 0x2301;
+const FS_STAT_LONG: u64 = 0x2302;
+
+// Long-path scratch infrastructure.
+//
+// linux_srv (or any other personality client) grants a scratch page to VFS at
+// LIN_SCRATCH_VA. VFS reads long path bytes from there. VFS in turn grants its
+// own scratch page to each FS server's task port at FS_SCRATCH_VA on first
+// forward, and writes the relativized path there before sending FS_OPEN_LONG.
+const LIN_SCRATCH_VA: usize = 0x5_0000_0000;
+const FS_SCRATCH_VA: usize = 0x5_0000_0000;
+const MAX_LONG_PATH: usize = 4096;
+
+/// Lazily-allocated VA of VFS's own scratch page (the page granted to FS servers).
+static mut VFS_SCRATCH_VA: usize = 0;
+
+fn ensure_vfs_scratch() -> usize {
+    unsafe {
+        if VFS_SCRATCH_VA == 0 {
+            match syscall::mmap_anon(0, 1, 1) {
+                Some(va) => VFS_SCRATCH_VA = va,
+                None => return 0,
+            }
+        }
+        VFS_SCRATCH_VA
+    }
+}
 const FS_READDIR: u64 = 0x2200;
 const FS_READDIR_OK: u64 = 0x2201;
 const FS_READDIR_END: u64 = 0x2202;
@@ -263,7 +292,7 @@ fn relative_path<'a>(
 }
 
 /// Handle VFS_MOUNT: add a mount entry.
-/// data[2] = path_len(16) | reply_port(32 in upper), data[3] = fs_port
+/// data[2] = path_len(16) | reply_port(32 in upper), data[3] = fs_port.
 fn handle_mount(data: &[u64; 6]) {
     let path_len = (data[2] & 0xFFFF) as usize;
     let reply_port = data[2] >> 32;
@@ -350,6 +379,336 @@ fn handle_unmount(data: &[u64; 6]) {
     if reply_port != 0 {
         syscall::send(reply_port, VFS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
     }
+}
+
+/// Read a long path written into LIN_SCRATCH_VA by a personality client.
+/// Returns the number of bytes read into `dst` (clamped to dst.len() and 4096).
+fn read_long_path(dst: &mut [u8], path_len: usize) -> usize {
+    let n = path_len.min(dst.len()).min(MAX_LONG_PATH);
+    let src = LIN_SCRATCH_VA as *const u8;
+    for i in 0..n {
+        dst[i] = unsafe { *src.add(i) };
+    }
+    n
+}
+
+/// Normalize a long (>16 byte) path in `buf[..len]`. Resolves "." and "..".
+/// Returns the new length. Up to 16 components.
+fn normalize_long(buf: &mut [u8], len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let mut comp_start = [0usize; 16];
+    let mut comp_len_arr = [0usize; 16];
+    let mut ncomp = 0usize;
+
+    let mut i = 0;
+    if buf[0] == b'/' {
+        i = 1;
+    }
+    while i < len && ncomp < 16 {
+        while i < len && buf[i] == b'/' {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+        let start = i;
+        while i < len && buf[i] != b'/' {
+            i += 1;
+        }
+        let clen = i - start;
+        if clen == 1 && buf[start] == b'.' {
+            continue;
+        } else if clen == 2 && buf[start] == b'.' && buf[start + 1] == b'.' {
+            if ncomp > 0 {
+                ncomp -= 1;
+            }
+        } else {
+            comp_start[ncomp] = start;
+            comp_len_arr[ncomp] = clen;
+            ncomp += 1;
+        }
+    }
+
+    // Rebuild in a temporary then copy back. Use a stack scratch capped at MAX_LONG_PATH.
+    let mut tmp = [0u8; 256];
+    let cap = tmp.len().min(len + 1);
+    let mut pos = 0;
+    if pos < cap {
+        tmp[pos] = b'/';
+        pos += 1;
+    }
+    for c in 0..ncomp {
+        if c > 0 && pos < cap {
+            tmp[pos] = b'/';
+            pos += 1;
+        }
+        for j in 0..comp_len_arr[c] {
+            if pos < cap {
+                tmp[pos] = buf[comp_start[c] + j];
+                pos += 1;
+            }
+        }
+    }
+    for k in 0..pos {
+        buf[k] = tmp[k];
+    }
+    pos
+}
+
+/// Find longest mount prefix for a long path slice.
+fn find_mount_long(path: &[u8]) -> Option<(usize, usize)> {
+    let mounts = unsafe { &*core::ptr::addr_of!(MOUNTS) };
+    let mut best_idx: Option<usize> = None;
+    let mut best_len = 0usize;
+    let path_len = path.len();
+    for i in 0..MAX_MOUNTS {
+        if !mounts[i].active {
+            continue;
+        }
+        let plen = mounts[i].prefix_len;
+        if plen == 1 && mounts[i].prefix[0] == b'/' {
+            if best_len < 1 {
+                best_idx = Some(i);
+                best_len = 1;
+            }
+            continue;
+        }
+        if path_len >= plen {
+            let mut matches = true;
+            for j in 0..plen {
+                if path[j] != mounts[i].prefix[j] {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches && (path_len == plen || path[plen] == b'/') {
+                if plen > best_len {
+                    best_idx = Some(i);
+                    best_len = plen;
+                }
+            }
+        }
+    }
+    best_idx.map(|idx| (idx, best_len))
+}
+
+/// Cached fs_port → fs_task → grant-done state.
+/// Currently we only support up to 4 distinct FS servers needing long-path
+/// forwarding. Each entry caches the discovered task port and remembers
+/// whether VFS's scratch page has been granted to it yet.
+struct FsScratchEntry {
+    fs_port: u64,
+    fs_task: u64,
+    granted: bool,
+}
+static mut FS_SCRATCH_TABLE: [FsScratchEntry; 4] = [
+    FsScratchEntry { fs_port: 0, fs_task: 0, granted: false },
+    FsScratchEntry { fs_port: 0, fs_task: 0, granted: false },
+    FsScratchEntry { fs_port: 0, fs_task: 0, granted: false },
+    FsScratchEntry { fs_port: 0, fs_task: 0, granted: false },
+];
+
+/// Known FS server names for which we will look up `<name>_task` lazily.
+const KNOWN_FS_NAMES: &[&[u8]] = &[b"rootfs", b"ext2", b"fat16", b"tmpfs"];
+
+/// Discover the task port for a given fs_port by ns-looking-up known FS names
+/// until one matches. Returns 0 if not found.
+fn discover_fs_task(fs_port: u64) -> u64 {
+    for name in KNOWN_FS_NAMES.iter() {
+        if let Some(p) = syscall::ns_lookup(name) {
+            if p == fs_port {
+                // Build "<name>_task".
+                let mut buf = [0u8; 32];
+                let mut n = 0;
+                for &b in name.iter() {
+                    if n < buf.len() { buf[n] = b; n += 1; }
+                }
+                for &b in b"_task".iter() {
+                    if n < buf.len() { buf[n] = b; n += 1; }
+                }
+                if let Some(t) = syscall::ns_lookup(&buf[..n]) {
+                    return t;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Lazily grant VFS's scratch page to the FS server (identified by fs_port).
+/// Returns true on success.
+fn ensure_fs_scratch_grant(fs_port: u64) -> bool {
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(FS_SCRATCH_TABLE) };
+    // Look up existing entry.
+    let mut slot: Option<usize> = None;
+    for (i, e) in table.iter().enumerate() {
+        if e.fs_port == fs_port { slot = Some(i); break; }
+    }
+    let idx = match slot {
+        Some(i) => i,
+        None => {
+            // Allocate a new slot.
+            let mut found: Option<usize> = None;
+            for (i, e) in table.iter().enumerate() {
+                if e.fs_port == 0 { found = Some(i); break; }
+            }
+            let i = match found { Some(x) => x, None => return false };
+            table[i].fs_port = fs_port;
+            table[i].fs_task = discover_fs_task(fs_port);
+            i
+        }
+    };
+    if table[idx].fs_task == 0 {
+        return false;
+    }
+    if table[idx].granted {
+        return true;
+    }
+    let src_va = ensure_vfs_scratch();
+    if src_va == 0 {
+        return false;
+    }
+    let ok = syscall::grant_pages(table[idx].fs_task, src_va, FS_SCRATCH_VA, 1, false);
+    if ok {
+        table[idx].granted = true;
+    }
+    ok
+}
+
+/// Common long-path forwarder: takes a tag (FS_OPEN_LONG / FS_STAT_LONG),
+/// the absolute path, flags, reply_port, and forwards to the FS server.
+/// Wire format for FS_*_LONG: data[0] = rel_len(16)|flags(16)|reply_port(32),
+/// data[1..] reserved. Path bytes live in FS_SCRATCH_VA in the FS server's aspace.
+fn forward_fs_long(
+    fs_tag: u64,
+    expect_ok: u64,
+    abs_path: &[u8],
+    flags: u32,
+    client_reply: u64,
+    err_tag: u64,
+) {
+    let plen = abs_path.len();
+    let (mount_idx, prefix_end) = match find_mount_long(abs_path) {
+        Some(r) => r,
+        None => {
+            if client_reply != 0 {
+                syscall::send(client_reply, err_tag, ERR_NO_MOUNT, 0, 0, 0);
+            }
+            return;
+        }
+    };
+
+    let fs_port_for_grant = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
+    if !ensure_fs_scratch_grant(fs_port_for_grant) {
+        if client_reply != 0 {
+            syscall::send(client_reply, err_tag, ERR_IO, 0, 0, 0);
+        }
+        return;
+    }
+
+    // Compute the relative path inside the FS.
+    let mut rel_start = if prefix_end == 1 { 1 } else { prefix_end };
+    while rel_start < plen && abs_path[rel_start] == b'/' {
+        rel_start += 1;
+    }
+    let rel = &abs_path[rel_start..];
+    let rel_len = rel.len();
+
+    // Write the relative path into VFS's own scratch (which is mapped at
+    // FS_SCRATCH_VA in the FS server's aspace via the lazy grant).
+    let scratch = unsafe { VFS_SCRATCH_VA };
+    if scratch == 0 {
+        if client_reply != 0 {
+            syscall::send(client_reply, err_tag, ERR_IO, 0, 0, 0);
+        }
+        return;
+    }
+    let dst = scratch as *mut u8;
+    for i in 0..rel_len.min(MAX_LONG_PATH) {
+        unsafe { *dst.add(i) = rel[i] };
+    }
+
+    let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
+    let my_reply = syscall::port_create();
+    let d0 = (rel_len as u64) | ((flags as u64 & 0xFFFF) << 16) | ((my_reply as u64) << 32);
+    syscall::send(fs_port, fs_tag, d0, 0, 0, 0);
+
+    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+        if fs_reply.tag == expect_ok {
+            if client_reply != 0 {
+                // Same reply shape as the short variant.
+                if expect_ok == FS_OPEN_OK {
+                    let handle = fs_reply.data[0];
+                    let size = fs_reply.data[1];
+                    let fs_aspace = fs_reply.data[2];
+                    syscall::send(
+                        client_reply,
+                        VFS_OPEN_OK,
+                        fs_port,
+                        handle,
+                        size,
+                        fs_aspace,
+                    );
+                } else if expect_ok == FS_STAT_OK {
+                    syscall::send(
+                        client_reply,
+                        VFS_STAT_OK,
+                        fs_reply.data[0],
+                        fs_reply.data[1],
+                        fs_reply.data[2],
+                        fs_reply.data[3],
+                    );
+                }
+            }
+        } else {
+            if client_reply != 0 {
+                syscall::send(client_reply, err_tag, fs_reply.data[0], 0, 0, 0);
+            }
+        }
+    } else if client_reply != 0 {
+        syscall::send(client_reply, err_tag, ERR_IO, 0, 0, 0);
+    }
+
+    syscall::port_destroy(my_reply);
+}
+
+/// Handle VFS_OPEN_LONG: client has written the absolute path to LIN_SCRATCH_VA.
+/// data[0] = path_len(16) | flags(16) | reply_port(32).
+fn handle_open_long(data: &[u64; 6]) {
+    let path_len = (data[0] & 0xFFFF) as usize;
+    let flags = ((data[0] >> 16) & 0xFFFF) as u32;
+    let reply_port = data[0] >> 32;
+
+    let mut buf = [0u8; 256];
+    let n = read_long_path(&mut buf, path_len);
+    let n = normalize_long(&mut buf, n);
+    if n == 0 {
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
+        return;
+    }
+    forward_fs_long(FS_OPEN_LONG, FS_OPEN_OK, &buf[..n], flags, reply_port, VFS_ERROR);
+}
+
+/// Handle VFS_STAT_LONG: same as VFS_OPEN_LONG but stat-only.
+/// data[0] = path_len(16) | reply_port(32 in upper 32 of bits >=32).
+fn handle_stat_long(data: &[u64; 6]) {
+    let path_len = (data[0] & 0xFFFF) as usize;
+    let reply_port = data[0] >> 32;
+
+    let mut buf = [0u8; 256];
+    let n = read_long_path(&mut buf, path_len);
+    let n = normalize_long(&mut buf, n);
+    if n == 0 {
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
+        return;
+    }
+    forward_fs_long(FS_STAT_LONG, FS_STAT_OK, &buf[..n], 0, reply_port, VFS_ERROR);
 }
 
 /// Handle VFS_OPEN: resolve path, forward FS_OPEN to FS server, return result.
@@ -666,6 +1025,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::exit(1);
     }
     syscall::ns_register(b"vfs", port);
+    // Publish our task port so personality clients (and other servers) can
+    // grant_pages to us for long-path scratch buffers.
+    syscall::ns_register(b"vfs_task", syscall::aspace_id());
     syscall::debug_puts(b"  [vfs_srv] ready\n");
 
     // Main message loop (blocking recv).
@@ -678,7 +1040,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             VFS_MOUNT => handle_mount(&msg.data),
             VFS_UNMOUNT => handle_unmount(&msg.data),
             VFS_OPEN => handle_open(&msg.data),
+            VFS_OPEN_LONG => handle_open_long(&msg.data),
             VFS_STAT => handle_stat(&msg.data),
+            VFS_STAT_LONG => handle_stat_long(&msg.data),
             VFS_READDIR => handle_readdir(&msg.data),
             VFS_MKDIR => handle_mkdir(&msg.data),
             VFS_UNLINK => handle_unlink(&msg.data),

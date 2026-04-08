@@ -224,7 +224,11 @@ pub fn load_elf_at_base(
     }
 
     // For ET_DYN, find the lowest vaddr to compute the actual base offset.
+    // Also extract PT_INTERP so callers (e.g. exec_for_task) can chain-load
+    // the dynamic linker.
     let mut min_vaddr: usize = usize::MAX;
+    let mut interp = [0u8; 64];
+    let mut interp_len: usize = 0;
     for i in 0..phnum {
         let off = phoff + i * phentsize;
         if off + 56 > data.len() {
@@ -233,6 +237,18 @@ pub fn load_elf_at_base(
         let phdr = unsafe { core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr) };
         if phdr.p_type == PT_LOAD && (phdr.p_vaddr as usize) < min_vaddr {
             min_vaddr = phdr.p_vaddr as usize;
+        }
+        if phdr.p_type == PT_INTERP {
+            let ioff = phdr.p_offset as usize;
+            let ilen = (phdr.p_filesz as usize).min(63);
+            if ioff + ilen <= data.len() {
+                interp[..ilen].copy_from_slice(&data[ioff..ioff + ilen]);
+                interp_len = if ilen > 0 && interp[ilen - 1] == 0 {
+                    ilen - 1
+                } else {
+                    ilen
+                };
+            }
         }
     }
     if min_vaddr == usize::MAX {
@@ -262,8 +278,8 @@ pub fn load_elf_at_base(
         phdr_vaddr: base + phoff, // approximate
         phentsize,
         phnum,
-        interp: [0; 64],
-        interp_len: 0,
+        interp,
+        interp_len,
     })
 }
 

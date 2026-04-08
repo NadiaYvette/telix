@@ -307,7 +307,9 @@ fn linux_err(e: u64) -> u64 {
 
 // VFS IPC protocol tags
 const VFS_OPEN: u64 = 0x6010;
+const VFS_OPEN_LONG: u64 = 0x6011;
 const VFS_OPEN_OK: u64 = 0x6110;
+const VFS_STAT_LONG: u64 = 0x6021;
 const VFS_STAT: u64 = 0x6020;
 const VFS_STAT_OK: u64 = 0x6120;
 const VFS_MKDIR: u64 = 0x6040;
@@ -495,6 +497,14 @@ impl ProcessState {
 static mut PROC_TABLE: [ProcessState; MAX_PROCS] = [const { ProcessState::empty() }; MAX_PROCS];
 static mut VFS_PORT: u64 = 0;
 static mut REPLY_PORT: u64 = 0;
+
+/// Local VA of our long-path scratch page (granted to vfs_task at LIN_SCRATCH_VA).
+/// 0 = not yet allocated.
+static mut LIN_PATH_SCRATCH_LOCAL: usize = 0;
+/// VA inside VFS's aspace where our scratch is mapped.
+const LIN_SCRATCH_REMOTE_VA: usize = 0x5_0000_0000;
+/// Length of the longest long path we'll ship in one open call.
+const MAX_LONG_PATH: usize = 4096;
 static mut PIPE_PORT: u64 = 0;
 static mut UDS_PORT: u64 = 0;
 static mut NET_PORT: u64 = 0;
@@ -1480,6 +1490,101 @@ fn handle_sendfile(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     total as u64
 }
 
+/// Lazily allocate the long-path scratch page and grant it to vfs_task at
+/// LIN_SCRATCH_REMOTE_VA. Returns true if scratch is ready to use.
+fn ensure_lin_path_scratch() -> bool {
+    unsafe {
+        if LIN_PATH_SCRATCH_LOCAL != 0 {
+            return true;
+        }
+        let va = match syscall::mmap_anon(0, 1, 1) {
+            Some(v) => v,
+            None => return false,
+        };
+        let vfs_task = syscall::ns_lookup(b"vfs_task").unwrap_or(0);
+        if vfs_task == 0 {
+            return false;
+        }
+        // RW grant: VFS will normalize-in-place if needed (but with our normalize
+        // happening before we send, we could go RO; keep RW for flexibility).
+        if !syscall::grant_pages(vfs_task, va, LIN_SCRATCH_REMOTE_VA, 1, false) {
+            return false;
+        }
+        LIN_PATH_SCRATCH_LOCAL = va;
+        true
+    }
+}
+
+/// Write a path into the scratch page. Returns the truncated length actually
+/// stored, or 0 on failure.
+fn put_long_path(path: &[u8]) -> usize {
+    if !ensure_lin_path_scratch() {
+        return 0;
+    }
+    let n = path.len().min(MAX_LONG_PATH);
+    let dst = unsafe { LIN_PATH_SCRATCH_LOCAL } as *mut u8;
+    for i in 0..n {
+        unsafe { *dst.add(i) = path[i] };
+    }
+    n
+}
+
+/// Open via VFS_OPEN_LONG. Returns fd or negated errno.
+fn do_open_long(pi: usize, path: &[u8], flags: u64) -> u64 {
+    let vfs_port = unsafe { VFS_PORT };
+    let reply_port = unsafe { REPLY_PORT };
+    if vfs_port == 0 {
+        return linux_err(ENOSYS);
+    }
+    let n = put_long_path(path);
+    if n == 0 {
+        return linux_err(ENOENT);
+    }
+    let d0 = (n as u64) | ((flags & 0xFFFF) << 16) | (reply_port << 32);
+    syscall::send(vfs_port, VFS_OPEN_LONG, d0, 0, 0, 0);
+    let resp = match syscall::recv_msg(reply_port) {
+        Some(m) => m,
+        None => return linux_err(ENOENT),
+    };
+    if resp.tag != VFS_OPEN_OK {
+        return linux_err(ENOENT);
+    }
+    let fd = match alloc_fd(pi) {
+        Some(f) => f,
+        None => return linux_err(EBADF),
+    };
+    unsafe {
+        PROC_TABLE[pi].fds[fd].kind = FdKind::File;
+        PROC_TABLE[pi].fds[fd].fs_port = resp.data[0];
+        PROC_TABLE[pi].fds[fd].handle = resp.data[1];
+        PROC_TABLE[pi].fds[fd].file_size = resp.data[2];
+        PROC_TABLE[pi].fds[fd].offset = 0;
+    }
+    fd as u64
+}
+
+/// Stat via VFS_STAT_LONG. Fills (size, mode, ftype) into result words.
+/// Returns 0 on success or negated errno.
+fn do_stat_long(path: &[u8]) -> Option<(u64, u64, u64, u64)> {
+    let vfs_port = unsafe { VFS_PORT };
+    let reply_port = unsafe { REPLY_PORT };
+    if vfs_port == 0 {
+        return None;
+    }
+    let n = put_long_path(path);
+    if n == 0 {
+        return None;
+    }
+    let d0 = (n as u64) | (reply_port << 32);
+    syscall::send(vfs_port, VFS_STAT_LONG, d0, 0, 0, 0);
+    let resp = syscall::recv_msg(reply_port)?;
+    const VFS_STAT_OK: u64 = 0x6120;
+    if resp.tag != VFS_STAT_OK {
+        return None;
+    }
+    Some((resp.data[0], resp.data[1], resp.data[2], resp.data[3]))
+}
+
 /// Open a file via VFS. Returns fd or negated errno.
 fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
     let vfs_port = unsafe { VFS_PORT };
@@ -1488,10 +1593,21 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         return linux_err(ENOSYS);
     }
 
-    // Copy path from caller — use 32 bytes for virtual path matching,
-    // then truncate to 16 for VFS protocol.
-    let mut path = [0u8; 32];
-    let copied = syscall::personality_copy_in(caller_port, path_va, &mut path);
+    // Copy path from caller. We support long paths via the granted scratch
+    // page, so read up to 256 bytes (more than enough for typical glibc
+    // library paths like /lib64/ld-linux-x86-64.so.2). copy_from_user is
+    // all-or-nothing per request, so if a 256-byte read straddles into an
+    // unmapped page (common for stack-resident paths), we fall back to
+    // progressively smaller reads.
+    let mut path = [0u8; 256];
+    let mut copied = 0usize;
+    for &try_len in &[256usize, 128, 64, 32, 16, 8] {
+        let n = syscall::personality_copy_in(caller_port, path_va, &mut path[..try_len]);
+        if n > 0 {
+            copied = n;
+            break;
+        }
+    }
     if copied == 0 {
         return linux_err(EFAULT);
     }
@@ -1543,6 +1659,12 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
     };
     if let Some(content) = etc_content {
         return open_virtual_file(pi, content, flags);
+    }
+
+    // For paths longer than the 16-byte inline limit, use the long-path
+    // protocol via the granted scratch page.
+    if pathlen > 16 {
+        return do_open_long(pi, &path[..pathlen], flags);
     }
 
     // Pack path into two u64 words (little-endian).
@@ -1842,7 +1964,9 @@ fn handle_openat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     // dirfd-relative open: read the path, check if it's absolute.
     let mut raw = [0u8; 32];
     let copied = syscall::personality_copy_in(caller_port, path_va, &mut raw);
-    if copied == 0 { return linux_err(EFAULT); }
+    if copied == 0 {
+        return linux_err(EFAULT);
+    }
     let rawlen = raw[..copied].iter().position(|&b| b == 0).unwrap_or(copied);
     if rawlen == 0 { return linux_err(ENOENT); }
 
@@ -2012,9 +2136,19 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         return linux_err(ENOSYS);
     }
 
-    // Copy path from caller — use 32 bytes for virtual path matching.
-    let mut path = [0u8; 32];
-    let copied = syscall::personality_copy_in(caller_port, path_va, &mut path);
+    // Copy path from caller. Buffer is 256 bytes to allow long library paths
+    // such as /lib64/ld-linux-x86-64.so.2 to round-trip through stat().
+    // copy_from_user is all-or-nothing, so fall back to smaller chunks if
+    // a 256-byte read straddles into an unmapped page.
+    let mut path = [0u8; 256];
+    let mut copied = 0usize;
+    for &try_len in &[256usize, 128, 64, 32, 16, 8] {
+        let n = syscall::personality_copy_in(caller_port, path_va, &mut path[..try_len]);
+        if n > 0 {
+            copied = n;
+            break;
+        }
+    }
     if copied == 0 {
         return linux_err(EFAULT);
     }
@@ -2077,33 +2211,42 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         return 0;
     }
 
-    let mut w0 = 0u64;
-    let mut w1 = 0u64;
-    for i in 0..pathlen.min(8) {
-        w0 |= (path[i] as u64) << (i * 8);
-    }
-    for i in 8..pathlen.min(16) {
-        w1 |= (path[i] as u64) << ((i - 8) * 8);
-    }
+    // Long path: use VFS_STAT_LONG.
+    let (resp_data0, resp_data1, _resp_data2, resp_data3) = if pathlen > 16 {
+        match do_stat_long(&path[..pathlen]) {
+            Some(t) => t,
+            None => return linux_err(ENOENT),
+        }
+    } else {
+        let mut w0 = 0u64;
+        let mut w1 = 0u64;
+        for i in 0..pathlen.min(8) {
+            w0 |= (path[i] as u64) << (i * 8);
+        }
+        for i in 8..pathlen.min(16) {
+            w1 |= (path[i] as u64) << ((i - 8) * 8);
+        }
 
-    let d2 = (pathlen as u64) | ((reply_port) << 32);
-    syscall::send(vfs_port, VFS_STAT, w0, w1, d2, 0);
+        let d2 = (pathlen as u64) | ((reply_port) << 32);
+        syscall::send(vfs_port, VFS_STAT, w0, w1, d2, 0);
 
-    let resp = match syscall::recv_msg(reply_port) {
-        Some(m) => m,
-        None => return linux_err(ENOENT),
+        let resp = match syscall::recv_msg(reply_port) {
+            Some(m) => m,
+            None => return linux_err(ENOENT),
+        };
+
+        if resp.tag == VFS_ERROR || resp.tag != VFS_STAT_OK {
+            return linux_err(ENOENT);
+        }
+        (resp.data[0], resp.data[1], resp.data[2], resp.data[3])
     };
-
-    if resp.tag == VFS_ERROR || resp.tag != VFS_STAT_OK {
-        return linux_err(ENOENT);
-    }
 
     // Build a minimal Linux struct stat (x86_64).
     // sizeof(struct stat) = 144 bytes.
     let mut stat_buf = [0u8; 144];
-    let file_size = resp.data[0];
-    let mode = resp.data[1] as u32;
-    let ino = resp.data[3];
+    let file_size = resp_data0;
+    let mode = resp_data1 as u32;
+    let ino = resp_data3;
 
     // st_ino at offset 8 (u64)
     stat_buf[8..16].copy_from_slice(&ino.to_le_bytes());
@@ -2279,6 +2422,13 @@ fn handle_statx(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     // Root "/" — VFS doesn't respond to stat on root, handle it directly.
     if pathlen == 1 && path[0] == b'/' {
         return fill_statx(caller_port, statxbuf_va, 0o040755, 2, 4096);
+    }
+
+    if pathlen > 16 {
+        return match do_stat_long(&path[..pathlen]) {
+            Some((sz, mode, _, ino)) => fill_statx(caller_port, statxbuf_va, mode as u32, ino, sz),
+            None => linux_err(ENOENT),
+        };
     }
 
     let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
@@ -2591,6 +2741,13 @@ fn handle_access(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         || path[..pathlen] == *b"/etc/hostname" || path[..pathlen] == *b"/etc/nsswitch.conf"
     {
         return 0;
+    }
+
+    if pathlen > 16 {
+        return match do_stat_long(&path[..pathlen]) {
+            Some(_) => 0,
+            None => linux_err(ENOENT),
+        };
     }
 
     let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
@@ -3478,8 +3635,18 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
 /// Resolve a path from caller's address space. If relative, prepend CWD.
 /// Returns (absolute_path_buf, path_len).
 fn resolve_path(pi: usize, caller_port: u64, path_va: usize) -> ([u8; 64], usize) {
+    // copy_from_user is all-or-nothing per call. If the user-space path lives
+    // near the end of a page, a 64-byte read can straddle into an unmapped
+    // page and fail entirely. Fall back to progressively smaller reads.
     let mut raw = [0u8; 64];
-    let copied = syscall::personality_copy_in(caller_port, path_va, &mut raw);
+    let mut copied = 0usize;
+    for &try_len in &[64usize, 32, 16, 8] {
+        let n = syscall::personality_copy_in(caller_port, path_va, &mut raw[..try_len]);
+        if n > 0 {
+            copied = n;
+            break;
+        }
+    }
     if copied == 0 {
         return ([0u8; 64], 0);
     }
@@ -6558,6 +6725,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         PIPE_PORT = syscall::ns_lookup(b"pipe").unwrap_or(0);
         UDS_PORT = syscall::ns_lookup(b"uds").unwrap_or(0);
         NET_PORT = syscall::ns_lookup(b"net").unwrap_or(0);
+    }
+
+    // Eagerly set up the long-path scratch grant to VFS so the first openat()
+    // for a >16-byte path doesn't race with vfs_task ns publication.
+    if !ensure_lin_path_scratch() {
+        syscall::debug_puts(b"[linux_srv] WARN: long-path scratch grant deferred\n");
     }
 
     syscall::debug_puts(b"[linux_srv] ready on port ");
