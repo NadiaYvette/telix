@@ -73,6 +73,15 @@ sys.stdout.buffer.write(hdr + ttinfo + desig)
 RESOLV_TMP=$(mktemp)
 printf 'nameserver 10.0.2.3\n' > "$RESOLV_TMP"
 
+# Glibc dynamic linker artifacts (Phase 172): copy real ld-linux + libc.so.6 etc.
+# from initramfs/lib64 into the ext2 image so dynamically-linked binaries can
+# resolve their interpreter and shared libraries when ext2 is the root mount.
+INITRAMFS_DIR="$SCRIPT_DIR/../initramfs"
+LD_SO="$INITRAMFS_DIR/lib64/ld-linux-x86-64.so.2"
+LIBC_SO="$INITRAMFS_DIR/lib64/libc.so.6"
+LIBPTHREAD_SO="$INITRAMFS_DIR/lib64/libpthread.so.0"
+GLIBC_DYN_HELLO="$INITRAMFS_DIR/glibc_dyn_hello"
+
 # Use debugfs to populate the filesystem.
 debugfs -w "$EXT2_TMP" <<DEBUGFS_EOF
 mkdir testdir
@@ -80,6 +89,16 @@ mkdir etc
 mkdir usr
 mkdir usr/share
 mkdir usr/share/zoneinfo
+mkdir lib64
+write $LD_SO lib64/ld-linux-x86-64.so.2
+write $LIBC_SO lib64/libc.so.6
+write $LIBPTHREAD_SO lib64/libpthread.so.0
+write $GLIBC_DYN_HELLO glibc_dyn_hello
+set_inode_field lib64 mode 040755
+set_inode_field lib64/ld-linux-x86-64.so.2 mode 0100755
+set_inode_field lib64/libc.so.6 mode 0100755
+set_inode_field lib64/libpthread.so.0 mode 0100755
+set_inode_field glibc_dyn_hello mode 0100755
 write $TMPFILE hello.txt
 write $TMPFILE2 bench.dat
 write $TMPFILE3 secret.txt

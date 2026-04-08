@@ -2342,6 +2342,16 @@ pub(crate) fn exec_for_task(
     //   argc          <-- sp
     let mut str_pos = USER_STACK_TOP;
     let mut data_off: usize = 0;
+    // Snapshot string lengths BEFORE reusing meta_page as addr_buf: the two
+    // views alias the same physical page, and writing addr_buf[0] clobbers
+    // meta_lens[0..4]. Keep a local copy so later iterations read correct
+    // lengths. Capacity matches the earlier arg_max_strings limit (ps/8).
+    // ps/8 == arg_max_strings upper bound; use a fixed small stack array.
+    let mut slens_local = [0u16; 512];
+    let slens_cap = slens_local.len().min(argc + envc);
+    for i in 0..slens_cap {
+        slens_local[i] = meta_lens[i];
+    }
     let addr_buf =
         unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u64, ps / 8) };
     let data_src =
@@ -2349,7 +2359,7 @@ pub(crate) fn exec_for_task(
 
     // argv strings (top down).
     for i in 0..argc {
-        let slen = meta_lens[i] as usize;
+        let slen = slens_local[i] as usize;
         str_pos -= slen + 1;
         addr_buf[i] = str_pos as u64;
         copy_to_user(new_pt_root, str_pos, &data_src[data_off..data_off + slen]);
@@ -2357,7 +2367,7 @@ pub(crate) fn exec_for_task(
     }
     // envp strings.
     for i in 0..envc {
-        let slen = meta_lens[argc + i] as usize;
+        let slen = slens_local[argc + i] as usize;
         str_pos -= slen + 1;
         addr_buf[argc + i] = str_pos as u64;
         copy_to_user(new_pt_root, str_pos, &data_src[data_off..data_off + slen]);

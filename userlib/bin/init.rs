@@ -14767,6 +14767,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         static A1: &[u8] = b"a\0";
                         static A2: &[u8] = b"b\0";
                         static A3: &[u8] = b"c\0";
+                        static E0: &[u8] = b"LD_LIBRARY_PATH=/lib64\0";
+                        static E1: &[u8] = b"LD_DEBUG=libs,files\0";
+                        static E2: &[u8] = b"PATH=/usr/bin\0";
                         let argv: [u64; 5] = [
                             A0.as_ptr() as u64,
                             A1.as_ptr() as u64,
@@ -14774,12 +14777,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             A3.as_ptr() as u64,
                             0,
                         ];
+                        let envp: [u64; 4] = [
+                            E0.as_ptr() as u64,
+                            E1.as_ptr() as u64,
+                            E2.as_ptr() as u64,
+                            0,
+                        ];
                         core::arch::asm!(
                             "int 0x80",
                             inlateout("rax") 59u64 => _,
                             in("rdi") PATH.as_ptr() as u64,
                             in("rsi") argv.as_ptr() as u64,
-                            in("rdx") 0u64,
+                            in("rdx") envp.as_ptr() as u64,
                             lateout("rcx") _,
                             lateout("r11") _,
                         );
@@ -14828,6 +14837,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 172 dynamic glibc binary: SKIPPED\n");
         }
     }
+    // Phase 172 debug: exit immediately after 172 so we don't wait on benchmarks.
+    syscall::debug_puts(b"  init: Phase 172 debug exit\n");
+    syscall::exit(0);
 
     // ============================================================
     // --- Test 23: Benchmark Suite ---

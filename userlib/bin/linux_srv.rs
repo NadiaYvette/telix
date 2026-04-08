@@ -498,6 +498,10 @@ static mut PROC_TABLE: [ProcessState; MAX_PROCS] = [const { ProcessState::empty(
 static mut VFS_PORT: u64 = 0;
 static mut REPLY_PORT: u64 = 0;
 
+/// Debug: when set to a valid pi, every dispatch call from that pi is logged.
+/// Used to isolate the Phase 172 EFAULT mystery.
+static mut TRACE_PI: usize = usize::MAX;
+
 /// Local VA of our long-path scratch page (granted to vfs_task at LIN_SCRATCH_VA).
 /// 0 = not yet allocated.
 static mut LIN_PATH_SCRATCH_LOCAL: usize = 0;
@@ -1560,6 +1564,20 @@ fn do_open_long(pi: usize, path: &[u8], flags: u64) -> u64 {
         PROC_TABLE[pi].fds[fd].file_size = resp.data[2];
         PROC_TABLE[pi].fds[fd].offset = 0;
     }
+    // Phase 172 diag: print size for libc.so.6 opens.
+    unsafe {
+        if pi == TRACE_PI {
+            syscall::debug_puts(b"[trace] open_long path_len=");
+            print_num(path.len() as u64);
+            syscall::debug_puts(b" size=");
+            print_num(resp.data[2]);
+            syscall::debug_puts(b" fs_port=");
+            print_num(resp.data[0]);
+            syscall::debug_puts(b" handle=");
+            print_num(resp.data[1]);
+            syscall::debug_puts(b"\n");
+        }
+    }
     fd as u64
 }
 
@@ -1686,6 +1704,17 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
     };
 
     if resp.tag == VFS_ERROR || resp.tag != VFS_OPEN_OK {
+        unsafe {
+            if pi == TRACE_PI {
+                syscall::debug_puts(b"[trace] do_open short VFS_ERROR pathlen=");
+                print_num(pathlen as u64);
+                syscall::debug_puts(b" tag=");
+                print_num(resp.tag);
+                syscall::debug_puts(b" err=");
+                print_num(resp.data[0]);
+                syscall::debug_puts(b"\n");
+            }
+        }
         // VFS_OPEN failed — this might be a directory (FS servers don't open dirs).
         // Create a Dir FD so getdents64 can enumerate via VFS_READDIR later.
         // Resolve relative paths by prepending CWD.
@@ -1729,6 +1758,18 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         PROC_TABLE[pi].fds[fd].handle = resp.data[1];
         PROC_TABLE[pi].fds[fd].file_size = resp.data[2];
         PROC_TABLE[pi].fds[fd].offset = 0;
+    }
+    // Phase 172 diag.
+    unsafe {
+        if pi == TRACE_PI {
+            syscall::debug_puts(b"[trace] do_open short pathlen=");
+            print_num(pathlen as u64);
+            syscall::debug_puts(b" size=");
+            print_num(resp.data[2]);
+            syscall::debug_puts(b" fd=");
+            print_num(fd as u64);
+            syscall::debug_puts(b"\n");
+        }
     }
 
     fd as u64
@@ -2012,8 +2053,9 @@ fn do_close(pi: usize, fd: usize) {
         match PROC_TABLE[pi].fds[fd].kind {
             FdKind::File => {
                 let rp = REPLY_PORT;
-                let d3 = rp << 32;
-                syscall::send(PROC_TABLE[pi].fds[fd].fs_port, FS_CLOSE, PROC_TABLE[pi].fds[fd].handle, 0, 0, d3);
+                // FS_CLOSE wire format: data[0]=handle, data[2] upper 32=reply_port.
+                let d2 = rp << 32;
+                syscall::send(PROC_TABLE[pi].fds[fd].fs_port, FS_CLOSE, PROC_TABLE[pi].fds[fd].handle, 0, d2, 0);
                 let _ = syscall::recv_msg(rp);
             }
             FdKind::Pipe => {
@@ -3595,7 +3637,6 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
     if copied == 0 {
         return Some(linux_err(EFAULT));
     }
-
     // Find null terminator.
     let name_len = name_buf[..copied].iter().position(|&b| b == 0).unwrap_or(copied);
     let name = &name_buf[..name_len];
@@ -3613,6 +3654,17 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
 
     // On success: close CLOEXEC FDs and reset BRK.
     unsafe {
+        // Phase 172 EFAULT trace: arm tracer when glibc_dyn_hello is exec'd.
+        let armed = {
+            let needle: &[u8] = b"glibc_dyn_hello";
+            name.windows(needle.len()).any(|w| w == needle)
+        };
+        if armed {
+            TRACE_PI = pi;
+            syscall::debug_puts(b"[trace] armed for glibc_dyn_hello pi=");
+            print_num(pi as u64);
+            syscall::debug_puts(b"\n");
+        }
         for i in 3..MAX_FDS {
             if PROC_TABLE[pi].fds[i].in_use && (PROC_TABLE[pi].fds[i].fd_flags & FD_CLOEXEC) != 0 {
                 do_close(pi, i);
@@ -6757,6 +6809,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         };
 
+        // Phase 172 EFAULT trace: dump every syscall from the target pi.
+        unsafe {
+            if pi == TRACE_PI {
+                syscall::debug_puts(b"[trace] >>nr=");
+                print_num(linux_nr);
+                syscall::debug_puts(b" d0=");
+                print_num(msg.data[0]);
+                syscall::debug_puts(b" d1=");
+                print_num(msg.data[1]);
+                syscall::debug_puts(b" d2=");
+                print_num(msg.data[2]);
+                syscall::debug_puts(b"\n");
+            }
+        }
+
         let result = match linux_nr {
             __NR_READ => handle_read(pi, caller_port, &msg.data),
             __NR_PREAD64 => handle_pread64(pi, caller_port, &msg.data),
@@ -6767,7 +6834,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_WRITE => handle_write(pi, caller_port, &msg.data),
             __NR_OPEN => handle_open(pi, caller_port, &msg.data),
             __NR_CLOSE => handle_close(pi, &msg.data),
-            __NR_STAT | __NR_LSTAT | __NR_NEWFSTATAT => handle_stat(caller_port, &msg.data),
+            __NR_STAT | __NR_LSTAT => handle_stat(caller_port, &msg.data),
+            __NR_NEWFSTATAT => {
+                // newfstatat(dirfd, path, statbuf, flags) — shift args by 1
+                // so handle_stat sees (path, statbuf). dirfd is honored only
+                // for AT_FDCWD; non-AT_FDCWD dirfds fall back to treating the
+                // path as absolute/cwd-relative (glibc uses AT_FDCWD in the
+                // library search path so this covers the Tier 1 case).
+                let shifted: [u64; 6] = [msg.data[1], msg.data[2], msg.data[3], msg.data[4], msg.data[5], 0];
+                handle_stat(caller_port, &shifted)
+            }
             __NR_FSTAT => handle_fstat(pi, caller_port, &msg.data),
             __NR_LSEEK => handle_lseek(pi, &msg.data),
             __NR_WRITEV => handle_writev(pi, caller_port, &msg.data),
@@ -7068,6 +7144,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 linux_err(ENOSYS)
             }
         };
+
+        // Phase 172 EFAULT trace: show the return value before reply.
+        unsafe {
+            if pi == TRACE_PI {
+                syscall::debug_puts(b"[trace] <<nr=");
+                print_num(linux_nr);
+                // Print as signed: negative errno values show as very large numbers
+                // (e.g. -14 = 0xFFFF...FFF2 = 18446744073709551602).
+                syscall::debug_puts(b" ret=");
+                print_num(result);
+                syscall::debug_puts(b"\n");
+            }
+        }
 
         // Check for pending signals to deliver before replying.
         let final_result = match maybe_deliver_signal(pi, caller_port, result) {
