@@ -80,6 +80,7 @@ const SYS_PERSONALITY_DEQUEUE_SIGNAL: u64 = 0xF011;
 const SYS_PERSONALITY_READ_FRAME: u64 = 0xF012;
 const SYS_PERSONALITY_WRITE_FRAME: u64 = 0xF013;
 const SYS_PERSONALITY_MAP_SHARED: u64 = 0xF014;
+const SYS_PERSONALITY_PEEK_SIGNALS: u64 = 0xF015;
 const SYS_FRAMEBUFFER_INFO: u64 = 109;
 
 /// Register a personality server for a given personality ID.
@@ -256,6 +257,12 @@ pub fn personality_thread_create(
 /// Returns the 1-based signal number, 0 if none, or u64::MAX on error.
 pub fn personality_dequeue_signal(target_port: u64, mask: u64) -> u64 {
     unsafe { arch::syscall2(SYS_PERSONALITY_DEQUEUE_SIGNAL, target_port, mask) }
+}
+
+/// Peek at the raw pending-signal mask of a target task without consuming.
+/// Returns the u64 sig_pending bitmask, or u64::MAX on error.
+pub fn personality_peek_signals(target_port: u64) -> u64 {
+    unsafe { arch::syscall1(SYS_PERSONALITY_PEEK_SIGNALS, target_port) }
 }
 
 /// Read the exception frame of a target task into the caller's buffer.

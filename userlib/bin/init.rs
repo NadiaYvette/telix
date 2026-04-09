@@ -2618,6 +2618,484 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 173: filesystem realism (chmod + utimensat) ---
+    //
+    // Talk directly to ext2_srv via the new FS_CHMOD / FS_UTIMENS long-path
+    // protocol, exercising the new ext2 inode-patching helpers.  Must run
+    // BEFORE Phase 171/172 (Linux personality) so that VFS hasn't yet
+    // granted scratch to ext2_srv at FS_SCRATCH_VA.
+    syscall::debug_puts(b"  init: Phase 173 filesystem realism...\n");
+    {
+        let ext2_port_opt = if has_blk { syscall::ns_lookup(b"ext2") } else { None };
+        let ext2_task_opt = if has_blk { syscall::ns_lookup(b"ext2_task") } else { None };
+
+        if let (Some(ext2_port), Some(ext2_task)) = (ext2_port_opt, ext2_task_opt) {
+            const FS_SCRATCH_VA: usize = 0x5_0000_0000;
+            const FS_STAT_LONG: u64 = 0x2302;
+            const FS_STAT_OK: u64 = 0x2301;
+            const FS_CHMOD: u64 = 0x2E00;
+            const FS_CHMOD_OK: u64 = 0x2E01;
+            const FS_UTIMENS: u64 = 0x2900;
+            const FS_UTIMENS_OK: u64 = 0x2901;
+
+            let mut p173_ok = true;
+
+            // Allocate a scratch page and grant it to ext2_srv at FS_SCRATCH_VA.
+            let scratch_va = match syscall::mmap_anon(0, 1, 1) {
+                Some(va) => va,
+                None => {
+                    syscall::debug_puts(b"    p173: mmap_anon failed\n");
+                    p173_ok = false;
+                    0
+                }
+            };
+
+            if p173_ok {
+                if !syscall::grant_pages(ext2_task, scratch_va, FS_SCRATCH_VA, 1, false) {
+                    syscall::debug_puts(b"    p173: grant_pages to ext2_task failed\n");
+                    p173_ok = false;
+                }
+            }
+
+            // Helper: write a path into the scratch page.
+            let write_path = |path: &[u8]| {
+                let dst = scratch_va as *mut u8;
+                for i in 0..path.len() {
+                    unsafe { *dst.add(i) = path[i] };
+                }
+            };
+
+            let reply_port = syscall::port_create();
+            let path: &[u8] = b"hello.txt";
+
+            // Step 1: stat the file to capture its current mode.
+            let mut original_mode: u16 = 0o100644;
+            if p173_ok {
+                write_path(path);
+                let d0 = (path.len() as u64) | (reply_port << 32);
+                syscall::send(ext2_port, FS_STAT_LONG, d0, 0, 0, 0);
+                if let Some(reply) = syscall::recv_msg(reply_port) {
+                    if reply.tag == FS_STAT_OK {
+                        original_mode = reply.data[1] as u16;
+                        syscall::debug_puts(b"    p173: orig mode=");
+                        print_num(original_mode as u64);
+                        syscall::debug_puts(b"\n");
+                    } else {
+                        syscall::debug_puts(b"    p173: initial FS_STAT_LONG failed\n");
+                        p173_ok = false;
+                    }
+                } else {
+                    p173_ok = false;
+                }
+            }
+
+            // Step 2: chmod hello.txt to 0o600.
+            if p173_ok {
+                write_path(path);
+                let new_mode: u64 = 0o600;
+                let d0 = (path.len() as u64) | ((new_mode & 0xFFFF) << 16) | (reply_port << 32);
+                syscall::send(ext2_port, FS_CHMOD, d0, 0, 0, 0);
+                if let Some(reply) = syscall::recv_msg(reply_port) {
+                    if reply.tag != FS_CHMOD_OK {
+                        syscall::debug_puts(b"    p173: FS_CHMOD failed tag=");
+                        print_num(reply.tag);
+                        syscall::debug_puts(b"\n");
+                        p173_ok = false;
+                    }
+                } else {
+                    p173_ok = false;
+                }
+            }
+
+            // Step 3: re-stat to verify the on-disk mode changed.
+            if p173_ok {
+                write_path(path);
+                let d0 = (path.len() as u64) | (reply_port << 32);
+                syscall::send(ext2_port, FS_STAT_LONG, d0, 0, 0, 0);
+                if let Some(reply) = syscall::recv_msg(reply_port) {
+                    if reply.tag == FS_STAT_OK {
+                        let m = reply.data[1] as u16;
+                        // Top nibble = file type (0x8 = regular), low 12 = perms.
+                        if (m & 0o7777) != 0o600 {
+                            syscall::debug_puts(b"    p173: chmod did not persist, mode=");
+                            print_num(m as u64);
+                            syscall::debug_puts(b"\n");
+                            p173_ok = false;
+                        } else {
+                            syscall::debug_puts(b"    p173: chmod persisted (mode=0600)\n");
+                        }
+                    } else {
+                        p173_ok = false;
+                    }
+                } else {
+                    p173_ok = false;
+                }
+            }
+
+            // Step 4: restore original mode (so Phase 39 still passes on rerun).
+            if p173_ok {
+                write_path(path);
+                let d0 = (path.len() as u64)
+                    | (((original_mode as u64) & 0o7777) << 16)
+                    | (reply_port << 32);
+                syscall::send(ext2_port, FS_CHMOD, d0, 0, 0, 0);
+                let _ = syscall::recv_msg(reply_port);
+            }
+
+            // Step 5: utimens. We can't easily verify the times via FS_STAT_LONG
+            // (it doesn't return them), so we just assert the call succeeds and
+            // returns FS_UTIMENS_OK on a valid path / FS_ERROR on a bogus path.
+            if p173_ok {
+                write_path(path);
+                let d0 = (path.len() as u64) | (reply_port << 32);
+                let atime: u64 = 12345;
+                let mtime: u64 = 67890;
+                syscall::send(ext2_port, FS_UTIMENS, d0, atime, mtime, 0);
+                if let Some(reply) = syscall::recv_msg(reply_port) {
+                    if reply.tag != FS_UTIMENS_OK {
+                        syscall::debug_puts(b"    p173: FS_UTIMENS failed tag=");
+                        print_num(reply.tag);
+                        syscall::debug_puts(b"\n");
+                        p173_ok = false;
+                    } else {
+                        syscall::debug_puts(b"    p173: utimens OK\n");
+                    }
+                } else {
+                    p173_ok = false;
+                }
+            }
+
+            // Step 6: utimens on a non-existent path should return FS_ERROR.
+            if p173_ok {
+                let bad: &[u8] = b"no_such_phase173_file.txt";
+                write_path(bad);
+                let d0 = (bad.len() as u64) | (reply_port << 32);
+                syscall::send(ext2_port, FS_UTIMENS, d0, 1, 1, 0);
+                if let Some(reply) = syscall::recv_msg(reply_port) {
+                    if reply.tag == FS_UTIMENS_OK {
+                        syscall::debug_puts(b"    p173: utimens(missing) returned OK\n");
+                        p173_ok = false;
+                    }
+                }
+            }
+
+            // Revoke the grant so VFS can grant its own scratch later
+            // (Phase 171/172 use long-path through VFS).
+            syscall::revoke(ext2_task, FS_SCRATCH_VA);
+            if scratch_va != 0 {
+                syscall::munmap(scratch_va);
+            }
+            syscall::port_destroy(reply_port);
+
+            if p173_ok {
+                syscall::debug_puts(b"Phase 173 filesystem realism: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 173 filesystem realism: FAILED\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 173 filesystem realism: SKIPPED (no ext2)\n");
+        }
+    }
+
+    // --- Phase 174: full threads (clone + concurrent shared-mem atomics) ---
+    // Inlined here (adjacent to Phase 173) so results are observable even
+    // when later phases like Phase 172 (glibc dyn) hit SMP flakes.
+    syscall::debug_puts(b"  init: Phase 174 full threads...\n");
+    {
+        if syscall::ns_lookup(b"linux").is_none() {
+            let _ = syscall::spawn(b"linux_srv", 50);
+            for _ in 0..200 {
+                if syscall::ns_lookup(b"linux").is_some() { break; }
+                syscall::yield_now();
+            }
+        }
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_MMAP: u64 = 9;
+                        const __NR_CLONE: u64 = 56;
+                        const __NR_EXIT: u64 = 60;
+                        const __NR_EXIT_GROUP: u64 = 231;
+                        const __NR_SCHED_YIELD: u64 = 24;
+                        const PROT_RW: u64 = 3;
+                        const MAP_PA: u64 = 0x22;
+                        const CLONE_VM: u64 = 0x100;
+                        const CLONE_THREAD: u64 = 0x10000;
+                        const CLONE_SIGHAND: u64 = 0x800;
+                        const CLONE_SETTLS: u64 = 0x80000;
+
+                        // Shared page: counter@0, done0@8, done1@12
+                        let shared: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_MMAP => shared,
+                            in("rdi") 0u64, in("rsi") 4096u64, in("rdx") PROT_RW,
+                            in("r10") MAP_PA, in("r8") !0u64, in("r9") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (shared as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 91u64, options(noreturn));
+                        }
+                        core::ptr::write_volatile(shared as *mut u32, 0);
+                        core::ptr::write_volatile((shared + 8) as *mut u32, 0);
+                        core::ptr::write_volatile((shared + 12) as *mut u32, 0);
+
+                        let mut stacks: [u64; 2] = [0, 0];
+                        let mut i = 0;
+                        while i < 2 {
+                            let s: u64;
+                            core::arch::asm!("int 0x80", inlateout("rax") __NR_MMAP => s,
+                                in("rdi") 0u64, in("rsi") 65536u64, in("rdx") PROT_RW,
+                                in("r10") MAP_PA, in("r8") !0u64, in("r9") 0u64,
+                                lateout("rcx") _, lateout("r11") _);
+                            if (s as i64) < 0 {
+                                core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 92u64, options(noreturn));
+                            }
+                            stacks[i] = s;
+                            i += 1;
+                        }
+
+                        let flags = CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_SETTLS;
+                        let mut t = 0;
+                        while t < 2 {
+                            let stack_top = stacks[t] + 65536;
+                            let child_sp = stack_top - 16;
+                            core::ptr::write_volatile(child_sp as *mut u64, shared);
+                            core::ptr::write_volatile((child_sp + 8) as *mut u64, t as u64);
+                            let r: u64;
+                            core::arch::asm!("int 0x80", inlateout("rax") __NR_CLONE => r,
+                                in("rdi") flags, in("rsi") child_sp,
+                                in("rdx") 0u64, in("r10") 0u64, in("r8") 0u64,
+                                lateout("rcx") _, lateout("r11") _);
+                            if (r as i64) < 0 {
+                                core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 93u64, options(noreturn));
+                            }
+                            if r == 0 {
+                                // CHILD: lock-free atomic adds via xadd
+                                let my_sp: u64;
+                                core::arch::asm!("mov {}, rsp", out(reg) my_sp);
+                                let sh = core::ptr::read_volatile(my_sp as *const u64);
+                                let didx = core::ptr::read_volatile((my_sp + 8) as *const u64);
+                                let ctr = sh as *mut u32;
+                                let done = (sh + 8 + didx * 4) as *mut u32;
+                                let mut n = 0;
+                                while n < 500 {
+                                    core::arch::asm!("lock xadd [{}], {:e}",
+                                        in(reg) ctr, inout(reg) 1u32 => _);
+                                    n += 1;
+                                }
+                                core::ptr::write_volatile(done, 1);
+                                core::arch::asm!("int 0x80", in("rax") __NR_EXIT, in("rdi") 0u64, options(noreturn));
+                            }
+                            t += 1;
+                        }
+
+                        // PARENT: join via done flags
+                        let mut joined = 0;
+                        let mut spins = 0u32;
+                        while joined < 2 && spins < 2_000_000 {
+                            joined = 0;
+                            let d0 = core::ptr::read_volatile((shared + 8) as *const u32);
+                            let d1 = core::ptr::read_volatile((shared + 12) as *const u32);
+                            if d0 != 0 { joined += 1; }
+                            if d1 != 0 { joined += 1; }
+                            if joined == 2 { break; }
+                            core::arch::asm!("int 0x80", inlateout("rax") __NR_SCHED_YIELD => _,
+                                lateout("rcx") _, lateout("r11") _, lateout("rdi") _);
+                            spins += 1;
+                        }
+                        if joined < 2 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 94u64, options(noreturn));
+                        }
+                        let counter = core::ptr::read_volatile(shared as *const u32);
+                        if counter != 1000 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 95u64, options(noreturn));
+                        }
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..6000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 174 full threads: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 174 full threads: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 174 full threads: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 174 full threads: SKIPPED\n");
+        }
+    }
+
+    // --- Phase 175: signals end-to-end (rt_sigpending + sigaltstack) ---
+    syscall::debug_puts(b"  init: Phase 175 signals end-to-end...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_RT_SIGPROCMASK: u64 = 14;
+                        const __NR_RT_SIGPENDING: u64 = 127;
+                        const __NR_SIGALTSTACK: u64 = 131;
+                        const __NR_TKILL: u64 = 200;
+                        const __NR_GETTID: u64 = 186;
+                        const __NR_EXIT_GROUP: u64 = 231;
+                        const __NR_MMAP: u64 = 9;
+                        const PROT_RW: u64 = 3;
+                        const MAP_PA: u64 = 0x22;
+                        const SIG_BLOCK: u64 = 0;
+                        const SIGUSR2: u64 = 12;
+
+                        let mask: u64 = 1u64 << (SIGUSR2 - 1);
+                        let mask_buf = mask.to_le_bytes();
+                        let mut r: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_RT_SIGPROCMASK => r,
+                            in("rdi") SIG_BLOCK, in("rsi") mask_buf.as_ptr() as u64,
+                            in("rdx") 0u64, in("r10") 8u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 60u64, options(noreturn));
+                        }
+
+                        let tid: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_GETTID => tid,
+                            lateout("rcx") _, lateout("r11") _, lateout("rdi") _);
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_TKILL => r,
+                            in("rdi") tid, in("rsi") SIGUSR2,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 61u64, options(noreturn));
+                        }
+
+                        let mut pend = [0u8; 8];
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_RT_SIGPENDING => r,
+                            in("rdi") pend.as_mut_ptr() as u64, in("rsi") 8u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 62u64, options(noreturn));
+                        }
+                        let p_mask = u64::from_le_bytes(pend);
+                        if (p_mask & (1u64 << (SIGUSR2 - 1))) == 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 63u64, options(noreturn));
+                        }
+
+                        let astack: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_MMAP => astack,
+                            in("rdi") 0u64, in("rsi") 16384u64, in("rdx") PROT_RW,
+                            in("r10") MAP_PA, in("r8") !0u64, in("r9") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (astack as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 64u64, options(noreturn));
+                        }
+                        let mut ss = [0u8; 24];
+                        ss[0..8].copy_from_slice(&astack.to_le_bytes());
+                        ss[16..24].copy_from_slice(&16384u64.to_le_bytes());
+                        let mut oss = [0u8; 24];
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_SIGALTSTACK => r,
+                            in("rdi") ss.as_ptr() as u64, in("rsi") oss.as_mut_ptr() as u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 65u64, options(noreturn));
+                        }
+                        let mut oss2 = [0u8; 24];
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_SIGALTSTACK => r,
+                            in("rdi") 0u64, in("rsi") oss2.as_mut_ptr() as u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if (r as i64) < 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 66u64, options(noreturn));
+                        }
+                        let got_sp = u64::from_le_bytes([oss2[0],oss2[1],oss2[2],oss2[3],oss2[4],oss2[5],oss2[6],oss2[7]]);
+                        let got_size = u64::from_le_bytes([oss2[16],oss2[17],oss2[18],oss2[19],oss2[20],oss2[21],oss2[22],oss2[23]]);
+                        if got_sp != astack || got_size != 16384 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 67u64, options(noreturn));
+                        }
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..3000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 175 signals end-to-end: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 175 signals end-to-end: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 175 signals end-to-end: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 175 signals end-to-end: SKIPPED\n");
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

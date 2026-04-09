@@ -39,6 +39,11 @@ const FS_MKDIR: u64 = 0x2A00;
 const FS_MKDIR_OK: u64 = 0x2A01;
 const FS_UNLINK: u64 = 0x2A20;
 const FS_UNLINK_OK: u64 = 0x2A21;
+// Phase 173: filesystem realism (long-path).
+const FS_CHMOD: u64 = 0x2E00;
+const FS_CHMOD_OK: u64 = 0x2E01;
+const FS_UTIMENS: u64 = 0x2900;
+const FS_UTIMENS_OK: u64 = 0x2901;
 const FS_ERROR: u64 = 0x2F00;
 
 const ERR_NOT_FOUND: u64 = 1;
@@ -735,6 +740,51 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                     syscall::send(reply_port, FS_ERROR, ERR_FULL, 0, 0, 0);
                 } else {
                     syscall::send(reply_port, FS_MKDIR_OK, fi as u64, 0, 0, 0);
+                }
+            }
+
+            FS_CHMOD => {
+                // Long-path. data[0] = path_len(16) | mode(16) | reply_port(32).
+                let name_len = (msg.data[0] & 0xFFFF) as usize;
+                let mode = ((msg.data[0] >> 16) & 0xFFFF) as u16;
+                let reply_port = msg.data[0] >> 32;
+
+                let mut name = [0u8; MAX_NAME];
+                let nlen = name_len.min(MAX_NAME);
+                let src = FS_SCRATCH_VA as *const u8;
+                for i in 0..nlen {
+                    name[i] = unsafe { *src.add(i) };
+                }
+                match find_file(&files, &name, nlen) {
+                    Some(fi) => {
+                        files[fi].mode = (files[fi].mode & 0xF000) | (mode & 0x0FFF);
+                        syscall::send(reply_port, FS_CHMOD_OK, 0, 0, 0, 0);
+                    }
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    }
+                }
+            }
+
+            FS_UTIMENS => {
+                // Long-path. data[0] = path_len(16) | reply_port(32).
+                // rootfs doesn't track times — no-op success if file exists.
+                let name_len = (msg.data[0] & 0xFFFF) as usize;
+                let reply_port = msg.data[0] >> 32;
+
+                let mut name = [0u8; MAX_NAME];
+                let nlen = name_len.min(MAX_NAME);
+                let src = FS_SCRATCH_VA as *const u8;
+                for i in 0..nlen {
+                    name[i] = unsafe { *src.add(i) };
+                }
+                match find_file(&files, &name, nlen) {
+                    Some(_) => {
+                        syscall::send(reply_port, FS_UTIMENS_OK, 0, 0, 0, 0);
+                    }
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    }
                 }
             }
 

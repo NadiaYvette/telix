@@ -38,6 +38,11 @@ const VFS_MKDIR: u64 = 0x6040;
 const VFS_MKDIR_OK: u64 = 0x6140;
 const VFS_UNLINK: u64 = 0x6050;
 const VFS_UNLINK_OK: u64 = 0x6150;
+// Phase 173: filesystem realism. Long-path style operations.
+const VFS_CHMOD: u64 = 0x6080;
+const VFS_CHMOD_OK: u64 = 0x6180;
+const VFS_UTIMENS: u64 = 0x6090;
+const VFS_UTIMENS_OK: u64 = 0x6190;
 const VFS_ERROR: u64 = 0x6F00;
 
 // FS protocol tags (forwarded to underlying FS servers).
@@ -47,6 +52,10 @@ const FS_OPEN_LONG: u64 = 0x2002;
 const FS_STAT: u64 = 0x2300;
 const FS_STAT_OK: u64 = 0x2301;
 const FS_STAT_LONG: u64 = 0x2302;
+const FS_CHMOD: u64 = 0x2E00;
+const FS_CHMOD_OK: u64 = 0x2E01;
+const FS_UTIMENS: u64 = 0x2900;
+const FS_UTIMENS_OK: u64 = 0x2901;
 
 // Long-path scratch infrastructure.
 //
@@ -711,6 +720,149 @@ fn handle_stat_long(data: &[u64; 6]) {
     forward_fs_long(FS_STAT_LONG, FS_STAT_OK, &buf[..n], 0, reply_port, VFS_ERROR);
 }
 
+/// Handle VFS_CHMOD: long-path. data[0] = path_len(16) | mode(16) | reply_port(32).
+/// Path bytes live at LIN_SCRATCH_VA in our aspace.
+fn handle_chmod(data: &[u64; 6]) {
+    let path_len = (data[0] & 0xFFFF) as usize;
+    let mode = ((data[0] >> 16) & 0xFFFF) as u32;
+    let reply_port = data[0] >> 32;
+
+    let mut buf = [0u8; 256];
+    let n = read_long_path(&mut buf, path_len);
+    let n = normalize_long(&mut buf, n);
+    if n == 0 {
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
+        return;
+    }
+
+    let abs_path = &buf[..n];
+    let plen = abs_path.len();
+    let (mount_idx, prefix_end) = match find_mount_long(abs_path) {
+        Some(r) => r,
+        None => {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
+            }
+            return;
+        }
+    };
+    let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
+    if !ensure_fs_scratch_grant(fs_port) {
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+        }
+        return;
+    }
+
+    let mut rel_start = if prefix_end == 1 { 1 } else { prefix_end };
+    while rel_start < plen && abs_path[rel_start] == b'/' {
+        rel_start += 1;
+    }
+    let rel = &abs_path[rel_start..];
+    let rel_len = rel.len();
+    let scratch = unsafe { VFS_SCRATCH_VA };
+    if scratch == 0 {
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+        }
+        return;
+    }
+    let dst = scratch as *mut u8;
+    for i in 0..rel_len.min(MAX_LONG_PATH) {
+        unsafe { *dst.add(i) = rel[i] };
+    }
+
+    let my_reply = syscall::port_create();
+    let d0 = (rel_len as u64) | ((mode as u64 & 0xFFFF) << 16) | ((my_reply as u64) << 32);
+    syscall::send(fs_port, FS_CHMOD, d0, 0, 0, 0);
+    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+        if fs_reply.tag == FS_CHMOD_OK {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_CHMOD_OK, 0, 0, 0, 0);
+            }
+        } else if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+        }
+    } else if reply_port != 0 {
+        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    }
+    syscall::port_destroy(my_reply);
+}
+
+/// Handle VFS_UTIMENS: long-path. data[0] = path_len(16) | reply_port(32).
+/// data[1] = atime_secs, data[2] = mtime_secs.
+fn handle_utimens(data: &[u64; 6]) {
+    let path_len = (data[0] & 0xFFFF) as usize;
+    let reply_port = data[0] >> 32;
+    let atime = data[1];
+    let mtime = data[2];
+
+    let mut buf = [0u8; 256];
+    let n = read_long_path(&mut buf, path_len);
+    let n = normalize_long(&mut buf, n);
+    if n == 0 {
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
+        return;
+    }
+
+    let abs_path = &buf[..n];
+    let plen = abs_path.len();
+    let (mount_idx, prefix_end) = match find_mount_long(abs_path) {
+        Some(r) => r,
+        None => {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
+            }
+            return;
+        }
+    };
+    let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
+    if !ensure_fs_scratch_grant(fs_port) {
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+        }
+        return;
+    }
+
+    let mut rel_start = if prefix_end == 1 { 1 } else { prefix_end };
+    while rel_start < plen && abs_path[rel_start] == b'/' {
+        rel_start += 1;
+    }
+    let rel = &abs_path[rel_start..];
+    let rel_len = rel.len();
+    let scratch = unsafe { VFS_SCRATCH_VA };
+    if scratch == 0 {
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+        }
+        return;
+    }
+    let dst = scratch as *mut u8;
+    for i in 0..rel_len.min(MAX_LONG_PATH) {
+        unsafe { *dst.add(i) = rel[i] };
+    }
+
+    let my_reply = syscall::port_create();
+    let d0 = (rel_len as u64) | ((my_reply as u64) << 32);
+    syscall::send(fs_port, FS_UTIMENS, d0, atime, mtime, 0);
+    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+        if fs_reply.tag == FS_UTIMENS_OK {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_UTIMENS_OK, 0, 0, 0, 0);
+            }
+        } else if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+        }
+    } else if reply_port != 0 {
+        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    }
+    syscall::port_destroy(my_reply);
+}
+
 /// Handle VFS_OPEN: resolve path, forward FS_OPEN to FS server, return result.
 /// data[2] = path_len(16) | flags(16) | reply_port(32)
 fn handle_open(data: &[u64; 6]) {
@@ -1046,6 +1198,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             VFS_READDIR => handle_readdir(&msg.data),
             VFS_MKDIR => handle_mkdir(&msg.data),
             VFS_UNLINK => handle_unlink(&msg.data),
+            VFS_CHMOD => handle_chmod(&msg.data),
+            VFS_UTIMENS => handle_utimens(&msg.data),
             _ => {
                 let reply_port = msg.data[2] >> 32;
                 if reply_port != 0 {

@@ -135,6 +135,7 @@ pub const SYS_PERSONALITY_DEQUEUE_SIGNAL: u64 = 0xF011;
 pub const SYS_PERSONALITY_READ_FRAME: u64 = 0xF012;
 pub const SYS_PERSONALITY_WRITE_FRAME: u64 = 0xF013;
 pub const SYS_PERSONALITY_MAP_SHARED: u64 = 0xF014;
+pub const SYS_PERSONALITY_PEEK_SIGNALS: u64 = 0xF015;
 pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 pub const SYS_PORT_ALIVE: u64 = 110;
 
@@ -216,7 +217,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         && nr != SYS_PERSONALITY_DEQUEUE_SIGNAL
         && nr != SYS_PERSONALITY_READ_FRAME
         && nr != SYS_PERSONALITY_WRITE_FRAME
-        && nr != SYS_PERSONALITY_MAP_SHARED {
+        && nr != SYS_PERSONALITY_MAP_SHARED
+        && nr != SYS_PERSONALITY_PEEK_SIGNALS {
         let tid = crate::sched::smp::current()
             .current_thread
             .load(core::sync::atomic::Ordering::Relaxed);
@@ -508,6 +510,9 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         }
         SYS_PERSONALITY_MAP_SHARED => {
             crate::syscall::personality::personality_map_shared(a0, a1, a2, a3, a4)
+        }
+        SYS_PERSONALITY_PEEK_SIGNALS => {
+            crate::syscall::personality::personality_peek_signals(a0)
         }
         SYS_FRAMEBUFFER_INFO => sys_framebuffer_info(frame),
         _ => {

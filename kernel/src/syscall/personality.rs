@@ -929,6 +929,27 @@ pub fn personality_dequeue_signal(target_port: u64, mask: u64) -> u64 {
     sig as u64
 }
 
+/// Peek at the raw pending-signal mask of a target task's personality-waiting
+/// thread, WITHOUT consuming any pending signals.
+///
+/// Args: target_port. Returns the raw `sig_pending` u64 (bit i = signal i+1
+/// pending), or u64::MAX on error.
+pub fn personality_peek_signals(target_port: u64) -> u64 {
+    let _caller_task_id = match check_personality_server() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    let target_tid = find_personality_waiter(target_task_id);
+    if target_tid == u32::MAX {
+        return u64::MAX;
+    }
+    crate::sched::scheduler::thread_ref(target_tid).sig_pending
+}
+
 /// Read the exception frame of a target task's personality-waiting thread.
 ///
 /// Copies the raw exception frame bytes into the caller's buffer at `dst_va`.

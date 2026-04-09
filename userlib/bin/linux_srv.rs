@@ -130,9 +130,12 @@ const __NR_LSTAT: u64 = 6;
 const __NR_PREAD64: u64 = 17;
 const __NR_PWRITE64: u64 = 18;
 const __NR_READV: u64 = 19;
+const __NR_CHMOD: u64 = 90;
 const __NR_FCHMOD: u64 = 91;
 const __NR_FCHOWN: u64 = 93;
 const __NR_SIGALTSTACK: u64 = 131;
+const __NR_RT_SIGPENDING: u64 = 127;
+const __NR_RT_SIGSUSPEND: u64 = 130;
 const __NR_FCHOWNAT: u64 = 260;
 const __NR_FCHMODAT: u64 = 268;
 const __NR_MREMAP: u64 = 25;
@@ -269,6 +272,7 @@ const ENOTSOCK: u64 = 88;
 const EAFNOSUPPORT: u64 = 97;
 const ENOTCONN: u64 = 107;
 const ESRCH: u64 = 3;
+const EINTR: u64 = 4;
 const ECONNREFUSED: u64 = 111;
 const EOPNOTSUPP: u64 = 95;
 const ENOPROTOOPT: u64 = 92;
@@ -316,6 +320,11 @@ const VFS_MKDIR: u64 = 0x6040;
 const VFS_MKDIR_OK: u64 = 0x6140;
 const VFS_UNLINK: u64 = 0x6050;
 const VFS_UNLINK_OK: u64 = 0x6150;
+// Phase 173: filesystem realism (long-path).
+const VFS_CHMOD: u64 = 0x6080;
+const VFS_CHMOD_OK: u64 = 0x6180;
+const VFS_UTIMENS: u64 = 0x6090;
+const VFS_UTIMENS_OK: u64 = 0x6190;
 const VFS_READDIR: u64 = 0x6030;
 const VFS_READDIR_OK: u64 = 0x6130;
 const VFS_READDIR_END: u64 = 0x6131;
@@ -471,6 +480,13 @@ struct ProcessState {
     exe_name: [u8; 16],  // binary name for /proc/self/exe
     exe_name_len: u8,
     clear_child_tid: usize,  // CLONE_CHILD_CLEARTID / set_tid_address: futex-wake on exit
+    sig_altstack_sp: usize,  // sigaltstack base (Phase 175)
+    sig_altstack_size: usize,
+    sig_altstack_flags: u32,
+    // Phase 174: CLONE_THREAD-created thread ports that share this process's
+    // address space. Used so that syscalls (esp. futex wake) from any thread
+    // of the process resolve to the same pi, sharing futex table keys.
+    thread_ports: [u64; 8],
 }
 
 impl ProcessState {
@@ -490,6 +506,10 @@ impl ProcessState {
             exe_name: [0u8; 16],
             exe_name_len: 0,
             clear_child_tid: 0,
+            sig_altstack_sp: 0,
+            sig_altstack_size: 0,
+            sig_altstack_flags: 0,
+            thread_ports: [0u64; 8],
         }
     }
 }
@@ -636,7 +656,10 @@ impl PendingFdTransfer {
 static mut PENDING_FD_TRANSFERS: [PendingFdTransfer; MAX_PENDING_FD_TRANSFERS] = [const { PendingFdTransfer::empty() }; MAX_PENDING_FD_TRANSFERS];
 
 // ---- Futex wait queue ----
-const MAX_FUTEX_WAITERS: usize = 32;
+// Phase 174: bumped from 32 → 128 to accommodate dozens of glibc pthread
+// condvars/rwlocks co-existing (pthread_cond_broadcast can legitimately
+// queue large numbers of waiters transiently via FUTEX_CMP_REQUEUE).
+const MAX_FUTEX_WAITERS: usize = 128;
 
 #[derive(Clone, Copy)]
 struct FutexWaiter {
@@ -659,8 +682,13 @@ static mut FUTEX_TABLE: [FutexWaiter; MAX_FUTEX_WAITERS] = [const { FutexWaiter:
 fn find_proc(port: u64) -> Option<usize> {
     unsafe {
         for i in 0..MAX_PROCS {
-            if PROC_TABLE[i].active && PROC_TABLE[i].port == port {
-                return Some(i);
+            if !PROC_TABLE[i].active { continue; }
+            if PROC_TABLE[i].port == port { return Some(i); }
+            // Phase 174: a CLONE_THREAD sibling shares this process's state.
+            for t in 0..PROC_TABLE[i].thread_ports.len() {
+                if PROC_TABLE[i].thread_ports[t] == port {
+                    return Some(i);
+                }
             }
         }
     }
@@ -1670,6 +1698,44 @@ fn do_stat_long(path: &[u8]) -> Option<(u64, u64, u64, u64)> {
         return None;
     }
     Some((resp.data[0], resp.data[1], resp.data[2], resp.data[3]))
+}
+
+/// chmod via VFS_CHMOD long-path. Returns 0 on success or negated errno.
+fn do_chmod_long(path: &[u8], mode: u32) -> u64 {
+    let vfs_port = unsafe { VFS_PORT };
+    let reply_port = unsafe { REPLY_PORT };
+    if vfs_port == 0 {
+        return linux_err(ENOSYS);
+    }
+    let n = put_long_path(path);
+    if n == 0 {
+        return linux_err(ENOENT);
+    }
+    let d0 = (n as u64) | ((mode as u64 & 0xFFFF) << 16) | (reply_port << 32);
+    syscall::send(vfs_port, VFS_CHMOD, d0, 0, 0, 0);
+    match syscall::recv_msg(reply_port) {
+        Some(resp) if resp.tag == VFS_CHMOD_OK => 0,
+        _ => linux_err(ENOENT),
+    }
+}
+
+/// utimens via VFS_UTIMENS long-path. Returns 0 on success or negated errno.
+fn do_utimens_long(path: &[u8], atime: u64, mtime: u64) -> u64 {
+    let vfs_port = unsafe { VFS_PORT };
+    let reply_port = unsafe { REPLY_PORT };
+    if vfs_port == 0 {
+        return linux_err(ENOSYS);
+    }
+    let n = put_long_path(path);
+    if n == 0 {
+        return linux_err(ENOENT);
+    }
+    let d0 = (n as u64) | (reply_port << 32);
+    syscall::send(vfs_port, VFS_UTIMENS, d0, atime, mtime, 0);
+    match syscall::recv_msg(reply_port) {
+        Some(resp) if resp.tag == VFS_UTIMENS_OK => 0,
+        _ => linux_err(ENOENT),
+    }
 }
 
 /// Open a file via VFS. Returns fd or negated errno.
@@ -3257,6 +3323,7 @@ const CLONE_THREAD: u64 = 0x0001_0000;
 const CLONE_SETTLS: u64 = 0x0008_0000;
 const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
 const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 const CLONE_SIGHAND: u64 = 0x0000_0800;
 
 /// Handle Linux clone() with thread support.
@@ -3271,6 +3338,11 @@ fn handle_clone(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let parent_tid_ptr = args[2] as usize;
     let child_tid_ptr = args[3] as usize;
     let tls = args[4];
+
+    // Phase 174: reject CLONE_THREAD without CLONE_VM (undefined by POSIX).
+    if flags & CLONE_THREAD != 0 && flags & CLONE_VM == 0 {
+        return linux_err(EINVAL);
+    }
 
     // If not requesting shared address space, fall back to fork.
     if flags & CLONE_VM == 0 {
@@ -3293,19 +3365,29 @@ fn handle_clone(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         return linux_err(EAGAIN);
     }
 
+    // Phase 174: register thread_port so syscalls from the new thread resolve
+    // to the parent's pi (shared futex/FD state).
+    unsafe {
+        for t in 0..PROC_TABLE[pi].thread_ports.len() {
+            if PROC_TABLE[pi].thread_ports[t] == 0 {
+                PROC_TABLE[pi].thread_ports[t] = thread_port;
+                break;
+            }
+        }
+    }
+
     // Write the new thread's TID to parent_tid_ptr if CLONE_PARENT_SETTID.
     if flags & CLONE_PARENT_SETTID != 0 && parent_tid_ptr != 0 {
         let tid_bytes = (thread_port as u32).to_ne_bytes();
         syscall::personality_copy_out(caller_port, parent_tid_ptr, &tid_bytes);
     }
 
-    // Write the new thread's TID to child_tid_ptr if CLONE_CHILD_CLEARTID.
-    // (The actual clear-on-exit + futex wake is not yet implemented, but
-    // writing the tid now is required for pthread_create to work.)
-    if flags & CLONE_CHILD_CLEARTID != 0 && child_tid_ptr != 0 {
+    // Write the new thread's TID to child_tid_ptr if CLONE_CHILD_CLEARTID
+    // (clear-on-exit + futex wake handled in thread-exit path) OR if
+    // CLONE_CHILD_SETTID (Phase 174) — both semantics require the tid to
+    // be visible at that location in the shared address space.
+    if (flags & (CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID)) != 0 && child_tid_ptr != 0 {
         let tid_bytes = (thread_port as u32).to_ne_bytes();
-        // Write into the *child's* address space — but since CLONE_VM, it's
-        // the same address space as the parent, so writing via caller_port works.
         syscall::personality_copy_out(caller_port, child_tid_ptr, &tid_bytes);
     }
 
@@ -4599,10 +4681,14 @@ fn handle_futex(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
     let uaddr = args[0];
     let op = args[1] & 0x7F; // Mask out FUTEX_PRIVATE_FLAG
     let val = args[2];
-    let timeout_va = args[3] as usize; // struct timespec* for WAIT
+    let timeout_va = args[3] as usize; // struct timespec* for WAIT / val2 for REQUEUE
+    let uaddr2 = args[4]; // addr2 for REQUEUE
+    let val3 = args[5] as u32; // CMP_REQUEUE expected value at addr1
 
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
+    const FUTEX_REQUEUE: u64 = 3;
+    const FUTEX_CMP_REQUEUE: u64 = 4;
     const FUTEX_WAIT_BITSET: u64 = 9;
     const FUTEX_WAKE_BITSET: u64 = 10;
 
@@ -4665,6 +4751,41 @@ fn handle_futex(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
                 }
             }
             Some(woken as u64)
+        }
+        FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+            // val  = max waiters to wake from uaddr
+            // val2 = max waiters to requeue to uaddr2 (passed in args[3]/timeout_va)
+            // val3 = expected value at uaddr (CMP_REQUEUE only)
+            if op == FUTEX_CMP_REQUEUE {
+                let mut valbuf = [0u8; 4];
+                let copied = syscall::personality_copy_in(caller_port, uaddr as usize, &mut valbuf);
+                if copied < 4 { return Some(linux_err(EFAULT)); }
+                let cur = u32::from_le_bytes(valbuf);
+                if cur != val3 { return Some(linux_err(EAGAIN)); }
+            }
+            let max_wake = val as usize;
+            let max_requeue = timeout_va; // val2
+            let mut woken = 0usize;
+            let mut requeued = 0usize;
+            unsafe {
+                for i in 0..MAX_FUTEX_WAITERS {
+                    if !FUTEX_TABLE[i].active { continue; }
+                    if FUTEX_TABLE[i].uaddr != uaddr || FUTEX_TABLE[i].pi != pi { continue; }
+                    if woken < max_wake {
+                        syscall::personality_reply(FUTEX_TABLE[i].caller_port, 0);
+                        FUTEX_TABLE[i].active = false;
+                        woken += 1;
+                    } else if requeued < max_requeue {
+                        // Move waiter to uaddr2 by rewriting its uaddr field; it
+                        // remains parked until a FUTEX_WAKE on uaddr2 fires.
+                        FUTEX_TABLE[i].uaddr = uaddr2;
+                        requeued += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Some((woken + requeued) as u64)
         }
         _ => Some(linux_err(ENOSYS)),
     }
@@ -4945,6 +5066,98 @@ fn handle_rt_sigprocmask(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         }
     }
 
+    0
+}
+
+/// Handle Linux rt_sigpending(set, sigsetsize) — copy out the deliverable
+/// (pending & blocked) signal mask. Returns 0.
+fn handle_rt_sigpending(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let set_va = args[0] as usize;
+    let sigsetsize = args[1] as usize;
+    if sigsetsize != 8 { return linux_err(EINVAL); }
+    if set_va == 0 { return linux_err(EFAULT); }
+    let raw = syscall::personality_peek_signals(caller_port);
+    if raw == u64::MAX { return linux_err(ESRCH); }
+    let mask = unsafe { PROC_TABLE[pi].sig_mask };
+    // POSIX: rt_sigpending returns BLOCKED pending signals.
+    let pending = raw & mask;
+    if syscall::personality_copy_out(caller_port, set_va, &pending.to_le_bytes()) == 0 {
+        return linux_err(EFAULT);
+    }
+    0
+}
+
+/// Handle Linux rt_sigsuspend(mask, sigsetsize) — atomically install `mask`,
+/// wait for any deliverable signal, then restore the old mask. Always
+/// returns -EINTR after handler dispatch.
+fn handle_rt_sigsuspend(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let mask_va = args[0] as usize;
+    let sigsetsize = args[1] as usize;
+    if sigsetsize != 8 { return linux_err(EINVAL); }
+    if mask_va == 0 { return linux_err(EFAULT); }
+    let mut buf = [0u8; 8];
+    if syscall::personality_copy_in(caller_port, mask_va, &mut buf) < 8 {
+        return linux_err(EFAULT);
+    }
+    let new_mask = u64::from_le_bytes(buf);
+    // SIGKILL/SIGSTOP can't be blocked.
+    let unblockable = (1u64 << 8) | (1u64 << 18);
+    let new_mask_eff = new_mask & !unblockable;
+    let old_mask = unsafe { PROC_TABLE[pi].sig_mask };
+    unsafe { PROC_TABLE[pi].sig_mask = new_mask_eff; }
+
+    // Spin-poll for a deliverable signal. The personality wait infrastructure
+    // doesn't expose a fine-grained "wait for signal" hook, so we yield until
+    // sig_pending has something the new mask doesn't block.
+    for _ in 0..10_000_000u64 {
+        let raw = syscall::personality_peek_signals(caller_port);
+        if raw == u64::MAX { break; }
+        if (raw & !new_mask_eff) != 0 { break; }
+        syscall::yield_now();
+    }
+
+    // Restore old mask. The signal (if any) will be delivered by
+    // maybe_deliver_signal on return; the handler runs with old_mask.
+    unsafe { PROC_TABLE[pi].sig_mask = old_mask; }
+    linux_err(EINTR)
+}
+
+/// Handle Linux sigaltstack(ss, oss).
+fn handle_sigaltstack(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let ss_va = args[0] as usize;
+    let oss_va = args[1] as usize;
+    // struct sigaltstack { void *ss_sp; int ss_flags; size_t ss_size; }
+    // sizeof = 24 on x86_64 (4 bytes flags + 4 padding).
+    if oss_va != 0 {
+        let mut out = [0u8; 24];
+        unsafe {
+            out[0..8].copy_from_slice(&(PROC_TABLE[pi].sig_altstack_sp as u64).to_le_bytes());
+            out[8..12].copy_from_slice(&PROC_TABLE[pi].sig_altstack_flags.to_le_bytes());
+            out[16..24].copy_from_slice(&(PROC_TABLE[pi].sig_altstack_size as u64).to_le_bytes());
+        }
+        syscall::personality_copy_out(caller_port, oss_va, &out);
+    }
+    if ss_va != 0 {
+        let mut buf = [0u8; 24];
+        if syscall::personality_copy_in(caller_port, ss_va, &mut buf) < 24 {
+            return linux_err(EFAULT);
+        }
+        let sp = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]) as usize;
+        let flags = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let size = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]) as usize;
+        const SS_DISABLE: u32 = 2;
+        unsafe {
+            if flags & SS_DISABLE != 0 {
+                PROC_TABLE[pi].sig_altstack_sp = 0;
+                PROC_TABLE[pi].sig_altstack_size = 0;
+                PROC_TABLE[pi].sig_altstack_flags = SS_DISABLE;
+            } else {
+                PROC_TABLE[pi].sig_altstack_sp = sp;
+                PROC_TABLE[pi].sig_altstack_size = size;
+                PROC_TABLE[pi].sig_altstack_flags = flags;
+            }
+        }
+    }
     0
 }
 
@@ -7017,7 +7230,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_RT_SIGACTION => handle_rt_sigaction(pi, caller_port, &msg.data),
             __NR_RT_SIGPROCMASK => handle_rt_sigprocmask(pi, caller_port, &msg.data),
             __NR_RT_SIGRETURN => handle_rt_sigreturn_full(pi, caller_port),
-            __NR_SIGALTSTACK => 0,  // stub — no alternate signal stack yet
+            __NR_SIGALTSTACK => handle_sigaltstack(pi, caller_port, &msg.data),
+            __NR_RT_SIGPENDING => handle_rt_sigpending(pi, caller_port, &msg.data),
+            __NR_RT_SIGSUSPEND => handle_rt_sigsuspend(pi, caller_port, &msg.data),
             __NR_TGKILL => handle_tgkill(caller_port, &msg.data),
             __NR_KILL => handle_kill(pi, caller_port, &msg.data),
 
@@ -7030,7 +7245,31 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_GETRUSAGE => handle_getrusage(caller_port, &msg.data),
             __NR_FTRUNCATE => handle_ftruncate(pi, &msg.data),
             __NR_STATX => handle_statx(pi, caller_port, &msg.data),
-            __NR_FCHMOD | __NR_FCHMODAT => 0, // stub: single-user, no permission enforcement
+            __NR_CHMOD => {
+                // chmod(path, mode)
+                let path_va = msg.data[0] as usize;
+                let mode = msg.data[1] as u32;
+                let (path, plen) = resolve_path(pi, caller_port, path_va);
+                if plen == 0 { linux_err(EFAULT) } else { do_chmod_long(&path[..plen], mode) }
+            }
+            __NR_FCHMOD => {
+                // fchmod(fd, mode): need to look up the open path. We don't track
+                // a path on FdKind::File, so resolve via /proc/self/fd-style is
+                // not yet wired. Treat as no-op success for now (single-user).
+                0
+            }
+            __NR_FCHMODAT => {
+                // fchmodat(dirfd, path, mode, flags). Only AT_FDCWD path supported.
+                let dirfd = msg.data[0];
+                if dirfd != AT_FDCWD && (dirfd as i64) >= 0 {
+                    linux_err(ENOSYS)
+                } else {
+                    let path_va = msg.data[1] as usize;
+                    let mode = msg.data[2] as u32;
+                    let (path, plen) = resolve_path(pi, caller_port, path_va);
+                    if plen == 0 { linux_err(EFAULT) } else { do_chmod_long(&path[..plen], mode) }
+                }
+            }
             __NR_FCHOWN | __NR_FCHOWNAT => 0, // stub: single-user, no ownership enforcement
 
             // epoll
@@ -7081,7 +7320,40 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Phase 151: sync/persistence stubs + misc.
             __NR_FSYNC | __NR_FDATASYNC => 0, // no durable storage, always "synced"
             __NR_FALLOCATE => 0, // no-op: space is allocated on write
-            __NR_UTIMENSAT => 0, // stub: timestamp changes ignored
+            __NR_UTIMENSAT => {
+                // utimensat(dirfd, path, struct timespec times[2], flags).
+                // times == NULL means "set both to current time" — we treat
+                // current time as 0 for now (no wall clock).
+                let dirfd = msg.data[0];
+                let path_va = msg.data[1] as usize;
+                let times_va = msg.data[2] as usize;
+                if path_va == 0 {
+                    // utimensat(fd, NULL, ...) variant — would update via fd.
+                    // Not yet supported; treat as no-op success (legacy stub).
+                    0
+                } else if dirfd != AT_FDCWD && (dirfd as i64) >= 0 {
+                    linux_err(ENOSYS)
+                } else {
+                    let (path, plen) = resolve_path(pi, caller_port, path_va);
+                    if plen == 0 {
+                        linux_err(EFAULT)
+                    } else {
+                        // Each timespec is 16 bytes: tv_sec(8) + tv_nsec(8).
+                        // We only persist seconds.
+                        let mut atime: u64 = 0;
+                        let mut mtime: u64 = 0;
+                        if times_va != 0 {
+                            let mut buf = [0u8; 32];
+                            let n = syscall::personality_copy_in(caller_port, times_va, &mut buf);
+                            if n >= 32 {
+                                atime = u64::from_le_bytes([buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]]);
+                                mtime = u64::from_le_bytes([buf[16],buf[17],buf[18],buf[19],buf[20],buf[21],buf[22],buf[23]]);
+                            }
+                        }
+                        do_utimens_long(&path[..plen], atime, mtime)
+                    }
+                }
+            }
             __NR_SYMLINK | __NR_SYMLINKAT => linux_err(ENOSYS), // no symlink support
             __NR_LINK | __NR_LINKAT => linux_err(ENOSYS), // no hard link support
 
@@ -7165,7 +7437,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if persona == 0xFFFF_FFFF { 0 } else { 0 } // always PER_LINUX
             }
             __NR_STATFS | __NR_FSTATFS => handle_statfs(caller_port, &msg.data),
-            __NR_TKILL => 0, // stub: no intra-process signal delivery yet
+            __NR_TKILL => {
+                // tkill(tid, sig) — intra-process; tid IS the Telix port.
+                let tid = msg.data[0];
+                let sig = msg.data[1] as u32;
+                if sig == 0 { 0 }
+                else if syscall::kill_sig(tid, sig) { 0 }
+                else { linux_err(ESRCH) }
+            }
             __NR_TIME => {
                 // time(tloc): return seconds since epoch.
                 let ns = syscall::clock_gettime();

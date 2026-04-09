@@ -46,6 +46,11 @@ const FS_UNLINK: u64 = 0x2A20;
 const FS_UNLINK_OK: u64 = 0x2A21;
 const FS_FSYNC: u64 = 0x2B00;
 const FS_FSYNC_OK: u64 = 0x2B01;
+// Phase 173: filesystem realism.
+const FS_CHMOD: u64 = 0x2E00;
+const FS_CHMOD_OK: u64 = 0x2E01;
+const FS_UTIMENS: u64 = 0x2900;
+const FS_UTIMENS_OK: u64 = 0x2901;
 const FS_ERROR: u64 = 0x2F00;
 
 // File lock protocol.
@@ -1079,6 +1084,52 @@ fn write_inode(
     true
 }
 
+/// Patch only i_atime / i_mtime on an existing inode without touching other fields.
+/// Offsets: i_atime = 8, i_mtime = 16 (u32 seconds since epoch).
+fn write_inode_times(
+    blk: &BlkClient,
+    sb: &Superblock,
+    bgd: &BlockGroupDesc,
+    inode_num: u32,
+    atime: u32,
+    mtime: u32,
+) -> bool {
+    let idx = inode_num - 1;
+    let inode_offset =
+        (bgd.inode_table as u64) * (sb.block_size as u64) + (idx as u64) * (sb.inode_size as u64);
+
+    // We only need the first 32 bytes to patch atime/mtime. Read/write may
+    // cross a 512-byte sector boundary, so handle both halves.
+    let mut buf = [0u8; 32];
+    let sector_off = (inode_offset % 512) as usize;
+    let bytes_in_first = (512 - sector_off).min(32);
+    if !blk.read_bytes(inode_offset, &mut buf[..bytes_in_first]) {
+        return false;
+    }
+    if bytes_in_first < 32 {
+        if !blk.read_bytes(
+            inode_offset + bytes_in_first as u64,
+            &mut buf[bytes_in_first..32],
+        ) {
+            return false;
+        }
+    }
+    write_u32(&mut buf, 8, atime);
+    write_u32(&mut buf, 16, mtime);
+    if !blk.write_bytes(inode_offset, &buf[..bytes_in_first]) {
+        return false;
+    }
+    if bytes_in_first < 32 {
+        if !blk.write_bytes(
+            inode_offset + bytes_in_first as u64,
+            &buf[bytes_in_first..32],
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Flush superblock free counts back to disk.
 fn flush_superblock(blk: &BlkClient, sb: &Superblock) {
     // Superblock is at partition offset 1024. We need to update offsets 12 and 16.
@@ -2093,6 +2144,70 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 flush_superblock(&blk, &sb);
 
                 syscall::send(reply_port, FS_DELETE_OK, 0, 0, 0, 0);
+            }
+
+            FS_CHMOD => {
+                // Long-path: path bytes at VFS_LONG_PATH_SCRATCH_VA.
+                // data[0] = path_len | (mode << 16) | (reply_port << 32)
+                let path_len = (msg.data[0] & 0xFFFF) as usize;
+                let mode = ((msg.data[0] >> 16) & 0xFFFF) as u16;
+                let reply_port = msg.data[0] >> 32;
+
+                let mut name = [0u8; 256];
+                let nlen = path_len.min(256);
+                let src = VFS_LONG_PATH_SCRATCH_VA as *const u8;
+                for i in 0..nlen {
+                    name[i] = unsafe { *src.add(i) };
+                }
+
+                if let Some((ino, old_mode, uid, gid, size, blocks)) =
+                    path_resolve(&blk, &sb, &bgd, &name[..nlen], indirect_buf_va, block_buf_va)
+                {
+                    // Preserve top 4 bits (file type), replace low 12 bits.
+                    let new_mode = (old_mode & 0xF000) | (mode & 0x0FFF);
+                    if write_inode(&blk, &sb, &bgd, ino, new_mode, uid, gid, size, &blocks) {
+                        // Keep cached mode in sync for any open handles.
+                        for f in open_files.iter_mut() {
+                            if f.active && f.inode_num == ino {
+                                f.mode = new_mode;
+                            }
+                        }
+                        syscall::send(reply_port, FS_CHMOD_OK, 0, 0, 0, 0);
+                    } else {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                    }
+                } else {
+                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                }
+            }
+
+            FS_UTIMENS => {
+                // Long-path: path bytes at VFS_LONG_PATH_SCRATCH_VA.
+                // data[0] = path_len | (reply_port << 32)
+                // data[1] = atime_secs, data[2] = mtime_secs
+                let path_len = (msg.data[0] & 0xFFFF) as usize;
+                let reply_port = msg.data[0] >> 32;
+                let atime = msg.data[1] as u32;
+                let mtime = msg.data[2] as u32;
+
+                let mut name = [0u8; 256];
+                let nlen = path_len.min(256);
+                let src = VFS_LONG_PATH_SCRATCH_VA as *const u8;
+                for i in 0..nlen {
+                    name[i] = unsafe { *src.add(i) };
+                }
+
+                if let Some((ino, _mode, _uid, _gid, _size, _blocks)) =
+                    path_resolve(&blk, &sb, &bgd, &name[..nlen], indirect_buf_va, block_buf_va)
+                {
+                    if write_inode_times(&blk, &sb, &bgd, ino, atime, mtime) {
+                        syscall::send(reply_port, FS_UTIMENS_OK, 0, 0, 0, 0);
+                    } else {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                    }
+                } else {
+                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                }
             }
 
             FS_FLOCK => {
