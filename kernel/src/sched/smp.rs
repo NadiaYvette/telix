@@ -24,7 +24,7 @@ pub const MAX_CPUS: usize = 4096;
     feature = "max_cpus_1024",
     feature = "max_cpus_4096"
 )))]
-pub const MAX_CPUS: usize = 64;
+pub const MAX_CPUS: usize = 256;
 
 // ── Runtime-detected CPU count ───────────────────────────────────────
 //
