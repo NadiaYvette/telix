@@ -34,9 +34,10 @@
 //! Absence of the parameter leaves swap disabled; WSCLOCK continues to
 //! discard evicted pages as it does today.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use super::page::PhysAddr;
+use super::page::{PhysAddr, MMUPAGE_SIZE};
+use super::phys;
 
 /// Opaque identifier for one slot in a swap backend. 0 is reserved as
 /// "no slot" so that `swap_slots: [AtomicU32]` can use zero-initialized
@@ -75,10 +76,116 @@ pub enum SwapIoResult {
 /// `None` means swap is disabled.
 #[derive(Clone, Copy)]
 enum Backend {
-    /// RAM-backed mock backend. Reads/writes go to a phys-allocated
-    /// region. Lands in a follow-up commit.
-    #[allow(dead_code)]
-    Ram,
+    /// RAM-backed mock backend. Slot data lives in phys-allocated pages
+    /// carved out at boot; reads and writes are memcpy. Uses no real
+    /// I/O, so WSCLOCK can drive it synchronously during development
+    /// and tests.
+    Ram(&'static RamBackend),
+}
+
+/// RAM-backed swap store. Slot N (1-indexed externally) is a single
+/// MMU-page-sized buffer at `pages[N-1]`. Free/busy state is tracked in
+/// a bitmap of AtomicU64 words; slots are allocated with a CAS on the
+/// owning word. Entirely lock-free.
+pub struct RamBackend {
+    /// Physical pages (one per slot). Indexed 0..total; the external
+    /// slot id is `index + 1` so that 0 can stay reserved for
+    /// `SwapSlot::NONE`.
+    pages: &'static [u64],
+    /// Free bitmap: bit set = slot free. Covers `pages.len()` bits.
+    bitmap: &'static [AtomicU64],
+    total: u32,
+    /// Running tally of in-use slots, for reporting.
+    used: AtomicU32,
+}
+
+impl RamBackend {
+    fn alloc_slot(&self) -> SwapSlot {
+        let n = self.pages.len();
+        if n == 0 {
+            return SwapSlot::NONE;
+        }
+        // Scan the bitmap for a word with at least one free bit.
+        for (wi, word) in self.bitmap.iter().enumerate() {
+            loop {
+                let cur = word.load(Ordering::Relaxed);
+                if cur == 0 {
+                    break; // word fully used, move on
+                }
+                let bit = cur.trailing_zeros() as usize;
+                let idx = wi * 64 + bit;
+                if idx >= n {
+                    break; // past the valid range
+                }
+                let new = cur & !(1u64 << bit);
+                if word
+                    .compare_exchange(cur, new, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    self.used.fetch_add(1, Ordering::Relaxed);
+                    // External slot ids are 1-based.
+                    return SwapSlot((idx + 1) as u32);
+                }
+                // CAS lost, retry this word.
+            }
+        }
+        SwapSlot::NONE
+    }
+
+    fn free_slot(&self, slot: SwapSlot) {
+        if slot.is_none() {
+            return;
+        }
+        let idx = (slot.0 - 1) as usize;
+        if idx >= self.pages.len() {
+            return;
+        }
+        let wi = idx / 64;
+        let bit = idx % 64;
+        self.bitmap[wi].fetch_or(1u64 << bit, Ordering::Release);
+        self.used.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn slot_pa(&self, slot: SwapSlot) -> Option<u64> {
+        if slot.is_none() {
+            return None;
+        }
+        let idx = (slot.0 - 1) as usize;
+        self.pages.get(idx).copied()
+    }
+
+    fn write_page(&self, slot: SwapSlot, src_pa: PhysAddr) -> SwapIoResult {
+        let dst = match self.slot_pa(slot) {
+            Some(p) => p,
+            None => return SwapIoResult::Io,
+        };
+        // Safety: both addresses are kernel-identity-mapped phys pages
+        // of size MMUPAGE_SIZE; they never overlap (distinct slot
+        // allocations).
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src_pa.as_usize() as *const u8,
+                dst as *mut u8,
+                MMUPAGE_SIZE,
+            );
+        }
+        SwapIoResult::Ok
+    }
+
+    fn read_page(&self, slot: SwapSlot, dst_pa: PhysAddr) -> SwapIoResult {
+        let src = match self.slot_pa(slot) {
+            Some(p) => p,
+            None => return SwapIoResult::Io,
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src as *const u8,
+                dst_pa.as_usize() as *mut u8,
+                MMUPAGE_SIZE,
+            );
+        }
+        SwapIoResult::Ok
+    }
 }
 
 /// Slot to the active backend. Not an `Option<Backend>` because we want
@@ -96,7 +203,6 @@ pub static SWAP_IO_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// Install a backend. Called once at boot by the chosen backend's
 /// initializer. Subsequent calls are ignored.
-#[allow(dead_code)]
 fn install(backend: Backend) {
     if ENABLED.load(Ordering::Acquire) {
         return;
@@ -129,10 +235,7 @@ fn current() -> Option<Backend> {
 /// swap is disabled or the backend is full.
 pub fn alloc_slot() -> SwapSlot {
     match current() {
-        Some(Backend::Ram) => {
-            // Stub: ram backend lands in Commit 2.
-            SwapSlot::NONE
-        }
+        Some(Backend::Ram(b)) => b.alloc_slot(),
         None => SwapSlot::NONE,
     }
 }
@@ -143,41 +246,118 @@ pub fn free_slot(slot: SwapSlot) {
         return;
     }
     match current() {
-        Some(Backend::Ram) => {
-            // Stub.
-        }
+        Some(Backend::Ram(b)) => b.free_slot(slot),
         None => {}
     }
 }
 
 /// Write the contents of the physical page at `pa` into `slot`.
-pub fn write_page(slot: SwapSlot, _pa: PhysAddr) -> SwapIoResult {
+pub fn write_page(slot: SwapSlot, pa: PhysAddr) -> SwapIoResult {
     if slot.is_none() {
         return SwapIoResult::Io;
     }
-    match current() {
-        Some(Backend::Ram) => {
-            // Stub.
-            SWAP_IO_ERRORS.fetch_add(1, Ordering::Relaxed);
-            SwapIoResult::Io
-        }
+    let r = match current() {
+        Some(Backend::Ram(b)) => b.write_page(slot, pa),
         None => SwapIoResult::Io,
+    };
+    if r == SwapIoResult::Ok {
+        SWAP_OUT_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SWAP_IO_ERRORS.fetch_add(1, Ordering::Relaxed);
     }
+    r
 }
 
 /// Read `slot` into the physical page at `pa`.
-pub fn read_page(slot: SwapSlot, _pa: PhysAddr) -> SwapIoResult {
+pub fn read_page(slot: SwapSlot, pa: PhysAddr) -> SwapIoResult {
     if slot.is_none() {
         return SwapIoResult::Io;
     }
-    match current() {
-        Some(Backend::Ram) => {
-            // Stub.
-            SWAP_IO_ERRORS.fetch_add(1, Ordering::Relaxed);
-            SwapIoResult::Io
-        }
+    let r = match current() {
+        Some(Backend::Ram(b)) => b.read_page(slot, pa),
         None => SwapIoResult::Io,
+    };
+    if r == SwapIoResult::Ok {
+        SWAP_IN_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SWAP_IO_ERRORS.fetch_add(1, Ordering::Relaxed);
     }
+    r
+}
+
+/// Initialize a RAM-backed swap backend with `total` slots. Allocates
+/// one MMU-page-sized buffer per slot plus metadata. Returns `false` if
+/// phys allocation fails partway through (caller logs and leaves swap
+/// disabled).
+fn init_ram_backend(total: u32) -> bool {
+    if total == 0 {
+        return false;
+    }
+    let n = total as usize;
+    // Metadata: one u64 phys pointer per slot, one bit per slot in the
+    // free bitmap. alloc_static_slice zero-initializes; we then flip
+    // bitmap bits to "free" below.
+    let pages: &'static mut [u64] = unsafe { phys::alloc_static_slice::<u64>(n) };
+    let bmp_words = (n + 63) / 64;
+    let bitmap: &'static mut [AtomicU64] =
+        unsafe { phys::alloc_static_slice::<AtomicU64>(bmp_words) };
+
+    // Allocate one page per slot. If we run out, shrink to what we got.
+    let mut filled = 0usize;
+    for i in 0..n {
+        match phys::alloc_page() {
+            Some(pa) => {
+                pages[i] = pa.as_usize() as u64;
+                filled += 1;
+            }
+            None => break,
+        }
+    }
+    if filled == 0 {
+        return false;
+    }
+
+    // Mark the first `filled` slots as free; leave any shortfall tail
+    // as zero (busy → never allocated).
+    for i in 0..filled {
+        let wi = i / 64;
+        let bit = i % 64;
+        let cur = bitmap[wi].load(Ordering::Relaxed);
+        bitmap[wi].store(cur | (1u64 << bit), Ordering::Relaxed);
+    }
+
+    // Shrink the slice view to the filled portion so alloc_slot doesn't
+    // hand out unowned entries.
+    let pages: &'static [u64] = &pages[..filled];
+    let bitmap: &'static [AtomicU64] = &bitmap[..bmp_words];
+
+    // Allocate the RamBackend control block itself from phys so it is
+    // `'static`. It fits in well under a page.
+    let ctrl_pa = match phys::alloc_page() {
+        Some(p) => p,
+        None => return false,
+    };
+    let ctrl_ptr = ctrl_pa.as_usize() as *mut RamBackend;
+    unsafe {
+        core::ptr::write(
+            ctrl_ptr,
+            RamBackend {
+                pages,
+                bitmap,
+                total: filled as u32,
+                used: AtomicU32::new(0),
+            },
+        );
+    }
+    let ctrl: &'static RamBackend = unsafe { &*ctrl_ptr };
+
+    install(Backend::Ram(ctrl));
+    crate::println!(
+        "  Swap: ram backend online — {} slots ({} KiB)",
+        filled,
+        (filled * MMUPAGE_SIZE) / 1024
+    );
+    true
 }
 
 /// Parse the `swap=` boot parameter and bring up the matching backend.
@@ -200,10 +380,11 @@ pub fn init() {
                 return;
             }
         };
-        crate::println!(
-            "  Swap: ram:{} MiB requested (backend not yet wired)",
-            mib
-        );
+        // Slot = one MMU page (4 KiB). total = mib * 256.
+        let total = (mib as usize) * (1024 * 1024 / MMUPAGE_SIZE);
+        if !init_ram_backend(total as u32) {
+            crate::println!("  Swap: ram backend init failed, disabled");
+        }
         return;
     }
 
