@@ -2,6 +2,7 @@ pub mod capability;
 pub mod capset;
 pub mod cdt;
 pub mod cnode;
+pub mod mmio;
 pub mod space;
 
 pub use capability::{CapType, Capability, Rights};
@@ -183,6 +184,20 @@ pub fn grant_port_cap(task_id: u32, port_id: u64, rights: Rights) -> Option<usiz
         capset_grant(task_id, port_id, rights);
     }
     result
+}
+
+/// Grant a Memory capability (MMIO region) to a task. Returns the slot
+/// index or None on failure (bad region_id, cap space full, OOM).
+///
+/// Unlike port caps, Memory caps are not tracked in the per-task fast
+/// capset — they're only consulted by `sys_mmio_map_cap`, which does a
+/// direct CapSpace lookup by slot number.
+pub fn grant_mmio_cap(task_id: u32, region_id: u32, rights: Rights) -> Option<usize> {
+    let cap = mmio::make_cap(region_id, rights)?;
+    let _task_guard = lock_task_caps(task_id);
+    let space = task_capspace(task_id);
+    let mut cdt = CDT_LOCK.lock();
+    space.insert(cap, &mut *cdt)
 }
 
 /// Remove all caps for a port from a task, and clear capset.

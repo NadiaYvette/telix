@@ -156,6 +156,19 @@ fn startup_thread() -> ! {
     // Driver model Step A: smoke-test IRQ→port message delivery.
     io::irq_dispatch::self_test();
 
+    // Driver model Step B: register firmware-discovered MMIO regions as
+    // Memory-cap-backed regions, then smoke-test the registry and cap
+    // derivation path.
+    cap::mmio::populate_from_firmware();
+    println!(
+        "  [mmio-cap] firmware: mem_regions={}, cpus={}, virtio_devs={}, regions={}",
+        firmware::mem_regions().len(),
+        firmware::cpus().len(),
+        firmware::virtio_devices().len(),
+        cap::mmio::count()
+    );
+    cap::mmio::self_test();
+
     // Discover and spawn virtio-mmio device servers.
     // Uses firmware-discovered devices (from DTB) with hardcoded fallback.
     // On x86_64 find_device returns None (no MMIO transport), so these are no-ops.

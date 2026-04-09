@@ -140,6 +140,7 @@ pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 pub const SYS_PORT_ALIVE: u64 = 110;
 pub const SYS_IRQ_ATTACH: u64 = 111;
 pub const SYS_IRQ_ACK: u64 = 112;
+pub const SYS_MMIO_MAP_CAP: u64 = 113;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -280,6 +281,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_IRQ_WAIT => sys_irq_wait(a0, a1),
         SYS_IRQ_ATTACH => sys_irq_attach(a0, a1, a2),
         SYS_IRQ_ACK => sys_irq_ack(a0),
+        SYS_MMIO_MAP_CAP => sys_mmio_map_cap(a0),
         SYS_GETCHAR => sys_getchar(),
         SYS_IOPORT => sys_ioport(a0, a1, a2),
         SYS_SPAWN_ELF => sys_spawn_elf(a0, a1, a2, a3),
@@ -1423,6 +1425,83 @@ fn sys_irq_ack(irq_num: u64) -> u64 {
         return u64::MAX;
     }
     0
+}
+
+/// Map an MMIO region into the calling task's address space, validated
+/// by a `CapType::Memory` capability the task already holds.
+///
+/// Arguments:
+///   `slot` — index of the Memory cap in the calling task's root CNode
+///
+/// The cap must carry both `READ` and `WRITE` (every current MMIO use
+/// case is RW; we'll split once there's a read-only consumer). Returns
+/// the virtual address of the mapped region on success, `u64::MAX` on
+/// any failure.
+///
+/// Coexists with `sys_mmap_device` (unchanged) until Step D removes the
+/// static-range path.
+fn sys_mmio_map_cap(slot: u64) -> u64 {
+    let slot = slot as usize;
+
+    let task_id = crate::sched::scheduler::current_task_id();
+    if task_id == 0 {
+        return u64::MAX;
+    }
+
+    // Look up the cap under the task's cap_lock and copy out the region
+    // descriptor. We don't hold the lock across VA allocation / PTE
+    // installation — the region table is append-only so the descriptor
+    // is stable once read.
+    let region = {
+        use crate::cap::{CapType, Rights};
+        let task_ptr =
+            crate::sched::scheduler::TASK_TABLE.get(task_id) as *const crate::sched::task::Task;
+        if task_ptr.is_null() {
+            return u64::MAX;
+        }
+        let _guard = unsafe { (*task_ptr).cap_lock.lock() };
+        let capspace = unsafe { &(*task_ptr).capspace };
+        let cap = match capspace.lookup(slot) {
+            Some(c) => *c,
+            None => return u64::MAX,
+        };
+        if cap.cap_type as u8 != CapType::Memory as u8 {
+            return u64::MAX;
+        }
+        let rw = Rights::READ.union(Rights::WRITE);
+        if !cap.rights.contains(rw) {
+            return u64::MAX;
+        }
+        match crate::cap::mmio::region(cap.object as u32) {
+            Some(r) => r,
+            None => return u64::MAX,
+        }
+    };
+
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    if aspace_id == 0 {
+        return u64::MAX;
+    }
+
+    let page = crate::mm::page::MMUPAGE_SIZE;
+    let pages = region.size / page;
+    if pages == 0 {
+        return u64::MAX;
+    }
+
+    let va =
+        crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(region.size));
+
+    let pt_root = crate::sched::scheduler::current_page_table_root();
+    let pte_flags = trapframe::device_pte_flags();
+
+    for i in 0..pages {
+        let page_va = va + i * page;
+        let page_pa = region.phys_base + i * page;
+        crate::mm::hat::map_single_mmupage(pt_root, page_va, page_pa, pte_flags);
+    }
+
+    va as u64
 }
 
 fn sys_ioport(op: u64, port: u64, value: u64) -> u64 {
