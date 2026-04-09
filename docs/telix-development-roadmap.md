@@ -244,15 +244,17 @@ Telix's message-passing architecture makes the simulation boundary **cleaner** t
 
 ## 5. Cross-Cutting Concerns
 
-### 5.1 Current Architecture Test Results (2026-04-01)
+### 5.1 Current Architecture Test Results (2026-04-09)
 
-| Architecture | Passed | Failed | Skipped | Notable Issues |
-|-------------|--------|--------|---------|----------------|
-| x86_64 | 105 | 0 | 0 | Clean; reference platform |
-| aarch64 | 105 | 0 | 0 | Clean; primary development target |
-| riscv64 | 105 | 0 | 0 | Clean |
-| loongarch64 | 88 | 3 | 7 | Failures are missing C cross-binaries only (Phase 66/72/74); remaining phases not yet reached (timeout). `#[inline(never)]` on `send()` works around LLVM release codegen bug; `ibar` after `tlbfill`/`invtlb` fixes intermittent INE. |
-| mips64el | ~10 | crashes | — | Crashes ~Phase 12; preexisting TLB/stack issues partially fixed but intermittent faults remain |
+The phase suite has grown from 105 → 175 since the previous snapshot. Phases 106–175 cover the Linux personality work (clone/futex/TLS, signal delivery, mmap features, /proc, dynamic linker, real-glibc execution, full threads, signals end-to-end, filesystem realism).
+
+| Architecture | Status | Notable Issues |
+|-------------|--------|----------------|
+| x86_64 | All 175 phases pass (with occasional timing-sensitive flakes on heavily loaded host); reference platform |
+| aarch64 | Tracks x86_64 closely; primary development target |
+| riscv64 | Tracks x86_64 closely; TRAP_SCRATCH base pointer reworked for runtime per-CPU storage (2026-04-09) |
+| loongarch64 | Equivalent to riscv64 for non-glibc phases; failures remain missing C cross-binaries only. `#[inline(never)]` on `send()` works around LLVM release codegen bug; `ibar` after `tlbfill`/`invtlb` fixes intermittent INE. |
+| mips64el | Single-CPU only; crashes in deeper phases on intermittent TLB/stack issues — work paused pending broader VM rework |
 
 ### 5.2 Development Environment
 
@@ -322,6 +324,8 @@ Load this document as context. Then specify which roadmap area you're working on
 ---
 
 ## 6. Boot-Time Configurable PAGE_MMUSHIFT
+
+**Status (2026-04-09): IMPLEMENTED.** `PAGE_MMUSHIFT` is now a runtime value sourced from the `page_mmushift=N` kernel command-line parameter (default `4` → 64 KiB). The cmdline parser in `kernel/src/boot/cmdline.rs` runs before `phys::init`, and `mm::page::page_size()` / `page_shift()` return the configured value through statics. A single kernel binary boots all four page-size configurations across every supported architecture. Sections 6.1–6.5 below are retained as the original design rationale; the relocation-patching approach (6.4) was not pursued — the variable-shift overhead proved invisible in practice.
 
 ### 6.1 Motivation
 
@@ -399,6 +403,8 @@ An **OS personality** is a translation layer that presents a specific OS's syste
 
 ### 7.2 Linux Personality
 
+**Status (2026-04-09):** Substantial in-kernel Linux syscall surface is live. Phases 168–175 exercise: `clone(CLONE_VM)` threads with futex/TLS/tkill, MAP_FIXED + VMA splitting, full Linux signal delivery (sigaction/sigprocmask/sigaltstack/SA_RESTART/rt_sigpending), `/proc/self/maps`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/sys`, `/etc` virtual files, dup'd stdio + openat absolute, batch syscall stubs, real `ld-linux` + `libc.so.6` (dynamic-PIE) execution against host glibc, plus filesystem realism (chmod/utimensat). The "personality server" is currently in-kernel rather than userspace — the split has been deferred so that the broader kernel surface stabilizes first. LTP integration is the next milestone; no LTP runs yet.
+
 #### Goal
 
 Pass a substantial subset of LTP test cases, demonstrating that Telix can run unmodified Linux binaries (ELF, dynamically linked against musl or glibc) with correct POSIX/Linux semantics.
@@ -466,11 +472,11 @@ Each personality is a separate userspace server. Multiple personalities can coex
 
 | Architecture | Kernel | Userland | QEMU Machine | Test Status |
 |-------------|--------|----------|--------------|-------------|
-| aarch64 | Full | Full | virt | 105/105 pass |
-| x86_64 | Full | Full | q35 | 105/105 pass |
-| riscv64 | Full | Full | virt | 105/105 pass |
-| loongarch64 | Full | Full (Rust) | virt | 88 pass, 3 fail (missing C bins), 7 skip |
-| mips64el | Full | Full | malta | ~10 pass, crashes ~Phase 12 |
+| aarch64 | Full | Full | virt | All 175 phases pass |
+| x86_64 | Full | Full | q35 | All 175 phases pass |
+| riscv64 | Full | Full | virt | All 175 phases pass |
+| loongarch64 | Full | Full (Rust) | virt | Phases up to ~88 pass; deeper phases blocked on missing C cross-binaries |
+| mips64el | Full | Full | malta | Single-CPU only; deep phases hit intermittent TLB/stack faults |
 
 ### 8.2 Expansion Plan — 64-bit Architectures
 
@@ -581,8 +587,9 @@ Before attempting a graphical desktop:
 
 | Dependency | Status | Notes |
 |-----------|--------|-------|
-| Linux personality (syscall compat) | Planned (Section 7) | GNOME/Firefox are Linux binaries |
+| Linux personality (syscall compat) | In progress (Section 7.2) | Dyn-linker, threads, signals, /proc all live (Phases 168–175); LTP not yet wired |
 | Dynamic linker (ld-telix) | Working | Phase 66 passes |
+| Real ld-linux + libc.so.6 (host glibc) | Working | Phase 172 passes (dynamic-PIE) |
 | Shared libraries (musl libc) | Working | Phase 52 passes |
 | VFS with writable root | Working | rootfs_srv |
 | Framebuffer / GPU driver | Not started | virtio-gpu or bochs-display in QEMU |
@@ -640,6 +647,8 @@ qemu-system-x86_64 \
 
 ## 11. Kernel Command Line & Boot Configuration
 
+**Status (2026-04-09): IMPLEMENTED.** `kernel/src/boot/cmdline.rs` parses the kernel command line into a static `BootConfig` before `phys::init`. Currently recognized keys: `page_mmushift`, `console`, `loglevel`, and `nr_cpus` (Linux-compatible cap on the runtime CPU count, used by the dynamic per-CPU storage path added 2026-04-09). Unknown keys are accepted and stored as `extra` for personality-specific use. The relocation-patching path described in 11.2 was not pursued.
+
 ### 11.1 Command Line Parsing
 
 Implement a generic kernel command line parser available before allocator init:
@@ -679,6 +688,16 @@ For configuration that must be resolved before any Rust code runs (like PAGE_MMU
 
 This means the Rust code sees PAGE_SIZE as a constant — no static-variable overhead — but the value was determined at boot time.
 
+### 11.3 Boot-Time Memory & Hardware Registration (Implemented)
+
+**Status (2026-04-09): IMPLEMENTED.** Telix has a unified, architecture-neutral firmware-discovery layer (`kernel/src/firmware/`) that every supported arch funnels into during early boot. Each per-arch boot stub parses whatever its platform actually delivers — Multiboot1 + ACPI on x86_64 (`firmware/multiboot.rs:7`, `firmware/acpi.rs:8`), Device Tree on aarch64 and riscv64 (`firmware/dtb.rs:547` and `:643`), QEMU FW_CFG on loongarch64, and YAMON argv on mips64 — and pushes the results into a small set of global, write-once registries declared in `firmware/mod.rs:100`. Storage is fixed-size, zero-allocation (`UnsafeCell + AtomicU32` counters published with `Release` and read with `Acquire`), so the firmware data is fully usable from the moment it's parsed without needing the heap or any locking discipline beyond the BSP-only-writes invariant during early boot.
+
+The unified intermediate representation captures: physical memory regions (`MemRegion { base, size }`), CPUs (`CpuDesc { id, flags }` — APIC ID on x86_64, MPIDR on aarch64, hart ID on riscv64), the interrupt controller (`IrqControllerInfo` covering GICv3 / PLIC / LAPIC+IOAPIC variants), virtio-mmio devices, an optional framebuffer descriptor, and the RISC-V `timebase-frequency`. The same data feeds three independent consumers: (1) the physical allocator at `mm/phys.rs:555`, which is invoked from `main.rs:58` with the firmware-discovered `ram_range()` so its managed window starts at `kernel_end` and never collides with the kernel image or firmware-resident pages; (2) the runtime per-CPU storage path added 2026-04-09, which calls `sched::smp::detect_cpu_count()` against `firmware::cpus()` after cmdline parsing and before `phys::init` so that the `nr_cpus=N` cap can take effect before any per-CPU slice is sized; and (3) the per-arch interrupt-controller and virtio enumeration code, which reads from the same registries rather than re-parsing platform tables.
+
+The reservation policy is simple by construction: `phys::init(ram_start, ram_end, kernel_start, kernel_end)` carves its chunk-metadata array from the front of the managed window and marks both that array and the kernel image's PFN range as allocated before exposing any pages to clients. Because the BSP runs all firmware parsing in a single-threaded, no-allocation phase before `phys::init`, parsed-in-place tables (DTB, ACPI, Multiboot info structs) are read once and then their backing pages become fair game — there is no need for a generic "reserved-region" list. Initramfs and framebuffer pages are not yet explicitly excluded; that's a known follow-up but hasn't bitten anything because the current managed window starts well above them.
+
+The remaining gap is loongarch64 and mips64, where the boot stubs currently hardcode a 256 MiB RAM window (`arch/loongarch64/mod.rs:24`, `arch/mips64/mod.rs:24`) instead of discovering it from firmware. Both archs successfully extract the kernel command line (FW_CFG and YAMON respectively), and CPU enumeration is single-CPU-only on those targets, so the hardcoded path is functionally correct for QEMU but should be replaced with real discovery before either arch is used on physical hardware.
+
 ---
 
 ## 12. Development Velocity & Prioritized Roadmap
@@ -689,10 +708,10 @@ The following order maximizes development velocity by front-loading infrastructu
 
 | Priority | Item | Section | Rationale |
 |----------|------|---------|-----------|
-| **P0** | Boot-time PAGE_MMUSHIFT | 6 | Eliminates rebuild cycles for page-size experiments; strengthens research contribution |
-| **P0** | Kernel command line parsing | 11 | Required for PAGE_MMUSHIFT; independently useful for all boot config |
-| **P1** | Linux personality (core syscalls) | 7.2 | Unlocks LTP testing; prerequisite for running real-world binaries |
-| **P1** | LTP integration | 7.2 | Quantitative correctness metric; drives bug discovery |
+| ~~**P0**~~ ✅ | Boot-time PAGE_MMUSHIFT | 6 | **Done.** Single binary boots all page-size configurations |
+| ~~**P0**~~ ✅ | Kernel command line parsing | 11 | **Done.** `BootConfig` with `page_mmushift`, `console`, `loglevel`, `nr_cpus` |
+| ~~**P1**~~ ✅ | Linux personality (core syscalls) | 7.2 | **Substantially done.** Phases 168–175 cover threads, signals, /proc, real glibc dyn-linker |
+| **P1** | LTP integration | 7.2 | Next correctness milestone; cross-compile LTP and wire `runltp` into the phase suite |
 | **P2** | Swap subsystem | 9 | Enables workloads that exceed physical RAM |
 | **P2** | NTFS read-only | 2.2 | First real filesystem; highest interop value |
 | **P2** | Homa transport | 3.1 | Native network transport aligned with IPC model |
@@ -834,6 +853,7 @@ The full phase-by-phase roadmap with dependencies is in [`docs/roadmap.md`](road
 
 | Date | Change |
 |------|--------|
+| 2026-04-09 | Status refresh: marked PAGE_MMUSHIFT (§6), kernel command line (§11), and core Linux personality (§7.2) as implemented; documented the boot-time memory & hardware registration system (§11.3); updated test result tables (§5.1, §8.1) for the 175-phase suite; added `nr_cpus` runtime per-CPU storage note; demoted P0/P1 items in §12.1 that are now complete |
 | 2026-04-01 | Integrated specialized design docs (driver model, personality servers, tracing, network/storage I/O, graphics, 32-bit compat) as Sections 13–18; added detailed phase roadmap cross-reference (Section 19); updated test results to current state (LoongArch64 88/3/7, RISC-V 105/105) |
 | 2026-03-30 | Expanded roadmap: boot-time PAGE_MMUSHIFT, Linux personality + LTP, multi-architecture plan (s390x, ppc64, sparc64, 32-bit targets), swap subsystem, graphical desktop (Xwayland + GNOME + Firefox), kernel command line parsing, prioritized development order |
 | 2026-03-30 | Initial roadmap created from extended design discussion covering filesystems (ZFS, btrfs, NTFS, bcachefs, APFS, ReFS), networking (eBPF, XDP, io_uring, Homa, QUIC), and SmartNIC/DPU offloading with QEMU simulation strategy |
