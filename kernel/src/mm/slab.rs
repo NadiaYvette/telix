@@ -228,7 +228,8 @@ impl SlabCache {
 
 // --- Per-CPU magazine layer ---
 
-use crate::sched::smp::MAX_CPUS;
+use crate::sched::smp;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 /// Magazine capacity. Reduced for very high CPU counts to limit .bss usage.
 #[cfg(any(feature = "max_cpus_1024", feature = "max_cpus_4096"))]
@@ -293,13 +294,35 @@ impl MagazinePair {
 }
 
 /// Per-CPU, per-cache magazine pairs.
-/// Indexed as CPU_MAGAZINES[cpu][cache_index].
+/// Stored in a dynamic per-CPU slice installed by `init_dynamic_percpu`
+/// from `smp::init_dynamic_percpu` after `phys::init`. Each entry is a row
+/// of `NUM_CACHES` magazine pairs. The all-zero pattern (from
+/// `alloc_static_slice`) matches `MagazinePair::empty()`, so no explicit
+/// initialization is needed.
+///
 /// Safety: accessed only with IRQs disabled from the owning CPU.
-static mut CPU_MAGAZINES: [[MagazinePair; NUM_CACHES]; MAX_CPUS] = {
-    const PAIR: MagazinePair = MagazinePair::empty();
-    const ROW: [MagazinePair; NUM_CACHES] = [PAIR; NUM_CACHES];
-    [ROW; MAX_CPUS]
-};
+static CPU_MAGAZINES_PTR: AtomicPtr<[MagazinePair; NUM_CACHES]> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn cpu_magazine_row(cpu: usize) -> *mut [MagazinePair; NUM_CACHES] {
+    let base = CPU_MAGAZINES_PTR.load(Ordering::Relaxed);
+    debug_assert!(!base.is_null(), "CPU_MAGAZINES not init");
+    debug_assert!(cpu < smp::num_cpus());
+    unsafe { base.add(cpu) }
+}
+
+/// Allocate and install the dynamic per-CPU magazine slice. Called from
+/// `smp::init_dynamic_percpu` after `phys::init`. Slabs are unused before
+/// this point — early kernel allocations go through `phys::alloc_pages`
+/// directly — so the global caches remain authoritative until installed.
+pub(crate) fn init_dynamic_percpu() {
+    let n = smp::num_cpus();
+    unsafe {
+        let s = crate::mm::phys::alloc_static_slice::<[MagazinePair; NUM_CACHES]>(n);
+        CPU_MAGAZINES_PTR.store(s.as_mut_ptr(), Ordering::Release);
+    }
+}
 
 // --- Global slab caches for common kernel object sizes ---
 
@@ -370,7 +393,7 @@ pub fn alloc(size: usize) -> Option<PhysAddr> {
     let saved = crate::sync::spinlock::arch_disable_irqs();
     let cpu = crate::sched::smp::cpu_id() as usize;
 
-    let mag = unsafe { &mut CPU_MAGAZINES[cpu][idx] };
+    let mag = unsafe { &mut (*cpu_magazine_row(cpu))[idx] };
 
     // Fast path 1: pop from loaded magazine.
     if !mag.loaded.is_empty() {
@@ -396,7 +419,7 @@ pub fn alloc(size: usize) -> Option<PhysAddr> {
     // Re-read cpu_id: we may have migrated while IRQs were enabled.
     let saved2 = crate::sync::spinlock::arch_disable_irqs();
     let cpu = crate::sched::smp::cpu_id() as usize;
-    let mag = unsafe { &mut CPU_MAGAZINES[cpu][idx] };
+    let mag = unsafe { &mut (*cpu_magazine_row(cpu))[idx] };
     while (mag.loaded.count as usize) < MAG_CAPACITY {
         match guard.alloc() {
             Some(pa) => mag.loaded.push(pa.as_usize()),
@@ -425,7 +448,7 @@ pub fn free(addr: PhysAddr, size: usize) {
 
     let saved = crate::sync::spinlock::arch_disable_irqs();
     let cpu = crate::sched::smp::cpu_id() as usize;
-    let mag = unsafe { &mut CPU_MAGAZINES[cpu][idx] };
+    let mag = unsafe { &mut (*cpu_magazine_row(cpu))[idx] };
 
     // Fast path 1: push to loaded magazine.
     if !mag.loaded.is_full() {
@@ -465,7 +488,7 @@ pub fn free(addr: PhysAddr, size: usize) {
 /// Drain all magazines for a CPU (call on hotplug offline).
 pub fn drain_cpu(cpu: u32) {
     let cpu = cpu as usize;
-    if cpu >= MAX_CPUS {
+    if cpu >= smp::num_cpus() {
         return;
     }
 
@@ -473,7 +496,7 @@ pub fn drain_cpu(cpu: u32) {
         let cache = cache_by_index(idx);
         let mut guard = cache.lock();
 
-        let mag = unsafe { &mut CPU_MAGAZINES[cpu][idx] };
+        let mag = unsafe { &mut (*cpu_magazine_row(cpu))[idx] };
         // Drain loaded.
         while !mag.loaded.is_empty() {
             let addr = mag.loaded.pop();
@@ -498,8 +521,8 @@ pub fn print_stats() {
         let c = cache.lock();
         // Count objects cached in magazines across all CPUs.
         let mut mag_cached = 0usize;
-        for cpu in 0..MAX_CPUS {
-            let mag = unsafe { &CPU_MAGAZINES[cpu][i] };
+        for cpu in 0..smp::num_cpus() {
+            let mag = unsafe { &(*cpu_magazine_row(cpu))[i] };
             mag_cached += mag.loaded.count as usize + mag.backup.count as usize;
         }
         crate::println!(

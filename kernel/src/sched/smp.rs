@@ -83,6 +83,8 @@ pub fn init_dynamic_percpu() {
     super::hotplug::init_dynamic_percpu();
     super::topology::init_dynamic_percpu();
     crate::sync::rcu::init_dynamic_percpu();
+    crate::mm::phys::init_dynamic_percpu();
+    crate::mm::slab::init_dynamic_percpu();
 }
 
 /// Per-hart trap scratch data for RISC-V tp/sscratch swap convention.

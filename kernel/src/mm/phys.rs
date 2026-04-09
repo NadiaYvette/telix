@@ -11,7 +11,7 @@
 //! - Multi-page allocation uses a separate lock (rare path)
 
 use super::page::{self, PhysAddr};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 /// Pages per chunk — matches one u64 bitmap.
 const CHUNK_PAGES: usize = 64;
@@ -25,7 +25,7 @@ const INLINE_K: u32 = 6;
 const NO_CPU: u32 = 0x7F;
 const NO_CHUNK: usize = usize::MAX;
 
-use crate::sched::smp::MAX_CPUS;
+use crate::sched::smp;
 
 // ── ChunkNode ────────────────────────────────────────────────────────
 
@@ -164,11 +164,45 @@ unsafe fn cas_bitmap(pa: usize, old: u64, new: u64) -> Result<u64, u64> {
 /// Per-CPU reservation: the chunk index this CPU "owns" for fast allocation.
 /// Accessed only by the owning CPU (with IRQs disabled in the allocator path),
 /// so no atomics needed. Stored as usize for alignment; NO_CHUNK = no reservation.
-static mut CPU_RESERVATION: [usize; MAX_CPUS] = [NO_CHUNK; MAX_CPUS];
+///
+/// Tier-1 bootstrap: a single-slot static used by the BSP from the moment
+/// `phys::init` first calls into the allocator until `init_dynamic_percpu`
+/// installs the real per-CPU slice. Necessary because `alloc_static_slice`
+/// itself runs through the allocator, which reads CPU_RESERVATION on the
+/// fast path. Once swapped, the bootstrap slot is never read again.
+static mut CPU_RESERVATION_BOOT: usize = NO_CHUNK;
+
+/// Pointer to the per-CPU reservation array. Initially aliases the
+/// Tier-1 bootstrap slot; `init_dynamic_percpu` swaps it for a fully
+/// sized dynamic slice (after copying the bootstrap value into slot 0).
+static CPU_RESERVATION_PTR: AtomicPtr<usize> =
+    AtomicPtr::new(&raw mut CPU_RESERVATION_BOOT);
+
+#[inline]
+fn cpu_reservation_at(cpu: usize) -> *mut usize {
+    let base = CPU_RESERVATION_PTR.load(Ordering::Relaxed);
+    debug_assert!(!base.is_null());
+    unsafe { base.add(cpu) }
+}
 
 #[inline]
 fn my_cpu() -> usize {
     crate::sched::smp::cpu_id() as usize
+}
+
+/// Allocate and install the dynamic per-CPU reservation slice. Called from
+/// `smp::init_dynamic_percpu` after `phys::init`. Copies the BSP's existing
+/// bootstrap reservation into slot 0 of the new slice before publishing.
+pub(crate) fn init_dynamic_percpu() {
+    let n = smp::num_cpus();
+    unsafe {
+        let s = alloc_static_slice::<usize>(n);
+        for slot in s.iter_mut() {
+            *slot = NO_CHUNK;
+        }
+        s[0] = CPU_RESERVATION_BOOT;
+        CPU_RESERVATION_PTR.store(s.as_mut_ptr(), Ordering::Release);
+    }
 }
 
 // ── Allocator ────────────────────────────────────────────────────────
@@ -667,7 +701,7 @@ pub fn alloc_page() -> Option<PhysAddr> {
 
     // Fast path: try the per-CPU reserved chunk.
     let reserved = if can_reserve {
-        unsafe { CPU_RESERVATION[cpu] }
+        unsafe { *cpu_reservation_at(cpu) }
     } else {
         NO_CHUNK
     };
@@ -678,7 +712,7 @@ pub fn alloc_page() -> Option<PhysAddr> {
             let s = ALLOC.chunk(reserved).load();
             if free_count(s) == 0 {
                 unsafe {
-                    CPU_RESERVATION[cpu] = NO_CHUNK;
+                    *cpu_reservation_at(cpu) = NO_CHUNK;
                 }
                 // Clear owner in chunk node.
                 loop {
@@ -693,7 +727,7 @@ pub fn alloc_page() -> Option<PhysAddr> {
         }
         // Reservation exhausted; release it.
         unsafe {
-            CPU_RESERVATION[cpu] = NO_CHUNK;
+            *cpu_reservation_at(cpu) = NO_CHUNK;
         }
         loop {
             let cur = ALLOC.chunk(reserved).load();
@@ -730,7 +764,7 @@ pub fn alloc_page() -> Option<PhysAddr> {
         }
 
         unsafe {
-            CPU_RESERVATION[cpu] = ci;
+            *cpu_reservation_at(cpu) = ci;
         }
 
         if let Some(pi) = chunk_alloc_one(ci) {
@@ -739,7 +773,7 @@ pub fn alloc_page() -> Option<PhysAddr> {
             let s2 = ALLOC.chunk(ci).load();
             if free_count(s2) == 0 {
                 unsafe {
-                    CPU_RESERVATION[cpu] = NO_CHUNK;
+                    *cpu_reservation_at(cpu) = NO_CHUNK;
                 }
                 loop {
                     let cur = ALLOC.chunk(ci).load();
