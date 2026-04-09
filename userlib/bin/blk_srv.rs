@@ -503,14 +503,15 @@ impl BlkDev {
 
     /// PCI MMIO transport init for LoongArch64 (memory-mapped BAR0).
     #[cfg(target_arch = "loongarch64")]
-    fn init(bar0_phys: usize, irq: u32) -> Option<Self> {
-        // Map BAR0 into userspace via mmap_device.
-        let mmio_va = syscall::mmap_device(bar0_phys, 1)?;
+    fn init(mmio_slot: usize, irq: u32) -> Option<Self> {
+        // Map BAR0 via the cap-based MMIO path (kernel pre-granted a
+        // Memory cap at `mmio_slot`).
+        let mmio_va = syscall::mmio_map_cap(mmio_slot)?;
 
         syscall::debug_puts(b"  [blk_srv] PCI BAR0 mapped at VA ");
         print_hex(mmio_va as u64);
-        syscall::debug_puts(b" (phys ");
-        print_hex(bar0_phys as u64);
+        syscall::debug_puts(b" (slot ");
+        print_num(mmio_slot as u64);
         syscall::debug_puts(b")\n");
 
         // Reset.
@@ -791,16 +792,15 @@ impl BlkDev {
 fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     // Unpack device info from arg0: irq in bits 48-63, low bits meaning
     // depends on transport:
-    //   - virtio-mmio (aarch64/riscv64): low 16 bits = MMIO cap slot
-    //     (granted by the kernel before spawn); call sys_mmio_map_cap.
+    //   - virtio-mmio (aarch64/riscv64) + PCI MMIO (loongarch64):
+    //     low 16 bits = MMIO cap slot (granted by the kernel before spawn);
+    //     call sys_mmio_map_cap.
     //   - PCI I/O ports (x86_64/mips64): low 48 bits = BAR0 port number.
-    //   - PCI MMIO (loongarch64): low 48 bits = BAR0 physical address
-    //     (still goes through the legacy sys_mmap_device for now).
     let irq = (arg0 >> 48) as u32;
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64")))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
     let base = (arg0 & 0xFFFF) as usize; // mmio cap slot
-    #[cfg(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64"))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
     let base = (arg0 & 0xFFFF_FFFF_FFFF) as usize;
 
     syscall::debug_puts(b"  [blk_srv] starting, base=");

@@ -275,19 +275,33 @@ fn startup_thread() -> ! {
     }
 
     // LoongArch64: Discover virtio devices via PCI ECAM scan.
+    // PCI BARs aren't in the firmware mem-region table; register them
+    // dynamically here so drivers can map them via sys_mmio_map_cap.
     #[cfg(target_arch = "loongarch64")]
     {
         println!("  Scanning PCI bus for virtio devices (ECAM)...");
         if let Some(dev) = arch::loongarch64::pci::find_virtio_device(0x1001) {
-            let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
-            match sched::spawn_user(b"blk_srv", 50, 20, arg0) {
+            let region_id =
+                cap::mmio::register_region(dev.bar0, 0x1000, cap::mmio::CacheAttr::Device);
+            let arg0_upper = (dev.irq as u64) << 48;
+            let spawned = match region_id {
+                Some(rid) => sched::spawn_user_with_mmio_cap(b"blk_srv", 50, 20, arg0_upper, rid),
+                None => sched::spawn_user(b"blk_srv", 50, 20, (dev.bar0 as u64) | arg0_upper),
+            };
+            match spawned {
                 Some(tid) => println!("  blk_srv spawned (thread {})", tid),
                 None => println!("  WARNING: blk_srv not found (ok if not yet built)"),
             }
         }
         if let Some(dev) = arch::loongarch64::pci::find_virtio_device(0x1000) {
-            let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
-            match sched::spawn_user(b"net_srv", 50, 20, arg0) {
+            let region_id =
+                cap::mmio::register_region(dev.bar0, 0x1000, cap::mmio::CacheAttr::Device);
+            let arg0_upper = (dev.irq as u64) << 48;
+            let spawned = match region_id {
+                Some(rid) => sched::spawn_user_with_mmio_cap(b"net_srv", 50, 20, arg0_upper, rid),
+                None => sched::spawn_user(b"net_srv", 50, 20, (dev.bar0 as u64) | arg0_upper),
+            };
+            match spawned {
                 Some(tid) => println!("  net_srv spawned (thread {})", tid),
                 None => println!("  WARNING: net_srv not found (ok if not yet built)"),
             }

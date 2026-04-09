@@ -736,8 +736,8 @@ impl NetDev {
 
     /// PCI MMIO transport init for LoongArch64 (memory-mapped BAR0).
     #[cfg(target_arch = "loongarch64")]
-    fn init(bar0_phys: usize, irq: u32) -> Option<Self> {
-        let mmio_va = syscall::mmap_device(bar0_phys, 1)?;
+    fn init(mmio_slot: usize, irq: u32) -> Option<Self> {
+        let mmio_va = syscall::mmio_map_cap(mmio_slot)?;
 
         syscall::debug_puts(b"  [net_srv] PCI BAR0 mapped at VA ");
         print_hex(mmio_va as u64);
@@ -1630,9 +1630,9 @@ impl NetDev {
 #[unsafe(no_mangle)]
 fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let irq = (arg0 >> 48) as u32;
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64")))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
     let base = (arg0 & 0xFFFF) as usize; // mmio cap slot
-    #[cfg(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64"))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
     let base = (arg0 & 0xFFFF_FFFF_FFFF) as usize;
 
     syscall::debug_puts(b"  [net_srv] starting, base=");
