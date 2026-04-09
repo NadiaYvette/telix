@@ -167,11 +167,14 @@ _trap_entry:
     beqz    $t1, .restore_to_kernel
 
 .restore_to_user:
-    // Returning to user mode: set SAVE0 = &TRAP_SCRATCH_ARRAY[cpu_id].
+    // Returning to user mode: set SAVE0 = &TRAP_SCRATCH[cpu_id].
+    // TRAP_SCRATCH_BASE holds a pointer to the dynamic per-CPU TrapScratch
+    // slice (installed by smp::init_dynamic_percpu after phys::init).
     csrrd   $t0, 0x20               // t0 = CSR.CPUID
-    la.pcrel $t1, TRAP_SCRATCH_ARRAY
+    la.pcrel $t1, TRAP_SCRATCH_BASE
+    ld.d    $t1, $t1, 0             // t1 = base of TrapScratch slice
     slli.d  $t0, $t0, 5             // t0 = cpu_id * 32 (sizeof TrapScratch)
-    add.d   $t1, $t1, $t0           // t1 = &TRAP_SCRATCH_ARRAY[cpu_id]
+    add.d   $t1, $t1, $t0           // t1 = &TRAP_SCRATCH[cpu_id]
 
     // Store kernel_sp for the next user trap.
     addi.d  $t0, $sp, 280

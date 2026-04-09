@@ -163,11 +163,14 @@ _trap_entry:
     sret
 
 .restore_to_user:
-    // Returning to U-mode: set sscratch = &TRAP_SCRATCH_ARRAY[cpu_id].
+    // Returning to U-mode: set sscratch = &TRAP_SCRATCH[cpu_id].
     // tp = cpu_id (preserved by Rust calling convention across trap_handler call).
-    la      t0, TRAP_SCRATCH_ARRAY
+    // TRAP_SCRATCH_BASE holds a pointer to the dynamic per-CPU TrapScratch
+    // slice (installed by smp::init_dynamic_percpu after phys::init).
+    la      t0, TRAP_SCRATCH_BASE
+    ld      t0, 0(t0)               // t0 = base of TrapScratch slice
     slli    t1, tp, 5               // t1 = cpu_id * 32 (sizeof TrapScratch)
-    add     t0, t0, t1              // t0 = &TRAP_SCRATCH_ARRAY[cpu_id]
+    add     t0, t0, t1              // t0 = &TRAP_SCRATCH[cpu_id]
 
     // Store kernel_sp for the next user trap.
     addi    t1, sp, 272

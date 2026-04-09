@@ -500,33 +500,18 @@ pub fn setup_signal_entry(
 
 /// Update the kernel stack pointer for the next thread on context switches.
 /// x86_64: writes TSS RSP0 for ring 3→0 transitions.
-/// riscv64: writes TRAP_SCRATCH_ARRAY[cpu].kernel_sp for user ecall entry.
+/// riscv64/loongarch64/mips64: writes TrapScratch.kernel_sp for the
+/// current CPU so the next user→kernel trap entry loads the right stack.
 #[inline]
 pub fn update_kernel_stack(_next_kstack_top: usize) {
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::gdt::set_rsp0(_next_kstack_top as u64);
 
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
     {
         let cpu = crate::arch::cpu::cpu_id() as usize;
         unsafe {
-            crate::sched::smp::TRAP_SCRATCH_ARRAY[cpu].kernel_sp = _next_kstack_top as u64;
-        }
-    }
-
-    #[cfg(target_arch = "loongarch64")]
-    {
-        let cpu = crate::arch::cpu::cpu_id() as usize;
-        unsafe {
-            crate::sched::smp::TRAP_SCRATCH_ARRAY[cpu].kernel_sp = _next_kstack_top as u64;
-        }
-    }
-
-    #[cfg(target_arch = "mips64")]
-    {
-        let cpu = crate::arch::cpu::cpu_id() as usize;
-        unsafe {
-            crate::sched::smp::TRAP_SCRATCH_ARRAY[cpu].kernel_sp = _next_kstack_top as u64;
+            (*crate::sched::smp::trap_scratch_for(cpu)).kernel_sp = _next_kstack_top as u64;
         }
     }
 }

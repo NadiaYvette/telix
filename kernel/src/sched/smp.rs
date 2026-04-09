@@ -86,6 +86,10 @@ pub fn init_dynamic_percpu() {
     crate::mm::phys::init_dynamic_percpu();
     crate::mm::slab::init_dynamic_percpu();
 
+    // TrapScratch slice (riscv64/loongarch64/mips64 only).
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
+    init_dynamic_percpu_trap_scratch();
+
     // Per-arch AP stack regions.
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::smp::init_dynamic_percpu();
@@ -95,33 +99,15 @@ pub fn init_dynamic_percpu() {
     crate::arch::riscv64::smp::init_dynamic_percpu();
 }
 
-/// Per-hart trap scratch data for RISC-V tp/sscratch swap convention.
-/// Accessed from vectors.S — layout and symbol name must stay in sync.
-#[cfg(target_arch = "riscv64")]
-#[repr(C, align(32))]
-pub struct TrapScratch {
-    pub kernel_sp: u64, // offset 0: kernel stack pointer for user traps
-    pub cpu_id: u64,    // offset 8: this hart's CPU ID
-    pub user_sp: u64,   // offset 16: temporary save of user sp during trap entry
-    pub _pad: u64,      // offset 24: padding to 32 bytes
-}
-
-#[cfg(target_arch = "riscv64")]
-#[unsafe(no_mangle)]
-pub static mut TRAP_SCRATCH_ARRAY: [TrapScratch; MAX_CPUS] = {
-    const INIT: TrapScratch = TrapScratch {
-        kernel_sp: 0,
-        cpu_id: 0,
-        user_sp: 0,
-        _pad: 0,
-    };
-    [INIT; MAX_CPUS]
-};
-
-/// Per-CPU trap scratch data for LoongArch64.
-/// CSR.SAVE0 points to &TRAP_SCRATCH_ARRAY[cpu] when in user mode (0 in kernel mode).
-/// Accessed from vectors.S — layout and symbol name must stay in sync.
-#[cfg(target_arch = "loongarch64")]
+/// Per-CPU trap scratch data, used by archs whose user→kernel trap entry
+/// loads the kernel sp from a CPU-local scratch register that points into
+/// this slice. Layout and size are referenced from vectors.S — keep in
+/// sync (size must be 32 bytes; field offsets baked into asm).
+///
+/// - RISC-V: sscratch = &TRAP_SCRATCH[cpu] in U-mode, 0 in S-mode
+/// - LoongArch64: SAVE0 = &TRAP_SCRATCH[cpu] in user mode, 0 in kernel
+/// - MIPS64 (single-CPU): KScratch0 = &TRAP_SCRATCH[0]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
 #[repr(C, align(32))]
 pub struct TrapScratch {
     pub kernel_sp: u64, // offset 0
@@ -130,41 +116,50 @@ pub struct TrapScratch {
     pub _pad: u64,      // offset 24
 }
 
-#[cfg(target_arch = "loongarch64")]
+/// Pointer to the dynamic per-CPU TrapScratch slice. Trap vector asm reads
+/// this symbol (`ld base, TRAP_SCRATCH_BASE`) then indexes by cpu_id to
+/// compute `&TRAP_SCRATCH[cpu]` on the user-return path.
+///
+/// `#[no_mangle]` because vectors.S references it by name.
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
 #[unsafe(no_mangle)]
-pub static mut TRAP_SCRATCH_ARRAY: [TrapScratch; MAX_CPUS] = {
-    const INIT: TrapScratch = TrapScratch {
-        kernel_sp: 0,
-        cpu_id: 0,
-        user_sp: 0,
-        _pad: 0,
-    };
-    [INIT; MAX_CPUS]
-};
+pub static mut TRAP_SCRATCH_BASE: u64 = 0;
 
-/// Per-CPU trap scratch data for MIPS64.
-/// KScratch0 (CP0 $31 sel 2) points to &TRAP_SCRATCH_ARRAY[cpu] when in user mode (0 in kernel).
-/// Accessed from vectors.S — layout and symbol name must stay in sync.
-#[cfg(target_arch = "mips64")]
-#[repr(C, align(32))]
-pub struct TrapScratch {
-    pub kernel_sp: u64, // offset 0
-    pub cpu_id: u64,    // offset 8
-    pub user_sp: u64,   // offset 16
-    pub _pad: u64,      // offset 24
+/// Rust-side accessor: pointer to the dynamic TrapScratch slice. Mirrors
+/// `TRAP_SCRATCH_BASE` (kept in lockstep at init time).
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
+static TRAP_SCRATCH_PTR: AtomicPtr<TrapScratch> = AtomicPtr::new(core::ptr::null_mut());
+
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
+#[inline]
+fn trap_scratch_at(cpu: usize) -> *mut TrapScratch {
+    let base = TRAP_SCRATCH_PTR.load(Ordering::Relaxed);
+    debug_assert!(!base.is_null(), "TRAP_SCRATCH not init");
+    debug_assert!(cpu < num_cpus());
+    unsafe { base.add(cpu) }
 }
 
-#[cfg(target_arch = "mips64")]
-#[unsafe(no_mangle)]
-pub static mut TRAP_SCRATCH_ARRAY: [TrapScratch; MAX_CPUS] = {
-    const INIT: TrapScratch = TrapScratch {
-        kernel_sp: 0,
-        cpu_id: 0,
-        user_sp: 0,
-        _pad: 0,
-    };
-    [INIT; MAX_CPUS]
-};
+/// Get a pointer to the per-CPU TrapScratch entry. Used by `trapframe.rs`
+/// when installing a kernel stack for a thread that's about to return to
+/// user mode.
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
+pub fn trap_scratch_for(cpu: usize) -> *mut TrapScratch {
+    trap_scratch_at(cpu)
+}
+
+/// Allocate the dynamic TrapScratch slice and publish both `TRAP_SCRATCH_PTR`
+/// (Rust) and `TRAP_SCRATCH_BASE` (asm symbol). Called from
+/// `init_dynamic_percpu` after `phys::init`.
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
+pub(crate) fn init_dynamic_percpu_trap_scratch() {
+    let n = num_cpus();
+    unsafe {
+        let s = crate::mm::phys::alloc_static_slice::<TrapScratch>(n);
+        let ptr = s.as_mut_ptr();
+        TRAP_SCRATCH_PTR.store(ptr, Ordering::Release);
+        TRAP_SCRATCH_BASE = ptr as u64;
+    }
+}
 
 /// Per-CPU data. Each CPU has its own instance, accessed lock-free by cpu_id().
 pub struct PerCpuData {
@@ -226,10 +221,10 @@ pub fn current() -> &'static PerCpuData {
 pub fn init_bsp(idle_thread: ThreadId) {
     crate::arch::cpu::init_bsp_cpu_id();
 
-    // Update trap scratch array for boot CPU.
+    // Update trap scratch entry for boot CPU.
     #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
     unsafe {
-        TRAP_SCRATCH_ARRAY[0].cpu_id = 0;
+        (*trap_scratch_at(0)).cpu_id = 0;
     }
 
     let pcpu = get(0);
@@ -243,7 +238,7 @@ pub fn init_bsp(idle_thread: ThreadId) {
 pub fn init_ap(cpu: u32, idle_thread: ThreadId) {
     #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
     unsafe {
-        TRAP_SCRATCH_ARRAY[cpu as usize].cpu_id = cpu as u64;
+        (*trap_scratch_at(cpu as usize)).cpu_id = cpu as u64;
     }
 
     let pcpu = get(cpu);

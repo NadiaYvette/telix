@@ -90,8 +90,11 @@ _trap_entry:
     move    $k0, $sp               // k0 = user sp
     move    $k1, $ra               // k1 = user ra
 
-    // Load TrapScratch pointer. Single-CPU: use TRAP_SCRATCH_ARRAY[0].
-    dla     $sp, TRAP_SCRATCH_ARRAY // sp = &TRAP_SCRATCH_ARRAY (KSEG0 address)
+    // Load TrapScratch pointer. Single-CPU: use TRAP_SCRATCH[0].
+    // TRAP_SCRATCH_BASE holds a pointer to the dynamic per-CPU TrapScratch
+    // slice (installed by smp::init_dynamic_percpu after phys::init).
+    dla     $sp, TRAP_SCRATCH_BASE // sp = &TRAP_SCRATCH_BASE
+    ld      $sp, 0($sp)            // sp = base of TrapScratch slice = &TrapScratch[0]
     sd      $k0, 16($sp)           // TrapScratch.user_sp = user sp
     ld      $sp, 0($sp)            // sp = TrapScratch.kernel_sp
 
@@ -201,7 +204,8 @@ _trap_entry:
 .restore_to_user:
     // Save kernel_sp to TrapScratch before returning to user.
     daddiu  $t0, $sp, 288
-    dla     $t1, TRAP_SCRATCH_ARRAY
+    dla     $t1, TRAP_SCRATCH_BASE
+    ld      $t1, 0($t1)             // t1 = base of TrapScratch slice = &TrapScratch[0]
     sd      $t0, 0($t1)             // TrapScratch.kernel_sp = stack_top
 
     // Restore registers.
