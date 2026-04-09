@@ -46,6 +46,8 @@ pub(crate) fn init_dynamic_percpu() {
         let s = crate::mm::phys::alloc_static_slice::<u8>(total);
         AP_STACKS_PTR.store(s.as_mut_ptr(), Ordering::Release);
     }
+    // Per-AP GDT/TSS slices.
+    super::gdt::init_dynamic_percpu();
 }
 
 /// Start secondary CPUs via INIT-SIPI-SIPI.

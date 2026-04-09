@@ -3,9 +3,20 @@
 //! Defines kernel and user code/data segments, plus a per-CPU TSS for
 //! ring 3→0 transitions. Each CPU gets its own GDT and TSS so that
 //! RSP0 can be updated independently on SMP systems.
+//!
+//! Storage layout (Tier-1 bootstrap + Tier-2 dynamic):
+//! - BSP (cpu 0) uses `PER_CPU_GDT_BOOT` / `PER_CPU_TSS_BOOT` — single
+//!   static slot. The BSP runs `init()` very early in boot, before
+//!   `phys::init`, so dynamic allocation isn't available yet. Once the
+//!   GDT is loaded into GDTR (a CPU register holding a pointer), the
+//!   storage cannot move, so the BSP keeps using the bootstrap forever.
+//! - APs use `PER_CPU_GDT_AP` / `PER_CPU_TSS_AP` — dynamic slices
+//!   allocated by `init_dynamic_percpu()` after `phys::init`, sized
+//!   `num_cpus() - 1` and indexed by `(cpu - 1)`.
 
-use crate::sched::smp::MAX_CPUS;
+use crate::sched::smp;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_DS: u16 = 0x10;
@@ -40,49 +51,109 @@ struct PerCpuGdt {
     entries: [u64; 7],
 }
 
-/// Per-CPU GDT and TSS arrays.
-static mut PER_CPU_GDT: [PerCpuGdt; MAX_CPUS] = {
-    const INIT: PerCpuGdt = PerCpuGdt {
-        entries: [
-            0x0000_0000_0000_0000, // 0x00: Null
-            0x00AF_9A00_0000_FFFF, // 0x08: Kernel code (64-bit, DPL=0)
-            0x00CF_9200_0000_FFFF, // 0x10: Kernel data (DPL=0)
-            0x00CF_F200_0000_FFFF, // 0x18: User data (DPL=3)
-            0x00AF_FA00_0000_FFFF, // 0x20: User code (64-bit, DPL=3)
-            0,                     // 0x28: TSS low (filled at runtime)
-            0,                     // 0x30: TSS high (filled at runtime)
-        ],
-    };
-    [INIT; MAX_CPUS]
+/// Initial GDT entries (filled in at runtime for the TSS slots).
+const GDT_INIT: PerCpuGdt = PerCpuGdt {
+    entries: [
+        0x0000_0000_0000_0000, // 0x00: Null
+        0x00AF_9A00_0000_FFFF, // 0x08: Kernel code (64-bit, DPL=0)
+        0x00CF_9200_0000_FFFF, // 0x10: Kernel data (DPL=0)
+        0x00CF_F200_0000_FFFF, // 0x18: User data (DPL=3)
+        0x00AF_FA00_0000_FFFF, // 0x20: User code (64-bit, DPL=3)
+        0,                     // 0x28: TSS low (filled at runtime)
+        0,                     // 0x30: TSS high (filled at runtime)
+    ],
 };
 
-static mut PER_CPU_TSS: [Tss; MAX_CPUS] = {
-    const INIT: Tss = Tss {
-        reserved0: 0,
-        rsp0: 0,
-        rsp1: 0,
-        rsp2: 0,
-        reserved1: 0,
-        ist: [0; 7],
-        reserved2: 0,
-        reserved3: 0,
-        iopb_offset: size_of::<Tss>() as u16,
-    };
-    [INIT; MAX_CPUS]
+const TSS_INIT: Tss = Tss {
+    reserved0: 0,
+    rsp0: 0,
+    rsp1: 0,
+    rsp2: 0,
+    reserved1: 0,
+    ist: [0; 7],
+    reserved2: 0,
+    reserved3: 0,
+    iopb_offset: size_of::<Tss>() as u16,
 };
+
+/// Tier-1 bootstrap GDT/TSS for the BSP. Loaded into GDTR at very early
+/// boot (before phys::init), so the storage must be statically known and
+/// cannot move afterwards.
+static mut PER_CPU_GDT_BOOT: PerCpuGdt = GDT_INIT;
+static mut PER_CPU_TSS_BOOT: Tss = TSS_INIT;
+
+/// Tier-2 dynamic per-CPU GDT/TSS for APs. Allocated by
+/// `init_dynamic_percpu()` after `phys::init`. Sized `num_cpus() - 1` and
+/// indexed by `(cpu - 1)` so slot 0 (BSP) is not wasted.
+static PER_CPU_GDT_AP_PTR: AtomicPtr<PerCpuGdt> = AtomicPtr::new(core::ptr::null_mut());
+static PER_CPU_TSS_AP_PTR: AtomicPtr<Tss> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Allocate the AP per-CPU GDT/TSS slices. Called from
+/// `smp::init_dynamic_percpu` after `phys::init`. Initializes each AP
+/// slot with the same GDT_INIT/TSS_INIT pattern as the bootstrap.
+pub(crate) fn init_dynamic_percpu() {
+    let n = smp::num_cpus();
+    if n <= 1 {
+        return; // Single-CPU mode: no APs.
+    }
+    let aps = n - 1;
+    unsafe {
+        let g = crate::mm::phys::alloc_static_slice::<PerCpuGdt>(aps);
+        for slot in g.iter_mut() {
+            *slot = GDT_INIT;
+        }
+        PER_CPU_GDT_AP_PTR.store(g.as_mut_ptr(), Ordering::Release);
+
+        let t = crate::mm::phys::alloc_static_slice::<Tss>(aps);
+        for slot in t.iter_mut() {
+            *slot = TSS_INIT;
+        }
+        PER_CPU_TSS_AP_PTR.store(t.as_mut_ptr(), Ordering::Release);
+    }
+}
+
+/// Pointer to this CPU's GDT storage. BSP uses bootstrap, APs use the
+/// dynamic slice.
+#[inline]
+fn gdt_for(cpu: usize) -> *mut PerCpuGdt {
+    if cpu == 0 {
+        &raw mut PER_CPU_GDT_BOOT
+    } else {
+        let base = PER_CPU_GDT_AP_PTR.load(Ordering::Relaxed);
+        debug_assert!(!base.is_null(), "PER_CPU_GDT_AP not init");
+        debug_assert!(cpu < smp::num_cpus());
+        unsafe { base.add(cpu - 1) }
+    }
+}
+
+/// Pointer to this CPU's TSS storage. BSP uses bootstrap, APs use the
+/// dynamic slice.
+#[inline]
+fn tss_for(cpu: usize) -> *mut Tss {
+    if cpu == 0 {
+        &raw mut PER_CPU_TSS_BOOT
+    } else {
+        let base = PER_CPU_TSS_AP_PTR.load(Ordering::Relaxed);
+        debug_assert!(!base.is_null(), "PER_CPU_TSS_AP not init");
+        debug_assert!(cpu < smp::num_cpus());
+        unsafe { base.add(cpu - 1) }
+    }
+}
 
 /// Set the kernel stack pointer used when entering ring 0 from ring 3.
 /// Updates the current CPU's TSS.
 pub fn set_rsp0(rsp0: u64) {
-    let cpu = crate::sched::smp::cpu_id() as usize;
+    let cpu = smp::cpu_id() as usize;
     unsafe {
-        PER_CPU_TSS[cpu].rsp0 = rsp0;
+        (*tss_for(cpu)).rsp0 = rsp0;
     }
 }
 
 /// Build and load a TSS descriptor into the given CPU's GDT, then lgdt + ltr.
 fn load_gdt_for_cpu(cpu: usize) {
-    let tss_addr = unsafe { core::ptr::addr_of!(PER_CPU_TSS[cpu]) as u64 };
+    let gdt = gdt_for(cpu);
+    let tss = tss_for(cpu);
+    let tss_addr = tss as u64;
     let tss_limit = (size_of::<Tss>() - 1) as u64;
 
     // TSS descriptor low: limit[15:0], base[23:0], type=0x9, P=1, base[31:24]
@@ -96,13 +167,13 @@ fn load_gdt_for_cpu(cpu: usize) {
     let tss_high: u64 = tss_addr >> 32;
 
     unsafe {
-        PER_CPU_GDT[cpu].entries[5] = tss_low;
-        PER_CPU_GDT[cpu].entries[6] = tss_high;
+        (*gdt).entries[5] = tss_low;
+        (*gdt).entries[6] = tss_high;
     }
 
     let ptr = GdtPtr {
         limit: (size_of::<[u64; 7]>() - 1) as u16,
-        base: unsafe { PER_CPU_GDT[cpu].entries.as_ptr() as u64 },
+        base: unsafe { (*gdt).entries.as_ptr() as u64 },
     };
 
     unsafe {
@@ -137,7 +208,7 @@ pub fn init() {
     unsafe {
         let rsp: u64;
         core::arch::asm!("mov {}, rsp", out(reg) rsp);
-        PER_CPU_TSS[0].rsp0 = rsp;
+        (*tss_for(0)).rsp0 = rsp;
     }
 
     load_gdt_for_cpu(0);
@@ -151,7 +222,7 @@ pub fn init_ap(cpu: u32) {
     unsafe {
         let rsp: u64;
         core::arch::asm!("mov {}, rsp", out(reg) rsp);
-        PER_CPU_TSS[cpu].rsp0 = rsp;
+        (*tss_for(cpu)).rsp0 = rsp;
     }
 
     load_gdt_for_cpu(cpu);
