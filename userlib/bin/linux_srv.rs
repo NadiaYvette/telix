@@ -505,6 +505,13 @@ static mut TRACE_PI: usize = usize::MAX;
 /// Local VA of our long-path scratch page (granted to vfs_task at LIN_SCRATCH_VA).
 /// 0 = not yet allocated.
 static mut LIN_PATH_SCRATCH_LOCAL: usize = 0;
+/// Bitmask: which FS server tasks have been granted the scratch page.
+/// 0=ext2_task, 1=rootfs_task, 2=tmpfs_task. After being granted, scratch
+/// remains valid in that task's aspace at LIN_SCRATCH_REMOTE_VA.
+static mut FS_SCRATCH_GRANTED_MASK: u32 = 0;
+/// Whether we've attempted (and either succeeded or failed) granting once.
+/// Used to avoid retrying ns_lookup on every FS_READ when servers don't exist.
+static mut FS_SCRATCH_GRANT_TRIED: u32 = 0;
 /// VA inside VFS's aspace where our scratch is mapped.
 const LIN_SCRATCH_REMOTE_VA: usize = 0x5_0000_0000;
 /// Length of the longest long path we'll ship in one open call.
@@ -1519,6 +1526,68 @@ fn ensure_lin_path_scratch() -> bool {
     }
 }
 
+/// Lazily grant scratch to all known FS server tasks (ext2/rootfs/tmpfs).
+/// Idempotent: each task is granted at most once. Servers that aren't running
+/// are silently skipped, but FS_SCRATCH_GRANT_TRIED prevents repeated lookups.
+fn ensure_fs_scratch_grants() {
+    if !ensure_lin_path_scratch() {
+        return;
+    }
+    unsafe {
+        let names: [(&[u8], u32); 3] = [
+            (b"ext2_task", 1 << 0),
+            (b"rootfs_task", 1 << 1),
+            (b"tmpfs_task", 1 << 2),
+        ];
+        for (name, bit) in names.iter() {
+            if FS_SCRATCH_GRANTED_MASK & bit != 0 {
+                continue;
+            }
+            if FS_SCRATCH_GRANT_TRIED & bit != 0 {
+                continue;
+            }
+            FS_SCRATCH_GRANT_TRIED |= bit;
+            let fs_task = syscall::ns_lookup(*name).unwrap_or(0);
+            if fs_task == 0 {
+                continue;
+            }
+            if syscall::grant_pages(
+                fs_task,
+                LIN_PATH_SCRATCH_LOCAL,
+                LIN_SCRATCH_REMOTE_VA,
+                1,
+                false,
+            ) {
+                FS_SCRATCH_GRANTED_MASK |= bit;
+            }
+        }
+    }
+}
+
+/// Read up to one page (4096 bytes max) from a file into the local scratch
+/// page via FS_READ's grant_va fast path. Returns bytes read, or None if the
+/// FS server doesn't accept grant_va or no scratch grant has been made.
+fn fs_read_bulk(fs_port: u64, handle: u64, offset: u64, max_len: usize) -> Option<usize> {
+    ensure_fs_scratch_grants();
+    unsafe {
+        if FS_SCRATCH_GRANTED_MASK == 0 {
+            return None;
+        }
+    }
+    let reply_port = unsafe { REPLY_PORT };
+    let length = max_len.min(4096) as u64;
+    let d2 = (length & 0xFFFF_FFFF) | (reply_port << 32);
+    syscall::send(fs_port, FS_READ, handle, offset, d2, LIN_SCRATCH_REMOTE_VA as u64);
+    let resp = match syscall::recv_msg(reply_port) {
+        Some(m) => m,
+        None => return None,
+    };
+    if resp.tag != FS_READ_OK {
+        return None;
+    }
+    Some(resp.data[0] as usize)
+}
+
 /// Write a path into the scratch page. Returns the truncated length actually
 /// stored, or 0 on failure.
 fn put_long_path(path: &[u8]) -> usize {
@@ -2374,7 +2443,16 @@ fn handle_fstat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         }
 
         let file_size = PROC_TABLE[pi].fds[fd].file_size;
+        let fs_port = PROC_TABLE[pi].fds[fd].fs_port;
+        let handle = PROC_TABLE[pi].fds[fd].handle;
         let mut stat_buf = [0u8; 144];
+        // Synthesize a non-zero (st_dev, st_ino) so glibc's _dl_get_file_id
+        // can distinguish distinct files. Without this, all fstat'd files
+        // share (0,0) and glibc treats them as already-loaded aliases of
+        // ld.so, short-circuiting _dl_map_object_from_fd before mmap.
+        stat_buf[0..8].copy_from_slice(&fs_port.to_le_bytes());   // st_dev
+        stat_buf[8..16].copy_from_slice(&(handle + 1).to_le_bytes()); // st_ino
+        stat_buf[16..24].copy_from_slice(&1u64.to_le_bytes());    // st_nlink
         let mode: u32 = 0o100644; // S_IFREG | 0644
         stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
         stat_buf[48..56].copy_from_slice(&file_size.to_le_bytes());
@@ -3343,7 +3421,11 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let linux_prot = args[2];
     let flags = args[3];
     let fd = args[4] as i64;
-    let file_offset = args[5];
+    // args[5] is clobbered by IPC priority inheritance (port::send overwrites
+    // msg.data[5] with sender's effective priority). Recover the real arg5
+    // (file offset) by reading it directly from the caller's saved frame.
+    let (_real_arg4, real_arg5) = syscall::personality_read_args(caller_port);
+    let file_offset = real_arg5;
 
     if len == 0 { return linux_err(EINVAL); }
 
@@ -3405,6 +3487,8 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     // Kernel prot encoding: 0=RO, 1=RW, 2=RE, 3=RWE.
     let need_bump = !is_anon && kern_prot != 1 && kern_prot != 3;
     let map_prot = if need_bump { 1 } else { kern_prot }; // RW for file data copy
+    // Page-aligned length for mprotect (kernel rejects misaligned len).
+    let aligned_len = (pages as usize) * page_size;
 
     // MAP_FIXED: use personality_mmap_fixed which properly splits overlapping
     // VMAs (required for ld.so's reserve-then-replace pattern).
@@ -3430,7 +3514,7 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                      PROC_TABLE[pi].fds[fd_idx].handle, PROC_TABLE[pi].fds[fd_idx].file_size)
                 } else {
                     if need_bump {
-                        syscall::personality_mprotect(caller_port, va, len, kern_prot as u8);
+                        syscall::personality_mprotect(caller_port, va, aligned_len, kern_prot as u8);
                     }
                     return va as u64;
                 }
@@ -3438,50 +3522,70 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
             match kind {
                 FdKind::File => {
-                    // Read from VFS and populate pages via batched IPC reads.
-                    // Accumulate 16-byte IPC reads into a local buffer, then
-                    // copy out in bulk via personality_copy_out (up to 4096 bytes
-                    // per kernel crossing instead of 16).
+                    // Read from FS and populate pages via the scratch-grant
+                    // bulk path (4096 bytes/IPC). Falls back to 16-byte inline
+                    // reads if no FS server has been granted scratch yet.
                     let avail = if file_offset >= file_size { 0 }
                                 else { (file_size - file_offset) as usize };
                     let to_read = len.min(avail);
                     if to_read > 0 {
                         let reply_port = unsafe { REPLY_PORT };
                         let mut total = 0usize;
-                        let mut buf = [0u8; 4096];
-                        let mut buf_used = 0usize;
-                        while total < to_read {
-                            let chunk = (to_read - total).min(16);
-                            let d2 = (chunk as u64) | ((reply_port) << 32);
-                            syscall::send(fs_port, FS_READ, handle, file_offset + total as u64, d2, 0);
-                            let resp = match syscall::recv_msg(reply_port) {
-                                Some(m) => m,
-                                None => break,
-                            };
-                            if resp.tag != FS_READ_OK { break; }
-                            let got = (resp.data[0] & 0xFFFF) as usize;
-                            if got == 0 { break; }
-                            let b1 = resp.data[1].to_le_bytes();
-                            let b2 = resp.data[2].to_le_bytes();
-                            let to_copy = got.min(chunk);
-                            for i in 0..to_copy {
-                                if i < 8 { buf[buf_used] = b1[i]; }
-                                else { buf[buf_used] = b2[i - 8]; }
-                                buf_used += 1;
+                        // Probe scratch availability with the first chunk.
+                        ensure_fs_scratch_grants();
+                        let bulk_ok = unsafe { FS_SCRATCH_GRANTED_MASK != 0 };
+                        if bulk_ok {
+                            while total < to_read {
+                                let want = to_read - total;
+                                let got = match fs_read_bulk(
+                                    fs_port,
+                                    handle,
+                                    file_offset + total as u64,
+                                    want,
+                                ) {
+                                    Some(g) if g > 0 => g,
+                                    _ => break,
+                                };
+                                let scratch = unsafe { LIN_PATH_SCRATCH_LOCAL } as *const u8;
+                                let src = unsafe { core::slice::from_raw_parts(scratch, got) };
+                                syscall::personality_copy_out(caller_port, va + total, src);
+                                total += got;
                             }
-                            total += to_copy;
-                            // Flush buffer when full or done.
-                            if buf_used >= 4096 || total >= to_read {
+                        } else {
+                            // Fallback: 16-byte inline IPC reads.
+                            let mut buf = [0u8; 4096];
+                            let mut buf_used = 0usize;
+                            while total < to_read {
+                                let chunk = (to_read - total).min(16);
+                                let d2 = (chunk as u64) | ((reply_port) << 32);
+                                syscall::send(fs_port, FS_READ, handle, file_offset + total as u64, d2, 0);
+                                let resp = match syscall::recv_msg(reply_port) {
+                                    Some(m) => m,
+                                    None => break,
+                                };
+                                if resp.tag != FS_READ_OK { break; }
+                                let got = (resp.data[0] & 0xFFFF) as usize;
+                                if got == 0 { break; }
+                                let b1 = resp.data[1].to_le_bytes();
+                                let b2 = resp.data[2].to_le_bytes();
+                                let to_copy = got.min(chunk);
+                                for i in 0..to_copy {
+                                    if i < 8 { buf[buf_used] = b1[i]; }
+                                    else { buf[buf_used] = b2[i - 8]; }
+                                    buf_used += 1;
+                                }
+                                total += to_copy;
+                                if buf_used >= 4096 || total >= to_read {
+                                    let flush_va = va + total - buf_used;
+                                    syscall::personality_copy_out(caller_port, flush_va, &buf[..buf_used]);
+                                    buf_used = 0;
+                                }
+                                if got < chunk { break; }
+                            }
+                            if buf_used > 0 {
                                 let flush_va = va + total - buf_used;
                                 syscall::personality_copy_out(caller_port, flush_va, &buf[..buf_used]);
-                                buf_used = 0;
                             }
-                            if got < chunk { break; }
-                        }
-                        // Flush remaining.
-                        if buf_used > 0 {
-                            let flush_va = va + total - buf_used;
-                            syscall::personality_copy_out(caller_port, flush_va, &buf[..buf_used]);
                         }
                     }
                 }
@@ -3516,7 +3620,7 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     // Restore requested protection if we temporarily bumped it.
     if need_bump {
-        syscall::personality_mprotect(caller_port, va, len, kern_prot as u8);
+        syscall::personality_mprotect(caller_port, va, aligned_len, kern_prot as u8);
     }
 
     va as u64
@@ -3654,17 +3758,6 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
 
     // On success: close CLOEXEC FDs and reset BRK.
     unsafe {
-        // Phase 172 EFAULT trace: arm tracer when glibc_dyn_hello is exec'd.
-        let armed = {
-            let needle: &[u8] = b"glibc_dyn_hello";
-            name.windows(needle.len()).any(|w| w == needle)
-        };
-        if armed {
-            TRACE_PI = pi;
-            syscall::debug_puts(b"[trace] armed for glibc_dyn_hello pi=");
-            print_num(pi as u64);
-            syscall::debug_puts(b"\n");
-        }
         for i in 3..MAX_FDS {
             if PROC_TABLE[pi].fds[i].in_use && (PROC_TABLE[pi].fds[i].fd_flags & FD_CLOEXEC) != 0 {
                 do_close(pi, i);

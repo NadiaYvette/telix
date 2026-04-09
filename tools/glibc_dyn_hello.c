@@ -14,5 +14,5 @@ int main(int argc, char **argv)
     (void)argv;
     static const char msg[] = "[glibc_dyn_hello] hello from dynamically-linked glibc!\n";
     write(1, msg, sizeof(msg) - 1);
-    return argc;
+    _exit(argc);
 }

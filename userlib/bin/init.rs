@@ -14811,7 +14811,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::personality_set(child, 2, abi);
 
                 let mut exit_code: i64 = -1;
-                for _ in 0..1500 {
+                for _ in 0..12000 {
                     if let Some(code) = syscall::waitpid(child) {
                         exit_code = code as i64;
                         break;
@@ -14837,9 +14837,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 172 dynamic glibc binary: SKIPPED\n");
         }
     }
-    // Phase 172 debug: exit immediately after 172 so we don't wait on benchmarks.
-    syscall::debug_puts(b"  init: Phase 172 debug exit\n");
-    syscall::exit(0);
 
     // ============================================================
     // --- Test 23: Benchmark Suite ---

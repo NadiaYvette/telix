@@ -113,13 +113,7 @@ pub fn personality_reply(target_task_port: u64, result: u64) -> u64 {
 /// Only callable by a registered personality server.
 /// Returns (arg4, arg5).
 pub fn personality_read_args(target_task_port: u64) -> (u64, u64) {
-    let (r0, r1) = unsafe {
-        let r0 = arch::syscall1(SYS_PERSONALITY_READ_ARGS, target_task_port);
-        // arg5 is returned in the second register — we need syscall1_2ret.
-        // For now, just return r0 as arg4; arg5 support needs arch work.
-        (r0, 0)
-    };
-    (r0, r1)
+    unsafe { arch::syscall1_2ret(SYS_PERSONALITY_READ_ARGS, target_task_port) }
 }
 
 /// Copy bytes from a blocked personality-wait task's address space into
