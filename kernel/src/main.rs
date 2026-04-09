@@ -174,12 +174,25 @@ fn startup_thread() -> ! {
     // On x86_64 find_device returns None (no MMIO transport), so these are no-ops.
     if let Some(base) = drivers::virtio_mmio::find_device(drivers::virtio_mmio::DEVICE_BLK) {
         let irq = drivers::virtio_mmio::device_irq(base) as u64;
-        let arg0 = (base as u64) | (irq << 48);
+        // Look up (or lazily register) the MMIO region for this device in
+        // the cap registry. `populate_from_firmware` usually covers this
+        // already; register_region is idempotent on (base, size).
+        let region_id = cap::mmio::register_region(base, 0x1000, cap::mmio::CacheAttr::Device);
+        // Pre-register the IRQ→MMIO association so the kernel can ACK the
+        // virtio interrupt itself — the driver doesn't need to pass phys.
+        let _ = io::irq_dispatch::register(irq as u32, base);
+        let arg0_upper = irq << 48;
         println!(
-            "  virtio-blk at {:#x}, irq {}, spawning blk_srv with arg0={:#x}",
-            base, irq, arg0
+            "  virtio-blk at {:#x}, irq {}, region_id={:?}, spawning blk_srv",
+            base, irq, region_id
         );
-        match sched::spawn_user(b"blk_srv", 50, 20, arg0) {
+        let spawned = match region_id {
+            Some(rid) => sched::spawn_user_with_mmio_cap(b"blk_srv", 50, 20, arg0_upper, rid),
+            // Fall back to the legacy path if registration failed (shouldn't
+            // happen — 32 slots is plenty).
+            None => sched::spawn_user(b"blk_srv", 50, 20, (base as u64) | arg0_upper),
+        };
+        match spawned {
             Some(tid) => println!("  blk_srv spawned (thread {})", tid),
             None => println!("  WARNING: blk_srv not found (ok if not yet built)"),
         }

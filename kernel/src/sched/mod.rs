@@ -20,7 +20,8 @@ pub use scheduler::{
     get_signal_pending, getpgid, getsid, init, is_killed, kill_task, park_current_for_sleep,
     reset_priority, sa_getid, sa_register, sa_wait, send_signal_to_pgroup, send_signal_to_task,
     send_signal_to_thread, set_affinity, set_ctty, set_signal_action, set_signal_mask, setpgid,
-    setsid, spawn, spawn_user, spawn_user_from_elf, spawn_user_with_data, tcgetpgrp, tcsetpgrp,
+    setsid, spawn, spawn_user, spawn_user_from_elf, spawn_user_with_data, spawn_user_with_mmio_cap,
+    tcgetpgrp, tcsetpgrp,
     thread_create, thread_effective_priority, thread_join_block, thread_join_poll, thread_task_id,
     tick, wake_thread,
 };

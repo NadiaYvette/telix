@@ -236,9 +236,10 @@ mod pci_mmio {
 
 impl BlkDev {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64")))]
-    fn init(mmio_phys: usize, irq: u32) -> Option<Self> {
-        // Map MMIO registers into our address space.
-        let mmio_va = syscall::mmap_device(mmio_phys, 1)?;
+    fn init(mmio_slot: usize, irq: u32) -> Option<Self> {
+        // Map MMIO registers into our address space via the cap the
+        // kernel pre-granted at spawn time.
+        let mmio_va = syscall::mmio_map_cap(mmio_slot)?;
 
         syscall::debug_puts(b"  [blk_srv] MMIO mapped at VA ");
         print_hex(mmio_va as u64);
@@ -336,9 +337,10 @@ impl BlkDev {
         let status_pa = buf_pa + 16; // After 16-byte header
         let data_pa = buf_pa + 32; // After header + status gap
 
-        // Register IRQ for userspace dispatch (first irq_wait call with mmio_base).
-        // We pass the *physical* MMIO base so the kernel can ACK the virtio interrupt.
-        syscall::irq_wait(irq, mmio_phys);
+        // IRQ→MMIO association is pre-registered by the kernel at spawn
+        // time, so the driver doesn't need to know (or pass) the phys
+        // base. Step C4 will migrate this to port-based irq_attach.
+        let _ = irq;
 
         if version == 1 {
             // Legacy MMIO.
@@ -787,11 +789,19 @@ impl BlkDev {
 
 #[unsafe(no_mangle)]
 fn main(arg0: u64, _arg1: u64, _arg2: u64) {
-    // Unpack device info from arg0: base in low 48 bits, irq in bits 48-63.
-    // On aarch64/riscv64: base = MMIO physical address.
-    // On x86_64: base = BAR0 I/O port number.
-    let base = (arg0 & 0xFFFF_FFFF_FFFF) as usize;
+    // Unpack device info from arg0: irq in bits 48-63, low bits meaning
+    // depends on transport:
+    //   - virtio-mmio (aarch64/riscv64): low 16 bits = MMIO cap slot
+    //     (granted by the kernel before spawn); call sys_mmio_map_cap.
+    //   - PCI I/O ports (x86_64/mips64): low 48 bits = BAR0 port number.
+    //   - PCI MMIO (loongarch64): low 48 bits = BAR0 physical address
+    //     (still goes through the legacy sys_mmap_device for now).
     let irq = (arg0 >> 48) as u32;
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64")))]
+    let base = (arg0 & 0xFFFF) as usize; // mmio cap slot
+    #[cfg(any(target_arch = "x86_64", target_arch = "mips64", target_arch = "loongarch64"))]
+    let base = (arg0 & 0xFFFF_FFFF_FFFF) as usize;
 
     syscall::debug_puts(b"  [blk_srv] starting, base=");
     print_hex(base as u64);

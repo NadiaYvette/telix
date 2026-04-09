@@ -829,6 +829,7 @@ fn do_spawn_heavy_work(
     _quantum: u32,
     arg0: u64,
     arg0_is_port: bool,
+    mmio_cap_region: Option<u32>,
 ) -> Option<(u64, usize, u64, usize, u64, u64)> {
     // Create kernel-held ports for this task and its initial thread.
     let task_port = crate::ipc::port::create_kernel_port(task_port_handler, task_id as usize)?;
@@ -875,6 +876,21 @@ fn do_spawn_heavy_work(
         crate::cap::grant_send_cap(task_id, task_port);
         crate::cap::grant_port_cap(task_id, thread_port, srm);
     }
+
+    // If the caller requested an MMIO cap, grant it now — the resulting
+    // slot is OR'd into arg0's low 16 bits so the child can call
+    // `sys_mmio_map_cap(slot)` as its first MMIO operation. The caller
+    // keeps the upper bits of arg0 (e.g. irq<<48) free.
+    let arg0 = match mmio_cap_region {
+        Some(region_id) => {
+            use crate::cap::capability::Rights;
+            let rw = Rights::READ.union(Rights::WRITE);
+            let slot = crate::cap::grant_mmio_cap(task_id, region_id, rw)?;
+            debug_assert!(slot < 0x10000, "mmio cap slot doesn't fit in 16 bits");
+            (arg0 & !0xFFFFu64) | (slot as u64 & 0xFFFF)
+        }
+        None => arg0,
+    };
 
     // Load ELF segments into the address space.
     let elf_info = match crate::loader::elf::load_elf(elf_data, aspace_id, pt_root) {
@@ -1264,6 +1280,7 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
         quantum,
         arg0,
         arg0_is_port,
+        None,
     )?;
 
     // Duplicate groups overflow page for child.
@@ -1272,6 +1289,59 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
     }
 
     // Phase 3: finalize task/thread state.
+    finalize_spawn(
+        task_id,
+        thread_id,
+        &parent,
+        aspace_id,
+        pt_root,
+        priority,
+        quantum,
+        frame_sp,
+        kstack_base,
+        task_port,
+        thread_port,
+    );
+    Some(thread_id)
+}
+
+/// Spawn a driver process with a pre-granted `CapType::Memory` cap for
+/// an MMIO region. The resulting cap slot is OR'd into `arg0`'s low 16
+/// bits — drivers decode it and pass it to `sys_mmio_map_cap`. Upper
+/// bits of `arg0_upper` (typically `irq << 48`) are preserved.
+pub fn spawn_user_with_mmio_cap(
+    elf_name: &[u8],
+    priority: u8,
+    quantum: u32,
+    arg0_upper: u64,
+    mmio_region_id: u32,
+) -> Option<ThreadId> {
+    // Clear the slot bits the child will overwrite with the cap slot.
+    let arg0 = arg0_upper & !0xFFFFu64;
+
+    let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
+
+    let (task_id, thread_id, mut parent) = {
+        let _lock = SPAWN_LOCK.lock();
+        alloc_spawn_ids()?
+    };
+
+    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) = do_spawn_heavy_work(
+        task_id,
+        thread_id,
+        &parent,
+        elf_data,
+        priority,
+        quantum,
+        arg0,
+        false,
+        Some(mmio_region_id),
+    )?;
+
+    if !dup_groups_overflow(&mut parent) {
+        return None;
+    }
+
     finalize_spawn(
         task_id,
         thread_id,
@@ -1311,6 +1381,7 @@ pub fn spawn_user_from_elf(
         quantum,
         arg0,
         arg0_is_port,
+        None,
     )?;
 
     if !dup_groups_overflow(&mut parent) {
@@ -1362,6 +1433,7 @@ pub fn spawn_user_with_data(
         quantum,
         arg0,
         arg0_is_port,
+        None,
     )?;
 
     // Map data pages into the child's address space (still no SCHEDULER lock).

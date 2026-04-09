@@ -59,6 +59,9 @@ const SYS_PROXY_REGISTER: u64 = 99;
 const SYS_PORT_RESIZE: u64 = 100;
 const SYS_PAGE_SIZE: u64 = 103;
 const SYS_PORT_ALIVE: u64 = 110;
+const SYS_IRQ_ATTACH: u64 = 111;
+const SYS_IRQ_ACK: u64 = 112;
+const SYS_MMIO_MAP_CAP: u64 = 113;
 const SYS_PERSONALITY_REGISTER: u64 = 0xF000;
 const SYS_PERSONALITY_SET: u64 = 0xF001;
 const SYS_PERSONALITY_GET: u64 = 0xF002;
@@ -894,6 +897,18 @@ pub fn mmap_device(phys: usize, page_count: usize) -> Option<usize> {
     } else {
         Some(r as usize)
     }
+}
+
+/// Map an MMIO region identified by a `CapType::Memory` capability in the
+/// calling task's CapSpace. The cap must carry `READ|WRITE`. Returns the
+/// virtual address where the region was mapped, or `None` on failure.
+///
+/// This is the capability-gated replacement for `mmap_device`; drivers
+/// spawned by the kernel receive a pre-granted Memory cap at a well-known
+/// slot (encoded in arg0's low bits).
+pub fn mmio_map_cap(slot: usize) -> Option<usize> {
+    let r = unsafe { arch::syscall1(SYS_MMIO_MAP_CAP, slot as u64) };
+    if r == u64::MAX { None } else { Some(r as usize) }
 }
 
 /// Translate a virtual address to physical. Returns PA or None.
