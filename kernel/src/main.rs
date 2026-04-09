@@ -62,6 +62,11 @@ pub fn kmain() -> ! {
     // per-CPU arrays here.
     sched::smp::init_dynamic_percpu();
 
+    // Bring up the swap backend if requested on the cmdline. Must run
+    // after phys::init (backends allocate storage) and before any
+    // workload that can trigger WSCLOCK.
+    mm::swap::init();
+
     // Enable MMU: set up kernel identity-mapped page tables.
     // Must happen before secondary CPU startup (they need the page table root).
     arch::platform::enable_mmu();

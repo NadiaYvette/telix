@@ -16,6 +16,7 @@ pub mod phys;
 pub mod ptshare;
 pub mod slab;
 pub mod stats;
+pub mod swap;
 pub mod vma;
 pub mod vmatree;
 pub mod wsclock;
