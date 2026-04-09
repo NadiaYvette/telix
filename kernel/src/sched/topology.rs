@@ -4,7 +4,8 @@
 //! x86_64: Uses CPUID leaf 0x0B (Extended Topology Enumeration).
 //! riscv64/aarch64: Flat topology (each CPU = separate core, 1 package).
 
-use super::smp::MAX_CPUS;
+use super::smp;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 /// Topology entry for a single CPU.
 #[derive(Clone, Copy)]
@@ -26,7 +27,29 @@ impl CpuTopoEntry {
     }
 }
 
-static mut CPU_TOPO: [CpuTopoEntry; MAX_CPUS] = [CpuTopoEntry::empty(); MAX_CPUS];
+// CPU topology lives in a dynamic slice installed by `init_dynamic_percpu`
+// from `smp::init_dynamic_percpu`. The all-zero bit pattern (from
+// `alloc_static_slice`) matches `CpuTopoEntry::empty()`.
+static CPU_TOPO_PTR: AtomicPtr<CpuTopoEntry> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn cpu_topo() -> &'static mut [CpuTopoEntry] {
+    let ptr = CPU_TOPO_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "CPU_TOPO not init");
+    unsafe { core::slice::from_raw_parts_mut(ptr, smp::num_cpus()) }
+}
+
+/// Allocate and install this module's dynamic per-CPU slice.
+/// Called by `smp::init_dynamic_percpu` after `phys::init`.
+pub(crate) fn init_dynamic_percpu() {
+    let n = smp::num_cpus();
+    unsafe {
+        let s = crate::mm::phys::alloc_static_slice::<CpuTopoEntry>(n);
+        // CpuTopoEntry::empty() is all-zero; alloc_static_slice zeroes the
+        // backing pages, so no explicit init is needed.
+        CPU_TOPO_PTR.store(s.as_mut_ptr(), Ordering::Release);
+    }
+}
 
 // --- CPUID helper (x86_64 only) ---
 
@@ -51,31 +74,27 @@ fn cpuid(eax: u32, ecx: u32) -> (u32, u32, u32, u32) {
 /// Initialize topology for the BSP (CPU 0).
 pub fn init() {
     let entry = discover_local();
-    unsafe {
-        CPU_TOPO[0] = CpuTopoEntry {
+    cpu_topo()[0] = CpuTopoEntry {
+        online: true,
+        ..entry
+    };
+}
+
+/// Initialize topology for a secondary CPU.
+pub fn init_ap(cpu: u32) {
+    if (cpu as usize) < smp::num_cpus() {
+        let entry = discover_local();
+        cpu_topo()[cpu as usize] = CpuTopoEntry {
             online: true,
             ..entry
         };
     }
 }
 
-/// Initialize topology for a secondary CPU.
-pub fn init_ap(cpu: u32) {
-    if (cpu as usize) < MAX_CPUS {
-        let entry = discover_local();
-        unsafe {
-            CPU_TOPO[cpu as usize] = CpuTopoEntry {
-                online: true,
-                ..entry
-            };
-        }
-    }
-}
-
 /// Get topology entry for a CPU.
 pub fn get(cpu: usize) -> CpuTopoEntry {
-    if cpu < MAX_CPUS {
-        unsafe { CPU_TOPO[cpu] }
+    if cpu < smp::num_cpus() {
+        cpu_topo()[cpu]
     } else {
         CpuTopoEntry::empty()
     }
@@ -84,20 +103,19 @@ pub fn get(cpu: usize) -> CpuTopoEntry {
 /// Set the online state for a CPU (used by hotplug).
 ///
 /// # Safety
-/// Caller must ensure `cpu < MAX_CPUS`.
+/// Caller must ensure `cpu < num_cpus()`.
 pub unsafe fn set_online(cpu: usize, online: bool) {
-    if cpu < MAX_CPUS {
-        unsafe {
-            CPU_TOPO[cpu].online = online;
-        }
+    if cpu < smp::num_cpus() {
+        cpu_topo()[cpu].online = online;
     }
 }
 
 /// Print topology at boot.
 pub fn print() {
     crate::println!("  CPU topology:");
-    for i in 0..MAX_CPUS {
-        let e = unsafe { CPU_TOPO[i] };
+    let topo = cpu_topo();
+    for i in 0..smp::num_cpus() {
+        let e = topo[i];
         if e.online {
             crate::println!(
                 "    CPU {}: package={} core={} smt={}",

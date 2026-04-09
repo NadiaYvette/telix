@@ -25,7 +25,7 @@ use crate::ipc::art::Art;
 use crate::mm::page::{self, MMUPAGE_SIZE, PhysAddr};
 use crate::mm::{phys, slab};
 use crate::sync::SpinLock;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Kernel stack allocation order (0 = 1 page, 1 = 2 pages).
 /// 2 pages (8 KiB) provides headroom for nested interrupts during syscalls,
@@ -130,47 +130,80 @@ pub fn thread_ref_opt(id: ThreadId) -> Option<&'static Thread> {
         .map(|val| unsafe { &*(val as *const Thread) })
 }
 
+// Per-CPU scheduler state lives in dynamic slices sized by num_cpus() and
+// installed by `init_dynamic_percpu` (invoked from smp::init_dynamic_percpu
+// just after phys::init). See the runtime-nr_cpus plan.
+//
+// Each array is stored behind an AtomicPtr so it can be published once and
+// read cheaply (relaxed load + bounds check) from every call site. The
+// accessors panic (via debug_assert!) if called before init_dynamic_percpu.
+
 /// Per-CPU saved frame SP. The exception handler stores the current frame_sp
 /// here before calling syscall dispatch, so that park_current_for_ipc() can
 /// read it without changing dispatch()'s signature.
-static CURRENT_FRAME_SP: [AtomicU64; smp::MAX_CPUS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; smp::MAX_CPUS]
-};
+static CURRENT_FRAME_SP_PTR: AtomicPtr<AtomicU64> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn current_frame_sp() -> &'static [AtomicU64] {
+    let ptr = CURRENT_FRAME_SP_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "CURRENT_FRAME_SP not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
 
 /// Per-CPU pending context switch target SP. When a syscall handler parks the
 /// current thread or does a direct handoff, it stores the target thread's SP
 /// here. The exception handler checks this after dispatch() returns and uses
 /// it as the new SP if non-zero.
-static PENDING_SWITCH_SP: [AtomicU64; smp::MAX_CPUS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; smp::MAX_CPUS]
-};
+static PENDING_SWITCH_SP_PTR: AtomicPtr<AtomicU64> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn pending_switch_sp() -> &'static [AtomicU64] {
+    let ptr = PENDING_SWITCH_SP_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "PENDING_SWITCH_SP not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
 
 /// Per-CPU deferred kernel stack free. When a thread exits, it can't free
 /// its own stack (it's running on it). The address is stored here and freed
 /// by the next thread scheduled on that CPU.
-static DEFERRED_KSTACK: [AtomicUsize; smp::MAX_CPUS] = {
-    const INIT: AtomicUsize = AtomicUsize::new(0);
-    [INIT; smp::MAX_CPUS]
-};
+static DEFERRED_KSTACK_PTR: AtomicPtr<AtomicUsize> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn deferred_kstack() -> &'static [AtomicUsize] {
+    let ptr = DEFERRED_KSTACK_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "DEFERRED_KSTACK not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
 
 /// Per-CPU deferred thread ID — the thread whose kstack is in DEFERRED_KSTACK.
 /// When try_switch drains the deferred free, it also sets stack_base=0 on this
 /// thread, making the slot eligible for reuse. This prevents a race where a
 /// slot is reused while the dead thread is still physically running.
-static DEFERRED_THREAD: [AtomicUsize; smp::MAX_CPUS] = {
-    const INIT: AtomicUsize = AtomicUsize::new(usize::MAX);
-    [INIT; smp::MAX_CPUS]
-};
+static DEFERRED_THREAD_PTR: AtomicPtr<AtomicUsize> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn deferred_thread() -> &'static [AtomicUsize] {
+    let ptr = DEFERRED_THREAD_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "DEFERRED_THREAD not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
 
 /// Per-CPU deferred killed-thread cleanup. When try_switch preempts a
 /// killed user thread, it marks it Dead and stores the thread ID here.
 /// The next tick() call drains this and does full cleanup (aspace destroy, etc.).
-static DEFERRED_KILL: [AtomicUsize; smp::MAX_CPUS] = {
-    const INIT: AtomicUsize = AtomicUsize::new(usize::MAX);
-    [INIT; smp::MAX_CPUS]
-};
+static DEFERRED_KILL_PTR: AtomicPtr<AtomicUsize> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn deferred_kill() -> &'static [AtomicUsize] {
+    let ptr = DEFERRED_KILL_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "DEFERRED_KILL not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
 
 const NUM_PRIORITIES: usize = 256;
 
@@ -433,15 +466,57 @@ impl PerCpuRunQueues {
     }
 }
 
-static PERCPU_RQ: [SpinLock<PerCpuRunQueues>; smp::MAX_CPUS] = {
-    const INIT: SpinLock<PerCpuRunQueues> = SpinLock::new(PerCpuRunQueues::new());
-    [INIT; smp::MAX_CPUS]
-};
+static PERCPU_RQ_PTR: AtomicPtr<SpinLock<PerCpuRunQueues>> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn percpu_rq() -> &'static [SpinLock<PerCpuRunQueues>] {
+    let ptr = PERCPU_RQ_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "PERCPU_RQ not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
+
+/// Allocate and install this module's dynamic per-CPU slices.
+/// Called by `smp::init_dynamic_percpu` after `phys::init`.
+pub(crate) fn init_dynamic_percpu() {
+    let n = smp::num_cpus();
+    unsafe {
+        let s = phys::alloc_static_slice::<AtomicU64>(n);
+        CURRENT_FRAME_SP_PTR.store(s.as_mut_ptr(), Ordering::Release);
+
+        let s = phys::alloc_static_slice::<AtomicU64>(n);
+        PENDING_SWITCH_SP_PTR.store(s.as_mut_ptr(), Ordering::Release);
+
+        let s = phys::alloc_static_slice::<AtomicUsize>(n);
+        DEFERRED_KSTACK_PTR.store(s.as_mut_ptr(), Ordering::Release);
+
+        // DEFERRED_THREAD and DEFERRED_KILL sentinel value is usize::MAX,
+        // not 0 — alloc_static_slice returns zeroed memory, so explicitly
+        // initialize each slot.
+        let s = phys::alloc_static_slice::<AtomicUsize>(n);
+        for slot in s.iter() {
+            slot.store(usize::MAX, Ordering::Relaxed);
+        }
+        DEFERRED_THREAD_PTR.store(s.as_mut_ptr(), Ordering::Release);
+
+        let s = phys::alloc_static_slice::<AtomicUsize>(n);
+        for slot in s.iter() {
+            slot.store(usize::MAX, Ordering::Relaxed);
+        }
+        DEFERRED_KILL_PTR.store(s.as_mut_ptr(), Ordering::Release);
+
+        // PERCPU_RQ: zero-initialized bytes match PerCpuRunQueues::new()
+        // (which uses RQ_NIL == 0 sentinels — see comment on RQ_NIL above).
+        // SpinLock<T>::new() is also all-zero for the unlocked state.
+        let s = phys::alloc_static_slice::<SpinLock<PerCpuRunQueues>>(n);
+        PERCPU_RQ_PTR.store(s.as_mut_ptr(), Ordering::Release);
+    }
+}
 
 /// Enqueue a thread onto the per-CPU run queue for the given target CPU.
 /// The caller must ensure the thread's state is Ready before calling.
 fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
-    let mut rq = PERCPU_RQ[target_cpu as usize].lock();
+    let mut rq = percpu_rq()[target_cpu as usize].lock();
     rq.push(prio, tid);
 }
 
@@ -463,7 +538,7 @@ fn try_steal_min(cpu: u32, min_len: u32) -> Option<ThreadId> {
     }
     for i in 1..online {
         let victim = ((cpu as usize + i) % online) as u32;
-        if let Some(mut rq) = PERCPU_RQ[victim as usize].try_lock() {
+        if let Some(mut rq) = percpu_rq()[victim as usize].try_lock() {
             if let Some(tid) = rq.steal_one_min(cpu, min_len) {
                 return Some(tid);
             }
@@ -1069,7 +1144,7 @@ pub(crate) unsafe fn task_mut_from_ref(id: TaskId) -> &'static mut Task {
 /// Pick next thread from the current CPU's per-CPU run queue.
 /// Returns idle_id if nothing is ready.
 fn percpu_pick_next(cpu: u32, idle_id: ThreadId) -> ThreadId {
-    let mut rq = PERCPU_RQ[cpu as usize].lock();
+    let mut rq = percpu_rq()[cpu as usize].lock();
     // First try local queue.
     if let Some(tid) = rq.pop_highest() {
         return tid;
@@ -1084,7 +1159,7 @@ fn percpu_pick_next(cpu: u32, idle_id: ThreadId) -> ThreadId {
 
 /// Pick next thread, preferring a cosched group mate on the current CPU.
 fn percpu_pick_next_cosched(cpu: u32, idle_id: ThreadId, prev_group: u32) -> (ThreadId, bool) {
-    let mut rq = PERCPU_RQ[cpu as usize].lock();
+    let mut rq = percpu_rq()[cpu as usize].lock();
     if prev_group != 0 && rq.cosched_burst < MAX_COSCHED_BURST {
         if let Some(tid) = rq.pop_for_group(prev_group) {
             rq.cosched_burst += 1;
@@ -1463,7 +1538,7 @@ pub fn current_page_table_root() -> usize {
 /// Called at the start of each tick, while running on a live thread's stack.
 fn drain_deferred_kills() {
     let cpu = smp::cpu_id() as usize;
-    let tid = DEFERRED_KILL[cpu].swap(usize::MAX, Ordering::AcqRel);
+    let tid = deferred_kill()[cpu].swap(usize::MAX, Ordering::AcqRel);
     if tid == usize::MAX || tid >= RadixTable::capacity() {
         return;
     }
@@ -1562,15 +1637,15 @@ fn try_switch(current_sp: u64) -> u64 {
     super::hotplug::tick_load(cpu, cur_for_load == idle_id_for_load);
 
     // Drain deferred kernel stack free from a previous exit on this CPU.
-    let deferred = DEFERRED_KSTACK[cpu as usize].load(Ordering::Acquire);
+    let deferred = deferred_kstack()[cpu as usize].load(Ordering::Acquire);
     if deferred != 0 {
         let cur_tid = pcpu.current_thread.load(Ordering::Relaxed);
         // Safety: cur_tid is Running on this CPU, we own it.
         let cur_stack = thread_ref(cur_tid).stack_base;
         if cur_stack != deferred {
-            DEFERRED_KSTACK[cpu as usize].store(0, Ordering::Release);
+            deferred_kstack()[cpu as usize].store(0, Ordering::Release);
             crate::mm::phys::free_pages(crate::mm::page::PhysAddr::new(deferred), KSTACK_ORDER);
-            let dead_tid = DEFERRED_THREAD[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
+            let dead_tid = deferred_thread()[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
             if dead_tid < RadixTable::capacity() {
                 // Safety: dead thread is Dead, not on any queue or CPU.
                 let t = unsafe { thread_mut_from_ref(dead_tid as ThreadId) };
@@ -1588,7 +1663,7 @@ fn try_switch(current_sp: u64) -> u64 {
         // Idle thread: preempt if local queue has work. Also try stealing
         // from other CPUs (with min_len=1) to pick up threads that were
         // demoted to prio 254 by block_current and are stuck on a busy CPU.
-        let rq = PERCPU_RQ[cpu as usize].lock();
+        let rq = percpu_rq()[cpu as usize].lock();
         let has_work = rq.has_ready();
         drop(rq);
         if !has_work {
@@ -1678,11 +1753,11 @@ fn try_switch(current_sp: u64) -> u64 {
                     wake_wait_child_threads(task.parent_task);
                 }
                 // Queue for deferred resource cleanup on next tick.
-                DEFERRED_KILL[cpu as usize].store(prev_id as usize, Ordering::Release);
+                deferred_kill()[cpu as usize].store(prev_id as usize, Ordering::Release);
                 // Also defer kstack free.
                 let kstack_base = prev_t.stack_base;
-                DEFERRED_THREAD[cpu as usize].store(prev_id as usize, Ordering::Release);
-                DEFERRED_KSTACK[cpu as usize].store(kstack_base, Ordering::Release);
+                deferred_thread()[cpu as usize].store(prev_id as usize, Ordering::Release);
+                deferred_kstack()[cpu as usize].store(kstack_base, Ordering::Release);
             } else {
                 prev_t.state = ThreadState::Ready;
                 percpu_enqueue(cpu, prev_prio, prev_id);
@@ -1742,7 +1817,7 @@ pub fn voluntary_reschedule() {
     let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
 
     // Save frame SP into thread struct.
-    let frame_sp = CURRENT_FRAME_SP[cpu as usize].load(Ordering::Acquire);
+    let frame_sp = current_frame_sp()[cpu as usize].load(Ordering::Acquire);
     let cur_prio;
     let cur_task;
     {
@@ -1798,7 +1873,7 @@ pub fn voluntary_reschedule() {
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     let next_sp = next_t.saved_sp;
 
-    PENDING_SWITCH_SP[cpu as usize].store(next_sp, Ordering::Release);
+    pending_switch_sp()[cpu as usize].store(next_sp, Ordering::Release);
 }
 
 // --- Coscheduling ---
@@ -1903,7 +1978,7 @@ pub fn wake_thread(tid: ThreadId) {
             let waker_cpu = smp::cpu_id();
             // Try to remove from old CPU's queue and re-enqueue at base prio.
             let removed = {
-                if let Some(mut rq) = PERCPU_RQ[old_cpu as usize].try_lock() {
+                if let Some(mut rq) = percpu_rq()[old_cpu as usize].try_lock() {
                     rq.remove_tid(tid)
                 } else {
                     false
@@ -2478,7 +2553,7 @@ pub fn current_aspace_id() -> u64 {
 /// The child will return 0 from this syscall (set in its exception frame).
 pub fn fork_current() -> u64 {
     let cpu = smp::cpu_id() as usize;
-    let parent_frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
+    let parent_frame_sp = current_frame_sp()[cpu].load(Ordering::Acquire);
     if parent_frame_sp == 0 {
         return u64::MAX;
     }
@@ -3271,8 +3346,8 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     // Defer freeing our own kernel stack — we're running on it.
     // Also store our thread ID so try_switch can mark the slot as reusable.
     let cpu = smp::cpu_id();
-    DEFERRED_THREAD[cpu as usize].store(tid as usize, Ordering::Release);
-    DEFERRED_KSTACK[cpu as usize].store(kstack_base, Ordering::Release);
+    deferred_thread()[cpu as usize].store(tid as usize, Ordering::Release);
+    deferred_kstack()[cpu as usize].store(kstack_base, Ordering::Release);
 
     // Enable interrupts so the timer can preempt us (we may be in a syscall
     // handler where hardware masked IRQs on exception entry).
@@ -3484,12 +3559,12 @@ pub fn thread_effective_priority(tid: ThreadId) -> u8 {
 /// Called by the arch exception handler before dispatching a syscall.
 pub fn store_frame_sp(sp: u64) {
     let cpu = smp::cpu_id() as usize;
-    CURRENT_FRAME_SP[cpu].store(sp, Ordering::Release);
+    current_frame_sp()[cpu].store(sp, Ordering::Release);
 }
 
 /// Read the current exception frame SP for a given CPU.
-pub fn current_frame_sp(cpu: usize) -> u64 {
-    CURRENT_FRAME_SP[cpu].load(Ordering::Acquire)
+pub fn read_frame_sp(cpu: usize) -> u64 {
+    current_frame_sp()[cpu].load(Ordering::Acquire)
 }
 
 /// Take (read and clear) any pending context switch SP.
@@ -3497,7 +3572,7 @@ pub fn current_frame_sp(cpu: usize) -> u64 {
 /// Returns 0 if no switch is pending.
 pub fn take_pending_switch() -> u64 {
     let cpu = smp::cpu_id() as usize;
-    PENDING_SWITCH_SP[cpu].swap(0, Ordering::AcqRel)
+    pending_switch_sp()[cpu].swap(0, Ordering::AcqRel)
 }
 
 /// Check if a pending context switch is queued on this CPU.
@@ -3506,7 +3581,7 @@ pub fn take_pending_switch() -> u64 {
 /// (signal delivery, is_killed) since those queries would use the wrong thread.
 pub fn has_pending_switch() -> bool {
     let cpu = smp::cpu_id() as usize;
-    PENDING_SWITCH_SP[cpu].load(Ordering::Acquire) != 0
+    pending_switch_sp()[cpu].load(Ordering::Acquire) != 0
 }
 
 /// Get a thread's saved SP. Used by inject_recv_into_frame to write into
@@ -3535,7 +3610,7 @@ pub const PARK_COMMITTED: u8 = 2;
 /// the injection writes to the correct frame.
 pub fn pre_save_frame(tid: ThreadId) {
     let cpu = smp::cpu_id() as usize;
-    let frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
+    let frame_sp = current_frame_sp()[cpu].load(Ordering::Acquire);
     let t = unsafe { thread_mut_from_ref(tid) };
     t.saved_sp = frame_sp;
     // Publish saved_sp before becoming visible. The Release on park_state
@@ -3632,7 +3707,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
         }
     }
 
-    PENDING_SWITCH_SP[cpu].store(next_sp, Ordering::Release);
+    pending_switch_sp()[cpu].store(next_sp, Ordering::Release);
 }
 
 /// Wake a parked thread by marking it Ready and enqueueing it.
@@ -3672,7 +3747,7 @@ pub fn wake_parked_thread(tid: ThreadId) {
         // enqueueing, otherwise the scheduler on another CPU could start
         // executing on the same kernel stack concurrently.
         let parked_cpu = tref.last_cpu.load(Ordering::Relaxed) as usize;
-        while PENDING_SWITCH_SP[parked_cpu].load(Ordering::Acquire) != 0 {
+        while pending_switch_sp()[parked_cpu].load(Ordering::Acquire) != 0 {
             core::hint::spin_loop();
         }
 
@@ -3875,7 +3950,7 @@ fn check_interval_timers() {
 pub fn park_current_for_sleep(deadline_ns: u64) {
     let cpu = smp::cpu_id() as usize;
     let cpu_idx = cpu as u32;
-    let frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
+    let frame_sp = current_frame_sp()[cpu].load(Ordering::Acquire);
 
     let pcpu = smp::current();
     let tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
@@ -3942,7 +4017,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
         }
     }
 
-    PENDING_SWITCH_SP[cpu].store(next_sp, Ordering::Release);
+    pending_switch_sp()[cpu].store(next_sp, Ordering::Release);
 }
 
 /// Set an alarm timer for the current task.
@@ -3976,7 +4051,7 @@ pub fn alarm(initial_ns: u64, interval_ns: u64) -> u64 {
 pub fn handoff_to(receiver_tid: ThreadId) {
     let cpu = smp::cpu_id() as usize;
     let cpu_id = cpu as u32;
-    let frame_sp = CURRENT_FRAME_SP[cpu].load(Ordering::Acquire);
+    let frame_sp = current_frame_sp()[cpu].load(Ordering::Acquire);
 
     let pcpu = smp::current();
     let sender_tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
@@ -4029,7 +4104,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     let recv_sp = receiver.saved_sp;
     crate::arch::irq::restore(irq_saved);
 
-    PENDING_SWITCH_SP[cpu].store(recv_sp, Ordering::Release);
+    pending_switch_sp()[cpu].store(recv_sp, Ordering::Release);
 }
 
 // --- Scheduler Activations API ---

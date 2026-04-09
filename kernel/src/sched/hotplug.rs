@@ -10,27 +10,57 @@
 //! CPUs, leaving idle CPUs in low-power states.
 
 use super::cpumask::{AtomicCpuMask, CpuMask};
-use super::smp::{self, MAX_CPUS};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use super::smp;
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+
+// Per-CPU load tracking lives in dynamic slices installed by
+// `init_dynamic_percpu` from `smp::init_dynamic_percpu`. See the
+// runtime-nr_cpus plan.
 
 /// Per-CPU load: number of ticks in the last window where this CPU was
 /// NOT idle. Updated every tick. Range 0..LOAD_WINDOW.
-static CPU_LOAD: [AtomicU32; MAX_CPUS] = {
-    const INIT: AtomicU32 = AtomicU32::new(0);
-    [INIT; MAX_CPUS]
-};
+static CPU_LOAD_PTR: AtomicPtr<AtomicU32> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn cpu_load_slice() -> &'static [AtomicU32] {
+    let ptr = CPU_LOAD_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "CPU_LOAD not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
 
 /// Per-CPU tick counter within the current load window.
-static CPU_BUSY_TICKS: [AtomicU32; MAX_CPUS] = {
-    const INIT: AtomicU32 = AtomicU32::new(0);
-    [INIT; MAX_CPUS]
-};
+static CPU_BUSY_TICKS_PTR: AtomicPtr<AtomicU32> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn cpu_busy_ticks() -> &'static [AtomicU32] {
+    let ptr = CPU_BUSY_TICKS_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "CPU_BUSY_TICKS not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
 
 /// Per-CPU window tick counter.
-static CPU_WINDOW_TICKS: [AtomicU32; MAX_CPUS] = {
-    const INIT: AtomicU32 = AtomicU32::new(0);
-    [INIT; MAX_CPUS]
-};
+static CPU_WINDOW_TICKS_PTR: AtomicPtr<AtomicU32> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn cpu_window_ticks() -> &'static [AtomicU32] {
+    let ptr = CPU_WINDOW_TICKS_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "CPU_WINDOW_TICKS not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
+
+/// Allocate and install this module's dynamic per-CPU slices.
+/// Called by `smp::init_dynamic_percpu` after `phys::init`.
+pub(crate) fn init_dynamic_percpu() {
+    let n = smp::num_cpus();
+    unsafe {
+        let s = crate::mm::phys::alloc_static_slice::<AtomicU32>(n);
+        CPU_LOAD_PTR.store(s.as_mut_ptr(), Ordering::Release);
+        let s = crate::mm::phys::alloc_static_slice::<AtomicU32>(n);
+        CPU_BUSY_TICKS_PTR.store(s.as_mut_ptr(), Ordering::Release);
+        let s = crate::mm::phys::alloc_static_slice::<AtomicU32>(n);
+        CPU_WINDOW_TICKS_PTR.store(s.as_mut_ptr(), Ordering::Release);
+    }
+}
 
 /// Load measurement window size in ticks (1 second at 100 Hz).
 const LOAD_WINDOW: u32 = 100;
@@ -56,24 +86,27 @@ pub fn online_mask() -> CpuMask {
 /// Update per-CPU load counter. Called from tick() on each CPU.
 pub fn tick_load(cpu: u32, is_idle: bool) {
     let c = cpu as usize;
+    let busy = cpu_busy_ticks();
+    let win = cpu_window_ticks();
+    let load = cpu_load_slice();
     if !is_idle {
-        CPU_BUSY_TICKS[c].fetch_add(1, Ordering::Relaxed);
+        busy[c].fetch_add(1, Ordering::Relaxed);
     }
-    let window = CPU_WINDOW_TICKS[c].fetch_add(1, Ordering::Relaxed) + 1;
+    let window = win[c].fetch_add(1, Ordering::Relaxed) + 1;
     if window >= LOAD_WINDOW {
         // End of window: publish load and reset counters.
-        let busy = CPU_BUSY_TICKS[c].swap(0, Ordering::Relaxed);
-        CPU_LOAD[c].store(busy, Ordering::Relaxed);
-        CPU_WINDOW_TICKS[c].store(0, Ordering::Relaxed);
+        let b = busy[c].swap(0, Ordering::Relaxed);
+        load[c].store(b, Ordering::Relaxed);
+        win[c].store(0, Ordering::Relaxed);
     }
 }
 
 /// Get current load for a CPU (0..LOAD_WINDOW, higher = busier).
 pub fn cpu_load(cpu: u32) -> u32 {
-    if (cpu as usize) >= MAX_CPUS {
+    if (cpu as usize) >= smp::num_cpus() {
         return 0;
     }
-    CPU_LOAD[cpu as usize].load(Ordering::Relaxed)
+    cpu_load_slice()[cpu as usize].load(Ordering::Relaxed)
 }
 
 /// Get the load window size (for interpreting load values).
@@ -87,7 +120,7 @@ pub fn load_window() -> u32 {
 /// Returns 0 on success, 1 on error (e.g., trying to offline the last CPU,
 /// or invalid CPU ID).
 pub fn cpu_offline(cpu: u32) -> u64 {
-    if (cpu as usize) >= MAX_CPUS {
+    if (cpu as usize) >= smp::num_cpus() {
         return 1;
     }
 
@@ -159,7 +192,7 @@ pub fn cpu_offline(cpu: u32) -> u64 {
 ///
 /// Returns 0 on success, 1 on error.
 pub fn cpu_online(cpu: u32) -> u64 {
-    if (cpu as usize) >= MAX_CPUS {
+    if (cpu as usize) >= smp::num_cpus() {
         return 1;
     }
 
@@ -184,9 +217,9 @@ pub fn cpu_online(cpu: u32) -> u64 {
     }
 
     // Reset load counters for this CPU.
-    CPU_LOAD[cpu as usize].store(0, Ordering::Relaxed);
-    CPU_BUSY_TICKS[cpu as usize].store(0, Ordering::Relaxed);
-    CPU_WINDOW_TICKS[cpu as usize].store(0, Ordering::Relaxed);
+    cpu_load_slice()[cpu as usize].store(0, Ordering::Relaxed);
+    cpu_busy_ticks()[cpu as usize].store(0, Ordering::Relaxed);
+    cpu_window_ticks()[cpu as usize].store(0, Ordering::Relaxed);
 
     HOTPLUG_EVENTS.fetch_add(1, Ordering::Relaxed);
     0
@@ -207,8 +240,9 @@ pub fn pick_packed_cpu() -> u32 {
     let mut best_load: u32 = 0;
     let mut found = false;
 
+    let load_slice = cpu_load_slice();
     mask.for_each(|cpu| {
-        let load = CPU_LOAD[cpu as usize].load(Ordering::Relaxed);
+        let load = load_slice[cpu as usize].load(Ordering::Relaxed);
         if !found || load > best_load {
             best_cpu = cpu;
             best_load = load;

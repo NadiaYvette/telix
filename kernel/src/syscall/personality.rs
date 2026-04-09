@@ -198,7 +198,7 @@ pub fn forward_to_server(
     // which overwrites saved_sp with the kernel context (not the exception frame).
     {
         let cpu = crate::sched::smp::cpu_id() as usize;
-        let frame_sp = crate::sched::scheduler::current_frame_sp(cpu);
+        let frame_sp = crate::sched::scheduler::read_frame_sp(cpu);
         unsafe { crate::sched::scheduler::thread_mut_from_ref(tid) }.personality_frame_sp = frame_sp;
     }
 

@@ -19,7 +19,7 @@
 
 use crate::sched::hotplug;
 use crate::sched::smp::{self, MAX_CPUS};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // Per-CPU generation counter
@@ -28,7 +28,32 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// Each CPU increments its generation counter every tick (in try_switch).
 /// `synchronize_rcu` / callback processing observe these to detect grace
 /// period completion.
-static RCU_GEN: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+///
+/// Stored in a dynamic per-CPU slice installed by `init_dynamic_percpu` from
+/// `smp::init_dynamic_percpu`. Zero-init from `alloc_static_slice` matches
+/// `AtomicU64::new(0)`.
+static RCU_GEN_PTR: AtomicPtr<AtomicU64> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn rcu_gen() -> &'static [AtomicU64] {
+    let ptr = RCU_GEN_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "RCU_GEN not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
+
+/// Allocate and install this module's dynamic per-CPU slices.
+/// Called by `smp::init_dynamic_percpu` after `phys::init`.
+pub(crate) fn init_dynamic_percpu() {
+    let n = smp::num_cpus();
+    unsafe {
+        let s = crate::mm::phys::alloc_static_slice::<AtomicU64>(n);
+        RCU_GEN_PTR.store(s.as_mut_ptr(), Ordering::Release);
+        let s = crate::mm::phys::alloc_static_slice::<RcuCpuState>(n);
+        RCU_CPU_PTR.store(s.as_mut_ptr(), Ordering::Release);
+        let s = crate::mm::phys::alloc_static_slice::<AtomicUsize>(n);
+        RCU_BUSY_PTR.store(s.as_mut_ptr(), Ordering::Release);
+    }
+}
 
 /// Record a quiescent state on the current CPU.
 /// Called once per timer tick from `try_switch`, and also on voluntary
@@ -40,7 +65,7 @@ pub fn rcu_quiescent() {
     // Acquire loads.  The quiescent increment itself doesn't order any
     // particular data — the ordering comes from the Acquire/Release on
     // the child pointers that readers follow.
-    RCU_GEN[cpu].fetch_add(1, Ordering::Release);
+    rcu_gen()[cpu].fetch_add(1, Ordering::Release);
     rcu_process_callbacks(cpu);
 }
 
@@ -50,15 +75,16 @@ pub fn synchronize_rcu() {
     // Snapshot every online CPU's current generation.
     let mask = hotplug::online_mask();
     let mut snap = [0u64; MAX_CPUS];
+    let gens = rcu_gen();
     mask.for_each(|cpu| {
-        snap[cpu as usize] = RCU_GEN[cpu as usize].load(Ordering::Acquire);
+        snap[cpu as usize] = gens[cpu as usize].load(Ordering::Acquire);
     });
 
     // Spin until each CPU advances past its snapshot.
     loop {
         let mut done = true;
         mask.for_each(|cpu| {
-            let cur = RCU_GEN[cpu as usize].load(Ordering::Acquire);
+            let cur = gens[cpu as usize].load(Ordering::Acquire);
             if cur <= snap[cpu as usize] {
                 done = false;
             }
@@ -126,10 +152,27 @@ impl RcuCpuState {
 // rcu_quiescent runs from IRQ (timer tick) and rcu_defer_free runs
 // from syscall context, we use an atomic flag as a simple reentrance
 // guard.
-static mut RCU_CPU: [RcuCpuState; MAX_CPUS] = [const { RcuCpuState::new() }; MAX_CPUS];
+//
+// Stored in a dynamic per-CPU slice. `RcuCpuState::new()` is all-zero
+// (null pointers + 0 count), matching `alloc_static_slice` zero-init.
+static RCU_CPU_PTR: AtomicPtr<RcuCpuState> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn rcu_cpu() -> &'static mut [RcuCpuState] {
+    let ptr = RCU_CPU_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "RCU_CPU not init");
+    unsafe { core::slice::from_raw_parts_mut(ptr, smp::num_cpus()) }
+}
 
 /// Reentrance guard per CPU (0 = free, 1 = in use).
-static RCU_BUSY: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static RCU_BUSY_PTR: AtomicPtr<AtomicUsize> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn rcu_busy() -> &'static [AtomicUsize] {
+    let ptr = RCU_BUSY_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "RCU_BUSY not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
 
 /// Defer freeing `ptr` by calling `free_fn(ptr)` after a grace period.
 ///
@@ -140,15 +183,16 @@ pub fn rcu_defer_free(ptr: usize, free_fn: fn(usize)) {
     let cpu = smp::cpu_id() as usize;
 
     // Reentrance guard (IRQ might fire rcu_quiescent while we're here).
-    if RCU_BUSY[cpu].swap(1, Ordering::Acquire) != 0 {
+    let busy = rcu_busy();
+    if busy[cpu].swap(1, Ordering::Acquire) != 0 {
         // Already inside RCU processing on this CPU — execute immediately.
         // This is safe because we're past the grace period detection point.
         free_fn(ptr);
         return;
     }
 
-    // Safety: we are the only accessor of RCU_CPU[cpu] (same CPU, guard held).
-    let state = unsafe { &mut RCU_CPU[cpu] };
+    // Safety: we are the only accessor of rcu_cpu()[cpu] (same CPU, guard held).
+    let state = &mut rcu_cpu()[cpu];
 
     // Ensure we have a current batch.
     if state.current.is_null() {
@@ -156,13 +200,13 @@ pub fn rcu_defer_free(ptr: usize, free_fn: fn(usize)) {
             let batch = page.as_usize() as *mut RcuBatch;
             unsafe {
                 (*batch).next = core::ptr::null_mut();
-                (*batch).epoch = RCU_GEN[cpu].load(Ordering::Relaxed);
+                (*batch).epoch = rcu_gen()[cpu].load(Ordering::Relaxed);
                 (*batch).len = 0;
             }
             state.current = batch;
         } else {
             // OOM — free immediately (safe but blocks grace period guarantee).
-            RCU_BUSY[cpu].store(0, Ordering::Release);
+            busy[cpu].store(0, Ordering::Release);
             free_fn(ptr);
             return;
         }
@@ -185,27 +229,29 @@ pub fn rcu_defer_free(ptr: usize, free_fn: fn(usize)) {
         state.current = core::ptr::null_mut();
     }
 
-    RCU_BUSY[cpu].store(0, Ordering::Release);
+    busy[cpu].store(0, Ordering::Release);
 }
 
 /// Process eligible callbacks on this CPU.  Called from `rcu_quiescent`.
 fn rcu_process_callbacks(cpu: usize) {
-    if RCU_BUSY[cpu].swap(1, Ordering::Acquire) != 0 {
+    let busy = rcu_busy();
+    if busy[cpu].swap(1, Ordering::Acquire) != 0 {
         return; // Reentrant — skip this tick.
     }
 
-    let state = unsafe { &mut RCU_CPU[cpu] };
+    let state = &mut rcu_cpu()[cpu];
 
     if state.pending_count == 0 {
-        RCU_BUSY[cpu].store(0, Ordering::Release);
+        busy[cpu].store(0, Ordering::Release);
         return;
     }
 
     // Snapshot all CPUs' generations to determine which epoch is safe to free.
     let mask = hotplug::online_mask();
+    let gens = rcu_gen();
     let mut min_gen = u64::MAX;
     mask.for_each(|c| {
-        let g = RCU_GEN[c as usize].load(Ordering::Acquire);
+        let g = gens[c as usize].load(Ordering::Acquire);
         if g < min_gen {
             min_gen = g;
         }
@@ -252,11 +298,11 @@ fn rcu_process_callbacks(cpu: usize) {
             state.pending_count -= cur.len;
             cur.len = 0;
             // Update epoch for reuse.
-            cur.epoch = RCU_GEN[cpu].load(Ordering::Relaxed);
+            cur.epoch = gens[cpu].load(Ordering::Relaxed);
         }
     }
 
-    RCU_BUSY[cpu].store(0, Ordering::Release);
+    busy[cpu].store(0, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------

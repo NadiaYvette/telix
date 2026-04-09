@@ -7,7 +7,7 @@
 //!   x86-64:  LAPIC ID register
 
 use super::thread::ThreadId;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 /// Maximum CPUs supported (compile-time, selected via cargo feature).
 #[cfg(feature = "max_cpus_4")]
@@ -63,12 +63,26 @@ pub fn detect_cpu_count() -> usize {
 }
 
 /// Allocate and install dynamic per-CPU slices. Called once from the BSP
-/// just after `phys::init()` returns, before `sched::init()`. Per-module
-/// migrations land in subsequent commits — for now this is an empty shell
-/// that establishes the call site.
+/// just after `phys::init()` returns, before `sched::init()`. Each module
+/// that owns per-CPU state publishes its own slices here.
 pub fn init_dynamic_percpu() {
     debug_assert!(NR_CPUS.load(Ordering::Relaxed) >= 1);
     debug_assert!(num_cpus() <= MAX_CPUS);
+
+    // PER_CPU itself.
+    let n = num_cpus();
+    unsafe {
+        let s = crate::mm::phys::alloc_static_slice::<PerCpuData>(n);
+        // PerCpuData::new() produces an all-zero image, matching what
+        // alloc_static_slice gives us. No explicit init needed.
+        PER_CPU_PTR.store(s.as_mut_ptr(), Ordering::Release);
+    }
+
+    // Per-module slices.
+    super::scheduler::init_dynamic_percpu();
+    super::hotplug::init_dynamic_percpu();
+    super::topology::init_dynamic_percpu();
+    crate::sync::rcu::init_dynamic_percpu();
 }
 
 /// Per-hart trap scratch data for RISC-V tp/sscratch swap convention.
@@ -162,7 +176,20 @@ impl PerCpuData {
     }
 }
 
-static PER_CPU: [PerCpuData; MAX_CPUS] = [const { PerCpuData::new() }; MAX_CPUS];
+/// Dynamic per-CPU data slice. Installed by `init_dynamic_percpu` after
+/// phys::init; indexed by CPU id thereafter.
+static PER_CPU_PTR: AtomicPtr<PerCpuData> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Get a per-CPU entry by raw pointer arithmetic, skipping slice bounds
+/// checks. The caller must ensure `cpu < num_cpus()` (true for any valid
+/// cpu_id). This is the hot accessor used by the scheduler.
+#[inline]
+fn per_cpu_at(cpu: usize) -> &'static PerCpuData {
+    let ptr = PER_CPU_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "PER_CPU not init");
+    debug_assert!(cpu < num_cpus());
+    unsafe { &*ptr.add(cpu) }
+}
 
 /// Number of CPUs that have completed initialization.
 static ONLINE_CPUS: AtomicU32 = AtomicU32::new(0);
@@ -176,7 +203,7 @@ pub fn cpu_id() -> u32 {
 /// Get per-CPU data for the given CPU index.
 #[inline]
 pub fn get(cpu: u32) -> &'static PerCpuData {
-    &PER_CPU[cpu as usize]
+    per_cpu_at(cpu as usize)
 }
 
 /// Get per-CPU data for the current CPU.
