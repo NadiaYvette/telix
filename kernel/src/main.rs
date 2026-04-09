@@ -200,12 +200,18 @@ fn startup_thread() -> ! {
 
     if let Some(base) = drivers::virtio_mmio::find_device(drivers::virtio_mmio::DEVICE_NET) {
         let irq = drivers::virtio_mmio::device_irq(base) as u64;
-        let arg0 = (base as u64) | (irq << 48);
+        let region_id = cap::mmio::register_region(base, 0x1000, cap::mmio::CacheAttr::Device);
+        // Note: net_srv is poll-based, so no irq_dispatch::register here.
+        let arg0_upper = irq << 48;
         println!(
-            "  virtio-net at {:#x}, irq {}, spawning net_srv with arg0={:#x}",
-            base, irq, arg0
+            "  virtio-net at {:#x}, irq {}, region_id={:?}, spawning net_srv",
+            base, irq, region_id
         );
-        match sched::spawn_user(b"net_srv", 50, 20, arg0) {
+        let spawned = match region_id {
+            Some(rid) => sched::spawn_user_with_mmio_cap(b"net_srv", 50, 20, arg0_upper, rid),
+            None => sched::spawn_user(b"net_srv", 50, 20, (base as u64) | arg0_upper),
+        };
+        match spawned {
             Some(tid) => println!("  net_srv spawned (thread {})", tid),
             None => println!("  WARNING: net_srv not found (ok if not yet built)"),
         }
