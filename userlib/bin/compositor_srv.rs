@@ -327,7 +327,7 @@ fn poll_reply(port: u64, expected_tag: u64) -> Option<syscall::Message> {
 }
 
 /// Connect to fb_srv: get info and map the framebuffer.
-fn init_framebuffer() -> Option<(u64, usize, u32, u32, u32)> {
+fn init_framebuffer(fb_cap_slot: usize) -> Option<(u64, usize, u32, u32, u32)> {
     // Retry ns_lookup for fb.
     let mut fb_port = None;
     for _ in 0..500 {
@@ -339,20 +339,18 @@ fn init_framebuffer() -> Option<(u64, usize, u32, u32, u32)> {
 
     let reply = syscall::port_create();
 
-    // FB_GET_INFO: get dimensions and physical address.
+    // FB_GET_INFO: get dimensions. We no longer consume the phys address
+    // from the reply — the kernel granted us a Memory cap at spawn time.
     syscall::send(fb_port, FB_GET_INFO, 0, 0, reply << 32, 0);
     let info = poll_reply(reply, FB_GET_INFO_OK)?;
     let fb_w = info.data[0] as u32;
     let fb_h = (info.data[0] >> 32) as u32;
     let fb_pitch = info.data[1] as u32;
     let _bpp = (info.data[1] >> 32) as u32;
-    let fb_phys = info.data[2];
 
-    // Map framebuffer directly via mmap_device (same as fb_srv does internally).
-    let fb_bytes = fb_pitch as usize * fb_h as usize;
-    let fb_pages_4k = (fb_bytes + 4095) / 4096;
-    let fb_va = if fb_phys != 0 {
-        match syscall::mmap_device(fb_phys as usize, fb_pages_4k) {
+    // Map framebuffer via the pre-granted Memory cap (same region as fb_srv).
+    let fb_va = if fb_cap_slot != 0 {
+        match syscall::mmio_map_cap(fb_cap_slot) {
             Some(va) => va,
             None => return None,
         }
@@ -1372,11 +1370,14 @@ impl Compositor {
 }
 
 #[unsafe(no_mangle)]
-fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
+fn main(arg0: u64, _arg1: u64, _arg2: u64) {
+    // arg0 low 16 bits = VBE framebuffer MMIO cap slot (granted by kernel).
+    let fb_cap_slot = (arg0 & 0xFFFF) as usize;
+
     syscall::debug_puts(b"  [compositor_srv] starting\n");
 
     // Connect to fb_srv.
-    let (fb_port, fb_va, fb_w, fb_h, fb_pitch) = match init_framebuffer() {
+    let (fb_port, fb_va, fb_w, fb_h, fb_pitch) = match init_framebuffer(fb_cap_slot) {
         Some(info) => info,
         None => {
             syscall::debug_puts(b"  [compositor_srv] ERROR: failed to connect to fb_srv\n");

@@ -237,8 +237,24 @@ fn startup_thread() -> ! {
         }
         // Probe BochsVBE (QEMU -vga std) and set up framebuffer info.
         arch::x86_64::pci::probe_bochs_vbe();
-        // Spawn fb_srv: arg0=0 means no virtio-gpu, use VBE fallback.
-        match sched::spawn_user(b"fb_srv", 50, 20, 0) {
+        // Register the VBE framebuffer as an MMIO region so fb_srv and
+        // compositor_srv can map it via sys_mmio_map_cap. This is x86_64's
+        // only MMIO device outside PCI I/O ports.
+        let vbe_region = firmware::framebuffer_info().and_then(|fb| {
+            let size = (fb.pitch as usize) * (fb.height as usize);
+            if fb.addr != 0 && size > 0 {
+                cap::mmio::register_region(fb.addr as usize, size, cap::mmio::CacheAttr::WriteCombine)
+            } else {
+                None
+            }
+        });
+        // fb_srv arg0 encoding: arg0=0 means no VBE available.
+        // With a VBE region, the cap slot is granted by spawn_user_with_mmio_cap.
+        let fb_spawn = match vbe_region {
+            Some(rid) => sched::spawn_user_with_mmio_cap(b"fb_srv", 50, 20, 0, rid),
+            None => sched::spawn_user(b"fb_srv", 50, 20, 0),
+        };
+        match fb_spawn {
             Some(tid) => println!("  fb_srv spawned (thread {})", tid),
             None => println!("  WARNING: fb_srv not found (ok if not yet built)"),
         }
@@ -247,8 +263,14 @@ fn startup_thread() -> ! {
             Some(tid) => println!("  input_srv spawned (thread {})", tid),
             None => println!("  WARNING: input_srv not found (ok if not yet built)"),
         }
-        // Spawn compositor_srv: window compositor (connects to fb_srv + input_srv).
-        match sched::spawn_user(b"compositor_srv", 50, 20, 0) {
+        // Spawn compositor_srv: connects to fb_srv + input_srv. It maps the
+        // VBE framebuffer directly via a cap granted here (same region as
+        // fb_srv — shared-memory display).
+        let comp_spawn = match vbe_region {
+            Some(rid) => sched::spawn_user_with_mmio_cap(b"compositor_srv", 50, 20, 0, rid),
+            None => sched::spawn_user(b"compositor_srv", 50, 20, 0),
+        };
+        match comp_spawn {
             Some(tid) => println!("  compositor_srv spawned (thread {})", tid),
             None => println!("  WARNING: compositor_srv not found (ok if not yet built)"),
         }

@@ -638,8 +638,12 @@ fn draw_gradient(fb_va: usize, width: u32, height: u32, pitch: u32) {
     }
 }
 
-/// Try VBE fallback: query framebuffer info from kernel, map it.
-fn try_vbe() -> Option<FbState> {
+/// Try VBE fallback: query framebuffer dims from kernel, map via the
+/// pre-granted MMIO cap.
+fn try_vbe(fb_cap_slot: usize) -> Option<FbState> {
+    if fb_cap_slot == 0 {
+        return None;
+    }
     let (addr, width, height, pitch, bpp) = syscall::framebuffer_info()?;
 
     if addr == 0 || width == 0 || height == 0 {
@@ -652,16 +656,14 @@ fn try_vbe() -> Option<FbState> {
     print_num(height as u64);
     syscall::debug_puts(b"x");
     print_num(bpp as u64);
-    syscall::debug_puts(b" at ");
-    print_hex(addr);
+    syscall::debug_puts(b" via cap slot ");
+    print_num(fb_cap_slot as u64);
     syscall::debug_puts(b"\n");
 
     let fb_bytes = pitch as usize * height as usize;
-    // mmap_device maps 4KB hardware pages, not system pages.
-    let fb_pages_4k = (fb_bytes + 4095) / 4096;
 
-    // Map the framebuffer physical memory into userspace.
-    let fb_va = syscall::mmap_device(addr as usize, fb_pages_4k)?;
+    // Map the framebuffer via the pre-granted Memory cap.
+    let fb_va = syscall::mmio_map_cap(fb_cap_slot)?;
     let fb_pages = (fb_bytes + syscall::page_size() - 1) / syscall::page_size();
 
     Some(FbState {
@@ -678,7 +680,13 @@ fn try_vbe() -> Option<FbState> {
 
 #[unsafe(no_mangle)]
 fn main(arg0: u64, _arg1: u64, _arg2: u64) {
-    let bar0 = (arg0 & 0xFFFF_FFFF_FFFF) as u16;
+    // arg0 encoding (matches the shared "MMIO cap slot in low 16" convention
+    // used by blk_srv/net_srv — spawn_user_with_mmio_cap writes it there):
+    //   bits  0-15: VBE framebuffer MMIO cap slot (0 if no VBE)
+    //   bits 16-31: virtio-gpu PCI BAR0 port (0 if no GPU)
+    //   bits 48-63: IRQ (for virtio-gpu)
+    let fb_cap_slot = (arg0 & 0xFFFF) as usize;
+    let bar0 = ((arg0 >> 16) & 0xFFFF) as u16;
     let irq = (arg0 >> 48) as u32;
 
     syscall::debug_puts(b"  [fb_srv] starting");
@@ -687,6 +695,10 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         print_hex(bar0 as u64);
         syscall::debug_puts(b" irq=");
         print_num(irq as u64);
+    }
+    if fb_cap_slot != 0 {
+        syscall::debug_puts(b", VBE fb cap slot=");
+        print_num(fb_cap_slot as u64);
     }
     syscall::debug_puts(b"\n");
 
@@ -712,17 +724,17 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                     None => {
                         syscall::debug_puts(b"  [fb_srv] GPU display init failed, trying VBE\n");
-                        try_vbe()
+                        try_vbe(fb_cap_slot)
                     }
                 }
             }
             None => {
                 syscall::debug_puts(b"  [fb_srv] GPU init failed, trying VBE\n");
-                try_vbe()
+                try_vbe(fb_cap_slot)
             }
         }
     } else {
-        try_vbe()
+        try_vbe(fb_cap_slot)
     };
 
     let fb = match fb.as_mut() {
