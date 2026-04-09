@@ -22,6 +22,7 @@ const IO_WRITE_OK: u64 = 0x301;
 // --- FS protocol constants (served by this server) ---
 const FS_OPEN: u64 = 0x2000;
 const FS_OPEN_OK: u64 = 0x2001;
+const FS_OPEN_LONG: u64 = 0x2002;
 const FS_READ: u64 = 0x2100;
 const FS_READ_OK: u64 = 0x2101;
 const FS_READDIR: u64 = 0x2200;
@@ -29,6 +30,9 @@ const FS_READDIR_OK: u64 = 0x2201;
 const FS_READDIR_END: u64 = 0x2202;
 const FS_STAT: u64 = 0x2300;
 const FS_STAT_OK: u64 = 0x2301;
+const FS_STAT_LONG: u64 = 0x2302;
+/// VFS grants its scratch page here in our aspace for long-path lookups.
+const VFS_LONG_PATH_SCRATCH_VA: usize = 0x5_0000_0000;
 const FS_CLOSE: u64 = 0x2400;
 const FS_CREATE: u64 = 0x2500;
 const FS_CREATE_OK: u64 = 0x2501;
@@ -1235,6 +1239,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
     syscall::ns_register(b"ext2", port);
+    syscall::ns_register(b"ext2_task", my_aspace);
 
     syscall::debug_puts(b"  [ext2_srv] registered, port=");
     print_num(port as u64);
@@ -1493,16 +1498,25 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let block_idx = offset / sb.block_size;
                 let offset_in_block = (offset % sb.block_size) as usize;
 
+                // Sparse hole handling: a missing block in an ext2 file
+                // means zero-filled data per ext2 semantics. Don't error —
+                // fill the block buffer with zeros for this logical block.
+                let is_sparse_hole;
                 let phys_block =
                     match resolve_block(&blk, &sb, &file.block_ptrs, block_idx, indirect_buf_va) {
-                        Some(b) => b,
-                        None => {
-                            syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
-                            continue;
-                        }
+                        Some(b) => { is_sparse_hole = false; b }
+                        None => { is_sparse_hole = true; 0 }
                     };
 
-                if !blk.read_block(phys_block, sb.block_size, block_buf_va) {
+                if is_sparse_hole {
+                    unsafe {
+                        core::ptr::write_bytes(
+                            block_buf_va as *mut u8,
+                            0,
+                            sb.block_size as usize,
+                        );
+                    }
+                } else if !blk.read_block(phys_block, sb.block_size, block_buf_va) {
                     syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
                     continue;
                 }
@@ -1609,6 +1623,85 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     None => {
                         syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
                     }
+                }
+            }
+
+            FS_OPEN_LONG => {
+                // Wire: data[0] = name_len(16) | flags(16) | reply_port(32)
+                // Path bytes at VFS_LONG_PATH_SCRATCH_VA (granted by VFS).
+                let name_len = (msg.data[0] & 0xFFFF) as usize;
+                let _flags = ((msg.data[0] >> 16) & 0xFFFF) as u32;
+                let reply_port = msg.data[0] >> 32;
+                let caller_pid = msg.data[1] as u32;
+
+                let mut name = [0u8; 256];
+                let nlen = name_len.min(256);
+                let src = VFS_LONG_PATH_SCRATCH_VA as *const u8;
+                for i in 0..nlen {
+                    name[i] = unsafe { *src.add(i) };
+                }
+
+                if let Some((ino, mode, uid, gid, size, blocks)) =
+                    path_resolve(&blk, &sb, &bgd, &name[..nlen], indirect_buf_va, block_buf_va)
+                {
+                    let mut handle = u64::MAX;
+                    for (i, f) in open_files.iter_mut().enumerate() {
+                        if !f.active {
+                            f.active = true;
+                            f.inode_num = ino;
+                            f.file_size = size;
+                            f.mode = mode;
+                            f.uid = uid;
+                            f.gid = gid;
+                            f.block_ptrs = blocks;
+                            f.pid = caller_pid;
+                            handle = i as u64;
+                            break;
+                        }
+                    }
+                    if handle == u64::MAX {
+                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    } else {
+                        syscall::send(
+                            reply_port,
+                            FS_OPEN_OK,
+                            handle,
+                            size as u64,
+                            my_aspace as u64,
+                            0,
+                        );
+                    }
+                } else {
+                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                }
+            }
+
+            FS_STAT_LONG => {
+                let name_len = (msg.data[0] & 0xFFFF) as usize;
+                let reply_port = msg.data[0] >> 32;
+
+                let mut name = [0u8; 256];
+                let nlen = name_len.min(256);
+                let src = VFS_LONG_PATH_SCRATCH_VA as *const u8;
+                for i in 0..nlen {
+                    name[i] = unsafe { *src.add(i) };
+                }
+
+                if let Some((ino, mode, uid, gid, size, _blocks)) =
+                    path_resolve(&blk, &sb, &bgd, &name[..nlen], indirect_buf_va, block_buf_va)
+                {
+                    let uid_gid = (uid as u64) | ((gid as u64) << 16);
+                    let _ = mode;
+                    syscall::send(
+                        reply_port,
+                        FS_STAT_OK,
+                        size as u64,
+                        mode as u64,
+                        uid_gid,
+                        ino as u64,
+                    );
+                } else {
+                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
                 }
             }
 
