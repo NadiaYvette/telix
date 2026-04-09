@@ -153,6 +153,9 @@ fn startup_thread() -> ! {
 
     sched::spawn(io::initramfs::initramfs_server, 50, 20).expect("spawn initramfs");
 
+    // Driver model Step A: smoke-test IRQ→port message delivery.
+    io::irq_dispatch::self_test();
+
     // Discover and spawn virtio-mmio device servers.
     // Uses firmware-discovered devices (from DTB) with hardcoded fallback.
     // On x86_64 find_device returns None (no MMIO transport), so these are no-ops.

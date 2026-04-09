@@ -696,6 +696,28 @@ pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {
     }
 }
 
+/// Send a message to a port from kernel/interrupt context.
+///
+/// Bypasses sender priority stamping (there is no current thread to credit
+/// when called from a hardware IRQ handler) and avoids touching scheduler
+/// state that would be unsafe in IRQ context. Returns Err if the destination
+/// port is missing or its queue is full.
+///
+/// Used by `irq_dispatch::handle_irq` to deliver hardware interrupts as
+/// messages to a userspace driver's port.
+pub fn send_from_kernel(port_id: PortId, msg: Message) -> Result<(), ()> {
+    let port = match port_ref(port_id) {
+        Some(p) => p,
+        None => return Err(()),
+    };
+    if port.is_kernel_held() {
+        let handler_fn: KernelHandler = unsafe { core::mem::transmute(port.kernel_handler) };
+        let _reply = handler_fn(port_id, port.kernel_user_data, &msg);
+        return Ok(());
+    }
+    do_send(port, &msg)
+}
+
 /// Send a message to a port (blocking).
 /// Blocks if the queue is full until space is available.
 pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {

@@ -138,6 +138,8 @@ pub const SYS_PERSONALITY_MAP_SHARED: u64 = 0xF014;
 pub const SYS_PERSONALITY_PEEK_SIGNALS: u64 = 0xF015;
 pub const SYS_FRAMEBUFFER_INFO: u64 = 109;
 pub const SYS_PORT_ALIVE: u64 = 110;
+pub const SYS_IRQ_ATTACH: u64 = 111;
+pub const SYS_IRQ_ACK: u64 = 112;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -276,6 +278,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_MMAP_DEVICE => sys_mmap_device(a0, a1),
         SYS_VIRT_TO_PHYS => sys_virt_to_phys(a0),
         SYS_IRQ_WAIT => sys_irq_wait(a0, a1),
+        SYS_IRQ_ATTACH => sys_irq_attach(a0, a1, a2),
+        SYS_IRQ_ACK => sys_irq_ack(a0),
         SYS_GETCHAR => sys_getchar(),
         SYS_IOPORT => sys_ioport(a0, a1, a2),
         SYS_SPAWN_ELF => sys_spawn_elf(a0, a1, a2, a3),
@@ -1388,6 +1392,37 @@ fn sys_irq_wait(irq_num: u64, mmio_base: u64) -> u64 {
 
     // Subsequent calls: block until IRQ fires.
     crate::io::irq_dispatch::wait(irq)
+}
+
+/// Bind an IRQ to a destination port for message-based delivery.
+/// `port_id` must be a valid port the calling task holds. `mmio_base = 0`
+/// skips the kernel-side virtio ACK (driver ACKs the device itself).
+fn sys_irq_attach(irq_num: u64, port_id: u64, mmio_base: u64) -> u64 {
+    let irq = irq_num as u32;
+    let (irq_lo, irq_hi) = crate::arch::irq::valid_irq_range();
+    if irq < irq_lo || irq > irq_hi {
+        return u64::MAX;
+    }
+    if crate::ipc::port::port_ref(port_id).is_none() {
+        return u64::MAX;
+    }
+    if !crate::io::irq_dispatch::attach_port(irq, port_id, mmio_base as usize) {
+        return u64::MAX;
+    }
+    0
+}
+
+/// Acknowledge an IRQ message. Currently a no-op: virtio devices are
+/// already ACKed by the kernel handler before the message is queued, and
+/// platform-IC masking is not yet implemented. Reserved for future use
+/// once IRQ-line masking is wired up.
+fn sys_irq_ack(irq_num: u64) -> u64 {
+    let irq = irq_num as u32;
+    let (irq_lo, irq_hi) = crate::arch::irq::valid_irq_range();
+    if irq < irq_lo || irq > irq_hi {
+        return u64::MAX;
+    }
+    0
 }
 
 fn sys_ioport(op: u64, port: u64, value: u64) -> u64 {
