@@ -749,6 +749,23 @@ Telix drivers are userspace servers accessing hardware via capabilities and comm
 - Phased introduction: Phase 1 (kernel primitives) → Phase 2 (bus enumeration) → Phase 3 (driver library) → Phase 4 (hotplug/power)
 - Retrenchment strategies available if IPC overhead is unacceptable: polling, co-location, kernel migration
 
+### 13.1 Phased Rollout — Status (2026-04-10)
+
+The driver model is being introduced incrementally so that every commit keeps the existing 175-phase test suite green. Progress so far:
+
+| Step | Scope | Status |
+|------|-------|--------|
+| **A** | IRQ → port message plumbing (`cap::irq` + `irq_dispatch::register`, per-arch ack path) | ✅ Done |
+| **B** | Firmware MMIO memory capabilities (`cap::mmio::register_region`, `CacheAttr::{Device,WriteCombine}`, boot-time device-range registration from the firmware IR) | ✅ Done |
+| **C1–C3** | Cap-based MMIO mapping syscall (`sys_mmio_map_cap`, slot 3 convention via `spawn_user_with_mmio_cap`) and migration of virtio-mmio `net_srv` / `blk_srv` | ✅ Done |
+| **C (b)** | Extended cap-based MMIO to loongarch64 PCI BARs (dynamic `register_region` from the LA64 spawn path), x86_64 VBE framebuffer (`fb_srv` with `CacheAttr::WriteCombine`), and the compositor's framebuffer handle (`compositor_srv` consumes the same cap slot) | ✅ Done |
+| **D** | Removed the legacy `sys_mmap_device` syscall and the per-arch `DEVICE_MMIO_RANGE` allowlists entirely — all userspace MMIO now flows through typed memory caps | ✅ Done (commit `212d302`) |
+| **C4** | Port-based IRQ for `blk_srv` (currently polling); last driver still on the pre-Step-A interrupt path | ⏳ Pending |
+| **E** | Device-manager server: driver matching database, lifecycle/hotplug, centralized capability distribution | Not started |
+| **F** | PCI bus server (x86_64 + LA64), Platform/DTB bus server (aarch64 + riscv64) as independent servers, replacing the kernel-side `drivers/` enumeration stubs | Not started |
+
+**Current posture:** Every userspace driver (`net_srv`, `blk_srv`, `fb_srv`, `compositor_srv`) gets its MMIO through a capability granted by the root task at spawn time, validated on use by `sys_mmio_map_cap`. There is no kernel-side phys-range allowlist and no hardcoded device VA window. The remaining gap before "full Phase 1" driver-model is a single driver on port-based IRQ (Step C4) plus the device-manager and bus-server split (Steps E–F); neither is on the critical path for Swap, LTP, or the graphics stack.
+
 ---
 
 ## 14. OS Personality Servers
@@ -853,6 +870,7 @@ The full phase-by-phase roadmap with dependencies is in [`docs/roadmap.md`](road
 
 | Date | Change |
 |------|--------|
+| 2026-04-10 | Driver model status refresh (§13.1): Steps A, B, C1–C3, C(b), and D complete; `sys_mmap_device` and per-arch `DEVICE_MMIO_RANGE` removed; all userspace drivers (net/blk/fb/compositor) now use cap-gated `sys_mmio_map_cap`. Remaining: Step C4 (port-IRQ for blk_srv), Step E (device manager), Step F (bus servers). |
 | 2026-04-09 | Status refresh: marked PAGE_MMUSHIFT (§6), kernel command line (§11), and core Linux personality (§7.2) as implemented; documented the boot-time memory & hardware registration system (§11.3); updated test result tables (§5.1, §8.1) for the 175-phase suite; added `nr_cpus` runtime per-CPU storage note; demoted P0/P1 items in §12.1 that are now complete |
 | 2026-04-01 | Integrated specialized design docs (driver model, personality servers, tracing, network/storage I/O, graphics, 32-bit compat) as Sections 13–18; added detailed phase roadmap cross-reference (Section 19); updated test results to current state (LoongArch64 88/3/7, RISC-V 105/105) |
 | 2026-03-30 | Expanded roadmap: boot-time PAGE_MMUSHIFT, Linux personality + LTP, multi-architecture plan (s390x, ppc64, sparc64, 32-bit targets), swap subsystem, graphical desktop (Xwayland + GNOME + Firefox), kernel command line parsing, prioritized development order |
