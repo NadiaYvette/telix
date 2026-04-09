@@ -85,6 +85,14 @@ pub fn init_dynamic_percpu() {
     crate::sync::rcu::init_dynamic_percpu();
     crate::mm::phys::init_dynamic_percpu();
     crate::mm::slab::init_dynamic_percpu();
+
+    // Per-arch AP stack regions.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::smp::init_dynamic_percpu();
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::smp::init_dynamic_percpu();
+    #[cfg(target_arch = "riscv64")]
+    crate::arch::riscv64::smp::init_dynamic_percpu();
 }
 
 /// Per-hart trap scratch data for RISC-V tp/sscratch swap convention.

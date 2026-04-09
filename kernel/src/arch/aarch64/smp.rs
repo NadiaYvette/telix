@@ -3,8 +3,8 @@
 //! QEMU virt provides PSCI via HVC (when running with EL2 firmware).
 //! The PSCI CPU_ON function starts a secondary core at a given entry point.
 
-use crate::sched::smp::MAX_CPUS;
-use core::sync::atomic::{AtomicU32, Ordering};
+use crate::sched::smp;
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 /// PSCI function IDs (SMCCC convention, 64-bit).
 const PSCI_CPU_ON_64: u64 = 0xC400_0003;
@@ -30,12 +30,33 @@ fn psci_cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
     ret
 }
 
-/// Per-CPU boot stacks for secondary cores (allocated statically).
-/// Each secondary gets a 16 KiB stack.
+/// Each secondary gets a 16 KiB boot stack.
 const AP_STACK_SIZE: usize = 16384;
-#[repr(C, align(16))]
-struct ApStacks([[u8; AP_STACK_SIZE]; MAX_CPUS]);
-static mut AP_STACKS: ApStacks = ApStacks([[0u8; AP_STACK_SIZE]; MAX_CPUS]);
+
+/// Per-CPU boot stacks for secondary cores. Stored as a dynamic flat byte
+/// slice of length `num_cpus() * AP_STACK_SIZE`, allocated by
+/// `init_dynamic_percpu` from phys after `phys::init`. Indexed by linear
+/// CPU id (0 = BSP, 1.. = secondaries).
+static AP_STACKS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn ap_stack_top(cpu: usize) -> u64 {
+    let base = AP_STACKS_PTR.load(Ordering::Relaxed);
+    debug_assert!(!base.is_null(), "AP_STACKS not init");
+    debug_assert!(cpu < smp::num_cpus());
+    unsafe { base.add((cpu + 1) * AP_STACK_SIZE) as u64 }
+}
+
+/// Allocate the dynamic AP boot-stack region. Called from
+/// `smp::init_dynamic_percpu` after `phys::init`.
+pub(crate) fn init_dynamic_percpu() {
+    let n = smp::num_cpus();
+    let total = n.checked_mul(AP_STACK_SIZE).expect("AP stack overflow");
+    unsafe {
+        let s = crate::mm::phys::alloc_static_slice::<u8>(total);
+        AP_STACKS_PTR.store(s.as_mut_ptr(), Ordering::Release);
+    }
+}
 
 /// Start secondary CPUs. Called by BSP after scheduler init.
 pub fn start_secondary_cpus() {
@@ -48,17 +69,18 @@ pub fn start_secondary_cpus() {
     let fw_cpus = crate::firmware::cpus();
     let mut started = 0u32;
 
+    let n = smp::num_cpus();
     if fw_cpus.len() > 1 {
         // Use firmware-discovered CPU list (skip first = BSP).
         for (i, desc) in fw_cpus.iter().enumerate() {
             if i == 0 {
                 continue;
             } // BSP
-            if i >= MAX_CPUS {
+            if i >= n {
                 break;
             }
             let target_mpidr = desc.id as u64;
-            let stack_top = unsafe { AP_STACKS.0[i].as_ptr().add(AP_STACK_SIZE) as u64 };
+            let stack_top = ap_stack_top(i);
             let ret = psci_cpu_on(target_mpidr, entry, stack_top);
             if ret != 0 {
                 crate::println!(
@@ -72,9 +94,9 @@ pub fn start_secondary_cpus() {
         }
     } else {
         // Fallback: probe sequentially (original behavior).
-        for cpu in 1..MAX_CPUS {
+        for cpu in 1..n {
             let target_mpidr = cpu as u64;
-            let stack_top = unsafe { AP_STACKS.0[cpu].as_ptr().add(AP_STACK_SIZE) as u64 };
+            let stack_top = ap_stack_top(cpu);
             let ret = psci_cpu_on(target_mpidr, entry, stack_top);
             if ret != 0 {
                 break;

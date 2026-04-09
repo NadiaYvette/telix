@@ -3,8 +3,8 @@
 //! The BSP copies an AP trampoline to low memory (0x8000), fills in
 //! startup parameters, and sends INIT + SIPI to each AP.
 
-use crate::sched::smp::MAX_CPUS;
-use core::sync::atomic::{AtomicU32, Ordering};
+use crate::sched::smp::{self, MAX_CPUS};
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 /// Physical address where the AP trampoline is copied.
 const TRAMPOLINE_PHYS: usize = 0x8000;
@@ -17,11 +17,36 @@ const DATA_OFFSET: usize = 0xF00;
 /// Number of APs that have completed init.
 static AP_READY_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Per-AP boot stacks.
+/// Per-AP boot stack size (4 pages).
 const AP_STACK_SIZE: usize = 16384;
-#[repr(C, align(16))]
-struct ApStacks([[u8; AP_STACK_SIZE]; MAX_CPUS]);
-static mut AP_STACKS: ApStacks = ApStacks([[0u8; AP_STACK_SIZE]; MAX_CPUS]);
+
+/// Per-AP boot stacks. Stored as a dynamic flat byte slice of length
+/// `num_cpus() * AP_STACK_SIZE`, allocated by `init_dynamic_percpu` from
+/// phys after `phys::init`. Indexed by kernel CPU id (== LAPIC ID on x86_64
+/// for the dense QEMU/most-real-hardware layout). The trampoline is only
+/// invoked for APs with id < num_cpus(), so an out-of-range LAPIC ID (in
+/// theory possible on sparse-APIC-ID hardware) is filtered out before we
+/// dereference the slice.
+static AP_STACKS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn ap_stack_top(cpu: usize) -> u64 {
+    let base = AP_STACKS_PTR.load(Ordering::Relaxed);
+    debug_assert!(!base.is_null(), "AP_STACKS not init");
+    debug_assert!(cpu < smp::num_cpus());
+    unsafe { base.add((cpu + 1) * AP_STACK_SIZE) as u64 }
+}
+
+/// Allocate the dynamic AP boot-stack region. Called from
+/// `smp::init_dynamic_percpu` after `phys::init`.
+pub(crate) fn init_dynamic_percpu() {
+    let n = smp::num_cpus();
+    let total = n.checked_mul(AP_STACK_SIZE).expect("AP stack overflow");
+    unsafe {
+        let s = crate::mm::phys::alloc_static_slice::<u8>(total);
+        AP_STACKS_PTR.store(s.as_mut_ptr(), Ordering::Release);
+    }
+}
 
 /// Start secondary CPUs via INIT-SIPI-SIPI.
 pub fn start_secondary_cpus() {
@@ -60,26 +85,42 @@ pub fn start_secondary_cpus() {
     }
 
     // Build list of APIC IDs to start. Use ACPI MADT if available,
-    // otherwise probe sequentially 0..MAX_CPUS.
+    // otherwise probe sequentially 0..num_cpus().
+    //
+    // Cap at num_cpus()-1 entries (the BSP doesn't need an AP slot). The
+    // resulting list is sized by the runtime CPU count, not MAX_CPUS, so
+    // the bitmap-width compile-time ceiling can be raised aggressively
+    // without enlarging this stack-resident scratch buffer.
     let fw_cpus = crate::firmware::cpus();
+    let n = smp::num_cpus();
     let mut ap_ids = [0u32; MAX_CPUS];
     let mut ap_count = 0usize;
+    let cap = n.saturating_sub(1);
 
     if !fw_cpus.is_empty() {
         for desc in fw_cpus {
             if desc.id == bsp_id || desc.flags & 1 == 0 {
                 continue;
             }
-            if ap_count < MAX_CPUS {
+            // Skip APIC IDs that exceed our runtime CPU count: they have
+            // no AP stack slot allocated and can't participate in
+            // scheduling without growing every per-CPU slice.
+            if (desc.id as usize) >= n {
+                continue;
+            }
+            if ap_count < cap {
                 ap_ids[ap_count] = desc.id;
                 ap_count += 1;
             }
         }
     } else {
         // Fallback: probe sequential IDs.
-        for id in 0..(MAX_CPUS as u32) {
+        for id in 0..(n as u32) {
             if id == bsp_id {
                 continue;
+            }
+            if ap_count >= cap {
+                break;
             }
             ap_ids[ap_count] = id;
             ap_count += 1;
@@ -92,7 +133,7 @@ pub fn start_secondary_cpus() {
     for i in 0..ap_count {
         let cpu = ap_ids[i];
 
-        let stack_top = unsafe { AP_STACKS.0[cpu as usize].as_ptr().add(AP_STACK_SIZE) as u64 };
+        let stack_top = ap_stack_top(cpu as usize);
 
         // Write the data block at TRAMPOLINE_PHYS + DATA_OFFSET.
         let data_base = (TRAMPOLINE_PHYS + DATA_OFFSET) as *mut u8;

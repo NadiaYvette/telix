@@ -3,8 +3,8 @@
 //! The SBI HSM (Hart State Management) extension starts secondary harts
 //! at a specified entry point with an opaque value in a1.
 
-use crate::sched::smp::MAX_CPUS;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::sched::smp::{self, MAX_CPUS};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 /// SBI HSM extension ID and function IDs.
 const SBI_EXT_HSM: u64 = 0x48534D;
@@ -42,11 +42,32 @@ fn sbi_hart_start(hartid: u64, start_addr: u64, opaque: u64) -> i64 {
     error
 }
 
-/// Per-CPU boot stacks for secondary harts.
+/// Per-hart boot stack size.
 const AP_STACK_SIZE: usize = 16384;
-#[repr(C, align(16))]
-struct ApStacks([[u8; AP_STACK_SIZE]; MAX_CPUS]);
-static mut AP_STACKS: ApStacks = ApStacks([[0u8; AP_STACK_SIZE]; MAX_CPUS]);
+
+/// Per-hart boot stacks. Stored as a dynamic flat byte slice of length
+/// `num_cpus() * AP_STACK_SIZE`, allocated by `init_dynamic_percpu` from
+/// phys after `phys::init`. Indexed by linear CPU index (0 = BSP).
+static AP_STACKS_PTR: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn ap_stack_top(cpu: usize) -> u64 {
+    let base = AP_STACKS_PTR.load(Ordering::Relaxed);
+    debug_assert!(!base.is_null(), "AP_STACKS not init");
+    debug_assert!(cpu < smp::num_cpus());
+    unsafe { base.add((cpu + 1) * AP_STACK_SIZE) as u64 }
+}
+
+/// Allocate the dynamic AP boot-stack region. Called from
+/// `smp::init_dynamic_percpu` after `phys::init`.
+pub(crate) fn init_dynamic_percpu() {
+    let n = smp::num_cpus();
+    let total = n.checked_mul(AP_STACK_SIZE).expect("AP stack overflow");
+    unsafe {
+        let s = crate::mm::phys::alloc_static_slice::<u8>(total);
+        AP_STACKS_PTR.store(s.as_mut_ptr(), Ordering::Release);
+    }
+}
 
 /// Start secondary harts. Called by BSP after scheduler init.
 pub fn start_secondary_cpus() {
@@ -57,6 +78,7 @@ pub fn start_secondary_cpus() {
     let boot_hart = super::boot::BOOT_HART_ID.load(Ordering::Relaxed) as u64;
 
     let fw_cpus = crate::firmware::cpus();
+    let n = smp::num_cpus();
     let mut cpu_index: usize = 1;
     let mut started = 0u32;
 
@@ -67,11 +89,11 @@ pub fn start_secondary_cpus() {
             if hartid == boot_hart {
                 continue; // Skip the boot hart.
             }
-            if cpu_index >= MAX_CPUS {
+            if cpu_index >= n {
                 break;
             }
 
-            let stack_top = unsafe { AP_STACKS.0[cpu_index].as_ptr().add(AP_STACK_SIZE) as u64 };
+            let stack_top = ap_stack_top(cpu_index);
             AP_STACK_TOPS[cpu_index].store(stack_top, Ordering::Release);
 
             let ret = sbi_hart_start(hartid, entry, cpu_index as u64);
@@ -84,12 +106,15 @@ pub fn start_secondary_cpus() {
         }
     } else {
         // Fallback: probe sequentially (original behavior).
-        for hartid in 0..(MAX_CPUS as u64) {
+        for hartid in 0..(n as u64) {
             if hartid == boot_hart {
                 continue;
             }
+            if cpu_index >= n {
+                break;
+            }
 
-            let stack_top = unsafe { AP_STACKS.0[cpu_index].as_ptr().add(AP_STACK_SIZE) as u64 };
+            let stack_top = ap_stack_top(cpu_index);
             AP_STACK_TOPS[cpu_index].store(stack_top, Ordering::Release);
 
             let ret = sbi_hart_start(hartid, entry, cpu_index as u64);
