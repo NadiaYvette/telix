@@ -30,7 +30,6 @@ pub const SYS_ASPACE_ID: u64 = 20;
 pub const SYS_GET_INITRAMFS_PORT: u64 = 21;
 pub const SYS_PORT_SET_RECV: u64 = 22;
 pub const SYS_NSRV_PORT: u64 = 23;
-pub const SYS_MMAP_DEVICE: u64 = 24;
 pub const SYS_VIRT_TO_PHYS: u64 = 25;
 pub const SYS_IRQ_WAIT: u64 = 26;
 pub const SYS_GETCHAR: u64 = 27;
@@ -276,7 +275,6 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_GET_INITRAMFS_PORT => sys_get_initramfs_port(),
         SYS_PORT_SET_RECV => sys_port_set_recv(a0, frame),
         SYS_NSRV_PORT => sys_nsrv_port(),
-        SYS_MMAP_DEVICE => sys_mmap_device(a0, a1),
         SYS_VIRT_TO_PHYS => sys_virt_to_phys(a0),
         SYS_IRQ_WAIT => sys_irq_wait(a0, a1),
         SYS_IRQ_ATTACH => sys_irq_attach(a0, a1, a2),
@@ -1307,48 +1305,6 @@ fn sys_nsrv_port() -> u64 {
     crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire)
 }
 
-fn sys_mmap_device(phys_addr: u64, page_count: u64) -> u64 {
-    let phys = phys_addr as usize;
-    let pages = page_count as usize;
-    if pages == 0 || pages > 4096 {
-        return u64::MAX;
-    }
-
-    // Page-align the physical address (PTEs require page-aligned PA).
-    let page_offset = phys & 0xFFF;
-    let phys_aligned = phys & !0xFFF;
-    // If the range spans an extra page due to offset, account for it.
-    let total_pages = if page_offset > 0 { pages + 1 } else { pages };
-
-    // Validate phys_addr is within approved device MMIO ranges.
-    let (mmio_start, mmio_end) = trapframe::DEVICE_MMIO_RANGE;
-    let end = phys_aligned + total_pages * 4096;
-    let valid = mmio_start != 0 && phys_aligned >= mmio_start && end <= mmio_end;
-    if !valid {
-        return u64::MAX;
-    }
-
-    let aspace_id = crate::sched::scheduler::current_aspace_id();
-    if aspace_id == 0 {
-        return u64::MAX;
-    }
-
-    // Allocate VA in userspace heap.
-    let va = crate::mm::aspace::with_aspace(aspace_id, |aspace| aspace.alloc_heap_va(total_pages * 4096));
-
-    let pt_root = crate::sched::scheduler::current_page_table_root();
-    let pte_flags = trapframe::device_pte_flags();
-
-    for i in 0..total_pages {
-        let page_va = va + i * 4096;
-        let page_pa = phys_aligned + i * 4096;
-        crate::mm::hat::map_single_mmupage(pt_root, page_va, page_pa, pte_flags);
-    }
-
-    // Return VA + page_offset so caller gets pointer to exact MMIO base.
-    (va + page_offset) as u64
-}
-
 fn sys_virt_to_phys(va: u64) -> u64 {
     let pt_root = crate::sched::scheduler::current_page_table_root();
     if pt_root == 0 {
@@ -1437,9 +1393,6 @@ fn sys_irq_ack(irq_num: u64) -> u64 {
 /// case is RW; we'll split once there's a read-only consumer). Returns
 /// the virtual address of the mapped region on success, `u64::MAX` on
 /// any failure.
-///
-/// Coexists with `sys_mmap_device` (unchanged) until Step D removes the
-/// static-range path.
 fn sys_mmio_map_cap(slot: u64) -> u64 {
     let slot = slot as usize;
 

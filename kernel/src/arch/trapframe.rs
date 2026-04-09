@@ -52,19 +52,6 @@ pub const EXCEPTION_FRAME_SIZE: usize = 280;
 #[cfg(target_arch = "mips64")]
 pub const EXCEPTION_FRAME_SIZE: usize = 288;
 
-/// Approved device MMIO physical address range for sys_mmap_device (start, end).
-/// (0, 0) means MMIO device mapping is disabled on this platform.
-#[cfg(target_arch = "aarch64")]
-pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x0a00_0000, 0x0a01_0000);
-#[cfg(target_arch = "riscv64")]
-pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x1000_0000, 0x1001_0000);
-#[cfg(target_arch = "x86_64")]
-pub const DEVICE_MMIO_RANGE: (usize, usize) = (0xC000_0000, 0x1_0000_0000);
-#[cfg(target_arch = "loongarch64")]
-pub const DEVICE_MMIO_RANGE: (usize, usize) = (0x1800_0000, 0x8000_0000); // PCI I/O window + MEM region
-#[cfg(target_arch = "mips64")]
-pub const DEVICE_MMIO_RANGE: (usize, usize) = (0, 0); // TODO: Malta PCI MMIO range
-
 /// PTE flags for device memory mapping (user-accessible, device-nGnRnE on AArch64).
 #[inline]
 pub fn device_pte_flags() -> u64 {

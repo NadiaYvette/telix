@@ -22,7 +22,6 @@ const SYS_GRANT_PAGES: u64 = 18;
 const SYS_REVOKE: u64 = 19;
 const SYS_ASPACE_ID: u64 = 20;
 const SYS_GET_INITRAMFS_PORT: u64 = 21;
-const SYS_MMAP_DEVICE: u64 = 24;
 const SYS_VIRT_TO_PHYS: u64 = 25;
 const SYS_IRQ_WAIT: u64 = 26;
 const SYS_GETCHAR: u64 = 27;
@@ -889,23 +888,12 @@ pub fn framebuffer_info() -> Option<(u64, u32, u32, u32, u8)> {
     Some((addr, width, height, pitch, bpp))
 }
 
-/// Map device MMIO registers into userspace. Returns VA or None.
-pub fn mmap_device(phys: usize, page_count: usize) -> Option<usize> {
-    let r = unsafe { arch::syscall2(SYS_MMAP_DEVICE, phys as u64, page_count as u64) };
-    if r == u64::MAX {
-        None
-    } else {
-        Some(r as usize)
-    }
-}
-
 /// Map an MMIO region identified by a `CapType::Memory` capability in the
 /// calling task's CapSpace. The cap must carry `READ|WRITE`. Returns the
 /// virtual address where the region was mapped, or `None` on failure.
 ///
-/// This is the capability-gated replacement for `mmap_device`; drivers
-/// spawned by the kernel receive a pre-granted Memory cap at a well-known
-/// slot (encoded in arg0's low bits).
+/// Drivers spawned by the kernel receive a pre-granted Memory cap at a
+/// well-known slot (encoded in arg0's low bits).
 pub fn mmio_map_cap(slot: usize) -> Option<usize> {
     let r = unsafe { arch::syscall1(SYS_MMIO_MAP_CAP, slot as u64) };
     if r == u64::MAX { None } else { Some(r as usize) }
