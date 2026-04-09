@@ -937,6 +937,41 @@ pub fn free_pages(addr: PhysAddr, order: usize) {
     }
 }
 
+/// Allocate `len` zero-initialized elements of `T` from phys and return
+/// them as a `&'static mut [T]`. Rounds up to a power-of-two page count
+/// and delegates to `alloc_pages`. Only intended for one-shot boot
+/// initialization of dynamic per-CPU state — there is no `free_static_slice`.
+///
+/// Safety:
+/// - `T` must be safely initializable from all-zero bytes.
+/// - Must only be called from the BSP during single-threaded boot.
+/// - The returned reference aliases the physical page (identity mapped);
+///   the caller must not free it.
+pub unsafe fn alloc_static_slice<T>(len: usize) -> &'static mut [T] {
+    if len == 0 {
+        return unsafe { core::slice::from_raw_parts_mut(core::ptr::NonNull::<T>::dangling().as_ptr(), 0) };
+    }
+    let bytes = core::mem::size_of::<T>()
+        .checked_mul(len)
+        .expect("alloc_static_slice size overflow");
+    let align = core::mem::align_of::<T>();
+    let page_sz = page::page_size();
+    assert!(
+        align <= page_sz,
+        "alloc_static_slice: T alignment {} exceeds page size {}",
+        align,
+        page_sz
+    );
+    let page_count = (bytes + page_sz - 1) / page_sz;
+    let order = (page_count.next_power_of_two()).trailing_zeros() as usize;
+    let pa = alloc_pages(order).expect("alloc_static_slice: out of memory");
+    let ptr = pa.as_usize() as *mut T;
+    unsafe {
+        core::ptr::write_bytes(ptr, 0, len);
+        core::slice::from_raw_parts_mut(ptr, len)
+    }
+}
+
 /// Get (total_pages, free_pages).
 pub fn stats() -> (usize, usize) {
     (

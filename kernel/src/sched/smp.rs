@@ -7,7 +7,7 @@
 //!   x86-64:  LAPIC ID register
 
 use super::thread::ThreadId;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 /// Maximum CPUs supported (compile-time, selected via cargo feature).
 #[cfg(feature = "max_cpus_4")]
@@ -25,6 +25,51 @@ pub const MAX_CPUS: usize = 4096;
     feature = "max_cpus_4096"
 )))]
 pub const MAX_CPUS: usize = 64;
+
+// ── Runtime-detected CPU count ───────────────────────────────────────
+//
+// MAX_CPUS above is a compile-time *ceiling* that sizes bitmaps and the
+// few bootstrap per-CPU slots that exist before phys::init runs. The
+// runtime value `NR_CPUS` is the number of CPUs actually detected by
+// firmware (optionally capped by the `nr_cpus=N` cmdline parameter), and
+// it's what per-CPU *storage* scales with. See
+// `/home/nyc/.claude/plans/sparkling-frolicking-pike.md`.
+
+/// Runtime-detected CPU count. Defaults to 1 (BSP only) until
+/// `detect_cpu_count()` runs between `parse_firmware()` and `phys::init()`.
+static NR_CPUS: AtomicUsize = AtomicUsize::new(1);
+
+/// Number of CPUs actually present (detected + cmdline-capped). Use this
+/// for loop bounds and to size dynamically-allocated per-CPU storage.
+/// `MAX_CPUS` remains the compile-time ceiling used only for bitmap width
+/// and the handful of Tier-1 bootstrap slots.
+#[inline]
+pub fn num_cpus() -> usize {
+    NR_CPUS.load(Ordering::Relaxed)
+}
+
+/// Discover the real CPU count from firmware and apply the optional
+/// `nr_cpus=N` cmdline cap. Call once from the BSP between
+/// `parse_firmware()` and `phys::init()`. Returns the resolved count.
+pub fn detect_cpu_count() -> usize {
+    let detected = crate::firmware::cpu_count() as usize;
+    let capped = match crate::boot::cmdline::nr_cpus_cap() {
+        Some(cap) => detected.min(cap),
+        None => detected,
+    };
+    let n = capped.max(1).min(MAX_CPUS);
+    NR_CPUS.store(n, Ordering::Release);
+    n
+}
+
+/// Allocate and install dynamic per-CPU slices. Called once from the BSP
+/// just after `phys::init()` returns, before `sched::init()`. Per-module
+/// migrations land in subsequent commits — for now this is an empty shell
+/// that establishes the call site.
+pub fn init_dynamic_percpu() {
+    debug_assert!(NR_CPUS.load(Ordering::Relaxed) >= 1);
+    debug_assert!(num_cpus() <= MAX_CPUS);
+}
 
 /// Per-hart trap scratch data for RISC-V tp/sscratch swap convention.
 /// Accessed from vectors.S — layout and symbol name must stay in sync.

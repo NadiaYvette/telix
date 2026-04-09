@@ -8,7 +8,7 @@
 //! Must be called before the physical allocator is initialized, since
 //! `page_mmushift` affects allocation granularity.
 
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 /// Maximum command line length we support.
 const MAX_CMDLINE: usize = 1024;
@@ -38,6 +38,10 @@ pub struct BootConfig {
     /// Log level (0 = quiet, 7 = debug). Default: 5 (notice+).
     pub loglevel: AtomicU8,
 
+    /// Cap on the number of CPUs to bring online (0 = no cap, use firmware
+    /// detected count). Mirrors Linux `nr_cpus=N`.
+    pub nr_cpus: AtomicU32,
+
     /// Whether command line was successfully parsed.
     pub parsed: AtomicU8,
 }
@@ -46,6 +50,7 @@ pub static BOOT_CONFIG: BootConfig = BootConfig {
     page_mmushift: AtomicU8::new(0),
     console: AtomicU8::new(0),
     loglevel: AtomicU8::new(5),
+    nr_cpus: AtomicU32::new(0),
     parsed: AtomicU8::new(0),
 };
 
@@ -122,6 +127,11 @@ fn handle_param(key: &[u8], val: &[u8]) {
                 BOOT_CONFIG.loglevel.store((n as u8).min(7), Ordering::Relaxed);
             }
         }
+        b"nr_cpus" => {
+            if let Some(n) = parse_u64(val) {
+                BOOT_CONFIG.nr_cpus.store(n as u32, Ordering::Relaxed);
+            }
+        }
         b"console" => {
             // Future: map console name to index.
             let _ = val;
@@ -163,6 +173,13 @@ pub fn get_extra(key: &[u8]) -> Option<&'static [u8]> {
         }
     }
     None
+}
+
+/// Optional cap on the number of CPUs from `nr_cpus=N` on the command line.
+/// `None` means no cap (use firmware-detected count as-is).
+pub fn nr_cpus_cap() -> Option<usize> {
+    let v = BOOT_CONFIG.nr_cpus.load(Ordering::Relaxed);
+    if v == 0 { None } else { Some(v as usize) }
 }
 
 /// Get the configured PAGE_MMUSHIFT, or the compile-time default if not set.

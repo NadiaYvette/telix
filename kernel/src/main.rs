@@ -43,6 +43,12 @@ pub fn kmain() -> ! {
     mm::slab::reinit_for_page_size();
     println!("  Page size: {} bytes (mmushift={})", mm::page::page_size(), mmushift);
 
+    // Resolve runtime CPU count (firmware detection + nr_cpus=N cmdline cap).
+    // Must happen after parse_firmware + cmdline::parse and before any
+    // per-CPU storage is sized or allocated.
+    let nr = sched::smp::detect_cpu_count();
+    println!("  CPUs: {} (ceiling {})", nr, sched::smp::MAX_CPUS);
+
     // Physical memory allocator.
     // Start managed RAM at kernel_end so the allocator never touches
     // firmware (OpenSBI) or kernel image pages — its bitmap metadata
@@ -50,6 +56,11 @@ pub fn kmain() -> ! {
     let (_ram_start, ram_end) = arch::platform::ram_range();
     let kernel_end = arch::platform::kernel_end_addr();
     mm::phys::init(kernel_end, ram_end, kernel_end, kernel_end);
+
+    // Allocate dynamic per-CPU storage now that phys is live. Currently a
+    // no-op; subsequent commits in the runtime-nr_cpus series migrate
+    // per-CPU arrays here.
+    sched::smp::init_dynamic_percpu();
 
     // Enable MMU: set up kernel identity-mapped page tables.
     // Must happen before secondary CPU startup (they need the page table root).
