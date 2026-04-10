@@ -368,6 +368,7 @@ pub fn dup_slot(slot: SwapSlot) {
     if let Some(rc) = refcount_of(slot) {
         let old = rc.fetch_add(1, Ordering::Relaxed);
         debug_assert!(old < 255, "swap slot refcount overflow");
+        super::stats::SWAP_SLOTS_DUPED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -401,6 +402,15 @@ pub fn enabled() -> bool {
 /// cannot do blocking IPC to blk_srv.
 pub fn is_ram_backend() -> bool {
     matches!(current(), Some(Backend::Ram(_)))
+}
+
+/// Number of swap slots currently in use (allocated but not freed).
+pub fn slots_in_use() -> u32 {
+    match current() {
+        Some(Backend::Ram(b)) => b.used.load(Ordering::Relaxed),
+        Some(Backend::BlkIo(b)) => b.used.load(Ordering::Relaxed),
+        None => 0,
+    }
 }
 
 #[inline]

@@ -214,8 +214,9 @@ impl MemObject {
                 // overwritten.
                 return Some((pa, true));
             }
-            // Swap read failed — fall through to zero-fill.
-            // (The slot will be leaked; this is a degraded path.)
+            // Swap read failed — free the slot and fall through to zero-fill.
+            self.clear_swap_slot(page_idx);
+            swap::free_slot(slot);
             phys::free_page(pa);
         }
 
@@ -737,6 +738,11 @@ pub fn swap_out_page(obj_id: ObjectId, page_idx: usize) {
     if swap::write_page(slot, PhysAddr::new(pa)) != swap::SwapIoResult::Ok {
         swap::free_slot(slot);
         return;
+    }
+    // Defensive: free any stale slot before recording the new one.
+    let old = guard.clear_swap_slot(page_idx);
+    if !old.is_none() {
+        swap::free_slot(old);
     }
     guard.set_swap_slot(page_idx, slot);
 }

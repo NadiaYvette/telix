@@ -24,6 +24,7 @@ pub static PT_TABLES_SHARED: AtomicU64 = AtomicU64::new(0);
 pub static PT_COW_BREAKS: AtomicU64 = AtomicU64::new(0);
 pub static KSWAPD_SCANS: AtomicU64 = AtomicU64::new(0);
 pub static KSWAPD_RECLAIMED: AtomicU64 = AtomicU64::new(0);
+pub static SWAP_SLOTS_DUPED: AtomicU64 = AtomicU64::new(0);
 
 pub fn print() {
     crate::println!("  VM stats:");
@@ -111,5 +112,9 @@ pub fn print() {
     crate::println!(
         "    kswapd reclaimed: {}",
         KSWAPD_RECLAIMED.load(Ordering::Relaxed)
+    );
+    crate::println!(
+        "    Swap slots duped: {}",
+        SWAP_SLOTS_DUPED.load(Ordering::Relaxed)
     );
 }

@@ -721,6 +721,7 @@ fn test_swap_e2e() {
     let ps = page::page_size();
 
     println!("  Swap E2E: testing data integrity through swap round-trip...");
+    let slots_before = mm::swap::slots_in_use();
 
     let out_before = mm::swap::SWAP_OUT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
     let in_before = mm::swap::SWAP_IN_COUNT.load(core::sync::atomic::Ordering::Relaxed);
@@ -844,7 +845,13 @@ fn test_swap_e2e() {
     );
 
     mm::aspace::destroy(aspace_id);
-    println!("  Swap E2E data integrity test: PASSED");
+    let slots_after = mm::swap::slots_in_use();
+    assert_eq!(
+        slots_after, slots_before,
+        "swap e2e: slot leak — {} before, {} after",
+        slots_before, slots_after,
+    );
+    println!("  Swap E2E data integrity test: PASSED (no slot leaks)");
 }
 
 /// Test that fork correctly inherits swap slots. Creates a parent aspace,
@@ -856,6 +863,7 @@ fn test_swap_cow_fork() {
     let ps = page::page_size();
 
     println!("  Swap COW fork: testing swap slot inheritance across fork...");
+    let slots_before = mm::swap::slots_in_use();
 
     // --- Parent: create aspace, fault pages, write patterns ---
     // Use a proper user page table (includes kernel mappings) because
@@ -963,5 +971,14 @@ fn test_swap_cow_fork() {
 
     mm::aspace::destroy(child_aspace);
     mm::aspace::destroy(parent_aspace);
-    println!("  Swap COW fork data integrity test: PASSED");
+
+    // Verify no swap slot leak: all slots allocated during the test
+    // should be freed after both aspaces are destroyed.
+    let slots_after = mm::swap::slots_in_use();
+    assert_eq!(
+        slots_after, slots_before,
+        "swap cow: slot leak detected — {} slots before, {} after",
+        slots_before, slots_after,
+    );
+    println!("  Swap COW fork data integrity test: PASSED (no slot leaks)");
 }
