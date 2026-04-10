@@ -532,8 +532,12 @@ static mut FS_SCRATCH_GRANTED_MASK: u32 = 0;
 /// Whether we've attempted (and either succeeded or failed) granting once.
 /// Used to avoid retrying ns_lookup on every FS_READ when servers don't exist.
 static mut FS_SCRATCH_GRANT_TRIED: u32 = 0;
-/// VA inside VFS's aspace where our scratch is mapped.
+/// VA inside VFS's aspace where our scratch is mapped (path bytes for VFS_OPEN_LONG).
 const LIN_SCRATCH_REMOTE_VA: usize = 0x5_0000_0000;
+/// VA inside FS servers' aspaces where our scratch is mapped (bulk FS_READ data).
+/// Must differ from FS_SCRATCH_VA (0x5_0000_0000) used by VFS for path forwarding,
+/// otherwise the second grant to the same VA fails (VMA overlap).
+const LIN_FS_SCRATCH_VA: usize = 0x5_0001_0000;
 /// Length of the longest long path we'll ship in one open call.
 const MAX_LONG_PATH: usize = 4096;
 static mut PIPE_PORT: u64 = 0;
@@ -1582,7 +1586,7 @@ fn ensure_fs_scratch_grants() {
             if syscall::grant_pages(
                 fs_task,
                 LIN_PATH_SCRATCH_LOCAL,
-                LIN_SCRATCH_REMOTE_VA,
+                LIN_FS_SCRATCH_VA,
                 1,
                 false,
             ) {
@@ -1605,7 +1609,7 @@ fn fs_read_bulk(fs_port: u64, handle: u64, offset: u64, max_len: usize) -> Optio
     let reply_port = unsafe { REPLY_PORT };
     let length = max_len.min(4096) as u64;
     let d2 = (length & 0xFFFF_FFFF) | (reply_port << 32);
-    syscall::send(fs_port, FS_READ, handle, offset, d2, LIN_SCRATCH_REMOTE_VA as u64);
+    syscall::send(fs_port, FS_READ, handle, offset, d2, LIN_FS_SCRATCH_VA as u64);
     let resp = match syscall::recv_msg(reply_port) {
         Some(m) => m,
         None => return None,

@@ -69,6 +69,8 @@ const MAX_LONG_PATH: usize = 4096;
 
 /// Lazily-allocated VA of VFS's own scratch page (the page granted to FS servers).
 static mut VFS_SCRATCH_VA: usize = 0;
+/// Cached reply port for forward_fs_long (avoids per-request port_create/destroy).
+static mut VFS_FWD_REPLY_PORT: u64 = 0;
 
 fn ensure_vfs_scratch() -> usize {
     unsafe {
@@ -640,7 +642,12 @@ fn forward_fs_long(
     }
 
     let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
-    let my_reply = syscall::port_create();
+    let my_reply = unsafe {
+        if VFS_FWD_REPLY_PORT == 0 {
+            VFS_FWD_REPLY_PORT = syscall::port_create();
+        }
+        VFS_FWD_REPLY_PORT
+    };
     let d0 = (rel_len as u64) | ((flags as u64 & 0xFFFF) << 16) | ((my_reply as u64) << 32);
     syscall::send(fs_port, fs_tag, d0, 0, 0, 0);
 
@@ -679,8 +686,6 @@ fn forward_fs_long(
     } else if client_reply != 0 {
         syscall::send(client_reply, err_tag, ERR_IO, 0, 0, 0);
     }
-
-    syscall::port_destroy(my_reply);
 }
 
 /// Handle VFS_OPEN_LONG: client has written the absolute path to LIN_SCRATCH_VA.
