@@ -552,26 +552,30 @@ For each new architecture, the following must be implemented:
 
 ### 9.1 Architecture
 
-Telix's WSCLOCK page reclamation already identifies pages to evict. Currently, evicted anonymous pages are simply discarded (and re-faulted as zero pages). Adding swap means:
+Telix's WSCLOCK page reclamation identifies pages to evict. The swap subsystem preserves evicted anonymous page contents in an external store so they can be read back on the next fault, rather than being silently discarded and zero-filled.
 
-1. **Swap map:** Track which swap slot holds each evicted page (per-object swap radix tree or per-aspace swap table)
-2. **Swap-out path:** WSCLOCK selects victim → write page to swap device via block I/O server → record swap slot in PTE (not-present + swap-slot encoding)
-3. **Swap-in path:** Page fault on swap PTE → read from swap device → install page → resume
-4. **Swap device:** A block device (partition or file) managed by a userspace swap server, or direct kernel-managed swap for simplicity
+**Key design decision:** Unlike Linux, Telix does **not** encode swap location in the PTE. Every anonymous page belongs to a `MemObject` identified by `(obj_id, page_idx)`. When WSCLOCK evicts a page, the PTE becomes not-present and the object records a `SwapSlot(u32)` in a lazily-allocated `swap_slots` table. On the next fault, `ensure_page` consults `swap_slots[idx]` and reads the page back from the swap backend. This keeps the PTE format untouched across all 5 architectures.
 
-### 9.2 Implementation Phases
+### 9.2 Implementation Status (2026-04-10)
 
-1. **Swap PTE encoding:** Define not-present PTE format that encodes swap device + slot number (similar to Linux's `swp_entry_t`)
-2. **Swap server (userspace):** Manages swap space allocation/deallocation, handles read/write requests via IPC
-3. **WSCLOCK integration:** When reclaiming a dirty anonymous page, send it to swap server before freeing
-4. **Fault handler integration:** Recognize swap PTEs, issue swap-in read, block faulting thread until I/O completes
-5. **Swap-backed tmpfs:** tmpfs pages that exceed RAM are swapped out (makes rootfs_srv viable for larger workloads)
+| Step | Scope | Status |
+|------|-------|--------|
+| **Scaffolding** | `mm/swap.rs` module, `SwapSlot` newtype, `Backend` enum, `swap=` cmdline parser, `init()` from kmain | ✅ Done |
+| **RAM backend** | Lock-free `RamBackend` — phys-allocated pages as slot storage, AtomicU64 bitmap with CAS alloc, memcpy read/write | ✅ Done |
+| **Object metadata** | Lazy `swap_slots: *mut u32` in `MemObject`, `get/set/clear_swap_slot`, `release_all_swap_slots` on destroy | ✅ Done |
+| **Swap-out** | `swap_out_page()` called from WSCLOCK before `release_page`; writes anon, non-COW pages to backend | ✅ Done |
+| **Swap-in** | `ensure_page()` checks `swap_slots[idx]` before zero-fill; alloc + read_page + clear slot | ✅ Done |
+| **Round-trip verified** | Kernel self-test: out=3, in=1, err=0; x86_64 QEMU with `swap=ram:4` → 174 phases PASSED | ✅ Done |
+| **Virtio-blk backend** | Dedicated swap partition on second QEMU drive; kernel-side polling | ⏳ Pending |
+| **Pressure trigger** | Low-watermark or OOM-preemptive WSCLOCK scan (currently manual only) | ⏳ Pending |
+| **Swap-backed tmpfs** | rootfs_srv pages that exceed RAM are swapped out | Not started |
+| **Stress test (Phase 176)** | Allocate more anon memory than RAM, touch all pages, verify correctness | ⏳ Pending |
 
 ### 9.3 Testing
 
-- Create a swap partition on the QEMU disk image
-- Stress test: allocate more anonymous memory than physical RAM, verify correctness
-- Measure swap throughput via virtio-blk
+- Boot with `swap=ram:4` on x86_64 — kernel self-test reports swap out/in counts
+- Stress test: allocate more anonymous memory than physical RAM, verify correctness (Phase 176)
+- Future: swap partition on QEMU disk image, measure swap throughput via virtio-blk
 
 ---
 
@@ -712,7 +716,7 @@ The following order maximizes development velocity by front-loading infrastructu
 | ~~**P0**~~ ✅ | Kernel command line parsing | 11 | **Done.** `BootConfig` with `page_mmushift`, `console`, `loglevel`, `nr_cpus` |
 | ~~**P1**~~ ✅ | Linux personality (core syscalls) | 7.2 | **Substantially done.** Phases 168–175 cover threads, signals, /proc, real glibc dyn-linker |
 | **P1** | LTP integration | 7.2 | Next correctness milestone; cross-compile LTP and wire `runltp` into the phase suite |
-| **P2** | Swap subsystem | 9 | Enables workloads that exceed physical RAM |
+| **P2** (in progress) | Swap subsystem | 9 | Core round-trip works (RAM backend); virtio-blk + pressure trigger pending |
 | **P2** | NTFS read-only | 2.2 | First real filesystem; highest interop value |
 | **P2** | Homa transport | 3.1 | Native network transport aligned with IPC model |
 | **P3** | Additional architectures (s390x, ppc64) | 8.2 | Tests portability assumptions; big-endian validation |
@@ -870,6 +874,7 @@ The full phase-by-phase roadmap with dependencies is in [`docs/roadmap.md`](road
 
 | Date | Change |
 |------|--------|
+| 2026-04-10 | Swap subsystem §9: core round-trip working — RAM backend, WSCLOCK swap-out, ensure_page swap-in. Kernel self-test: out=3, in=1, err=0. Design: object-tracked swap slots (no PTE encoding), enum-dispatched backends. |
 | 2026-04-10 | Driver model status refresh (§13.1): Steps A, B, C1–C3, C(b), and D complete; `sys_mmap_device` and per-arch `DEVICE_MMIO_RANGE` removed; all userspace drivers (net/blk/fb/compositor) now use cap-gated `sys_mmio_map_cap`. Remaining: Step C4 (port-IRQ for blk_srv), Step E (device manager), Step F (bus servers). |
 | 2026-04-09 | Status refresh: marked PAGE_MMUSHIFT (§6), kernel command line (§11), and core Linux personality (§7.2) as implemented; documented the boot-time memory & hardware registration system (§11.3); updated test result tables (§5.1, §8.1) for the 175-phase suite; added `nr_cpus` runtime per-CPU storage note; demoted P0/P1 items in §12.1 that are now complete |
 | 2026-04-01 | Integrated specialized design docs (driver model, personality servers, tracing, network/storage I/O, graphics, 32-bit compat) as Sections 13–18; added detailed phase roadmap cross-reference (Section 19); updated test results to current state (LoongArch64 88/3/7, RISC-V 105/105) |
