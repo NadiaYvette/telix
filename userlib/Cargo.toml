@@ -174,3 +174,7 @@ path = "bin/compositor_srv.rs"
 [[bin]]
 name = "term_srv"
 path = "bin/term_srv.rs"
+
+[[bin]]
+name = "udf_srv"
+path = "bin/udf_srv.rs"
