@@ -3704,6 +3704,13 @@ pub fn wait4(pid: i64, flags: u32) -> (u64, i32, i32) {
 
 /// Boost a thread's effective priority if `to_prio` is higher (lower number).
 /// Lock-free: uses atomic CAS on prio + direct write to effective_priority.
+///
+/// For EEVDF (SCHED_NORMAL) threads boosted into the RT range (< 128),
+/// the thread is temporarily promoted to SCHED_RT so that `percpu_enqueue`
+/// routes it to the RT bitmap on its next enqueue.  If the thread is
+/// currently sitting in an EEVDF heap, we tighten its deadline to zero
+/// so that it is the next thread picked from the heap, after which the
+/// RT routing kicks in.
 pub fn boost_priority(tid: ThreadId, to_prio: u8) {
     let tref = thread_ref(tid);
     // CAS loop: only boost if current prio is lower (higher number).
@@ -3717,7 +3724,25 @@ pub fn boost_priority(tid: ThreadId, to_prio: u8) {
             .compare_exchange_weak(cur, to_prio, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            unsafe { thread_mut_from_ref(tid) }.effective_priority = to_prio;
+            let t = unsafe { thread_mut_from_ref(tid) };
+            t.effective_priority = to_prio;
+            // Promote SCHED_NORMAL → SCHED_RT for priority inheritance.
+            // On next enqueue, percpu_enqueue will route to the RT bitmap.
+            if t.sched_class == SCHED_NORMAL && to_prio < 128 {
+                t.sched_class = super::thread::SCHED_RT;
+                // If the thread is in an EEVDF heap, tighten its deadline
+                // to zero so it is picked first at the next class_pick_next.
+                let heap_pos = t.eevdf_heap_pos;
+                if heap_pos != super::heap::HEAP_POS_NONE {
+                    let cpu = tref.last_cpu.load(Ordering::Relaxed) as usize;
+                    let mut rq = percpu_rq()[cpu].lock();
+                    // Re-check under lock — may have been popped or stolen.
+                    let pos = t.eevdf_heap_pos;
+                    if pos != super::heap::HEAP_POS_NONE {
+                        rq.eevdf_heap.decrease_key(pos as usize, 0);
+                    }
+                }
+            }
             break;
         }
     }
@@ -3725,11 +3750,20 @@ pub fn boost_priority(tid: ThreadId, to_prio: u8) {
 
 /// Reset a thread's effective priority back to its base priority.
 /// Lock-free: uses atomic store on prio + direct write to effective_priority.
+///
+/// If the thread was temporarily promoted to SCHED_RT by `boost_priority`,
+/// restore it to SCHED_NORMAL so subsequent enqueues route through EEVDF.
 pub fn reset_priority(tid: ThreadId) {
     let tref = thread_ref(tid);
     let base = tref.base_priority;
     tref.prio.store(base, Ordering::Release);
-    unsafe { thread_mut_from_ref(tid) }.effective_priority = base;
+    let t = unsafe { thread_mut_from_ref(tid) };
+    t.effective_priority = base;
+    // Restore scheduling class if temporarily promoted by PI.
+    // (No threads are permanently SCHED_RT today; SCHED_IDLE is never boosted.)
+    if t.sched_class == super::thread::SCHED_RT {
+        t.sched_class = SCHED_NORMAL;
+    }
 }
 
 /// Get a thread's current effective priority (lock-free).
