@@ -178,6 +178,7 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                     frame.set_rip(frame.rip() + 2);
                     crate::sched::scheduler::store_frame_sp(frame_sp);
                     crate::syscall::dispatch(frame);
+                    crate::sched::scheduler::check_preempt_on_return();
                     let pending = crate::sched::scheduler::take_pending_switch();
                     if pending != 0 {
                         return pending;
@@ -204,19 +205,16 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         // Timer (PIT IRQ 0 -> vector 32, or LAPIC timer -> vector 32).
         32 => {
             super::timer::handle_timer_irq();
-            // Send EOI to both LAPIC and PIC (safe even if only one is active).
             super::lapic::eoi();
             super::pic::send_eoi(0);
-            // Let the scheduler decide if we should context switch.
             return crate::sched::tick(frame_sp);
         }
 
         // Syscall via int 0x80.
         0x80 => {
-            // Store frame SP so park/handoff can read it without changing dispatch()'s signature.
             crate::sched::scheduler::store_frame_sp(frame_sp);
             crate::syscall::dispatch(frame);
-            // Check if the syscall triggered a context switch (park or handoff).
+            crate::sched::scheduler::check_preempt_on_return();
             let pending = crate::sched::scheduler::take_pending_switch();
             if pending != 0 {
                 return pending;

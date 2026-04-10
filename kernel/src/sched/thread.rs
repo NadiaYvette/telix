@@ -116,6 +116,9 @@ pub struct Thread {
     /// block_current spin-wait), this field preserves the original exception
     /// frame so personality_fork/personality_read_args can read it reliably.
     pub personality_frame_sp: u64,
+    /// Current syscall exception frame SP. Set by store_frame_sp() on syscall
+    /// entry. Per-thread (not per-CPU) so it survives preemptive migration.
+    pub syscall_frame_sp: u64,
     // --- EEVDF scheduling class ---
     /// Scheduling class: SCHED_NORMAL (0, EEVDF), SCHED_RT (1), SCHED_IDLE (2).
     pub sched_class: u8,
@@ -180,6 +183,7 @@ impl Thread {
             ts_blocked_on: core::sync::atomic::AtomicUsize::new(0),
             personality_result: core::sync::atomic::AtomicU64::new(0),
             personality_frame_sp: 0,
+            syscall_frame_sp: 0,
             sched_class: SCHED_NORMAL,
             eevdf_weight: 1024,
             eevdf_heap_pos: super::heap::HEAP_POS_NONE,

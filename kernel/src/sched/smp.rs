@@ -169,6 +169,9 @@ pub struct PerCpuData {
     pub idle_thread_id: AtomicU32,
     /// Whether this CPU is online and participating in scheduling.
     pub online: AtomicBool,
+    /// Set by wake_thread()/tick() when a reschedule is needed.
+    /// Checked on syscall return to trigger preemption.
+    pub need_resched: AtomicBool,
 }
 
 impl PerCpuData {
@@ -177,6 +180,7 @@ impl PerCpuData {
             current_thread: AtomicU32::new(0),
             idle_thread_id: AtomicU32::new(0),
             online: AtomicBool::new(false),
+            need_resched: AtomicBool::new(false),
         }
     }
 }

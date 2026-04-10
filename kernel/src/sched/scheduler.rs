@@ -37,8 +37,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 const VTIME_UNIT: u64 = 1 << 20;
 
 /// Kernel stack allocation order (0 = 1 page, 1 = 2 pages).
-/// 2 pages (8 KiB) provides headroom for nested interrupts during syscalls,
-/// especially on MIPS64 where EXL clearing enables timer preemption.
+/// 2 pages provides headroom for deep syscall call chains.
 const KSTACK_ORDER: usize = 1;
 
 /// Kernel stack size in bytes (2^KSTACK_ORDER pages).
@@ -174,6 +173,7 @@ fn current_frame_sp() -> &'static [AtomicU64] {
 /// it as the new SP if non-zero.
 static PENDING_SWITCH_SP_PTR: AtomicPtr<AtomicU64> =
     AtomicPtr::new(core::ptr::null_mut());
+
 
 #[inline]
 fn pending_switch_sp() -> &'static [AtomicU64] {
@@ -2082,7 +2082,7 @@ pub fn voluntary_reschedule() {
     let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
 
     // Save frame SP into thread struct.
-    let frame_sp = current_frame_sp()[cpu as usize].load(Ordering::Acquire);
+    let frame_sp = unsafe { thread_mut_from_ref(cur_id) }.syscall_frame_sp;
     let cur_prio;
     let cur_task;
     {
@@ -2109,6 +2109,11 @@ pub fn voluntary_reschedule() {
     }
 
     crate::sched::stats::CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
+
+    // Disable IRQs across page-table switch + current_thread update +
+    // pending_switch_sp store to prevent timer-driven try_switch from
+    // seeing inconsistent state.
+    let _irq_saved = crate::arch::irq::disable();
 
     // Switch page tables if crossing task boundaries.
     let next_task = thread_ref(next_id).task_id;
@@ -2139,6 +2144,7 @@ pub fn voluntary_reschedule() {
     let next_sp = next_t.saved_sp;
 
     pending_switch_sp()[cpu as usize].store(next_sp, Ordering::Release);
+    // Leave IRQs disabled — exception handler consumes pending_switch.
 }
 
 // --- Coscheduling ---
@@ -2276,8 +2282,32 @@ pub fn wake_thread(tid: ThreadId) {
             // block_current on its next check.
         }
     }
+    // If the woken thread has higher priority than the current thread on this
+    // CPU, set need_resched so check_preempt_on_return triggers an immediate
+    // voluntary reschedule at the next syscall return boundary.
+    {
+        let waker_cpu = smp::cpu_id();
+        let pcpu = smp::get(waker_cpu);
+        let cur_tid = pcpu.current_thread.load(Ordering::Relaxed);
+        let cur_prio = thread_ref(cur_tid).effective_priority;
+        let woken_prio = tref.base_priority;
+        if woken_prio < cur_prio {
+            pcpu.need_resched.store(true, Ordering::Release);
+        }
+    }
     // Signal all CPUs so any core spinning in block_current's WFE wakes immediately.
     crate::arch::irq::send_event();
+}
+
+/// Called on syscall return. If need_resched was set (by wake_thread or a
+/// blocking path on this CPU), perform an immediate voluntary reschedule so
+/// the higher-priority thread runs without waiting for the next timer tick.
+pub fn check_preempt_on_return() {
+    let cpu = smp::cpu_id();
+    let pcpu = smp::get(cpu);
+    if pcpu.need_resched.swap(false, Ordering::AcqRel) {
+        voluntary_reschedule();
+    }
 }
 
 /// Check if a thread has been marked for kill.
@@ -2837,7 +2867,8 @@ pub fn current_aspace_id() -> u64 {
 /// The child will return 0 from this syscall (set in its exception frame).
 pub fn fork_current() -> u64 {
     let cpu = smp::cpu_id() as usize;
-    let parent_frame_sp = current_frame_sp()[cpu].load(Ordering::Acquire);
+    let tid = smp::get(cpu as u32).current_thread.load(Ordering::Relaxed);
+    let parent_frame_sp = unsafe { thread_mut_from_ref(tid) }.syscall_frame_sp;
     if parent_frame_sp == 0 {
         return u64::MAX;
     }
@@ -3878,6 +3909,9 @@ pub fn thread_effective_priority(tid: ThreadId) -> u8 {
 pub fn store_frame_sp(sp: u64) {
     let cpu = smp::cpu_id() as usize;
     current_frame_sp()[cpu].store(sp, Ordering::Release);
+    // Also store per-thread so the value survives preemptive CPU migration.
+    let tid = smp::get(cpu as u32).current_thread.load(Ordering::Relaxed);
+    unsafe { thread_mut_from_ref(tid) }.syscall_frame_sp = sp;
 }
 
 /// Read the current exception frame SP for a given CPU.
@@ -3927,8 +3961,7 @@ pub const PARK_COMMITTED: u8 = 2;
 /// and calls `inject_recv_into_frame` before `park_current_for_ipc` runs,
 /// the injection writes to the correct frame.
 pub fn pre_save_frame(tid: ThreadId) {
-    let cpu = smp::cpu_id() as usize;
-    let frame_sp = current_frame_sp()[cpu].load(Ordering::Acquire);
+    let frame_sp = unsafe { thread_mut_from_ref(tid) }.syscall_frame_sp;
     let t = unsafe { thread_mut_from_ref(tid) };
     t.saved_sp = frame_sp;
     // Publish saved_sp before becoming visible. The Release on park_state
@@ -4011,7 +4044,12 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     next_t.state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     let next_sp = next_t.saved_sp;
-    crate::arch::irq::restore(irq_saved);
+
+    // Store pending_switch and do SA notification BEFORE restoring IRQs.
+    // With preemptive syscalls, a timer between current_thread update and
+    // the exception handler consuming pending_switch would corrupt state:
+    // try_switch would see the wrong current_thread on the old thread's stack.
+    pending_switch_sp()[cpu].store(next_sp, Ordering::Release);
 
     // Scheduler activation: notify userspace that a kthread blocked.
     if sa_enabled {
@@ -4025,7 +4063,10 @@ pub fn park_current_for_ipc(reason: BlockReason) {
         }
     }
 
-    pending_switch_sp()[cpu].store(next_sp, Ordering::Release);
+    // Leave IRQs disabled — the exception handler will consume pending_switch
+    // and perform the actual stack switch via iretq/eret/sret. Restoring IRQs
+    // here would open a window where current_thread != physical stack.
+    let _ = irq_saved;
 }
 
 /// Wake a parked thread by marking it Ready and enqueueing it.
@@ -4298,7 +4339,8 @@ fn check_interval_timers() {
 pub fn park_current_for_sleep(deadline_ns: u64) {
     let cpu = smp::cpu_id() as usize;
     let cpu_idx = cpu as u32;
-    let frame_sp = current_frame_sp()[cpu].load(Ordering::Acquire);
+    let tid_for_sp = smp::get(cpu_idx).current_thread.load(Ordering::Relaxed);
+    let frame_sp = unsafe { thread_mut_from_ref(tid_for_sp) }.syscall_frame_sp;
 
     let pcpu = smp::current();
     let tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
@@ -4352,7 +4394,9 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     next_t.state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     let next_sp = next_t.saved_sp;
-    crate::arch::irq::restore(irq_saved);
+
+    // Store pending_switch before restoring IRQs — see park_current_for_ipc.
+    pending_switch_sp()[cpu].store(next_sp, Ordering::Release);
 
     if sa_enabled {
         let tptr = TASK_TABLE.get(parked_task_id) as *mut Task;
@@ -4365,7 +4409,8 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
         }
     }
 
-    pending_switch_sp()[cpu].store(next_sp, Ordering::Release);
+    // Leave IRQs disabled — exception handler consumes pending_switch.
+    let _ = irq_saved;
 }
 
 /// Set an alarm timer for the current task.
@@ -4406,7 +4451,8 @@ pub fn alarm(initial_ns: u64, interval_ns: u64) -> u64 {
 pub fn handoff_to(receiver_tid: ThreadId) {
     let cpu = smp::cpu_id() as usize;
     let cpu_id = cpu as u32;
-    let frame_sp = current_frame_sp()[cpu].load(Ordering::Acquire);
+    let sender_tid_for_sp = smp::get(cpu_id).current_thread.load(Ordering::Relaxed);
+    let frame_sp = unsafe { thread_mut_from_ref(sender_tid_for_sp) }.syscall_frame_sp;
 
     let pcpu = smp::current();
     let sender_tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
@@ -4457,9 +4503,12 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     receiver.state = ThreadState::Running;
     pcpu.current_thread.store(receiver_tid, Ordering::Relaxed);
     let recv_sp = receiver.saved_sp;
-    crate::arch::irq::restore(irq_saved);
 
+    // Store pending_switch before restoring IRQs — see park_current_for_ipc
+    // comment for why this ordering is critical with preemptive syscalls.
     pending_switch_sp()[cpu].store(recv_sp, Ordering::Release);
+    // Leave IRQs disabled through exception handler return.
+    let _ = irq_saved;
 }
 
 // --- Scheduler Activations API ---

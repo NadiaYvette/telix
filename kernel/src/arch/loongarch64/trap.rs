@@ -213,6 +213,7 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             frame.era += 4;
             crate::sched::scheduler::store_frame_sp(frame_sp);
             crate::syscall::dispatch(frame);
+            crate::sched::scheduler::check_preempt_on_return();
             let pending = crate::sched::scheduler::take_pending_switch();
             if pending != 0 {
                 return pending;

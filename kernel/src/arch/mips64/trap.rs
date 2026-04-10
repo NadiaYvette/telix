@@ -189,11 +189,8 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             // Syscall — advance EPC past the syscall instruction (4 bytes).
             frame.epc += 4;
 
-            // Clear EXL (to leave exception context) and KSU (to stay in
-            // kernel mode), but ALSO clear IE to keep interrupts disabled.
-            // The scheduler explicitly calls irq::enable() when it needs
-            // timer preemption (park, exit_current_thread). This avoids the
-            // register corruption caused by timer preempting mid-dispatch.
+            // Clear EXL and KSU to leave exception context (stay in kernel
+            // mode with IRQs disabled). IE stays cleared for non-preemptive dispatch.
             unsafe {
                 core::arch::asm!(
                     "di",                            // clear IE first
@@ -208,6 +205,7 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
 
             crate::sched::scheduler::store_frame_sp(frame_sp);
             crate::syscall::dispatch(frame);
+            crate::sched::scheduler::check_preempt_on_return();
             let pending = crate::sched::scheduler::take_pending_switch();
             if pending != 0 {
                 return pending;
