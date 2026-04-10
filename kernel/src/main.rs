@@ -186,9 +186,8 @@ fn startup_thread() -> ! {
         // the cap registry. `populate_from_firmware` usually covers this
         // already; register_region is idempotent on (base, size).
         let region_id = cap::mmio::register_region(base, 0x1000, cap::mmio::CacheAttr::Device);
-        // Pre-register the IRQ→MMIO association so the kernel can ACK the
-        // virtio interrupt itself — the driver doesn't need to pass phys.
-        let _ = io::irq_dispatch::register(irq as u32, base);
+        // The driver calls sys_irq_attach to bind its IRQ port and provide
+        // the MMIO base for kernel-side ACK (Step C4).
         let arg0_upper = irq << 48;
         println!(
             "  virtio-blk at {:#x}, irq {}, region_id={:?}, spawning blk_srv",
@@ -237,6 +236,10 @@ fn startup_thread() -> ! {
             }
         }
         if let Some(dev) = arch::x86_64::pci::find_virtio_device(0x1000) {
+            // net_srv is poll-based, but its device may share a PCI IRQ line
+            // with blk_srv. Register the MMIO base so the kernel's IRQ handler
+            // can ACK the net device and deassert the level-triggered line.
+            io::irq_dispatch::register(dev.irq as u32, dev.bar0 as usize);
             let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
             match sched::spawn_user(b"net_srv", 50, 20, arg0) {
                 Some(tid) => println!("  net_srv spawned (thread {})", tid),

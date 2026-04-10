@@ -764,7 +764,7 @@ The driver model is being introduced incrementally so that every commit keeps th
 | **C1–C3** | Cap-based MMIO mapping syscall (`sys_mmio_map_cap`, slot 3 convention via `spawn_user_with_mmio_cap`) and migration of virtio-mmio `net_srv` / `blk_srv` | ✅ Done |
 | **C (b)** | Extended cap-based MMIO to loongarch64 PCI BARs (dynamic `register_region` from the LA64 spawn path), x86_64 VBE framebuffer (`fb_srv` with `CacheAttr::WriteCombine`), and the compositor's framebuffer handle (`compositor_srv` consumes the same cap slot) | ✅ Done |
 | **D** | Removed the legacy `sys_mmap_device` syscall and the per-arch `DEVICE_MMIO_RANGE` allowlists entirely — all userspace MMIO now flows through typed memory caps | ✅ Done (commit `212d302`) |
-| **C4** | Port-based IRQ for `blk_srv` (currently polling); last driver still on the pre-Step-A interrupt path | ⏳ Pending |
+| **C4** | Port-based IRQ for `blk_srv`: replaced polling `wait_complete` with `recv_msg(irq_port)`; kernel ACKs virtio device per-platform (MMIO, PCI I/O, PCI MMIO); added `irq_attach` userlib wrapper | ✅ Done |
 | **E** | Device-manager server: driver matching database, lifecycle/hotplug, centralized capability distribution | Not started |
 | **F** | PCI bus server (x86_64 + LA64), Platform/DTB bus server (aarch64 + riscv64) as independent servers, replacing the kernel-side `drivers/` enumeration stubs | Not started |
 

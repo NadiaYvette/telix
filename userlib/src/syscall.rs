@@ -915,6 +915,14 @@ pub fn irq_wait(irq: u32, mmio_base: usize) -> u64 {
     unsafe { arch::syscall2(SYS_IRQ_WAIT, irq as u64, mmio_base as u64) }
 }
 
+/// Bind an IRQ to a port for message-based delivery.
+/// The kernel ACKs the virtio device using `mmio_base` (physical MMIO
+/// base on MMIO transports, BAR0 I/O port on PCI I/O transports).
+/// Pass mmio_base=0 to skip kernel-side device ACK.
+pub fn irq_attach(irq: u32, port_id: u64, mmio_base: usize) -> bool {
+    unsafe { arch::syscall3(SYS_IRQ_ATTACH, irq as u64, port_id, mmio_base as u64) == 0 }
+}
+
 /// Non-blocking read of a single character from the serial console.
 pub fn getchar() -> Option<u8> {
     let r = unsafe { arch::syscall0(SYS_GETCHAR) };

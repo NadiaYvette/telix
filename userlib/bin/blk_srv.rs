@@ -162,10 +162,12 @@ fn print_hex(n: u64) {
     }
 }
 
+/// IRQ message tag sent by the kernel (must match irq_dispatch::IRQ_MSG_TAG).
+const IRQ_MSG: u64 = 0x4000;
+
 /// Userspace block device driver state.
 struct BlkDev {
     mmio_va: usize,
-    #[allow(dead_code)]
     irq: u32,
     /// VA of the virtqueue page (desc + avail + used rings).
     vq_va: usize,
@@ -187,6 +189,8 @@ struct BlkDev {
     capacity: u64,
     /// Actual virtqueue size (device-reported on PCI, negotiated on MMIO).
     queue_size: usize,
+    /// Port receiving IRQ notifications (0 = not yet set up).
+    irq_port: u64,
 }
 
 // --- Legacy virtio-PCI BAR0 register offsets ---
@@ -337,10 +341,7 @@ impl BlkDev {
         let status_pa = buf_pa + 16; // After 16-byte header
         let data_pa = buf_pa + 32; // After header + status gap
 
-        // IRQ→MMIO association is pre-registered by the kernel at spawn
-        // time, so the driver doesn't need to know (or pass) the phys
-        // base. Step C4 will migrate this to port-based irq_attach.
-        let _ = irq;
+        // IRQ is attached to a port in main() after init returns.
 
         if version == 1 {
             // Legacy MMIO.
@@ -369,6 +370,7 @@ impl BlkDev {
                 last_used_idx: 0,
                 capacity,
                 queue_size: QUEUE_SIZE,
+                irq_port: 0,
             });
         }
 
@@ -401,6 +403,7 @@ impl BlkDev {
             last_used_idx: 0,
             capacity,
             queue_size: QUEUE_SIZE,
+            irq_port: 0,
         })
     }
 
@@ -498,6 +501,7 @@ impl BlkDev {
             last_used_idx: 0,
             capacity,
             queue_size: qsz,
+            irq_port: 0,
         })
     }
 
@@ -596,6 +600,7 @@ impl BlkDev {
             last_used_idx: 0,
             capacity,
             queue_size: qsz,
+            irq_port: 0,
         })
     }
 
@@ -762,9 +767,33 @@ impl BlkDev {
         let used_va = self.vq_va + used_offset;
         let used_idx_ptr = (used_va + 2) as *const u16; // VringUsed.idx at offset 2
 
-        // Poll the used ring, yielding between checks.
+        // Check if already complete (IRQ may have fired before we get here).
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("dsb sy");
+        }
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!("fence iorw, iorw");
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            core::arch::asm!("dbar 0");
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let idx = unsafe { core::ptr::read_volatile(used_idx_ptr) };
+        if idx != self.last_used_idx {
+            self.last_used_idx = idx;
+            return;
+        }
+
+        // Wait for IRQ notification on the dedicated port (or poll as fallback).
         loop {
-            // DSB ensures device writes to the used ring are visible before we read.
+            if self.irq_port != 0 {
+                let _ = syscall::recv_msg(self.irq_port);
+            } else {
+                syscall::yield_now();
+            }
             #[cfg(target_arch = "aarch64")]
             unsafe {
                 core::arch::asm!("dsb sy");
@@ -783,7 +812,6 @@ impl BlkDev {
                 self.last_used_idx = idx;
                 return;
             }
-            syscall::yield_now();
         }
     }
 }
@@ -825,6 +853,24 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b" sectors (");
     print_num(capacity / 2);
     syscall::debug_puts(b" KiB)\n");
+
+    // Set up IRQ port and bind it to the device interrupt.
+    let irq_port = syscall::port_create();
+    // Recover the physical MMIO base for kernel-side virtio ACK.
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "mips64")))]
+    let mmio_phys = syscall::virt_to_phys(dev.mmio_va).unwrap_or(0);
+    #[cfg(any(target_arch = "x86_64", target_arch = "mips64"))]
+    let mmio_phys = dev.mmio_va; // BAR0 I/O port number
+    if syscall::irq_attach(irq, irq_port, mmio_phys) {
+        dev.irq_port = irq_port;
+        syscall::debug_puts(b"  [blk_srv] IRQ ");
+        print_num(irq as u64);
+        syscall::debug_puts(b" bound to port ");
+        print_num(irq_port as u64);
+        syscall::debug_puts(b"\n");
+    } else {
+        syscall::debug_puts(b"  [blk_srv] WARNING: irq_attach failed, using poll fallback\n");
+    }
 
     // Create IPC port and register with name server.
     let port = syscall::port_create();

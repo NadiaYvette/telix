@@ -28,7 +28,7 @@ pub const IRQ_MSG_TAG: u64 = 0x4000;
 struct IrqWaiter {
     /// Thread ID waiting for this IRQ, or 0 if none (thread 0 = idle, never waits).
     thread_id: AtomicU32,
-    /// MMIO base for virtio interrupt ACK (kernel identity-mapped).
+    /// MMIO base for legacy (thread-based) virtio interrupt ACK.
     mmio_base: AtomicUsize,
     /// IRQ fired but no waiter was blocked yet.
     pending: AtomicBool,
@@ -36,6 +36,11 @@ struct IrqWaiter {
     /// When non-zero, `handle_irq` queues an `IRQ_MSG` message instead of
     /// (or in addition to) waking `thread_id`.
     port_id: AtomicU64,
+    /// Separate MMIO base for the port-based listener's device.
+    /// Needed when two devices share one IRQ line (e.g. PCI legacy IRQ 11):
+    /// the legacy listener's device is ACKed via `mmio_base`, the port
+    /// listener's device via `port_mmio_base`.
+    port_mmio_base: AtomicUsize,
 }
 
 /// Page-allocated waiter table. Null until first register().
@@ -134,7 +139,7 @@ pub fn attach_port(irq: u32, port_id: PortId, mmio_base: usize) -> bool {
         return false;
     }
     let slot = unsafe { &*page.add(idx) };
-    slot.mmio_base.store(mmio_base, Ordering::Release);
+    slot.port_mmio_base.store(mmio_base, Ordering::Release);
     slot.port_id.store(port_id, Ordering::Release);
     crate::arch::irq::enable_device_irq(irq);
     true
@@ -149,6 +154,7 @@ pub fn detach_port(irq: u32) -> bool {
         None => return false,
     };
     slot.port_id.store(0, Ordering::Release);
+    slot.port_mmio_base.store(0, Ordering::Release);
     true
 }
 
@@ -197,23 +203,46 @@ pub fn handle_irq(irq: u32) -> bool {
     };
     let mmio_base = slot.mmio_base.load(Ordering::Acquire);
     let port_id = slot.port_id.load(Ordering::Acquire);
-    if mmio_base == 0 && port_id == 0 {
+    let port_mmio = slot.port_mmio_base.load(Ordering::Acquire);
+    if mmio_base == 0 && port_id == 0 && port_mmio == 0 {
         return false; // Not registered for userspace dispatch.
     }
 
-    // ACK the virtio interrupt (must happen in kernel/S-mode with identity map).
-    if mmio_base != 0 {
-        #[cfg(not(target_arch = "x86_64"))]
+    // ACK virtio interrupt for ALL devices sharing this IRQ line.
+    // On shared PCI legacy IRQs, both the legacy listener's device and the
+    // port listener's device must be ACKed to deassert the level-triggered line.
+    for base in [mmio_base, port_mmio] {
+        if base == 0 {
+            continue;
+        }
+        // Virtio-MMIO transport: read InterruptStatus, write InterruptACK.
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         {
             let status = crate::drivers::virtio_mmio::read32(
-                mmio_base,
+                base,
                 crate::drivers::virtio_mmio::INTERRUPT_STATUS,
             );
             crate::drivers::virtio_mmio::write32(
-                mmio_base,
+                base,
                 crate::drivers::virtio_mmio::INTERRUPT_ACK,
                 status,
             );
+        }
+        // PCI legacy virtio (I/O ports): ISR_STATUS at BAR0+0x13, read clears.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let port = base as u16 + 0x13;
+            let _isr: u8;
+            core::arch::asm!("in al, dx", in("dx") port, out("al") _isr, options(nomem, nostack));
+        }
+        #[cfg(target_arch = "mips64")]
+        unsafe {
+            crate::arch::mips64::pci::ioport_read8(base as u16 + 0x13);
+        }
+        // PCI legacy virtio (MMIO BAR): ISR_STATUS at BAR0+0x13, read clears.
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            core::ptr::read_volatile((base + 0x13) as *const u8);
         }
     }
 
