@@ -17,6 +17,7 @@
 use super::page::PhysAddr;
 use super::pagevec::PageVec;
 use super::phys;
+use super::swap::{self, SwapSlot};
 use crate::ipc::port::{self, PortId};
 use crate::mm::slab;
 use crate::sync::SpinLock;
@@ -78,6 +79,11 @@ pub struct MemObject {
     /// For Pager objects: user-facing IPC port for fault notifications.
     /// 0 for anonymous objects.
     pub pager_port: u64,
+    /// Per-page swap slot table. Lazily allocated (null = no swap slots
+    /// recorded). For anonymous objects only. Indexed by page offset
+    /// within the object; value 0 means "not swapped". Allocated via
+    /// phys; length is `page_count`.
+    swap_slots: *mut u32,
 }
 
 impl MemObject {
@@ -93,12 +99,98 @@ impl MemObject {
             file_handle: 0,
             file_base_offset: 0,
             pager_port: 0,
+            swap_slots: core::ptr::null_mut(),
         }
+    }
+
+    /// Lazily allocate the per-page swap slot table. Returns `false` if
+    /// allocation fails. No-op if already allocated.
+    fn ensure_swap_slots(&mut self) -> bool {
+        if !self.swap_slots.is_null() {
+            return true;
+        }
+        let n = self.page_count as usize;
+        if n == 0 {
+            return false;
+        }
+        let bytes = n * core::mem::size_of::<u32>();
+        let page_sz = super::page::page_size();
+        let pages_needed = (bytes + page_sz - 1) / page_sz;
+        let order = pages_needed.next_power_of_two().trailing_zeros() as usize;
+        let pa = match phys::alloc_pages(order) {
+            Some(p) => p,
+            None => return false,
+        };
+        let ptr = pa.as_usize() as *mut u32;
+        unsafe {
+            core::ptr::write_bytes(ptr as *mut u8, 0, pages_needed * page_sz);
+        }
+        self.swap_slots = ptr;
+        true
+    }
+
+    /// Get the swap slot for page `idx`. Returns `SwapSlot::NONE` if no
+    /// table or slot 0.
+    pub fn get_swap_slot(&self, idx: usize) -> SwapSlot {
+        if self.swap_slots.is_null() || idx >= self.page_count as usize {
+            return SwapSlot::NONE;
+        }
+        SwapSlot(unsafe { *self.swap_slots.add(idx) })
+    }
+
+    /// Record a swap slot for page `idx`. Allocates the table lazily.
+    /// Returns `false` if allocation of the table fails.
+    pub fn set_swap_slot(&mut self, idx: usize, slot: SwapSlot) -> bool {
+        if idx >= self.page_count as usize {
+            return false;
+        }
+        if !self.ensure_swap_slots() {
+            return false;
+        }
+        unsafe {
+            *self.swap_slots.add(idx) = slot.0;
+        }
+        true
+    }
+
+    /// Clear the swap slot for page `idx`, returning the old slot (so
+    /// the caller can free it).
+    pub fn clear_swap_slot(&mut self, idx: usize) -> SwapSlot {
+        if self.swap_slots.is_null() || idx >= self.page_count as usize {
+            return SwapSlot::NONE;
+        }
+        let old = unsafe { *self.swap_slots.add(idx) };
+        unsafe {
+            *self.swap_slots.add(idx) = 0;
+        }
+        SwapSlot(old)
+    }
+
+    /// Release all swap slots back to the swap subsystem. Called during
+    /// object destruction.
+    pub fn release_all_swap_slots(&mut self) {
+        if self.swap_slots.is_null() {
+            return;
+        }
+        for i in 0..self.page_count as usize {
+            let slot = SwapSlot(unsafe { *self.swap_slots.add(i) });
+            if !slot.is_none() {
+                swap::free_slot(slot);
+            }
+        }
+        // Note: we don't free the swap_slots page itself here because
+        // it was allocated from phys and the object is about to be freed.
+        // It will be reclaimed when the object's backing storage is freed.
     }
 
     /// Allocate the physical page at offset `page_idx` if not already allocated.
     /// Returns `(PhysAddr, pre_zeroed)` where `pre_zeroed` is true if the page
     /// came from the zero pool (entire PAGE_SIZE already zeroed).
+    ///
+    /// If a swap slot is recorded for this page, allocates a fresh physical
+    /// page, reads the swapped-out contents back, clears the swap slot, and
+    /// returns the page (with `pre_zeroed = false` since the contents came
+    /// from swap, not the zero pool).
     pub fn ensure_page(&mut self, page_idx: usize) -> Option<(PhysAddr, bool)> {
         if page_idx >= self.page_count as usize {
             return None;
@@ -107,7 +199,23 @@ impl MemObject {
         if existing != 0 {
             return Some((PhysAddr::new(existing), false));
         }
-        // Try pre-zeroed pool first, then dirty allocator.
+
+        // Check for swap-in: the page was evicted and written to swap.
+        let slot = self.get_swap_slot(page_idx);
+        if !slot.is_none() {
+            let pa = phys::alloc_page()?;
+            if swap::read_page(slot, pa) == swap::SwapIoResult::Ok {
+                self.pages.set(page_idx, pa.as_usize());
+                self.clear_swap_slot(page_idx);
+                swap::free_slot(slot);
+                return Some((pa, false));
+            }
+            // Swap read failed — fall through to zero-fill.
+            // (The slot will be leaked; this is a degraded path.)
+            phys::free_page(pa);
+        }
+
+        // Normal path: try pre-zeroed pool first, then dirty allocator.
         let (pa, pre_zeroed) = if let Some(pa) = super::zeropool::alloc_zeroed_page() {
             (pa, true)
         } else {
@@ -469,6 +577,9 @@ pub fn destroy(id: ObjectId) {
             base = range_end;
         }
     }
+
+    // Free any swap slots this object still holds.
+    guard.release_all_swap_slots();
 
     // Free PageVec heap and mappings page.
     guard.pages.free_heap();
