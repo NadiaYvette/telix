@@ -346,6 +346,7 @@ fn startup_thread() -> ! {
     // evict via WSCLOCK (triggering swap-out), re-fault (swap-in), verify data.
     if mm::swap::is_ram_backend() {
         test_swap_e2e();
+        test_swap_cow_fork();
     }
 
     // Phase 4: Spawning init process...
@@ -844,4 +845,123 @@ fn test_swap_e2e() {
 
     mm::aspace::destroy(aspace_id);
     println!("  Swap E2E data integrity test: PASSED");
+}
+
+/// Test that fork correctly inherits swap slots. Creates a parent aspace,
+/// faults in pages, writes patterns, evicts them to swap, then forks.
+/// The child faults on the swapped pages and verifies data integrity.
+fn test_swap_cow_fork() {
+    use mm::page::{self, MMUPAGE_SIZE};
+    use mm::vma::VmaProt;
+    let ps = page::page_size();
+
+    println!("  Swap COW fork: testing swap slot inheritance across fork...");
+
+    // --- Parent: create aspace, fault pages, write patterns ---
+    // Use a proper user page table (includes kernel mappings) because
+    // clone_for_cow reloads CR3 to flush TLB.
+    let pt_root = mm::hat::create_user_page_table().expect("swap cow pt root");
+    let parent_aspace = mm::aspace::create(pt_root).expect("swap cow parent aspace");
+
+    let test_va = 0xB0_0000_0000usize;
+    let num_alloc_pages = 4;
+    let num_mmu_pages = num_alloc_pages * page::page_mmucount();
+    mm::aspace::with_aspace(parent_aspace, |aspace| {
+        aspace
+            .map_anon(test_va, num_mmu_pages, VmaProt::ReadWrite)
+            .expect("swap cow map_anon");
+    });
+
+    // Fault and write patterns.
+    for page_idx in 0..num_alloc_pages {
+        let va = test_va + page_idx * ps;
+        mm::fault::handle_page_fault(parent_aspace, va, mm::fault::FaultType::Write);
+        let pa = mm::hat::translate_va(pt_root, va).expect("swap cow translate");
+        let pattern = 0xCAFE_0000u64 | (page_idx as u64);
+        unsafe {
+            core::ptr::write_volatile(pa as *mut u64, pattern);
+            core::ptr::write_volatile((pa + ps - 8) as *mut u64, pattern ^ 0xFFFF_FFFF);
+        }
+    }
+
+    // --- Evict all pages to swap ---
+    let scan1 = mm::wsclock::scan(parent_aspace, 100);
+    let scan2 = mm::wsclock::scan(parent_aspace, 100);
+    let total_freed = scan1.pages_freed + scan2.pages_freed;
+    assert!(
+        total_freed >= num_alloc_pages,
+        "swap cow: expected {} pages freed, got {}",
+        num_alloc_pages,
+        total_freed,
+    );
+
+    // --- Fork: child should inherit swap slots ---
+    let (child_aspace, child_pt_root) =
+        mm::aspace::clone_for_cow(parent_aspace).expect("swap cow fork");
+
+    // --- Child faults on swapped pages and verifies data ---
+    for page_idx in 0..num_alloc_pages {
+        let va = test_va + page_idx * ps;
+        let result =
+            mm::fault::handle_page_fault(child_aspace, va, mm::fault::FaultType::Read);
+        assert!(
+            result == mm::fault::FaultResult::HandledMajor,
+            "swap cow: child expected major fault for page {}, got {:?}",
+            page_idx,
+            result,
+        );
+
+        let pa = mm::hat::translate_va(child_pt_root, va).expect("swap cow child translate");
+        let pattern = 0xCAFE_0000u64 | (page_idx as u64);
+        unsafe {
+            let start_val = core::ptr::read_volatile(pa as *const u64);
+            let end_val = core::ptr::read_volatile((pa + ps - 8) as *const u64);
+            assert_eq!(
+                start_val, pattern,
+                "swap cow: child page {} start mismatch: got {:#x}, expected {:#x}",
+                page_idx, start_val, pattern,
+            );
+            assert_eq!(
+                end_val,
+                pattern ^ 0xFFFF_FFFF,
+                "swap cow: child page {} end mismatch: got {:#x}, expected {:#x}",
+                page_idx, end_val, pattern ^ 0xFFFF_FFFF,
+            );
+        }
+    }
+
+    // --- Parent also faults and verifies (swap slot has refcount > 0) ---
+    for page_idx in 0..num_alloc_pages {
+        let va = test_va + page_idx * ps;
+        let result =
+            mm::fault::handle_page_fault(parent_aspace, va, mm::fault::FaultType::Read);
+        assert!(
+            result == mm::fault::FaultResult::HandledMajor,
+            "swap cow: parent expected major fault for page {}, got {:?}",
+            page_idx,
+            result,
+        );
+
+        let pa = mm::hat::translate_va(pt_root, va).expect("swap cow parent translate");
+        let pattern = 0xCAFE_0000u64 | (page_idx as u64);
+        unsafe {
+            let start_val = core::ptr::read_volatile(pa as *const u64);
+            let end_val = core::ptr::read_volatile((pa + ps - 8) as *const u64);
+            assert_eq!(
+                start_val, pattern,
+                "swap cow: parent page {} start mismatch: got {:#x}, expected {:#x}",
+                page_idx, start_val, pattern,
+            );
+            assert_eq!(
+                end_val,
+                pattern ^ 0xFFFF_FFFF,
+                "swap cow: parent page {} end mismatch: got {:#x}, expected {:#x}",
+                page_idx, end_val, pattern ^ 0xFFFF_FFFF,
+            );
+        }
+    }
+
+    mm::aspace::destroy(child_aspace);
+    mm::aspace::destroy(parent_aspace);
+    println!("  Swap COW fork data integrity test: PASSED");
 }

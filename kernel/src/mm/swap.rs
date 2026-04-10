@@ -34,7 +34,7 @@
 //! Absence of the parameter leaves swap disabled; WSCLOCK continues to
 //! discard evicted pages as it does today.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use super::page::{self, PhysAddr};
 use super::phys;
@@ -321,6 +321,56 @@ static mut BACKEND: Option<Backend> = None;
 /// release/acquire gate for `BACKEND`.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+// -----------------------------------------------------------------------
+// Swap slot refcounting — supports shared slots across COW fork siblings
+// -----------------------------------------------------------------------
+
+/// Per-slot reference count array. Indexed by `slot.0 - 1` (0-based).
+/// Allocated once during backend init, sized to match total slots.
+static mut SLOT_REFCOUNTS: *mut AtomicU8 = core::ptr::null_mut();
+static SLOT_REFCOUNT_LEN: AtomicU32 = AtomicU32::new(0);
+
+/// Allocate the refcount array for `total` slots. Called once from each
+/// backend's init path, after the backend bitmap is set up.
+fn init_refcounts(total: usize) {
+    let rc: &'static mut [AtomicU8] = unsafe { phys::alloc_static_slice::<AtomicU8>(total) };
+    unsafe {
+        SLOT_REFCOUNTS = rc.as_mut_ptr();
+    }
+    SLOT_REFCOUNT_LEN.store(total as u32, Ordering::Release);
+}
+
+/// Get a reference to the refcount for `slot`.
+#[inline]
+fn refcount_of(slot: SwapSlot) -> Option<&'static AtomicU8> {
+    if slot.is_none() {
+        return None;
+    }
+    let idx = (slot.0 - 1) as usize;
+    let len = SLOT_REFCOUNT_LEN.load(Ordering::Relaxed) as usize;
+    if idx >= len {
+        return None;
+    }
+    unsafe { Some(&*SLOT_REFCOUNTS.add(idx)) }
+}
+
+/// Set the refcount to 1 for a freshly allocated slot.
+#[inline]
+fn refcount_init(slot: SwapSlot) {
+    if let Some(rc) = refcount_of(slot) {
+        rc.store(1, Ordering::Relaxed);
+    }
+}
+
+/// Increment the reference count on a swap slot. Called during fork to
+/// share a slot between parent and child objects.
+pub fn dup_slot(slot: SwapSlot) {
+    if let Some(rc) = refcount_of(slot) {
+        let old = rc.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(old < 255, "swap slot refcount overflow");
+    }
+}
+
 /// Counters exposed to tests and /proc-like interfaces.
 pub static SWAP_OUT_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static SWAP_IN_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -364,20 +414,34 @@ fn current() -> Option<Backend> {
 }
 
 /// Allocate a slot in the active backend. Returns `SwapSlot::NONE` if
-/// swap is disabled or the backend is full.
+/// swap is disabled or the backend is full. The new slot has refcount 1.
 pub fn alloc_slot() -> SwapSlot {
-    match current() {
+    let slot = match current() {
         Some(Backend::Ram(b)) => b.alloc_slot(),
         Some(Backend::BlkIo(b)) => b.alloc_slot(),
         None => SwapSlot::NONE,
+    };
+    if !slot.is_none() {
+        refcount_init(slot);
     }
+    slot
 }
 
-/// Release a slot previously returned by `alloc_slot`.
+/// Decrement the refcount on a swap slot. When the refcount reaches
+/// zero the slot is returned to the backend's free pool.
 pub fn free_slot(slot: SwapSlot) {
     if slot.is_none() {
         return;
     }
+    // Decrement refcount. If still > 0, another COW sibling holds the slot.
+    if let Some(rc) = refcount_of(slot) {
+        let prev = rc.fetch_sub(1, Ordering::Release);
+        debug_assert!(prev > 0, "swap slot refcount underflow");
+        if prev > 1 {
+            return; // other references remain
+        }
+    }
+    // Refcount hit zero (or no refcount tracking) — return to backend.
     match current() {
         Some(Backend::Ram(b)) => b.free_slot(slot),
         Some(Backend::BlkIo(b)) => b.free_slot(slot),
@@ -466,6 +530,9 @@ fn init_ram_backend(total: u32) -> bool {
     // hand out unowned entries.
     let pages: &'static [u64] = &pages[..filled];
     let bitmap: &'static [AtomicU64] = &bitmap[..bmp_words];
+
+    // Per-slot refcount array for COW fork sharing.
+    init_refcounts(filled);
 
     // Allocate the RamBackend control block itself from phys so it is
     // `'static`. It fits in well under a page.
@@ -565,6 +632,9 @@ fn init_blk_backend(offset_kb: u32, size_kb: u32) -> bool {
         let cur = bitmap[wi].load(Ordering::Relaxed);
         bitmap[wi].store(cur | (1u64 << bit), Ordering::Relaxed);
     }
+
+    // Per-slot refcount array for COW fork sharing.
+    init_refcounts(total_slots);
 
     // Dedicated reply port for synchronous swap I/O.
     let reply_port = match port::create() {

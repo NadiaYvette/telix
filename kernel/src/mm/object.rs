@@ -451,8 +451,8 @@ pub fn create_anon(page_count: u16) -> Option<ObjectId> {
 pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
     let src_entry = resolve_entry(src_id)? as *mut ObjEntry;
 
-    // Step 1: lock source, read state, copy pages.
-    let (page_count, group_port, new_pages) = {
+    // Step 1: lock source, read state, copy pages + swap slots.
+    let (page_count, group_port, new_pages, child_swap_slots) = {
         let mut src = unsafe { (*src_entry).inner.lock() };
 
         let first_fork = src.cow_group_port == 0;
@@ -474,7 +474,38 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
         // Fork epochs track pairwise sharing — no per-page refcount bumps needed
         // for any fork (first or cascading).
 
-        (page_count, group_port, new_pages)
+        // Copy swap slots so the child can fault in pages that were swapped
+        // out before fork. Each shared slot gets its refcount bumped.
+        let child_swap_slots = if !src.swap_slots.is_null() {
+            let n = page_count as usize;
+            let bytes = n * core::mem::size_of::<u32>();
+            let page_sz = super::page::page_size();
+            let pages_needed = (bytes + page_sz - 1) / page_sz;
+            let order = pages_needed.next_power_of_two().trailing_zeros() as usize;
+            match phys::alloc_pages(order) {
+                Some(pa) => {
+                    let ptr = pa.as_usize() as *mut u32;
+                    unsafe {
+                        // Zero the full allocation first (may be larger than n slots).
+                        core::ptr::write_bytes(ptr as *mut u8, 0, pages_needed * page_sz);
+                        core::ptr::copy_nonoverlapping(src.swap_slots, ptr, n);
+                    }
+                    // Bump refcount on each shared swap slot.
+                    for i in 0..n {
+                        let slot_val = unsafe { *src.swap_slots.add(i) };
+                        if slot_val != 0 {
+                            swap::dup_slot(swap::SwapSlot(slot_val));
+                        }
+                    }
+                    ptr
+                }
+                None => core::ptr::null_mut(),
+            }
+        } else {
+            core::ptr::null_mut()
+        };
+
+        (page_count, group_port, new_pages, child_swap_slots)
     };
 
     // Step 2: allocate entry + kernel port.
@@ -495,6 +526,7 @@ pub fn clone_for_cow(src_id: ObjectId) -> Option<ObjectId> {
         obj.page_count = page_count;
         obj.cow_group_port = group_port;
         obj.pages = new_pages;
+        obj.swap_slots = child_swap_slots;
         core::ptr::write(&mut (*ptr).inner, SpinLock::new(obj));
     }
 
