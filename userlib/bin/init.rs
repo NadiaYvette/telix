@@ -3096,6 +3096,99 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 176: swap stress (memory pressure + fork + data integrity) ---
+    //
+    // Allocates a large anonymous region, writes a pattern to every u64,
+    // forks, and verifies both parent and child see the correct data.
+    // With swap=ram:N enabled, kswapd evicts pages to swap under
+    // pressure; fork inherits swap slots so both sides can fault the
+    // data back in. Without swap this is a plain COW fork test.
+    syscall::debug_puts(b"  init: Phase 176 swap stress...\n");
+    {
+        let ps = syscall::page_size();
+        // Allocate 2 MiB — exercises COW fork and (with swap=ram:N) swap
+        // inheritance across ~30 allocation pages. Larger regions can OOM
+        // the init process in 256 MiB VMs due to concurrent server memory use.
+        let target_bytes: usize = 2 * 1024 * 1024;
+        let page_count = target_bytes / ps;
+        let mut p176_ok = true;
+
+        let base_va = match syscall::mmap_anon(0, page_count, 1) {
+            Some(va) => va,
+            None => {
+                syscall::debug_puts(b"    p176: mmap failed\n");
+                p176_ok = false;
+                0
+            }
+        };
+
+        if p176_ok && base_va != 0 {
+            // Write a pattern to every u64 in the region.
+            let u64_count = target_bytes / 8;
+            let ptr = base_va as *mut u64;
+            for i in 0..u64_count {
+                unsafe {
+                    core::ptr::write_volatile(ptr.add(i), 0xA5A5_0000_0000u64 | (i as u64));
+                }
+            }
+
+            // Fork — child inherits the region (COW + swap slot sharing).
+            let child = syscall::fork();
+            if child == 0 {
+                // --- CHILD: verify every u64, exit 0 on success ---
+                let ptr = base_va as *const u64;
+                for i in 0..u64_count {
+                    let val = unsafe { core::ptr::read_volatile(ptr.add(i)) };
+                    let expected = 0xA5A5_0000_0000u64 | (i as u64);
+                    if val != expected {
+                        syscall::debug_puts(b"    p176: child mismatch\n");
+                        syscall::exit(1);
+                    }
+                }
+                syscall::exit(0);
+            } else if child != u64::MAX {
+                // --- PARENT: verify own copy ---
+                let ptr = base_va as *const u64;
+                for i in 0..u64_count {
+                    let val = unsafe { core::ptr::read_volatile(ptr.add(i)) };
+                    let expected = 0xA5A5_0000_0000u64 | (i as u64);
+                    if val != expected {
+                        syscall::debug_puts(b"    p176: parent mismatch\n");
+                        p176_ok = false;
+                        break;
+                    }
+                }
+
+                // Wait for child.
+                let mut child_exit: i64 = -1;
+                for _ in 0..6000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        child_exit = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if child_exit != 0 {
+                    p176_ok = false;
+                    if child_exit == -1 {
+                        syscall::debug_puts(b"    p176: child timeout\n");
+                    }
+                }
+            } else {
+                syscall::debug_puts(b"    p176: fork failed\n");
+                p176_ok = false;
+            }
+
+            syscall::munmap(base_va);
+        }
+
+        if p176_ok {
+            syscall::debug_puts(b"Phase 176 swap stress: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 176 swap stress: FAILED\n");
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {
