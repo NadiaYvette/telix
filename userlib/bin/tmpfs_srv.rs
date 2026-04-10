@@ -30,6 +30,21 @@ const FS_DELETE: u64 = 0x2700;
 const FS_DELETE_OK: u64 = 0x2701;
 const FS_ERROR: u64 = 0x2F00;
 
+// Extended FS protocol (Phase 177+).
+const FS_SYMLINK: u64 = 0x2C00;
+const FS_SYMLINK_OK: u64 = 0x2C01;
+const FS_READLINK: u64 = 0x2C10;
+const FS_READLINK_OK: u64 = 0x2C11;
+const FS_LINK: u64 = 0x2C20;
+const FS_RENAME: u64 = 0x2C30;
+const FS_RENAME_OK: u64 = 0x2C31;
+const FS_CHOWN: u64 = 0x2C40;
+const FS_CHOWN_OK: u64 = 0x2C41;
+const FS_TRUNCATE: u64 = 0x2C50;
+const FS_TRUNCATE_OK: u64 = 0x2C51;
+const FS_STATFS: u64 = 0x2C60;
+const FS_STATFS_OK: u64 = 0x2C61;
+
 // File lock protocol.
 const FS_FLOCK: u64 = 0x2800;
 const FS_FLOCK_OK: u64 = 0x2801;
@@ -59,6 +74,9 @@ struct TmpfsFile {
     name_len: u8,
     active: bool,
     mode: u16,
+    uid: u32,
+    gid: u32,
+    is_symlink: bool,
     size: u32,
     pages: [usize; MAX_PAGES_PER_FILE], // VA of allocated pages, 0 = unallocated
 }
@@ -70,6 +88,9 @@ impl TmpfsFile {
             name_len: 0,
             active: false,
             mode: 0,
+            uid: 0,
+            gid: 0,
+            is_symlink: false,
             size: 0,
             pages: [0; MAX_PAGES_PER_FILE],
         }
@@ -547,6 +568,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         f.name_len = nlen as u8;
                         f.active = true;
                         f.mode = 0o100644;
+                        f.uid = 0;
+                        f.gid = 0;
+                        f.is_symlink = false;
                         f.size = 0;
                         f.pages = [0; MAX_PAGES_PER_FILE];
                         fi = i;
@@ -807,6 +831,180 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         syscall::send(reply_port, FS_GETLK_OK, d0, 0, 0, 0);
                     }
                 }
+            }
+
+            FS_SYMLINK => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let reply_port = msg.data[2] >> 32;
+                let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
+
+                if find_file(&files, &name, nlen).is_some() {
+                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    continue;
+                }
+
+                let target_word = msg.data[3];
+                let mut target = [0u8; 8];
+                let mut target_len = 0usize;
+                for i in 0..8 {
+                    let b = (target_word >> (i * 8)) as u8;
+                    if b == 0 { break; }
+                    target[i] = b;
+                    target_len += 1;
+                }
+
+                let mut fi = usize::MAX;
+                for (i, f) in files.iter_mut().enumerate() {
+                    if !f.active {
+                        f.name = [0u8; MAX_NAME];
+                        for j in 0..nlen { f.name[j] = name[j]; }
+                        f.name_len = nlen as u8;
+                        f.active = true;
+                        f.is_symlink = true;
+                        f.mode = 0o120777;
+                        f.size = target_len as u32;
+                        f.uid = 0;
+                        f.gid = 0;
+                        f.pages = [0; MAX_PAGES_PER_FILE];
+                        if let Some(va) = syscall::mmap_anon(0, 1, 1) {
+                            unsafe {
+                                core::ptr::write_bytes(va as *mut u8, 0, PAGE_SIZE);
+                                core::ptr::copy_nonoverlapping(
+                                    target.as_ptr(),
+                                    va as *mut u8,
+                                    target_len,
+                                );
+                            }
+                            f.pages[0] = va;
+                        }
+                        fi = i;
+                        break;
+                    }
+                }
+                if fi == usize::MAX {
+                    syscall::send(reply_port, FS_ERROR, ERR_FULL, 0, 0, 0);
+                } else {
+                    syscall::send(reply_port, FS_SYMLINK_OK, 0, 0, 0, 0);
+                }
+            }
+
+            FS_READLINK => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let reply_port = msg.data[2] >> 32;
+                let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
+
+                match find_file(&files, &name, nlen) {
+                    Some(fi) => {
+                        let f = &files[fi];
+                        if !f.is_symlink {
+                            syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                            continue;
+                        }
+                        let to_read = (f.size as usize).min(MAX_INLINE);
+                        if f.pages[0] != 0 && to_read > 0 {
+                            let src = unsafe { core::slice::from_raw_parts(f.pages[0] as *const u8, to_read) };
+                            let packed = pack_inline_data(src);
+                            syscall::send(reply_port, FS_READLINK_OK, to_read as u64, packed[0], packed[1], packed[2]);
+                        } else {
+                            syscall::send(reply_port, FS_READLINK_OK, 0, 0, 0, 0);
+                        }
+                    }
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    }
+                }
+            }
+
+            FS_LINK => {
+                let reply_port = msg.data[2] >> 32;
+                syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+            }
+
+            FS_RENAME => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let reply_port = msg.data[2] >> 32;
+                let (old_name, old_nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
+
+                let new_word = msg.data[3];
+                let mut new_name = [0u8; MAX_NAME];
+                let mut new_nlen = 0usize;
+                for i in 0..8 {
+                    let b = (new_word >> (i * 8)) as u8;
+                    if b == 0 { break; }
+                    new_name[i] = b;
+                    new_nlen += 1;
+                }
+
+                match find_file(&files, &old_name, old_nlen) {
+                    Some(fi) => {
+                        if find_file(&files, &new_name, new_nlen).is_some() {
+                            syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                            continue;
+                        }
+                        files[fi].name = new_name;
+                        files[fi].name_len = new_nlen as u8;
+                        syscall::send(reply_port, FS_RENAME_OK, 0, 0, 0, 0);
+                    }
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    }
+                }
+            }
+
+            FS_CHOWN => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let reply_port = msg.data[2] >> 32;
+                let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
+                let uid = (msg.data[3] & 0xFFFF_FFFF) as u32;
+                let gid = (msg.data[3] >> 32) as u32;
+
+                match find_file(&files, &name, nlen) {
+                    Some(fi) => {
+                        files[fi].uid = uid;
+                        files[fi].gid = gid;
+                        syscall::send(reply_port, FS_CHOWN_OK, 0, 0, 0, 0);
+                    }
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    }
+                }
+            }
+
+            FS_TRUNCATE => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let reply_port = msg.data[2] >> 32;
+                let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
+                let new_size = msg.data[3] as u32;
+
+                match find_file(&files, &name, nlen) {
+                    Some(fi) => {
+                        let old_size = files[fi].size;
+                        files[fi].size = new_size;
+                        if new_size < old_size {
+                            let first_freed = (new_size as usize + PAGE_SIZE - 1) / PAGE_SIZE;
+                            for p in first_freed..MAX_PAGES_PER_FILE {
+                                if files[fi].pages[p] != 0 {
+                                    syscall::munmap(files[fi].pages[p]);
+                                    files[fi].pages[p] = 0;
+                                }
+                            }
+                        }
+                        syscall::send(reply_port, FS_TRUNCATE_OK, 0, 0, 0, 0);
+                    }
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    }
+                }
+            }
+
+            FS_STATFS => {
+                let reply_port = msg.data[2] >> 32;
+                let mut used = 0u64;
+                for f in files.iter() {
+                    if f.active { used += 1; }
+                }
+                let free = MAX_FILES as u64 - used;
+                syscall::send(reply_port, FS_STATFS_OK, used, free, PAGE_SIZE as u64, 0);
             }
 
             _ => {}

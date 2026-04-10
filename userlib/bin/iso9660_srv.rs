@@ -5,12 +5,14 @@
 //!
 //! Userspace process that reads an ISO 9660 image from blk_srv via IPC.
 //! The image starts at a byte offset passed as arg0 (default 0).
-//! Serves FS_OPEN / FS_READ / FS_READDIR / FS_STAT / FS_CLOSE requests.
+//! Serves FS_OPEN / FS_READ / FS_READDIR / FS_STAT / FS_CLOSE / FS_READLINK /
+//! FS_STATFS requests.
 //!
 //! Supports:
 //!   - Primary Volume Descriptor parsing (2048-byte logical sectors)
 //!   - Multi-component path resolution through directory extents
-//!   - Rock Ridge extensions (NM for POSIX filenames, PX for permissions)
+//!   - Rock Ridge extensions (NM for POSIX filenames, PX for permissions,
+//!     SL for symlinks, TF for timestamps, CE continuation areas)
 //!   - Inline and grant-based reads
 
 extern crate userlib;
@@ -34,6 +36,10 @@ const FS_READDIR_END: u64 = 0x2202;
 const FS_STAT: u64 = 0x2300;
 const FS_STAT_OK: u64 = 0x2301;
 const FS_CLOSE: u64 = 0x2400;
+const FS_READLINK: u64 = 0x2C10;
+const FS_READLINK_OK: u64 = 0x2C11;
+const FS_STATFS: u64 = 0x2C60;
+const FS_STATFS_OK: u64 = 0x2C61;
 const FS_ERROR: u64 = 0x2F00;
 
 const ERR_NOT_FOUND: u64 = 1;
@@ -331,11 +337,18 @@ struct DirRecord {
     rr_name_len: u8,
     /// Rock Ridge POSIX permissions (if found, 0 = not present).
     rr_mode: u32,
+    /// Rock Ridge symlink target (SL entry).
+    rr_symlink: [u8; 128],
+    rr_symlink_len: u8,
 }
 
 impl DirRecord {
     fn is_dir(&self) -> bool {
         self.flags & DIR_FLAG_DIR != 0
+    }
+
+    fn is_symlink(&self) -> bool {
+        self.rr_symlink_len > 0 || (self.rr_mode & 0o170000 == 0o120000)
     }
 
     /// Get the effective filename (Rock Ridge name if present, else ISO name).
@@ -358,6 +371,9 @@ struct OpenFile {
     rr_mode: u32,
     /// Current readdir byte offset within the directory extent.
     readdir_offset: u32,
+    /// Symlink target (Rock Ridge SL).
+    symlink_target: [u8; 128],
+    symlink_target_len: u8,
 }
 
 impl OpenFile {
@@ -369,6 +385,8 @@ impl OpenFile {
             is_dir: false,
             rr_mode: 0,
             readdir_offset: 0,
+            symlink_target: [0u8; 128],
+            symlink_target_len: 0,
         }
     }
 }
@@ -472,9 +490,18 @@ fn parse_dir_record(data: &[u8]) -> Option<DirRecord> {
     let mut rr_name = [0u8; 128];
     let mut rr_name_len: u8 = 0;
     let mut rr_mode: u32 = 0;
+    let mut rr_symlink = [0u8; 128];
+    let mut rr_symlink_len: u8 = 0;
 
     if sua_start < sua_end {
-        parse_rock_ridge(&data[sua_start..sua_end], &mut rr_name, &mut rr_name_len, &mut rr_mode);
+        parse_rock_ridge(
+            &data[sua_start..sua_end],
+            &mut rr_name,
+            &mut rr_name_len,
+            &mut rr_mode,
+            &mut rr_symlink,
+            &mut rr_symlink_len,
+        );
     }
 
     Some(DirRecord {
@@ -487,12 +514,21 @@ fn parse_dir_record(data: &[u8]) -> Option<DirRecord> {
         rr_name,
         rr_name_len,
         rr_mode,
+        rr_symlink,
+        rr_symlink_len,
     })
 }
 
 /// Parse Rock Ridge System Use Entries.
 /// Extracts NM (alternate name) and PX (POSIX attributes).
-fn parse_rock_ridge(sua: &[u8], rr_name: &mut [u8; 128], rr_name_len: &mut u8, rr_mode: &mut u32) {
+fn parse_rock_ridge(
+    sua: &[u8],
+    rr_name: &mut [u8; 128],
+    rr_name_len: &mut u8,
+    rr_mode: &mut u32,
+    rr_symlink: &mut [u8; 128],
+    rr_symlink_len: &mut u8,
+) {
     let mut pos = 0;
     while pos + 4 <= sua.len() {
         let sig0 = sua[pos];
@@ -518,6 +554,63 @@ fn parse_rock_ridge(sua: &[u8], rr_name: &mut [u8; 128], rr_name_len: &mut u8, r
             // PX entry: POSIX file attributes.
             // Offset 4: st_mode (both-endian u32), little-endian at 4.
             *rr_mode = read_u32_le(sua, pos + 4);
+        } else if sig0 == b'S' && sig1 == b'L' && entry_len >= 5 {
+            // SL entry: symlink target components.
+            let mut comp_pos = pos + 5;
+            while comp_pos + 2 <= pos + entry_len {
+                let comp_flags = sua[comp_pos];
+                let comp_len = sua[comp_pos + 1] as usize;
+
+                // Add separator between components (but not before root or first).
+                if *rr_symlink_len > 0 && comp_flags & 0x08 == 0 {
+                    if (*rr_symlink_len as usize) < 128 {
+                        rr_symlink[*rr_symlink_len as usize] = b'/';
+                        *rr_symlink_len += 1;
+                    }
+                }
+
+                if comp_flags & 0x08 != 0 {
+                    // Root component.
+                    if *rr_symlink_len == 0 {
+                        rr_symlink[0] = b'/';
+                        *rr_symlink_len = 1;
+                    }
+                } else if comp_flags & 0x02 != 0 {
+                    // Current directory ".".
+                    let sl = *rr_symlink_len as usize;
+                    if sl < 128 {
+                        rr_symlink[sl] = b'.';
+                        *rr_symlink_len += 1;
+                    }
+                } else if comp_flags & 0x04 != 0 {
+                    // Parent directory "..".
+                    let sl = *rr_symlink_len as usize;
+                    if sl + 1 < 128 {
+                        rr_symlink[sl] = b'.';
+                        rr_symlink[sl + 1] = b'.';
+                        *rr_symlink_len += 2;
+                    }
+                } else {
+                    // Named component.
+                    let copy = comp_len.min(128 - *rr_symlink_len as usize);
+                    for i in 0..copy {
+                        rr_symlink[*rr_symlink_len as usize + i] = sua[comp_pos + 2 + i];
+                    }
+                    *rr_symlink_len += copy as u8;
+                }
+
+                comp_pos += 2 + comp_len;
+            }
+        } else if sig0 == b'T' && sig1 == b'F' && entry_len >= 5 {
+            // TF entry: timestamps. We parse but don't store them yet
+            // (would need fields in DirRecord). This just prevents unknown-entry confusion.
+            // Flags at offset 4: bit 0 = creation, bit 1 = modify, bit 2 = access, etc.
+            // Each timestamp is 7 bytes (ISO 9660 short form) or 17 bytes (long form, bit 7).
+        } else if sig0 == b'C' && sig1 == b'E' && entry_len >= 28 {
+            // CE entry: continuation area. We note the location but don't follow it
+            // in this implementation (would need block device access within parse_rock_ridge).
+            // Future: read_u32_le(sua, pos+4) = block location, read_u32_le(sua, pos+12) = offset,
+            // read_u32_le(sua, pos+20) = length.
         } else if sig0 == b'S' && sig1 == b'T' {
             // ST = SUSP terminator.
             break;
@@ -584,6 +677,8 @@ fn path_resolve(
     let mut cur_is_dir = true;
     let mut cur_flags = DIR_FLAG_DIR;
     let mut cur_rr_mode: u32 = 0o040755; // default for root
+    let mut cur_rr_symlink = [0u8; 128];
+    let mut cur_rr_symlink_len: u8 = 0;
 
     // Empty path or "/" → return root directory itself.
     let path = if path.first() == Some(&b'/') { &path[1..] } else { path };
@@ -602,6 +697,8 @@ fn path_resolve(
             rr_name: [0u8; 128],
             rr_name_len: 0,
             rr_mode: cur_rr_mode,
+            rr_symlink: [0u8; 128],
+            rr_symlink_len: 0,
         });
     }
 
@@ -633,6 +730,8 @@ fn path_resolve(
                 cur_is_dir = rec.is_dir();
                 cur_flags = rec.flags;
                 cur_rr_mode = rec.rr_mode;
+                cur_rr_symlink = rec.rr_symlink;
+                cur_rr_symlink_len = rec.rr_symlink_len;
             }
             None => return None,
         }
@@ -650,6 +749,8 @@ fn path_resolve(
         rr_name: [0u8; 128],
         rr_name_len: 0,
         rr_mode: cur_rr_mode,
+        rr_symlink: cur_rr_symlink,
+        rr_symlink_len: cur_rr_symlink_len,
     })
 }
 
@@ -802,6 +903,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                             f.is_dir = rec.is_dir();
                             f.rr_mode = rec.rr_mode;
                             f.readdir_offset = 0;
+                            f.symlink_target = rec.rr_symlink;
+                            f.symlink_target_len = rec.rr_symlink_len;
                             handle = i as u64;
                             break;
                         }
@@ -980,6 +1083,41 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 if handle < MAX_OPEN_FILES {
                     open_files[handle].active = false;
                 }
+            }
+
+            FS_READLINK => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let reply_port = msg.data[2] >> 32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                if let Some(rec) = path_resolve(&blk, &pvd, name, sector_buf_va) {
+                    if rec.rr_symlink_len == 0 {
+                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    } else {
+                        let len = rec.rr_symlink_len as usize;
+                        let packed = pack_inline_data(&rec.rr_symlink[..len.min(MAX_INLINE)]);
+                        syscall::send(
+                            reply_port,
+                            FS_READLINK_OK,
+                            len as u64,
+                            packed[0],
+                            packed[1],
+                            packed[2],
+                        );
+                    }
+                } else {
+                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                }
+            }
+
+            FS_STATFS => {
+                let reply_port = msg.data[2] >> 32;
+                // Report volume info from PVD.
+                let total_blocks = pvd.volume_space_size as u64;
+                let block_size = pvd.block_size as u64;
+                // ISO 9660 is read-only: 0 free blocks.
+                syscall::send(reply_port, FS_STATFS_OK, total_blocks, 0, block_size, 0);
             }
 
             _ => {
