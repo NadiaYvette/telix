@@ -1,4 +1,5 @@
 pub mod cpumask;
+pub mod heap;
 pub mod hotplug;
 pub mod radix;
 pub mod scheduler;

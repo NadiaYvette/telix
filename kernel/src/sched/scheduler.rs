@@ -25,7 +25,16 @@ use crate::ipc::art::Art;
 use crate::mm::page::{self, MMUPAGE_SIZE, PhysAddr};
 use crate::mm::{phys, slab};
 use crate::sync::SpinLock;
+use super::thread::SCHED_NORMAL;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+// ---------------------------------------------------------------------------
+// EEVDF virtual-time constants
+// ---------------------------------------------------------------------------
+
+/// Fixed-point scaling factor for virtual time. ~1M gives microsecond-ish
+/// granularity in virtual time space with pure integer arithmetic.
+const VTIME_UNIT: u64 = 1 << 20;
 
 /// Kernel stack allocation order (0 = 1 page, 1 = 2 pages).
 /// 2 pages (8 KiB) provides headroom for nested interrupts during syscalls,
@@ -350,12 +359,20 @@ impl RunQueue {
 // Per-CPU run queues with active priority bitmap
 // ---------------------------------------------------------------------------
 
-/// Per-CPU run queues: 256 linked-list heads + 256-bit active bitmap.
+/// Per-CPU run queues: 256 linked-list heads + 256-bit active bitmap + EEVDF heap.
 /// Each CPU's instance is protected by its own SpinLock in PERCPU_RQ.
 struct PerCpuRunQueues {
     queues: [RunQueue; NUM_PRIORITIES],
     active: [u64; 4],
     cosched_burst: u32,
+    /// EEVDF d-4 min-heap keyed on virtual deadline.
+    eevdf_heap: super::heap::Heap4,
+    /// Monotonically advancing virtual time floor.  New/waking threads snap
+    /// their vruntime to at least this value so sleepers don't accumulate
+    /// unbounded credit.
+    eevdf_min_vruntime: u64,
+    /// Number of SCHED_NORMAL threads currently in the EEVDF heap.
+    eevdf_nr_running: u32,
 }
 
 impl PerCpuRunQueues {
@@ -364,6 +381,9 @@ impl PerCpuRunQueues {
             queues: [const { RunQueue::new() }; NUM_PRIORITIES],
             active: [0; 4],
             cosched_burst: 0,
+            eevdf_heap: super::heap::Heap4::new(),
+            eevdf_min_vruntime: 0,
+            eevdf_nr_running: 0,
         }
     }
 
@@ -373,9 +393,44 @@ impl PerCpuRunQueues {
         self.active[prio as usize / 64] |= 1u64 << (prio as usize % 64);
     }
 
-    /// Dequeue the highest-priority (lowest numeric) thread. O(1) via bitmap.
+    /// Dequeue the highest-priority (lowest numeric) thread from the bitmap. O(1).
     fn pop_highest(&mut self) -> Option<ThreadId> {
         for word in 0..4 {
+            if self.active[word] != 0 {
+                let bit = self.active[word].trailing_zeros() as usize;
+                let prio = word * 64 + bit;
+                let tid = self.queues[prio].pop()?;
+                if self.queues[prio].len == 0 {
+                    self.active[word] &= !(1u64 << bit);
+                }
+                return Some(tid);
+            }
+        }
+        None
+    }
+
+    /// Class-aware pick-next: RT bitmap (prio 0-127), then EEVDF heap,
+    /// then legacy/demoted bitmap (prio 128-255).
+    fn class_pick_next(&mut self) -> Option<ThreadId> {
+        // 1. RT: check bitmap words 0-1 (priorities 0-127).
+        for word in 0..2 {
+            if self.active[word] != 0 {
+                let bit = self.active[word].trailing_zeros() as usize;
+                let prio = word * 64 + bit;
+                let tid = self.queues[prio].pop()?;
+                if self.queues[prio].len == 0 {
+                    self.active[word] &= !(1u64 << bit);
+                }
+                return Some(tid);
+            }
+        }
+        // 2. EEVDF: pop earliest deadline from heap.
+        if let Some((tid, _deadline)) = self.eevdf_heap.pop_min() {
+            self.eevdf_nr_running -= 1;
+            return Some(tid);
+        }
+        // 3. Legacy/demoted/idle: check bitmap words 2-3 (priorities 128-255).
+        for word in 2..4 {
             if self.active[word] != 0 {
                 let bit = self.active[word].trailing_zeros() as usize;
                 let prio = word * 64 + bit;
@@ -428,9 +483,10 @@ impl PerCpuRunQueues {
         false
     }
 
-    /// Check if any threads are enqueued. O(1) via bitmap.
+    /// Check if any threads are enqueued. O(1) via bitmap + heap check.
     fn has_ready(&self) -> bool {
         self.active[0] | self.active[1] | self.active[2] | self.active[3] != 0
+            || self.eevdf_nr_running > 0
     }
 
     /// Steal one thread for `thief_cpu` from lowest-priority queue with ≥2 threads.
@@ -443,6 +499,7 @@ impl PerCpuRunQueues {
     /// at that priority level. `min_len=1` allows stealing the only thread
     /// (used by idle CPUs); `min_len=2` preserves at least one for the victim.
     fn steal_one_min(&mut self, thief_cpu: u32, min_len: u32) -> Option<ThreadId> {
+        // Try stealing from bitmap queues first (RT and legacy).
         for word in (0..4).rev() {
             if self.active[word] != 0 {
                 let mut bits = self.active[word];
@@ -460,6 +517,20 @@ impl PerCpuRunQueues {
                     }
                     bits &= !(1u64 << bit);
                 }
+            }
+        }
+        // Try stealing from EEVDF heap (steal earliest-deadline thread).
+        if self.eevdf_nr_running >= min_len {
+            if let Some((tid, _deadline)) = self.eevdf_heap.pop_min() {
+                // Check affinity — if the thread can't run on thief, put it back.
+                if thread_ref(tid).affinity_mask.test(thief_cpu) {
+                    self.eevdf_nr_running -= 1;
+                    return Some(tid);
+                }
+                // Can't run on thief — re-insert with same deadline.
+                let t = thread_ref(tid);
+                self.eevdf_heap.insert(tid, t.eevdf_deadline);
+                // Don't decrement eevdf_nr_running — we put it back.
             }
         }
         None
@@ -515,9 +586,43 @@ pub(crate) fn init_dynamic_percpu() {
 
 /// Enqueue a thread onto the per-CPU run queue for the given target CPU.
 /// The caller must ensure the thread's state is Ready before calling.
+/// Routes SCHED_NORMAL threads (not demoted to prio 254) to the EEVDF heap;
+/// all others go to the legacy bitmap queue.
 fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
     let mut rq = percpu_rq()[target_cpu as usize].lock();
-    rq.push(prio, tid);
+    let t = thread_ref(tid);
+    if t.sched_class == SCHED_NORMAL && prio != 254 {
+        eevdf_enqueue(&mut rq, tid);
+    } else {
+        rq.push(prio, tid);
+    }
+}
+
+/// Compute EEVDF deadline and insert a thread into the per-CPU heap.
+/// Called under the per-CPU RQ lock.
+fn eevdf_enqueue(rq: &mut PerCpuRunQueues, tid: ThreadId) {
+    let t = unsafe { thread_mut_from_ref(tid) };
+    // Snap vruntime to at least min_vruntime so sleepers don't accumulate
+    // unbounded credit.
+    if t.eevdf_vruntime < rq.eevdf_min_vruntime {
+        t.eevdf_vruntime = rq.eevdf_min_vruntime;
+    }
+    // Advance min_vruntime: it's the max of all threads' vruntime at enqueue.
+    if t.eevdf_vruntime > rq.eevdf_min_vruntime {
+        rq.eevdf_min_vruntime = t.eevdf_vruntime;
+    }
+    // Compute virtual time slice: quantum * VTIME_UNIT / weight.
+    let weight = t.eevdf_weight as u64;
+    t.eevdf_slice_vt = (t.default_quantum as u64) * VTIME_UNIT / weight;
+    // Set deadline.
+    t.eevdf_deadline = t.eevdf_vruntime + t.eevdf_slice_vt;
+    // Insert into heap. If full, fall back to bitmap.
+    if !rq.eevdf_heap.insert(tid, t.eevdf_deadline) {
+        // Heap overflow — fall back to bitmap at the thread's priority.
+        rq.push(t.effective_priority, tid);
+        return;
+    }
+    rq.eevdf_nr_running += 1;
 }
 
 /// Try to steal a thread from another CPU's run queue.
@@ -573,8 +678,9 @@ fn thread_port_handler(
 // Thread/Task slab/page allocation
 // ---------------------------------------------------------------------------
 
-/// Slab size for Thread entries (Thread is ~136 bytes, fits in 256-byte slab).
-const THREAD_SLAB_SIZE: usize = 256;
+/// Slab size for Thread entries (Thread is ~260 bytes with EEVDF fields,
+/// requires 512-byte slab).
+const THREAD_SLAB_SIZE: usize = 512;
 
 fn alloc_thread_entry() -> Option<*mut Thread> {
     let pa = slab::alloc(THREAD_SLAB_SIZE)?;
@@ -675,6 +781,7 @@ fn create_idle_thread() -> Option<ThreadId> {
         (*ptr).effective_priority = 255;
         (*ptr).quantum = u32::MAX;
         (*ptr).default_quantum = u32::MAX;
+        (*ptr).sched_class = super::thread::SCHED_IDLE;
     }
     let t = unsafe { &*ptr };
     t.prio.store(255, Ordering::Relaxed);
@@ -1161,8 +1268,8 @@ pub(crate) unsafe fn task_mut_from_ref(id: TaskId) -> &'static mut Task {
 /// Returns idle_id if nothing is ready.
 fn percpu_pick_next(cpu: u32, idle_id: ThreadId) -> ThreadId {
     let mut rq = percpu_rq()[cpu as usize].lock();
-    // First try local queue.
-    if let Some(tid) = rq.pop_highest() {
+    // Class-aware dispatch: RT → EEVDF → legacy.
+    if let Some(tid) = rq.class_pick_next() {
         return tid;
     }
     drop(rq);
@@ -1174,6 +1281,7 @@ fn percpu_pick_next(cpu: u32, idle_id: ThreadId) -> ThreadId {
 }
 
 /// Pick next thread, preferring a cosched group mate on the current CPU.
+/// Coscheduling only applies to RT-class threads in the bitmap queues.
 fn percpu_pick_next_cosched(cpu: u32, idle_id: ThreadId, prev_group: u32) -> (ThreadId, bool) {
     let mut rq = percpu_rq()[cpu as usize].lock();
     if prev_group != 0 && rq.cosched_burst < MAX_COSCHED_BURST {
@@ -1184,7 +1292,8 @@ fn percpu_pick_next_cosched(cpu: u32, idle_id: ThreadId, prev_group: u32) -> (Th
         }
     }
     rq.cosched_burst = 0;
-    if let Some(tid) = rq.pop_highest() {
+    // Class-aware dispatch: RT → EEVDF → legacy.
+    if let Some(tid) = rq.class_pick_next() {
         return (tid, false);
     }
     drop(rq);
@@ -1756,6 +1865,13 @@ fn try_switch(current_sp: u64) -> u64 {
         } else {
             // Safety: prev_id is Running on this CPU, we own it.
             let t = unsafe { thread_mut_from_ref(prev_id) };
+            // Advance EEVDF virtual runtime for fair accounting.
+            // Preemption is still quantum-based for stability; EEVDF deadlines
+            // drive dispatch order (earliest-deadline-first) via class_pick_next.
+            if t.sched_class == SCHED_NORMAL && t.effective_priority != 254 {
+                let weight = t.eevdf_weight as u64;
+                t.eevdf_vruntime += VTIME_UNIT / weight;
+            }
             t.quantum = t.quantum.saturating_sub(1);
             if t.quantum != 0 {
                 crate::sync::rcu::rcu_quiescent();

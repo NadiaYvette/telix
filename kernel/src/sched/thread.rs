@@ -116,6 +116,19 @@ pub struct Thread {
     /// block_current spin-wait), this field preserves the original exception
     /// frame so personality_fork/personality_read_args can read it reliably.
     pub personality_frame_sp: u64,
+    // --- EEVDF scheduling class ---
+    /// Scheduling class: SCHED_NORMAL (0, EEVDF), SCHED_RT (1), SCHED_IDLE (2).
+    pub sched_class: u8,
+    /// EEVDF weight (nice-to-weight mapping, default 1024). Higher = more CPU share.
+    pub eevdf_weight: u16,
+    /// Position in the per-CPU d-4 heap (u16::MAX = not in heap).
+    pub eevdf_heap_pos: u16,
+    /// EEVDF virtual runtime consumed so far (fixed-point, VTIME_UNIT per real tick).
+    pub eevdf_vruntime: u64,
+    /// EEVDF virtual deadline (key in the d-4 heap).
+    pub eevdf_deadline: u64,
+    /// EEVDF virtual time slice length = quantum * VTIME_UNIT / weight.
+    pub eevdf_slice_vt: u64,
 }
 
 impl Thread {
@@ -161,6 +174,19 @@ impl Thread {
             ts_blocked_on: core::sync::atomic::AtomicUsize::new(0),
             personality_result: core::sync::atomic::AtomicU64::new(0),
             personality_frame_sp: 0,
+            sched_class: SCHED_NORMAL,
+            eevdf_weight: 1024,
+            eevdf_heap_pos: super::heap::HEAP_POS_NONE,
+            eevdf_vruntime: 0,
+            eevdf_deadline: 0,
+            eevdf_slice_vt: 0,
         }
     }
 }
+
+/// EEVDF fair scheduling (default for all normal threads).
+pub const SCHED_NORMAL: u8 = 0;
+/// Real-time fixed-priority FIFO/RR (for explicitly marked RT threads).
+pub const SCHED_RT: u8 = 1;
+/// Idle class (only runs when no other thread is runnable).
+pub const SCHED_IDLE: u8 = 2;
