@@ -21,15 +21,15 @@
 //! Backends are dispatched through the [`Backend`] enum. Enum dispatch
 //! (rather than `dyn SwapBackend`) avoids the fat-pointer atomic storage
 //! problem in no-std and keeps the swap hot path branch-free once the
-//! backend is chosen. The initial backend is a RAM-backed mock
-//! (`Backend::Ram`) that carves a fixed number of pages from phys at
-//! boot. A later commit will add `Backend::VirtioBlk`.
+//! backend is chosen. `Backend::Ram` is a mock that uses phys pages;
+//! `Backend::BlkIo` talks to the "blk" service via the generic I/O
+//! protocol (IO_READ/IO_WRITE IPC), making it device-agnostic.
 //!
 //! # Command line
 //!
 //! `swap=<spec>` selects a backend at boot:
 //! - `swap=ram:<mib>` — mock RAM backend with `<mib>` MiB of swap space
-//! - `swap=vda2`      — (future) virtio-blk partition backend
+//! - `swap=blk:<offset_kb>:<size_kb>` — block I/O backend (disk swap area)
 //!
 //! Absence of the parameter leaves swap disabled; WSCLOCK continues to
 //! discard evicted pages as it does today.
@@ -81,6 +81,10 @@ enum Backend {
     /// I/O, so WSCLOCK can drive it synchronously during development
     /// and tests.
     Ram(&'static RamBackend),
+    /// Block I/O backend. Sends IO_READ/IO_WRITE to the name-server-
+    /// registered "blk" service via standard IPC. Device-agnostic —
+    /// works with any block driver (virtio-blk, NVMe, etc.).
+    BlkIo(&'static BlkIoBackend),
 }
 
 /// RAM-backed swap store. Slot N (1-indexed externally) is a single
@@ -188,6 +192,127 @@ impl RamBackend {
     }
 }
 
+// -----------------------------------------------------------------------
+// Block I/O backend — talks to the "blk" service via generic IPC
+// -----------------------------------------------------------------------
+
+use crate::ipc::Message;
+use crate::ipc::port;
+
+/// Block-I/O-backed swap. Sends IO_READ/IO_WRITE to the name-server-
+/// registered "blk" service. Slot N (1-indexed) maps to disk byte
+/// offset `swap_offset + (N-1) * page_size()`.
+pub struct BlkIoBackend {
+    /// Port of the "blk" service (resolved at init via name server).
+    blk_port: u64,
+    /// Dedicated reply port for swap I/O. Only one swap I/O is in
+    /// flight at a time (enforced by the object lock or WSCLOCK
+    /// single-threadedness).
+    reply_port: u64,
+    /// Byte offset on the block device where the swap area starts.
+    swap_offset: u64,
+    /// Free bitmap (same pattern as RamBackend).
+    bitmap: &'static [AtomicU64],
+    total_slots: u32,
+    used: AtomicU32,
+}
+
+impl BlkIoBackend {
+    fn alloc_slot(&self) -> SwapSlot {
+        let n = self.total_slots as usize;
+        if n == 0 {
+            return SwapSlot::NONE;
+        }
+        for (wi, word) in self.bitmap.iter().enumerate() {
+            loop {
+                let cur = word.load(Ordering::Relaxed);
+                if cur == 0 {
+                    break;
+                }
+                let bit = cur.trailing_zeros() as usize;
+                let idx = wi * 64 + bit;
+                if idx >= n {
+                    break;
+                }
+                let new = cur & !(1u64 << bit);
+                if word
+                    .compare_exchange(cur, new, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    self.used.fetch_add(1, Ordering::Relaxed);
+                    return SwapSlot((idx + 1) as u32);
+                }
+            }
+        }
+        SwapSlot::NONE
+    }
+
+    fn free_slot(&self, slot: SwapSlot) {
+        if slot.is_none() {
+            return;
+        }
+        let idx = (slot.0 - 1) as usize;
+        if idx >= self.total_slots as usize {
+            return;
+        }
+        let wi = idx / 64;
+        let bit = idx % 64;
+        self.bitmap[wi].fetch_or(1u64 << bit, Ordering::Release);
+        self.used.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Disk byte offset for slot N (1-indexed).
+    fn slot_byte_offset(&self, slot: SwapSlot) -> u64 {
+        self.swap_offset + ((slot.0 - 1) as u64) * (page::page_size() as u64)
+    }
+
+    fn write_page(&self, slot: SwapSlot, src_pa: PhysAddr) -> SwapIoResult {
+        let offset = self.slot_byte_offset(slot);
+        let len = page::page_size() as u64;
+        let d2 = (len & 0xFFFF_FFFF) | ((self.reply_port) << 32);
+        let msg = Message::new(
+            crate::io::protocol::IO_WRITE,
+            [0, offset, d2, src_pa.as_usize() as u64, 0, 0],
+        );
+        if port::send(self.blk_port, msg).is_err() {
+            return SwapIoResult::Io;
+        }
+        match port::recv(self.reply_port) {
+            Ok(reply) => {
+                if reply.tag == crate::io::protocol::IO_WRITE_OK {
+                    SwapIoResult::Ok
+                } else {
+                    SwapIoResult::Io
+                }
+            }
+            Err(()) => SwapIoResult::Io,
+        }
+    }
+
+    fn read_page(&self, slot: SwapSlot, dst_pa: PhysAddr) -> SwapIoResult {
+        let offset = self.slot_byte_offset(slot);
+        let len = page::page_size() as u64;
+        let d2 = (len & 0xFFFF_FFFF) | ((self.reply_port) << 32);
+        let msg = Message::new(
+            crate::io::protocol::IO_READ,
+            [0, offset, d2, dst_pa.as_usize() as u64, 0, 0],
+        );
+        if port::send(self.blk_port, msg).is_err() {
+            return SwapIoResult::Io;
+        }
+        match port::recv(self.reply_port) {
+            Ok(reply) => {
+                if reply.tag == crate::io::protocol::IO_READ_OK {
+                    SwapIoResult::Ok
+                } else {
+                    SwapIoResult::Io
+                }
+            }
+            Err(()) => SwapIoResult::Io,
+        }
+    }
+}
+
 /// Slot to the active backend. Not an `Option<Backend>` because we want
 /// the enabled check to be a single atomic load on the fast path.
 static mut BACKEND: Option<Backend> = None;
@@ -236,6 +361,7 @@ fn current() -> Option<Backend> {
 pub fn alloc_slot() -> SwapSlot {
     match current() {
         Some(Backend::Ram(b)) => b.alloc_slot(),
+        Some(Backend::BlkIo(b)) => b.alloc_slot(),
         None => SwapSlot::NONE,
     }
 }
@@ -247,6 +373,7 @@ pub fn free_slot(slot: SwapSlot) {
     }
     match current() {
         Some(Backend::Ram(b)) => b.free_slot(slot),
+        Some(Backend::BlkIo(b)) => b.free_slot(slot),
         None => {}
     }
 }
@@ -258,6 +385,7 @@ pub fn write_page(slot: SwapSlot, pa: PhysAddr) -> SwapIoResult {
     }
     let r = match current() {
         Some(Backend::Ram(b)) => b.write_page(slot, pa),
+        Some(Backend::BlkIo(b)) => b.write_page(slot, pa),
         None => SwapIoResult::Io,
     };
     if r == SwapIoResult::Ok {
@@ -275,6 +403,7 @@ pub fn read_page(slot: SwapSlot, pa: PhysAddr) -> SwapIoResult {
     }
     let r = match current() {
         Some(Backend::Ram(b)) => b.read_page(slot, pa),
+        Some(Backend::BlkIo(b)) => b.read_page(slot, pa),
         None => SwapIoResult::Io,
     };
     if r == SwapIoResult::Ok {
@@ -360,9 +489,150 @@ fn init_ram_backend(total: u32) -> bool {
     true
 }
 
+// -----------------------------------------------------------------------
+// Block I/O deferred init — the blk service isn't up during swap::init()
+// -----------------------------------------------------------------------
+
+/// Pending blk backend parameters (stored during init, applied later).
+static PENDING_BLK_OFFSET_KB: AtomicU32 = AtomicU32::new(0);
+static PENDING_BLK_SIZE_KB: AtomicU32 = AtomicU32::new(0);
+static BLK_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Resolve the "blk" service port via NS_LOOKUP.
+fn ns_lookup_blk() -> Option<u64> {
+    let nsrv = crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire);
+    if nsrv == u64::MAX {
+        return None;
+    }
+
+    let (n0, n1, n2) = crate::io::protocol::pack_name(b"blk");
+    let reply_port = port::create()?;
+    let d3 = 3u64 | ((reply_port) << 32);
+    let msg = Message::new(crate::io::protocol::NS_LOOKUP, [n0, n1, n2, d3, 0, 0]);
+    if port::send(nsrv, msg).is_err() {
+        port::destroy(reply_port);
+        return None;
+    }
+    let reply = match port::recv(reply_port) {
+        Ok(r) => r,
+        Err(()) => {
+            port::destroy(reply_port);
+            return None;
+        }
+    };
+    port::destroy(reply_port);
+
+    if reply.tag == crate::io::protocol::NS_LOOKUP_OK && reply.data[0] != u64::MAX {
+        Some(reply.data[0])
+    } else {
+        None
+    }
+}
+
+/// Initialize the block I/O swap backend. Called from `init_blk_deferred`
+/// once the blk service is running.
+fn init_blk_backend(offset_kb: u32, size_kb: u32) -> bool {
+    let blk_port = match ns_lookup_blk() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let slot_size = page::page_size();
+    let total_bytes = (size_kb as usize) * 1024;
+    let total_slots = total_bytes / slot_size;
+    if total_slots == 0 {
+        return false;
+    }
+
+    let swap_offset = (offset_kb as u64) * 1024;
+
+    // Allocate free bitmap.
+    let bmp_words = (total_slots + 63) / 64;
+    let bitmap: &'static mut [AtomicU64] =
+        unsafe { phys::alloc_static_slice::<AtomicU64>(bmp_words) };
+
+    // Mark all slots as free.
+    for i in 0..total_slots {
+        let wi = i / 64;
+        let bit = i % 64;
+        let cur = bitmap[wi].load(Ordering::Relaxed);
+        bitmap[wi].store(cur | (1u64 << bit), Ordering::Relaxed);
+    }
+
+    // Dedicated reply port for synchronous swap I/O.
+    let reply_port = match port::create() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // Allocate the BlkIoBackend control block from phys.
+    let ctrl_pa = match phys::alloc_page() {
+        Some(p) => p,
+        None => return false,
+    };
+    let ctrl_ptr = ctrl_pa.as_usize() as *mut BlkIoBackend;
+    unsafe {
+        core::ptr::write(
+            ctrl_ptr,
+            BlkIoBackend {
+                blk_port,
+                reply_port,
+                swap_offset,
+                bitmap: &*bitmap,
+                total_slots: total_slots as u32,
+                used: AtomicU32::new(0),
+            },
+        );
+    }
+    let ctrl: &'static BlkIoBackend = unsafe { &*ctrl_ptr };
+
+    install(Backend::BlkIo(ctrl));
+    crate::println!(
+        "  Swap: blk backend online — {} slots ({} KiB) at disk offset {} KiB, port={}",
+        total_slots,
+        (total_slots * slot_size) / 1024,
+        offset_kb,
+        blk_port,
+    );
+    true
+}
+
+/// Complete deferred blk backend initialization. Called from
+/// `startup_thread()` after I/O servers are running and registered
+/// with the name server. Retries NS_LOOKUP a few times with yields
+/// to give blk_srv time to register.
+pub fn init_blk_deferred() {
+    if !BLK_PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    let offset_kb = PENDING_BLK_OFFSET_KB.load(Ordering::Relaxed);
+    let size_kb = PENDING_BLK_SIZE_KB.load(Ordering::Relaxed);
+
+    // The blk_srv may still be initializing. Retry with yields.
+    for attempt in 0..20 {
+        if init_blk_backend(offset_kb, size_kb) {
+            return;
+        }
+        if attempt < 19 {
+            // Yield to let blk_srv progress.
+            let my_tid = crate::sched::current_thread_id();
+            crate::sched::scheduler::set_yield_asap(my_tid);
+            crate::sched::scheduler::arch_wait_for_irq();
+        }
+    }
+    crate::println!("  Swap: blk backend init failed after retries, swap disabled");
+}
+
+// -----------------------------------------------------------------------
+// Initialization
+// -----------------------------------------------------------------------
+
 /// Parse the `swap=` boot parameter and bring up the matching backend.
 /// Called once from `kmain` after `phys::init` and before any workload
 /// that might trigger WSCLOCK.
+///
+/// For `swap=blk:...`, only stores parameters; actual init is deferred
+/// to `init_blk_deferred()` after I/O servers are up.
 pub fn init() {
     let spec = match crate::boot::cmdline::get_extra(b"swap") {
         Some(s) => s,
@@ -384,6 +654,24 @@ pub fn init() {
         let total = (mib as usize) * (1024 * 1024 / page::page_size());
         if !init_ram_backend(total as u32) {
             crate::println!("  Swap: ram backend init failed, disabled");
+        }
+        return;
+    }
+
+    if let Some(rest) = strip_prefix(spec, b"blk:") {
+        // Format: blk:<offset_kb>:<size_kb>
+        match parse_blk_spec(rest) {
+            Some((offset_kb, size_kb)) => {
+                PENDING_BLK_OFFSET_KB.store(offset_kb, Ordering::Relaxed);
+                PENDING_BLK_SIZE_KB.store(size_kb, Ordering::Relaxed);
+                BLK_PENDING.store(true, Ordering::Release);
+                crate::println!(
+                    "  Swap: blk backend deferred (offset={}K, size={}K)",
+                    offset_kb,
+                    size_kb,
+                );
+            }
+            None => crate::println!("  Swap: bad blk spec (expected blk:<offset_kb>:<size_kb>)"),
         }
         return;
     }
@@ -411,4 +699,15 @@ fn parse_u32(s: &[u8]) -> Option<u32> {
         acc = acc.checked_mul(10)?.checked_add((b - b'0') as u32)?;
     }
     Some(acc)
+}
+
+/// Parse `<offset_kb>:<size_kb>` from the blk swap spec.
+fn parse_blk_spec(s: &[u8]) -> Option<(u32, u32)> {
+    let colon = s.iter().position(|&b| b == b':')?;
+    let offset_kb = parse_u32(&s[..colon])?;
+    let size_kb = parse_u32(&s[colon + 1..])?;
+    if size_kb == 0 {
+        return None;
+    }
+    Some((offset_kb, size_kb))
 }

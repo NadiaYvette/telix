@@ -159,43 +159,82 @@ pub fn blk_server() -> ! {
                 let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
-                let sector = (offset / 512) as u64;
-                let mut buf = [0u8; 512];
-
-                match dev.read_sector(sector, &mut buf) {
-                    Ok(()) => {
-                        let bytes_read = length.min(512);
-                        if grant_va != 0 {
-                            // Grant-based: copy data into granted pages.
-                            ensure_kernel_pt();
-                            let dst = grant_va as *mut u8;
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, bytes_read);
+                if grant_va != 0 && length > 512 {
+                    // Multi-sector grant read: loop over sectors.
+                    ensure_kernel_pt();
+                    let mut done = 0usize;
+                    let mut ok = true;
+                    while done < length {
+                        let sector = ((offset + done) / 512) as u64;
+                        let mut buf = [0u8; 512];
+                        match dev.read_sector(sector, &mut buf) {
+                            Ok(()) => {
+                                let chunk = (length - done).min(512);
+                                let dst = (grant_va + done) as *mut u8;
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        buf.as_ptr(),
+                                        dst,
+                                        chunk,
+                                    );
+                                }
+                                done += chunk;
                             }
-                            let reply =
-                                Message::new(IO_READ_OK, [bytes_read as u64, 0, 0, 0, 0, 0]);
-                            let _ = port::send_nb(reply_port, reply);
-                        } else {
-                            // Inline read.
-                            let inline_len = bytes_read.min(MAX_INLINE_READ);
-                            let packed = pack_inline_data(&buf[..inline_len]);
-                            let reply = Message::new(
-                                IO_READ_OK,
-                                [
-                                    inline_len as u64,
-                                    packed[0],
-                                    packed[1],
-                                    packed[2],
-                                    packed[3],
-                                    packed[4],
-                                ],
-                            );
-                            let _ = port::send_nb(reply_port, reply);
+                            Err(()) => {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
-                    Err(()) => {
-                        let reply = Message::new(IO_ERROR, [ERR_IO, 0, 0, 0, 0, 0]);
-                        let _ = port::send_nb(reply_port, reply);
+                    let reply = if ok {
+                        Message::new(IO_READ_OK, [done as u64, 0, 0, 0, 0, 0])
+                    } else {
+                        Message::new(IO_ERROR, [ERR_IO, 0, 0, 0, 0, 0])
+                    };
+                    let _ = port::send_nb(reply_port, reply);
+                } else {
+                    // Single-sector path (inline or grant ≤512).
+                    let sector = (offset / 512) as u64;
+                    let mut buf = [0u8; 512];
+                    match dev.read_sector(sector, &mut buf) {
+                        Ok(()) => {
+                            let bytes_read = length.min(512);
+                            if grant_va != 0 {
+                                ensure_kernel_pt();
+                                let dst = grant_va as *mut u8;
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        buf.as_ptr(),
+                                        dst,
+                                        bytes_read,
+                                    );
+                                }
+                                let reply = Message::new(
+                                    IO_READ_OK,
+                                    [bytes_read as u64, 0, 0, 0, 0, 0],
+                                );
+                                let _ = port::send_nb(reply_port, reply);
+                            } else {
+                                let inline_len = bytes_read.min(MAX_INLINE_READ);
+                                let packed = pack_inline_data(&buf[..inline_len]);
+                                let reply = Message::new(
+                                    IO_READ_OK,
+                                    [
+                                        inline_len as u64,
+                                        packed[0],
+                                        packed[1],
+                                        packed[2],
+                                        packed[3],
+                                        packed[4],
+                                    ],
+                                );
+                                let _ = port::send_nb(reply_port, reply);
+                            }
+                        }
+                        Err(()) => {
+                            let reply = Message::new(IO_ERROR, [ERR_IO, 0, 0, 0, 0, 0]);
+                            let _ = port::send_nb(reply_port, reply);
+                        }
                     }
                 }
             }
@@ -209,28 +248,63 @@ pub fn blk_server() -> ! {
                 let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
-                let sector = (offset / 512) as u64;
-                let mut buf = [0u8; 512];
-
-                if grant_va != 0 {
-                    // Grant-based write: copy from granted pages.
+                if grant_va != 0 && length > 512 {
+                    // Multi-sector grant write: loop over sectors.
                     ensure_kernel_pt();
-                    let bytes_to_write = length.min(512);
-                    let src = grant_va as *const u8;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), bytes_to_write);
+                    let mut done = 0usize;
+                    let mut ok = true;
+                    while done < length {
+                        let sector = ((offset + done) / 512) as u64;
+                        let chunk = (length - done).min(512);
+                        let mut buf = [0u8; 512];
+                        let src = (grant_va + done) as *const u8;
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), chunk);
+                        }
+                        match dev.write_sector(sector, &buf) {
+                            Ok(()) => {
+                                done += chunk;
+                            }
+                            Err(()) => {
+                                ok = false;
+                                break;
+                            }
+                        }
                     }
-                }
-
-                match dev.write_sector(sector, &buf) {
-                    Ok(()) => {
-                        let reply =
-                            Message::new(IO_WRITE_OK, [length.min(512) as u64, 0, 0, 0, 0, 0]);
-                        let _ = port::send_nb(reply_port, reply);
+                    let reply = if ok {
+                        Message::new(IO_WRITE_OK, [done as u64, 0, 0, 0, 0, 0])
+                    } else {
+                        Message::new(IO_ERROR, [ERR_IO, 0, 0, 0, 0, 0])
+                    };
+                    let _ = port::send_nb(reply_port, reply);
+                } else {
+                    // Single-sector path.
+                    let sector = (offset / 512) as u64;
+                    let mut buf = [0u8; 512];
+                    if grant_va != 0 {
+                        ensure_kernel_pt();
+                        let bytes_to_write = length.min(512);
+                        let src = grant_va as *const u8;
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                src,
+                                buf.as_mut_ptr(),
+                                bytes_to_write,
+                            );
+                        }
                     }
-                    Err(()) => {
-                        let reply = Message::new(IO_ERROR, [ERR_IO, 0, 0, 0, 0, 0]);
-                        let _ = port::send_nb(reply_port, reply);
+                    match dev.write_sector(sector, &buf) {
+                        Ok(()) => {
+                            let reply = Message::new(
+                                IO_WRITE_OK,
+                                [length.min(512) as u64, 0, 0, 0, 0, 0],
+                            );
+                            let _ = port::send_nb(reply_port, reply);
+                        }
+                        Err(()) => {
+                            let reply = Message::new(IO_ERROR, [ERR_IO, 0, 0, 0, 0, 0]);
+                            let _ = port::send_nb(reply_port, reply);
+                        }
                     }
                 }
             }

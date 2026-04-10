@@ -335,6 +335,10 @@ fn startup_thread() -> ! {
         }
     }
 
+    // Complete deferred swap backend initialization (blk backend needs
+    // the "blk" service to be registered with the name server).
+    mm::swap::init_blk_deferred();
+
     // Phase 4: Spawning init process...
     println!("Phase 4: Spawning init process...");
 
