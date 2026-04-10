@@ -566,7 +566,7 @@ Telix's WSCLOCK page reclamation identifies pages to evict. The swap subsystem p
 | **Swap-out** | `swap_out_page()` called from WSCLOCK before `release_page`; writes anon, non-COW pages to backend | ✅ Done |
 | **Swap-in** | `ensure_page()` checks `swap_slots[idx]` before zero-fill; alloc + read_page + clear slot | ✅ Done |
 | **Round-trip verified** | Kernel self-test: out=3, in=1, err=0; x86_64 QEMU with `swap=ram:4` → 174 phases PASSED | ✅ Done |
-| **Virtio-blk backend** | Dedicated swap partition on second QEMU drive; kernel-side polling | ⏳ Pending |
+| **Block I/O backend** | Swap backend speaks `IO_READ`/`IO_WRITE` to the name-server-registered "blk" service via standard IPC — device-agnostic (works with virtio-blk, NVMe, or any future block driver). Kernel swap daemon thread processes a queue so the fault path doesn't block on IPC. | ⏳ Pending |
 | **Pressure trigger** | Low-watermark or OOM-preemptive WSCLOCK scan (currently manual only) | ⏳ Pending |
 | **Swap-backed tmpfs** | rootfs_srv pages that exceed RAM are swapped out | Not started |
 | **Stress test (Phase 176)** | Allocate more anon memory than RAM, touch all pages, verify correctness | ⏳ Pending |
