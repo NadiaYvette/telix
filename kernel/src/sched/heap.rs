@@ -190,6 +190,27 @@ impl Heap4 {
         (removed.tid, removed.key)
     }
 
+    /// Find and remove an eligible thread in the given coscheduling group,
+    /// preferring the one with the earliest deadline.
+    /// Returns `(tid, key)` or `None` if no group mate is present.
+    pub fn pop_for_group(&mut self, group: u32, max_vruntime: u64) -> Option<(u32, u64)> {
+        let n = self.len as usize;
+        let mut best_pos: Option<usize> = None;
+        let mut best_key: u64 = u64::MAX;
+        for i in 0..n {
+            let e = &self.entries[i];
+            let t = super::scheduler::thread_ref(e.tid);
+            if t.cosched_group.load(core::sync::atomic::Ordering::Relaxed) == group
+                && t.eevdf_vruntime <= max_vruntime
+                && e.key < best_key
+            {
+                best_key = e.key;
+                best_pos = Some(i);
+            }
+        }
+        best_pos.map(|pos| self.remove(pos))
+    }
+
     /// Update the key of the entry at `pos` to `new_key` (may increase or decrease).
     /// Returns the old key.
     #[allow(dead_code)]

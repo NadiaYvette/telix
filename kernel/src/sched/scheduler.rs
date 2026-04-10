@@ -452,9 +452,33 @@ impl PerCpuRunQueues {
         None
     }
 
-    /// Find and dequeue a thread in the given coscheduling group. Searches by priority.
+    /// Find and dequeue a thread in the given coscheduling group.
+    /// Checks RT bitmap queues first, then the EEVDF heap.
     fn pop_for_group(&mut self, group: u32) -> Option<ThreadId> {
-        for word in 0..4 {
+        // 1. RT bitmap queues (priorities 0-127).
+        for word in 0..2 {
+            if self.active[word] != 0 {
+                let mut bits = self.active[word];
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    let prio = word * 64 + bit;
+                    if let Some(tid) = self.queues[prio].find_remove_by_group(group) {
+                        if self.queues[prio].len == 0 {
+                            self.active[word] &= !(1u64 << bit);
+                        }
+                        return Some(tid);
+                    }
+                    bits &= !(1u64 << bit);
+                }
+            }
+        }
+        // 2. EEVDF heap (SCHED_NORMAL threads).
+        if let Some((tid, _key)) = self.eevdf_heap.pop_for_group(group, self.eevdf_min_vruntime) {
+            self.eevdf_nr_running -= 1;
+            return Some(tid);
+        }
+        // 3. Legacy/demoted bitmap queues (priorities 128-255).
+        for word in 2..4 {
             if self.active[word] != 0 {
                 let mut bits = self.active[word];
                 while bits != 0 {
@@ -2282,17 +2306,20 @@ pub fn wake_thread(tid: ThreadId) {
             // block_current on its next check.
         }
     }
-    // If the woken thread has higher priority than the current thread on this
-    // CPU, set need_resched so check_preempt_on_return triggers an immediate
+    // If a DIFFERENT thread with higher priority was woken on this CPU,
+    // set need_resched so check_preempt_on_return triggers an immediate
     // voluntary reschedule at the next syscall return boundary.
+    // Skip when waking ourselves (e.g., sleep timer waking us from block_current).
     {
         let waker_cpu = smp::cpu_id();
         let pcpu = smp::get(waker_cpu);
         let cur_tid = pcpu.current_thread.load(Ordering::Relaxed);
-        let cur_prio = thread_ref(cur_tid).effective_priority;
-        let woken_prio = tref.base_priority;
-        if woken_prio < cur_prio {
-            pcpu.need_resched.store(true, Ordering::Release);
+        if tid != cur_tid {
+            let cur_prio = thread_ref(cur_tid).effective_priority;
+            let woken_prio = tref.base_priority;
+            if woken_prio < cur_prio {
+                pcpu.need_resched.store(true, Ordering::Release);
+            }
         }
     }
     // Signal all CPUs so any core spinning in block_current's WFE wakes immediately.

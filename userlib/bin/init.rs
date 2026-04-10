@@ -4582,7 +4582,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
             // Parent: wait for child to finish.
             let mut waited = false;
-            for _ in 0..200 {
+            for _ in 0..50 {
                 if let Some(code) = syscall::waitpid(child) {
                     if code != 0 {
                         phase48_ok = false;
@@ -4590,7 +4590,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     waited = true;
                     break;
                 }
-                syscall::yield_now();
+                syscall::sleep_ms(10);
             }
             if !waited {
                 syscall::debug_puts(b"  FAIL: phase48 child did not exit\n");
