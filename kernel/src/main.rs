@@ -680,6 +680,12 @@ fn test_demand_paging() {
             "Expected major fault after reclaim, got {:?}",
             result
         );
+        println!(
+            "  Swap stats: out={}, in={}, err={}",
+            mm::swap::SWAP_OUT_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+            mm::swap::SWAP_IN_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+            mm::swap::SWAP_IO_ERRORS.load(core::sync::atomic::Ordering::Relaxed),
+        );
         println!("  WSCLOCK re-fault after reclaim: PASSED");
     }
 

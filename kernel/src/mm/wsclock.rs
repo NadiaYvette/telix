@@ -112,6 +112,8 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
                             }
 
                             if all_unmapped {
+                                // If swap is enabled, save page contents before freeing.
+                                object::swap_out_page(obj_id, obj_page_idx);
                                 object::release_page(obj_id, obj_page_idx);
                                 // Clear SW_ZEROED hints since the physical page is freed.
                                 for i in ap_start..ap_end {

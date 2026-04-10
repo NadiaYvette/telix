@@ -672,6 +672,39 @@ fn detach_sole_survivor(survivor_id: ObjectId) {
     guard.cow_group_port = 0;
 }
 
+/// Write the physical page at `page_idx` to swap (if enabled and
+/// applicable) before the caller releases the page. Only swaps
+/// anonymous, non-COW pages. The swap slot is recorded in the object's
+/// `swap_slots` table so that `ensure_page` can read it back on the
+/// next fault.
+pub fn swap_out_page(obj_id: ObjectId, page_idx: usize) {
+    if !swap::enabled() {
+        return;
+    }
+    let entry_ptr = match resolve_entry(obj_id) {
+        Some(p) => p as *mut ObjEntry,
+        None => return,
+    };
+    let mut guard = unsafe { (*entry_ptr).inner.lock() };
+    // Only swap anonymous, exclusively-owned pages.
+    if guard.obj_type != ObjectType::Anonymous || guard.cow_group_port != 0 {
+        return;
+    }
+    let pa = guard.pages.get(page_idx);
+    if pa == 0 {
+        return;
+    }
+    let slot = swap::alloc_slot();
+    if slot.is_none() {
+        return;
+    }
+    if swap::write_page(slot, PhysAddr::new(pa)) != swap::SwapIoResult::Ok {
+        swap::free_slot(slot);
+        return;
+    }
+    guard.set_swap_slot(page_idx, slot);
+}
+
 /// Release a physical page from object `obj_id` at `page_idx`.
 /// Frees the page if no other object references the same PA.
 /// Returns true if the physical page was freed, false if still shared.

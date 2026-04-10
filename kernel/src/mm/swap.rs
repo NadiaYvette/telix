@@ -36,7 +36,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use super::page::{PhysAddr, MMUPAGE_SIZE};
+use super::page::{self, PhysAddr};
 use super::phys;
 
 /// Opaque identifier for one slot in a swap backend. 0 is reserved as
@@ -160,13 +160,13 @@ impl RamBackend {
             None => return SwapIoResult::Io,
         };
         // Safety: both addresses are kernel-identity-mapped phys pages
-        // of size MMUPAGE_SIZE; they never overlap (distinct slot
+        // of size page::page_size(); they never overlap (distinct slot
         // allocations).
         unsafe {
             core::ptr::copy_nonoverlapping(
                 src_pa.as_usize() as *const u8,
                 dst as *mut u8,
-                MMUPAGE_SIZE,
+                page::page_size(),
             );
         }
         SwapIoResult::Ok
@@ -181,7 +181,7 @@ impl RamBackend {
             core::ptr::copy_nonoverlapping(
                 src as *const u8,
                 dst_pa.as_usize() as *mut u8,
-                MMUPAGE_SIZE,
+                page::page_size(),
             );
         }
         SwapIoResult::Ok
@@ -355,7 +355,7 @@ fn init_ram_backend(total: u32) -> bool {
     crate::println!(
         "  Swap: ram backend online — {} slots ({} KiB)",
         filled,
-        (filled * MMUPAGE_SIZE) / 1024
+        (filled * page::page_size()) / 1024
     );
     true
 }
@@ -380,8 +380,8 @@ pub fn init() {
                 return;
             }
         };
-        // Slot = one MMU page (4 KiB). total = mib * 256.
-        let total = (mib as usize) * (1024 * 1024 / MMUPAGE_SIZE);
+        // Slot = one allocation page (page_size()). total = mib * 1M / page_size().
+        let total = (mib as usize) * (1024 * 1024 / page::page_size());
         if !init_ram_backend(total as u32) {
             crate::println!("  Swap: ram backend init failed, disabled");
         }
