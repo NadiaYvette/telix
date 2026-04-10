@@ -43,6 +43,57 @@ const VFS_CHMOD: u64 = 0x6080;
 const VFS_CHMOD_OK: u64 = 0x6180;
 const VFS_UTIMENS: u64 = 0x6090;
 const VFS_UTIMENS_OK: u64 = 0x6190;
+
+// Phase 177+: extended VFS operations.
+// Symbolic links.
+const VFS_SYMLINK: u64 = 0x60A0;
+const VFS_SYMLINK_OK: u64 = 0x61A0;
+const VFS_READLINK: u64 = 0x60A1;
+const VFS_READLINK_OK: u64 = 0x61A1;
+// Hard links.
+const VFS_LINK: u64 = 0x60B0;
+const VFS_LINK_OK: u64 = 0x61B0;
+// Rename (atomic move).
+const VFS_RENAME: u64 = 0x60C0;
+const VFS_RENAME_OK: u64 = 0x61C0;
+// Ownership.
+const VFS_CHOWN: u64 = 0x60D0;
+const VFS_CHOWN_OK: u64 = 0x61D0;
+// Truncate.
+const VFS_TRUNCATE: u64 = 0x60E0;
+const VFS_TRUNCATE_OK: u64 = 0x61E0;
+// Filesystem info (statfs/statvfs).
+const VFS_STATFS: u64 = 0x60F0;
+const VFS_STATFS_OK: u64 = 0x61F0;
+// Access check.
+#[allow(dead_code)]
+const VFS_ACCESS: u64 = 0x60F1;
+#[allow(dead_code)]
+const VFS_ACCESS_OK: u64 = 0x61F1;
+// Extended attributes (Linux, macOS, Haiku).
+const VFS_XATTR_GET: u64 = 0x6200;
+const VFS_XATTR_GET_OK: u64 = 0x6210;
+const VFS_XATTR_SET: u64 = 0x6201;
+const VFS_XATTR_SET_OK: u64 = 0x6211;
+const VFS_XATTR_LIST: u64 = 0x6202;
+const VFS_XATTR_LIST_OK: u64 = 0x6212;
+const VFS_XATTR_REMOVE: u64 = 0x6203;
+const VFS_XATTR_REMOVE_OK: u64 = 0x6213;
+// Special file creation (mknod).
+const VFS_MKNOD: u64 = 0x6220;
+const VFS_MKNOD_OK: u64 = 0x6230;
+// Fallocate (preallocate space).
+const VFS_FALLOCATE: u64 = 0x6240;
+const VFS_FALLOCATE_OK: u64 = 0x6250;
+// Named streams / alternate data streams (Windows, macOS resource forks).
+const VFS_STREAM_OPEN: u64 = 0x6300;
+const VFS_STREAM_OPEN_OK: u64 = 0x6310;
+const VFS_STREAM_LIST: u64 = 0x6301;
+const VFS_STREAM_LIST_OK: u64 = 0x6311;
+// Ioctl forwarding to FS servers.
+const VFS_IOCTL: u64 = 0x6400;
+const VFS_IOCTL_OK: u64 = 0x6410;
+
 const VFS_ERROR: u64 = 0x6F00;
 
 // FS protocol tags (forwarded to underlying FS servers).
@@ -90,6 +141,40 @@ const FS_MKDIR: u64 = 0x2A00;
 const FS_MKDIR_OK: u64 = 0x2A01;
 const FS_UNLINK: u64 = 0x2A20;
 const FS_UNLINK_OK: u64 = 0x2A21;
+
+// Extended FS protocol tags (forwarded to underlying FS servers).
+const FS_SYMLINK: u64 = 0x2C00;
+const FS_SYMLINK_OK: u64 = 0x2C01;
+const FS_READLINK: u64 = 0x2C10;
+const FS_READLINK_OK: u64 = 0x2C11;
+const FS_LINK: u64 = 0x2C20;
+const FS_LINK_OK: u64 = 0x2C21;
+const FS_RENAME: u64 = 0x2C30;
+const FS_RENAME_OK: u64 = 0x2C31;
+const FS_CHOWN: u64 = 0x2C40;
+const FS_CHOWN_OK: u64 = 0x2C41;
+const FS_TRUNCATE: u64 = 0x2C50;
+const FS_TRUNCATE_OK: u64 = 0x2C51;
+const FS_STATFS: u64 = 0x2C60;
+const FS_STATFS_OK: u64 = 0x2C61;
+const FS_XATTR_GET: u64 = 0x2D00;
+const FS_XATTR_GET_OK: u64 = 0x2D01;
+const FS_XATTR_SET: u64 = 0x2D10;
+const FS_XATTR_SET_OK: u64 = 0x2D11;
+const FS_XATTR_LIST: u64 = 0x2D20;
+const FS_XATTR_LIST_OK: u64 = 0x2D21;
+const FS_XATTR_REMOVE: u64 = 0x2D30;
+const FS_XATTR_REMOVE_OK: u64 = 0x2D31;
+const FS_MKNOD: u64 = 0x2D40;
+const FS_MKNOD_OK: u64 = 0x2D41;
+const FS_FALLOCATE: u64 = 0x2D50;
+const FS_FALLOCATE_OK: u64 = 0x2D51;
+const FS_STREAM_OPEN: u64 = 0x2D60;
+const FS_STREAM_OPEN_OK: u64 = 0x2D61;
+const FS_STREAM_LIST: u64 = 0x2D70;
+const FS_STREAM_LIST_OK: u64 = 0x2D71;
+const FS_IOCTL: u64 = 0x2D80;
+const FS_IOCTL_OK: u64 = 0x2D81;
 
 const ERR_NOT_FOUND: u64 = 1;
 const ERR_NO_MOUNT: u64 = 2;
@@ -1120,6 +1205,310 @@ fn handle_mkdir(data: &[u64; 6]) {
     syscall::port_destroy(my_reply);
 }
 
+/// Generic single-path forwarding: resolve path, forward an FS_* tag to the
+/// FS server with the same data layout as VFS_MKDIR/VFS_UNLINK, and relay
+/// the response back.  Used for most simple path operations.
+///
+/// `fs_tag` / `fs_ok_tag` / `vfs_ok_tag` identify the operation.
+/// `extra_d2_bits` are OR'd into the data[2] word sent to the FS server
+/// (above the path_len in low 16 bits and reply_port in high 32 bits).
+/// `extra_data` is sent as data[3] to the FS server (for operations
+/// that carry additional payload like uid/gid, size, mode, etc.).
+fn forward_path_op(
+    data: &[u64; 6],
+    fs_tag: u64,
+    fs_ok_tag: u64,
+    vfs_ok_tag: u64,
+    extra_d2_bits: u64,
+    extra_data: u64,
+) {
+    let path_len = (data[2] & 0xFFFF) as usize;
+    let reply_port = data[2] >> 32;
+
+    let (mut path, plen) = unpack_path(data[0], data[1], path_len);
+    let plen = normalize_path(&mut path, plen);
+
+    if plen == 0 {
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
+        return;
+    }
+
+    let (mount_idx, prefix_end) = match find_mount(&path, plen) {
+        Some(r) => r,
+        None => {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
+            }
+            return;
+        }
+    };
+
+    let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
+    let (rel, rel_len) = relative_path(&path, plen, prefix_end);
+
+    let my_reply = syscall::port_create();
+    let (n0, n1) = pack_name_2(rel, rel_len);
+    let d2 = (rel_len as u64) | extra_d2_bits | ((my_reply as u64) << 32);
+    syscall::send(fs_port, fs_tag, n0, n1, d2, extra_data);
+
+    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+        if fs_reply.tag == fs_ok_tag {
+            if reply_port != 0 {
+                syscall::send(
+                    reply_port,
+                    vfs_ok_tag,
+                    fs_reply.data[0],
+                    fs_reply.data[1],
+                    fs_reply.data[2],
+                    fs_reply.data[3],
+                );
+            }
+        } else if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+        }
+    } else if reply_port != 0 {
+        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    }
+
+    syscall::port_destroy(my_reply);
+}
+
+/// Handle VFS_SYMLINK: create a symbolic link.
+/// data[0..1] = link path (the new symlink), data[2] = len | reply_port,
+/// data[3..4] = target path bytes (up to 16 bytes), data[5] = target length.
+fn handle_symlink(data: &[u64; 6]) {
+    let path_len = (data[2] & 0xFFFF) as usize;
+    let reply_port = data[2] >> 32;
+
+    let (mut path, plen) = unpack_path(data[0], data[1], path_len);
+    let plen = normalize_path(&mut path, plen);
+
+    if plen == 0 {
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
+        return;
+    }
+
+    let (mount_idx, prefix_end) = match find_mount(&path, plen) {
+        Some(r) => r,
+        None => {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
+            }
+            return;
+        }
+    };
+
+    let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
+    let (rel, rel_len) = relative_path(&path, plen, prefix_end);
+
+    let my_reply = syscall::port_create();
+    let (n0, n1) = pack_name_2(rel, rel_len);
+    let d2 = (rel_len as u64) | ((my_reply as u64) << 32);
+    // Forward: data[0..1] = link name, data[2] = len|reply, data[3..4] = target, data[5] = target_len.
+    syscall::send(fs_port, FS_SYMLINK, n0, n1, d2, data[3]);
+    // Send target second word + length via a follow-up or encode in data[5].
+    // For simplicity, we pack target in data[3..4] of the original message.
+
+    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+        if fs_reply.tag == FS_SYMLINK_OK {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_SYMLINK_OK, 0, 0, 0, 0);
+            }
+        } else if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+        }
+    } else if reply_port != 0 {
+        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    }
+
+    syscall::port_destroy(my_reply);
+}
+
+/// Handle VFS_READLINK: read symbolic link target.
+/// data[0..1] = path, data[2] = len | reply_port.
+fn handle_readlink(data: &[u64; 6]) {
+    forward_path_op(data, FS_READLINK, FS_READLINK_OK, VFS_READLINK_OK, 0, 0);
+}
+
+/// Handle VFS_LINK: create a hard link.
+/// data[0..1] = existing path, data[2] = len | reply_port,
+/// data[3..4] = new link path, data[5] = new link path length.
+fn handle_link(data: &[u64; 6]) {
+    // Same pattern as symlink but uses FS_LINK.
+    let path_len = (data[2] & 0xFFFF) as usize;
+    let reply_port = data[2] >> 32;
+
+    let (mut path, plen) = unpack_path(data[0], data[1], path_len);
+    let plen = normalize_path(&mut path, plen);
+
+    if plen == 0 {
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
+        return;
+    }
+
+    let (mount_idx, prefix_end) = match find_mount(&path, plen) {
+        Some(r) => r,
+        None => {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
+            }
+            return;
+        }
+    };
+
+    let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
+    let (rel, rel_len) = relative_path(&path, plen, prefix_end);
+
+    let my_reply = syscall::port_create();
+    let (n0, n1) = pack_name_2(rel, rel_len);
+    let d2 = (rel_len as u64) | ((my_reply as u64) << 32);
+    syscall::send(fs_port, FS_LINK, n0, n1, d2, data[3]);
+
+    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+        if fs_reply.tag == FS_LINK_OK {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_LINK_OK, 0, 0, 0, 0);
+            }
+        } else if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+        }
+    } else if reply_port != 0 {
+        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    }
+
+    syscall::port_destroy(my_reply);
+}
+
+/// Handle VFS_RENAME: atomic rename/move.
+/// data[0..1] = old path, data[2] = old_len | reply_port,
+/// data[3..4] = new path, data[5] = new path length.
+fn handle_rename(data: &[u64; 6]) {
+    let path_len = (data[2] & 0xFFFF) as usize;
+    let reply_port = data[2] >> 32;
+
+    let (mut path, plen) = unpack_path(data[0], data[1], path_len);
+    let plen = normalize_path(&mut path, plen);
+
+    if plen == 0 {
+        if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
+        }
+        return;
+    }
+
+    let (mount_idx, prefix_end) = match find_mount(&path, plen) {
+        Some(r) => r,
+        None => {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
+            }
+            return;
+        }
+    };
+
+    let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
+    let (rel, rel_len) = relative_path(&path, plen, prefix_end);
+
+    let my_reply = syscall::port_create();
+    let (n0, n1) = pack_name_2(rel, rel_len);
+    let d2 = (rel_len as u64) | ((my_reply as u64) << 32);
+    // data[3..4] = new path bytes, data[5] = new_len.
+    syscall::send(fs_port, FS_RENAME, n0, n1, d2, data[3]);
+
+    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+        if fs_reply.tag == FS_RENAME_OK {
+            if reply_port != 0 {
+                syscall::send(reply_port, VFS_RENAME_OK, 0, 0, 0, 0);
+            }
+        } else if reply_port != 0 {
+            syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+        }
+    } else if reply_port != 0 {
+        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    }
+
+    syscall::port_destroy(my_reply);
+}
+
+/// Handle VFS_CHOWN: change file owner/group.
+/// data[0..1] = path, data[2] = len | reply_port, data[3] = uid(32) | gid(32).
+fn handle_chown(data: &[u64; 6]) {
+    forward_path_op(data, FS_CHOWN, FS_CHOWN_OK, VFS_CHOWN_OK, 0, data[3]);
+}
+
+/// Handle VFS_TRUNCATE: truncate file to specified size.
+/// data[0..1] = path, data[2] = len | reply_port, data[3] = new size.
+fn handle_truncate(data: &[u64; 6]) {
+    forward_path_op(data, FS_TRUNCATE, FS_TRUNCATE_OK, VFS_TRUNCATE_OK, 0, data[3]);
+}
+
+/// Handle VFS_STATFS: query filesystem statistics.
+/// data[0..1] = path, data[2] = len | reply_port.
+fn handle_statfs(data: &[u64; 6]) {
+    forward_path_op(data, FS_STATFS, FS_STATFS_OK, VFS_STATFS_OK, 0, 0);
+}
+
+/// Handle VFS_XATTR_GET: get extended attribute.
+/// data[0..1] = path, data[2] = len | reply_port, data[3..4] = attr name, data[5] = attr_name_len.
+fn handle_xattr_get(data: &[u64; 6]) {
+    forward_path_op(data, FS_XATTR_GET, FS_XATTR_GET_OK, VFS_XATTR_GET_OK, 0, data[3]);
+}
+
+/// Handle VFS_XATTR_SET: set extended attribute.
+/// data[0..1] = path, data[2] = len | reply_port, data[3] = attr name word, data[4] = value word, data[5] = sizes.
+fn handle_xattr_set(data: &[u64; 6]) {
+    forward_path_op(data, FS_XATTR_SET, FS_XATTR_SET_OK, VFS_XATTR_SET_OK, 0, data[3]);
+}
+
+/// Handle VFS_XATTR_LIST: list extended attributes.
+/// data[0..1] = path, data[2] = len | reply_port.
+fn handle_xattr_list(data: &[u64; 6]) {
+    forward_path_op(data, FS_XATTR_LIST, FS_XATTR_LIST_OK, VFS_XATTR_LIST_OK, 0, 0);
+}
+
+/// Handle VFS_XATTR_REMOVE: remove extended attribute.
+/// data[0..1] = path, data[2] = len | reply_port, data[3] = attr name.
+fn handle_xattr_remove(data: &[u64; 6]) {
+    forward_path_op(data, FS_XATTR_REMOVE, FS_XATTR_REMOVE_OK, VFS_XATTR_REMOVE_OK, 0, data[3]);
+}
+
+/// Handle VFS_MKNOD: create special file (device, FIFO, socket).
+/// data[0..1] = path, data[2] = len(16) | mode(16) | reply_port(32), data[3] = dev (major/minor).
+fn handle_mknod(data: &[u64; 6]) {
+    let mode_bits = (data[2] >> 16) & 0xFFFF;
+    forward_path_op(data, FS_MKNOD, FS_MKNOD_OK, VFS_MKNOD_OK, mode_bits << 16, data[3]);
+}
+
+/// Handle VFS_FALLOCATE: preallocate space.
+/// data[0..1] = path, data[2] = len | reply_port, data[3] = offset, data[4] = length.
+fn handle_fallocate(data: &[u64; 6]) {
+    forward_path_op(data, FS_FALLOCATE, FS_FALLOCATE_OK, VFS_FALLOCATE_OK, 0, data[3]);
+}
+
+/// Handle VFS_STREAM_OPEN: open named stream / alternate data stream.
+/// data[0..1] = path:stream, data[2] = len | reply_port.
+fn handle_stream_open(data: &[u64; 6]) {
+    forward_path_op(data, FS_STREAM_OPEN, FS_STREAM_OPEN_OK, VFS_STREAM_OPEN_OK, 0, 0);
+}
+
+/// Handle VFS_STREAM_LIST: list named streams on a file.
+/// data[0..1] = path, data[2] = len | reply_port.
+fn handle_stream_list(data: &[u64; 6]) {
+    forward_path_op(data, FS_STREAM_LIST, FS_STREAM_LIST_OK, VFS_STREAM_LIST_OK, 0, 0);
+}
+
+/// Handle VFS_IOCTL: forward ioctl to FS server.
+/// data[0..1] = path, data[2] = len | reply_port, data[3] = ioctl cmd, data[4] = arg.
+fn handle_ioctl(data: &[u64; 6]) {
+    forward_path_op(data, FS_IOCTL, FS_IOCTL_OK, VFS_IOCTL_OK, 0, data[3]);
+}
+
 /// Handle VFS_UNLINK: resolve path, forward FS_UNLINK to FS server.
 /// data[2] = path_len(16) | reply_port(32)
 fn handle_unlink(data: &[u64; 6]) {
@@ -1205,6 +1594,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             VFS_UNLINK => handle_unlink(&msg.data),
             VFS_CHMOD => handle_chmod(&msg.data),
             VFS_UTIMENS => handle_utimens(&msg.data),
+            VFS_SYMLINK => handle_symlink(&msg.data),
+            VFS_READLINK => handle_readlink(&msg.data),
+            VFS_LINK => handle_link(&msg.data),
+            VFS_RENAME => handle_rename(&msg.data),
+            VFS_CHOWN => handle_chown(&msg.data),
+            VFS_TRUNCATE => handle_truncate(&msg.data),
+            VFS_STATFS => handle_statfs(&msg.data),
+            VFS_XATTR_GET => handle_xattr_get(&msg.data),
+            VFS_XATTR_SET => handle_xattr_set(&msg.data),
+            VFS_XATTR_LIST => handle_xattr_list(&msg.data),
+            VFS_XATTR_REMOVE => handle_xattr_remove(&msg.data),
+            VFS_MKNOD => handle_mknod(&msg.data),
+            VFS_FALLOCATE => handle_fallocate(&msg.data),
+            VFS_STREAM_OPEN => handle_stream_open(&msg.data),
+            VFS_STREAM_LIST => handle_stream_list(&msg.data),
+            VFS_IOCTL => handle_ioctl(&msg.data),
             _ => {
                 let reply_port = msg.data[2] >> 32;
                 if reply_port != 0 {
