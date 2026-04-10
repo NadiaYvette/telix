@@ -1920,11 +1920,11 @@ fn try_switch(current_sp: u64) -> u64 {
         // woken (wakeup flag set), restore its base priority so it gets
         // re-enqueued at the correct level instead of being starved.
         if prev_prio == 254 && prev_t.base_priority < 254 {
-            if thread_ref(prev_id).wakeup.load(Ordering::Relaxed) {
+            if thread_ref(prev_id).wakeup.load(Ordering::Acquire) {
                 prev_t.effective_priority = prev_t.base_priority;
                 thread_ref(prev_id)
                     .prio
-                    .store(prev_t.base_priority, Ordering::Relaxed);
+                    .store(prev_t.base_priority, Ordering::Release);
                 prev_prio = prev_t.base_priority;
             }
         }
@@ -2166,7 +2166,7 @@ pub fn wake_thread(tid: ThreadId) {
     // stuck in a ready queue where higher-priority threads prevent it from
     // running. Move it from its old CPU's prio-254 slot to the waker's CPU
     // at its base priority so it gets picked up promptly.
-    let demoted_prio = tref.prio.load(Ordering::Relaxed);
+    let demoted_prio = tref.prio.load(Ordering::Acquire);
     if demoted_prio == 254 {
         // Read base_priority directly from the thread struct (immutable after creation,
         // safe without SCHEDULER lock). Avoids deadlock when wake_thread is called
@@ -2175,20 +2175,36 @@ pub fn wake_thread(tid: ThreadId) {
         if base < 254 {
             let old_cpu = tref.last_cpu.load(Ordering::Relaxed);
             let waker_cpu = smp::cpu_id();
-            // Try to remove from old CPU's queue and re-enqueue at base prio.
+            // Remove from old CPU's queue and re-enqueue at base prio.
+            // If old_cpu == waker_cpu, the caller may already hold this
+            // CPU's RQ lock (e.g. try_switch → wake_thread for join_waiter),
+            // so use try_lock to avoid deadlock.  For remote CPUs, use the
+            // blocking lock() — spinlocks are held briefly and there's no
+            // cross-CPU lock ordering issue.  This ensures the thread is
+            // promptly re-enqueued instead of languishing at prio-254 where
+            // the EEVDF heap would starve it.
             let removed = {
-                if let Some(mut rq) = percpu_rq()[old_cpu as usize].try_lock() {
-                    rq.remove_tid(tid)
+                if old_cpu as usize == waker_cpu as usize {
+                    // Same CPU — try_lock to avoid recursive deadlock.
+                    if let Some(mut rq) = percpu_rq()[old_cpu as usize].try_lock() {
+                        rq.remove_tid(tid)
+                    } else {
+                        // Lock held by our try_switch — the wakeup flag is set,
+                        // and try_switch will restore priority at re-enqueue.
+                        false
+                    }
                 } else {
-                    false
+                    // Remote CPU — safe to block; no deadlock possible.
+                    let mut rq = percpu_rq()[old_cpu as usize].lock();
+                    rq.remove_tid(tid)
                 }
             };
             if removed {
                 percpu_enqueue(waker_cpu, base, tid);
             }
-            // If we couldn't lock or find the thread (it may be currently
-            // Running in WFI), that's OK — the wakeup flag is set and it
-            // will exit block_current on its next check.
+            // If we couldn't remove the thread (it may be currently Running
+            // in WFI on its CPU), the wakeup flag is set and it will exit
+            // block_current on its next check.
         }
     }
     // Signal all CPUs so any core spinning in block_current's WFE wakes immediately.
