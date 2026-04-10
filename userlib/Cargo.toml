@@ -92,6 +92,10 @@ name = "ext2_srv"
 path = "bin/ext2_srv.rs"
 
 [[bin]]
+name = "iso9660_srv"
+path = "bin/iso9660_srv.rs"
+
+[[bin]]
 name = "shm_srv"
 path = "bin/shm_srv.rs"
 

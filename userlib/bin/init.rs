@@ -3189,6 +3189,191 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 177: ISO 9660 filesystem server ---
+    syscall::debug_puts(b"  init: Phase 177 ISO 9660 filesystem...\n");
+    {
+        // ISO 9660 image is at offset 32 MiB in test.img.
+        const ISO_OFFSET: u64 = 32 * 1024 * 1024;
+        const FS_OPEN: u64 = 0x2000;
+        const FS_OPEN_OK: u64 = 0x2001;
+        const FS_READ: u64 = 0x2100;
+        const FS_READ_OK: u64 = 0x2101;
+        const FS_READDIR: u64 = 0x2200;
+        const FS_READDIR_OK: u64 = 0x2201;
+        const FS_READDIR_END: u64 = 0x2202;
+        const FS_STAT: u64 = 0x2300;
+        const FS_STAT_OK: u64 = 0x2301;
+        const FS_CLOSE: u64 = 0x2400;
+        #[allow(dead_code)]
+        const FS_ERROR: u64 = 0x2F00;
+
+        let iso_tid = syscall::spawn_with_arg(b"iso9660_srv", 50, ISO_OFFSET);
+        if iso_tid != u64::MAX {
+            // Wait for iso9660_srv to register.
+            let iso_port = {
+                let mut retries = 500;
+                loop {
+                    if let Some(p) = syscall::ns_lookup(b"iso9660") {
+                        break Some(p);
+                    }
+                    retries -= 1;
+                    if retries == 0 {
+                        break None;
+                    }
+                    syscall::sleep_ms(2);
+                }
+            };
+
+            if let Some(iso_port) = iso_port {
+                let reply_port = syscall::port_create();
+                let mut passed = true;
+                let mut checks = 0u32;
+
+                // Test 1: Open and read hello.txt
+                {
+                    let (n0, n1, _) = syscall::pack_name(b"hello.txt");
+                    let d2 = 9u64 | ((reply_port as u64) << 32);
+                    syscall::send(iso_port, FS_OPEN, n0, n1, d2, 0);
+                    if let Some(r) = syscall::recv_msg(reply_port) {
+                        if r.tag == FS_OPEN_OK {
+                            let handle = r.data[0];
+                            let size = r.data[1];
+                            let d2r = 20u64 | ((reply_port as u64) << 32);
+                            syscall::send(iso_port, FS_READ, handle, 0, d2r, 0);
+                            if let Some(rr) = syscall::recv_msg(reply_port) {
+                                if rr.tag == FS_READ_OK && rr.data[0] > 0 {
+                                    let b0 = (rr.data[1] & 0xFF) as u8;
+                                    let b1 = ((rr.data[1] >> 8) & 0xFF) as u8;
+                                    let b2 = ((rr.data[1] >> 16) & 0xFF) as u8;
+                                    let b3 = ((rr.data[1] >> 24) & 0xFF) as u8;
+                                    let b4 = ((rr.data[1] >> 32) & 0xFF) as u8;
+                                    if b0 == b'H' && b1 == b'e' && b2 == b'l' && b3 == b'l' && b4 == b'o' {
+                                        checks += 1;
+                                    } else {
+                                        syscall::debug_puts(b"  [177] hello.txt content mismatch\n");
+                                        passed = false;
+                                    }
+                                } else {
+                                    syscall::debug_puts(b"  [177] hello.txt read failed\n");
+                                    passed = false;
+                                }
+                            } else { passed = false; }
+                            syscall::send(iso_port, FS_CLOSE, handle, 0, 0, 0);
+                            let _ = size;
+                        } else {
+                            syscall::debug_puts(b"  [177] hello.txt open failed\n");
+                            passed = false;
+                        }
+                    } else { passed = false; }
+                }
+
+                // Test 2: Open and read sub/deep.txt (nested dir traversal)
+                {
+                    let (n0, n1, _) = syscall::pack_name(b"sub/deep.txt");
+                    let d2 = 12u64 | ((reply_port as u64) << 32);
+                    syscall::send(iso_port, FS_OPEN, n0, n1, d2, 0);
+                    if let Some(r) = syscall::recv_msg(reply_port) {
+                        if r.tag == FS_OPEN_OK {
+                            let handle = r.data[0];
+                            let d2r = 19u64 | ((reply_port as u64) << 32);
+                            syscall::send(iso_port, FS_READ, handle, 0, d2r, 0);
+                            if let Some(rr) = syscall::recv_msg(reply_port) {
+                                if rr.tag == FS_READ_OK && rr.data[0] > 0 {
+                                    let b0 = (rr.data[1] & 0xFF) as u8;
+                                    let b1 = ((rr.data[1] >> 8) & 0xFF) as u8;
+                                    if b0 == b'N' && b1 == b'e' {
+                                        checks += 1;
+                                    } else {
+                                        syscall::debug_puts(b"  [177] deep.txt content mismatch\n");
+                                        passed = false;
+                                    }
+                                } else { passed = false; }
+                            } else { passed = false; }
+                            syscall::send(iso_port, FS_CLOSE, handle, 0, 0, 0);
+                        } else {
+                            syscall::debug_puts(b"  [177] sub/deep.txt open failed\n");
+                            passed = false;
+                        }
+                    } else { passed = false; }
+                }
+
+                // Test 3: Readdir on root directory
+                {
+                    let (n0, n1, _) = syscall::pack_name(b"/");
+                    let d2 = 1u64 | ((reply_port as u64) << 32);
+                    syscall::send(iso_port, FS_OPEN, n0, n1, d2, 0);
+                    if let Some(r) = syscall::recv_msg(reply_port) {
+                        if r.tag == FS_OPEN_OK {
+                            let handle = r.data[0];
+                            let mut entries = 0u32;
+                            loop {
+                                syscall::send(iso_port, FS_READDIR, handle, reply_port, 0, 0);
+                                if let Some(rr) = syscall::recv_msg(reply_port) {
+                                    if rr.tag == FS_READDIR_OK {
+                                        entries += 1;
+                                    } else { break; }
+                                } else { break; }
+                            }
+                            if entries >= 3 {
+                                checks += 1;
+                            } else {
+                                syscall::debug_puts(b"  [177] readdir got ");
+                                print_num(entries as u64);
+                                syscall::debug_puts(b" entries (expected >=3)\n");
+                                passed = false;
+                            }
+                            syscall::send(iso_port, FS_CLOSE, handle, 0, 0, 0);
+                        } else { passed = false; }
+                    } else { passed = false; }
+                }
+
+                // Test 4: Stat a file
+                {
+                    let (n0, n1, _) = syscall::pack_name(b"alpha.txt");
+                    let d2 = 9u64 | ((reply_port as u64) << 32);
+                    syscall::send(iso_port, FS_OPEN, n0, n1, d2, 0);
+                    if let Some(r) = syscall::recv_msg(reply_port) {
+                        if r.tag == FS_OPEN_OK {
+                            let handle = r.data[0];
+                            syscall::send(iso_port, FS_STAT, handle, reply_port, 0, 0);
+                            if let Some(sr) = syscall::recv_msg(reply_port) {
+                                if sr.tag == FS_STAT_OK {
+                                    let size = sr.data[0];
+                                    let ftype = sr.data[1];
+                                    if size == 26 && ftype == 0 {
+                                        checks += 1;
+                                    } else {
+                                        syscall::debug_puts(b"  [177] stat: size=");
+                                        print_num(size);
+                                        syscall::debug_puts(b" type=");
+                                        print_num(ftype);
+                                        syscall::debug_puts(b"\n");
+                                        passed = false;
+                                    }
+                                } else { passed = false; }
+                            } else { passed = false; }
+                            syscall::send(iso_port, FS_CLOSE, handle, 0, 0, 0);
+                        } else { passed = false; }
+                    } else { passed = false; }
+                }
+
+                if passed && checks == 4 {
+                    syscall::debug_puts(b"Phase 177 ISO 9660 filesystem: PASSED (");
+                    print_num(checks as u64);
+                    syscall::debug_puts(b"/4 checks)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 177 ISO 9660 filesystem: FAILED (");
+                    print_num(checks as u64);
+                    syscall::debug_puts(b"/4 checks)\n");
+                }
+            } else {
+                syscall::debug_puts(b"Phase 177 ISO 9660 filesystem: FAILED (iso9660 not found)\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 177 ISO 9660 filesystem: SKIPPED (spawn failed)\n");
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {
