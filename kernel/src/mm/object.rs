@@ -208,7 +208,11 @@ impl MemObject {
                 self.pages.set(page_idx, pa.as_usize());
                 self.clear_swap_slot(page_idx);
                 swap::free_slot(slot);
-                return Some((pa, false));
+                // Return pre_zeroed=true to prevent the fault handler from
+                // zeroing the sub-page — the contents came from swap, not
+                // the zero pool, but they're already valid and must not be
+                // overwritten.
+                return Some((pa, true));
             }
             // Swap read failed — fall through to zero-fill.
             // (The slot will be leaked; this is a degraded path.)

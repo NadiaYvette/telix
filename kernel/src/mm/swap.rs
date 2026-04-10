@@ -346,6 +346,13 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }
 
+/// Returns true if the active backend is the in-memory RAM backend
+/// (synchronous, no IPC). Used to gate kernel-context E2E tests that
+/// cannot do blocking IPC to blk_srv.
+pub fn is_ram_backend() -> bool {
+    matches!(current(), Some(Backend::Ram(_)))
+}
+
 #[inline]
 fn current() -> Option<Backend> {
     if !enabled() {

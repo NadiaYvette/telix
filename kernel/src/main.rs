@@ -342,6 +342,12 @@ fn startup_thread() -> ! {
     // the "blk" service to be registered with the name server).
     mm::swap::init_blk_deferred();
 
+    // Swap end-to-end verification: fault pages with known data patterns,
+    // evict via WSCLOCK (triggering swap-out), re-fault (swap-in), verify data.
+    if mm::swap::is_ram_backend() {
+        test_swap_e2e();
+    }
+
     // Phase 4: Spawning init process...
     println!("Phase 4: Spawning init process...");
 
@@ -700,4 +706,142 @@ fn test_demand_paging() {
 
     mm::aspace::destroy(aspace_id);
     println!("  Demand paging test: PASSED");
+}
+
+// --- Swap end-to-end verification ---
+//
+// Runs after I/O servers are up (startup_thread), so the blk backend
+// is initialized. Verifies that data survives the full round-trip:
+// fault-in → write pattern → WSCLOCK eviction (swap-out) → re-fault (swap-in) → verify.
+
+fn test_swap_e2e() {
+    use mm::page::{self, MMUPAGE_SIZE};
+    use mm::vma::VmaProt;
+    let ps = page::page_size();
+
+    println!("  Swap E2E: testing data integrity through swap round-trip...");
+
+    let out_before = mm::swap::SWAP_OUT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let in_before = mm::swap::SWAP_IN_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Create a fresh page table + address space.
+    let pt_root = {
+        let pa = mm::phys::alloc_page().expect("swap e2e pt root");
+        unsafe {
+            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, MMUPAGE_SIZE);
+        }
+        pa.as_usize()
+    };
+    let aspace_id = mm::aspace::create(pt_root).expect("swap e2e aspace");
+
+    // Map 4 allocation pages of anonymous memory at a high VA.
+    let test_va = 0xA0_0000_0000usize;
+    let num_alloc_pages = 4;
+    let num_mmu_pages = num_alloc_pages * page::page_mmucount();
+    mm::aspace::with_aspace(aspace_id, |aspace| {
+        aspace
+            .map_anon(test_va, num_mmu_pages, VmaProt::ReadWrite)
+            .expect("swap e2e map_anon");
+    });
+
+    // Fault in each allocation page and write a recognizable pattern.
+    // Pattern: each allocation page gets its page index as a repeating u64.
+    for page_idx in 0..num_alloc_pages {
+        let va = test_va + page_idx * ps;
+        let result =
+            mm::fault::handle_page_fault(aspace_id, va, mm::fault::FaultType::Write);
+        assert!(
+            result == mm::fault::FaultResult::HandledMajor
+                || result == mm::fault::FaultResult::HandledMinor,
+            "swap e2e: unexpected fault result {:?} for page {}",
+            result,
+            page_idx,
+        );
+
+        // Write pattern: translate VA → PA, write through identity map.
+        let pa = mm::hat::translate_va(pt_root, va).expect("swap e2e translate");
+        let pattern = 0xDEAD_0000u64 | (page_idx as u64);
+        let ptr = pa as *mut u64;
+        unsafe {
+            // Write pattern at the start and end of the page.
+            core::ptr::write_volatile(ptr, pattern);
+            let end_ptr = (pa + ps - 8) as *mut u64;
+            core::ptr::write_volatile(end_ptr, pattern ^ 0xFFFF_FFFF);
+        }
+    }
+
+    // Run WSCLOCK twice to evict all pages (pass 1 clears ref bits,
+    // pass 2 evicts unreferenced pages). With swap enabled, evicted
+    // pages should be written to the swap backend before being freed.
+    let scan1 = mm::wsclock::scan(aspace_id, 100);
+    let scan2 = mm::wsclock::scan(aspace_id, 100);
+    let total_freed = scan1.pages_freed + scan2.pages_freed;
+    println!(
+        "  Swap E2E: WSCLOCK freed {} pages (pass1={}, pass2={})",
+        total_freed, scan1.pages_freed, scan2.pages_freed,
+    );
+    assert!(total_freed >= num_alloc_pages, "swap e2e: expected to free all pages");
+
+    let out_after = mm::swap::SWAP_OUT_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let swapped_out = out_after - out_before;
+    println!("  Swap E2E: {} pages swapped out", swapped_out);
+    assert!(
+        swapped_out >= num_alloc_pages as u32,
+        "swap e2e: expected {} swap-outs, got {}",
+        num_alloc_pages,
+        swapped_out,
+    );
+
+    // Re-fault each page (triggers swap-in) and verify data patterns.
+    for page_idx in 0..num_alloc_pages {
+        let va = test_va + page_idx * ps;
+        let result =
+            mm::fault::handle_page_fault(aspace_id, va, mm::fault::FaultType::Read);
+        assert!(
+            result == mm::fault::FaultResult::HandledMajor,
+            "swap e2e: expected major fault (swap-in) for page {}, got {:?}",
+            page_idx,
+            result,
+        );
+
+        // Verify pattern through identity-mapped PA.
+        let pa = mm::hat::translate_va(pt_root, va).expect("swap e2e translate after");
+        let pattern = 0xDEAD_0000u64 | (page_idx as u64);
+        let ptr = pa as *const u64;
+        unsafe {
+            let start_val = core::ptr::read_volatile(ptr);
+            let end_val = core::ptr::read_volatile((pa + ps - 8) as *const u64);
+            assert_eq!(
+                start_val, pattern,
+                "swap e2e: page {} start mismatch: got {:#x}, expected {:#x}",
+                page_idx, start_val, pattern,
+            );
+            assert_eq!(
+                end_val,
+                pattern ^ 0xFFFF_FFFF,
+                "swap e2e: page {} end mismatch: got {:#x}, expected {:#x}",
+                page_idx,
+                end_val,
+                pattern ^ 0xFFFF_FFFF,
+            );
+        }
+    }
+
+    let in_after = mm::swap::SWAP_IN_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let swapped_in = in_after - in_before;
+    let errors = mm::swap::SWAP_IO_ERRORS.load(core::sync::atomic::Ordering::Relaxed);
+    println!(
+        "  Swap E2E: out={}, in={}, err={}",
+        swapped_out, swapped_in, errors,
+    );
+    assert_eq!(errors, 0, "swap e2e: unexpected I/O errors");
+    assert!(
+        swapped_in >= num_alloc_pages as u32,
+        "swap e2e: expected {} swap-ins, got {}",
+        num_alloc_pages,
+        swapped_in,
+    );
+
+    mm::aspace::destroy(aspace_id);
+    println!("  Swap E2E data integrity test: PASSED");
 }
