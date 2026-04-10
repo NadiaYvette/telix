@@ -109,6 +109,37 @@ impl Heap4 {
         true
     }
 
+    /// Pick the eligible thread with the earliest deadline.
+    ///
+    /// Scans all entries and selects the one with minimum key (deadline)
+    /// whose thread's `eevdf_vruntime <= max_vruntime`.  If no thread is
+    /// eligible, falls back to `pop_min()` to prevent livelock.
+    ///
+    /// O(n) scan over contiguous 16-byte entries — cache-friendly for
+    /// typical run-queue sizes (< 50 threads).
+    pub fn pick_eligible(&mut self, max_vruntime: u64) -> Option<(u32, u64)> {
+        if self.len == 0 {
+            return None;
+        }
+        let n = self.len as usize;
+        let mut best_pos: Option<usize> = None;
+        let mut best_key: u64 = u64::MAX;
+        for i in 0..n {
+            let e = &self.entries[i];
+            let vrt = super::scheduler::thread_ref(e.tid).eevdf_vruntime;
+            if vrt <= max_vruntime && e.key < best_key {
+                best_key = e.key;
+                best_pos = Some(i);
+            }
+        }
+        if let Some(pos) = best_pos {
+            Some(self.remove(pos))
+        } else {
+            // No eligible thread — fall back to earliest deadline to avoid livelock.
+            self.pop_min()
+        }
+    }
+
     /// Remove and return the minimum entry.
     /// Returns `(tid, key)` or `None` if empty.
     pub fn pop_min(&mut self) -> Option<(u32, u64)> {

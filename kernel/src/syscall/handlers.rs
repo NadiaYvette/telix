@@ -109,6 +109,7 @@ pub const SYS_PORT_RESIZE: u64 = 100;
 pub const SYS_FUTEX_WAIT_PI: u64 = 101;
 pub const SYS_FUTEX_WAKE_PI: u64 = 102;
 pub const SYS_PAGE_SIZE: u64 = 103;
+pub const SYS_SCHED_SETATTR: u64 = 114;
 // Personality syscalls live in the 0xF000 range to avoid collisions with
 // Linux x86_64 syscall numbers (which go up to ~450). Previously these were
 // 104-114 which collided with Linux getgid, setuid, setgid, geteuid, getegid,
@@ -280,6 +281,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_IRQ_ATTACH => sys_irq_attach(a0, a1, a2),
         SYS_IRQ_ACK => sys_irq_ack(a0),
         SYS_MMIO_MAP_CAP => sys_mmio_map_cap(a0),
+        SYS_SCHED_SETATTR => sys_sched_setattr(a0, a1, a2),
         SYS_GETCHAR => sys_getchar(),
         SYS_IOPORT => sys_ioport(a0, a1, a2),
         SYS_SPAWN_ELF => sys_spawn_elf(a0, a1, a2, a3),
@@ -1455,6 +1457,56 @@ fn sys_mmio_map_cap(slot: u64) -> u64 {
     }
 
     va as u64
+}
+
+/// Set EEVDF scheduling attributes for a thread.
+///
+/// `tid_port`: thread port ID (0 = self).
+/// `nice`: nice value as i64 (-20..+19, or i64::MIN to leave unchanged).
+/// `latency_nice`: latency nice as i64 (-20..+19, or i64::MIN to leave unchanged).
+/// Returns 0 on success, u64::MAX on error.
+fn sys_sched_setattr(tid_port: u64, nice: u64, latency_nice: u64) -> u64 {
+    use crate::sched::thread::nice_to_weight;
+    const UNCHANGED: i64 = i64::MIN;
+
+    let my_tid = crate::sched::current_thread_id();
+    let tid = if tid_port == 0 {
+        my_tid
+    } else {
+        match crate::sched::thread_id_from_port(tid_port) {
+            Some(t) => t,
+            None => return u64::MAX,
+        }
+    };
+
+    // Security: target thread must be in the same task as caller.
+    if tid != my_tid {
+        let caller_task = crate::sched::scheduler::thread_ref(my_tid).task_id;
+        let target_task = crate::sched::scheduler::thread_ref(tid).task_id;
+        if caller_task != target_task {
+            return u64::MAX;
+        }
+    }
+
+    let nice_val = nice as i64;
+    let lat_val = latency_nice as i64;
+    let t = unsafe { crate::sched::scheduler::thread_mut_from_ref(tid) };
+
+    if nice_val != UNCHANGED {
+        if nice_val < -20 || nice_val > 19 {
+            return u64::MAX;
+        }
+        t.eevdf_weight = nice_to_weight(nice_val as i32);
+    }
+
+    if lat_val != UNCHANGED {
+        if lat_val < -20 || lat_val > 19 {
+            return u64::MAX;
+        }
+        t.eevdf_latency_weight = nice_to_weight(lat_val as i32);
+    }
+
+    0
 }
 
 fn sys_ioport(op: u64, port: u64, value: u64) -> u64 {

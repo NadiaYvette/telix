@@ -424,8 +424,8 @@ impl PerCpuRunQueues {
                 return Some(tid);
             }
         }
-        // 2. EEVDF: pop earliest deadline from heap.
-        if let Some((tid, _deadline)) = self.eevdf_heap.pop_min() {
+        // 2. EEVDF: pick eligible thread with earliest deadline.
+        if let Some((tid, _deadline)) = self.eevdf_heap.pick_eligible(self.eevdf_min_vruntime) {
             self.eevdf_nr_running -= 1;
             return Some(tid);
         }
@@ -602,18 +602,29 @@ fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
 /// Called under the per-CPU RQ lock.
 fn eevdf_enqueue(rq: &mut PerCpuRunQueues, tid: ThreadId) {
     let t = unsafe { thread_mut_from_ref(tid) };
-    // Snap vruntime to at least min_vruntime so sleepers don't accumulate
-    // unbounded credit.
+    // Compute base virtual time slice and apply latency scaling.
+    let weight = t.eevdf_weight as u64;
+    let lat_w = t.eevdf_latency_weight as u64;
+    let base_slice = (t.default_quantum as u64) * VTIME_UNIT / weight;
+    // Lower latency_weight → shorter slice → tighter deadlines → more responsive.
+    t.eevdf_slice_vt = ((base_slice * 1024) / lat_w).max(1);
+
+    // Hard-snap vruntime to min_vruntime.  This works in concert with the
+    // eligibility filter in class_pick_next: waking threads land at exactly
+    // min_vruntime (eligible), while preempted threads have vruntime above
+    // min_vruntime (ineligible until others catch up).  The combination
+    // provides the EEVDF sleeping-credit benefit — wakers are naturally
+    // preferred — without explicit vruntime manipulation below the floor.
     if t.eevdf_vruntime < rq.eevdf_min_vruntime {
         t.eevdf_vruntime = rq.eevdf_min_vruntime;
     }
+    // Compute lag: positive = thread is owed CPU (eligible), negative = ahead.
+    t.eevdf_lag = rq.eevdf_min_vruntime as i64 - t.eevdf_vruntime as i64;
+
     // Advance min_vruntime: it's the max of all threads' vruntime at enqueue.
     if t.eevdf_vruntime > rq.eevdf_min_vruntime {
         rq.eevdf_min_vruntime = t.eevdf_vruntime;
     }
-    // Compute virtual time slice: quantum * VTIME_UNIT / weight.
-    let weight = t.eevdf_weight as u64;
-    t.eevdf_slice_vt = (t.default_quantum as u64) * VTIME_UNIT / weight;
     // Set deadline.
     t.eevdf_deadline = t.eevdf_vruntime + t.eevdf_slice_vt;
     // Insert into heap. If full, fall back to bitmap.

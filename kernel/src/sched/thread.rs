@@ -129,6 +129,12 @@ pub struct Thread {
     pub eevdf_deadline: u64,
     /// EEVDF virtual time slice length = quantum * VTIME_UNIT / weight.
     pub eevdf_slice_vt: u64,
+    /// EEVDF lag: positive = thread is owed CPU (eligible), negative = ahead of fair share.
+    pub eevdf_lag: i64,
+    /// Latency weight (from latency_nice, default 1024). Scales the virtual time slice:
+    /// slice_vt = base_slice * 1024 / latency_weight. Lower latency_weight → shorter
+    /// slices → tighter deadlines → more responsive scheduling.
+    pub eevdf_latency_weight: u16,
 }
 
 impl Thread {
@@ -180,6 +186,8 @@ impl Thread {
             eevdf_vruntime: 0,
             eevdf_deadline: 0,
             eevdf_slice_vt: 0,
+            eevdf_lag: 0,
+            eevdf_latency_weight: 1024,
         }
     }
 }
@@ -190,3 +198,19 @@ pub const SCHED_NORMAL: u8 = 0;
 pub const SCHED_RT: u8 = 1;
 /// Idle class (only runs when no other thread is runnable).
 pub const SCHED_IDLE: u8 = 2;
+
+/// Nice-to-weight table (Linux CFS/EEVDF compatible).
+/// Index = nice + 20, so nice -20 → index 0, nice 0 → index 20, nice +19 → index 39.
+/// Values for nice < -10 are clamped to u16::MAX (65535) since the true Linux weights
+/// (e.g. nice -20 = 88761) exceed u16 range.
+pub const NICE_TO_WEIGHT: [u16; 40] = [
+    65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535, // nice -20..-11 (clamped)
+    9548, 8192, 7024, 6025, 5168, 4434, 3803, 3264, 2800, 2399,        // nice -10..-1
+    1024,  820,  655,  526,  423,  335,  272,  215,  172,  137,         // nice  0..+9
+     110,   87,   70,   56,   45,   36,   29,   23,   18,   15,        // nice +10..+19
+];
+
+/// Convert a nice value (-20..+19) to an EEVDF weight.
+pub fn nice_to_weight(nice: i32) -> u16 {
+    NICE_TO_WEIGHT[(nice + 20).clamp(0, 39) as usize]
+}
