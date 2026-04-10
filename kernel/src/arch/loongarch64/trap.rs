@@ -80,9 +80,9 @@ pub fn init() {
     let interval = freq / 100; // 100 Hz
     TIMER_INTERVAL.store(interval, Ordering::Relaxed);
 
-    // Set timer: TCFG.En=1, TCFG.Periodic=1, TCFG.InitVal=interval.
+    // Set timer: TCFG.En=1, TCFG.Periodic=0 (one-shot), TCFG.InitVal=interval.
     // TCFG format: bits 31:2 = InitVal, bit 1 = Periodic, bit 0 = En.
-    let tcfg = (interval << 2) | 0x3; // periodic + enable
+    let tcfg = (interval << 2) | 0x1; // one-shot + enable
     unsafe {
         core::arch::asm!(
             "csrwr {val}, {tcfg}",
@@ -124,7 +124,8 @@ pub fn enable_interrupts() {
     }
 }
 
-/// Handle timer interrupt: clear TI, rearm, and increment tick count.
+/// Handle timer interrupt: clear TI and increment tick count.
+/// Timer is NOT rearmed here; the scheduler calls `program_oneshot()`.
 fn handle_timer_irq() {
     let _ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -137,8 +138,34 @@ fn handle_timer_irq() {
             ticlr = const CSR_TICLR,
         );
     }
+}
 
-    // Timer is periodic (auto-reload), no need to manually rearm.
+/// Program the timer to fire at `deadline_ns` nanoseconds since boot.
+pub fn program_oneshot(deadline_ns: u64) {
+    let now_ns = crate::arch::timer::monotonic_ns();
+    let delta_ns = deadline_ns.saturating_sub(now_ns);
+    let freq: u128 = 100_000_000; // QEMU virt Stable Counter = 100 MHz
+    let ticks = ((delta_ns as u128 * freq) / 1_000_000_000u128) as u64;
+    let ticks = ticks.max(1);
+
+    // Clear any pending timer interrupt.
+    unsafe {
+        core::arch::asm!(
+            "li.w {tmp}, 1",
+            "csrwr {tmp}, {ticlr}",
+            tmp = out(reg) _,
+            ticlr = const CSR_TICLR,
+        );
+    }
+    // Program TCFG: one-shot + enable.
+    let tcfg = (ticks << 2) | 0x1;
+    unsafe {
+        core::arch::asm!(
+            "csrwr {val}, {tcfg}",
+            val = in(reg) tcfg,
+            tcfg = const CSR_TCFG,
+        );
+    }
 }
 
 /// Read CSR.BADV.

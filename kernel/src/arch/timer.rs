@@ -69,3 +69,30 @@ pub fn monotonic_ns() -> u64 {
     let f = timer_freq() as u128;
     ((c * 1_000_000_000u128) / f) as u64
 }
+
+/// Program the per-CPU timer to fire once at `deadline_ns` (nanoseconds since boot).
+/// If the deadline is in the past, the timer fires as soon as possible.
+/// Called by the scheduler after each tick to arm the next event.
+#[inline]
+pub fn program_oneshot_ns(deadline_ns: u64) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::aarch64::timer::program_oneshot(deadline_ns);
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::arch::riscv64::trap::program_oneshot(deadline_ns);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::x86_64::lapic::program_oneshot(deadline_ns);
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        crate::arch::loongarch64::trap::program_oneshot(deadline_ns);
+    }
+    #[cfg(target_arch = "mips64")]
+    {
+        crate::arch::mips64::trap::program_oneshot(deadline_ns);
+    }
+}

@@ -109,6 +109,14 @@ static SLEEP_QUEUE_HEAD: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Lock protecting sleep queue mutations (insert / drain).
 static SLEEP_QUEUE_LOCK: SpinLock<()> = SpinLock::new(());
 
+/// Cached earliest alarm deadline (0 = none). Updated by alarm() and check_alarm_timers().
+static EARLIEST_ALARM_NS: AtomicU64 = AtomicU64::new(0);
+/// Cached earliest interval timer deadline (0 = none). Updated by timer_create and check_interval_timers().
+static EARLIEST_INTERVAL_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum idle duration (1 second). Prevents unbounded sleep in case of stale caches.
+const MAX_IDLE_NS: u64 = 1_000_000_000;
+
 /// Get a thread reference by ID via radix lookup (lockless).
 #[inline]
 pub fn thread_ref(tid: u32) -> &'static Thread {
@@ -1808,6 +1816,9 @@ fn drain_deferred_kills() {
 /// (pointing to the saved exception frame). Returns the SP to use
 /// for restore_regs — either the same SP (no switch) or a different
 /// thread's SP (preemption).
+/// Interval between ticks in nanoseconds (10ms = 100 Hz equivalent).
+const TICK_INTERVAL_NS: u64 = 10_000_000;
+
 pub fn tick(current_sp: u64) -> u64 {
     check_sleep_timers();
     check_alarm_timers();
@@ -1816,7 +1827,62 @@ pub fn tick(current_sp: u64) -> u64 {
     // Drain deferred killed-thread cleanup from the previous tick.
     drain_deferred_kills();
 
-    try_switch(current_sp)
+    let result = try_switch(current_sp);
+
+    // Compute and program the next timer event (dynamic tick).
+    let cpu = smp::cpu_id();
+    let pcpu = smp::get(cpu);
+    let is_idle = pcpu.current_thread.load(Ordering::Relaxed)
+        == pcpu.idle_thread_id.load(Ordering::Relaxed);
+    let next = compute_next_event(cpu, is_idle);
+    crate::arch::timer::program_oneshot_ns(next);
+
+    result
+}
+
+/// Compute the earliest timer event this CPU needs to wake for.
+/// Returns an absolute deadline in nanoseconds since boot.
+fn compute_next_event(cpu: u32, is_idle: bool) -> u64 {
+    let now = get_monotonic_ns();
+    let mut earliest = now + MAX_IDLE_NS; // cap: 1 second
+
+    // 1. Quantum deadline: if running a real thread, wake when its quantum expires.
+    if !is_idle {
+        let tid = smp::get(cpu).current_thread.load(Ordering::Relaxed);
+        let q = unsafe { thread_mut_from_ref(tid) }.quantum;
+        if q != u32::MAX {
+            earliest = earliest.min(now + (q as u64) * TICK_INTERVAL_NS);
+        }
+    }
+
+    // 2. Sleep queue head (O(1) peek, no lock).
+    let head = SLEEP_QUEUE_HEAD.load(Ordering::Acquire);
+    if head != u32::MAX {
+        let head_deadline = unsafe { thread_mut_from_ref(head) }.sleep_deadline_ns;
+        if head_deadline != 0 {
+            earliest = earliest.min(head_deadline);
+        }
+    }
+
+    // 3. Cached alarm deadline.
+    let alarm = EARLIEST_ALARM_NS.load(Ordering::Relaxed);
+    if alarm != 0 {
+        earliest = earliest.min(alarm);
+    }
+
+    // 4. Cached interval timer deadline.
+    let interval = EARLIEST_INTERVAL_NS.load(Ordering::Relaxed);
+    if interval != 0 {
+        earliest = earliest.min(interval);
+    }
+
+    // 5. Deferred kills need draining within one tick.
+    if deferred_kill()[cpu as usize].load(Ordering::Relaxed) != 0 {
+        earliest = earliest.min(now + TICK_INTERVAL_NS);
+    }
+
+    // Floor: never less than 1 microsecond from now.
+    earliest.max(now + 1_000)
 }
 
 /// Attempt to switch threads on the current CPU.
@@ -2120,6 +2186,9 @@ pub fn block_current(_reason: BlockReason) {
     // waiting for the full quantum. This prevents spinning threads from
     // starving real work on SMP systems.
     tref.yield_asap.store(true, Ordering::Release);
+    // With dynamic tick, the timer might be programmed far in the future.
+    // Reprogram it to fire within one tick so we get preempted promptly.
+    crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
     // Enable interrupts so the timer can preempt us while we spin.
     // This is critical when called from a syscall handler (SVC/ecall/int),
     // because hardware masks IRQs on exception entry.
@@ -4017,30 +4086,41 @@ pub fn get_monotonic_ns() -> u64 {
 /// Must be called with the thread already marked Blocked/Sleep and deadline set.
 /// Caller must NOT hold SLEEP_QUEUE_LOCK.
 fn sleep_queue_insert(tid: ThreadId, deadline_ns: u64) {
-    let _guard = SLEEP_QUEUE_LOCK.lock();
-    let head = SLEEP_QUEUE_HEAD.load(Ordering::Relaxed);
+    let inserted_at_head;
+    {
+        let _guard = SLEEP_QUEUE_LOCK.lock();
+        let head = SLEEP_QUEUE_HEAD.load(Ordering::Relaxed);
 
-    // Walk the list to find insertion point (sorted by deadline ascending).
-    let mut prev: u32 = u32::MAX; // u32::MAX = inserting at head
-    let mut cur = head;
-    while cur != u32::MAX {
-        let ct = unsafe { thread_mut_from_ref(cur) };
-        if ct.sleep_deadline_ns > deadline_ns {
-            break;
+        // Walk the list to find insertion point (sorted by deadline ascending).
+        let mut prev: u32 = u32::MAX; // u32::MAX = inserting at head
+        let mut cur = head;
+        while cur != u32::MAX {
+            let ct = unsafe { thread_mut_from_ref(cur) };
+            if ct.sleep_deadline_ns > deadline_ns {
+                break;
+            }
+            prev = cur;
+            cur = ct.sleep_next;
         }
-        prev = cur;
-        cur = ct.sleep_next;
+
+        let t = unsafe { thread_mut_from_ref(tid) };
+        t.sleep_next = cur;
+
+        if prev == u32::MAX {
+            // Insert at head.
+            SLEEP_QUEUE_HEAD.store(tid, Ordering::Release);
+            inserted_at_head = true;
+        } else {
+            let pt = unsafe { thread_mut_from_ref(prev) };
+            pt.sleep_next = tid;
+            inserted_at_head = false;
+        }
     }
 
-    let t = unsafe { thread_mut_from_ref(tid) };
-    t.sleep_next = cur;
-
-    if prev == u32::MAX {
-        // Insert at head.
-        SLEEP_QUEUE_HEAD.store(tid, Ordering::Release);
-    } else {
-        let pt = unsafe { thread_mut_from_ref(prev) };
-        pt.sleep_next = tid;
+    // If the new deadline is the earliest (inserted at head), reprogram the
+    // local CPU's timer so we don't oversleep.
+    if inserted_at_head {
+        crate::arch::timer::program_oneshot_ns(deadline_ns);
     }
 }
 
@@ -4131,23 +4211,35 @@ fn check_alarm_timers() {
     let now_ns = get_monotonic_ns();
     let mut fired = [0u32; 64];
     let mut count = 0usize;
+    let mut next_earliest: u64 = 0;
 
     // Lock-free: alarm fields are only written by the owning task (alarm())
     // or by this tick path; no concurrent mutation.
     SCHED_TASK_ART.for_each(|_key, val| {
         let task = unsafe { &mut *(val as *mut Task) };
-        if task.active && task.alarm_deadline_ns != 0 && task.alarm_deadline_ns <= now_ns {
-            if task.alarm_interval_ns != 0 {
-                task.alarm_deadline_ns = now_ns + task.alarm_interval_ns;
-            } else {
-                task.alarm_deadline_ns = 0;
+        if task.active && task.alarm_deadline_ns != 0 {
+            if task.alarm_deadline_ns <= now_ns {
+                if task.alarm_interval_ns != 0 {
+                    task.alarm_deadline_ns = now_ns + task.alarm_interval_ns;
+                } else {
+                    task.alarm_deadline_ns = 0;
+                }
+                if count < 64 {
+                    fired[count] = task.id;
+                    count += 1;
+                }
             }
-            if count < 64 {
-                fired[count] = task.id;
-                count += 1;
+            // Track the next earliest alarm (including rearmed ones).
+            if task.alarm_deadline_ns != 0 {
+                if next_earliest == 0 || task.alarm_deadline_ns < next_earliest {
+                    next_earliest = task.alarm_deadline_ns;
+                }
             }
         }
     });
+
+    // Update the cached earliest alarm deadline.
+    EARLIEST_ALARM_NS.store(next_earliest, Ordering::Relaxed);
 
     for i in 0..count {
         send_signal_to_task(fired[i], super::task::SIGALRM);
@@ -4161,33 +4253,40 @@ fn check_interval_timers() {
     let mut fired_sig: u32 = 0;
     let mut fired_interval: u64 = 0;
     let mut found = false;
+    let mut next_earliest: u64 = 0;
 
     // Lock-free: timer fields are only written by the owning thread
     // (sys_timer_create) or by this tick path.
     SCHED_THREAD_ART.for_each(|key, val| {
-        if found {
-            return;
-        }
         let t = unsafe { &*(val as *const Thread) };
         if t.state != ThreadState::Dead
             && t.stack_base != 0
             && t.timer_signal != 0
             && t.timer_next_ns != 0
-            && now_ns >= t.timer_next_ns
         {
-            fired_tid = key as ThreadId;
-            fired_sig = t.timer_signal;
-            fired_interval = t.timer_interval_ns;
-            // Re-arm the timer while we have the pointer.
-            let t_mut = unsafe { &mut *(val as *mut Thread) };
-            t_mut.timer_next_ns = if fired_interval != 0 {
-                now_ns + fired_interval
-            } else {
-                0
-            };
-            found = true;
+            if !found && now_ns >= t.timer_next_ns {
+                fired_tid = key as ThreadId;
+                fired_sig = t.timer_signal;
+                fired_interval = t.timer_interval_ns;
+                // Re-arm the timer while we have the pointer.
+                let t_mut = unsafe { &mut *(val as *mut Thread) };
+                t_mut.timer_next_ns = if fired_interval != 0 {
+                    now_ns + fired_interval
+                } else {
+                    0
+                };
+                found = true;
+            }
+            // Track the next earliest interval timer (including rearmed).
+            let next = unsafe { &*(val as *const Thread) }.timer_next_ns;
+            if next != 0 && (next_earliest == 0 || next < next_earliest) {
+                next_earliest = next;
+            }
         }
     });
+
+    // Update the cached earliest interval timer deadline.
+    EARLIEST_INTERVAL_NS.store(next_earliest, Ordering::Relaxed);
 
     if found {
         send_signal_to_thread(fired_tid, fired_sig);
@@ -4288,8 +4387,15 @@ pub fn alarm(initial_ns: u64, interval_ns: u64) -> u64 {
         task.alarm_deadline_ns = 0;
         task.alarm_interval_ns = 0;
     } else {
-        task.alarm_deadline_ns = now + initial_ns;
+        let deadline = now + initial_ns;
+        task.alarm_deadline_ns = deadline;
         task.alarm_interval_ns = interval_ns;
+        // If this alarm is earlier than the cached earliest, update and reprogram.
+        let cached = EARLIEST_ALARM_NS.load(Ordering::Relaxed);
+        if cached == 0 || deadline < cached {
+            EARLIEST_ALARM_NS.store(deadline, Ordering::Relaxed);
+            crate::arch::timer::program_oneshot_ns(deadline);
+        }
     }
     prev_remaining
 }

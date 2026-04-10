@@ -131,6 +131,10 @@ pub fn kmain() -> ! {
     // Priority 60 is lower than spawned servers (50) so they can run during waits.
     sched::spawn(startup_thread, 60, 20).expect("spawn startup");
 
+    // Arm the first one-shot timer so the scheduler can preempt the idle loop.
+    let first_tick = arch::timer::monotonic_ns() + 10_000_000; // 10ms
+    arch::timer::program_oneshot_ns(first_tick);
+
     println!("Enabling interrupts");
     arch::platform::enable_interrupts();
 

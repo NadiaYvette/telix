@@ -216,7 +216,7 @@ extern "C" fn ap_rust_entry(cpu_id: u32) {
     // Load the IDT (shared with BSP — it's at a fixed address).
     super::idt::load();
 
-    // Set up LAPIC timer for this CPU.
+    // Set up LAPIC timer for this CPU (one-shot mode).
     super::lapic::setup_timer();
 
     // Register with the scheduler.
@@ -227,6 +227,10 @@ extern "C" fn ap_rust_entry(cpu_id: u32) {
     AP_READY_COUNT.fetch_add(1, Ordering::Release);
 
     crate::println!("  CPU {} online (LAPIC ID {})", cpu_id, super::lapic::id());
+
+    // Arm the first one-shot timer for this CPU before entering idle.
+    let first_tick = crate::arch::timer::monotonic_ns() + 10_000_000;
+    crate::arch::timer::program_oneshot_ns(first_tick);
 
     // Enable interrupts and idle.
     unsafe {

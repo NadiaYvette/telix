@@ -165,14 +165,20 @@ fn handle_external_irq() {
     super::plic::complete(hart, irq);
 }
 
-/// Handle timer interrupt: reset the timer and increment tick count.
+/// Handle timer interrupt: increment tick count. Timer is NOT rearmed here;
+/// the scheduler calls `program_oneshot()` after processing the tick.
 fn handle_timer_irq() {
     let _ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+}
 
-    // Rearm the timer.
-    let interval = TIMER_INTERVAL.load(Ordering::Relaxed);
+/// Program the timer to fire at `deadline_ns` nanoseconds since boot.
+pub fn program_oneshot(deadline_ns: u64) {
+    let fw_freq = crate::firmware::timebase_freq();
+    let freq = if fw_freq != 0 { fw_freq } else { 10_000_000 } as u128;
+    let ticks = ((deadline_ns as u128 * freq) / 1_000_000_000u128) as u64;
     let now = read_time();
-    sbi_set_timer(now + interval);
+    let deadline = if ticks > now { ticks } else { now + 1 };
+    sbi_set_timer(deadline);
 }
 
 /// Main Rust trap handler. Called from vectors.S with current SP as argument.

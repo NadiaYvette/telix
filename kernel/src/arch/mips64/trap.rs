@@ -129,25 +129,28 @@ pub fn enable_interrupts() {
     }
 }
 
-/// Handle timer interrupt: reset the timer and increment tick count.
-///
-/// If Count has advanced past Compare by multiple intervals (common after
-/// boot when interrupts were disabled), skip ahead to avoid a storm of
-/// rapid back-to-back timer interrupts that burn through thread quantum
-/// without giving threads time to execute.
+/// Handle timer interrupt: increment tick count. Timer is NOT rearmed here;
+/// the scheduler calls `program_oneshot()` after processing the tick.
 fn handle_timer_irq() {
     let _ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-
-    let interval = TIMER_INTERVAL.load(Ordering::Relaxed);
+    // Clear the timer interrupt by writing a far-future Compare value.
+    // This prevents immediate re-fire before the scheduler reprograms.
     let now = read_count();
-    let mut next = read_compare().wrapping_add(interval);
-    // Skip ahead if Compare is still in the past.
-    // Use signed comparison to handle 32-bit counter wraparound correctly:
-    // if (next - now) is negative (as i32), next is in the past.
-    while (next.wrapping_sub(now) as i32) <= 0 {
-        next = next.wrapping_add(interval);
-    }
-    write_compare(next);
+    write_compare(now.wrapping_add(0x7FFF_FFFF));
+}
+
+/// Program the timer to fire at `deadline_ns` nanoseconds since boot.
+/// CP0.Compare is 32-bit; cap at ~30 seconds to avoid wrap issues.
+pub fn program_oneshot(deadline_ns: u64) {
+    let now_ns = crate::arch::timer::monotonic_ns();
+    let delta_ns = deadline_ns.saturating_sub(now_ns);
+    // Cap at 30 seconds (3 billion ticks at 100 MHz wraps 32-bit counter).
+    let delta_ns = delta_ns.min(30_000_000_000);
+    let freq: u128 = 100_000_000;
+    let ticks = ((delta_ns as u128 * freq) / 1_000_000_000u128) as u32;
+    let ticks = ticks.max(1);
+    let now = read_count();
+    write_compare(now.wrapping_add(ticks));
 }
 
 /// Main Rust trap handler. Called from vectors.S with current SP as argument.

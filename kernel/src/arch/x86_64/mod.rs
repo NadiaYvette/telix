@@ -18,13 +18,16 @@ global_asm!(include_str!("vectors.S"));
 global_asm!(include_str!("ap_trampoline.S"));
 global_asm!(include_str!("usertest.S"));
 
-/// Platform init: GDT, IDT, PIC, PIT timer, LAPIC.
+/// Platform init: GDT, IDT, PIC, PIT (for calibration), LAPIC one-shot timer.
 pub fn init() {
     gdt::init();
     idt::init();
     pic::init();
-    timer::init();
+    timer::init();        // PIT fires for LAPIC calibration reference
     lapic::init_bsp();
+    lapic::calibrate_timer();
+    lapic::setup_timer(); // LAPIC one-shot mode, vector 32
+    pic::mask(0);         // Mask PIT IRQ 0 — LAPIC timer takes over
 }
 
 /// Parse firmware tables (Multiboot memory map + ACPI MADT).

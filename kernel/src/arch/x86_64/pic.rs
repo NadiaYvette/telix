@@ -105,6 +105,19 @@ pub fn unmask(irq: u8) {
     }
 }
 
+/// Mask a specific IRQ line.
+pub fn mask(irq: u8) {
+    unsafe {
+        if irq < 8 {
+            let m = inb(PIC1_DATA) | (1 << irq);
+            outb(PIC1_DATA, m);
+        } else {
+            let m = inb(PIC2_DATA) | (1 << (irq - 8));
+            outb(PIC2_DATA, m);
+        }
+    }
+}
+
 /// Send End-of-Interrupt for the given IRQ.
 pub fn send_eoi(irq: u8) {
     unsafe {
