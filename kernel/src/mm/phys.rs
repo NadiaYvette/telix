@@ -691,8 +691,13 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
 
 /// Allocate a single page. Returns its physical address.
 pub fn alloc_page() -> Option<PhysAddr> {
-    if ALLOC.free_count_global.load(Ordering::Relaxed) == 0 {
+    let free = ALLOC.free_count_global.load(Ordering::Relaxed);
+    if free == 0 {
         return None;
+    }
+    // Wake kswapd if memory is getting low.
+    if free < ALLOC.total_pages >> super::kswapd::LOW_WATERMARK_SHIFT {
+        super::kswapd::wake_if_needed();
     }
 
     let cpu = my_cpu();

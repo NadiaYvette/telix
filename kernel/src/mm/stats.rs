@@ -22,6 +22,8 @@ pub static POOL_ALLOCS: AtomicU64 = AtomicU64::new(0);
 pub static POOL_CREATES: AtomicU64 = AtomicU64::new(0);
 pub static PT_TABLES_SHARED: AtomicU64 = AtomicU64::new(0);
 pub static PT_COW_BREAKS: AtomicU64 = AtomicU64::new(0);
+pub static KSWAPD_SCANS: AtomicU64 = AtomicU64::new(0);
+pub static KSWAPD_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 
 pub fn print() {
     crate::println!("  VM stats:");
@@ -101,5 +103,13 @@ pub fn print() {
     crate::println!(
         "    PT COW breaks:    {}",
         PT_COW_BREAKS.load(Ordering::Relaxed)
+    );
+    crate::println!(
+        "    kswapd scans:  {}",
+        KSWAPD_SCANS.load(Ordering::Relaxed)
+    );
+    crate::println!(
+        "    kswapd reclaimed: {}",
+        KSWAPD_RECLAIMED.load(Ordering::Relaxed)
     );
 }

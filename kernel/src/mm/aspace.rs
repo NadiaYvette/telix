@@ -17,10 +17,71 @@ use super::vma::{Vma, VmaProt};
 use super::vmatree::{VmaCursor, VmaTree};
 use crate::mm::slab;
 use crate::sync::SpinLock;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Slab size for ASpaceEntry allocations.
 const ASPACE_SLAB_SIZE: usize = 128;
+
+// ---------------------------------------------------------------------------
+// Active aspace registry — used by kswapd to enumerate scan targets
+// ---------------------------------------------------------------------------
+
+/// Maximum concurrent address spaces tracked for kswapd scanning.
+const MAX_ACTIVE_ASPACES: usize = 256;
+
+/// Registry of active address space IDs. Slot value 0 = empty.
+static ACTIVE_ASPACES: [AtomicU64; MAX_ACTIVE_ASPACES] = {
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    [ZERO; MAX_ACTIVE_ASPACES]
+};
+
+/// Register an aspace ID in the active registry.
+fn registry_add(id: ASpaceId) {
+    for slot in ACTIVE_ASPACES.iter() {
+        if slot.compare_exchange(0, id, Ordering::Release, Ordering::Relaxed).is_ok() {
+            return;
+        }
+    }
+    // Registry full — kswapd just won't scan this aspace. Not fatal.
+}
+
+/// Remove an aspace ID from the active registry.
+fn registry_remove(id: ASpaceId) {
+    for slot in ACTIVE_ASPACES.iter() {
+        if slot.compare_exchange(id, 0, Ordering::Release, Ordering::Relaxed).is_ok() {
+            return;
+        }
+    }
+}
+
+/// Snapshot of active aspace IDs, returned on the stack.
+pub struct ASpaceIdList {
+    pub ids: [ASpaceId; MAX_ACTIVE_ASPACES],
+    pub len: usize,
+}
+
+impl ASpaceIdList {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Return a snapshot of all active aspace IDs (for kswapd iteration).
+pub fn active_aspace_ids() -> ASpaceIdList {
+    let mut list = ASpaceIdList {
+        ids: [0; MAX_ACTIVE_ASPACES],
+        len: 0,
+    };
+    for slot in ACTIVE_ASPACES.iter() {
+        let id = slot.load(Ordering::Acquire);
+        if id != 0 {
+            list.ids[list.len] = id;
+            list.len += 1;
+        }
+    }
+    list
+}
 
 /// Address space ID type — a kernel-held port ID (u64).
 /// Value 0 means "no address space" (kernel task).
@@ -320,6 +381,7 @@ pub fn create(page_table_root: usize) -> Option<ASpaceId> {
     }
 
     let _ = seq; // debug sequence number, unused for now
+    registry_add(port_id);
     Some(port_id)
 }
 
@@ -327,6 +389,8 @@ pub fn create(page_table_root: usize) -> Option<ASpaceId> {
 /// The caller must have already switched to the boot page table if this
 /// aspace was active on the current CPU.
 pub fn destroy(id: ASpaceId) {
+    registry_remove(id);
+
     // Step 1: Resolve entry pointer.
     let entry_ptr = match resolve_entry(id) {
         Some(p) => p as *mut ASpaceEntry,

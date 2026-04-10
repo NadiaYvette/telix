@@ -7,6 +7,7 @@ pub mod hat;
 pub mod radix_pt;
 
 pub mod grant;
+pub mod kswapd;
 pub mod object;
 pub mod page;
 pub mod paged_array;

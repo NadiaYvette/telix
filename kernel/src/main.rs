@@ -118,6 +118,9 @@ pub fn kmain() -> ! {
     // Background page pre-zeroing daemon.
     sched::spawn(mm::zeropool::zero_daemon, 1, 5).expect("spawn zero_daemon");
 
+    // Background page reclaim daemon (kswapd).
+    sched::spawn(mm::kswapd::kswapd, 200, 10).expect("spawn kswapd");
+
     // Phase 2: Demand-paging test.
     println!("Testing demand-paged memory...");
     test_demand_paging();
