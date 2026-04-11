@@ -114,7 +114,7 @@ static EARLIEST_ALARM_NS: AtomicU64 = AtomicU64::new(0);
 static EARLIEST_INTERVAL_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum idle duration (1 second). Prevents unbounded sleep in case of stale caches.
-const MAX_IDLE_NS: u64 = 50_000_000; // 50ms — bounds cross-CPU wake latency without IPI
+const MAX_IDLE_NS: u64 = 10_000_000; // 10ms — one tick interval, matches TICK_INTERVAL_NS
 
 /// Get a thread reference by ID via radix lookup (lockless).
 #[inline]
