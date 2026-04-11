@@ -193,12 +193,12 @@ pub fn forward_to_server(
 
     // Save the exception frame pointer into personality_frame_sp so the
     // personality server can read it reliably (for personality_read_args,
-    // personality_copy_in/out, personality_fork). We cannot use saved_sp
-    // because block_current's spin-wait gets preempted by the scheduler,
-    // which overwrites saved_sp with the kernel context (not the exception frame).
+    // personality_copy_in/out, personality_fork). We read from the per-thread
+    // syscall_frame_sp (set by store_frame_sp before IRQs were enabled)
+    // rather than the per-CPU slot, which may have been overwritten if a
+    // timer preempted us and another thread ran on our original CPU.
     {
-        let cpu = crate::sched::smp::cpu_id() as usize;
-        let frame_sp = crate::sched::scheduler::read_frame_sp(cpu);
+        let frame_sp = unsafe { crate::sched::scheduler::thread_mut_from_ref(tid) }.syscall_frame_sp;
         unsafe { crate::sched::scheduler::thread_mut_from_ref(tid) }.personality_frame_sp = frame_sp;
     }
 
