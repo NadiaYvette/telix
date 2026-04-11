@@ -190,7 +190,8 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             frame.epc += 4;
 
             // Clear EXL and KSU to leave exception context (stay in kernel
-            // mode with IRQs disabled). IE stays cleared for non-preemptive dispatch.
+            // mode with IRQs masked). EXL must be cleared before enabling
+            // interrupts so nested exceptions use the correct handler path.
             unsafe {
                 core::arch::asm!(
                     "di",                            // clear IE first
@@ -204,7 +205,9 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             }
 
             crate::sched::scheduler::store_frame_sp(frame_sp);
+            crate::arch::irq::enable();
             crate::syscall::dispatch(frame);
+            let _ = crate::arch::irq::disable();
             crate::sched::scheduler::check_preempt_on_return();
             let pending = crate::sched::scheduler::take_pending_switch();
             if pending != 0 {

@@ -47,7 +47,9 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
         0x15 => {
             // SVC from AArch64. Dispatch syscall.
             crate::sched::scheduler::store_frame_sp(frame_sp);
+            crate::arch::irq::enable();
             crate::syscall::dispatch(frame);
+            let _ = crate::arch::irq::disable();
             crate::sched::scheduler::check_preempt_on_return();
             let pending = crate::sched::scheduler::take_pending_switch();
             if pending != 0 {
@@ -171,7 +173,9 @@ extern "C" fn exception_sync_el0(frame_sp: u64) -> u64 {
         0x15 => {
             // SVC from AArch64 EL0.
             crate::sched::scheduler::store_frame_sp(frame_sp);
+            crate::arch::irq::enable();
             crate::syscall::dispatch(frame);
+            let _ = crate::arch::irq::disable();
             crate::sched::scheduler::check_preempt_on_return();
             let pending = crate::sched::scheduler::take_pending_switch();
             if pending != 0 {

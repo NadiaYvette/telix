@@ -177,7 +177,9 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                     // the instruction after it.
                     frame.set_rip(frame.rip() + 2);
                     crate::sched::scheduler::store_frame_sp(frame_sp);
+                    crate::arch::irq::enable();
                     crate::syscall::dispatch(frame);
+                    let _ = crate::arch::irq::disable();
                     crate::sched::scheduler::check_preempt_on_return();
                     let pending = crate::sched::scheduler::take_pending_switch();
                     if pending != 0 {
@@ -213,7 +215,9 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         // Syscall via int 0x80.
         0x80 => {
             crate::sched::scheduler::store_frame_sp(frame_sp);
+            crate::arch::irq::enable();
             crate::syscall::dispatch(frame);
+            let _ = crate::arch::irq::disable();
             crate::sched::scheduler::check_preempt_on_return();
             let pending = crate::sched::scheduler::take_pending_switch();
             if pending != 0 {

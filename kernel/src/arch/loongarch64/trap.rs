@@ -212,7 +212,9 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             // Syscall — advance ERA past the syscall instruction (4 bytes).
             frame.era += 4;
             crate::sched::scheduler::store_frame_sp(frame_sp);
+            crate::arch::irq::enable();
             crate::syscall::dispatch(frame);
+            let _ = crate::arch::irq::disable();
             crate::sched::scheduler::check_preempt_on_return();
             let pending = crate::sched::scheduler::take_pending_switch();
             if pending != 0 {
