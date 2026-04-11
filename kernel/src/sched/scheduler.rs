@@ -4422,6 +4422,12 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     let next_sp = next_t.saved_sp;
 
+    // Reprogram the one-shot timer so this CPU wakes at the sleep deadline.
+    // Without this, the dynamic tick may have the timer set far in the future
+    // (up to MAX_IDLE_NS = 1s), causing the sleep to overshoot its deadline.
+    // Done here with IRQs disabled so the timer cannot fire before the switch.
+    crate::arch::timer::program_oneshot_ns(deadline_ns);
+
     // Store pending_switch before restoring IRQs — see park_current_for_ipc.
     pending_switch_sp()[cpu].store(next_sp, Ordering::Release);
 

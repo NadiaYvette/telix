@@ -9691,9 +9691,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // --- Phase 126: Linux personality directory operations ---
-    // NOTE: Still hangs — VFS mkdir from personality tasks deadlocks on REPLY_PORT.
-    syscall::debug_puts(b"Phase 126 linux dir ops: SKIPPED (known hang)\n");
-    if false {
     syscall::debug_puts(b"  init: Phase 126 linux dir ops...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
@@ -9813,7 +9810,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             syscall::debug_puts(b"Phase 126 linux dir ops: SKIPPED (linux_srv not found)\n");
         }
-    }
     }
 
     // --- Phase 127: Linux personality syscall coverage ---
