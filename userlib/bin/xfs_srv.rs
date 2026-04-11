@@ -52,7 +52,6 @@ const FS_SYMLINK_OK: u64 = 0x2C01;
 const FS_READLINK: u64 = 0x2C10;
 const FS_READLINK_OK: u64 = 0x2C11;
 const FS_LINK: u64 = 0x2C20;
-#[allow(dead_code)]
 const FS_LINK_OK: u64 = 0x2C21;
 const FS_RENAME: u64 = 0x2C30;
 const FS_RENAME_OK: u64 = 0x2C31;
@@ -66,7 +65,6 @@ const FS_MKNOD: u64 = 0x2D40;
 const FS_ERROR: u64 = 0x2F00;
 
 const ERR_NOT_FOUND: u64 = 1;
-#[allow(dead_code)]
 const ERR_IO: u64 = 2;
 const ERR_INVALID: u64 = 3;
 
@@ -190,13 +188,11 @@ fn read_be64(buf: &[u8], off: usize) -> u64 {
         | (buf[off + 7] as u64)
 }
 
-#[allow(dead_code)]
 fn write_be16(buf: &mut [u8], off: usize, val: u16) {
     buf[off] = (val >> 8) as u8;
     buf[off + 1] = val as u8;
 }
 
-#[allow(dead_code)]
 fn write_be32(buf: &mut [u8], off: usize, val: u32) {
     buf[off] = (val >> 24) as u8;
     buf[off + 1] = (val >> 16) as u8;
@@ -204,7 +200,6 @@ fn write_be32(buf: &mut [u8], off: usize, val: u32) {
     buf[off + 3] = val as u8;
 }
 
-#[allow(dead_code)]
 fn write_be64(buf: &mut [u8], off: usize, val: u64) {
     buf[off] = (val >> 56) as u8;
     buf[off + 1] = (val >> 48) as u8;
@@ -523,7 +518,6 @@ impl BlkClient {
     }
 
     /// Write a full block from memory at `src` VA.
-    #[allow(dead_code)]
     fn write_block(&self, block_num: u64, block_size: u32, src: usize) -> bool {
         let byte_off = block_num * (block_size as u64);
         let abs_off = self.partition_offset + byte_off;
@@ -561,6 +555,72 @@ impl BlkClient {
             }
         }
         true
+    }
+
+    /// Read-modify-write: patch `data` at byte offset `off` (partition-relative)
+    /// within a single 512-byte sector.
+    fn write_bytes(&self, off: u64, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return true;
+        }
+        let abs_off = self.partition_offset + off;
+        let sector_byte = (abs_off / 512) * 512;
+        let ofs = (abs_off % 512) as usize;
+        if ofs + data.len() > 512 {
+            return false;
+        }
+
+        // Read the sector.
+        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
+            return false;
+        }
+        let d2 = 512u64 | ((self.reply_port as u64) << 32);
+        syscall::send(
+            self.blk_port,
+            IO_READ,
+            0,
+            sector_byte,
+            d2,
+            self.grant_va as u64,
+        );
+        let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
+            rr.tag == IO_READ_OK && rr.data[0] == 512
+        } else {
+            false
+        };
+        syscall::revoke(self.blk_aspace, self.grant_va);
+        if !ok {
+            return false;
+        }
+
+        // Patch bytes in scratch_va.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                (self.scratch_va + ofs) as *mut u8,
+                data.len(),
+            );
+        }
+
+        // Write sector back.
+        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
+            return false;
+        }
+        syscall::send(
+            self.blk_port,
+            IO_WRITE,
+            0,
+            sector_byte,
+            d2,
+            self.grant_va as u64,
+        );
+        let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
+            rr.tag == IO_WRITE_OK
+        } else {
+            false
+        };
+        syscall::revoke(self.blk_aspace, self.grant_va);
+        ok
     }
 }
 
@@ -1502,6 +1562,958 @@ fn read_symlink_target(
 }
 
 // =====================================================================
+// Write infrastructure (Phase C)
+// =====================================================================
+
+/// v5 short-form B+tree block header size (bnobt, cntbt, inobt).
+const AG_BT_HDR_V5: usize = 56;
+
+/// Scratch page for write operations (set in main).
+static mut WRITE_VA: usize = 0;
+
+/// Invalidate all cache entries for a given block.
+fn cache_invalidate(block_num: u64) {
+    unsafe {
+        for i in 0..CACHE_SLOTS {
+            if CACHE_META[i].valid && CACHE_META[i].block_num == block_num {
+                CACHE_META[i].valid = false;
+            }
+        }
+    }
+}
+
+/// Encode an Extent into a 16-byte big-endian packed record.
+fn encode_extent(ext: &Extent) -> [u8; 16] {
+    let l0: u64 =
+        ((ext.file_off & 0x003F_FFFF_FFFF_FFFF) << 9) | ((ext.disk_blk >> 43) & 0x1FF);
+    let l1: u64 =
+        ((ext.disk_blk & 0x7FF_FFFF_FFFF) << 21) | (ext.count as u64 & 0x001F_FFFF);
+    let mut out = [0u8; 16];
+    write_be64(&mut out, 0, l0);
+    write_be64(&mut out, 8, l1);
+    out
+}
+
+/// Write an XfsInode's metadata and data fork back to disk (read-modify-write).
+fn write_inode(blk: &BlkClient, sb: &XfsSb, inode: &XfsInode) -> bool {
+    let block = ino_abs_block(inode.ino, sb);
+    let off_in_blk = (ino_offset(inode.ino, sb) as usize) * (sb.inode_size as usize);
+    let wva = unsafe { WRITE_VA };
+
+    if !blk.read_block(block, sb.block_size, wva) {
+        return false;
+    }
+
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(
+            (wva + off_in_blk) as *mut u8,
+            sb.inode_size as usize,
+        )
+    };
+
+    // Patch inode core fields.
+    write_be16(buf, 2, inode.mode);
+    buf[5] = inode.format;
+    write_be32(buf, 8, inode.uid);
+    write_be32(buf, 12, inode.gid);
+    write_be32(buf, 16, inode.nlink);
+    write_be64(buf, 56, inode.size);
+    write_be64(buf, 64, inode.nblocks);
+    buf[82] = inode.forkoff;
+
+    // Handle nextents (NREXT64-aware).
+    let version = buf[4];
+    let flags2 = if version >= 3 {
+        read_be64(buf, 120)
+    } else {
+        0
+    };
+    if (flags2 & (1 << 4)) != 0 {
+        write_be64(buf, 24, inode.nextents as u64);
+    } else {
+        write_be32(buf, 76, inode.nextents);
+    }
+
+    // Write data fork.
+    let core_size: usize = if version >= 3 { 176 } else { 100 };
+    if inode.dfork_len > 0 && core_size + inode.dfork_len <= sb.inode_size as usize {
+        buf[core_size..core_size + inode.dfork_len]
+            .copy_from_slice(&inode.dfork[..inode.dfork_len]);
+    }
+
+    cache_invalidate(block);
+    blk.write_block(block, sb.block_size, wva)
+}
+
+/// Patch a u32 field in the AGF on disk.
+fn write_agf_u32(blk: &BlkClient, sb: &XfsSb, ag: u32, field_off: usize, val: u32) -> bool {
+    let ag_start = (ag as u64) * (sb.ag_blocks as u64) * (sb.block_size as u64);
+    let agf_off = ag_start + (sb.sect_size as u64);
+    let mut d = [0u8; 4];
+    write_be32(&mut d, 0, val);
+    blk.write_bytes(agf_off + field_off as u64, &d)
+}
+
+/// Patch a u32 field in the AGI on disk.
+fn write_agi_u32(blk: &BlkClient, sb: &XfsSb, ag: u32, field_off: usize, val: u32) -> bool {
+    let ag_start = (ag as u64) * (sb.ag_blocks as u64) * (sb.block_size as u64);
+    let agi_off = ag_start + 2 * (sb.sect_size as u64);
+    let mut d = [0u8; 4];
+    write_be32(&mut d, 0, val);
+    blk.write_bytes(agi_off + field_off as u64, &d)
+}
+
+/// Flush the in-memory AGF to disk.
+fn flush_agf(blk: &BlkClient, sb: &XfsSb, ag: u32) -> bool {
+    let agf = unsafe { &AG_F[ag as usize] };
+    write_agf_u32(blk, sb, ag, 20, agf.bnoroot)
+        && write_agf_u32(blk, sb, ag, 24, agf.cntroot)
+        && write_agf_u32(blk, sb, ag, 28, agf.bno_level)
+        && write_agf_u32(blk, sb, ag, 32, agf.cnt_level)
+        && write_agf_u32(blk, sb, ag, 48, agf.freeblks)
+        && write_agf_u32(blk, sb, ag, 52, agf.longest)
+}
+
+/// Flush the in-memory AGI to disk.
+fn flush_agi(blk: &BlkClient, sb: &XfsSb, ag: u32) -> bool {
+    let agi = unsafe { &AG_I[ag as usize] };
+    write_agi_u32(blk, sb, ag, 16, agi.count)
+        && write_agi_u32(blk, sb, ag, 28, agi.freecount)
+}
+
+/// Allocate `count` contiguous blocks. Returns absolute block number.
+fn alloc_blocks(blk: &BlkClient, sb: &XfsSb, count: u32) -> Option<u64> {
+    let n_ag = (sb.ag_count as usize).min(MAX_AG);
+    let wva = unsafe { WRITE_VA };
+
+    for ag in 0..n_ag {
+        let agf = unsafe { &mut AG_F[ag] };
+        if agf.freeblks < count {
+            continue;
+        }
+
+        let ag_start = (ag as u64) * (sb.ag_blocks as u64);
+
+        // Walk bnobt to leaf level.
+        let mut cur_agbno = agf.bnoroot;
+        let mut depth = 0u32;
+        loop {
+            let abs_blk = ag_start + (cur_agbno as u64);
+            if !blk.read_block(abs_blk, sb.block_size, wva) {
+                break;
+            }
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(wva as *mut u8, sb.block_size as usize)
+            };
+
+            let level = read_be16(buf, 4);
+            let numrecs = read_be16(buf, 6) as usize;
+
+            if level > 0 {
+                // Internal node: descend to leftmost child.
+                if numrecs == 0 {
+                    break;
+                }
+                // bnobt keys are 8 bytes each, pointers are 4 bytes each.
+                let ptr_off = AG_BT_HDR_V5 + numrecs * 8;
+                if ptr_off + 4 > sb.block_size as usize {
+                    break;
+                }
+                cur_agbno = read_be32(buf, ptr_off);
+                depth += 1;
+                if depth > 10 {
+                    break;
+                }
+                continue;
+            }
+
+            // Leaf level: scan for a free extent with blockcount >= count.
+            for i in 0..numrecs {
+                let rec_off = AG_BT_HDR_V5 + i * 8;
+                let startblock = read_be32(buf, rec_off);
+                let blockcount = read_be32(buf, rec_off + 4);
+
+                if blockcount >= count {
+                    let alloc_start = startblock;
+
+                    if blockcount == count {
+                        // Remove record: shift remaining left.
+                        for j in i..numrecs - 1 {
+                            let src_off = AG_BT_HDR_V5 + (j + 1) * 8;
+                            let dst_off = AG_BT_HDR_V5 + j * 8;
+                            let s = read_be32(buf, src_off);
+                            let c = read_be32(buf, src_off + 4);
+                            write_be32(buf, dst_off, s);
+                            write_be32(buf, dst_off + 4, c);
+                        }
+                        write_be16(buf, 6, (numrecs - 1) as u16);
+                    } else {
+                        write_be32(buf, rec_off, startblock + count);
+                        write_be32(buf, rec_off + 4, blockcount - count);
+                    }
+
+                    // Write leaf block back.
+                    cache_invalidate(abs_blk);
+                    if !blk.write_block(abs_blk, sb.block_size, wva) {
+                        return None;
+                    }
+
+                    // Update AGF.
+                    agf.freeblks -= count;
+                    if blockcount == agf.longest {
+                        // Recompute longest from this leaf.
+                        let nr = read_be16(buf, 6) as usize;
+                        let mut ml = 0u32;
+                        for j in 0..nr {
+                            let c = read_be32(buf, AG_BT_HDR_V5 + j * 8 + 4);
+                            if c > ml {
+                                ml = c;
+                            }
+                        }
+                        agf.longest = ml;
+                    }
+                    flush_agf(blk, sb, ag as u32);
+
+                    return Some(ag_start + alloc_start as u64);
+                }
+            }
+            break;
+        }
+    }
+    None
+}
+
+/// Free `count` blocks starting at `abs_blk` back to AG free space.
+fn free_blocks(blk: &BlkClient, sb: &XfsSb, abs_blk: u64, count: u32) {
+    let ag = (abs_blk / (sb.ag_blocks as u64)) as usize;
+    if ag >= (sb.ag_count as usize).min(MAX_AG) {
+        return;
+    }
+    let ag_start = (ag as u64) * (sb.ag_blocks as u64);
+    let agbno = (abs_blk - ag_start) as u32;
+    let agf = unsafe { &mut AG_F[ag] };
+    let wva = unsafe { WRITE_VA };
+
+    // Walk bnobt to leaf.
+    let mut cur_agbno = agf.bnoroot;
+    let mut depth = 0u32;
+    loop {
+        let blk_abs = ag_start + (cur_agbno as u64);
+        if !blk.read_block(blk_abs, sb.block_size, wva) {
+            return;
+        }
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(wva as *mut u8, sb.block_size as usize)
+        };
+        let level = read_be16(buf, 4);
+        let numrecs = read_be16(buf, 6) as usize;
+
+        if level > 0 {
+            if numrecs == 0 {
+                return;
+            }
+            let mut child_idx = 0usize;
+            for i in 1..numrecs {
+                let key_start = read_be32(buf, AG_BT_HDR_V5 + i * 8);
+                if agbno < key_start {
+                    break;
+                }
+                child_idx = i;
+            }
+            let ptr_off = AG_BT_HDR_V5 + numrecs * 8 + child_idx * 4;
+            if ptr_off + 4 > sb.block_size as usize {
+                return;
+            }
+            cur_agbno = read_be32(buf, ptr_off);
+            depth += 1;
+            if depth > 10 {
+                return;
+            }
+            continue;
+        }
+
+        // Leaf: insert sorted by startblock, merging with neighbours.
+        let mut ins_idx = numrecs;
+        for i in 0..numrecs {
+            let s = read_be32(buf, AG_BT_HDR_V5 + i * 8);
+            if agbno < s {
+                ins_idx = i;
+                break;
+            }
+        }
+
+        // Try merge with previous record.
+        let mut merged = false;
+        if ins_idx > 0 {
+            let prev_off = AG_BT_HDR_V5 + (ins_idx - 1) * 8;
+            let prev_start = read_be32(buf, prev_off);
+            let prev_count = read_be32(buf, prev_off + 4);
+            if prev_start + prev_count == agbno {
+                let new_count = prev_count + count;
+                write_be32(buf, prev_off + 4, new_count);
+                // Also merge with next?
+                if ins_idx < numrecs {
+                    let next_off = AG_BT_HDR_V5 + ins_idx * 8;
+                    let next_start = read_be32(buf, next_off);
+                    if agbno + count == next_start {
+                        let next_count = read_be32(buf, next_off + 4);
+                        write_be32(buf, prev_off + 4, new_count + next_count);
+                        // Remove next record.
+                        for j in ins_idx..numrecs - 1 {
+                            let src = AG_BT_HDR_V5 + (j + 1) * 8;
+                            let dst = AG_BT_HDR_V5 + j * 8;
+                            write_be32(buf, dst, read_be32(buf, src));
+                            write_be32(buf, dst + 4, read_be32(buf, src + 4));
+                        }
+                        write_be16(buf, 6, (numrecs - 1) as u16);
+                    }
+                }
+                merged = true;
+            }
+        }
+        if !merged && ins_idx < numrecs {
+            let next_off = AG_BT_HDR_V5 + ins_idx * 8;
+            let next_start = read_be32(buf, next_off);
+            if agbno + count == next_start {
+                let next_count = read_be32(buf, next_off + 4);
+                write_be32(buf, next_off, agbno);
+                write_be32(buf, next_off + 4, next_count + count);
+                merged = true;
+            }
+        }
+        if !merged {
+            // Insert new record.
+            let max_recs = (sb.block_size as usize - AG_BT_HDR_V5) / 8;
+            if numrecs >= max_recs {
+                return; // Leaf full (no split impl)
+            }
+            for j in (ins_idx..numrecs).rev() {
+                let src = AG_BT_HDR_V5 + j * 8;
+                let dst = AG_BT_HDR_V5 + (j + 1) * 8;
+                write_be32(buf, dst, read_be32(buf, src));
+                write_be32(buf, dst + 4, read_be32(buf, src + 4));
+            }
+            write_be32(buf, AG_BT_HDR_V5 + ins_idx * 8, agbno);
+            write_be32(buf, AG_BT_HDR_V5 + ins_idx * 8 + 4, count);
+            write_be16(buf, 6, (numrecs + 1) as u16);
+        }
+
+        cache_invalidate(blk_abs);
+        blk.write_block(blk_abs, sb.block_size, wva);
+
+        // Update AGF.
+        agf.freeblks += count;
+        let new_nr = read_be16(buf, 6) as usize;
+        let mut ml = 0u32;
+        for j in 0..new_nr {
+            let c = read_be32(buf, AG_BT_HDR_V5 + j * 8 + 4);
+            if c > ml {
+                ml = c;
+            }
+        }
+        agf.longest = ml;
+        flush_agf(blk, sb, ag as u32);
+        return;
+    }
+}
+
+/// Allocate a new inode number from the inobt. Returns absolute inode number.
+fn alloc_inode_num(blk: &BlkClient, sb: &XfsSb) -> Option<u64> {
+    let n_ag = (sb.ag_count as usize).min(MAX_AG);
+    let wva = unsafe { WRITE_VA };
+
+    for ag in 0..n_ag {
+        let agi = unsafe { &mut AG_I[ag] };
+        if agi.freecount == 0 {
+            continue;
+        }
+
+        let ag_start = (ag as u64) * (sb.ag_blocks as u64);
+
+        // Walk inobt to leaf.
+        let mut cur_agbno = agi.root;
+        let mut depth = 0u32;
+        loop {
+            let abs_blk = ag_start + (cur_agbno as u64);
+            if !blk.read_block(abs_blk, sb.block_size, wva) {
+                break;
+            }
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(wva as *mut u8, sb.block_size as usize)
+            };
+            let level = read_be16(buf, 4);
+            let numrecs = read_be16(buf, 6) as usize;
+
+            if level > 0 {
+                if numrecs == 0 {
+                    break;
+                }
+                // inobt key = startino(u32) = 4 bytes, ptr = agblock(u32) = 4 bytes.
+                let ptr_off = AG_BT_HDR_V5 + numrecs * 4;
+                if ptr_off + 4 > sb.block_size as usize {
+                    break;
+                }
+                cur_agbno = read_be32(buf, ptr_off);
+                depth += 1;
+                if depth > 10 {
+                    break;
+                }
+                continue;
+            }
+
+            // Leaf: scan for record with free inodes.
+            // Record: startino(4) + holemask(2) + count(1) + freecount(1) + free(8) = 16 bytes
+            for i in 0..numrecs {
+                let rec_off = AG_BT_HDR_V5 + i * 16;
+                if rec_off + 16 > sb.block_size as usize {
+                    break;
+                }
+                let startino = read_be32(buf, rec_off);
+                let freecount = buf[rec_off + 7];
+                if freecount == 0 {
+                    continue;
+                }
+
+                let free_mask = read_be64(buf, rec_off + 8);
+                // Find lowest set bit (1 = free in XFS inobt).
+                let mut bit = 0u32;
+                while bit < 64 {
+                    if (free_mask >> bit) & 1 != 0 {
+                        break;
+                    }
+                    bit += 1;
+                }
+                if bit >= 64 {
+                    continue;
+                }
+
+                // Clear the bit, decrement freecount.
+                let new_free = free_mask & !(1u64 << bit);
+                write_be64(buf, rec_off + 8, new_free);
+                buf[rec_off + 7] = freecount - 1;
+
+                cache_invalidate(abs_blk);
+                blk.write_block(abs_blk, sb.block_size, wva);
+
+                agi.freecount -= 1;
+                flush_agi(blk, sb, ag as u32);
+
+                // Compute absolute inode number.
+                let ag_ino = startino + bit;
+                let ino = ((ag as u64) << ((sb.agblklog + sb.inopblog) as u64))
+                    | (ag_ino as u64);
+                return Some(ino);
+            }
+            break;
+        }
+    }
+    None
+}
+
+/// Free an inode number back to the inobt.
+fn free_inode_num(blk: &BlkClient, sb: &XfsSb, ino: u64) {
+    let ag = ino_ag(ino, sb) as usize;
+    if ag >= (sb.ag_count as usize).min(MAX_AG) {
+        return;
+    }
+    let agi = unsafe { &mut AG_I[ag] };
+    let ag_start = (ag as u64) * (sb.ag_blocks as u64);
+    let wva = unsafe { WRITE_VA };
+
+    let ag_ino =
+        (ino & ((1u64 << ((sb.agblklog + sb.inopblog) as u64)) - 1)) as u32;
+    let chunk_start = ag_ino & !63;
+    let bit = ag_ino & 63;
+
+    // Walk inobt to find the chunk's record.
+    let mut cur_agbno = agi.root;
+    let mut depth = 0u32;
+    loop {
+        let abs_blk = ag_start + (cur_agbno as u64);
+        if !blk.read_block(abs_blk, sb.block_size, wva) {
+            return;
+        }
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(wva as *mut u8, sb.block_size as usize)
+        };
+        let level = read_be16(buf, 4);
+        let numrecs = read_be16(buf, 6) as usize;
+
+        if level > 0 {
+            if numrecs == 0 {
+                return;
+            }
+            let mut child_idx = 0usize;
+            for i in 1..numrecs {
+                let key = read_be32(buf, AG_BT_HDR_V5 + i * 4);
+                if chunk_start < key {
+                    break;
+                }
+                child_idx = i;
+            }
+            let ptr_off = AG_BT_HDR_V5 + numrecs * 4 + child_idx * 4;
+            if ptr_off + 4 > sb.block_size as usize {
+                return;
+            }
+            cur_agbno = read_be32(buf, ptr_off);
+            depth += 1;
+            if depth > 10 {
+                return;
+            }
+            continue;
+        }
+
+        // Leaf: find matching record.
+        for i in 0..numrecs {
+            let rec_off = AG_BT_HDR_V5 + i * 16;
+            if rec_off + 16 > sb.block_size as usize {
+                break;
+            }
+            let startino = read_be32(buf, rec_off);
+            if startino == chunk_start {
+                let freecount = buf[rec_off + 7];
+                let free_mask = read_be64(buf, rec_off + 8);
+                write_be64(buf, rec_off + 8, free_mask | (1u64 << bit));
+                buf[rec_off + 7] = freecount + 1;
+
+                cache_invalidate(abs_blk);
+                blk.write_block(abs_blk, sb.block_size, wva);
+                agi.freecount += 1;
+                flush_agi(blk, sb, ag as u32);
+                return;
+            }
+        }
+        return;
+    }
+}
+
+/// Initialize a new inode on disk. Returns the XfsInode.
+fn init_new_inode(
+    blk: &BlkClient,
+    sb: &XfsSb,
+    ino: u64,
+    mode: u16,
+    nlink: u32,
+) -> Option<XfsInode> {
+    let block = ino_abs_block(ino, sb);
+    let off_in_blk = (ino_offset(ino, sb) as usize) * (sb.inode_size as usize);
+    let wva = unsafe { WRITE_VA };
+
+    if !blk.read_block(block, sb.block_size, wva) {
+        return None;
+    }
+
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(
+            (wva + off_in_blk) as *mut u8,
+            sb.inode_size as usize,
+        )
+    };
+
+    // Zero the inode area.
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+
+    // Set v5 inode core.
+    write_be16(buf, 0, XFS_DINODE_MAGIC);
+    write_be16(buf, 2, mode);
+    buf[4] = 3; // v3 (on-disk version for v5 XFS)
+    buf[5] = XFS_DINODE_FMT_EXTENTS;
+    write_be32(buf, 16, nlink);
+
+    cache_invalidate(block);
+    if !blk.write_block(block, sb.block_size, wva) {
+        return None;
+    }
+
+    let dfork_len = (sb.inode_size as usize).saturating_sub(176).min(336);
+
+    Some(XfsInode {
+        ino,
+        mode,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        nlink,
+        format: XFS_DINODE_FMT_EXTENTS,
+        nextents: 0,
+        forkoff: 0,
+        nblocks: 0,
+        dfork: [0u8; 336],
+        dfork_len,
+    })
+}
+
+/// Add an extent to an inode's dfork (format=2 extents list). In-memory only.
+fn inode_add_extent(inode: &mut XfsInode, ext: &Extent) -> bool {
+    let cur = inode.nextents as usize;
+    let new_off = cur * 16;
+    if new_off + 16 > inode.dfork_len {
+        return false;
+    }
+    let encoded = encode_extent(ext);
+    inode.dfork[new_off..new_off + 16].copy_from_slice(&encoded);
+    inode.nextents += 1;
+    inode.nblocks += ext.count as u64;
+    true
+}
+
+/// Add a directory entry to a shortform directory.
+fn dir_sf_add_entry(
+    blk: &BlkClient,
+    sb: &XfsSb,
+    parent: &mut XfsInode,
+    child_name: &[u8],
+    child_ino: u64,
+    ftype: u8,
+) -> bool {
+    if parent.format != XFS_DINODE_FMT_LOCAL {
+        return false;
+    }
+    let d = &parent.dfork;
+    let dlen = parent.dfork_len;
+    if dlen < 6 {
+        return false;
+    }
+
+    let count = d[0] as usize;
+    let i8count = d[1] as usize;
+    let use_64 = i8count > 0 || child_ino > 0xFFFF_FFFF;
+    let ino_size: usize = if use_64 { 8 } else { 4 };
+    let parent_size: usize = if i8count > 0 || use_64 { 8 } else { 4 };
+
+    // Find end of current entries.
+    let mut pos = 2 + parent_size;
+    let total = count + i8count;
+    for entry_idx in 0..total {
+        if pos >= dlen {
+            break;
+        }
+        let namelen = d[pos] as usize;
+        let entry_ino_size: usize = if entry_idx < i8count { 8 } else { 4 };
+        pos += 3 + namelen + 1 + entry_ino_size;
+    }
+
+    // Check space.
+    let entry_size = 1 + 2 + child_name.len() + 1 + ino_size;
+    if pos + entry_size > 336 {
+        return false;
+    }
+
+    // Write entry into dfork.
+    let d = &mut parent.dfork;
+    d[pos] = child_name.len() as u8;
+    d[pos + 1] = 0; // offset hi
+    d[pos + 2] = 0; // offset lo
+    d[pos + 3..pos + 3 + child_name.len()].copy_from_slice(child_name);
+    d[pos + 3 + child_name.len()] = ftype;
+    let ino_off = pos + 3 + child_name.len() + 1;
+    if use_64 {
+        write_be64(d, ino_off, child_ino);
+    } else {
+        write_be32(d, ino_off, child_ino as u32);
+    }
+
+    // Update count.
+    if use_64 {
+        d[1] = (i8count + 1) as u8;
+    } else {
+        d[0] = (count + 1) as u8;
+    }
+
+    parent.size = (pos + entry_size) as u64;
+    write_inode(blk, sb, parent)
+}
+
+/// Add an entry to a block-format directory (single data block).
+fn dir_block_add_entry(
+    blk_client: &BlkClient,
+    sb: &XfsSb,
+    parent: &XfsInode,
+    child_name: &[u8],
+    child_ino: u64,
+    ftype: u8,
+) -> bool {
+    if parent.dfork_len < 16 {
+        return false;
+    }
+    let ext = decode_extent(&parent.dfork[0..16]);
+    if ext.count == 0 {
+        return false;
+    }
+
+    let wva = unsafe { WRITE_VA };
+    let disk_blk = ext.disk_blk;
+
+    if !blk_client.read_block(disk_blk, sb.block_size, wva) {
+        return false;
+    }
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(wva as *mut u8, sb.block_size as usize)
+    };
+
+    let bs = sb.block_size as usize;
+    let raw_entry = 8 + 1 + child_name.len() + 1 + 2;
+    let needed = (raw_entry + 7) & !7;
+    let hdr_size = 64; // v5 data block header
+    let mut pos = hdr_size;
+
+    while pos + 8 < bs {
+        let freetag = read_be16(buf, pos);
+        if freetag == 0xFFFF {
+            let free_len = read_be16(buf, pos + 2) as usize;
+            if free_len >= needed {
+                // Write the new entry here.
+                write_be64(buf, pos, child_ino);
+                buf[pos + 8] = child_name.len() as u8;
+                buf[pos + 9..pos + 9 + child_name.len()].copy_from_slice(child_name);
+                buf[pos + 9 + child_name.len()] = ftype;
+                // Tag at end of entry (aligned).
+                let tag_off = pos + needed - 2;
+                write_be16(buf, tag_off, pos as u16);
+
+                // Mark remaining free space.
+                let remaining = free_len - needed;
+                if remaining >= 8 {
+                    write_be16(buf, pos + needed, 0xFFFF);
+                    write_be16(buf, pos + needed + 2, remaining as u16);
+                }
+
+                cache_invalidate(disk_blk);
+                return blk_client.write_block(disk_blk, sb.block_size, wva);
+            }
+            if free_len == 0 {
+                break;
+            }
+            pos += free_len;
+            continue;
+        }
+
+        if pos + 11 > bs {
+            break;
+        }
+        let namelen = buf[pos + 8] as usize;
+        let raw_end = 8 + 1 + namelen + 1 + 2;
+        pos += (raw_end + 7) & !7;
+    }
+
+    false
+}
+
+/// Remove an entry from a shortform directory. Returns child ino on success.
+fn dir_sf_remove_entry(
+    blk: &BlkClient,
+    sb: &XfsSb,
+    parent: &mut XfsInode,
+    name: &[u8],
+) -> Option<u64> {
+    if parent.format != XFS_DINODE_FMT_LOCAL {
+        return None;
+    }
+    let d = &parent.dfork;
+    let dlen = parent.dfork_len;
+    if dlen < 6 {
+        return None;
+    }
+
+    let count = d[0] as usize;
+    let i8count = d[1] as usize;
+    let parent_size: usize = if i8count > 0 { 8 } else { 4 };
+
+    let mut pos = 2 + parent_size;
+    let total = count + i8count;
+
+    for entry_idx in 0..total {
+        if pos >= dlen {
+            break;
+        }
+        let namelen = d[pos] as usize;
+        let entry_name_start = pos + 3;
+        if entry_name_start + namelen > dlen {
+            break;
+        }
+
+        let ftype_off = entry_name_start + namelen;
+        let ino_off = ftype_off + 1;
+        let ino_size: usize = if entry_idx < i8count { 8 } else { 4 };
+        if ino_off + ino_size > dlen {
+            break;
+        }
+        let entry_end = ino_off + ino_size;
+
+        if namelen == name.len() && &d[entry_name_start..entry_name_start + namelen] == name {
+            let child_ino = if ino_size == 8 {
+                read_be64(d, ino_off)
+            } else {
+                read_be32(d, ino_off) as u64
+            };
+
+            // Remove by shifting.
+            let entry_size = entry_end - pos;
+            let d = &mut parent.dfork;
+            let remaining = dlen - entry_end;
+            for i in 0..remaining {
+                d[pos + i] = d[entry_end + i];
+            }
+            for i in (pos + remaining)..dlen {
+                d[i] = 0;
+            }
+
+            if entry_idx < i8count {
+                d[1] = (i8count - 1) as u8;
+            } else {
+                d[0] = (count - 1) as u8;
+            }
+
+            parent.size = parent.size.saturating_sub(entry_size as u64);
+            write_inode(blk, sb, parent);
+            return Some(child_ino);
+        }
+
+        pos = entry_end;
+    }
+    None
+}
+
+/// Remove an entry from a block-format directory. Returns child ino on success.
+fn dir_block_remove_entry(
+    blk_client: &BlkClient,
+    sb: &XfsSb,
+    parent: &XfsInode,
+    name: &[u8],
+) -> Option<u64> {
+    if parent.dfork_len < 16 {
+        return None;
+    }
+    let ext = decode_extent(&parent.dfork[0..16]);
+    if ext.count == 0 {
+        return None;
+    }
+
+    let wva = unsafe { WRITE_VA };
+    let disk_blk = ext.disk_blk;
+    if !blk_client.read_block(disk_blk, sb.block_size, wva) {
+        return None;
+    }
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(wva as *mut u8, sb.block_size as usize)
+    };
+
+    let bs = sb.block_size as usize;
+    let hdr_size = 64;
+    let mut pos = hdr_size;
+
+    while pos + 8 < bs {
+        let freetag = read_be16(buf, pos);
+        if freetag == 0xFFFF {
+            let free_len = read_be16(buf, pos + 2) as usize;
+            if free_len == 0 {
+                break;
+            }
+            pos += free_len;
+            continue;
+        }
+
+        if pos + 11 > bs {
+            break;
+        }
+        let entry_ino = read_be64(buf, pos);
+        let namelen = buf[pos + 8] as usize;
+        let name_start = pos + 9;
+        if name_start + namelen + 2 > bs {
+            break;
+        }
+
+        let raw_end = 8 + 1 + namelen + 1 + 2;
+        let entry_size = (raw_end + 7) & !7;
+
+        if namelen == name.len() && &buf[name_start..name_start + namelen] == name {
+            // Mark as free.
+            write_be16(buf, pos, 0xFFFF);
+            write_be16(buf, pos + 2, entry_size as u16);
+            for i in 4..entry_size {
+                if pos + i < bs {
+                    buf[pos + i] = 0;
+                }
+            }
+
+            cache_invalidate(disk_blk);
+            blk_client.write_block(disk_blk, sb.block_size, wva);
+            return Some(entry_ino);
+        }
+
+        pos += entry_size;
+    }
+    None
+}
+
+/// Unified: add directory entry.
+fn dir_add_entry(
+    blk: &BlkClient,
+    sb: &XfsSb,
+    parent_ino: u64,
+    child_name: &[u8],
+    child_ino: u64,
+    ftype: u8,
+) -> bool {
+    let mut parent = match read_inode(blk, sb, parent_ino) {
+        Some(i) => i,
+        None => return false,
+    };
+
+    match parent.format {
+        XFS_DINODE_FMT_LOCAL => {
+            dir_sf_add_entry(blk, sb, &mut parent, child_name, child_ino, ftype)
+        }
+        XFS_DINODE_FMT_EXTENTS if parent.nextents >= 1 => {
+            dir_block_add_entry(blk, sb, &parent, child_name, child_ino, ftype)
+        }
+        _ => false,
+    }
+}
+
+/// Unified: remove directory entry. Returns child ino.
+fn dir_remove_entry(
+    blk: &BlkClient,
+    sb: &XfsSb,
+    parent_ino: u64,
+    name: &[u8],
+) -> Option<u64> {
+    let mut parent = match read_inode(blk, sb, parent_ino) {
+        Some(i) => i,
+        None => return None,
+    };
+
+    match parent.format {
+        XFS_DINODE_FMT_LOCAL => dir_sf_remove_entry(blk, sb, &mut parent, name),
+        XFS_DINODE_FMT_EXTENTS if parent.nextents >= 1 => {
+            dir_block_remove_entry(blk, sb, &parent, name)
+        }
+        _ => None,
+    }
+}
+
+/// Free all data blocks referenced by an inode's extents.
+fn free_inode_blocks(blk: &BlkClient, sb: &XfsSb, inode: &XfsInode) {
+    if inode.format != XFS_DINODE_FMT_EXTENTS {
+        return;
+    }
+    let nrecs = inode.nextents as usize;
+    let max_recs = inode.dfork_len / 16;
+    for i in 0..nrecs.min(max_recs) {
+        let off = i * 16;
+        if off + 16 > inode.dfork_len {
+            break;
+        }
+        let ext = decode_extent(&inode.dfork[off..]);
+        if ext.count > 0 && ext.disk_blk != 0 {
+            free_blocks(blk, sb, ext.disk_blk, ext.count);
+        }
+    }
+}
+
+// =====================================================================
 // Main server
 // =====================================================================
 
@@ -1586,6 +2598,19 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
     // Initialize block cache.
     cache_init();
+
+    // Allocate scratch page for write operations (Phase C).
+    match syscall::mmap_anon(0, 1, 1) {
+        Some(va) => unsafe {
+            WRITE_VA = va;
+        },
+        None => {
+            syscall::debug_puts(b"  [xfs_srv] write scratch alloc FAILED\n");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    }
 
     // Read superblock (sector 0).
     syscall::debug_puts(b"  [xfs_srv] reading superblock at partition offset ");
@@ -2009,46 +3034,514 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 );
             }
 
-            // --- Write operations (stubs for Phase C, return ERR_INVALID for now) ---
-            FS_CREATE | FS_MKDIR | FS_MKNOD => {
+            // --- Write operations (Phase C) ---
+
+            FS_CREATE | FS_MKNOD => {
+                let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
                 let reply_port = msg.data[2] >> 32;
-                syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                let caller_pid = msg.data[3] as u32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                // Allocate inode.
+                let ino = match alloc_inode_num(&blk, &sb) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Initialize inode as regular file.
+                let new_inode = match init_new_inode(&blk, &sb, ino, 0o100644, 1) {
+                    Some(i) => i,
+                    None => {
+                        free_inode_num(&blk, &sb, ino);
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Add to root directory.
+                if !dir_add_entry(&blk, &sb, sb.root_ino, name, ino, 1) {
+                    free_inode_num(&blk, &sb, ino);
+                    syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                    continue;
+                }
+
+                // Allocate a handle.
+                let mut handle = u64::MAX;
+                for (i, h) in handles.iter_mut().enumerate() {
+                    if !h.active {
+                        h.active = true;
+                        h.inode = new_inode;
+                        h.pid = caller_pid;
+                        handle = i as u64;
+                        break;
+                    }
+                }
+                if handle == u64::MAX {
+                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                } else {
+                    syscall::send(
+                        reply_port,
+                        FS_CREATE_OK,
+                        handle,
+                        0,
+                        my_aspace as u64,
+                        0,
+                    );
+                }
+            }
+
+            FS_MKDIR => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let mode = ((msg.data[2] >> 16) & 0xFFFF) as u16;
+                let reply_port = msg.data[2] >> 32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                let ino = match alloc_inode_num(&blk, &sb) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                let dir_mode = S_IFDIR | (mode & 0o7777);
+                let mut new_dir = match init_new_inode(&blk, &sb, ino, dir_mode, 2) {
+                    Some(i) => i,
+                    None => {
+                        free_inode_num(&blk, &sb, ino);
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Set up as shortform directory with ".." pointing to root.
+                new_dir.format = XFS_DINODE_FMT_LOCAL;
+                new_dir.dfork[0] = 0; // count
+                new_dir.dfork[1] = 0; // i8count
+                write_be32(&mut new_dir.dfork, 2, sb.root_ino as u32);
+                new_dir.size = 6;
+                write_inode(&blk, &sb, &new_dir);
+
+                if !dir_add_entry(&blk, &sb, sb.root_ino, name, ino, 2) {
+                    free_inode_num(&blk, &sb, ino);
+                    syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                    continue;
+                }
+
+                syscall::send(reply_port, FS_MKDIR_OK, 0, 0, 0, 0);
             }
 
             FS_WRITE => {
-                let reply_port = msg.data[2] >> 32;
-                syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                let handle = msg.data[0] as usize;
+                let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
+                let reply_port = msg.data[1] >> 32;
+                let grant_va = msg.data[2] as usize;
+
+                if handle >= MAX_OPEN || !handles[handle].active {
+                    if reply_port != 0 {
+                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    }
+                    continue;
+                }
+
+                let bs = sb.block_size as usize;
+                let mut written = 0usize;
+                let mut offset = handles[handle].inode.size;
+
+                while written < length {
+                    let logical_blk = offset / (sb.block_size as u64);
+                    let off_in_blk = (offset % (sb.block_size as u64)) as usize;
+                    let space = bs - off_in_blk;
+                    let chunk = (length - written).min(space);
+
+                    // Resolve or allocate the physical block.
+                    let phys = match resolve_block(
+                        &blk,
+                        &sb,
+                        &handles[handle].inode,
+                        logical_blk,
+                    ) {
+                        Some(b) => b,
+                        None => {
+                            // Allocate a new block.
+                            match alloc_blocks(&blk, &sb, 1) {
+                                Some(abs_blk) => {
+                                    // Add extent to inode.
+                                    let ext = Extent {
+                                        file_off: logical_blk,
+                                        disk_blk: abs_blk,
+                                        count: 1,
+                                    };
+                                    if !inode_add_extent(
+                                        &mut handles[handle].inode,
+                                        &ext,
+                                    ) {
+                                        free_blocks(&blk, &sb, abs_blk, 1);
+                                        break;
+                                    }
+                                    abs_blk
+                                }
+                                None => break,
+                            }
+                        }
+                    };
+
+                    let wva = unsafe { WRITE_VA };
+
+                    // Read-modify-write for partial blocks; zero for new full blocks.
+                    if off_in_blk != 0 || chunk < bs {
+                        if !blk.read_block(phys, sb.block_size, wva) {
+                            break;
+                        }
+                    } else {
+                        unsafe {
+                            core::ptr::write_bytes(wva as *mut u8, 0, bs);
+                        }
+                    }
+
+                    // Copy data from grant page.
+                    if grant_va != 0 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                (grant_va + written) as *const u8,
+                                (wva + off_in_blk) as *mut u8,
+                                chunk,
+                            );
+                        }
+                    }
+
+                    cache_invalidate(phys);
+                    if !blk.write_block(phys, sb.block_size, wva) {
+                        break;
+                    }
+
+                    written += chunk;
+                    offset += chunk as u64;
+                }
+
+                // Update file size and flush inode.
+                handles[handle].inode.size = offset;
+                write_inode(&blk, &sb, &handles[handle].inode);
+
+                if reply_port != 0 {
+                    syscall::send(reply_port, FS_WRITE_OK, written as u64, 0, 0, 0);
+                }
             }
 
             FS_DELETE | FS_UNLINK => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
                 let reply_port = msg.data[2] >> 32;
-                syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                // Look up the file.
+                let root = match read_inode(&blk, &sb, sb.root_ino) {
+                    Some(r) => r,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+                let child_ino = match dir_lookup(&blk, &sb, &root, name) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        continue;
+                    }
+                };
+                let child = match read_inode(&blk, &sb, child_ino) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Free data blocks.
+                free_inode_blocks(&blk, &sb, &child);
+
+                // Remove directory entry.
+                dir_remove_entry(&blk, &sb, sb.root_ino, name);
+
+                // Free inode.
+                free_inode_num(&blk, &sb, child_ino);
+
+                // Zero inode on disk.
+                let mut zeroed = child;
+                zeroed.mode = 0;
+                zeroed.nlink = 0;
+                zeroed.size = 0;
+                zeroed.nblocks = 0;
+                zeroed.nextents = 0;
+                zeroed.dfork = [0u8; 336];
+                write_inode(&blk, &sb, &zeroed);
+
+                syscall::send(reply_port, FS_DELETE_OK, 0, 0, 0, 0);
             }
 
             FS_CHMOD => {
+                let path_len = (msg.data[0] & 0xFFFF) as usize;
+                let mode = ((msg.data[0] >> 16) & 0xFFFF) as u16;
                 let reply_port = msg.data[0] >> 32;
-                syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+
+                let mut name = [0u8; 256];
+                let nlen = path_len.min(256);
+                let src = VFS_LONG_PATH_SCRATCH_VA as *const u8;
+                for i in 0..nlen {
+                    name[i] = unsafe { *src.add(i) };
+                }
+
+                if let Some(mut inode) = path_resolve(&blk, &sb, &name[..nlen]) {
+                    inode.mode = (inode.mode & 0xF000) | (mode & 0x0FFF);
+                    write_inode(&blk, &sb, &inode);
+                    syscall::send(reply_port, FS_CHMOD_OK, 0, 0, 0, 0);
+                } else {
+                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                }
             }
 
             FS_UTIMENS => {
                 let reply_port = msg.data[0] >> 32;
-                // No-op success for timestamps.
                 syscall::send(reply_port, FS_UTIMENS_OK, 0, 0, 0, 0);
             }
 
-            FS_SYMLINK | FS_LINK | FS_RENAME => {
-                let reply_port = msg.data[2] >> 32;
-                syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
-            }
-
             FS_CHOWN => {
+                let path_len = (msg.data[0] & 0xFFFF) as usize;
+                let uid = ((msg.data[0] >> 16) & 0xFFFF) as u32;
                 let reply_port = msg.data[0] >> 32;
-                syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                let gid = msg.data[1] as u32;
+
+                let mut name = [0u8; 256];
+                let nlen = path_len.min(256);
+                let src = VFS_LONG_PATH_SCRATCH_VA as *const u8;
+                for i in 0..nlen {
+                    name[i] = unsafe { *src.add(i) };
+                }
+
+                if let Some(mut inode) = path_resolve(&blk, &sb, &name[..nlen]) {
+                    inode.uid = uid;
+                    inode.gid = gid;
+                    write_inode(&blk, &sb, &inode);
+                    syscall::send(reply_port, FS_CHOWN_OK, 0, 0, 0, 0);
+                } else {
+                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                }
             }
 
             FS_TRUNCATE => {
+                let handle_lo = (msg.data[0] & 0xFFFF_FFFF) as usize;
                 let reply_port = msg.data[0] >> 32;
-                syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                let new_size = msg.data[1];
+
+                if handle_lo >= MAX_OPEN || !handles[handle_lo].active {
+                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    continue;
+                }
+
+                let inode = &mut handles[handle_lo].inode;
+                if new_size < inode.size {
+                    if new_size == 0 {
+                        free_inode_blocks(&blk, &sb, inode);
+                        inode.nextents = 0;
+                        inode.nblocks = 0;
+                        inode.dfork = [0u8; 336];
+                    }
+                }
+                inode.size = new_size;
+                write_inode(&blk, &sb, inode);
+                syscall::send(reply_port, FS_TRUNCATE_OK, 0, 0, 0, 0);
+            }
+
+            FS_SYMLINK => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let reply_port = msg.data[2] >> 32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                // Extract target from data[3] (up to 8 bytes, null-terminated).
+                let target_word = msg.data[3];
+                let mut target = [0u8; 8];
+                let mut target_len = 0usize;
+                for i in 0..8 {
+                    let b = (target_word >> (i * 8)) as u8;
+                    if b == 0 { break; }
+                    target[i] = b;
+                    target_len += 1;
+                }
+
+                if target_len == 0 {
+                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    continue;
+                }
+
+                // Allocate inode.
+                let ino = match alloc_inode_num(&blk, &sb) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Initialize as symlink inode: S_IFLNK | 0o777, format=LOCAL.
+                let mut sym_inode = match init_new_inode(&blk, &sb, ino, S_IFLNK | 0o0777, 1) {
+                    Some(i) => i,
+                    None => {
+                        free_inode_num(&blk, &sb, ino);
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Store target inline in dfork.
+                sym_inode.format = XFS_DINODE_FMT_LOCAL;
+                for i in 0..target_len {
+                    sym_inode.dfork[i] = target[i];
+                }
+                sym_inode.size = target_len as u64;
+                write_inode(&blk, &sb, &sym_inode);
+
+                // Add directory entry with ftype=7 (symlink).
+                if !dir_add_entry(&blk, &sb, sb.root_ino, name, ino, 7) {
+                    free_inode_num(&blk, &sb, ino);
+                    syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                    continue;
+                }
+
+                syscall::send(reply_port, FS_SYMLINK_OK, 0, 0, 0, 0);
+            }
+
+            FS_LINK => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let reply_port = msg.data[2] >> 32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                // Extract new link name from data[3] (up to 8 bytes, null-terminated).
+                let new_word = msg.data[3];
+                let mut new_name = [0u8; 8];
+                let mut new_nlen = 0usize;
+                for i in 0..8 {
+                    let b = (new_word >> (i * 8)) as u8;
+                    if b == 0 { break; }
+                    new_name[i] = b;
+                    new_nlen += 1;
+                }
+
+                // Look up existing file by name in root directory.
+                let root_inode = match read_inode(&blk, &sb, sb.root_ino) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                let target_ino = match dir_lookup(&blk, &sb, &root_inode, name) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Read target inode, increment nlink, write back.
+                let mut target_inode = match read_inode(&blk, &sb, target_ino) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+                target_inode.nlink += 1;
+                write_inode(&blk, &sb, &target_inode);
+
+                // Determine ftype from mode.
+                let ftype = match target_inode.mode & S_IFMT {
+                    S_IFDIR => 2u8,
+                    S_IFLNK => 7u8,
+                    _ => 1u8, // regular
+                };
+
+                // Add new directory entry pointing to same inode.
+                if !dir_add_entry(&blk, &sb, sb.root_ino, &new_name[..new_nlen], target_ino, ftype) {
+                    // Rollback nlink.
+                    target_inode.nlink -= 1;
+                    write_inode(&blk, &sb, &target_inode);
+                    syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                    continue;
+                }
+
+                syscall::send(reply_port, FS_LINK_OK, 0, 0, 0, 0);
+            }
+
+            FS_RENAME => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let reply_port = msg.data[2] >> 32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let old_name = &name_buf[..name_len.min(16)];
+
+                // Extract new name from data[3] (up to 8 bytes, null-terminated).
+                let new_word = msg.data[3];
+                let mut new_name = [0u8; 8];
+                let mut new_nlen = 0usize;
+                for i in 0..8 {
+                    let b = (new_word >> (i * 8)) as u8;
+                    if b == 0 { break; }
+                    new_name[i] = b;
+                    new_nlen += 1;
+                }
+
+                // Look up old name to get inode number.
+                let root_inode = match read_inode(&blk, &sb, sb.root_ino) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                let ino = match dir_lookup(&blk, &sb, &root_inode, old_name) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        continue;
+                    }
+                };
+
+                // Get ftype from inode.
+                let target_inode = match read_inode(&blk, &sb, ino) {
+                    Some(i) => i,
+                    None => {
+                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        continue;
+                    }
+                };
+                let ftype = match target_inode.mode & S_IFMT {
+                    S_IFDIR => 2u8,
+                    S_IFLNK => 7u8,
+                    _ => 1u8,
+                };
+
+                // Remove old entry, add new entry with same inode.
+                if dir_remove_entry(&blk, &sb, sb.root_ino, old_name).is_none() {
+                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    continue;
+                }
+
+                if !dir_add_entry(&blk, &sb, sb.root_ino, &new_name[..new_nlen], ino, ftype) {
+                    // Try to re-add old entry on failure.
+                    dir_add_entry(&blk, &sb, sb.root_ino, old_name, ino, ftype);
+                    syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                    continue;
+                }
+
+                syscall::send(reply_port, FS_RENAME_OK, 0, 0, 0, 0);
             }
 
             _ => {

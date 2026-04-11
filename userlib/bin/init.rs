@@ -453,6 +453,302 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"Phase 7 zero-copy I/O test: FAILED\n");
     }
 
+    // --- Early XFS write smoke test (Phase C) ---
+    // Runs here because later phases may hang on pre-existing issues.
+    syscall::debug_puts(b"  init: XFS write smoke test...\n");
+    {
+        // Wait for XFS server.
+        let mut xfs_port_opt = None;
+        for _ in 0..500 {
+            if let Some(p) = syscall::ns_lookup(b"xfs") {
+                xfs_port_opt = Some(p);
+                break;
+            }
+            for _ in 0..50 {
+                syscall::yield_now();
+            }
+        }
+
+        if let Some(xfs_port) = xfs_port_opt {
+            let rp = syscall::port_create();
+            let mut smoke_ok = true;
+
+            // 1) FS_CREATE "smoke.txt"
+            let (n0, n1, _) = pack_name(b"smoke.txt");
+            let d2 = 9u64 | (rp << 32);
+            syscall::send(xfs_port, 0x2500, n0, n1, d2, 0);
+
+            let create_h = if let Some(r) = syscall::recv_msg(rp) {
+                if r.tag == 0x2501 {
+                    syscall::debug_puts(b"    xfs-smoke create: OK\n");
+                    Some((r.data[0], r.data[2]))
+                } else {
+                    syscall::debug_puts(b"    xfs-smoke create: FAIL tag=");
+                    print_num(r.tag);
+                    if r.tag == 0x2F00 {
+                        syscall::debug_puts(b" err=");
+                        print_num(r.data[0]);
+                    }
+                    syscall::debug_puts(b"\n");
+                    smoke_ok = false;
+                    None
+                }
+            } else {
+                smoke_ok = false;
+                None
+            };
+
+            if let Some((h, fs_aspace)) = create_h {
+                // 2) FS_WRITE "Hello XFS W!"
+                let wdata = b"Hello XFS W!";
+                let dp = syscall::mmap_anon(0, 1, 1);
+                if let Some(va) = dp {
+                    unsafe {
+                        for i in 0..wdata.len() {
+                            core::ptr::write((va + i) as *mut u8, wdata[i]);
+                        }
+                    }
+                    let gdst: usize = 0x9_0000_0000;
+                    if syscall::grant_pages(fs_aspace, va, gdst, 1, false) {
+                        let wd1 = (wdata.len() as u64) | (rp << 32);
+                        syscall::send(xfs_port, 0x2600, h, wd1, gdst as u64, 0);
+                        if let Some(wr) = syscall::recv_msg(rp) {
+                            if wr.tag == 0x2601 && wr.data[0] as usize == wdata.len() {
+                                syscall::debug_puts(b"    xfs-smoke write: OK\n");
+                            } else {
+                                syscall::debug_puts(b"    xfs-smoke write: FAIL\n");
+                                smoke_ok = false;
+                            }
+                        } else {
+                            smoke_ok = false;
+                        }
+                        syscall::revoke(fs_aspace, gdst);
+                    }
+                    syscall::munmap(va);
+                }
+
+                // 3) Close
+                syscall::send(xfs_port, 0x2400, h, 0, 0, 0);
+
+                // 4) Re-open and read back
+                if smoke_ok {
+                    let (n0, n1, _) = pack_name(b"smoke.txt");
+                    let d2 = 9u64 | (rp << 32);
+                    syscall::send(xfs_port, 0x2000, n0, n1, d2, 0);
+                    if let Some(r) = syscall::recv_msg(rp) {
+                        if r.tag == 0x2001 {
+                            let h2 = r.data[0];
+                            let sz = r.data[1];
+                            // Read inline
+                            let d2r = sz | (rp << 32);
+                            syscall::send(xfs_port, 0x2100, h2, 0, d2r, 0);
+                            if let Some(rr) = syscall::recv_msg(rp) {
+                                if rr.tag == 0x2101 {
+                                    let br = rr.data[0] as usize;
+                                    let expected = b"Hello XFS W!";
+                                    let mut c = [0u8; 24];
+                                    let w = [rr.data[1], rr.data[2], rr.data[3]];
+                                    for i in 0..br.min(24) {
+                                        c[i] = (w[i / 8] >> ((i % 8) * 8)) as u8;
+                                    }
+                                    if br == expected.len() && &c[..br] == expected {
+                                        syscall::debug_puts(
+                                            b"    xfs-smoke read-back: OK\n",
+                                        );
+                                    } else {
+                                        syscall::debug_puts(
+                                            b"    xfs-smoke read-back: MISMATCH\n",
+                                        );
+                                        smoke_ok = false;
+                                    }
+                                } else {
+                                    smoke_ok = false;
+                                }
+                            }
+                            syscall::send(xfs_port, 0x2400, h2, 0, 0, 0);
+                        } else {
+                            smoke_ok = false;
+                        }
+                    }
+                }
+
+                // 5) Delete
+                if smoke_ok {
+                    let (n0, n1, _) = pack_name(b"smoke.txt");
+                    let d2 = 9u64 | (rp << 32);
+                    syscall::send(xfs_port, 0x2700, n0, n1, d2, 0);
+                    if let Some(r) = syscall::recv_msg(rp) {
+                        if r.tag == 0x2701 {
+                            syscall::debug_puts(b"    xfs-smoke delete: OK\n");
+                        } else {
+                            syscall::debug_puts(b"    xfs-smoke delete: FAIL\n");
+                            smoke_ok = false;
+                        }
+                    }
+                }
+            }
+
+            syscall::port_destroy(rp);
+
+            if smoke_ok {
+                syscall::debug_puts(b"XFS write smoke test: PASSED\n");
+            } else {
+                syscall::debug_puts(b"XFS write smoke test: FAILED\n");
+            }
+        } else {
+            syscall::debug_puts(b"XFS write smoke test: SKIPPED (no server)\n");
+        }
+    }
+
+    // --- XFS symlink/link/rename smoke test ---
+    syscall::debug_puts(b"  init: XFS symlink/link/rename test...\n");
+    {
+        if let Some(xfs_port) = syscall::ns_lookup(b"xfs") {
+            let rp = syscall::port_create();
+            let mut ok = true;
+
+            // 1) Create "orig.txt" (empty file).
+            let (n0, n1, _) = pack_name(b"orig.txt");
+            let d2 = 8u64 | (rp << 32);
+            syscall::send(xfs_port, 0x2500, n0, n1, d2, 0); // FS_CREATE
+            if let Some(r) = syscall::recv_msg(rp) {
+                if r.tag == 0x2501 {
+                    // Close the handle.
+                    syscall::send(xfs_port, 0x2400, r.data[0], 0, 0, 0);
+                } else { ok = false; }
+            } else { ok = false; }
+
+            // 2) FS_SYMLINK: create "sym.txt" -> "orig"
+            if ok {
+                let (sn0, sn1, _) = pack_name(b"sym.txt");
+                let sd2 = 7u64 | (rp << 32);
+                let mut tbuf = [0u8; 8];
+                for (i, &b) in b"orig".iter().enumerate() { tbuf[i] = b; }
+                let target_word = u64::from_le_bytes(tbuf);
+                syscall::send(xfs_port, 0x2C00, sn0, sn1, sd2, target_word);
+                if let Some(r) = syscall::recv_msg(rp) {
+                    if r.tag == 0x2C01 {
+                        syscall::debug_puts(b"    xfs symlink: OK\n");
+                    } else {
+                        syscall::debug_puts(b"    xfs symlink: FAIL\n");
+                        ok = false;
+                    }
+                } else { ok = false; }
+            }
+
+            // 3) FS_READLINK "sym.txt" — verify target is "orig".
+            if ok {
+                let (sn0, sn1, _) = pack_name(b"sym.txt");
+                let sd2 = 7u64 | (rp << 32);
+                syscall::send(xfs_port, 0x2C10, sn0, sn1, sd2, 0);
+                if let Some(r) = syscall::recv_msg(rp) {
+                    if r.tag == 0x2C11 {
+                        let tlen = r.data[0] as usize;
+                        let mut got = [0u8; 8];
+                        let w1 = r.data[1].to_le_bytes();
+                        for i in 0..tlen.min(8) { got[i] = w1[i]; }
+                        if tlen == 4 && &got[..4] == b"orig" {
+                            syscall::debug_puts(b"    xfs readlink: OK\n");
+                        } else {
+                            syscall::debug_puts(b"    xfs readlink: MISMATCH\n");
+                            ok = false;
+                        }
+                    } else {
+                        syscall::debug_puts(b"    xfs readlink: FAIL\n");
+                        ok = false;
+                    }
+                } else { ok = false; }
+            }
+
+            // 4) FS_LINK: create "hard.txt" as hardlink to "orig.txt".
+            if ok {
+                let (ln0, ln1, _) = pack_name(b"orig.txt");
+                let ld2 = 8u64 | (rp << 32);
+                let mut nbuf = [0u8; 8];
+                for (i, &b) in b"hard.txt".iter().enumerate() { nbuf[i] = b; }
+                let new_word = u64::from_le_bytes(nbuf);
+                syscall::send(xfs_port, 0x2C20, ln0, ln1, ld2, new_word);
+                if let Some(r) = syscall::recv_msg(rp) {
+                    if r.tag == 0x2C21 {
+                        syscall::debug_puts(b"    xfs link: OK\n");
+                    } else {
+                        syscall::debug_puts(b"    xfs link: FAIL\n");
+                        ok = false;
+                    }
+                } else { ok = false; }
+            }
+
+            // 5) Verify "hard.txt" can be opened (proves link worked).
+            if ok {
+                let (on0, on1, _) = pack_name(b"hard.txt");
+                let od2 = 8u64 | (rp << 32);
+                syscall::send(xfs_port, 0x2000, on0, on1, od2, 0);
+                if let Some(r) = syscall::recv_msg(rp) {
+                    if r.tag == 0x2001 {
+                        syscall::debug_puts(b"    xfs open hard: OK\n");
+                        syscall::send(xfs_port, 0x2400, r.data[0], 0, 0, 0);
+                    } else {
+                        syscall::debug_puts(b"    xfs open hard: FAIL\n");
+                        ok = false;
+                    }
+                } else { ok = false; }
+            }
+
+            // 6) FS_RENAME: rename "hard.txt" -> "moved.tx".
+            if ok {
+                let (rn0, rn1, _) = pack_name(b"hard.txt");
+                let rd2 = 8u64 | (rp << 32);
+                let mut nbuf = [0u8; 8];
+                for (i, &b) in b"moved.tx".iter().enumerate().take(8) { nbuf[i] = b; }
+                let new_word = u64::from_le_bytes(nbuf);
+                syscall::send(xfs_port, 0x2C30, rn0, rn1, rd2, new_word);
+                if let Some(r) = syscall::recv_msg(rp) {
+                    if r.tag == 0x2C31 {
+                        syscall::debug_puts(b"    xfs rename: OK\n");
+                    } else {
+                        syscall::debug_puts(b"    xfs rename: FAIL\n");
+                        ok = false;
+                    }
+                } else { ok = false; }
+            }
+
+            // 7) Verify "moved.tx" can be opened (proves rename worked).
+            if ok {
+                let (on0, on1, _) = pack_name(b"moved.tx");
+                let od2 = 8u64 | (rp << 32);
+                syscall::send(xfs_port, 0x2000, on0, on1, od2, 0);
+                if let Some(r) = syscall::recv_msg(rp) {
+                    if r.tag == 0x2001 {
+                        syscall::debug_puts(b"    xfs open moved: OK\n");
+                        syscall::send(xfs_port, 0x2400, r.data[0], 0, 0, 0);
+                    } else {
+                        syscall::debug_puts(b"    xfs open moved: FAIL\n");
+                        ok = false;
+                    }
+                } else { ok = false; }
+            }
+
+            // Cleanup: delete sym.txt, orig.txt, moved.tx.
+            for name in [b"sym.txt\0", b"orig.txt", b"moved.tx"] {
+                let len = if name[name.len() - 1] == 0 { name.len() - 1 } else { name.len() };
+                let (dn0, dn1, _) = pack_name(&name[..len]);
+                let dd2 = (len as u64) | (rp << 32);
+                syscall::send(xfs_port, 0x2700, dn0, dn1, dd2, 0);
+                let _ = syscall::recv_msg(rp);
+            }
+
+            syscall::port_destroy(rp);
+
+            if ok {
+                syscall::debug_puts(b"XFS symlink/link/rename: PASSED\n");
+            } else {
+                syscall::debug_puts(b"XFS symlink/link/rename: FAILED\n");
+            }
+        } else {
+            syscall::debug_puts(b"XFS symlink/link/rename: SKIPPED\n");
+        }
+    }
+
     // --- Test 8: Block device I/O via grant ---
     syscall::debug_puts(b"  init: testing block device I/O...\n");
 
@@ -3761,6 +4057,217 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         } else {
             syscall::debug_puts(b"Phase 179 XFS filesystem: SKIPPED (no xfs server)\n");
+        }
+    }
+
+    // --- Phase 180: XFS write support ---
+    syscall::debug_puts(b"  init: Phase 180 XFS write...\n");
+    {
+        let mut write_ok = true;
+
+        let xfs_port = if has_blk {
+            let mut found = None;
+            for _ in 0..200 {
+                if let Some(p) = syscall::ns_lookup(b"xfs") {
+                    found = Some(p);
+                    break;
+                }
+                for _ in 0..50 {
+                    syscall::yield_now();
+                }
+            }
+            found
+        } else {
+            None
+        };
+
+        if let Some(xfs_port) = xfs_port {
+            let reply_port = syscall::port_create();
+
+            // Step 1: Create a file "test_w.txt" via FS_CREATE (0x2500).
+            {
+                let (n0, n1, _) = pack_name(b"test_w.txt");
+                let d2 = 10u64 | (reply_port << 32);
+                syscall::send(xfs_port, 0x2500, n0, n1, d2, 0);
+            }
+
+            let create_handle = if let Some(reply) = syscall::recv_msg(reply_port) {
+                if reply.tag == 0x2501 {
+                    let h = reply.data[0];
+                    syscall::debug_puts(b"    xfs create test_w.txt: OK handle=");
+                    print_num(h);
+                    syscall::debug_puts(b"\n");
+                    Some((h, reply.data[2])) // (handle, fs_aspace)
+                } else {
+                    syscall::debug_puts(b"    xfs create FAILED tag=");
+                    print_num(reply.tag);
+                    if reply.tag == 0x2F00 {
+                        syscall::debug_puts(b" err=");
+                        print_num(reply.data[0]);
+                    }
+                    syscall::debug_puts(b"\n");
+                    write_ok = false;
+                    None
+                }
+            } else {
+                syscall::debug_puts(b"    xfs create no reply\n");
+                write_ok = false;
+                None
+            };
+
+            if let Some((handle, fs_aspace)) = create_handle {
+                // Step 2: Write "XFS write OK!" to the file via FS_WRITE (0x2600).
+                let write_data = b"XFS write OK!";
+                let data_page = syscall::mmap_anon(0, 1, 1);
+                if let Some(va) = data_page {
+                    unsafe {
+                        for i in 0..write_data.len() {
+                            core::ptr::write((va + i) as *mut u8, write_data[i]);
+                        }
+                    }
+                    let grant_dst: usize = 0x9_0000_0000;
+                    if syscall::grant_pages(fs_aspace, va, grant_dst, 1, false) {
+                        let d1 = (write_data.len() as u64) | (reply_port << 32);
+                        syscall::send(
+                            xfs_port,
+                            0x2600,
+                            handle,
+                            d1,
+                            grant_dst as u64,
+                            0,
+                        );
+
+                        if let Some(reply) = syscall::recv_msg(reply_port) {
+                            if reply.tag == 0x2601 {
+                                let written = reply.data[0] as usize;
+                                if written == write_data.len() {
+                                    syscall::debug_puts(b"    xfs write: OK (");
+                                    print_num(written as u64);
+                                    syscall::debug_puts(b" bytes)\n");
+                                } else {
+                                    syscall::debug_puts(b"    xfs write: short (");
+                                    print_num(written as u64);
+                                    syscall::debug_puts(b")\n");
+                                    write_ok = false;
+                                }
+                            } else {
+                                syscall::debug_puts(b"    xfs write FAILED tag=");
+                                print_num(reply.tag);
+                                if reply.tag == 0x2F00 {
+                                    syscall::debug_puts(b" err=");
+                                    print_num(reply.data[0]);
+                                }
+                                syscall::debug_puts(b"\n");
+                                write_ok = false;
+                            }
+                        } else {
+                            syscall::debug_puts(b"    xfs write no reply\n");
+                            write_ok = false;
+                        }
+                        syscall::revoke(fs_aspace, grant_dst);
+                    }
+                    syscall::munmap(va);
+                }
+
+                // Step 3: Close the file.
+                syscall::send(xfs_port, 0x2400, handle, 0, 0, 0);
+
+                // Step 4: Re-open and read back to verify.
+                if write_ok {
+                    let (n0, n1, _) = pack_name(b"test_w.txt");
+                    let d2 = 10u64 | (reply_port << 32);
+                    syscall::send(xfs_port, 0x2000, n0, n1, d2, 0);
+
+                    if let Some(reply) = syscall::recv_msg(reply_port) {
+                        if reply.tag == 0x2001 {
+                            let h2 = reply.data[0];
+                            let sz = reply.data[1];
+                            syscall::debug_puts(b"    xfs reopen test_w.txt: size=");
+                            print_num(sz);
+                            syscall::debug_puts(b"\n");
+
+                            // Read inline.
+                            let d2r = sz | (reply_port << 32);
+                            syscall::send(xfs_port, 0x2100, h2, 0, d2r, 0);
+                            if let Some(rr) = syscall::recv_msg(reply_port) {
+                                if rr.tag == 0x2101 {
+                                    let br = rr.data[0] as usize;
+                                    let expected = b"XFS write OK!";
+                                    let mut content = [0u8; 24];
+                                    let w = [rr.data[1], rr.data[2], rr.data[3]];
+                                    for i in 0..br.min(24) {
+                                        content[i] = (w[i / 8] >> ((i % 8) * 8)) as u8;
+                                    }
+                                    if br == expected.len()
+                                        && &content[..br] == expected
+                                    {
+                                        syscall::debug_puts(
+                                            b"    xfs read-back: OK (\"XFS write OK!\")\n",
+                                        );
+                                    } else {
+                                        syscall::debug_puts(
+                                            b"    xfs read-back: content mismatch\n",
+                                        );
+                                        write_ok = false;
+                                    }
+                                } else {
+                                    syscall::debug_puts(b"    xfs read-back FAILED\n");
+                                    write_ok = false;
+                                }
+                            }
+
+                            syscall::send(xfs_port, 0x2400, h2, 0, 0, 0);
+                        } else {
+                            syscall::debug_puts(b"    xfs reopen FAILED\n");
+                            write_ok = false;
+                        }
+                    }
+                }
+
+                // Step 5: Delete the file via FS_DELETE (0x2700).
+                if write_ok {
+                    let (n0, n1, _) = pack_name(b"test_w.txt");
+                    let d2 = 10u64 | (reply_port << 32);
+                    syscall::send(xfs_port, 0x2700, n0, n1, d2, 0);
+                    if let Some(reply) = syscall::recv_msg(reply_port) {
+                        if reply.tag == 0x2701 {
+                            syscall::debug_puts(b"    xfs delete test_w.txt: OK\n");
+                        } else {
+                            syscall::debug_puts(b"    xfs delete FAILED tag=");
+                            print_num(reply.tag);
+                            syscall::debug_puts(b"\n");
+                            write_ok = false;
+                        }
+                    }
+
+                    // Step 6: Verify file is gone.
+                    let (n0, n1, _) = pack_name(b"test_w.txt");
+                    let d2 = 10u64 | (reply_port << 32);
+                    syscall::send(xfs_port, 0x2000, n0, n1, d2, 0);
+                    if let Some(reply) = syscall::recv_msg(reply_port) {
+                        if reply.tag == 0x2F00 {
+                            syscall::debug_puts(
+                                b"    xfs verify-gone: OK (file not found)\n",
+                            );
+                        } else {
+                            syscall::debug_puts(
+                                b"    xfs verify-gone: FAIL (file still exists)\n",
+                            );
+                            write_ok = false;
+                        }
+                    }
+                }
+            }
+
+            syscall::port_destroy(reply_port);
+
+            if write_ok {
+                syscall::debug_puts(b"Phase 180 XFS write: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 180 XFS write: FAILED\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 180 XFS write: SKIPPED (no xfs server)\n");
         }
     }
 
