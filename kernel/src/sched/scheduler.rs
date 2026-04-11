@@ -4072,6 +4072,14 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     let next_sp = next_t.saved_sp;
 
+    // Reprogram the one-shot timer so this CPU gets a tick within one
+    // interval. Without this, the dynamic tick may have the timer set far
+    // in the future (up to MAX_IDLE_NS = 1s). If a remote CPU wakes us via
+    // wake_parked_thread and enqueues on this CPU, the enqueued thread would
+    // sit in the run queue until the next timer fires. A prompt tick ensures
+    // try_switch() picks it up quickly.
+    crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
+
     // Store pending_switch and do SA notification BEFORE restoring IRQs.
     // With preemptive syscalls, a timer between current_thread update and
     // the exception handler consuming pending_switch would corrupt state:
