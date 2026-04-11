@@ -182,6 +182,34 @@ fn pending_switch_sp() -> &'static [AtomicU64] {
     unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
 }
 
+/// Per-CPU deferred re-enqueue. When try_switch re-enqueues the previous
+/// thread, a work-stealing CPU could dequeue it while this CPU is still
+/// physically on its kernel stack (between percpu_enqueue and the assembly
+/// `mov rsp, rax`). We defer the enqueue and process it at the start of
+/// the next try_switch / voluntary_reschedule / park_current_for_ipc.
+/// Encoding: bits [31:0] = tid, bits [39:32] = prio, bits [47:40] = cpu.
+/// Sentinel: 0 = no deferred enqueue (tid 0 = idle, never deferred).
+static DEFERRED_REQUEUE_PTR: AtomicPtr<AtomicU64> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn deferred_requeue() -> &'static [AtomicU64] {
+    let ptr = DEFERRED_REQUEUE_PTR.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "DEFERRED_REQUEUE not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
+
+#[inline]
+fn drain_deferred_requeue(cpu: u32) {
+    let val = deferred_requeue()[cpu as usize].swap(0, Ordering::AcqRel);
+    if val != 0 {
+        let tid = (val & 0xFFFFFFFF) as ThreadId;
+        let prio = ((val >> 32) & 0xFF) as u8;
+        let target = ((val >> 40) & 0xFF) as u32;
+        percpu_enqueue(target, prio, tid);
+    }
+}
+
 /// Per-CPU deferred kernel stack free. When a thread exits, it can't free
 /// its own stack (it's running on it). The address is stored here and freed
 /// by the next thread scheduled on that CPU.
@@ -589,6 +617,9 @@ pub(crate) fn init_dynamic_percpu() {
 
         let s = phys::alloc_static_slice::<AtomicU64>(n);
         PENDING_SWITCH_SP_PTR.store(s.as_mut_ptr(), Ordering::Release);
+
+        let s = phys::alloc_static_slice::<AtomicU64>(n);
+        DEFERRED_REQUEUE_PTR.store(s.as_mut_ptr(), Ordering::Release);
 
         let s = phys::alloc_static_slice::<AtomicUsize>(n);
         DEFERRED_KSTACK_PTR.store(s.as_mut_ptr(), Ordering::Release);
@@ -1953,6 +1984,7 @@ fn compute_next_event(cpu: u32, is_idle: bool) -> u64 {
 /// Uses only per-CPU run queue locks — does NOT take the global SCHEDULER lock.
 fn try_switch(current_sp: u64) -> u64 {
     let cpu = smp::cpu_id();
+    drain_deferred_requeue(cpu);
     let pcpu = smp::get(cpu);
     let idle_id_for_load = pcpu.idle_thread_id.load(Ordering::Relaxed);
     let cur_for_load = pcpu.current_thread.load(Ordering::Relaxed);
@@ -2044,6 +2076,7 @@ fn try_switch(current_sp: u64) -> u64 {
     {
         let prev_t = unsafe { thread_mut_from_ref(prev_id) };
         prev_t.saved_sp = current_sp;
+        prev_t.saved_sp_source = 1; // try_switch
         let mut prev_prio = prev_t.effective_priority;
         prev_task = prev_t.task_id;
         // If the thread was demoted by block_current (prio 254) and has been
@@ -2094,7 +2127,10 @@ fn try_switch(current_sp: u64) -> u64 {
                 deferred_kstack()[cpu as usize].store(kstack_base, Ordering::Release);
             } else {
                 prev_t.state = ThreadState::Ready;
-                percpu_enqueue(cpu, prev_prio, prev_id);
+                // Defer re-enqueue: prevent work-stealing from picking up
+                // prev while this CPU is still on its kernel stack.
+                let packed = (prev_id as u64) | ((prev_prio as u64) << 32) | ((cpu as u64) << 40);
+                deferred_requeue()[cpu as usize].store(packed, Ordering::Release);
             }
         }
     }
@@ -2145,7 +2181,15 @@ fn try_switch(current_sp: u64) -> u64 {
 /// If another thread is runnable, sets PENDING_SWITCH_SP so the trap
 /// handler performs the context switch on return.
 pub fn voluntary_reschedule() {
+    // Disable IRQs for the entire function. With preemptive syscalls, a
+    // timer firing between percpu_enqueue (re-enqueue self) and
+    // percpu_pick_next would let try_switch see this thread in the queue
+    // and defer-enqueue it again — double-enqueue → potential dual-CPU
+    // scheduling of the same thread.
+    let _irq_saved = crate::arch::irq::disable();
+
     let cpu = smp::cpu_id();
+    drain_deferred_requeue(cpu);
     let pcpu = smp::current();
     let cur_id = pcpu.current_thread.load(Ordering::Relaxed);
     let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
@@ -2157,6 +2201,7 @@ pub fn voluntary_reschedule() {
     {
         let t = unsafe { thread_mut_from_ref(cur_id) };
         t.saved_sp = frame_sp;
+        t.saved_sp_source = 2; // voluntary_reschedule
         cur_prio = t.effective_priority;
         cur_task = t.task_id;
         t.state = ThreadState::Ready;
@@ -2178,11 +2223,6 @@ pub fn voluntary_reschedule() {
     }
 
     crate::sched::stats::CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
-
-    // Disable IRQs across page-table switch + current_thread update +
-    // pending_switch_sp store to prevent timer-driven try_switch from
-    // seeing inconsistent state.
-    let _irq_saved = crate::arch::irq::disable();
 
     // Switch page tables if crossing task boundaries.
     let next_task = thread_ref(next_id).task_id;
@@ -4032,10 +4072,14 @@ pub fn has_pending_switch() -> bool {
     pending_switch_sp()[cpu].load(Ordering::Acquire) != 0
 }
 
-/// Get a thread's saved SP. Used by inject_recv_into_frame to write into
-/// a parked thread's exception frame.
+/// Get a thread's IPC-injection frame SP. Used by inject_recv_into_frame
+/// and inject_fault_into_frame to write into a parked thread's syscall
+/// exception frame. Returns ipc_frame_sp (set by pre_save_frame), which
+/// is immune to timer-driven try_switch overwriting saved_sp.
 pub fn thread_saved_sp(tid: ThreadId) -> u64 {
-    thread_ref(tid).saved_sp
+    let t = thread_ref(tid);
+    let ipc = t.ipc_frame_sp;
+    if ipc != 0 { ipc } else { t.saved_sp }
 }
 
 /// Park the current thread for IPC (true off-CPU park).
@@ -4060,8 +4104,11 @@ pub fn pre_save_frame(tid: ThreadId) {
     let frame_sp = unsafe { thread_mut_from_ref(tid) }.syscall_frame_sp;
     let t = unsafe { thread_mut_from_ref(tid) };
     t.saved_sp = frame_sp;
-    // Publish saved_sp before becoming visible. The Release on park_state
-    // ensures saved_sp is visible to any thread that reads park_state ≥ 1.
+    t.saved_sp_source = 3; // pre_save_frame
+    t.ipc_frame_sp = frame_sp;
+    // Publish saved_sp/ipc_frame_sp before becoming visible. The Release on
+    // park_state ensures both fields are visible to any thread that reads
+    // park_state ≥ 1.
     thread_ref(tid).park_state.store(PARK_ENQUEUED, Ordering::Release);
 }
 
@@ -4073,7 +4120,14 @@ pub fn pre_save_frame(tid: ThreadId) {
 /// function. The caller must have already called `pre_save_frame()` (which
 /// sets park_state = PARK_ENQUEUED) and `port_enqueue_with_check()`.
 pub fn park_current_for_ipc(reason: BlockReason) {
+    // Disable IRQs for the entire function. With preemptive syscalls, a
+    // timer firing after state=Blocked would let try_switch see a Blocked
+    // thread still on-CPU, overwrite state to Ready, and re-enqueue it —
+    // creating a double-schedule with the IPC HAMT entry.
+    let irq_saved = crate::arch::irq::disable();
+
     let cpu = smp::cpu_id() as usize;
+    drain_deferred_requeue(cpu as u32);
 
     let cpu_idx = cpu as u32;
     let pcpu = smp::current();
@@ -4104,14 +4158,6 @@ pub fn park_current_for_ipc(reason: BlockReason) {
 
     // Pick next thread from per-CPU queue (don't re-enqueue current — it's Blocked).
     let next_id = percpu_pick_next(cpu_idx, idle_id);
-
-    // Switch page tables if needed.
-    // Disable interrupts across the page-table switch + current_thread update
-    // to prevent a timer from seeing TLB_PT_ROOT pointing to the new task
-    // while current_thread still identifies the old task (which would cause
-    // a subsequent tick() to restore the old task's root, leaving the new
-    // task running with the wrong page table).
-    let irq_saved = crate::arch::irq::disable();
     let prev_task = thread_ref(tid as ThreadId).task_id;
     let next_task = thread_ref(next_id).task_id;
     if prev_task != next_task {
@@ -4193,6 +4239,7 @@ pub fn wake_parked_thread(tid: ThreadId) {
         .compare_exchange(PARK_ENQUEUED, PARK_NONE, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
+        unsafe { thread_mut_from_ref(tid) }.ipc_frame_sp = 0;
         return;
     }
 
@@ -4203,6 +4250,7 @@ pub fn wake_parked_thread(tid: ThreadId) {
         .compare_exchange(PARK_COMMITTED, PARK_NONE, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
+        unsafe { thread_mut_from_ref(tid) }.ipc_frame_sp = 0;
         // park_current_for_ipc used a deferred context switch: it set
         // PENDING_SWITCH_SP on the parking CPU but continued running on the
         // thread's kernel stack until the exception handler consumed the
@@ -4448,6 +4496,11 @@ fn check_interval_timers() {
 /// Park the current thread for a timed sleep.
 /// Sets the deadline and blocks the thread (off-CPU).
 pub fn park_current_for_sleep(deadline_ns: u64) {
+    // Disable IRQs for the entire function. Same preemption race as
+    // park_current_for_ipc — timer after state=Blocked would let try_switch
+    // overwrite state to Ready and re-enqueue.
+    let irq_saved = crate::arch::irq::disable();
+
     let cpu = smp::cpu_id() as usize;
     let cpu_idx = cpu as u32;
     let tid_for_sp = smp::get(cpu_idx).current_thread.load(Ordering::Relaxed);
@@ -4473,10 +4526,6 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
 
     // Pick next thread from per-CPU queue.
     let next_id = percpu_pick_next(cpu_idx, idle_id);
-
-    // Disable interrupts across page-table switch + current_thread update
-    // (same race as park_current_for_ipc — see comment there).
-    let irq_saved = crate::arch::irq::disable();
     let prev_task = thread_ref(tid as ThreadId).task_id;
     let next_task = thread_ref(next_id).task_id;
     if prev_task != next_task {
@@ -4566,6 +4615,11 @@ pub fn alarm(initial_ns: u64, interval_ns: u64) -> u64 {
 /// Saves sender's SP, loads receiver as current thread, stores receiver's SP
 /// in PENDING_SWITCH_SP. Receiver must already have its frame injected.
 pub fn handoff_to(receiver_tid: ThreadId) {
+    // Disable IRQs for the entire function. Same preemption race as
+    // voluntary_reschedule — timer after percpu_enqueue would let try_switch
+    // double-enqueue the sender.
+    let irq_saved = crate::arch::irq::disable();
+
     let cpu = smp::cpu_id() as usize;
     let cpu_id = cpu as u32;
     let sender_tid_for_sp = smp::get(cpu_id).current_thread.load(Ordering::Relaxed);
@@ -4590,10 +4644,6 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     // Safety: receiver was Blocked (parked), not on any queue or CPU.
     let receiver = unsafe { thread_mut_from_ref(receiver_tid) };
     receiver.quantum = remaining_quantum;
-
-    // Disable interrupts across page-table switch + current_thread update
-    // (same race as park_current_for_ipc — see comment there).
-    let irq_saved = crate::arch::irq::disable();
     let recv_task = receiver.task_id;
     if sender_task != recv_task {
         let next_root = {

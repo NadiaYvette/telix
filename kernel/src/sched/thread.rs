@@ -119,6 +119,15 @@ pub struct Thread {
     /// Current syscall exception frame SP. Set by store_frame_sp() on syscall
     /// entry. Per-thread (not per-CPU) so it survives preemptive migration.
     pub syscall_frame_sp: u64,
+    /// Saved IPC-injection frame pointer. Set by pre_save_frame() alongside
+    /// saved_sp. Unlike saved_sp (which may be overwritten by timer-driven
+    /// try_switch during preemptive syscalls), this field is only written by
+    /// pre_save_frame and preserves the correct syscall frame for
+    /// inject_recv_into_frame / inject_fault_into_frame.
+    pub ipc_frame_sp: u64,
+    /// Debug: tracks which code path last wrote saved_sp.
+    /// 1 = try_switch, 2 = voluntary_reschedule, 3 = pre_save_frame, 4 = init.
+    pub saved_sp_source: u8,
     // --- EEVDF scheduling class ---
     /// Scheduling class: SCHED_NORMAL (0, EEVDF), SCHED_RT (1), SCHED_IDLE (2).
     pub sched_class: u8,
@@ -184,6 +193,8 @@ impl Thread {
             personality_result: core::sync::atomic::AtomicU64::new(0),
             personality_frame_sp: 0,
             syscall_frame_sp: 0,
+            ipc_frame_sp: 0,
+            saved_sp_source: 4,
             sched_class: SCHED_NORMAL,
             eevdf_weight: 1024,
             eevdf_heap_pos: super::heap::HEAP_POS_NONE,

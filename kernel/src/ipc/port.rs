@@ -966,6 +966,7 @@ pub fn recv_or_park(port_id: PortId) -> Result<Message, ()> {
         Err(())
     } else {
         // Condition changed (message arrived) — reset park_state and retry recv.
+        unsafe { crate::sched::scheduler::thread_mut_from_ref(my_tid) }.ipc_frame_sp = 0;
         crate::sched::scheduler::thread_ref(my_tid)
             .park_state
             .store(crate::sched::scheduler::PARK_NONE, Ordering::Release);

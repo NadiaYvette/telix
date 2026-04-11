@@ -146,6 +146,47 @@ pub const FRAME_SIZE_U64: usize = 22;
 #[allow(dead_code)]
 pub const EXCEPTION_FRAME_SIZE: usize = FRAME_SIZE_U64 * 8; // 176 bytes
 
+/// Validate the iretq frame at `sp` before returning to assembly.
+#[inline]
+fn validate_iretq_frame(sp: u64, vector: u64) -> u64 {
+    let f = unsafe { &*(sp as *const ExceptionFrame) };
+    let cs = f.cs();
+    let ss = f.ss();
+    if cs != 0x08 && cs != 0x23 {
+        let tid = crate::sched::scheduler::current_thread_id();
+        let tref = crate::sched::scheduler::thread_ref(tid);
+        let cur_cpu = crate::sched::smp::cpu_id();
+        crate::println!(
+            "BAD CS={:#x} SS={:#x} RIP={:#x} vec={} tid={} sp={:#x} src={} last_cpu={} cur_cpu={}",
+            cs, ss, f.rip(), vector, tid, sp,
+            tref.saved_sp_source,
+            tref.last_cpu.load(core::sync::atomic::Ordering::Relaxed),
+            cur_cpu
+        );
+        crate::println!(
+            "  saved_sp={:#x} syscall_frame_sp={:#x} stack_base={:#x}",
+            tref.saved_sp, tref.syscall_frame_sp, tref.stack_base
+        );
+        loop { core::hint::spin_loop(); }
+    }
+    if ss != 0x00 && ss != 0x10 && ss != 0x1B {
+        let tid = crate::sched::scheduler::current_thread_id();
+        let tref = crate::sched::scheduler::thread_ref(tid);
+        crate::println!(
+            "BAD SS={:#x} CS={:#x} RIP={:#x} vec={} tid={} sp={:#x} src={} last_cpu={}",
+            ss, cs, f.rip(), vector, tid, sp,
+            tref.saved_sp_source,
+            tref.last_cpu.load(core::sync::atomic::Ordering::Relaxed)
+        );
+        crate::println!(
+            "  saved_sp={:#x} syscall_frame_sp={:#x} stack_base={:#x}",
+            tref.saved_sp, tref.syscall_frame_sp, tref.stack_base
+        );
+        loop { core::hint::spin_loop(); }
+    }
+    sp
+}
+
 /// Common interrupt/exception handler called from assembly.
 /// For timer IRQ (vector 32), returns potentially new SP for context switch.
 #[unsafe(no_mangle)]
@@ -209,7 +250,7 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             super::timer::handle_timer_irq();
             super::lapic::eoi();
             super::pic::send_eoi(0);
-            return crate::sched::tick(frame_sp);
+            return validate_iretq_frame(crate::sched::tick(frame_sp), 32);
         }
 
         // Syscall via int 0x80.
@@ -221,9 +262,9 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             crate::sched::scheduler::check_preempt_on_return();
             let pending = crate::sched::scheduler::take_pending_switch();
             if pending != 0 {
-                return pending;
+                return validate_iretq_frame(pending, 0x80);
             }
-            return frame_sp;
+            return validate_iretq_frame(frame_sp, 0x80);
         }
 
         // Reschedule IPI (vector 0xFD). Sent by a remote CPU when it
@@ -231,7 +272,7 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         // runs try_switch() — no tick accounting, no timer reprogramming.
         0xFD => {
             super::lapic::eoi();
-            return crate::sched::scheduler::reschedule_ipi(frame_sp);
+            return validate_iretq_frame(crate::sched::scheduler::reschedule_ipi(frame_sp), 0xFD);
         }
 
         // Other IRQs (33-47).
@@ -248,7 +289,7 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         }
     }
 
-    frame_sp
+    validate_iretq_frame(frame_sp, vector)
 }
 
 fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {

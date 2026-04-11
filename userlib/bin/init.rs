@@ -9820,7 +9820,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let child = syscall::fork();
             if child == 0 {
                 // Child: wait for personality to be set.
-                for _ in 0..100 {
+                for i in 0..100u32 {
                     let (p, _) = syscall::personality_get();
                     if p != 0 { break; }
                     syscall::yield_now();
@@ -9865,6 +9865,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         }
 
                         // Step 3: rt_sigaction(SIGUSR1, ...) — Linux NR=13 (stub returns 0)
+                        // r10 = sigsetsize (must be 8 on x86_64 Linux)
                         let ret3: u64;
                         core::arch::asm!(
                             "int 0x80",
@@ -9872,6 +9873,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             in("rdi") 10u64, // SIGUSR1
                             in("rsi") 0u64,  // NULL new action
                             in("rdx") 0u64,  // NULL old action
+                            in("r10") 8u64,  // sigsetsize = sizeof(sigset_t)
                             lateout("rcx") _,
                             lateout("r11") _,
                         );
@@ -9943,7 +9945,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 1u8;
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
-                syscall::personality_set(child, 2, abi);
+                let pset_r = syscall::personality_set(child, 2, abi);
+                if pset_r != 0 {
+                    syscall::debug_puts(b"  p127: personality_set FAILED!\n");
+                } else {
+                    syscall::debug_puts(b"  p127: personality_set OK\n");
+                }
 
                 let mut exit_code: i64 = -1;
                 for _ in 0..500 {
