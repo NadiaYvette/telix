@@ -92,7 +92,7 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
 fi
 
 # Copy ELF binaries to initramfs directory.
-for bin in init hello echo_client initramfs_srv rootfs_srv ramdisk_srv blk_srv cache_srv fat16_srv ext2_srv iso9660_srv udf_srv console_srv shell net_srv pipe_upper pipe_drain spin bench pong grant_echo macro_bench cap_test security_srv shm_srv vfs_srv tmpfs_srv devfs_srv procfs_srv uds_srv pipe_srv pty_srv event_srv inotify_srv syslog_srv sysv_srv hello_c sock_test tsh getty_login ld-telix tz_test pthread_test initdb_test postmaster_test pg_full_test libc_test calc stress_test sshd proxy_srv linux_srv linux_exit42 glibc_hello fb_srv input_srv compositor_srv term_srv; do
+for bin in init hello echo_client initramfs_srv rootfs_srv ramdisk_srv blk_srv cache_srv fat16_srv ext2_srv xfs_srv iso9660_srv udf_srv console_srv shell net_srv pipe_upper pipe_drain spin bench pong grant_echo macro_bench cap_test security_srv shm_srv vfs_srv tmpfs_srv devfs_srv procfs_srv uds_srv pipe_srv pty_srv event_srv inotify_srv syslog_srv sysv_srv hello_c sock_test tsh getty_login ld-telix tz_test pthread_test initdb_test postmaster_test pg_full_test libc_test calc stress_test sshd proxy_srv linux_srv linux_exit42 glibc_hello fb_srv input_srv compositor_srv term_srv; do
     if [ -f "$BINDIR/$bin" ]; then
         cp "$BINDIR/$bin" "$INITRAMFS_DIR/$bin"
         SIZE=$(wc -c < "$INITRAMFS_DIR/$bin")
@@ -115,6 +115,9 @@ echo "Building ISO 9660 test image..."
 
 echo "Building UDF test image..."
 "$ROOTDIR/tools/make-udf.sh"
+
+echo "Building XFS test image..."
+"$ROOTDIR/tools/make-xfs.sh"
 
 # Rebuild the CPIO archive.
 echo "Packing initramfs..."

@@ -825,12 +825,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             if tid != u64::MAX {
                                 // Wait for child to exit.
                                 syscall::debug_puts(b"  init: waiting for child exit\n");
-                                loop {
+                                for _ in 0..2000 {
                                     if let Some(_code) = syscall::waitpid(tid) {
                                         exec_ok = true;
                                         break;
                                     }
-                                    syscall::yield_now();
+                                    syscall::sleep_ms(1);
                                 }
                             } else {
                                 syscall::debug_puts(b"  init: spawn_elf failed\n");
@@ -3555,6 +3555,212 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         } else {
             syscall::debug_puts(b"Phase 178 UDF filesystem: SKIPPED (spawn failed)\n");
+        }
+    }
+
+    // --- Phase 179: XFS filesystem server (read-only) ---
+    syscall::debug_puts(b"  init: Phase 179 XFS filesystem...\n");
+    {
+        let mut xfs_ok = true;
+
+        let xfs_port = if has_blk {
+            let mut found = None;
+            for _ in 0..200 {
+                if let Some(p) = syscall::ns_lookup(b"xfs") {
+                    found = Some(p);
+                    break;
+                }
+                for _ in 0..50 {
+                    syscall::yield_now();
+                }
+            }
+            found
+        } else {
+            None
+        };
+
+        if let Some(xfs_port) = xfs_port {
+            let reply_port = syscall::port_create();
+
+            // Step 1: Open hello.txt
+            {
+                let (n0, n1, _) = pack_name(b"hello.txt");
+                let d2 = 9u64 | (reply_port << 32);
+                syscall::send(xfs_port, 0x2000, n0, n1, d2, 0);
+            }
+
+            let (handle, file_size, _fs_aspace) =
+                if let Some(reply) = syscall::recv_msg(reply_port) {
+                    if reply.tag == 0x2001 {
+                        (reply.data[0], reply.data[1], reply.data[2])
+                    } else {
+                        syscall::debug_puts(b"    xfs open hello.txt FAILED tag=");
+                        print_num(reply.tag);
+                        syscall::debug_puts(b"\n");
+                        xfs_ok = false;
+                        (u64::MAX, 0, 0)
+                    }
+                } else {
+                    syscall::debug_puts(b"    xfs open hello.txt no reply\n");
+                    xfs_ok = false;
+                    (u64::MAX, 0, 0)
+                };
+
+            if handle != u64::MAX {
+                syscall::debug_puts(b"    xfs opened hello.txt: size=");
+                print_num(file_size);
+                syscall::debug_puts(b"\n");
+
+                // Step 2: Read hello.txt content (inline, small file).
+                {
+                    let d2 = file_size | (reply_port << 32);
+                    syscall::send(xfs_port, 0x2100, handle, 0, d2, 0);
+                }
+
+                if let Some(reply) = syscall::recv_msg(reply_port) {
+                    if reply.tag == 0x2101 {
+                        let bytes_read = reply.data[0] as usize;
+                        let expected = b"Hello from XFS!";
+                        let mut content = [0u8; 24];
+                        let words = [reply.data[1], reply.data[2], reply.data[3]];
+                        for i in 0..bytes_read.min(24) {
+                            content[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
+                        }
+                        if bytes_read == expected.len() && &content[..bytes_read] == expected {
+                            syscall::debug_puts(
+                                b"    xfs read hello.txt: OK (\"Hello from XFS!\")\n",
+                            );
+                        } else {
+                            syscall::debug_puts(b"    xfs read hello.txt: content mismatch (got ");
+                            print_num(bytes_read as u64);
+                            syscall::debug_puts(b" bytes)\n");
+                            xfs_ok = false;
+                        }
+                    } else {
+                        syscall::debug_puts(b"    xfs read FAILED tag=");
+                        print_num(reply.tag);
+                        syscall::debug_puts(b"\n");
+                        xfs_ok = false;
+                    }
+                }
+
+                // Step 3: FS_STAT
+                {
+                    let d2 = reply_port;
+                    syscall::send(xfs_port, 0x2300, handle, 0, d2, 0);
+                }
+
+                if let Some(reply) = syscall::recv_msg(reply_port) {
+                    if reply.tag == 0x2301 {
+                        let stat_size = reply.data[0] as u32;
+                        let mode = reply.data[1] as u16;
+                        if stat_size != file_size as u32 {
+                            syscall::debug_puts(b"    xfs stat: size mismatch\n");
+                            xfs_ok = false;
+                        }
+                        if mode != 0o100644 {
+                            syscall::debug_puts(b"    xfs stat: mode mismatch (got ");
+                            print_num(mode as u64);
+                            syscall::debug_puts(b")\n");
+                            xfs_ok = false;
+                        } else {
+                            syscall::debug_puts(b"    xfs stat: mode OK\n");
+                        }
+                    } else {
+                        syscall::debug_puts(b"    xfs stat FAILED\n");
+                        xfs_ok = false;
+                    }
+                }
+
+                // Step 4: Close
+                syscall::send(xfs_port, 0x2400, handle, 0, 0, 0);
+            }
+
+            // Step 5: Open subdir/nested.txt via FS_OPEN_LONG
+            {
+                let path = b"subdir/nested.txt";
+                let path_page = syscall::mmap_anon(0, 1, 1);
+                if let Some(va) = path_page {
+                    unsafe {
+                        let dst = va as *mut u8;
+                        for i in 0..path.len() {
+                            core::ptr::write(dst.add(i), path[i]);
+                        }
+                        core::ptr::write(dst.add(path.len()), 0);
+                    }
+                    if let Some(xfs_aspace) = syscall::ns_lookup(b"xfs_task") {
+                        let grant_dst: usize = 0x8_0000_0000;
+                        if syscall::grant_pages(xfs_aspace, va, grant_dst, 1, false) {
+                            let d2 = (path.len() as u64) | (reply_port << 32);
+                            syscall::send(xfs_port, 0x2002, grant_dst as u64, 0, d2, 0);
+
+                            if let Some(reply) = syscall::recv_msg(reply_port) {
+                                if reply.tag == 0x2001 {
+                                    let h2 = reply.data[0];
+                                    let sz2 = reply.data[1];
+                                    syscall::debug_puts(
+                                        b"    xfs opened subdir/nested.txt: size=",
+                                    );
+                                    print_num(sz2);
+                                    syscall::debug_puts(b"\n");
+
+                                    // Read it
+                                    {
+                                        let d2r = sz2 | (reply_port << 32);
+                                        syscall::send(xfs_port, 0x2100, h2, 0, d2r, 0);
+                                    }
+                                    if let Some(rr) = syscall::recv_msg(reply_port) {
+                                        if rr.tag == 0x2101 {
+                                            let br = rr.data[0] as usize;
+                                            let expected2 = b"Nested XFS file.";
+                                            let mut c2 = [0u8; 24];
+                                            let w2 = [rr.data[1], rr.data[2], rr.data[3]];
+                                            for i in 0..br.min(24) {
+                                                c2[i] = (w2[i / 8] >> ((i % 8) * 8)) as u8;
+                                            }
+                                            if br == expected2.len() && &c2[..br] == expected2 {
+                                                syscall::debug_puts(
+                                                    b"    xfs read nested.txt: OK\n",
+                                                );
+                                            } else {
+                                                syscall::debug_puts(
+                                                    b"    xfs read nested.txt: mismatch\n",
+                                                );
+                                                xfs_ok = false;
+                                            }
+                                        } else {
+                                            syscall::debug_puts(
+                                                b"    xfs read nested.txt FAILED\n",
+                                            );
+                                            xfs_ok = false;
+                                        }
+                                    }
+                                    syscall::send(xfs_port, 0x2400, h2, 0, 0, 0);
+                                } else {
+                                    syscall::debug_puts(
+                                        b"    xfs open subdir/nested.txt FAILED tag=",
+                                    );
+                                    print_num(reply.tag);
+                                    syscall::debug_puts(b"\n");
+                                    xfs_ok = false;
+                                }
+                            }
+                            syscall::revoke(xfs_aspace, grant_dst);
+                        }
+                    }
+                    syscall::munmap(va);
+                }
+            }
+
+            syscall::port_destroy(reply_port);
+
+            if xfs_ok {
+                syscall::debug_puts(b"Phase 179 XFS filesystem: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 179 XFS filesystem: FAILED\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 179 XFS filesystem: SKIPPED (no xfs server)\n");
         }
     }
 

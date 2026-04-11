@@ -469,6 +469,12 @@ fn startup_thread() -> ! {
         None => println!("  WARNING: ext2_srv not found (ok if not yet built)"),
     }
 
+    // Spawn XFS filesystem server (partition starts at byte 36 MiB in test.img).
+    match sched::spawn_user(b"xfs_srv", 50, 20, 36 * 1024 * 1024) {
+        Some(tid) => println!("  xfs_srv spawned (thread {})", tid),
+        None => println!("  WARNING: xfs_srv not found (ok if not yet built)"),
+    }
+
     // Spawn ramdisk server (userspace, no data copy needed).
     match sched::spawn_user(b"ramdisk_srv", 50, 20, 0) {
         Some(tid) => println!("  ramdisk_srv spawned (thread {})", tid),
