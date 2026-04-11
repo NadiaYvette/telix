@@ -1875,9 +1875,15 @@ pub fn tick(current_sp: u64) -> u64 {
 
     let result = try_switch(current_sp);
 
-    // Compute and program the next timer event (dynamic tick).
+    // If try_switch performed a context switch, clear need_resched since
+    // the switch already satisfied the preemption request.
     let cpu = smp::cpu_id();
     let pcpu = smp::get(cpu);
+    if result != current_sp {
+        pcpu.need_resched.store(false, Ordering::Relaxed);
+    }
+
+    // Compute and program the next timer event (dynamic tick).
     let is_idle = pcpu.current_thread.load(Ordering::Relaxed)
         == pcpu.idle_thread_id.load(Ordering::Relaxed);
     let next = compute_next_event(cpu, is_idle);
@@ -2376,6 +2382,12 @@ pub fn wake_thread(tid: ThreadId) {
             let woken_prio = tref.base_priority;
             if woken_prio < cur_prio {
                 pcpu.need_resched.store(true, Ordering::Release);
+                // Reprogram timer to fire within one tick for prompt preemption.
+                // Under dynamic tick, the timer may be set far out (up to
+                // MAX_IDLE_NS) if the CPU was idle. With IRQs enabled during
+                // syscalls, this ensures the timer fires mid-syscall and
+                // try_switch() preempts to the higher-priority thread.
+                crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
             }
         }
     }
