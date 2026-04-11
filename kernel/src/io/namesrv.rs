@@ -126,7 +126,9 @@ pub fn namesrv_server() -> ! {
                     reply_port,
                     Message::new(NS_LOOKUP_OK, [port_id, 0, 0, 0, 0, 0]),
                 );
-                let _ = result;
+                if result.is_err() {
+                    crate::println!("[namesrv] WARN: reply send_nb failed for port {}", reply_port);
+                }
             }
 
             _ => {}

@@ -383,6 +383,7 @@ pub(crate) fn port_ref(port_id: PortId) -> Option<&'static Port> {
     if port.is_alive() { Some(port) } else { None }
 }
 
+
 // ---------------------------------------------------------------------------
 // Create / Destroy
 // ---------------------------------------------------------------------------

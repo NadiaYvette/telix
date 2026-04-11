@@ -307,12 +307,17 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
     frame_sp
 }
 
+/// Handle a CPU exception. For userspace faults, kill the thread so the CPU
+/// can continue running other threads. For kernel faults, halt (fatal).
 fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
+    let is_user = (frame.cs() & 3) == 3;
     crate::println!(
-        "EXCEPTION: {} at RIP={:#x} error_code={:#x}",
+        "EXCEPTION: {} at RIP={:#x} error_code={:#x} tid={} {}",
         name,
         frame.rip(),
-        frame.error_code()
+        frame.error_code(),
+        crate::sched::scheduler::current_thread_id(),
+        if is_user { "(user)" } else { "(KERNEL)" }
     );
     crate::println!(
         "  RAX={:#x} RBX={:#x} RCX={:#x} RDX={:#x}",
@@ -334,6 +339,12 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
         frame.rflags(),
         frame.ss()
     );
+    if is_user {
+        // Kill the faulting thread so the CPU can continue running others.
+        // Signal number: SIGILL(4) for #UD, SIGSEGV(11) for #GP/#SS, etc.
+        crate::sched::scheduler::exit_current_thread(-11);
+    }
+    // Kernel fault: halt this CPU (fatal).
     loop {
         core::hint::spin_loop();
     }

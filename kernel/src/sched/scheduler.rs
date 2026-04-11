@@ -2043,8 +2043,13 @@ fn try_switch(current_sp: u64) -> u64 {
         // If the thread was demoted by block_current (prio 254) and has been
         // woken (wakeup flag set), restore its base priority so it gets
         // re-enqueued at the correct level instead of being starved.
+        // Check both effective_priority==254 (normal case) and the case where
+        // wake_thread already restored prio but effective_priority is still 254.
         if prev_prio == 254 && prev_t.base_priority < 254 {
-            if thread_ref(prev_id).wakeup.load(Ordering::Acquire) {
+            // Check both wakeup flag AND whether prio was already restored
+            // by wake_thread (prio != 254 means wake_thread boosted it).
+            let current_prio = thread_ref(prev_id).prio.load(Ordering::Acquire);
+            if thread_ref(prev_id).wakeup.load(Ordering::Acquire) || current_prio != 254 {
                 prev_t.effective_priority = prev_t.base_priority;
                 thread_ref(prev_id)
                     .prio
@@ -2311,6 +2316,15 @@ pub fn wake_thread(tid: ThreadId) {
         // from exit_current_thread which already holds SCHEDULER.
         let base = tref.base_priority;
         if base < 254 {
+            // Restore prio to base BEFORE attempting remove. This ensures
+            // that even if try_switch on a remote CPU races with us and
+            // re-enqueues the thread, the priority restoration code in
+            // try_switch (which checks wakeup + prio==254) will fire because
+            // wakeup is already true. Also, if try_switch reads our updated
+            // prio before re-enqueueing, it uses percpu_enqueue with the
+            // correct priority directly.
+            tref.prio.store(base, Ordering::Release);
+
             let old_cpu = tref.last_cpu.load(Ordering::Relaxed);
             let waker_cpu = smp::cpu_id();
             // Remove from old CPU's queue and re-enqueue at base prio.
@@ -2339,15 +2353,14 @@ pub fn wake_thread(tid: ThreadId) {
             };
             if removed {
                 percpu_enqueue(waker_cpu, base, tid);
-            } else if old_cpu != waker_cpu {
-                // Thread is Running (in WFI/HLT) on a remote CPU.
-                // send_event() is a no-op on x86, so send a reschedule IPI
-                // to wake the remote CPU from HLT immediately.
-                crate::arch::irq::send_reschedule_ipi(old_cpu);
+            } else {
+                // Thread is either Running (in WFI/HLT) or in limbo during
+                // try_switch. The wakeup flag and restored prio are set;
+                // try_switch will handle the boost. Send IPI to wake from HLT.
+                if old_cpu != waker_cpu {
+                    crate::arch::irq::send_reschedule_ipi(old_cpu);
+                }
             }
-            // If we couldn't remove the thread (it may be currently Running
-            // in WFI on its CPU), the wakeup flag is set and it will exit
-            // block_current on its next check.
         }
     }
     // If a DIFFERENT thread with higher priority was woken on this CPU,
@@ -4193,6 +4206,13 @@ pub fn wake_parked_thread(tid: ThreadId) {
         let target = tref.last_cpu.load(Ordering::Relaxed);
         unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
         percpu_enqueue(target, prio, tid);
+        // If the target CPU is remote, it may be idle in HLT with the timer
+        // set far out (up to MAX_IDLE_NS).  Send a reschedule IPI so it
+        // picks up the newly-enqueued thread immediately.
+        let waker_cpu = smp::cpu_id();
+        if target != waker_cpu {
+            crate::arch::irq::send_reschedule_ipi(target);
+        }
     }
     // If park_state is PARK_NONE, thread was already woken or never parked. No-op.
 }

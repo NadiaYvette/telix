@@ -788,7 +788,9 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
                 Err(()) => 1,
             }
         }
-        crate::ipc::port::SendDirectResult::Error => 1,
+        crate::ipc::port::SendDirectResult::Error => {
+            1
+        }
     }
 }
 
