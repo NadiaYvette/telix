@@ -222,6 +222,14 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             return frame_sp;
         }
 
+        // Reschedule IPI (vector 0xFD). Sent by a remote CPU when it
+        // enqueues a thread on our run queue while we are idle.  Only
+        // runs try_switch() — no tick accounting, no timer reprogramming.
+        0xFD => {
+            super::lapic::eoi();
+            return crate::sched::scheduler::reschedule_ipi(frame_sp);
+        }
+
         // Other IRQs (33-47).
         33..=47 => {
             let irq = (vector - 32) as u8;

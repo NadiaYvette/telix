@@ -217,6 +217,18 @@ pub fn program_oneshot(deadline_ns: u64) {
     write(LAPIC_TIMER_INIT, ticks);
 }
 
+/// Send a reschedule IPI (vector 0xFD) to a target CPU.
+///
+/// The target CPU wakes from HLT (if idle) and runs try_switch(),
+/// which discovers the newly-enqueued thread.  Uses a dedicated vector
+/// to avoid tick count inflation and full timer processing.
+pub fn send_reschedule(target_lapic_id: u32) {
+    wait_icr_idle();
+    write(LAPIC_ICR_HIGH, target_lapic_id << 24);
+    // Fixed delivery (000), vector 0xFD, edge-triggered, assert.
+    write(LAPIC_ICR_LOW, 0xFD);
+}
+
 /// Delay roughly N microseconds using a busy loop.
 /// This is very approximate — used only during AP startup.
 /// Under QEMU TCG, spin loops are much slower than real hardware,

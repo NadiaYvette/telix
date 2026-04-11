@@ -114,7 +114,7 @@ static EARLIEST_ALARM_NS: AtomicU64 = AtomicU64::new(0);
 static EARLIEST_INTERVAL_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum idle duration (1 second). Prevents unbounded sleep in case of stale caches.
-const MAX_IDLE_NS: u64 = 1_000_000_000;
+const MAX_IDLE_NS: u64 = 50_000_000; // 50ms — bounds cross-CPU wake latency without IPI
 
 /// Get a thread reference by ID via radix lookup (lockless).
 #[inline]
@@ -1733,6 +1733,13 @@ pub fn thread_join_block(tid: ThreadId, caller_task: u32) -> u64 {
         thread_ref(caller_tid)
             .wakeup
             .store(false, Ordering::Release);
+        // Re-check: the target may have exited between the first Dead
+        // check and join_waiter registration.  If it raced and didn't see
+        // our waiter, we must not block (nobody would wake us).
+        if thread_ref(tid).state == ThreadState::Dead {
+            unsafe { thread_mut_from_ref(tid) }.join_waiter = u32::MAX;
+            return thread_ref(tid).exit_code as u64;
+        }
     }
     // Block until the target thread wakes us via exit_current_thread.
     block_current(BlockReason::FutexWait);
@@ -1843,6 +1850,21 @@ fn drain_deferred_kills() {
 /// Interval between ticks in nanoseconds (10ms = 100 Hz equivalent).
 const TICK_INTERVAL_NS: u64 = 10_000_000;
 
+/// Handle a reschedule IPI (dedicated vector, no tick processing).
+/// Called when a remote CPU enqueues a thread on our run queue while we
+/// are idle.  Only runs try_switch() to pick up the newly-enqueued thread.
+pub fn reschedule_ipi(current_sp: u64) -> u64 {
+    let result = try_switch(current_sp);
+    // Reprogram the timer for the (possibly new) running thread.
+    let cpu = smp::cpu_id();
+    let pcpu = smp::get(cpu);
+    let is_idle = pcpu.current_thread.load(core::sync::atomic::Ordering::Relaxed)
+        == pcpu.idle_thread_id.load(core::sync::atomic::Ordering::Relaxed);
+    let next = compute_next_event(cpu, is_idle);
+    crate::arch::timer::program_oneshot_ns(next);
+    result
+}
+
 pub fn tick(current_sp: u64) -> u64 {
     check_sleep_timers();
     check_alarm_timers();
@@ -1903,6 +1925,18 @@ fn compute_next_event(cpu: u32, is_idle: bool) -> u64 {
     // 5. Deferred kills need draining within one tick.
     if deferred_kill()[cpu as usize].load(Ordering::Relaxed) != 0 {
         earliest = earliest.min(now + TICK_INTERVAL_NS);
+    }
+
+    // 6. When idle, check if a remote CPU enqueued work after try_switch
+    //    checked the queue.  Without this, the newly-enqueued thread could
+    //    sit in the run queue for up to MAX_IDLE_NS (1 second).
+    if is_idle {
+        let rq = percpu_rq()[cpu as usize].lock();
+        let has_work = rq.has_ready();
+        drop(rq);
+        if has_work {
+            earliest = earliest.min(now + 1_000); // 1 μs — wake ASAP
+        }
     }
 
     // Floor: never less than 1 microsecond from now.
@@ -2232,6 +2266,11 @@ pub fn block_current(_reason: BlockReason) {
         if tref.killed.load(Ordering::Acquire) {
             break;
         }
+        // Reprogram the timer before HLT. After being preempted and
+        // scheduled back, compute_next_event may have set the timer far in
+        // the future (up to MAX_IDLE_NS). We need a prompt tick so
+        // try_switch preempts us and other threads can run.
+        crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
         // Use WFI to wait for the next interrupt (timer tick or device IRQ).
         // This is critical on QEMU TCG: spin_loop() keeps the vCPU busy,
         // starving QEMU's I/O thread from processing virtio requests.
@@ -2300,6 +2339,11 @@ pub fn wake_thread(tid: ThreadId) {
             };
             if removed {
                 percpu_enqueue(waker_cpu, base, tid);
+            } else if old_cpu != waker_cpu {
+                // Thread is Running (in WFI/HLT) on a remote CPU.
+                // send_event() is a no-op on x86, so send a reschedule IPI
+                // to wake the remote CPU from HLT immediately.
+                crate::arch::irq::send_reschedule_ipi(old_cpu);
             }
             // If we couldn't remove the thread (it may be currently Running
             // in WFI on its CPU), the wakeup flag is set and it will exit

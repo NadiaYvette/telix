@@ -241,6 +241,19 @@ pub fn wait_for_interrupt() {
     }
 }
 
+/// Send a reschedule IPI to a remote CPU, waking it from idle (HLT/WFI).
+///
+/// The target CPU's timer ISR fires, running tick() → try_switch(), which
+/// discovers any newly-enqueued threads.  On architectures without IPI
+/// support yet, this is a no-op (the dynamic tick timer will eventually fire).
+#[inline]
+pub fn send_reschedule_ipi(target_cpu: u32) {
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::lapic::send_reschedule(target_cpu);
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = target_cpu; }
+}
+
 /// Send an event to all CPUs (SEV on AArch64, no-op elsewhere).
 #[inline(always)]
 pub fn send_event() {
