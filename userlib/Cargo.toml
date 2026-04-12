@@ -182,3 +182,7 @@ path = "bin/term_srv.rs"
 [[bin]]
 name = "udf_srv"
 path = "bin/udf_srv.rs"
+
+[[bin]]
+name = "apfs_srv"
+path = "bin/apfs_srv.rs"

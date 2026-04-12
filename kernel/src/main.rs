@@ -475,6 +475,12 @@ fn startup_thread() -> ! {
         None => println!("  WARNING: xfs_srv not found (ok if not yet built)"),
     }
 
+    // Spawn APFS filesystem server (partition starts at byte 336 MiB in test.img).
+    match sched::spawn_user(b"apfs_srv", 50, 20, 336 * 1024 * 1024) {
+        Some(tid) => println!("  apfs_srv spawned (thread {})", tid),
+        None => println!("  WARNING: apfs_srv not found (ok if not yet built)"),
+    }
+
     // Spawn ramdisk server (userspace, no data copy needed).
     match sched::spawn_user(b"ramdisk_srv", 50, 20, 0) {
         Some(tid) => println!("  ramdisk_srv spawned (thread {})", tid),
