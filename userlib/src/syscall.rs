@@ -40,6 +40,7 @@ const SYS_PORT_SET_ADD: u64 = 6;
 #[allow(dead_code)]
 const SYS_PORT_SET_RECV: u64 = 22;
 const SYS_NSRV_PORT: u64 = 23;
+const SYS_SVC_PORT: u64 = 115;
 const SYS_MADVISE: u64 = 90;
 #[allow(dead_code)]
 const SYS_TLS_SET: u64 = 91;
@@ -716,6 +717,13 @@ pub fn recv_msg(port: u64) -> Option<Message> {
 /// Get the name server port.
 pub fn nsrv_port() -> u64 {
     unsafe { arch::syscall0(SYS_NSRV_PORT) }
+}
+
+/// Get a well-known service port by index (0=blk, 1=apfs).
+/// Returns 0 if the service hasn't registered yet.
+/// Also grants SEND capability on the port to the calling task.
+pub fn svc_port(index: u64) -> u64 {
+    unsafe { arch::syscall1(SYS_SVC_PORT, index) }
 }
 
 /// Create a port set.

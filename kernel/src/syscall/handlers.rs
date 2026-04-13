@@ -110,6 +110,7 @@ pub const SYS_FUTEX_WAIT_PI: u64 = 101;
 pub const SYS_FUTEX_WAKE_PI: u64 = 102;
 pub const SYS_PAGE_SIZE: u64 = 103;
 pub const SYS_SCHED_SETATTR: u64 = 114;
+pub const SYS_SVC_PORT: u64 = 115;
 // Personality syscalls live in the 0xF000 range to avoid collisions with
 // Linux x86_64 syscall numbers (which go up to ~450). Previously these were
 // 104-114 which collided with Linux getgid, setuid, setgid, geteuid, getegid,
@@ -456,6 +457,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_PORT_ALIVE => {
             if crate::ipc::port::port_ref(a0).is_some() { 1 } else { 0 }
         }
+        SYS_SVC_PORT => sys_svc_port(a0),
         SYS_PERSONALITY_REGISTER => {
             crate::syscall::personality::register_server(a0 as u8, a1)
         }
@@ -1307,6 +1309,22 @@ fn sys_port_set_recv(set_id: u64, frame: &mut ExceptionFrame) -> u64 {
 fn sys_nsrv_port() -> u64 {
     use core::sync::atomic::Ordering;
     crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire)
+}
+
+/// Return the port ID for a well-known service by index, granting SEND cap.
+/// index 0 = blk, 1 = apfs.  Returns 0 if not yet registered.
+fn sys_svc_port(index: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    let port_id = match index {
+        0 => crate::io::namesrv::BLK_SRV_PORT.load(Ordering::Acquire),
+        1 => crate::io::namesrv::APFS_SRV_PORT.load(Ordering::Acquire),
+        _ => return 0,
+    };
+    if port_id != 0 {
+        let task_id = crate::sched::scheduler::current_task_id();
+        crate::cap::grant_send_cap(task_id, port_id);
+    }
+    port_id
 }
 
 fn sys_virt_to_phys(va: u64) -> u64 {

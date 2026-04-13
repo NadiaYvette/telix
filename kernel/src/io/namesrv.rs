@@ -11,6 +11,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Global port ID for the name server.
 pub static NAMESRV_PORT: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// Port ID for the "blk" service, set when it registers.
+/// Used to pass blk_srv's port to late-spawning servers that can't
+/// use the name server due to the lost-wakeup bug.
+pub static BLK_SRV_PORT: AtomicU64 = AtomicU64::new(0);
+
+/// Port ID for the "apfs" service, set when it registers.
+pub static APFS_SRV_PORT: AtomicU64 = AtomicU64::new(0);
+
 const MAX_SVC_NAME: usize = 24;
 
 struct ServiceEntry {
@@ -86,6 +94,7 @@ pub fn namesrv_server() -> ! {
 
     let mut table = NameTable::new();
 
+    let mut msg_count = 0u32;
     loop {
         let msg = match port::recv(srv_port) {
             Ok(m) => m,
@@ -94,6 +103,10 @@ pub fn namesrv_server() -> ! {
                 break;
             }
         };
+        msg_count += 1;
+        if msg_count <= 30 || msg_count % 100 == 0 {
+            crate::println!("[namesrv] msg #{} tag={:#x}", msg_count, msg.tag);
+        }
 
         match msg.tag {
             NS_REGISTER => {
@@ -104,6 +117,12 @@ pub fn namesrv_server() -> ! {
                 let name = &name_buf[..name_len.min(MAX_SVC_NAME)];
 
                 table.register(name, service_port);
+                // Track well-known service ports for direct access.
+                if name == b"blk" {
+                    BLK_SRV_PORT.store(service_port, Ordering::Release);
+                } else if name == b"apfs" {
+                    APFS_SRV_PORT.store(service_port, Ordering::Release);
+                }
                 let _ = port::send_nb(reply_port, Message::new(NS_REGISTER_OK, [0, 0, 0, 0, 0, 0]));
             }
 
