@@ -1,6 +1,10 @@
 #![no_std]
 #![no_main]
 
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2024-2026 Nadia Chambers
+// Reference codebases: Linux kernel (syscall interface semantics)
+
 //! Linux personality server.
 //!
 //! Receives forwarded Linux syscalls from the kernel's personality routing

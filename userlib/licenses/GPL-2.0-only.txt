@@ -1,0 +1,25 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+The following source files in this repository are licensed under the
+GNU General Public License, version 2 only (GPL-2.0-only):
+
+  apfs_srv.rs    — informed by linux-apfs-rw, apfsprogs
+  xfs_srv.rs     — informed by Linux fs/xfs, xfsprogs
+  ext2_srv.rs    — informed by Linux fs/ext2, e2fsprogs
+  fat16_srv.rs   — informed by Linux fs/fat
+  iso9660_srv.rs — informed by Linux fs/isofs
+  udf_srv.rs     — informed by Linux fs/udf, udftools
+  linux_srv.rs   — informed by Linux kernel syscall semantics
+  net_srv.rs     — informed by Linux networking stack
+  procfs_srv.rs  — informed by Linux fs/proc
+  sysv_srv.rs    — informed by Linux ipc/ (SysV IPC semantics)
+  pty_srv.rs     — informed by Linux drivers/tty
+
+The full license text is available at:
+  https://spdx.org/licenses/GPL-2.0-only.html
+  https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+
+A copy may also be obtained by writing to:
+  Free Software Foundation, Inc.
+  51 Franklin Street, Fifth Floor
+  Boston, MA 02110-1301, USA

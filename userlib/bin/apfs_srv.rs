@@ -1,6 +1,10 @@
 #![no_std]
 #![no_main]
 
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2024-2026 Nadia Chambers
+// Reference codebases: linux-apfs-rw (by Ernesto A. Fernandez), apfsprogs
+
 //! APFS read-write filesystem server.
 //!
 //! Pure userspace process that reads/writes an APFS partition via cache_blk IPC.

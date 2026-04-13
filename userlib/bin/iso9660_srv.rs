@@ -1,6 +1,10 @@
 #![no_std]
 #![no_main]
 
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2024-2026 Nadia Chambers
+// Reference codebases: Linux fs/isofs
+
 //! ISO 9660 (ECMA-119) read-only filesystem server.
 //!
 //! Userspace process that reads an ISO 9660 image from blk_srv via IPC.

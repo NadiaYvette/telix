@@ -1,6 +1,10 @@
 #![no_std]
 #![no_main]
 
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2024-2026 Nadia Chambers
+// Reference codebases: Linux fs/proc
+
 //! procfs — process filesystem server.
 //!
 //! Serves virtual files: meminfo, uptime, N/status (per-process).

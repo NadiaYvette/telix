@@ -1,6 +1,10 @@
 #![no_std]
 #![no_main]
 
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2024-2026 Nadia Chambers
+// Reference codebases: Linux ipc/ (SysV IPC semantics)
+
 //! SysV IPC server — semaphore sets for PostgreSQL inter-process sync.
 //!
 //! Protocol tags (0xA000-0xAFFF):

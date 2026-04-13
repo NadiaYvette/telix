@@ -1,6 +1,10 @@
 #![no_std]
 #![no_main]
 
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2024-2026 Nadia Chambers
+// Reference codebases: Linux fs/udf, udftools
+
 //! UDF (Universal Disk Format, ECMA-167 / OSTA UDF) read-only filesystem server.
 //!
 //! Userspace process that reads a UDF image from blk_srv via IPC.

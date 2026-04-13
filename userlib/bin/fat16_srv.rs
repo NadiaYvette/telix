@@ -1,6 +1,10 @@
 #![no_std]
 #![no_main]
 
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright 2024-2026 Nadia Chambers
+// Reference codebases: Linux fs/fat
+
 //! FAT16 filesystem server.
 //!
 //! Pure userspace process that reads a FAT16 filesystem from blk_srv via IPC.
