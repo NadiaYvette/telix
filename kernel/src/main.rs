@@ -149,19 +149,8 @@ fn startup_thread() -> ! {
     // Phase 3: I/O server stack.
     println!("Phase 3: Starting I/O servers...");
 
-    // Name server (kernel thread) — must start first for service registration.
-    sched::spawn(io::namesrv::namesrv_server, 50, 20).expect("spawn namesrv");
-    // Wait for name server to be ready. block_current demotes our priority
-    // to 254, so namesrv (prio 50) gets scheduled to complete initialization.
-    while io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire) == u64::MAX {
-        // Fake a block so we yield to namesrv. wake_thread won't be called
-        // for us, but we'll break out when NAMESRV_PORT changes.
-        // Use set_yield_asap + WFI instead of block_current to avoid needing
-        // a wakeup signal.
-        let my_tid = sched::current_thread_id();
-        sched::scheduler::set_yield_asap(my_tid);
-        sched::scheduler::arch_wait_for_irq();
-    }
+    // Service registry is now kernel-internal (no namesrv thread needed).
+    // Servers call SYS_SVC_REGISTER/SYS_SVC_LOOKUP directly.
 
     sched::spawn(io::initramfs::initramfs_server, 50, 20).expect("spawn initramfs");
 
@@ -366,21 +355,8 @@ fn startup_thread() -> ! {
         let srv_port = ipc::port::create().expect("initramfs_srv port");
         io::initramfs::USER_INITRAMFS_PORT.store(srv_port, Ordering::Release);
 
-        // Register initramfs with name server.
-        {
-            let nsrv = io::namesrv::NAMESRV_PORT.load(Ordering::Acquire);
-            let (n0, n1, _n2) = io::protocol::pack_name(b"initramfs");
-            let name_len = 9u64;
-            let reply_port = ipc::port::create().expect("reg reply port");
-            let d3 = name_len | ((reply_port as u64) << 32);
-            let msg = ipc::Message::new(
-                io::protocol::NS_REGISTER,
-                [n0, n1, srv_port as u64, d3, 0, 0],
-            );
-            let _ = ipc::port::send(nsrv, msg);
-            let _ = ipc::port::recv(reply_port); // wait for NS_REGISTER_OK
-            ipc::port::destroy(reply_port);
-        }
+        // Register initramfs in the kernel service registry.
+        io::namesrv::svc_register(b"initramfs", srv_port);
 
         match sched::spawn_user_with_data(
             b"initramfs_srv",
@@ -409,21 +385,8 @@ fn startup_thread() -> ! {
         let cpio_data: &[u8] = include_bytes!("io/initramfs.cpio");
         let srv_port = ipc::port::create().expect("rootfs_srv port");
 
-        // Register rootfs with name server.
-        {
-            let nsrv = io::namesrv::NAMESRV_PORT.load(Ordering::Acquire);
-            let (n0, n1, _n2) = io::protocol::pack_name(b"rootfs");
-            let name_len = 6u64;
-            let reply_port = ipc::port::create().expect("reg reply port");
-            let d3 = name_len | ((reply_port as u64) << 32);
-            let msg = ipc::Message::new(
-                io::protocol::NS_REGISTER,
-                [n0, n1, srv_port as u64, d3, 0, 0],
-            );
-            let _ = ipc::port::send(nsrv, msg);
-            let _ = ipc::port::recv(reply_port); // wait for NS_REGISTER_OK
-            ipc::port::destroy(reply_port);
-        }
+        // Register rootfs in the kernel service registry.
+        io::namesrv::svc_register(b"rootfs", srv_port);
 
         match sched::spawn_user_with_data(
             b"rootfs_srv",
@@ -476,30 +439,13 @@ fn startup_thread() -> ! {
     }
 
     // Spawn APFS filesystem server.
-    // Pass blk_srv's port via arg0 high bits. BLK_SRV_PORT is set by the name
-    // server when blk_srv registers. We spin briefly to wait for it.
+    // arg0 = partition byte offset. apfs_srv discovers blk_srv via
+    // ns_lookup_wait("blk") at runtime — no kernel-side port spinning needed.
     {
-        use core::sync::atomic::Ordering;
         let part_off: u64 = 336 * 1024 * 1024;
-        let mut blk_port = 0u64;
-        for _ in 0..100_000u32 {
-            blk_port = io::namesrv::BLK_SRV_PORT.load(Ordering::Acquire);
-            if blk_port != 0 { break; }
-            core::hint::spin_loop();
-        }
-        if blk_port == 0 {
-            println!("  WARNING: blk_srv port not found for apfs_srv");
-        }
-        // Encode: low 48 bits = partition offset, high 16 bits = blk_port.
-        let arg0 = part_off | (blk_port << 48);
-        match sched::spawn_user(b"apfs_srv", 50, 20, arg0) {
+        match sched::spawn_user(b"apfs_srv", 50, 20, part_off) {
             Some(tid) => {
-                // Grant SEND cap on blk_port to the apfs_srv task.
-                if blk_port != 0 {
-                    let task_id = sched::thread_task_id(tid);
-                    cap::grant_send_cap(task_id, blk_port);
-                }
-                println!("  apfs_srv spawned (thread {}, blk_port={})", tid, blk_port);
+                println!("  apfs_srv spawned (thread {})", tid);
             }
             None => println!("  WARNING: apfs_srv not found (ok if not yet built)"),
         }

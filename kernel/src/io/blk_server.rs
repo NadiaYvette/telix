@@ -30,17 +30,8 @@ fn blk_server_no_device() -> ! {
     let port = port::create().expect("blk null port");
     BLK_PORT.store(port, Ordering::Release);
 
-    // Register with name server so ns_lookup("blk") doesn't hang.
-    let nsrv = crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire);
-    if nsrv != u64::MAX {
-        let (n0, n1, _) = pack_name(b"blk");
-        let reply_port = port::create().expect("blk reg reply");
-        let d3 = 3u64 | ((reply_port as u64) << 32);
-        let msg = Message::new(NS_REGISTER, [n0, n1, port as u64, d3, 0, 0]);
-        let _ = crate::ipc::port::send(nsrv, msg);
-        let _ = crate::ipc::port::recv(reply_port);
-        crate::ipc::port::destroy(reply_port);
-    }
+    // Register in the kernel service registry.
+    crate::io::namesrv::svc_register(b"blk", port);
 
     crate::println!("  [blk] no-device stub on port {}", port);
 
@@ -107,20 +98,8 @@ pub fn blk_server() -> ! {
     let pt_root = crate::mm::hat::boot_page_table_root();
     let my_aspace = crate::mm::aspace::create(pt_root).expect("blk aspace");
 
-    // Register with name server.
-    {
-        let nsrv = crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire);
-        if nsrv != u64::MAX {
-            let (n0, n1, _n2) = pack_name(b"blk");
-            let name_len = 3u64;
-            let reply_port = port::create().expect("blk reg reply port");
-            let d3 = name_len | ((reply_port as u64) << 32);
-            let msg = Message::new(NS_REGISTER, [n0, n1, port as u64, d3, 0, 0]);
-            let _ = crate::ipc::port::send(nsrv, msg);
-            let _ = crate::ipc::port::recv(reply_port); // wait for NS_REGISTER_OK
-            crate::ipc::port::destroy(reply_port);
-        }
-    }
+    // Register in the kernel service registry.
+    crate::io::namesrv::svc_register(b"blk", port);
 
     crate::println!("  [blk] server ready on port {}", port);
 

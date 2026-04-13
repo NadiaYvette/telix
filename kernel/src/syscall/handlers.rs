@@ -110,7 +110,9 @@ pub const SYS_FUTEX_WAIT_PI: u64 = 101;
 pub const SYS_FUTEX_WAKE_PI: u64 = 102;
 pub const SYS_PAGE_SIZE: u64 = 103;
 pub const SYS_SCHED_SETATTR: u64 = 114;
-pub const SYS_SVC_PORT: u64 = 115;
+pub const SYS_SVC_PORT: u64 = 115; // legacy — kept for compat, routes to svc_lookup
+pub const SYS_SVC_REGISTER: u64 = 116;
+pub const SYS_SVC_LOOKUP: u64 = 117;
 // Personality syscalls live in the 0xF000 range to avoid collisions with
 // Linux x86_64 syscall numbers (which go up to ~450). Previously these were
 // 104-114 which collided with Linux getgid, setuid, setgid, geteuid, getegid,
@@ -458,6 +460,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
             if crate::ipc::port::port_ref(a0).is_some() { 1 } else { 0 }
         }
         SYS_SVC_PORT => sys_svc_port(a0),
+        SYS_SVC_REGISTER => sys_svc_register(a0, a1, a2, a3, a4),
+        SYS_SVC_LOOKUP => sys_svc_lookup(a0, a1, a2, a3),
         SYS_PERSONALITY_REGISTER => {
             crate::syscall::personality::register_server(a0 as u8, a1)
         }
@@ -1307,24 +1311,41 @@ fn sys_port_set_recv(set_id: u64, frame: &mut ExceptionFrame) -> u64 {
 }
 
 fn sys_nsrv_port() -> u64 {
-    use core::sync::atomic::Ordering;
-    crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire)
+    // Legacy: there is no namesrv port anymore (service registry is a syscall).
+    // Return u64::MAX ("not available") for backward compatibility.
+    u64::MAX
 }
 
-/// Return the port ID for a well-known service by index, granting SEND cap.
-/// index 0 = blk, 1 = apfs.  Returns 0 if not yet registered.
+/// Legacy: return well-known service port by index (0=blk, 1=apfs).
+/// Routes through the new kernel name table for backward compatibility.
 fn sys_svc_port(index: u64) -> u64 {
-    use core::sync::atomic::Ordering;
-    let port_id = match index {
-        0 => crate::io::namesrv::BLK_SRV_PORT.load(Ordering::Acquire),
-        1 => crate::io::namesrv::APFS_SRV_PORT.load(Ordering::Acquire),
+    let name: &[u8] = match index {
+        0 => b"blk",
+        1 => b"apfs",
         _ => return 0,
     };
-    if port_id != 0 {
-        let task_id = crate::sched::scheduler::current_task_id();
-        crate::cap::grant_send_cap(task_id, port_id);
-    }
-    port_id
+    crate::io::namesrv::svc_lookup(name, false)
+}
+
+/// Register a service name → port mapping in the kernel name table.
+/// args: name packed in a0/a1/a2 (3 × u64 = 24 bytes), a3 = name_len, a4 = port_id.
+/// Returns 0 on success, 1 on failure.
+fn sys_svc_register(a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let name_len = (a3 as usize).min(24);
+    let name_buf = crate::io::protocol::unpack_name(a0, a1, a2, name_len);
+    let name = &name_buf[..name_len];
+    crate::io::namesrv::svc_register(name, a4)
+}
+
+/// Look up a service by name. Returns port ID (with SEND cap granted), or 0.
+/// args: name packed in a0/a1/a2, a3 = name_len (low 32) | flags (high 32).
+/// Flag bit 32: WAIT — block until the service registers.
+fn sys_svc_lookup(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let name_len = ((a3 & 0xFFFF_FFFF) as usize).min(24);
+    let wait = (a3 >> 32) & 1 != 0;
+    let name_buf = crate::io::protocol::unpack_name(a0, a1, a2, name_len);
+    let name = &name_buf[..name_len];
+    crate::io::namesrv::svc_lookup(name, wait)
 }
 
 fn sys_virt_to_phys(va: u64) -> u64 {

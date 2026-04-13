@@ -150,25 +150,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- APFS write smoke test (before name server test which may hang) ---
     syscall::debug_puts(b"  init: APFS write smoke test...\n");
     {
-        // Discover apfs_srv port via SYS_SVC_PORT (index 1), bypassing
-        // the name server which suffers from a lost-wakeup bug.
+        // Poll for apfs_srv to register (ns_lookup_wait would work but
+        // spin-waits at prio 254 which starves apfs_srv on single-CPU QEMU).
         let apfs_port_opt = {
-            let mut found = 0u64;
-            for _ in 0..200_000u32 {
-                found = syscall::svc_port(1);
-                if found != 0 { break; }
+            let mut found: Option<u64> = None;
+            for _ in 0..500_000u32 {
+                if let Some(p) = syscall::ns_lookup(b"apfs") {
+                    found = Some(p);
+                    break;
+                }
                 syscall::yield_now();
             }
-            if found != 0 {
-                syscall::debug_puts(b"  init: found apfs port=");
-                print_num(found);
-                syscall::debug_puts(b"\n");
-                Some(found)
-            } else {
-                syscall::debug_puts(b"  init: apfs not found after retries\n");
-                None
-            }
+            found
         };
+        if let Some(p) = apfs_port_opt {
+            syscall::debug_puts(b"  init: found apfs port=");
+            print_num(p);
+            syscall::debug_puts(b"\n");
+        } else {
+            syscall::debug_puts(b"  init: apfs not found after retries\n");
+        }
 
         if let Some(apfs_port) = apfs_port_opt {
             let rp = syscall::port_create();

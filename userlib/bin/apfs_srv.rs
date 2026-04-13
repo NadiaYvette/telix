@@ -439,9 +439,9 @@ impl BlkClient {
                 return Some(m);
             }
         }
-        // Sleep-poll: sleep briefly then check. The sleep guarantees we get
-        // woken by the timer (not relying on IPC wakeup), and the poll checks
-        // if the reply arrived while we were asleep.
+        // Sleep-poll: sleep briefly then check.  blk_srv replies with send_nb
+        // which can silently fail; the sleep+poll loop absorbs that by giving
+        // the sender time to re-run on this single CPU.
         for _ in 0..500 {
             syscall::nanosleep(100_000); // 100μs
             if let Some(m) = syscall::recv_nb_msg(self.reply_port) {
@@ -3149,71 +3149,51 @@ static mut BLOCK_COUNT: u64 = 0;
 fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  [apfs_srv] starting\n");
 
-    // arg0 encoding: low 48 bits = partition byte offset, high 16 bits = blk_port
-    let partition_offset = arg0 & 0x0000_FFFF_FFFF_FFFF;
-    let passed_blk_port = arg0 >> 48;
+    // arg0 = partition byte offset (blk_port discovered via name registry).
+    let partition_offset = arg0;
 
     syscall::debug_puts(b"  [apfs_srv] partition offset=");
     print_num(partition_offset);
-    syscall::debug_puts(b" blk_hint=");
-    print_num(passed_blk_port);
     syscall::debug_puts(b"\n");
 
     // Create port. Registration deferred until after init completes.
     let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
 
-    // Use blk_port passed by kernel via arg0 high bits.
-    let blk_port = if passed_blk_port != 0 {
-        syscall::debug_puts(b"  [apfs_srv] using blk port=");
-        print_num(passed_blk_port);
-        syscall::debug_puts(b"\n");
-        passed_blk_port
-    } else {
-        syscall::debug_puts(b"  [apfs_srv] no blk port passed, exiting\n");
-        syscall::exit(1);
-        0 // unreachable
+    // Discover blk_srv via blocking name lookup (waits until blk registers).
+    syscall::debug_puts(b"  [apfs_srv] waiting for blk_srv...\n");
+    let blk_port = match syscall::ns_lookup_wait(b"blk") {
+        Some(p) => p,
+        None => {
+            syscall::debug_puts(b"  [apfs_srv] blk_srv lookup failed, exiting\n");
+            syscall::exit(1);
+            0
+        }
     };
-    // Connect directly to blk_srv using non-blocking send + poll recv.
+    syscall::debug_puts(b"  [apfs_srv] blk port=");
+    print_num(blk_port);
+    syscall::debug_puts(b"\n");
+
+    // Connect to blk_srv.
     syscall::debug_puts(b"  [apfs_srv] connecting to blk_srv...\n");
     let blk_reply = syscall::port_create();
     let blk_aspace = {
         let d2 = 3u64 | ((blk_reply as u64) << 32);
-        // Retry the send until it succeeds.
-        let mut send_ok = false;
-        for _ in 0..10000u32 {
-            let sr = syscall::send_nb_4(blk_port, IO_CONNECT, 0, 0, d2, 0);
-            if sr == 0 {
-                send_ok = true;
-                break;
+        syscall::send(blk_port, IO_CONNECT, 0, 0, d2, 0);
+        let reply = match syscall::recv_msg(blk_reply) {
+            Some(r) => r,
+            None => {
+                syscall::debug_puts(b"  [apfs_srv] blk connect recv failed\n");
+                loop { core::hint::spin_loop(); }
             }
-            syscall::yield_now();
-        }
-        if !send_ok {
-            syscall::debug_puts(b"  [apfs_srv] connect send failed\n");
+        };
+        if reply.tag != IO_CONNECT_OK {
+            syscall::debug_puts(b"  [apfs_srv] blk connect FAILED tag=");
+            print_num(reply.tag);
+            syscall::debug_puts(b"\n");
             loop { core::hint::spin_loop(); }
         }
-        // Poll for reply.
-        let mut aspace = 0u64;
-        for _ in 0..50000u32 {
-            if let Some(reply) = syscall::recv_nb_msg(blk_reply) {
-                if reply.tag == IO_CONNECT_OK {
-                    aspace = reply.data[2];
-                } else {
-                    syscall::debug_puts(b"  [apfs_srv] blk connect FAILED tag=");
-                    print_num(reply.tag);
-                    syscall::debug_puts(b"\n");
-                    loop { core::hint::spin_loop(); }
-                }
-                break;
-            }
-            syscall::yield_now();
-        }
-        if aspace == 0 {
-            syscall::debug_puts(b"  [apfs_srv] blk connect timeout\n");
-            loop { core::hint::spin_loop(); }
-        }
-        aspace
+        reply.data[2]
     };
 
     // Allocate scratch page for block reads.
@@ -3400,36 +3380,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         unsafe { VOL_NEXT_OBJ_ID = 2048; }
     }
 
-    // Register with name server using non-blocking IPC (avoid lost-wakeup bug).
-    {
-        let nsrv = syscall::nsrv_port();
-        let rp = syscall::port_create();
-        let (n0, n1, _) = syscall::pack_name(b"apfs");
-        let d3 = 4u64 | (rp << 32);
-        let mut registered = false;
-        for _ in 0..5000u32 {
-            let sr = syscall::send_nb_4(nsrv, 0x1000, n0, n1, port, d3);
-            if sr != 0 {
-                for _ in 0..50 { syscall::yield_now(); }
-                continue;
-            }
-            for _ in 0..5000u32 {
-                if let Some(reply) = syscall::recv_nb_msg(rp) {
-                    if reply.tag == 0x1001 {
-                        registered = true;
-                    }
-                    break;
-                }
-                syscall::yield_now();
-            }
-            if registered { break; }
-            for _ in 0..50 { syscall::yield_now(); }
-        }
-        syscall::port_destroy(rp);
-        if !registered {
-            syscall::debug_puts(b"  [apfs_srv] ns_register FAILED\n");
-        }
-    }
+    // Register in the kernel service registry (direct syscall, no IPC needed).
+    syscall::ns_register(b"apfs", port);
     syscall::debug_puts(b"  [apfs_srv] ready (read-write)\n");
 
     // Open file table.

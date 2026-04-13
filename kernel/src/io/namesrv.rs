@@ -1,23 +1,18 @@
-//! Name server — maps service names to IPC port IDs.
+//! Service registry — maps service names to IPC port IDs.
 //!
-//! Runs as a kernel thread. Clients register and look up services via IPC messages.
-//! The name table grows dynamically — no compile-time cap on registered services.
+//! Implemented as kernel-internal functions called directly from syscall
+//! handlers (`SYS_SVC_REGISTER`, `SYS_SVC_LOOKUP`). This replaces the
+//! previous design where a kernel thread processed IPC messages — that
+//! approach was fragile because the reply-port dance could lose wakeups
+//! and hang callers indefinitely.
+//!
+//! Blocking lookups (`SVC_LOOKUP_WAIT` flag) park the calling thread and
+//! wake it when the requested service registers. No ephemeral reply ports,
+//! no message queues, no scheduling-order sensitivity.
 
-use super::protocol::*;
-use crate::ipc::{Message, port};
 use crate::mm::paged_array::PagedArray;
-use core::sync::atomic::{AtomicU64, Ordering};
-
-/// Global port ID for the name server.
-pub static NAMESRV_PORT: AtomicU64 = AtomicU64::new(u64::MAX);
-
-/// Port ID for the "blk" service, set when it registers.
-/// Used to pass blk_srv's port to late-spawning servers that can't
-/// use the name server due to the lost-wakeup bug.
-pub static BLK_SRV_PORT: AtomicU64 = AtomicU64::new(0);
-
-/// Port ID for the "apfs" service, set when it registers.
-pub static APFS_SRV_PORT: AtomicU64 = AtomicU64::new(0);
+use crate::sched::thread::BlockReason;
+use crate::sync::SpinLock;
 
 const MAX_SVC_NAME: usize = 24;
 
@@ -39,9 +34,30 @@ impl ServiceEntry {
     }
 }
 
+/// A thread blocked in `SYS_SVC_LOOKUP` with the `WAIT` flag.
+struct SvcWaiter {
+    name: [u8; MAX_SVC_NAME],
+    name_len: usize,
+    tid: u32,
+    active: bool,
+}
+
+impl SvcWaiter {
+    const fn empty() -> Self {
+        Self {
+            name: [0; MAX_SVC_NAME],
+            name_len: 0,
+            tid: 0,
+            active: false,
+        }
+    }
+}
+
 struct NameTable {
     entries: PagedArray<ServiceEntry>,
     count: usize,
+    waiters: PagedArray<SvcWaiter>,
+    waiter_count: usize,
 }
 
 impl NameTable {
@@ -49,11 +65,13 @@ impl NameTable {
         Self {
             entries: PagedArray::new(),
             count: 0,
+            waiters: PagedArray::new(),
+            waiter_count: 0,
         }
     }
 
     fn register(&mut self, name: &[u8], port_id: u64) -> bool {
-        // Check for duplicate — update if exists.
+        // Update if already registered.
         for i in 0..self.count {
             let e = self.entries.get(i);
             if e.active && e.name_len == name.len() && &e.name[..name.len()] == name {
@@ -84,77 +102,112 @@ impl NameTable {
         }
         None
     }
-}
 
-/// Name server entry point (kernel thread).
-pub fn namesrv_server() -> ! {
-    let srv_port = port::create().expect("namesrv port");
-    NAMESRV_PORT.store(srv_port, Ordering::Release);
-    crate::println!("  [namesrv] ready on port {}", srv_port);
-
-    let mut table = NameTable::new();
-
-    let mut msg_count = 0u32;
-    loop {
-        let msg = match port::recv(srv_port) {
-            Ok(m) => m,
-            Err(()) => {
-                crate::println!("[namesrv] recv returned Err — exiting loop!");
-                break;
-            }
-        };
-        msg_count += 1;
-        if msg_count <= 30 || msg_count % 100 == 0 {
-            crate::println!("[namesrv] msg #{} tag={:#x}", msg_count, msg.tag);
+    /// Add a waiter for a service name. Returns true if added.
+    fn add_waiter(&mut self, name: &[u8], tid: u32) -> bool {
+        if !self.waiters.ensure_capacity(self.waiter_count + 1) {
+            return false;
         }
-
-        match msg.tag {
-            NS_REGISTER => {
-                let name_len = (msg.data[3] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[3] >> 32;
-                let service_port = msg.data[2];
-                let name_buf = unpack_name(msg.data[0], msg.data[1], 0, name_len);
-                let name = &name_buf[..name_len.min(MAX_SVC_NAME)];
-
-                table.register(name, service_port);
-                // Track well-known service ports for direct access.
-                if name == b"blk" {
-                    BLK_SRV_PORT.store(service_port, Ordering::Release);
-                } else if name == b"apfs" {
-                    APFS_SRV_PORT.store(service_port, Ordering::Release);
-                }
-                let _ = port::send_nb(reply_port, Message::new(NS_REGISTER_OK, [0, 0, 0, 0, 0, 0]));
-            }
-
-            NS_LOOKUP => {
-                let name_len = (msg.data[3] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[3] >> 32;
-                let name_buf = unpack_name(msg.data[0], msg.data[1], msg.data[2], name_len);
-                let name = &name_buf[..name_len.min(MAX_SVC_NAME)];
-
-                let port_id = table.lookup(name).unwrap_or(u64::MAX);
-
-                // Grant SEND cap for the looked-up service port to the client task.
-                if port_id != u64::MAX {
-                    if let Some(client_task) = port::port_creator(reply_port) {
-                        crate::cap::grant_send_cap(client_task, port_id);
-                    }
-                }
-
-                let result = port::send_nb(
-                    reply_port,
-                    Message::new(NS_LOOKUP_OK, [port_id, 0, 0, 0, 0, 0]),
-                );
-                if result.is_err() {
-                    crate::println!("[namesrv] WARN: reply send_nb failed for port {}", reply_port);
-                }
-            }
-
-            _ => {}
-        }
+        let w = self.waiters.get_mut(self.waiter_count);
+        *w = SvcWaiter::empty();
+        let len = name.len().min(MAX_SVC_NAME);
+        w.name[..len].copy_from_slice(&name[..len]);
+        w.name_len = len;
+        w.tid = tid;
+        w.active = true;
+        self.waiter_count += 1;
+        true
     }
 
+    /// Collect thread IDs of waiters matching a service name, marking them inactive.
+    /// Returns the number of waiters found (writes into `out`).
+    fn drain_waiters(&mut self, name: &[u8], out: &mut [u32; 32]) -> usize {
+        let mut n = 0;
+        for i in 0..self.waiter_count {
+            let w = self.waiters.get_mut(i);
+            if w.active && w.name_len == name.len() && &w.name[..name.len()] == name {
+                if n < 32 {
+                    out[n] = w.tid;
+                    n += 1;
+                }
+                w.active = false;
+            }
+        }
+        n
+    }
+}
+
+static TABLE: SpinLock<NameTable> = SpinLock::new(NameTable::new());
+
+/// Register a service. Called from `SYS_SVC_REGISTER`.
+///
+/// Returns 0 on success, 1 on failure (table full).
+/// Wakes any threads blocked in `svc_lookup(..., WAIT)` for this name.
+pub fn svc_register(name: &[u8], port_id: u64) -> u64 {
+    let mut wake_tids = [0u32; 32];
+    let wake_count;
+
+    {
+        let mut table = TABLE.lock();
+        if !table.register(name, port_id) {
+            return 1;
+        }
+        wake_count = table.drain_waiters(name, &mut wake_tids);
+    }
+    // Drop the lock before waking — wake_thread may reschedule.
+
+    // Grant SEND capability to each woken waiter's task.
+    for i in 0..wake_count {
+        let tid = wake_tids[i];
+        let task_id = crate::sched::scheduler::thread_ref(tid).task_id;
+        crate::cap::grant_send_cap(task_id, port_id);
+        crate::sched::scheduler::wake_thread(tid);
+    }
+
+    if name.len() <= 16 {
+        let mut buf = [0u8; 16];
+        buf[..name.len()].copy_from_slice(name);
+        crate::println!(
+            "  [svc] registered {:?} on port {}",
+            core::str::from_utf8(&buf[..name.len()]).unwrap_or("?"),
+            port_id
+        );
+    }
+
+    0
+}
+
+/// Look up a service by name. Called from `SYS_SVC_LOOKUP`.
+///
+/// If `wait` is true and the service is not yet registered, the calling
+/// thread is parked until a matching `svc_register` arrives.
+///
+/// Returns the service port ID, or 0 if not found (and `wait` is false).
+/// On success, grants SEND capability on the service port to the caller.
+pub fn svc_lookup(name: &[u8], wait: bool) -> u64 {
+    let tid = crate::sched::current_thread_id();
+    let task_id = crate::sched::scheduler::current_task_id();
+
     loop {
-        core::hint::spin_loop();
+        let mut table = TABLE.lock();
+        if let Some(port_id) = table.lookup(name) {
+            drop(table);
+            crate::cap::grant_send_cap(task_id, port_id);
+            return port_id;
+        }
+        if !wait {
+            return 0;
+        }
+        // Park: add ourselves as a waiter, then block.
+        if !table.add_waiter(name, tid) {
+            return 0; // waiter table full — shouldn't happen
+        }
+        drop(table);
+
+        crate::sched::block_current(BlockReason::SvcLookup);
+
+        // Woken by svc_register — loop back to look up the port.
+        // (We loop rather than trusting the waker because another thread
+        // could have consumed the registration in a narrow race.)
     }
 }

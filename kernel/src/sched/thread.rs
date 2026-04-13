@@ -29,6 +29,7 @@ pub enum BlockReason {
     WaitChild,
     PersonalityWait,
     Kswapd,
+    SvcLookup,
 }
 
 // Thread ID capacity is determined by RadixTable::capacity() — no fixed constant needed.

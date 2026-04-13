@@ -41,6 +41,8 @@ const SYS_PORT_SET_ADD: u64 = 6;
 const SYS_PORT_SET_RECV: u64 = 22;
 const SYS_NSRV_PORT: u64 = 23;
 const SYS_SVC_PORT: u64 = 115;
+const SYS_SVC_REGISTER: u64 = 116;
+const SYS_SVC_LOOKUP: u64 = 117;
 const SYS_MADVISE: u64 = 90;
 #[allow(dead_code)]
 const SYS_TLS_SET: u64 = 91;
@@ -714,14 +716,13 @@ pub fn recv_msg(port: u64) -> Option<Message> {
     })
 }
 
-/// Get the name server port.
+/// Get the name server port (legacy — kept for cap_test compatibility).
 pub fn nsrv_port() -> u64 {
     unsafe { arch::syscall0(SYS_NSRV_PORT) }
 }
 
 /// Get a well-known service port by index (0=blk, 1=apfs).
-/// Returns 0 if the service hasn't registered yet.
-/// Also grants SEND capability on the port to the calling task.
+/// Legacy — routes through the kernel name table now.
 pub fn svc_port(index: u64) -> u64 {
     unsafe { arch::syscall1(SYS_SVC_PORT, index) }
 }
@@ -853,32 +854,22 @@ pub fn pack_name(name: &[u8]) -> (u64, u64, u64) {
     (words[0], words[1], words[2])
 }
 
-/// Lookup a service by name via the name server. Returns port ID or None.
+/// Lookup a service by name via the kernel name table. Returns port ID or None.
+/// Non-blocking: returns None immediately if the service is not registered.
 pub fn ns_lookup(name: &[u8]) -> Option<u64> {
-    let nsrv = nsrv_port();
-    if nsrv == u64::MAX {
-        return None;
-    }
-
-    let reply_port = port_create();
     let (n0, n1, n2) = pack_name(name);
-    let d3 = (name.len() as u64) | (reply_port << 32);
+    let d3 = name.len() as u64; // no WAIT flag
+    let port = unsafe { arch::syscall4(SYS_SVC_LOOKUP, n0, n1, n2, d3) };
+    if port != 0 { Some(port) } else { None }
+}
 
-    // NS_LOOKUP = 0x1100
-    send(nsrv, 0x1100, n0, n1, n2, d3);
-
-    let result = if let Some(reply) = recv_msg(reply_port) {
-        if reply.tag == 0x1101 {
-            let port = reply.data[0];
-            if port != u64::MAX { Some(port) } else { None }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    port_destroy(reply_port);
-    result
+/// Lookup a service by name, blocking until it registers.
+/// Returns port ID (always non-zero on success).
+pub fn ns_lookup_wait(name: &[u8]) -> Option<u64> {
+    let (n0, n1, n2) = pack_name(name);
+    let d3 = (name.len() as u64) | (1u64 << 32); // WAIT flag
+    let port = unsafe { arch::syscall4(SYS_SVC_LOOKUP, n0, n1, n2, d3) };
+    if port != 0 { Some(port) } else { None }
 }
 
 /// Query the bootloader-provided framebuffer info.
@@ -2070,28 +2061,13 @@ pub fn shm_unlink(shm_port: u64, name: &[u8]) -> bool {
     result
 }
 
-/// Register a service with the name server.
+/// Register a service in the kernel name table.
 pub fn ns_register(name: &[u8], service_port: u64) -> bool {
-    let nsrv = nsrv_port();
-    if nsrv == u64::MAX {
-        return false;
-    }
-
-    let reply_port = port_create();
-    let (n0, n1, _n2) = pack_name(name);
-    let d3 = (name.len() as u64) | (reply_port << 32);
-
-    // NS_REGISTER = 0x1000
-    // data[0..1] = name, data[2] = service_port, data[3] = name_len | reply_port
-    send(nsrv, 0x1000, n0, n1, service_port, d3);
-
-    let result = if let Some(reply) = recv_msg(reply_port) {
-        reply.tag == 0x1001
-    } else {
-        false
+    let (n0, n1, n2) = pack_name(name);
+    let result = unsafe {
+        arch::syscall5(SYS_SVC_REGISTER, n0, n1, n2, name.len() as u64, service_port)
     };
-    port_destroy(reply_port);
-    result
+    result == 0
 }
 
 /// madvise: advise kernel about memory usage patterns.

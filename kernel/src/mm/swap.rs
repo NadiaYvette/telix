@@ -582,35 +582,10 @@ static PENDING_BLK_OFFSET_KB: AtomicU32 = AtomicU32::new(0);
 static PENDING_BLK_SIZE_KB: AtomicU32 = AtomicU32::new(0);
 static BLK_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// Resolve the "blk" service port via NS_LOOKUP.
+/// Resolve the "blk" service port via the kernel service registry.
 fn ns_lookup_blk() -> Option<u64> {
-    let nsrv = crate::io::namesrv::NAMESRV_PORT.load(Ordering::Acquire);
-    if nsrv == u64::MAX {
-        return None;
-    }
-
-    let (n0, n1, n2) = crate::io::protocol::pack_name(b"blk");
-    let reply_port = port::create()?;
-    let d3 = 3u64 | ((reply_port) << 32);
-    let msg = Message::new(crate::io::protocol::NS_LOOKUP, [n0, n1, n2, d3, 0, 0]);
-    if port::send(nsrv, msg).is_err() {
-        port::destroy(reply_port);
-        return None;
-    }
-    let reply = match port::recv(reply_port) {
-        Ok(r) => r,
-        Err(()) => {
-            port::destroy(reply_port);
-            return None;
-        }
-    };
-    port::destroy(reply_port);
-
-    if reply.tag == crate::io::protocol::NS_LOOKUP_OK && reply.data[0] != u64::MAX {
-        Some(reply.data[0])
-    } else {
-        None
-    }
+    let port = crate::io::namesrv::svc_lookup(b"blk", false);
+    if port != 0 { Some(port) } else { None }
 }
 
 /// Initialize the block I/O swap backend. Called from `init_blk_deferred`

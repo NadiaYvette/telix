@@ -1032,11 +1032,8 @@ fn do_spawn_heavy_work(
                 (*tptr).capspace = crate::cap::CapSpace::new(task_id);
             }
         }
-        let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
-        if nsrv != u64::MAX {
-            crate::cap::grant_send_cap(task_id, nsrv);
-        }
-
+        // Grant SEND cap for initramfs port (well-known kernel service).
+        // No namesrv port grant needed — service registry is a syscall now.
         let iramfs =
             crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
         if iramfs != u64::MAX {
@@ -3183,10 +3180,6 @@ pub fn fork_current() -> u64 {
             }
         }
         // Grant SEND caps for well-known kernel ports.
-        let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
-        if nsrv != u64::MAX {
-            crate::cap::grant_send_cap(child_task_id, nsrv);
-        }
         let iramfs =
             crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
         if iramfs != u64::MAX {
@@ -3418,10 +3411,6 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
         {
             let tptr = TASK_TABLE.get(child_task_id) as *mut Task;
             unsafe { (*tptr).capspace = crate::cap::CapSpace::new(child_task_id); }
-        }
-        let nsrv = crate::io::namesrv::NAMESRV_PORT.load(core::sync::atomic::Ordering::Acquire);
-        if nsrv != u64::MAX {
-            crate::cap::grant_send_cap(child_task_id, nsrv);
         }
         let iramfs =
             crate::io::initramfs::USER_INITRAMFS_PORT.load(core::sync::atomic::Ordering::Acquire);
