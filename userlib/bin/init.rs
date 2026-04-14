@@ -1987,23 +1987,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         // Test 2: cross-server IPC exercises park + wake + inject.
-        // Send NS_LOOKUP to name server, recv reply on our reply port.
-        let nsrv = syscall::nsrv_port();
-        let ns_tag: u64 = 0x1100; // NS_LOOKUP
-        let name = b"initramfs\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-        let w0 = u64::from_le_bytes(name[0..8].try_into().unwrap());
-        let w1 = u64::from_le_bytes(name[8..16].try_into().unwrap());
-        let w2 = u64::from_le_bytes(name[16..24].try_into().unwrap());
-        let len_reply = 9u64 | (rply_port << 32);
-        syscall::send(nsrv, ns_tag, w0, w1, w2, len_reply);
-        if let Some(reply) = syscall::recv_msg(rply_port) {
-            let port_id = reply.data[0];
-            if port_id == 0 || port_id > 63 {
-                syscall::debug_puts(b"  init: L4 ns_lookup got bad port\n");
+        // Send IO_STAT to blk server, recv reply on our reply port.
+        if let Some(blk) = syscall::ns_lookup(b"blk") {
+            let io_stat: u64 = 0x400;
+            let io_stat_ok: u64 = 0x401;
+            let d0 = 0u64 | (rply_port << 32); // handle=0 | reply_port<<32
+            syscall::send(blk, io_stat, d0, 0, 0, 0);
+            if let Some(reply) = syscall::recv_msg(rply_port) {
+                if reply.tag != io_stat_ok || reply.data[0] == 0 {
+                    syscall::debug_puts(b"  init: L4 blk stat bad reply\n");
+                    handoff_ok = false;
+                }
+            } else {
+                syscall::debug_puts(b"  init: L4 blk stat recv failed\n");
                 handoff_ok = false;
             }
         } else {
-            syscall::debug_puts(b"  init: L4 ns_lookup recv failed\n");
+            syscall::debug_puts(b"  init: L4 blk lookup failed\n");
             handoff_ok = false;
         }
 
