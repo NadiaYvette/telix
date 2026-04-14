@@ -433,7 +433,7 @@ impl BlkClient {
             self.grant_va as u64,
         );
 
-        let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
+        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 50_000) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
                 let copy_len = out.len().min(512 - offset_in_sector);
                 unsafe {
@@ -488,7 +488,7 @@ impl BlkClient {
                 self.grant_va as u64,
             );
 
-            let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
+            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 50_000) {
                 if rr.tag == IO_READ_OK && rr.data[0] == 512 {
                     unsafe {
                         core::ptr::copy_nonoverlapping(
@@ -529,7 +529,7 @@ impl BlkClient {
             d2,
             self.grant_va as u64,
         );
-        let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
+        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 50_000) {
             rr.tag == IO_WRITE_OK
         } else {
             false
@@ -559,7 +559,7 @@ impl BlkClient {
             d2,
             self.grant_va as u64,
         );
-        let ok = if let Some(rr) = syscall::recv_msg(self.reply_port) {
+        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 50_000) {
             if rr.tag == IO_READ_OK {
                 unsafe {
                     core::ptr::copy_nonoverlapping(

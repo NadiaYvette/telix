@@ -60,6 +60,7 @@ const SYS_GETRANDOM: u64 = 96;
 const SYS_PROXY_REGISTER: u64 = 99;
 const SYS_PORT_RESIZE: u64 = 100;
 const SYS_PAGE_SIZE: u64 = 103;
+const SYS_PORT_RECV_TIMEOUT: u64 = 104;
 const SYS_PORT_ALIVE: u64 = 110;
 const SYS_IRQ_ATTACH: u64 = 111;
 const SYS_IRQ_ACK: u64 = 112;
@@ -1029,6 +1030,42 @@ pub fn recv_nb_msg(port: u64) -> Option<Message> {
         tag: r1,
         data: [r2, r3, r4, r5, r6, r7],
     })
+}
+
+/// Receive from a single port with timeout (microseconds).
+/// Returns `None` if the timeout elapses without a message arriving.
+/// `timeout_us = u64::MAX` is treated as infinite (blocking recv).
+pub fn recv_msg_timeout(port: u64, timeout_us: u64) -> Option<Message> {
+    // Infinite: delegate to blocking recv.
+    if timeout_us == u64::MAX {
+        return recv_msg(port);
+    }
+    // Fast path: message already queued.
+    if let Some(m) = recv_nb_msg(port) {
+        return Some(m);
+    }
+    if timeout_us == 0 {
+        return None;
+    }
+    // Poll with backoff: yield first, then nanosleep in 100μs increments.
+    let mut elapsed_us: u64 = 0;
+    // Yield phase: ~10 yields to cover fast replies.
+    for _ in 0..10u32 {
+        yield_now();
+        if let Some(m) = recv_nb_msg(port) {
+            return Some(m);
+        }
+    }
+    // Sleep phase: 100μs steps.
+    let step_us: u64 = 100;
+    while elapsed_us < timeout_us {
+        nanosleep(step_us * 1000);
+        elapsed_us += step_us;
+        if let Some(m) = recv_nb_msg(port) {
+            return Some(m);
+        }
+    }
+    None
 }
 
 /// Read a byte from an I/O port (x86_64 only).

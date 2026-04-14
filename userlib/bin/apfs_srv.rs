@@ -424,32 +424,9 @@ struct BlkClient {
 }
 
 impl BlkClient {
-    /// Receive a reply on reply_port.
-    /// Uses sleep-based polling to work around the kernel IPC wakeup race
-    /// (reschedule IPI is unreliable across CPUs, blocking recv_msg can hang).
+    /// Receive a reply on reply_port with 50ms timeout.
     fn recv_reply(&self) -> Option<syscall::Message> {
-        // Fast path: reply already queued.
-        if let Some(m) = syscall::recv_nb_msg(self.reply_port) {
-            return Some(m);
-        }
-        // Yield-poll: quick check after giving up the timeslice.
-        for _ in 0..10 {
-            syscall::yield_now();
-            if let Some(m) = syscall::recv_nb_msg(self.reply_port) {
-                return Some(m);
-            }
-        }
-        // Sleep-poll: sleep briefly then check.  blk_srv replies with send_nb
-        // which can silently fail; the sleep+poll loop absorbs that by giving
-        // the sender time to re-run on this single CPU.
-        for _ in 0..500 {
-            syscall::nanosleep(100_000); // 100μs
-            if let Some(m) = syscall::recv_nb_msg(self.reply_port) {
-                return Some(m);
-            }
-        }
-        // Final attempt: blocking recv.
-        syscall::recv_msg(self.reply_port)
+        syscall::recv_msg_timeout(self.reply_port, 50_000)
     }
 
     /// Read `len` bytes at byte offset `off` (relative to partition start) into `out`.

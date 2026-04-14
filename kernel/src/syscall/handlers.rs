@@ -109,6 +109,7 @@ pub const SYS_PORT_RESIZE: u64 = 100;
 pub const SYS_FUTEX_WAIT_PI: u64 = 101;
 pub const SYS_FUTEX_WAKE_PI: u64 = 102;
 pub const SYS_PAGE_SIZE: u64 = 103;
+pub const SYS_PORT_RECV_TIMEOUT: u64 = 104;
 pub const SYS_SCHED_SETATTR: u64 = 114;
 pub const SYS_SVC_PORT: u64 = 115; // legacy — kept for compat, routes to svc_lookup
 pub const SYS_SVC_REGISTER: u64 = 116;
@@ -444,6 +445,10 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_TLS_GET => sys_tls_get(),
         SYS_PORT_SET_RECV_TIMEOUT => {
             sys_port_set_recv_timeout(a0, a1, frame);
+            return;
+        }
+        SYS_PORT_RECV_TIMEOUT => {
+            sys_port_recv_timeout(a0, a1, frame);
             return;
         }
         SYS_TIMER_CREATE => sys_timer_create(a0, a1),
@@ -3774,8 +3779,67 @@ fn sys_tls_get() -> u64 {
 }
 
 // ============================================================
-// Phase 75: port_set_recv with timeout
+// Phase 75: port recv with timeout (single port + port set)
 // ============================================================
+
+/// Single-port recv with timeout.  Tries non-blocking recv; on miss returns
+/// u64::MAX (timeout) for finite timeouts, or falls through to blocking recv
+/// for infinite (0xFFFF…).  Userspace wraps the finite case in a poll loop.
+fn sys_port_recv_timeout(port_id: u64, timeout_us: u64, frame: &mut ExceptionFrame) {
+    if !check_port_cap(port_id, crate::cap::Rights::RECV) {
+        set_return(frame, u64::MAX);
+        return;
+    }
+    // Try non-blocking recv first.
+    match crate::ipc::port::recv_nb(port_id) {
+        Ok(msg) => {
+            let task_id = crate::sched::current_task_id();
+            auto_grant_sender_identity(task_id, msg.data[4]);
+            auto_grant_reply_caps(task_id, &msg);
+            set_reg(frame, 1, msg.tag);
+            set_reg(frame, 2, msg.data[0]);
+            set_reg(frame, 3, msg.data[1]);
+            set_reg(frame, 4, msg.data[2]);
+            set_reg(frame, 5, msg.data[3]);
+            set_reg(frame, 6, msg.data[4]);
+            set_reg(frame, 7, msg.data[5]);
+            set_return(frame, 0);
+            let nr = SYS_PORT_RECV_TIMEOUT;
+            crate::trace::trace_event(crate::trace::EVT_SYSCALL_EXIT, nr as u32, 0);
+            if crate::sched::scheduler::current_aspace_id() != 0 {
+                deliver_pending_signals(frame);
+            }
+        }
+        Err(()) => {
+            if timeout_us == 0xFFFFFFFFFFFFFFFF {
+                // Infinite timeout — use blocking recv.
+                let result = sys_recv(port_id, frame);
+                set_return(frame, result);
+                let nr = SYS_PORT_RECV_TIMEOUT;
+                crate::trace::trace_event(
+                    crate::trace::EVT_SYSCALL_EXIT,
+                    nr as u32,
+                    result as u32,
+                );
+                if crate::sched::scheduler::current_aspace_id() != 0 {
+                    deliver_pending_signals(frame);
+                }
+            } else {
+                // Finite timeout (including 0) — return u64::MAX.
+                set_return(frame, u64::MAX);
+                let nr = SYS_PORT_RECV_TIMEOUT;
+                crate::trace::trace_event(
+                    crate::trace::EVT_SYSCALL_EXIT,
+                    nr as u32,
+                    u64::MAX as u32,
+                );
+                if crate::sched::scheduler::current_aspace_id() != 0 {
+                    deliver_pending_signals(frame);
+                }
+            }
+        }
+    }
+}
 
 fn sys_port_set_recv_timeout(set_id: u64, timeout_us: u64, frame: &mut ExceptionFrame) {
     // Try non-blocking port_set_recv from the set.

@@ -114,6 +114,23 @@ fn mmio_write32(base: usize, offset: usize, val: u32) {
     }
 }
 
+/// Non-blocking send with retry.  If the first send_nb fails (queue full or
+/// transient), yield and retry up to 50 times.  Falls back to blocking send
+/// as last resort so replies are never silently dropped.
+fn send_reply(port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
+    if syscall::send_nb_4(port, tag, d0, d1, d2, d3) == 0 {
+        return;
+    }
+    for _ in 0..50u32 {
+        syscall::yield_now();
+        if syscall::send_nb_4(port, tag, d0, d1, d2, d3) == 0 {
+            return;
+        }
+    }
+    // Last resort: blocking send.
+    syscall::send(port, tag, d0, d1, d2, d3);
+}
+
 fn pack_inline_data(data: &[u8]) -> [u64; 5] {
     let mut words = [0u64; 5];
     for (i, &b) in data.iter().enumerate().take(MAX_INLINE_READ) {
@@ -934,7 +951,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                             unsafe {
                                 core::arch::asm!("dbar 0");
                             }
-                            syscall::send_nb(reply_port, IO_READ_OK, bytes_read as u64, 0);
+                            send_reply(reply_port, IO_READ_OK, bytes_read as u64, 0, 0, 0);
                         } else {
                             // Inline read.
                             let inline_len = bytes_read.min(MAX_INLINE_READ);
@@ -950,7 +967,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         }
                     }
                     Err(()) => {
-                        syscall::send_nb(reply_port, IO_ERROR, ERR_IO, 0);
+                        send_reply(reply_port, IO_ERROR, ERR_IO, 0, 0, 0);
                     }
                 }
             }
@@ -974,17 +991,17 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
                 match dev.write_sector(sector, &buf) {
                     Ok(()) => {
-                        syscall::send_nb(reply_port, IO_WRITE_OK, length.min(512) as u64, 0);
+                        send_reply(reply_port, IO_WRITE_OK, length.min(512) as u64, 0, 0, 0);
                     }
                     Err(()) => {
-                        syscall::send_nb(reply_port, IO_ERROR, ERR_IO, 0);
+                        send_reply(reply_port, IO_ERROR, ERR_IO, 0, 0, 0);
                     }
                 }
             }
 
             IO_STAT => {
                 let reply_port = msg.data[0] >> 32;
-                syscall::send_nb(reply_port, IO_STAT_OK, capacity * 512, 0);
+                send_reply(reply_port, IO_STAT_OK, capacity * 512, 0, 0, 0);
             }
 
             IO_CLOSE => {}
