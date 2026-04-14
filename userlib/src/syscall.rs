@@ -1068,6 +1068,25 @@ pub fn recv_msg_timeout(port: u64, timeout_us: u64) -> Option<Message> {
     None
 }
 
+/// Receive a blk/FS reply with timeout, then revoke the grant ONLY if a
+/// reply actually arrived. On timeout the grant is left in place: the
+/// server may still be mid-transaction on the granted page, and revoking
+/// would cause a server-side PF when it writes the page. In practice a
+/// timeout here means the server is likely hung, so leaking a single
+/// grant is strictly preferable to crashing the server.
+pub fn recv_reply_revoke(
+    reply_port: u64,
+    grant_aspace: u64,
+    grant_va: usize,
+    timeout_us: u64,
+) -> Option<Message> {
+    let reply = recv_msg_timeout(reply_port, timeout_us);
+    if reply.is_some() {
+        revoke(grant_aspace, grant_va);
+    }
+    reply
+}
+
 /// Read a byte from an I/O port (x86_64 only).
 pub fn ioport_inb(port: u16) -> u8 {
     unsafe { arch::syscall2(SYS_IOPORT, 0, port as u64) as u8 }

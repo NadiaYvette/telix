@@ -424,9 +424,11 @@ struct BlkClient {
 }
 
 impl BlkClient {
-    /// Receive a reply on reply_port with 50ms timeout.
+    /// Receive a reply on reply_port with a 5s timeout. Timeout must be
+    /// long enough to cover worst-case blk_srv latency — see note on the
+    /// grant/revoke race in userlib::syscall::recv_reply_revoke.
     fn recv_reply(&self) -> Option<syscall::Message> {
-        syscall::recv_msg_timeout(self.reply_port, 50_000)
+        syscall::recv_msg_timeout(self.reply_port, 5_000_000)
     }
 
     /// Read `len` bytes at byte offset `off` (relative to partition start) into `out`.

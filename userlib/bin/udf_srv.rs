@@ -223,7 +223,7 @@ impl BlkClient {
                 self.grant_va as u64,
             );
 
-            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 50_000) {
+            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
                 rr.tag == IO_READ_OK && rr.data[0] == 512
             } else {
                 false
@@ -282,7 +282,7 @@ impl BlkClient {
                 self.grant_va as u64,
             );
 
-            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 50_000) {
+            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
                 rr.tag == IO_READ_OK && rr.data[0] == 512
             } else {
                 false

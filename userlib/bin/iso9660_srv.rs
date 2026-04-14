@@ -197,7 +197,7 @@ impl BlkClient {
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(self.blk_port, IO_READ, 0, sector_start, d2, self.grant_va as u64);
 
-            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 50_000) {
+            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
                 rr.tag == IO_READ_OK && rr.data[0] == 512
             } else {
                 false
@@ -238,7 +238,7 @@ impl BlkClient {
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(self.blk_port, IO_READ, 0, sector_byte, d2, self.grant_va as u64);
 
-            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 50_000) {
+            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
                 rr.tag == IO_READ_OK && rr.data[0] == 512
             } else {
                 false
@@ -280,7 +280,7 @@ impl BlkClient {
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(self.blk_port, IO_READ, 0, sector_start, d2, self.grant_va as u64);
 
-            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 50_000) {
+            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
                 rr.tag == IO_READ_OK && rr.data[0] == 512
             } else {
                 false
