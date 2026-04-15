@@ -92,8 +92,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
     syscall::debug_puts(b"[security_srv] listening\n");
 
+    // Call/reply server: recv_with_cap installs the reply-cap; every request
+    // path must consume it by calling sys_reply exactly once (including error
+    // paths), or the kernel's server-death teardown will deliver
+    // CALL_REPLY_SERVER_DIED to the caller.
     loop {
-        let msg = match syscall::recv_msg(svc_port) {
+        let msg = match syscall::recv_with_cap(svc_port) {
             Some(m) => m,
             None => continue,
         };
@@ -102,44 +106,39 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             SEC_LOGIN => {
                 let username_hash = msg.data[0];
                 let password_hash = msg.data[1];
-                let reply_port = msg.data[2];
 
                 if let Some(roles) = find_user(username_hash, password_hash) {
                     // Create credential port as token.
                     let cred_port = syscall::port_create();
                     if cred_port != u64::MAX && alloc_credential(cred_port, username_hash, roles) {
-                        // Reply with credential port in data[0] — auto-grant
-                        // gives client SEND cap to the credential port.
-                        syscall::send(reply_port, SEC_LOGIN_OK, cred_port as u64, roles, 0, 0);
+                        let _ = syscall::reply(SEC_LOGIN_OK, cred_port as u64, roles, 0, 0, 0);
                     } else {
-                        syscall::send(reply_port, SEC_LOGIN_FAIL, 1, 0, 0, 0);
+                        let _ = syscall::reply(SEC_LOGIN_FAIL, 1, 0, 0, 0, 0);
                     }
                 } else {
-                    syscall::send(reply_port, SEC_LOGIN_FAIL, 2, 0, 0, 0);
+                    let _ = syscall::reply(SEC_LOGIN_FAIL, 2, 0, 0, 0, 0);
                 }
             }
             SEC_VERIFY => {
                 let cred_port = msg.data[0];
-                let reply_port = msg.data[2];
 
                 if let Some(idx) = find_credential(cred_port) {
                     let slot = unsafe { &raw const CREDENTIALS };
                     let cred = unsafe { (*slot)[idx].as_ref().unwrap() };
-                    syscall::send(
-                        reply_port,
+                    let _ = syscall::reply(
                         SEC_VERIFY_OK,
                         cred_port as u64,
                         cred.roles,
                         cred.username_hash,
                         0,
+                        0,
                     );
                 } else {
-                    syscall::send(reply_port, SEC_VERIFY_FAIL, 1, 0, 0, 0);
+                    let _ = syscall::reply(SEC_VERIFY_FAIL, 1, 0, 0, 0, 0);
                 }
             }
             SEC_REVOKE => {
                 let cred_port = msg.data[0];
-                let reply_port = msg.data[2];
 
                 if let Some(idx) = find_credential(cred_port) {
                     syscall::port_destroy(cred_port);
@@ -149,9 +148,11 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
                 // Idempotent: always reply OK.
-                syscall::send(reply_port, SEC_REVOKE_OK, 0, 0, 0, 0);
+                let _ = syscall::reply(SEC_REVOKE_OK, 0, 0, 0, 0, 0);
             }
-            _ => {}
+            _ => {
+                let _ = syscall::reply(0, 0xFF, 0, 0, 0, 0);
+            }
         }
     }
 }

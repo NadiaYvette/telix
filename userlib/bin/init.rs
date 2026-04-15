@@ -185,6 +185,63 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5e: early security_srv call/reply smoke test ---
+    syscall::debug_puts(b"  init: running security_srv (call/reply) smoke test...\n");
+    {
+        let sp = syscall::port_create();
+        let tid = syscall::spawn_with_arg(b"security_srv", 50, sp);
+        if tid != u64::MAX {
+            for _ in 0..100 { syscall::yield_now(); }
+            let mut ok = true;
+
+            // Login (root).
+            let cred_port = match syscall::call(sp, 0x700, 0x0001_0001, 0x0001_0002, 0, 0) {
+                Some(r) if r.tag == 0x701 && r.data[1] == 0x03 => r.data[0],
+                _ => { ok = false; 0 }
+            };
+
+            // Bad login.
+            if ok {
+                match syscall::call(sp, 0x700, 0x0001_0001, 0xBAD_0000, 0, 0) {
+                    Some(r) if r.tag == 0x702 => {}
+                    _ => { ok = false; }
+                }
+            }
+
+            // Verify.
+            if ok {
+                match syscall::call(sp, 0x703, cred_port, 0, 0, 0) {
+                    Some(r) if r.tag == 0x704 && r.data[1] == 0x03 && r.data[2] == 0x0001_0001 => {}
+                    _ => { ok = false; }
+                }
+            }
+
+            // Revoke.
+            if ok {
+                match syscall::call(sp, 0x706, cred_port, 0, 0, 0) {
+                    Some(r) if r.tag == 0x707 => {}
+                    _ => { ok = false; }
+                }
+            }
+
+            // Verify after revoke must fail.
+            if ok {
+                match syscall::call(sp, 0x703, cred_port, 0, 0, 0) {
+                    Some(r) if r.tag == 0x705 => {}
+                    _ => { ok = false; }
+                }
+            }
+
+            if ok {
+                syscall::debug_puts(b"Phase 5e security_srv call/reply smoke: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 5e security_srv call/reply smoke: FAILED\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 5e security_srv call/reply smoke: FAILED (spawn)\n");
+        }
+    }
+
     // --- Test 3: mmap_anon / munmap ---
     syscall::debug_puts(b"  init: testing mmap_anon...\n");
     if let Some(va) = syscall::mmap_anon(0, 1, 1) {
@@ -2830,92 +2887,76 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         if sec_ok {
-            let reply = syscall::port_create();
-
-            // Part A: Login with valid credentials (root).
+            // Part A: Login with valid credentials (root) via call().
             // username_hash=0x0001_0001, password_hash=0x0001_0002
-            syscall::send(sec_port, 0x700, 0x0001_0001, 0x0001_0002, reply as u64, 0);
             let cred_port;
             let cred_roles;
-            if let Some(r) = syscall::recv_msg(reply) {
-                if r.tag == 0x701 {
+            match syscall::call(sec_port, 0x700, 0x0001_0001, 0x0001_0002, 0, 0) {
+                Some(r) if r.tag == 0x701 => {
                     // SEC_LOGIN_OK
                     cred_port = r.data[0];
                     cred_roles = r.data[1];
                     if cred_roles != 0x03 {
-                        // ADMIN|USER
                         syscall::debug_puts(b"  init: login roles wrong\n");
                         sec_ok = false;
                     }
-                } else {
+                }
+                Some(_) => {
                     syscall::debug_puts(b"  init: login failed unexpectedly\n");
                     sec_ok = false;
                     cred_port = 0;
                     cred_roles = 0;
                 }
-            } else {
-                syscall::debug_puts(b"  init: login no reply\n");
-                sec_ok = false;
-                cred_port = 0;
-                cred_roles = 0;
+                None => {
+                    syscall::debug_puts(b"  init: login no reply\n");
+                    sec_ok = false;
+                    cred_port = 0;
+                    cred_roles = 0;
+                }
             }
 
             // Part B: Login with wrong password.
-            syscall::send(sec_port, 0x700, 0x0001_0001, 0xBAD_0000, reply as u64, 0);
-            if let Some(r) = syscall::recv_msg(reply) {
-                if r.tag != 0x702 {
-                    // SEC_LOGIN_FAIL
+            match syscall::call(sec_port, 0x700, 0x0001_0001, 0xBAD_0000, 0, 0) {
+                Some(r) if r.tag == 0x702 => {}
+                _ => {
                     syscall::debug_puts(b"  init: bad login not rejected\n");
                     sec_ok = false;
                 }
-            } else {
-                sec_ok = false;
             }
 
             if sec_ok && cred_port != 0 {
                 // Part C: Verify credential.
-                syscall::send(sec_port, 0x703, cred_port, 0, reply as u64, 0);
-                if let Some(r) = syscall::recv_msg(reply) {
-                    if r.tag == 0x704 {
-                        // SEC_VERIFY_OK
+                match syscall::call(sec_port, 0x703, cred_port, 0, 0, 0) {
+                    Some(r) if r.tag == 0x704 => {
                         if r.data[1] != cred_roles || r.data[2] != 0x0001_0001 {
                             syscall::debug_puts(b"  init: verify data mismatch\n");
                             sec_ok = false;
                         }
-                    } else {
+                    }
+                    _ => {
                         syscall::debug_puts(b"  init: verify failed\n");
                         sec_ok = false;
                     }
-                } else {
-                    sec_ok = false;
                 }
 
                 // Part D: Revoke credential.
-                syscall::send(sec_port, 0x706, cred_port, 0, reply as u64, 0);
-                if let Some(r) = syscall::recv_msg(reply) {
-                    if r.tag != 0x707 {
-                        // SEC_REVOKE_OK
+                match syscall::call(sec_port, 0x706, cred_port, 0, 0, 0) {
+                    Some(r) if r.tag == 0x707 => {}
+                    _ => {
                         syscall::debug_puts(b"  init: revoke failed\n");
                         sec_ok = false;
                     }
-                } else {
-                    sec_ok = false;
                 }
 
                 // Part E: Verify after revoke should fail.
-                syscall::send(sec_port, 0x703, cred_port, 0, reply as u64, 0);
-                if let Some(r) = syscall::recv_msg(reply) {
-                    if r.tag != 0x705 {
-                        // SEC_VERIFY_FAIL
+                match syscall::call(sec_port, 0x703, cred_port, 0, 0, 0) {
+                    Some(r) if r.tag == 0x705 => {}
+                    _ => {
                         syscall::debug_puts(b"  init: verify after revoke not denied\n");
                         sec_ok = false;
                     }
-                } else {
-                    sec_ok = false;
                 }
             }
-
-            syscall::port_destroy(reply);
         }
 
         if sec_ok {
