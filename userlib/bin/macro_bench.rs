@@ -85,11 +85,9 @@ fn print_opsec(name: &[u8], total_cycles: u64, freq: u64, iters: u64) {
 
 /// Open a file on the given fat16 port. Returns (handle, file_size, srv_aspace) or None.
 fn fs_open(fat_port: u64, name: &[u8]) -> Option<(u64, u32, u64)> {
-    let reply_port = syscall::port_create();
     let (n0, n1, _) = syscall::pack_name(name);
-    let d2 = (name.len() as u64) | ((reply_port) << 32);
-    syscall::send(fat_port, FS_OPEN, n0, n1, d2, 0);
-    let result = if let Some(msg) = syscall::recv_msg(reply_port) {
+    let d2 = name.len() as u64;
+    if let Some(msg) = syscall::call(fat_port, FS_OPEN, n0, n1, d2, 0) {
         if msg.tag == FS_OPEN_OK {
             Some((msg.data[0], msg.data[1] as u32, msg.data[2]))
         } else {
@@ -97,9 +95,7 @@ fn fs_open(fat_port: u64, name: &[u8]) -> Option<(u64, u32, u64)> {
         }
     } else {
         None
-    };
-    syscall::port_destroy(reply_port);
-    result
+    }
 }
 
 /// Grant-based read: reads `length` bytes at `offset` from handle into scratch_va.
@@ -112,22 +108,18 @@ fn fs_read_grant(
     srv_aspace: u64,
     scratch_va: usize,
 ) -> u32 {
-    let reply_port = syscall::port_create();
-    // Grant our scratch page to fat16_srv.
     if !syscall::grant_pages(srv_aspace, scratch_va, GRANT_DST, 1, false) {
-        syscall::port_destroy(reply_port);
         return 0;
     }
-    let d2 = (length as u64) | ((reply_port) << 32);
-    syscall::send(
+    let d2 = length as u64;
+    let bytes = if let Some(msg) = syscall::call(
         fat_port,
         FS_READ,
         handle,
         offset as u64,
         d2,
         GRANT_DST as u64,
-    );
-    let bytes = if let Some(msg) = syscall::recv_msg(reply_port) {
+    ) {
         if msg.tag == FS_READ_OK {
             msg.data[0] as u32
         } else {
@@ -137,17 +129,14 @@ fn fs_read_grant(
         0
     };
     syscall::revoke(srv_aspace, GRANT_DST);
-    syscall::port_destroy(reply_port);
     bytes
 }
 
 /// Create a file. Returns (handle, srv_aspace) or None.
 fn fs_create(fat_port: u64, name: &[u8]) -> Option<(u64, u64)> {
-    let reply_port = syscall::port_create();
     let (n0, n1, _) = syscall::pack_name(name);
-    let d2 = (name.len() as u64) | ((reply_port) << 32);
-    syscall::send(fat_port, FS_CREATE, n0, n1, d2, 0);
-    let result = if let Some(msg) = syscall::recv_msg(reply_port) {
+    let d2 = name.len() as u64;
+    if let Some(msg) = syscall::call(fat_port, FS_CREATE, n0, n1, d2, 0) {
         if msg.tag == FS_CREATE_OK {
             Some((msg.data[0], msg.data[2]))
         } else {
@@ -155,9 +144,7 @@ fn fs_create(fat_port: u64, name: &[u8]) -> Option<(u64, u64)> {
         }
     } else {
         None
-    };
-    syscall::port_destroy(reply_port);
-    result
+    }
 }
 
 /// Grant-based write: writes `length` bytes from scratch_va to handle.
@@ -169,14 +156,11 @@ fn fs_write_grant(
     srv_aspace: u64,
     scratch_va: usize,
 ) -> u32 {
-    let reply_port = syscall::port_create();
     if !syscall::grant_pages(srv_aspace, scratch_va, GRANT_DST, 1, false) {
-        syscall::port_destroy(reply_port);
         return 0;
     }
-    let d1 = (length as u64) | ((reply_port) << 32);
-    syscall::send(fat_port, FS_WRITE, handle, d1, GRANT_DST as u64, 0);
-    let written = if let Some(msg) = syscall::recv_msg(reply_port) {
+    let d1 = length as u64;
+    let written = if let Some(msg) = syscall::call(fat_port, FS_WRITE, handle, d1, GRANT_DST as u64, 0) {
         if msg.tag == FS_WRITE_OK {
             msg.data[0] as u32
         } else {
@@ -186,32 +170,23 @@ fn fs_write_grant(
         0
     };
     syscall::revoke(srv_aspace, GRANT_DST);
-    syscall::port_destroy(reply_port);
     written
 }
 
 /// Close a file handle.
 fn fs_close(fat_port: u64, handle: u64) {
-    syscall::send_nb(fat_port, FS_CLOSE, handle, 0);
-    // Give time for close + flush.
-    for _ in 0..500 {
-        syscall::yield_now();
-    }
+    let _ = syscall::call(fat_port, FS_CLOSE, handle, 0, 0, 0);
 }
 
 /// Delete a file by name.
 fn fs_delete(fat_port: u64, name: &[u8]) -> bool {
-    let reply_port = syscall::port_create();
     let (n0, n1, _) = syscall::pack_name(name);
-    let d2 = (name.len() as u64) | ((reply_port) << 32);
-    syscall::send(fat_port, FS_DELETE, n0, n1, d2, 0);
-    let ok = if let Some(msg) = syscall::recv_msg(reply_port) {
+    let d2 = name.len() as u64;
+    if let Some(msg) = syscall::call(fat_port, FS_DELETE, n0, n1, d2, 0) {
         msg.tag == FS_DELETE_OK
     } else {
         false
-    };
-    syscall::port_destroy(reply_port);
-    ok
+    }
 }
 
 #[unsafe(no_mangle)]

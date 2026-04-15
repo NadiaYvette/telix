@@ -311,10 +311,8 @@ fn cmd_ls(con_port: u64, reply_port: u64, fat16_port: Option<u64>) {
     let mut idx = 0u64;
 
     loop {
-        // FS_READDIR: data[0]=entry_index, data[2]=reply_port
-        syscall::send(fp, FS_READDIR, idx, 0, fs_reply as u64, 0);
-
-        if let Some(msg) = syscall::recv_msg(fs_reply) {
+        // FS_READDIR: data[0]=entry_index (reply via cap)
+        if let Some(msg) = syscall::call(fp, FS_READDIR, idx, 0, 0, 0) {
             if msg.tag == FS_READDIR_OK {
                 let file_size = msg.data[0] as u32;
                 let name_lo = msg.data[1];
@@ -377,10 +375,8 @@ fn cmd_cat(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
 
     // FS_OPEN.
     let (n0, n1, _) = pack_name(filename);
-    let d2 = (filename.len() as u64) | ((fs_reply as u64) << 32);
-    syscall::send(fp, FS_OPEN, n0, n1, d2, 0);
-
-    let (handle, file_size) = if let Some(msg) = syscall::recv_msg(fs_reply) {
+    let d2 = filename.len() as u64;
+    let (handle, file_size) = if let Some(msg) = syscall::call(fp, FS_OPEN, n0, n1, d2, 0) {
         if msg.tag == FS_OPEN_OK {
             (msg.data[0], msg.data[1] as u32)
         } else {
@@ -395,10 +391,8 @@ fn cmd_cat(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
     let mut offset = 0u32;
     while offset < file_size {
         let to_read = (file_size - offset).min(24);
-        let rd_d2 = (to_read as u64) | ((fs_reply as u64) << 32);
-        syscall::send(fp, FS_READ, handle, offset as u64, rd_d2, 0);
-
-        if let Some(msg) = syscall::recv_msg(fs_reply) {
+        let rd_d2 = to_read as u64;
+        if let Some(msg) = syscall::call(fp, FS_READ, handle, offset as u64, rd_d2, 0) {
             if msg.tag == FS_READ_OK {
                 let bytes_read = msg.data[0] as usize;
                 if bytes_read == 0 {
@@ -424,7 +418,7 @@ fn cmd_cat(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
     con_puts(con_port, reply_port, b"\r\n");
 
     // FS_CLOSE.
-    syscall::send_nb(fp, FS_CLOSE, handle, 0);
+    let _ = syscall::call(fp, FS_CLOSE, handle, 0, 0, 0);
 }
 
 fn cmd_net(con_port: u64, reply_port: u64) {
@@ -562,10 +556,8 @@ fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
 
     // FS_OPEN.
     let (n0, n1, _) = pack_name(filename);
-    let d2 = (filename.len() as u64) | ((fs_reply as u64) << 32);
-    syscall::send(fp, FS_OPEN, n0, n1, d2, 0);
-
-    let (handle, file_size, srv_aspace) = if let Some(msg) = syscall::recv_msg(fs_reply) {
+    let d2 = filename.len() as u64;
+    let (handle, file_size, srv_aspace) = if let Some(msg) = syscall::call(fp, FS_OPEN, n0, n1, d2, 0) {
         if msg.tag == FS_OPEN_OK {
             (msg.data[0], msg.data[1] as usize, msg.data[2])
         } else {
@@ -580,7 +572,7 @@ fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
 
     if file_size == 0 {
         con_puts(con_port, reply_port, b"empty file\r\n");
-        syscall::send_nb(fp, FS_CLOSE, handle, 0);
+        let _ = syscall::call(fp, FS_CLOSE, handle, 0, 0, 0);
         syscall::port_destroy(fs_reply);
         return;
     }
@@ -591,7 +583,7 @@ fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
         Some(va) => va,
         None => {
             con_puts(con_port, reply_port, b"alloc failed\r\n");
-            syscall::send_nb(fp, FS_CLOSE, handle, 0);
+            let _ = syscall::call(fp, FS_CLOSE, handle, 0, 0, 0);
             syscall::port_destroy(fs_reply);
             return;
         }
@@ -603,7 +595,7 @@ fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
         None => {
             con_puts(con_port, reply_port, b"alloc failed\r\n");
             syscall::munmap(elf_va);
-            syscall::send_nb(fp, FS_CLOSE, handle, 0);
+            let _ = syscall::call(fp, FS_CLOSE, handle, 0, 0, 0);
             syscall::port_destroy(fs_reply);
             return;
         }
@@ -615,7 +607,7 @@ fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
         con_puts(con_port, reply_port, b"grant failed\r\n");
         syscall::munmap(scratch_va);
         syscall::munmap(elf_va);
-        syscall::send_nb(fp, FS_CLOSE, handle, 0);
+        let _ = syscall::call(fp, FS_CLOSE, handle, 0, 0, 0);
         syscall::port_destroy(fs_reply);
         return;
     }
@@ -626,10 +618,8 @@ fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
     while offset < file_size {
         let remaining = file_size - offset;
         let chunk = if remaining > 512 { 512 } else { remaining };
-        let rd_d2 = (chunk as u64) | ((fs_reply as u64) << 32);
-        syscall::send(fp, FS_READ, handle, offset as u64, rd_d2, grant_dst as u64);
-
-        if let Some(msg) = syscall::recv_msg(fs_reply) {
+        let rd_d2 = chunk as u64;
+        if let Some(msg) = syscall::call(fp, FS_READ, handle, offset as u64, rd_d2, grant_dst as u64) {
             if msg.tag == FS_READ_OK {
                 let bytes_read = msg.data[0] as usize;
                 if bytes_read == 0 {
@@ -656,7 +646,7 @@ fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
 
     // Cleanup grant + file handle.
     syscall::revoke(srv_aspace, grant_dst);
-    syscall::send_nb(fp, FS_CLOSE, handle, 0);
+    let _ = syscall::call(fp, FS_CLOSE, handle, 0, 0, 0);
 
     if !read_ok || offset < file_size {
         con_puts(con_port, reply_port, b"read error\r\n");
@@ -720,10 +710,8 @@ fn cmd_write(con_port: u64, reply_port: u64, fat16_port: Option<u64>, args: &[u8
 
     // FS_CREATE.
     let (n0, n1, _) = pack_name(filename);
-    let d2 = (filename.len() as u64) | ((fs_reply as u64) << 32);
-    syscall::send(fp, FS_CREATE, n0, n1, d2, 0);
-
-    let (handle, srv_aspace) = if let Some(msg) = syscall::recv_msg(fs_reply) {
+    let d2 = filename.len() as u64;
+    let (handle, srv_aspace) = if let Some(msg) = syscall::call(fp, FS_CREATE, n0, n1, d2, 0) {
         if msg.tag == FS_CREATE_OK {
             (msg.data[0], msg.data[2])
         } else {
@@ -741,7 +729,7 @@ fn cmd_write(con_port: u64, reply_port: u64, fat16_port: Option<u64>, args: &[u8
         Some(va) => va,
         None => {
             con_puts(con_port, reply_port, b"alloc failed\r\n");
-            syscall::send_nb(fp, FS_CLOSE, handle, 0);
+            let _ = syscall::call(fp, FS_CLOSE, handle, 0, 0, 0);
             syscall::port_destroy(fs_reply);
             return;
         }
@@ -758,17 +746,15 @@ fn cmd_write(con_port: u64, reply_port: u64, fat16_port: Option<u64>, args: &[u8
     if !syscall::grant_pages(srv_aspace, scratch_va, grant_dst, 1, false) {
         con_puts(con_port, reply_port, b"grant failed\r\n");
         syscall::munmap(scratch_va);
-        syscall::send_nb(fp, FS_CLOSE, handle, 0);
+        let _ = syscall::call(fp, FS_CLOSE, handle, 0, 0, 0);
         syscall::port_destroy(fs_reply);
         return;
     }
 
-    // FS_WRITE: data[0]=handle, data[1]=length|(reply<<32), data[2]=grant_va
-    let wd1 = (write_len as u64) | ((fs_reply as u64) << 32);
-    syscall::send(fp, FS_WRITE_FILE, handle, wd1, grant_dst as u64, 0);
-
+    // FS_WRITE: data[0]=handle, data[1]=length, data[2]=grant_va (reply via cap)
+    let wd1 = write_len as u64;
     let mut wrote = 0usize;
-    if let Some(msg) = syscall::recv_msg(fs_reply) {
+    if let Some(msg) = syscall::call(fp, FS_WRITE_FILE, handle, wd1, grant_dst as u64, 0) {
         if msg.tag == FS_WRITE_OK {
             wrote = msg.data[0] as usize;
         }
@@ -777,7 +763,7 @@ fn cmd_write(con_port: u64, reply_port: u64, fat16_port: Option<u64>, args: &[u8
     // Revoke grant, close file.
     syscall::revoke(srv_aspace, grant_dst);
     syscall::munmap(scratch_va);
-    syscall::send_nb(fp, FS_CLOSE, handle, 0);
+    let _ = syscall::call(fp, FS_CLOSE, handle, 0, 0, 0);
     syscall::port_destroy(fs_reply);
 
     // Print confirmation.
@@ -877,10 +863,8 @@ fn pipe_cat(pipe_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: 
 
     // FS_OPEN.
     let (n0, n1, _) = pack_name(filename);
-    let d2 = (filename.len() as u64) | ((fs_reply as u64) << 32);
-    syscall::send(fp, FS_OPEN, n0, n1, d2, 0);
-
-    let (handle, file_size) = if let Some(msg) = syscall::recv_msg(fs_reply) {
+    let d2 = filename.len() as u64;
+    let (handle, file_size) = if let Some(msg) = syscall::call(fp, FS_OPEN, n0, n1, d2, 0) {
         if msg.tag == FS_OPEN_OK {
             (msg.data[0], msg.data[1] as u32)
         } else {
@@ -896,10 +880,8 @@ fn pipe_cat(pipe_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: 
     let mut offset = 0u32;
     while offset < file_size {
         let to_read = (file_size - offset).min(24);
-        let rd_d2 = (to_read as u64) | ((fs_reply as u64) << 32);
-        syscall::send(fp, FS_READ, handle, offset as u64, rd_d2, 0);
-
-        if let Some(msg) = syscall::recv_msg(fs_reply) {
+        let rd_d2 = to_read as u64;
+        if let Some(msg) = syscall::call(fp, FS_READ, handle, offset as u64, rd_d2, 0) {
             if msg.tag == FS_READ_OK {
                 let bytes_read = msg.data[0] as usize;
                 if bytes_read == 0 {
@@ -922,7 +904,7 @@ fn pipe_cat(pipe_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: 
         }
     }
 
-    syscall::send_nb(fp, FS_CLOSE, handle, 0);
+    let _ = syscall::call(fp, FS_CLOSE, handle, 0, 0, 0);
     syscall::port_destroy(fs_reply);
 }
 

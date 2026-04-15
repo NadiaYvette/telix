@@ -1433,16 +1433,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         print_num(fp);
         syscall::debug_puts(b"\n");
 
-        let fs_reply = syscall::port_create();
-
         // FS_OPEN "HELLO.TXT"
         let fname = b"HELLO.TXT";
         let (fn0, fn1, _) = pack_name(fname);
-        let fs_d2 = (fname.len() as u64) | (fs_reply << 32);
-        syscall::send(fp, 0x2000, fn0, fn1, fs_d2, 0);
+        let fs_d2 = fname.len() as u64;
 
         let mut fs_ok = false;
-        if let Some(reply) = syscall::recv_msg(fs_reply) {
+        if let Some(reply) = syscall::call(fp, 0x2000, fn0, fn1, fs_d2, 0) {
             if reply.tag == 0x2001 {
                 let handle = reply.data[0];
                 let file_size = reply.data[1];
@@ -1454,10 +1451,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 if file_size == 17 {
                     // FS_READ inline (17 bytes fits in 3 words = 24 bytes max)
-                    let rd_d2 = file_size | (fs_reply << 32);
-                    syscall::send(fp, 0x2100, handle, 0, rd_d2, 0);
-
-                    if let Some(rr) = syscall::recv_msg(fs_reply) {
+                    let rd_d2 = file_size;
+                    if let Some(rr) = syscall::call(fp, 0x2100, handle, 0, rd_d2, 0) {
                         if rr.tag == 0x2101 {
                             let bytes_read = rr.data[0] as usize;
                             // Unpack inline data from words 1..3
@@ -1483,7 +1478,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
 
                     // FS_CLOSE
-                    syscall::send_nb(fp, 0x2400, handle, 0);
+                    let _ = syscall::call(fp, 0x2400, handle, 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  init: unexpected file size\n");
                 }
@@ -1617,16 +1612,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing exec from filesystem...\n");
 
     if let Some(fp) = fat16_port {
-        let exec_reply = syscall::port_create();
-
         // FS_OPEN "HELLO.ELF"
         let fname = b"HELLO.ELF";
         let (fn0, fn1, _) = pack_name(fname);
-        let fs_d2 = (fname.len() as u64) | (exec_reply << 32);
-        syscall::send(fp, 0x2000, fn0, fn1, fs_d2, 0);
+        let fs_d2 = fname.len() as u64;
 
         let mut exec_ok = false;
-        if let Some(reply) = syscall::recv_msg(exec_reply) {
+        if let Some(reply) = syscall::call(fp, 0x2000, fn0, fn1, fs_d2, 0) {
             if reply.tag == 0x2001 {
                 let handle = reply.data[0];
                 let file_size = reply.data[1] as usize;
@@ -1648,17 +1640,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         while offset < file_size {
                             let remaining = file_size - offset;
                             let chunk = if remaining > 512 { 512 } else { remaining };
-                            let rd_d2 = (chunk as u64) | (exec_reply << 32);
-                            syscall::send(
+                            let rd_d2 = chunk as u64;
+                            if let Some(msg) = syscall::call(
                                 fp,
                                 0x2100,
                                 handle,
                                 offset as u64,
                                 rd_d2,
                                 grant_dst as u64,
-                            );
-
-                            if let Some(msg) = syscall::recv_msg(exec_reply) {
+                            ) {
                                 if msg.tag == 0x2101 {
                                     let bytes_read = msg.data[0] as usize;
                                     if bytes_read == 0 {
@@ -1714,7 +1704,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::munmap(elf_buf);
                 }
 
-                syscall::send_nb(fp, 0x2400, handle, 0);
+                let _ = syscall::call(fp, 0x2400, handle, 0, 0, 0);
             } else {
                 syscall::debug_puts(b"  init: HELLO.ELF not found on disk\n");
             }
@@ -1734,23 +1724,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing writable FAT16...\n");
 
     if let Some(fp) = fat16_port {
-        let wr_reply = syscall::port_create();
-
         // FS_CREATE "TEST.TXT"
         let fname = b"TEST.TXT";
         let (fn0, fn1, _) = pack_name(fname);
-        let fs_d2 = (fname.len() as u64) | (wr_reply << 32);
+        let fs_d2 = fname.len() as u64;
         syscall::debug_puts(b"  init: sending FS_CREATE to port ");
         print_num(fp);
-        syscall::debug_puts(b" reply=");
-        print_num(wr_reply);
         syscall::debug_puts(b"\n");
-        syscall::send(fp, 0x2500, fn0, fn1, fs_d2, 0);
-        syscall::debug_puts(b"  init: FS_CREATE sent, waiting reply\n");
 
         let mut phase15_ok = false;
 
-        if let Some(reply) = syscall::recv_msg(wr_reply) {
+        if let Some(reply) = syscall::call(fp, 0x2500, fn0, fn1, fs_d2, 0) {
             if reply.tag != 0x2501 {
                 syscall::debug_puts(b"  init: FS_CREATE reply tag=");
                 print_num(reply.tag);
@@ -1787,12 +1771,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         b"  init: grant FAIL\n"
                     });
                     if grant_ok {
-                        // FS_WRITE: data[0]=handle, data[1]=length|(reply<<32), data[2]=grant_va
-                        let wd1 = (test_data.len() as u64) | (wr_reply << 32);
-                        syscall::send(fp, 0x2600, handle, wd1, grant_dst as u64, 0);
+                        // FS_WRITE: data[0]=handle, data[1]=length, data[2]=grant_va
+                        let wd1 = test_data.len() as u64;
                         syscall::debug_puts(b"  init: FS_WRITE sent\n");
 
-                        if let Some(wr_msg) = syscall::recv_msg(wr_reply) {
+                        if let Some(wr_msg) = syscall::call(fp, 0x2600, handle, wd1, grant_dst as u64, 0) {
                             syscall::debug_puts(b"  init: FS_WRITE reply tag=");
                             print_num(wr_msg.tag);
                             syscall::debug_puts(b" d0=");
@@ -1802,23 +1785,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 // Revoke grant, close file.
                                 syscall::revoke(srv_aspace, grant_dst);
 
-                                // FS_CLOSE (triggers flush). Use blocking send to ensure delivery.
-                                syscall::send(fp, 0x2400, handle, 0, 0, 0);
-
-                                // Delay for close to complete (server processes close + disk flush).
-                                // Fat16_srv must: flush FAT sectors + write dir entry, each requiring
-                                // IPC round-trips to blk_srv + virtio disk I/O.
-                                for _ in 0..2000 {
-                                    syscall::yield_now();
-                                }
+                                // FS_CLOSE (triggers flush). Synchronous — returns after
+                                // server has flushed FAT sectors + dir entry via blk_srv.
+                                let _ = syscall::call(fp, 0x2400, handle, 0, 0, 0);
 
                                 // Now re-open and verify.
                                 let (fn0b, fn1b, _) = pack_name(fname);
-                                let fs_d2b = (fname.len() as u64) | (wr_reply << 32);
-                                syscall::send(fp, 0x2000, fn0b, fn1b, fs_d2b, 0);
+                                let fs_d2b = fname.len() as u64;
 
                                 syscall::debug_puts(b"  init: re-opening\n");
-                                if let Some(open_msg) = syscall::recv_msg(wr_reply) {
+                                if let Some(open_msg) = syscall::call(fp, 0x2000, fn0b, fn1b, fs_d2b, 0) {
                                     syscall::debug_puts(b"  init: reopen tag=");
                                     print_num(open_msg.tag);
                                     syscall::debug_puts(b" size=");
@@ -1839,17 +1815,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                             if syscall::grant_pages(
                                                 rsrv, scratch, grant_rd, 1, false,
                                             ) {
-                                                let rd_d2 = (rsize as u64) | (wr_reply << 32);
-                                                syscall::send(
+                                                let rd_d2 = rsize as u64;
+                                                if let Some(rd_msg) = syscall::call(
                                                     fp,
                                                     0x2100,
                                                     rh,
                                                     0,
                                                     rd_d2,
                                                     grant_rd as u64,
-                                                );
-
-                                                if let Some(rd_msg) = syscall::recv_msg(wr_reply) {
+                                                ) {
                                                     if rd_msg.tag == 0x2101 {
                                                         let bytes_read = rd_msg.data[0] as usize;
                                                         let buf = unsafe {
@@ -1868,16 +1842,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                                 syscall::revoke(rsrv, grant_rd);
                                             }
                                         }
-                                        syscall::send_nb(fp, 0x2400, rh, 0);
+                                        let _ = syscall::call(fp, 0x2400, rh, 0, 0, 0);
                                     }
                                 }
                             } else {
                                 syscall::revoke(srv_aspace, grant_dst);
-                                syscall::send_nb(fp, 0x2400, handle, 0);
+                                let _ = syscall::call(fp, 0x2400, handle, 0, 0, 0);
                             }
                         } else {
                             syscall::revoke(srv_aspace, grant_dst);
-                            syscall::send_nb(fp, 0x2400, handle, 0);
+                            let _ = syscall::call(fp, 0x2400, handle, 0, 0, 0);
                         }
                     }
                     syscall::munmap(scratch);

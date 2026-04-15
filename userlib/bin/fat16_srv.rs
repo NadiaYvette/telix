@@ -31,6 +31,7 @@ const FS_READDIR: u64 = 0x2200;
 const FS_READDIR_OK: u64 = 0x2201;
 const FS_READDIR_END: u64 = 0x2202;
 const FS_CLOSE: u64 = 0x2400;
+const FS_CLOSE_OK: u64 = 0x2401;
 const FS_CREATE: u64 = 0x2500;
 const FS_CREATE_OK: u64 = 0x2501;
 const FS_WRITE: u64 = 0x2600;
@@ -542,16 +543,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // Server loop.
     'msg_loop: loop {
-        let msg = match syscall::recv_msg(port) {
+        let msg = match syscall::recv_with_cap(port) {
             Some(m) => m,
             None => break,
         };
 
         match msg.tag {
             FS_OPEN => {
-                // data[0] = name_lo, data[1] = name_hi, data[2] = name_len|(reply<<32), data[3] = unused
+                // data[0] = name_lo, data[1] = name_hi, data[2] = name_len (reply via cap)
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
 
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
@@ -615,38 +615,37 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         }
                     }
                     if handle == u64::MAX {
-                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     } else {
-                        syscall::send(
-                            reply_port,
+                        let _ = syscall::reply(
                             FS_OPEN_OK,
                             handle,
                             file_size as u64,
                             my_aspace as u64,
                             0,
+                            0,
                         );
                     }
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                 }
             }
 
             FS_READ => {
-                // data[0] = handle, data[1] = offset, data[2] = length|(reply<<32), data[3] = grant_va
+                // data[0] = handle, data[1] = offset, data[2] = length, data[3] = grant_va (reply via cap)
                 let handle = msg.data[0] as usize;
                 let offset = msg.data[1] as u32;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as u32;
-                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
                 let file = &open_files[handle];
                 if offset >= file.file_size {
                     // EOF - return 0 bytes.
-                    syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -662,7 +661,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 for _ in 0..target_cluster_idx {
                     cluster = fat_entry(fat_va, cluster);
                     if cluster >= 0xFFF8 {
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                         continue 'msg_loop;
                     }
                 }
@@ -676,7 +675,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 let mut sec = [0u8; 512];
                 if !blk.read_sector(sector, &mut sec) {
-                    syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -691,28 +690,27 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             bytes_in_sector as usize,
                         );
                     }
-                    syscall::send(reply_port, FS_READ_OK, bytes_in_sector as u64, 0, 0, 0);
+                    let _ = syscall::reply(FS_READ_OK, bytes_in_sector as u64, 0, 0, 0, 0);
                 } else {
                     // Inline read.
                     let inline_len = (bytes_in_sector as usize).min(MAX_INLINE);
                     let packed = pack_inline_data(
                         &sec[offset_in_sector as usize..(offset_in_sector as usize + inline_len)],
                     );
-                    syscall::send(
-                        reply_port,
+                    let _ = syscall::reply(
                         FS_READ_OK,
                         inline_len as u64,
                         packed[0],
                         packed[1],
                         packed[2],
+                        0,
                     );
                 }
             }
 
             FS_READDIR => {
-                // data[0] = entry_index, data[2] = reply_port (low 32)
+                // data[0] = entry_index (reply via cap)
                 let start_index = msg.data[0] as u32;
-                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 // Iterate root directory from start_index.
                 let entries_per_sector = 16u32; // 512 / 32
@@ -783,27 +781,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
 
                     // FS_READDIR_OK: data[0]=file_size, data[1]=name_lo, data[2]=name_hi, data[3]=next_index
-                    syscall::send(
-                        reply_port,
+                    let _ = syscall::reply(
                         FS_READDIR_OK,
                         file_size as u64,
                         name_lo,
                         name_hi,
                         idx as u64,
+                        0,
                     );
                     found = true;
                     break;
                 }
 
                 if !found {
-                    syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_READDIR_END, 0, 0, 0, 0, 0);
                 }
             }
 
             FS_CREATE => {
-                // data[0] = name_lo, data[1] = name_hi, data[2] = name_len|(reply<<32)
+                // data[0] = name_lo, data[1] = name_hi, data[2] = name_len (reply via cap)
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
 
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
@@ -814,7 +811,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Find free directory entry.
                 let dir_slot = find_free_dir_entry(&blk, &layout, bpb.root_entry_count);
                 if dir_slot.is_none() {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
                 let (dir_sector, dir_offset) = dir_slot.unwrap();
@@ -823,7 +820,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let first_cluster = match alloc_cluster(fat_va, max_clusters) {
                     Some(c) => c,
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                         continue;
                     }
                 };
@@ -847,24 +844,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
                 if handle == u64::MAX {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                 } else {
-                    syscall::send(reply_port, FS_CREATE_OK, handle, 0, my_aspace as u64, 0);
+                    let _ = syscall::reply(FS_CREATE_OK, handle, 0, my_aspace as u64, 0, 0);
                 }
             }
 
             FS_WRITE => {
-                // data[0] = handle, data[1] = data_len|(reply<<32), data[2] = grant_va, data[3] = unused
+                // data[0] = handle, data[1] = data_len, data[2] = grant_va (reply via cap)
                 let handle = msg.data[0] as usize;
                 let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[1] >> 32;
                 let grant_va = msg.data[2] as usize;
 
                 if handle >= MAX_OPEN_FILES
                     || !open_files[handle].active
                     || !open_files[handle].writable
                 {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -926,7 +922,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     written += to_write;
                 }
 
-                syscall::send(reply_port, FS_WRITE_OK, written as u64, 0, 0, 0);
+                let _ = syscall::reply(FS_WRITE_OK, written as u64, 0, 0, 0, 0);
             }
 
             FS_CLOSE => {
@@ -945,12 +941,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                     open_files[handle].active = false;
                 }
+                let _ = syscall::reply(FS_CLOSE_OK, 0, 0, 0, 0, 0);
             }
 
             FS_DELETE => {
-                // data[0] = name_lo, data[1] = name_hi, data[2] = name_len|(reply<<32)
+                // data[0] = name_lo, data[1] = name_hi, data[2] = name_len (reply via cap)
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
 
@@ -1016,13 +1012,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // Flush FAT to disk.
                     flush_fat(&blk, fat_va, layout.fat_start, fat_sectors);
 
-                    syscall::send(reply_port, FS_DELETE_OK, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_DELETE_OK, 0, 0, 0, 0, 0);
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                 }
             }
 
-            _ => {}
+            _ => {
+                let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
+            }
         }
     }
 
