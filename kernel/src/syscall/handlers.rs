@@ -1527,9 +1527,16 @@ fn sys_grant_pages_lease(
     if my_aspace == 0 {
         return u64::MAX;
     }
+    // Accept either an explicit task port (resolves via kernel_user_data) or
+    // any regular service port owned by the target task (resolves via port
+    // creator). This lets callers lease onto ns-discovered service ports
+    // without needing to separately look up the server's task port.
     let dst_task = match resolve_task_port(dst_port) {
         Some(t) => t,
-        None => return u64::MAX,
+        None => match crate::ipc::port::port_creator(dst_port) {
+            Some(t) if t != 0 => t,
+            _ => return u64::MAX,
+        },
     };
     let dst_aspace = crate::sched::scheduler::task_ref(dst_task).aspace_id;
     let mmu_count = crate::mm::page::page_mmucount();

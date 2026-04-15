@@ -73,6 +73,14 @@ name = "grant_echo"
 path = "bin/grant_echo.rs"
 
 [[bin]]
+name = "grant_echo_srv"
+path = "bin/grant_echo_srv.rs"
+
+[[bin]]
+name = "grant_echo_test"
+path = "bin/grant_echo_test.rs"
+
+[[bin]]
 name = "macro_bench"
 path = "bin/macro_bench.rs"
 

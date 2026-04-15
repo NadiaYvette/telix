@@ -122,6 +122,27 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 5c: call/reply + GrantLease end-to-end (pilot server migration) ---
+    syscall::debug_puts(b"  init: running grant_echo (call/reply + lease) test...\n");
+    {
+        let ge_tid = syscall::spawn(b"grant_echo_test", 50);
+        if ge_tid != u64::MAX {
+            loop {
+                if let Some(code) = syscall::waitpid(ge_tid) {
+                    if code == 0 {
+                        syscall::debug_puts(b"Phase 5c grant_echo call/reply+lease: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 5c grant_echo call/reply+lease: FAILED\n");
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+        } else {
+            syscall::debug_puts(b"Phase 5c grant_echo call/reply+lease: FAILED (spawn)\n");
+        }
+    }
+
     // --- Test 3: mmap_anon / munmap ---
     syscall::debug_puts(b"  init: testing mmap_anon...\n");
     if let Some(va) = syscall::mmap_anon(0, 1, 1) {
