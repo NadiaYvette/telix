@@ -40,6 +40,7 @@ const FS_READDIR_END: u64 = 0x2202;
 const FS_STAT: u64 = 0x2300;
 const FS_STAT_OK: u64 = 0x2301;
 const FS_CLOSE: u64 = 0x2400;
+const FS_CLOSE_OK: u64 = 0x2401;
 const FS_READLINK: u64 = 0x2C10;
 const FS_READLINK_OK: u64 = 0x2C11;
 const FS_STATFS: u64 = 0x2C60;
@@ -884,7 +885,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
     // Server loop.
     loop {
-        let msg = match syscall::recv_msg(port) {
+        let msg = match syscall::recv_with_cap(port) {
             Some(m) => m,
             None => break,
         };
@@ -892,12 +893,10 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         match msg.tag {
             FS_OPEN => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
 
                 if let Some(rec) = path_resolve(&blk, &pvd, name, sector_buf_va) {
-                    // Allocate a handle.
                     let mut handle = u64::MAX;
                     for (i, f) in open_files.iter_mut().enumerate() {
                         if !f.active {
@@ -914,19 +913,19 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         }
                     }
                     if handle == u64::MAX {
-                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     } else {
-                        syscall::send(
-                            reply_port,
+                        let _ = syscall::reply(
                             FS_OPEN_OK,
                             handle,
                             rec.extent_size as u64,
                             my_aspace as u64,
                             0,
+                            0,
                         );
                     }
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                 }
             }
 
@@ -934,80 +933,74 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = msg.data[0] as usize;
                 let offset = msg.data[1] as u32;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as u32;
-                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
                 let file = &open_files[handle];
                 if offset >= file.extent_size {
-                    syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                     continue;
                 }
 
                 let avail = file.extent_size - offset;
                 let to_read = length.min(avail);
 
-                // ISO 9660 files are contiguous extents — just compute byte offset.
                 let file_byte_off =
                     (file.extent_lba as u64) * (ISO_SECTOR_SIZE as u64) + (offset as u64);
 
                 if grant_va != 0 {
-                    // Grant-based read: read directly into granted memory.
                     let chunk = (to_read as usize).min(4096);
                     if !blk.read_to_va(file_byte_off, grant_va, chunk) {
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                         continue;
                     }
-                    syscall::send_nb(reply_port, FS_READ_OK, chunk as u64, 0);
+                    let _ = syscall::reply(FS_READ_OK, chunk as u64, 0, 0, 0, 0);
                 } else {
-                    // Inline read.
                     let inline_len = (to_read as usize).min(MAX_INLINE);
                     let mut tmp = [0u8; 24];
                     if !blk.read_bytes(file_byte_off, &mut tmp[..inline_len]) {
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                         continue;
                     }
                     let words = pack_inline_data(&tmp[..inline_len]);
-                    syscall::send(
-                        reply_port,
+                    let _ = syscall::reply(
                         FS_READ_OK,
                         inline_len as u64,
                         words[0],
                         words[1],
                         words[2],
+                        0,
                     );
                 }
             }
 
             FS_READDIR => {
                 let handle = msg.data[0] as usize;
-                let reply_port = msg.data[1];
 
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
                 let file = &mut open_files[handle];
                 if !file.is_dir {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
-                // Scan for the next valid directory entry (skip "." and "..").
-                let mut found = false;
+                let mut sent = false;
                 while file.readdir_offset < file.extent_size {
                     let sector_off = file.readdir_offset / ISO_SECTOR_SIZE;
                     let lba = file.extent_lba + sector_off;
                     let pos_in_sector = (file.readdir_offset % ISO_SECTOR_SIZE) as usize;
 
                     if !blk.read_sector(lba, sector_buf_va) {
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
-                        found = true; // prevent FS_READDIR_END
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
+                        sent = true;
                         break;
                     }
 
@@ -1019,7 +1012,6 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     };
 
                     if sector_data[pos_in_sector] == 0 {
-                        // Padding — skip to next sector boundary.
                         file.readdir_offset =
                             (file.readdir_offset / ISO_SECTOR_SIZE + 1) * ISO_SECTOR_SIZE;
                         continue;
@@ -1029,55 +1021,50 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         file.readdir_offset += rec.record_len as u32;
 
                         let eff = rec.effective_name();
-                        // Skip "." and ".." entries.
                         if eff == b"." || eff == b".." {
                             continue;
                         }
 
-                        // Pack entry name and send.
                         let is_dir = if rec.is_dir() { 1u64 } else { 0u64 };
                         let name_data = pack_inline_data(eff);
-                        syscall::send(
-                            reply_port,
+                        let _ = syscall::reply(
                             FS_READDIR_OK,
                             eff.len() as u64 | (is_dir << 32),
                             name_data[0],
                             name_data[1],
                             rec.extent_size as u64,
+                            0,
                         );
-                        found = true;
+                        sent = true;
                         break;
                     } else {
-                        // Invalid record — advance to next sector.
                         file.readdir_offset =
                             (file.readdir_offset / ISO_SECTOR_SIZE + 1) * ISO_SECTOR_SIZE;
                     }
                 }
 
-                if !found {
-                    syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
-                    // Reset for future readdir calls.
+                if !sent {
+                    let _ = syscall::reply(FS_READDIR_END, 0, 0, 0, 0, 0);
                     file.readdir_offset = 0;
                 }
             }
 
             FS_STAT => {
                 let handle = msg.data[0] as usize;
-                let reply_port = msg.data[1];
 
                 if handle >= MAX_OPEN_FILES || !open_files[handle].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
                 let file = &open_files[handle];
                 let ftype = if file.is_dir { 1u64 } else { 0u64 };
-                syscall::send(
-                    reply_port,
+                let _ = syscall::reply(
                     FS_STAT_OK,
                     file.extent_size as u64,
                     ftype,
                     file.rr_mode as u64,
+                    0,
                     0,
                 );
             }
@@ -1087,49 +1074,42 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 if handle < MAX_OPEN_FILES {
                     open_files[handle].active = false;
                 }
+                let _ = syscall::reply(FS_CLOSE_OK, 0, 0, 0, 0, 0);
             }
 
             FS_READLINK => {
                 let name_len = (msg.data[2] & 0xFFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
 
                 if let Some(rec) = path_resolve(&blk, &pvd, name, sector_buf_va) {
                     if rec.rr_symlink_len == 0 {
-                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     } else {
                         let len = rec.rr_symlink_len as usize;
                         let packed = pack_inline_data(&rec.rr_symlink[..len.min(MAX_INLINE)]);
-                        syscall::send(
-                            reply_port,
+                        let _ = syscall::reply(
                             FS_READLINK_OK,
                             len as u64,
                             packed[0],
                             packed[1],
                             packed[2],
+                            0,
                         );
                     }
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                 }
             }
 
             FS_STATFS => {
-                let reply_port = msg.data[2] >> 32;
-                // Report volume info from PVD.
                 let total_blocks = pvd.volume_space_size as u64;
                 let block_size = pvd.block_size as u64;
-                // ISO 9660 is read-only: 0 free blocks.
-                syscall::send(reply_port, FS_STATFS_OK, total_blocks, 0, block_size, 0);
+                let _ = syscall::reply(FS_STATFS_OK, total_blocks, 0, block_size, 0, 0);
             }
 
             _ => {
-                // Unknown message — try to extract reply port and send error.
-                let reply_port = msg.data[2] >> 32;
-                if reply_port != 0 {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
-                }
+                let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
             }
         }
     }
