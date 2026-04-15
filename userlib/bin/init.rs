@@ -4245,21 +4245,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             };
 
             if let Some(udf_port) = udf_port {
-                let reply_port = syscall::port_create();
                 let mut passed = true;
                 let mut checks = 0u32;
 
                 // Test 1: Open and read hello.txt
                 {
                     let (n0, n1, _) = syscall::pack_name(b"hello.txt");
-                    let d2 = 9u64 | ((reply_port as u64) << 32);
-                    syscall::send(udf_port, FS_OPEN, n0, n1, d2, 0);
-                    if let Some(r) = syscall::recv_msg(reply_port) {
+                    if let Some(r) = syscall::call(udf_port, FS_OPEN, n0, n1, 9, 0) {
                         if r.tag == FS_OPEN_OK {
                             let handle = r.data[0];
-                            let d2r = 20u64 | ((reply_port as u64) << 32);
-                            syscall::send(udf_port, FS_READ, handle, 0, d2r, 0);
-                            if let Some(rr) = syscall::recv_msg(reply_port) {
+                            if let Some(rr) = syscall::call(udf_port, FS_READ, handle, 0, 20, 0) {
                                 if rr.tag == FS_READ_OK && rr.data[0] > 0 {
                                     let b0 = (rr.data[1] & 0xFF) as u8;
                                     let b1 = ((rr.data[1] >> 8) & 0xFF) as u8;
@@ -4277,7 +4272,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     passed = false;
                                 }
                             } else { passed = false; }
-                            syscall::send(udf_port, FS_CLOSE, handle, 0, 0, 0);
+                            let _ = syscall::call(udf_port, FS_CLOSE, handle, 0, 0, 0);
                         } else {
                             syscall::debug_puts(b"  [178] hello.txt open failed\n");
                             passed = false;
@@ -4288,14 +4283,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Test 2: Open and read sub/deep.txt (nested dir traversal)
                 {
                     let (n0, n1, _) = syscall::pack_name(b"sub/deep.txt");
-                    let d2 = 12u64 | ((reply_port as u64) << 32);
-                    syscall::send(udf_port, FS_OPEN, n0, n1, d2, 0);
-                    if let Some(r) = syscall::recv_msg(reply_port) {
+                    if let Some(r) = syscall::call(udf_port, FS_OPEN, n0, n1, 12, 0) {
                         if r.tag == FS_OPEN_OK {
                             let handle = r.data[0];
-                            let d2r = 19u64 | ((reply_port as u64) << 32);
-                            syscall::send(udf_port, FS_READ, handle, 0, d2r, 0);
-                            if let Some(rr) = syscall::recv_msg(reply_port) {
+                            if let Some(rr) = syscall::call(udf_port, FS_READ, handle, 0, 19, 0) {
                                 if rr.tag == FS_READ_OK && rr.data[0] > 0 {
                                     let b0 = (rr.data[1] & 0xFF) as u8;
                                     let b1 = ((rr.data[1] >> 8) & 0xFF) as u8;
@@ -4307,7 +4298,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     }
                                 } else { passed = false; }
                             } else { passed = false; }
-                            syscall::send(udf_port, FS_CLOSE, handle, 0, 0, 0);
+                            let _ = syscall::call(udf_port, FS_CLOSE, handle, 0, 0, 0);
                         } else {
                             syscall::debug_puts(b"  [178] sub/deep.txt open failed\n");
                             passed = false;
@@ -4318,15 +4309,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Test 3: Readdir on root directory
                 {
                     let (n0, n1, _) = syscall::pack_name(b"/");
-                    let d2 = 1u64 | ((reply_port as u64) << 32);
-                    syscall::send(udf_port, FS_OPEN, n0, n1, d2, 0);
-                    if let Some(r) = syscall::recv_msg(reply_port) {
+                    if let Some(r) = syscall::call(udf_port, FS_OPEN, n0, n1, 1, 0) {
                         if r.tag == FS_OPEN_OK {
                             let handle = r.data[0];
                             let mut entries = 0u32;
                             loop {
-                                syscall::send(udf_port, FS_READDIR, handle, reply_port, 0, 0);
-                                if let Some(rr) = syscall::recv_msg(reply_port) {
+                                if let Some(rr) = syscall::call(udf_port, FS_READDIR, handle, 0, 0, 0) {
                                     if rr.tag == FS_READDIR_OK {
                                         entries += 1;
                                     } else { break; }
@@ -4340,7 +4328,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 syscall::debug_puts(b" entries (expected >=3)\n");
                                 passed = false;
                             }
-                            syscall::send(udf_port, FS_CLOSE, handle, 0, 0, 0);
+                            let _ = syscall::call(udf_port, FS_CLOSE, handle, 0, 0, 0);
                         } else { passed = false; }
                     } else { passed = false; }
                 }
@@ -4348,13 +4336,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Test 4: Stat a file
                 {
                     let (n0, n1, _) = syscall::pack_name(b"alpha.txt");
-                    let d2 = 9u64 | ((reply_port as u64) << 32);
-                    syscall::send(udf_port, FS_OPEN, n0, n1, d2, 0);
-                    if let Some(r) = syscall::recv_msg(reply_port) {
+                    if let Some(r) = syscall::call(udf_port, FS_OPEN, n0, n1, 9, 0) {
                         if r.tag == FS_OPEN_OK {
                             let handle = r.data[0];
-                            syscall::send(udf_port, FS_STAT, handle, reply_port, 0, 0);
-                            if let Some(sr) = syscall::recv_msg(reply_port) {
+                            if let Some(sr) = syscall::call(udf_port, FS_STAT, handle, 0, 0, 0) {
                                 if sr.tag == FS_STAT_OK {
                                     let size = sr.data[0];
                                     let ftype = sr.data[1];
@@ -4370,7 +4355,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     }
                                 } else { passed = false; }
                             } else { passed = false; }
-                            syscall::send(udf_port, FS_CLOSE, handle, 0, 0, 0);
+                            let _ = syscall::call(udf_port, FS_CLOSE, handle, 0, 0, 0);
                         } else { passed = false; }
                     } else { passed = false; }
                 }
