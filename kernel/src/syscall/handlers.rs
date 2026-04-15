@@ -152,6 +152,7 @@ pub const SYS_REPLY: u64 = 120;
 pub const SYS_GRANT_PAGES_LEASE: u64 = 121;
 pub const SYS_REPLY_TAKE: u64 = 122;
 pub const SYS_REPLY_TO: u64 = 123;
+pub const SYS_RECV_WITH_CAP_NB: u64 = 124;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -477,6 +478,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_GRANT_PAGES_LEASE => sys_grant_pages_lease(a0, a1, a2, a3, a4),
         SYS_REPLY_TAKE => sys_reply_take(),
         SYS_REPLY_TO => sys_reply_to(a0, a1, [a2, a3, a4, a5, 0, 0]),
+        SYS_RECV_WITH_CAP_NB => sys_recv_with_cap_nb(a0, frame),
         SYS_SVC_PORT => sys_svc_port(a0),
         SYS_SVC_REGISTER => sys_svc_register(a0, a1, a2, a3, a4),
         SYS_SVC_LOOKUP => sys_svc_lookup(a0, a1, a2, a3),
@@ -1203,6 +1205,48 @@ fn sys_reply(tag: u64, data: [u64; 6]) -> u64 {
         }
         call_reply::FulfillResult::Abandoned => 0,
         call_reply::FulfillResult::InvalidHandle => 1,
+    }
+}
+
+// Non-blocking variant of sys_recv_with_cap. Returns 0 on success with
+// the message in registers (and the reply-cap installed in held_reply_cap),
+// or 1 if the queue was empty.
+fn sys_recv_with_cap_nb(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
+    if !check_port_cap(port_id, crate::cap::Rights::RECV) {
+        return ECAP;
+    }
+    // Reset priority between iterations so stacked priority donations from
+    // prior fulfilled replies don't accumulate.
+    crate::sched::reset_priority(crate::sched::current_thread_id());
+    match crate::ipc::port::recv_nb(port_id) {
+        Ok(mut msg) => {
+            let task_id = crate::sched::current_task_id();
+            auto_grant_sender_identity(task_id, msg.data[4]);
+            auto_grant_reply_caps(task_id, &msg);
+            let handle = msg.data[5];
+            msg.data[5] = 0;
+            let tid = crate::sched::current_thread_id();
+            crate::sched::scheduler::thread_ref(tid)
+                .held_reply_cap
+                .store(handle, core::sync::atomic::Ordering::Release);
+            if let Some(cap) = crate::ipc::call_reply::lookup(handle) {
+                let caller_tid = cap.caller_tid.load(core::sync::atomic::Ordering::Acquire);
+                if caller_tid != 0 {
+                    let caller_prio =
+                        crate::sched::scheduler::thread_ref(caller_tid).effective_priority;
+                    crate::ipc::call_reply::donate_priority(handle, tid, caller_prio);
+                }
+            }
+            set_reg(frame, 1, msg.tag);
+            set_reg(frame, 2, msg.data[0]);
+            set_reg(frame, 3, msg.data[1]);
+            set_reg(frame, 4, msg.data[2]);
+            set_reg(frame, 5, msg.data[3]);
+            set_reg(frame, 6, msg.data[4]);
+            set_reg(frame, 7, msg.data[5]);
+            0
+        }
+        Err(()) => 1, // Queue empty — caller can poll, yield, etc.
     }
 }
 

@@ -359,6 +359,110 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5g: early event_srv call/reply smoke test ---
+    // Covers EVENT_CREATE (eventfd), EVENT_WRITE, EVENT_READ (immediate +
+    // deferred-via-fork), EVENT_POLL, EVENT_CLOSE. The deferred-reply path
+    // (sys_reply_take + sys_reply_to) is the novel kernel code path.
+    syscall::debug_puts(b"  init: running event_srv (call/reply) smoke test...\n");
+    {
+        let event_tid = syscall::spawn(b"event_srv", 50);
+        if event_tid == u64::MAX {
+            syscall::debug_puts(b"Phase 5g event_srv call/reply smoke: FAILED (spawn)\n");
+        } else {
+            let mut ep_opt: Option<u64> = None;
+            for _ in 0..500u32 {
+                if let Some(p) = syscall::ns_lookup(b"event") {
+                    ep_opt = Some(p);
+                    break;
+                }
+                syscall::yield_now();
+            }
+
+            let mut ok = true;
+            let ep = match ep_opt {
+                Some(p) => p,
+                None => { ok = false; 0 }
+            };
+
+            // Create eventfd (type=0, initval=0, flags=0).
+            let mut handle: u32 = 0;
+            if ok {
+                match syscall::call(ep, 0x7000, 0, 0, 0, 0) {
+                    Some(r) if r.tag == 0x7100 => {
+                        handle = r.data[1] as u32;
+                    }
+                    _ => { ok = false; }
+                }
+            }
+
+            // Poll — should be not-ready.
+            if ok {
+                match syscall::call(ep, 0x7050, handle as u64, 0, 0, 0) {
+                    Some(r) if r.tag == 0x7100 && r.data[0] == 0 => {}
+                    _ => { ok = false; }
+                }
+            }
+
+            // Write 5 — synchronous.
+            if ok {
+                match syscall::call(ep, 0x7020, handle as u64, 5, 0, 0) {
+                    Some(r) if r.tag == 0x7100 => {}
+                    _ => { ok = false; }
+                }
+            }
+
+            // Poll — should be ready.
+            if ok {
+                match syscall::call(ep, 0x7050, handle as u64, 0, 0, 0) {
+                    Some(r) if r.tag == 0x7100 && r.data[0] == 1 => {}
+                    _ => { ok = false; }
+                }
+            }
+
+            // Read — immediate path, counter > 0 → returns 5 and clears.
+            if ok {
+                match syscall::call(ep, 0x7010, handle as u64, 0, 0, 0) {
+                    Some(r) if r.tag == 0x7100 && r.data[0] == 5 => {}
+                    _ => { ok = false; }
+                }
+            }
+
+            // Deferred-reply path: fork a child that writes after a delay
+            // while parent blocks in EVENT_READ (counter==0 branch).
+            if ok {
+                let child = syscall::fork();
+                if child == 0 {
+                    for _ in 0..2000 { syscall::yield_now(); }
+                    let _ = syscall::call(ep, 0x7020, handle as u64, 42, 0, 0);
+                    syscall::exit(0);
+                }
+                if child == u64::MAX {
+                    ok = false;
+                } else {
+                    match syscall::call(ep, 0x7010, handle as u64, 0, 0, 0) {
+                        Some(r) if r.tag == 0x7100 && r.data[0] == 42 => {}
+                        _ => { ok = false; }
+                    }
+                    loop {
+                        if syscall::waitpid(child).is_some() { break; }
+                        syscall::yield_now();
+                    }
+                }
+            }
+
+            // Close.
+            if ok {
+                let _ = syscall::call(ep, 0x7030, handle as u64, 0, 0, 0);
+            }
+
+            if ok {
+                syscall::debug_puts(b"Phase 5g event_srv call/reply smoke: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 5g event_srv call/reply smoke: FAILED\n");
+            }
+        }
+    }
+
     // --- Test 3: mmap_anon / munmap ---
     syscall::debug_puts(b"  init: testing mmap_anon...\n");
     if let Some(va) = syscall::mmap_anon(0, 1, 1) {

@@ -71,6 +71,7 @@ const SYS_REPLY: u64 = 120;
 const SYS_GRANT_PAGES_LEASE: u64 = 121;
 const SYS_REPLY_TAKE: u64 = 122;
 const SYS_REPLY_TO: u64 = 123;
+const SYS_RECV_WITH_CAP_NB: u64 = 124;
 const SYS_PERSONALITY_REGISTER: u64 = 0xF000;
 const SYS_PERSONALITY_SET: u64 = 0xF001;
 const SYS_PERSONALITY_GET: u64 = 0xF002;
@@ -2262,6 +2263,70 @@ pub fn recv_with_cap(port: u64) -> Option<Message> {
         core::arch::asm!(
             "syscall",
             inlateout("rax") SYS_RECV_WITH_CAP => s,
+            inlateout("rdi") port => _,
+            lateout("rsi") r1,
+            lateout("rdx") r2,
+            lateout("r10") r3,
+            lateout("r8") r4,
+            lateout("r9") r5,
+            lateout("rcx") _, lateout("r11") _,
+            lateout("r12") r6,
+            lateout("r13") r7,
+        );
+        status = s;
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = port;
+        status = 1;
+        r1 = 0; r2 = 0; r3 = 0; r4 = 0; r5 = 0; r6 = 0; r7 = 0;
+    }
+
+    if status != 0 {
+        return None;
+    }
+    Some(Message {
+        tag: r1,
+        data: [r2, r3, r4, r5, r6, r7],
+    })
+}
+
+/// Non-blocking variant of [`recv_with_cap`]. Returns `Some(Message)` if a
+/// message was waiting (and the reply-cap has been installed on this
+/// thread), or `None` if the queue was empty.
+pub fn recv_with_cap_nb(port: u64) -> Option<Message> {
+    let status: u64;
+    let r1: u64;
+    let r2: u64;
+    let r3: u64;
+    let r4: u64;
+    let r5: u64;
+    let r6: u64;
+    let r7: u64;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_RECV_WITH_CAP_NB,
+            inlateout("x0") port => status,
+            lateout("x1") r1,
+            lateout("x2") r2,
+            lateout("x3") r3,
+            lateout("x4") r4,
+            lateout("x5") r5,
+            lateout("x6") r6,
+            lateout("x7") r7,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let s: u64;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_RECV_WITH_CAP_NB => s,
             inlateout("rdi") port => _,
             lateout("rsi") r1,
             lateout("rdx") r2,

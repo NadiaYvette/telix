@@ -57,8 +57,9 @@ struct EventSlot {
     timer_interval_ns: u64,
     timer_next_ns: u64,
     timer_expirations: u64,
-    // Blocked reader reply port (u64::MAX = none).
-    blocked_reader: u64,
+    // Deferred reply-cap handle for a blocked reader (u64::MAX = none).
+    // Saved via sys_reply_take; fulfilled later via sys_reply_to.
+    blocked_reader_cap: u64,
 }
 
 impl EventSlot {
@@ -71,7 +72,7 @@ impl EventSlot {
             timer_interval_ns: 0,
             timer_next_ns: 0,
             timer_expirations: 0,
-            blocked_reader: u64::MAX,
+            blocked_reader_cap: u64::MAX,
         }
     }
 }
@@ -113,22 +114,20 @@ fn check_timers() {
             if slot.timer_interval_ns > 0 {
                 // Repeating timer: advance to next expiry.
                 slot.timer_next_ns += slot.timer_interval_ns;
-                // If we fell behind, catch up.
                 if slot.timer_next_ns <= now {
                     slot.timer_next_ns = now + slot.timer_interval_ns;
                 }
             } else {
-                // One-shot: disable.
                 slot.timer_next_ns = 0;
             }
 
-            // Wake blocked reader if any.
-            if slot.blocked_reader != u64::MAX {
-                let reply = slot.blocked_reader;
-                slot.blocked_reader = u64::MAX;
+            // Wake blocked reader if any (deferred reply-cap).
+            if slot.blocked_reader_cap != u64::MAX {
+                let cap = slot.blocked_reader_cap;
+                slot.blocked_reader_cap = u64::MAX;
                 let exp = slot.timer_expirations;
                 slot.timer_expirations = 0;
-                syscall::send(reply, EVENT_OK, exp, 0, 0, 0);
+                let _ = syscall::reply_to(cap, EVENT_OK, exp, 0, 0, 0);
             }
         }
     }
@@ -140,31 +139,34 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
     let port = syscall::port_create();
     syscall::ns_register(b"event", port);
 
+    // Call/reply server:
+    // - recv_with_cap blocks until a request arrives
+    // - immediate paths use sys_reply
+    // - blocking read paths (EventFd/TimerFd/SignalFd empty) stash the cap
+    //   via sys_reply_take; fulfilled later in EVENT_WRITE via sys_reply_to
+    //
+    // NOTE: timerfd expiries cannot currently wake a blocked reader — they
+    // are checked only when a new request arrives (lazy). A future revision
+    // should hook timer IRQs or use a dedicated wakeup mechanism.
     loop {
-        // Check timers before blocking on recv.
         check_timers();
 
-        // Non-blocking recv so we can keep checking timers.
-        let msg = syscall::recv_nb_msg(port);
-        if msg.is_none() {
-            syscall::yield_now();
-            continue;
-        }
-        let msg = msg.unwrap();
-
+        let msg = match syscall::recv_with_cap(port) {
+            Some(m) => m,
+            None => continue,
+        };
         match msg.tag {
             EVENT_CREATE => {
                 let etype_raw = msg.data[0];
                 let initval = msg.data[1];
                 let flags = msg.data[2] & 0xFFFFFFFF;
-                let reply = msg.data[2] >> 32;
 
                 let etype = match etype_raw {
                     EVT_EVENTFD => EventType::EventFd,
                     EVT_SIGNALFD => EventType::SignalFd,
                     EVT_TIMERFD => EventType::TimerFd,
                     _ => {
-                        syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
+                        let _ = syscall::reply(EVENT_ERROR, 0, 0, 0, 0, 0);
                         continue;
                     }
                 };
@@ -179,30 +181,28 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                             slot.timer_interval_ns = 0;
                             slot.timer_next_ns = 0;
                             slot.timer_expirations = 0;
-                            slot.blocked_reader = u64::MAX;
+                            slot.blocked_reader_cap = u64::MAX;
                         }
-                        // Reply: d0 = server_port, d1 = handle
-                        syscall::send(reply, EVENT_OK, port as u64, handle as u64, 0, 0);
+                        let _ = syscall::reply(EVENT_OK, port as u64, handle as u64, 0, 0, 0);
                     }
                     None => {
-                        syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
+                        let _ = syscall::reply(EVENT_ERROR, 0, 0, 0, 0, 0);
                     }
                 }
             }
 
             EVENT_READ => {
                 let handle = msg.data[0] as u32;
-                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_EVENTS {
-                    syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
+                    let _ = syscall::reply(EVENT_ERROR, 0, 0, 0, 0, 0);
                     continue;
                 }
 
                 unsafe {
                     let slot = &mut EVENTS[handle as usize];
                     if !slot.active {
-                        syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
+                        let _ = syscall::reply(EVENT_ERROR, 0, 0, 0, 0, 0);
                         continue;
                     }
 
@@ -217,25 +217,37 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                                     slot.counter = 0;
                                     v
                                 };
-                                syscall::send(reply, EVENT_OK, val, 0, 0, 0);
+                                let _ = syscall::reply(EVENT_OK, val, 0, 0, 0, 0);
                             } else {
-                                slot.blocked_reader = reply;
+                                // Defer: stash cap, fulfilled on EVENT_WRITE.
+                                let cap = syscall::reply_take();
+                                if cap != u64::MAX {
+                                    slot.blocked_reader_cap = cap;
+                                }
                             }
                         }
                         EventType::TimerFd => {
                             if slot.timer_expirations > 0 {
                                 let exp = slot.timer_expirations;
                                 slot.timer_expirations = 0;
-                                syscall::send(reply, EVENT_OK, exp, 0, 0, 0);
+                                let _ = syscall::reply(EVENT_OK, exp, 0, 0, 0, 0);
                             } else {
-                                slot.blocked_reader = reply;
+                                // Defer: stash cap, fulfilled on timer expiry.
+                                let cap = syscall::reply_take();
+                                if cap != u64::MAX {
+                                    slot.blocked_reader_cap = cap;
+                                }
                             }
                         }
                         EventType::SignalFd => {
-                            slot.blocked_reader = reply;
+                            // Defer indefinitely (no wake source wired up yet).
+                            let cap = syscall::reply_take();
+                            if cap != u64::MAX {
+                                slot.blocked_reader_cap = cap;
+                            }
                         }
                         EventType::None => {
-                            syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
+                            let _ = syscall::reply(EVENT_ERROR, 0, 0, 0, 0, 0);
                         }
                     }
                 }
@@ -244,26 +256,28 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
             EVENT_WRITE => {
                 let handle = msg.data[0] as u32;
                 let value = msg.data[1];
-                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_EVENTS {
-                    syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
+                    let _ = syscall::reply(EVENT_ERROR, 0, 0, 0, 0, 0);
                     continue;
                 }
 
                 unsafe {
                     let slot = &mut EVENTS[handle as usize];
                     if !slot.active || slot.etype != EventType::EventFd {
-                        syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
+                        let _ = syscall::reply(EVENT_ERROR, 0, 0, 0, 0, 0);
                         continue;
                     }
 
                     slot.counter = slot.counter.saturating_add(value);
 
-                    // Wake blocked reader.
-                    if slot.blocked_reader != u64::MAX && slot.counter > 0 {
-                        let reader = slot.blocked_reader;
-                        slot.blocked_reader = u64::MAX;
+                    // Reply to the writer first.
+                    let _ = syscall::reply(EVENT_OK, 8, 0, 0, 0, 0);
+
+                    // Then wake blocked reader if any.
+                    if slot.blocked_reader_cap != u64::MAX && slot.counter > 0 {
+                        let cap = slot.blocked_reader_cap;
+                        slot.blocked_reader_cap = u64::MAX;
                         let val = if slot.flags & EFD_SEMAPHORE != 0 {
                             slot.counter -= 1;
                             1
@@ -272,27 +286,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                             slot.counter = 0;
                             v
                         };
-                        syscall::send(reader, EVENT_OK, val, 0, 0, 0);
+                        let _ = syscall::reply_to(cap, EVENT_OK, val, 0, 0, 0);
                     }
-
-                    syscall::send(reply, EVENT_OK, 8, 0, 0, 0); // wrote 8 bytes
                 }
             }
 
             EVENT_TIMER_SET => {
                 let handle = msg.data[0] as u32;
                 let interval_ns = msg.data[1];
-                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_EVENTS {
-                    syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
+                    let _ = syscall::reply(EVENT_ERROR, 0, 0, 0, 0, 0);
                     continue;
                 }
 
                 unsafe {
                     let slot = &mut EVENTS[handle as usize];
                     if !slot.active || slot.etype != EventType::TimerFd {
-                        syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
+                        let _ = syscall::reply(EVENT_ERROR, 0, 0, 0, 0, 0);
                         continue;
                     }
 
@@ -301,35 +312,39 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                     slot.timer_expirations = 0;
                 }
 
-                syscall::send(reply, EVENT_OK, 0, 0, 0, 0);
+                let _ = syscall::reply(EVENT_OK, 0, 0, 0, 0, 0);
             }
 
             EVENT_CLOSE => {
                 let handle = msg.data[0] as u32;
-                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_EVENTS {
-                    syscall::send(reply, EVENT_ERROR, 0, 0, 0, 0);
+                    let _ = syscall::reply(EVENT_ERROR, 0, 0, 0, 0, 0);
                     continue;
                 }
 
                 unsafe {
                     let slot = &mut EVENTS[handle as usize];
+                    // If a reader was blocked on this fd, reply with ERROR
+                    // so it doesn't leak a waiting cap.
+                    if slot.blocked_reader_cap != u64::MAX {
+                        let cap = slot.blocked_reader_cap;
+                        slot.blocked_reader_cap = u64::MAX;
+                        let _ = syscall::reply_to(cap, EVENT_ERROR, 0, 0, 0, 0);
+                    }
                     slot.active = false;
                     slot.etype = EventType::None;
                     slot.counter = 0;
-                    slot.blocked_reader = u64::MAX;
                 }
 
-                syscall::send(reply, EVENT_OK, 0, 0, 0, 0);
+                let _ = syscall::reply(EVENT_OK, 0, 0, 0, 0, 0);
             }
 
             EVENT_POLL => {
                 let handle = msg.data[0] as u32;
-                let reply = msg.data[2] >> 32;
 
                 if handle as usize >= MAX_EVENTS {
-                    syscall::send(reply, EVENT_OK, 0, 0, 0, 0);
+                    let _ = syscall::reply(EVENT_OK, 0, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -340,28 +355,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                     } else {
                         match slot.etype {
                             EventType::EventFd => {
-                                if slot.counter > 0 {
-                                    1
-                                } else {
-                                    0
-                                }
+                                if slot.counter > 0 { 1 } else { 0 }
                             }
                             EventType::TimerFd => {
-                                if slot.timer_expirations > 0 {
-                                    1
-                                } else {
-                                    0
-                                }
+                                if slot.timer_expirations > 0 { 1 } else { 0 }
                             }
                             _ => 0,
                         }
                     };
-                    syscall::send(reply, EVENT_OK, ready, 0, 0, 0);
+                    let _ = syscall::reply(EVENT_OK, ready, 0, 0, 0, 0);
                 }
             }
 
             _ => {
-                // Unknown tag — ignore.
+                let _ = syscall::reply(EVENT_ERROR, 0, 0, 0, 0, 0);
             }
         }
     }
