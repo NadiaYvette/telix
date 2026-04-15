@@ -7175,35 +7175,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             0
         };
 
-        let rp = if phase56_ok {
-            syscall::port_create()
-        } else {
-            0
-        };
-
         // Test 1: open "meminfo", read, verify non-empty
         if phase56_ok {
             let fname = b"meminfo";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (rp << 32);
-            syscall::send(procfs_port, 0x2000, fn0, fn1, d2, 0); // FS_OPEN
-            if let Some(reply) = syscall::recv_msg(rp) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(procfs_port, 0x2000, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2001 {
-                    // FS_OPEN_OK
                     let h = reply.data[0];
 
-                    // Read inline.
-                    let rd2 = (24u64) | (rp << 32);
-                    syscall::send(procfs_port, 0x2100, h, 0, rd2, 0); // FS_READ
-                    if let Some(rr) = syscall::recv_msg(rp) {
+                    let rd2 = 24u64;
+                    if let Some(rr) = syscall::call(procfs_port, 0x2100, h, 0, rd2, 0) {
                         if rr.tag == 0x2101 {
-                            // FS_READ_OK
                             let len = rr.data[0] as usize;
                             if len == 0 {
                                 syscall::debug_puts(b"  FAIL: procfs meminfo empty\n");
                                 phase56_ok = false;
                             }
-                            // First bytes should start with 'T' from "Total:"
                             if phase56_ok {
                                 let first = (rr.data[1] & 0xFF) as u8;
                                 if first != b'T' {
@@ -7218,7 +7206,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         phase56_ok = false;
                     }
 
-                    syscall::send(procfs_port, 0x2400, h, 0, 0, 0); // FS_CLOSE
+                    let _ = syscall::call(procfs_port, 0x2400, h, 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  FAIL: procfs open meminfo\n");
                     phase56_ok = false;
@@ -7232,22 +7220,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase56_ok {
             let fname = b"1/status";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (rp << 32);
-            syscall::send(procfs_port, 0x2000, fn0, fn1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(rp) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(procfs_port, 0x2000, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2001 {
                     let h = reply.data[0];
 
-                    let rd2 = (24u64) | (rp << 32);
-                    syscall::send(procfs_port, 0x2100, h, 0, rd2, 0);
-                    if let Some(rr) = syscall::recv_msg(rp) {
+                    let rd2 = 24u64;
+                    if let Some(rr) = syscall::call(procfs_port, 0x2100, h, 0, rd2, 0) {
                         if rr.tag == 0x2101 {
                             let len = rr.data[0] as usize;
                             if len < 5 {
                                 syscall::debug_puts(b"  FAIL: procfs status too short\n");
                                 phase56_ok = false;
                             }
-                            // Check starts with "Pid: "
                             if phase56_ok {
                                 let lo = rr.data[1];
                                 let b0 = (lo & 0xFF) as u8;
@@ -7266,7 +7251,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         phase56_ok = false;
                     }
 
-                    syscall::send(procfs_port, 0x2400, h, 0, 0, 0);
+                    let _ = syscall::call(procfs_port, 0x2400, h, 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  FAIL: procfs open 1/status\n");
                     phase56_ok = false;
@@ -7280,22 +7265,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase56_ok {
             let fname = b"uptime";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (rp << 32);
-            syscall::send(procfs_port, 0x2000, fn0, fn1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(rp) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(procfs_port, 0x2000, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2001 {
                     let h = reply.data[0];
 
-                    let rd2 = (24u64) | (rp << 32);
-                    syscall::send(procfs_port, 0x2100, h, 0, rd2, 0);
-                    if let Some(rr) = syscall::recv_msg(rp) {
+                    let rd2 = 24u64;
+                    if let Some(rr) = syscall::call(procfs_port, 0x2100, h, 0, rd2, 0) {
                         if rr.tag == 0x2101 {
                             let len = rr.data[0] as usize;
                             if len == 0 {
                                 syscall::debug_puts(b"  FAIL: procfs uptime empty\n");
                                 phase56_ok = false;
                             }
-                            // First byte should be a digit.
                             if phase56_ok {
                                 let first = (rr.data[1] & 0xFF) as u8;
                                 if first < b'0' || first > b'9' {
@@ -7310,7 +7292,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         phase56_ok = false;
                     }
 
-                    syscall::send(procfs_port, 0x2400, h, 0, 0, 0);
+                    let _ = syscall::call(procfs_port, 0x2400, h, 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  FAIL: procfs open uptime\n");
                     phase56_ok = false;
@@ -7325,13 +7307,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let mut count = 0usize;
             let mut next_off = 0u64;
             for _ in 0..40 {
-                let d2 = rp;
-                syscall::send(procfs_port, 0x2200, next_off, 0, d2, 0); // FS_READDIR
-                if let Some(rr) = syscall::recv_msg(rp) {
+                if let Some(rr) = syscall::call(procfs_port, 0x2200, next_off, 0, 0, 0) {
                     if rr.tag == 0x2201 {
-                        // FS_READDIR_OK
                         count += 1;
-                        next_off = rr.data[3]; // next offset
+                        next_off = rr.data[3];
                     } else {
                         break; // FS_READDIR_END
                     }

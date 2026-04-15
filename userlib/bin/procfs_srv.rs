@@ -25,6 +25,7 @@ const FS_READDIR_END: u64 = 0x2202;
 const FS_STAT: u64 = 0x2300;
 const FS_STAT_OK: u64 = 0x2301;
 const FS_CLOSE: u64 = 0x2400;
+const FS_CLOSE_OK: u64 = 0x2401;
 const FS_ERROR: u64 = 0x2F00;
 
 const ERR_NOT_FOUND: u64 = 1;
@@ -248,7 +249,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let mut handles = [OpenHandle::empty(); MAX_OPEN];
 
     loop {
-        let msg = match syscall::recv_msg(port) {
+        let msg = match syscall::recv_with_cap(port) {
             Some(m) => m,
             None => break,
         };
@@ -256,10 +257,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         match msg.tag {
             FS_OPEN => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
-                // Determine virtual file type and generate content.
                 let mut buf = [0u8; MAX_BUF];
                 let buf_len;
 
@@ -270,15 +269,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 } else if let Some(pid) = parse_pid_status(&name, nlen) {
                     buf_len = gen_status(&mut buf, pid);
                     if buf_len == 0 {
-                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                         continue;
                     }
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     continue;
                 }
 
-                // Allocate handle.
                 let mut h = u64::MAX;
                 for (i, hnd) in handles.iter_mut().enumerate() {
                     if !hnd.active {
@@ -290,14 +288,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
                 if h == u64::MAX {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                 } else {
-                    syscall::send(
-                        reply_port,
+                    let _ = syscall::reply(
                         FS_OPEN_OK,
                         h,
                         handles[h as usize].buf_len as u64,
                         my_aspace,
+                        0,
                         0,
                     );
                 }
@@ -307,17 +305,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = msg.data[0] as usize;
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
                 let hnd = &handles[handle];
                 if offset >= hnd.buf_len {
-                    syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -332,73 +329,62 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             *dst.add(i) = hnd.buf[offset + i];
                         }
                     }
-                    syscall::send_nb(reply_port, FS_READ_OK, actual as u64, 0);
+                    let _ = syscall::reply(FS_READ_OK, actual as u64, 0, 0, 0, 0);
                 } else {
                     let inline_len = to_read.min(MAX_INLINE);
                     let packed = pack_inline_data(&hnd.buf[offset..offset + inline_len]);
-                    syscall::send(
-                        reply_port,
+                    let _ = syscall::reply(
                         FS_READ_OK,
                         inline_len as u64,
                         packed[0],
                         packed[1],
                         packed[2],
+                        0,
                     );
                 }
             }
 
             FS_STAT => {
                 let handle = msg.data[0] as usize;
-                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
                 let size = handles[handle].buf_len;
-                // mode = 0o100444 (regular file, read-only)
-                syscall::send(reply_port, FS_STAT_OK, size as u64, 0o100444u64, 0, 0);
+                let _ = syscall::reply(FS_STAT_OK, size as u64, 0o100444u64, 0, 0, 0);
             }
 
             FS_READDIR => {
                 let start_offset = msg.data[0] as usize;
-                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
-                // Virtual directory layout:
-                //   0 = "meminfo"
-                //   1 = "uptime"
-                //   2..2+MAX_TASKS = PID entries (only active ones)
-                //
-                // We use a running index to skip inactive slots.
-                let mut idx = start_offset;
+                let idx = start_offset;
                 let mut sent = false;
 
                 if idx == 0 {
                     let name_lo = pack_name_lo(b"meminfo");
-                    syscall::send(reply_port, FS_READDIR_OK, 0, name_lo, 0, 1);
+                    let _ = syscall::reply(FS_READDIR_OK, 0, name_lo, 0, 1, 0);
                     sent = true;
                 } else if idx == 1 {
                     let name_lo = pack_name_lo(b"uptime");
-                    syscall::send(reply_port, FS_READDIR_OK, 0, name_lo, 0, 2);
+                    let _ = syscall::reply(FS_READDIR_OK, 0, name_lo, 0, 2, 0);
                     sent = true;
                 } else {
-                    // PID entries: idx 2 maps to task slot (idx-2).
                     let mut slot = idx - 2;
                     while slot < MAX_TASKS {
                         let tid = syscall::proc_list(slot as u32);
                         if tid != 0 {
-                            // Format PID as name.
                             let mut nbuf = [0u8; 8];
                             let nlen = u64_to_dec(tid, &mut nbuf);
                             let name_lo = pack_name_lo(&nbuf[..nlen]);
-                            syscall::send(
-                                reply_port,
+                            let _ = syscall::reply(
                                 FS_READDIR_OK,
                                 0,
                                 name_lo,
                                 0,
                                 (slot + 3) as u64,
+                                0,
                             );
                             sent = true;
                             break;
@@ -408,7 +394,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 if !sent {
-                    syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_READDIR_END, 0, 0, 0, 0, 0);
                 }
             }
 
@@ -417,9 +403,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if handle < MAX_OPEN && handles[handle].active {
                     handles[handle].active = false;
                 }
+                let _ = syscall::reply(FS_CLOSE_OK, 0, 0, 0, 0, 0);
             }
 
-            _ => {}
+            _ => {
+                let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
+            }
         }
     }
 
