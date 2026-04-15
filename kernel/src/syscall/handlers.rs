@@ -1083,6 +1083,12 @@ fn sys_call(
             crate::sched::scheduler::thread_ref(receiver_tid)
                 .held_reply_cap
                 .store(handle, core::sync::atomic::Ordering::Release);
+            // Priority-inheritance donation: raise the server to the caller's
+            // effective priority (if the caller is more urgent) for the
+            // duration of the cap. Unwound in call_reply::free/abandon.
+            let caller_prio =
+                crate::sched::scheduler::thread_ref(caller_tid).effective_priority;
+            call_reply::donate_priority(handle, receiver_tid, caller_prio);
             msg.data[5] = 0;
             inject_recv_into_frame(receiver_tid, &msg);
             crate::sched::scheduler::wake_parked_thread(receiver_tid);
@@ -1146,6 +1152,17 @@ fn sys_recv_with_cap(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
             crate::sched::scheduler::thread_ref(tid)
                 .held_reply_cap
                 .store(handle, core::sync::atomic::Ordering::Release);
+            // Priority-inheritance donation for the queued-delivery path.
+            // The caller's tid is recorded on the cap; look up its
+            // effective_priority and donate onto ourselves.
+            if let Some(cap) = crate::ipc::call_reply::lookup(handle) {
+                let caller_tid = cap.caller_tid.load(core::sync::atomic::Ordering::Acquire);
+                if caller_tid != 0 {
+                    let caller_prio =
+                        crate::sched::scheduler::thread_ref(caller_tid).effective_priority;
+                    crate::ipc::call_reply::donate_priority(handle, tid, caller_prio);
+                }
+            }
             set_reg(frame, 1, msg.tag);
             set_reg(frame, 2, msg.data[0]);
             set_reg(frame, 3, msg.data[1]);

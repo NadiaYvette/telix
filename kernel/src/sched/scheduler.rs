@@ -2341,6 +2341,42 @@ pub fn block_current(_reason: BlockReason) {
     crate::arch::irq::restore(saved);
 }
 
+/// Raise a thread's effective priority to `new_prio` *if* that represents a
+/// priority increase (i.e. a lower numeric value in Telix's convention where
+/// 0 = highest, 254 = lowest non-idle). Returns the thread's prior
+/// `effective_priority` so the caller can save it for later restoration.
+///
+/// Used by IPC priority-inheritance donation (`call_reply::donate_priority`).
+/// Writes both the `prio` atomic (read by try_switch and wake_thread) and
+/// the per-thread `effective_priority` field.
+///
+/// NOTE: This does not re-enqueue a ready thread at the new priority — the
+/// next try_switch tick will pick up the change via the `prio` atomic. For
+/// the IPC donation use case, the server is either currently running (just
+/// returned from recv_with_cap) or about to be woken (DirectTransfer), so
+/// no mid-queue re-sorting is required.
+pub fn raise_thread_priority_to(tid: ThreadId, new_prio: u8) -> u8 {
+    let tref = thread_ref(tid);
+    let old = tref.effective_priority;
+    if new_prio < old {
+        tref.prio.store(new_prio, Ordering::Release);
+        unsafe { thread_mut_from_ref(tid) }.effective_priority = new_prio;
+    }
+    old
+}
+
+/// Restore a thread's effective priority to a saved value. Counterpart to
+/// `raise_thread_priority_to`; called when IPC donation is unwound.
+///
+/// Unconditional write: callers record the exact pre-donation value and
+/// expect that value to be re-installed on any terminal path (reply,
+/// caller death, server death).
+pub fn restore_thread_priority(tid: ThreadId, saved_prio: u8) {
+    let tref = thread_ref(tid);
+    tref.prio.store(saved_prio, Ordering::Release);
+    unsafe { thread_mut_from_ref(tid) }.effective_priority = saved_prio;
+}
+
 /// Wake a blocked thread, making it runnable.
 pub fn wake_thread(tid: ThreadId) {
     let tref = thread_ref(tid);

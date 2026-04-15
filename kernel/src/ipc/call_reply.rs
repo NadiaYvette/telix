@@ -126,6 +126,14 @@ pub struct ReplyCap {
     /// Number of occupied lease slots (high-water; slots may be cleared
     /// out-of-order so iteration checks `dst_aspace != 0`).
     pub lease_count: AtomicU32,
+    /// Priority-donation target: the server TID whose effective priority
+    /// was raised on behalf of this cap's caller. 0 = none / already unwound.
+    /// Set by `donate_priority` when the server installs the cap; cleared
+    /// idempotently by `undonate_priority` (called from `free` and `abandon`).
+    pub donated_server_tid: AtomicU32,
+    /// Saved server effective_priority, captured at donation time. Restored
+    /// on undonation. Stored as u32 for atomic convenience; value fits in u8.
+    pub saved_server_prio: AtomicU32,
 }
 
 impl ReplyCap {
@@ -145,6 +153,8 @@ impl ReplyCap {
             ],
             leases: [const { LeaseSlot::empty() }; MAX_LEASES_PER_CAP],
             lease_count: AtomicU32::new(0),
+            donated_server_tid: AtomicU32::new(0),
+            saved_server_prio: AtomicU32::new(0),
         }
     }
 
@@ -244,6 +254,9 @@ pub fn alloc(caller_tid: u32) -> Option<CapHandle> {
                 l.clear();
             }
             cap.lease_count.store(0, Ordering::Relaxed);
+            // Clear any stale donation bookkeeping from a prior use.
+            cap.donated_server_tid.store(0, Ordering::Relaxed);
+            cap.saved_server_prio.store(0, Ordering::Relaxed);
             return Some(encode_handle(slot as u32, g));
         }
     }
@@ -262,6 +275,7 @@ pub fn free(handle: CapHandle) {
         Some(c) => c,
         None => return,
     };
+    undonate_priority(cap);
     revoke_cap_leases(cap);
     // Transition to Free regardless of current state.
     cap.state.store(CAP_FREE, Ordering::Release);
@@ -396,16 +410,70 @@ pub fn abandon(handle: CapHandle) {
             // therefore the granted pages' source) is being torn down.
             // Leaving the server holding a mapping into a dead source
             // aspace is exactly the fault we're trying to prevent.
+            // Also unwind priority donation eagerly: the server is still
+            // alive, and may take arbitrary time to reply.
+            undonate_priority(cap);
             revoke_cap_leases(cap);
         }
         Err(CAP_FULFILLED) => {
             // Reply already in; just drop it (and revoke any stragglers —
             // fulfill's caller should have done so, but be defensive).
+            undonate_priority(cap);
             revoke_cap_leases(cap);
             cap.state.store(CAP_FREE, Ordering::Release);
         }
         Err(_) => {}
     }
+}
+
+/// Priority-inheritance donation (step 3a, MCS-lite without budgets).
+///
+/// When a caller parks in `sys_call` and a server receives the message, we
+/// *donate* the caller's effective priority to the server for the duration
+/// of the cap. In Telix priority numbers lower = higher priority, so this
+/// means we lower the server's `effective_priority` to `min(server, caller)`.
+/// The server's original priority is saved on the cap and restored on any
+/// terminal path (normal reply, caller death, server death).
+///
+/// Chained donations compose naturally: if server A (already running at the
+/// donated priority from upstream client C) calls into server B, B inherits
+/// A's current elevated priority via a fresh cap whose `saved_server_prio`
+/// captures B's pre-donation value. Unwinding B's cap restores B; A stays
+/// elevated until A replies to C.
+///
+/// Called at the point the server installs its `held_reply_cap` — both the
+/// sys_call DirectTransfer path and the sys_recv_with_cap immediate-delivery
+/// path. Idempotent per-cap (a second donate on the same cap would overwrite
+/// saved_server_prio, so callers must not double-call).
+pub fn donate_priority(handle: CapHandle, server_tid: u32, caller_prio: u8) {
+    let cap = match lookup(handle) {
+        Some(c) => c,
+        None => return,
+    };
+    // Record the donation target first. Use Release so a concurrent
+    // undonate_priority observing nonzero also sees the saved prio.
+    cap.saved_server_prio
+        .store(0, Ordering::Relaxed); // placeholder; real value written below
+    let old_prio =
+        crate::sched::scheduler::raise_thread_priority_to(server_tid, caller_prio);
+    cap.saved_server_prio.store(old_prio as u32, Ordering::Relaxed);
+    cap.donated_server_tid.store(server_tid, Ordering::Release);
+}
+
+/// Reverse `donate_priority`. Idempotent: a second call on the same cap is a
+/// no-op because `donated_server_tid` is swap-cleared to 0.
+///
+/// Called from `free` and `abandon` so every terminal path unwinds exactly
+/// once. `free` runs on the reply path; `abandon` runs eagerly on caller
+/// death so the server's priority is restored without waiting for its
+/// eventual reply.
+pub fn undonate_priority(cap: &ReplyCap) {
+    let server_tid = cap.donated_server_tid.swap(0, Ordering::AcqRel);
+    if server_tid == 0 {
+        return;
+    }
+    let saved = cap.saved_server_prio.load(Ordering::Acquire) as u8;
+    crate::sched::scheduler::restore_thread_priority(server_tid, saved);
 }
 
 /// Read the reply message from a fulfilled cap. Only called by the caller
