@@ -3352,30 +3352,25 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         };
 
         if let Some(ext2_port) = ext2_port {
-            let reply_port = syscall::port_create();
-
             // Step 2: Open hello.txt
-            {
+            let (handle, file_size, _fs_aspace) = {
                 let (n0, n1, _) = pack_name(b"hello.txt");
-                let d2 = 9u64 | (reply_port << 32);
-                syscall::send(ext2_port, 0x2000, n0, n1, d2, 0);
-            }
-
-            let (handle, file_size, fs_aspace) = if let Some(reply) = syscall::recv_msg(reply_port)
-            {
-                if reply.tag == 0x2001 {
-                    (reply.data[0], reply.data[1], reply.data[2])
+                let d2 = 9u64;
+                if let Some(reply) = syscall::call(ext2_port, 0x2000, n0, n1, d2, 0) {
+                    if reply.tag == 0x2001 {
+                        (reply.data[0], reply.data[1], reply.data[2])
+                    } else {
+                        syscall::debug_puts(b"    ext2 open hello.txt FAILED tag=");
+                        print_num(reply.tag);
+                        syscall::debug_puts(b"\n");
+                        ext2_ok = false;
+                        (u64::MAX, 0, 0)
+                    }
                 } else {
-                    syscall::debug_puts(b"    ext2 open hello.txt FAILED tag=");
-                    print_num(reply.tag);
-                    syscall::debug_puts(b"\n");
+                    syscall::debug_puts(b"    ext2 open hello.txt no reply\n");
                     ext2_ok = false;
                     (u64::MAX, 0, 0)
                 }
-            } else {
-                syscall::debug_puts(b"    ext2 open hello.txt no reply\n");
-                ext2_ok = false;
-                (u64::MAX, 0, 0)
             };
 
             if handle != u64::MAX {
@@ -3384,12 +3379,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"\n");
 
                 // Step 3: Read hello.txt content (inline, small file).
-                {
-                    let d2 = file_size | (reply_port << 32);
-                    syscall::send(ext2_port, 0x2100, handle, 0, d2, 0);
-                }
-
-                if let Some(reply) = syscall::recv_msg(reply_port) {
+                if let Some(reply) = syscall::call(ext2_port, 0x2100, handle, 0, file_size, 0) {
                     if reply.tag == 0x2101 {
                         let bytes_read = reply.data[0] as usize;
                         // Verify content is "Hello from ext2!"
@@ -3414,12 +3404,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 // Step 4: FS_STAT — verify Unix permissions.
-                {
-                    let d2 = reply_port;
-                    syscall::send(ext2_port, 0x2300, handle, 0, d2, 0);
-                }
-
-                if let Some(reply) = syscall::recv_msg(reply_port) {
+                if let Some(reply) = syscall::call(ext2_port, 0x2300, handle, 0, 0, 0) {
                     if reply.tag == 0x2301 {
                         let stat_size = reply.data[0] as u32;
                         let mode = reply.data[1] as u16;
@@ -3452,10 +3437,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 // Step 5: Close hello.txt.
-                syscall::send(ext2_port, 0x2400, handle, 0, 0, 0);
+                let _ = syscall::call(ext2_port, 0x2400, handle, 0, 0, 0);
             }
-
-            syscall::port_destroy(reply_port);
 
             if ext2_ok {
                 syscall::debug_puts(b"Phase 39 ext2 filesystem: PASSED\n");
@@ -3514,16 +3497,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             };
 
-            let reply_port = syscall::port_create();
             let path: &[u8] = b"hello.txt";
 
             // Step 1: stat the file to capture its current mode.
             let mut original_mode: u16 = 0o100644;
             if p173_ok {
                 write_path(path);
-                let d0 = (path.len() as u64) | (reply_port << 32);
-                syscall::send(ext2_port, FS_STAT_LONG, d0, 0, 0, 0);
-                if let Some(reply) = syscall::recv_msg(reply_port) {
+                let d0 = path.len() as u64;
+                if let Some(reply) = syscall::call(ext2_port, FS_STAT_LONG, d0, 0, 0, 0) {
                     if reply.tag == FS_STAT_OK {
                         original_mode = reply.data[1] as u16;
                         syscall::debug_puts(b"    p173: orig mode=");
@@ -3542,9 +3523,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if p173_ok {
                 write_path(path);
                 let new_mode: u64 = 0o600;
-                let d0 = (path.len() as u64) | ((new_mode & 0xFFFF) << 16) | (reply_port << 32);
-                syscall::send(ext2_port, FS_CHMOD, d0, 0, 0, 0);
-                if let Some(reply) = syscall::recv_msg(reply_port) {
+                let d0 = (path.len() as u64) | ((new_mode & 0xFFFF) << 16);
+                if let Some(reply) = syscall::call(ext2_port, FS_CHMOD, d0, 0, 0, 0) {
                     if reply.tag != FS_CHMOD_OK {
                         syscall::debug_puts(b"    p173: FS_CHMOD failed tag=");
                         print_num(reply.tag);
@@ -3559,9 +3539,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Step 3: re-stat to verify the on-disk mode changed.
             if p173_ok {
                 write_path(path);
-                let d0 = (path.len() as u64) | (reply_port << 32);
-                syscall::send(ext2_port, FS_STAT_LONG, d0, 0, 0, 0);
-                if let Some(reply) = syscall::recv_msg(reply_port) {
+                let d0 = path.len() as u64;
+                if let Some(reply) = syscall::call(ext2_port, FS_STAT_LONG, d0, 0, 0, 0) {
                     if reply.tag == FS_STAT_OK {
                         let m = reply.data[1] as u16;
                         // Top nibble = file type (0x8 = regular), low 12 = perms.
@@ -3585,10 +3564,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if p173_ok {
                 write_path(path);
                 let d0 = (path.len() as u64)
-                    | (((original_mode as u64) & 0o7777) << 16)
-                    | (reply_port << 32);
-                syscall::send(ext2_port, FS_CHMOD, d0, 0, 0, 0);
-                let _ = syscall::recv_msg(reply_port);
+                    | (((original_mode as u64) & 0o7777) << 16);
+                let _ = syscall::call(ext2_port, FS_CHMOD, d0, 0, 0, 0);
             }
 
             // Step 5: utimens. We can't easily verify the times via FS_STAT_LONG
@@ -3596,11 +3573,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // returns FS_UTIMENS_OK on a valid path / FS_ERROR on a bogus path.
             if p173_ok {
                 write_path(path);
-                let d0 = (path.len() as u64) | (reply_port << 32);
+                let d0 = path.len() as u64;
                 let atime: u64 = 12345;
                 let mtime: u64 = 67890;
-                syscall::send(ext2_port, FS_UTIMENS, d0, atime, mtime, 0);
-                if let Some(reply) = syscall::recv_msg(reply_port) {
+                if let Some(reply) = syscall::call(ext2_port, FS_UTIMENS, d0, atime, mtime, 0) {
                     if reply.tag != FS_UTIMENS_OK {
                         syscall::debug_puts(b"    p173: FS_UTIMENS failed tag=");
                         print_num(reply.tag);
@@ -3618,9 +3594,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if p173_ok {
                 let bad: &[u8] = b"no_such_phase173_file.txt";
                 write_path(bad);
-                let d0 = (bad.len() as u64) | (reply_port << 32);
-                syscall::send(ext2_port, FS_UTIMENS, d0, 1, 1, 0);
-                if let Some(reply) = syscall::recv_msg(reply_port) {
+                let d0 = bad.len() as u64;
+                if let Some(reply) = syscall::call(ext2_port, FS_UTIMENS, d0, 1, 1, 0) {
                     if reply.tag == FS_UTIMENS_OK {
                         syscall::debug_puts(b"    p173: utimens(missing) returned OK\n");
                         p173_ok = false;
@@ -3634,7 +3609,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if scratch_va != 0 {
                 syscall::munmap(scratch_va);
             }
-            syscall::port_destroy(reply_port);
 
             if p173_ok {
                 syscall::debug_puts(b"Phase 173 filesystem realism: PASSED\n");
@@ -6417,21 +6391,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 53 ext2 write: SKIPPED (no ext2)\n");
         }
 
-        let reply_port = if phase53_ok {
-            syscall::port_create()
-        } else {
-            0
-        };
-
         // Step 1: FS_CREATE "WTEST.TXT"
         let mut handle = 0u64;
         let mut srv_aspace = 0u64;
         if phase53_ok {
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (reply_port << 32);
-            syscall::send(ext2_port, 0x2500, fn0, fn1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(reply_port) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(ext2_port, 0x2500, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2501 {
                     handle = reply.data[0];
                     srv_aspace = reply.data[2];
@@ -6458,9 +6425,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let grant_dst: usize = 0x8_0000_0000;
                 let grant_ok = syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false);
                 if grant_ok {
-                    let wd1 = 64u64 | (reply_port << 32);
-                    syscall::send(ext2_port, 0x2600, handle, wd1, grant_dst as u64, 0);
-                    if let Some(wr) = syscall::recv_msg(reply_port) {
+                    let wd1 = 64u64;
+                    if let Some(wr) = syscall::call(ext2_port, 0x2600, handle, wd1, grant_dst as u64, 0) {
                         if wr.tag != 0x2601 || wr.data[0] != 64 {
                             syscall::debug_puts(b"  FAIL: ext2 FS_WRITE bad reply\n");
                             phase53_ok = false;
@@ -6481,7 +6447,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Step 3: FS_CLOSE (triggers inode flush)
         if phase53_ok {
-            syscall::send(ext2_port, 0x2400, handle, 0, 0, 0);
+            let _ = syscall::call(ext2_port, 0x2400, handle, 0, 0, 0);
             syscall::sleep_ms(50); // Wait for disk I/O
         }
 
@@ -6489,9 +6455,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase53_ok {
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (reply_port << 32);
-            syscall::send(ext2_port, 0x2000, fn0, fn1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(reply_port) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(ext2_port, 0x2000, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2001 {
                     let rh = reply.data[0];
                     let rsize = reply.data[1];
@@ -6506,9 +6471,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if let Some(scratch) = syscall::mmap_anon(0, 1, 1) {
                             let grant_dst: usize = 0x8_0000_0000;
                             if syscall::grant_pages(r_aspace, scratch, grant_dst, 1, false) {
-                                let rd2 = 64u64 | (reply_port << 32);
-                                syscall::send(ext2_port, 0x2100, rh, 0, rd2, grant_dst as u64);
-                                if let Some(rd) = syscall::recv_msg(reply_port) {
+                                let rd2 = 64u64;
+                                if let Some(rd) = syscall::call(ext2_port, 0x2100, rh, 0, rd2, grant_dst as u64) {
                                     if rd.tag == 0x2101 && rd.data[0] == 64 {
                                         // Verify pattern
                                         let p = scratch as *const u8;
@@ -6545,7 +6509,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
 
                     // Close the re-opened file.
-                    syscall::send(ext2_port, 0x2400, rh, 0, 0, 0);
+                    let _ = syscall::call(ext2_port, 0x2400, rh, 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  FAIL: ext2 re-open not found\n");
                     phase53_ok = false;
@@ -6559,9 +6523,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase53_ok {
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (reply_port << 32);
-            syscall::send(ext2_port, 0x2700, fn0, fn1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(reply_port) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(ext2_port, 0x2700, fn0, fn1, d2, 0) {
                 if reply.tag != 0x2701 {
                     syscall::debug_puts(b"  FAIL: ext2 FS_DELETE failed\n");
                     phase53_ok = false;
@@ -6576,14 +6539,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::sleep_ms(20);
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (reply_port << 32);
-            syscall::send(ext2_port, 0x2000, fn0, fn1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(reply_port) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(ext2_port, 0x2000, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2001 {
                     // File still exists — fail.
                     syscall::debug_puts(b"  FAIL: ext2 file not deleted\n");
                     // Close the handle we got.
-                    syscall::send(ext2_port, 0x2400, reply.data[0], 0, 0, 0);
+                    let _ = syscall::call(ext2_port, 0x2400, reply.data[0], 0, 0, 0);
                     phase53_ok = false;
                 }
                 // FS_ERROR (not found) is the expected response.
@@ -6594,11 +6556,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase53_ok {
             let fname = b"hello.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (reply_port << 32);
-            syscall::send(ext2_port, 0x2000, fn0, fn1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(reply_port) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(ext2_port, 0x2000, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2001 {
-                    syscall::send(ext2_port, 0x2400, reply.data[0], 0, 0, 0);
+                    let _ = syscall::call(ext2_port, 0x2400, reply.data[0], 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  FAIL: ext2 hello.txt corrupted\n");
                     phase53_ok = false;
@@ -6606,10 +6567,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             } else {
                 phase53_ok = false;
             }
-        }
-
-        if reply_port != 0 {
-            syscall::port_destroy(reply_port);
         }
 
         if phase53_ok {
@@ -9534,31 +9491,49 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             const FS_CREATE_OK: u64 = 0x2501;
             const FS_READ: u64 = 0x2100;
             const FS_READ_OK: u64 = 0x2101;
-            const FS_CLOSE: u64 = 0x2300;
-            let reply = syscall::port_create();
             // Create "pg_ctl" (6 bytes).
             let n0: u64 = 0x6C74635F6770; // "pg_ctl" LE
-            let d2 = 6u64 | (reply << 32);
-            syscall::send(fs_port, FS_CREATE, n0, 0, d2, 0);
-            if let Some(resp) = syscall::recv_msg(reply) {
-                if resp.tag == FS_CREATE_OK {
-                    let handle = resp.data[0];
-                    // Read back to verify handle is valid.
-                    let rd2 = 4u64 | (reply << 32);
-                    syscall::send(fs_port, FS_READ, handle, 0, rd2, 0);
-                    if let Some(rd) = syscall::recv_msg(reply) {
-                        if rd.tag == FS_READ_OK {
-                            syscall::debug_puts(b"    create+read pg_ctl: OK\n");
-                        } else {
-                            phase80_ok = false;
+            if has_blk {
+                // ext2 is on call/reply protocol.
+                let d2 = 6u64;
+                if let Some(resp) = syscall::call(fs_port, FS_CREATE, n0, 0, d2, 0) {
+                    if resp.tag == FS_CREATE_OK {
+                        let handle = resp.data[0];
+                        let rd2 = 4u64;
+                        if let Some(rd) = syscall::call(fs_port, FS_READ, handle, 0, rd2, 0) {
+                            if rd.tag == FS_READ_OK {
+                                syscall::debug_puts(b"    create+read pg_ctl: OK\n");
+                            } else {
+                                phase80_ok = false;
+                            }
                         }
+                    } else {
+                        syscall::debug_puts(b"    WARN: FS_CREATE failed (may already exist)\n");
                     }
-                    // Note: skip FS_CLOSE — read-only test, handle leaked but harmless.
-                } else {
-                    syscall::debug_puts(b"    WARN: FS_CREATE failed (may already exist)\n");
                 }
+            } else {
+                // rootfs is still on legacy send/recv_msg protocol.
+                let reply = syscall::port_create();
+                let d2 = 6u64 | (reply << 32);
+                syscall::send(fs_port, FS_CREATE, n0, 0, d2, 0);
+                if let Some(resp) = syscall::recv_msg(reply) {
+                    if resp.tag == FS_CREATE_OK {
+                        let handle = resp.data[0];
+                        let rd2 = 4u64 | (reply << 32);
+                        syscall::send(fs_port, FS_READ, handle, 0, rd2, 0);
+                        if let Some(rd) = syscall::recv_msg(reply) {
+                            if rd.tag == FS_READ_OK {
+                                syscall::debug_puts(b"    create+read pg_ctl: OK\n");
+                            } else {
+                                phase80_ok = false;
+                            }
+                        }
+                    } else {
+                        syscall::debug_puts(b"    WARN: FS_CREATE failed (may already exist)\n");
+                    }
+                }
+                syscall::port_destroy(reply);
             }
-            syscall::port_destroy(reply);
         }
 
         if phase80_ok {
