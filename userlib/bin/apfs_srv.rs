@@ -37,6 +37,7 @@ const FS_STAT: u64 = 0x2300;
 const FS_STAT_OK: u64 = 0x2301;
 const FS_STAT_LONG: u64 = 0x2302;
 const FS_CLOSE: u64 = 0x2400;
+const FS_CLOSE_OK: u64 = 0x2401;
 const FS_CREATE: u64 = 0x2500;
 const FS_CREATE_OK: u64 = 0x2501;
 const FS_WRITE: u64 = 0x2600;
@@ -3373,7 +3374,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
     // ---- Server loop ----
     loop {
-        let msg = match syscall::recv_msg(port) {
+        let msg = match syscall::recv_with_cap(port) {
             Some(m) => m,
             None => break,
         };
@@ -3398,12 +3399,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         }
                     }
                     if handle == u64::MAX {
-                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     } else {
-                        syscall::send(reply_port, FS_OPEN_OK, handle, inode.size, my_aspace as u64, 0);
+                        let _ = syscall::reply(FS_OPEN_OK, handle, inode.size, my_aspace as u64, 0, 0);
                     }
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                 }
             }
 
@@ -3429,12 +3430,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         }
                     }
                     if handle == u64::MAX {
-                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     } else {
-                        syscall::send(reply_port, FS_OPEN_OK, handle, inode.size, my_aspace as u64, 0);
+                        let _ = syscall::reply(FS_OPEN_OK, handle, inode.size, my_aspace as u64, 0, 0);
                     }
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                 }
             }
 
@@ -3443,6 +3444,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 if handle_id < MAX_OPEN && handles[handle_id].active {
                     handles[handle_id].active = false;
                 }
+                let _ = syscall::reply(FS_CLOSE_OK, 0, 0, 0, 0, 0);
             }
 
             FS_READ => {
@@ -3453,13 +3455,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let grant_va = msg.data[3] as usize;
 
                 if handle_id >= MAX_OPEN || !handles[handle_id].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
                 let inode = &handles[handle_id].inode;
                 if offset >= inode.size {
-                    syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -3504,7 +3506,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 if grant_va != 0 {
-                    syscall::send(reply_port, FS_READ_OK, total_read as u64, 0, 0, 0);
+                    let _ = syscall::reply(FS_READ_OK, total_read as u64, 0, 0, 0, 0);
                 } else {
                     // Inline read (up to 24 bytes).
                     let inline_len = total_read.min(MAX_INLINE);
@@ -3514,14 +3516,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         ) {
                             Some(r) => r,
                             None => {
-                                syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                                let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                                 continue;
                             }
                         };
                         let block_va = match cache_read(&blk, phys_block, bs) {
                             Some(va) => va,
                             None => {
-                                syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                                let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                                 continue;
                             }
                         };
@@ -3532,9 +3534,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                             )
                         };
                         let packed = pack_inline_data(src);
-                        syscall::send(reply_port, FS_READ_OK, inline_len as u64, packed[0], packed[1], packed[2]);
+                        let _ = syscall::reply(FS_READ_OK, inline_len as u64, packed[0], packed[1], packed[2], 0);
                     } else {
-                        syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                        let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                     }
                 }
             }
@@ -3554,7 +3556,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     match path_resolve(&blk, bs, vol_omap, cur_fs_root, max_xid, name) {
                         Some(inode) if inode.is_dir() => inode.ino,
                         _ => {
-                            syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                            let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                             continue;
                         }
                     }
@@ -3576,10 +3578,10 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                             Some(i) => i.size,
                             None => 0,
                         };
-                        syscall::send(reply_port, FS_READDIR_OK, file_size, n0, n1, next_off as u64);
+                        let _ = syscall::reply(FS_READDIR_OK, file_size, n0, n1, next_off as u64, 0);
                     }
                     None => {
-                        syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
+                        let _ = syscall::reply(FS_READDIR_END, 0, 0, 0, 0, 0);
                     }
                 }
             }
@@ -3589,20 +3591,18 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 if handle_id >= MAX_OPEN || !handles[handle_id].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
                 let inode = &handles[handle_id].inode;
                 let uid_gid = (inode.owner as u64) | ((inode.group as u64) << 32);
-                syscall::send(
-                    reply_port,
-                    FS_STAT_OK,
+                let _ = syscall::reply(FS_STAT_OK,
                     inode.size,
                     inode.mode as u64,
                     uid_gid,
-                    inode.ino,
-                );
+                    inode.ino
+                , 0);
             }
 
             FS_STAT_LONG => {
@@ -3615,9 +3615,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
                 if let Some(inode) = path_resolve(&blk, bs, vol_omap, cur_fs_root, max_xid, name) {
                     let uid_gid = (inode.owner as u64) | ((inode.group as u64) << 32);
-                    syscall::send(reply_port, FS_STAT_OK, inode.size, inode.mode as u64, uid_gid, inode.ino);
+                    let _ = syscall::reply(FS_STAT_OK, inode.size, inode.mode as u64, uid_gid, inode.ino, 0);
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                 }
             }
 
@@ -3629,21 +3629,21 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
                 let ino = if let Some(inode) = path_resolve(&blk, bs, vol_omap, cur_fs_root, max_xid, name) {
                     if !inode.is_symlink() {
-                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                         continue;
                     }
                     inode.ino
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     continue;
                 };
 
                 let mut target = [0u8; 256];
                 if let Some(len) = read_symlink_target(&blk, bs, vol_omap, cur_fs_root, max_xid, ino, &mut target) {
                     let packed = pack_inline_data(&target[..len.min(MAX_INLINE)]);
-                    syscall::send(reply_port, FS_READLINK_OK, len as u64, packed[0], packed[1], packed[2]);
+                    let _ = syscall::reply(FS_READLINK_OK, len as u64, packed[0], packed[1], packed[2], 0);
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                 }
             }
 
@@ -3652,7 +3652,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 unsafe {
                     let total_blocks = BLOCK_COUNT;
                     let bsize = BLOCK_SIZE as u64;
-                    syscall::send(reply_port, FS_STATFS_OK, bsize, total_blocks, 0, 0);
+                    let _ = syscall::reply(FS_STATFS_OK, bsize, total_blocks, 0, 0, 0);
                 }
             }
 
@@ -3678,7 +3678,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     Some(r) => r,
                     None => {
                         syscall::debug_puts(b"  [apfs_srv] CREATE: inode FAILED\n");
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                         continue;
                     }
                 };
@@ -3692,7 +3692,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     Some(r) => r,
                     None => {
                         syscall::debug_puts(b"  [apfs_srv] CREATE: drec FAILED\n");
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                         continue;
                     }
                 };
@@ -3728,10 +3728,10 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
                 if handle == u64::MAX {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                 } else {
                     update_volume_superblock(&blk, bs, unsafe { VOL_PHYS_BLOCK }, 1, 0);
-                    syscall::send(reply_port, FS_CREATE_OK, handle, 0, my_aspace as u64, 0);
+                    let _ = syscall::reply(FS_CREATE_OK, handle, 0, my_aspace as u64, 0, 0);
                 }
             }
 
@@ -3755,7 +3755,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 ) {
                     Some(r) => r,
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                         continue;
                     }
                 };
@@ -3767,7 +3767,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 ) {
                     Some(r) => r,
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                         continue;
                     }
                 };
@@ -3781,7 +3781,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 update_volume_superblock(&blk, bs, unsafe { VOL_PHYS_BLOCK }, 0, 1);
-                syscall::send(reply_port, FS_MKDIR_OK, 0, 0, 0, 0);
+                let _ = syscall::reply(FS_MKDIR_OK, 0, 0, 0, 0, 0);
             }
 
             FS_WRITE => {
@@ -3792,7 +3792,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
                 if handle_id >= MAX_OPEN || !handles[handle_id].active {
                     if reply_port != 0 {
-                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     }
                     continue;
                 }
@@ -3861,7 +3861,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 if reply_port != 0 {
-                    syscall::send(reply_port, FS_WRITE_OK, written as u64, 0, 0, 0);
+                    let _ = syscall::reply(FS_WRITE_OK, written as u64, 0, 0, 0, 0);
                 }
             }
 
@@ -3875,7 +3875,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let child_ino = match dir_lookup(&blk, bs, vol_omap, cur_fs_root, max_xid, ROOT_DIR_INO_NUM, name) {
                     Some(i) => i,
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                         continue;
                     }
                 };
@@ -3883,7 +3883,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let child = match read_inode(&blk, bs, vol_omap, cur_fs_root, max_xid, child_ino) {
                     Some(i) => i,
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                         continue;
                     }
                 };
@@ -3959,7 +3959,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
                 let (fd, dd) = if is_dir { (0i64, -1i64) } else { (-1, 0) };
                 update_volume_superblock(&blk, bs, unsafe { VOL_PHYS_BLOCK }, fd, dd);
-                syscall::send(reply_port, FS_DELETE_OK, 0, 0, 0, 0);
+                let _ = syscall::reply(FS_DELETE_OK, 0, 0, 0, 0, 0);
             }
 
             FS_TRUNCATE => {
@@ -3968,7 +3968,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let new_size = msg.data[1];
 
                 if handle_lo >= MAX_OPEN || !handles[handle_lo].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -4018,7 +4018,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 ) {
                     cur_fs_root = r;
                 }
-                syscall::send(reply_port, FS_TRUNCATE_OK, 0, 0, 0, 0);
+                let _ = syscall::reply(FS_TRUNCATE_OK, 0, 0, 0, 0, 0);
             }
 
             FS_RENAME => {
@@ -4042,7 +4042,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let file_id = match dir_lookup(&blk, bs, vol_omap, cur_fs_root, max_xid, ROOT_DIR_INO_NUM, old_name) {
                     Some(i) => i,
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                         continue;
                     }
                 };
@@ -4050,7 +4050,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let target_inode = match read_inode(&blk, bs, vol_omap, cur_fs_root, max_xid, file_id) {
                     Some(i) => i,
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                         continue;
                     }
                 };
@@ -4067,7 +4067,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 ) {
                     cur_fs_root = r;
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -4085,12 +4085,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         ) {
                             cur_fs_root = r;
                         }
-                        syscall::send(reply_port, FS_ERROR, ERR_IO, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
                         continue;
                     }
                 }
 
-                syscall::send(reply_port, FS_RENAME_OK, 0, 0, 0, 0);
+                let _ = syscall::reply(FS_RENAME_OK, 0, 0, 0, 0, 0);
             }
 
             FS_CHMOD => {
@@ -4112,9 +4112,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     ) {
                         cur_fs_root = r;
                     }
-                    syscall::send(reply_port, FS_CHMOD_OK, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_CHMOD_OK, 0, 0, 0, 0, 0);
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                 }
             }
 
@@ -4139,37 +4139,39 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     ) {
                         cur_fs_root = r;
                     }
-                    syscall::send(reply_port, FS_CHOWN_OK, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_CHOWN_OK, 0, 0, 0, 0, 0);
                 } else {
-                    syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                 }
             }
 
             FS_UTIMENS => {
                 let reply_port = msg.data[0] >> 32;
-                syscall::send(reply_port, FS_UTIMENS_OK, 0, 0, 0, 0);
+                let _ = syscall::reply(FS_UTIMENS_OK, 0, 0, 0, 0, 0);
             }
 
             FS_SYMLINK => {
                 let name_len = (msg.data[2] & 0xFFFF) as usize;
                 let reply_port = msg.data[2] >> 32;
                 // Stub: symlink creation not yet supported.
-                syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
             }
 
             FS_LINK => {
                 let reply_port = msg.data[2] >> 32;
-                syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
             }
 
             FS_FSYNC => {
                 let reply_port = msg.data[2] >> 32;
                 // Flush all metadata to disk.
                 checkpoint_commit(&blk, bs, 0);
-                syscall::send(reply_port, FS_FSYNC_OK, 0, 0, 0, 0);
+                let _ = syscall::reply(FS_FSYNC_OK, 0, 0, 0, 0, 0);
             }
 
-            _ => {}
+            _ => {
+                let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
+            }
         }
     }
 }

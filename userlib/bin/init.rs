@@ -534,33 +534,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         if let Some(apfs_port) = apfs_port_opt {
-            let rp = syscall::port_create();
             let mut smoke_ok = true;
 
             // 1) FS_OPEN root "."
             {
                 let (n0, n1, _) = pack_name(b".");
-                let d2 = 1u64 | (rp << 32);
-                syscall::send_nb_4(apfs_port, 0x2000, n0, n1, d2, 0);
-                let mut got_reply = false;
-                for _ in 0..50000u32 {
-                    if let Some(r) = syscall::recv_nb_msg(rp) {
-                        got_reply = true;
-                        if r.tag == 0x2001 {
-                            syscall::debug_puts(b"    apfs open root: OK\n");
-                            let h = r.data[0];
-                            syscall::send_nb(apfs_port, 0x2400, h, 0); // close
-                        } else {
-                            syscall::debug_puts(b"    apfs open root: FAIL tag=");
-                            print_num(r.tag);
-                            syscall::debug_puts(b"\n");
-                            smoke_ok = false;
-                        }
-                        break;
+                if let Some(r) = syscall::call(apfs_port, 0x2000, n0, n1, 1u64, 0) {
+                    if r.tag == 0x2001 {
+                        syscall::debug_puts(b"    apfs open root: OK\n");
+                        let h = r.data[0];
+                        let _ = syscall::call(apfs_port, 0x2400, h, 0, 0, 0); // close
+                    } else {
+                        syscall::debug_puts(b"    apfs open root: FAIL tag=");
+                        print_num(r.tag);
+                        syscall::debug_puts(b"\n");
+                        smoke_ok = false;
                     }
-                    syscall::yield_now();
-                }
-                if !got_reply {
+                } else {
                     syscall::debug_puts(b"    apfs open root: no reply\n");
                     smoke_ok = false;
                 }
@@ -569,148 +559,111 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // 2) FS_CREATE "atest.txt"
             if smoke_ok {
                 let (n0, n1, _) = pack_name(b"atest.txt");
-                let d2 = 9u64 | (rp << 32);
-                syscall::send_nb_4(apfs_port, 0x2500, n0, n1, d2, 0);
-                let mut got_reply = false;
-                for _ in 0..100000u32 {
-                    if let Some(r) = syscall::recv_nb_msg(rp) {
-                        got_reply = true;
-                        if r.tag == 0x2501 {
-                            syscall::debug_puts(b"    apfs create: OK\n");
-                            let h = r.data[0];
-                            let fs_aspace = r.data[2];
+                if let Some(r) = syscall::call(apfs_port, 0x2500, n0, n1, 9u64, 0) {
+                    if r.tag == 0x2501 {
+                        syscall::debug_puts(b"    apfs create: OK\n");
+                        let h = r.data[0];
+                        let fs_aspace = r.data[2];
 
-                            // 3) FS_WRITE "Hello APFS!"
-                            let wdata = b"Hello APFS!";
-                            if let Some(va) = syscall::mmap_anon(0, 1, 1) {
-                                unsafe {
-                                    for i in 0..wdata.len() {
-                                        core::ptr::write((va + i) as *mut u8, wdata[i]);
-                                    }
+                        // 3) FS_WRITE "Hello APFS!"
+                        let wdata = b"Hello APFS!";
+                        if let Some(va) = syscall::mmap_anon(0, 1, 1) {
+                            unsafe {
+                                for i in 0..wdata.len() {
+                                    core::ptr::write((va + i) as *mut u8, wdata[i]);
                                 }
-                                let gdst: usize = 0x9_0000_0000;
-                                if syscall::grant_pages(fs_aspace, va, gdst, 1, false) {
-                                    let wd1 = (wdata.len() as u64) | (rp << 32);
-                                    syscall::send_nb_4(apfs_port, 0x2600, h, wd1, gdst as u64, 0);
-                                    let mut wr_ok = false;
-                                    for _ in 0..100000u32 {
-                                        if let Some(wr) = syscall::recv_nb_msg(rp) {
-                                            if wr.tag == 0x2601 && wr.data[0] as usize == wdata.len() {
-                                                syscall::debug_puts(b"    apfs write: OK\n");
-                                                wr_ok = true;
-                                            } else {
-                                                syscall::debug_puts(b"    apfs write: FAIL tag=");
-                                                print_num(wr.tag);
-                                                syscall::debug_puts(b" d0=");
-                                                print_num(wr.data[0]);
-                                                syscall::debug_puts(b"\n");
-                                                smoke_ok = false;
-                                            }
-                                            break;
-                                        }
-                                        syscall::yield_now();
-                                    }
-                                    if !wr_ok && smoke_ok {
-                                        syscall::debug_puts(b"    apfs write: no reply\n");
+                            }
+                            let gdst: usize = 0x9_0000_0000;
+                            if syscall::grant_pages(fs_aspace, va, gdst, 1, false) {
+                                if let Some(wr) = syscall::call(apfs_port, 0x2600, h, wdata.len() as u64, gdst as u64, 0) {
+                                    if wr.tag == 0x2601 && wr.data[0] as usize == wdata.len() {
+                                        syscall::debug_puts(b"    apfs write: OK\n");
+                                    } else {
+                                        syscall::debug_puts(b"    apfs write: FAIL tag=");
+                                        print_num(wr.tag);
+                                        syscall::debug_puts(b" d0=");
+                                        print_num(wr.data[0]);
+                                        syscall::debug_puts(b"\n");
                                         smoke_ok = false;
                                     }
-                                    syscall::revoke(fs_aspace, gdst);
                                 } else {
-                                    syscall::debug_puts(b"    apfs write: grant failed\n");
+                                    syscall::debug_puts(b"    apfs write: no reply\n");
                                     smoke_ok = false;
                                 }
-                                syscall::munmap(va);
+                                syscall::revoke(fs_aspace, gdst);
+                            } else {
+                                syscall::debug_puts(b"    apfs write: grant failed\n");
+                                smoke_ok = false;
                             }
-
-                            // 4) Close
-                            syscall::send_nb(apfs_port, 0x2400, h, 0);
-
-                            // 5) Re-open and read back
-                            if smoke_ok {
-                                let (n0, n1, _) = pack_name(b"atest.txt");
-                                let d2 = 9u64 | (rp << 32);
-                                syscall::send_nb_4(apfs_port, 0x2000, n0, n1, d2, 0);
-                                for _ in 0..50000u32 {
-                                    if let Some(r) = syscall::recv_nb_msg(rp) {
-                                        if r.tag == 0x2001 {
-                                            let h2 = r.data[0];
-                                            let sz = r.data[1];
-                                            let d2r = sz | (rp << 32);
-                                            syscall::send_nb_4(apfs_port, 0x2100, h2, 0, d2r, 0);
-                                            for _ in 0..50000u32 {
-                                                if let Some(rr) = syscall::recv_nb_msg(rp) {
-                                                    if rr.tag == 0x2101 {
-                                                        let br = rr.data[0] as usize;
-                                                        let expected = b"Hello APFS!";
-                                                        let mut c = [0u8; 24];
-                                                        let w = [rr.data[1], rr.data[2], rr.data[3]];
-                                                        for i in 0..br.min(24) {
-                                                            c[i] = (w[i / 8] >> ((i % 8) * 8)) as u8;
-                                                        }
-                                                        if br == expected.len() && &c[..br] == expected {
-                                                            syscall::debug_puts(b"    apfs read-back: OK\n");
-                                                        } else {
-                                                            syscall::debug_puts(b"    apfs read-back: MISMATCH\n");
-                                                            smoke_ok = false;
-                                                        }
-                                                    } else {
-                                                        syscall::debug_puts(b"    apfs read-back: bad tag\n");
-                                                        smoke_ok = false;
-                                                    }
-                                                    break;
-                                                }
-                                                syscall::yield_now();
-                                            }
-                                            syscall::send_nb(apfs_port, 0x2400, h2, 0);
-                                        } else {
-                                            syscall::debug_puts(b"    apfs reopen: FAIL\n");
-                                            smoke_ok = false;
-                                        }
-                                        break;
-                                    }
-                                    syscall::yield_now();
-                                }
-                            }
-
-                            // 6) Delete
-                            if smoke_ok {
-                                let (n0, n1, _) = pack_name(b"atest.txt");
-                                let d2 = 9u64 | (rp << 32);
-                                syscall::send_nb_4(apfs_port, 0x2700, n0, n1, d2, 0);
-                                for _ in 0..100000u32 {
-                                    if let Some(r) = syscall::recv_nb_msg(rp) {
-                                        if r.tag == 0x2701 {
-                                            syscall::debug_puts(b"    apfs delete: OK\n");
-                                        } else {
-                                            syscall::debug_puts(b"    apfs delete: FAIL\n");
-                                            smoke_ok = false;
-                                        }
-                                        break;
-                                    }
-                                    syscall::yield_now();
-                                }
-                            }
-                        } else {
-                            syscall::debug_puts(b"    apfs create: FAIL tag=");
-                            print_num(r.tag);
-                            if r.tag == 0x2F00 {
-                                syscall::debug_puts(b" err=");
-                                print_num(r.data[0]);
-                            }
-                            syscall::debug_puts(b"\n");
-                            smoke_ok = false;
+                            syscall::munmap(va);
                         }
-                        break;
+
+                        // 4) Close
+                        let _ = syscall::call(apfs_port, 0x2400, h, 0, 0, 0);
+
+                        // 5) Re-open and read back
+                        if smoke_ok {
+                            let (n0, n1, _) = pack_name(b"atest.txt");
+                            if let Some(r) = syscall::call(apfs_port, 0x2000, n0, n1, 9u64, 0) {
+                                if r.tag == 0x2001 {
+                                    let h2 = r.data[0];
+                                    let sz = r.data[1];
+                                    if let Some(rr) = syscall::call(apfs_port, 0x2100, h2, 0, sz, 0) {
+                                        if rr.tag == 0x2101 {
+                                            let br = rr.data[0] as usize;
+                                            let expected = b"Hello APFS!";
+                                            let mut c = [0u8; 24];
+                                            let w = [rr.data[1], rr.data[2], rr.data[3]];
+                                            for i in 0..br.min(24) {
+                                                c[i] = (w[i / 8] >> ((i % 8) * 8)) as u8;
+                                            }
+                                            if br == expected.len() && &c[..br] == expected {
+                                                syscall::debug_puts(b"    apfs read-back: OK\n");
+                                            } else {
+                                                syscall::debug_puts(b"    apfs read-back: MISMATCH\n");
+                                                smoke_ok = false;
+                                            }
+                                        } else {
+                                            syscall::debug_puts(b"    apfs read-back: bad tag\n");
+                                            smoke_ok = false;
+                                        }
+                                    }
+                                    let _ = syscall::call(apfs_port, 0x2400, h2, 0, 0, 0);
+                                } else {
+                                    syscall::debug_puts(b"    apfs reopen: FAIL\n");
+                                    smoke_ok = false;
+                                }
+                            }
+                        }
+
+                        // 6) Delete
+                        if smoke_ok {
+                            let (n0, n1, _) = pack_name(b"atest.txt");
+                            if let Some(r) = syscall::call(apfs_port, 0x2700, n0, n1, 9u64, 0) {
+                                if r.tag == 0x2701 {
+                                    syscall::debug_puts(b"    apfs delete: OK\n");
+                                } else {
+                                    syscall::debug_puts(b"    apfs delete: FAIL\n");
+                                    smoke_ok = false;
+                                }
+                            }
+                        }
+                    } else {
+                        syscall::debug_puts(b"    apfs create: FAIL tag=");
+                        print_num(r.tag);
+                        if r.tag == 0x2F00 {
+                            syscall::debug_puts(b" err=");
+                            print_num(r.data[0]);
+                        }
+                        syscall::debug_puts(b"\n");
+                        smoke_ok = false;
                     }
-                    syscall::yield_now();
-                }
-                if !got_reply {
+                } else {
                     syscall::debug_puts(b"    apfs create: no reply\n");
                     smoke_ok = false;
                 }
             }
 
-            syscall::port_destroy(rp);
             if smoke_ok {
                 syscall::debug_puts(b"APFS write smoke test: PASSED\n");
             } else {
