@@ -81,6 +81,10 @@ name = "cap_test"
 path = "bin/cap_test.rs"
 
 [[bin]]
+name = "call_reply_test"
+path = "bin/call_reply_test.rs"
+
+[[bin]]
 name = "cache_srv"
 path = "bin/cache_srv.rs"
 

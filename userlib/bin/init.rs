@@ -101,6 +101,27 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     syscall::debug_puts(b"Phase 5 process lifecycle + IPC test: PASSED\n");
 
+    // --- Test 5b: seL4-style call/reply IPC (run early, before long tests) ---
+    syscall::debug_puts(b"  init: running call/reply IPC test (early)...\n");
+    {
+        let cr_tid = syscall::spawn(b"call_reply_test", 50);
+        if cr_tid != u64::MAX {
+            loop {
+                if let Some(code) = syscall::waitpid(cr_tid) {
+                    if code == 0 {
+                        syscall::debug_puts(b"Phase 5b call/reply: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 5b call/reply: FAILED\n");
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+        } else {
+            syscall::debug_puts(b"Phase 5b call/reply: FAILED (spawn)\n");
+        }
+    }
+
     // --- Test 3: mmap_anon / munmap ---
     syscall::debug_puts(b"  init: testing mmap_anon...\n");
     if let Some(va) = syscall::mmap_anon(0, 1, 1) {
@@ -1818,6 +1839,27 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         syscall::port_destroy(svc_port);
+    }
+
+    // --- Test 24b: seL4-style call/reply IPC ---
+    syscall::debug_puts(b"  init: running call/reply IPC test...\n");
+    {
+        let cr_tid = syscall::spawn(b"call_reply_test", 50);
+        if cr_tid != u64::MAX {
+            loop {
+                if let Some(code) = syscall::waitpid(cr_tid) {
+                    if code == 0 {
+                        syscall::debug_puts(b"Phase 24b call/reply: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 24b call/reply: FAILED\n");
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+        } else {
+            syscall::debug_puts(b"Phase 24b call/reply: FAILED (spawn)\n");
+        }
     }
 
     // --- Test 25: Phase 33 Page Cache ---

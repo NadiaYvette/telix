@@ -30,6 +30,8 @@ pub enum BlockReason {
     PersonalityWait,
     Kswapd,
     SvcLookup,
+    /// Parked in sys_call waiting for sys_reply on a reply-cap slot.
+    CallReply(u32),
 }
 
 // Thread ID capacity is determined by RadixTable::capacity() — no fixed constant needed.
@@ -148,6 +150,22 @@ pub struct Thread {
     /// slice_vt = base_slice * 1024 / latency_weight. Lower latency_weight → shorter
     /// slices → tighter deadlines → more responsive scheduling.
     pub eevdf_latency_weight: u16,
+    // --- Call/reply IPC (seL4-style) ---
+    /// Handle of the reply-cap this thread currently holds, or
+    /// `CAP_HANDLE_NONE` (u64::MAX) if none. Set by sys_recv_with_cap when a
+    /// call-style request is received; consumed by sys_reply. Walked by the
+    /// thread-teardown path to deliver CALL_REPLY_SERVER_DIED if the server
+    /// dies holding a cap.
+    pub held_reply_cap: core::sync::atomic::AtomicU64,
+    /// Pending grant leases staged by `sys_grant_pages_lease`, atomically
+    /// transferred into the freshly-allocated reply-cap by the next
+    /// `sys_call`. Slots with `dst_aspace == 0` are empty. See
+    /// `ipc::call_reply::LeaseSlot`.
+    pub pending_leases: [crate::ipc::call_reply::LeaseSlot;
+        crate::ipc::call_reply::MAX_LEASES_PER_CAP],
+    /// High-water count of staged leases (slots may be cleared below this;
+    /// iterate by `dst_aspace != 0`).
+    pub pending_lease_count: core::sync::atomic::AtomicU32,
 }
 
 impl Thread {
@@ -204,6 +222,10 @@ impl Thread {
             eevdf_slice_vt: 0,
             eevdf_lag: 0,
             eevdf_latency_weight: 1024,
+            held_reply_cap: core::sync::atomic::AtomicU64::new(u64::MAX),
+            pending_leases: [const { crate::ipc::call_reply::LeaseSlot::empty() };
+                crate::ipc::call_reply::MAX_LEASES_PER_CAP],
+            pending_lease_count: core::sync::atomic::AtomicU32::new(0),
         }
     }
 }

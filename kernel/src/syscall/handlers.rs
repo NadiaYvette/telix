@@ -145,6 +145,11 @@ pub const SYS_PORT_ALIVE: u64 = 110;
 pub const SYS_IRQ_ATTACH: u64 = 111;
 pub const SYS_IRQ_ACK: u64 = 112;
 pub const SYS_MMIO_MAP_CAP: u64 = 113;
+// seL4-style call/reply IPC.
+pub const SYS_CALL: u64 = 118;
+pub const SYS_RECV_WITH_CAP: u64 = 119;
+pub const SYS_REPLY: u64 = 120;
+pub const SYS_GRANT_PAGES_LEASE: u64 = 121;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -464,6 +469,10 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_PORT_ALIVE => {
             if crate::ipc::port::port_ref(a0).is_some() { 1 } else { 0 }
         }
+        SYS_CALL => sys_call(a0, a1, [a2, a3, a4, a5], frame),
+        SYS_RECV_WITH_CAP => sys_recv_with_cap(a0, frame),
+        SYS_REPLY => sys_reply(a0, [a1, a2, a3, a4, a5, 0]),
+        SYS_GRANT_PAGES_LEASE => sys_grant_pages_lease(a0, a1, a2, a3, a4),
         SYS_SVC_PORT => sys_svc_port(a0),
         SYS_SVC_REGISTER => sys_svc_register(a0, a1, a2, a3, a4),
         SYS_SVC_LOOKUP => sys_svc_lookup(a0, a1, a2, a3),
@@ -970,6 +979,212 @@ fn sys_recv_nb(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
     }
 }
 
+// -------------------------------------------------------------------------
+// seL4-style call/reply IPC
+// -------------------------------------------------------------------------
+//
+// sys_call(dest_port, tag, data[0..4]):
+//   Alloc a reply-cap, pack it into data[5] of the outgoing message, send
+//   (via the normal port path), then park on the cap. When the server
+//   eventually replies via sys_reply, the kernel injects the reply into
+//   this thread's saved exception frame and wakes us. Returns 0 on success
+//   with the reply in regs, or an error code.
+//
+// sys_recv_with_cap(port, frame):
+//   Like sys_recv, but also extracts the reply-cap handle from data[5] of
+//   the received message, installs it in the current thread's
+//   `held_reply_cap` field, and zeros data[5] in the frame before returning
+//   so the server sees a clean message.
+//
+// sys_reply(tag, data[0..5]):
+//   Read the current thread's held reply-cap, fulfill it with (tag, data),
+//   inject into the caller's parked frame, wake the caller, and clear the
+//   held cap. Returns 0 on success.
+
+fn sys_call(
+    dest_port: u64,
+    tag: u64,
+    user_data: [u64; 4],
+    frame: &mut ExceptionFrame,
+) -> u64 {
+    use crate::ipc::call_reply;
+
+    if !check_port_cap(dest_port, crate::cap::Rights::SEND) {
+        return ECAP;
+    }
+
+    let caller_tid = crate::sched::current_thread_id();
+
+    // Allocate a reply cap. On exhaustion, fail fast.
+    let handle = match call_reply::alloc(caller_tid) {
+        Some(h) => h,
+        None => return 2, // cap table full
+    };
+
+    // Transfer any pending grant leases staged by sys_grant_pages_lease onto
+    // the cap. After this block, the grants' lifetime is bound to the cap:
+    // revocation happens in call_reply::free (called from sys_reply) or in
+    // abandon (called from the caller-death teardown hook).
+    {
+        use core::sync::atomic::Ordering;
+        let t = crate::sched::scheduler::thread_ref(caller_tid);
+        let n = t.pending_lease_count.swap(0, Ordering::AcqRel) as usize;
+        let n = n.min(call_reply::MAX_LEASES_PER_CAP);
+        for i in 0..n {
+            let slot = &t.pending_leases[i];
+            let aspace = slot.dst_aspace.swap(0, Ordering::AcqRel);
+            if aspace == 0 {
+                continue;
+            }
+            let va = slot.dst_va.swap(0, Ordering::Relaxed);
+            let pc = slot.page_count.swap(0, Ordering::Relaxed);
+            // Arm the lease on the cap. If the cap is already full (should
+            // not happen — bounds match), revoke eagerly to avoid a leak.
+            if !call_reply::arm_lease(handle, aspace, va, pc) {
+                crate::mm::grant::revoke_grant(aspace, va);
+            }
+        }
+    }
+
+    // Pre-save our frame BEFORE sending the message. If the server replies
+    // before we call park_current_for_ipc, wake_parked_thread will CAS
+    // ENQUEUED→NONE (fast wake) and our park CAS will fail, unwinding the
+    // Blocked state and returning with the injected reply already in our
+    // frame. If pre_save_frame ran AFTER send, a fast reply would see
+    // park_state=NONE and the reply would never wake us.
+    crate::sched::scheduler::pre_save_frame(caller_tid);
+
+    // Build the outgoing message. data[4] is sender task port (stamped like
+    // sys_send), data[5] carries the reply-cap handle.
+    let sender_task = crate::sched::current_task_id();
+    let mut msg = crate::ipc::Message::new(
+        tag,
+        [
+            user_data[0],
+            user_data[1],
+            user_data[2],
+            user_data[3],
+            crate::sched::task_port_id(sender_task),
+            handle,
+        ],
+    );
+
+    // Send through the normal port path. Use the non-direct path (send/
+    // send_nb style) to keep wake semantics simple for step 1.
+    match crate::ipc::port::send_direct(dest_port, &mut msg) {
+        crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
+            let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
+            auto_grant_sender_identity(receiver_task, msg.data[4]);
+            auto_grant_reply_caps(receiver_task, &msg);
+            // Install the reply-cap on the receiver thread and hide data[5]
+            // from its view. Must happen BEFORE inject_recv_into_frame, and
+            // using Release ordering so the handle is visible once the
+            // receiver resumes.
+            crate::sched::scheduler::thread_ref(receiver_tid)
+                .held_reply_cap
+                .store(handle, core::sync::atomic::Ordering::Release);
+            msg.data[5] = 0;
+            inject_recv_into_frame(receiver_tid, &msg);
+            crate::sched::scheduler::wake_parked_thread(receiver_tid);
+        }
+        crate::ipc::port::SendDirectResult::Queued => {}
+        crate::ipc::port::SendDirectResult::Full => {
+            match crate::ipc::port::send(dest_port, msg) {
+                Ok(()) => {}
+                Err(()) => {
+                    call_reply::free(handle);
+                    return 1;
+                }
+            }
+        }
+        crate::ipc::port::SendDirectResult::Error => {
+            call_reply::free(handle);
+            return 1;
+        }
+    }
+
+    // Park on the cap. pre_save_frame already ran above. If sys_reply beat
+    // us to it, park_current_for_ipc's CAS fails and it returns immediately.
+    let slot = (handle & 0xFFFF_FFFF) as u32;
+    crate::sched::scheduler::park_current_for_ipc(
+        crate::sched::thread::BlockReason::CallReply(slot),
+    );
+
+    // NOTE: park_current_for_ipc uses a deferred context switch — it may
+    // return while we still own the CPU, with pending_switch_sp set. The
+    // caller never regains kernel-side control after this point: when the
+    // scheduler later reschedules us, we resume directly at the exception
+    // handler's return path. Therefore we CANNOT free the reply-cap here.
+    // The cap is released by sys_reply on the server side, after it has
+    // injected the reply into our saved frame.
+    // Placeholder return — sys_reply overrode set_return already.
+    let _ = frame;
+    0
+}
+
+fn sys_recv_with_cap(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
+    if !check_port_cap(port_id, crate::cap::Rights::RECV) {
+        return ECAP;
+    }
+
+    // Two paths for delivery:
+    // - Ok(msg): the queue had a message waiting — install the reply-cap
+    //   synchronously from data[5], zero it, and populate registers.
+    // - Err(()): we parked. The sender's sys_call DirectTransfer handler
+    //   already stored the reply-cap into our thread's `held_reply_cap`
+    //   and zeroed data[5] before inject_recv_into_frame, so when we
+    //   resume the frame already holds the cleaned message and the cap
+    //   is installed. Nothing to do here.
+    match crate::ipc::port::recv_or_park(port_id) {
+        Ok(mut msg) => {
+            let task_id = crate::sched::current_task_id();
+            auto_grant_sender_identity(task_id, msg.data[4]);
+            auto_grant_reply_caps(task_id, &msg);
+            let handle = msg.data[5];
+            msg.data[5] = 0;
+            let tid = crate::sched::current_thread_id();
+            crate::sched::scheduler::thread_ref(tid)
+                .held_reply_cap
+                .store(handle, core::sync::atomic::Ordering::Release);
+            set_reg(frame, 1, msg.tag);
+            set_reg(frame, 2, msg.data[0]);
+            set_reg(frame, 3, msg.data[1]);
+            set_reg(frame, 4, msg.data[2]);
+            set_reg(frame, 5, msg.data[3]);
+            set_reg(frame, 6, msg.data[4]);
+            set_reg(frame, 7, msg.data[5]);
+            0
+        }
+        Err(()) => 0,
+    }
+}
+
+fn sys_reply(tag: u64, data: [u64; 6]) -> u64 {
+    use crate::ipc::call_reply;
+
+    let tid = crate::sched::current_thread_id();
+    let t = crate::sched::scheduler::thread_ref(tid);
+    let handle = t.held_reply_cap.swap(u64::MAX, core::sync::atomic::Ordering::AcqRel);
+    if handle == u64::MAX {
+        return 1; // no cap held
+    }
+    let reply = crate::ipc::Message::new(tag, data);
+    match call_reply::fulfill(handle, &reply) {
+        call_reply::FulfillResult::WakeCaller(caller_tid) => {
+            inject_recv_into_frame(caller_tid, &reply);
+            crate::sched::scheduler::wake_parked_thread(caller_tid);
+            // Caller can't clean up its own reply-cap (it returns to user
+            // via the deferred context switch, never re-entering the
+            // kernel-side sys_call body), so the server owns releasing
+            // the slot once the reply has been delivered.
+            call_reply::free(handle);
+            0
+        }
+        call_reply::FulfillResult::Abandoned => 0,
+        call_reply::FulfillResult::InvalidHandle => 1,
+    }
+}
+
 fn sys_port_set_create() -> u64 {
     match crate::ipc::port_set::create() {
         Some(id) => id as u64,
@@ -1273,6 +1488,62 @@ fn sys_grant_pages(dst_port: u64, src_va: u64, dst_va: u64, page_count: u64, rea
     ) {
         Ok(()) => 0,
         Err(_) => u64::MAX,
+    }
+}
+
+/// Grant pages to a destination aspace AND stage a lease on the calling
+/// thread. The next `sys_call` will atomically transfer the staged leases
+/// onto the freshly-allocated reply-cap, so when the call completes (reply,
+/// abandon, or server-death) the kernel revokes the grant automatically —
+/// eliminating the client-timeout-vs-manual-revoke race that killed servers
+/// under load.
+fn sys_grant_pages_lease(
+    dst_port: u64,
+    src_va: u64,
+    dst_va: u64,
+    page_count: u64,
+    readonly: u64,
+) -> u64 {
+    use core::sync::atomic::Ordering;
+
+    let my_aspace = crate::sched::scheduler::current_aspace_id();
+    if my_aspace == 0 {
+        return u64::MAX;
+    }
+    let dst_task = match resolve_task_port(dst_port) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
+    let dst_aspace = crate::sched::scheduler::task_ref(dst_task).aspace_id;
+    let mmu_count = crate::mm::page::page_mmucount();
+    let alloc_pages = (page_count as usize + mmu_count - 1) / mmu_count;
+
+    // Reserve a pending-lease slot on the current thread BEFORE granting, so
+    // a full buffer fails fast (without leaving an orphan grant).
+    let tid = crate::sched::current_thread_id();
+    let t = crate::sched::scheduler::thread_ref(tid);
+    let idx = t.pending_lease_count.fetch_add(1, Ordering::AcqRel) as usize;
+    if idx >= crate::ipc::call_reply::MAX_LEASES_PER_CAP {
+        t.pending_lease_count.fetch_sub(1, Ordering::AcqRel);
+        return u64::MAX; // buffer full — caller must sys_call or clear first
+    }
+
+    match crate::mm::grant::grant_pages(
+        my_aspace,
+        src_va as usize,
+        dst_aspace,
+        dst_va as usize,
+        alloc_pages,
+        readonly != 0,
+    ) {
+        Ok(()) => {
+            t.pending_leases[idx].store(dst_aspace, dst_va as usize, page_count as u32);
+            0
+        }
+        Err(_) => {
+            t.pending_lease_count.fetch_sub(1, Ordering::AcqRel);
+            u64::MAX
+        }
     }
 }
 

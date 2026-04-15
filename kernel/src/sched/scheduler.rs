@@ -3710,6 +3710,53 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         )
     };
 
+    // If the dying thread is holding a reply-cap, deliver a server-died
+    // reply to the parked caller so they don't hang forever.
+    {
+        let tref = thread_ref(tid);
+        let handle = tref
+            .held_reply_cap
+            .swap(u64::MAX, Ordering::AcqRel);
+        if handle != u64::MAX {
+            let died = crate::ipc::Message::new(
+                crate::ipc::call_reply::CALL_REPLY_SERVER_DIED,
+                [0; 6],
+            );
+            match crate::ipc::call_reply::fulfill(handle, &died) {
+                crate::ipc::call_reply::FulfillResult::WakeCaller(caller_tid) => {
+                    // Inject into the caller's parked frame, then wake.
+                    let sp = thread_saved_sp(caller_tid);
+                    if sp != 0 {
+                        unsafe {
+                            use crate::arch::trapframe::ExceptionFrame;
+                            let frame = &mut *(sp as *mut ExceptionFrame);
+                            crate::syscall::handlers::set_return(frame, 0);
+                            crate::syscall::handlers::set_reg(frame, 1, died.tag);
+                            crate::syscall::handlers::set_reg(frame, 2, 0);
+                            crate::syscall::handlers::set_reg(frame, 3, 0);
+                            crate::syscall::handlers::set_reg(frame, 4, 0);
+                            crate::syscall::handlers::set_reg(frame, 5, 0);
+                            crate::syscall::handlers::set_reg(frame, 6, 0);
+                            crate::syscall::handlers::set_reg(frame, 7, 0);
+                        }
+                    }
+                    wake_parked_thread(caller_tid);
+                }
+                _ => {}
+            }
+            // free() revokes any grant leases on the cap and returns the
+            // slot to the pool. Crucial here: the server is dying, so any
+            // grants the caller made into its aspace must be released now
+            // to avoid dangling mappings.
+            crate::ipc::call_reply::free(handle);
+        }
+
+        // Caller-death: if this thread is parked in sys_call (or was about
+        // to be), abandon any Pending cap it owns. abandon() revokes its
+        // leases so a later server reply cannot reach into a dead aspace.
+        crate::ipc::call_reply::abandon_all_for_caller(tid);
+    }
+
     // Clean up turnstile state: dequeue from any wait queue, free pre-allocated turnstile.
     crate::sync::turnstile::cleanup_blocked(tid);
     let tptr = THREAD_TABLE.get(tid) as *const super::thread::Thread;

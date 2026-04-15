@@ -65,6 +65,10 @@ const SYS_PORT_ALIVE: u64 = 110;
 const SYS_IRQ_ATTACH: u64 = 111;
 const SYS_IRQ_ACK: u64 = 112;
 const SYS_MMIO_MAP_CAP: u64 = 113;
+const SYS_CALL: u64 = 118;
+const SYS_RECV_WITH_CAP: u64 = 119;
+const SYS_REPLY: u64 = 120;
+const SYS_GRANT_PAGES_LEASE: u64 = 121;
 const SYS_PERSONALITY_REGISTER: u64 = 0xF000;
 const SYS_PERSONALITY_SET: u64 = 0xF001;
 const SYS_PERSONALITY_GET: u64 = 0xF002;
@@ -498,6 +502,33 @@ pub fn grant_pages(
     let r = unsafe {
         arch::syscall5(
             SYS_GRANT_PAGES,
+            dst_task,
+            src_va as u64,
+            dst_va as u64,
+            page_count as u64,
+            readonly as u64,
+        )
+    };
+    r == 0
+}
+
+/// Stage a grant as a *lease* tied to the next `call()` invocation. The kernel
+/// transfers the lease into the newly-allocated reply-cap; the grant is
+/// automatically revoked when the reply-cap is fulfilled, abandoned, or the
+/// server dies. Up to `MAX_LEASES_PER_CAP` (4) leases may be staged per call.
+///
+/// Returns true on success. Fails if: staging buffer full, grant_pages failed,
+/// or caller has no active aspace.
+pub fn grant_pages_lease(
+    dst_task: u64,
+    src_va: usize,
+    dst_va: usize,
+    page_count: usize,
+    readonly: bool,
+) -> bool {
+    let r = unsafe {
+        arch::syscall5(
+            SYS_GRANT_PAGES_LEASE,
             dst_task,
             src_va as u64,
             dst_va as u64,
@@ -2156,4 +2187,152 @@ pub fn timer_create(signal: u32, interval_ns: u64) -> u64 {
 /// getrandom: fill buffer with random bytes. Returns number of bytes written.
 pub fn getrandom(buf: usize, len: usize) -> u64 {
     unsafe { arch::syscall3(SYS_GETRANDOM, buf as u64, len as u64, 0) }
+}
+
+// ---------------------------------------------------------------------------
+// seL4-style call/reply IPC wrappers.
+// ---------------------------------------------------------------------------
+
+/// Reply-tag sentinel meaning "the server died before replying".
+pub const CALL_REPLY_SERVER_DIED: u64 = 0xFFFF_FFFF_FFFF_FE00;
+
+/// Client-side call: send a request message to `dest_port` and block until
+/// the server delivers a reply via `reply()`. Returns the reply message or
+/// `None` on error (full cap table / invalid port / server died).
+///
+/// The kernel allocates a one-shot reply-cap for this call; the caller can
+/// only be woken by a `sys_reply` on that specific cap (or by the
+/// server-died hook). This kills the "revoke races dangling reply" class
+/// of bugs by construction.
+pub fn call(dest_port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) -> Option<Message> {
+    let status: u64;
+    let r1: u64;
+    let r2: u64;
+    let r3: u64;
+    let r4: u64;
+    let r5: u64;
+    let r6: u64;
+    let r7: u64;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_CALL,
+            inlateout("x0") dest_port => status,
+            inlateout("x1") tag => r1,
+            inlateout("x2") d0 => r2,
+            inlateout("x3") d1 => r3,
+            inlateout("x4") d2 => r4,
+            inlateout("x5") d3 => r5,
+            lateout("x6") r6,
+            lateout("x7") r7,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let s: u64;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_CALL => s,
+            inlateout("rdi") dest_port => _,
+            inlateout("rsi") tag => r1,
+            inlateout("rdx") d0 => r2,
+            inlateout("r10") d1 => r3,
+            inlateout("r8") d2 => r4,
+            inlateout("r9") d3 => r5,
+            lateout("rcx") _, lateout("r11") _,
+            lateout("r12") r6,
+            lateout("r13") r7,
+        );
+        status = s;
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        // Portable fallback via syscall6 — returns status only, no reply.
+        let _ = (dest_port, tag, d0, d1, d2, d3);
+        status = 1;
+        r1 = 0; r2 = 0; r3 = 0; r4 = 0; r5 = 0; r6 = 0; r7 = 0;
+    }
+
+    if status != 0 {
+        return None;
+    }
+    Some(Message {
+        tag: r1,
+        data: [r2, r3, r4, r5, r6, r7],
+    })
+}
+
+/// Server-side receive that also installs a reply-cap on the current
+/// thread. The received message has `data[5]` already zeroed (the cap
+/// handle is opaque and lives in kernel state).
+pub fn recv_with_cap(port: u64) -> Option<Message> {
+    let status: u64;
+    let r1: u64;
+    let r2: u64;
+    let r3: u64;
+    let r4: u64;
+    let r5: u64;
+    let r6: u64;
+    let r7: u64;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_RECV_WITH_CAP,
+            inlateout("x0") port => status,
+            lateout("x1") r1,
+            lateout("x2") r2,
+            lateout("x3") r3,
+            lateout("x4") r4,
+            lateout("x5") r5,
+            lateout("x6") r6,
+            lateout("x7") r7,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let s: u64;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_RECV_WITH_CAP => s,
+            inlateout("rdi") port => _,
+            lateout("rsi") r1,
+            lateout("rdx") r2,
+            lateout("r10") r3,
+            lateout("r8") r4,
+            lateout("r9") r5,
+            lateout("rcx") _, lateout("r11") _,
+            lateout("r12") r6,
+            lateout("r13") r7,
+        );
+        status = s;
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = port;
+        status = 1;
+        r1 = 0; r2 = 0; r3 = 0; r4 = 0; r5 = 0; r6 = 0; r7 = 0;
+    }
+
+    if status != 0 {
+        return None;
+    }
+    Some(Message {
+        tag: r1,
+        data: [r2, r3, r4, r5, r6, r7],
+    })
+}
+
+/// Server-side reply to the call whose cap is currently installed on this
+/// thread. Returns 0 on success, nonzero if no cap is held or the cap has
+/// been abandoned.
+pub fn reply(tag: u64, d0: u64, d1: u64, d2: u64, d3: u64, d4: u64) -> u64 {
+    unsafe { arch::syscall6(SYS_REPLY, tag, d0, d1, d2, d3, d4) }
 }
