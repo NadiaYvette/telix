@@ -2030,122 +2030,81 @@ const SHM_UNLINK_TAG: u64 = 0x5004;
 const SHM_OK_TAG: u64 = 0x5100;
 const SHM_MAP_OK_TAG: u64 = 0x5102;
 
-/// Poll for a reply on a temporary port. The send+handoff path causes the
-/// server to run immediately (direct transfer), so the reply is usually
-/// queued before we even check. Use non-blocking recv to avoid a blocking
-/// recv bug where the receiver parks but the queued reply isn't visible.
-fn shm_poll_reply(reply_port: u64) -> Option<Message> {
-    for _ in 0..50000u32 {
-        if let Some(r) = recv_nb_msg(reply_port) {
-            return Some(r);
-        }
-        yield_now();
-    }
-    None
-}
+// Ported to the kernel-managed call/reply primitive: clients now use
+// `call()` directly — no more per-request port_create/poll/port_destroy
+// dance, and the kernel guarantees the reply is delivered or the cap is
+// abandoned via server-death. `client_aspace` parameters were dropped
+// from shm_map/shm_unmap because the server now reads sender identity
+// from msg.data[4] (stamped by sys_call).
 
 /// Create or open a named shared memory segment.
 /// Returns (handle, page_count, srv_aspace) on success.
 pub fn shm_create(shm_port: u64, name: &[u8], page_count: usize) -> Option<(u32, usize, u64)> {
-    let reply_port = port_create();
     let (n0, n1, _) = pack_name(name);
-    let d2 = (name.len() as u64) | ((reply_port as u64) << 32);
-    send(shm_port, SHM_CREATE_TAG, n0, n1, d2, page_count as u64);
-    let result = if let Some(reply) = shm_poll_reply(reply_port) {
-        if reply.tag == SHM_OK_TAG {
-            Some((reply.data[0] as u32, reply.data[1] as usize, reply.data[2]))
-        } else {
-            None
-        }
+    let reply = call(shm_port, SHM_CREATE_TAG, n0, n1, name.len() as u64, page_count as u64)?;
+    if reply.tag == SHM_OK_TAG {
+        Some((reply.data[0] as u32, reply.data[1] as usize, reply.data[2]))
     } else {
         None
-    };
-    port_destroy(reply_port);
-    result
+    }
 }
 
 /// Open an existing named shared memory segment.
 /// Returns (handle, page_count, srv_aspace) on success.
 pub fn shm_open(shm_port: u64, name: &[u8]) -> Option<(u32, usize, u64)> {
-    let reply_port = port_create();
     let (n0, n1, _) = pack_name(name);
-    let d2 = (name.len() as u64) | ((reply_port as u64) << 32);
-    send(shm_port, SHM_OPEN_TAG, n0, n1, d2, 0);
-    let result = if let Some(reply) = shm_poll_reply(reply_port) {
-        if reply.tag == SHM_OK_TAG {
-            Some((reply.data[0] as u32, reply.data[1] as usize, reply.data[2]))
-        } else {
-            None
-        }
+    let reply = call(shm_port, SHM_OPEN_TAG, n0, n1, name.len() as u64, 0)?;
+    if reply.tag == SHM_OK_TAG {
+        Some((reply.data[0] as u32, reply.data[1] as usize, reply.data[2]))
     } else {
         None
-    };
-    port_destroy(reply_port);
-    result
+    }
 }
 
 /// Map a shared memory segment into the caller's address space.
-/// The server grants pages to `client_aspace` at `dst_va`.
+/// The server grants pages to the caller at `dst_va` (server reads the
+/// caller's aspace from the sys_call-stamped sender identity).
 /// Returns the number of pages mapped on success.
 pub fn shm_map(
     shm_port: u64,
     handle: u32,
-    client_aspace: u64,
     dst_va: usize,
     readonly: bool,
 ) -> Option<usize> {
-    let reply_port = port_create();
-    let d2 = ((reply_port as u64) << 32) | (readonly as u64);
-    send(
+    let reply = call(
         shm_port,
         SHM_MAP_TAG,
         handle as u64,
-        client_aspace,
-        d2,
+        0,
+        readonly as u64,
         dst_va as u64,
-    );
-    let result = if let Some(reply) = shm_poll_reply(reply_port) {
-        if reply.tag == SHM_MAP_OK_TAG {
-            Some(reply.data[1] as usize)
-        } else {
-            None
-        }
+    )?;
+    if reply.tag == SHM_MAP_OK_TAG {
+        Some(reply.data[1] as usize)
     } else {
         None
-    };
-    port_destroy(reply_port);
-    result
+    }
 }
 
 /// Unmap a shared memory segment from the caller's address space.
-pub fn shm_unmap(shm_port: u64, handle: u32, client_aspace: u64, dst_va: usize) {
-    let reply_port = port_create();
-    let d2 = (reply_port as u64) << 32;
-    send(
+pub fn shm_unmap(shm_port: u64, handle: u32, dst_va: usize) {
+    let _ = call(
         shm_port,
         SHM_UNMAP_TAG,
         handle as u64,
-        client_aspace,
-        d2,
+        0,
+        0,
         dst_va as u64,
     );
-    let _ = shm_poll_reply(reply_port);
-    port_destroy(reply_port);
 }
 
 /// Unlink (delete) a named shared memory segment.
 pub fn shm_unlink(shm_port: u64, name: &[u8]) -> bool {
-    let reply_port = port_create();
     let (n0, n1, _) = pack_name(name);
-    let d2 = (name.len() as u64) | ((reply_port as u64) << 32);
-    send(shm_port, SHM_UNLINK_TAG, n0, n1, d2, 0);
-    let result = if let Some(reply) = shm_poll_reply(reply_port) {
-        reply.tag == SHM_OK_TAG
-    } else {
-        false
-    };
-    port_destroy(reply_port);
-    result
+    match call(shm_port, SHM_UNLINK_TAG, n0, n1, name.len() as u64, 0) {
+        Some(reply) => reply.tag == SHM_OK_TAG,
+        None => false,
+    }
 }
 
 /// Register a service in the kernel name table.

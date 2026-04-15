@@ -143,6 +143,48 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5d: early shm_srv call/reply smoke test ---
+    // Verifies shm_srv still works after call/reply migration, before APFS
+    // smoke test (which may hang if apfs_srv doesn't register).
+    syscall::debug_puts(b"  init: running shm_srv (call/reply) smoke test...\n");
+    {
+        let shm_port_early = syscall::port_create();
+        let shm_tid_early = syscall::spawn_with_arg(b"shm_srv", 50, shm_port_early);
+        if shm_tid_early != u64::MAX {
+            for _ in 0..100 { syscall::yield_now(); }
+            let mut ok = true;
+            let (handle, pages, _) = match syscall::shm_create(shm_port_early, b"smoke", 1) {
+                Some(r) => r,
+                None => { ok = false; (0, 0, 0) }
+            };
+            if ok && pages != 1 { ok = false; }
+            let va = 0xB_0000_0000usize;
+            if ok && syscall::shm_map(shm_port_early, handle, va, false).is_none() { ok = false; }
+            if ok {
+                unsafe { core::ptr::write_volatile(va as *mut u8, 0x5A); }
+                let v = unsafe { core::ptr::read_volatile(va as *const u8) };
+                if v != 0x5A { ok = false; }
+            }
+            if ok {
+                match syscall::shm_open(shm_port_early, b"smoke") {
+                    Some((h2, pc2, _)) if h2 == handle && pc2 == 1 => {}
+                    _ => { ok = false; }
+                }
+            }
+            if ok {
+                syscall::shm_unmap(shm_port_early, handle, va);
+                if !syscall::shm_unlink(shm_port_early, b"smoke") { ok = false; }
+            }
+            if ok {
+                syscall::debug_puts(b"Phase 5d shm_srv call/reply smoke: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 5d shm_srv call/reply smoke: FAILED\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 5d shm_srv call/reply smoke: FAILED (spawn)\n");
+        }
+    }
+
     // --- Test 3: mmap_anon / munmap ---
     syscall::debug_puts(b"  init: testing mmap_anon...\n");
     if let Some(va) = syscall::mmap_anon(0, 1, 1) {
@@ -5114,7 +5156,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Map the segment at a known VA for first mapping.
             let map_va1: usize = 0xA_0000_0000;
             if phase46_ok {
-                match syscall::shm_map(shm_port, handle, my_aspace, map_va1, false) {
+                match syscall::shm_map(shm_port, handle, map_va1, false) {
                     Some(pc) => {
                         if pc != 1 {
                             syscall::debug_puts(b"  FAIL: shm_map returned wrong page count\n");
@@ -5142,7 +5184,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Map the same segment at a different VA (second mapping of same pages).
             let map_va2: usize = 0xA_0001_0000;
             if phase46_ok {
-                match syscall::shm_map(shm_port, handle, my_aspace, map_va2, false) {
+                match syscall::shm_map(shm_port, handle, map_va2, false) {
                     Some(_) => {}
                     None => {
                         syscall::debug_puts(b"  FAIL: shm_map #2 failed\n");
@@ -5195,8 +5237,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // Clean up: unmap both, unlink.
             if phase46_ok {
-                syscall::shm_unmap(shm_port, handle, my_aspace, map_va2);
-                syscall::shm_unmap(shm_port, handle, my_aspace, map_va1);
+                syscall::shm_unmap(shm_port, handle, map_va2);
+                syscall::shm_unmap(shm_port, handle, map_va1);
                 if !syscall::shm_unlink(shm_port, b"test_shm") {
                     syscall::debug_puts(b"  FAIL: shm_unlink failed\n");
                     phase46_ok = false;

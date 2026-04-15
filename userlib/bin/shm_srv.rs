@@ -114,13 +114,19 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
     let my_aspace = syscall::aspace_id();
 
+    // Call/reply server: recv_with_cap installs the reply-cap onto this
+    // thread; every request path must consume the cap by calling sys_reply
+    // exactly once (including error paths), or the kernel's server-death
+    // teardown will eventually deliver CALL_REPLY_SERVER_DIED to the caller.
     loop {
-        let msg = match syscall::recv_msg(svc_port) {
+        let msg = match syscall::recv_with_cap(svc_port) {
             Some(m) => m,
             None => continue,
         };
 
-        let reply_port = msg.data[2] >> 32;
+        // data[4] holds the sender task port stamped by sys_call; that's our
+        // client_aspace for SHM_MAP/SHM_UNMAP. No more per-request reply_port.
+        let client_aspace = msg.data[4];
 
         match msg.tag {
             SHM_CREATE => {
@@ -128,7 +134,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let page_count = msg.data[3] as usize;
 
                 if name_len == 0 || name_len > MAX_NAME_LEN || page_count == 0 || page_count > 256 {
-                    syscall::send(reply_port, SHM_ERROR, 1, 0, 0, 0);
+                    let _ = syscall::reply(SHM_ERROR, 1, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -138,12 +144,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 // Check if already exists — return existing handle.
                 if let Some(idx) = find_segment(name) {
                     let pc = unsafe { SEGMENTS[idx].page_count };
-                    syscall::send(
-                        reply_port,
+                    let _ = syscall::reply(
                         SHM_OK,
                         idx as u64,
                         pc as u64,
                         my_aspace as u64,
+                        0,
                         0,
                     );
                     continue;
@@ -152,7 +158,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let slot = match alloc_segment_slot() {
                     Some(s) => s,
                     None => {
-                        syscall::send(reply_port, SHM_ERROR, 2, 0, 0, 0);
+                        let _ = syscall::reply(SHM_ERROR, 2, 0, 0, 0, 0);
                         continue;
                     }
                 };
@@ -160,7 +166,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let va = match syscall::mmap_anon(0, page_count, 1) {
                     Some(v) => v,
                     None => {
-                        syscall::send(reply_port, SHM_ERROR, 3, 0, 0, 0);
+                        let _ = syscall::reply(SHM_ERROR, 3, 0, 0, 0, 0);
                         continue;
                     }
                 };
@@ -182,12 +188,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     SEGMENTS[slot].va = va;
                 }
 
-                syscall::send(
-                    reply_port,
+                let _ = syscall::reply(
                     SHM_OK,
                     slot as u64,
                     page_count as u64,
                     my_aspace as u64,
+                    0,
                     0,
                 );
             }
@@ -196,7 +202,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
 
                 if name_len == 0 || name_len > MAX_NAME_LEN {
-                    syscall::send(reply_port, SHM_ERROR, 1, 0, 0, 0);
+                    let _ = syscall::reply(SHM_ERROR, 1, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -206,30 +212,32 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 match find_segment(name) {
                     Some(idx) => {
                         let pc = unsafe { SEGMENTS[idx].page_count };
-                        syscall::send(
-                            reply_port,
+                        let _ = syscall::reply(
                             SHM_OK,
                             idx as u64,
                             pc as u64,
                             my_aspace as u64,
                             0,
+                            0,
                         );
                     }
                     None => {
-                        syscall::send(reply_port, SHM_ERROR, 4, 0, 0, 0);
+                        let _ = syscall::reply(SHM_ERROR, 4, 0, 0, 0, 0);
                     }
                 }
             }
 
             SHM_MAP => {
-                // d0=handle, d1=client_aspace, d2=(reply_port<<32 | readonly), d3=dst_va
+                // d0=handle, d2=(readonly flag), d3=dst_va. Sender aspace is
+                // in data[4] (auto-stamped by sys_call). The SHM mapping is a
+                // long-lived grant that outlives this call — deliberately
+                // NOT using GrantLease, which would be revoked on reply.
                 let handle = msg.data[0] as usize;
-                let client_aspace = msg.data[1];
                 let dst_va = msg.data[3] as usize;
                 let readonly = (msg.data[2] & 1) != 0;
 
                 if handle >= MAX_SEGMENTS {
-                    syscall::send(reply_port, SHM_ERROR, 5, 0, 0, 0);
+                    let _ = syscall::reply(SHM_ERROR, 5, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -242,27 +250,26 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 };
 
                 if !active {
-                    syscall::send(reply_port, SHM_ERROR, 6, 0, 0, 0);
+                    let _ = syscall::reply(SHM_ERROR, 6, 0, 0, 0, 0);
                     continue;
                 }
 
                 if syscall::grant_pages(client_aspace, src_va, dst_va, page_count, readonly) {
-                    syscall::send(
-                        reply_port,
+                    let _ = syscall::reply(
                         SHM_MAP_OK,
                         handle as u64,
                         page_count as u64,
                         0,
                         0,
+                        0,
                     );
                 } else {
-                    syscall::send(reply_port, SHM_ERROR, 7, 0, 0, 0);
+                    let _ = syscall::reply(SHM_ERROR, 7, 0, 0, 0, 0);
                 }
             }
 
             SHM_UNMAP => {
                 let handle = msg.data[0] as usize;
-                let client_aspace = msg.data[1];
                 let dst_va = msg.data[3] as usize;
 
                 if handle < MAX_SEGMENTS {
@@ -272,14 +279,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
 
-                syscall::send(reply_port, SHM_OK, 0, 0, 0, 0);
+                let _ = syscall::reply(SHM_OK, 0, 0, 0, 0, 0);
             }
 
             SHM_UNLINK => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
 
                 if name_len == 0 || name_len > MAX_NAME_LEN {
-                    syscall::send(reply_port, SHM_ERROR, 1, 0, 0, 0);
+                    let _ = syscall::reply(SHM_ERROR, 1, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -293,18 +300,16 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         unsafe {
                             SEGMENTS[idx].active = false;
                         }
-                        syscall::send(reply_port, SHM_OK, 0, 0, 0, 0);
+                        let _ = syscall::reply(SHM_OK, 0, 0, 0, 0, 0);
                     }
                     None => {
-                        syscall::send(reply_port, SHM_ERROR, 4, 0, 0, 0);
+                        let _ = syscall::reply(SHM_ERROR, 4, 0, 0, 0, 0);
                     }
                 }
             }
 
             _ => {
-                if reply_port != 0 {
-                    syscall::send(reply_port, SHM_ERROR, 0xFF, 0, 0, 0);
-                }
+                let _ = syscall::reply(SHM_ERROR, 0xFF, 0, 0, 0, 0);
             }
         }
     }
