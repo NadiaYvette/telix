@@ -69,6 +69,8 @@ const SYS_CALL: u64 = 118;
 const SYS_RECV_WITH_CAP: u64 = 119;
 const SYS_REPLY: u64 = 120;
 const SYS_GRANT_PAGES_LEASE: u64 = 121;
+const SYS_REPLY_TAKE: u64 = 122;
+const SYS_REPLY_TO: u64 = 123;
 const SYS_PERSONALITY_REGISTER: u64 = 0xF000;
 const SYS_PERSONALITY_SET: u64 = 0xF001;
 const SYS_PERSONALITY_GET: u64 = 0xF002;
@@ -2294,4 +2296,16 @@ pub fn recv_with_cap(port: u64) -> Option<Message> {
 /// been abandoned.
 pub fn reply(tag: u64, d0: u64, d1: u64, d2: u64, d3: u64, d4: u64) -> u64 {
     unsafe { arch::syscall6(SYS_REPLY, tag, d0, d1, d2, d3, d4) }
+}
+
+/// Take the currently-installed reply-cap handle so the server can defer
+/// the reply. Returns u64::MAX if no cap is held.
+pub fn reply_take() -> u64 {
+    unsafe { arch::syscall0(SYS_REPLY_TAKE) }
+}
+
+/// Reply to a specific reply-cap handle previously obtained via
+/// [`reply_take`]. Returns 0 on success, nonzero on error.
+pub fn reply_to(handle: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) -> u64 {
+    unsafe { arch::syscall6(SYS_REPLY_TO, handle, tag, d0, d1, d2, d3) }
 }

@@ -38,7 +38,9 @@ struct PipeSlot {
     tail: usize,
     writer_closed: bool,
     reader_closed: bool,
-    recv_reply: u64, // blocked reader's reply port (u64::MAX = none)
+    // Deferred reply-cap handle for a blocked reader (u64::MAX = none).
+    // Saved via sys_reply_take; fulfilled later via sys_reply_to.
+    recv_reply_cap: u64,
 }
 
 impl PipeSlot {
@@ -50,7 +52,7 @@ impl PipeSlot {
             tail: 0,
             writer_closed: false,
             reader_closed: false,
-            recv_reply: u64::MAX,
+            recv_reply_cap: u64::MAX,
         }
     }
 
@@ -120,26 +122,23 @@ fn pack_bytes(data: &[u8], len: usize) -> (u64, u64) {
     (w0, w1)
 }
 
-fn reply(port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
-    syscall::send(port, tag, d0, d1, d2, d3);
-}
-
-/// Deliver data (or EOF) to a pipe that has a blocked reader.
+/// Deliver data (or EOF) to a pipe that has a blocked reader whose
+/// reply-cap was saved via sys_reply_take.
 fn try_wake_reader(slot: u32) {
     let s = unsafe { &mut PIPES[slot as usize] };
-    if s.recv_reply == u64::MAX {
+    if s.recv_reply_cap == u64::MAX {
         return;
     }
-    let rp = s.recv_reply;
+    let cap = s.recv_reply_cap;
     if s.len() > 0 {
         let mut tmp = [0u8; 16];
         let n = s.pop(&mut tmp);
         let (w0, w1) = pack_bytes(&tmp, n);
-        s.recv_reply = u64::MAX;
-        reply(rp, PIPE_OK, w0, w1, n as u64, 0);
+        s.recv_reply_cap = u64::MAX;
+        let _ = syscall::reply_to(cap, PIPE_OK, w0, w1, n as u64, 0);
     } else if s.writer_closed {
-        s.recv_reply = u64::MAX;
-        reply(rp, PIPE_EOF, 0, 0, 0, 0);
+        s.recv_reply_cap = u64::MAX;
+        let _ = syscall::reply_to(cap, PIPE_EOF, 0, 0, 0, 0);
     }
 }
 
@@ -148,23 +147,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let svc_port = syscall::port_create();
     syscall::ns_register(b"pipe", svc_port);
 
+    // Call/reply server: recv_with_cap installs a reply-cap on this
+    // thread; every request path must consume it exactly once — either
+    // via sys_reply (immediate) or sys_reply_take + sys_reply_to
+    // (deferred, for blocking PIPE_READ).
     loop {
-        let msg = match syscall::recv_msg(svc_port) {
+        let msg = match syscall::recv_with_cap(svc_port) {
             Some(m) => m,
             None => continue,
         };
 
         let tag = msg.tag;
-        let reply_port = msg.data[2] >> 32;
 
         match tag {
             PIPE_CREATE => {
                 if let Some(slot) = alloc_pipe() {
                     let read_h = slot * 2;
                     let write_h = slot * 2 + 1;
-                    reply(reply_port, PIPE_OK, read_h as u64, write_h as u64, 0, 0);
+                    let _ = syscall::reply(PIPE_OK, read_h as u64, write_h as u64, 0, 0, 0);
                 } else {
-                    reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
+                    let _ = syscall::reply(PIPE_ERROR, 0, 0, 0, 0, 0);
                 }
             }
 
@@ -173,23 +175,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let len = (msg.data[2] & 0xFFFF) as usize;
                 let len = if len > 16 { 16 } else { len };
 
-                // Must be a write handle (odd).
                 if handle & 1 == 0 || (handle / 2) as usize >= MAX_PIPES {
-                    if reply_port != u64::MAX {
-                        reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
-                    }
+                    let _ = syscall::reply(PIPE_ERROR, 0, 0, 0, 0, 0);
                     continue;
                 }
                 let slot = (handle / 2) as usize;
                 let s = unsafe { &mut PIPES[slot] };
                 if !s.active || s.reader_closed {
-                    if reply_port != u64::MAX {
-                        reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
-                    }
+                    let _ = syscall::reply(PIPE_ERROR, 0, 0, 0, 0, 0);
                     continue;
                 }
 
-                // Unpack data bytes.
                 let mut tmp = [0u8; 16];
                 let b0 = msg.data[1].to_le_bytes();
                 let b1 = msg.data[3].to_le_bytes();
@@ -204,9 +200,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 let written = s.push(&tmp[..len]);
-                if reply_port != u64::MAX {
-                    reply(reply_port, PIPE_OK, written as u64, 0, 0, 0);
-                }
+                let _ = syscall::reply(PIPE_OK, written as u64, 0, 0, 0, 0);
 
                 // Wake blocked reader if any.
                 try_wake_reader(slot as u32);
@@ -215,15 +209,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             PIPE_READ => {
                 let handle = msg.data[0] as u32;
 
-                // Must be a read handle (even).
                 if handle & 1 != 0 || (handle / 2) as usize >= MAX_PIPES {
-                    reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
+                    let _ = syscall::reply(PIPE_ERROR, 0, 0, 0, 0, 0);
                     continue;
                 }
                 let slot = (handle / 2) as usize;
                 let s = unsafe { &mut PIPES[slot] };
                 if !s.active {
-                    reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
+                    let _ = syscall::reply(PIPE_ERROR, 0, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -231,12 +224,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     let mut tmp = [0u8; 16];
                     let n = s.pop(&mut tmp);
                     let (w0, w1) = pack_bytes(&tmp, n);
-                    reply(reply_port, PIPE_OK, w0, w1, n as u64, 0);
+                    let _ = syscall::reply(PIPE_OK, w0, w1, n as u64, 0, 0);
                 } else if s.writer_closed {
-                    reply(reply_port, PIPE_EOF, 0, 0, 0, 0);
+                    let _ = syscall::reply(PIPE_EOF, 0, 0, 0, 0, 0);
                 } else {
-                    // Block — store reply port.
-                    s.recv_reply = reply_port;
+                    // Defer the reply: take the cap handle and stash it.
+                    // Fulfilled later in try_wake_reader when a writer
+                    // pushes data or closes.
+                    let cap = syscall::reply_take();
+                    if cap == u64::MAX {
+                        // No cap held — shouldn't happen but be safe.
+                        continue;
+                    }
+                    s.recv_reply_cap = cap;
                 }
             }
 
@@ -246,29 +246,30 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let slot_idx = (handle / 2) as usize;
 
                 if slot_idx >= MAX_PIPES {
-                    reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
+                    let _ = syscall::reply(PIPE_ERROR, 0, 0, 0, 0, 0);
                     continue;
                 }
                 let s = unsafe { &mut PIPES[slot_idx] };
                 if !s.active {
-                    reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
+                    let _ = syscall::reply(PIPE_ERROR, 0, 0, 0, 0, 0);
                     continue;
                 }
 
                 if is_write {
                     s.writer_closed = true;
-                    // Wake blocked reader so it sees EOF.
+                    let _ = syscall::reply(PIPE_OK, 0, 0, 0, 0, 0);
+                    // After replying, wake blocked reader so it sees EOF.
                     try_wake_reader(slot_idx as u32);
                 } else {
                     s.reader_closed = true;
+                    let _ = syscall::reply(PIPE_OK, 0, 0, 0, 0, 0);
                 }
 
-                // Free slot if both ends closed.
-                if s.writer_closed && s.reader_closed {
-                    s.active = false;
+                // Re-read after potential reader-wake.
+                let s2 = unsafe { &mut PIPES[slot_idx] };
+                if s2.writer_closed && s2.reader_closed {
+                    s2.active = false;
                 }
-
-                reply(reply_port, PIPE_OK, 0, 0, 0, 0);
             }
 
             PIPE_POLL => {
@@ -278,12 +279,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let slot_idx = (handle / 2) as usize;
 
                 if slot_idx >= MAX_PIPES {
-                    reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
+                    let _ = syscall::reply(PIPE_ERROR, 0, 0, 0, 0, 0);
                     continue;
                 }
                 let s = unsafe { &PIPES[slot_idx] };
                 if !s.active {
-                    reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
+                    let _ = syscall::reply(PIPE_ERROR, 0, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -302,13 +303,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         revents |= 0x0010; // POLLHUP
                     }
                 }
-                reply(reply_port, PIPE_OK, revents as u64, 0, 0, 0);
+                let _ = syscall::reply(PIPE_OK, revents as u64, 0, 0, 0, 0);
             }
 
             _ => {
-                if reply_port != 0 && reply_port != u64::MAX {
-                    reply(reply_port, PIPE_ERROR, 0, 0, 0, 0);
-                }
+                let _ = syscall::reply(PIPE_ERROR, 0, 0, 0, 0, 0);
             }
         }
     }

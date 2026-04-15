@@ -150,6 +150,8 @@ pub const SYS_CALL: u64 = 118;
 pub const SYS_RECV_WITH_CAP: u64 = 119;
 pub const SYS_REPLY: u64 = 120;
 pub const SYS_GRANT_PAGES_LEASE: u64 = 121;
+pub const SYS_REPLY_TAKE: u64 = 122;
+pub const SYS_REPLY_TO: u64 = 123;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -473,6 +475,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_RECV_WITH_CAP => sys_recv_with_cap(a0, frame),
         SYS_REPLY => sys_reply(a0, [a1, a2, a3, a4, a5, 0]),
         SYS_GRANT_PAGES_LEASE => sys_grant_pages_lease(a0, a1, a2, a3, a4),
+        SYS_REPLY_TAKE => sys_reply_take(),
+        SYS_REPLY_TO => sys_reply_to(a0, a1, [a2, a3, a4, a5, 0, 0]),
         SYS_SVC_PORT => sys_svc_port(a0),
         SYS_SVC_REGISTER => sys_svc_register(a0, a1, a2, a3, a4),
         SYS_SVC_LOOKUP => sys_svc_lookup(a0, a1, a2, a3),
@@ -1194,6 +1198,37 @@ fn sys_reply(tag: u64, data: [u64; 6]) -> u64 {
             // via the deferred context switch, never re-entering the
             // kernel-side sys_call body), so the server owns releasing
             // the slot once the reply has been delivered.
+            call_reply::free(handle);
+            0
+        }
+        call_reply::FulfillResult::Abandoned => 0,
+        call_reply::FulfillResult::InvalidHandle => 1,
+    }
+}
+
+// Take (extract) the currently-held reply-cap handle and clear the slot.
+// Returns u64::MAX if no cap is held. Used by servers that need to defer
+// a reply (e.g. blocking reader in pipe_srv): stash the handle, serve
+// other requests, fulfill later via sys_reply_to.
+fn sys_reply_take() -> u64 {
+    let tid = crate::sched::current_thread_id();
+    let t = crate::sched::scheduler::thread_ref(tid);
+    t.held_reply_cap.swap(u64::MAX, core::sync::atomic::Ordering::AcqRel)
+}
+
+// Reply to a specific reply-cap handle (obtained earlier from
+// sys_reply_take). Does NOT touch held_reply_cap — that slot may already
+// hold a fresh cap from a subsequent recv_with_cap.
+fn sys_reply_to(handle: u64, tag: u64, data: [u64; 6]) -> u64 {
+    use crate::ipc::call_reply;
+    if handle == u64::MAX {
+        return 1;
+    }
+    let reply = crate::ipc::Message::new(tag, data);
+    match call_reply::fulfill(handle, &reply) {
+        call_reply::FulfillResult::WakeCaller(caller_tid) => {
+            inject_recv_into_frame(caller_tid, &reply);
+            crate::sched::scheduler::wake_parked_thread(caller_tid);
             call_reply::free(handle);
             0
         }

@@ -71,11 +71,7 @@ pub fn pipe_read(pipe_port: u64, buf: &mut [u8]) -> usize {
 /// Requires the pipe server ("pipe") to be running.
 pub fn pipe() -> Option<(i32, i32)> {
     let pipe_port = syscall::ns_lookup(b"pipe")?;
-    let reply_port = syscall::port_create();
-    let d2 = (reply_port as u64) << 32;
-    syscall::send(pipe_port, PIPE_CREATE, 0, 0, d2, 0);
-    let msg = syscall::recv_msg(reply_port)?;
-    syscall::port_destroy(reply_port);
+    let msg = syscall::call(pipe_port, PIPE_CREATE, 0, 0, 0, 0)?;
     if msg.tag != PIPE_OK {
         return None;
     }
@@ -103,9 +99,14 @@ pub fn pipe_write_fd(fd_num: i32, buf: &[u8]) -> isize {
         for i in 8..chunk_len {
             w1 |= (buf[offset + i] as u64) << ((i - 8) * 8);
         }
-        // Fire-and-forget: d2 low16 = len, high32 = 0xFFFFFFFF (no reply).
-        let d2 = (chunk_len as u64) | (0xFFFFFFFF_u64 << 32);
-        syscall::send(entry.port, PIPE_WRITE_TAG, entry.handle as u64, w0, d2, w1);
+        let d2 = chunk_len as u64;
+        let msg = match syscall::call(entry.port, PIPE_WRITE_TAG, entry.handle as u64, w0, d2, w1) {
+            Some(m) => m,
+            None => return -1,
+        };
+        if msg.tag != PIPE_OK {
+            return -1;
+        }
         offset += chunk_len;
     }
     buf.len() as isize
@@ -118,17 +119,10 @@ pub fn pipe_read_fd(fd_num: i32, buf: &mut [u8]) -> isize {
         Some(e) => e,
         None => return -1,
     };
-    let reply_port = syscall::port_create();
-    let d2 = (reply_port as u64) << 32;
-    syscall::send(entry.port, PIPE_READ_TAG, entry.handle as u64, 0, d2, 0);
-    let msg = match syscall::recv_msg(reply_port) {
+    let msg = match syscall::call(entry.port, PIPE_READ_TAG, entry.handle as u64, 0, 0, 0) {
         Some(m) => m,
-        None => {
-            syscall::port_destroy(reply_port);
-            return -1;
-        }
+        None => return -1,
     };
-    syscall::port_destroy(reply_port);
 
     if msg.tag == PIPE_EOF_TAG {
         return 0;
@@ -152,11 +146,7 @@ pub fn pipe_close_fd(fd_num: i32) -> bool {
         Some(e) => e,
         None => return false,
     };
-    let reply_port = syscall::port_create();
-    let d2 = (reply_port as u64) << 32;
-    syscall::send(entry.port, PIPE_CLOSE_TAG, entry.handle as u64, 0, d2, 0);
-    let _ = syscall::recv_msg(reply_port);
-    syscall::port_destroy(reply_port);
+    let _ = syscall::call(entry.port, PIPE_CLOSE_TAG, entry.handle as u64, 0, 0, 0);
     fd::fd_close(fd_num);
     true
 }

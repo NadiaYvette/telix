@@ -242,6 +242,123 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5f: early pipe_srv call/reply smoke test ---
+    // Covers PIPE_CREATE, PIPE_WRITE (synchronous), PIPE_READ (data-available
+    // path), and PIPE_CLOSE. The blocking-read path (sys_reply_take +
+    // sys_reply_to deferred reply) is exercised by Phase 59 later.
+    syscall::debug_puts(b"  init: running pipe_srv (call/reply) smoke test...\n");
+    {
+        let pipe_tid = syscall::spawn(b"pipe_srv", 50);
+        if pipe_tid == u64::MAX {
+            syscall::debug_puts(b"Phase 5f pipe_srv call/reply smoke: FAILED (spawn)\n");
+        } else {
+            let mut pp_opt: Option<u64> = None;
+            for _ in 0..500u32 {
+                if let Some(p) = syscall::ns_lookup(b"pipe") {
+                    pp_opt = Some(p);
+                    break;
+                }
+                syscall::yield_now();
+            }
+
+            let mut ok = true;
+            let pp = match pp_opt {
+                Some(p) => p,
+                None => { ok = false; 0 }
+            };
+
+            // Create pipe.
+            let mut rh = 0u32;
+            let mut wh = 0u32;
+            if ok {
+                match syscall::call(pp, 0x5010, 0, 0, 0, 0) {
+                    Some(r) if r.tag == 0x5100 => {
+                        rh = r.data[0] as u32;
+                        wh = r.data[1] as u32;
+                    }
+                    _ => { ok = false; }
+                }
+            }
+
+            // Write "ABCD" (4 bytes).
+            if ok {
+                let data: u64 = 0x44434241; // "ABCD" LE
+                match syscall::call(pp, 0x5020, wh as u64, data, 4, 0) {
+                    Some(r) if r.tag == 0x5100 && r.data[0] == 4 => {}
+                    _ => { ok = false; }
+                }
+            }
+
+            // Read back — data should be available, no blocking.
+            if ok {
+                match syscall::call(pp, 0x5030, rh as u64, 0, 0, 0) {
+                    Some(r) if r.tag == 0x5100 => {
+                        let n = r.data[2] as usize;
+                        let b0 = (r.data[0] & 0xFF) as u8;
+                        let b3 = ((r.data[0] >> 24) & 0xFF) as u8;
+                        if n != 4 || b0 != b'A' || b3 != b'D' {
+                            ok = false;
+                        }
+                    }
+                    _ => { ok = false; }
+                }
+            }
+
+            // Close write and read ends of this pipe.
+            if ok {
+                let _ = syscall::call(pp, 0x5040, wh as u64, 0, 0, 0);
+                let _ = syscall::call(pp, 0x5040, rh as u64, 0, 0, 0);
+            }
+
+            // Deferred-reply path: create a fresh pipe, fork a child that
+            // sleeps briefly then writes. Parent blocks in PIPE_READ and
+            // the server must use sys_reply_take/sys_reply_to to wake it.
+            if ok {
+                let (rh2, wh2) = match syscall::call(pp, 0x5010, 0, 0, 0, 0) {
+                    Some(r) if r.tag == 0x5100 => (r.data[0] as u32, r.data[1] as u32),
+                    _ => { ok = false; (0, 0) }
+                };
+                if ok {
+                    let child = syscall::fork();
+                    if child == 0 {
+                        // Child: yield a lot to let parent block first, then write.
+                        for _ in 0..2000 { syscall::yield_now(); }
+                        let data: u64 = 0x54534645; // "EFST" LE — marker
+                        let _ = syscall::call(pp, 0x5020, wh2 as u64, data, 4, 0);
+                        let _ = syscall::call(pp, 0x5040, wh2 as u64, 0, 0, 0);
+                        syscall::exit(0);
+                    }
+                    if child == u64::MAX {
+                        ok = false;
+                    } else {
+                        // Parent: blocking read — must be woken by child's write.
+                        match syscall::call(pp, 0x5030, rh2 as u64, 0, 0, 0) {
+                            Some(r) if r.tag == 0x5100 => {
+                                let n = r.data[2] as usize;
+                                let b0 = (r.data[0] & 0xFF) as u8;
+                                if n != 4 || b0 != b'E' {
+                                    ok = false;
+                                }
+                            }
+                            _ => { ok = false; }
+                        }
+                        loop {
+                            if syscall::waitpid(child).is_some() { break; }
+                            syscall::yield_now();
+                        }
+                        let _ = syscall::call(pp, 0x5040, rh2 as u64, 0, 0, 0);
+                    }
+                }
+            }
+
+            if ok {
+                syscall::debug_puts(b"Phase 5f pipe_srv call/reply smoke: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 5f pipe_srv call/reply smoke: FAILED\n");
+            }
+        }
+    }
+
     // --- Test 3: mmap_anon / munmap ---
     syscall::debug_puts(b"  init: testing mmap_anon...\n");
     if let Some(va) = syscall::mmap_anon(0, 1, 1) {
@@ -8643,10 +8760,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         {
             let pipe_port = syscall::ns_lookup(b"pipe");
             if let Some(pp) = pipe_port {
-                let reply = syscall::port_create();
-                let d2 = reply << 32;
-                syscall::send(pp, 0x5010, 0, 0, d2, 0); // PIPE_CREATE
-                if let Some(resp) = syscall::recv_msg(reply) {
+                // PIPE_CREATE via call().
+                if let Some(resp) = syscall::call(pp, 0x5010, 0, 0, 0, 0) {
                     if resp.tag == 0x5100 {
                         // PIPE_OK
                         let rh = resp.data[0] as u32;
@@ -8655,13 +8770,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         let writer = syscall::fork();
                         if writer == 0 {
                             let msg_bytes: u64 = 0x6F6C6C6568; // "hello" LE
-                            let wd2 = 5u64 | (0xFFFFFFFF_u64 << 32);
-                            syscall::send(pp, 0x5020, wh as u64, msg_bytes, wd2, 0);
-                            let cr = syscall::port_create();
-                            let cd = cr << 32;
-                            syscall::send(pp, 0x5040, wh as u64, 0, cd, 0);
-                            let _ = syscall::recv_msg(cr);
-                            syscall::port_destroy(cr);
+                            let _ = syscall::call(pp, 0x5020, wh as u64, msg_bytes, 5, 0);
+                            let _ = syscall::call(pp, 0x5040, wh as u64, 0, 0, 0);
                             syscall::exit(0);
                         }
 
@@ -8669,12 +8779,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             syscall::debug_puts(b"      pipe fork failed, skipping\n");
                             phase63_ok = false;
                         } else {
-                            let rr = syscall::port_create();
-                            let rd2 = rr << 32;
-                            syscall::send(pp, 0x5030, rh as u64, 0, rd2, 0); // PIPE_READ
-                            if let Some(data) = syscall::recv_msg(rr) {
+                            if let Some(data) = syscall::call(pp, 0x5030, rh as u64, 0, 0, 0) {
                                 if data.tag == 0x5100 {
-                                    // PIPE_OK
                                     let n = (data.data[2] & 0xFFFF) as usize;
                                     let b0 = (data.data[0] & 0xFF) as u8;
                                     if n == 5 && b0 == b'h' {
@@ -8685,7 +8791,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     }
                                 }
                             }
-                            syscall::port_destroy(rr);
 
                             loop {
                                 if syscall::waitpid(writer).is_some() {
@@ -8695,14 +8800,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             }
                         }
 
-                        let cr2 = syscall::port_create();
-                        let cd2 = cr2 << 32;
-                        syscall::send(pp, 0x5040, rh as u64, 0, cd2, 0);
-                        let _ = syscall::recv_msg(cr2);
-                        syscall::port_destroy(cr2);
+                        let _ = syscall::call(pp, 0x5040, rh as u64, 0, 0, 0);
                     }
                 }
-                syscall::port_destroy(reply);
             }
         }
 
