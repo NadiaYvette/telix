@@ -21,6 +21,7 @@ const FS_READDIR_END: u64 = 0x2202;
 const FS_STAT: u64 = 0x2300;
 const FS_STAT_OK: u64 = 0x2301;
 const FS_CLOSE: u64 = 0x2400;
+const FS_CLOSE_OK: u64 = 0x2401;
 const FS_WRITE: u64 = 0x2600;
 const FS_WRITE_OK: u64 = 0x2601;
 const FS_ERROR: u64 = 0x2F00;
@@ -202,7 +203,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let mut handles = [OpenHandle::empty(); MAX_OPEN];
 
     loop {
-        let msg = match syscall::recv_msg(port) {
+        let msg = match syscall::recv_with_cap(port) {
             Some(m) => m,
             None => break,
         };
@@ -210,7 +211,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         match msg.tag {
             FS_OPEN => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
                 match find_device(&name, nlen) {
@@ -225,13 +225,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             }
                         }
                         if h == u64::MAX {
-                            syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                            let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                         } else {
-                            syscall::send(reply_port, FS_OPEN_OK, h, 0, my_aspace as u64, 0);
+                            let _ = syscall::reply(FS_OPEN_OK, h, 0, my_aspace as u64, 0, 0);
                         }
                     }
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     }
                 }
             }
@@ -240,11 +240,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = msg.data[0] as usize;
                 let _offset = msg.data[1];
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -253,7 +252,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 match dev_type {
                     DeviceType::Null => {
                         // EOF — 0 bytes.
-                        syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                        let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                     }
                     DeviceType::Zero | DeviceType::Full => {
                         let to_read = length.min(MAX_INLINE);
@@ -261,10 +260,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             unsafe {
                                 core::ptr::write_bytes(grant_va as *mut u8, 0, length.min(4096));
                             }
-                            syscall::send_nb(reply_port, FS_READ_OK, length.min(4096) as u64, 0);
+                            let _ = syscall::reply(FS_READ_OK, length.min(4096) as u64, 0, 0, 0, 0);
                         } else {
                             // Inline zeros.
-                            syscall::send(reply_port, FS_READ_OK, to_read as u64, 0, 0, 0);
+                            let _ = syscall::reply(FS_READ_OK, to_read as u64, 0, 0, 0, 0);
                         }
                     }
                     DeviceType::Random | DeviceType::Urandom => {
@@ -277,49 +276,48 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     *p.add(i) = rng.next_u8();
                                 }
                             }
-                            syscall::send_nb(reply_port, FS_READ_OK, actual as u64, 0);
+                            let _ = syscall::reply(FS_READ_OK, actual as u64, 0, 0, 0, 0);
                         } else {
                             let mut buf = [0u8; MAX_INLINE];
                             for i in 0..to_read {
                                 buf[i] = rng.next_u8();
                             }
                             let packed = pack_inline_data(&buf[..to_read]);
-                            syscall::send(
-                                reply_port,
+                            let _ = syscall::reply(
                                 FS_READ_OK,
                                 to_read as u64,
                                 packed[0],
                                 packed[1],
                                 packed[2],
+                                0,
                             );
                         }
                     }
                     DeviceType::Console | DeviceType::Tty => {
                         if console_port == 0 {
-                            syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                            let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                             continue;
                         }
-                        // Send CON_READ to console_srv.
+                        // Send CON_READ to console_srv (legacy protocol path).
                         let d0 = (con_reply as u64) << 32;
                         syscall::send(console_port, CON_READ, d0, 0, 0, 0);
                         if let Some(cr) = syscall::recv_msg(con_reply) {
                             if cr.tag == CON_READ_OK {
                                 let len = cr.data[0] as usize;
                                 let actual = len.min(length);
-                                // Forward inline data.
-                                syscall::send(
-                                    reply_port,
+                                let _ = syscall::reply(
                                     FS_READ_OK,
                                     actual as u64,
                                     cr.data[1],
                                     cr.data[2],
                                     cr.data[3],
+                                    0,
                                 );
                             } else {
-                                syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                                let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                             }
                         } else {
-                            syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                            let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                         }
                     }
                 }
@@ -328,13 +326,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             FS_WRITE => {
                 let handle = msg.data[0] as usize;
                 let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[1] >> 32;
                 let grant_va = msg.data[2] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    if reply_port != 0 {
-                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
-                    }
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -343,28 +338,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 match dev_type {
                     DeviceType::Full => {
                         // ENOSPC.
-                        if reply_port != 0 {
-                            syscall::send(reply_port, FS_ERROR, ERR_NOSPC, 0, 0, 0);
-                        }
+                        let _ = syscall::reply(FS_ERROR, ERR_NOSPC, 0, 0, 0, 0);
                     }
                     DeviceType::Null
                     | DeviceType::Zero
                     | DeviceType::Random
                     | DeviceType::Urandom => {
                         // Discard.
-                        if reply_port != 0 {
-                            syscall::send(reply_port, FS_WRITE_OK, length as u64, 0, 0, 0);
-                        }
+                        let _ = syscall::reply(FS_WRITE_OK, length as u64, 0, 0, 0, 0);
                     }
                     DeviceType::Console | DeviceType::Tty => {
                         if console_port == 0 {
-                            if reply_port != 0 {
-                                syscall::send(reply_port, FS_WRITE_OK, 0, 0, 0, 0);
-                            }
+                            let _ = syscall::reply(FS_WRITE_OK, 0, 0, 0, 0, 0);
                             continue;
                         }
-                        // Pack data for CON_WRITE: data[0]=lo, data[1]=hi, data[2]=len|(reply<<32), data[3]=extra
-                        // Up to 24 bytes inline.
+                        // Pack data for CON_WRITE: legacy path to console_srv.
                         let actual = length.min(24);
                         let mut d0 = 0u64;
                         let mut d1 = 0u64;
@@ -387,30 +375,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         syscall::send(console_port, CON_WRITE, d0, d1, d2, d3);
                         // Wait for ack.
                         syscall::recv_msg(con_reply);
-                        if reply_port != 0 {
-                            syscall::send(reply_port, FS_WRITE_OK, actual as u64, 0, 0, 0);
-                        }
+                        let _ = syscall::reply(FS_WRITE_OK, actual as u64, 0, 0, 0, 0);
                     }
                 }
             }
 
             FS_STAT => {
                 let handle = msg.data[0] as usize;
-                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
                 let di = handles[handle].dev_idx;
                 // mode = 0o020666 (char device, rw for all)
-                syscall::send(reply_port, FS_STAT_OK, 0, 0o020666u64, 0, di as u64);
+                let _ = syscall::reply(FS_STAT_OK, 0, 0o020666u64, 0, di as u64, 0);
             }
 
             FS_READDIR => {
                 let start_offset = msg.data[0] as usize;
-                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 if start_offset < NUM_DEVICES {
                     let dev = &DEVICES[start_offset];
@@ -423,16 +407,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     for j in 8..nlen.min(16) {
                         name_hi |= (dev.name[j] as u64) << ((j - 8) * 8);
                     }
-                    syscall::send(
-                        reply_port,
+                    let _ = syscall::reply(
                         FS_READDIR_OK,
                         0,
                         name_lo,
                         name_hi,
                         (start_offset + 1) as u64,
+                        0,
                     );
                 } else {
-                    syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_READDIR_END, 0, 0, 0, 0, 0);
                 }
             }
 
@@ -441,9 +425,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if handle < MAX_OPEN && handles[handle].active {
                     handles[handle].active = false;
                 }
+                let _ = syscall::reply(FS_CLOSE_OK, 0, 0, 0, 0, 0);
             }
 
-            _ => {}
+            _ => {
+                let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
+            }
         }
     }
 
