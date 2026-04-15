@@ -22,6 +22,7 @@ const FS_READDIR_END: u64 = 0x2202;
 const FS_STAT: u64 = 0x2300;
 const FS_STAT_OK: u64 = 0x2301;
 const FS_CLOSE: u64 = 0x2400;
+const FS_CLOSE_OK: u64 = 0x2401;
 const FS_CREATE: u64 = 0x2500;
 const FS_CREATE_OK: u64 = 0x2501;
 const FS_WRITE: u64 = 0x2600;
@@ -304,9 +305,9 @@ fn try_wake_waiters(
         if !lock_conflicts(locks, w.file_idx, w.pid, w.lock_type, w.start, w.len) {
             // Grant the lock and wake.
             if acquire_lock(locks, w.file_idx, w.pid, w.lock_type, w.start, w.len) {
-                syscall::send(w.reply_port, FS_FLOCK_OK, 0, 0, 0, 0);
+                let _ = syscall::reply_to(w.reply_port, FS_FLOCK_OK, 0, 0, 0, 0);
             } else {
-                syscall::send(w.reply_port, FS_LOCK_ERR, ERR_FULL as u64, 0, 0, 0);
+                let _ = syscall::reply_to(w.reply_port, FS_LOCK_ERR, ERR_FULL as u64, 0, 0, 0);
             }
             w.active = false;
         }
@@ -367,7 +368,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let mut waiters = [LockWaiter::empty(); MAX_LOCK_WAITERS];
 
     loop {
-        let msg = match syscall::recv_msg(port) {
+        let msg = match syscall::recv_with_cap(port) {
             Some(m) => m,
             None => break,
         };
@@ -375,7 +376,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         match msg.tag {
             FS_OPEN => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let caller_pid = msg.data[3] as u32; // PID from d3
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
@@ -394,20 +394,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             }
                         }
                         if h == u64::MAX {
-                            syscall::send(reply_port, FS_ERROR, ERR_FULL, 0, 0, 0);
+                            let _ = syscall::reply(FS_ERROR, ERR_FULL, 0, 0, 0, 0);
                         } else {
-                            syscall::send(
-                                reply_port,
+                            let _ = syscall::reply(
                                 FS_OPEN_OK,
                                 h,
                                 files[fi].size as u64,
                                 my_aspace as u64,
                                 0,
+                                0,
                             );
                         }
                     }
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     }
                 }
             }
@@ -416,18 +416,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = msg.data[0] as usize;
                 let offset = msg.data[1] as u32;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as u32;
-                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
                 let fi = handles[handle].file_idx;
                 let file = &files[fi];
                 if offset >= file.size {
-                    syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -440,7 +439,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 if page_idx >= MAX_PAGES_PER_FILE || file.pages[page_idx] == 0 {
                     // No data allocated — return zeros.
-                    syscall::send(reply_port, FS_READ_OK, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_READ_OK, 0, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -454,25 +453,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             bytes_in_page,
                         );
                     }
-                    syscall::send_nb(reply_port, FS_READ_OK, bytes_in_page as u64, 0);
+                    let _ = syscall::reply(FS_READ_OK, bytes_in_page as u64, 0, 0, 0, 0);
                 } else {
                     let inline_len = bytes_in_page.min(MAX_INLINE);
                     let data = unsafe { core::slice::from_raw_parts(src as *const u8, inline_len) };
                     let packed = pack_inline_data(data);
-                    syscall::send(
-                        reply_port,
+                    let _ = syscall::reply(
                         FS_READ_OK,
                         inline_len as u64,
                         packed[0],
                         packed[1],
                         packed[2],
+                        0,
                     );
                 }
             }
 
             FS_READDIR => {
                 let start_offset = msg.data[0] as usize;
-                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 // start_offset is used as an index into the files array.
                 let mut found = false;
@@ -488,41 +486,40 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         for j in 8..nlen.min(16) {
                             name_hi |= (f.name[j] as u64) << ((j - 8) * 8);
                         }
-                        syscall::send(
-                            reply_port,
+                        let _ = syscall::reply(
                             FS_READDIR_OK,
                             f.size as u64,
                             name_lo,
                             name_hi,
                             (i + 1) as u64,
+                            0,
                         );
                         found = true;
                         break;
                     }
                 }
                 if !found {
-                    syscall::send(reply_port, FS_READDIR_END, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_READDIR_END, 0, 0, 0, 0, 0);
                 }
             }
 
             FS_STAT => {
                 let handle = msg.data[0] as usize;
-                let reply_port = msg.data[2] & 0xFFFF_FFFF;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
                 let fi = handles[handle].file_idx;
                 let f = &files[fi];
-                syscall::send(
-                    reply_port,
+                let _ = syscall::reply(
                     FS_STAT_OK,
                     f.size as u64,
                     f.mode as u64,
                     0,
                     fi as u64,
+                    0,
                 );
             }
 
@@ -546,17 +543,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         try_wake_waiters(&mut locks, &mut waiters, fi);
                     }
                 }
+                let _ = syscall::reply(FS_CLOSE_OK, 0, 0, 0, 0, 0);
             }
 
             FS_CREATE => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let caller_pid = msg.data[3] as u32;
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
                 // Check if file already exists.
                 if find_file(&files, &name, nlen).is_some() {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -578,7 +575,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
                 if fi == usize::MAX {
-                    syscall::send(reply_port, FS_ERROR, ERR_FULL, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_FULL, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -596,22 +593,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 if h == u64::MAX {
                     files[fi].active = false;
-                    syscall::send(reply_port, FS_ERROR, ERR_FULL, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_FULL, 0, 0, 0, 0);
                 } else {
-                    syscall::send(reply_port, FS_CREATE_OK, h, 0, my_aspace as u64, 0);
+                    let _ = syscall::reply(FS_CREATE_OK, h, 0, my_aspace as u64, 0, 0);
                 }
             }
 
             FS_WRITE => {
                 let handle = msg.data[0] as usize;
                 let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[1] >> 32;
                 let grant_va = msg.data[2] as usize;
 
                 if handle >= MAX_OPEN || !handles[handle].active || !handles[handle].writable {
-                    if reply_port != 0 {
-                        syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
-                    }
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -659,14 +653,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 files[fi].size = offset as u32;
 
-                if reply_port != 0 {
-                    syscall::send(reply_port, FS_WRITE_OK, written as u64, 0, 0, 0);
-                }
+                let _ = syscall::reply(FS_WRITE_OK, written as u64, 0, 0, 0, 0);
             }
 
             FS_DELETE => {
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
                 match find_file(&files, &name, nlen) {
@@ -685,10 +676,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 hnd.active = false;
                             }
                         }
-                        syscall::send(reply_port, FS_DELETE_OK, 0, 0, 0, 0);
+                        let _ = syscall::reply(FS_DELETE_OK, 0, 0, 0, 0, 0);
                     }
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     }
                 }
             }
@@ -697,10 +688,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
                 let operation = (msg.data[0] >> 32) as i32;
                 let pid = msg.data[1] as u32;
-                let reply_port = msg.data[2] >> 32;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    syscall::send(reply_port, FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0);
+                    let _ = syscall::reply(FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0, 0);
                     continue;
                 }
                 let fi = handles[handle].file_idx as u32;
@@ -719,23 +709,27 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if is_unlock {
                     release_locks(&mut locks, fi, pid, 0, 0);
                     try_wake_waiters(&mut locks, &mut waiters, fi);
-                    syscall::send(reply_port, FS_FLOCK_OK, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_FLOCK_OK, 0, 0, 0, 0, 0);
                 } else if !lock_conflicts(&locks, fi, pid, lock_type, 0, 0) {
                     if acquire_lock(&mut locks, fi, pid, lock_type, 0, 0) {
-                        syscall::send(reply_port, FS_FLOCK_OK, 0, 0, 0, 0);
+                        let _ = syscall::reply(FS_FLOCK_OK, 0, 0, 0, 0, 0);
                     } else {
-                        syscall::send(reply_port, FS_LOCK_ERR, ERR_FULL as u64, 0, 0, 0);
+                        let _ = syscall::reply(FS_LOCK_ERR, ERR_FULL as u64, 0, 0, 0, 0);
                     }
                 } else if is_nb {
-                    syscall::send(reply_port, FS_LOCK_ERR, ERR_AGAIN as u64, 0, 0, 0);
+                    let _ = syscall::reply(FS_LOCK_ERR, ERR_AGAIN as u64, 0, 0, 0, 0);
                 } else {
-                    // Block — store waiter.
+                    // Block — defer reply by taking the cap and storing it.
+                    let cap = syscall::reply_take();
+                    if cap == u64::MAX {
+                        continue;
+                    }
                     let mut queued = false;
                     for w in waiters.iter_mut() {
                         if !w.active {
                             *w = LockWaiter {
                                 active: true,
-                                reply_port,
+                                reply_port: cap,
                                 file_idx: fi,
                                 pid,
                                 lock_type,
@@ -747,7 +741,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         }
                     }
                     if !queued {
-                        syscall::send(reply_port, FS_LOCK_ERR, ERR_FULL as u64, 0, 0, 0);
+                        let _ = syscall::reply_to(cap, FS_LOCK_ERR, ERR_FULL as u64, 0, 0, 0);
                     }
                 }
             }
@@ -758,11 +752,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let pid = msg.data[3] as u32;
                 let start = msg.data[1];
                 let len = (msg.data[2] & 0xFFFF_FFFF) as u64;
-                let reply_port = msg.data[2] >> 32;
                 let blocking = msg.tag == FS_SETLKW;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    syscall::send(reply_port, FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0);
+                    let _ = syscall::reply(FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0, 0);
                     continue;
                 }
                 let fi = handles[handle].file_idx as u32;
@@ -771,24 +764,28 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     release_locks(&mut locks, fi, pid, start, len);
                     try_wake_waiters(&mut locks, &mut waiters, fi);
                     let ok_tag = if blocking { FS_SETLKW_OK } else { FS_SETLK_OK };
-                    syscall::send(reply_port, ok_tag, 0, 0, 0, 0);
+                    let _ = syscall::reply(ok_tag, 0, 0, 0, 0, 0);
                 } else if !lock_conflicts(&locks, fi, pid, lock_type, start, len) {
                     if acquire_lock(&mut locks, fi, pid, lock_type, start, len) {
                         let ok_tag = if blocking { FS_SETLKW_OK } else { FS_SETLK_OK };
-                        syscall::send(reply_port, ok_tag, 0, 0, 0, 0);
+                        let _ = syscall::reply(ok_tag, 0, 0, 0, 0, 0);
                     } else {
-                        syscall::send(reply_port, FS_LOCK_ERR, ERR_FULL as u64, 0, 0, 0);
+                        let _ = syscall::reply(FS_LOCK_ERR, ERR_FULL as u64, 0, 0, 0, 0);
                     }
                 } else if !blocking {
-                    syscall::send(reply_port, FS_LOCK_ERR, ERR_AGAIN as u64, 0, 0, 0);
+                    let _ = syscall::reply(FS_LOCK_ERR, ERR_AGAIN as u64, 0, 0, 0, 0);
                 } else {
-                    // Block — store waiter.
+                    // Block — defer reply by taking the cap and storing it.
+                    let cap = syscall::reply_take();
+                    if cap == u64::MAX {
+                        continue;
+                    }
                     let mut queued = false;
                     for w in waiters.iter_mut() {
                         if !w.active {
                             *w = LockWaiter {
                                 active: true,
-                                reply_port,
+                                reply_port: cap,
                                 file_idx: fi,
                                 pid,
                                 lock_type,
@@ -800,7 +797,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         }
                     }
                     if !queued {
-                        syscall::send(reply_port, FS_LOCK_ERR, ERR_FULL as u64, 0, 0, 0);
+                        let _ = syscall::reply_to(cap, FS_LOCK_ERR, ERR_FULL as u64, 0, 0, 0);
                     }
                 }
             }
@@ -811,10 +808,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let pid = msg.data[3] as u32;
                 let start = msg.data[1];
                 let len = (msg.data[2] & 0xFFFF_FFFF) as u64;
-                let reply_port = msg.data[2] >> 32;
 
                 if handle >= MAX_OPEN || !handles[handle].active {
-                    syscall::send(reply_port, FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0);
+                    let _ = syscall::reply(FS_LOCK_ERR, ERR_INVALID as u64, 0, 0, 0, 0);
                     continue;
                 }
                 let fi = handles[handle].file_idx as u32;
@@ -823,23 +819,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     Some(idx) => {
                         let lk = &locks[idx];
                         let d0 = (lk.lock_type as u64) | ((lk.pid as u64) << 32);
-                        syscall::send(reply_port, FS_GETLK_OK, d0, lk.start, lk.len, 0);
+                        let _ = syscall::reply(FS_GETLK_OK, d0, lk.start, lk.len, 0, 0);
                     }
                     None => {
                         // No conflict — return F_UNLCK.
                         let d0 = F_UNLCK as u64;
-                        syscall::send(reply_port, FS_GETLK_OK, d0, 0, 0, 0);
+                        let _ = syscall::reply(FS_GETLK_OK, d0, 0, 0, 0, 0);
                     }
                 }
             }
 
             FS_SYMLINK => {
                 let name_len = (msg.data[2] & 0xFFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
                 if find_file(&files, &name, nlen).is_some() {
-                    syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -882,47 +877,44 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
                 if fi == usize::MAX {
-                    syscall::send(reply_port, FS_ERROR, ERR_FULL, 0, 0, 0);
+                    let _ = syscall::reply(FS_ERROR, ERR_FULL, 0, 0, 0, 0);
                 } else {
-                    syscall::send(reply_port, FS_SYMLINK_OK, 0, 0, 0, 0);
+                    let _ = syscall::reply(FS_SYMLINK_OK, 0, 0, 0, 0, 0);
                 }
             }
 
             FS_READLINK => {
                 let name_len = (msg.data[2] & 0xFFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
                 match find_file(&files, &name, nlen) {
                     Some(fi) => {
                         let f = &files[fi];
                         if !f.is_symlink {
-                            syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                            let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                             continue;
                         }
                         let to_read = (f.size as usize).min(MAX_INLINE);
                         if f.pages[0] != 0 && to_read > 0 {
                             let src = unsafe { core::slice::from_raw_parts(f.pages[0] as *const u8, to_read) };
                             let packed = pack_inline_data(src);
-                            syscall::send(reply_port, FS_READLINK_OK, to_read as u64, packed[0], packed[1], packed[2]);
+                            let _ = syscall::reply(FS_READLINK_OK, to_read as u64, packed[0], packed[1], packed[2], 0);
                         } else {
-                            syscall::send(reply_port, FS_READLINK_OK, 0, 0, 0, 0);
+                            let _ = syscall::reply(FS_READLINK_OK, 0, 0, 0, 0, 0);
                         }
                     }
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     }
                 }
             }
 
             FS_LINK => {
-                let reply_port = msg.data[2] >> 32;
-                syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
             }
 
             FS_RENAME => {
                 let name_len = (msg.data[2] & 0xFFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let (old_name, old_nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
 
                 let new_word = msg.data[3];
@@ -938,22 +930,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 match find_file(&files, &old_name, old_nlen) {
                     Some(fi) => {
                         if find_file(&files, &new_name, new_nlen).is_some() {
-                            syscall::send(reply_port, FS_ERROR, ERR_INVALID, 0, 0, 0);
+                            let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                             continue;
                         }
                         files[fi].name = new_name;
                         files[fi].name_len = new_nlen as u8;
-                        syscall::send(reply_port, FS_RENAME_OK, 0, 0, 0, 0);
+                        let _ = syscall::reply(FS_RENAME_OK, 0, 0, 0, 0, 0);
                     }
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     }
                 }
             }
 
             FS_CHOWN => {
                 let name_len = (msg.data[2] & 0xFFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
                 let uid = (msg.data[3] & 0xFFFF_FFFF) as u32;
                 let gid = (msg.data[3] >> 32) as u32;
@@ -962,17 +953,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     Some(fi) => {
                         files[fi].uid = uid;
                         files[fi].gid = gid;
-                        syscall::send(reply_port, FS_CHOWN_OK, 0, 0, 0, 0);
+                        let _ = syscall::reply(FS_CHOWN_OK, 0, 0, 0, 0, 0);
                     }
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     }
                 }
             }
 
             FS_TRUNCATE => {
                 let name_len = (msg.data[2] & 0xFFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
                 let new_size = msg.data[3] as u32;
 
@@ -989,25 +979,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 }
                             }
                         }
-                        syscall::send(reply_port, FS_TRUNCATE_OK, 0, 0, 0, 0);
+                        let _ = syscall::reply(FS_TRUNCATE_OK, 0, 0, 0, 0, 0);
                     }
                     None => {
-                        syscall::send(reply_port, FS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
+                        let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     }
                 }
             }
 
             FS_STATFS => {
-                let reply_port = msg.data[2] >> 32;
                 let mut used = 0u64;
                 for f in files.iter() {
                     if f.active { used += 1; }
                 }
                 let free = MAX_FILES as u64 - used;
-                syscall::send(reply_port, FS_STATFS_OK, used, free, PAGE_SIZE as u64, 0);
+                let _ = syscall::reply(FS_STATFS_OK, used, free, PAGE_SIZE as u64, 0, 0);
             }
 
-            _ => {}
+            _ => {
+                let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
+            }
         }
     }
 

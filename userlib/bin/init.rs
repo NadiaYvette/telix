@@ -6648,21 +6648,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             0
         };
 
-        let rp = if phase54_ok {
-            syscall::port_create()
-        } else {
-            0
-        };
-
         // Step 1: FS_CREATE "test.txt"
         let mut handle = 0u64;
         let mut srv_aspace = 0u64;
         if phase54_ok {
             let fname = b"test.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (rp << 32);
-            syscall::send(tmpfs_port, 0x2500, fn0, fn1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(rp) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2500, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2501 {
                     handle = reply.data[0];
                     srv_aspace = reply.data[2];
@@ -6686,9 +6679,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 let grant_dst: usize = 0x8_0000_0000;
                 if syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false) {
-                    let wd1 = 48u64 | (rp << 32);
-                    syscall::send(tmpfs_port, 0x2600, handle, wd1, grant_dst as u64, 0);
-                    if let Some(wr) = syscall::recv_msg(rp) {
+                    let wd1 = 48u64;
+                    if let Some(wr) = syscall::call(tmpfs_port, 0x2600, handle, wd1, grant_dst as u64, 0) {
                         if wr.tag != 0x2601 || wr.data[0] != 48 {
                             syscall::debug_puts(b"  FAIL: tmpfs WRITE bad reply\n");
                             phase54_ok = false;
@@ -6708,16 +6700,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Step 3: FS_CLOSE
         if phase54_ok {
-            syscall::send(tmpfs_port, 0x2400, handle, 0, 0, 0);
+            let _ = syscall::call(tmpfs_port, 0x2400, handle, 0, 0, 0);
         }
 
         // Step 4: FS_OPEN "test.txt" and verify read-back
         if phase54_ok {
             let fname = b"test.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (rp << 32);
-            syscall::send(tmpfs_port, 0x2000, fn0, fn1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(rp) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2000, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2001 {
                     let rh = reply.data[0];
                     let rsize = reply.data[1];
@@ -6731,9 +6722,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if let Some(scratch) = syscall::mmap_anon(0, 1, 1) {
                             let grant_dst: usize = 0x8_0000_0000;
                             if syscall::grant_pages(r_aspace, scratch, grant_dst, 1, false) {
-                                let rd2 = 48u64 | (rp << 32);
-                                syscall::send(tmpfs_port, 0x2100, rh, 0, rd2, grant_dst as u64);
-                                if let Some(rd) = syscall::recv_msg(rp) {
+                                let rd2 = 48u64;
+                                if let Some(rd) = syscall::call(tmpfs_port, 0x2100, rh, 0, rd2, grant_dst as u64) {
                                     if rd.tag == 0x2101 && rd.data[0] == 48 {
                                         let p = scratch as *const u8;
                                         for i in 0..48 {
@@ -6762,7 +6752,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             phase54_ok = false;
                         }
                     }
-                    syscall::send(tmpfs_port, 0x2400, rh, 0, 0, 0);
+                    let _ = syscall::call(tmpfs_port, 0x2400, rh, 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  FAIL: tmpfs re-open not found\n");
                     phase54_ok = false;
@@ -6776,11 +6766,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase54_ok {
             let fname = b"other.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (rp << 32);
-            syscall::send(tmpfs_port, 0x2500, fn0, fn1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(rp) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2500, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2501 {
-                    syscall::send(tmpfs_port, 0x2400, reply.data[0], 0, 0, 0);
+                    let _ = syscall::call(tmpfs_port, 0x2400, reply.data[0], 0, 0, 0);
                 } else {
                     syscall::debug_puts(b"  FAIL: tmpfs CREATE other\n");
                     phase54_ok = false;
@@ -6795,8 +6784,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let mut count = 0u32;
             let mut next = 0u64;
             for _ in 0..10 {
-                syscall::send(tmpfs_port, 0x2200, next, 0, rp, 0);
-                if let Some(reply) = syscall::recv_msg(rp) {
+                if let Some(reply) = syscall::call(tmpfs_port, 0x2200, next, 0, 0, 0) {
                     if reply.tag == 0x2201 {
                         count += 1;
                         next = reply.data[3]; // next_offset
@@ -6817,9 +6805,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase54_ok {
             let fname = b"test.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (rp << 32);
-            syscall::send(tmpfs_port, 0x2700, fn0, fn1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(rp) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2700, fn0, fn1, d2, 0) {
                 if reply.tag != 0x2701 {
                     syscall::debug_puts(b"  FAIL: tmpfs DELETE failed\n");
                     phase54_ok = false;
@@ -6833,12 +6820,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase54_ok {
             let fname = b"test.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (rp << 32);
-            syscall::send(tmpfs_port, 0x2000, fn0, fn1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(rp) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2000, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2001 {
                     syscall::debug_puts(b"  FAIL: tmpfs file not deleted\n");
-                    syscall::send(tmpfs_port, 0x2400, reply.data[0], 0, 0, 0);
+                    let _ = syscall::call(tmpfs_port, 0x2400, reply.data[0], 0, 0, 0);
                     phase54_ok = false;
                 }
             }
@@ -6849,8 +6835,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let mut count = 0u32;
             let mut next = 0u64;
             for _ in 0..10 {
-                syscall::send(tmpfs_port, 0x2200, next, 0, rp, 0);
-                if let Some(reply) = syscall::recv_msg(rp) {
+                if let Some(reply) = syscall::call(tmpfs_port, 0x2200, next, 0, 0, 0) {
                     if reply.tag == 0x2201 {
                         count += 1;
                         next = reply.data[3];
@@ -6871,13 +6856,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase54_ok {
             let fname = b"other.txt";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (rp << 32);
-            syscall::send(tmpfs_port, 0x2700, fn0, fn1, d2, 0);
-            syscall::recv_msg(rp);
-        }
-
-        if rp != 0 {
-            syscall::port_destroy(rp);
+            let d2 = fname.len() as u64;
+            let _ = syscall::call(tmpfs_port, 0x2700, fn0, fn1, d2, 0);
         }
 
         if phase54_ok {
@@ -8124,20 +8104,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         };
 
-        let rp = if phase61_ok {
-            syscall::port_create()
-        } else {
-            0
-        };
-
         // Create a test file for locking.
         let mut handle = 0u64;
         if phase61_ok {
             let fname = b"locktest";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (rp << 32);
-            syscall::send(tmpfs_port, 0x2500, fn0, fn1, d2, 0); // FS_CREATE
-            if let Some(reply) = syscall::recv_msg(rp) {
+            let d2 = fname.len() as u64;
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2500, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2501 {
                     handle = reply.data[0];
                 } else {
@@ -8154,9 +8127,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let pid = syscall::getpid();
             let d0 = handle | (2u64 << 32); // LOCK_EX = 2
             let d1 = pid;
-            let d2 = rp << 32;
-            syscall::send(tmpfs_port, 0x2800, d0, d1, d2, 0); // FS_FLOCK
-            if let Some(reply) = syscall::recv_msg(rp) {
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2800, d0, d1, 0, 0) {
                 if reply.tag != 0x2801 {
                     syscall::debug_puts(b"  FAIL: flock(EX) failed\n");
                     phase61_ok = false;
@@ -8169,9 +8140,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let pid = syscall::getpid();
             let d0 = handle | (8u64 << 32); // LOCK_UN = 8
             let d1 = pid;
-            let d2 = rp << 32;
-            syscall::send(tmpfs_port, 0x2800, d0, d1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(rp) {
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2800, d0, d1, 0, 0) {
                 if reply.tag != 0x2801 {
                     syscall::debug_puts(b"  FAIL: flock(UN) failed\n");
                     phase61_ok = false;
@@ -8185,9 +8154,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase61_ok {
             // PID 100: LOCK_SH
             let d0 = handle | (1u64 << 32); // LOCK_SH = 1
-            let d2 = rp << 32;
-            syscall::send(tmpfs_port, 0x2800, d0, 100u64, d2, 0);
-            if let Some(reply) = syscall::recv_msg(rp) {
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2800, d0, 100u64, 0, 0) {
                 if reply.tag != 0x2801 {
                     syscall::debug_puts(b"  FAIL: flock SH pid=100\n");
                     phase61_ok = false;
@@ -8199,9 +8166,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase61_ok {
             // PID 200: LOCK_SH — should also succeed (shared).
             let d0 = handle | (1u64 << 32);
-            let d2 = rp << 32;
-            syscall::send(tmpfs_port, 0x2800, d0, 200u64, d2, 0);
-            if let Some(reply) = syscall::recv_msg(rp) {
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2800, d0, 200u64, 0, 0) {
                 if reply.tag != 0x2801 {
                     syscall::debug_puts(b"  FAIL: flock SH pid=200\n");
                     phase61_ok = false;
@@ -8214,9 +8179,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Test 3: flock(LOCK_EX|LOCK_NB) with existing SH locks — should get EAGAIN.
         if phase61_ok {
             let d0 = handle | (6u64 << 32); // LOCK_EX|LOCK_NB = 2|4 = 6
-            let d2 = rp << 32;
-            syscall::send(tmpfs_port, 0x2800, d0, 300u64, d2, 0);
-            if let Some(reply) = syscall::recv_msg(rp) {
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2800, d0, 300u64, 0, 0) {
                 if reply.tag != 0x28FF {
                     // FS_LOCK_ERR expected
                     syscall::debug_puts(b"  FAIL: flock EX|NB no EAGAIN\n");
@@ -8230,11 +8193,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Cleanup: unlock both SH locks.
         if phase61_ok {
             let d0 = handle | (8u64 << 32);
-            let d2 = rp << 32;
-            syscall::send(tmpfs_port, 0x2800, d0, 100u64, d2, 0);
-            let _ = syscall::recv_msg(rp);
-            syscall::send(tmpfs_port, 0x2800, d0, 200u64, d2, 0);
-            let _ = syscall::recv_msg(rp);
+            let _ = syscall::call(tmpfs_port, 0x2800, d0, 100u64, 0, 0);
+            let _ = syscall::call(tmpfs_port, 0x2800, d0, 200u64, 0, 0);
         }
 
         // Test 4: fcntl F_SETLK non-overlapping ranges — no conflict.
@@ -8242,10 +8202,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // PID 100: write lock [0, 100)
             let d0 = handle | (1u64 << 32); // lock_type=F_WRLCK(1) in bits 32..47
             let d1 = 0u64; // start = 0
-            let d2 = 100u64 | (rp << 32); // len = 100
+            let d2 = 100u64; // len = 100
             let d3 = 100u64; // pid = 100
-            syscall::send(tmpfs_port, 0x2820, d0, d1, d2, d3); // FS_SETLK
-            if let Some(reply) = syscall::recv_msg(rp) {
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2820, d0, d1, d2, d3) {
                 if reply.tag != 0x2821 {
                     syscall::debug_puts(b"  FAIL: SETLK [0,100)\n");
                     phase61_ok = false;
@@ -8258,10 +8217,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // PID 200: write lock [100, 200) — no overlap, should succeed.
             let d0 = handle | (1u64 << 32);
             let d1 = 100u64;
-            let d2 = 100u64 | (rp << 32);
+            let d2 = 100u64;
             let d3 = 200u64;
-            syscall::send(tmpfs_port, 0x2820, d0, d1, d2, d3);
-            if let Some(reply) = syscall::recv_msg(rp) {
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2820, d0, d1, d2, d3) {
                 if reply.tag != 0x2821 {
                     syscall::debug_puts(b"  FAIL: SETLK [100,200)\n");
                     phase61_ok = false;
@@ -8276,10 +8234,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // PID 300 queries write lock [0,100) — should see PID 100's lock.
             let d0 = handle | (1u64 << 32); // F_WRLCK
             let d1 = 0u64;
-            let d2 = 100u64 | (rp << 32);
+            let d2 = 100u64;
             let d3 = 300u64;
-            syscall::send(tmpfs_port, 0x2810, d0, d1, d2, d3); // FS_GETLK
-            if let Some(reply) = syscall::recv_msg(rp) {
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2810, d0, d1, d2, d3) {
                 if reply.tag == 0x2811 {
                     let ret_type = (reply.data[0] & 0xFFFF) as u8;
                     let ret_pid = (reply.data[0] >> 32) as u32;
@@ -8304,12 +8261,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase61_ok {
             // PID 100: F_UNLCK [0,100)
             let d0 = handle | (2u64 << 32); // F_UNLCK=2
-            let d2 = 100u64 | (rp << 32);
-            syscall::send(tmpfs_port, 0x2820, d0, 0u64, d2, 100u64);
-            let _ = syscall::recv_msg(rp);
+            let d2 = 100u64;
+            let _ = syscall::call(tmpfs_port, 0x2820, d0, 0u64, d2, 100u64);
             // PID 200: F_UNLCK [100,200)
-            syscall::send(tmpfs_port, 0x2820, d0, 100u64, d2, 200u64);
-            let _ = syscall::recv_msg(rp);
+            let _ = syscall::call(tmpfs_port, 0x2820, d0, 100u64, d2, 200u64);
         }
 
         // Test 6: Lock cleanup on close.
@@ -8317,31 +8272,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Open a second handle to the same file.
             let fname = b"locktest";
             let (fn0, fn1, _) = pack_name(fname);
-            let d2 = (fname.len() as u64) | (rp << 32);
+            let d2 = fname.len() as u64;
             // Pack PID=400 in d3.
-            syscall::send(tmpfs_port, 0x2000, fn0, fn1, d2, 400u64); // FS_OPEN
-            if let Some(reply) = syscall::recv_msg(rp) {
+            if let Some(reply) = syscall::call(tmpfs_port, 0x2000, fn0, fn1, d2, 400u64) {
                 if reply.tag == 0x2001 {
                     let h2 = reply.data[0];
                     // Take exclusive lock with PID 400.
                     let d0 = h2 | (2u64 << 32); // LOCK_EX
-                    let d2 = rp << 32;
-                    syscall::send(tmpfs_port, 0x2800, d0, 400u64, d2, 0);
-                    if let Some(lr) = syscall::recv_msg(rp) {
+                    if let Some(lr) = syscall::call(tmpfs_port, 0x2800, d0, 400u64, 0, 0) {
                         if lr.tag != 0x2801 {
                             syscall::debug_puts(b"  FAIL: lock for close test\n");
                             phase61_ok = false;
                         }
                     }
                     // Close h2 — should release lock.
-                    syscall::send(tmpfs_port, 0x2400, h2, 0, 0, 0); // FS_CLOSE
+                    let _ = syscall::call(tmpfs_port, 0x2400, h2, 0, 0, 0); // FS_CLOSE
 
                     // Now PID 500 should be able to take EX lock.
                     if phase61_ok {
                         let d0 = handle | (6u64 << 32); // LOCK_EX|LOCK_NB
-                        let d2 = rp << 32;
-                        syscall::send(tmpfs_port, 0x2800, d0, 500u64, d2, 0);
-                        if let Some(lr2) = syscall::recv_msg(rp) {
+                        if let Some(lr2) = syscall::call(tmpfs_port, 0x2800, d0, 500u64, 0, 0) {
                             if lr2.tag != 0x2801 {
                                 syscall::debug_puts(b"  FAIL: lock after close\n");
                                 phase61_ok = false;
@@ -8349,9 +8299,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         }
                         // Clean up: unlock.
                         let d0 = handle | (8u64 << 32);
-                        let d2 = rp << 32;
-                        syscall::send(tmpfs_port, 0x2800, d0, 500u64, d2, 0);
-                        let _ = syscall::recv_msg(rp);
+                        let _ = syscall::call(tmpfs_port, 0x2800, d0, 500u64, 0, 0);
                     }
                 } else {
                     syscall::debug_puts(b"  FAIL: open for close test\n");
@@ -8360,10 +8308,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             } else {
                 phase61_ok = false;
             }
-        }
-
-        if rp != 0 {
-            syscall::port_destroy(rp);
         }
 
         if phase61_ok {
