@@ -377,9 +377,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(port as u64);
     syscall::debug_puts(b"\n");
 
-    // Look up blk_srv with bounded retry.
+    // Look up blk_srv with bounded retry (short timeout — blk_srv registers
+    // very early if it initialises successfully).
     let blk_port = {
-        let mut retries = 2000;
+        let mut retries = 200u32;
         loop {
             if let Some(p) = syscall::ns_lookup(b"blk") {
                 break p;
@@ -389,37 +390,35 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  [cache_srv] blk_srv not found, serving without backing\n");
                 break u64::MAX;
             }
-            for _ in 0..50 {
+            for _ in 0..10 {
                 syscall::yield_now();
             }
         }
     };
 
-    syscall::debug_puts(b"  [cache_srv] blk_srv on port ");
-    print_num(blk_port as u64);
-    syscall::debug_puts(b"\n");
-
-    // Connect to blk_srv.
+    // Connect to blk_srv (skip if not found).
     let blk_reply = syscall::port_create();
-    {
+    let (blk_aspace, disk_capacity) = if blk_port == u64::MAX {
+        (0u64, 0u64)
+    } else {
+        syscall::debug_puts(b"  [cache_srv] blk_srv on port ");
+        print_num(blk_port as u64);
+        syscall::debug_puts(b"\n");
+
         let (n0, n1, _) = syscall::pack_name(b"blk");
         let d2 = 3u64 | ((blk_reply as u64) << 32);
         syscall::send(blk_port, IO_CONNECT, n0, n1, d2, 0);
-    }
 
-    let (blk_aspace, disk_capacity) = if let Some(reply) = syscall::recv_msg(blk_reply) {
-        if reply.tag == IO_CONNECT_OK {
-            (reply.data[2], reply.data[1])
-        } else {
-            syscall::debug_puts(b"  [cache_srv] blk connect FAILED\n");
-            loop {
-                core::hint::spin_loop();
+        if let Some(reply) = syscall::recv_msg(blk_reply) {
+            if reply.tag == IO_CONNECT_OK {
+                (reply.data[2], reply.data[1])
+            } else {
+                syscall::debug_puts(b"  [cache_srv] blk connect FAILED\n");
+                (0u64, 0u64)
             }
-        }
-    } else {
-        syscall::debug_puts(b"  [cache_srv] blk no reply\n");
-        loop {
-            core::hint::spin_loop();
+        } else {
+            syscall::debug_puts(b"  [cache_srv] blk no reply\n");
+            (0u64, 0u64)
         }
     };
 

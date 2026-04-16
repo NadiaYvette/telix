@@ -3140,26 +3140,35 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
 
-    // Discover blk_srv via blocking name lookup (waits until blk registers).
-    syscall::debug_puts(b"  [apfs_srv] waiting for blk_srv...\n");
-    let blk_port = match syscall::ns_lookup_wait(b"blk") {
-        Some(p) => p,
-        None => {
-            syscall::debug_puts(b"  [apfs_srv] blk_srv lookup failed, exiting\n");
-            syscall::exit(1);
-            0
+    // Look up cache_blk with bounded retry.
+    syscall::debug_puts(b"  [apfs_srv] waiting for cache_blk...\n");
+    let blk_port = {
+        let mut retries = 2000u32;
+        loop {
+            if let Some(p) = syscall::ns_lookup(b"cache_blk") {
+                break p;
+            }
+            retries -= 1;
+            if retries == 0 {
+                syscall::debug_puts(b"  [apfs_srv] cache_blk not found, exiting\n");
+                syscall::exit(1);
+            }
+            for _ in 0..50 {
+                syscall::yield_now();
+            }
         }
     };
     syscall::debug_puts(b"  [apfs_srv] blk port=");
     print_num(blk_port);
     syscall::debug_puts(b"\n");
 
-    // Connect to blk_srv.
-    syscall::debug_puts(b"  [apfs_srv] connecting to blk_srv...\n");
+    // Connect to cache_blk.
+    syscall::debug_puts(b"  [apfs_srv] connecting to cache_blk...\n");
     let blk_reply = syscall::port_create();
     let blk_aspace = {
+        let (n0, n1, _) = syscall::pack_name(b"blk");
         let d2 = 3u64 | ((blk_reply as u64) << 32);
-        syscall::send(blk_port, IO_CONNECT, 0, 0, d2, 0);
+        syscall::send(blk_port, IO_CONNECT, n0, n1, d2, 0);
         let reply = match syscall::recv_msg(blk_reply) {
             Some(r) => r,
             None => {
