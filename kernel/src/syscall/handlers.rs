@@ -243,13 +243,20 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
             // Handle exit syscalls natively to avoid deadlock: if the
             // personality server is processing a blocking wait4, it can't
             // drain exit messages from its port queue.
-            let is_native_exit = match task.syscall_abi as u8 {
+            let is_native_exit = nr == SYS_EXIT || match task.syscall_abi as u8 {
                 3 => nr == 60 || nr == 231, // LinuxX86_64: exit / exit_group
+                1 => nr == 93 || nr == 94,  // LinuxAArch64: exit / exit_group
                 _ => false,
             };
             if is_native_exit {
                 crate::sched::scheduler::exit_current_thread(a0 as i32);
             }
+            // Handle Telix-native infrastructure syscalls natively even
+            // when a personality is active.  These don't map to any Linux
+            // syscall and the personality server can't handle them.
+            if nr == SYS_YIELD || nr == SYS_DEBUG_PUTS || nr == SYS_DEBUG_PUTCHAR {
+                // Fall through to the native dispatch below.
+            } else {
             let port = task.personality_port;
             let result = crate::syscall::personality::forward_to_server(
                 port, nr, [a0, a1, a2, a3, a4, a5],
@@ -261,6 +268,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
                 crate::sched::scheduler::exit_current_thread(-9);
             }
             return;
+            }
         }
     }
 

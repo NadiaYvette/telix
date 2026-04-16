@@ -3667,7 +3667,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
                 let mut exit_code: i64 = -1;
-                for _ in 0..6000 {
+                for _ in 0..1000 {
                     if let Some(code) = syscall::waitpid(child) {
                         exit_code = code as i64;
                         break;
@@ -9378,7 +9378,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let n0: u64 = 0x666275705F6770; // "pg_buf" + nul LE (7 bytes)
             let d2 = 6u64 | (1u64 << 16) | (reply << 32); // O_CREAT=1
             syscall::send(shm_port, 0x7010, n0, 0, d2, 0); // SHM_OPEN
-            if let Some(resp) = syscall::recv_msg(reply) {
+            if let Some(resp) = syscall::recv_msg_timeout(reply, 5_000_000) {
                 if resp.tag == 0x7100 {
                     // SHM_OK
                     syscall::debug_puts(b"    shm_open pg_buf: OK\n");
@@ -9411,7 +9411,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let reply = syscall::port_create();
             // NET_TCP_LISTEN: d0=port(5432), d1=backlog(4), d2=reply<<32
             syscall::send(net_port, NET_TCP_LISTEN, 5432, 4, reply << 32, 0);
-            if let Some(resp) = syscall::recv_msg(reply) {
+            if let Some(resp) = syscall::recv_msg_timeout(reply, 5_000_000) {
                 if resp.tag == NET_TCP_LISTEN_OK {
                     syscall::debug_puts(b"    TCP listen 5432: OK\n");
                 } else {
