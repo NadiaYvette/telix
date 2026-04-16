@@ -3296,15 +3296,23 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(volume.root_tree_oid);
     syscall::debug_puts(b"\n");
 
-    // Resolve fs tree root via volume omap.
-    let fs_root_block = match omap_lookup(&blk, bs, volume.omap_oid, volume.root_tree_oid, nx_sb.xid) {
-        Some(b) => b,
-        None => {
-            syscall::debug_puts(b"  [apfs_srv] fs tree omap lookup failed\n");
+    // Resolve fs tree root via volume omap (retry with cache invalidation).
+    let mut fs_root_block = 0u64;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            cache_invalidate(volume.omap_oid);
+        }
+        if let Some(b) = omap_lookup(&blk, bs, volume.omap_oid, volume.root_tree_oid, nx_sb.xid) {
+            fs_root_block = b;
+            break;
+        }
+        if attempt == 2 {
+            syscall::debug_puts(b"  [apfs_srv] fs tree omap lookup failed after retries\n");
             syscall::exit(1);
             loop { core::hint::spin_loop(); }
         }
-    };
+        syscall::nanosleep(1_000_000); // 1ms between retries
+    }
 
     syscall::debug_puts(b"  [apfs_srv] fs tree root at block ");
     print_num(fs_root_block);
@@ -3796,13 +3804,10 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             FS_WRITE => {
                 let handle_id = msg.data[0] as usize;
                 let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[1] >> 32;
                 let grant_va = msg.data[2] as usize;
 
                 if handle_id >= MAX_OPEN || !handles[handle_id].active {
-                    if reply_port != 0 {
-                        let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
-                    }
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -3869,9 +3874,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     cur_fs_root = r;
                 }
 
-                if reply_port != 0 {
-                    let _ = syscall::reply(FS_WRITE_OK, written as u64, 0, 0, 0, 0);
-                }
+                let _ = syscall::reply(FS_WRITE_OK, written as u64, 0, 0, 0, 0);
             }
 
             FS_DELETE | FS_UNLINK => {
