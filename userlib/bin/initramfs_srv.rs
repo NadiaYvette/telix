@@ -179,7 +179,7 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
 
     // Server loop.
     loop {
-        let msg = match syscall::recv_msg(port) {
+        let msg = match syscall::recv_with_cap(port) {
             Some(m) => m,
             None => break,
         };
@@ -189,43 +189,41 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                 // Userspace protocol (4 data words max):
                 //   data[0] = name bytes 0-7
                 //   data[1] = name bytes 8-15
-                //   data[2] = name_len (low 32) | reply_port (high 32)
+                //   data[2] = name_len (low 32)
                 //   data[3] = unused
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let name_buf = unpack_name(msg.data[0], msg.data[1], 0, name_len);
                 let name = &name_buf[..name_len.min(16)];
 
                 match fs.find(name) {
                     Some(idx) => {
-                        // data[0]=handle, data[1]=size, data[2]=server_aspace_id
-                        syscall::send(
-                            reply_port,
+                        // d0=handle, d1=size, d2=server_aspace_id
+                        let _ = syscall::reply(
                             IO_CONNECT_OK,
                             idx as u64,
                             fs.files[idx].data_len as u64,
                             my_aspace as u64,
                             0,
+                            0,
                         );
                     }
                     None => {
-                        syscall::send_nb(reply_port, IO_ERROR, ERR_NOT_FOUND, 0);
+                        let _ = syscall::reply(IO_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     }
                 }
             }
 
             IO_READ => {
                 // data[0] = handle, data[1] = offset
-                // data[2] = length (low 32) | reply_port (high 32)
-                // data[3] = grant_dst_va (if grant), data[4] = flags
+                // data[2] = length (low 32)
+                // data[3] = grant_dst_va (if grant)
                 let file_handle = msg.data[0] as usize;
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
                 if file_handle >= fs.count || !fs.files[file_handle].active {
-                    syscall::send_nb(reply_port, IO_ERROR, ERR_INVALID, 0);
+                    let _ = syscall::reply(IO_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -241,42 +239,47 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                     unsafe {
                         core::ptr::copy_nonoverlapping(data.as_ptr(), dst, bytes_read);
                     }
-                    syscall::send_nb(reply_port, IO_READ_OK, bytes_read as u64, 0);
+                    let _ = syscall::reply(IO_READ_OK, bytes_read as u64, 0, 0, 0, 0);
                 } else {
                     // Inline read: pack into message words.
                     let bytes_read = data.len().min(MAX_INLINE_READ);
                     let packed = pack_inline_data(&data[..bytes_read]);
-                    syscall::send(
-                        reply_port,
+                    let _ = syscall::reply(
                         IO_READ_OK,
                         bytes_read as u64,
                         packed[0],
                         packed[1],
                         packed[2],
+                        0,
                     );
                 }
             }
 
             IO_STAT => {
-                // data[0] = handle | (reply_port << 32)
+                // data[0] = handle (low 32)
                 let file_handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
-                let reply_port = msg.data[0] >> 32;
 
                 if file_handle >= fs.count || !fs.files[file_handle].active {
-                    syscall::send_nb(reply_port, IO_ERROR, ERR_INVALID, 0);
+                    let _ = syscall::reply(IO_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
-                syscall::send_nb(
-                    reply_port,
+                let _ = syscall::reply(
                     IO_STAT_OK,
                     fs.files[file_handle].data_len as u64,
+                    0,
+                    0,
+                    0,
                     0,
                 );
             }
 
-            IO_CLOSE => {}
-            _ => {}
+            IO_CLOSE => {
+                let _ = syscall::reply(IO_CONNECT_OK, 0, 0, 0, 0, 0);
+            }
+            _ => {
+                let _ = syscall::reply(IO_ERROR, ERR_INVALID, 0, 0, 0, 0);
+            }
         }
     }
 

@@ -692,15 +692,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     };
 
-    let reply_port = syscall::port_create();
-
     // IO_CONNECT to open hello.txt
     let name = b"hello.txt";
     let (w0, w1, _) = pack_name(name);
-    let d2 = (name.len() as u64) | (reply_port << 32);
-    syscall::send(srv_port, 0x100, w0, w1, d2, 0);
-
-    let (handle, size, srv_aspace) = if let Some(reply) = syscall::recv_msg(reply_port) {
+    let (handle, size, srv_aspace) = if let Some(reply) = syscall::call(srv_port, 0x100, w0, w1, name.len() as u64, 0) {
         if reply.tag == 0x101 {
             (reply.data[0], reply.data[1], reply.data[2])
         } else {
@@ -723,14 +718,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"\n");
 
     // Inline read (up to 40 bytes)
-    let d2_read = size.min(40) | (reply_port << 32);
-    syscall::send(srv_port, 0x200, handle, 0, d2_read, 0);
-
-    for _ in 0..20 {
-        syscall::yield_now();
-    }
-
-    if let Some(rr) = syscall::recv_msg(reply_port) {
+    if let Some(rr) = syscall::call(srv_port, 0x200, handle, 0, size.min(40), 0) {
         if rr.tag == 0x201 {
             let bytes_read = rr.data[0] as usize;
             syscall::debug_puts(b"  init: inline read ");
@@ -764,16 +752,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    // IO_READ with grant: data[0]=handle, data[1]=offset, data[2]=length|(reply<<32), data[3]=grant_va
+    // IO_READ with grant: data[0]=handle, data[1]=offset, data[2]=length, data[3]=grant_va
     // Server detects grant mode by data[3] != 0.
-    let d2_grant = size | (reply_port << 32);
-    syscall::send(srv_port, 0x200, handle, 0, d2_grant, grant_dst_va as u64);
-
-    for _ in 0..20 {
-        syscall::yield_now();
-    }
-
-    if let Some(rr) = syscall::recv_msg(reply_port) {
+    if let Some(rr) = syscall::call(srv_port, 0x200, handle, 0, size, grant_dst_va as u64) {
         if rr.tag == 0x201 {
             let bytes_read = rr.data[0] as usize;
             syscall::debug_puts(b"  init: grant read ");
@@ -798,7 +779,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::munmap(buf_va);
 
     // Close.
-    syscall::send_nb(srv_port, 0x500, handle, 0);
+    let _ = syscall::call(srv_port, 0x500, handle, 0, 0, 0);
 
     syscall::debug_puts(b"Phase 7 grant-based read: PASSED\n");
 
