@@ -2170,6 +2170,22 @@ fn try_switch(current_sp: u64) -> u64 {
     // previous timeslice are now dead.  Process deferred frees.
     crate::sync::rcu::rcu_quiescent();
 
+    // Sanity check: saved_sp must be within the thread's kstack.
+    {
+        let sp = next_t.saved_sp;
+        let kbase = next_t.stack_base;
+        let kend = kbase as u64 + kstack_size() as u64;
+        if kbase != 0 && (sp < kbase as u64 || sp >= kend) {
+            crate::println!(
+                "BUG: try_switch: tid={} saved_sp={:#x} OUTSIDE kstack {:#x}..{:#x} (source={})",
+                next_id, sp, kbase, kend, next_t.saved_sp_source
+            );
+            crate::println!(
+                "  prev={} next={} task={} state={:?}",
+                prev_id, next_id, next_t.task_id, next_t.state
+            );
+        }
+    }
     next_t.saved_sp
 }
 
@@ -4259,6 +4275,18 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     let next_sp = next_t.saved_sp;
 
+    // Sanity check: saved_sp must be within the thread's kstack.
+    {
+        let kbase = next_t.stack_base;
+        let kend = kbase as u64 + kstack_size() as u64;
+        if kbase != 0 && (next_sp < kbase as u64 || next_sp >= kend) {
+            crate::println!(
+                "BUG: park_ipc: tid={} saved_sp={:#x} OUTSIDE kstack {:#x}..{:#x} (source={})",
+                next_id, next_sp, kbase, kend, next_t.saved_sp_source
+            );
+        }
+    }
+
     // Reprogram the one-shot timer so this CPU gets a tick within one
     // interval. Without this, the dynamic tick may have the timer set far
     // in the future (up to MAX_IDLE_NS = 1s). If a remote CPU wakes us via
@@ -4742,6 +4770,18 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     receiver.state = ThreadState::Running;
     pcpu.current_thread.store(receiver_tid, Ordering::Relaxed);
     let recv_sp = receiver.saved_sp;
+
+    // Sanity check: saved_sp must be within the thread's kstack.
+    {
+        let kbase = receiver.stack_base;
+        let kend = kbase as u64 + kstack_size() as u64;
+        if kbase != 0 && (recv_sp < kbase as u64 || recv_sp >= kend) {
+            crate::println!(
+                "BUG: handoff_to: tid={} saved_sp={:#x} OUTSIDE kstack {:#x}..{:#x} (source={})",
+                receiver_tid, recv_sp, kbase, kend, receiver.saved_sp_source
+            );
+        }
+    }
 
     // Store pending_switch before restoring IRQs — see park_current_for_ipc
     // comment for why this ordering is critical with preemptive syscalls.

@@ -19,6 +19,7 @@ fn gicd_base() -> usize {
 
 // GICD register offsets
 const GICD_CTLR_OFF: usize = 0x000;
+const GICD_IGROUPR_OFF: usize = 0x080; // Interrupt Group Registers (SPIs)
 const GICD_ISENABLER_OFF: usize = 0x100; // Array of 32-bit registers
 const GICD_IPRIORITYR_OFF: usize = 0x400; // Array of 8-bit fields
 
@@ -131,7 +132,18 @@ pub fn init() {
         core::arch::asm!("mov {tmp}, #1", "msr S3_0_C12_C12_7, {tmp}", "isb", tmp = out(reg) _);
     }
 
-    // 3. Enable the distributor (Group 1 non-secure).
+    // 3. Put all SPIs (INTID 32..1020) into Group 1 non-secure.
+    //    GICD_IGROUPR[0] covers INTIDs 0-31 (SGI/PPI, handled via GICR above).
+    //    GICD_IGROUPR[1..32] covers SPIs 32-1023.
+    unsafe {
+        let gicd = gicd_base();
+        for i in 1..32u32 {
+            let reg = (gicd + GICD_IGROUPR_OFF + (i as usize) * 4) as *mut u32;
+            core::ptr::write_volatile(reg, 0xFFFF_FFFF);
+        }
+    }
+
+    // 4. Enable the distributor (Group 1 non-secure).
     unsafe {
         let ctlr = (gicd_base() + GICD_CTLR_OFF) as *mut u32;
         // Set EnableGrp1NS (bit 1) and ARE_NS (bit 4).
