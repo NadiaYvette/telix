@@ -248,24 +248,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // sys_reply_to deferred reply) is exercised by Phase 59 later.
     syscall::debug_puts(b"  init: running pipe_srv (call/reply) smoke test...\n");
     {
-        let pipe_tid = syscall::spawn(b"pipe_srv", 50);
+        // Pass a pre-created port to pipe_srv to avoid ns_lookup race.
+        let pp = syscall::port_create();
+        let pipe_tid = syscall::spawn_with_arg(b"pipe_srv", 50, pp);
         if pipe_tid == u64::MAX {
             syscall::debug_puts(b"Phase 5f pipe_srv call/reply smoke: FAILED (spawn)\n");
         } else {
-            let mut pp_opt: Option<u64> = None;
-            for _ in 0..500u32 {
-                if let Some(p) = syscall::ns_lookup(b"pipe") {
-                    pp_opt = Some(p);
-                    break;
-                }
-                syscall::yield_now();
-            }
+            // Give pipe_srv time to start its recv loop.
+            for _ in 0..100u32 { syscall::yield_now(); }
 
             let mut ok = true;
-            let pp = match pp_opt {
-                Some(p) => p,
-                None => { ok = false; 0 }
-            };
 
             // Create pipe.
             let mut rh = 0u32;

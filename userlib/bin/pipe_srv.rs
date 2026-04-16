@@ -143,8 +143,12 @@ fn try_wake_reader(slot: u32) {
 }
 
 #[unsafe(no_mangle)]
-fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
-    let svc_port = syscall::port_create();
+fn main(arg0: u64, _arg1: u64, _arg2: u64) {
+    let svc_port = if arg0 != 0 && arg0 != u64::MAX {
+        arg0 // Pre-created port from parent (smoke test path).
+    } else {
+        syscall::port_create()
+    };
     syscall::ns_register(b"pipe", svc_port);
 
     // Call/reply server: recv_with_cap installs a reply-cap on this
