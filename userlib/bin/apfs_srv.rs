@@ -953,6 +953,7 @@ fn block_alloc(count: u32) -> Option<u64> {
                         ALLOC_BITMAP[w] |= 1u64 << s;
                     }
                     ALLOC_FREE -= count as u64;
+                    BLOCKS_ALLOCED_DELTA += count as u64;
                     return Some(start as u64);
                 }
             }
@@ -973,6 +974,7 @@ fn block_free(start: u64, count: u32) {
             }
         }
         ALLOC_FREE += count as u64;
+        BLOCKS_FREED_DELTA += count as u64;
     }
 }
 
@@ -1019,13 +1021,23 @@ static mut NX_DESC_LEN: u32 = 0;        // xp_desc_len: blocks in current checkp
 static mut NX_SPACEMAN_OID: u64 = 0;    // nx_spaceman_oid: for checkpoint mapping
 static mut NX_REAPER_OID: u64 = 0;      // nx_reaper_oid: for checkpoint mapping
 
-// Volume superblock field offsets for writes.
-const APFS_NUM_FILES_OFF: usize = 0x90;       // apfs_num_files (u64) at 144
-const APFS_NUM_DIRS_OFF: usize = 0x98;        // apfs_num_directories (u64) at 152
-const APFS_NUM_SYMLINKS_OFF: usize = 0xA0;    // apfs_num_symlinks (u64) at 160
-const APFS_NEXT_OBJ_ID_OFF: usize = 0x70;     // apfs_next_obj_id at 112
-const NX_NEXT_OID_OFF: usize = 88;            // in container superblock
-const NX_NEXT_XID_OFF: usize = 96;            // in container superblock
+// Volume superblock field offsets (from apfs_superblock in raw.h).
+const APFS_FS_ALLOC_COUNT_OFF: usize = 0x58;  // apfs_fs_alloc_count (u64)
+const APFS_NEXT_OBJ_ID_OFF: usize = 0xB0;     // apfs_next_obj_id (u64)
+const APFS_NUM_FILES_OFF: usize = 0xB8;        // apfs_num_files (u64)
+const APFS_NUM_DIRS_OFF: usize = 0xC0;         // apfs_num_directories (u64)
+const APFS_NUM_SYMLINKS_OFF: usize = 0xC8;     // apfs_num_symlinks (u64)
+const APFS_TOTAL_BLOCKS_ALLOCED_OFF: usize = 0xE0; // apfs_total_blocks_alloced (u64)
+const APFS_TOTAL_BLOCKS_FREED_OFF: usize = 0xE8;   // apfs_total_blocks_freed (u64)
+const APFS_LAST_MOD_TIME_OFF: usize = 0x100;       // apfs_last_mod_time (u64, ns since epoch)
+
+// Container superblock field offsets.
+const NX_NEXT_OID_OFF: usize = 88;            // nx_next_oid
+const NX_NEXT_XID_OFF: usize = 96;            // nx_next_xid
+
+// Volume-level block accounting for W8 checkpoint updates.
+static mut BLOCKS_ALLOCED_DELTA: u64 = 0;     // blocks allocated this transaction
+static mut BLOCKS_FREED_DELTA: u64 = 0;       // blocks freed this transaction
 
 // =====================================================================
 // B-tree modification helpers (CoW)
@@ -2103,7 +2115,8 @@ fn checkpoint_commit(blk: &BlkClient, bs: u32, nx_buf_block: u64) -> bool {
     true
 }
 
-/// Update the volume superblock with current file/dir counts.
+/// Update the volume superblock with current file/dir counts, block accounting,
+/// and modification time. Writes in-place (simplified — no CoW for vol superblock).
 fn update_volume_superblock(
     blk: &BlkClient, bs: u32, vol_phys_block: u64,
     num_files_delta: i64, num_dirs_delta: i64,
@@ -2116,7 +2129,9 @@ fn update_volume_superblock(
         core::slice::from_raw_parts_mut(wva as *mut u8, bs as usize)
     };
 
-    // Update counts.
+    let xid = unsafe { NX_NEXT_XID };
+
+    // Update file/directory counts.
     if num_files_delta != 0 {
         let cur = read_le64(mbuf, APFS_NUM_FILES_OFF) as i64;
         write_le64(mbuf, APFS_NUM_FILES_OFF, (cur + num_files_delta).max(0) as u64);
@@ -2130,10 +2145,40 @@ fn update_volume_superblock(
     let next_obj = unsafe { VOL_NEXT_OBJ_ID };
     write_le64(mbuf, APFS_NEXT_OBJ_ID_OFF, next_obj);
 
+    // Update block accounting: fs_alloc_count, total_blocks_alloced/freed.
+    unsafe {
+        if BLOCKS_ALLOCED_DELTA != 0 || BLOCKS_FREED_DELTA != 0 {
+            // apfs_fs_alloc_count tracks how many blocks the volume currently uses.
+            let net_delta = BLOCKS_ALLOCED_DELTA as i64 - BLOCKS_FREED_DELTA as i64;
+            let cur_alloc = read_le64(mbuf, APFS_FS_ALLOC_COUNT_OFF) as i64;
+            write_le64(mbuf, APFS_FS_ALLOC_COUNT_OFF, (cur_alloc + net_delta).max(0) as u64);
+
+            // Cumulative totals.
+            let cur_total_a = read_le64(mbuf, APFS_TOTAL_BLOCKS_ALLOCED_OFF);
+            write_le64(mbuf, APFS_TOTAL_BLOCKS_ALLOCED_OFF, cur_total_a + BLOCKS_ALLOCED_DELTA);
+            let cur_total_f = read_le64(mbuf, APFS_TOTAL_BLOCKS_FREED_OFF);
+            write_le64(mbuf, APFS_TOTAL_BLOCKS_FREED_OFF, cur_total_f + BLOCKS_FREED_DELTA);
+
+            // Reset deltas for next transaction.
+            BLOCKS_ALLOCED_DELTA = 0;
+            BLOCKS_FREED_DELTA = 0;
+        }
+    }
+
+    // Update modification time (nanoseconds since epoch).
+    // Use XID as a proxy — we don't have a real clock in userspace yet.
+    // Set to xid * 1_000_000_000 as a monotonically increasing timestamp.
+    let mod_time = read_le64(mbuf, APFS_LAST_MOD_TIME_OFF);
+    if mod_time > 0 {
+        // Advance by 1 second per transaction (synthetic but monotonic).
+        write_le64(mbuf, APFS_LAST_MOD_TIME_OFF, mod_time + 1_000_000_000);
+    }
+
     // Update o_xid.
-    let xid = unsafe { NX_NEXT_XID };
     write_le64(mbuf, 16, xid);
 
+    // Write in-place (no CoW for volume superblock in simplified implementation —
+    // the omap still points to this block, so it's always consistent).
     stamp_checksum(wva, bs);
     cache_invalidate(vol_phys_block);
     blk.write_block(vol_phys_block, bs, wva)
@@ -3333,7 +3378,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // Look up volume OID in container omap.
-    let vol_phys_block = match omap_lookup(&blk, bs, nx_sb.omap_oid, vol_oid, nx_sb.xid) {
+    // Use u64::MAX for max_xid — we don't support snapshots, always want latest version.
+    // Post-checkpoint writes may advance XID past the checkpoint's o_xid.
+    let vol_phys_block = match omap_lookup(&blk, bs, nx_sb.omap_oid, vol_oid, u64::MAX) {
         Some(b) => b,
         None => {
             syscall::debug_puts(b"  [apfs_srv] volume omap lookup failed for oid=");
@@ -3369,7 +3416,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         if attempt > 0 {
             cache_invalidate(volume.omap_oid);
         }
-        if let Some(b) = omap_lookup(&blk, bs, volume.omap_oid, volume.root_tree_oid, nx_sb.xid) {
+        if let Some(b) = omap_lookup(&blk, bs, volume.omap_oid, volume.root_tree_oid, u64::MAX) {
             fs_root_block = b;
             break;
         }
@@ -3389,7 +3436,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     unsafe {
         VOL_OMAP_PHYS = volume.omap_oid;
         FS_ROOT_BLOCK = fs_root_block;
-        MAX_XID = nx_sb.xid;
+        MAX_XID = u64::MAX; // No snapshot support; always use latest version.
         BLOCK_SIZE = bs;
         BLOCK_COUNT = nx_sb.block_count;
         NX_OMAP_PHYS = nx_sb.omap_oid;
