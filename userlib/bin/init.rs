@@ -9386,16 +9386,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
             } else {
-                // rootfs is still on legacy send/recv_msg protocol.
-                let reply = syscall::port_create();
-                let d2 = 6u64 | (reply << 32);
-                syscall::send(fs_port, FS_CREATE, n0, 0, d2, 0);
-                if let Some(resp) = syscall::recv_msg(reply) {
+                // rootfs is now on call/reply protocol too.
+                let d2 = 6u64;
+                if let Some(resp) = syscall::call(fs_port, FS_CREATE, n0, 0, d2, 0) {
                     if resp.tag == FS_CREATE_OK {
                         let handle = resp.data[0];
-                        let rd2 = 4u64 | (reply << 32);
-                        syscall::send(fs_port, FS_READ, handle, 0, rd2, 0);
-                        if let Some(rd) = syscall::recv_msg(reply) {
+                        let rd2 = 4u64;
+                        if let Some(rd) = syscall::call(fs_port, FS_READ, handle, 0, rd2, 0) {
                             if rd.tag == FS_READ_OK {
                                 syscall::debug_puts(b"    create+read pg_ctl: OK\n");
                             } else {
@@ -9406,7 +9403,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         syscall::debug_puts(b"    WARN: FS_CREATE failed (may already exist)\n");
                     }
                 }
-                syscall::port_destroy(reply);
             }
         }
 
