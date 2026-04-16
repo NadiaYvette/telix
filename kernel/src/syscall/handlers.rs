@@ -1876,7 +1876,10 @@ fn sys_mmio_map_cap(slot: u64) -> u64 {
         crate::mm::hat::map_single_mmupage(pt_root, page_va, page_pa, pte_flags);
     }
 
-    va as u64
+    // Return VA + sub-page offset so the caller sees the exact device
+    // register window (virtio-mmio regions on AArch64 virt are at 0x200
+    // intervals within a 4K page).
+    (va + region.sub_page_offset) as u64
 }
 
 /// Set EEVDF scheduling attributes for a thread.

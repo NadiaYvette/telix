@@ -44,8 +44,14 @@ impl Default for CacheAttr {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct MmioRegion {
+    /// Page-aligned physical base (used for PTE mapping).
     pub phys_base: usize,
+    /// Page-aligned size (covers `phys_base..phys_base+size`).
     pub size: usize,
+    /// Sub-page byte offset of the original (unaligned) base address.
+    /// `sys_mmio_map_cap` adds this to the VA so callers see the exact
+    /// device register window.
+    pub sub_page_offset: usize,
     pub caching: CacheAttr,
 }
 
@@ -54,6 +60,7 @@ impl MmioRegion {
         Self {
             phys_base: 0,
             size: 0,
+            sub_page_offset: 0,
             caching: CacheAttr::Device,
         }
     }
@@ -90,15 +97,21 @@ pub fn register_region(phys_base: usize, size: usize, caching: CacheAttr) -> Opt
     // Page-align both ends so PTE installation is well-defined.
     let page = crate::mm::page::MMUPAGE_SIZE;
     let base_aligned = phys_base & !(page - 1);
+    let sub_page_offset = phys_base - base_aligned;
     let end = phys_base.checked_add(size)?;
     let end_aligned = (end + page - 1) & !(page - 1);
     let size_aligned = end_aligned - base_aligned;
 
-    // Deduplicate against existing registrations.
+    // Deduplicate against existing registrations (exact unaligned base +
+    // size — two devices on the same page get distinct regions so each
+    // preserves its sub-page offset for sys_mmio_map_cap).
     let n = MMIO_TABLE.count.load(Ordering::Acquire);
     for i in 0..n {
         let r = unsafe { *MMIO_TABLE.slots[i as usize].get() };
-        if r.phys_base == base_aligned && r.size == size_aligned {
+        if r.phys_base == base_aligned
+            && r.sub_page_offset == sub_page_offset
+            && r.size == size_aligned
+        {
             return Some(i);
         }
     }
@@ -111,6 +124,7 @@ pub fn register_region(phys_base: usize, size: usize, caching: CacheAttr) -> Opt
         *MMIO_TABLE.slots[idx as usize].get() = MmioRegion {
             phys_base: base_aligned,
             size: size_aligned,
+            sub_page_offset,
             caching,
         };
     }
