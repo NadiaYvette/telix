@@ -636,6 +636,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             }
                         }
 
+                        // 5b) FS_FSYNC to exercise checkpoint commit
+                        if smoke_ok {
+                            if let Some(r) = syscall::call(apfs_port, 0x2B00, 0, 0, 0, 0) {
+                                if r.tag == 0x2B01 {
+                                    syscall::debug_puts(b"    apfs fsync: OK\n");
+                                } else {
+                                    syscall::debug_puts(b"    apfs fsync: FAIL tag=");
+                                    print_num(r.tag);
+                                    syscall::debug_puts(b"\n");
+                                    smoke_ok = false;
+                                }
+                            } else {
+                                syscall::debug_puts(b"    apfs fsync: no reply\n");
+                                smoke_ok = false;
+                            }
+                        }
+
                         // 6) Delete
                         if smoke_ok {
                             let (n0, n1, _) = pack_name(b"atest.txt");

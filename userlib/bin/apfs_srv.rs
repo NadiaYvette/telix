@@ -1011,6 +1011,14 @@ static mut VOL_NEXT_OBJ_ID: u64 = 0;
 static mut VOL_PHYS_BLOCK: u64 = 0;
 static mut NX_OMAP_PHYS: u64 = 0;
 
+// Checkpoint descriptor ring state for proper checkpoint persistence.
+static mut NX_DESC_BASE: u64 = 0;       // xp_desc_base: ring start block
+static mut NX_DESC_BLOCKS: u32 = 0;     // xp_desc_blocks: ring capacity
+static mut NX_DESC_INDEX: u32 = 0;      // xp_desc_index: current checkpoint start
+static mut NX_DESC_LEN: u32 = 0;        // xp_desc_len: blocks in current checkpoint
+static mut NX_SPACEMAN_OID: u64 = 0;    // nx_spaceman_oid: for checkpoint mapping
+static mut NX_REAPER_OID: u64 = 0;      // nx_reaper_oid: for checkpoint mapping
+
 // Volume superblock field offsets for writes.
 const APFS_NUM_FILES_OFF: usize = 0x90;       // apfs_num_files (u64) at 144
 const APFS_NUM_DIRS_OFF: usize = 0x98;        // apfs_num_directories (u64) at 152
@@ -1958,8 +1966,9 @@ fn update_parent_nchildren(
 // Checkpoint commit
 // =====================================================================
 
-/// Flush all metadata to disk: bitmap, space manager, CIB, container superblock.
+/// Flush all metadata to disk: bitmap, CIB, space manager, checkpoint ring, container superblock.
 fn checkpoint_commit(blk: &BlkClient, bs: u32, nx_buf_block: u64) -> bool {
+    syscall::debug_puts(b"  [apfs_srv] checkpoint commit...\n");
     let wva = unsafe { WRITE_VA };
 
     // 1. Flush allocation bitmap.
@@ -2012,18 +2021,72 @@ fn checkpoint_commit(blk: &BlkClient, bs: u32, nx_buf_block: u64) -> bool {
         }
     }
 
-    // 4. Update container superblock (block 0).
+    // 4. Update checkpoint descriptor ring entries (mapping block + superblock copy).
+    //    These must be written before block 0, which is the commit point.
+    let desc_base = unsafe { NX_DESC_BASE };
+    let desc_blocks = unsafe { NX_DESC_BLOCKS };
+    let desc_index = unsafe { NX_DESC_INDEX };
+    let desc_len = unsafe { NX_DESC_LEN };
+    let xid = unsafe { NX_NEXT_XID };
+    let next_oid = unsafe { NX_NEXT_OID };
+
+    if desc_base != 0 && desc_len > 0 && desc_blocks > 0 {
+        for i in 0..desc_len {
+            let slot = desc_base + ((desc_index + i) % desc_blocks) as u64;
+            if !blk.read_block(slot, bs, wva) {
+                continue;
+            }
+            let mbuf = unsafe {
+                core::slice::from_raw_parts_mut(wva as *mut u8, bs as usize)
+            };
+
+            let o_type = read_le32(mbuf, 24);
+            let obj_type = o_type & OBJECT_TYPE_MASK;
+
+            // Update o_xid in all ring entries.
+            write_le64(mbuf, 16, xid);
+
+            if obj_type == 0x0c {
+                // Checkpoint mapping block: update spaceman paddr.
+                let cpm_count = read_le32(mbuf, 36) as usize;
+                let sm_oid = unsafe { NX_SPACEMAN_OID };
+                let sm_block = unsafe { SPACEMAN_BLOCK };
+                for j in 0..cpm_count {
+                    let base = 40 + j * 40;
+                    if base + 40 > bs as usize {
+                        break;
+                    }
+                    let cpm_oid = read_le64(mbuf, base + 24);
+                    if cpm_oid == sm_oid && sm_block != 0 {
+                        write_le64(mbuf, base + 32, sm_block);
+                    }
+                }
+            } else if obj_type == OBJECT_TYPE_NX_SUPERBLOCK {
+                // Container superblock copy: update same fields as block 0.
+                write_le64(mbuf, NX_NEXT_OID_OFF, next_oid);
+                write_le64(mbuf, NX_NEXT_XID_OFF, xid + 1);
+                write_le64(mbuf, NX_OMAP_OID_OFF, unsafe { NX_OMAP_PHYS });
+            }
+
+            stamp_checksum(wva, bs);
+            cache_invalidate(slot);
+            if !blk.write_block(slot, bs, wva) {
+                // Non-fatal for ring entries.
+            }
+        }
+    }
+
+    // 5. Update container superblock (block 0) — the commit point.
     if !blk.read_block(0, bs, wva) {
         return false;
     }
     let mbuf = unsafe {
         core::slice::from_raw_parts_mut(wva as *mut u8, bs as usize)
     };
-    let xid = unsafe { NX_NEXT_XID };
-    let next_oid = unsafe { NX_NEXT_OID };
     write_le64(mbuf, 16, xid); // o_xid
     write_le64(mbuf, NX_NEXT_OID_OFF, next_oid);
     write_le64(mbuf, NX_NEXT_XID_OFF, xid + 1);
+    write_le64(mbuf, NX_OMAP_OID_OFF, unsafe { NX_OMAP_PHYS });
     stamp_checksum(wva, bs);
     cache_invalidate(0);
     if !blk.write_block(0, bs, wva) {
@@ -2032,6 +2095,10 @@ fn checkpoint_commit(blk: &BlkClient, bs: u32, nx_buf_block: u64) -> bool {
 
     // Advance XID for next transaction.
     unsafe { NX_NEXT_XID = xid + 1; }
+
+    syscall::debug_puts(b"  [apfs_srv] checkpoint committed xid=");
+    print_num(xid);
+    syscall::debug_puts(b"\n");
 
     true
 }
@@ -3358,6 +3425,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         unsafe {
             NX_NEXT_OID = read_le64(block0_full, NX_NEXT_OID_OFF);
             NX_NEXT_XID = read_le64(block0_full, NX_NEXT_XID_OFF);
+            NX_SPACEMAN_OID = read_le64(block0_full, 152); // nx_spaceman_oid
+            NX_REAPER_OID = read_le64(block0_full, 168);   // nx_reaper_oid
+            NX_DESC_BASE = nx_sb.xp_desc_base;
+            NX_DESC_BLOCKS = nx_sb.xp_desc_blocks & 0x7FFFFFFF;
+            NX_DESC_INDEX = nx_sb.xp_desc_index;
+            NX_DESC_LEN = nx_sb.xp_desc_len;
         }
     } else {
         syscall::debug_puts(b"  [apfs_srv] block0 re-read failed, using defaults\n");
