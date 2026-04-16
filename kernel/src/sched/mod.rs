@@ -15,7 +15,7 @@ pub use hotplug::{
 };
 #[allow(unused_imports)]
 pub use scheduler::{
-    alarm, arch_irq_restore, arch_irq_save_enable, block_current, boost_priority,
+    alarm, arch_irq_restore, arch_irq_save_enable, block_current, boost_priority, boost_priority_from_sender,
     clear_wakeup_flag, cosched_set, current_aspace_id, current_task_id, current_thread_id,
     dequeue_signal, get_affinity, get_monotonic_ns, get_signal_action, get_signal_mask,
     get_signal_pending, getpgid, getsid, init, is_killed, kill_task, park_current_for_sleep,

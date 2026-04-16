@@ -165,8 +165,6 @@ pub fn recv_blocking(set_id: PortSetId) -> Option<(PortId, Message)> {
                 return None;
             }
             if let Some((port_id, msg)) = table.sets.get(set_id as usize).try_recv() {
-                // Boost to sender's priority (priority inheritance).
-                crate::sched::boost_priority(my_tid, msg.data[5] as u8);
                 return Some((port_id, msg));
             }
         }
@@ -175,8 +173,8 @@ pub fn recv_blocking(set_id: PortSetId) -> Option<(PortId, Message)> {
         {
             let mut table = PORT_SET_TABLE.lock();
             // Double-check: a message may have arrived between the two locks.
-            if let Some((port_id, msg)) = table.sets.get(set_id as usize).try_recv() {
-                crate::sched::boost_priority(my_tid, msg.data[5] as u8);
+            if let Some((port_id, mut msg)) = table.sets.get(set_id as usize).try_recv() {
+                crate::sched::boost_priority_from_sender(my_tid, &mut msg.data[4]);
                 return Some((port_id, msg));
             }
             let tid = crate::sched::current_thread_id();

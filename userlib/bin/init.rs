@@ -254,8 +254,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if pipe_tid == u64::MAX {
             syscall::debug_puts(b"Phase 5f pipe_srv call/reply smoke: FAILED (spawn)\n");
         } else {
-            // Give pipe_srv time to start its recv loop.
-            for _ in 0..100u32 { syscall::yield_now(); }
+            // Wait for pipe_srv to register (proves it's in its recv loop).
+            syscall::debug_puts(b"    5f: waiting for pipe_srv...\n");
+            let _ = syscall::ns_lookup_wait(b"pipe");
+            syscall::debug_puts(b"    5f: pipe_srv ready\n");
 
             let mut ok = true;
 
@@ -263,6 +265,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let mut rh = 0u32;
             let mut wh = 0u32;
             if ok {
+                syscall::debug_puts(b"    5f: calling PIPE_CREATE\n");
                 match syscall::call(pp, 0x5010, 0, 0, 0, 0) {
                     Some(r) if r.tag == 0x5100 => {
                         rh = r.data[0] as u32;
@@ -501,28 +504,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     syscall::debug_puts(b"Phase 6 M1-M3 tests: PASSED\n");
 
-    // --- APFS write smoke test (before name server test which may hang) ---
+    // --- APFS write smoke test (only when APFS container present) ---
     syscall::debug_puts(b"  init: APFS write smoke test...\n");
     {
-        // Poll for apfs_srv to register (ns_lookup_wait would work but
-        // spin-waits at prio 254 which starves apfs_srv on single-CPU QEMU).
-        let apfs_port_opt = {
-            let mut found: Option<u64> = None;
-            for _ in 0..500_000u32 {
-                if let Some(p) = syscall::ns_lookup(b"apfs") {
-                    found = Some(p);
-                    break;
-                }
-                syscall::yield_now();
-            }
-            found
-        };
+        // Give apfs_srv time to start and register (or exit).
+        for _ in 0..50 { syscall::yield_now(); }
+        let apfs_port_opt: Option<u64> = syscall::ns_lookup(b"apfs");
         if let Some(p) = apfs_port_opt {
             syscall::debug_puts(b"  init: found apfs port=");
             print_num(p);
             syscall::debug_puts(b"\n");
         } else {
-            syscall::debug_puts(b"  init: apfs not found after retries\n");
+            syscall::debug_puts(b"  init: apfs not registered, skipping\n");
         }
 
         if let Some(apfs_port) = apfs_port_opt {
@@ -4360,10 +4353,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 // Step 4: Close
+                syscall::debug_puts(b"    xfs close...\n");
                 let _ = syscall::call(xfs_port, 0x2400, handle, 0, 0, 0);
+                syscall::debug_puts(b"    xfs close done\n");
             }
 
             // Step 5: Open subdir/nested.txt via FS_OPEN_LONG
+            // Protocol: grant path page to FS server's VFS_LONG_PATH_SCRATCH_VA (0x5_0000_0000),
+            // then send FS_OPEN_LONG with data[0] = name_len(low16) | flags(high16).
             {
                 let path = b"subdir/nested.txt";
                 let path_page = syscall::mmap_anon(0, 1, 1);
@@ -4376,9 +4373,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         core::ptr::write(dst.add(path.len()), 0);
                     }
                     if let Some(xfs_aspace) = syscall::ns_lookup(b"xfs_task") {
-                        let grant_dst: usize = 0x8_0000_0000;
+                        // Grant to xfs_srv's VFS_LONG_PATH_SCRATCH_VA
+                        let grant_dst: usize = 0x5_0000_0000;
+                        syscall::debug_puts(b"    xfs grant_pages...\n");
                         if syscall::grant_pages(xfs_aspace, va, grant_dst, 1, false) {
-                            if let Some(reply) = syscall::call(xfs_port, 0x2002, grant_dst as u64, 0, path.len() as u64, 0) {
+                            syscall::debug_puts(b"    xfs FS_OPEN_LONG call...\n");
+                            // data[0] = name_len(16) | flags(16), matching FS_OPEN_LONG wire format
+                            let d0 = path.len() as u64;
+                            if let Some(reply) = syscall::call(xfs_port, 0x2002, d0, 0, 0, 0) {
                                 if reply.tag == 0x2001 {
                                     let h2 = reply.data[0];
                                     let sz2 = reply.data[1];
@@ -5697,17 +5699,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             phase49_ok = false;
         }
 
+        let mut child_reaped = false;
         if phase49_ok {
-            // The child's task_id is what we need. Since the kernel returns
-            // the first thread ID, and thread.task_id gives us the task,
-            // wait4 works with task IDs. We need to figure out the task ID.
-            // For spawned processes, the task_id is typically the thread's task_id.
-            // Let's use wait4(-1, 0) to wait for any child exit.
             // First try WNOHANG — the child may or may not have exited yet.
             let nh = syscall::wait4(-1, syscall::WNOHANG);
             match nh {
                 None => {
-                    // ECHILD — shouldn't happen, we have children.
                     syscall::debug_puts(b"  FAIL: wait4(-1, WNOHANG) returned ECHILD\n");
                     phase49_ok = false;
                 }
@@ -5715,18 +5712,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // No child exited yet — expected, try blocking wait.
                 }
                 Some((pid, status)) => {
-                    // A child already exited. Check status.
+                    // A child already exited.
                     if !syscall::wifexited(status) {
                         syscall::debug_puts(b"  FAIL: child did not exit normally\n");
                         phase49_ok = false;
                     }
-                    let _ = pid; // OK
+                    let _ = pid;
+                    child_reaped = true;
                 }
             }
         }
 
-        if phase49_ok {
-            // Test 3: Blocking wait4(-1, 0) — should return when the hello child exits.
+        if phase49_ok && !child_reaped {
+            // Blocking wait4(-1, 0) — should return when the hello child exits.
             let result = syscall::wait4(-1, 0);
             match result {
                 None => {
@@ -5742,7 +5740,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         phase49_ok = false;
                     } else {
                         let code = syscall::wexitstatus(status);
-                        let _ = code; // hello exits with 0
+                        let _ = code;
                     }
                 }
             }
@@ -7767,20 +7765,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         };
 
+        syscall::debug_puts(b"  p60: pipe ok\n");
         // 2. poll read end with no data, timeout=0 → should return 0 ready FDs.
         if phase60_ok {
+            syscall::debug_puts(b"  p60: before poll\n");
             let mut fds = [userlib::poll::PollFd {
                 fd: read_fd,
                 events: userlib::poll::POLLIN,
                 revents: 0,
             }];
             let n = userlib::poll::poll(&mut fds, 0);
+            syscall::debug_puts(b"  p60: after poll\n");
             if n != 0 || fds[0].revents != 0 {
                 syscall::debug_puts(b"  FAIL: poll empty pipe returned ready\n");
                 phase60_ok = false;
             }
         }
 
+        syscall::debug_puts(b"  p60: poll1 ok\n");
         // 3. Write data, poll read end → should return POLLIN.
         if phase60_ok {
             userlib::pipe::pipe_write_fd(write_fd, b"polltest");
@@ -7796,6 +7798,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         }
 
+        syscall::debug_puts(b"  p60: poll2 ok\n");
         // 4. poll write end → should return POLLOUT (buffer has space).
         if phase60_ok {
             let mut fds = [userlib::poll::PollFd {
@@ -7810,12 +7813,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         }
 
+        syscall::debug_puts(b"  p60: poll3 ok\n");
         // 5. Close write end, drain remaining data, poll read end → should get POLLHUP.
         if phase60_ok {
             userlib::pipe::pipe_close_fd(write_fd);
-            // Drain remaining data (writer closed, so read won't block forever).
+            // Drain remaining data (writer closed, so read should return 0/EOF).
             let mut buf = [0u8; 32];
-            while userlib::pipe::pipe_read_fd(read_fd, &mut buf) > 0 {}
+            for _ in 0..10u32 {
+                if userlib::pipe::pipe_read_fd(read_fd, &mut buf) <= 0 {
+                    break;
+                }
+            }
             let mut fds = [userlib::poll::PollFd {
                 fd: read_fd,
                 events: userlib::poll::POLLIN,
@@ -8737,98 +8745,74 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
             if phase68_ok {
                 // Test 1: eventfd — create, write 5, read → expect 5.
-                let reply = syscall::port_create();
-                let d2 = reply << 32; // flags=0, reply in high32
-                syscall::send(event_port, 0x7000, 0, 0, d2, 0); // EVT_EVENTFD=0, initval=0
-                let msg = syscall::recv_msg(reply).unwrap();
-                let efd_port = msg.data[0];
-                let efd_handle = msg.data[1] as u32;
+                // event_srv uses recv_with_cap + reply(), so use call().
+                let cmsg = syscall::call(event_port, 0x7000, 0, 0, 0, 0);
+                let (efd_port, efd_handle) = match cmsg {
+                    Some(ref m) if m.tag == 0x7100 => (m.data[0], m.data[1] as u32),
+                    _ => {
+                        syscall::debug_puts(b"    FAIL: eventfd create\n");
+                        phase68_ok = false;
+                        (0, 0)
+                    }
+                };
 
-                if msg.tag != 0x7100 {
-                    syscall::debug_puts(b"    FAIL: eventfd create\n");
-                    phase68_ok = false;
-                } else {
+                if phase68_ok {
                     // Write 5 to eventfd.
-                    let reply2 = syscall::port_create();
-                    let d2w = reply2 << 32;
-                    syscall::send(efd_port, 0x7020, efd_handle as u64, 5, d2w, 0);
-                    let wmsg = syscall::recv_msg(reply2).unwrap();
-                    syscall::port_destroy(reply2);
-
-                    if wmsg.tag != 0x7100 {
+                    let wmsg = syscall::call(efd_port, 0x7020, efd_handle as u64, 5, 0, 0);
+                    if wmsg.map_or(true, |m| m.tag != 0x7100) {
                         syscall::debug_puts(b"    FAIL: eventfd write\n");
                         phase68_ok = false;
                     }
 
                     // Read from eventfd.
-                    let reply3 = syscall::port_create();
-                    let d2r = reply3 << 32;
-                    syscall::send(efd_port, 0x7010, efd_handle as u64, 0, d2r, 0);
-                    let rmsg = syscall::recv_msg(reply3).unwrap();
-                    syscall::port_destroy(reply3);
-
-                    if rmsg.tag != 0x7100 || rmsg.data[0] != 5 {
-                        syscall::debug_puts(b"    FAIL: eventfd read != 5\n");
-                        phase68_ok = false;
+                    if phase68_ok {
+                        let rmsg = syscall::call(efd_port, 0x7010, efd_handle as u64, 0, 0, 0);
+                        match rmsg {
+                            Some(m) if m.tag == 0x7100 && m.data[0] == 5 => {}
+                            _ => {
+                                syscall::debug_puts(b"    FAIL: eventfd read != 5\n");
+                                phase68_ok = false;
+                            }
+                        }
                     }
 
                     // Close eventfd.
-                    let reply4 = syscall::port_create();
-                    let d2c = reply4 << 32;
-                    syscall::send(efd_port, 0x7030, efd_handle as u64, 0, d2c, 0);
-                    let _cmsg = syscall::recv_msg(reply4);
-                    syscall::port_destroy(reply4);
+                    let _ = syscall::call(efd_port, 0x7030, efd_handle as u64, 0, 0, 0);
                 }
 
-                // Test 2: timerfd — create, set 10ms timer, busy wait, read.
-                let reply5 = syscall::port_create();
-                // d0=type(2=timerfd), d1=initval(0), d2=flags(low32)|reply(high32)
-                syscall::send(event_port, 0x7000, 2, 0, reply5 << 32, 0);
-                let tmsg = syscall::recv_msg(reply5).unwrap();
-                syscall::port_destroy(reply5);
+                // Test 2: timerfd — create, set 50ms timer, wait 100ms, read.
+                if phase68_ok {
+                    let tmsg = syscall::call(event_port, 0x7000, 2, 0, 0, 0);
+                    match tmsg {
+                        Some(m) if m.tag == 0x7100 => {
+                            let tfd_port = m.data[0];
+                            let tfd_handle = m.data[1] as u32;
 
-                if tmsg.tag != 0x7100 {
-                    syscall::debug_puts(b"    FAIL: timerfd create\n");
-                    phase68_ok = false;
-                } else {
-                    let tfd_port = tmsg.data[0];
-                    let tfd_handle = tmsg.data[1] as u32;
+                            // Set timer to 50ms (50_000_000 ns).
+                            let _ = syscall::call(tfd_port, 0x7040, tfd_handle as u64, 50_000_000, 0, 0);
 
-                    // Set timer to 50ms (50_000_000 ns).
-                    let reply6 = syscall::port_create();
-                    syscall::send(
-                        tfd_port,
-                        0x7040,
-                        tfd_handle as u64,
-                        50_000_000,
-                        reply6 << 32,
-                        0,
-                    );
-                    let _smsg = syscall::recv_msg(reply6);
-                    syscall::port_destroy(reply6);
+                            // Wait ~100ms.
+                            syscall::nanosleep(100_000_000);
 
-                    // Wait ~100ms.
-                    syscall::nanosleep(100_000_000);
+                            // Read timerfd — should have at least 1 expiration.
+                            let trmsg = syscall::call(tfd_port, 0x7010, tfd_handle as u64, 0, 0, 0);
+                            match trmsg {
+                                Some(m2) if m2.tag == 0x7100 && m2.data[0] > 0 => {}
+                                _ => {
+                                    syscall::debug_puts(b"    FAIL: timerfd read expirations == 0\n");
+                                    phase68_ok = false;
+                                }
+                            }
 
-                    // Read timerfd — should have at least 1 expiration.
-                    let reply7 = syscall::port_create();
-                    syscall::send(tfd_port, 0x7010, tfd_handle as u64, 0, reply7 << 32, 0);
-                    let trmsg = syscall::recv_msg(reply7).unwrap();
-                    syscall::port_destroy(reply7);
-
-                    if trmsg.tag != 0x7100 || trmsg.data[0] == 0 {
-                        syscall::debug_puts(b"    FAIL: timerfd read expirations == 0\n");
-                        phase68_ok = false;
+                            // Close timerfd.
+                            let _ = syscall::call(tfd_port, 0x7030, tfd_handle as u64, 0, 0, 0);
+                        }
+                        _ => {
+                            syscall::debug_puts(b"    FAIL: timerfd create\n");
+                            phase68_ok = false;
+                        }
                     }
-
-                    // Close timerfd.
-                    let reply8 = syscall::port_create();
-                    syscall::send(tfd_port, 0x7030, tfd_handle as u64, 0, reply8 << 32, 0);
-                    let _cmsg2 = syscall::recv_msg(reply8);
-                    syscall::port_destroy(reply8);
                 }
-
-                syscall::port_destroy(reply);
             }
         }
 

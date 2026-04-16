@@ -43,20 +43,12 @@ fn poll_check_fd(entry: &fd::FdEntry, events: u16) -> u16 {
             rev
         }
         FdType::Pipe => {
-            let reply_port = syscall::port_create();
-            let d2 = (events as u64) | ((reply_port as u64) << 32);
-            syscall::send(entry.port, PIPE_POLL, entry.handle as u64, 0, d2, 0);
-            let rev = if let Some(msg) = syscall::recv_msg(reply_port) {
-                if msg.tag == PIPE_OK {
-                    msg.data[0] as u16
-                } else {
-                    POLLERR
-                }
-            } else {
-                POLLERR
-            };
-            syscall::port_destroy(reply_port);
-            rev
+            // Use call/reply so pipe_srv can respond via reply().
+            syscall::debug_puts(b"  [poll] pipe call\n");
+            match syscall::call(entry.port, PIPE_POLL, entry.handle as u64, 0, events as u64, 0) {
+                Some(msg) if msg.tag == PIPE_OK => msg.data[0] as u16,
+                _ => POLLERR,
+            }
         }
         FdType::Socket => {
             let reply_port = syscall::port_create();

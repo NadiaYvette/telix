@@ -277,6 +277,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             PIPE_POLL => {
+                syscall::debug_puts(b"  [pipe] POLL recv\n");
                 let handle = msg.data[0] as u32;
                 let events = (msg.data[2] & 0xFFFF) as u16;
                 let is_write = handle & 1 != 0;
@@ -307,7 +308,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         revents |= 0x0010; // POLLHUP
                     }
                 }
-                let _ = syscall::reply(PIPE_OK, revents as u64, 0, 0, 0, 0);
+                let rc = syscall::reply(PIPE_OK, revents as u64, 0, 0, 0, 0);
+                syscall::debug_puts(b"  [pipe] POLL reply rc=");
+                if rc == 0 { syscall::debug_puts(b"0\n"); } else { syscall::debug_puts(b"ERR\n"); }
             }
 
             _ => {

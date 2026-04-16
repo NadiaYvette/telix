@@ -147,17 +147,22 @@ pub const FRAME_SIZE_U64: usize = 22;
 pub const EXCEPTION_FRAME_SIZE: usize = FRAME_SIZE_U64 * 8; // 176 bytes
 
 /// Validate the iretq frame at `sp` before returning to assembly.
+/// If the frame is bad but `sp == fallback_sp` (no context switch happened),
+/// we have no safe recovery — halt. If a switch did happen, mark the target
+/// killed and return fallback_sp.
 #[inline]
-fn validate_iretq_frame(sp: u64, vector: u64) -> u64 {
+fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
     let f = unsafe { &*(sp as *const ExceptionFrame) };
     let cs = f.cs();
     let ss = f.ss();
-    if cs != 0x08 && cs != 0x23 {
+    let bad_cs = cs != 0x08 && cs != 0x23;
+    let bad_ss = ss != 0x00 && ss != 0x10 && ss != 0x1B;
+    if bad_cs || bad_ss {
         let tid = crate::sched::scheduler::current_thread_id();
         let tref = crate::sched::scheduler::thread_ref(tid);
         let cur_cpu = crate::sched::smp::cpu_id();
         crate::println!(
-            "BAD CS={:#x} SS={:#x} RIP={:#x} vec={} tid={} sp={:#x} src={} last_cpu={} cur_cpu={}",
+            "BAD frame: CS={:#x} SS={:#x} RIP={:#x} vec={} tid={} sp={:#x} src={} last_cpu={} cur_cpu={}",
             cs, ss, f.rip(), vector, tid, sp,
             tref.saved_sp_source,
             tref.last_cpu.load(core::sync::atomic::Ordering::Relaxed),
@@ -167,21 +172,11 @@ fn validate_iretq_frame(sp: u64, vector: u64) -> u64 {
             "  saved_sp={:#x} syscall_frame_sp={:#x} stack_base={:#x}",
             tref.saved_sp, tref.syscall_frame_sp, tref.stack_base
         );
-        loop { core::hint::spin_loop(); }
-    }
-    if ss != 0x00 && ss != 0x10 && ss != 0x1B {
-        let tid = crate::sched::scheduler::current_thread_id();
-        let tref = crate::sched::scheduler::thread_ref(tid);
-        crate::println!(
-            "BAD SS={:#x} CS={:#x} RIP={:#x} vec={} tid={} sp={:#x} src={} last_cpu={}",
-            ss, cs, f.rip(), vector, tid, sp,
-            tref.saved_sp_source,
-            tref.last_cpu.load(core::sync::atomic::Ordering::Relaxed)
-        );
-        crate::println!(
-            "  saved_sp={:#x} syscall_frame_sp={:#x} stack_base={:#x}",
-            tref.saved_sp, tref.syscall_frame_sp, tref.stack_base
-        );
+        // Mark the current thread (the one with corrupt state) as killed
+        // so the scheduler won't re-enqueue it on the next tick.
+        tref.killed.store(true, core::sync::atomic::Ordering::Release);
+        // Enable interrupts so timer can switch us off this thread.
+        crate::arch::irq::enable();
         loop { core::hint::spin_loop(); }
     }
     sp
@@ -224,7 +219,7 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                     crate::sched::scheduler::check_preempt_on_return();
                     let pending = crate::sched::scheduler::take_pending_switch();
                     if pending != 0 {
-                        return pending;
+                        return validate_iretq_frame(pending, frame_sp, 6);
                     }
                     return frame_sp;
                 }
@@ -250,7 +245,7 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             super::timer::handle_timer_irq();
             super::lapic::eoi();
             super::pic::send_eoi(0);
-            return validate_iretq_frame(crate::sched::tick(frame_sp), 32);
+            return validate_iretq_frame(crate::sched::tick(frame_sp), frame_sp, 32);
         }
 
         // Syscall via int 0x80.
@@ -262,9 +257,9 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             crate::sched::scheduler::check_preempt_on_return();
             let pending = crate::sched::scheduler::take_pending_switch();
             if pending != 0 {
-                return validate_iretq_frame(pending, 0x80);
+                return validate_iretq_frame(pending, frame_sp, 0x80);
             }
-            return validate_iretq_frame(frame_sp, 0x80);
+            return validate_iretq_frame(frame_sp, frame_sp, 0x80);
         }
 
         // Reschedule IPI (vector 0xFD). Sent by a remote CPU when it
@@ -272,7 +267,7 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         // runs try_switch() — no tick accounting, no timer reprogramming.
         0xFD => {
             super::lapic::eoi();
-            return validate_iretq_frame(crate::sched::scheduler::reschedule_ipi(frame_sp), 0xFD);
+            return validate_iretq_frame(crate::sched::scheduler::reschedule_ipi(frame_sp), frame_sp, 0xFD);
         }
 
         // Other IRQs (33-47).
@@ -289,7 +284,7 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         }
     }
 
-    validate_iretq_frame(frame_sp, vector)
+    validate_iretq_frame(frame_sp, frame_sp, vector)
 }
 
 fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
@@ -389,7 +384,15 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
         // Signal number: SIGILL(4) for #UD, SIGSEGV(11) for #GP/#SS, etc.
         crate::sched::scheduler::exit_current_thread(-11);
     }
-    // Kernel fault: halt this CPU (fatal).
+    // Mark the current thread as killed so the scheduler won't re-run it,
+    // then spin with interrupts enabled so the timer can switch us off.
+    let tid = crate::sched::scheduler::current_thread_id();
+    if tid != 0 {
+        crate::sched::scheduler::thread_ref(tid)
+            .killed
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+    crate::arch::irq::enable();
     loop {
         core::hint::spin_loop();
     }

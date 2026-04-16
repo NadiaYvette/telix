@@ -679,8 +679,8 @@ fn wake_recv_waiter(port_id: PortId) {
 /// Send a message to a port (non-blocking).
 /// Returns Ok(()) on success, Err(msg) if the queue is full.
 pub fn send_nb(port_id: PortId, mut msg: Message) -> Result<(), Message> {
-    let tid = crate::sched::current_thread_id();
-    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
+    // Priority inheritance for DirectTransfer is handled in sys_send/sys_call
+    // handlers (direct boost_priority call). Queued messages don't need PI.
     let port = match port_ref(port_id) {
         Some(p) => p,
         None => return Err(msg),
@@ -726,7 +726,8 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
     use crate::sync::turnstile::KEY_PORT_SEND;
 
     let tid = crate::sched::current_thread_id();
-    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
+    // Priority inheritance for DirectTransfer is handled in sys_send/sys_call
+    // handlers (direct boost_priority call). Queued messages don't need PI.
     crate::sched::stats::IPC_SENDS.fetch_add(1, Ordering::Relaxed);
 
     // Check for kernel handler.
@@ -780,8 +781,8 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
 pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
     use crate::sync::turnstile::KEY_PORT_RECV_PARK;
 
-    let tid = crate::sched::current_thread_id();
-    msg.data[5] = crate::sched::thread_effective_priority(tid) as u64;
+    // Priority inheritance for DirectTransfer is handled in sys_send/sys_call
+    // handlers (direct boost_priority call). Queued messages don't need PI.
     crate::sched::stats::IPC_SENDS.fetch_add(1, Ordering::Relaxed);
     crate::trace::trace_event(crate::trace::EVT_IPC_SEND, port_id as u32, 0);
 
@@ -878,7 +879,6 @@ pub fn recv(port_id: PortId) -> Result<Message, ()> {
         if let Some(msg) = q.recv() {
             // Wake a blocked sender.
             crate::sync::turnstile::port_wake_one(port_id, KEY_PORT_SEND);
-            crate::sched::boost_priority(my_tid, msg.data[5] as u8);
 
             return Ok(msg);
         }
@@ -934,7 +934,6 @@ pub fn recv_or_park(port_id: PortId) -> Result<Message, ()> {
     if let Some(msg) = q.recv() {
         crate::sync::turnstile::port_wake_one(port_id, KEY_PORT_SEND);
         crate::sched::stats::IPC_RECVS.fetch_add(1, Ordering::Relaxed);
-        crate::sched::boost_priority(my_tid, msg.data[5] as u8);
         return Ok(msg);
     }
 
@@ -973,7 +972,6 @@ pub fn recv_or_park(port_id: PortId) -> Result<Message, ()> {
         if let Some(msg) = q.recv() {
             crate::sync::turnstile::port_wake_one(port_id, KEY_PORT_SEND);
             crate::sched::stats::IPC_RECVS.fetch_add(1, Ordering::Relaxed);
-            crate::sched::boost_priority(my_tid, msg.data[5] as u8);
             Ok(msg)
         } else {
             // Lost message: port_enqueue_with_check said non-empty, but q.recv() returned None.

@@ -608,7 +608,20 @@ pub(crate) fn deliver_to_parked_receiver(receiver_tid: u32, msg: &crate::ipc::Me
     let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
     auto_grant_sender_identity(receiver_task, msg.data[4]);
     auto_grant_reply_caps(receiver_task, msg);
-    crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
+    // For call/reply messages (data[5] is reply-cap handle), boost the receiver
+    // to the caller's priority via the reply-cap.  This handles the case where
+    // the message was queued and a parked receiver is woken by wake_recv_waiter.
+    let handle = msg.data[5];
+    if handle != 0 {
+        if let Some(cap) = crate::ipc::call_reply::lookup(handle) {
+            let caller_tid = cap.caller_tid.load(core::sync::atomic::Ordering::Acquire);
+            if caller_tid != 0 {
+                let caller_prio =
+                    crate::sched::scheduler::thread_ref(caller_tid).effective_priority;
+                crate::sched::boost_priority(receiver_tid, caller_prio);
+            }
+        }
+    }
 }
 
 /// Check if the current task has a port capability with the needed rights.
@@ -778,16 +791,19 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
     let mut msg = crate::ipc::Message::new(tag, data);
     // Stamp sender identity: data[4] = sender's task port_id.
     let sender_task = crate::sched::current_task_id();
+    let sender_tid = crate::sched::current_thread_id();
+    let sender_prio = crate::sched::thread_effective_priority(sender_tid);
     msg.data[4] = crate::sched::task_port_id(sender_task);
 
     match crate::ipc::port::send_direct(port_id, &mut msg) {
         crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
             // L4-style direct handoff: inject message and switch to receiver.
+            // Boost receiver to sender's priority (priority inheritance).
+            crate::sched::boost_priority(receiver_tid, sender_prio);
             let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
             auto_grant_sender_identity(receiver_task, msg.data[4]);
             auto_grant_reply_caps(receiver_task, &msg);
             inject_recv_into_frame(receiver_tid, &msg);
-            crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
             // CAS park_state COMMITTED → NONE: receiver is off-CPU, handoff.
             // If it's still ENQUEUED (hasn't called park_current_for_ipc yet),
             // CAS ENQUEUED → NONE so it skips the park. Message is already in
@@ -838,16 +854,19 @@ fn sys_send_nb(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
     let mut msg = crate::ipc::Message::new(tag, data);
     // Stamp sender identity: data[4] = sender's task port_id.
     let sender_task = crate::sched::current_task_id();
+    let sender_tid = crate::sched::current_thread_id();
+    let sender_prio = crate::sched::thread_effective_priority(sender_tid);
     msg.data[4] = crate::sched::task_port_id(sender_task);
 
     match crate::ipc::port::send_direct(port_id, &mut msg) {
         crate::ipc::port::SendDirectResult::DirectTransfer(receiver_tid) => {
             // Direct transfer: inject message into parked receiver's frame and wake.
+            // Boost receiver to sender's priority (priority inheritance).
+            crate::sched::boost_priority(receiver_tid, sender_prio);
             let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
             auto_grant_sender_identity(receiver_task, msg.data[4]);
             auto_grant_reply_caps(receiver_task, &msg);
             inject_recv_into_frame(receiver_tid, &msg);
-            crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
             crate::sched::scheduler::wake_parked_thread(receiver_tid);
             0
         }
@@ -1068,8 +1087,8 @@ fn sys_call(
     // park_state=NONE and the reply would never wake us.
     crate::sched::scheduler::pre_save_frame(caller_tid);
 
-    // Build the outgoing message. data[4] is sender task port (stamped like
-    // sys_send), data[5] carries the reply-cap handle.
+    // Build the outgoing message. data[4] is sender task port, data[5]
+    // carries the reply-cap handle.
     let sender_task = crate::sched::current_task_id();
     let mut msg = crate::ipc::Message::new(
         tag,
@@ -3147,7 +3166,7 @@ fn sys_send_cap(
             let recv_task = crate::sched::scheduler::thread_task_id(receiver_tid);
             auto_grant_reply_caps(recv_task, &msg);
             inject_recv_into_frame(receiver_tid, &msg);
-            crate::sched::boost_priority(receiver_tid, msg.data[5] as u8);
+            // No priority boost here — data[4] holds rights bits, not sender port.
             let tref = crate::sched::scheduler::thread_ref(receiver_tid);
             if tref.park_state.compare_exchange(
                 crate::sched::scheduler::PARK_COMMITTED,

@@ -2170,12 +2170,15 @@ fn try_switch(current_sp: u64) -> u64 {
     // previous timeslice are now dead.  Process deferred frees.
     crate::sync::rcu::rcu_quiescent();
 
-    // Sanity check: saved_sp must be within the thread's kstack.
+    // Sanity check: saved_sp must be within the thread's kstack, and the
+    // CS/RIP fields in the exception frame must be valid.
     {
         let sp = next_t.saved_sp;
         let kbase = next_t.stack_base;
         let kend = kbase as u64 + kstack_size() as u64;
-        if kbase != 0 && (sp < kbase as u64 || sp >= kend) {
+        // Note: kbase==0 can be legitimate for early threads (e.g. kernel init thread)
+        // so we only log, never kill based on kbase alone.
+        if sp < kbase as u64 || sp >= kend {
             crate::println!(
                 "BUG: try_switch: tid={} saved_sp={:#x} OUTSIDE kstack {:#x}..{:#x} (source={})",
                 next_id, sp, kbase, kend, next_t.saved_sp_source
@@ -2184,6 +2187,25 @@ fn try_switch(current_sp: u64) -> u64 {
                 "  prev={} next={} task={} state={:?}",
                 prev_id, next_id, next_t.task_id, next_t.state
             );
+        }
+        // Check for corrupt exception frame (CS must be 0x08/0x23, RIP must be valid).
+        if kbase != 0 && sp >= kbase as u64 && sp < kend {
+            let rip = unsafe { *((sp as usize + 136) as *const u64) };
+            let cs = unsafe { *((sp as usize + 144) as *const u64) };
+            let bad_cs = cs != 0x08 && cs != 0x23;
+            let bad_rip = rip < 0x10000; // no code below 64K in kernel or user
+            if bad_cs || bad_rip {
+                crate::println!(
+                    "BUG: try_switch: tid={} bad frame RIP={:#x} CS={:#x} sp={:#x} src={} prev={} task={}",
+                    next_id, rip, cs, sp, next_t.saved_sp_source, prev_id, next_t.task_id
+                );
+                // Skip this thread — mark killed and pick idle instead.
+                thread_ref(next_id).killed.store(true, Ordering::Release);
+                let idle_sp = thread_ref(idle_id).saved_sp;
+                unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
+                pcpu.current_thread.store(idle_id, Ordering::Relaxed);
+                return idle_sp;
+            }
         }
     }
     next_t.saved_sp
@@ -4124,6 +4146,22 @@ pub fn thread_effective_priority(tid: ThreadId) -> u8 {
     } else {
         255
     }
+}
+
+/// Boost receiver's priority from the sender (no-op for queued messages).
+///
+/// Priority inheritance for IPC is handled via two mechanisms:
+/// 1. call/reply: the reply-cap mechanism in recv_with_cap does
+///    donate_priority from the caller's thread — this is authoritative.
+/// 2. DirectTransfer (send): the sys_send/sys_send_nb handlers call
+///    boost_priority directly with the sender's effective priority when
+///    a parked receiver is found.
+///
+/// For queued messages there is no synchronous relationship between
+/// sender and receiver, so no priority inheritance is needed.
+#[inline(always)]
+pub fn boost_priority_from_sender(_receiver_tid: ThreadId, _data4: &mut u64) {
+    // Intentional no-op — see doc comment above.
 }
 
 // --- L4-style handoff scheduling ---

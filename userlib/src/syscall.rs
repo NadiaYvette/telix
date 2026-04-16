@@ -2196,17 +2196,19 @@ pub fn call(dest_port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) -> Opt
     unsafe {
         let s: u64;
         core::arch::asm!(
+            "push rbx",
             "syscall",
+            "mov {r7}, rbx",
+            "pop rbx",
+            r7 = lateout(reg) r7,
             inlateout("rax") SYS_CALL => s,
-            inlateout("rdi") dest_port => _,
-            inlateout("rsi") tag => r1,
-            inlateout("rdx") d0 => r2,
-            inlateout("r10") d1 => r3,
-            inlateout("r8") d2 => r4,
-            inlateout("r9") d3 => r5,
+            inlateout("rdi") dest_port => r1,
+            inlateout("rsi") tag => r2,
+            inlateout("rdx") d0 => r3,
+            inlateout("r10") d1 => r4,
+            inlateout("r8") d2 => r5,
+            inlateout("r9") d3 => r6,
             lateout("rcx") _, lateout("r11") _,
-            lateout("r12") r6,
-            lateout("r13") r7,
         );
         status = s;
     }
@@ -2261,17 +2263,19 @@ pub fn recv_with_cap(port: u64) -> Option<Message> {
     unsafe {
         let s: u64;
         core::arch::asm!(
+            "push rbx",
             "syscall",
+            "mov {r7}, rbx",
+            "pop rbx",
+            r7 = lateout(reg) r7,
             inlateout("rax") SYS_RECV_WITH_CAP => s,
-            inlateout("rdi") port => _,
-            lateout("rsi") r1,
-            lateout("rdx") r2,
-            lateout("r10") r3,
-            lateout("r8") r4,
-            lateout("r9") r5,
+            inlateout("rdi") port => r1,
+            lateout("rsi") r2,
+            lateout("rdx") r3,
+            lateout("r10") r4,
+            lateout("r8") r5,
+            lateout("r9") r6,
             lateout("rcx") _, lateout("r11") _,
-            lateout("r12") r6,
-            lateout("r13") r7,
         );
         status = s;
     }
@@ -2325,17 +2329,19 @@ pub fn recv_with_cap_nb(port: u64) -> Option<Message> {
     unsafe {
         let s: u64;
         core::arch::asm!(
+            "push rbx",
             "syscall",
+            "mov {r7}, rbx",
+            "pop rbx",
+            r7 = lateout(reg) r7,
             inlateout("rax") SYS_RECV_WITH_CAP_NB => s,
-            inlateout("rdi") port => _,
-            lateout("rsi") r1,
-            lateout("rdx") r2,
-            lateout("r10") r3,
-            lateout("r8") r4,
-            lateout("r9") r5,
+            inlateout("rdi") port => r1,
+            lateout("rsi") r2,
+            lateout("rdx") r3,
+            lateout("r10") r4,
+            lateout("r8") r5,
+            lateout("r9") r6,
             lateout("rcx") _, lateout("r11") _,
-            lateout("r12") r6,
-            lateout("r13") r7,
         );
         status = s;
     }
