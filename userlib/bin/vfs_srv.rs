@@ -120,8 +120,7 @@ const MAX_LONG_PATH: usize = 4096;
 
 /// Lazily-allocated VA of VFS's own scratch page (the page granted to FS servers).
 static mut VFS_SCRATCH_VA: usize = 0;
-/// Cached reply port for forward_fs_long (avoids per-request port_create/destroy).
-static mut VFS_FWD_REPLY_PORT: u64 = 0;
+// (VFS_FWD_REPLY_PORT removed — call/reply IPC replaces per-request ports.)
 
 fn ensure_vfs_scratch() -> usize {
     unsafe {
@@ -391,14 +390,11 @@ fn relative_path<'a>(
 /// data[2] = path_len(16) | reply_port(32 in upper), data[3] = fs_port.
 fn handle_mount(data: &[u64; 6]) {
     let path_len = (data[2] & 0xFFFF) as usize;
-    let reply_port = data[2] >> 32;
     let fs_port = data[3];
     let (path, plen) = unpack_path(data[0], data[1], path_len);
 
     if plen == 0 || plen > MAX_PATH || fs_port == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
 
@@ -416,9 +412,7 @@ fn handle_mount(data: &[u64; 6]) {
             }
             if same {
                 mounts[i].fs_port = fs_port;
-                if reply_port != 0 {
-                    syscall::send(reply_port, VFS_OK, 0, 0, 0, 0);
-                }
+                let _ = syscall::reply(VFS_OK, 0, 0, 0, 0, 0);
                 return;
             }
         }
@@ -431,22 +425,17 @@ fn handle_mount(data: &[u64; 6]) {
             mounts[i].prefix_len = plen;
             mounts[i].fs_port = fs_port;
             mounts[i].active = true;
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_OK, 0, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_OK, 0, 0, 0, 0, 0);
             return;
         }
     }
 
-    if reply_port != 0 {
-        syscall::send(reply_port, VFS_ERROR, ERR_FULL, 0, 0, 0);
-    }
+    let _ = syscall::reply(VFS_ERROR, ERR_FULL, 0, 0, 0, 0);
 }
 
 /// Handle VFS_UNMOUNT: remove a mount entry.
 fn handle_unmount(data: &[u64; 6]) {
     let path_len = (data[2] & 0xFFFF) as usize;
-    let reply_port = data[2] >> 32;
     let (path, plen) = unpack_path(data[0], data[1], path_len);
 
     let mounts = unsafe { &mut *core::ptr::addr_of_mut!(MOUNTS) };
@@ -466,15 +455,11 @@ fn handle_unmount(data: &[u64; 6]) {
         }
         if same {
             mounts[i].active = false;
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_OK, 0, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_OK, 0, 0, 0, 0, 0);
             return;
         }
     }
-    if reply_port != 0 {
-        syscall::send(reply_port, VFS_ERROR, ERR_NOT_FOUND, 0, 0, 0);
-    }
+    let _ = syscall::reply(VFS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
 }
 
 /// Read a long path written into LIN_SCRATCH_VA by a personality client.
@@ -674,33 +659,29 @@ fn ensure_fs_scratch_grant(fs_port: u64) -> bool {
 }
 
 /// Common long-path forwarder: takes a tag (FS_OPEN_LONG / FS_STAT_LONG),
-/// the absolute path, flags, reply_port, and forwards to the FS server.
-/// Wire format for FS_*_LONG: data[0] = rel_len(16)|flags(16)|reply_port(32),
-/// data[1..] reserved. Path bytes live in FS_SCRATCH_VA in the FS server's aspace.
+/// the absolute path, flags, stashed client cap, and forwards to the FS server.
+/// Wire format for FS_*_LONG: data[0] = rel_len(16)|flags(16).
+/// Path bytes live in FS_SCRATCH_VA in the FS server's aspace.
 fn forward_fs_long(
     fs_tag: u64,
     expect_ok: u64,
     abs_path: &[u8],
     flags: u32,
-    client_reply: u64,
+    client_cap: u64,
     err_tag: u64,
 ) {
     let plen = abs_path.len();
     let (mount_idx, prefix_end) = match find_mount_long(abs_path) {
         Some(r) => r,
         None => {
-            if client_reply != 0 {
-                syscall::send(client_reply, err_tag, ERR_NO_MOUNT, 0, 0, 0);
-            }
+            syscall::reply_to(client_cap, err_tag, ERR_NO_MOUNT, 0, 0, 0);
             return;
         }
     };
 
     let fs_port_for_grant = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
     if !ensure_fs_scratch_grant(fs_port_for_grant) {
-        if client_reply != 0 {
-            syscall::send(client_reply, err_tag, ERR_IO, 0, 0, 0);
-        }
+        syscall::reply_to(client_cap, err_tag, ERR_IO, 0, 0, 0);
         return;
     }
 
@@ -716,9 +697,7 @@ fn forward_fs_long(
     // FS_SCRATCH_VA in the FS server's aspace via the lazy grant).
     let scratch = unsafe { VFS_SCRATCH_VA };
     if scratch == 0 {
-        if client_reply != 0 {
-            syscall::send(client_reply, err_tag, ERR_IO, 0, 0, 0);
-        }
+        syscall::reply_to(client_cap, err_tag, ERR_IO, 0, 0, 0);
         return;
     }
     let dst = scratch as *mut u8;
@@ -727,103 +706,84 @@ fn forward_fs_long(
     }
 
     let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
-    let my_reply = unsafe {
-        if VFS_FWD_REPLY_PORT == 0 {
-            VFS_FWD_REPLY_PORT = syscall::port_create();
-        }
-        VFS_FWD_REPLY_PORT
-    };
-    let d0 = (rel_len as u64) | ((flags as u64 & 0xFFFF) << 16) | ((my_reply as u64) << 32);
-    syscall::send(fs_port, fs_tag, d0, 0, 0, 0);
-
-    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+    let d0 = (rel_len as u64) | ((flags as u64 & 0xFFFF) << 16);
+    if let Some(fs_reply) = syscall::call(fs_port, fs_tag, d0, 0, 0, 0) {
         if fs_reply.tag == expect_ok {
-            if client_reply != 0 {
-                // Same reply shape as the short variant.
-                if expect_ok == FS_OPEN_OK {
-                    let handle = fs_reply.data[0];
-                    let size = fs_reply.data[1];
-                    let fs_aspace = fs_reply.data[2];
-                    syscall::send(
-                        client_reply,
-                        VFS_OPEN_OK,
-                        fs_port,
-                        handle,
-                        size,
-                        fs_aspace,
-                    );
-                } else if expect_ok == FS_STAT_OK {
-                    syscall::send(
-                        client_reply,
-                        VFS_STAT_OK,
-                        fs_reply.data[0],
-                        fs_reply.data[1],
-                        fs_reply.data[2],
-                        fs_reply.data[3],
-                    );
-                }
+            // Same reply shape as the short variant.
+            if expect_ok == FS_OPEN_OK {
+                let handle = fs_reply.data[0];
+                let size = fs_reply.data[1];
+                let fs_aspace = fs_reply.data[2];
+                syscall::reply_to(
+                    client_cap,
+                    VFS_OPEN_OK,
+                    fs_port,
+                    handle,
+                    size,
+                    fs_aspace,
+                );
+            } else if expect_ok == FS_STAT_OK {
+                syscall::reply_to(
+                    client_cap,
+                    VFS_STAT_OK,
+                    fs_reply.data[0],
+                    fs_reply.data[1],
+                    fs_reply.data[2],
+                    fs_reply.data[3],
+                );
             }
         } else {
-            if client_reply != 0 {
-                syscall::send(client_reply, err_tag, fs_reply.data[0], 0, 0, 0);
-            }
+            syscall::reply_to(client_cap, err_tag, fs_reply.data[0], 0, 0, 0);
         }
-    } else if client_reply != 0 {
-        syscall::send(client_reply, err_tag, ERR_IO, 0, 0, 0);
+    } else {
+        syscall::reply_to(client_cap, err_tag, ERR_IO, 0, 0, 0);
     }
 }
 
 /// Handle VFS_OPEN_LONG: client has written the absolute path to LIN_SCRATCH_VA.
-/// data[0] = path_len(16) | flags(16) | reply_port(32).
+/// data[0] = path_len(16) | flags(16).
 fn handle_open_long(data: &[u64; 6]) {
     let path_len = (data[0] & 0xFFFF) as usize;
     let flags = ((data[0] >> 16) & 0xFFFF) as u32;
-    let reply_port = data[0] >> 32;
 
     let mut buf = [0u8; 256];
     let n = read_long_path(&mut buf, path_len);
     let n = normalize_long(&mut buf, n);
     if n == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
-    forward_fs_long(FS_OPEN_LONG, FS_OPEN_OK, &buf[..n], flags, reply_port, VFS_ERROR);
+    let client_cap = syscall::reply_take();
+    forward_fs_long(FS_OPEN_LONG, FS_OPEN_OK, &buf[..n], flags, client_cap, VFS_ERROR);
 }
 
 /// Handle VFS_STAT_LONG: same as VFS_OPEN_LONG but stat-only.
-/// data[0] = path_len(16) | reply_port(32 in upper 32 of bits >=32).
+/// data[0] = path_len(16).
 fn handle_stat_long(data: &[u64; 6]) {
     let path_len = (data[0] & 0xFFFF) as usize;
-    let reply_port = data[0] >> 32;
 
     let mut buf = [0u8; 256];
     let n = read_long_path(&mut buf, path_len);
     let n = normalize_long(&mut buf, n);
     if n == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
-    forward_fs_long(FS_STAT_LONG, FS_STAT_OK, &buf[..n], 0, reply_port, VFS_ERROR);
+    let client_cap = syscall::reply_take();
+    forward_fs_long(FS_STAT_LONG, FS_STAT_OK, &buf[..n], 0, client_cap, VFS_ERROR);
 }
 
-/// Handle VFS_CHMOD: long-path. data[0] = path_len(16) | mode(16) | reply_port(32).
+/// Handle VFS_CHMOD: long-path. data[0] = path_len(16) | mode(16).
 /// Path bytes live at LIN_SCRATCH_VA in our aspace.
 fn handle_chmod(data: &[u64; 6]) {
     let path_len = (data[0] & 0xFFFF) as usize;
     let mode = ((data[0] >> 16) & 0xFFFF) as u32;
-    let reply_port = data[0] >> 32;
 
     let mut buf = [0u8; 256];
     let n = read_long_path(&mut buf, path_len);
     let n = normalize_long(&mut buf, n);
     if n == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
 
@@ -832,17 +792,13 @@ fn handle_chmod(data: &[u64; 6]) {
     let (mount_idx, prefix_end) = match find_mount_long(abs_path) {
         Some(r) => r,
         None => {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0, 0);
             return;
         }
     };
     let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
     if !ensure_fs_scratch_grant(fs_port) {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_IO, 0, 0, 0, 0);
         return;
     }
 
@@ -854,9 +810,7 @@ fn handle_chmod(data: &[u64; 6]) {
     let rel_len = rel.len();
     let scratch = unsafe { VFS_SCRATCH_VA };
     if scratch == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_IO, 0, 0, 0, 0);
         return;
     }
     let dst = scratch as *mut u8;
@@ -864,28 +818,23 @@ fn handle_chmod(data: &[u64; 6]) {
         unsafe { *dst.add(i) = rel[i] };
     }
 
-    let my_reply = syscall::port_create();
-    let d0 = (rel_len as u64) | ((mode as u64 & 0xFFFF) << 16) | ((my_reply as u64) << 32);
-    syscall::send(fs_port, FS_CHMOD, d0, 0, 0, 0);
-    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+    let client_cap = syscall::reply_take();
+    let d0 = (rel_len as u64) | ((mode as u64 & 0xFFFF) << 16);
+    if let Some(fs_reply) = syscall::call(fs_port, FS_CHMOD, d0, 0, 0, 0) {
         if fs_reply.tag == FS_CHMOD_OK {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_CHMOD_OK, 0, 0, 0, 0);
-            }
-        } else if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+            syscall::reply_to(client_cap, VFS_CHMOD_OK, 0, 0, 0, 0);
+        } else {
+            syscall::reply_to(client_cap, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
         }
-    } else if reply_port != 0 {
-        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    } else {
+        syscall::reply_to(client_cap, VFS_ERROR, ERR_IO, 0, 0, 0);
     }
-    syscall::port_destroy(my_reply);
 }
 
-/// Handle VFS_UTIMENS: long-path. data[0] = path_len(16) | reply_port(32).
+/// Handle VFS_UTIMENS: long-path. data[0] = path_len(16).
 /// data[1] = atime_secs, data[2] = mtime_secs.
 fn handle_utimens(data: &[u64; 6]) {
     let path_len = (data[0] & 0xFFFF) as usize;
-    let reply_port = data[0] >> 32;
     let atime = data[1];
     let mtime = data[2];
 
@@ -893,9 +842,7 @@ fn handle_utimens(data: &[u64; 6]) {
     let n = read_long_path(&mut buf, path_len);
     let n = normalize_long(&mut buf, n);
     if n == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
 
@@ -904,17 +851,13 @@ fn handle_utimens(data: &[u64; 6]) {
     let (mount_idx, prefix_end) = match find_mount_long(abs_path) {
         Some(r) => r,
         None => {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0, 0);
             return;
         }
     };
     let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
     if !ensure_fs_scratch_grant(fs_port) {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_IO, 0, 0, 0, 0);
         return;
     }
 
@@ -926,9 +869,7 @@ fn handle_utimens(data: &[u64; 6]) {
     let rel_len = rel.len();
     let scratch = unsafe { VFS_SCRATCH_VA };
     if scratch == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_IO, 0, 0, 0, 0);
         return;
     }
     let dst = scratch as *mut u8;
@@ -936,37 +877,30 @@ fn handle_utimens(data: &[u64; 6]) {
         unsafe { *dst.add(i) = rel[i] };
     }
 
-    let my_reply = syscall::port_create();
-    let d0 = (rel_len as u64) | ((my_reply as u64) << 32);
-    syscall::send(fs_port, FS_UTIMENS, d0, atime, mtime, 0);
-    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+    let client_cap = syscall::reply_take();
+    let d0 = rel_len as u64;
+    if let Some(fs_reply) = syscall::call(fs_port, FS_UTIMENS, d0, atime, mtime, 0) {
         if fs_reply.tag == FS_UTIMENS_OK {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_UTIMENS_OK, 0, 0, 0, 0);
-            }
-        } else if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+            syscall::reply_to(client_cap, VFS_UTIMENS_OK, 0, 0, 0, 0);
+        } else {
+            syscall::reply_to(client_cap, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
         }
-    } else if reply_port != 0 {
-        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    } else {
+        syscall::reply_to(client_cap, VFS_ERROR, ERR_IO, 0, 0, 0);
     }
-    syscall::port_destroy(my_reply);
 }
 
 /// Handle VFS_OPEN: resolve path, forward FS_OPEN to FS server, return result.
-/// data[2] = path_len(16) | flags(16) | reply_port(32)
+/// data[2] = path_len(16) | flags(16)
 fn handle_open(data: &[u64; 6]) {
     let path_len = (data[2] & 0xFFFF) as usize;
     let _flags = ((data[2] >> 16) & 0xFFFF) as u32;
-    let reply_port = data[2] >> 32;
 
     let (mut path, plen) = unpack_path(data[0], data[1], path_len);
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
 
@@ -974,9 +908,7 @@ fn handle_open(data: &[u64; 6]) {
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0, 0);
             return;
         }
     };
@@ -986,66 +918,49 @@ fn handle_open(data: &[u64; 6]) {
     // Get relative path within the filesystem.
     let (rel, rel_len) = relative_path(&path, plen, prefix_end);
 
-    // Forward FS_OPEN to the filesystem server.
-    // FS_OPEN protocol: data[0]=name_lo, data[1]=name_hi, data[2]=len|(reply<<32)
-    let my_reply = syscall::port_create();
+    // Forward FS_OPEN to the filesystem server via call/reply.
+    let client_cap = syscall::reply_take();
     let (n0, n1) = pack_name_2(rel, rel_len);
-    let d2 = (rel_len as u64) | ((my_reply as u64) << 32);
-    syscall::send(fs_port, FS_OPEN, n0, n1, d2, 0);
-
-    // Wait for FS server reply (blocking).
-    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+    let d2 = rel_len as u64;
+    if let Some(fs_reply) = syscall::call(fs_port, FS_OPEN, n0, n1, d2, 0) {
         if fs_reply.tag == FS_OPEN_OK {
             let handle = fs_reply.data[0];
             let size = fs_reply.data[1];
             let fs_aspace = fs_reply.data[2];
-            if reply_port != 0 {
-                syscall::send(
-                    reply_port,
-                    VFS_OPEN_OK,
-                    fs_port as u64,
-                    handle,
-                    size,
-                    fs_aspace,
-                );
-            }
+            syscall::reply_to(
+                client_cap,
+                VFS_OPEN_OK,
+                fs_port as u64,
+                handle,
+                size,
+                fs_aspace,
+            );
             // Notify inotify server of file open.
             notify_inotify(IN_EVT_OPEN, data[0], data[1]);
         } else {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
-            }
+            syscall::reply_to(client_cap, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
         }
     } else {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
-        }
+        syscall::reply_to(client_cap, VFS_ERROR, ERR_IO, 0, 0, 0);
     }
-
-    syscall::port_destroy(my_reply);
 }
 
 /// Handle VFS_STAT: resolve path, forward FS_STAT to FS server.
 fn handle_stat(data: &[u64; 6]) {
     let path_len = (data[2] & 0xFFFF) as usize;
-    let reply_port = data[2] >> 32;
 
     let (mut path, plen) = unpack_path(data[0], data[1], path_len);
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
 
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0, 0);
             return;
         }
     };
@@ -1053,56 +968,46 @@ fn handle_stat(data: &[u64; 6]) {
     let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
     let (rel, rel_len) = relative_path(&path, plen, prefix_end);
 
-    let my_reply = syscall::port_create();
+    let client_cap = syscall::reply_take();
     let (n0, n1) = pack_name_2(rel, rel_len);
-    let d2 = (rel_len as u64) | ((my_reply as u64) << 32);
-    syscall::send(fs_port, FS_STAT, n0, n1, d2, 0);
-
-    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+    let d2 = rel_len as u64;
+    if let Some(fs_reply) = syscall::call(fs_port, FS_STAT, n0, n1, d2, 0) {
         if fs_reply.tag == FS_STAT_OK {
-            if reply_port != 0 {
-                syscall::send(
-                    reply_port,
-                    VFS_STAT_OK,
-                    fs_reply.data[0],
-                    fs_reply.data[1],
-                    fs_reply.data[2],
-                    fs_reply.data[3],
-                );
-            }
+            syscall::reply_to(
+                client_cap,
+                VFS_STAT_OK,
+                fs_reply.data[0],
+                fs_reply.data[1],
+                fs_reply.data[2],
+                fs_reply.data[3],
+            );
         } else {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
-            }
+            syscall::reply_to(client_cap, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
         }
-    } else if reply_port != 0 {
-        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    } else {
+        syscall::reply_to(client_cap, VFS_ERROR, ERR_IO, 0, 0, 0);
     }
-
-    syscall::port_destroy(my_reply);
 }
 
 /// Handle VFS_READDIR: resolve path, forward FS_READDIR to FS server.
+/// Under call/reply, this is per-entry: client sends offset in data[3],
+/// VFS forwards one FS_READDIR call, relays the single reply (OK or END).
 fn handle_readdir(data: &[u64; 6]) {
     let path_len = (data[2] & 0xFFFF) as usize;
-    let reply_port = data[2] >> 32;
+    let start_offset = data[3];
 
     let (mut path, plen) = unpack_path(data[0], data[1], path_len);
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
 
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0, 0);
             return;
         }
     };
@@ -1110,72 +1015,47 @@ fn handle_readdir(data: &[u64; 6]) {
     let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
     let (rel, rel_len) = relative_path(&path, plen, prefix_end);
 
-    let my_reply = syscall::port_create();
+    let client_cap = syscall::reply_take();
     let (n0, n1) = pack_name_2(rel, rel_len);
-    let d2 = (rel_len as u64) | ((my_reply as u64) << 32);
-    syscall::send(fs_port, FS_READDIR, n0, n1, d2, 0);
-
-    // Stream readdir entries from FS server to client (blocking recv).
-    for _ in 0..200 {
-        if let Some(fs_reply) = syscall::recv_msg(my_reply) {
-            if fs_reply.tag == FS_READDIR_OK {
-                if reply_port != 0 {
-                    syscall::send(
-                        reply_port,
-                        VFS_READDIR_OK,
-                        fs_reply.data[0],
-                        fs_reply.data[1],
-                        fs_reply.data[2],
-                        fs_reply.data[3],
-                    );
-                }
-            } else if fs_reply.tag == FS_READDIR_END {
-                if reply_port != 0 {
-                    syscall::send(reply_port, VFS_READDIR_END, 0, 0, 0, 0);
-                }
-                syscall::port_destroy(my_reply);
-                return;
-            } else {
-                if reply_port != 0 {
-                    syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
-                }
-                syscall::port_destroy(my_reply);
-                return;
-            }
+    let d2 = rel_len as u64;
+    if let Some(fs_reply) = syscall::call(fs_port, FS_READDIR, n0, n1, d2, start_offset) {
+        if fs_reply.tag == FS_READDIR_OK {
+            syscall::reply_to(
+                client_cap,
+                VFS_READDIR_OK,
+                fs_reply.data[0],
+                fs_reply.data[1],
+                fs_reply.data[2],
+                fs_reply.data[3],
+            );
+        } else if fs_reply.tag == FS_READDIR_END {
+            syscall::reply_to(client_cap, VFS_READDIR_END, 0, 0, 0, 0);
         } else {
-            break;
+            syscall::reply_to(client_cap, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
         }
-    }
-
-    syscall::port_destroy(my_reply);
-    if reply_port != 0 {
-        syscall::send(reply_port, VFS_READDIR_END, 0, 0, 0, 0);
+    } else {
+        syscall::reply_to(client_cap, VFS_ERROR, ERR_IO, 0, 0, 0);
     }
 }
 
 /// Handle VFS_MKDIR: resolve path, forward FS_MKDIR to FS server.
-/// data[2] = path_len(16) | mode(16) | reply_port(32)
+/// data[2] = path_len(16) | mode(16)
 fn handle_mkdir(data: &[u64; 6]) {
     let path_len = (data[2] & 0xFFFF) as usize;
     let mode = ((data[2] >> 16) & 0xFFFF) as u32;
-    let reply_port = data[2] >> 32;
 
     let (mut path, plen) = unpack_path(data[0], data[1], path_len);
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
 
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0, 0);
             return;
         }
     };
@@ -1183,26 +1063,18 @@ fn handle_mkdir(data: &[u64; 6]) {
     let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
     let (rel, rel_len) = relative_path(&path, plen, prefix_end);
 
-    let my_reply = syscall::port_create();
+    let client_cap = syscall::reply_take();
     let (n0, n1) = pack_name_2(rel, rel_len);
-    let d2 = (rel_len as u64) | ((mode as u64) << 16) | ((my_reply as u64) << 32);
-    syscall::send(fs_port, FS_MKDIR, n0, n1, d2, 0);
-
-    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+    let d2 = (rel_len as u64) | ((mode as u64) << 16);
+    if let Some(fs_reply) = syscall::call(fs_port, FS_MKDIR, n0, n1, d2, 0) {
         if fs_reply.tag == FS_MKDIR_OK {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_MKDIR_OK, 0, 0, 0, 0);
-            }
+            syscall::reply_to(client_cap, VFS_MKDIR_OK, 0, 0, 0, 0);
         } else {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
-            }
+            syscall::reply_to(client_cap, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
         }
-    } else if reply_port != 0 {
-        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    } else {
+        syscall::reply_to(client_cap, VFS_ERROR, ERR_IO, 0, 0, 0);
     }
-
-    syscall::port_destroy(my_reply);
 }
 
 /// Generic single-path forwarding: resolve path, forward an FS_* tag to the
@@ -1223,24 +1095,19 @@ fn forward_path_op(
     extra_data: u64,
 ) {
     let path_len = (data[2] & 0xFFFF) as usize;
-    let reply_port = data[2] >> 32;
 
     let (mut path, plen) = unpack_path(data[0], data[1], path_len);
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
 
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0, 0);
             return;
         }
     };
@@ -1248,56 +1115,45 @@ fn forward_path_op(
     let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
     let (rel, rel_len) = relative_path(&path, plen, prefix_end);
 
-    let my_reply = syscall::port_create();
+    let client_cap = syscall::reply_take();
     let (n0, n1) = pack_name_2(rel, rel_len);
-    let d2 = (rel_len as u64) | extra_d2_bits | ((my_reply as u64) << 32);
-    syscall::send(fs_port, fs_tag, n0, n1, d2, extra_data);
-
-    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+    let d2 = (rel_len as u64) | extra_d2_bits;
+    if let Some(fs_reply) = syscall::call(fs_port, fs_tag, n0, n1, d2, extra_data) {
         if fs_reply.tag == fs_ok_tag {
-            if reply_port != 0 {
-                syscall::send(
-                    reply_port,
-                    vfs_ok_tag,
-                    fs_reply.data[0],
-                    fs_reply.data[1],
-                    fs_reply.data[2],
-                    fs_reply.data[3],
-                );
-            }
-        } else if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+            syscall::reply_to(
+                client_cap,
+                vfs_ok_tag,
+                fs_reply.data[0],
+                fs_reply.data[1],
+                fs_reply.data[2],
+                fs_reply.data[3],
+            );
+        } else {
+            syscall::reply_to(client_cap, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
         }
-    } else if reply_port != 0 {
-        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    } else {
+        syscall::reply_to(client_cap, VFS_ERROR, ERR_IO, 0, 0, 0);
     }
-
-    syscall::port_destroy(my_reply);
 }
 
 /// Handle VFS_SYMLINK: create a symbolic link.
-/// data[0..1] = link path (the new symlink), data[2] = len | reply_port,
+/// data[0..1] = link path (the new symlink), data[2] = len,
 /// data[3..4] = target path bytes (up to 16 bytes), data[5] = target length.
 fn handle_symlink(data: &[u64; 6]) {
     let path_len = (data[2] & 0xFFFF) as usize;
-    let reply_port = data[2] >> 32;
 
     let (mut path, plen) = unpack_path(data[0], data[1], path_len);
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
 
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0, 0);
             return;
         }
     };
@@ -1305,27 +1161,18 @@ fn handle_symlink(data: &[u64; 6]) {
     let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
     let (rel, rel_len) = relative_path(&path, plen, prefix_end);
 
-    let my_reply = syscall::port_create();
+    let client_cap = syscall::reply_take();
     let (n0, n1) = pack_name_2(rel, rel_len);
-    let d2 = (rel_len as u64) | ((my_reply as u64) << 32);
-    // Forward: data[0..1] = link name, data[2] = len|reply, data[3..4] = target, data[5] = target_len.
-    syscall::send(fs_port, FS_SYMLINK, n0, n1, d2, data[3]);
-    // Send target second word + length via a follow-up or encode in data[5].
-    // For simplicity, we pack target in data[3..4] of the original message.
-
-    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+    let d2 = rel_len as u64;
+    if let Some(fs_reply) = syscall::call(fs_port, FS_SYMLINK, n0, n1, d2, data[3]) {
         if fs_reply.tag == FS_SYMLINK_OK {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_SYMLINK_OK, 0, 0, 0, 0);
-            }
-        } else if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+            syscall::reply_to(client_cap, VFS_SYMLINK_OK, 0, 0, 0, 0);
+        } else {
+            syscall::reply_to(client_cap, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
         }
-    } else if reply_port != 0 {
-        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    } else {
+        syscall::reply_to(client_cap, VFS_ERROR, ERR_IO, 0, 0, 0);
     }
-
-    syscall::port_destroy(my_reply);
 }
 
 /// Handle VFS_READLINK: read symbolic link target.
@@ -1335,29 +1182,23 @@ fn handle_readlink(data: &[u64; 6]) {
 }
 
 /// Handle VFS_LINK: create a hard link.
-/// data[0..1] = existing path, data[2] = len | reply_port,
+/// data[0..1] = existing path, data[2] = len,
 /// data[3..4] = new link path, data[5] = new link path length.
 fn handle_link(data: &[u64; 6]) {
-    // Same pattern as symlink but uses FS_LINK.
     let path_len = (data[2] & 0xFFFF) as usize;
-    let reply_port = data[2] >> 32;
 
     let (mut path, plen) = unpack_path(data[0], data[1], path_len);
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
 
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0, 0);
             return;
         }
     };
@@ -1365,49 +1206,38 @@ fn handle_link(data: &[u64; 6]) {
     let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
     let (rel, rel_len) = relative_path(&path, plen, prefix_end);
 
-    let my_reply = syscall::port_create();
+    let client_cap = syscall::reply_take();
     let (n0, n1) = pack_name_2(rel, rel_len);
-    let d2 = (rel_len as u64) | ((my_reply as u64) << 32);
-    syscall::send(fs_port, FS_LINK, n0, n1, d2, data[3]);
-
-    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+    let d2 = rel_len as u64;
+    if let Some(fs_reply) = syscall::call(fs_port, FS_LINK, n0, n1, d2, data[3]) {
         if fs_reply.tag == FS_LINK_OK {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_LINK_OK, 0, 0, 0, 0);
-            }
-        } else if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+            syscall::reply_to(client_cap, VFS_LINK_OK, 0, 0, 0, 0);
+        } else {
+            syscall::reply_to(client_cap, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
         }
-    } else if reply_port != 0 {
-        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    } else {
+        syscall::reply_to(client_cap, VFS_ERROR, ERR_IO, 0, 0, 0);
     }
-
-    syscall::port_destroy(my_reply);
 }
 
 /// Handle VFS_RENAME: atomic rename/move.
-/// data[0..1] = old path, data[2] = old_len | reply_port,
+/// data[0..1] = old path, data[2] = old_len,
 /// data[3..4] = new path, data[5] = new path length.
 fn handle_rename(data: &[u64; 6]) {
     let path_len = (data[2] & 0xFFFF) as usize;
-    let reply_port = data[2] >> 32;
 
     let (mut path, plen) = unpack_path(data[0], data[1], path_len);
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
 
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0, 0);
             return;
         }
     };
@@ -1415,25 +1245,18 @@ fn handle_rename(data: &[u64; 6]) {
     let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
     let (rel, rel_len) = relative_path(&path, plen, prefix_end);
 
-    let my_reply = syscall::port_create();
+    let client_cap = syscall::reply_take();
     let (n0, n1) = pack_name_2(rel, rel_len);
-    let d2 = (rel_len as u64) | ((my_reply as u64) << 32);
-    // data[3..4] = new path bytes, data[5] = new_len.
-    syscall::send(fs_port, FS_RENAME, n0, n1, d2, data[3]);
-
-    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+    let d2 = rel_len as u64;
+    if let Some(fs_reply) = syscall::call(fs_port, FS_RENAME, n0, n1, d2, data[3]) {
         if fs_reply.tag == FS_RENAME_OK {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_RENAME_OK, 0, 0, 0, 0);
-            }
-        } else if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
+            syscall::reply_to(client_cap, VFS_RENAME_OK, 0, 0, 0, 0);
+        } else {
+            syscall::reply_to(client_cap, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
         }
-    } else if reply_port != 0 {
-        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    } else {
+        syscall::reply_to(client_cap, VFS_ERROR, ERR_IO, 0, 0, 0);
     }
-
-    syscall::port_destroy(my_reply);
 }
 
 /// Handle VFS_CHOWN: change file owner/group.
@@ -1510,27 +1333,22 @@ fn handle_ioctl(data: &[u64; 6]) {
 }
 
 /// Handle VFS_UNLINK: resolve path, forward FS_UNLINK to FS server.
-/// data[2] = path_len(16) | reply_port(32)
+/// data[2] = path_len(16)
 fn handle_unlink(data: &[u64; 6]) {
     let path_len = (data[2] & 0xFFFF) as usize;
-    let reply_port = data[2] >> 32;
 
     let (mut path, plen) = unpack_path(data[0], data[1], path_len);
     let plen = normalize_path(&mut path, plen);
 
     if plen == 0 {
-        if reply_port != 0 {
-            syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-        }
+        let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
         return;
     }
 
     let (mount_idx, prefix_end) = match find_mount(&path, plen) {
         Some(r) => r,
         None => {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0);
-            }
+            let _ = syscall::reply(VFS_ERROR, ERR_NO_MOUNT, 0, 0, 0, 0);
             return;
         }
     };
@@ -1538,26 +1356,18 @@ fn handle_unlink(data: &[u64; 6]) {
     let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
     let (rel, rel_len) = relative_path(&path, plen, prefix_end);
 
-    let my_reply = syscall::port_create();
+    let client_cap = syscall::reply_take();
     let (n0, n1) = pack_name_2(rel, rel_len);
-    let d2 = (rel_len as u64) | ((my_reply as u64) << 32);
-    syscall::send(fs_port, FS_UNLINK, n0, n1, d2, 0);
-
-    if let Some(fs_reply) = syscall::recv_msg(my_reply) {
+    let d2 = rel_len as u64;
+    if let Some(fs_reply) = syscall::call(fs_port, FS_UNLINK, n0, n1, d2, 0) {
         if fs_reply.tag == FS_UNLINK_OK {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_UNLINK_OK, 0, 0, 0, 0);
-            }
+            syscall::reply_to(client_cap, VFS_UNLINK_OK, 0, 0, 0, 0);
         } else {
-            if reply_port != 0 {
-                syscall::send(reply_port, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
-            }
+            syscall::reply_to(client_cap, VFS_ERROR, fs_reply.data[0], 0, 0, 0);
         }
-    } else if reply_port != 0 {
-        syscall::send(reply_port, VFS_ERROR, ERR_IO, 0, 0, 0);
+    } else {
+        syscall::reply_to(client_cap, VFS_ERROR, ERR_IO, 0, 0, 0);
     }
-
-    syscall::port_destroy(my_reply);
 }
 
 #[unsafe(no_mangle)]
@@ -1578,7 +1388,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // Main message loop (blocking recv).
     loop {
-        let msg = match syscall::recv_msg(port) {
+        let msg = match syscall::recv_with_cap(port) {
             Some(m) => m,
             None => break,
         };
@@ -1611,10 +1421,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             VFS_STREAM_LIST => handle_stream_list(&msg.data),
             VFS_IOCTL => handle_ioctl(&msg.data),
             _ => {
-                let reply_port = msg.data[2] >> 32;
-                if reply_port != 0 {
-                    syscall::send(reply_port, VFS_ERROR, ERR_INVALID, 0, 0, 0);
-                }
+                let _ = syscall::reply(VFS_ERROR, ERR_INVALID, 0, 0, 0, 0);
             }
         }
     }

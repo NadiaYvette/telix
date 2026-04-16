@@ -6071,23 +6071,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test 1: Mount root FS on "/".
         if phase51_ok {
-            let reply_port = syscall::port_create();
             let path = b"/";
             let (w0, w1, _w2) = pack_name(path);
-            let d2 = (path.len() as u64) | (reply_port << 32);
-            syscall::send(vfs_port, VFS_MOUNT, w0, w1, d2, root_fs_port);
-
+            let d2 = path.len() as u64;
             let mut mounted = false;
-            for _ in 0..100 {
-                if let Some(reply) = syscall::recv_nb_msg(reply_port) {
-                    if reply.tag == VFS_OK {
-                        mounted = true;
-                    }
-                    break;
+            if let Some(reply) = syscall::call(vfs_port, VFS_MOUNT, w0, w1, d2, root_fs_port) {
+                if reply.tag == VFS_OK {
+                    mounted = true;
                 }
-                syscall::sleep_ms(10);
             }
-            syscall::port_destroy(reply_port);
 
             if !mounted {
                 syscall::debug_puts(b"  FAIL: VFS_MOUNT / failed (");
@@ -6099,30 +6091,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test 2: Mount fat16 on "/mnt" (only with block device).
         if phase51_ok && fat16_port != 0 {
-            let reply_port = syscall::port_create();
             let path = b"/mnt";
             let (w0, w1, _w2) = pack_name(path);
-            let d2 = (path.len() as u64) | (reply_port << 32);
-            syscall::send(vfs_port, VFS_MOUNT, w0, w1, d2, fat16_port);
-
+            let d2 = path.len() as u64;
             let mut mnt_ok = false;
-            for _ in 0..100 {
-                if let Some(reply) = syscall::recv_nb_msg(reply_port) {
-                    if reply.tag == VFS_OK {
-                        mnt_ok = true;
-                    } else {
-                        syscall::debug_puts(b"  FAIL: VFS_MOUNT /mnt rejected\n");
-                        phase51_ok = false;
-                    }
-                    break;
+            if let Some(reply) = syscall::call(vfs_port, VFS_MOUNT, w0, w1, d2, fat16_port) {
+                if reply.tag == VFS_OK {
+                    mnt_ok = true;
+                } else {
+                    syscall::debug_puts(b"  FAIL: VFS_MOUNT /mnt rejected\n");
+                    phase51_ok = false;
                 }
-                syscall::sleep_ms(10);
             }
             if !mnt_ok && phase51_ok {
                 syscall::debug_puts(b"  FAIL: VFS_MOUNT /mnt timeout\n");
                 phase51_ok = false;
             }
-            syscall::port_destroy(reply_port);
         }
 
         // Brief pause to let VFS server process mount table updates.
@@ -6130,14 +6114,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test 3: VFS_OPEN "/hello.txt" — should resolve to root FS on "/".
         if phase51_ok {
-            let reply_port = syscall::port_create();
             let path = b"/hello.txt";
             let (w0, w1, _w2) = pack_name(path);
-            let d2 = (path.len() as u64) | (reply_port << 32);
-            syscall::send(vfs_port, VFS_OPEN, w0, w1, d2, 0);
+            let d2 = path.len() as u64;
 
             let mut open_ok = false;
-            if let Some(reply) = syscall::recv_msg(reply_port) {
+            if let Some(reply) = syscall::call(vfs_port, VFS_OPEN, w0, w1, d2, 0) {
                 if reply.tag == VFS_OPEN_OK {
                     let ret_fs_port = reply.data[0];
                     if ret_fs_port == root_fs_port {
@@ -6149,7 +6131,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  FAIL: VFS_OPEN err\n");
                 }
             }
-            syscall::port_destroy(reply_port);
 
             if !open_ok {
                 phase51_ok = false;
@@ -6158,21 +6139,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test 4: VFS_OPEN "/mnt/HELLO.TXT" — should resolve to fat16 on "/mnt".
         if phase51_ok && fat16_port != 0 {
-            let reply_port = syscall::port_create();
             let path = b"/mnt/HELLO.TXT";
             let (w0, w1, _w2) = pack_name(path);
-            let d2 = (path.len() as u64) | (reply_port << 32);
-            syscall::send(vfs_port, VFS_OPEN, w0, w1, d2, 0);
+            let d2 = path.len() as u64;
 
             let mut open_ok = false;
-            if let Some(reply) = syscall::recv_msg(reply_port) {
+            if let Some(reply) = syscall::call(vfs_port, VFS_OPEN, w0, w1, d2, 0) {
                 if reply.tag == VFS_OPEN_OK {
                     if reply.data[0] == fat16_port {
                         open_ok = true;
                     }
                 }
             }
-            syscall::port_destroy(reply_port);
             if !open_ok {
                 syscall::debug_puts(b"  FAIL: VFS /mnt open\n");
                 phase51_ok = false;
@@ -6181,18 +6159,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test 5: Path normalization — "/a/../hello.txt" resolves to "/hello.txt".
         if phase51_ok {
-            let reply_port = syscall::port_create();
             let path = b"/a/../hello.txt";
             let (w0, w1, _w2) = pack_name(path);
-            let d2 = (path.len() as u64) | (reply_port << 32);
-            syscall::send(vfs_port, VFS_OPEN, w0, w1, d2, 0);
-            if let Some(reply) = syscall::recv_msg(reply_port) {
+            let d2 = path.len() as u64;
+            if let Some(reply) = syscall::call(vfs_port, VFS_OPEN, w0, w1, d2, 0) {
                 if reply.tag == VFS_OPEN_OK {
                     // Path normalization worked.
                 }
                 // VFS_ERROR also OK if file not found.
             }
-            syscall::port_destroy(reply_port);
         }
 
         if phase51_ok {
@@ -8408,11 +8383,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 for i in 8..path_len.min(16) {
                     w1 |= (path[i] as u64) << ((i - 8) * 8);
                 }
-                let reply = syscall::port_create();
-                let d2 = (path_len as u64) | (reply << 32);
-                syscall::send(vp, 0x6010, w0, w1, d2, 0); // VFS_OPEN
-
-                if let Some(resp) = syscall::recv_msg(reply) {
+                let d2 = path_len as u64;
+                if let Some(resp) = syscall::call(vp, 0x6010, w0, w1, d2, 0) { // VFS_OPEN
                     if resp.tag == 0x6110 {
                         // VFS_OPEN_OK
                         let fs_port = resp.data[0];
@@ -8426,10 +8398,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         }
 
                         // Read content to verify.
-                        let read_reply = syscall::port_create();
-                        let rd2 = 16u64 | ((read_reply) << 32);
-                        syscall::send(fs_port, 0x2100, handle as u64, 0, rd2, 0); // FS_READ
-                        if let Some(rr) = syscall::recv_msg(read_reply) {
+                        let rd2 = 16u64;
+                        if let Some(rr) = syscall::call(fs_port, 0x2100, handle as u64, 0, rd2, 0) { // FS_READ
                             if rr.tag == 0x2101 {
                                 // FS_READ_OK
                                 // ext2_srv inline reply: data[0]=len, data[1..2]=packed content
@@ -8457,14 +8427,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 phase63_ok = false;
                             }
                         }
-                        syscall::port_destroy(read_reply);
 
                         // Close.
-                        let close_reply = syscall::port_create();
-                        let cd2 = (close_reply) << 32;
-                        syscall::send(fs_port, 0x2400, handle as u64, 0, cd2, 0);
-                        let _ = syscall::recv_msg(close_reply);
-                        syscall::port_destroy(close_reply);
+                        let _ = syscall::call(fs_port, 0x2400, handle as u64, 0, 0, 0);
                     } else {
                         syscall::debug_puts(b"      VFS_OPEN failed (tag mismatch)\n");
                         phase63_ok = false;
@@ -8473,7 +8438,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"      VFS_OPEN no reply\n");
                     phase63_ok = false;
                 }
-                syscall::port_destroy(reply);
             } else {
                 syscall::debug_puts(b"      VFS not found\n");
                 if has_blk {
@@ -9315,20 +9279,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if let Some(vfs_port) = syscall::ns_lookup(b"vfs") {
             const VFS_MKDIR: u64 = 0x6040;
             const VFS_MKDIR_OK: u64 = 0x6140;
-            let reply = syscall::port_create();
             // Pack path "pgdata" (6 bytes) into w0/w1.
             let w0: u64 = 0x617461646770; // "pgdata" LE
             let w1: u64 = 0;
-            let d2 = 6u64 | (0o755u64 << 16) | (reply << 32);
-            syscall::send(vfs_port, VFS_MKDIR, w0, w1, d2, 0);
-            if let Some(resp) = syscall::recv_msg(reply) {
+            let d2 = 6u64 | (0o755u64 << 16);
+            if let Some(resp) = syscall::call(vfs_port, VFS_MKDIR, w0, w1, d2, 0) {
                 if resp.tag == VFS_MKDIR_OK {
                     syscall::debug_puts(b"    mkdir /pgdata: OK\n");
                 } else {
                     syscall::debug_puts(b"    mkdir /pgdata: error (may already exist)\n");
                 }
             }
-            syscall::port_destroy(reply);
         } else {
             syscall::debug_puts(b"    SKIP: no VFS server\n");
             phase80_ok = false;
