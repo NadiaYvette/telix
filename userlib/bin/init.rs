@@ -9853,16 +9853,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let reply_port = syscall::port_create();
             // INPUT_SUBSCRIBE = 0x9000: data[0] = subscriber port, data[2] upper 32 = reply port.
             syscall::send(input_port, 0x9000, event_port, 0, reply_port << 32, 0);
-            let mut got_reply = false;
-            for _ in 0..100 {
-                if let Some(msg) = syscall::recv_nb_msg(reply_port) {
-                    if msg.tag == 0x9001 && msg.data[0] == 0 {
-                        got_reply = true;
-                    }
-                    break;
-                }
-                syscall::yield_now();
-            }
+            let got_reply = match syscall::recv_msg_timeout(reply_port, 5_000_000) {
+                Some(msg) if msg.tag == 0x9001 && msg.data[0] == 0 => true,
+                _ => false,
+            };
             // Unsubscribe.
             syscall::send(input_port, 0x9003, event_port, 0, 0, 0);
             syscall::port_destroy(event_port);
