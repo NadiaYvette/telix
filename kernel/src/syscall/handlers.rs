@@ -243,18 +243,26 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
             // Handle exit syscalls natively to avoid deadlock: if the
             // personality server is processing a blocking wait4, it can't
             // drain exit messages from its port queue.
-            let is_native_exit = nr == SYS_EXIT || match task.syscall_abi as u8 {
+            // Only check ABI-specific exit numbers — Telix SYS_EXIT (11)
+            // collides with Linux __NR_MUNMAP so we must NOT match it here.
+            let is_native_exit = match task.syscall_abi as u8 {
                 3 => nr == 60 || nr == 231, // LinuxX86_64: exit / exit_group
                 1 => nr == 93 || nr == 94,  // LinuxAArch64: exit / exit_group
-                _ => false,
+                _ => nr == SYS_EXIT,        // non-Linux ABIs: Telix native exit
             };
             if is_native_exit {
                 crate::sched::scheduler::exit_current_thread(a0 as i32);
             }
             // Handle Telix-native infrastructure syscalls natively even
-            // when a personality is active.  These don't map to any Linux
-            // syscall and the personality server can't handle them.
-            if nr == SYS_YIELD || nr == SYS_DEBUG_PUTS || nr == SYS_DEBUG_PUTCHAR {
+            // when a personality is active, but ONLY for non-Linux ABIs
+            // where the numbers don't collide with Linux syscall numbers.
+            // For Linux x86_64/aarch64, SYS_YIELD(7), SYS_DEBUG_PUTS(14),
+            // SYS_DEBUG_PUTCHAR(0) collide with poll, rt_sigprocmask, read.
+            let native_passthrough = match task.syscall_abi as u8 {
+                1 | 3 => false,  // Linux ABIs: all numbers collide
+                _ => nr == SYS_YIELD || nr == SYS_DEBUG_PUTS || nr == SYS_DEBUG_PUTCHAR,
+            };
+            if native_passthrough {
                 // Fall through to the native dispatch below.
             } else {
             let port = task.personality_port;
