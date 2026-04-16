@@ -1291,15 +1291,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(partition_offset);
     syscall::debug_puts(b"\n");
 
-    // Create port and register with name server.
+    // Create port (register with name server after init is complete).
     let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
-    syscall::ns_register(b"ext2", port);
-    syscall::ns_register(b"ext2_task", my_aspace);
-
-    syscall::debug_puts(b"  [ext2_srv] registered, port=");
-    print_num(port as u64);
-    syscall::debug_puts(b"\n");
 
     // Look up cache_blk with bounded retry.
     let blk_port = {
@@ -1470,7 +1464,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    syscall::debug_puts(b"  [ext2_srv] ready\n");
+    // Register with name server only after filesystem is fully initialized.
+    syscall::ns_register(b"ext2", port);
+    syscall::ns_register(b"ext2_task", my_aspace);
+
+    syscall::debug_puts(b"  [ext2_srv] ready, port=");
+    print_num(port as u64);
+    syscall::debug_puts(b"\n");
 
     // Open file table.
     let mut open_files = [OpenFile::empty(); MAX_OPEN_FILES];
