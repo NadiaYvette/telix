@@ -181,6 +181,18 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
             tref.last_cpu.load(core::sync::atomic::Ordering::Relaxed),
             cur_cpu
         );
+        // Dump full frame to diagnose corruption pattern. If GPRs (offsets
+        // 0-112) are valid but CPU-pushed (136-168) are garbage: partial
+        // overwrite from frame top. If everything is garbage: full page alias.
+        crate::println!(
+            "  saved_sp={:#x} kstack={:#x} task={}",
+            tref.saved_sp, tref.stack_base, tref.task_id
+        );
+        // Raw dump: 22 u64 values at [sp..sp+176)
+        for i in 0..22u64 {
+            let val = unsafe { *((sp + i * 8) as *const u64) };
+            crate::println!("  frame[{}]={:#018x}", i, val);
+        }
         // Mark the current thread (the one with corrupt state) as killed
         // so the scheduler won't re-enqueue it on the next tick.
         tref.killed.store(true, core::sync::atomic::Ordering::Release);

@@ -856,9 +856,9 @@ fn thread_port_handler(
 // Thread/Task slab/page allocation
 // ---------------------------------------------------------------------------
 
-/// Slab size for Thread entries (Thread is ~260 bytes with EEVDF fields,
-/// requires 512-byte slab).
+/// Slab size for Thread entries (Thread is ~408 bytes, 512-byte slab).
 const THREAD_SLAB_SIZE: usize = 512;
+const _: () = assert!(core::mem::size_of::<Thread>() <= THREAD_SLAB_SIZE);
 
 fn alloc_thread_entry() -> Option<*mut Thread> {
     let pa = slab::alloc(THREAD_SLAB_SIZE)?;
@@ -4484,8 +4484,14 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     let tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
     let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
 
-    // saved_sp was already set by pre_save_frame(). Set Blocked + reason.
+    // Re-assign saved_sp from syscall_frame_sp. pre_save_frame set it
+    // earlier, but try_switch may have overwritten saved_sp if a timer
+    // preempted us between pre_save_frame and this point.
+    // syscall_frame_sp is set once at syscall entry (store_frame_sp) and
+    // never touched by try_switch, so it always holds the correct value.
     let t = unsafe { thread_mut_from_ref(tid as ThreadId) };
+    t.saved_sp = t.syscall_frame_sp;
+    t.saved_sp_source = 3; // park_ipc
     t.state = ThreadState::Blocked;
     t.blocked_on = reason;
 
