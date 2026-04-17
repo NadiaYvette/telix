@@ -7120,8 +7120,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             #[allow(dead_code)]
             const UDS_EOF: u64 = 0x81FF;
 
-            let reply_port = syscall::port_create();
-
             // Helper: pack name into 2 u64 words.
             let pack_name = |name: &[u8]| -> (u64, u64) {
                 let mut w0 = 0u64;
@@ -7142,9 +7140,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // 1. Create a server-side listening socket.
             let mut srv_listen = u64::MAX;
             if phase57_ok {
-                let d2 = reply_port << 32;
-                syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0); // type=0 (STREAM)
-                if let Some(m) = syscall::recv_msg(reply_port) {
+                if let Some(m) = syscall::call(uds_port, UDS_SOCKET, 0, 0, 0, 0) {
                     if m.tag == UDS_OK {
                         srv_listen = m.data[0];
                     } else {
@@ -7157,10 +7153,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // 2. Bind to "test.sock".
             if phase57_ok {
                 let (n0, n1) = pack_name(b"test.sock");
-                let name_len = 9u64;
-                let d2 = name_len | (reply_port << 32);
-                syscall::send(uds_port, UDS_BIND, srv_listen, n0, d2, n1);
-                if let Some(m) = syscall::recv_msg(reply_port) {
+                if let Some(m) = syscall::call(uds_port, UDS_BIND, srv_listen, n0, 9, n1) {
                     if m.tag != UDS_OK {
                         syscall::debug_puts(b"  FAIL: UDS_BIND failed\n");
                         phase57_ok = false;
@@ -7170,9 +7163,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // 3. Listen.
             if phase57_ok {
-                let d2 = reply_port << 32;
-                syscall::send(uds_port, UDS_LISTEN, srv_listen, 4, d2, 0);
-                if let Some(m) = syscall::recv_msg(reply_port) {
+                if let Some(m) = syscall::call(uds_port, UDS_LISTEN, srv_listen, 4, 0, 0) {
                     if m.tag != UDS_OK {
                         syscall::debug_puts(b"  FAIL: UDS_LISTEN failed\n");
                         phase57_ok = false;
@@ -7184,13 +7175,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let mut cli_end = u64::MAX;
             if phase57_ok {
                 let (n0, n1) = pack_name(b"test.sock");
-                let name_len = 9u64;
-                let d2 = name_len | (reply_port << 32);
                 let pid = syscall::getpid();
                 let uid = syscall::getuid() as u64;
                 let d3 = pid | (uid << 32);
-                syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, d3);
-                if let Some(m) = syscall::recv_msg(reply_port) {
+                if let Some(m) = syscall::call(uds_port, UDS_CONNECT, n0, n1, 9, d3) {
                     if m.tag == UDS_OK {
                         cli_end = m.data[0];
                     } else {
@@ -7203,9 +7191,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // 5. Accept (dequeues the server-end).
             let mut srv_end = u64::MAX;
             if phase57_ok {
-                let d2 = reply_port << 32;
-                syscall::send(uds_port, UDS_ACCEPT, srv_listen, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(reply_port) {
+                if let Some(m) = syscall::call(uds_port, UDS_ACCEPT, srv_listen, 0, 0, 0) {
                     if m.tag == UDS_OK {
                         srv_end = m.data[0];
                     } else {
@@ -7218,9 +7204,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // 6. Client sends "hello" to server via cli_end.
             if phase57_ok {
                 let (w0, w1) = pack_name(b"hello");
-                let d2 = 5u64 | (reply_port << 32);
-                syscall::send(uds_port, UDS_SEND, cli_end, w0, d2, w1);
-                if let Some(m) = syscall::recv_msg(reply_port) {
+                if let Some(m) = syscall::call(uds_port, UDS_SEND, cli_end, w0, 5, w1) {
                     if m.tag != UDS_OK || m.data[0] != 5 {
                         syscall::debug_puts(b"  FAIL: UDS_SEND hello failed\n");
                         phase57_ok = false;
@@ -7230,9 +7214,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // 7. Server recvs on srv_end -> should get "hello".
             if phase57_ok {
-                let d2 = reply_port << 32;
-                syscall::send(uds_port, UDS_RECV, srv_end, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(reply_port) {
+                if let Some(m) = syscall::call(uds_port, UDS_RECV, srv_end, 0, 0, 0) {
                     if m.tag != UDS_OK {
                         syscall::debug_puts(b"  FAIL: UDS_RECV failed\n");
                         phase57_ok = false;
@@ -7256,9 +7238,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // 8. Server sends "world" back via srv_end.
             if phase57_ok {
                 let (w0, w1) = pack_name(b"world");
-                let d2 = 5u64 | (reply_port << 32);
-                syscall::send(uds_port, UDS_SEND, srv_end, w0, d2, w1);
-                if let Some(m) = syscall::recv_msg(reply_port) {
+                if let Some(m) = syscall::call(uds_port, UDS_SEND, srv_end, w0, 5, w1) {
                     if m.tag != UDS_OK || m.data[0] != 5 {
                         syscall::debug_puts(b"  FAIL: UDS_SEND world failed\n");
                         phase57_ok = false;
@@ -7268,9 +7248,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // 9. Client recvs on cli_end -> should get "world".
             if phase57_ok {
-                let d2 = reply_port << 32;
-                syscall::send(uds_port, UDS_RECV, cli_end, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(reply_port) {
+                if let Some(m) = syscall::call(uds_port, UDS_RECV, cli_end, 0, 0, 0) {
                     if m.tag != UDS_OK {
                         syscall::debug_puts(b"  FAIL: UDS_RECV world failed\n");
                         phase57_ok = false;
@@ -7286,9 +7264,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // 10. Getpeercred test on srv_end.
             if phase57_ok {
-                let d2 = reply_port << 32;
-                syscall::send(uds_port, UDS_GETPEERCRED, srv_end, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(reply_port) {
+                if let Some(m) = syscall::call(uds_port, UDS_GETPEERCRED, srv_end, 0, 0, 0) {
                     if m.tag != UDS_OK {
                         syscall::debug_puts(b"  FAIL: UDS_GETPEERCRED failed\n");
                         phase57_ok = false;
@@ -7304,9 +7280,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // 11. Close client end, verify server recv gets EOF.
             if phase57_ok {
-                let d2 = reply_port << 32;
-                syscall::send(uds_port, UDS_CLOSE, cli_end, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(reply_port) {
+                if let Some(m) = syscall::call(uds_port, UDS_CLOSE, cli_end, 0, 0, 0) {
                     if m.tag != UDS_OK {
                         syscall::debug_puts(b"  FAIL: UDS_CLOSE failed\n");
                         phase57_ok = false;
@@ -7314,9 +7288,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             }
             if phase57_ok {
-                let d2 = reply_port << 32;
-                syscall::send(uds_port, UDS_RECV, srv_end, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(reply_port) {
+                if let Some(m) = syscall::call(uds_port, UDS_RECV, srv_end, 0, 0, 0) {
                     if m.tag != UDS_EOF {
                         syscall::debug_puts(b"  FAIL: expected EOF after close\n");
                         phase57_ok = false;
@@ -7326,12 +7298,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // Clean up.
             if srv_end != u64::MAX {
-                let d2 = reply_port << 32;
-                syscall::send(uds_port, UDS_CLOSE, srv_end, 0, d2, 0);
-                let _ = syscall::recv_msg(reply_port);
+                let _ = syscall::call(uds_port, UDS_CLOSE, srv_end, 0, 0, 0);
             }
-
-            syscall::port_destroy(reply_port);
 
             if phase57_ok {
                 syscall::debug_puts(b"Phase 57 uds: PASSED\n");
@@ -7389,8 +7357,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 ok = false;
             }
 
-            let rp = syscall::port_create();
-
             let pack_name = |name: &[u8]| -> (u64, u64) {
                 let mut w0 = 0u64;
                 let mut w1 = 0u64;
@@ -7410,9 +7376,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // socket(STREAM)
             let mut srv_h = u64::MAX;
             if ok {
-                let d2 = rp << 32;
-                syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_SOCKET, 0, 0, 0, 0) {
                     if m.tag == UDS_OK {
                         srv_h = m.data[0];
                     } else {
@@ -7425,9 +7389,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // bind("p58.sock")
             if ok {
                 let (n0, n1) = pack_name(b"p58.sock");
-                let d2 = 8u64 | (rp << 32);
-                syscall::send(uds_port, UDS_BIND, srv_h, n0, d2, n1);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_BIND, srv_h, n0, 8, n1) {
                     if m.tag != UDS_OK {
                         ok = false;
                         syscall::debug_puts(b"  FAIL58: bind\n");
@@ -7437,9 +7399,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // listen
             if ok {
-                let d2 = rp << 32;
-                syscall::send(uds_port, UDS_LISTEN, srv_h, 4, d2, 0);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_LISTEN, srv_h, 4, 0, 0) {
                     if m.tag != UDS_OK {
                         ok = false;
                         syscall::debug_puts(b"  FAIL58: listen\n");
@@ -7451,11 +7411,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let mut cli_h = u64::MAX;
             if ok {
                 let (n0, n1) = pack_name(b"p58.sock");
-                let d2 = 8u64 | (rp << 32);
                 let pid = syscall::getpid();
                 let uid = syscall::getuid() as u64;
-                syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, pid | (uid << 32));
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_CONNECT, n0, n1, 8, pid | (uid << 32)) {
                     if m.tag == UDS_OK {
                         cli_h = m.data[0];
                     } else {
@@ -7468,9 +7426,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // accept — returns server-end handle
             let mut acc_h = u64::MAX;
             if ok {
-                let d2 = rp << 32;
-                syscall::send(uds_port, UDS_ACCEPT, srv_h, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_ACCEPT, srv_h, 0, 0, 0) {
                     if m.tag == UDS_OK {
                         acc_h = m.data[0];
                     } else {
@@ -7483,18 +7439,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // send "Hi" on cli, recv on acc
             if ok {
                 let (w0, w1) = pack_name(b"Hi");
-                let d2 = 2u64 | (rp << 32);
-                syscall::send(uds_port, UDS_SEND, cli_h, w0, d2, w1);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_SEND, cli_h, w0, 2, w1) {
                     if m.tag != UDS_OK {
                         ok = false;
                     }
                 }
             }
             if ok {
-                let d2 = rp << 32;
-                syscall::send(uds_port, UDS_RECV, acc_h, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_RECV, acc_h, 0, 0, 0) {
                     if m.tag != UDS_OK || m.data[2] != 2 || (m.data[0] & 0xFF) as u8 != b'H' {
                         ok = false;
                         syscall::debug_puts(b"  FAIL58: recv Hi\n");
@@ -7505,18 +7457,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // send "Ok" on acc, recv on cli
             if ok {
                 let (w0, w1) = pack_name(b"Ok");
-                let d2 = 2u64 | (rp << 32);
-                syscall::send(uds_port, UDS_SEND, acc_h, w0, d2, w1);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_SEND, acc_h, w0, 2, w1) {
                     if m.tag != UDS_OK {
                         ok = false;
                     }
                 }
             }
             if ok {
-                let d2 = rp << 32;
-                syscall::send(uds_port, UDS_RECV, cli_h, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_RECV, cli_h, 0, 0, 0) {
                     if m.tag != UDS_OK || (m.data[0] & 0xFF) as u8 != b'O' {
                         ok = false;
                         syscall::debug_puts(b"  FAIL58: recv Ok\n");
@@ -7526,15 +7474,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // close client, verify EOF on server recv
             if ok {
-                let d2 = rp << 32;
-                syscall::send(uds_port, UDS_CLOSE, cli_h, 0, d2, 0);
-                let _ = syscall::recv_msg(rp);
+                let _ = syscall::call(uds_port, UDS_CLOSE, cli_h, 0, 0, 0);
                 cli_h = u64::MAX;
             }
             if ok {
-                let d2 = rp << 32;
-                syscall::send(uds_port, UDS_RECV, acc_h, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_RECV, acc_h, 0, 0, 0) {
                     if m.tag != UDS_EOF {
                         ok = false;
                         syscall::debug_puts(b"  FAIL58: expected EOF\n");
@@ -7548,10 +7492,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let mut acc2 = u64::MAX;
             if ok {
                 let (n0, n1) = pack_name(b"p58.sock");
-                let d2 = 8u64 | (rp << 32);
                 let pid = syscall::getpid();
-                syscall::send(uds_port, UDS_CONNECT, n0, n1, d2, pid);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_CONNECT, n0, n1, 8, pid) {
                     if m.tag == UDS_OK {
                         cli2 = m.data[0];
                     } else {
@@ -7560,9 +7502,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             }
             if ok {
-                let d2 = rp << 32;
-                syscall::send(uds_port, UDS_ACCEPT, srv_h, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_ACCEPT, srv_h, 0, 0, 0) {
                     if m.tag == UDS_OK {
                         acc2 = m.data[0];
                     } else {
@@ -7573,9 +7513,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Send 16 bytes "ABCDEFGHIJKLMNOP"
             if ok {
                 let (w0, w1) = pack_name(b"ABCDEFGHIJKLMNOP");
-                let d2 = 16u64 | (rp << 32);
-                syscall::send(uds_port, UDS_SEND, cli2, w0, d2, w1);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_SEND, cli2, w0, 16, w1) {
                     if m.tag != UDS_OK || m.data[0] != 16 {
                         ok = false;
                         syscall::debug_puts(b"  FAIL58: send 16B\n");
@@ -7584,9 +7522,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
             // Recv should get 16 bytes back
             if ok {
-                let d2 = rp << 32;
-                syscall::send(uds_port, UDS_RECV, acc2, 0, d2, 0);
-                if let Some(m) = syscall::recv_msg(rp) {
+                if let Some(m) = syscall::call(uds_port, UDS_RECV, acc2, 0, 0, 0) {
                     if m.tag != UDS_OK || m.data[2] != 16 || (m.data[0] & 0xFF) as u8 != b'A' {
                         ok = false;
                         syscall::debug_puts(b"  FAIL58: recv 16B\n");
@@ -7596,22 +7532,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // Clean up.
             if cli2 != u64::MAX {
-                let d2 = rp << 32;
-                syscall::send(uds_port, UDS_CLOSE, cli2, 0, d2, 0);
-                let _ = syscall::recv_msg(rp);
+                let _ = syscall::call(uds_port, UDS_CLOSE, cli2, 0, 0, 0);
             }
             if acc2 != u64::MAX {
-                let d2 = rp << 32;
-                syscall::send(uds_port, UDS_CLOSE, acc2, 0, d2, 0);
-                let _ = syscall::recv_msg(rp);
+                let _ = syscall::call(uds_port, UDS_CLOSE, acc2, 0, 0, 0);
             }
             if acc_h != u64::MAX {
-                let d2 = rp << 32;
-                syscall::send(uds_port, UDS_CLOSE, acc_h, 0, d2, 0);
-                let _ = syscall::recv_msg(rp);
+                let _ = syscall::call(uds_port, UDS_CLOSE, acc_h, 0, 0, 0);
             }
-
-            syscall::port_destroy(rp);
 
             if ok {
                 syscall::debug_puts(b"Phase 58 socket API (Rust): PASSED\n");
@@ -10354,6 +10282,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if p == 2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
+                        // Helper macro: linux write(1, msg, len) for debug
+                        macro_rules! dbg124 {
+                            ($s:expr) => {{
+                                let _wr: u64;
+                                core::arch::asm!(
+                                    "int 0x80",
+                                    inlateout("rax") 1u64 => _wr,
+                                    in("rdi") 1u64,
+                                    in("rsi") $s.as_ptr() as u64,
+                                    in("rdx") $s.len() as u64,
+                                    lateout("rcx") _, lateout("r11") _,
+                                );
+                            }};
+                        }
+                        dbg124!(b"[124] step1: pipe2\n");
                         // 1. pipe2(pipefd, 0) → syscall 293
                         let mut pipefd = [0u8; 8];
                         let pipe_ret: u64;
@@ -10365,12 +10308,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             lateout("rcx") _,
                             lateout("r11") _,
                         );
+                        dbg124!(b"[124] pipe2 returned\n");
                         if (pipe_ret as i64) < 0 {
                             core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 1u64, options(noreturn));
                         }
                         let read_fd = i32::from_le_bytes([pipefd[0], pipefd[1], pipefd[2], pipefd[3]]);
                         let write_fd = i32::from_le_bytes([pipefd[4], pipefd[5], pipefd[6], pipefd[7]]);
 
+                        dbg124!(b"[124] step2: write\n");
                         // 2. write(write_fd, "hello pipe\n", 11)
                         let msg = b"hello pipe\n";
                         let _: u64;
@@ -10384,6 +10329,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             lateout("r11") _,
                         );
 
+                        dbg124!(b"[124] step3: read\n");
                         // 3. read(read_fd, buf, 64)
                         let mut rbuf = [0u8; 64];
                         let nread: u64;
@@ -10402,6 +10348,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 10u64, options(noreturn));
                         }
 
+                        dbg124!(b"[124] step5: dup2\n");
                         // 5. Test dup2: dup2(write_fd, 10)
                         let dup_ret: u64;
                         core::arch::asm!(

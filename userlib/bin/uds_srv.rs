@@ -68,15 +68,15 @@ struct UnixSocket {
     // Accept queue (for listening sockets).
     pending: [u32; MAX_PENDING], // server-end socket indices
     pending_count: usize,
-    // Blocked accept caller.
-    accept_reply: u64, // reply port (0 = none blocked)
+    // Blocked accept caller (call/reply cap from reply_take, 0 = none).
+    accept_reply_cap: u64,
     // Receive buffer (ring buffer).
     rx_buf: [u8; RX_BUF_SIZE],
     rx_head: usize,
     rx_tail: usize,
     rx_eof: bool,
-    // Blocked recv caller.
-    recv_reply: u64, // reply port (0 = none blocked)
+    // Blocked recv caller (call/reply cap from reply_take, 0 = none).
+    recv_reply_cap: u64,
 }
 
 impl UnixSocket {
@@ -92,12 +92,12 @@ impl UnixSocket {
             cred_gid: 0,
             pending: [0; MAX_PENDING],
             pending_count: 0,
-            accept_reply: 0,
+            accept_reply_cap: 0,
             rx_buf: [0; RX_BUF_SIZE],
             rx_head: 0,
             rx_tail: 0,
             rx_eof: false,
-            recv_reply: 0,
+            recv_reply_cap: 0,
         }
     }
 
@@ -205,29 +205,29 @@ fn pack_bytes(data: &[u8], len: usize) -> (u64, u64) {
     (w0, w1)
 }
 
-/// Send a reply with up to 4 data words.
-fn reply(port: u64, tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
-    syscall::send(port, tag, d0, d1, d2, d3);
+/// Send an immediate reply to the current caller (via call/reply).
+fn reply(tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
+    syscall::reply(tag, d0, d1, d2, d3, 0);
 }
 
 /// Deliver data (or EOF) to a socket that has a blocked recv.
-/// Returns true if data was delivered to a waiter.
+/// Uses reply_to() to send to the saved reply capability.
 fn try_wake_recv(sock_idx: u32) {
     let s = unsafe { &mut SOCKS[sock_idx as usize] };
-    if s.recv_reply == 0 {
+    if s.recv_reply_cap == 0 {
         return;
     }
-    let rp = s.recv_reply;
+    let cap = s.recv_reply_cap;
     // Check if there's data.
     if s.rx_len() > 0 {
         let mut tmp = [0u8; 16];
         let n = s.rx_pop(&mut tmp);
         let (w0, w1) = pack_bytes(&tmp, n);
-        s.recv_reply = 0;
-        reply(rp, UDS_OK, w0, w1, n as u64, 0);
+        s.recv_reply_cap = 0;
+        syscall::reply_to(cap, UDS_OK, w0, w1, n as u64, 0);
     } else if s.rx_eof {
-        s.recv_reply = 0;
-        reply(rp, UDS_EOF, 0, 0, 0, 0);
+        s.recv_reply_cap = 0;
+        syscall::reply_to(cap, UDS_EOF, 0, 0, 0, 0);
     }
 }
 
@@ -237,13 +237,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::ns_register(b"uds", svc_port);
 
     loop {
-        let msg = match syscall::recv_msg(svc_port) {
+        let msg = match syscall::recv_with_cap(svc_port) {
             Some(m) => m,
             None => continue,
         };
 
         let tag = msg.tag;
-        let reply_port = msg.data[2] >> 32;
 
         match tag {
             UDS_SOCKET => {
@@ -252,9 +251,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     unsafe {
                         SOCKS[h as usize].sock_type = sock_type;
                     }
-                    reply(reply_port, UDS_OK, h as u64, 0, 0, 0);
+                    reply(UDS_OK, h as u64, 0, 0, 0);
                 } else {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                 }
             }
 
@@ -263,33 +262,33 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let name_len = (msg.data[2] & 0xFFFF) as usize;
                 let (name, nlen) = unpack_name(msg.data[1], msg.data[3], name_len);
                 if handle as usize >= MAX_SOCKETS {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let s = unsafe { &mut SOCKS[handle as usize] };
                 if s.state != SockState::Created {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 s.name = name;
                 s.name_len = nlen;
                 s.state = SockState::Bound;
-                reply(reply_port, UDS_OK, 0, 0, 0, 0);
+                reply(UDS_OK, 0, 0, 0, 0);
             }
 
             UDS_LISTEN => {
                 let handle = msg.data[0] as u32;
                 if handle as usize >= MAX_SOCKETS {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let s = unsafe { &mut SOCKS[handle as usize] };
                 if s.state != SockState::Bound {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 s.state = SockState::Listening;
-                reply(reply_port, UDS_OK, 0, 0, 0, 0);
+                reply(UDS_OK, 0, 0, 0, 0);
             }
 
             UDS_CONNECT => {
@@ -304,7 +303,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let listener = match find_listening(&name, nlen) {
                     Some(l) => l,
                     None => {
-                        reply(reply_port, UDS_ERROR, 1, 0, 0, 0); // ECONNREFUSED
+                        reply(UDS_ERROR, 1, 0, 0, 0); // ECONNREFUSED
                         continue;
                     }
                 };
@@ -313,7 +312,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let srv_end = match alloc_socket() {
                     Some(h) => h,
                     None => {
-                        reply(reply_port, UDS_ERROR, 2, 0, 0, 0);
+                        reply(UDS_ERROR, 2, 0, 0, 0);
                         continue;
                     }
                 };
@@ -323,7 +322,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         unsafe {
                             SOCKS[srv_end as usize].state = SockState::Free;
                         }
-                        reply(reply_port, UDS_ERROR, 2, 0, 0, 0);
+                        reply(UDS_ERROR, 2, 0, 0, 0);
                         continue;
                     }
                 };
@@ -346,13 +345,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 // Check if accept() is already blocked on the listener.
-                let accept_rp = unsafe { SOCKS[listener as usize].accept_reply };
-                if accept_rp != 0 {
-                    // Wake the blocked acceptor immediately.
+                let accept_cap = unsafe { SOCKS[listener as usize].accept_reply_cap };
+                if accept_cap != 0 {
+                    // Wake the blocked acceptor immediately via deferred reply.
                     unsafe {
-                        SOCKS[listener as usize].accept_reply = 0;
+                        SOCKS[listener as usize].accept_reply_cap = 0;
                     }
-                    reply(accept_rp, UDS_OK, srv_end as u64, 0, 0, 0);
+                    syscall::reply_to(accept_cap, UDS_OK, srv_end as u64, 0, 0, 0);
                 } else {
                     // Queue server-end for later accept().
                     let ls = unsafe { &mut SOCKS[listener as usize] };
@@ -365,24 +364,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             SOCKS[srv_end as usize].state = SockState::Free;
                             SOCKS[cli_end as usize].state = SockState::Free;
                         }
-                        reply(reply_port, UDS_ERROR, 3, 0, 0, 0); // ECONNREFUSED
+                        reply(UDS_ERROR, 3, 0, 0, 0); // ECONNREFUSED
                         continue;
                     }
                 }
 
                 // Reply to connector with client-end handle.
-                reply(reply_port, UDS_OK, cli_end as u64, 0, 0, 0);
+                reply(UDS_OK, cli_end as u64, 0, 0, 0);
             }
 
             UDS_ACCEPT => {
                 let handle = msg.data[0] as u32;
                 if handle as usize >= MAX_SOCKETS {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let s = unsafe { &mut SOCKS[handle as usize] };
                 if s.state != SockState::Listening {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -396,10 +395,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         i += 1;
                     }
                     s.pending_count -= 1;
-                    reply(reply_port, UDS_OK, srv_end as u64, 0, 0, 0);
+                    reply(UDS_OK, srv_end as u64, 0, 0, 0);
                 } else {
-                    // No pending — block the acceptor.
-                    s.accept_reply = reply_port;
+                    // No pending — block the acceptor (deferred reply).
+                    s.accept_reply_cap = syscall::reply_take();
                 }
             }
 
@@ -408,17 +407,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let len = (msg.data[2] & 0xFFFF) as usize;
                 let len = if len > 16 { 16 } else { len };
                 if handle as usize >= MAX_SOCKETS {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let s = unsafe { &SOCKS[handle as usize] };
                 if s.state != SockState::Connected {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let peer_idx = s.peer;
                 if peer_idx == u32::MAX || peer_idx as usize >= MAX_SOCKETS {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -439,11 +438,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Push into peer's rx_buf.
                 let peer = unsafe { &mut SOCKS[peer_idx as usize] };
                 if peer.state == SockState::Closed || peer.state == SockState::Free {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let written = peer.rx_push(&tmp[..len]);
-                reply(reply_port, UDS_OK, written as u64, 0, 0, 0);
+                reply(UDS_OK, written as u64, 0, 0, 0);
 
                 // Wake blocked recv on peer if any.
                 try_wake_recv(peer_idx);
@@ -452,12 +451,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             UDS_RECV => {
                 let handle = msg.data[0] as u32;
                 if handle as usize >= MAX_SOCKETS {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let s = unsafe { &mut SOCKS[handle as usize] };
                 if s.state != SockState::Connected && s.state != SockState::Closed {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -465,19 +464,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     let mut tmp = [0u8; 16];
                     let n = s.rx_pop(&mut tmp);
                     let (w0, w1) = pack_bytes(&tmp, n);
-                    reply(reply_port, UDS_OK, w0, w1, n as u64, 0);
+                    reply(UDS_OK, w0, w1, n as u64, 0);
                 } else if s.rx_eof {
-                    reply(reply_port, UDS_EOF, 0, 0, 0, 0);
+                    reply(UDS_EOF, 0, 0, 0, 0);
                 } else {
-                    // Block — store reply port.
-                    s.recv_reply = reply_port;
+                    // Block — save reply capability for deferred reply.
+                    s.recv_reply_cap = syscall::reply_take();
                 }
             }
 
             UDS_CLOSE => {
                 let handle = msg.data[0] as u32;
                 if handle as usize >= MAX_SOCKETS {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let s = unsafe { &mut SOCKS[handle as usize] };
@@ -495,29 +494,28 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
 
-                reply(reply_port, UDS_OK, 0, 0, 0, 0);
+                reply(UDS_OK, 0, 0, 0, 0);
             }
 
             UDS_GETPEERCRED => {
                 let handle = msg.data[0] as u32;
                 if handle as usize >= MAX_SOCKETS {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let s = unsafe { &SOCKS[handle as usize] };
                 if s.state != SockState::Connected {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 // Return credentials of the peer.
                 let peer_idx = s.peer;
                 if peer_idx == u32::MAX || peer_idx as usize >= MAX_SOCKETS {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let peer = unsafe { &SOCKS[peer_idx as usize] };
                 reply(
-                    reply_port,
                     UDS_OK,
                     peer.cred_pid as u64,
                     (peer.cred_uid as u64) | ((peer.cred_gid as u64) << 32),
@@ -530,12 +528,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let handle = msg.data[0] as u32;
                 let events = (msg.data[2] & 0xFFFF) as u16;
                 if handle as usize >= MAX_SOCKETS {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let s = unsafe { &SOCKS[handle as usize] };
                 if s.state == SockState::Free {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -567,27 +565,25 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         revents |= 0x0020; // POLLNVAL
                     }
                 }
-                reply(reply_port, UDS_OK, revents as u64, 0, 0, 0);
+                reply(UDS_OK, revents as u64, 0, 0, 0);
             }
 
             UDS_GETPEER => {
                 let handle = msg.data[0] as u32;
                 if handle as usize >= MAX_SOCKETS {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
                 let s = unsafe { &SOCKS[handle as usize] };
                 if s.state != SockState::Connected || s.peer == u32::MAX {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
+                    reply(UDS_ERROR, 0, 0, 0, 0);
                     continue;
                 }
-                reply(reply_port, UDS_OK, s.peer as u64, 0, 0, 0);
+                reply(UDS_OK, s.peer as u64, 0, 0, 0);
             }
 
             _ => {
-                if reply_port != 0 {
-                    reply(reply_port, UDS_ERROR, 0, 0, 0, 0);
-                }
+                reply(UDS_ERROR, 0, 0, 0, 0);
             }
         }
     }

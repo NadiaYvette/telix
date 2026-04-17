@@ -1105,7 +1105,6 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         return 0; // EOF
     }
 
-    let reply_port = unsafe { REPLY_PORT };
     let remaining = (file_size - offset) as usize;
     let want = count.min(remaining);
     let mut total = 0usize;
@@ -1113,9 +1112,8 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     // FS_READ returns max 16 bytes per message.
     while total < want {
         let chunk = (want - total).min(16);
-        let d2 = (chunk as u64) | ((reply_port) << 32);
-        syscall::send(fs_port, FS_READ, handle, offset + total as u64, d2, 0);
-        let resp = match syscall::recv_msg(reply_port) {
+        let d2 = chunk as u64;
+        let resp = match syscall::call(fs_port, FS_READ, handle, offset + total as u64, d2, 0) {
             Some(m) => m,
             None => break,
         };
@@ -1199,16 +1197,14 @@ fn handle_pread64(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     // Regular file via FS server.
     if offset >= file_size { return 0; }
-    let reply_port = unsafe { REPLY_PORT };
     let remaining = (file_size - offset) as usize;
     let want = count.min(remaining);
     let mut total = 0usize;
 
     while total < want {
         let chunk = (want - total).min(16);
-        let d2 = (chunk as u64) | ((reply_port) << 32);
-        syscall::send(fs_port, FS_READ, handle, offset + total as u64, d2, 0);
-        let resp = match syscall::recv_msg(reply_port) {
+        let d2 = chunk as u64;
+        let resp = match syscall::call(fs_port, FS_READ, handle, offset + total as u64, d2, 0) {
             Some(m) => m,
             None => break,
         };
@@ -1480,11 +1476,11 @@ fn handle_sendfile(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         if to_read == 0 { break; }
 
         // Read from FS server.
-        let reply_port = unsafe { REPLY_PORT };
         let d2 = (handle << 32) | (to_read as u64);
-        let d3 = (reply_port << 32) | offset;
+        let d3 = offset;
         syscall::send(fs_port, FS_READ, 0, 0, d2, d3);
         let mut got = 0usize;
+        let reply_port = unsafe { REPLY_PORT };
         loop {
             let resp = match syscall::recv_msg(reply_port) {
                 Some(m) => m,
@@ -1516,9 +1512,8 @@ fn handle_sendfile(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             let w1 = if got > 8 {
                 u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]])
             } else { 0 };
-            let wd2 = (reply_port << 32) | (out_handle << 16) | (got.min(16) as u64);
-            syscall::send(out_fs_port, 0x5001, w0, w1, wd2, 0);
-            let _ = syscall::recv_msg(reply_port);
+            let wd2 = (out_handle << 16) | (got.min(16) as u64);
+            let _ = syscall::call(out_fs_port, 0x5001, w0, w1, wd2, 0);
         }
         // For simplicity, only handle pipe output. For file→file, skip.
 
@@ -1610,11 +1605,9 @@ fn fs_read_bulk(fs_port: u64, handle: u64, offset: u64, max_len: usize) -> Optio
             return None;
         }
     }
-    let reply_port = unsafe { REPLY_PORT };
     let length = max_len.min(4096) as u64;
-    let d2 = (length & 0xFFFF_FFFF) | (reply_port << 32);
-    syscall::send(fs_port, FS_READ, handle, offset, d2, LIN_FS_SCRATCH_VA as u64);
-    let resp = match syscall::recv_msg(reply_port) {
+    let d2 = length & 0xFFFF_FFFF;
+    let resp = match syscall::call(fs_port, FS_READ, handle, offset, d2, LIN_FS_SCRATCH_VA as u64) {
         Some(m) => m,
         None => return None,
     };
@@ -1641,7 +1634,6 @@ fn put_long_path(path: &[u8]) -> usize {
 /// Open via VFS_OPEN_LONG. Returns fd or negated errno.
 fn do_open_long(pi: usize, path: &[u8], flags: u64) -> u64 {
     let vfs_port = unsafe { VFS_PORT };
-    let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
@@ -1649,9 +1641,8 @@ fn do_open_long(pi: usize, path: &[u8], flags: u64) -> u64 {
     if n == 0 {
         return linux_err(ENOENT);
     }
-    let d0 = (n as u64) | ((flags & 0xFFFF) << 16) | (reply_port << 32);
-    syscall::send(vfs_port, VFS_OPEN_LONG, d0, 0, 0, 0);
-    let resp = match syscall::recv_msg(reply_port) {
+    let d0 = (n as u64) | ((flags & 0xFFFF) << 16);
+    let resp = match syscall::call(vfs_port, VFS_OPEN_LONG, d0, 0, 0, 0) {
         Some(m) => m,
         None => return linux_err(ENOENT),
     };
@@ -1690,7 +1681,6 @@ fn do_open_long(pi: usize, path: &[u8], flags: u64) -> u64 {
 /// Returns 0 on success or negated errno.
 fn do_stat_long(path: &[u8]) -> Option<(u64, u64, u64, u64)> {
     let vfs_port = unsafe { VFS_PORT };
-    let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 {
         return None;
     }
@@ -1698,9 +1688,8 @@ fn do_stat_long(path: &[u8]) -> Option<(u64, u64, u64, u64)> {
     if n == 0 {
         return None;
     }
-    let d0 = (n as u64) | (reply_port << 32);
-    syscall::send(vfs_port, VFS_STAT_LONG, d0, 0, 0, 0);
-    let resp = syscall::recv_msg(reply_port)?;
+    let d0 = n as u64;
+    let resp = syscall::call(vfs_port, VFS_STAT_LONG, d0, 0, 0, 0)?;
     const VFS_STAT_OK: u64 = 0x6120;
     if resp.tag != VFS_STAT_OK {
         return None;
@@ -1711,7 +1700,6 @@ fn do_stat_long(path: &[u8]) -> Option<(u64, u64, u64, u64)> {
 /// chmod via VFS_CHMOD long-path. Returns 0 on success or negated errno.
 fn do_chmod_long(path: &[u8], mode: u32) -> u64 {
     let vfs_port = unsafe { VFS_PORT };
-    let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
@@ -1719,9 +1707,8 @@ fn do_chmod_long(path: &[u8], mode: u32) -> u64 {
     if n == 0 {
         return linux_err(ENOENT);
     }
-    let d0 = (n as u64) | ((mode as u64 & 0xFFFF) << 16) | (reply_port << 32);
-    syscall::send(vfs_port, VFS_CHMOD, d0, 0, 0, 0);
-    match syscall::recv_msg(reply_port) {
+    let d0 = (n as u64) | ((mode as u64 & 0xFFFF) << 16);
+    match syscall::call(vfs_port, VFS_CHMOD, d0, 0, 0, 0) {
         Some(resp) if resp.tag == VFS_CHMOD_OK => 0,
         _ => linux_err(ENOENT),
     }
@@ -1730,7 +1717,6 @@ fn do_chmod_long(path: &[u8], mode: u32) -> u64 {
 /// utimens via VFS_UTIMENS long-path. Returns 0 on success or negated errno.
 fn do_utimens_long(path: &[u8], atime: u64, mtime: u64) -> u64 {
     let vfs_port = unsafe { VFS_PORT };
-    let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
@@ -1738,9 +1724,8 @@ fn do_utimens_long(path: &[u8], atime: u64, mtime: u64) -> u64 {
     if n == 0 {
         return linux_err(ENOENT);
     }
-    let d0 = (n as u64) | (reply_port << 32);
-    syscall::send(vfs_port, VFS_UTIMENS, d0, atime, mtime, 0);
-    match syscall::recv_msg(reply_port) {
+    let d0 = n as u64;
+    match syscall::call(vfs_port, VFS_UTIMENS, d0, atime, mtime, 0) {
         Some(resp) if resp.tag == VFS_UTIMENS_OK => 0,
         _ => linux_err(ENOENT),
     }
@@ -1749,7 +1734,6 @@ fn do_utimens_long(path: &[u8], atime: u64, mtime: u64) -> u64 {
 /// Open a file via VFS. Returns fd or negated errno.
 fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
     let vfs_port = unsafe { VFS_PORT };
-    let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
@@ -1838,10 +1822,8 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         w1 |= (path[i] as u64) << ((i - 8) * 8);
     }
 
-    let d2 = (pathlen as u64) | ((flags & 0xFFFF) << 16) | ((reply_port) << 32);
-    syscall::send(vfs_port, VFS_OPEN, w0, w1, d2, 0);
-
-    let resp = match syscall::recv_msg(reply_port) {
+    let d2 = (pathlen as u64) | ((flags & 0xFFFF) << 16);
+    let resp = match syscall::call(vfs_port, VFS_OPEN, w0, w1, d2, 0) {
         Some(m) => m,
         None => return linux_err(ENOENT),
     };
@@ -2195,31 +2177,18 @@ fn do_close(pi: usize, fd: usize) {
         }
         match PROC_TABLE[pi].fds[fd].kind {
             FdKind::File => {
-                let rp = REPLY_PORT;
-                // FS_CLOSE wire format: data[0]=handle, data[2] upper 32=reply_port.
-                let d2 = rp << 32;
-                syscall::send(PROC_TABLE[pi].fds[fd].fs_port, FS_CLOSE, PROC_TABLE[pi].fds[fd].handle, 0, d2, 0);
-                let _ = syscall::recv_msg(rp);
+                let _ = syscall::call(PROC_TABLE[pi].fds[fd].fs_port, FS_CLOSE, PROC_TABLE[pi].fds[fd].handle, 0, 0, 0);
             }
             FdKind::Pipe => {
-                let rp = syscall::port_create();
-                let d2 = (rp as u64) << 32;
-                syscall::send(PROC_TABLE[pi].fds[fd].fs_port, PIPE_CLOSE_TAG, PROC_TABLE[pi].fds[fd].handle, 0, d2, 0);
-                let _ = syscall::recv_msg(rp);
-                syscall::port_destroy(rp);
+                let _ = syscall::call(PROC_TABLE[pi].fds[fd].fs_port, PIPE_CLOSE_TAG, PROC_TABLE[pi].fds[fd].handle, 0, 0, 0);
             }
             FdKind::Socket => {
-                let rp = syscall::port_create();
                 let dom = PROC_TABLE[pi].fds[fd].sock_domain;
                 if dom == AF_UNIX as u8 {
-                    let d2 = (rp as u64) << 32;
-                    syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_CLOSE, PROC_TABLE[pi].fds[fd].handle, 0, d2, 0);
-                    let _ = syscall::recv_msg(rp);
+                    let _ = syscall::call(PROC_TABLE[pi].fds[fd].fs_port, UDS_CLOSE, PROC_TABLE[pi].fds[fd].handle, 0, 0, 0);
                 } else if dom == AF_INET as u8 && PROC_TABLE[pi].fds[fd].handle != u64::MAX {
-                    syscall::send(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_CLOSE, PROC_TABLE[pi].fds[fd].handle, rp, 0, 0);
-                    let _ = syscall::recv_msg(rp);
+                    let _ = syscall::call(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_CLOSE, PROC_TABLE[pi].fds[fd].handle, 0, 0, 0);
                 }
-                syscall::port_destroy(rp);
             }
             FdKind::Dir => {} // No server handle to close.
             FdKind::Epoll => {
@@ -2316,7 +2285,6 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
     let statbuf_va = args[1] as usize;
 
     let vfs_port = unsafe { VFS_PORT };
-    let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
@@ -2412,10 +2380,8 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
             w1 |= (path[i] as u64) << ((i - 8) * 8);
         }
 
-        let d2 = (pathlen as u64) | ((reply_port) << 32);
-        syscall::send(vfs_port, VFS_STAT, w0, w1, d2, 0);
-
-        let resp = match syscall::recv_msg(reply_port) {
+        let d2 = pathlen as u64;
+        let resp = match syscall::call(vfs_port, VFS_STAT, w0, w1, d2, 0) {
             Some(m) => m,
             None => return linux_err(ENOENT),
         };
@@ -2626,11 +2592,8 @@ fn handle_statx(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     }
 
     let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
-    let reply_port = unsafe { REPLY_PORT };
-    let d2 = plen | (reply_port << 32);
-    syscall::send(vfs_port, VFS_STAT, w0, w1, d2, 0);
-
-    let resp = match syscall::recv_msg(reply_port) {
+    let d2 = plen;
+    let resp = match syscall::call(vfs_port, VFS_STAT, w0, w1, d2, 0) {
         Some(m) => m,
         None => return linux_err(ENOENT),
     };
@@ -2914,7 +2877,6 @@ fn handle_access(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let path_va = args[0] as usize;
 
     let vfs_port = unsafe { VFS_PORT };
-    let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
@@ -2945,10 +2907,8 @@ fn handle_access(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     }
 
     let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
-    let d2 = plen | ((reply_port) << 32);
-    syscall::send(vfs_port, VFS_STAT, w0, w1, d2, 0);
-
-    let resp = match syscall::recv_msg(reply_port) {
+    let d2 = plen;
+    let resp = match syscall::call(vfs_port, VFS_STAT, w0, w1, d2, 0) {
         Some(m) => m,
         None => return linux_err(ENOENT),
     };
@@ -3110,18 +3070,13 @@ fn handle_tgkill(caller_port: u64, args: &[u64; 6]) -> u64 {
 
 /// Read from a pipe FD into the caller's buffer via personality_copy_out.
 fn read_pipe(caller_port: u64, pipe_port: u64, handle: u64, buf_va: usize, count: usize) -> u64 {
-    let rp = syscall::port_create();
-    let d2 = (rp as u64) << 32;
-    syscall::send(pipe_port, PIPE_READ_TAG, handle, 0, d2, 0);
-    let msg = match syscall::recv_msg(rp) {
+    let msg = match syscall::call(pipe_port, PIPE_READ_TAG, handle, 0, 0, 0) {
         Some(m) => m,
         None => {
             syscall::debug_puts(b"[linux_srv] read_pipe: no reply\n");
-            syscall::port_destroy(rp);
             return linux_err(EBADF);
         }
     };
-    syscall::port_destroy(rp);
 
     if msg.tag == PIPE_EOF_TAG {
         return 0;
@@ -3161,9 +3116,7 @@ fn write_pipe(caller_port: u64, pipe_port: u64, handle: u64, buf_va: usize, coun
         let mut w1 = 0u64;
         for i in 0..copied.min(8) { w0 |= (tmp[i] as u64) << (i * 8); }
         for i in 8..copied { w1 |= (tmp[i] as u64) << ((i - 8) * 8); }
-        // Fire-and-forget: d2 low16 = len, high32 = 0xFFFFFFFF (no reply).
-        let d2 = (copied as u64) | (0xFFFFFFFF_u64 << 32);
-        syscall::send(pipe_port, PIPE_WRITE_TAG, handle, w0, d2, w1);
+        let _ = syscall::call(pipe_port, PIPE_WRITE_TAG, handle, w0, copied as u64, w1);
         offset += copied;
     }
     offset as u64
@@ -3177,15 +3130,11 @@ fn handle_pipe2(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let pipe_port = unsafe { PIPE_PORT };
     if pipe_port == 0 { return linux_err(ENOSYS); }
 
-    // Create a pipe via pipe_srv.
-    let rp = syscall::port_create();
-    let d2 = (rp as u64) << 32;
-    syscall::send(pipe_port, PIPE_CREATE, 0, 0, d2, 0);
-    let msg = match syscall::recv_msg(rp) {
+    // Create a pipe via pipe_srv (call/reply).
+    let msg = match syscall::call(pipe_port, PIPE_CREATE, 0, 0, 0, 0) {
         Some(m) => m,
-        None => { syscall::port_destroy(rp); return linux_err(ENOSYS); }
+        None => return linux_err(ENOSYS),
     };
-    syscall::port_destroy(rp);
     if msg.tag != PIPE_OK { return linux_err(ENOSYS); }
 
     let read_handle = msg.data[0];
@@ -3619,7 +3568,6 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                 else { (file_size - file_offset) as usize };
                     let to_read = len.min(avail);
                     if to_read > 0 {
-                        let reply_port = unsafe { REPLY_PORT };
                         let mut total = 0usize;
                         // Probe scratch availability with the first chunk.
                         ensure_fs_scratch_grants();
@@ -3647,9 +3595,8 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                             let mut buf_used = 0usize;
                             while total < to_read {
                                 let chunk = (to_read - total).min(16);
-                                let d2 = (chunk as u64) | ((reply_port) << 32);
-                                syscall::send(fs_port, FS_READ, handle, file_offset + total as u64, d2, 0);
-                                let resp = match syscall::recv_msg(reply_port) {
+                                let d2 = chunk as u64;
+                                let resp = match syscall::call(fs_port, FS_READ, handle, file_offset + total as u64, d2, 0) {
                                     Some(m) => m,
                                     None => break,
                                 };
@@ -3936,17 +3883,14 @@ fn handle_mkdir(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let mode = args[1] as u32;
 
     let vfs_port = unsafe { VFS_PORT };
-    let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 { return linux_err(ENOSYS); }
 
     let (path, pathlen) = resolve_path(pi, caller_port, path_va);
     if pathlen == 0 { return linux_err(EFAULT); }
 
     let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
-    let d2 = plen | (((mode & 0xFFFF) as u64) << 16) | ((reply_port) << 32);
-    syscall::send(vfs_port, VFS_MKDIR, w0, w1, d2, 0);
-
-    match syscall::recv_msg(reply_port) {
+    let d2 = plen | (((mode & 0xFFFF) as u64) << 16);
+    match syscall::call(vfs_port, VFS_MKDIR, w0, w1, d2, 0) {
         Some(resp) if resp.tag == VFS_MKDIR_OK => 0,
         _ => linux_err(EEXIST),
     }
@@ -3965,17 +3909,14 @@ fn handle_unlink_impl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let path_va = args[0] as usize;
 
     let vfs_port = unsafe { VFS_PORT };
-    let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 { return linux_err(ENOSYS); }
 
     let (path, pathlen) = resolve_path(pi, caller_port, path_va);
     if pathlen == 0 { return linux_err(EFAULT); }
 
     let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
-    let d2 = plen | ((reply_port) << 32);
-    syscall::send(vfs_port, VFS_UNLINK, w0, w1, d2, 0);
-
-    match syscall::recv_msg(reply_port) {
+    let d2 = plen;
+    match syscall::call(vfs_port, VFS_UNLINK, w0, w1, d2, 0) {
         Some(resp) if resp.tag == VFS_UNLINK_OK => 0,
         _ => linux_err(ENOENT),
     }
@@ -3998,14 +3939,11 @@ fn handle_chdir(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     // Verify directory exists via VFS_STAT.
     let vfs_port = unsafe { VFS_PORT };
-    let reply_port = unsafe { REPLY_PORT };
     if vfs_port == 0 { return linux_err(ENOSYS); }
 
     let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
-    let d2 = plen | ((reply_port) << 32);
-    syscall::send(vfs_port, VFS_STAT, w0, w1, d2, 0);
-
-    match syscall::recv_msg(reply_port) {
+    let d2 = plen;
+    match syscall::call(vfs_port, VFS_STAT, w0, w1, d2, 0) {
         Some(resp) if resp.tag == VFS_STAT_OK => {
             // Update CWD for this process.
             unsafe {
@@ -4168,7 +4106,6 @@ fn handle_getdents64(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     // Use the FD's offset as the readdir pagination cursor.
     let start_offset = unsafe { PROC_TABLE[pi].fds[fd].offset } as u64;
 
-    let rp = syscall::port_create();
     let mut buf = [0u8; 2048];
     let mut buf_pos = 0usize;
     let mut next_off = start_offset;
@@ -4177,10 +4114,7 @@ fn handle_getdents64(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     for _ in 0..200 {
         if buf_pos + 280 > count.min(2048) { break; } // Leave room for next entry
 
-        let d2 = (rp as u64) & 0xFFFF_FFFF;
-        syscall::send(fs_port, FS_READDIR, next_off, 0, d2, 0);
-
-        let resp = match syscall::recv_msg(rp) {
+        let resp = match syscall::call(fs_port, FS_READDIR, next_off, 0, 0, 0) {
             Some(m) => m,
             None => break,
         };
@@ -4240,8 +4174,6 @@ fn handle_getdents64(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
         buf_pos += reclen;
     }
-
-    syscall::port_destroy(rp);
 
     // Update FD offset for next call.
     unsafe { PROC_TABLE[pi].fds[fd].offset = next_off; }
@@ -5205,14 +5137,10 @@ fn handle_getid(nr: u64, caller_port: u64) -> u64 {
 /// Read from a socket FD (UDS or TCP).
 fn read_socket(caller_port: u64, srv_port: u64, handle: u64, domain: u8, buf_va: usize, count: usize) -> u64 {
     if domain == AF_UNIX as u8 {
-        let rp = syscall::port_create();
-        let d2 = (rp as u64) << 32;
-        syscall::send(srv_port, UDS_RECV, handle, 0, d2, 0);
-        let resp = match syscall::recv_msg(rp) {
+        let resp = match syscall::call(srv_port, UDS_RECV, handle, 0, 0, 0) {
             Some(m) => m,
-            None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+            None => { return linux_err(ECONNREFUSED); }
         };
-        syscall::port_destroy(rp);
         if resp.tag == UDS_EOF { return 0; }
         if resp.tag != UDS_OK { return linux_err(ECONNREFUSED); }
         let len = (resp.data[2] & 0xFFFF) as usize;
@@ -5227,14 +5155,10 @@ fn read_socket(caller_port: u64, srv_port: u64, handle: u64, domain: u8, buf_va:
         written as u64
     } else if domain == AF_INET as u8 {
         if handle == u64::MAX { return linux_err(ENOTCONN); }
-        let rp = syscall::port_create();
-        let d1 = (rp as u64) << 16;
-        syscall::send(srv_port, NET_TCP_RECV, handle, d1, 0, 0);
-        let resp = match syscall::recv_msg(rp) {
+        let resp = match syscall::call(srv_port, NET_TCP_RECV, handle, 0, 0, 0) {
             Some(m) => m,
-            None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+            None => { return linux_err(ECONNREFUSED); }
         };
-        syscall::port_destroy(rp);
         if resp.tag == NET_TCP_CLOSED { return 0; }
         if resp.tag != NET_TCP_DATA { return linux_err(ECONNREFUSED); }
         let len = (resp.data[0] & 0xFFFF) as usize;
@@ -5266,14 +5190,11 @@ fn write_socket(caller_port: u64, srv_port: u64, handle: u64, domain: u8, buf_va
             if copied == 0 { break; }
             let w0 = u64::from_le_bytes([tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]]);
             let w1 = u64::from_le_bytes([tmp[8], tmp[9], tmp[10], tmp[11], tmp[12], tmp[13], tmp[14], tmp[15]]);
-            let rp = syscall::port_create();
-            let d2 = (copied as u64) | ((rp as u64) << 32);
-            syscall::send(srv_port, UDS_SEND, handle, w0, d2, w1);
-            let resp = match syscall::recv_msg(rp) {
+            let d2 = copied as u64;
+            let resp = match syscall::call(srv_port, UDS_SEND, handle, w0, d2, w1) {
                 Some(m) => m,
-                None => { syscall::port_destroy(rp); break; }
+                None => { break; }
             };
-            syscall::port_destroy(rp);
             if resp.tag != UDS_OK { break; }
             let sent = (resp.data[0] & 0xFFFF) as usize;
             total += sent;
@@ -5288,14 +5209,11 @@ fn write_socket(caller_port: u64, srv_port: u64, handle: u64, domain: u8, buf_va
             if copied == 0 { break; }
             let w0 = u64::from_le_bytes([tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]]);
             let w1 = u64::from_le_bytes([tmp[8], tmp[9], tmp[10], tmp[11], tmp[12], tmp[13], tmp[14], tmp[15]]);
-            let rp = syscall::port_create();
-            let d1 = (copied as u64) | ((rp as u64) << 16);
-            syscall::send(srv_port, NET_TCP_SEND, handle, d1, w0, w1);
-            let resp = match syscall::recv_msg(rp) {
+            let d1 = copied as u64;
+            let resp = match syscall::call(srv_port, NET_TCP_SEND, handle, d1, w0, w1) {
                 Some(m) => m,
-                None => { syscall::port_destroy(rp); break; }
+                None => { break; }
             };
-            syscall::port_destroy(rp);
             if resp.tag != NET_TCP_SEND_OK { break; }
             total += copied;
         }
@@ -5327,14 +5245,10 @@ fn handle_socket(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
         let uds_port = unsafe { UDS_PORT };
         if uds_port == 0 { unsafe { PROC_TABLE[pi].fds[fd] = FdEntry::empty(); } return linux_err(EAFNOSUPPORT); }
         // Create UDS socket via uds_srv.
-        let rp = syscall::port_create();
-        let d2 = (rp as u64) << 32;
-        syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0);
-        let resp = match syscall::recv_msg(rp) {
+        let resp = match syscall::call(uds_port, UDS_SOCKET, 0, 0, 0, 0) {
             Some(m) => m,
-            None => { syscall::port_destroy(rp); unsafe { PROC_TABLE[pi].fds[fd] = FdEntry::empty(); } return linux_err(EAFNOSUPPORT); }
+            None => { unsafe { PROC_TABLE[pi].fds[fd] = FdEntry::empty(); } return linux_err(EAFNOSUPPORT); }
         };
-        syscall::port_destroy(rp);
         if resp.tag != UDS_OK {
             unsafe { PROC_TABLE[pi].fds[fd] = FdEntry::empty(); }
             return linux_err(ENOMEM);
@@ -5435,28 +5349,21 @@ fn handle_bind(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             let (name, nlen) = parse_sockaddr_un(caller_port, addr_va, addrlen);
             if nlen == 0 { return linux_err(EINVAL); }
             let (w0, w1) = pack_uds_name(&name, nlen);
-            let rp = syscall::port_create();
-            let d2 = (nlen as u64) | ((rp as u64) << 32);
-            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_BIND, PROC_TABLE[pi].fds[fd].handle, w0, d2, w1);
-            let resp = match syscall::recv_msg(rp) {
+            let d2 = nlen as u64;
+            let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, UDS_BIND, PROC_TABLE[pi].fds[fd].handle, w0, d2, w1) {
                 Some(m) => m,
-                None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+                None => { return linux_err(ECONNREFUSED); }
             };
-            syscall::port_destroy(rp);
             if resp.tag != UDS_OK { return linux_err(EINVAL); }
             PROC_TABLE[pi].fds[fd].sock_state = 1;
             0
         } else if dom == AF_INET as u8 {
             let (ip, port) = parse_sockaddr_in(caller_port, addr_va, addrlen);
             let _ = ip; // net_srv bind only cares about port
-            let rp = syscall::port_create();
-            let d1 = (rp as u64) << 32;
-            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_BIND, port as u64, d1, 0, 0);
-            let resp = match syscall::recv_msg(rp) {
+            let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_BIND, port as u64, 0, 0, 0) {
                 Some(m) => m,
-                None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+                None => { return linux_err(ECONNREFUSED); }
             };
-            syscall::port_destroy(rp);
             if resp.tag == 0x4601 { // NET_TCP_BIND_OK
                 PROC_TABLE[pi].fds[fd].sock_port = port;
                 PROC_TABLE[pi].fds[fd].sock_ip = ip;
@@ -5483,27 +5390,19 @@ fn handle_listen(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
         }
         let dom = PROC_TABLE[pi].fds[fd].sock_domain;
         if dom == AF_UNIX as u8 {
-            let rp = syscall::port_create();
-            let d2 = (rp as u64) << 32;
-            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_LISTEN, PROC_TABLE[pi].fds[fd].handle, backlog, d2, 0);
-            let resp = match syscall::recv_msg(rp) {
+            let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, UDS_LISTEN, PROC_TABLE[pi].fds[fd].handle, backlog, 0, 0) {
                 Some(m) => m,
-                None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+                None => { return linux_err(ECONNREFUSED); }
             };
-            syscall::port_destroy(rp);
             if resp.tag != UDS_OK { return linux_err(EINVAL); }
             PROC_TABLE[pi].fds[fd].sock_state = 2;
             0
         } else if dom == AF_INET as u8 {
             let port = PROC_TABLE[pi].fds[fd].sock_port;
-            let rp = syscall::port_create();
-            let d2 = (rp as u64) << 32;
-            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_LISTEN, port as u64, backlog, d2, 0);
-            let resp = match syscall::recv_msg(rp) {
+            let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_LISTEN, port as u64, backlog, 0, 0) {
                 Some(m) => m,
-                None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+                None => { return linux_err(ECONNREFUSED); }
             };
-            syscall::port_destroy(rp);
             if resp.tag != NET_TCP_LISTEN_OK { return linux_err(EINVAL); }
             PROC_TABLE[pi].fds[fd].sock_state = 2;
             0
@@ -5529,17 +5428,14 @@ fn handle_connect(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             let (name, nlen) = parse_sockaddr_un(caller_port, addr_va, addrlen);
             if nlen == 0 { return linux_err(EINVAL); }
             let (w0, w1) = pack_uds_name(&name, nlen);
-            let rp = syscall::port_create();
-            let d2 = (nlen as u64) | ((rp as u64) << 32);
+            let d2 = nlen as u64;
             let pid = syscall::getpid();
             let uid = syscall::getuid() as u64;
             let d3 = pid | (uid << 32);
-            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_CONNECT, w0, w1, d2, d3);
-            let resp = match syscall::recv_msg(rp) {
+            let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, UDS_CONNECT, w0, w1, d2, d3) {
                 Some(m) => m,
-                None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+                None => { return linux_err(ECONNREFUSED); }
             };
-            syscall::port_destroy(rp);
             if resp.tag != UDS_OK { return linux_err(ECONNREFUSED); }
             // UDS_CONNECT reply: data[0] = client-end handle
             PROC_TABLE[pi].fds[fd].handle = resp.data[0];
@@ -5547,14 +5443,11 @@ fn handle_connect(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             0
         } else if dom == AF_INET as u8 {
             let (ip, port) = parse_sockaddr_in(caller_port, addr_va, addrlen);
-            let rp = syscall::port_create();
-            let d1 = (port as u64) | ((rp as u64) << 16);
-            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_CONNECT, ip as u64, d1, 0, 0);
-            let resp = match syscall::recv_msg(rp) {
+            let d1 = port as u64;
+            let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_CONNECT, ip as u64, d1, 0, 0) {
                 Some(m) => m,
-                None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+                None => { return linux_err(ECONNREFUSED); }
             };
-            syscall::port_destroy(rp);
             if resp.tag != NET_TCP_CONNECTED { return linux_err(ECONNREFUSED); }
             PROC_TABLE[pi].fds[fd].handle = resp.data[0]; // conn_id
             PROC_TABLE[pi].fds[fd].sock_port = port;
@@ -5587,14 +5480,10 @@ fn handle_accept_inner(pi: usize, caller_port: u64, args: &[u64; 6], flags: u64)
         };
 
         if dom == AF_UNIX as u8 {
-            let rp = syscall::port_create();
-            let d2 = (rp as u64) << 32;
-            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_ACCEPT, PROC_TABLE[pi].fds[fd].handle, 0, d2, 0);
-            let resp = match syscall::recv_msg(rp) {
+            let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, UDS_ACCEPT, PROC_TABLE[pi].fds[fd].handle, 0, 0, 0) {
                 Some(m) => m,
-                None => { syscall::port_destroy(rp); PROC_TABLE[pi].fds[new_fd] = FdEntry::empty(); return linux_err(ECONNREFUSED); }
+                None => { PROC_TABLE[pi].fds[new_fd] = FdEntry::empty(); return linux_err(ECONNREFUSED); }
             };
-            syscall::port_destroy(rp);
             if resp.tag != UDS_OK {
                 PROC_TABLE[pi].fds[new_fd] = FdEntry::empty();
                 return linux_err(ECONNREFUSED);
@@ -5607,14 +5496,10 @@ fn handle_accept_inner(pi: usize, caller_port: u64, args: &[u64; 6], flags: u64)
             PROC_TABLE[pi].fds[new_fd].sock_state = 3;
         } else if dom == AF_INET as u8 {
             let port = PROC_TABLE[pi].fds[fd].sock_port;
-            let rp = syscall::port_create();
-            let d1 = (rp as u64) << 32;
-            syscall::send(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_ACCEPT, port as u64, d1, 0, 0);
-            let resp = match syscall::recv_msg(rp) {
+            let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_ACCEPT, port as u64, 0, 0, 0) {
                 Some(m) => m,
-                None => { syscall::port_destroy(rp); PROC_TABLE[pi].fds[new_fd] = FdEntry::empty(); return linux_err(ECONNREFUSED); }
+                None => { PROC_TABLE[pi].fds[new_fd] = FdEntry::empty(); return linux_err(ECONNREFUSED); }
             };
-            syscall::port_destroy(rp);
             if resp.tag != NET_TCP_ACCEPT_OK {
                 PROC_TABLE[pi].fds[new_fd] = FdEntry::empty();
                 return linux_err(ECONNREFUSED);
@@ -5802,11 +5687,7 @@ fn handle_sendmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                 // Query UDS_GETPEER to find receiver's handle
                                 let sender_handle = PROC_TABLE[pi].fds[fd].handle;
                                 let uds_port = PROC_TABLE[pi].fds[fd].fs_port;
-                                let rp = syscall::port_create();
-                                let d2 = (rp as u64) << 32;
-                                syscall::send(uds_port, UDS_GETPEER, sender_handle, 0, d2, 0);
-                                if let Some(resp) = syscall::recv_msg(rp) {
-                                    syscall::port_destroy(rp);
+                                if let Some(resp) = syscall::call(uds_port, UDS_GETPEER, sender_handle, 0, 0, 0) {
                                     if resp.tag == UDS_OK {
                                         let peer_handle = resp.data[0];
                                         // Find free transfer slot
@@ -5820,8 +5701,6 @@ fn handle_sendmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                             }
                                         }
                                     }
-                                } else {
-                                    syscall::port_destroy(rp);
                                 }
                             }
                         }
@@ -6052,14 +5931,11 @@ fn send_socket_data(srv_port: u64, handle: u64, domain: u8, data: &[u8]) -> u64 
             tmp[..chunk].copy_from_slice(&data[total..total + chunk]);
             let w0 = u64::from_le_bytes([tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]]);
             let w1 = u64::from_le_bytes([tmp[8], tmp[9], tmp[10], tmp[11], tmp[12], tmp[13], tmp[14], tmp[15]]);
-            let rp = syscall::port_create();
-            let d2 = (chunk as u64) | ((rp as u64) << 32);
-            syscall::send(srv_port, UDS_SEND, handle, w0, d2, w1);
-            let resp = match syscall::recv_msg(rp) {
+            let d2 = chunk as u64;
+            let resp = match syscall::call(srv_port, UDS_SEND, handle, w0, d2, w1) {
                 Some(m) => m,
-                None => { syscall::port_destroy(rp); break; }
+                None => { break; }
             };
-            syscall::port_destroy(rp);
             if resp.tag != UDS_OK { break; }
             let sent = (resp.data[0] & 0xFFFF) as usize;
             total += sent;
@@ -6072,14 +5948,11 @@ fn send_socket_data(srv_port: u64, handle: u64, domain: u8, data: &[u8]) -> u64 
             tmp[..chunk].copy_from_slice(&data[total..total + chunk]);
             let w0 = u64::from_le_bytes([tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]]);
             let w1 = u64::from_le_bytes([tmp[8], tmp[9], tmp[10], tmp[11], tmp[12], tmp[13], tmp[14], tmp[15]]);
-            let rp = syscall::port_create();
-            let d1 = (chunk as u64) | ((rp as u64) << 16);
-            syscall::send(srv_port, NET_TCP_SEND, handle, d1, w0, w1);
-            let resp = match syscall::recv_msg(rp) {
+            let d1 = chunk as u64;
+            let resp = match syscall::call(srv_port, NET_TCP_SEND, handle, d1, w0, w1) {
                 Some(m) => m,
-                None => { syscall::port_destroy(rp); break; }
+                None => { break; }
             };
-            syscall::port_destroy(rp);
             if resp.tag != NET_TCP_SEND_OK { break; }
             total += chunk;
         }
@@ -6093,14 +5966,10 @@ fn send_socket_data(srv_port: u64, handle: u64, domain: u8, data: &[u8]) -> u64 
 /// Uses the same inline IPC protocol as read_socket but to local memory.
 fn recv_socket_data(srv_port: u64, handle: u64, domain: u8, buf: &mut [u8]) -> u64 {
     if domain == AF_UNIX as u8 {
-        let rp = syscall::port_create();
-        let d2 = (rp as u64) << 32;
-        syscall::send(srv_port, UDS_RECV, handle, 0, d2, 0);
-        let resp = match syscall::recv_msg(rp) {
+        let resp = match syscall::call(srv_port, UDS_RECV, handle, 0, 0, 0) {
             Some(m) => m,
-            None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+            None => { return linux_err(ECONNREFUSED); }
         };
-        syscall::port_destroy(rp);
         if resp.tag == UDS_EOF { return 0; }
         if resp.tag != UDS_OK { return linux_err(ECONNREFUSED); }
         let len = (resp.data[2] & 0xFFFF) as usize;
@@ -6114,14 +5983,10 @@ fn recv_socket_data(srv_port: u64, handle: u64, domain: u8, buf: &mut [u8]) -> u
         buf[..got].copy_from_slice(&tmp[..got]);
         got as u64
     } else if domain == AF_INET as u8 {
-        let rp = syscall::port_create();
-        let d1 = (rp as u64) << 16;
-        syscall::send(srv_port, NET_TCP_RECV, handle, d1, 0, 0);
-        let resp = match syscall::recv_msg(rp) {
+        let resp = match syscall::call(srv_port, NET_TCP_RECV, handle, 0, 0, 0) {
             Some(m) => m,
-            None => { syscall::port_destroy(rp); return linux_err(ECONNREFUSED); }
+            None => { return linux_err(ECONNREFUSED); }
         };
-        syscall::port_destroy(rp);
         if resp.tag == NET_TCP_CLOSED { return 0; }
         if resp.tag != NET_TCP_DATA { return linux_err(ECONNREFUSED); }
         let len = (resp.data[0] & 0xFFFF) as usize;
@@ -6167,22 +6032,18 @@ fn handle_socketpair(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     };
 
     // Create two UDS sockets.
-    let rp = syscall::port_create();
-    let d2 = (rp as u64) << 32;
 
     // Socket A (will be server side).
-    syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0);
-    let resp_a = match syscall::recv_msg(rp) {
+    let resp_a = match syscall::call(uds_port, UDS_SOCKET, 0, 0, 0, 0) {
         Some(m) if m.tag == UDS_OK => m,
-        _ => { syscall::port_destroy(rp); unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); } return linux_err(ENOMEM); }
+        _ => { unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); } return linux_err(ENOMEM); }
     };
     let handle_a = resp_a.data[0];
 
     // Socket B (will be client side).
-    syscall::send(uds_port, UDS_SOCKET, 0, 0, d2, 0);
-    let resp_b = match syscall::recv_msg(rp) {
+    let resp_b = match syscall::call(uds_port, UDS_SOCKET, 0, 0, 0, 0) {
         Some(m) if m.tag == UDS_OK => m,
-        _ => { syscall::port_destroy(rp); unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); } return linux_err(ENOMEM); }
+        _ => { unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); } return linux_err(ENOMEM); }
     };
     let _handle_b = resp_b.data[0];
 
@@ -6202,50 +6063,40 @@ fn handle_socketpair(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     // Bind socket A.
     let (w0, w1) = pack_uds_name(&name, nlen);
-    let d2_bind = (nlen as u64) | ((rp as u64) << 32);
-    syscall::send(uds_port, UDS_BIND, handle_a, w0, d2_bind, w1);
-    let bind_resp = syscall::recv_msg(rp);
+    let d2_bind = nlen as u64;
+    let bind_resp = syscall::call(uds_port, UDS_BIND, handle_a, w0, d2_bind, w1);
     if bind_resp.is_none() || bind_resp.unwrap().tag != UDS_OK {
-        syscall::port_destroy(rp);
         unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); }
         return linux_err(EINVAL);
     }
 
     // Listen socket A.
-    let d2_listen = (rp as u64) << 32;
-    syscall::send(uds_port, UDS_LISTEN, handle_a, 1, d2_listen, 0);
-    let listen_resp = syscall::recv_msg(rp);
+    let listen_resp = syscall::call(uds_port, UDS_LISTEN, handle_a, 1, 0, 0);
     if listen_resp.is_none() || listen_resp.unwrap().tag != UDS_OK {
-        syscall::port_destroy(rp);
         unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); }
         return linux_err(EINVAL);
     }
 
     // Connect socket B to socket A's name.
-    let d2_conn = (nlen as u64) | ((rp as u64) << 32);
+    let d2_conn = nlen as u64;
     let pid = syscall::getpid();
     let uid = syscall::getuid() as u64;
     let d3_conn = pid | (uid << 32);
-    syscall::send(uds_port, UDS_CONNECT, w0, w1, d2_conn, d3_conn);
-    let conn_resp = match syscall::recv_msg(rp) {
+    let conn_resp = match syscall::call(uds_port, UDS_CONNECT, w0, w1, d2_conn, d3_conn) {
         Some(m) => m,
-        None => { syscall::port_destroy(rp); unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); } return linux_err(ECONNREFUSED); }
+        None => { unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); } return linux_err(ECONNREFUSED); }
     };
     if conn_resp.tag != UDS_OK {
-        syscall::port_destroy(rp);
         unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); }
         return linux_err(ECONNREFUSED);
     }
     let client_handle = conn_resp.data[0];
 
     // Accept on socket A.
-    let d2_acc = (rp as u64) << 32;
-    syscall::send(uds_port, UDS_ACCEPT, handle_a, 0, d2_acc, 0);
-    let acc_resp = match syscall::recv_msg(rp) {
+    let acc_resp = match syscall::call(uds_port, UDS_ACCEPT, handle_a, 0, 0, 0) {
         Some(m) => m,
-        None => { syscall::port_destroy(rp); unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); } return linux_err(ECONNREFUSED); }
+        None => { unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); } return linux_err(ECONNREFUSED); }
     };
-    syscall::port_destroy(rp);
     if acc_resp.tag != UDS_OK {
         unsafe { PROC_TABLE[pi].fds[fd0] = FdEntry::empty(); PROC_TABLE[pi].fds[fd1] = FdEntry::empty(); }
         return linux_err(ECONNREFUSED);
@@ -6461,14 +6312,10 @@ fn handle_getsockopt(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             SO_PEERCRED => {
                 unsafe {
                     if PROC_TABLE[pi].fds[fd].sock_domain == AF_UNIX as u8 {
-                        let rp = syscall::port_create();
-                        let d2 = (rp as u64) << 32;
-                        syscall::send(PROC_TABLE[pi].fds[fd].fs_port, UDS_GETPEERCRED, PROC_TABLE[pi].fds[fd].handle, 0, d2, 0);
-                        let resp = match syscall::recv_msg(rp) {
+                        let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, UDS_GETPEERCRED, PROC_TABLE[pi].fds[fd].handle, 0, 0, 0) {
                             Some(m) => m,
-                            None => { syscall::port_destroy(rp); return linux_err(ENOTCONN); }
+                            None => { return linux_err(ENOTCONN); }
                         };
-                        syscall::port_destroy(rp);
                         if resp.tag == UDS_OK && optval_va != 0 {
                             let pid = resp.data[0] as u32;
                             let uid_gid = resp.data[1];
@@ -6547,12 +6394,9 @@ fn poll_single_fd(pi: usize, fd: usize) -> u32 {
         let entry = &PROC_TABLE[pi].fds[fd];
         match entry.kind {
             FdKind::Pipe => {
-                let rp = syscall::port_create();
                 let events: u16 = 0x0015; // POLLIN|POLLOUT|POLLHUP
-                let d2 = ((rp as u64) << 32) | (events as u64);
-                syscall::send(entry.fs_port, PIPE_POLL_TAG, entry.handle, 0, d2, 0);
-                let resp = syscall::recv_msg(rp);
-                syscall::port_destroy(rp);
+                let d2 = events as u64;
+                let resp = syscall::call(entry.fs_port, PIPE_POLL_TAG, entry.handle, 0, d2, 0);
                 match resp {
                     Some(m) if m.tag == PIPE_OK => m.data[0] as u32,
                     _ => EPOLLERR,
@@ -6561,12 +6405,9 @@ fn poll_single_fd(pi: usize, fd: usize) -> u32 {
             FdKind::Socket => {
                 let dom = entry.sock_domain;
                 if dom == AF_UNIX as u8 {
-                    let rp = syscall::port_create();
                     let events: u16 = 0x0015; // POLLIN|POLLOUT|POLLHUP
-                    let d2 = ((rp as u64) << 32) | (events as u64);
-                    syscall::send(entry.fs_port, UDS_POLL_TAG, entry.handle, 0, d2, 0);
-                    let resp = syscall::recv_msg(rp);
-                    syscall::port_destroy(rp);
+                    let d2 = events as u64;
+                    let resp = syscall::call(entry.fs_port, UDS_POLL_TAG, entry.handle, 0, d2, 0);
                     match resp {
                         Some(m) if m.tag == UDS_OK => m.data[0] as u32,
                         _ => EPOLLERR,
