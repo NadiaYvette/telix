@@ -647,8 +647,8 @@ fn wake_recv_waiter(port_id: PortId) {
         let mut injected = false;
         if let Some(port) = port_ref(port_id) {
             if let Some(q) = port.mpsc() {
-                if let Some(msg) = q.recv() {
-                    crate::syscall::handlers::deliver_to_parked_receiver(tid, &msg);
+                if let Some(mut msg) = q.recv() {
+                    crate::syscall::handlers::deliver_to_parked_receiver(tid, &mut msg);
                     // Wake a blocked sender now that we freed a queue slot.
                     crate::sync::turnstile::port_wake_one(
                         port_id,

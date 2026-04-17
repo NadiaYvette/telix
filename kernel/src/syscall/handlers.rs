@@ -611,23 +611,26 @@ fn inject_recv_into_frame(receiver_tid: u32, msg: &crate::ipc::Message) {
 /// the thread's saved exception frame. Also handles auto-grant caps and priority
 /// inheritance. Called from port::send/send_nb when the old queue path wakes a
 /// parked receiver.
-pub(crate) fn deliver_to_parked_receiver(receiver_tid: u32, msg: &crate::ipc::Message) {
-    inject_recv_into_frame(receiver_tid, msg);
+pub(crate) fn deliver_to_parked_receiver(receiver_tid: u32, msg: &mut crate::ipc::Message) {
     let receiver_task = crate::sched::scheduler::thread_task_id(receiver_tid);
     auto_grant_sender_identity(receiver_task, msg.data[4]);
     auto_grant_reply_caps(receiver_task, msg);
-    // For call/reply messages (data[5] is reply-cap handle), boost the receiver
-    // to the caller's priority via the reply-cap.  This handles the case where
-    // the message was queued and a parked receiver is woken by wake_recv_waiter.
+    // Install the reply-cap on the receiver thread so sys_reply can find it.
+    // Must match the DirectTransfer and Ok(msg) paths in sys_recv_with_cap.
     let handle = msg.data[5];
-    if handle != 0 {
-        if let Some(cap) = crate::ipc::call_reply::lookup(handle) {
-            let caller_tid = cap.caller_tid.load(core::sync::atomic::Ordering::Acquire);
-            if caller_tid != 0 {
-                let caller_prio =
-                    crate::sched::scheduler::thread_ref(caller_tid).effective_priority;
-                crate::sched::boost_priority(receiver_tid, caller_prio);
-            }
+    crate::sched::scheduler::thread_ref(receiver_tid)
+        .held_reply_cap
+        .store(handle, core::sync::atomic::Ordering::Release);
+    // Zero data[5] before injection so userspace doesn't see the raw handle.
+    msg.data[5] = 0;
+    inject_recv_into_frame(receiver_tid, msg);
+    // Priority-inheritance donation for the queued-delivery path.
+    if let Some(cap) = crate::ipc::call_reply::lookup(handle) {
+        let caller_tid = cap.caller_tid.load(core::sync::atomic::Ordering::Acquire);
+        if caller_tid != 0 {
+            let caller_prio =
+                crate::sched::scheduler::thread_ref(caller_tid).effective_priority;
+            crate::ipc::call_reply::donate_priority(handle, receiver_tid, caller_prio);
         }
     }
 }
@@ -1181,11 +1184,10 @@ fn sys_recv_with_cap(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
     // Two paths for delivery:
     // - Ok(msg): the queue had a message waiting — install the reply-cap
     //   synchronously from data[5], zero it, and populate registers.
-    // - Err(()): we parked. The sender's sys_call DirectTransfer handler
-    //   already stored the reply-cap into our thread's `held_reply_cap`
-    //   and zeroed data[5] before inject_recv_into_frame, so when we
-    //   resume the frame already holds the cleaned message and the cap
-    //   is installed. Nothing to do here.
+    // - Err(()): we parked. The waker (either DirectTransfer in sys_call
+    //   or deliver_to_parked_receiver in wake_recv_waiter) stored the
+    //   reply-cap into our thread's `held_reply_cap` and zeroed data[5]
+    //   before inject_recv_into_frame. Nothing to do here.
     match crate::ipc::port::recv_or_park(port_id) {
         Ok(mut msg) => {
             let task_id = crate::sched::current_task_id();
@@ -1711,10 +1713,26 @@ fn sys_get_initramfs_port() -> u64 {
 
 fn sys_port_set_recv(set_id: u64, frame: &mut ExceptionFrame) -> u64 {
     match crate::ipc::port_set::recv_blocking(set_id as u32) {
-        Some((port_id, msg)) => {
+        Some((port_id, mut msg)) => {
             let task_id = crate::sched::current_task_id();
             auto_grant_sender_identity(task_id, msg.data[4]);
             auto_grant_reply_caps(task_id, &msg);
+            // Install reply-cap and zero data[5] — same protocol as
+            // sys_recv_with_cap's Ok path.
+            let handle = msg.data[5];
+            msg.data[5] = 0;
+            let tid = crate::sched::current_thread_id();
+            crate::sched::scheduler::thread_ref(tid)
+                .held_reply_cap
+                .store(handle, core::sync::atomic::Ordering::Release);
+            if let Some(cap) = crate::ipc::call_reply::lookup(handle) {
+                let caller_tid = cap.caller_tid.load(core::sync::atomic::Ordering::Acquire);
+                if caller_tid != 0 {
+                    let caller_prio =
+                        crate::sched::scheduler::thread_ref(caller_tid).effective_priority;
+                    crate::ipc::call_reply::donate_priority(handle, tid, caller_prio);
+                }
+            }
             set_reg(frame, 1, msg.tag);
             set_reg(frame, 2, msg.data[0]);
             set_reg(frame, 3, msg.data[1]);
@@ -4260,10 +4278,25 @@ fn sys_port_recv_timeout(port_id: u64, timeout_us: u64, frame: &mut ExceptionFra
 fn sys_port_set_recv_timeout(set_id: u64, timeout_us: u64, frame: &mut ExceptionFrame) {
     // Try non-blocking port_set_recv from the set.
     match crate::ipc::port_set::recv(set_id as u32) {
-        Some((port_id, msg)) => {
+        Some((port_id, mut msg)) => {
             let task_id = crate::sched::current_task_id();
             auto_grant_sender_identity(task_id, msg.data[4]);
             auto_grant_reply_caps(task_id, &msg);
+            // Install reply-cap and zero data[5].
+            let handle = msg.data[5];
+            msg.data[5] = 0;
+            let tid = crate::sched::current_thread_id();
+            crate::sched::scheduler::thread_ref(tid)
+                .held_reply_cap
+                .store(handle, core::sync::atomic::Ordering::Release);
+            if let Some(cap) = crate::ipc::call_reply::lookup(handle) {
+                let caller_tid = cap.caller_tid.load(core::sync::atomic::Ordering::Acquire);
+                if caller_tid != 0 {
+                    let caller_prio =
+                        crate::sched::scheduler::thread_ref(caller_tid).effective_priority;
+                    crate::ipc::call_reply::donate_priority(handle, tid, caller_prio);
+                }
+            }
             set_reg(frame, 1, msg.tag);
             set_reg(frame, 2, msg.data[0]);
             set_reg(frame, 3, msg.data[1]);
