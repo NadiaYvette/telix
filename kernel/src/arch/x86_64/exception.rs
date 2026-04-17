@@ -181,10 +181,6 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
             tref.last_cpu.load(core::sync::atomic::Ordering::Relaxed),
             cur_cpu
         );
-        crate::println!(
-            "  saved_sp={:#x} syscall_frame_sp={:#x} stack_base={:#x}",
-            tref.saved_sp, tref.syscall_frame_sp, tref.stack_base
-        );
         // Mark the current thread (the one with corrupt state) as killed
         // so the scheduler won't re-enqueue it on the next tick.
         tref.killed.store(true, core::sync::atomic::Ordering::Release);

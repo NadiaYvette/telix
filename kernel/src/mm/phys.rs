@@ -826,11 +826,20 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
 
     // For orders where 2^order <= CHUNK_PAGES (i.e., order <= 6), we can
     // find contiguous free pages within a single chunk by scanning its bitmap.
+    //
+    // IMPORTANT: alloc_page/chunk_alloc_one uses lock-free CAS on bitmaps
+    // without holding BULK_LOCK. We must either skip owned chunks (whose
+    // bitmaps may be concurrently modified) or use CAS ourselves.
     if need <= CHUNK_PAGES {
         for ci in 0..ALLOC.total_chunks {
             let s = ALLOC.chunk(ci).load();
             let fc = free_count(s);
             if (fc as usize) < need {
+                continue;
+            }
+            // Skip chunks owned by another CPU — their bitmaps are being
+            // modified lock-free by chunk_alloc_one on the owning CPU.
+            if owner(s) != NO_CPU {
                 continue;
             }
 
@@ -860,15 +869,20 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                     bmp &= (1u64 << pages_in_chunk) - 1;
                 }
 
+                // Write bitmap BEFORE publishing the chunk state. Otherwise a
+                // concurrent alloc_page could see has_bitmap=true but read an
+                // uninitialised bitmap page, allocating based on garbage bits.
                 let bpa = page_pa(ci, bmp_pg);
                 unsafe {
                     write_bitmap(bpa, bmp);
                 }
 
                 let new_fc = bmp.count_ones();
-                ALLOC
-                    .chunk(ci)
-                    .store(make_state(new_fc, NO_CPU, true, bmp_pg, 0));
+                let new_s = make_state(new_fc, NO_CPU, true, bmp_pg, 0);
+                if ALLOC.chunk(ci).cas(s, new_s).is_err() {
+                    continue; // another CPU claimed or modified this chunk
+                }
+
                 // Subtract: need pages + 1 bitmap page from the 64 that were free.
                 let consumed = 64u32 - new_fc;
                 ALLOC
@@ -883,6 +897,8 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
             } // inline mode, too fragmented
 
             // Scan bitmap for a contiguous run of `need` set bits.
+            // Use CAS on the bitmap to avoid racing with concurrent
+            // chunk_alloc_one (which CAS-modifies bitmaps without BULK_LOCK).
             let bp = bmp_page(s);
             let bpa = bitmap_pa(ci, bp);
             let bmp = unsafe { read_bitmap(bpa) };
@@ -893,11 +909,15 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                 for b in start_bit..(start_bit + need) {
                     new_bmp &= !(1u64 << b);
                 }
-                unsafe {
-                    write_bitmap(bpa, new_bmp);
+                // CAS the bitmap — if chunk_alloc_one modified it concurrently,
+                // our CAS fails and we skip this chunk rather than restoring
+                // freed bits (which would cause double-allocation).
+                let cas_ok = unsafe { cas_bitmap(bpa, bmp, new_bmp).is_ok() };
+                if !cas_ok {
+                    continue; // bitmap was concurrently modified, skip chunk
                 }
 
-                let new_fc = fc - need as u32;
+                let new_fc = new_bmp.count_ones();
                 // Possibly transition to inline mode.
                 if new_fc <= INLINE_K && new_fc > 0 {
                     let mut indices = [0u32; INLINE_K as usize];
@@ -914,22 +934,21 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                         count += 1;
                     }
                     let inline_bits = pack_inline(&indices[..count as usize]);
-                    ALLOC
+                    let _ = ALLOC
                         .chunk(ci)
-                        .store(make_state(count, owner(s), false, 0, inline_bits));
+                        .cas(s, make_state(count, owner(s), false, 0, inline_bits));
                 } else if new_fc == 0 {
                     // Also free the bitmap page since chunk is now fully allocated.
-                    ALLOC.chunk(ci).store(make_state(0, NO_CPU, false, 0, 0));
-                    // +1 for the bitmap page being released (it was overhead).
-                    // Actually the bitmap page was already not counted in fc,
-                    // and now fc=0, so nothing extra to do.
+                    let _ = ALLOC.chunk(ci).cas(s, make_state(0, NO_CPU, false, 0, 0));
                 } else {
-                    ALLOC
+                    let _ = ALLOC
                         .chunk(ci)
-                        .store((s & !FREE_COUNT_MASK) | (new_fc as u64));
+                        .cas(s, (s & !FREE_COUNT_MASK) | (new_fc as u64));
                 }
 
-                ALLOC.free_count_global.fetch_sub(need, Ordering::Relaxed);
+                // Use actual bitmap popcount difference for accurate accounting.
+                let allocated = bmp.count_ones() - new_bmp.count_ones();
+                ALLOC.free_count_global.fetch_sub(allocated as usize, Ordering::Relaxed);
                 return Some(PhysAddr::new(page_pa(ci, start_bit as u32)));
             }
         }
@@ -949,9 +968,31 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
             run_len += 1;
             if run_len >= chunks_needed {
                 // Found enough consecutive all-free chunks.
-                // Mark them all as fully allocated.
+                // Mark them all as fully allocated via CAS (another CPU's
+                // alloc_page could claim one between our scan and store).
+                let mut ok = true;
                 for c in run_start..(run_start + chunks_needed) {
-                    ALLOC.chunk(c).store(make_state(0, NO_CPU, false, 0, 0));
+                    let cur = ALLOC.chunk(c).load();
+                    if free_count(cur) != 64 || owner(cur) != NO_CPU {
+                        ok = false;
+                        break;
+                    }
+                    if ALLOC.chunk(c).cas(cur, make_state(0, NO_CPU, false, 0, 0)).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    // Race lost — undo any chunks we already claimed and retry.
+                    for c in run_start..(run_start + chunks_needed) {
+                        let cur = ALLOC.chunk(c).load();
+                        if free_count(cur) == 0 && !has_bitmap(cur) {
+                            // Restore to all-free (we were the ones who zeroed it).
+                            let _ = ALLOC.chunk(c).cas(cur, make_state(64, NO_CPU, false, 0, 0));
+                        }
+                    }
+                    run_len = 0;
+                    continue;
                 }
                 ALLOC
                     .free_count_global
