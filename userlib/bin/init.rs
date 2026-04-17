@@ -507,9 +507,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- APFS write smoke test (only when APFS container present) ---
     syscall::debug_puts(b"  init: APFS write smoke test...\n");
     {
-        // Give apfs_srv time to start and register (or exit).
-        for _ in 0..50 { syscall::yield_now(); }
-        let apfs_port_opt: Option<u64> = syscall::ns_lookup(b"apfs");
+        // apfs_srv needs time to read container/volume/omap/spaceman.
+        // Retry ns_lookup up to 500 times (~5s) before giving up.
+        let mut apfs_port_opt: Option<u64> = None;
+        for _ in 0..500 {
+            apfs_port_opt = syscall::ns_lookup(b"apfs");
+            if apfs_port_opt.is_some() { break; }
+            syscall::nanosleep(10_000_000); // 10ms
+        }
         if let Some(p) = apfs_port_opt {
             syscall::debug_puts(b"  init: found apfs port=");
             print_num(p);
