@@ -23,6 +23,7 @@
 #define SYS_MMAP_ANON       16
 #define SYS_MUNMAP          17
 #define SYS_NSRV_PORT       23
+#define SYS_SVC_LOOKUP      117
 #define SYS_GETPID          35
 #define SYS_EXECVE          54
 #define SYS_GET_CYCLES      36

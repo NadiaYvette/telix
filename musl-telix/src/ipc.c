@@ -35,23 +35,12 @@ void telix_pack_name(const char *name, int len, uint64_t out[3]) {
 }
 
 uint32_t telix_ns_lookup(const char *name, int namelen) {
-    uint32_t nsrv = telix_nsrv_port();
-    if (nsrv == 0xFFFFFFFF) return 0xFFFFFFFF;
-
-    uint32_t reply = telix_port_create();
+    /* Use the kernel's SYS_SVC_LOOKUP syscall directly (the old IPC-based
+       name server was replaced by a kernel-internal service table). */
     uint64_t words[3];
     telix_pack_name(name, namelen, words);
-    uint64_t d3 = (uint64_t)namelen | ((uint64_t)reply << 32);
-
-    telix_send(nsrv, NS_LOOKUP, words[0], words[1], words[2], d3);
-
-    struct telix_msg msg;
-    int ok = telix_recv_msg(reply, &msg);
-    telix_port_destroy(reply);
-
-    if (ok == 0 && msg.tag == NS_LOOKUP_OK) {
-        uint32_t p = (uint32_t)msg.data[0];
-        if (p != 0xFFFFFFFF) return p;
-    }
-    return 0xFFFFFFFF;
+    uint64_t port = __telix_syscall4(SYS_SVC_LOOKUP, words[0], words[1],
+                                      words[2], (uint64_t)namelen);
+    if (port == 0) return 0xFFFFFFFF;
+    return (uint32_t)port;
 }
