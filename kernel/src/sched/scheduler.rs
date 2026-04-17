@@ -818,6 +818,11 @@ fn sched_init() {
     let thread_ptr = alloc_thread_entry().expect("thread 0 alloc");
     let thread0_port =
         crate::ipc::port::create_kernel_port(thread_port_handler, 0).expect("thread 0 port");
+    // Allocate a proper kernel stack for the BSP idle thread so that
+    // update_kernel_stack() sets TSS RSP0 correctly when switching to idle.
+    // Without this, stack_base defaults to 0 and RSP0 = 0 + kstack_size(),
+    // causing interrupts on the idle CPU to corrupt low memory.
+    let bsp_kstack = crate::mm::phys::alloc_pages(KSTACK_ORDER).expect("thread 0 kstack");
     unsafe {
         (*thread_ptr).id = 0;
         (*thread_ptr).state = ThreadState::Running;
@@ -827,6 +832,7 @@ fn sched_init() {
         (*thread_ptr).effective_priority = 255;
         (*thread_ptr).quantum = u32::MAX;
         (*thread_ptr).default_quantum = u32::MAX;
+        (*thread_ptr).stack_base = bsp_kstack.as_usize();
     }
     unsafe { &*thread_ptr }.prio.store(255, Ordering::Relaxed);
     SCHED_THREAD_ART.insert(0, thread_ptr as usize);
@@ -846,6 +852,9 @@ fn create_idle_thread() -> Option<ThreadId> {
 
     let ptr = alloc_thread_entry()?;
     let idle_port = crate::ipc::port::create_kernel_port(thread_port_handler, id as usize)?;
+    // Allocate a proper kernel stack so update_kernel_stack() sets correct
+    // TSS RSP0 when switching to this idle thread.
+    let idle_kstack = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
     unsafe {
         (*ptr).id = id;
         (*ptr).state = ThreadState::Running;
@@ -856,6 +865,7 @@ fn create_idle_thread() -> Option<ThreadId> {
         (*ptr).quantum = u32::MAX;
         (*ptr).default_quantum = u32::MAX;
         (*ptr).sched_class = super::thread::SCHED_IDLE;
+        (*ptr).stack_base = idle_kstack.as_usize();
     }
     let t = unsafe { &*ptr };
     t.prio.store(255, Ordering::Relaxed);
@@ -2176,9 +2186,10 @@ fn try_switch(current_sp: u64) -> u64 {
         let sp = next_t.saved_sp;
         let kbase = next_t.stack_base;
         let kend = kbase as u64 + kstack_size() as u64;
-        // Note: kbase==0 can be legitimate for early threads (e.g. kernel init thread)
-        // so we only log, never kill based on kbase alone.
-        if sp < kbase as u64 || sp >= kend {
+        let is_idle = next_id == idle_id;
+        // Idle threads run on boot stacks (ring 0), not their allocated kstack.
+        // Their saved_sp is legitimately outside the kstack range — skip the check.
+        if !is_idle && (sp < kbase as u64 || sp >= kend) {
             crate::println!(
                 "BUG: try_switch: tid={} saved_sp={:#x} OUTSIDE kstack {:#x}..{:#x} (source={})",
                 next_id, sp, kbase, kend, next_t.saved_sp_source
@@ -2189,7 +2200,7 @@ fn try_switch(current_sp: u64) -> u64 {
             );
         }
         // Check for corrupt exception frame (CS must be 0x08/0x23, RIP must be valid).
-        if kbase != 0 && sp >= kbase as u64 && sp < kend {
+        if !is_idle && kbase != 0 && sp >= kbase as u64 && sp < kend {
             let rip = unsafe { *((sp as usize + 136) as *const u64) };
             let cs = unsafe { *((sp as usize + 144) as *const u64) };
             let bad_cs = cs != 0x08 && cs != 0x23;
@@ -4314,10 +4325,12 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     let next_sp = next_t.saved_sp;
 
     // Sanity check: saved_sp must be within the thread's kstack.
+    // Idle threads run on boot stacks (ring 0), not their allocated kstack.
     {
+        let is_idle = next_id == idle_id;
         let kbase = next_t.stack_base;
         let kend = kbase as u64 + kstack_size() as u64;
-        if kbase != 0 && (next_sp < kbase as u64 || next_sp >= kend) {
+        if !is_idle && kbase != 0 && (next_sp < kbase as u64 || next_sp >= kend) {
             crate::println!(
                 "BUG: park_ipc: tid={} saved_sp={:#x} OUTSIDE kstack {:#x}..{:#x} (source={})",
                 next_id, next_sp, kbase, kend, next_t.saved_sp_source
@@ -4810,10 +4823,13 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     let recv_sp = receiver.saved_sp;
 
     // Sanity check: saved_sp must be within the thread's kstack.
+    // Idle threads run on boot stacks (ring 0), not their allocated kstack.
     {
+        let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
+        let is_idle = receiver_tid == idle_id;
         let kbase = receiver.stack_base;
         let kend = kbase as u64 + kstack_size() as u64;
-        if kbase != 0 && (recv_sp < kbase as u64 || recv_sp >= kend) {
+        if !is_idle && kbase != 0 && (recv_sp < kbase as u64 || recv_sp >= kend) {
             crate::println!(
                 "BUG: handoff_to: tid={} saved_sp={:#x} OUTSIDE kstack {:#x}..{:#x} (source={})",
                 receiver_tid, recv_sp, kbase, kend, receiver.saved_sp_source
