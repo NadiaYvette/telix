@@ -112,6 +112,11 @@ pub struct Thread {
     /// Transitions: recv_or_park sets 0→1, park_current_for_ipc CAS 1→2,
     /// wake_parked_thread CAS 1→0 (early) or CAS 2→0 (normal).
     pub park_state: core::sync::atomic::AtomicU8,
+    /// True while this thread's parking CPU hasn't finished its assembly
+    /// stack switch. Set before the thread becomes visible to wakers
+    /// (park_state CAS or sleep_queue_insert). Cleared by
+    /// clear_pending_switch at the next exception handler entry.
+    pub stack_switch_pending: core::sync::atomic::AtomicBool,
     // --- Turnstile futex support ---
     /// Pre-allocated turnstile (phys addr as usize, 0 = none/lent).
     pub turnstile: core::sync::atomic::AtomicUsize,
@@ -207,6 +212,7 @@ impl Thread {
             run_next: core::sync::atomic::AtomicU32::new(0),
             run_prev: core::sync::atomic::AtomicU32::new(0),
             park_state: core::sync::atomic::AtomicU8::new(0),
+            stack_switch_pending: core::sync::atomic::AtomicBool::new(false),
             wakeup: core::sync::atomic::AtomicBool::new(false),
             prio: core::sync::atomic::AtomicU8::new(255),
             yield_asap: core::sync::atomic::AtomicBool::new(false),

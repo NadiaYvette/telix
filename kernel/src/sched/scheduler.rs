@@ -194,9 +194,25 @@ static PARK_SWITCH_PENDING_PTR: AtomicPtr<core::sync::atomic::AtomicBool> =
     AtomicPtr::new(core::ptr::null_mut());
 
 #[inline]
-fn park_switch_pending() -> &'static [core::sync::atomic::AtomicBool] {
+pub fn park_switch_pending() -> &'static [core::sync::atomic::AtomicBool] {
     let ptr = PARK_SWITCH_PENDING_PTR.load(Ordering::Relaxed);
     debug_assert!(!ptr.is_null(), "PARK_SWITCH_PENDING not init");
+    unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
+}
+
+/// Per-CPU ID of the thread that just parked (IPC or sleep) on this CPU.
+/// Set before the park becomes visible to wakers. Cleared by
+/// clear_pending_switch at the next exception handler entry, which also
+/// clears the per-thread stack_switch_pending flag.
+static PARKED_TID_PTR: AtomicPtr<AtomicU32> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn parked_tid() -> &'static [AtomicU32] {
+    let ptr = PARKED_TID_PTR.load(Ordering::Relaxed);
+    if ptr.is_null() {
+        // During early init before alloc. Return empty safe slice.
+        return &[];
+    }
     unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
 }
 
@@ -642,6 +658,10 @@ pub(crate) fn init_dynamic_percpu() {
 
         let s = phys::alloc_static_slice::<core::sync::atomic::AtomicBool>(n);
         PARK_SWITCH_PENDING_PTR.store(s.as_mut_ptr(), Ordering::Release);
+
+        let s = phys::alloc_static_slice::<AtomicU32>(n);
+        for v in s.iter() { v.store(u32::MAX, Ordering::Relaxed); }
+        PARKED_TID_PTR.store(s.as_mut_ptr(), Ordering::Release);
 
         let s = phys::alloc_static_slice::<AtomicU64>(n);
         DEFERRED_REQUEUE_PTR.store(s.as_mut_ptr(), Ordering::Release);
@@ -2759,6 +2779,10 @@ pub fn kill_task_by_id(task_id: TaskId) -> bool {
         let t = unsafe { thread_mut_from_ref(tid) };
         if t.state == ThreadState::Blocked && matches!(t.blocked_on, BlockReason::Sleep) {
             sleep_queue_remove(tid);
+            // Wait for the thread's parking stack switch to complete.
+            while thread_ref(tid).stack_switch_pending.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
             t.state = ThreadState::Ready;
             t.blocked_on = BlockReason::None;
             t.sleep_deadline_ns = 0;
@@ -4378,6 +4402,15 @@ pub fn take_pending_switch() -> u64 {
 /// `wake_parked_thread`'s spin-wait.
 pub fn clear_pending_switch(cpu: usize) {
     park_switch_pending()[cpu].store(false, Ordering::Release);
+    // Also clear the per-thread stack_switch_pending for whatever thread
+    // was parked on this CPU. The assembly stack switch is now complete.
+    let pt = parked_tid();
+    if cpu < pt.len() {
+        let tid = pt[cpu].swap(u32::MAX, Ordering::AcqRel);
+        if tid != u32::MAX {
+            thread_ref(tid).stack_switch_pending.store(false, Ordering::Release);
+        }
+    }
 }
 
 /// Check if a pending context switch is queued on this CPU.
@@ -4465,6 +4498,13 @@ pub fn park_current_for_ipc(reason: BlockReason) {
         thread_ref(tid as ThreadId).on_cpu.store(u32::MAX, Ordering::Release);
     }
 
+    // Mark per-thread stack_switch_pending BEFORE park_state CAS. Once
+    // COMMITTED, wake_parked_thread may fire on another CPU. It spins on
+    // this per-thread flag (not the per-CPU one) to wait for our assembly
+    // stack switch. Cleared by clear_pending_switch at exception entry.
+    thread_ref(tid as ThreadId).stack_switch_pending.store(true, Ordering::Release);
+    parked_tid()[cpu].store(tid as u32, Ordering::Release);
+
     // Try to commit the park: CAS PARK_ENQUEUED → PARK_COMMITTED.
     // If this fails, wake_parked_thread already CAS'd PARK_ENQUEUED → PARK_NONE,
     // meaning a sender woke us before we could switch out. The message is
@@ -4474,7 +4514,10 @@ pub fn park_current_for_ipc(reason: BlockReason) {
         .compare_exchange(PARK_ENQUEUED, PARK_COMMITTED, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        // Early wake — thread stays running on this CPU. Restore on_cpu.
+        // Early wake — no switch will happen. Clear per-thread flag.
+        thread_ref(tid as ThreadId).stack_switch_pending.store(false, Ordering::Release);
+        parked_tid()[cpu].store(u32::MAX, Ordering::Release);
+        // Restore on_cpu.
         if (tid as ThreadId) != idle_id {
             thread_ref(tid as ThreadId).on_cpu.store(cpu_idx, Ordering::Release);
         }
@@ -4569,10 +4612,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
 
     // Mark that this CPU has a park-triggered stack switch pending.
-    // wake_parked_thread spins on this flag (not pending_switch_sp) to
-    // avoid the race where take_pending_switch's swap(0) signals "done"
-    // before the assembly `mov rsp, rax` completes.  The flag is cleared
-    // by clear_pending_switch() at the next exception handler entry.
+    // wake_parked_thread spins on this flag to wait for our assembly switch.
     park_switch_pending()[cpu].store(true, Ordering::Release);
 
     // Store pending_switch and do SA notification BEFORE restoring IRQs.
@@ -4631,16 +4671,12 @@ pub fn wake_parked_thread(tid: ThreadId) {
         .is_ok()
     {
         unsafe { thread_mut_from_ref(tid) }.ipc_frame_sp = 0;
-        // park_current_for_ipc staged a context switch on the parking CPU
-        // (pending_switch_sp set, park_switch_pending flagged).  The actual
-        // stack switch (`mov rsp, rax`) happens later in assembly.  We must
-        // wait until that switch is complete before enqueueing, otherwise
-        // another CPU could schedule this thread and use the same kernel
-        // stack concurrently.  Spin on park_switch_pending (cleared by
-        // clear_pending_switch at the next exception handler entry, which
-        // is guaranteed to be AFTER the assembly stack switch).
-        let parked_cpu = tref.last_cpu.load(Ordering::Relaxed) as usize;
-        while park_switch_pending()[parked_cpu].load(Ordering::Acquire) {
+        // park_current_for_ipc staged a context switch on the parking CPU.
+        // The actual stack switch (`mov rsp, rax`) happens later in assembly.
+        // Wait for the per-thread flag (set before park_state CAS, cleared
+        // at exception handler entry) so we don't enqueue while the stack
+        // is still in use.
+        while tref.stack_switch_pending.load(Ordering::Acquire) {
             core::hint::spin_loop();
         }
 
@@ -4780,6 +4816,10 @@ fn check_sleep_timers() {
     // Wake collected threads (outside the lock).
     for i in 0..count {
         let (tid, prio, target) = to_wake[i];
+        // Wait for the thread's parking stack switch to complete.
+        while thread_ref(tid).stack_switch_pending.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
         let t = unsafe { thread_mut_from_ref(tid) };
         t.state = ThreadState::Ready;
         t.blocked_on = BlockReason::None;
@@ -4912,6 +4952,12 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     if (tid as ThreadId) != idle_id {
         thread_ref(tid as ThreadId).on_cpu.store(u32::MAX, Ordering::Release);
     }
+
+    // Mark per-thread stack_switch_pending BEFORE sleep_queue_insert.
+    // Once visible, check_sleep_timers may expire and enqueue us
+    // immediately. It spins on this flag before enqueueing.
+    thread_ref(tid as ThreadId).stack_switch_pending.store(true, Ordering::Release);
+    parked_tid()[cpu].store(tid as u32, Ordering::Release);
 
     // Insert into sorted sleep queue so check_sleep_timers can find us.
     sleep_queue_insert(tid as ThreadId, deadline_ns);

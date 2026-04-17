@@ -824,6 +824,10 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
                 core::sync::atomic::Ordering::Acquire,
             ).is_ok() {
                 // Receiver is off-CPU — direct handoff (L4 style).
+                // Wait for receiver's parking stack switch to complete.
+                while tref.stack_switch_pending.load(core::sync::atomic::Ordering::Acquire) {
+                    core::hint::spin_loop();
+                }
                 crate::sched::scheduler::handoff_to(receiver_tid);
             } else {
                 // Receiver hasn't fully parked yet. Prevent it from parking.
