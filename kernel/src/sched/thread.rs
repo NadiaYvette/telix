@@ -94,6 +94,16 @@ pub struct Thread {
     pub thread_task: core::sync::atomic::AtomicU32,
     pub cosched_group: core::sync::atomic::AtomicU32,
     pub last_cpu: core::sync::atomic::AtomicU32,
+    /// Debug: tracks which CPU currently owns this thread (u32::MAX = not
+    /// scheduled on any CPU). CAS from MAX→cpu when picking a thread in
+    /// try_switch; store MAX when descheduling. If CAS fails, another CPU
+    /// already has this thread — indicates double-scheduling bug.
+    pub on_cpu: core::sync::atomic::AtomicU32,
+    /// Debug: set true when thread is in a run queue, false when dequeued.
+    /// Detects double-enqueue (thread added to queue while already queued).
+    pub in_queue: core::sync::atomic::AtomicBool,
+    /// Debug tag: 1=try_switch, 2=vol_resched, 3=park_ipc, 4=handoff.
+    pub on_cpu_set_by: core::sync::atomic::AtomicU8,
     pub affinity_mask: super::cpumask::AtomicCpuMask,
     // --- IPC park state machine (recv_or_park / park_current_for_ipc) ---
     /// Atomic park state for the Dekker-safe park protocol.
@@ -204,6 +214,9 @@ impl Thread {
             thread_task: core::sync::atomic::AtomicU32::new(0),
             cosched_group: core::sync::atomic::AtomicU32::new(0),
             last_cpu: core::sync::atomic::AtomicU32::new(0),
+            on_cpu: core::sync::atomic::AtomicU32::new(u32::MAX),
+            in_queue: core::sync::atomic::AtomicBool::new(false),
+            on_cpu_set_by: core::sync::atomic::AtomicU8::new(0),
             affinity_mask: super::cpumask::AtomicCpuMask::new_all(),
             turnstile: core::sync::atomic::AtomicUsize::new(0),
             ts_next: core::sync::atomic::AtomicU32::new(0),

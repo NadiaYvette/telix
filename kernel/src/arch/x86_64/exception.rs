@@ -152,6 +152,19 @@ pub const EXCEPTION_FRAME_SIZE: usize = FRAME_SIZE_U64 * 8; // 176 bytes
 /// killed and return fallback_sp.
 #[inline]
 fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
+    // Absolute minimum: no valid kstack frame can be below 64K — catch
+    // saved_sp=0 or any pointer into the real-mode IVT / BIOS data area.
+    if sp < 0x10000 {
+        let tid = crate::sched::scheduler::current_thread_id();
+        crate::println!(
+            "BAD frame: sp={:#x} (below 64K) vec={} tid={}",
+            sp, vector, tid
+        );
+        crate::sched::scheduler::thread_ref(tid)
+            .killed.store(true, core::sync::atomic::Ordering::Release);
+        crate::arch::irq::enable();
+        loop { core::hint::spin_loop(); }
+    }
     let f = unsafe { &*(sp as *const ExceptionFrame) };
     let cs = f.cs();
     let ss = f.ss();
@@ -186,6 +199,14 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
 /// For timer IRQ (vector 32), returns potentially new SP for context switch.
 #[unsafe(no_mangle)]
 extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
+    // Clear any stale pending_switch_sp left by the previous exception's
+    // return path.  The previous cycle's take_pending_switch() loaded the
+    // SP without clearing it (so wake_parked_thread's spin-wait could see
+    // the non-zero value until the assembly `mov rsp, rax` completed).
+    // By this point the stack switch is done — safe to signal completion.
+    let cpu = crate::sched::smp::cpu_id() as usize;
+    crate::sched::scheduler::clear_pending_switch(cpu);
+
     let frame = unsafe { &mut *(frame_sp as *mut ExceptionFrame) };
     let vector = frame.vector();
 

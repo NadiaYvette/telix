@@ -52,8 +52,15 @@ __isr_common:
     // Call Rust handler: rdi = current SP (pointer to ExceptionFrame)
     mov     rdi, rsp
     call    x86_exception_handler
-    // Return value in rax = (potentially new) SP for context switch
+    // Return value in rax = (potentially new) SP for context switch.
+    // Guard: if the returned SP is below 64K, the frame is corrupt
+    // (e.g. saved_sp=0 from a scheduler race). Fall through with the
+    // original RSP so the CPU returns to whatever it was doing before
+    // the interrupt, rather than restoring from address 0.
+    cmp     rax, 0x10000
+    jb      1f
     mov     rsp, rax
+1:
 
     pop     r15
     pop     r14
