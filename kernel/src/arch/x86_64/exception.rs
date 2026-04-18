@@ -256,7 +256,33 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             exception_fault("Invalid Opcode (#UD)", frame)
         }
         7 => exception_fault("Device Not Available (#NM)", frame),
-        8 => exception_fault("Double Fault (#DF)", frame),
+        8 => {
+            // #DF now runs on IST stack — safe to print diagnostics.
+            let cr2: u64;
+            unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2); }
+            let tid = crate::sched::scheduler::current_thread_id();
+            crate::println!(
+                "DOUBLE FAULT (#DF): RIP={:#x} RSP={:#x} CR2={:#x} tid={} error={:#x}",
+                frame.rip(), frame.rsp(), cr2, tid, frame.error_code()
+            );
+            crate::println!(
+                "  RAX={:#x} RBX={:#x} RCX={:#x} RDX={:#x}",
+                frame.rax(), frame.rbx(), frame.rcx(), frame.rdx()
+            );
+            crate::println!(
+                "  RSI={:#x} RDI={:#x} RBP={:#x} CS={:#x} SS={:#x}",
+                frame.rsi(), frame.rdi(), frame.rbp(), frame.cs(), frame.ss()
+            );
+            let tref = crate::sched::scheduler::thread_ref(tid);
+            crate::println!(
+                "  task={} saved_sp={:#x} kstack={:#x} personality_frame_sp={:#x}",
+                tref.task_id, tref.saved_sp, tref.stack_base,
+                tref.personality_frame_sp
+            );
+            tref.killed.store(true, core::sync::atomic::Ordering::Release);
+            crate::arch::irq::enable();
+            loop { core::hint::spin_loop(); }
+        }
         10 => exception_fault("Invalid TSS (#TS)", frame),
         11 => exception_fault("Segment Not Present (#NP)", frame),
         12 => exception_fault("Stack Segment (#SS)", frame),

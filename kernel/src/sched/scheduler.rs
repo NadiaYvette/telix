@@ -727,23 +727,6 @@ fn get_enq_tag() -> u8 {
 }
 
 fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
-    // Invariant check: on_cpu must be MAX (released) before enqueue.
-    // If on_cpu is still set to a CPU value, the thread is still "owned"
-    // by that CPU and enqueueing it creates a double-schedule risk.
-    let on_cpu_val = thread_ref(tid).on_cpu.load(Ordering::Acquire);
-    if on_cpu_val != u32::MAX {
-        let caller = get_enq_tag();
-        let this_cpu = smp::cpu_id();
-        let cur_on_cpu = smp::get(this_cpu).current_thread.load(Ordering::Relaxed);
-        crate::println!(
-            "ENQ-STALE-ONCPU: tid={} on_cpu={} prio={} target={} src={} set_by={} caller={} cur={} cpu={} state={:?}",
-            tid, on_cpu_val, prio, target_cpu,
-            thread_ref(tid).saved_sp_source,
-            thread_ref(tid).on_cpu_set_by.load(Ordering::Relaxed),
-            caller, cur_on_cpu, this_cpu,
-            thread_ref(tid).state
-        );
-    }
     // Double-enqueue detection.
     if thread_ref(tid).in_queue.swap(true, Ordering::AcqRel) {
         crate::println!(
@@ -2025,6 +2008,95 @@ pub fn tick(current_sp: u64) -> u64 {
     // Drain deferred killed-thread cleanup from the previous tick.
     drain_deferred_kills();
 
+    // IPC watchdog: on CPU 0, check for stalled IPC every ~5 seconds.
+    // If no IPC send/recv has occurred since the last check, dump blocked
+    // thread states to help diagnose flaky hangs.
+    {
+        use core::sync::atomic::AtomicU64;
+        static WATCHDOG_TICK: AtomicU64 = AtomicU64::new(0);
+        static LAST_IPC_COUNT: AtomicU64 = AtomicU64::new(0);
+        static STALL_COUNT: AtomicU64 = AtomicU64::new(0);
+        let cpu = smp::cpu_id();
+        if cpu == 0 {
+            let n = WATCHDOG_TICK.fetch_add(1, Ordering::Relaxed);
+            // Check roughly every 5 seconds (tick ≈ 10ms → 500 ticks).
+            if n > 0 && n % 500 == 0 {
+                let sends = crate::sched::stats::IPC_SENDS.load(Ordering::Relaxed);
+                let recvs = crate::sched::stats::IPC_RECVS.load(Ordering::Relaxed);
+                let total = sends.wrapping_add(recvs);
+                let last = LAST_IPC_COUNT.swap(total, Ordering::Relaxed);
+                if total == last {
+                    let sc = STALL_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if sc < 3 {
+                        // First stall detection — dump per-CPU and thread states.
+                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={})", sends, recvs);
+                        // Per-CPU state: what each CPU is running, RQ sizes
+                        let ncpus = smp::num_cpus();
+                        for c in 0..ncpus {
+                            let pc = smp::get(c as u32);
+                            let cur = pc.current_thread.load(Ordering::Relaxed);
+                            let idle = pc.idle_thread_id.load(Ordering::Relaxed);
+                            let rq = percpu_rq()[c].lock();
+                            let rq_len = rq.eevdf_nr_running;
+                            let has_rdy = rq.has_ready();
+                            drop(rq);
+                            let is_idle = cur == idle;
+                            crate::println!("  cpu{}: cur=tid{} idle={} rq_eevdf={} has_ready={}",
+                                c, cur, is_idle, rq_len, has_rdy);
+                        }
+                        let max_tid = NEXT_THREAD_ID.load(Ordering::Relaxed).min(200);
+                        for tid in 1..max_tid {
+                            let t = unsafe { &*(THREAD_TABLE.get(tid) as *const Thread) };
+                            if t.task_id != 0 && t.state != ThreadState::Dead {
+                                let park = t.park_state.load(Ordering::Relaxed);
+                                let wakeup = t.wakeup.load(Ordering::Relaxed);
+                                let on_cpu = t.on_cpu.load(Ordering::Relaxed);
+                                let in_q = t.in_queue.load(Ordering::Relaxed);
+                                let last_cpu = t.last_cpu.load(Ordering::Relaxed);
+                                let prio = t.prio.load(Ordering::Relaxed);
+                                match t.blocked_on {
+                                    crate::sched::thread::BlockReason::CallReply(slot) =>
+                                        crate::println!(
+                                            "  tid={} {:?} CallReply(slot={}) park={} wake={} prio={} on_cpu={} in_q={} last_cpu={} task={}",
+                                            tid, t.state, slot, park, wakeup, prio, on_cpu, in_q, last_cpu, t.task_id),
+                                    crate::sched::thread::BlockReason::PortRecv(port) =>
+                                        crate::println!(
+                                            "  tid={} {:?} PortRecv(p={}) park={} wake={} prio={} task={}",
+                                            tid, t.state, port, park, wakeup, prio, t.task_id),
+                                    crate::sched::thread::BlockReason::PortSetRecv(set) =>
+                                        crate::println!(
+                                            "  tid={} {:?} PSetRecv(s={}) park={} wake={} prio={} task={}",
+                                            tid, t.state, set, park, wakeup, prio, t.task_id),
+                                    crate::sched::thread::BlockReason::PersonalityWait =>
+                                        crate::println!(
+                                            "  tid={} {:?} PersonalityWait park={} wake={} prio={} on_cpu={} in_q={} last_cpu={} task={}",
+                                            tid, t.state, park, wakeup, prio, on_cpu, in_q, last_cpu, t.task_id),
+                                    crate::sched::thread::BlockReason::None => {
+                                        if t.state != ThreadState::Running {
+                                            crate::println!(
+                                                "  tid={} {:?} None park={} wake={} prio={} on_cpu={} in_q={} last_cpu={} task={}",
+                                                tid, t.state, park, wakeup, prio, on_cpu, in_q, last_cpu, t.task_id);
+                                        }
+                                    }
+                                    other =>
+                                        crate::println!(
+                                            "  tid={} {:?} {:?} park={} wake={} prio={} task={}",
+                                            tid, t.state, other, park, wakeup, prio, t.task_id),
+                                };
+                            }
+                        }
+                    }
+                    // After two stall periods, attempt to rescue orphaned threads.
+                    if sc >= 1 {
+                        rescue_orphaned_threads();
+                    }
+                } else {
+                    STALL_COUNT.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     let result = try_switch(current_sp);
 
     // If try_switch performed a context switch, clear need_resched since
@@ -2470,6 +2542,25 @@ pub fn voluntary_reschedule() {
             if cur_id != idle_id {
                 thread_ref(cur_id).on_cpu.store(cpu, Ordering::Release);
             }
+            // Undo page table and kernel stack changes that were made above
+            // before we discovered the double-schedule. We're staying on
+            // cur_id, so restore cur's page table and kernel stack pointer.
+            if cur_task != next_task {
+                let cur_root = {
+                    let tptr = TASK_TABLE.get(cur_task) as *const Task;
+                    if !tptr.is_null() {
+                        unsafe { (*tptr).page_table_root }
+                    } else {
+                        0
+                    }
+                };
+                if cur_root != 0 {
+                    crate::mm::hat::switch_page_table(cur_root);
+                }
+            }
+            crate::arch::trapframe::update_kernel_stack(
+                thread_ref(cur_id).stack_base + kstack_size(),
+            );
             return;
         }
         thread_ref(next_id).on_cpu_set_by.store(2, Ordering::Relaxed); // 2=vol_resched
@@ -4700,6 +4791,52 @@ pub fn wake_parked_thread(tid: ThreadId) {
         }
     }
     // If park_state is PARK_NONE, thread was already woken or never parked. No-op.
+}
+
+/// Scan for threads stuck in Ready state that are not in any run queue
+/// or deferred-requeue slot.  This can happen due to narrow SMP races in
+/// the deferred-requeue path.  Re-enqueue them so the system self-heals.
+/// Called from the watchdog when an IPC stall is detected.
+#[cold]
+#[inline(never)]
+fn rescue_orphaned_threads() {
+    let max_tid = NEXT_THREAD_ID.load(Ordering::Relaxed).min(200);
+    let ncpus = smp::num_cpus();
+    // Snapshot deferred slots to avoid rescuing a thread about to be drained.
+    let mut deferred_tids = [0u32; 16];
+    for c in 0..ncpus.min(16) {
+        let dv = deferred_requeue()[c].load(Ordering::Relaxed);
+        if dv != 0 {
+            deferred_tids[c] = (dv & 0xFFFFFFFF) as u32;
+        }
+    }
+    for tid in 1..max_tid {
+        let t = unsafe { &*(THREAD_TABLE.get(tid) as *const Thread) };
+        if t.task_id == 0 || t.state != ThreadState::Ready {
+            continue;
+        }
+        let on = t.on_cpu.load(Ordering::Acquire);
+        let inq = t.in_queue.load(Ordering::Acquire);
+        if on == u32::MAX && !inq {
+            let mut in_deferred = false;
+            for c in 0..ncpus.min(16) {
+                if deferred_tids[c] == tid as u32 {
+                    in_deferred = true;
+                    break;
+                }
+            }
+            if !in_deferred {
+                let target = t.last_cpu.load(Ordering::Relaxed);
+                let prio = t.prio.load(Ordering::Relaxed);
+                crate::println!(
+                    "RESCUE: tid={} prio={} cpu={} task={}",
+                    tid, prio, target, t.task_id
+                );
+                set_enq_tag(7); // 7=rescue
+                percpu_enqueue(target, prio, tid as ThreadId);
+            }
+        }
+    }
 }
 
 /// Get monotonic time in nanoseconds since boot.

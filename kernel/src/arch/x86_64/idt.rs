@@ -41,6 +41,11 @@ impl IdtEntry {
         self.offset_high = (handler >> 32) as u32;
         self.reserved = 0;
     }
+
+    /// Set IST index (1-7) for this gate. 0 means no IST.
+    fn set_ist(&mut self, ist_index: u8) {
+        self.ist = ist_index & 0x7;
+    }
 }
 
 /// IDTR pointer structure for lidt instruction.
@@ -74,6 +79,9 @@ pub fn init() {
             let dpl3 = i == 0x80;
             idt[i].set(handler, dpl3);
         }
+        // Vector 8 (#DF) uses IST 1 → TSS.ist[0] so it gets a clean stack
+        // even when the current kernel stack is corrupted/overflowed.
+        idt[8].set_ist(1);
 
         let ptr = IdtPtr {
             limit: (core::mem::size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,

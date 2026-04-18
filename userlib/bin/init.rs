@@ -458,6 +458,165 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 145e: rt_sigaction early repro (before flaky I/O phases) ---
+    syscall::debug_puts(b"  init: Phase 145e rt_sigaction early...\n");
+    {
+        // Spawn linux_srv if not already running.
+        if syscall::ns_lookup(b"linux").is_none() {
+            let _ = syscall::spawn(b"linux_srv", 50);
+            for _ in 0..200 {
+                if syscall::ns_lookup(b"linux").is_some() { break; }
+                syscall::yield_now();
+            }
+        }
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_MMAP: u64 = 9;
+                        const __NR_RT_SIGACTION: u64 = 13;
+                        const __NR_EXIT_GROUP: u64 = 231;
+                        const SIGUSR1: u64 = 10;
+
+                        // mmap a page for buffers
+                        let pg: u64;
+                        core::arch::asm!("int 0x80", inlateout("rax") __NR_MMAP => pg,
+                            in("rdi") 0u64, in("rsi") 4096u64, in("rdx") 3u64,
+                            in("r10") 0x22u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if pg > 0xFFFF_FFFF_FFFF_F000 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 50u64, options(noreturn));
+                        }
+
+                        // Build sigaction: handler(8) + flags(8) + restorer(8) + mask(8)
+                        let act_va = pg;
+                        let oldact_va = pg + 64;
+                        core::ptr::write_volatile(act_va as *mut u64, 0xDEAD);
+                        core::ptr::write_volatile((act_va + 8) as *mut u64, 4);
+                        core::ptr::write_volatile((act_va + 16) as *mut u64, 0xBEEF);
+                        core::ptr::write_volatile((act_va + 24) as *mut u64, 0);
+
+                        const __NR_RT_SIGPROCMASK: u64 = 14;
+                        const SIG_BLOCK: u64 = 0;
+                        const SIG_SETMASK: u64 = 2;
+
+                        macro_rules! linux {
+                            ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+                                let r: u64;
+                                core::arch::asm!("int 0x80", inlateout("rax") $nr as u64 => r,
+                                    in("rdi") $a0 as u64, in("rsi") $a1 as u64, in("rdx") $a2 as u64,
+                                    in("r10") $a3 as u64, in("r8") 0u64,
+                                    lateout("rcx") _, lateout("r11") _);
+                                r
+                            }};
+                        }
+
+                        // 1. rt_sigaction(SIGUSR1, act, oldact, 8)
+                        let ret = linux!(__NR_RT_SIGACTION, SIGUSR1, act_va, oldact_va, 8u64);
+                        if ret != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 51u64, options(noreturn));
+                        }
+                        let old_handler = core::ptr::read_volatile(oldact_va as *const u64);
+                        if old_handler != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 52u64, options(noreturn));
+                        }
+
+                        // 2. rt_sigaction(SIGUSR1, NULL, oldact, 8) — read back
+                        let ret2 = linux!(__NR_RT_SIGACTION, SIGUSR1, 0u64, oldact_va, 8u64);
+                        if ret2 != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 53u64, options(noreturn));
+                        }
+                        let readback_handler = core::ptr::read_volatile(oldact_va as *const u64);
+                        if readback_handler != 0xDEAD {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 54u64, options(noreturn));
+                        }
+                        let readback_flags = core::ptr::read_volatile((oldact_va + 8) as *const u64);
+                        if readback_flags != 4 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 55u64, options(noreturn));
+                        }
+
+                        // 3. rt_sigprocmask(SIG_BLOCK, {SIGUSR1}, oldset, 8)
+                        let set_va = pg + 128;
+                        let oldset_va = pg + 192;
+                        let mask_val: u64 = 1 << (SIGUSR1 - 1);
+                        core::ptr::write_volatile(set_va as *mut u64, mask_val);
+                        let ret3 = linux!(__NR_RT_SIGPROCMASK, SIG_BLOCK, set_va, oldset_va, 8u64);
+                        if ret3 != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 56u64, options(noreturn));
+                        }
+                        let old_mask = core::ptr::read_volatile(oldset_va as *const u64);
+                        if old_mask != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 57u64, options(noreturn));
+                        }
+
+                        // 4. rt_sigprocmask(SIG_SETMASK, NULL, oldset, 8) — read back mask
+                        let ret4 = linux!(__NR_RT_SIGPROCMASK, SIG_SETMASK, 0u64, oldset_va, 8u64);
+                        if ret4 != 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 58u64, options(noreturn));
+                        }
+                        let cur_mask = core::ptr::read_volatile(oldset_va as *const u64);
+                        if cur_mask & mask_val == 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 59u64, options(noreturn));
+                        }
+
+                        // 5. rt_sigaction on SIGKILL should fail
+                        let ret5 = linux!(__NR_RT_SIGACTION, 9u64, act_va, 0u64, 8u64);
+                        if ret5 == 0 {
+                            core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 60u64, options(noreturn));
+                        }
+
+                        core::arch::asm!("int 0x80", in("rax") __NR_EXIT_GROUP, in("rdi") 0u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 145e rt_sigaction early: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 145e rt_sigaction early: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 145e rt_sigaction early: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 145e rt_sigaction early: SKIPPED\n");
+        }
+    }
+
     // --- Test 3: mmap_anon / munmap ---
     syscall::debug_puts(b"  init: testing mmap_anon...\n");
     if let Some(va) = syscall::mmap_anon(0, 1, 1) {
@@ -2040,9 +2199,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Test 23: Capability Enforcement + Resource Quotas ---
     syscall::debug_puts(b"  init: running capability test...\n");
     {
-        // Register a test service for ns_lookup cap brokering test.
         let svc_port = syscall::port_create();
-        syscall::ns_register(b"cap_svc", svc_port);
 
         // Spawn cap_test (no special arg0 needed).
         let ct_tid = syscall::spawn(b"cap_test", 50);
@@ -2050,7 +2207,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Set child's port quota to 3: allows 2 user port_create calls
             // (ns_lookup internally creates+destroys a reply port, which may
             // leave cur_ports at 1 if cap bookkeeping prevents port_destroy).
-            syscall::set_quota(ct_tid, 0, 3); // max 3 ports
+            syscall::set_quota(ct_tid, 0, 3);
+            // Register cap_svc AFTER set_quota — cap_test retries ns_lookup
+            // until this service exists, naturally synchronizing the quota.
+            syscall::ns_register(b"cap_svc", svc_port); // max 3 ports
 
             loop {
                 if let Some(code) = syscall::waitpid(ct_tid) {

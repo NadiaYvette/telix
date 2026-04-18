@@ -126,6 +126,22 @@ fn gdt_for(cpu: usize) -> *mut PerCpuGdt {
     }
 }
 
+/// Per-CPU IST stack for the double-fault handler (4 KiB each, up to 16 CPUs).
+/// A dedicated stack is critical: without IST, a #DF caused by stack overflow
+/// or corruption tries to push onto the broken stack → triple fault → silent reboot.
+const MAX_IST_CPUS: usize = 16;
+const IST_STACK_SIZE: usize = 4096;
+
+#[repr(C, align(4096))]
+struct IstStack {
+    data: [u8; IST_STACK_SIZE],
+}
+
+static mut IST_STACKS: [IstStack; MAX_IST_CPUS] = {
+    const EMPTY: IstStack = IstStack { data: [0; IST_STACK_SIZE] };
+    [EMPTY; MAX_IST_CPUS]
+};
+
 /// Pointer to this CPU's TSS storage. BSP uses bootstrap, APs use the
 /// dynamic slice.
 #[inline]
@@ -209,6 +225,9 @@ pub fn init() {
         let rsp: u64;
         core::arch::asm!("mov {}, rsp", out(reg) rsp);
         (*tss_for(0)).rsp0 = rsp;
+        // IST[0] → dedicated double-fault stack (stack grows down, so point to top).
+        (*tss_for(0)).ist[0] =
+            IST_STACKS[0].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
     }
 
     load_gdt_for_cpu(0);
@@ -223,6 +242,11 @@ pub fn init_ap(cpu: u32) {
         let rsp: u64;
         core::arch::asm!("mov {}, rsp", out(reg) rsp);
         (*tss_for(cpu)).rsp0 = rsp;
+        // IST[0] → dedicated double-fault stack.
+        if cpu < MAX_IST_CPUS {
+            (*tss_for(cpu)).ist[0] =
+                IST_STACKS[cpu].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+        }
     }
 
     load_gdt_for_cpu(cpu);

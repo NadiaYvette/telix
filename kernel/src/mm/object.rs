@@ -441,6 +441,14 @@ pub fn create_anon(page_count: u16) -> Option<ObjectId> {
         core::ptr::write(&mut (*ptr).inner, SpinLock::new(obj));
     }
 
+    // DEBUG: verify the just-created port is immediately resolvable
+    if resolve_entry(kernel_port).is_none() {
+        crate::println!(
+            "BUG: create_anon: port {} created but resolve_entry failed immediately! ptr={:#x}",
+            kernel_port, ptr as usize
+        );
+    }
+
     Some(kernel_port)
 }
 
@@ -656,6 +664,13 @@ where
         Some(p) => p,
         None => {
             let caller = core::panic::Location::caller();
+            // Detailed diagnostics: check individual steps of resolve_entry
+            let port_exists = port::port_ref(id).is_some();
+            let port_data = port::port_kernel_data(id);
+            crate::println!(
+                "with_object DIAG: id={} port_exists={} kernel_data={:?} caller={}:{}",
+                id, port_exists, port_data, caller.file(), caller.line()
+            );
             panic!(
                 "with_object: invalid ObjectId {} at {}:{}",
                 id,

@@ -46,18 +46,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // Test 2: ns_lookup grants cap — look up a service, then send to it.
+    // Retry until cap_svc is registered: this synchronizes with the parent's
+    // set_quota call (parent registers cap_svc AFTER setting the quota).
     syscall::debug_puts(b"  [cap_test] test2: ns_lookup\n");
-    if let Some(svc_port) = syscall::ns_lookup(b"cap_svc") {
-        syscall::debug_puts(b"  [cap_test] test2: got port, sending\n");
-        let result2 = syscall::send_nb(svc_port, 0x99, 0xBEEF, 0);
-        if result2 == 0 {
-            syscall::debug_puts(b"  [cap_test] ns_lookup grants cap: send OK\n");
-        } else {
-            syscall::debug_puts(b"  [cap_test] ns_lookup grants cap: send FAIL\n");
-            syscall::exit(1);
+    let svc_port = loop {
+        if let Some(p) = syscall::ns_lookup(b"cap_svc") {
+            break p;
         }
+        syscall::yield_now();
+    };
+    syscall::debug_puts(b"  [cap_test] test2: got port, sending\n");
+    let result2 = syscall::send_nb(svc_port, 0x99, 0xBEEF, 0);
+    if result2 == 0 {
+        syscall::debug_puts(b"  [cap_test] ns_lookup grants cap: send OK\n");
     } else {
-        syscall::debug_puts(b"  [cap_test] ns_lookup failed FAIL\n");
+        syscall::debug_puts(b"  [cap_test] ns_lookup grants cap: send FAIL\n");
         syscall::exit(1);
     }
 
