@@ -2134,13 +2134,28 @@ pub fn tick(current_sp: u64) -> u64 {
                             }
                         }
                     }
-                    // After two stall periods, attempt to rescue orphaned threads.
-                    if sc >= 1 {
-                        rescue_orphaned_threads();
-                    }
+                    // On every stall tick, attempt to rescue orphaned threads.
+                    // TOCTOU false positives are harmless: DOUBLE-ENQ handler
+                    // detects and skips redundant enqueues.
+                    rescue_orphaned_threads();
                 } else {
                     STALL_COUNT.store(0, Ordering::Relaxed);
                 }
+            }
+        }
+    }
+
+    // Periodic orphan rescue: every 100 ticks (~1 second), scan for Ready
+    // threads stuck outside all queues.  Independent of IPC stall detection
+    // because orphans can occur during active IPC (e.g. during boot when
+    // servers are still initializing and IPC counters keep changing).
+    {
+        static RESCUE_TICK: AtomicU64 = AtomicU64::new(0);
+        let cpu = smp::cpu_id();
+        if cpu == 0 {
+            let rt = RESCUE_TICK.fetch_add(1, Ordering::Relaxed);
+            if rt > 0 && rt % 100 == 0 {
+                rescue_orphaned_threads();
             }
         }
     }
@@ -4912,7 +4927,12 @@ fn rescue_orphaned_threads() {
                     break;
                 }
             }
-            if !in_deferred {
+            if in_deferred {
+                crate::println!(
+                    "RESCUE-SKIP-DEFERRED: tid={} task={} last_cpu={}",
+                    tid, t.task_id, t.last_cpu.load(Ordering::Relaxed)
+                );
+            } else {
                 let target = t.last_cpu.load(Ordering::Relaxed);
                 let prio = t.prio.load(Ordering::Relaxed);
                 let (tevt, tcpu, tseq) = trace_last(tid as u32);
