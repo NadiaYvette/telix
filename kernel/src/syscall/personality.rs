@@ -178,11 +178,17 @@ pub fn forward_to_server(
         data: [args[0], args[1], args[2], args[3], args[4], args[5]],
     };
 
+    // Sentinel: -4096 as u64. Not a valid Linux syscall return value (valid
+    // errno range is -1..-4095, success is non-negative). Used to detect
+    // spurious wakes from signals — if we wake and personality_result still
+    // holds this sentinel, the personality server hasn't replied yet.
+    const PERSONALITY_PENDING: u64 = (-4096i64) as u64;
+
     // Clear the result field and set blocked_on before sending, so the
     // personality server can find us even if it replies before we block.
     {
         let tref = crate::sched::scheduler::thread_ref(tid);
-        tref.personality_result.store(u64::MAX, Ordering::Release);
+        tref.personality_result.store(PERSONALITY_PENDING, Ordering::Release);
         tref.wakeup.store(false, Ordering::Release);
     }
     // Safety: single writer (current thread setting its own state).
@@ -212,7 +218,37 @@ pub fn forward_to_server(
     }
 
     // Block until the personality server calls SYS_PERSONALITY_REPLY.
-    crate::sched::block_current(BlockReason::PersonalityWait);
+    // Loop handles spurious wakes from signals: if personality_result still
+    // holds the sentinel, the server hasn't replied — re-arm and re-block.
+    loop {
+        crate::sched::block_current(BlockReason::PersonalityWait);
+        let result = crate::sched::scheduler::thread_ref(tid)
+            .personality_result
+            .load(Ordering::Acquire);
+        if result != PERSONALITY_PENDING {
+            break;
+        }
+        // Spurious wake (signal delivery). Check if we were killed.
+        if crate::sched::scheduler::thread_ref(tid)
+            .killed
+            .load(Ordering::Acquire)
+        {
+            break;
+        }
+        // Re-arm wakeup flag for re-blocking.
+        crate::sched::scheduler::thread_ref(tid)
+            .wakeup
+            .store(false, Ordering::Release);
+        // Re-check personality_result AFTER clearing wakeup. If personality_reply
+        // fired between our first check and the wakeup.store(false), the result
+        // is ready but we just overwrote wakeup — break instead of re-blocking.
+        let result2 = crate::sched::scheduler::thread_ref(tid)
+            .personality_result
+            .load(Ordering::Acquire);
+        if result2 != PERSONALITY_PENDING {
+            break;
+        }
+    }
 
     // Clear blocked_on now that we're awake.
     unsafe {
