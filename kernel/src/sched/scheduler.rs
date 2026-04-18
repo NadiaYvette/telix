@@ -116,6 +116,13 @@ static EARLIEST_INTERVAL_NS: AtomicU64 = AtomicU64::new(0);
 /// Maximum idle duration (1 second). Prevents unbounded sleep in case of stale caches.
 const MAX_IDLE_NS: u64 = 10_000_000; // 10ms — one tick interval, matches TICK_INTERVAL_NS
 
+/// Sentinel value for on_cpu: thread has been dequeued by percpu_pick_next
+/// but the CAS in try_switch hasn't promoted it to a real CPU id yet.
+/// Prevents rescue_orphaned_threads from re-enqueuing threads in this
+/// transient window (which could cause DOUBLE-SCHED if a third CPU steals
+/// the re-enqueued thread before the original CAS completes).
+const ON_CPU_PENDING: u32 = u32::MAX - 1;
+
 /// Get a thread reference by ID via radix lookup (lockless).
 #[inline]
 pub fn thread_ref(tid: u32) -> &'static Thread {
@@ -240,6 +247,10 @@ fn drain_deferred_requeue(cpu: u32) {
         let tid = (val & 0xFFFFFFFF) as ThreadId;
         let prio = ((val >> 32) & 0xFF) as u8;
         let target = ((val >> 40) & 0xFF) as u32;
+        // Mark ON_CPU_PENDING before enqueue to close the TOCTOU window:
+        // without this, between swap(0) and percpu_enqueue, rescue on
+        // another CPU sees on_cpu=MAX + in_queue=false and re-enqueues.
+        thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
         trace_sched(tid, 2); // 2=drain_enq
         set_enq_tag(1); // 1=drain_deferred
         percpu_enqueue(target, prio, tid);
@@ -1487,6 +1498,7 @@ fn percpu_pick_next(cpu: u32, idle_id: ThreadId) -> ThreadId {
     // Class-aware dispatch: RT → EEVDF → legacy.
     if let Some(tid) = rq.class_pick_next() {
         thread_ref(tid).in_queue.store(false, Ordering::Release);
+        thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
         trace_sched(tid, 3); // 3=pick_deq
         return tid;
     }
@@ -1494,6 +1506,7 @@ fn percpu_pick_next(cpu: u32, idle_id: ThreadId) -> ThreadId {
     // Nothing local — try work stealing.
     if let Some(tid) = try_steal(cpu) {
         thread_ref(tid).in_queue.store(false, Ordering::Release);
+        thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
         trace_sched(tid, 12); // 12=steal_deq
         return tid;
     }
@@ -1507,6 +1520,7 @@ fn percpu_pick_next_cosched(cpu: u32, idle_id: ThreadId, prev_group: u32) -> (Th
     if prev_group != 0 && rq.cosched_burst < MAX_COSCHED_BURST {
         if let Some(tid) = rq.pop_for_group(prev_group) {
             thread_ref(tid).in_queue.store(false, Ordering::Release);
+            thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
             trace_sched(tid, 3); // 3=pick_deq
             rq.cosched_burst += 1;
             COSCHED_HITS.fetch_add(1, Ordering::Relaxed);
@@ -1517,6 +1531,7 @@ fn percpu_pick_next_cosched(cpu: u32, idle_id: ThreadId, prev_group: u32) -> (Th
     // Class-aware dispatch: RT → EEVDF → legacy.
     if let Some(tid) = rq.class_pick_next() {
         thread_ref(tid).in_queue.store(false, Ordering::Release);
+        thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
         trace_sched(tid, 3); // 3=pick_deq
         return (tid, false);
     }
@@ -1524,6 +1539,7 @@ fn percpu_pick_next_cosched(cpu: u32, idle_id: ThreadId, prev_group: u32) -> (Th
     // Nothing local — try work stealing.
     if let Some(tid) = try_steal(cpu) {
         thread_ref(tid).in_queue.store(false, Ordering::Release);
+        thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
         trace_sched(tid, 12); // 12=steal_deq
         return (tid, false);
     }
@@ -2137,7 +2153,9 @@ pub fn tick(current_sp: u64) -> u64 {
                     // On every stall tick, attempt to rescue orphaned threads.
                     // TOCTOU false positives are harmless: DOUBLE-ENQ handler
                     // detects and skips redundant enqueues.
-                    rescue_orphaned_threads();
+                    // Also rescue CallReply-blocked threads (rescue_parked=true)
+                    // since IPC is confirmed stalled.
+                    rescue_orphaned_threads_impl(true);
                 } else {
                     STALL_COUNT.store(0, Ordering::Relaxed);
                 }
@@ -2155,7 +2173,8 @@ pub fn tick(current_sp: u64) -> u64 {
         if cpu == 0 {
             let rt = RESCUE_TICK.fetch_add(1, Ordering::Relaxed);
             if rt > 0 && rt % 100 == 0 {
-                rescue_orphaned_threads();
+                // Periodic: only rescue Ready orphans, not parked threads.
+                rescue_orphaned_threads_impl(false);
             }
         }
     }
@@ -2353,11 +2372,16 @@ fn try_switch(current_sp: u64) -> u64 {
                 prev_prio = prev_t.base_priority;
             }
         }
-        // Release on_cpu for prev thread — it is no longer on this CPU.
-        if prev_id != idle_id {
-            thread_ref(prev_id).on_cpu.store(u32::MAX, Ordering::Release);
-            trace_sched(prev_id, 5); // 5=on_cpu_clear
-        }
+        // NOTE: prev.on_cpu is intentionally NOT cleared here.  It stays
+        // at the CPU number from the CAS that scheduled it.  This prevents a
+        // TOCTOU window: if we set on_cpu=MAX before storing in the deferred
+        // slot, rescue_orphaned_threads could see (state=Ready, on_cpu=MAX,
+        // !in_queue) and re-enqueue the thread while it's still in the
+        // deferred slot.  drain_deferred_requeue sets ON_CPU_PENDING before
+        // enqueue, and percpu_pick_next sets ON_CPU_PENDING on dequeue, so
+        // nothing in the normal path depends on on_cpu being MAX here.
+        // on_cpu=MAX is only set by park_current_for_ipc/sleep (for
+        // handoff_to's CAS which expects MAX for parked threads).
         // Don't re-enqueue Dead threads (they are exiting).
         if prev_id != idle_id && prev_t.state != ThreadState::Dead {
             // If the thread was killed, mark Dead + defer full cleanup
@@ -2388,9 +2412,14 @@ fn try_switch(current_sp: u64) -> u64 {
                 deferred_thread()[cpu as usize].store(prev_id as usize, Ordering::Release);
                 deferred_kstack()[cpu as usize].store(kstack_base, Ordering::Release);
             } else {
-                prev_t.state = ThreadState::Ready;
                 // Defer re-enqueue: prevent work-stealing from picking up
                 // prev while this CPU is still on its kernel stack.
+                // IMPORTANT: store in deferred slot BEFORE setting state=Ready.
+                // With AcqRel on the swap, the compiler cannot reorder the
+                // state write before the deferred store. This ensures other
+                // CPUs see the thread in the deferred slot before they see
+                // state=Ready, preventing rescue_orphaned_threads from
+                // re-enqueuing a thread that's already in the deferred slot.
                 let packed = (prev_id as u64) | ((prev_prio as u64) << 32) | ((cpu as u64) << 40);
                 let old_deferred = deferred_requeue()[cpu as usize].swap(packed, Ordering::AcqRel);
                 if old_deferred != 0 {
@@ -2405,6 +2434,7 @@ fn try_switch(current_sp: u64) -> u64 {
                     set_enq_tag(10); // 10=overwrite_rescue
                     percpu_enqueue(lost_target, lost_prio, lost_tid);
                 }
+                prev_t.state = ThreadState::Ready;
                 trace_sched(prev_id, 1); // 1=deferred_store
             }
         }
@@ -2438,12 +2468,14 @@ fn try_switch(current_sp: u64) -> u64 {
     // Always write FSBASE so stale values from another thread don't leak.
     crate::arch::cpu::set_tls(thread_ref(next_id).tls_base);
 
-    // Double-scheduling detection: CAS on_cpu from MAX→cpu. If it fails,
-    // another CPU already owns this thread — kill it and switch to idle.
+    // Double-scheduling detection: CAS on_cpu from ON_CPU_PENDING→cpu.
+    // percpu_pick_next sets on_cpu to ON_CPU_PENDING when dequeuing, so
+    // we expect that value here. If it fails, another CPU already owns
+    // this thread — kill it and switch to idle.
     // Skip for idle threads (per-CPU, never enqueued, can't be double-scheduled).
     if next_id != idle_id {
         let prev_on = thread_ref(next_id).on_cpu.compare_exchange(
-            u32::MAX, cpu, Ordering::AcqRel, Ordering::Acquire,
+            ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire,
         );
         if let Err(other_cpu) = prev_on {
             crate::println!(
@@ -2548,7 +2580,8 @@ pub fn voluntary_reschedule() {
         t.saved_sp_source = 2; // voluntary_reschedule
         cur_prio = t.effective_priority;
         cur_task = t.task_id;
-        t.state = ThreadState::Ready;
+        // NOTE: state stays Running here. Set to Ready AFTER the deferred
+        // store to close the orphan window (see try_switch for rationale).
     }
 
     // Check if there's another runnable thread before yielding.
@@ -2556,9 +2589,7 @@ pub fn voluntary_reschedule() {
     let next_id = percpu_pick_next(cpu, idle_id);
 
     if next_id == idle_id {
-        // No other thread to run — undo Ready, stay Running.
-        let t = unsafe { thread_mut_from_ref(cur_id) };
-        t.state = ThreadState::Running;
+        // No other thread to run — stay Running.
         return;
     }
 
@@ -2587,11 +2618,10 @@ pub fn voluntary_reschedule() {
 
     crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
 
-    // Release on_cpu for cur. Must happen before deferred_requeue store so
-    // that when the drain eventually enqueues cur, on_cpu is MAX.
-    if cur_id != idle_id {
-        thread_ref(cur_id).on_cpu.store(u32::MAX, Ordering::Release);
-    }
+    // NOTE: cur.on_cpu is intentionally NOT cleared here (same reasoning
+    // as try_switch).  drain_deferred_requeue sets ON_CPU_PENDING before
+    // enqueue; leaving on_cpu at the CPU number prevents rescue from seeing
+    // the thread as orphaned while it's in the deferred slot.
 
     // Defer re-enqueue of cur instead of percpu_enqueue. We are still on
     // cur's kernel stack — the assembly `mov rsp, rax` hasn't executed yet.
@@ -2613,13 +2643,15 @@ pub fn voluntary_reschedule() {
             set_enq_tag(10);
             percpu_enqueue(lost_target, lost_prio, lost_tid);
         }
+        // Set state=Ready AFTER deferred store (AcqRel prevents reorder).
+        unsafe { thread_mut_from_ref(cur_id) }.state = ThreadState::Ready;
         trace_sched(cur_id, 1); // 1=deferred_store
     }
 
-    // Claim on_cpu for next.
+    // Claim on_cpu for next (ON_CPU_PENDING → cpu).
     if next_id != idle_id {
         if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
-            u32::MAX, cpu, Ordering::AcqRel, Ordering::Acquire,
+            ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire,
         ) {
             crate::println!(
                 "DOUBLE-SCHED(vol): tid={} already on cpu={}, this cpu={}",
@@ -4754,10 +4786,10 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
 
     // on_cpu for parked thread was released above (before park_state CAS).
-    // Claim on_cpu for next.
+    // Claim on_cpu for next (ON_CPU_PENDING → cpu).
     if next_id != idle_id {
         if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
-            u32::MAX, cpu_idx, Ordering::AcqRel, Ordering::Acquire,
+            ON_CPU_PENDING, cpu_idx, Ordering::AcqRel, Ordering::Acquire,
         ) {
             crate::println!(
                 "DOUBLE-SCHED(park): tid={} already on cpu={}, this cpu={}",
@@ -4898,10 +4930,14 @@ pub fn wake_parked_thread(tid: ThreadId) {
 
 /// Scan for threads stuck in Ready state that are not in any run queue
 /// or deferred-requeue slot.  Re-enqueue them so the system self-heals.
-/// Called from the watchdog when an IPC stall is detected.
+///
+/// `rescue_parked`: if true, also scan for CallReply-blocked threads stuck
+/// in COMMITTED with wakeup=true and inject SERVER_DIED. Only set this
+/// during confirmed IPC stalls (watchdog), not on periodic sweeps, to
+/// avoid prematurely killing legitimate slow IPC calls.
 #[cold]
 #[inline(never)]
-fn rescue_orphaned_threads() {
+fn rescue_orphaned_threads_impl(rescue_parked: bool) {
     let max_tid = NEXT_THREAD_ID.load(Ordering::Relaxed).min(200);
     let ncpus = smp::num_cpus();
     // Snapshot deferred slots to avoid rescuing a thread about to be drained.
@@ -4919,6 +4955,8 @@ fn rescue_orphaned_threads() {
         }
         let on = t.on_cpu.load(Ordering::Acquire);
         let inq = t.in_queue.load(Ordering::Acquire);
+        // Skip threads that are on a CPU, in a queue, or being scheduled
+        // (ON_CPU_PENDING = dequeued by percpu_pick_next, CAS pending).
         if on == u32::MAX && !inq {
             let mut in_deferred = false;
             for c in 0..ncpus.min(16) {
@@ -4928,10 +4966,14 @@ fn rescue_orphaned_threads() {
                 }
             }
             if in_deferred {
-                crate::println!(
-                    "RESCUE-SKIP-DEFERRED: tid={} task={} last_cpu={}",
-                    tid, t.task_id, t.last_cpu.load(Ordering::Relaxed)
-                );
+                // Thread is in a deferred-requeue slot. Can't enqueue directly
+                // (the owning CPU may still be on this thread's kernel stack).
+                // Send a reschedule IPI to the owning CPU so its next
+                // try_switch → drain_deferred_requeue unsticks the thread.
+                let target_cpu = t.last_cpu.load(Ordering::Relaxed);
+                if target_cpu != smp::cpu_id() {
+                    crate::arch::irq::send_reschedule_ipi(target_cpu);
+                }
             } else {
                 let target = t.last_cpu.load(Ordering::Relaxed);
                 let prio = t.prio.load(Ordering::Relaxed);
@@ -4954,11 +4996,16 @@ fn rescue_orphaned_threads() {
     }
 
     // Second pass: rescue CallReply-blocked threads stuck in COMMITTED
-    // with wakeup=true. These were parked via park_current_for_ipc and
-    // then a signal was delivered via wake_thread, but wake_thread cannot
-    // handle COMMITTED threads (would need to spin on stack_switch_pending,
-    // unsafe in IRQ context). By the time rescue runs (after multiple stall
-    // detection cycles), the parking CPU has long finished its stack switch.
+    // with wakeup=true. Only runs during confirmed IPC stalls, not on
+    // periodic sweeps, to avoid prematurely killing legitimate slow calls.
+    if !rescue_parked {
+        return;
+    }
+    // These were parked via park_current_for_ipc and then a signal was
+    // delivered via wake_thread, but wake_thread cannot handle COMMITTED
+    // threads (would need to spin on stack_switch_pending, unsafe in IRQ
+    // context). By the time the watchdog stall fires (after 5+ seconds),
+    // the parking CPU has long finished its stack switch.
     //
     // ONLY CallReply threads are rescued here. Other block reasons
     // (PagerWait, PortRecv, etc.) have their own wake mechanisms and must
@@ -5301,10 +5348,10 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
 
     crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
 
-    // Claim on_cpu for next thread (same as park_current_for_ipc).
+    // Claim on_cpu for next thread (ON_CPU_PENDING → cpu).
     if next_id != idle_id {
         if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
-            u32::MAX, cpu_idx, Ordering::AcqRel, Ordering::Acquire,
+            ON_CPU_PENDING, cpu_idx, Ordering::AcqRel, Ordering::Acquire,
         ) {
             crate::println!(
                 "DOUBLE-SCHED(sleep): tid={} already on cpu={}, this cpu={}",
@@ -5414,15 +5461,16 @@ pub fn handoff_to(receiver_tid: ThreadId) {
         sender_prio = sender.effective_priority;
         remaining_quantum = sender.quantum;
         sender_task = sender.task_id;
-        sender.state = ThreadState::Ready;
+        // NOTE: state stays Running here. Set to Ready AFTER deferred store.
     }
-    // Release on_cpu and defer re-enqueue. Same pattern as voluntary_reschedule:
+    // Defer re-enqueue of sender. Same pattern as voluntary_reschedule:
     // we're still on the sender's kernel stack, so immediate percpu_enqueue
     // would let another CPU steal the sender and use the same stack.
+    // NOTE: sender.on_cpu is intentionally NOT cleared (same reasoning as
+    // try_switch) — drain_deferred_requeue sets ON_CPU_PENDING before enqueue.
     {
         let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
         if (sender_tid as ThreadId) != idle_id {
-            thread_ref(sender_tid as ThreadId).on_cpu.store(u32::MAX, Ordering::Release);
             let packed = (sender_tid as u64) | ((sender_prio as u64) << 32)
                 | ((cpu_id as u64) << 40);
             let old_deferred = deferred_requeue()[cpu].swap(packed, Ordering::AcqRel);
@@ -5437,6 +5485,8 @@ pub fn handoff_to(receiver_tid: ThreadId) {
                 set_enq_tag(10);
                 percpu_enqueue(lost_target, lost_prio, lost_tid);
             }
+            // Set state=Ready AFTER deferred store (AcqRel prevents reorder).
+            unsafe { thread_mut_from_ref(sender_tid as ThreadId) }.state = ThreadState::Ready;
             trace_sched(sender_tid as u32, 1); // 1=deferred_store
         }
     }
@@ -5467,8 +5517,8 @@ pub fn handoff_to(receiver_tid: ThreadId) {
 
     crate::arch::trapframe::update_kernel_stack(receiver.stack_base + kstack_size());
 
-    // on_cpu for sender was released above (before deferred_requeue).
-    // Claim on_cpu for receiver.
+    // Claim on_cpu for receiver (parked threads have on_cpu=MAX from
+    // park_current_for_ipc, so CAS expects MAX).
     {
         let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
         if receiver_tid != idle_id {
