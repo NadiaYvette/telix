@@ -88,6 +88,8 @@ void     telix_port_destroy(uint32_t port);
 uint64_t telix_send(uint32_t port, uint64_t tag, uint64_t d0, uint64_t d1,
                      uint64_t d2, uint64_t d3);
 int      telix_recv_msg(uint32_t port, struct telix_msg *out);
+int      telix_call(uint32_t port, uint64_t tag, uint64_t d0, uint64_t d1,
+                    uint64_t d2, uint64_t d3, struct telix_msg *reply);
 uint32_t telix_nsrv_port(void);
 uint32_t telix_ns_lookup(const char *name, int namelen);
 

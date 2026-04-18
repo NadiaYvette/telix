@@ -42,7 +42,18 @@ static int my_strlen(const char *s) {
     return n;
 }
 
-/* IPC helper: send request and receive reply on a temporary port. */
+/* IPC helper (call/reply): for servers using sys_call/sys_reply (uds_srv).
+ * The kernel blocks the caller and injects the reply directly — no temporary
+ * reply port needed. */
+static int ipc_call(uint32_t server_port, uint64_t tag,
+                    uint64_t d0, uint64_t d1, uint64_t d2,
+                    uint64_t d3, struct telix_msg *reply) {
+    return telix_call(server_port, tag, d0, d1, d2, d3, reply);
+}
+
+/* IPC helper (fire-and-forget + reply port): for servers using the old
+ * send/recv protocol (net_srv). Creates a temporary reply port, packs it
+ * into d2 high bits, sends, and waits. */
 static int ipc_request(uint32_t server_port, uint64_t tag,
                        uint64_t d0, uint64_t d1, uint64_t d2_low,
                        uint64_t d3, struct telix_msg *reply) {
@@ -86,7 +97,7 @@ int socket(int domain, int type, int protocol) {
     }
 
     struct telix_msg reply;
-    int ok = ipc_request(srv, UDS_SOCKET, (uint64_t)(unsigned)type, 0, 0, 0, &reply);
+    int ok = ipc_call(srv, UDS_SOCKET, (uint64_t)(unsigned)type, 0, 0, 0, &reply);
     if (ok != 0 || reply.tag != UDS_OK) return -1;
 
     uint32_t handle = (uint32_t)reply.data[0];
@@ -117,9 +128,9 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
         pack16((const unsigned char *)un->sun_path, namelen, &n0, &n1);
 
         struct telix_msg reply;
-        int ok = ipc_request(fde->server_port, UDS_BIND,
-                             (uint64_t)fde->server_handle, n0,
-                             (uint64_t)namelen, n1, &reply);
+        int ok = ipc_call(fde->server_port, UDS_BIND,
+                          (uint64_t)fde->server_handle, n0,
+                          (uint64_t)namelen, n1, &reply);
         if (ok != 0 || reply.tag != UDS_OK) return -1;
         return 0;
     }
@@ -140,9 +151,9 @@ int listen(int sockfd, int backlog) {
     }
 
     struct telix_msg reply;
-    int ok = ipc_request(fde->server_port, UDS_LISTEN,
-                         (uint64_t)fde->server_handle, (uint64_t)backlog,
-                         0, 0, &reply);
+    int ok = ipc_call(fde->server_port, UDS_LISTEN,
+                      (uint64_t)fde->server_handle, (uint64_t)backlog,
+                      0, 0, &reply);
     if (ok != 0 || reply.tag != UDS_OK) return -1;
     return 0;
 }
@@ -164,8 +175,8 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     }
 
     struct telix_msg reply;
-    int ok = ipc_request(fde->server_port, UDS_ACCEPT,
-                         (uint64_t)fde->server_handle, 0, 0, 0, &reply);
+    int ok = ipc_call(fde->server_port, UDS_ACCEPT,
+                      (uint64_t)fde->server_handle, 0, 0, 0, &reply);
     if (ok != 0 || reply.tag != UDS_OK) return -1;
 
     uint32_t new_handle = (uint32_t)reply.data[0];
@@ -206,8 +217,8 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
         uint64_t d3 = (pid & 0xFFFFFFFF) | (uid << 32);
 
         struct telix_msg reply;
-        int ok = ipc_request(fde->server_port, UDS_CONNECT,
-                             n0, n1, (uint64_t)namelen, d3, &reply);
+        int ok = ipc_call(fde->server_port, UDS_CONNECT,
+                          n0, n1, (uint64_t)namelen, d3, &reply);
         if (ok != 0 || reply.tag != UDS_OK) return -1;
         fde->server_handle = (uint32_t)reply.data[0];
         return 0;
@@ -263,9 +274,9 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
         pack16(p, chunk, &w0, &w1);
 
         struct telix_msg reply;
-        int ok = ipc_request(fde->server_port, UDS_SEND,
-                             (uint64_t)fde->server_handle, w0,
-                             (uint64_t)chunk, w1, &reply);
+        int ok = ipc_call(fde->server_port, UDS_SEND,
+                          (uint64_t)fde->server_handle, w0,
+                          (uint64_t)chunk, w1, &reply);
         if (ok != 0 || reply.tag != UDS_OK) {
             return total > 0 ? (ssize_t)total : -1;
         }
@@ -308,8 +319,8 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
 
     /* AF_UNIX path. */
     struct telix_msg reply;
-    int ok = ipc_request(fde->server_port, UDS_RECV,
-                         (uint64_t)fde->server_handle, 0, 0, 0, &reply);
+    int ok = ipc_call(fde->server_port, UDS_RECV,
+                      (uint64_t)fde->server_handle, 0, 0, 0, &reply);
     if (ok != 0) return -1;
     if (reply.tag == UDS_EOF) return 0;
     if (reply.tag != UDS_OK) return -1;
@@ -364,8 +375,8 @@ int shutdown(int sockfd, int how) {
     }
 
     struct telix_msg reply;
-    ipc_request(fde->server_port, UDS_CLOSE,
-                (uint64_t)fde->server_handle, 0, 0, 0, &reply);
+    ipc_call(fde->server_port, UDS_CLOSE,
+             (uint64_t)fde->server_handle, 0, 0, 0, &reply);
     telix_fd_close(sockfd);
     return 0;
 }

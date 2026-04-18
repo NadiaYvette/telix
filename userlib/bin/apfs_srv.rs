@@ -3806,7 +3806,6 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     VOL_NEXT_OBJ_ID += 1;
                     id
                 };
-
                 // Create inode record.
                 let new_root = match create_inode_record(
                     &blk, bs, vol_omap, cur_fs_root, fs_root_oid, max_xid,

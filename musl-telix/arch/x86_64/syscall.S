@@ -113,3 +113,40 @@ __telix_recv_msg:
     pop %rbx
     ret
     .size __telix_recv_msg, . - __telix_recv_msg
+
+/* uint64_t __telix_call_msg(uint32_t port, uint64_t tag,
+ *                           uint64_t d0, uint64_t d1,
+ *                           uint64_t d2, uint64_t d3,
+ *                           struct telix_msg *out)
+ *
+ * Performs SYS_CALL (118): sends (tag, d0..d3) to port, blocks until
+ * the server replies, and writes the reply message into *out.
+ *
+ * C args:   rdi=port, rsi=tag, rdx=d0, rcx=d1, r8=d2, r9=d3,
+ *           8(%rsp)=out
+ * Syscall:  rax=118, rdi=port, rsi=tag, rdx=d0, r10=d1, r8=d2, r9=d3
+ * Returns status in rax.
+ */
+    .global __telix_call_msg
+    .type __telix_call_msg, @function
+__telix_call_msg:
+    push %rbx
+    push %r12
+    mov 24(%rsp), %r12      /* save out pointer (7th C arg) */
+    mov %rcx, %r10          /* d1: C rcx → syscall r10 */
+    mov $118, %rax          /* SYS_CALL = 118 */
+    /* rdi=port, rsi=tag, rdx=d0 already set; r8=d2, r9=d3 already set */
+    int $0x80
+    /* Store reply into struct telix_msg at r12 */
+    mov %rdi, 0(%r12)       /* out->tag */
+    mov %rsi, 8(%r12)       /* out->data[0] */
+    mov %rdx, 16(%r12)      /* out->data[1] */
+    mov %r10, 24(%r12)      /* out->data[2] */
+    mov %r8,  32(%r12)      /* out->data[3] */
+    mov %r9,  40(%r12)      /* out->data[4] */
+    mov %rbx, 48(%r12)      /* out->data[5] */
+    /* rax has status */
+    pop %r12
+    pop %rbx
+    ret
+    .size __telix_call_msg, . - __telix_call_msg

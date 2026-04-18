@@ -53,7 +53,7 @@ fi
 # Add virtio-blk disk if test.img exists.
 if [ -f "$DISK_IMG" ]; then
     QEMU_ARGS+=(
-        -drive file="$DISK_IMG",format=raw,if=none,id=disk0
+        -drive file="$DISK_IMG",format=raw,if=none,id=disk0,snapshot=on
         -device virtio-blk-pci,drive=disk0
     )
 fi

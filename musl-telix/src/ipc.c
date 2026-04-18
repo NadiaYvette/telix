@@ -27,6 +27,19 @@ int telix_recv_msg(uint32_t port, struct telix_msg *out) {
     return (status == 0) ? 0 : -1;
 }
 
+/* Assembly stub for sys_call (SYS_CALL=118). Sends a message and blocks
+   until the server replies; reply is written into *out. */
+extern uint64_t __telix_call_msg(uint32_t port, uint64_t tag,
+                                 uint64_t d0, uint64_t d1,
+                                 uint64_t d2, uint64_t d3,
+                                 struct telix_msg *out);
+
+int telix_call(uint32_t port, uint64_t tag, uint64_t d0, uint64_t d1,
+               uint64_t d2, uint64_t d3, struct telix_msg *reply) {
+    uint64_t status = __telix_call_msg(port, tag, d0, d1, d2, d3, reply);
+    return (status == 0) ? 0 : -1;
+}
+
 void telix_pack_name(const char *name, int len, uint64_t out[3]) {
     out[0] = out[1] = out[2] = 0;
     for (int i = 0; i < len && i < 24; i++) {
