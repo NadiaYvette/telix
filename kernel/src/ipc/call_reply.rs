@@ -95,6 +95,10 @@ pub const CAP_ABANDONED: u32 = 3;
 /// by the kernel's thread-teardown path.
 pub const CALL_REPLY_SERVER_DIED: u64 = 0xFFFF_FFFF_FFFF_FE00;
 
+/// Special reply tag: IPC call interrupted by signal delivery.
+/// The cap was abandoned; the server's reply (if any) will be silently dropped.
+pub const CALL_REPLY_INTERRUPTED: u64 = 0xFFFF_FFFF_FFFF_FE02;
+
 /// Special reply tag: cap invalidated for another reason (future use).
 #[allow(dead_code)]
 pub const CALL_REPLY_INVALIDATED: u64 = 0xFFFF_FFFF_FFFF_FE01;
@@ -423,6 +427,40 @@ pub fn abandon(handle: CapHandle) {
             cap.state.store(CAP_FREE, Ordering::Release);
         }
         Err(_) => {}
+    }
+}
+
+/// Abandon a cap identified by slot index + expected caller, for signal
+/// interruption of a parked IPC call.
+///
+/// Returns `true` if the cap was successfully transitioned PENDING → ABANDONED
+/// (meaning the caller now owns the wake — the server's future `fulfill` will
+/// see ABANDONED and NOT inject into the frame).  Returns `false` if the cap
+/// was already fulfilled/free/abandoned or the caller_tid didn't match.
+///
+/// Used by `wake_thread` to coordinate with `sys_reply`: the cap state CAS
+/// serializes against `fulfill`'s CAS, so exactly one side wins and handles
+/// frame injection + wake.
+pub fn abandon_for_interrupt(slot: u32, expected_caller: u32) -> bool {
+    if (slot as usize) >= MAX_REPLY_CAPS {
+        return false;
+    }
+    let cap = &REPLY_CAPS[slot as usize];
+    if cap.caller_tid.load(Ordering::Acquire) != expected_caller {
+        return false;
+    }
+    match cap.state.compare_exchange(
+        CAP_PENDING,
+        CAP_ABANDONED,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            undonate_priority(cap);
+            revoke_cap_leases(cap);
+            true
+        }
+        Err(_) => false,
     }
 }
 
