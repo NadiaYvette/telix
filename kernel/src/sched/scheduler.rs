@@ -4993,11 +4993,20 @@ pub fn wake_parked_thread(tid: ThreadId) {
         trace_sched(tid, 16); // 16=ipc_wake (COMMITTED→NONE, about to enqueue)
         set_enq_tag(6); // 6=wake_parked
         percpu_enqueue(target, prio, tid);
-        // If the target CPU is remote, it may be idle in HLT with the timer
-        // set far out (up to MAX_IDLE_NS).  Send a reschedule IPI so it
-        // picks up the newly-enqueued thread immediately.
+        // IPC wakes are latency-critical: the caller is blocked waiting for
+        // its reply.  Trigger preemption so the woken thread runs promptly
+        // rather than waiting for the current thread's quantum to expire.
         let waker_cpu = smp::cpu_id();
-        if target != waker_cpu {
+        if target == waker_cpu {
+            // Local: set need_resched so check_preempt_on_return triggers
+            // voluntary_reschedule on syscall return.  Reprogram the timer
+            // in case the waker enters a user-space loop without syscalls.
+            smp::get(waker_cpu).need_resched.store(true, Ordering::Release);
+            crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
+        } else {
+            // Remote: send IPI to wake from HLT.  The IPI fires try_switch
+            // which drains the deferred slot and picks from the queue at
+            // the next quantum boundary.
             crate::arch::irq::send_reschedule_ipi(target);
         }
     } else {
