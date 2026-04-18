@@ -1138,8 +1138,18 @@ fn sys_call(
                 crate::sched::scheduler::thread_ref(caller_tid).effective_priority;
             call_reply::donate_priority(handle, receiver_tid, caller_prio);
             msg.data[5] = 0;
+            let recv_park = crate::sched::scheduler::thread_ref(receiver_tid)
+                .park_state.load(core::sync::atomic::Ordering::Acquire);
             inject_recv_into_frame(receiver_tid, &msg);
             crate::sched::scheduler::wake_parked_thread(receiver_tid);
+            let recv_park_after = crate::sched::scheduler::thread_ref(receiver_tid)
+                .park_state.load(core::sync::atomic::Ordering::Acquire);
+            if recv_park_after != crate::sched::scheduler::PARK_NONE {
+                crate::println!(
+                    "CALL-DT-WARN: caller={} recv={} port={} tag={:#x} park_before={} park_after={}",
+                    caller_tid, receiver_tid, dest_port, tag, recv_park, recv_park_after
+                );
+            }
         }
         crate::ipc::port::SendDirectResult::Queued => {}
         crate::ipc::port::SendDirectResult::Full => {
@@ -1160,6 +1170,8 @@ fn sys_call(
     // Park on the cap. pre_save_frame already ran above. If sys_reply beat
     // us to it, park_current_for_ipc's CAS fails and it returns immediately.
     let slot = (handle & 0xFFFF_FFFF) as u32;
+    // Store dest_port for diagnostics (visible in watchdog dumps).
+    unsafe { crate::sched::scheduler::thread_mut_from_ref(caller_tid) }.call_dest_port = dest_port;
     crate::sched::scheduler::park_current_for_ipc(
         crate::sched::thread::BlockReason::CallReply(slot),
     );
@@ -1179,6 +1191,24 @@ fn sys_call(
 fn sys_recv_with_cap(port_id: u64, frame: &mut ExceptionFrame) -> u64 {
     if !check_port_cap(port_id, crate::cap::Rights::RECV) {
         return ECAP;
+    }
+
+    // Diagnostic: if the server still holds an unreplied cap, it's about to
+    // leak it. This catches the case where a message was injected but the
+    // server didn't call reply() before calling recv_with_cap again.
+    {
+        let tid = crate::sched::current_thread_id();
+        let old_cap = crate::sched::scheduler::thread_ref(tid)
+            .held_reply_cap.load(core::sync::atomic::Ordering::Acquire);
+        if old_cap != u64::MAX {
+            let slot = (old_cap & 0xFFFF_FFFF) as u32;
+            let cap_state = crate::ipc::call_reply::REPLY_CAPS[slot as usize]
+                .state.load(core::sync::atomic::Ordering::Acquire);
+            crate::println!(
+                "LEAKED-CAP: tid={} port={} old_cap={:#x} slot={} cap_state={}",
+                tid, port_id, old_cap, slot, cap_state
+            );
+        }
     }
 
     // Two paths for delivery:

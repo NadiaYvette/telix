@@ -153,6 +153,22 @@ impl MpscQueue {
         let idx = (h as usize) & (self.capacity as usize - 1);
         self.slot_state(idx).load(Ordering::Acquire) != SLOT_READY
     }
+
+    /// Number of READY messages in the queue (diagnostic only — racy).
+    fn pending_count(&self) -> u32 {
+        let h = self.head.load(Ordering::Relaxed);
+        let t = self.tail.load(Ordering::Relaxed);
+        let claimed = t.wrapping_sub(h);
+        // Count only READY slots (some may still be being written).
+        let mut ready = 0u32;
+        for i in 0..claimed.min(self.capacity) {
+            let idx = (h.wrapping_add(i) as usize) & (self.capacity as usize - 1);
+            if self.slot_state(idx).load(Ordering::Relaxed) == SLOT_READY {
+                ready += 1;
+            }
+        }
+        ready
+    }
 }
 
 /// Compute MPSC queue capacity for a given allocation size.
@@ -665,8 +681,22 @@ fn wake_recv_waiter(port_id: PortId) {
         // future recv_or_park will pick it up; re-enqueue the thread so the
         // next send can wake it.
         if injected {
+            let park_before = crate::sched::scheduler::thread_ref(tid)
+                .park_state.load(core::sync::atomic::Ordering::Acquire);
             crate::sched::scheduler::wake_parked_thread(tid);
+            let park_after = crate::sched::scheduler::thread_ref(tid)
+                .park_state.load(core::sync::atomic::Ordering::Acquire);
+            if park_after != 0 {
+                crate::println!(
+                    "WAKE-RECV-FAIL: port={} tid={} park_before={} park_after={}",
+                    port_id, tid, park_before, park_after
+                );
+            }
         } else {
+            crate::println!(
+                "WAKE-RECV-NOINJECT: port={} tid={} (msg consumed by concurrent recv)",
+                port_id, tid
+            );
             // Re-enqueue on turnstile so a future send finds this waiter.
             crate::sync::turnstile::port_enqueue_raw(port_id, KEY_PORT_RECV_PARK, tid);
         }
@@ -908,6 +938,13 @@ pub fn recv(port_id: PortId) -> Result<Message, ()> {
         } else {
         }
     }
+}
+
+/// Diagnostic: return (pending_count, capacity) for a port queue, or None.
+pub fn port_queue_info(port_id: PortId) -> Option<(u32, u32)> {
+    let port = port_ref(port_id)?;
+    let q = port.mpsc()?;
+    Some((q.pending_count(), q.capacity))
 }
 
 /// Try to receive from a port, or park the current thread as a waiter.

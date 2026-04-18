@@ -57,6 +57,8 @@ pub struct Thread {
     /// Why this thread is blocked (only valid when state == Blocked).
     #[allow(dead_code)]
     pub blocked_on: BlockReason,
+    /// Debug: destination port for sys_call (set at CallReply park time).
+    pub call_dest_port: u64,
     /// Exit code set by sys_exit (for thread_join).
     pub exit_code: i32,
     /// Per-thread signal mask — bitmask of blocked signals (bit N = signal N+1).
@@ -197,6 +199,7 @@ impl Thread {
             saved_sp: 0,
             stack_base: 0,
             blocked_on: BlockReason::None,
+            call_dest_port: 0,
             exit_code: 0,
             sig_mask: 0,
             sig_pending: 0,

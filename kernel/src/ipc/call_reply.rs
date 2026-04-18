@@ -181,7 +181,7 @@ impl ReplyCap {
 }
 
 /// Global slab of reply caps.
-static REPLY_CAPS: [ReplyCap; MAX_REPLY_CAPS] = {
+pub(crate) static REPLY_CAPS: [ReplyCap; MAX_REPLY_CAPS] = {
     // Manually construct because ReplyCap::empty() is not Copy.
     const EMPTY: ReplyCap = ReplyCap::empty();
     [const { EMPTY }; MAX_REPLY_CAPS]
