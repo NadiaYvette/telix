@@ -240,8 +240,48 @@ fn drain_deferred_requeue(cpu: u32) {
         let tid = (val & 0xFFFFFFFF) as ThreadId;
         let prio = ((val >> 32) & 0xFF) as u8;
         let target = ((val >> 40) & 0xFF) as u32;
+        trace_sched(tid, 2); // 2=drain_enq
         set_enq_tag(1); // 1=drain_deferred
         percpu_enqueue(target, prio, tid);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-tid event trace (separate from Thread struct to avoid layout changes)
+// ---------------------------------------------------------------------------
+// Stores the last scheduling event for each thread. When rescue fires, we
+// print this to identify which code path left the thread orphaned.
+// Encoding: bits [7:0] = event type, bits [39:8] = cpu, bits [63:40] = seq.
+// Events: 1=deferred_store, 2=drain_enq, 3=pick_deq, 4=on_cpu_set,
+//         5=on_cpu_clear, 6=state_ready, 7=state_running, 8=rescue_enq,
+//         9=wake_enq, 10=wake_no_enq, 11=double_enq, 12=steal_deq,
+//         13=park_sleep, 14=park_ipc, 15=sleep_wake, 16=ipc_wake
+const TRACE_CAP: usize = 256;
+static TRACE_EVENTS: [AtomicU64; TRACE_CAP] = {
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    [ZERO; TRACE_CAP]
+};
+static TRACE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[inline(always)]
+fn trace_sched(tid: u32, event: u8) {
+    if (tid as usize) < TRACE_CAP {
+        let seq = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let cpu = smp::cpu_id() as u64;
+        let packed = ((seq & 0xFF_FFFF) << 40) | ((cpu & 0xFFFF_FFFF) << 8) | (event as u64);
+        TRACE_EVENTS[tid as usize].store(packed, Ordering::Release);
+    }
+}
+
+fn trace_last(tid: u32) -> (u8, u32, u32) {
+    if (tid as usize) < TRACE_CAP {
+        let v = TRACE_EVENTS[tid as usize].load(Ordering::Acquire);
+        let event = (v & 0xFF) as u8;
+        let cpu = ((v >> 8) & 0xFFFF_FFFF) as u32;
+        let seq = ((v >> 40) & 0xFF_FFFF) as u32;
+        (event, cpu, seq)
+    } else {
+        (0, 0, 0)
     }
 }
 
@@ -729,14 +769,17 @@ fn get_enq_tag() -> u8 {
 fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
     // Double-enqueue detection.
     if thread_ref(tid).in_queue.swap(true, Ordering::AcqRel) {
+        let (tevt, tcpu, tseq) = trace_last(tid);
         crate::println!(
-            "DOUBLE-ENQ: tid={} prio={} target_cpu={} on_cpu={} src={} state={:?}",
+            "DOUBLE-ENQ: tid={} prio={} target_cpu={} on_cpu={} src={} state={:?} enq_tag={} trace=(evt={} cpu={} seq={})",
             tid, prio, target_cpu,
             thread_ref(tid).on_cpu.load(Ordering::Relaxed),
             thread_ref(tid).saved_sp_source,
-            thread_ref(tid).state
+            thread_ref(tid).state,
+            get_enq_tag(),
+            tevt, tcpu, tseq
         );
-        // Print a backtrace-style hint using the return address.
+        trace_sched(tid, 11); // 11=double_enq
         return; // Don't enqueue again.
     }
     let mut rq = percpu_rq()[target_cpu as usize].lock();
@@ -1444,12 +1487,14 @@ fn percpu_pick_next(cpu: u32, idle_id: ThreadId) -> ThreadId {
     // Class-aware dispatch: RT → EEVDF → legacy.
     if let Some(tid) = rq.class_pick_next() {
         thread_ref(tid).in_queue.store(false, Ordering::Release);
+        trace_sched(tid, 3); // 3=pick_deq
         return tid;
     }
     drop(rq);
     // Nothing local — try work stealing.
     if let Some(tid) = try_steal(cpu) {
         thread_ref(tid).in_queue.store(false, Ordering::Release);
+        trace_sched(tid, 12); // 12=steal_deq
         return tid;
     }
     idle_id
@@ -1462,6 +1507,7 @@ fn percpu_pick_next_cosched(cpu: u32, idle_id: ThreadId, prev_group: u32) -> (Th
     if prev_group != 0 && rq.cosched_burst < MAX_COSCHED_BURST {
         if let Some(tid) = rq.pop_for_group(prev_group) {
             thread_ref(tid).in_queue.store(false, Ordering::Release);
+            trace_sched(tid, 3); // 3=pick_deq
             rq.cosched_burst += 1;
             COSCHED_HITS.fetch_add(1, Ordering::Relaxed);
             return (tid, true);
@@ -1471,12 +1517,14 @@ fn percpu_pick_next_cosched(cpu: u32, idle_id: ThreadId, prev_group: u32) -> (Th
     // Class-aware dispatch: RT → EEVDF → legacy.
     if let Some(tid) = rq.class_pick_next() {
         thread_ref(tid).in_queue.store(false, Ordering::Release);
+        trace_sched(tid, 3); // 3=pick_deq
         return (tid, false);
     }
     drop(rq);
     // Nothing local — try work stealing.
     if let Some(tid) = try_steal(cpu) {
         thread_ref(tid).in_queue.store(false, Ordering::Release);
+        trace_sched(tid, 12); // 12=steal_deq
         return (tid, false);
     }
     (idle_id, false)
@@ -2293,6 +2341,7 @@ fn try_switch(current_sp: u64) -> u64 {
         // Release on_cpu for prev thread — it is no longer on this CPU.
         if prev_id != idle_id {
             thread_ref(prev_id).on_cpu.store(u32::MAX, Ordering::Release);
+            trace_sched(prev_id, 5); // 5=on_cpu_clear
         }
         // Don't re-enqueue Dead threads (they are exiting).
         if prev_id != idle_id && prev_t.state != ThreadState::Dead {
@@ -2328,7 +2377,20 @@ fn try_switch(current_sp: u64) -> u64 {
                 // Defer re-enqueue: prevent work-stealing from picking up
                 // prev while this CPU is still on its kernel stack.
                 let packed = (prev_id as u64) | ((prev_prio as u64) << 32) | ((cpu as u64) << 40);
-                deferred_requeue()[cpu as usize].store(packed, Ordering::Release);
+                let old_deferred = deferred_requeue()[cpu as usize].swap(packed, Ordering::AcqRel);
+                if old_deferred != 0 {
+                    let lost_tid = (old_deferred & 0xFFFFFFFF) as u32;
+                    let lost_prio = ((old_deferred >> 32) & 0xFF) as u8;
+                    crate::println!(
+                        "DEFERRED-OVERWRITE(try_switch): cpu={} lost tid={} prio={} replaced by tid={} prio={}",
+                        cpu, lost_tid, lost_prio, prev_id, prev_prio
+                    );
+                    // Enqueue the lost thread immediately to prevent orphaning.
+                    let lost_target = ((old_deferred >> 40) & 0xFF) as u32;
+                    set_enq_tag(10); // 10=overwrite_rescue
+                    percpu_enqueue(lost_target, lost_prio, lost_tid);
+                }
+                trace_sched(prev_id, 1); // 1=deferred_store
             }
         }
     }
@@ -2384,11 +2446,13 @@ fn try_switch(current_sp: u64) -> u64 {
             return idle_sp;
         }
         thread_ref(next_id).on_cpu_set_by.store(1, Ordering::Relaxed); // 1=try_switch
+        trace_sched(next_id, 4); // 4=on_cpu_set
     }
 
     // Activate next thread. Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     next_t.state = ThreadState::Running;
+    trace_sched(next_id, 7); // 7=state_running
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     thread_ref(next_id).last_cpu.store(cpu, Ordering::Relaxed);
 
@@ -2522,7 +2586,19 @@ pub fn voluntary_reschedule() {
     // on THIS CPU, by which time the stack switch is complete.
     if cur_id != idle_id {
         let packed = (cur_id as u64) | ((cur_prio as u64) << 32) | ((cpu as u64) << 40);
-        deferred_requeue()[cpu as usize].store(packed, Ordering::Release);
+        let old_deferred = deferred_requeue()[cpu as usize].swap(packed, Ordering::AcqRel);
+        if old_deferred != 0 {
+            let lost_tid = (old_deferred & 0xFFFFFFFF) as u32;
+            let lost_prio = ((old_deferred >> 32) & 0xFF) as u8;
+            crate::println!(
+                "DEFERRED-OVERWRITE(vol_resched): cpu={} lost tid={} prio={} replaced by tid={} prio={}",
+                cpu, lost_tid, lost_prio, cur_id, cur_prio
+            );
+            let lost_target = ((old_deferred >> 40) & 0xFF) as u32;
+            set_enq_tag(10);
+            percpu_enqueue(lost_target, lost_prio, lost_tid);
+        }
+        trace_sched(cur_id, 1); // 1=deferred_store
     }
 
     // Claim on_cpu for next.
@@ -2753,9 +2829,11 @@ pub fn wake_thread(tid: ThreadId) {
                 }
             };
             if removed {
+                trace_sched(tid, 9); // 9=wake_enq
                 set_enq_tag(3); // 3=wake_thread
                 percpu_enqueue(waker_cpu, base, tid);
             } else {
+                trace_sched(tid, 10); // 10=wake_no_enq
                 // Thread is either Running (in WFI/HLT) or in limbo during
                 // try_switch. The wakeup flag and restored prio are set;
                 // try_switch will handle the boost. Send IPI to wake from HLT.
@@ -2787,6 +2865,14 @@ pub fn wake_thread(tid: ThreadId) {
             }
         }
     }
+    // NOTE: we intentionally do NOT touch park_state here. Parked threads
+    // (park_current_for_ipc) have a Dekker-style protocol with their wakers
+    // (wake_parked_thread). CAS'ing park_state from wake_thread would race
+    // with frame injection by legitimate wakers (inject_recv_into_frame,
+    // inject_fault_into_frame), corrupting the thread's saved frame.
+    // For genuinely stuck parked threads (e.g. CallReply where the server
+    // died), rescue_orphaned_threads' RESCUE-PARK handles recovery.
+    //
     // Signal all CPUs so any core spinning in block_current's WFE wakes immediately.
     crate::arch::irq::send_event();
 }
@@ -4594,6 +4680,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     if (tid as ThreadId) != idle_id {
         thread_ref(tid as ThreadId).on_cpu.store(u32::MAX, Ordering::Release);
     }
+    trace_sched(tid as u32, 14); // 14=park_ipc (state=Blocked, on_cpu=MAX)
 
     // Mark per-thread stack_switch_pending BEFORE park_state CAS. Once
     // COMMITTED, wake_parked_thread may fire on another CPU. It spins on
@@ -4780,6 +4867,7 @@ pub fn wake_parked_thread(tid: ThreadId) {
         let prio = tref.prio.load(Ordering::Acquire);
         let target = tref.last_cpu.load(Ordering::Relaxed);
         unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
+        trace_sched(tid, 16); // 16=ipc_wake (COMMITTED→NONE, about to enqueue)
         set_enq_tag(6); // 6=wake_parked
         percpu_enqueue(target, prio, tid);
         // If the target CPU is remote, it may be idle in HLT with the timer
@@ -4794,8 +4882,7 @@ pub fn wake_parked_thread(tid: ThreadId) {
 }
 
 /// Scan for threads stuck in Ready state that are not in any run queue
-/// or deferred-requeue slot.  This can happen due to narrow SMP races in
-/// the deferred-requeue path.  Re-enqueue them so the system self-heals.
+/// or deferred-requeue slot.  Re-enqueue them so the system self-heals.
 /// Called from the watchdog when an IPC stall is detected.
 #[cold]
 #[inline(never)]
@@ -4828,13 +4915,71 @@ fn rescue_orphaned_threads() {
             if !in_deferred {
                 let target = t.last_cpu.load(Ordering::Relaxed);
                 let prio = t.prio.load(Ordering::Relaxed);
+                let (tevt, tcpu, tseq) = trace_last(tid as u32);
+                let park = t.park_state.load(Ordering::Relaxed);
+                let wake = t.wakeup.load(Ordering::Relaxed);
+                let src = t.saved_sp_source;
+                let blk = t.blocked_on;
+                let heap_pos = t.eevdf_heap_pos;
                 crate::println!(
-                    "RESCUE: tid={} prio={} cpu={} task={}",
-                    tid, prio, target, t.task_id
+                    "RESCUE: tid={} prio={} cpu={} task={} trace=(evt={} cpu={} seq={}) park={} wake={} src={} blk={:?} hp={}",
+                    tid, prio, target, t.task_id, tevt, tcpu, tseq,
+                    park, wake, src, blk, heap_pos
                 );
+                trace_sched(tid as u32, 8); // 8=rescue_enq
                 set_enq_tag(7); // 7=rescue
                 percpu_enqueue(target, prio, tid as ThreadId);
             }
+        }
+    }
+
+    // Second pass: rescue CallReply-blocked threads stuck in COMMITTED
+    // with wakeup=true. These were parked via park_current_for_ipc and
+    // then a signal was delivered via wake_thread, but wake_thread cannot
+    // handle COMMITTED threads (would need to spin on stack_switch_pending,
+    // unsafe in IRQ context). By the time rescue runs (after multiple stall
+    // detection cycles), the parking CPU has long finished its stack switch.
+    //
+    // ONLY CallReply threads are rescued here. Other block reasons
+    // (PagerWait, PortRecv, etc.) have their own wake mechanisms and must
+    // not be prematurely woken — doing so can corrupt in-flight pager or
+    // IPC operations.
+    for tid in 1..max_tid {
+        let t = unsafe { &*(THREAD_TABLE.get(tid) as *const Thread) };
+        if t.task_id == 0 || t.state != ThreadState::Blocked {
+            continue;
+        }
+        // Only rescue CallReply-blocked threads.
+        if !matches!(t.blocked_on, BlockReason::CallReply(_)) {
+            continue;
+        }
+        let park = t.park_state.load(Ordering::Acquire);
+        let wake = t.wakeup.load(Ordering::Acquire);
+        if park == PARK_COMMITTED && wake {
+            let (tevt, tcpu, tseq) = trace_last(tid as u32);
+            crate::println!(
+                "RESCUE-PARK: tid={} task={} blk={:?} trace=(evt={} cpu={} seq={})",
+                tid, t.task_id, t.blocked_on, tevt, tcpu, tseq
+            );
+            // Inject a SERVER_DIED error into the saved frame before waking,
+            // so userspace sees a clean error rather than stale register values.
+            let sp = thread_saved_sp(tid as ThreadId);
+            if sp != 0 {
+                let died_tag = crate::ipc::call_reply::CALL_REPLY_SERVER_DIED;
+                unsafe {
+                    use crate::arch::trapframe::ExceptionFrame;
+                    let frame = &mut *(sp as *mut ExceptionFrame);
+                    crate::syscall::handlers::set_return(frame, 0);
+                    crate::syscall::handlers::set_reg(frame, 1, died_tag);
+                    crate::syscall::handlers::set_reg(frame, 2, 0);
+                    crate::syscall::handlers::set_reg(frame, 3, 0);
+                    crate::syscall::handlers::set_reg(frame, 4, 0);
+                    crate::syscall::handlers::set_reg(frame, 5, 0);
+                    crate::syscall::handlers::set_reg(frame, 6, 0);
+                    crate::syscall::handlers::set_reg(frame, 7, 0);
+                }
+            }
+            wake_parked_thread(tid as ThreadId);
         }
     }
 }
@@ -4967,6 +5112,7 @@ fn check_sleep_timers() {
         t.state = ThreadState::Ready;
         t.blocked_on = BlockReason::None;
         t.sleep_deadline_ns = 0;
+        trace_sched(tid, 15); // 15=sleep_wake (state=Ready, about to enqueue)
         set_enq_tag(7); // 7=sleep_timer
         percpu_enqueue(target, prio, tid);
     }
@@ -5095,6 +5241,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     if (tid as ThreadId) != idle_id {
         thread_ref(tid as ThreadId).on_cpu.store(u32::MAX, Ordering::Release);
     }
+    trace_sched(tid as u32, 13); // 13=park_sleep (state=Blocked, on_cpu=MAX)
 
     // Mark per-thread stack_switch_pending BEFORE sleep_queue_insert.
     // Once visible, check_sleep_timers may expire and enqueue us
@@ -5258,7 +5405,19 @@ pub fn handoff_to(receiver_tid: ThreadId) {
             thread_ref(sender_tid as ThreadId).on_cpu.store(u32::MAX, Ordering::Release);
             let packed = (sender_tid as u64) | ((sender_prio as u64) << 32)
                 | ((cpu_id as u64) << 40);
-            deferred_requeue()[cpu].store(packed, Ordering::Release);
+            let old_deferred = deferred_requeue()[cpu].swap(packed, Ordering::AcqRel);
+            if old_deferred != 0 {
+                let lost_tid = (old_deferred & 0xFFFFFFFF) as u32;
+                let lost_prio = ((old_deferred >> 32) & 0xFF) as u8;
+                crate::println!(
+                    "DEFERRED-OVERWRITE(handoff): cpu={} lost tid={} prio={} replaced by tid={}",
+                    cpu, lost_tid, lost_prio, sender_tid
+                );
+                let lost_target = ((old_deferred >> 40) & 0xFF) as u32;
+                set_enq_tag(10);
+                percpu_enqueue(lost_target, lost_prio, lost_tid);
+            }
+            trace_sched(sender_tid as u32, 1); // 1=deferred_store
         }
     }
 
