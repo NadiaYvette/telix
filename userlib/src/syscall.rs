@@ -1090,8 +1090,10 @@ pub fn recv_msg_timeout(port: u64, timeout_us: u64) -> Option<Message> {
             return Some(m);
         }
     }
-    // Sleep phase: 100μs steps.
-    let step_us: u64 = 100;
+    // Sleep phase: 10ms steps (kernel timer tick is 10ms, so smaller
+    // sleeps round up to ~10ms anyway — using 100μs steps made a 5s
+    // timeout take ~500s effective).
+    let step_us: u64 = 10_000;
     while elapsed_us < timeout_us {
         nanosleep(step_us * 1000);
         elapsed_us += step_us;

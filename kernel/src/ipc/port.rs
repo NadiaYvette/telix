@@ -681,23 +681,10 @@ fn wake_recv_waiter(port_id: PortId) {
         // future recv_or_park will pick it up; re-enqueue the thread so the
         // next send can wake it.
         if injected {
-            let park_before = crate::sched::scheduler::thread_ref(tid)
-                .park_state.load(core::sync::atomic::Ordering::Acquire);
             crate::sched::scheduler::wake_parked_thread(tid);
-            let park_after = crate::sched::scheduler::thread_ref(tid)
-                .park_state.load(core::sync::atomic::Ordering::Acquire);
-            if park_after != 0 {
-                crate::println!(
-                    "WAKE-RECV-FAIL: port={} tid={} park_before={} park_after={}",
-                    port_id, tid, park_before, park_after
-                );
-            }
         } else {
-            crate::println!(
-                "WAKE-RECV-NOINJECT: port={} tid={} (msg consumed by concurrent recv)",
-                port_id, tid
-            );
-            // Re-enqueue on turnstile so a future send finds this waiter.
+            // Message consumed by concurrent recv — re-enqueue on turnstile
+            // so a future send finds this waiter.
             crate::sync::turnstile::port_enqueue_raw(port_id, KEY_PORT_RECV_PARK, tid);
         }
         return;

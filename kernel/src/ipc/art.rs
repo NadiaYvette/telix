@@ -827,7 +827,11 @@ unsafe fn split_node(
         // COW: clone old node with the remaining partial (after the mismatch byte).
         let remaining = old_plen - match_len - 1;
         let mut shortened = [0u8; MAX_PARTIAL];
-        for i in 0..remaining.min(MAX_PARTIAL) {
+        // Only copy bytes that exist in old_h.partial[]; the array has
+        // MAX_PARTIAL slots, so indices match_len+1.. may be out of range
+        // when match_len is near the end.
+        let avail = MAX_PARTIAL.saturating_sub(match_len + 1);
+        for i in 0..remaining.min(MAX_PARTIAL).min(avail) {
             shortened[i] = old_h.partial[match_len + 1 + i];
         }
 

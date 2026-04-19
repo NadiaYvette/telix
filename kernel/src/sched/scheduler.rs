@@ -2401,16 +2401,12 @@ fn try_switch(current_sp: u64) -> u64 {
         prev_t.saved_sp_source = 1; // try_switch
         let mut prev_prio = prev_t.effective_priority;
         prev_task = prev_t.task_id;
-        // If the thread was demoted by block_current (prio 254) and has been
-        // woken (wakeup flag set), restore its base priority so it gets
+        // If the thread was demoted by block_current and has been woken
+        // (wakeup flag set), restore its base priority so it gets
         // re-enqueued at the correct level instead of being starved.
-        // Check both effective_priority==254 (normal case) and the case where
-        // wake_thread already restored prio but effective_priority is still 254.
-        if prev_prio == 254 && prev_t.base_priority < 254 {
-            // Check both wakeup flag AND whether prio was already restored
-            // by wake_thread (prio != 254 means wake_thread boosted it).
+        if prev_prio > prev_t.base_priority {
             let current_prio = thread_ref(prev_id).prio.load(Ordering::Acquire);
-            if thread_ref(prev_id).wakeup.load(Ordering::Acquire) || current_prio != 254 {
+            if thread_ref(prev_id).wakeup.load(Ordering::Acquire) || current_prio < prev_prio {
                 prev_t.effective_priority = prev_t.base_priority;
                 thread_ref(prev_id)
                     .prio
@@ -2817,10 +2813,12 @@ pub fn block_current(_reason: BlockReason) {
     // re-enqueues us at the bottom. This prevents blocked-spinning threads
     // from starving lower-priority threads on single-CPU.
     let tref = thread_ref(tid);
-    // Save and demote priority atomically — no SCHEDULER lock needed.
-    // effective_priority is synced from prio in try_switch.
-    let saved_prio = tref.prio.swap(254, Ordering::AcqRel);
-    unsafe { thread_mut_from_ref(tid) }.effective_priority = 254;
+    // Save and demote by one level — enough for try_switch to prefer
+    // productive threads but not so extreme that the blocked thread
+    // starves (prio=254 caused indefinite starvation under load).
+    let demoted = (tref.base_priority as u16 + 1).min(253) as u8;
+    let saved_prio = tref.prio.swap(demoted, Ordering::AcqRel);
+    unsafe { thread_mut_from_ref(tid) }.effective_priority = demoted;
     // Signal the scheduler to preempt us on the next timer tick instead of
     // waiting for the full quantum. This prevents spinning threads from
     // starving real work on SMP systems.
@@ -2911,64 +2909,37 @@ pub fn wake_thread(tid: ThreadId) {
     // Clear yield_asap so the thread isn't preempted on the very next tick
     // before it can check the wakeup flag and exit block_current.
     tref.yield_asap.store(false, Ordering::Release);
-    // If the thread was demoted to prio 254 by block_current, it may be
-    // stuck in a ready queue where higher-priority threads prevent it from
-    // running. Move it from its old CPU's prio-254 slot to the waker's CPU
-    // at its base priority so it gets picked up promptly.
+    // If the thread was demoted by block_current, restore its priority
+    // and send an IPI so it exits the WFI loop promptly.
     let demoted_prio = tref.prio.load(Ordering::Acquire);
-    if demoted_prio == 254 {
-        // Read base_priority directly from the thread struct (immutable after creation,
-        // safe without SCHEDULER lock). Avoids deadlock when wake_thread is called
-        // from exit_current_thread which already holds SCHEDULER.
-        let base = tref.base_priority;
-        if base < 254 {
-            // Restore prio to base BEFORE attempting remove. This ensures
-            // that even if try_switch on a remote CPU races with us and
-            // re-enqueues the thread, the priority restoration code in
-            // try_switch (which checks wakeup + prio==254) will fire because
-            // wakeup is already true. Also, if try_switch reads our updated
-            // prio before re-enqueueing, it uses percpu_enqueue with the
-            // correct priority directly.
-            tref.prio.store(base, Ordering::Release);
+    let base = tref.base_priority;
+    if demoted_prio > base {
+        // Restore prio to base BEFORE attempting remove.
+        tref.prio.store(base, Ordering::Release);
 
-            let old_cpu = tref.last_cpu.load(Ordering::Relaxed);
-            let waker_cpu = smp::cpu_id();
-            // Remove from old CPU's queue and re-enqueue at base prio.
-            // If old_cpu == waker_cpu, the caller may already hold this
-            // CPU's RQ lock (e.g. try_switch → wake_thread for join_waiter),
-            // so use try_lock to avoid deadlock.  For remote CPUs, use the
-            // blocking lock() — spinlocks are held briefly and there's no
-            // cross-CPU lock ordering issue.  This ensures the thread is
-            // promptly re-enqueued instead of languishing at prio-254 where
-            // the EEVDF heap would starve it.
-            let removed = {
-                if old_cpu as usize == waker_cpu as usize {
-                    // Same CPU — try_lock to avoid recursive deadlock.
-                    if let Some(mut rq) = percpu_rq()[old_cpu as usize].try_lock() {
-                        rq.remove_tid(tid)
-                    } else {
-                        // Lock held by our try_switch — the wakeup flag is set,
-                        // and try_switch will restore priority at re-enqueue.
-                        false
-                    }
-                } else {
-                    // Remote CPU — safe to block; no deadlock possible.
-                    let mut rq = percpu_rq()[old_cpu as usize].lock();
+        let old_cpu = tref.last_cpu.load(Ordering::Relaxed);
+        let waker_cpu = smp::cpu_id();
+        // Remove from old CPU's queue and re-enqueue at base prio.
+        let removed = {
+            if old_cpu as usize == waker_cpu as usize {
+                if let Some(mut rq) = percpu_rq()[old_cpu as usize].try_lock() {
                     rq.remove_tid(tid)
+                } else {
+                    false
                 }
-            };
-            if removed {
-                trace_sched(tid, 9); // 9=wake_enq
-                set_enq_tag(3); // 3=wake_thread
-                percpu_enqueue(waker_cpu, base, tid);
             } else {
-                trace_sched(tid, 10); // 10=wake_no_enq
-                // Thread is either Running (in WFI/HLT) or in limbo during
-                // try_switch. The wakeup flag and restored prio are set;
-                // try_switch will handle the boost. Send IPI to wake from HLT.
-                if old_cpu != waker_cpu {
-                    crate::arch::irq::send_reschedule_ipi(old_cpu);
-                }
+                let mut rq = percpu_rq()[old_cpu as usize].lock();
+                rq.remove_tid(tid)
+            }
+        };
+        if removed {
+            trace_sched(tid, 9); // 9=wake_enq
+            set_enq_tag(3); // 3=wake_thread
+            percpu_enqueue(waker_cpu, base, tid);
+        } else {
+            trace_sched(tid, 10); // 10=wake_no_enq
+            if old_cpu != waker_cpu {
+                crate::arch::irq::send_reschedule_ipi(old_cpu);
             }
         }
     }
