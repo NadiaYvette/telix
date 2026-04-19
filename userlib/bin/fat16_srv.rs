@@ -377,9 +377,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(port as u64);
     syscall::debug_puts(b"\n");
 
-    // Look up cache_blk (cache server proxy) with bounded retry.
+    // Look up cache_blk with bounded retry.  Use nanosleep instead of
+    // yield_now so the thread truly sleeps, giving CPU time for cache_srv
+    // to start (yield_now completes too fast under CPU contention).
     let blk_port = {
-        let mut retries = 2000;
+        let mut retries = 200u32;
         loop {
             if let Some(p) = syscall::ns_lookup(b"cache_blk") {
                 break p;
@@ -389,9 +391,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  [fat16_srv] cache_blk not found, exiting\n");
                 syscall::exit(1);
             }
-            for _ in 0..50 {
-                syscall::yield_now();
-            }
+            syscall::nanosleep(10_000_000); // 10ms per retry, ~2s total
         }
     };
 
@@ -412,15 +412,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             reply.data[2]
         } else {
             syscall::debug_puts(b"  [fat16_srv] blk connect FAILED\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            syscall::exit(1);
         }
     } else {
         syscall::debug_puts(b"  [fat16_srv] blk no reply\n");
-        loop {
-            core::hint::spin_loop();
-        }
+        syscall::exit(1);
     };
 
     // Allocate scratch page for block reads.
@@ -428,9 +424,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [fat16_srv] scratch alloc FAILED\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            syscall::exit(1);
         }
     };
 
@@ -446,17 +440,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let mut boot_sector = [0u8; 512];
     if !blk.read_sector(0, &mut boot_sector) {
         syscall::debug_puts(b"  [fat16_srv] failed to read boot sector\n");
-        loop {
-            core::hint::spin_loop();
-        }
+        loop { syscall::nanosleep(1_000_000_000_000); }
     }
 
     // Verify boot signature.
     if boot_sector[510] != 0x55 || boot_sector[511] != 0xAA {
         syscall::debug_puts(b"  [fat16_srv] bad boot signature\n");
-        loop {
-            core::hint::spin_loop();
-        }
+        loop { syscall::nanosleep(1_000_000_000_000); }
     }
 
     // Parse BPB.
@@ -509,9 +499,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [fat16_srv] fat alloc FAILED\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     };
     // Read FAT sectors (up to 8 sectors = 4096 bytes = 1 page).
@@ -520,9 +508,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let mut sec = [0u8; 512];
         if !blk.read_sector(layout.fat_start + i, &mut sec) {
             syscall::debug_puts(b"  [fat16_srv] failed to read FAT sector\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
         unsafe {
             core::ptr::copy_nonoverlapping(

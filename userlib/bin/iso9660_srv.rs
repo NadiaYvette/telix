@@ -776,9 +776,11 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(port);
     syscall::debug_puts(b"\n");
 
-    // Look up cache_blk (or blk).
+    // Look up cache_blk with bounded retry.  Use nanosleep instead of
+    // yield_now so the thread truly sleeps, giving CPU time for cache_srv
+    // to start (yield_now completes too fast under CPU contention).
     let blk_port = {
-        let mut retries = 2000;
+        let mut retries = 200u32;
         let mut found = None;
         loop {
             if let Some(p) = syscall::ns_lookup(b"cache_blk") {
@@ -794,9 +796,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  [iso9660_srv] blk not found, exiting\n");
                 syscall::exit(1);
             }
-            for _ in 0..50 {
-                syscall::yield_now();
-            }
+            syscall::nanosleep(10_000_000); // 10ms per retry, ~2s total
         }
         found.unwrap_or(0)
     };
@@ -846,7 +846,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [iso9660_srv] sector_buf alloc FAILED\n");
-            syscall::exit(1);
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     };
 
@@ -855,7 +855,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [iso9660_srv] read_buf alloc FAILED\n");
-            syscall::exit(1);
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     };
 
@@ -864,7 +864,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(p) => p,
         None => {
             syscall::debug_puts(b"  [iso9660_srv] no valid PVD found\n");
-            syscall::exit(1);
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     };
 

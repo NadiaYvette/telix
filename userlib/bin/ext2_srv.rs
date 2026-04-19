@@ -1295,9 +1295,11 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
 
-    // Look up cache_blk with bounded retry.
+    // Look up cache_blk with bounded retry.  Use nanosleep instead of
+    // yield_now so the thread truly sleeps, giving CPU time for cache_srv
+    // to start (yield_now completes too fast under CPU contention).
     let blk_port = {
-        let mut retries = 2000;
+        let mut retries = 200u32;
         loop {
             if let Some(p) = syscall::ns_lookup(b"cache_blk") {
                 break p;
@@ -1307,9 +1309,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  [ext2_srv] cache_blk not found, exiting\n");
                 syscall::exit(1);
             }
-            for _ in 0..50 {
-                syscall::yield_now();
-            }
+            syscall::nanosleep(10_000_000); // 10ms per retry, ~2s total
         }
     };
 
@@ -1326,15 +1326,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             reply.data[2]
         } else {
             syscall::debug_puts(b"  [ext2_srv] blk connect FAILED\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            syscall::exit(1);
+            unreachable!()
         }
     } else {
         syscall::debug_puts(b"  [ext2_srv] blk no reply\n");
-        loop {
-            core::hint::spin_loop();
-        }
+        syscall::exit(1);
+        unreachable!()
     };
 
     // Allocate scratch page for block reads.
@@ -1342,9 +1340,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [ext2_srv] scratch alloc FAILED\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            syscall::exit(1);
+            unreachable!()
         }
     };
 
@@ -1358,11 +1355,25 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     };
 
     // --- Read superblock (at byte offset 1024 within the partition) ---
+    // Retry up to 5 times with 50ms backoff — during boot, cache_srv may
+    // be saturated by concurrent FS server initialization requests.
     let mut sb_buf = [0u8; 512];
-    if !blk.read_bytes(1024, &mut sb_buf) {
-        syscall::debug_puts(b"  [ext2_srv] failed to read superblock\n");
-        loop {
-            core::hint::spin_loop();
+    {
+        let mut ok = false;
+        for attempt in 0..5u32 {
+            if blk.read_bytes(1024, &mut sb_buf) {
+                ok = true;
+                break;
+            }
+            if attempt < 4 {
+                syscall::nanosleep(50_000_000); // 50ms backoff
+            }
+        }
+        if !ok {
+            syscall::debug_puts(b"  [ext2_srv] failed to read superblock\n");
+            // Cannot exit — cache_blk may hold in-flight grants referencing
+            // our aspace. Sleep forever instead to keep aspace alive.
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     }
 
@@ -1371,9 +1382,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"  [ext2_srv] bad magic: ");
         print_hex(magic as u64);
         syscall::debug_puts(b"\n");
-        loop {
-            core::hint::spin_loop();
-        }
+        loop { syscall::nanosleep(1_000_000_000_000); }
     }
 
     let log_block_size = read_u32(&sb_buf, 24);
@@ -1410,9 +1419,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let bgd_byte_off = (bgd_block as u64) * (block_size as u64);
     if !blk.read_bytes(bgd_byte_off, &mut bgd_buf) {
         syscall::debug_puts(b"  [ext2_srv] failed to read BGD\n");
-        loop {
-            core::hint::spin_loop();
-        }
+        loop { syscall::nanosleep(1_000_000_000_000); }
     }
 
     // We only support a single block group for the 16 MiB partition.
@@ -1431,9 +1438,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [ext2_srv] block_buf alloc FAILED\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     };
 
@@ -1442,25 +1447,32 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [ext2_srv] indirect_buf alloc FAILED\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     };
 
-    // Read root inode to verify.
-    if let Some((mode, uid, gid, size, _blocks)) = read_inode(&blk, &sb, &bgd, EXT2_ROOT_INO) {
-        syscall::debug_puts(b"  [ext2_srv] root inode: mode=");
-        print_hex(mode as u64);
-        syscall::debug_puts(b" uid=");
-        print_num(uid as u64);
-        syscall::debug_puts(b" size=");
-        print_num(size as u64);
-        syscall::debug_puts(b"\n");
-    } else {
-        syscall::debug_puts(b"  [ext2_srv] failed to read root inode\n");
-        loop {
-            core::hint::spin_loop();
+    // Read root inode to verify (retry on transient I/O failure during boot).
+    {
+        let mut root_ok = false;
+        for attempt in 0..5u32 {
+            if let Some((mode, uid, _gid, size, _blocks)) = read_inode(&blk, &sb, &bgd, EXT2_ROOT_INO) {
+                syscall::debug_puts(b"  [ext2_srv] root inode: mode=");
+                print_hex(mode as u64);
+                syscall::debug_puts(b" uid=");
+                print_num(uid as u64);
+                syscall::debug_puts(b" size=");
+                print_num(size as u64);
+                syscall::debug_puts(b"\n");
+                root_ok = true;
+                break;
+            }
+            if attempt < 4 {
+                syscall::nanosleep(50_000_000); // 50ms backoff
+            }
+        }
+        if !root_ok {
+            syscall::debug_puts(b"  [ext2_srv] failed to read root inode\n");
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     }
 

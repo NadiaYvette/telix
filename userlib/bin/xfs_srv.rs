@@ -644,9 +644,7 @@ fn cache_init() {
         },
         None => {
             syscall::debug_puts(b"  [xfs_srv] cache alloc FAILED\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     }
 }
@@ -2539,9 +2537,11 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::ns_register(b"xfs", port);
     syscall::ns_register(b"xfs_task", my_aspace);
 
-    // Look up cache_blk with bounded retry.
+    // Look up cache_blk with bounded retry.  Use nanosleep instead of
+    // yield_now so the thread truly sleeps, giving CPU time for cache_srv
+    // to start (yield_now completes too fast under CPU contention).
     let blk_port = {
-        let mut retries = 2000;
+        let mut retries = 200u32;
         loop {
             if let Some(p) = syscall::ns_lookup(b"cache_blk") {
                 break p;
@@ -2551,9 +2551,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  [xfs_srv] cache_blk not found, exiting\n");
                 syscall::exit(1);
             }
-            for _ in 0..50 {
-                syscall::yield_now();
-            }
+            syscall::nanosleep(10_000_000); // 10ms per retry, ~2s total
         }
     };
 
@@ -2570,15 +2568,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             reply.data[2]
         } else {
             syscall::debug_puts(b"  [xfs_srv] blk connect FAILED\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            syscall::exit(1);
+            unreachable!()
         }
     } else {
         syscall::debug_puts(b"  [xfs_srv] blk no reply\n");
-        loop {
-            core::hint::spin_loop();
-        }
+        syscall::exit(1);
+        unreachable!()
     };
 
     // Allocate scratch page for block reads.
@@ -2586,9 +2582,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [xfs_srv] scratch alloc FAILED\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            syscall::exit(1);
+            unreachable!()
         }
     };
 
@@ -2611,9 +2606,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         },
         None => {
             syscall::debug_puts(b"  [xfs_srv] write scratch alloc FAILED\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     }
 
@@ -2642,7 +2635,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     }
     if !read_ok {
         syscall::debug_puts(b"  [xfs_srv] failed to read superblock (no XFS found)\n");
-        syscall::exit(1);
+        loop { syscall::nanosleep(1_000_000_000_000); }
     }
 
     // Debug: dump first 8 bytes to see what we got.
@@ -2657,9 +2650,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(s) => s,
         None => {
             syscall::debug_puts(b"  [xfs_srv] invalid superblock\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     };
 
@@ -2682,19 +2673,28 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     // Read AG headers.
     init_ag_headers(&blk, &sb);
 
-    // Verify root inode.
-    if let Some(root) = read_inode(&blk, &sb, sb.root_ino) {
-        syscall::debug_puts(b"  [xfs_srv] root inode: mode=");
-        print_hex(root.mode as u64);
-        syscall::debug_puts(b" format=");
-        print_num(root.format as u64);
-        syscall::debug_puts(b" size=");
-        print_num(root.size);
-        syscall::debug_puts(b"\n");
-    } else {
-        syscall::debug_puts(b"  [xfs_srv] failed to read root inode\n");
-        loop {
-            core::hint::spin_loop();
+    // Verify root inode (retry on transient I/O failure during boot).
+    {
+        let mut root_ok = false;
+        for attempt in 0..5u32 {
+            if let Some(root) = read_inode(&blk, &sb, sb.root_ino) {
+                syscall::debug_puts(b"  [xfs_srv] root inode: mode=");
+                print_hex(root.mode as u64);
+                syscall::debug_puts(b" format=");
+                print_num(root.format as u64);
+                syscall::debug_puts(b" size=");
+                print_num(root.size);
+                syscall::debug_puts(b"\n");
+                root_ok = true;
+                break;
+            }
+            if attempt < 4 {
+                syscall::nanosleep(50_000_000); // 50ms backoff
+            }
+        }
+        if !root_ok {
+            syscall::debug_puts(b"  [xfs_srv] failed to read root inode\n");
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     }
 

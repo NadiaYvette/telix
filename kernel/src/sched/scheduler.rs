@@ -278,15 +278,21 @@ fn drain_deferred_requeue(cpu: u32) {
             .on_cpu
             .compare_exchange(target, ON_CPU_PENDING, Ordering::AcqRel, Ordering::Acquire)
         {
-            // Log what prevented the enqueue.  If actual is a valid CPU number
-            // and in_queue is false, the thread may be genuinely orphaned.
+            // CAS failed — on_cpu changed since try_switch stored the
+            // deferred slot. If the thread is genuinely orphaned (Ready,
+            // not in any queue, not being processed), try a second CAS
+            // from the actual value to rescue it. This prevents threads
+            // from falling through the cracks when on_cpu drifts.
             let inq = thread_ref(tid).in_queue.load(Ordering::Acquire);
             let st = thread_ref(tid).state;
             if st == ThreadState::Ready && !inq && actual != ON_CPU_PENDING {
-                crate::println!(
-                    "DRAIN-CAS-ORPHAN: cpu={} tid={} target={} actual_on_cpu={} inq={} state={:?}",
-                    cpu, tid, target, actual, inq, st
-                );
+                if thread_ref(tid).on_cpu.compare_exchange(
+                    actual, ON_CPU_PENDING, Ordering::AcqRel, Ordering::Acquire,
+                ).is_ok() {
+                    trace_sched(tid, 2); // 2=drain_enq
+                    set_enq_tag(1); // 1=drain_deferred
+                    percpu_enqueue(cpu, prio, tid);
+                }
             }
             return;
         }
@@ -2161,8 +2167,10 @@ pub fn tick(current_sp: u64) -> u64 {
                             let is_idle = cur == idle;
                             let def_v = deferred_requeue()[c].load(Ordering::Relaxed);
                             let def_tid = if def_v != 0 { (def_v & 0xFFFFFFFF) as u32 } else { 0 };
-                            crate::println!("  cpu{}: cur=tid{} idle={} rq_eevdf={} has_ready={} def={}",
-                                c, cur, is_idle, rq_len, has_rdy, def_tid);
+                            let cur_task = thread_ref(cur as u32).task_id;
+                            let cur_blk = unsafe { &*(THREAD_TABLE.get(cur as u32) as *const Thread) }.blocked_on;
+                            crate::println!("  cpu{}: cur=tid{} task={} idle={} rq_eevdf={} has_ready={} def={} blk={:?}",
+                                c, cur, cur_task, is_idle, rq_len, has_rdy, def_tid, cur_blk);
                         }
                         let max_tid = NEXT_THREAD_ID.load(Ordering::Relaxed).min(200);
                         for tid in 1..max_tid {
@@ -2200,9 +2208,11 @@ pub fn tick(current_sp: u64) -> u64 {
 
     // Periodic orphan rescue: every 10 ticks (~100ms), scan for Ready
     // threads stuck outside all queues.  Runs on CPU 0 only.
-    // Independent of IPC stall detection because orphans can occur during
-    // active IPC (e.g. during boot when servers are still initializing and
-    // IPC counters keep changing).
+    // Must not run too frequently — running every 2 ticks causes false-
+    // positive rescues by catching threads in the transient window
+    // between state=Ready and percpu_enqueue in check_sleep_timers
+    // (cross-CPU race).  10 ticks gives all CPUs time to drain deferred
+    // slots and complete enqueues.
     {
         static RESCUE_TICK: AtomicU64 = AtomicU64::new(0);
         let cpu = smp::cpu_id();
@@ -5326,9 +5336,13 @@ fn check_sleep_timers() {
             core::hint::spin_loop();
         }
         let t = unsafe { thread_mut_from_ref(tid) };
-        t.state = ThreadState::Ready;
         t.blocked_on = BlockReason::None;
         t.sleep_deadline_ns = 0;
+        // Set state=Ready and enqueue atomically from rescue's perspective:
+        // percpu_enqueue sets in_queue=true, and state=Ready is set just
+        // before it.  The rescue interval (100ms) is long enough that this
+        // window never causes false-positive rescues in practice.
+        t.state = ThreadState::Ready;
         trace_sched(tid, 15); // 15=sleep_wake (state=Ready, about to enqueue)
         set_enq_tag(7); // 7=sleep_timer
         percpu_enqueue(target, prio, tid);

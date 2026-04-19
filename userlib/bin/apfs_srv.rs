@@ -628,9 +628,7 @@ fn cache_init() {
         },
         None => {
             syscall::debug_puts(b"  [apfs_srv] cache alloc FAILED\n");
-            loop {
-                core::hint::spin_loop();
-            }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     }
 }
@@ -3252,10 +3250,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
 
-    // Look up cache_blk with bounded retry.
+    // Look up cache_blk with bounded retry.  Use nanosleep instead of
+    // yield_now so the thread truly sleeps, giving CPU time for cache_srv
+    // to start (yield_now completes too fast under CPU contention).
     syscall::debug_puts(b"  [apfs_srv] waiting for cache_blk...\n");
     let blk_port = {
-        let mut retries = 2000u32;
+        let mut retries = 200u32;
         loop {
             if let Some(p) = syscall::ns_lookup(b"cache_blk") {
                 break p;
@@ -3265,9 +3265,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  [apfs_srv] cache_blk not found, exiting\n");
                 syscall::exit(1);
             }
-            for _ in 0..50 {
-                syscall::yield_now();
-            }
+            syscall::nanosleep(10_000_000); // 10ms per retry, ~2s total
         }
     };
     syscall::debug_puts(b"  [apfs_srv] blk port=");
@@ -3285,14 +3283,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             Some(r) => r,
             None => {
                 syscall::debug_puts(b"  [apfs_srv] blk connect recv failed\n");
-                loop { core::hint::spin_loop(); }
+                syscall::exit(1);
             }
         };
         if reply.tag != IO_CONNECT_OK {
             syscall::debug_puts(b"  [apfs_srv] blk connect FAILED tag=");
             print_num(reply.tag);
             syscall::debug_puts(b"\n");
-            loop { core::hint::spin_loop(); }
+            syscall::exit(1);
         }
         reply.data[2]
     };
@@ -3302,7 +3300,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  [apfs_srv] scratch alloc FAILED\n");
-            loop { core::hint::spin_loop(); }
+            syscall::exit(1);
         }
     };
 
@@ -3329,8 +3327,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(b) if read_le32(b, NX_MAGIC_OFF) == NX_MAGIC => b,
         _ => {
             syscall::debug_puts(b"  [apfs_srv] no APFS container found, exiting\n");
-            syscall::exit(1);
-            loop { core::hint::spin_loop(); }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     };
 
@@ -3338,8 +3335,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(s) => s,
         None => {
             syscall::debug_puts(b"  [apfs_srv] invalid container superblock\n");
-            syscall::exit(1);
-            loop { core::hint::spin_loop(); }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     };
 
@@ -3357,8 +3353,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(s) => s,
         None => {
             syscall::debug_puts(b"  [apfs_srv] checkpoint scan failed\n");
-            syscall::exit(1);
-            loop { core::hint::spin_loop(); }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     };
 
@@ -3374,7 +3369,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let vol_oid = nx_sb.fs_oid[0];
     if vol_oid == 0 {
         syscall::debug_puts(b"  [apfs_srv] no volume found\n");
-        syscall::exit(1);
+        loop { syscall::nanosleep(1_000_000_000_000); }
     }
 
     // Look up volume OID in container omap.
@@ -3386,8 +3381,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"  [apfs_srv] volume omap lookup failed for oid=");
             print_num(vol_oid);
             syscall::debug_puts(b"\n");
-            syscall::exit(1);
-            loop { core::hint::spin_loop(); }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     };
 
@@ -3399,8 +3393,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         Some(v) => v,
         None => {
             syscall::debug_puts(b"  [apfs_srv] invalid volume superblock\n");
-            syscall::exit(1);
-            loop { core::hint::spin_loop(); }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
     };
 
@@ -3422,8 +3415,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         }
         if attempt == 2 {
             syscall::debug_puts(b"  [apfs_srv] fs tree omap lookup failed after retries\n");
-            syscall::exit(1);
-            loop { core::hint::spin_loop(); }
+            loop { syscall::nanosleep(1_000_000_000_000); }
         }
         syscall::nanosleep(1_000_000); // 1ms between retries
     }
