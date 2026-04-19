@@ -24,9 +24,15 @@ objcopy -O elf32-i386 "$KERNEL" "$KERNEL32"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DISK_IMG="$SCRIPT_DIR/../test.img"
 
+ACCEL="${TELIX_ACCEL:-tcg}"
+case "$ACCEL" in
+    kvm)  CPU_MODEL=host ;;
+    *)    CPU_MODEL=qemu64; ACCEL=tcg ;;
+esac
+
 QEMU_ARGS=(
-    -machine q35
-    -cpu qemu64
+    -machine q35,accel=$ACCEL
+    -cpu $CPU_MODEL
     -m 256M
     -kernel "$KERNEL32"
     -smp 4
