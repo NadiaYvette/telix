@@ -292,6 +292,20 @@ fn drain_deferred_requeue(cpu: u32) {
                     trace_sched(tid, 2); // 2=drain_enq
                     set_enq_tag(1); // 1=drain_deferred
                     percpu_enqueue(cpu, prio, tid);
+                } else {
+                    // Both CAS attempts failed — on_cpu is racing.
+                    // Force-enqueue via unconditional store to prevent
+                    // silent thread loss. percpu_enqueue's in_queue swap
+                    // catches double-enqueue safely.
+                    let on3 = thread_ref(tid).on_cpu.load(Ordering::Acquire);
+                    let inq2 = thread_ref(tid).in_queue.load(Ordering::Acquire);
+                    let st2 = thread_ref(tid).state;
+                    if st2 == ThreadState::Ready && !inq2 && on3 != ON_CPU_PENDING {
+                        thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                        trace_sched(tid, 2); // 2=drain_enq
+                        set_enq_tag(1); // 1=drain_deferred
+                        percpu_enqueue(cpu, prio, tid);
+                    }
                 }
             }
             return;
@@ -1289,7 +1303,7 @@ fn do_spawn_heavy_work(
     const USER_STACK_TOP: usize = crate::arch::trapframe::USER_STACK_TOP;
 
     let ps = page::page_size();
-    let stack_alloc_pages = 2;
+    let stack_alloc_pages = 8;
     let stack_mmu_pages = stack_alloc_pages * page::page_mmucount();
     let stack_va = USER_STACK_TOP - stack_alloc_pages * ps;
 
@@ -2560,11 +2574,15 @@ fn try_switch(current_sp: u64) -> u64 {
                     if let Err(actual) = thread_ref(lost_tid).on_cpu.compare_exchange(
                         lost_target, ON_CPU_PENDING, Ordering::AcqRel, Ordering::Acquire,
                     ) {
+                        // CAS failed — force-recover if the thread is genuinely
+                        // orphaned to prevent silent thread loss.
                         let inq = thread_ref(lost_tid).in_queue.load(Ordering::Acquire);
-                        crate::println!(
-                            "OVERWRITE-CAS-FAIL(try_switch): tid={} target={} actual={} inq={}",
-                            lost_tid, lost_target, actual, inq
-                        );
+                        let st = thread_ref(lost_tid).state;
+                        if st == ThreadState::Ready && !inq && actual != ON_CPU_PENDING {
+                            thread_ref(lost_tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                            set_enq_tag(10); // 10=overwrite_rescue
+                            percpu_enqueue(lost_target, lost_prio, lost_tid);
+                        }
                     } else {
                         set_enq_tag(10); // 10=overwrite_rescue
                         percpu_enqueue(lost_target, lost_prio, lost_tid);
@@ -2786,10 +2804,12 @@ pub fn voluntary_reschedule() {
                 lost_target, ON_CPU_PENDING, Ordering::AcqRel, Ordering::Acquire,
             ) {
                 let inq = thread_ref(lost_tid).in_queue.load(Ordering::Acquire);
-                crate::println!(
-                    "OVERWRITE-CAS-FAIL(vol_resched): tid={} target={} actual={} inq={}",
-                    lost_tid, lost_target, actual, inq
-                );
+                let st = thread_ref(lost_tid).state;
+                if st == ThreadState::Ready && !inq && actual != ON_CPU_PENDING {
+                    thread_ref(lost_tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                    set_enq_tag(10);
+                    percpu_enqueue(lost_target, lost_prio, lost_tid);
+                }
             } else {
                 set_enq_tag(10);
                 percpu_enqueue(lost_target, lost_prio, lost_tid);
@@ -5151,7 +5171,7 @@ pub fn wake_parked_thread(tid: ThreadId) {
 /// CALL_REPLY_TIMEOUT_NS.  Uses the same abandon_for_interrupt CAS as the
 /// signal-interrupt path to safely coordinate with concurrent server replies.
 /// Called periodically from tick() on CPU 0 (~every 1 second).
-const CALL_REPLY_TIMEOUT_NS: u64 = 6_000_000_000; // 6 seconds
+const CALL_REPLY_TIMEOUT_NS: u64 = 10_000_000_000; // 10 seconds
 
 #[cold]
 #[inline(never)]
@@ -5837,10 +5857,12 @@ pub fn handoff_to(receiver_tid: ThreadId) {
                     lost_target, ON_CPU_PENDING, Ordering::AcqRel, Ordering::Acquire,
                 ) {
                     let inq = thread_ref(lost_tid).in_queue.load(Ordering::Acquire);
-                    crate::println!(
-                        "OVERWRITE-CAS-FAIL(handoff): tid={} target={} actual={} inq={}",
-                        lost_tid, lost_target, actual, inq
-                    );
+                    let st = thread_ref(lost_tid).state;
+                    if st == ThreadState::Ready && !inq && actual != ON_CPU_PENDING {
+                        thread_ref(lost_tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                        set_enq_tag(10);
+                        percpu_enqueue(lost_target, lost_prio, lost_tid);
+                    }
                 } else {
                     set_enq_tag(10);
                     percpu_enqueue(lost_target, lost_prio, lost_tid);
