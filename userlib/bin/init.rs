@@ -9962,14 +9962,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // 1. Get compositor info.
             syscall::send(comp_port, 0xA008, 0, 0, reply_port << 32, 0);
             let mut got_info = false;
-            for _ in 0..200 {
-                if let Some(msg) = syscall::recv_nb_msg(reply_port) {
-                    if msg.tag == 0xA009 {
-                        got_info = true;
-                    }
-                    break;
+            if let Some(msg) = syscall::recv_msg_timeout(reply_port, 2_000_000) {
+                if msg.tag == 0xA009 {
+                    got_info = true;
                 }
-                syscall::yield_now();
             }
 
             if got_info {
@@ -9986,15 +9982,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 let mut win_id = u64::MAX;
                 let mut buf_va = 0usize;
-                for _ in 0..200 {
-                    if let Some(msg) = syscall::recv_nb_msg(reply_port) {
-                        if msg.tag == 0xA001 && msg.data[0] != u64::MAX {
-                            win_id = msg.data[0];
-                            buf_va = msg.data[1] as usize;
-                        }
-                        break;
+                if let Some(msg) = syscall::recv_msg_timeout(reply_port, 2_000_000) {
+                    if msg.tag == 0xA001 && msg.data[0] != u64::MAX {
+                        win_id = msg.data[0];
+                        buf_va = msg.data[1] as usize;
                     }
-                    syscall::yield_now();
                 }
 
                 if win_id != u64::MAX && buf_va != 0 {
@@ -10009,24 +10001,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // 4. Commit.
                     syscall::send(comp_port, 0xA004, win_id, 0, reply_port << 32, 0);
                     let mut commit_ok = false;
-                    for _ in 0..200 {
-                        if let Some(msg) = syscall::recv_nb_msg(reply_port) {
-                            if msg.tag == 0xA005 && msg.data[0] == 0 {
-                                commit_ok = true;
-                            }
-                            break;
+                    if let Some(msg) = syscall::recv_msg_timeout(reply_port, 2_000_000) {
+                        if msg.tag == 0xA005 && msg.data[0] == 0 {
+                            commit_ok = true;
                         }
-                        syscall::yield_now();
                     }
 
                     // 5. Destroy window.
                     syscall::send(comp_port, 0xA002, win_id, 0, reply_port << 32, 0);
-                    for _ in 0..200 {
-                        if syscall::recv_nb_msg(reply_port).is_some() {
-                            break;
-                        }
-                        syscall::yield_now();
-                    }
+                    let _ = syscall::recv_msg_timeout(reply_port, 2_000_000);
 
                     if commit_ok {
                         syscall::debug_puts(b"Phase 109 compositor: PASSED\n");
@@ -10075,12 +10058,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let rp = syscall::port_create();
             syscall::send(cp, 0xA008, 0, 0, rp << 32, 0); // COMP_GET_INFO
             let mut ok = false;
-            for _ in 0..200 {
-                if let Some(msg) = syscall::recv_nb_msg(rp) {
-                    if msg.tag == 0xA009 { ok = true; } // COMP_GET_INFO_OK
-                    break;
-                }
-                syscall::yield_now();
+            if let Some(msg) = syscall::recv_msg_timeout(rp, 2_000_000) {
+                if msg.tag == 0xA009 { ok = true; } // COMP_GET_INFO_OK
             }
             syscall::port_destroy(rp);
             if ok {
@@ -10101,12 +10080,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let rp = syscall::port_create();
             syscall::send(cp, 0xA008, 0, 0, rp << 32, 0); // COMP_GET_INFO
             let mut ok = false;
-            for _ in 0..200 {
-                if let Some(msg) = syscall::recv_nb_msg(rp) {
-                    if msg.tag == 0xA009 { ok = true; }
-                    break;
-                }
-                syscall::yield_now();
+            if let Some(msg) = syscall::recv_msg_timeout(rp, 2_000_000) {
+                if msg.tag == 0xA009 { ok = true; }
             }
             syscall::port_destroy(rp);
             if ok {

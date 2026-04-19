@@ -5151,7 +5151,7 @@ pub fn wake_parked_thread(tid: ThreadId) {
 /// CALL_REPLY_TIMEOUT_NS.  Uses the same abandon_for_interrupt CAS as the
 /// signal-interrupt path to safely coordinate with concurrent server replies.
 /// Called periodically from tick() on CPU 0 (~every 1 second).
-const CALL_REPLY_TIMEOUT_NS: u64 = 3_000_000_000; // 3 seconds
+const CALL_REPLY_TIMEOUT_NS: u64 = 6_000_000_000; // 6 seconds
 
 #[cold]
 #[inline(never)]
@@ -5217,6 +5217,15 @@ fn call_reply_timeout_sweep() {
 /// in COMMITTED with wakeup=true and inject SERVER_DIED. Only set this
 /// during confirmed IPC stalls (watchdog), not on periodic sweeps, to
 /// avoid prematurely killing legitimate slow IPC calls.
+/// Per-thread orphan age counter: tracks how many consecutive rescue sweeps
+/// a thread has appeared orphaned.  Only rescue when age >= 2 to filter out
+/// false positives from the narrow dequeue window (in_queue=false before
+/// on_cpu=ON_CPU_PENDING in percpu_pick_next).
+static ORPHAN_AGE: [AtomicU32; 256] = {
+    const Z: AtomicU32 = AtomicU32::new(0);
+    [Z; 256]
+};
+
 #[cold]
 #[inline(never)]
 fn rescue_orphaned_threads_impl(rescue_parked: bool) {
@@ -5234,6 +5243,8 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
     for tid in 1..max_tid {
         let t = unsafe { &*(THREAD_TABLE.get(tid) as *const Thread) };
         if t.task_id == 0 || t.state != ThreadState::Ready {
+            // Not a candidate — reset orphan age.
+            if (tid as usize) < ORPHAN_AGE.len() { ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed); }
             continue;
         }
         let on = t.on_cpu.load(Ordering::Acquire);
@@ -5253,7 +5264,22 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
         } else {
             false // garbage value — don't touch
         };
-        if is_orphan && !inq {
+        if !(is_orphan && !inq) {
+            if (tid as usize) < ORPHAN_AGE.len() { ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed); }
+            continue;
+        }
+        {
+            // Track orphan age: only rescue after 2+ consecutive sweeps to
+            // filter false positives from the narrow dequeue window where
+            // in_queue=false but on_cpu hasn't been set to ON_CPU_PENDING yet.
+            let age = if (tid as usize) < ORPHAN_AGE.len() {
+                ORPHAN_AGE[tid as usize].fetch_add(1, Ordering::Relaxed)
+            } else {
+                1 // always rescue for high tids (shouldn't happen in practice)
+            };
+            if age < 1 {
+                continue; // first sighting — wait one more sweep to confirm
+            }
             // Just-in-time deferred slot check: read ALL deferred slots NOW,
             // not from a stale snapshot.  The old snapshot approach went stale
             // within one tick (10ms), causing rescue to falsely re-enqueue
@@ -5282,15 +5308,18 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 // If drain just handled it, on_cpu will be ON_CPU_PENDING now.
                 let on2 = t.on_cpu.load(Ordering::Acquire);
                 if on2 == ON_CPU_PENDING {
+                    if (tid as usize) < ORPHAN_AGE.len() { ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed); }
                     continue; // drain just handled it
                 }
                 // Re-read state: the dispatching CPU may have set Running
                 // between our initial state read and the on_cpu/deferred checks.
                 if t.state != ThreadState::Ready {
+                    if (tid as usize) < ORPHAN_AGE.len() { ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed); }
                     continue; // dispatch completed — thread is Running now
                 }
                 // Also skip if in_queue changed (drain enqueued between our checks).
                 if t.in_queue.load(Ordering::Acquire) {
+                    if (tid as usize) < ORPHAN_AGE.len() { ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed); }
                     continue;
                 }
                 let target = t.last_cpu.load(Ordering::Relaxed);
@@ -5306,6 +5335,7 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     tid, prio, target, t.task_id, on2, tevt, tcpu, tseq,
                     park, wake, src, blk, heap_pos
                 );
+                if (tid as usize) < ORPHAN_AGE.len() { ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed); }
                 trace_sched(tid as u32, 8); // 8=rescue_enq
                 set_enq_tag(7); // 7=rescue
                 percpu_enqueue(target, prio, tid as ThreadId);
