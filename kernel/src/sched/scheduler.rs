@@ -274,11 +274,20 @@ fn drain_deferred_requeue(cpu: u32) {
         // CPU number), the CAS fails and we skip — preventing double-sched.
         // An unconditional store would clobber the new on_cpu value, causing
         // drain to re-enqueue a thread that's already running.
-        if thread_ref(tid)
+        if let Err(actual) = thread_ref(tid)
             .on_cpu
             .compare_exchange(target, ON_CPU_PENDING, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
         {
+            // Log what prevented the enqueue.  If actual is a valid CPU number
+            // and in_queue is false, the thread may be genuinely orphaned.
+            let inq = thread_ref(tid).in_queue.load(Ordering::Acquire);
+            let st = thread_ref(tid).state;
+            if st == ThreadState::Ready && !inq && actual != ON_CPU_PENDING {
+                crate::println!(
+                    "DRAIN-CAS-ORPHAN: cpu={} tid={} target={} actual_on_cpu={} inq={} state={:?}",
+                    cpu, tid, target, actual, inq, st
+                );
+            }
             return;
         }
         trace_sched(tid, 2); // 2=drain_enq
@@ -807,6 +816,13 @@ fn get_enq_tag() -> u8 {
     if cpu < tags.len() { tags[cpu].load(Ordering::Relaxed) } else { 0 }
 }
 
+/// Per-source double-enqueue counters for diagnosing thread-loss.
+static DOUBLE_ENQ_DRAIN: AtomicU64 = AtomicU64::new(0);
+static DOUBLE_ENQ_RESCUE: AtomicU64 = AtomicU64::new(0);
+static DOUBLE_ENQ_WAKE: AtomicU64 = AtomicU64::new(0);
+static DOUBLE_ENQ_OTHER: AtomicU64 = AtomicU64::new(0);
+static ENQ_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
     // Double-enqueue detection.  Benign race: rescue_orphaned_threads may
     // enqueue a thread that drain_deferred_requeue is about to enqueue.
@@ -815,8 +831,16 @@ fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
     // lock would deadlock with concurrent output on other CPUs.
     if thread_ref(tid).in_queue.swap(true, Ordering::AcqRel) {
         trace_sched(tid, 11); // 11=double_enq
+        let src = get_enq_tag();
+        match src {
+            1 => { DOUBLE_ENQ_DRAIN.fetch_add(1, Ordering::Relaxed); }
+            7 => { DOUBLE_ENQ_RESCUE.fetch_add(1, Ordering::Relaxed); }
+            6 | 3 => { DOUBLE_ENQ_WAKE.fetch_add(1, Ordering::Relaxed); }
+            _ => { DOUBLE_ENQ_OTHER.fetch_add(1, Ordering::Relaxed); }
+        }
         return; // Don't enqueue again.
     }
+    ENQ_TOTAL.fetch_add(1, Ordering::Relaxed);
     let mut rq = percpu_rq()[target_cpu as usize].lock();
     let t = thread_ref(tid);
     if t.sched_class == SCHED_NORMAL && prio != 254 {
@@ -2117,7 +2141,13 @@ pub fn tick(current_sp: u64) -> u64 {
                     let sc = STALL_COUNT.fetch_add(1, Ordering::Relaxed);
                     if sc < 3 {
                         // First stall detection — dump per-CPU and thread states.
-                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={})", sends, recvs);
+                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={}",
+                            sends, recvs,
+                            DOUBLE_ENQ_DRAIN.load(Ordering::Relaxed),
+                            DOUBLE_ENQ_RESCUE.load(Ordering::Relaxed),
+                            DOUBLE_ENQ_WAKE.load(Ordering::Relaxed),
+                            DOUBLE_ENQ_OTHER.load(Ordering::Relaxed),
+                            ENQ_TOTAL.load(Ordering::Relaxed));
                         // Per-CPU state: what each CPU is running, RQ sizes
                         let ncpus = smp::num_cpus();
                         for c in 0..ncpus {
@@ -2448,9 +2478,15 @@ fn try_switch(current_sp: u64) -> u64 {
                     // CAS on_cpu from lost_target → ON_CPU_PENDING. If rescue
                     // already claimed this thread, the CAS fails and we skip.
                     let lost_target = ((old_deferred >> 40) & 0xFF) as u32;
-                    if thread_ref(lost_tid).on_cpu.compare_exchange(
+                    if let Err(actual) = thread_ref(lost_tid).on_cpu.compare_exchange(
                         lost_target, ON_CPU_PENDING, Ordering::AcqRel, Ordering::Acquire,
-                    ).is_ok() {
+                    ) {
+                        let inq = thread_ref(lost_tid).in_queue.load(Ordering::Acquire);
+                        crate::println!(
+                            "OVERWRITE-CAS-FAIL(try_switch): tid={} target={} actual={} inq={}",
+                            lost_tid, lost_target, actual, inq
+                        );
+                    } else {
                         set_enq_tag(10); // 10=overwrite_rescue
                         percpu_enqueue(lost_target, lost_prio, lost_tid);
                     }
@@ -2513,12 +2549,18 @@ fn try_switch(current_sp: u64) -> u64 {
             return idle_sp;
         }
         thread_ref(next_id).on_cpu_set_by.store(1, Ordering::Relaxed); // 1=try_switch
+        // Set Running IMMEDIATELY after CAS to close the TOCTOU window:
+        // between CAS(on_cpu=cpu) and state=Running, rescue sees
+        // state=Ready + on_cpu=cpu + current_thread≠tid → false orphan.
+        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
         trace_sched(next_id, 4); // 4=on_cpu_set
+    } else {
+        // Idle thread: no CAS needed, just set Running.
+        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
     }
 
-    // Activate next thread. Safety: next_id was just dequeued, we own it.
+    // Activate next thread.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
-    next_t.state = ThreadState::Running;
     trace_sched(next_id, 7); // 7=state_running
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     thread_ref(next_id).last_cpu.store(cpu, Ordering::Relaxed);
@@ -2661,9 +2703,15 @@ pub fn voluntary_reschedule() {
                 cpu, lost_tid, lost_prio, cur_id, cur_prio
             );
             let lost_target = ((old_deferred >> 40) & 0xFF) as u32;
-            if thread_ref(lost_tid).on_cpu.compare_exchange(
+            if let Err(actual) = thread_ref(lost_tid).on_cpu.compare_exchange(
                 lost_target, ON_CPU_PENDING, Ordering::AcqRel, Ordering::Acquire,
-            ).is_ok() {
+            ) {
+                let inq = thread_ref(lost_tid).in_queue.load(Ordering::Acquire);
+                crate::println!(
+                    "OVERWRITE-CAS-FAIL(vol_resched): tid={} target={} actual={} inq={}",
+                    lost_tid, lost_target, actual, inq
+                );
+            } else {
                 set_enq_tag(10);
                 percpu_enqueue(lost_target, lost_prio, lost_tid);
             }
@@ -2712,14 +2760,23 @@ pub fn voluntary_reschedule() {
             return;
         }
         thread_ref(next_id).on_cpu_set_by.store(2, Ordering::Relaxed); // 2=vol_resched
+        // Set Running IMMEDIATELY after CAS — close TOCTOU window (see try_switch).
+        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
+    } else {
+        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
     }
 
     let next_t = unsafe { thread_mut_from_ref(next_id) };
-    next_t.state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     let next_sp = next_t.saved_sp;
 
     pending_switch_sp()[cpu as usize].store(next_sp, Ordering::Release);
+
+    // Reprogram the timer so the deferred slot (holding cur_id) is drained
+    // promptly.  Without this, the timer stays at the previous tick's value
+    // (up to 200ms in the future), leaving the deferred thread un-enqueued
+    // until rescue IPIs the CPU ~100ms later.
+    crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
     // Leave IRQs disabled — exception handler consumes pending_switch.
 }
 
@@ -4880,11 +4937,14 @@ pub fn park_current_for_ipc(reason: BlockReason) {
             return;
         }
         thread_ref(next_id).on_cpu_set_by.store(3, Ordering::Relaxed); // 3=park_ipc
+        // Set Running IMMEDIATELY after CAS — close TOCTOU window (see try_switch).
+        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
+    } else {
+        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
     }
 
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
-    next_t.state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     let next_sp = next_t.saved_sp;
 
@@ -5097,6 +5157,11 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 let on2 = t.on_cpu.load(Ordering::Acquire);
                 if on2 == ON_CPU_PENDING {
                     continue; // drain just handled it
+                }
+                // Re-read state: the dispatching CPU may have set Running
+                // between our initial state read and the on_cpu/deferred checks.
+                if t.state != ThreadState::Ready {
+                    continue; // dispatch completed — thread is Running now
                 }
                 // Also skip if in_queue changed (drain enqueued between our checks).
                 if t.in_queue.load(Ordering::Acquire) {
@@ -5481,11 +5546,14 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
             return;
         }
         thread_ref(next_id).on_cpu_set_by.store(5, Ordering::Relaxed); // 5=park_sleep
+        // Set Running IMMEDIATELY after CAS — close TOCTOU window (see try_switch).
+        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
+    } else {
+        unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
     }
 
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
-    next_t.state = ThreadState::Running;
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
     let next_sp = next_t.saved_sp;
 
@@ -5597,9 +5665,15 @@ pub fn handoff_to(receiver_tid: ThreadId) {
                     cpu, lost_tid, lost_prio, sender_tid
                 );
                 let lost_target = ((old_deferred >> 40) & 0xFF) as u32;
-                if thread_ref(lost_tid).on_cpu.compare_exchange(
+                if let Err(actual) = thread_ref(lost_tid).on_cpu.compare_exchange(
                     lost_target, ON_CPU_PENDING, Ordering::AcqRel, Ordering::Acquire,
-                ).is_ok() {
+                ) {
+                    let inq = thread_ref(lost_tid).in_queue.load(Ordering::Acquire);
+                    crate::println!(
+                        "OVERWRITE-CAS-FAIL(handoff): tid={} target={} actual={} inq={}",
+                        lost_tid, lost_target, actual, inq
+                    );
+                } else {
                     set_enq_tag(10);
                     percpu_enqueue(lost_target, lost_prio, lost_tid);
                 }
@@ -5686,6 +5760,10 @@ pub fn handoff_to(receiver_tid: ThreadId) {
             return;
         }
     }
+
+    // Reprogram the timer so the deferred slot (holding sender) is drained
+    // promptly — same rationale as voluntary_reschedule.
+    crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
 
     // Store pending_switch before restoring IRQs — see park_current_for_ipc
     // comment for why this ordering is critical with preemptive syscalls.
