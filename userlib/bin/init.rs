@@ -858,29 +858,27 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
         None => {
             syscall::debug_puts(b"  init: ns_lookup FAILED\n");
-            loop {
-                syscall::yield_now();
-            }
+            0
         }
     };
 
     // IO_CONNECT to open hello.txt
     let name = b"hello.txt";
     let (w0, w1, _) = pack_name(name);
-    let (handle, size, srv_aspace) = if let Some(reply) = syscall::call(srv_port, 0x100, w0, w1, name.len() as u64, 0) {
-        if reply.tag == 0x101 {
-            (reply.data[0], reply.data[1], reply.data[2])
-        } else {
-            syscall::debug_puts(b"  init: connect failed\n");
-            loop {
-                syscall::yield_now();
+    let (handle, size, srv_aspace) = if srv_port != 0 {
+        if let Some(reply) = syscall::call(srv_port, 0x100, w0, w1, name.len() as u64, 0) {
+            if reply.tag == 0x101 {
+                (reply.data[0], reply.data[1], reply.data[2])
+            } else {
+                syscall::debug_puts(b"  init: connect failed\n");
+                (0, 0, 0)
             }
+        } else {
+            syscall::debug_puts(b"  init: no connect reply\n");
+            (0, 0, 0)
         }
     } else {
-        syscall::debug_puts(b"  init: no connect reply\n");
-        loop {
-            syscall::yield_now();
-        }
+        (0, 0, 0)
     };
 
     syscall::debug_puts(b"  init: connected, handle=");
@@ -909,19 +907,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         Some(va) => va,
         None => {
             syscall::debug_puts(b"  init: mmap for grant buf FAILED\n");
-            loop {
-                syscall::yield_now();
-            }
+            0
         }
     };
 
     // Grant the buffer page to the initramfs server (RW).
     let grant_dst_va: usize = 0x5_0000_0000;
-    if !syscall::grant_pages(srv_aspace, buf_va, grant_dst_va, 1, false) {
+    if buf_va != 0 && srv_aspace != 0 && !syscall::grant_pages(srv_aspace, buf_va, grant_dst_va, 1, false) {
         syscall::debug_puts(b"  init: grant_pages FAILED\n");
-        loop {
-            syscall::yield_now();
-        }
     }
 
     // IO_READ with grant: data[0]=handle, data[1]=offset, data[2]=length, data[3]=grant_va
@@ -973,45 +966,36 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         None => {
             syscall::debug_puts(b"  init: ramdisk not found, skipping\n");
             syscall::debug_puts(b"Phase 7 zero-copy I/O test: PASSED (partial)\n");
-            loop {
-                syscall::yield_now();
-            }
+            0
         }
     };
 
     let rd_reply = syscall::port_create();
 
     // Connect to ramdisk.
+    let rd_aspace = if rd_port == 0 { 0 } else {
     let rd_name = b"ramdisk";
     let (rn0, rn1, _) = pack_name(rd_name);
     let rd_d2 = (rd_name.len() as u64) | (rd_reply << 32);
     syscall::send(rd_port, 0x100, rn0, rn1, rd_d2, 0);
 
-    let rd_aspace = if let Some(reply) = syscall::recv_msg(rd_reply) {
+    if let Some(reply) = syscall::recv_msg_timeout(rd_reply, 5_000_000) {
         if reply.tag == 0x101 {
             reply.data[2]
         } else {
             syscall::debug_puts(b"  init: ramdisk connect failed\n");
-            loop {
-                syscall::yield_now();
-            }
+            0
         }
     } else {
-        syscall::debug_puts(b"  init: ramdisk no reply\n");
-        loop {
-            syscall::yield_now();
-        }
-    };
+        syscall::debug_puts(b"  init: ramdisk no reply (timeout)\n");
+        0
+    }
+    }; // close if rd_port == 0
 
     // Inline write: 8 bytes "TestOK!\n" at offset 0.
-    // IO_WRITE: data[0]=handle, data[1]=offset, data[2]=length|(reply<<32), data[3]=grant_va(0=inline)
-    // For inline writes, server reads data from msg.data[5] — but we can't set data[5] from send().
-    // Instead, pack inline data into data[3] (the 4th arg, a5) since grant_va=0 means inline.
-    // Actually the server reads msg.data[5] for inline data. But data[5] is always 0.
-    // Let me fix the ramdisk server to read inline data from data[3] when grant_va=0.
-    // Actually, we only have 4 data words via send(). For inline writes, just pack the data
-    // into data[3] (the grant_va field is 0 for inline).
     let test_data: u64 = 0x0A_21_4B_4F_74_73_65_54; // "TestOK!\n" little-endian
+    let mut grant_read_ok = false;
+  if rd_aspace != 0 {
     let wr_d2 = 8u64 | (rd_reply << 32);
     syscall::send(rd_port, 0x300, 0, 0, wr_d2, test_data);
 
@@ -1019,7 +1003,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::yield_now();
     }
 
-    if let Some(rr) = syscall::recv_msg(rd_reply) {
+    if let Some(rr) = syscall::recv_msg_timeout(rd_reply, 5_000_000) {
         if rr.tag == 0x301 {
             syscall::debug_puts(b"  init: ramdisk wrote ");
             print_num(rr.data[0]);
@@ -1035,7 +1019,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::yield_now();
     }
 
-    if let Some(rr) = syscall::recv_msg(rd_reply) {
+    if let Some(rr) = syscall::recv_msg_timeout(rd_reply, 5_000_000) {
         if rr.tag == 0x201 {
             let bytes_read = rr.data[0] as usize;
             // Unpack inline data.
@@ -1051,9 +1035,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // Grant-based write: 256 bytes of pattern.
     let wr_buf = match syscall::mmap_anon(0, 1, 1) {
         Some(va) => va,
-        None => loop {
-            syscall::yield_now();
-        },
+        None => 0,
     };
     // Fill with pattern.
     for i in 0..256 {
@@ -1073,7 +1055,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::yield_now();
     }
 
-    if let Some(rr) = syscall::recv_msg(rd_reply) {
+    if let Some(rr) = syscall::recv_msg_timeout(rd_reply, 5_000_000) {
         if rr.tag == 0x301 {
             syscall::debug_puts(b"  init: ramdisk grant-wrote ");
             print_num(rr.data[0]);
@@ -1087,9 +1069,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // Grant-based read back: 256 bytes.
     let rd_buf = match syscall::mmap_anon(0, 1, 1) {
         Some(va) => va,
-        None => loop {
-            syscall::yield_now();
-        },
+        None => 0,
     };
 
     let grant_rd_va: usize = 0x5_0000_0000;
@@ -1102,8 +1082,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::yield_now();
     }
 
-    let mut grant_read_ok = false;
-    if let Some(rr) = syscall::recv_msg(rd_reply) {
+    if let Some(rr) = syscall::recv_msg_timeout(rd_reply, 5_000_000) {
         if rr.tag == 0x201 {
             let bytes_read = rr.data[0] as usize;
             // Verify pattern.
@@ -1126,6 +1105,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     syscall::revoke(rd_aspace, grant_rd_va);
     syscall::munmap(rd_buf);
+
+  } // rd_aspace != 0
 
     if grant_read_ok {
         syscall::debug_puts(b"Phase 7 zero-copy I/O test: PASSED\n");
@@ -1417,7 +1398,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let blk_d2 = 3u64 | (blk_reply << 32);
         syscall::send(bp, 0x100, bn0, bn1, blk_d2, 0);
 
-        let blk_aspace = if let Some(reply) = syscall::recv_msg(blk_reply) {
+        let blk_aspace = if let Some(reply) = syscall::recv_msg_timeout(blk_reply, 5_000_000) {
             if reply.tag == 0x101 {
                 syscall::debug_puts(b"  init: blk connected, size=");
                 print_num(reply.data[1]);
@@ -1438,12 +1419,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 Some(va) => va,
                 None => {
                     syscall::debug_puts(b"  init: blk buf alloc FAILED\n");
-                    loop {
-                        syscall::yield_now();
-                    }
+                    0
                 }
             };
 
+          if blk_buf != 0 {
             // Grant buffer to blk server.
             let blk_grant_va: usize = 0x5_0000_0000;
             syscall::grant_pages(blk_aspace, blk_buf, blk_grant_va, 1, false);
@@ -1452,7 +1432,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let blk_rd_d2 = 512u64 | (blk_reply << 32);
             syscall::send(bp, 0x200, 0, 0, blk_rd_d2, blk_grant_va as u64);
 
-            if let Some(rr) = syscall::recv_msg(blk_reply) {
+            if let Some(rr) = syscall::recv_msg_timeout(blk_reply, 5_000_000) {
                 if rr.tag == 0x201 {
                     let bytes_read = rr.data[0] as usize;
                     // Verify boot signature at bytes 510-511.
@@ -1477,6 +1457,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             syscall::revoke(blk_aspace, blk_grant_va);
             syscall::munmap(blk_buf);
+          } // blk_buf != 0
         }
     } else {
         syscall::debug_puts(b"  init: blk not found, skipping block test\n");
@@ -1602,7 +1583,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let d2 = (test_msg.len() as u64) | (con_reply << 32);
         syscall::send(cp, 0x3100, w0, w1, d2, 0);
 
-        if let Some(reply) = syscall::recv_msg(con_reply) {
+        if let Some(reply) = syscall::recv_msg_timeout(con_reply, 5_000_000) {
             if reply.tag == 0x3101 {
                 syscall::debug_puts(b"Phase 11 console server: PASSED\n");
             } else {
@@ -1649,7 +1630,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Wait for reply (blocking — net_srv always replies with OK or FAIL).
         let mut ping_ok = false;
-        if let Some(reply) = syscall::recv_msg(net_reply) {
+        if let Some(reply) = syscall::recv_msg_timeout(net_reply, 5_000_000) {
             if reply.tag == 0x4101 {
                 ping_ok = true;
             }
@@ -2083,8 +2064,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let mut tcp_ok = false;
         let mut conn_id: u64 = 0;
 
-        // Wait for NET_TCP_CONNECTED or NET_TCP_FAIL.
-        if let Some(reply) = syscall::recv_msg(tcp_reply) {
+        // Wait for NET_TCP_CONNECTED or NET_TCP_FAIL (5s timeout).
+        if let Some(reply) = syscall::recv_msg_timeout(tcp_reply, 5_000_000) {
             if reply.tag == 0x4201 {
                 conn_id = reply.data[0];
                 syscall::debug_puts(b"  init: TCP connected, conn=");
@@ -2104,15 +2085,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let d1_send = (test_str.len() as u64) | (tcp_reply << 16);
                 syscall::send(tcp_net_port, 0x4300, conn_id, d1_send, d2, d3);
 
-                // Wait for SEND_OK.
-                if let Some(sr) = syscall::recv_msg(tcp_reply) {
+                // Wait for SEND_OK (5s timeout).
+                if let Some(sr) = syscall::recv_msg_timeout(tcp_reply, 5_000_000) {
                     if sr.tag == 0x4301 {
                         // NET_TCP_RECV: data[0]=conn_id, data[1]=0|(reply<<16)
                         let d1_recv = tcp_reply << 16;
                         syscall::send(tcp_net_port, 0x4400, conn_id, d1_recv, 0, 0);
 
-                        // Wait for NET_TCP_DATA.
-                        if let Some(dr) = syscall::recv_msg(tcp_reply) {
+                        // Wait for NET_TCP_DATA (5s timeout).
+                        if let Some(dr) = syscall::recv_msg_timeout(tcp_reply, 5_000_000) {
                             if dr.tag == 0x4401 {
                                 let recv_len = dr.data[0] as usize;
                                 // Unpack received bytes.
@@ -2138,8 +2119,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 // NET_TCP_CLOSE.
                 syscall::send(tcp_net_port, 0x4500, conn_id, tcp_reply, 0, 0);
-                // Wait for close OK (best effort).
-                let _ = syscall::recv_msg(tcp_reply);
+                // Wait for close OK (best effort, 1s timeout).
+                let _ = syscall::recv_msg_timeout(tcp_reply, 1_000_000);
             } else {
                 syscall::debug_puts(b"  init: TCP connect failed, tag=");
                 print_num(reply.tag);
@@ -2277,7 +2258,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let d2 = 9u64 | (cache_reply << 32);
             syscall::send(cache_port, 0x100, n0, n1, d2, 0);
 
-            if let Some(cr) = syscall::recv_msg(cache_reply) {
+            if let Some(cr) = syscall::recv_msg_timeout(cache_reply, 5_000_000) {
                 if cr.tag == 0x101 {
                     let cache_aspace = cr.data[2];
 
@@ -2293,7 +2274,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 return false;
                             }
                             syscall::send(cache_port, 0x200, 0, offset, rd2, grant_va as u64);
-                            let ok = if let Some(rr) = syscall::recv_msg(cache_reply) {
+                            let ok = if let Some(rr) = syscall::recv_msg_timeout(cache_reply, 5_000_000) {
                                 rr.tag == 0x201 && rr.data[0] == 512
                             } else {
                                 false
@@ -2318,7 +2299,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         let sd0 = cache_reply << 32;
                         syscall::send(cache_port, 0xC100, sd0, 0, 0, 0);
                         let (hits_after_readahead, misses_after_readahead) =
-                            if let Some(sr) = syscall::recv_msg(cache_reply) {
+                            if let Some(sr) = syscall::recv_msg_timeout(cache_reply, 5_000_000) {
                                 if sr.tag == 0xC101 {
                                     (sr.data[0], sr.data[1])
                                 } else {
@@ -2351,7 +2332,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         // Query stats to get current counts.
                         syscall::send(cache_port, 0xC100, sd0, 0, 0, 0);
                         let (final_hits, final_misses, cache_size) =
-                            if let Some(sr) = syscall::recv_msg(cache_reply) {
+                            if let Some(sr) = syscall::recv_msg_timeout(cache_reply, 5_000_000) {
                                 if sr.tag == 0xC101 {
                                     (sr.data[0], sr.data[1], sr.data[2])
                                 } else {
@@ -2407,7 +2388,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Test 1: queue path — send then recv on same port.
         let tag: u64 = 0x2600;
         syscall::send(req_port, tag, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD);
-        if let Some(msg) = syscall::recv_msg(req_port) {
+        if let Some(msg) = syscall::recv_msg_timeout(req_port, 5_000_000) {
             if msg.tag != tag || msg.data[0] != 0xAAAA || msg.data[1] != 0xBBBB {
                 syscall::debug_puts(b"  init: L4 queue recv data mismatch\n");
                 handoff_ok = false;
@@ -2424,7 +2405,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let io_stat_ok: u64 = 0x401;
             let d0 = 0u64 | (rply_port << 32); // handle=0 | reply_port<<32
             syscall::send(blk, io_stat, d0, 0, 0, 0);
-            if let Some(reply) = syscall::recv_msg(rply_port) {
+            if let Some(reply) = syscall::recv_msg_timeout(rply_port, 5_000_000) {
                 if reply.tag != io_stat_ok || reply.data[0] == 0 {
                     syscall::debug_puts(b"  init: L4 blk stat bad reply\n");
                     handoff_ok = false;
@@ -2533,7 +2514,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::send(port_notify, 0xAA, port_child as u64, 0, 0, 0);
 
             // Recv on our port — parent will send_cap granting us SEND on a new port.
-            if let Some(msg) = syscall::recv_msg(port_child) {
+            if let Some(msg) = syscall::recv_msg_timeout(port_child, 5_000_000) {
                 let granted_port = msg.data[3]; // data[3] = granted port ID
                 // Try to send on the granted port — this should work if cap transfer succeeded.
                 syscall::send(granted_port, 0xBB, 0xCAFE, 0, 0, 0);
@@ -2545,7 +2526,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let port_secret = syscall::port_create();
 
             // Recv child's port_child ID.
-            if let Some(msg) = syscall::recv_msg(port_notify) {
+            if let Some(msg) = syscall::recv_msg_timeout(port_notify, 5_000_000) {
                 let port_child = msg.data[0];
 
                 // Transfer SEND cap for port_secret to child via port_child.
@@ -2961,7 +2942,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let d2 = 9u64 | (reply_port << 32);
             syscall::send(cache_port, 0x100, n0, n1, d2, 0);
 
-            if let Some(cr) = syscall::recv_msg(reply_port) {
+            if let Some(cr) = syscall::recv_msg_timeout(reply_port, 5_000_000) {
                 if cr.tag == 0x101 {
                     let cache_aspace = cr.data[2];
 
@@ -8992,7 +8973,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let reply = syscall::port_create();
                 // SYSLOG_OPEN: d0=facility(0), d1=ident(0), d2=reply<<32
                 syscall::send(syslog_port, 0x9000, 0, 0, reply << 32, 0);
-                if let Some(msg) = syscall::recv_msg(reply) {
+                if let Some(msg) = syscall::recv_msg_timeout(reply, 5_000_000) {
                     if msg.tag != 0x9100 {
                         syscall::debug_puts(b"    FAIL: SYSLOG_OPEN bad reply\n");
                         phase71_ok = false;
@@ -9006,7 +8987,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let reply2 = syscall::port_create();
                 let msg_w0 = 0x0074_7365_7400u64; // "test"
                 syscall::send(syslog_port, 0x9010, 3, msg_w0, 0, 4 | (reply2 << 32));
-                if let Some(msg) = syscall::recv_msg(reply2) {
+                if let Some(msg) = syscall::recv_msg_timeout(reply2, 5_000_000) {
                     if msg.tag != 0x9100 {
                         syscall::debug_puts(b"    FAIL: SYSLOG_MSG bad reply\n");
                         phase71_ok = false;
@@ -9298,7 +9279,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let reply = syscall::port_create();
                 syscall::send(sysv_port, 0xA000, 0, 1, reply << 32, 0);
                 let mut semid = u64::MAX;
-                if let Some(msg) = syscall::recv_msg(reply) {
+                if let Some(msg) = syscall::recv_msg_timeout(reply, 5_000_000) {
                     if msg.tag == 0xA100 {
                         semid = msg.data[0];
                     } else {
@@ -9312,7 +9293,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // SEM_CTL SETVAL: d0=semid, d1=sem_num(0), d2=cmd(16=SETVAL)|reply<<32, d3=value(5)
                     let reply2 = syscall::port_create();
                     syscall::send(sysv_port, 0xA020, semid, 0, 16 | (reply2 << 32), 5);
-                    if let Some(msg) = syscall::recv_msg(reply2) {
+                    if let Some(msg) = syscall::recv_msg_timeout(reply2, 5_000_000) {
                         if msg.tag != 0xA100 {
                             syscall::debug_puts(b"    FAIL: SEM_CTL SETVAL\n");
                             phase79_ok = false;
@@ -9323,7 +9304,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // SEM_CTL GETVAL: d0=semid, d1=sem_num(0), d2=cmd(12=GETVAL)|reply<<32
                     let reply3 = syscall::port_create();
                     syscall::send(sysv_port, 0xA020, semid, 0, 12 | (reply3 << 32), 0);
-                    if let Some(msg) = syscall::recv_msg(reply3) {
+                    if let Some(msg) = syscall::recv_msg_timeout(reply3, 5_000_000) {
                         if msg.tag == 0xA110 {
                             if msg.data[0] != 5 {
                                 syscall::debug_puts(b"    FAIL: GETVAL != 5\n");
@@ -9339,7 +9320,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // SEM_CTL IPC_RMID: d0=semid, d1=0, d2=cmd(0=IPC_RMID)|reply<<32
                     let reply4 = syscall::port_create();
                     syscall::send(sysv_port, 0xA020, semid, 0, 0 | (reply4 << 32), 0);
-                    if let Some(msg) = syscall::recv_msg(reply4) {
+                    if let Some(msg) = syscall::recv_msg_timeout(reply4, 5_000_000) {
                         if msg.tag != 0xA100 {
                             syscall::debug_puts(b"    FAIL: IPC_RMID\n");
                             phase79_ok = false;

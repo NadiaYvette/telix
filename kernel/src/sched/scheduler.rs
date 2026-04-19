@@ -2198,6 +2198,19 @@ pub fn tick(current_sp: u64) -> u64 {
                     // detects and skips redundant enqueues.
                     // Also rescue CallReply-blocked threads (rescue_parked=true)
                     // since IPC is confirmed stalled.
+                    // IPC is confirmed stalled for 5+ seconds — force-drain
+                    // ALL remote deferred slots.  The assembly switch window
+                    // is <1µs; 5s of confirmed stall means it completed eons
+                    // ago.  Also send IPIs to kick timer-dead CPUs.
+                    {
+                        let ncpus_w = smp::num_cpus();
+                        for cw in 0..ncpus_w.min(16) {
+                            drain_deferred_requeue(cw as u32);
+                            if cw as u32 != cpu {
+                                crate::arch::irq::send_reschedule_ipi(cw as u32);
+                            }
+                        }
+                    }
                     rescue_orphaned_threads_impl(true);
                 } else {
                     STALL_COUNT.store(0, Ordering::Relaxed);
@@ -2214,13 +2227,73 @@ pub fn tick(current_sp: u64) -> u64 {
     // (cross-CPU race).  10 ticks gives all CPUs time to drain deferred
     // slots and complete enqueues.
     {
-        static RESCUE_TICK: AtomicU64 = AtomicU64::new(0);
-        let cpu = smp::cpu_id();
-        if cpu == 0 {
-            let rt = RESCUE_TICK.fetch_add(1, Ordering::Relaxed);
-            if rt > 0 && rt % 10 == 0 {
-                // Periodic: only rescue Ready orphans, not parked threads.
+        static RESCUE_COUNTER: AtomicU64 = AtomicU64::new(0);
+        static RESCUE_LOCK: AtomicU32 = AtomicU32::new(0);
+        let rt = RESCUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // All CPUs contribute; fire every ~40 ticks with 4 CPUs (~100ms).
+        if rt > 0 && rt % 40 == 0 {
+            if RESCUE_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 rescue_orphaned_threads_impl(false);
+                RESCUE_LOCK.store(0, Ordering::Release);
+            }
+        }
+    }
+
+    // Heartbeat: every ~250ms, a live CPU sends reschedule IPIs and
+    // drains stale remote deferred-requeue slots.  All CPUs contribute
+    // to a global tick counter; every 100 increments (~250ms with 4
+    // CPUs at 10ms ticks), one CPU CAS-wins the HEARTBEAT_LOCK and
+    // performs the work.  This survives any single CPU being timer-dead.
+    //
+    // Stale-slot age: DEFERRED_STALE[c] counts consecutive heartbeat
+    // rounds with CPU c's slot non-zero.  Age >=1 means occupied for
+    // >=250ms — safe to drain (switch window is <1µs).
+    {
+        static DEFERRED_STALE: [AtomicU32; 16] = {
+            const Z: AtomicU32 = AtomicU32::new(0);
+            [Z; 16]
+        };
+        static HEARTBEAT_COUNTER: AtomicU64 = AtomicU64::new(0);
+        static HEARTBEAT_LOCK: AtomicU32 = AtomicU32::new(0);
+        let hb = HEARTBEAT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if hb > 0 && hb % 100 == 0 {
+            if HEARTBEAT_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                let cpu = smp::cpu_id();
+                let ncpus = smp::num_cpus();
+                for c in 0..ncpus.min(16) {
+                    if c as u32 != cpu {
+                        crate::arch::irq::send_reschedule_ipi(c as u32);
+                    }
+                    let slot = deferred_requeue()[c].load(Ordering::Relaxed);
+                    if slot != 0 {
+                        let age = DEFERRED_STALE[c].fetch_add(1, Ordering::Relaxed);
+                        if age >= 1 {
+                            drain_deferred_requeue(c as u32);
+                            DEFERRED_STALE[c].store(0, Ordering::Relaxed);
+                        }
+                    } else {
+                        DEFERRED_STALE[c].store(0, Ordering::Relaxed);
+                    }
+                }
+                HEARTBEAT_LOCK.store(0, Ordering::Release);
+            }
+        }
+    }
+
+    // CallReply timeout: every 50 ticks (~500ms), sweep for call/reply
+    // threads stuck longer than CALL_REPLY_TIMEOUT_NS. Unlike the WATCHDOG
+    // (which requires zero IPC activity system-wide), this fires
+    // unconditionally and uses per-thread timestamps to catch individual
+    // stuck calls while other IPC traffic continues.
+    {
+        static CALL_TIMEOUT_COUNTER: AtomicU64 = AtomicU64::new(0);
+        static CALL_TIMEOUT_LOCK: AtomicU32 = AtomicU32::new(0);
+        let ct = CALL_TIMEOUT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // All CPUs contribute; fire every ~200 ticks (~500ms with 4 CPUs).
+        if ct > 0 && ct % 200 == 0 {
+            if CALL_TIMEOUT_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                call_reply_timeout_sweep();
+                CALL_TIMEOUT_LOCK.store(0, Ordering::Release);
             }
         }
     }
@@ -4833,6 +4906,14 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     t.state = ThreadState::Blocked;
     t.blocked_on = reason;
 
+    // Record wall-clock time for CallReply timeout sweep.
+    if matches!(reason, BlockReason::CallReply(_)) {
+        thread_ref(tid as ThreadId).call_blocked_ns.store(
+            get_monotonic_ns(),
+            Ordering::Release,
+        );
+    }
+
     // Release on_cpu BEFORE committing park_state. Once park_state is
     // COMMITTED, wake_parked_thread may re-enqueue us on any CPU. If
     // on_cpu still holds a stale CPU value at that point, the scheduling
@@ -5066,6 +5147,69 @@ pub fn wake_parked_thread(tid: ThreadId) {
     }
 }
 
+/// Force-wake CallReply-blocked threads that have been parked longer than
+/// CALL_REPLY_TIMEOUT_NS.  Uses the same abandon_for_interrupt CAS as the
+/// signal-interrupt path to safely coordinate with concurrent server replies.
+/// Called periodically from tick() on CPU 0 (~every 1 second).
+const CALL_REPLY_TIMEOUT_NS: u64 = 3_000_000_000; // 3 seconds
+
+#[cold]
+#[inline(never)]
+fn call_reply_timeout_sweep() {
+    let now = get_monotonic_ns();
+    let max_tid = NEXT_THREAD_ID.load(Ordering::Relaxed).min(200);
+    for tid in 1..max_tid {
+        let t = unsafe { &*(THREAD_TABLE.get(tid) as *const Thread) };
+        if t.task_id == 0 || t.state != ThreadState::Blocked {
+            continue;
+        }
+        let slot = match t.blocked_on {
+            BlockReason::CallReply(s) => s,
+            _ => continue,
+        };
+        let park = t.park_state.load(Ordering::Acquire);
+        if park != PARK_COMMITTED {
+            continue;
+        }
+        let blocked_ns = t.call_blocked_ns.load(Ordering::Acquire);
+        if blocked_ns == 0 || now.saturating_sub(blocked_ns) < CALL_REPLY_TIMEOUT_NS {
+            continue;
+        }
+        // Thread has been in CallReply for >10s. Force-wake with SERVER_DIED.
+        if crate::ipc::call_reply::abandon_for_interrupt(slot, tid as u32) {
+            let sp = thread_saved_sp(tid as ThreadId);
+            if sp != 0 {
+                let tag = crate::ipc::call_reply::CALL_REPLY_SERVER_DIED;
+                unsafe {
+                    use crate::arch::trapframe::ExceptionFrame;
+                    let frame = &mut *(sp as *mut ExceptionFrame);
+                    crate::syscall::handlers::set_return(frame, 0);
+                    crate::syscall::handlers::set_reg(frame, 1, tag);
+                    crate::syscall::handlers::set_reg(frame, 2, 0);
+                    crate::syscall::handlers::set_reg(frame, 3, 0);
+                    crate::syscall::handlers::set_reg(frame, 4, 0);
+                    crate::syscall::handlers::set_reg(frame, 5, 0);
+                    crate::syscall::handlers::set_reg(frame, 6, 0);
+                    crate::syscall::handlers::set_reg(frame, 7, 0);
+                }
+            }
+            // Free the cap slot (leases/donation already unwound by abandon).
+            let cap_gen = crate::ipc::call_reply::REPLY_CAPS[slot as usize]
+                .generation
+                .load(Ordering::Acquire);
+            crate::ipc::call_reply::free((slot as u64) | ((cap_gen as u64) << 32));
+            // Clear the timestamp so we don't re-fire on next sweep.
+            t.call_blocked_ns.store(0, Ordering::Relaxed);
+            crate::println!(
+                "CALL-TIMEOUT: tid={} slot={} task={} port={:#x} blocked_for={}ms",
+                tid, slot, t.task_id, t.call_dest_port,
+                (now - blocked_ns) / 1_000_000
+            );
+            wake_parked_thread(tid as ThreadId);
+        }
+    }
+}
+
 /// Scan for threads stuck in Ready state that are not in any run queue
 /// or deferred-requeue slot.  Re-enqueue them so the system self-heals.
 ///
@@ -5115,21 +5259,22 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
             // within one tick (10ms), causing rescue to falsely re-enqueue
             // threads that were legitimately cycling through deferred slots.
             let mut in_deferred = false;
+            let mut deferred_cpu = 0u32;
             for c in 0..ncpus.min(16) {
                 let dv = deferred_requeue()[c].load(Ordering::Relaxed);
                 if dv != 0 && (dv & 0xFFFFFFFF) as u32 == tid as u32 {
                     in_deferred = true;
+                    deferred_cpu = c as u32;
                     break;
                 }
             }
             if in_deferred {
                 // Thread is in a deferred-requeue slot. Can't enqueue directly
                 // (the owning CPU may still be on this thread's kernel stack).
-                // Send a reschedule IPI to the owning CPU so its next
-                // try_switch → drain_deferred_requeue unsticks the thread.
-                let target_cpu = t.last_cpu.load(Ordering::Relaxed);
-                if target_cpu != smp::cpu_id() {
-                    crate::arch::irq::send_reschedule_ipi(target_cpu);
+                // Send a reschedule IPI to the CPU whose slot holds this thread
+                // so its try_switch → drain_deferred_requeue unsticks it.
+                if deferred_cpu != smp::cpu_id() {
+                    crate::arch::irq::send_reschedule_ipi(deferred_cpu);
                 }
             } else {
                 // Not in deferred slot. Re-read on_cpu to filter out the
@@ -5346,6 +5491,14 @@ fn check_sleep_timers() {
         trace_sched(tid, 15); // 15=sleep_wake (state=Ready, about to enqueue)
         set_enq_tag(7); // 7=sleep_timer
         percpu_enqueue(target, prio, tid);
+        // If the target is a remote CPU, send a reschedule IPI so it picks
+        // up the newly-enqueued thread promptly instead of waiting for its
+        // next timer tick (which may be up to TICK_INTERVAL_NS away, or
+        // longer if the LAPIC one-shot was lost under QEMU MTTCG).
+        let waker = smp::cpu_id();
+        if target != waker {
+            crate::arch::irq::send_reschedule_ipi(target);
+        }
     }
 }
 

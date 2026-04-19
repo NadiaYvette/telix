@@ -174,6 +174,11 @@ pub struct Thread {
     /// thread-teardown path to deliver CALL_REPLY_SERVER_DIED if the server
     /// dies holding a cap.
     pub held_reply_cap: core::sync::atomic::AtomicU64,
+    /// Monotonic nanosecond timestamp when this thread parked for CallReply.
+    /// 0 means not currently in a timed CallReply park. Used by the periodic
+    /// call_reply_timeout_sweep to force-wake threads stuck longer than
+    /// CALL_REPLY_TIMEOUT_NS.
+    pub call_blocked_ns: core::sync::atomic::AtomicU64,
     /// Pending grant leases staged by `sys_grant_pages_lease`, atomically
     /// transferred into the freshly-allocated reply-cap by the next
     /// `sys_call`. Slots with `dst_aspace == 0` are empty. See
@@ -244,6 +249,7 @@ impl Thread {
             eevdf_slice_vt: 0,
             eevdf_lag: 0,
             eevdf_latency_weight: 1024,
+            call_blocked_ns: core::sync::atomic::AtomicU64::new(0),
             held_reply_cap: core::sync::atomic::AtomicU64::new(u64::MAX),
             pending_leases: [const { crate::ipc::call_reply::LeaseSlot::empty() };
                 crate::ipc::call_reply::MAX_LEASES_PER_CAP],
