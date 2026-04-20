@@ -56,6 +56,42 @@ struct telix_msg {
 #define NET_TCP_ACCEPT_OK  0x4711
 #define NET_TCP_ACCEPT_FAIL 0x47FE
 
+/* TCP6 protocol tags (ip6_srv). */
+#define TCP6_CONNECT     0x6300
+#define TCP6_CONNECTED   0x6301
+#define TCP6_FAIL        0x63FF
+#define TCP6_SEND        0x6400
+#define TCP6_SEND_OK     0x6401
+#define TCP6_RECV        0x6500
+#define TCP6_DATA        0x6501
+#define TCP6_RECV_NB     0x6510
+#define TCP6_RECV_NONE   0x6512
+#define TCP6_CLOSED      0x65FF
+#define TCP6_CLOSE       0x6600
+#define TCP6_CLOSE_OK    0x6601
+#define TCP6_BIND        0x6700
+#define TCP6_BIND_OK     0x6701
+#define TCP6_LISTEN      0x6800
+#define TCP6_LISTEN_OK   0x6801
+#define TCP6_LISTEN_FAIL 0x68FF
+#define TCP6_ACCEPT      0x6810
+#define TCP6_ACCEPT_OK   0x6811
+#define TCP6_ACCEPT_FAIL 0x68FE
+
+/* UDP6 protocol tags (ip6_srv). */
+#define UDP6_BIND        0x6900
+#define UDP6_BIND_OK     0x6901
+#define UDP6_BIND_FAIL   0x69FF
+#define UDP6_SEND        0x6A00
+#define UDP6_SEND_OK     0x6A01
+#define UDP6_SEND_FAIL   0x6AFF
+#define UDP6_RECV        0x6B00
+#define UDP6_DATA6       0x6B01
+#define UDP6_RECV_NB     0x6B10
+#define UDP6_RECV_NONE   0x6B12
+#define UDP6_CLOSE       0x6C00
+#define UDP6_CLOSE_OK    0x6C01
+
 /* Pipe protocol tags (Phase 59). */
 #define PIPE_CREATE_TAG  0x5010
 #define PIPE_WRITE_TAG   0x5020

@@ -136,6 +136,12 @@ link_binary "$OUTDIR/sock_test" $COMMON_OBJS "$OUTDIR/sock_test.o"
 SIZE=$(wc -c < "$OUTDIR/sock_test")
 echo "  sock_test: $SIZE bytes"
 
+# Build sock6_test (AF_INET6 socket API test).
+$CC $CFLAGS -c "$MUSL/test/sock6_test.c" -o "$OUTDIR/sock6_test.o"
+link_binary "$OUTDIR/sock6_test" $COMMON_OBJS "$OUTDIR/sock6_test.o"
+SIZE=$(wc -c < "$OUTDIR/sock6_test")
+echo "  sock6_test: $SIZE bytes"
+
 # Build tsh (shell + coreutils).
 $CC $CFLAGS -c "$MUSL/test/tsh.c" -o "$OUTDIR/tsh.o"
 link_binary "$OUTDIR/tsh" $COMMON_OBJS "$OUTDIR/tsh.o"

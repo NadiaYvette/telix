@@ -7967,6 +7967,29 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 58b: AF_INET6 socket API (C test) ---
+    syscall::debug_puts(b"  init: testing IPv6 socket API...\n");
+    {
+        let sock6_tid = syscall::spawn(b"sock6_test", 50);
+        if sock6_tid != u64::MAX {
+            loop {
+                if let Some(code) = syscall::waitpid(sock6_tid) {
+                    if code == 0 {
+                        syscall::debug_puts(b"Phase 58b socket6 API (C): PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 58b socket6 API (C): FAILED (exit=");
+                        print_num(code);
+                        syscall::debug_puts(b")\n");
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+        } else {
+            syscall::debug_puts(b"Phase 58b socket6 API (C): SKIPPED (no binary)\n");
+        }
+    }
+
     // --- Phase 59: Pipe improvements (pipe server + FD-integrated API) ---
     syscall::debug_puts(b"  init: testing pipe server...\n");
     {

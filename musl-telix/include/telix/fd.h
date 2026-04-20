@@ -19,7 +19,8 @@ struct telix_fd_entry {
     uint32_t server_handle; /* server-side handle */
     int      active;
     int      fd_type;       /* FD_TYPE_* */
-    int      domain;        /* AF_UNIX, AF_INET, etc. (sockets only) */
+    int      domain;        /* AF_UNIX, AF_INET, AF_INET6 (sockets only) */
+    int      sock_type;     /* SOCK_STREAM, SOCK_DGRAM (sockets only) */
     uint64_t file_offset;   /* current read/write position (files) */
     uint64_t file_size;     /* total file size (files) */
     uint32_t fs_aspace;     /* server address space ID (for grants) */

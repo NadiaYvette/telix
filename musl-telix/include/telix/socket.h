@@ -12,6 +12,7 @@ typedef unsigned int socklen_t;
 #define AF_UNIX   1
 #define AF_LOCAL  AF_UNIX
 #define AF_INET   2
+#define AF_INET6  10
 
 /* Socket types. */
 #define SOCK_STREAM 1
@@ -43,6 +44,14 @@ struct sockaddr_in {
     char     sin_zero[8];
 };
 
+struct sockaddr_in6 {
+    uint16_t sin6_family;
+    uint16_t sin6_port;
+    uint32_t sin6_flowinfo;
+    uint8_t  sin6_addr[16];
+    uint32_t sin6_scope_id;
+};
+
 int     socket(int domain, int type, int protocol);
 int     bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 int     listen(int sockfd, int backlog);
@@ -50,6 +59,10 @@ int     accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 int     connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 ssize_t send(int sockfd, const void *buf, size_t len, int flags);
 ssize_t recv(int sockfd, void *buf, size_t len, int flags);
+ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+               const struct sockaddr *dest_addr, socklen_t addrlen);
+ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
+                 struct sockaddr *src_addr, socklen_t *addrlen);
 int     shutdown(int sockfd, int how);
 int     getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 int     setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen);
@@ -58,5 +71,6 @@ int     getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *
 /* Internal: server ports set during init. */
 extern uint32_t __telix_uds_port;
 extern uint32_t __telix_net_port;
+extern uint32_t __telix_ip6_port;
 
 #endif /* TELIX_SOCKET_H */

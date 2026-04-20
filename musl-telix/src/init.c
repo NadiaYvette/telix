@@ -8,6 +8,7 @@
 /* Server ports (defined here, declared extern in various headers). */
 uint32_t __telix_uds_port = 0xFFFFFFFF;
 uint32_t __telix_net_port = 0xFFFFFFFF;
+uint32_t __telix_ip6_port = 0xFFFFFFFF;
 uint32_t __telix_pipe_port = 0xFFFFFFFF;
 uint32_t __telix_vfs_port = 0xFFFFFFFF;
 
@@ -35,6 +36,9 @@ void __telix_init(void) {
 
     _trace("[init] ns:net..\n", 16);
     __telix_net_port = telix_ns_lookup("net", 3);
+
+    _trace("[init] ns:ip6..\n", 16);
+    __telix_ip6_port = telix_ns_lookup("ip6", 3);
 
     _trace("[init] ns:pipe.\n", 16);
     __telix_pipe_port = telix_ns_lookup("pipe", 4);
