@@ -2322,6 +2322,94 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 19c: UDP6 self-loopback ---
+    syscall::debug_puts(b"  init: testing UDP6 loopback...\n");
+    {
+        let mut ip6_opt: Option<u64> = None;
+        for _ in 0..20 {
+            ip6_opt = syscall::ns_lookup(b"ip6");
+            if ip6_opt.is_some() { break; }
+            syscall::sleep_ms(10);
+        }
+        if let Some(ip6_port) = ip6_opt {
+            let rp = syscall::port_create();
+            let mut udp6_ok = false;
+
+            // Get our global address (same as TCP6 test).
+            syscall::send(ip6_port, 0x6000, rp, 0, 0, 0); // IP6_STATUS
+            let our_addr = if let Some(sr) = syscall::recv_msg_timeout(rp, 2_000_000) {
+                if sr.tag == 0x6001 { Some((sr.data[0], sr.data[1])) } else { None }
+            } else { None };
+
+            if let Some((a0, a1)) = our_addr {
+                // Wait for gateway (ensures global addr is configured).
+                syscall::send(ip6_port, 0x6200, rp, 0, 0, 0); // IP6_GATEWAY
+                let has_gw = if let Some(gr) = syscall::recv_msg_timeout(rp, 500_000) {
+                    gr.tag == 0x6201
+                } else { false };
+
+                if has_gw {
+                    // UDP6_BIND on port 9999.
+                    let bind_msg = 9999u64 | (rp << 16);
+                    syscall::send(ip6_port, 0x6900, bind_msg, 0, 0, 0);
+                    let bind_id = if let Some(br) = syscall::recv_msg_timeout(rp, 2_000_000) {
+                        if br.tag == 0x6901 { Some(br.data[0]) } else { None } // UDP6_BIND_OK
+                    } else { None };
+
+                    if let Some(bid) = bind_id {
+                        // UDP6_SEND to our own address, port 9999.
+                        // data[0..1] = dst IPv6, data[2] = dst_port|bind_id|reply_port
+                        // data[3] = payload_len(low8) | payload_bytes(shifted by 8)
+                        let test_msg: &[u8] = b"Hi6!";
+                        let d2 = 9999u64 | ((bid & 0xFFFF) << 16) | (rp << 32);
+                        let mut d3 = test_msg.len() as u64;
+                        for i in 0..test_msg.len() {
+                            d3 |= (test_msg[i] as u64) << ((i + 1) * 8);
+                        }
+                        syscall::send(ip6_port, 0x6A00, a0, a1, d2, d3); // UDP6_SEND
+
+                        // Wait for send OK.
+                        if let Some(sr) = syscall::recv_msg_timeout(rp, 2_000_000) {
+                            if sr.tag == 0x6A01 { // UDP6_SEND_OK
+                                // UDP6_RECV (blocking).
+                                let recv_msg = (bid as u64) | (rp << 32);
+                                syscall::send(ip6_port, 0x6B00, recv_msg, 0, 0, 0);
+
+                                if let Some(dr) = syscall::recv_msg_timeout(rp, 5_000_000) {
+                                    if dr.tag == 0x6B01 { // UDP6_DATA
+                                        let plen = (dr.data[0] & 0xFFFF) as usize;
+                                        let d3_rx = dr.data[3];
+                                        let mut ok = plen == test_msg.len();
+                                        for i in 0..plen.min(8) {
+                                            if ((d3_rx >> (i * 8)) & 0xFF) as u8 != test_msg[i] {
+                                                ok = false;
+                                            }
+                                        }
+                                        if ok { udp6_ok = true; }
+                                    }
+                                }
+                            }
+                        }
+
+                        // UDP6_CLOSE.
+                        let close_msg = (bid as u64) | (rp << 32);
+                        syscall::send(ip6_port, 0x6C00, close_msg, 0, 0, 0);
+                        let _ = syscall::recv_msg_timeout(rp, 1_000_000);
+                    }
+                }
+            }
+
+            syscall::port_destroy(rp);
+            if udp6_ok {
+                syscall::debug_puts(b"Phase 19c UDP6 echo: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 19c UDP6 echo: FAILED\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 19c UDP6 echo: SKIPPED (no ip6_srv)\n");
+        }
+    }
+
     // --- Test 20: Signal/Kill ---
     syscall::debug_puts(b"  init: testing signal/kill...\n");
     {

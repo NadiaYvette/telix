@@ -60,6 +60,23 @@ const TCP6_ACCEPT: u64 = 0x6810;
 const TCP6_ACCEPT_OK: u64 = 0x6811;
 const TCP6_ACCEPT_FAIL: u64 = 0x68FE;
 
+// --- UDP6 IPC protocol ---
+const UDP6_BIND: u64 = 0x6900;
+const UDP6_BIND_OK: u64 = 0x6901;
+const UDP6_BIND_FAIL: u64 = 0x69FF;
+const UDP6_SEND: u64 = 0x6A00;
+const UDP6_SEND_OK: u64 = 0x6A01;
+const UDP6_SEND_FAIL: u64 = 0x6AFF;
+const UDP6_RECV: u64 = 0x6B00;
+const UDP6_DATA: u64 = 0x6B01;
+const UDP6_RECV_NB: u64 = 0x6B10;
+const UDP6_RECV_NONE: u64 = 0x6B12;
+const UDP6_CLOSE: u64 = 0x6C00;
+const UDP6_CLOSE_OK: u64 = 0x6C01;
+
+const MAX_UDP6_BINDS: usize = 8;
+const UDP6_RX_BUF_SIZE: usize = 1024;
+
 // --- TCP constants ---
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
@@ -235,6 +252,33 @@ impl ListenSlot6 {
     }
 }
 
+// --- UDP6 binding ---
+
+struct Udp6Binding {
+    active: bool,
+    local_port: u16,
+    recv_reply_port: u64,   // pending recv caller (0 = none)
+    // Small circular RX buffer for one queued datagram.
+    rx_buf: [u8; UDP6_RX_BUF_SIZE],
+    rx_len: usize,          // bytes in current datagram (0 = empty)
+    rx_src_ip: [u8; 16],
+    rx_src_port: u16,
+}
+
+impl Udp6Binding {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            local_port: 0,
+            recv_reply_port: 0,
+            rx_buf: [0; UDP6_RX_BUF_SIZE],
+            rx_len: 0,
+            rx_src_ip: [0; 16],
+            rx_src_port: 0,
+        }
+    }
+}
+
 // --- IPv6 device ---
 
 struct Ip6Dev {
@@ -261,6 +305,8 @@ struct Ip6Dev {
     tcp6_next_port: u16,
     tcp6_isn: u32,
     tcp6_deliver_pending: bool,
+    // UDP6 state.
+    udp6: [Udp6Binding; MAX_UDP6_BINDS],
 }
 
 impl Ip6Dev {
@@ -287,6 +333,7 @@ impl Ip6Dev {
             tcp6_next_port: 49152,
             tcp6_isn: 200000,
             tcp6_deliver_pending: false,
+            udp6: [const { Udp6Binding::new() }; MAX_UDP6_BINDS],
         }
     }
 
@@ -603,6 +650,7 @@ impl Ip6Dev {
         match next_header {
             IPPROTO_ICMPV6 => self.handle_icmpv6(&src_ip6, &dst_ip6, src_mac, data),
             IPPROTO_TCP => self.handle_tcp6_rx(&src_ip6, data),
+            IPPROTO_UDP => self.handle_udp6_rx(&src_ip6, data),
             _ => {}
         }
     }
@@ -1399,6 +1447,240 @@ impl Ip6Dev {
             }
         }
     }
+
+    // ---------------------------------------------------------------
+    // UDP6: receive from network
+    // ---------------------------------------------------------------
+
+    fn handle_udp6_rx(&mut self, src_ip: &[u8; 16], udp_data: &[u8]) {
+        // UDP header: src_port(2) + dst_port(2) + length(2) + checksum(2) = 8 bytes
+        if udp_data.len() < 8 {
+            return;
+        }
+        let src_port = get_u16_be(udp_data, 0);
+        let dst_port = get_u16_be(udp_data, 2);
+        let udp_len = get_u16_be(udp_data, 4) as usize;
+        let payload = if udp_len > 8 && udp_len <= udp_data.len() {
+            &udp_data[8..udp_len]
+        } else if udp_data.len() > 8 {
+            &udp_data[8..]
+        } else {
+            return;
+        };
+
+        // Find matching binding.
+        let idx = self.udp6.iter().position(|b| b.active && b.local_port == dst_port);
+        let idx = match idx {
+            Some(i) => i,
+            None => return, // No binding, drop silently.
+        };
+
+        // If there's a pending recv, deliver immediately.
+        let recv_rp = self.udp6[idx].recv_reply_port;
+        if recv_rp != 0 {
+            self.udp6[idx].recv_reply_port = 0;
+            self.deliver_udp6_datagram(recv_rp, src_ip, src_port, payload);
+        } else {
+            // Queue in binding buffer (one datagram deep; drop if full).
+            let copy_len = payload.len().min(UDP6_RX_BUF_SIZE);
+            self.udp6[idx].rx_buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+            self.udp6[idx].rx_len = copy_len;
+            self.udp6[idx].rx_src_ip = *src_ip;
+            self.udp6[idx].rx_src_port = src_port;
+        }
+    }
+
+    /// Deliver a UDP datagram to a waiting receiver.
+    /// Format: tag=UDP6_DATA, data[0]=payload_len | (src_port << 16),
+    ///         data[1..2]=src_ip6 (16 bytes), data[3]=payload (up to 8 bytes inline).
+    fn deliver_udp6_datagram(&self, reply_port: u64, src_ip: &[u8; 16], src_port: u16, payload: &[u8]) {
+        let plen = payload.len().min(8); // inline payload limit per message
+        let d0 = (plen as u64) | ((src_port as u64) << 16);
+        // Pack source IP into d1, d2.
+        let mut d1 = 0u64;
+        let mut d2 = 0u64;
+        for i in 0..8 { d1 |= (src_ip[i] as u64) << (i * 8); }
+        for i in 0..8 { d2 |= (src_ip[8 + i] as u64) << (i * 8); }
+        // Pack payload into d3.
+        let mut d3 = 0u64;
+        for i in 0..plen { d3 |= (payload[i] as u64) << (i * 8); }
+        syscall::send_nb_4(reply_port, UDP6_DATA, d0, d1, d2, d3);
+    }
+
+    // ---------------------------------------------------------------
+    // UDP6: send datagram
+    // ---------------------------------------------------------------
+
+    fn handle_udp6_send(
+        &mut self,
+        dst_ip: &[u8; 16],
+        dst_port: u16,
+        src_port: u16,
+        payload: &[u8],
+        reply_port: u64,
+    ) {
+        // Loopback: if destination is our own address, deliver directly.
+        let is_loopback = *dst_ip == self.link_local
+            || (self.has_global && *dst_ip == self.global_addr);
+        if is_loopback {
+            let src = self.src_for(dst_ip);
+            // Find matching binding for dst_port and deliver.
+            if let Some(idx) = self.udp6.iter().position(|b| b.active && b.local_port == dst_port) {
+                let recv_rp = self.udp6[idx].recv_reply_port;
+                if recv_rp != 0 {
+                    self.udp6[idx].recv_reply_port = 0;
+                    self.deliver_udp6_datagram(recv_rp, &src, src_port, payload);
+                } else {
+                    let copy_len = payload.len().min(UDP6_RX_BUF_SIZE);
+                    self.udp6[idx].rx_buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                    self.udp6[idx].rx_len = copy_len;
+                    self.udp6[idx].rx_src_ip = src;
+                    self.udp6[idx].rx_src_port = src_port;
+                }
+            }
+            syscall::send_nb(reply_port, UDP6_SEND_OK, 0, 0);
+            return;
+        }
+
+        // Build UDP datagram: header(8) + payload.
+        let udp_len = 8 + payload.len();
+        if udp_len > MAX_IPV6_PAYLOAD {
+            syscall::send_nb(reply_port, UDP6_SEND_FAIL, 0, 0);
+            return;
+        }
+        let mut dgram = [0u8; 1460];
+        put_u16_be(&mut dgram, 0, src_port);
+        put_u16_be(&mut dgram, 2, dst_port);
+        put_u16_be(&mut dgram, 4, udp_len as u16);
+        // Checksum at [6..8] — compute with pseudo-header.
+        dgram[6] = 0;
+        dgram[7] = 0;
+        if !payload.is_empty() {
+            dgram[8..8 + payload.len()].copy_from_slice(payload);
+        }
+        let src = self.src_for(dst_ip);
+        let cksum = Self::udp6_checksum(&src, dst_ip, &dgram[..udp_len]);
+        dgram[6] = (cksum >> 8) as u8;
+        dgram[7] = cksum as u8;
+
+        let mac = self.dst_mac_for(dst_ip);
+        self.send_ipv6(dst_ip, IPPROTO_UDP, &dgram[..udp_len], mac, 64);
+        syscall::send_nb(reply_port, UDP6_SEND_OK, 0, 0);
+    }
+
+    /// UDP checksum with IPv6 pseudo-header (mandatory for UDP over IPv6).
+    fn udp6_checksum(src: &[u8; 16], dst: &[u8; 16], udp_data: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        let mut i = 0;
+        while i < 16 {
+            sum += ((src[i] as u32) << 8) | (src[i + 1] as u32);
+            i += 2;
+        }
+        i = 0;
+        while i < 16 {
+            sum += ((dst[i] as u32) << 8) | (dst[i + 1] as u32);
+            i += 2;
+        }
+        let len = udp_data.len() as u32;
+        sum += len >> 16;
+        sum += len & 0xFFFF;
+        sum += IPPROTO_UDP as u32;
+        i = 0;
+        while i + 1 < udp_data.len() {
+            sum += ((udp_data[i] as u32) << 8) | (udp_data[i + 1] as u32);
+            i += 2;
+        }
+        if i < udp_data.len() {
+            sum += (udp_data[i] as u32) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        let result = !(sum as u16);
+        // RFC 2460: UDP checksum of 0 must be transmitted as 0xFFFF.
+        if result == 0 { 0xFFFF } else { result }
+    }
+
+    // ---------------------------------------------------------------
+    // UDP6: bind / recv / close
+    // ---------------------------------------------------------------
+
+    fn handle_udp6_bind(&mut self, port: u16, reply_port: u64) {
+        // Check for duplicate binding.
+        if self.udp6.iter().any(|b| b.active && b.local_port == port) {
+            syscall::send_nb(reply_port, UDP6_BIND_FAIL, 0, 0);
+            return;
+        }
+        let slot = self.udp6.iter().position(|b| !b.active);
+        match slot {
+            Some(s) => {
+                self.udp6[s] = Udp6Binding {
+                    active: true,
+                    local_port: port,
+                    recv_reply_port: 0,
+                    rx_buf: [0; UDP6_RX_BUF_SIZE],
+                    rx_len: 0,
+                    rx_src_ip: [0; 16],
+                    rx_src_port: 0,
+                };
+                syscall::send_nb(reply_port, UDP6_BIND_OK, s as u64, 0);
+            }
+            None => {
+                syscall::send_nb(reply_port, UDP6_BIND_FAIL, 0, 0);
+            }
+        }
+    }
+
+    fn handle_udp6_recv(&mut self, bind_id: usize, reply_port: u64) {
+        if bind_id >= MAX_UDP6_BINDS || !self.udp6[bind_id].active {
+            syscall::send_nb(reply_port, UDP6_RECV_NONE, 0, 0);
+            return;
+        }
+        // If we have a queued datagram, deliver immediately.
+        if self.udp6[bind_id].rx_len > 0 {
+            let src_ip = self.udp6[bind_id].rx_src_ip;
+            let src_port = self.udp6[bind_id].rx_src_port;
+            let len = self.udp6[bind_id].rx_len;
+            let mut payload = [0u8; UDP6_RX_BUF_SIZE];
+            payload[..len].copy_from_slice(&self.udp6[bind_id].rx_buf[..len]);
+            self.udp6[bind_id].rx_len = 0;
+            self.deliver_udp6_datagram(reply_port, &src_ip, src_port, &payload[..len]);
+        } else {
+            // Park the recv — will be delivered when datagram arrives.
+            self.udp6[bind_id].recv_reply_port = reply_port;
+        }
+    }
+
+    fn handle_udp6_recv_nb(&mut self, bind_id: usize, reply_port: u64) {
+        if bind_id >= MAX_UDP6_BINDS || !self.udp6[bind_id].active {
+            syscall::send_nb(reply_port, UDP6_RECV_NONE, 0, 0);
+            return;
+        }
+        if self.udp6[bind_id].rx_len > 0 {
+            let src_ip = self.udp6[bind_id].rx_src_ip;
+            let src_port = self.udp6[bind_id].rx_src_port;
+            let len = self.udp6[bind_id].rx_len;
+            let mut payload = [0u8; UDP6_RX_BUF_SIZE];
+            payload[..len].copy_from_slice(&self.udp6[bind_id].rx_buf[..len]);
+            self.udp6[bind_id].rx_len = 0;
+            self.deliver_udp6_datagram(reply_port, &src_ip, src_port, &payload[..len]);
+        } else {
+            syscall::send_nb(reply_port, UDP6_RECV_NONE, 0, 0);
+        }
+    }
+
+    fn handle_udp6_close(&mut self, bind_id: usize, reply_port: u64) {
+        if bind_id < MAX_UDP6_BINDS && self.udp6[bind_id].active {
+            self.udp6[bind_id].active = false;
+            // Wake any parked recv with close notification.
+            let rp = self.udp6[bind_id].recv_reply_port;
+            if rp != 0 {
+                syscall::send_nb(rp, UDP6_RECV_NONE, 0, 0);
+                self.udp6[bind_id].recv_reply_port = 0;
+            }
+        }
+        syscall::send_nb(reply_port, UDP6_CLOSE_OK, bind_id as u64, 0);
+    }
 }
 
 // --- Helpers ---
@@ -1676,6 +1958,54 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     let port_num = msg.data[0] as u16;
                     let reply_port = msg.data[1] >> 32;
                     dev.handle_tcp6_accept(port_num, reply_port);
+                }
+                // --- UDP6 IPC ---
+                UDP6_BIND => {
+                    // data[0] = port(low16) | reply_port(high48)
+                    let port_num = msg.data[0] as u16;
+                    let reply_port = msg.data[0] >> 16;
+                    dev.handle_udp6_bind(port_num, reply_port);
+                }
+                UDP6_SEND => {
+                    // data[0..1] = dest IPv6 (16 bytes in 2 u64s)
+                    // data[2] = dst_port(low16) | bind_id(16-31) | reply_port(high32)
+                    // data[3] = inline payload (up to 8 bytes)
+                    let mut dst = [0u8; 16];
+                    let d0 = msg.data[0];
+                    let d1 = msg.data[1];
+                    for i in 0..8 { dst[i] = (d0 >> (i * 8)) as u8; }
+                    for i in 0..8 { dst[8 + i] = (d1 >> (i * 8)) as u8; }
+                    let dst_port = msg.data[2] as u16;
+                    let bind_id = ((msg.data[2] >> 16) & 0xFFFF) as usize;
+                    let reply_port = msg.data[2] >> 32;
+                    let payload_len = (msg.data[3] & 0xFF) as usize;
+                    let mut payload = [0u8; 8];
+                    let d3 = msg.data[3] >> 8;
+                    for i in 0..payload_len.min(7) { payload[i] = (d3 >> (i * 8)) as u8; }
+                    if bind_id >= MAX_UDP6_BINDS || !dev.udp6[bind_id].active {
+                        syscall::send_nb(reply_port, UDP6_SEND_FAIL, 0, 0);
+                    } else {
+                        let src_port = dev.udp6[bind_id].local_port;
+                        dev.handle_udp6_send(&dst, dst_port, src_port, &payload[..payload_len.min(7)], reply_port);
+                    }
+                }
+                UDP6_RECV => {
+                    // data[0] = bind_id(low32) | reply_port(high32)
+                    let bind_id = (msg.data[0] & 0xFFFFFFFF) as usize;
+                    let reply_port = msg.data[0] >> 32;
+                    dev.handle_udp6_recv(bind_id, reply_port);
+                }
+                UDP6_RECV_NB => {
+                    // data[0] = bind_id(low32) | reply_port(high32)
+                    let bind_id = (msg.data[0] & 0xFFFFFFFF) as usize;
+                    let reply_port = msg.data[0] >> 32;
+                    dev.handle_udp6_recv_nb(bind_id, reply_port);
+                }
+                UDP6_CLOSE => {
+                    // data[0] = bind_id(low32) | reply_port(high32)
+                    let bind_id = (msg.data[0] & 0xFFFFFFFF) as usize;
+                    let reply_port = msg.data[0] >> 32;
+                    dev.handle_udp6_close(bind_id, reply_port);
                 }
                 _ => {}
             }
