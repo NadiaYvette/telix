@@ -34,6 +34,9 @@ const IP6_PING_OK: u64 = 0x6101;
 const IP6_PING_FAIL: u64 = 0x61FF;
 const IP6_STATUS: u64 = 0x6000;
 const IP6_STATUS_OK: u64 = 0x6001;
+const IP6_GATEWAY: u64 = 0x6200;
+const IP6_GATEWAY_OK: u64 = 0x6201;
+const IP6_GATEWAY_NONE: u64 = 0x62FF;
 
 // --- Ethertypes ---
 const ETHERTYPE_IPV6: u16 = 0x86DD;
@@ -108,8 +111,14 @@ impl PingState {
 struct Ip6Dev {
     eth_port: u64,      // eth_srv's IPC port
     my_port: u64,       // our IPC port
+    client_id: u64,     // eth_srv client slot (for NETIF_XMIT data[3])
     mac: [u8; 6],       // link-layer address
     link_local: [u8; 16], // fe80::eui64
+    global_addr: [u8; 16], // SLAAC global address (from RA prefix + EUI-64)
+    has_global: bool,    // true once RA prefix processed
+    gateway_ip6: [u8; 16], // default router link-local (from RA source)
+    gateway_mac: [u8; 6],  // default router MAC
+    has_gateway: bool,     // true once RA received
     rx_va: usize,       // grant page for receiving frames from eth_srv
     tx_va: usize,       // grant page for sending frames to eth_srv
     // Neighbor cache (IPv6 → MAC).
@@ -120,13 +129,19 @@ struct Ip6Dev {
 }
 
 impl Ip6Dev {
-    fn new(eth_port: u64, my_port: u64, mac: [u8; 6], rx_va: usize, tx_va: usize) -> Self {
+    fn new(eth_port: u64, my_port: u64, client_id: u64, mac: [u8; 6], rx_va: usize, tx_va: usize) -> Self {
         let link_local = eui64_link_local(mac);
         Self {
             eth_port,
             my_port,
+            client_id,
             mac,
             link_local,
+            global_addr: [0; 16],
+            has_global: false,
+            gateway_ip6: [0; 16],
+            gateway_mac: [0; 6],
+            has_gateway: false,
             rx_va,
             tx_va,
             neighbors: [const { NeighborEntry::new() }; NEIGHBOR_CACHE_SIZE],
@@ -170,7 +185,7 @@ impl Ip6Dev {
 
     /// Send an IPv6 packet via eth_srv. Builds IPv6 header + copies payload
     /// into the TX grant page, then sends NETIF_XMIT.
-    fn send_ipv6(&mut self, dst_ip6: &[u8; 16], next_header: u8, payload: &[u8], dst_mac: [u8; 6]) {
+    fn send_ipv6(&mut self, dst_ip6: &[u8; 16], next_header: u8, payload: &[u8], dst_mac: [u8; 6], hop_limit: u8) {
         let payload_len = payload.len();
         if payload_len > MAX_IPV6_PAYLOAD {
             return;
@@ -193,29 +208,35 @@ impl Ip6Dev {
             // Next header.
             *hdr.add(6) = next_header;
             // Hop limit.
-            *hdr.add(7) = 64;
-            // Source address (16 bytes).
-            core::ptr::copy_nonoverlapping(self.link_local.as_ptr(), hdr.add(8), 16);
+            *hdr.add(7) = hop_limit;
+            // Source address: use global if available and dest is non-link-local.
+            let src = if self.has_global && !Self::is_link_local(&dst_ip6) {
+                &self.global_addr
+            } else {
+                &self.link_local
+            };
+            core::ptr::copy_nonoverlapping(src.as_ptr(), hdr.add(8), 16);
             // Destination address (16 bytes).
             core::ptr::copy_nonoverlapping(dst_ip6.as_ptr(), hdr.add(24), 16);
             // Payload.
             core::ptr::copy_nonoverlapping(payload.as_ptr(), hdr.add(IPV6_HDR_LEN), payload_len);
         }
 
-        // Send NETIF_XMIT to eth_srv.
+        // Send NETIF_XMIT to eth_srv (blocking send to guarantee delivery).
         let reply_port = syscall::port_create();
         let mac_val = mac_to_u64(dst_mac);
-        // data[0]=payload_len, data[1]=dst_mac, data[2]=ethertype|(reply_port<<16), data[3]=client_id(0)
-        syscall::send_nb_4(
+        // data[0]=payload_len, data[1]=dst_mac, data[2]=ethertype|(reply_port<<16), data[3]=client_id
+        syscall::send(
             self.eth_port,
             NETIF_XMIT,
             total as u64,
             mac_val,
             ETHERTYPE_IPV6 as u64 | (reply_port << 16),
-            0, // client_id — we're the first registered client
+            self.client_id,
         );
-        // Wait briefly for XMIT_OK.
-        let _ = syscall::recv_msg_timeout(reply_port, 100_000);
+        // Wait for eth_srv to read TX page and reply XMIT_OK (must complete
+        // before we overwrite the TX page with the next send).
+        let _ = syscall::recv_msg_timeout(reply_port, 500_000);
         syscall::port_destroy(reply_port);
     }
 
@@ -256,6 +277,15 @@ impl Ip6Dev {
         !(sum as u16)
     }
 
+    /// Pick source address: global for non-link-local dests, link-local otherwise.
+    fn src_for(&self, dst: &[u8; 16]) -> [u8; 16] {
+        if self.has_global && !Self::is_link_local(dst) {
+            self.global_addr
+        } else {
+            self.link_local
+        }
+    }
+
     /// Send ICMPv6 Echo Request.
     fn send_echo_request(&mut self, dst_ip6: &[u8; 16], dst_mac: [u8; 6], seq: u16) {
         // ICMPv6 echo: type(1) + code(1) + checksum(2) + id(2) + seq(2) + data(32) = 40 bytes
@@ -271,10 +301,11 @@ impl Ip6Dev {
         for i in 0..32 {
             icmp[8 + i] = i as u8;
         }
-        let cksum = Self::icmpv6_checksum(&self.link_local, dst_ip6, &icmp);
+        let src = self.src_for(dst_ip6);
+        let cksum = Self::icmpv6_checksum(&src, dst_ip6, &icmp);
         icmp[2] = (cksum >> 8) as u8;
         icmp[3] = cksum as u8;
-        self.send_ipv6(dst_ip6, IPPROTO_ICMPV6, &icmp, dst_mac);
+        self.send_ipv6(dst_ip6, IPPROTO_ICMPV6, &icmp, dst_mac, 64);
     }
 
     /// Send ICMPv6 Echo Reply (mirror back the received echo request).
@@ -302,7 +333,7 @@ impl Ip6Dev {
         let cksum = Self::icmpv6_checksum(&self.link_local, dst_ip6, &icmp[..total_len]);
         icmp[2] = (cksum >> 8) as u8;
         icmp[3] = cksum as u8;
-        self.send_ipv6(dst_ip6, IPPROTO_ICMPV6, &icmp[..total_len], dst_mac);
+        self.send_ipv6(dst_ip6, IPPROTO_ICMPV6, &icmp[..total_len], dst_mac, 64);
     }
 
     /// Send NDP Neighbor Solicitation for the given target address.
@@ -340,27 +371,30 @@ impl Ip6Dev {
             target_ip6[14],
             target_ip6[15],
         ];
-        self.send_ipv6(&sol_node, IPPROTO_ICMPV6, &ns, dst_mac);
+        self.send_ipv6(&sol_node, IPPROTO_ICMPV6, &ns, dst_mac, 255);
     }
 
     /// Send NDP Neighbor Advertisement in response to a solicitation.
-    fn send_neighbor_advert(&mut self, dst_ip6: &[u8; 16], dst_mac: [u8; 6]) {
+    fn send_neighbor_advert(&mut self, dst_ip6: &[u8; 16], dst_mac: [u8; 6], target: &[u8; 16]) {
         // NA: type(136) + code(0) + cksum(2) + flags(4) + target(16) + option(8) = 32 bytes
         let mut na = [0u8; 32];
         na[0] = ICMPV6_NEIGHBOR_ADVERT;
         // Flags: Solicited=1, Override=1 → 0x60000000 in bytes 4-7.
         na[4] = 0x60;
-        // Target address: our link-local.
-        na[8..24].copy_from_slice(&self.link_local);
+        // Target address: the address that was solicited.
+        na[8..24].copy_from_slice(target);
         // Target link-layer address option.
         na[24] = 2; // option type (target link-layer)
         na[25] = 1; // length in 8-byte units
         na[26..32].copy_from_slice(&self.mac);
 
-        let cksum = Self::icmpv6_checksum(&self.link_local, dst_ip6, &na);
+        // Checksum must use the same source address that send_ipv6 will put
+        // in the IPv6 header (global for non-link-local destinations).
+        let src = self.src_for(dst_ip6);
+        let cksum = Self::icmpv6_checksum(&src, dst_ip6, &na);
         na[2] = (cksum >> 8) as u8;
         na[3] = cksum as u8;
-        self.send_ipv6(dst_ip6, IPPROTO_ICMPV6, &na, dst_mac);
+        self.send_ipv6(dst_ip6, IPPROTO_ICMPV6, &na, dst_mac, 255);
     }
 
     /// Send Router Solicitation to discover default router.
@@ -381,7 +415,7 @@ impl Ip6Dev {
 
         // All-routers multicast MAC: 33:33:00:00:00:02
         let dst_mac = [0x33, 0x33, 0x00, 0x00, 0x00, 0x02];
-        self.send_ipv6(&all_routers, IPPROTO_ICMPV6, &rs, dst_mac);
+        self.send_ipv6(&all_routers, IPPROTO_ICMPV6, &rs, dst_mac, 255);
     }
 
     // ---------------------------------------------------------------
@@ -450,14 +484,12 @@ impl Ip6Dev {
                     let id = ((data[4] as u16) << 8) | (data[5] as u16);
                     let seq = ((data[6] as u16) << 8) | (data[7] as u16);
                     let echo_data = if data.len() > 8 { &data[8..] } else { &[] };
-                    syscall::debug_puts(b"  [ip6_srv] echo request, replying\n");
                     self.send_echo_reply(src_ip6, src_mac, id, seq, echo_data);
                 }
             }
             ICMPV6_ECHO_REPLY => {
                 // Received ping reply.
                 if self.ping.active {
-                    syscall::debug_puts(b"  [ip6_srv] ping6 reply received\n");
                     syscall::send_nb(self.ping.reply_port, IP6_PING_OK, 0, 0);
                     self.ping.active = false;
                 }
@@ -465,10 +497,20 @@ impl Ip6Dev {
             ICMPV6_NEIGHBOR_SOLICIT => {
                 // Someone is asking for our MAC.
                 if data.len() >= 24 {
-                    let target = &data[8..24];
-                    if target == self.link_local {
-                        syscall::debug_puts(b"  [ip6_srv] NS for us, sending NA\n");
-                        self.send_neighbor_advert(src_ip6, src_mac);
+                    let mut t16 = [0u8; 16];
+                    t16.copy_from_slice(&data[8..24]);
+                    // Match against link-local or global address.
+                    if t16 == self.link_local
+                        || (self.has_global && t16 == self.global_addr)
+                    {
+                        // If NS from :: (DAD), reply to all-nodes multicast.
+                        let (na_dst, na_mac) = if *src_ip6 == [0u8; 16] {
+                            let all_nodes: [u8; 16] = [0xFF,0x02,0,0,0,0,0,0,0,0,0,0,0,0,0,1];
+                            (all_nodes, [0x33,0x33,0x00,0x00,0x00,0x01])
+                        } else {
+                            (*src_ip6, src_mac)
+                        };
+                        self.send_neighbor_advert(&na_dst, na_mac, &t16);
                     }
                 }
             }
@@ -513,8 +555,47 @@ impl Ip6Dev {
                 }
             }
             ICMPV6_ROUTER_ADVERT => {
-                // Parse Router Advertisement for prefix info (future SLAAC).
-                syscall::debug_puts(b"  [ip6_srv] RA received\n");
+                // RA layout: type(1)+code(1)+cksum(2)+hop_limit(1)+flags(1)+
+                //   router_lifetime(2)+reachable(4)+retrans(4) = 16 bytes header
+                // then options.
+                if data.len() >= 16 {
+                    // Source IP of the RA is the router's link-local.
+                    if !self.has_gateway {
+                        self.gateway_ip6 = *src_ip6;
+                        self.gateway_mac = src_mac;
+                        self.has_gateway = true;
+                        self.neigh_store(*src_ip6, src_mac);
+                    }
+                    // Parse options for Prefix Information (type=3).
+                    let mut off = 16;
+                    while off + 2 <= data.len() {
+                        let otype = data[off];
+                        let olen = data[off + 1] as usize * 8;
+                        if olen == 0 { break; }
+                        if otype == 3 && olen >= 32 && off + 32 <= data.len() {
+                            // Prefix Information option.
+                            let prefix_len = data[off + 2];
+                            let flags = data[off + 3]; // L=0x80, A=0x40
+                            if flags & 0x40 != 0 && prefix_len == 64 && !self.has_global {
+                                // Autonomous flag set, /64 prefix → SLAAC.
+                                let mut addr = [0u8; 16];
+                                addr[..8].copy_from_slice(&data[off + 16..off + 24]);
+                                // EUI-64 interface ID for lower 8 bytes.
+                                addr[8] = self.mac[0] ^ 0x02;
+                                addr[9] = self.mac[1];
+                                addr[10] = self.mac[2];
+                                addr[11] = 0xFF;
+                                addr[12] = 0xFE;
+                                addr[13] = self.mac[3];
+                                addr[14] = self.mac[4];
+                                addr[15] = self.mac[5];
+                                self.global_addr = addr;
+                                self.has_global = true;
+                            }
+                        }
+                        off += olen;
+                    }
+                }
             }
             _ => {}
         }
@@ -524,6 +605,25 @@ impl Ip6Dev {
     // Ping6 handling
     // ---------------------------------------------------------------
 
+    /// Check if target is on-link (same link-local prefix fe80::/10).
+    fn is_link_local(addr: &[u8; 16]) -> bool {
+        addr[0] == 0xFE && (addr[1] & 0xC0) == 0x80
+    }
+
+    /// Resolve destination MAC for a target: neighbor cache, gateway, or broadcast.
+    fn dst_mac_for(&self, target: &[u8; 16]) -> [u8; 6] {
+        // 1. Check neighbor cache.
+        if let Some(mac) = self.neigh_lookup(target) {
+            return mac;
+        }
+        // 2. For non-link-local, route through gateway.
+        if !Self::is_link_local(target) && self.has_gateway {
+            return self.gateway_mac;
+        }
+        // 3. Broadcast fallback (works in QEMU SLIRP).
+        [0xFF; 6]
+    }
+
     fn start_ping6(&mut self, target: [u8; 16], reply_port: u64) {
         self.ping.target = target;
         self.ping.reply_port = reply_port;
@@ -532,13 +632,10 @@ impl Ip6Dev {
         self.ping.active = true;
         self.ping.sent = false;
 
-        if let Some(mac) = self.neigh_lookup(&target) {
-            self.send_echo_request(&target, mac, self.ping.seq);
-            self.ping.sent = true;
-        } else {
-            // Need neighbor discovery first.
-            self.send_neighbor_solicit(&target);
-        }
+        let mac = self.dst_mac_for(&target);
+        let seq = self.ping.seq;
+        self.send_echo_request(&target, mac, seq);
+        self.ping.sent = true;
     }
 
     fn tick_ping(&mut self) {
@@ -546,8 +643,14 @@ impl Ip6Dev {
             return;
         }
         self.ping.polls += 1;
+        // Retransmit every 200 ticks.
+        if self.ping.polls % 200 == 0 {
+            let target = self.ping.target;
+            let mac = self.dst_mac_for(&target);
+            let seq = self.ping.seq;
+            self.send_echo_request(&target, mac, seq);
+        }
         if self.ping.polls > 5000 {
-            syscall::debug_puts(b"  [ip6_srv] ping6 timeout\n");
             syscall::send_nb(self.ping.reply_port, IP6_PING_FAIL, 0, 0);
             self.ping.active = false;
         }
@@ -594,70 +697,6 @@ fn eui64_link_local(mac: [u8; 6]) -> [u8; 16] {
     addr
 }
 
-fn print_num(n: u64) {
-    if n == 0 {
-        syscall::debug_putchar(b'0');
-        return;
-    }
-    let mut buf = [0u8; 20];
-    let mut val = n;
-    let mut i = 0;
-    while val > 0 {
-        buf[i] = b'0' + (val % 10) as u8;
-        val /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        syscall::debug_putchar(buf[i]);
-    }
-}
-
-fn print_hex(n: u64) {
-    syscall::debug_puts(b"0x");
-    if n == 0 {
-        syscall::debug_putchar(b'0');
-        return;
-    }
-    let mut buf = [0u8; 16];
-    let mut val = n;
-    let mut i = 0;
-    while val > 0 {
-        let d = (val & 0xF) as u8;
-        buf[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
-        val >>= 4;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        syscall::debug_putchar(buf[i]);
-    }
-}
-
-fn print_ipv6(addr: &[u8; 16]) {
-    for i in 0..8 {
-        if i > 0 {
-            syscall::debug_putchar(b':');
-        }
-        let hi = addr[i * 2];
-        let lo = addr[i * 2 + 1];
-        let val = ((hi as u16) << 8) | (lo as u16);
-        print_hex(val as u64);
-    }
-}
-
-fn print_mac(mac: [u8; 6]) {
-    for i in 0..6 {
-        if i > 0 {
-            syscall::debug_putchar(b':');
-        }
-        let hi = mac[i] >> 4;
-        let lo = mac[i] & 0xF;
-        syscall::debug_putchar(if hi < 10 { b'0' + hi } else { b'a' + hi - 10 });
-        syscall::debug_putchar(if lo < 10 { b'0' + lo } else { b'a' + lo - 10 });
-    }
-}
-
 // ---------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------
@@ -677,9 +716,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     };
 
-    syscall::debug_puts(b"  [ip6_srv] found eth_srv on port ");
-    print_num(eth_port);
-    syscall::debug_puts(b"\n");
 
     // Query link status to get our MAC address.
     let reply_port = syscall::port_create();
@@ -695,9 +731,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     };
     syscall::port_destroy(reply_port);
 
-    syscall::debug_puts(b"  [ip6_srv] MAC=");
-    print_mac(mac);
-    syscall::debug_puts(b"\n");
 
     // Create our IPC port.
     let my_port = syscall::port_create();
@@ -729,14 +762,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         0,
     );
 
-    if let Some(msg) = syscall::recv_msg_timeout(reg_reply, 2_000_000) {
+    let client_id = if let Some(msg) = syscall::recv_msg_timeout(reg_reply, 2_000_000) {
         if msg.tag == NETIF_REGISTER_OK {
-            let _client_id = msg.data[0];
+            let cid = msg.data[0];
             let eth_rx_va = msg.data[1] as usize; // VA in eth_srv's aspace for RX page
             let eth_tx_va = msg.data[2] as usize; // VA in eth_srv's aspace for TX page
-            syscall::debug_puts(b"  [ip6_srv] registered with eth_srv, client_id=");
-            print_num(_client_id);
-            syscall::debug_puts(b"\n");
 
             // Grant our RX page to eth_srv (eth_srv writes incoming frames here).
             if !syscall::grant_pages(eth_port, rx_va, eth_rx_va, 1, false) {
@@ -746,7 +776,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if !syscall::grant_pages(eth_port, tx_va, eth_tx_va, 1, false) {
                 syscall::debug_puts(b"  [ip6_srv] grant tx failed\n");
             }
-            syscall::debug_puts(b"  [ip6_srv] grant pages established\n");
+            cid
         } else {
             syscall::debug_puts(b"  [ip6_srv] register failed\n");
             loop { core::hint::spin_loop(); }
@@ -757,23 +787,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     };
     syscall::port_destroy(reg_reply);
 
-    let mut dev = Ip6Dev::new(eth_port, my_port, mac, rx_va, tx_va);
-
-    // Print our link-local address.
-    syscall::debug_puts(b"  [ip6_srv] link-local ");
-    print_ipv6(&dev.link_local);
-    syscall::debug_puts(b"\n");
+    let mut dev = Ip6Dev::new(eth_port, my_port, client_id, mac, rx_va, tx_va);
 
     // Register with name server.
     syscall::ns_register(b"ip6", my_port);
-    syscall::debug_puts(b"  [ip6_srv] registered on port ");
-    print_num(my_port);
-    syscall::debug_puts(b"\n");
+    syscall::debug_puts(b"  [ip6_srv] ready\n");
 
     // Send Router Solicitation to discover default gateway.
     dev.send_router_solicit();
 
     // Poll-based server loop.
+    let mut tick: u64 = 0;
     loop {
         // 1. Poll IPC (netif input notifications + client requests).
         if let Some(msg) = syscall::recv_nb_msg(my_port) {
@@ -797,9 +821,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     for i in 0..8 {
                         target[8 + i] = (d1 >> (i * 8)) as u8;
                     }
-                    syscall::debug_puts(b"  [ip6_srv] ping6 ");
-                    print_ipv6(&target);
-                    syscall::debug_puts(b"\n");
                     dev.start_ping6(target, reply_port);
                 }
                 IP6_STATUS => {
@@ -815,14 +836,37 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                     syscall::send_nb_4(reply_port, IP6_STATUS_OK, a0, a1, mac_to_u64(dev.mac), 0);
                 }
+                IP6_GATEWAY => {
+                    // Return gateway link-local address (from RA).
+                    let reply_port = msg.data[0];
+                    if dev.has_gateway {
+                        let mut g0 = 0u64;
+                        let mut g1 = 0u64;
+                        for i in 0..8 {
+                            g0 |= (dev.gateway_ip6[i] as u64) << (i * 8);
+                        }
+                        for i in 0..8 {
+                            g1 |= (dev.gateway_ip6[8 + i] as u64) << (i * 8);
+                        }
+                        syscall::send_nb_4(reply_port, IP6_GATEWAY_OK, g0, g1, mac_to_u64(dev.gateway_mac), 0);
+                    } else {
+                        syscall::send_nb(reply_port, IP6_GATEWAY_NONE, 0, 0);
+                    }
+                }
                 _ => {}
             }
         }
 
         // 2. Tick timeouts.
         dev.tick_ping();
+        tick += 1;
 
-        // 3. Yield.
+        // 3. Retransmit RS periodically until gateway discovered.
+        if !dev.has_gateway && tick % 500 == 0 {
+            dev.send_router_solicit();
+        }
+
+        // 4. Yield.
         syscall::yield_now();
     }
 }

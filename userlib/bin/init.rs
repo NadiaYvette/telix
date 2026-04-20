@@ -1646,6 +1646,47 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"Phase 12 virtio-net ping: SKIPPED\n");
     }
 
+    // --- Test 11b: IPv6 ping via ip6_srv ---
+    // Target: fec0::2 (QEMU SLIRP default IPv6 host address).
+    // Uses broadcast MAC fallback since SLIRP doesn't do RS/RA.
+    syscall::debug_puts(b"  init: testing IPv6 ping6...\n");
+    {
+        let mut ip6_port_opt: Option<u64> = None;
+        for _ in 0..20 {
+            ip6_port_opt = syscall::ns_lookup(b"ip6");
+            if ip6_port_opt.is_some() { break; }
+            syscall::sleep_ms(10);
+        }
+        if let Some(ip6_port) = ip6_port_opt {
+            let ip6_reply = syscall::port_create();
+
+            // Ping fec0::2 (QEMU SLIRP IPv6 host).
+            // fec0::2 = [0xfe, 0xc0, 0,0,0,0,0,0, 0,0,0,0,0,0,0,2]
+            let target: [u8; 16] = [0xFE, 0xC0, 0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0x02];
+            let mut d0 = 0u64;
+            let mut d1 = 0u64;
+            for i in 0..8 { d0 |= (target[i] as u64) << (i * 8); }
+            for i in 0..8 { d1 |= (target[8 + i] as u64) << (i * 8); }
+            syscall::send(ip6_port, 0x6100, d0, d1, ip6_reply, 0);
+
+            let mut ping6_ok = false;
+            if let Some(pr) = syscall::recv_msg_timeout(ip6_reply, 5_000_000) {
+                if pr.tag == 0x6101 { // IP6_PING_OK
+                    ping6_ok = true;
+                }
+            }
+            if ping6_ok {
+                syscall::debug_puts(b"Phase 12b IPv6 ping6: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 12b IPv6 ping6: FAILED\n");
+            }
+
+            syscall::port_destroy(ip6_reply);
+        } else {
+            syscall::debug_puts(b"Phase 12b IPv6 ping6: SKIPPED (no ip6_srv)\n");
+        }
+    }
+
     // Spawn sshd + getty_login early (after console_srv + net_srv are up).
     // These run concurrently with remaining test phases.
     syscall::debug_puts(b"  init: spawning sshd...\n");
