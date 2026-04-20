@@ -57,6 +57,10 @@ name = "ip6_srv"
 path = "bin/ip6_srv.rs"
 
 [[bin]]
+name = "tcp4_srv"
+path = "bin/tcp4_srv.rs"
+
+[[bin]]
 name = "pipe_upper"
 path = "bin/pipe_upper.rs"
 

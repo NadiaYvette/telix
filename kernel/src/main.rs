@@ -220,6 +220,10 @@ fn startup_thread() -> ! {
             Some(tid) => println!("  ip6_srv spawned (thread {})", tid),
             None => println!("  WARNING: ip6_srv not found (ok if not yet built)"),
         }
+        match sched::spawn_user(b"tcp4_srv", 50, 20, 0) {
+            Some(tid) => println!("  tcp4_srv spawned (thread {})", tid),
+            None => println!("  WARNING: tcp4_srv not found (ok if not yet built)"),
+        }
     }
 
     // x86_64: Discover virtio devices via PCI bus scan.
@@ -247,6 +251,10 @@ fn startup_thread() -> ! {
         match sched::spawn_user(b"ip6_srv", 50, 20, 0) {
             Some(tid) => println!("  ip6_srv spawned (thread {})", tid),
             None => println!("  WARNING: ip6_srv not found (ok if not yet built)"),
+        }
+        match sched::spawn_user(b"tcp4_srv", 50, 20, 0) {
+            Some(tid) => println!("  tcp4_srv spawned (thread {})", tid),
+            None => println!("  WARNING: tcp4_srv not found (ok if not yet built)"),
         }
         // Probe BochsVBE (QEMU -vga std) and set up framebuffer info.
         arch::x86_64::pci::probe_bochs_vbe();
@@ -311,6 +319,10 @@ fn startup_thread() -> ! {
             Some(tid) => println!("  ip6_srv spawned (thread {})", tid),
             None => println!("  WARNING: ip6_srv not found (ok if not yet built)"),
         }
+        match sched::spawn_user(b"tcp4_srv", 50, 20, 0) {
+            Some(tid) => println!("  tcp4_srv spawned (thread {})", tid),
+            None => println!("  WARNING: tcp4_srv not found (ok if not yet built)"),
+        }
     }
 
     // LoongArch64: Discover virtio devices via PCI ECAM scan.
@@ -348,6 +360,10 @@ fn startup_thread() -> ! {
         match sched::spawn_user(b"ip6_srv", 50, 20, 0) {
             Some(tid) => println!("  ip6_srv spawned (thread {})", tid),
             None => println!("  WARNING: ip6_srv not found (ok if not yet built)"),
+        }
+        match sched::spawn_user(b"tcp4_srv", 50, 20, 0) {
+            Some(tid) => println!("  tcp4_srv spawned (thread {})", tid),
+            None => println!("  WARNING: tcp4_srv not found (ok if not yet built)"),
         }
     }
 

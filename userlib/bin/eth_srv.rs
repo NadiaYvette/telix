@@ -1247,10 +1247,10 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     print_ip(MY_IP);
     syscall::debug_puts(b"\n");
 
-    // Register with name server as both "eth" (new) and "net" (compat).
+    // Register with name server as "eth" (link-layer service).
+    // "net" registration is handled by tcp4_srv for backward compat.
     let port = syscall::port_create();
     syscall::ns_register(b"eth", port);
-    syscall::ns_register(b"net", port);
 
     syscall::debug_puts(b"  [eth_srv] registered on port ");
     print_num(port as u64);

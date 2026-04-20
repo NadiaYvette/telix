@@ -2088,31 +2088,41 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Wait for SEND_OK (5s timeout).
                 if let Some(sr) = syscall::recv_msg_timeout(tcp_reply, 5_000_000) {
                     if sr.tag == 0x4301 {
-                        // NET_TCP_RECV: data[0]=conn_id, data[1]=0|(reply<<16)
-                        let d1_recv = tcp_reply << 16;
-                        syscall::send(tcp_net_port, 0x4400, conn_id, d1_recv, 0, 0);
-
-                        // Wait for NET_TCP_DATA (5s timeout).
-                        if let Some(dr) = syscall::recv_msg_timeout(tcp_reply, 5_000_000) {
-                            if dr.tag == 0x4401 {
-                                let recv_len = dr.data[0] as usize;
-                                // Unpack received bytes.
-                                let mut recv_buf = [0u8; 24];
-                                let words = [dr.data[1], dr.data[2], dr.data[3]];
-                                for i in 0..recv_len.min(24) {
-                                    recv_buf[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
-                                }
-                                // Compare with sent data.
-                                if recv_len == test_str.len() && &recv_buf[..recv_len] == test_str {
-                                    tcp_ok = true;
+                        // Receive echo data — TCP may deliver in multiple
+                        // segments, so loop until we have all expected bytes.
+                        let mut recv_buf = [0u8; 24];
+                        let mut total_recv = 0usize;
+                        let mut recv_ok = true;
+                        while total_recv < test_str.len() {
+                            let d1_recv = tcp_reply << 16;
+                            syscall::send(tcp_net_port, 0x4400, conn_id, d1_recv, 0, 0);
+                            if let Some(dr) = syscall::recv_msg_timeout(tcp_reply, 5_000_000) {
+                                if dr.tag == 0x4401 {
+                                    let chunk_len = dr.data[0] as usize;
+                                    let words = [dr.data[1], dr.data[2], dr.data[3]];
+                                    for i in 0..chunk_len.min(24 - total_recv) {
+                                        recv_buf[total_recv + i] =
+                                            (words[i / 8] >> ((i % 8) * 8)) as u8;
+                                    }
+                                    total_recv += chunk_len;
                                 } else {
-                                    syscall::debug_puts(b"  init: TCP echo mismatch, got ");
-                                    print_num(recv_len as u64);
-                                    syscall::debug_puts(b" bytes\n");
+                                    recv_ok = false;
+                                    break;
                                 }
-                            } else if dr.tag == 0x44FF {
-                                syscall::debug_puts(b"  init: TCP connection closed\n");
+                            } else {
+                                recv_ok = false;
+                                break;
                             }
+                        }
+                        if recv_ok
+                            && total_recv == test_str.len()
+                            && &recv_buf[..total_recv] == test_str
+                        {
+                            tcp_ok = true;
+                        } else if !recv_ok || total_recv != test_str.len() {
+                            syscall::debug_puts(b"  init: TCP echo mismatch, got ");
+                            print_num(total_recv as u64);
+                            syscall::debug_puts(b" bytes\n");
                         }
                     }
                 }
