@@ -39,6 +39,8 @@ const SYS_PORT_SET_CREATE: u64 = 5;
 const SYS_PORT_SET_ADD: u64 = 6;
 #[allow(dead_code)]
 const SYS_PORT_SET_RECV: u64 = 22;
+const SYS_PORT_SET_REMOVE: u64 = 105;
+const SYS_PORT_SET_DESTROY: u64 = 106;
 const SYS_NSRV_PORT: u64 = 23;
 const SYS_SVC_PORT: u64 = 115;
 const SYS_SVC_REGISTER: u64 = 116;
@@ -770,6 +772,16 @@ pub fn port_set_create() -> u64 {
 /// Add a port to a port set.
 pub fn port_set_add(set_id: u32, port_id: u64) -> bool {
     unsafe { arch::syscall2(SYS_PORT_SET_ADD, set_id as u64, port_id) == 0 }
+}
+
+/// Remove a port from a port set.
+pub fn port_set_remove(set_id: u32, port_id: u64) -> bool {
+    unsafe { arch::syscall2(SYS_PORT_SET_REMOVE, set_id as u64, port_id) == 0 }
+}
+
+/// Destroy a port set, clearing membership on all member ports.
+pub fn port_set_destroy(set_id: u32) -> bool {
+    unsafe { arch::syscall1(SYS_PORT_SET_DESTROY, set_id as u64) == 0 }
 }
 
 /// Blocking receive from any port in a port set.

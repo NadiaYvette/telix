@@ -9607,6 +9607,78 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 75b: port set remove/destroy ---
+    syscall::debug_puts(b"  init: testing port set remove/destroy...\n");
+    {
+        let mut phase75b_ok = true;
+
+        let ps = syscall::port_set_create();
+        if ps == u64::MAX {
+            syscall::debug_puts(b"    FAIL: port_set_create\n");
+            phase75b_ok = false;
+        } else {
+            let ps_id = ps as u32;
+            let p1 = syscall::port_create();
+            let p2 = syscall::port_create();
+
+            if !syscall::port_set_add(ps_id, p1) || !syscall::port_set_add(ps_id, p2) {
+                syscall::debug_puts(b"    FAIL: port_set_add\n");
+                phase75b_ok = false;
+            }
+
+            if phase75b_ok {
+                // Remove p1 from the set.
+                if !syscall::port_set_remove(ps_id, p1) {
+                    syscall::debug_puts(b"    FAIL: port_set_remove\n");
+                    phase75b_ok = false;
+                }
+            }
+
+            if phase75b_ok {
+                // Removing again should fail (not in set).
+                if syscall::port_set_remove(ps_id, p1) {
+                    syscall::debug_puts(b"    FAIL: double-remove succeeded\n");
+                    phase75b_ok = false;
+                }
+            }
+
+            if phase75b_ok {
+                // Send to p2 — still in the set — recv should find it.
+                syscall::send_nb(p2, 0xCAFE, 99, 0);
+                let r = syscall::port_set_recv_timeout(ps_id, 100_000);
+                if r == u64::MAX {
+                    syscall::debug_puts(b"    FAIL: recv after remove returned MAX\n");
+                    phase75b_ok = false;
+                }
+            }
+
+            if phase75b_ok {
+                // Destroy the port set.
+                if !syscall::port_set_destroy(ps_id) {
+                    syscall::debug_puts(b"    FAIL: port_set_destroy\n");
+                    phase75b_ok = false;
+                }
+            }
+
+            if phase75b_ok {
+                // Destroying again should fail (already destroyed).
+                if syscall::port_set_destroy(ps_id) {
+                    syscall::debug_puts(b"    FAIL: double-destroy succeeded\n");
+                    phase75b_ok = false;
+                }
+            }
+
+            syscall::port_destroy(p1);
+            syscall::port_destroy(p2);
+        }
+
+        if phase75b_ok {
+            syscall::debug_puts(b"Phase 75b port set remove/destroy: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 75b port set remove/destroy: FAILED\n");
+        }
+    }
+
     // ============================================================
     // --- Phase 76: timer signals and guard pages ---
     syscall::debug_puts(b"  init: testing timer signals...\n");

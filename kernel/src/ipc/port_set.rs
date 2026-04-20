@@ -78,6 +78,48 @@ impl PortSet {
         }
     }
 
+    /// Remove a port from this set. Returns true if the port was found and removed.
+    pub fn remove(&mut self, port_id: PortId) -> bool {
+        for i in 0..self.count {
+            let pid = unsafe { *self.ports.add(i) };
+            if pid == port_id {
+                // Swap-remove: replace this slot with the last element.
+                self.count -= 1;
+                if i < self.count {
+                    unsafe {
+                        let last = *self.ports.add(self.count);
+                        *self.ports.add(i) = last;
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Destroy this set: clear port_set_id on all member ports, free backing page.
+    pub fn destroy(&mut self) {
+        // Clear membership on all member ports.
+        for i in 0..self.count {
+            let pid = unsafe { *self.ports.add(i) };
+            port::set_port_set(pid, u32::MAX);
+        }
+        // Free the backing page if allocated.
+        if !self.ports.is_null() {
+            unsafe {
+                phys::free_page(page::PhysAddr::new(self.ports as usize));
+            }
+            self.ports = core::ptr::null_mut();
+        }
+        self.count = 0;
+        self.ports_cap = 0;
+        self.active = false;
+        // Wake any blocked waiter with failure.
+        if let Some(tid) = self.waiter.take() {
+            crate::sched::wake_thread(tid);
+        }
+    }
+
     /// Try to receive a message from any port in the set (non-blocking).
     /// Returns (port_id, message) on success.
     pub fn try_recv(&self) -> Option<(PortId, Message)> {
@@ -135,6 +177,37 @@ pub fn add_port(set_id: PortSetId, port_id: PortId) -> bool {
         port::set_port_set(port_id, set_id);
     }
     ok
+}
+
+/// Remove a port from a port set. Also clears the port's set membership tag.
+pub fn remove_port(set_id: PortSetId, port_id: PortId) -> bool {
+    let ok = {
+        let mut table = PORT_SET_TABLE.lock();
+        if (set_id as usize) < table.next_id as usize
+            && table.sets.get(set_id as usize).active
+        {
+            table.sets.get_mut(set_id as usize).remove(port_id)
+        } else {
+            false
+        }
+    };
+    if ok {
+        port::set_port_set(port_id, u32::MAX);
+    }
+    ok
+}
+
+/// Destroy a port set, clearing membership on all member ports.
+pub fn destroy(set_id: PortSetId) -> bool {
+    let mut table = PORT_SET_TABLE.lock();
+    if (set_id as usize) < table.next_id as usize
+        && table.sets.get(set_id as usize).active
+    {
+        table.sets.get_mut(set_id as usize).destroy();
+        true
+    } else {
+        false
+    }
 }
 
 /// Try to receive from any port in a set (non-blocking).

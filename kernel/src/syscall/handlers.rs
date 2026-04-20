@@ -110,6 +110,8 @@ pub const SYS_FUTEX_WAIT_PI: u64 = 101;
 pub const SYS_FUTEX_WAKE_PI: u64 = 102;
 pub const SYS_PAGE_SIZE: u64 = 103;
 pub const SYS_PORT_RECV_TIMEOUT: u64 = 104;
+pub const SYS_PORT_SET_REMOVE: u64 = 105;
+pub const SYS_PORT_SET_DESTROY: u64 = 106;
 pub const SYS_SCHED_SETATTR: u64 = 114;
 pub const SYS_SVC_PORT: u64 = 115; // legacy — kept for compat, routes to svc_lookup
 pub const SYS_SVC_REGISTER: u64 = 116;
@@ -288,6 +290,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_RECV => sys_recv(a0, frame),
         SYS_PORT_SET_CREATE => sys_port_set_create(),
         SYS_PORT_SET_ADD => sys_port_set_add(a0, a1),
+        SYS_PORT_SET_REMOVE => sys_port_set_remove(a0, a1),
+        SYS_PORT_SET_DESTROY => sys_port_set_destroy(a0),
         SYS_YIELD => sys_yield(),
         SYS_THREAD_ID => sys_thread_id(),
         SYS_SEND_NB => sys_send_nb(a0, a1, [a2, a3, a4, a5, 0, 0]),
@@ -1364,6 +1368,22 @@ fn sys_port_set_add(set_id: u64, port_id: u64) -> u64 {
         return ECAP;
     }
     if crate::ipc::port_set::add_port(set_id as u32, port_id) {
+        0
+    } else {
+        1
+    }
+}
+
+fn sys_port_set_remove(set_id: u64, port_id: u64) -> u64 {
+    if crate::ipc::port_set::remove_port(set_id as u32, port_id) {
+        0
+    } else {
+        1
+    }
+}
+
+fn sys_port_set_destroy(set_id: u64) -> u64 {
+    if crate::ipc::port_set::destroy(set_id as u32) {
         0
     } else {
         1
