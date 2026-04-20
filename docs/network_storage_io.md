@@ -16,7 +16,16 @@ The network stack decomposes into layered servers, each communicating via standa
 
 An **Ethernet server** handles MAC addressing, VLAN tagging (802.1Q), and frame demultiplexing by EtherType. It receives raw frames from NIC drivers, strips/adds Ethernet headers, and delivers payloads to the appropriate network layer server based on EtherType (0x0800 → IPv4, 0x86DD → IPv6, 0x0806 → ARP, 0x8914 → FCoE, etc.).
 
-For non-Ethernet link types, equivalent link layer servers fill the same structural role: an **InfiniBand link server** handles IB packet framing, a **Fibre Channel link server** (FC-0/FC-1/FC-2) handles FC frame encoding and ordered sets, a **Wi-Fi server** handles 802.11 frame management and association state. Each presents the same upward interface: deliver typed payloads to network layer servers.
+For non-Ethernet link types, equivalent link layer servers fill the same structural role:
+
+- An **InfiniBand link server** handles IB packet framing.
+- A **Fibre Channel link server** (FC-0/FC-1/FC-2) handles FC frame encoding and ordered sets.
+- A **Wi-Fi (802.11) server** handles frame management, association/authentication state (WPA2/WPA3), power management, and rate adaptation. Structurally it is an Ethernet-like link with additional state machines (scan, associate, 4-way handshake). Presents the same upward interface (typed payloads keyed by EtherType) once association is established. *Testability: requires `mac80211_hwsim` kernel module in host or real hardware; not practically emulable in stock QEMU.*
+- A **PPP/PPPoE server** handles the Point-to-Point Protocol framing (LCP negotiation, authentication via PAP/CHAP, NCP for IPCP/IPv6CP) and optionally PPPoE session encapsulation over Ethernet. PPP wraps a serial or Ethernet link into a point-to-point IP channel; the IP server above sees a normal link interface. PPPoE adds Ethernet discovery (PADI/PADO/PADR/PADS) before the PPP session. *Testability: a host-side `pppd` instance over a QEMU serial port could validate PPP framing; PPPoE could be tested with a host bridge and `rp-pppoe`. Prototype-feasible without dedicated hardware.*
+- A **cellular modem server** (e.g., FiboCom L350, MediaTek T700) handles AT command initialization, PDP context activation (3GPP), and data-plane framing over USB or PCIe. The control plane uses AT commands or QMI/MBIM protocols; the data plane is typically a PPP session or a raw IP pipe over a USB NCM/ECM endpoint. Presents the same link interface to the IP server once the bearer is established. *Testability: not emulable in QEMU; implementation deferred to real hardware availability. Prototype code can define the IPC protocol and state machines without a live modem.*
+- A **B.A.T.M.A.N. (Better Approach To Mobile Ad-hoc Networking) server** implements a Layer 2 mesh routing overlay. It sits between the Ethernet server (or Wi-Fi server) and the IP server as a virtual link layer — encapsulating Ethernet frames in mesh routing headers (OGM protocol for topology discovery, unicast/broadcast forwarding via multi-hop relay). The IP server above sees a flat L2 network regardless of mesh topology changes. *Testability: multiple QEMU instances with tap/bridge networking can form a mesh; alternatively, loopback testing of the routing protocol state machine without real multi-hop topology. Prototype-feasible.*
+
+Each presents the same upward interface: deliver typed payloads to network layer servers.
 
 ### Network Layer
 
@@ -47,6 +56,22 @@ Each transport protocol is a separate server:
 SCTP's properties make it a particularly natural fit for Telix's I/O model. Its message orientation avoids the framing problem that TCP imposes on message-based protocols.
 
 **RDMA server:** Manages RDMA queue pairs for protocols that use RDMA transport (NVMe/RDMA, iSER for iSCSI over RDMA, user-level RDMA applications). RDMA's performance model depends on kernel bypass and zero-copy from userspace directly to network hardware. See §RDMA Considerations below for the implications.
+
+### POSIX Socket Compatibility Layer
+
+The BSD socket API (`socket`/`bind`/`connect`/`accept`/`send`/`recv`/`shutdown`) is a userspace library that translates POSIX calling conventions into native IPC messages to transport servers. This layer is architecturally significant because it is where the unified async model meets legacy application expectations:
+
+- `socket(AF_INET6, SOCK_STREAM, 0)` → allocates an FD entry pointing at the TCP6 server port
+- `connect(fd, addr, len)` → sends `TCP6_CONNECT` message to ip6_srv, blocks on reply port
+- `send(fd, buf, len, 0)` → sends `TCP6_SEND` message with data packed in IPC words
+- `recv(fd, buf, len, 0)` → sends `TCP6_RECV` message, receives `TCP6_DATA` response
+- `poll(fds, nfds, timeout)` → sends typed `*_POLL` messages to each fd's server
+
+The FD table maps integer file descriptors to `(server_port, server_handle)` tuples. A socket fd and a file fd are structurally identical — both route messages to a server that owns the state. This is the concrete realisation of the unified I/O model's claim that file I/O and network I/O are not architecturally distinct.
+
+For Linux binary compatibility, the personality server (`linux_srv`) intercepts socket syscalls (numbers 41–55) and translates them to native Telix IPC. Simple syscalls (read/write on an established connection) can use a kernel-resident fast-path translation table; complex syscalls (socket creation, connect with address parsing) use IPC to the personality server.
+
+Port sets provide the native multiplexing primitive. `select`/`poll`/`epoll` are implemented atop port sets: the kernel can wait for messages on any port in the set, replacing the fd-readiness model with a message-arrival model. This eliminates the thundering-herd and level-triggered-wakeup problems that plague `epoll` implementations because the native model is inherently edge-triggered (a message either arrived or it didn't).
 
 ### Application Layer Protocols
 
@@ -182,13 +207,92 @@ A generic block device consumer (the cache server) does not configure transport 
 
 This separation is clean: the block device interface carries data, and transport configuration flows through a separate administrative path.
 
+## Port-Referenced Port Sets
+
+Port sets are the IPC multiplexing primitive that replaces `select`/`poll`/`epoll`. A port set allows a thread to block until a message arrives on any port in the set. The current implementation uses numeric IDs; the target architecture makes port sets port-referenced, completing the "everything is a port" principle.
+
+### Design
+
+A port set IS a port. Creating a port set returns a port capability. The set is managed entirely via messages sent to that port:
+
+- **Add member:** Send an `ADD_PORT` message to the set port, carrying the member port capability in the message. The kernel tags the member with the set's identity.
+- **Remove member:** Send a `REMOVE_PORT` message to the set port.
+- **Receive:** Call `recv_msg()` on the set port. The kernel drains member ports and delivers the first available message, blocking if none are ready. The returned message includes the originating member port ID so the receiver knows which source produced it.
+- **Destroy:** Destroy the set port capability (standard port destruction). All members are untagged.
+
+This is fully message-based: no dedicated port-set syscalls exist. The kernel recognises set-typed ports internally and routes `recv` through the aggregation logic, but from userspace the interface is uniform `send`/`recv` on port capabilities.
+
+### Why Port-Referenced
+
+1. **Capability protection:** Access to a port set is governed by the same capability model as all other resources. No numeric-ID guessing; revocation works naturally.
+2. **Transferability:** A port set capability can be passed between processes. A supervisor can create a poll set and hand it to a worker, or a parent can bequeath an epoll instance across exec.
+3. **Composability:** Since a port set is a port, it can be a member of another port set. Hierarchical multiplexing (a set of sets) is free.
+4. **Clustering:** Port capabilities already carry node-origin bits for distributed IPC. Port-referenced sets inherit this — a set can aggregate ports across nodes without a new mechanism.
+5. **Interface uniformity:** "Wait for one thing" (`recv_msg(port)`) and "wait for many things" (`recv_msg(set_port)`) are the same operation on different objects. No API bifurcation.
+
+### Required Kernel Changes
+
+The current port set implementation (kernel/src/ipc/port_set.rs) needs:
+
+- **Port removal from set** — currently impossible; needed for `epoll_ctl(DEL)` and dynamic subscription changes.
+- **Port set destruction** — exists in kernel code but not exposed as syscall; must clean up member tags on destroy.
+- **Multiple waiters** — current single-waiter field is insufficient for multi-reader patterns (e.g., thread pool draining a shared work queue). Needs a waiter list or turnstile.
+- **Multi-set membership** — a port should be able to belong to more than one set simultaneously (the atomic u32 tag must become a list or the tagging model must change). Required for patterns where multiple epoll instances watch overlapping fd sets.
+- **Port-capability-based interface** — replace u32 set IDs with port capabilities; retire `SYS_PORT_SET_CREATE`/`SYS_PORT_SET_ADD`/`SYS_PORT_SET_RECV` in favour of messages to a set-typed port and standard `recv_msg`.
+
+### Interaction with poll/select/epoll
+
+Once port sets are port-referenced:
+
+- `epoll_create1()` → create a port set (returns fd mapped to set port capability)
+- `epoll_ctl(ADD)` → send `ADD_PORT` message to set port with the target fd's notify port
+- `epoll_ctl(DEL)` → send `REMOVE_PORT` message to set port
+- `epoll_wait()` → `recv_msg(set_port)` with timeout; kernel drains members
+- `poll()`/`select()` → create ephemeral set, add fds' ports, recv with timeout, destroy set. Or: convert poll() to use port sets internally rather than busy-loop RPC (eliminates the current yield-loop inefficiency).
+
+The current `poll()` implementation busy-loops sending per-fd `POLL_CHECK` RPCs and yielding — this is O(n) per iteration, creates/destroys reply ports per call, and burns CPU. Port-set-based poll eliminates all of this: block once on the set, wake on first message arrival from any member.
+
 ## Development Phasing
 
-**Phase 3 (I/O Server Stack):** Minimal network stack (Ethernet server, IPv4/IPv6 server, TCP server, UDP server) sufficient for basic network connectivity. Local block device drivers (NVMe/virtio-blk) via the block device interface. No storage-over-network protocols yet.
+**Phase 3 (I/O Server Stack):** Minimal network stack sufficient for basic network connectivity:
+- Ethernet server (eth_srv) — done
+- IPv4 + ICMP + TCP (tcp4_srv) — done
+- IPv6 + ICMPv6 + NDP/SLAAC + TCP6 (ip6_srv) — done
+- UDP server (datagram demux, DNS/DHCP support) — next
+- Socket compatibility layer wired to TCP6 (AF_INET6 in socket.c) — next
+- Local block device drivers (NVMe/virtio-blk) via block device interface — done
 
-**Phase 4 (Completeness):** SCTP server. iSCSI initiator server (first storage-over-network protocol — demonstrates the unified I/O model's block/network convergence). Multipath server. Network configuration daemon.
+**Phase 3b (Port Set Completion):** Required for correct network server behaviour:
+- Port removal from set (enables epoll_ctl DEL, connection teardown)
+- Port set destruction + cleanup of member tags (prevents resource leaks)
+- Convert poll() from busy-loop RPC to port-set-based blocking (eliminates CPU waste in SSH, proxy, and any poll()-using server)
+- Multiple waiters per set (enables thread-pool patterns for high-connection-count servers)
+- Multi-set membership for ports (enables overlapping epoll instances)
 
-**Future work:** NVMe-oF initiator (TCP and RDMA transports). Fibre Channel stack (requires FC HBA hardware or emulation). FCoE. AoE. Full zero-copy NIC-to-page-cache path. RDMA verbs server.
+**Phase 3c (Port-Referenced Port Sets):** Unify port sets into the capability model:
+- Port sets become ports (set-typed); creation returns a port capability
+- Management via messages to the set port: ADD_PORT, REMOVE_PORT
+- Receive from set via standard recv_msg on set port capability
+- Retire SYS_PORT_SET_CREATE / SYS_PORT_SET_ADD / SYS_PORT_SET_RECV syscalls
+- Update epoll, poll, select to use new interface
+- Node-bit propagation for future distributed port set aggregation (clustering)
+
+**Phase 4 (Protocol Completeness):**
+- SCTP server (message-oriented transport, multi-homing). *Testable via loopback; QEMU SLIRP does not speak SCTP.*
+- iSCSI initiator server (first storage-over-network protocol — demonstrates block/network convergence).
+- Multipath server.
+- Network configuration daemon.
+- PPP/PPPoE server. *Testable with host-side pppd over QEMU serial port.*
+- B.A.T.M.A.N. mesh overlay. *Testable with multi-QEMU tap/bridge topology or loopback state machine testing.*
+
+**Future work (real hardware required or deferred):**
+- NVMe-oF initiator (TCP and RDMA transports).
+- Fibre Channel stack (requires FC HBA hardware or emulation). FCoE. AoE.
+- Full zero-copy NIC-to-page-cache path. RDMA verbs server.
+- Wi-Fi (802.11) server. *Requires mac80211_hwsim or real Wi-Fi hardware; not QEMU-emulable.*
+- Cellular modem server (FiboCom/MediaTek QMI/MBIM). *Requires real modem hardware; IPC protocol and state machines can be prototyped without a live bearer.*
+
+**Prototype-without-test policy:** For protocols not testable in QEMU (802.11, cellular), implementation may proceed as prototype code that defines the IPC protocol, state machines, and structural integration, clearly marked as untested against real hardware. This allows the architectural interfaces to be validated by inspection and the code to be exercised immediately once hardware becomes available, without requiring a second design pass.
 
 ## Summary
 
