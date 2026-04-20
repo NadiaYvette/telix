@@ -49,6 +49,14 @@ name = "net_srv"
 path = "bin/net_srv.rs"
 
 [[bin]]
+name = "eth_srv"
+path = "bin/eth_srv.rs"
+
+[[bin]]
+name = "ip6_srv"
+path = "bin/ip6_srv.rs"
+
+[[bin]]
 name = "pipe_upper"
 path = "bin/pipe_upper.rs"
 

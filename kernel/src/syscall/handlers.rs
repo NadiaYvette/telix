@@ -1635,10 +1635,13 @@ fn sys_grant_pages(dst_port: u64, src_va: u64, dst_va: u64, page_count: u64, rea
     if my_aspace == 0 {
         return u64::MAX;
     }
-    // Resolve destination task port to its aspace_id.
+    // Resolve destination task port (or service port) to its aspace_id.
     let dst_task = match resolve_task_port(dst_port) {
         Some(t) => t,
-        None => return u64::MAX,
+        None => match crate::ipc::port::port_creator(dst_port) {
+            Some(t) if t != 0 => t,
+            _ => return u64::MAX,
+        },
     };
     let dst_aspace = crate::sched::scheduler::task_ref(dst_task).aspace_id;
     // page_count from userspace is in MMU pages (matching mmap_anon convention).

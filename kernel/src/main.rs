@@ -201,19 +201,24 @@ fn startup_thread() -> ! {
     if let Some(base) = drivers::virtio_mmio::find_device(drivers::virtio_mmio::DEVICE_NET) {
         let irq = drivers::virtio_mmio::device_irq(base) as u64;
         let region_id = cap::mmio::register_region(base, 0x1000, cap::mmio::CacheAttr::Device);
-        // Note: net_srv is poll-based, so no irq_dispatch::register here.
+        // Note: eth_srv is poll-based, so no irq_dispatch::register here.
         let arg0_upper = irq << 48;
         println!(
-            "  virtio-net at {:#x}, irq {}, region_id={:?}, spawning net_srv",
+            "  virtio-net at {:#x}, irq {}, region_id={:?}, spawning eth_srv",
             base, irq, region_id
         );
         let spawned = match region_id {
-            Some(rid) => sched::spawn_user_with_mmio_cap(b"net_srv", 50, 20, arg0_upper, rid),
-            None => sched::spawn_user(b"net_srv", 50, 20, (base as u64) | arg0_upper),
+            Some(rid) => sched::spawn_user_with_mmio_cap(b"eth_srv", 50, 20, arg0_upper, rid),
+            None => sched::spawn_user(b"eth_srv", 50, 20, (base as u64) | arg0_upper),
         };
         match spawned {
-            Some(tid) => println!("  net_srv spawned (thread {})", tid),
-            None => println!("  WARNING: net_srv not found (ok if not yet built)"),
+            Some(tid) => println!("  eth_srv spawned (thread {})", tid),
+            None => println!("  WARNING: eth_srv not found (ok if not yet built)"),
+        }
+        // ip6_srv is a pure IPC server — no device access needed, just spawn it.
+        match sched::spawn_user(b"ip6_srv", 50, 20, 0) {
+            Some(tid) => println!("  ip6_srv spawned (thread {})", tid),
+            None => println!("  WARNING: ip6_srv not found (ok if not yet built)"),
         }
     }
 
@@ -229,15 +234,19 @@ fn startup_thread() -> ! {
             }
         }
         if let Some(dev) = arch::x86_64::pci::find_virtio_device(0x1000) {
-            // net_srv is poll-based, but its device may share a PCI IRQ line
+            // eth_srv is poll-based, but its device may share a PCI IRQ line
             // with blk_srv. Register the MMIO base so the kernel's IRQ handler
             // can ACK the net device and deassert the level-triggered line.
             io::irq_dispatch::register(dev.irq as u32, dev.bar0 as usize);
             let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
-            match sched::spawn_user(b"net_srv", 50, 20, arg0) {
-                Some(tid) => println!("  net_srv spawned (thread {})", tid),
-                None => println!("  WARNING: net_srv not found (ok if not yet built)"),
+            match sched::spawn_user(b"eth_srv", 50, 20, arg0) {
+                Some(tid) => println!("  eth_srv spawned (thread {})", tid),
+                None => println!("  WARNING: eth_srv not found (ok if not yet built)"),
             }
+        }
+        match sched::spawn_user(b"ip6_srv", 50, 20, 0) {
+            Some(tid) => println!("  ip6_srv spawned (thread {})", tid),
+            None => println!("  WARNING: ip6_srv not found (ok if not yet built)"),
         }
         // Probe BochsVBE (QEMU -vga std) and set up framebuffer info.
         arch::x86_64::pci::probe_bochs_vbe();
@@ -293,10 +302,14 @@ fn startup_thread() -> ! {
         }
         if let Some(dev) = arch::mips64::pci::find_virtio_device(0x1000) {
             let arg0 = (dev.bar0 as u64) | ((dev.irq as u64) << 48);
-            match sched::spawn_user(b"net_srv", 50, 20, arg0) {
-                Some(tid) => println!("  net_srv spawned (thread {})", tid),
-                None => println!("  WARNING: net_srv not found (ok if not yet built)"),
+            match sched::spawn_user(b"eth_srv", 50, 20, arg0) {
+                Some(tid) => println!("  eth_srv spawned (thread {})", tid),
+                None => println!("  WARNING: eth_srv not found (ok if not yet built)"),
             }
+        }
+        match sched::spawn_user(b"ip6_srv", 50, 20, 0) {
+            Some(tid) => println!("  ip6_srv spawned (thread {})", tid),
+            None => println!("  WARNING: ip6_srv not found (ok if not yet built)"),
         }
     }
 
@@ -324,13 +337,17 @@ fn startup_thread() -> ! {
                 cap::mmio::register_region(dev.bar0, 0x1000, cap::mmio::CacheAttr::Device);
             let arg0_upper = (dev.irq as u64) << 48;
             let spawned = match region_id {
-                Some(rid) => sched::spawn_user_with_mmio_cap(b"net_srv", 50, 20, arg0_upper, rid),
-                None => sched::spawn_user(b"net_srv", 50, 20, (dev.bar0 as u64) | arg0_upper),
+                Some(rid) => sched::spawn_user_with_mmio_cap(b"eth_srv", 50, 20, arg0_upper, rid),
+                None => sched::spawn_user(b"eth_srv", 50, 20, (dev.bar0 as u64) | arg0_upper),
             };
             match spawned {
-                Some(tid) => println!("  net_srv spawned (thread {})", tid),
-                None => println!("  WARNING: net_srv not found (ok if not yet built)"),
+                Some(tid) => println!("  eth_srv spawned (thread {})", tid),
+                None => println!("  WARNING: eth_srv not found (ok if not yet built)"),
             }
+        }
+        match sched::spawn_user(b"ip6_srv", 50, 20, 0) {
+            Some(tid) => println!("  ip6_srv spawned (thread {})", tid),
+            None => println!("  WARNING: ip6_srv not found (ok if not yet built)"),
         }
     }
 
