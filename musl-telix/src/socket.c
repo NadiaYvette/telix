@@ -147,6 +147,20 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     if (fde->domain == AF_INET) {
         const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
         uint16_t port = my_ntohs(sin->sin_port);
+
+        if (fde->sock_type == SOCK_DGRAM) {
+            /* NET_UDP_BIND: data[0] = port(low16) | reply_port(high48) */
+            uint32_t rp = telix_port_create();
+            uint64_t d0 = (uint64_t)port | ((uint64_t)rp << 16);
+            telix_send(fde->server_port, NET_UDP_BIND, d0, 0, 0, 0);
+            struct telix_msg reply;
+            int ok = telix_recv_msg(rp, &reply);
+            telix_port_destroy(rp);
+            if (ok != 0 || reply.tag != NET_UDP_BIND_OK) return -1;
+            fde->server_handle = (uint32_t)reply.data[0]; /* bind_id */
+            return 0;
+        }
+
         struct telix_msg reply;
         int ok = ipc_request(fde->server_port, NET_TCP_BIND,
                              (uint64_t)port, 0, 0, 0, &reply);
@@ -295,6 +309,14 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
         uint32_t ip_be = sin->sin_addr;
         uint16_t port = my_ntohs(sin->sin_port);
 
+        if (fde->sock_type == SOCK_DGRAM) {
+            /* UDP4: "connect" stores peer addr for send(). */
+            fde->file_offset = (uint64_t)ip_be;
+            fde->file_size = 0;
+            fde->fs_aspace = port;
+            return 0;
+        }
+
         uint32_t rp = telix_port_create();
         uint64_t d1 = (uint64_t)port | ((uint64_t)rp << 16);
         telix_send(fde->server_port, NET_TCP_CONNECT, (uint64_t)ip_be, d1, 0, 0);
@@ -366,7 +388,7 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
     struct telix_fd_entry *fde = telix_fd_get(sockfd);
     if (!fde || fde->fd_type != FD_TYPE_SOCKET) return -1;
 
-    if (fde->domain == AF_INET) {
+    if (fde->domain == AF_INET && fde->sock_type == SOCK_STREAM) {
         const unsigned char *p = (const unsigned char *)buf;
         size_t remaining = len;
         size_t total = 0;
@@ -393,6 +415,34 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
             remaining -= chunk;
         }
         return (ssize_t)total;
+    }
+
+    if (fde->domain == AF_INET && fde->sock_type == SOCK_DGRAM) {
+        /* Connected UDP4: send to stored peer address.
+         * NET_UDP_SEND: data[0]=dst_ip(32)|dst_port(16)|bind_id(16)
+         *               data[1]=reply_port(32)|payload_len(8)
+         *               data[2..3]=payload (up to 16 bytes) */
+        uint32_t ip_be = (uint32_t)fde->file_offset;
+        uint16_t port = (uint16_t)fde->fs_aspace;
+        uint32_t bind_id = fde->server_handle;
+
+        const unsigned char *p = (const unsigned char *)buf;
+        int chunk = (len > 16) ? 16 : (int)len;
+
+        uint32_t rp = telix_port_create();
+        uint64_t d0 = (uint64_t)ip_be
+            | ((uint64_t)port << 32)
+            | ((uint64_t)(bind_id & 0xFFFF) << 48);
+        uint64_t d1 = (uint64_t)rp | ((uint64_t)chunk << 32);
+        uint64_t w0 = 0, w1 = 0;
+        pack16(p, chunk, &w0, &w1);
+
+        telix_send(fde->server_port, NET_UDP_SEND, d0, d1, w0, w1);
+        struct telix_msg reply;
+        int ok = telix_recv_msg(rp, &reply);
+        telix_port_destroy(rp);
+        if (ok != 0 || reply.tag != NET_UDP_SEND_OK) return -1;
+        return (ssize_t)chunk;
     }
 
     if (fde->domain == AF_INET6 && fde->sock_type == SOCK_STREAM) {
@@ -485,7 +535,7 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
     struct telix_fd_entry *fde = telix_fd_get(sockfd);
     if (!fde || fde->fd_type != FD_TYPE_SOCKET) return -1;
 
-    if (fde->domain == AF_INET) {
+    if (fde->domain == AF_INET && fde->sock_type == SOCK_STREAM) {
         uint32_t rp = telix_port_create();
         uint64_t d0 = (uint64_t)fde->server_handle;
         uint64_t d1 = ((uint64_t)rp << 16);
@@ -504,6 +554,27 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
         unpack24(reply.data[1], reply.data[2], reply.data[3],
                  (unsigned char *)buf, n);
         return (ssize_t)n;
+    }
+
+    if (fde->domain == AF_INET && fde->sock_type == SOCK_DGRAM) {
+        /* NET_UDP_RECV: data[0]=bind_id|reply_port<<32 */
+        uint32_t rp = telix_port_create();
+        uint64_t d0 = (uint64_t)fde->server_handle | ((uint64_t)rp << 32);
+        telix_send(fde->server_port, NET_UDP_RECV, d0, 0, 0, 0);
+
+        struct telix_msg reply;
+        int ok = telix_recv_msg(rp, &reply);
+        telix_port_destroy(rp);
+        if (ok != 0) return -1;
+        if (reply.tag == NET_UDP_RECV_NONE) return 0;
+        if (reply.tag != NET_UDP_DATA) return -1;
+
+        /* NET_UDP_DATA: data[0]=plen|(src_port<<16), data[1]=src_ip, data[2..3]=payload */
+        int plen = (int)(reply.data[0] & 0xFFFF);
+        if (plen > 16) plen = 16;
+        if (plen > (int)len) plen = (int)len;
+        unpack16(reply.data[2], reply.data[3], (unsigned char *)buf, plen);
+        return (ssize_t)plen;
     }
 
     if (fde->domain == AF_INET6 && fde->sock_type == SOCK_STREAM) {
@@ -580,6 +651,31 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
     if (fde->sock_type == SOCK_STREAM || dest_addr == 0)
         return send(sockfd, buf, len, flags);
 
+    if (fde->domain == AF_INET && fde->sock_type == SOCK_DGRAM) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)dest_addr;
+        uint32_t ip_be = sin->sin_addr;
+        uint16_t port = my_ntohs(sin->sin_port);
+        uint32_t bind_id = fde->server_handle;
+
+        const unsigned char *p = (const unsigned char *)buf;
+        int chunk = (len > 16) ? 16 : (int)len;
+
+        uint32_t rp = telix_port_create();
+        uint64_t d0 = (uint64_t)ip_be
+            | ((uint64_t)port << 32)
+            | ((uint64_t)(bind_id & 0xFFFF) << 48);
+        uint64_t d1 = (uint64_t)rp | ((uint64_t)chunk << 32);
+        uint64_t w0 = 0, w1 = 0;
+        pack16(p, chunk, &w0, &w1);
+
+        telix_send(fde->server_port, NET_UDP_SEND, d0, d1, w0, w1);
+        struct telix_msg reply;
+        int ok = telix_recv_msg(rp, &reply);
+        telix_port_destroy(rp);
+        if (ok != 0 || reply.tag != NET_UDP_SEND_OK) return -1;
+        return (ssize_t)chunk;
+    }
+
     if (fde->domain == AF_INET6 && fde->sock_type == SOCK_DGRAM) {
         const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)dest_addr;
         uint16_t port = my_ntohs(sin6->sin6_port);
@@ -620,6 +716,38 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
     /* For SOCK_STREAM or when src_addr is NULL, fall back to recv(). */
     if (fde->sock_type == SOCK_STREAM)
         return recv(sockfd, buf, len, flags);
+
+    if (fde->domain == AF_INET && fde->sock_type == SOCK_DGRAM) {
+        /* NET_UDP_RECV: data[0]=bind_id|reply_port<<32 */
+        uint32_t rp = telix_port_create();
+        uint64_t d0 = (uint64_t)fde->server_handle | ((uint64_t)rp << 32);
+        telix_send(fde->server_port, NET_UDP_RECV, d0, 0, 0, 0);
+
+        struct telix_msg reply;
+        int ok = telix_recv_msg(rp, &reply);
+        telix_port_destroy(rp);
+        if (ok != 0) return -1;
+        if (reply.tag == NET_UDP_RECV_NONE) return 0;
+        if (reply.tag != NET_UDP_DATA) return -1;
+
+        /* NET_UDP_DATA: data[0]=plen|(src_port<<16), data[1]=src_ip(low32),
+         * data[2..3]=payload (up to 16 bytes) */
+        int plen = (int)(reply.data[0] & 0xFFFF);
+        uint16_t src_port = (uint16_t)(reply.data[0] >> 16);
+        if (plen > 16) plen = 16;
+        if (plen > (int)len) plen = (int)len;
+        unpack16(reply.data[2], reply.data[3], (unsigned char *)buf, plen);
+
+        /* Fill in source address if requested. */
+        if (src_addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)src_addr;
+            sin->sin_family = AF_INET;
+            sin->sin_port = my_ntohs(src_port);
+            sin->sin_addr = (uint32_t)reply.data[1];
+            *addrlen = sizeof(struct sockaddr_in);
+        }
+        return (ssize_t)plen;
+    }
 
     if (fde->domain == AF_INET6 && fde->sock_type == SOCK_DGRAM) {
         /* UDP6_RECV: data[0]=bind_id|reply_port<<32 */
@@ -669,7 +797,7 @@ ssize_t recv_nb(int sockfd, void *buf, size_t len) {
     struct telix_fd_entry *fde = telix_fd_get(sockfd);
     if (!fde || fde->fd_type != FD_TYPE_SOCKET) return -1;
 
-    if (fde->domain == AF_INET) {
+    if (fde->domain == AF_INET && fde->sock_type == SOCK_STREAM) {
         uint32_t rp = telix_port_create();
         uint64_t d0 = (uint64_t)fde->server_handle;
         uint64_t d1 = ((uint64_t)rp << 16);
@@ -726,8 +854,14 @@ int shutdown(int sockfd, int how) {
 
     if (fde->domain == AF_INET) {
         uint32_t rp = telix_port_create();
-        telix_send(fde->server_port, NET_TCP_CLOSE,
-                   (uint64_t)fde->server_handle, (uint64_t)rp, 0, 0);
+        if (fde->sock_type == SOCK_DGRAM) {
+            /* NET_UDP_CLOSE: data[0]=bind_id|reply_port<<32 */
+            uint64_t d0 = (uint64_t)fde->server_handle | ((uint64_t)rp << 32);
+            telix_send(fde->server_port, NET_UDP_CLOSE, d0, 0, 0, 0);
+        } else {
+            telix_send(fde->server_port, NET_TCP_CLOSE,
+                       (uint64_t)fde->server_handle, (uint64_t)rp, 0, 0);
+        }
         struct telix_msg reply;
         telix_recv_msg(rp, &reply);
         telix_port_destroy(rp);

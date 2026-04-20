@@ -69,6 +69,20 @@ const NET_TCP_ACCEPT_FAIL: u64 = 0x47FE;
 const NET_TCP_RECV_NB: u64 = 0x4410;
 const NET_TCP_RECV_NONE: u64 = 0x4412;
 
+// --- UDP4 IPC tags ---
+const NET_UDP_BIND: u64 = 0x4900;
+const NET_UDP_BIND_OK: u64 = 0x4901;
+const NET_UDP_BIND_FAIL: u64 = 0x49FF;
+const NET_UDP_SEND: u64 = 0x4A00;
+const NET_UDP_SEND_OK: u64 = 0x4A01;
+const NET_UDP_SEND_FAIL: u64 = 0x4AFF;
+const NET_UDP_RECV: u64 = 0x4B00;
+const NET_UDP_DATA: u64 = 0x4B01;
+const NET_UDP_RECV_NB: u64 = 0x4B10;
+const NET_UDP_RECV_NONE: u64 = 0x4B12;
+const NET_UDP_CLOSE: u64 = 0x4C00;
+const NET_UDP_CLOSE_OK: u64 = 0x4C01;
+
 // --- TCP flags ---
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
@@ -93,6 +107,9 @@ const TCP_RX_BUF_SIZE: usize = 2048;
 const TCP_TIMEOUT: u32 = 10000;
 const TCP_TIME_WAIT_TIMEOUT: u32 = 5000;
 const PING_TIMEOUT: u32 = 5000;
+
+const MAX_UDP4_BINDS: usize = 8;
+const UDP4_RX_BUF_SIZE: usize = 512;
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
 
@@ -186,6 +203,34 @@ impl TcpConn {
 }
 
 // ---------------------------------------------------------------
+// UDP4 binding
+// ---------------------------------------------------------------
+
+struct Udp4Binding {
+    active: bool,
+    local_port: u16,
+    recv_reply_port: u64,   // pending recv caller (0 = none)
+    rx_buf: [u8; UDP4_RX_BUF_SIZE],
+    rx_len: usize,
+    rx_src_ip: [u8; 4],
+    rx_src_port: u16,
+}
+
+impl Udp4Binding {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            local_port: 0,
+            recv_reply_port: 0,
+            rx_buf: [0; UDP4_RX_BUF_SIZE],
+            rx_len: 0,
+            rx_src_ip: [0; 4],
+            rx_src_port: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // IPv4 device atop eth_srv
 // ---------------------------------------------------------------
 
@@ -222,6 +267,9 @@ struct Tcp4Dev {
     dns_reply_port: u64,
     dns_txid: u16,
     dns_polls: u32,
+
+    // UDP4 state.
+    udp4: [Udp4Binding; MAX_UDP4_BINDS],
 }
 
 impl Tcp4Dev {
@@ -249,6 +297,7 @@ impl Tcp4Dev {
             dns_reply_port: 0,
             dns_txid: 0,
             dns_polls: 0,
+            udp4: [const { Udp4Binding::new() }; MAX_UDP4_BINDS],
         }
     }
 
@@ -440,18 +489,47 @@ impl Tcp4Dev {
     // DNS resolver (UDP to 10.0.2.3:53)
     // ---------------------------------------------------------------
 
-    /// Handle incoming UDP packet — only used for DNS responses.
-    fn handle_udp_rx(&mut self, _src_ip: [u8; 4], data: &[u8]) {
+    /// Handle incoming UDP packet — dispatches to DNS resolver or UDP4 bindings.
+    fn handle_udp_rx(&mut self, src_ip: [u8; 4], data: &[u8]) {
         if data.len() < 8 {
             return;
         }
+        let src_port = get_u16_be(data, 0);
         let dst_port = get_u16_be(data, 2);
-        if dst_port != DNS_LOCAL_PORT || !self.dns_active {
+        let udp_len = get_u16_be(data, 4) as usize;
+        let payload = if udp_len > 8 && udp_len <= data.len() {
+            &data[8..udp_len]
+        } else if data.len() > 8 {
+            &data[8..]
+        } else {
+            return;
+        };
+
+        // DNS response handler (legacy, internal).
+        if dst_port == DNS_LOCAL_PORT && self.dns_active {
+            self.handle_dns_response(payload);
             return;
         }
-        // UDP payload starts at offset 8.
-        let payload = &data[8..];
-        self.handle_dns_response(payload);
+
+        // Dispatch to UDP4 bindings.
+        let idx = self.udp4.iter().position(|b| b.active && b.local_port == dst_port);
+        let idx = match idx {
+            Some(i) => i,
+            None => return,
+        };
+
+        let recv_rp = self.udp4[idx].recv_reply_port;
+        if recv_rp != 0 {
+            self.udp4[idx].recv_reply_port = 0;
+            self.deliver_udp4_datagram(recv_rp, &src_ip, src_port, payload);
+        } else {
+            // Queue one datagram (drop if full).
+            let copy_len = payload.len().min(UDP4_RX_BUF_SIZE);
+            self.udp4[idx].rx_buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+            self.udp4[idx].rx_len = copy_len;
+            self.udp4[idx].rx_src_ip = src_ip;
+            self.udp4[idx].rx_src_port = src_port;
+        }
     }
 
     /// Parse DNS response and reply to caller.
@@ -649,6 +727,158 @@ impl Tcp4Dev {
                 self.dns_active = false;
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    // UDP4: bind / send / recv / close
+    // ---------------------------------------------------------------
+
+    fn handle_udp4_bind(&mut self, port: u16, reply_port: u64) {
+        // Disallow binding DNS_LOCAL_PORT (reserved for DNS resolver).
+        if port == DNS_LOCAL_PORT {
+            syscall::send_nb(reply_port, NET_UDP_BIND_FAIL, 0, 0);
+            return;
+        }
+        if self.udp4.iter().any(|b| b.active && b.local_port == port) {
+            syscall::send_nb(reply_port, NET_UDP_BIND_FAIL, 0, 0);
+            return;
+        }
+        let slot = self.udp4.iter().position(|b| !b.active);
+        match slot {
+            Some(s) => {
+                self.udp4[s] = Udp4Binding {
+                    active: true,
+                    local_port: port,
+                    recv_reply_port: 0,
+                    rx_buf: [0; UDP4_RX_BUF_SIZE],
+                    rx_len: 0,
+                    rx_src_ip: [0; 4],
+                    rx_src_port: 0,
+                };
+                syscall::send_nb(reply_port, NET_UDP_BIND_OK, s as u64, 0);
+            }
+            None => {
+                syscall::send_nb(reply_port, NET_UDP_BIND_FAIL, 0, 0);
+            }
+        }
+    }
+
+    fn handle_udp4_send(
+        &mut self,
+        dst_ip: [u8; 4],
+        dst_port: u16,
+        src_port: u16,
+        payload: &[u8],
+        reply_port: u64,
+    ) {
+        // Loopback: if dst is our own IP, deliver directly.
+        if dst_ip == MY_IP || dst_ip == [127, 0, 0, 1] {
+            if let Some(idx) = self.udp4.iter().position(|b| b.active && b.local_port == dst_port) {
+                let recv_rp = self.udp4[idx].recv_reply_port;
+                if recv_rp != 0 {
+                    self.udp4[idx].recv_reply_port = 0;
+                    self.deliver_udp4_datagram(recv_rp, &MY_IP, src_port, payload);
+                } else {
+                    let copy_len = payload.len().min(UDP4_RX_BUF_SIZE);
+                    self.udp4[idx].rx_buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+                    self.udp4[idx].rx_len = copy_len;
+                    self.udp4[idx].rx_src_ip = MY_IP;
+                    self.udp4[idx].rx_src_port = src_port;
+                }
+            }
+            syscall::send_nb(reply_port, NET_UDP_SEND_OK, 0, 0);
+            return;
+        }
+
+        // Build UDP datagram: header(8) + payload.
+        let udp_len = 8 + payload.len();
+        if udp_len > 1480 {
+            syscall::send_nb(reply_port, NET_UDP_SEND_FAIL, 0, 0);
+            return;
+        }
+        let mut udp = [0u8; 1488];
+        udp[0] = (src_port >> 8) as u8;
+        udp[1] = src_port as u8;
+        udp[2] = (dst_port >> 8) as u8;
+        udp[3] = dst_port as u8;
+        udp[4] = (udp_len >> 8) as u8;
+        udp[5] = udp_len as u8;
+        // Checksum = 0 (optional for IPv4 UDP).
+        udp[6] = 0;
+        udp[7] = 0;
+        if !payload.is_empty() {
+            udp[8..8 + payload.len()].copy_from_slice(payload);
+        }
+
+        let mac = self.dst_mac_for(dst_ip);
+        self.send_ipv4(dst_ip, 17, &udp[..udp_len], mac);
+        syscall::send_nb(reply_port, NET_UDP_SEND_OK, 0, 0);
+    }
+
+    fn handle_udp4_recv(&mut self, bind_id: usize, reply_port: u64) {
+        if bind_id >= MAX_UDP4_BINDS || !self.udp4[bind_id].active {
+            syscall::send_nb(reply_port, NET_UDP_RECV_NONE, 0, 0);
+            return;
+        }
+        if self.udp4[bind_id].rx_len > 0 {
+            let src_ip = self.udp4[bind_id].rx_src_ip;
+            let src_port = self.udp4[bind_id].rx_src_port;
+            let len = self.udp4[bind_id].rx_len;
+            let mut payload = [0u8; UDP4_RX_BUF_SIZE];
+            payload[..len].copy_from_slice(&self.udp4[bind_id].rx_buf[..len]);
+            self.udp4[bind_id].rx_len = 0;
+            self.deliver_udp4_datagram(reply_port, &src_ip, src_port, &payload[..len]);
+        } else {
+            // Park the recv — will be delivered when datagram arrives.
+            self.udp4[bind_id].recv_reply_port = reply_port;
+        }
+    }
+
+    fn handle_udp4_recv_nb(&mut self, bind_id: usize, reply_port: u64) {
+        if bind_id >= MAX_UDP4_BINDS || !self.udp4[bind_id].active {
+            syscall::send_nb(reply_port, NET_UDP_RECV_NONE, 0, 0);
+            return;
+        }
+        if self.udp4[bind_id].rx_len > 0 {
+            let src_ip = self.udp4[bind_id].rx_src_ip;
+            let src_port = self.udp4[bind_id].rx_src_port;
+            let len = self.udp4[bind_id].rx_len;
+            let mut payload = [0u8; UDP4_RX_BUF_SIZE];
+            payload[..len].copy_from_slice(&self.udp4[bind_id].rx_buf[..len]);
+            self.udp4[bind_id].rx_len = 0;
+            self.deliver_udp4_datagram(reply_port, &src_ip, src_port, &payload[..len]);
+        } else {
+            syscall::send_nb(reply_port, NET_UDP_RECV_NONE, 0, 0);
+        }
+    }
+
+    fn handle_udp4_close(&mut self, bind_id: usize, reply_port: u64) {
+        if bind_id < MAX_UDP4_BINDS && self.udp4[bind_id].active {
+            self.udp4[bind_id].active = false;
+            let rp = self.udp4[bind_id].recv_reply_port;
+            if rp != 0 {
+                syscall::send_nb(rp, NET_UDP_RECV_NONE, 0, 0);
+                self.udp4[bind_id].recv_reply_port = 0;
+            }
+        }
+        syscall::send_nb(reply_port, NET_UDP_CLOSE_OK, bind_id as u64, 0);
+    }
+
+    /// Deliver a UDP4 datagram to a waiting receiver.
+    /// Format: tag=NET_UDP_DATA, data[0]=payload_len | (src_port << 16),
+    ///         data[1]=src_ipv4 (4 bytes in low32), data[2..3]=payload (up to 16 bytes).
+    fn deliver_udp4_datagram(&self, reply_port: u64, src_ip: &[u8; 4], src_port: u16, payload: &[u8]) {
+        let plen = payload.len().min(16);
+        let d0 = (plen as u64) | ((src_port as u64) << 16);
+        let d1 = (src_ip[0] as u64)
+            | ((src_ip[1] as u64) << 8)
+            | ((src_ip[2] as u64) << 16)
+            | ((src_ip[3] as u64) << 24);
+        let mut d2 = 0u64;
+        let mut d3 = 0u64;
+        for i in 0..plen.min(8) { d2 |= (payload[i] as u64) << (i * 8); }
+        for i in 8..plen { d3 |= (payload[i] as u64) << ((i - 8) * 8); }
+        syscall::send_nb_4(reply_port, NET_UDP_DATA, d0, d1, d2, d3);
     }
 
     // ---------------------------------------------------------------
@@ -1427,6 +1657,58 @@ fn handle_msg(dev: &mut Tcp4Dev, msg: &syscall::Message) {
             } else {
                 syscall::send_nb(reply_port, NET_TCP_RECV_NONE, 0, 0);
             }
+        }
+        // --- UDP4 IPC ---
+        NET_UDP_BIND => {
+            // data[0] = port(low16) | reply_port(high48)
+            let port_num = msg.data[0] as u16;
+            let reply_port = msg.data[0] >> 16;
+            dev.handle_udp4_bind(port_num, reply_port);
+        }
+        NET_UDP_SEND => {
+            // data[0] = dst_ip(low32) | dst_port(bits32-47) | bind_id(bits48-63)
+            // data[1] = reply_port(low32) | payload_len(bits32-39)
+            // data[2..3] = payload (up to 16 bytes in 2 u64s)
+            let dst_ip = [
+                msg.data[0] as u8,
+                (msg.data[0] >> 8) as u8,
+                (msg.data[0] >> 16) as u8,
+                (msg.data[0] >> 24) as u8,
+            ];
+            let dst_port = (msg.data[0] >> 32) as u16;
+            let bind_id = (msg.data[0] >> 48) as usize;
+            let reply_port = msg.data[1] & 0xFFFFFFFF;
+            let payload_len = ((msg.data[1] >> 32) & 0xFF) as usize;
+            let mut payload = [0u8; 16];
+            let d2 = msg.data[2];
+            let d3 = msg.data[3];
+            for i in 0..8 { payload[i] = (d2 >> (i * 8)) as u8; }
+            for i in 0..8 { payload[8 + i] = (d3 >> (i * 8)) as u8; }
+            let plen = payload_len.min(16);
+            if bind_id >= MAX_UDP4_BINDS || !dev.udp4[bind_id].active {
+                syscall::send_nb(reply_port, NET_UDP_SEND_FAIL, 0, 0);
+            } else {
+                let src_port = dev.udp4[bind_id].local_port;
+                dev.handle_udp4_send(dst_ip, dst_port, src_port, &payload[..plen], reply_port);
+            }
+        }
+        NET_UDP_RECV => {
+            // data[0] = bind_id(low32) | reply_port(high32)
+            let bind_id = (msg.data[0] & 0xFFFFFFFF) as usize;
+            let reply_port = msg.data[0] >> 32;
+            dev.handle_udp4_recv(bind_id, reply_port);
+        }
+        NET_UDP_RECV_NB => {
+            // data[0] = bind_id(low32) | reply_port(high32)
+            let bind_id = (msg.data[0] & 0xFFFFFFFF) as usize;
+            let reply_port = msg.data[0] >> 32;
+            dev.handle_udp4_recv_nb(bind_id, reply_port);
+        }
+        NET_UDP_CLOSE => {
+            // data[0] = bind_id(low32) | reply_port(high32)
+            let bind_id = (msg.data[0] & 0xFFFFFFFF) as usize;
+            let reply_port = msg.data[0] >> 32;
+            dev.handle_udp4_close(bind_id, reply_port);
         }
         _ => {}
     }

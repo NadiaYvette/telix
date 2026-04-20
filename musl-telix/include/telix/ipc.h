@@ -97,6 +97,20 @@ struct telix_msg {
 #define DNS_RESOLVE_OK   0x4801
 #define DNS_RESOLVE_FAIL 0x48FF
 
+/* UDP4 protocol tags (tcp4_srv / net_srv). */
+#define NET_UDP_BIND       0x4900
+#define NET_UDP_BIND_OK    0x4901
+#define NET_UDP_BIND_FAIL  0x49FF
+#define NET_UDP_SEND       0x4A00
+#define NET_UDP_SEND_OK    0x4A01
+#define NET_UDP_SEND_FAIL  0x4AFF
+#define NET_UDP_RECV       0x4B00
+#define NET_UDP_DATA       0x4B01
+#define NET_UDP_RECV_NB    0x4B10
+#define NET_UDP_RECV_NONE  0x4B12
+#define NET_UDP_CLOSE      0x4C00
+#define NET_UDP_CLOSE_OK   0x4C01
+
 /* Pipe protocol tags (Phase 59). */
 #define PIPE_CREATE_TAG  0x5010
 #define PIPE_WRITE_TAG   0x5020

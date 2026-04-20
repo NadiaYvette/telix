@@ -2448,6 +2448,65 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 19e: UDP4 loopback via IPC ---
+    syscall::debug_puts(b"  init: testing UDP4 loopback...\n");
+    {
+        const NET_UDP_BIND: u64 = 0x4900;
+        const NET_UDP_BIND_OK: u64 = 0x4901;
+        const NET_UDP_SEND: u64 = 0x4A00;
+        const NET_UDP_SEND_OK: u64 = 0x4A01;
+        const NET_UDP_RECV: u64 = 0x4B00;
+        const NET_UDP_DATA: u64 = 0x4B01;
+
+        let mut udp4_ok = false;
+        if let Some(net_port) = syscall::ns_lookup(b"net") {
+            let rp = syscall::port_create();
+
+            // Bind port 7777.
+            let bind_d0 = 7777u64 | (rp << 16);
+            syscall::send(net_port, NET_UDP_BIND, bind_d0, 0, 0, 0);
+            let bind_id = if let Some(br) = syscall::recv_msg_timeout(rp, 2_000_000) {
+                if br.tag == NET_UDP_BIND_OK { Some(br.data[0] as u32) } else { None }
+            } else { None };
+
+            if let Some(bid) = bind_id {
+                // Send to ourselves: dst_ip=10.0.2.15, dst_port=7777.
+                let my_ip: u64 = 10 | (0 << 8) | (2 << 16) | (15 << 24);
+                let send_d0 = my_ip | (7777u64 << 32) | ((bid as u64) << 48);
+                let send_d1 = (rp & 0xFFFFFFFF) | (5u64 << 32); // rp(32) | len(8)
+                // Payload: "hello" = [104, 101, 108, 108, 111]
+                let send_d2: u64 = 104 | (101 << 8) | (108 << 16) | (108 << 24) | (111 << 32);
+                syscall::send(net_port, NET_UDP_SEND, send_d0, send_d1, send_d2, 0);
+
+                if let Some(sr) = syscall::recv_msg_timeout(rp, 5_000_000) {
+                    if sr.tag == NET_UDP_SEND_OK {
+                        // Recv.
+                        let recv_d0 = (bid as u64) | (rp << 32);
+                        syscall::send(net_port, NET_UDP_RECV, recv_d0, 0, 0, 0);
+
+                        if let Some(rr) = syscall::recv_msg_timeout(rp, 5_000_000) {
+                            if rr.tag == NET_UDP_DATA {
+                                let plen = (rr.data[0] & 0xFFFF) as usize;
+                                let got_d2 = rr.data[2];
+                                // Check first byte == 'h' (104) and length == 5.
+                                if plen == 5 && (got_d2 & 0xFF) == 104 {
+                                    udp4_ok = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            syscall::port_destroy(rp);
+        }
+        if udp4_ok {
+            syscall::debug_puts(b"Phase 19e UDP4 loopback: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 19e UDP4 loopback: FAILED\n");
+        }
+    }
+
     // --- Test 20: Signal/Kill ---
     syscall::debug_puts(b"  init: testing signal/kill...\n");
     {
