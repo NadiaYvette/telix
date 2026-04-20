@@ -107,6 +107,8 @@ pub fn start_secondary_cpus() {
 
     if started == 0 {
         crate::println!("  Single-CPU mode (no secondaries started)");
+        // Clamp NR_CPUS to 1 so the scheduler only uses CPU 0's run queue.
+        smp::NR_CPUS.store(1, Ordering::Release);
         return;
     }
 

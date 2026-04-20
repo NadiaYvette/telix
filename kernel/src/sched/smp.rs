@@ -37,7 +37,7 @@ pub const MAX_CPUS: usize = 256;
 
 /// Runtime-detected CPU count. Defaults to 1 (BSP only) until
 /// `detect_cpu_count()` runs between `parse_firmware()` and `phys::init()`.
-static NR_CPUS: AtomicUsize = AtomicUsize::new(1);
+pub(crate) static NR_CPUS: AtomicUsize = AtomicUsize::new(1);
 
 /// Number of CPUs actually present (detected + cmdline-capped). Use this
 /// for loop bounds and to size dynamically-allocated per-CPU storage.

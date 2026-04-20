@@ -3,5 +3,6 @@ initramfs/
 kernel/src/io/initramfs.cpio
 *.pdf
 test.img
+.qemu-virt.dtb
 BENCH.DAT
 HELLO.ELF

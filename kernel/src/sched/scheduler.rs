@@ -2692,8 +2692,10 @@ fn try_switch(current_sp: u64) -> u64 {
             pcpu.current_thread.store(idle_id, Ordering::Relaxed);
             return idle_sp;
         }
-        // Check for corrupt exception frame (CS must be 0x08/0x23, RIP must be valid).
+        // Check for corrupt exception frame (architecture-specific).
+        #[cfg(target_arch = "x86_64")]
         if !is_idle && sp >= kbase as u64 && sp < kend {
+            // x86_64: CS must be 0x08 (kernel) or 0x23 (user), RIP must be > 64K.
             let rip = unsafe { *((sp as usize + 136) as *const u64) };
             let cs = unsafe { *((sp as usize + 144) as *const u64) };
             let bad_cs = cs != 0x08 && cs != 0x23;
@@ -2704,6 +2706,22 @@ fn try_switch(current_sp: u64) -> u64 {
                     next_id, rip, cs, sp, next_t.saved_sp_source, prev_id, next_t.task_id
                 );
                 // Skip this thread — mark killed and pick idle instead.
+                thread_ref(next_id).killed.store(true, Ordering::Release);
+                let idle_sp = thread_ref(idle_id).saved_sp;
+                unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
+                pcpu.current_thread.store(idle_id, Ordering::Relaxed);
+                return idle_sp;
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        if !is_idle && sp >= kbase as u64 && sp < kend {
+            // aarch64: ELR_EL1 at frame[32] (offset 256) must be > 64K.
+            let elr = unsafe { *((sp as usize + 256) as *const u64) };
+            if elr < 0x10000 {
+                crate::println!(
+                    "BUG: try_switch: tid={} bad frame ELR={:#x} sp={:#x} src={} prev={} task={}",
+                    next_id, elr, sp, next_t.saved_sp_source, prev_id, next_t.task_id
+                );
                 thread_ref(next_id).killed.store(true, Ordering::Release);
                 let idle_sp = thread_ref(idle_id).saved_sp;
                 unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;

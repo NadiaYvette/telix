@@ -36,13 +36,10 @@ pub extern "C" fn _rust_entry(dtb_ptr: usize) -> ! {
 /// Parse firmware tables (DTB) to discover hardware.
 /// Must be called before phys::init() — the DTB blob lives in physical memory.
 pub fn parse_firmware() {
-    // QEMU only sets x0 to the DTB address when it thinks it's booting a
-    // Linux kernel (raw-image path in `hw/arm/boot.c`). Telix is loaded as
-    // an ELF, so QEMU takes the `!is_linux` branch in `do_cpu_reset` and
-    // jumps to the entry point with x0 = 0. However, QEMU still drops the
-    // DTB at `info->loader_start` (the base of RAM) whenever the ELF image
-    // doesn't cover that address. So on x0 == 0 we fall back to scanning
-    // the base of RAM for the FDT magic.
+    // Discovery priority:
+    //   1. DTB address in x0 (Linux-style boot, rarely works for ELF)
+    //   2. Scan RAM for FDT magic (works when QEMU drops DTB at loader_start)
+    //   3. Read "etc/fdt" from QEMU fw_cfg MMIO (always works)
     let dtb = {
         let from_x0 = DTB_ADDR.load(Ordering::Relaxed);
         if from_x0 != 0 && fdt_magic_ok(from_x0) {
@@ -52,25 +49,39 @@ pub fn parse_firmware() {
         }
     };
 
-    if dtb != 0 {
+    // If RAM scan found it, use that address directly.
+    let dtb_addr = if dtb != 0 {
+        crate::println!("  Firmware: DTB at {:#x} (RAM scan)", dtb);
         DTB_ADDR.store(dtb, Ordering::Relaxed);
-        crate::println!("  Firmware: DTB at {:#x}", dtb);
-        crate::firmware::dtb::parse_aarch64(dtb);
-        let nr = crate::firmware::mem_regions().len();
-        let nc = crate::firmware::cpu_count();
-        let nd = crate::firmware::virtio_devices().len();
-        crate::println!(
-            "  Firmware: {} mem regions, {} CPUs, {} virtio devices",
-            nr,
-            nc,
-            nd
-        );
-
-        // Extract kernel command line from /chosen/bootargs.
-        extract_bootargs(dtb);
+        dtb
     } else {
-        crate::println!("  Firmware: no DTB found at RAM base; hardware discovery disabled");
-    }
+        // Last resort: read DTB from fw_cfg into a static buffer.
+        match fwcfg_read_fdt() {
+            Some(addr) => {
+                crate::println!("  Firmware: DTB at {:#x} (fw_cfg)", addr);
+                DTB_ADDR.store(addr, Ordering::Relaxed);
+                addr
+            }
+            None => {
+                crate::println!("  Firmware: no DTB found (RAM scan + fw_cfg both failed)");
+                return;
+            }
+        }
+    };
+
+    crate::firmware::dtb::parse_aarch64(dtb_addr);
+    let nr = crate::firmware::mem_regions().len();
+    let nc = crate::firmware::cpu_count();
+    let nd = crate::firmware::virtio_devices().len();
+    crate::println!(
+        "  Firmware: {} mem regions, {} CPUs, {} virtio devices",
+        nr,
+        nc,
+        nd
+    );
+
+    // Extract kernel command line from /chosen/bootargs.
+    extract_bootargs(dtb_addr);
 }
 
 /// FDT header magic (big-endian 0xd00dfeed).
@@ -88,17 +99,12 @@ fn fdt_magic_ok(addr: usize) -> bool {
     u32::from_be(magic) == FDT_MAGIC_BE
 }
 
-/// Scan known-plausible DTB locations and return the first one that has
-/// the FDT magic in its header. QEMU aarch64 virt, when loading an ELF
-/// kernel whose lowest segment is above `info->loader_start`, drops the
-/// DTB at `info->loader_start` == 0x40000000 (see `hw/arm/boot.c:937`).
+/// Scan RAM for FDT magic. QEMU aarch64 virt places DTB either:
+///   - At RAM base (0x40000000) if the kernel doesn't cover it
+///   - Just above the kernel image (aligned to page boundary)
+///   - At the end of RAM minus DTB size (observed on QEMU 9+)
 fn find_fdt_in_ram() -> Option<usize> {
-    // QEMU is supposed to place the DTB at `info->loader_start` == RAM
-    // base when the ELF image doesn't cover it (see `hw/arm/boot.c:937`),
-    // but the observed behavior on QEMU 10.1 with ELF `-kernel` loading
-    // is that the DTB lands somewhere else. Scan:
-    //   - Gap below the kernel image: [0x40000000 .. 0x40080000)
-    //   - Above the kernel, before the initrd/stack region, up to 128 MiB
+    // Phase 1: Check below the kernel image [0x40000000 .. 0x40080000).
     let kernel_img_start = 0x4008_0000usize;
     let mut addr = QEMU_VIRT_RAM_BASE;
     while addr < kernel_img_start {
@@ -107,18 +113,120 @@ fn find_fdt_in_ram() -> Option<usize> {
         }
         addr += 0x1000;
     }
-    // Wider scan: first 128 MiB of RAM at 64 KiB granularity, skipping
-    // the kernel image itself (whose .text is already occupied).
-    let kernel_end = (kernel_end_addr() + 0xFFFF) & !0xFFFFusize;
+    // Phase 2: Scan above the kernel up to end of RAM (256 MiB) at 4K steps.
+    // QEMU may place DTB immediately after the kernel image.
+    let kernel_end = (kernel_end_addr() + 0xFFF) & !0xFFFusize;
+    let ram_end = QEMU_VIRT_RAM_BASE + 256 * 1024 * 1024;
     let mut addr = kernel_end;
-    let end = QEMU_VIRT_RAM_BASE + 0x0800_0000; // 128 MiB
-    while addr < end {
+    while addr < ram_end {
         if fdt_magic_ok(addr) {
             return Some(addr);
         }
-        addr += 0x1_0000;
+        addr += 0x1000;
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// QEMU fw_cfg MMIO interface (aarch64 virt: base 0x09020000)
+// ---------------------------------------------------------------------------
+
+const FWCFG_BASE: usize = 0x0902_0000;
+const FWCFG_DATA: usize = FWCFG_BASE + 0x00; // 8-bit read (byte stream)
+const FWCFG_SEL: usize = FWCFG_BASE + 0x08; // 16-bit write (selector key, big-endian)
+
+/// Static buffer for DTB read from fw_cfg. 128 KiB covers any QEMU virt DTB.
+/// Aligned to 8 bytes so fdt_magic_ok's alignment check passes.
+#[repr(C, align(8))]
+struct FdtBuf([u8; 128 * 1024]);
+static mut FDT_BUF: FdtBuf = FdtBuf([0u8; 128 * 1024]);
+
+unsafe fn fwcfg_select(key: u16) {
+    core::ptr::write_volatile(FWCFG_SEL as *mut u16, key.to_be());
+}
+
+unsafe fn fwcfg_read_byte() -> u8 {
+    core::ptr::read_volatile(FWCFG_DATA as *const u8)
+}
+
+unsafe fn fwcfg_read_be32() -> u32 {
+    let mut b = [0u8; 4];
+    for byte in &mut b {
+        *byte = fwcfg_read_byte();
+    }
+    u32::from_be_bytes(b)
+}
+
+unsafe fn fwcfg_read_be16() -> u16 {
+    let mut b = [0u8; 2];
+    for byte in &mut b {
+        *byte = fwcfg_read_byte();
+    }
+    u16::from_be_bytes(b)
+}
+
+/// Read the DTB from QEMU fw_cfg ("etc/fdt" file).
+/// Returns the address of the static FDT_BUF on success.
+fn fwcfg_read_fdt() -> Option<usize> {
+    unsafe {
+        // Verify fw_cfg exists: key 0x0000 → signature "QEMU".
+        fwcfg_select(0x0000);
+        let mut sig = [0u8; 4];
+        for b in &mut sig {
+            *b = fwcfg_read_byte();
+        }
+        if &sig != b"QEMU" {
+            return None;
+        }
+
+        // Read file directory (key 0x0019) to find "etc/fdt".
+        fwcfg_select(0x0019);
+        let count = fwcfg_read_be32() as usize;
+        if count == 0 || count > 2048 {
+            return None;
+        }
+
+        let mut fdt_key: u16 = 0;
+        let mut fdt_size: u32 = 0;
+
+        for _i in 0..count {
+            let size = fwcfg_read_be32();
+            let key = fwcfg_read_be16();
+            let _reserved = fwcfg_read_be16();
+            let mut name = [0u8; 56];
+            for b in &mut name {
+                *b = fwcfg_read_byte();
+            }
+
+            if name.starts_with(b"etc/fdt\0") {
+                fdt_key = key;
+                fdt_size = size;
+            }
+        }
+
+        if fdt_key == 0 || fdt_size == 0 {
+            return None;
+        }
+
+        let buf_ptr = core::ptr::addr_of_mut!(FDT_BUF) as *mut u8;
+        let buf_cap = 128 * 1024;
+        let read_size = (fdt_size as usize).min(buf_cap);
+
+        // Select the FDT file and read into our static buffer.
+        fwcfg_select(fdt_key);
+        for i in 0..read_size {
+            *buf_ptr.add(i) = fwcfg_read_byte();
+        }
+
+        // Verify the blob starts with FDT magic.
+        let buf_addr = buf_ptr as usize;
+        if !fdt_magic_ok(buf_addr) {
+            return None;
+        }
+
+        crate::println!("  fw_cfg: read {} byte DTB from key {:#x}", read_size, fdt_key);
+        Some(buf_addr)
+    }
 }
 
 /// Extract bootargs from DTB /chosen node and save as kernel command line.
