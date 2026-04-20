@@ -2190,6 +2190,138 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::debug_puts(b"Phase 19 TCP echo: SKIPPED (no net)\n");
     }
 
+    // --- Test 19b: TCP6 self-loopback echo ---
+    {
+        let mut ip6_port_opt: Option<u64> = None;
+        for _ in 0..20 {
+            ip6_port_opt = syscall::ns_lookup(b"ip6");
+            if ip6_port_opt.is_some() { break; }
+            syscall::sleep_ms(10);
+        }
+        if let Some(ip6_port) = ip6_port_opt {
+            let tcp6_reply = syscall::port_create();
+            let mut tcp6_ok = false;
+
+            // Get our MAC from IP6_STATUS to compute global address.
+            syscall::send(ip6_port, 0x6000, tcp6_reply, 0, 0, 0); // IP6_STATUS
+            let our_mac_opt = if let Some(sr) = syscall::recv_msg_timeout(tcp6_reply, 2_000_000) {
+                if sr.tag == 0x6001 { Some(sr.data[2]) } else { None }
+            } else { None };
+
+            if let Some(mac_val) = our_mac_opt {
+                // Compute our SLAAC global address: fec0:: prefix + EUI-64 from MAC.
+                let mac = [
+                    mac_val as u8, (mac_val >> 8) as u8, (mac_val >> 16) as u8,
+                    (mac_val >> 24) as u8, (mac_val >> 32) as u8, (mac_val >> 40) as u8,
+                ];
+                let our_addr: [u8; 16] = [
+                    0xFE, 0xC0, 0, 0, 0, 0, 0, 0,
+                    mac[0] ^ 0x02, mac[1], mac[2], 0xFF,
+                    0xFE, mac[3], mac[4], mac[5],
+                ];
+
+                // Wait for SLAAC to complete (gateway discovery).
+                let mut slaac_ok = false;
+                for _ in 0..200 {
+                    syscall::send(ip6_port, 0x6200, tcp6_reply, 0, 0, 0); // IP6_GATEWAY
+                    if let Some(gr) = syscall::recv_msg_timeout(tcp6_reply, 500_000) {
+                        if gr.tag == 0x6201 { // IP6_GATEWAY_OK
+                            slaac_ok = true;
+                            break;
+                        }
+                    }
+                    syscall::sleep_ms(50);
+                }
+
+                if slaac_ok {
+                    // TCP6_BIND on port 7777.
+                    syscall::send(ip6_port, 0x6700, 7777, tcp6_reply << 32, 0, 0);
+                    let _ = syscall::recv_msg_timeout(tcp6_reply, 2_000_000);
+
+                    // TCP6_LISTEN on port 7777.
+                    syscall::send(ip6_port, 0x6800, 7777, 0, tcp6_reply << 32, 0);
+                    let _ = syscall::recv_msg_timeout(tcp6_reply, 2_000_000);
+
+                    // TCP6_CONNECT to our own global address on port 7777.
+                    // data[0..1] = dst IPv6 (16 bytes in 2 u64s), data[2] = port|(reply<<16)
+                    let mut d0 = 0u64;
+                    let mut d1 = 0u64;
+                    for i in 0..8 { d0 |= (our_addr[i] as u64) << (i * 8); }
+                    for i in 0..8 { d1 |= (our_addr[8 + i] as u64) << (i * 8); }
+                    let d2_connect = 7777u64 | (tcp6_reply << 16);
+                    syscall::send(ip6_port, 0x6300, d0, d1, d2_connect, 0);
+
+                    // Wait for TCP6_CONNECTED (5s timeout).
+                    if let Some(cr) = syscall::recv_msg_timeout(tcp6_reply, 5_000_000) {
+                        if cr.tag == 0x6301 { // TCP6_CONNECTED
+                            let client_conn = cr.data[0];
+
+                            // TCP6_ACCEPT on port 7777.
+                            syscall::send(ip6_port, 0x6810, 7777, tcp6_reply << 32, 0, 0);
+                            if let Some(ar) = syscall::recv_msg_timeout(tcp6_reply, 5_000_000) {
+                                if ar.tag == 0x6811 { // TCP6_ACCEPT_OK
+                                    let server_conn = ar.data[0];
+
+                                    // Send data on client connection.
+                                    let test_data = b"TCP6 echo!\n";
+                                    let mut sd2: u64 = 0;
+                                    let mut sd3: u64 = 0;
+                                    for i in 0..test_data.len().min(8) {
+                                        sd2 |= (test_data[i] as u64) << (i * 8);
+                                    }
+                                    for i in 0..test_data.len().saturating_sub(8).min(8) {
+                                        sd3 |= (test_data[8 + i] as u64) << (i * 8);
+                                    }
+                                    let sd1 = (test_data.len() as u64) | (tcp6_reply << 16);
+                                    syscall::send(ip6_port, 0x6400, client_conn, sd1, sd2, sd3);
+
+                                    // Wait for SEND_OK.
+                                    if let Some(sr) = syscall::recv_msg_timeout(tcp6_reply, 5_000_000) {
+                                        if sr.tag == 0x6401 { // TCP6_SEND_OK
+                                            // Recv on server connection.
+                                            let rd1 = tcp6_reply << 16;
+                                            syscall::send(ip6_port, 0x6500, server_conn, rd1, 0, 0);
+                                            if let Some(dr) = syscall::recv_msg_timeout(tcp6_reply, 5_000_000) {
+                                                if dr.tag == 0x6501 { // TCP6_DATA
+                                                    let chunk_len = dr.data[0] as usize;
+                                                    let words = [dr.data[1], dr.data[2], dr.data[3]];
+                                                    let mut recv_buf = [0u8; 24];
+                                                    for i in 0..chunk_len.min(24) {
+                                                        recv_buf[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
+                                                    }
+                                                    if chunk_len == test_data.len()
+                                                        && &recv_buf[..chunk_len] == test_data
+                                                    {
+                                                        tcp6_ok = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Close both connections.
+                                    syscall::send(ip6_port, 0x6600, client_conn, tcp6_reply, 0, 0);
+                                    let _ = syscall::recv_msg_timeout(tcp6_reply, 1_000_000);
+                                    syscall::send(ip6_port, 0x6600, server_conn, tcp6_reply, 0, 0);
+                                    let _ = syscall::recv_msg_timeout(tcp6_reply, 1_000_000);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            syscall::port_destroy(tcp6_reply);
+            if tcp6_ok {
+                syscall::debug_puts(b"Phase 19b TCP6 echo: PASSED\n");
+            } else {
+                syscall::debug_puts(b"Phase 19b TCP6 echo: FAILED\n");
+            }
+        } else {
+            syscall::debug_puts(b"Phase 19b TCP6 echo: SKIPPED (no ip6_srv)\n");
+        }
+    }
+
     // --- Test 20: Signal/Kill ---
     syscall::debug_puts(b"  init: testing signal/kill...\n");
     {

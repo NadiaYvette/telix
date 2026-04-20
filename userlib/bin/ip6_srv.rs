@@ -38,6 +38,52 @@ const IP6_GATEWAY: u64 = 0x6200;
 const IP6_GATEWAY_OK: u64 = 0x6201;
 const IP6_GATEWAY_NONE: u64 = 0x62FF;
 
+// --- TCP6 IPC protocol ---
+const TCP6_CONNECT: u64 = 0x6300;
+const TCP6_CONNECTED: u64 = 0x6301;
+const TCP6_FAIL: u64 = 0x63FF;
+const TCP6_SEND: u64 = 0x6400;
+const TCP6_SEND_OK: u64 = 0x6401;
+const TCP6_RECV: u64 = 0x6500;
+const TCP6_DATA: u64 = 0x6501;
+const TCP6_CLOSED: u64 = 0x65FF;
+const TCP6_RECV_NB: u64 = 0x6510;
+const TCP6_RECV_NONE: u64 = 0x6512;
+const TCP6_CLOSE: u64 = 0x6600;
+const TCP6_CLOSE_OK: u64 = 0x6601;
+const TCP6_BIND: u64 = 0x6700;
+const TCP6_BIND_OK: u64 = 0x6701;
+const TCP6_LISTEN: u64 = 0x6800;
+const TCP6_LISTEN_OK: u64 = 0x6801;
+const TCP6_LISTEN_FAIL: u64 = 0x68FF;
+const TCP6_ACCEPT: u64 = 0x6810;
+const TCP6_ACCEPT_OK: u64 = 0x6811;
+const TCP6_ACCEPT_FAIL: u64 = 0x68FE;
+
+// --- TCP constants ---
+const TCP_FIN: u8 = 0x01;
+const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
+const TCP_PSH: u8 = 0x08;
+const TCP_ACK: u8 = 0x10;
+
+const TCP_ST_CLOSED: u8 = 0;
+const TCP_ST_SYN_SENT: u8 = 1;
+const TCP_ST_ESTABLISHED: u8 = 2;
+const TCP_ST_FIN_WAIT_1: u8 = 3;
+const TCP_ST_FIN_WAIT_2: u8 = 4;
+const TCP_ST_TIME_WAIT: u8 = 5;
+const TCP_ST_CLOSE_WAIT: u8 = 6;
+const TCP_ST_LAST_ACK: u8 = 7;
+const TCP_ST_SYN_RECEIVED: u8 = 8;
+
+const MAX_TCP6_CONNS: usize = 8;
+const MAX_TCP6_LISTEN: usize = 4;
+const TCP6_RX_BUF_SIZE: usize = 2048;
+const TCP6_WINDOW: u16 = 2048;
+const TCP6_TIMEOUT: u32 = 10000;
+const TCP6_TIME_WAIT_TIMEOUT: u32 = 5000;
+
 // --- Ethertypes ---
 const ETHERTYPE_IPV6: u16 = 0x86DD;
 
@@ -106,6 +152,89 @@ impl PingState {
     }
 }
 
+// --- TCP6 connection ---
+
+struct TcpConn6 {
+    state: u8,
+    local_port: u16,
+    remote_ip: [u8; 16],
+    remote_port: u16,
+    snd_nxt: u32,
+    snd_una: u32,
+    rcv_nxt: u32,
+    reply_port: u64,
+    recv_reply_port: u64,
+    rx_buf: [u8; TCP6_RX_BUF_SIZE],
+    rx_head: usize,
+    rx_tail: usize,
+    timeout: u32,
+}
+
+impl TcpConn6 {
+    const fn new() -> Self {
+        Self {
+            state: TCP_ST_CLOSED,
+            local_port: 0,
+            remote_ip: [0; 16],
+            remote_port: 0,
+            snd_nxt: 0,
+            snd_una: 0,
+            rcv_nxt: 0,
+            reply_port: 0,
+            recv_reply_port: 0,
+            rx_buf: [0; TCP6_RX_BUF_SIZE],
+            rx_head: 0,
+            rx_tail: 0,
+            timeout: 0,
+        }
+    }
+
+    fn rx_len(&self) -> usize {
+        if self.rx_head >= self.rx_tail {
+            self.rx_head - self.rx_tail
+        } else {
+            TCP6_RX_BUF_SIZE - self.rx_tail + self.rx_head
+        }
+    }
+
+    fn rx_push(&mut self, data: &[u8]) {
+        for &b in data {
+            let next = (self.rx_head + 1) % TCP6_RX_BUF_SIZE;
+            if next == self.rx_tail {
+                break;
+            }
+            self.rx_buf[self.rx_head] = b;
+            self.rx_head = next;
+        }
+    }
+
+    fn rx_pop(&mut self, dst: &mut [u8]) -> usize {
+        let mut n = 0;
+        while n < dst.len() && self.rx_tail != self.rx_head {
+            dst[n] = self.rx_buf[self.rx_tail];
+            self.rx_tail = (self.rx_tail + 1) % TCP6_RX_BUF_SIZE;
+            n += 1;
+        }
+        n
+    }
+}
+
+struct ListenSlot6 {
+    active: bool,
+    port: u16,
+    accept_reply_port: u64,
+}
+
+impl ListenSlot6 {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            port: 0,
+            accept_reply_port: 0,
+        }
+    }
+}
+
 // --- IPv6 device ---
 
 struct Ip6Dev {
@@ -126,6 +255,12 @@ struct Ip6Dev {
     neigh_next: usize,
     // Pending ping.
     ping: PingState,
+    // TCP6 state.
+    tcp6: [TcpConn6; MAX_TCP6_CONNS],
+    listen6: [ListenSlot6; MAX_TCP6_LISTEN],
+    tcp6_next_port: u16,
+    tcp6_isn: u32,
+    tcp6_deliver_pending: bool,
 }
 
 impl Ip6Dev {
@@ -147,6 +282,11 @@ impl Ip6Dev {
             neighbors: [const { NeighborEntry::new() }; NEIGHBOR_CACHE_SIZE],
             neigh_next: 0,
             ping: PingState::new(),
+            tcp6: [const { TcpConn6::new() }; MAX_TCP6_CONNS],
+            listen6: [const { ListenSlot6::new() }; MAX_TCP6_LISTEN],
+            tcp6_next_port: 49152,
+            tcp6_isn: 200000,
+            tcp6_deliver_pending: false,
         }
     }
 
@@ -462,10 +602,7 @@ impl Ip6Dev {
 
         match next_header {
             IPPROTO_ICMPV6 => self.handle_icmpv6(&src_ip6, &dst_ip6, src_mac, data),
-            IPPROTO_TCP => {
-                // Future: dispatch to tcp6 client.
-                let _ = (IPPROTO_TCP, IPPROTO_UDP);
-            }
+            IPPROTO_TCP => self.handle_tcp6_rx(&src_ip6, data),
             _ => {}
         }
     }
@@ -655,6 +792,613 @@ impl Ip6Dev {
             self.ping.active = false;
         }
     }
+
+    // ---------------------------------------------------------------
+    // TCP6: checksum
+    // ---------------------------------------------------------------
+
+    /// TCP checksum with IPv6 pseudo-header (RFC 2460 §8.1).
+    fn tcp6_checksum(src: &[u8; 16], dst: &[u8; 16], tcp_data: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        // Pseudo-header: src (16) + dst (16) + TCP length (4) + next_header (4).
+        let mut i = 0;
+        while i < 16 {
+            sum += ((src[i] as u32) << 8) | (src[i + 1] as u32);
+            i += 2;
+        }
+        i = 0;
+        while i < 16 {
+            sum += ((dst[i] as u32) << 8) | (dst[i + 1] as u32);
+            i += 2;
+        }
+        let len = tcp_data.len() as u32;
+        sum += len >> 16;
+        sum += len & 0xFFFF;
+        sum += IPPROTO_TCP as u32; // next header = 6
+        // TCP segment data.
+        i = 0;
+        while i + 1 < tcp_data.len() {
+            sum += ((tcp_data[i] as u32) << 8) | (tcp_data[i + 1] as u32);
+            i += 2;
+        }
+        if i < tcp_data.len() {
+            sum += (tcp_data[i] as u32) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    // ---------------------------------------------------------------
+    // TCP6: send segments
+    // ---------------------------------------------------------------
+
+    fn build_tcp6_segment(
+        &mut self,
+        dst_ip: &[u8; 16],
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) {
+        let tcp_len = 20 + payload.len();
+        let mut seg = [0u8; 1460];
+        put_u16_be(&mut seg, 0, src_port);
+        put_u16_be(&mut seg, 2, dst_port);
+        put_u32_be(&mut seg, 4, seq);
+        put_u32_be(&mut seg, 8, ack);
+        seg[12] = 5 << 4; // data offset = 5 (20 bytes header)
+        seg[13] = flags;
+        put_u16_be(&mut seg, 14, TCP6_WINDOW);
+        if !payload.is_empty() {
+            seg[20..20 + payload.len()].copy_from_slice(payload);
+        }
+        // Compute checksum.
+        let src = self.src_for(dst_ip);
+        let cksum = Self::tcp6_checksum(&src, dst_ip, &seg[..tcp_len]);
+        seg[16] = (cksum >> 8) as u8;
+        seg[17] = cksum as u8;
+
+        let mac = self.dst_mac_for(dst_ip);
+        self.send_ipv6(dst_ip, IPPROTO_TCP, &seg[..tcp_len], mac, 64);
+    }
+
+    fn send_tcp6_for_conn(&mut self, idx: usize, flags: u8, payload: &[u8]) {
+        let dst_ip = self.tcp6[idx].remote_ip;
+        let src_port = self.tcp6[idx].local_port;
+        let dst_port = self.tcp6[idx].remote_port;
+        let seq = self.tcp6[idx].snd_nxt;
+        let ack = self.tcp6[idx].rcv_nxt;
+        self.build_tcp6_segment(&dst_ip, src_port, dst_port, seq, ack, flags, payload);
+    }
+
+    // ---------------------------------------------------------------
+    // TCP6: connect (active open)
+    // ---------------------------------------------------------------
+
+    fn handle_tcp6_connect(&mut self, dst_ip: [u8; 16], dst_port: u16, reply_port: u64) {
+        // Loopback: if connecting to our own address, short-circuit.
+        let is_loopback = dst_ip == self.link_local
+            || (self.has_global && dst_ip == self.global_addr);
+
+        if is_loopback {
+            self.handle_tcp6_connect_loopback(dst_ip, dst_port, reply_port);
+            return;
+        }
+
+        let slot = self.tcp6.iter().position(|c| c.state == TCP_ST_CLOSED);
+        let slot = match slot {
+            Some(s) => s,
+            None => {
+                syscall::send_nb(reply_port, TCP6_FAIL, 1, 0);
+                return;
+            }
+        };
+        let local_port = self.tcp6_next_port;
+        self.tcp6_next_port = self.tcp6_next_port.wrapping_add(1);
+        if self.tcp6_next_port < 49152 {
+            self.tcp6_next_port = 49152;
+        }
+
+        let isn = self.tcp6_isn;
+        self.tcp6_isn = self.tcp6_isn.wrapping_add(64000);
+
+        self.tcp6[slot] = TcpConn6 {
+            state: TCP_ST_SYN_SENT,
+            local_port,
+            remote_ip: dst_ip,
+            remote_port: dst_port,
+            snd_nxt: isn,
+            snd_una: isn,
+            rcv_nxt: 0,
+            reply_port,
+            recv_reply_port: 0,
+            rx_buf: [0; TCP6_RX_BUF_SIZE],
+            rx_head: 0,
+            rx_tail: 0,
+            timeout: 0,
+        };
+
+        // Send SYN.
+        self.build_tcp6_segment(&dst_ip, local_port, dst_port, isn, 0, TCP_SYN, &[]);
+    }
+
+    /// Loopback connect: create both client and server connections internally.
+    fn handle_tcp6_connect_loopback(&mut self, dst_ip: [u8; 16], dst_port: u16, reply_port: u64) {
+        // Check listen slot.
+        let listen_idx = self.listen6.iter().position(|l| l.active && l.port == dst_port);
+        if listen_idx.is_none() {
+            syscall::send_nb(reply_port, TCP6_FAIL, 2, 0);
+            return;
+        }
+        let listen_idx = listen_idx.unwrap();
+
+        // Need two free connection slots.
+        let client_slot = self.tcp6.iter().position(|c| c.state == TCP_ST_CLOSED);
+        let client_slot = match client_slot {
+            Some(s) => s,
+            None => {
+                syscall::send_nb(reply_port, TCP6_FAIL, 1, 0);
+                return;
+            }
+        };
+        // Find second free slot, skipping client_slot.
+        let server_slot = self.tcp6.iter().enumerate().position(|(i, c)| {
+            i != client_slot && c.state == TCP_ST_CLOSED
+        });
+        let server_slot = match server_slot {
+            Some(s) => s,
+            None => {
+                syscall::send_nb(reply_port, TCP6_FAIL, 1, 0);
+                return;
+            }
+        };
+
+        let local_port = self.tcp6_next_port;
+        self.tcp6_next_port = self.tcp6_next_port.wrapping_add(1);
+        if self.tcp6_next_port < 49152 {
+            self.tcp6_next_port = 49152;
+        }
+
+        let isn_c = self.tcp6_isn;
+        self.tcp6_isn = self.tcp6_isn.wrapping_add(64000);
+        let isn_s = self.tcp6_isn;
+        self.tcp6_isn = self.tcp6_isn.wrapping_add(64000);
+
+        // Client connection (active open).
+        self.tcp6[client_slot] = TcpConn6 {
+            state: TCP_ST_ESTABLISHED,
+            local_port,
+            remote_ip: dst_ip,
+            remote_port: dst_port,
+            snd_nxt: isn_c.wrapping_add(1),
+            snd_una: isn_c.wrapping_add(1),
+            rcv_nxt: isn_s.wrapping_add(1),
+            reply_port: 0,
+            recv_reply_port: 0,
+            rx_buf: [0; TCP6_RX_BUF_SIZE],
+            rx_head: 0,
+            rx_tail: 0,
+            timeout: 0,
+        };
+
+        // Server connection (passive open).
+        self.tcp6[server_slot] = TcpConn6 {
+            state: TCP_ST_ESTABLISHED,
+            local_port: dst_port,
+            remote_ip: dst_ip,
+            remote_port: local_port,
+            snd_nxt: isn_s.wrapping_add(1),
+            snd_una: isn_s.wrapping_add(1),
+            rcv_nxt: isn_c.wrapping_add(1),
+            reply_port: 0,
+            recv_reply_port: 0,
+            rx_buf: [0; TCP6_RX_BUF_SIZE],
+            rx_head: 0,
+            rx_tail: 0,
+            timeout: 0,
+        };
+
+        // Reply CONNECTED with client slot.
+        syscall::send_nb(reply_port, TCP6_CONNECTED, client_slot as u64, 0);
+
+        // Wire up pending accept if any.
+        let accept_rp = self.listen6[listen_idx].accept_reply_port;
+        if accept_rp != 0 {
+            self.listen6[listen_idx].accept_reply_port = 0;
+            syscall::send_nb(accept_rp, TCP6_ACCEPT_OK, server_slot as u64, 0);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // TCP6: RX state machine
+    // ---------------------------------------------------------------
+
+    fn handle_tcp6_rx(&mut self, src_ip: &[u8; 16], tcp_data: &[u8]) {
+        if tcp_data.len() < 20 {
+            return;
+        }
+        let src_port = get_u16_be(tcp_data, 0);
+        let dst_port = get_u16_be(tcp_data, 2);
+        let seq = get_u32_be(tcp_data, 4);
+        let ack = get_u32_be(tcp_data, 8);
+        let data_off = ((tcp_data[12] >> 4) as usize) * 4;
+        let flags = tcp_data[13];
+        let payload = if data_off < tcp_data.len() {
+            &tcp_data[data_off..]
+        } else {
+            &[]
+        };
+
+        // Find matching connection.
+        let idx = self.tcp6.iter().position(|c| {
+            c.state != TCP_ST_CLOSED
+                && c.local_port == dst_port
+                && c.remote_port == src_port
+                && c.remote_ip == *src_ip
+        });
+        let idx = match idx {
+            Some(i) => i,
+            None => {
+                if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
+                    self.handle_incoming_syn6(*src_ip, src_port, dst_port, seq);
+                }
+                return;
+            }
+        };
+
+        if flags & TCP_RST != 0 {
+            let reply_port = self.tcp6[idx].reply_port;
+            self.tcp6[idx].state = TCP_ST_CLOSED;
+            syscall::send_nb(reply_port, TCP6_FAIL, 2, 0);
+            return;
+        }
+
+        match self.tcp6[idx].state {
+            TCP_ST_SYN_SENT => {
+                if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 {
+                    if ack != self.tcp6[idx].snd_nxt.wrapping_add(1) {
+                        return;
+                    }
+                    self.tcp6[idx].snd_una = ack;
+                    self.tcp6[idx].snd_nxt = ack;
+                    self.tcp6[idx].rcv_nxt = seq.wrapping_add(1);
+                    self.tcp6[idx].state = TCP_ST_ESTABLISHED;
+                    self.tcp6[idx].timeout = 0;
+                    self.send_tcp6_for_conn(idx, TCP_ACK, &[]);
+                    let reply_port = self.tcp6[idx].reply_port;
+                    syscall::send_nb(reply_port, TCP6_CONNECTED, idx as u64, 0);
+                }
+            }
+            TCP_ST_SYN_RECEIVED => {
+                if flags & TCP_ACK != 0 {
+                    self.tcp6[idx].snd_una = ack;
+                    self.tcp6[idx].state = TCP_ST_ESTABLISHED;
+                    self.tcp6[idx].timeout = 0;
+                    let reply_port = self.tcp6[idx].reply_port;
+                    if reply_port != 0 {
+                        self.tcp6[idx].reply_port = 0;
+                        syscall::send_nb(reply_port, TCP6_ACCEPT_OK, idx as u64, 0);
+                    }
+                }
+            }
+            TCP_ST_ESTABLISHED => {
+                if flags & TCP_ACK != 0 {
+                    self.tcp6[idx].snd_una = ack;
+                }
+                if !payload.is_empty() && seq == self.tcp6[idx].rcv_nxt {
+                    self.tcp6[idx].rcv_nxt = seq.wrapping_add(payload.len() as u32);
+                    self.tcp6[idx].rx_push(payload);
+                    self.send_tcp6_for_conn(idx, TCP_ACK, &[]);
+                    if self.tcp6[idx].recv_reply_port != 0 {
+                        self.tcp6_deliver_pending = true;
+                    }
+                }
+                if flags & TCP_FIN != 0 {
+                    self.tcp6[idx].rcv_nxt = self.tcp6[idx].rcv_nxt.wrapping_add(1);
+                    self.send_tcp6_for_conn(idx, TCP_ACK, &[]);
+                    self.tcp6[idx].state = TCP_ST_CLOSE_WAIT;
+                }
+            }
+            TCP_ST_FIN_WAIT_1 => {
+                if flags & TCP_ACK != 0 {
+                    self.tcp6[idx].snd_una = ack;
+                    if flags & TCP_FIN != 0 {
+                        self.tcp6[idx].rcv_nxt = seq.wrapping_add(1);
+                        self.send_tcp6_for_conn(idx, TCP_ACK, &[]);
+                        self.tcp6[idx].state = TCP_ST_TIME_WAIT;
+                        self.tcp6[idx].timeout = 0;
+                    } else {
+                        self.tcp6[idx].state = TCP_ST_FIN_WAIT_2;
+                    }
+                }
+            }
+            TCP_ST_FIN_WAIT_2 => {
+                if flags & TCP_FIN != 0 {
+                    self.tcp6[idx].rcv_nxt = seq.wrapping_add(1);
+                    self.send_tcp6_for_conn(idx, TCP_ACK, &[]);
+                    self.tcp6[idx].state = TCP_ST_TIME_WAIT;
+                    self.tcp6[idx].timeout = 0;
+                }
+            }
+            TCP_ST_LAST_ACK => {
+                if flags & TCP_ACK != 0 {
+                    self.tcp6[idx].state = TCP_ST_CLOSED;
+                    let reply_port = self.tcp6[idx].reply_port;
+                    syscall::send_nb(reply_port, TCP6_CLOSE_OK, idx as u64, 0);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // TCP6: passive open (listen/accept)
+    // ---------------------------------------------------------------
+
+    fn handle_incoming_syn6(&mut self, src_ip: [u8; 16], src_port: u16, dst_port: u16, seq: u32) {
+        let listen_idx = self.listen6.iter().position(|l| l.active && l.port == dst_port);
+        if listen_idx.is_none() {
+            return;
+        }
+        let listen_idx = listen_idx.unwrap();
+
+        let slot = self.tcp6.iter().position(|c| c.state == TCP_ST_CLOSED);
+        let slot = match slot {
+            Some(s) => s,
+            None => return,
+        };
+
+        let isn = self.tcp6_isn;
+        self.tcp6_isn = self.tcp6_isn.wrapping_add(64000);
+
+        self.tcp6[slot] = TcpConn6 {
+            state: TCP_ST_SYN_RECEIVED,
+            local_port: dst_port,
+            remote_ip: src_ip,
+            remote_port: src_port,
+            snd_nxt: isn.wrapping_add(1),
+            snd_una: isn,
+            rcv_nxt: seq.wrapping_add(1),
+            reply_port: 0,
+            recv_reply_port: 0,
+            rx_buf: [0; TCP6_RX_BUF_SIZE],
+            rx_head: 0,
+            rx_tail: 0,
+            timeout: 0,
+        };
+
+        // Send SYN-ACK.
+        self.build_tcp6_segment(&src_ip, dst_port, src_port, isn, seq.wrapping_add(1), TCP_SYN | TCP_ACK, &[]);
+
+        // Wire up pending accept.
+        let accept_rp = self.listen6[listen_idx].accept_reply_port;
+        if accept_rp != 0 {
+            self.listen6[listen_idx].accept_reply_port = 0;
+            self.tcp6[slot].reply_port = accept_rp;
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // TCP6: data delivery
+    // ---------------------------------------------------------------
+
+    fn deliver_tcp6_data(&mut self, idx: usize, reply_port: u64) {
+        let mut buf = [0u8; 24];
+        let n = self.tcp6[idx].rx_pop(&mut buf);
+        if n == 0 {
+            return;
+        }
+        let mut d1: u64 = 0;
+        let mut d2: u64 = 0;
+        let mut d3: u64 = 0;
+        for i in 0..n.min(8) {
+            d1 |= (buf[i] as u64) << (i * 8);
+        }
+        for i in 0..n.saturating_sub(8).min(8) {
+            d2 |= (buf[8 + i] as u64) << (i * 8);
+        }
+        for i in 0..n.saturating_sub(16).min(8) {
+            d3 |= (buf[16 + i] as u64) << (i * 8);
+        }
+        syscall::send_nb_4(reply_port, TCP6_DATA, n as u64, d1, d2, d3);
+    }
+
+    fn handle_tcp6_send(&mut self, conn_id: usize, payload: &[u8], reply_port: u64) {
+        if conn_id >= MAX_TCP6_CONNS || self.tcp6[conn_id].state != TCP_ST_ESTABLISHED {
+            syscall::send_nb(reply_port, TCP6_FAIL, 0, 0);
+            return;
+        }
+
+        // Check for loopback peer: find the matching reverse connection.
+        let remote_ip = self.tcp6[conn_id].remote_ip;
+        let is_loopback = remote_ip == self.link_local
+            || (self.has_global && remote_ip == self.global_addr);
+
+        if is_loopback {
+            // Find peer connection (reverse direction).
+            let local_port = self.tcp6[conn_id].local_port;
+            let remote_port = self.tcp6[conn_id].remote_port;
+            let peer = self.tcp6.iter().enumerate().position(|(i, c)| {
+                i != conn_id
+                    && c.state == TCP_ST_ESTABLISHED
+                    && c.local_port == remote_port
+                    && c.remote_port == local_port
+                    && c.remote_ip == remote_ip
+            });
+            if let Some(peer_idx) = peer {
+                self.tcp6[peer_idx].rx_push(payload);
+                self.tcp6[peer_idx].rcv_nxt = self.tcp6[peer_idx].rcv_nxt.wrapping_add(payload.len() as u32);
+                if self.tcp6[peer_idx].recv_reply_port != 0 {
+                    self.tcp6_deliver_pending = true;
+                }
+            }
+            self.tcp6[conn_id].snd_nxt = self.tcp6[conn_id].snd_nxt.wrapping_add(payload.len() as u32);
+            syscall::send_nb(reply_port, TCP6_SEND_OK, conn_id as u64, 0);
+        } else {
+            self.send_tcp6_for_conn(conn_id, TCP_ACK | TCP_PSH, payload);
+            self.tcp6[conn_id].snd_nxt = self.tcp6[conn_id].snd_nxt.wrapping_add(payload.len() as u32);
+            syscall::send_nb(reply_port, TCP6_SEND_OK, conn_id as u64, 0);
+        }
+    }
+
+    fn handle_tcp6_recv(&mut self, conn_id: usize, reply_port: u64) {
+        if conn_id >= MAX_TCP6_CONNS || self.tcp6[conn_id].state == TCP_ST_CLOSED {
+            syscall::send_nb(reply_port, TCP6_FAIL, 0, 0);
+            return;
+        }
+        if self.tcp6[conn_id].state == TCP_ST_ESTABLISHED || self.tcp6[conn_id].rx_len() > 0 {
+            self.tcp6[conn_id].recv_reply_port = reply_port;
+            if self.tcp6[conn_id].rx_len() > 0 {
+                self.tcp6_deliver_pending = true;
+            }
+        } else {
+            syscall::send_nb(reply_port, TCP6_CLOSED, conn_id as u64, 0);
+        }
+    }
+
+    fn handle_tcp6_close(&mut self, conn_id: usize, reply_port: u64) {
+        if conn_id >= MAX_TCP6_CONNS {
+            syscall::send_nb(reply_port, TCP6_FAIL, 0, 0);
+            return;
+        }
+        self.tcp6[conn_id].reply_port = reply_port;
+        match self.tcp6[conn_id].state {
+            TCP_ST_ESTABLISHED => {
+                self.send_tcp6_for_conn(conn_id, TCP_FIN | TCP_ACK, &[]);
+                self.tcp6[conn_id].snd_nxt = self.tcp6[conn_id].snd_nxt.wrapping_add(1);
+                self.tcp6[conn_id].state = TCP_ST_FIN_WAIT_1;
+                self.tcp6[conn_id].timeout = 0;
+            }
+            TCP_ST_CLOSE_WAIT => {
+                self.send_tcp6_for_conn(conn_id, TCP_FIN | TCP_ACK, &[]);
+                self.tcp6[conn_id].snd_nxt = self.tcp6[conn_id].snd_nxt.wrapping_add(1);
+                self.tcp6[conn_id].state = TCP_ST_LAST_ACK;
+                self.tcp6[conn_id].timeout = 0;
+            }
+            _ => {
+                self.tcp6[conn_id].state = TCP_ST_CLOSED;
+                syscall::send_nb(reply_port, TCP6_CLOSE_OK, conn_id as u64, 0);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // TCP6: bind/listen/accept
+    // ---------------------------------------------------------------
+
+    fn handle_tcp6_bind(&self, _port: u16, reply_port: u64) {
+        syscall::send_nb(reply_port, TCP6_BIND_OK, 0, 0);
+    }
+
+    fn handle_tcp6_listen(&mut self, port: u16, reply_port: u64) {
+        let slot = self.listen6.iter().position(|l| !l.active);
+        match slot {
+            Some(s) => {
+                self.listen6[s] = ListenSlot6 {
+                    active: true,
+                    port,
+                    accept_reply_port: 0,
+                };
+                syscall::send_nb(reply_port, TCP6_LISTEN_OK, port as u64, 0);
+            }
+            None => {
+                syscall::send_nb(reply_port, TCP6_LISTEN_FAIL, 0, 0);
+            }
+        }
+    }
+
+    fn handle_tcp6_accept(&mut self, port: u16, reply_port: u64) {
+        // Check for already-established connections on this port.
+        for i in 0..MAX_TCP6_CONNS {
+            if (self.tcp6[i].state == TCP_ST_ESTABLISHED || self.tcp6[i].state == TCP_ST_SYN_RECEIVED)
+                && self.tcp6[i].local_port == port
+            {
+                if self.tcp6[i].state == TCP_ST_ESTABLISHED {
+                    syscall::send_nb(reply_port, TCP6_ACCEPT_OK, i as u64, 0);
+                    return;
+                }
+                self.tcp6[i].reply_port = reply_port;
+                return;
+            }
+        }
+        // Defer in listen slot.
+        for l in self.listen6.iter_mut() {
+            if l.active && l.port == port {
+                l.accept_reply_port = reply_port;
+                return;
+            }
+        }
+        syscall::send_nb(reply_port, TCP6_ACCEPT_FAIL, 0, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // TCP6: timeouts
+    // ---------------------------------------------------------------
+
+    fn tick_tcp6(&mut self) {
+        for i in 0..MAX_TCP6_CONNS {
+            match self.tcp6[i].state {
+                TCP_ST_SYN_SENT => {
+                    self.tcp6[i].timeout += 1;
+                    if self.tcp6[i].timeout % 500 == 0 && self.tcp6[i].timeout < TCP6_TIMEOUT {
+                        let dst_ip = self.tcp6[i].remote_ip;
+                        let src_port = self.tcp6[i].local_port;
+                        let dst_port = self.tcp6[i].remote_port;
+                        let seq = self.tcp6[i].snd_una;
+                        self.build_tcp6_segment(&dst_ip, src_port, dst_port, seq, 0, TCP_SYN, &[]);
+                    }
+                    if self.tcp6[i].timeout >= TCP6_TIMEOUT {
+                        let reply_port = self.tcp6[i].reply_port;
+                        self.tcp6[i].state = TCP_ST_CLOSED;
+                        syscall::send_nb(reply_port, TCP6_FAIL, 3, 0);
+                    }
+                }
+                TCP_ST_SYN_RECEIVED => {
+                    self.tcp6[i].timeout += 1;
+                    if self.tcp6[i].timeout >= TCP6_TIMEOUT {
+                        self.tcp6[i].state = TCP_ST_CLOSED;
+                    }
+                }
+                TCP_ST_FIN_WAIT_1 | TCP_ST_FIN_WAIT_2 | TCP_ST_LAST_ACK => {
+                    self.tcp6[i].timeout += 1;
+                    if self.tcp6[i].timeout >= TCP6_TIMEOUT {
+                        let reply_port = self.tcp6[i].reply_port;
+                        self.tcp6[i].state = TCP_ST_CLOSED;
+                        syscall::send_nb(reply_port, TCP6_CLOSE_OK, i as u64, 0);
+                    }
+                }
+                TCP_ST_TIME_WAIT => {
+                    self.tcp6[i].timeout += 1;
+                    if self.tcp6[i].timeout >= TCP6_TIME_WAIT_TIMEOUT {
+                        let reply_port = self.tcp6[i].reply_port;
+                        self.tcp6[i].state = TCP_ST_CLOSED;
+                        syscall::send_nb(reply_port, TCP6_CLOSE_OK, i as u64, 0);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn deliver_pending_tcp6_recvs(&mut self) {
+        for i in 0..MAX_TCP6_CONNS {
+            let recv_port = self.tcp6[i].recv_reply_port;
+            if recv_port == 0 {
+                continue;
+            }
+            if self.tcp6[i].rx_len() > 0 {
+                self.tcp6[i].recv_reply_port = 0;
+                self.deliver_tcp6_data(i, recv_port);
+            } else if self.tcp6[i].state != TCP_ST_ESTABLISHED {
+                self.tcp6[i].recv_reply_port = 0;
+                syscall::send_nb(recv_port, TCP6_CLOSED, i as u64, 0);
+            }
+        }
+    }
 }
 
 // --- Helpers ---
@@ -695,6 +1439,29 @@ fn eui64_link_local(mac: [u8; 6]) -> [u8; 16] {
     addr[14] = mac[4];
     addr[15] = mac[5];
     addr
+}
+
+fn get_u16_be(buf: &[u8], off: usize) -> u16 {
+    ((buf[off] as u16) << 8) | (buf[off + 1] as u16)
+}
+
+fn get_u32_be(buf: &[u8], off: usize) -> u32 {
+    ((buf[off] as u32) << 24)
+        | ((buf[off + 1] as u32) << 16)
+        | ((buf[off + 2] as u32) << 8)
+        | (buf[off + 3] as u32)
+}
+
+fn put_u16_be(buf: &mut [u8], off: usize, val: u16) {
+    buf[off] = (val >> 8) as u8;
+    buf[off + 1] = val as u8;
+}
+
+fn put_u32_be(buf: &mut [u8], off: usize, val: u32) {
+    buf[off] = (val >> 24) as u8;
+    buf[off + 1] = (val >> 16) as u8;
+    buf[off + 2] = (val >> 8) as u8;
+    buf[off + 3] = val as u8;
 }
 
 // ---------------------------------------------------------------
@@ -799,18 +1566,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // Poll-based server loop.
     let mut tick: u64 = 0;
     loop {
-        // 1. Poll IPC (netif input notifications + client requests).
-        if let Some(msg) = syscall::recv_nb_msg(my_port) {
+        // 1. Drain all queued IPC messages.
+        while let Some(msg) = syscall::recv_nb_msg(my_port) {
             match msg.tag {
                 NETIF_INPUT => {
-                    // Frame from eth_srv.
                     let payload_len = msg.data[0] as usize;
                     let src_mac = u64_to_mac(msg.data[1]);
                     dev.handle_input(payload_len, src_mac);
                 }
                 IP6_PING => {
-                    // Ping6 request from a client.
-                    // data[0..1] = target IPv6 address (16 bytes packed in 2 u64s)
                     let reply_port = msg.data[2];
                     let mut target = [0u8; 16];
                     let d0 = msg.data[0];
@@ -825,7 +1589,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 IP6_STATUS => {
                     let reply_port = msg.data[0];
-                    // Pack link-local address into 2 u64s.
                     let mut a0 = 0u64;
                     let mut a1 = 0u64;
                     for i in 0..8 {
@@ -837,7 +1600,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::send_nb_4(reply_port, IP6_STATUS_OK, a0, a1, mac_to_u64(dev.mac), 0);
                 }
                 IP6_GATEWAY => {
-                    // Return gateway link-local address (from RA).
                     let reply_port = msg.data[0];
                     if dev.has_gateway {
                         let mut g0 = 0u64;
@@ -853,20 +1615,89 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         syscall::send_nb(reply_port, IP6_GATEWAY_NONE, 0, 0);
                     }
                 }
+                // --- TCP6 IPC ---
+                TCP6_CONNECT => {
+                    // data[0..1] = dest IPv6 (16 bytes in 2 u64s)
+                    // data[2] = dst_port(low16) | reply_port(high48)
+                    let mut dst = [0u8; 16];
+                    let d0 = msg.data[0];
+                    let d1 = msg.data[1];
+                    for i in 0..8 { dst[i] = (d0 >> (i * 8)) as u8; }
+                    for i in 0..8 { dst[8 + i] = (d1 >> (i * 8)) as u8; }
+                    let dst_port = msg.data[2] as u16;
+                    let reply_port = msg.data[2] >> 16;
+                    dev.handle_tcp6_connect(dst, dst_port, reply_port);
+                }
+                TCP6_SEND => {
+                    let conn_id = msg.data[0] as usize;
+                    let len = (msg.data[1] & 0xFFFF) as usize;
+                    let reply_port = msg.data[1] >> 16;
+                    let mut payload = [0u8; 16];
+                    let d2 = msg.data[2];
+                    let d3 = msg.data[3];
+                    for i in 0..8 { payload[i] = (d2 >> (i * 8)) as u8; }
+                    for i in 0..8 { payload[8 + i] = (d3 >> (i * 8)) as u8; }
+                    dev.handle_tcp6_send(conn_id, &payload[..len.min(16)], reply_port);
+                }
+                TCP6_RECV => {
+                    let conn_id = msg.data[0] as usize;
+                    let reply_port = msg.data[1] >> 16;
+                    dev.handle_tcp6_recv(conn_id, reply_port);
+                }
+                TCP6_RECV_NB => {
+                    let conn_id = msg.data[0] as usize;
+                    let reply_port = msg.data[1] >> 16;
+                    if conn_id >= MAX_TCP6_CONNS || dev.tcp6[conn_id].state == TCP_ST_CLOSED {
+                        syscall::send_nb(reply_port, TCP6_FAIL, 0, 0);
+                    } else if dev.tcp6[conn_id].rx_len() > 0 {
+                        dev.deliver_tcp6_data(conn_id, reply_port);
+                    } else if dev.tcp6[conn_id].state != TCP_ST_ESTABLISHED {
+                        syscall::send_nb(reply_port, TCP6_CLOSED, conn_id as u64, 0);
+                    } else {
+                        syscall::send_nb(reply_port, TCP6_RECV_NONE, 0, 0);
+                    }
+                }
+                TCP6_CLOSE => {
+                    let conn_id = msg.data[0] as usize;
+                    let reply_port = msg.data[1];
+                    dev.handle_tcp6_close(conn_id, reply_port);
+                }
+                TCP6_BIND => {
+                    let port_num = msg.data[0] as u16;
+                    let reply_port = msg.data[1] >> 32;
+                    dev.handle_tcp6_bind(port_num, reply_port);
+                }
+                TCP6_LISTEN => {
+                    let port_num = msg.data[0] as u16;
+                    let reply_port = msg.data[2] >> 32;
+                    dev.handle_tcp6_listen(port_num, reply_port);
+                }
+                TCP6_ACCEPT => {
+                    let port_num = msg.data[0] as u16;
+                    let reply_port = msg.data[1] >> 32;
+                    dev.handle_tcp6_accept(port_num, reply_port);
+                }
                 _ => {}
             }
         }
 
-        // 2. Tick timeouts.
+        // 2. Deliver pending TCP6 data.
+        if dev.tcp6_deliver_pending {
+            dev.tcp6_deliver_pending = false;
+            dev.deliver_pending_tcp6_recvs();
+        }
+
+        // 3. Tick timeouts.
         dev.tick_ping();
+        dev.tick_tcp6();
         tick += 1;
 
-        // 3. Retransmit RS periodically until gateway discovered.
+        // 4. Retransmit RS periodically until gateway discovered.
         if !dev.has_gateway && tick % 500 == 0 {
             dev.send_router_solicit();
         }
 
-        // 4. Yield.
+        // 5. Yield.
         syscall::yield_now();
     }
 }
