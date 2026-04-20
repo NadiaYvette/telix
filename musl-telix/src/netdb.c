@@ -1,9 +1,12 @@
-/* DNS resolver / getaddrinfo for Telix. */
+/* DNS resolver / getaddrinfo for Telix.
+ * Resolves hostnames by sending DNS_RESOLVE to tcp4_srv (which queries
+ * QEMU SLIRP DNS at 10.0.2.3:53 over UDP). */
 #include <netdb.h>
 #include <string.h>
 #include <telix/syscall.h>
+#include <telix/ipc.h>
 
-/* Simple numeric IP parser: "a.b.c.d" → network-order u32.  Returns 0 on failure. */
+/* Simple numeric IPv4 parser: "a.b.c.d" -> network-order u32.  Returns 0 on failure. */
 static int parse_ipv4(const char *s, uint32_t *out) {
     uint32_t parts[4];
     int pi = 0;
@@ -42,9 +45,57 @@ static int parse_port(const char *s) {
     return val;
 }
 
+static int my_strlen(const char *s) {
+    int n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
 /* Minimal malloc from our malloc.c */
 extern void *malloc(unsigned long size);
 extern void free(void *ptr);
+
+/* Server port for tcp4_srv ("net" service). */
+extern uint32_t __telix_net_port;
+
+/* Resolve a hostname via DNS_RESOLVE IPC to tcp4_srv.
+ * Returns 1 on success (fills *out_ip with network-order IPv4).
+ * Returns 0 on failure.
+ *
+ * Message format:
+ *   data[0..2] = hostname (up to 24 bytes, LE byte pack)
+ *   data[3] = namelen(low32) | reply_port(high32)
+ */
+static int dns_resolve(const char *hostname, uint32_t *out_ip) {
+    if (__telix_net_port == 0xFFFFFFFF) return 0;
+
+    int namelen = my_strlen(hostname);
+    if (namelen == 0 || namelen > 24) return 0;
+
+    /* Pack name into d0..d2 (24 bytes max). */
+    uint64_t d0 = 0, d1 = 0, d2 = 0;
+    for (int i = 0; i < namelen && i < 8; i++)
+        d0 |= (uint64_t)(unsigned char)hostname[i] << (i * 8);
+    for (int i = 8; i < namelen && i < 16; i++)
+        d1 |= (uint64_t)(unsigned char)hostname[i] << ((i - 8) * 8);
+    for (int i = 16; i < namelen && i < 24; i++)
+        d2 |= (uint64_t)(unsigned char)hostname[i] << ((i - 16) * 8);
+
+    uint32_t rp = telix_port_create();
+    uint64_t d3 = (uint64_t)(unsigned)namelen | ((uint64_t)rp << 32);
+
+    telix_send(__telix_net_port, DNS_RESOLVE, d0, d1, d2, d3);
+
+    struct telix_msg reply;
+    int ok = telix_recv_msg(rp, &reply);
+    telix_port_destroy(rp);
+
+    if (ok != 0 || reply.tag != DNS_RESOLVE_OK) return 0;
+
+    /* reply.data[0] = IPv4 address (network byte order as u32 in u64). */
+    *out_ip = (uint32_t)reply.data[0];
+    return 1;
+}
 
 int getaddrinfo(const char *node, const char *service,
                 const struct addrinfo *hints, struct addrinfo **res) {
@@ -61,10 +112,16 @@ int getaddrinfo(const char *node, const char *service,
     if (node == 0 || node[0] == '\0') {
         /* AI_PASSIVE: bind to INADDR_ANY. */
         addr = 0;
-    } else if (!parse_ipv4(node, &addr)) {
-        /* Non-numeric — DNS resolution would go here.
-         * For now, return EAI_NONAME for non-numeric hosts. */
+    } else if (parse_ipv4(node, &addr)) {
+        /* Numeric IPv4 address — no lookup needed. */
+    } else if (hints && (hints->ai_flags & AI_NUMERICHOST)) {
+        /* Caller explicitly said numeric-only, don't attempt DNS. */
         return EAI_NONAME;
+    } else {
+        /* Hostname: attempt DNS resolution. */
+        if (!dns_resolve(node, &addr)) {
+            return EAI_NONAME;
+        }
     }
 
     if (service) {
@@ -77,12 +134,12 @@ int getaddrinfo(const char *node, const char *service,
 
     struct sockaddr_in *sa = (struct sockaddr_in *)(ai + 1);
     memset(sa, 0, sizeof(*sa));
-    sa->sin_family = (uint16_t)family;
+    sa->sin_family = AF_INET;
     sa->sin_port = htons(port);
     sa->sin_addr = addr;
 
     ai->ai_flags = 0;
-    ai->ai_family = family;
+    ai->ai_family = AF_INET;
     ai->ai_socktype = socktype;
     ai->ai_protocol = (socktype == SOCK_DGRAM) ? 17 : 6;
     ai->ai_addrlen = sizeof(struct sockaddr_in);

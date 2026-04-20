@@ -92,6 +92,11 @@ struct telix_msg {
 #define UDP6_CLOSE       0x6C00
 #define UDP6_CLOSE_OK    0x6C01
 
+/* DNS resolution via tcp4_srv. */
+#define DNS_RESOLVE      0x4800
+#define DNS_RESOLVE_OK   0x4801
+#define DNS_RESOLVE_FAIL 0x48FF
+
 /* Pipe protocol tags (Phase 59). */
 #define PIPE_CREATE_TAG  0x5010
 #define PIPE_WRITE_TAG   0x5020

@@ -54,6 +54,14 @@ const NET_TCP_BIND_OK: u64 = 0x4601;
 const NET_TCP_LISTEN: u64 = 0x4700;
 const NET_TCP_LISTEN_OK: u64 = 0x4701;
 const NET_TCP_LISTEN_FAIL: u64 = 0x47FF;
+
+// DNS resolution via UDP to 10.0.2.3:53 (QEMU SLIRP DNS).
+const DNS_RESOLVE: u64 = 0x4800;
+const DNS_RESOLVE_OK: u64 = 0x4801;
+const DNS_RESOLVE_FAIL: u64 = 0x48FF;
+const DNS_SERVER_IP: [u8; 4] = [10, 0, 2, 3];
+const DNS_PORT: u16 = 53;
+const DNS_LOCAL_PORT: u16 = 61053;
 const NET_TCP_ACCEPT: u64 = 0x4710;
 const NET_TCP_ACCEPT_OK: u64 = 0x4711;
 const NET_TCP_ACCEPT_FAIL: u64 = 0x47FE;
@@ -209,6 +217,11 @@ struct Tcp4Dev {
     ping_polls: u32,
     ping_sent_icmp: bool,
 
+    // DNS resolver state.
+    dns_active: bool,
+    dns_reply_port: u64,
+    dns_txid: u16,
+    dns_polls: u32,
 }
 
 impl Tcp4Dev {
@@ -232,6 +245,10 @@ impl Tcp4Dev {
             ping_polls: 0,
             ping_sent_icmp: false,
             deliver_pending: false,
+            dns_active: false,
+            dns_reply_port: 0,
+            dns_txid: 0,
+            dns_polls: 0,
         }
     }
 
@@ -350,6 +367,7 @@ impl Tcp4Dev {
         match proto {
             1 => self.handle_icmp(src_ip, &data[ihl..end]),
             6 => self.handle_tcp_rx(src_ip, &data[ihl..end]),
+            17 => self.handle_udp_rx(src_ip, &data[ihl..end]),
             _ => {}
         }
     }
@@ -416,6 +434,221 @@ impl Tcp4Dev {
         icmp[2] = (cksum >> 8) as u8;
         icmp[3] = cksum as u8;
         self.send_ipv4(dst_ip, 1, &icmp, dst_mac);
+    }
+
+    // ---------------------------------------------------------------
+    // DNS resolver (UDP to 10.0.2.3:53)
+    // ---------------------------------------------------------------
+
+    /// Handle incoming UDP packet — only used for DNS responses.
+    fn handle_udp_rx(&mut self, _src_ip: [u8; 4], data: &[u8]) {
+        if data.len() < 8 {
+            return;
+        }
+        let dst_port = get_u16_be(data, 2);
+        if dst_port != DNS_LOCAL_PORT || !self.dns_active {
+            return;
+        }
+        // UDP payload starts at offset 8.
+        let payload = &data[8..];
+        self.handle_dns_response(payload);
+    }
+
+    /// Parse DNS response and reply to caller.
+    fn handle_dns_response(&mut self, data: &[u8]) {
+        // DNS header: ID(2) + Flags(2) + QDCOUNT(2) + ANCOUNT(2) + NSCOUNT(2) + ARCOUNT(2)
+        if data.len() < 12 {
+            return;
+        }
+        let txid = get_u16_be(data, 0);
+        if txid != self.dns_txid {
+            return;
+        }
+        let flags = get_u16_be(data, 2);
+        let rcode = flags & 0x000F;
+        if rcode != 0 {
+            // Non-zero RCODE = error.
+            syscall::send_nb(self.dns_reply_port, DNS_RESOLVE_FAIL, 0, 0);
+            self.dns_active = false;
+            return;
+        }
+        let ancount = get_u16_be(data, 6);
+        if ancount == 0 {
+            syscall::send_nb(self.dns_reply_port, DNS_RESOLVE_FAIL, 0, 0);
+            self.dns_active = false;
+            return;
+        }
+        // Skip question section: find the first answer.
+        let mut off = 12;
+        // Skip QDCOUNT questions (each: name + QTYPE(2) + QCLASS(2)).
+        let qdcount = get_u16_be(data, 4);
+        for _ in 0..qdcount {
+            off = self.skip_dns_name(data, off);
+            off += 4; // QTYPE + QCLASS
+        }
+        // Parse answer records looking for A (type 1) or AAAA (type 28).
+        for _ in 0..ancount {
+            if off >= data.len() {
+                break;
+            }
+            off = self.skip_dns_name(data, off);
+            if off + 10 > data.len() {
+                break;
+            }
+            let rtype = get_u16_be(data, off);
+            let rdlength = get_u16_be(data, off + 8) as usize;
+            off += 10; // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2)
+            if rtype == 1 && rdlength == 4 && off + 4 <= data.len() {
+                // A record: 4-byte IPv4 address.
+                let ip = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+                syscall::send_nb(self.dns_reply_port, DNS_RESOLVE_OK, ip as u64, 0);
+                self.dns_active = false;
+                return;
+            }
+            if rtype == 28 && rdlength == 16 && off + 16 <= data.len() {
+                // AAAA record: 16-byte IPv6 address. Pack into 2 u64s.
+                let mut a0 = 0u64;
+                let mut a1 = 0u64;
+                for i in 0..8 {
+                    a0 |= (data[off + i] as u64) << (i * 8);
+                }
+                for i in 0..8 {
+                    a1 |= (data[off + 8 + i] as u64) << (i * 8);
+                }
+                // Return as type=28 in data[2] so caller knows it's IPv6.
+                syscall::send_nb_4(self.dns_reply_port, DNS_RESOLVE_OK, a0, a1, 28, 0);
+                self.dns_active = false;
+                return;
+            }
+            off += rdlength;
+        }
+        // No A/AAAA found.
+        syscall::send_nb(self.dns_reply_port, DNS_RESOLVE_FAIL, 0, 0);
+        self.dns_active = false;
+    }
+
+    /// Skip a DNS name (handles compression pointers).
+    fn skip_dns_name(&self, data: &[u8], mut off: usize) -> usize {
+        loop {
+            if off >= data.len() {
+                return off;
+            }
+            let len = data[off] as usize;
+            if len == 0 {
+                return off + 1;
+            }
+            if len & 0xC0 == 0xC0 {
+                // Compression pointer — 2 bytes total.
+                return off + 2;
+            }
+            off += 1 + len;
+        }
+    }
+
+    /// Build and send a DNS A query for the given hostname (max 24 bytes).
+    fn handle_dns_resolve(&mut self, name: &[u8], name_len: usize, reply_port: u64) {
+        if self.dns_active {
+            // Already have a pending query.
+            syscall::send_nb(reply_port, DNS_RESOLVE_FAIL, 0, 0);
+            return;
+        }
+
+        // Build DNS query packet.
+        // Header(12) + Question(name_encoded + QTYPE(2) + QCLASS(2))
+        let mut pkt = [0u8; 512];
+        // Transaction ID.
+        self.dns_txid = self.dns_txid.wrapping_add(1);
+        let txid = self.dns_txid;
+        pkt[0] = (txid >> 8) as u8;
+        pkt[1] = txid as u8;
+        // Flags: standard query, recursion desired.
+        pkt[2] = 0x01; // RD=1
+        pkt[3] = 0x00;
+        // QDCOUNT = 1.
+        pkt[4] = 0;
+        pkt[5] = 1;
+        // ANCOUNT, NSCOUNT, ARCOUNT = 0.
+
+        // Encode hostname as DNS name (labels).
+        let mut off = 12;
+        let mut label_start = 0;
+        let actual_len = name_len.min(name.len());
+        for i in 0..actual_len {
+            if name[i] == b'.' {
+                let label_len = i - label_start;
+                if label_len == 0 || label_len > 63 || off + 1 + label_len > 500 {
+                    syscall::send_nb(reply_port, DNS_RESOLVE_FAIL, 0, 0);
+                    return;
+                }
+                pkt[off] = label_len as u8;
+                off += 1;
+                pkt[off..off + label_len].copy_from_slice(&name[label_start..i]);
+                off += label_len;
+                label_start = i + 1;
+            }
+        }
+        // Last label (after final dot, or no dots at all).
+        let label_len = actual_len - label_start;
+        if label_len > 0 {
+            if label_len > 63 || off + 1 + label_len > 500 {
+                syscall::send_nb(reply_port, DNS_RESOLVE_FAIL, 0, 0);
+                return;
+            }
+            pkt[off] = label_len as u8;
+            off += 1;
+            pkt[off..off + label_len].copy_from_slice(&name[label_start..actual_len]);
+            off += label_len;
+        }
+        // Null terminator for name.
+        pkt[off] = 0;
+        off += 1;
+        // QTYPE = A (1).
+        pkt[off] = 0;
+        pkt[off + 1] = 1;
+        off += 2;
+        // QCLASS = IN (1).
+        pkt[off] = 0;
+        pkt[off + 1] = 1;
+        off += 2;
+
+        let dns_payload_len = off;
+
+        // Build UDP header (8 bytes) + DNS payload.
+        let udp_len = 8 + dns_payload_len;
+        let mut udp = [0u8; 600];
+        // Src port.
+        udp[0] = (DNS_LOCAL_PORT >> 8) as u8;
+        udp[1] = DNS_LOCAL_PORT as u8;
+        // Dst port.
+        udp[2] = (DNS_PORT >> 8) as u8;
+        udp[3] = DNS_PORT as u8;
+        // Length.
+        udp[4] = (udp_len >> 8) as u8;
+        udp[5] = udp_len as u8;
+        // Checksum = 0 (optional for IPv4 UDP).
+        udp[6] = 0;
+        udp[7] = 0;
+        // DNS payload.
+        udp[8..8 + dns_payload_len].copy_from_slice(&pkt[..dns_payload_len]);
+
+        // Send as IPv4 UDP (proto 17) to DNS server.
+        let mac = self.dst_mac_for(DNS_SERVER_IP);
+        self.send_ipv4(DNS_SERVER_IP, 17, &udp[..udp_len], mac);
+
+        self.dns_active = true;
+        self.dns_reply_port = reply_port;
+        self.dns_polls = 0;
+    }
+
+    /// Tick DNS timeout.
+    fn tick_dns(&mut self) {
+        if self.dns_active {
+            self.dns_polls += 1;
+            if self.dns_polls > 5000 {
+                syscall::send_nb(self.dns_reply_port, DNS_RESOLVE_FAIL, 0, 0);
+                self.dns_active = false;
+            }
+        }
     }
 
     // ---------------------------------------------------------------
@@ -1168,6 +1401,20 @@ fn handle_msg(dev: &mut Tcp4Dev, msg: &syscall::Message) {
             let reply_port = msg.data[1] >> 32;
             dev.handle_tcp_accept(port_num, reply_port);
         }
+        DNS_RESOLVE => {
+            // data[0..2] = hostname (up to 24 bytes packed LE in 3 u64s)
+            // data[3] = name_len(low32) | reply_port(high32)
+            let mut name_buf = [0u8; 24];
+            let d0 = msg.data[0];
+            let d1 = msg.data[1];
+            let d2 = msg.data[2];
+            for i in 0..8 { name_buf[i] = (d0 >> (i * 8)) as u8; }
+            for i in 0..8 { name_buf[8 + i] = (d1 >> (i * 8)) as u8; }
+            for i in 0..8 { name_buf[16 + i] = (d2 >> (i * 8)) as u8; }
+            let name_len = (msg.data[3] & 0xFFFFFFFF) as usize;
+            let reply_port = msg.data[3] >> 32;
+            dev.handle_dns_resolve(&name_buf, name_len.min(24), reply_port);
+        }
         NET_TCP_RECV_NB => {
             let conn_id = msg.data[0] as usize;
             let reply_port = msg.data[1] >> 16;
@@ -1316,6 +1563,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // 3. Tick timeouts.
         dev.tick_ping();
         dev.tick_tcp();
+        dev.tick_dns();
 
         // 4. Yield.
         syscall::yield_now();

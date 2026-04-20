@@ -7,6 +7,7 @@
 /* Address families. */
 #define AF_UNSPEC 0
 #define AF_INET   2
+#define AF_INET6  10
 
 /* Socket types. */
 #define SOCK_STREAM 1
@@ -33,6 +34,14 @@ struct sockaddr_in {
     uint16_t sin_port;
     uint32_t sin_addr;
     char sin_zero[8];
+};
+
+struct sockaddr_in6 {
+    uint16_t sin6_family;
+    uint16_t sin6_port;
+    uint32_t sin6_flowinfo;
+    uint8_t  sin6_addr[16];
+    uint32_t sin6_scope_id;
 };
 
 struct addrinfo {

@@ -2410,6 +2410,44 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Test 19d: DNS resolution ---
+    syscall::debug_puts(b"  init: testing DNS resolution...\n");
+    {
+        const DNS_RESOLVE: u64 = 0x4800;
+        const DNS_RESOLVE_OK: u64 = 0x4801;
+
+        let mut dns_ok = false;
+        let mut net_port_opt: Option<u64> = None;
+        for _ in 0..20 {
+            net_port_opt = syscall::ns_lookup(b"net");
+            if net_port_opt.is_some() { break; }
+            syscall::sleep_ms(10);
+        }
+        if let Some(net_port) = net_port_opt {
+            let rp = syscall::port_create();
+            // Resolve "google.com" (10 bytes).
+            let name = b"google.com";
+            let mut d0 = 0u64;
+            let mut d1 = 0u64;
+            for i in 0..8 { d0 |= (name[i] as u64) << (i * 8); }
+            for i in 8..10 { d1 |= (name[i] as u64) << ((i - 8) * 8); }
+            let d3 = 10u64 | ((rp as u64) << 32);
+            syscall::send(net_port, DNS_RESOLVE, d0, d1, 0, d3);
+
+            if let Some(reply) = syscall::recv_msg_timeout(rp, 10_000_000) {
+                if reply.tag == DNS_RESOLVE_OK && reply.data[0] != 0 {
+                    dns_ok = true;
+                }
+            }
+            syscall::port_destroy(rp);
+        }
+        if dns_ok {
+            syscall::debug_puts(b"Phase 19d DNS resolve: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 19d DNS resolve: FAILED\n");
+        }
+    }
+
     // --- Test 20: Signal/Kill ---
     syscall::debug_puts(b"  init: testing signal/kill...\n");
     {
