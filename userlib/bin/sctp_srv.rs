@@ -66,6 +66,13 @@ const RX_BUF_SIZE: usize = 1024;
 const MAX_DATA_CHUNK_PAYLOAD: usize = 64; // Limited by IPC inline data
 const COOKIE_KEY: u64 = 0x5C7B_C001_1E5E_C873;
 
+// --- Retransmission timer constants (RFC 4960 Section 6.3) ---
+const RTO_INITIAL_US: u64 = 3_000_000;   // 3 seconds
+const RTO_MIN_US: u64 = 1_000_000;       // 1 second
+const RTO_MAX_US: u64 = 60_000_000;      // 60 seconds
+const MAX_RETRANSMITS: u8 = 10;          // Max retransmissions before abort
+const MAX_UNACKED_PKT: usize = 300;      // Max stored unacked packet size
+
 // Built-in echo server port.
 const ECHO_PORT: u16 = 7;
 
@@ -133,6 +140,13 @@ struct Association {
     recv_reply_port: u64,  // Pending SCTP_RECV caller (0 = none)
     // Cookie (for COOKIE-ECHO verification).
     cookie: u64,
+    // Retransmission timer state (RFC 4960 Section 6.3).
+    rto_us: u64,           // Current RTO in microseconds
+    t3_deadline_ns: u64,   // T3-rtx expiry (absolute ns, 0 = stopped)
+    retransmit_count: u8,  // Number of retransmissions for current DATA
+    unacked_tsn: u32,      // Lowest unacknowledged TSN
+    unacked_pkt: [u8; MAX_UNACKED_PKT], // Stored packet for retransmission
+    unacked_len: usize,    // Length of stored packet (0 = nothing to retransmit)
 }
 
 impl Association {
@@ -160,6 +174,12 @@ impl Association {
             reply_port: 0,
             recv_reply_port: 0,
             cookie: 0,
+            rto_us: RTO_INITIAL_US,
+            t3_deadline_ns: 0,
+            retransmit_count: 0,
+            unacked_tsn: 0,
+            unacked_pkt: [0u8; MAX_UNACKED_PKT],
+            unacked_len: 0,
         }
     }
 
@@ -1294,8 +1314,24 @@ fn handle_rx_sack(data: &[u8], off: usize, chunk_len: usize,
     };
 
     if let Some(i) = idx {
-        unsafe { ASSOCS[i].cum_tsn_ack = cum_tsn; }
+        unsafe {
+            let a = &mut ASSOCS[i];
+            a.cum_tsn_ack = cum_tsn;
+            // If SACK acknowledges our unacked DATA, stop T3-rtx (RFC 4960 6.3.2 R3).
+            if a.unacked_len > 0 && tsn_le(a.unacked_tsn, cum_tsn) {
+                a.t3_deadline_ns = 0;
+                a.unacked_len = 0;
+                a.retransmit_count = 0;
+                a.rto_us = RTO_INITIAL_US; // Reset RTO on successful ACK
+            }
+        }
     }
+}
+
+/// TSN comparison: a <= b (with wrapping, RFC 4960 serial arithmetic).
+fn tsn_le(a: u32, b: u32) -> bool {
+    let diff = b.wrapping_sub(a);
+    diff == 0 || diff < 0x8000_0000
 }
 
 fn handle_rx_heartbeat(data: &[u8], off: usize, chunk_len: usize,
@@ -1379,8 +1415,90 @@ fn udp_send_data(assoc_idx: usize, payload: &[u8]) {
         let clen = build_data_chunk(&mut pkt, 12, tsn, stream_id, ssn, 0, payload);
         let total = 12 + clen;
         stamp_sctp_checksum(&mut pkt, total);
+
+        // Store packet for T3-rtx retransmission (RFC 4960 Section 6.3.2).
+        if total <= MAX_UNACKED_PKT {
+            a.unacked_pkt[..total].copy_from_slice(&pkt[..total]);
+            a.unacked_len = total;
+            a.unacked_tsn = tsn;
+            a.retransmit_count = 0;
+            // Start T3-rtx timer.
+            a.t3_deadline_ns = syscall::clock_gettime() + a.rto_us * 1000;
+        }
+
         udp_send_sctp(assoc_idx, &pkt, total);
     }
+}
+
+// -------------------------------------------------------------------
+// T3-rtx retransmission timer (RFC 4960 Section 6.3).
+// -------------------------------------------------------------------
+
+/// Check all associations for expired T3-rtx timers and retransmit.
+fn check_retransmission_timers() {
+    let now = syscall::clock_gettime();
+    for i in 0..MAX_ASSOCIATIONS {
+        unsafe {
+            let a = &mut ASSOCS[i];
+            if a.state != STATE_ESTABLISHED || a.transport != TRANSPORT_UDP {
+                continue;
+            }
+            if a.t3_deadline_ns == 0 || a.unacked_len == 0 {
+                continue;
+            }
+            if now < a.t3_deadline_ns {
+                continue;
+            }
+
+            // T3-rtx expired.
+            a.retransmit_count += 1;
+            if a.retransmit_count > MAX_RETRANSMITS {
+                syscall::debug_puts(b"  [sctp_srv] T3-rtx: max retransmits, aborting assoc\n");
+                if a.recv_reply_port != 0 {
+                    syscall::send(a.recv_reply_port, SCTP_RECV_NONE, 0, 0, 0, 0);
+                }
+                if a.reply_port != 0 {
+                    syscall::send(a.reply_port, SCTP_ASSOC_FAIL, 5, 0, 0, 0);
+                }
+                a.reset();
+                continue;
+            }
+
+            // Exponential backoff: double RTO, clamped to RTO_MAX.
+            a.rto_us = (a.rto_us * 2).min(RTO_MAX_US);
+
+            // Retransmit the stored packet.
+            let len = a.unacked_len;
+            let mut pkt = [0u8; MAX_UNACKED_PKT];
+            pkt[..len].copy_from_slice(&a.unacked_pkt[..len]);
+            // Restart T3-rtx with new (doubled) RTO.
+            a.t3_deadline_ns = syscall::clock_gettime() + a.rto_us * 1000;
+
+            syscall::debug_puts(b"  [sctp_srv] T3-rtx: retransmit #");
+            print_num(a.retransmit_count as u64);
+            syscall::debug_puts(b" rto=");
+            print_num(a.rto_us / 1000);
+            syscall::debug_puts(b"ms\n");
+
+            udp_send_sctp(i, &pkt, len);
+        }
+    }
+}
+
+/// Compute the next T3-rtx deadline across all associations (0 = no timer running).
+fn next_t3_deadline_ns() -> u64 {
+    let mut earliest: u64 = 0;
+    for i in 0..MAX_ASSOCIATIONS {
+        unsafe {
+            let a = &ASSOCS[i];
+            if a.state == STATE_ESTABLISHED && a.t3_deadline_ns != 0 {
+                if earliest == 0 || a.t3_deadline_ns < earliest {
+                    earliest = a.t3_deadline_ns;
+                }
+            }
+        }
+    }
+    earliest
 }
 
 // -------------------------------------------------------------------
@@ -1404,10 +1522,33 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // Main service loop.
+    // Uses timeout-based recv to support T3-rtx retransmission timers.
     loop {
-        let msg = match syscall::recv_msg(port) {
+        // Compute timeout: if a T3-rtx timer is running, wake at its deadline.
+        let deadline = next_t3_deadline_ns();
+        let msg_opt = if deadline != 0 {
+            let now = syscall::clock_gettime();
+            if now >= deadline {
+                // Already expired — check timers immediately.
+                check_retransmission_timers();
+                // Try non-blocking recv after timer processing.
+                syscall::recv_nb_msg(port)
+            } else {
+                let wait_us = (deadline - now) / 1000;
+                syscall::recv_msg_timeout(port, wait_us.max(1))
+            }
+        } else {
+            // No timers running — block indefinitely.
+            syscall::recv_msg(port)
+        };
+
+        let msg = match msg_opt {
             Some(m) => m,
-            None => continue,
+            None => {
+                // Timeout — check retransmission timers.
+                check_retransmission_timers();
+                continue;
+            }
         };
 
         match msg.tag {
