@@ -255,3 +255,7 @@ path = "bin/iwl_srv.rs"
 [[bin]]
 name = "mtk_srv"
 path = "bin/mtk_srv.rs"
+
+[[bin]]
+name = "ntfs_srv"
+path = "bin/ntfs_srv.rs"
