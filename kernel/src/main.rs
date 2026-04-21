@@ -342,6 +342,26 @@ fn startup_thread() -> ! {
             }
         }
 
+        // MediaTek 5G modem discovery and mtk_srv spawn.
+        if let Some(mtk) = arch::x86_64::pci::find_mtk_device() {
+            let region_id = cap::mmio::register_region(
+                mtk.bar0 as usize,
+                mtk.bar0_size as usize,
+                cap::mmio::CacheAttr::Device,
+            );
+            let arg0_upper = (mtk.irq as u64) << 48;
+            let spawned = match region_id {
+                Some(rid) => {
+                    sched::spawn_user_with_mmio_cap(b"mtk_srv", 50, 20, arg0_upper, rid)
+                }
+                None => sched::spawn_user(b"mtk_srv", 50, 20, arg0_upper),
+            };
+            match spawned {
+                Some(tid) => println!("  mtk_srv spawned (thread {})", tid),
+                None => println!("  WARNING: mtk_srv not found (ok if not yet built)"),
+            }
+        }
+
         // Probe BochsVBE (QEMU -vga std) and set up framebuffer info.
         arch::x86_64::pci::probe_bochs_vbe();
         // Register the VBE framebuffer as an MMIO region so fb_srv and

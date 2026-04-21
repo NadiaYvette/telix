@@ -5816,6 +5816,39 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 188: MediaTek 5G modem driver ---
+    syscall::debug_puts(b"  init: Phase 188 MediaTek 5G modem driver...\n");
+    {
+        // mtk_srv only runs when real MediaTek 5G hardware is present.
+        // In QEMU there is no T7xx device, so ns_lookup will fail.
+        match syscall::ns_lookup(b"wwan") {
+            Some(wwan_port) => {
+                const NETIF_STATUS: u64 = 0x5400;
+                const NETIF_STATUS_OK: u64 = 0x5401;
+                let reply = syscall::call(wwan_port, NETIF_STATUS, 0, 0, 0, 0);
+                match reply {
+                    Some(r) if r.tag == NETIF_STATUS_OK => {
+                        let mac_val = r.data[0];
+                        if mac_val != 0 {
+                            syscall::debug_puts(b"Phase 188 5G modem: PASSED (online)\n");
+                        } else {
+                            syscall::debug_puts(b"Phase 188 5G modem: FAILED (no IMEI)\n");
+                        }
+                    }
+                    Some(_) => {
+                        syscall::debug_puts(b"Phase 188 5G modem: FAILED (bad reply)\n");
+                    }
+                    None => {
+                        syscall::debug_puts(b"Phase 188 5G modem: FAILED (no reply)\n");
+                    }
+                }
+            }
+            None => {
+                syscall::debug_puts(b"Phase 188 5G modem: SKIPPED (no mtk_srv, expected in QEMU)\n");
+            }
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

@@ -251,3 +251,7 @@ path = "bin/nvme_srv.rs"
 [[bin]]
 name = "iwl_srv"
 path = "bin/iwl_srv.rs"
+
+[[bin]]
+name = "mtk_srv"
+path = "bin/mtk_srv.rs"
