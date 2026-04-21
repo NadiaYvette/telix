@@ -5595,6 +5595,42 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 183: B.A.T.M.A.N. mesh status ---
+    syscall::debug_puts(b"  init: Phase 183 batman mesh status...\n");
+    {
+        const BAT_STATUS: u64 = 0x5500;
+        const BAT_STATUS_OK: u64 = 0x5501;
+
+        match syscall::ns_lookup(b"bat0") {
+            Some(bat_port) => {
+                let rp = syscall::port_create();
+                syscall::send_nb(bat_port, BAT_STATUS, rp, 0);
+                match syscall::recv_msg_timeout(rp, 2_000_000) {
+                    Some(msg) if msg.tag == BAT_STATUS_OK => {
+                        let orig_count = msg.data[0];
+                        let neigh_count = msg.data[1];
+                        let ogm_seqno = msg.data[2];
+                        syscall::debug_puts(b"  bat0: originators=");
+                        print_num(orig_count);
+                        syscall::debug_puts(b" neighbors=");
+                        print_num(neigh_count);
+                        syscall::debug_puts(b" ogm_seqno=");
+                        print_num(ogm_seqno);
+                        syscall::debug_puts(b"\n");
+                        syscall::debug_puts(b"Phase 183 batman mesh: PASSED\n");
+                    }
+                    _ => {
+                        syscall::debug_puts(b"Phase 183 batman mesh: FAILED (no reply)\n");
+                    }
+                }
+                syscall::port_destroy(rp);
+            }
+            None => {
+                syscall::debug_puts(b"Phase 183 batman mesh: SKIPPED (no bat0)\n");
+            }
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

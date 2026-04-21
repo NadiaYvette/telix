@@ -1757,7 +1757,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // Prefer bat0 (B.A.T.M.A.N. mesh) if available, fall back to eth.
     let eth_port = {
         let mut found = None;
-        for _ in 0..20 {
+        for _ in 0..50 {
             if let Some(p) = syscall::ns_lookup(b"bat0") {
                 found = Some(p);
                 break;

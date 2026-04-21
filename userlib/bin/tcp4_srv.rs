@@ -131,7 +131,21 @@ const RAW_IP_RX_BUF_SIZE: usize = 1400;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 
 // Static IP config (matches QEMU user-net defaults).
-const MY_IP: [u8; 4] = [10, 0, 2, 15];
+/// Default IP for SLIRP user-mode networking.
+const DEFAULT_IP: [u8; 4] = [10, 0, 2, 15];
+/// Runtime IP — overridden to 10.0.0.mac[5] when connected to bat0 mesh.
+/// Single-threaded, so safe to access via the helper functions below.
+static mut MY_IP_STORAGE: [u8; 4] = [10, 0, 2, 15];
+
+#[inline(always)]
+fn my_ip() -> [u8; 4] {
+    unsafe { MY_IP_STORAGE }
+}
+
+#[inline(always)]
+fn set_my_ip(ip: [u8; 4]) {
+    unsafe { MY_IP_STORAGE = ip; }
+}
 const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 
 // ---------------------------------------------------------------
@@ -386,7 +400,7 @@ impl Tcp4Dev {
             *hdr.add(10) = 0;
             *hdr.add(11) = 0;
             // Source IP.
-            core::ptr::copy_nonoverlapping(MY_IP.as_ptr(), hdr.add(12), 4);
+            core::ptr::copy_nonoverlapping(my_ip().as_ptr(), hdr.add(12), 4);
             // Destination IP.
             core::ptr::copy_nonoverlapping(dst_ip.as_ptr(), hdr.add(16), 4);
             // Compute IP header checksum.
@@ -836,7 +850,7 @@ impl Tcp4Dev {
         reply_port: u64,
     ) {
         // Loopback: if dst is our own IP, deliver directly.
-        if dst_ip == MY_IP || dst_ip == [127, 0, 0, 1] {
+        if dst_ip == my_ip() || dst_ip == [127, 0, 0, 1] {
             if let Some(idx) = self.udp4.iter().position(|b| b.active && b.local_port == dst_port) {
                 let recv_rp = self.udp4[idx].recv_reply_port;
                 if recv_rp != 0 {
@@ -844,15 +858,15 @@ impl Tcp4Dev {
                     let gva = self.udp4[idx].recv_grant_va;
                     if gva != 0 {
                         self.udp4[idx].recv_grant_va = 0;
-                        self.deliver_udp4_datagram_buf(recv_rp, &MY_IP, src_port, payload, gva);
+                        self.deliver_udp4_datagram_buf(recv_rp, &my_ip(), src_port, payload, gva);
                     } else {
-                        self.deliver_udp4_datagram(recv_rp, &MY_IP, src_port, payload);
+                        self.deliver_udp4_datagram(recv_rp, &my_ip(), src_port, payload);
                     }
                 } else {
                     let copy_len = payload.len().min(UDP4_RX_BUF_SIZE);
                     self.udp4[idx].rx_buf[..copy_len].copy_from_slice(&payload[..copy_len]);
                     self.udp4[idx].rx_len = copy_len;
-                    self.udp4[idx].rx_src_ip = MY_IP;
+                    self.udp4[idx].rx_src_ip = my_ip();
                     self.udp4[idx].rx_src_port = src_port;
                 }
             }
@@ -1040,8 +1054,8 @@ impl Tcp4Dev {
             return;
         }
         // Loopback: if destination is our own IP, deliver directly.
-        if dst_ip == MY_IP || dst_ip == [127, 0, 0, 1] {
-            self.handle_raw_ip_rx(MY_IP, protocol, payload);
+        if dst_ip == my_ip() || dst_ip == [127, 0, 0, 1] {
+            self.handle_raw_ip_rx(my_ip(), protocol, payload);
             syscall::send_nb(reply_port, NET_RAW_SEND_OK, 0, 0);
             return;
         }
@@ -1136,7 +1150,7 @@ impl Tcp4Dev {
             tcp_seg[20..20 + payload.len()].copy_from_slice(payload);
         }
         // TCP checksum (pseudo-header + segment).
-        let cksum = tcp_checksum(&MY_IP, &dst_ip, &tcp_seg[..tcp_len]);
+        let cksum = tcp_checksum(&my_ip(), &dst_ip, &tcp_seg[..tcp_len]);
         tcp_seg[16] = (cksum >> 8) as u8;
         tcp_seg[17] = cksum as u8;
 
@@ -1758,7 +1772,7 @@ fn handle_msg(dev: &mut Tcp4Dev, msg: &syscall::Message) {
         NET_STATUS => {
             let reply_port = msg.data[0];
             let mac_val = mac_to_u64(dev.mac);
-            let ip_val = u32::from_be_bytes(MY_IP) as u64;
+            let ip_val = u32::from_be_bytes(my_ip()) as u64;
             syscall::send_nb(reply_port, NET_STATUS_OK, mac_val, ip_val);
         }
         NET_PING => {
@@ -2021,9 +2035,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  [tcp4_srv] starting\n");
 
     // Prefer bat0 (B.A.T.M.A.N. mesh) if available, fall back to eth.
+    let mut is_mesh = false;
     let eth_port = {
         let mut found = None;
-        for _ in 0..20 {
+        for _ in 0..50 {
             if let Some(p) = syscall::ns_lookup(b"bat0") {
                 found = Some(p);
                 break;
@@ -2033,6 +2048,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         match found {
             Some(p) => {
                 syscall::debug_puts(b"  [tcp4_srv] using bat0 (mesh)\n");
+                is_mesh = true;
                 p
             }
             None => match syscall::ns_lookup_wait(b"eth") {
@@ -2063,10 +2079,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     };
     syscall::port_destroy(reply_port);
 
+    // If connected to bat0 with a mesh-assigned MAC (52:54:00:00:00:xx),
+    // derive IP from MAC: 10.0.0.mac[5]. This gives each mesh node a
+    // unique IP. Default QEMU MACs (52:54:00:12:34:56) keep the SLIRP IP.
+    if is_mesh && mac[0] == 0x52 && mac[1] == 0x54
+        && mac[2] == 0x00 && mac[3] == 0x00 && mac[4] == 0x00
+        && mac[5] != 0
+    {
+        set_my_ip([10, 0, 0, mac[5]]);
+    }
+
     syscall::debug_puts(b"  [tcp4_srv] MAC=");
     print_mac(mac);
     syscall::debug_puts(b" IP=");
-    print_ip(MY_IP);
+    print_ip(my_ip());
     syscall::debug_puts(b"\n");
 
     // Create our IPC port.
