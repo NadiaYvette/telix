@@ -44,7 +44,13 @@ const MTU: usize = 1500;
 
 const BATMAN_VERSION: u8 = 15;
 const BATMAN_PACKET_OGM: u8 = 0x01;
-const OGM_SIZE: usize = 26; // 26-byte OGM (no TVLVs for now)
+const BATMAN_PACKET_BCAST: u8 = 0x02;
+const BATMAN_PACKET_UNICAST: u8 = 0x03;
+const OGM_SIZE: usize = 26;       // 26-byte OGM (no TVLVs)
+const UNICAST_HDR_SIZE: usize = 12; // unicast encapsulation header
+const BCAST_HDR_SIZE: usize = 14;   // broadcast encapsulation header
+const INNER_ETH_HDR: usize = 14;    // inner ethernet header (dst+src+ethertype)
+const BATMAN_MTU: usize = MTU - BCAST_HDR_SIZE - INNER_ETH_HDR; // 1472
 
 const OGM_INTERVAL_NS: u64 = 1_000_000_000;   // 1 second
 const OGM_PURGE_NS: u64 = 200_000_000_000;     // 200 seconds
@@ -54,6 +60,7 @@ const TQ_LOCAL_WINDOW_SIZE: u32 = 64;
 
 const MAX_NEIGHBORS: usize = 16;
 const MAX_ORIGINATORS: usize = 16;
+const BCAST_DEDUP_SIZE: usize = 64;
 
 // -------------------------------------------------------------------
 // Data structures.
@@ -175,6 +182,11 @@ struct BatmanDev {
     originators: [Originator; MAX_ORIGINATORS],
     last_ogm_ns: u64,
     bat_ctrl_idx: usize, // downstream index for 0x4305
+    // Broadcast encapsulation
+    bcast_seqno: u32,
+    bcast_dedup_orig: [[u8; 6]; BCAST_DEDUP_SIZE],
+    bcast_dedup_seq: [u32; BCAST_DEDUP_SIZE],
+    bcast_dedup_head: usize,
 }
 
 // Grant page VA base for upstream clients.
@@ -382,6 +394,7 @@ impl BatmanDev {
 
     // ---------------------------------------------------------------
     // Proxy: NETIF_XMIT from upstream client → forward to eth_srv.
+    // If mesh peers exist, encapsulate in BATMAN unicast/broadcast.
     // ---------------------------------------------------------------
 
     fn handle_xmit(&mut self, client_id: usize, payload_len: usize,
@@ -393,38 +406,199 @@ impl BatmanDev {
             return;
         }
 
+        let dst_mac = if dst_mac_val == 0 { [0xFF; 6] } else { u64_to_mac(dst_mac_val) };
+        let is_broadcast = dst_mac == [0xFF; 6];
+        let has_mesh = self.neighbors.iter().any(|n| n.active);
+
+        if has_mesh {
+            if is_broadcast {
+                // Broadcast: encapsulate and flood via 0x4305 for mesh peers.
+                self.send_broadcast_encap(client_id, payload_len, dst_mac, ethertype);
+                // Also proxy directly for local/gateway destinations (fall through).
+            } else if let Some(next_hop) = self.lookup_next_hop(dst_mac) {
+                // Known mesh destination: unicast encapsulate to next-hop.
+                self.send_unicast_encap(client_id, payload_len, dst_mac, ethertype, next_hop);
+                syscall::send_nb(reply_port, NETIF_XMIT_OK, 0, 0);
+                return; // Don't also proxy directly for mesh-routed frames.
+            }
+            // Unknown destination: fall through to direct proxy (off-mesh / gateway).
+        }
+
+        // Direct proxy (Phase 1 behavior): copy payload and forward.
         let down_idx = self.upstream[client_id].downstream_idx;
         if !self.downstream[down_idx].active {
             return;
         }
-
-        let down = &self.downstream[down_idx];
-
-        // Copy payload from upstream client's TX grant page to downstream TX grant page.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 self.upstream[client_id].tx_va as *const u8,
-                down.tx_va as *mut u8,
+                self.downstream[down_idx].tx_va as *mut u8,
                 payload_len,
             );
         }
-
-        // Forward NETIF_XMIT to eth_srv.
         let xmit_reply = syscall::port_create();
         syscall::send_nb_4(
             self.eth_port,
             NETIF_XMIT,
-            payload_len as u64,                              // data[0]
-            dst_mac_val,                                      // data[1]
-            (ethertype as u64) | ((xmit_reply as u64) << 16), // data[2]
-            down.client_id,                                   // data[3]
+            payload_len as u64,
+            dst_mac_val,
+            (ethertype as u64) | ((xmit_reply as u64) << 16),
+            self.downstream[down_idx].client_id,
         );
-        // Wait for XMIT_OK from eth_srv.
         let _ = syscall::recv_msg_timeout(xmit_reply, 500_000);
         syscall::port_destroy(xmit_reply);
-
-        // Reply to upstream client.
         syscall::send_nb(reply_port, NETIF_XMIT_OK, 0, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Mesh routing: originator lookup.
+    // ---------------------------------------------------------------
+
+    /// Look up the best next-hop MAC for a destination.
+    /// For mesh nodes without bridging, dst_mac == originator MAC.
+    fn lookup_next_hop(&self, dst_mac: [u8; 6]) -> Option<[u8; 6]> {
+        for o in &self.originators {
+            if o.active && o.orig_mac == dst_mac {
+                return Some(o.best_next_hop);
+            }
+        }
+        None
+    }
+
+    // ---------------------------------------------------------------
+    // Unicast encapsulation: wrap frame in BATMAN unicast header.
+    // ---------------------------------------------------------------
+
+    /// Encapsulate an upstream client's payload in a BATMAN unicast frame
+    /// and send to the next-hop via 0x4305.
+    fn send_unicast_encap(
+        &self,
+        client_id: usize,
+        payload_len: usize,
+        dst_mac: [u8; 6],
+        ethertype: u16,
+        next_hop: [u8; 6],
+    ) {
+        let ctrl = &self.downstream[self.bat_ctrl_idx];
+        if !ctrl.active {
+            return;
+        }
+
+        // Total frame: unicast_hdr(12) + inner_eth_hdr(14) + payload
+        let total = UNICAST_HDR_SIZE + INNER_ETH_HDR + payload_len;
+        if total > MTU {
+            return;
+        }
+
+        let tx = ctrl.tx_va as *mut u8;
+        unsafe {
+            // Build unicast header [0..12]
+            *tx.add(0) = BATMAN_PACKET_UNICAST;  // packet_type
+            *tx.add(1) = BATMAN_VERSION;          // version
+            *tx.add(2) = OGM_DEFAULT_TTL;         // ttl
+            *tx.add(3) = 0;                       // reserved
+            // [4..10] destination originator MAC
+            core::ptr::copy_nonoverlapping(dst_mac.as_ptr(), tx.add(4), 6);
+            *tx.add(10) = 0; // ttvn
+            *tx.add(11) = 0; // reserved
+
+            // Build inner ethernet header [12..26]
+            core::ptr::copy_nonoverlapping(dst_mac.as_ptr(), tx.add(12), 6);     // inner dst
+            core::ptr::copy_nonoverlapping(self.mac.as_ptr(), tx.add(18), 6);    // inner src
+            *tx.add(24) = (ethertype >> 8) as u8;  // ethertype big-endian
+            *tx.add(25) = ethertype as u8;
+
+            // Copy payload [26..]
+            core::ptr::copy_nonoverlapping(
+                self.upstream[client_id].tx_va as *const u8,
+                tx.add(UNICAST_HDR_SIZE + INNER_ETH_HDR),
+                payload_len,
+            );
+        }
+
+        // Send via 0x4305 to next_hop.
+        let xmit_reply = syscall::port_create();
+        syscall::send_nb_4(
+            self.eth_port,
+            NETIF_XMIT,
+            total as u64,
+            mac_to_u64(next_hop),
+            (ETHERTYPE_BATMAN as u64) | ((xmit_reply as u64) << 16),
+            ctrl.client_id,
+        );
+        let _ = syscall::recv_msg_timeout(xmit_reply, 500_000);
+        syscall::port_destroy(xmit_reply);
+    }
+
+    // ---------------------------------------------------------------
+    // Broadcast encapsulation: wrap frame in BATMAN broadcast header.
+    // ---------------------------------------------------------------
+
+    /// Encapsulate an upstream client's payload in a BATMAN broadcast frame
+    /// and flood via 0x4305 (ethernet broadcast).
+    fn send_broadcast_encap(
+        &mut self,
+        client_id: usize,
+        payload_len: usize,
+        dst_mac: [u8; 6],
+        ethertype: u16,
+    ) {
+        let ctrl = &self.downstream[self.bat_ctrl_idx];
+        if !ctrl.active {
+            return;
+        }
+
+        // Total frame: bcast_hdr(14) + inner_eth_hdr(14) + payload
+        let total = BCAST_HDR_SIZE + INNER_ETH_HDR + payload_len;
+        if total > MTU {
+            return;
+        }
+
+        let tx = ctrl.tx_va as *mut u8;
+        let seq = self.bcast_seqno;
+        unsafe {
+            // Build broadcast header [0..14]
+            *tx.add(0) = BATMAN_PACKET_BCAST;  // packet_type
+            *tx.add(1) = BATMAN_VERSION;        // version
+            *tx.add(2) = OGM_DEFAULT_TTL;       // ttl
+            *tx.add(3) = 0;                     // reserved
+            // [4..10] originator MAC
+            core::ptr::copy_nonoverlapping(self.mac.as_ptr(), tx.add(4), 6);
+            // [10..14] broadcast seqno (u32 LE)
+            *tx.add(10) = seq as u8;
+            *tx.add(11) = (seq >> 8) as u8;
+            *tx.add(12) = (seq >> 16) as u8;
+            *tx.add(13) = (seq >> 24) as u8;
+
+            // Build inner ethernet header [14..28]
+            core::ptr::copy_nonoverlapping(dst_mac.as_ptr(), tx.add(14), 6);     // inner dst
+            core::ptr::copy_nonoverlapping(self.mac.as_ptr(), tx.add(20), 6);    // inner src
+            *tx.add(26) = (ethertype >> 8) as u8;  // ethertype big-endian
+            *tx.add(27) = ethertype as u8;
+
+            // Copy payload [28..]
+            core::ptr::copy_nonoverlapping(
+                self.upstream[client_id].tx_va as *const u8,
+                tx.add(BCAST_HDR_SIZE + INNER_ETH_HDR),
+                payload_len,
+            );
+        }
+
+        self.bcast_seqno = self.bcast_seqno.wrapping_add(1);
+
+        // Send via 0x4305 as ethernet broadcast (dst_mac=0).
+        let ctrl = &self.downstream[self.bat_ctrl_idx];
+        let xmit_reply = syscall::port_create();
+        syscall::send_nb_4(
+            self.eth_port,
+            NETIF_XMIT,
+            total as u64,
+            0u64, // broadcast
+            (ETHERTYPE_BATMAN as u64) | ((xmit_reply as u64) << 16),
+            ctrl.client_id,
+        );
+        let _ = syscall::recv_msg_timeout(xmit_reply, 500_000);
+        syscall::port_destroy(xmit_reply);
     }
 
     // ---------------------------------------------------------------
@@ -478,11 +652,15 @@ impl BatmanDev {
     // ---------------------------------------------------------------
 
     fn handle_status(&self, reply_port: u64) {
+        // Report reduced MTU if mesh is active so upstream clients
+        // don't send frames larger than we can encapsulate.
+        let has_mesh = self.neighbors.iter().any(|n| n.active);
+        let mtu = if has_mesh { BATMAN_MTU } else { MTU };
         syscall::send_nb(
             reply_port,
             NETIF_STATUS_OK,
             mac_to_u64(self.mac),
-            MTU as u64 | (1u64 << 32), // mtu | link_up flag
+            mtu as u64 | (1u64 << 32), // mtu | link_up flag
         );
     }
 
@@ -624,8 +802,224 @@ impl BatmanDev {
                 }
                 self.handle_rx_ogm(&ogm, src_mac);
             }
+            BATMAN_PACKET_UNICAST => {
+                self.handle_rx_unicast(payload_len);
+            }
+            BATMAN_PACKET_BCAST => {
+                self.handle_rx_broadcast(payload_len, src_mac);
+            }
             _ => {} // Phase 7: ELP, OGMv2
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Receive-side unicast decapsulation.
+    // ---------------------------------------------------------------
+
+    fn handle_rx_unicast(&mut self, payload_len: usize) {
+        if payload_len < UNICAST_HDR_SIZE + INNER_ETH_HDR {
+            return;
+        }
+
+        let rx_ptr = self.downstream[self.bat_ctrl_idx].rx_va as *const u8;
+        let ttl = unsafe { *rx_ptr.add(2) };
+
+        // Read destination originator MAC.
+        let mut dest_orig = [0u8; 6];
+        unsafe {
+            core::ptr::copy_nonoverlapping(rx_ptr.add(4), dest_orig.as_mut_ptr(), 6);
+        }
+
+        // Is this frame for us?
+        if dest_orig == self.mac {
+            // Decapsulate: extract inner ethernet frame.
+            let inner_start = UNICAST_HDR_SIZE; // offset 12
+            let inner_len = payload_len - UNICAST_HDR_SIZE;
+            self.deliver_inner_frame(rx_ptr, inner_start, inner_len);
+        } else if ttl > 1 {
+            // Relay: forward to next-hop with decremented TTL.
+            if let Some(next_hop) = self.lookup_next_hop(dest_orig) {
+                self.relay_unicast(payload_len, next_hop, ttl - 1);
+            }
+        }
+    }
+
+    /// Relay a unicast frame to the next-hop with updated TTL.
+    fn relay_unicast(&self, payload_len: usize, next_hop: [u8; 6], new_ttl: u8) {
+        let ctrl = &self.downstream[self.bat_ctrl_idx];
+        if !ctrl.active {
+            return;
+        }
+
+        // Copy entire frame from RX to TX, update TTL.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                ctrl.rx_va as *const u8,
+                ctrl.tx_va as *mut u8,
+                payload_len,
+            );
+            *(ctrl.tx_va as *mut u8).add(2) = new_ttl;
+        }
+
+        let xmit_reply = syscall::port_create();
+        syscall::send_nb_4(
+            self.eth_port,
+            NETIF_XMIT,
+            payload_len as u64,
+            mac_to_u64(next_hop),
+            (ETHERTYPE_BATMAN as u64) | ((xmit_reply as u64) << 16),
+            ctrl.client_id,
+        );
+        let _ = syscall::recv_msg_timeout(xmit_reply, 500_000);
+        syscall::port_destroy(xmit_reply);
+    }
+
+    // ---------------------------------------------------------------
+    // Receive-side broadcast decapsulation.
+    // ---------------------------------------------------------------
+
+    fn handle_rx_broadcast(&mut self, payload_len: usize, _src_mac: [u8; 6]) {
+        if payload_len < BCAST_HDR_SIZE + INNER_ETH_HDR {
+            return;
+        }
+
+        let rx_ptr = self.downstream[self.bat_ctrl_idx].rx_va as *const u8;
+        let ttl = unsafe { *rx_ptr.add(2) };
+
+        // Read originator MAC and seqno.
+        let mut orig = [0u8; 6];
+        unsafe {
+            core::ptr::copy_nonoverlapping(rx_ptr.add(4), orig.as_mut_ptr(), 6);
+        }
+
+        // Ignore our own broadcasts.
+        if orig == self.mac {
+            return;
+        }
+
+        let seqno = unsafe {
+            (*rx_ptr.add(10) as u32)
+                | ((*rx_ptr.add(11) as u32) << 8)
+                | ((*rx_ptr.add(12) as u32) << 16)
+                | ((*rx_ptr.add(13) as u32) << 24)
+        };
+
+        // Dedup check: if we've seen this (orig, seqno), drop it.
+        if !self.bcast_dedup_check(orig, seqno) {
+            return;
+        }
+
+        // Decapsulate: extract inner ethernet frame.
+        let inner_start = BCAST_HDR_SIZE; // offset 14
+        let inner_len = payload_len - BCAST_HDR_SIZE;
+        self.deliver_inner_frame(rx_ptr, inner_start, inner_len);
+
+        // Re-flood with TTL-1 if still alive.
+        if ttl > 1 {
+            self.reflood_broadcast(payload_len, ttl - 1);
+        }
+    }
+
+    /// Re-flood a broadcast frame with updated TTL.
+    fn reflood_broadcast(&self, payload_len: usize, new_ttl: u8) {
+        let ctrl = &self.downstream[self.bat_ctrl_idx];
+        if !ctrl.active {
+            return;
+        }
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                ctrl.rx_va as *const u8,
+                ctrl.tx_va as *mut u8,
+                payload_len,
+            );
+            *(ctrl.tx_va as *mut u8).add(2) = new_ttl;
+        }
+
+        let xmit_reply = syscall::port_create();
+        syscall::send_nb_4(
+            self.eth_port,
+            NETIF_XMIT,
+            payload_len as u64,
+            0u64, // broadcast
+            (ETHERTYPE_BATMAN as u64) | ((xmit_reply as u64) << 16),
+            ctrl.client_id,
+        );
+        let _ = syscall::recv_msg_timeout(xmit_reply, 500_000);
+        syscall::port_destroy(xmit_reply);
+    }
+
+    // ---------------------------------------------------------------
+    // Inner frame delivery to upstream clients.
+    // ---------------------------------------------------------------
+
+    /// Extract inner ethernet frame and deliver payload to the correct
+    /// upstream client based on inner ethertype.
+    fn deliver_inner_frame(&self, rx_ptr: *const u8, inner_start: usize, inner_len: usize) {
+        if inner_len < INNER_ETH_HDR {
+            return;
+        }
+
+        // Parse inner ethernet header.
+        let mut inner_src = [0u8; 6];
+        unsafe {
+            // inner_dst at inner_start+0 (6 bytes) — we don't need it
+            core::ptr::copy_nonoverlapping(rx_ptr.add(inner_start + 6), inner_src.as_mut_ptr(), 6);
+        }
+        let inner_ethertype = unsafe {
+            ((*rx_ptr.add(inner_start + 12) as u16) << 8) | (*rx_ptr.add(inner_start + 13) as u16)
+        };
+        let payload_start = inner_start + INNER_ETH_HDR;
+        let payload_len = inner_len - INNER_ETH_HDR;
+
+        // Find upstream client for this ethertype.
+        let up_idx = match self.upstream.iter().position(|u| u.active && u.ethertype == inner_ethertype) {
+            Some(i) => i,
+            None => return,
+        };
+
+        if payload_len == 0 {
+            return;
+        }
+
+        // Copy payload to upstream client's RX grant page.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                rx_ptr.add(payload_start),
+                self.upstream[up_idx].rx_va as *mut u8,
+                payload_len.min(MTU),
+            );
+        }
+
+        // Send NETIF_INPUT to upstream client.
+        syscall::send(
+            self.upstream[up_idx].port,
+            NETIF_INPUT,
+            payload_len.min(MTU) as u64,
+            mac_to_u64(inner_src),
+            0, 0,
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Broadcast dedup ring buffer.
+    // ---------------------------------------------------------------
+
+    /// Check if (orig, seqno) is new. Returns true if new (not a dup),
+    /// and adds it to the ring buffer.
+    fn bcast_dedup_check(&mut self, orig: [u8; 6], seqno: u32) -> bool {
+        // Search ring for duplicate.
+        for i in 0..BCAST_DEDUP_SIZE {
+            if self.bcast_dedup_orig[i] == orig && self.bcast_dedup_seq[i] == seqno {
+                return false; // duplicate
+            }
+        }
+        // Not found — add to ring.
+        let h = self.bcast_dedup_head;
+        self.bcast_dedup_orig[h] = orig;
+        self.bcast_dedup_seq[h] = seqno;
+        self.bcast_dedup_head = (h + 1) % BCAST_DEDUP_SIZE;
+        true
     }
 
     /// Parse and process a received OGMv1 packet.
@@ -911,6 +1305,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         originators: [const { Originator::new() }; MAX_ORIGINATORS],
         last_ogm_ns: 0,
         bat_ctrl_idx: 0,
+        bcast_seqno: 0,
+        bcast_dedup_orig: [[0u8; 6]; BCAST_DEDUP_SIZE],
+        bcast_dedup_seq: [0u32; BCAST_DEDUP_SIZE],
+        bcast_dedup_head: 0,
     };
 
     // Step 5: Register for B.A.T.M.A.N. control frames (0x4305) with eth_srv.
