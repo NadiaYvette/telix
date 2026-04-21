@@ -348,6 +348,50 @@ static void handle_heartbeat(int fd, const uint8_t *pkt, size_t pkt_len,
     printf("  → HEARTBEAT-ACK\n");
 }
 
+static void handle_shutdown_chunk(int fd, const uint8_t *pkt, size_t pkt_len,
+                                  struct sockaddr_in *peer)
+{
+    if (pkt_len < 20) return; /* 12 header + 8 SHUTDOWN chunk */
+
+    uint16_t src_port = get16(pkt + 0);
+    uint16_t dst_port = get16(pkt + 2);
+
+    struct assoc *a = find_assoc(dst_port, src_port, peer);
+    if (!a) {
+        printf("  SHUTDOWN: no matching association\n");
+        return;
+    }
+
+    printf("  SHUTDOWN from port %u\n", src_port);
+
+    /* Send SHUTDOWN-ACK */
+    uint8_t resp[16];
+    memset(resp, 0, sizeof(resp));
+    put16(resp + 0, a->local_port);
+    put16(resp + 2, a->remote_port);
+    put32(resp + 4, a->remote_vtag);
+    resp[12] = CHUNK_SHUTDOWN_ACK;
+    resp[13] = 0;
+    put16(resp + 14, 4);
+    stamp_checksum(resp, 16);
+    sendto(fd, resp, 16, 0, (struct sockaddr *)peer, sizeof(*peer));
+    printf("  → SHUTDOWN-ACK sent\n");
+}
+
+static void handle_shutdown_complete(int fd, const uint8_t *pkt, size_t pkt_len,
+                                     struct sockaddr_in *peer)
+{
+    (void)fd;
+    uint16_t src_port = get16(pkt + 0);
+    uint16_t dst_port = get16(pkt + 2);
+
+    struct assoc *a = find_assoc(dst_port, src_port, peer);
+    if (a) {
+        a->active = 0;
+        printf("  SHUTDOWN-COMPLETE from port %u, association closed\n", src_port);
+    }
+}
+
 int main(void)
 {
     crc32c_init();
@@ -408,8 +452,13 @@ int main(void)
             handle_heartbeat(fd, buf, n, &peer);
             break;
         case CHUNK_SHUTDOWN:
-            printf("  SHUTDOWN received\n");
-            /* TODO: send SHUTDOWN-ACK */
+            handle_shutdown_chunk(fd, buf, n, &peer);
+            break;
+        case CHUNK_SHUTDOWN_COMPLETE:
+            handle_shutdown_complete(fd, buf, n, &peer);
+            break;
+        case CHUNK_SACK:
+            /* We don't retransmit, just ignore SACKs */
             break;
         default:
             printf("  Unknown chunk type %u (len=%zd)\n", chunk_type, n);

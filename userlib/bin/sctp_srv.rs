@@ -673,7 +673,33 @@ fn handle_shutdown(msg: &syscall::Message) {
 
     unsafe {
         let a = &mut ASSOCS[assoc_id];
-        // Find the echo peer and shut it down too.
+
+        if a.transport == TRANSPORT_UDP && a.state == STATE_ESTABLISHED {
+            // RFC 4960 Section 9.2: Initiate graceful shutdown over UDP.
+            // Send SHUTDOWN chunk with cumulative TSN ack.
+            let cum_tsn = a.rcv_next_tsn.wrapping_sub(1);
+            let mut pkt = [0u8; 32];
+            build_sctp_header(&mut pkt, a.local_port, a.remote_port, a.remote_vtag);
+            let clen = build_shutdown_chunk(&mut pkt, 12, cum_tsn);
+            let total = 12 + clen;
+            stamp_sctp_checksum(&mut pkt, total);
+
+            // Store for T2-shutdown retransmission (reuse T3 timer fields).
+            a.unacked_pkt[..total].copy_from_slice(&pkt[..total]);
+            a.unacked_len = total;
+            a.retransmit_count = 0;
+            a.rto_us = RTO_INITIAL_US;
+            a.t3_deadline_ns = syscall::clock_gettime() + a.rto_us * 1000;
+
+            a.state = STATE_SHUTDOWN_SENT;
+            a.reply_port = reply_port; // Deferred reply on SHUTDOWN-COMPLETE
+
+            udp_send_sctp(assoc_id, &pkt, total);
+            syscall::debug_puts(b"  [sctp_srv] SHUTDOWN sent over UDP\n");
+            return;
+        }
+
+        // Loopback: immediate shutdown.
         if let Some(echo_idx) = find_assoc_by_ports(a.remote_port, a.local_port) {
             ASSOCS[echo_idx].reset();
         }
@@ -926,6 +952,22 @@ fn build_shutdown_chunk(buf: &mut [u8], off: usize, cum_tsn: u32) -> usize {
     8
 }
 
+/// Build SHUTDOWN-ACK chunk (4 bytes).
+fn build_shutdown_ack_chunk(buf: &mut [u8], off: usize) -> usize {
+    buf[off] = CHUNK_SHUTDOWN_ACK;
+    buf[off + 1] = 0;
+    put_u16_be(buf, off + 2, 4);
+    4
+}
+
+/// Build SHUTDOWN-COMPLETE chunk (4 bytes).
+fn build_shutdown_complete_chunk(buf: &mut [u8], off: usize) -> usize {
+    buf[off] = CHUNK_SHUTDOWN_COMPLETE;
+    buf[off + 1] = 0;
+    put_u16_be(buf, off + 2, 4);
+    4
+}
+
 // --- UDP transport send/recv ---
 
 /// Send an SCTP packet via UDP encapsulation to the remote peer.
@@ -1116,6 +1158,15 @@ fn handle_sctp_packet(data: &[u8], data_len: usize, src_ip: u32, _src_port: u16)
             }
             CHUNK_HEARTBEAT => {
                 handle_rx_heartbeat(data, off, chunk_len, sctp_src_port, sctp_dst_port, src_ip);
+            }
+            CHUNK_SHUTDOWN => {
+                handle_rx_shutdown(data, off, chunk_len, sctp_src_port, sctp_dst_port);
+            }
+            CHUNK_SHUTDOWN_ACK => {
+                handle_rx_shutdown_ack(sctp_src_port, sctp_dst_port);
+            }
+            CHUNK_SHUTDOWN_COMPLETE => {
+                handle_rx_shutdown_complete(sctp_src_port, sctp_dst_port);
             }
             CHUNK_ABORT => {
                 handle_rx_abort(sctp_src_port, sctp_dst_port);
@@ -1370,6 +1421,118 @@ fn handle_rx_heartbeat(data: &[u8], off: usize, chunk_len: usize,
     udp_send_sctp(idx, &pkt, total);
 }
 
+/// Handle incoming SHUTDOWN-ACK: we are the initiator (STATE_SHUTDOWN_SENT).
+/// Send SHUTDOWN-COMPLETE, notify client, close association.
+fn handle_rx_shutdown_ack(src_port: u16, dst_port: u16) {
+    let idx = unsafe {
+        let mut found = None;
+        for i in 0..MAX_ASSOCIATIONS {
+            if ASSOCS[i].state == STATE_SHUTDOWN_SENT
+                && ASSOCS[i].local_port == dst_port
+                && ASSOCS[i].remote_port == src_port
+                && ASSOCS[i].transport == TRANSPORT_UDP
+            {
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    };
+
+    let idx = match idx {
+        Some(i) => i,
+        None => return,
+    };
+
+    // Send SHUTDOWN-COMPLETE to peer.
+    let remote_vtag = unsafe { ASSOCS[idx].remote_vtag };
+    let local_port = unsafe { ASSOCS[idx].local_port };
+    let mut pkt = [0u8; 16];
+    build_sctp_header(&mut pkt, local_port, src_port, remote_vtag);
+    let clen = build_shutdown_complete_chunk(&mut pkt, 12);
+    let total = 12 + clen;
+    stamp_sctp_checksum(&mut pkt, total);
+    udp_send_sctp(idx, &pkt, total);
+
+    syscall::debug_puts(b"  [sctp_srv] SHUTDOWN-ACK received, sent SHUTDOWN-COMPLETE\n");
+
+    // Notify client that shutdown is complete.
+    unsafe {
+        let a = &mut ASSOCS[idx];
+        let rp = a.reply_port;
+        a.reply_port = 0;
+        a.reset();
+        if rp != 0 {
+            syscall::send(rp, SCTP_SHUTDOWN_COMPLETE, idx as u64, 0, 0, 0);
+        }
+    }
+}
+
+/// Handle incoming SHUTDOWN from peer (peer-initiated shutdown).
+/// Respond with SHUTDOWN-ACK.
+fn handle_rx_shutdown(data: &[u8], off: usize, chunk_len: usize,
+                      src_port: u16, dst_port: u16) {
+    if chunk_len < 8 { return; }
+    let _cum_tsn = get_u32_be(data, off + 4);
+
+    let idx = unsafe {
+        let mut found = None;
+        for i in 0..MAX_ASSOCIATIONS {
+            if ASSOCS[i].state == STATE_ESTABLISHED
+                && ASSOCS[i].local_port == dst_port
+                && ASSOCS[i].remote_port == src_port
+                && ASSOCS[i].transport == TRANSPORT_UDP
+            {
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    };
+
+    let idx = match idx {
+        Some(i) => i,
+        None => return,
+    };
+
+    // Send SHUTDOWN-ACK.
+    let remote_vtag = unsafe { ASSOCS[idx].remote_vtag };
+    let local_port = unsafe { ASSOCS[idx].local_port };
+    let mut pkt = [0u8; 16];
+    build_sctp_header(&mut pkt, local_port, src_port, remote_vtag);
+    let clen = build_shutdown_ack_chunk(&mut pkt, 12);
+    let total = 12 + clen;
+    stamp_sctp_checksum(&mut pkt, total);
+
+    unsafe { ASSOCS[idx].state = STATE_SHUTDOWN_ACK_SENT; }
+    udp_send_sctp(idx, &pkt, total);
+
+    syscall::debug_puts(b"  [sctp_srv] peer SHUTDOWN received, sent SHUTDOWN-ACK\n");
+}
+
+/// Handle incoming SHUTDOWN-COMPLETE (we are the responder, STATE_SHUTDOWN_ACK_SENT).
+fn handle_rx_shutdown_complete(src_port: u16, dst_port: u16) {
+    let idx = unsafe {
+        let mut found = None;
+        for i in 0..MAX_ASSOCIATIONS {
+            if ASSOCS[i].state == STATE_SHUTDOWN_ACK_SENT
+                && ASSOCS[i].local_port == dst_port
+                && ASSOCS[i].remote_port == src_port
+                && ASSOCS[i].transport == TRANSPORT_UDP
+            {
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    };
+
+    if let Some(i) = idx {
+        unsafe { ASSOCS[i].reset(); }
+        syscall::debug_puts(b"  [sctp_srv] SHUTDOWN-COMPLETE received, association closed\n");
+    }
+}
+
 fn handle_rx_abort(src_port: u16, dst_port: u16) {
     let idx = unsafe {
         let mut found = None;
@@ -1434,13 +1597,16 @@ fn udp_send_data(assoc_idx: usize, payload: &[u8]) {
 // T3-rtx retransmission timer (RFC 4960 Section 6.3).
 // -------------------------------------------------------------------
 
-/// Check all associations for expired T3-rtx timers and retransmit.
+/// Check all associations for expired retransmission timers (T3-rtx and T2-shutdown).
 fn check_retransmission_timers() {
     let now = syscall::clock_gettime();
     for i in 0..MAX_ASSOCIATIONS {
         unsafe {
             let a = &mut ASSOCS[i];
-            if a.state != STATE_ESTABLISHED || a.transport != TRANSPORT_UDP {
+            if a.transport != TRANSPORT_UDP {
+                continue;
+            }
+            if a.state != STATE_ESTABLISHED && a.state != STATE_SHUTDOWN_SENT {
                 continue;
             }
             if a.t3_deadline_ns == 0 || a.unacked_len == 0 {
@@ -1485,13 +1651,16 @@ fn check_retransmission_timers() {
     }
 }
 
-/// Compute the next T3-rtx deadline across all associations (0 = no timer running).
+/// Compute the next retransmission deadline across all associations (0 = no timer running).
+/// Covers both T3-rtx (ESTABLISHED) and T2-shutdown (SHUTDOWN_SENT) timers.
 fn next_t3_deadline_ns() -> u64 {
     let mut earliest: u64 = 0;
     for i in 0..MAX_ASSOCIATIONS {
         unsafe {
             let a = &ASSOCS[i];
-            if a.state == STATE_ESTABLISHED && a.t3_deadline_ns != 0 {
+            let has_timer = (a.state == STATE_ESTABLISHED || a.state == STATE_SHUTDOWN_SENT)
+                && a.t3_deadline_ns != 0;
+            if has_timer {
                 if earliest == 0 || a.t3_deadline_ns < earliest {
                     earliest = a.t3_deadline_ns;
                 }
