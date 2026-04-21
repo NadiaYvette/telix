@@ -88,6 +88,15 @@ const NET_UDP_SEND_BUF: u64 = 0x4A10;
 const NET_UDP_RECV_BUF: u64 = 0x4B20;
 const NET_UDP_DATA_BUF: u64 = 0x4B21;
 
+// Raw IP protocol binding (SCTP protocol 132 directly over IP).
+const NET_RAW_BIND: u64 = 0x4D50;
+const NET_RAW_BIND_OK: u64 = 0x4D51;
+const NET_RAW_BIND_FAIL: u64 = 0x4D5F;
+const NET_RAW_SEND_BUF: u64 = 0x4D60;
+const NET_RAW_SEND_OK: u64 = 0x4D61;
+const NET_RAW_RECV_BUF: u64 = 0x4D70;
+const NET_RAW_DATA_BUF: u64 = 0x4D71;
+
 // --- TCP flags ---
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
@@ -115,6 +124,9 @@ const PING_TIMEOUT: u32 = 5000;
 
 const MAX_UDP4_BINDS: usize = 8;
 const UDP4_RX_BUF_SIZE: usize = 512;
+
+const MAX_RAW_IP_BINDS: usize = 2;
+const RAW_IP_RX_BUF_SIZE: usize = 1400;
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
 
@@ -238,6 +250,34 @@ impl Udp4Binding {
 }
 
 // ---------------------------------------------------------------
+// Raw IP protocol binding (e.g., SCTP protocol 132 over IP)
+// ---------------------------------------------------------------
+
+struct RawIpBinding {
+    active: bool,
+    protocol: u8,           // IP protocol number (132 = SCTP)
+    recv_reply_port: u64,   // pending recv caller (0 = none)
+    recv_grant_va: usize,   // grant page for receive
+    rx_buf: [u8; RAW_IP_RX_BUF_SIZE],
+    rx_len: usize,
+    rx_src_ip: [u8; 4],
+}
+
+impl RawIpBinding {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            protocol: 0,
+            recv_reply_port: 0,
+            recv_grant_va: 0,
+            rx_buf: [0; RAW_IP_RX_BUF_SIZE],
+            rx_len: 0,
+            rx_src_ip: [0; 4],
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // IPv4 device atop eth_srv
 // ---------------------------------------------------------------
 
@@ -277,6 +317,9 @@ struct Tcp4Dev {
 
     // UDP4 state.
     udp4: [Udp4Binding; MAX_UDP4_BINDS],
+
+    // Raw IP protocol bindings.
+    raw_ip: [RawIpBinding; MAX_RAW_IP_BINDS],
 }
 
 impl Tcp4Dev {
@@ -305,6 +348,7 @@ impl Tcp4Dev {
             dns_txid: 0,
             dns_polls: 0,
             udp4: [const { Udp4Binding::new() }; MAX_UDP4_BINDS],
+            raw_ip: [const { RawIpBinding::new() }; MAX_RAW_IP_BINDS],
         }
     }
 
@@ -430,7 +474,7 @@ impl Tcp4Dev {
             1 => self.handle_icmp(src_ip, &data[ihl..end]),
             6 => self.handle_tcp_rx(src_ip, &data[ihl..end]),
             17 => self.handle_udp_rx(src_ip, &data[ihl..end]),
-            _ => {}
+            _ => self.handle_raw_ip_rx(src_ip, proto, &data[ihl..end]),
         }
     }
 
@@ -923,6 +967,103 @@ impl Tcp4Dev {
             | ((src_ip[2] as u64) << 16)
             | ((src_ip[3] as u64) << 24);
         syscall::send_nb_4(reply_port, NET_UDP_DATA_BUF, d0, d1, 0, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Raw IP protocol bindings (SCTP protocol 132, etc.)
+    // ---------------------------------------------------------------
+
+    fn handle_raw_ip_rx(&mut self, src_ip: [u8; 4], proto: u8, data: &[u8]) {
+        let idx = self.raw_ip.iter().position(|b| b.active && b.protocol == proto);
+        let idx = match idx {
+            Some(i) => i,
+            None => return,
+        };
+
+        let recv_rp = self.raw_ip[idx].recv_reply_port;
+        if recv_rp != 0 {
+            self.raw_ip[idx].recv_reply_port = 0;
+            let gva = self.raw_ip[idx].recv_grant_va;
+            if gva != 0 {
+                self.raw_ip[idx].recv_grant_va = 0;
+                self.deliver_raw_ip_buf(recv_rp, &src_ip, data, gva);
+            } else {
+                // No grant page — queue in buffer.
+                let copy_len = data.len().min(RAW_IP_RX_BUF_SIZE);
+                self.raw_ip[idx].rx_buf[..copy_len].copy_from_slice(&data[..copy_len]);
+                self.raw_ip[idx].rx_len = copy_len;
+                self.raw_ip[idx].rx_src_ip = src_ip;
+            }
+        } else {
+            // Queue one packet (drop if full).
+            let copy_len = data.len().min(RAW_IP_RX_BUF_SIZE);
+            self.raw_ip[idx].rx_buf[..copy_len].copy_from_slice(&data[..copy_len]);
+            self.raw_ip[idx].rx_len = copy_len;
+            self.raw_ip[idx].rx_src_ip = src_ip;
+        }
+    }
+
+    fn handle_raw_ip_bind(&mut self, protocol: u8, reply_port: u64) {
+        if self.raw_ip.iter().any(|b| b.active && b.protocol == protocol) {
+            syscall::send_nb(reply_port, NET_RAW_BIND_FAIL, 0, 0);
+            return;
+        }
+        let slot = self.raw_ip.iter().position(|b| !b.active);
+        match slot {
+            Some(s) => {
+                self.raw_ip[s] = RawIpBinding {
+                    active: true,
+                    protocol,
+                    recv_reply_port: 0,
+                    recv_grant_va: 0,
+                    rx_buf: [0; RAW_IP_RX_BUF_SIZE],
+                    rx_len: 0,
+                    rx_src_ip: [0; 4],
+                };
+                syscall::send_nb(reply_port, NET_RAW_BIND_OK, s as u64, 0);
+            }
+            None => {
+                syscall::send_nb(reply_port, NET_RAW_BIND_FAIL, 0, 0);
+            }
+        }
+    }
+
+    fn handle_raw_ip_send(
+        &mut self,
+        dst_ip: [u8; 4],
+        protocol: u8,
+        payload: &[u8],
+        reply_port: u64,
+    ) {
+        if payload.len() > 1480 {
+            syscall::send_nb(reply_port, NET_RAW_BIND_FAIL, 0, 0);
+            return;
+        }
+        // Loopback: if destination is our own IP, deliver directly.
+        if dst_ip == MY_IP || dst_ip == [127, 0, 0, 1] {
+            self.handle_raw_ip_rx(MY_IP, protocol, payload);
+            syscall::send_nb(reply_port, NET_RAW_SEND_OK, 0, 0);
+            return;
+        }
+        let mac = self.dst_mac_for(dst_ip);
+        self.send_ipv4(dst_ip, protocol, payload, mac);
+        syscall::send_nb(reply_port, NET_RAW_SEND_OK, 0, 0);
+    }
+
+    fn deliver_raw_ip_buf(
+        &self, reply_port: u64, src_ip: &[u8; 4], payload: &[u8], grant_va: usize,
+    ) {
+        let plen = payload.len().min(1400);
+        let dst = grant_va as *mut u8;
+        for i in 0..plen {
+            unsafe { dst.add(i).write_volatile(payload[i]); }
+        }
+        let d0 = plen as u64;
+        let d1 = (src_ip[0] as u64)
+            | ((src_ip[1] as u64) << 8)
+            | ((src_ip[2] as u64) << 16)
+            | ((src_ip[3] as u64) << 24);
+        syscall::send_nb_4(reply_port, NET_RAW_DATA_BUF, d0, d1, 0, 0);
     }
 
     // ---------------------------------------------------------------
@@ -1811,6 +1952,64 @@ fn handle_msg(dev: &mut Tcp4Dev, msg: &syscall::Message) {
                 // Park — store grant_va for when data arrives.
                 dev.udp4[bind_id].recv_reply_port = reply_port;
                 dev.udp4[bind_id].recv_grant_va = grant_va;
+            }
+        }
+        // --- Raw IP protocol bindings ---
+        NET_RAW_BIND => {
+            // data[0] = protocol(low8) | reply_port(high48, from bit16)
+            let protocol = (msg.data[0] & 0xFF) as u8;
+            let reply_port = msg.data[0] >> 16;
+            dev.handle_raw_ip_bind(protocol, reply_port);
+        }
+        NET_RAW_SEND_BUF => {
+            // data[0] = dst_ip(low32) | bind_id(bits32-47)
+            // data[1] = grant_va(low48) | payload_len(bits48-63)
+            // data[2] = reply_port
+            let dst_ip = [
+                msg.data[0] as u8,
+                (msg.data[0] >> 8) as u8,
+                (msg.data[0] >> 16) as u8,
+                (msg.data[0] >> 24) as u8,
+            ];
+            let bind_id = ((msg.data[0] >> 32) & 0xFFFF) as usize;
+            let grant_va = (msg.data[1] & 0xFFFF_FFFF_FFFF) as usize;
+            let payload_len = (msg.data[1] >> 48) as usize;
+            let reply_port = msg.data[2];
+            if bind_id >= MAX_RAW_IP_BINDS || !dev.raw_ip[bind_id].active || payload_len > 1400 {
+                syscall::send_nb(reply_port, NET_RAW_BIND_FAIL, 0, 0);
+            } else {
+                let mut payload = [0u8; 1400];
+                let src = grant_va as *const u8;
+                for i in 0..payload_len {
+                    payload[i] = unsafe { src.add(i).read_volatile() };
+                }
+                let proto = dev.raw_ip[bind_id].protocol;
+                dev.handle_raw_ip_send(dst_ip, proto, &payload[..payload_len], reply_port);
+            }
+        }
+        NET_RAW_RECV_BUF => {
+            // data[0] = bind_id(low32) | reply_port(high32)
+            // data[1] = grant_va
+            let bind_id = (msg.data[0] & 0xFFFFFFFF) as usize;
+            let reply_port = msg.data[0] >> 32;
+            let grant_va = msg.data[1] as usize;
+            if bind_id >= MAX_RAW_IP_BINDS || !dev.raw_ip[bind_id].active {
+                syscall::send_nb(reply_port, 0x4B12, 0, 0); // RECV_NONE
+            } else if dev.raw_ip[bind_id].rx_len > 0 {
+                let src_ip = dev.raw_ip[bind_id].rx_src_ip;
+                let len = dev.raw_ip[bind_id].rx_len;
+                let dst = grant_va as *mut u8;
+                for i in 0..len {
+                    unsafe { dst.add(i).write_volatile(dev.raw_ip[bind_id].rx_buf[i]); }
+                }
+                dev.raw_ip[bind_id].rx_len = 0;
+                let d0 = len as u64;
+                let d1 = (src_ip[0] as u64) | ((src_ip[1] as u64) << 8)
+                    | ((src_ip[2] as u64) << 16) | ((src_ip[3] as u64) << 24);
+                syscall::send_nb_4(reply_port, NET_RAW_DATA_BUF, d0, d1, 0, 0);
+            } else {
+                dev.raw_ip[bind_id].recv_reply_port = reply_port;
+                dev.raw_ip[bind_id].recv_grant_va = grant_va;
             }
         }
         _ => {}

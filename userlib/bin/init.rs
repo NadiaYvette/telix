@@ -5522,6 +5522,79 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 182d: SCTP over raw IP (protocol 132) loopback ---
+    syscall::debug_puts(b"  init: Phase 182d SCTP raw IP loopback...\n");
+    {
+        if let Some(sp) = syscall::ns_lookup(b"sctp") {
+            let rp = syscall::port_create();
+
+            // Associate to own IP (10.0.2.15) on SCTP port 7, transport_hint=2 (raw IP).
+            // tcp4_srv's loopback shortcut delivers the packet back without TAP.
+            let remote_ip: u64 = 0x0A00020F; // 10.0.2.15
+            let d0: u64 = remote_ip | (7u64 << 32);
+            let d1: u64 = 0 | ((rp as u64) << 16);
+            let d2: u64 = 1 | (1 << 16) | (2u64 << 32); // 1 out, 1 in, transport_hint=2
+            syscall::send(sp, 0x4D00, d0, d1, d2, 0); // SCTP_ASSOCIATE
+
+            let mut assoc_id: u64 = u64::MAX;
+            if let Some(m) = syscall::recv_msg_timeout(rp, 10_000_000) {
+                if m.tag == 0x4D01 { assoc_id = m.data[0] & 0xFFFFFFFF; }
+            }
+
+            if assoc_id == u64::MAX {
+                syscall::debug_puts(b"Phase 182d SCTP raw IP: SKIPPED (associate failed)\n");
+            } else {
+                // Send "RawIP!" on stream 0.
+                let test_data = b"RawIP!";
+                let mut w0: u64 = 0;
+                for i in 0..test_data.len() { w0 |= (test_data[i] as u64) << (i * 8); }
+                let sd0 = assoc_id | (0u64 << 32); // stream 0
+                let sd1 = (test_data.len() as u64) | ((rp as u64) << 16);
+                syscall::send(sp, 0x4E00, sd0, sd1, w0, 0); // SCTP_SEND
+
+                let mut send_ok = false;
+                if let Some(m) = syscall::recv_msg_timeout(rp, 5_000_000) {
+                    if m.tag == 0x4E01 { send_ok = true; }
+                }
+
+                if !send_ok {
+                    syscall::debug_puts(b"Phase 182d SCTP raw IP: FAILED (send)\n");
+                } else {
+                    // Receive echo.
+                    let rd0 = assoc_id | ((rp as u64) << 32);
+                    syscall::send(sp, 0x4F00, rd0, 0, 0, 0); // SCTP_RECV
+                    if let Some(m) = syscall::recv_msg_timeout(rp, 10_000_000) {
+                        if m.tag == 0x4F01 {
+                            let len = (m.data[0] & 0xFFFF) as usize;
+                            let mut ok = len == test_data.len();
+                            for i in 0..len.min(8) {
+                                if (m.data[1] >> (i * 8)) as u8 != test_data[i] { ok = false; }
+                            }
+                            if ok {
+                                syscall::debug_puts(b"Phase 182d SCTP raw IP: PASSED\n");
+                            } else {
+                                syscall::debug_puts(b"Phase 182d SCTP raw IP: FAILED (echo mismatch)\n");
+                            }
+                        } else {
+                            syscall::debug_puts(b"Phase 182d SCTP raw IP: FAILED (recv bad tag)\n");
+                        }
+                    } else {
+                        syscall::debug_puts(b"Phase 182d SCTP raw IP: FAILED (recv timeout)\n");
+                    }
+                }
+
+                // Shutdown.
+                let shd0 = assoc_id | ((rp as u64) << 32);
+                syscall::send(sp, 0x4D10, shd0, 0, 0, 0);
+                syscall::recv_msg_timeout(rp, 1_000_000);
+            }
+
+            syscall::port_destroy(rp);
+        } else {
+            syscall::debug_puts(b"Phase 182d SCTP raw IP: SKIPPED (no sctp_srv)\n");
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

@@ -79,6 +79,7 @@ const ECHO_PORT: u16 = 7;
 // --- Transport modes ---
 const TRANSPORT_LOOPBACK: u8 = 0;
 const TRANSPORT_UDP: u8 = 1;
+const TRANSPORT_RAW_IP: u8 = 2;
 
 // UDP encapsulation port (RFC 6951 default).
 const UDP_ENCAP_PORT: u16 = 9899;
@@ -90,6 +91,14 @@ const NET_UDP_SEND_BUF: u64 = 0x4A10;
 const NET_UDP_SEND_OK: u64 = 0x4A01;
 const NET_UDP_RECV_BUF: u64 = 0x4B20;
 const NET_UDP_DATA_BUF: u64 = 0x4B21;
+
+// IPC tags for raw IP protocol binding (SCTP over IP protocol 132).
+const NET_RAW_BIND: u64 = 0x4D50;
+const NET_RAW_BIND_OK: u64 = 0x4D51;
+const NET_RAW_SEND_BUF: u64 = 0x4D60;
+const NET_RAW_SEND_OK: u64 = 0x4D61;
+const NET_RAW_RECV_BUF: u64 = 0x4D70;
+const NET_RAW_DATA_BUF: u64 = 0x4D71;
 
 // --- Data structures ---
 
@@ -147,6 +156,7 @@ struct Association {
     unacked_tsn: u32,      // Lowest unacknowledged TSN
     unacked_pkt: [u8; MAX_UNACKED_PKT], // Stored packet for retransmission
     unacked_len: usize,    // Length of stored packet (0 = nothing to retransmit)
+    is_echo: bool,         // Server-side echo association (auto-echoes DATA back)
 }
 
 impl Association {
@@ -180,6 +190,7 @@ impl Association {
             unacked_tsn: 0,
             unacked_pkt: [0u8; MAX_UNACKED_PKT],
             unacked_len: 0,
+            is_echo: false,
         }
     }
 
@@ -451,7 +462,8 @@ fn deliver_pending_recv(assoc_idx: usize) {
 /// Handle SCTP_ASSOCIATE request from client.
 /// data[0] = remote_ip(low32) | remote_port(bits32-47)
 /// data[1] = local_port(low16) | reply_port(high48)
-/// data[2] = num_out_streams(low16) | num_in_streams(high16)
+/// data[2] = num_out_streams(low16) | num_in_streams(bits16-31) | transport_hint(bits32-39)
+///           transport_hint: 0=auto, 2=raw IP (protocol 132)
 fn handle_associate(msg: &syscall::Message) {
     let remote_ip = (msg.data[0] & 0xFFFFFFFF) as u32;
     let remote_port = ((msg.data[0] >> 32) & 0xFFFF) as u16;
@@ -459,6 +471,7 @@ fn handle_associate(msg: &syscall::Message) {
     let reply_port = msg.data[1] >> 16;
     let num_out = ((msg.data[2] & 0xFFFF) as u16).max(1).min(MAX_STREAMS as u16);
     let num_in = (((msg.data[2] >> 16) & 0xFFFF) as u16).max(1).min(MAX_STREAMS as u16);
+    let transport_hint = ((msg.data[2] >> 32) & 0xFF) as u8;
 
     let local_port = if local_port_req != 0 { local_port_req } else { alloc_port() };
 
@@ -474,13 +487,20 @@ fn handle_associate(msg: &syscall::Message) {
     let local_vtag = alloc_vtag();
     let init_tsn: u32 = 1;
 
-    // Determine transport: loopback if remote is 127.0.0.1 or echo port, else UDP.
+    // Determine transport: loopback if remote is 127.0.0.1 or 0, raw IP if hinted, else UDP.
     let is_loopback = remote_ip == 0x7F000001 || remote_ip == 0;
+    let transport = if is_loopback {
+        TRANSPORT_LOOPBACK
+    } else if transport_hint == 2 {
+        TRANSPORT_RAW_IP
+    } else {
+        TRANSPORT_UDP
+    };
 
     unsafe {
         let a = &mut ASSOCS[init_idx];
         a.state = STATE_COOKIE_WAIT;
-        a.transport = if is_loopback { TRANSPORT_LOOPBACK } else { TRANSPORT_UDP };
+        a.transport = transport;
         a.local_port = local_port;
         a.local_vtag = local_vtag;
         a.remote_port = remote_port;
@@ -491,7 +511,19 @@ fn handle_associate(msg: &syscall::Message) {
         a.reply_port = reply_port;
     }
 
-    if !is_loopback {
+    if transport == TRANSPORT_RAW_IP {
+        // --- Raw IP: send INIT directly as IP protocol 132 ---
+        if !unsafe { RAW_IP_READY } {
+            unsafe { ASSOCS[init_idx].reset(); }
+            syscall::send(reply_port, SCTP_ASSOC_FAIL, 4, 0, 0, 0);
+            return;
+        }
+        raw_ip_initiate_association(init_idx, local_port, remote_port,
+                                    local_vtag, num_out, num_in, init_tsn);
+        return;
+    }
+
+    if transport == TRANSPORT_UDP {
         // --- UDP transport: send INIT and return. Handshake completes async. ---
         if !unsafe { UDP_READY } {
             unsafe { ASSOCS[init_idx].reset(); }
@@ -604,6 +636,9 @@ fn handle_send(msg: &syscall::Message) {
         if transport == TRANSPORT_UDP {
             // UDP: serialize DATA chunk and send on wire.
             udp_send_data(assoc_id, stream_id, &payload[..actual_len]);
+        } else if transport == TRANSPORT_RAW_IP {
+            // Raw IP: serialize DATA chunk and send as IP proto 132.
+            raw_ip_send_data(assoc_id, stream_id, &payload[..actual_len]);
         } else {
             // Loopback: deliver directly to the echo association.
             let tsn = a.next_tsn;
@@ -674,10 +709,12 @@ fn handle_shutdown(msg: &syscall::Message) {
     unsafe {
         let a = &mut ASSOCS[assoc_id];
 
-        if a.transport == TRANSPORT_UDP && a.state == STATE_ESTABLISHED {
-            // RFC 4960 Section 9.2: Initiate graceful shutdown over UDP.
-            // Send SHUTDOWN chunk with cumulative TSN ack.
+        let is_wire = (a.transport == TRANSPORT_UDP || a.transport == TRANSPORT_RAW_IP)
+            && a.state == STATE_ESTABLISHED;
+        if is_wire {
+            // RFC 4960 Section 9.2: Initiate graceful shutdown on wire.
             let cum_tsn = a.rcv_next_tsn.wrapping_sub(1);
+            let transport = a.transport;
             let mut pkt = [0u8; 32];
             build_sctp_header(&mut pkt, a.local_port, a.remote_port, a.remote_vtag);
             let clen = build_shutdown_chunk(&mut pkt, 12, cum_tsn);
@@ -692,10 +729,15 @@ fn handle_shutdown(msg: &syscall::Message) {
             a.t3_deadline_ns = syscall::clock_gettime() + a.rto_us * 1000;
 
             a.state = STATE_SHUTDOWN_SENT;
-            a.reply_port = reply_port; // Deferred reply on SHUTDOWN-COMPLETE
+            a.reply_port = reply_port;
 
-            udp_send_sctp(assoc_id, &pkt, total);
-            syscall::debug_puts(b"  [sctp_srv] SHUTDOWN sent over UDP\n");
+            if transport == TRANSPORT_RAW_IP {
+                raw_ip_send_sctp(assoc_id, &pkt, total);
+                syscall::debug_puts(b"  [sctp_srv] SHUTDOWN sent over raw IP\n");
+            } else {
+                udp_send_sctp(assoc_id, &pkt, total);
+                syscall::debug_puts(b"  [sctp_srv] SHUTDOWN sent over UDP\n");
+            }
             return;
         }
 
@@ -968,6 +1010,36 @@ fn build_shutdown_complete_chunk(buf: &mut [u8], off: usize) -> usize {
     4
 }
 
+/// Build INIT-ACK chunk with state cookie parameter. Returns total chunk length.
+fn build_init_ack_chunk(buf: &mut [u8], off: usize, init_tag: u32, a_rwnd: u32,
+                        num_out: u16, num_in: u16, initial_tsn: u32,
+                        cookie: &[u8]) -> usize {
+    buf[off] = CHUNK_INIT_ACK;
+    buf[off + 1] = 0;
+    // chunk length = 20 (fixed) + 4 (param header) + cookie_len
+    let param_len = 4 + cookie.len();
+    let chunk_len = 20 + param_len;
+    put_u16_be(buf, off + 2, chunk_len as u16);
+    put_u32_be(buf, off + 4, init_tag);
+    put_u32_be(buf, off + 8, a_rwnd);
+    put_u16_be(buf, off + 12, num_out);
+    put_u16_be(buf, off + 14, num_in);
+    put_u32_be(buf, off + 16, initial_tsn);
+    // State Cookie parameter (type 0x0007).
+    put_u16_be(buf, off + 20, 7);
+    put_u16_be(buf, off + 22, param_len as u16);
+    buf[off + 24..off + 24 + cookie.len()].copy_from_slice(cookie);
+    (chunk_len + 3) & !3 // padded
+}
+
+/// Build COOKIE-ACK chunk (4 bytes).
+fn build_cookie_ack_chunk(buf: &mut [u8], off: usize) -> usize {
+    buf[off] = CHUNK_COOKIE_ACK;
+    buf[off + 1] = 0;
+    put_u16_be(buf, off + 2, 4);
+    4
+}
+
 // --- UDP transport send/recv ---
 
 /// Send an SCTP packet via UDP encapsulation to the remote peer.
@@ -1084,6 +1156,157 @@ fn udp_transport_init() -> bool {
     true
 }
 
+// ===================================================================
+// Phase 3: Raw IP transport — SCTP directly over IP protocol 132.
+// No UDP encapsulation; SCTP packets are the IP payload.
+// ===================================================================
+
+static mut RAW_IP_NET_PORT: u64 = 0;
+static mut RAW_IP_BIND_ID: u64 = !0;
+static mut RAW_IP_SEND_VA: usize = 0;
+static mut RAW_IP_RECV_VA: usize = 0;
+static mut RAW_IP_READY: bool = false;
+
+/// Initialize raw IP transport: bind IP protocol 132 via tcp4_srv.
+fn raw_ip_transport_init() -> bool {
+    let net_port = match syscall::ns_lookup(b"net") {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let send_va = match syscall::mmap_anon(0, 1, 1) {
+        Some(va) => va,
+        None => return false,
+    };
+    let recv_va = match syscall::mmap_anon(0, 1, 1) {
+        Some(va) => va,
+        None => return false,
+    };
+
+    // NET_RAW_BIND: data[0] = protocol(low8) | reply_port(from bit16)
+    let rp = syscall::port_create();
+    let d0 = 132u64 | ((rp as u64) << 16); // IP protocol 132 = SCTP
+    syscall::send_nb(net_port, NET_RAW_BIND, d0, 0);
+    let reply = match syscall::recv_msg_timeout(rp, 2_000_000) {
+        Some(m) => m,
+        None => {
+            syscall::port_destroy(rp);
+            return false;
+        }
+    };
+    syscall::port_destroy(rp);
+
+    if reply.tag != NET_RAW_BIND_OK {
+        return false;
+    }
+    let bind_id = reply.data[0];
+
+    // Grant pages to tcp4_srv.
+    if !syscall::grant_pages(net_port, send_va, send_va, 1, false) { return false; }
+    if !syscall::grant_pages(net_port, recv_va, recv_va, 1, false) { return false; }
+
+    unsafe {
+        RAW_IP_NET_PORT = net_port;
+        RAW_IP_BIND_ID = bind_id;
+        RAW_IP_SEND_VA = send_va;
+        RAW_IP_RECV_VA = recv_va;
+        RAW_IP_READY = true;
+    }
+
+    syscall::debug_puts(b"  [sctp_srv] raw IP transport ready (proto 132)\n");
+    true
+}
+
+/// Send an SCTP packet via raw IP (protocol 132).
+fn raw_ip_send_sctp(assoc_idx: usize, pkt: &[u8], pkt_len: usize) {
+    unsafe {
+        if !RAW_IP_READY { return; }
+        let a = &ASSOCS[assoc_idx];
+        let dst_ip_le = a.remote_ip.swap_bytes();
+        let gva = RAW_IP_SEND_VA;
+
+        let dst = gva as *mut u8;
+        for i in 0..pkt_len {
+            dst.add(i).write_volatile(pkt[i]);
+        }
+
+        // NET_RAW_SEND_BUF:
+        // data[0] = dst_ip(low32) | bind_id(bits32-47)
+        // data[1] = grant_va(low48) | payload_len(bits48-63)
+        // data[2] = reply_port
+        let d0 = (dst_ip_le as u64) | ((RAW_IP_BIND_ID) << 32);
+        let d1 = (gva as u64 & 0xFFFF_FFFF_FFFF) | ((pkt_len as u64) << 48);
+        let rp = syscall::port_create();
+        syscall::send(RAW_IP_NET_PORT, NET_RAW_SEND_BUF, d0, d1, rp, 0);
+        let _ = syscall::recv_msg_timeout(rp, 500_000);
+        syscall::port_destroy(rp);
+    }
+}
+
+/// Post a raw IP receive on our binding.
+fn raw_ip_post_recv() {
+    unsafe {
+        if !RAW_IP_READY { return; }
+        let d0 = (RAW_IP_BIND_ID & 0xFFFFFFFF) | (MY_PORT << 32);
+        let d1 = RAW_IP_RECV_VA as u64;
+        syscall::send_nb_4(RAW_IP_NET_PORT, NET_RAW_RECV_BUF, d0, d1, 0, 0);
+    }
+}
+
+/// Send an SCTP packet via the association's transport (UDP or raw IP).
+fn wire_send_sctp(assoc_idx: usize, pkt: &[u8], pkt_len: usize) {
+    let transport = unsafe { ASSOCS[assoc_idx].transport };
+    if transport == TRANSPORT_RAW_IP {
+        raw_ip_send_sctp(assoc_idx, pkt, pkt_len);
+    } else {
+        udp_send_sctp(assoc_idx, pkt, pkt_len);
+    }
+}
+
+// --- Raw IP mode: send SCTP DATA on protocol 132 ---
+
+fn raw_ip_send_data(assoc_idx: usize, stream_id: u16, payload: &[u8]) {
+    unsafe {
+        let a = &mut ASSOCS[assoc_idx];
+        let tsn = a.next_tsn;
+        a.next_tsn += 1;
+        let sid = (stream_id as usize) % MAX_STREAMS;
+        let ssn = a.streams[sid].next_ssn_send;
+        a.streams[sid].next_ssn_send += 1;
+
+        let mut pkt = [0u8; 300];
+        build_sctp_header(&mut pkt, a.local_port, a.remote_port, a.remote_vtag);
+        let clen = build_data_chunk(&mut pkt, 12, tsn, stream_id, ssn, 0, payload);
+        let total = 12 + clen;
+        stamp_sctp_checksum(&mut pkt, total);
+
+        // Store for T3-rtx retransmission.
+        if total <= MAX_UNACKED_PKT {
+            a.unacked_pkt[..total].copy_from_slice(&pkt[..total]);
+            a.unacked_len = total;
+            a.unacked_tsn = tsn;
+            a.retransmit_count = 0;
+            a.t3_deadline_ns = syscall::clock_gettime() + a.rto_us * 1000;
+        }
+
+        raw_ip_send_sctp(assoc_idx, &pkt, total);
+    }
+}
+
+/// Initiate an SCTP association over raw IP protocol 132.
+fn raw_ip_initiate_association(
+    init_idx: usize, local_port: u16, remote_port: u16,
+    local_vtag: u32, num_out: u16, num_in: u16, init_tsn: u32,
+) {
+    let mut pkt = [0u8; 64];
+    build_sctp_header(&mut pkt, local_port, remote_port, 0);
+    let clen = build_init_chunk(&mut pkt, 12, local_vtag, 65535, num_out, num_in, init_tsn);
+    let total = 12 + clen;
+    stamp_sctp_checksum(&mut pkt, total);
+    raw_ip_send_sctp(init_idx, &pkt, total);
+    syscall::debug_puts(b"  [sctp_srv] sent INIT over raw IP\n");
+}
+
 // --- UDP-mode association (async 4-way handshake) ---
 
 /// Initiate an SCTP association over UDP. Sends INIT, then the handshake
@@ -1102,6 +1325,23 @@ fn udp_initiate_association(
 
     udp_send_sctp(init_idx, &pkt, total);
     syscall::debug_puts(b"  [sctp_srv] sent INIT over UDP\n");
+}
+
+/// Common helper: find a wire-transport association matching ports and any of the given states.
+fn find_wire_assoc(dst_port: u16, src_port: u16, states: &[u8]) -> Option<usize> {
+    unsafe {
+        for i in 0..MAX_ASSOCIATIONS {
+            let a = &ASSOCS[i];
+            if (a.transport == TRANSPORT_UDP || a.transport == TRANSPORT_RAW_IP)
+                && a.local_port == dst_port
+                && a.remote_port == src_port
+                && states.contains(&a.state)
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
 }
 
 /// Process an incoming SCTP-over-UDP packet.
@@ -1144,8 +1384,14 @@ fn handle_sctp_packet(data: &[u8], data_len: usize, src_ip: u32, _src_port: u16)
         if chunk_len < 4 || off + chunk_len > data_len { break; }
 
         match chunk_type {
+            CHUNK_INIT => {
+                handle_rx_init(data, off, chunk_len, sctp_src_port, sctp_dst_port, src_ip);
+            }
             CHUNK_INIT_ACK => {
                 handle_rx_init_ack(data, off, chunk_len, sctp_src_port, sctp_dst_port);
+            }
+            CHUNK_COOKIE_ECHO => {
+                handle_rx_cookie_echo_server(data, off, chunk_len, sctp_src_port, sctp_dst_port);
             }
             CHUNK_COOKIE_ACK => {
                 handle_rx_cookie_ack(sctp_src_port, sctp_dst_port);
@@ -1219,7 +1465,7 @@ fn handle_rx_init_ack(data: &[u8], off: usize, chunk_len: usize,
             if ASSOCS[i].state == STATE_COOKIE_WAIT
                 && ASSOCS[i].local_port == dst_port
                 && ASSOCS[i].remote_port == src_port
-                && ASSOCS[i].transport == TRANSPORT_UDP
+                && (ASSOCS[i].transport == TRANSPORT_UDP || ASSOCS[i].transport == TRANSPORT_RAW_IP)
             {
                 found = Some(i);
                 break;
@@ -1252,7 +1498,7 @@ fn handle_rx_init_ack(data: &[u8], off: usize, chunk_len: usize,
     let clen = build_cookie_echo_chunk(&mut pkt, 12, &cookie[..cookie_len]);
     let total = 12 + clen;
     stamp_sctp_checksum(&mut pkt, total);
-    udp_send_sctp(idx, &pkt, total);
+    wire_send_sctp(idx, &pkt, total);
     syscall::debug_puts(b"  [sctp_srv] sent COOKIE-ECHO\n");
 }
 
@@ -1263,7 +1509,7 @@ fn handle_rx_cookie_ack(src_port: u16, dst_port: u16) {
             if ASSOCS[i].state == STATE_COOKIE_ECHOED
                 && ASSOCS[i].local_port == dst_port
                 && ASSOCS[i].remote_port == src_port
-                && ASSOCS[i].transport == TRANSPORT_UDP
+                && (ASSOCS[i].transport == TRANSPORT_UDP || ASSOCS[i].transport == TRANSPORT_RAW_IP)
             {
                 found = Some(i);
                 break;
@@ -1308,7 +1554,7 @@ fn handle_rx_data(data: &[u8], off: usize, chunk_len: usize, _flags: u8,
             if ASSOCS[i].state == STATE_ESTABLISHED
                 && ASSOCS[i].local_port == dst_port
                 && ASSOCS[i].remote_port == src_port
-                && ASSOCS[i].transport == TRANSPORT_UDP
+                && (ASSOCS[i].transport == TRANSPORT_UDP || ASSOCS[i].transport == TRANSPORT_RAW_IP)
             {
                 found = Some(i);
                 break;
@@ -1334,7 +1580,23 @@ fn handle_rx_data(data: &[u8], off: usize, chunk_len: usize, _flags: u8,
     let clen = build_sack_chunk(&mut pkt, 12, cum_tsn, 65535);
     let total = 12 + clen;
     stamp_sctp_checksum(&mut pkt, total);
-    udp_send_sctp(idx, &pkt, total);
+    wire_send_sctp(idx, &pkt, total);
+
+    // If this is a server-side echo association, echo the DATA back.
+    unsafe {
+        if ASSOCS[idx].is_echo && payload_len > 0 {
+            let a = &mut ASSOCS[idx];
+            let echo_tsn = a.next_tsn;
+            a.next_tsn = echo_tsn.wrapping_add(1);
+            let mut epkt = [0u8; 256];
+            build_sctp_header(&mut epkt, a.local_port, a.remote_port, a.remote_vtag);
+            let eclen = build_data_chunk(&mut epkt, 12, echo_tsn, stream_id, ssn, 0,
+                                          &data[off + 16..off + 16 + payload_len]);
+            let etotal = 12 + eclen;
+            stamp_sctp_checksum(&mut epkt, etotal);
+            wire_send_sctp(idx, &epkt, etotal);
+        }
+    }
 
     // Wake pending recv if any.
     unsafe {
@@ -1355,7 +1617,7 @@ fn handle_rx_sack(data: &[u8], off: usize, chunk_len: usize,
             if ASSOCS[i].state == STATE_ESTABLISHED
                 && ASSOCS[i].local_port == dst_port
                 && ASSOCS[i].remote_port == src_port
-                && ASSOCS[i].transport == TRANSPORT_UDP
+                && (ASSOCS[i].transport == TRANSPORT_UDP || ASSOCS[i].transport == TRANSPORT_RAW_IP)
             {
                 found = Some(i);
                 break;
@@ -1394,7 +1656,7 @@ fn handle_rx_heartbeat(data: &[u8], off: usize, chunk_len: usize,
             if ASSOCS[i].state == STATE_ESTABLISHED
                 && ASSOCS[i].local_port == dst_port
                 && ASSOCS[i].remote_port == src_port
-                && ASSOCS[i].transport == TRANSPORT_UDP
+                && (ASSOCS[i].transport == TRANSPORT_UDP || ASSOCS[i].transport == TRANSPORT_RAW_IP)
             {
                 found = Some(i);
                 break;
@@ -1418,7 +1680,7 @@ fn handle_rx_heartbeat(data: &[u8], off: usize, chunk_len: usize,
     pkt[12] = CHUNK_HEARTBEAT_ACK;
     let total = 12 + ((copy_len + 3) & !3);
     stamp_sctp_checksum(&mut pkt, total);
-    udp_send_sctp(idx, &pkt, total);
+    wire_send_sctp(idx, &pkt, total);
 }
 
 /// Handle incoming SHUTDOWN-ACK: we are the initiator (STATE_SHUTDOWN_SENT).
@@ -1430,7 +1692,7 @@ fn handle_rx_shutdown_ack(src_port: u16, dst_port: u16) {
             if ASSOCS[i].state == STATE_SHUTDOWN_SENT
                 && ASSOCS[i].local_port == dst_port
                 && ASSOCS[i].remote_port == src_port
-                && ASSOCS[i].transport == TRANSPORT_UDP
+                && (ASSOCS[i].transport == TRANSPORT_UDP || ASSOCS[i].transport == TRANSPORT_RAW_IP)
             {
                 found = Some(i);
                 break;
@@ -1452,7 +1714,7 @@ fn handle_rx_shutdown_ack(src_port: u16, dst_port: u16) {
     let clen = build_shutdown_complete_chunk(&mut pkt, 12);
     let total = 12 + clen;
     stamp_sctp_checksum(&mut pkt, total);
-    udp_send_sctp(idx, &pkt, total);
+    wire_send_sctp(idx, &pkt, total);
 
     syscall::debug_puts(b"  [sctp_srv] SHUTDOWN-ACK received, sent SHUTDOWN-COMPLETE\n");
 
@@ -1481,7 +1743,7 @@ fn handle_rx_shutdown(data: &[u8], off: usize, chunk_len: usize,
             if ASSOCS[i].state == STATE_ESTABLISHED
                 && ASSOCS[i].local_port == dst_port
                 && ASSOCS[i].remote_port == src_port
-                && ASSOCS[i].transport == TRANSPORT_UDP
+                && (ASSOCS[i].transport == TRANSPORT_UDP || ASSOCS[i].transport == TRANSPORT_RAW_IP)
             {
                 found = Some(i);
                 break;
@@ -1505,7 +1767,7 @@ fn handle_rx_shutdown(data: &[u8], off: usize, chunk_len: usize,
     stamp_sctp_checksum(&mut pkt, total);
 
     unsafe { ASSOCS[idx].state = STATE_SHUTDOWN_ACK_SENT; }
-    udp_send_sctp(idx, &pkt, total);
+    wire_send_sctp(idx, &pkt, total);
 
     syscall::debug_puts(b"  [sctp_srv] peer SHUTDOWN received, sent SHUTDOWN-ACK\n");
 }
@@ -1518,7 +1780,7 @@ fn handle_rx_shutdown_complete(src_port: u16, dst_port: u16) {
             if ASSOCS[i].state == STATE_SHUTDOWN_ACK_SENT
                 && ASSOCS[i].local_port == dst_port
                 && ASSOCS[i].remote_port == src_port
-                && ASSOCS[i].transport == TRANSPORT_UDP
+                && (ASSOCS[i].transport == TRANSPORT_UDP || ASSOCS[i].transport == TRANSPORT_RAW_IP)
             {
                 found = Some(i);
                 break;
@@ -1540,7 +1802,7 @@ fn handle_rx_abort(src_port: u16, dst_port: u16) {
             if ASSOCS[i].state != STATE_CLOSED
                 && ASSOCS[i].local_port == dst_port
                 && ASSOCS[i].remote_port == src_port
-                && ASSOCS[i].transport == TRANSPORT_UDP
+                && (ASSOCS[i].transport == TRANSPORT_UDP || ASSOCS[i].transport == TRANSPORT_RAW_IP)
             {
                 found = Some(i);
                 break;
@@ -1560,6 +1822,114 @@ fn handle_rx_abort(src_port: u16, dst_port: u16) {
         }
         syscall::debug_puts(b"  [sctp_srv] ABORT received, association closed\n");
     }
+}
+
+// --- Server-side handlers for incoming INIT/COOKIE-ECHO over the wire ---
+// These allow sctp_srv to act as a passive SCTP listener on the echo port,
+// enabling raw IP loopback testing (send to own IP, handle the handshake).
+
+fn handle_rx_init(data: &[u8], off: usize, chunk_len: usize,
+                  src_port: u16, dst_port: u16, src_ip: u32) {
+    if chunk_len < 20 { return; }
+    if dst_port != ECHO_PORT { return; }
+
+    let init_tag = get_u32_be(data, off + 4);
+    let a_rwnd = get_u32_be(data, off + 8);
+    let num_out = get_u16_be(data, off + 12);
+    let num_in = get_u16_be(data, off + 14);
+    let initial_tsn = get_u32_be(data, off + 16);
+
+    let idx = match find_assoc_slot() {
+        Some(i) => i,
+        None => return,
+    };
+    let local_vtag = alloc_vtag();
+    let cookie = make_cookie(dst_port, src_port, local_vtag, init_tag);
+
+    // Determine transport from src_ip: if it matches our IP, it came via raw IP loopback.
+    let transport = if src_ip == 0x0A00020F || src_ip == 0x7F000001 {
+        TRANSPORT_RAW_IP
+    } else {
+        TRANSPORT_UDP
+    };
+
+    unsafe {
+        let a = &mut ASSOCS[idx];
+        a.state = STATE_CLOSED; // Pre-ESTABLISHED, waiting for COOKIE-ECHO
+        a.transport = transport;
+        a.is_echo = true;
+        a.local_port = dst_port;
+        a.local_vtag = local_vtag;
+        a.remote_port = src_port;
+        a.remote_vtag = init_tag;
+        a.remote_ip = src_ip;
+        a.next_tsn = 1;
+        a.rcv_next_tsn = initial_tsn;
+        a.peer_rwnd = a_rwnd;
+        a.out_streams = num_in.min(MAX_STREAMS as u16);
+        a.in_streams = num_out.min(MAX_STREAMS as u16);
+        a.cookie = cookie;
+    }
+
+    // Build and send INIT-ACK.
+    let mut pkt = [0u8; 128];
+    build_sctp_header(&mut pkt, dst_port, src_port, init_tag);
+    let cookie_bytes = cookie.to_le_bytes();
+    let clen = build_init_ack_chunk(&mut pkt, 12, local_vtag, 65535,
+                                     num_in.min(MAX_STREAMS as u16),
+                                     num_out.min(MAX_STREAMS as u16),
+                                     1, &cookie_bytes);
+    let total = 12 + clen;
+    stamp_sctp_checksum(&mut pkt, total);
+    wire_send_sctp(idx, &pkt, total);
+
+    syscall::debug_puts(b"  [sctp_srv] server: INIT-ACK sent (echo assoc)\n");
+}
+
+fn handle_rx_cookie_echo_server(data: &[u8], off: usize, chunk_len: usize,
+                                src_port: u16, dst_port: u16) {
+    if chunk_len < 12 { return; } // 4 header + 8 cookie minimum
+
+    // Extract cookie from the chunk.
+    let cookie_len = chunk_len - 4;
+    if cookie_len < 8 { return; }
+    let mut cookie_bytes = [0u8; 8];
+    cookie_bytes.copy_from_slice(&data[off + 4..off + 12]);
+    let cookie = u64::from_le_bytes(cookie_bytes);
+
+    // Find the server-side association matching this cookie.
+    let idx = unsafe {
+        let mut found = None;
+        for i in 0..MAX_ASSOCIATIONS {
+            if ASSOCS[i].is_echo
+                && ASSOCS[i].local_port == dst_port
+                && ASSOCS[i].remote_port == src_port
+                && ASSOCS[i].cookie == cookie
+            {
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    };
+
+    let idx = match idx {
+        Some(i) => i,
+        None => return,
+    };
+
+    unsafe { ASSOCS[idx].state = STATE_ESTABLISHED; }
+
+    // Send COOKIE-ACK.
+    let remote_vtag = unsafe { ASSOCS[idx].remote_vtag };
+    let mut pkt = [0u8; 32];
+    build_sctp_header(&mut pkt, dst_port, src_port, remote_vtag);
+    let clen = build_cookie_ack_chunk(&mut pkt, 12);
+    let total = 12 + clen;
+    stamp_sctp_checksum(&mut pkt, total);
+    wire_send_sctp(idx, &pkt, total);
+
+    syscall::debug_puts(b"  [sctp_srv] server: COOKIE-ACK sent, echo assoc ESTABLISHED\n");
 }
 
 // --- Modified SEND for UDP transport ---
@@ -1603,7 +1973,7 @@ fn check_retransmission_timers() {
     for i in 0..MAX_ASSOCIATIONS {
         unsafe {
             let a = &mut ASSOCS[i];
-            if a.transport != TRANSPORT_UDP {
+            if a.transport != TRANSPORT_UDP && a.transport != TRANSPORT_RAW_IP {
                 continue;
             }
             if a.state != STATE_ESTABLISHED && a.state != STATE_SHUTDOWN_SENT {
@@ -1646,7 +2016,7 @@ fn check_retransmission_timers() {
             print_num(a.rto_us / 1000);
             syscall::debug_puts(b"ms\n");
 
-            udp_send_sctp(i, &pkt, len);
+            wire_send_sctp(i, &pkt, len);
         }
     }
 }
@@ -1686,8 +2056,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // Attempt to initialize UDP transport (non-fatal if net service not up yet).
     if udp_transport_init() {
-        // Post first recv so we can receive incoming SCTP-over-UDP packets.
         udp_post_recv();
+    }
+
+    // Attempt to initialize raw IP transport (IP protocol 132).
+    if raw_ip_transport_init() {
+        raw_ip_post_recv();
     }
 
     // Main service loop.
@@ -1730,10 +2104,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Incoming SCTP-over-UDP packet.
                 let plen = (msg.data[0] & 0xFFFF) as usize;
                 let src_port = ((msg.data[0] >> 16) & 0xFFFF) as u16;
-                // src_ip from tcp4_srv is in LE byte order; swap to BE.
                 let src_ip_le = (msg.data[1] & 0xFFFFFFFF) as u32;
                 let src_ip = src_ip_le.swap_bytes();
-                // Read payload from recv grant page (separate from send page).
                 let mut pkt = [0u8; 1400];
                 let gva = unsafe { UDP_RECV_VA };
                 let src = gva as *const u8;
@@ -1741,8 +2113,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     pkt[i] = unsafe { src.add(i).read_volatile() };
                 }
                 handle_sctp_packet(&pkt, plen.min(1400), src_ip, src_port);
-                // Re-post recv for next packet.
                 udp_post_recv();
+            }
+            NET_RAW_DATA_BUF => {
+                // Incoming SCTP packet via raw IP (protocol 132).
+                let plen = (msg.data[0] & 0xFFFF) as usize;
+                let src_ip_le = (msg.data[1] & 0xFFFFFFFF) as u32;
+                let src_ip = src_ip_le.swap_bytes();
+                let mut pkt = [0u8; 1400];
+                let gva = unsafe { RAW_IP_RECV_VA };
+                let src = gva as *const u8;
+                for i in 0..plen.min(1400) {
+                    pkt[i] = unsafe { src.add(i).read_volatile() };
+                }
+                handle_sctp_packet(&pkt, plen.min(1400), src_ip, 0);
+                raw_ip_post_recv();
             }
             _ => {}
         }

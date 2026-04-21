@@ -392,9 +392,98 @@ static void handle_shutdown_complete(int fd, const uint8_t *pkt, size_t pkt_len,
     }
 }
 
-int main(void)
+/*
+ * Raw IP mode: listen on a raw socket (IP protocol 132) for SCTP packets.
+ * Used with TELIX_NET=tap where SCTP frames arrive as raw IP payloads.
+ */
+static void serve_raw_ip(void)
+{
+    int fd = socket(AF_INET, SOCK_RAW, 132);  /* IPPROTO_SCTP = 132 */
+    if (fd < 0) { perror("socket(RAW, 132)"); exit(1); }
+
+    int one = 1;
+    setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
+
+    printf("SCTP raw-IP echo server listening on IP protocol 132\n");
+    printf("Waiting for SCTP associations (echo on SCTP port %d)...\n",
+           SCTP_ECHO_PORT);
+
+    while (1) {
+        uint8_t buf[MAX_PKT];
+        struct sockaddr_in peer;
+        socklen_t peer_len = sizeof(peer);
+
+        ssize_t n = recvfrom(fd, buf, sizeof(buf), 0,
+                             (struct sockaddr *)&peer, &peer_len);
+        if (n < 0) { perror("recvfrom"); continue; }
+
+        /* Skip IP header (IHL * 4 bytes) to get to SCTP payload. */
+        if (n < 20) continue;
+        int ihl = (buf[0] & 0x0F) * 4;
+        if (ihl < 20 || n < ihl + 12) continue;
+
+        uint8_t *sctp = buf + ihl;
+        size_t sctp_len = (size_t)(n - ihl);
+
+        /* Verify SCTP checksum */
+        uint32_t wire_cksum = (uint32_t)sctp[8] | ((uint32_t)sctp[9] << 8) |
+                              ((uint32_t)sctp[10] << 16) | ((uint32_t)sctp[11] << 24);
+        uint32_t calc_cksum = sctp_checksum(sctp, sctp_len);
+        if (wire_cksum != calc_cksum) {
+            printf("  BAD CHECKSUM: wire=0x%08x calc=0x%08x (len=%zu)\n",
+                   wire_cksum, calc_cksum, sctp_len);
+            continue;
+        }
+
+        if (sctp_len < 13) continue;
+        uint8_t chunk_type = sctp[12];
+
+        /*
+         * For raw IP, sendto() with IP_HDRINCL sends just the SCTP payload —
+         * the kernel prepends the IP header. We reuse all the existing
+         * handle_* functions which build SCTP-level packets and use sendto().
+         * They work because sendto() on a SOCK_RAW + IP_HDRINCL socket
+         * treats the buffer as IP payload when the first byte isn't 0x45.
+         * Our SCTP responses start with the SCTP common header (port bytes),
+         * so the kernel adds the IP header for us.
+         */
+        switch (chunk_type) {
+        case CHUNK_INIT:
+            handle_init(fd, sctp, sctp_len, &peer);
+            break;
+        case CHUNK_COOKIE_ECHO:
+            handle_cookie_echo(fd, sctp, sctp_len, &peer);
+            break;
+        case CHUNK_DATA:
+            handle_data(fd, sctp, sctp_len, &peer);
+            break;
+        case CHUNK_HEARTBEAT:
+            handle_heartbeat(fd, sctp, sctp_len, &peer);
+            break;
+        case CHUNK_SHUTDOWN:
+            handle_shutdown_chunk(fd, sctp, sctp_len, &peer);
+            break;
+        case CHUNK_SHUTDOWN_COMPLETE:
+            handle_shutdown_complete(fd, sctp, sctp_len, &peer);
+            break;
+        case CHUNK_SACK:
+            break;
+        default:
+            printf("  Unknown chunk type %u (len=%zu)\n", chunk_type, sctp_len);
+            break;
+        }
+    }
+}
+
+int main(int argc, char **argv)
 {
     crc32c_init();
+
+    /* --raw mode: listen on raw IP socket (protocol 132) for TAP testing. */
+    if (argc > 1 && strcmp(argv[0+1], "--raw") == 0) {
+        serve_raw_ip();
+        return 0;
+    }
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) { perror("socket"); return 1; }

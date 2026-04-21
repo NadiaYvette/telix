@@ -64,11 +64,24 @@ if [ -f "$DISK_IMG" ]; then
     )
 fi
 
-# Add virtio-net (QEMU user-mode networking).
-QEMU_ARGS+=(
-    -netdev user,id=net0,guestfwd=tcp:10.0.2.100:1234-cmd:cat,hostfwd=tcp::${SSH_PORT}-:22
-    -device virtio-net-pci,netdev=net0
-)
+# Add virtio-net.
+# TELIX_NET=tap uses a TAP device (requires sudo setup, supports raw IP proto 132).
+# Default: SLIRP user-mode networking (no raw IP, but zero-config).
+case "${TELIX_NET:-}" in
+    tap)
+        TAP_IF="${TELIX_TAP:-tap0}"
+        QEMU_ARGS+=(
+            -netdev tap,id=net0,ifname="$TAP_IF",script=no,downscript=no
+            -device virtio-net-pci,netdev=net0
+        )
+        ;;
+    *)
+        QEMU_ARGS+=(
+            -netdev user,id=net0,guestfwd=tcp:10.0.2.100:1234-cmd:cat,hostfwd=tcp::${SSH_PORT}-:22
+            -device virtio-net-pci,netdev=net0
+        )
+        ;;
+esac
 
 # Add debug flags if requested.
 if [ "${1:-}" = "--debug" ]; then
