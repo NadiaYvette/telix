@@ -220,6 +220,10 @@ fn startup_thread() -> ! {
             Some(tid) => println!("  ip6_srv spawned (thread {})", tid),
             None => println!("  WARNING: ip6_srv not found (ok if not yet built)"),
         }
+        match sched::spawn_user(b"batman_srv", 50, 20, 0) {
+            Some(tid) => println!("  batman_srv spawned (thread {})", tid),
+            None => println!("  WARNING: batman_srv not found (ok if not yet built)"),
+        }
         match sched::spawn_user(b"tcp4_srv", 50, 20, 0) {
             Some(tid) => println!("  tcp4_srv spawned (thread {})", tid),
             None => println!("  WARNING: tcp4_srv not found (ok if not yet built)"),
@@ -251,6 +255,10 @@ fn startup_thread() -> ! {
         match sched::spawn_user(b"ip6_srv", 50, 20, 0) {
             Some(tid) => println!("  ip6_srv spawned (thread {})", tid),
             None => println!("  WARNING: ip6_srv not found (ok if not yet built)"),
+        }
+        match sched::spawn_user(b"batman_srv", 50, 20, 0) {
+            Some(tid) => println!("  batman_srv spawned (thread {})", tid),
+            None => println!("  WARNING: batman_srv not found (ok if not yet built)"),
         }
         match sched::spawn_user(b"tcp4_srv", 50, 20, 0) {
             Some(tid) => println!("  tcp4_srv spawned (thread {})", tid),
@@ -319,6 +327,10 @@ fn startup_thread() -> ! {
             Some(tid) => println!("  ip6_srv spawned (thread {})", tid),
             None => println!("  WARNING: ip6_srv not found (ok if not yet built)"),
         }
+        match sched::spawn_user(b"batman_srv", 50, 20, 0) {
+            Some(tid) => println!("  batman_srv spawned (thread {})", tid),
+            None => println!("  WARNING: batman_srv not found (ok if not yet built)"),
+        }
         match sched::spawn_user(b"tcp4_srv", 50, 20, 0) {
             Some(tid) => println!("  tcp4_srv spawned (thread {})", tid),
             None => println!("  WARNING: tcp4_srv not found (ok if not yet built)"),
@@ -360,6 +372,10 @@ fn startup_thread() -> ! {
         match sched::spawn_user(b"ip6_srv", 50, 20, 0) {
             Some(tid) => println!("  ip6_srv spawned (thread {})", tid),
             None => println!("  WARNING: ip6_srv not found (ok if not yet built)"),
+        }
+        match sched::spawn_user(b"batman_srv", 50, 20, 0) {
+            Some(tid) => println!("  batman_srv spawned (thread {})", tid),
+            None => println!("  WARNING: batman_srv not found (ok if not yet built)"),
         }
         match sched::spawn_user(b"tcp4_srv", 50, 20, 0) {
             Some(tid) => println!("  tcp4_srv spawned (thread {})", tid),

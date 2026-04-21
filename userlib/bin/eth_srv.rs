@@ -131,7 +131,7 @@ const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 const PING_TIMEOUT: u32 = 5000;
 
 // --- Max registered netif clients ---
-const MAX_CLIENTS: usize = 4;
+const MAX_CLIENTS: usize = 8;
 
 /// Grant page base addresses for netif clients.
 /// Each client gets a RX page and a TX page in our address space.

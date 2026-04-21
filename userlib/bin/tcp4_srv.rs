@@ -2020,14 +2020,28 @@ fn handle_msg(dev: &mut Tcp4Dev, msg: &syscall::Message) {
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  [tcp4_srv] starting\n");
 
-    // Wait for eth_srv to register.
-    let eth_port = match syscall::ns_lookup_wait(b"eth") {
-        Some(p) => p,
-        None => {
-            syscall::debug_puts(b"  [tcp4_srv] eth service not found\n");
-            loop {
-                core::hint::spin_loop();
+    // Prefer bat0 (B.A.T.M.A.N. mesh) if available, fall back to eth.
+    let eth_port = {
+        let mut found = None;
+        for _ in 0..20 {
+            if let Some(p) = syscall::ns_lookup(b"bat0") {
+                found = Some(p);
+                break;
             }
+            syscall::yield_now();
+        }
+        match found {
+            Some(p) => {
+                syscall::debug_puts(b"  [tcp4_srv] using bat0 (mesh)\n");
+                p
+            }
+            None => match syscall::ns_lookup_wait(b"eth") {
+                Some(p) => p,
+                None => {
+                    syscall::debug_puts(b"  [tcp4_srv] eth service not found\n");
+                    loop { core::hint::spin_loop(); }
+                }
+            },
         }
     };
 

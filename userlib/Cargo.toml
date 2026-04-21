@@ -53,6 +53,10 @@ name = "eth_srv"
 path = "bin/eth_srv.rs"
 
 [[bin]]
+name = "batman_srv"
+path = "bin/batman_srv.rs"
+
+[[bin]]
 name = "ip6_srv"
 path = "bin/ip6_srv.rs"
 
