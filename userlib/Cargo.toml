@@ -243,3 +243,7 @@ path = "bin/pci_srv.rs"
 [[bin]]
 name = "part_srv"
 path = "bin/part_srv.rs"
+
+[[bin]]
+name = "nvme_srv"
+path = "bin/nvme_srv.rs"

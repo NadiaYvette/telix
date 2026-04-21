@@ -64,6 +64,15 @@ if [ -f "$DISK_IMG" ]; then
     )
 fi
 
+# Add NVMe device if TELIX_NVME=1 and test.img exists.
+# Creates a second reference to the same disk image (snapshot mode, read-only from NVMe side).
+if [ "${TELIX_NVME:-}" = "1" ] && [ -f "$DISK_IMG" ]; then
+    QEMU_ARGS+=(
+        -drive file="$DISK_IMG",format=raw,if=none,id=nvme0,snapshot=on
+        -device nvme,drive=nvme0,serial=TELIX-NVME-01
+    )
+fi
+
 # Add virtio-net.
 # TELIX_NET=tap uses a TAP device (requires sudo setup, supports raw IP proto 132).
 # Default: SLIRP user-mode networking (no raw IP, but zero-config).

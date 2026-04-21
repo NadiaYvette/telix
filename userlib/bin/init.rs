@@ -5733,6 +5733,44 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 186: NVMe block device ---
+    syscall::debug_puts(b"  init: Phase 186 NVMe block device...\n");
+    {
+        // Give nvme_srv time to initialize and register.
+        for _ in 0..20u32 {
+            syscall::yield_now();
+        }
+        match syscall::ns_lookup(b"nvme") {
+            Some(nvme_port) => {
+                // Send IO_STAT to get capacity.
+                let my_port = syscall::port_create();
+                let reply_port_bits = (my_port as u64) << 32;
+                syscall::send(nvme_port, 0x400, 0, 0, reply_port_bits, 0);
+                match syscall::recv_msg(my_port) {
+                    Some(reply) if reply.tag == 0x401 => {
+                        let capacity_bytes = reply.data[0];
+                        if capacity_bytes > 0 {
+                            syscall::debug_puts(b"Phase 186 NVMe: PASSED (");
+                            print_num(capacity_bytes / 1024);
+                            syscall::debug_puts(b" KiB)\n");
+                        } else {
+                            syscall::debug_puts(b"Phase 186 NVMe: FAILED (0 capacity)\n");
+                        }
+                    }
+                    Some(_) => {
+                        syscall::debug_puts(b"Phase 186 NVMe: FAILED (bad reply)\n");
+                    }
+                    None => {
+                        syscall::debug_puts(b"Phase 186 NVMe: FAILED (no reply)\n");
+                    }
+                }
+            }
+            None => {
+                syscall::debug_puts(b"Phase 186 NVMe: SKIPPED (no nvme_srv)\n");
+            }
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

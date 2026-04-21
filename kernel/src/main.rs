@@ -302,6 +302,26 @@ fn startup_thread() -> ! {
             Some(tid) => println!("  tcp4_srv spawned (thread {})", tid),
             None => println!("  WARNING: tcp4_srv not found (ok if not yet built)"),
         }
+        // NVMe controller discovery and nvme_srv spawn.
+        if let Some(nvme) = arch::x86_64::pci::find_nvme_device() {
+            let region_id = cap::mmio::register_region(
+                nvme.bar0 as usize,
+                nvme.bar0_size as usize,
+                cap::mmio::CacheAttr::Device,
+            );
+            let arg0_upper = (nvme.irq as u64) << 48;
+            let spawned = match region_id {
+                Some(rid) => {
+                    sched::spawn_user_with_mmio_cap(b"nvme_srv", 50, 20, arg0_upper, rid)
+                }
+                None => sched::spawn_user(b"nvme_srv", 50, 20, arg0_upper),
+            };
+            match spawned {
+                Some(tid) => println!("  nvme_srv spawned (thread {})", tid),
+                None => println!("  WARNING: nvme_srv not found (ok if not yet built)"),
+            }
+        }
+
         // Probe BochsVBE (QEMU -vga std) and set up framebuffer info.
         arch::x86_64::pci::probe_bochs_vbe();
         // Register the VBE framebuffer as an MMIO region so fb_srv and
