@@ -2154,6 +2154,112 @@ pub fn port_set_recv_timeout(set_id: u32, timeout_us: u64) -> u64 {
     unsafe { arch::syscall2(SYS_PORT_SET_RECV_TIMEOUT, set_id as u64, timeout_us) }
 }
 
+/// port_set_recv_timeout with full message extraction.
+/// Returns (port_id, Message) on success, None on timeout.
+pub fn port_set_recv_timeout_msg(set_id: u32, timeout_us: u64) -> Option<(u64, Message)> {
+    let status: u64;
+    let r1: u64;
+    let r2: u64;
+    let r3: u64;
+    let r4: u64;
+    let r5: u64;
+    let r6: u64;
+    let r7: u64;
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "int 0x80",
+            "mov {r7}, rbx",
+            "pop rbx",
+            r7 = lateout(reg) r7,
+            inlateout("rax") SYS_PORT_SET_RECV_TIMEOUT => status,
+            inlateout("rdi") set_id as u64 => r1,
+            inlateout("rsi") timeout_us => r2,
+            lateout("rdx") r3,
+            lateout("r10") r4,
+            lateout("r8") r5,
+            lateout("r9") r6,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_PORT_SET_RECV_TIMEOUT,
+            inlateout("x0") set_id as u64 => status,
+            inlateout("x1") timeout_us => r1,
+            lateout("x2") r2,
+            lateout("x3") r3,
+            lateout("x4") r4,
+            lateout("x5") r5,
+            lateout("x6") r6,
+            lateout("x7") r7,
+        );
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a7") SYS_PORT_SET_RECV_TIMEOUT as u64 => r7,
+            inlateout("a0") set_id as u64 => status,
+            inlateout("a1") timeout_us => r1,
+            lateout("a2") r2,
+            lateout("a3") r3,
+            lateout("a4") r4,
+            lateout("a5") r5,
+            lateout("a6") r6,
+        );
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall 0",
+            inlateout("$r11") SYS_PORT_SET_RECV_TIMEOUT as u64 => r7,
+            inlateout("$r4") set_id as u64 => status,
+            inlateout("$r5") timeout_us => r1,
+            lateout("$r6") r2,
+            lateout("$r7") r3,
+            lateout("$r8") r4,
+            lateout("$r9") r5,
+            lateout("$r10") r6,
+        );
+    }
+
+    #[cfg(target_arch = "mips64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("$2") SYS_PORT_SET_RECV_TIMEOUT as u64 => status,
+            inlateout("$4") set_id as u64 => _,
+            inlateout("$5") timeout_us => r1,
+            lateout("$6") r2,
+            lateout("$7") r3,
+            lateout("$8") r4,
+            lateout("$9") r5,
+            lateout("$10") r6,
+            lateout("$11") r7,
+        );
+    }
+
+    if status == u64::MAX {
+        return None;
+    }
+    Some((
+        status,
+        Message {
+            tag: r1,
+            data: [r2, r3, r4, r5, r6, r7],
+        },
+    ))
+}
+
 /// timer_create: set per-thread interval timer.
 /// signal=0 disables the timer.
 pub fn timer_create(signal: u32, interval_ns: u64) -> u64 {

@@ -370,6 +370,11 @@ const UDS_OK: u64 = 0x8100;
 const UDS_EOF: u64 = 0x81FF;
 const _UDS_ERROR: u64 = 0x8F00;
 
+// Unified poll subscription protocol
+const POLL_SUBSCRIBE: u64 = 0xF010;
+const POLL_UNSUBSCRIBE: u64 = 0xF020;
+const POLL_NOTIFY: u64 = 0xF030;
+
 // NET server TCP protocol tags
 const NET_TCP_CONNECT: u64 = 0x4200;
 const NET_TCP_CONNECTED: u64 = 0x4201;
@@ -556,22 +561,26 @@ struct EpollWatch {
     fd: u8,
     events: u32,
     data: u64,
+    /// Port receiving POLL_NOTIFY for this watch (0 = none/local-only).
+    notify_port: u64,
 }
 
 impl EpollWatch {
-    const fn empty() -> Self { Self { active: false, fd: 0, events: 0, data: 0 } }
+    const fn empty() -> Self { Self { active: false, fd: 0, events: 0, data: 0, notify_port: 0 } }
 }
 
 #[derive(Clone, Copy)]
 struct EpollInstance {
     active: bool,
     owner_port: u64,
+    /// Port set for blocking epoll_wait (0 = not created).
+    port_set: u32,
     watches: [EpollWatch; MAX_EPOLL_WATCHES],
 }
 
 impl EpollInstance {
     const fn empty() -> Self {
-        Self { active: false, owner_port: 0, watches: [const { EpollWatch::empty() }; MAX_EPOLL_WATCHES] }
+        Self { active: false, owner_port: 0, port_set: 0, watches: [const { EpollWatch::empty() }; MAX_EPOLL_WATCHES] }
     }
 }
 
@@ -826,6 +835,8 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             if copied < 8 { return linux_err(EFAULT); }
             let val = u64::from_le_bytes(tmp);
             EVENTFD_TABLE[idx].counter = EVENTFD_TABLE[idx].counter.saturating_add(val);
+            // Notify epoll watchers of this eventfd.
+            epoll_notify_local_fd(pi, fd_idx, EPOLLIN);
             return 8;
         }
         if PROC_TABLE[pi].fds[fd_idx].kind == FdKind::MemFd {
@@ -2193,7 +2204,22 @@ fn do_close(pi: usize, fd: usize) {
             FdKind::Dir => {} // No server handle to close.
             FdKind::Epoll => {
                 let idx = PROC_TABLE[pi].fds[fd].handle as usize;
-                if idx < MAX_EPOLL_INSTANCES {
+                if idx < MAX_EPOLL_INSTANCES && EPOLL_TABLE[idx].active {
+                    // Unsubscribe + destroy all watch ports.
+                    for w in 0..MAX_EPOLL_WATCHES {
+                        let np = EPOLL_TABLE[idx].watches[w].notify_port;
+                        if EPOLL_TABLE[idx].watches[w].active && np != 0 {
+                            let wfd = EPOLL_TABLE[idx].watches[w].fd as usize;
+                            if wfd < MAX_FDS && PROC_TABLE[pi].fds[wfd].in_use {
+                                epoll_unsubscribe_fd(pi, wfd, np);
+                            }
+                            syscall::port_destroy(np);
+                        }
+                    }
+                    // Destroy the port set.
+                    if EPOLL_TABLE[idx].port_set != 0 {
+                        syscall::port_set_destroy(EPOLL_TABLE[idx].port_set);
+                    }
                     EPOLL_TABLE[idx] = EpollInstance::empty();
                 }
             }
@@ -6444,6 +6470,74 @@ fn poll_single_fd(pi: usize, fd: usize) -> u32 {
     }
 }
 
+/// Create a notify port for an fd being added to epoll, subscribe to its server.
+/// Returns the notify port (0 if the fd kind doesn't support subscription).
+fn epoll_subscribe_fd(pi: usize, fd: usize, port_set: u32, events: u32) -> u64 {
+    unsafe {
+        let entry = &PROC_TABLE[pi].fds[fd];
+        match entry.kind {
+            FdKind::Pipe | FdKind::Socket | FdKind::DevTty => {
+                let np = syscall::port_create();
+                syscall::port_set_add(port_set, np);
+                // Send POLL_SUBSCRIBE: data[0]=handle, data[1]=notify_port, data[2]=events
+                syscall::send(entry.fs_port, POLL_SUBSCRIBE, entry.handle, np, events as u64, 0);
+                np
+            }
+            // EventFd/TimerFd are local — no external server to subscribe to.
+            // We'll self-notify via the port set when their state changes.
+            FdKind::EventFd | FdKind::TimerFd => {
+                let np = syscall::port_create();
+                syscall::port_set_add(port_set, np);
+                np
+            }
+            // File/MemFd/DevNull/DevZero/DevUrandom/ProcBuf are always ready.
+            // Create a port and immediately self-notify so epoll_wait returns.
+            _ => {
+                let np = syscall::port_create();
+                syscall::port_set_add(port_set, np);
+                // Immediately ready: send notification to ourselves.
+                let revents = poll_single_fd(pi, fd);
+                if revents != 0 {
+                    syscall::send_nb(np, POLL_NOTIFY, revents as u64, 0);
+                }
+                np
+            }
+        }
+    }
+}
+
+/// Unsubscribe an fd from poll notifications.
+fn epoll_unsubscribe_fd(pi: usize, fd: usize, notify_port: u64) {
+    unsafe {
+        let entry = &PROC_TABLE[pi].fds[fd];
+        match entry.kind {
+            FdKind::Pipe | FdKind::Socket | FdKind::DevTty => {
+                // Send POLL_UNSUBSCRIBE: data[0]=handle, data[1]=notify_port
+                syscall::send(entry.fs_port, POLL_UNSUBSCRIBE, entry.handle, notify_port, 0, 0);
+            }
+            _ => {} // Local types — nothing to unsubscribe from.
+        }
+    }
+}
+
+/// Notify epoll watchers of a locally-managed fd (EventFd/TimerFd) becoming ready.
+/// Sends POLL_NOTIFY to the watch's notify_port so port_set_recv_timeout wakes up.
+fn epoll_notify_local_fd(pi: usize, fd: usize, revents: u32) {
+    unsafe {
+        for ep in 0..MAX_EPOLL_INSTANCES {
+            if !EPOLL_TABLE[ep].active { continue; }
+            // Only notify if this epoll belongs to the same process.
+            if EPOLL_TABLE[ep].owner_port != PROC_TABLE[pi].port { continue; }
+            for w in 0..MAX_EPOLL_WATCHES {
+                if !EPOLL_TABLE[ep].watches[w].active { continue; }
+                if EPOLL_TABLE[ep].watches[w].fd as usize == fd && EPOLL_TABLE[ep].watches[w].notify_port != 0 {
+                    syscall::send_nb(EPOLL_TABLE[ep].watches[w].notify_port, POLL_NOTIFY, revents as u64, 0);
+                }
+            }
+        }
+    }
+}
+
 /// Handle epoll_create(size) / epoll_create1(flags).
 fn handle_epoll_create1(pi: usize, flags: u64) -> u64 {
     // Allocate an epoll instance.
@@ -6466,9 +6560,13 @@ fn handle_epoll_create1(pi: usize, flags: u64) -> u64 {
         None => return linux_err(EMFILE),
     };
 
+    // Create a port set for blocking epoll_wait.
+    let ps = syscall::port_set_create() as u32;
+
     unsafe {
         EPOLL_TABLE[ep_idx].active = true;
         EPOLL_TABLE[ep_idx].owner_port = PROC_TABLE[pi].port;
+        EPOLL_TABLE[ep_idx].port_set = ps;
         EPOLL_TABLE[ep_idx].watches = [const { EpollWatch::empty() }; MAX_EPOLL_WATCHES];
 
         PROC_TABLE[pi].fds[fd].kind = FdKind::Epoll;
@@ -6501,6 +6599,8 @@ fn handle_epoll_ctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             return linux_err(EBADF);
         }
 
+        let ps = EPOLL_TABLE[ep_idx].port_set;
+
         match op {
             EPOLL_CTL_ADD => {
                 // Check for duplicate.
@@ -6515,14 +6615,25 @@ fn handle_epoll_ctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                 if copied < 12 { return linux_err(EFAULT); }
                 let events = u32::from_le_bytes([ev_buf[0], ev_buf[1], ev_buf[2], ev_buf[3]]);
                 let data = u64::from_le_bytes([ev_buf[4], ev_buf[5], ev_buf[6], ev_buf[7], ev_buf[8], ev_buf[9], ev_buf[10], ev_buf[11]]);
+
+                // Create a notify port and add to port set.
+                let np = epoll_subscribe_fd(pi, target_fd, ps, events);
+
                 // Find empty watch slot.
                 for w in 0..MAX_EPOLL_WATCHES {
                     if !EPOLL_TABLE[ep_idx].watches[w].active {
-                        EPOLL_TABLE[ep_idx].watches[w] = EpollWatch { active: true, fd: target_fd as u8, events, data };
+                        EPOLL_TABLE[ep_idx].watches[w] = EpollWatch {
+                            active: true, fd: target_fd as u8, events, data, notify_port: np,
+                        };
                         return 0;
                     }
                 }
-                linux_err(ENOMEM) // No space
+                // No space — clean up the port we just created.
+                if np != 0 {
+                    syscall::port_set_remove(ps, np);
+                    syscall::port_destroy(np);
+                }
+                linux_err(ENOMEM)
             }
             EPOLL_CTL_MOD => {
                 let mut ev_buf = [0u8; 12];
@@ -6542,6 +6653,13 @@ fn handle_epoll_ctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             EPOLL_CTL_DEL => {
                 for w in 0..MAX_EPOLL_WATCHES {
                     if EPOLL_TABLE[ep_idx].watches[w].active && EPOLL_TABLE[ep_idx].watches[w].fd == target_fd as u8 {
+                        let np = EPOLL_TABLE[ep_idx].watches[w].notify_port;
+                        // Unsubscribe from server.
+                        if np != 0 {
+                            epoll_unsubscribe_fd(pi, target_fd, np);
+                            syscall::port_set_remove(ps, np);
+                            syscall::port_destroy(np);
+                        }
                         EPOLL_TABLE[ep_idx].watches[w] = EpollWatch::empty();
                         return 0;
                     }
@@ -6554,6 +6672,7 @@ fn handle_epoll_ctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle epoll_wait(epfd, events, maxevents, timeout).
+/// Uses port-set-based blocking instead of busy-loop polling.
 fn handle_epoll_wait(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let epfd = args[0] as usize;
     let events_va = args[1] as usize;
@@ -6563,7 +6682,7 @@ fn handle_epoll_wait(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     if epfd >= MAX_FDS { return linux_err(EBADF); }
     if maxevents == 0 || maxevents > 64 { return linux_err(EINVAL); }
 
-    let ep_idx = unsafe {
+    let (ep_idx, ps) = unsafe {
         if !PROC_TABLE[pi].fds[epfd].in_use || PROC_TABLE[pi].fds[epfd].kind != FdKind::Epoll {
             return linux_err(EBADF);
         }
@@ -6571,34 +6690,31 @@ fn handle_epoll_wait(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         if idx >= MAX_EPOLL_INSTANCES || !EPOLL_TABLE[idx].active {
             return linux_err(EBADF);
         }
-        idx
+        (idx, EPOLL_TABLE[idx].port_set)
     };
 
-    let max_iters: u32 = if timeout_ms == 0 {
-        1
-    } else if timeout_ms > 0 {
-        ((timeout_ms as u32) / 5).max(1).min(200)
-    } else {
-        400 // ~2s for infinite timeout
-    };
+    let cap = maxevents.min(16);
+    let mut out_count = 0usize;
+    let mut out_buf = [0u8; 12 * 16]; // max 16 events
 
-    for iter in 0..max_iters {
-        let mut out_count = 0usize;
-        let mut out_buf = [0u8; 12 * 16]; // max 16 events at a time
-
-        let cap = maxevents.min(16);
-        unsafe {
-            for w in 0..MAX_EPOLL_WATCHES {
-                if out_count >= cap { break; }
-                if !EPOLL_TABLE[ep_idx].watches[w].active { continue; }
-
-                let fd = EPOLL_TABLE[ep_idx].watches[w].fd as usize;
-                if fd >= MAX_FDS || !PROC_TABLE[pi].fds[fd].in_use { continue; }
-
+    // 1. Non-blocking pass: check locally-managed fds (EventFd/TimerFd) and
+    //    drain any queued POLL_NOTIFY messages already in the port set.
+    unsafe {
+        // Check EventFd/TimerFd state directly (they don't have external servers).
+        for w in 0..MAX_EPOLL_WATCHES {
+            if out_count >= cap { break; }
+            if !EPOLL_TABLE[ep_idx].watches[w].active { continue; }
+            let fd = EPOLL_TABLE[ep_idx].watches[w].fd as usize;
+            if fd >= MAX_FDS || !PROC_TABLE[pi].fds[fd].in_use { continue; }
+            let kind = PROC_TABLE[pi].fds[fd].kind;
+            if kind == FdKind::EventFd || kind == FdKind::TimerFd
+                || kind == FdKind::MemFd || kind == FdKind::File
+                || kind == FdKind::DevNull || kind == FdKind::DevZero
+                || kind == FdKind::DevUrandom || kind == FdKind::ProcBuf
+            {
                 let revents = poll_single_fd(pi, fd);
                 let matched = (revents & EPOLL_TABLE[ep_idx].watches[w].events)
                     | (revents & (EPOLLERR | EPOLLHUP));
-
                 if matched != 0 {
                     let off = out_count * 12;
                     out_buf[off..off + 4].copy_from_slice(&matched.to_le_bytes());
@@ -6608,18 +6724,93 @@ fn handle_epoll_wait(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                 }
             }
         }
+    }
 
-        if out_count > 0 {
-            syscall::personality_copy_out(caller_port, events_va, &out_buf[..out_count * 12]);
-            return out_count as u64;
-        }
-
-        if iter + 1 < max_iters {
-            syscall::sleep_ms(5);
+    // Drain any already-queued POLL_NOTIFY messages (non-blocking: timeout=0).
+    while out_count < cap {
+        match syscall::port_set_recv_timeout_msg(ps, 0) {
+            Some((port_id, msg)) => {
+                if msg.tag == POLL_NOTIFY {
+                    if let Some((matched, data)) = epoll_match_notify(ep_idx, port_id, msg.data[0] as u32) {
+                        let off = out_count * 12;
+                        out_buf[off..off + 4].copy_from_slice(&matched.to_le_bytes());
+                        out_buf[off + 4..off + 12].copy_from_slice(&data.to_le_bytes());
+                        out_count += 1;
+                    }
+                }
+            }
+            None => break,
         }
     }
 
-    0 // timeout, no events
+    // 2. If we already have events, or timeout=0, return now.
+    if out_count > 0 {
+        syscall::personality_copy_out(caller_port, events_va, &out_buf[..out_count * 12]);
+        return out_count as u64;
+    }
+    if timeout_ms == 0 {
+        return 0;
+    }
+
+    // 3. Block on port set with timeout.
+    let timeout_us: u64 = if timeout_ms < 0 {
+        u64::MAX // infinite
+    } else {
+        (timeout_ms as u64) * 1000
+    };
+
+    match syscall::port_set_recv_timeout_msg(ps, timeout_us) {
+        Some((port_id, msg)) => {
+            if msg.tag == POLL_NOTIFY {
+                if let Some((matched, data)) = epoll_match_notify(ep_idx, port_id, msg.data[0] as u32) {
+                    let off = out_count * 12;
+                    out_buf[off..off + 4].copy_from_slice(&matched.to_le_bytes());
+                    out_buf[off + 4..off + 12].copy_from_slice(&data.to_le_bytes());
+                    out_count += 1;
+                }
+            }
+            // Drain more without blocking.
+            while out_count < cap {
+                match syscall::port_set_recv_timeout_msg(ps, 0) {
+                    Some((port_id2, msg2)) => {
+                        if msg2.tag == POLL_NOTIFY {
+                            if let Some((matched, data)) = epoll_match_notify(ep_idx, port_id2, msg2.data[0] as u32) {
+                                let off = out_count * 12;
+                                out_buf[off..off + 4].copy_from_slice(&matched.to_le_bytes());
+                                out_buf[off + 4..off + 12].copy_from_slice(&data.to_le_bytes());
+                                out_count += 1;
+                            }
+                        }
+                    }
+                    None => break,
+                }
+            }
+            if out_count > 0 {
+                syscall::personality_copy_out(caller_port, events_va, &out_buf[..out_count * 12]);
+            }
+            out_count as u64
+        }
+        None => 0, // timeout
+    }
+}
+
+/// Match a POLL_NOTIFY arriving on `port_id` to an epoll watch.
+/// Returns (matched_events, epoll_data) if found.
+fn epoll_match_notify(ep_idx: usize, port_id: u64, revents: u32) -> Option<(u32, u64)> {
+    unsafe {
+        for w in 0..MAX_EPOLL_WATCHES {
+            if !EPOLL_TABLE[ep_idx].watches[w].active { continue; }
+            if EPOLL_TABLE[ep_idx].watches[w].notify_port == port_id {
+                let matched = (revents & EPOLL_TABLE[ep_idx].watches[w].events)
+                    | (revents & (EPOLLERR | EPOLLHUP));
+                if matched != 0 {
+                    return Some((matched, EPOLL_TABLE[ep_idx].watches[w].data));
+                }
+                return None;
+            }
+        }
+    }
+    None
 }
 
 // ---- EventFd / TimerFd handlers ----
