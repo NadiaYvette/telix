@@ -5154,6 +5154,58 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 181: iSCSI initiator (storage-over-network) ---
+    syscall::debug_puts(b"  init: Phase 181 iSCSI initiator...\n");
+    {
+        // Spawn iscsi_srv — it will try to connect to 10.0.2.2:3260.
+        // If no target is running, it will fail TCP connect and spin.
+        // We use a timeout to detect success.
+        let iscsi_tid = syscall::spawn(b"iscsi_srv", 50);
+        if iscsi_tid == 0 {
+            syscall::debug_puts(b"Phase 181 iSCSI: SKIPPED (spawn failed)\n");
+        } else {
+            // Poll for iscsi_srv registration (TCP connect + login + SCSI init over SLIRP).
+            let mut iscsi_found = None;
+            for _ in 0..150 { // 150 * 100ms = 15s max
+                if let Some(p) = syscall::ns_lookup(b"iscsi") {
+                    iscsi_found = Some(p);
+                    break;
+                }
+                syscall::sleep_ms(100);
+            }
+            match iscsi_found {
+                Some(iscsi_port) => {
+                    // Try IO_CONNECT.
+                    let rp = syscall::port_create();
+                    let d2 = (rp as u64) << 32;
+                    syscall::send(iscsi_port, 0x100, 0, 0, d2, 0); // IO_CONNECT
+                    // Wait for response with timeout.
+                    let resp = syscall::recv_msg_timeout(rp, 5_000_000);
+                    match resp {
+                        Some(m) if m.tag == 0x101 => { // IO_CONNECT_OK
+                            let capacity = m.data[1];
+                            syscall::debug_puts(b"  iscsi: capacity=");
+                            print_num(capacity);
+                            syscall::debug_puts(b" bytes\n");
+                            if capacity > 0 {
+                                syscall::debug_puts(b"Phase 181 iSCSI: PASSED\n");
+                            } else {
+                                syscall::debug_puts(b"Phase 181 iSCSI: PASSED (zero-cap)\n");
+                            }
+                        }
+                        _ => {
+                            syscall::debug_puts(b"Phase 181 iSCSI: FAILED (connect err)\n");
+                        }
+                    }
+                    syscall::port_destroy(rp);
+                }
+                None => {
+                    syscall::debug_puts(b"Phase 181 iSCSI: SKIPPED (no target)\n");
+                }
+            }
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

@@ -266,7 +266,7 @@ The current `poll()` implementation busy-loops sending per-fd `POLL_CHECK` RPCs 
 **Phase 3b (Port Set Completion):** Required for correct network server behaviour:
 - Port removal from set — done (SYS_PORT_SET_REMOVE, syscall 105)
 - Port set destruction + cleanup of member tags — done (SYS_PORT_SET_DESTROY, syscall 106)
-- Convert poll() from busy-loop RPC to port-set-based blocking — **done**: POLL_SUBSCRIBE/UNSUBSCRIBE/NOTIFY handlers in pipe_srv, uds_srv, event_srv, pty_srv; remaining: linux_srv epoll_wait (uses its own polling loop internally)
+- Convert poll() from busy-loop RPC to port-set-based blocking — **done**: POLL_SUBSCRIBE/UNSUBSCRIBE/NOTIFY in all IPC servers (pipe_srv, uds_srv, event_srv, pty_srv, console_srv) + linux_srv epoll_wait converted to port_set_recv_timeout_msg blocking
 - Multiple waiters per set (enables thread-pool patterns for high-connection-count servers)
 - Multi-set membership for ports (enables overlapping epoll instances)
 
