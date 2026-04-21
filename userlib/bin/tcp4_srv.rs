@@ -83,6 +83,11 @@ const NET_UDP_RECV_NONE: u64 = 0x4B12;
 const NET_UDP_CLOSE: u64 = 0x4C00;
 const NET_UDP_CLOSE_OK: u64 = 0x4C01;
 
+// Grant-page-based UDP for larger datagrams (SCTP, etc).
+const NET_UDP_SEND_BUF: u64 = 0x4A10;
+const NET_UDP_RECV_BUF: u64 = 0x4B20;
+const NET_UDP_DATA_BUF: u64 = 0x4B21;
+
 // --- TCP flags ---
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
@@ -210,6 +215,7 @@ struct Udp4Binding {
     active: bool,
     local_port: u16,
     recv_reply_port: u64,   // pending recv caller (0 = none)
+    recv_grant_va: usize,   // if nonzero, deliver to grant page instead of inline
     rx_buf: [u8; UDP4_RX_BUF_SIZE],
     rx_len: usize,
     rx_src_ip: [u8; 4],
@@ -222,6 +228,7 @@ impl Udp4Binding {
             active: false,
             local_port: 0,
             recv_reply_port: 0,
+            recv_grant_va: 0,
             rx_buf: [0; UDP4_RX_BUF_SIZE],
             rx_len: 0,
             rx_src_ip: [0; 4],
@@ -521,7 +528,13 @@ impl Tcp4Dev {
         let recv_rp = self.udp4[idx].recv_reply_port;
         if recv_rp != 0 {
             self.udp4[idx].recv_reply_port = 0;
-            self.deliver_udp4_datagram(recv_rp, &src_ip, src_port, payload);
+            let gva = self.udp4[idx].recv_grant_va;
+            if gva != 0 {
+                self.udp4[idx].recv_grant_va = 0;
+                self.deliver_udp4_datagram_buf(recv_rp, &src_ip, src_port, payload, gva);
+            } else {
+                self.deliver_udp4_datagram(recv_rp, &src_ip, src_port, payload);
+            }
         } else {
             // Queue one datagram (drop if full).
             let copy_len = payload.len().min(UDP4_RX_BUF_SIZE);
@@ -750,6 +763,7 @@ impl Tcp4Dev {
                     active: true,
                     local_port: port,
                     recv_reply_port: 0,
+                    recv_grant_va: 0,
                     rx_buf: [0; UDP4_RX_BUF_SIZE],
                     rx_len: 0,
                     rx_src_ip: [0; 4],
@@ -777,7 +791,13 @@ impl Tcp4Dev {
                 let recv_rp = self.udp4[idx].recv_reply_port;
                 if recv_rp != 0 {
                     self.udp4[idx].recv_reply_port = 0;
-                    self.deliver_udp4_datagram(recv_rp, &MY_IP, src_port, payload);
+                    let gva = self.udp4[idx].recv_grant_va;
+                    if gva != 0 {
+                        self.udp4[idx].recv_grant_va = 0;
+                        self.deliver_udp4_datagram_buf(recv_rp, &MY_IP, src_port, payload, gva);
+                    } else {
+                        self.deliver_udp4_datagram(recv_rp, &MY_IP, src_port, payload);
+                    }
                 } else {
                     let copy_len = payload.len().min(UDP4_RX_BUF_SIZE);
                     self.udp4[idx].rx_buf[..copy_len].copy_from_slice(&payload[..copy_len]);
@@ -879,6 +899,24 @@ impl Tcp4Dev {
         for i in 0..plen.min(8) { d2 |= (payload[i] as u64) << (i * 8); }
         for i in 8..plen { d3 |= (payload[i] as u64) << ((i - 8) * 8); }
         syscall::send_nb_4(reply_port, NET_UDP_DATA, d0, d1, d2, d3);
+    }
+
+    /// Deliver a UDP4 datagram to a waiting receiver via grant page.
+    /// Writes the payload to the grant VA, then replies with NET_UDP_DATA_BUF.
+    fn deliver_udp4_datagram_buf(
+        &self, reply_port: u64, src_ip: &[u8; 4], src_port: u16, payload: &[u8], grant_va: usize,
+    ) {
+        let plen = payload.len().min(1400);
+        let dst = grant_va as *mut u8;
+        for i in 0..plen {
+            unsafe { dst.add(i).write_volatile(payload[i]); }
+        }
+        let d0 = (plen as u64) | ((src_port as u64) << 16);
+        let d1 = (src_ip[0] as u64)
+            | ((src_ip[1] as u64) << 8)
+            | ((src_ip[2] as u64) << 16)
+            | ((src_ip[3] as u64) << 24);
+        syscall::send_nb_4(reply_port, NET_UDP_DATA_BUF, d0, d1, 0, 0);
     }
 
     // ---------------------------------------------------------------
@@ -1709,6 +1747,65 @@ fn handle_msg(dev: &mut Tcp4Dev, msg: &syscall::Message) {
             let bind_id = (msg.data[0] & 0xFFFFFFFF) as usize;
             let reply_port = msg.data[0] >> 32;
             dev.handle_udp4_close(bind_id, reply_port);
+        }
+        NET_UDP_SEND_BUF => {
+            // Grant-page UDP send for larger datagrams (SCTP etc).
+            // data[0] = dst_ip(low32) | dst_port(bits32-47) | bind_id(bits48-63)
+            // data[1] = grant_va(low48) | payload_len(bits48-63)
+            // data[2] = reply_port
+            let dst_ip = [
+                msg.data[0] as u8,
+                (msg.data[0] >> 8) as u8,
+                (msg.data[0] >> 16) as u8,
+                (msg.data[0] >> 24) as u8,
+            ];
+            let dst_port = (msg.data[0] >> 32) as u16;
+            let bind_id = (msg.data[0] >> 48) as usize;
+            let grant_va = (msg.data[1] & 0xFFFF_FFFF_FFFF) as usize;
+            let payload_len = (msg.data[1] >> 48) as usize;
+            let reply_port = msg.data[2];
+            if bind_id >= MAX_UDP4_BINDS || !dev.udp4[bind_id].active || payload_len > 1400 {
+                syscall::send_nb(reply_port, NET_UDP_SEND_FAIL, 0, 0);
+            } else {
+                // Read payload from grant page.
+                let mut payload = [0u8; 1400];
+                let src = grant_va as *const u8;
+                for i in 0..payload_len {
+                    payload[i] = unsafe { src.add(i).read_volatile() };
+                }
+                let src_port = dev.udp4[bind_id].local_port;
+                dev.handle_udp4_send(dst_ip, dst_port, src_port, &payload[..payload_len], reply_port);
+            }
+        }
+        NET_UDP_RECV_BUF => {
+            // Grant-page UDP recv for larger datagrams.
+            // data[0] = bind_id(low32) | reply_port(high32)
+            // data[1] = grant_va (destination for received data)
+            let bind_id = (msg.data[0] & 0xFFFFFFFF) as usize;
+            let reply_port = msg.data[0] >> 32;
+            let grant_va = msg.data[1] as usize;
+            if bind_id >= MAX_UDP4_BINDS || !dev.udp4[bind_id].active {
+                syscall::send_nb(reply_port, NET_UDP_RECV_NONE, 0, 0);
+            } else if dev.udp4[bind_id].rx_len > 0 {
+                let src_ip = dev.udp4[bind_id].rx_src_ip;
+                let src_port = dev.udp4[bind_id].rx_src_port;
+                let len = dev.udp4[bind_id].rx_len;
+                // Write payload to grant page.
+                let dst = grant_va as *mut u8;
+                for i in 0..len {
+                    unsafe { dst.add(i).write_volatile(dev.udp4[bind_id].rx_buf[i]); }
+                }
+                dev.udp4[bind_id].rx_len = 0;
+                // Reply: data[0]=len(low16)|src_port(high16), data[1]=src_ip
+                let d0 = (len as u64) | ((src_port as u64) << 16);
+                let d1 = (src_ip[0] as u64) | ((src_ip[1] as u64) << 8)
+                    | ((src_ip[2] as u64) << 16) | ((src_ip[3] as u64) << 24);
+                syscall::send_nb_4(reply_port, NET_UDP_DATA_BUF, d0, d1, 0, 0);
+            } else {
+                // Park — store grant_va for when data arrives.
+                dev.udp4[bind_id].recv_reply_port = reply_port;
+                dev.udp4[bind_id].recv_grant_va = grant_va;
+            }
         }
         _ => {}
     }

@@ -5321,6 +5321,104 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 182b: SCTP over UDP encapsulation (host interop) ---
+    syscall::debug_puts(b"  init: Phase 182b SCTP/UDP echo (host)...\n");
+    {
+        // This test requires the host-side sctp-echo-server running on port 9899.
+        // It's non-fatal if the host server isn't available.
+        if let Some(sp) = syscall::ns_lookup(b"sctp") {
+            let rp = syscall::port_create();
+
+            // SCTP_ASSOCIATE to 10.0.2.2:7 (QEMU gateway = host) via UDP encap.
+            // remote_ip = 10.0.2.2 = 0x0A000202 (big-endian stored in u32)
+            let remote_ip: u64 = 0x0A000202;
+            let d0: u64 = remote_ip | (7u64 << 32); // 10.0.2.2:7
+            let d1: u64 = 0 | ((rp as u64) << 16); // ephemeral port, reply_port
+            let d2: u64 = 2 | (2 << 16); // 2 out, 2 in streams
+            syscall::send(sp, 0x4D00, d0, d1, d2, 0); // SCTP_ASSOCIATE
+
+            let mut assoc_id: u64 = u64::MAX;
+            // Longer timeout for UDP (network + host processing).
+            if let Some(m) = syscall::recv_msg_timeout(rp, 10_000_000) {
+                if m.tag == 0x4D01 { // SCTP_ASSOCIATED
+                    assoc_id = m.data[0] & 0xFFFFFFFF;
+                }
+            }
+
+            if assoc_id == u64::MAX {
+                syscall::debug_puts(b"Phase 182b SCTP/UDP: SKIPPED (no host echo server)\n");
+            } else {
+                // Send "SCTP/UDP!" on stream 0.
+                let test_data = b"SCTP/UDP!";
+                let mut w0: u64 = 0;
+                let mut w1: u64 = 0;
+                for i in 0..test_data.len().min(8) {
+                    w0 |= (test_data[i] as u64) << (i * 8);
+                }
+                for i in 0..test_data.len().saturating_sub(8).min(8) {
+                    w1 |= (test_data[8 + i] as u64) << (i * 8);
+                }
+                // SCTP_SEND
+                let sd0 = assoc_id; // stream 0
+                let sd1 = (test_data.len() as u64) | ((rp as u64) << 16);
+                syscall::send(sp, 0x4E00, sd0, sd1, w0, w1);
+
+                let mut send_ok = false;
+                if let Some(m) = syscall::recv_msg_timeout(rp, 5_000_000) {
+                    if m.tag == 0x4E01 { send_ok = true; }
+                }
+
+                if !send_ok {
+                    syscall::debug_puts(b"Phase 182b SCTP/UDP: FAILED (send)\n");
+                } else {
+                    // SCTP_RECV
+                    let rd0 = assoc_id | ((rp as u64) << 32);
+                    syscall::send(sp, 0x4F00, rd0, 0, 0, 0);
+
+                    let mut recv_ok = false;
+                    let mut echo_match = false;
+                    if let Some(m) = syscall::recv_msg_timeout(rp, 10_000_000) {
+                        if m.tag == 0x4F01 { // SCTP_DATA
+                            let len = (m.data[0] & 0xFFFF) as usize;
+                            recv_ok = true;
+                            if len == test_data.len() {
+                                let mut match_ok = true;
+                                for i in 0..len.min(8) {
+                                    if (m.data[1] >> (i * 8)) as u8 != test_data[i] {
+                                        match_ok = false;
+                                    }
+                                }
+                                for i in 0..len.saturating_sub(8).min(8) {
+                                    if (m.data[2] >> (i * 8)) as u8 != test_data[8 + i] {
+                                        match_ok = false;
+                                    }
+                                }
+                                echo_match = match_ok;
+                            }
+                        }
+                    }
+
+                    if recv_ok && echo_match {
+                        syscall::debug_puts(b"Phase 182b SCTP/UDP: PASSED\n");
+                    } else if recv_ok {
+                        syscall::debug_puts(b"Phase 182b SCTP/UDP: FAILED (echo mismatch)\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 182b SCTP/UDP: FAILED (recv timeout)\n");
+                    }
+                }
+
+                // Shutdown.
+                let shd0 = assoc_id | ((rp as u64) << 32);
+                syscall::send(sp, 0x4D10, shd0, 0, 0, 0);
+                syscall::recv_msg_timeout(rp, 1_000_000);
+            }
+
+            syscall::port_destroy(rp);
+        } else {
+            syscall::debug_puts(b"Phase 182b SCTP/UDP: SKIPPED (no sctp_srv)\n");
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {
