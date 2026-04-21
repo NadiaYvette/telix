@@ -77,8 +77,22 @@ const DEFAULT_THROUGHPUT: u32 = 10000;          // 10000 * 100 Kbit/s = 1 Gbit/s
 
 const BATMAN_MODE_IV: u8 = 0;
 const BATMAN_MODE_V: u8 = 1;
-/// Active routing mode. Set at compile time; Phase 8+ may make runtime-switchable.
+/// Active routing mode. Set at compile time.
 const BATMAN_MODE: u8 = BATMAN_MODE_IV;
+
+// -------------------------------------------------------------------
+// Gateway support constants.
+// -------------------------------------------------------------------
+
+/// TVLV type for gateway announcement (appended to OGM tvlv area).
+const TVLV_GW_TYPE: u8 = 0x01;
+const TVLV_GW_LEN: u8 = 4; // 4 bytes: download(u16 LE) + upload(u16 LE)
+
+/// Gateway speeds in 100 Kbit/s units.
+const GW_DOWN_SPEED: u16 = 10000; // 1 Gbit/s
+const GW_UP_SPEED: u16 = 1000;    // 100 Mbit/s
+
+const MAX_GATEWAYS: usize = 8;
 
 // -------------------------------------------------------------------
 // Data structures.
@@ -199,6 +213,33 @@ impl Originator {
     }
 }
 
+/// A known gateway node in the mesh.
+struct Gateway {
+    active: bool,
+    orig_mac: [u8; 6],
+    next_hop: [u8; 6],
+    down_speed: u16,   // 100 Kbit/s units
+    up_speed: u16,     // 100 Kbit/s units
+    tq: u8,            // IV: path TQ to this gateway
+    throughput: u32,   // V: min-throughput path to gateway
+    last_seen_ns: u64,
+}
+
+impl Gateway {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            orig_mac: [0; 6],
+            next_hop: [0; 6],
+            down_speed: 0,
+            up_speed: 0,
+            tq: 0,
+            throughput: 0,
+            last_seen_ns: 0,
+        }
+    }
+}
+
 /// Main device state.
 struct BatmanDev {
     eth_port: u64,
@@ -216,6 +257,9 @@ struct BatmanDev {
     elp_seqno: u32,
     last_elp_ns: u64,
     ogm2_seqno: u32,
+    // Gateway state
+    gateways: [Gateway; MAX_GATEWAYS],
+    is_gateway: bool,  // true if we announce ourselves as a gateway
     // Broadcast encapsulation
     bcast_seqno: u32,
     bcast_dedup_orig: [[u8; 6]; BCAST_DEDUP_SIZE],
@@ -454,8 +498,13 @@ impl BatmanDev {
                 self.send_unicast_encap(client_id, payload_len, dst_mac, ethertype, next_hop);
                 syscall::send_nb(reply_port, NETIF_XMIT_OK, 0, 0);
                 return; // Don't also proxy directly for mesh-routed frames.
+            } else if let Some(gw_hop) = self.best_gateway() {
+                // Unknown destination, but we have a gateway — route through it.
+                self.send_unicast_encap(client_id, payload_len, dst_mac, ethertype, gw_hop);
+                syscall::send_nb(reply_port, NETIF_XMIT_OK, 0, 0);
+                return;
             }
-            // Unknown destination: fall through to direct proxy (off-mesh / gateway).
+            // No gateway, unknown destination: fall through to direct proxy.
         }
 
         // Direct proxy (Phase 1 behavior): copy payload and forward.
@@ -705,13 +754,14 @@ impl BatmanDev {
     fn handle_bat_status(&self, reply_port: u64) {
         let orig_count = self.originators.iter().filter(|o| o.active).count() as u64;
         let neigh_count = self.neighbors.iter().filter(|n| n.active).count() as u64;
+        let gw_count = self.gateways.iter().filter(|g| g.active).count() as u64;
         syscall::send_nb_4(
             reply_port,
             BAT_STATUS_OK,
             orig_count,
             neigh_count,
             self.ogm_seqno as u64,
-            0,
+            gw_count,
         );
     }
 
@@ -745,10 +795,16 @@ impl BatmanDev {
         buf[22] = 0;
         // [23] tq
         buf[23] = tq;
-        // [24..26] tvlv_len (u16 LE) = 0
-        buf[24] = 0;
-        buf[25] = 0;
-        OGM_SIZE
+        // [24..26] tvlv_len (u16 LE)
+        // Append gateway TVLV if we're a gateway.
+        let tvlv_written = if self.is_gateway && buf.len() >= OGM_SIZE + 8 {
+            self.build_gw_tvlv(&mut buf[OGM_SIZE..])
+        } else {
+            0
+        };
+        buf[24] = tvlv_written as u8;
+        buf[25] = (tvlv_written >> 8) as u8;
+        OGM_SIZE + tvlv_written
     }
 
     /// Broadcast our own OGM via the 0x4305 downstream channel.
@@ -759,7 +815,7 @@ impl BatmanDev {
         }
 
         let tx_ptr = ctrl.tx_va as *mut u8;
-        let mut buf = [0u8; OGM_SIZE];
+        let mut buf = [0u8; OGM_SIZE + 8]; // room for TVLV
         let len = self.build_ogm(&mut buf, OGM_DEFAULT_TTL, TQ_MAX, self.mac);
 
         unsafe {
@@ -834,7 +890,7 @@ impl BatmanDev {
                 unsafe {
                     core::ptr::copy_nonoverlapping(rx_ptr, ogm.as_mut_ptr(), OGM_SIZE);
                 }
-                self.handle_rx_ogm(&ogm, src_mac);
+                self.handle_rx_ogm(&ogm, payload_len, src_mac);
             }
             BATMAN_PACKET_UNICAST => {
                 self.handle_rx_unicast(payload_len);
@@ -1067,7 +1123,7 @@ impl BatmanDev {
     }
 
     /// Parse and process a received OGMv1 packet.
-    fn handle_rx_ogm(&mut self, ogm: &[u8; OGM_SIZE], src_mac: [u8; 6]) {
+    fn handle_rx_ogm(&mut self, ogm: &[u8; OGM_SIZE], payload_len: usize, src_mac: [u8; 6]) {
         let _version = ogm[1];
         let ttl = ogm[2];
         let seqno = (ogm[6] as u32)
@@ -1079,6 +1135,7 @@ impl BatmanDev {
         let mut prev_sender = [0u8; 6];
         prev_sender.copy_from_slice(&ogm[16..22]);
         let tq = ogm[23];
+        let tvlv_len = (ogm[24] as usize) | ((ogm[25] as usize) << 8);
 
         // Ignore our own OGMs.
         if orig == self.mac {
@@ -1108,6 +1165,11 @@ impl BatmanDev {
 
         // Update originator table.
         self.update_originator(orig, src_mac, path_tq, seqno, now);
+
+        // Parse TVLVs for gateway announcements.
+        if tvlv_len > 0 && payload_len >= OGM_SIZE + tvlv_len {
+            self.parse_tvlv_gw(orig, src_mac, path_tq, 0, now, OGM_SIZE, tvlv_len);
+        }
 
         // Rebroadcast with decremented TTL if still alive.
         if ttl > 1 {
@@ -1279,6 +1341,160 @@ impl BatmanDev {
                 o.active = false;
             }
         }
+        for gw in self.gateways.iter_mut() {
+            if gw.active && now.wrapping_sub(gw.last_seen_ns) > OGM_PURGE_NS {
+                syscall::debug_puts(b"  [batman_srv] purge gateway: ");
+                print_mac(gw.orig_mac);
+                syscall::debug_puts(b"\n");
+                gw.active = false;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Gateway support.
+    // ---------------------------------------------------------------
+
+    /// Parse TVLV area from an OGM for gateway announcements.
+    /// `tvlv_start` is the byte offset into the rx buffer where TVLVs begin.
+    /// `tvlv_len` is the total TVLV area length.
+    fn parse_tvlv_gw(
+        &mut self,
+        orig: [u8; 6],
+        next_hop: [u8; 6],
+        tq: u8,
+        throughput: u32,
+        now: u64,
+        tvlv_start: usize,
+        tvlv_len: usize,
+    ) {
+        if tvlv_len < 6 {
+            return; // minimum: type(1) + version(1) + length(2) + payload(2)
+        }
+        let rx_ptr = self.downstream[self.bat_ctrl_idx].rx_va as *const u8;
+        let mut off = tvlv_start;
+        let end = tvlv_start + tvlv_len;
+
+        while off + 4 <= end {
+            let ttype = unsafe { *rx_ptr.add(off) };
+            let _tver = unsafe { *rx_ptr.add(off + 1) };
+            let tlen = unsafe {
+                (*rx_ptr.add(off + 2) as usize) | ((*rx_ptr.add(off + 3) as usize) << 8)
+            };
+            off += 4;
+            if off + tlen > end {
+                break;
+            }
+
+            if ttype == TVLV_GW_TYPE && tlen >= 4 {
+                let down = unsafe {
+                    (*rx_ptr.add(off) as u16) | ((*rx_ptr.add(off + 1) as u16) << 8)
+                };
+                let up = unsafe {
+                    (*rx_ptr.add(off + 2) as u16) | ((*rx_ptr.add(off + 3) as u16) << 8)
+                };
+                self.update_gateway(orig, next_hop, down, up, tq, throughput, now);
+            }
+
+            off += tlen;
+        }
+    }
+
+    /// Update or insert a gateway entry.
+    fn update_gateway(
+        &mut self,
+        orig: [u8; 6],
+        next_hop: [u8; 6],
+        down_speed: u16,
+        up_speed: u16,
+        tq: u8,
+        throughput: u32,
+        now: u64,
+    ) {
+        let mut idx = None;
+        let mut free = None;
+        for i in 0..MAX_GATEWAYS {
+            if self.gateways[i].active && self.gateways[i].orig_mac == orig {
+                idx = Some(i);
+                break;
+            }
+            if !self.gateways[i].active && free.is_none() {
+                free = Some(i);
+            }
+        }
+
+        match idx {
+            Some(i) => {
+                let gw = &mut self.gateways[i];
+                gw.next_hop = next_hop;
+                gw.down_speed = down_speed;
+                gw.up_speed = up_speed;
+                gw.tq = tq;
+                gw.throughput = throughput;
+                gw.last_seen_ns = now;
+            }
+            None => {
+                if let Some(f) = free {
+                    self.gateways[f] = Gateway {
+                        active: true,
+                        orig_mac: orig,
+                        next_hop,
+                        down_speed,
+                        up_speed,
+                        tq,
+                        throughput,
+                        last_seen_ns: now,
+                    };
+                    syscall::debug_puts(b"  [batman_srv] new gateway: ");
+                    print_mac(orig);
+                    syscall::debug_puts(b" down=");
+                    print_num(down_speed as u64);
+                    syscall::debug_puts(b" up=");
+                    print_num(up_speed as u64);
+                    syscall::debug_puts(b"\n");
+                }
+            }
+        }
+    }
+
+    /// Select the best gateway (highest TQ in IV mode, highest throughput in V).
+    fn best_gateway(&self) -> Option<[u8; 6]> {
+        let mut best_idx: Option<usize> = None;
+        let mut best_score: u64 = 0;
+
+        for i in 0..MAX_GATEWAYS {
+            if !self.gateways[i].active {
+                continue;
+            }
+            let score = if BATMAN_MODE == BATMAN_MODE_IV {
+                self.gateways[i].tq as u64 * self.gateways[i].down_speed as u64
+            } else {
+                self.gateways[i].throughput as u64
+            };
+            if score > best_score {
+                best_score = score;
+                best_idx = Some(i);
+            }
+        }
+
+        best_idx.map(|i| self.gateways[i].next_hop)
+    }
+
+    /// Build the TVLV gateway announcement bytes (8 bytes: header + payload).
+    /// Returns number of bytes written.
+    fn build_gw_tvlv(&self, buf: &mut [u8]) -> usize {
+        if buf.len() < 8 || !self.is_gateway {
+            return 0;
+        }
+        buf[0] = TVLV_GW_TYPE;  // type
+        buf[1] = 1;              // version
+        buf[2] = TVLV_GW_LEN;   // length low byte
+        buf[3] = 0;              // length high byte
+        buf[4] = GW_DOWN_SPEED as u8;
+        buf[5] = (GW_DOWN_SPEED >> 8) as u8;
+        buf[6] = GW_UP_SPEED as u8;
+        buf[7] = (GW_UP_SPEED >> 8) as u8;
+        8
     }
 
     // ---------------------------------------------------------------
@@ -1715,6 +1931,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         elp_seqno: 0,
         last_elp_ns: 0,
         ogm2_seqno: 0,
+        gateways: [const { Gateway::new() }; MAX_GATEWAYS],
+        is_gateway: false,
         bcast_seqno: 0,
         bcast_dedup_orig: [[0u8; 6]; BCAST_DEDUP_SIZE],
         bcast_dedup_seq: [0u32; BCAST_DEDUP_SIZE],
