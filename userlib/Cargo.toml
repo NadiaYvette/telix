@@ -125,6 +125,10 @@ name = "ext2_srv"
 path = "bin/ext2_srv.rs"
 
 [[bin]]
+name = "ext_srv"
+path = "bin/ext_srv.rs"
+
+[[bin]]
 name = "xfs_srv"
 path = "bin/xfs_srv.rs"
 

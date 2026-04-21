@@ -27,6 +27,7 @@ lineage that made this work possible.
 | `userlib/bin/apfs_srv.rs` | GPL-2.0-only | linux-apfs-rw, apfsprogs |
 | `userlib/bin/xfs_srv.rs` | GPL-2.0-only | Linux fs/xfs, xfsprogs |
 | `userlib/bin/ext2_srv.rs` | GPL-2.0-only | Linux fs/ext2, e2fsprogs |
+| `userlib/bin/ext_srv.rs` | GPL-2.0-only | Linux fs/ext2, Linux fs/ext4, e2fsprogs |
 | `userlib/bin/fat16_srv.rs` | GPL-2.0-only | Linux fs/fat |
 | `userlib/bin/fat_srv.rs` | GPL-2.0-only | Linux fs/fat, Microsoft FAT specification |
 | `userlib/bin/iso9660_srv.rs` | GPL-2.0-only | Linux fs/isofs |

@@ -592,7 +592,7 @@ static mut FS_SCRATCH_TABLE: [FsScratchEntry; 4] = [
 ];
 
 /// Known FS server names for which we will look up `<name>_task` lazily.
-const KNOWN_FS_NAMES: &[&[u8]] = &[b"rootfs", b"ext2", b"fat", b"tmpfs"];
+const KNOWN_FS_NAMES: &[&[u8]] = &[b"rootfs", b"ext", b"fat", b"tmpfs"];
 
 /// Discover the task port for a given fs_port by ns-looking-up known FS names
 /// until one matches. Returns 0 if not found.

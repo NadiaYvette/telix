@@ -3752,16 +3752,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    // --- Test 30: Phase 39 ext2 Filesystem Server ---
-    syscall::debug_puts(b"  init: testing ext2 filesystem...\n");
+    // --- Test 30: Phase 39 ext Filesystem Server ---
+    syscall::debug_puts(b"  init: testing ext filesystem...\n");
     {
-        let mut ext2_ok = true;
+        let mut ext_ok = true;
 
-        // ext2 requires a block device backend — skip lookup if none.
-        let ext2_port = if has_blk {
+        // ext requires a block device backend — skip lookup if none.
+        let ext_port = if has_blk {
             let mut found = None;
             for _ in 0..200 {
-                if let Some(p) = syscall::ns_lookup(b"ext2") {
+                if let Some(p) = syscall::ns_lookup(b"ext") {
                     found = Some(p);
                     break;
                 }
@@ -3774,35 +3774,35 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             None
         };
 
-        if let Some(ext2_port) = ext2_port {
+        if let Some(ext_port) = ext_port {
             // Step 2: Open hello.txt
             let (handle, file_size, _fs_aspace) = {
                 let (n0, n1, _) = pack_name(b"hello.txt");
                 let d2 = 9u64;
-                if let Some(reply) = syscall::call(ext2_port, 0x2000, n0, n1, d2, 0) {
+                if let Some(reply) = syscall::call(ext_port, 0x2000, n0, n1, d2, 0) {
                     if reply.tag == 0x2001 {
                         (reply.data[0], reply.data[1], reply.data[2])
                     } else {
-                        syscall::debug_puts(b"    ext2 open hello.txt FAILED tag=");
+                        syscall::debug_puts(b"    ext open hello.txt FAILED tag=");
                         print_num(reply.tag);
                         syscall::debug_puts(b"\n");
-                        ext2_ok = false;
+                        ext_ok = false;
                         (u64::MAX, 0, 0)
                     }
                 } else {
-                    syscall::debug_puts(b"    ext2 open hello.txt no reply\n");
-                    ext2_ok = false;
+                    syscall::debug_puts(b"    ext open hello.txt no reply\n");
+                    ext_ok = false;
                     (u64::MAX, 0, 0)
                 }
             };
 
             if handle != u64::MAX {
-                syscall::debug_puts(b"    ext2 opened hello.txt: size=");
+                syscall::debug_puts(b"    ext opened hello.txt: size=");
                 print_num(file_size);
                 syscall::debug_puts(b"\n");
 
                 // Step 3: Read hello.txt content (inline, small file).
-                if let Some(reply) = syscall::call(ext2_port, 0x2100, handle, 0, file_size, 0) {
+                if let Some(reply) = syscall::call(ext_port, 0x2100, handle, 0, file_size, 0) {
                     if reply.tag == 0x2101 {
                         let bytes_read = reply.data[0] as usize;
                         // Verify content is "Hello from ext2!"
@@ -3814,20 +3814,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         }
                         if bytes_read == expected.len() && &content[..bytes_read] == expected {
                             syscall::debug_puts(
-                                b"    ext2 read hello.txt: OK (\"Hello from ext2!\")\n",
+                                b"    ext read hello.txt: OK (\"Hello from ext2!\")\n",
                             );
                         } else {
-                            syscall::debug_puts(b"    ext2 read hello.txt: content mismatch\n");
-                            ext2_ok = false;
+                            syscall::debug_puts(b"    ext read hello.txt: content mismatch\n");
+                            ext_ok = false;
                         }
                     } else {
-                        syscall::debug_puts(b"    ext2 read FAILED\n");
-                        ext2_ok = false;
+                        syscall::debug_puts(b"    ext read FAILED\n");
+                        ext_ok = false;
                     }
                 }
 
                 // Step 4: FS_STAT — verify Unix permissions.
-                if let Some(reply) = syscall::call(ext2_port, 0x2300, handle, 0, 0, 0) {
+                if let Some(reply) = syscall::call(ext_port, 0x2300, handle, 0, 0, 0) {
                     if reply.tag == 0x2301 {
                         let stat_size = reply.data[0] as u32;
                         let mode = reply.data[1] as u16;
@@ -3836,55 +3836,55 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                         // hello.txt should be mode 0100644, uid 1000, gid 1000
                         if stat_size != file_size as u32 {
-                            syscall::debug_puts(b"    ext2 stat: size mismatch\n");
-                            ext2_ok = false;
+                            syscall::debug_puts(b"    ext stat: size mismatch\n");
+                            ext_ok = false;
                         }
                         if mode != 0o100644 {
                             syscall::debug_puts(
-                                b"    ext2 stat: mode mismatch (expected 0100644, got ",
+                                b"    ext stat: mode mismatch (expected 0100644, got ",
                             );
                             print_num(mode as u64);
                             syscall::debug_puts(b")\n");
-                            ext2_ok = false;
+                            ext_ok = false;
                         }
                         if uid != 1000 || gid != 1000 {
-                            syscall::debug_puts(b"    ext2 stat: uid/gid mismatch\n");
-                            ext2_ok = false;
+                            syscall::debug_puts(b"    ext stat: uid/gid mismatch\n");
+                            ext_ok = false;
                         } else {
-                            syscall::debug_puts(b"    ext2 stat: mode/uid/gid OK\n");
+                            syscall::debug_puts(b"    ext stat: mode/uid/gid OK\n");
                         }
                     } else {
-                        syscall::debug_puts(b"    ext2 stat FAILED\n");
-                        ext2_ok = false;
+                        syscall::debug_puts(b"    ext stat FAILED\n");
+                        ext_ok = false;
                     }
                 }
 
                 // Step 5: Close hello.txt.
-                let _ = syscall::call(ext2_port, 0x2400, handle, 0, 0, 0);
+                let _ = syscall::call(ext_port, 0x2400, handle, 0, 0, 0);
             }
 
-            if ext2_ok {
-                syscall::debug_puts(b"Phase 39 ext2 filesystem: PASSED\n");
+            if ext_ok {
+                syscall::debug_puts(b"Phase 39 ext filesystem: PASSED\n");
             } else {
-                syscall::debug_puts(b"Phase 39 ext2 filesystem: FAILED\n");
+                syscall::debug_puts(b"Phase 39 ext filesystem: FAILED\n");
             }
         } else {
-            syscall::debug_puts(b"Phase 39 ext2 filesystem: SKIPPED (no ext2 server)\n");
+            syscall::debug_puts(b"Phase 39 ext filesystem: SKIPPED (no ext server)\n");
         }
     }
 
     // --- Phase 173: filesystem realism (chmod + utimensat) ---
     //
-    // Talk directly to ext2_srv via the new FS_CHMOD / FS_UTIMENS long-path
-    // protocol, exercising the new ext2 inode-patching helpers.  Must run
+    // Talk directly to ext_srv via the new FS_CHMOD / FS_UTIMENS long-path
+    // protocol, exercising the ext inode-patching helpers.  Must run
     // BEFORE Phase 171/172 (Linux personality) so that VFS hasn't yet
-    // granted scratch to ext2_srv at FS_SCRATCH_VA.
+    // granted scratch to ext_srv at FS_SCRATCH_VA.
     syscall::debug_puts(b"  init: Phase 173 filesystem realism...\n");
     {
-        let ext2_port_opt = if has_blk { syscall::ns_lookup(b"ext2") } else { None };
-        let ext2_task_opt = if has_blk { syscall::ns_lookup(b"ext2_task") } else { None };
+        let ext_port_opt = if has_blk { syscall::ns_lookup(b"ext") } else { None };
+        let ext_task_opt = if has_blk { syscall::ns_lookup(b"ext_task") } else { None };
 
-        if let (Some(ext2_port), Some(ext2_task)) = (ext2_port_opt, ext2_task_opt) {
+        if let (Some(ext_port), Some(ext_task)) = (ext_port_opt, ext_task_opt) {
             const FS_SCRATCH_VA: usize = 0x5_0000_0000;
             const FS_STAT_LONG: u64 = 0x2302;
             const FS_STAT_OK: u64 = 0x2301;
@@ -3895,7 +3895,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             let mut p173_ok = true;
 
-            // Allocate a scratch page and grant it to ext2_srv at FS_SCRATCH_VA.
+            // Allocate a scratch page and grant it to ext_srv at FS_SCRATCH_VA.
             let scratch_va = match syscall::mmap_anon(0, 1, 1) {
                 Some(va) => va,
                 None => {
@@ -3906,8 +3906,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             };
 
             if p173_ok {
-                if !syscall::grant_pages(ext2_task, scratch_va, FS_SCRATCH_VA, 1, false) {
-                    syscall::debug_puts(b"    p173: grant_pages to ext2_task failed\n");
+                if !syscall::grant_pages(ext_task, scratch_va, FS_SCRATCH_VA, 1, false) {
+                    syscall::debug_puts(b"    p173: grant_pages to ext_task failed\n");
                     p173_ok = false;
                 }
             }
@@ -3927,7 +3927,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if p173_ok {
                 write_path(path);
                 let d0 = path.len() as u64;
-                if let Some(reply) = syscall::call(ext2_port, FS_STAT_LONG, d0, 0, 0, 0) {
+                if let Some(reply) = syscall::call(ext_port, FS_STAT_LONG, d0, 0, 0, 0) {
                     if reply.tag == FS_STAT_OK {
                         original_mode = reply.data[1] as u16;
                         syscall::debug_puts(b"    p173: orig mode=");
@@ -3947,7 +3947,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 write_path(path);
                 let new_mode: u64 = 0o600;
                 let d0 = (path.len() as u64) | ((new_mode & 0xFFFF) << 16);
-                if let Some(reply) = syscall::call(ext2_port, FS_CHMOD, d0, 0, 0, 0) {
+                if let Some(reply) = syscall::call(ext_port, FS_CHMOD, d0, 0, 0, 0) {
                     if reply.tag != FS_CHMOD_OK {
                         syscall::debug_puts(b"    p173: FS_CHMOD failed tag=");
                         print_num(reply.tag);
@@ -3963,7 +3963,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if p173_ok {
                 write_path(path);
                 let d0 = path.len() as u64;
-                if let Some(reply) = syscall::call(ext2_port, FS_STAT_LONG, d0, 0, 0, 0) {
+                if let Some(reply) = syscall::call(ext_port, FS_STAT_LONG, d0, 0, 0, 0) {
                     if reply.tag == FS_STAT_OK {
                         let m = reply.data[1] as u16;
                         // Top nibble = file type (0x8 = regular), low 12 = perms.
@@ -3988,7 +3988,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 write_path(path);
                 let d0 = (path.len() as u64)
                     | (((original_mode as u64) & 0o7777) << 16);
-                let _ = syscall::call(ext2_port, FS_CHMOD, d0, 0, 0, 0);
+                let _ = syscall::call(ext_port, FS_CHMOD, d0, 0, 0, 0);
             }
 
             // Step 5: utimens. We can't easily verify the times via FS_STAT_LONG
@@ -3999,7 +3999,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let d0 = path.len() as u64;
                 let atime: u64 = 12345;
                 let mtime: u64 = 67890;
-                if let Some(reply) = syscall::call(ext2_port, FS_UTIMENS, d0, atime, mtime, 0) {
+                if let Some(reply) = syscall::call(ext_port, FS_UTIMENS, d0, atime, mtime, 0) {
                     if reply.tag != FS_UTIMENS_OK {
                         syscall::debug_puts(b"    p173: FS_UTIMENS failed tag=");
                         print_num(reply.tag);
@@ -4018,7 +4018,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let bad: &[u8] = b"no_such_phase173_file.txt";
                 write_path(bad);
                 let d0 = bad.len() as u64;
-                if let Some(reply) = syscall::call(ext2_port, FS_UTIMENS, d0, 1, 1, 0) {
+                if let Some(reply) = syscall::call(ext_port, FS_UTIMENS, d0, 1, 1, 0) {
                     if reply.tag == FS_UTIMENS_OK {
                         syscall::debug_puts(b"    p173: utimens(missing) returned OK\n");
                         p173_ok = false;
@@ -4028,7 +4028,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             // Revoke the grant so VFS can grant its own scratch later
             // (Phase 171/172 use long-path through VFS).
-            syscall::revoke(ext2_task, FS_SCRATCH_VA);
+            syscall::revoke(ext_task, FS_SCRATCH_VA);
             if scratch_va != 0 {
                 syscall::munmap(scratch_va);
             }
@@ -4039,7 +4039,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"Phase 173 filesystem realism: FAILED\n");
             }
         } else {
-            syscall::debug_puts(b"Phase 173 filesystem realism: SKIPPED (no ext2)\n");
+            syscall::debug_puts(b"Phase 173 filesystem realism: SKIPPED (no ext)\n");
         }
     }
 
@@ -7024,15 +7024,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             0
         };
 
-        // Determine root FS: ext2 if block device present, rootfs otherwise.
+        // Determine root FS: ext if block device present, rootfs otherwise.
         let root_fs_port;
         let root_fs_name: &[u8];
         if has_blk {
             root_fs_port = if phase51_ok {
-                match syscall::ns_lookup(b"ext2") {
+                match syscall::ns_lookup(b"ext") {
                     Some(p) => p,
                     None => {
-                        syscall::debug_puts(b"  FAIL: ns_lookup(ext2) failed\n");
+                        syscall::debug_puts(b"  FAIL: ns_lookup(ext) failed\n");
                         phase51_ok = false;
                         0
                     }
@@ -7040,7 +7040,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             } else {
                 0
             };
-            root_fs_name = b"ext2";
+            root_fs_name = b"ext";
         } else {
             // No block device — use rootfs (CPIO-backed writable tmpfs).
             root_fs_port = if phase51_ok {
@@ -7209,20 +7209,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    // --- Phase 53: ext2 write support ---
-    syscall::debug_puts(b"  init: testing ext2 write...\n");
+    // --- Phase 53: ext write support ---
+    syscall::debug_puts(b"  init: testing ext write...\n");
     {
-        let ext2_port = if has_blk {
-            match syscall::ns_lookup(b"ext2") {
+        let ext_port = if has_blk {
+            match syscall::ns_lookup(b"ext") {
                 Some(p) => p,
                 None => 0,
             }
         } else {
             0
         };
-        let mut phase53_ok = ext2_port != 0;
+        let mut phase53_ok = ext_port != 0;
         if !phase53_ok {
-            syscall::debug_puts(b"Phase 53 ext2 write: SKIPPED (no ext2)\n");
+            syscall::debug_puts(b"Phase 53 ext write: SKIPPED (no ext)\n");
         }
 
         // Step 1: FS_CREATE "WTEST.TXT"
@@ -7232,16 +7232,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
             let d2 = fname.len() as u64;
-            if let Some(reply) = syscall::call(ext2_port, 0x2500, fn0, fn1, d2, 0) {
+            if let Some(reply) = syscall::call(ext_port, 0x2500, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2501 {
                     handle = reply.data[0];
                     srv_aspace = reply.data[2];
                 } else {
-                    syscall::debug_puts(b"  FAIL: ext2 FS_CREATE failed\n");
+                    syscall::debug_puts(b"  FAIL: ext FS_CREATE failed\n");
                     phase53_ok = false;
                 }
             } else {
-                syscall::debug_puts(b"  FAIL: ext2 FS_CREATE no reply\n");
+                syscall::debug_puts(b"  FAIL: ext FS_CREATE no reply\n");
                 phase53_ok = false;
             }
         }
@@ -7260,9 +7260,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let grant_ok = syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false);
                 if grant_ok {
                     let wd1 = 64u64;
-                    if let Some(wr) = syscall::call(ext2_port, 0x2600, handle, wd1, grant_dst as u64, 0) {
+                    if let Some(wr) = syscall::call(ext_port, 0x2600, handle, wd1, grant_dst as u64, 0) {
                         if wr.tag != 0x2601 || wr.data[0] != 64 {
-                            syscall::debug_puts(b"  FAIL: ext2 FS_WRITE bad reply\n");
+                            syscall::debug_puts(b"  FAIL: ext FS_WRITE bad reply\n");
                             phase53_ok = false;
                         }
                     } else {
@@ -7270,7 +7270,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                     syscall::revoke(srv_aspace, grant_dst);
                 } else {
-                    syscall::debug_puts(b"  FAIL: ext2 grant failed\n");
+                    syscall::debug_puts(b"  FAIL: ext grant failed\n");
                     phase53_ok = false;
                 }
                 syscall::munmap(scratch);
@@ -7281,7 +7281,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Step 3: FS_CLOSE (triggers inode flush)
         if phase53_ok {
-            let _ = syscall::call(ext2_port, 0x2400, handle, 0, 0, 0);
+            let _ = syscall::call(ext_port, 0x2400, handle, 0, 0, 0);
             syscall::sleep_ms(50); // Wait for disk I/O
         }
 
@@ -7290,13 +7290,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
             let d2 = fname.len() as u64;
-            if let Some(reply) = syscall::call(ext2_port, 0x2000, fn0, fn1, d2, 0) {
+            if let Some(reply) = syscall::call(ext_port, 0x2000, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2001 {
                     let rh = reply.data[0];
                     let rsize = reply.data[1];
                     let r_aspace = reply.data[2];
                     if rsize != 64 {
-                        syscall::debug_puts(b"  FAIL: ext2 re-open size mismatch\n");
+                        syscall::debug_puts(b"  FAIL: ext re-open size mismatch\n");
                         phase53_ok = false;
                     }
 
@@ -7306,7 +7306,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             let grant_dst: usize = 0x8_0000_0000;
                             if syscall::grant_pages(r_aspace, scratch, grant_dst, 1, false) {
                                 let rd2 = 64u64;
-                                if let Some(rd) = syscall::call(ext2_port, 0x2100, rh, 0, rd2, grant_dst as u64) {
+                                if let Some(rd) = syscall::call(ext_port, 0x2100, rh, 0, rd2, grant_dst as u64) {
                                     if rd.tag == 0x2101 && rd.data[0] == 64 {
                                         // Verify pattern
                                         let p = scratch as *const u8;
@@ -7321,12 +7321,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                         }
                                         if mismatch {
                                             syscall::debug_puts(
-                                                b"  FAIL: ext2 read-back mismatch\n",
+                                                b"  FAIL: ext read-back mismatch\n",
                                             );
                                             phase53_ok = false;
                                         }
                                     } else {
-                                        syscall::debug_puts(b"  FAIL: ext2 FS_READ bad reply\n");
+                                        syscall::debug_puts(b"  FAIL: ext FS_READ bad reply\n");
                                         phase53_ok = false;
                                     }
                                 } else {
@@ -7343,9 +7343,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
 
                     // Close the re-opened file.
-                    let _ = syscall::call(ext2_port, 0x2400, rh, 0, 0, 0);
+                    let _ = syscall::call(ext_port, 0x2400, rh, 0, 0, 0);
                 } else {
-                    syscall::debug_puts(b"  FAIL: ext2 re-open not found\n");
+                    syscall::debug_puts(b"  FAIL: ext re-open not found\n");
                     phase53_ok = false;
                 }
             } else {
@@ -7358,9 +7358,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
             let d2 = fname.len() as u64;
-            if let Some(reply) = syscall::call(ext2_port, 0x2700, fn0, fn1, d2, 0) {
+            if let Some(reply) = syscall::call(ext_port, 0x2700, fn0, fn1, d2, 0) {
                 if reply.tag != 0x2701 {
-                    syscall::debug_puts(b"  FAIL: ext2 FS_DELETE failed\n");
+                    syscall::debug_puts(b"  FAIL: ext FS_DELETE failed\n");
                     phase53_ok = false;
                 }
             } else {
@@ -7374,12 +7374,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
             let d2 = fname.len() as u64;
-            if let Some(reply) = syscall::call(ext2_port, 0x2000, fn0, fn1, d2, 0) {
+            if let Some(reply) = syscall::call(ext_port, 0x2000, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2001 {
                     // File still exists — fail.
-                    syscall::debug_puts(b"  FAIL: ext2 file not deleted\n");
+                    syscall::debug_puts(b"  FAIL: ext file not deleted\n");
                     // Close the handle we got.
-                    let _ = syscall::call(ext2_port, 0x2400, reply.data[0], 0, 0, 0);
+                    let _ = syscall::call(ext_port, 0x2400, reply.data[0], 0, 0, 0);
                     phase53_ok = false;
                 }
                 // FS_ERROR (not found) is the expected response.
@@ -7391,11 +7391,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let fname = b"hello.txt";
             let (fn0, fn1, _) = pack_name(fname);
             let d2 = fname.len() as u64;
-            if let Some(reply) = syscall::call(ext2_port, 0x2000, fn0, fn1, d2, 0) {
+            if let Some(reply) = syscall::call(ext_port, 0x2000, fn0, fn1, d2, 0) {
                 if reply.tag == 0x2001 {
-                    let _ = syscall::call(ext2_port, 0x2400, reply.data[0], 0, 0, 0);
+                    let _ = syscall::call(ext_port, 0x2400, reply.data[0], 0, 0, 0);
                 } else {
-                    syscall::debug_puts(b"  FAIL: ext2 hello.txt corrupted\n");
+                    syscall::debug_puts(b"  FAIL: ext hello.txt corrupted\n");
                     phase53_ok = false;
                 }
             } else {
@@ -7404,9 +7404,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         if phase53_ok {
-            syscall::debug_puts(b"Phase 53 ext2 write: PASSED\n");
-        } else if ext2_port != 0 {
-            syscall::debug_puts(b"Phase 53 ext2 write: FAILED\n");
+            syscall::debug_puts(b"Phase 53 ext write: PASSED\n");
+        } else if ext_port != 0 {
+            syscall::debug_puts(b"Phase 53 ext write: FAILED\n");
         }
     }
 
@@ -9333,7 +9333,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     {
         let mut phase63_ok = true;
 
-        // Test 1: Verify VFS can open /etc/passwd (requires ext2 path traversal).
+        // Test 1: Verify VFS can open /etc/passwd (requires ext path traversal).
         syscall::debug_puts(b"    [63] VFS open /etc/passwd...\n");
         {
             let vfs_port = syscall::ns_lookup(b"vfs");
@@ -9367,7 +9367,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if let Some(rr) = syscall::call(fs_port, 0x2100, handle as u64, 0, rd2, 0) { // FS_READ
                             if rr.tag == 0x2101 {
                                 // FS_READ_OK
-                                // ext2_srv inline reply: data[0]=len, data[1..2]=packed content
+                                // ext_srv inline reply: data[0]=len, data[1..2]=packed content
                                 let n = rr.data[0] as usize;
                                 let mut buf = [0u8; 16];
                                 for i in 0..n.min(8) {
@@ -10013,8 +10013,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: testing DNS resolver...\n");
     {
         // Phase 73 verifies DNS resolver infrastructure exists.
-        // ext2 has /etc/resolv.conf; netdb.c has getaddrinfo for numeric IPs.
-        // Just verify the ext2 partition has the resolv.conf file by checking
+        // ext has /etc/resolv.conf; netdb.c has getaddrinfo for numeric IPs.
+        // Just verify the ext partition has the resolv.conf file by checking
         // that a shorter path stat works (since resolv.conf path may hit VFS issue).
         let phase73_ok = syscall::ns_lookup(b"vfs").is_some();
 
@@ -10360,7 +10360,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // ============================================================
     // --- Phase 80: initdb simulation ---
-    // Test VFS mkdir + ext2 filesystem operations via IPC (no C binary spawn).
+    // Test VFS mkdir + ext filesystem operations via IPC (no C binary spawn).
     syscall::debug_puts(b"  init: testing initdb simulation...\n");
     {
         let mut phase80_ok = true;
@@ -10386,9 +10386,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         // Test FS_CREATE + FS_READ via IPC (like Phase 53).
-        // Use ext2 if block device present, otherwise rootfs.
+        // Use ext if block device present, otherwise rootfs.
         let fs_port_80 = if has_blk {
-            syscall::ns_lookup(b"ext2")
+            syscall::ns_lookup(b"ext")
         } else {
             syscall::ns_lookup(b"rootfs")
         };
@@ -10400,7 +10400,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             // Create "pg_ctl" (6 bytes).
             let n0: u64 = 0x6C74635F6770; // "pg_ctl" LE
             if has_blk {
-                // ext2 is on call/reply protocol.
+                // ext is on call/reply protocol.
                 let d2 = 6u64;
                 if let Some(resp) = syscall::call(fs_port, FS_CREATE, n0, 0, d2, 0) {
                     if resp.tag == FS_CREATE_OK {
