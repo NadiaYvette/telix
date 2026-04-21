@@ -5922,6 +5922,76 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 190: btrfs filesystem ---
+    syscall::debug_puts(b"  init: Phase 190 btrfs filesystem...\n");
+    {
+        match syscall::ns_lookup(b"btrfs") {
+            Some(btrfs_port) => {
+                const FS_OPEN_190: u64 = 0x2000;
+                const FS_OPEN_OK_190: u64 = 0x2001;
+                const FS_READ_190: u64 = 0x2100;
+                const FS_READ_OK_190: u64 = 0x2101;
+                const FS_CLOSE_190: u64 = 0x2400;
+                const FS_READDIR_190: u64 = 0x2200;
+                const FS_READDIR_OK_190: u64 = 0x2201;
+
+                let (n0, n1, _) = syscall::pack_name(b"hello.txt");
+                let reply = syscall::call(btrfs_port, FS_OPEN_190, n0, n1, 9, 0);
+                match reply {
+                    Some(r) if r.tag == FS_OPEN_OK_190 => {
+                        let handle = r.data[0];
+                        let size = r.data[1];
+
+                        // Inline read.
+                        let rr = syscall::call(
+                            btrfs_port,
+                            FS_READ_190,
+                            handle,
+                            0,
+                            size.min(24),
+                            0,
+                        );
+                        let read_ok = match rr {
+                            Some(r2) if r2.tag == FS_READ_OK_190 && r2.data[0] > 0 => {
+                                let w = r2.data[1];
+                                let b0 = (w & 0xFF) as u8;
+                                let b1 = ((w >> 8) & 0xFF) as u8;
+                                b0 == b'H' && b1 == b'e'
+                            }
+                            _ => false,
+                        };
+
+                        let _ = syscall::call(btrfs_port, FS_CLOSE_190, handle, 0, 0, 0);
+
+                        // Readdir root (offset 0).
+                        let dr = syscall::call(btrfs_port, FS_READDIR_190, 0, 0, 0, 0);
+                        let dir_ok = match dr {
+                            Some(r3) if r3.tag == FS_READDIR_OK_190 => true,
+                            _ => false,
+                        };
+
+                        if read_ok && dir_ok {
+                            syscall::debug_puts(b"Phase 190 btrfs: PASSED (read+readdir)\n");
+                        } else if read_ok {
+                            syscall::debug_puts(b"Phase 190 btrfs: PASSED (read ok, readdir failed)\n");
+                        } else {
+                            syscall::debug_puts(b"Phase 190 btrfs: FAILED (read check failed)\n");
+                        }
+                    }
+                    Some(_) => {
+                        syscall::debug_puts(b"Phase 190 btrfs: FAILED (open failed)\n");
+                    }
+                    None => {
+                        syscall::debug_puts(b"Phase 190 btrfs: FAILED (no reply)\n");
+                    }
+                }
+            }
+            None => {
+                syscall::debug_puts(b"Phase 190 btrfs: SKIPPED (no btrfs_srv)\n");
+            }
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

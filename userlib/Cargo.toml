@@ -259,3 +259,7 @@ path = "bin/mtk_srv.rs"
 [[bin]]
 name = "ntfs_srv"
 path = "bin/ntfs_srv.rs"
+
+[[bin]]
+name = "btrfs_srv"
+path = "bin/btrfs_srv.rs"

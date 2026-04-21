@@ -606,6 +606,26 @@ fn startup_thread() -> ! {
         }
     }
 
+    // Spawn NTFS filesystem server.
+    // GPT partition 6: NTFS at 369 MiB offset.
+    {
+        let part_off: u64 = 369 * 1024 * 1024;
+        match sched::spawn_user(b"ntfs_srv", 50, 20, part_off) {
+            Some(tid) => println!("  ntfs_srv spawned (thread {})", tid),
+            None => println!("  WARNING: ntfs_srv not found (ok if not yet built)"),
+        }
+    }
+
+    // Spawn btrfs filesystem server.
+    // GPT partition 7: btrfs at 401 MiB offset.
+    {
+        let part_off: u64 = 401 * 1024 * 1024;
+        match sched::spawn_user(b"btrfs_srv", 50, 20, part_off) {
+            Some(tid) => println!("  btrfs_srv spawned (thread {})", tid),
+            None => println!("  WARNING: btrfs_srv not found (ok if not yet built)"),
+        }
+    }
+
     // Spawn ramdisk server (userspace, no data copy needed).
     match sched::spawn_user(b"ramdisk_srv", 50, 20, 0) {
         Some(tid) => println!("  ramdisk_srv spawned (thread {})", tid),

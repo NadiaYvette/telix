@@ -11,6 +11,7 @@
 #   4: XFS          37 MiB  - 337 MiB   (Linux Filesystem)
 #   5: APFS        337 MiB  - 369 MiB   (Apple APFS)
 #   6: NTFS        369 MiB  - 401 MiB   (Microsoft Basic Data)
+#   7: btrfs       401 MiB  - 433 MiB   (Linux Filesystem)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -73,6 +74,7 @@ partitions = [
     ('XFS',     LINUX_FS,    mib_to_lba(37),         mib_to_lba(337) - 1, 4),
     ('APFS',    APPLE_APFS,  mib_to_lba(337),        mib_to_lba(369) - 1, 5),
     ('NTFS',    BASIC_DATA,  mib_to_lba(369),        mib_to_lba(401) - 1, 6),
+    ('btrfs',   LINUX_FS,    mib_to_lba(401),        mib_to_lba(433) - 1, 7),
 ]
 
 # --- Build partition entries (128 bytes each, 128 entries, = 16384 bytes = 32 sectors) ---
