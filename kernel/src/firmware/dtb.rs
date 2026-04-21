@@ -631,6 +631,44 @@ pub fn parse_aarch64(dtb_addr: usize) {
             _pad: 0,
         });
     }
+
+    // 5. PCI ECAM: find pci-host-ecam-generic node at root level.
+    for node in fdt.root_children() {
+        if let Some(compat) = node.property(b"compatible") {
+            if compat.contains_string(b"pci-host-ecam-generic") {
+                if let Some(reg) = node.property(b"reg") {
+                    let (ecam_base, ecam_size) =
+                        reg.reg_iter(2, 2).next().unwrap_or((0, 0));
+                    if ecam_base != 0 && ecam_size != 0 {
+                        // bus-range property: 2 × u32 cells (start, end).
+                        let (bus_start, bus_end) = node
+                            .property(b"bus-range")
+                            .map(|p| {
+                                if p.data.len() >= 8 {
+                                    (be32(p.data, 0) as u8, be32(p.data, 4) as u8)
+                                } else {
+                                    (0u8, 255u8)
+                                }
+                            })
+                            .unwrap_or((0, 255));
+                        super::set_pci_ecam(super::PciEcamInfo {
+                            base: ecam_base,
+                            size: ecam_size,
+                            segment: 0,
+                            bus_start,
+                            bus_end,
+                            _pad: 0,
+                        });
+                        crate::println!(
+                            "  DTB: PCI ECAM at {:#x}+{:#x}, buses {}..{}",
+                            ecam_base, ecam_size, bus_start, bus_end
+                        );
+                    }
+                }
+                break;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +771,43 @@ pub fn parse_riscv64(dtb_addr: usize) {
                 irq,
                 _pad: 0,
             });
+        }
+
+        // 5. PCI ECAM: find pci-host-ecam-generic under /soc.
+        for child in soc.children() {
+            if let Some(compat) = child.property(b"compatible") {
+                if compat.contains_string(b"pci-host-ecam-generic") {
+                    if let Some(reg) = child.property(b"reg") {
+                        let (ecam_base, ecam_size) =
+                            reg.reg_iter(2, 2).next().unwrap_or((0, 0));
+                        if ecam_base != 0 && ecam_size != 0 {
+                            let (bus_start, bus_end) = child
+                                .property(b"bus-range")
+                                .map(|p| {
+                                    if p.data.len() >= 8 {
+                                        (be32(p.data, 0) as u8, be32(p.data, 4) as u8)
+                                    } else {
+                                        (0u8, 255u8)
+                                    }
+                                })
+                                .unwrap_or((0, 255));
+                            super::set_pci_ecam(super::PciEcamInfo {
+                                base: ecam_base,
+                                size: ecam_size,
+                                segment: 0,
+                                bus_start,
+                                bus_end,
+                                _pad: 0,
+                            });
+                            crate::println!(
+                                "  DTB: PCI ECAM at {:#x}+{:#x}, buses {}..{}",
+                                ecam_base, ecam_size, bus_start, bus_end
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
         }
     }
 }

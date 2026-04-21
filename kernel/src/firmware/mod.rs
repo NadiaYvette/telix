@@ -89,6 +89,37 @@ pub struct IrqControllerInfo {
     pub base1: u64,
 }
 
+/// Descriptor for an ACPI table discovered at boot (x86_64).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct AcpiTableDesc {
+    /// 4-byte ASCII signature (e.g., b"APIC", b"MCFG").
+    pub signature: [u8; 4],
+    pub _pad: u32,
+    /// Physical address of the table header.
+    pub phys_addr: u64,
+    /// Total table length (from header field at offset 4).
+    pub length: u32,
+    pub _pad2: u32,
+}
+
+/// PCI ECAM (Enhanced Configuration Access Mechanism) info.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct PciEcamInfo {
+    /// Physical base address of ECAM region.
+    pub base: u64,
+    /// Size in bytes.
+    pub size: u64,
+    /// PCI segment group number.
+    pub segment: u16,
+    /// Start bus number.
+    pub bus_start: u8,
+    /// End bus number.
+    pub bus_end: u8,
+    pub _pad: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Static storage — UnsafeCell + atomic counts (write-once during boot)
 // ---------------------------------------------------------------------------
@@ -144,6 +175,9 @@ static MEM_REGIONS: FwArray<MemRegion, MAX_MEM_REGIONS> = FwArray::new();
 static CPUS: FwArray<CpuDesc, MAX_CPUS> = FwArray::new();
 static VIRTIO_DEVICES: FwArray<VirtioMmioDesc, MAX_DEVICES> = FwArray::new();
 
+pub const MAX_ACPI_TABLES: usize = 16;
+static ACPI_TABLES: FwArray<AcpiTableDesc, MAX_ACPI_TABLES> = FwArray::new();
+
 // Wrapper to allow UnsafeCell<IrqControllerInfo> in a static.
 struct IrqCtrlCell(UnsafeCell<IrqControllerInfo>);
 // SAFETY: same single-writer (BSP) / post-boot-read pattern as FwArray.
@@ -166,6 +200,13 @@ static IRQ_CTRL: IrqCtrlCell = IrqCtrlCell(UnsafeCell::new(IrqControllerInfo {
 static IRQ_CTRL_SET: AtomicU32 = AtomicU32::new(0);
 #[allow(dead_code)]
 static TIMEBASE_FREQ: AtomicU64 = AtomicU64::new(0);
+
+struct EcamCell(UnsafeCell<PciEcamInfo>);
+unsafe impl Sync for EcamCell {}
+static PCI_ECAM: EcamCell = EcamCell(UnsafeCell::new(PciEcamInfo {
+    base: 0, size: 0, segment: 0, bus_start: 0, bus_end: 0, _pad: 0,
+}));
+static PCI_ECAM_SET: AtomicU32 = AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
 // Public accessors
@@ -215,6 +256,28 @@ pub fn timebase_freq() -> u64 {
     TIMEBASE_FREQ.load(Ordering::Acquire)
 }
 
+/// ACPI table descriptors discovered from RSDT/XSDT (x86_64).
+#[allow(dead_code)]
+pub fn acpi_tables() -> &'static [AcpiTableDesc] {
+    ACPI_TABLES.as_slice()
+}
+
+/// Number of ACPI tables discovered.
+#[allow(dead_code)]
+pub fn acpi_table_count() -> u32 {
+    ACPI_TABLES.len()
+}
+
+/// PCI ECAM info (from MCFG or DTB), if available.
+#[allow(dead_code)]
+pub fn pci_ecam() -> Option<PciEcamInfo> {
+    if PCI_ECAM_SET.load(Ordering::Acquire) != 0 {
+        Some(unsafe { *PCI_ECAM.0.get() })
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal push functions (called by arch-specific parsers)
 // ---------------------------------------------------------------------------
@@ -249,4 +312,17 @@ pub(crate) fn set_framebuffer(info: FramebufferInfo) {
 #[allow(dead_code)]
 pub(crate) fn set_timebase_freq(freq: u64) {
     TIMEBASE_FREQ.store(freq, Ordering::Release);
+}
+
+#[allow(dead_code)]
+pub(crate) fn push_acpi_table(desc: AcpiTableDesc) {
+    ACPI_TABLES.push(desc);
+}
+
+#[allow(dead_code)]
+pub(crate) fn set_pci_ecam(info: PciEcamInfo) {
+    unsafe {
+        *PCI_ECAM.0.get() = info;
+    }
+    PCI_ECAM_SET.store(1, Ordering::Release);
 }

@@ -74,6 +74,7 @@ const SYS_GRANT_PAGES_LEASE: u64 = 121;
 const SYS_REPLY_TAKE: u64 = 122;
 const SYS_REPLY_TO: u64 = 123;
 const SYS_RECV_WITH_CAP_NB: u64 = 124;
+const SYS_FW_INFO: u64 = 125;
 const SYS_PERSONALITY_REGISTER: u64 = 0xF000;
 const SYS_PERSONALITY_SET: u64 = 0xF001;
 const SYS_PERSONALITY_GET: u64 = 0xF002;
@@ -943,6 +944,60 @@ pub fn framebuffer_info() -> Option<(u64, u32, u32, u32, u8)> {
 pub fn mmio_map_cap(slot: usize) -> Option<usize> {
     let r = unsafe { arch::syscall1(SYS_MMIO_MAP_CAP, slot as u64) };
     if r == u64::MAX { None } else { Some(r as usize) }
+}
+
+// ---------------------------------------------------------------------------
+// Firmware info queries (SYS_FW_INFO)
+// ---------------------------------------------------------------------------
+
+/// Number of ACPI tables discovered at boot (0 on non-ACPI platforms).
+pub fn fw_acpi_table_count() -> u32 {
+    unsafe { arch::syscall2(SYS_FW_INFO, 0, 0) as u32 }
+}
+
+/// ACPI table info at `index`: returns (signature_le_u32, length) or None.
+pub fn fw_acpi_table_info(index: u32) -> Option<(u32, u32)> {
+    let r = unsafe { arch::syscall2(SYS_FW_INFO, 1, index as u64) };
+    if r == u64::MAX { None } else { Some((r as u32, (r >> 32) as u32)) }
+}
+
+/// Physical address of ACPI table at `index`, or None.
+pub fn fw_acpi_table_addr(index: u32) -> Option<u64> {
+    let r = unsafe { arch::syscall2(SYS_FW_INFO, 2, index as u64) };
+    if r == u64::MAX { None } else { Some(r) }
+}
+
+/// ACPI table bounding region: (base_phys, size). None if no ACPI.
+pub fn fw_acpi_region() -> Option<(u64, u64)> {
+    let base = unsafe { arch::syscall2(SYS_FW_INFO, 3, 0) };
+    if base == u64::MAX { return None; }
+    let size = unsafe { arch::syscall2(SYS_FW_INFO, 4, 0) };
+    Some((base, size))
+}
+
+/// PCI ECAM base address, or None if no ECAM available.
+pub fn fw_pci_ecam_base() -> Option<u64> {
+    let r = unsafe { arch::syscall2(SYS_FW_INFO, 5, 0) };
+    if r == u64::MAX { None } else { Some(r) }
+}
+
+/// PCI ECAM region size, or None.
+pub fn fw_pci_ecam_size() -> Option<u64> {
+    let r = unsafe { arch::syscall2(SYS_FW_INFO, 6, 0) };
+    if r == u64::MAX { None } else { Some(r) }
+}
+
+/// PCI ECAM bus info: (segment, bus_start, bus_end), or None.
+pub fn fw_pci_ecam_buses() -> Option<(u16, u8, u8)> {
+    let r = unsafe { arch::syscall2(SYS_FW_INFO, 7, 0) };
+    if r == u64::MAX {
+        None
+    } else {
+        let segment = (r & 0xFFFF) as u16;
+        let bus_start = ((r >> 16) & 0xFF) as u8;
+        let bus_end = ((r >> 24) & 0xFF) as u8;
+        Some((segment, bus_start, bus_end))
+    }
 }
 
 /// Translate a virtual address to physical. Returns PA or None.

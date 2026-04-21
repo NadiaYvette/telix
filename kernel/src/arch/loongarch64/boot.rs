@@ -119,4 +119,14 @@ fn read_fwcfg_cmdline() {
 /// Parse firmware tables. For LoongArch64, read FW_CFG FDT.
 pub fn parse_firmware() {
     read_fwcfg_cmdline();
+
+    // LoongArch64 QEMU virt: PCI ECAM at hardcoded 0x2000_0000.
+    crate::firmware::set_pci_ecam(crate::firmware::PciEcamInfo {
+        base: 0x2000_0000,
+        size: 256 * 32 * 8 * 4096, // 256 buses
+        segment: 0,
+        bus_start: 0,
+        bus_end: 255,
+        _pad: 0,
+    });
 }

@@ -170,6 +170,44 @@ fn startup_thread() -> ! {
     );
     cap::mmio::self_test();
 
+    // Spawn ACPI table server (x86_64 only — ACPI tables from BIOS area).
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (acpi_base, acpi_size) = firmware::acpi::table_region_bounds();
+        if acpi_base != 0 && acpi_size != 0 {
+            if let Some(rid) =
+                cap::mmio::register_region(acpi_base, acpi_size, cap::mmio::CacheAttr::Device)
+            {
+                match sched::spawn_user_with_mmio_cap(b"acpi_srv", 50, 20, 0, rid) {
+                    Some(tid) => println!("  acpi_srv spawned (thread {})", tid),
+                    None => println!("  WARNING: acpi_srv not found (ok if not yet built)"),
+                }
+            }
+        }
+    }
+
+    // Spawn PCI bus enumeration server (all arches with ECAM).
+    if let Some(ecam) = firmware::pci_ecam() {
+        if let Some(rid) = cap::mmio::register_region(
+            ecam.base as usize,
+            ecam.size as usize,
+            cap::mmio::CacheAttr::Device,
+        ) {
+            match sched::spawn_user_with_mmio_cap(b"pci_srv", 50, 20, 0, rid) {
+                Some(tid) => println!("  pci_srv spawned (thread {})", tid),
+                None => println!("  WARNING: pci_srv not found (ok if not yet built)"),
+            }
+        }
+    }
+    // x86_64 fallback: spawn pci_srv in legacy I/O mode if no ECAM.
+    #[cfg(target_arch = "x86_64")]
+    if firmware::pci_ecam().is_none() {
+        match sched::spawn_user(b"pci_srv", 50, 20, 0) {
+            Some(tid) => println!("  pci_srv spawned (thread {}, legacy I/O)", tid),
+            None => println!("  WARNING: pci_srv not found (ok if not yet built)"),
+        }
+    }
+
     // Discover and spawn virtio-mmio device servers.
     // Uses firmware-discovered devices (from DTB) with hardcoded fallback.
     // On x86_64 find_device returns None (no MMIO transport), so these are no-ops.

@@ -231,3 +231,11 @@ path = "bin/iscsi_srv.rs"
 [[bin]]
 name = "sctp_srv"
 path = "bin/sctp_srv.rs"
+
+[[bin]]
+name = "acpi_srv"
+path = "bin/acpi_srv.rs"
+
+[[bin]]
+name = "pci_srv"
+path = "bin/pci_srv.rs"

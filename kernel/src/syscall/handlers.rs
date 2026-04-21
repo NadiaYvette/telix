@@ -155,6 +155,7 @@ pub const SYS_GRANT_PAGES_LEASE: u64 = 121;
 pub const SYS_REPLY_TAKE: u64 = 122;
 pub const SYS_REPLY_TO: u64 = 123;
 pub const SYS_RECV_WITH_CAP_NB: u64 = 124;
+pub const SYS_FW_INFO: u64 = 125;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -313,6 +314,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_IRQ_ATTACH => sys_irq_attach(a0, a1, a2),
         SYS_IRQ_ACK => sys_irq_ack(a0),
         SYS_MMIO_MAP_CAP => sys_mmio_map_cap(a0),
+        SYS_FW_INFO => sys_fw_info(a0, a1),
         SYS_SCHED_SETATTR => sys_sched_setattr(a0, a1, a2),
         SYS_GETCHAR => sys_getchar(),
         SYS_IOPORT => sys_ioport(a0, a1, a2),
@@ -2049,7 +2051,8 @@ fn sys_ioport(op: u64, port: u64, value: u64) -> u64 {
         // Allow PS/2 keyboard/mouse ports + high-numbered device ports.
         // Block system-critical ports (PIC, PIT, COM1, DMA, etc.).
         let allowed = (port == 0x60 || port == 0x64) // PS/2 i8042
-            || port >= 0x1000;                        // PCI device I/O
+            || (port >= 0xCF8 && port <= 0xCFF)       // PCI config space
+            || port >= 0x1000;                         // PCI device I/O
         if !allowed {
             return u64::MAX;
         }
@@ -4559,6 +4562,73 @@ fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
         t.sig_altstack_size = new_size;
     }
     0
+}
+
+/// Read-only firmware info query.
+/// type 0: ACPI table count. type 1: sig|length at index. type 2: phys_addr at index.
+/// type 3: ACPI region base. type 4: ACPI region size.
+/// type 5: PCI ECAM base. type 6: PCI ECAM size. type 7: ECAM buses packed.
+fn sys_fw_info(info_type: u64, index: u64) -> u64 {
+    match info_type {
+        0 => crate::firmware::acpi_table_count() as u64,
+        1 => {
+            let tables = crate::firmware::acpi_tables();
+            let idx = index as usize;
+            if idx >= tables.len() {
+                return u64::MAX;
+            }
+            let t = &tables[idx];
+            let sig = u32::from_le_bytes(t.signature);
+            (sig as u64) | ((t.length as u64) << 32)
+        }
+        2 => {
+            let tables = crate::firmware::acpi_tables();
+            let idx = index as usize;
+            if idx >= tables.len() {
+                return u64::MAX;
+            }
+            tables[idx].phys_addr
+        }
+        3 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let (base, _size) = crate::firmware::acpi::table_region_bounds();
+                base as u64
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                u64::MAX
+            }
+        }
+        4 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let (_base, size) = crate::firmware::acpi::table_region_bounds();
+                size as u64
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                u64::MAX
+            }
+        }
+        5 => match crate::firmware::pci_ecam() {
+            Some(info) => info.base,
+            None => u64::MAX,
+        },
+        6 => match crate::firmware::pci_ecam() {
+            Some(info) => info.size,
+            None => u64::MAX,
+        },
+        7 => match crate::firmware::pci_ecam() {
+            Some(info) => {
+                (info.bus_end as u64) << 24
+                    | (info.bus_start as u64) << 16
+                    | info.segment as u64
+            }
+            None => u64::MAX,
+        },
+        _ => u64::MAX,
+    }
 }
 
 /// Return bootloader-provided framebuffer info.

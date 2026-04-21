@@ -5631,6 +5631,64 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 184: ACPI & PCI services ---
+    syscall::debug_puts(b"  init: Phase 184 ACPI & PCI services...\n");
+    {
+        // ACPI service test (x86_64 only — acpi_srv parses ACPI tables).
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Give acpi_srv time to start (it spawns before us).
+            for _ in 0..200 {
+                syscall::yield_now();
+            }
+            match syscall::ns_lookup(b"acpi") {
+                Some(acpi_port) => {
+                    match syscall::call(acpi_port, 0x7000, 0, 0, 0, 0) {
+                        Some(reply) if reply.tag == 0x7000 && reply.data[0] > 0 => {
+                            syscall::debug_puts(b"Phase 184 ACPI: PASSED (");
+                            print_num(reply.data[0]);
+                            syscall::debug_puts(b" tables)\n");
+                        }
+                        Some(_) => {
+                            syscall::debug_puts(b"Phase 184 ACPI: FAILED (0 tables)\n");
+                        }
+                        None => {
+                            syscall::debug_puts(b"Phase 184 ACPI: FAILED (no reply)\n");
+                        }
+                    }
+                }
+                None => {
+                    syscall::debug_puts(b"Phase 184 ACPI: SKIPPED (no acpi_srv)\n");
+                }
+            }
+        }
+
+        // PCI service test (all architectures).
+        for _ in 0..200 {
+            syscall::yield_now();
+        }
+        match syscall::ns_lookup(b"pci") {
+            Some(pci_port) => {
+                match syscall::call(pci_port, 0x7100, 0, 0, 0, 0) {
+                    Some(reply) if reply.tag == 0x7100 && reply.data[0] > 0 => {
+                        syscall::debug_puts(b"Phase 184 PCI: PASSED (");
+                        print_num(reply.data[0]);
+                        syscall::debug_puts(b" devices)\n");
+                    }
+                    Some(_) => {
+                        syscall::debug_puts(b"Phase 184 PCI: FAILED (0 devices)\n");
+                    }
+                    None => {
+                        syscall::debug_puts(b"Phase 184 PCI: FAILED (no reply)\n");
+                    }
+                }
+            }
+            None => {
+                syscall::debug_puts(b"Phase 184 PCI: SKIPPED (no pci_srv)\n");
+            }
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {
