@@ -5419,6 +5419,109 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 182c: Multi-stream SCTP (UDP, streams 0 and 1) ---
+    syscall::debug_puts(b"  init: Phase 182c SCTP multi-stream (UDP)...\n");
+    {
+        if let Some(sp) = syscall::ns_lookup(b"sctp") {
+            let rp = syscall::port_create();
+
+            // Associate to host echo server 10.0.2.2:7 with 2 out/in streams.
+            let remote_ip: u64 = 0x0A000202;
+            let d0: u64 = remote_ip | (7u64 << 32);
+            let d1: u64 = 0 | ((rp as u64) << 16);
+            let d2: u64 = 2 | (2 << 16); // 2 out, 2 in
+            syscall::send(sp, 0x4D00, d0, d1, d2, 0); // SCTP_ASSOCIATE
+
+            let mut assoc_id: u64 = u64::MAX;
+            if let Some(m) = syscall::recv_msg_timeout(rp, 10_000_000) {
+                if m.tag == 0x4D01 { assoc_id = m.data[0] & 0xFFFFFFFF; }
+            }
+
+            if assoc_id == u64::MAX {
+                syscall::debug_puts(b"Phase 182c SCTP multi-stream: SKIPPED (no host)\n");
+            } else {
+                // Send "S0!" on stream 0 and "S1!" on stream 1.
+                let msg0 = b"S0!";
+                let msg1 = b"S1!";
+                let mut pass = true;
+
+                // --- Send on stream 0 ---
+                let mut w0: u64 = 0;
+                for i in 0..msg0.len() { w0 |= (msg0[i] as u64) << (i * 8); }
+                let sd0 = assoc_id | (0u64 << 32); // stream 0
+                let sd1 = (msg0.len() as u64) | ((rp as u64) << 16);
+                syscall::send(sp, 0x4E00, sd0, sd1, w0, 0);
+                if let Some(m) = syscall::recv_msg_timeout(rp, 5_000_000) {
+                    if m.tag != 0x4E01 { pass = false; }
+                } else { pass = false; }
+
+                // --- Send on stream 1 ---
+                let mut w0b: u64 = 0;
+                for i in 0..msg1.len() { w0b |= (msg1[i] as u64) << (i * 8); }
+                let sd0b = assoc_id | (1u64 << 32); // stream 1
+                let sd1b = (msg1.len() as u64) | ((rp as u64) << 16);
+                syscall::send(sp, 0x4E00, sd0b, sd1b, w0b, 0);
+                if let Some(m) = syscall::recv_msg_timeout(rp, 5_000_000) {
+                    if m.tag != 0x4E01 { pass = false; }
+                } else { pass = false; }
+
+                // --- Receive echo from stream 0 ---
+                let rd0 = assoc_id | ((rp as u64) << 32);
+                syscall::send(sp, 0x4F00, rd0, 0, 0, 0);
+                let mut s0_ok = false;
+                if let Some(m) = syscall::recv_msg_timeout(rp, 10_000_000) {
+                    if m.tag == 0x4F01 {
+                        let len = (m.data[0] & 0xFFFF) as usize;
+                        let sid = ((m.data[0] >> 16) & 0xFFFF) as u16;
+                        if len == msg0.len() && sid == 0 {
+                            let mut ok = true;
+                            for i in 0..len.min(8) {
+                                if (m.data[1] >> (i * 8)) as u8 != msg0[i] { ok = false; }
+                            }
+                            s0_ok = ok;
+                        }
+                    }
+                }
+
+                // --- Receive echo from stream 1 ---
+                syscall::send(sp, 0x4F00, rd0, 0, 0, 0);
+                let mut s1_ok = false;
+                if let Some(m) = syscall::recv_msg_timeout(rp, 10_000_000) {
+                    if m.tag == 0x4F01 {
+                        let len = (m.data[0] & 0xFFFF) as usize;
+                        let sid = ((m.data[0] >> 16) & 0xFFFF) as u16;
+                        if len == msg1.len() && sid == 1 {
+                            let mut ok = true;
+                            for i in 0..len.min(8) {
+                                if (m.data[1] >> (i * 8)) as u8 != msg1[i] { ok = false; }
+                            }
+                            s1_ok = ok;
+                        }
+                    }
+                }
+
+                if pass && s0_ok && s1_ok {
+                    syscall::debug_puts(b"Phase 182c SCTP multi-stream: PASSED\n");
+                } else {
+                    syscall::debug_puts(b"Phase 182c SCTP multi-stream: FAILED (");
+                    if !pass { syscall::debug_puts(b"send"); }
+                    else if !s0_ok { syscall::debug_puts(b"stream0"); }
+                    else { syscall::debug_puts(b"stream1"); }
+                    syscall::debug_puts(b")\n");
+                }
+
+                // Shutdown.
+                let shd0 = assoc_id | ((rp as u64) << 32);
+                syscall::send(sp, 0x4D10, shd0, 0, 0, 0);
+                syscall::recv_msg_timeout(rp, 1_000_000);
+            }
+
+            syscall::port_destroy(rp);
+        } else {
+            syscall::debug_puts(b"Phase 182c SCTP multi-stream: SKIPPED (no sctp_srv)\n");
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

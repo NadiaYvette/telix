@@ -603,7 +603,7 @@ fn handle_send(msg: &syscall::Message) {
 
         if transport == TRANSPORT_UDP {
             // UDP: serialize DATA chunk and send on wire.
-            udp_send_data(assoc_id, &payload[..actual_len]);
+            udp_send_data(assoc_id, stream_id, &payload[..actual_len]);
         } else {
             // Loopback: deliver directly to the echo association.
             let tsn = a.next_tsn;
@@ -1564,14 +1564,14 @@ fn handle_rx_abort(src_port: u16, dst_port: u16) {
 
 // --- Modified SEND for UDP transport ---
 
-fn udp_send_data(assoc_idx: usize, payload: &[u8]) {
+fn udp_send_data(assoc_idx: usize, stream_id: u16, payload: &[u8]) {
     unsafe {
         let a = &mut ASSOCS[assoc_idx];
         let tsn = a.next_tsn;
         a.next_tsn += 1;
-        let stream_id = 0u16;
-        let ssn = a.streams[0].next_ssn_send;
-        a.streams[0].next_ssn_send += 1;
+        let sid = (stream_id as usize) % MAX_STREAMS;
+        let ssn = a.streams[sid].next_ssn_send;
+        a.streams[sid].next_ssn_send += 1;
 
         let mut pkt = [0u8; 300];
         build_sctp_header(&mut pkt, a.local_port, a.remote_port, a.remote_vtag);
