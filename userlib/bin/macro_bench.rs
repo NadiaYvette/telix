@@ -2,7 +2,7 @@
 #![no_main]
 
 //! Telix macrobenchmark suite. Exercises the full multi-server I/O pipeline:
-//! app → fat16_srv (IPC + FAT chain walk) → blk_srv (IPC + grant) → virtio DMA.
+//! app → fat_srv (IPC + FAT chain walk) → blk_srv (IPC + grant) → virtio DMA.
 
 extern crate userlib;
 
@@ -83,7 +83,7 @@ fn print_opsec(name: &[u8], total_cycles: u64, freq: u64, iters: u64) {
     syscall::debug_puts(b" ops/s)\n");
 }
 
-/// Open a file on the given fat16 port. Returns (handle, file_size, srv_aspace) or None.
+/// Open a file on the given fat port. Returns (handle, file_size, srv_aspace) or None.
 fn fs_open(fat_port: u64, name: &[u8]) -> Option<(u64, u32, u64)> {
     let (n0, n1, _) = syscall::pack_name(name);
     let d2 = name.len() as u64;
@@ -200,7 +200,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // Look up fat16 server.
     let fat_port = loop {
-        if let Some(p) = syscall::ns_lookup(b"fat16") {
+        if let Some(p) = syscall::ns_lookup(b"fat") {
             break p;
         }
         for _ in 0..100 {
@@ -360,14 +360,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // --- Macro 4: Server Crash Recovery (srv_recovery) ---
     {
-        // Spawn our own fat16_srv instance.
-        let mut fat16_tid = syscall::spawn(b"fat16_srv", 50);
-        if fat16_tid != u64::MAX {
+        // Spawn our own fat_srv instance.
+        let mut fat_tid = syscall::spawn(b"fat_srv", 50);
+        if fat_tid != u64::MAX {
             // Wait for it to register and become operational.
             let mut my_fat_port: Option<u64> = None;
             for _ in 0..10_000 {
                 syscall::yield_now();
-                if let Some(p) = syscall::ns_lookup(b"fat16") {
+                if let Some(p) = syscall::ns_lookup(b"fat") {
                     // Try opening BENCH.DAT to confirm it's operational.
                     if let Some((h, _sz, _asp)) = fs_open(p, b"BENCH.DAT") {
                         fs_close(p, h);
@@ -401,22 +401,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // Timed: kill, respawn, verify.
                     let t0 = syscall::get_cycles();
 
-                    syscall::kill(fat16_tid);
+                    syscall::kill(fat_tid);
                     loop {
-                        if syscall::waitpid(fat16_tid).is_some() {
+                        if syscall::waitpid(fat_tid).is_some() {
                             break;
                         }
                         syscall::yield_now();
                     }
 
                     // Respawn.
-                    fat16_tid = syscall::spawn(b"fat16_srv", 50);
-                    if fat16_tid != u64::MAX {
+                    fat_tid = syscall::spawn(b"fat_srv", 50);
+                    if fat_tid != u64::MAX {
                         // Poll until the new instance is operational.
                         let mut recovery_ok = false;
                         for _ in 0..10_000 {
                             syscall::yield_now();
-                            if let Some(new_port) = syscall::ns_lookup(b"fat16") {
+                            if let Some(new_port) = syscall::ns_lookup(b"fat") {
                                 if let Some((h, _sz, asp)) = fs_open(new_port, b"BENCH.DAT") {
                                     let got = fs_read_grant(new_port, h, 0, 512, asp, scratch_va);
                                     if got == 512 {
@@ -460,10 +460,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             );
                         }
 
-                        // Cleanup: kill our fat16_srv.
-                        syscall::kill(fat16_tid);
+                        // Cleanup: kill our fat_srv.
+                        syscall::kill(fat_tid);
                         loop {
-                            if syscall::waitpid(fat16_tid).is_some() {
+                            if syscall::waitpid(fat_tid).is_some() {
                                 break;
                             }
                             syscall::yield_now();
@@ -473,19 +473,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 } else {
                     syscall::debug_puts(b"  macro: srv_recovery: SKIP (baseline read failed)\n");
-                    syscall::kill(fat16_tid);
+                    syscall::kill(fat_tid);
                     loop {
-                        if syscall::waitpid(fat16_tid).is_some() {
+                        if syscall::waitpid(fat_tid).is_some() {
                             break;
                         }
                         syscall::yield_now();
                     }
                 }
             } else {
-                syscall::debug_puts(b"  macro: srv_recovery: SKIP (fat16_srv not ready)\n");
-                syscall::kill(fat16_tid);
+                syscall::debug_puts(b"  macro: srv_recovery: SKIP (fat_srv not ready)\n");
+                syscall::kill(fat_tid);
                 loop {
-                    if syscall::waitpid(fat16_tid).is_some() {
+                    if syscall::waitpid(fat_tid).is_some() {
                         break;
                     }
                     syscall::yield_now();

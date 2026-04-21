@@ -1466,24 +1466,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     let has_blk = blk_port.is_some();
 
-    // --- Test 9: FAT16 filesystem via fat16_srv ---
-    syscall::debug_puts(b"  init: testing FAT16 filesystem...\n");
+    // --- Test 9: FAT filesystem via fat_srv ---
+    syscall::debug_puts(b"  init: testing FAT filesystem...\n");
 
-    // FAT16 requires a block device — skip if none was found in Phase 8.
-    let mut fat16_port: Option<u64> = None;
+    // FAT requires a block device — skip if none was found in Phase 8.
+    let mut fat_port: Option<u64> = None;
     if has_blk {
-        // Wait for fat16_srv to register.
+        // Wait for fat_srv to register.
         for _ in 0..500 {
-            if let Some(p) = syscall::ns_lookup(b"fat16") {
-                fat16_port = Some(p);
+            if let Some(p) = syscall::ns_lookup(b"fat") {
+                fat_port = Some(p);
                 break;
             }
             syscall::yield_now();
         }
     }
 
-    if let Some(fp) = fat16_port {
-        syscall::debug_puts(b"  init: ns_lookup(fat16) = port ");
+    if let Some(fp) = fat_port {
+        syscall::debug_puts(b"  init: ns_lookup(fat) = port ");
         print_num(fp);
         syscall::debug_puts(b"\n");
 
@@ -1544,13 +1544,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         if fs_ok {
-            syscall::debug_puts(b"Phase 10 FAT16 filesystem: PASSED\n");
+            syscall::debug_puts(b"Phase 10 FAT filesystem: PASSED\n");
         } else {
-            syscall::debug_puts(b"Phase 10 FAT16 filesystem: FAILED\n");
+            syscall::debug_puts(b"Phase 10 FAT filesystem: FAILED\n");
         }
     } else {
-        syscall::debug_puts(b"  init: fat16 not found, skipping\n");
-        syscall::debug_puts(b"Phase 10 FAT16 filesystem: SKIPPED\n");
+        syscall::debug_puts(b"  init: fat not found, skipping\n");
+        syscall::debug_puts(b"Phase 10 FAT filesystem: SKIPPED\n");
     }
 
     // --- Test 10: Console server ---
@@ -1706,7 +1706,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Test 13: Execute ELF from FAT16 filesystem ---
     syscall::debug_puts(b"  init: testing exec from filesystem...\n");
 
-    if let Some(fp) = fat16_port {
+    if let Some(fp) = fat_port {
         // FS_OPEN "HELLO.ELF"
         let fname = b"HELLO.ELF";
         let (fn0, fn1, _) = pack_name(fname);
@@ -1725,7 +1725,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let scratch_va = syscall::mmap_anon(0, 1, 1);
 
                 if let (Some(elf_buf), Some(scratch)) = (elf_va, scratch_va) {
-                    // Grant scratch to fat16_srv.
+                    // Grant scratch to fat_srv.
                     let grant_dst: usize = 0x7_0000_0000;
                     if syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false) {
                         syscall::debug_puts(b"  init: grant ok, reading HELLO.ELF...\n");
@@ -1811,14 +1811,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 14 exec from filesystem: FAILED\n");
         }
     } else {
-        syscall::debug_puts(b"  init: fat16 not available, skipping\n");
+        syscall::debug_puts(b"  init: fat not available, skipping\n");
         syscall::debug_puts(b"Phase 14 exec from filesystem: SKIPPED\n");
     }
 
     // --- Test 14: Writable FAT16 filesystem ---
-    syscall::debug_puts(b"  init: testing writable FAT16...\n");
+    syscall::debug_puts(b"  init: testing writable FAT...\n");
 
-    if let Some(fp) = fat16_port {
+    if let Some(fp) = fat_port {
         // FS_CREATE "TEST.TXT"
         let fname = b"TEST.TXT";
         let (fn0, fn1, _) = pack_name(fname);
@@ -1857,7 +1857,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         );
                     }
 
-                    // Grant scratch to fat16_srv.
+                    // Grant scratch to fat_srv.
                     let grant_dst: usize = 0x8_0000_0000;
                     let grant_ok = syscall::grant_pages(srv_aspace, scratch, grant_dst, 1, false);
                     syscall::debug_puts(if grant_ok {
@@ -1959,13 +1959,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         if phase15_ok {
-            syscall::debug_puts(b"Phase 15 writable FAT16: PASSED\n");
+            syscall::debug_puts(b"Phase 15 writable FAT: PASSED\n");
         } else {
-            syscall::debug_puts(b"Phase 15 writable FAT16: FAILED\n");
+            syscall::debug_puts(b"Phase 15 writable FAT: FAILED\n");
         }
     } else {
-        syscall::debug_puts(b"  init: fat16 not available, skipping\n");
-        syscall::debug_puts(b"Phase 15 writable FAT16: SKIPPED\n");
+        syscall::debug_puts(b"  init: fat not available, skipping\n");
+        syscall::debug_puts(b"Phase 15 writable FAT: SKIPPED\n");
     }
 
     // --- Test 15: Pipe IPC ---
@@ -7063,9 +7063,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             root_fs_name = b"rootfs";
         }
 
-        // Look up fat16 port (only if block device).
-        let fat16_port = if phase51_ok && has_blk {
-            match syscall::ns_lookup(b"fat16") {
+        // Look up fat port (only if block device).
+        let fat_port = if phase51_ok && has_blk {
+            match syscall::ns_lookup(b"fat") {
                 Some(p) => p,
                 None => 0,
             }
@@ -7093,13 +7093,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         }
 
-        // Test 2: Mount fat16 on "/mnt" (only with block device).
-        if phase51_ok && fat16_port != 0 {
+        // Test 2: Mount fat on "/mnt" (only with block device).
+        if phase51_ok && fat_port != 0 {
             let path = b"/mnt";
             let (w0, w1, _w2) = pack_name(path);
             let d2 = path.len() as u64;
             let mut mnt_ok = false;
-            if let Some(reply) = syscall::call(vfs_port, VFS_MOUNT, w0, w1, d2, fat16_port) {
+            if let Some(reply) = syscall::call(vfs_port, VFS_MOUNT, w0, w1, d2, fat_port) {
                 if reply.tag == VFS_OK {
                     mnt_ok = true;
                 } else {
@@ -7141,8 +7141,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         }
 
-        // Test 4: VFS_OPEN "/mnt/HELLO.TXT" — should resolve to fat16 on "/mnt".
-        if phase51_ok && fat16_port != 0 {
+        // Test 4: VFS_OPEN "/mnt/HELLO.TXT" — should resolve to fat on "/mnt".
+        if phase51_ok && fat_port != 0 {
             let path = b"/mnt/HELLO.TXT";
             let (w0, w1, _w2) = pack_name(path);
             let d2 = path.len() as u64;
@@ -7150,7 +7150,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let mut open_ok = false;
             if let Some(reply) = syscall::call(vfs_port, VFS_OPEN, w0, w1, d2, 0) {
                 if reply.tag == VFS_OPEN_OK {
-                    if reply.data[0] == fat16_port {
+                    if reply.data[0] == fat_port {
                         open_ok = true;
                     }
                 }

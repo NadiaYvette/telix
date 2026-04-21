@@ -3,7 +3,7 @@
 
 //! Interactive shell for Telix.
 //!
-//! Connects to console_srv for I/O and fat16_srv for filesystem access.
+//! Connects to console_srv for I/O and fat_srv for filesystem access.
 //! Commands: help, ls, cat, echo, info.
 
 extern crate userlib;
@@ -226,8 +226,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
     let reply_port = syscall::port_create();
 
-    // Try to find fat16_srv (may not exist on x86_64).
-    let fat16_port = syscall::ns_lookup(b"fat16");
+    // Try to find fat_srv (may not exist on x86_64).
+    let fat_port = syscall::ns_lookup(b"fat");
 
     // Welcome banner.
     con_puts(con_port, reply_port, b"Telix shell v0.1\r\n");
@@ -271,12 +271,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             if left.is_empty() || right.is_empty() {
                 con_puts(con_port, reply_port, b"usage: CMD | CMD\r\n");
             } else {
-                cmd_pipe(con_port, reply_port, fat16_port, left, right);
+                cmd_pipe(con_port, reply_port, fat_port, left, right);
             }
         } else if line == b"ls" {
-            cmd_ls(con_port, reply_port, fat16_port);
+            cmd_ls(con_port, reply_port, fat_port);
         } else if starts_with(line, b"cat ") {
-            cmd_cat(con_port, reply_port, fat16_port, &line[4..]);
+            cmd_cat(con_port, reply_port, fat_port, &line[4..]);
         } else if starts_with(line, b"echo ") {
             con_puts(con_port, reply_port, &line[5..]);
             con_puts(con_port, reply_port, b"\r\n");
@@ -287,9 +287,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         } else if starts_with(line, b"ping ") {
             cmd_ping(con_port, reply_port, &line[5..]);
         } else if starts_with(line, b"run ") {
-            cmd_run(con_port, reply_port, fat16_port, &line[4..]);
+            cmd_run(con_port, reply_port, fat_port, &line[4..]);
         } else if starts_with(line, b"write ") {
-            cmd_write(con_port, reply_port, fat16_port, &line[6..]);
+            cmd_write(con_port, reply_port, fat_port, &line[6..]);
         } else {
             con_puts(con_port, reply_port, b"unknown: ");
             con_puts(con_port, reply_port, line);
@@ -298,8 +298,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     }
 }
 
-fn cmd_ls(con_port: u64, reply_port: u64, fat16_port: Option<u64>) {
-    let fp = match fat16_port {
+fn cmd_ls(con_port: u64, reply_port: u64, fat_port: Option<u64>) {
+    let fp = match fat_port {
         Some(p) => p,
         None => {
             con_puts(con_port, reply_port, b"no filesystem\r\n");
@@ -362,8 +362,8 @@ fn cmd_ls(con_port: u64, reply_port: u64, fat16_port: Option<u64>) {
     }
 }
 
-fn cmd_cat(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[u8]) {
-    let fp = match fat16_port {
+fn cmd_cat(con_port: u64, reply_port: u64, fat_port: Option<u64>, filename: &[u8]) {
+    let fp = match fat_port {
         Some(p) => p,
         None => {
             con_puts(con_port, reply_port, b"no filesystem\r\n");
@@ -543,8 +543,8 @@ fn cmd_ping(con_port: u64, reply_port: u64, target: &[u8]) {
     syscall::port_destroy(net_reply);
 }
 
-fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[u8]) {
-    let fp = match fat16_port {
+fn cmd_run(con_port: u64, reply_port: u64, fat_port: Option<u64>, filename: &[u8]) {
+    let fp = match fat_port {
         Some(p) => p,
         None => {
             con_puts(con_port, reply_port, b"no filesystem\r\n");
@@ -601,7 +601,7 @@ fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
         }
     };
 
-    // Grant scratch page to fat16_srv.
+    // Grant scratch page to fat_srv.
     let grant_dst: usize = 0x6_0000_0000;
     if !syscall::grant_pages(srv_aspace, scratch_va, grant_dst, 1, false) {
         con_puts(con_port, reply_port, b"grant failed\r\n");
@@ -681,8 +681,8 @@ fn cmd_run(con_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[
     syscall::port_destroy(fs_reply);
 }
 
-fn cmd_write(con_port: u64, reply_port: u64, fat16_port: Option<u64>, args: &[u8]) {
-    let fp = match fat16_port {
+fn cmd_write(con_port: u64, reply_port: u64, fat_port: Option<u64>, args: &[u8]) {
+    let fp = match fat_port {
         Some(p) => p,
         None => {
             con_puts(con_port, reply_port, b"no filesystem\r\n");
@@ -741,7 +741,7 @@ fn cmd_write(con_port: u64, reply_port: u64, fat16_port: Option<u64>, args: &[u8
         core::ptr::copy_nonoverlapping(data.as_ptr(), scratch_va as *mut u8, write_len);
     }
 
-    // Grant scratch to fat16_srv.
+    // Grant scratch to fat_srv.
     let grant_dst: usize = 0x6_0000_0000;
     if !syscall::grant_pages(srv_aspace, scratch_va, grant_dst, 1, false) {
         con_puts(con_port, reply_port, b"grant failed\r\n");
@@ -810,7 +810,7 @@ fn trim_slice(s: &[u8]) -> &[u8] {
     &s[start..end]
 }
 
-fn cmd_pipe(con_port: u64, reply_port: u64, fat16_port: Option<u64>, left: &[u8], right: &[u8]) {
+fn cmd_pipe(con_port: u64, reply_port: u64, fat_port: Option<u64>, left: &[u8], right: &[u8]) {
     let pipe_port = syscall::port_create();
 
     // Extract right-side binary name (first word).
@@ -835,7 +835,7 @@ fn cmd_pipe(con_port: u64, reply_port: u64, fat16_port: Option<u64>, left: &[u8]
     if starts_with(left, b"echo ") {
         userlib::pipe::pipe_write(pipe_port, &left[5..]);
     } else if starts_with(left, b"cat ") {
-        pipe_cat(pipe_port, reply_port, fat16_port, &left[4..]);
+        pipe_cat(pipe_port, reply_port, fat_port, &left[4..]);
     } else {
         con_puts(con_port, reply_port, b"pipe: unsupported left cmd\r\n");
     }
@@ -853,8 +853,8 @@ fn cmd_pipe(con_port: u64, reply_port: u64, fat16_port: Option<u64>, left: &[u8]
 }
 
 /// Read a file and write its contents to a pipe port (instead of console).
-fn pipe_cat(pipe_port: u64, reply_port: u64, fat16_port: Option<u64>, filename: &[u8]) {
-    let fp = match fat16_port {
+fn pipe_cat(pipe_port: u64, reply_port: u64, fat_port: Option<u64>, filename: &[u8]) {
+    let fp = match fat_port {
         Some(p) => p,
         None => return,
     };

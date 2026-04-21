@@ -7,6 +7,7 @@ GNU General Public License, version 2 only (GPL-2.0-only):
   xfs_srv.rs     — informed by Linux fs/xfs, xfsprogs
   ext2_srv.rs    — informed by Linux fs/ext2, e2fsprogs
   fat16_srv.rs   — informed by Linux fs/fat
+  fat_srv.rs     — informed by Linux fs/fat, Microsoft FAT specification
   iso9660_srv.rs — informed by Linux fs/isofs
   udf_srv.rs     — informed by Linux fs/udf, udftools
   linux_srv.rs   — informed by Linux kernel syscall semantics

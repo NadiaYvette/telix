@@ -469,10 +469,10 @@ fn startup_thread() -> ! {
         None => println!("  WARNING: cache_srv not found (ok if not yet built)"),
     }
 
-    // Spawn FAT16 filesystem server (userspace, connects to cache_srv via IPC).
-    match sched::spawn_user(b"fat16_srv", 50, 20, 0) {
-        Some(tid) => println!("  fat16_srv spawned (thread {})", tid),
-        None => println!("  WARNING: fat16_srv not found (ok if not yet built)"),
+    // Spawn unified FAT filesystem server (FAT12/16/32, userspace).
+    match sched::spawn_user(b"fat_srv", 50, 20, 0) {
+        Some(tid) => println!("  fat_srv spawned (thread {})", tid),
+        None => println!("  WARNING: fat_srv not found (ok if not yet built)"),
     }
 
     // Spawn ext2 filesystem server (partition starts at byte 16 MiB in test.img).
