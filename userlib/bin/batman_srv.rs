@@ -63,6 +63,24 @@ const MAX_ORIGINATORS: usize = 16;
 const BCAST_DEDUP_SIZE: usize = 64;
 
 // -------------------------------------------------------------------
+// B.A.T.M.A.N. V constants (ELP + OGMv2).
+// -------------------------------------------------------------------
+
+const BATMAN_PACKET_ELP: u8 = 0x05;
+const BATMAN_PACKET_OGM2: u8 = 0x06;
+const ELP_SIZE: usize = 18;
+const OGM2_SIZE: usize = 24;  // 24-byte OGMv2 (no TVLVs)
+
+const ELP_INTERVAL_NS: u64 = 500_000_000;     // 500ms
+const ELP_WINDOW_SIZE: u32 = 32;               // sliding window for ELP loss
+const DEFAULT_THROUGHPUT: u32 = 10000;          // 10000 * 100 Kbit/s = 1 Gbit/s
+
+const BATMAN_MODE_IV: u8 = 0;
+const BATMAN_MODE_V: u8 = 1;
+/// Active routing mode. Set at compile time; Phase 8+ may make runtime-switchable.
+const BATMAN_MODE: u8 = BATMAN_MODE_IV;
+
+// -------------------------------------------------------------------
 // Data structures.
 // -------------------------------------------------------------------
 
@@ -129,8 +147,15 @@ struct Neighbor {
     rx_window: u64,
     /// Last OGM seqno received from this neighbor as prev_sender.
     last_seqno: u32,
-    /// Estimated receive quality (0..TQ_MAX): fraction of OGMs received.
+    /// Estimated receive quality (0..TQ_MAX): fraction of OGMs received. (IV mode)
     tq_recv: u8,
+    // --- B.A.T.M.A.N. V (ELP) fields ---
+    /// ELP sliding window for packet loss estimation.
+    elp_window: u32,
+    /// Last ELP seqno received from this neighbor.
+    elp_last_seqno: u32,
+    /// Estimated throughput to this neighbor (units of 100 Kbit/s).
+    throughput: u32,
 }
 
 impl Neighbor {
@@ -142,6 +167,9 @@ impl Neighbor {
             rx_window: 0,
             last_seqno: 0,
             tq_recv: 0,
+            elp_window: 0,
+            elp_last_seqno: 0,
+            throughput: 0,
         }
     }
 }
@@ -151,7 +179,8 @@ struct Originator {
     active: bool,
     orig_mac: [u8; 6],
     best_next_hop: [u8; 6],
-    best_tq: u8,
+    best_tq: u8,            // IV mode: best TQ
+    best_throughput: u32,    // V mode: best min-throughput path (100 Kbit/s units)
     last_seqno: u32,
     last_seen_ns: u64,
 }
@@ -163,6 +192,7 @@ impl Originator {
             orig_mac: [0; 6],
             best_next_hop: [0; 6],
             best_tq: 0,
+            best_throughput: 0,
             last_seqno: 0,
             last_seen_ns: 0,
         }
@@ -182,6 +212,10 @@ struct BatmanDev {
     originators: [Originator; MAX_ORIGINATORS],
     last_ogm_ns: u64,
     bat_ctrl_idx: usize, // downstream index for 0x4305
+    // B.A.T.M.A.N. V state
+    elp_seqno: u32,
+    last_elp_ns: u64,
+    ogm2_seqno: u32,
     // Broadcast encapsulation
     bcast_seqno: u32,
     bcast_dedup_orig: [[u8; 6]; BCAST_DEDUP_SIZE],
@@ -808,7 +842,17 @@ impl BatmanDev {
             BATMAN_PACKET_BCAST => {
                 self.handle_rx_broadcast(payload_len, src_mac);
             }
-            _ => {} // Phase 7: ELP, OGMv2
+            BATMAN_PACKET_ELP => {
+                if payload_len >= ELP_SIZE {
+                    self.handle_rx_elp(src_mac);
+                }
+            }
+            BATMAN_PACKET_OGM2 => {
+                if payload_len >= OGM2_SIZE {
+                    self.handle_rx_ogm2(src_mac);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1108,6 +1152,9 @@ impl BatmanDev {
                         rx_window: 1,
                         last_seqno: seqno,
                         tq_recv: TQ_MAX,
+                        elp_window: 0,
+                        elp_last_seqno: 0,
+                        throughput: 0,
                     };
                     syscall::debug_puts(b"  [batman_srv] new neighbor: ");
                     print_mac(mac);
@@ -1195,6 +1242,7 @@ impl BatmanDev {
                         orig_mac: orig,
                         best_next_hop: next_hop,
                         best_tq: tq,
+                        best_throughput: 0,
                         last_seqno: seqno,
                         last_seen_ns: now,
                     };
@@ -1239,15 +1287,374 @@ impl BatmanDev {
 
     fn tick_ogm(&mut self) {
         let now = syscall::clock_gettime();
-        if now.wrapping_sub(self.last_ogm_ns) >= OGM_INTERVAL_NS {
-            self.send_ogm();
-            self.last_ogm_ns = now;
+        if BATMAN_MODE == BATMAN_MODE_IV {
+            if now.wrapping_sub(self.last_ogm_ns) >= OGM_INTERVAL_NS {
+                self.send_ogm();
+                self.last_ogm_ns = now;
+            }
+        } else {
+            // B.A.T.M.A.N. V: ELP for neighbor discovery, OGMv2 for routing.
+            if now.wrapping_sub(self.last_elp_ns) >= ELP_INTERVAL_NS {
+                self.send_elp();
+                self.last_elp_ns = now;
+            }
+            if now.wrapping_sub(self.last_ogm_ns) >= OGM_INTERVAL_NS {
+                self.send_ogm2();
+                self.last_ogm_ns = now;
+            }
         }
-        // Purge every ~10 OGM intervals.
-        // (Cheap: just checks timestamps, no allocation.)
-        if self.ogm_seqno % 10 == 0 {
+        // Purge every ~10 intervals.
+        if self.ogm_seqno.wrapping_add(self.ogm2_seqno) % 10 == 0 {
             self.purge_stale(now);
         }
+    }
+
+    // ---------------------------------------------------------------
+    // B.A.T.M.A.N. V: ELP (Echo Location Protocol).
+    // ---------------------------------------------------------------
+
+    /// Build and broadcast an 18-byte ELP packet for neighbor discovery.
+    fn send_elp(&mut self) {
+        let ctrl = &self.downstream[self.bat_ctrl_idx];
+        if !ctrl.active {
+            return;
+        }
+
+        let tx = ctrl.tx_va as *mut u8;
+        unsafe {
+            // ELP header [0..18]
+            *tx.add(0) = BATMAN_PACKET_ELP;   // packet_type
+            *tx.add(1) = BATMAN_VERSION;       // version
+            *tx.add(2) = 0;                    // reserved
+            *tx.add(3) = 0;                    // reserved
+            // [4..10] originator MAC
+            core::ptr::copy_nonoverlapping(self.mac.as_ptr(), tx.add(4), 6);
+            // [10..14] seqno (u32 LE)
+            let s = self.elp_seqno;
+            *tx.add(10) = s as u8;
+            *tx.add(11) = (s >> 8) as u8;
+            *tx.add(12) = (s >> 16) as u8;
+            *tx.add(13) = (s >> 24) as u8;
+            // [14..18] interval (u32 LE, milliseconds)
+            let interval_ms = (ELP_INTERVAL_NS / 1_000_000) as u32;
+            *tx.add(14) = interval_ms as u8;
+            *tx.add(15) = (interval_ms >> 8) as u8;
+            *tx.add(16) = (interval_ms >> 16) as u8;
+            *tx.add(17) = (interval_ms >> 24) as u8;
+        }
+
+        self.elp_seqno = self.elp_seqno.wrapping_add(1);
+
+        // Broadcast ELP via 0x4305.
+        let xmit_reply = syscall::port_create();
+        syscall::send_nb_4(
+            self.eth_port,
+            NETIF_XMIT,
+            ELP_SIZE as u64,
+            0u64, // broadcast
+            (ETHERTYPE_BATMAN as u64) | ((xmit_reply as u64) << 16),
+            ctrl.client_id,
+        );
+        let _ = syscall::recv_msg_timeout(xmit_reply, 500_000);
+        syscall::port_destroy(xmit_reply);
+    }
+
+    /// Process a received ELP packet. Updates neighbor's throughput estimate.
+    fn handle_rx_elp(&mut self, src_mac: [u8; 6]) {
+        let rx_ptr = self.downstream[self.bat_ctrl_idx].rx_va as *const u8;
+
+        let mut orig = [0u8; 6];
+        unsafe { core::ptr::copy_nonoverlapping(rx_ptr.add(4), orig.as_mut_ptr(), 6); }
+
+        // Ignore our own ELPs.
+        if orig == self.mac {
+            return;
+        }
+
+        let seqno = unsafe {
+            (*rx_ptr.add(10) as u32)
+                | ((*rx_ptr.add(11) as u32) << 8)
+                | ((*rx_ptr.add(12) as u32) << 16)
+                | ((*rx_ptr.add(13) as u32) << 24)
+        };
+
+        let now = syscall::clock_gettime();
+
+        // Find or create neighbor.
+        let mut idx = None;
+        let mut free = None;
+        for i in 0..MAX_NEIGHBORS {
+            if self.neighbors[i].active && self.neighbors[i].mac == src_mac {
+                idx = Some(i);
+                break;
+            }
+            if !self.neighbors[i].active && free.is_none() {
+                free = Some(i);
+            }
+        }
+
+        let i = match idx {
+            Some(i) => i,
+            None => match free {
+                Some(f) => {
+                    self.neighbors[f] = Neighbor {
+                        active: true,
+                        mac: src_mac,
+                        last_seen_ns: now,
+                        rx_window: 0,
+                        last_seqno: 0,
+                        tq_recv: 0,
+                        elp_window: 1,
+                        elp_last_seqno: seqno,
+                        throughput: DEFAULT_THROUGHPUT,
+                    };
+                    syscall::debug_puts(b"  [batman_srv] new ELP neighbor: ");
+                    print_mac(src_mac);
+                    syscall::debug_puts(b"\n");
+                    return;
+                }
+                None => return,
+            },
+        };
+
+        let n = &mut self.neighbors[i];
+        n.last_seen_ns = now;
+
+        // Update ELP sliding window.
+        let diff = seqno.wrapping_sub(n.elp_last_seqno);
+        if diff == 0 {
+            return; // duplicate
+        }
+        if diff <= 32 {
+            n.elp_window = if diff >= 32 { 0 } else { n.elp_window << diff };
+            n.elp_window |= 1;
+            n.elp_last_seqno = seqno;
+        }
+
+        // Estimate throughput from packet reception ratio.
+        let ones = n.elp_window.count_ones();
+        n.throughput = (DEFAULT_THROUGHPUT as u64 * ones as u64 / ELP_WINDOW_SIZE as u64) as u32;
+    }
+
+    // ---------------------------------------------------------------
+    // B.A.T.M.A.N. V: OGMv2 (throughput-based routing).
+    // ---------------------------------------------------------------
+
+    /// Build and broadcast a 24-byte OGMv2 packet.
+    fn send_ogm2(&mut self) {
+        let ctrl = &self.downstream[self.bat_ctrl_idx];
+        if !ctrl.active {
+            return;
+        }
+
+        let tx = ctrl.tx_va as *mut u8;
+        unsafe {
+            // OGMv2 header [0..24]
+            *tx.add(0) = BATMAN_PACKET_OGM2;  // packet_type
+            *tx.add(1) = BATMAN_VERSION;       // version
+            *tx.add(2) = OGM_DEFAULT_TTL;      // ttl
+            *tx.add(3) = 0;                    // reserved
+            // [4..6] flags (u16)
+            *tx.add(4) = 0;
+            *tx.add(5) = 0;
+            // [6..10] seqno (u32 LE)
+            let s = self.ogm2_seqno;
+            *tx.add(6) = s as u8;
+            *tx.add(7) = (s >> 8) as u8;
+            *tx.add(8) = (s >> 16) as u8;
+            *tx.add(9) = (s >> 24) as u8;
+            // [10..16] originator MAC
+            core::ptr::copy_nonoverlapping(self.mac.as_ptr(), tx.add(10), 6);
+            // [16..18] tvlv_len + pad
+            *tx.add(16) = 0;
+            *tx.add(17) = 0;
+            *tx.add(18) = 0;
+            *tx.add(19) = 0;
+            // [20..24] throughput (u32 LE, units of 100 Kbit/s)
+            let tp = DEFAULT_THROUGHPUT;
+            *tx.add(20) = tp as u8;
+            *tx.add(21) = (tp >> 8) as u8;
+            *tx.add(22) = (tp >> 16) as u8;
+            *tx.add(23) = (tp >> 24) as u8;
+        }
+
+        self.ogm2_seqno = self.ogm2_seqno.wrapping_add(1);
+
+        // Broadcast OGMv2 via 0x4305.
+        let xmit_reply = syscall::port_create();
+        syscall::send_nb_4(
+            self.eth_port,
+            NETIF_XMIT,
+            OGM2_SIZE as u64,
+            0u64, // broadcast
+            (ETHERTYPE_BATMAN as u64) | ((xmit_reply as u64) << 16),
+            ctrl.client_id,
+        );
+        let _ = syscall::recv_msg_timeout(xmit_reply, 500_000);
+        syscall::port_destroy(xmit_reply);
+    }
+
+    /// Process a received OGMv2 packet. Throughput-based route selection.
+    fn handle_rx_ogm2(&mut self, src_mac: [u8; 6]) {
+        let rx_ptr = self.downstream[self.bat_ctrl_idx].rx_va as *const u8;
+
+        let ttl = unsafe { *rx_ptr.add(2) };
+        let seqno = unsafe {
+            (*rx_ptr.add(6) as u32)
+                | ((*rx_ptr.add(7) as u32) << 8)
+                | ((*rx_ptr.add(8) as u32) << 16)
+                | ((*rx_ptr.add(9) as u32) << 24)
+        };
+        let mut orig = [0u8; 6];
+        unsafe { core::ptr::copy_nonoverlapping(rx_ptr.add(10), orig.as_mut_ptr(), 6); }
+        let path_throughput = unsafe {
+            (*rx_ptr.add(20) as u32)
+                | ((*rx_ptr.add(21) as u32) << 8)
+                | ((*rx_ptr.add(22) as u32) << 16)
+                | ((*rx_ptr.add(23) as u32) << 24)
+        };
+
+        // Ignore our own OGMv2s.
+        if orig == self.mac {
+            return;
+        }
+
+        if path_throughput == 0 {
+            return;
+        }
+
+        let now = syscall::clock_gettime();
+
+        // Get neighbor's link throughput for the minimum calculation.
+        let link_tp = {
+            let mut tp = 0u32;
+            for n in &self.neighbors {
+                if n.active && n.mac == src_mac {
+                    tp = n.throughput;
+                    break;
+                }
+            }
+            tp
+        };
+
+        if link_tp == 0 {
+            return;
+        }
+
+        // Path metric: minimum throughput along the path.
+        // OGMv2 carries the min-throughput so far; we take the min of that
+        // and our link to the sender.
+        let min_tp = path_throughput.min(link_tp);
+
+        // Update originator table (V mode: maximize minimum throughput).
+        self.update_originator_v(orig, src_mac, min_tp, seqno, now);
+
+        // Rebroadcast with updated throughput and decremented TTL.
+        if ttl > 1 {
+            self.rebroadcast_ogm2(min_tp, ttl - 1);
+        }
+
+        syscall::debug_puts(b"  [batman_srv] OGMv2: orig=");
+        print_mac(orig);
+        syscall::debug_puts(b" tp=");
+        print_num(min_tp as u64);
+        syscall::debug_puts(b" seq=");
+        print_num(seqno as u64);
+        syscall::debug_puts(b"\n");
+    }
+
+    /// Update originator table for V mode (throughput-based).
+    fn update_originator_v(
+        &mut self,
+        orig: [u8; 6],
+        next_hop: [u8; 6],
+        throughput: u32,
+        seqno: u32,
+        now: u64,
+    ) {
+        let mut idx = None;
+        let mut free = None;
+        for i in 0..MAX_ORIGINATORS {
+            if self.originators[i].active && self.originators[i].orig_mac == orig {
+                idx = Some(i);
+                break;
+            }
+            if !self.originators[i].active && free.is_none() {
+                free = Some(i);
+            }
+        }
+
+        match idx {
+            Some(i) => {
+                let o = &mut self.originators[i];
+                let sdiff = seqno.wrapping_sub(o.last_seqno);
+                if sdiff > 0 && sdiff < 0x8000_0000 {
+                    // Newer seqno — always accept.
+                    o.best_next_hop = next_hop;
+                    o.best_throughput = throughput;
+                    o.last_seqno = seqno;
+                    o.last_seen_ns = now;
+                } else if sdiff == 0 && throughput > o.best_throughput {
+                    // Same seqno, better throughput — prefer this path.
+                    o.best_next_hop = next_hop;
+                    o.best_throughput = throughput;
+                    o.last_seen_ns = now;
+                }
+            }
+            None => {
+                if let Some(f) = free {
+                    self.originators[f] = Originator {
+                        active: true,
+                        orig_mac: orig,
+                        best_next_hop: next_hop,
+                        best_tq: 0,
+                        best_throughput: throughput,
+                        last_seqno: seqno,
+                        last_seen_ns: now,
+                    };
+                    syscall::debug_puts(b"  [batman_srv] new originator (V): ");
+                    print_mac(orig);
+                    syscall::debug_puts(b" tp=");
+                    print_num(throughput as u64);
+                    syscall::debug_puts(b"\n");
+                }
+            }
+        }
+    }
+
+    /// Rebroadcast a received OGMv2 with updated throughput and TTL.
+    fn rebroadcast_ogm2(&self, new_throughput: u32, new_ttl: u8) {
+        let ctrl = &self.downstream[self.bat_ctrl_idx];
+        if !ctrl.active {
+            return;
+        }
+
+        // Copy OGMv2 from RX to TX, update TTL and throughput.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                ctrl.rx_va as *const u8,
+                ctrl.tx_va as *mut u8,
+                OGM2_SIZE,
+            );
+            let tx = ctrl.tx_va as *mut u8;
+            *tx.add(2) = new_ttl;
+            *tx.add(20) = new_throughput as u8;
+            *tx.add(21) = (new_throughput >> 8) as u8;
+            *tx.add(22) = (new_throughput >> 16) as u8;
+            *tx.add(23) = (new_throughput >> 24) as u8;
+        }
+
+        let xmit_reply = syscall::port_create();
+        syscall::send_nb_4(
+            self.eth_port,
+            NETIF_XMIT,
+            OGM2_SIZE as u64,
+            0u64, // broadcast
+            (ETHERTYPE_BATMAN as u64) | ((xmit_reply as u64) << 16),
+            ctrl.client_id,
+        );
+        let _ = syscall::recv_msg_timeout(xmit_reply, 500_000);
+        syscall::port_destroy(xmit_reply);
     }
 }
 
@@ -1305,6 +1712,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         originators: [const { Originator::new() }; MAX_ORIGINATORS],
         last_ogm_ns: 0,
         bat_ctrl_idx: 0,
+        elp_seqno: 0,
+        last_elp_ns: 0,
+        ogm2_seqno: 0,
         bcast_seqno: 0,
         bcast_dedup_orig: [[0u8; 6]; BCAST_DEDUP_SIZE],
         bcast_dedup_seq: [0u32; BCAST_DEDUP_SIZE],
