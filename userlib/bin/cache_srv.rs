@@ -195,9 +195,15 @@ impl PageCache {
     }
 
     /// Fill a cache slot by reading 8 sectors from blk_srv.
-    fn fill_page(&mut self, blk: &BlkClient, slot: usize, page_number: u64, max_sectors: u64) {
+    /// Returns false if any in-range sector read failed or no disk is
+    /// connected (page should NOT be cached).
+    fn fill_page(&mut self, blk: &BlkClient, slot: usize, page_number: u64, max_sectors: u64) -> bool {
+        if max_sectors == 0 {
+            return false; // No disk connected.
+        }
         let base_sector = page_number * SECTORS_PER_PAGE as u64;
         let dest_base = self.data_va + slot * MMUPAGE_SIZE;
+        let mut ok = true;
         for i in 0..SECTORS_PER_PAGE {
             let sector = base_sector + i as u64;
             if sector < max_sectors {
@@ -211,14 +217,7 @@ impl PageCache {
                         );
                     }
                 } else {
-                    // Zero-fill on read failure.
-                    unsafe {
-                        core::ptr::write_bytes(
-                            (dest_base + i * SECTOR_SIZE) as *mut u8,
-                            0,
-                            SECTOR_SIZE,
-                        );
-                    }
+                    ok = false;
                 }
             } else {
                 // Beyond disk capacity — zero-fill.
@@ -231,6 +230,7 @@ impl PageCache {
                 }
             }
         }
+        ok
     }
 
     /// Read handler. Returns data pointer and length, or None on error.
@@ -255,15 +255,19 @@ impl PageCache {
             // Cache miss.
             self.misses += 1;
             let slot = self.clock_evict();
-            self.fill_page(blk, slot, page_number, max_sectors);
-            self.entries[slot] = CacheEntry {
-                page_number,
-                referenced: true,
-            };
-            self.hash_insert(page_number, slot);
-            self.occupied += 1;
-            let ptr = (self.data_va + slot * MMUPAGE_SIZE + off_in_page) as *const u8;
-            Some((ptr, bytes))
+            if self.fill_page(blk, slot, page_number, max_sectors) {
+                self.entries[slot] = CacheEntry {
+                    page_number,
+                    referenced: true,
+                };
+                self.hash_insert(page_number, slot);
+                self.occupied += 1;
+                let ptr = (self.data_va + slot * MMUPAGE_SIZE + off_in_page) as *const u8;
+                Some((ptr, bytes))
+            } else {
+                // Read failed — don't cache, caller will retry later.
+                None
+            }
         }
     }
 

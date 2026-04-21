@@ -6,11 +6,12 @@
 // Copyright 2024-2026 Nadia Chambers
 // Reference: btrfs on-disk format (kernel.org wiki), Linux btrfs driver
 
-//! Btrfs filesystem server (read-only).
+//! Btrfs filesystem server (read-write).
 //!
-//! Pure userspace process that reads a btrfs partition from cache_blk via IPC.
+//! Pure userspace process that talks to cache_blk via IPC for a btrfs partition.
 //! The partition starts at a byte offset passed as arg0 (default 401 MiB).
-//! Serves FS_OPEN / FS_READ / FS_READDIR / FS_STAT / FS_CLOSE.
+//! Serves FS_OPEN / FS_READ / FS_READDIR / FS_STAT / FS_CLOSE / FS_CREATE /
+//! FS_WRITE / FS_DELETE / FS_MKDIR / FS_RENAME / FS_TRUNCATE / FS_CHMOD etc.
 
 extern crate userlib;
 use userlib::syscall;
@@ -22,6 +23,8 @@ const IO_CONNECT: u64 = 0x100;
 const IO_CONNECT_OK: u64 = 0x101;
 const IO_READ: u64 = 0x200;
 const IO_READ_OK: u64 = 0x201;
+const IO_WRITE: u64 = 0x300;
+const IO_WRITE_OK: u64 = 0x301;
 
 const FS_OPEN: u64 = 0x2000;
 const FS_OPEN_OK: u64 = 0x2001;
@@ -37,18 +40,28 @@ const FS_STAT_LONG: u64 = 0x2302;
 const FS_CLOSE: u64 = 0x2400;
 const FS_CLOSE_OK: u64 = 0x2401;
 const FS_CREATE: u64 = 0x2500;
+const FS_CREATE_OK: u64 = 0x2501;
 const FS_WRITE_FS: u64 = 0x2600;
+const FS_WRITE_OK: u64 = 0x2601;
 const FS_DELETE: u64 = 0x2700;
+const FS_DELETE_OK: u64 = 0x2701;
 const FS_MKDIR: u64 = 0x2A00;
+const FS_MKDIR_OK: u64 = 0x2A01;
 const FS_UNLINK: u64 = 0x2A20;
 const FS_CHMOD: u64 = 0x2E00;
+const FS_CHMOD_OK: u64 = 0x2E01;
 const FS_UTIMENS: u64 = 0x2900;
+const FS_UTIMENS_OK: u64 = 0x2901;
 const FS_SYMLINK: u64 = 0x2C00;
 const FS_READLINK: u64 = 0x2C10;
 const FS_LINK: u64 = 0x2C20;
 const FS_RENAME: u64 = 0x2C30;
+const FS_RENAME_OK: u64 = 0x2C31;
 const FS_CHOWN: u64 = 0x2C40;
+const FS_CHOWN_OK: u64 = 0x2C41;
 const FS_TRUNCATE: u64 = 0x2C50;
+const FS_TRUNCATE_OK: u64 = 0x2C51;
+const FS_UNLINK_OK: u64 = 0x2A21;
 const FS_STATFS: u64 = 0x2C60;
 const FS_STATFS_OK: u64 = 0x2C61;
 const FS_MKNOD: u64 = 0x2D40;
@@ -85,7 +98,6 @@ const SB_SYS_CHUNK_ARRAY: usize = 811;
 
 // Key types
 const BTRFS_INODE_ITEM_KEY: u8 = 0x01;
-#[allow(dead_code)]
 const BTRFS_INODE_REF_KEY: u8 = 0x0C;
 const BTRFS_DIR_ITEM_KEY: u8 = 0x54;
 const BTRFS_DIR_INDEX_KEY: u8 = 0x60;
@@ -174,6 +186,26 @@ fn read_le64(buf: &[u8], off: usize) -> u64 {
     ])
 }
 
+fn write_le32(buf: &mut [u8], off: usize, v: u32) {
+    let b = v.to_le_bytes();
+    buf[off] = b[0];
+    buf[off + 1] = b[1];
+    buf[off + 2] = b[2];
+    buf[off + 3] = b[3];
+}
+
+fn write_le64(buf: &mut [u8], off: usize, v: u64) {
+    let b = v.to_le_bytes();
+    buf[off] = b[0];
+    buf[off + 1] = b[1];
+    buf[off + 2] = b[2];
+    buf[off + 3] = b[3];
+    buf[off + 4] = b[4];
+    buf[off + 5] = b[5];
+    buf[off + 6] = b[6];
+    buf[off + 7] = b[7];
+}
+
 // =====================================================================
 // Btrfs disk key
 // =====================================================================
@@ -203,6 +235,12 @@ fn key_cmp(a: &BtrfsKey, b: &BtrfsKey) -> i32 {
         return if a.offset < b.offset { -1 } else { 1 };
     }
     0
+}
+
+fn write_key_at(buf: &mut [u8], off: usize, key: &BtrfsKey) {
+    write_le64(buf, off, key.objectid);
+    buf[off + 8] = key.typ;
+    write_le64(buf, off + 9, key.offset);
 }
 
 // =====================================================================
@@ -365,6 +403,54 @@ impl BlkClient {
                     } else {
                         false
                     }
+                } else {
+                    false
+                };
+            syscall::revoke(self.blk_aspace, self.grant_va);
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Write `len` bytes from `src` VA to **sector-aligned** byte offset `off`.
+    fn write_range(&self, off: u64, src: usize, len: usize) -> bool {
+        let sectors = (len + 511) / 512;
+        for s in 0..sectors {
+            // Copy data into scratch page.
+            let chunk = (len - s * 512).min(512);
+            unsafe {
+                // Zero the scratch first (partial last sector).
+                core::ptr::write_bytes(self.scratch_va as *mut u8, 0, 512);
+                core::ptr::copy_nonoverlapping(
+                    (src + s * 512) as *const u8,
+                    self.scratch_va as *mut u8,
+                    chunk,
+                );
+            }
+            if !syscall::grant_pages(
+                self.blk_aspace,
+                self.scratch_va,
+                self.grant_va,
+                1,
+                false,
+            ) {
+                return false;
+            }
+            let abs = self.partition_offset + off + (s as u64) * SECTOR;
+            let d2 = SECTOR | ((self.reply_port as u64) << 32);
+            syscall::send(
+                self.blk_port,
+                IO_WRITE,
+                0,
+                abs,
+                d2,
+                self.grant_va as u64,
+            );
+            let ok =
+                if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+                    rr.tag == IO_WRITE_OK
                 } else {
                     false
                 };
@@ -554,6 +640,143 @@ fn read_node(blk: &BlkClient, logical: u64) -> Option<usize> {
     }
 }
 
+/// Invalidate a cached node (call after writing it to disk).
+fn cache_invalidate_logical(logical: u64) {
+    unsafe {
+        for i in 0..NODE_CACHE_SLOTS {
+            if NODE_ADDR[i] == logical {
+                NODE_ADDR[i] = u64::MAX;
+                return;
+            }
+        }
+    }
+}
+
+/// Compute CRC32c over bytes [32..nodesize) and write into [0..4).
+fn node_update_csum(slot: usize) {
+    unsafe {
+        let nsz = REAL_NODESIZE;
+        let crc = crc32c_update(!0u32, &NODE_BUF[slot][32..nsz]);
+        write_le32(&mut NODE_BUF[slot], 0, crc);
+    }
+}
+
+/// Flush a cached node to disk: recompute CRC32c, write via BlkClient.
+fn flush_node(blk: &BlkClient, slot: usize) -> bool {
+    unsafe {
+        let logical = NODE_ADDR[slot];
+        if logical == u64::MAX {
+            return false;
+        }
+        node_update_csum(slot);
+        let physical = match logical_to_physical(logical) {
+            Some(p) => p,
+            None => return false,
+        };
+        let nsz = REAL_NODESIZE;
+        blk.write_range(physical, NODE_BUF[slot].as_ptr() as usize, nsz)
+    }
+}
+
+// =====================================================================
+// Block allocator — simple linear allocator from end of largest DATA chunk.
+// No free-space tree updates; mkfs.btrfs -f rebuilds on next mount.
+// =====================================================================
+static mut ALLOC_CHUNK_IDX: usize = 0;
+static mut ALLOC_CURSOR: u64 = 0; // logical address of next free block
+static mut ALLOC_END: u64 = 0;    // end of the allocating chunk
+
+fn init_allocator() {
+    unsafe {
+        // Find the largest DATA chunk (type determined by position — typically
+        // the last chunk is the largest DATA chunk on a small btrfs image).
+        let mut best = 0usize;
+        let mut best_len = 0u64;
+        for i in 0..CHUNK_COUNT {
+            if CHUNKS[i].length > best_len {
+                best_len = CHUNKS[i].length;
+                best = i;
+            }
+        }
+        ALLOC_CHUNK_IDX = best;
+        // Start allocating from 75% into the chunk to avoid existing data.
+        ALLOC_CURSOR = CHUNKS[best].logical + (best_len * 3 / 4);
+        // Align to nodesize.
+        let nsz = REAL_NODESIZE as u64;
+        ALLOC_CURSOR = (ALLOC_CURSOR + nsz - 1) & !(nsz - 1);
+        ALLOC_END = CHUNKS[best].logical + best_len;
+    }
+}
+
+/// Allocate `size` bytes of logical space (nodesize-aligned).
+/// Returns logical address or None if full.
+fn alloc_logical(size: u64) -> Option<u64> {
+    unsafe {
+        let aligned = (size + (REAL_NODESIZE as u64) - 1) & !((REAL_NODESIZE as u64) - 1);
+        if ALLOC_CURSOR + aligned > ALLOC_END {
+            return None;
+        }
+        let addr = ALLOC_CURSOR;
+        ALLOC_CURSOR += aligned;
+        Some(addr)
+    }
+}
+
+// =====================================================================
+// Superblock update — write bytes_used and root tree pointer back.
+// =====================================================================
+static mut SB_BUF: [u8; 4096] = [0u8; 4096];
+
+fn flush_superblock(blk: &BlkClient, vol: &BtrfsVol) -> bool {
+    unsafe {
+        // Re-read superblock so we don't clobber other fields.
+        if !blk.read_range(BTRFS_SUPER_OFFSET, SB_BUF.as_mut_ptr() as usize, 4096) {
+            return false;
+        }
+        // Update bytes_used.
+        write_le64(&mut SB_BUF, SB_BYTES_USED, vol.bytes_used);
+        // Update root tree root pointer (in case it changed — but we do in-place).
+        write_le64(&mut SB_BUF, SB_ROOT, vol.fs_tree_root);
+        // Recompute superblock CRC32c over [32..4096).
+        let crc = crc32c_update(!0u32, &SB_BUF[32..4096]);
+        write_le32(&mut SB_BUF, 0, crc);
+        blk.write_range(BTRFS_SUPER_OFFSET, SB_BUF.as_ptr() as usize, 4096)
+    }
+}
+
+// Next inode number counter.
+static mut NEXT_INO: u64 = 0;
+
+fn init_next_ino(blk: &BlkClient, vol: &BtrfsVol) {
+    // Scan DIR_INDEX entries to find highest objectid in use.
+    // Simple: just start at FIRST_FREE_OBJECTID + 256 + scan.
+    let mut max_ino = BTRFS_FIRST_FREE_OBJECTID;
+    // Walk DIR_INDEX entries from root dir to find max objectid.
+    let mut idx = 2u64;
+    loop {
+        match dir_next_entry(blk, vol, BTRFS_FIRST_FREE_OBJECTID, idx) {
+            Some((child_oid, _, _, next)) => {
+                if child_oid > max_ino {
+                    max_ino = child_oid;
+                }
+                idx = next;
+            }
+            None => break,
+        }
+    }
+    unsafe {
+        NEXT_INO = max_ino + 1;
+    }
+}
+
+fn alloc_ino() -> u64 {
+    unsafe {
+        let ino = NEXT_INO;
+        NEXT_INO += 1;
+        ino
+    }
+}
+
 // =====================================================================
 // B-tree search
 // =====================================================================
@@ -686,6 +909,282 @@ fn leaf_item_info(slot: usize, index: usize) -> (usize, usize) {
 }
 
 // =====================================================================
+// Leaf modification (in-place, no COW)
+// =====================================================================
+
+/// Insert an item into a leaf node at `slot`.  `key` is the item key,
+/// `data` is the item payload.  Returns false if the leaf is full.
+/// In btrfs leaves: item headers grow forward from HEADER_SIZE, item data
+/// grows backward from nodesize.  data_offset in each item header is
+/// relative to the start of the header area (not node start) — we store
+/// it as "offset from start of data area" per the on-disk format: the
+/// value stored is the offset from BTRFS_HEADER_SIZE.
+fn leaf_insert_item(
+    blk: &BlkClient,
+    slot: usize,
+    key: &BtrfsKey,
+    data: &[u8],
+) -> bool {
+    unsafe {
+        let nsz = REAL_NODESIZE;
+        let nritems = read_le32(&NODE_BUF[slot], 96) as usize;
+
+        // Find insertion point (keep sorted order).
+        let mut ins = nritems;
+        for i in 0..nritems {
+            let k = read_key_at(
+                &NODE_BUF[slot],
+                BTRFS_HEADER_SIZE + i * BTRFS_LEAF_ITEM_SIZE,
+            );
+            if key_cmp(key, &k) < 0 {
+                ins = i;
+                break;
+            } else if key_cmp(key, &k) == 0 {
+                // Key already exists — duplicate.
+                return false;
+            }
+        }
+
+        // Check space: headers end, data start.
+        let headers_end = BTRFS_HEADER_SIZE + (nritems + 1) * BTRFS_LEAF_ITEM_SIZE;
+        let data_start = if nritems == 0 {
+            nsz
+        } else {
+            // Lowest data_offset among all items.
+            let mut lowest = nsz;
+            for i in 0..nritems {
+                let hdr = BTRFS_HEADER_SIZE + i * BTRFS_LEAF_ITEM_SIZE;
+                let d = BTRFS_HEADER_SIZE + read_le32(&NODE_BUF[slot], hdr + 17) as usize;
+                if d < lowest {
+                    lowest = d;
+                }
+            }
+            lowest
+        };
+
+        if headers_end + data.len() > data_start {
+            return false; // Leaf full.
+        }
+
+        // New data goes just below existing data.
+        let new_data_off = data_start - data.len();
+
+        // Shift item headers at [ins..nritems] right by one slot.
+        if ins < nritems {
+            let src = BTRFS_HEADER_SIZE + ins * BTRFS_LEAF_ITEM_SIZE;
+            let dst = BTRFS_HEADER_SIZE + (ins + 1) * BTRFS_LEAF_ITEM_SIZE;
+            let count = (nritems - ins) * BTRFS_LEAF_ITEM_SIZE;
+            core::ptr::copy(
+                NODE_BUF[slot].as_ptr().add(src),
+                NODE_BUF[slot].as_mut_ptr().add(dst),
+                count,
+            );
+        }
+
+        // Write new item header.
+        let hdr = BTRFS_HEADER_SIZE + ins * BTRFS_LEAF_ITEM_SIZE;
+        write_key_at(&mut NODE_BUF[slot], hdr, key);
+        // data_offset is relative to BTRFS_HEADER_SIZE.
+        write_le32(
+            &mut NODE_BUF[slot],
+            hdr + 17,
+            (new_data_off - BTRFS_HEADER_SIZE) as u32,
+        );
+        write_le32(&mut NODE_BUF[slot], hdr + 21, data.len() as u32);
+
+        // Write item data.
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            NODE_BUF[slot].as_mut_ptr().add(new_data_off),
+            data.len(),
+        );
+
+        // Increment nritems.
+        write_le32(&mut NODE_BUF[slot], 96, (nritems + 1) as u32);
+
+        // Flush to disk.
+        flush_node(blk, slot)
+    }
+}
+
+/// Delete item at `index` from leaf at `slot`.
+fn leaf_delete_item(blk: &BlkClient, slot: usize, index: usize) -> bool {
+    unsafe {
+        let nritems = read_le32(&NODE_BUF[slot], 96) as usize;
+        if index >= nritems {
+            return false;
+        }
+
+        let nsz = REAL_NODESIZE;
+        let del_hdr = BTRFS_HEADER_SIZE + index * BTRFS_LEAF_ITEM_SIZE;
+        let del_data_off =
+            BTRFS_HEADER_SIZE + read_le32(&NODE_BUF[slot], del_hdr + 17) as usize;
+        let del_data_sz = read_le32(&NODE_BUF[slot], del_hdr + 21) as usize;
+
+        // Find lowest data offset among all items (the data area boundary).
+        let mut lowest_data = nsz;
+        for i in 0..nritems {
+            let h = BTRFS_HEADER_SIZE + i * BTRFS_LEAF_ITEM_SIZE;
+            let d = BTRFS_HEADER_SIZE + read_le32(&NODE_BUF[slot], h + 17) as usize;
+            if d < lowest_data {
+                lowest_data = d;
+            }
+        }
+
+        // Compact data area: shift items with offsets < del_data_off up by del_data_sz.
+        // (These are the items whose data is below the deleted item's data.)
+        if del_data_off > lowest_data {
+            core::ptr::copy(
+                NODE_BUF[slot].as_ptr().add(lowest_data),
+                NODE_BUF[slot].as_mut_ptr().add(lowest_data + del_data_sz),
+                del_data_off - lowest_data,
+            );
+        }
+
+        // Update data_offsets for items whose data was shifted.
+        for i in 0..nritems {
+            if i == index {
+                continue;
+            }
+            let h = BTRFS_HEADER_SIZE + i * BTRFS_LEAF_ITEM_SIZE;
+            let d = BTRFS_HEADER_SIZE + read_le32(&NODE_BUF[slot], h + 17) as usize;
+            if d < del_data_off {
+                write_le32(
+                    &mut NODE_BUF[slot],
+                    h + 17,
+                    (d + del_data_sz - BTRFS_HEADER_SIZE) as u32,
+                );
+            }
+        }
+
+        // Shift item headers left.
+        if index + 1 < nritems {
+            let src = BTRFS_HEADER_SIZE + (index + 1) * BTRFS_LEAF_ITEM_SIZE;
+            let dst = del_hdr;
+            let count = (nritems - index - 1) * BTRFS_LEAF_ITEM_SIZE;
+            core::ptr::copy(
+                NODE_BUF[slot].as_ptr().add(src),
+                NODE_BUF[slot].as_mut_ptr().add(dst),
+                count,
+            );
+        }
+
+        // Clear last header slot.
+        let last_hdr = BTRFS_HEADER_SIZE + (nritems - 1) * BTRFS_LEAF_ITEM_SIZE;
+        core::ptr::write_bytes(
+            NODE_BUF[slot].as_mut_ptr().add(last_hdr),
+            0,
+            BTRFS_LEAF_ITEM_SIZE,
+        );
+
+        // Decrement nritems.
+        write_le32(&mut NODE_BUF[slot], 96, (nritems - 1) as u32);
+
+        flush_node(blk, slot)
+    }
+}
+
+/// Update the data payload of an existing item at `index` in leaf `slot`.
+/// The new data must be the same size as the old data.
+fn leaf_update_item_data(
+    blk: &BlkClient,
+    slot: usize,
+    index: usize,
+    data: &[u8],
+) -> bool {
+    let (data_off, data_sz) = leaf_item_info(slot, index);
+    if data.len() != data_sz {
+        return false;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            NODE_BUF[slot].as_mut_ptr().add(data_off),
+            data.len(),
+        );
+    }
+    flush_node(blk, slot)
+}
+
+// =====================================================================
+// Tree-level insert/delete (single-leaf, no splits)
+// =====================================================================
+
+/// Insert an item into a tree rooted at `tree_root`.
+/// Walks down to the correct leaf and inserts there.
+fn tree_insert(
+    blk: &BlkClient,
+    tree_root: u64,
+    key: &BtrfsKey,
+    data: &[u8],
+) -> bool {
+    // Walk to the target leaf.
+    let mut logical = tree_root;
+    loop {
+        let slot = match read_node(blk, logical) {
+            Some(s) => s,
+            None => return false,
+        };
+        let (level, nritems) = unsafe {
+            (NODE_BUF[slot][100], read_le32(&NODE_BUF[slot], 96) as usize)
+        };
+        if nritems == 0 && level == 0 {
+            // Empty leaf — insert directly.
+            return leaf_insert_item(blk, slot, key, data);
+        }
+        if level == 0 {
+            return leaf_insert_item(blk, slot, key, data);
+        }
+        // Internal: find child.
+        let mut idx = 0;
+        for i in 1..nritems {
+            let k = unsafe {
+                read_key_at(
+                    &NODE_BUF[slot],
+                    BTRFS_HEADER_SIZE + i * BTRFS_KEY_PTR_SIZE,
+                )
+            };
+            if key_cmp(&k, key) <= 0 {
+                idx = i;
+            } else {
+                break;
+            }
+        }
+        logical = unsafe {
+            read_le64(
+                &NODE_BUF[slot],
+                BTRFS_HEADER_SIZE + idx * BTRFS_KEY_PTR_SIZE + BTRFS_KEY_SIZE,
+            )
+        };
+    }
+}
+
+/// Delete an item from a tree.  Returns true if found and deleted.
+fn tree_delete(blk: &BlkClient, tree_root: u64, key: &BtrfsKey) -> bool {
+    match tree_search(blk, tree_root, key) {
+        Some((slot, idx, found)) if key_cmp(&found, key) == 0 => {
+            leaf_delete_item(blk, slot, idx)
+        }
+        _ => false,
+    }
+}
+
+/// Update an existing item's data in-place (same size only).
+fn tree_update(
+    blk: &BlkClient,
+    tree_root: u64,
+    key: &BtrfsKey,
+    data: &[u8],
+) -> bool {
+    match tree_search(blk, tree_root, key) {
+        Some((slot, idx, found)) if key_cmp(&found, key) == 0 => {
+            leaf_update_item_data(blk, slot, idx, data)
+        }
+        _ => false,
+    }
+}
+
+// =====================================================================
 // Volume state + superblock parsing
 // =====================================================================
 struct BtrfsVol {
@@ -702,6 +1201,14 @@ struct BtrfsVol {
 /// Parse superblock, bootstrap chunks, walk chunk tree.
 /// Returns (BtrfsVol-without-fs-tree, root_tree_root, root_level).
 fn parse_superblock(blk: &BlkClient) -> Option<(BtrfsVol, u64, u8)> {
+    // Reset state (in case this is a retry).
+    unsafe {
+        CHUNK_COUNT = 0;
+        for i in 0..NODE_CACHE_SLOTS {
+            NODE_ADDR[i] = u64::MAX;
+        }
+    }
+
     // Read 4096-byte superblock at device offset 0x10000.
     let mut sb = [0u8; 4096];
     if !blk.read_range(BTRFS_SUPER_OFFSET, sb.as_mut_ptr() as usize, 4096) {
@@ -722,33 +1229,21 @@ fn parse_superblock(blk: &BlkClient) -> Option<(BtrfsVol, u64, u8)> {
     let total_bytes = read_le64(&sb, SB_TOTAL_BYTES);
     let bytes_used = read_le64(&sb, SB_BYTES_USED);
 
-    syscall::debug_puts(b"  [btrfs_srv] nodesize=");
-    print_num(nodesize as u64);
-    syscall::debug_puts(b" sectorsize=");
-    print_num(sectorsize as u64);
-    syscall::debug_puts(b"\n");
-
     if (nodesize as usize) > MAX_NODESIZE {
-        syscall::debug_puts(b"  [btrfs_srv] nodesize too large\n");
         return None;
     }
     unsafe {
         REAL_NODESIZE = nodesize as usize;
     }
 
-    // Bootstrap chunk map from sys_chunk_array.
+    // Bootstrap chunk map from sys_chunk_array, then walk chunk tree.
     parse_sys_chunk_array(&sb);
-
-    syscall::debug_puts(b"  [btrfs_srv] bootstrap chunks: ");
-    print_num(unsafe { CHUNK_COUNT } as u64);
-    syscall::debug_puts(b"\n");
-
-    // Walk chunk tree for full map.
     walk_chunk_tree(blk, chunk_root);
 
-    syscall::debug_puts(b"  [btrfs_srv] total chunks: ");
-    print_num(unsafe { CHUNK_COUNT } as u64);
-    syscall::debug_puts(b"\n");
+    // Verify the chunk map can resolve the root tree root.
+    if logical_to_physical(root_tree_root).is_none() {
+        return None;
+    }
 
     let vol = BtrfsVol {
         nodesize,
@@ -770,6 +1265,7 @@ fn find_fs_tree(blk: &BlkClient, root_tree_root: u64) -> Option<(u64, u8)> {
         offset: u64::MAX,
     };
     let (slot, idx, found) = tree_search(blk, root_tree_root, &key)?;
+
     if found.objectid != BTRFS_FS_TREE_OBJECTID
         || found.typ != BTRFS_ROOT_ITEM_KEY
     {
@@ -917,6 +1413,447 @@ fn dir_next_entry(
         }
         Some((target_oid, name_buf, nlen, found.offset + 1))
     }
+}
+
+// =====================================================================
+// Inode / directory / file write helpers
+// =====================================================================
+
+/// Build an INODE_ITEM (160 bytes) in a buffer.
+fn build_inode_item(size: u64, mode: u32, nlink: u32) -> [u8; 160] {
+    let mut buf = [0u8; 160];
+    // generation at +0 (u64) — leave 0
+    // transid at +8 (u64) — leave 0
+    write_le64(&mut buf, 16, size);     // size
+    // nbytes at +24 (u64) — same as size for inline
+    write_le64(&mut buf, 24, size);
+    // block_group at +32 (u64) — leave 0
+    write_le32(&mut buf, 40, nlink);    // nlink
+    write_le32(&mut buf, 44, 0);        // uid
+    write_le32(&mut buf, 48, 0);        // gid
+    write_le32(&mut buf, 52, mode);     // mode
+    // rdev, flags, sequence all 0
+    // atime/ctime/mtime/otime are timespec pairs at offsets 80+ — leave 0
+    buf
+}
+
+/// Create a new regular file inode + INODE_REF + DIR_ITEM + DIR_INDEX.
+/// Returns objectid on success.
+fn create_file(
+    blk: &BlkClient,
+    vol: &BtrfsVol,
+    parent_oid: u64,
+    name: &[u8],
+) -> Option<u64> {
+    let ino = alloc_ino();
+
+    // 1. INODE_ITEM
+    let inode_data = build_inode_item(0, 0o100644, 1);
+    let inode_key = BtrfsKey {
+        objectid: ino,
+        typ: BTRFS_INODE_ITEM_KEY,
+        offset: 0,
+    };
+    if !tree_insert(blk, vol.fs_tree_root, &inode_key, &inode_data) {
+        return None;
+    }
+
+    // 2. INODE_REF: (ino, INODE_REF, parent_oid) → index(u64) + namelen(u16) + name
+    let mut ref_data = [0u8; 128];
+    let dir_index = next_dir_index(blk, vol, parent_oid);
+    write_le64(&mut ref_data, 0, dir_index);               // index
+    ref_data[8] = name.len() as u8;
+    ref_data[9] = (name.len() >> 8) as u8;
+    for i in 0..name.len().min(116) {
+        ref_data[10 + i] = name[i];
+    }
+    let ref_key = BtrfsKey {
+        objectid: ino,
+        typ: BTRFS_INODE_REF_KEY,
+        offset: parent_oid,
+    };
+    if !tree_insert(blk, vol.fs_tree_root, &ref_key, &ref_data[..10 + name.len()]) {
+        tree_delete(blk, vol.fs_tree_root, &inode_key);
+        return None;
+    }
+
+    // 3. DIR_ITEM: (parent, DIR_ITEM, name_hash)
+    if !add_dir_entry(blk, vol, parent_oid, name, ino, dir_index) {
+        tree_delete(blk, vol.fs_tree_root, &ref_key);
+        tree_delete(blk, vol.fs_tree_root, &inode_key);
+        return None;
+    }
+
+    // 4. Update parent inode size (not critical, skip for simplicity).
+
+    Some(ino)
+}
+
+/// Create a new directory.
+fn create_dir(
+    blk: &BlkClient,
+    vol: &BtrfsVol,
+    parent_oid: u64,
+    name: &[u8],
+    mode: u32,
+) -> Option<u64> {
+    let ino = alloc_ino();
+    let dir_mode = 0o040000 | (mode & 0o7777);
+
+    // 1. INODE_ITEM for directory
+    let inode_data = build_inode_item(0, dir_mode, 2);
+    let inode_key = BtrfsKey {
+        objectid: ino,
+        typ: BTRFS_INODE_ITEM_KEY,
+        offset: 0,
+    };
+    if !tree_insert(blk, vol.fs_tree_root, &inode_key, &inode_data) {
+        return None;
+    }
+
+    // 2. INODE_REF
+    let mut ref_data = [0u8; 128];
+    let dir_index = next_dir_index(blk, vol, parent_oid);
+    write_le64(&mut ref_data, 0, dir_index);
+    ref_data[8] = name.len() as u8;
+    ref_data[9] = (name.len() >> 8) as u8;
+    for i in 0..name.len().min(116) {
+        ref_data[10 + i] = name[i];
+    }
+    let ref_key = BtrfsKey {
+        objectid: ino,
+        typ: BTRFS_INODE_REF_KEY,
+        offset: parent_oid,
+    };
+    if !tree_insert(blk, vol.fs_tree_root, &ref_key, &ref_data[..10 + name.len()]) {
+        tree_delete(blk, vol.fs_tree_root, &inode_key);
+        return None;
+    }
+
+    // 3. DIR_ITEM + DIR_INDEX in parent
+    if !add_dir_entry(blk, vol, parent_oid, name, ino, dir_index) {
+        tree_delete(blk, vol.fs_tree_root, &ref_key);
+        tree_delete(blk, vol.fs_tree_root, &inode_key);
+        return None;
+    }
+
+    Some(ino)
+}
+
+/// Find the next available DIR_INDEX for a parent directory.
+fn next_dir_index(blk: &BlkClient, vol: &BtrfsVol, parent_oid: u64) -> u64 {
+    // Search for the highest DIR_INDEX entry.
+    let key = BtrfsKey {
+        objectid: parent_oid,
+        typ: BTRFS_DIR_INDEX_KEY,
+        offset: u64::MAX,
+    };
+    match tree_search(blk, vol.fs_tree_root, &key) {
+        Some((_, _, found))
+            if found.objectid == parent_oid
+                && found.typ == BTRFS_DIR_INDEX_KEY =>
+        {
+            found.offset + 1
+        }
+        _ => 2, // DIR_INDEX starts at 2.
+    }
+}
+
+/// Add a DIR_ITEM + DIR_INDEX entry for `child_oid` under `parent_oid`.
+fn add_dir_entry(
+    blk: &BlkClient,
+    vol: &BtrfsVol,
+    parent_oid: u64,
+    name: &[u8],
+    child_oid: u64,
+    dir_index: u64,
+) -> bool {
+    // DIR_ITEM data: location key (17) + transid(8) + data_len(2) + name_len(2) + type(1) + name
+    let entry_sz = 30 + name.len();
+    let mut entry = [0u8; 286]; // 30 + 256 max
+    // location key: (child_oid, INODE_ITEM, 0)
+    write_le64(&mut entry, 0, child_oid);   // location.objectid
+    entry[8] = BTRFS_INODE_ITEM_KEY;        // location.type
+    write_le64(&mut entry, 9, 0);           // location.offset
+    // transid at +17 — leave 0
+    // data_len at +25
+    entry[25] = 0;
+    entry[26] = 0;
+    // name_len at +27
+    entry[27] = name.len() as u8;
+    entry[28] = (name.len() >> 8) as u8;
+    // type at +29: 1=regular file, 2=directory
+    // Peek at child inode to determine type.
+    entry[29] = if let Some(inode) = lookup_inode(blk, vol, child_oid) {
+        if inode.is_dir() { 2 } else { 1 }
+    } else {
+        1
+    };
+    // name at +30
+    for i in 0..name.len() {
+        entry[30 + i] = name[i];
+    }
+
+    let hash = btrfs_name_hash(name);
+
+    // Insert DIR_ITEM.
+    let dir_item_key = BtrfsKey {
+        objectid: parent_oid,
+        typ: BTRFS_DIR_ITEM_KEY,
+        offset: hash,
+    };
+    if !tree_insert(blk, vol.fs_tree_root, &dir_item_key, &entry[..entry_sz]) {
+        return false;
+    }
+
+    // Insert DIR_INDEX.
+    let dir_index_key = BtrfsKey {
+        objectid: parent_oid,
+        typ: BTRFS_DIR_INDEX_KEY,
+        offset: dir_index,
+    };
+    if !tree_insert(blk, vol.fs_tree_root, &dir_index_key, &entry[..entry_sz]) {
+        // Rollback DIR_ITEM.
+        tree_delete(blk, vol.fs_tree_root, &dir_item_key);
+        return false;
+    }
+
+    true
+}
+
+/// Remove directory entries (DIR_ITEM + DIR_INDEX + INODE_REF) for `name` under `parent_oid`.
+fn remove_dir_entry(
+    blk: &BlkClient,
+    vol: &BtrfsVol,
+    parent_oid: u64,
+    name: &[u8],
+    child_oid: u64,
+) -> bool {
+    let hash = btrfs_name_hash(name);
+
+    // Delete DIR_ITEM.
+    let dir_item_key = BtrfsKey {
+        objectid: parent_oid,
+        typ: BTRFS_DIR_ITEM_KEY,
+        offset: hash,
+    };
+    tree_delete(blk, vol.fs_tree_root, &dir_item_key);
+
+    // Find and delete DIR_INDEX — scan for the one pointing to child_oid.
+    let mut idx = 2u64;
+    loop {
+        let key = BtrfsKey {
+            objectid: parent_oid,
+            typ: BTRFS_DIR_INDEX_KEY,
+            offset: idx,
+        };
+        match tree_search_ge(blk, vol.fs_tree_root, &key) {
+            Some((slot, item_idx, found))
+                if found.objectid == parent_oid
+                    && found.typ == BTRFS_DIR_INDEX_KEY =>
+            {
+                let (data_off, data_sz) = leaf_item_info(slot, item_idx);
+                if data_sz >= 30 {
+                    let target = unsafe { read_le64(&NODE_BUF[slot], data_off) };
+                    if target == child_oid {
+                        tree_delete(blk, vol.fs_tree_root, &found);
+                        break;
+                    }
+                }
+                idx = found.offset + 1;
+            }
+            _ => break,
+        }
+    }
+
+    // Delete INODE_REF.
+    let ref_key = BtrfsKey {
+        objectid: child_oid,
+        typ: BTRFS_INODE_REF_KEY,
+        offset: parent_oid,
+    };
+    tree_delete(blk, vol.fs_tree_root, &ref_key);
+
+    true
+}
+
+/// Update an inode's INODE_ITEM (size, mode, etc.) on disk.
+fn update_inode(
+    blk: &BlkClient,
+    vol: &BtrfsVol,
+    inode: &BtrfsInode,
+) -> bool {
+    let key = BtrfsKey {
+        objectid: inode.objectid,
+        typ: BTRFS_INODE_ITEM_KEY,
+        offset: 0,
+    };
+    let data = build_inode_item(inode.size, inode.mode, inode.nlink);
+    tree_update(blk, vol.fs_tree_root, &key, &data)
+}
+
+/// Write inline file data (for small files, ≤ ~3800 bytes).
+/// Replaces or creates EXTENT_DATA item with inline type.
+fn write_inline_extent(
+    blk: &BlkClient,
+    vol: &BtrfsVol,
+    ino: u64,
+    data: &[u8],
+) -> bool {
+    let key = BtrfsKey {
+        objectid: ino,
+        typ: BTRFS_EXTENT_DATA_KEY,
+        offset: 0,
+    };
+
+    // Delete existing extent if any.
+    tree_delete(blk, vol.fs_tree_root, &key);
+
+    if data.is_empty() {
+        return true;
+    }
+
+    // Build inline extent item: 21-byte header + data.
+    let item_sz = 21 + data.len();
+    let mut item = [0u8; 4096]; // max inline
+    // generation at +0 (u64) — 0
+    write_le64(&mut item, 0, 0);
+    // ram_bytes at +8 (u64) — actual size
+    write_le64(&mut item, 8, data.len() as u64);
+    // compression at +16 — 0 (none)
+    item[16] = 0;
+    // encryption at +17 — 0
+    item[17] = 0;
+    // other_encoding at +18 (u16) — 0
+    item[18] = 0;
+    item[19] = 0;
+    // type at +20 — INLINE
+    item[20] = BTRFS_FILE_EXTENT_INLINE;
+    // data at +21
+    for i in 0..data.len() {
+        item[21 + i] = data[i];
+    }
+
+    tree_insert(blk, vol.fs_tree_root, &key, &item[..item_sz])
+}
+
+/// Write a regular (non-inline) extent for larger files.
+/// Allocates a new logical block, writes data, creates EXTENT_DATA item.
+fn write_regular_extent(
+    blk: &BlkClient,
+    vol: &mut BtrfsVol,
+    ino: u64,
+    file_off: u64,
+    data: &[u8],
+) -> bool {
+    let nsz = unsafe { REAL_NODESIZE as u64 };
+    // Round up to nodesize for allocation.
+    let alloc_sz = ((data.len() as u64) + nsz - 1) & !(nsz - 1);
+
+    let logical = match alloc_logical(alloc_sz) {
+        Some(a) => a,
+        None => return false,
+    };
+    let physical = match logical_to_physical(logical) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // Write data to disk.
+    // Use a temporary buffer for the write (sector-aligned).
+    static mut EXTENT_BUF: [u8; 16384] = [0u8; 16384];
+    unsafe {
+        let wlen = data.len().min(16384);
+        core::ptr::write_bytes(EXTENT_BUF.as_mut_ptr(), 0, 16384);
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            EXTENT_BUF.as_mut_ptr(),
+            wlen,
+        );
+        if !blk.write_range(physical, EXTENT_BUF.as_ptr() as usize, alloc_sz as usize) {
+            return false;
+        }
+    }
+
+    vol.bytes_used += alloc_sz;
+
+    // Build EXTENT_DATA item (53 bytes for regular extent).
+    let mut item = [0u8; 53];
+    // generation at +0
+    write_le64(&mut item, 0, 0);
+    // ram_bytes at +8
+    write_le64(&mut item, 8, data.len() as u64);
+    // compression=0, encryption=0, other_encoding=0
+    // type at +20 = REGULAR
+    item[20] = BTRFS_FILE_EXTENT_REG;
+    // disk_bytenr at +21
+    write_le64(&mut item, 21, logical);
+    // disk_num_bytes at +29
+    write_le64(&mut item, 29, alloc_sz);
+    // offset at +37 (offset within extent) = 0
+    write_le64(&mut item, 37, 0);
+    // num_bytes at +45 (logical bytes = data.len)
+    write_le64(&mut item, 45, data.len() as u64);
+
+    let key = BtrfsKey {
+        objectid: ino,
+        typ: BTRFS_EXTENT_DATA_KEY,
+        offset: file_off,
+    };
+    tree_insert(blk, vol.fs_tree_root, &key, &item)
+}
+
+/// Free all extent data items for an inode (before deletion).
+fn free_file_extents(blk: &BlkClient, vol: &BtrfsVol, ino: u64) {
+    // Delete all EXTENT_DATA keys for this inode.
+    loop {
+        let key = BtrfsKey {
+            objectid: ino,
+            typ: BTRFS_EXTENT_DATA_KEY,
+            offset: 0,
+        };
+        match tree_search_ge(blk, vol.fs_tree_root, &key) {
+            Some((_, _, found))
+                if found.objectid == ino
+                    && found.typ == BTRFS_EXTENT_DATA_KEY =>
+            {
+                if !tree_delete(blk, vol.fs_tree_root, &found) {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
+/// Delete a file (or empty directory): remove dir entries, extents, inode.
+fn delete_file(
+    blk: &BlkClient,
+    vol: &BtrfsVol,
+    parent_oid: u64,
+    name: &[u8],
+) -> bool {
+    // Look up the child.
+    let child_oid = match lookup_dir_entry(blk, vol, parent_oid, name) {
+        Some(oid) => oid,
+        None => return false,
+    };
+
+    // Free file extents.
+    free_file_extents(blk, vol, child_oid);
+
+    // Remove dir entries.
+    remove_dir_entry(blk, vol, parent_oid, name, child_oid);
+
+    // Delete INODE_ITEM.
+    let inode_key = BtrfsKey {
+        objectid: child_oid,
+        typ: BTRFS_INODE_ITEM_KEY,
+        offset: 0,
+    };
+    tree_delete(blk, vol.fs_tree_root, &inode_key);
+
+    true
 }
 
 // =====================================================================
@@ -1221,39 +2158,39 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     };
 
     // --- Parse btrfs superblock, build chunk map, find FS tree ---
-    let (mut vol, root_tree_root, _root_level) = match parse_superblock(&blk) {
-        Some(v) => v,
-        None => {
-            syscall::debug_puts(b"  [btrfs_srv] mount failed\n");
-            loop {
-                syscall::nanosleep(1_000_000_000_000);
+    // Wait briefly for cache_srv to connect to blk_srv, then retry mount.
+    syscall::nanosleep(200_000_000); // 200 ms initial wait
+    let mut vol = {
+        let mut attempt = 0u32;
+        loop {
+            if let Some((mut v, root_tree_root, _root_level)) = parse_superblock(&blk) {
+                if let Some((bytenr, level)) = find_fs_tree(&blk, root_tree_root) {
+                    v.fs_tree_root = bytenr;
+                    v.fs_tree_level = level;
+                    if lookup_inode(&blk, &v, BTRFS_FIRST_FREE_OBJECTID).is_some() {
+                        syscall::debug_puts(b"  [btrfs_srv] FS tree root=");
+                        print_hex(bytenr);
+                        syscall::debug_puts(b" level=");
+                        print_num(level as u64);
+                        syscall::debug_puts(b"\n");
+                        break v;
+                    }
+                }
             }
+            attempt += 1;
+            if attempt >= 20 {
+                syscall::debug_puts(b"  [btrfs_srv] mount failed after retries\n");
+                loop { syscall::nanosleep(1_000_000_000_000); }
+            }
+            syscall::nanosleep(200_000_000); // 200 ms between retries
         }
     };
 
-    match find_fs_tree(&blk, root_tree_root) {
-        Some((bytenr, level)) => {
-            vol.fs_tree_root = bytenr;
-            vol.fs_tree_level = level;
-            syscall::debug_puts(b"  [btrfs_srv] FS tree root=");
-            print_hex(bytenr);
-            syscall::debug_puts(b" level=");
-            print_num(level as u64);
-            syscall::debug_puts(b"\n");
-        }
-        None => {
-            syscall::debug_puts(b"  [btrfs_srv] FS tree not found\n");
-            loop {
-                syscall::nanosleep(1_000_000_000_000);
-            }
-        }
-    }
+    // Initialize write infrastructure.
+    init_allocator();
+    init_next_ino(&blk, &vol);
 
-    if lookup_inode(&blk, &vol, BTRFS_FIRST_FREE_OBJECTID).is_none() {
-        syscall::debug_puts(b"  [btrfs_srv] WARNING: root dir inode not found\n");
-    }
-
-    syscall::debug_puts(b"  [btrfs_srv] ready\n");
+    syscall::debug_puts(b"  [btrfs_srv] ready (read-write)\n");
 
     // --- Server loop ---
     let mut handles = [OpenHandle::empty(); MAX_OPEN];
@@ -1498,10 +2435,307 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 );
             }
 
-            // Write operations — stubs (read-only filesystem).
-            FS_CREATE | FS_MKNOD | FS_WRITE_FS | FS_DELETE | FS_MKDIR
-            | FS_UNLINK | FS_CHMOD | FS_UTIMENS | FS_SYMLINK | FS_READLINK
-            | FS_LINK | FS_RENAME | FS_CHOWN | FS_TRUNCATE => {
+            // ----- FS_CREATE / FS_MKNOD -----
+            FS_CREATE | FS_MKNOD => {
+                let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
+                let caller_pid = msg.data[3] as u32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                match create_file(&blk, &vol, BTRFS_FIRST_FREE_OBJECTID, name) {
+                    Some(ino) => {
+                        let inode = match lookup_inode(&blk, &vol, ino) {
+                            Some(i) => i,
+                            None => {
+                                let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
+                                continue;
+                            }
+                        };
+                        match alloc_handle(&mut handles, inode, caller_pid) {
+                            Some(h) => {
+                                let _ = syscall::reply(
+                                    FS_CREATE_OK,
+                                    h as u64,
+                                    0,
+                                    my_aspace as u64,
+                                    0,
+                                    0,
+                                );
+                            }
+                            None => {
+                                let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
+                    }
+                }
+            }
+
+            // ----- FS_WRITE -----
+            FS_WRITE_FS => {
+                let handle = msg.data[0] as usize;
+                let length = (msg.data[1] & 0xFFFF_FFFF) as usize;
+                let grant_va = msg.data[2] as usize;
+
+                if handle >= MAX_OPEN || !handles[handle].active {
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
+                    continue;
+                }
+
+                let ino = handles[handle].inode.objectid;
+                let cur_size = handles[handle].inode.size;
+
+                // For simplicity: collect all data to write.
+                // Small files (<= ~3800): use inline extent.
+                // Larger: use regular extent.
+                if length == 0 {
+                    let _ = syscall::reply(FS_WRITE_OK, 0, 0, 0, 0, 0);
+                    continue;
+                }
+
+                // Read data from grant page into a local buffer.
+                static mut WRITE_BUF: [u8; 16384] = [0u8; 16384];
+                let wlen = length.min(16384);
+                if grant_va != 0 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            grant_va as *const u8,
+                            WRITE_BUF.as_mut_ptr(),
+                            wlen,
+                        );
+                    }
+                }
+
+                let new_size = cur_size + wlen as u64;
+
+                let ok = if new_size <= 3800 {
+                    // Inline: read existing data, append, rewrite.
+                    let mut combined = [0u8; 4096];
+                    let existing = if cur_size > 0 {
+                        read_file_data_buf(
+                            &blk,
+                            &vol,
+                            ino,
+                            cur_size,
+                            0,
+                            &mut combined[..cur_size as usize],
+                        )
+                    } else {
+                        0
+                    };
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            WRITE_BUF.as_ptr(),
+                            combined.as_mut_ptr().add(existing),
+                            wlen,
+                        );
+                    }
+                    write_inline_extent(
+                        &blk,
+                        &vol,
+                        ino,
+                        &combined[..existing + wlen],
+                    )
+                } else {
+                    // Regular extent: write at current EOF.
+                    unsafe {
+                        write_regular_extent(
+                            &blk,
+                            &mut vol,
+                            ino,
+                            cur_size,
+                            &WRITE_BUF[..wlen],
+                        )
+                    }
+                };
+
+                if ok {
+                    handles[handle].inode.size = new_size;
+                    update_inode(&blk, &vol, &handles[handle].inode);
+                    let _ = syscall::reply(FS_WRITE_OK, wlen as u64, 0, 0, 0, 0);
+                } else {
+                    let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
+                }
+            }
+
+            // ----- FS_DELETE / FS_UNLINK -----
+            FS_DELETE | FS_UNLINK => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                if delete_file(&blk, &vol, BTRFS_FIRST_FREE_OBJECTID, name) {
+                    let _ = syscall::reply(FS_UNLINK_OK, 0, 0, 0, 0, 0);
+                } else {
+                    let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
+                }
+            }
+
+            // ----- FS_MKDIR -----
+            FS_MKDIR => {
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let mode = ((msg.data[2] >> 16) & 0xFFFF) as u32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
+                let name = &name_buf[..name_len.min(16)];
+
+                let dir_mode = if mode == 0 { 0o755 } else { mode & 0o7777 };
+                match create_dir(&blk, &vol, BTRFS_FIRST_FREE_OBJECTID, name, dir_mode)
+                {
+                    Some(_) => {
+                        let _ = syscall::reply(FS_MKDIR_OK, 0, 0, 0, 0, 0);
+                    }
+                    None => {
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
+                    }
+                }
+            }
+
+            // ----- FS_RENAME -----
+            FS_RENAME => {
+                // data[0..1] = old name, data[2] = old_len | new_len<<16,
+                // data[3..4] = new name
+                let old_len = (msg.data[2] & 0xFFFF) as usize;
+                let new_len = ((msg.data[2] >> 16) & 0xFFFF) as usize;
+                let old_buf = unpack_name(msg.data[0], msg.data[1], old_len);
+                let old_name = &old_buf[..old_len.min(16)];
+                let new_buf = unpack_name(msg.data[3], msg.data[4], new_len);
+                let new_name = &new_buf[..new_len.min(16)];
+
+                let parent = BTRFS_FIRST_FREE_OBJECTID;
+                let child_oid =
+                    match lookup_dir_entry(&blk, &vol, parent, old_name) {
+                        Some(oid) => oid,
+                        None => {
+                            let _ = syscall::reply(
+                                FS_ERROR,
+                                ERR_NOT_FOUND,
+                                0,
+                                0,
+                                0,
+                                0,
+                            );
+                            continue;
+                        }
+                    };
+
+                // Remove old dir entries.
+                remove_dir_entry(&blk, &vol, parent, old_name, child_oid);
+
+                // Add new dir entries.
+                let dir_index = next_dir_index(&blk, &vol, parent);
+
+                // Re-add INODE_REF with new name.
+                let mut ref_data = [0u8; 128];
+                write_le64(&mut ref_data, 0, dir_index);
+                ref_data[8] = new_name.len() as u8;
+                ref_data[9] = (new_name.len() >> 8) as u8;
+                for i in 0..new_name.len().min(116) {
+                    ref_data[10 + i] = new_name[i];
+                }
+                let ref_key = BtrfsKey {
+                    objectid: child_oid,
+                    typ: BTRFS_INODE_REF_KEY,
+                    offset: parent,
+                };
+                tree_insert(
+                    &blk,
+                    vol.fs_tree_root,
+                    &ref_key,
+                    &ref_data[..10 + new_name.len()],
+                );
+
+                add_dir_entry(
+                    &blk,
+                    &vol,
+                    parent,
+                    new_name,
+                    child_oid,
+                    dir_index,
+                );
+
+                let _ = syscall::reply(FS_RENAME_OK, 0, 0, 0, 0, 0);
+            }
+
+            // ----- FS_TRUNCATE -----
+            FS_TRUNCATE => {
+                let handle = msg.data[0] as usize;
+                let new_size = msg.data[1];
+
+                if handle >= MAX_OPEN || !handles[handle].active {
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
+                    continue;
+                }
+
+                let ino = handles[handle].inode.objectid;
+
+                // Delete all extents and rewrite if new_size > 0.
+                free_file_extents(&blk, &vol, ino);
+
+                if new_size > 0 && new_size <= 3800 {
+                    // Read existing data, truncate, rewrite as inline.
+                    let old_size = handles[handle].inode.size;
+                    let read_sz = (new_size as usize).min(old_size as usize);
+                    let mut buf = [0u8; 4096];
+                    let got = read_file_data_buf(
+                        &blk,
+                        &vol,
+                        ino,
+                        old_size,
+                        0,
+                        &mut buf[..read_sz],
+                    );
+                    write_inline_extent(&blk, &vol, ino, &buf[..got.min(new_size as usize)]);
+                }
+
+                handles[handle].inode.size = new_size;
+                update_inode(&blk, &vol, &handles[handle].inode);
+                let _ = syscall::reply(FS_TRUNCATE_OK, 0, 0, 0, 0, 0);
+            }
+
+            // ----- FS_CHMOD -----
+            FS_CHMOD => {
+                let handle = msg.data[0] as usize;
+                let new_mode = msg.data[1] as u32;
+
+                if handle >= MAX_OPEN || !handles[handle].active {
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
+                    continue;
+                }
+
+                // Preserve file type bits, update permission bits.
+                let ftype = handles[handle].inode.mode & 0o170000;
+                handles[handle].inode.mode = ftype | (new_mode & 0o7777);
+                update_inode(&blk, &vol, &handles[handle].inode);
+                let _ = syscall::reply(FS_CHMOD_OK, 0, 0, 0, 0, 0);
+            }
+
+            // ----- FS_CHOWN -----
+            FS_CHOWN => {
+                let handle = msg.data[0] as usize;
+                let uid = msg.data[1] as u32;
+                let gid = msg.data[2] as u32;
+
+                if handle >= MAX_OPEN || !handles[handle].active {
+                    let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
+                    continue;
+                }
+
+                handles[handle].inode.uid = uid;
+                handles[handle].inode.gid = gid;
+                update_inode(&blk, &vol, &handles[handle].inode);
+                let _ = syscall::reply(FS_CHOWN_OK, 0, 0, 0, 0, 0);
+            }
+
+            // ----- FS_UTIMENS -----
+            FS_UTIMENS => {
+                // Timestamps stored as zero — just acknowledge.
+                let _ = syscall::reply(FS_UTIMENS_OK, 0, 0, 0, 0, 0);
+            }
+
+            // Unsupported write ops.
+            FS_SYMLINK | FS_READLINK | FS_LINK => {
                 let _ = syscall::reply(FS_ERROR, ERR_INVALID, 0, 0, 0, 0);
             }
 

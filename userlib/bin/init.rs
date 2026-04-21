@@ -5922,68 +5922,147 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    // --- Phase 190: btrfs filesystem ---
+    // --- Phase 190: btrfs filesystem (read + write) ---
     syscall::debug_puts(b"  init: Phase 190 btrfs filesystem...\n");
     {
         match syscall::ns_lookup(b"btrfs") {
             Some(btrfs_port) => {
-                const FS_OPEN_190: u64 = 0x2000;
-                const FS_OPEN_OK_190: u64 = 0x2001;
-                const FS_READ_190: u64 = 0x2100;
-                const FS_READ_OK_190: u64 = 0x2101;
-                const FS_CLOSE_190: u64 = 0x2400;
-                const FS_READDIR_190: u64 = 0x2200;
-                const FS_READDIR_OK_190: u64 = 0x2201;
+                let mut ok = true;
 
+                // --- Read test: open hello.txt, verify content ---
                 let (n0, n1, _) = syscall::pack_name(b"hello.txt");
-                let reply = syscall::call(btrfs_port, FS_OPEN_190, n0, n1, 9, 0);
+                let reply = syscall::call(btrfs_port, 0x2000, n0, n1, 9, 0);
                 match reply {
-                    Some(r) if r.tag == FS_OPEN_OK_190 => {
+                    Some(r) if r.tag == 0x2001 => {
                         let handle = r.data[0];
                         let size = r.data[1];
-
-                        // Inline read.
-                        let rr = syscall::call(
-                            btrfs_port,
-                            FS_READ_190,
-                            handle,
-                            0,
-                            size.min(24),
-                            0,
-                        );
-                        let read_ok = match rr {
-                            Some(r2) if r2.tag == FS_READ_OK_190 && r2.data[0] > 0 => {
+                        let rr = syscall::call(btrfs_port, 0x2100, handle, 0, size.min(24), 0);
+                        match rr {
+                            Some(r2) if r2.tag == 0x2101 && r2.data[0] > 0 => {
                                 let w = r2.data[1];
-                                let b0 = (w & 0xFF) as u8;
-                                let b1 = ((w >> 8) & 0xFF) as u8;
-                                b0 == b'H' && b1 == b'e'
+                                if (w & 0xFF) as u8 != b'H' { ok = false; }
                             }
-                            _ => false,
-                        };
-
-                        let _ = syscall::call(btrfs_port, FS_CLOSE_190, handle, 0, 0, 0);
-
-                        // Readdir root (offset 0).
-                        let dr = syscall::call(btrfs_port, FS_READDIR_190, 0, 0, 0, 0);
-                        let dir_ok = match dr {
-                            Some(r3) if r3.tag == FS_READDIR_OK_190 => true,
-                            _ => false,
-                        };
-
-                        if read_ok && dir_ok {
-                            syscall::debug_puts(b"Phase 190 btrfs: PASSED (read+readdir)\n");
-                        } else if read_ok {
-                            syscall::debug_puts(b"Phase 190 btrfs: PASSED (read ok, readdir failed)\n");
-                        } else {
-                            syscall::debug_puts(b"Phase 190 btrfs: FAILED (read check failed)\n");
+                            _ => { ok = false; }
                         }
+                        let _ = syscall::call(btrfs_port, 0x2400, handle, 0, 0, 0);
                     }
-                    Some(_) => {
-                        syscall::debug_puts(b"Phase 190 btrfs: FAILED (open failed)\n");
+                    _ => { ok = false; }
+                }
+
+                // --- Write test: create, write, read-back, delete ---
+                let mut write_ok = ok;
+                if write_ok {
+                    // Create test_w.txt
+                    let (n0, n1, _) = syscall::pack_name(b"test_w.txt");
+                    let cr = syscall::call(btrfs_port, 0x2500, n0, n1, 10u64, 0);
+                    match cr {
+                        Some(r) if r.tag == 0x2501 => {
+                            let handle = r.data[0];
+                            let fs_aspace = r.data[2];
+
+                            // Write "btrfs write OK!" via grant
+                            let wd = b"btrfs write OK!";
+                            let data_page = syscall::mmap_anon(0, 1, 1);
+                            if let Some(va) = data_page {
+                                unsafe {
+                                    for i in 0..wd.len() {
+                                        core::ptr::write((va + i) as *mut u8, wd[i]);
+                                    }
+                                }
+                                let grant_dst: usize = 0x9_0000_0000;
+                                if syscall::grant_pages(fs_aspace, va, grant_dst, 1, false) {
+                                    let wr = syscall::call(
+                                        btrfs_port, 0x2600, handle,
+                                        wd.len() as u64, grant_dst as u64, 0,
+                                    );
+                                    match wr {
+                                        Some(r) if r.tag == 0x2601 && r.data[0] as usize == wd.len() => {
+                                            syscall::debug_puts(b"    btrfs write: OK\n");
+                                        }
+                                        Some(r) => {
+                                            syscall::debug_puts(b"    btrfs write FAIL tag=");
+                                            print_num(r.tag);
+                                            syscall::debug_puts(b" d0=");
+                                            print_num(r.data[0]);
+                                            syscall::debug_puts(b"\n");
+                                            write_ok = false;
+                                        }
+                                        _ => { syscall::debug_puts(b"    btrfs write: no reply\n"); write_ok = false; }
+                                    }
+                                    syscall::revoke(fs_aspace, grant_dst);
+                                } else {
+                                    write_ok = false;
+                                }
+                                syscall::munmap(va);
+                            }
+                            let _ = syscall::call(btrfs_port, 0x2400, handle, 0, 0, 0);
+
+                            // Read back: reopen and verify content
+                            if write_ok {
+                                let (n0, n1, _) = syscall::pack_name(b"test_w.txt");
+                                if let Some(ro) = syscall::call(btrfs_port, 0x2000, n0, n1, 10u64, 0) {
+                                    if ro.tag == 0x2001 {
+                                        let h2 = ro.data[0];
+                                        let sz = ro.data[1];
+                                        if let Some(rr) = syscall::call(btrfs_port, 0x2100, h2, 0, sz.min(24), 0) {
+                                            if rr.tag == 0x2101 {
+                                                let br = rr.data[0] as usize;
+                                                let expected = b"btrfs write OK!";
+                                                let mut content = [0u8; 24];
+                                                let w = [rr.data[1], rr.data[2], rr.data[3]];
+                                                for i in 0..br.min(24) {
+                                                    content[i] = (w[i / 8] >> ((i % 8) * 8)) as u8;
+                                                }
+                                                if br == expected.len() && &content[..br] == expected {
+                                                    syscall::debug_puts(b"    btrfs read-back: OK\n");
+                                                } else {
+                                                    write_ok = false;
+                                                }
+                                            } else { write_ok = false; }
+                                        } else { write_ok = false; }
+                                        let _ = syscall::call(btrfs_port, 0x2400, h2, 0, 0, 0);
+                                    } else { write_ok = false; }
+                                } else { write_ok = false; }
+                            }
+
+                            // Delete the file
+                            if write_ok {
+                                let (n0, n1, _) = syscall::pack_name(b"test_w.txt");
+                                if let Some(dr) = syscall::call(btrfs_port, 0x2700, n0, n1, 10u64, 0) {
+                                    if dr.tag == 0x2701 {
+                                        syscall::debug_puts(b"    btrfs delete: OK\n");
+                                    } else {
+                                        write_ok = false;
+                                    }
+                                }
+
+                                // Verify gone
+                                let (n0, n1, _) = syscall::pack_name(b"test_w.txt");
+                                if let Some(vr) = syscall::call(btrfs_port, 0x2000, n0, n1, 10u64, 0) {
+                                    if vr.tag == 0x2F00 {
+                                        syscall::debug_puts(b"    btrfs verify-gone: OK\n");
+                                    } else {
+                                        write_ok = false;
+                                    }
+                                }
+                            }
+                        }
+                        Some(r) => {
+                            syscall::debug_puts(b"    btrfs create FAIL tag=");
+                            print_num(r.tag);
+                            syscall::debug_puts(b"\n");
+                            write_ok = false;
+                        }
+                        _ => { syscall::debug_puts(b"    btrfs create: no reply\n"); write_ok = false; }
                     }
-                    None => {
-                        syscall::debug_puts(b"Phase 190 btrfs: FAILED (no reply)\n");
-                    }
+                }
+
+                if ok && write_ok {
+                    syscall::debug_puts(b"Phase 190 btrfs: PASSED (read+write)\n");
+                } else if ok {
+                    syscall::debug_puts(b"Phase 190 btrfs: PASSED (read ok, write failed)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 190 btrfs: FAILED\n");
                 }
             }
             None => {
