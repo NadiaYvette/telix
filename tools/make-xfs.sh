@@ -1,6 +1,6 @@
 #!/bin/bash
-# Create a test XFS image and append it to test.img at 36 MiB offset.
-# The XFS region starts at byte offset 37748736.
+# Create a test XFS image and append it to test.img at 37 MiB offset.
+# Layout: ...35 MiB UDF end + 37 MiB XFS start (300 MiB).
 # Requires: xfsprogs (mkfs.xfs); needs 300 MiB minimum for mkfs.xfs 6.x.
 # Uses mkfs.xfs -p (protofile) to populate without needing root.
 set -e
@@ -13,7 +13,7 @@ if [ ! -f "$DISK_IMG" ]; then
     exit 1
 fi
 
-XFS_OFFSET=$((36 * 1024 * 1024))
+XFS_OFFSET=$((37 * 1024 * 1024))
 XFS_SIZE=$((300 * 1024 * 1024))  # 300 MiB (mkfs.xfs 6.x minimum)
 TOTAL_SIZE=$((XFS_OFFSET + XFS_SIZE))
 

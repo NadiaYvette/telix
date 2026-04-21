@@ -1,6 +1,6 @@
 #!/bin/bash
-# Create a test APFS image and append it to test.img at 336 MiB offset.
-# The APFS region starts at byte offset 352321536 (after XFS at 36+300 MiB).
+# Create a test APFS image and append it to test.img at 337 MiB offset.
+# Layout: after XFS at 37+300 MiB = 337 MiB.
 # Requires: mkapfs from linux-apfsprogs (~/src/apfsprogs/mkapfs/mkapfs).
 set -e
 
@@ -18,7 +18,7 @@ if [ ! -x "$MKAPFS" ]; then
     exit 0
 fi
 
-APFS_OFFSET=$((336 * 1024 * 1024))
+APFS_OFFSET=$((337 * 1024 * 1024))
 APFS_SIZE=$((32 * 1024 * 1024))  # 32 MiB
 TOTAL_SIZE=$((APFS_OFFSET + APFS_SIZE))
 

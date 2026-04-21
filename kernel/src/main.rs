@@ -507,29 +507,37 @@ fn startup_thread() -> ! {
         None => println!("  WARNING: cache_srv not found (ok if not yet built)"),
     }
 
+    // Spawn partition table server (reads GPT from block device).
+    match sched::spawn_user(b"part_srv", 50, 20, 0) {
+        Some(tid) => println!("  part_srv spawned (thread {})", tid),
+        None => println!("  WARNING: part_srv not found (ok if not yet built)"),
+    }
+
     // Spawn unified FAT filesystem server (FAT12/16/32, userspace).
-    match sched::spawn_user(b"fat_srv", 50, 20, 0) {
+    // GPT partition 1: FAT16 at 1 MiB offset.
+    match sched::spawn_user(b"fat_srv", 50, 20, 1 * 1024 * 1024) {
         Some(tid) => println!("  fat_srv spawned (thread {})", tid),
         None => println!("  WARNING: fat_srv not found (ok if not yet built)"),
     }
 
-    // Spawn unified ext2/3/4 filesystem server (partition starts at byte 16 MiB in test.img).
-    match sched::spawn_user(b"ext_srv", 50, 20, 16 * 1024 * 1024) {
+    // Spawn unified ext2/3/4 filesystem server.
+    // GPT partition 2: ext2 at 17 MiB offset.
+    match sched::spawn_user(b"ext_srv", 50, 20, 17 * 1024 * 1024) {
         Some(tid) => println!("  ext_srv spawned (thread {})", tid),
         None => println!("  WARNING: ext_srv not found (ok if not yet built)"),
     }
 
-    // Spawn XFS filesystem server (partition starts at byte 36 MiB in test.img).
-    match sched::spawn_user(b"xfs_srv", 50, 20, 36 * 1024 * 1024) {
+    // Spawn XFS filesystem server.
+    // GPT partition 4: XFS at 37 MiB offset.
+    match sched::spawn_user(b"xfs_srv", 50, 20, 37 * 1024 * 1024) {
         Some(tid) => println!("  xfs_srv spawned (thread {})", tid),
         None => println!("  WARNING: xfs_srv not found (ok if not yet built)"),
     }
 
     // Spawn APFS filesystem server.
-    // arg0 = partition byte offset. apfs_srv discovers blk_srv via
-    // ns_lookup_wait("blk") at runtime — no kernel-side port spinning needed.
+    // GPT partition 5: APFS at 337 MiB offset.
     {
-        let part_off: u64 = 336 * 1024 * 1024;
+        let part_off: u64 = 337 * 1024 * 1024;
         match sched::spawn_user(b"apfs_srv", 50, 20, part_off) {
             Some(tid) => {
                 println!("  apfs_srv spawned (thread {})", tid);

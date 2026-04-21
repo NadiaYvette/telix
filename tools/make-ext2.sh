@@ -1,21 +1,20 @@
 #!/bin/bash
 # Append a 16 MiB ext2 partition to test.img after the FAT16 region.
-# The ext2 region starts at byte offset 16777216 (sector 32768).
+# Layout: 1 MiB GPT + 16 MiB FAT16 + 16 MiB ext2 = ext2 at 17 MiB.
 # Requires: e2fsprogs (mke2fs), debugfs or e2tools or fuse2fs
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DISK_IMG="$SCRIPT_DIR/../test.img"
 
-# Ensure FAT16 portion exists (should be 16 MiB from make-fat16.sh).
 if [ ! -f "$DISK_IMG" ]; then
     echo "ERROR: $DISK_IMG not found. Run make-fat16.sh first."
     exit 1
 fi
 
-FAT16_SIZE=$((16 * 1024 * 1024))
+EXT2_OFFSET=$((17 * 1024 * 1024))
 EXT2_SIZE=$((16 * 1024 * 1024))
-TOTAL_SIZE=$((FAT16_SIZE + EXT2_SIZE))
+TOTAL_SIZE=$((EXT2_OFFSET + EXT2_SIZE))
 
 # Truncate to include both partitions.
 truncate -s "$TOTAL_SIZE" "$DISK_IMG"
@@ -142,8 +141,8 @@ DEBUGFS_EOF
 
 rm -f "$TMPFILE" "$TMPFILE2" "$TMPFILE3" "$PASSWD_TMP" "$GROUP_TMP" "$LOCALTIME_TMP" "$RESOLV_TMP"
 
-# Splice the ext2 image into test.img at the FAT16 boundary.
-dd if="$EXT2_TMP" of="$DISK_IMG" bs=1M seek=16 conv=notrunc 2>/dev/null
+# Splice the ext2 image into test.img at the ext2 partition offset.
+dd if="$EXT2_TMP" of="$DISK_IMG" bs=1M seek=$((EXT2_OFFSET / 1024 / 1024)) conv=notrunc 2>/dev/null
 rm -f "$EXT2_TMP"
 
-echo "  ext2 partition appended to test.img at offset $FAT16_SIZE ($((EXT2_SIZE / 1024)) KiB ext2)"
+echo "  ext2 partition appended to test.img at offset $EXT2_OFFSET ($((EXT2_SIZE / 1024)) KiB ext2)"

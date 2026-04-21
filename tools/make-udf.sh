@@ -1,6 +1,6 @@
 #!/bin/bash
-# Create a test UDF image and append it to test.img at 34 MiB offset.
-# The UDF region starts at byte offset 35651584.
+# Create a test UDF image and append it to test.img at 35 MiB offset.
+# Layout: 1 MiB GPT + 16 MiB FAT16 + 16 MiB ext2 + 2 MiB gap + 2 MiB UDF.
 # Requires: genisoimage (or mkisofs)
 set -e
 
@@ -12,7 +12,7 @@ if [ ! -f "$DISK_IMG" ]; then
     exit 1
 fi
 
-UDF_OFFSET=$((34 * 1024 * 1024))
+UDF_OFFSET=$((35 * 1024 * 1024))
 UDF_SIZE=$((2 * 1024 * 1024))  # Reserve 2 MiB for UDF
 TOTAL_SIZE=$((UDF_OFFSET + UDF_SIZE))
 
@@ -30,8 +30,8 @@ echo -n "ABCDEFGHIJKLMNOPQRSTUVWXYZ" > "$UDF_TMP/alpha.txt"
 UDF_IMG=$(mktemp)
 genisoimage -udf -quiet -o "$UDF_IMG" "$UDF_TMP" 2>/dev/null
 
-# Splice the UDF into test.img at 34 MiB offset.
-dd if="$UDF_IMG" of="$DISK_IMG" bs=1M seek=34 conv=notrunc 2>/dev/null
+# Splice the UDF into test.img at 35 MiB offset.
+dd if="$UDF_IMG" of="$DISK_IMG" bs=1M seek=$((UDF_OFFSET / 1024 / 1024)) conv=notrunc 2>/dev/null
 
 UDF_ACTUAL_SIZE=$(stat -c %s "$UDF_IMG")
 echo "  UDF image appended to test.img at offset $UDF_OFFSET ($((UDF_ACTUAL_SIZE / 1024)) KiB UDF)"

@@ -245,6 +245,8 @@ struct BlkClient {
     reply_port: u64,
     scratch_va: usize,
     grant_va: usize,
+    /// Byte offset of the FAT partition within the disk image.
+    partition_offset: u64,
 }
 
 impl BlkClient {
@@ -258,7 +260,7 @@ impl BlkClient {
         ) {
             return false;
         }
-        let offset = (sector as u64) * 512;
+        let offset = self.partition_offset + (sector as u64) * 512;
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
@@ -301,7 +303,7 @@ impl BlkClient {
         ) {
             return false;
         }
-        let offset = (sector as u64) * 512;
+        let offset = self.partition_offset + (sector as u64) * 512;
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
@@ -1236,7 +1238,8 @@ fn resolve_dir(
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
+fn main(arg0: u64, _arg1: u64, _arg2: u64) {
+    let partition_offset = arg0; // byte offset of FAT partition (0 if unpartitioned)
     syscall::debug_puts(b"  [fat_srv] starting\n");
 
     let port = syscall::port_create();
@@ -1291,6 +1294,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         reply_port: blk_reply,
         scratch_va,
         grant_va: 0x6_0000_0000, // blk_srv grant target (not FS_SCRATCH_VA)
+        partition_offset,
     };
 
     // -----------------------------------------------------------------------

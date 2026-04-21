@@ -5689,6 +5689,50 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 185: GPT partition table ---
+    syscall::debug_puts(b"  init: Phase 185 GPT partition table...\n");
+    {
+        // Give part_srv time to start and parse GPT.
+        for _ in 0..300 {
+            syscall::yield_now();
+        }
+        match syscall::ns_lookup(b"part") {
+            Some(part_port) => {
+                match syscall::call(part_port, 0x7200, 0, 0, 0, 0) {
+                    Some(reply) if reply.tag == 0x7200 && reply.data[0] > 0 => {
+                        let count = reply.data[0];
+                        syscall::debug_puts(b"Phase 185 GPT: PASSED (");
+                        print_num(count);
+                        syscall::debug_puts(b" partitions)\n");
+
+                        // Query first partition byte range for validation.
+                        if let Some(info) = syscall::call(part_port, 0x7204, 0, 0, 0, 0) {
+                            if info.tag == 0x7204 {
+                                syscall::debug_puts(b"  part 0: offset=");
+                                print_num(info.data[0]);
+                                syscall::debug_puts(b" size=");
+                                print_num(info.data[1]);
+                                syscall::debug_puts(b"\n");
+                            }
+                        }
+                    }
+                    Some(reply) if reply.tag == 0x7200 => {
+                        syscall::debug_puts(b"Phase 185 GPT: SKIPPED (0 partitions, no GPT on disk)\n");
+                    }
+                    Some(_) => {
+                        syscall::debug_puts(b"Phase 185 GPT: FAILED (bad reply)\n");
+                    }
+                    None => {
+                        syscall::debug_puts(b"Phase 185 GPT: FAILED (no reply)\n");
+                    }
+                }
+            }
+            None => {
+                syscall::debug_puts(b"Phase 185 GPT: SKIPPED (no part_srv)\n");
+            }
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

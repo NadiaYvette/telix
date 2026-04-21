@@ -239,3 +239,7 @@ path = "bin/acpi_srv.rs"
 [[bin]]
 name = "pci_srv"
 path = "bin/pci_srv.rs"
+
+[[bin]]
+name = "part_srv"
+path = "bin/part_srv.rs"
