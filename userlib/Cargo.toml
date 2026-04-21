@@ -215,3 +215,7 @@ path = "bin/apfs_srv.rs"
 [[bin]]
 name = "iscsi_srv"
 path = "bin/iscsi_srv.rs"
+
+[[bin]]
+name = "sctp_srv"
+path = "bin/sctp_srv.rs"

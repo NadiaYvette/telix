@@ -5206,6 +5206,121 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 182: SCTP (Stream Control Transmission Protocol) ---
+    syscall::debug_puts(b"  init: Phase 182 SCTP loopback echo...\n");
+    {
+        let sctp_tid = syscall::spawn(b"sctp_srv", 50);
+        if sctp_tid == 0 {
+            syscall::debug_puts(b"Phase 182 SCTP: SKIPPED (spawn failed)\n");
+        } else {
+            // Wait for sctp_srv to register.
+            let mut sctp_port = None;
+            for _ in 0..50 { // 50 * 100ms = 5s
+                if let Some(p) = syscall::ns_lookup(b"sctp") {
+                    sctp_port = Some(p);
+                    break;
+                }
+                syscall::sleep_ms(100);
+            }
+            match sctp_port {
+                Some(sp) => {
+                    let rp = syscall::port_create();
+
+                    // SCTP_ASSOCIATE to echo port 7 on 127.0.0.1.
+                    // data[0] = remote_ip(low32) | remote_port(bits32-47)
+                    // data[1] = local_port(low16) | reply_port(high48)
+                    // data[2] = num_out_streams(low16) | num_in_streams(high16)
+                    let d0: u64 = 0x7F000001 | (7u64 << 32); // 127.0.0.1:7
+                    let d1: u64 = 0 | ((rp as u64) << 16); // ephemeral port, reply_port
+                    let d2: u64 = 2 | (2 << 16); // 2 out, 2 in streams
+                    syscall::send(sp, 0x4D00, d0, d1, d2, 0); // SCTP_ASSOCIATE
+
+                    let mut assoc_id: u64 = u64::MAX;
+                    if let Some(m) = syscall::recv_msg_timeout(rp, 5_000_000) {
+                        if m.tag == 0x4D01 { // SCTP_ASSOCIATED
+                            assoc_id = m.data[0] & 0xFFFFFFFF;
+                        }
+                    }
+
+                    if assoc_id == u64::MAX {
+                        syscall::debug_puts(b"Phase 182 SCTP: FAILED (associate)\n");
+                    } else {
+                        // Send "Hello SCTP!" on stream 0.
+                        let test_data = b"Hello SCTP!";
+                        let mut w0: u64 = 0;
+                        let mut w1: u64 = 0;
+                        for i in 0..test_data.len().min(8) {
+                            w0 |= (test_data[i] as u64) << (i * 8);
+                        }
+                        for i in 0..test_data.len().saturating_sub(8).min(8) {
+                            w1 |= (test_data[8 + i] as u64) << (i * 8);
+                        }
+                        // SCTP_SEND: data[0]=assoc_id|stream_id<<32, data[1]=len|reply<<16
+                        let sd0 = assoc_id; // stream 0
+                        let sd1 = (test_data.len() as u64) | ((rp as u64) << 16);
+                        syscall::send(sp, 0x4E00, sd0, sd1, w0, w1);
+
+                        let mut send_ok = false;
+                        if let Some(m) = syscall::recv_msg_timeout(rp, 5_000_000) {
+                            if m.tag == 0x4E01 { send_ok = true; } // SCTP_SEND_OK
+                        }
+
+                        if !send_ok {
+                            syscall::debug_puts(b"Phase 182 SCTP: FAILED (send)\n");
+                        } else {
+                            // Receive echo response.
+                            // SCTP_RECV: data[0]=assoc_id(low32)|reply_port(high32)
+                            let rd0 = assoc_id | ((rp as u64) << 32);
+                            syscall::send(sp, 0x4F00, rd0, 0, 0, 0);
+
+                            let mut recv_ok = false;
+                            let mut echo_match = false;
+                            if let Some(m) = syscall::recv_msg_timeout(rp, 5_000_000) {
+                                if m.tag == 0x4F01 { // SCTP_DATA
+                                    let len = (m.data[0] & 0xFFFF) as usize;
+                                    recv_ok = true;
+                                    // Verify echoed data.
+                                    if len == test_data.len() {
+                                        let mut match_ok = true;
+                                        for i in 0..len.min(8) {
+                                            if (m.data[1] >> (i * 8)) as u8 != test_data[i] {
+                                                match_ok = false;
+                                            }
+                                        }
+                                        for i in 0..len.saturating_sub(8).min(8) {
+                                            if (m.data[2] >> (i * 8)) as u8 != test_data[8 + i] {
+                                                match_ok = false;
+                                            }
+                                        }
+                                        echo_match = match_ok;
+                                    }
+                                }
+                            }
+
+                            if recv_ok && echo_match {
+                                syscall::debug_puts(b"Phase 182 SCTP: PASSED\n");
+                            } else if recv_ok {
+                                syscall::debug_puts(b"Phase 182 SCTP: FAILED (echo mismatch)\n");
+                            } else {
+                                syscall::debug_puts(b"Phase 182 SCTP: FAILED (recv timeout)\n");
+                            }
+                        }
+
+                        // Shutdown association.
+                        let shd0 = assoc_id | ((rp as u64) << 32);
+                        syscall::send(sp, 0x4D10, shd0, 0, 0, 0); // SCTP_SHUTDOWN_REQ
+                        syscall::recv_msg_timeout(rp, 1_000_000);
+                    }
+
+                    syscall::port_destroy(rp);
+                }
+                None => {
+                    syscall::debug_puts(b"Phase 182 SCTP: SKIPPED (no server)\n");
+                }
+            }
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {
