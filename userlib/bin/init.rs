@@ -5771,6 +5771,51 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 187: Intel Wi-Fi driver ---
+    syscall::debug_puts(b"  init: Phase 187 Intel Wi-Fi driver...\n");
+    {
+        // iwl_srv only runs when real Intel Wi-Fi hardware is present.
+        // In QEMU, there's no device — test should SKIP cleanly.
+        match syscall::ns_lookup(b"wlan") {
+            Some(wlan_port) => {
+                // Query link status via NETIF_STATUS.
+                let my_port = syscall::port_create();
+                syscall::send(wlan_port, 0x5400, my_port as u64, 0, 0, 0);
+                match syscall::recv_msg(my_port) {
+                    Some(reply) if reply.tag == 0x5401 => {
+                        let mac_val = reply.data[0];
+                        if mac_val != 0 {
+                            syscall::debug_puts(b"Phase 187 WiFi: PASSED (MAC=");
+                            // Print MAC from packed u64.
+                            for i in 0..6u32 {
+                                if i > 0 {
+                                    syscall::debug_putchar(b':');
+                                }
+                                let b = ((mac_val >> (i * 8)) & 0xFF) as u8;
+                                let hi = b >> 4;
+                                let lo = b & 0xF;
+                                syscall::debug_putchar(if hi < 10 { b'0' + hi } else { b'a' + hi - 10 });
+                                syscall::debug_putchar(if lo < 10 { b'0' + lo } else { b'a' + lo - 10 });
+                            }
+                            syscall::debug_puts(b")\n");
+                        } else {
+                            syscall::debug_puts(b"Phase 187 WiFi: FAILED (no MAC)\n");
+                        }
+                    }
+                    Some(_) => {
+                        syscall::debug_puts(b"Phase 187 WiFi: FAILED (bad reply)\n");
+                    }
+                    None => {
+                        syscall::debug_puts(b"Phase 187 WiFi: FAILED (no reply)\n");
+                    }
+                }
+            }
+            None => {
+                syscall::debug_puts(b"Phase 187 WiFi: SKIPPED (no iwl_srv, expected in QEMU)\n");
+            }
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

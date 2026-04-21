@@ -247,3 +247,7 @@ path = "bin/part_srv.rs"
 [[bin]]
 name = "nvme_srv"
 path = "bin/nvme_srv.rs"
+
+[[bin]]
+name = "iwl_srv"
+path = "bin/iwl_srv.rs"
