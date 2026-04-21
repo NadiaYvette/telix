@@ -8,7 +8,7 @@
 //! protocol services (tcp4_srv, ip6_srv). Registers as "bat0".
 //!
 //! Phase 1: Transparent pass-through (no encapsulation).
-//! Phase 2+: OGM generation, neighbor discovery, mesh routing.
+//! Phase 2: B.A.T.M.A.N. IV OGM generation + neighbor/originator tables.
 
 extern crate userlib;
 
@@ -37,6 +37,23 @@ const BAT_STATUS_OK: u64 = 0x5501;
 const ETHERTYPE_BATMAN: u16 = 0x4305;
 
 const MTU: usize = 1500;
+
+// -------------------------------------------------------------------
+// B.A.T.M.A.N. IV constants.
+// -------------------------------------------------------------------
+
+const BATMAN_VERSION: u8 = 15;
+const BATMAN_PACKET_OGM: u8 = 0x01;
+const OGM_SIZE: usize = 26; // 26-byte OGM (no TVLVs for now)
+
+const OGM_INTERVAL_NS: u64 = 1_000_000_000;   // 1 second
+const OGM_PURGE_NS: u64 = 200_000_000_000;     // 200 seconds
+const OGM_DEFAULT_TTL: u8 = 50;
+const TQ_MAX: u8 = 255;
+const TQ_LOCAL_WINDOW_SIZE: u32 = 64;
+
+const MAX_NEIGHBORS: usize = 16;
+const MAX_ORIGINATORS: usize = 16;
 
 // -------------------------------------------------------------------
 // Data structures.
@@ -92,6 +109,59 @@ impl UpstreamClient {
     }
 }
 
+// -------------------------------------------------------------------
+// B.A.T.M.A.N. IV neighbor + originator tables.
+// -------------------------------------------------------------------
+
+/// A directly-connected neighbor (one-hop peer).
+struct Neighbor {
+    active: bool,
+    mac: [u8; 6],
+    last_seen_ns: u64,
+    /// Sliding window: bit i = 1 means OGM seqno (last_seqno - i) was received.
+    rx_window: u64,
+    /// Last OGM seqno received from this neighbor as prev_sender.
+    last_seqno: u32,
+    /// Estimated receive quality (0..TQ_MAX): fraction of OGMs received.
+    tq_recv: u8,
+}
+
+impl Neighbor {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            mac: [0; 6],
+            last_seen_ns: 0,
+            rx_window: 0,
+            last_seqno: 0,
+            tq_recv: 0,
+        }
+    }
+}
+
+/// A known originator (any node in the mesh, possibly multi-hop).
+struct Originator {
+    active: bool,
+    orig_mac: [u8; 6],
+    best_next_hop: [u8; 6],
+    best_tq: u8,
+    last_seqno: u32,
+    last_seen_ns: u64,
+}
+
+impl Originator {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            orig_mac: [0; 6],
+            best_next_hop: [0; 6],
+            best_tq: 0,
+            last_seqno: 0,
+            last_seen_ns: 0,
+        }
+    }
+}
+
 /// Main device state.
 struct BatmanDev {
     eth_port: u64,
@@ -100,6 +170,11 @@ struct BatmanDev {
     downstream: [DownstreamConn; MAX_DOWNSTREAM],
     upstream: [UpstreamClient; MAX_UPSTREAM],
     ogm_seqno: u32,
+    // B.A.T.M.A.N. IV mesh state
+    neighbors: [Neighbor; MAX_NEIGHBORS],
+    originators: [Originator; MAX_ORIGINATORS],
+    last_ogm_ns: u64,
+    bat_ctrl_idx: usize, // downstream index for 0x4305
 }
 
 // Grant page VA base for upstream clients.
@@ -416,11 +491,369 @@ impl BatmanDev {
     // ---------------------------------------------------------------
 
     fn handle_bat_status(&self, reply_port: u64) {
-        // Phase 1: just report we're alive with OGM seqno.
-        let d0 = 0u64;                     // originator_count
-        let d1 = 0u64;                     // neighbor_count
-        let d2 = self.ogm_seqno as u64;    // ogm_seqno
-        syscall::send_nb_4(reply_port, BAT_STATUS_OK, d0, d1, d2, 0);
+        let orig_count = self.originators.iter().filter(|o| o.active).count() as u64;
+        let neigh_count = self.neighbors.iter().filter(|n| n.active).count() as u64;
+        syscall::send_nb_4(
+            reply_port,
+            BAT_STATUS_OK,
+            orig_count,
+            neigh_count,
+            self.ogm_seqno as u64,
+            0,
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // B.A.T.M.A.N. IV: OGM construction and broadcast.
+    // ---------------------------------------------------------------
+
+    /// Build a 26-byte OGMv1 packet in `buf`. Returns OGM_SIZE.
+    fn build_ogm(&self, buf: &mut [u8], ttl: u8, tq: u8, prev_sender: [u8; 6]) -> usize {
+        if buf.len() < OGM_SIZE {
+            return 0;
+        }
+        buf[0] = BATMAN_PACKET_OGM;     // packet_type
+        buf[1] = BATMAN_VERSION;         // version
+        buf[2] = ttl;                    // ttl
+        buf[3] = 0;                      // flags byte (reserved)
+        // [4..6] flags (u16 LE)
+        buf[4] = 0;
+        buf[5] = 0;
+        // [6..10] seqno (u32 LE)
+        let s = self.ogm_seqno;
+        buf[6] = s as u8;
+        buf[7] = (s >> 8) as u8;
+        buf[8] = (s >> 16) as u8;
+        buf[9] = (s >> 24) as u8;
+        // [10..16] orig MAC
+        buf[10..16].copy_from_slice(&self.mac);
+        // [16..22] prev_sender MAC
+        buf[16..22].copy_from_slice(&prev_sender);
+        // [22] reserved
+        buf[22] = 0;
+        // [23] tq
+        buf[23] = tq;
+        // [24..26] tvlv_len (u16 LE) = 0
+        buf[24] = 0;
+        buf[25] = 0;
+        OGM_SIZE
+    }
+
+    /// Broadcast our own OGM via the 0x4305 downstream channel.
+    fn send_ogm(&mut self) {
+        let ctrl = &self.downstream[self.bat_ctrl_idx];
+        if !ctrl.active {
+            return;
+        }
+
+        let tx_ptr = ctrl.tx_va as *mut u8;
+        let mut buf = [0u8; OGM_SIZE];
+        let len = self.build_ogm(&mut buf, OGM_DEFAULT_TTL, TQ_MAX, self.mac);
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), tx_ptr, len);
+        }
+
+        // XMIT to eth_srv: dst_mac=0 → broadcast, ethertype=0x4305.
+        let xmit_reply = syscall::port_create();
+        syscall::send_nb_4(
+            self.eth_port,
+            NETIF_XMIT,
+            len as u64,
+            0u64, // dst_mac=0 → broadcast
+            (ETHERTYPE_BATMAN as u64) | ((xmit_reply as u64) << 16),
+            ctrl.client_id,
+        );
+        let _ = syscall::recv_msg_timeout(xmit_reply, 500_000);
+        syscall::port_destroy(xmit_reply);
+
+        self.ogm_seqno = self.ogm_seqno.wrapping_add(1);
+    }
+
+    /// Re-broadcast a received OGM with decremented TTL and adjusted TQ.
+    fn rebroadcast_ogm(&self, ogm: &[u8; OGM_SIZE], new_ttl: u8, new_tq: u8) {
+        let ctrl = &self.downstream[self.bat_ctrl_idx];
+        if !ctrl.active {
+            return;
+        }
+
+        let tx_ptr = ctrl.tx_va as *mut u8;
+        let mut buf = *ogm;
+        buf[2] = new_ttl;
+        buf[23] = new_tq;
+        // Set prev_sender to our own MAC.
+        buf[16..22].copy_from_slice(&self.mac);
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), tx_ptr, OGM_SIZE);
+        }
+
+        let xmit_reply = syscall::port_create();
+        syscall::send_nb_4(
+            self.eth_port,
+            NETIF_XMIT,
+            OGM_SIZE as u64,
+            0u64, // broadcast
+            (ETHERTYPE_BATMAN as u64) | ((xmit_reply as u64) << 16),
+            ctrl.client_id,
+        );
+        let _ = syscall::recv_msg_timeout(xmit_reply, 500_000);
+        syscall::port_destroy(xmit_reply);
+    }
+
+    // ---------------------------------------------------------------
+    // B.A.T.M.A.N. IV: OGM receive + table updates.
+    // ---------------------------------------------------------------
+
+    /// Process an incoming batman control frame from the 0x4305 channel.
+    fn handle_bat_ctrl(&mut self, payload_len: usize, src_mac: [u8; 6]) {
+        if payload_len < 2 {
+            return;
+        }
+        let rx_ptr = self.downstream[self.bat_ctrl_idx].rx_va as *const u8;
+        let ptype = unsafe { *rx_ptr };
+
+        match ptype {
+            BATMAN_PACKET_OGM => {
+                if payload_len < OGM_SIZE {
+                    return;
+                }
+                let mut ogm = [0u8; OGM_SIZE];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(rx_ptr, ogm.as_mut_ptr(), OGM_SIZE);
+                }
+                self.handle_rx_ogm(&ogm, src_mac);
+            }
+            _ => {} // Phase 7: ELP, OGMv2
+        }
+    }
+
+    /// Parse and process a received OGMv1 packet.
+    fn handle_rx_ogm(&mut self, ogm: &[u8; OGM_SIZE], src_mac: [u8; 6]) {
+        let _version = ogm[1];
+        let ttl = ogm[2];
+        let seqno = (ogm[6] as u32)
+            | ((ogm[7] as u32) << 8)
+            | ((ogm[8] as u32) << 16)
+            | ((ogm[9] as u32) << 24);
+        let mut orig = [0u8; 6];
+        orig.copy_from_slice(&ogm[10..16]);
+        let mut prev_sender = [0u8; 6];
+        prev_sender.copy_from_slice(&ogm[16..22]);
+        let tq = ogm[23];
+
+        // Ignore our own OGMs.
+        if orig == self.mac {
+            return;
+        }
+
+        // Ignore if TQ is zero (dead route).
+        if tq == 0 {
+            return;
+        }
+
+        let now = syscall::clock_gettime();
+
+        // Update neighbor table for the direct sender (src_mac from Ethernet).
+        let neigh_tq = self.update_neighbor(src_mac, seqno, now);
+
+        // Compute path TQ: incoming TQ * local link quality.
+        let path_tq = if neigh_tq > 0 {
+            ((tq as u32) * (neigh_tq as u32) / (TQ_MAX as u32)) as u8
+        } else {
+            0
+        };
+
+        if path_tq == 0 {
+            return;
+        }
+
+        // Update originator table.
+        self.update_originator(orig, src_mac, path_tq, seqno, now);
+
+        // Rebroadcast with decremented TTL if still alive.
+        if ttl > 1 {
+            self.rebroadcast_ogm(ogm, ttl - 1, path_tq);
+        }
+
+        // Debug output (only on new/changed originators).
+        syscall::debug_puts(b"  [batman_srv] OGM: orig=");
+        print_mac(orig);
+        syscall::debug_puts(b" via=");
+        print_mac(src_mac);
+        syscall::debug_puts(b" tq=");
+        print_num(path_tq as u64);
+        syscall::debug_puts(b" seq=");
+        print_num(seqno as u64);
+        syscall::debug_puts(b"\n");
+    }
+
+    /// Update or insert a neighbor entry. Returns the neighbor's receive TQ.
+    fn update_neighbor(&mut self, mac: [u8; 6], seqno: u32, now: u64) -> u8 {
+        // Find existing neighbor or free slot.
+        let mut idx = None;
+        let mut free = None;
+        for i in 0..MAX_NEIGHBORS {
+            if self.neighbors[i].active && self.neighbors[i].mac == mac {
+                idx = Some(i);
+                break;
+            }
+            if !self.neighbors[i].active && free.is_none() {
+                free = Some(i);
+            }
+        }
+
+        let i = match idx {
+            Some(i) => i,
+            None => match free {
+                Some(f) => {
+                    self.neighbors[f] = Neighbor {
+                        active: true,
+                        mac,
+                        last_seen_ns: now,
+                        rx_window: 1,
+                        last_seqno: seqno,
+                        tq_recv: TQ_MAX,
+                    };
+                    syscall::debug_puts(b"  [batman_srv] new neighbor: ");
+                    print_mac(mac);
+                    syscall::debug_puts(b"\n");
+                    return TQ_MAX;
+                }
+                None => return 0, // table full
+            },
+        };
+
+        let n = &mut self.neighbors[i];
+        n.last_seen_ns = now;
+
+        // Sliding window update: shift by the seqno difference.
+        let diff = seqno.wrapping_sub(n.last_seqno);
+        if diff == 0 {
+            // Duplicate — already counted.
+            return n.tq_recv;
+        }
+        if diff <= 64 {
+            // Forward seqno: shift window and mark this one received.
+            n.rx_window = if diff >= 64 { 0 } else { n.rx_window << diff };
+            n.rx_window |= 1;
+            n.last_seqno = seqno;
+        } else if diff > 0xFFFF_FF00 {
+            // Slightly old (wrapped): mark bit if within window.
+            let back = seqno.wrapping_sub(n.last_seqno.wrapping_sub(63));
+            if (back as usize) < 64 {
+                n.rx_window |= 1u64 << back;
+            }
+        }
+        // else: very old or very far ahead — ignore for window purposes.
+
+        // Compute TQ from window population count.
+        let ones = n.rx_window.count_ones();
+        n.tq_recv = ((ones as u32 * TQ_MAX as u32) / TQ_LOCAL_WINDOW_SIZE) as u8;
+        n.tq_recv
+    }
+
+    /// Update or insert an originator entry.
+    fn update_originator(
+        &mut self,
+        orig: [u8; 6],
+        next_hop: [u8; 6],
+        tq: u8,
+        seqno: u32,
+        now: u64,
+    ) {
+        // Find existing entry or free slot.
+        let mut idx = None;
+        let mut free = None;
+        for i in 0..MAX_ORIGINATORS {
+            if self.originators[i].active && self.originators[i].orig_mac == orig {
+                idx = Some(i);
+                break;
+            }
+            if !self.originators[i].active && free.is_none() {
+                free = Some(i);
+            }
+        }
+
+        match idx {
+            Some(i) => {
+                let o = &mut self.originators[i];
+                // Accept if newer seqno, or same seqno with better TQ.
+                let sdiff = seqno.wrapping_sub(o.last_seqno);
+                if sdiff > 0 && sdiff < 0x8000_0000 {
+                    // Newer seqno — always accept.
+                    o.best_next_hop = next_hop;
+                    o.best_tq = tq;
+                    o.last_seqno = seqno;
+                    o.last_seen_ns = now;
+                } else if sdiff == 0 && tq > o.best_tq {
+                    // Same seqno, better TQ.
+                    o.best_next_hop = next_hop;
+                    o.best_tq = tq;
+                    o.last_seen_ns = now;
+                }
+                // Else: older seqno or worse TQ — ignore.
+            }
+            None => {
+                if let Some(f) = free {
+                    self.originators[f] = Originator {
+                        active: true,
+                        orig_mac: orig,
+                        best_next_hop: next_hop,
+                        best_tq: tq,
+                        last_seqno: seqno,
+                        last_seen_ns: now,
+                    };
+                    syscall::debug_puts(b"  [batman_srv] new originator: ");
+                    print_mac(orig);
+                    syscall::debug_puts(b" via ");
+                    print_mac(next_hop);
+                    syscall::debug_puts(b" tq=");
+                    print_num(tq as u64);
+                    syscall::debug_puts(b"\n");
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Purge stale neighbors and originators.
+    // ---------------------------------------------------------------
+
+    fn purge_stale(&mut self, now: u64) {
+        for n in self.neighbors.iter_mut() {
+            if n.active && now.wrapping_sub(n.last_seen_ns) > OGM_PURGE_NS {
+                syscall::debug_puts(b"  [batman_srv] purge neighbor: ");
+                print_mac(n.mac);
+                syscall::debug_puts(b"\n");
+                n.active = false;
+            }
+        }
+        for o in self.originators.iter_mut() {
+            if o.active && now.wrapping_sub(o.last_seen_ns) > OGM_PURGE_NS {
+                syscall::debug_puts(b"  [batman_srv] purge originator: ");
+                print_mac(o.orig_mac);
+                syscall::debug_puts(b"\n");
+                o.active = false;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // OGM timer tick (called from main loop).
+    // ---------------------------------------------------------------
+
+    fn tick_ogm(&mut self) {
+        let now = syscall::clock_gettime();
+        if now.wrapping_sub(self.last_ogm_ns) >= OGM_INTERVAL_NS {
+            self.send_ogm();
+            self.last_ogm_ns = now;
+        }
+        // Purge every ~10 OGM intervals.
+        // (Cheap: just checks timestamps, no allocation.)
+        if self.ogm_seqno % 10 == 0 {
+            self.purge_stale(now);
+        }
     }
 }
 
@@ -474,12 +907,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         downstream: [const { DownstreamConn::new() }; MAX_DOWNSTREAM],
         upstream: [const { UpstreamClient::new() }; MAX_UPSTREAM],
         ogm_seqno: 0,
+        neighbors: [const { Neighbor::new() }; MAX_NEIGHBORS],
+        originators: [const { Originator::new() }; MAX_ORIGINATORS],
+        last_ogm_ns: 0,
+        bat_ctrl_idx: 0,
     };
 
     // Step 5: Register for B.A.T.M.A.N. control frames (0x4305) with eth_srv.
     // This is our dedicated batman control channel for OGMs etc.
-    if dev.register_downstream(ETHERTYPE_BATMAN).is_some() {
-        syscall::debug_puts(b"  [batman_srv] batman control channel ready (0x4305)\n");
+    match dev.register_downstream(ETHERTYPE_BATMAN) {
+        Some(idx) => {
+            dev.bat_ctrl_idx = idx;
+            syscall::debug_puts(b"  [batman_srv] batman control channel ready (0x4305)\n");
+        }
+        None => {
+            syscall::debug_puts(b"  [batman_srv] WARNING: failed to register 0x4305\n");
+        }
     }
 
     // Step 6: Register as "bat0" so tcp4_srv/ip6_srv can find us.
@@ -503,8 +946,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     let plen = msg.data[0] as usize;
                     let src_mac_val = msg.data[1];
                     if dev.downstream[di].ethertype == ETHERTYPE_BATMAN {
-                        // TODO Phase 2: process OGM / batman control frame.
-                        let _ = (plen, src_mac_val);
+                        let src_mac = u64_to_mac(src_mac_val);
+                        dev.handle_bat_ctrl(plen, src_mac);
                     } else {
                         dev.handle_input(di, plen, src_mac_val);
                     }
@@ -546,7 +989,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         }
 
-        // TODO Phase 2: tick OGM timers, send periodic OGMs.
+        // B.A.T.M.A.N. IV: periodic OGM broadcast + purge.
+        dev.tick_ogm();
 
         syscall::yield_now();
     }
