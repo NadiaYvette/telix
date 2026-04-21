@@ -402,10 +402,16 @@ impl Tcp4Dev {
         if payload_len == 0 {
             return;
         }
-        // Read the IPv4 payload from our RX grant page.
-        let buf = self.rx_va as *const u8;
-        let data = unsafe { core::slice::from_raw_parts(buf, payload_len.min(4096)) };
-        self.handle_ipv4(data);
+        // Copy the frame off the RX grant page immediately — eth_srv can
+        // overwrite it at any time (no flow control), so we must not hold
+        // a reference to the grant page across blocking operations.
+        let len = payload_len.min(1500);
+        let mut local = [0u8; 1500];
+        let src = self.rx_va as *const u8;
+        for i in 0..len {
+            local[i] = unsafe { src.add(i).read_volatile() };
+        }
+        self.handle_ipv4(&local[..len]);
     }
 
     fn handle_ipv4(&mut self, data: &[u8]) {

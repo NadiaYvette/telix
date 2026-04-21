@@ -723,6 +723,20 @@ fn print_num(n: u64) {
     }
 }
 
+fn print_hex8(v: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    syscall::debug_putchar(HEX[(v >> 4) as usize]);
+    syscall::debug_putchar(HEX[(v & 0xF) as usize]);
+}
+
+fn print_hex32(v: u32) {
+    syscall::debug_puts(b"0x");
+    print_hex8((v >> 24) as u8);
+    print_hex8((v >> 16) as u8);
+    print_hex8((v >> 8) as u8);
+    print_hex8(v as u8);
+}
+
 // ===================================================================
 // Phase 2: UDP-encapsulated SCTP transport (RFC 6951).
 // SCTP packets are serialized to wire format and sent inside UDP
@@ -732,7 +746,8 @@ fn print_num(n: u64) {
 // --- UDP transport global state ---
 static mut UDP_NET_PORT: u64 = 0;   // tcp4_srv service port
 static mut UDP_BIND_ID: u64 = !0;   // UDP binding ID from tcp4_srv
-static mut UDP_GRANT_VA: usize = 0;  // Grant page for send/recv (4096 bytes)
+static mut UDP_SEND_VA: usize = 0;  // Grant page for outgoing UDP (4096 bytes)
+static mut UDP_RECV_VA: usize = 0;  // Grant page for incoming UDP (4096 bytes)
 static mut UDP_READY: bool = false;
 static mut MY_PORT: u64 = 0;        // Our IPC port (for UDP recv replies)
 
@@ -901,9 +916,9 @@ fn udp_send_sctp(assoc_idx: usize, pkt: &[u8], pkt_len: usize) {
         // remote_ip is big-endian (e.g. 0x0A000202 = 10.0.2.2).
         // NET_UDP_SEND_BUF extracts bytes in little-endian order, so swap.
         let dst_ip_le = a.remote_ip.swap_bytes();
-        let gva = UDP_GRANT_VA;
+        let gva = UDP_SEND_VA;
 
-        // Copy packet to grant page.
+        // Copy packet to send grant page (separate from recv page).
         let dst = gva as *mut u8;
         for i in 0..pkt_len {
             dst.add(i).write_volatile(pkt[i]);
@@ -931,9 +946,9 @@ fn udp_post_recv() {
     unsafe {
         if !UDP_READY { return; }
         // NET_UDP_RECV_BUF: data[0] = bind_id(low32) | reply_port(high32)
-        //                   data[1] = grant_va
+        //                   data[1] = grant_va (recv page, separate from send)
         let d0 = (UDP_BIND_ID & 0xFFFFFFFF) | (MY_PORT << 32);
-        let d1 = UDP_GRANT_VA as u64;
+        let d1 = UDP_RECV_VA as u64;
         syscall::send_nb_4(UDP_NET_PORT, NET_UDP_RECV_BUF, d0, d1, 0, 0);
     }
 }
@@ -949,11 +964,18 @@ fn udp_transport_init() -> bool {
         }
     };
 
-    // Allocate grant page for UDP payloads (4 KiB).
-    let gva = match syscall::mmap_anon(0, 1, 1) {
+    // Allocate two grant pages: one for send, one for recv (avoids race).
+    let send_va = match syscall::mmap_anon(0, 1, 1) {
         Some(va) => va,
         None => {
-            syscall::debug_puts(b"  [sctp_srv] mmap_anon failed for UDP grant page\n");
+            syscall::debug_puts(b"  [sctp_srv] mmap_anon failed for UDP send page\n");
+            return false;
+        }
+    };
+    let recv_va = match syscall::mmap_anon(0, 1, 1) {
+        Some(va) => va,
+        None => {
+            syscall::debug_puts(b"  [sctp_srv] mmap_anon failed for UDP recv page\n");
             return false;
         }
     };
@@ -978,16 +1000,21 @@ fn udp_transport_init() -> bool {
     }
     let bind_id = reply.data[0];
 
-    // Grant the UDP buffer page to tcp4_srv so it can read/write it.
-    if !syscall::grant_pages(net_port, gva, gva, 1, false) {
-        syscall::debug_puts(b"  [sctp_srv] UDP grant failed\n");
+    // Grant both pages to tcp4_srv so it can read the send page and write the recv page.
+    if !syscall::grant_pages(net_port, send_va, send_va, 1, false) {
+        syscall::debug_puts(b"  [sctp_srv] UDP send grant failed\n");
+        return false;
+    }
+    if !syscall::grant_pages(net_port, recv_va, recv_va, 1, false) {
+        syscall::debug_puts(b"  [sctp_srv] UDP recv grant failed\n");
         return false;
     }
 
     unsafe {
         UDP_NET_PORT = net_port;
         UDP_BIND_ID = bind_id;
-        UDP_GRANT_VA = gva;
+        UDP_SEND_VA = send_va;
+        UDP_RECV_VA = recv_va;
         UDP_READY = true;
     }
 
@@ -1031,7 +1058,18 @@ fn handle_sctp_packet(data: &[u8], data_len: usize, src_ip: u32, _src_port: u16)
     // Verify checksum.
     let calc_cksum = sctp_checksum(&data[..data_len]);
     if wire_cksum != calc_cksum {
-        syscall::debug_puts(b"  [sctp_srv] bad SCTP checksum, dropping\n");
+        syscall::debug_puts(b"  [sctp_srv] bad SCTP cksum: len=");
+        print_num(data_len as u64);
+        syscall::debug_puts(b" wire=");
+        print_hex32(wire_cksum);
+        syscall::debug_puts(b" calc=");
+        print_hex32(calc_cksum);
+        syscall::debug_puts(b" hdr=");
+        // Print first 16 bytes as hex for debugging.
+        for i in 0..data_len.min(16) {
+            print_hex8(data[i]);
+        }
+        syscall::debug_puts(b"\n");
         return;
     }
 
@@ -1385,9 +1423,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // src_ip from tcp4_srv is in LE byte order; swap to BE.
                 let src_ip_le = (msg.data[1] & 0xFFFFFFFF) as u32;
                 let src_ip = src_ip_le.swap_bytes();
-                // Read payload from grant page.
+                // Read payload from recv grant page (separate from send page).
                 let mut pkt = [0u8; 1400];
-                let gva = unsafe { UDP_GRANT_VA };
+                let gva = unsafe { UDP_RECV_VA };
                 let src = gva as *const u8;
                 for i in 0..plen.min(1400) {
                     pkt[i] = unsafe { src.add(i).read_volatile() };

@@ -1132,12 +1132,14 @@ impl EthDev {
                 let src_mac = [
                     frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
                 ];
-                // Notify client.
-                syscall::send_nb(
+                // Notify client (blocking send so we don't overwrite the
+                // RX grant page before the client copies the data out).
+                syscall::send(
                     self.clients[i].port,
                     NETIF_INPUT,
                     payload_len as u64,
                     mac_to_u64(src_mac),
+                    0, 0,
                 );
                 return true;
             }
