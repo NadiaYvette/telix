@@ -18,6 +18,10 @@ const CON_WRITE_OK: u64 = 0x3101;
 const CON_POLL: u64 = 0x3110;
 const CON_POLL_OK: u64 = 0x3111;
 
+const POLL_SUBSCRIBE: u64 = 0xF010;
+const POLL_UNSUBSCRIBE: u64 = 0xF020;
+const POLL_NOTIFY: u64 = 0xF030;
+
 const MAX_LINE: usize = 64;
 
 fn print_num(n: u64) {
@@ -47,6 +51,8 @@ struct ConsoleSrv {
     pending_reader: u64,
     /// Remaining bytes to skip in an escape sequence (e.g. \x1b[A).
     esc_skip: u8,
+    /// Poll subscription port (u64::MAX = no subscriber).
+    poll_notify_port: u64,
 }
 
 impl ConsoleSrv {
@@ -57,6 +63,7 @@ impl ConsoleSrv {
             line_ready: false,
             pending_reader: u64::MAX,
             esc_skip: 0,
+            poll_notify_port: u64::MAX,
         }
     }
 
@@ -170,6 +177,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             srv.handle_char(ch);
         }
 
+        // 1b. Notify poll subscriber if line just became ready.
+        if srv.line_ready && srv.poll_notify_port != u64::MAX {
+            syscall::send_nb(srv.poll_notify_port, POLL_NOTIFY, 0x0001, 0); // POLLIN
+        }
+
         // 2. If line ready and there's a pending reader, deliver it.
         if srv.line_ready && srv.pending_reader != u64::MAX {
             let rp = srv.pending_reader;
@@ -185,12 +197,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 CON_POLL => {
                     let events = (msg.data[2] & 0xFFFF) as u16;
                     let rp = msg.data[2] >> 32;
-                    // Console is always writable. Not readable (yet).
+                    // Console is always writable. Readable when line_ready.
                     let mut revents = 0u16;
                     if events & 0x0004 != 0 {
                         revents |= 0x0004; // POLLOUT
                     }
+                    if events & 0x0001 != 0 && srv.line_ready {
+                        revents |= 0x0001; // POLLIN
+                    }
                     syscall::send(rp, CON_POLL_OK, revents as u64, 0, 0, 0);
+                }
+                POLL_SUBSCRIBE => {
+                    // data[1] = notify_port
+                    srv.poll_notify_port = msg.data[1];
+                    // Immediate notification if already readable.
+                    if srv.line_ready && srv.poll_notify_port != u64::MAX {
+                        syscall::send_nb(srv.poll_notify_port, POLL_NOTIFY, 0x0001, 0);
+                    }
+                }
+                POLL_UNSUBSCRIBE => {
+                    srv.poll_notify_port = u64::MAX;
                 }
                 _ => {}
             }
