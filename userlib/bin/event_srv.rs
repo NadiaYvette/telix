@@ -23,6 +23,10 @@ const EVENT_CLOSE: u64 = 0x7030;
 const EVENT_TIMER_SET: u64 = 0x7040;
 const EVENT_POLL: u64 = 0x7050;
 
+const POLL_SUBSCRIBE: u64 = 0xF010;
+const POLL_UNSUBSCRIBE: u64 = 0xF020;
+const POLL_NOTIFY: u64 = 0xF030;
+
 const EVENT_OK: u64 = 0x7100;
 const EVENT_ERROR: u64 = 0x7F00;
 
@@ -60,6 +64,8 @@ struct EventSlot {
     // Deferred reply-cap handle for a blocked reader (u64::MAX = none).
     // Saved via sys_reply_take; fulfilled later via sys_reply_to.
     blocked_reader_cap: u64,
+    // Poll subscription port (u64::MAX = no subscriber).
+    poll_notify_port: u64,
 }
 
 impl EventSlot {
@@ -73,6 +79,7 @@ impl EventSlot {
             timer_next_ns: 0,
             timer_expirations: 0,
             blocked_reader_cap: u64::MAX,
+            poll_notify_port: u64::MAX,
         }
     }
 }
@@ -96,6 +103,22 @@ fn alloc_slot() -> Option<u32> {
 
 fn get_time_ns() -> u64 {
     syscall::clock_gettime()
+}
+
+/// Send POLL_NOTIFY if the event slot is ready and has a subscriber.
+fn notify_poll_event(handle: u32) {
+    let slot = unsafe { &EVENTS[handle as usize] };
+    if slot.poll_notify_port == u64::MAX || !slot.active {
+        return;
+    }
+    let ready = match slot.etype {
+        EventType::EventFd => slot.counter > 0,
+        EventType::TimerFd => slot.timer_expirations > 0,
+        _ => false,
+    };
+    if ready {
+        syscall::send_nb(slot.poll_notify_port, POLL_NOTIFY, 0x0001, 0); // POLLIN
+    }
 }
 
 fn check_timers() {
@@ -129,6 +152,9 @@ fn check_timers() {
                 slot.timer_expirations = 0;
                 let _ = syscall::reply_to(cap, EVENT_OK, exp, 0, 0, 0);
             }
+
+            // Notify poll subscriber on timer expiry.
+            notify_poll_event(i as u32);
         }
     }
 }
@@ -288,6 +314,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                         };
                         let _ = syscall::reply_to(cap, EVENT_OK, val, 0, 0, 0);
                     }
+
+                    // Notify poll subscriber if counter is now non-zero.
+                    if slot.counter > 0 {
+                        notify_poll_event(handle);
+                    }
                 }
             }
 
@@ -365,6 +396,35 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) -> ! {
                     };
                     let _ = syscall::reply(EVENT_OK, ready, 0, 0, 0, 0);
                 }
+            }
+
+            POLL_SUBSCRIBE => {
+                let handle = msg.data[0] as u32;
+                let notify_port = msg.data[1];
+
+                if (handle as usize) < MAX_EVENTS {
+                    unsafe {
+                        let slot = &mut EVENTS[handle as usize];
+                        if slot.active {
+                            slot.poll_notify_port = notify_port;
+                        }
+                    }
+                }
+                let _ = syscall::reply(EVENT_OK, 0, 0, 0, 0, 0);
+                // Send immediate notification if already ready.
+                if (handle as usize) < MAX_EVENTS {
+                    notify_poll_event(handle);
+                }
+            }
+
+            POLL_UNSUBSCRIBE => {
+                let handle = msg.data[0] as u32;
+                if (handle as usize) < MAX_EVENTS {
+                    unsafe {
+                        EVENTS[handle as usize].poll_notify_port = u64::MAX;
+                    }
+                }
+                let _ = syscall::reply(EVENT_OK, 0, 0, 0, 0, 0);
             }
 
             _ => {

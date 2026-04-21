@@ -9679,6 +9679,83 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 75c: POLL_SUBSCRIBE on pipes ---
+    syscall::debug_puts(b"  init: testing pipe POLL_SUBSCRIBE...\n");
+    {
+        let mut phase75c_ok = true;
+
+        let pipe_port = syscall::ns_lookup(b"pipe");
+        if pipe_port.is_none() {
+            syscall::debug_puts(b"    SKIP: pipe_srv not registered\n");
+            phase75c_ok = false;
+        }
+
+        if phase75c_ok {
+            let pp = pipe_port.unwrap();
+            // Create a pipe.
+            let resp = syscall::call(pp, 0x5010, 0, 0, 0, 0);
+            if resp.is_none() || resp.as_ref().unwrap().tag != 0x5100 {
+                syscall::debug_puts(b"    FAIL: PIPE_CREATE\n");
+                phase75c_ok = false;
+            } else {
+                let resp = resp.unwrap();
+                let read_h = resp.data[0]; // read handle (even)
+                let write_h = resp.data[1]; // write handle (odd)
+
+                // Create a notify port for poll subscriptions.
+                let notify_port = syscall::port_create();
+
+                // Subscribe for POLLIN on the read end (fire-and-forget send).
+                const POLL_SUBSCRIBE_TAG: u64 = 0xF010;
+                const POLL_NOTIFY_TAG: u64 = 0xF030;
+
+                // Send POLL_SUBSCRIBE: handle=read_h, notify_port, events=POLLIN
+                syscall::send(pp, POLL_SUBSCRIBE_TAG, read_h, notify_port, 1, 0);
+
+                // Pipe is empty — no immediate notification expected.
+                // Now write data to trigger the notification.
+                let data: u64 = 0x6F6C6C6568; // "hello" LE
+                let wr = syscall::call(pp, 0x5020, write_h, data, 5, 0);
+                if wr.is_none() || wr.as_ref().unwrap().tag != 0x5100 {
+                    syscall::debug_puts(b"    FAIL: PIPE_WRITE\n");
+                    phase75c_ok = false;
+                }
+
+                if phase75c_ok {
+                    // The notification should now be in our notify port.
+                    let notif = syscall::recv_nb_msg(notify_port);
+                    if notif.is_none() {
+                        syscall::debug_puts(b"    FAIL: no POLL_NOTIFY received\n");
+                        phase75c_ok = false;
+                    } else {
+                        let notif = notif.unwrap();
+                        if notif.tag != POLL_NOTIFY_TAG {
+                            syscall::debug_puts(b"    FAIL: wrong tag on notify\n");
+                            phase75c_ok = false;
+                        } else {
+                            let revents = notif.data[0] as u16;
+                            if revents & 0x0001 == 0 {
+                                syscall::debug_puts(b"    FAIL: POLLIN not set\n");
+                                phase75c_ok = false;
+                            }
+                        }
+                    }
+                }
+
+                // Cleanup.
+                let _ = syscall::call(pp, 0x5040, write_h, 0, 0, 0);
+                let _ = syscall::call(pp, 0x5040, read_h, 0, 0, 0);
+                syscall::port_destroy(notify_port);
+            }
+        }
+
+        if phase75c_ok {
+            syscall::debug_puts(b"Phase 75c pipe POLL_SUBSCRIBE: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 75c pipe POLL_SUBSCRIBE: FAILED\n");
+        }
+    }
+
     // ============================================================
     // --- Phase 76: timer signals and guard pages ---
     syscall::debug_puts(b"  init: testing timer signals...\n");

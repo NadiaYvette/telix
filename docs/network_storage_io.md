@@ -254,18 +254,19 @@ The current `poll()` implementation busy-loops sending per-fd `POLL_CHECK` RPCs 
 
 ## Development Phasing
 
-**Phase 3 (I/O Server Stack):** Minimal network stack sufficient for basic network connectivity:
+**Phase 3 (I/O Server Stack) — COMPLETE:**
 - Ethernet server (eth_srv) — done
 - IPv4 + ICMP + TCP (tcp4_srv) — done
 - IPv6 + ICMPv6 + NDP/SLAAC + TCP6 (ip6_srv) — done
-- UDP server (datagram demux, DNS/DHCP support) — next
-- Socket compatibility layer wired to TCP6 (AF_INET6 in socket.c) — next
+- UDP4 in tcp4_srv + UDP6 in ip6_srv (stateless datagram, bind/send/recv/close) — done
+- DNS resolver (hostname→IP via SLIRP UDP to 10.0.2.3) — done
+- Socket compatibility layer (AF_INET + AF_INET6 in musl-telix socket.c, wired to tcp4_srv/ip6_srv for TCP/UDP) — done
 - Local block device drivers (NVMe/virtio-blk) via block device interface — done
 
 **Phase 3b (Port Set Completion):** Required for correct network server behaviour:
-- Port removal from set (enables epoll_ctl DEL, connection teardown)
-- Port set destruction + cleanup of member tags (prevents resource leaks)
-- Convert poll() from busy-loop RPC to port-set-based blocking (eliminates CPU waste in SSH, proxy, and any poll()-using server)
+- Port removal from set — done (SYS_PORT_SET_REMOVE, syscall 105)
+- Port set destruction + cleanup of member tags — done (SYS_PORT_SET_DESTROY, syscall 106)
+- Convert poll() from busy-loop RPC to port-set-based blocking — **done**: POLL_SUBSCRIBE/UNSUBSCRIBE/NOTIFY handlers in pipe_srv, uds_srv, event_srv, pty_srv; remaining: linux_srv epoll_wait (uses its own polling loop internally)
 - Multiple waiters per set (enables thread-pool patterns for high-connection-count servers)
 - Multi-set membership for ports (enables overlapping epoll instances)
 
@@ -281,18 +282,18 @@ The current `poll()` implementation busy-loops sending per-fd `POLL_CHECK` RPCs 
 - SCTP server (message-oriented transport, multi-homing). *Testable via loopback; QEMU SLIRP does not speak SCTP.*
 - iSCSI initiator server (first storage-over-network protocol — demonstrates block/network convergence).
 - Multipath server.
-- Network configuration daemon.
-- PPP/PPPoE server. *Testable with host-side pppd over QEMU serial port.*
-- B.A.T.M.A.N. mesh overlay. *Testable with multi-QEMU tap/bridge topology or loopback state machine testing.*
+- Network configuration daemon (DHCP client, static route config via IPC).
+- PPP/PPPoE server (LCP/IPCP/IPv6CP negotiation, PAP/CHAP auth, PPPoE discovery). *Testable with host-side `pppd` over QEMU serial chardev; PPPoE via host bridge + `rp-pppoe`.*
+- B.A.T.M.A.N. mesh overlay (OGM topology discovery, L2 unicast/broadcast relay). *Testable with multi-QEMU tap/bridge topology: 3–4 instances on a Linux bridge, verify packet forwarding between non-adjacent nodes. Loopback state machine testing also feasible.*
+- GSM/cellular modem (AT command state machine, QMI/MBIM control plane, PPP or raw IP data plane over USB NCM/ECM). *Control-plane prototype testable against recorded AT traces or mock serial; data plane requires real modem hardware.*
 
 **Future work (real hardware required or deferred):**
 - NVMe-oF initiator (TCP and RDMA transports).
 - Fibre Channel stack (requires FC HBA hardware or emulation). FCoE. AoE.
 - Full zero-copy NIC-to-page-cache path. RDMA verbs server.
 - Wi-Fi (802.11) server. *Requires mac80211_hwsim or real Wi-Fi hardware; not QEMU-emulable.*
-- Cellular modem server (FiboCom/MediaTek QMI/MBIM). *Requires real modem hardware; IPC protocol and state machines can be prototyped without a live bearer.*
 
-**Prototype-without-test policy:** For protocols not testable in QEMU (802.11, cellular), implementation may proceed as prototype code that defines the IPC protocol, state machines, and structural integration, clearly marked as untested against real hardware. This allows the architectural interfaces to be validated by inspection and the code to be exercised immediately once hardware becomes available, without requiring a second design pass.
+**Prototype-without-test policy:** For protocols not testable in QEMU (802.11, cellular data plane), implementation may proceed as prototype code that defines the IPC protocol, state machines, and structural integration, clearly marked as untested against real hardware. This allows the architectural interfaces to be validated by inspection and the code to be exercised immediately once hardware becomes available, without requiring a second design pass.
 
 ## Summary
 

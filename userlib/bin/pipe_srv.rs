@@ -23,6 +23,10 @@ const PIPE_READ: u64 = 0x5030;
 const PIPE_CLOSE: u64 = 0x5040;
 const PIPE_POLL: u64 = 0x5050;
 
+const POLL_SUBSCRIBE: u64 = 0xF010;
+const POLL_UNSUBSCRIBE: u64 = 0xF020;
+const POLL_NOTIFY: u64 = 0xF030;
+
 const PIPE_OK: u64 = 0x5100;
 const PIPE_EOF: u64 = 0x51FF;
 const PIPE_ERROR: u64 = 0x5F00;
@@ -41,6 +45,10 @@ struct PipeSlot {
     // Deferred reply-cap handle for a blocked reader (u64::MAX = none).
     // Saved via sys_reply_take; fulfilled later via sys_reply_to.
     recv_reply_cap: u64,
+    // Poll subscription ports (u64::MAX = no subscriber).
+    // When readiness changes, we send POLL_NOTIFY to these ports.
+    poll_notify_read: u64,  // subscriber watching the read end
+    poll_notify_write: u64, // subscriber watching the write end
 }
 
 impl PipeSlot {
@@ -53,6 +61,8 @@ impl PipeSlot {
             writer_closed: false,
             reader_closed: false,
             recv_reply_cap: u64::MAX,
+            poll_notify_read: u64::MAX,
+            poll_notify_write: u64::MAX,
         }
     }
 
@@ -142,6 +152,41 @@ fn try_wake_reader(slot: u32) {
     }
 }
 
+/// Send POLL_NOTIFY to the read-end subscriber (data available or HUP).
+fn notify_poll_read(slot: u32) {
+    let s = unsafe { &PIPES[slot as usize] };
+    if s.poll_notify_read == u64::MAX {
+        return;
+    }
+    let mut revents: u16 = 0;
+    if s.len() > 0 {
+        revents |= 0x0001; // POLLIN
+    }
+    if s.writer_closed && s.len() == 0 {
+        revents |= 0x0010; // POLLHUP
+    }
+    if revents != 0 {
+        syscall::send_nb(s.poll_notify_read, POLL_NOTIFY, revents as u64, 0);
+    }
+}
+
+/// Send POLL_NOTIFY to the write-end subscriber (space available or ERR).
+fn notify_poll_write(slot: u32) {
+    let s = unsafe { &PIPES[slot as usize] };
+    if s.poll_notify_write == u64::MAX {
+        return;
+    }
+    let mut revents: u16 = 0;
+    if s.reader_closed {
+        revents |= 0x0008; // POLLERR
+    } else if s.free() > 0 {
+        revents |= 0x0004; // POLLOUT
+    }
+    if revents != 0 {
+        syscall::send_nb(s.poll_notify_write, POLL_NOTIFY, revents as u64, 0);
+    }
+}
+
 #[unsafe(no_mangle)]
 fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let svc_port = if arg0 != 0 && arg0 != u64::MAX {
@@ -190,6 +235,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     continue;
                 }
 
+                let was_empty = s.len() == 0;
+
                 let mut tmp = [0u8; 16];
                 let b0 = msg.data[1].to_le_bytes();
                 let b1 = msg.data[3].to_le_bytes();
@@ -208,6 +255,11 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
                 // Wake blocked reader if any.
                 try_wake_reader(slot as u32);
+
+                // Notify poll subscriber on read end (empty → non-empty).
+                if was_empty && written > 0 {
+                    notify_poll_read(slot as u32);
+                }
             }
 
             PIPE_READ => {
@@ -224,11 +276,18 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     continue;
                 }
 
+                let was_full = s.free() == 0;
+
                 if s.len() > 0 {
                     let mut tmp = [0u8; 16];
                     let n = s.pop(&mut tmp);
                     let (w0, w1) = pack_bytes(&tmp, n);
                     let _ = syscall::reply(PIPE_OK, w0, w1, n as u64, 0, 0);
+
+                    // Notify poll subscriber on write end (full → has space).
+                    if was_full {
+                        notify_poll_write(slot as u32);
+                    }
                 } else if s.writer_closed {
                     let _ = syscall::reply(PIPE_EOF, 0, 0, 0, 0, 0);
                 } else {
@@ -264,9 +323,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     let _ = syscall::reply(PIPE_OK, 0, 0, 0, 0, 0);
                     // After replying, wake blocked reader so it sees EOF.
                     try_wake_reader(slot_idx as u32);
+                    // Notify read-end poll subscriber (POLLHUP).
+                    notify_poll_read(slot_idx as u32);
                 } else {
                     s.reader_closed = true;
                     let _ = syscall::reply(PIPE_OK, 0, 0, 0, 0, 0);
+                    // Notify write-end poll subscriber (POLLERR — broken pipe).
+                    notify_poll_write(slot_idx as u32);
                 }
 
                 // Re-read after potential reader-wake.
@@ -311,6 +374,57 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let rc = syscall::reply(PIPE_OK, revents as u64, 0, 0, 0, 0);
                 syscall::debug_puts(b"  [pipe] POLL reply rc=");
                 if rc == 0 { syscall::debug_puts(b"0\n"); } else { syscall::debug_puts(b"ERR\n"); }
+            }
+
+            POLL_SUBSCRIBE => {
+                // data[0] = pipe handle, data[1] = notify_port, data[2] = events
+                let handle = msg.data[0] as u32;
+                let notify_port = msg.data[1];
+                let is_write = handle & 1 != 0;
+                let slot_idx = (handle / 2) as usize;
+
+                if slot_idx >= MAX_PIPES {
+                    let _ = syscall::reply(PIPE_ERROR, 0, 0, 0, 0, 0);
+                    continue;
+                }
+                let s = unsafe { &mut PIPES[slot_idx] };
+                if !s.active {
+                    let _ = syscall::reply(PIPE_ERROR, 0, 0, 0, 0, 0);
+                    continue;
+                }
+
+                if is_write {
+                    s.poll_notify_write = notify_port;
+                } else {
+                    s.poll_notify_read = notify_port;
+                }
+
+                // Consume reply cap (harmless no-op for fire-and-forget sends).
+                let _ = syscall::reply(PIPE_OK, 0, 0, 0, 0, 0);
+
+                // If already ready, send immediate notification.
+                if is_write {
+                    notify_poll_write(slot_idx as u32);
+                } else {
+                    notify_poll_read(slot_idx as u32);
+                }
+            }
+
+            POLL_UNSUBSCRIBE => {
+                // data[0] = pipe handle, data[1] = notify_port
+                let handle = msg.data[0] as u32;
+                let is_write = handle & 1 != 0;
+                let slot_idx = (handle / 2) as usize;
+
+                if slot_idx < MAX_PIPES {
+                    let s = unsafe { &mut PIPES[slot_idx] };
+                    if is_write {
+                        s.poll_notify_write = u64::MAX;
+                    } else {
+                        s.poll_notify_read = u64::MAX;
+                    }
+                }
+                let _ = syscall::reply(PIPE_OK, 0, 0, 0, 0, 0);
             }
 
             _ => {

@@ -35,6 +35,10 @@ const UDS_GETPEERCRED: u64 = 0x8080;
 const UDS_POLL: u64 = 0x8090;
 const UDS_GETPEER: u64 = 0x80A0;
 
+const POLL_SUBSCRIBE: u64 = 0xF010;
+const POLL_UNSUBSCRIBE: u64 = 0xF020;
+const POLL_NOTIFY: u64 = 0xF030;
+
 const UDS_OK: u64 = 0x8100;
 const UDS_EOF: u64 = 0x81FF;
 const UDS_ERROR: u64 = 0x8F00;
@@ -77,6 +81,8 @@ struct UnixSocket {
     rx_eof: bool,
     // Blocked recv caller (call/reply cap from reply_take, 0 = none).
     recv_reply_cap: u64,
+    // Poll subscription: notify port for epoll (u64::MAX = none).
+    poll_notify_port: u64,
 }
 
 impl UnixSocket {
@@ -98,6 +104,7 @@ impl UnixSocket {
             rx_tail: 0,
             rx_eof: false,
             recv_reply_cap: 0,
+            poll_notify_port: u64::MAX,
         }
     }
 
@@ -231,6 +238,42 @@ fn try_wake_recv(sock_idx: u32) {
     }
 }
 
+/// Send POLL_NOTIFY to a socket's subscriber if readiness is non-zero.
+fn notify_poll(sock_idx: u32) {
+    let s = unsafe { &SOCKS[sock_idx as usize] };
+    if s.poll_notify_port == u64::MAX {
+        return;
+    }
+
+    // Compute current revents (same logic as UDS_POLL handler, with all events).
+    let mut revents = 0u16;
+    match s.state {
+        SockState::Listening => {
+            if s.pending_count > 0 {
+                revents |= 0x0001; // POLLIN
+            }
+        }
+        SockState::Connected => {
+            if s.rx_len() > 0 || s.rx_eof {
+                revents |= 0x0001; // POLLIN
+            }
+            if s.rx_eof && s.rx_len() == 0 {
+                revents |= 0x0010; // POLLHUP
+            }
+            // POLLOUT — always writable.
+            revents |= 0x0004; // POLLOUT
+        }
+        SockState::Closed => {
+            revents |= 0x0010; // POLLHUP
+        }
+        _ => {}
+    }
+
+    if revents != 0 {
+        syscall::send_nb(s.poll_notify_port, POLL_NOTIFY, revents as u64, 0);
+    }
+}
+
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let svc_port = syscall::port_create();
@@ -358,6 +401,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     if ls.pending_count < MAX_PENDING {
                         ls.pending[ls.pending_count] = srv_end;
                         ls.pending_count += 1;
+                        // Notify poll subscriber on listener (POLLIN for accept).
+                        notify_poll(listener);
                     } else {
                         // Queue full — reject.
                         unsafe {
@@ -446,6 +491,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 // Wake blocked recv on peer if any.
                 try_wake_recv(peer_idx);
+                // Notify poll subscriber on peer (new data = POLLIN).
+                notify_poll(peer_idx);
             }
 
             UDS_RECV => {
@@ -491,6 +538,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         peer.rx_eof = true;
                         // Wake blocked recv on peer.
                         try_wake_recv(peer_idx);
+                        // Notify poll subscriber on peer (POLLHUP).
+                        notify_poll(peer_idx);
                     }
                 }
 
@@ -580,6 +629,34 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     continue;
                 }
                 reply(UDS_OK, s.peer as u64, 0, 0, 0);
+            }
+
+            POLL_SUBSCRIBE => {
+                let handle = msg.data[0] as u32;
+                let notify_port = msg.data[1];
+                if handle as usize >= MAX_SOCKETS {
+                    // Consume reply cap (harmless no-op for fire-and-forget sends).
+                    let _ = syscall::reply_take();
+                    continue;
+                }
+                let s = unsafe { &mut SOCKS[handle as usize] };
+                s.poll_notify_port = notify_port;
+                // Consume reply cap (POLL_SUBSCRIBE is sent via SYS_SEND, no reply expected).
+                let _ = syscall::reply_take();
+                // Send immediate notification if already ready.
+                notify_poll(handle);
+            }
+
+            POLL_UNSUBSCRIBE => {
+                let handle = msg.data[0] as u32;
+                if handle as usize >= MAX_SOCKETS {
+                    let _ = syscall::reply_take();
+                    continue;
+                }
+                let s = unsafe { &mut SOCKS[handle as usize] };
+                s.poll_notify_port = u64::MAX;
+                // Consume reply cap.
+                let _ = syscall::reply_take();
             }
 
             _ => {

@@ -41,6 +41,10 @@ const PTY_POLL_OK: u64 = 0x9051;
 const PTY_EOF: u64 = 0x90FF;
 const PTY_ERROR: u64 = 0x9F00;
 
+const POLL_SUBSCRIBE: u64 = 0xF010;
+const POLL_UNSUBSCRIBE: u64 = 0xF020;
+const POLL_NOTIFY: u64 = 0xF030;
+
 // Ioctl requests.
 const TCGETS: u32 = 0x5401;
 const TCSETS: u32 = 0x5402;
@@ -144,6 +148,9 @@ struct PtyPair {
     slave_closed: bool,
     // EOF pending for slave.
     slave_eof: bool,
+    // Poll subscription ports (u64::MAX = no subscriber).
+    poll_notify_master: u64,
+    poll_notify_slave: u64,
 }
 
 impl PtyPair {
@@ -173,6 +180,8 @@ impl PtyPair {
             master_closed: false,
             slave_closed: false,
             slave_eof: false,
+            poll_notify_master: u64::MAX,
+            poll_notify_slave: u64::MAX,
         }
     }
 }
@@ -239,6 +248,42 @@ fn try_wake_slave(slot: usize) {
         let rp = p.slave_reader;
         p.slave_reader = NO_READER;
         reply(rp, PTY_EOF, 0, 0, 0, 0);
+    }
+}
+
+/// Send POLL_NOTIFY to the master-end subscriber if readable.
+fn notify_poll_master(slot: usize) {
+    let p = unsafe { &PTYS[slot] };
+    if p.poll_notify_master == u64::MAX {
+        return;
+    }
+    let mut revents: u16 = 0;
+    if p.s2m.len() > 0 {
+        revents |= 0x0001; // POLLIN
+    }
+    if p.slave_closed && p.s2m.len() == 0 {
+        revents |= 0x0010; // POLLHUP
+    }
+    if revents != 0 {
+        syscall::send_nb(p.poll_notify_master, POLL_NOTIFY, revents as u64, 0);
+    }
+}
+
+/// Send POLL_NOTIFY to the slave-end subscriber if readable.
+fn notify_poll_slave(slot: usize) {
+    let p = unsafe { &PTYS[slot] };
+    if p.poll_notify_slave == u64::MAX {
+        return;
+    }
+    let mut revents: u16 = 0;
+    if p.m2s.len() > 0 || p.slave_eof {
+        revents |= 0x0001; // POLLIN
+    }
+    if p.master_closed && p.m2s.len() == 0 {
+        revents |= 0x0010; // POLLHUP
+    }
+    if revents != 0 {
+        syscall::send_nb(p.poll_notify_slave, POLL_NOTIFY, revents as u64, 0);
     }
 }
 
@@ -433,6 +478,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         opost_output(slot, tmp[j]);
                     }
                     try_wake_master(slot);
+                    notify_poll_master(slot);
                 } else {
                     // Master writing → line discipline → m2s buffer.
                     for j in 0..len {
@@ -440,8 +486,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                     // Wake blocked slave reader if data available.
                     try_wake_slave(slot);
+                    notify_poll_slave(slot);
                     // Wake blocked master reader if echo data.
                     try_wake_master(slot);
+                    notify_poll_master(slot);
                 }
 
                 if reply_port != NO_READER {
@@ -516,9 +564,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if is_slave {
                     p.slave_closed = true;
                     try_wake_master(slot);
+                    notify_poll_master(slot);
                 } else {
                     p.master_closed = true;
                     try_wake_slave(slot);
+                    notify_poll_slave(slot);
                 }
 
                 if p.master_closed && p.slave_closed {
@@ -624,6 +674,54 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
                 reply(reply_port, PTY_POLL_OK, revents as u64, 0, 0, 0);
+            }
+
+            POLL_SUBSCRIBE => {
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as u32;
+                let notify_port = msg.data[1];
+                let is_slave = handle & 1 != 0;
+                let slot = (handle / 2) as usize;
+
+                if slot < MAX_PTYS {
+                    let p = unsafe { &mut PTYS[slot] };
+                    if p.active {
+                        if is_slave {
+                            p.poll_notify_slave = notify_port;
+                        } else {
+                            p.poll_notify_master = notify_port;
+                        }
+                    }
+                }
+                // Consume reply cap (harmless no-op for fire-and-forget).
+                if reply_port != 0 && reply_port != NO_READER {
+                    reply(reply_port, PTY_POLL_OK, 0, 0, 0, 0);
+                }
+                // Send immediate notification if already ready.
+                if slot < MAX_PTYS {
+                    if is_slave {
+                        notify_poll_slave(slot);
+                    } else {
+                        notify_poll_master(slot);
+                    }
+                }
+            }
+
+            POLL_UNSUBSCRIBE => {
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as u32;
+                let is_slave = handle & 1 != 0;
+                let slot = (handle / 2) as usize;
+
+                if slot < MAX_PTYS {
+                    let p = unsafe { &mut PTYS[slot] };
+                    if is_slave {
+                        p.poll_notify_slave = u64::MAX;
+                    } else {
+                        p.poll_notify_master = u64::MAX;
+                    }
+                }
+                if reply_port != 0 && reply_port != NO_READER {
+                    reply(reply_port, PTY_POLL_OK, 0, 0, 0, 0);
+                }
             }
 
             _ => {
