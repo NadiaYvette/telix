@@ -6146,6 +6146,33 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 193: Intel HDA audio controller ---
+    syscall::debug_puts(b"  init: Phase 193 Intel HDA audio...\n");
+    {
+        match syscall::ns_lookup(b"hda") {
+            Some(hda_port) => {
+                let rp = syscall::port_create();
+                syscall::send(hda_port, 0xA000, 0, 0, (rp as u64) << 32, 0);
+                match syscall::recv_msg_timeout(rp, 2_000_000) {
+                    Some(msg) => {
+                        if msg.tag == 0xA001 {
+                            syscall::debug_puts(b"Phase 193 HDA: PASSED\n");
+                        } else {
+                            syscall::debug_puts(b"Phase 193 HDA: FAILED (bad reply)\n");
+                        }
+                    }
+                    None => {
+                        syscall::debug_puts(b"Phase 193 HDA: FAILED (timeout)\n");
+                    }
+                }
+                syscall::port_destroy(rp);
+            }
+            None => {
+                syscall::debug_puts(b"Phase 193 HDA: SKIPPED (no hda server)\n");
+            }
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

@@ -82,6 +82,14 @@ if [ "${TELIX_USB:-}" = "1" ]; then
     )
 fi
 
+# Add Intel HDA audio device if TELIX_AUDIO=1.
+if [ "${TELIX_AUDIO:-}" = "1" ]; then
+    QEMU_ARGS+=(
+        -device intel-hda,id=hda0
+        -device hda-duplex,bus=hda0.0
+    )
+fi
+
 # Add virtio-net.
 # TELIX_NET=tap uses a TAP device (requires sudo setup, supports raw IP proto 132).
 # Default: SLIRP user-mode networking (no raw IP, but zero-config).

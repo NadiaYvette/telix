@@ -271,3 +271,7 @@ path = "bin/i915_srv.rs"
 [[bin]]
 name = "usb_srv"
 path = "bin/usb_srv.rs"
+
+[[bin]]
+name = "hda_srv"
+path = "bin/hda_srv.rs"
