@@ -367,6 +367,19 @@ const F_SETFD: u64 = 2;
 const F_GETFL: u64 = 3;
 const F_SETFL: u64 = 4;
 const F_DUPFD_CLOEXEC: u64 = 1030;
+const F_ADD_SEALS: u64 = 1033;
+const F_GET_SEALS: u64 = 1034;
+
+// memfd_create flags
+const MFD_CLOEXEC: u64 = 0x01;
+const MFD_ALLOW_SEALING: u64 = 0x02;
+
+// Memfd seal bits
+const F_SEAL_SEAL: u32 = 0x01;   // prevent further seals
+const F_SEAL_SHRINK: u32 = 0x02; // prevent ftruncate to smaller size
+const F_SEAL_GROW: u32 = 0x04;   // prevent ftruncate/write to larger size
+const F_SEAL_WRITE: u32 = 0x08;  // prevent writes
+const F_SEAL_FUTURE_WRITE: u32 = 0x10;
 
 // File descriptor flags
 const FD_CLOEXEC: u32 = 1;
@@ -713,13 +726,15 @@ const MAX_MEMFD_INSTANCES: usize = 16;
 #[derive(Clone, Copy)]
 struct MemFdSlot {
     active: bool,
-    va: usize,        // backing memory VA (0 = not allocated)
-    capacity: usize,  // allocated bytes (page-aligned)
-    size: usize,      // logical file size
+    va: usize,          // backing memory VA (0 = not allocated)
+    capacity: usize,    // allocated bytes (page-aligned)
+    size: usize,        // logical file size
+    seals: u32,         // active seal bits (F_SEAL_*)
+    allow_sealing: bool, // MFD_ALLOW_SEALING was set at creation
 }
 
 impl MemFdSlot {
-    const fn empty() -> Self { Self { active: false, va: 0, capacity: 0, size: 0 } }
+    const fn empty() -> Self { Self { active: false, va: 0, capacity: 0, size: 0, seals: 0, allow_sealing: false } }
 }
 
 static mut MEMFD_TABLE: [MemFdSlot; MAX_MEMFD_INSTANCES] = [const { MemFdSlot::empty() }; MAX_MEMFD_INSTANCES];
@@ -2189,6 +2204,46 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         return fd as u64;
     }
 
+    // /dev/shm — tmpfs-backed shared memory (glibc shm_open uses this).
+    // open("/dev/shm/name", O_RDWR|O_CREAT, ...) → MemFd-backed file.
+    if pathlen > 9 && &path[..9] == b"/dev/shm/" {
+        // Allocate a memfd slot for this shm file.
+        let slot_idx = unsafe {
+            let mut found = None;
+            for i in 0..MAX_MEMFD_INSTANCES {
+                if !MEMFD_TABLE[i].active {
+                    found = Some(i);
+                    break;
+                }
+            }
+            found
+        };
+        let slot_idx = match slot_idx {
+            Some(i) => i,
+            None => return linux_err(EMFILE),
+        };
+        let fd = match alloc_fd(pi) {
+            Some(f) => f,
+            None => return linux_err(EMFILE),
+        };
+        unsafe {
+            MEMFD_TABLE[slot_idx] = MemFdSlot::empty();
+            MEMFD_TABLE[slot_idx].active = true;
+            MEMFD_TABLE[slot_idx].allow_sealing = true; // shm_open files support sealing
+
+            PROC_TABLE[pi].fds[fd] = FdEntry::empty();
+            PROC_TABLE[pi].fds[fd].in_use = true;
+            PROC_TABLE[pi].fds[fd].kind = FdKind::MemFd;
+            PROC_TABLE[pi].fds[fd].handle = slot_idx as u64;
+            PROC_TABLE[pi].fds[fd].file_size = 0;
+            PROC_TABLE[pi].fds[fd].offset = 0;
+            if flags & 0x80000 != 0 { // O_CLOEXEC
+                PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+            }
+        }
+        return fd as u64;
+    }
+
     // /proc pseudo-filesystem — generate content on open.
     if pathlen >= 6 && &path[..6] == b"/proc/" {
         return open_proc_file(pi, caller_port, &path[..pathlen], flags);
@@ -2771,7 +2826,8 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         b"/proc" | b"/proc/" | b"/proc/self" | b"/proc/self/"
         | b"/proc/sys" | b"/proc/sys/" | b"/proc/sys/kernel" | b"/proc/sys/kernel/"
         | b"/dev" | b"/dev/" | b"/dev/dri" | b"/dev/dri/"
-        | b"/dev/input" | b"/dev/input/" => true,
+        | b"/dev/input" | b"/dev/input/"
+        | b"/dev/shm" | b"/dev/shm/" => true,
         _ => false,
     };
     if is_proc_dir {
@@ -4382,6 +4438,11 @@ fn handle_unlink_impl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let (path, pathlen) = resolve_path(pi, caller_port, path_va);
     if pathlen == 0 { return linux_err(EFAULT); }
 
+    // /dev/shm/* unlink — no-op success (shm_unlink).
+    if pathlen > 9 && &path[..9] == b"/dev/shm/" {
+        return 0;
+    }
+
     let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
     let d2 = plen;
     match syscall::call(vfs_port, VFS_UNLINK, w0, w1, d2, 0) {
@@ -4709,6 +4770,33 @@ fn handle_fcntl(pi: usize, args: &[u64; 6]) -> u64 {
                 None => linux_err(EMFILE),
             }
         }
+        F_GET_SEALS => unsafe {
+            if PROC_TABLE[pi].fds[fd].kind != FdKind::MemFd {
+                return linux_err(EINVAL);
+            }
+            let idx = PROC_TABLE[pi].fds[fd].handle as usize;
+            if idx >= MAX_MEMFD_INSTANCES || !MEMFD_TABLE[idx].active {
+                return linux_err(EBADF);
+            }
+            MEMFD_TABLE[idx].seals as u64
+        },
+        F_ADD_SEALS => unsafe {
+            if PROC_TABLE[pi].fds[fd].kind != FdKind::MemFd {
+                return linux_err(EINVAL);
+            }
+            let idx = PROC_TABLE[pi].fds[fd].handle as usize;
+            if idx >= MAX_MEMFD_INSTANCES || !MEMFD_TABLE[idx].active {
+                return linux_err(EBADF);
+            }
+            if !MEMFD_TABLE[idx].allow_sealing {
+                return linux_err(EPERM);
+            }
+            if MEMFD_TABLE[idx].seals & F_SEAL_SEAL != 0 {
+                return linux_err(EPERM); // sealed against further seals
+            }
+            MEMFD_TABLE[idx].seals |= arg as u32;
+            0
+        },
         _ => linux_err(EINVAL),
     }
 }
@@ -8231,7 +8319,9 @@ fn handle_timerfd_gettime(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 // ---- MemFd handlers ----
 
 /// memfd_create(name, flags) — NR 319
-fn handle_memfd_create(pi: usize, _caller_port: u64, _args: &[u64; 6]) -> u64 {
+fn handle_memfd_create(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
+    let flags = args[1];
+
     // Allocate table slot.
     let slot_idx = unsafe {
         let mut found = None;
@@ -8265,6 +8355,7 @@ fn handle_memfd_create(pi: usize, _caller_port: u64, _args: &[u64; 6]) -> u64 {
     unsafe {
         MEMFD_TABLE[slot_idx] = MemFdSlot::empty();
         MEMFD_TABLE[slot_idx].active = true;
+        MEMFD_TABLE[slot_idx].allow_sealing = (flags & MFD_ALLOW_SEALING) != 0;
 
         PROC_TABLE[pi].fds[fd] = FdEntry::empty();
         PROC_TABLE[pi].fds[fd].in_use = true;
@@ -8272,6 +8363,9 @@ fn handle_memfd_create(pi: usize, _caller_port: u64, _args: &[u64; 6]) -> u64 {
         PROC_TABLE[pi].fds[fd].handle = slot_idx as u64;
         PROC_TABLE[pi].fds[fd].file_size = 0;
         PROC_TABLE[pi].fds[fd].offset = 0;
+        if (flags & MFD_CLOEXEC) != 0 {
+            PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+        }
     }
 
     fd as u64
