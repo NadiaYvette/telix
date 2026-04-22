@@ -324,6 +324,32 @@ const FB_FLIP: u64      = 0x8004;
 #[allow(dead_code)]
 const FB_FLIP_OK: u64   = 0x8005;
 
+// --- Evdev input device constants ---
+// input_srv IPC protocol tags.
+const INPUT_SUBSCRIBE: u64    = 0x9000;
+const INPUT_SUBSCRIBE_OK: u64 = 0x9001;
+const INPUT_EVENT: u64        = 0x9002;
+
+// input_srv event types (packed in data[0] low byte).
+const INEVT_KEY_DOWN: u8    = 1;
+const INEVT_KEY_UP: u8      = 2;
+const INEVT_MOUSE_MOVE: u8  = 3;
+const INEVT_MOUSE_BUTTON: u8 = 4;
+
+// Linux evdev event types.
+const EV_SYN: u16 = 0x00;
+const EV_KEY: u16 = 0x01;
+const EV_REL: u16 = 0x02;
+
+// Linux REL axis codes.
+const REL_X: u16 = 0x00;
+const REL_Y: u16 = 0x01;
+
+// Linux button codes.
+const BTN_LEFT: u16   = 0x110;
+const BTN_RIGHT: u16  = 0x111;
+const BTN_MIDDLE: u16 = 0x112;
+
 // Socket address families
 const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
@@ -477,6 +503,7 @@ enum FdKind {
     DevTty,
     ProcBuf, // /proc pseudo-file with content in PROCBUF_TABLE
     Drm,     // /dev/dri/card0 — DRM/KMS virtual device
+    Evdev,   // /dev/input/event* — evdev input device (handle=0 kbd, 1 mouse)
 }
 
 #[derive(Clone, Copy)]
@@ -778,6 +805,80 @@ static mut DRM_STATE: DrmState = DrmState {
     reply_port: 0,
 };
 
+// --- Evdev ring buffer and state ---
+const EVDEV_RING_SIZE: usize = 64;
+const EVDEV_EVENT_SIZE: usize = 24; // sizeof(struct input_event)
+
+#[derive(Clone, Copy)]
+struct EvdevRing {
+    events: [[u8; EVDEV_EVENT_SIZE]; EVDEV_RING_SIZE],
+    head: usize,
+    tail: usize,
+    count: usize,
+}
+
+impl EvdevRing {
+    const fn empty() -> Self {
+        Self {
+            events: [[0u8; EVDEV_EVENT_SIZE]; EVDEV_RING_SIZE],
+            head: 0,
+            tail: 0,
+            count: 0,
+        }
+    }
+    fn push(&mut self, ev: &[u8; EVDEV_EVENT_SIZE]) {
+        self.events[self.head] = *ev;
+        self.head = (self.head + 1) % EVDEV_RING_SIZE;
+        if self.count < EVDEV_RING_SIZE {
+            self.count += 1;
+        } else {
+            self.tail = (self.tail + 1) % EVDEV_RING_SIZE; // overwrite oldest
+        }
+    }
+    fn pop(&mut self) -> Option<[u8; EVDEV_EVENT_SIZE]> {
+        if self.count == 0 { return None; }
+        let ev = self.events[self.tail];
+        self.tail = (self.tail + 1) % EVDEV_RING_SIZE;
+        self.count -= 1;
+        Some(ev)
+    }
+}
+
+/// Push an event into an EvdevRing via raw pointer (avoids &mut static ref).
+unsafe fn evdev_ring_push(ring: *mut EvdevRing, ev: &[u8; EVDEV_EVENT_SIZE]) {
+    let h = (*ring).head;
+    (*ring).events[h] = *ev;
+    (*ring).head = (h + 1) % EVDEV_RING_SIZE;
+    if (*ring).count < EVDEV_RING_SIZE {
+        (*ring).count += 1;
+    } else {
+        (*ring).tail = ((*ring).tail + 1) % EVDEV_RING_SIZE;
+    }
+}
+
+/// Pop an event from an EvdevRing via raw pointer (avoids &mut static ref).
+unsafe fn evdev_ring_pop(ring: *mut EvdevRing) -> Option<[u8; EVDEV_EVENT_SIZE]> {
+    if (*ring).count == 0 { return None; }
+    let ev = (*ring).events[(*ring).tail];
+    (*ring).tail = ((*ring).tail + 1) % EVDEV_RING_SIZE;
+    (*ring).count -= 1;
+    Some(ev)
+}
+
+struct EvdevState {
+    initialized: bool,
+    sub_port: u64,        // subscription port for input_srv events
+    prev_buttons: u8,     // previous mouse button state for edge detection
+}
+
+static mut EVDEV_STATE: EvdevState = EvdevState {
+    initialized: false,
+    sub_port: 0,
+    prev_buttons: 0,
+};
+static mut EVDEV_KBD_RING: EvdevRing = EvdevRing::empty();
+static mut EVDEV_MOUSE_RING: EvdevRing = EvdevRing::empty();
+
 // SCM_RIGHTS: pending FD transfers over UDS
 const MAX_PENDING_FD_TRANSFERS: usize = 16;
 const MAX_FDS_PER_TRANSFER: usize = 4;
@@ -1017,7 +1118,7 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         if dk == FdKind::DevNull || dk == FdKind::DevZero || dk == FdKind::DevUrandom {
             return count as u64;
         }
-        if dk == FdKind::Drm {
+        if dk == FdKind::Drm || dk == FdKind::Evdev {
             return linux_err(EINVAL);
         }
         if dk == FdKind::DevTty {
@@ -1221,6 +1322,32 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     }
     if kind == FdKind::Drm {
         return linux_err(EAGAIN); // No pending DRM events
+    }
+    if kind == FdKind::Evdev {
+        unsafe {
+            evdev_poll_events();
+            let dev = handle as usize;
+            let ring = if dev == 0 {
+                core::ptr::addr_of_mut!(EVDEV_KBD_RING)
+            } else {
+                core::ptr::addr_of_mut!(EVDEV_MOUSE_RING)
+            };
+            let max_events = count / EVDEV_EVENT_SIZE;
+            if max_events == 0 { return linux_err(EINVAL); }
+            let mut total = 0usize;
+            for _ in 0..max_events {
+                match evdev_ring_pop(ring) {
+                    Some(ev) => {
+                        let written = syscall::personality_copy_out(caller_port, buf_va + total, &ev);
+                        if written == 0 { break; }
+                        total += EVDEV_EVENT_SIZE;
+                    }
+                    None => break,
+                }
+            }
+            if total == 0 { return linux_err(EAGAIN); }
+            return total as u64;
+        }
     }
     if kind == FdKind::ProcBuf {
         let idx = handle as usize;
@@ -2038,6 +2165,8 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         b"/dev/urandom" | b"/dev/random" => Some(FdKind::DevUrandom),
         b"/dev/tty" | b"/dev/console" => Some(FdKind::DevTty),
         b"/dev/dri/card0" | b"/dev/dri/renderD128" => Some(FdKind::Drm),
+        b"/dev/input/event0" => Some(FdKind::Evdev),
+        b"/dev/input/event1" => Some(FdKind::Evdev),
         _ => None,
     };
     if let Some(kind) = dev_kind {
@@ -2049,6 +2178,12 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
             PROC_TABLE[pi].fds[fd].kind = kind;
             if flags & 0x80000 != 0 { // O_CLOEXEC
                 PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+            }
+            // For evdev: handle=0 keyboard, handle=1 mouse.
+            if kind == FdKind::Evdev {
+                let dev_num: u64 = if &path[..pathlen] == b"/dev/input/event1" { 1 } else { 0 };
+                PROC_TABLE[pi].fds[fd].handle = dev_num;
+                evdev_ensure_init();
             }
         }
         return fd as u64;
@@ -2502,7 +2637,8 @@ fn do_close(pi: usize, fd: usize) {
                     MEMFD_TABLE[idx] = MemFdSlot::empty();
                 }
             }
-            FdKind::DevNull | FdKind::DevZero | FdKind::DevUrandom | FdKind::DevTty => {}
+            FdKind::DevNull | FdKind::DevZero | FdKind::DevUrandom | FdKind::DevTty
+            | FdKind::Evdev => {}
             FdKind::Drm => {
                 // Free all dumb buffers and framebuffers (single-user device).
                 let ps = syscall::page_size();
@@ -2615,6 +2751,8 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         b"/dev/tty" | b"/dev/console" => Some((5 << 8) | 0),
         b"/dev/dri/card0" => Some((226 << 8) | 0),
         b"/dev/dri/renderD128" => Some((226 << 8) | 128),
+        b"/dev/input/event0" => Some((13 << 8) | 64),
+        b"/dev/input/event1" => Some((13 << 8) | 65),
         _ => None,
     };
     if let Some(rdev) = dev_rdev {
@@ -2632,7 +2770,8 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
     let is_proc_dir = match &path[..pathlen] {
         b"/proc" | b"/proc/" | b"/proc/self" | b"/proc/self/"
         | b"/proc/sys" | b"/proc/sys/" | b"/proc/sys/kernel" | b"/proc/sys/kernel/"
-        | b"/dev" | b"/dev/" | b"/dev/dri" | b"/dev/dri/" => true,
+        | b"/dev" | b"/dev/" | b"/dev/dri" | b"/dev/dri/"
+        | b"/dev/input" | b"/dev/input/" => true,
         _ => false,
     };
     if is_proc_dir {
@@ -2755,7 +2894,7 @@ fn handle_fstat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         // Virtual device fstat — report as character device.
         let dk = PROC_TABLE[pi].fds[fd].kind;
         if dk == FdKind::DevNull || dk == FdKind::DevZero || dk == FdKind::DevUrandom
-            || dk == FdKind::DevTty || dk == FdKind::Drm {
+            || dk == FdKind::DevTty || dk == FdKind::Drm || dk == FdKind::Evdev {
             let mut stat_buf = [0u8; 144];
             let mode: u32 = 0o020666; // S_IFCHR | 0666
             stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
@@ -2765,6 +2904,7 @@ fn handle_fstat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                 FdKind::DevUrandom => (1 << 8) | 9,
                 FdKind::DevTty => (5 << 8) | 0, // /dev/tty = 5:0
                 FdKind::Drm => (226 << 8) | 0, // /dev/dri/card0 = 226:0
+                FdKind::Evdev => (13 << 8) | (64 + PROC_TABLE[pi].fds[fd].handle), // 13:64+dev
                 _ => 0,
             };
             stat_buf[40..48].copy_from_slice(&rdev.to_le_bytes());
@@ -4574,6 +4714,242 @@ fn handle_fcntl(pi: usize, args: &[u64; 6]) -> u64 {
 }
 
 // ============================================================
+// Evdev input device compatibility layer
+// ============================================================
+
+/// Pack a single struct input_event (24 bytes).
+fn evdev_pack_event(ev_type: u16, code: u16, value: i32) -> [u8; EVDEV_EVENT_SIZE] {
+    let mut buf = [0u8; EVDEV_EVENT_SIZE];
+    let ns = syscall::clock_gettime();
+    let secs = (ns / 1_000_000_000) as i64;
+    let usecs = ((ns % 1_000_000_000) / 1_000) as i64;
+    buf[0..8].copy_from_slice(&secs.to_le_bytes());
+    buf[8..16].copy_from_slice(&usecs.to_le_bytes());
+    buf[16..18].copy_from_slice(&ev_type.to_le_bytes());
+    buf[18..20].copy_from_slice(&code.to_le_bytes());
+    buf[20..24].copy_from_slice(&value.to_le_bytes());
+    buf
+}
+
+/// Subscribe to input_srv on first evdev open.
+fn evdev_ensure_init() -> bool {
+    unsafe {
+        if EVDEV_STATE.initialized { return true; }
+        let input_port = match syscall::ns_lookup(b"input") {
+            Some(p) => p,
+            None => return false,
+        };
+        EVDEV_STATE.sub_port = syscall::port_create();
+        syscall::send(input_port, INPUT_SUBSCRIBE, EVDEV_STATE.sub_port, 0, 0, 0);
+        // Wait for ack (with timeout).
+        for _ in 0..500 {
+            if let Some(m) = syscall::recv_nb_msg(EVDEV_STATE.sub_port) {
+                if m.tag == INPUT_SUBSCRIBE_OK { break; }
+            }
+            syscall::yield_now();
+        }
+        EVDEV_STATE.initialized = true;
+        syscall::debug_puts(b"[evdev] subscribed to input_srv\n");
+        true
+    }
+}
+
+/// Drain pending input_srv events into the evdev ring buffers.
+fn evdev_poll_events() {
+    unsafe {
+        if !EVDEV_STATE.initialized { return; }
+        // Drain up to 32 messages per poll to avoid stalling.
+        for _ in 0..32 {
+            let msg = match syscall::recv_nb_msg(EVDEV_STATE.sub_port) {
+                Some(m) => m,
+                None => break,
+            };
+            if msg.tag != INPUT_EVENT { continue; }
+            let d0 = msg.data[0];
+            let extra = msg.data[1];
+            let event_type = (d0 & 0xFF) as u8;
+            let keycode = ((d0 >> 8) & 0xFF) as u8;
+
+            let kbd = core::ptr::addr_of_mut!(EVDEV_KBD_RING);
+            let mouse = core::ptr::addr_of_mut!(EVDEV_MOUSE_RING);
+            match event_type {
+                INEVT_KEY_DOWN => {
+                    // PS/2 scancode set 1 make code == Linux KEY_* code.
+                    let ev = evdev_pack_event(EV_KEY, keycode as u16, 1);
+                    evdev_ring_push(kbd, &ev);
+                    let syn = evdev_pack_event(EV_SYN, 0, 0);
+                    evdev_ring_push(kbd, &syn);
+                }
+                INEVT_KEY_UP => {
+                    let ev = evdev_pack_event(EV_KEY, keycode as u16, 0);
+                    evdev_ring_push(kbd, &ev);
+                    let syn = evdev_pack_event(EV_SYN, 0, 0);
+                    evdev_ring_push(kbd, &syn);
+                }
+                INEVT_MOUSE_MOVE => {
+                    let dx = extra as u16 as i16;
+                    let dy = (extra >> 16) as u16 as i16;
+                    if dx != 0 {
+                        let ev = evdev_pack_event(EV_REL, REL_X, dx as i32);
+                        evdev_ring_push(mouse, &ev);
+                    }
+                    if dy != 0 {
+                        // PS/2 Y is inverted vs evdev convention.
+                        let ev = evdev_pack_event(EV_REL, REL_Y, -(dy as i32));
+                        evdev_ring_push(mouse, &ev);
+                    }
+                    if dx != 0 || dy != 0 {
+                        let syn = evdev_pack_event(EV_SYN, 0, 0);
+                        evdev_ring_push(mouse, &syn);
+                    }
+                }
+                INEVT_MOUSE_BUTTON => {
+                    let buttons = extra as u8;
+                    let prev = EVDEV_STATE.prev_buttons;
+                    // Emit press/release events for each changed button.
+                    if (buttons ^ prev) & 0x01 != 0 {
+                        let ev = evdev_pack_event(EV_KEY, BTN_LEFT, if buttons & 0x01 != 0 { 1 } else { 0 });
+                        evdev_ring_push(mouse, &ev);
+                    }
+                    if (buttons ^ prev) & 0x02 != 0 {
+                        let ev = evdev_pack_event(EV_KEY, BTN_RIGHT, if buttons & 0x02 != 0 { 1 } else { 0 });
+                        evdev_ring_push(mouse, &ev);
+                    }
+                    if (buttons ^ prev) & 0x04 != 0 {
+                        let ev = evdev_pack_event(EV_KEY, BTN_MIDDLE, if buttons & 0x04 != 0 { 1 } else { 0 });
+                        evdev_ring_push(mouse, &ev);
+                    }
+                    if buttons != prev {
+                        let syn = evdev_pack_event(EV_SYN, 0, 0);
+                        evdev_ring_push(mouse, &syn);
+                    }
+                    EVDEV_STATE.prev_buttons = buttons;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Set bit `n` in a byte array (bitmap).
+fn evdev_set_bit(buf: &mut [u8], n: usize) {
+    let byte_idx = n / 8;
+    let bit_idx = n % 8;
+    if byte_idx < buf.len() {
+        buf[byte_idx] |= 1 << bit_idx;
+    }
+}
+
+/// Handle evdev ioctls. `dev` = 0 for keyboard, 1 for mouse.
+fn handle_evdev_ioctl(dev: usize, caller_port: u64, request: u64, arg_va: usize) -> u64 {
+    if !evdev_ensure_init() { return linux_err(ENODEV); }
+
+    // Match on low 16 bits to handle variable size encoding in EVIOCGBIT.
+    let req_lo = request & 0xFFFF;
+
+    // EVIOCGVERSION = 0x4501
+    if req_lo == 0x4501 {
+        let ver: u32 = 0x01_00_01; // 1.0.1
+        syscall::personality_copy_out(caller_port, arg_va, &ver.to_le_bytes());
+        return 0;
+    }
+
+    // EVIOCGID = 0x4502 — struct input_id (8 bytes: bustype, vendor, product, version)
+    if req_lo == 0x4502 {
+        let mut id = [0u8; 8];
+        id[0..2].copy_from_slice(&0x11u16.to_le_bytes()); // BUS_I8042
+        // vendor = 0, product = dev as u16
+        id[4..6].copy_from_slice(&(dev as u16).to_le_bytes());
+        id[6..8].copy_from_slice(&1u16.to_le_bytes()); // version
+        syscall::personality_copy_out(caller_port, arg_va, &id);
+        return 0;
+    }
+
+    // EVIOCGNAME = 0x4506 — device name string
+    if req_lo == 0x4506 {
+        let name: &[u8] = if dev == 0 { b"Telix PS/2 Keyboard\0" } else { b"Telix PS/2 Mouse\0" };
+        let max_len = ((request >> 16) & 0x3FFF) as usize;
+        let copy_len = name.len().min(max_len);
+        if copy_len > 0 {
+            syscall::personality_copy_out(caller_port, arg_va, &name[..copy_len]);
+        }
+        return (copy_len as i64 - 1).max(0) as u64; // Return string length (excluding NUL).
+    }
+
+    // EVIOCGBIT family: 0x4520 + ev_type
+    if req_lo >= 0x4520 && req_lo < 0x4560 {
+        let ev_type = (req_lo - 0x4520) as u16;
+        let max_len = ((request >> 16) & 0x3FFF) as usize;
+        let max_len = max_len.min(128); // sanity cap
+        let mut bits = [0u8; 128];
+
+        match (dev, ev_type) {
+            // EV type bitmap (which event types this device supports).
+            (0, 0) => {
+                // Keyboard: EV_SYN + EV_KEY
+                evdev_set_bit(&mut bits, EV_SYN as usize);
+                evdev_set_bit(&mut bits, EV_KEY as usize);
+            }
+            (1, 0) => {
+                // Mouse: EV_SYN + EV_KEY + EV_REL
+                evdev_set_bit(&mut bits, EV_SYN as usize);
+                evdev_set_bit(&mut bits, EV_KEY as usize);
+                evdev_set_bit(&mut bits, EV_REL as usize);
+            }
+            // EV_KEY capability bitmap.
+            (0, 1) => {
+                // Keyboard keys: ESC(1) through F12(88), plus common keys.
+                for k in 1..=58 { evdev_set_bit(&mut bits, k); }  // ESC..CAPSLOCK
+                for k in 59..=88 { evdev_set_bit(&mut bits, k); } // F1..F12+extras
+                evdev_set_bit(&mut bits, 96);  // KEY_KPENTER
+                evdev_set_bit(&mut bits, 97);  // KEY_RIGHTCTRL
+                evdev_set_bit(&mut bits, 100); // KEY_RIGHTALT
+                evdev_set_bit(&mut bits, 102); // KEY_HOME
+                evdev_set_bit(&mut bits, 103); // KEY_UP
+                evdev_set_bit(&mut bits, 105); // KEY_LEFT
+                evdev_set_bit(&mut bits, 106); // KEY_RIGHT
+                evdev_set_bit(&mut bits, 108); // KEY_DOWN
+                evdev_set_bit(&mut bits, 111); // KEY_DELETE
+            }
+            (1, 1) => {
+                // Mouse buttons.
+                evdev_set_bit(&mut bits, BTN_LEFT as usize);
+                evdev_set_bit(&mut bits, BTN_RIGHT as usize);
+                evdev_set_bit(&mut bits, BTN_MIDDLE as usize);
+            }
+            // EV_REL capability bitmap.
+            (1, 2) => {
+                evdev_set_bit(&mut bits, REL_X as usize);
+                evdev_set_bit(&mut bits, REL_Y as usize);
+            }
+            _ => {} // Unknown ev_type or unsupported: return zeroes.
+        }
+
+        let out_len = max_len.min(bits.len());
+        if out_len > 0 {
+            syscall::personality_copy_out(caller_port, arg_va, &bits[..out_len]);
+        }
+        return 0;
+    }
+
+    // EVIOCGRAB = 0x4590 — exclusive grab (no-op, always succeed)
+    if req_lo == 0x4590 { return 0; }
+
+    // EVIOCGPROP = 0x4509 — input properties (return empty)
+    if req_lo == 0x4509 {
+        let max_len = ((request >> 16) & 0x3FFF) as usize;
+        let zeros = [0u8; 8];
+        let out_len = max_len.min(zeros.len());
+        if out_len > 0 {
+            syscall::personality_copy_out(caller_port, arg_va, &zeros[..out_len]);
+        }
+        return 0;
+    }
+
+    linux_err(ENOTTY)
+}
+
+// ============================================================
 // DRM/KMS compatibility layer
 // ============================================================
 
@@ -5205,11 +5581,15 @@ fn handle_ioctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             0
         }
         _ => {
-            // Route DRM ioctls to the DRM handler if fd is a DRM device.
+            // Route DRM/evdev ioctls to their handlers.
             if fd < MAX_FDS {
                 unsafe {
                     if PROC_TABLE[pi].fds[fd].kind == FdKind::Drm {
                         return handle_drm_ioctl(caller_port, request, args[2] as usize);
+                    }
+                    if PROC_TABLE[pi].fds[fd].kind == FdKind::Evdev {
+                        let dev = PROC_TABLE[pi].fds[fd].handle as usize;
+                        return handle_evdev_ioctl(dev, caller_port, request, args[2] as usize);
                     }
                 }
             }
@@ -7289,6 +7669,14 @@ fn poll_single_fd(pi: usize, fd: usize) -> u32 {
             FdKind::DevZero | FdKind::DevUrandom => EPOLLIN | EPOLLOUT,
             FdKind::DevTty => EPOLLOUT, // writable, reads would block
             FdKind::Drm => EPOLLOUT, // page flip always accepted
+            FdKind::Evdev => {
+                unsafe {
+                    evdev_poll_events();
+                    let dev = PROC_TABLE[pi].fds[fd].handle as usize;
+                    let cnt = if dev == 0 { EVDEV_KBD_RING.count } else { EVDEV_MOUSE_RING.count };
+                    if cnt > 0 { EPOLLIN } else { 0 }
+                }
+            }
             FdKind::ProcBuf => EPOLLIN, // readable synthetic file
             _ => EPOLLERR,
         }
