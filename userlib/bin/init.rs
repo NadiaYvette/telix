@@ -6099,6 +6099,53 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 192: USB xHCI host controller ---
+    syscall::debug_puts(b"  init: Phase 192 USB xHCI controller...\n");
+    {
+        match syscall::ns_lookup(b"usb") {
+            Some(usb_port) => {
+                // Send USB_LIST_DEVICES (0x9000).
+                let rp = syscall::port_create();
+                syscall::send(usb_port, 0x9000, 0, 0, (rp as u64) << 32, 0);
+                match syscall::recv_msg_timeout(rp, 2_000_000) {
+                    Some(msg) => {
+                        if msg.tag == 0x9001 {
+                            syscall::debug_puts(b"Phase 192 USB: PASSED (");
+                            let dev_count = msg.data[0];
+                            // Print device count
+                            if dev_count == 0 {
+                                syscall::debug_putchar(b'0');
+                            } else {
+                                let mut buf = [0u8; 4];
+                                let mut v = dev_count;
+                                let mut i = 0;
+                                while v > 0 {
+                                    buf[i] = b'0' + (v % 10) as u8;
+                                    v /= 10;
+                                    i += 1;
+                                }
+                                while i > 0 {
+                                    i -= 1;
+                                    syscall::debug_putchar(buf[i]);
+                                }
+                            }
+                            syscall::debug_puts(b" devices)\n");
+                        } else {
+                            syscall::debug_puts(b"Phase 192 USB: FAILED (bad reply)\n");
+                        }
+                    }
+                    None => {
+                        syscall::debug_puts(b"Phase 192 USB: FAILED (timeout)\n");
+                    }
+                }
+                syscall::port_destroy(rp);
+            }
+            None => {
+                syscall::debug_puts(b"Phase 192 USB: SKIPPED (no usb server)\n");
+            }
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

@@ -712,3 +712,108 @@ pub fn find_i915_device() -> Option<I915Device> {
     }
     None
 }
+
+/// Discovered xHCI USB host controller.
+pub struct XhciDevice {
+    pub bus: u8,
+    pub device: u8,
+    pub func: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    /// BAR0 MMIO base address (64-bit).
+    pub bar0: u64,
+    /// BAR0 region size.
+    pub bar0_size: u64,
+    /// PCI interrupt line.
+    pub irq: u8,
+}
+
+/// Scan PCI buses 0-7 for an xHCI USB host controller.
+/// xHCI: class 0x0C (serial bus), subclass 0x03 (USB), prog-if 0x30 (xHCI).
+/// Reads the 64-bit BAR0 (MMIO registers), enables bus mastering + memory space.
+pub fn find_xhci_device() -> Option<XhciDevice> {
+    for bus in 0..8u8 {
+        for dev in 0..32u8 {
+            for func in 0..8u8 {
+                let reg0 = pci_config_read32(bus, dev, func, 0);
+                let vendor = reg0 as u16;
+                let did = (reg0 >> 16) as u16;
+                if vendor == 0xFFFF || vendor == 0 {
+                    if func == 0 {
+                        break;
+                    }
+                    continue;
+                }
+
+                // Check class: 0x0C (serial bus), subclass 0x03 (USB), prog-if 0x30 (xHCI).
+                let class_reg = pci_config_read32(bus, dev, func, 0x08);
+                let class_code = (class_reg >> 8) & 0xFF_FFFF;
+                if class_code != 0x0C_03_30 {
+                    if func == 0 {
+                        let hdr = pci_config_read32(bus, dev, 0, 0x0C);
+                        if (hdr >> 16) & 0x80 == 0 {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                // Read 64-bit BAR0.
+                let bar0_lo = pci_config_read32(bus, dev, func, 0x10);
+                if bar0_lo & 1 != 0 {
+                    continue; // I/O BAR, skip
+                }
+                let bar_type = (bar0_lo >> 1) & 3;
+                if bar_type != 2 {
+                    continue; // not 64-bit
+                }
+                let bar0_hi = pci_config_read32(bus, dev, func, 0x14);
+                let bar0 = ((bar0_hi as u64) << 32) | ((bar0_lo & !0xF) as u64);
+                if bar0 == 0 {
+                    continue;
+                }
+
+                // Probe BAR0 size.
+                let bar0_size = {
+                    pci_config_write32(bus, dev, func, 0x10, 0xFFFF_FFFF);
+                    let size_lo = pci_config_read32(bus, dev, func, 0x10);
+                    pci_config_write32(bus, dev, func, 0x10, bar0_lo);
+                    pci_config_write32(bus, dev, func, 0x14, 0xFFFF_FFFF);
+                    let size_hi = pci_config_read32(bus, dev, func, 0x14);
+                    pci_config_write32(bus, dev, func, 0x14, bar0_hi);
+                    let mask = ((size_hi as u64) << 32) | ((size_lo & !0xF) as u64);
+                    if mask == 0 {
+                        0x1_0000 // default 64 KiB
+                    } else {
+                        (!mask).wrapping_add(1)
+                    }
+                };
+
+                let irq = pci_config_read32(bus, dev, func, 0x3C) as u8;
+
+                // Enable bus mastering + memory space.
+                let cmd = pci_config_read16(bus, dev, func, 0x04);
+                if cmd & 0x06 != 0x06 {
+                    pci_config_write16(bus, dev, func, 0x04, cmd | 0x06);
+                }
+
+                crate::println!(
+                    "  PCI: xHCI USB {:04x}:{:04x} at {}.{}.{} BAR0={:#x} size={:#x} IRQ={}",
+                    vendor, did, bus, dev, func, bar0, bar0_size, irq
+                );
+
+                return Some(XhciDevice {
+                    bus,
+                    device: dev,
+                    func,
+                    vendor_id: vendor,
+                    device_id: did,
+                    bar0,
+                    bar0_size,
+                    irq,
+                });
+            }
+        }
+    }
+    None
+}

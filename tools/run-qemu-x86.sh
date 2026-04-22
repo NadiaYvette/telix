@@ -73,6 +73,15 @@ if [ "${TELIX_NVME:-}" = "1" ] && [ -f "$DISK_IMG" ]; then
     )
 fi
 
+# Add USB xHCI controller + devices if TELIX_USB=1.
+if [ "${TELIX_USB:-}" = "1" ]; then
+    QEMU_ARGS+=(
+        -device qemu-xhci,id=xhci0
+        -device usb-kbd,bus=xhci0.0
+        -device usb-mouse,bus=xhci0.0
+    )
+fi
+
 # Add virtio-net.
 # TELIX_NET=tap uses a TAP device (requires sudo setup, supports raw IP proto 132).
 # Default: SLIRP user-mode networking (no raw IP, but zero-config).

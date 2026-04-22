@@ -382,6 +382,26 @@ fn startup_thread() -> ! {
             }
         }
 
+        // xHCI USB host controller discovery and usb_srv spawn.
+        if let Some(xhci) = arch::x86_64::pci::find_xhci_device() {
+            let region_id = cap::mmio::register_region(
+                xhci.bar0 as usize,
+                xhci.bar0_size as usize,
+                cap::mmio::CacheAttr::Device,
+            );
+            let arg0_upper = (xhci.irq as u64) << 48;
+            let spawned = match region_id {
+                Some(rid) => {
+                    sched::spawn_user_with_mmio_cap(b"usb_srv", 50, 20, arg0_upper, rid)
+                }
+                None => sched::spawn_user(b"usb_srv", 50, 20, arg0_upper),
+            };
+            match spawned {
+                Some(tid) => println!("  usb_srv spawned (thread {})", tid),
+                None => println!("  WARNING: usb_srv not found (ok if not yet built)"),
+            }
+        }
+
         // Discover virtio-GPU and encode bar0+irq for fb_srv arg0.
         let mut fb_arg0_upper: u64 = 0;
         if let Some(vgpu) = arch::x86_64::pci::find_virtio_gpu() {
