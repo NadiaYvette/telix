@@ -283,6 +283,46 @@ const ECONNREFUSED: u64 = 111;
 const EOPNOTSUPP: u64 = 95;
 const ENOPROTOOPT: u64 = 92;
 const ENAMETOOLONG: u64 = 36;
+const ENODEV: u64 = 19;
+
+// --- DRM/KMS ioctl constants ---
+// Ioctl numbers use Linux x86_64 _IOWR encoding, type byte 0x64 ('d').
+const DRM_IOCTL_VERSION: u64           = 0xC040_6400;
+const DRM_IOCTL_GET_CAP: u64          = 0xC010_640C;
+const DRM_IOCTL_SET_MASTER: u64       = 0x0000_641E;
+const DRM_IOCTL_DROP_MASTER: u64      = 0x0000_641F;
+const DRM_IOCTL_MODE_GETRESOURCES: u64 = 0xC040_64A0;
+const DRM_IOCTL_MODE_GETCRTC: u64     = 0xC068_64A1;
+const DRM_IOCTL_MODE_SETCRTC: u64     = 0xC068_64A2;
+const DRM_IOCTL_MODE_GETENCODER: u64  = 0xC014_64A6;
+const DRM_IOCTL_MODE_GETCONNECTOR: u64 = 0xC050_64A7;
+const DRM_IOCTL_MODE_ADDFB: u64       = 0xC044_64AE;
+const DRM_IOCTL_MODE_RMFB: u64        = 0xC004_64AF;
+const DRM_IOCTL_MODE_PAGE_FLIP: u64   = 0xC010_64B0;
+const DRM_IOCTL_MODE_CREATE_DUMB: u64 = 0xC020_64B2;
+const DRM_IOCTL_MODE_MAP_DUMB: u64    = 0xC010_64B3;
+const DRM_IOCTL_MODE_DESTROY_DUMB: u64 = 0xC004_64B4;
+
+const DRM_CAP_DUMB_BUFFER: u64        = 0x1;
+#[allow(dead_code)]
+const DRM_CAP_PRIME: u64              = 0x5;
+const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 0x6;
+#[allow(dead_code)]
+const DRM_CAP_ASYNC_PAGE_FLIP: u64    = 0x7;
+
+// Virtual hardware IDs for the single display pipeline.
+const DRM_CRTC_ID: u32     = 1;
+const DRM_ENCODER_ID: u32  = 1;
+const DRM_CONNECTOR_ID: u32 = 1;
+
+// fb_srv IPC protocol tags (re-declared for drm_ensure_init).
+const FB_GET_INFO: u64  = 0x8000;
+const FB_GET_INFO_OK: u64 = 0x8001;
+const FB_MAP: u64       = 0x8002;
+const FB_MAP_OK: u64    = 0x8003;
+const FB_FLIP: u64      = 0x8004;
+#[allow(dead_code)]
+const FB_FLIP_OK: u64   = 0x8005;
 
 // Socket address families
 const AF_UNIX: u64 = 1;
@@ -436,6 +476,7 @@ enum FdKind {
     DevUrandom,
     DevTty,
     ProcBuf, // /proc pseudo-file with content in PROCBUF_TABLE
+    Drm,     // /dev/dri/card0 — DRM/KMS virtual device
 }
 
 #[derive(Clone, Copy)]
@@ -672,6 +713,70 @@ impl ProcBufSlot {
 }
 
 static mut PROCBUF_TABLE: [ProcBufSlot; MAX_PROCBUF_INSTANCES] = [const { ProcBufSlot::empty() }; MAX_PROCBUF_INSTANCES];
+
+// --- DRM/KMS dumb buffer, framebuffer, and state tables ---
+const MAX_DRM_DUMB: usize = 8;
+const MAX_DRM_FB: usize = 4;
+
+#[derive(Clone, Copy)]
+struct DrmDumbBuffer {
+    active: bool,
+    va: usize,       // linux_srv-local VA of allocated pages
+    size: usize,     // pitch * height
+    width: u32,
+    height: u32,
+    pitch: u32,
+    bpp: u32,
+}
+
+impl DrmDumbBuffer {
+    const fn empty() -> Self {
+        Self { active: false, va: 0, size: 0, width: 0, height: 0, pitch: 0, bpp: 0 }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DrmFramebuffer {
+    active: bool,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    bpp: u32,
+    depth: u32,
+    handle: u32,     // dumb buffer handle (1-based)
+}
+
+impl DrmFramebuffer {
+    const fn empty() -> Self {
+        Self { active: false, width: 0, height: 0, pitch: 0, bpp: 0, depth: 0, handle: 0 }
+    }
+}
+
+struct DrmState {
+    initialized: bool,
+    fb_port: u64,
+    display_width: u32,
+    display_height: u32,
+    fb_va: usize,         // mapped framebuffer in linux_srv address space
+    fb_pitch: u32,
+    active_fb_id: u32,
+    crtc_fb_id: u32,
+    reply_port: u64,
+}
+
+static mut DRM_DUMB_TABLE: [DrmDumbBuffer; MAX_DRM_DUMB] = [const { DrmDumbBuffer::empty() }; MAX_DRM_DUMB];
+static mut DRM_FB_TABLE: [DrmFramebuffer; MAX_DRM_FB] = [const { DrmFramebuffer::empty() }; MAX_DRM_FB];
+static mut DRM_STATE: DrmState = DrmState {
+    initialized: false,
+    fb_port: 0,
+    display_width: 0,
+    display_height: 0,
+    fb_va: 0,
+    fb_pitch: 0,
+    active_fb_id: 0,
+    crtc_fb_id: 0,
+    reply_port: 0,
+};
 
 // SCM_RIGHTS: pending FD transfers over UDS
 const MAX_PENDING_FD_TRANSFERS: usize = 16;
@@ -912,6 +1017,9 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         if dk == FdKind::DevNull || dk == FdKind::DevZero || dk == FdKind::DevUrandom {
             return count as u64;
         }
+        if dk == FdKind::Drm {
+            return linux_err(EINVAL);
+        }
         if dk == FdKind::DevTty {
             // /dev/tty writes go to debug console.
             let mut total = 0usize;
@@ -1110,6 +1218,9 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     }
     if kind == FdKind::DevTty {
         return linux_err(EAGAIN); // /dev/tty read with no terminal input
+    }
+    if kind == FdKind::Drm {
+        return linux_err(EAGAIN); // No pending DRM events
     }
     if kind == FdKind::ProcBuf {
         let idx = handle as usize;
@@ -1926,6 +2037,7 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         b"/dev/zero" => Some(FdKind::DevZero),
         b"/dev/urandom" | b"/dev/random" => Some(FdKind::DevUrandom),
         b"/dev/tty" | b"/dev/console" => Some(FdKind::DevTty),
+        b"/dev/dri/card0" | b"/dev/dri/renderD128" => Some(FdKind::Drm),
         _ => None,
     };
     if let Some(kind) = dev_kind {
@@ -2391,6 +2503,22 @@ fn do_close(pi: usize, fd: usize) {
                 }
             }
             FdKind::DevNull | FdKind::DevZero | FdKind::DevUrandom | FdKind::DevTty => {}
+            FdKind::Drm => {
+                // Free all dumb buffers and framebuffers (single-user device).
+                let ps = syscall::page_size();
+                for i in 0..MAX_DRM_DUMB {
+                    if DRM_DUMB_TABLE[i].active && DRM_DUMB_TABLE[i].va != 0 {
+                        let buf_pages = (DRM_DUMB_TABLE[i].size + ps - 1) / ps;
+                        for p in 0..buf_pages {
+                            syscall::munmap(DRM_DUMB_TABLE[i].va + p * ps);
+                        }
+                    }
+                    DRM_DUMB_TABLE[i] = DrmDumbBuffer::empty();
+                }
+                for i in 0..MAX_DRM_FB {
+                    DRM_FB_TABLE[i] = DrmFramebuffer::empty();
+                }
+            }
             FdKind::ProcBuf => {
                 let idx = PROC_TABLE[pi].fds[fd].handle as usize;
                 if idx < MAX_PROCBUF_INSTANCES {
@@ -2485,6 +2613,8 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         b"/dev/zero" => Some((1 << 8) | 5),
         b"/dev/urandom" | b"/dev/random" => Some((1 << 8) | 9),
         b"/dev/tty" | b"/dev/console" => Some((5 << 8) | 0),
+        b"/dev/dri/card0" => Some((226 << 8) | 0),
+        b"/dev/dri/renderD128" => Some((226 << 8) | 128),
         _ => None,
     };
     if let Some(rdev) = dev_rdev {
@@ -2502,7 +2632,7 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
     let is_proc_dir = match &path[..pathlen] {
         b"/proc" | b"/proc/" | b"/proc/self" | b"/proc/self/"
         | b"/proc/sys" | b"/proc/sys/" | b"/proc/sys/kernel" | b"/proc/sys/kernel/"
-        | b"/dev" | b"/dev/" => true,
+        | b"/dev" | b"/dev/" | b"/dev/dri" | b"/dev/dri/" => true,
         _ => false,
     };
     if is_proc_dir {
@@ -2625,7 +2755,7 @@ fn handle_fstat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         // Virtual device fstat — report as character device.
         let dk = PROC_TABLE[pi].fds[fd].kind;
         if dk == FdKind::DevNull || dk == FdKind::DevZero || dk == FdKind::DevUrandom
-            || dk == FdKind::DevTty {
+            || dk == FdKind::DevTty || dk == FdKind::Drm {
             let mut stat_buf = [0u8; 144];
             let mode: u32 = 0o020666; // S_IFCHR | 0666
             stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
@@ -2634,6 +2764,7 @@ fn handle_fstat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                 FdKind::DevZero => (1 << 8) | 5,
                 FdKind::DevUrandom => (1 << 8) | 9,
                 FdKind::DevTty => (5 << 8) | 0, // /dev/tty = 5:0
+                FdKind::Drm => (226 << 8) | 0, // /dev/dri/card0 = 226:0
                 _ => 0,
             };
             stat_buf[40..48].copy_from_slice(&rdev.to_le_bytes());
@@ -3691,6 +3822,31 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                     None => return u64::MAX,
                 }
             }
+            // DRM dumb buffer mmap: offset encodes the handle.
+            if let FdKind::Drm = kind {
+                let handle_idx = (file_offset >> 12) as usize;
+                if handle_idx == 0 || handle_idx > MAX_DRM_DUMB {
+                    return linux_err(EINVAL);
+                }
+                let idx = handle_idx - 1;
+                unsafe {
+                    if !DRM_DUMB_TABLE[idx].active || DRM_DUMB_TABLE[idx].va == 0 {
+                        return linux_err(EINVAL);
+                    }
+                    let src_va = DRM_DUMB_TABLE[idx].va;
+                    let target_hint = if is_fixed && addr != 0 { addr } else { 0 };
+                    match syscall::personality_map_shared(
+                        caller_port,
+                        src_va as u64,
+                        target_hint,
+                        pages,
+                        kern_prot as u64,
+                    ) {
+                        Some(v) => return v as u64,
+                        None => return linux_err(ENOMEM),
+                    }
+                }
+            }
         }
     }
 
@@ -4417,6 +4573,518 @@ fn handle_fcntl(pi: usize, args: &[u64; 6]) -> u64 {
     }
 }
 
+// ============================================================
+// DRM/KMS compatibility layer
+// ============================================================
+
+/// Lazy-init: connect to fb_srv, query display info, map framebuffer.
+fn drm_ensure_init() -> bool {
+    unsafe {
+        if DRM_STATE.initialized { return true; }
+        let fb_port = match syscall::ns_lookup(b"fb") {
+            Some(p) => p,
+            None => return false,
+        };
+        DRM_STATE.fb_port = fb_port;
+        DRM_STATE.reply_port = syscall::port_create();
+
+        // FB_GET_INFO → width, height, pitch, bpp.
+        syscall::send(fb_port, FB_GET_INFO, 0, 0, DRM_STATE.reply_port << 32, 0);
+        let info = loop {
+            if let Some(m) = syscall::recv_msg(DRM_STATE.reply_port) {
+                if m.tag == FB_GET_INFO_OK { break m; }
+            }
+            syscall::yield_now();
+        };
+        DRM_STATE.display_width = info.data[0] as u32;
+        DRM_STATE.display_height = (info.data[0] >> 32) as u32;
+        DRM_STATE.fb_pitch = info.data[1] as u32;
+
+        // FB_MAP → map framebuffer pages into our address space.
+        let my_aspace = syscall::aspace_id();
+        syscall::send(fb_port, FB_MAP, 0, 0, DRM_STATE.reply_port << 32, my_aspace);
+        let map_resp = loop {
+            if let Some(m) = syscall::recv_msg(DRM_STATE.reply_port) {
+                if m.tag == FB_MAP_OK { break m; }
+            }
+            syscall::yield_now();
+        };
+        DRM_STATE.fb_va = map_resp.data[0] as usize;
+        if DRM_STATE.fb_va == 0 { return false; }
+
+        DRM_STATE.initialized = true;
+        syscall::debug_puts(b"[drm] initialized: fb mapped\n");
+        true
+    }
+}
+
+/// Fill a drm_mode_modeinfo (68 bytes) for the current display resolution.
+fn drm_fill_modeinfo(buf: &mut [u8; 68], w: u32, h: u32) {
+    // Use standard VESA timing for 1024x768@60 as default.
+    // For other resolutions, use simplified timing: htotal = w+320, vtotal = h+38.
+    let (clock, htotal, hsync_start, hsync_end, vtotal, vsync_start, vsync_end) =
+        if w == 1024 && h == 768 {
+            (65000u32, 1344u16, 1048u16, 1184u16, 806u16, 771u16, 777u16)
+        } else {
+            // Generic: ~60 Hz approximation.
+            let ht = w as u16 + 320;
+            let vt = h as u16 + 38;
+            let clk = (ht as u32) * (vt as u32) * 60 / 1000;
+            (clk, ht, w as u16 + 48, w as u16 + 112, vt, h as u16 + 3, h as u16 + 6)
+        };
+    *buf = [0u8; 68];
+    buf[0..4].copy_from_slice(&clock.to_le_bytes());
+    buf[4..6].copy_from_slice(&(w as u16).to_le_bytes());  // hdisplay
+    buf[6..8].copy_from_slice(&hsync_start.to_le_bytes());
+    buf[8..10].copy_from_slice(&hsync_end.to_le_bytes());
+    buf[10..12].copy_from_slice(&htotal.to_le_bytes());
+    buf[12..14].copy_from_slice(&0u16.to_le_bytes());       // hskew
+    buf[14..16].copy_from_slice(&(h as u16).to_le_bytes()); // vdisplay
+    buf[16..18].copy_from_slice(&vsync_start.to_le_bytes());
+    buf[18..20].copy_from_slice(&vsync_end.to_le_bytes());
+    buf[20..22].copy_from_slice(&vtotal.to_le_bytes());
+    buf[22..24].copy_from_slice(&0u16.to_le_bytes());       // vscan
+    buf[24..28].copy_from_slice(&60u32.to_le_bytes());      // vrefresh
+    buf[28..32].copy_from_slice(&0u32.to_le_bytes());       // flags
+    buf[32..36].copy_from_slice(&(1u32 << 6).to_le_bytes()); // type = DRM_MODE_TYPE_PREFERRED
+    // name: "1024x768" or similar
+    let name = if w == 1024 && h == 768 { b"1024x768\0" } else { b"display\0\0" };
+    buf[36..36 + name.len()].copy_from_slice(name);
+}
+
+fn drm_ioctl_version(caller_port: u64, arg_va: usize) -> u64 {
+    // struct drm_version (64 bytes on x86_64):
+    //   i32 major(0), minor(4), patchlevel(8), pad(12)
+    //   u64 name_len(16), *name(24), date_len(32), *date(40), desc_len(48), *desc(56)
+    let mut buf = [0u8; 64];
+    syscall::personality_copy_in(caller_port, arg_va, &mut buf);
+
+    buf[0..4].copy_from_slice(&1i32.to_le_bytes());  // major
+    buf[4..8].copy_from_slice(&0i32.to_le_bytes());  // minor
+    buf[8..12].copy_from_slice(&0i32.to_le_bytes()); // patchlevel
+
+    let driver_name = b"telix-drm";
+    let name_len = u64::from_le_bytes([buf[16],buf[17],buf[18],buf[19],buf[20],buf[21],buf[22],buf[23]]);
+    let name_ptr = u64::from_le_bytes([buf[24],buf[25],buf[26],buf[27],buf[28],buf[29],buf[30],buf[31]]);
+    buf[16..24].copy_from_slice(&(driver_name.len() as u64).to_le_bytes());
+    if name_ptr != 0 && name_len > 0 {
+        let n = (name_len as usize).min(driver_name.len());
+        syscall::personality_copy_out(caller_port, name_ptr as usize, &driver_name[..n]);
+    }
+
+    let date = b"20260422";
+    let date_len = u64::from_le_bytes([buf[32],buf[33],buf[34],buf[35],buf[36],buf[37],buf[38],buf[39]]);
+    let date_ptr = u64::from_le_bytes([buf[40],buf[41],buf[42],buf[43],buf[44],buf[45],buf[46],buf[47]]);
+    buf[32..40].copy_from_slice(&(date.len() as u64).to_le_bytes());
+    if date_ptr != 0 && date_len > 0 {
+        let n = (date_len as usize).min(date.len());
+        syscall::personality_copy_out(caller_port, date_ptr as usize, &date[..n]);
+    }
+
+    let desc = b"Telix DRM";
+    let desc_len = u64::from_le_bytes([buf[48],buf[49],buf[50],buf[51],buf[52],buf[53],buf[54],buf[55]]);
+    let desc_ptr = u64::from_le_bytes([buf[56],buf[57],buf[58],buf[59],buf[60],buf[61],buf[62],buf[63]]);
+    buf[48..56].copy_from_slice(&(desc.len() as u64).to_le_bytes());
+    if desc_ptr != 0 && desc_len > 0 {
+        let n = (desc_len as usize).min(desc.len());
+        syscall::personality_copy_out(caller_port, desc_ptr as usize, &desc[..n]);
+    }
+
+    syscall::personality_copy_out(caller_port, arg_va, &buf);
+    0
+}
+
+fn drm_ioctl_get_cap(caller_port: u64, arg_va: usize) -> u64 {
+    // struct drm_get_cap { u64 capability, u64 value } — 16 bytes
+    let mut buf = [0u8; 16];
+    syscall::personality_copy_in(caller_port, arg_va, &mut buf);
+    let cap = u64::from_le_bytes([buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]]);
+    let val: u64 = match cap {
+        DRM_CAP_DUMB_BUFFER => 1,
+        DRM_CAP_TIMESTAMP_MONOTONIC => 1,
+        _ => 0,
+    };
+    buf[8..16].copy_from_slice(&val.to_le_bytes());
+    syscall::personality_copy_out(caller_port, arg_va, &buf);
+    0
+}
+
+fn drm_ioctl_getresources(caller_port: u64, arg_va: usize) -> u64 {
+    // struct drm_mode_card_res (64 bytes):
+    //   u64 fb_id_ptr(0), crtc_id_ptr(8), connector_id_ptr(16), encoder_id_ptr(24)
+    //   u32 count_fbs(32), count_crtcs(36), count_connectors(40), count_encoders(44)
+    //   u32 min_width(48), max_width(52), min_height(56), max_height(60)
+    let mut buf = [0u8; 64];
+    syscall::personality_copy_in(caller_port, arg_va, &mut buf);
+
+    let crtc_ptr = u64::from_le_bytes([buf[8],buf[9],buf[10],buf[11],buf[12],buf[13],buf[14],buf[15]]);
+    let conn_ptr = u64::from_le_bytes([buf[16],buf[17],buf[18],buf[19],buf[20],buf[21],buf[22],buf[23]]);
+    let enc_ptr = u64::from_le_bytes([buf[24],buf[25],buf[26],buf[27],buf[28],buf[29],buf[30],buf[31]]);
+
+    let count_fbs: u32 = unsafe {
+        let mut n = 0u32;
+        for i in 0..MAX_DRM_FB {
+            if DRM_FB_TABLE[i].active { n += 1; }
+        }
+        n
+    };
+    buf[32..36].copy_from_slice(&count_fbs.to_le_bytes());
+    buf[36..40].copy_from_slice(&1u32.to_le_bytes()); // count_crtcs
+    buf[40..44].copy_from_slice(&1u32.to_le_bytes()); // count_connectors
+    buf[44..48].copy_from_slice(&1u32.to_le_bytes()); // count_encoders
+    buf[48..52].copy_from_slice(&0u32.to_le_bytes()); // min_width
+    buf[52..56].copy_from_slice(&8192u32.to_le_bytes()); // max_width
+    buf[56..60].copy_from_slice(&0u32.to_le_bytes()); // min_height
+    buf[60..64].copy_from_slice(&8192u32.to_le_bytes()); // max_height
+
+    // Second pass: fill ID arrays if pointers provided.
+    if crtc_ptr != 0 {
+        syscall::personality_copy_out(caller_port, crtc_ptr as usize, &DRM_CRTC_ID.to_le_bytes());
+    }
+    if conn_ptr != 0 {
+        syscall::personality_copy_out(caller_port, conn_ptr as usize, &DRM_CONNECTOR_ID.to_le_bytes());
+    }
+    if enc_ptr != 0 {
+        syscall::personality_copy_out(caller_port, enc_ptr as usize, &DRM_ENCODER_ID.to_le_bytes());
+    }
+    // FB IDs (active framebuffers).
+    let fb_ptr = u64::from_le_bytes([buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]]);
+    if fb_ptr != 0 && count_fbs > 0 {
+        let mut idx = 0usize;
+        unsafe {
+            for i in 0..MAX_DRM_FB {
+                if DRM_FB_TABLE[i].active {
+                    let id = (i + 1) as u32;
+                    syscall::personality_copy_out(caller_port, fb_ptr as usize + idx * 4, &id.to_le_bytes());
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    syscall::personality_copy_out(caller_port, arg_va, &buf);
+    0
+}
+
+fn drm_ioctl_getconnector(caller_port: u64, arg_va: usize) -> u64 {
+    // struct drm_mode_get_connector (80 bytes):
+    //   u64 encoders_ptr(0), modes_ptr(8), props_ptr(16), prop_values_ptr(24)
+    //   u32 count_modes(32), count_props(36), count_encoders(40)
+    //   u32 encoder_id(44), connector_id(48), connector_type(52)
+    //   u32 connector_type_id(56), connection(60), mm_width(64), mm_height(68)
+    //   u32 subpixel(72), pad(76)
+    let mut buf = [0u8; 80];
+    syscall::personality_copy_in(caller_port, arg_va, &mut buf);
+
+    let modes_ptr = u64::from_le_bytes([buf[8],buf[9],buf[10],buf[11],buf[12],buf[13],buf[14],buf[15]]);
+    let encoders_ptr = u64::from_le_bytes([buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]]);
+
+    buf[32..36].copy_from_slice(&1u32.to_le_bytes()); // count_modes = 1
+    buf[36..40].copy_from_slice(&0u32.to_le_bytes()); // count_props = 0
+    buf[40..44].copy_from_slice(&1u32.to_le_bytes()); // count_encoders = 1
+    buf[44..48].copy_from_slice(&DRM_ENCODER_ID.to_le_bytes()); // encoder_id
+    buf[48..52].copy_from_slice(&DRM_CONNECTOR_ID.to_le_bytes()); // connector_id
+    buf[52..56].copy_from_slice(&15u32.to_le_bytes()); // connector_type = DRM_MODE_CONNECTOR_Virtual
+    buf[56..60].copy_from_slice(&1u32.to_le_bytes()); // connector_type_id
+    buf[60..64].copy_from_slice(&1u32.to_le_bytes()); // connection = connected
+    buf[64..68].copy_from_slice(&0u32.to_le_bytes()); // mm_width (unknown)
+    buf[68..72].copy_from_slice(&0u32.to_le_bytes()); // mm_height
+    buf[72..76].copy_from_slice(&0u32.to_le_bytes()); // subpixel = unknown
+
+    // Write mode info if pointer provided.
+    if modes_ptr != 0 {
+        let mut mode = [0u8; 68];
+        unsafe { drm_fill_modeinfo(&mut mode, DRM_STATE.display_width, DRM_STATE.display_height); }
+        syscall::personality_copy_out(caller_port, modes_ptr as usize, &mode);
+    }
+    // Write encoder ID if pointer provided.
+    if encoders_ptr != 0 {
+        syscall::personality_copy_out(caller_port, encoders_ptr as usize, &DRM_ENCODER_ID.to_le_bytes());
+    }
+
+    syscall::personality_copy_out(caller_port, arg_va, &buf);
+    0
+}
+
+fn drm_ioctl_getencoder(caller_port: u64, arg_va: usize) -> u64 {
+    // struct drm_mode_get_encoder (20 bytes):
+    //   u32 encoder_id(0), encoder_type(4), crtc_id(8)
+    //   u32 possible_crtcs(12), possible_clones(16)
+    let mut buf = [0u8; 20];
+    buf[0..4].copy_from_slice(&DRM_ENCODER_ID.to_le_bytes());
+    buf[4..8].copy_from_slice(&0u32.to_le_bytes()); // type = NONE (virtual)
+    buf[8..12].copy_from_slice(&DRM_CRTC_ID.to_le_bytes());
+    buf[12..16].copy_from_slice(&1u32.to_le_bytes()); // possible_crtcs bitmask
+    buf[16..20].copy_from_slice(&0u32.to_le_bytes()); // possible_clones
+    syscall::personality_copy_out(caller_port, arg_va, &buf);
+    0
+}
+
+fn drm_ioctl_getcrtc(caller_port: u64, arg_va: usize) -> u64 {
+    // struct drm_mode_crtc (104 bytes):
+    //   u64 set_connectors_ptr(0), u32 count_connectors(8), crtc_id(12)
+    //   u32 fb_id(16), x(20), y(24), gamma_size(28), mode_valid(32)
+    //   struct drm_mode_modeinfo mode(36..103)
+    let mut buf = [0u8; 104];
+    buf[12..16].copy_from_slice(&DRM_CRTC_ID.to_le_bytes());
+    unsafe {
+        buf[16..20].copy_from_slice(&DRM_STATE.crtc_fb_id.to_le_bytes());
+    }
+    buf[32..36].copy_from_slice(&1u32.to_le_bytes()); // mode_valid = 1
+    // Fill mode at offset 36.
+    let mut mode = [0u8; 68];
+    unsafe { drm_fill_modeinfo(&mut mode, DRM_STATE.display_width, DRM_STATE.display_height); }
+    buf[36..104].copy_from_slice(&mode);
+    syscall::personality_copy_out(caller_port, arg_va, &buf);
+    0
+}
+
+fn drm_ioctl_setcrtc(caller_port: u64, arg_va: usize) -> u64 {
+    // Same struct as getcrtc (104 bytes). Read fb_id.
+    let mut buf = [0u8; 104];
+    syscall::personality_copy_in(caller_port, arg_va, &mut buf);
+    let fb_id = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+    unsafe {
+        DRM_STATE.crtc_fb_id = fb_id;
+        // If fb_id is valid, blit to display.
+        if fb_id > 0 {
+            let fb_idx = (fb_id - 1) as usize;
+            if fb_idx < MAX_DRM_FB && DRM_FB_TABLE[fb_idx].active {
+                let dumb_idx = (DRM_FB_TABLE[fb_idx].handle - 1) as usize;
+                if dumb_idx < MAX_DRM_DUMB && DRM_DUMB_TABLE[dumb_idx].active {
+                    drm_blit_to_fb(dumb_idx);
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Blit dumb buffer contents to the fb_srv framebuffer (row-by-row).
+fn drm_blit_to_fb(dumb_idx: usize) {
+    unsafe {
+        let dumb = &DRM_DUMB_TABLE[dumb_idx];
+        let src = dumb.va as *const u8;
+        let dst = DRM_STATE.fb_va as *mut u8;
+        if src.is_null() || dst.is_null() { return; }
+        let row_bytes = (dumb.width as usize) * (dumb.bpp as usize / 8);
+        let rows = (dumb.height as usize).min(DRM_STATE.display_height as usize);
+        let src_pitch = dumb.pitch as usize;
+        let dst_pitch = DRM_STATE.fb_pitch as usize;
+        for row in 0..rows {
+            let copy_len = row_bytes.min(dst_pitch);
+            core::ptr::copy_nonoverlapping(
+                src.add(row * src_pitch),
+                dst.add(row * dst_pitch),
+                copy_len,
+            );
+        }
+        // Tell fb_srv to flush the entire display.
+        let wh = (DRM_STATE.display_width as u64) | ((DRM_STATE.display_height as u64) << 32);
+        syscall::send(DRM_STATE.fb_port, FB_FLIP, 0, wh, DRM_STATE.reply_port << 32, 0);
+        // Drain the reply (non-blocking poll).
+        for _ in 0..200 {
+            if syscall::recv_nb_msg(DRM_STATE.reply_port).is_some() { break; }
+            syscall::yield_now();
+        }
+    }
+}
+
+fn drm_ioctl_create_dumb(caller_port: u64, arg_va: usize) -> u64 {
+    // struct drm_mode_create_dumb (32 bytes):
+    //   u32 height(0), width(4), bpp(8), flags(12)
+    //   u32 handle(16), pitch(20), u64 size(24)
+    let mut buf = [0u8; 32];
+    syscall::personality_copy_in(caller_port, arg_va, &mut buf);
+    let height = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let width = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let bpp = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+
+    // Pitch aligned to 64 bytes.
+    let pitch = ((width * (bpp / 8)) + 63) & !63;
+    let size = (pitch * height) as usize;
+    if size == 0 { return linux_err(EINVAL); }
+
+    // Find free slot.
+    let slot = unsafe {
+        let mut found = None;
+        for i in 0..MAX_DRM_DUMB {
+            if !DRM_DUMB_TABLE[i].active { found = Some(i); break; }
+        }
+        found
+    };
+    let slot = match slot {
+        Some(s) => s,
+        None => return linux_err(ENOMEM),
+    };
+
+    // Allocate pages.
+    let ps = syscall::page_size();
+    let pages = (size + ps - 1) / ps;
+    let va = match syscall::mmap_anon(0, pages, 1) { // RW
+        Some(v) => v,
+        None => return linux_err(ENOMEM),
+    };
+    // Zero the buffer.
+    unsafe { core::ptr::write_bytes(va as *mut u8, 0, pages * ps); }
+
+    unsafe {
+        DRM_DUMB_TABLE[slot] = DrmDumbBuffer {
+            active: true,
+            va,
+            size,
+            width,
+            height,
+            pitch,
+            bpp,
+        };
+    }
+
+    let handle = (slot + 1) as u32; // 1-based
+    buf[16..20].copy_from_slice(&handle.to_le_bytes());
+    buf[20..24].copy_from_slice(&pitch.to_le_bytes());
+    buf[24..32].copy_from_slice(&(size as u64).to_le_bytes());
+    syscall::personality_copy_out(caller_port, arg_va, &buf);
+    0
+}
+
+fn drm_ioctl_map_dumb(caller_port: u64, arg_va: usize) -> u64 {
+    // struct drm_mode_map_dumb (16 bytes):
+    //   u32 handle(0), pad(4), u64 offset(8)
+    let mut buf = [0u8; 16];
+    syscall::personality_copy_in(caller_port, arg_va, &mut buf);
+    let handle = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if handle == 0 || handle as usize > MAX_DRM_DUMB { return linux_err(EINVAL); }
+    let idx = (handle - 1) as usize;
+    unsafe {
+        if !DRM_DUMB_TABLE[idx].active { return linux_err(EINVAL); }
+    }
+    // Magic offset = handle << 12 (page-aligned, non-zero).
+    let offset = (handle as u64) << 12;
+    buf[8..16].copy_from_slice(&offset.to_le_bytes());
+    syscall::personality_copy_out(caller_port, arg_va, &buf);
+    0
+}
+
+fn drm_ioctl_destroy_dumb(caller_port: u64, arg_va: usize) -> u64 {
+    // struct drm_mode_destroy_dumb (4 bytes): u32 handle
+    let mut buf = [0u8; 4];
+    syscall::personality_copy_in(caller_port, arg_va, &mut buf);
+    let handle = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if handle == 0 || handle as usize > MAX_DRM_DUMB { return linux_err(EINVAL); }
+    let idx = (handle - 1) as usize;
+    unsafe {
+        if !DRM_DUMB_TABLE[idx].active { return linux_err(EINVAL); }
+        if DRM_DUMB_TABLE[idx].va != 0 {
+            let ps = syscall::page_size();
+            let pages = (DRM_DUMB_TABLE[idx].size + ps - 1) / ps;
+            for p in 0..pages {
+                syscall::munmap(DRM_DUMB_TABLE[idx].va + p * ps);
+            }
+        }
+        DRM_DUMB_TABLE[idx] = DrmDumbBuffer::empty();
+    }
+    0
+}
+
+fn drm_ioctl_addfb(caller_port: u64, arg_va: usize) -> u64 {
+    // struct drm_mode_fb_cmd (28 bytes used of 68):
+    //   u32 fb_id(0), width(4), height(8), pitch(12), bpp(16), depth(20), handle(24)
+    let mut buf = [0u8; 68];
+    syscall::personality_copy_in(caller_port, arg_va, &mut buf);
+    let width = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let height = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let pitch = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    let bpp = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+    let depth = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+    let handle = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
+
+    // Validate handle.
+    if handle == 0 || handle as usize > MAX_DRM_DUMB { return linux_err(EINVAL); }
+    unsafe {
+        if !DRM_DUMB_TABLE[(handle - 1) as usize].active { return linux_err(EINVAL); }
+    }
+
+    // Find free FB slot.
+    let slot = unsafe {
+        let mut found = None;
+        for i in 0..MAX_DRM_FB {
+            if !DRM_FB_TABLE[i].active { found = Some(i); break; }
+        }
+        found
+    };
+    let slot = match slot {
+        Some(s) => s,
+        None => return linux_err(ENOMEM),
+    };
+    unsafe {
+        DRM_FB_TABLE[slot] = DrmFramebuffer {
+            active: true,
+            width,
+            height,
+            pitch,
+            bpp,
+            depth,
+            handle,
+        };
+    }
+    let fb_id = (slot + 1) as u32;
+    buf[0..4].copy_from_slice(&fb_id.to_le_bytes());
+    syscall::personality_copy_out(caller_port, arg_va, &buf);
+    0
+}
+
+fn drm_ioctl_rmfb(caller_port: u64, arg_va: usize) -> u64 {
+    let mut buf = [0u8; 4];
+    syscall::personality_copy_in(caller_port, arg_va, &mut buf);
+    let fb_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if fb_id == 0 || fb_id as usize > MAX_DRM_FB { return linux_err(EINVAL); }
+    unsafe { DRM_FB_TABLE[(fb_id - 1) as usize] = DrmFramebuffer::empty(); }
+    0
+}
+
+fn drm_ioctl_page_flip(caller_port: u64, arg_va: usize) -> u64 {
+    // struct drm_mode_crtc_page_flip (16 bytes):
+    //   u32 crtc_id(0), fb_id(4), flags(8), reserved(12)
+    let mut buf = [0u8; 16];
+    syscall::personality_copy_in(caller_port, arg_va, &mut buf);
+    let fb_id = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if fb_id == 0 || fb_id as usize > MAX_DRM_FB { return linux_err(EINVAL); }
+    let fb_idx = (fb_id - 1) as usize;
+    unsafe {
+        if !DRM_FB_TABLE[fb_idx].active { return linux_err(EINVAL); }
+        let dumb_handle = DRM_FB_TABLE[fb_idx].handle;
+        if dumb_handle == 0 || dumb_handle as usize > MAX_DRM_DUMB { return linux_err(EINVAL); }
+        let dumb_idx = (dumb_handle - 1) as usize;
+        if !DRM_DUMB_TABLE[dumb_idx].active { return linux_err(EINVAL); }
+        drm_blit_to_fb(dumb_idx);
+        DRM_STATE.active_fb_id = fb_id;
+    }
+    0
+}
+
+/// Top-level DRM ioctl dispatcher.
+fn handle_drm_ioctl(caller_port: u64, request: u64, arg_va: usize) -> u64 {
+    if !drm_ensure_init() { return linux_err(ENODEV); }
+    match request {
+        DRM_IOCTL_VERSION => drm_ioctl_version(caller_port, arg_va),
+        DRM_IOCTL_GET_CAP => drm_ioctl_get_cap(caller_port, arg_va),
+        DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => 0,
+        DRM_IOCTL_MODE_GETRESOURCES => drm_ioctl_getresources(caller_port, arg_va),
+        DRM_IOCTL_MODE_GETCRTC => drm_ioctl_getcrtc(caller_port, arg_va),
+        DRM_IOCTL_MODE_SETCRTC => drm_ioctl_setcrtc(caller_port, arg_va),
+        DRM_IOCTL_MODE_GETCONNECTOR => drm_ioctl_getconnector(caller_port, arg_va),
+        DRM_IOCTL_MODE_GETENCODER => drm_ioctl_getencoder(caller_port, arg_va),
+        DRM_IOCTL_MODE_CREATE_DUMB => drm_ioctl_create_dumb(caller_port, arg_va),
+        DRM_IOCTL_MODE_MAP_DUMB => drm_ioctl_map_dumb(caller_port, arg_va),
+        DRM_IOCTL_MODE_DESTROY_DUMB => drm_ioctl_destroy_dumb(caller_port, arg_va),
+        DRM_IOCTL_MODE_ADDFB => drm_ioctl_addfb(caller_port, arg_va),
+        DRM_IOCTL_MODE_RMFB => drm_ioctl_rmfb(caller_port, arg_va),
+        DRM_IOCTL_MODE_PAGE_FLIP => drm_ioctl_page_flip(caller_port, arg_va),
+        _ => linux_err(ENOTTY),
+    }
+}
+
 /// Handle Linux ioctl(fd, request, arg).
 fn handle_ioctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let fd = args[0] as usize;
@@ -4536,7 +5204,17 @@ fn handle_ioctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             }
             0
         }
-        _ => linux_err(ENOTTY),
+        _ => {
+            // Route DRM ioctls to the DRM handler if fd is a DRM device.
+            if fd < MAX_FDS {
+                unsafe {
+                    if PROC_TABLE[pi].fds[fd].kind == FdKind::Drm {
+                        return handle_drm_ioctl(caller_port, request, args[2] as usize);
+                    }
+                }
+            }
+            linux_err(ENOTTY)
+        }
     }
 }
 
@@ -6610,6 +7288,7 @@ fn poll_single_fd(pi: usize, fd: usize) -> u32 {
             FdKind::DevNull => EPOLLOUT, // writable sink
             FdKind::DevZero | FdKind::DevUrandom => EPOLLIN | EPOLLOUT,
             FdKind::DevTty => EPOLLOUT, // writable, reads would block
+            FdKind::Drm => EPOLLOUT, // page flip always accepted
             FdKind::ProcBuf => EPOLLIN, // readable synthetic file
             _ => EPOLLERR,
         }
