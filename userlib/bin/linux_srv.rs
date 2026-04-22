@@ -2827,7 +2827,11 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         | b"/proc/sys" | b"/proc/sys/" | b"/proc/sys/kernel" | b"/proc/sys/kernel/"
         | b"/dev" | b"/dev/" | b"/dev/dri" | b"/dev/dri/"
         | b"/dev/input" | b"/dev/input/"
-        | b"/dev/shm" | b"/dev/shm/" => true,
+        | b"/dev/shm" | b"/dev/shm/"
+        | b"/run" | b"/run/" | b"/run/user" | b"/run/user/"
+        | b"/run/user/0" | b"/run/user/0/"
+        | b"/tmp" | b"/tmp/"
+        | b"/tmp/.X11-unix" | b"/tmp/.X11-unix/" => true,
         _ => false,
     };
     if is_proc_dir {
@@ -3391,6 +3395,7 @@ fn handle_access(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     }
     // Virtual paths always exist.
     if (pathlen >= 5 && &path[..5] == b"/proc") || (pathlen >= 4 && &path[..4] == b"/dev/")
+        || (pathlen >= 4 && &path[..4] == b"/run") || (pathlen >= 4 && &path[..4] == b"/tmp")
         || path[..pathlen] == *b"/etc/passwd" || path[..pathlen] == *b"/etc/group"
         || path[..pathlen] == *b"/etc/hosts" || path[..pathlen] == *b"/etc/resolv.conf"
         || path[..pathlen] == *b"/etc/hostname" || path[..pathlen] == *b"/etc/nsswitch.conf"
@@ -4440,6 +4445,12 @@ fn handle_unlink_impl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     // /dev/shm/* unlink — no-op success (shm_unlink).
     if pathlen > 9 && &path[..9] == b"/dev/shm/" {
+        return 0;
+    }
+    // /run/user/0/* and /tmp/.X11-unix/* unlink — no-op (socket cleanup before bind).
+    if (pathlen > 13 && &path[..13] == b"/run/user/0/")
+        || (pathlen > 16 && &path[..16] == b"/tmp/.X11-unix/")
+    {
         return 0;
     }
 
@@ -6618,13 +6629,40 @@ fn parse_sockaddr_un(caller_port: u64, addr_va: usize, addrlen: usize) -> ([u8; 
     if copied < 3 {
         return ([0; 16], 0);
     }
-    // sun_path starts at offset 2
-    let path_len = (copied - 2).min(16);
-    let mut name = [0u8; 16];
-    for i in 0..path_len {
-        name[i] = buf[2 + i];
+    // sun_path starts at offset 2; find its null-terminated length.
+    let raw_len = buf[2..copied].iter().position(|&b| b == 0).unwrap_or(copied - 2);
+    if raw_len == 0 {
+        return ([0; 16], 0);
     }
-    (name, path_len)
+
+    // Abstract sockets (sun_path[0] == '\0') or short paths: use directly.
+    if buf[2] == 0 || raw_len <= 16 {
+        let use_len = raw_len.min(16);
+        let mut name = [0u8; 16];
+        for i in 0..use_len {
+            name[i] = buf[2 + i];
+        }
+        return (name, use_len);
+    }
+
+    // Long filesystem paths (> 16 bytes): extract basename (last component
+    // after '/') and use it as the flat UDS namespace key. This maps paths
+    // like /run/user/0/wayland-0 → "wayland-0" and /tmp/.X11-unix/X0 → "X0".
+    let path = &buf[2..2 + raw_len];
+    let mut last_slash = 0;
+    for i in 0..raw_len {
+        if path[i] == b'/' { last_slash = i + 1; }
+    }
+    let basename = &path[last_slash..];
+    let blen = basename.len().min(16);
+    if blen == 0 {
+        return ([0; 16], 0);
+    }
+    let mut name = [0u8; 16];
+    for i in 0..blen {
+        name[i] = basename[i];
+    }
+    (name, blen)
 }
 
 /// Parse a Linux sockaddr_in from caller memory. Returns (ip_be32, port_be16).
