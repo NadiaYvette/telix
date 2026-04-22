@@ -517,6 +517,8 @@ enum FdKind {
     ProcBuf, // /proc pseudo-file with content in PROCBUF_TABLE
     Drm,     // /dev/dri/card0 — DRM/KMS virtual device
     Evdev,   // /dev/input/event* — evdev input device (handle=0 kbd, 1 mouse)
+    Inotify, // inotify instance — stub (no events, prevents ENOSYS crashes)
+    SignalFd, // signalfd — stub (no events, prevents ENOSYS crashes)
 }
 
 #[derive(Clone, Copy)]
@@ -1133,7 +1135,7 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         if dk == FdKind::DevNull || dk == FdKind::DevZero || dk == FdKind::DevUrandom {
             return count as u64;
         }
-        if dk == FdKind::Drm || dk == FdKind::Evdev {
+        if dk == FdKind::Drm || dk == FdKind::Evdev || dk == FdKind::Inotify || dk == FdKind::SignalFd {
             return linux_err(EINVAL);
         }
         if dk == FdKind::DevTty {
@@ -1335,8 +1337,8 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     if kind == FdKind::DevTty {
         return linux_err(EAGAIN); // /dev/tty read with no terminal input
     }
-    if kind == FdKind::Drm {
-        return linux_err(EAGAIN); // No pending DRM events
+    if kind == FdKind::Drm || kind == FdKind::Inotify || kind == FdKind::SignalFd {
+        return linux_err(EAGAIN); // No pending events
     }
     if kind == FdKind::Evdev {
         unsafe {
@@ -2693,7 +2695,7 @@ fn do_close(pi: usize, fd: usize) {
                 }
             }
             FdKind::DevNull | FdKind::DevZero | FdKind::DevUrandom | FdKind::DevTty
-            | FdKind::Evdev => {}
+            | FdKind::Evdev | FdKind::Inotify | FdKind::SignalFd => {}
             FdKind::Drm => {
                 // Free all dumb buffers and framebuffers (single-user device).
                 let ps = syscall::page_size();
@@ -3854,6 +3856,39 @@ fn handle_clone(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     // Return the new thread's port as the "child pid" to the parent.
     thread_port
+}
+
+/// Handle Linux clone3(struct clone_args *cl_args, size_t size).
+///
+/// Reads the struct clone_args from user space and dispatches to handle_clone
+/// with the equivalent positional arguments.
+fn handle_clone3(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let cl_args_va = args[0] as usize;
+    let _size = args[1] as usize;
+
+    // struct clone_args layout (each field is u64):
+    //  0: flags      8: pidfd     16: child_tid  24: parent_tid
+    // 32: exit_signal 40: stack   48: stack_size  56: tls
+    let mut buf = [0u8; 64];
+    let copied = syscall::personality_copy_in(caller_port, cl_args_va, &mut buf);
+    if copied < 56 { return linux_err(EINVAL); }
+
+    let flags = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
+    let child_tid = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
+    let parent_tid = u64::from_le_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]);
+    let stack = u64::from_le_bytes([buf[40], buf[41], buf[42], buf[43], buf[44], buf[45], buf[46], buf[47]]);
+    let stack_size = u64::from_le_bytes([buf[48], buf[49], buf[50], buf[51], buf[52], buf[53], buf[54], buf[55]]);
+    let tls = if copied >= 64 {
+        u64::from_le_bytes([buf[56], buf[57], buf[58], buf[59], buf[60], buf[61], buf[62], buf[63]])
+    } else { 0 };
+
+    // clone3's stack field points to the BASE of the stack region (not the top).
+    // Linux clone() expects the top of the stack (base + size).
+    let child_stack = if stack != 0 && stack_size != 0 { stack + stack_size } else { stack };
+
+    // Map to clone() positional args: flags, child_stack, parent_tid, child_tid, tls.
+    let clone_args: [u64; 6] = [flags, child_stack, parent_tid, child_tid, tls, 0];
+    handle_clone(pi, caller_port, &clone_args)
 }
 
 /// Handle Linux wait4(pid, wstatus, options, rusage).
@@ -7795,6 +7830,7 @@ fn poll_single_fd(pi: usize, fd: usize) -> u32 {
             FdKind::DevZero | FdKind::DevUrandom => EPOLLIN | EPOLLOUT,
             FdKind::DevTty => EPOLLOUT, // writable, reads would block
             FdKind::Drm => EPOLLOUT, // page flip always accepted
+            FdKind::Inotify | FdKind::SignalFd => 0, // stub: never ready
             FdKind::Evdev => {
                 unsafe {
                     evdev_poll_events();
@@ -8676,7 +8712,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_TIMERFD_GETTIME => handle_timerfd_gettime(pi, caller_port, &msg.data),
 
             __NR_MEMFD_CREATE => handle_memfd_create(pi, caller_port, &msg.data),
-            __NR_CLONE3 => handle_fork(pi, caller_port), // clone3 uses struct; fork fallback for now
+            __NR_CLONE3 => handle_clone3(pi, caller_port, &msg.data),
 
             // mmap: anonymous or file-backed mapping in caller's address space.
             __NR_MMAP => handle_mmap(pi, caller_port, &msg.data),
@@ -8783,8 +8819,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_SETXATTR | __NR_LSETXATTR | __NR_FSETXATTR => linux_err(ENOSYS), // no xattr support
             __NR_LISTXATTR | __NR_LLISTXATTR | __NR_FLISTXATTR => 0, // empty list, 0 bytes
             __NR_REMOVEXATTR | __NR_LREMOVEXATTR | __NR_FREMOVEXATTR => linux_err(ENODATA),
-            __NR_INOTIFY_INIT1 => linux_err(ENOSYS), // no inotify support
-            __NR_INOTIFY_ADD_WATCH | __NR_INOTIFY_RM_WATCH => linux_err(EBADF),
+            __NR_INOTIFY_INIT1 => {
+                // Stub inotify fd — never delivers events, prevents ENOSYS crashes.
+                // (inotify_srv exists for future full wiring.)
+                match alloc_fd(pi) {
+                    Some(fd) => unsafe {
+                        PROC_TABLE[pi].fds[fd].kind = FdKind::Inotify;
+                        if msg.data[0] & 0x80000 != 0 { // IN_CLOEXEC
+                            PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+                        }
+                        fd as u64
+                    },
+                    None => linux_err(EMFILE),
+                }
+            }
+            __NR_INOTIFY_ADD_WATCH => 1, // fake watch descriptor
+            __NR_INOTIFY_RM_WATCH => 0,  // success
             __NR_SCHED_SET_ATTR => 0, // ignore scheduling attributes
             __NR_SCHED_GET_ATTR => linux_err(EINVAL), // unsupported, force fallback to getparam
             __NR_COPY_FILE_RANGE => linux_err(ENOSYS), // not supported yet
@@ -8906,7 +8956,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_PERF_EVENT_OPEN => linux_err(ENOSYS), // no perf support
             __NR_IO_SETUP | __NR_IO_DESTROY | __NR_IO_SUBMIT | __NR_IO_GETEVENTS => linux_err(ENOSYS),
             __NR_IO_URING_SETUP | __NR_IO_URING_ENTER | __NR_IO_URING_REGISTER => linux_err(ENOSYS),
-            __NR_SIGNALFD4 => linux_err(ENOSYS), // no signalfd yet
+            __NR_SIGNALFD4 => {
+                // Stub signalfd — never delivers signal info, prevents ENOSYS crashes.
+                match alloc_fd(pi) {
+                    Some(fd) => unsafe {
+                        PROC_TABLE[pi].fds[fd].kind = FdKind::SignalFd;
+                        if msg.data[2] & 0x80000 != 0 { // SFD_CLOEXEC
+                            PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+                        }
+                        fd as u64
+                    },
+                    None => linux_err(EMFILE),
+                }
+            }
             __NR_NAME_TO_HANDLE_AT | __NR_OPEN_BY_HANDLE_AT => linux_err(ENOSYS),
             __NR_SENDMMSG => handle_sendmmsg(pi, caller_port, &msg.data),
             __NR_RECVMMSG => handle_recvmmsg(pi, caller_port, &msg.data),
