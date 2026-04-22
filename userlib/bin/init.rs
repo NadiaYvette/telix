@@ -6071,6 +6071,34 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 191: GPU driver (Intel i915 or future GPU backends) ---
+    syscall::debug_puts(b"  init: Phase 191 GPU driver...\n");
+    {
+        match syscall::ns_lookup(b"gpu") {
+            Some(gpu_port) => {
+                // Send GPU_GET_CAPS (0x8100).
+                let rp = syscall::port_create();
+                syscall::send(gpu_port, 0x8100, 0, 0, (rp as u64) << 32, 0);
+                match syscall::recv_msg_timeout(rp, 2_000_000) {
+                    Some(msg) => {
+                        if msg.tag == 0x8101 {
+                            syscall::debug_puts(b"Phase 191 GPU: PASSED\n");
+                        } else {
+                            syscall::debug_puts(b"Phase 191 GPU: FAILED (bad reply)\n");
+                        }
+                    }
+                    None => {
+                        syscall::debug_puts(b"Phase 191 GPU: FAILED (timeout)\n");
+                    }
+                }
+                syscall::port_destroy(rp);
+            }
+            None => {
+                syscall::debug_puts(b"Phase 191 GPU: SKIPPED (no gpu server)\n");
+            }
+        }
+    }
+
     // --- Test 31: Phase 41 signal delivery ---
     syscall::debug_puts(b"  init: testing signal delivery...\n");
     {

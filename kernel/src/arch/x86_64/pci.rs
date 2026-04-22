@@ -545,3 +545,170 @@ pub fn find_virtio_device(device_id: u16) -> Option<PciDevice> {
     }
     None
 }
+
+/// Find a virtio-GPU PCI device.
+/// QEMU's `-device virtio-gpu-pci` uses vendor 0x1AF4, device ID 0x1050 (modern).
+/// The legacy I/O-port interface is at BAR0, same as other virtio devices.
+pub fn find_virtio_gpu() -> Option<PciDevice> {
+    for bus in 0..4u8 {
+        for dev in 0..32u8 {
+            let reg0 = pci_config_read32(bus, dev, 0, 0);
+            let vendor = reg0 as u16;
+            let did = (reg0 >> 16) as u16;
+            if vendor == 0xFFFF || vendor == 0 {
+                continue;
+            }
+            if vendor != VIRTIO_VENDOR {
+                continue;
+            }
+            // Match modern virtio-GPU (0x1050) or transitional (0x1002).
+            if did != 0x1050 && did != 0x1002 {
+                continue;
+            }
+            // Extra safety: verify class 0x03 (display controller).
+            let class_reg = pci_config_read32(bus, dev, 0, 0x08);
+            let base_class = (class_reg >> 24) as u8;
+            if base_class != 0x03 {
+                continue;
+            }
+
+            // Read BAR0 (I/O port for legacy virtio interface).
+            let bar0_raw = pci_config_read32(bus, dev, 0, 0x10);
+            let bar0 = (bar0_raw & !3) as u16;
+
+            let irq = pci_config_read32(bus, dev, 0, 0x3C) as u8;
+
+            let cmd = pci_config_read16(bus, dev, 0, 0x04);
+            if cmd & 0x05 != 0x05 {
+                pci_config_write16(bus, dev, 0, 0x04, cmd | 0x05);
+            }
+
+            crate::println!(
+                "  PCI: virtio-GPU {:04x}:{:04x} at {}.{} BAR0={:#x} IRQ={}",
+                vendor, did, bus, dev, bar0, irq
+            );
+
+            return Some(PciDevice {
+                bus,
+                device: dev,
+                vendor,
+                device_id: did,
+                bar0,
+                irq,
+            });
+        }
+    }
+    None
+}
+
+/// Discovered Intel GPU (i915).
+pub struct I915Device {
+    pub bus: u8,
+    pub device: u8,
+    pub func: u8,
+    pub device_id: u16,
+    /// BAR0 MMIO base address (GTTMMADR: registers + GGTT).
+    pub bar0: u64,
+    /// BAR0 region size.
+    pub bar0_size: u64,
+    /// PCI interrupt line.
+    pub irq: u8,
+}
+
+/// Scan PCI buses 0-7 for an Intel GPU (vendor 0x8086, class 0x03).
+/// Reads the 64-bit BAR0 (GTTMMADR), probes its size, enables bus mastering.
+/// Covers Gen 9 (Skylake), Gen 11 (Ice Lake), Gen 12 (Tiger Lake/Alder Lake/Raptor Lake).
+pub fn find_i915_device() -> Option<I915Device> {
+    for bus in 0..8u8 {
+        for dev in 0..32u8 {
+            for func in 0..8u8 {
+                let reg0 = pci_config_read32(bus, dev, func, 0);
+                let vendor = reg0 as u16;
+                let did = (reg0 >> 16) as u16;
+                if vendor == 0xFFFF || vendor == 0 {
+                    if func == 0 {
+                        break;
+                    }
+                    continue;
+                }
+
+                // Intel GPU: vendor 0x8086, class 0x03 (display controller).
+                if vendor != 0x8086 {
+                    if func == 0 {
+                        let hdr = pci_config_read32(bus, dev, 0, 0x0C);
+                        if (hdr >> 16) & 0x80 == 0 {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                let class_reg = pci_config_read32(bus, dev, func, 0x08);
+                let base_class = (class_reg >> 24) as u8;
+                if base_class != 0x03 {
+                    if func == 0 {
+                        let hdr = pci_config_read32(bus, dev, 0, 0x0C);
+                        if (hdr >> 16) & 0x80 == 0 {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                // Read 64-bit BAR0 (GTTMMADR).
+                let bar0_lo = pci_config_read32(bus, dev, func, 0x10);
+                if bar0_lo & 1 != 0 {
+                    continue; // I/O BAR, skip
+                }
+                let bar_type = (bar0_lo >> 1) & 3;
+                if bar_type != 2 {
+                    continue; // not 64-bit
+                }
+                let bar0_hi = pci_config_read32(bus, dev, func, 0x14);
+                let bar0 = ((bar0_hi as u64) << 32) | ((bar0_lo & !0xF) as u64);
+                if bar0 == 0 {
+                    continue;
+                }
+
+                // Probe BAR0 size.
+                let bar0_size = {
+                    pci_config_write32(bus, dev, func, 0x10, 0xFFFF_FFFF);
+                    let size_lo = pci_config_read32(bus, dev, func, 0x10);
+                    pci_config_write32(bus, dev, func, 0x10, bar0_lo);
+                    pci_config_write32(bus, dev, func, 0x14, 0xFFFF_FFFF);
+                    let size_hi = pci_config_read32(bus, dev, func, 0x14);
+                    pci_config_write32(bus, dev, func, 0x14, bar0_hi);
+                    let mask = ((size_hi as u64) << 32) | ((size_lo & !0xF) as u64);
+                    if mask == 0 {
+                        0x100_0000 // default 16 MiB
+                    } else {
+                        (!mask).wrapping_add(1)
+                    }
+                };
+
+                let irq = pci_config_read32(bus, dev, func, 0x3C) as u8;
+
+                // Enable bus mastering + memory space.
+                let cmd = pci_config_read16(bus, dev, func, 0x04);
+                if cmd & 0x06 != 0x06 {
+                    pci_config_write16(bus, dev, func, 0x04, cmd | 0x06);
+                }
+
+                crate::println!(
+                    "  PCI: Intel GPU {:04x}:{:04x} at {}.{}.{} BAR0={:#x} size={:#x} IRQ={}",
+                    vendor, did, bus, dev, func, bar0, bar0_size, irq
+                );
+
+                return Some(I915Device {
+                    bus,
+                    device: dev,
+                    func,
+                    device_id: did,
+                    bar0,
+                    bar0_size,
+                    irq,
+                });
+            }
+        }
+    }
+    None
+}

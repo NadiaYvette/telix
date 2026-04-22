@@ -362,6 +362,32 @@ fn startup_thread() -> ! {
             }
         }
 
+        // Intel GPU (i915) discovery and i915_srv spawn.
+        if let Some(i915) = arch::x86_64::pci::find_i915_device() {
+            let region_id = cap::mmio::register_region(
+                i915.bar0 as usize,
+                i915.bar0_size as usize,
+                cap::mmio::CacheAttr::Device,
+            );
+            let arg0_upper = (i915.irq as u64) << 48;
+            let spawned = match region_id {
+                Some(rid) => {
+                    sched::spawn_user_with_mmio_cap(b"i915_srv", 50, 20, arg0_upper, rid)
+                }
+                None => sched::spawn_user(b"i915_srv", 50, 20, arg0_upper),
+            };
+            match spawned {
+                Some(tid) => println!("  i915_srv spawned (thread {})", tid),
+                None => println!("  WARNING: i915_srv not found (ok if not yet built)"),
+            }
+        }
+
+        // Discover virtio-GPU and encode bar0+irq for fb_srv arg0.
+        let mut fb_arg0_upper: u64 = 0;
+        if let Some(vgpu) = arch::x86_64::pci::find_virtio_gpu() {
+            fb_arg0_upper = ((vgpu.irq as u64) << 48) | ((vgpu.bar0 as u64) << 16);
+        }
+
         // Probe BochsVBE (QEMU -vga std) and set up framebuffer info.
         arch::x86_64::pci::probe_bochs_vbe();
         // Register the VBE framebuffer as an MMIO region so fb_srv and
@@ -375,11 +401,13 @@ fn startup_thread() -> ! {
                 None
             }
         });
-        // fb_srv arg0 encoding: arg0=0 means no VBE available.
-        // With a VBE region, the cap slot is granted by spawn_user_with_mmio_cap.
+        // fb_srv arg0 encoding:
+        //   bits  0-15: VBE framebuffer MMIO cap slot (from spawn_user_with_mmio_cap)
+        //   bits 16-31: virtio-GPU BAR0 I/O port (0 if no GPU)
+        //   bits 48-63: virtio-GPU IRQ
         let fb_spawn = match vbe_region {
-            Some(rid) => sched::spawn_user_with_mmio_cap(b"fb_srv", 50, 20, 0, rid),
-            None => sched::spawn_user(b"fb_srv", 50, 20, 0),
+            Some(rid) => sched::spawn_user_with_mmio_cap(b"fb_srv", 50, 20, fb_arg0_upper, rid),
+            None => sched::spawn_user(b"fb_srv", 50, 20, fb_arg0_upper),
         };
         match fb_spawn {
             Some(tid) => println!("  fb_srv spawned (thread {})", tid),

@@ -263,3 +263,7 @@ path = "bin/ntfs_srv.rs"
 [[bin]]
 name = "btrfs_srv"
 path = "bin/btrfs_srv.rs"
+
+[[bin]]
+name = "i915_srv"
+path = "bin/i915_srv.rs"
