@@ -71,6 +71,10 @@ pub fn kmain() -> ! {
     // Must happen before secondary CPU startup (they need the page table root).
     arch::platform::enable_mmu();
 
+    // Initialize framebuffer console (if GOP/VBE framebuffer is available).
+    // After MMU enable so the framebuffer address is identity-mapped.
+    drivers::fb_console::init();
+
     // Quick phys allocator test.
     if let Some(page) = mm::phys::alloc_page() {
         println!("  Phys alloc test: page at {:?}", page);
@@ -430,6 +434,9 @@ fn startup_thread() -> ! {
 
         // Probe BochsVBE (QEMU -vga std) and set up framebuffer info.
         arch::x86_64::pci::probe_bochs_vbe();
+        // Re-try framebuffer console init now that VBE info is available.
+        // (The early init at boot only succeeds on EFI where GOP is set up.)
+        drivers::fb_console::init();
         // Register the VBE framebuffer as an MMIO region so fb_srv and
         // compositor_srv can map it via sys_mmio_map_cap. This is x86_64's
         // only MMIO device outside PCI I/O ports.

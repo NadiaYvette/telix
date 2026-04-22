@@ -1,3 +1,4 @@
+pub mod fb_console;
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(dead_code)]
 pub mod virtio_blk;

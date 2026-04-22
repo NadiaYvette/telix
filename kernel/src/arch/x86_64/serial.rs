@@ -108,6 +108,21 @@ pub fn putc(c: u8) {
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
     Serial.write_fmt(args).unwrap();
+    // Mirror output to framebuffer console (if initialized).
+    if crate::drivers::fb_console::available() {
+        let mut fb = FbWriter;
+        let _ = fb.write_fmt(args);
+    }
+}
+
+/// Thin wrapper for writing to the framebuffer console via core::fmt.
+struct FbWriter;
+
+impl fmt::Write for FbWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        crate::drivers::fb_console::write_str(s);
+        Ok(())
+    }
 }
 
 #[macro_export]
