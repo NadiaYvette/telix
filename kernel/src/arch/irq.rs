@@ -273,7 +273,13 @@ pub fn enable_device_irq(irq: u32) {
         crate::arch::riscv64::plic::enable_irq(hart, irq);
     }
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::pic::unmask(irq as u8);
+    {
+        if crate::arch::x86_64::ioapic::available() {
+            crate::arch::x86_64::ioapic::unmask_irq(irq as u8);
+        } else {
+            crate::arch::x86_64::pic::unmask(irq as u8);
+        }
+    }
     #[cfg(target_arch = "loongarch64")]
     {
         let _ = irq; // TODO: EIOINTC enable

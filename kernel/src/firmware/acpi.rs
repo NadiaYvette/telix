@@ -139,14 +139,19 @@ fn walk_sdt(sdt_addr: usize, is_xsdt: bool) {
     );
 }
 
-/// Scan the BIOS data area (0xE0000..0xFFFFF) for the RSDP signature.
-/// Returns the address of the RSDP, or 0 if not found.
+/// Find the RSDP.  If the EFI boot path provided an override, use it;
+/// otherwise scan the BIOS data area (0xE0000..0xFFFFF).
 fn find_rsdp() -> usize {
+    // EFI boot path provides the RSDP address directly.
+    let ovr = super::rsdp_override();
+    if ovr != 0 {
+        return ovr as usize;
+    }
+    // Legacy BIOS scan.
     let mut addr = 0xE_0000usize;
     while addr < 0x10_0000 {
         let sig = unsafe { core::slice::from_raw_parts(addr as *const u8, 8) };
         if sig == b"RSD PTR " {
-            // Validate checksum: sum of first 20 bytes must be 0.
             let mut sum: u8 = 0;
             for i in 0..20 {
                 sum = sum.wrapping_add(unsafe { *((addr + i) as *const u8) });
@@ -211,6 +216,22 @@ fn parse_madt(madt_addr: usize) {
                     let mut info = super::irq_controller();
                     info.base1 = io_apic_addr as u64;
                     super::set_irq_controller(info);
+                }
+            }
+            2 => {
+                // Type 2: Interrupt Source Override (10 bytes).
+                // Byte 2: bus (always 0 = ISA), byte 3: source IRQ,
+                // bytes 4-7: Global System Interrupt, bytes 8-9: flags.
+                if entry_len >= 10 {
+                    let source = unsafe { *((madt_addr + offset + 3) as *const u8) };
+                    let gsi = unsafe {
+                        core::ptr::read_unaligned((madt_addr + offset + 4) as *const u32)
+                    };
+                    let flags = unsafe {
+                        core::ptr::read_unaligned((madt_addr + offset + 8) as *const u16)
+                    };
+                    #[cfg(target_arch = "x86_64")]
+                    crate::arch::x86_64::ioapic::register_iso(source, gsi, flags);
                 }
             }
             _ => {}

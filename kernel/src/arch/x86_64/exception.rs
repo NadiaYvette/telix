@@ -331,7 +331,11 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             if !crate::io::irq_dispatch::handle_irq(irq as u32) {
                 crate::println!("Unhandled IRQ {}", irq);
             }
-            super::pic::send_eoi(irq);
+            if super::ioapic::available() {
+                super::lapic::eoi();
+            } else {
+                super::pic::send_eoi(irq);
+            }
         }
 
         _ => {

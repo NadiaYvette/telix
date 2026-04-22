@@ -1,0 +1,12 @@
+[package]
+name = "telix-efi"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "telix-efi"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true

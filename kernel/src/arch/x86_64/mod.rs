@@ -5,6 +5,7 @@ pub mod idt;
 pub mod lapic;
 pub mod mm;
 pub mod pci;
+pub mod ioapic;
 pub mod pic;
 pub mod serial;
 pub mod smp;
@@ -30,9 +31,11 @@ pub fn init() {
     pic::mask(0);         // Mask PIT IRQ 0 — LAPIC timer takes over
 }
 
-/// Parse firmware tables (Multiboot memory map + ACPI MADT).
+/// Parse firmware tables (Multiboot memory map + ACPI MADT),
+/// then initialize the I/O APIC (after LAPIC init + MADT ISO entries).
 pub fn parse_firmware() {
     boot::parse_firmware();
+    ioapic::init();
 }
 
 /// RAM range for the physical allocator.

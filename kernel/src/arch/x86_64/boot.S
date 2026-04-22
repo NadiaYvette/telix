@@ -19,6 +19,16 @@ multiboot_header:
     .long   MB_FLAGS
     .long   MB_CHECKSUM
 
+// EFI boot header: lets the EFI stub find the 64-bit entry point and stack.
+// Located at kernel_base + 12 (immediately after Multiboot header).
+.set EFI_HDR_MAGIC, 0x54454649   // "TEFI"
+.global _efi_header
+_efi_header:
+    .long   EFI_HDR_MAGIC
+    .long   0                       // reserved
+    .quad   _rust_entry             // 64-bit entry point
+    .quad   __boot_stack_top        // boot stack top
+
 // ============================================================================
 // 32-bit entry point
 // ============================================================================

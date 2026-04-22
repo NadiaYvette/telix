@@ -7,6 +7,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Multiboot info pointer saved from boot.
 pub static MULTIBOOT_INFO: AtomicUsize = AtomicUsize::new(0);
+/// EFI boot info pointer (0 if Multiboot boot).
+pub static EFI_BOOT_INFO: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" {
     static __kernel_end: u8;
@@ -20,49 +22,63 @@ pub fn kernel_end_addr() -> usize {
     unsafe { &__kernel_end as *const u8 as usize }
 }
 
-/// Rust entry point called from assembly.
+/// Rust entry point called from assembly (Multiboot) or EFI stub.
 #[unsafe(no_mangle)]
-pub extern "C" fn _rust_entry(multiboot_info: usize) -> ! {
-    MULTIBOOT_INFO.store(multiboot_info, Ordering::Relaxed);
-
-    // Serial is available immediately (I/O ports, no MMIO setup needed).
-    crate::println!("Telix booting on x86-64");
-    crate::println!("  Multiboot info at: {:#x}", multiboot_info);
+pub extern "C" fn _rust_entry(boot_info: usize) -> ! {
+    // Detect EFI vs Multiboot boot by checking for the "TEFI" magic.
+    let magic = unsafe { *(boot_info as *const u32) };
+    if magic == crate::firmware::efi_boot::EFI_BOOT_MAGIC {
+        EFI_BOOT_INFO.store(boot_info, Ordering::Relaxed);
+        crate::println!("Telix booting on x86-64 (EFI)");
+        crate::println!("  EFI boot info at: {:#x}", boot_info);
+    } else {
+        MULTIBOOT_INFO.store(boot_info, Ordering::Relaxed);
+        crate::println!("Telix booting on x86-64");
+        crate::println!("  Multiboot info at: {:#x}", boot_info);
+    }
     crate::println!("  Kernel end at: {:#x}", kernel_end_addr());
 
     crate::kmain()
 }
 
-/// Parse firmware tables (Multiboot memory map + ACPI MADT).
-/// Must be called before phys::init() — Multiboot info is in physical memory.
+/// Parse firmware tables (Multiboot memory map + ACPI MADT, or EFI boot info).
+/// Must be called before phys::init() — firmware data lives in physical memory.
 pub fn parse_firmware() {
-    let info = MULTIBOOT_INFO.load(Ordering::Relaxed);
-    if info != 0 {
-        crate::firmware::multiboot::parse(info);
-        let nr = crate::firmware::mem_regions().len();
-        crate::println!("  Multiboot: {} memory regions", nr);
+    let efi = EFI_BOOT_INFO.load(Ordering::Relaxed);
+    if efi != 0 {
+        // EFI boot path: memory map, framebuffer, and RSDP from EFI loader.
+        crate::firmware::efi_boot::parse(efi);
+    } else {
+        let info = MULTIBOOT_INFO.load(Ordering::Relaxed);
+        if info != 0 {
+            crate::firmware::multiboot::parse(info);
+            let nr = crate::firmware::mem_regions().len();
+            crate::println!("  Multiboot: {} memory regions", nr);
 
-        // Extract kernel command line (flags bit 2 → cmdline at offset 16).
-        let info_ptr = info as *const u8;
-        let flags = unsafe { core::ptr::read_unaligned(info_ptr as *const u32) };
-        if flags & (1 << 2) != 0 {
-            let cmdline_addr =
-                unsafe { core::ptr::read_unaligned(info_ptr.add(16) as *const u32) } as usize;
-            if cmdline_addr != 0 {
-                // Find null terminator (C string).
-                let ptr = cmdline_addr as *const u8;
-                let mut len = 0usize;
-                while len < 1024 {
-                    if unsafe { *ptr.add(len) } == 0 {
-                        break;
+            // Extract kernel command line (flags bit 2 → cmdline at offset 16).
+            let info_ptr = info as *const u8;
+            let flags = unsafe { core::ptr::read_unaligned(info_ptr as *const u32) };
+            if flags & (1 << 2) != 0 {
+                let cmdline_addr =
+                    unsafe { core::ptr::read_unaligned(info_ptr.add(16) as *const u32) }
+                        as usize;
+                if cmdline_addr != 0 {
+                    let ptr = cmdline_addr as *const u8;
+                    let mut len = 0usize;
+                    while len < 1024 {
+                        if unsafe { *ptr.add(len) } == 0 {
+                            break;
+                        }
+                        len += 1;
                     }
-                    len += 1;
-                }
-                if len > 0 {
-                    let cmdline = unsafe { core::slice::from_raw_parts(ptr, len) };
-                    crate::boot::cmdline::save_cmdline(cmdline);
-                    crate::println!("  Multiboot: cmdline \"{}\"",
-                        core::str::from_utf8(cmdline).unwrap_or("?"));
+                    if len > 0 {
+                        let cmdline = unsafe { core::slice::from_raw_parts(ptr, len) };
+                        crate::boot::cmdline::save_cmdline(cmdline);
+                        crate::println!(
+                            "  Multiboot: cmdline \"{}\"",
+                            core::str::from_utf8(cmdline).unwrap_or("?")
+                        );
+                    }
                 }
             }
         }

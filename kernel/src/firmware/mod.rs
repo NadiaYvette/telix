@@ -12,6 +12,8 @@
 pub mod acpi;
 pub mod dtb;
 #[cfg(target_arch = "x86_64")]
+pub mod efi_boot;
+#[cfg(target_arch = "x86_64")]
 pub mod multiboot;
 
 use crate::sched::smp::MAX_CPUS;
@@ -325,4 +327,17 @@ pub(crate) fn set_pci_ecam(info: PciEcamInfo) {
         *PCI_ECAM.0.get() = info;
     }
     PCI_ECAM_SET.store(1, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
+// RSDP override (set by EFI boot path, used by acpi.rs)
+// ---------------------------------------------------------------------------
+static RSDP_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn set_rsdp_override(addr: u64) {
+    RSDP_OVERRIDE.store(addr, Ordering::Release);
+}
+
+pub(crate) fn rsdp_override() -> u64 {
+    RSDP_OVERRIDE.load(Ordering::Acquire)
 }
