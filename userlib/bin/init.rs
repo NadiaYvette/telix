@@ -4435,6 +4435,126 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 194: Linux personality FS syscall dispatch ---
+    // Verify rename/truncate/chown/symlink dispatch (not ENOSYS).
+    // Needs linux_srv + VFS. Spawn VFS early if not already up.
+    syscall::debug_puts(b"  init: Phase 194 FS syscall dispatch...\n");
+    {
+        // Ensure VFS is running (normally spawned later in Phase 51).
+        if syscall::ns_lookup(b"vfs").is_none() {
+            let _ = syscall::spawn(b"vfs_srv", 50);
+            for _ in 0..200 {
+                if syscall::ns_lookup(b"vfs").is_some() { break; }
+                syscall::sleep_ms(10);
+            }
+        }
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        let vfs_ok = syscall::ns_lookup(b"vfs").is_some();
+        if linux_ok && vfs_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const NR_TRUNCATE: u64 = 76;
+                        const NR_RENAME: u64 = 82;
+                        const NR_CHOWN: u64 = 92;
+                        const NR_SYMLINK: u64 = 88;
+                        const NR_EXIT_GROUP: u64 = 231;
+                        const ENOSYS_NEG: u64 = (-38i64) as u64;
+
+                        let path: [u8; 16] = *b"/tmp/no_exist\0\0\0";
+                        let tgt: [u8; 8] = *b"target\0\0";
+                        let mut pass: u64 = 0;
+
+                        let ret: u64;
+                        core::arch::asm!("syscall",
+                            in("rax") NR_TRUNCATE,
+                            in("rdi") path.as_ptr(),
+                            in("rsi") 0u64,
+                            lateout("rax") ret,
+                            out("rcx") _, out("r11") _);
+                        if ret != ENOSYS_NEG { pass += 1; }
+
+                        let ret2: u64;
+                        core::arch::asm!("syscall",
+                            in("rax") NR_RENAME,
+                            in("rdi") path.as_ptr(),
+                            in("rsi") path.as_ptr(),
+                            lateout("rax") ret2,
+                            out("rcx") _, out("r11") _);
+                        if ret2 != ENOSYS_NEG { pass += 1; }
+
+                        let ret3: u64;
+                        core::arch::asm!("syscall",
+                            in("rax") NR_CHOWN,
+                            in("rdi") path.as_ptr(),
+                            in("rsi") 0u64,
+                            in("rdx") 0u64,
+                            lateout("rax") ret3,
+                            out("rcx") _, out("r11") _);
+                        if ret3 != ENOSYS_NEG { pass += 1; }
+
+                        let ret4: u64;
+                        core::arch::asm!("syscall",
+                            in("rax") NR_SYMLINK,
+                            in("rdi") tgt.as_ptr(),
+                            in("rsi") path.as_ptr(),
+                            lateout("rax") ret4,
+                            out("rcx") _, out("r11") _);
+                        if ret4 != ENOSYS_NEG { pass += 1; }
+
+                        core::arch::asm!("syscall",
+                            in("rax") NR_EXIT_GROUP,
+                            in("rdi") pass,
+                            options(noreturn));
+                    }
+                }
+                syscall::exit(99);
+                loop {}
+            }
+            {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..3000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 4 {
+                    syscall::debug_puts(b"Phase 194 FS syscall dispatch: PASSED (4/4)\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 194 FS syscall dispatch: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 194 FS syscall dispatch: FAILED (");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b"/4)\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 194 FS syscall dispatch: SKIPPED\n");
+        }
+    }
+
     // --- Phase 177: ISO 9660 filesystem server ---
     syscall::debug_puts(b"  init: Phase 177 ISO 9660 filesystem...\n");
     {

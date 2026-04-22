@@ -136,7 +136,9 @@ const __NR_PWRITE64: u64 = 18;
 const __NR_READV: u64 = 19;
 const __NR_CHMOD: u64 = 90;
 const __NR_FCHMOD: u64 = 91;
+const __NR_CHOWN: u64 = 92;
 const __NR_FCHOWN: u64 = 93;
+const __NR_LCHOWN: u64 = 94;
 const __NR_SIGALTSTACK: u64 = 131;
 const __NR_RT_SIGPENDING: u64 = 127;
 const __NR_RT_SIGSUSPEND: u64 = 130;
@@ -280,6 +282,7 @@ const EINTR: u64 = 4;
 const ECONNREFUSED: u64 = 111;
 const EOPNOTSUPP: u64 = 95;
 const ENOPROTOOPT: u64 = 92;
+const ENAMETOOLONG: u64 = 36;
 
 // Socket address families
 const AF_UNIX: u64 = 1;
@@ -332,6 +335,16 @@ const VFS_UTIMENS_OK: u64 = 0x6190;
 const VFS_READDIR: u64 = 0x6030;
 const VFS_READDIR_OK: u64 = 0x6130;
 const VFS_READDIR_END: u64 = 0x6131;
+const VFS_SYMLINK: u64 = 0x60A0;
+const VFS_SYMLINK_OK: u64 = 0x61A0;
+const VFS_RENAME: u64 = 0x60C0;
+const VFS_RENAME_OK: u64 = 0x61C0;
+const VFS_CHOWN: u64 = 0x60D0;
+const VFS_CHOWN_OK: u64 = 0x61D0;
+const VFS_TRUNCATE: u64 = 0x60E0;
+const VFS_TRUNCATE_OK: u64 = 0x61E0;
+const VFS_READLINK: u64 = 0x60F0;
+const VFS_READLINK_OK: u64 = 0x61F0;
 const VFS_ERROR: u64 = 0x6F00;
 
 // FS server protocol tags
@@ -526,6 +539,16 @@ impl ProcessState {
 static mut PROC_TABLE: [ProcessState; MAX_PROCS] = [const { ProcessState::empty() }; MAX_PROCS];
 static mut VFS_PORT: u64 = 0;
 static mut REPLY_PORT: u64 = 0;
+
+/// Lazily resolve VFS_PORT. Returns the cached value if non-zero, else retries ns_lookup.
+fn get_vfs_port() -> u64 {
+    unsafe {
+        if VFS_PORT == 0 {
+            VFS_PORT = syscall::ns_lookup(b"vfs").unwrap_or(0);
+        }
+        VFS_PORT
+    }
+}
 
 /// Debug: when set to a valid pi, every dispatch call from that pi is logged.
 /// Used to isolate the Phase 172 EFAULT mystery.
@@ -1644,7 +1667,7 @@ fn put_long_path(path: &[u8]) -> usize {
 
 /// Open via VFS_OPEN_LONG. Returns fd or negated errno.
 fn do_open_long(pi: usize, path: &[u8], flags: u64) -> u64 {
-    let vfs_port = unsafe { VFS_PORT };
+    let vfs_port = get_vfs_port();
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
@@ -1691,7 +1714,7 @@ fn do_open_long(pi: usize, path: &[u8], flags: u64) -> u64 {
 /// Stat via VFS_STAT_LONG. Fills (size, mode, ftype) into result words.
 /// Returns 0 on success or negated errno.
 fn do_stat_long(path: &[u8]) -> Option<(u64, u64, u64, u64)> {
-    let vfs_port = unsafe { VFS_PORT };
+    let vfs_port = get_vfs_port();
     if vfs_port == 0 {
         return None;
     }
@@ -1710,7 +1733,7 @@ fn do_stat_long(path: &[u8]) -> Option<(u64, u64, u64, u64)> {
 
 /// chmod via VFS_CHMOD long-path. Returns 0 on success or negated errno.
 fn do_chmod_long(path: &[u8], mode: u32) -> u64 {
-    let vfs_port = unsafe { VFS_PORT };
+    let vfs_port = get_vfs_port();
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
@@ -1727,7 +1750,7 @@ fn do_chmod_long(path: &[u8], mode: u32) -> u64 {
 
 /// utimens via VFS_UTIMENS long-path. Returns 0 on success or negated errno.
 fn do_utimens_long(path: &[u8], atime: u64, mtime: u64) -> u64 {
-    let vfs_port = unsafe { VFS_PORT };
+    let vfs_port = get_vfs_port();
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
@@ -1742,9 +1765,132 @@ fn do_utimens_long(path: &[u8], atime: u64, mtime: u64) -> u64 {
     }
 }
 
+// ===========================================================================
+// Phase 176: rename, truncate, symlink, chown via VFS
+// ===========================================================================
+
+/// Rename a file via VFS. Old path in data[0..2], new name (basename) in data[3].
+/// VFS resolves the old path to a mount, then forwards old relative name + new
+/// name to the FS server. Same-directory rename only (VFS protocol limitation).
+fn do_rename(pi: usize, caller_port: u64, old_va: usize, new_va: usize) -> u64 {
+    let vfs_port = get_vfs_port();
+    if vfs_port == 0 { return linux_err(ENOSYS); }
+
+    let (old_path, old_len) = resolve_path(pi, caller_port, old_va);
+    if old_len == 0 { return linux_err(EFAULT); }
+
+    // Read new path and extract basename (just the filename portion).
+    let (new_path, new_len) = resolve_path(pi, caller_port, new_va);
+    if new_len == 0 { return linux_err(EFAULT); }
+    // Find basename: last component after final '/'.
+    let mut base_start = 0;
+    for i in 0..new_len {
+        if new_path[i] == b'/' { base_start = i + 1; }
+    }
+    let base_len = new_len - base_start;
+    if base_len == 0 || base_len > 8 { return linux_err(ENAMETOOLONG); }
+
+    // Pack new basename into a single u64.
+    let mut new_word: u64 = 0;
+    for i in 0..base_len {
+        new_word |= (new_path[base_start + i] as u64) << (i * 8);
+    }
+
+    if old_len > 16 { return linux_err(ENAMETOOLONG); }
+    let (w0, w1, plen) = pack_path_vfs(&old_path, old_len);
+    match syscall::call(vfs_port, VFS_RENAME, w0, w1, plen, new_word) {
+        Some(resp) if resp.tag == VFS_RENAME_OK => 0,
+        _ => linux_err(ENOENT),
+    }
+}
+
+/// Truncate a file by path via VFS.
+fn do_truncate(pi: usize, caller_port: u64, path_va: usize, length: u64) -> u64 {
+    let vfs_port = get_vfs_port();
+    if vfs_port == 0 { return linux_err(ENOSYS); }
+
+    let (path, plen) = resolve_path(pi, caller_port, path_va);
+    if plen == 0 { return linux_err(EFAULT); }
+
+    if plen > 16 {
+        let n = put_long_path(&path[..plen]);
+        if n == 0 { return linux_err(ENOENT); }
+        let d0 = n as u64;
+        match syscall::call(vfs_port, VFS_TRUNCATE, d0, 0, 0, length) {
+            Some(resp) if resp.tag == VFS_TRUNCATE_OK => 0,
+            _ => linux_err(ENOENT),
+        }
+    } else {
+        let (w0, w1, pathlen) = pack_path_vfs(&path, plen);
+        match syscall::call(vfs_port, VFS_TRUNCATE, w0, w1, pathlen, length) {
+            Some(resp) if resp.tag == VFS_TRUNCATE_OK => 0,
+            _ => linux_err(ENOENT),
+        }
+    }
+}
+
+/// Create a symbolic link via VFS. link_path in data[0..2], target in data[3].
+fn do_symlink(pi: usize, caller_port: u64, target_va: usize, linkpath_va: usize) -> u64 {
+    let vfs_port = get_vfs_port();
+    if vfs_port == 0 { return linux_err(ENOSYS); }
+
+    // Read target string from user memory.
+    let mut target_buf = [0u8; 64];
+    let mut target_len = 0usize;
+    for &try_len in &[64usize, 32, 16, 8] {
+        let n = syscall::personality_copy_in(caller_port, target_va, &mut target_buf[..try_len]);
+        if n > 0 { target_len = n; break; }
+    }
+    if target_len == 0 { return linux_err(EFAULT); }
+    target_len = target_buf[..target_len].iter().position(|&b| b == 0).unwrap_or(target_len);
+    if target_len > 8 { return linux_err(ENAMETOOLONG); }
+
+    let (link_path, link_len) = resolve_path(pi, caller_port, linkpath_va);
+    if link_len == 0 { return linux_err(EFAULT); }
+    if link_len > 16 { return linux_err(ENAMETOOLONG); }
+
+    let (w0, w1, plen) = pack_path_vfs(&link_path, link_len);
+    // Pack target into a single u64 (VFS passes data[3] to FS_SYMLINK).
+    let mut target_word: u64 = 0;
+    for i in 0..target_len {
+        target_word |= (target_buf[i] as u64) << (i * 8);
+    }
+    match syscall::call(vfs_port, VFS_SYMLINK, w0, w1, plen, target_word) {
+        Some(resp) if resp.tag == VFS_SYMLINK_OK => 0,
+        _ => linux_err(ENOENT),
+    }
+}
+
+/// Change file ownership via VFS.
+fn do_chown(pi: usize, caller_port: u64, path_va: usize, uid: u32, gid: u32) -> u64 {
+    let vfs_port = get_vfs_port();
+    if vfs_port == 0 { return linux_err(ENOSYS); }
+
+    let (path, plen) = resolve_path(pi, caller_port, path_va);
+    if plen == 0 { return linux_err(EFAULT); }
+
+    let uid_gid = (uid as u64) | ((gid as u64) << 32);
+
+    if plen > 16 {
+        let n = put_long_path(&path[..plen]);
+        if n == 0 { return linux_err(ENOENT); }
+        let d0 = n as u64;
+        match syscall::call(vfs_port, VFS_CHOWN, d0, 0, 0, uid_gid) {
+            Some(resp) if resp.tag == VFS_CHOWN_OK => 0,
+            _ => linux_err(ENOENT),
+        }
+    } else {
+        let (w0, w1, pathlen) = pack_path_vfs(&path, plen);
+        match syscall::call(vfs_port, VFS_CHOWN, w0, w1, pathlen, uid_gid) {
+            Some(resp) if resp.tag == VFS_CHOWN_OK => 0,
+            _ => linux_err(ENOENT),
+        }
+    }
+}
+
 /// Open a file via VFS. Returns fd or negated errno.
 fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
-    let vfs_port = unsafe { VFS_PORT };
+    let vfs_port = get_vfs_port();
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
@@ -2310,7 +2456,7 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
     let path_va = args[0] as usize;
     let statbuf_va = args[1] as usize;
 
-    let vfs_port = unsafe { VFS_PORT };
+    let vfs_port = get_vfs_port();
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
@@ -2599,7 +2745,7 @@ fn handle_statx(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     }
 
     // Path-based statx: resolve path, query VFS.
-    let vfs_port = unsafe { VFS_PORT };
+    let vfs_port = get_vfs_port();
     if vfs_port == 0 { return linux_err(ENOSYS); }
 
     let (path, pathlen) = resolve_path(pi, caller_port, path_va);
@@ -2902,7 +3048,7 @@ fn handle_umask(pi: usize, args: &[u64; 6]) -> u64 {
 fn handle_access(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let path_va = args[0] as usize;
 
-    let vfs_port = unsafe { VFS_PORT };
+    let vfs_port = get_vfs_port();
     if vfs_port == 0 {
         return linux_err(ENOSYS);
     }
@@ -3908,7 +4054,7 @@ fn handle_mkdir(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let path_va = args[0] as usize;
     let mode = args[1] as u32;
 
-    let vfs_port = unsafe { VFS_PORT };
+    let vfs_port = get_vfs_port();
     if vfs_port == 0 { return linux_err(ENOSYS); }
 
     let (path, pathlen) = resolve_path(pi, caller_port, path_va);
@@ -3934,7 +4080,7 @@ fn handle_mkdirat(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 fn handle_unlink_impl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let path_va = args[0] as usize;
 
-    let vfs_port = unsafe { VFS_PORT };
+    let vfs_port = get_vfs_port();
     if vfs_port == 0 { return linux_err(ENOSYS); }
 
     let (path, pathlen) = resolve_path(pi, caller_port, path_va);
@@ -3964,7 +4110,7 @@ fn handle_chdir(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     if pathlen == 0 { return linux_err(EFAULT); }
 
     // Verify directory exists via VFS_STAT.
-    let vfs_port = unsafe { VFS_PORT };
+    let vfs_port = get_vfs_port();
     if vfs_port == 0 { return linux_err(ENOSYS); }
 
     let (w0, w1, plen) = pack_path_vfs(&path, pathlen);
@@ -4017,7 +4163,7 @@ fn handle_fchdir(pi: usize, args: &[u64; 6]) -> u64 {
 /// VFS_READDIR: data[0]=path_lo, data[1]=path_hi, data[2]=path_len(16)|reply_port(32)
 /// VFS_READDIR_OK: data[0]=size, data[1]=name_lo, data[2]=name_hi, data[3]=next_offset
 fn handle_getdents64_dir(pi: usize, caller_port: u64, fd: usize, dirp_va: usize, count: usize) -> u64 {
-    let vfs_port = unsafe { VFS_PORT };
+    let vfs_port = get_vfs_port();
     if vfs_port == 0 { return 0; }
 
     let (path, plen) = unsafe {
@@ -7310,7 +7456,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     if plen == 0 { linux_err(EFAULT) } else { do_chmod_long(&path[..plen], mode) }
                 }
             }
-            __NR_FCHOWN | __NR_FCHOWNAT => 0, // stub: single-user, no ownership enforcement
+            __NR_FCHOWN => 0, // single-user stub for fd-based chown
+            __NR_CHOWN | __NR_LCHOWN => do_chown(pi, caller_port, msg.data[0] as usize, msg.data[1] as u32, msg.data[2] as u32),
+            __NR_FCHOWNAT => {
+                let dirfd = msg.data[0];
+                if dirfd != AT_FDCWD && (dirfd as i64) >= 0 { 0 }
+                else { do_chown(pi, caller_port, msg.data[1] as usize, msg.data[2] as u32, msg.data[3] as u32) }
+            }
 
             // epoll
             __NR_EPOLL_CREATE => handle_epoll_create1(pi, 0),
@@ -7352,10 +7504,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             }
 
-            // Stubs: file ops that need VFS extensions.
-            __NR_RENAME | __NR_RENAMEAT | __NR_RENAMEAT2 => linux_err(ENOSYS),
+            // Filesystem operations via VFS.
+            __NR_RENAME => do_rename(pi, caller_port, msg.data[0] as usize, msg.data[1] as usize),
+            __NR_RENAMEAT | __NR_RENAMEAT2 => {
+                let olddirfd = msg.data[0];
+                let newdirfd = msg.data[2];
+                if (olddirfd != AT_FDCWD && (olddirfd as i64) >= 0)
+                    || (newdirfd != AT_FDCWD && (newdirfd as i64) >= 0) { linux_err(ENOSYS) }
+                else { do_rename(pi, caller_port, msg.data[1] as usize, msg.data[3] as usize) }
+            }
             __NR_FLOCK => 0, // stub: no mandatory locking
-            __NR_TRUNCATE => linux_err(ENOSYS), // needs VFS_TRUNCATE
+            __NR_TRUNCATE => do_truncate(pi, caller_port, msg.data[0] as usize, msg.data[1]),
 
             // Phase 151: sync/persistence stubs + misc.
             __NR_FSYNC | __NR_FDATASYNC => 0, // no durable storage, always "synced"
@@ -7394,7 +7553,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
             }
-            __NR_SYMLINK | __NR_SYMLINKAT => linux_err(ENOSYS), // no symlink support
+            __NR_SYMLINK => do_symlink(pi, caller_port, msg.data[0] as usize, msg.data[1] as usize),
+            __NR_SYMLINKAT => {
+                let newdirfd = msg.data[1];
+                if newdirfd != AT_FDCWD && (newdirfd as i64) >= 0 { linux_err(ENOSYS) }
+                else { do_symlink(pi, caller_port, msg.data[0] as usize, msg.data[2] as usize) }
+            }
             __NR_LINK | __NR_LINKAT => linux_err(ENOSYS), // no hard link support
 
             // Phase 152: scheduler, memory, sendfile.
@@ -7495,7 +7659,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 sec
             }
-            __NR_SCHED_YIELD => { syscall::yield_now(); 0 }
             __NR_SYNC | __NR_SYNCFS => 0, // no durable storage
             __NR_CHROOT | __NR_PIVOT_ROOT | __NR_MOUNT | __NR_UMOUNT2 => linux_err(EPERM),
 
