@@ -51,6 +51,48 @@ const CSR_TCFG: u32 = 0x41;
 const CSR_TICLR: u32 = 0x44;
 const CSR_BADV: u32 = 0x7;
 
+// IOCSR addresses for the IPI unit (per-core).  LoongArch IPIs are
+// delivered as bit 12 of ESTAT.IS and dispatched through the per-core
+// IPI mailbox CSRs.  `_SEND` lets a core raise an IPI on *another* core
+// — bits[25:16] hold the target CPU id and bits[4:0] select the IPI
+// vector (a single bit in the target's IPI_STATUS).
+const LOONGARCH_IOCSR_IPI_STATUS: u32 = 0x1000;
+const LOONGARCH_IOCSR_IPI_EN:     u32 = 0x1004;
+#[allow(dead_code)]
+const LOONGARCH_IOCSR_IPI_SET:    u32 = 0x1008;
+const LOONGARCH_IOCSR_IPI_CLEAR:  u32 = 0x100c;
+const LOONGARCH_IOCSR_IPI_SEND:   u32 = 0x1040;
+
+/// Vector used for reschedule IPIs.  IPI_STATUS has 32 bits, so a
+/// simple 0 suffices; nothing else here sends IPIs yet.
+const IPI_VECTOR_RESCHEDULE: u32 = 0;
+
+/// Write a 32-bit value to an IOCSR register (iocsrwr.w).
+#[inline]
+fn iocsr_write32(addr: u32, val: u32) {
+    unsafe {
+        core::arch::asm!(
+            "iocsrwr.w {val}, {addr}",
+            val = in(reg) val,
+            addr = in(reg) addr,
+        );
+    }
+}
+
+/// Read a 32-bit value from an IOCSR register (iocsrrd.w).
+#[inline]
+fn iocsr_read32(addr: u32) -> u32 {
+    let val: u32;
+    unsafe {
+        core::arch::asm!(
+            "iocsrrd.w {val}, {addr}",
+            val = out(reg) val,
+            addr = in(reg) addr,
+        );
+    }
+    val
+}
+
 /// Read the stable counter (RDTIME instruction).
 pub fn read_time() -> u64 {
     let val: u64;
@@ -91,11 +133,11 @@ pub fn init() {
         );
     }
 
-    // Enable timer interrupt (bit 11) and HWI0 (bit 2) in ECFG.LIE.
-    // Bits 12:0 of ECFG are the Local Interrupt Enable mask.
-    // bit 11 = TI (timer interrupt)
-    // bit 2  = HWI0
-    let ecfg_lie: u64 = (1 << 11) | (1 << 2);
+    // Enable timer (TI = bit 11), HWI0 (bit 2), and IPI (bit 12) in
+    // ECFG.LIE.  IPI is how send_reschedule_ipi wakes another core out
+    // of `idle`; per-core IPI_EN below gates which vectors actually
+    // raise the interrupt.
+    let ecfg_lie: u64 = (1 << 11) | (1 << 2) | (1 << 12);
     unsafe {
         core::arch::asm!(
             "csrwr {val}, {ecfg}",
@@ -103,6 +145,10 @@ pub fn init() {
             ecfg = const CSR_ECFG,
         );
     }
+
+    // Unmask all IPI vectors on this core so iocsr-delivered IPIs set
+    // bits in IPI_STATUS and raise ESTAT.IS[12].
+    iocsr_write32(LOONGARCH_IOCSR_IPI_EN, 0xFFFF_FFFF);
 
     crate::println!(
         "  Timer initialized: freq={}Hz, interval={} ticks ({}ms)",
@@ -122,6 +168,39 @@ pub fn enable_interrupts() {
             crmd = const CSR_CRMD,
         );
     }
+}
+
+/// Send INTID-equivalent reschedule IPI to `target_cpu` (LoongArch IPI).
+/// Writes `(target << 16) | vector` to the IOCSR IPI_SEND mailbox; the
+/// target core sees bit `vector` set in its IPI_STATUS, and if that
+/// vector is unmasked in IPI_EN it raises ESTAT.IS[12].  Our
+/// dispatcher then calls sched::tick which picks up newly-enqueued
+/// work on the target's runqueue — same pattern as x86 LAPIC /
+/// aarch64 SGI / riscv64 SSIP.
+///
+/// Currently a latent mechanism: start_secondary_cpus is still a TODO
+/// on LoongArch64, so the only CPU online is CPU 0 and nothing calls
+/// this with a non-self target.  Wiring it now keeps things consistent
+/// and avoids a sharp edge the moment SMP lands.
+pub fn send_ipi(target_cpu: u32) {
+    let payload = ((target_cpu & 0x3FF) << 16) | (IPI_VECTOR_RESCHEDULE & 0x1F);
+    iocsr_write32(LOONGARCH_IOCSR_IPI_SEND, payload);
+    SGI_SEND_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub static SGI_SEND_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static SGI_RECV_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Ack the pending IPI vectors on this core.  Called from the IS[12]
+/// branch of the trap handler before sched::tick runs.
+fn handle_ipi_irq() {
+    let pending = iocsr_read32(LOONGARCH_IOCSR_IPI_STATUS);
+    if pending != 0 {
+        iocsr_write32(LOONGARCH_IOCSR_IPI_CLEAR, pending);
+    }
+    SGI_RECV_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Handle timer interrupt: clear TI and increment tick count.
@@ -196,6 +275,10 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
             if is & (1 << 11) != 0 {
                 // Timer interrupt (TI).
                 handle_timer_irq();
+                crate::sched::tick(frame_sp)
+            } else if is & (1 << 12) != 0 {
+                // IPI — reschedule wake-up from another core.
+                handle_ipi_irq();
                 crate::sched::tick(frame_sp)
             } else if is & (1 << 2) != 0 {
                 // HWI0 — external device interrupt.

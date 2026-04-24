@@ -260,10 +260,17 @@ pub fn send_reschedule_ipi(target_cpu: u32) {
     );
     #[cfg(target_arch = "riscv64")]
     crate::arch::riscv64::trap::sbi_send_ipi(target_cpu);
+    #[cfg(target_arch = "loongarch64")]
+    crate::arch::loongarch64::trap::send_ipi(target_cpu);
+    // mips64: start_secondary_cpus is a TODO and there's no agreed-upon
+    // QEMU machine SMP model yet (MT/CMP/CPS all take different paths).
+    // Leave this as a no-op until the SMP bring-up picks one; revisit
+    // based on /tmp/telix-tickless-smp-ipi.md §"mips64".
     #[cfg(not(any(
         target_arch = "x86_64",
         target_arch = "aarch64",
         target_arch = "riscv64",
+        target_arch = "loongarch64",
     )))]
     { let _ = target_cpu; }
 }

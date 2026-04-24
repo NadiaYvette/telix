@@ -2178,9 +2178,17 @@ pub fn tick(current_sp: u64) -> u64 {
                             crate::arch::riscv64::trap::SGI_RECV_COUNT
                                 .load(Ordering::Relaxed),
                         );
+                        #[cfg(target_arch = "loongarch64")]
+                        let (sgi_s, sgi_r) = (
+                            crate::arch::loongarch64::trap::SGI_SEND_COUNT
+                                .load(Ordering::Relaxed),
+                            crate::arch::loongarch64::trap::SGI_RECV_COUNT
+                                .load(Ordering::Relaxed),
+                        );
                         #[cfg(not(any(
                             target_arch = "aarch64",
                             target_arch = "riscv64",
+                            target_arch = "loongarch64",
                         )))]
                         let (sgi_s, sgi_r): (u64, u64) = (0, 0);
                         crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} sgi=(s={} r={})",
