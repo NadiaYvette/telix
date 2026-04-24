@@ -55,8 +55,11 @@ for pkg in "$@"; do
     mkdir -p "${stage}"
     (cd "${stage}" && rpm2cpio "${cached}" | cpio -idm --quiet 2>/dev/null)
 
-    # Copy .so files + symlinks from {/usr}/lib64.  -a preserves symlinks
-    # as symlinks (essential — ld.so follows them).
+    # Copy .so files from {/usr}/lib64.  Use `cp -L` to dereference
+    # symlinks: our initramfs / VFS doesn't follow symlinks, so the
+    # canonical soname (e.g. libxcvt.so.0) needs to be a real file
+    # holding the .so contents, not a symlink to libxcvt.so.0.1.2.
+    # That duplicates bytes but keeps each requested soname openable.
     shopt -s nullglob
     for src_root in "${stage}/usr/lib64" "${stage}/lib64"; do
         [ -d "${src_root}" ] || continue
@@ -67,8 +70,11 @@ for pkg in "$@"; do
                 *.a) continue ;;
                 *.debug) continue ;;
             esac
-            cp -a "${entry}" "${DEST_DIR}/${name}"
-            echo "  + lib64/${name}"
+            # Remove first so cp can replace either a stale symlink or
+            # a stale regular file from a previous install.
+            rm -f "${DEST_DIR}/${name}"
+            cp -L "${entry}" "${DEST_DIR}/${name}"
+            echo "  + lib64/${name} ($(stat -c %s "${DEST_DIR}/${name}") bytes)"
         done
     done
     shopt -u nullglob
