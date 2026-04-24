@@ -6,3 +6,4 @@ test.img
 .qemu-virt.dtb
 BENCH.DAT
 HELLO.ELF
+tools/xport/cache/
