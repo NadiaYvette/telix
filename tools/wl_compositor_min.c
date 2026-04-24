@@ -102,6 +102,39 @@
 #define WL_OUTPUT_EV_NAME           4
 #define WL_OUTPUT_EV_DESCRIPTION    5
 
+/* xdg_wm_base (xdg-shell v3) */
+#define XDG_WM_BASE_REQ_DESTROY            0
+#define XDG_WM_BASE_REQ_CREATE_POSITIONER  1
+#define XDG_WM_BASE_REQ_GET_XDG_SURFACE    2
+#define XDG_WM_BASE_REQ_PONG               3
+#define XDG_WM_BASE_EV_PING                0
+
+/* xdg_surface */
+#define XDG_SURFACE_REQ_DESTROY              0
+#define XDG_SURFACE_REQ_GET_TOPLEVEL         1
+#define XDG_SURFACE_REQ_GET_POPUP            2
+#define XDG_SURFACE_REQ_SET_WINDOW_GEOMETRY  3
+#define XDG_SURFACE_REQ_ACK_CONFIGURE        4
+#define XDG_SURFACE_EV_CONFIGURE             0
+
+/* xdg_toplevel */
+#define XDG_TOPLEVEL_REQ_DESTROY           0
+#define XDG_TOPLEVEL_REQ_SET_PARENT        1
+#define XDG_TOPLEVEL_REQ_SET_TITLE         2
+#define XDG_TOPLEVEL_REQ_SET_APP_ID        3
+#define XDG_TOPLEVEL_REQ_SHOW_WINDOW_MENU  4
+#define XDG_TOPLEVEL_REQ_MOVE              5
+#define XDG_TOPLEVEL_REQ_RESIZE            6
+#define XDG_TOPLEVEL_REQ_SET_MAX_SIZE      7
+#define XDG_TOPLEVEL_REQ_SET_MIN_SIZE      8
+#define XDG_TOPLEVEL_REQ_SET_MAXIMIZED     9
+#define XDG_TOPLEVEL_REQ_UNSET_MAXIMIZED  10
+#define XDG_TOPLEVEL_REQ_SET_FULLSCREEN   11
+#define XDG_TOPLEVEL_REQ_UNSET_FULLSCREEN 12
+#define XDG_TOPLEVEL_REQ_SET_MINIMIZED    13
+#define XDG_TOPLEVEL_EV_CONFIGURE          0
+#define XDG_TOPLEVEL_EV_CLOSE              1
+
 /* ---------- Logging ---------- */
 
 static int verbose = 1;
@@ -328,6 +361,9 @@ enum obj_type {
     OBJ_WL_SURFACE,
     OBJ_WL_REGION,
     OBJ_WL_OUTPUT,
+    OBJ_XDG_WM_BASE,
+    OBJ_XDG_SURFACE,
+    OBJ_XDG_TOPLEVEL,
 };
 
 static const char *obj_type_name(enum obj_type t) {
@@ -343,6 +379,9 @@ static const char *obj_type_name(enum obj_type t) {
     case OBJ_WL_SURFACE:    return "wl_surface";
     case OBJ_WL_REGION:     return "wl_region";
     case OBJ_WL_OUTPUT:     return "wl_output";
+    case OBJ_XDG_WM_BASE:   return "xdg_wm_base";
+    case OBJ_XDG_SURFACE:   return "xdg_surface";
+    case OBJ_XDG_TOPLEVEL:  return "xdg_toplevel";
     }
     return "(unknown)";
 }
@@ -368,14 +407,35 @@ struct wl_surface_state {
     int has_pending_buffer;   /* set by attach even if pending_buffer==0 (detach) */
     /* Current after most recent commit. */
     uint32_t current_buffer;
+    /* If the surface has been given an xdg_surface role, this is that
+     * object's id (non-zero).  The first commit on a role-assigned
+     * surface triggers a configure handshake before the client can
+     * legally attach a buffer. */
+    uint32_t xdg_surface_id;
+};
+
+struct xdg_surface_state {
+    uint32_t wl_surface_id;   /* the wl_surface this wraps */
+    uint32_t toplevel_id;     /* set once get_toplevel has assigned a role */
+    uint32_t last_configure_serial;
+    int      configured;      /* true once we've emitted the first configure */
+    int      acked;           /* true once client has ack_configured */
+};
+
+struct xdg_toplevel_state {
+    uint32_t xdg_surface_id;  /* back-reference to the wrapping xdg_surface */
+    char     title[64];
+    char     app_id[64];
 };
 
 struct obj_entry {
     enum obj_type type;
     union {
-        struct shm_pool        *pool;
-        struct wl_buffer_state *buffer;
-        struct wl_surface_state *surface;
+        struct shm_pool           *pool;
+        struct wl_buffer_state    *buffer;
+        struct wl_surface_state   *surface;
+        struct xdg_surface_state  *xdg_surface;
+        struct xdg_toplevel_state *xdg_toplevel;
     };
 };
 
@@ -409,6 +469,7 @@ static const struct global GLOBALS[] = {
     { 1, "wl_compositor", 4, OBJ_WL_COMPOSITOR },
     { 2, "wl_shm",        1, OBJ_WL_SHM        },
     { 3, "wl_output",     3, OBJ_WL_OUTPUT     },
+    { 4, "xdg_wm_base",   3, OBJ_XDG_WM_BASE   },
 };
 #define N_GLOBALS ((int)(sizeof GLOBALS / sizeof GLOBALS[0]))
 
@@ -578,9 +639,40 @@ static void obj_clear(struct client *c, uint32_t id) {
         break;
     }
     case OBJ_WL_SURFACE: free(e->surface); break;
+    case OBJ_XDG_SURFACE: free(e->xdg_surface); break;
+    case OBJ_XDG_TOPLEVEL: free(e->xdg_toplevel); break;
     default: break;
     }
     memset(e, 0, sizeof *e);
+}
+
+/* Bump forward and return the next configure serial.  Wayland serials are
+ * monotonic across the whole connection; using a single counter is fine. */
+static uint32_t g_next_serial = 1;
+static uint32_t alloc_serial(void) { return g_next_serial++; }
+
+/* Send xdg_surface.configure(serial) then wl_display.delete_id for the
+ * surface's staging — actually just configure; delete is wrong here. */
+static void send_xdg_surface_configure(struct client *c, uint32_t xdg_surface_id,
+                                       uint32_t serial)
+{
+    uint8_t body[4];
+    put_u32(body, serial);
+    send_msg(c, xdg_surface_id, XDG_SURFACE_EV_CONFIGURE, body, 4);
+}
+
+/* Send xdg_toplevel.configure(width, height, states[]).  Kiosk-style: full
+ * display, no state bits set yet — the client picks its own buffer size. */
+static void send_xdg_toplevel_configure(struct client *c, uint32_t toplevel_id,
+                                        int32_t width, int32_t height)
+{
+    uint8_t body[16];
+    put_u32(body,       (uint32_t)width);
+    put_u32(body + 4,   (uint32_t)height);
+    put_u32(body + 8,   0);  /* array length: 0 states */
+    put_u32(body + 12,  0);  /* (pad for 4-byte alignment) */
+    send_msg(c, toplevel_id, XDG_TOPLEVEL_EV_CONFIGURE, body, 12);
+    (void)body[12]; (void)body[15];  /* silence unused-pad warnings */
 }
 
 /* ---------- Request dispatch ---------- */
@@ -983,6 +1075,193 @@ static void handle_wl_output(struct client *c, uint32_t id, uint16_t opcode,
     }
 }
 
+/* Copy a wire-format string into dst[dst_sz], NUL-terminated + bounded.
+ * Returns the number of bytes consumed from args (including the 4-byte
+ * length header and the 4-byte padding), or -1 if malformed. */
+static ssize_t copy_wire_string(const uint8_t *args, uint16_t arg_len,
+                                char *dst, size_t dst_sz)
+{
+    if (arg_len < 4) return -1;
+    uint32_t len = get_u32(args);
+    uint32_t pad = (len + 3u) & ~3u;
+    if (len == 0 || 4u + pad > arg_len) return -1;
+    if (args[4 + len - 1] != '\0') return -1;
+    size_t copy_len = (size_t)len - 1;
+    if (copy_len >= dst_sz) copy_len = dst_sz - 1;
+    memcpy(dst, args + 4, copy_len);
+    dst[copy_len] = '\0';
+    return (ssize_t)(4 + pad);
+}
+
+static void handle_xdg_wm_base(struct client *c, uint32_t id,
+                               uint16_t opcode,
+                               const uint8_t *args, uint16_t arg_len)
+{
+    switch (opcode) {
+    case XDG_WM_BASE_REQ_DESTROY:
+        LOG("xdg_wm_base(%u).destroy", id);
+        obj_clear(c, id);
+        send_delete_id(c, id);
+        break;
+    case XDG_WM_BASE_REQ_GET_XDG_SURFACE: {
+        if (arg_len < 8) { LOG("get_xdg_surface: short args"); return; }
+        uint32_t new_id     = get_u32(args);
+        uint32_t surface_id = get_u32(args + 4);
+        LOG("xdg_wm_base(%u).get_xdg_surface(new_id=%u surface=%u)",
+            id, new_id, surface_id);
+        if (new_id >= MAX_CLIENT_OBJS || surface_id >= MAX_CLIENT_OBJS
+            || c->objs[surface_id].type != OBJ_WL_SURFACE)
+        {
+            send_error(c, id, 0, "get_xdg_surface: bad surface");
+            return;
+        }
+        struct xdg_surface_state *xs = calloc(1, sizeof *xs);
+        if (!xs) { send_error(c, id, 2, "oom"); return; }
+        xs->wl_surface_id = surface_id;
+        obj_clear(c, new_id);
+        c->objs[new_id].type = OBJ_XDG_SURFACE;
+        c->objs[new_id].xdg_surface = xs;
+        /* Back-link from wl_surface so commit can enforce the
+         * configure-before-attach rule. */
+        c->objs[surface_id].surface->xdg_surface_id = new_id;
+        break;
+    }
+    case XDG_WM_BASE_REQ_CREATE_POSITIONER: {
+        /* Positioners are only needed for popups, which we don't handle —
+         * but we still need to allocate the object id so subsequent requests
+         * don't hit "dead object" errors. */
+        if (arg_len < 4) return;
+        uint32_t new_id = get_u32(args);
+        LOG("xdg_wm_base(%u).create_positioner(new_id=%u) — stub", id, new_id);
+        if (new_id >= MAX_CLIENT_OBJS) return;
+        obj_clear(c, new_id);
+        /* Reuse OBJ_WL_REGION as a "opaque no-op object" type. */
+        c->objs[new_id].type = OBJ_WL_REGION;
+        break;
+    }
+    case XDG_WM_BASE_REQ_PONG:
+        /* Client acknowledging our (non-existent) ping. */
+        break;
+    default:
+        LOG("xdg_wm_base: unknown opcode %u", opcode);
+        break;
+    }
+}
+
+static void handle_xdg_surface(struct client *c, uint32_t id,
+                               uint16_t opcode,
+                               const uint8_t *args, uint16_t arg_len)
+{
+    struct xdg_surface_state *xs = c->objs[id].xdg_surface;
+    if (!xs) { send_error(c, id, 0, "dead xdg_surface"); return; }
+    switch (opcode) {
+    case XDG_SURFACE_REQ_DESTROY:
+        LOG("xdg_surface(%u).destroy", id);
+        /* Detach back-reference on the underlying wl_surface, if any. */
+        if (xs->wl_surface_id < MAX_CLIENT_OBJS
+            && c->objs[xs->wl_surface_id].type == OBJ_WL_SURFACE)
+        {
+            c->objs[xs->wl_surface_id].surface->xdg_surface_id = 0;
+        }
+        obj_clear(c, id);
+        send_delete_id(c, id);
+        break;
+    case XDG_SURFACE_REQ_GET_TOPLEVEL: {
+        if (arg_len < 4) return;
+        uint32_t new_id = get_u32(args);
+        LOG("xdg_surface(%u).get_toplevel(new_id=%u)", id, new_id);
+        if (new_id >= MAX_CLIENT_OBJS) { send_error(c, id, 0, "out of range"); return; }
+        struct xdg_toplevel_state *tl = calloc(1, sizeof *tl);
+        if (!tl) { send_error(c, id, 2, "oom"); return; }
+        tl->xdg_surface_id = id;
+        obj_clear(c, new_id);
+        c->objs[new_id].type = OBJ_XDG_TOPLEVEL;
+        c->objs[new_id].xdg_toplevel = tl;
+        xs->toplevel_id = new_id;
+        /* Send the initial configure handshake.  For kiosk-style
+         * presentation we suggest the full display size; the client is
+         * free to pick its own buffer dimensions in response. */
+        int32_t w = g_drm.fd >= 0 ? (int32_t)g_drm.width  : 1024;
+        int32_t h = g_drm.fd >= 0 ? (int32_t)g_drm.height : 768;
+        send_xdg_toplevel_configure(c, new_id, w, h);
+        uint32_t serial = alloc_serial();
+        xs->last_configure_serial = serial;
+        xs->configured = 1;
+        send_xdg_surface_configure(c, id, serial);
+        break;
+    }
+    case XDG_SURFACE_REQ_GET_POPUP:
+        /* Popups are layered on top of a parent surface; not modelled here,
+         * but still need to eat the new_id so the client doesn't stall on
+         * a dead object. */
+        if (arg_len >= 4) {
+            uint32_t new_id = get_u32(args);
+            LOG("xdg_surface(%u).get_popup(new_id=%u) — stub", id, new_id);
+            if (new_id < MAX_CLIENT_OBJS) {
+                obj_clear(c, new_id);
+                c->objs[new_id].type = OBJ_WL_REGION;
+            }
+        }
+        break;
+    case XDG_SURFACE_REQ_SET_WINDOW_GEOMETRY:
+        /* Hint for where the window's 'visible' geometry is within the
+         * buffer (excluding drop shadows etc).  Ignored. */
+        break;
+    case XDG_SURFACE_REQ_ACK_CONFIGURE: {
+        if (arg_len < 4) return;
+        uint32_t serial = get_u32(args);
+        LOG("xdg_surface(%u).ack_configure(serial=%u)", id, serial);
+        if (serial == xs->last_configure_serial) xs->acked = 1;
+        break;
+    }
+    default:
+        LOG("xdg_surface: unknown opcode %u", opcode);
+        break;
+    }
+}
+
+static void handle_xdg_toplevel(struct client *c, uint32_t id,
+                                uint16_t opcode,
+                                const uint8_t *args, uint16_t arg_len)
+{
+    struct xdg_toplevel_state *tl = c->objs[id].xdg_toplevel;
+    if (!tl) { send_error(c, id, 0, "dead xdg_toplevel"); return; }
+    switch (opcode) {
+    case XDG_TOPLEVEL_REQ_DESTROY:
+        LOG("xdg_toplevel(%u).destroy", id);
+        obj_clear(c, id);
+        send_delete_id(c, id);
+        break;
+    case XDG_TOPLEVEL_REQ_SET_TITLE:
+        if (copy_wire_string(args, arg_len, tl->title, sizeof tl->title) >= 0) {
+            LOG("xdg_toplevel(%u).set_title(\"%s\")", id, tl->title);
+        }
+        break;
+    case XDG_TOPLEVEL_REQ_SET_APP_ID:
+        if (copy_wire_string(args, arg_len, tl->app_id, sizeof tl->app_id) >= 0) {
+            LOG("xdg_toplevel(%u).set_app_id(\"%s\")", id, tl->app_id);
+        }
+        break;
+    case XDG_TOPLEVEL_REQ_SET_PARENT:
+    case XDG_TOPLEVEL_REQ_SHOW_WINDOW_MENU:
+    case XDG_TOPLEVEL_REQ_MOVE:
+    case XDG_TOPLEVEL_REQ_RESIZE:
+    case XDG_TOPLEVEL_REQ_SET_MAX_SIZE:
+    case XDG_TOPLEVEL_REQ_SET_MIN_SIZE:
+    case XDG_TOPLEVEL_REQ_SET_MAXIMIZED:
+    case XDG_TOPLEVEL_REQ_UNSET_MAXIMIZED:
+    case XDG_TOPLEVEL_REQ_SET_FULLSCREEN:
+    case XDG_TOPLEVEL_REQ_UNSET_FULLSCREEN:
+    case XDG_TOPLEVEL_REQ_SET_MINIMIZED:
+        /* All accepted silently — kiosk behaviour treats every client as
+         * full-screen and non-interactive. */
+        break;
+    default:
+        LOG("xdg_toplevel: unknown opcode %u", opcode);
+        break;
+    }
+}
+
 /* Dispatch one complete message from client buffer.  Returns bytes consumed,
  * or 0 if more data needed, or -1 on protocol error. */
 static ssize_t dispatch_one(struct client *c) {
@@ -1017,6 +1296,9 @@ static ssize_t dispatch_one(struct client *c) {
     case OBJ_WL_SURFACE:    handle_wl_surface(c, object_id, opcode, args, arg_len); break;
     case OBJ_WL_REGION:     handle_wl_region(c, object_id, opcode, args, arg_len); break;
     case OBJ_WL_OUTPUT:     handle_wl_output(c, object_id, opcode, args, arg_len); break;
+    case OBJ_XDG_WM_BASE:   handle_xdg_wm_base(c, object_id, opcode, args, arg_len); break;
+    case OBJ_XDG_SURFACE:   handle_xdg_surface(c, object_id, opcode, args, arg_len); break;
+    case OBJ_XDG_TOPLEVEL:  handle_xdg_toplevel(c, object_id, opcode, args, arg_len); break;
     case OBJ_NONE:
         LOG("request on dead/unknown object %u", object_id);
         send_error(c, object_id, 0, "invalid object");

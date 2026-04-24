@@ -56,6 +56,15 @@
 #define WL_SHM_FORMAT_ARGB8888      0
 #define WL_SHM_FORMAT_XRGB8888      1
 
+/* xdg-shell v3 */
+#define XDG_WM_BASE_REQ_GET_XDG_SURFACE  2
+#define XDG_WM_BASE_REQ_PONG             3
+#define XDG_WM_BASE_EV_PING              0
+#define XDG_SURFACE_REQ_GET_TOPLEVEL     1
+#define XDG_SURFACE_REQ_ACK_CONFIGURE    4
+#define XDG_SURFACE_EV_CONFIGURE         0
+#define XDG_TOPLEVEL_REQ_SET_TITLE       2
+
 /* Client-assigned object IDs we use.  A real libwayland client allocates
  * these; we pin them by hand. */
 #define ID_DISPLAY      1
@@ -67,6 +76,9 @@
 #define ID_BUFFER       7
 #define ID_SURFACE      8
 #define ID_SYNC_CB2     9
+#define ID_XDG_WM_BASE 10
+#define ID_XDG_SURFACE 11
+#define ID_XDG_TOPLEVEL 12
 
 /* ---------- Wire helpers ---------- */
 
@@ -178,11 +190,14 @@ struct rx {
     /* Resolved global names from wl_registry.global events. */
     uint32_t compositor_name;
     uint32_t shm_name;
+    uint32_t xdg_wm_base_name;
     int got_compositor;
     int got_shm;
+    int got_xdg_wm_base;
     /* Event flags. */
     int got_sync_done;
     int got_buffer_release;
+    uint32_t xdg_configure_serial;  /* 0 = not seen yet */
 };
 
 static void rx_read(struct rx *r) {
@@ -229,7 +244,19 @@ static int rx_consume_one(struct rx *r) {
         } else if (strcmp(iface, "wl_shm") == 0) {
             r->shm_name = name;
             r->got_shm = 1;
+        } else if (strcmp(iface, "xdg_wm_base") == 0) {
+            r->xdg_wm_base_name = name;
+            r->got_xdg_wm_base = 1;
         }
+    }
+    if (obj == ID_XDG_WM_BASE && op == XDG_WM_BASE_EV_PING && blen >= 4) {
+        /* Answer pings so the compositor doesn't kill us. */
+        uint32_t serial = get_u32(body);
+        uint8_t buf[4]; put_u32(buf, serial);
+        send_req(r->fd, ID_XDG_WM_BASE, XDG_WM_BASE_REQ_PONG, buf, 4);
+    }
+    if (obj == ID_XDG_SURFACE && op == XDG_SURFACE_EV_CONFIGURE && blen >= 4) {
+        r->xdg_configure_serial = get_u32(body);
     }
     if (obj == ID_SYNC_CB && op == WL_CALLBACK_EV_DONE) {
         r->got_sync_done = 1;
@@ -259,6 +286,20 @@ static void rx_wait_sync(struct rx *r) {
 
 static void rx_wait_release(struct rx *r) {
     while (!r->got_buffer_release) {
+        rx_read(r);
+        for (;;) {
+            int used = rx_consume_one(r);
+            if (used <= 0) break;
+            if ((size_t)used < r->len)
+                memmove(r->buf, r->buf + used, r->len - used);
+            r->len -= (size_t)used;
+        }
+    }
+}
+
+static void rx_wait_xdg_configure(struct rx *r) {
+    r->xdg_configure_serial = 0;
+    while (r->xdg_configure_serial == 0) {
         rx_read(r);
         for (;;) {
             int used = rx_consume_one(r);
@@ -308,9 +349,11 @@ int main(int argc, char **argv) {
 
     rx_wait_sync(&r);
 
-    if (!r.got_compositor) DIE("compositor did not advertise wl_compositor");
-    if (!r.got_shm)        DIE("compositor did not advertise wl_shm");
-    LOG("globals resolved: compositor=%u shm=%u", r.compositor_name, r.shm_name);
+    if (!r.got_compositor)  DIE("compositor did not advertise wl_compositor");
+    if (!r.got_shm)         DIE("compositor did not advertise wl_shm");
+    if (!r.got_xdg_wm_base) DIE("compositor did not advertise xdg_wm_base");
+    LOG("globals resolved: compositor=%u shm=%u xdg_wm_base=%u",
+        r.compositor_name, r.shm_name, r.xdg_wm_base_name);
 
     /* bind wl_compositor, name=compositor_name, v=4, new_id=4 */
     uint8_t bind_buf[64];
@@ -328,6 +371,15 @@ int main(int argc, char **argv) {
     put_u32(bind_buf + off, 1);
     off += 4;
     put_u32(bind_buf + off, ID_SHM);
+    off += 4;
+    send_req(fd, ID_REGISTRY, WL_REGISTRY_REQ_BIND, bind_buf, off);
+
+    /* bind xdg_wm_base, v=3, new_id=10 */
+    put_u32(bind_buf, r.xdg_wm_base_name);
+    off = 4 + put_string(bind_buf + 4, "xdg_wm_base");
+    put_u32(bind_buf + off, 3);
+    off += 4;
+    put_u32(bind_buf + off, ID_XDG_WM_BASE);
     off += 4;
     send_req(fd, ID_REGISTRY, WL_REGISTRY_REQ_BIND, bind_buf, off);
 
@@ -357,6 +409,30 @@ int main(int argc, char **argv) {
     /* wl_compositor.create_surface(new_id=8) */
     put_u32(buf, ID_SURFACE);
     send_req(fd, ID_COMPOSITOR, WL_COMPOSITOR_REQ_CREATE_SURFACE, buf, 4);
+
+    /* xdg_wm_base.get_xdg_surface(new_id=11, surface=8) */
+    uint8_t gxs_buf[8];
+    put_u32(gxs_buf,     ID_XDG_SURFACE);
+    put_u32(gxs_buf + 4, ID_SURFACE);
+    send_req(fd, ID_XDG_WM_BASE, XDG_WM_BASE_REQ_GET_XDG_SURFACE, gxs_buf, 8);
+
+    /* xdg_surface.get_toplevel(new_id=12) */
+    put_u32(buf, ID_XDG_TOPLEVEL);
+    send_req(fd, ID_XDG_SURFACE, XDG_SURFACE_REQ_GET_TOPLEVEL, buf, 4);
+
+    /* xdg_toplevel.set_title("hello_wl") */
+    uint8_t title_buf[32];
+    size_t tl = put_string(title_buf, "hello_wl");
+    send_req(fd, ID_XDG_TOPLEVEL, XDG_TOPLEVEL_REQ_SET_TITLE, title_buf, tl);
+
+    /* Wait for the initial xdg_surface.configure before attaching a
+     * buffer — the xdg-shell spec forbids pre-configure attach. */
+    LOG("waiting for xdg_surface.configure");
+    rx_wait_xdg_configure(&r);
+    LOG("configure serial=%u; ack'ing", r.xdg_configure_serial);
+    uint8_t ack_buf[4];
+    put_u32(ack_buf, r.xdg_configure_serial);
+    send_req(fd, ID_XDG_SURFACE, XDG_SURFACE_REQ_ACK_CONFIGURE, ack_buf, 4);
 
     /* wl_surface.attach(buffer=7, 0, 0) */
     uint8_t at_buf[12];
