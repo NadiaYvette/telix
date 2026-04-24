@@ -2161,13 +2161,36 @@ pub fn tick(current_sp: u64) -> u64 {
                     let sc = STALL_COUNT.fetch_add(1, Ordering::Relaxed);
                     if sc < 3 {
                         // First stall detection — dump per-CPU and thread states.
-                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={}",
+                        // Per-arch IPI counters for validating the tickless-SMP
+                        // IPI fix at a glance.  Both aarch64 SGIs and riscv64
+                        // S-mode software IRQs share this column.
+                        #[cfg(target_arch = "aarch64")]
+                        let (sgi_s, sgi_r) = (
+                            crate::arch::aarch64::irq::SGI_SEND_COUNT
+                                .load(Ordering::Relaxed),
+                            crate::arch::aarch64::irq::SGI_RECV_COUNT
+                                .load(Ordering::Relaxed),
+                        );
+                        #[cfg(target_arch = "riscv64")]
+                        let (sgi_s, sgi_r) = (
+                            crate::arch::riscv64::trap::SGI_SEND_COUNT
+                                .load(Ordering::Relaxed),
+                            crate::arch::riscv64::trap::SGI_RECV_COUNT
+                                .load(Ordering::Relaxed),
+                        );
+                        #[cfg(not(any(
+                            target_arch = "aarch64",
+                            target_arch = "riscv64",
+                        )))]
+                        let (sgi_s, sgi_r): (u64, u64) = (0, 0);
+                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} sgi=(s={} r={})",
                             sends, recvs,
                             DOUBLE_ENQ_DRAIN.load(Ordering::Relaxed),
                             DOUBLE_ENQ_RESCUE.load(Ordering::Relaxed),
                             DOUBLE_ENQ_WAKE.load(Ordering::Relaxed),
                             DOUBLE_ENQ_OTHER.load(Ordering::Relaxed),
-                            ENQ_TOTAL.load(Ordering::Relaxed));
+                            ENQ_TOTAL.load(Ordering::Relaxed),
+                            sgi_s, sgi_r);
                         // Per-CPU state: what each CPU is running, RQ sizes
                         let ncpus = smp::num_cpus();
                         for c in 0..ncpus {

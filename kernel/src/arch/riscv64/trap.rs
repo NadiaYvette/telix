@@ -23,6 +23,7 @@ pub struct TrapFrame {
 
 // scause values
 const SCAUSE_INTERRUPT_BIT: u64 = 1 << 63;
+const SCAUSE_S_SOFTWARE_IRQ: u64 = SCAUSE_INTERRUPT_BIT | 1;
 const SCAUSE_S_TIMER_IRQ: u64 = SCAUSE_INTERRUPT_BIT | 5;
 const SCAUSE_S_EXTERNAL_IRQ: u64 = SCAUSE_INTERRUPT_BIT | 9;
 const SCAUSE_ECALL_FROM_UMODE: u64 = 8;
@@ -34,6 +35,11 @@ const SCAUSE_STORE_PAGE_FAULT: u64 = 15;
 /// SBI TIME extension ID and function.
 const SBI_EXT_TIME: u64 = 0x54494D45;
 const SBI_FUN_SET_TIMER: u64 = 0;
+/// SBI IPI extension ('sPI' = 0x735049) with function 0 = send_ipi
+/// (hart_mask, hart_mask_base).  Used by send_reschedule_ipi to wake
+/// another hart out of WFI when the scheduler decides it has work for it.
+const SBI_EXT_IPI: u64 = 0x735049;
+const SBI_FUN_SEND_IPI: u64 = 0;
 
 /// Read the `time` CSR (or rdtime pseudo-instruction).
 pub fn read_time() -> u64 {
@@ -55,6 +61,36 @@ fn sbi_set_timer(stime_value: u64) {
         );
     }
 }
+
+/// Send a reschedule IPI to `target_hart` via SBI.  Sets the target hart's
+/// `msip` bit; the hart takes a supervisor software interrupt on its next
+/// interruptible point (which includes waking from WFI), so a runnable
+/// thread enqueued on its runqueue is seen by the next sched::tick.
+pub fn sbi_send_ipi(target_hart: u32) {
+    // SBI v0.2+ hart mask convention: bit (hart - base) in the word at
+    // `hart_mask` (a virtual address).  We pass the mask directly by
+    // using a local on-stack variable and its VA.  base = 0 so the bit
+    // index is the hart id directly.
+    let mask: u64 = 1u64 << (target_hart & 63);
+    let mask_addr = &mask as *const u64 as u64;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a0") mask_addr,
+            in("a1") 0u64,       /* hart_mask_base */
+            in("a6") SBI_FUN_SEND_IPI,
+            in("a7") SBI_EXT_IPI,
+            lateout("a0") _,
+            lateout("a1") _,
+        );
+    }
+    SGI_SEND_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub static SGI_SEND_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static SGI_RECV_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Initialize trap handling: set stvec, configure timer.
 pub fn init() {
@@ -83,7 +119,9 @@ pub fn init() {
     // Enable S-mode timer interrupt and external interrupt in sie.
     unsafe {
         // sie.STIE = bit 5, sie.SEIE = bit 9
-        core::arch::asm!("csrs sie, {}", in(reg) (1u64 << 5) | (1u64 << 9));
+        // sie.STIE = bit 5, sie.SSIE = bit 1, sie.SEIE = bit 9.  SSIE
+        // lets SBI-delivered software IPIs wake this hart.
+        core::arch::asm!("csrs sie, {}", in(reg) (1u64 << 1) | (1u64 << 5) | (1u64 << 9));
     }
 
     // Initialize PLIC for hart 0.
@@ -115,7 +153,9 @@ pub fn init_ap() {
 
     // Enable S-mode timer and external interrupts in sie.
     unsafe {
-        core::arch::asm!("csrs sie, {}", in(reg) (1u64 << 5) | (1u64 << 9));
+        // sie.STIE = bit 5, sie.SSIE = bit 1, sie.SEIE = bit 9.  SSIE
+        // lets SBI-delivered software IPIs wake this hart.
+        core::arch::asm!("csrs sie, {}", in(reg) (1u64 << 1) | (1u64 << 5) | (1u64 << 9));
     }
 
     // Initialize PLIC for this hart.
@@ -193,6 +233,17 @@ extern "C" fn trap_handler(frame_sp: u64) -> u64 {
         SCAUSE_S_TIMER_IRQ => {
             handle_timer_irq();
             // Let the scheduler decide if we should switch threads.
+            crate::sched::tick(frame_sp)
+        }
+
+        SCAUSE_S_SOFTWARE_IRQ => {
+            // SBI-delivered reschedule IPI.  Clear sip.SSIP and let the
+            // scheduler run — sched::tick picks up any freshly-enqueued
+            // work on this hart's runqueue.
+            unsafe {
+                core::arch::asm!("csrc sip, {}", in(reg) 1u64 << 1);
+            }
+            SGI_RECV_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             crate::sched::tick(frame_sp)
         }
 

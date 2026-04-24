@@ -243,14 +243,28 @@ pub fn wait_for_interrupt() {
 
 /// Send a reschedule IPI to a remote CPU, waking it from idle (HLT/WFI).
 ///
-/// The target CPU's timer ISR fires, running tick() → try_switch(), which
-/// discovers any newly-enqueued threads.  On architectures without IPI
-/// support yet, this is a no-op (the dynamic tick timer will eventually fire).
+/// The target CPU takes an interrupt, runs handle_irq() → sched::tick(),
+/// and discovers any newly-enqueued threads on its runqueue.  Without a
+/// real IPI here the wake-up never arrives under tickless scheduling —
+/// the target CPU parks in WFI and, since it decided not to re-arm its
+/// timer (no local work), stays parked forever.  Writeup:
+/// /tmp/telix-tickless-smp-ipi.md (QEMU-side session, 2026-04-24).
 #[inline]
 pub fn send_reschedule_ipi(target_cpu: u32) {
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::lapic::send_reschedule(target_cpu);
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::irq::send_sgi(
+        target_cpu,
+        crate::arch::aarch64::irq::INTID_RESCHEDULE,
+    );
+    #[cfg(target_arch = "riscv64")]
+    crate::arch::riscv64::trap::sbi_send_ipi(target_cpu);
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+    )))]
     { let _ = target_cpu; }
 }
 
