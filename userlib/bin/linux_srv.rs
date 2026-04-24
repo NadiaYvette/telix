@@ -633,6 +633,33 @@ fn get_vfs_port() -> u64 {
     }
 }
 
+fn get_uds_port() -> u64 {
+    unsafe {
+        if UDS_PORT == 0 {
+            UDS_PORT = syscall::ns_lookup(b"uds").unwrap_or(0);
+        }
+        UDS_PORT
+    }
+}
+
+fn get_pipe_port() -> u64 {
+    unsafe {
+        if PIPE_PORT == 0 {
+            PIPE_PORT = syscall::ns_lookup(b"pipe").unwrap_or(0);
+        }
+        PIPE_PORT
+    }
+}
+
+fn get_net_port() -> u64 {
+    unsafe {
+        if NET_PORT == 0 {
+            NET_PORT = syscall::ns_lookup(b"net").unwrap_or(0);
+        }
+        NET_PORT
+    }
+}
+
 /// Debug: when set to a valid pi, every dispatch call from that pi is logged.
 /// Used to isolate the Phase 172 EFAULT mystery.
 static mut TRACE_PI: usize = usize::MAX;
@@ -2145,11 +2172,6 @@ fn do_chown(pi: usize, caller_port: u64, path_va: usize, uid: u32, gid: u32) -> 
 
 /// Open a file via VFS. Returns fd or negated errno.
 fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
-    let vfs_port = get_vfs_port();
-    if vfs_port == 0 {
-        return linux_err(ENOSYS);
-    }
-
     // Copy path from caller. We support long paths via the granted scratch
     // page, so read up to 256 bytes (more than enough for typical glibc
     // library paths like /lib64/ld-linux-x86-64.so.2). copy_from_user is
@@ -2265,6 +2287,13 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
     };
     if let Some(content) = etc_content {
         return open_virtual_file(pi, content, flags);
+    }
+
+    // Below here we need the VFS server.  Virtual devices handled above
+    // don't require VFS; fall through to VFS only for real filesystem paths.
+    let vfs_port = get_vfs_port();
+    if vfs_port == 0 {
+        return linux_err(ENOSYS);
     }
 
     // For paths longer than the 16-byte inline limit, use the long-path
@@ -5098,7 +5127,11 @@ fn drm_ensure_init() -> bool {
         DRM_STATE.fb_port = fb_port;
         DRM_STATE.reply_port = syscall::port_create();
 
-        // FB_GET_INFO → width, height, pitch, bpp.
+        // FB_GET_INFO → width, height, pitch, bpp.  This is the only step
+        // required to satisfy version/capability/mode ioctls.  FB mapping is
+        // deferred to MAP_DUMB so ioctl(VERSION) works before any concrete
+        // dumb buffer is created, and so a VA collision on the fb_srv-chosen
+        // address doesn't block the whole DRM subsystem.
         syscall::send(fb_port, FB_GET_INFO, 0, 0, DRM_STATE.reply_port << 32, 0);
         let info = loop {
             if let Some(m) = syscall::recv_msg(DRM_STATE.reply_port) {
@@ -5110,9 +5143,21 @@ fn drm_ensure_init() -> bool {
         DRM_STATE.display_height = (info.data[0] >> 32) as u32;
         DRM_STATE.fb_pitch = info.data[1] as u32;
 
-        // FB_MAP → map framebuffer pages into our address space.
+        DRM_STATE.initialized = true;
+        syscall::debug_puts(b"[drm] initialized (fb mapping deferred)\n");
+        true
+    }
+}
+
+/// Map the framebuffer into linux_srv's address space.  Called lazily on
+/// operations that need direct pixel access (MAP_DUMB).  Returns the VA on
+/// success or 0 on failure.
+fn drm_ensure_fb_mapped() -> usize {
+    unsafe {
+        if DRM_STATE.fb_va != 0 { return DRM_STATE.fb_va; }
+        if !DRM_STATE.initialized { return 0; }
         let my_aspace = syscall::aspace_id();
-        syscall::send(fb_port, FB_MAP, 0, 0, DRM_STATE.reply_port << 32, my_aspace);
+        syscall::send(DRM_STATE.fb_port, FB_MAP, 0, 0, DRM_STATE.reply_port << 32, my_aspace);
         let map_resp = loop {
             if let Some(m) = syscall::recv_msg(DRM_STATE.reply_port) {
                 if m.tag == FB_MAP_OK { break m; }
@@ -5120,11 +5165,7 @@ fn drm_ensure_init() -> bool {
             syscall::yield_now();
         };
         DRM_STATE.fb_va = map_resp.data[0] as usize;
-        if DRM_STATE.fb_va == 0 { return false; }
-
-        DRM_STATE.initialized = true;
-        syscall::debug_puts(b"[drm] initialized: fb mapped\n");
-        true
+        DRM_STATE.fb_va
     }
 }
 
@@ -5372,6 +5413,7 @@ fn drm_ioctl_setcrtc(caller_port: u64, arg_va: usize) -> u64 {
 
 /// Blit dumb buffer contents to the fb_srv framebuffer (row-by-row).
 fn drm_blit_to_fb(dumb_idx: usize) {
+    drm_ensure_fb_mapped();
     unsafe {
         let dumb = &DRM_DUMB_TABLE[dumb_idx];
         let src = dumb.va as *const u8;
@@ -6606,7 +6648,7 @@ fn handle_socket(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
     };
 
     if domain == AF_UNIX {
-        let uds_port = unsafe { UDS_PORT };
+        let uds_port = get_uds_port();
         if uds_port == 0 { unsafe { PROC_TABLE[pi].fds[fd] = FdEntry::empty(); } return linux_err(EAFNOSUPPORT); }
         // Create UDS socket via uds_srv.
         let resp = match syscall::call(uds_port, UDS_SOCKET, 0, 0, 0, 0) {
@@ -6627,7 +6669,7 @@ fn handle_socket(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
             PROC_TABLE[pi].fds[fd].sock_state = 0;
         }
     } else if domain == AF_INET {
-        let net_port = unsafe { NET_PORT };
+        let net_port = get_net_port();
         if net_port == 0 { unsafe { PROC_TABLE[pi].fds[fd] = FdEntry::empty(); } return linux_err(EAFNOSUPPORT); }
         // AF_INET: no IPC yet — handle allocated on connect/accept.
         unsafe {
@@ -7409,7 +7451,7 @@ fn handle_socketpair(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let base_type = type_raw & 0xF;
     if base_type != SOCK_STREAM { return linux_err(EOPNOTSUPP); }
 
-    let uds_port = unsafe { UDS_PORT };
+    let uds_port = get_uds_port();
     if uds_port == 0 { return linux_err(EAFNOSUPPORT); }
 
     // Allocate two FDs.

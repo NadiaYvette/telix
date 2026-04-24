@@ -617,6 +617,99 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Step F: Wayland infrastructure smoke test (EARLY — right after linux_srv comes up) ---
+    //
+    // Exercises the four subsystems a Wayland compositor needs:
+    //   1. DRM/KMS (open + ioctl on /dev/dri/card0)
+    //   2. Evdev input (open + ioctl on /dev/input/event0)
+    //   3. Memfd SHM (memfd_create + ftruncate + mmap MAP_SHARED)
+    //   4. Unix domain sockets (socket + bind + listen)
+    // wayland_test.c returns 0 on success, 1-4 on failure.
+    syscall::debug_puts(b"  init: Step F wayland infra test...\n");
+    {
+        // Ensure uds_srv is up — section 4 of the test needs AF_UNIX sockets.
+        if syscall::ns_lookup(b"uds").is_none() {
+            let _ = syscall::spawn(b"uds_srv", 50);
+            for _ in 0..200 {
+                if syscall::ns_lookup(b"uds").is_some() { break; }
+                syscall::yield_now();
+            }
+        }
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        static PATH: &[u8] = b"/wayland_test\0";
+                        static A0: &[u8] = b"wayland_test\0";
+                        let argv: [u64; 2] = [
+                            A0.as_ptr() as u64,
+                            0,
+                        ];
+                        let envp: [u64; 1] = [0];
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => _,
+                            in("rdi") PATH.as_ptr() as u64,
+                            in("rsi") argv.as_ptr() as u64,
+                            in("rdx") envp.as_ptr() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 99u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        syscall::exit(99);
+                    }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..12000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(10);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Step F wayland infra test: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Step F wayland infra test: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Step F wayland infra test: FAILED (section=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Step F wayland infra test: SKIPPED\n");
+        }
+    }
+
     // --- Test 3: mmap_anon / munmap ---
     syscall::debug_puts(b"  init: testing mmap_anon...\n");
     if let Some(va) = syscall::mmap_anon(0, 1, 1) {
