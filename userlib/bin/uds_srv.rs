@@ -28,8 +28,23 @@ const UDS_BIND: u64 = 0x8010;
 const UDS_LISTEN: u64 = 0x8020;
 const UDS_CONNECT: u64 = 0x8030;
 const UDS_ACCEPT: u64 = 0x8040;
+// Async accept: request registered on the listener; when a client connects,
+// uds_srv sends UDS_ACCEPT_REPLY to the supplied reply_port with the
+// correlation id so the caller (linux_srv) can resume without parking its
+// main thread.  Reply is immediate (UDS_OK on registration, UDS_ERROR on
+// bad handle / non-listening socket / duplicate registration).
+const UDS_ACCEPT_ASYNC: u64 = 0x8041;
+const UDS_ACCEPT_REPLY: u64 = 0x8042;
 const UDS_SEND: u64 = 0x8050;
 const UDS_RECV: u64 = 0x8060;
+// Async recv: equivalent to UDS_RECV but when no data is buffered the
+// request is registered on the socket and completed later when the peer
+// sends (via send_nb to the supplied reply_port).  Immediate success is
+// delivered the same way (send_nb back) followed by a UDS_OK reply to the
+// caller to confirm registration/completion.  Up to 16 bytes per reply
+// (packed in d1/d3 like UDS_RECV).
+const UDS_RECV_ASYNC: u64 = 0x8061;
+const UDS_RECV_REPLY: u64 = 0x8062;
 const UDS_CLOSE: u64 = 0x8070;
 const UDS_GETPEERCRED: u64 = 0x8080;
 const UDS_POLL: u64 = 0x8090;
@@ -74,6 +89,17 @@ struct UnixSocket {
     pending_count: usize,
     // Blocked accept caller (call/reply cap from reply_take, 0 = none).
     accept_reply_cap: u64,
+    // Async accept notification: when a client connects, send
+    // UDS_ACCEPT_REPLY to this port with the correlation id.  Used by
+    // linux_srv's non-blocking accept dispatch.  0 = none registered.
+    async_accept_reply_port: u64,
+    async_accept_correlation: u64,
+    // Async recv notification: when data arrives (or EOF), send
+    // UDS_RECV_REPLY to this port with correlation + up to 16 bytes in
+    // data[1]/data[3] (format matching UDS_RECV).  0 = none registered.
+    async_recv_reply_port: u64,
+    async_recv_correlation: u64,
+    async_recv_max: u16,
     // Receive buffer (ring buffer).
     rx_buf: [u8; RX_BUF_SIZE],
     rx_head: usize,
@@ -99,6 +125,11 @@ impl UnixSocket {
             pending: [0; MAX_PENDING],
             pending_count: 0,
             accept_reply_cap: 0,
+            async_accept_reply_port: 0,
+            async_accept_correlation: 0,
+            async_recv_reply_port: 0,
+            async_recv_correlation: 0,
+            async_recv_max: 0,
             rx_buf: [0; RX_BUF_SIZE],
             rx_head: 0,
             rx_tail: 0,
@@ -221,6 +252,33 @@ fn reply(tag: u64, d0: u64, d1: u64, d2: u64, d3: u64) {
 /// Uses reply_to() to send to the saved reply capability.
 fn try_wake_recv(sock_idx: u32) {
     let s = unsafe { &mut SOCKS[sock_idx as usize] };
+
+    // Async registration: higher-priority than the legacy deferred-cap path
+    // because the call reaches this sock via port_set dispatch, not via a
+    // parked sys_call.  Fire the async notification first if registered.
+    if s.async_recv_reply_port != 0 && (s.rx_len() > 0 || s.rx_eof) {
+        let port = s.async_recv_reply_port;
+        let correlation = s.async_recv_correlation;
+        let max = s.async_recv_max as usize;
+        if s.rx_len() > 0 {
+            let cap = if max > 16 { 16 } else { max };
+            let mut tmp = [0u8; 16];
+            let n = s.rx_pop(&mut tmp[..cap]);
+            let (w0, w1) = pack_bytes(&tmp, n);
+            s.async_recv_reply_port = 0;
+            s.async_recv_correlation = 0;
+            s.async_recv_max = 0;
+            let _ = syscall::send(port, UDS_RECV_REPLY, correlation, w0, n as u64, w1);
+        } else {
+            s.async_recv_reply_port = 0;
+            s.async_recv_correlation = 0;
+            s.async_recv_max = 0;
+            let _ = syscall::send_nb_4(port, UDS_RECV_REPLY,
+                                       correlation, 0, u64::MAX, 0);
+        }
+        return;
+    }
+
     if s.recv_reply_cap == 0 {
         return;
     }
@@ -387,9 +445,25 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     SOCKS[cli_end as usize].cred_gid = gid;
                 }
 
-                // Check if accept() is already blocked on the listener.
+                // Dispatch preference: async registration → deferred cap →
+                // pending queue.  Async is how linux_srv's non-blocking
+                // accept (from a Linux process) picks up the connection
+                // without parking its main thread.
+                let (async_port, async_id) = unsafe {
+                    (SOCKS[listener as usize].async_accept_reply_port,
+                     SOCKS[listener as usize].async_accept_correlation)
+                };
                 let accept_cap = unsafe { SOCKS[listener as usize].accept_reply_cap };
-                if accept_cap != 0 {
+                if async_port != 0 {
+                    unsafe {
+                        SOCKS[listener as usize].async_accept_reply_port = 0;
+                        SOCKS[listener as usize].async_accept_correlation = 0;
+                    }
+                    // Fire-and-forget notification.  The caller (linux_srv)
+                    // resumes the original Linux accept() via its main loop.
+                    let _ = syscall::send_nb_4(async_port, UDS_ACCEPT_REPLY,
+                                               async_id, srv_end as u64, 0, 0);
+                } else if accept_cap != 0 {
                     // Wake the blocked acceptor immediately via deferred reply.
                     unsafe {
                         SOCKS[listener as usize].accept_reply_cap = 0;
@@ -444,6 +518,50 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 } else {
                     // No pending — block the acceptor (deferred reply).
                     s.accept_reply_cap = syscall::reply_take();
+                }
+            }
+
+            UDS_ACCEPT_ASYNC => {
+                // Non-blocking accept registration.  d0=handle,
+                // d1=notify_port, d2=correlation_id.  When a client
+                // eventually connects, uds_srv sends
+                // UDS_ACCEPT_REPLY(correlation_id, srv_end, 0, 0) to
+                // notify_port and clears the registration.
+                let handle = msg.data[0] as u32;
+                let notify_port = msg.data[1];
+                let correlation = msg.data[2];
+                if handle as usize >= MAX_SOCKETS {
+                    reply(UDS_ERROR, 0, 0, 0, 0);
+                    continue;
+                }
+                let s = unsafe { &mut SOCKS[handle as usize] };
+                if s.state != SockState::Listening {
+                    reply(UDS_ERROR, 0, 0, 0, 0);
+                    continue;
+                }
+
+                if s.pending_count > 0 {
+                    // Dequeue and notify immediately.
+                    let srv_end = s.pending[0];
+                    let mut i = 0;
+                    while i + 1 < s.pending_count {
+                        s.pending[i] = s.pending[i + 1];
+                        i += 1;
+                    }
+                    s.pending_count -= 1;
+                    let _ = syscall::send_nb_4(notify_port, UDS_ACCEPT_REPLY,
+                                               correlation, srv_end as u64, 0, 0);
+                    reply(UDS_OK, 0, 0, 0, 0);
+                } else if s.async_accept_reply_port != 0 {
+                    // Only one async accept can be outstanding on a listener.
+                    // This matches the practical single-threaded compositor
+                    // case; a second concurrent async accept would need a
+                    // queue of (port, correlation) tuples.
+                    reply(UDS_ERROR, 0, 0, 0, 0);
+                } else {
+                    s.async_accept_reply_port = notify_port;
+                    s.async_accept_correlation = correlation;
+                    reply(UDS_OK, 0, 0, 0, 0);
                 }
             }
 
@@ -517,6 +635,51 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 } else {
                     // Block — save reply capability for deferred reply.
                     s.recv_reply_cap = syscall::reply_take();
+                }
+            }
+
+            UDS_RECV_ASYNC => {
+                // d0=handle, d1=reply_port, d2=correlation, d3=max_len.
+                // If data is buffered, send UDS_RECV_REPLY straight away
+                // (in addition to the sync UDS_OK confirmation).  Otherwise
+                // stash the async notification on the socket; try_wake_recv
+                // fires it when peer sends or closes.
+                let handle = msg.data[0] as u32;
+                let reply_port = msg.data[1];
+                let correlation = msg.data[2];
+                let max_len = msg.data[3] as u16;
+                if handle as usize >= MAX_SOCKETS {
+                    reply(UDS_ERROR, 0, 0, 0, 0);
+                    continue;
+                }
+                let s = unsafe { &mut SOCKS[handle as usize] };
+                if s.state != SockState::Connected && s.state != SockState::Closed {
+                    reply(UDS_ERROR, 0, 0, 0, 0);
+                    continue;
+                }
+                if s.async_recv_reply_port != 0 {
+                    // Only one outstanding async recv per socket.
+                    reply(UDS_ERROR, 0, 0, 0, 0);
+                    continue;
+                }
+
+                if s.rx_len() > 0 {
+                    let cap = (max_len as usize).min(16);
+                    let mut tmp = [0u8; 16];
+                    let n = s.rx_pop(&mut tmp[..cap]);
+                    let (w0, w1) = pack_bytes(&tmp, n);
+                    let _ = syscall::send(reply_port, UDS_RECV_REPLY,
+                                          correlation, w0, n as u64, w1);
+                    reply(UDS_OK, 0, 0, 0, 0);
+                } else if s.rx_eof {
+                    let _ = syscall::send_nb_4(reply_port, UDS_RECV_REPLY,
+                                               correlation, 0, u64::MAX, 0);
+                    reply(UDS_OK, 0, 0, 0, 0);
+                } else {
+                    s.async_recv_reply_port = reply_port;
+                    s.async_recv_correlation = correlation;
+                    s.async_recv_max = max_len;
+                    reply(UDS_OK, 0, 0, 0, 0);
                 }
             }
 

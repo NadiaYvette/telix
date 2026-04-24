@@ -710,16 +710,131 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    // --- Step G: Wayland compositor + client (Telix integration pending) ---
+    // --- Step G: Wayland compositor + client end-to-end under Linux personality ---
     //
-    // tools/wl_compositor_min.c + tools/hello_wl.c are built and shipped in
-    // initramfs.  End-to-end works on Fedora host (tested vs wayland-info).
-    //
-    // In-Telix integration deferred: linux_srv is single-threaded; a blocking
-    // UDS_ACCEPT on the compositor deadlocks the client's UDS_CONNECT because
-    // both flow through linux_srv's one recv_msg loop.  Fix requires async
-    // handling in linux_srv (deferred-reply for Linux syscalls, or per-process
-    // handler threads).  See project_linux_srv_async memory note.
+    // Spawns two Linux-personality processes:
+    //   1. wl_compositor_min --one-shot  (listens on /run/user/0/wayland-0,
+    //                                     exits after first client disconnect)
+    //   2. hello_wl                      (connects, pushes a 256x256 XRGB8888
+    //                                     buffer via wl_shm, waits for
+    //                                     wl_buffer.release, exits 0)
+    // Exercises linux_srv's async UDS accept/connect path (task #283):
+    // the compositor's accept() registers an async notification with uds_srv
+    // instead of parking linux_srv's main thread, so the client's connect
+    // can progress.  Expected result: PASSED (both exit 0).
+    syscall::debug_puts(b"  init: Step G wayland compositor end-to-end...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let comp_child = syscall::fork();
+            if comp_child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    static PATH: &[u8] = b"/wl_compositor_min\0";
+                    static A0: &[u8]   = b"wl_compositor_min\0";
+                    static A1: &[u8]   = b"--one-shot\0";
+                    let argv: [u64; 3] = [A0.as_ptr() as u64, A1.as_ptr() as u64, 0];
+                    let envp: [u64; 1] = [0];
+                    core::arch::asm!(
+                        "int 0x80",
+                        inlateout("rax") 59u64 => _,
+                        in("rdi") PATH.as_ptr() as u64,
+                        in("rsi") argv.as_ptr() as u64,
+                        in("rdx") envp.as_ptr() as u64,
+                        lateout("rcx") _, lateout("r11") _,
+                    );
+                    core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 98u64, options(noreturn));
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                { syscall::exit(99); }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(comp_child, 2, abi);
+
+                // Give the compositor a chance to bind + listen on the UDS.
+                for _ in 0..200 { syscall::sleep_ms(5); }
+
+                let cli_child = syscall::fork();
+                if cli_child == 0 {
+                    for _ in 0..100 {
+                        let (p, _) = syscall::personality_get();
+                        if p != 0 { break; }
+                        syscall::yield_now();
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        static PATH: &[u8] = b"/hello_wl\0";
+                        static A0: &[u8]   = b"hello_wl\0";
+                        let argv: [u64; 2] = [A0.as_ptr() as u64, 0];
+                        let envp: [u64; 1] = [0];
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => _,
+                            in("rdi") PATH.as_ptr() as u64,
+                            in("rsi") argv.as_ptr() as u64,
+                            in("rdx") envp.as_ptr() as u64,
+                            lateout("rcx") _, lateout("r11") _,
+                        );
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 97u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    { syscall::exit(99); }
+                } else {
+                    syscall::personality_set(cli_child, 2, abi);
+
+                    let mut cli_code: i64 = -1;
+                    for _ in 0..12000 {
+                        if let Some(code) = syscall::waitpid(cli_child) {
+                            cli_code = code as i64;
+                            break;
+                        }
+                        syscall::sleep_ms(10);
+                    }
+
+                    let mut comp_code: i64 = -1;
+                    for _ in 0..3000 {
+                        if let Some(code) = syscall::waitpid(comp_child) {
+                            comp_code = code as i64;
+                            break;
+                        }
+                        syscall::sleep_ms(10);
+                    }
+
+                    if cli_code == 0 && comp_code == 0 {
+                        syscall::debug_puts(b"Step G wayland compositor end-to-end: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Step G wayland compositor end-to-end: FAILED (client=");
+                        let mut buf = [0u8; 10];
+                        let mut val = cli_code as u32;
+                        let mut i = 10;
+                        if val == 0 { i -= 1; buf[i] = b'0'; }
+                        while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                        syscall::debug_puts(&buf[i..10]);
+                        syscall::debug_puts(b", comp=");
+                        let mut buf2 = [0u8; 10];
+                        let mut val2 = comp_code as u32;
+                        let mut j = 10;
+                        if val2 == 0 { j -= 1; buf2[j] = b'0'; }
+                        while val2 > 0 && j > 0 { j -= 1; buf2[j] = b'0' + (val2 % 10) as u8; val2 /= 10; }
+                        syscall::debug_puts(&buf2[j..10]);
+                        syscall::debug_puts(b")\n");
+                    }
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Step G wayland compositor end-to-end: SKIPPED\n");
+        }
+    }
 
     // --- Test 3: mmap_anon / munmap ---
     syscall::debug_puts(b"  init: testing mmap_anon...\n");

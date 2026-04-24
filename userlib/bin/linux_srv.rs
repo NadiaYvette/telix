@@ -452,6 +452,10 @@ const UDS_BIND: u64 = 0x8010;
 const UDS_LISTEN: u64 = 0x8020;
 const UDS_CONNECT: u64 = 0x8030;
 const UDS_ACCEPT: u64 = 0x8040;
+const UDS_ACCEPT_ASYNC: u64 = 0x8041;
+const UDS_ACCEPT_REPLY: u64 = 0x8042;
+const UDS_RECV_ASYNC: u64 = 0x8061;
+const UDS_RECV_REPLY: u64 = 0x8062;
 const UDS_SEND: u64 = 0x8050;
 const UDS_RECV: u64 = 0x8060;
 const UDS_CLOSE: u64 = 0x8070;
@@ -687,6 +691,117 @@ static mut UDS_PORT: u64 = 0;
 static mut NET_PORT: u64 = 0;
 static mut SOCKETPAIR_SEQ: u32 = 0;
 
+// --- Async dispatch infrastructure ---
+//
+// linux_srv processes Linux syscalls in a single main loop.  A handler that
+// would block (e.g. AF_UNIX accept on an empty listener) would otherwise park
+// the main thread, queueing every other Linux process's syscalls behind it —
+// a fatal problem for a two-process Wayland compositor + client pair.
+//
+// BACKEND_REPLY_PORT receives completion notifications for previously-dispatched
+// async backend requests (UDS_ACCEPT_REPLY etc.).  It lives in a port set with
+// the main service port so the dispatch loop can pick up either kind of
+// message without parking on one of them.
+//
+// PENDING_ASYNC is the continuation table: each entry remembers what to do
+// when a correlation id comes back on BACKEND_REPLY_PORT.  Today only the
+// "finish an AF_UNIX accept" continuation exists; later additions (blocking
+// read, poll, pipe-read, futex) layer on the same machinery.
+//
+// REPLY_DEFERRED is a sticky per-dispatch flag set by any handler that stashed
+// the caller in PENDING_ASYNC instead of replying immediately.  The main loop
+// checks it after dispatch to decide whether to call personality_reply now or
+// wait for the backend reply to resume.
+static mut BACKEND_REPLY_PORT: u64 = 0;
+static mut ASYNC_NEXT_ID: u64 = 1;
+static mut REPLY_DEFERRED: bool = false;
+
+const MAX_PENDING_ASYNC: usize = 64;
+
+#[derive(Copy, Clone)]
+enum PendingAsyncKind {
+    Unused,
+    AcceptUnix,
+    /// Blocking recv/recvfrom on an AF_UNIX socket; completed by
+    /// UDS_RECV_REPLY.
+    RecvUnix,
+}
+
+#[derive(Copy, Clone)]
+struct PendingAsync {
+    kind: PendingAsyncKind,
+    correlation: u64,
+    /// Process index of the caller (for PROC_TABLE lookups).
+    pi: usize,
+    /// Where to route personality_reply on completion.
+    caller_task_port: u64,
+    /// The listener fd (AcceptUnix: for fd inheritance) or the socket fd
+    /// (RecvUnix: for validation on completion).
+    listen_fd: usize,
+    /// accept4 flags (SOCK_CLOEXEC / SOCK_NONBLOCK) — AcceptUnix only.
+    flags: u64,
+    /// Destination buffer VA in the caller's aspace — RecvUnix only.
+    buf_va: usize,
+    /// Destination buffer capacity — RecvUnix only.
+    buf_len: usize,
+}
+
+impl PendingAsync {
+    const fn empty() -> Self {
+        Self {
+            kind: PendingAsyncKind::Unused,
+            correlation: 0,
+            pi: 0,
+            caller_task_port: 0,
+            listen_fd: 0,
+            flags: 0,
+            buf_va: 0,
+            buf_len: 0,
+        }
+    }
+}
+
+static mut PENDING_ASYNC: [PendingAsync; MAX_PENDING_ASYNC] =
+    [PendingAsync::empty(); MAX_PENDING_ASYNC];
+
+fn async_alloc_slot() -> Option<usize> {
+    unsafe {
+        for i in 0..MAX_PENDING_ASYNC {
+            if matches!(PENDING_ASYNC[i].kind, PendingAsyncKind::Unused) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn async_free_slot(idx: usize) {
+    if idx >= MAX_PENDING_ASYNC { return; }
+    unsafe { PENDING_ASYNC[idx] = PendingAsync::empty(); }
+}
+
+fn async_find_by_correlation(correlation: u64) -> Option<usize> {
+    unsafe {
+        for i in 0..MAX_PENDING_ASYNC {
+            if !matches!(PENDING_ASYNC[i].kind, PendingAsyncKind::Unused)
+                && PENDING_ASYNC[i].correlation == correlation
+            {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn next_correlation_id() -> u64 {
+    unsafe {
+        let id = ASYNC_NEXT_ID;
+        ASYNC_NEXT_ID = ASYNC_NEXT_ID.wrapping_add(1);
+        if ASYNC_NEXT_ID == 0 { ASYNC_NEXT_ID = 1; } // 0 reserved for "none"
+        id
+    }
+}
+
 // Epoll subsystem
 #[derive(Clone, Copy)]
 struct EpollWatch {
@@ -760,10 +875,22 @@ struct MemFdSlot {
     size: usize,        // logical file size
     seals: u32,         // active seal bits (F_SEAL_*)
     allow_sealing: bool, // MFD_ALLOW_SEALING was set at creation
+    /// Number of fd-table entries referencing this slot.  Incremented on
+    /// creation, dup, and SCM_RIGHTS delivery; decremented on close.  The
+    /// backing memory is released (and the slot marked inactive) only when
+    /// refcount drops to zero.  Without this, closing a shm fd in the sender
+    /// would free the memfd while the receiver still has it — which is
+    /// exactly the pattern Wayland's wl_shm.create_pool uses.
+    refcount: u32,
 }
 
 impl MemFdSlot {
-    const fn empty() -> Self { Self { active: false, va: 0, capacity: 0, size: 0, seals: 0, allow_sealing: false } }
+    const fn empty() -> Self {
+        Self {
+            active: false, va: 0, capacity: 0, size: 0,
+            seals: 0, allow_sealing: false, refcount: 0,
+        }
+    }
 }
 
 static mut MEMFD_TABLE: [MemFdSlot; MAX_MEMFD_INSTANCES] = [const { MemFdSlot::empty() }; MAX_MEMFD_INSTANCES];
@@ -2254,6 +2381,7 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
             MEMFD_TABLE[slot_idx] = MemFdSlot::empty();
             MEMFD_TABLE[slot_idx].active = true;
             MEMFD_TABLE[slot_idx].allow_sealing = true; // shm_open files support sealing
+            MEMFD_TABLE[slot_idx].refcount = 1;
 
             PROC_TABLE[pi].fds[fd] = FdEntry::empty();
             PROC_TABLE[pi].fds[fd].in_use = true;
@@ -2716,11 +2844,16 @@ fn do_close(pi: usize, fd: usize) {
             }
             FdKind::MemFd => {
                 let idx = PROC_TABLE[pi].fds[fd].handle as usize;
-                if idx < MAX_MEMFD_INSTANCES {
-                    if MEMFD_TABLE[idx].va != 0 {
-                        syscall::munmap(MEMFD_TABLE[idx].va);
+                if idx < MAX_MEMFD_INSTANCES && MEMFD_TABLE[idx].active {
+                    if MEMFD_TABLE[idx].refcount > 0 {
+                        MEMFD_TABLE[idx].refcount -= 1;
                     }
-                    MEMFD_TABLE[idx] = MemFdSlot::empty();
+                    if MEMFD_TABLE[idx].refcount == 0 {
+                        if MEMFD_TABLE[idx].va != 0 {
+                            syscall::munmap(MEMFD_TABLE[idx].va);
+                        }
+                        MEMFD_TABLE[idx] = MemFdSlot::empty();
+                    }
                 }
             }
             FdKind::DevNull | FdKind::DevZero | FdKind::DevUrandom | FdKind::DevTty
@@ -6543,22 +6676,70 @@ fn handle_getid(nr: u64, caller_port: u64) -> u64 {
 /// Read from a socket FD (UDS or TCP).
 fn read_socket(caller_port: u64, srv_port: u64, handle: u64, domain: u8, buf_va: usize, count: usize) -> u64 {
     if domain == AF_UNIX as u8 {
-        let resp = match syscall::call(srv_port, UDS_RECV, handle, 0, 0, 0) {
-            Some(m) => m,
-            None => { return linux_err(ECONNREFUSED); }
+        // Async recv: uds_srv returns either the buffered data (via async
+        // send-back now) or registers a notification.  Either way, main
+        // thread doesn't park on the receive; the completion arrives on
+        // BACKEND_REPLY_PORT and finish_recv_unix delivers data to the
+        // caller.  We need the caller's pi and fd to cross-check on
+        // completion — look them up via caller_port + the fs_port/handle
+        // already passed in (we don't have pi here, so recover it).
+        //
+        // read_socket is called from several handlers without pi directly —
+        // recover it from caller_port via find_proc (MAX_PROCS is small).
+        let pi = match find_proc(caller_port) {
+            Some(i) => i,
+            None => return linux_err(EBADF),
         };
-        if resp.tag == UDS_EOF { return 0; }
-        if resp.tag != UDS_OK { return linux_err(ECONNREFUSED); }
-        let len = (resp.data[2] & 0xFFFF) as usize;
-        let got = len.min(count);
-        if got == 0 { return 0; }
-        let mut tmp = [0u8; 16];
-        let b0 = resp.data[0].to_le_bytes();
-        let b1 = resp.data[1].to_le_bytes();
-        tmp[..8].copy_from_slice(&b0);
-        tmp[8..16].copy_from_slice(&b1);
-        let written = syscall::personality_copy_out(caller_port, buf_va, &tmp[..got]);
-        written as u64
+        // Find the fd whose handle matches the one we were handed.  (pi may
+        // have multiple fds on the same handle; first match wins.)
+        let mut fd_found: Option<usize> = None;
+        unsafe {
+            for fi in 0..MAX_FDS {
+                if PROC_TABLE[pi].fds[fi].in_use
+                    && PROC_TABLE[pi].fds[fi].kind == FdKind::Socket
+                    && PROC_TABLE[pi].fds[fi].handle == handle
+                    && PROC_TABLE[pi].fds[fi].sock_domain == AF_UNIX as u8
+                {
+                    fd_found = Some(fi);
+                    break;
+                }
+            }
+        }
+        let fd = match fd_found {
+            Some(f) => f,
+            None => return linux_err(EBADF),
+        };
+
+        let slot = match async_alloc_slot() {
+            Some(i) => i,
+            None => return linux_err(ENOMEM),
+        };
+        let correlation = next_correlation_id();
+        unsafe {
+            PENDING_ASYNC[slot] = PendingAsync {
+                kind: PendingAsyncKind::RecvUnix,
+                correlation,
+                pi,
+                caller_task_port: caller_port,
+                listen_fd: fd,
+                flags: 0,
+                buf_va,
+                buf_len: count,
+            };
+        }
+        let rp = unsafe { BACKEND_REPLY_PORT };
+        let max = if count > 16 { 16u64 } else { count as u64 };
+        let resp = match syscall::call(srv_port, UDS_RECV_ASYNC,
+                                       handle, rp, correlation, max) {
+            Some(m) => m,
+            None => { async_free_slot(slot); return linux_err(ECONNREFUSED); }
+        };
+        if resp.tag != UDS_OK {
+            async_free_slot(slot);
+            return linux_err(ECONNREFUSED);
+        }
+        unsafe { REPLY_DEFERRED = true; }
+        0
     } else if domain == AF_INET as u8 {
         if handle == u64::MAX { return linux_err(ENOTCONN); }
         let resp = match syscall::call(srv_port, NET_TCP_RECV, handle, 0, 0, 0) {
@@ -6907,27 +7088,49 @@ fn handle_accept_inner(pi: usize, caller_port: u64, args: &[u64; 6], flags: u64)
         if PROC_TABLE[pi].fds[fd].sock_state != 2 { return linux_err(EINVAL); }
 
         let dom = PROC_TABLE[pi].fds[fd].sock_domain;
+
+        if dom == AF_UNIX as u8 {
+            // Async dispatch: register with uds_srv and defer the Linux reply.
+            // uds_srv will send UDS_ACCEPT_REPLY to BACKEND_REPLY_PORT when a
+            // client eventually connects; the main loop picks it up in
+            // finish_accept_unix and completes the syscall.
+            let slot = match async_alloc_slot() {
+                Some(i) => i,
+                None => return linux_err(ENOMEM),
+            };
+            let correlation = next_correlation_id();
+            PENDING_ASYNC[slot] = PendingAsync {
+                kind: PendingAsyncKind::AcceptUnix,
+                correlation,
+                pi,
+                caller_task_port: caller_port,
+                listen_fd: fd,
+                flags,
+                buf_va: 0,
+                buf_len: 0,
+            };
+            let uds_port = PROC_TABLE[pi].fds[fd].fs_port;
+            let handle   = PROC_TABLE[pi].fds[fd].handle;
+            let rp       = BACKEND_REPLY_PORT;
+            let resp = match syscall::call(uds_port, UDS_ACCEPT_ASYNC,
+                                           handle, rp, correlation, 0) {
+                Some(m) => m,
+                None => { async_free_slot(slot); return linux_err(ECONNREFUSED); }
+            };
+            if resp.tag != UDS_OK {
+                async_free_slot(slot);
+                return linux_err(ECONNREFUSED);
+            }
+            REPLY_DEFERRED = true;
+            return 0;
+        }
+
         let new_fd = match alloc_fd(pi) {
             Some(f) => f,
             None => return linux_err(EMFILE),
         };
 
-        if dom == AF_UNIX as u8 {
-            let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, UDS_ACCEPT, PROC_TABLE[pi].fds[fd].handle, 0, 0, 0) {
-                Some(m) => m,
-                None => { PROC_TABLE[pi].fds[new_fd] = FdEntry::empty(); return linux_err(ECONNREFUSED); }
-            };
-            if resp.tag != UDS_OK {
-                PROC_TABLE[pi].fds[new_fd] = FdEntry::empty();
-                return linux_err(ECONNREFUSED);
-            }
-            PROC_TABLE[pi].fds[new_fd].kind = FdKind::Socket;
-            PROC_TABLE[pi].fds[new_fd].fs_port = PROC_TABLE[pi].fds[fd].fs_port;
-            PROC_TABLE[pi].fds[new_fd].handle = resp.data[0]; // accepted handle
-            PROC_TABLE[pi].fds[new_fd].sock_domain = AF_UNIX as u8;
-            PROC_TABLE[pi].fds[new_fd].sock_type = SOCK_STREAM as u8;
-            PROC_TABLE[pi].fds[new_fd].sock_state = 3;
-        } else if dom == AF_INET as u8 {
+        if dom == AF_INET as u8 {
             let port = PROC_TABLE[pi].fds[fd].sock_port;
             let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, NET_TCP_ACCEPT, port as u64, 0, 0, 0) {
                 Some(m) => m,
@@ -6959,6 +7162,122 @@ fn handle_accept_inner(pi: usize, caller_port: u64, args: &[u64; 6], flags: u64)
         // TODO: write sockaddr back to caller if addr_va != 0
 
         new_fd as u64
+    }
+}
+
+/// Complete a deferred AF_UNIX accept.  Called from the main loop when a
+/// UDS_ACCEPT_REPLY arrives on BACKEND_REPLY_PORT.  Allocates the new fd in
+/// the caller's PROC_TABLE slice, wires the accepted UDS handle, applies
+/// accept4 flags, and personality_replies the original Linux caller.
+fn finish_accept_unix(slot: usize, srv_end: u64) {
+    unsafe {
+        let info = PENDING_ASYNC[slot];
+        async_free_slot(slot);
+        let pi = info.pi;
+        let listen_fd = info.listen_fd;
+        let caller = info.caller_task_port;
+
+        // If the caller's listening fd is gone (process exited before we
+        // completed), just drop the result.  uds_srv already moved the
+        // pending pair to Connected; cleanup on caller-death would have to
+        // reap that, but that's out of scope here.
+        if listen_fd >= MAX_FDS
+            || !PROC_TABLE[pi].fds[listen_fd].in_use
+            || PROC_TABLE[pi].fds[listen_fd].kind != FdKind::Socket
+        {
+            let _ = syscall::personality_reply(caller, linux_err(EBADF));
+            return;
+        }
+
+        let new_fd = match alloc_fd(pi) {
+            Some(f) => f,
+            None => {
+                let _ = syscall::personality_reply(caller, linux_err(EMFILE));
+                return;
+            }
+        };
+        PROC_TABLE[pi].fds[new_fd].kind = FdKind::Socket;
+        PROC_TABLE[pi].fds[new_fd].fs_port = PROC_TABLE[pi].fds[listen_fd].fs_port;
+        PROC_TABLE[pi].fds[new_fd].handle = srv_end;
+        PROC_TABLE[pi].fds[new_fd].sock_domain = AF_UNIX as u8;
+        PROC_TABLE[pi].fds[new_fd].sock_type = SOCK_STREAM as u8;
+        PROC_TABLE[pi].fds[new_fd].sock_state = 3;
+        if info.flags & SOCK_NONBLOCK != 0 {
+            PROC_TABLE[pi].fds[new_fd].status_flags |= O_NONBLOCK as u32;
+        }
+        if info.flags & SOCK_CLOEXEC != 0 {
+            PROC_TABLE[pi].fds[new_fd].fd_flags |= FD_CLOEXEC;
+        }
+        let _ = syscall::personality_reply(caller, new_fd as u64);
+    }
+}
+
+/// Complete a deferred AF_UNIX recv/recvfrom.  Called when uds_srv sends
+/// UDS_RECV_REPLY to BACKEND_REPLY_PORT.  `len` is the byte count packed
+/// into the UDS reply (u64::MAX = EOF).  `b0`/`b1` hold up to 16 bytes of
+/// payload (little-endian as packed by uds_srv::pack_bytes).
+fn finish_recv_unix(slot: usize, b0: u64, len_raw: u64, b1: u64) {
+    unsafe {
+        let info = PENDING_ASYNC[slot];
+        async_free_slot(slot);
+        let caller = info.caller_task_port;
+
+        // EOF sentinel (see uds_srv: UDS_RECV_REPLY with len=u64::MAX).
+        if len_raw == u64::MAX {
+            let _ = syscall::personality_reply(caller, 0);
+            return;
+        }
+
+        let len = (len_raw as usize).min(16).min(info.buf_len);
+        if len == 0 {
+            let _ = syscall::personality_reply(caller, 0);
+            return;
+        }
+        let mut tmp = [0u8; 16];
+        tmp[..8].copy_from_slice(&b0.to_le_bytes());
+        tmp[8..].copy_from_slice(&b1.to_le_bytes());
+        let written = syscall::personality_copy_out(caller, info.buf_va, &tmp[..len]);
+        let _ = syscall::personality_reply(caller, written as u64);
+    }
+}
+
+/// Dispatch an incoming message on BACKEND_REPLY_PORT to the matching
+/// continuation handler.  Returns whether a continuation fired.
+fn handle_async_reply(msg: &syscall::Message) -> bool {
+    match msg.tag {
+        UDS_ACCEPT_REPLY => {
+            let correlation = msg.data[0];
+            let srv_end = msg.data[1];
+            let slot = match async_find_by_correlation(correlation) {
+                Some(s) => s,
+                None => return false,
+            };
+            let kind = unsafe { PENDING_ASYNC[slot].kind };
+            match kind {
+                PendingAsyncKind::AcceptUnix => finish_accept_unix(slot, srv_end),
+                _ => async_free_slot(slot),
+            }
+            true
+        }
+        UDS_RECV_REPLY => {
+            // data[0] = correlation, data[1] = bytes 0-7, data[2] = length
+            // (u64::MAX = EOF), data[3] = bytes 8-15.
+            let correlation = msg.data[0];
+            let b0 = msg.data[1];
+            let len_raw = msg.data[2];
+            let b1 = msg.data[3];
+            let slot = match async_find_by_correlation(correlation) {
+                Some(s) => s,
+                None => return false,
+            };
+            let kind = unsafe { PENDING_ASYNC[slot].kind };
+            match kind {
+                PendingAsyncKind::RecvUnix => finish_recv_unix(slot, b0, len_raw, b1),
+                _ => async_free_slot(slot),
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -7130,6 +7449,20 @@ fn handle_sendmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                                 PENDING_FD_TRANSFERS[s].receiver_uds_handle = peer_handle;
                                                 PENDING_FD_TRANSFERS[s].fd_count = fd_count;
                                                 PENDING_FD_TRANSFERS[s].entries = entries;
+                                                // Bump ref on any MemFd entries so the sender can
+                                                // close() its fd without freeing the memfd — the
+                                                // pending transfer now owns a reference, which is
+                                                // then handed to the receiver on deliver_scm_rights.
+                                                for i in 0..fd_count {
+                                                    if entries[i].kind == FdKind::MemFd {
+                                                        let idx = entries[i].handle as usize;
+                                                        if idx < MAX_MEMFD_INSTANCES
+                                                            && MEMFD_TABLE[idx].active
+                                                        {
+                                                            MEMFD_TABLE[idx].refcount += 1;
+                                                        }
+                                                    }
+                                                }
                                                 break;
                                             }
                                         }
@@ -8472,6 +8805,7 @@ fn handle_memfd_create(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
         MEMFD_TABLE[slot_idx] = MemFdSlot::empty();
         MEMFD_TABLE[slot_idx].active = true;
         MEMFD_TABLE[slot_idx].allow_sealing = (flags & MFD_ALLOW_SEALING) != 0;
+        MEMFD_TABLE[slot_idx].refcount = 1;
 
         PROC_TABLE[pi].fds[fd] = FdEntry::empty();
         PROC_TABLE[pi].fds[fd].in_use = true;
@@ -8546,7 +8880,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         PIPE_PORT = syscall::ns_lookup(b"pipe").unwrap_or(0);
         UDS_PORT = syscall::ns_lookup(b"uds").unwrap_or(0);
         NET_PORT = syscall::ns_lookup(b"net").unwrap_or(0);
+        BACKEND_REPLY_PORT = syscall::port_create();
     }
+
+    // Build a port set covering the main service port and the backend reply
+    // port so the dispatch loop waits on both simultaneously.  This is what
+    // makes async dispatch work: while a previously-delegated UDS_ACCEPT is
+    // pending on the backend_reply_port, new Linux syscalls on the service
+    // port are still serviced.
+    let port_set = syscall::port_set_create() as u32;
+    let a1 = syscall::port_set_add(port_set, port);
+    let a2 = syscall::port_set_add(port_set, unsafe { BACKEND_REPLY_PORT });
+    syscall::debug_puts(b"[linux_srv] port_set=");
+    print_num(port_set as u64);
+    syscall::debug_puts(b" svc_add=");
+    syscall::debug_puts(if a1 { b"ok" } else { b"FAIL" });
+    syscall::debug_puts(b" rpl_add=");
+    syscall::debug_puts(if a2 { b"ok" } else { b"FAIL" });
+    syscall::debug_puts(b"\n");
 
     // Eagerly set up the long-path scratch grant to VFS so the first openat()
     // for a >16-byte path doesn't race with vfs_task ns publication.
@@ -8561,10 +8912,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     loop {
         expire_futex_waiters();
 
-        let msg = match syscall::recv_msg(port) {
-            Some(m) => m,
+        let (src_port, msg) = match syscall::port_set_recv(port_set) {
+            Some(x) => x,
             None => continue,
         };
+
+        // Backend reply for a previously-deferred syscall?  Dispatch the
+        // continuation and loop.  Continuations handle their own personality
+        // replies — nothing further to do here.
+        if src_port == unsafe { BACKEND_REPLY_PORT } {
+            let _ = handle_async_reply(&msg);
+            continue;
+        }
 
         let linux_nr = msg.tag & 0xFFFF_FFFF;
         let caller_port = msg.tag >> 32;
@@ -8592,6 +8951,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"\n");
             }
         }
+
+        // Handlers that defer their reply (e.g. async accept) set
+        // REPLY_DEFERRED.  Reset before dispatch so stale flag state from a
+        // previous iteration can't suppress a legitimate reply.
+        unsafe { REPLY_DEFERRED = false; }
 
         let result = match linux_nr {
             __NR_READ => handle_read(pi, caller_port, &msg.data),
@@ -9046,7 +9410,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         };
 
-        // Reply to the blocked caller.
+        // Reply to the blocked caller — unless the handler deferred the
+        // reply (e.g. async accept registered with uds_srv and stashed the
+        // caller in PENDING_ASYNC).  Those handlers personality_reply later
+        // from handle_async_reply when the backend completion arrives.
+        if unsafe { REPLY_DEFERRED } {
+            continue;
+        }
         syscall::personality_reply(caller_port, final_result);
     }
 }
