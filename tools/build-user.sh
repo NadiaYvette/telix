@@ -97,6 +97,20 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
         echo "  WARNING: wayland_test build failed"
     fi
     # Step G: handwritten minimal Wayland compositor + test client.
+    # Regenerate the embedded XKB_V1 keymap header if xkbcomp is available;
+    # otherwise the existing checked-in copy is used.  xkbcomp output is
+    # stable across machines, so the checked-in header also stays stable.
+    if command -v xkbcomp >/dev/null 2>&1; then
+        echo "Regenerating tools/xkb_keymap_us.h from xkbcomp..."
+        echo 'xkb_keymap {
+  xkb_keycodes  { include "evdev+aliases(qwerty)" };
+  xkb_types     { include "complete" };
+  xkb_compat    { include "complete" };
+  xkb_symbols   { include "pc+us+inet(evdev)" };
+};' | xkbcomp -xkb - - 2>/dev/null > "$ROOTDIR/tools/xkb_keymap_us.txt"
+        xxd -i -n xkb_keymap_us "$ROOTDIR/tools/xkb_keymap_us.txt" \
+            > "$ROOTDIR/tools/xkb_keymap_us.h"
+    fi
     echo "Building wl_compositor_min + hello_wl (Step G)..."
     if gcc -static-pie -fPIE -O2 -fno-stack-protector -s -o "$BINDIR/wl_compositor_min" "$ROOTDIR/tools/wl_compositor_min.c" 2>&1; then
         echo "  wl_compositor_min: $(wc -c < "$BINDIR/wl_compositor_min") bytes"

@@ -5619,8 +5619,21 @@ fn drm_ioctl_create_dumb(caller_port: u64, arg_va: usize) -> u64 {
         Some(v) => v,
         None => return linux_err(ENOMEM),
     };
-    // Zero the buffer.
-    unsafe { core::ptr::write_bytes(va as *mut u8, 0, pages * ps); }
+    // Force a write to every MMU page so each is backed by a real PTE
+    // before personality_map_shared walks translate_va.  (The kernel's
+    // translate_va was also fixed to handle the 2 MiB superpages that
+    // the fault handler sometimes installs on aligned ranges — but
+    // touching every page is still the belt alongside that suspenders.)
+    const MMU_PAGE: usize = 4096;
+    unsafe {
+        let base = va as *mut u8;
+        let total = pages * ps;
+        let mut off = 0usize;
+        while off < total {
+            core::ptr::write_volatile(base.add(off), 0u8);
+            off += MMU_PAGE;
+        }
+    }
 
     unsafe {
         DRM_DUMB_TABLE[slot] = DrmDumbBuffer {

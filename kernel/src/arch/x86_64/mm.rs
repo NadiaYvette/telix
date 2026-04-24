@@ -335,13 +335,44 @@ pub fn read_and_clear_ref_bit(pml4: usize, va: usize) -> bool {
 /// Translate a user VA to a physical address by walking the x86-64 page table.
 /// Returns None if the page is not mapped.
 pub fn translate_va(pml4: usize, va: usize) -> Option<usize> {
-    let slot = radix_pt::walk_to_leaf::<X86Pte>(pml4, va)?;
-    let entry = unsafe { *slot };
-    if entry & PTE_P == 0 {
-        return None;
+    // Walk the tables one level at a time so we catch superpages that
+    // the strict walk_to_leaf can't see.  x86-64 allows a 2 MiB block
+    // at PD level (level 2) and a 1 GiB block at PDPT level (level 1);
+    // the kernel's zero-fill fault handler installs a 2 MiB superpage
+    // on aligned ranges when it's cheaper than 512 individual PTEs,
+    // and the previous walk_to_leaf-based translate_va returned None
+    // the moment it hit one.  That made every DRM dumb-buffer mmap
+    // that crossed a 2 MiB boundary fail with ENOMEM.
+    let mut table = pml4 as *mut u64;
+    for level in 0..X86Pte::LEVELS {
+        let idx = X86Pte::va_index(va, level);
+        let entry = unsafe { *table.add(idx) };
+        if entry & PTE_P == 0 {
+            return None;
+        }
+        // Leaf (last level) always contains the PA.  Intermediate entries
+        // with PTE_PS set (page size) are superpage terminators — combine
+        // their base PA with the low-bit offset for the level.
+        let is_leaf = level == X86Pte::LEVELS - 1;
+        let is_block = !is_leaf && (entry & PTE_PS) != 0;
+        if is_leaf || is_block {
+            // Mask: for a leaf (4 KiB) the offset is 12 bits; for a PD
+            // superpage (2 MiB) it's 21 bits; for a PDPT superpage
+            // (1 GiB) it's 30 bits.  X86Pte::LEVELS == 4, so level=3 is
+            // leaf (12), level=2 is 2 MiB (21), level=1 is 1 GiB (30).
+            let offset_bits = match level {
+                3 => 12,
+                2 => 21,
+                1 => 30,
+                _ => return None, // PML4 superpage doesn't exist on x86-64.
+            };
+            let frame_mask = !((1usize << offset_bits) - 1);
+            let pa = (entry as usize) & frame_mask & 0x000F_FFFF_FFFF_FFFF;
+            return Some(pa | (va & ((1usize << offset_bits) - 1)));
+        }
+        table = X86Pte::table_pa(entry) as *mut u64;
     }
-    let pa = X86Pte::leaf_pa(entry);
-    Some(pa | (va & 0xFFF))
+    None
 }
 
 /// Create a new PML4 for a user process, copying the kernel's identity-mapped

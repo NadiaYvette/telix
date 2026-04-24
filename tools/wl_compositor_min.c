@@ -392,6 +392,12 @@ static void input_ensure_focused(struct client *c);
 #include <sys/syscall.h>
 #include <poll.h>
 
+/* Pre-generated XKB_V1 keymap (US layout).  Produced at build time by
+ * xkbcomp from the pc+us+inet(evdev) layout.  Embedded here so the
+ * compositor stays a single self-contained static-PIE binary — no need
+ * for runtime file lookups under the Linux personality. */
+#include "xkb_keymap_us.h"
+
 struct seat_state {
     int      kbd_fd;      /* /dev/input/event0 (keyboard) */
     int      ptr_fd;      /* /dev/input/event1 (mouse) */
@@ -423,23 +429,37 @@ static void input_setup(void) {
     if (g_seat.ptr_fd < 0)
         LOG("input: open /dev/input/event1: %s (no pointer events)", strerror(errno));
 
-    /* Minimal keymap memfd: one byte (a NUL).  The NO_KEYMAP format signals
-     * the client not to interpret the data.  We still need a valid fd to
-     * satisfy the wl_keyboard.keymap event. */
-    long memfd = syscall(SYS_memfd_create, "wl-keymap", 0);
+    /* Populate a memfd with the bundled XKB_V1 US keymap.  Xwayland (and
+     * any xkbcommon-based client) parses this buffer via
+     * xkb_keymap_new_from_string; NO_KEYMAP is rejected, so an actual
+     * keymap is required.  The trailing NUL from xxd's byte array is
+     * benign — xkbcommon ignores whatever's past the parser EOF. */
+    long memfd = syscall(SYS_memfd_create, "wl-keymap-xkb", 0);
     if (memfd < 0) {
         LOG("input: memfd_create failed: %s", strerror(errno));
         return;
     }
-    if (ftruncate((int)memfd, 1) < 0) {
+    if (ftruncate((int)memfd, (off_t)xkb_keymap_us_len) < 0) {
         LOG("input: ftruncate keymap memfd: %s", strerror(errno));
         close((int)memfd);
         return;
     }
+    /* mmap + memcpy is the simplest cross-platform way to fill a memfd —
+     * avoids caring whether Telix's VFS-less linux_srv supports write()
+     * on MemFds. */
+    void *p = mmap(NULL, xkb_keymap_us_len, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, (int)memfd, 0);
+    if (p == MAP_FAILED) {
+        LOG("input: mmap keymap memfd: %s", strerror(errno));
+        close((int)memfd);
+        return;
+    }
+    memcpy(p, xkb_keymap_us, xkb_keymap_us_len);
+    munmap(p, xkb_keymap_us_len);
     g_seat.keymap_fd = (int)memfd;
-    g_seat.keymap_len = 1;
-    LOG("input: seat ready kbd_fd=%d ptr_fd=%d keymap_fd=%d",
-        g_seat.kbd_fd, g_seat.ptr_fd, g_seat.keymap_fd);
+    g_seat.keymap_len = xkb_keymap_us_len;
+    LOG("input: seat ready kbd_fd=%d ptr_fd=%d keymap_fd=%d (xkb_v1, %zu bytes)",
+        g_seat.kbd_fd, g_seat.ptr_fd, g_seat.keymap_fd, g_seat.keymap_len);
 }
 
 static void input_teardown(void) {
@@ -1295,7 +1315,7 @@ static void handle_wl_seat(struct client *c, uint32_t id, uint16_t opcode,
          * received fd so reuse is fine either way. */
         if (g_seat.keymap_fd >= 0) {
             uint8_t body[8];
-            put_u32(body,     WL_KEYBOARD_KEYMAP_NO_KEYMAP);
+            put_u32(body,     WL_KEYBOARD_KEYMAP_XKB_V1);
             put_u32(body + 4, (uint32_t)g_seat.keymap_len);
             send_msg_fd(c, new_id, WL_KEYBOARD_EV_KEYMAP, body, 8,
                         g_seat.keymap_fd);
