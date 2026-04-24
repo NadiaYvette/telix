@@ -296,7 +296,11 @@ const DRM_IOCTL_MODE_GETCRTC: u64     = 0xC068_64A1;
 const DRM_IOCTL_MODE_SETCRTC: u64     = 0xC068_64A2;
 const DRM_IOCTL_MODE_GETENCODER: u64  = 0xC014_64A6;
 const DRM_IOCTL_MODE_GETCONNECTOR: u64 = 0xC050_64A7;
-const DRM_IOCTL_MODE_ADDFB: u64       = 0xC044_64AE;
+// Canonical Linux encoding: _IOWR('d', 0xAE, drm_mode_fb_cmd) where the
+// struct is 28 bytes (0x1C).  Earlier Telix code had 0xC044_64AE which
+// would claim a 68-byte struct — not matching any real Linux layout and
+// causing glibc's ioctl() to get ENOTTY from every real compositor.
+const DRM_IOCTL_MODE_ADDFB: u64       = 0xC01C_64AE;
 const DRM_IOCTL_MODE_RMFB: u64        = 0xC004_64AF;
 const DRM_IOCTL_MODE_PAGE_FLIP: u64   = 0xC010_64B0;
 const DRM_IOCTL_MODE_CREATE_DUMB: u64 = 0xC020_64B2;
@@ -4233,11 +4237,16 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                     }
                     let src_va = DRM_DUMB_TABLE[idx].va;
                     let target_hint = if is_fixed && addr != 0 { addr } else { 0 };
+                    // `pages` here is userland-facing page units; the call
+                    // wants MMUPAGE_SIZE units.  On archs where the kernel's
+                    // PAGE_SIZE > MMUPAGE_SIZE, scale accordingly so the PTE
+                    // mapping covers every MMU page the caller expects.
+                    let mmu_pages = pages * (syscall::page_size() as u64 / 4096);
                     match syscall::personality_map_shared(
                         caller_port,
                         src_va as u64,
                         target_hint,
-                        pages,
+                        mmu_pages,
                         kern_prot as u64,
                     ) {
                         Some(v) => return v as u64,

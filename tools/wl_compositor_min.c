@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -106,6 +107,212 @@
 static int verbose = 1;
 #define LOG(fmt, ...) do { if (verbose) fprintf(stderr, "[wl] " fmt "\n", ##__VA_ARGS__); } while (0)
 #define DIE(fmt, ...) do { fprintf(stderr, "[wl] FATAL: " fmt "\n", ##__VA_ARGS__); exit(1); } while (0)
+
+/* ---------- DRM scanout ---------- *
+ *
+ * Telix's linux_srv translates the kernel's DRM/KMS ioctls into its native
+ * framebuffer server calls: CREATE_DUMB allocates a CPU-accessible buffer,
+ * MAP_DUMB + mmap exposes it in our aspace, ADDFB wraps it in a fb_id, and
+ * SETCRTC binds that fb_id to the only CRTC.  PAGE_FLIP then blits the
+ * dumb buffer to the real framebuffer (fb_srv) and schedules scanout.
+ *
+ * All of this is optional: opening /dev/dri/card0 may fail (e.g. on Fedora
+ * host without the video group).  When it does, drm_setup returns 0 and
+ * commits fall back to log-only — same behaviour as the pre-DRM skeleton.
+ */
+
+#define DRM_IOCTL_MODE_CREATE_DUMB   0xC02064B2UL
+#define DRM_IOCTL_MODE_MAP_DUMB      0xC01064B3UL
+#define DRM_IOCTL_MODE_DESTROY_DUMB  0xC00464B4UL
+#define DRM_IOCTL_MODE_ADDFB         0xC01C64AEUL
+#define DRM_IOCTL_MODE_RMFB          0xC00464AFUL
+#define DRM_IOCTL_MODE_SETCRTC       0xC06864A2UL
+#define DRM_IOCTL_MODE_PAGE_FLIP     0xC01064B0UL
+
+struct drm_mode_create_dumb {
+    uint32_t height, width, bpp, flags;
+    uint32_t handle, pitch;
+    uint64_t size;
+};
+
+struct drm_mode_map_dumb {
+    uint32_t handle, pad;
+    uint64_t offset;
+};
+
+struct drm_mode_fb_cmd {
+    uint32_t fb_id, width, height, pitch;
+    uint32_t bpp, depth, handle;
+};
+
+/* drm_mode_crtc (104 bytes) — only fb_id + mode_valid are required by our
+ * linux_srv impl, but libdrm sends the full struct so we match the layout. */
+struct drm_mode_crtc {
+    uint64_t set_connectors_ptr;
+    uint32_t count_connectors;
+    uint32_t crtc_id;
+    uint32_t fb_id;
+    uint32_t x, y;
+    uint32_t gamma_size;
+    uint32_t mode_valid;
+    uint8_t  mode[68];  /* drm_mode_modeinfo — content ignored by Telix */
+};
+
+struct drm_mode_crtc_page_flip {
+    uint32_t crtc_id, fb_id, flags, reserved;
+    uint64_t user_data;
+};
+
+struct drm_scanout {
+    int      fd;           /* -1 if DRM unavailable */
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint32_t dumb_handle;
+    uint32_t fb_id;
+    size_t   size;
+    void    *va;           /* mmap of the dumb buffer */
+};
+
+/* Single-scanout state — one CRTC, one dumb buffer, one fb_id. */
+static struct drm_scanout g_drm = { .fd = -1 };
+
+static int drm_setup(uint32_t width, uint32_t height) {
+    int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        LOG("drm: open /dev/dri/card0 failed: %s (running headless)", strerror(errno));
+        return 0;
+    }
+
+    /* 1. CREATE_DUMB — allocates a CPU-coherent XRGB8888 buffer. */
+    struct drm_mode_create_dumb cd;
+    memset(&cd, 0, sizeof cd);
+    cd.width  = width;
+    cd.height = height;
+    cd.bpp    = 32;
+    if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) {
+        LOG("drm: CREATE_DUMB: %s", strerror(errno));
+        close(fd);
+        return 0;
+    }
+
+    /* 2. MAP_DUMB — returns the magic offset into drm_fd. */
+    struct drm_mode_map_dumb md = { .handle = cd.handle };
+    if (ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &md) < 0) {
+        LOG("drm: MAP_DUMB: %s", strerror(errno));
+        close(fd);
+        return 0;
+    }
+
+    /* 3. mmap at that offset to get the buffer VA. */
+    void *va = mmap(NULL, cd.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                    fd, (off_t)md.offset);
+    if (va == MAP_FAILED) {
+        LOG("drm: mmap dumb: %s", strerror(errno));
+        close(fd);
+        return 0;
+    }
+
+    /* 4. ADDFB — wrap the dumb buffer in a framebuffer object. */
+    struct drm_mode_fb_cmd fb;
+    memset(&fb, 0, sizeof fb);
+    fb.width  = width;
+    fb.height = height;
+    fb.pitch  = cd.pitch;
+    fb.bpp    = 32;
+    fb.depth  = 24;
+    fb.handle = cd.handle;
+    if (ioctl(fd, DRM_IOCTL_MODE_ADDFB, &fb) < 0) {
+        LOG("drm: ADDFB: %s", strerror(errno));
+        munmap(va, cd.size);
+        close(fd);
+        return 0;
+    }
+
+    /* 5. SETCRTC — bind fb to the only CRTC.  Telix's linux_srv ignores the
+     * mode struct; only fb_id matters.  (A libdrm-compatible compositor
+     * would query the connector's preferred mode and fill it in.) */
+    struct drm_mode_crtc crtc;
+    memset(&crtc, 0, sizeof crtc);
+    crtc.crtc_id     = 1; /* DRM_CRTC_ID in linux_srv */
+    crtc.fb_id       = fb.fb_id;
+    crtc.mode_valid  = 1;
+    /* Best-effort mode fill (ignored, but reasonable). */
+    uint8_t *m = crtc.mode;
+    uint32_t clock = 65000;  /* 1024x768@60 VESA */
+    memcpy(m, &clock, 4);
+    *(uint16_t *)(m + 4) = (uint16_t)width;    /* hdisplay */
+    *(uint16_t *)(m + 14) = (uint16_t)height;  /* vdisplay */
+    *(uint32_t *)(m + 28) = 0;                  /* flags */
+    if (ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &crtc) < 0) {
+        LOG("drm: SETCRTC: %s", strerror(errno));
+        munmap(va, cd.size);
+        close(fd);
+        return 0;
+    }
+
+    g_drm.fd           = fd;
+    g_drm.width        = width;
+    g_drm.height       = height;
+    g_drm.pitch        = cd.pitch;
+    g_drm.dumb_handle  = cd.handle;
+    g_drm.fb_id        = fb.fb_id;
+    g_drm.size         = cd.size;
+    g_drm.va           = va;
+
+    /* Clear buffer to opaque black — visible pixel check if nothing is
+     * drawn, and proof that SETCRTC's initial blit reached the display. */
+    uint32_t *px = (uint32_t *)va;
+    size_t count = cd.size / 4;
+    for (size_t i = 0; i < count; i++) px[i] = 0xFF000000;
+
+    LOG("drm: scanout ready %ux%u pitch=%u fb_id=%u dumb_handle=%u",
+        width, height, cd.pitch, fb.fb_id, cd.handle);
+    return 1;
+}
+
+static void drm_teardown(void) {
+    if (g_drm.fd < 0) return;
+    if (g_drm.va && g_drm.va != MAP_FAILED) munmap(g_drm.va, g_drm.size);
+    close(g_drm.fd);
+    g_drm.fd = -1;
+    g_drm.va = NULL;
+}
+
+/* Present the current dumb buffer on the CRTC. */
+static void drm_present(void) {
+    if (g_drm.fd < 0) return;
+    struct drm_mode_crtc_page_flip pf = { .crtc_id = 1, .fb_id = g_drm.fb_id };
+    if (ioctl(g_drm.fd, DRM_IOCTL_MODE_PAGE_FLIP, &pf) < 0) {
+        LOG("drm: PAGE_FLIP: %s", strerror(errno));
+    }
+}
+
+/* Blit a client's shm-backed surface buffer to the scanout dumb buffer.
+ * Naive top-left placement with per-row clip against the display.  Surface
+ * pixels are assumed XRGB8888 / ARGB8888 (the two formats we advertise). */
+static void drm_blit_surface(const void *src_base, size_t src_offset,
+                             int32_t width, int32_t height,
+                             int32_t stride)
+{
+    if (g_drm.fd < 0 || !g_drm.va) return;
+    if (width <= 0 || height <= 0 || stride < width * 4) return;
+
+    const uint8_t *src = (const uint8_t *)src_base + src_offset;
+    uint8_t *dst = (uint8_t *)g_drm.va;
+
+    size_t rows = (size_t)height;
+    if (rows > g_drm.height) rows = g_drm.height;
+    size_t row_bytes = (size_t)width * 4;
+    if (row_bytes > g_drm.pitch) row_bytes = g_drm.pitch;
+
+    for (size_t r = 0; r < rows; r++) {
+        memcpy(dst + r * g_drm.pitch,
+               src + r * (size_t)stride,
+               row_bytes);
+    }
+    LOG("drm: blit %zux%zu bytes/row=%zu → scanout", rows, row_bytes / 4, row_bytes);
+}
 
 /* ---------- Object table ---------- */
 
@@ -462,8 +669,10 @@ static void handle_wl_registry(struct client *c, uint32_t reg_id,
             send_shm_format(c, new_id, WL_SHM_FORMAT_ARGB8888);
             send_shm_format(c, new_id, WL_SHM_FORMAT_XRGB8888);
         } else if (g->type == OBJ_WL_OUTPUT) {
-            /* Single hard-coded output until we wire into DRM.  Geometry +
-             * mode events are required before done. */
+            /* Use the DRM-detected mode when scanout is live; otherwise
+             * fall back to the same 1024x768 linux_srv advertises. */
+            uint32_t out_w = g_drm.fd >= 0 ? g_drm.width  : 1024u;
+            uint32_t out_h = g_drm.fd >= 0 ? g_drm.height : 768u;
             uint8_t body[128];
             put_u32(body,       0);  /* x */
             put_u32(body + 4,   0);  /* y */
@@ -479,8 +688,8 @@ static void handle_wl_registry(struct client *c, uint32_t reg_id,
 
             uint8_t m[16];
             put_u32(m,      (1u << 0) | (1u << 1)); /* flags: current | preferred */
-            put_u32(m + 4,  1024);                    /* width */
-            put_u32(m + 8,  768);                     /* height */
+            put_u32(m + 4,  out_w);
+            put_u32(m + 8,  out_h);
             put_u32(m + 12, 60000);                   /* refresh mHz */
             send_msg(c, new_id, WL_OUTPUT_EV_MODE, m, 16);
 
@@ -714,16 +923,20 @@ static void handle_wl_surface(struct client *c, uint32_t id, uint16_t opcode,
         if (s->has_pending_buffer) {
             s->current_buffer = s->pending_buffer;
             s->has_pending_buffer = 0;
-            /* No rendering yet — just log the buffer's dimensions to prove
-             * we tracked it. */
             if (s->current_buffer && s->current_buffer < MAX_CLIENT_OBJS
                 && c->objs[s->current_buffer].type == OBJ_WL_BUFFER)
             {
                 struct wl_buffer_state *b = c->objs[s->current_buffer].buffer;
                 LOG("  committed buffer: %dx%d stride=%d fmt=%u",
                     b->width, b->height, b->stride, b->format);
-                /* Hand the buffer straight back to the client until we
-                 * actually render it. */
+                /* Blit the client's surface into the scanout dumb buffer
+                 * and page-flip — the buffer can be reused as soon as we
+                 * return, which is what wl_buffer.release signals. */
+                if (b->pool && b->pool->base) {
+                    drm_blit_surface(b->pool->base, b->offset,
+                                     b->width, b->height, b->stride);
+                    drm_present();
+                }
                 send_msg(c, s->current_buffer, WL_BUFFER_EV_RELEASE, NULL, 0);
             }
         }
@@ -942,6 +1155,12 @@ int main(int argc, char **argv) {
     build_socket_path(sock_path, sizeof sock_path);
     LOG("socket path: %s%s", sock_path, one_shot ? " (one-shot)" : "");
 
+    /* Set up scanout before accepting clients so the wl_output geometry
+     * we advertise matches the display that'll actually receive pixels.
+     * 1024x768 matches what Telix's linux_srv / fb_srv expose; libdrm
+     * would query the connector for its preferred mode. */
+    drm_setup(1024, 768);
+
     int lfd = make_listen_socket(sock_path);
 
     for (;;) {
@@ -957,6 +1176,7 @@ int main(int argc, char **argv) {
         if (one_shot) break;
     }
 
+    drm_teardown();
     close(lfd);
     unlink(sock_path);
     return 0;
