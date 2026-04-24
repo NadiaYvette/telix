@@ -422,17 +422,24 @@ pub fn personality_copy_in(target_port: u64, src_va: usize, dst_va: usize, len: 
     let caller_aspace = crate::sched::scheduler::task_ref(caller_task_id).aspace_id;
 
     // Copy in chunks through a kernel-side buffer to avoid mapping issues.
+    // On failure, try to fault-in the unmapped pages and retry once —
+    // translate_va does not demand-page on its own, so fresh stack /
+    // COW / pager-backed pages silently fail without this.
     let mut offset = 0;
     let mut tmp = [0u8; 4096];
     while offset < len {
         let chunk = (len - offset).min(4096);
-        fault_in_range(target_aspace, target_pt, src_va + offset, chunk, crate::mm::fault::FaultType::Read);
         if !crate::syscall::handlers::copy_from_user(target_pt, src_va + offset, &mut tmp[..chunk]) {
-            break;
+            fault_in_range(target_aspace, target_pt, src_va + offset, chunk, crate::mm::fault::FaultType::Read);
+            if !crate::syscall::handlers::copy_from_user(target_pt, src_va + offset, &mut tmp[..chunk]) {
+                break;
+            }
         }
-        fault_in_range(caller_aspace, caller_pt, dst_va + offset, chunk, crate::mm::fault::FaultType::Write);
         if !crate::syscall::handlers::copy_to_user(caller_pt, dst_va + offset, &tmp[..chunk]) {
-            break;
+            fault_in_range(caller_aspace, caller_pt, dst_va + offset, chunk, crate::mm::fault::FaultType::Write);
+            if !crate::syscall::handlers::copy_to_user(caller_pt, dst_va + offset, &tmp[..chunk]) {
+                break;
+            }
         }
         offset += chunk;
     }
@@ -471,13 +478,17 @@ pub fn personality_copy_out(target_port: u64, dst_va: usize, src_va: usize, len:
     let mut tmp = [0u8; 4096];
     while offset < len {
         let chunk = (len - offset).min(4096);
-        fault_in_range(caller_aspace, caller_pt, src_va + offset, chunk, crate::mm::fault::FaultType::Read);
         if !crate::syscall::handlers::copy_from_user(caller_pt, src_va + offset, &mut tmp[..chunk]) {
-            break;
+            fault_in_range(caller_aspace, caller_pt, src_va + offset, chunk, crate::mm::fault::FaultType::Read);
+            if !crate::syscall::handlers::copy_from_user(caller_pt, src_va + offset, &mut tmp[..chunk]) {
+                break;
+            }
         }
-        fault_in_range(target_aspace, target_pt, dst_va + offset, chunk, crate::mm::fault::FaultType::Write);
         if !crate::syscall::handlers::copy_to_user(target_pt, dst_va + offset, &tmp[..chunk]) {
-            break;
+            fault_in_range(target_aspace, target_pt, dst_va + offset, chunk, crate::mm::fault::FaultType::Write);
+            if !crate::syscall::handlers::copy_to_user(target_pt, dst_va + offset, &tmp[..chunk]) {
+                break;
+            }
         }
         offset += chunk;
     }
