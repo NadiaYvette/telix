@@ -493,6 +493,10 @@ pub fn personality_copy_out(target_port: u64, dst_va: usize, src_va: usize, len:
 /// None and the copy fails silently.  This helper explicitly invokes
 /// the fault handler for each MMU page touched so the PTE is populated
 /// before the copy runs.
+///
+/// Uses with_aspace_mut (not with_aspace) so a stale aspace id silently
+/// no-ops instead of panicking — the subsequent copy_from_user will
+/// still fail, but the caller handles that path gracefully.
 fn fault_in_range(
     aspace: u64,
     pt_root: usize,
@@ -500,7 +504,12 @@ fn fault_in_range(
     len: usize,
     fault_type: crate::mm::fault::FaultType,
 ) {
-    if len == 0 || pt_root == 0 {
+    if len == 0 || pt_root == 0 || aspace == 0 {
+        return;
+    }
+    // Bail if the aspace id isn't live.  handle_page_fault would panic
+    // via with_aspace otherwise.
+    if crate::mm::aspace::with_aspace_mut(aspace, |_| ()).is_none() {
         return;
     }
     let page_size = crate::mm::page::page_size();
