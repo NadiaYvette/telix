@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <time.h>
 
 /* ---------- Wire constants (client side) ---------- */
 
@@ -188,9 +189,15 @@ static int connect_display(void) {
     if (strlen(path) >= sizeof sun.sun_path) DIE("socket path too long");
     strncpy(sun.sun_path, path, sizeof sun.sun_path - 1);
     socklen_t slen = offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1;
-    if (connect(fd, (struct sockaddr *)&sun, slen) < 0)
-        DIE("connect(%s): %s", path, strerror(errno));
-    return fd;
+    /* Retry on ECONNREFUSED — the compositor may have just bind()d but
+     * not yet accept()ed.  Up to ~3 s total. */
+    for (int attempt = 0; attempt < 60; attempt++) {
+        if (connect(fd, (struct sockaddr *)&sun, slen) == 0) return fd;
+        if (errno != ECONNREFUSED && errno != ENOENT) break;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    DIE("connect(%s): %s", path, strerror(errno));
 }
 
 /* ---------- Receive-side state ---------- */

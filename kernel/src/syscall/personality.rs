@@ -418,15 +418,19 @@ pub fn personality_copy_in(target_port: u64, src_va: usize, dst_va: usize, len: 
 
     let target_pt = crate::sched::scheduler::task_ref(target_task_id).page_table_root;
     let caller_pt = crate::sched::scheduler::task_ref(caller_task_id).page_table_root;
+    let target_aspace = crate::sched::scheduler::task_ref(target_task_id).aspace_id;
+    let caller_aspace = crate::sched::scheduler::task_ref(caller_task_id).aspace_id;
 
     // Copy in chunks through a kernel-side buffer to avoid mapping issues.
     let mut offset = 0;
     let mut tmp = [0u8; 4096];
     while offset < len {
         let chunk = (len - offset).min(4096);
+        fault_in_range(target_aspace, target_pt, src_va + offset, chunk, crate::mm::fault::FaultType::Read);
         if !crate::syscall::handlers::copy_from_user(target_pt, src_va + offset, &mut tmp[..chunk]) {
             break;
         }
+        fault_in_range(caller_aspace, caller_pt, dst_va + offset, chunk, crate::mm::fault::FaultType::Write);
         if !crate::syscall::handlers::copy_to_user(caller_pt, dst_va + offset, &tmp[..chunk]) {
             break;
         }
@@ -460,20 +464,55 @@ pub fn personality_copy_out(target_port: u64, dst_va: usize, src_va: usize, len:
 
     let caller_pt = crate::sched::scheduler::task_ref(caller_task_id).page_table_root;
     let target_pt = crate::sched::scheduler::task_ref(target_task_id).page_table_root;
+    let caller_aspace = crate::sched::scheduler::task_ref(caller_task_id).aspace_id;
+    let target_aspace = crate::sched::scheduler::task_ref(target_task_id).aspace_id;
 
     let mut offset = 0;
     let mut tmp = [0u8; 4096];
     while offset < len {
         let chunk = (len - offset).min(4096);
+        fault_in_range(caller_aspace, caller_pt, src_va + offset, chunk, crate::mm::fault::FaultType::Read);
         if !crate::syscall::handlers::copy_from_user(caller_pt, src_va + offset, &mut tmp[..chunk]) {
             break;
         }
+        fault_in_range(target_aspace, target_pt, dst_va + offset, chunk, crate::mm::fault::FaultType::Write);
         if !crate::syscall::handlers::copy_to_user(target_pt, dst_va + offset, &tmp[..chunk]) {
             break;
         }
         offset += chunk;
     }
     offset as u64
+}
+
+/// Pre-fault each MMU page in [va, va+len) for the given aspace so that
+/// subsequent copy_from_user/copy_to_user see a present leaf PTE.
+///
+/// Kernel-initiated user-memory access via translate_va doesn't trigger
+/// demand-paging the way a hardware MMU fault would — if the page isn't
+/// yet present (fresh stack, COW, pager-backed), translate_va returns
+/// None and the copy fails silently.  This helper explicitly invokes
+/// the fault handler for each MMU page touched so the PTE is populated
+/// before the copy runs.
+fn fault_in_range(
+    aspace: u64,
+    pt_root: usize,
+    va: usize,
+    len: usize,
+    fault_type: crate::mm::fault::FaultType,
+) {
+    if len == 0 || pt_root == 0 {
+        return;
+    }
+    let page_size = crate::mm::page::page_size();
+    let first_page = va & !(page_size - 1);
+    let last_page = (va + len - 1) & !(page_size - 1);
+    let mut p = first_page;
+    while p <= last_page {
+        if crate::mm::hat::translate_va(pt_root, p).is_none() {
+            let _ = crate::mm::fault::handle_page_fault(aspace, p, fault_type);
+        }
+        p += page_size;
+    }
 }
 
 /// Fork a target task on behalf of a personality server.
