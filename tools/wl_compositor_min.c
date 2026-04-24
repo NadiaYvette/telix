@@ -102,6 +102,52 @@
 #define WL_OUTPUT_EV_NAME           4
 #define WL_OUTPUT_EV_DESCRIPTION    5
 
+/* wl_seat (v5) */
+#define WL_SEAT_REQ_GET_POINTER    0
+#define WL_SEAT_REQ_GET_KEYBOARD   1
+#define WL_SEAT_REQ_GET_TOUCH      2
+#define WL_SEAT_REQ_RELEASE        3
+#define WL_SEAT_EV_CAPABILITIES    0
+#define WL_SEAT_EV_NAME            1
+#define WL_SEAT_CAP_POINTER        (1u << 0)
+#define WL_SEAT_CAP_KEYBOARD       (1u << 1)
+#define WL_SEAT_CAP_TOUCH          (1u << 2)
+
+/* wl_pointer (v5) */
+#define WL_POINTER_REQ_SET_CURSOR  0
+#define WL_POINTER_REQ_RELEASE     1
+#define WL_POINTER_EV_ENTER        0
+#define WL_POINTER_EV_LEAVE        1
+#define WL_POINTER_EV_MOTION       2
+#define WL_POINTER_EV_BUTTON       3
+#define WL_POINTER_EV_AXIS         4
+#define WL_POINTER_EV_FRAME        5
+#define WL_POINTER_BUTTON_RELEASED 0
+#define WL_POINTER_BUTTON_PRESSED  1
+
+/* wl_keyboard (v5) */
+#define WL_KEYBOARD_REQ_RELEASE       0
+#define WL_KEYBOARD_EV_KEYMAP         0
+#define WL_KEYBOARD_EV_ENTER          1
+#define WL_KEYBOARD_EV_LEAVE          2
+#define WL_KEYBOARD_EV_KEY            3
+#define WL_KEYBOARD_EV_MODIFIERS      4
+#define WL_KEYBOARD_EV_REPEAT_INFO    5
+#define WL_KEYBOARD_KEYMAP_NO_KEYMAP  0
+#define WL_KEYBOARD_KEYMAP_XKB_V1     1
+#define WL_KEYBOARD_KEY_RELEASED      0
+#define WL_KEYBOARD_KEY_PRESSED       1
+
+/* Linux evdev */
+#define EV_SYN   0x00
+#define EV_KEY   0x01
+#define EV_REL   0x02
+#define REL_X    0x00
+#define REL_Y    0x01
+#define BTN_LEFT   0x110
+#define BTN_RIGHT  0x111
+#define BTN_MIDDLE 0x112
+
 /* xdg_wm_base (xdg-shell v3) */
 #define XDG_WM_BASE_REQ_DESTROY            0
 #define XDG_WM_BASE_REQ_CREATE_POSITIONER  1
@@ -321,6 +367,98 @@ static void drm_present(void) {
     }
 }
 
+/* Forward declarations: input_pump / input_ensure_focused reach into the
+ * client struct (kbd_obj_id, focused_surface_id, ...) but we want to keep
+ * the evdev setup/teardown scaffolding next to DRM's, above the protocol
+ * machinery.  Declare here, define below struct client. */
+struct client;
+static void input_pump(struct client *c, int fd, int is_keyboard);
+static void input_ensure_focused(struct client *c);
+
+/* ---------- Input (evdev → wl_seat) ---------- *
+ *
+ * The compositor owns a single seat — "default" — with keyboard + pointer
+ * capabilities reported on wl_seat bind.  Evdev fds are opened eagerly so
+ * wl_keyboard.keymap can later ship the keymap file descriptor; actually
+ * reading input events happens via poll() in the serve_client loop.
+ *
+ * The keymap is currently sent as WL_KEYBOARD_KEYMAP_NO_KEYMAP (backed by
+ * a memfd containing the byte 0) — enough for the hello_wl handshake to
+ * succeed.  Xwayland integration will require a real XKB_V1 keymap; we'll
+ * swap this out for either a bundled static keymap or a runtime xkbcommon
+ * call when the Xwayland work starts.
+ */
+
+#include <sys/syscall.h>
+#include <poll.h>
+
+struct seat_state {
+    int      kbd_fd;      /* /dev/input/event0 (keyboard) */
+    int      ptr_fd;      /* /dev/input/event1 (mouse) */
+    int      keymap_fd;   /* memfd containing keymap for wl_keyboard.keymap */
+    size_t   keymap_len;
+    /* Pointer position tracking (evdev sends relative deltas). */
+    int32_t  ptr_x;
+    int32_t  ptr_y;
+};
+
+static struct seat_state g_seat = { .kbd_fd = -1, .ptr_fd = -1, .keymap_fd = -1 };
+
+/* Linux evdev input_event layout (x86_64): 24 bytes.
+ *   struct timeval time;  // 16 bytes (sec + usec, 8 each)
+ *   __u16 type;           // 2
+ *   __u16 code;           // 2
+ *   __s32 value;          // 4
+ */
+#define EVDEV_EVENT_SIZE 24
+
+static void input_setup(void) {
+    /* Keyboard + mouse via Linux evdev.  Failure is non-fatal: we still
+     * advertise the capabilities and let clients bind, they just won't
+     * receive any events. */
+    g_seat.kbd_fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (g_seat.kbd_fd < 0)
+        LOG("input: open /dev/input/event0: %s (no key events)", strerror(errno));
+    g_seat.ptr_fd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (g_seat.ptr_fd < 0)
+        LOG("input: open /dev/input/event1: %s (no pointer events)", strerror(errno));
+
+    /* Minimal keymap memfd: one byte (a NUL).  The NO_KEYMAP format signals
+     * the client not to interpret the data.  We still need a valid fd to
+     * satisfy the wl_keyboard.keymap event. */
+    long memfd = syscall(SYS_memfd_create, "wl-keymap", 0);
+    if (memfd < 0) {
+        LOG("input: memfd_create failed: %s", strerror(errno));
+        return;
+    }
+    if (ftruncate((int)memfd, 1) < 0) {
+        LOG("input: ftruncate keymap memfd: %s", strerror(errno));
+        close((int)memfd);
+        return;
+    }
+    g_seat.keymap_fd = (int)memfd;
+    g_seat.keymap_len = 1;
+    LOG("input: seat ready kbd_fd=%d ptr_fd=%d keymap_fd=%d",
+        g_seat.kbd_fd, g_seat.ptr_fd, g_seat.keymap_fd);
+}
+
+static void input_teardown(void) {
+    if (g_seat.kbd_fd    >= 0) close(g_seat.kbd_fd);
+    if (g_seat.ptr_fd    >= 0) close(g_seat.ptr_fd);
+    if (g_seat.keymap_fd >= 0) close(g_seat.keymap_fd);
+    g_seat.kbd_fd = g_seat.ptr_fd = g_seat.keymap_fd = -1;
+}
+
+/* Monotonic time in ms, for wl_*.time fields.  A real compositor would use
+ * CLOCK_MONOTONIC; here a wall-ish counter is good enough. */
+static uint32_t now_ms(void) {
+    static uint32_t t = 0;
+    return ++t;
+}
+
+/* (input_ensure_focused and input_pump are defined further down, after
+ * struct client's full definition — they need the field layout.) */
+
 /* Blit a client's shm-backed surface buffer to the scanout dumb buffer.
  * Naive top-left placement with per-row clip against the display.  Surface
  * pixels are assumed XRGB8888 / ARGB8888 (the two formats we advertise). */
@@ -364,6 +502,9 @@ enum obj_type {
     OBJ_XDG_WM_BASE,
     OBJ_XDG_SURFACE,
     OBJ_XDG_TOPLEVEL,
+    OBJ_WL_SEAT,
+    OBJ_WL_POINTER,
+    OBJ_WL_KEYBOARD,
 };
 
 static const char *obj_type_name(enum obj_type t) {
@@ -382,6 +523,9 @@ static const char *obj_type_name(enum obj_type t) {
     case OBJ_XDG_WM_BASE:   return "xdg_wm_base";
     case OBJ_XDG_SURFACE:   return "xdg_surface";
     case OBJ_XDG_TOPLEVEL:  return "xdg_toplevel";
+    case OBJ_WL_SEAT:       return "wl_seat";
+    case OBJ_WL_POINTER:    return "wl_pointer";
+    case OBJ_WL_KEYBOARD:   return "wl_keyboard";
     }
     return "(unknown)";
 }
@@ -451,6 +595,21 @@ struct client {
     int rfds[16];
     int nrfds;
     struct obj_entry objs[MAX_CLIENT_OBJS];
+
+    /* Input routing: object ids the client got back from
+     * wl_seat.get_pointer / get_keyboard.  Zero until requested.  When
+     * evdev events arrive we fan them out via these ids.  Real
+     * compositors track focus per-surface; this is kiosk-style where
+     * the sole client owns the seat. */
+    uint32_t kbd_obj_id;
+    uint32_t ptr_obj_id;
+    /* First surface that reached commit — counts as 'focused' for the
+     * purposes of enter/leave events. */
+    uint32_t focused_surface_id;
+    /* Whether we've already sent wl_keyboard.enter / wl_pointer.enter
+     * for the focused surface. */
+    int kbd_entered;
+    int ptr_entered;
 };
 
 /* ---------- Globals advertised to clients ---------- */
@@ -470,6 +629,7 @@ static const struct global GLOBALS[] = {
     { 2, "wl_shm",        1, OBJ_WL_SHM        },
     { 3, "wl_output",     3, OBJ_WL_OUTPUT     },
     { 4, "xdg_wm_base",   3, OBJ_XDG_WM_BASE   },
+    { 5, "wl_seat",       5, OBJ_WL_SEAT       },
 };
 #define N_GLOBALS ((int)(sizeof GLOBALS / sizeof GLOBALS[0]))
 
@@ -790,6 +950,16 @@ static void handle_wl_registry(struct client *c, uint32_t reg_id,
             send_msg(c, new_id, WL_OUTPUT_EV_SCALE, s, 4);
 
             send_msg(c, new_id, WL_OUTPUT_EV_DONE, NULL, 0);
+        } else if (g->type == OBJ_WL_SEAT) {
+            /* Advertise pointer + keyboard capability bits, then the
+             * human-readable name.  Both are required for a well-behaved
+             * wl_seat. */
+            uint8_t cap_body[4];
+            put_u32(cap_body, WL_SEAT_CAP_POINTER | WL_SEAT_CAP_KEYBOARD);
+            send_msg(c, new_id, WL_SEAT_EV_CAPABILITIES, cap_body, 4);
+            uint8_t name_body[32];
+            size_t nb = put_string(name_body, sizeof name_body, "default");
+            send_msg(c, new_id, WL_SEAT_EV_NAME, name_body, nb);
         }
         break;
     }
@@ -1012,6 +1182,8 @@ static void handle_wl_surface(struct client *c, uint32_t id, uint16_t opcode,
         break;
     case WL_SURFACE_REQ_COMMIT: {
         LOG("wl_surface(%u).commit", id);
+        /* First surface with a committed buffer wins keyboard/pointer focus. */
+        if (!c->focused_surface_id) c->focused_surface_id = id;
         if (s->has_pending_buffer) {
             s->current_buffer = s->pending_buffer;
             s->has_pending_buffer = 0;
@@ -1091,6 +1263,118 @@ static ssize_t copy_wire_string(const uint8_t *args, uint16_t arg_len,
     memcpy(dst, args + 4, copy_len);
     dst[copy_len] = '\0';
     return (ssize_t)(4 + pad);
+}
+
+static void handle_wl_seat(struct client *c, uint32_t id, uint16_t opcode,
+                           const uint8_t *args, uint16_t arg_len)
+{
+    switch (opcode) {
+    case WL_SEAT_REQ_GET_POINTER: {
+        if (arg_len < 4) return;
+        uint32_t new_id = get_u32(args);
+        LOG("wl_seat(%u).get_pointer(new_id=%u)", id, new_id);
+        if (new_id >= MAX_CLIENT_OBJS) { send_error(c, id, 0, "out of range"); return; }
+        obj_clear(c, new_id);
+        c->objs[new_id].type = OBJ_WL_POINTER;
+        c->ptr_obj_id = new_id;
+        /* If we already have a focused surface, fire the enter event now. */
+        input_ensure_focused(c);
+        break;
+    }
+    case WL_SEAT_REQ_GET_KEYBOARD: {
+        if (arg_len < 4) return;
+        uint32_t new_id = get_u32(args);
+        LOG("wl_seat(%u).get_keyboard(new_id=%u)", id, new_id);
+        if (new_id >= MAX_CLIENT_OBJS) { send_error(c, id, 0, "out of range"); return; }
+        obj_clear(c, new_id);
+        c->objs[new_id].type = OBJ_WL_KEYBOARD;
+        c->kbd_obj_id = new_id;
+        /* wl_keyboard.keymap(format, fd, size) with SCM_RIGHTS fd.  The
+         * fd stays owned by the compositor — libwayland dup()s it before
+         * close, but the client on our test path will just close the
+         * received fd so reuse is fine either way. */
+        if (g_seat.keymap_fd >= 0) {
+            uint8_t body[8];
+            put_u32(body,     WL_KEYBOARD_KEYMAP_NO_KEYMAP);
+            put_u32(body + 4, (uint32_t)g_seat.keymap_len);
+            send_msg_fd(c, new_id, WL_KEYBOARD_EV_KEYMAP, body, 8,
+                        g_seat.keymap_fd);
+        }
+        /* wl_keyboard.repeat_info(rate, delay) — rate in keys/sec, delay in ms. */
+        uint8_t rbody[8];
+        put_u32(rbody,     25);   /* 25 keys/s */
+        put_u32(rbody + 4, 600);  /* 600 ms */
+        send_msg(c, new_id, WL_KEYBOARD_EV_REPEAT_INFO, rbody, 8);
+        /* wl_keyboard.modifiers with all zero mods — clients expect a
+         * modifiers state to initialise to. */
+        uint8_t mbody[20];
+        put_u32(mbody,      alloc_serial());
+        put_u32(mbody + 4,  0);
+        put_u32(mbody + 8,  0);
+        put_u32(mbody + 12, 0);
+        put_u32(mbody + 16, 0);
+        send_msg(c, new_id, WL_KEYBOARD_EV_MODIFIERS, mbody, 20);
+        input_ensure_focused(c);
+        break;
+    }
+    case WL_SEAT_REQ_GET_TOUCH:
+        /* Accept silently — no touch capability advertised, so clients
+         * shouldn't call this in the first place.  Allocate a passthrough
+         * object so subsequent requests won't hit "dead object" errors. */
+        if (arg_len >= 4) {
+            uint32_t new_id = get_u32(args);
+            if (new_id < MAX_CLIENT_OBJS) {
+                obj_clear(c, new_id);
+                c->objs[new_id].type = OBJ_WL_REGION;
+            }
+        }
+        break;
+    case WL_SEAT_REQ_RELEASE:
+        LOG("wl_seat(%u).release", id);
+        obj_clear(c, id);
+        send_delete_id(c, id);
+        break;
+    default:
+        LOG("wl_seat: unknown opcode %u", opcode);
+        break;
+    }
+}
+
+static void handle_wl_pointer(struct client *c, uint32_t id, uint16_t opcode,
+                              const uint8_t *args, uint16_t arg_len)
+{
+    (void)args; (void)arg_len;
+    switch (opcode) {
+    case WL_POINTER_REQ_SET_CURSOR:
+        /* Client sets a cursor surface — accepted silently. */
+        break;
+    case WL_POINTER_REQ_RELEASE:
+        LOG("wl_pointer(%u).release", id);
+        if (c->ptr_obj_id == id) { c->ptr_obj_id = 0; c->ptr_entered = 0; }
+        obj_clear(c, id);
+        send_delete_id(c, id);
+        break;
+    default:
+        LOG("wl_pointer: unknown opcode %u", opcode);
+        break;
+    }
+}
+
+static void handle_wl_keyboard(struct client *c, uint32_t id, uint16_t opcode,
+                               const uint8_t *args, uint16_t arg_len)
+{
+    (void)args; (void)arg_len;
+    switch (opcode) {
+    case WL_KEYBOARD_REQ_RELEASE:
+        LOG("wl_keyboard(%u).release", id);
+        if (c->kbd_obj_id == id) { c->kbd_obj_id = 0; c->kbd_entered = 0; }
+        obj_clear(c, id);
+        send_delete_id(c, id);
+        break;
+    default:
+        LOG("wl_keyboard: unknown opcode %u", opcode);
+        break;
+    }
 }
 
 static void handle_xdg_wm_base(struct client *c, uint32_t id,
@@ -1299,6 +1583,9 @@ static ssize_t dispatch_one(struct client *c) {
     case OBJ_XDG_WM_BASE:   handle_xdg_wm_base(c, object_id, opcode, args, arg_len); break;
     case OBJ_XDG_SURFACE:   handle_xdg_surface(c, object_id, opcode, args, arg_len); break;
     case OBJ_XDG_TOPLEVEL:  handle_xdg_toplevel(c, object_id, opcode, args, arg_len); break;
+    case OBJ_WL_SEAT:       handle_wl_seat(c, object_id, opcode, args, arg_len); break;
+    case OBJ_WL_POINTER:    handle_wl_pointer(c, object_id, opcode, args, arg_len); break;
+    case OBJ_WL_KEYBOARD:   handle_wl_keyboard(c, object_id, opcode, args, arg_len); break;
     case OBJ_NONE:
         LOG("request on dead/unknown object %u", object_id);
         send_error(c, object_id, 0, "invalid object");
@@ -1399,13 +1686,105 @@ static void build_socket_path(char *out, size_t out_sz) {
 
 /* ---------- Main loop ---------- */
 
+/* Ensure enter events have been sent to the focused surface.  Called just
+ * before dispatching any input-derived Wayland event. */
+static void input_ensure_focused(struct client *c) {
+    if (!c->focused_surface_id) return;
+    if (c->kbd_obj_id && !c->kbd_entered) {
+        uint8_t body[16];
+        put_u32(body, alloc_serial());
+        put_u32(body + 4, c->focused_surface_id);
+        put_u32(body + 8, 0);  /* keys array: empty */
+        put_u32(body + 12, 0); /* (pad for alignment) */
+        send_msg(c, c->kbd_obj_id, WL_KEYBOARD_EV_ENTER, body, 12);
+        c->kbd_entered = 1;
+    }
+    if (c->ptr_obj_id && !c->ptr_entered) {
+        uint8_t body[16];
+        put_u32(body,      alloc_serial());
+        put_u32(body + 4,  c->focused_surface_id);
+        put_u32(body + 8,  0); /* surface_x fixed: 0.0 */
+        put_u32(body + 12, 0); /* surface_y fixed: 0.0 */
+        send_msg(c, c->ptr_obj_id, WL_POINTER_EV_ENTER, body, 16);
+        c->ptr_entered = 1;
+    }
+}
+
+/* Drain an evdev fd and fan translated events out to `c`.
+ * `is_keyboard`: true for key events, false for pointer. */
+static void input_pump(struct client *c, int fd, int is_keyboard) {
+    uint8_t buf[EVDEV_EVENT_SIZE * 32];
+    ssize_t n = read(fd, buf, sizeof buf);
+    if (n <= 0) return;
+    input_ensure_focused(c);
+
+    for (ssize_t off = 0; off + EVDEV_EVENT_SIZE <= n; off += EVDEV_EVENT_SIZE) {
+        uint16_t type  = (uint16_t)(buf[off + 16] | (buf[off + 17] << 8));
+        uint16_t code  = (uint16_t)(buf[off + 18] | (buf[off + 19] << 8));
+        int32_t  value = (int32_t)(buf[off + 20] | (buf[off + 21] << 8)
+                                 | (buf[off + 22] << 16) | (buf[off + 23] << 24));
+
+        if (type == EV_SYN) continue;
+
+        if (is_keyboard && type == EV_KEY && c->kbd_obj_id) {
+            uint8_t body[16];
+            put_u32(body,      alloc_serial());
+            put_u32(body + 4,  now_ms());
+            put_u32(body + 8,  code);
+            put_u32(body + 12, value ? WL_KEYBOARD_KEY_PRESSED
+                                     : WL_KEYBOARD_KEY_RELEASED);
+            send_msg(c, c->kbd_obj_id, WL_KEYBOARD_EV_KEY, body, 16);
+        } else if (!is_keyboard && c->ptr_obj_id) {
+            if (type == EV_REL && code == REL_X) {
+                g_seat.ptr_x += value;
+                uint8_t body[16];
+                /* fixed-point 24.8: pixel << 8 */
+                put_u32(body,      now_ms());
+                put_u32(body + 4,  (uint32_t)(g_seat.ptr_x << 8));
+                put_u32(body + 8,  (uint32_t)(g_seat.ptr_y << 8));
+                put_u32(body + 12, 0);
+                send_msg(c, c->ptr_obj_id, WL_POINTER_EV_MOTION, body, 12);
+            } else if (type == EV_REL && code == REL_Y) {
+                g_seat.ptr_y += value;
+                uint8_t body[16];
+                put_u32(body,      now_ms());
+                put_u32(body + 4,  (uint32_t)(g_seat.ptr_x << 8));
+                put_u32(body + 8,  (uint32_t)(g_seat.ptr_y << 8));
+                put_u32(body + 12, 0);
+                send_msg(c, c->ptr_obj_id, WL_POINTER_EV_MOTION, body, 12);
+            } else if (type == EV_KEY) {
+                /* BTN_LEFT/RIGHT/MIDDLE arrive as EV_KEY events with
+                 * codes in the BTN_* range — forward as pointer buttons. */
+                uint8_t body[16];
+                put_u32(body,      alloc_serial());
+                put_u32(body + 4,  now_ms());
+                put_u32(body + 8,  code);
+                put_u32(body + 12, value ? WL_POINTER_BUTTON_PRESSED
+                                         : WL_POINTER_BUTTON_RELEASED);
+                send_msg(c, c->ptr_obj_id, WL_POINTER_EV_BUTTON, body, 16);
+            }
+            /* Wayland v5: frame after every logical input group.  Cheap. */
+            send_msg(c, c->ptr_obj_id, WL_POINTER_EV_FRAME, NULL, 0);
+        }
+    }
+}
+
 static void serve_client(int cfd) {
     struct client c;
     memset(&c, 0, sizeof c);
     c.fd = cfd;
     c.objs[WL_DISPLAY_ID].type = OBJ_WL_DISPLAY;
 
+    /* Input dispatch runs opportunistically rather than via a poll() on
+     * both the client socket and the evdev fds.  Telix's linux_srv has a
+     * poll() that returns early on unknown fd kinds, and the result was
+     * flaky when mixing UDS + evdev in a single pollfd set.  The evdev
+     * fds are O_NONBLOCK, so drain-then-recv gives us the input-event
+     * fanout with far less surface area — at the cost of higher latency
+     * on rapid key events (which we don't care about for smoke tests). */
     for (;;) {
+        if (g_seat.kbd_fd >= 0) input_pump(&c, g_seat.kbd_fd, 1);
+        if (g_seat.ptr_fd >= 0) input_pump(&c, g_seat.ptr_fd, 0);
         int r = client_recv(&c);
         if (r == 0) { LOG("client disconnected"); break; }
         if (r < 0)  { LOG("client recv error, dropping"); break; }
@@ -1442,6 +1821,7 @@ int main(int argc, char **argv) {
      * 1024x768 matches what Telix's linux_srv / fb_srv expose; libdrm
      * would query the connector for its preferred mode. */
     drm_setup(1024, 768);
+    input_setup();
 
     int lfd = make_listen_socket(sock_path);
 
@@ -1459,6 +1839,7 @@ int main(int argc, char **argv) {
     }
 
     drm_teardown();
+    input_teardown();
     close(lfd);
     unlink(sock_path);
     return 0;

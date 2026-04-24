@@ -65,6 +65,15 @@
 #define XDG_SURFACE_EV_CONFIGURE         0
 #define XDG_TOPLEVEL_REQ_SET_TITLE       2
 
+/* wl_seat (v5) */
+#define WL_SEAT_REQ_GET_POINTER    0
+#define WL_SEAT_REQ_GET_KEYBOARD   1
+#define WL_SEAT_EV_CAPABILITIES    0
+#define WL_SEAT_EV_NAME            1
+#define WL_KEYBOARD_EV_KEYMAP      0
+#define WL_KEYBOARD_EV_REPEAT_INFO 5
+#define WL_KEYBOARD_EV_KEY         3
+
 /* Client-assigned object IDs we use.  A real libwayland client allocates
  * these; we pin them by hand. */
 #define ID_DISPLAY      1
@@ -79,6 +88,9 @@
 #define ID_XDG_WM_BASE 10
 #define ID_XDG_SURFACE 11
 #define ID_XDG_TOPLEVEL 12
+#define ID_SEAT        13
+#define ID_POINTER     14
+#define ID_KEYBOARD    15
 
 /* ---------- Wire helpers ---------- */
 
@@ -191,12 +203,16 @@ struct rx {
     uint32_t compositor_name;
     uint32_t shm_name;
     uint32_t xdg_wm_base_name;
+    uint32_t seat_name;
     int got_compositor;
     int got_shm;
     int got_xdg_wm_base;
+    int got_seat;
     /* Event flags. */
     int got_sync_done;
     int got_buffer_release;
+    int got_seat_capabilities;
+    int got_keymap;
     uint32_t xdg_configure_serial;  /* 0 = not seen yet */
 };
 
@@ -247,7 +263,33 @@ static int rx_consume_one(struct rx *r) {
         } else if (strcmp(iface, "xdg_wm_base") == 0) {
             r->xdg_wm_base_name = name;
             r->got_xdg_wm_base = 1;
+        } else if (strcmp(iface, "wl_seat") == 0) {
+            r->seat_name = name;
+            r->got_seat = 1;
         }
+    }
+    if (obj == ID_SEAT && op == WL_SEAT_EV_CAPABILITIES && blen >= 4) {
+        uint32_t caps = get_u32(body);
+        LOG("   seat caps: 0x%x%s%s%s", caps,
+            (caps & 1) ? " POINTER" : "",
+            (caps & 2) ? " KEYBOARD" : "",
+            (caps & 4) ? " TOUCH" : "");
+        r->got_seat_capabilities = 1;
+    }
+    if (obj == ID_KEYBOARD && op == WL_KEYBOARD_EV_KEYMAP && blen >= 8) {
+        uint32_t format = get_u32(body);
+        uint32_t size   = get_u32(body + 4);
+        LOG("   keymap: format=%u size=%u", format, size);
+        r->got_keymap = 1;
+    }
+    if (obj == ID_KEYBOARD && op == WL_KEYBOARD_EV_REPEAT_INFO && blen >= 8) {
+        LOG("   repeat_info: rate=%u delay=%u",
+            get_u32(body), get_u32(body + 4));
+    }
+    if (obj == ID_KEYBOARD && op == WL_KEYBOARD_EV_KEY && blen >= 16) {
+        LOG("   key: serial=%u time=%u code=%u state=%u",
+            get_u32(body), get_u32(body + 4),
+            get_u32(body + 8), get_u32(body + 12));
     }
     if (obj == ID_XDG_WM_BASE && op == XDG_WM_BASE_EV_PING && blen >= 4) {
         /* Answer pings so the compositor doesn't kill us. */
@@ -352,8 +394,9 @@ int main(int argc, char **argv) {
     if (!r.got_compositor)  DIE("compositor did not advertise wl_compositor");
     if (!r.got_shm)         DIE("compositor did not advertise wl_shm");
     if (!r.got_xdg_wm_base) DIE("compositor did not advertise xdg_wm_base");
-    LOG("globals resolved: compositor=%u shm=%u xdg_wm_base=%u",
-        r.compositor_name, r.shm_name, r.xdg_wm_base_name);
+    if (!r.got_seat)        DIE("compositor did not advertise wl_seat");
+    LOG("globals resolved: compositor=%u shm=%u xdg_wm_base=%u seat=%u",
+        r.compositor_name, r.shm_name, r.xdg_wm_base_name, r.seat_name);
 
     /* bind wl_compositor, name=compositor_name, v=4, new_id=4 */
     uint8_t bind_buf[64];
@@ -382,6 +425,24 @@ int main(int argc, char **argv) {
     put_u32(bind_buf + off, ID_XDG_WM_BASE);
     off += 4;
     send_req(fd, ID_REGISTRY, WL_REGISTRY_REQ_BIND, bind_buf, off);
+
+    /* bind wl_seat, v=5, new_id=13 — then request pointer + keyboard so
+     * the compositor sends caps/keymap/repeat_info events. */
+    put_u32(bind_buf, r.seat_name);
+    off = 4 + put_string(bind_buf + 4, "wl_seat");
+    put_u32(bind_buf + off, 5);
+    off += 4;
+    put_u32(bind_buf + off, ID_SEAT);
+    off += 4;
+    send_req(fd, ID_REGISTRY, WL_REGISTRY_REQ_BIND, bind_buf, off);
+
+    /* wl_seat.get_pointer(new_id=14) */
+    put_u32(buf, ID_POINTER);
+    send_req(fd, ID_SEAT, WL_SEAT_REQ_GET_POINTER, buf, 4);
+
+    /* wl_seat.get_keyboard(new_id=15) */
+    put_u32(buf, ID_KEYBOARD);
+    send_req(fd, ID_SEAT, WL_SEAT_REQ_GET_KEYBOARD, buf, 4);
 
     const int W = 256, H = 256;
     const int stride = W * 4;
