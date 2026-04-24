@@ -96,10 +96,22 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     else
         echo "  WARNING: wayland_test build failed"
     fi
+    # Step G: handwritten minimal Wayland compositor + test client.
+    echo "Building wl_compositor_min + hello_wl (Step G)..."
+    if gcc -static-pie -fPIE -O2 -fno-stack-protector -s -o "$BINDIR/wl_compositor_min" "$ROOTDIR/tools/wl_compositor_min.c" 2>&1; then
+        echo "  wl_compositor_min: $(wc -c < "$BINDIR/wl_compositor_min") bytes"
+    else
+        echo "  WARNING: wl_compositor_min build failed"
+    fi
+    if gcc -static-pie -fPIE -O2 -fno-stack-protector -s -o "$BINDIR/hello_wl" "$ROOTDIR/tools/hello_wl.c" 2>&1; then
+        echo "  hello_wl: $(wc -c < "$BINDIR/hello_wl") bytes"
+    else
+        echo "  WARNING: hello_wl build failed"
+    fi
 fi
 
 # Copy ELF binaries to initramfs directory.
-for bin in init hello echo_client initramfs_srv rootfs_srv ramdisk_srv blk_srv nvme_srv iwl_srv cache_srv fat16_srv fat_srv ext2_srv ext_srv xfs_srv iso9660_srv udf_srv apfs_srv iscsi_srv sctp_srv acpi_srv pci_srv part_srv console_srv shell net_srv eth_srv batman_srv ip6_srv tcp4_srv pipe_upper pipe_drain spin bench pong grant_echo grant_echo_srv grant_echo_test macro_bench cap_test call_reply_test security_srv shm_srv vfs_srv tmpfs_srv devfs_srv procfs_srv uds_srv pipe_srv pty_srv event_srv inotify_srv syslog_srv sysv_srv hello_c sock_test sock6_test tsh getty_login ld-telix tz_test pthread_test initdb_test postmaster_test pg_full_test libc_test calc stress_test sshd proxy_srv linux_srv linux_exit42 glibc_hello wayland_test fb_srv input_srv compositor_srv term_srv mtk_srv ntfs_srv btrfs_srv i915_srv usb_srv hda_srv; do
+for bin in init hello echo_client initramfs_srv rootfs_srv ramdisk_srv blk_srv nvme_srv iwl_srv cache_srv fat16_srv fat_srv ext2_srv ext_srv xfs_srv iso9660_srv udf_srv apfs_srv iscsi_srv sctp_srv acpi_srv pci_srv part_srv console_srv shell net_srv eth_srv batman_srv ip6_srv tcp4_srv pipe_upper pipe_drain spin bench pong grant_echo grant_echo_srv grant_echo_test macro_bench cap_test call_reply_test security_srv shm_srv vfs_srv tmpfs_srv devfs_srv procfs_srv uds_srv pipe_srv pty_srv event_srv inotify_srv syslog_srv sysv_srv hello_c sock_test sock6_test tsh getty_login ld-telix tz_test pthread_test initdb_test postmaster_test pg_full_test libc_test calc stress_test sshd proxy_srv linux_srv linux_exit42 glibc_hello wayland_test wl_compositor_min hello_wl fb_srv input_srv compositor_srv term_srv mtk_srv ntfs_srv btrfs_srv i915_srv usb_srv hda_srv; do
     if [ -f "$BINDIR/$bin" ]; then
         cp "$BINDIR/$bin" "$INITRAMFS_DIR/$bin"
         SIZE=$(wc -c < "$INITRAMFS_DIR/$bin")

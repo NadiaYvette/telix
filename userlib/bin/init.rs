@@ -710,6 +710,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Step G: Wayland compositor + client (Telix integration pending) ---
+    //
+    // tools/wl_compositor_min.c + tools/hello_wl.c are built and shipped in
+    // initramfs.  End-to-end works on Fedora host (tested vs wayland-info).
+    //
+    // In-Telix integration deferred: linux_srv is single-threaded; a blocking
+    // UDS_ACCEPT on the compositor deadlocks the client's UDS_CONNECT because
+    // both flow through linux_srv's one recv_msg loop.  Fix requires async
+    // handling in linux_srv (deferred-reply for Linux syscalls, or per-process
+    // handler threads).  See project_linux_srv_async memory note.
+
     // --- Test 3: mmap_anon / munmap ---
     syscall::debug_puts(b"  init: testing mmap_anon...\n");
     if let Some(va) = syscall::mmap_anon(0, 1, 1) {
