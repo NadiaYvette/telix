@@ -8062,6 +8062,100 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 172e: dynamic-PIE glibc binary (early variant) ---
+    //
+    // Runs right after Phase 51 so VFS + rootfs mount are already in
+    // place.  Exercises the kernel's PT_INTERP loader + ld.so
+    // mmap-fixed path + the VFS protocol that ld.so uses to open
+    // /lib64/libc.so.6.  glibc_dyn_hello does `return argc;` with
+    // argc=4 so PASS == exit code 4.
+    syscall::debug_puts(b"  init: Phase 172e dynamic glibc binary (early)...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        let vfs_ok   = syscall::ns_lookup(b"vfs").is_some();
+        if linux_ok && vfs_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        static PATH: &[u8] = b"/glibc_dyn_hello\0";
+                        static A0: &[u8]   = b"glibc_dyn_hello\0";
+                        static A1: &[u8]   = b"a\0";
+                        static A2: &[u8]   = b"b\0";
+                        static A3: &[u8]   = b"c\0";
+                        static E0: &[u8]   = b"LD_LIBRARY_PATH=/lib64\0";
+                        static E1: &[u8]   = b"PATH=/usr/bin\0";
+                        let argv: [u64; 5] = [
+                            A0.as_ptr() as u64,
+                            A1.as_ptr() as u64,
+                            A2.as_ptr() as u64,
+                            A3.as_ptr() as u64,
+                            0,
+                        ];
+                        let envp: [u64; 3] = [
+                            E0.as_ptr() as u64,
+                            E1.as_ptr() as u64,
+                            0,
+                        ];
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => _,
+                            in("rdi") PATH.as_ptr() as u64,
+                            in("rsi") argv.as_ptr() as u64,
+                            in("rdx") envp.as_ptr() as u64,
+                            lateout("rcx") _, lateout("r11") _,
+                        );
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 99u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    { syscall::exit(99); }
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..12000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(10);
+                }
+                if exit_code == 4 {
+                    syscall::debug_puts(b"Phase 172e dynamic glibc binary: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 172e dynamic glibc binary: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 172e dynamic glibc binary: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 172e dynamic glibc binary: SKIPPED\n");
+        }
+    }
+
     // --- Phase 52: musl-libc C binary test ---
     syscall::debug_puts(b"  init: testing C binary (musl-telix)...\n");
     {
