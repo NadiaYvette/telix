@@ -726,6 +726,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
         if linux_ok {
+            syscall::debug_puts(b"  [G] forking compositor...\n");
             let comp_child = syscall::fork();
             if comp_child == 0 {
                 for _ in 0..100 {
@@ -760,9 +761,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(comp_child, 2, abi);
+                syscall::debug_puts(b"  [G] compositor personality set; sleeping 1s\n");
 
                 // Give the compositor a chance to bind + listen on the UDS.
                 for _ in 0..200 { syscall::sleep_ms(5); }
+                syscall::debug_puts(b"  [G] sleep done; forking client\n");
 
                 let cli_child = syscall::fork();
                 if cli_child == 0 {
@@ -791,22 +794,35 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     { syscall::exit(99); }
                 } else {
                     syscall::personality_set(cli_child, 2, abi);
+                    syscall::debug_puts(b"  [G] client personality set; waitpid client\n");
 
                     let mut cli_code: i64 = -1;
-                    for _ in 0..12000 {
+                    for i in 0..12000 {
                         if let Some(code) = syscall::waitpid(cli_child) {
                             cli_code = code as i64;
                             break;
                         }
                         syscall::sleep_ms(10);
+                        // Heartbeat every ~1s so we can tell a live spin apart
+                        // from a frozen scheduler.
+                        if i == 100 { syscall::debug_puts(b"  [G] waitpid client @1s\n"); }
+                        if i == 500 { syscall::debug_puts(b"  [G] waitpid client @5s\n"); }
+                        if i == 1000 { syscall::debug_puts(b"  [G] waitpid client @10s\n"); }
+                        if i == 3000 { syscall::debug_puts(b"  [G] waitpid client @30s\n"); }
+                        if i == 6000 { syscall::debug_puts(b"  [G] waitpid client @60s\n"); }
                     }
+                    syscall::debug_puts(b"  [G] client waitpid done; waitpid compositor\n");
 
                     let mut comp_code: i64 = -1;
-                    for _ in 0..3000 {
+                    for i in 0..3000 {
                         if let Some(code) = syscall::waitpid(comp_child) {
                             comp_code = code as i64;
                             break;
                         }
+                        if i == 100 { syscall::debug_puts(b"  [G] waitpid comp @1s\n"); }
+                        if i == 500 { syscall::debug_puts(b"  [G] waitpid comp @5s\n"); }
+                        if i == 1000 { syscall::debug_puts(b"  [G] waitpid comp @10s\n"); }
+                        if i == 2000 { syscall::debug_puts(b"  [G] waitpid comp @20s\n"); }
                         syscall::sleep_ms(10);
                     }
 

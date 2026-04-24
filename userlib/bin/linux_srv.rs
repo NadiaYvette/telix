@@ -8931,8 +8931,36 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(port);
     syscall::debug_puts(b"\n");
 
+    // Round-robin sweep index for dead-process cleanup.  One slot checked
+    // per main-loop iteration so the cost stays O(1) per dispatch.  When
+    // a process dies on a signal (e.g. SIGSEGV from null-deref) the kernel
+    // won't forward an exit message to linux_srv, so its PROC_TABLE entry
+    // lingers with open FDs — including AF_UNIX sockets whose peer never
+    // sees EOF.  That's what caused the Step G "compositor never exits"
+    // hang: hello_wl crashed, its UDS socket wasn't closed, compositor's
+    // recv() blocked on dead peer.  See reaper below.
+    let mut reaper_idx: usize = 0;
+
     loop {
         expire_futex_waiters();
+
+        // Reaper: check one PROC_TABLE slot per iteration, closing its
+        // FDs if the owner's task port has gone dead (task exited or was
+        // signal-killed).  Closing the FDs propagates UDS EOF to peers.
+        unsafe {
+            let i = reaper_idx;
+            reaper_idx = (reaper_idx + 1) % MAX_PROCS;
+            if PROC_TABLE[i].active
+                && !syscall::port_alive(PROC_TABLE[i].port)
+            {
+                for fd in 3..MAX_FDS {
+                    if PROC_TABLE[i].fds[fd].in_use {
+                        do_close(i, fd);
+                    }
+                }
+                PROC_TABLE[i] = ProcessState::empty();
+            }
+        }
 
         let (src_port, msg) = match syscall::port_set_recv(port_set) {
             Some(x) => x,
