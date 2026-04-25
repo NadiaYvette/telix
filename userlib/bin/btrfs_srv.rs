@@ -322,16 +322,6 @@ impl BlkClient {
         let sector_byte = abs_off & !511;
         let off_in = (abs_off & 511) as usize;
 
-        if !syscall::grant_pages(
-            self.blk_aspace,
-            self.scratch_va,
-            self.grant_va,
-            1,
-            false,
-        ) {
-            return false;
-        }
-
         let d2 = SECTOR | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
@@ -342,27 +332,23 @@ impl BlkClient {
             self.grant_va as u64,
         );
 
-        let ok =
-            if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
-                if rr.tag == IO_READ_OK && rr.data[0] == SECTOR {
-                    let copy_len = out.len().min(512 - off_in);
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            (self.scratch_va + off_in) as *const u8,
-                            out.as_mut_ptr(),
-                            copy_len,
-                        );
-                    }
-                    true
-                } else {
-                    false
+        if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+            if rr.tag == IO_READ_OK && rr.data[0] == SECTOR {
+                let copy_len = out.len().min(512 - off_in);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (self.scratch_va + off_in) as *const u8,
+                        out.as_mut_ptr(),
+                        copy_len,
+                    );
                 }
+                true
             } else {
                 false
-            };
-
-        syscall::revoke(self.blk_aspace, self.grant_va);
-        ok
+            }
+        } else {
+            false
+        }
     }
 
     /// Read `len` bytes at **sector-aligned** offset `off` into `dest` VA.
@@ -370,15 +356,6 @@ impl BlkClient {
         let sectors = (len + 511) / 512;
         for s in 0..sectors {
             let abs = self.partition_offset + off + (s as u64) * SECTOR;
-            if !syscall::grant_pages(
-                self.blk_aspace,
-                self.scratch_va,
-                self.grant_va,
-                1,
-                false,
-            ) {
-                return false;
-            }
             let d2 = SECTOR | ((self.reply_port as u64) << 32);
             syscall::send(
                 self.blk_port,
@@ -406,7 +383,6 @@ impl BlkClient {
                 } else {
                     false
                 };
-            syscall::revoke(self.blk_aspace, self.grant_va);
             if !ok {
                 return false;
             }
@@ -429,15 +405,6 @@ impl BlkClient {
                     chunk,
                 );
             }
-            if !syscall::grant_pages(
-                self.blk_aspace,
-                self.scratch_va,
-                self.grant_va,
-                1,
-                false,
-            ) {
-                return false;
-            }
             let abs = self.partition_offset + off + (s as u64) * SECTOR;
             let d2 = SECTOR | ((self.reply_port as u64) << 32);
             syscall::send(
@@ -454,7 +421,6 @@ impl BlkClient {
                 } else {
                     false
                 };
-            syscall::revoke(self.blk_aspace, self.grant_va);
             if !ok {
                 return false;
             }
@@ -2156,6 +2122,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         grant_va: 0x6_0000_5000,
         partition_offset,
     };
+
+    // Permanent grant of `scratch_va` into cache_blk's aspace at grant_va so
+    // every IO_READ/IO_WRITE can skip the per-request grant_pages/revoke pair.
+    if !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, blk.grant_va, 1, false) {
+        syscall::debug_puts(b"  [btrfs_srv] permanent grant FAILED\n");
+        loop { syscall::nanosleep(1_000_000_000_000); }
+    }
 
     // --- Parse btrfs superblock, build chunk map, find FS tree ---
     // Wait briefly for cache_srv to connect to blk_srv, then retry mount.
