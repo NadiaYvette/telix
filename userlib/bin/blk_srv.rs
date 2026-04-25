@@ -925,35 +925,63 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let reply_port = msg.data[2] >> 32;
                 let grant_va = msg.data[3] as usize;
 
-                let sector = (offset / 512) as u64;
-                let mut buf = [0u8; 512];
+                if grant_va != 0 {
+                    // Grant-based: support multi-sector reads.  ext_srv et al.
+                    // grant a single 4 KiB page, so cap at 8 sectors (4096 B)
+                    // per request to stay within the granted region.
+                    let mut bytes_total = length.min(4096);
+                    if bytes_total == 0 {
+                        bytes_total = 512;
+                    }
+                    let sectors_total = bytes_total.div_ceil(512);
+                    let start_sector = (offset / 512) as u64;
+                    let mut buf = [0u8; 512];
+                    let mut bytes_done: usize = 0;
+                    let mut io_err = false;
 
-                match dev.read_sector(sector, &mut buf) {
-                    Ok(()) => {
-                        let bytes_read = length.min(512);
-                        if grant_va != 0 {
-                            // Grant-based: copy data into granted pages.
-                            let dst = grant_va as *mut u8;
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, bytes_read);
+                    for i in 0..sectors_total {
+                        match dev.read_sector(start_sector + i as u64, &mut buf) {
+                            Ok(()) => {
+                                let chunk = (bytes_total - bytes_done).min(512);
+                                let dst = (grant_va + i * 512) as *mut u8;
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, chunk);
+                                }
+                                bytes_done += chunk;
                             }
-                            // Ensure grant page writes are visible to the receiver
-                            // (on another CPU) before the IPC notification.
-                            #[cfg(target_arch = "aarch64")]
-                            unsafe {
-                                core::arch::asm!("dsb ish");
+                            Err(()) => {
+                                io_err = true;
+                                break;
                             }
-                            #[cfg(target_arch = "riscv64")]
-                            unsafe {
-                                core::arch::asm!("fence rw, rw");
-                            }
-                            #[cfg(target_arch = "loongarch64")]
-                            unsafe {
-                                core::arch::asm!("dbar 0");
-                            }
-                            send_reply(reply_port, IO_READ_OK, bytes_read as u64, 0, 0, 0);
-                        } else {
-                            // Inline read.
+                        }
+                    }
+
+                    if io_err {
+                        send_reply(reply_port, IO_ERROR, ERR_IO, 0, 0, 0);
+                    } else {
+                        // Ensure grant page writes are visible to the receiver
+                        // (on another CPU) before the IPC notification.
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            core::arch::asm!("dsb ish");
+                        }
+                        #[cfg(target_arch = "riscv64")]
+                        unsafe {
+                            core::arch::asm!("fence rw, rw");
+                        }
+                        #[cfg(target_arch = "loongarch64")]
+                        unsafe {
+                            core::arch::asm!("dbar 0");
+                        }
+                        send_reply(reply_port, IO_READ_OK, bytes_done as u64, 0, 0, 0);
+                    }
+                } else {
+                    // Inline read (no grant): single sector.
+                    let sector = (offset / 512) as u64;
+                    let mut buf = [0u8; 512];
+                    match dev.read_sector(sector, &mut buf) {
+                        Ok(()) => {
+                            let bytes_read = length.min(512);
                             let inline_len = bytes_read.min(MAX_INLINE_READ);
                             let packed = pack_inline_data(&buf[..inline_len]);
                             syscall::send(
@@ -965,9 +993,9 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                                 packed[2],
                             );
                         }
-                    }
-                    Err(()) => {
-                        send_reply(reply_port, IO_ERROR, ERR_IO, 0, 0, 0);
+                        Err(()) => {
+                            send_reply(reply_port, IO_ERROR, ERR_IO, 0, 0, 0);
+                        }
                     }
                 }
             }

@@ -530,40 +530,47 @@ impl BlkClient {
     fn read_block(&self, block_num: u64, block_size: u32, dest: usize) -> bool {
         let byte_off = block_num * (block_size as u64);
         let abs_off = self.partition_offset + byte_off;
-        let sectors = block_size / 512;
-        if sectors == 0 {
+        let bs = block_size as usize;
+        if bs < 512 {
             let mut sec = [0u8; 512];
             if !self.read_bytes(byte_off, &mut sec) {
                 return false;
             }
             unsafe {
-                core::ptr::copy_nonoverlapping(sec.as_ptr(), dest as *mut u8, block_size as usize);
+                core::ptr::copy_nonoverlapping(sec.as_ptr(), dest as *mut u8, bs);
             }
             return true;
         }
 
-        for s in 0..sectors {
+        // blk_srv supports multi-sector grant reads up to 4 KiB (one MMU page),
+        // so issue one IO_READ for block sizes ≤ 4096; only chunk for larger
+        // ext4 blocks (8 KiB / 16 KiB / 32 KiB / 64 KiB).
+        const MAX_BATCH: usize = 4096;
+        let mut consumed = 0usize;
+        while consumed < bs {
+            let chunk = (bs - consumed).min(MAX_BATCH);
+
             // Drain stale replies (see read_bytes for the rationale).
             while let Some(_) = syscall::recv_nb_msg(self.reply_port) {}
 
-            let sector_byte = abs_off + (s as u64) * 512;
-            let d2 = 512u64 | ((self.reply_port as u64) << 32);
+            let chunk_byte = abs_off + consumed as u64;
+            let d2 = (chunk as u64) | ((self.reply_port as u64) << 32);
             syscall::send(
                 self.blk_port,
                 IO_READ,
                 0,
-                sector_byte,
+                chunk_byte,
                 d2,
                 self.grant_va as u64,
             );
 
             let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
-                if rr.tag == IO_READ_OK && rr.data[0] == 512 {
+                if rr.tag == IO_READ_OK && rr.data[0] as usize == chunk {
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             self.scratch_va as *const u8,
-                            (dest + (s as usize) * 512) as *mut u8,
-                            512,
+                            (dest + consumed) as *mut u8,
+                            chunk,
                         );
                     }
                     true
@@ -577,6 +584,7 @@ impl BlkClient {
             if !ok {
                 return false;
             }
+            consumed += chunk;
         }
         true
     }
