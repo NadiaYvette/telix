@@ -1271,6 +1271,13 @@ fn sys_reply(tag: u64, data: [u64; 6]) -> u64 {
     let reply = crate::ipc::Message::new(tag, data);
     match call_reply::fulfill(handle, &reply) {
         call_reply::FulfillResult::WakeCaller(caller_tid) => {
+            // Auto-grant SEND on any port IDs in the reply data so the
+            // caller can use them (e.g. an FS server's port returned by
+            // VFS_OPEN).  Without this, the caller has to ns_lookup or
+            // be granted explicitly — every cross-server handoff that
+            // returns a port would otherwise hand back an unusable id.
+            let caller_task = crate::sched::scheduler::thread_task_id(caller_tid);
+            auto_grant_reply_caps(caller_task, &reply);
             inject_recv_into_frame(caller_tid, &reply);
             crate::sched::scheduler::wake_parked_thread(caller_tid);
             // Caller can't clean up its own reply-cap (it returns to user
@@ -1348,6 +1355,12 @@ fn sys_reply_to(handle: u64, tag: u64, data: [u64; 6]) -> u64 {
     let reply = crate::ipc::Message::new(tag, data);
     match call_reply::fulfill(handle, &reply) {
         call_reply::FulfillResult::WakeCaller(caller_tid) => {
+            // Same auto-grant rationale as sys_reply: ports returned in
+            // the reply (e.g. fs_port from VFS_OPEN_OK forwarded via
+            // reply_to in vfs_srv) need a SEND cap or the caller's next
+            // syscall::call against them ECAPs into None.
+            let caller_task = crate::sched::scheduler::thread_task_id(caller_tid);
+            auto_grant_reply_caps(caller_task, &reply);
             inject_recv_into_frame(caller_tid, &reply);
             crate::sched::scheduler::wake_parked_thread(caller_tid);
             call_reply::free(handle);
