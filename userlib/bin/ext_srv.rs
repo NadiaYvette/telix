@@ -487,6 +487,15 @@ impl BlkClient {
         let sector = abs_off / 512;
         let offset_in_sector = (abs_off % 512) as usize;
 
+        // Drain any stale replies from a prior request that timed out
+        // (recv_msg_timeout returned None) but whose reply eventually
+        // arrived and got queued.  Without this drain, the next call's
+        // recv picks up the previous reply and reads the previous
+        // request's bytes from `scratch_va`, silently corrupting our
+        // result.  This is the documented "Mode A" flake where fstat
+        // returns 0 because the inode read picked up a stale block.
+        while let Some(_) = syscall::recv_nb_msg(self.reply_port) {}
+
         if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
             return false;
         }
@@ -541,6 +550,9 @@ impl BlkClient {
         }
 
         for s in 0..sectors {
+            // Drain stale replies (see read_bytes for the rationale).
+            while let Some(_) = syscall::recv_nb_msg(self.reply_port) {}
+
             if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
                 return false;
             }
@@ -993,14 +1005,24 @@ fn read_ind_cached(
     true
 }
 
-/// Invalidate both indirect caches.  Called from FS_OPEN whenever a
-/// fresh file is opened, since the new file may share block numbers
-/// with the old file's freed blocks (ext2 reuses) — stale data would
-/// silently corrupt subsequent reads.
+/// Cache the most recently read DATA block too: sequential 16-byte
+/// FS_READ chunks (handle_read's inline path) all hit the same 1 KiB
+/// block, but without this cache ext_srv re-reads the block from
+/// blk_srv every time.  For a 64-byte read split across 4 chunks
+/// that's 4× the disk I/O.  We track the disk block number that's
+/// currently in `block_buf_va` and skip the read on a hit.
+static mut DATA_BLOCK_CACHE_VALID: bool = false;
+static mut DATA_BLOCK_CACHE_PHYS: u64 = 0;
+
+/// Invalidate the indirect + data-block caches.  Called from FS_OPEN
+/// whenever a fresh file is opened, since the new file may share
+/// block numbers with the old file's freed blocks (ext2 reuses) —
+/// stale data would silently corrupt subsequent reads.
 fn invalidate_ind_caches() {
     unsafe {
         DIND_CACHE.valid = false;
         IND_CACHE.valid = false;
+        DATA_BLOCK_CACHE_VALID = false;
     }
 }
 
@@ -1982,10 +2004,23 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                             0,
                             sb.block_size as usize,
                         );
+                        DATA_BLOCK_CACHE_VALID = false;
                     }
-                } else if !blk.read_block(phys_block, sb.block_size, block_buf_va) {
-                    let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
-                    continue;
+                } else {
+                    let cache_hit = unsafe {
+                        DATA_BLOCK_CACHE_VALID && DATA_BLOCK_CACHE_PHYS == phys_block
+                    };
+                    if !cache_hit {
+                        if !blk.read_block(phys_block, sb.block_size, block_buf_va) {
+                            unsafe { DATA_BLOCK_CACHE_VALID = false; }
+                            let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
+                            continue;
+                        }
+                        unsafe {
+                            DATA_BLOCK_CACHE_PHYS = phys_block;
+                            DATA_BLOCK_CACHE_VALID = true;
+                        }
+                    }
                 }
 
                 let bytes_in_block =
