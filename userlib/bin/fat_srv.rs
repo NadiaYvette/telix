@@ -251,15 +251,6 @@ struct BlkClient {
 
 impl BlkClient {
     fn read_sector(&self, sector: u32, out: &mut [u8; 512]) -> bool {
-        if !syscall::grant_pages(
-            self.blk_aspace,
-            self.scratch_va,
-            self.grant_va,
-            1,
-            false,
-        ) {
-            return false;
-        }
         let offset = self.partition_offset + (sector as u64) * 512;
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(
@@ -270,7 +261,7 @@ impl BlkClient {
             d2,
             self.grant_va as u64,
         );
-        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
                 unsafe {
                     core::ptr::copy_nonoverlapping(
@@ -285,23 +276,12 @@ impl BlkClient {
             }
         } else {
             false
-        };
-        syscall::revoke(self.blk_aspace, self.grant_va);
-        ok
+        }
     }
 
     fn write_sector(&self, sector: u32, data: &[u8; 512]) -> bool {
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.scratch_va as *mut u8, 512);
-        }
-        if !syscall::grant_pages(
-            self.blk_aspace,
-            self.scratch_va,
-            self.grant_va,
-            1,
-            false,
-        ) {
-            return false;
         }
         let offset = self.partition_offset + (sector as u64) * 512;
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
@@ -313,13 +293,11 @@ impl BlkClient {
             d2,
             self.grant_va as u64,
         );
-        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
             rr.tag == IO_WRITE_OK
         } else {
             false
-        };
-        syscall::revoke(self.blk_aspace, self.grant_va);
-        ok
+        }
     }
 }
 
@@ -1296,6 +1274,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         grant_va: 0x6_0000_0000, // blk_srv grant target (not FS_SCRATCH_VA)
         partition_offset,
     };
+
+    // Permanent grant of `scratch_va` into cache_blk's aspace at grant_va so
+    // every IO_READ/IO_WRITE can skip the per-request grant_pages/revoke pair.
+    if !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, blk.grant_va, 1, false) {
+        syscall::debug_puts(b"  [fat_srv] permanent grant FAILED\n");
+        syscall::exit(1);
+    }
 
     // -----------------------------------------------------------------------
     // Read boot sector, parse BPB, detect variant.
