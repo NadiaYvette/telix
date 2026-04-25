@@ -12,6 +12,7 @@
 
 extern crate userlib;
 
+use core::cell::Cell;
 use userlib::syscall;
 
 // --- I/O protocol constants ---
@@ -292,15 +293,41 @@ struct BlkClient {
     blk_aspace: u64,
     reply_port: u64,
     scratch_va: usize,
+    /// Per-client nonce counter.  Each IO_READ/IO_WRITE request gets a fresh
+    /// nonce in d0; blk_srv echoes it in d1 of the reply.  We discard any
+    /// reply whose echo doesn't match — kills the stale-reply race that
+    /// otherwise made permanent grants unsafe.
+    nonce: Cell<u64>,
 }
 
 impl BlkClient {
+    fn next_nonce(&self) -> u64 {
+        let n = self.nonce.get().wrapping_add(1);
+        self.nonce.set(n);
+        n
+    }
+
+    /// Receive a reply matching `nonce`.  Drops mismatched (stale) replies and
+    /// keeps waiting until either a matching reply arrives or the timeout
+    /// expires on a single recv (we don't track a global deadline — under
+    /// normal load the matching reply is the only one in the queue).
+    fn recv_match(&self, nonce: u64) -> Option<syscall::Message> {
+        loop {
+            match syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+                Some(rr) if rr.data[1] == nonce => return Some(rr),
+                Some(_) => continue, // stale reply, drop it
+                None => return None,
+            }
+        }
+    }
+
     fn read_sector(&self, sector: u64, out: &mut [u8; 512]) -> bool {
+        let nonce = self.next_nonce();
         let offset = sector * 512;
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
-        syscall::send(self.blk_port, IO_READ, 0, offset, d2, BLK_GRANT_VA as u64);
+        syscall::send(self.blk_port, IO_READ, nonce, offset, d2, BLK_GRANT_VA as u64);
 
-        if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        if let Some(rr) = self.recv_match(nonce) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
                 unsafe {
                     core::ptr::copy_nonoverlapping(
@@ -323,11 +350,12 @@ impl BlkClient {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.scratch_va as *mut u8, 512);
         }
 
+        let nonce = self.next_nonce();
         let offset = sector * 512;
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
-        syscall::send(self.blk_port, IO_WRITE, 0, offset, d2, BLK_GRANT_VA as u64);
+        syscall::send(self.blk_port, IO_WRITE, nonce, offset, d2, BLK_GRANT_VA as u64);
 
-        if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        if let Some(rr) = self.recv_match(nonce) {
             rr.tag == IO_WRITE_OK
         } else {
             false
@@ -434,6 +462,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         blk_aspace,
         reply_port: blk_reply,
         scratch_va,
+        nonce: Cell::new(0),
     };
 
     // Permanent grant of `scratch_va` into blk_srv's aspace at BLK_GRANT_VA so
@@ -521,7 +550,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         );
                     }
                 } else {
-                    syscall::send_nb(reply_port, IO_ERROR, 1, 0);
+                    syscall::send_nb_4(reply_port, IO_ERROR, 1, request_id, 0, 0);
                 }
             }
 
@@ -559,7 +588,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         0,
                     );
                 } else {
-                    syscall::send_nb(reply_port, IO_ERROR, 1, 0);
+                    syscall::send_nb_4(reply_port, IO_ERROR, 1, request_id, 0, 0);
                 }
             }
 

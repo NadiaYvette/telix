@@ -920,6 +920,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             IO_READ => {
+                // Correlation-ID protocol: client puts a fresh nonce in d0 of
+                // the request; we echo it in d1 of the reply.  Receivers drop
+                // any reply whose nonce doesn't match — eliminates the stale-
+                // reply race when a previous request timed out and its reply
+                // arrives late.  IO_CONNECT / IO_STAT / IO_CLOSE don't need
+                // nonces because they're one-shot at init with no preceding
+                // in-flight traffic.
+                let nonce = msg.data[0];
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
                 let reply_port = msg.data[2] >> 32;
@@ -957,7 +965,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     }
 
                     if io_err {
-                        send_reply(reply_port, IO_ERROR, ERR_IO, 0, 0, 0);
+                        send_reply(reply_port, IO_ERROR, ERR_IO, nonce, 0, 0);
                     } else {
                         // Ensure grant page writes are visible to the receiver
                         // (on another CPU) before the IPC notification.
@@ -973,10 +981,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         unsafe {
                             core::arch::asm!("dbar 0");
                         }
-                        send_reply(reply_port, IO_READ_OK, bytes_done as u64, 0, 0, 0);
+                        send_reply(reply_port, IO_READ_OK, bytes_done as u64, nonce, 0, 0);
                     }
                 } else {
-                    // Inline read (no grant): single sector.
+                    // Inline read (no grant): single sector.  Nonce can't be
+                    // echoed — the reply uses all 4 data slots for the inline
+                    // payload.  This path is unused by current fs_srvs (they
+                    // all grant a scratch page), so the nonce gap doesn't
+                    // matter in practice.
                     let sector = (offset / 512) as u64;
                     let mut buf = [0u8; 512];
                     match dev.read_sector(sector, &mut buf) {
@@ -994,13 +1006,14 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                             );
                         }
                         Err(()) => {
-                            send_reply(reply_port, IO_ERROR, ERR_IO, 0, 0, 0);
+                            send_reply(reply_port, IO_ERROR, ERR_IO, nonce, 0, 0);
                         }
                     }
                 }
             }
 
             IO_WRITE => {
+                let nonce = msg.data[0];
                 let offset = msg.data[1] as usize;
                 let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
                 let reply_port = msg.data[2] >> 32;
@@ -1019,10 +1032,10 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
                 match dev.write_sector(sector, &buf) {
                     Ok(()) => {
-                        send_reply(reply_port, IO_WRITE_OK, length.min(512) as u64, 0, 0, 0);
+                        send_reply(reply_port, IO_WRITE_OK, length.min(512) as u64, nonce, 0, 0);
                     }
                     Err(()) => {
-                        send_reply(reply_port, IO_ERROR, ERR_IO, 0, 0, 0);
+                        send_reply(reply_port, IO_ERROR, ERR_IO, nonce, 0, 0);
                     }
                 }
             }

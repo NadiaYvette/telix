@@ -13,6 +13,7 @@
 
 extern crate userlib;
 
+use core::cell::Cell;
 use userlib::syscall;
 
 // --- I/O protocol constants (for talking to blk_srv) ---
@@ -410,9 +411,27 @@ struct BlkClient {
     grant_va: usize,
     /// Byte offset of the ext2 partition within the disk image.
     partition_offset: u64,
+    /// Per-client nonce counter. See cache_srv::BlkClient for the protocol.
+    nonce: Cell<u64>,
 }
 
 impl BlkClient {
+    fn next_nonce(&self) -> u64 {
+        let n = self.nonce.get().wrapping_add(1);
+        self.nonce.set(n);
+        n
+    }
+
+    fn recv_match(&self, nonce: u64) -> Option<syscall::Message> {
+        loop {
+            match syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+                Some(rr) if rr.data[1] == nonce => return Some(rr),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
     /// Read `len` bytes at byte offset `off` (relative to partition start) into `out`.
     /// `out` must be <= 512 bytes. Only reads from the sector containing `off`.
     fn read_bytes(&self, off: u64, out: &mut [u8]) -> bool {
@@ -420,21 +439,18 @@ impl BlkClient {
         let sector = abs_off / 512;
         let offset_in_sector = (abs_off % 512) as usize;
 
-        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
-            return false;
-        }
-
+        let nonce = self.next_nonce();
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
             IO_READ,
-            0,
+            nonce,
             sector * 512,
             d2,
             self.grant_va as u64,
         );
 
-        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        if let Some(rr) = self.recv_match(nonce) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
                 let copy_len = out.len().min(512 - offset_in_sector);
                 unsafe {
@@ -450,10 +466,7 @@ impl BlkClient {
             }
         } else {
             false
-        };
-
-        syscall::revoke(self.blk_aspace, self.grant_va);
-        ok
+        }
     }
 
     /// Read a full block (block_size bytes) into memory at `dest`.
@@ -475,21 +488,19 @@ impl BlkClient {
         }
 
         for s in 0..sectors {
-            if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
-                return false;
-            }
+            let nonce = self.next_nonce();
             let sector_byte = abs_off + (s as u64) * 512;
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(
                 self.blk_port,
                 IO_READ,
-                0,
+                nonce,
                 sector_byte,
                 d2,
                 self.grant_va as u64,
             );
 
-            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+            let ok = if let Some(rr) = self.recv_match(nonce) {
                 if rr.tag == IO_READ_OK && rr.data[0] == 512 {
                     unsafe {
                         core::ptr::copy_nonoverlapping(
@@ -506,7 +517,6 @@ impl BlkClient {
                 false
             };
 
-            syscall::revoke(self.blk_aspace, self.grant_va);
             if !ok {
                 return false;
             }
@@ -518,25 +528,21 @@ impl BlkClient {
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.scratch_va as *mut u8, 512);
         }
-        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
-            return false;
-        }
+        let nonce = self.next_nonce();
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
             IO_WRITE,
-            0,
+            nonce,
             abs_byte_off,
             d2,
             self.grant_va as u64,
         );
-        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        if let Some(rr) = self.recv_match(nonce) {
             rr.tag == IO_WRITE_OK
         } else {
             false
-        };
-        syscall::revoke(self.blk_aspace, self.grant_va);
-        ok
+        }
     }
 
     /// Read-modify-write: write `data` bytes at byte offset `off` (relative to partition).
@@ -548,19 +554,17 @@ impl BlkClient {
 
         // Read the existing sector.
         let mut sec = [0u8; 512];
-        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
-            return false;
-        }
+        let nonce = self.next_nonce();
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
             IO_READ,
-            0,
+            nonce,
             sector_start,
             d2,
             self.grant_va as u64,
         );
-        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        let ok = if let Some(rr) = self.recv_match(nonce) {
             if rr.tag == IO_READ_OK {
                 unsafe {
                     core::ptr::copy_nonoverlapping(
@@ -576,7 +580,6 @@ impl BlkClient {
         } else {
             false
         };
-        syscall::revoke(self.blk_aspace, self.grant_va);
         if !ok {
             return false;
         }
@@ -1352,7 +1355,16 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         scratch_va,
         grant_va: 0x6_0000_0000,
         partition_offset,
+        nonce: Cell::new(0),
     };
+
+    // Permanent grant of `scratch_va` into cache_blk's aspace at grant_va.
+    // The nonce protocol (see BlkClient::recv_match) makes stale-reply
+    // corruption impossible, so per-request grant/revoke is no longer needed.
+    if !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, blk.grant_va, 1, false) {
+        syscall::debug_puts(b"  [ext2_srv] permanent grant FAILED\n");
+        loop { syscall::nanosleep(1_000_000_000_000); }
+    }
 
     // --- Read superblock (at byte offset 1024 within the partition) ---
     // Retry up to 5 times with 50ms backoff — during boot, cache_srv may

@@ -23,6 +23,7 @@
 
 extern crate userlib;
 
+use core::cell::Cell;
 use userlib::syscall;
 
 // --- I/O protocol constants (for talking to blk_srv) ---
@@ -190,9 +191,27 @@ struct BlkClient {
     scratch_va: usize,
     grant_va: usize,
     image_offset: u64,
+    /// Per-client nonce counter. See cache_srv::BlkClient for the protocol.
+    nonce: Cell<u64>,
 }
 
 impl BlkClient {
+    fn next_nonce(&self) -> u64 {
+        let n = self.nonce.get().wrapping_add(1);
+        self.nonce.set(n);
+        n
+    }
+
+    fn recv_match(&self, nonce: u64) -> Option<syscall::Message> {
+        loop {
+            match syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+                Some(rr) if rr.data[1] == nonce => return Some(rr),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
     /// Read `out.len()` bytes at byte offset `off` (relative to image start).
     fn read_bytes(&self, off: u64, out: &mut [u8]) -> bool {
         let mut remaining = out.len();
@@ -204,33 +223,22 @@ impl BlkClient {
             let sector_start = (abs_off / 512) * 512;
             let offset_in_sector = (abs_off % 512) as usize;
 
-            if !syscall::grant_pages(
-                self.blk_aspace,
-                self.scratch_va,
-                self.grant_va,
-                1,
-                false,
-            ) {
-                return false;
-            }
-
+            let nonce = self.next_nonce();
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(
                 self.blk_port,
                 IO_READ,
-                0,
+                nonce,
                 sector_start,
                 d2,
                 self.grant_va as u64,
             );
 
-            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+            let ok = if let Some(rr) = self.recv_match(nonce) {
                 rr.tag == IO_READ_OK && rr.data[0] == 512
             } else {
                 false
             };
-
-            syscall::revoke(self.blk_aspace, self.grant_va);
 
             if !ok {
                 return false;
@@ -263,34 +271,24 @@ impl BlkClient {
             let sector_start = (abs_off / 512) * 512;
             let offset_in_sector = (abs_off % 512) as usize;
 
-            if !syscall::grant_pages(
-                self.blk_aspace,
-                self.scratch_va,
-                self.grant_va,
-                1,
-                false,
-            ) {
-                return false;
-            }
-
+            let nonce = self.next_nonce();
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(
                 self.blk_port,
                 IO_READ,
-                0,
+                nonce,
                 sector_start,
                 d2,
                 self.grant_va as u64,
             );
 
-            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+            let ok = if let Some(rr) = self.recv_match(nonce) {
                 rr.tag == IO_READ_OK && rr.data[0] == 512
             } else {
                 false
             };
 
             if !ok {
-                syscall::revoke(self.blk_aspace, self.grant_va);
                 return false;
             }
 
@@ -302,7 +300,6 @@ impl BlkClient {
                     copy_len,
                 );
             }
-            syscall::revoke(self.blk_aspace, self.grant_va);
 
             cur_dest += copy_len;
             cur_off += copy_len as u64;
@@ -1064,7 +1061,16 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         scratch_va,
         grant_va: 0x6_0000_2000,
         image_offset,
+        nonce: Cell::new(0),
     };
+
+    // Permanent grant of `scratch_va` into cache_blk's aspace at grant_va.
+    // The nonce protocol (see BlkClient::recv_match) makes stale-reply
+    // corruption impossible, so per-request grant/revoke is no longer needed.
+    if !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, blk.grant_va, 1, false) {
+        syscall::debug_puts(b"  [udf_srv] permanent grant FAILED\n");
+        loop { syscall::nanosleep(1_000_000_000_000); }
+    }
 
     // Allocate buffer for sector/block reads.
     let buf_va = match syscall::mmap_anon(0, 1, 1) {

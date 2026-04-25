@@ -19,6 +19,7 @@
 
 extern crate userlib;
 
+use core::cell::Cell;
 use userlib::syscall;
 
 // --- I/O protocol constants (for talking to blk_srv) ---
@@ -477,9 +478,35 @@ struct BlkClient {
     grant_va: usize,
     /// Byte offset of the ext partition within the disk image.
     partition_offset: u64,
+    /// Per-client nonce counter.  Each IO_READ/IO_WRITE request gets a fresh
+    /// nonce in d0; cache_blk echoes it in d1 of the reply.  We discard any
+    /// reply whose echo doesn't match — eliminates the stale-reply race that
+    /// otherwise made the permanent grant unsafe.
+    nonce: Cell<u64>,
 }
 
 impl BlkClient {
+    fn next_nonce(&self) -> u64 {
+        let n = self.nonce.get().wrapping_add(1);
+        self.nonce.set(n);
+        n
+    }
+
+    /// Receive a reply matching `nonce`.  Drops mismatched (stale) replies and
+    /// keeps waiting until either a matching reply arrives or recv_msg_timeout
+    /// expires with no message at all.  No global deadline — under normal
+    /// load the matching reply is the only one in the queue, and the timeout
+    /// fires once if the request is genuinely lost.
+    fn recv_match(&self, nonce: u64) -> Option<syscall::Message> {
+        loop {
+            match syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+                Some(rr) if rr.data[1] == nonce => return Some(rr),
+                Some(_) => continue, // stale reply, drop it
+                None => return None,
+            }
+        }
+    }
+
     /// Read `len` bytes at byte offset `off` (relative to partition start) into `out`.
     /// `out` must be <= 512 bytes. Only reads from the sector containing `off`.
     fn read_bytes(&self, off: u64, out: &mut [u8]) -> bool {
@@ -487,26 +514,18 @@ impl BlkClient {
         let sector = abs_off / 512;
         let offset_in_sector = (abs_off % 512) as usize;
 
-        // Drain any stale replies from a prior request that timed out
-        // (recv_msg_timeout returned None) but whose reply eventually
-        // arrived and got queued.  Without this drain, the next call's
-        // recv picks up the previous reply and reads the previous
-        // request's bytes from `scratch_va`, silently corrupting our
-        // result.  This is the documented "Mode A" flake where fstat
-        // returns 0 because the inode read picked up a stale block.
-        while let Some(_) = syscall::recv_nb_msg(self.reply_port) {}
-
+        let nonce = self.next_nonce();
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
             IO_READ,
-            0,
+            nonce,
             sector * 512,
             d2,
             self.grant_va as u64,
         );
 
-        if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        if let Some(rr) = self.recv_match(nonce) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
                 let copy_len = out.len().min(512 - offset_in_sector);
                 unsafe {
@@ -550,21 +569,19 @@ impl BlkClient {
         while consumed < bs {
             let chunk = (bs - consumed).min(MAX_BATCH);
 
-            // Drain stale replies (see read_bytes for the rationale).
-            while let Some(_) = syscall::recv_nb_msg(self.reply_port) {}
-
+            let nonce = self.next_nonce();
             let chunk_byte = abs_off + consumed as u64;
             let d2 = (chunk as u64) | ((self.reply_port as u64) << 32);
             syscall::send(
                 self.blk_port,
                 IO_READ,
-                0,
+                nonce,
                 chunk_byte,
                 d2,
                 self.grant_va as u64,
             );
 
-            let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+            let ok = if let Some(rr) = self.recv_match(nonce) {
                 if rr.tag == IO_READ_OK && rr.data[0] as usize == chunk {
                     unsafe {
                         core::ptr::copy_nonoverlapping(
@@ -594,16 +611,17 @@ impl BlkClient {
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.scratch_va as *mut u8, 512);
         }
+        let nonce = self.next_nonce();
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
             IO_WRITE,
-            0,
+            nonce,
             abs_byte_off,
             d2,
             self.grant_va as u64,
         );
-        if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        if let Some(rr) = self.recv_match(nonce) {
             rr.tag == IO_WRITE_OK
         } else {
             false
@@ -617,16 +635,17 @@ impl BlkClient {
         let offset_in_sector = (abs_off % 512) as usize;
 
         let mut sec = [0u8; 512];
+        let nonce = self.next_nonce();
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
             IO_READ,
-            0,
+            nonce,
             sector_start,
             d2,
             self.grant_va as u64,
         );
-        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        let ok = if let Some(rr) = self.recv_match(nonce) {
             if rr.tag == IO_READ_OK {
                 unsafe {
                     core::ptr::copy_nonoverlapping(
@@ -1722,6 +1741,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         scratch_va,
         grant_va: 0x6_0000_0000,
         partition_offset,
+        nonce: Cell::new(0),
     };
 
     // Establish a permanent grant of `scratch_va` into blk_srv's aspace.  blk_srv

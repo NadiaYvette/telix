@@ -14,6 +14,7 @@
 //! FS_WRITE / FS_DELETE / FS_MKDIR / FS_RENAME / FS_TRUNCATE / FS_CHMOD etc.
 
 extern crate userlib;
+use core::cell::Cell;
 use userlib::syscall;
 
 // =====================================================================
@@ -313,56 +314,61 @@ struct BlkClient {
     scratch_va: usize,
     grant_va: usize,
     partition_offset: u64,
+    /// Per-client nonce counter. See cache_srv::BlkClient for the protocol.
+    nonce: Cell<u64>,
 }
 
 impl BlkClient {
+    fn next_nonce(&self) -> u64 {
+        let n = self.nonce.get().wrapping_add(1);
+        self.nonce.set(n);
+        n
+    }
+
+    fn recv_match(&self, nonce: u64) -> Option<syscall::Message> {
+        loop {
+            match syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+                Some(rr) if rr.data[1] == nonce => return Some(rr),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
     /// Read up to 512 bytes at byte offset `off` (relative to partition).
     fn read_bytes(&self, off: u64, out: &mut [u8]) -> bool {
         let abs_off = self.partition_offset + off;
         let sector_byte = abs_off & !511;
         let off_in = (abs_off & 511) as usize;
 
-        if !syscall::grant_pages(
-            self.blk_aspace,
-            self.scratch_va,
-            self.grant_va,
-            1,
-            false,
-        ) {
-            return false;
-        }
-
+        let nonce = self.next_nonce();
         let d2 = SECTOR | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
             IO_READ,
-            0,
+            nonce,
             sector_byte,
             d2,
             self.grant_va as u64,
         );
 
-        let ok =
-            if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
-                if rr.tag == IO_READ_OK && rr.data[0] == SECTOR {
-                    let copy_len = out.len().min(512 - off_in);
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            (self.scratch_va + off_in) as *const u8,
-                            out.as_mut_ptr(),
-                            copy_len,
-                        );
-                    }
-                    true
-                } else {
-                    false
+        if let Some(rr) = self.recv_match(nonce) {
+            if rr.tag == IO_READ_OK && rr.data[0] == SECTOR {
+                let copy_len = out.len().min(512 - off_in);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (self.scratch_va + off_in) as *const u8,
+                        out.as_mut_ptr(),
+                        copy_len,
+                    );
                 }
+                true
             } else {
                 false
-            };
-
-        syscall::revoke(self.blk_aspace, self.grant_va);
-        ok
+            }
+        } else {
+            false
+        }
     }
 
     /// Read `len` bytes at **sector-aligned** offset `off` into `dest` VA.
@@ -370,26 +376,18 @@ impl BlkClient {
         let sectors = (len + 511) / 512;
         for s in 0..sectors {
             let abs = self.partition_offset + off + (s as u64) * SECTOR;
-            if !syscall::grant_pages(
-                self.blk_aspace,
-                self.scratch_va,
-                self.grant_va,
-                1,
-                false,
-            ) {
-                return false;
-            }
+            let nonce = self.next_nonce();
             let d2 = SECTOR | ((self.reply_port as u64) << 32);
             syscall::send(
                 self.blk_port,
                 IO_READ,
-                0,
+                nonce,
                 abs,
                 d2,
                 self.grant_va as u64,
             );
             let ok =
-                if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+                if let Some(rr) = self.recv_match(nonce) {
                     if rr.tag == IO_READ_OK && rr.data[0] == SECTOR {
                         let chunk = (len - s * 512).min(512);
                         unsafe {
@@ -406,7 +404,6 @@ impl BlkClient {
                 } else {
                     false
                 };
-            syscall::revoke(self.blk_aspace, self.grant_va);
             if !ok {
                 return false;
             }
@@ -429,32 +426,23 @@ impl BlkClient {
                     chunk,
                 );
             }
-            if !syscall::grant_pages(
-                self.blk_aspace,
-                self.scratch_va,
-                self.grant_va,
-                1,
-                false,
-            ) {
-                return false;
-            }
+            let nonce = self.next_nonce();
             let abs = self.partition_offset + off + (s as u64) * SECTOR;
             let d2 = SECTOR | ((self.reply_port as u64) << 32);
             syscall::send(
                 self.blk_port,
                 IO_WRITE,
-                0,
+                nonce,
                 abs,
                 d2,
                 self.grant_va as u64,
             );
             let ok =
-                if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+                if let Some(rr) = self.recv_match(nonce) {
                     rr.tag == IO_WRITE_OK
                 } else {
                     false
                 };
-            syscall::revoke(self.blk_aspace, self.grant_va);
             if !ok {
                 return false;
             }
@@ -2155,7 +2143,16 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         scratch_va,
         grant_va: 0x6_0000_5000,
         partition_offset,
+        nonce: Cell::new(0),
     };
+
+    // Permanent grant of `scratch_va` into cache_blk's aspace at grant_va.
+    // The nonce protocol (see BlkClient::recv_match) makes stale-reply
+    // corruption impossible, so per-request grant/revoke is no longer needed.
+    if !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, blk.grant_va, 1, false) {
+        syscall::debug_puts(b"  [btrfs_srv] permanent grant FAILED\n");
+        loop { syscall::nanosleep(1_000_000_000_000); }
+    }
 
     // --- Parse btrfs superblock, build chunk map, find FS tree ---
     // Wait briefly for cache_srv to connect to blk_srv, then retry mount.

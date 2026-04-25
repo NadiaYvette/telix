@@ -13,6 +13,7 @@
 //! (VFAT/LFN).
 
 extern crate userlib;
+use core::cell::Cell;
 use userlib::syscall;
 
 // ---------------------------------------------------------------------------
@@ -247,30 +248,40 @@ struct BlkClient {
     grant_va: usize,
     /// Byte offset of the FAT partition within the disk image.
     partition_offset: u64,
+    /// Per-client nonce counter. See cache_srv::BlkClient for the protocol.
+    nonce: Cell<u64>,
 }
 
 impl BlkClient {
-    fn read_sector(&self, sector: u32, out: &mut [u8; 512]) -> bool {
-        if !syscall::grant_pages(
-            self.blk_aspace,
-            self.scratch_va,
-            self.grant_va,
-            1,
-            false,
-        ) {
-            return false;
+    fn next_nonce(&self) -> u64 {
+        let n = self.nonce.get().wrapping_add(1);
+        self.nonce.set(n);
+        n
+    }
+
+    fn recv_match(&self, nonce: u64) -> Option<syscall::Message> {
+        loop {
+            match syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+                Some(rr) if rr.data[1] == nonce => return Some(rr),
+                Some(_) => continue,
+                None => return None,
+            }
         }
+    }
+
+    fn read_sector(&self, sector: u32, out: &mut [u8; 512]) -> bool {
+        let nonce = self.next_nonce();
         let offset = self.partition_offset + (sector as u64) * 512;
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
             IO_READ,
-            0,
+            nonce,
             offset,
             d2,
             self.grant_va as u64,
         );
-        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        if let Some(rr) = self.recv_match(nonce) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
                 unsafe {
                     core::ptr::copy_nonoverlapping(
@@ -285,41 +296,29 @@ impl BlkClient {
             }
         } else {
             false
-        };
-        syscall::revoke(self.blk_aspace, self.grant_va);
-        ok
+        }
     }
 
     fn write_sector(&self, sector: u32, data: &[u8; 512]) -> bool {
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.scratch_va as *mut u8, 512);
         }
-        if !syscall::grant_pages(
-            self.blk_aspace,
-            self.scratch_va,
-            self.grant_va,
-            1,
-            false,
-        ) {
-            return false;
-        }
+        let nonce = self.next_nonce();
         let offset = self.partition_offset + (sector as u64) * 512;
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
             IO_WRITE,
-            0,
+            nonce,
             offset,
             d2,
             self.grant_va as u64,
         );
-        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        if let Some(rr) = self.recv_match(nonce) {
             rr.tag == IO_WRITE_OK
         } else {
             false
-        };
-        syscall::revoke(self.blk_aspace, self.grant_va);
-        ok
+        }
     }
 }
 
@@ -1295,7 +1294,16 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         scratch_va,
         grant_va: 0x6_0000_0000, // blk_srv grant target (not FS_SCRATCH_VA)
         partition_offset,
+        nonce: Cell::new(0),
     };
+
+    // Permanent grant of `scratch_va` into cache_blk's aspace at grant_va.
+    // The nonce protocol (see BlkClient::recv_match) makes stale-reply
+    // corruption impossible, so per-request grant/revoke is no longer needed.
+    if !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, blk.grant_va, 1, false) {
+        syscall::debug_puts(b"  [fat_srv] permanent grant FAILED\n");
+        syscall::exit(1);
+    }
 
     // -----------------------------------------------------------------------
     // Read boot sector, parse BPB, detect variant.
