@@ -151,11 +151,21 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     # necessarily installed on the build host.
     if [ -f "$ROOTDIR/initramfs/lib64/libxcvt.so.0" ]; then
         echo "Building libxcvt_dyn_test (Tier-0 Xwayland)..."
+        # Pass -lc explicitly BEFORE -l:libxcvt.so.0 so the resulting
+        # binary's DT_NEEDED list has libc.so.6 first.  glibc's ld.so
+        # iterates NEEDED in order, and our loader exposes a bug
+        # where if libxcvt loads first its dependency on libc.so.6 is
+        # dropped from libxcvt_dyn_test's symbol search list — see
+        # project_phase172_tier1.md.  Reordering side-steps the bug
+        # by ensuring libc.so.6 is in scope before libxcvt's
+        # version_r is processed.
         if gcc -pie -fPIE -O2 -fno-stack-protector -s \
                 -I"$ROOTDIR/tools/xport/include" \
                 -o "$BINDIR/libxcvt_dyn_test" \
                 "$ROOTDIR/tools/libxcvt_dyn_test.c" \
-                -L"$ROOTDIR/initramfs/lib64" -l:libxcvt.so.0 \
+                -L"$ROOTDIR/initramfs/lib64" \
+                -Wl,--no-as-needed -lc -Wl,--as-needed \
+                -l:libxcvt.so.0 \
                 -Wl,-rpath,/lib64 2>&1; then
             echo "  libxcvt_dyn_test: $(wc -c < "$BINDIR/libxcvt_dyn_test") bytes"
         else
