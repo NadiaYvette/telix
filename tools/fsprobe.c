@@ -198,6 +198,22 @@ void _start(void)
     wstr("\n");
     if (hr != 64) sys_exit(36);
 
+    /* libc .gnu.version_d at file offset 0x181f08 — what ld.so reads
+     * to look up GLIBC_2.2.5 */
+    lr = sys3(SYS_lseek, fd, 0x181f08, 0);
+    wstr(tag);
+    wstr("libc lseek(0x181f08) = "); wnum(lr);
+    hr = sys3(SYS_read, fd, (long)hibuf, 32);
+    wstr(" read(32) = "); wnum(hr);
+    if (hr > 0) {
+        wstr(" first16=");
+        for (int i = 0; i < 16 && i < hr; i++) {
+            whex((unsigned char)hibuf[i]);
+            wstr(" ");
+        }
+    }
+    wstr("\n");
+
     /* 4) close */
     sys1(SYS_close, fd);
 
@@ -262,6 +278,22 @@ void _start(void)
     if (n5 > 0) {
         wstr(" first8=");
         for (int i = 0; i < 8 && i < n5; i++) {
+            whex((unsigned char)rdbuf3[i]);
+            wstr(" ");
+        }
+    }
+    wstr("\n");
+
+    /* libxcvt .gnu.version at file offset 0x1178 — host bytes are:
+     * 00 00 01 00 02 00 01 00 01 00 02 00 01 00 00 00 */
+    long n6 = sys3(SYS_lseek, fd2, 0x1178, 0);
+    wstr(tag);
+    wstr("xcvt lseek(0x1178) = "); wnum(n6);
+    long n7 = sys3(SYS_read, fd2, (long)rdbuf3, 16);
+    wstr(" read(16) = "); wnum(n7);
+    if (n7 > 0) {
+        wstr(" bytes=");
+        for (int i = 0; i < n7; i++) {
             whex((unsigned char)rdbuf3[i]);
             wstr(" ");
         }
