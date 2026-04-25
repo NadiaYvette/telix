@@ -296,15 +296,11 @@ struct BlkClient {
 
 impl BlkClient {
     fn read_sector(&self, sector: u64, out: &mut [u8; 512]) -> bool {
-        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, BLK_GRANT_VA, 1, false) {
-            return false;
-        }
-
         let offset = sector * 512;
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(self.blk_port, IO_READ, 0, offset, d2, BLK_GRANT_VA as u64);
 
-        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
                 unsafe {
                     core::ptr::copy_nonoverlapping(
@@ -319,10 +315,7 @@ impl BlkClient {
             }
         } else {
             false
-        };
-
-        syscall::revoke(self.blk_aspace, BLK_GRANT_VA);
-        ok
+        }
     }
 
     fn write_sector(&self, sector: u64, data: &[u8; 512]) -> bool {
@@ -330,22 +323,15 @@ impl BlkClient {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.scratch_va as *mut u8, 512);
         }
 
-        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, BLK_GRANT_VA, 1, false) {
-            return false;
-        }
-
         let offset = sector * 512;
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(self.blk_port, IO_WRITE, 0, offset, d2, BLK_GRANT_VA as u64);
 
-        let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
+        if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
             rr.tag == IO_WRITE_OK
         } else {
             false
-        };
-
-        syscall::revoke(self.blk_aspace, BLK_GRANT_VA);
-        ok
+        }
     }
 }
 
@@ -449,6 +435,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         reply_port: blk_reply,
         scratch_va,
     };
+
+    // Permanent grant of `scratch_va` into blk_srv's aspace at BLK_GRANT_VA so
+    // every IO_READ/IO_WRITE can skip the per-request grant_pages/revoke pair
+    // (two extra syscalls and TLB shootdowns per disk sector).  See
+    // ext_srv's matching change (commit 5e37e0c).
+    if !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, BLK_GRANT_VA, 1, false) {
+        syscall::debug_puts(b"  [cache_srv] permanent grant FAILED\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
 
     // Allocate 512 KiB data pool (128 entries × 4 KiB = 8 allocation pages).
     let data_va = match syscall::mmap_anon(0, DATA_ALLOC_PAGES, 1) {
