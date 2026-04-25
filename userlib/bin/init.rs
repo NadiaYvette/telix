@@ -8271,8 +8271,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     static PATH: &[u8] = b"/libxcvt_dyn_test\0";
                     static A0: &[u8] = b"libxcvt_dyn_test\0";
                     static E0: &[u8] = b"LD_LIBRARY_PATH=/lib64\0";
+                    static E1: &[u8] = b"LD_DEBUG=symbols,bindings,versions\0";
                     let argv: [u64; 2] = [A0.as_ptr() as u64, 0];
-                    let envp: [u64; 2] = [E0.as_ptr() as u64, 0];
+                    let envp: [u64; 3] = [E0.as_ptr() as u64, E1.as_ptr() as u64, 0];
                     core::arch::asm!(
                         "int 0x80",
                         inlateout("rax") 59u64 => _,
