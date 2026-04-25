@@ -438,10 +438,14 @@ impl BlkClient {
         let sector = abs_off / 512;
         let offset_in_sector = (abs_off % 512) as usize;
 
+        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
+            return false;
+        }
+
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(self.blk_port, IO_READ, 0, sector * 512, d2, self.grant_va as u64);
 
-        if let Some(rr) = self.recv_reply() {
+        let ok = if let Some(rr) = self.recv_reply() {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
                 let copy_len = out.len().min(512 - offset_in_sector);
                 unsafe {
@@ -457,7 +461,10 @@ impl BlkClient {
             }
         } else {
             false
-        }
+        };
+
+        syscall::revoke(self.blk_aspace, self.grant_va);
+        ok
     }
 
     /// Read a full block (block_size bytes) into memory at `dest` VA.
@@ -467,6 +474,9 @@ impl BlkClient {
         let sectors = block_size / 512;
 
         for s in 0..sectors {
+            if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
+                return false;
+            }
             let sector_byte = abs_off + (s as u64) * 512;
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(self.blk_port, IO_READ, 0, sector_byte, d2, self.grant_va as u64);
@@ -488,6 +498,7 @@ impl BlkClient {
                 false
             };
 
+            syscall::revoke(self.blk_aspace, self.grant_va);
             if !ok {
                 return false;
             }
@@ -509,6 +520,9 @@ impl BlkClient {
                     512,
                 );
             }
+            if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
+                return false;
+            }
             let sector_byte = abs_off + (s as u64) * 512;
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(
@@ -524,6 +538,7 @@ impl BlkClient {
             } else {
                 false
             };
+            syscall::revoke(self.blk_aspace, self.grant_va);
             if !ok {
                 return false;
             }
@@ -545,6 +560,9 @@ impl BlkClient {
         }
 
         // Read the sector.
+        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
+            return false;
+        }
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
         syscall::send(
             self.blk_port,
@@ -559,6 +577,7 @@ impl BlkClient {
         } else {
             false
         };
+        syscall::revoke(self.blk_aspace, self.grant_va);
         if !ok {
             return false;
         }
@@ -573,6 +592,9 @@ impl BlkClient {
         }
 
         // Write sector back.
+        if !syscall::grant_pages(self.blk_aspace, self.scratch_va, self.grant_va, 1, false) {
+            return false;
+        }
         syscall::send(
             self.blk_port,
             IO_WRITE,
@@ -581,11 +603,13 @@ impl BlkClient {
             d2,
             self.grant_va as u64,
         );
-        if let Some(rr) = self.recv_reply() {
+        let ok = if let Some(rr) = self.recv_reply() {
             rr.tag == IO_WRITE_OK
         } else {
             false
-        }
+        };
+        syscall::revoke(self.blk_aspace, self.grant_va);
+        ok
     }
 }
 
@@ -3288,13 +3312,6 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         grant_va: 0x7_0000_0000,
         partition_offset,
     };
-
-    // Permanent grant of `scratch_va` into cache_blk's aspace at grant_va so
-    // every IO_READ/IO_WRITE can skip the per-request grant_pages/revoke pair.
-    if !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, blk.grant_va, 1, false) {
-        syscall::debug_puts(b"  [apfs_srv] permanent grant FAILED\n");
-        loop { syscall::nanosleep(1_000_000_000_000); }
-    }
 
     syscall::debug_puts(b"  [apfs_srv] connected, aspace=");
     print_num(blk.blk_aspace);

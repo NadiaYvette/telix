@@ -204,6 +204,16 @@ impl BlkClient {
             let sector_start = (abs_off / 512) * 512;
             let offset_in_sector = (abs_off % 512) as usize;
 
+            if !syscall::grant_pages(
+                self.blk_aspace,
+                self.scratch_va,
+                self.grant_va,
+                1,
+                false,
+            ) {
+                return false;
+            }
+
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(
                 self.blk_port,
@@ -219,6 +229,8 @@ impl BlkClient {
             } else {
                 false
             };
+
+            syscall::revoke(self.blk_aspace, self.grant_va);
 
             if !ok {
                 return false;
@@ -251,6 +263,16 @@ impl BlkClient {
             let sector_start = (abs_off / 512) * 512;
             let offset_in_sector = (abs_off % 512) as usize;
 
+            if !syscall::grant_pages(
+                self.blk_aspace,
+                self.scratch_va,
+                self.grant_va,
+                1,
+                false,
+            ) {
+                return false;
+            }
+
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(
                 self.blk_port,
@@ -268,6 +290,7 @@ impl BlkClient {
             };
 
             if !ok {
+                syscall::revoke(self.blk_aspace, self.grant_va);
                 return false;
             }
 
@@ -279,6 +302,7 @@ impl BlkClient {
                     copy_len,
                 );
             }
+            syscall::revoke(self.blk_aspace, self.grant_va);
 
             cur_dest += copy_len;
             cur_off += copy_len as u64;
@@ -1041,13 +1065,6 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         grant_va: 0x6_0000_2000,
         image_offset,
     };
-
-    // Permanent grant of `scratch_va` into cache_blk's aspace at grant_va so
-    // every IO_READ can skip the per-request grant_pages/revoke pair.
-    if !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, blk.grant_va, 1, false) {
-        syscall::debug_puts(b"  [udf_srv] permanent grant FAILED\n");
-        loop { syscall::nanosleep(1_000_000_000_000); }
-    }
 
     // Allocate buffer for sector/block reads.
     let buf_va = match syscall::mmap_anon(0, 1, 1) {

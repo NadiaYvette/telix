@@ -324,6 +324,16 @@ impl BlkClient {
             let sector = abs_off / 512;
             let offset_in_sector = (abs_off % 512) as usize;
 
+            if !syscall::grant_pages(
+                self.blk_aspace,
+                self.scratch_va,
+                self.grant_va,
+                1,
+                false,
+            ) {
+                return false;
+            }
+
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(
                 self.blk_port,
@@ -356,6 +366,7 @@ impl BlkClient {
                     false
                 };
 
+            syscall::revoke(self.blk_aspace, self.grant_va);
             if !ok {
                 return false;
             }
@@ -370,6 +381,15 @@ impl BlkClient {
         let sectors = cluster_size / 512;
 
         for s in 0..sectors {
+            if !syscall::grant_pages(
+                self.blk_aspace,
+                self.scratch_va,
+                self.grant_va,
+                1,
+                false,
+            ) {
+                return false;
+            }
             let sector_byte = abs_off + (s as u64) * 512;
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(
@@ -399,6 +419,7 @@ impl BlkClient {
                     false
                 };
 
+            syscall::revoke(self.blk_aspace, self.grant_va);
             if !ok {
                 return false;
             }
@@ -420,6 +441,15 @@ impl BlkClient {
                     512,
                 );
             }
+            if !syscall::grant_pages(
+                self.blk_aspace,
+                self.scratch_va,
+                self.grant_va,
+                1,
+                false,
+            ) {
+                return false;
+            }
             let sector_byte = abs_off + (s as u64) * 512;
             let d2 = 512u64 | ((self.reply_port as u64) << 32);
             syscall::send(
@@ -436,6 +466,7 @@ impl BlkClient {
                 } else {
                     false
                 };
+            syscall::revoke(self.blk_aspace, self.grant_va);
             if !ok {
                 return false;
             }
@@ -1627,6 +1658,9 @@ fn write_mft_record(blk: &BlkClient, vol: &NtfsVolume, record_num: u64, buf: &mu
             );
         }
 
+        if !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, blk.grant_va, 1, false) {
+            return false;
+        }
         unsafe {
             core::ptr::copy_nonoverlapping(
                 wva as *const u8,
@@ -1643,6 +1677,7 @@ fn write_mft_record(blk: &BlkClient, vol: &NtfsVolume, record_num: u64, buf: &mu
         } else {
             false
         };
+        syscall::revoke(blk.blk_aspace, blk.grant_va);
         if !ok {
             return false;
         }
@@ -2577,13 +2612,6 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         grant_va: 0x6_0000_4000, // Unique per FS server.
         partition_offset,
     };
-
-    // Permanent grant of `scratch_va` into cache_blk's aspace at grant_va so
-    // every IO_READ/IO_WRITE can skip the per-request grant_pages/revoke pair.
-    if !syscall::grant_pages(blk.blk_aspace, blk.scratch_va, blk.grant_va, 1, false) {
-        syscall::debug_puts(b"  [ntfs_srv] permanent grant FAILED\n");
-        loop { syscall::nanosleep(1_000_000_000_000); }
-    }
 
     // Initialize block cache.
     cache_init();
