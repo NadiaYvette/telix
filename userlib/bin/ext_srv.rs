@@ -922,6 +922,88 @@ fn resolve_block(
     resolve_indirect(blk, sb, block_ptrs, logical_block as u32, scratch_page)
 }
 
+/// Single-slot cache of the most recently read indirect-tier block
+/// (dind, ind, or tind).  Sequential reads within the same ind chunk
+/// re-resolve through the same dind & ind blocks; before this cache,
+/// each FS_READ paid the full 6-sector I/O cost (2 sectors each for
+/// dind, ind, and the data block itself), serializing past the
+/// kernel's 10 s call watchdog under load.
+///
+/// We keep two cache slots (one for dind, one for ind) so a triple-
+/// indirect read can still benefit from caching.  Cache contents are a
+/// raw copy of the block data; the entries are read out via byte
+/// offsets the same way `scratch_page` is used.
+const IND_CACHE_BLOCK_BYTES: usize = 4096;
+struct IndCacheSlot {
+    valid: bool,
+    block_num: u32,
+    contents: [u8; IND_CACHE_BLOCK_BYTES],
+}
+static mut DIND_CACHE: IndCacheSlot = IndCacheSlot {
+    valid: false,
+    block_num: 0,
+    contents: [0; IND_CACHE_BLOCK_BYTES],
+};
+static mut IND_CACHE: IndCacheSlot = IndCacheSlot {
+    valid: false,
+    block_num: 0,
+    contents: [0; IND_CACHE_BLOCK_BYTES],
+};
+
+/// Read an indirect block into `scratch_page`, consulting the named
+/// cache slot first.  On miss, reads from disk and populates the cache.
+/// On hit, copies cached bytes into scratch_page so subsequent ptr
+/// reads against scratch_page work the same as the uncached path.
+fn read_ind_cached(
+    blk: &BlkClient,
+    sb: &Superblock,
+    block_num: u32,
+    scratch_page: usize,
+    use_dind_slot: bool,
+) -> bool {
+    let cache = unsafe {
+        if use_dind_slot {
+            &mut *core::ptr::addr_of_mut!(DIND_CACHE)
+        } else {
+            &mut *core::ptr::addr_of_mut!(IND_CACHE)
+        }
+    };
+    let bs = sb.block_size as usize;
+    if cache.valid && cache.block_num == block_num && bs <= IND_CACHE_BLOCK_BYTES {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                cache.contents.as_ptr(), scratch_page as *mut u8, bs,
+            );
+        }
+        return true;
+    }
+    if !blk.read_block(block_num as u64, sb.block_size, scratch_page) {
+        cache.valid = false;
+        return false;
+    }
+    if bs <= IND_CACHE_BLOCK_BYTES {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                scratch_page as *const u8, cache.contents.as_mut_ptr(), bs,
+            );
+        }
+        cache.block_num = block_num;
+        cache.valid = true;
+    }
+    true
+}
+
+/// Invalidate both indirect caches.  Called from FS_OPEN whenever a
+/// fresh file is opened, since the new file may share block numbers
+/// with the old file's freed blocks (ext2 reuses) — stale data would
+/// silently corrupt subsequent reads.
+fn invalidate_ind_caches() {
+    unsafe {
+        DIND_CACHE.valid = false;
+        IND_CACHE.valid = false;
+    }
+}
+
 /// Resolve via traditional ext2/3 indirect block pointers.
 fn resolve_indirect(
     blk: &BlkClient,
@@ -947,7 +1029,7 @@ fn resolve_indirect(
         if ind_block == 0 {
             return None;
         }
-        if !blk.read_block(ind_block as u64, sb.block_size, scratch_page) {
+        if !read_ind_cached(blk, sb, ind_block, scratch_page, false) {
             return None;
         }
         let ptr =
@@ -965,7 +1047,7 @@ fn resolve_indirect(
         if dind_block == 0 {
             return None;
         }
-        if !blk.read_block(dind_block as u64, sb.block_size, scratch_page) {
+        if !read_ind_cached(blk, sb, dind_block, scratch_page, true) {
             return None;
         }
         let idx1 = logical_block / ptrs_per_block;
@@ -974,7 +1056,7 @@ fn resolve_indirect(
         if ind_block == 0 {
             return None;
         }
-        if !blk.read_block(ind_block as u64, sb.block_size, scratch_page) {
+        if !read_ind_cached(blk, sb, ind_block, scratch_page, false) {
             return None;
         }
         let idx2 = logical_block % ptrs_per_block;
@@ -993,7 +1075,7 @@ fn resolve_indirect(
         if tind_block == 0 {
             return None;
         }
-        if !blk.read_block(tind_block as u64, sb.block_size, scratch_page) {
+        if !read_ind_cached(blk, sb, tind_block, scratch_page, true) {
             return None;
         }
         let idx1 = logical_block / pp;
@@ -1002,7 +1084,7 @@ fn resolve_indirect(
         if dind == 0 {
             return None;
         }
-        if !blk.read_block(dind as u64, sb.block_size, scratch_page) {
+        if !read_ind_cached(blk, sb, dind, scratch_page, true) {
             return None;
         }
         let idx2 = (logical_block % pp) / ptrs_per_block;
@@ -1011,7 +1093,7 @@ fn resolve_indirect(
         if ind == 0 {
             return None;
         }
-        if !blk.read_block(ind as u64, sb.block_size, scratch_page) {
+        if !read_ind_cached(blk, sb, ind, scratch_page, false) {
             return None;
         }
         let idx3 = logical_block % ptrs_per_block;
@@ -1822,6 +1904,11 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let name_buf = unpack_name(msg.data[0], msg.data[1], name_len);
                 let name = &name_buf[..name_len.min(16)];
 
+                // Block numbers are reused across files; cached
+                // indirect blocks from a previously-open file are
+                // invalid for this lookup.
+                invalidate_ind_caches();
+
                 if let Some((ino, mode, uid, gid, size, iflags, blocks)) =
                     path_resolve(&blk, &sb, name, indirect_buf_va, block_buf_va)
                 {
@@ -2011,6 +2098,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 for i in 0..nlen {
                     name[i] = unsafe { *src.add(i) };
                 }
+
+                invalidate_ind_caches();
 
                 if let Some((ino, mode, uid, gid, size, iflags, blocks)) =
                     path_resolve(&blk, &sb, &name[..nlen], indirect_buf_va, block_buf_va)
