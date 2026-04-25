@@ -8084,6 +8084,74 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 172d: minimal Linux-personality FS probe (no glibc) ---
+    //
+    // Static-PIE binary that does open + fstat + read on
+    // /lib64/libc.so.6 via raw int 0x80, no ld.so.  Isolates whether
+    // the kernel + linux_srv + ext_srv FS path is actually working
+    // for libc-sized files separately from any glibc/ld.so issue.
+    syscall::debug_puts(b"  init: Phase 172d fsprobe...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        let vfs_ok   = syscall::ns_lookup(b"vfs").is_some();
+        if linux_ok && vfs_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    static PATH: &[u8] = b"/fsprobe\0";
+                    static A0: &[u8]   = b"fsprobe\0";
+                    let argv: [u64; 2] = [A0.as_ptr() as u64, 0];
+                    let envp: [u64; 1] = [0];
+                    core::arch::asm!(
+                        "int 0x80",
+                        inlateout("rax") 59u64 => _,
+                        in("rdi") PATH.as_ptr() as u64,
+                        in("rsi") argv.as_ptr() as u64,
+                        in("rdx") envp.as_ptr() as u64,
+                        lateout("rcx") _, lateout("r11") _,
+                    );
+                    core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 99u64, options(noreturn));
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                { syscall::exit(99); }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(not(target_arch = "x86_64"))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let mut exit_code: i64 = -1;
+                for _ in 0..3000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(10);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 172d fsprobe: PASSED\n");
+                } else {
+                    syscall::debug_puts(b"Phase 172d fsprobe: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 172d fsprobe: SKIPPED\n");
+        }
+    }
+
     // --- Phase 172e: dynamic-PIE glibc binary (early variant) ---
     //
     // Runs right after Phase 51 so VFS + rootfs mount are already in
