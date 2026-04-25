@@ -28,10 +28,13 @@ typedef long off_t;
 #define SYS_close  3
 #define SYS_fstat  5
 #define SYS_lseek  8
+#define SYS_mmap   9
 #define SYS_exit   60
 #define SYS_openat 257
 
-#define O_RDONLY  0
+#define O_RDONLY      0
+#define PROT_READ     1
+#define MAP_PRIVATE   2
 
 /* Inline raw syscalls.  Using `int 0x80` since that's what other
  * Telix Linux-personality programs use; the kernel routes both 0x80
@@ -55,6 +58,21 @@ static inline long sys1(long nr, long a0)
         "int $0x80"
         : "=a"(r)
         : "a"(nr), "D"(a0)
+        : "rcx", "r11", "memory"
+    );
+    return r;
+}
+
+static inline long sys6(long nr, long a0, long a1, long a2, long a3, long a4, long a5)
+{
+    long r;
+    register long r10 __asm__("r10") = a3;
+    register long r8  __asm__("r8")  = a4;
+    register long r9  __asm__("r9")  = a5;
+    __asm__ volatile (
+        "int $0x80"
+        : "=a"(r)
+        : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "r"(r10), "r"(r8), "r"(r9)
         : "rcx", "r11", "memory"
     );
     return r;
@@ -211,6 +229,25 @@ void _start(void)
             whex((unsigned char)hibuf[i]);
             wstr(" ");
         }
+    }
+    wstr("\n");
+
+    /* mmap probe: same offset as `read` above, but via the file-backed
+     * mmap path that ld.so actually uses to load segments.  If mmap
+     * returns different bytes here than read above, the kernel/
+     * personality mmap loader has a bug. */
+    long mp = sys6(SYS_mmap, 0, 0x2000, PROT_READ, MAP_PRIVATE, fd, 0x180000);
+    wstr(tag);
+    wstr("libc mmap(0x180000, 0x2000, R, PRIV) = ");
+    whex((unsigned long)mp);
+    if (mp >= 0 && mp < (long)0xFFFFFFFFFFFFF000UL) {
+        const unsigned char *m = (const unsigned char *)mp;
+        wstr(" first16@0x0=");
+        for (int i = 0; i < 16; i++) { whex(m[i]); wstr(" "); }
+        wstr("\n");
+        wstr(tag);
+        wstr("libc mmap @0x1f08=");
+        for (int i = 0; i < 16; i++) { whex(m[0x1f08 + i]); wstr(" "); }
     }
     wstr("\n");
 
