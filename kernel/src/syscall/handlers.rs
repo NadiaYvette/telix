@@ -2663,11 +2663,19 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
 
     let cur_task_id = crate::sched::current_task_id();
     let cur_task = crate::sched::scheduler::task_ref(cur_task_id);
+    // AT_PAGESZ must report the MMU page size (4 KiB on x86-64), not the
+    // kernel's allocation page size.  ELF program headers and glibc
+    // ld.so's PT_LOAD alignment check use this value to validate
+    // `(p_vaddr - p_offset) % page_size == 0`; reporting the alloc
+    // page size (e.g. 16 KiB on x86-64 with feature `page_size_16k`)
+    // makes well-formed Linux .so files (e.g. libxcvt's small RW
+    // segment with diff = 4 KiB) fail the check and load with
+    // "ELF load command address/offset not page-aligned".
     let auxv: [(u64, u64); 12] = [
         (AT_PHDR, elf_info.phdr_vaddr as u64),
         (AT_PHENT, elf_info.phentsize as u64),
         (AT_PHNUM, elf_info.phnum as u64),
-        (AT_PAGESZ, ps as u64),
+        (AT_PAGESZ, crate::mm::page::MMUPAGE_SIZE as u64),
         (AT_ENTRY, elf_info.entry as u64),
         (AT_BASE, interp_base as u64),
         (AT_UID, cur_task.uid as u64),
@@ -3076,11 +3084,13 @@ pub(crate) fn exec_for_task(
     const AT_RANDOM: u64 = 25;
 
     let cur_task = crate::sched::scheduler::task_ref(target_task_id);
+    // See AT_PAGESZ note in the other auxv site above: must be MMU page
+    // size for ELF/ld.so alignment checks to make sense.
     let auxv: [(u64, u64); 12] = [
         (AT_PHDR, elf_info.phdr_vaddr as u64),
         (AT_PHENT, elf_info.phentsize as u64),
         (AT_PHNUM, elf_info.phnum as u64),
-        (AT_PAGESZ, ps as u64),
+        (AT_PAGESZ, crate::mm::page::MMUPAGE_SIZE as u64),
         (AT_ENTRY, elf_info.entry as u64),
         (AT_BASE, interp_base as u64),
         (AT_UID, cur_task.uid as u64),
