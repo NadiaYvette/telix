@@ -307,15 +307,21 @@ impl BlkClient {
         n
     }
 
-    /// Receive a reply matching `nonce`.  Drops mismatched (stale) replies and
-    /// keeps waiting until either a matching reply arrives or the timeout
-    /// expires on a single recv (we don't track a global deadline — under
-    /// normal load the matching reply is the only one in the queue).
+    /// Receive a reply matching `nonce`.  Drops mismatched (stale) replies
+    /// and keeps waiting until either a matching reply arrives or the
+    /// timeout expires.  After a matching reply, issue an Acquire fence and
+    /// a yield (one syscall) — empirically required to keep buffer loads
+    /// from returning zero on x86 KVM under heavy boot-time concurrency.
+    /// Plain memory fences alone were not sufficient.
     fn recv_match(&self, nonce: u64) -> Option<syscall::Message> {
         loop {
             match syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
-                Some(rr) if rr.data[1] == nonce => return Some(rr),
-                Some(_) => continue, // stale reply, drop it
+                Some(rr) if rr.data[1] == nonce => {
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                    syscall::yield_now();
+                    return Some(rr);
+                }
+                Some(_) => continue,
                 None => return None,
             }
         }
@@ -524,6 +530,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         unsafe {
                             core::ptr::copy_nonoverlapping(ptr, dst, bytes_read);
                         }
+                        // Release fence so the receiver (on another CPU) sees
+                        // our writes to grant_va before observing the reply
+                        // notification in the IPC port.
+                        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
                         syscall::send_nb_4(
                             reply_port,
                             IO_READ_OK,

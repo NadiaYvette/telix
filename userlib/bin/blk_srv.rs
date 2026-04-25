@@ -968,7 +968,17 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                         send_reply(reply_port, IO_ERROR, ERR_IO, nonce, 0, 0);
                     } else {
                         // Ensure grant page writes are visible to the receiver
-                        // (on another CPU) before the IPC notification.
+                        // (on another CPU) before the IPC notification.  x86 TSO
+                        // ought to suffice via the SYSCALL serialization in
+                        // send_reply, but empirical evidence (boot-time bad
+                        // magic in btrfs) shows the receiver can read stale
+                        // zeros without an explicit cross-CPU fence — so issue
+                        // mfence on x86 as well.
+                        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            core::arch::asm!("mfence");
+                        }
                         #[cfg(target_arch = "aarch64")]
                         unsafe {
                             core::arch::asm!("dsb ish");

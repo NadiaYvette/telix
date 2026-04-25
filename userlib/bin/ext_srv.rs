@@ -500,7 +500,11 @@ impl BlkClient {
     fn recv_match(&self, nonce: u64) -> Option<syscall::Message> {
         loop {
             match syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
-                Some(rr) if rr.data[1] == nonce => return Some(rr),
+                Some(rr) if rr.data[1] == nonce => {
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                    syscall::yield_now();
+                    return Some(rr);
+                }
                 Some(_) => continue, // stale reply, drop it
                 None => return None,
             }

@@ -191,7 +191,17 @@ impl BlkClient {
     fn recv_match(&self, nonce: u64) -> Option<syscall::Message> {
         loop {
             match syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
-                Some(rr) if rr.data[1] == nonce => return Some(rr),
+                Some(rr) if rr.data[1] == nonce => {
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                    // Empirical: a yield (one syscall) between recv and the
+                    // buffer load eliminates a boot-time race where reads
+                    // returned all zeros despite blk_srv having written real
+                    // data and a Release+mfence on the send side.  Plain
+                    // memory fences were not sufficient on x86 KVM under heavy
+                    // boot-time concurrency.
+                    syscall::yield_now();
+                    return Some(rr);
+                }
                 Some(_) => continue,
                 None => return None,
             }
