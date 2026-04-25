@@ -7895,30 +7895,36 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         const VFS_READDIR_END: u64 = 0x6131;
         const VFS_ERROR: u64 = 0x6F00;
 
-        // Spawn VFS server.
-        let vfs_tid = syscall::spawn(b"vfs_srv", 50);
-        if vfs_tid == u64::MAX {
-            syscall::debug_puts(b"  FAIL: cannot spawn vfs_srv\n");
-            phase51_ok = false;
-        }
-
-        // Give VFS server time to register (retry lookup).
-        let vfs_port = if phase51_ok {
-            let mut found = 0u64;
-            for _ in 0..100 {
-                if let Some(p) = syscall::ns_lookup(b"vfs") {
-                    found = p;
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
-            if found == 0 {
-                syscall::debug_puts(b"  FAIL: ns_lookup(vfs) failed\n");
-                phase51_ok = false;
-            }
-            found
+        // Reuse an already-running vfs_srv if one is registered (Phase 194
+        // spawns one earlier).  Spawning a second instance here registered
+        // a fresh "vfs" port over the first; the old vfs_srv was the one
+        // already wired up to the FS servers via lazy grants, so calls to
+        // the new port timed out and any cached vfs_port (e.g. inside
+        // linux_srv's get_vfs_port) pointed at a dead server for the rest
+        // of the boot.
+        let vfs_port = if let Some(p) = syscall::ns_lookup(b"vfs") {
+            p
         } else {
-            0
+            let vfs_tid = syscall::spawn(b"vfs_srv", 50);
+            if vfs_tid == u64::MAX {
+                syscall::debug_puts(b"  FAIL: cannot spawn vfs_srv\n");
+                phase51_ok = false;
+                0
+            } else {
+                let mut found = 0u64;
+                for _ in 0..100 {
+                    if let Some(p) = syscall::ns_lookup(b"vfs") {
+                        found = p;
+                        break;
+                    }
+                    syscall::sleep_ms(10);
+                }
+                if found == 0 {
+                    syscall::debug_puts(b"  FAIL: ns_lookup(vfs) failed\n");
+                    phase51_ok = false;
+                }
+                found
+            }
         };
 
         // Determine root FS: ext if block device present, rootfs otherwise.

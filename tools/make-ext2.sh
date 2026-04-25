@@ -80,6 +80,31 @@ LD_SO="$INITRAMFS_DIR/lib64/ld-linux-x86-64.so.2"
 LIBC_SO="$INITRAMFS_DIR/lib64/libc.so.6"
 LIBPTHREAD_SO="$INITRAMFS_DIR/lib64/libpthread.so.0"
 GLIBC_DYN_HELLO="$INITRAMFS_DIR/glibc_dyn_hello"
+LIBXCVT_DYN_TEST="$INITRAMFS_DIR/libxcvt_dyn_test"
+
+# Tier-0 Xwayland deps: enumerate every .so under initramfs/lib64/ that
+# isn't a glibc artifact already handled above so the ext2 root sees the
+# same library set as initramfs.
+TIER0_LIBS=$(find "$INITRAMFS_DIR/lib64" -maxdepth 1 -name '*.so*' \
+    ! -name 'ld-linux-x86-64.so.2' \
+    ! -name 'libc.so.6' \
+    ! -name 'libpthread.so.0' \
+    -printf '%f\n' 2>/dev/null | sort)
+
+# Build dynamic chunks of debugfs commands for the Tier-0 libs and the
+# libxcvt_dyn_test binary.  These must end up inside the heredoc below.
+TIER0_WRITES=""
+TIER0_PERMS=""
+for lib in $TIER0_LIBS; do
+    TIER0_WRITES+="write $INITRAMFS_DIR/lib64/$lib lib64/$lib"$'\n'
+    TIER0_PERMS+="set_inode_field lib64/$lib mode 0100755"$'\n'
+done
+TEST_WRITE=""
+TEST_PERM=""
+if [ -f "$LIBXCVT_DYN_TEST" ]; then
+    TEST_WRITE="write $LIBXCVT_DYN_TEST libxcvt_dyn_test"
+    TEST_PERM="set_inode_field libxcvt_dyn_test mode 0100755"
+fi
 
 # Use debugfs to populate the filesystem.
 debugfs -w "$EXT2_TMP" <<DEBUGFS_EOF
@@ -93,12 +118,14 @@ write $LD_SO lib64/ld-linux-x86-64.so.2
 write $LIBC_SO lib64/libc.so.6
 write $LIBPTHREAD_SO lib64/libpthread.so.0
 write $GLIBC_DYN_HELLO glibc_dyn_hello
-set_inode_field lib64 mode 040755
+$TEST_WRITE
+${TIER0_WRITES}set_inode_field lib64 mode 040755
 set_inode_field lib64/ld-linux-x86-64.so.2 mode 0100755
 set_inode_field lib64/libc.so.6 mode 0100755
 set_inode_field lib64/libpthread.so.0 mode 0100755
 set_inode_field glibc_dyn_hello mode 0100755
-write $TMPFILE hello.txt
+$TEST_PERM
+${TIER0_PERMS}write $TMPFILE hello.txt
 write $TMPFILE2 bench.dat
 write $TMPFILE3 secret.txt
 write $PASSWD_TMP etc/passwd

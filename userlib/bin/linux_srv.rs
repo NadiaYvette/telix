@@ -2012,10 +2012,11 @@ fn ensure_fs_scratch_grants() {
         return;
     }
     unsafe {
-        let names: [(&[u8], u32); 3] = [
+        let names: [(&[u8], u32); 4] = [
             (b"ext2_task", 1 << 0),
             (b"rootfs_task", 1 << 1),
             (b"tmpfs_task", 1 << 2),
+            (b"ext_task", 1 << 3),
         ];
         for (name, bit) in names.iter() {
             if FS_SCRATCH_GRANTED_MASK & bit != 0 {
@@ -2107,7 +2108,7 @@ fn do_open_long(pi: usize, path: &[u8], flags: u64) -> u64 {
         PROC_TABLE[pi].fds[fd].file_size = resp.data[2];
         PROC_TABLE[pi].fds[fd].offset = 0;
     }
-    // Phase 172 diag: print size for libc.so.6 opens.
+    // Phase 172 diag.
     unsafe {
         if pi == TRACE_PI {
             syscall::debug_puts(b"[trace] open_long path_len=");
