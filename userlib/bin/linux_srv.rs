@@ -2108,20 +2108,6 @@ fn do_open_long(pi: usize, path: &[u8], flags: u64) -> u64 {
         PROC_TABLE[pi].fds[fd].file_size = resp.data[2];
         PROC_TABLE[pi].fds[fd].offset = 0;
     }
-    // Phase 172 diag.
-    unsafe {
-        if pi == TRACE_PI {
-            syscall::debug_puts(b"[trace] open_long path_len=");
-            print_num(path.len() as u64);
-            syscall::debug_puts(b" size=");
-            print_num(resp.data[2]);
-            syscall::debug_puts(b" fs_port=");
-            print_num(resp.data[0]);
-            syscall::debug_puts(b" handle=");
-            print_num(resp.data[1]);
-            syscall::debug_puts(b"\n");
-        }
-    }
     fd as u64
 }
 
@@ -2506,18 +2492,6 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         PROC_TABLE[pi].fds[fd].handle = resp.data[1];
         PROC_TABLE[pi].fds[fd].file_size = resp.data[2];
         PROC_TABLE[pi].fds[fd].offset = 0;
-    }
-    // Phase 172 diag.
-    unsafe {
-        if pi == TRACE_PI {
-            syscall::debug_puts(b"[trace] do_open short pathlen=");
-            print_num(pathlen as u64);
-            syscall::debug_puts(b" size=");
-            print_num(resp.data[2]);
-            syscall::debug_puts(b" fd=");
-            print_num(fd as u64);
-            syscall::debug_puts(b"\n");
-        }
     }
 
     fd as u64
