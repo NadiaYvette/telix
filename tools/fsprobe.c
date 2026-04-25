@@ -163,6 +163,41 @@ void _start(void)
     if (rdbuf[0] != 0x7F || rdbuf[1] != 'E' || rdbuf[2] != 'L' || rdbuf[3] != 'F')
         sys_exit(32);
 
+    /* Test high-offset reads (require ext2 double-indirect blocks).
+     * libc.so.6 is large (~2.4 MB) so any offset > 268*1024 = 274432
+     * needs the double-indirect path in resolve_indirect. */
+    static char hibuf[64];
+    long lr = sys3(SYS_lseek, fd, 0x100000, 0);  /* 1 MiB */
+    wstr(tag);
+    wstr("libc lseek(0x100000) = "); wnum(lr);
+    long hr = sys3(SYS_read, fd, (long)hibuf, 64);
+    wstr(" read(64) = "); wnum(hr);
+    if (hr > 0) {
+        wstr(" first8=");
+        for (int i = 0; i < 8 && i < hr; i++) {
+            whex((unsigned char)hibuf[i]);
+            wstr(" ");
+        }
+    }
+    wstr("\n");
+    if (hr != 64) sys_exit(35);
+
+    /* And way deeper — offset 0x180000 = 1.5 MiB, near .gnu.version */
+    lr = sys3(SYS_lseek, fd, 0x180000, 0);
+    wstr(tag);
+    wstr("libc lseek(0x180000) = "); wnum(lr);
+    hr = sys3(SYS_read, fd, (long)hibuf, 64);
+    wstr(" read(64) = "); wnum(hr);
+    if (hr > 0) {
+        wstr(" first8=");
+        for (int i = 0; i < 8 && i < hr; i++) {
+            whex((unsigned char)hibuf[i]);
+            wstr(" ");
+        }
+    }
+    wstr("\n");
+    if (hr != 64) sys_exit(36);
+
     /* 4) close */
     sys1(SYS_close, fd);
 
