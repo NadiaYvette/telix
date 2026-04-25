@@ -122,6 +122,18 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     else
         echo "  WARNING: hello_wl build failed"
     fi
+    # glibc_dyn_hello: minimal dynamically-linked test for Phase 172e.
+    # Always rebuild against the host's current libc.so.6 so that our
+    # initramfs/lib64/libc.so.6 (also from the host) and this binary
+    # agree on glibc version and ABI.
+    echo "Building glibc_dyn_hello (Phase 172e)..."
+    if gcc -pie -fPIE -O2 -fno-stack-protector -s \
+            -o "$BINDIR/glibc_dyn_hello" "$ROOTDIR/tools/glibc_dyn_hello.c" 2>&1; then
+        echo "  glibc_dyn_hello: $(wc -c < "$BINDIR/glibc_dyn_hello") bytes"
+        cp "$BINDIR/glibc_dyn_hello" "$ROOTDIR/initramfs/glibc_dyn_hello"
+    else
+        echo "  WARNING: glibc_dyn_hello build failed"
+    fi
     # fsprobe: minimal static-PIE Linux probe that exercises the FS
     # path (open + fstat + read) for /lib64/libc.so.6 with NO ld.so /
     # glibc so we can isolate kernel/linux_srv/ext_srv issues from
