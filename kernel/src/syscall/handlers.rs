@@ -2629,6 +2629,17 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
         data_off += slen;
     }
 
+    // Place AT_PLATFORM string ("x86_64\0" on x86-64) on the stack.
+    // Glibc's __init_misc may dereference platform; missing → segfault.
+    static PLATFORM_X86_64: &[u8] = b"x86_64\0";
+    str_pos -= PLATFORM_X86_64.len();
+    let at_platform_addr = str_pos;
+    copy_to_user(new_pt_root, at_platform_addr, PLATFORM_X86_64);
+
+    // AT_EXECFN: a string pointer to the executed program's path.
+    // Use argv[0] if we have one; otherwise re-use the platform string.
+    let at_execfn_addr = if argc > 0 { addr_buf[0] as usize } else { at_platform_addr };
+
     // Align str_pos down to 16 bytes.
     str_pos &= !15;
 
@@ -2654,12 +2665,20 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     const AT_PHNUM: u64 = 5;
     const AT_PAGESZ: u64 = 6;
     const AT_BASE: u64 = 7;
+    const AT_FLAGS: u64 = 8;
     const AT_ENTRY: u64 = 9;
     const AT_UID: u64 = 11;
     const AT_EUID: u64 = 12;
     const AT_GID: u64 = 13;
     const AT_EGID: u64 = 14;
+    const AT_PLATFORM: u64 = 15;
+    const AT_HWCAP: u64 = 16;
+    const AT_CLKTCK: u64 = 17;
+    const AT_SECURE: u64 = 23;
     const AT_RANDOM: u64 = 25;
+    const AT_HWCAP2: u64 = 26;
+    const AT_EXECFN: u64 = 31;
+    const AT_SYSINFO_EHDR: u64 = 33;
 
     let cur_task_id = crate::sched::current_task_id();
     let cur_task = crate::sched::scheduler::task_ref(cur_task_id);
@@ -2671,17 +2690,35 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     // makes well-formed Linux .so files (e.g. libxcvt's small RW
     // segment with diff = 4 KiB) fail the check and load with
     // "ELF load command address/offset not page-aligned".
-    let auxv: [(u64, u64); 12] = [
+    //
+    // The other auxv keys we emit are minimal-but-defensible defaults
+    // glibc looks for during startup:
+    //   AT_PLATFORM   → "x86_64" (used by some libc paths, e.g. nss)
+    //   AT_EXECFN     → argv[0] if present (else the platform string)
+    //   AT_HWCAP/2    → 0 — glibc falls back to non-vector code paths
+    //   AT_CLKTCK     → 100 (the canonical Linux value)
+    //   AT_FLAGS      → 0
+    //   AT_SECURE     → 0 (we don't model setuid yet)
+    //   AT_SYSINFO_EHDR → 0 (no vDSO; glibc handles this gracefully)
+    let auxv: [(u64, u64); 20] = [
         (AT_PHDR, elf_info.phdr_vaddr as u64),
         (AT_PHENT, elf_info.phentsize as u64),
         (AT_PHNUM, elf_info.phnum as u64),
         (AT_PAGESZ, crate::mm::page::MMUPAGE_SIZE as u64),
         (AT_ENTRY, elf_info.entry as u64),
         (AT_BASE, interp_base as u64),
+        (AT_FLAGS, 0),
         (AT_UID, cur_task.uid as u64),
         (AT_EUID, cur_task.euid as u64),
         (AT_GID, cur_task.gid as u64),
         (AT_EGID, cur_task.egid as u64),
+        (AT_PLATFORM, at_platform_addr as u64),
+        (AT_HWCAP, 0),
+        (AT_HWCAP2, 0),
+        (AT_CLKTCK, 100),
+        (AT_SECURE, 0),
+        (AT_SYSINFO_EHDR, 0),
+        (AT_EXECFN, at_execfn_addr as u64),
         (AT_RANDOM, at_random_addr as u64),
         (AT_NULL, 0),
     ];
@@ -3055,6 +3092,15 @@ pub(crate) fn exec_for_task(
         data_off += slen;
     }
 
+    // AT_PLATFORM string ("x86_64\0").  See sys_execve site above for
+    // rationale; both auxv emitters need the same set.
+    static PLATFORM_X86_64: &[u8] = b"x86_64\0";
+    str_pos -= PLATFORM_X86_64.len();
+    let at_platform_addr = str_pos;
+    copy_to_user(new_pt_root, at_platform_addr, PLATFORM_X86_64);
+
+    let at_execfn_addr = if argc > 0 { addr_buf[0] as usize } else { at_platform_addr };
+
     // 16-byte align.
     str_pos &= !15;
 
@@ -3076,27 +3122,44 @@ pub(crate) fn exec_for_task(
     const AT_PHNUM: u64 = 5;
     const AT_PAGESZ: u64 = 6;
     const AT_BASE: u64 = 7;
+    const AT_FLAGS: u64 = 8;
     const AT_ENTRY: u64 = 9;
     const AT_UID: u64 = 11;
     const AT_EUID: u64 = 12;
     const AT_GID: u64 = 13;
     const AT_EGID: u64 = 14;
+    const AT_PLATFORM: u64 = 15;
+    const AT_HWCAP: u64 = 16;
+    const AT_CLKTCK: u64 = 17;
+    const AT_SECURE: u64 = 23;
     const AT_RANDOM: u64 = 25;
+    const AT_HWCAP2: u64 = 26;
+    const AT_EXECFN: u64 = 31;
+    const AT_SYSINFO_EHDR: u64 = 33;
 
     let cur_task = crate::sched::scheduler::task_ref(target_task_id);
     // See AT_PAGESZ note in the other auxv site above: must be MMU page
-    // size for ELF/ld.so alignment checks to make sense.
-    let auxv: [(u64, u64); 12] = [
+    // size for ELF/ld.so alignment checks to make sense.  Other auxv
+    // entries are minimal-but-defensible defaults — see comment there.
+    let auxv: [(u64, u64); 20] = [
         (AT_PHDR, elf_info.phdr_vaddr as u64),
         (AT_PHENT, elf_info.phentsize as u64),
         (AT_PHNUM, elf_info.phnum as u64),
         (AT_PAGESZ, crate::mm::page::MMUPAGE_SIZE as u64),
         (AT_ENTRY, elf_info.entry as u64),
         (AT_BASE, interp_base as u64),
+        (AT_FLAGS, 0),
         (AT_UID, cur_task.uid as u64),
         (AT_EUID, cur_task.euid as u64),
         (AT_GID, cur_task.gid as u64),
         (AT_EGID, cur_task.egid as u64),
+        (AT_PLATFORM, at_platform_addr as u64),
+        (AT_HWCAP, 0),
+        (AT_HWCAP2, 0),
+        (AT_CLKTCK, 100),
+        (AT_SECURE, 0),
+        (AT_SYSINFO_EHDR, 0),
+        (AT_EXECFN, at_execfn_addr as u64),
         (AT_RANDOM, at_random_addr as u64),
         (AT_NULL, 0),
     ];
