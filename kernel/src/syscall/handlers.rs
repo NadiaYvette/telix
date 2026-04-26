@@ -866,6 +866,16 @@ fn sys_send(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
 }
 
 fn sys_send_nb(port_id: u64, tag: u64, data: [u64; 6]) -> u64 {
+    // Explicit cross-CPU full fence: drain the calling CPU's store buffer
+    // and force a memory barrier before queuing this message.  Senders that
+    // wrote into a grant page just before this syscall (e.g. blk_srv writing
+    // disk data into a cache_srv-granted scratch page) need their writes to
+    // be globally visible BEFORE the receiver observes the ready slot, or
+    // the receiver may read stale zeros.  The MPSC queue's Release-Acquire
+    // pair on slot_state in theory covers this, but empirically a missing
+    // fence here was correlating with cache_blk-path zero-data reads under
+    // heavy boot-time concurrency on x86 KVM.
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     if crate::ipc::port::port_node(port_id) != 0 {
         return sys_send_to_proxy(port_id, tag, data, false);
     }
