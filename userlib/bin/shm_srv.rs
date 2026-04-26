@@ -163,7 +163,15 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 };
 
-                let va = match syscall::mmap_anon(0, page_count, 1) {
+                // page_count from the protocol is in alloc pages (historical
+                // semantics — predates the grant_pages mmu-count fix in
+                // dec88a7).  Convert to mmu pages for both mmap_anon and the
+                // subsequent grant_pages calls in SHM_MAP.
+                let ps = syscall::page_size();
+                let mmu_per_alloc = ps / 4096;
+                let mmu_pages = page_count * mmu_per_alloc;
+
+                let va = match syscall::mmap_anon(0, mmu_pages, 1) {
                     Some(v) => v,
                     None => {
                         let _ = syscall::reply(SHM_ERROR, 3, 0, 0, 0, 0);
@@ -173,7 +181,6 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
 
                 // Touch pages to ensure physical backing (grants require it).
                 let ptr = va as *mut u8;
-                let ps = syscall::page_size();
                 for p in 0..page_count {
                     unsafe {
                         core::ptr::write_volatile(ptr.add(p * ps), 0);
@@ -254,7 +261,11 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     continue;
                 }
 
-                if syscall::grant_pages(client_aspace, src_va, dst_va, page_count, readonly) {
+                // page_count is alloc pages; grant_pages takes mmu pages.
+                let ps = syscall::page_size();
+                let mmu_per_alloc = ps / 4096;
+                let mmu_pages = page_count * mmu_per_alloc;
+                if syscall::grant_pages(client_aspace, src_va, dst_va, mmu_pages, readonly) {
                     let _ = syscall::reply(
                         SHM_MAP_OK,
                         handle as u64,
