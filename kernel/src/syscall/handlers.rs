@@ -2964,6 +2964,15 @@ pub(crate) fn exec_for_task(
     // Reset address space: destroy all VMAs/PTEs, free old page table, install new one.
     crate::mm::aspace::reset(aspace_id, new_pt_root);
 
+    // The pre-exec tls_base pointed into the OLD address space, which we just
+    // destroyed.  If we leave the stale value in place the next context switch
+    // will load it into FSBASE and any %fs:0xN access from the new binary
+    // before its runtime calls sys_tls_set will fault with CR2=N.  Zero it so
+    // FSBASE = 0 deterministically until the new program installs its own TLS.
+    unsafe {
+        crate::sched::scheduler::thread_mut_from_ref(target_tid).tls_base = 0;
+    }
+
     // Load ELF segments into the fresh address space.
     // ET_DYN binaries (static-PIE, shared objects) are loaded at a high base
     // address to avoid colliding with the kernel identity gigapages at 0-4GB.

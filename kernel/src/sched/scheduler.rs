@@ -3792,6 +3792,7 @@ pub fn fork_current() -> u64 {
         parent_priority,
         parent_quantum,
         parent_sig_mask,
+        parent_tls_base,
     ) = {
         let tid = smp::current().current_thread.load(Ordering::Relaxed);
         let thread = thread_ref(tid);
@@ -3803,6 +3804,7 @@ pub fn fork_current() -> u64 {
             thread.base_priority,
             thread.default_quantum,
             thread.sig_mask,
+            thread.tls_base,
         )
     };
 
@@ -4009,6 +4011,8 @@ pub fn fork_current() -> u64 {
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;
+    // Inherit FSBASE from parent — see fork_for_task for details.
+    thread.tls_base = parent_tls_base;
 
     percpu_enqueue(smp::cpu_id(), parent_priority, child_tid);
 
@@ -4044,6 +4048,7 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     let parent_priority;
     let parent_quantum;
     let parent_sig_mask;
+    let parent_tls_base;
     {
         let thread = thread_ref(target_tid);
         let task = task_ref(target_task_id);
@@ -4051,6 +4056,7 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
         parent_priority = thread.base_priority;
         parent_quantum = thread.default_quantum;
         parent_sig_mask = thread.sig_mask;
+        parent_tls_base = thread.tls_base;
 
         // RLIMIT_NPROC check.
         let uid = task.uid;
@@ -4237,6 +4243,11 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;
+    // Inherit FSBASE from parent.  Without this, the child wakes with
+    // tls_base=0, and any compiler-emitted `%fs:0x28` access (e.g. glibc's
+    // internal stack-canary loads) faults on first context switch
+    // (project_step_g_flakes.md: CR2=0x28, RIP in compositor canary check).
+    thread.tls_base = parent_tls_base;
 
     percpu_enqueue(smp::cpu_id(), parent_priority, child_tid);
 
@@ -4257,6 +4268,10 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
 /// Copies the parent thread's exception frame, sets return value to 0, applies
 /// the new stack pointer and TLS base.  The new thread resumes at the same IP
 /// as the parent — exactly what Linux clone(CLONE_VM|CLONE_THREAD) expects.
+///
+/// `tls_base` of 0 means "inherit from parent" (matches Linux clone semantics
+/// when CLONE_SETTLS is not set — the child inherits the parent's TLS, NOT a
+/// zero TLS base, otherwise glibc internal `%fs:0xN` accesses fault).
 ///
 /// Returns the new thread's port_id, or u64::MAX on error.
 pub fn clone_thread_in_task(
@@ -4339,7 +4354,12 @@ pub fn clone_thread_in_task(
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;
-    thread.tls_base = tls_base;
+    // tls_base = 0 means "inherit from parent" (Linux clone without CLONE_SETTLS).
+    thread.tls_base = if tls_base == 0 {
+        thread_ref(parent_tid).tls_base
+    } else {
+        tls_base
+    };
 
     let ts = crate::sync::turnstile::alloc_thread_turnstile();
     thread.turnstile.store(ts, Ordering::Relaxed);
