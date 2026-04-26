@@ -1763,28 +1763,30 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Read superblock (at byte offset 1024 within the partition) ---
     let mut sb_buf = [0u8; 512];
     {
+        // Retry on both I/O failure AND bad magic.  The first read after
+        // boot can come back with race-induced zero data even though the
+        // IO_READ_OK reply arrived correctly (see project_phase172_tier1.md
+        // for details).  fat_srv and xfs_srv use the same pattern.
         let mut ok = false;
-        for attempt in 0..5u32 {
+        for attempt in 0..20u32 {
             if blk.read_bytes(1024, &mut sb_buf) {
-                ok = true;
-                break;
+                let magic = read_u16(&sb_buf, 56);
+                if magic == EXT2_SUPER_MAGIC {
+                    ok = true;
+                    break;
+                }
             }
-            if attempt < 4 {
+            if attempt < 19 {
                 syscall::nanosleep(50_000_000);
             }
         }
         if !ok {
-            syscall::debug_puts(b"  [ext_srv] failed to read superblock\n");
+            let final_magic = read_u16(&sb_buf, 56);
+            syscall::debug_puts(b"  [ext_srv] bad magic after retries: ");
+            print_hex(final_magic as u64);
+            syscall::debug_puts(b"\n");
             loop { syscall::nanosleep(1_000_000_000_000); }
         }
-    }
-
-    let magic = read_u16(&sb_buf, 56);
-    if magic != EXT2_SUPER_MAGIC {
-        syscall::debug_puts(b"  [ext_srv] bad magic: ");
-        print_hex(magic as u64);
-        syscall::debug_puts(b"\n");
-        loop { syscall::nanosleep(1_000_000_000_000); }
     }
 
     let log_block_size = read_u32(&sb_buf, 24);
