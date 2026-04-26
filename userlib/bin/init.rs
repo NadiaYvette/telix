@@ -1659,8 +1659,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             };
 
           if blk_buf != 0 {
-            // Grant buffer to blk server.
-            let blk_grant_va: usize = 0x5_0000_0000;
+            // Grant buffer to blk server.  NOTE: must NOT collide with
+            // cache_srv's permanent grant at 0x5_0000_0000 — when this
+            // test revokes, it would tear down cache_srv's mapping in
+            // blk_srv's aspace, breaking every subsequent fs_srv read.
+            // Use a distinct VA: 0xA_0000_0000 (unused range).
+            let blk_grant_va: usize = 0xA_0000_0000;
             syscall::grant_pages(blk_aspace, blk_buf, blk_grant_va, 1, false);
 
             // IO_READ 512 bytes at offset 0 (sector 0 = boot sector).
