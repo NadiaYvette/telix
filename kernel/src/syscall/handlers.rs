@@ -2964,13 +2964,46 @@ pub(crate) fn exec_for_task(
     // Reset address space: destroy all VMAs/PTEs, free old page table, install new one.
     crate::mm::aspace::reset(aspace_id, new_pt_root);
 
-    // The pre-exec tls_base pointed into the OLD address space, which we just
-    // destroyed.  If we leave the stale value in place the next context switch
-    // will load it into FSBASE and any %fs:0xN access from the new binary
-    // before its runtime calls sys_tls_set will fault with CR2=N.  Zero it so
-    // FSBASE = 0 deterministically until the new program installs its own TLS.
-    unsafe {
-        crate::sched::scheduler::thread_mut_from_ref(target_tid).tls_base = 0;
+    // Bootstrap a zero-filled "placeholder TLS" page in the new aspace and
+    // point tls_base at it.  Two reasons:
+    //
+    //   1. The pre-exec tls_base pointed into the OLD aspace, which we just
+    //      destroyed — keeping it would make any %fs:N access fault until
+    //      the new program calls arch_prctl(ARCH_SET_FS, ...).
+    //   2. Static-PIE glibc binaries call canary-protected functions
+    //      (e.g. __libc_start_main, malloc, etc.) BEFORE _start gets to
+    //      arch_prctl.  If tls_base is 0 here, those `mov %fs:0x28, %rax`
+    //      loads fault with CR2=0x28.
+    //
+    // Pointing at a fresh zero page lets %fs:0xN reads return 0 deterministic-
+    // ally; the canary check passes because entry and exit both load the same
+    // zero value.  glibc still overwrites tls_base via sys_tls_set when it
+    // gets to arch_prctl, so this only affects the bootstrap window.
+    //
+    // Use a fixed VA well above the ELF / heap / mmap regions but below the
+    // stack top, so it can't collide with anything load_elf or map_anon does
+    // in the rest of this function.
+    const TLS_PLACEHOLDER_VA: usize = 0x7FFE_0000_0000;
+    {
+        let placeholder_obj = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
+            aspace
+                .map_anon(TLS_PLACEHOLDER_VA, 1, crate::mm::vma::VmaProt::ReadWrite)
+                .map(|vma| vma.object_id)
+        });
+        if let Some(obj_id) = placeholder_obj {
+            if let Some((pa, _)) = crate::mm::object::with_object(obj_id, |obj| obj.ensure_page(0)) {
+                let pa_usize = pa.as_usize();
+                unsafe {
+                    core::ptr::write_bytes(pa_usize as *mut u8, 0, page::page_size());
+                }
+                let sw_z = crate::mm::fault::sw_zeroed_bit();
+                let pte_flags = crate::mm::hat::USER_RW_FLAGS | sw_z;
+                crate::mm::hat::map_single_mmupage(new_pt_root, TLS_PLACEHOLDER_VA, pa_usize, pte_flags);
+                unsafe {
+                    crate::sched::scheduler::thread_mut_from_ref(target_tid).tls_base = TLS_PLACEHOLDER_VA as u64;
+                }
+            }
+        }
     }
 
     // Load ELF segments into the fresh address space.
