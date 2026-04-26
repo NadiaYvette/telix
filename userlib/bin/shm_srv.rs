@@ -167,9 +167,16 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 // semantics — predates the grant_pages mmu-count fix in
                 // dec88a7).  Convert to mmu pages for both mmap_anon and the
                 // subsequent grant_pages calls in SHM_MAP.
-                let ps = syscall::page_size();
-                let mmu_per_alloc = ps / 4096;
-                let mmu_pages = page_count * mmu_per_alloc;
+                //
+                // syscall::page_size() returns MMUPAGE_SIZE (4 KiB) — it's
+                // the unit mmap_anon's page_count expects, not the kernel's
+                // alloc page size.  Hardcode the alloc-page→mmu conversion
+                // for the current 64 KiB page-size build (16 MMU pages per
+                // alloc page).  When the kernel is rebuilt with a different
+                // page_size feature this constant must change in sync.
+                const MMU_PER_ALLOC: usize = 16; // 64 KiB / 4 KiB
+                let ps = syscall::page_size() * MMU_PER_ALLOC;
+                let mmu_pages = page_count * MMU_PER_ALLOC;
 
                 let va = match syscall::mmap_anon(0, mmu_pages, 1) {
                     Some(v) => v,
@@ -262,9 +269,8 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 }
 
                 // page_count is alloc pages; grant_pages takes mmu pages.
-                let ps = syscall::page_size();
-                let mmu_per_alloc = ps / 4096;
-                let mmu_pages = page_count * mmu_per_alloc;
+                const MMU_PER_ALLOC: usize = 16; // 64 KiB / 4 KiB — see SHM_CREATE
+                let mmu_pages = page_count * MMU_PER_ALLOC;
                 if syscall::grant_pages(client_aspace, src_va, dst_va, mmu_pages, readonly) {
                     let _ = syscall::reply(
                         SHM_MAP_OK,
