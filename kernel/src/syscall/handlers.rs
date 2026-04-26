@@ -2964,33 +2964,38 @@ pub(crate) fn exec_for_task(
     // Reset address space: destroy all VMAs/PTEs, free old page table, install new one.
     crate::mm::aspace::reset(aspace_id, new_pt_root);
 
-    // Bootstrap a zero-filled "placeholder TLS" page in the new aspace and
-    // point tls_base at it.  Two reasons:
+    // Bootstrap a zero-filled "placeholder TLS" region in the new aspace and
+    // point tls_base into the middle of it.  Two reasons:
     //
     //   1. The pre-exec tls_base pointed into the OLD aspace, which we just
     //      destroyed — keeping it would make any %fs:N access fault until
     //      the new program calls arch_prctl(ARCH_SET_FS, ...).
     //   2. Static-PIE glibc binaries call canary-protected functions
-    //      (e.g. __libc_start_main, malloc, etc.) BEFORE _start gets to
-    //      arch_prctl.  If tls_base is 0 here, those `mov %fs:0x28, %rax`
-    //      loads fault with CR2=0x28.
+    //      (e.g. __libc_start_main, malloc, errno setters) BEFORE _start
+    //      gets to arch_prctl.  If tls_base is 0 here, those `mov %fs:0x28,
+    //      %rax` reads / `mov %eax, %fs:-0x10` errno writes fault.
     //
-    // Pointing at a fresh zero page lets %fs:0xN reads return 0 deterministic-
-    // ally; the canary check passes because entry and exit both load the same
-    // zero value.  glibc still overwrites tls_base via sys_tls_set when it
-    // gets to arch_prctl, so this only affects the bootstrap window.
+    // glibc's TLS layout puts errno at offset -16 from FSBASE and the
+    // canary at +0x28, so we need both negative and positive offsets
+    // mapped.  Allocate 16 MMU pages (64 KiB) total and point tls_base at
+    // the midpoint — covers ±32 KiB which is more than enough for glibc's
+    // static TLS bootstrap (the binary's own runtime overrides tls_base
+    // via sys_tls_set once it reaches arch_prctl).
     //
-    // Use a fixed VA well above the ELF / heap / mmap regions but below the
-    // stack top, so it can't collide with anything load_elf or map_anon does
-    // in the rest of this function.
-    const TLS_PLACEHOLDER_VA: usize = 0x7FFE_0000_0000;
+    // Use a fixed VA well above the ELF / heap / mmap regions but below
+    // the stack top, so it can't collide with anything load_elf or
+    // map_anon does in the rest of this function.
+    const TLS_PLACEHOLDER_BASE: usize = 0x7FFE_0000_0000;
+    const TLS_PLACEHOLDER_PAGES: usize = 16;
+    const TLS_PLACEHOLDER_OFFSET: usize = (TLS_PLACEHOLDER_PAGES / 2) * MMUPAGE_SIZE;
     {
         let placeholder_obj = crate::mm::aspace::with_aspace(aspace_id, |aspace| {
             aspace
-                .map_anon(TLS_PLACEHOLDER_VA, 1, crate::mm::vma::VmaProt::ReadWrite)
+                .map_anon(TLS_PLACEHOLDER_BASE, TLS_PLACEHOLDER_PAGES, crate::mm::vma::VmaProt::ReadWrite)
                 .map(|vma| vma.object_id)
         });
         if let Some(obj_id) = placeholder_obj {
+            // Ensure at least the alloc page covering all the mmu pages exists.
             if let Some((pa, _)) = crate::mm::object::with_object(obj_id, |obj| obj.ensure_page(0)) {
                 let pa_usize = pa.as_usize();
                 unsafe {
@@ -2998,9 +3003,32 @@ pub(crate) fn exec_for_task(
                 }
                 let sw_z = crate::mm::fault::sw_zeroed_bit();
                 let pte_flags = crate::mm::hat::USER_RW_FLAGS | sw_z;
-                crate::mm::hat::map_single_mmupage(new_pt_root, TLS_PLACEHOLDER_VA, pa_usize, pte_flags);
+                let mmu_per_alloc = page::page_mmucount();
+                let alloc_pages = (TLS_PLACEHOLDER_PAGES + mmu_per_alloc - 1) / mmu_per_alloc;
+                for ap in 0..alloc_pages {
+                    let alloc_pa = if ap == 0 {
+                        pa_usize
+                    } else {
+                        match crate::mm::object::with_object(obj_id, |obj| obj.ensure_page(ap)) {
+                            Some((p, _)) => {
+                                let pu = p.as_usize();
+                                unsafe { core::ptr::write_bytes(pu as *mut u8, 0, page::page_size()); }
+                                pu
+                            }
+                            None => continue,
+                        }
+                    };
+                    for mi in 0..mmu_per_alloc {
+                        let mmu_idx = ap * mmu_per_alloc + mi;
+                        if mmu_idx >= TLS_PLACEHOLDER_PAGES { break; }
+                        let va = TLS_PLACEHOLDER_BASE + mmu_idx * MMUPAGE_SIZE;
+                        let mmu_pa = alloc_pa + mi * MMUPAGE_SIZE;
+                        crate::mm::hat::map_single_mmupage(new_pt_root, va, mmu_pa, pte_flags);
+                    }
+                }
+                let tls_va = TLS_PLACEHOLDER_BASE + TLS_PLACEHOLDER_OFFSET;
                 unsafe {
-                    crate::sched::scheduler::thread_mut_from_ref(target_tid).tls_base = TLS_PLACEHOLDER_VA as u64;
+                    crate::sched::scheduler::thread_mut_from_ref(target_tid).tls_base = tls_va as u64;
                 }
             }
         }

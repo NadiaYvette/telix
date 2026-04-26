@@ -152,6 +152,17 @@ pub const EXCEPTION_FRAME_SIZE: usize = FRAME_SIZE_U64 * 8; // 176 bytes
 /// killed and return fallback_sp.
 #[inline]
 fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
+    // Re-apply the current thread's TLS base before any exception-return
+    // path (syscall, IRQ, fault retry).  Empirically FSBASE drifts to 0 on
+    // x86 KVM when a personality_set_tls runs while the target is parked
+    // and the wake-up race-loses the set_tls call (project_step_g_flakes.md
+    // CR2=0x28 mode).  A single wrmsr here is cheap and makes the bug
+    // disappear.
+    {
+        let tid = crate::sched::scheduler::current_thread_id();
+        let tls = crate::sched::scheduler::thread_ref(tid).tls_base;
+        crate::arch::cpu::set_tls(tls);
+    }
     // Absolute minimum: no valid kstack frame can be below 64K — catch
     // saved_sp=0 or any pointer into the real-mode IVT / BIOS data area.
     if sp < 0x10000 {
