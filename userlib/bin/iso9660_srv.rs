@@ -232,12 +232,13 @@ impl BlkClient {
             }
 
             let copy_len = remaining.min(512 - offset_in_sector);
+            let src = (self.scratch_va + offset_in_sector) as *const u8;
+            let dst = out[buf_off..].as_mut_ptr();
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    (self.scratch_va + offset_in_sector) as *const u8,
-                    out[buf_off..].as_mut_ptr(),
-                    copy_len,
-                );
+                for i in 0..copy_len {
+                    let b = core::ptr::read_volatile(src.add(i));
+                    core::ptr::write_volatile(dst.add(i), b);
+                }
             }
 
             buf_off += copy_len;
@@ -268,12 +269,13 @@ impl BlkClient {
                 return false;
             }
 
+            let src = self.scratch_va as *const u8;
+            let dst = (dest + (s as usize) * 512) as *mut u8;
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    self.scratch_va as *const u8,
-                    (dest + (s as usize) * 512) as *mut u8,
-                    512,
-                );
+                for i in 0..512 {
+                    let b = core::ptr::read_volatile(src.add(i));
+                    core::ptr::write_volatile(dst.add(i), b);
+                }
             }
         }
         true
@@ -306,12 +308,13 @@ impl BlkClient {
             }
 
             let copy_len = remaining.min(512 - offset_in_sector);
+            let src = (self.scratch_va + offset_in_sector) as *const u8;
+            let dst = cur_dest as *mut u8;
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    (self.scratch_va + offset_in_sector) as *const u8,
-                    cur_dest as *mut u8,
-                    copy_len,
-                );
+                for i in 0..copy_len {
+                    let b = core::ptr::read_volatile(src.add(i));
+                    core::ptr::write_volatile(dst.add(i), b);
+                }
             }
 
             cur_dest += copy_len;

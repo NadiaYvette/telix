@@ -158,12 +158,13 @@ impl BlkClient {
 
         let ok = if let Some(rr) = syscall::recv_msg_timeout(self.reply_port, 5_000_000) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
+                let src = self.scratch_va as *const u8;
+                let dst = out.as_mut_ptr();
                 unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        self.scratch_va as *const u8,
-                        out.as_mut_ptr(),
-                        512,
-                    );
+                    for i in 0..512 {
+                        let b = core::ptr::read_volatile(src.add(i));
+                        core::ptr::write_volatile(dst.add(i), b);
+                    }
                 }
                 true
             } else {
@@ -179,9 +180,13 @@ impl BlkClient {
 
     /// Write a single 512-byte sector to disk.
     fn write_sector(&self, sector: u32, data: &[u8; 512]) -> bool {
-        // Copy data into scratch page.
+        let src = data.as_ptr();
+        let dst = self.scratch_va as *mut u8;
         unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), self.scratch_va as *mut u8, 512);
+            for i in 0..512 {
+                let b = core::ptr::read_volatile(src.add(i));
+                core::ptr::write_volatile(dst.add(i), b);
+            }
         }
 
         // Grant our scratch page to blk_srv.

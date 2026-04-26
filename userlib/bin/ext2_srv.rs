@@ -460,12 +460,13 @@ impl BlkClient {
         if let Some(rr) = self.recv_match(nonce) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
                 let copy_len = out.len().min(512 - offset_in_sector);
+                let src = (self.scratch_va + offset_in_sector) as *const u8;
+                let dst = out.as_mut_ptr();
                 unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        (self.scratch_va + offset_in_sector) as *const u8,
-                        out.as_mut_ptr(),
-                        copy_len,
-                    );
+                    for i in 0..copy_len {
+                        let b = core::ptr::read_volatile(src.add(i));
+                        core::ptr::write_volatile(dst.add(i), b);
+                    }
                 }
                 true
             } else {
@@ -509,12 +510,13 @@ impl BlkClient {
 
             let ok = if let Some(rr) = self.recv_match(nonce) {
                 if rr.tag == IO_READ_OK && rr.data[0] == 512 {
+                    let src = self.scratch_va as *const u8;
+                    let dst = (dest + (s as usize) * 512) as *mut u8;
                     unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            self.scratch_va as *const u8,
-                            (dest + (s as usize) * 512) as *mut u8,
-                            512,
-                        );
+                        for i in 0..512 {
+                            let b = core::ptr::read_volatile(src.add(i));
+                            core::ptr::write_volatile(dst.add(i), b);
+                        }
                     }
                     true
                 } else {
@@ -532,8 +534,13 @@ impl BlkClient {
     }
     /// Write a 512-byte sector at absolute byte offset.
     fn write_sector(&self, abs_byte_off: u64, data: &[u8; 512]) -> bool {
+        let src = data.as_ptr();
+        let dst = self.scratch_va as *mut u8;
         unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), self.scratch_va as *mut u8, 512);
+            for i in 0..512 {
+                let b = core::ptr::read_volatile(src.add(i));
+                core::ptr::write_volatile(dst.add(i), b);
+            }
         }
         let nonce = self.next_nonce();
         let d2 = 512u64 | ((self.reply_port as u64) << 32);
@@ -573,12 +580,13 @@ impl BlkClient {
         );
         let ok = if let Some(rr) = self.recv_match(nonce) {
             if rr.tag == IO_READ_OK {
+                let src = self.scratch_va as *const u8;
+                let dst = sec.as_mut_ptr();
                 unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        self.scratch_va as *const u8,
-                        sec.as_mut_ptr(),
-                        512,
-                    );
+                    for i in 0..512 {
+                        let b = core::ptr::read_volatile(src.add(i));
+                        core::ptr::write_volatile(dst.add(i), b);
+                    }
                 }
                 true
             } else {

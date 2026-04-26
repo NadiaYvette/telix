@@ -362,12 +362,13 @@ impl BlkClient {
         if let Some(rr) = self.recv_match(nonce) {
             if rr.tag == IO_READ_OK && rr.data[0] == SECTOR {
                 let copy_len = out.len().min(512 - off_in);
+                let src = (self.scratch_va + off_in) as *const u8;
+                let dst = out.as_mut_ptr();
                 unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        (self.scratch_va + off_in) as *const u8,
-                        out.as_mut_ptr(),
-                        copy_len,
-                    );
+                    for i in 0..copy_len {
+                        let b = core::ptr::read_volatile(src.add(i));
+                        core::ptr::write_volatile(dst.add(i), b);
+                    }
                 }
                 true
             } else {
@@ -397,12 +398,13 @@ impl BlkClient {
                 if let Some(rr) = self.recv_match(nonce) {
                     if rr.tag == IO_READ_OK && rr.data[0] == SECTOR {
                         let chunk = (len - s * 512).min(512);
+                        let src = self.scratch_va as *const u8;
+                        let dst = (dest + s * 512) as *mut u8;
                         unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                self.scratch_va as *const u8,
-                                (dest + s * 512) as *mut u8,
-                                chunk,
-                            );
+                            for i in 0..chunk {
+                                let b = core::ptr::read_volatile(src.add(i));
+                                core::ptr::write_volatile(dst.add(i), b);
+                            }
                         }
                         true
                     } else {
