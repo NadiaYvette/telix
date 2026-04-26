@@ -1316,15 +1316,28 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     // Read boot sector, parse BPB, detect variant.
     // -----------------------------------------------------------------------
 
+    // Retry the boot-sector read.  Under heavy boot-time concurrency the
+    // first read can come back with stale/zero data even though the
+    // server-side reply was IO_READ_OK (see project_phase172_tier1.md
+    // memory-ordering notes).  xfs_srv does the same — without this loop
+    // a single bad read leaves fat_srv stuck in nanosleep forever and
+    // every subsequent FS_OPEN to "fat" times out at the kernel watchdog.
     let mut boot_sector = [0u8; 512];
-    if !blk.read_sector(0, &mut boot_sector) {
-        syscall::debug_puts(b"  [fat_srv] boot sector read failed\n");
-        loop {
-            syscall::nanosleep(1_000_000_000_000);
+    let mut boot_ok = false;
+    for _ in 0..20 {
+        if blk.read_sector(0, &mut boot_sector)
+            && boot_sector[510] == 0x55
+            && boot_sector[511] == 0xAA
+        {
+            boot_ok = true;
+            break;
+        }
+        for _ in 0..100 {
+            syscall::yield_now();
         }
     }
-    if boot_sector[510] != 0x55 || boot_sector[511] != 0xAA {
-        syscall::debug_puts(b"  [fat_srv] bad boot signature\n");
+    if !boot_ok {
+        syscall::debug_puts(b"  [fat_srv] bad boot signature after retries\n");
         loop {
             syscall::nanosleep(1_000_000_000_000);
         }
