@@ -2186,6 +2186,20 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  [btrfs_srv] mount failed after retries\n");
                 loop { syscall::nanosleep(1_000_000_000_000); }
             }
+            // Invalidate cached pages covering the superblock + a generous
+            // window around it.  Cache_blk's read-ahead caches a 4 KiB page
+            // on the first miss; if that first read returned race-induced
+            // bad data, every subsequent retry hits the cache and reads the
+            // same bad data.  Drop those cached pages so the next attempt
+            // re-fetches from blk_srv.
+            const CACHE_INVALIDATE: u64 = 0xC110;
+            let nonce = blk.next_nonce();
+            let abs_off = blk.partition_offset + BTRFS_SUPER_OFFSET;
+            let d2 = (4096u64) | ((blk.reply_port as u64) << 32);
+            syscall::send(blk.blk_port, CACHE_INVALIDATE, nonce, abs_off, d2, 0);
+            // Drain the OK reply (best-effort — if it never arrives we just
+            // sleep below anyway).
+            let _ = blk.recv_match(nonce);
             syscall::nanosleep(200_000_000); // 200 ms between retries
         }
     };

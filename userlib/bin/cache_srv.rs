@@ -31,6 +31,12 @@ const IO_ERROR: u64 = 0xF00;
 
 const CACHE_STATS: u64 = 0xC100;
 const CACHE_STATS_OK: u64 = 0xC101;
+/// Invalidate cached pages covering [offset, offset+length).
+/// Lets fs_srvs recover from boot-time race-induced bad data: detect
+/// "bad magic" / wrong content, send CACHE_INVALIDATE for that region,
+/// then retry the read so cache_srv re-fetches from blk_srv.
+const CACHE_INVALIDATE: u64 = 0xC110;
+const CACHE_INVALIDATE_OK: u64 = 0xC111;
 
 const SECTOR_SIZE: usize = 512;
 const MMUPAGE_SIZE: usize = 4096;
@@ -283,6 +289,23 @@ impl PageCache {
                 core::ptr::copy_nonoverlapping(data, dst, bytes);
             }
             self.entries[slot].referenced = true;
+        }
+    }
+
+    /// Evict every cached page that covers any byte in [offset, offset+length).
+    /// Does nothing if the page is not currently cached.
+    fn invalidate_range(&mut self, offset: usize, length: usize) {
+        if length == 0 {
+            return;
+        }
+        let first_page = (offset / MMUPAGE_SIZE) as u64;
+        let last_page = ((offset + length - 1) / MMUPAGE_SIZE) as u64;
+        for page_number in first_page..=last_page {
+            if let Some(slot) = self.lookup(page_number) {
+                self.hash_remove(page_number);
+                self.entries[slot].page_number = INVALID;
+                self.occupied -= 1;
+            }
         }
     }
 }
@@ -627,6 +650,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     CACHE_ENTRIES as u64,
                     cache.occupied as u64,
                 );
+            }
+
+            CACHE_INVALIDATE => {
+                // Request: d0 = nonce/request_id (echoed in reply d1),
+                //          d1 = byte offset, d2 = length | reply_port<<32.
+                let request_id = msg.data[0];
+                let offset = msg.data[1] as usize;
+                let length = (msg.data[2] & 0xFFFF_FFFF) as usize;
+                let reply_port = msg.data[2] >> 32;
+                cache.invalidate_range(offset, length);
+                syscall::send_nb_4(reply_port, CACHE_INVALIDATE_OK, 0, request_id, 0, 0);
             }
 
             _ => {}
