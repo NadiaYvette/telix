@@ -572,21 +572,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 core::ptr::write_volatile(dst.add(i), b);
                             }
                         }
-                        // Empirically the receiver can see stale zeros if we
-                        // send the IPC reply too quickly after the grant-page
-                        // write — even though Rust's SeqCst fence in user
-                        // space and the kernel-side SeqCst fence at
-                        // sys_send_nb entry should both drain the store
-                        // buffer.  Mirror the trick (Acquire fence + sleep)
-                        // already used in BlkClient::recv_match.  This
-                        // narrows the race; for fs_srvs that hit it anyway
-                        // (mostly first-read superblock checks) the retry
-                        // path uses CACHE_INVALIDATE to force a re-fetch.
-                        #[cfg(target_arch = "x86_64")]
-                        unsafe {
-                            core::arch::asm!("mfence", options(nostack, preserves_flags));
-                        }
-                        syscall::nanosleep(1_000);
                         // Release fence so the receiver (on another CPU) sees
                         // our writes to grant_va before observing the reply
                         // notification in the IPC port.
