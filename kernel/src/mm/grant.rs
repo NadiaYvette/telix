@@ -22,26 +22,33 @@ pub enum GrantError {
     PteFailed,
 }
 
-/// Grant `page_count` allocation pages from one address space to another.
+/// Grant `mmu_page_count` MMU pages from one address space to another.
 ///
 /// The source pages must already be backed by physical memory (allocated).
 /// The destination gets a shared VMA backed by the same memory object.
-/// PTEs are eagerly installed for all allocated pages.
+/// PTEs are eagerly installed for the requested MMU pages — and *only* those
+/// pages.  Earlier versions installed `page_mmucount()` PTEs per allocation
+/// page (16 for 64 KiB pages), which caused overlapping installs across
+/// neighbouring 4 KiB grant_va values to silently overwrite each other's
+/// PTEs (project_grant_pages_phys_mismatch.md).
 pub fn grant_pages(
     src_aspace: ASpaceId,
     src_va: usize,
     dst_aspace: ASpaceId,
     dst_va: usize,
-    page_count: usize,
+    mmu_page_count: usize,
     readonly: bool,
 ) -> Result<(), GrantError> {
+    let pmc = page::page_mmucount();
+    let alloc_page_count = (mmu_page_count + pmc - 1) / pmc;
+
     // Step 1: Look up the source VMA and collect its object ID + offset + phys pages.
     let (obj_id, obj_mmu_offset, phys_pages) = aspace::with_aspace(src_aspace, |aspace| {
         let vma = aspace.find_vma(src_va).ok_or(GrantError::NoSourceVma)?;
         let mmu_idx_start = vma.mmu_index_of(src_va);
         let mut pages = [0usize; 256];
-        for i in 0..page_count {
-            let obj_page = vma.obj_page_index(mmu_idx_start + i * page::page_mmucount());
+        for i in 0..alloc_page_count {
+            let obj_page = vma.obj_page_index(mmu_idx_start + i * pmc);
             let pa = object::with_object(vma.object_id, |obj| {
                 obj.get_page(obj_page).map(|p| p.as_usize())
             });
@@ -64,13 +71,15 @@ pub fn grant_pages(
         } else {
             VmaProt::ReadWrite
         };
-        let va_len = page_count * page::page_size();
+        // VMA covers exactly the requested MMU range, not a rounded-up
+        // alloc-page multiple — neighbouring grants must not overlap.
+        let va_len = mmu_page_count * MMUPAGE_SIZE;
         let _vma = aspace
             .vmas
             .insert(dst_va, va_len, prot, obj_id, obj_mmu_offset)
             .ok_or(GrantError::DestMapFailed)?;
 
-        // Step 4: Install PTEs for all MMU pages that have physical backing.
+        // Step 4: Install PTEs ONLY for the requested MMU pages.
         let pt_root = aspace.page_table_root;
         let flags = if readonly {
             user_ro_flags()
@@ -78,18 +87,16 @@ pub fn grant_pages(
             user_rw_flags()
         };
 
-        let pmc = page::page_mmucount();
-        for page_i in 0..page_count {
+        for mmu_idx in 0..mmu_page_count {
+            let page_i = mmu_idx / pmc;
+            let mmu_i = mmu_idx % pmc;
             let pa_base = phys_pages[page_i];
             if pa_base == 0 {
                 continue;
             }
-            for mmu_i in 0..pmc {
-                let mmu_idx = page_i * pmc + mmu_i;
-                let va = dst_va + mmu_idx * MMUPAGE_SIZE;
-                let pa = pa_base + mmu_i * MMUPAGE_SIZE;
-                map_single_mmupage(pt_root, va, pa, flags | sw_zeroed_bit());
-            }
+            let va = dst_va + mmu_idx * MMUPAGE_SIZE;
+            let pa = pa_base + mmu_i * MMUPAGE_SIZE;
+            map_single_mmupage(pt_root, va, pa, flags | sw_zeroed_bit());
         }
 
         Ok(())

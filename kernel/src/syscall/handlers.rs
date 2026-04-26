@@ -1690,15 +1690,12 @@ fn sys_grant_pages(dst_port: u64, src_va: u64, dst_va: u64, page_count: u64, rea
     };
     let dst_aspace = crate::sched::scheduler::task_ref(dst_task).aspace_id;
     // page_count from userspace is in MMU pages (matching mmap_anon convention).
-    // Convert to allocation pages for grant::grant_pages.
-    let mmu_count = crate::mm::page::page_mmucount();
-    let alloc_pages = (page_count as usize + mmu_count - 1) / mmu_count;
     match crate::mm::grant::grant_pages(
         my_aspace,
         src_va as usize,
         dst_aspace,
         dst_va as usize,
-        alloc_pages,
+        page_count as usize,
         readonly != 0,
     ) {
         Ok(()) => 0,
@@ -1737,8 +1734,6 @@ fn sys_grant_pages_lease(
         },
     };
     let dst_aspace = crate::sched::scheduler::task_ref(dst_task).aspace_id;
-    let mmu_count = crate::mm::page::page_mmucount();
-    let alloc_pages = (page_count as usize + mmu_count - 1) / mmu_count;
 
     // Reserve a pending-lease slot on the current thread BEFORE granting, so
     // a full buffer fails fast (without leaving an orphan grant).
@@ -1755,7 +1750,7 @@ fn sys_grant_pages_lease(
         src_va as usize,
         dst_aspace,
         dst_va as usize,
-        alloc_pages,
+        page_count as usize,
         readonly != 0,
     ) {
         Ok(()) => {

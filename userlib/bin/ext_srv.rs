@@ -1754,7 +1754,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         blk_aspace,
         reply_port: blk_reply,
         scratch_va,
-        grant_va: 0x6_0000_0000,
+        grant_va: 0x6_0000_6000,
         partition_offset,
         nonce: Cell::new(0),
     };
