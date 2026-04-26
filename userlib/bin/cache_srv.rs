@@ -577,10 +577,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         // write — even though Rust's SeqCst fence in user
                         // space and the kernel-side SeqCst fence at
                         // sys_send_nb entry should both drain the store
-                        // buffer.  A 1 µs nanosleep here closes the window;
-                        // the same trick (Acquire fence + 1 µs sleep) is
-                        // already used in BlkClient::recv_match across all
-                        // fs_srvs for the symmetric race.
+                        // buffer.  Mirror the trick (Acquire fence + sleep)
+                        // already used in BlkClient::recv_match.  This
+                        // narrows the race; for fs_srvs that hit it anyway
+                        // (mostly first-read superblock checks) the retry
+                        // path uses CACHE_INVALIDATE to force a re-fetch.
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
                             core::arch::asm!("mfence", options(nostack, preserves_flags));

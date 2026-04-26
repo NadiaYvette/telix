@@ -2638,12 +2638,20 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     // Read boot sector (sector 0 of partition).
     let mut boot = [0u8; 512];
     let mut read_ok = false;
-    for _ in 0..20 {
+    for attempt in 0..20 {
         if blk.read_bytes(0, &mut boot) {
             if boot[3] == b'N' && boot[4] == b'T' && boot[5] == b'F' && boot[6] == b'S' {
                 read_ok = true;
                 break;
             }
+        }
+        if attempt > 0 {
+            const CACHE_INVALIDATE: u64 = 0xC110;
+            let nonce = blk.next_nonce();
+            let abs_off = blk.partition_offset;
+            let d2 = 4096u64 | ((blk.reply_port as u64) << 32);
+            syscall::send(blk.blk_port, CACHE_INVALIDATE, nonce, abs_off, d2, 0);
+            let _ = blk.recv_match(nonce);
         }
         for _ in 0..100 {
             syscall::yield_now();

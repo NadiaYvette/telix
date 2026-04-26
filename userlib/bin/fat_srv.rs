@@ -1330,13 +1330,25 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     // every subsequent FS_OPEN to "fat" times out at the kernel watchdog.
     let mut boot_sector = [0u8; 512];
     let mut boot_ok = false;
-    for _ in 0..20 {
+    for attempt in 0..20 {
         if blk.read_sector(0, &mut boot_sector)
             && boot_sector[510] == 0x55
             && boot_sector[511] == 0xAA
         {
             boot_ok = true;
             break;
+        }
+        // Drop any cache_blk page that covers the boot sector before
+        // retrying — otherwise we just re-read the same race-poisoned
+        // cached zeros every time.  Same idiom as btrfs_srv on its SB
+        // retry path.
+        if attempt > 0 {
+            const CACHE_INVALIDATE: u64 = 0xC110;
+            let nonce = blk.next_nonce();
+            let abs_off = blk.partition_offset;
+            let d2 = 4096u64 | ((blk.reply_port as u64) << 32);
+            syscall::send(blk.blk_port, CACHE_INVALIDATE, nonce, abs_off, d2, 0);
+            let _ = blk.recv_match(nonce);
         }
         for _ in 0..100 {
             syscall::yield_now();

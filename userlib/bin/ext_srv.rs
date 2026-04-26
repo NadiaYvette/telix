@@ -1784,6 +1784,17 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     break;
                 }
             }
+            if attempt > 0 {
+                // Evict cache_blk's page covering the SB so the next attempt
+                // re-fetches from blk_srv (race-poisoned cache page would
+                // otherwise hand back zeros forever).
+                const CACHE_INVALIDATE: u64 = 0xC110;
+                let nonce = blk.next_nonce();
+                let abs_off = blk.partition_offset + 1024;
+                let d2 = 4096u64 | ((blk.reply_port as u64) << 32);
+                syscall::send(blk.blk_port, CACHE_INVALIDATE, nonce, abs_off, d2, 0);
+                let _ = blk.recv_match(nonce);
+            }
             if attempt < 19 {
                 syscall::nanosleep(50_000_000);
             }

@@ -2638,14 +2638,25 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"\n");
 
     let mut sb_buf = [0u8; 512];
-    // Retry reads — cache_blk may not be fully ready yet.
+    // Retry reads — cache_blk may not be fully ready yet, and the first
+    // read can come back race-poisoned with zero data even on IO_READ_OK
+    // (project_phase172_tier1.md).  On retry, evict any cached page that
+    // covers the SB so we re-fetch from blk_srv.
     let mut read_ok = false;
-    for _ in 0..20 {
+    for attempt in 0..20 {
         if blk.read_bytes(0, &mut sb_buf) {
             if read_be32(&sb_buf, 0) == XFS_SB_MAGIC {
                 read_ok = true;
                 break;
             }
+        }
+        if attempt > 0 {
+            const CACHE_INVALIDATE: u64 = 0xC110;
+            let nonce = blk.next_nonce();
+            let abs_off = blk.partition_offset;
+            let d2 = 4096u64 | ((blk.reply_port as u64) << 32);
+            syscall::send(blk.blk_port, CACHE_INVALIDATE, nonce, abs_off, d2, 0);
+            let _ = blk.recv_match(nonce);
         }
         for _ in 0..100 {
             syscall::yield_now();
