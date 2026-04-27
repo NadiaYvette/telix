@@ -216,13 +216,12 @@ impl PageCache {
             if sector < max_sectors {
                 let mut buf = [0u8; SECTOR_SIZE];
                 if blk.read_sector(sector, &mut buf) {
-                    let src = buf.as_ptr();
-                    let dst = (dest_base + i * SECTOR_SIZE) as *mut u8;
                     unsafe {
-                        for j in 0..SECTOR_SIZE {
-                            let b = core::ptr::read_volatile(src.add(j));
-                            core::ptr::write_volatile(dst.add(j), b);
-                        }
+                        core::ptr::copy_nonoverlapping(
+                            buf.as_ptr(),
+                            (dest_base + i * SECTOR_SIZE) as *mut u8,
+                            SECTOR_SIZE,
+                        );
                     }
                 } else {
                     ok = false;
@@ -362,20 +361,12 @@ impl BlkClient {
 
         if let Some(rr) = self.recv_match(nonce) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
-                // Volatile byte-by-byte copy from scratch_va to out.
-                // Empirically `core::ptr::copy_nonoverlapping` after recv
-                // can return all-zeros even when blk_srv has clearly
-                // written the right data into the granted page (verified
-                // with a separate volatile read in the same function).
-                // Forcing volatile loads bypasses whatever cached / lifted
-                // load LLVM is generating from the regular memcpy.
-                let src = self.scratch_va as *const u8;
-                let dst = out.as_mut_ptr();
                 unsafe {
-                    for i in 0..512 {
-                        let b = core::ptr::read_volatile(src.add(i));
-                        core::ptr::write_volatile(dst.add(i), b);
-                    }
+                    core::ptr::copy_nonoverlapping(
+                        self.scratch_va as *const u8,
+                        out.as_mut_ptr(),
+                        512,
+                    );
                 }
                 true
             } else {
@@ -562,15 +553,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if let Some((ptr, bytes_read)) = cache.read(&blk, offset, length, max_sectors) {
                     if grant_va != 0 {
                         let dst = grant_va as *mut u8;
-                        // Volatile byte-by-byte copy.  Empirically a plain
-                        // memcpy here can deliver zeros to the fs_srv even
-                        // though the cache buffer holds correct data (same
-                        // class of bug as the read path inside BlkClient).
                         unsafe {
-                            for i in 0..bytes_read {
-                                let b = core::ptr::read_volatile(ptr.add(i));
-                                core::ptr::write_volatile(dst.add(i), b);
-                            }
+                            core::ptr::copy_nonoverlapping(ptr, dst, bytes_read);
                         }
                         // Release fence so the receiver (on another CPU) sees
                         // our writes to grant_va before observing the reply
