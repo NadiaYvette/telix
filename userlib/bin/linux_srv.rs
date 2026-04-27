@@ -4147,6 +4147,30 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let file_offset = real_arg5;
 
     if len == 0 { return linux_err(EINVAL); }
+    // DIAG for Step H investigation: print mmap() args that pass a real fd.
+    if fd >= 0 {
+        syscall::debug_puts(b"  [linux_srv MMAP DIAG] fd=");
+        let mut buf = [0u8; 20]; let mut v = fd as u64; let mut i = 20;
+        if v == 0 { i -= 1; buf[i] = b'0'; }
+        while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+        syscall::debug_puts(&buf[i..20]);
+        syscall::debug_puts(b" off=");
+        let mut buf = [0u8; 20]; let mut v = file_offset; let mut i = 20;
+        if v == 0 { i -= 1; buf[i] = b'0'; }
+        while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+        syscall::debug_puts(&buf[i..20]);
+        syscall::debug_puts(b" len=");
+        let mut buf = [0u8; 20]; let mut v = len as u64; let mut i = 20;
+        if v == 0 { i -= 1; buf[i] = b'0'; }
+        while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+        syscall::debug_puts(&buf[i..20]);
+        syscall::debug_puts(b" addr=");
+        let mut buf = [0u8; 20]; let mut v = addr; let mut i = 20;
+        if v == 0 { i -= 1; buf[i] = b'0'; }
+        while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+        syscall::debug_puts(&buf[i..20]);
+        syscall::debug_puts(b"\n");
+    }
 
     let page_size = syscall::page_size() as usize;
     let pages = ((len + page_size - 1) / page_size) as u64;
