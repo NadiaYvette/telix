@@ -1979,6 +1979,13 @@ fn handle_sendfile(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     total as u64
 }
 
+/// MMU pages of scratch granted to FS servers for FS_READ / VFS_OPEN_LONG.
+/// Sized to match `MAX_BLOCKS_PER_REPLY` (=4) in ext_srv's FS_READ multi-
+/// block fill — 4 × 4 KiB = 16 KiB lets ext_srv pack up to 4 file blocks
+/// per reply, cutting the IPC count for large mmap reads (libc.so.6,
+/// ~ 2 MB) by 4×.  Path forwarding via VFS only uses the first page.
+const FS_SCRATCH_PAGES: usize = 4;
+
 /// Lazily allocate the long-path scratch page and grant it to vfs_task at
 /// LIN_SCRATCH_REMOTE_VA. Returns true if scratch is ready to use.
 fn ensure_lin_path_scratch() -> bool {
@@ -1986,7 +1993,7 @@ fn ensure_lin_path_scratch() -> bool {
         if LIN_PATH_SCRATCH_LOCAL != 0 {
             return true;
         }
-        let va = match syscall::mmap_anon(0, 1, 1) {
+        let va = match syscall::mmap_anon(0, FS_SCRATCH_PAGES, 1) {
             Some(v) => v,
             None => return false,
         };
@@ -1994,8 +2001,9 @@ fn ensure_lin_path_scratch() -> bool {
         if vfs_task == 0 {
             return false;
         }
-        // RW grant: VFS will normalize-in-place if needed (but with our normalize
-        // happening before we send, we could go RO; keep RW for flexibility).
+        // RW grant: VFS will normalize-in-place if needed.  VFS only
+        // needs the first page for path forwarding; the rest is
+        // reserved for FS_READ bulk fills via ensure_fs_scratch_grants.
         if !syscall::grant_pages(vfs_task, va, LIN_SCRATCH_REMOTE_VA, 1, false) {
             return false;
         }
@@ -2034,7 +2042,7 @@ fn ensure_fs_scratch_grants() {
                 fs_task,
                 LIN_PATH_SCRATCH_LOCAL,
                 LIN_FS_SCRATCH_VA,
-                1,
+                FS_SCRATCH_PAGES,
                 false,
             ) {
                 FS_SCRATCH_GRANTED_MASK |= bit;
@@ -2053,7 +2061,8 @@ fn fs_read_bulk(fs_port: u64, handle: u64, offset: u64, max_len: usize) -> Optio
             return None;
         }
     }
-    let length = max_len.min(4096) as u64;
+    // Bulk grant is FS_SCRATCH_PAGES × 4 KiB; cap requested length to that.
+    let length = max_len.min(FS_SCRATCH_PAGES * 4096) as u64;
     let d2 = length & 0xFFFF_FFFF;
     let resp = match syscall::call(fs_port, FS_READ, handle, offset, d2, LIN_FS_SCRATCH_VA as u64) {
         Some(m) => m,
@@ -2449,7 +2458,21 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
     }
 
     let d2 = (pathlen as u64) | ((flags & 0xFFFF) << 16);
-    let resp = match syscall::call(vfs_port, VFS_OPEN, w0, w1, d2, 0) {
+    // Retry up to 3× on CALL_REPLY_SERVER_DIED (transient kernel
+    // 10 s watchdog fire on a stale reply slot for vfs_srv); see the
+    // matching pattern in do_open_long.  Without retry, an open of
+    // /lib64/libc.so.6 (16-char path → short VFS_OPEN) under boot
+    // contention falls through to the Dir-FD fallback below and ld.so
+    // reads it as a 0-byte "directory", surfacing as "file too short".
+    const SERVER_DIED: u64 = 0xFFFF_FFFF_FFFF_FE00;
+    let mut resp_opt = None;
+    for _ in 0..3 {
+        match syscall::call(vfs_port, VFS_OPEN, w0, w1, d2, 0) {
+            Some(m) if m.tag != SERVER_DIED => { resp_opt = Some(m); break; }
+            _ => { syscall::sleep_ms(1); }
+        }
+    }
+    let resp = match resp_opt {
         Some(m) => m,
         None => return linux_err(ENOENT),
     };
