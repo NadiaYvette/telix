@@ -2090,7 +2090,24 @@ fn do_open_long(pi: usize, path: &[u8], flags: u64) -> u64 {
         return linux_err(ENOENT);
     }
     let d0 = (n as u64) | ((flags & 0xFFFF) << 16);
-    let resp = match syscall::call(vfs_port, VFS_OPEN_LONG, d0, 0, 0, 0) {
+    // The kernel's 10s CALL_REPLY watchdog can occasionally fire on a
+    // stale reply slot for vfs_srv (especially during boot when many
+    // FS clients connect at once), returning CALL_REPLY_SERVER_DIED
+    // (0xFFFF_FFFF_FFFF_FE00) instead of a real reply.  Retry up to 3
+    // times so callers like ld.so don't have to keep re-opening the
+    // same path and burning their own budget.
+    const SERVER_DIED: u64 = 0xFFFF_FFFF_FFFF_FE00;
+    let mut resp_opt = None;
+    for _ in 0..3 {
+        match syscall::call(vfs_port, VFS_OPEN_LONG, d0, 0, 0, 0) {
+            Some(m) if m.tag != SERVER_DIED => { resp_opt = Some(m); break; }
+            _ => {
+                // Brief backoff before retrying.
+                syscall::sleep_ms(1);
+            }
+        }
+    }
+    let resp = match resp_opt {
         Some(m) => m,
         None => return linux_err(ENOENT),
     };
