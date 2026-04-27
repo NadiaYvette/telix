@@ -216,16 +216,13 @@ impl PageCache {
             if sector < max_sectors {
                 let mut buf = [0u8; SECTOR_SIZE];
                 if blk.read_sector(sector, &mut buf) {
-                    // Volatile byte loop — buf is local but the cache page
-                    // (dest_base) is shared via grant_pages with fs_srvs;
-                    // empirically still needs volatile to round-trip
-                    // correctly through the cache_blk handoff.
-                    let src = buf.as_ptr();
-                    let dst = (dest_base + i * SECTOR_SIZE) as *mut u8;
+                    // Volatile u64 loop — see read_sector for why.
+                    let src = buf.as_ptr() as *const u64;
+                    let dst = (dest_base + i * SECTOR_SIZE) as *mut u64;
                     unsafe {
-                        for j in 0..SECTOR_SIZE {
-                            let b = core::ptr::read_volatile(src.add(j));
-                            core::ptr::write_volatile(dst.add(j), b);
+                        for j in 0..(SECTOR_SIZE / 8) {
+                            let v = core::ptr::read_volatile(src.add(j));
+                            core::ptr::write_volatile(dst.add(j), v);
                         }
                     }
                 } else {
@@ -366,17 +363,16 @@ impl BlkClient {
 
         if let Some(rr) = self.recv_match(nonce) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
-                // Volatile byte loop — empirically required.  compiler_fence
+                // Volatile u64 loop — empirically required (compiler_fence
                 // alone is NOT sufficient; LLVM still elides reads from the
-                // grant page even after Acquire fence (likely because the
-                // page contents post-mmap_anon are tracked as "all zeros"
-                // by some pass that runs after the fence visibility check).
-                let src = self.scratch_va as *const u8;
-                let dst = out.as_mut_ptr();
+                // grant page).  u64 stride is 8× fewer iterations than the
+                // byte loop while still producing real load/store insns.
+                let src = self.scratch_va as *const u64;
+                let dst = out.as_mut_ptr() as *mut u64;
                 unsafe {
-                    for i in 0..512 {
-                        let b = core::ptr::read_volatile(src.add(i));
-                        core::ptr::write_volatile(dst.add(i), b);
+                    for i in 0..64 {
+                        let v = core::ptr::read_volatile(src.add(i));
+                        core::ptr::write_volatile(dst.add(i), v);
                     }
                 }
                 true
@@ -564,9 +560,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if let Some((ptr, bytes_read)) = cache.read(&blk, offset, length, max_sectors) {
                     if grant_va != 0 {
                         let dst = grant_va as *mut u8;
-                        // Volatile byte loop — see read_sector above for why.
+                        // Volatile u64 loop — see read_sector for why.
+                        // Tail bytes (when bytes_read isn't a multiple of 8)
+                        // fall through to a byte loop so we don't read past
+                        // the requested range.
+                        let words = bytes_read / 8;
+                        let tail_start = words * 8;
+                        let src_u64 = ptr as *const u64;
+                        let dst_u64 = dst as *mut u64;
                         unsafe {
-                            for i in 0..bytes_read {
+                            for i in 0..words {
+                                let v = core::ptr::read_volatile(src_u64.add(i));
+                                core::ptr::write_volatile(dst_u64.add(i), v);
+                            }
+                            for i in tail_start..bytes_read {
                                 let b = core::ptr::read_volatile(ptr.add(i));
                                 core::ptr::write_volatile(dst.add(i), b);
                             }
