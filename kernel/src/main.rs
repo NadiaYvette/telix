@@ -701,6 +701,24 @@ fn startup_thread() -> ! {
         }
     }
 
+    // Spawn ISO 9660 filesystem server.
+    // ISO image appended at 32 MiB offset (see tools/make-iso9660.sh).
+    // Pre-spawning here (rather than inline at Phase 177) gives the server
+    // time to IO_CONNECT to cache_blk and parse the PVD before any client
+    // calls in.  Without this, Phase 177 races the server's init and the
+    // first FS_OPEN times out for 10s.
+    match sched::spawn_user(b"iso9660_srv", 50, 20, 32 * 1024 * 1024) {
+        Some(tid) => println!("  iso9660_srv spawned (thread {})", tid),
+        None => println!("  WARNING: iso9660_srv not found (ok if not yet built)"),
+    }
+
+    // Spawn UDF filesystem server.
+    // UDF image appended at 35 MiB offset (see tools/make-udf.sh).
+    match sched::spawn_user(b"udf_srv", 50, 20, 35 * 1024 * 1024) {
+        Some(tid) => println!("  udf_srv spawned (thread {})", tid),
+        None => println!("  WARNING: udf_srv not found (ok if not yet built)"),
+    }
+
     // Spawn ramdisk server (userspace, no data copy needed).
     match sched::spawn_user(b"ramdisk_srv", 50, 20, 0) {
         Some(tid) => println!("  ramdisk_srv spawned (thread {})", tid),

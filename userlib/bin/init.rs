@@ -4812,7 +4812,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         #[allow(dead_code)]
         const FS_ERROR: u64 = 0x2F00;
 
-        let iso_tid = syscall::spawn_with_arg(b"iso9660_srv", 50, ISO_OFFSET);
+        // iso9660_srv is pre-spawned at boot in kernel/src/main.rs; only
+        // spawn here as a fallback if it isn't already registered.  Spawning
+        // a second instance would race (both would try to ns_register
+        // "iso9660" and only one wins) and steal cache_blk grant_va.
+        let iso_tid = if syscall::ns_lookup(b"iso9660").is_some() {
+            0u64 // sentinel: already running
+        } else {
+            syscall::spawn_with_arg(b"iso9660_srv", 50, ISO_OFFSET)
+        };
         if iso_tid != u64::MAX {
             // Wait for iso9660_srv to register.
             let iso_port = {
@@ -4967,8 +4975,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Phase 178: UDF filesystem server ---
     syscall::debug_puts(b"  init: Phase 178 UDF filesystem...\n");
     {
-        // UDF image is at offset 34 MiB in test.img.
-        const UDF_OFFSET: u64 = 34 * 1024 * 1024;
+        // UDF image is at offset 35 MiB in test.img (see tools/make-udf.sh).
+        const UDF_OFFSET: u64 = 35 * 1024 * 1024;
         const FS_OPEN: u64 = 0x2000;
         const FS_OPEN_OK: u64 = 0x2001;
         const FS_READ: u64 = 0x2100;
@@ -4983,7 +4991,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         #[allow(dead_code)]
         const FS_ERROR: u64 = 0x2F00;
 
-        let udf_tid = syscall::spawn_with_arg(b"udf_srv", 50, UDF_OFFSET);
+        // udf_srv is pre-spawned at boot in kernel/src/main.rs; only
+        // spawn here as a fallback if it isn't already registered.
+        let udf_tid = if syscall::ns_lookup(b"udf").is_some() {
+            0u64
+        } else {
+            syscall::spawn_with_arg(b"udf_srv", 50, UDF_OFFSET)
+        };
         if udf_tid != u64::MAX {
             // Wait for udf_srv to register.
             let udf_port = {
@@ -8140,7 +8154,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::personality_set(child, 2, abi);
 
                 let mut exit_code: i64 = -1;
-                for _ in 0..3000 {
+                for _ in 0..9000 {
                     if let Some(code) = syscall::waitpid(child) {
                         exit_code = code as i64;
                         break;
