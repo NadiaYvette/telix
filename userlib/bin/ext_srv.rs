@@ -2072,32 +2072,84 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     ((sb.block_size as usize) - offset_in_block).min(to_read as usize);
 
                 if grant_va != 0 {
-                    // Volatile u64 stride + Release fence + mfence: cache_srv
-                    // empirically needs the same pattern (see its IO_READ
-                    // handler) — without it, ld.so reads zeros from grant
-                    // pages on the receiving CPU under boot concurrency,
-                    // surfacing as "Verdef version 0" in libc when ld.so
-                    // loads it under Step H.  ext_srv had no such fence.
-                    unsafe {
-                        let src = (block_buf_va + offset_in_block) as *const u8;
-                        let dst = grant_va as *mut u8;
-                        let words = bytes_in_block / 8;
-                        let tail_start = words * 8;
-                        let src_u64 = src as *const u64;
-                        let dst_u64 = dst as *mut u64;
-                        for i in 0..words {
-                            let v = core::ptr::read_volatile(src_u64.add(i));
-                            core::ptr::write_volatile(dst_u64.add(i), v);
+                    // Multi-block grant fill (cap 4 blocks ~ 16 KiB) with
+                    // volatile u64 stride + Release fence + mfence per
+                    // block: cache_srv needed the same fence pattern;
+                    // without it ld.so reads zeros from the grant page
+                    // and reports "Verdef version 0".  Capping at 4
+                    // blocks limits per-FS_READ latency so other clients'
+                    // 10 s CALL_REPLY watchdog doesn't fire.
+                    const MAX_BLOCKS_PER_REPLY: u64 = 4;
+                    let mut bytes_done: u64 = 0;
+                    let mut io_err = false;
+                    let mut blocks_done: u64 = 0;
+                    while bytes_done < to_read && blocks_done < MAX_BLOCKS_PER_REPLY {
+                        let cur_off = offset + bytes_done;
+                        let blk_idx = cur_off / sb.block_size as u64;
+                        let off_in_blk = (cur_off % sb.block_size as u64) as usize;
+
+                        let phys = resolve_block(
+                            &blk, &sb, file.inode_flags, &file.block_ptrs,
+                            blk_idx, indirect_buf_va,
+                        );
+                        let sparse = phys.is_none();
+                        let phys = phys.unwrap_or(0);
+
+                        if sparse {
+                            unsafe {
+                                core::ptr::write_bytes(
+                                    block_buf_va as *mut u8,
+                                    0,
+                                    sb.block_size as usize,
+                                );
+                                DATA_BLOCK_CACHE_VALID = false;
+                            }
+                        } else {
+                            let hit = unsafe {
+                                DATA_BLOCK_CACHE_VALID && DATA_BLOCK_CACHE_PHYS == phys
+                            };
+                            if !hit {
+                                if !blk.read_block(phys, sb.block_size, block_buf_va) {
+                                    unsafe { DATA_BLOCK_CACHE_VALID = false; }
+                                    io_err = true;
+                                    break;
+                                }
+                                unsafe {
+                                    DATA_BLOCK_CACHE_PHYS = phys;
+                                    DATA_BLOCK_CACHE_VALID = true;
+                                }
+                            }
                         }
-                        for i in tail_start..bytes_in_block {
-                            let b = core::ptr::read_volatile(src.add(i));
-                            core::ptr::write_volatile(dst.add(i), b);
+
+                        let chunk = ((sb.block_size as u64) - off_in_blk as u64)
+                            .min(to_read - bytes_done) as usize;
+                        unsafe {
+                            let src = (block_buf_va + off_in_blk) as *const u8;
+                            let dst = (grant_va + bytes_done as usize) as *mut u8;
+                            let words = chunk / 8;
+                            let tail_start = words * 8;
+                            let src_u64 = src as *const u64;
+                            let dst_u64 = dst as *mut u64;
+                            for i in 0..words {
+                                let v = core::ptr::read_volatile(src_u64.add(i));
+                                core::ptr::write_volatile(dst_u64.add(i), v);
+                            }
+                            for i in tail_start..chunk {
+                                let b = core::ptr::read_volatile(src.add(i));
+                                core::ptr::write_volatile(dst.add(i), b);
+                            }
                         }
+                        bytes_done += chunk as u64;
+                        blocks_done += 1;
                     }
                     core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
                     #[cfg(target_arch = "x86_64")]
                     unsafe { core::arch::asm!("mfence"); }
-                    let _ = syscall::reply(FS_READ_OK, bytes_in_block as u64, 0, 0, 0, 0);
+                    if io_err && bytes_done == 0 {
+                        let _ = syscall::reply(FS_ERROR, ERR_IO, 0, 0, 0, 0);
+                    } else {
+                        let _ = syscall::reply(FS_READ_OK, bytes_done, 0, 0, 0, 0);
+                    }
                 } else {
                     let inline_len = bytes_in_block.min(MAX_INLINE);
                     let data = unsafe {
