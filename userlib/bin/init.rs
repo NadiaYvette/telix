@@ -8097,9 +8097,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // --- Step H (early): run libxcvt dyn-link RIGHT AFTER Phase 51 so it ---
-    // doesn't wait on Phase 172d/172e, which currently hang on linux_srv FS
-    // double-indirect reads.  VFS is up by this point, and ld.so resolves
-    // libxcvt + libc via VFS, which is all Step H actually needs.
+    // runs before the slow Phase 177-180 CALL-TIMEOUTs that would otherwise
+    // burn the test budget.  Phase 51 mounted '/' on the root FS, so VFS_OPEN
+    // on /lib64/* works.
     syscall::debug_puts(b"  init: Step H libxcvt dyn-link (early)...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
@@ -8140,7 +8140,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::personality_set(child, 2, abi);
 
                 let mut exit_code: i64 = -1;
-                for _ in 0..6000 {
+                for _ in 0..3000 {
                     if let Some(code) = syscall::waitpid(child) {
                         exit_code = code as i64;
                         break;
