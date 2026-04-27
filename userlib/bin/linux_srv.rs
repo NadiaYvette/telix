@@ -1979,13 +1979,6 @@ fn handle_sendfile(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     total as u64
 }
 
-/// MMU pages of scratch granted to FS servers for FS_READ / VFS_OPEN_LONG.
-/// Sized to match `MAX_BLOCKS_PER_REPLY` (=4) in ext_srv's FS_READ multi-
-/// block fill — 4 × 4 KiB = 16 KiB lets ext_srv pack up to 4 file blocks
-/// per reply, cutting the IPC count for large mmap reads (libc.so.6,
-/// ~ 2 MB) by 4×.  Path forwarding via VFS only uses the first page.
-const FS_SCRATCH_PAGES: usize = 4;
-
 /// Lazily allocate the long-path scratch page and grant it to vfs_task at
 /// LIN_SCRATCH_REMOTE_VA. Returns true if scratch is ready to use.
 fn ensure_lin_path_scratch() -> bool {
@@ -1993,7 +1986,7 @@ fn ensure_lin_path_scratch() -> bool {
         if LIN_PATH_SCRATCH_LOCAL != 0 {
             return true;
         }
-        let va = match syscall::mmap_anon(0, FS_SCRATCH_PAGES, 1) {
+        let va = match syscall::mmap_anon(0, 1, 1) {
             Some(v) => v,
             None => return false,
         };
@@ -2003,8 +1996,6 @@ fn ensure_lin_path_scratch() -> bool {
         }
         // RW grant: VFS will normalize-in-place if needed (but with our normalize
         // happening before we send, we could go RO; keep RW for flexibility).
-        // VFS only needs the first page for path forwarding; the rest is
-        // reserved for FS_READ bulk fills via ensure_fs_scratch_grants.
         if !syscall::grant_pages(vfs_task, va, LIN_SCRATCH_REMOTE_VA, 1, false) {
             return false;
         }
@@ -2043,7 +2034,7 @@ fn ensure_fs_scratch_grants() {
                 fs_task,
                 LIN_PATH_SCRATCH_LOCAL,
                 LIN_FS_SCRATCH_VA,
-                FS_SCRATCH_PAGES,
+                1,
                 false,
             ) {
                 FS_SCRATCH_GRANTED_MASK |= bit;
@@ -2062,8 +2053,7 @@ fn fs_read_bulk(fs_port: u64, handle: u64, offset: u64, max_len: usize) -> Optio
             return None;
         }
     }
-    // Bulk grant is FS_SCRATCH_PAGES × 4 KiB; cap requested length to that.
-    let length = max_len.min(FS_SCRATCH_PAGES * 4096) as u64;
+    let length = max_len.min(4096) as u64;
     let d2 = length & 0xFFFF_FFFF;
     let resp = match syscall::call(fs_port, FS_READ, handle, offset, d2, LIN_FS_SCRATCH_VA as u64) {
         Some(m) => m,
