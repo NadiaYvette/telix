@@ -216,7 +216,10 @@ impl PageCache {
             if sector < max_sectors {
                 let mut buf = [0u8; SECTOR_SIZE];
                 if blk.read_sector(sector, &mut buf) {
-                    // Volatile byte loop — see read_sector above for why.
+                    // Volatile byte loop — buf is local but the cache page
+                    // (dest_base) is shared via grant_pages with fs_srvs;
+                    // empirically still needs volatile to round-trip
+                    // correctly through the cache_blk handoff.
                     let src = buf.as_ptr();
                     let dst = (dest_base + i * SECTOR_SIZE) as *mut u8;
                     unsafe {
@@ -363,10 +366,11 @@ impl BlkClient {
 
         if let Some(rr) = self.recv_match(nonce) {
             if rr.tag == IO_READ_OK && rr.data[0] == 512 {
-                // Volatile byte loop — without this the fs_srv-side reads
-                // intermittently come back as zeros, even though the kernel
-                // grant_pages mmu-count fix (dec88a7) closed the underlying
-                // shared-page race.  Empirically still needed.
+                // Volatile byte loop — empirically required.  compiler_fence
+                // alone is NOT sufficient; LLVM still elides reads from the
+                // grant page even after Acquire fence (likely because the
+                // page contents post-mmap_anon are tracked as "all zeros"
+                // by some pass that runs after the fence visibility check).
                 let src = self.scratch_va as *const u8;
                 let dst = out.as_mut_ptr();
                 unsafe {
