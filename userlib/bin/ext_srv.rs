@@ -2072,13 +2072,31 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     ((sb.block_size as usize) - offset_in_block).min(to_read as usize);
 
                 if grant_va != 0 {
+                    // Volatile u64 stride + Release fence + mfence: cache_srv
+                    // empirically needs the same pattern (see its IO_READ
+                    // handler) — without it, ld.so reads zeros from grant
+                    // pages on the receiving CPU under boot concurrency,
+                    // surfacing as "Verdef version 0" in libc when ld.so
+                    // loads it under Step H.  ext_srv had no such fence.
                     unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            (block_buf_va + offset_in_block) as *const u8,
-                            grant_va as *mut u8,
-                            bytes_in_block,
-                        );
+                        let src = (block_buf_va + offset_in_block) as *const u8;
+                        let dst = grant_va as *mut u8;
+                        let words = bytes_in_block / 8;
+                        let tail_start = words * 8;
+                        let src_u64 = src as *const u64;
+                        let dst_u64 = dst as *mut u64;
+                        for i in 0..words {
+                            let v = core::ptr::read_volatile(src_u64.add(i));
+                            core::ptr::write_volatile(dst_u64.add(i), v);
+                        }
+                        for i in tail_start..bytes_in_block {
+                            let b = core::ptr::read_volatile(src.add(i));
+                            core::ptr::write_volatile(dst.add(i), b);
+                        }
                     }
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe { core::arch::asm!("mfence"); }
                     let _ = syscall::reply(FS_READ_OK, bytes_in_block as u64, 0, 0, 0, 0);
                 } else {
                     let inline_len = bytes_in_block.min(MAX_INLINE);
