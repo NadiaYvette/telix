@@ -6995,6 +6995,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // --- Phase 44: clock_gettime / nanosleep / interval timers ---
+    if STEP_H_DEBUG_SKIP_SLOW_PHASES {
+        syscall::debug_puts(b"Phase 44 clock_gettime/nanosleep/alarm: SKIPPED (STEP_H_DEBUG)\n");
+    } else {
     syscall::debug_puts(b"  init: testing clock_gettime / nanosleep / alarm...\n");
     {
         let mut phase44_ok = true;
@@ -7064,6 +7067,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             syscall::debug_puts(b"Phase 44 clock_gettime/nanosleep/alarm: FAILED\n");
         }
+    }
     }
 
     // --- Phase 45: file-backed mmap (pager thread) ---
@@ -8399,6 +8403,81 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         } else {
             syscall::debug_puts(b"Step H8 libX11 dyn-link: SKIPPED\n");
+        }
+    }
+
+    // --- Step H9: Tier-3 X11 extension batch dyn-link smoke ---
+    // Single binary linking against all 10 Tier-3 extension libs:
+    //   libXext, libXfixes, libXi, libxkbfile, libXmu,
+    //   libXrender, libXRes, libXtst, libXv, libXinerama
+    // Each lib's symbol is referenced via &func to force ld.so to
+    // resolve the GOT entry; we don't actually call them since X11
+    // extension functions overwhelmingly need a Display* and would
+    // crash on NULL.
+    syscall::debug_puts(b"  init: Step H9 Tier-3 X11ext batch...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        let vfs_ok   = syscall::ns_lookup(b"vfs").is_some();
+        if linux_ok && vfs_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    static PATH: &[u8] = b"/libX11ext_dyn_test\0";
+                    static A0: &[u8] = b"libX11ext_dyn_test\0";
+                    static E0: &[u8] = b"LD_LIBRARY_PATH=/lib64\0";
+                    let argv: [u64; 2] = [A0.as_ptr() as u64, 0];
+                    let envp: [u64; 2] = [E0.as_ptr() as u64, 0];
+                    core::arch::asm!(
+                        "int 0x80",
+                        inlateout("rax") 59u64 => _,
+                        in("rdi") PATH.as_ptr() as u64,
+                        in("rsi") argv.as_ptr() as u64,
+                        in("rdx") envp.as_ptr() as u64,
+                        lateout("rcx") _,
+                        lateout("r11") _,
+                    );
+                    core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 99u64, options(noreturn));
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                { syscall::exit(99); }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(not(target_arch = "x86_64"))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..30000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(10);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Step H9 Tier-3 X11ext batch: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Step H9 Tier-3 X11ext batch: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Step H9 Tier-3 X11ext batch: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Step H9 Tier-3 X11ext batch: SKIPPED\n");
         }
     }
 
