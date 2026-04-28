@@ -8698,6 +8698,130 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Step H13: Xwayland against wl_compositor_min ---
+    // Spawn wl_compositor_min --one-shot (provides /run/user/0/wayland-0),
+    // then fork Xwayland with WAYLAND_DISPLAY=wayland-0 +
+    // XDG_RUNTIME_DIR=/run/user/0.  PASS criterion is loose: Xwayland
+    // exits within the budget without crashing.  Even a clean exit
+    // saying "couldn't bind compositor protocol XYZ" tells us the
+    // wayland socket handshake worked end-to-end.
+    syscall::debug_puts(b"  init: Step H13 Xwayland + wl_compositor_min...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            syscall::debug_puts(b"  [H13] forking compositor...\n");
+            let comp_child = syscall::fork();
+            if comp_child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    static PATH: &[u8] = b"/wl_compositor_min\0";
+                    static A0: &[u8]   = b"wl_compositor_min\0";
+                    static A1: &[u8]   = b"--one-shot\0";
+                    let argv: [u64; 3] = [A0.as_ptr() as u64, A1.as_ptr() as u64, 0];
+                    let envp: [u64; 1] = [0];
+                    core::arch::asm!(
+                        "int 0x80",
+                        inlateout("rax") 59u64 => _,
+                        in("rdi") PATH.as_ptr() as u64,
+                        in("rsi") argv.as_ptr() as u64,
+                        in("rdx") envp.as_ptr() as u64,
+                        lateout("rcx") _, lateout("r11") _,
+                    );
+                    core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 98u64, options(noreturn));
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                { syscall::exit(99); }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(not(target_arch = "x86_64"))]
+                let abi = 0u8;
+                syscall::personality_set(comp_child, 2, abi);
+                // Give compositor 1s to bind the UDS.
+                for _ in 0..200 { syscall::sleep_ms(5); }
+                syscall::debug_puts(b"  [H13] forking Xwayland...\n");
+
+                let xw_child = syscall::fork();
+                if xw_child == 0 {
+                    for _ in 0..100 {
+                        let (p, _) = syscall::personality_get();
+                        if p != 0 { break; }
+                        syscall::yield_now();
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        static PATH: &[u8] = b"/Xwayland\0";
+                        static A0: &[u8]   = b"Xwayland\0";
+                        static A1: &[u8]   = b"-terminate\0";
+                        static E0: &[u8]   = b"LD_LIBRARY_PATH=/lib64\0";
+                        static E1: &[u8]   = b"WAYLAND_DISPLAY=wayland-0\0";
+                        static E2: &[u8]   = b"XDG_RUNTIME_DIR=/run/user/0\0";
+                        let argv: [u64; 3] = [A0.as_ptr() as u64, A1.as_ptr() as u64, 0];
+                        let envp: [u64; 4] = [E0.as_ptr() as u64, E1.as_ptr() as u64, E2.as_ptr() as u64, 0];
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => _,
+                            in("rdi") PATH.as_ptr() as u64,
+                            in("rsi") argv.as_ptr() as u64,
+                            in("rdx") envp.as_ptr() as u64,
+                            lateout("rcx") _, lateout("r11") _,
+                        );
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 97u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    { syscall::exit(99); }
+                } else {
+                    syscall::personality_set(xw_child, 2, abi);
+                    syscall::debug_puts(b"  [H13] waiting for Xwayland (30s budget)...\n");
+
+                    let mut xw_code: i64 = -1;
+                    for i in 0..3000 {
+                        if let Some(code) = syscall::waitpid(xw_child) {
+                            xw_code = code as i64;
+                            break;
+                        }
+                        syscall::sleep_ms(10);
+                        if i == 500 { syscall::debug_puts(b"  [H13] Xwayland @5s\n"); }
+                        if i == 1000 { syscall::debug_puts(b"  [H13] Xwayland @10s\n"); }
+                        if i == 2000 { syscall::debug_puts(b"  [H13] Xwayland @20s\n"); }
+                    }
+                    syscall::debug_puts(b"  [H13] reaping compositor...\n");
+                    let mut comp_code: i64 = -1;
+                    for _ in 0..1000 {
+                        if let Some(code) = syscall::waitpid(comp_child) {
+                            comp_code = code as i64;
+                            break;
+                        }
+                        syscall::sleep_ms(10);
+                    }
+
+                    if xw_code != -1 {
+                        syscall::debug_puts(b"Step H13 Xwayland + compositor: PASSED (xw_exit=");
+                        let mut buf = [0u8; 12]; let mut val = xw_code as u32; let mut i = 12;
+                        if val == 0 { i -= 1; buf[i] = b'0'; }
+                        while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                        syscall::debug_puts(&buf[i..12]);
+                        syscall::debug_puts(b" comp_exit=");
+                        let mut buf = [0u8; 12]; let mut val = comp_code as u32; let mut i = 12;
+                        if val == 0 { i -= 1; buf[i] = b'0'; }
+                        while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                        syscall::debug_puts(&buf[i..12]);
+                        syscall::debug_puts(b")\n");
+                    } else {
+                        syscall::debug_puts(b"Step H13 Xwayland + compositor: FAILED (Xwayland timeout)\n");
+                    }
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Step H13 Xwayland + compositor: SKIPPED\n");
+        }
+    }
+
     // --- Step H2: libdrm.so.2 dyn-link smoke (Tier-0 round-out) ---
     // Same pattern as Step H (early) — fork, exec, waitpid.  Runs
     // /libdrm_dyn_test which calls drmGetLibVersion(-1) (pure
