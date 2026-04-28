@@ -51,6 +51,18 @@ fn signal_handler_sigusr1(_sig: u64, frame_addr: u64) {
     }
 }
 
+/// DEBUG TOGGLE for chasing Step H end-to-end specifically.
+///
+/// When `true`, init skips a handful of slow / flaky pre-Phase-51 phases
+/// (Step G, Phase 33, 39, 173, 174, 175, 176) to free up the 600 s QEMU
+/// wall-clock budget so Step H (libxcvt dyn-link) has room to finish.
+///
+/// This is NOT a general "skip slow tests" knob — those phases are useful
+/// regression coverage and must run in normal CI.  Only flip to `true`
+/// locally when actively debugging Step H, then flip back before
+/// committing or pushing.  Default `false` keeps full coverage.
+const STEP_H_DEBUG_SKIP_SLOW_PHASES: bool = false;
+
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"Telix init starting\n");
@@ -722,6 +734,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // the compositor's accept() registers an async notification with uds_srv
     // instead of parking linux_srv's main thread, so the client's connect
     // can progress.  Expected result: PASSED (both exit 0).
+    if STEP_H_DEBUG_SKIP_SLOW_PHASES {
+        syscall::debug_puts(b"Step G wayland compositor end-to-end: SKIPPED (STEP_H_DEBUG)\n");
+    } else {
     syscall::debug_puts(b"  init: Step G wayland compositor end-to-end...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
@@ -850,6 +865,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             syscall::debug_puts(b"Step G wayland compositor end-to-end: SKIPPED\n");
         }
+    }
     }
 
     // --- Test 3: mmap_anon / munmap ---
@@ -2840,6 +2856,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // --- Test 25: Phase 33 Page Cache ---
+    if STEP_H_DEBUG_SKIP_SLOW_PHASES {
+        syscall::debug_puts(b"Phase 33 page cache: SKIPPED (STEP_H_DEBUG)\n");
+    } else {
     syscall::debug_puts(b"  init: testing page cache...\n");
     {
         let mut cache_ok = false;
@@ -2982,6 +3001,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             syscall::debug_puts(b"Phase 33 page cache: FAILED\n");
         }
+    }
     }
 
     // --- Test 26: L4-style handoff scheduling ---
@@ -3992,6 +4012,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // --- Test 30: Phase 39 ext Filesystem Server ---
+    if STEP_H_DEBUG_SKIP_SLOW_PHASES {
+        syscall::debug_puts(b"Phase 39 ext filesystem: SKIPPED (STEP_H_DEBUG)\n");
+    } else {
     syscall::debug_puts(b"  init: testing ext filesystem...\n");
     {
         let mut ext_ok = true;
@@ -4111,6 +4134,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 39 ext filesystem: SKIPPED (no ext server)\n");
         }
     }
+    }
 
     // --- Phase 173: filesystem realism (chmod + utimensat) ---
     //
@@ -4118,6 +4142,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // protocol, exercising the ext inode-patching helpers.  Must run
     // BEFORE Phase 171/172 (Linux personality) so that VFS hasn't yet
     // granted scratch to ext_srv at FS_SCRATCH_VA.
+    if STEP_H_DEBUG_SKIP_SLOW_PHASES {
+        syscall::debug_puts(b"Phase 173 filesystem realism: SKIPPED (STEP_H_DEBUG)\n");
+    } else {
     syscall::debug_puts(b"  init: Phase 173 filesystem realism...\n");
     {
         let ext_port_opt = if has_blk { syscall::ns_lookup(b"ext") } else { None };
@@ -4281,10 +4308,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 173 filesystem realism: SKIPPED (no ext)\n");
         }
     }
+    }
 
     // --- Phase 174: full threads (clone + concurrent shared-mem atomics) ---
     // Inlined here (adjacent to Phase 173) so results are observable even
     // when later phases like Phase 172 (glibc dyn) hit SMP flakes.
+    if STEP_H_DEBUG_SKIP_SLOW_PHASES {
+        syscall::debug_puts(b"Phase 174 full threads: SKIPPED (STEP_H_DEBUG)\n");
+    } else {
     syscall::debug_puts(b"  init: Phase 174 full threads...\n");
     {
         if syscall::ns_lookup(b"linux").is_none() {
@@ -4445,8 +4476,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 174 full threads: SKIPPED\n");
         }
     }
+    }
 
     // --- Phase 175: signals end-to-end (rt_sigpending + sigaltstack) ---
+    if STEP_H_DEBUG_SKIP_SLOW_PHASES {
+        syscall::debug_puts(b"Phase 175 signals end-to-end: SKIPPED (STEP_H_DEBUG)\n");
+    } else {
     syscall::debug_puts(b"  init: Phase 175 signals end-to-end...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
@@ -4580,6 +4615,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 175 signals end-to-end: SKIPPED\n");
         }
     }
+    }
 
     // --- Phase 176: swap stress (memory pressure + fork + data integrity) ---
     //
@@ -4588,6 +4624,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // With swap=ram:N enabled, kswapd evicts pages to swap under
     // pressure; fork inherits swap slots so both sides can fault the
     // data back in. Without swap this is a plain COW fork test.
+    if STEP_H_DEBUG_SKIP_SLOW_PHASES {
+        syscall::debug_puts(b"Phase 176 swap stress: SKIPPED (STEP_H_DEBUG)\n");
+    } else {
     syscall::debug_puts(b"  init: Phase 176 swap stress...\n");
     {
         let ps = syscall::page_size();
@@ -4672,6 +4711,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             syscall::debug_puts(b"Phase 176 swap stress: FAILED\n");
         }
+    }
     }
 
     // --- Phase 194: Linux personality FS syscall dispatch ---
