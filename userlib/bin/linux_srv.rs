@@ -2184,13 +2184,17 @@ fn try_open_initramfs(path: &[u8]) -> Option<(u64, u64)> {
     }
     // Strip leading '/'.
     let name = if path.first() == Some(&b'/') { &path[1..] } else { path };
-    if name.is_empty() || name.len() > 24 {
+    if name.is_empty() || name.len() > 28 {
         return None;
     }
-    // Pack name into 3 u64 words: bytes 0-7 in d0, 8-15 in d1, 16-23 in d3.
+    // Pack name into 4 u64 words within syscall::call's 4-data-word ABI:
+    //   d0 = bytes 0-7, d1 = bytes 8-15, d3 = bytes 16-23
+    //   d2 = name_len (low 16 bits) | bytes 24-27 (upper 32 bits)
+    // 28-char limit covers "lib64/libwayland-client.so.0" (28 chars).
     let mut w0 = 0u64;
     let mut w1 = 0u64;
     let mut w3 = 0u64;
+    let mut w2_extra: u64 = 0;
     for i in 0..name.len().min(8) {
         w0 |= (name[i] as u64) << (i * 8);
     }
@@ -2200,7 +2204,11 @@ fn try_open_initramfs(path: &[u8]) -> Option<(u64, u64)> {
     for i in 16..name.len().min(24) {
         w3 |= (name[i] as u64) << ((i - 16) * 8);
     }
-    let resp = syscall::call(irfs_port, IRFS_IO_CONNECT, w0, w1, name.len() as u64, w3)?;
+    for i in 24..name.len().min(28) {
+        w2_extra |= (name[i] as u64) << ((i - 24) * 8);
+    }
+    let d2 = (name.len() as u64 & 0xFFFF) | (w2_extra << 32);
+    let resp = syscall::call(irfs_port, IRFS_IO_CONNECT, w0, w1, d2, w3)?;
     if resp.tag == IRFS_IO_CONNECT_OK {
         // d0 = handle, d1 = size, d2 = server_aspace_id.
         Some((resp.data[0], resp.data[1]))

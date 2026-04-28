@@ -121,11 +121,28 @@ fn align4(n: usize) -> usize {
     (n + 3) & !3
 }
 
-fn unpack_name(w0: u64, w1: u64, w2: u64, len: usize) -> [u8; 24] {
-    let mut buf = [0u8; 24];
-    let words = [w0, w1, w2];
-    for i in 0..len.min(24) {
-        buf[i] = (words[i / 8] >> ((i % 8) * 8)) as u8;
+/// Unpack a path name from 4 packed u64 words.  d0 / d1 / d3 hold
+/// 24 bytes (3 × 8); the upper 32 bits of d2 (whose low 16 bits
+/// carry name_len) hold 4 more — total 28 chars.  That fits paths
+/// like "lib64/libwayland-client.so.0" (28 chars exactly) without
+/// needing a long-path IPC variant.
+fn unpack_name(w0: u64, w1: u64, w2_extra: u32, w3: u64, len: usize) -> [u8; 28] {
+    let mut buf = [0u8; 28];
+    // bytes 0-7 from w0
+    for i in 0..len.min(8) {
+        buf[i] = (w0 >> (i * 8)) as u8;
+    }
+    // bytes 8-15 from w1
+    for i in 8..len.min(16) {
+        buf[i] = (w1 >> ((i - 8) * 8)) as u8;
+    }
+    // bytes 16-23 from w3
+    for i in 16..len.min(24) {
+        buf[i] = (w3 >> ((i - 16) * 8)) as u8;
+    }
+    // bytes 24-27 from upper 32 bits of d2
+    for i in 24..len.min(28) {
+        buf[i] = (w2_extra >> ((i - 24) * 8)) as u8;
     }
     buf
 }
@@ -190,15 +207,19 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
 
         match msg.tag {
             IO_CONNECT => {
-                // Userspace protocol (5 data words used):
+                // Userspace protocol (4 data words used):
                 //   data[0] = name bytes 0-7
                 //   data[1] = name bytes 8-15
-                //   data[2] = name_len (low 32)
-                //   data[3] = name bytes 16-23 (extended for paths up to 24 chars,
-                //             e.g. "lib64/libxcvt.so.0" = 18 chars)
-                let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let name_buf = unpack_name(msg.data[0], msg.data[1], msg.data[3], name_len);
-                let name = &name_buf[..name_len.min(24)];
+                //   data[2] = name_len (low 16) | name_bytes_24_27 (upper 32)
+                //   data[3] = name bytes 16-23
+                // Total 28-char inline name (covers
+                // "lib64/libwayland-client.so.0" = 28 exactly).  We pack
+                // 4 extra bytes into d2's upper 32 bits because the
+                // syscall ABI gives us only 4 data words on the wire.
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let w2_extra = ((msg.data[2] >> 32) & 0xFFFF_FFFF) as u32;
+                let name_buf = unpack_name(msg.data[0], msg.data[1], w2_extra, msg.data[3], name_len);
+                let name = &name_buf[..name_len.min(28)];
 
                 match fs.find(name) {
                     Some(idx) => {

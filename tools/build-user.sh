@@ -281,6 +281,27 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
             echo "  WARNING: libX11_dyn_test build failed"
         fi
     fi
+    # Tier-5 batch smoke: libepoxy + openssl libs + libtirpc.  These
+    # are listed as "try --disable first" in the porting plan; we
+    # smoke them so the option is on the table.
+    if [ -f "$ROOTDIR/initramfs/lib64/libepoxy.so.0" ]; then
+        echo "Building libssl_dyn_test (Tier-5 batch)..."
+        if gcc -pie -fPIE -O2 -fno-stack-protector -s \
+                -o "$BINDIR/libssl_dyn_test" \
+                "$ROOTDIR/tools/libssl_dyn_test.c" \
+                -L"$ROOTDIR/initramfs/lib64" \
+                -Wl,--no-as-needed -lc \
+                -l:libepoxy.so.0 \
+                -l:libssl.so.3 \
+                -l:libcrypto.so.3 \
+                -l:libtirpc.so.3 \
+                -Wl,--as-needed \
+                -Wl,-rpath,/lib64 2>&1; then
+            echo "  libssl_dyn_test: $(wc -c < "$BINDIR/libssl_dyn_test") bytes"
+        else
+            echo "  WARNING: libssl_dyn_test build failed"
+        fi
+    fi
     # Tier-4 batch smoke: combined test linking the 3 font libs.
     if [ -f "$ROOTDIR/initramfs/lib64/libfreetype.so.6" ]; then
         echo "Building libfont_dyn_test (Tier-4 batch)..."
@@ -328,7 +349,7 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
 fi
 
 # Copy ELF binaries to initramfs directory.
-for bin in init hello echo_client initramfs_srv rootfs_srv ramdisk_srv blk_srv nvme_srv iwl_srv cache_srv fat16_srv fat_srv ext2_srv ext_srv xfs_srv iso9660_srv udf_srv apfs_srv iscsi_srv sctp_srv acpi_srv pci_srv part_srv console_srv shell net_srv eth_srv batman_srv ip6_srv tcp4_srv pipe_upper pipe_drain spin bench pong grant_echo grant_echo_srv grant_echo_test macro_bench cap_test call_reply_test security_srv shm_srv vfs_srv tmpfs_srv devfs_srv procfs_srv uds_srv pipe_srv pty_srv event_srv inotify_srv syslog_srv sysv_srv hello_c sock_test sock6_test tsh getty_login ld-telix tz_test pthread_test initdb_test postmaster_test pg_full_test libc_test calc stress_test sshd proxy_srv linux_srv linux_exit42 glibc_hello wayland_test wl_compositor_min hello_wl libxcvt_dyn_test libdrm_dyn_test libxshmfence_dyn_test libXau_dyn_test libXdmcp_dyn_test libpixman_dyn_test libwayland_dyn_test libX11_dyn_test libX11ext_dyn_test libfont_dyn_test fsprobe fb_srv input_srv compositor_srv term_srv mtk_srv ntfs_srv btrfs_srv i915_srv usb_srv hda_srv; do
+for bin in init hello echo_client initramfs_srv rootfs_srv ramdisk_srv blk_srv nvme_srv iwl_srv cache_srv fat16_srv fat_srv ext2_srv ext_srv xfs_srv iso9660_srv udf_srv apfs_srv iscsi_srv sctp_srv acpi_srv pci_srv part_srv console_srv shell net_srv eth_srv batman_srv ip6_srv tcp4_srv pipe_upper pipe_drain spin bench pong grant_echo grant_echo_srv grant_echo_test macro_bench cap_test call_reply_test security_srv shm_srv vfs_srv tmpfs_srv devfs_srv procfs_srv uds_srv pipe_srv pty_srv event_srv inotify_srv syslog_srv sysv_srv hello_c sock_test sock6_test tsh getty_login ld-telix tz_test pthread_test initdb_test postmaster_test pg_full_test libc_test calc stress_test sshd proxy_srv linux_srv linux_exit42 glibc_hello wayland_test wl_compositor_min hello_wl libxcvt_dyn_test libdrm_dyn_test libxshmfence_dyn_test libXau_dyn_test libXdmcp_dyn_test libpixman_dyn_test libwayland_dyn_test libX11_dyn_test libX11ext_dyn_test libfont_dyn_test libssl_dyn_test fsprobe fb_srv input_srv compositor_srv term_srv mtk_srv ntfs_srv btrfs_srv i915_srv usb_srv hda_srv; do
     if [ -f "$BINDIR/$bin" ]; then
         cp "$BINDIR/$bin" "$INITRAMFS_DIR/$bin"
         SIZE=$(wc -c < "$INITRAMFS_DIR/$bin")
