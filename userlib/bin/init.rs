@@ -4854,6 +4854,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // --- Phase 177: ISO 9660 filesystem server ---
+    if STEP_H_DEBUG_SKIP_SLOW_PHASES {
+        syscall::debug_puts(b"Phase 177 ISO 9660 filesystem: SKIPPED (STEP_H_DEBUG)\n");
+        syscall::debug_puts(b"Phase 178 UDF filesystem: SKIPPED (STEP_H_DEBUG)\n");
+        syscall::debug_puts(b"Phase 179 XFS filesystem: SKIPPED (STEP_H_DEBUG)\n");
+        syscall::debug_puts(b"Phase 180 XFS write: SKIPPED (STEP_H_DEBUG)\n");
+    } else {
     syscall::debug_puts(b"  init: Phase 177 ISO 9660 filesystem...\n");
     {
         // ISO 9660 image is at offset 32 MiB in test.img.
@@ -5584,6 +5590,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             syscall::debug_puts(b"Phase 180 XFS write: SKIPPED (no xfs server)\n");
         }
+    }
     }
 
     // --- Phase 181: iSCSI initiator (storage-over-network) ---
