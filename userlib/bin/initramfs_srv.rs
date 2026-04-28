@@ -176,6 +176,10 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
 
     // Register with name server.
     syscall::ns_register(b"initramfs", port);
+    // Also register our aspace under `initramfs_task` so linux_srv (and
+    // others) can grant pages to us — same convention as ext_srv /
+    // ext2_srv / rootfs_srv.
+    syscall::ns_register(b"initramfs_task", my_aspace);
 
     // Server loop.
     loop {
@@ -186,14 +190,15 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
 
         match msg.tag {
             IO_CONNECT => {
-                // Userspace protocol (4 data words max):
+                // Userspace protocol (5 data words used):
                 //   data[0] = name bytes 0-7
                 //   data[1] = name bytes 8-15
                 //   data[2] = name_len (low 32)
-                //   data[3] = unused
+                //   data[3] = name bytes 16-23 (extended for paths up to 24 chars,
+                //             e.g. "lib64/libxcvt.so.0" = 18 chars)
                 let name_len = (msg.data[2] & 0xFFFF_FFFF) as usize;
-                let name_buf = unpack_name(msg.data[0], msg.data[1], 0, name_len);
-                let name = &name_buf[..name_len.min(16)];
+                let name_buf = unpack_name(msg.data[0], msg.data[1], msg.data[3], name_len);
+                let name = &name_buf[..name_len.min(24)];
 
                 match fs.find(name) {
                     Some(idx) => {

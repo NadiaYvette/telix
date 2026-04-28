@@ -399,6 +399,13 @@ fn linux_err(e: u64) -> u64 {
     (-(e as i64)) as u64
 }
 
+// initramfs_srv IPC protocol tags (see userlib/bin/initramfs_srv.rs).
+// Used by the initramfs fast path in do_open / handle_read / handle_mmap.
+const IRFS_IO_CONNECT: u64 = 0x100;
+const IRFS_IO_CONNECT_OK: u64 = 0x101;
+const IRFS_IO_READ: u64 = 0x200;
+const IRFS_IO_READ_OK: u64 = 0x201;
+
 // VFS IPC protocol tags
 const VFS_OPEN: u64 = 0x6010;
 const VFS_OPEN_LONG: u64 = 0x6011;
@@ -527,6 +534,13 @@ enum FdKind {
     Evdev,   // /dev/input/event* — evdev input device (handle=0 kbd, 1 mouse)
     Inotify, // inotify instance — stub (no events, prevents ENOSYS crashes)
     SignalFd, // signalfd — stub (no events, prevents ENOSYS crashes)
+    /// Initramfs-backed file: fs_port = initramfs_srv port, handle = cpio
+    /// file index.  Reads use IO_READ (initramfs protocol), not FS_READ.
+    /// Used as a fast path for /lib64/* and other paths whose content
+    /// lives in initramfs.cpio — bypasses the ext_srv → cache_blk →
+    /// blk_srv chain entirely (the data is already in memory inside
+    /// initramfs_srv, so a single IPC copies it out).
+    Initramfs,
 }
 
 #[derive(Clone, Copy)]
@@ -1556,6 +1570,26 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let want = count.min(remaining);
     let mut total = 0usize;
 
+    // Initramfs fast path: in-memory cpio data via single IPC + grant.
+    if kind == FdKind::Initramfs {
+        while total < want {
+            let req = want - total;
+            let got = match irfs_read_bulk(fs_port, handle, offset + total as u64, req) {
+                Some(g) if g > 0 => g,
+                _ => break,
+            };
+            let scratch = unsafe { LIN_PATH_SCRATCH_LOCAL } as *const u8;
+            let src = unsafe { core::slice::from_raw_parts(scratch, got) };
+            let written = syscall::personality_copy_out(caller_port, buf_va + total, src);
+            if written == 0 {
+                return if total > 0 { total as u64 } else { linux_err(EFAULT) };
+            }
+            total += written;
+            unsafe { PROC_TABLE[pi].fds[fd].offset += written as u64; }
+        }
+        return total as u64;
+    }
+
     // FS_READ returns max 16 bytes per message.
     while total < want {
         let chunk = (want - total).min(16);
@@ -1647,6 +1681,26 @@ fn handle_pread64(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let remaining = (file_size - offset) as usize;
     let want = count.min(remaining);
     let mut total = 0usize;
+
+    // Initramfs fast path (single in-memory IPC + grant).
+    if kind == FdKind::Initramfs {
+        while total < want {
+            let req = want - total;
+            let got = match irfs_read_bulk(fs_port, handle, offset + total as u64, req) {
+                Some(g) if g > 0 => g,
+                _ => break,
+            };
+            let scratch = unsafe { LIN_PATH_SCRATCH_LOCAL } as *const u8;
+            let src = unsafe { core::slice::from_raw_parts(scratch, got) };
+            let written = syscall::personality_copy_out(caller_port, buf_va + total, src);
+            if written == 0 {
+                return if total > 0 { total as u64 } else { linux_err(EFAULT) };
+            }
+            total += written;
+            // Do NOT update fd offset (pread64 contract).
+        }
+        return total as u64;
+    }
 
     while total < want {
         let chunk = (want - total).min(16);
@@ -2020,11 +2074,15 @@ fn ensure_fs_scratch_grants() {
         return;
     }
     unsafe {
-        let names: [(&[u8], u32); 4] = [
+        let names: [(&[u8], u32); 5] = [
             (b"ext2_task", 1 << 0),
             (b"rootfs_task", 1 << 1),
             (b"tmpfs_task", 1 << 2),
             (b"ext_task", 1 << 3),
+            // initramfs_srv exposes a `_task` alias too; grant scratch so
+            // its IO_READ can write file content into our buffer for the
+            // initramfs fast-path opens.
+            (b"initramfs_task", 1 << 4),
         ];
         for (name, bit) in names.iter() {
             if FS_SCRATCH_GRANTED_MASK & bit != 0 {
@@ -2051,6 +2109,28 @@ fn ensure_fs_scratch_grants() {
     }
 }
 
+/// Read from initramfs_srv via IO_READ + grant_va.  Mirrors
+/// `fs_read_bulk` but uses the initramfs IPC tags.  Initramfs serves
+/// in-memory cpio data so this is dramatically faster than the
+/// FS_READ → cache_blk → blk_srv chain for the same content.
+fn irfs_read_bulk(irfs_port: u64, handle: u64, offset: u64, max_len: usize) -> Option<usize> {
+    ensure_fs_scratch_grants();
+    unsafe {
+        if FS_SCRATCH_GRANTED_MASK & (1 << 4) == 0 {
+            // initramfs_task scratch grant didn't take — fall back to
+            // inline-read path in the caller.
+            return None;
+        }
+    }
+    let length = max_len.min(FS_SCRATCH_PAGES * 4096) as u64;
+    let d2 = length & 0xFFFF_FFFF;
+    let resp = syscall::call(irfs_port, IRFS_IO_READ, handle, offset, d2, LIN_FS_SCRATCH_VA as u64)?;
+    if resp.tag != IRFS_IO_READ_OK {
+        return None;
+    }
+    Some(resp.data[0] as usize)
+}
+
 /// Read up to one page (4096 bytes max) from a file into the local scratch
 /// page via FS_READ's grant_va fast path. Returns bytes read, or None if the
 /// FS server doesn't accept grant_va or no scratch grant has been made.
@@ -2072,6 +2152,61 @@ fn fs_read_bulk(fs_port: u64, handle: u64, offset: u64, max_len: usize) -> Optio
         return None;
     }
     Some(resp.data[0] as usize)
+}
+
+/// Cached initramfs_srv port — looked up on first use.  Set to 0 if
+/// the lookup hasn't been attempted; u64::MAX once we've tried and
+/// failed (so we don't keep retrying).
+static mut INITRAMFS_PORT: u64 = 0;
+
+fn get_initramfs_port() -> u64 {
+    unsafe {
+        if INITRAMFS_PORT == 0 {
+            INITRAMFS_PORT = match syscall::ns_lookup(b"initramfs") {
+                Some(p) => p,
+                None => u64::MAX,
+            };
+        }
+        if INITRAMFS_PORT == u64::MAX { 0 } else { INITRAMFS_PORT }
+    }
+}
+
+/// Try to open a file via initramfs_srv (the in-memory cpio archive).
+/// `path` is the absolute path with a leading '/'; we strip it because
+/// initramfs_srv stores names without the leading slash.  Returns
+/// Some((handle, file_size)) on success, None if the file isn't in
+/// initramfs or initramfs_srv isn't running.  Names up to 24 bytes
+/// (after stripping '/') fit — covers /lib64/libxcvt.so.0 (18 chars).
+fn try_open_initramfs(path: &[u8]) -> Option<(u64, u64)> {
+    let irfs_port = get_initramfs_port();
+    if irfs_port == 0 {
+        return None;
+    }
+    // Strip leading '/'.
+    let name = if path.first() == Some(&b'/') { &path[1..] } else { path };
+    if name.is_empty() || name.len() > 24 {
+        return None;
+    }
+    // Pack name into 3 u64 words: bytes 0-7 in d0, 8-15 in d1, 16-23 in d3.
+    let mut w0 = 0u64;
+    let mut w1 = 0u64;
+    let mut w3 = 0u64;
+    for i in 0..name.len().min(8) {
+        w0 |= (name[i] as u64) << (i * 8);
+    }
+    for i in 8..name.len().min(16) {
+        w1 |= (name[i] as u64) << ((i - 8) * 8);
+    }
+    for i in 16..name.len().min(24) {
+        w3 |= (name[i] as u64) << ((i - 16) * 8);
+    }
+    let resp = syscall::call(irfs_port, IRFS_IO_CONNECT, w0, w1, name.len() as u64, w3)?;
+    if resp.tag == IRFS_IO_CONNECT_OK {
+        // d0 = handle, d1 = size, d2 = server_aspace_id.
+        Some((resp.data[0], resp.data[1]))
+    } else {
+        None
+    }
 }
 
 /// Write a path into the scratch page. Returns the truncated length actually
@@ -2432,6 +2567,33 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
     };
     if let Some(content) = etc_content {
         return open_virtual_file(pi, content, flags);
+    }
+
+    // Initramfs fast path: many of the .so files Step H and other Linux
+    // binaries open (libc.so.6, libxcvt.so.0, ld-linux-x86-64.so.2, etc.)
+    // are present in initramfs.cpio AND in the ext2 image.  Reading from
+    // initramfs_srv is a single in-memory IPC; reading from ext_srv goes
+    // through cache_blk → blk_srv (4 IPC layers, possibly disk).  Try
+    // initramfs first; on miss fall through to VFS.  Only attempt for
+    // names that fit initramfs_srv's 24-char inline limit (after stripping
+    // the leading '/'), which covers most lib paths.
+    if let Some((handle, file_size)) = try_open_initramfs(&path[..pathlen]) {
+        let irfs_port = get_initramfs_port();
+        let fd = match alloc_fd(pi) {
+            Some(f) => f,
+            None => return linux_err(EMFILE),
+        };
+        unsafe {
+            PROC_TABLE[pi].fds[fd].kind = FdKind::Initramfs;
+            PROC_TABLE[pi].fds[fd].fs_port = irfs_port;
+            PROC_TABLE[pi].fds[fd].handle = handle;
+            PROC_TABLE[pi].fds[fd].file_size = file_size;
+            PROC_TABLE[pi].fds[fd].offset = 0;
+            if flags & 0x80000 != 0 { // O_CLOEXEC
+                PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+            }
+        }
+        return fd as u64;
     }
 
     // Below here we need the VFS server.  Virtual devices handled above
@@ -2815,6 +2977,9 @@ fn do_close(pi: usize, fd: usize) {
         match PROC_TABLE[pi].fds[fd].kind {
             FdKind::File => {
                 let _ = syscall::call(PROC_TABLE[pi].fds[fd].fs_port, FS_CLOSE, PROC_TABLE[pi].fds[fd].handle, 0, 0, 0);
+            }
+            FdKind::Initramfs => {
+                // initramfs_srv treats IO_CLOSE as a no-op; nothing to do.
             }
             FdKind::Pipe => {
                 let _ = syscall::call(PROC_TABLE[pi].fds[fd].fs_port, PIPE_CLOSE_TAG, PROC_TABLE[pi].fds[fd].handle, 0, 0, 0);
@@ -4348,6 +4513,33 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             };
 
             match kind {
+                FdKind::Initramfs => {
+                    // Initramfs fast path: in-memory cpio data via single
+                    // IPC + grant.  Skips ext_srv → cache_blk → blk_srv.
+                    let avail = if file_offset >= file_size { 0 }
+                                else { (file_size - file_offset) as usize };
+                    let to_read = len.min(avail);
+                    if to_read > 0 {
+                        let mut total = 0usize;
+                        ensure_fs_scratch_grants();
+                        while total < to_read {
+                            let want = to_read - total;
+                            let got = match irfs_read_bulk(
+                                fs_port,
+                                handle,
+                                file_offset + total as u64,
+                                want,
+                            ) {
+                                Some(g) if g > 0 => g,
+                                _ => break,
+                            };
+                            let scratch = unsafe { LIN_PATH_SCRATCH_LOCAL } as *const u8;
+                            let src = unsafe { core::slice::from_raw_parts(scratch, got) };
+                            syscall::personality_copy_out(caller_port, va + total, src);
+                            total += got;
+                        }
+                    }
+                }
                 FdKind::File => {
                     // Read from FS and populate pages via the scratch-grant
                     // bulk path (4096 bytes/IPC). Falls back to 16-byte inline
@@ -8275,7 +8467,7 @@ fn poll_single_fd(pi: usize, fd: usize) -> u32 {
                     EPOLLERR
                 }
             }
-            FdKind::MemFd | FdKind::File | FdKind::Dir => EPOLLIN | EPOLLOUT,
+            FdKind::MemFd | FdKind::File | FdKind::Initramfs | FdKind::Dir => EPOLLIN | EPOLLOUT,
             FdKind::DevNull => EPOLLOUT, // writable sink
             FdKind::DevZero | FdKind::DevUrandom => EPOLLIN | EPOLLOUT,
             FdKind::DevTty => EPOLLOUT, // writable, reads would block
@@ -8534,6 +8726,7 @@ fn handle_epoll_wait(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             let kind = PROC_TABLE[pi].fds[fd].kind;
             if kind == FdKind::EventFd || kind == FdKind::TimerFd
                 || kind == FdKind::MemFd || kind == FdKind::File
+                || kind == FdKind::Initramfs
                 || kind == FdKind::DevNull || kind == FdKind::DevZero
                 || kind == FdKind::DevUrandom || kind == FdKind::ProcBuf
             {

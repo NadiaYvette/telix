@@ -2043,6 +2043,16 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     // the receiving CPU sees consistent grant content
                     // even when libc.so.6's PT_LOAD #1 (~ 2 MB) fills
                     // many sequential blocks.
+                    // MAX_BLOCKS_PER_REPLY = 4 keeps any single FS_READ
+                    // well under the kernel CALL_REPLY 10 s watchdog even
+                    // when multiple concurrent FS clients are queued on
+                    // ext_srv's port.  yield_now between blocks lets the
+                    // scheduler interleave callers but ext_srv is still
+                    // single-threaded so the port stays exclusive for the
+                    // duration; 4 blocks (~ 50 ms typical) is the sweet
+                    // spot.  linux_srv's FS_SCRATCH_PAGES is bigger than
+                    // this for headroom, but ext_srv only fills the first
+                    // MAX_BLOCKS_PER_REPLY × block_size bytes.
                     const MAX_BLOCKS_PER_REPLY: u64 = 4;
                     let mut bytes_done: u64 = 0;
                     let mut io_err = false;

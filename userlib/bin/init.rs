@@ -8154,7 +8154,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::personality_set(child, 2, abi);
 
                 let mut exit_code: i64 = -1;
-                for _ in 0..9000 {
+                // 30000 × 10 ms = 300 s.  libc.so.6 + libxcvt mmap +
+                // main + cleanup totals up to 250 s on slow KVM trials
+                // even with the initramfs fast path; budget generously.
+                for _ in 0..30000 {
                     if let Some(code) = syscall::waitpid(child) {
                         exit_code = code as i64;
                         break;
