@@ -83,6 +83,27 @@ for pkg in "$@"; do
     # what was installed.  `tools/xport/clean.sh` will nuke the cache.
 done
 
+# Patch libc.so.6's __intl_freemem to a bare `ret`.  Telix's
+# Linux personality leaves the libc i18n machinery in a state that
+# makes __intl_freemem walk a corrupt _nl_domain_bindings list and
+# fault at `mov 0x8(%rbx),%rdi` with rbx=NULL — symptom is
+# `Unhandled #PF: CR2=0x8 RIP=libc+0x1416d` whenever a binary exits
+# via libc's atexit cleanup.  Replacing the function entry with 0xc3
+# (ret) leaks the i18n state at exit (we don't care, the process is
+# dying) but unblocks any binary that uses exit() instead of _exit().
+# Offset 0x14110 in glibc-2.42 (Fedora 43); verify before patching.
+LIBC_SO="${DEST_DIR}/libc.so.6"
+if [ -f "${LIBC_SO}" ]; then
+    if [ "$(xxd -s 0x14110 -l 4 -p "${LIBC_SO}")" = "f30f1efa" ]; then
+        printf '\xc3' | dd of="${LIBC_SO}" bs=1 seek=82192 count=1 conv=notrunc 2>/dev/null
+        echo "===> patched libc.so.6 __intl_freemem -> ret"
+    elif [ "$(xxd -s 0x14110 -l 1 -p "${LIBC_SO}")" = "c3" ]; then
+        : # already patched
+    else
+        echo "===> WARNING: libc.so.6 __intl_freemem signature changed; not patching" >&2
+    fi
+fi
+
 # Dedupe: when fetch produces both libfoo.so.X (the soname) and
 # libfoo.so.X.Y.Z (the canonical file) with identical content, drop
 # the longer-named copy.  initramfs_srv has a fixed file-table cap

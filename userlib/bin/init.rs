@@ -8758,10 +8758,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         static PATH: &[u8] = b"/Xwayland\0";
                         static A0: &[u8]   = b"Xwayland\0";
                         static A1: &[u8]   = b"-terminate\0";
+                        static A2: &[u8]   = b"-verbose\0";
+                        static A3: &[u8]   = b"9\0";
                         static E0: &[u8]   = b"LD_LIBRARY_PATH=/lib64\0";
                         static E1: &[u8]   = b"WAYLAND_DISPLAY=wayland-0\0";
                         static E2: &[u8]   = b"XDG_RUNTIME_DIR=/run/user/0\0";
-                        let argv: [u64; 3] = [A0.as_ptr() as u64, A1.as_ptr() as u64, 0];
+                        let argv: [u64; 5] = [A0.as_ptr() as u64, A1.as_ptr() as u64, A2.as_ptr() as u64, A3.as_ptr() as u64, 0];
                         let envp: [u64; 4] = [E0.as_ptr() as u64, E1.as_ptr() as u64, E2.as_ptr() as u64, 0];
                         core::arch::asm!(
                             "int 0x80",
