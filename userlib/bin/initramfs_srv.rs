@@ -238,12 +238,32 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                 let data = &cpio_data[start..end];
 
                 if grant_va != 0 {
-                    // Grant-based read: copy file data into granted pages.
+                    // Grant-based read with cache_srv-style fence pattern:
+                    // volatile u64 stride + Release fence + mfence.  Without
+                    // this, ld.so on the receiving CPU sees zero-filled
+                    // grant pages under boot concurrency (same shape of bug
+                    // cache_srv and ext_srv had — surfaces in Step H as
+                    // "Verdef version 0" / "Verneed version 0" on libc).
                     let bytes_read = data.len();
-                    let dst = grant_va as *mut u8;
                     unsafe {
-                        core::ptr::copy_nonoverlapping(data.as_ptr(), dst, bytes_read);
+                        let src = data.as_ptr();
+                        let dst = grant_va as *mut u8;
+                        let words = bytes_read / 8;
+                        let tail_start = words * 8;
+                        let src_u64 = src as *const u64;
+                        let dst_u64 = dst as *mut u64;
+                        for i in 0..words {
+                            let v = core::ptr::read_volatile(src_u64.add(i));
+                            core::ptr::write_volatile(dst_u64.add(i), v);
+                        }
+                        for i in tail_start..bytes_read {
+                            let b = core::ptr::read_volatile(src.add(i));
+                            core::ptr::write_volatile(dst.add(i), b);
+                        }
                     }
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe { core::arch::asm!("mfence"); }
                     let _ = syscall::reply(IO_READ_OK, bytes_read as u64, 0, 0, 0, 0);
                 } else {
                     // Inline read: pack into message words.
