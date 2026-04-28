@@ -8254,6 +8254,82 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Step H7: libwayland-client.so.0 dyn-link smoke (Tier-2) ---
+    // First Tier-2 lib.  Pulls libffi.so.8 (DT_NEEDED) so ld.so walks
+    // a 3-level dep tree (binary → libwayland-client → libffi → libc)
+    // for the first time.  wl_display_connect(NULL) returns NULL when
+    // no compositor is up, which is the expected outcome here.
+    //
+    // Placed before H2-H6 so we can verify Tier-2 in a constrained
+    // wall-clock window without waiting for the (already-proven)
+    // Tier-0/1 chain to run first.
+    syscall::debug_puts(b"  init: Step H7 libwayland-client dyn-link...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        let vfs_ok   = syscall::ns_lookup(b"vfs").is_some();
+        if linux_ok && vfs_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    static PATH: &[u8] = b"/libwayland_dyn_test\0";
+                    static A0: &[u8] = b"libwayland_dyn_test\0";
+                    static E0: &[u8] = b"LD_LIBRARY_PATH=/lib64\0";
+                    let argv: [u64; 2] = [A0.as_ptr() as u64, 0];
+                    let envp: [u64; 2] = [E0.as_ptr() as u64, 0];
+                    core::arch::asm!(
+                        "int 0x80",
+                        inlateout("rax") 59u64 => _,
+                        in("rdi") PATH.as_ptr() as u64,
+                        in("rsi") argv.as_ptr() as u64,
+                        in("rdx") envp.as_ptr() as u64,
+                        lateout("rcx") _,
+                        lateout("r11") _,
+                    );
+                    core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 99u64, options(noreturn));
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                { syscall::exit(99); }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(not(target_arch = "x86_64"))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+
+                let mut exit_code: i64 = -1;
+                for _ in 0..30000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(10);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Step H7 libwayland-client dyn-link: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Step H7 libwayland-client dyn-link: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Step H7 libwayland-client dyn-link: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Step H7 libwayland-client dyn-link: SKIPPED\n");
+        }
+    }
+
     // --- Step H2: libdrm.so.2 dyn-link smoke (Tier-0 round-out) ---
     // Same pattern as Step H (early) — fork, exec, waitpid.  Runs
     // /libdrm_dyn_test which calls drmGetLibVersion(-1) (pure
