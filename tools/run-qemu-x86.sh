@@ -33,7 +33,7 @@ esac
 QEMU_ARGS=(
     -machine q35,accel=$ACCEL
     -cpu $CPU_MODEL
-    -m 256M
+    -m 512M
     -kernel "$KERNEL32"
     -smp 4
 )

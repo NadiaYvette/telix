@@ -83,5 +83,20 @@ for pkg in "$@"; do
     # what was installed.  `tools/xport/clean.sh` will nuke the cache.
 done
 
+# Dedupe: when fetch produces both libfoo.so.X (the soname) and
+# libfoo.so.X.Y.Z (the canonical file) with identical content, drop
+# the longer-named copy.  initramfs_srv has a fixed file-table cap
+# (MAX_FILES) — every dup we keep eats a slot for nothing, and ld.so
+# only ever opens by soname.
+shopt -s nullglob
+for soname in "${DEST_DIR}"/*.so.[0-9]; do
+    for longer in "${soname}".[0-9]*; do
+        if [ -f "$longer" ] && cmp -s "$soname" "$longer" 2>/dev/null; then
+            rm -f "$longer"
+        fi
+    done
+done
+shopt -u nullglob
+
 echo "===> done.  initramfs/lib64 contents:"
 ls -la "${DEST_DIR}" | tail -n +2 | awk '{print "  " $NF " ( " $5 " bytes )"}'

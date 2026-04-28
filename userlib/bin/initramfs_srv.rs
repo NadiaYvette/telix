@@ -19,7 +19,7 @@ const ERR_NOT_FOUND: u64 = 1;
 const ERR_INVALID: u64 = 3;
 
 const MAX_INLINE_READ: usize = 40;
-const MAX_FILES: usize = 256;
+const MAX_FILES: usize = 512;
 const MAX_NAME: usize = 64;
 
 struct FileEntry {
