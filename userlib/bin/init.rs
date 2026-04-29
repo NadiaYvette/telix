@@ -8799,8 +8799,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         static E0: &[u8]   = b"LD_LIBRARY_PATH=/lib64\0";
                         static E1: &[u8]   = b"WAYLAND_DISPLAY=wayland-0\0";
                         static E2: &[u8]   = b"XDG_RUNTIME_DIR=/run/user/0\0";
+                        // Force C locale so libc's gettext machinery
+                        // (__dcigettext / __intl_freemem) takes the
+                        // fast no-translation path.  We've seen that
+                        // path GP-fault under Telix's personality
+                        // (mid-instruction RIP at libc+0x1405d on the
+                        // exit path).  C locale bypasses it.
+                        static E3: &[u8]   = b"LANG=C\0";
+                        static E4: &[u8]   = b"LC_ALL=C\0";
                         let argv: [u64; 5] = [A0.as_ptr() as u64, A1.as_ptr() as u64, A2.as_ptr() as u64, A3.as_ptr() as u64, 0];
-                        let envp: [u64; 4] = [E0.as_ptr() as u64, E1.as_ptr() as u64, E2.as_ptr() as u64, 0];
+                        let envp: [u64; 6] = [E0.as_ptr() as u64, E1.as_ptr() as u64, E2.as_ptr() as u64, E3.as_ptr() as u64, E4.as_ptr() as u64, 0];
                         core::arch::asm!(
                             "int 0x80",
                             inlateout("rax") 59u64 => _,
