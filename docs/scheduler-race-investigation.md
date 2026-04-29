@@ -102,3 +102,67 @@ The fixes proposed in Track 3's report (mostly "make `in_queue` strictly
 self-consistent") are defensible regardless of whether the stall stems from
 the queue-insertion path or the CPU-reschedule path; both are areas where
 the current scheduler relies on more invariants than it actively enforces.
+
+## Update — Track 1 first sched_stress reproduction
+
+`tools/scheduler-repro-loop.sh` run-002 (the first iteration with
+`sched_stress` from Track 2 wired in) reproduced the bug in **seconds**, not
+minutes.  Output:
+
+    [sched_stress] starting workers=8 rounds=10000
+    [sched_stress] BAD reply tag/data
+    [sched_stress] BAD reply tag/data
+    ...
+    [sched_stress] FAILED (worker error)
+    Phase 5h sched_stress: FAILED code=1
+
+"BAD reply tag/data" means a worker received a reply whose tag/data didn't
+match what the server replied with — the IPC reply got mis-routed to a
+different waiter, or its payload got clobbered between the server's
+`syscall::reply` and the kernel-side delivery to the original caller.  This
+is a **strictly harder** failure than "stuck on CallReply" — it indicates
+state-machine corruption, not just a missed wake-up.
+
+The watchdog dump that immediately follows shows the smoking gun:
+
+    cpu0: cur=tid5 task=0 idle=false rq_eevdf=20 has_ready=true def=30 blk=None
+    ...
+    tid=30 Ready CallReply(0) park=0 wake=false prio=50
+           on_cpu=0 in_q=false last_cpu=0 task=25
+
+`cpu0.current_thread = tid5` (idle), yet `tid30.on_cpu = 0` (cpu0).
+`tid30.in_queue = false` and `tid30.state = Ready`.  **The
+`pcpu.current_thread == tid IFF tid.on_cpu == cpu` invariant has been
+violated.**  This is concrete: tid30 *thinks* it's running on cpu0, but cpu0
+is running idle.  Neither side is consistent with the queueing state
+either — `in_queue=false` means tid30 isn't enqueued, so try_switch on cpu0
+won't pick it up; rescue-orphan at line 5349 sees `on=0 (a real CPU)` and
+`cur != tid`, would mark it orphan, but the rescue-age=1 filter or the
+`drain_deferred_requeue` window prevents re-enqueue.
+
+This points at a **preemption path that doesn't reset `on_cpu`** when the
+outgoing thread is preempted-not-blocked.  `try_switch` clears `on_cpu` only
+on the blocking exit path (e.g. `block_current` at line ~5012 stores `MAX`).
+On a timer/IRQ-driven preemption that pushes the prev thread back to the
+runqueue with `state=Ready`, if `on_cpu` retains the cpu-number value, the
+*next* dispatch of that thread observes `on_cpu = real_cpu` and the
+ON_CPU_PENDING CAS at line 2663 fails.
+
+## Next concrete fix candidate
+
+In the preempt-not-block path of `try_switch` (and `percpu_pick_next` /
+`percpu_enqueue`), explicitly store `on_cpu = u32::MAX` (or
+`ON_CPU_PENDING`) on the outgoing thread *before* re-enqueueing it.  The
+ordering should be:
+
+  1. set `state = Ready` on outgoing thread
+  2. set `on_cpu = MAX` (release-store)
+  3. `percpu_enqueue(target, ...)` with the AcqRel `in_queue` swap inside
+
+If this fixes the reproducer, the BAD reply tag/data symptom should also
+disappear — that symptom likely stems from a syscall-return that resumes a
+thread which still has stale on_cpu, with the wrong reply slot in the
+trapframe.
+
+`run-002` archived under `/tmp/sched-runs/run-002.log` for later
+instrumentation.
