@@ -3126,11 +3126,30 @@ pub fn wake_thread(tid: ThreadId) {
     // the server's future fulfill() will see ABANDONED and skip frame
     // injection + wake.  If the server already fulfilled, our CAS fails and
     // the server owns the wake.  This avoids the frame corruption race.
+    //
+    // BUT: only fire the abandon path when the wake represents a *genuine*
+    // interruption — i.e., the thread has been killed or has a pending
+    // unmasked signal.  Incidental wake_thread calls (a stale wake left
+    // over from a previous block_current iteration, a port_wake_one for an
+    // earlier turnstile membership, an IPI-driven reschedule attempt) must
+    // NOT cancel a legitimate in-flight call/reply.  Cancelling such a call
+    // not only frees the cap slot prematurely (allowing reuse before the
+    // server replies — the server's fulfill then fails harmlessly, but the
+    // caller has been mis-informed via CALL_REPLY_INTERRUPTED) but, in the
+    // worst case under rapid call cycles, can race with a fresh sys_call
+    // that has just re-published `blocked_on = CallReply(new_slot)` after
+    // park_state has been re-armed to PARK_COMMITTED — abandoning a brand-
+    // new pending cap with no actual interrupt request behind the wake.
     {
         let park = tref.park_state.load(Ordering::Acquire);
         if park == PARK_COMMITTED {
             let t = unsafe { &*(THREAD_TABLE.get(tid) as *const Thread) };
-            if let BlockReason::CallReply(slot) = t.blocked_on {
+            // Only abandon if there's a genuine interrupt request: thread
+            // killed, or a deliverable (unmasked) signal pending.  This
+            // mirrors the syscall-return signal-check predicate.
+            let killed = tref.killed.load(Ordering::Acquire);
+            let has_signal = (t.sig_pending & !t.sig_mask) != 0;
+            if (killed || has_signal) && let BlockReason::CallReply(slot) = t.blocked_on {
                 if crate::ipc::call_reply::abandon_for_interrupt(slot, tid) {
                     // We won: cap is ABANDONED. Inject an interrupted-call
                     // error into the thread's saved frame so userspace sees a
