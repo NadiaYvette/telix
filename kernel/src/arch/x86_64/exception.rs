@@ -332,6 +332,8 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         // enqueues a thread on our run queue while we are idle.  Only
         // runs try_switch() — no tick accounting, no timer reprogramming.
         0xFD => {
+            super::lapic::IPI_RECV_COUNT
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             super::lapic::eoi();
             return validate_iretq_frame(crate::sched::scheduler::reschedule_ipi(frame_sp), frame_sp, 0xFD);
         }

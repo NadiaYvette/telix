@@ -2185,7 +2185,15 @@ pub fn tick(current_sp: u64) -> u64 {
                             crate::arch::loongarch64::trap::SGI_RECV_COUNT
                                 .load(Ordering::Relaxed),
                         );
+                        #[cfg(target_arch = "x86_64")]
+                        let (sgi_s, sgi_r) = (
+                            crate::arch::x86_64::lapic::IPI_SEND_COUNT
+                                .load(Ordering::Relaxed),
+                            crate::arch::x86_64::lapic::IPI_RECV_COUNT
+                                .load(Ordering::Relaxed),
+                        );
                         #[cfg(not(any(
+                            target_arch = "x86_64",
                             target_arch = "aarch64",
                             target_arch = "riscv64",
                             target_arch = "loongarch64",

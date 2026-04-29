@@ -217,6 +217,14 @@ pub fn program_oneshot(deadline_ns: u64) {
     write(LAPIC_TIMER_INIT, ticks);
 }
 
+/// Reschedule IPI counters (diagnostic).  Incremented in `send_reschedule`
+/// after the LAPIC ICR write and in the 0xFD vector handler at IRQ entry.
+/// Surfaced in the watchdog dump's `sgi=(s=… r=…)` field on x86 so we can
+/// distinguish "parked CPU is being poked but stuck" (counts increasing)
+/// from "CPU is not being poked at all" (counts flat).
+pub static IPI_SEND_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static IPI_RECV_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Send a reschedule IPI (vector 0xFD) to a target CPU.
 ///
 /// The target CPU wakes from HLT (if idle) and runs try_switch(),
@@ -227,6 +235,7 @@ pub fn send_reschedule(target_lapic_id: u32) {
     write(LAPIC_ICR_HIGH, target_lapic_id << 24);
     // Fixed delivery (000), vector 0xFD, edge-triggered, assert.
     write(LAPIC_ICR_LOW, 0xFD);
+    IPI_SEND_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Delay roughly N microseconds using a busy loop.
