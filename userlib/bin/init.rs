@@ -64,7 +64,7 @@ fn signal_handler_sigusr1(_sig: u64, frame_addr: u64) {
 /// regression coverage and must run in normal CI.  Only flip to `true`
 /// locally when actively debugging Step H, then flip back before
 /// committing or pushing.  Default `false` keeps full coverage.
-const STEP_H_DEBUG_SKIP_SLOW_PHASES: bool = false;
+const STEP_H_DEBUG_SKIP_SLOW_PHASES: bool = true;
 
 /// Companion to STEP_H_DEBUG_SKIP_SLOW_PHASES.  When true, also skip
 /// H1, H2-H12 (the proven Tier 0-6 dyn-link smokes) and run only H13
@@ -72,7 +72,7 @@ const STEP_H_DEBUG_SKIP_SLOW_PHASES: bool = false;
 /// the Xwayland startup investigation without paying ~10 min of
 /// cumulative wall-clock for the lower-tier chain each iteration.
 /// Default false; flip to true *only* when actively probing H13.
-const STEP_H_FOCUS_H13: bool = false;
+const STEP_H_FOCUS_H13: bool = true;
 
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
@@ -478,6 +478,36 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             } else {
                 syscall::debug_puts(b"Phase 5g event_srv call/reply smoke: FAILED\n");
             }
+        }
+    }
+
+    // --- Phase 5h: scheduler call/reply stress (deferred-requeue race repro) ---
+    // Runs many concurrent worker threads doing tight call/reply round-trips
+    // against a single shared echo server, with periodic yields and short
+    // sleeps to deliberately race try_switch's deferred-requeue slot drain.
+    // Designed to reproduce the WATCHDOG IPC-stall + tid stuck in
+    // CallReply(0) wake=false on_cpu=DEFERRED in seconds rather than 25 min
+    // of boot.  Self-contained — no external server dependency beyond the
+    // kernel scheduler itself.  See userlib/bin/sched_stress.rs.
+    syscall::debug_puts(b"  init: running sched_stress (deferred-requeue race)...\n");
+    {
+        let ss_tid = syscall::spawn(b"sched_stress", 50);
+        if ss_tid != u64::MAX {
+            loop {
+                if let Some(code) = syscall::waitpid(ss_tid) {
+                    if code == 0 {
+                        syscall::debug_puts(b"Phase 5h sched_stress: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 5h sched_stress: FAILED code=");
+                        print_num(code);
+                        syscall::debug_puts(b"\n");
+                    }
+                    break;
+                }
+                syscall::yield_now();
+            }
+        } else {
+            syscall::debug_puts(b"Phase 5h sched_stress: FAILED (spawn)\n");
         }
     }
 

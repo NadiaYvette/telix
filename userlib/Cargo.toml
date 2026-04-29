@@ -113,6 +113,10 @@ name = "call_reply_test"
 path = "bin/call_reply_test.rs"
 
 [[bin]]
+name = "sched_stress"
+path = "bin/sched_stress.rs"
+
+[[bin]]
 name = "cache_srv"
 path = "bin/cache_srv.rs"
 
