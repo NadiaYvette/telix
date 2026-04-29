@@ -358,3 +358,79 @@ session of kernel work in `kernel/src/sched/scheduler.rs::percpu_enqueue`
 and `kernel/src/ipc/port.rs::wake_parked_thread`.  The reproducer lets
 each iteration of that work happen in seconds rather than 25 minutes of
 boot — that's the major unlock from this investigation.
+
+## Update — phantom-enqueued is also rejected
+
+The phantom-rescue branch (commit `44dfc0d`) exposed a `phantom=N` field
+in the watchdog dump and a `RESCUE-PHANTOM:` log line on each fire.
+Track 1's first instrumented run (run-013) shows:
+
+  - `phantom=0` in **every** watchdog dump (~30 fires across the run).
+  - 0 occurrences of `RESCUE-PHANTOM:` in dmesg.
+
+So the run-007 phantom-enqueued snapshot was a transient state, not a
+persistent bug, and the rescue branch never had to fire.  The thread
+state in stalled run-013 dumps is dominated by:
+
+  - many `Blocked PortRecv(N) park=2 wake=false` (correctly parked
+    receivers),
+  - several `Ready None on_cpu=ON_CPU_PENDING in_q=true` (correctly
+    queued for dispatch),
+  - one or two `Ready CallReply(0) on_cpu=ON_CPU_PENDING in_q=true`
+    (correctly queued workers waiting for replies),
+  - and the classic Bug A pattern: a worker tid in `Ready None on_cpu=
+    cpu_real in_q=false` while `pcpu.current_thread != tid` is on the
+    same cpu_real — but rescue counters are still zero, so even the
+    `stale_on_cpu` rescue branch from `712e741` apparently isn't
+    firing.
+
+Sends and receives both keep growing across watchdog windows
+(`sends=4609 → 4617`, `recvs=838 → 847`), so the system *is* making
+forward progress; it's just slow enough to trip the 5-second
+"no-progress" threshold of the watchdog.  Boot eventually reaches
+Phase 7+ etc.
+
+### Net assessment
+
+This investigation has converted "Telix kernel scheduler is flaky" into
+a series of concrete, named, partially-resolved issues:
+
+  - Bug A scheduler stale-on-cpu: rescue branch added in `712e741`,
+    helps but rescue counter stays 0 in real reproductions — meaning
+    either the rescue predicate doesn't match the real pattern observed
+    here, or the pattern is sub-100ms-transient and rescue catches
+    nothing.
+  - Bug B IPC TOCTOU: real correctness improvement in `712e741`, not
+    the symptom's cause.
+  - `wake_thread` abandon-gate: real correctness improvement in
+    `8c889e5`, not the symptom's cause.
+  - Phantom-enqueued: not the bug — `phantom=0` in instrumented runs.
+  - 25% LAPIC IPI loss: normal IRR coalescing, benign.
+
+The reproducer (sched_stress + repro-loop) and the diagnostic
+counters (`phantom=`, x86 `sgi=(s,r)`, `RESCUE-PHANTOM:`) make any
+future iteration much faster than the 25-min full-boot loop we started
+with.
+
+### Concrete next-session targets
+
+1. **Add an explicit counter for the `stale_on_cpu` rescue branch**
+   (separate from the global `DOUBLE_ENQ_RESCUE` counter that's
+   currently shared with other rescue paths).  This will tell us
+   whether `712e741`'s branch is actually firing — possibly the
+   predicate doesn't match the real run-time pattern.
+2. **Trace one specific tid through the call/reply cycle** under
+   sched_stress: instrument `block_current` (entry into CallReply),
+   `wake_parked_thread` (wake up the receiver), the matching
+   `percpu_enqueue`, and `try_switch`'s dispatch CAS — log per-tid
+   nanosecond timestamps for one worker.  That gives a direct view of
+   where the slowness or missed wake is.
+3. **Profile under -smp 4 vs -smp 2**: SMP=2 was chosen earlier to
+   reduce the deadlock surface, but most of our analysis assumes the
+   bug should be visible under either.  A run with `-smp 4` after
+   today's fixes might shift the failure shape and reveal more.
+
+Investigation ends here for now.  18 commits + a 200-line doc, fast
+reproducer, three rejected hypotheses, two real correctness improvements
+shipped.  Boot now reaches Step H13 under FOCUS_H13 vs Phase 18 in the
+pre-fix baseline.
