@@ -35,7 +35,7 @@ QEMU_ARGS=(
     -cpu $CPU_MODEL
     -m 512M
     -kernel "$KERNEL32"
-    -smp 4
+    -smp 2
 )
 
 # Display mode: TELIX_DISPLAY=gpu|vbe (default: none/nographic).

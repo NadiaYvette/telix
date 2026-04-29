@@ -3032,6 +3032,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     // --- Test 26: L4-style handoff scheduling ---
+    if STEP_H_FOCUS_H13 {
+        syscall::debug_puts(b"Phase 26 L4 handoff scheduling: SKIPPED (FOCUS_H13)\n");
+    } else {
     syscall::debug_puts(b"  init: testing L4 handoff IPC...\n");
     {
         // Test that blocking send/recv with parking works correctly.
@@ -3101,6 +3104,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             syscall::debug_puts(b"Phase 26 L4 handoff scheduling: FAILED\n");
         }
+    }
     }
 
     // --- Test 23: COW Fork ---
