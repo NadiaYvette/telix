@@ -5342,6 +5342,11 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
         // by park), OR stale on_cpu (claims a CPU but that CPU is running a
         // different thread).  Skip ON_CPU_PENDING (transient state during
         // scheduling — rescuing it causes DOUBLE-SCHED).
+        // `stale_on_cpu` distinguishes the "thread thinks it's on cpu N but
+        // cpu N is running a different thread" pattern (Bug A) from the
+        // generic on_cpu==MAX orphan (which has wider race windows with
+        // park/wake paths and warrants the age filter).
+        let mut stale_on_cpu = false;
         let is_orphan = if on == u32::MAX {
             true
         } else if on == ON_CPU_PENDING {
@@ -5349,7 +5354,9 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
         } else if on < ncpus as u32 {
             // Check if the claimed CPU is actually running this thread.
             let cur = smp::get(on).current_thread.load(Ordering::Acquire);
-            cur != tid as u32
+            let stale = cur != tid as u32;
+            stale_on_cpu = stale;
+            stale
         } else {
             false // garbage value — don't touch
         };
@@ -5358,15 +5365,24 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
             continue;
         }
         {
-            // Track orphan age: only rescue after 2+ consecutive sweeps to
-            // filter false positives from the narrow dequeue window where
-            // in_queue=false but on_cpu hasn't been set to ON_CPU_PENDING yet.
+            // Track orphan age: filter false positives from the narrow
+            // dequeue window where in_queue=false but on_cpu hasn't been set
+            // to ON_CPU_PENDING yet.
+            //
+            // The stale-on-cpu pattern (state=Ready, on_cpu=cpu_real,
+            // !in_queue, cur!=tid) is unambiguous: every legitimate path
+            // either keeps the thread Running on that CPU, transitions
+            // on_cpu through ON_CPU_PENDING (filtered above), or holds the
+            // thread in a deferred slot (checked below).  Skip the age
+            // filter for this pattern — the age filter prevents recovery
+            // because tid oscillates through transient non-orphan states
+            // between 100ms rescue sweeps, resetting the counter (Bug A).
             let age = if (tid as usize) < ORPHAN_AGE.len() {
                 ORPHAN_AGE[tid as usize].fetch_add(1, Ordering::Relaxed)
             } else {
                 1 // always rescue for high tids (shouldn't happen in practice)
             };
-            if age < 1 {
+            if !stale_on_cpu && age < 1 {
                 continue; // first sighting — wait one more sweep to confirm
             }
             // Just-in-time deferred slot check: read ALL deferred slots NOW,
@@ -5425,6 +5441,13 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     park, wake, src, blk, heap_pos
                 );
                 if (tid as usize) < ORPHAN_AGE.len() { ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed); }
+                // Reset on_cpu so that when this thread is later dispatched,
+                // try_switch's CAS (ON_CPU_PENDING -> cpu) succeeds.
+                // dequeue_set_pending already does this on the dispatch
+                // side, but doing it here closes a window where a concurrent
+                // try_switch reads on_cpu as a stale CPU number before
+                // dequeue.
+                t.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
                 trace_sched(tid as u32, 8); // 8=rescue_enq
                 set_enq_tag(7); // 7=rescue
                 percpu_enqueue(target, prio, tid as ThreadId);

@@ -335,12 +335,25 @@ fn revoke_cap_leases(cap: &ReplyCap) {
 /// Returns the caller TID to wake, or None if the cap was abandoned (in
 /// which case the reply is dropped and the slot is freed here).
 pub fn fulfill(handle: CapHandle, reply: &Message) -> FulfillResult {
-    let cap = match lookup(handle) {
-        Some(c) => c,
+    // Decode the handle so we have the (slot, gen) pair available for
+    // re-validation after the state CAS — the cap could in principle be
+    // freed and re-allocated between `lookup` and the CAS, in which case
+    // CAS would succeed against the *new* PENDING owner and we'd deliver
+    // the reply to the wrong caller.
+    let (slot, expected_gen) = match decode_handle(handle) {
+        Some(p) => p,
         None => return FulfillResult::InvalidHandle,
     };
-    cap.store_reply(reply);
-    // Atomically claim the cap.
+    let cap = &REPLY_CAPS[slot as usize];
+    if cap.generation.load(Ordering::Acquire) != expected_gen {
+        return FulfillResult::InvalidHandle;
+    }
+    // Atomically claim the cap.  Note: we deliberately do NOT write the
+    // reply payload before the CAS — the payload is delivered by the
+    // caller (sys_reply) directly into the parked thread's frame via
+    // inject_recv_into_frame, not read from the cap.  Writing to the cap
+    // before the CAS would risk clobbering a recycled cap's storage if
+    // the handle is stale (lookup races free+alloc).
     match cap.state.compare_exchange(
         CAP_PENDING,
         CAP_FULFILLED,
@@ -348,7 +361,36 @@ pub fn fulfill(handle: CapHandle, reply: &Message) -> FulfillResult {
         Ordering::Acquire,
     ) {
         Ok(_) => {
+            // Re-validate generation under the FULFILLED state.  If the
+            // cap was freed and re-allocated between our lookup and the
+            // CAS, the CAS may have just claimed the *new* PENDING owner
+            // — caller_tid would be the new caller, and waking it would
+            // mis-route the reply to the wrong thread.  In that case undo
+            // the FULFILLED transition (restore PENDING for the new
+            // owner) and report invalid.
+            let cur_gen = cap.generation.load(Ordering::Acquire);
+            if cur_gen != expected_gen {
+                let _ = cap.state.compare_exchange(
+                    CAP_FULFILLED,
+                    CAP_PENDING,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+                return FulfillResult::InvalidHandle;
+            }
+            cap.store_reply(reply);
             let tid = cap.caller_tid.load(Ordering::Acquire);
+            if tid == 0 {
+                // Caller TID 0 is invalid (idle / not a real caller).
+                // Treat as InvalidHandle rather than wake tid=0.
+                let _ = cap.state.compare_exchange(
+                    CAP_FULFILLED,
+                    CAP_PENDING,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+                return FulfillResult::InvalidHandle;
+            }
             FulfillResult::WakeCaller(tid)
         }
         Err(CAP_ABANDONED) => {
