@@ -102,6 +102,25 @@ if [ -f "${LIBC_SO}" ]; then
     else
         echo "===> WARNING: libc.so.6 __intl_freemem signature changed; not patching" >&2
     fi
+
+    # Patch __dcigettext at 0x13820 to a fast no-translation
+    # `mov %rsi, %rax; ret` (returns msgid1 unchanged).  Same defensive
+    # rationale as __intl_freemem: under Telix's personality, Xwayland's
+    # threads occasionally land in the middle of __dcigettext's
+    # instruction stream (RIP=libc+0x1405d, mid-jmp-displacement) and
+    # GP-fault.  TLS / FSBASE corruption is the suspected upstream
+    # cause; until that's properly diagnosed, short-circuit gettext
+    # entirely so its body never executes.  C-locale binaries like
+    # Xwayland (with LANG=C) get back the same untranslated string
+    # they passed in, so this is functionally a no-op for them.
+    if [ "$(xxd -s 0x13820 -l 4 -p "${LIBC_SO}")" = "f30f1efa" ]; then
+        printf '\x48\x89\xf0\xc3' | dd of="${LIBC_SO}" bs=1 seek=79904 count=4 conv=notrunc 2>/dev/null
+        echo "===> patched libc.so.6 __dcigettext -> mov rsi,rax; ret"
+    elif [ "$(xxd -s 0x13820 -l 4 -p "${LIBC_SO}")" = "4889f0c3" ]; then
+        : # already patched
+    else
+        echo "===> WARNING: libc.so.6 __dcigettext signature changed; not patching" >&2
+    fi
 fi
 
 # Dedupe: when fetch produces both libfoo.so.X (the soname) and
