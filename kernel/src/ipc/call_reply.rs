@@ -335,6 +335,7 @@ fn revoke_cap_leases(cap: &ReplyCap) {
 /// Returns the caller TID to wake, or None if the cap was abandoned (in
 /// which case the reply is dropped and the slot is freed here).
 pub fn fulfill(handle: CapHandle, reply: &Message) -> FulfillResult {
+    crate::sched::scheduler::trace_point("call_reply.fulfill.entry", u32::MAX);
     // Decode the handle so we have the (slot, gen) pair available for
     // re-validation after the state CAS — the cap could in principle be
     // freed and re-allocated between `lookup` and the CAS, in which case
@@ -380,6 +381,7 @@ pub fn fulfill(handle: CapHandle, reply: &Message) -> FulfillResult {
             }
             cap.store_reply(reply);
             let tid = cap.caller_tid.load(Ordering::Acquire);
+            crate::sched::scheduler::trace_point("call_reply.fulfill.cas_ok", tid);
             if tid == 0 {
                 // Caller TID 0 is invalid (idle / not a real caller).
                 // Treat as InvalidHandle rather than wake tid=0.

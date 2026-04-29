@@ -149,6 +149,12 @@ extern "C" fn server_entry(_arg: u64) -> ! {
 extern "C" fn worker_entry(arg: u64) -> ! {
     let idx = arg as usize;
     let port = SERVER_PORT.load(Ordering::Acquire);
+    // Worker 0 opts itself in as the kernel-side trace target for the
+    // call/reply slow-path investigation.  See sys_debug_puts sentinel
+    // and `TRACE_TID` in kernel/src/sched/scheduler.rs.
+    if idx == 0 {
+        syscall::debug_puts(b"!TRACE_ME!\n");
+    }
     for round in 0..N_ROUNDS {
         WORKER_ROUND[idx].store(round, Ordering::Relaxed);
         // call() blocks the worker on CallReply against the server until

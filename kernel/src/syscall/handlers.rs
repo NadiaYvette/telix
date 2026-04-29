@@ -1525,6 +1525,17 @@ fn sys_debug_puts(buf_ptr: u64, buf_len: u64) -> u64 {
     if !copy_from_user(pt_root, buf_ptr as usize, &mut buf[..len]) {
         return u64::MAX;
     }
+    // Sentinel: caller can opt itself in as the trace target by writing
+    // exactly this string.  Used by sched_stress (Phase 5h) worker 0 to
+    // get a per-tid trace through the call/reply cycle.  Cheap one-shot
+    // detection — no separate syscall needed.
+    const TRACE_SENTINEL: &[u8] = b"!TRACE_ME!\n";
+    if &buf[..len] == TRACE_SENTINEL {
+        let tid = crate::sched::scheduler::current_thread_id() as u32;
+        crate::sched::scheduler::TRACE_TID.store(tid, core::sync::atomic::Ordering::Release);
+        crate::println!("[trace] TRACE_TID set to tid={}", tid);
+        return 0;
+    }
     for &ch in &buf[..len] {
         if ch == b'\n' {
             crate::arch::platform::serial::putc(b'\r');

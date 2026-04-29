@@ -130,6 +130,38 @@ const ON_CPU_PENDING: u32 = u32::MAX - 1;
 #[allow(dead_code)]
 const ON_CPU_DEFERRED: u32 = u32::MAX - 2;
 
+// ---------------------------------------------------------------------------
+// Targeted per-tid trace (call/reply slow-path investigation).
+// ---------------------------------------------------------------------------
+//
+// `TRACE_TID` is a single ThreadId.  When non-zero, scheduler/IPC trace
+// points emit a one-line ns-stamped log whenever the matched tid is
+// involved (either as `current_thread_id()` or as the explicit subject of
+// a wake/enqueue).  Set from userspace via `sys_debug_puts` with the
+// sentinel payload `b"!TRACE_ME!\n"` — see `sys_debug_puts`.  Initialised
+// to 0 at boot (no-trace).
+pub static TRACE_TID: AtomicU32 = AtomicU32::new(0);
+
+/// Emit a trace line if either the current thread or `subject` matches
+/// `TRACE_TID`.  Subject = u32::MAX means "current only".
+#[inline]
+pub fn trace_point(label: &'static str, subject: u32) {
+    let want = TRACE_TID.load(Ordering::Relaxed);
+    if want == 0 {
+        return;
+    }
+    let cur = current_thread_id();
+    if cur as u32 != want && subject != want {
+        return;
+    }
+    let ns = crate::arch::timer::monotonic_ns();
+    let cpu = smp::cpu_id();
+    crate::println!(
+        "[trace tid={} subj={} label={} cpu={} ts={}]",
+        cur, subject, label, cpu, ns
+    );
+}
+
 /// Get a thread reference by ID via radix lookup (lockless).
 #[inline]
 pub fn thread_ref(tid: u32) -> &'static Thread {
@@ -846,6 +878,18 @@ static ENQ_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// but no actual heap or bitmap membership on their `last_cpu`'s run queue.
 /// Driven by `rescue_orphaned_threads_impl`'s self-healing pass.
 static RESCUE_PHANTOM: AtomicU64 = AtomicU64::new(0);
+/// Per-branch rescue counters in `rescue_orphaned_threads_impl`.  Splits the
+/// global `DOUBLE_ENQ_RESCUE` count by which predicate fired so we can tell
+/// which orphan pattern is occurring during an IPC stall.
+/// `RESCUE_MAX`: orphan path where `on_cpu == u32::MAX`.
+/// `RESCUE_STALE_ON_CPU`: Bug A fix branch (commit 712e741) — `on_cpu` claims
+/// a real CPU but that CPU's `current_thread` is a different tid.
+/// `RESCUE_PENDING`: observed `on_cpu == ON_CPU_PENDING` during the scan.
+/// Currently filtered out (transient dispatch state) so no rescue action is
+/// taken, but the counter catches how often we observe it.
+static RESCUE_MAX: AtomicU64 = AtomicU64::new(0);
+static RESCUE_STALE_ON_CPU: AtomicU64 = AtomicU64::new(0);
+static RESCUE_PENDING: AtomicU64 = AtomicU64::new(0);
 
 fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
     // Double-enqueue detection.  Benign race: rescue_orphaned_threads may
@@ -855,6 +899,7 @@ fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
     // lock would deadlock with concurrent output on other CPUs.
     if thread_ref(tid).in_queue.swap(true, Ordering::AcqRel) {
         trace_sched(tid, 11); // 11=double_enq
+        trace_point("percpu_enqueue.skip_in_queue", tid as u32);
         let src = get_enq_tag();
         match src {
             1 => { DOUBLE_ENQ_DRAIN.fetch_add(1, Ordering::Relaxed); }
@@ -864,6 +909,7 @@ fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
         }
         return; // Don't enqueue again.
     }
+    trace_point("percpu_enqueue.insert", tid as u32);
     ENQ_TOTAL.fetch_add(1, Ordering::Relaxed);
     let mut rq = percpu_rq()[target_cpu as usize].lock();
     let t = thread_ref(tid);
@@ -2236,13 +2282,16 @@ pub fn tick(current_sp: u64) -> u64 {
                             target_arch = "loongarch64",
                         )))]
                         let (sgi_s, sgi_r): (u64, u64) = (0, 0);
-                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} phantom={} sgi=(s={} r={})",
+                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={}) sgi=(s={} r={})",
                             sends, recvs,
                             DOUBLE_ENQ_DRAIN.load(Ordering::Relaxed),
                             DOUBLE_ENQ_RESCUE.load(Ordering::Relaxed),
                             DOUBLE_ENQ_WAKE.load(Ordering::Relaxed),
                             DOUBLE_ENQ_OTHER.load(Ordering::Relaxed),
                             ENQ_TOTAL.load(Ordering::Relaxed),
+                            RESCUE_MAX.load(Ordering::Relaxed),
+                            RESCUE_STALE_ON_CPU.load(Ordering::Relaxed),
+                            RESCUE_PENDING.load(Ordering::Relaxed),
                             RESCUE_PHANTOM.load(Ordering::Relaxed),
                             sgi_s, sgi_r);
                         // Per-CPU state: what each CPU is running, RQ sizes
@@ -2708,6 +2757,7 @@ fn try_switch(current_sp: u64) -> u64 {
         if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
             ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire,
         ) {
+            trace_point("try_switch.cas_fail", next_id as u32);
             crate::println!(
                 "DOUBLE-SCHED: tid={} on_cpu={} this_cpu={} prev={} src={} set_by={} inq={} state={:?}",
                 next_id, other_cpu, cpu, prev_id,
@@ -2722,6 +2772,7 @@ fn try_switch(current_sp: u64) -> u64 {
             pcpu.current_thread.store(idle_id, Ordering::Relaxed);
             return idle_sp;
         }
+        trace_point("try_switch.cas_ok", next_id as u32);
         thread_ref(next_id).on_cpu_set_by.store(1, Ordering::Relaxed); // 1=try_switch
         // Set Running IMMEDIATELY after CAS to close the TOCTOU window:
         // between CAS(on_cpu=cpu) and state=Running, rescue sees
@@ -3007,6 +3058,11 @@ pub fn clear_wakeup_flag(tid: ThreadId) {
 /// the relevant lock, BEFORE adding itself as a waiter and dropping the lock.
 pub fn block_current(_reason: BlockReason) {
     let tid = current_thread_id();
+    if matches!(_reason, BlockReason::CallReply(_)) {
+        trace_point("block_current.CallReply", tid as u32);
+    } else {
+        trace_point("block_current.entry", tid as u32);
+    }
     // Demote effective_priority to 254 (lowest non-idle) so try_switch
     // re-enqueues us at the bottom. This prevents blocked-spinning threads
     // from starving lower-priority threads on single-CPU.
@@ -5066,6 +5122,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
             get_monotonic_ns(),
             Ordering::Release,
         );
+        trace_point("park_ipc.CallReply", tid as u32);
     }
 
     // Release on_cpu BEFORE committing park_state. Once park_state is
@@ -5232,6 +5289,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
 ///   Set state = Ready and enqueue on a run queue.
 pub fn wake_parked_thread(tid: ThreadId) {
     let tref = thread_ref(tid);
+    trace_point("wake_parked.entry", tid as u32);
 
     // Try early wake: CAS PARK_ENQUEUED → PARK_NONE.
     // If the thread hasn't committed to parking yet, just prevent the park.
@@ -5242,6 +5300,7 @@ pub fn wake_parked_thread(tid: ThreadId) {
         .compare_exchange(PARK_ENQUEUED, PARK_NONE, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
+        trace_point("wake_parked.early_wake", tid as u32);
         unsafe { thread_mut_from_ref(tid) }.ipc_frame_sp = 0;
         return;
     }
@@ -5253,6 +5312,7 @@ pub fn wake_parked_thread(tid: ThreadId) {
         .compare_exchange(PARK_COMMITTED, PARK_NONE, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
+        trace_point("wake_parked.committed_wake", tid as u32);
         unsafe { thread_mut_from_ref(tid) }.ipc_frame_sp = 0;
         // park_current_for_ipc staged a context switch on the parking CPU.
         // The actual stack switch (`mov rsp, rax`) happens later in assembly.
@@ -5279,11 +5339,13 @@ pub fn wake_parked_thread(tid: ThreadId) {
             // in case the waker enters a user-space loop without syscalls.
             smp::get(waker_cpu).need_resched.store(true, Ordering::Release);
             crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
+            trace_point("wake_parked.local_resched", tid as u32);
         } else {
             // Remote: send IPI to wake from HLT.  The IPI fires try_switch
             // which drains the deferred slot and picks from the queue at
             // the next quantum boundary.
             crate::arch::irq::send_reschedule_ipi(target);
+            trace_point("wake_parked.remote_ipi", tid as u32);
         }
     } else {
         // Both CAS operations failed — park_state is already PARK_NONE.
@@ -5415,7 +5477,11 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
         let is_orphan = if on == u32::MAX {
             true
         } else if on == ON_CPU_PENDING {
-            false // transient — dequeue_set_pending just set this
+            // Transient — dequeue_set_pending just set this.  Count
+            // observations so we know how often the scan sees this state,
+            // even though we deliberately don't rescue here.
+            RESCUE_PENDING.fetch_add(1, Ordering::Relaxed);
+            false
         } else if on < ncpus as u32 {
             // Check if the claimed CPU is actually running this thread.
             let cur = smp::get(on).current_thread.load(Ordering::Acquire);
@@ -5583,6 +5649,15 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 t.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
                 trace_sched(tid as u32, 8); // 8=rescue_enq
                 set_enq_tag(7); // 7=rescue
+                // Per-branch rescue counter: the two predicates that lead
+                // here are mutually exclusive.  `stale_on_cpu` is the Bug A
+                // pattern from commit 712e741; otherwise the orphan was
+                // detected via `on == u32::MAX`.
+                if stale_on_cpu {
+                    RESCUE_STALE_ON_CPU.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    RESCUE_MAX.fetch_add(1, Ordering::Relaxed);
+                }
                 percpu_enqueue(target, prio, tid as ThreadId);
             }
         }
