@@ -441,12 +441,30 @@ pub fn create_anon(page_count: u16) -> Option<ObjectId> {
         core::ptr::write(&mut (*ptr).inner, SpinLock::new(obj));
     }
 
-    // DEBUG: verify the just-created port is immediately resolvable
+    // DEBUG: verify the just-created port is immediately resolvable. If it
+    // isn't, emit structured diagnostics that pinpoint where the lookup
+    // failed (which descent step in the ART, or whether the port is in
+    // the ART but not flagged alive). See `art::LookupOutcome` and
+    // `port::PortRefDiag` for the schema.
     if resolve_entry(kernel_port).is_none() {
+        let root = port::port_art_root_snapshot();
         crate::println!(
-            "BUG: create_anon: port {} created but resolve_entry failed immediately! ptr={:#x}",
-            kernel_port, ptr as usize
+            "BUG: create_anon: port {} not resolvable! ptr={:#x} art_root={:#x}",
+            kernel_port, ptr as usize, root
         );
+        match port::port_ref_diag(kernel_port) {
+            port::PortRefDiag::Found =>
+                crate::println!("  port_ref_diag: Found (port_kernel_data probably saw is_kernel_held()==false; kernel_handler may not have been written yet?)"),
+            port::PortRefDiag::NotInArt(outcome) =>
+                crate::ipc::art::print_lookup_outcome(
+                    "  port_ref_diag.NotInArt", port::port_local(kernel_port), outcome,
+                ),
+            port::PortRefDiag::NotAlive { flags, kernel_handler_nz } =>
+                crate::println!(
+                    "  port_ref_diag: NotAlive flags={:#x} kernel_handler_nz={}",
+                    flags, kernel_handler_nz
+                ),
+        }
     }
 
     Some(kernel_port)
@@ -664,13 +682,24 @@ where
         Some(p) => p,
         None => {
             let caller = core::panic::Location::caller();
-            // Detailed diagnostics: check individual steps of resolve_entry
-            let port_exists = port::port_ref(id).is_some();
-            let port_data = port::port_kernel_data(id);
+            let root = port::port_art_root_snapshot();
             crate::println!(
-                "with_object DIAG: id={} port_exists={} kernel_data={:?} caller={}:{}",
-                id, port_exists, port_data, caller.file(), caller.line()
+                "with_object DIAG: id={} art_root={:#x} caller={}:{}",
+                id, root, caller.file(), caller.line()
             );
+            match port::port_ref_diag(id) {
+                port::PortRefDiag::Found =>
+                    crate::println!("  port_ref_diag: Found (resolve_entry None due to is_kernel_held()==false; kernel_handler write was clobbered or never landed)"),
+                port::PortRefDiag::NotInArt(outcome) =>
+                    crate::ipc::art::print_lookup_outcome(
+                        "  port_ref_diag.NotInArt", port::port_local(id), outcome,
+                    ),
+                port::PortRefDiag::NotAlive { flags, kernel_handler_nz } =>
+                    crate::println!(
+                        "  port_ref_diag: NotAlive flags={:#x} kernel_handler_nz={}",
+                        flags, kernel_handler_nz
+                    ),
+            }
             panic!(
                 "with_object: invalid ObjectId {} at {}:{}",
                 id,

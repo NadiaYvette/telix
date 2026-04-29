@@ -357,6 +357,18 @@ impl PortArt {
         Some(unsafe { &*(ptr as *const Port) })
     }
 
+    /// Diagnostic lookup — see `Art::lookup_diag`.
+    #[inline]
+    fn inner_lookup_diag(&self, local: u64) -> super::art::LookupOutcome {
+        unsafe { &*self.inner.get() }.lookup_diag(local)
+    }
+
+    /// Snapshot the ART root pointer (for diagnostics).
+    #[inline]
+    pub fn root_snapshot(&self) -> usize {
+        unsafe { &*self.inner.get() }.root_snapshot()
+    }
+
     /// Insert a port. Must hold ART_WRITE_LOCK.
     fn insert(&self, local: u64, ptr: *mut Port) -> bool {
         unsafe { &mut *self.inner.get() }.insert(local, ptr as usize)
@@ -397,6 +409,44 @@ pub(crate) fn port_ref(port_id: PortId) -> Option<&'static Port> {
     let local = port_local(port_id);
     let port = PORT_ART.lookup(local)?;
     if port.is_alive() { Some(port) } else { None }
+}
+
+/// Detailed outcome of `port_ref` for diagnostic call sites.
+pub enum PortRefDiag {
+    Found,
+    NotInArt(super::art::LookupOutcome),
+    NotAlive { flags: u32, kernel_handler_nz: bool },
+}
+
+/// Snapshot of the PORT_ART root pointer — for one-shot diagnostics.
+pub fn port_art_root_snapshot() -> usize {
+    PORT_ART.root_snapshot()
+}
+
+/// Like `port_ref`, but reports exactly why lookup failed.
+pub fn port_ref_diag(port_id: PortId) -> PortRefDiag {
+    let local = port_local(port_id);
+    let outcome = PORT_ART.inner_lookup_diag(local);
+    match outcome {
+        super::art::LookupOutcome::Found(_) => {
+            // ART found it — re-check is_alive on the actual Port.
+            match PORT_ART.lookup(local) {
+                Some(p) => {
+                    let flags = p.flags.load(Ordering::Acquire);
+                    if flags & PORT_ALIVE != 0 {
+                        PortRefDiag::Found
+                    } else {
+                        PortRefDiag::NotAlive {
+                            flags,
+                            kernel_handler_nz: p.kernel_handler != 0,
+                        }
+                    }
+                }
+                None => PortRefDiag::NotInArt(outcome), // shouldn't happen but be safe
+            }
+        }
+        _ => PortRefDiag::NotInArt(outcome),
+    }
 }
 
 

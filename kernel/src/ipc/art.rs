@@ -562,6 +562,55 @@ unsafe fn num_children(node_ptr: usize) -> u8 {
 /// Readers are lock-free via RCU; only writers need this lock.
 pub static ART_WRITE_LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
 
+/// Structured outcome of a diagnostic lookup. See `Art::lookup_diag`.
+/// `Display` is implemented via `print_lookup_outcome` (no_std-friendly
+/// — emits via `println!` directly so we don't have to plumb a fmt::Write).
+#[derive(Copy, Clone)]
+pub enum LookupOutcome {
+    Found(usize),
+    EmptySlot { step: u32, depth: u32 },
+    LeafKeyMismatch { leaf_key: u64, wanted: u64, depth: u32 },
+    PartialMismatch { depth: u32, partial_byte: u8, wanted: u8, node_ptr: usize, node_type: u8 },
+    DepthExceededInPartial { depth: u32, plen: u32 },
+    DepthExceededAfterPartial { depth: u32 },
+    MissingChild { depth: u32, byte: u8, node_ptr: usize, node_type: u8, num_children: u8 },
+    WalkRunaway { depth: u32 },
+}
+
+/// Emit a single-line description of a LookupOutcome to the kernel log.
+pub fn print_lookup_outcome(prefix: &str, key: u64, outcome: LookupOutcome) {
+    match outcome {
+        LookupOutcome::Found(v) =>
+            crate::println!("{}: key={} → Found(value={:#x})", prefix, key, v),
+        LookupOutcome::EmptySlot { step, depth } =>
+            crate::println!("{}: key={} → EmptySlot step={} depth={}", prefix, key, step, depth),
+        LookupOutcome::LeafKeyMismatch { leaf_key, wanted, depth } =>
+            crate::println!(
+                "{}: key={} → LeafKeyMismatch leaf_key={} wanted={} depth={}",
+                prefix, key, leaf_key, wanted, depth
+            ),
+        LookupOutcome::PartialMismatch { depth, partial_byte, wanted, node_ptr, node_type } =>
+            crate::println!(
+                "{}: key={} → PartialMismatch depth={} partial={:#x} wanted={:#x} node={:#x} type={}",
+                prefix, key, depth, partial_byte, wanted, node_ptr, node_type
+            ),
+        LookupOutcome::DepthExceededInPartial { depth, plen } =>
+            crate::println!(
+                "{}: key={} → DepthExceededInPartial depth={} plen={}",
+                prefix, key, depth, plen
+            ),
+        LookupOutcome::DepthExceededAfterPartial { depth } =>
+            crate::println!("{}: key={} → DepthExceededAfterPartial depth={}", prefix, key, depth),
+        LookupOutcome::MissingChild { depth, byte, node_ptr, node_type, num_children } =>
+            crate::println!(
+                "{}: key={} → MissingChild depth={} byte={:#x} node={:#x} type={} nc={}",
+                prefix, key, depth, byte, node_ptr, node_type, num_children
+            ),
+        LookupOutcome::WalkRunaway { depth } =>
+            crate::println!("{}: key={} → WalkRunaway depth={}", prefix, key, depth),
+    }
+}
+
 /// An Adaptive Radix Tree mapping 48-bit keys to usize values.
 pub struct Art {
     root: usize,
@@ -617,6 +666,94 @@ impl Art {
             node = unsafe { find_child(node, byte) };
             depth += 1;
         }
+    }
+
+    /// Lookup with structured outcome — used by diagnostic call sites.
+    /// Walks the same path as `lookup` but reports exactly which step
+    /// failed, so a single repro of an invariant violation pinpoints the
+    /// faulting descent step instead of just yielding a None.
+    pub fn lookup_diag(&self, key: u64) -> LookupOutcome {
+        let root = unsafe { slot_load(&self.root) };
+        let mut node = root;
+        let mut depth: usize = 0;
+        let mut step: u32 = 0;
+
+        loop {
+            if node == 0 {
+                return LookupOutcome::EmptySlot {
+                    step,
+                    depth: depth as u32,
+                };
+            }
+            if is_leaf(node) {
+                let leaf = unsafe { &*untag_leaf(node) };
+                if leaf.key == key {
+                    return LookupOutcome::Found(leaf.value);
+                } else {
+                    return LookupOutcome::LeafKeyMismatch {
+                        leaf_key: leaf.key,
+                        wanted: key,
+                        depth: depth as u32,
+                    };
+                }
+            }
+
+            let h = unsafe { &*(node as *const Header) };
+            let plen = h.partial_len as usize;
+            let nt = h.node_type;
+            let nc = h.num_children;
+
+            for i in 0..plen {
+                if depth + i >= KEY_LEN {
+                    return LookupOutcome::DepthExceededInPartial {
+                        depth: (depth + i) as u32,
+                        plen: plen as u32,
+                    };
+                }
+                let want = key_at(key, depth + i);
+                if h.partial[i] != want {
+                    return LookupOutcome::PartialMismatch {
+                        depth: (depth + i) as u32,
+                        partial_byte: h.partial[i],
+                        wanted: want,
+                        node_ptr: node,
+                        node_type: nt,
+                    };
+                }
+            }
+            depth += plen;
+
+            if depth >= KEY_LEN {
+                return LookupOutcome::DepthExceededAfterPartial {
+                    depth: depth as u32,
+                };
+            }
+
+            let byte = key_at(key, depth);
+            let next = unsafe { find_child(node, byte) };
+            if next == 0 {
+                return LookupOutcome::MissingChild {
+                    depth: depth as u32,
+                    byte,
+                    node_ptr: node,
+                    node_type: nt,
+                    num_children: nc,
+                };
+            }
+            node = next;
+            depth += 1;
+            step += 1;
+            if step > 32 {
+                return LookupOutcome::WalkRunaway { depth: depth as u32 };
+            }
+        }
+    }
+
+    /// Snapshot of the root pointer (atomic load) — for diagnostics that
+    /// want to compare what the writer just published with what the
+    /// reader observed on the same thread.
+    pub fn root_snapshot(&self) -> usize {
+        unsafe { slot_load(&self.root) }
     }
 
     /// Insert a (key, value) pair. Returns true on success, false on OOM.
