@@ -2556,6 +2556,61 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         return fd as u64;
     }
 
+    // /tmp/.tX*-lock and /tmp/.X*-lock — X server lock files.
+    // Xorg's LockServer() does:
+    //   open("/tmp/.tX{N}-lock", O_CREAT|O_EXCL|O_WRONLY, 0444)
+    //   write(fd, "PID\n", ...)
+    //   link("/tmp/.tX{N}-lock", "/tmp/.X{N}-lock")
+    //   unlink("/tmp/.tX{N}-lock")
+    // Then on shutdown unlink("/tmp/.X{N}-lock").
+    //
+    // ext_srv has FS_CREATE but only for the root directory; a proper
+    // O_CREAT path through VFS to nested ext dirs isn't wired up yet.
+    // Lock files are inherently ephemeral PID state — they don't need
+    // persistence across runs — so intercept them here with a memfd
+    // and let Xorg's link()/unlink() succeed as no-ops via existing
+    // virtual handlers.  Same shape as the /dev/shm fast path above.
+    let is_x_lock_path = pathlen >= 9
+        && &path[..6] == b"/tmp/."
+        && (path[6] == b'X' || (path[6] == b't' && pathlen >= 10 && path[7] == b'X'))
+        && path[..pathlen].ends_with(b"-lock");
+    if is_x_lock_path {
+        let slot_idx = unsafe {
+            let mut found = None;
+            for i in 0..MAX_MEMFD_INSTANCES {
+                if !MEMFD_TABLE[i].active {
+                    found = Some(i);
+                    break;
+                }
+            }
+            found
+        };
+        let slot_idx = match slot_idx {
+            Some(i) => i,
+            None => return linux_err(EMFILE),
+        };
+        let fd = match alloc_fd(pi) {
+            Some(f) => f,
+            None => return linux_err(EMFILE),
+        };
+        unsafe {
+            MEMFD_TABLE[slot_idx] = MemFdSlot::empty();
+            MEMFD_TABLE[slot_idx].active = true;
+            MEMFD_TABLE[slot_idx].refcount = 1;
+
+            PROC_TABLE[pi].fds[fd] = FdEntry::empty();
+            PROC_TABLE[pi].fds[fd].in_use = true;
+            PROC_TABLE[pi].fds[fd].kind = FdKind::MemFd;
+            PROC_TABLE[pi].fds[fd].handle = slot_idx as u64;
+            PROC_TABLE[pi].fds[fd].file_size = 0;
+            PROC_TABLE[pi].fds[fd].offset = 0;
+            if flags & 0x80000 != 0 { // O_CLOEXEC
+                PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+            }
+        }
+        return fd as u64;
+    }
+
     // /proc pseudo-filesystem — generate content on open.
     if pathlen >= 6 && &path[..6] == b"/proc/" {
         return open_proc_file(pi, caller_port, &path[..pathlen], flags);
@@ -4907,8 +4962,14 @@ fn handle_unlink_impl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         return 0;
     }
     // /run/user/0/* and /tmp/.X11-unix/* unlink — no-op (socket cleanup before bind).
+    // /tmp/.X*-lock and /tmp/.tX*-lock unlink — no-op (X server lock-file
+    // cleanup; matches the memfd-backed open intercept above).
     if (pathlen > 13 && &path[..13] == b"/run/user/0/")
         || (pathlen > 16 && &path[..16] == b"/tmp/.X11-unix/")
+        || (pathlen >= 9
+            && &path[..6] == b"/tmp/."
+            && (path[6] == b'X' || (path[6] == b't' && pathlen >= 10 && path[7] == b'X'))
+            && path[..pathlen].ends_with(b"-lock"))
     {
         return 0;
     }
@@ -9504,7 +9565,30 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if newdirfd != AT_FDCWD && (newdirfd as i64) >= 0 { linux_err(ENOSYS) }
                 else { do_symlink(pi, caller_port, msg.data[0] as usize, msg.data[2] as usize) }
             }
-            __NR_LINK | __NR_LINKAT => linux_err(ENOSYS), // no hard link support
+            __NR_LINK | __NR_LINKAT => {
+                // No general hard-link support, but Xorg's LockServer
+                // does link("/tmp/.tX0-lock", "/tmp/.X0-lock") atomically
+                // to publish the lock file.  Both paths are virtual
+                // X-lock files served by linux_srv's memfd intercept;
+                // since neither has any persistent state to update,
+                // accept the link as a no-op success.  Sniff the source
+                // path arg to verify it's an X lock-file before lying.
+                let path1_va = if msg.tag == __NR_LINKAT { msg.data[1] as usize }
+                               else { msg.data[0] as usize };
+                let mut buf = [0u8; 64];
+                let n = syscall::personality_copy_in(caller_port, path1_va, &mut buf[..]);
+                let pl = if n > 0 { buf.iter().take(n).position(|&b| b == 0).unwrap_or(n) }
+                         else { 0 };
+                if pl >= 9
+                    && &buf[..6] == b"/tmp/."
+                    && (buf[6] == b'X' || (buf[6] == b't' && pl >= 10 && buf[7] == b'X'))
+                    && buf[..pl].ends_with(b"-lock")
+                {
+                    0
+                } else {
+                    linux_err(ENOSYS)
+                }
+            }
 
             // Phase 152: scheduler, memory, sendfile.
             __NR_SCHED_SETSCHEDULER | __NR_SCHED_SETPARAM => 0, // single scheduler, ignore
