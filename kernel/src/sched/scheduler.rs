@@ -842,6 +842,10 @@ static DOUBLE_ENQ_RESCUE: AtomicU64 = AtomicU64::new(0);
 static DOUBLE_ENQ_WAKE: AtomicU64 = AtomicU64::new(0);
 static DOUBLE_ENQ_OTHER: AtomicU64 = AtomicU64::new(0);
 static ENQ_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Counts phantom-enqueued recoveries: threads found with `in_queue=true`
+/// but no actual heap or bitmap membership on their `last_cpu`'s run queue.
+/// Driven by `rescue_orphaned_threads_impl`'s self-healing pass.
+static RESCUE_PHANTOM: AtomicU64 = AtomicU64::new(0);
 
 fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
     // Double-enqueue detection.  Benign race: rescue_orphaned_threads may
@@ -906,6 +910,39 @@ fn eevdf_enqueue(rq: &mut PerCpuRunQueues, tid: ThreadId) {
         return;
     }
     rq.eevdf_nr_running += 1;
+}
+
+/// Verify that `tid` is actually present in the EEVDF heap or one of the
+/// bitmap-priority queues on `cpu`.  Caller must hold that CPU's `percpu_rq`
+/// lock for the duration of the check.
+///
+/// Used by the rescue self-healing pass to detect "phantom enqueued"
+/// threads — `in_queue=true` but no actual queue membership — and re-insert
+/// them so the run-queue invariant `in_queue == queue_membership` holds.
+fn rq_contains_tid(rq: &PerCpuRunQueues, tid: ThreadId) -> bool {
+    // Fast path: EEVDF heap membership is O(1) via the per-thread heap_pos.
+    if thread_ref(tid).eevdf_heap_pos != super::heap::HEAP_POS_NONE {
+        return true;
+    }
+    // Bitmap path: walk only the priority queues whose bitmap bits are set.
+    // Single-element queues have run_prev=run_next=RQ_NIL, so we can't rely
+    // on link fields alone; the head pointer is the source of truth.
+    for word in 0..4 {
+        let mut bits = rq.active[word];
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= !(1u64 << bit);
+            let prio = word * 64 + bit;
+            let mut cur = rq.queues[prio].head;
+            while cur != RQ_NIL {
+                if cur == tid {
+                    return true;
+                }
+                cur = thread_ref(cur).run_next.load(Ordering::Relaxed);
+            }
+        }
+    }
+    false
 }
 
 /// Try to steal a thread from another CPU's run queue.
@@ -2199,13 +2236,14 @@ pub fn tick(current_sp: u64) -> u64 {
                             target_arch = "loongarch64",
                         )))]
                         let (sgi_s, sgi_r): (u64, u64) = (0, 0);
-                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} sgi=(s={} r={})",
+                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} phantom={} sgi=(s={} r={})",
                             sends, recvs,
                             DOUBLE_ENQ_DRAIN.load(Ordering::Relaxed),
                             DOUBLE_ENQ_RESCUE.load(Ordering::Relaxed),
                             DOUBLE_ENQ_WAKE.load(Ordering::Relaxed),
                             DOUBLE_ENQ_OTHER.load(Ordering::Relaxed),
                             ENQ_TOTAL.load(Ordering::Relaxed),
+                            RESCUE_PHANTOM.load(Ordering::Relaxed),
                             sgi_s, sgi_r);
                         // Per-CPU state: what each CPU is running, RQ sizes
                         let ncpus = smp::num_cpus();
@@ -5387,7 +5425,75 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
         } else {
             false // garbage value — don't touch
         };
-        if !(is_orphan && !inq) {
+        // Phantom-enqueued detection: state=Ready + in_queue=true but the
+        // thread is not actually in any heap or bitmap queue on its
+        // last_cpu.  This violates the in_queue==membership invariant and
+        // makes the thread invisible to all schedulers.  Self-heal by
+        // clearing the stale flag and re-enqueueing.
+        if inq {
+            // Only spend cycles on the lock for plausible phantom candidates:
+            // on_cpu must be MAX or stale (same orphan filter as below) AND
+            // the thread must be Ready.  The earlier `t.state != Ready`
+            // check above the loop already screens out non-Ready threads.
+            if is_orphan {
+                let target = t.last_cpu.load(Ordering::Relaxed);
+                let phantom = if (target as usize) < percpu_rq().len() {
+                    if let Some(rq) = percpu_rq()[target as usize].try_lock() {
+                        let in_actual = rq_contains_tid(&rq, tid as ThreadId);
+                        drop(rq);
+                        // Re-validate the orphan predicate after the lock.
+                        // If state, in_queue or on_cpu flipped while we
+                        // scanned, the thread is no longer phantom and a
+                        // legitimate path will handle it.
+                        let inq_now = t.in_queue.load(Ordering::Acquire);
+                        let on_now = t.on_cpu.load(Ordering::Acquire);
+                        let still_ready = t.state == ThreadState::Ready;
+                        let still_orphan = on_now == u32::MAX
+                            || (on_now < ncpus as u32
+                                && smp::get(on_now).current_thread.load(Ordering::Acquire)
+                                    != tid as u32);
+                        inq_now && !in_actual && still_ready && still_orphan
+                    } else {
+                        false // contended — reassess next sweep
+                    }
+                } else {
+                    false
+                };
+                if phantom {
+                    // Self-heal: clear the stale flag and re-enqueue normally.
+                    // percpu_enqueue's swap(true) will succeed (we just
+                    // cleared) and proceed with the heap/bitmap insert.  If
+                    // a concurrent path enqueues between our store and
+                    // swap, the swap returns true and DOUBLE_ENQ counters
+                    // increment — benign.
+                    let prio = t.prio.load(Ordering::Relaxed);
+                    let park = t.park_state.load(Ordering::Relaxed);
+                    let wake = t.wakeup.load(Ordering::Relaxed);
+                    let blk = t.blocked_on;
+                    let heap_pos = t.eevdf_heap_pos;
+                    let (tevt, tcpu, tseq) = trace_last(tid as u32);
+                    crate::println!(
+                        "RESCUE-PHANTOM: tid={} prio={} cpu={} task={} on_cpu={} trace=(evt={} cpu={} seq={}) park={} wake={} blk={:?} hp={}",
+                        tid, prio, target, t.task_id, on, tevt, tcpu, tseq,
+                        park, wake, blk, heap_pos
+                    );
+                    RESCUE_PHANTOM.fetch_add(1, Ordering::Relaxed);
+                    t.in_queue.store(false, Ordering::Release);
+                    t.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                    trace_sched(tid as u32, 8); // 8=rescue_enq
+                    set_enq_tag(7); // 7=rescue
+                    percpu_enqueue(target, prio, tid as ThreadId);
+                    if (tid as usize) < ORPHAN_AGE.len() {
+                        ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+            }
+            // Genuine queue membership — reset orphan age and move on.
+            if (tid as usize) < ORPHAN_AGE.len() { ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed); }
+            continue;
+        }
+        if !is_orphan {
             if (tid as usize) < ORPHAN_AGE.len() { ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed); }
             continue;
         }
