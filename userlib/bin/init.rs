@@ -66,6 +66,14 @@ fn signal_handler_sigusr1(_sig: u64, frame_addr: u64) {
 /// committing or pushing.  Default `false` keeps full coverage.
 const STEP_H_DEBUG_SKIP_SLOW_PHASES: bool = false;
 
+/// Companion to STEP_H_DEBUG_SKIP_SLOW_PHASES.  When true, also skip
+/// H1, H2-H12 (the proven Tier 0-6 dyn-link smokes) and run only H13
+/// (Xwayland + wl_compositor_min orchestration).  Lets us iterate on
+/// the Xwayland startup investigation without paying ~10 min of
+/// cumulative wall-clock for the lower-tier chain each iteration.
+/// Default false; flip to true *only* when actively probing H13.
+const STEP_H_FOCUS_H13: bool = false;
+
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"Telix init starting\n");
@@ -8188,6 +8196,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // runs before the slow Phase 177-180 CALL-TIMEOUTs that would otherwise
     // burn the test budget.  Phase 51 mounted '/' on the root FS, so VFS_OPEN
     // on /lib64/* works.
+    if STEP_H_FOCUS_H13 {
+        syscall::debug_puts(b"Step H libxcvt dyn-link (early): SKIPPED (FOCUS_H13)\n");
+    } else {
     syscall::debug_puts(b"  init: Step H libxcvt dyn-link (early)...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
@@ -8257,6 +8268,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Step H libxcvt dyn-link (early): SKIPPED\n");
         }
     }
+    }
 
     // --- Step H7: libwayland-client.so.0 dyn-link smoke (Tier-2) ---
     // First Tier-2 lib.  Pulls libffi.so.8 (DT_NEEDED) so ld.so walks
@@ -8267,6 +8279,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // Placed before H2-H6 so we can verify Tier-2 in a constrained
     // wall-clock window without waiting for the (already-proven)
     // Tier-0/1 chain to run first.
+    if STEP_H_FOCUS_H13 {
+        syscall::debug_puts(b"Step H7 libwayland-client dyn-link: SKIPPED (FOCUS_H13)\n");
+    } else {
     syscall::debug_puts(b"  init: Step H7 libwayland-client dyn-link...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
@@ -8333,12 +8348,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Step H7 libwayland-client dyn-link: SKIPPED\n");
         }
     }
+    }
 
     // --- Step H8: libX11.so.6 dyn-link smoke (Tier-3 X11 stack) ---
     // First Tier-3 lib.  Pulls libxcb.so.1 (DT_NEEDED) which itself
     // pulls libXau — 4-level dep tree:
     //   binary → libX11 → libxcb → libXau → libc
     // XOpenDisplay(NULL) returns NULL when DISPLAY is unset (expected).
+    if STEP_H_FOCUS_H13 {
+        syscall::debug_puts(b"Step H8 libX11 dyn-link: SKIPPED (FOCUS_H13)\n");
+    } else {
     syscall::debug_puts(b"  init: Step H8 libX11 dyn-link...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
@@ -8405,6 +8424,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Step H8 libX11 dyn-link: SKIPPED\n");
         }
     }
+    }
 
     // --- Step H9: Tier-3 X11 extension batch dyn-link smoke ---
     // Single binary linking against all 10 Tier-3 extension libs:
@@ -8414,6 +8434,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // resolve the GOT entry; we don't actually call them since X11
     // extension functions overwhelmingly need a Display* and would
     // crash on NULL.
+    if STEP_H_FOCUS_H13 {
+        syscall::debug_puts(b"Step H9 Tier-3 X11ext batch: SKIPPED (FOCUS_H13)\n");
+    } else {
     syscall::debug_puts(b"  init: Step H9 Tier-3 X11ext batch...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
@@ -8480,11 +8503,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Step H9 Tier-3 X11ext batch: SKIPPED\n");
         }
     }
+    }
 
     // --- Step H10: Tier-4 fonts batch dyn-link smoke ---
     // Single binary linking libfreetype + libfontenc + libXfont2.
     // Pulls in (transitively): libz, libbz2, libpng16, libharfbuzz,
     // libbrotlidec/common, libglib-2.0, libgraphite2, libpcre2-8.
+    if STEP_H_FOCUS_H13 {
+        syscall::debug_puts(b"Step H10 Tier-4 fonts batch: SKIPPED (FOCUS_H13)\n");
+    } else {
     syscall::debug_puts(b"  init: Step H10 Tier-4 fonts batch...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
@@ -8551,11 +8578,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Step H10 Tier-4 fonts batch: SKIPPED\n");
         }
     }
+    }
 
     // --- Step H11: Tier-5 SSL/epoxy/tirpc batch dyn-link smoke ---
     // Single binary linking libepoxy + libssl + libcrypto + libtirpc.
     // libtirpc drags in krb5 + selinux + keyutils + com_err — heaviest
     // transitive walk so far (~12 libs deep).
+    if STEP_H_FOCUS_H13 {
+        syscall::debug_puts(b"Step H11 Tier-5 SSL batch: SKIPPED (FOCUS_H13)\n");
+    } else {
     syscall::debug_puts(b"  init: Step H11 Tier-5 SSL batch...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
@@ -8622,6 +8653,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Step H11 Tier-5 SSL batch: SKIPPED\n");
         }
     }
+    }
 
     // --- Step H12: Tier-6 Xwayland binary load test ---
     // Exec Fedora's prebuilt /Xwayland with -version.  This exercises
@@ -8630,6 +8662,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // libdecor, libaudit, libsystemd, libcap{,-ng}, etc.  -version
     // prints the build banner and exits before any wayland socket
     // handshake, so PASS == ld.so resolved every symbol cleanly.
+    if STEP_H_FOCUS_H13 {
+        syscall::debug_puts(b"Step H12 Xwayland binary load: SKIPPED (FOCUS_H13)\n");
+    } else {
     syscall::debug_puts(b"  init: Step H12 Xwayland binary load...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
@@ -8697,6 +8732,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Step H12 Xwayland binary load: SKIPPED\n");
         }
     }
+    }
 
     // --- Step H13: Xwayland against wl_compositor_min ---
     // Spawn wl_compositor_min --one-shot (provides /run/user/0/wayland-0),
@@ -8759,7 +8795,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         static A0: &[u8]   = b"Xwayland\0";
                         static A1: &[u8]   = b"-terminate\0";
                         static A2: &[u8]   = b"-verbose\0";
-                        static A3: &[u8]   = b"9\0";
+                        static A3: &[u8]   = b"3\0";
                         static E0: &[u8]   = b"LD_LIBRARY_PATH=/lib64\0";
                         static E1: &[u8]   = b"WAYLAND_DISPLAY=wayland-0\0";
                         static E2: &[u8]   = b"XDG_RUNTIME_DIR=/run/user/0\0";
@@ -8779,18 +8815,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     { syscall::exit(99); }
                 } else {
                     syscall::personality_set(xw_child, 2, abi);
-                    syscall::debug_puts(b"  [H13] waiting for Xwayland (30s budget)...\n");
+                    syscall::debug_puts(b"  [H13] waiting for Xwayland (120s budget)...\n");
 
                     let mut xw_code: i64 = -1;
-                    for i in 0..3000 {
+                    for i in 0..12000 {
                         if let Some(code) = syscall::waitpid(xw_child) {
                             xw_code = code as i64;
                             break;
                         }
                         syscall::sleep_ms(10);
                         if i == 500 { syscall::debug_puts(b"  [H13] Xwayland @5s\n"); }
-                        if i == 1000 { syscall::debug_puts(b"  [H13] Xwayland @10s\n"); }
-                        if i == 2000 { syscall::debug_puts(b"  [H13] Xwayland @20s\n"); }
+                        if i == 1500 { syscall::debug_puts(b"  [H13] Xwayland @15s\n"); }
+                        if i == 3000 { syscall::debug_puts(b"  [H13] Xwayland @30s\n"); }
+                        if i == 6000 { syscall::debug_puts(b"  [H13] Xwayland @60s\n"); }
+                        if i == 9000 { syscall::debug_puts(b"  [H13] Xwayland @90s\n"); }
                     }
                     syscall::debug_puts(b"  [H13] reaping compositor...\n");
                     let mut comp_code: i64 = -1;
@@ -8829,6 +8867,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // /libdrm_dyn_test which calls drmGetLibVersion(-1) (pure
     // malloc-only, no ioctl) to verify ld.so resolves a libdrm
     // entry point.  PASS == exit 0.
+    if STEP_H_FOCUS_H13 {
+        syscall::debug_puts(b"Step H2 libdrm dyn-link: SKIPPED (FOCUS_H13)\n");
+    } else {
     syscall::debug_puts(b"  init: Step H2 libdrm dyn-link...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
@@ -8894,6 +8935,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             syscall::debug_puts(b"Step H2 libdrm dyn-link: SKIPPED\n");
         }
+    }
     }
 
     // --- Step H3: libxshmfence.so.1 dyn-link smoke (Tier-0 round-out) ---

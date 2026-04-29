@@ -117,6 +117,8 @@ fi
 debugfs -w "$EXT2_TMP" <<DEBUGFS_EOF
 mkdir testdir
 mkdir etc
+mkdir tmp
+mkdir tmp/.X11-unix
 mkdir usr
 mkdir usr/share
 mkdir usr/share/zoneinfo
@@ -128,6 +130,8 @@ write $GLIBC_DYN_HELLO glibc_dyn_hello
 $TEST_WRITE
 $FSPROBE_WRITE
 ${TIER0_WRITES}set_inode_field lib64 mode 040755
+set_inode_field tmp mode 041777
+set_inode_field tmp/.X11-unix mode 041777
 set_inode_field lib64/ld-linux-x86-64.so.2 mode 0100755
 set_inode_field lib64/libc.so.6 mode 0100755
 set_inode_field lib64/libpthread.so.0 mode 0100755
