@@ -223,3 +223,66 @@ something the iterate-and-log loop can resolve on its own.
 
 The loop and reproducer are committed; logs accumulate under
 `/tmp/sched-runs/`.  Ready for whoever picks this up next session.
+
+## Update — Bug A is downstream of an IPC delivery bug
+
+After two more rounds of fix work and a deep-dive agent investigation:
+
+- **Commit 712e741** added rescue self-healing for the stale-on-cpu pattern.
+  Effect: post-fix runs reach Phase 32 vs Phase 18 baseline.  Solid win
+  but the underlying stalls still occur.
+- **Commit 8c889e5** narrowed `wake_thread`'s opportunistic
+  `abandon_for_interrupt` gate so only `killed || pending-signal` wakes
+  cancel an in-flight `CallReply`.  Defensive correctness improvement;
+  doesn't fix sched_stress directly.
+
+The deep-dive agent ruled out (with concrete log evidence):
+
+  - lost queue insertion: `total_enq` grows ~5k per 5 s — enqueues are
+    happening
+  - dispatch-CAS races: no `DOUBLE-SCHED` logs ever
+  - heap/bitmap fallback divergence
+  - per-CPU rq lock deadlock
+  - LAPIC timer not re-arming on long syscall (timer ticks visibly fire)
+  - init thread starvation (tid30 cycles normally through the deferred
+    slot)
+
+The actual residual stall pattern is:
+
+  - `CALL-TIMEOUT: tid=N slot=M task=25 port=0xPPP blocked_for=~12s`
+    fires before every BAD reply.
+  - The receiving server thread (e.g. pipe_srv at tid=34) is in
+    `Blocked PortRecv(port) park=2` and never picks up the request.
+  - **Either the send didn't enqueue on the port's turnstile, or the
+    enqueue happened but the recv-parked thread's wake-up didn't fire.**
+
+So "Bug A — scheduler stuck" reframes as an IPC-port-side stall:
+sends going to a port whose receiver is parked, where either the send
+loses the message or the wake misses the receiver.  The scheduler then
+inherits the symptom: it can't dispatch a thread that nobody asked it
+to wake.
+
+**Useful instrumentation gap noticed**: on x86 the watchdog's `sgi=(s=0
+r=0)` field is hardcoded to zero (scheduler.rs:2193) — we have no view
+into whether LAPIC reschedule IPIs are actually being sent and received
+on x86.  Adding x86 IPI send/recv counters in
+`crate::arch::x86_64::lapic::send_reschedule` and the 0xFD vector
+handler would let us tell whether a parked CPU is being-poked-but-stuck
+vs not-being-poked-at-all.  Not implemented yet.
+
+## Where to look next session
+
+1. **`kernel/src/ipc/port.rs`**: the send → wake-receiver path.  When a
+   send arrives at a port whose receiver is `park_state=2` (parked on
+   PortRecv), what code path is responsible for waking the receiver?
+   Search for `wake_parked_thread`, `wake_thread`, or any
+   `park_state.compare_exchange` calls around port message arrival.
+2. **`kernel/src/sched/scheduler.rs::wake_parked_thread`** (line ~5165):
+   does it work correctly when the parker is on a different CPU?  Does
+   the CAS sequence (`PARK_COMMITTED → PARK_NONE`) miss any case?
+3. **x86 LAPIC IPI instrumentation** — add the counters; cheap
+   diagnostic that disambiguates the next investigation.
+
+Both `userlib/bin/sched_stress.rs` and `tools/scheduler-repro-loop.sh`
+remain valid reproducers — once the IPC-side bug is found, they should
+go green.
