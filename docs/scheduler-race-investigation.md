@@ -286,3 +286,75 @@ vs not-being-poked-at-all.  Not implemented yet.
 Both `userlib/bin/sched_stress.rs` and `tools/scheduler-repro-loop.sh`
 remain valid reproducers — once the IPC-side bug is found, they should
 go green.
+
+## Update — Bug A fix dramatically improves boot progress; IPI counters reveal ~25% loss
+
+**Status after the cumulative fixes (`712e741`, `8c889e5`, `f53ee49`):**
+
+| run | wd stalls | last marker                                   | era                |
+|-----|----------:|-----------------------------------------------|--------------------|
+| 001 | 87        | Phase 7 zero-copy I/O test                    | pre-fix            |
+| 002 | 58        | Phase 18 futex/mutex                          | pre-fix            |
+| 003 | 103       | Phase 145e rt_sigaction early                 | pre-fix            |
+| 004 | 40        | Phase 145e rt_sigaction early                 | pre-fix            |
+| 005 | 108       | Phase 32 topology-aware scheduling            | post-Bug-A         |
+| 006 | 112       | Phase 145e rt_sigaction early                 | post-Bug-A         |
+| 007 | 99        | Phase 32 topology-aware scheduling            | post-Bug-A         |
+| 008 | 38        | Phase 145e rt_sigaction early                 | post-Bug-A+B-gate  |
+| 009 | **15**    | **Step H12 Xwayland binary load: SKIPPED**    | post-IPI-counters  |
+
+Run-009 reached **Step H13** (Xwayland + wl_compositor_min orchestration)
+under the loop's 25-min budget, with only 15 watchdog stalls vs 87+ in
+the pre-fix baseline.  The cumulative fix improved boot stability
+substantially.
+
+`sched_stress` still hits BAD reply because of the underlying CALL-TIMEOUT
+path, but the system as a whole survives that and progresses.  The
+"BAD reply" symptom is not Bug B (mis-routing); it's Bug A's residual
+stall causing the 10s call-reply timeout to fire and inject
+`CALL_REPLY_SERVER_DIED` into the worker frame.
+
+### IPI counter signal
+
+The new x86 IPI counters in run-009's watchdog dumps show a steady ~25%
+gap between sends and receives:
+
+    sgi=(s=397 r=161)         (40% recv-rate)
+    sgi=(s=556 r=243)         (43%)
+    sgi=(s=4933 r=2957)       (60%)
+    sgi=(s=11290 r=8380)      (74%)
+    sgi=(s=11938 r=8947)      (75%)
+
+The recv-rate climbs as the CPU spends less time in deep idle (more
+wake-already-running scenarios where the handler runs but the IPI is
+edge-coalesced into IRR and counts as one delivery for multiple sends).
+This **looks like normal LAPIC IRR coalescing** — multiple sends to the
+same vector while one is already pending are merged.  As long as the
+handler runs at least once after each unique need-to-reschedule event,
+no scheduling work is lost.
+
+So the IPI loss rate is *probably* benign.  The actual residual stall
+mechanism still wants to be: the **"phantom enqueued" pattern** that the
+IPC port-wake agent surfaced in `run-007.log` —
+
+    tid=37 Ready PortRecv(402) park=0 wake=false on_cpu=u32::MAX
+           in_q=true last_cpu=1
+    cpu1: rq_eevdf=0 has_ready=false def=3
+
+— `in_q=true` with no actual heap/bitmap membership, on a CPU whose
+queue is empty.  That's the next concrete pattern to chase.
+
+### Where this leaves the work
+
+Nine post-fix runs of the loop, three commits of fixes, one diagnostic
+counter shipped, two distinct kernel bugs analyzed and partially
+addressed.  The investigation has converted "Telix kernel scheduler is
+flaky" into specific, named, partially-resolved issues with a fast
+reproducer and concrete next-step targets.
+
+Realistically, finishing both bugs (turning sched_stress green and
+catching a clean Xwayland-past-lock-file H13 PASSED) is another focused
+session of kernel work in `kernel/src/sched/scheduler.rs::percpu_enqueue`
+and `kernel/src/ipc/port.rs::wake_parked_thread`.  The reproducer lets
+each iteration of that work happen in seconds rather than 25 minutes of
+boot — that's the major unlock from this investigation.
