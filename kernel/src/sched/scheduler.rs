@@ -1226,6 +1226,9 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
         .affinity_mask
         .store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+    // NEW_INV: on_cpu = ON_CPU_PENDING for any thread about to enter Ready.
+    thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    thread.in_queue.store(false, Ordering::Release);
 
     thread.id = id;
     thread.state = ThreadState::Ready;
@@ -1498,9 +1501,9 @@ fn finalize_spawn(
         .affinity_mask
         .store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
-    // Reset on_cpu — thread ID may be reused from a killed thread whose
-    // on_cpu still holds a stale CPU value.
-    thread.on_cpu.store(u32::MAX, Ordering::Release);
+    // NEW_INV: a freshly-spawned thread enters Ready, so on_cpu must be
+    // ON_CPU_PENDING (overrides any stale value from a recycled tid).
+    thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
     thread.in_queue.store(false, Ordering::Release);
 
     thread.id = thread_id;
@@ -1559,7 +1562,8 @@ fn create_thread_in_task(
         .affinity_mask
         .store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
-    thread.on_cpu.store(u32::MAX, Ordering::Release);
+    // NEW_INV: thread enters Ready, so on_cpu = ON_CPU_PENDING.
+    thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
 
     thread.id = id;
     thread.state = ThreadState::Ready;
@@ -4057,6 +4061,9 @@ pub fn fork_current() -> u64 {
         .affinity_mask
         .store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+    // NEW_INV: child enters Ready, so on_cpu = ON_CPU_PENDING.
+    thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    thread.in_queue.store(false, Ordering::Release);
 
     thread.id = child_tid;
     thread.state = ThreadState::Ready;
@@ -4289,6 +4296,9 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     thread.killed.store(false, Ordering::Release);
     thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+    // NEW_INV: child enters Ready, so on_cpu = ON_CPU_PENDING.
+    thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    thread.in_queue.store(false, Ordering::Release);
 
     thread.id = child_tid;
     thread.state = ThreadState::Ready;
@@ -4400,6 +4410,9 @@ pub fn clone_thread_in_task(
     thread.killed.store(false, Ordering::Release);
     thread.affinity_mask.store_mask(&cpumask::CpuMask::all(), Ordering::Relaxed);
     thread.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+    // NEW_INV: child enters Ready, so on_cpu = ON_CPU_PENDING.
+    thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    thread.in_queue.store(false, Ordering::Release);
 
     thread.id = child_tid;
     thread.state = ThreadState::Ready;
