@@ -166,3 +166,60 @@ trapframe.
 
 `run-002` archived under `/tmp/sched-runs/run-002.log` for later
 instrumentation.
+
+## Update — 4 sched_stress runs, two distinct bugs
+
+After 4 iterations of the loop:
+
+| run | watchdog stalls | last marker |
+|-----|----------------:|-------------|
+| 001 | 87  | Phase 7 zero-copy I/O test: PASSED |
+| 002 | 58  | Phase 18 futex/mutex: PASSED |
+| 003 | 103 | Phase 145e rt_sigaction early: PASSED |
+
+All sched_stress invocations cleanly trigger `BAD reply tag/data` from
+multiple workers within seconds.  Worker logic is:
+
+    syscall::call(port, ECHO_REQ, round, idx, 0, 0) → expects
+        Some(Message { tag: ECHO_REPLY, data: [round+1, idx, 0, 0, 0, 0] })
+
+Server replies `(ECHO_REPLY, m.data[0]+1, m.data[1], …)` synchronously to
+each request.  If `r.tag != ECHO_REPLY || r.data[0] != round+1`, BAD reply.
+
+This is concrete evidence of a **mis-routed IPC reply** — worker A receives
+a reply that was destined for worker B.  Whether that's:
+
+- a per-thread reply-slot shared across threads in a task,
+- a `reply_take` / `reply_to` cap getting reused before its previous owner
+  consumed it, or
+- a race in the kernel-side call/reply slot table,
+
+…is a *different* bug class from the on_cpu / `pcpu.current_thread`
+inconsistency observed earlier.  Both are real and both reproduce.
+
+## Where this leaves the investigation
+
+Two distinct, reproducible kernel bugs surfaced:
+
+  - **Bug A (scheduler state machine):** thread can sit in
+    `state=Ready, on_cpu=cpu_real, in_queue=false, blocked_on=CallReply` while
+    `pcpu.current_thread = idle`.  No invariant violation in the early-return
+    or wake-CAS paths; rescue/drain counters all zero.  Hypothesis is a
+    preempt-not-block path that doesn't update on_cpu, leaving the next
+    dispatch's CAS to silently fail.
+
+  - **Bug B (IPC reply mis-routing):** in heavy concurrent call/reply traffic,
+    workers receive replies whose `tag` or `data[0]` don't match what the
+    server sent for that worker's request.  Reproducible in seconds via
+    `sched_stress` (Phase 5h).
+
+These likely interact: a thread that mis-handles its reply slot (Bug B)
+might leave its scheduler state inconsistent (Bug A), or vice versa.
+
+The proper next step is **kernel-side fix work** in
+`kernel/src/sched/scheduler.rs` and `kernel/src/ipc/{call_reply,port}.rs`
+with the reproducer in hand.  That's a focused kernel investigation, not
+something the iterate-and-log loop can resolve on its own.
+
+The loop and reproducer are committed; logs accumulate under
+`/tmp/sched-runs/`.  Ready for whoever picks this up next session.
