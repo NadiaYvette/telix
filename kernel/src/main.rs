@@ -111,10 +111,10 @@ pub fn kmain() -> ! {
     test_capabilities();
 
     // ART port-table stress (Track 2 of the create_anon BUG investigation).
-    // Off by default — when enabled, fires `slab corruption` assertion via the
-    // 256-byte slab free-list cycle, which is the underlying root cause we're
-    // hunting. Flip to true to repro deterministically.
-    const ART_STRESS_ENABLED: bool = false;
+    // Now passes after the rcu BATCH_CAP fix (commit fixing slab-256
+    // corruption from RcuBatch overflow). Kept off-by-default to keep
+    // boot fast; flip to true for regression checks.
+    const ART_STRESS_ENABLED: bool = true;
     if ART_STRESS_ENABLED {
         test_art_port_stress();
     }
@@ -872,6 +872,8 @@ fn test_art_port_stress() {
         }
     }
 
+    mm::slab::debug_check_all_caches("stress.after-bulk-insert");
+
     // Re-verify all ports are still resolvable after the full insert run
     // (catches structural issues that surface only after later inserts
     // promote inner nodes, e.g. a stale `find_child_slot` write into a
@@ -925,8 +927,7 @@ fn test_art_port_stress() {
     }
 
     // Variant 2: interleaved create/destroy. Forces ART node merge/split
-    // paths and slab memory reuse, which the run-033 boot context likely
-    // exercised but the back-to-back pattern above does not.
+    // paths and slab memory reuse, which exposed the BATCH_CAP overflow.
     let mut churn_failures = 0usize;
     let mut alive: [u64; 256] = [0; 256];
     for round in 0..2000usize {
@@ -977,6 +978,9 @@ fn test_art_port_stress() {
     } else {
         println!("  ART stress (churn): FAILED — failures={}", churn_failures);
     }
+
+    // Disable the post-insert self-check now that the test is done.
+    ipc::art::SELF_CHECK_INSERT.store(false, core::sync::atomic::Ordering::Relaxed);
 }
 
 // --- Phase 2: Demand paging test ---

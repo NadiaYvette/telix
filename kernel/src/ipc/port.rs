@@ -423,6 +423,11 @@ pub fn port_art_root_snapshot() -> usize {
     PORT_ART.root_snapshot()
 }
 
+/// Print a one-line dump of PORT_ART's root for stress instrumentation.
+pub fn port_art_debug_dump_root(label: &str) {
+    unsafe { &*PORT_ART.inner.get() }.debug_dump_root(label);
+}
+
 /// Like `port_ref`, but reports exactly why lookup failed.
 pub fn port_ref_diag(port_id: PortId) -> PortRefDiag {
     let local = port_local(port_id);

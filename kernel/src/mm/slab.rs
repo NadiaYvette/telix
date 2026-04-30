@@ -167,6 +167,20 @@ impl SlabCache {
                     );
                 }
 
+                // Pre-write check: header.free_head should already be a
+                // valid index (NONE or < objs_per_slab). If it isn't, the
+                // header has been corrupted between this free and the
+                // previous alloc/free on this page — i.e., something
+                // outside the slab module is writing into the slab page
+                // (most likely use-after-free of an object that was on
+                // the free list).
+                if header.free_head != NONE && (header.free_head as usize) >= self.objs_per_slab {
+                    panic!(
+                        "slab::free entry corruption: page={:#x} obj_size={} free_head={} > capacity={} (about to free addr={:#x} idx={})",
+                        page_base, self.obj_size, header.free_head, self.objs_per_slab, addr_val, obj_index
+                    );
+                }
+
                 // Push onto free list.
                 let obj_ptr =
                     (page_base + self.data_offset + obj_index * self.obj_size) as *mut u16;
@@ -398,9 +412,51 @@ fn cache_for_size(size: usize) -> Option<&'static SpinLock<SlabCache>> {
     cache_index(size).map(cache_by_index)
 }
 
-/// Set true to log every 256-byte slab alloc/free for stress diagnostics.
-pub static SLAB_TRACE_256: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+/// Walk every slab page in every cache and panic if any page's free_head
+/// is out of range. Caught a real corruption (RcuBatch overflowing into a
+/// neighboring slab page when BATCH_CAP was sized for MAX_PAGE_SIZE rather
+/// than the runtime page size). Kept as a permanent invariant check —
+/// O(slab_count) per call, only used by diagnostic harnesses.
+pub fn debug_check_all_caches(label: &str) {
+    fn check_one(label: &str, name: &str, cache: &SpinLock<SlabCache>) {
+        let guard = cache.lock();
+        for i in 0..guard.slab_count {
+            let page = guard.slab_page(i);
+            if page == 0 {
+                continue;
+            }
+            let header = unsafe { &*(page as *const SlabHeader) };
+            let fh = header.free_head;
+            let in_use = header.in_use;
+            let cap_field = header.capacity;
+            let obj_size = guard.obj_size;
+            let cap = guard.objs_per_slab;
+            if fh != NONE && (fh as usize) >= cap {
+                // Dump first 32 bytes of the page to identify the corrupting writer.
+                let bytes: [u8; 32] = unsafe { core::ptr::read(page as *const [u8; 32]) };
+                // Count duplicate slab_dir entries for this page.
+                let mut dup_count = 0;
+                for j in 0..guard.slab_count {
+                    if guard.slab_page(j) == page { dup_count += 1; }
+                }
+                drop(guard);
+                crate::println!(
+                    "[{}] slab corruption {}: page={:#x} obj_size={} free_head={} > cap={} (header.in_use={} header.cap={} slab_dir_dup={})",
+                    label, name, page, obj_size, fh, cap, in_use, cap_field, dup_count
+                );
+                crate::println!(
+                    "  page[0..32]={:02x?}", bytes
+                );
+                panic!("slab corruption detected");
+            }
+        }
+    }
+    check_one(label, "CACHE_64", &CACHE_64);
+    check_one(label, "CACHE_128", &CACHE_128);
+    check_one(label, "CACHE_256", &CACHE_256);
+    check_one(label, "CACHE_512", &CACHE_512);
+    check_one(label, "CACHE_2048", &CACHE_2048);
+}
 
 /// Allocate an object of `size` bytes from the appropriate slab cache.
 /// Uses per-CPU magazine fast path when possible.

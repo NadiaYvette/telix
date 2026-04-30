@@ -114,9 +114,25 @@ struct RcuCallback {
     free_fn: fn(usize),
 }
 
-/// A batch of deferred callbacks, page-allocated.
+/// Maximum batch capacity — sized for the largest possible runtime page so
+/// `RcuBatch` fits in an `alloc_page()` allocation regardless of boot-time
+/// page_mmushift. The struct is statically sized for `MAX_PAGE_SIZE`; the
+/// effective per-allocation cap is computed at runtime in `batch_cap_runtime()`
+/// because `alloc_page()` returns the (possibly smaller) runtime page size,
+/// so writes past `batch_cap_runtime()` would spill into the next physical
+/// page and corrupt unrelated allocations (slab page headers, etc.).
 const BATCH_CAP: usize = (crate::mm::page::MAX_PAGE_SIZE - 3 * core::mem::size_of::<usize>())
     / core::mem::size_of::<RcuCallback>();
+
+/// Per-batch entry capacity at the boot-configured runtime page size.
+/// Must equal or be smaller than `BATCH_CAP`.
+#[inline]
+fn batch_cap_runtime() -> usize {
+    let page_size = crate::mm::page::page_size();
+    let header_size = 3 * core::mem::size_of::<usize>();
+    let entry_size = core::mem::size_of::<RcuCallback>();
+    (page_size - header_size) / entry_size
+}
 
 #[repr(C)]
 struct RcuBatch {
@@ -214,13 +230,24 @@ pub fn rcu_defer_free(ptr: usize, free_fn: fn(usize)) {
 
     let batch = unsafe { &mut *state.current };
 
-    // Append callback.
+    // Append callback. Bounds-check against the runtime cap because the
+    // statically-typed `BATCH_CAP` is sized for `MAX_PAGE_SIZE` and not the
+    // actual page returned by `phys::alloc_page()`.
+    debug_assert!(
+        batch.len < batch_cap_runtime(),
+        "RcuBatch overflow: batch.len {} >= runtime_cap {}",
+        batch.len,
+        batch_cap_runtime()
+    );
     batch.entries[batch.len] = RcuCallback { ptr, free_fn };
     batch.len += 1;
     state.pending_count += 1;
 
-    // If batch is full, move to pending list and start a new one.
-    if batch.len >= BATCH_CAP {
+    // If batch is full, move to pending list and start a new one. Use the
+    // runtime page-fitted cap, NOT the static `BATCH_CAP` (which is sized
+    // for MAX_PAGE_SIZE and would let writes overflow into the next page
+    // when running with smaller runtime pages).
+    if batch.len >= batch_cap_runtime() {
         let full = state.current;
         unsafe {
             (*full).next = state.pending_head;
