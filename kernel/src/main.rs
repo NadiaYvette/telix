@@ -110,6 +110,9 @@ pub fn kmain() -> ! {
     // Capability system test (validates CDT/CNode logic).
     test_capabilities();
 
+    // ART port-table stress (Track 2 of the create_anon BUG investigation).
+    test_art_port_stress();
+
     // Scheduler.
     sched::init();
     sched::topology::init();
@@ -790,6 +793,181 @@ fn test_capabilities() {
         );
     }
     println!("  Cap test: PASSED");
+}
+
+// --- ART port-table stress harness ---
+// Hammers `port::create_kernel_port` + immediate `port_kernel_data` lookup
+// in a tight single-thread loop. The recurring boot bug is a same-thread
+// `insert returns true → lookup returns None`; this harness forces that
+// path to execute thousands of times, growing the ART through Node4 →
+// Node16 → Node256 along the way. Failures emit the same structured
+// `LookupOutcome` diagnostic that the create_anon BUG site uses.
+fn test_art_port_stress() {
+    fn null_handler(
+        _port_id: ipc::port::PortId,
+        _user_data: usize,
+        _msg: &ipc::Message,
+    ) -> ipc::Message {
+        ipc::Message::empty()
+    }
+
+    const N: usize = 4000;
+    let mut ports: [u64; N] = [0; N];
+    let mut failures: usize = 0;
+
+    for i in 0..N {
+        let user_data = 0xCAFE_0000 + i;
+        let pid = match ipc::port::create_kernel_port(null_handler, user_data) {
+            Some(p) => p,
+            None => {
+                println!("  ART stress: create_kernel_port OOM at i={}", i);
+                break;
+            }
+        };
+        ports[i] = pid;
+
+        // The bug: same-thread immediate lookup returning None.
+        match ipc::port::port_kernel_data(pid) {
+            Some(ud) => {
+                if ud != user_data {
+                    println!(
+                        "  ART stress: user_data mismatch i={} pid={} got={:#x} want={:#x}",
+                        i, pid, ud, user_data
+                    );
+                    failures += 1;
+                }
+            }
+            None => {
+                failures += 1;
+                let root = ipc::port::port_art_root_snapshot();
+                println!(
+                    "  ART stress: HIT BUG at i={} pid={} root={:#x}",
+                    i, pid, root
+                );
+                match ipc::port::port_ref_diag(pid) {
+                    ipc::port::PortRefDiag::Found =>
+                        println!("    diag: Found (kernel_handler==0?)"),
+                    ipc::port::PortRefDiag::NotInArt(outcome) =>
+                        ipc::art::print_lookup_outcome(
+                            "    diag.NotInArt",
+                            ipc::port::port_local(pid),
+                            outcome,
+                        ),
+                    ipc::port::PortRefDiag::NotAlive { flags, kernel_handler_nz } =>
+                        println!(
+                            "    diag: NotAlive flags={:#x} kernel_handler_nz={}",
+                            flags, kernel_handler_nz
+                        ),
+                }
+            }
+        }
+    }
+
+    // Re-verify all ports are still resolvable after the full insert run
+    // (catches structural issues that surface only after later inserts
+    // promote inner nodes, e.g. a stale `find_child_slot` write into a
+    // freed node when the parent gets COW'd by a later insert).
+    let mut post_failures: usize = 0;
+    for i in 0..N {
+        if ports[i] == 0 {
+            continue;
+        }
+        if ipc::port::port_kernel_data(ports[i]).is_none() {
+            post_failures += 1;
+            if post_failures <= 5 {
+                let root = ipc::port::port_art_root_snapshot();
+                println!(
+                    "  ART stress: POST-PASS lookup fail at i={} pid={} root={:#x}",
+                    i, ports[i], root
+                );
+                match ipc::port::port_ref_diag(ports[i]) {
+                    ipc::port::PortRefDiag::NotInArt(outcome) =>
+                        ipc::art::print_lookup_outcome(
+                            "    diag.NotInArt",
+                            ipc::port::port_local(ports[i]),
+                            outcome,
+                        ),
+                    ipc::port::PortRefDiag::Found =>
+                        println!("    diag: Found"),
+                    ipc::port::PortRefDiag::NotAlive { flags, kernel_handler_nz } =>
+                        println!(
+                            "    diag: NotAlive flags={:#x} kernel_handler_nz={}",
+                            flags, kernel_handler_nz
+                        ),
+                }
+            }
+        }
+    }
+
+    // Tear down — ports leak otherwise.
+    for i in 0..N {
+        if ports[i] != 0 {
+            ipc::port::destroy(ports[i]);
+        }
+    }
+
+    if failures == 0 && post_failures == 0 {
+        println!("  ART stress: {} ports created/resolved/destroyed cleanly", N);
+    } else {
+        println!(
+            "  ART stress: FAILED — immediate={} post={}",
+            failures, post_failures
+        );
+    }
+
+    // Variant 2: interleaved create/destroy. Forces ART node merge/split
+    // paths and slab memory reuse, which the run-033 boot context likely
+    // exercised but the back-to-back pattern above does not.
+    let mut churn_failures = 0usize;
+    let mut alive: [u64; 256] = [0; 256];
+    for round in 0..2000usize {
+        let slot = round % alive.len();
+        if alive[slot] != 0 {
+            ipc::port::destroy(alive[slot]);
+            alive[slot] = 0;
+        }
+        let pid = match ipc::port::create_kernel_port(null_handler, 0xBEEF_0000 + round) {
+            Some(p) => p,
+            None => break,
+        };
+        alive[slot] = pid;
+        match ipc::port::port_kernel_data(pid) {
+            Some(_) => {}
+            None => {
+                churn_failures += 1;
+                if churn_failures <= 3 {
+                    let root = ipc::port::port_art_root_snapshot();
+                    println!(
+                        "  ART stress (churn): HIT BUG round={} slot={} pid={} root={:#x}",
+                        round, slot, pid, root
+                    );
+                    match ipc::port::port_ref_diag(pid) {
+                        ipc::port::PortRefDiag::NotInArt(outcome) =>
+                            ipc::art::print_lookup_outcome(
+                                "    diag.NotInArt", ipc::port::port_local(pid), outcome,
+                            ),
+                        ipc::port::PortRefDiag::Found =>
+                            println!("    diag: Found"),
+                        ipc::port::PortRefDiag::NotAlive { flags, kernel_handler_nz } =>
+                            println!(
+                                "    diag: NotAlive flags={:#x} kernel_handler_nz={}",
+                                flags, kernel_handler_nz
+                            ),
+                    }
+                }
+            }
+        }
+    }
+    for &p in alive.iter() {
+        if p != 0 {
+            ipc::port::destroy(p);
+        }
+    }
+    if churn_failures == 0 {
+        println!("  ART stress (churn): 2000 interleaved rounds clean");
+    } else {
+        println!("  ART stress (churn): FAILED — failures={}", churn_failures);
+    }
 }
 
 // --- Phase 2: Demand paging test ---
