@@ -6310,10 +6310,36 @@ fn handle_nanosleep(caller_port: u64, args: &[u64; 6]) -> u64 {
 
 /// Handle Linux poll(fds, nfds, timeout) — basic stub.
 /// Returns 0 (timeout) for non-zero timeouts, or nfds with POLLNVAL for unknown fds.
-fn handle_poll(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_poll(pi: usize, caller_port: u64, args: &[u64; 6], is_ppoll: bool) -> u64 {
     let fds_va = args[0] as usize;
     let nfds = args[1] as usize;
-    let timeout_ms = args[2] as i32;
+    // poll: args[2] is i32 timeout_ms (-1 = infinite, 0 = poll, >0 = ms).
+    // ppoll: args[2] is `const struct timespec *timeout_ts`, NULL = infinite.
+    // The two share a handler so they share a structural shape, but the
+    // timeout encoding is completely different — treating ppoll's
+    // pointer as an i32 ms count makes NULL look like "0 ms / return
+    // immediately", which breaks libwayland's wl_display_poll.
+    let timeout_ms: i32 = if is_ppoll {
+        let ts_va = args[2] as usize;
+        if ts_va == 0 {
+            -1 // NULL timespec → block forever
+        } else {
+            let mut tsbuf = [0u8; 16]; // tv_sec u64, tv_nsec u64
+            let copied = syscall::personality_copy_in(caller_port, ts_va, &mut tsbuf);
+            if copied < 16 {
+                -1 // can't read timespec — fall back to "block"
+            } else {
+                let sec = u64::from_le_bytes([tsbuf[0], tsbuf[1], tsbuf[2], tsbuf[3],
+                                              tsbuf[4], tsbuf[5], tsbuf[6], tsbuf[7]]);
+                let nsec = u64::from_le_bytes([tsbuf[8], tsbuf[9], tsbuf[10], tsbuf[11],
+                                               tsbuf[12], tsbuf[13], tsbuf[14], tsbuf[15]]);
+                let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
+                ms.min(i32::MAX as u64) as i32
+            }
+        }
+    } else {
+        args[2] as i32
+    };
 
     if nfds == 0 {
         // Pure sleep via poll(NULL, 0, timeout).
@@ -6338,7 +6364,12 @@ fn handle_poll(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     } else if timeout_ms > 0 {
         ((timeout_ms as u32) / 5).max(1).min(200)
     } else {
-        400 // ~2s for infinite timeout
+        // Infinite timeout (Linux contract: block until ready).
+        // Telix can't truly block a single-threaded server, so we cap
+        // at ~60 s of polling.  Long-lived event loops (Wayland clients)
+        // will retry via the same ppoll, so this is effectively
+        // "wake-and-recheck every minute" rather than a real deadline.
+        12000
     };
 
     for iter in 0..max_iters {
@@ -9466,7 +9497,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 handle_nanosleep(caller_port, &shifted)
             }
             __NR_CLOCK_GETRES => handle_clock_getres(caller_port, &msg.data),
-            __NR_POLL | __NR_PPOLL => handle_poll(pi, caller_port, &msg.data),
+            __NR_POLL => handle_poll(pi, caller_port, &msg.data, false),
+            __NR_PPOLL => handle_poll(pi, caller_port, &msg.data, true),
             __NR_SELECT | __NR_PSELECT6 => handle_select(pi, caller_port, &msg.data),
             __NR_PRCTL => handle_prctl(&msg.data),
             __NR_FUTEX => {
