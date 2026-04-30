@@ -1090,6 +1090,48 @@ impl PendingFdTransfer {
 
 static mut PENDING_FD_TRANSFERS: [PendingFdTransfer; MAX_PENDING_FD_TRANSFERS] = [const { PendingFdTransfer::empty() }; MAX_PENDING_FD_TRANSFERS];
 
+// ---- Poll wait queue ----
+// Deferred-reply pattern for ppoll(NULL) / poll(timeout=-1).  linux_srv
+// is single-threaded: spinning in handle_poll for any meaningful amount
+// of time would wedge every other Linux syscall.  Instead, register the
+// caller in POLL_TABLE, return None to defer reply, and let the main
+// loop's expire_poll_waiters re-check fd readiness on each tick.  When
+// any polled fd becomes ready (or the deadline fires) we
+// personality_reply with the count and write back the revents array.
+const MAX_POLL_WAITERS: usize = 32;
+const POLL_WAITER_MAX_FDS: usize = 16;
+
+#[derive(Clone, Copy)]
+struct PollFdEntry {
+    fd: i32,
+    events: u16,
+}
+
+#[derive(Clone, Copy)]
+struct PollWaiter {
+    active: bool,
+    caller_port: u64,
+    pi: usize,
+    fds_va: usize,    // user-space pollfd[] addr (write back revents here)
+    nfds: u16,
+    n_cached: u16,    // how many fds are cached in `fds`
+    fds: [PollFdEntry; POLL_WAITER_MAX_FDS],
+    deadline_ns: u64, // 0 = infinite
+}
+
+impl PollWaiter {
+    const fn empty() -> Self {
+        Self {
+            active: false, caller_port: 0, pi: 0, fds_va: 0,
+            nfds: 0, n_cached: 0,
+            fds: [PollFdEntry { fd: -1, events: 0 }; POLL_WAITER_MAX_FDS],
+            deadline_ns: 0,
+        }
+    }
+}
+
+static mut POLL_TABLE: [PollWaiter; MAX_POLL_WAITERS] = [const { PollWaiter::empty() }; MAX_POLL_WAITERS];
+
 // ---- Futex wait queue ----
 // Phase 174: bumped from 32 → 128 to accommodate dozens of glibc pthread
 // condvars/rwlocks co-existing (pthread_cond_broadcast can legitimately
@@ -6359,66 +6401,132 @@ fn handle_poll(pi: usize, caller_port: u64, args: &[u64; 6], is_ppoll: bool) -> 
     let copied = syscall::personality_copy_in(caller_port, fds_va, &mut buf[..byte_len]);
     if copied < byte_len { return linux_err(EFAULT); }
 
-    let max_iters: u32 = if timeout_ms == 0 {
-        1
-    } else if timeout_ms > 0 {
-        ((timeout_ms as u32) / 5).max(1).min(200)
-    } else {
-        // Infinite timeout (Linux contract: block until ready).
-        // Telix can't truly block a single-threaded server, so we cap
-        // at ~60 s of polling.  Long-lived event loops (Wayland clients)
-        // will retry via the same ppoll, so this is effectively
-        // "wake-and-recheck every minute" rather than a real deadline.
-        12000
-    };
-
-    for iter in 0..max_iters {
-        let mut ready_count = 0u32;
-
-        for i in 0..nfds {
-            let off = i * 8;
-            let fd = i32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]);
-            let events = u16::from_le_bytes([buf[off+4], buf[off+5]]);
-
-            // Clear revents.
-            buf[off+6] = 0;
-            buf[off+7] = 0;
-
-            if fd < 0 { continue; } // Negative fd → skip, revents=0.
-            let ufd = fd as usize;
-
-            if ufd >= MAX_FDS || unsafe { !PROC_TABLE[pi].fds[ufd].in_use } {
-                // Invalid fd → POLLNVAL.
-                let nval: u16 = 0x0020; // POLLNVAL
-                buf[off+6..off+8].copy_from_slice(&nval.to_le_bytes());
-                ready_count += 1;
-                continue;
-            }
-
-            let revents_u32 = poll_single_fd(pi, ufd);
-            // Mask: only report events the caller asked for, plus error/hangup.
-            let revents = (revents_u32 as u16 & events)
-                | (revents_u32 as u16 & (EPOLLERR as u16 | EPOLLHUP as u16));
-            if revents != 0 {
-                buf[off+6..off+8].copy_from_slice(&revents.to_le_bytes());
-                ready_count += 1;
-            }
-        }
-
-        if ready_count > 0 {
-            // Write back pollfd array with revents filled in.
-            syscall::personality_copy_out(caller_port, fds_va, &buf[..byte_len]);
-            return ready_count as u64;
-        }
-
-        if iter + 1 < max_iters {
-            syscall::sleep_ms(5);
-        }
+    // Pass 1: synchronous check — if anything's ready right now, reply
+    // immediately without going through the deferred-reply path.
+    let ready_count = poll_check_ready(pi, &mut buf[..byte_len]);
+    if ready_count > 0 || timeout_ms == 0 {
+        syscall::personality_copy_out(caller_port, fds_va, &buf[..byte_len]);
+        return ready_count as u64;
     }
 
-    // Timeout, no events — still write back zeroed revents.
+    // Nothing ready, timeout != 0 — defer the reply and let
+    // expire_poll_waiters notice when an fd becomes ready (or the
+    // deadline passes).  Replying inline here would force us to spin
+    // in handle_poll, blocking every other Linux syscall for the
+    // duration; deferring lets the dispatch loop service intervening
+    // requests (which is critical when one Linux process polls a
+    // socket whose data is produced by another Linux process).
+    let deadline_ns: u64 = if timeout_ms < 0 {
+        0 // infinite — never expires (kept alive until fd ready)
+    } else {
+        syscall::clock_gettime() + (timeout_ms as u64) * 1_000_000
+    };
+
+    unsafe {
+        for i in 0..MAX_POLL_WAITERS {
+            if !POLL_TABLE[i].active {
+                let mut w = PollWaiter::empty();
+                w.active = true;
+                w.caller_port = caller_port;
+                w.pi = pi;
+                w.fds_va = fds_va;
+                w.nfds = nfds as u16;
+                let cache_n = nfds.min(POLL_WAITER_MAX_FDS);
+                for j in 0..cache_n {
+                    let off = j * 8;
+                    let fd = i32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]);
+                    let events = u16::from_le_bytes([buf[off+4], buf[off+5]]);
+                    w.fds[j] = PollFdEntry { fd, events };
+                }
+                w.n_cached = cache_n as u16;
+                w.deadline_ns = deadline_ns;
+                POLL_TABLE[i] = w;
+                REPLY_DEFERRED = true;
+                return 0; // value ignored; REPLY_DEFERRED suppresses
+            }
+        }
+    }
+    // Table full — fall back to immediate "no events" reply.  Better
+    // than hanging the caller forever, even if it loses the polling
+    // semantics for this specific call.
     syscall::personality_copy_out(caller_port, fds_va, &buf[..byte_len]);
     0
+}
+
+/// Re-scan a pollfd array (already copied in to `buf`) and fill in
+/// revents bytes for any ready fds.  Returns the ready count.
+fn poll_check_ready(pi: usize, buf: &mut [u8]) -> u32 {
+    let nfds = buf.len() / 8;
+    let mut ready_count = 0u32;
+    for i in 0..nfds {
+        let off = i * 8;
+        let fd = i32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]);
+        let events = u16::from_le_bytes([buf[off+4], buf[off+5]]);
+        buf[off+6] = 0; buf[off+7] = 0;
+
+        if fd < 0 { continue; }
+        let ufd = fd as usize;
+        if ufd >= MAX_FDS || unsafe { !PROC_TABLE[pi].fds[ufd].in_use } {
+            let nval: u16 = 0x0020; // POLLNVAL
+            buf[off+6..off+8].copy_from_slice(&nval.to_le_bytes());
+            ready_count += 1;
+            continue;
+        }
+        let revents_u32 = poll_single_fd(pi, ufd);
+        let revents = (revents_u32 as u16 & events)
+            | (revents_u32 as u16 & (EPOLLERR as u16 | EPOLLHUP as u16));
+        if revents != 0 {
+            buf[off+6..off+8].copy_from_slice(&revents.to_le_bytes());
+            ready_count += 1;
+        }
+    }
+    ready_count
+}
+
+/// Re-check every active POLL_TABLE entry; reply (and deactivate) any
+/// that have an fd ready or whose deadline has passed.  Called once
+/// per dispatch loop iteration, just like expire_futex_waiters.
+fn expire_poll_waiters() {
+    // Quick presence check.
+    let mut any_active = false;
+    unsafe {
+        for i in 0..MAX_POLL_WAITERS {
+            if POLL_TABLE[i].active { any_active = true; break; }
+        }
+    }
+    if !any_active { return; }
+
+    let now = syscall::clock_gettime();
+    unsafe {
+        for i in 0..MAX_POLL_WAITERS {
+            if !POLL_TABLE[i].active { continue; }
+            let w = POLL_TABLE[i];
+            let nfds = w.nfds as usize;
+            let n_cached = w.n_cached as usize;
+            let byte_len = nfds * 8;
+
+            // Reconstruct the pollfd[] from the cached entries (may be
+            // a subset; uncached fds get treated as fd=-1 which makes
+            // them quiescent — acceptable since we capped n_cached at
+            // POLL_WAITER_MAX_FDS, larger callers are rare).
+            let mut buf = [0u8; 64 * 8];
+            for j in 0..n_cached {
+                let off = j * 8;
+                let fd = w.fds[j].fd;
+                let events = w.fds[j].events;
+                buf[off..off+4].copy_from_slice(&fd.to_le_bytes());
+                buf[off+4..off+6].copy_from_slice(&events.to_le_bytes());
+            }
+
+            let ready_count = poll_check_ready(w.pi, &mut buf[..byte_len]);
+            let deadline_passed = w.deadline_ns != 0 && now >= w.deadline_ns;
+            if ready_count > 0 || deadline_passed {
+                syscall::personality_copy_out(w.caller_port, w.fds_va, &buf[..byte_len]);
+                syscall::personality_reply(w.caller_port, ready_count as u64);
+                POLL_TABLE[i].active = false;
+            }
+        }
+    }
 }
 
 /// Handle Linux select(nfds, readfds, writefds, exceptfds, timeout) and pselect6.
@@ -9359,6 +9467,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     loop {
         expire_futex_waiters();
+        expire_poll_waiters();
 
         // Reaper: check one PROC_TABLE slot per iteration, closing its
         // FDs if the owner's task port has gone dead (task exited or was
