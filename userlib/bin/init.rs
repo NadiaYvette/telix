@@ -8884,18 +8884,92 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::personality_set(xw_child, 2, abi);
                     syscall::debug_puts(b"  [H13] waiting for Xwayland (120s budget)...\n");
 
+                    // --- Step H14: spawn xeyes once Xwayland has had time to bind X0 ---
+                    // Forked at i=2000 (~20s) so Xwayland's libs are loaded and the
+                    // X0 listener is up.  xeyes runs as an X11 client against
+                    // /tmp/.X11-unix/X0 (DISPLAY=:0) — the first real X client on
+                    // Telix's compositor + Xwayland stack.
+                    let mut xeyes_child: u64 = u64::MAX;
+                    let mut xeyes_code: i64 = -2; // -2 = "not started yet"
+
                     let mut xw_code: i64 = -1;
                     for i in 0..12000 {
                         if let Some(code) = syscall::waitpid(xw_child) {
                             xw_code = code as i64;
                             break;
                         }
+                        if xeyes_child != u64::MAX && xeyes_code == -1 {
+                            if let Some(code) = syscall::waitpid(xeyes_child) {
+                                xeyes_code = code as i64;
+                            }
+                        }
                         syscall::sleep_ms(10);
                         if i == 500 { syscall::debug_puts(b"  [H13] Xwayland @5s\n"); }
                         if i == 1500 { syscall::debug_puts(b"  [H13] Xwayland @15s\n"); }
+                        if i == 700 && xeyes_child == u64::MAX {
+                            syscall::debug_puts(b"  [H14] forking xeyes (early, retry on connect)...\n");
+                            let xc = syscall::fork();
+                            if xc == 0 {
+                                for _ in 0..100 {
+                                    let (p, _) = syscall::personality_get();
+                                    if p != 0 { break; }
+                                    syscall::yield_now();
+                                }
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    static XPATH: &[u8] = b"/xeyes\0";
+                                    static XA0:   &[u8] = b"xeyes\0";
+                                    static XE0:   &[u8] = b"LD_LIBRARY_PATH=/lib64\0";
+                                    static XE1:   &[u8] = b"DISPLAY=:0\0";
+                                    static XE2:   &[u8] = b"LANG=C\0";
+                                    static XE3:   &[u8] = b"LC_ALL=C\0";
+                                    let xargv: [u64; 2] = [XA0.as_ptr() as u64, 0];
+                                    let xenvp: [u64; 5] = [XE0.as_ptr() as u64, XE1.as_ptr() as u64,
+                                                            XE2.as_ptr() as u64, XE3.as_ptr() as u64, 0];
+                                    core::arch::asm!(
+                                        "int 0x80",
+                                        inlateout("rax") 59u64 => _,
+                                        in("rdi") XPATH.as_ptr() as u64,
+                                        in("rsi") xargv.as_ptr() as u64,
+                                        in("rdx") xenvp.as_ptr() as u64,
+                                        lateout("rcx") _, lateout("r11") _,
+                                    );
+                                    core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 96u64, options(noreturn));
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                { syscall::exit(99); }
+                            } else if xc != u64::MAX {
+                                syscall::personality_set(xc, 2, abi);
+                                xeyes_child = xc;
+                                xeyes_code = -1; // "running"
+                            }
+                        }
                         if i == 3000 { syscall::debug_puts(b"  [H13] Xwayland @30s\n"); }
                         if i == 6000 { syscall::debug_puts(b"  [H13] Xwayland @60s\n"); }
                         if i == 9000 { syscall::debug_puts(b"  [H13] Xwayland @90s\n"); }
+                    }
+                    // Final xeyes reap if still running.
+                    if xeyes_child != u64::MAX && xeyes_code == -1 {
+                        for _ in 0..500 {
+                            if let Some(code) = syscall::waitpid(xeyes_child) {
+                                xeyes_code = code as i64;
+                                break;
+                            }
+                            syscall::sleep_ms(10);
+                        }
+                    }
+                    if xeyes_child != u64::MAX {
+                        syscall::debug_puts(b"Step H14 xeyes: ");
+                        if xeyes_code >= -1 {
+                            syscall::debug_puts(b"exit=");
+                            let mut buf = [0u8; 12]; let mut val = xeyes_code as u32; let mut i = 12;
+                            if val == 0 { i -= 1; buf[i] = b'0'; }
+                            while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                            syscall::debug_puts(&buf[i..12]);
+                        } else {
+                            syscall::debug_puts(b"never_reaped");
+                        }
+                        syscall::debug_puts(b"\n");
                     }
                     syscall::debug_puts(b"  [H13] reaping compositor...\n");
                     let mut comp_code: i64 = -1;
