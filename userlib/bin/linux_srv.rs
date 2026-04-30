@@ -7340,8 +7340,12 @@ fn handle_bind(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                     return linux_err(ECONNREFUSED);
                 }
             };
-            if resp.tag != UDS_OK {
-                syscall::debug_puts(b"  [linux_srv bind] UDS_BIND tag=");
+            // Diagnostic: log every bind whose basename starts with 'X'
+            // (covers Xwayland's /tmp/.X11-unix/X0).  Prints success and
+            // failure so we can see whether Xwayland reaches bind at all.
+            let basename_is_x = nlen > 0 && name[0] == b'X';
+            if basename_is_x || resp.tag != UDS_OK {
+                syscall::debug_puts(b"  [linux_srv bind] tag=");
                 print_num(resp.tag);
                 syscall::debug_puts(b" handle=");
                 print_num(PROC_TABLE[pi].fds[fd].handle);
@@ -7354,6 +7358,8 @@ fn handle_bind(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                     syscall::debug_puts(&s);
                 }
                 syscall::debug_puts(b"]\n");
+            }
+            if resp.tag != UDS_OK {
                 return linux_err(EINVAL);
             }
             PROC_TABLE[pi].fds[fd].sock_state = 1;
