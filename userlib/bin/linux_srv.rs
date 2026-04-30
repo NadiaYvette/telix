@@ -3245,11 +3245,39 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         | b"/tmp/.X11-unix" | b"/tmp/.X11-unix/" => true,
         _ => false,
     };
+    // For paths that xtrans inspects (/tmp/.X11-unix), match the canonical
+    // X server expectations so its mode/owner check passes WITHOUT
+    // triggering the open()+fstat() revalidation that compares (st_dev,
+    // st_ino) against the lstat result. Other dirs use generic 0o755.
+    let is_x11_unix = matches!(&path[..pathlen], b"/tmp/.X11-unix" | b"/tmp/.X11-unix/");
     if is_proc_dir {
         let mut stat_buf = [0u8; 144];
-        let mode: u32 = 0o040755; // S_IFDIR | 0755
-        stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
-        stat_buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+        // Build a stable "real-directory-looking" stat. Xwayland's xtrans
+        // _XSERVTransmkdir does back-to-back lstat() calls on the same
+        // path and bails with "inode for /tmp/.X11-unix changed" if
+        // st_ino differs between calls — so st_ino has to be (a) non-zero
+        // and (b) deterministic per path. Hash the path bytes into the
+        // bottom 32 bits of st_ino (offset 8..16). nlink=2 makes the
+        // dir look like an empty real directory (`.` + parent ref).
+        let mut ino: u64 = 0xC001;
+        for (i, &b) in path[..pathlen].iter().enumerate() {
+            ino = ino.wrapping_mul(31).wrapping_add(b as u64);
+            if i > 32 { break; }
+        }
+        // For /tmp/.X11-unix we publish exactly what xtrans expects so its
+        // permission/owner check finds the dir already correct and skips
+        // the open()+fstat() revalidation path that would mismatch our
+        // synthetic ino against the (real or absent) backing fd.
+        // Sticky-bit dir 1777 owned by root: matches the canonical
+        // /tmp/.X11-unix that X.Org's server expects.
+        let mode: u32 = if is_x11_unix { 0o041777 } else { 0o040755 };
+        let nlink: u64 = 2;
+        let blksize: u64 = 4096;
+        stat_buf[8..16].copy_from_slice(&ino.to_le_bytes());        // st_ino
+        stat_buf[16..24].copy_from_slice(&nlink.to_le_bytes());     // st_nlink
+        stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());      // st_mode
+        // st_uid (offset 28) and st_gid (offset 32) stay 0 — root owned.
+        stat_buf[56..64].copy_from_slice(&blksize.to_le_bytes());   // st_blksize
         let written = syscall::personality_copy_out(caller_port, statbuf_va, &stat_buf);
         if written < 144 { return linux_err(EFAULT); }
         return 0;

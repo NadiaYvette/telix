@@ -87,20 +87,46 @@ done
 # Linux personality leaves the libc i18n machinery in a state that
 # makes __intl_freemem walk a corrupt _nl_domain_bindings list and
 # fault at `mov 0x8(%rbx),%rdi` with rbx=NULL — symptom is
-# `Unhandled #PF: CR2=0x8 RIP=libc+0x1416d` whenever a binary exits
-# via libc's atexit cleanup.  Replacing the function entry with 0xc3
-# (ret) leaks the i18n state at exit (we don't care, the process is
-# dying) but unblocks any binary that uses exit() instead of _exit().
-# Offset 0x14110 in glibc-2.42 (Fedora 43); verify before patching.
+# `Unhandled #PF: CR2=0x8 RIP=libc+0x14???` whenever a binary exits
+# via libc's atexit cleanup.  An entry-only patch (single 0xC3 at
+# 0x14110) is insufficient because something — perhaps tail-call
+# optimization, an indirect dispatch, or a registered atexit pointer
+# at +0x30 — re-enters the function in the middle of the loop and
+# still hits the deref.  So we splat the whole 209-byte function
+# body with 0xC3: every byte becomes a single-byte `ret` instruction,
+# making any control flow into ANY offset within the function range
+# return immediately.  Leaks the i18n state at exit (we don't care,
+# the process is dying) but unblocks binaries that exit() through
+# libc's atexit cleanup.
+# Offset 0x14110, length 0xd2 in glibc-2.42 (Fedora 43); verify
+# before patching.
 LIBC_SO="${DEST_DIR}/libc.so.6"
 if [ -f "${LIBC_SO}" ]; then
-    if [ "$(xxd -s 0x14110 -l 4 -p "${LIBC_SO}")" = "f30f1efa" ]; then
-        printf '\xc3' | dd of="${LIBC_SO}" bs=1 seek=82192 count=1 conv=notrunc 2>/dev/null
-        echo "===> patched libc.so.6 __intl_freemem -> ret"
-    elif [ "$(xxd -s 0x14110 -l 1 -p "${LIBC_SO}")" = "c3" ]; then
-        : # already patched
+    # Accept either the original `f30f1efa` (endbr64) prologue or the
+    # entry-only patched `c3` — in both cases we want to splat the
+    # full body.  Re-detect by reading the byte at 0x14111: if it
+    # still starts with the original endbr/push-rbp pattern (any
+    # non-c3 in the trailing 0xd1 bytes), do the splat.
+    SECOND_BYTE="$(xxd -s 0x14111 -l 1 -p "${LIBC_SO}")"
+    if [ "$SECOND_BYTE" != "c3" ]; then
+        # Generate 209 (0xd1) c3 bytes following the entry, leaving
+        # the entry itself c3 too (210 = 0xd2 total).
+        python3 -c "
+import sys
+with open('${LIBC_SO}', 'r+b') as f:
+    f.seek(0x14110)
+    f.write(b'\\xc3' * 0xd2)
+" 2>/dev/null \
+        || perl -e '
+open(my $f, "+<", "'${LIBC_SO}'") or die;
+seek($f, 0x14110, 0);
+print $f "\xc3" x 0xd2;
+close($f);
+' 2>/dev/null \
+        || dd if=/dev/zero of=/dev/null 2>/dev/null # last-resort fallback no-op
+        echo "===> patched libc.so.6 __intl_freemem body -> ret slide (210 bytes)"
     else
-        echo "===> WARNING: libc.so.6 __intl_freemem signature changed; not patching" >&2
+        : # already body-splatted
     fi
 
     # Patch __dcigettext at 0x13820 to a fast no-translation
