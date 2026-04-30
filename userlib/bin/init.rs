@@ -8768,6 +8768,138 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
     }
 
+    // --- Step H12b: minimal X0 bind probe ---
+    // Mimics what xtrans does on Xwayland startup: open an AF_UNIX
+    // STREAM socket and bind it to "/tmp/.X11-unix/X0". If this works,
+    // Xwayland's bind() failure is in xtrans-internal flow (e.g.
+    // setsockopt / SO_REUSEADDR / unlink) rather than our bind path.
+    // If it fails, the [linux_srv bind] UDS_BIND tag print fires and
+    // we know exactly which response uds_srv returned. Cost is a
+    // single fork + a handful of syscalls — no library load — so this
+    // runs to completion within seconds even on flaky boots that
+    // can't fit Xwayland inside its 120s budget.
+    syscall::debug_puts(b"  init: Step H12b X0 bind probe...\n");
+    {
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        const __NR_SOCKET:     u64 = 41;
+                        const __NR_BIND:       u64 = 49;
+                        const __NR_LISTEN:     u64 = 50;
+                        const __NR_CLOSE:      u64 = 3;
+                        const __NR_EXIT_GROUP: u64 = 231;
+                        const AF_UNIX:    u64 = 1;
+                        const SOCK_STREAM: u64 = 1;
+
+                        // Build sockaddr_un in stack-local memory.
+                        // Layout: sa_family (u16) + sun_path[108] (bytes)
+                        let mut addr: [u8; 110] = [0; 110];
+                        addr[0] = 1;  // AF_UNIX (LE u16)
+                        addr[1] = 0;
+                        let path = b"/tmp/.X11-unix/X0";
+                        for (i, &b) in path.iter().enumerate() {
+                            addr[2 + i] = b;
+                        }
+                        // addrlen = sa_family(2) + strlen(path)(17) + null(1)
+                        let addrlen: u64 = 2 + path.len() as u64 + 1;
+
+                        // socket(AF_UNIX, SOCK_STREAM, 0)
+                        let fd: u64;
+                        core::arch::asm!("int 0x80",
+                            inlateout("rax") __NR_SOCKET => fd,
+                            in("rdi") AF_UNIX,
+                            in("rsi") SOCK_STREAM,
+                            in("rdx") 0u64,
+                            in("r10") 0u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if fd > 0xFFFF_FFFF_FFFF_F000 {
+                            core::arch::asm!("int 0x80",
+                                in("rax") __NR_EXIT_GROUP, in("rdi") 91u64,
+                                options(noreturn));
+                        }
+
+                        // bind(fd, &addr, addrlen)
+                        let r: u64;
+                        core::arch::asm!("int 0x80",
+                            inlateout("rax") __NR_BIND => r,
+                            in("rdi") fd,
+                            in("rsi") addr.as_ptr() as u64,
+                            in("rdx") addrlen,
+                            in("r10") 0u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        if r > 0xFFFF_FFFF_FFFF_F000 {
+                            // bind failed — exit with errno (negated)
+                            // mapped into 100..200 so the reaper can
+                            // distinguish from socket() failures.
+                            let errno = (!r).wrapping_add(1) & 0xFF;
+                            core::arch::asm!("int 0x80",
+                                in("rax") __NR_EXIT_GROUP, in("rdi") (100 + errno),
+                                options(noreturn));
+                        }
+
+                        // listen(fd, 5)
+                        core::arch::asm!("int 0x80",
+                            inlateout("rax") __NR_LISTEN => _,
+                            in("rdi") fd, in("rsi") 5u64,
+                            in("rdx") 0u64, in("r10") 0u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+
+                        // close(fd) and exit cleanly.
+                        core::arch::asm!("int 0x80",
+                            inlateout("rax") __NR_CLOSE => _,
+                            in("rdi") fd,
+                            in("rsi") 0u64, in("rdx") 0u64,
+                            in("r10") 0u64, in("r8") 0u64,
+                            lateout("rcx") _, lateout("r11") _);
+                        core::arch::asm!("int 0x80",
+                            in("rax") __NR_EXIT_GROUP, in("rdi") 0u64,
+                            options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    { syscall::exit(99); }
+                } else {
+                    syscall::exit(90);
+                }
+            } else if child != u64::MAX {
+                syscall::personality_set(child, 2, 1);
+                let mut exit_code: i64 = -1;
+                for _ in 0..2000 {
+                    if let Some(code) = syscall::waitpid(child) {
+                        exit_code = code as i64;
+                        break;
+                    }
+                    syscall::sleep_ms(5);
+                }
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Step H12b X0 bind probe: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Step H12b X0 bind probe: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Step H12b X0 bind probe: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Step H12b X0 bind probe: SKIPPED\n");
+        }
+    }
+
     // --- Step H13: Xwayland against wl_compositor_min ---
     // Spawn wl_compositor_min --one-shot (provides /run/user/0/wayland-0),
     // then fork Xwayland with WAYLAND_DISPLAY=wayland-0 +
