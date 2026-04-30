@@ -7333,10 +7333,23 @@ fn handle_bind(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             }
             let (w0, w1) = pack_uds_name(&name, nlen);
             let d2 = nlen as u64;
-            let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, UDS_BIND, PROC_TABLE[pi].fds[fd].handle, w0, d2, w1) {
+            // Retry up to 3× on CALL_REPLY_SERVER_DIED — same transient
+            // 10s-watchdog fire we see in do_open.  Without retry, an
+            // Xwayland bind to /tmp/.X11-unix/X0 under boot contention
+            // hits the wedged uds_srv slot and surfaces as EINVAL when
+            // it should have succeeded on a retry.
+            const SERVER_DIED: u64 = 0xFFFF_FFFF_FFFF_FE00;
+            let mut resp_opt = None;
+            for _ in 0..3 {
+                match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, UDS_BIND, PROC_TABLE[pi].fds[fd].handle, w0, d2, w1) {
+                    Some(m) if m.tag != SERVER_DIED => { resp_opt = Some(m); break; }
+                    _ => { syscall::sleep_ms(1); }
+                }
+            }
+            let resp = match resp_opt {
                 Some(m) => m,
                 None => {
-                    syscall::debug_puts(b"  [linux_srv bind] UDS_BIND IPC: no reply\n");
+                    syscall::debug_puts(b"  [linux_srv bind] UDS_BIND IPC: no reply after 3 retries\n");
                     return linux_err(ECONNREFUSED);
                 }
             };
