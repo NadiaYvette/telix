@@ -2701,7 +2701,14 @@ fn try_switch(current_sp: u64) -> u64 {
     // parked (on_cpu=MAX) or already pending. If on_cpu is a real CPU
     // number (spurious rescue enqueue of a Running thread), CAS fails.
     // Skip for idle threads (per-CPU, never enqueued, can't be double-scheduled).
+    //
+    // dispatching_tid: published BEFORE the CAS so rescue's stale_on_cpu
+    // predicate (state=Ready, on_cpu=cpu_real, current_thread=prev_id) can
+    // observe "this CPU is in the middle of dispatching tid" and skip.
+    // Cleared AFTER the current_thread store so rescue never sees a thread
+    // that has on_cpu=cpu but is neither dispatching nor current_thread.
     if next_id != idle_id {
+        pcpu.dispatching_tid.store(next_id, Ordering::Release);
         if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
             ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire,
         ) {
@@ -2715,6 +2722,7 @@ fn try_switch(current_sp: u64) -> u64 {
                 thread_ref(next_id).state
             );
             thread_ref(next_id).killed.store(true, Ordering::Release);
+            pcpu.dispatching_tid.store(0, Ordering::Release);
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
             pcpu.current_thread.store(idle_id, Ordering::Relaxed);
@@ -2736,6 +2744,11 @@ fn try_switch(current_sp: u64) -> u64 {
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     trace_sched(next_id, 7); // 7=state_running
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
+    // Clear dispatching_tid: dispatch is fully visible — on_cpu=cpu,
+    // state=Running, current_thread=tid all observable to other CPUs.
+    if next_id != idle_id {
+        pcpu.dispatching_tid.store(0, Ordering::Release);
+    }
     thread_ref(next_id).last_cpu.store(cpu, Ordering::Relaxed);
 
     // RCU quiescent state: all syscall read-side references from the
@@ -2910,6 +2923,7 @@ pub fn voluntary_reschedule() {
 
     // Claim on_cpu for next (ON_CPU_PENDING → cpu).
     if next_id != idle_id {
+        pcpu.dispatching_tid.store(next_id, Ordering::Release);
         if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
             ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire,
         ) {
@@ -2918,6 +2932,7 @@ pub fn voluntary_reschedule() {
                 next_id, other_cpu, cpu
             );
             thread_ref(next_id).killed.store(true, Ordering::Release);
+            pcpu.dispatching_tid.store(0, Ordering::Release);
             // Undo: stay on cur_id. Drain our deferred store (it was cur).
             deferred_requeue()[cpu as usize].store(0, Ordering::Release);
             let t = unsafe { thread_mut_from_ref(cur_id) };
@@ -2955,6 +2970,9 @@ pub fn voluntary_reschedule() {
 
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
+    if next_id != idle_id {
+        pcpu.dispatching_tid.store(0, Ordering::Release);
+    }
     let next_sp = next_t.saved_sp;
 
     pending_switch_sp()[cpu as usize].store(next_sp, Ordering::Release);
@@ -5443,8 +5461,14 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
             false
         } else if on < ncpus as u32 {
             // Check if the claimed CPU is actually running this thread.
-            let cur = smp::get(on).current_thread.load(Ordering::Acquire);
-            let stale = cur != tid as u32;
+            // Also consult dispatching_tid: the claimed CPU may be in the
+            // middle of try_switch's dispatch sequence (CAS done, state and
+            // current_thread not yet updated).  In that window cur != tid,
+            // but the thread is *not* stale — it's about to be Running.
+            let pcpu = smp::get(on);
+            let cur = pcpu.current_thread.load(Ordering::Acquire);
+            let dispatching = pcpu.dispatching_tid.load(Ordering::Acquire);
+            let stale = cur != tid as u32 && dispatching != tid as u32;
             stale_on_cpu = stale;
             stale
         } else {
@@ -6154,6 +6178,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     {
         let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
         if receiver_tid != idle_id {
+            pcpu.dispatching_tid.store(receiver_tid, Ordering::Release);
             if let Err(other_cpu) = thread_ref(receiver_tid).on_cpu.compare_exchange(
                 u32::MAX, cpu_id, Ordering::AcqRel, Ordering::Acquire,
             ) {
@@ -6162,6 +6187,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
                     receiver_tid, other_cpu, cpu_id
                 );
                 thread_ref(receiver_tid).killed.store(true, Ordering::Release);
+                pcpu.dispatching_tid.store(0, Ordering::Release);
                 // Stay on sender. Clear deferred store and restore on_cpu.
                 deferred_requeue()[cpu].store(0, Ordering::Release);
                 let sender2 = unsafe { thread_mut_from_ref(sender_tid as ThreadId) };
@@ -6176,6 +6202,12 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     // Activate receiver.
     receiver.state = ThreadState::Running;
     pcpu.current_thread.store(receiver_tid, Ordering::Relaxed);
+    {
+        let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
+        if receiver_tid != idle_id {
+            pcpu.dispatching_tid.store(0, Ordering::Release);
+        }
+    }
     let recv_sp = receiver.saved_sp;
 
     // Sanity check: saved_sp must be within the thread's kstack.

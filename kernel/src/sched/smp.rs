@@ -172,6 +172,15 @@ pub struct PerCpuData {
     /// Set by wake_thread()/tick() when a reschedule is needed.
     /// Checked on syscall return to trigger preemption.
     pub need_resched: AtomicBool,
+    /// Tid currently being dispatched on this CPU (0 = no dispatch).
+    /// Set by try_switch BEFORE the on_cpu CAS; cleared AFTER state=Running
+    /// and current_thread store.  Lets the rescue path skip threads in the
+    /// transient (state=Ready, on_cpu=cpu_real, current_thread=prev_id)
+    /// dispatch window — try_switch's CAS already won, but the thread
+    /// hasn't transitioned to Running yet.  Without this hint rescue would
+    /// false-fire stale_on_cpu, re-enqueue the dispatching thread, and
+    /// trigger DOUBLE-SCHED detection that kills it.
+    pub dispatching_tid: AtomicU32,
 }
 
 impl PerCpuData {
@@ -181,6 +190,7 @@ impl PerCpuData {
             idle_thread_id: AtomicU32::new(0),
             online: AtomicBool::new(false),
             need_resched: AtomicBool::new(false),
+            dispatching_tid: AtomicU32::new(0),
         }
     }
 }
