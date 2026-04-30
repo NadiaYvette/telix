@@ -54,11 +54,13 @@ use userlib::syscall;
 // try_switch's deferred-store path.
 const N_WORKERS: usize = 8;
 
-// Round-trips per worker.  10_000 * 8 = 80_000 round-trips ≈ 160_000
-// scheduling decisions on a hot path.  At ~50µs per round-trip that's
-// ~4-8 seconds of pressure — well inside the 5s watchdog window so a
-// single repro iteration will fire WATCHDOG if the race trips.
-const N_ROUNDS: u64 = 10_000;
+// Round-trips per worker. Reduced from 10_000 → 500 now that the
+// NEW_INV scheduler fix has landed (8 workers × 500 = 4000 round-trips
+// ≈ ~1s). Still hits all the deferred-store/wake paths the original
+// stress was designed to exercise; just doesn't burn 25 minutes of
+// boot. Bump back up if a new scheduler regression needs a longer
+// soak.
+const N_ROUNDS: u64 = 500;
 
 // How often a worker yields between calls (in rounds).  0 = never; small
 // numbers introduce extra context switches that exercise the
@@ -149,12 +151,9 @@ extern "C" fn server_entry(_arg: u64) -> ! {
 extern "C" fn worker_entry(arg: u64) -> ! {
     let idx = arg as usize;
     let port = SERVER_PORT.load(Ordering::Acquire);
-    // Worker 0 opts itself in as the kernel-side trace target for the
-    // call/reply slow-path investigation.  See sys_debug_puts sentinel
-    // and `TRACE_TID` in kernel/src/sched/scheduler.rs.
-    if idx == 0 {
-        syscall::debug_puts(b"!TRACE_ME!\n");
-    }
+    // (TRACE_TID opt-in disabled now that the scheduler bug is fixed.
+    // Re-enable by uncommenting the debug_puts of "!TRACE_ME!\n" if a
+    // future regression needs the per-event trace.)
     for round in 0..N_ROUNDS {
         WORKER_ROUND[idx].store(round, Ordering::Relaxed);
         // call() blocks the worker on CallReply against the server until
