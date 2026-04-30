@@ -159,6 +159,14 @@ impl SlabCache {
                 let header = unsafe { &mut *(page_base as *mut SlabHeader) };
                 let obj_index = (addr_val - page_base - self.data_offset) / self.obj_size;
 
+                // Sanity: obj_index must be within the page's object capacity.
+                if obj_index >= self.objs_per_slab {
+                    panic!(
+                        "slab::free corruption: addr={:#x} page={:#x} obj_index={} > capacity={} obj_size={}",
+                        addr_val, page_base, obj_index, self.objs_per_slab, self.obj_size
+                    );
+                }
+
                 // Push onto free list.
                 let obj_ptr =
                     (page_base + self.data_offset + obj_index * self.obj_size) as *mut u16;
@@ -204,6 +212,15 @@ impl SlabCache {
     /// Allocate from a slab with known free objects.
     fn alloc_from_slab(&self, page_addr: usize, header: &mut SlabHeader) -> PhysAddr {
         let index = header.free_head as usize;
+        // Bounds: free_head MUST be a valid object index. If it isn't, the
+        // free list has been corrupted (e.g., by a stale write into a freed
+        // slot). Panic loudly rather than walk into garbage.
+        if index >= self.objs_per_slab {
+            panic!(
+                "slab corruption: page={:#x} obj_size={} free_head={} > capacity={}",
+                page_addr, self.obj_size, index, self.objs_per_slab
+            );
+        }
         let obj_addr = page_addr + self.data_offset + index * self.obj_size;
 
         // Advance free list.
@@ -380,6 +397,10 @@ fn cache_by_index(idx: usize) -> &'static SpinLock<SlabCache> {
 fn cache_for_size(size: usize) -> Option<&'static SpinLock<SlabCache>> {
     cache_index(size).map(cache_by_index)
 }
+
+/// Set true to log every 256-byte slab alloc/free for stress diagnostics.
+pub static SLAB_TRACE_256: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Allocate an object of `size` bytes from the appropriate slab cache.
 /// Uses per-CPU magazine fast path when possible.

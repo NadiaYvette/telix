@@ -160,11 +160,19 @@ fn alloc_node16(partial: &[u8]) -> Option<*mut Node16> {
     let pa = slab::alloc(NODE16_SLAB)?;
     let p = pa.as_usize() as *mut Node16;
     unsafe {
+        // Source-aliasing guard: if `partial` points into the slab block
+        // we just got back, write_bytes would zero the source bytes
+        // before copy_nonoverlapping reads them. Snapshot to a local
+        // first to break the alias.
+        let plen = partial.len().min(MAX_PARTIAL);
+        let mut snapshot = [0u8; MAX_PARTIAL];
+        for i in 0..plen {
+            snapshot[i] = partial[i];
+        }
         core::ptr::write_bytes(p as *mut u8, 0, NODE16_SLAB);
         (*p).h.node_type = NODE16;
-        let plen = partial.len().min(MAX_PARTIAL);
         (*p).h.partial_len = plen as u8;
-        core::ptr::copy_nonoverlapping(partial.as_ptr(), (*p).h.partial.as_mut_ptr(), plen);
+        core::ptr::copy_nonoverlapping(snapshot.as_ptr(), (*p).h.partial.as_mut_ptr(), plen);
     }
     Some(p)
 }
@@ -562,6 +570,12 @@ unsafe fn num_children(node_ptr: usize) -> u8 {
 /// Readers are lock-free via RCU; only writers need this lock.
 pub static ART_WRITE_LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
 
+/// When true, `Art::insert` runs a post-insert lookup self-check and
+/// dumps structural state on mismatch. Off by default to avoid runtime
+/// cost; enabled by the kernel-side ART stress harness.
+pub static SELF_CHECK_INSERT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Structured outcome of a diagnostic lookup. See `Art::lookup_diag`.
 /// `Display` is implemented via `print_lookup_outcome` (no_std-friendly
 /// — emits via `println!` directly so we don't have to plumb a fmt::Write).
@@ -780,7 +794,99 @@ impl Art {
         if !ok {
             free_leaf(leaf);
         }
+        // Post-insert self-check: a successful insert of `key` MUST be
+        // immediately resolvable by lookup. Failure here is a structural
+        // bug in the ART (not a race — `insert` is serialized).
+        if ok && SELF_CHECK_INSERT.load(Ordering::Relaxed) {
+            if self.lookup(key).is_none() {
+                let outcome = self.lookup_diag(key);
+                crate::println!(
+                    "ART self-check: insert(key={}) returned true but lookup failed. root={:#x}",
+                    key, unsafe { slot_load(&self.root) }
+                );
+                print_lookup_outcome("  self-check", key, outcome);
+                self.dump_root_partial(key);
+            }
+        }
         ok
+    }
+
+    /// Public root dump for stress-test instrumentation.
+    pub fn debug_dump_root(&self, label: &str) {
+        let root = unsafe { slot_load(&self.root) };
+        if root == 0 {
+            crate::println!("  [{}] root: empty", label);
+            return;
+        }
+        if is_leaf(root) {
+            let leaf = unsafe { &*untag_leaf(root) };
+            crate::println!("  [{}] root: leaf key={} value={:#x}", label, leaf.key, leaf.value);
+            return;
+        }
+        unsafe {
+            let h = &*(root as *const Header);
+            crate::println!(
+                "  [{}] root addr={:#x} type={} nc={} plen={} partial={:02x?}",
+                label, root, h.node_type, h.num_children, h.partial_len,
+                &h.partial[..h.partial_len as usize]
+            );
+            // Also show keys[] for inner nodes — confirms whether children
+            // are addressable.
+            match h.node_type {
+                NODE4 => {
+                    let n = &*(root as *const Node4);
+                    let nc = n.h.num_children as usize;
+                    crate::println!("    keys[0..{}]={:02x?}", nc, &n.keys[..nc]);
+                }
+                NODE16 => {
+                    let n = &*(root as *const Node16);
+                    let nc = n.h.num_children as usize;
+                    crate::println!("    keys[0..{}]={:02x?}", nc, &n.keys[..nc]);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// One-shot dump of the root inner node's header + first level keys —
+    /// used by the post-insert self-check. Cheap, called only on failure.
+    fn dump_root_partial(&self, key: u64) {
+        let root = unsafe { slot_load(&self.root) };
+        if root == 0 || is_leaf(root) {
+            crate::println!("  dump_root: root={:#x} leaf={}", root, is_leaf(root));
+            return;
+        }
+        unsafe {
+            let h = &*(root as *const Header);
+            crate::println!(
+                "  dump_root: addr={:#x} type={} nc={} plen={} partial={:02x?}",
+                root, h.node_type, h.num_children, h.partial_len,
+                &h.partial[..h.partial_len as usize]
+            );
+            // First-level keys
+            match h.node_type {
+                NODE4 => {
+                    let n = &*(root as *const Node4);
+                    let nc = n.h.num_children as usize;
+                    crate::println!("    Node4 keys[0..{}] = {:02x?}", nc, &n.keys[..nc]);
+                }
+                NODE16 => {
+                    let n = &*(root as *const Node16);
+                    let nc = n.h.num_children as usize;
+                    crate::println!("    Node16 keys[0..{}] = {:02x?}", nc, &n.keys[..nc]);
+                }
+                NODE256 => {
+                    let n = &*(root as *const Node256);
+                    let target = key_at(key, h.partial_len as usize);
+                    let child_at = slot_load(&n.children[target as usize]);
+                    crate::println!(
+                        "    Node256 nc={} children[wanted_byte=0x{:02x}]={:#x}",
+                        n.h.num_children, target, child_at
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Remove an entry by key. Returns the value if found.
