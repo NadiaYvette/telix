@@ -7325,14 +7325,37 @@ fn handle_bind(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         let dom = PROC_TABLE[pi].fds[fd].sock_domain;
         if dom == AF_UNIX as u8 {
             let (name, nlen) = parse_sockaddr_un(caller_port, addr_va, addrlen);
-            if nlen == 0 { return linux_err(EINVAL); }
+            if nlen == 0 {
+                syscall::debug_puts(b"  [linux_srv bind] EINVAL: parse_sockaddr_un nlen=0 addrlen=");
+                print_num(addrlen as u64);
+                syscall::debug_puts(b"\n");
+                return linux_err(EINVAL);
+            }
             let (w0, w1) = pack_uds_name(&name, nlen);
             let d2 = nlen as u64;
             let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, UDS_BIND, PROC_TABLE[pi].fds[fd].handle, w0, d2, w1) {
                 Some(m) => m,
-                None => { return linux_err(ECONNREFUSED); }
+                None => {
+                    syscall::debug_puts(b"  [linux_srv bind] UDS_BIND IPC: no reply\n");
+                    return linux_err(ECONNREFUSED);
+                }
             };
-            if resp.tag != UDS_OK { return linux_err(EINVAL); }
+            if resp.tag != UDS_OK {
+                syscall::debug_puts(b"  [linux_srv bind] UDS_BIND tag=");
+                print_num(resp.tag);
+                syscall::debug_puts(b" handle=");
+                print_num(PROC_TABLE[pi].fds[fd].handle);
+                syscall::debug_puts(b" nlen=");
+                print_num(nlen as u64);
+                syscall::debug_puts(b" basename[");
+                for i in 0..nlen.min(16) {
+                    let bb = name[i];
+                    let s = if bb >= 32 && bb < 127 { [bb] } else { [b'?'] };
+                    syscall::debug_puts(&s);
+                }
+                syscall::debug_puts(b"]\n");
+                return linux_err(EINVAL);
+            }
             PROC_TABLE[pi].fds[fd].sock_state = 1;
             0
         } else if dom == AF_INET as u8 {
