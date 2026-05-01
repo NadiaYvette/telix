@@ -2093,6 +2093,20 @@ fn ensure_lin_path_scratch() -> bool {
             Some(v) => v,
             None => return false,
         };
+        // Pre-fault every scratch page BEFORE granting.  mmap_anon returns
+        // CoW-on-write mappings to the global zero page; if we grant the VA
+        // before any write, kernel grants whatever PT entry exists (may be
+        // the shared zero page).  Then the first writer (the FS server)
+        // triggers CoW *in its aspace only*, leaving our view on the zero
+        // page — surfaces as "/lib64/libc.so.6: unsupported version 0 of
+        // Verdef record" because libc bytes coming back through the grant
+        // appear zero-filled to us.  Force unique writable phys pages by
+        // writing one byte per page before any grant_pages call.
+        let ps = syscall::page_size();
+        for i in 0..FS_SCRATCH_PAGES {
+            let p = (va + i * ps) as *mut u8;
+            core::ptr::write_volatile(p, 0u8);
+        }
         let vfs_task = syscall::ns_lookup(b"vfs_task").unwrap_or(0);
         if vfs_task == 0 {
             return false;
