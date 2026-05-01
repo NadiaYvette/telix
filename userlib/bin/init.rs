@@ -8939,7 +8939,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
 
                     let mut xw_code: i64 = -1;
-                    let mut xeyes_reported = false;
+                    // Track up to 3 xeyes attempts.  First attempt forks
+                    // immediately and races Xwayland's X0 bind — usually
+                    // loses (xtrans connect fails because /tmp/.X11-unix/X0
+                    // doesn't exist yet).  Each re-attempt fires 4 s after
+                    // the previous one's reap, giving Xwayland time to bind.
+                    // We stop retrying once xeyes returns 0 (success) or we
+                    // run out of attempts or Xwayland dies.
+                    let mut xeyes_attempt: u32 = 1;
+                    let mut xeyes_attempt_reported: u32 = 0; // last attempt # already printed
+                    let mut next_xeyes_fork_i: i32 = -1; // -1 = no pending refork
                     for i in 0..12000 {
                         if let Some(code) = syscall::waitpid(xw_child) {
                             xw_code = code as i64;
@@ -8954,14 +8963,69 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         // end of loop.  If init wedges later (scheduler stall,
                         // kernel fault elsewhere), we still capture the exit
                         // code for the goal "Step H14 xeyes: exit=N reported".
-                        if !xeyes_reported && xeyes_child != u64::MAX && xeyes_code >= 0 {
-                            syscall::debug_puts(b"Step H14 xeyes: exit=");
+                        // Only print once per attempt (gate on xeyes_attempt_reported).
+                        if xeyes_child != u64::MAX
+                            && xeyes_code >= 0
+                            && xeyes_attempt_reported < xeyes_attempt
+                        {
+                            syscall::debug_puts(b"Step H14 xeyes attempt ");
+                            syscall::debug_putchar(b'0' + xeyes_attempt as u8);
+                            syscall::debug_puts(b": exit=");
                             let mut buf = [0u8; 12]; let mut val = xeyes_code as u32; let mut k = 12;
                             if val == 0 { k -= 1; buf[k] = b'0'; }
                             while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
                             syscall::debug_puts(&buf[k..12]);
                             syscall::debug_puts(b"\n");
-                            xeyes_reported = true;
+                            xeyes_attempt_reported = xeyes_attempt;
+                            // Schedule a retry if this attempt failed and we
+                            // have attempts left.  4 s gap (i + 400) covers
+                            // typical Xwayland startup time.
+                            if xeyes_code != 0 && xeyes_attempt < 3 {
+                                next_xeyes_fork_i = i as i32 + 400;
+                            }
+                        }
+                        // Refork xeyes once the schedule fires.
+                        if next_xeyes_fork_i >= 0 && i as i32 >= next_xeyes_fork_i {
+                            syscall::debug_puts(b"  [H14] retrying xeyes (attempt ");
+                            xeyes_attempt += 1;
+                            syscall::debug_putchar(b'0' + xeyes_attempt as u8);
+                            syscall::debug_puts(b")...\n");
+                            let xc = syscall::fork();
+                            if xc == 0 {
+                                for _ in 0..100 {
+                                    let (p, _) = syscall::personality_get();
+                                    if p != 0 { break; }
+                                    syscall::yield_now();
+                                }
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    static XPATH: &[u8] = b"/xeyes\0";
+                                    static XA0:   &[u8] = b"xeyes\0";
+                                    static XE0:   &[u8] = b"LD_LIBRARY_PATH=/lib64\0";
+                                    static XE1:   &[u8] = b"DISPLAY=:0\0";
+                                    static XE2:   &[u8] = b"LANG=C\0";
+                                    static XE3:   &[u8] = b"LC_ALL=C\0";
+                                    let xargv: [u64; 2] = [XA0.as_ptr() as u64, 0];
+                                    let xenvp: [u64; 5] = [XE0.as_ptr() as u64, XE1.as_ptr() as u64,
+                                                            XE2.as_ptr() as u64, XE3.as_ptr() as u64, 0];
+                                    core::arch::asm!(
+                                        "int 0x80",
+                                        inlateout("rax") 59u64 => _,
+                                        in("rdi") XPATH.as_ptr() as u64,
+                                        in("rsi") xargv.as_ptr() as u64,
+                                        in("rdx") xenvp.as_ptr() as u64,
+                                        lateout("rcx") _, lateout("r11") _,
+                                    );
+                                    core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 96u64, options(noreturn));
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                { syscall::exit(99); }
+                            } else if xc != u64::MAX {
+                                syscall::personality_set(xc, 2, abi);
+                                xeyes_child = xc;
+                                xeyes_code = -1; // "running"
+                            }
+                            next_xeyes_fork_i = -1;
                         }
                         syscall::sleep_ms(10);
                         // Fine-grained checkpoints so silent stalls in the wait
