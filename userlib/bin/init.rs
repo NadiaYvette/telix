@@ -8939,6 +8939,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
 
                     let mut xw_code: i64 = -1;
+                    let mut xeyes_reported = false;
                     for i in 0..12000 {
                         if let Some(code) = syscall::waitpid(xw_child) {
                             xw_code = code as i64;
@@ -8949,10 +8950,35 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 xeyes_code = code as i64;
                             }
                         }
+                        // Print Step H14 xeyes exit immediately on reap, not at
+                        // end of loop.  If init wedges later (scheduler stall,
+                        // kernel fault elsewhere), we still capture the exit
+                        // code for the goal "Step H14 xeyes: exit=N reported".
+                        if !xeyes_reported && xeyes_child != u64::MAX && xeyes_code >= 0 {
+                            syscall::debug_puts(b"Step H14 xeyes: exit=");
+                            let mut buf = [0u8; 12]; let mut val = xeyes_code as u32; let mut k = 12;
+                            if val == 0 { k -= 1; buf[k] = b'0'; }
+                            while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                            syscall::debug_puts(&buf[k..12]);
+                            syscall::debug_puts(b"\n");
+                            xeyes_reported = true;
+                        }
                         syscall::sleep_ms(10);
+                        // Fine-grained checkpoints so silent stalls in the wait
+                        // loop leave a visible trace.  Earlier we'd see only @5s,
+                        // then nothing until QEMU killed the boot at 1500 s —
+                        // useless for telling whether init's loop hung at i=600
+                        // or i=11999.
+                        if i == 100 { syscall::debug_puts(b"  [H13] Xwayland @1s\n"); }
+                        if i == 200 { syscall::debug_puts(b"  [H13] Xwayland @2s\n"); }
+                        if i == 300 { syscall::debug_puts(b"  [H13] Xwayland @3s\n"); }
                         if i == 500 { syscall::debug_puts(b"  [H13] Xwayland @5s\n"); }
+                        if i == 800 { syscall::debug_puts(b"  [H13] Xwayland @8s\n"); }
+                        if i == 1100 { syscall::debug_puts(b"  [H13] Xwayland @11s\n"); }
                         if i == 1500 { syscall::debug_puts(b"  [H13] Xwayland @15s\n"); }
+                        if i == 2000 { syscall::debug_puts(b"  [H13] Xwayland @20s\n"); }
                         if i == 3000 { syscall::debug_puts(b"  [H13] Xwayland @30s\n"); }
+                        if i == 4500 { syscall::debug_puts(b"  [H13] Xwayland @45s\n"); }
                         if i == 6000 { syscall::debug_puts(b"  [H13] Xwayland @60s\n"); }
                         if i == 9000 { syscall::debug_puts(b"  [H13] Xwayland @90s\n"); }
                     }
