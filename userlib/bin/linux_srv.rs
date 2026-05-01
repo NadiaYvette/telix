@@ -3536,6 +3536,41 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         return 0;
     }
 
+    // /tmp/.X11-unix/X<n> — synthetic socket stat so libxcb's pre-connect
+    // check sees an existing AF_UNIX socket file at the canonical X11
+    // path.  Without this, libxcb's xcb_open_unix-and-friends do an
+    // access()/stat() on /tmp/.X11-unix/X0 first; if it returns ENOENT,
+    // libxcb gives up before ever calling socket() — the bug observed
+    // in r25 where the X0 listener was up (Xwayland called bind+listen
+    // OK) yet xeyes still reported "Can't open display" without even
+    // appearing in our [linux_srv socket] log.  We always claim the
+    // socket exists when its path begins with /tmp/.X11-unix/X; the
+    // subsequent connect() goes through handle_connect → uds_srv,
+    // which actually checks listener registration.
+    if pathlen >= 16
+        && &path[..16] == b"/tmp/.X11-unix/X"
+        && pathlen <= 32
+    {
+        let mut stat_buf = [0u8; 144];
+        let mode: u32 = 0o140660; // S_IFSOCK | 0660
+        let nlink: u64 = 1;
+        let blksize: u64 = 4096;
+        // Synthetic ino derived from path so back-to-back stats are
+        // deterministic.
+        let mut ino: u64 = 0xD00D;
+        for (i, &b) in path[..pathlen].iter().enumerate() {
+            ino = ino.wrapping_mul(31).wrapping_add(b as u64);
+            if i > 32 { break; }
+        }
+        stat_buf[8..16].copy_from_slice(&ino.to_le_bytes());
+        stat_buf[16..24].copy_from_slice(&nlink.to_le_bytes());
+        stat_buf[24..28].copy_from_slice(&mode.to_le_bytes());
+        stat_buf[56..64].copy_from_slice(&blksize.to_le_bytes());
+        let written = syscall::personality_copy_out(caller_port, statbuf_va, &stat_buf);
+        if written < 144 { return linux_err(EFAULT); }
+        return 0;
+    }
+
     // /proc pseudo-filesystem stat — return directory or regular file.
     let is_proc_dir = match &path[..pathlen] {
         b"/proc" | b"/proc/" | b"/proc/self" | b"/proc/self/"

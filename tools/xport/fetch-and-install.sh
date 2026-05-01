@@ -129,23 +129,36 @@ close($f);
         : # already body-splatted
     fi
 
-    # Patch __dcigettext at 0x13820 to a fast no-translation
-    # `mov %rsi, %rax; ret` (returns msgid1 unchanged).  Same defensive
-    # rationale as __intl_freemem: under Telix's personality, Xwayland's
-    # threads occasionally land in the middle of __dcigettext's
-    # instruction stream (RIP=libc+0x1405d, mid-jmp-displacement) and
-    # GP-fault.  TLS / FSBASE corruption is the suspected upstream
-    # cause; until that's properly diagnosed, short-circuit gettext
-    # entirely so its body never executes.  C-locale binaries like
-    # Xwayland (with LANG=C) get back the same untranslated string
-    # they passed in, so this is functionally a no-op for them.
-    if [ "$(xxd -s 0x13820 -l 4 -p "${LIBC_SO}")" = "f30f1efa" ]; then
-        printf '\x48\x89\xf0\xc3' | dd of="${LIBC_SO}" bs=1 seek=79904 count=4 conv=notrunc 2>/dev/null
-        echo "===> patched libc.so.6 __dcigettext -> mov rsi,rax; ret"
-    elif [ "$(xxd -s 0x13820 -l 4 -p "${LIBC_SO}")" = "4889f0c3" ]; then
-        : # already patched
+    # Patch __dcigettext at 0x13820.  Entry-only patch (mov rsi,rax; ret)
+    # was insufficient: Xwayland still GP-faults at RIP=libc+0x1405d,
+    # mid-instruction, even with the entry patched — the indirect
+    # dispatch must be re-entering the function body partway through.
+    # Same fix as __intl_freemem above: splat the entire function body
+    # with 0xC3 (single-byte `ret`).  Any control-flow landing on any
+    # offset inside the function returns immediately.  Function size
+    # bounded by distance to __intl_freemem (0x14110 - 0x13820 = 0x8F0);
+    # we splat 0x800 bytes (2048) to stay clear of __intl_freemem and
+    # any inter-function padding.  C-locale binaries (Xwayland with
+    # LANG=C) get back the same untranslated string they passed in,
+    # so behavior-wise this is a no-op for them.
+    SECOND_BYTE_DC="$(xxd -s 0x13821 -l 1 -p "${LIBC_SO}")"
+    if [ "$SECOND_BYTE_DC" != "c3" ]; then
+        python3 -c "
+import sys
+with open('${LIBC_SO}', 'r+b') as f:
+    f.seek(0x13820)
+    f.write(b'\\xc3' * 0x800)
+" 2>/dev/null \
+        || perl -e '
+open(my $f, "+<", "'${LIBC_SO}'") or die;
+seek($f, 0x13820, 0);
+print $f "\xc3" x 0x800;
+close($f);
+' 2>/dev/null \
+        || dd if=/dev/zero of=/dev/null 2>/dev/null # last-resort no-op
+        echo "===> patched libc.so.6 __dcigettext body -> ret slide (2048 bytes)"
     else
-        echo "===> WARNING: libc.so.6 __dcigettext signature changed; not patching" >&2
+        : # already body-splatted
     fi
 fi
 
