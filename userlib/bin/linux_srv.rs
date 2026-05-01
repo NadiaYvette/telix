@@ -260,6 +260,7 @@ const EPERM: u64 = 1;
 const ENOENT: u64 = 2;
 const EBADF: u64 = 9;
 const EFAULT: u64 = 14;
+const EIO: u64 = 5;
 const ENOTDIR: u64 = 20;
 const EINVAL: u64 = 22;
 const EAGAIN: u64 = 11;
@@ -1618,7 +1619,46 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             let req = want - total;
             let got = match irfs_read_bulk(fs_port, handle, offset + total as u64, req) {
                 Some(g) if g > 0 => g,
-                _ => break,
+                other => {
+                    if DEBUG_SHORT_READ {
+                        syscall::debug_puts(b"[lsrv] SHORT-READ read() initramfs h=");
+                        let mut buf = [0u8; 12]; let mut val = handle as u32; let mut k = 12;
+                        if val == 0 { k -= 1; buf[k] = b'0'; }
+                        while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                        syscall::debug_puts(&buf[k..12]);
+                        syscall::debug_puts(b" off=");
+                        let mut buf = [0u8; 20]; let mut val = offset + total as u64; let mut k = 20;
+                        if val == 0 { k -= 1; buf[k] = b'0'; }
+                        while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                        syscall::debug_puts(&buf[k..20]);
+                        syscall::debug_puts(b" req=");
+                        let mut buf = [0u8; 12]; let mut val = req as u32; let mut k = 12;
+                        if val == 0 { k -= 1; buf[k] = b'0'; }
+                        while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                        syscall::debug_puts(&buf[k..12]);
+                        syscall::debug_puts(b" total=");
+                        let mut buf = [0u8; 12]; let mut val = total as u32; let mut k = 12;
+                        if val == 0 { k -= 1; buf[k] = b'0'; }
+                        while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                        syscall::debug_puts(&buf[k..12]);
+                        syscall::debug_puts(b" want=");
+                        let mut buf = [0u8; 12]; let mut val = want as u32; let mut k = 12;
+                        if val == 0 { k -= 1; buf[k] = b'0'; }
+                        while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                        syscall::debug_puts(&buf[k..12]);
+                        syscall::debug_puts(if matches!(other, Some(_)) { b" reason=zero\n" } else { b" reason=none\n" });
+                    }
+                    let _ = other;
+                    // Mid-read CALL-TIMEOUT.  ld.so / read() callers will see
+                    // a short return; previously the rest of the user buffer
+                    // was zero (whatever it was initialized to).  Surface as
+                    // EIO so failure is explicit; if some bytes already
+                    // landed, return them so callers can decide.
+                    if total == 0 {
+                        return linux_err(EIO);
+                    }
+                    return total as u64;
+                }
             };
             let scratch = unsafe { LIN_PATH_SCRATCH_LOCAL } as *const u8;
             let src = unsafe { core::slice::from_raw_parts(scratch, got) };
@@ -4794,7 +4834,16 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                         syscall::debug_puts(if matches!(other, Some(_)) { b" reason=zero\n" } else { b" reason=none\n" });
                                     }
                                     let _ = other;
-                                    break;
+                                    // Surface the failure to the caller.  Without this, the
+                                    // mmap region stays partially anon-zero and ld.so silently
+                                    // reads zeros where the file's .data / Verdef / etc. should
+                                    // live — surfaces as the "Verdef version 0" / "file too
+                                    // short" / "cannot read file data" flake (#366).  Returning
+                                    // EIO makes ld.so fail explicitly with "cannot map shared
+                                    // object file" which is recoverable / debuggable.  The
+                                    // partially-mapped va_range leaks anon pages until process
+                                    // exit; acceptable since this is a fatal error path.
+                                    return linux_err(EIO);
                                 }
                             };
                             let scratch = unsafe { LIN_PATH_SCRATCH_LOCAL } as *const u8;
