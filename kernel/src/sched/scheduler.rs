@@ -851,6 +851,26 @@ static RESCUE_MAX: AtomicU64 = AtomicU64::new(0);
 static RESCUE_STALE_ON_CPU: AtomicU64 = AtomicU64::new(0);
 static RESCUE_PENDING: AtomicU64 = AtomicU64::new(0);
 
+/// Per-tid rescue counter for the watchdog dump.  Lets us see *which*
+/// tids account for the bulk of rescue traffic when a stall storm fires —
+/// e.g. r11/r12 saw 38k+ pend rescues with no clue which threads were
+/// being repeatedly rescued.  Indexed by tid, capped at 256 (the kernel
+/// rarely runs more threads on a focus boot, and we'd rather skip
+/// counting for the rare overflow than waste memory).
+const PER_TID_RESCUE_CAP: usize = 256;
+static RESCUE_PER_TID: [AtomicU64; PER_TID_RESCUE_CAP] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; PER_TID_RESCUE_CAP]
+};
+
+#[inline(always)]
+fn rescue_per_tid_inc(tid: u32) {
+    let i = tid as usize;
+    if i < PER_TID_RESCUE_CAP {
+        RESCUE_PER_TID[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
     // Double-enqueue detection.  Benign race: rescue_orphaned_threads may
     // enqueue a thread that drain_deferred_requeue is about to enqueue.
@@ -2295,6 +2315,36 @@ pub fn tick(current_sp: u64) -> u64 {
                                     "  tid={} {:?} {:?} park={} wake={} prio={} on_cpu={} in_q={} last_cpu={} task={}",
                                     tid, t.state, t.blocked_on, park, wakeup, prio, on_cpu, in_q, last_cpu, t.task_id);
                             }
+                        }
+                        // Top-N rescued tids: which tids dominate the rescue
+                        // storm?  When pend / stale_on_cpu / max counts are
+                        // huge but spread across many tids, the bug is
+                        // structural; when they pile on a single tid, the
+                        // bug is in that tid's wakeup path.  Print the top
+                        // 5 by rescue count.
+                        let mut top_idx = [0usize; 5];
+                        let mut top_cnt = [0u64; 5];
+                        for i in 1..PER_TID_RESCUE_CAP {
+                            let c = RESCUE_PER_TID[i].load(Ordering::Relaxed);
+                            if c == 0 { continue; }
+                            // Insert into descending top-5.
+                            let mut j = 5;
+                            while j > 0 && c > top_cnt[j - 1] { j -= 1; }
+                            if j < 5 {
+                                let mut k = 4;
+                                while k > j { top_cnt[k] = top_cnt[k - 1]; top_idx[k] = top_idx[k - 1]; k -= 1; }
+                                top_cnt[j] = c;
+                                top_idx[j] = i;
+                            }
+                        }
+                        if top_cnt[0] > 0 {
+                            crate::println!(
+                                "  rescue top: tid{}={} tid{}={} tid{}={} tid{}={} tid{}={}",
+                                top_idx[0], top_cnt[0],
+                                top_idx[1], top_cnt[1],
+                                top_idx[2], top_cnt[2],
+                                top_idx[3], top_cnt[3],
+                                top_idx[4], top_cnt[4]);
                         }
                     }
                     // On every stall tick, attempt to rescue orphaned threads.
@@ -5527,6 +5577,7 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                         park, wake, blk, heap_pos
                     );
                     RESCUE_PHANTOM.fetch_add(1, Ordering::Relaxed);
+                    rescue_per_tid_inc(tid as u32);
                     t.in_queue.store(false, Ordering::Release);
                     t.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
                     trace_sched(tid as u32, 8); // 8=rescue_enq
@@ -5641,6 +5692,7 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 } else {
                     RESCUE_MAX.fetch_add(1, Ordering::Relaxed);
                 }
+                rescue_per_tid_inc(tid as u32);
                 percpu_enqueue(target, prio, tid as ThreadId);
             }
         }

@@ -2172,6 +2172,34 @@ fn ensure_fs_scratch_grants() {
 /// `fs_read_bulk` but uses the initramfs IPC tags.  Initramfs serves
 /// in-memory cpio data so this is dramatically faster than the
 /// FS_READ → cache_blk → blk_srv chain for the same content.
+/// Diagnostic: log per-IO_READ csum on the linux_srv side.  Compare against
+/// the matching `[irfs] IO_READ srv h=...` line from initramfs_srv: csum
+/// mismatch means the grant_pages mapping resolved to different phys
+/// pages on the two aspaces (the file-too-short / Verdef-version-0 /
+/// cannot-read-file-data flake).  Same csum + valid bytes → corruption is
+/// upstream of the IO_READ.  Boot b9mfsq310-r13 confirmed clean (259 reads,
+/// all matched).  Keep `false` for normal boots; flip to `true` to recheck.
+const DEBUG_IO_READ_CSUM: bool = false;
+
+fn irfs_csum32(data: &[u8]) -> u32 {
+    let mut s1: u32 = 0;
+    let mut s2: u32 = 0;
+    for &b in data {
+        s1 = s1.wrapping_add(b as u32);
+        s2 = s2.wrapping_add(s1);
+    }
+    (s2 << 16) | (s1 & 0xFFFF)
+}
+
+fn irfs_print_hex32(n: u32) {
+    let hex = b"0123456789abcdef";
+    let mut buf = [0u8; 8];
+    for i in 0..8 {
+        buf[7 - i] = hex[((n >> (i * 4)) & 0xF) as usize];
+    }
+    syscall::debug_puts(&buf);
+}
+
 fn irfs_read_bulk(irfs_port: u64, handle: u64, offset: u64, max_len: usize) -> Option<usize> {
     ensure_fs_scratch_grants();
     unsafe {
@@ -2187,7 +2215,41 @@ fn irfs_read_bulk(irfs_port: u64, handle: u64, offset: u64, max_len: usize) -> O
     if resp.tag != IRFS_IO_READ_OK {
         return None;
     }
-    Some(resp.data[0] as usize)
+    let bytes_read = resp.data[0] as usize;
+    if DEBUG_IO_READ_CSUM && bytes_read >= 4096 {
+        unsafe {
+            let scratch = LIN_PATH_SCRATCH_LOCAL as *const u8;
+            let view = core::slice::from_raw_parts(scratch, bytes_read);
+            let cs = irfs_csum32(view);
+            syscall::debug_puts(b"[lsrv] irfs_read got h=");
+            // print decimal handle
+            let mut buf = [0u8; 12]; let mut val = handle as u32; let mut k = 12;
+            if val == 0 { k -= 1; buf[k] = b'0'; }
+            while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+            syscall::debug_puts(&buf[k..12]);
+            syscall::debug_puts(b" off=");
+            let mut buf = [0u8; 20]; let mut val = offset; let mut k = 20;
+            if val == 0 { k -= 1; buf[k] = b'0'; }
+            while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+            syscall::debug_puts(&buf[k..20]);
+            syscall::debug_puts(b" len=");
+            let mut buf = [0u8; 12]; let mut val = bytes_read as u32; let mut k = 12;
+            if val == 0 { k -= 1; buf[k] = b'0'; }
+            while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+            syscall::debug_puts(&buf[k..12]);
+            syscall::debug_puts(b" csum=");
+            irfs_print_hex32(cs);
+            syscall::debug_puts(b" first8=");
+            let hex = b"0123456789abcdef";
+            for i in 0..8.min(bytes_read) {
+                let b = *scratch.add(i);
+                syscall::debug_putchar(hex[(b >> 4) as usize]);
+                syscall::debug_putchar(hex[(b & 0xF) as usize]);
+            }
+            syscall::debug_puts(b"\n");
+        }
+    }
+    Some(bytes_read)
 }
 
 /// Read up to one page (4096 bytes max) from a file into the local scratch

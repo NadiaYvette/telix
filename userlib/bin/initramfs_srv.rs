@@ -22,6 +22,37 @@ const MAX_INLINE_READ: usize = 40;
 const MAX_FILES: usize = 512;
 const MAX_NAME: usize = 64;
 
+/// Diagnostic flag: log a per-IO_READ summary (handle, offset, len, csum,
+/// first 8 bytes) for reads >= 4 KiB.  Pair with the matching log on
+/// linux_srv's irfs_read_bulk side; csum mismatch between the two means
+/// the grant_pages mapping resolved to different phys pages on the two
+/// aspaces — the file-too-short / Verdef-version-0 / cannot-read-file-data
+/// flake.  Boot b9mfsq310-r13 ran with this on and confirmed every single
+/// observed read matched server↔client; flip back to true if the flake
+/// resurfaces and a fresh corruption-check is wanted.
+const DEBUG_IO_READ_CSUM: bool = false;
+
+/// Cheap Fletcher-style 32-bit running sum.  Not cryptographic, just
+/// enough to detect single-byte changes or wholesale zeroing.
+fn csum32(data: &[u8]) -> u32 {
+    let mut s1: u32 = 0;
+    let mut s2: u32 = 0;
+    for &b in data {
+        s1 = s1.wrapping_add(b as u32);
+        s2 = s2.wrapping_add(s1);
+    }
+    (s2 << 16) | (s1 & 0xFFFF)
+}
+
+fn print_hex32(n: u32) {
+    let hex = b"0123456789abcdef";
+    let mut buf = [0u8; 8];
+    for i in 0..8 {
+        buf[7 - i] = hex[((n >> (i * 4)) & 0xF) as usize];
+    }
+    syscall::debug_puts(&buf);
+}
+
 struct FileEntry {
     name: [u8; MAX_NAME],
     name_len: usize,
@@ -259,6 +290,24 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                 let data = &cpio_data[start..end];
 
                 if grant_va != 0 {
+                    if DEBUG_IO_READ_CSUM && data.len() >= 4096 {
+                        let cs = csum32(data);
+                        syscall::debug_puts(b"[irfs] IO_READ srv h=");
+                        print_num(file_handle as u64);
+                        syscall::debug_puts(b" off=");
+                        print_num(offset as u64);
+                        syscall::debug_puts(b" len=");
+                        print_num(data.len() as u64);
+                        syscall::debug_puts(b" csum=");
+                        print_hex32(cs);
+                        syscall::debug_puts(b" first8=");
+                        for k in 0..8.min(data.len()) {
+                            let hex = b"0123456789abcdef";
+                            syscall::debug_putchar(hex[(data[k] >> 4) as usize]);
+                            syscall::debug_putchar(hex[(data[k] & 0xF) as usize]);
+                        }
+                        syscall::debug_puts(b"\n");
+                    }
                     // Grant-based read with cache_srv-style fence pattern:
                     // volatile u64 stride + Release fence + mfence.  Without
                     // this, ld.so on the receiving CPU sees zero-filled
