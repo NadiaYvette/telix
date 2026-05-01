@@ -2181,6 +2181,14 @@ fn ensure_fs_scratch_grants() {
 /// all matched).  Keep `false` for normal boots; flip to `true` to recheck.
 const DEBUG_IO_READ_CSUM: bool = false;
 
+/// Diagnostic: log when a read loop exits early (irfs_read_bulk or
+/// fs_read_bulk returned None or Some(0) before total reached to_read),
+/// or when personality_copy_out returns fewer bytes than the source.
+/// Either case leaves the destination region partially zero-filled —
+/// the upstream of "Verdef version 0" / "file too short" / "cannot
+/// read file data".
+const DEBUG_SHORT_READ: bool = true;
+
 fn irfs_csum32(data: &[u8]) -> u32 {
     let mut s1: u32 = 0;
     let mut s2: u32 = 0;
@@ -4749,11 +4757,62 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                 want,
                             ) {
                                 Some(g) if g > 0 => g,
-                                _ => break,
+                                other => {
+                                    // SHORT-READ DIAG: irfs returned None (CALL_REPLY_SERVER_DIED)
+                                    // or Some(0).  The mmap region is partially filled — the rest
+                                    // stays as anon-zero from mmap_anon.  ld.so will read those
+                                    // zeros where Verdef / Verneed / .dynamic should live and
+                                    // surface as "Verdef version 0" / "cannot read file data" /
+                                    // "file too short".  This log identifies the *exact* offset
+                                    // where bytes go missing.
+                                    if DEBUG_SHORT_READ {
+                                        syscall::debug_puts(b"[lsrv] SHORT-READ mmap initramfs h=");
+                                        let mut buf = [0u8; 12]; let mut val = handle as u32; let mut k = 12;
+                                        if val == 0 { k -= 1; buf[k] = b'0'; }
+                                        while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                                        syscall::debug_puts(&buf[k..12]);
+                                        syscall::debug_puts(b" off=");
+                                        let mut buf = [0u8; 20]; let mut val = file_offset + total as u64; let mut k = 20;
+                                        if val == 0 { k -= 1; buf[k] = b'0'; }
+                                        while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                                        syscall::debug_puts(&buf[k..20]);
+                                        syscall::debug_puts(b" want=");
+                                        let mut buf = [0u8; 12]; let mut val = want as u32; let mut k = 12;
+                                        if val == 0 { k -= 1; buf[k] = b'0'; }
+                                        while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                                        syscall::debug_puts(&buf[k..12]);
+                                        syscall::debug_puts(b" total=");
+                                        let mut buf = [0u8; 12]; let mut val = total as u32; let mut k = 12;
+                                        if val == 0 { k -= 1; buf[k] = b'0'; }
+                                        while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                                        syscall::debug_puts(&buf[k..12]);
+                                        syscall::debug_puts(b" to_read=");
+                                        let mut buf = [0u8; 12]; let mut val = to_read as u32; let mut k = 12;
+                                        if val == 0 { k -= 1; buf[k] = b'0'; }
+                                        while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                                        syscall::debug_puts(&buf[k..12]);
+                                        syscall::debug_puts(if matches!(other, Some(_)) { b" reason=zero\n" } else { b" reason=none\n" });
+                                    }
+                                    let _ = other;
+                                    break;
+                                }
                             };
                             let scratch = unsafe { LIN_PATH_SCRATCH_LOCAL } as *const u8;
                             let src = unsafe { core::slice::from_raw_parts(scratch, got) };
-                            syscall::personality_copy_out(caller_port, va + total, src);
+                            let written = syscall::personality_copy_out(caller_port, va + total, src);
+                            if DEBUG_SHORT_READ && written != got {
+                                syscall::debug_puts(b"[lsrv] SHORT-COPYOUT mmap initramfs got=");
+                                let mut buf = [0u8; 12]; let mut val = got as u32; let mut k = 12;
+                                if val == 0 { k -= 1; buf[k] = b'0'; }
+                                while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                                syscall::debug_puts(&buf[k..12]);
+                                syscall::debug_puts(b" written=");
+                                let mut buf = [0u8; 12]; let mut val = written as u32; let mut k = 12;
+                                if val == 0 { k -= 1; buf[k] = b'0'; }
+                                while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                                syscall::debug_puts(&buf[k..12]);
+                                syscall::debug_puts(b"\n");
+                            }
                             total += got;
                         }
                     }

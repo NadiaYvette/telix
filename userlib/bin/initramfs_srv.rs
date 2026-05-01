@@ -32,6 +32,12 @@ const MAX_NAME: usize = 64;
 /// resurfaces and a fresh corruption-check is wanted.
 const DEBUG_IO_READ_CSUM: bool = false;
 
+/// Diagnostic flag: log every IO_CONNECT_OK with handle, size, name.
+/// Pair with linux_srv's record of the same handle's later read offsets:
+/// if linux_srv stops reading at offset N but the file's actual size is
+/// > N, we'd see fstat report N (correct) yet ld.so still expects more.
+const DEBUG_IO_CONNECT_LOG: bool = true;
+
 /// Cheap Fletcher-style 32-bit running sum.  Not cryptographic, just
 /// enough to detect single-byte changes or wholesale zeroing.
 fn csum32(data: &[u8]) -> u32 {
@@ -255,6 +261,23 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                 match fs.find(name) {
                     Some(idx) => {
                         // d0=handle, d1=size, d2=server_aspace_id
+                        if DEBUG_IO_CONNECT_LOG {
+                            // Log handle and size so we can verify ld.so's fstat
+                            // matches the actual cpio entry size.  If a file is
+                            // reported with the wrong size, ld.so would either
+                            // read past EOF (zeros, "file too short") or stop
+                            // short of real content.
+                            syscall::debug_puts(b"[irfs] IO_CONNECT_OK h=");
+                            print_num(idx as u64);
+                            syscall::debug_puts(b" size=");
+                            print_num(fs.files[idx].data_len as u64);
+                            syscall::debug_puts(b" name=");
+                            // Print first 24 bytes of name (covers most lib paths).
+                            for i in 0..fs.files[idx].name_len.min(28) {
+                                syscall::debug_putchar(fs.files[idx].name[i]);
+                            }
+                            syscall::debug_puts(b"\n");
+                        }
                         let _ = syscall::reply(
                             IO_CONNECT_OK,
                             idx as u64,
