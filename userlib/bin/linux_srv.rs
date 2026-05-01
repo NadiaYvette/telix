@@ -2077,10 +2077,13 @@ fn handle_sendfile(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
 /// MMU pages of scratch granted to FS servers for FS_READ / VFS_OPEN_LONG.
 /// Sized to match `MAX_BLOCKS_PER_REPLY` (=4) in ext_srv's FS_READ multi-
-/// block fill — 4 × 4 KiB = 16 KiB lets ext_srv pack up to 4 file blocks
-/// per reply, cutting the IPC count for large mmap reads (libc.so.6,
-/// ~ 2 MB) by 4×.  Path forwarding via VFS only uses the first page.
-const FS_SCRATCH_PAGES: usize = 4;
+/// block fill — bumped from 4 → 64 (256 KiB) so a single mmap-time read
+/// of libc.so.6 (~ 2.4 MB) is 10 IPCs instead of 150, and most other
+/// libs fit in a single IPC.  H13/H14 wallclock is dominated by these
+/// per-chunk round-trips during dynamic-link library loading.  Path
+/// forwarding via VFS only uses the first page; the rest is reserved
+/// for FS_READ / IRFS_IO_READ bulk fills via ensure_fs_scratch_grants.
+const FS_SCRATCH_PAGES: usize = 64;
 
 /// Lazily allocate the long-path scratch page and grant it to vfs_task at
 /// LIN_SCRATCH_REMOTE_VA. Returns true if scratch is ready to use.
@@ -4499,9 +4502,14 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let file_offset = real_arg5;
 
     if len == 0 { return linux_err(EINVAL); }
-    // DIAG for Step H investigation: print mmap() args that pass a real fd.
-    // Includes file_size so we can identify the file (libc=2455432, libxcvt=11368).
-    if fd >= 0 {
+    // [linux_srv MMAP DIAG] originally added for Step H lib-load triage —
+    // every file-backed mmap(2) prints six u64s through six debug_puts
+    // syscalls, then QEMU's serial prints synchronously.  H13 fires 200+
+    // mmaps so this print spam costs significant wallclock.  We have the
+    // information we need from the existing investigation; gate it off
+    // unless explicitly enabled.
+    const MMAP_DIAG_ENABLED: bool = false;
+    if MMAP_DIAG_ENABLED && fd >= 0 {
         let fd_idx = fd as usize;
         let fsz = if fd_idx < MAX_FDS {
             unsafe {
@@ -4537,6 +4545,7 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         syscall::debug_puts(&buf[i..20]);
         syscall::debug_puts(b"\n");
     }
+    let _ = pi; // silence unused when DIAG is off
 
     let page_size = syscall::page_size() as usize;
     let pages = ((len + page_size - 1) / page_size) as u64;
