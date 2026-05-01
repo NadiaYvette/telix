@@ -9056,7 +9056,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             syscall::sleep_ms(10);
                         }
                     }
-                    if xeyes_child != u64::MAX {
+                    // Only print the "Step H14 xeyes: exit=N" summary if no
+                    // per-attempt line was already emitted.  When retries
+                    // exercised the in-loop print, this would duplicate the
+                    // last attempt's exit code on the same line.  The
+                    // never_reaped case still needs handling.
+                    if xeyes_child != u64::MAX && xeyes_attempt_reported == 0 {
                         syscall::debug_puts(b"Step H14 xeyes: ");
                         if xeyes_code >= -1 {
                             syscall::debug_puts(b"exit=");
