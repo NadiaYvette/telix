@@ -7537,6 +7537,17 @@ fn handle_socket(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
             return linux_err(ENOMEM);
         }
         let handle = resp.data[0];
+        // Diagnostic: log every AF_UNIX socket() creation so we can tell
+        // whether xeyes (or any caller) actually creates a UDS in the
+        // first place — distinguishes "never reached connect" from
+        // "reached connect with a different basename".
+        syscall::debug_puts(b"  [linux_srv socket] AF_UNIX pid=");
+        print_num(syscall::getpid());
+        syscall::debug_puts(b" handle=");
+        print_num(handle);
+        syscall::debug_puts(b" fd=");
+        print_num(fd as u64);
+        syscall::debug_puts(b"\n");
         unsafe {
             PROC_TABLE[pi].fds[fd].kind = FdKind::Socket;
             PROC_TABLE[pi].fds[fd].fs_port = uds_port;
