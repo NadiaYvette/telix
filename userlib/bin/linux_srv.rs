@@ -7746,6 +7746,17 @@ fn handle_listen(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
                 Some(m) => m,
                 None => { return linux_err(ECONNREFUSED); }
             };
+            // Diagnostic: log every UDS listen.  Xwayland's X0 listen is the
+            // gate that lets xeyes' connect succeed; without this log we
+            // can't tell from the boot output whether listen() was even
+            // called between bind and the first xeyes connect attempt.
+            syscall::debug_puts(b"  [linux_srv listen] tag=");
+            print_num(resp.tag);
+            syscall::debug_puts(b" handle=");
+            print_num(PROC_TABLE[pi].fds[fd].handle);
+            syscall::debug_puts(b" backlog=");
+            print_num(backlog);
+            syscall::debug_puts(b"\n");
             if resp.tag != UDS_OK { return linux_err(EINVAL); }
             PROC_TABLE[pi].fds[fd].sock_state = 2;
             0
@@ -7786,8 +7797,31 @@ fn handle_connect(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             let d3 = pid | (uid << 32);
             let resp = match syscall::call(PROC_TABLE[pi].fds[fd].fs_port, UDS_CONNECT, w0, w1, d2, d3) {
                 Some(m) => m,
-                None => { return linux_err(ECONNREFUSED); }
+                None => {
+                    syscall::debug_puts(b"  [linux_srv connect] IPC None\n");
+                    return linux_err(ECONNREFUSED);
+                }
             };
+            // Diagnostic: log every UDS connect attempt (basename, result).
+            // For xeyes → Xwayland's X0 specifically we want to see whether
+            // connect arrives before/after Xwayland's listen() and what
+            // tag uds_srv responds with (UDS_OK vs UDS_ERROR(1)=ECONNREFUSED).
+            let basename_is_x = nlen > 0 && name[0] == b'X';
+            if basename_is_x || resp.tag != UDS_OK {
+                syscall::debug_puts(b"  [linux_srv connect] tag=");
+                print_num(resp.tag);
+                syscall::debug_puts(b" nlen=");
+                print_num(nlen as u64);
+                syscall::debug_puts(b" basename[");
+                for i in 0..nlen.min(16) {
+                    let bb = name[i];
+                    let s = if bb >= 32 && bb < 127 { [bb] } else { [b'?'] };
+                    syscall::debug_puts(&s);
+                }
+                syscall::debug_puts(b"] err=");
+                print_num(resp.data[0]);
+                syscall::debug_puts(b"\n");
+            }
             if resp.tag != UDS_OK { return linux_err(ECONNREFUSED); }
             // UDS_CONNECT reply: data[0] = client-end handle
             PROC_TABLE[pi].fds[fd].handle = resp.data[0];
