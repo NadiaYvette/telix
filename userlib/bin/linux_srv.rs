@@ -7581,6 +7581,27 @@ fn parse_sockaddr_un(caller_port: u64, addr_va: usize, addrlen: usize) -> ([u8; 
     let to_read = addrlen.min(110);
     let copied = syscall::personality_copy_in(caller_port, addr_va, &mut buf[..to_read]);
     if copied < 3 {
+        // DIAG: personality_copy_in failed or short.  Caller's addr_va
+        // wasn't fully readable.  Print the requested length, the actual
+        // copied length, and the first bytes we did get — distinguishes
+        // a partial copy (page boundary mid-stack) from a total fail.
+        syscall::debug_puts(b"  [parse_sockaddr_un] short copy_in: addrlen=");
+        print_num(addrlen as u64);
+        syscall::debug_puts(b" to_read=");
+        print_num(to_read as u64);
+        syscall::debug_puts(b" copied=");
+        print_num(copied as u64);
+        syscall::debug_puts(b" addr_va=0x");
+        let hex = b"0123456789abcdef";
+        for i in (0..16).rev() {
+            syscall::debug_putchar(hex[((addr_va >> (i * 4)) & 0xF) as usize]);
+        }
+        syscall::debug_puts(b" first16=");
+        for i in 0..to_read.min(16) {
+            syscall::debug_putchar(hex[(buf[i] >> 4) as usize]);
+            syscall::debug_putchar(hex[(buf[i] & 0xF) as usize]);
+        }
+        syscall::debug_puts(b"\n");
         return ([0; 16], 0);
     }
     // sun_path starts at offset 2; find its null-terminated length.
@@ -7802,26 +7823,26 @@ fn handle_connect(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                     return linux_err(ECONNREFUSED);
                 }
             };
-            // Diagnostic: log every UDS connect attempt (basename, result).
+            // Diagnostic: log EVERY UDS connect attempt (basename, result).
             // For xeyes → Xwayland's X0 specifically we want to see whether
             // connect arrives before/after Xwayland's listen() and what
             // tag uds_srv responds with (UDS_OK vs UDS_ERROR(1)=ECONNREFUSED).
-            let basename_is_x = nlen > 0 && name[0] == b'X';
-            if basename_is_x || resp.tag != UDS_OK {
-                syscall::debug_puts(b"  [linux_srv connect] tag=");
-                print_num(resp.tag);
-                syscall::debug_puts(b" nlen=");
-                print_num(nlen as u64);
-                syscall::debug_puts(b" basename[");
-                for i in 0..nlen.min(16) {
-                    let bb = name[i];
-                    let s = if bb >= 32 && bb < 127 { [bb] } else { [b'?'] };
-                    syscall::debug_puts(&s);
-                }
-                syscall::debug_puts(b"] err=");
-                print_num(resp.data[0]);
-                syscall::debug_puts(b"\n");
+            // r21 didn't see any [linux_srv connect basename[X0]] line, so
+            // either xeyes never reached connect() or it tried something
+            // other than "X0" — log everything to find out.
+            syscall::debug_puts(b"  [linux_srv connect] tag=");
+            print_num(resp.tag);
+            syscall::debug_puts(b" nlen=");
+            print_num(nlen as u64);
+            syscall::debug_puts(b" basename[");
+            for i in 0..nlen.min(16) {
+                let bb = name[i];
+                let s = if bb >= 32 && bb < 127 { [bb] } else { [b'?'] };
+                syscall::debug_puts(&s);
             }
+            syscall::debug_puts(b"] err=");
+            print_num(resp.data[0]);
+            syscall::debug_puts(b"\n");
             if resp.tag != UDS_OK { return linux_err(ECONNREFUSED); }
             // UDS_CONNECT reply: data[0] = client-end handle
             PROC_TABLE[pi].fds[fd].handle = resp.data[0];
