@@ -1615,6 +1615,29 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     // Initramfs fast path: in-memory cpio data via single IPC + grant.
     if kind == FdKind::Initramfs {
+        // Cache fast path: serve directly from linux_srv-local memory if
+        // this handle's full content has been cached.  Skips the IPC to
+        // initramfs_srv entirely on cache hit.
+        if let Some(cache_idx) = lib_cache_lookup(handle) {
+            let slot = unsafe { LIB_CACHE[cache_idx] };
+            let avail = if offset >= slot.file_size { 0 }
+                        else { (slot.file_size - offset) as usize };
+            let to_read_cached = want.min(avail);
+            if to_read_cached > 0 {
+                let src = unsafe {
+                    core::slice::from_raw_parts(
+                        (slot.backing_va + offset as usize) as *const u8,
+                        to_read_cached,
+                    )
+                };
+                let written = syscall::personality_copy_out(caller_port, buf_va, src);
+                if written > 0 {
+                    unsafe { PROC_TABLE[pi].fds[fd].offset += written as u64; }
+                    return written as u64;
+                }
+            }
+            return 0; // EOF
+        }
         while total < want {
             let req = want - total;
             let got = match irfs_read_bulk(fs_port, handle, offset + total as u64, req) {
@@ -2300,6 +2323,108 @@ fn irfs_read_bulk(irfs_port: u64, handle: u64, offset: u64, max_len: usize) -> O
     Some(bytes_read)
 }
 
+/// initramfs file content cache.  Once a file has been read fully into a
+/// dedicated anon-mapped backing region in linux_srv's aspace, all future
+/// reads/mmaps for the same handle serve from local memory — no IPC, no
+/// initramfs_srv contention, no SHORT-READ surface.  This is the mechanism
+/// that breaks the CALL-TIMEOUT cascade for repeated lib opens (libc.so.6,
+/// libpixman, libXdmcp etc. each get re-opened by every fork+exec).
+const LIB_CACHE_MAX: usize = 32;
+const LIB_CACHE_FILE_CAP: u64 = 4 * 1024 * 1024; // 4 MiB per file
+
+#[derive(Clone, Copy)]
+struct LibCacheSlot {
+    in_use: bool,
+    irfs_handle: u64,   // handle returned by IRFS_IO_CONNECT_OK
+    file_size: u64,
+    backing_va: usize,  // anon-mapped region, file_size bytes valid
+}
+
+static mut LIB_CACHE: [LibCacheSlot; LIB_CACHE_MAX] = [
+    LibCacheSlot { in_use: false, irfs_handle: 0, file_size: 0, backing_va: 0 };
+    LIB_CACHE_MAX
+];
+
+fn lib_cache_lookup(handle: u64) -> Option<usize> {
+    unsafe {
+        for i in 0..LIB_CACHE_MAX {
+            if LIB_CACHE[i].in_use && LIB_CACHE[i].irfs_handle == handle {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Populate the cache for a freshly-opened initramfs handle.  Reads the
+/// full file content via the existing irfs_read_bulk path, copies it into
+/// a dedicated anon-mapped backing region, and registers the slot.  On
+/// any failure (out of slots, mmap_anon failure, short read mid-populate)
+/// silently aborts — the open still succeeds, just without a cache entry,
+/// and future reads/mmaps fall through to the normal IPC path.
+fn lib_cache_populate(handle: u64, file_size: u64) -> Option<usize> {
+    if file_size == 0 || file_size > LIB_CACHE_FILE_CAP {
+        return None;
+    }
+    let irfs_port = get_initramfs_port();
+    if irfs_port == 0 {
+        return None;
+    }
+    // Find empty slot.
+    let slot_idx = unsafe {
+        let mut found: Option<usize> = None;
+        for i in 0..LIB_CACHE_MAX {
+            if !LIB_CACHE[i].in_use {
+                found = Some(i);
+                break;
+            }
+        }
+        found?
+    };
+    // Allocate backing pages.
+    let ps = syscall::page_size();
+    let pages = ((file_size as usize) + ps - 1) / ps;
+    let va = syscall::mmap_anon(0, pages, 1)?;
+    // Pre-fault each page.
+    for i in 0..pages {
+        unsafe { core::ptr::write_volatile((va + i * ps) as *mut u8, 0u8); }
+    }
+    // Read full content via existing scratch+grant path.
+    ensure_fs_scratch_grants();
+    let mut total: u64 = 0;
+    while total < file_size {
+        let want = (file_size - total) as usize;
+        let got = match irfs_read_bulk(irfs_port, handle, total, want) {
+            Some(g) if g > 0 => g,
+            _ => {
+                // Short read mid-populate.  Silent fail: don't claim a
+                // partial cache.  The leaked anon pages are released
+                // when the linux_srv process exits.
+                return None;
+            }
+        };
+        // Copy from scratch into backing region.
+        unsafe {
+            let src = LIN_PATH_SCRATCH_LOCAL as *const u8;
+            let dst = (va + total as usize) as *mut u8;
+            for i in 0..got {
+                core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
+            }
+        }
+        total += got as u64;
+    }
+    // Register the slot.
+    unsafe {
+        LIB_CACHE[slot_idx] = LibCacheSlot {
+            in_use: true,
+            irfs_handle: handle,
+            file_size,
+            backing_va: va,
+        };
+    }
+    Some(slot_idx)
+}
+
 /// Read up to one page (4096 bytes max) from a file into the local scratch
 /// page via FS_READ's grant_va fast path. Returns bytes read, or None if the
 /// FS server doesn't accept grant_va or no scratch grant has been made.
@@ -2380,7 +2505,17 @@ fn try_open_initramfs(path: &[u8]) -> Option<(u64, u64)> {
     let resp = syscall::call(irfs_port, IRFS_IO_CONNECT, w0, w1, d2, w3)?;
     if resp.tag == IRFS_IO_CONNECT_OK {
         // d0 = handle, d1 = size, d2 = server_aspace_id.
-        Some((resp.data[0], resp.data[1]))
+        let handle = resp.data[0];
+        let size = resp.data[1];
+        // Eagerly populate the content cache on first open of this handle
+        // (lib_cache_lookup miss).  Subsequent opens of the same lib by
+        // different processes skip initramfs_srv entirely on read/mmap.
+        // Silent fail on populate is acceptable — caller still has a
+        // valid handle and can fall through to the normal IPC path.
+        if lib_cache_lookup(handle).is_none() {
+            let _ = lib_cache_populate(handle, size);
+        }
+        Some((handle, size))
     } else {
         None
     }
@@ -4780,6 +4915,30 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
             match kind {
                 FdKind::Initramfs => {
+                    // Cache fast path: serve directly from linux_srv-local
+                    // memory if the handle's full content is cached.  Skips
+                    // initramfs_srv IPC entirely on cache hit, eliminating
+                    // the SHORT-READ contention surface for repeat lib opens.
+                    if let Some(cache_idx) = lib_cache_lookup(handle) {
+                        let slot = unsafe { LIB_CACHE[cache_idx] };
+                        let avail = if file_offset >= slot.file_size { 0 }
+                                    else { (slot.file_size - file_offset) as usize };
+                        let to_read_cached = len.min(avail);
+                        if to_read_cached > 0 {
+                            let src = unsafe {
+                                core::slice::from_raw_parts(
+                                    (slot.backing_va + file_offset as usize) as *const u8,
+                                    to_read_cached,
+                                )
+                            };
+                            syscall::personality_copy_out(caller_port, va, src);
+                        }
+                        // Restore protection if we bumped it.
+                        if need_bump {
+                            syscall::personality_mprotect(caller_port, va, aligned_len, kern_prot as u8);
+                        }
+                        return va as u64;
+                    }
                     // Initramfs fast path: in-memory cpio data via single
                     // IPC + grant.  Skips ext_srv → cache_blk → blk_srv.
                     let avail = if file_offset >= file_size { 0 }
