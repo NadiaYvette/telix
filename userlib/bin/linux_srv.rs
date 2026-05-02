@@ -2570,6 +2570,16 @@ fn fs_read_bulk(fs_port: u64, handle: u64, offset: u64, max_len: usize) -> Optio
 /// failed (so we don't keep retrying).
 static mut INITRAMFS_PORT: u64 = 0;
 
+/// Tracks whether IO_SET_ASYNC_REPLY_PORT has been delivered to
+/// initramfs_srv.  Until this flips to true, irfs_read_bulk falls back
+/// to the synchronous IRFS_IO_READ path (no async dispatch).  Set
+/// inside `try_register_irfs_async_reply_port`, called lazily from
+/// the main IPC loop once initramfs_srv is reachable.
+static mut IRFS_ASYNC_REGISTERED: bool = false;
+
+/// IRFS protocol tag for the registration call (matches initramfs_srv).
+const IRFS_IO_SET_ASYNC_REPLY_PORT: u64 = 0x204;
+
 fn get_initramfs_port() -> u64 {
     unsafe {
         if INITRAMFS_PORT == 0 {
@@ -2579,6 +2589,38 @@ fn get_initramfs_port() -> u64 {
             };
         }
         if INITRAMFS_PORT == u64::MAX { 0 } else { INITRAMFS_PORT }
+    }
+}
+
+/// Lazily register our BACKEND_REPLY_PORT with initramfs_srv so future
+/// IRFS_IO_READ_ASYNC reads can be delivered as IO_READ_REPLY
+/// notifications back to us.  Idempotent; safe to call repeatedly from
+/// the main loop.  Returns true once registration has succeeded.
+fn try_register_irfs_async_reply_port() -> bool {
+    unsafe {
+        if IRFS_ASYNC_REGISTERED {
+            return true;
+        }
+        let irfs = get_initramfs_port();
+        if irfs == 0 {
+            return false;
+        }
+        let rp = BACKEND_REPLY_PORT;
+        if rp == 0 {
+            return false;
+        }
+        let resp = match syscall::call(irfs, IRFS_IO_SET_ASYNC_REPLY_PORT, rp, 0, 0, 0) {
+            Some(m) => m,
+            None => return false,
+        };
+        // initramfs_srv acks with IO_READ_OK (0x201) on success.
+        if resp.tag == 0x201 {
+            IRFS_ASYNC_REGISTERED = true;
+            syscall::debug_puts(b"[linux_srv] IRFS async reply port registered\n");
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -10217,6 +10259,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     loop {
         expire_futex_waiters();
         expire_poll_waiters();
+
+        // Lazily register our async-reply port with initramfs_srv.  At
+        // linux_srv startup the `initramfs` ns alias may not be published
+        // yet (linux_srv and initramfs_srv come up in parallel); each
+        // main-loop iteration retries until it sticks, then becomes a
+        // no-op via IRFS_ASYNC_REGISTERED.
+        let _ = try_register_irfs_async_reply_port();
 
         // Reaper: check one PROC_TABLE slot per iteration, closing its
         // FDs if the owner's task port has gone dead (task exited or was
