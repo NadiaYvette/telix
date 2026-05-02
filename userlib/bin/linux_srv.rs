@@ -7809,14 +7809,53 @@ fn parse_sockaddr_un(caller_port: u64, addr_va: usize, addrlen: usize) -> ([u8; 
         syscall::debug_puts(b"\n");
         return ([0; 16], 0);
     }
+    // Abstract socket: sun_path[0] == '\0', and the rest of sun_path is
+    // the abstract name (NOT null-terminated; extends to addrlen).  This
+    // is the Linux kernel's distinguishing feature for abstract sockets.
+    // xtrans uses both regular AND abstract paths for X11; xeyes' connect
+    // attempt for `\0/tmp/.X11-unix/X0` previously fell into the
+    // raw_len==0 early-exit and returned nlen=0, making handle_connect
+    // emit EINVAL silently — xeyes saw connect fail before reaching the
+    // server.  Map abstract `\0/tmp/.X11-unix/X0` → basename "X0" so it
+    // collapses onto the same uds_srv namespace key as the regular path.
+    if buf[2] == 0 {
+        let abs_end = copied;
+        if abs_end <= 3 {
+            // Pure autobind (sa_family + leading nul, no name).  Not
+            // supported — return nlen=0 so handle_bind/handle_connect
+            // surface EINVAL.
+            return ([0; 16], 0);
+        }
+        let path = &buf[3..abs_end];
+        // If the abstract path looks like a normal filesystem path,
+        // extract the basename — same convention as the regular branch
+        // below.  Otherwise use the path bytes directly (truncated to
+        // 16 bytes).
+        let mut last_slash = 0;
+        let mut had_slash = false;
+        for i in 0..path.len() {
+            if path[i] == b'/' { last_slash = i + 1; had_slash = true; }
+        }
+        let basename = if had_slash { &path[last_slash..] } else { path };
+        let blen = basename.len().min(16);
+        if blen == 0 {
+            return ([0; 16], 0);
+        }
+        let mut name = [0u8; 16];
+        for i in 0..blen {
+            name[i] = basename[i];
+        }
+        return (name, blen);
+    }
+
     // sun_path starts at offset 2; find its null-terminated length.
     let raw_len = buf[2..copied].iter().position(|&b| b == 0).unwrap_or(copied - 2);
     if raw_len == 0 {
         return ([0; 16], 0);
     }
 
-    // Abstract sockets (sun_path[0] == '\0') or short paths: use directly.
-    if buf[2] == 0 || raw_len <= 16 {
+    // Short paths: use directly.
+    if raw_len <= 16 {
         let use_len = raw_len.min(16);
         let mut name = [0u8; 16];
         for i in 0..use_len {
@@ -8015,7 +8054,17 @@ fn handle_connect(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         let dom = PROC_TABLE[pi].fds[fd].sock_domain;
         if dom == AF_UNIX as u8 {
             let (name, nlen) = parse_sockaddr_un(caller_port, addr_va, addrlen);
-            if nlen == 0 { return linux_err(EINVAL); }
+            if nlen == 0 {
+                // Silent EINVAL was the gap between socket() and visible
+                // connect events in r25-r27: xeyes' connect for an abstract
+                // address returned EINVAL here without producing a log,
+                // making it look like xeyes never tried to connect.  Now
+                // logged so the connect-time bail is visible.
+                syscall::debug_puts(b"  [linux_srv connect] EINVAL: parse_sockaddr_un nlen=0 addrlen=");
+                print_num(addrlen as u64);
+                syscall::debug_puts(b"\n");
+                return linux_err(EINVAL);
+            }
             let (w0, w1) = pack_uds_name(&name, nlen);
             let d2 = nlen as u64;
             let pid = syscall::getpid();
