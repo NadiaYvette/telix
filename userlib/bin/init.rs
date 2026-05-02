@@ -9068,14 +9068,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             syscall::sleep_ms(10);
                         }
                     }
-                    // Only print the "Step H14 xeyes: exit=N" summary if no
-                    // per-attempt line was already emitted.  When retries
-                    // exercised the in-loop print, this would duplicate the
-                    // last attempt's exit code on the same line.  The
-                    // never_reaped case still needs handling.
-                    if xeyes_child != u64::MAX && xeyes_attempt_reported == 0 {
-                        syscall::debug_puts(b"Step H14 xeyes: ");
-                        if xeyes_code >= -1 {
+                    // Print "Step H14 xeyes: ..." summary covering the
+                    // last attempt that hasn't been reported yet (either
+                    // because no per-attempt line was emitted at all, or
+                    // because the wait loop exited via xw_code break
+                    // before the latest retry reaped).  never_reaped is
+                    // still possible if Xwayland died fast and xeyes is
+                    // mid-load when init bails.
+                    if xeyes_child != u64::MAX && xeyes_attempt_reported < xeyes_attempt {
+                        syscall::debug_puts(b"Step H14 xeyes attempt ");
+                        syscall::debug_putchar(b'0' + xeyes_attempt as u8);
+                        syscall::debug_puts(b": ");
+                        if xeyes_code >= 0 {
                             syscall::debug_puts(b"exit=");
                             let mut buf = [0u8; 12]; let mut val = xeyes_code as u32; let mut i = 12;
                             if val == 0 { i -= 1; buf[i] = b'0'; }
