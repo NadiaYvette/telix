@@ -9959,6 +9959,48 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(port);
     syscall::debug_puts(b"\n");
 
+    // Preload common Xwayland/xeyes libs into the content cache.  Each
+    // call to try_open_initramfs populates a cache slot via the existing
+    // irfs_read_bulk path, so subsequent opens by Linux processes hit
+    // local memory and bypass initramfs_srv entirely.  Doing this
+    // sequentially at startup (with no concurrent contention) reliably
+    // populates the cache, eliminating the contention-induced SHORT-READ
+    // pattern that kills Xwayland on lucky/unlucky boots (r28-r31).
+    // Silent on miss — any lib not in initramfs is just skipped.
+    let preload_libs: [&[u8]; 22] = [
+        b"lib64/libc.so.6",
+        b"lib64/libm.so.6",
+        b"lib64/libpixman-1.so.0",
+        b"lib64/libXdmcp.so.6",
+        b"lib64/libXau.so.6",
+        b"lib64/libXt.so.6",
+        b"lib64/libXmu.so.6",
+        b"lib64/libX11.so.6",
+        b"lib64/libX11-xcb.so.1",
+        b"lib64/libxcb.so.1",
+        b"lib64/libxshmfence.so.1",
+        b"lib64/libwayland-client.so.0",
+        b"lib64/libdrm.so.2",
+        b"lib64/libfreetype.so.6",
+        b"lib64/libharfbuzz.so.0",
+        b"lib64/libglib-2.0.so.0",
+        b"lib64/libsystemd.so.0",
+        b"lib64/libGL.so.1",
+        b"lib64/libGLX.so.0",
+        b"lib64/libEGL.so.1",
+        b"lib64/libXext.so.6",
+        b"lib64/libXfont2.so.2",
+    ];
+    let mut preloaded = 0usize;
+    for lib in preload_libs.iter() {
+        if try_open_initramfs(lib).is_some() {
+            preloaded += 1;
+        }
+    }
+    syscall::debug_puts(b"[linux_srv] preloaded ");
+    print_num(preloaded as u64);
+    syscall::debug_puts(b"/22 common libs into content cache\n");
+
     // Round-robin sweep index for dead-process cleanup.  One slot checked
     // per main-loop iteration so the cost stays O(1) per dispatch.  When
     // a process dies on a signal (e.g. SIGSEGV from null-deref) the kernel
