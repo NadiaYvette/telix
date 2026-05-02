@@ -2896,6 +2896,49 @@ fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
             let chunk_idx = info.in_flight_chunk as usize;
             let chunk_off = chunk_idx * CACHE_CHUNK_SIZE;
             let backing_va = LIB_CACHE[cache_idx].backing_va;
+            let file_size = LIB_CACHE[cache_idx].file_size;
+
+            // Short-read defence: if initramfs_srv returned fewer bytes
+            // than this chunk should hold (CACHE_CHUNK_SIZE, or
+            // file_size - chunk_off for the last chunk), the rest of
+            // the chunk's backing region is still anon-zero from
+            // pre-fault.  Marking it cached would silently hand zeros
+            // to the next mmap that hits this chunk — the classic
+            // "file too short" / "Verdef version 0" amplification.
+            // Reject the fill with EIO and leave the chunk uncached so
+            // a fresh mmap will retry the fetch.
+            let expected = CACHE_CHUNK_SIZE
+                .min((file_size.saturating_sub(chunk_off as u64)) as usize);
+            if got < expected {
+                if DEBUG_SHORT_READ {
+                    syscall::debug_puts(b"[lsrv] SHORT-READ async cached mmap chunk=");
+                    let mut buf = [0u8; 4]; let mut val = chunk_idx as u32; let mut k = 4;
+                    if val == 0 { k -= 1; buf[k] = b'0'; }
+                    while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[k..4]);
+                    syscall::debug_puts(b" got=");
+                    let mut buf = [0u8; 12]; let mut val = got as u32; let mut k = 12;
+                    if val == 0 { k -= 1; buf[k] = b'0'; }
+                    while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[k..12]);
+                    syscall::debug_puts(b" expected=");
+                    let mut buf = [0u8; 12]; let mut val = expected as u32; let mut k = 12;
+                    if val == 0 { k -= 1; buf[k] = b'0'; }
+                    while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[k..12]);
+                    syscall::debug_puts(b" handle=");
+                    let mut buf = [0u8; 12]; let mut val = info.extra_handle as u32; let mut k = 12;
+                    if val == 0 { k -= 1; buf[k] = b'0'; }
+                    while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[k..12]);
+                    syscall::debug_puts(b"\n");
+                }
+                async_free_slot(slot);
+                free_async_scratch_slot(info.scratch_slot);
+                let _ = syscall::personality_reply(caller, linux_err(EIO));
+                return;
+            }
+
             let dst = (backing_va + chunk_off) as *mut u8;
             // 8-byte stride for the bulk, then byte tail.
             let words = got / 8;

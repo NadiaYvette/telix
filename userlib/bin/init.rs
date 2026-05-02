@@ -8952,6 +8952,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // the previous one's reap, giving Xwayland time to bind.
                     // We stop retrying once xeyes returns 0 (success) or we
                     // run out of attempts or Xwayland dies.
+                    // Cap on H14 retries.  Bumped from 3 → 6 after smoke r7
+                    // showed 3-attempt runs sometimes flaking when Xwayland's
+                    // X0 bind landed late (~@15s wallclock instead of the
+                    // typical ~@1s).  6 attempts × ~5s each (xeyes load+exit
+                    // dominates) gives ~30s of catching window — comfortably
+                    // larger than the worst-case observed Xwayland startup.
+                    const MAX_XEYES_ATTEMPTS: u32 = 6;
                     let mut xeyes_attempt: u32 = 1;
                     let mut xeyes_attempt_reported: u32 = 0; // last attempt # already printed
                     let mut next_xeyes_fork_i: i32 = -1; // -1 = no pending refork
@@ -8992,7 +8999,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             // fire soon enough that the Xwayland @1s X0 bind
                             // (which we now reliably reach) catches the
                             // xeyes connect on the second try.
-                            if xeyes_code != 0 && xeyes_attempt < 3 {
+                            if xeyes_code != 0 && xeyes_attempt < MAX_XEYES_ATTEMPTS {
                                 next_xeyes_fork_i = i as i32 + 100;
                             }
                         }
