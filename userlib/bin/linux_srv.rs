@@ -752,6 +752,21 @@ enum PendingAsyncKind {
     ///   flags     → caller's offset within the file (used to confirm we
     ///               read what they asked for and for fd offset update)
     IrfsReadFd,
+    /// Multi-chunk fill of a file-backed Initramfs mmap region via
+    /// IRFS_IO_READ_ASYNC.  Each chunk reuses the same pending slot and
+    /// async scratch slot, advancing `total_so_far` toward `buf_len`
+    /// (== to_read).  When the final chunk lands, the continuation
+    /// restores prot (if `mmap_prot_flags` bit 7 is set) and replies
+    /// `buf_va` (== mapped va) to the caller.  Field map:
+    ///   listen_fd → fd index in PROC_TABLE[pi].fds (defensive validation)
+    ///   buf_va    → mapped region base in caller's aspace (return value)
+    ///   buf_len   → total bytes to fill (to_read)
+    ///   flags     → file_offset_base (start of the mapping in the file)
+    ///   extra_handle → irfs file handle
+    ///   total_so_far → bytes copied so far
+    ///   mmap_prot_flags → kern_prot in bits 0..=2; bit 7 = need_bump
+    ///   mmap_aligned_len → page-aligned len for mprotect on completion
+    IrfsReadMmap,
 }
 
 #[derive(Copy, Clone)]
@@ -768,14 +783,29 @@ struct PendingAsync {
     /// accept4 flags (SOCK_CLOEXEC / SOCK_NONBLOCK) — AcceptUnix only.
     /// IrfsReadFd: file offset at which the read was issued (for fd
     /// offset write-back semantics).
+    /// IrfsReadMmap: file offset base of the mapping.
     flags: u64,
     /// Destination buffer VA in the caller's aspace — RecvUnix only.
     /// Also IrfsReadFd: where to copy the bytes the irfs server wrote
     /// into our scratch.
+    /// IrfsReadMmap: mapped region base in caller's aspace.
     buf_va: usize,
     /// Destination buffer capacity — RecvUnix only.
     /// Also IrfsReadFd: max bytes to copy out (== request length).
+    /// IrfsReadMmap: total bytes to fill (to_read).
     buf_len: usize,
+    /// Async scratch slot held by this pending op (0xFF = none).
+    /// IrfsReadFd / IrfsReadMmap only.
+    scratch_slot: u8,
+    /// IrfsReadMmap: bytes already copied into the destination so far.
+    total_so_far: u32,
+    /// IrfsReadMmap: kern_prot in bits 0..=2 (0=RO, 1=RW, 2=RE, 3=RWE);
+    /// bit 7 = need_bump (whether to restore prot after fill).
+    mmap_prot_flags: u8,
+    /// IrfsReadMmap: page-aligned mapped length for mprotect on completion.
+    mmap_aligned_len: u32,
+    /// IrfsReadMmap: irfs file handle for issuing subsequent chunks.
+    extra_handle: u64,
 }
 
 impl PendingAsync {
@@ -789,6 +819,11 @@ impl PendingAsync {
             flags: 0,
             buf_va: 0,
             buf_len: 0,
+            scratch_slot: 0xFF,
+            total_so_far: 0,
+            mmap_prot_flags: 0,
+            mmap_aligned_len: 0,
+            extra_handle: 0,
         }
     }
 }
@@ -2359,6 +2394,118 @@ fn ensure_fs_scratch_grants() {
     }
 }
 
+// --- Async scratch rotation for IRFS_IO_READ_ASYNC ---
+//
+// The sync IRFS read path uses a single scratch region at LIN_FS_SCRATCH_VA
+// (FS_SCRATCH_PAGES × 4 KiB), shared with VFS path forwarding.  Step 3
+// reused that same region for async reads but had to serialize via
+// IRFS_IN_FLIGHT — only one async read could be outstanding at a time, so
+// linux_srv was effectively still single-threaded for IRFS bulk traffic.
+//
+// Step 4 (this block) adds N=FS_ASYNC_SCRATCH_SLOTS independent scratch
+// regions, each FS_ASYNC_SCRATCH_PAGES wide, granted en-bloc to
+// initramfs_srv at LIN_FS_ASYNC_SCRATCH_REMOTE_BASE.  Each pending IRFS
+// async op grabs a slot, fires the read, and releases the slot in its
+// continuation.  Concurrent reads from the IRFS fast path (handle_read,
+// handle_mmap, future pread) can now pipeline up to N deep without
+// blocking linux_srv's main thread.
+//
+// The N slots back onto a single mmap_anon allocation so we only pay one
+// grant_pages call to initramfs_srv.  Slots are addressed by index within
+// that region: local VA = FS_ASYNC_SCRATCH_LOCAL + slot*PAGES*page_size,
+// remote VA = LIN_FS_ASYNC_SCRATCH_REMOTE_BASE + slot*PAGES*4096.
+const FS_ASYNC_SCRATCH_PAGES: usize = 64;
+const FS_ASYNC_SCRATCH_SLOTS: usize = 4;
+const LIN_FS_ASYNC_SCRATCH_REMOTE_BASE: usize = 0x5_0010_0000;
+
+/// Local base of the async scratch region (4 × 64 pages contiguous).
+/// 0 = not yet allocated.
+static mut FS_ASYNC_SCRATCH_LOCAL: usize = 0;
+/// True once the bulk grant to initramfs_srv has succeeded.
+static mut FS_ASYNC_SCRATCH_GRANTED: bool = false;
+/// Bit per scratch slot — set means in flight.
+static mut FS_ASYNC_SCRATCH_BUSY: u8 = 0;
+
+/// Lazily allocate the async scratch region and grant it to initramfs_srv.
+/// Returns true once scratch is ready.
+fn ensure_irfs_async_scratch() -> bool {
+    unsafe {
+        if FS_ASYNC_SCRATCH_GRANTED {
+            return true;
+        }
+        if FS_ASYNC_SCRATCH_LOCAL == 0 {
+            let total_pages = FS_ASYNC_SCRATCH_PAGES * FS_ASYNC_SCRATCH_SLOTS;
+            let va = match syscall::mmap_anon(0, total_pages, 1) {
+                Some(v) => v,
+                None => return false,
+            };
+            // Pre-fault every page before granting (same reason as the sync
+            // scratch in ensure_lin_path_scratch — kernel grants the shared
+            // zero page until first write).
+            let ps = syscall::page_size();
+            for i in 0..total_pages {
+                core::ptr::write_volatile((va + i * ps) as *mut u8, 0u8);
+            }
+            FS_ASYNC_SCRATCH_LOCAL = va;
+        }
+        let irfs_task = syscall::ns_lookup(b"initramfs_task").unwrap_or(0);
+        if irfs_task == 0 {
+            return false;
+        }
+        let total_pages = FS_ASYNC_SCRATCH_PAGES * FS_ASYNC_SCRATCH_SLOTS;
+        if syscall::grant_pages(
+            irfs_task,
+            FS_ASYNC_SCRATCH_LOCAL,
+            LIN_FS_ASYNC_SCRATCH_REMOTE_BASE,
+            total_pages,
+            false,
+        ) {
+            FS_ASYNC_SCRATCH_GRANTED = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Reserve an async scratch slot.  Returns slot index on success, None if
+/// all slots are in flight.
+fn alloc_async_scratch_slot() -> Option<u8> {
+    unsafe {
+        if !FS_ASYNC_SCRATCH_GRANTED {
+            return None;
+        }
+        for i in 0..FS_ASYNC_SCRATCH_SLOTS {
+            let bit = 1u8 << i;
+            if FS_ASYNC_SCRATCH_BUSY & bit == 0 {
+                FS_ASYNC_SCRATCH_BUSY |= bit;
+                return Some(i as u8);
+            }
+        }
+    }
+    None
+}
+
+fn free_async_scratch_slot(slot: u8) {
+    if (slot as usize) >= FS_ASYNC_SCRATCH_SLOTS {
+        return;
+    }
+    unsafe {
+        FS_ASYNC_SCRATCH_BUSY &= !(1u8 << slot);
+    }
+}
+
+fn async_scratch_local_va(slot: u8) -> usize {
+    unsafe {
+        FS_ASYNC_SCRATCH_LOCAL
+            + (slot as usize) * FS_ASYNC_SCRATCH_PAGES * syscall::page_size()
+    }
+}
+
+fn async_scratch_remote_va(slot: u8) -> usize {
+    LIN_FS_ASYNC_SCRATCH_REMOTE_BASE + (slot as usize) * FS_ASYNC_SCRATCH_PAGES * 4096
+}
+
 /// Read from initramfs_srv via IO_READ + grant_va.  Mirrors
 /// `fs_read_bulk` but uses the initramfs IPC tags.  Initramfs serves
 /// in-memory cpio data so this is dramatically faster than the
@@ -2457,11 +2604,9 @@ fn irfs_read_bulk(irfs_port: u64, handle: u64, offset: u64, max_len: usize) -> O
 /// None if any preconditions fail — caller should fall back to the sync
 /// `irfs_read_bulk` path in that case.
 ///
-/// Preconditions: registration done, scratch grant up, no other async
-/// IRFS read currently in flight (we serialize so the single
-/// `LIN_FS_SCRATCH_VA` doesn't get overwritten before the continuation
-/// reads it), an async slot is free, and `length` fits in a single
-/// scratch buffer (FS_SCRATCH_PAGES × 4 KiB).
+/// Preconditions: registration done, async scratch grant up, a free
+/// scratch slot is available, an async pending slot is free, and
+/// `length` fits in one scratch slot (FS_ASYNC_SCRATCH_PAGES × 4 KiB).
 fn try_irfs_read_async(
     pi: usize,
     caller_port: u64,
@@ -2472,23 +2617,29 @@ fn try_irfs_read_async(
     user_buf_va: usize,
 ) -> Option<usize> {
     unsafe {
-        if !IRFS_ASYNC_REGISTERED || IRFS_IN_FLIGHT {
+        if !IRFS_ASYNC_REGISTERED {
             return None;
         }
-        ensure_fs_scratch_grants();
-        if FS_SCRATCH_GRANTED_MASK & (1 << 4) == 0 {
+        if !ensure_irfs_async_scratch() {
             return None;
         }
-        if length == 0 || length > FS_SCRATCH_PAGES * 4096 {
+        if length == 0 || length > FS_ASYNC_SCRATCH_PAGES * 4096 {
             return None;
         }
         let irfs = get_initramfs_port();
         if irfs == 0 {
             return None;
         }
-        let slot = match async_alloc_slot() {
+        let scratch_slot = match alloc_async_scratch_slot() {
             Some(s) => s,
             None => return None,
+        };
+        let slot = match async_alloc_slot() {
+            Some(s) => s,
+            None => {
+                free_async_scratch_slot(scratch_slot);
+                return None;
+            }
         };
         let correlation = next_correlation_id();
         PENDING_ASYNC[slot] = PendingAsync {
@@ -2500,6 +2651,11 @@ fn try_irfs_read_async(
             flags: offset,
             buf_va: user_buf_va,
             buf_len: length,
+            scratch_slot,
+            total_so_far: 0,
+            mmap_prot_flags: 0,
+            mmap_aligned_len: 0,
+            extra_handle: 0,
         };
         // Pack args per the IRFS_IO_READ_ASYNC contract:
         //   d0 = handle (low 32) | length (high 32)
@@ -2512,17 +2668,209 @@ fn try_irfs_read_async(
             IRFS_IO_READ_ASYNC,
             d0,
             offset,
-            LIN_FS_SCRATCH_VA as u64,
+            async_scratch_remote_va(scratch_slot) as u64,
             correlation,
         );
         if r != 0 {
             // send failed (queue full, port dead, etc.) — undo and let
             // caller fall back to sync.
             async_free_slot(slot);
+            free_async_scratch_slot(scratch_slot);
             return None;
         }
-        IRFS_IN_FLIGHT = true;
         Some(slot)
+    }
+}
+
+/// Try to start async fill of an Initramfs file-backed mmap region.
+/// Issues the *first* chunk async; subsequent chunks are issued from
+/// the continuation as each reply lands.  Returns true if the async
+/// path took over (caller must set REPLY_DEFERRED and not reply
+/// itself); false to fall back to the existing sync mmap fill loop.
+///
+/// `mapped_va` is the personality_mmap_anon return value (the value
+/// the caller's mmap(2) will see).  `total_target` is the byte count
+/// to fill from the file (already clamped by file_size).  `kern_prot`
+/// + `need_bump` are captured so the continuation can restore the
+/// requested protection on the final chunk.  `aligned_len` is the
+/// page-aligned mapping length (for mprotect).
+fn try_irfs_read_mmap(
+    pi: usize,
+    caller_port: u64,
+    fd_idx: usize,
+    handle: u64,
+    file_offset_base: u64,
+    total_target: usize,
+    mapped_va: usize,
+    aligned_len: usize,
+    kern_prot: u8,
+    need_bump: bool,
+) -> bool {
+    unsafe {
+        if !IRFS_ASYNC_REGISTERED {
+            return false;
+        }
+        if !ensure_irfs_async_scratch() {
+            return false;
+        }
+        if total_target == 0 {
+            return false;
+        }
+        if total_target > u32::MAX as usize || aligned_len > u32::MAX as usize {
+            return false;
+        }
+        let irfs = get_initramfs_port();
+        if irfs == 0 {
+            return false;
+        }
+        let scratch_slot = match alloc_async_scratch_slot() {
+            Some(s) => s,
+            None => return false,
+        };
+        let pending_slot = match async_alloc_slot() {
+            Some(s) => s,
+            None => {
+                free_async_scratch_slot(scratch_slot);
+                return false;
+            }
+        };
+        let chunk = total_target.min(FS_ASYNC_SCRATCH_PAGES * 4096);
+        let correlation = next_correlation_id();
+        let prot_flags = (kern_prot & 0x07) | if need_bump { 0x80 } else { 0 };
+        PENDING_ASYNC[pending_slot] = PendingAsync {
+            kind: PendingAsyncKind::IrfsReadMmap,
+            correlation,
+            pi,
+            caller_task_port: caller_port,
+            listen_fd: fd_idx,
+            flags: file_offset_base,
+            buf_va: mapped_va,
+            buf_len: total_target,
+            scratch_slot,
+            total_so_far: 0,
+            mmap_prot_flags: prot_flags,
+            mmap_aligned_len: aligned_len as u32,
+            extra_handle: handle,
+        };
+        let d0 = (handle & 0xFFFF_FFFF) | (((chunk as u64) & 0xFFFF_FFFF) << 32);
+        let r = syscall::send_nb_4(
+            irfs,
+            IRFS_IO_READ_ASYNC,
+            d0,
+            file_offset_base,
+            async_scratch_remote_va(scratch_slot) as u64,
+            correlation,
+        );
+        if r != 0 {
+            async_free_slot(pending_slot);
+            free_async_scratch_slot(scratch_slot);
+            return false;
+        }
+        true
+    }
+}
+
+/// Continuation for an `IrfsReadMmap` async read.  Fires when
+/// initramfs_srv posts IRFS_IO_READ_REPLY(correlation, bytes_read) for
+/// each chunk of the mapping.  Copies the chunk into the caller's
+/// mapped region; if more bytes remain, dispatches the next chunk on
+/// the same scratch slot (no copy back into PENDING_ASYNC needed —
+/// only correlation + total_so_far advance).  When the whole region
+/// is filled, restores prot (if bumped) and replies the mapped va.
+fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
+    unsafe {
+        let info = PENDING_ASYNC[slot];
+        let caller = info.caller_task_port;
+        let pi = info.pi;
+        let fd_idx = info.listen_fd;
+
+        // Defensive: caller process / fd may have gone away mid-fill
+        // (close-on-exit, fd close, …).  Tear down without a reply —
+        // if the process is alive its syscall is still parked, but
+        // returning EFAULT/EBADF for an in-progress mmap leaves an
+        // anonymously-mapped region the caller can't recover from.
+        // Surface EIO so ld.so etc. fail explicitly (matches sync
+        // SHORT-READ behavior) and the partial mapping leaks anon-zero
+        // until process exit.
+        let fd_dead = fd_idx >= MAX_FDS
+            || !PROC_TABLE[pi].fds[fd_idx].in_use
+            || PROC_TABLE[pi].fds[fd_idx].kind != FdKind::Initramfs;
+
+        if bytes_read == 0 || fd_dead {
+            async_free_slot(slot);
+            free_async_scratch_slot(info.scratch_slot);
+            if DEBUG_SHORT_READ && !fd_dead {
+                syscall::debug_puts(b"[lsrv] SHORT-READ async mmap initramfs h=");
+                let mut buf = [0u8; 12]; let mut val = info.extra_handle as u32; let mut k = 12;
+                if val == 0 { k -= 1; buf[k] = b'0'; }
+                while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                syscall::debug_puts(&buf[k..12]);
+                syscall::debug_puts(b"\n");
+            }
+            let _ = syscall::personality_reply(caller, linux_err(EIO));
+            return;
+        }
+
+        let got = bytes_read as usize;
+        let scratch = async_scratch_local_va(info.scratch_slot) as *const u8;
+        let src = core::slice::from_raw_parts(scratch, got);
+        let chunk_dst = info.buf_va + info.total_so_far as usize;
+        let written = syscall::personality_copy_out(caller, chunk_dst, src);
+        if written == 0 {
+            async_free_slot(slot);
+            free_async_scratch_slot(info.scratch_slot);
+            let _ = syscall::personality_reply(caller, linux_err(EFAULT));
+            return;
+        }
+        let new_total = info.total_so_far as usize + written;
+
+        if new_total >= info.buf_len {
+            // Final chunk.  Restore protection if we bumped it, then
+            // reply the mapped va to the caller.
+            async_free_slot(slot);
+            free_async_scratch_slot(info.scratch_slot);
+            if info.mmap_prot_flags & 0x80 != 0 {
+                let kern_prot = info.mmap_prot_flags & 0x07;
+                syscall::personality_mprotect(
+                    caller,
+                    info.buf_va,
+                    info.mmap_aligned_len as usize,
+                    kern_prot,
+                );
+            }
+            let _ = syscall::personality_reply(caller, info.buf_va as u64);
+            return;
+        }
+
+        // More to fill — issue the next chunk on the same scratch slot.
+        let irfs = get_initramfs_port();
+        if irfs == 0 {
+            async_free_slot(slot);
+            free_async_scratch_slot(info.scratch_slot);
+            let _ = syscall::personality_reply(caller, linux_err(EIO));
+            return;
+        }
+        let remaining = info.buf_len - new_total;
+        let chunk = remaining.min(FS_ASYNC_SCRATCH_PAGES * 4096);
+        let next_off = info.flags + new_total as u64;
+        let correlation = next_correlation_id();
+        let d0 = (info.extra_handle & 0xFFFF_FFFF) | (((chunk as u64) & 0xFFFF_FFFF) << 32);
+        let r = syscall::send_nb_4(
+            irfs,
+            IRFS_IO_READ_ASYNC,
+            d0,
+            next_off,
+            async_scratch_remote_va(info.scratch_slot) as u64,
+            correlation,
+        );
+        if r != 0 {
+            async_free_slot(slot);
+            free_async_scratch_slot(info.scratch_slot);
+            let _ = syscall::personality_reply(caller, linux_err(EIO));
+            return;
+        }
+        PENDING_ASYNC[slot].correlation = correlation;
+        PENDING_ASYNC[slot].total_so_far = new_total as u32;
     }
 }
 
@@ -2534,7 +2882,7 @@ fn finish_irfs_read_fd(slot: usize, bytes_read: u64) {
     unsafe {
         let info = PENDING_ASYNC[slot];
         async_free_slot(slot);
-        IRFS_IN_FLIGHT = false;
+        free_async_scratch_slot(info.scratch_slot);
 
         let caller = info.caller_task_port;
         let pi = info.pi;
@@ -2556,8 +2904,8 @@ fn finish_irfs_read_fd(slot: usize, bytes_read: u64) {
             let _ = syscall::personality_reply(caller, linux_err(EIO));
             return;
         }
-        // Copy from scratch to caller's user-space buffer.
-        let scratch = LIN_PATH_SCRATCH_LOCAL as *const u8;
+        // Copy from this op's scratch slot to caller's user-space buffer.
+        let scratch = async_scratch_local_va(info.scratch_slot) as *const u8;
         let src = core::slice::from_raw_parts(scratch, len);
         let written = syscall::personality_copy_out(caller, info.buf_va, src);
         if written == 0 {
@@ -2719,19 +3067,6 @@ static mut INITRAMFS_PORT: u64 = 0;
 /// inside `try_register_irfs_async_reply_port`, called lazily from
 /// the main IPC loop once initramfs_srv is reachable.
 static mut IRFS_ASYNC_REGISTERED: bool = false;
-
-/// True while exactly one IRFS_IO_READ_ASYNC is outstanding waiting
-/// for IRFS_IO_READ_REPLY.  Serializes async IRFS reads so the single
-/// `LIN_FS_SCRATCH_VA` doesn't get stomped by overlapping replies.
-/// Other Linux syscalls (open, write, socket, mmap of memfd, …) still
-/// run in parallel because linux_srv's main thread isn't blocked
-/// waiting for the reply — the whole point of this design.
-///
-/// When set, callers that would issue an async IRFS read fall back to
-/// the synchronous path (which blocks linux_srv's thread for the
-/// duration of one read).  This is OK for bringup; a future revision
-/// could queue the request behind the in-flight one instead.
-static mut IRFS_IN_FLIGHT: bool = false;
 
 /// IRFS protocol tag for the registration call (matches initramfs_srv).
 const IRFS_IO_SET_ASYNC_REPLY_PORT: u64 = 0x204;
@@ -5343,6 +5678,29 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                 else { (file_size - file_offset) as usize };
                     let to_read = len.min(avail);
                     if to_read > 0 {
+                        // Async fast path: dispatch the fill to initramfs_srv
+                        // via IRFS_IO_READ_ASYNC and let linux_srv's main
+                        // thread serve other Linux clients while the file
+                        // bytes flow back chunk-by-chunk.  finish_irfs_read_mmap
+                        // copies each chunk into the mapping and replies the
+                        // mapped va when the whole region is filled.  Falls
+                        // through to the sync loop on any precondition miss
+                        // (registration not done, no scratch slot free, etc.).
+                        if try_irfs_read_mmap(
+                            pi,
+                            caller_port,
+                            fd_idx,
+                            handle,
+                            file_offset,
+                            to_read,
+                            va,
+                            aligned_len,
+                            kern_prot as u8,
+                            need_bump,
+                        ) {
+                            unsafe { REPLY_DEFERRED = true; }
+                            return 0; // ignored — REPLY_DEFERRED suppresses reply
+                        }
                         let mut total = 0usize;
                         ensure_fs_scratch_grants();
                         while total < to_read {
@@ -7978,6 +8336,11 @@ fn read_socket(caller_port: u64, srv_port: u64, handle: u64, domain: u8, buf_va:
                 flags: 0,
                 buf_va,
                 buf_len: count,
+                scratch_slot: 0xFF,
+                total_so_far: 0,
+                mmap_prot_flags: 0,
+                mmap_aligned_len: 0,
+                extra_handle: 0,
             };
         }
         let rp = unsafe { BACKEND_REPLY_PORT };
@@ -8518,6 +8881,11 @@ fn handle_accept_inner(pi: usize, caller_port: u64, args: &[u64; 6], flags: u64)
                 flags,
                 buf_va: 0,
                 buf_len: 0,
+                scratch_slot: 0xFF,
+                total_so_far: 0,
+                mmap_prot_flags: 0,
+                mmap_aligned_len: 0,
+                extra_handle: 0,
             };
             let uds_port = PROC_TABLE[pi].fds[fd].fs_port;
             let handle   = PROC_TABLE[pi].fds[fd].handle;
@@ -8695,18 +9063,19 @@ fn handle_async_reply(msg: &syscall::Message) -> bool {
                 Some(s) => s,
                 None => {
                     // Stale reply (caller likely exited and reaper freed
-                    // the slot).  Clear the in-flight flag so we don't
-                    // permanently lock out async reads, then drop.
-                    unsafe { IRFS_IN_FLIGHT = false; }
+                    // the slot).  Drop — the scratch slot was already
+                    // freed when the pending slot was reaped.
                     return false;
                 }
             };
             let kind = unsafe { PENDING_ASYNC[slot].kind };
             match kind {
                 PendingAsyncKind::IrfsReadFd => finish_irfs_read_fd(slot, bytes_read),
+                PendingAsyncKind::IrfsReadMmap => finish_irfs_read_mmap(slot, bytes_read),
                 _ => {
+                    let scratch = unsafe { PENDING_ASYNC[slot].scratch_slot };
                     async_free_slot(slot);
-                    unsafe { IRFS_IN_FLIGHT = false; }
+                    free_async_scratch_slot(scratch);
                 }
             }
             true
