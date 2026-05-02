@@ -797,7 +797,8 @@ struct PendingAsync {
     /// Async scratch slot held by this pending op (0xFF = none).
     /// IrfsReadFd / IrfsReadMmap only.
     scratch_slot: u8,
-    /// IrfsReadMmap: bytes already copied into the destination so far.
+    /// IrfsReadMmap: bytes already copied into the destination so far
+    /// (counts both cached-chunk local copies and async-fetched chunks).
     total_so_far: u32,
     /// IrfsReadMmap: kern_prot in bits 0..=2 (0=RO, 1=RW, 2=RE, 3=RWE);
     /// bit 7 = need_bump (whether to restore prot after fill).
@@ -806,6 +807,13 @@ struct PendingAsync {
     mmap_aligned_len: u32,
     /// IrfsReadMmap: irfs file handle for issuing subsequent chunks.
     extra_handle: u64,
+    /// IrfsReadMmap: LIB_CACHE slot index for chunk caching, or 0xFF
+    /// if this mmap is filling without caching (alloc failed).
+    cache_slot: u8,
+    /// IrfsReadMmap: index of the chunk currently in flight (0..64).
+    /// On reply, the bytes go to backing[chunk * CACHE_CHUNK_SIZE..]
+    /// and we mark `LIB_CACHE[cache_slot].chunks_cached |= 1 << chunk`.
+    in_flight_chunk: u8,
 }
 
 impl PendingAsync {
@@ -824,6 +832,8 @@ impl PendingAsync {
             mmap_prot_flags: 0,
             mmap_aligned_len: 0,
             extra_handle: 0,
+            cache_slot: 0xFF,
+            in_flight_chunk: 0,
         }
     }
 }
@@ -2656,6 +2666,8 @@ fn try_irfs_read_async(
             mmap_prot_flags: 0,
             mmap_aligned_len: 0,
             extra_handle: 0,
+            cache_slot: 0xFF,
+            in_flight_chunk: 0,
         };
         // Pack args per the IRFS_IO_READ_ASYNC contract:
         //   d0 = handle (low 32) | length (high 32)
@@ -2682,11 +2694,24 @@ fn try_irfs_read_async(
     }
 }
 
-/// Try to start async fill of an Initramfs file-backed mmap region.
-/// Issues the *first* chunk async; subsequent chunks are issued from
-/// the continuation as each reply lands.  Returns true if the async
-/// path took over (caller must set REPLY_DEFERRED and not reply
-/// itself); false to fall back to the existing sync mmap fill loop.
+/// Result of `try_irfs_read_mmap` — distinguishes "all bytes were
+/// already in cache, copied locally, no IPC fired" from "async fetch
+/// in flight" from "couldn't even try, fall back".  The caller acts
+/// on each variant differently:
+///   Sync     — caller restores prot (if it bumped) and replies va
+///   Deferred — caller sets REPLY_DEFERRED so the dispatch loop skips
+///              the reply; finish_irfs_read_mmap will reply later
+///   Failed   — caller falls back to sync irfs_read_bulk loop
+enum MmapFillResult { Sync, Deferred, Failed }
+
+/// Try to fill a file-backed Initramfs mmap region from cache + async
+/// IRFS reads.  `cache_slot` is the LIB_CACHE slot allocated for this
+/// handle (or 0xFF for "no cache available").  When a cache slot is
+/// present, every chunk that's already cached is copied locally
+/// (backing→user) before any IPC fires; the first uncached chunk in
+/// the request range triggers an IRFS_IO_READ_ASYNC send.  Each fetched
+/// chunk is then mirrored into `LIB_CACHE[cache_slot].backing_va` so
+/// later mmaps from any process get cache hits for that chunk.
 ///
 /// `mapped_va` is the personality_mmap_anon return value (the value
 /// the caller's mmap(2) will see).  `total_target` is the byte count
@@ -2705,36 +2730,81 @@ fn try_irfs_read_mmap(
     aligned_len: usize,
     kern_prot: u8,
     need_bump: bool,
-) -> bool {
+    cache_slot: u8,
+) -> MmapFillResult {
     unsafe {
         if !IRFS_ASYNC_REGISTERED {
-            return false;
+            return MmapFillResult::Failed;
         }
         if !ensure_irfs_async_scratch() {
-            return false;
+            return MmapFillResult::Failed;
         }
         if total_target == 0 {
-            return false;
+            return MmapFillResult::Failed;
         }
         if total_target > u32::MAX as usize || aligned_len > u32::MAX as usize {
-            return false;
+            return MmapFillResult::Failed;
         }
+
+        // Walk cached chunks at the start of the range; bail out at the
+        // first uncached chunk (or return Sync if every chunk was cached).
+        let first_chunk =
+            (file_offset_base / CACHE_CHUNK_SIZE as u64) as usize;
+        let mut total_so_far: usize = 0;
+        let next_to_fetch = if cache_slot != 0xFF {
+            match cache_process_cached_chunks(
+                cache_slot as usize,
+                file_offset_base,
+                total_target,
+                mapped_va,
+                caller_port,
+                first_chunk,
+                &mut total_so_far,
+            ) {
+                Ok(()) => return MmapFillResult::Sync,
+                Err(c) => c,
+            }
+        } else {
+            first_chunk
+        };
+
         let irfs = get_initramfs_port();
         if irfs == 0 {
-            return false;
+            return MmapFillResult::Failed;
         }
         let scratch_slot = match alloc_async_scratch_slot() {
             Some(s) => s,
-            None => return false,
+            None => return MmapFillResult::Failed,
         };
         let pending_slot = match async_alloc_slot() {
             Some(s) => s,
             None => {
                 free_async_scratch_slot(scratch_slot);
-                return false;
+                return MmapFillResult::Failed;
             }
         };
-        let chunk = total_target.min(FS_ASYNC_SCRATCH_PAGES * 4096);
+
+        // Compute fetch parameters for the first uncached chunk.  We
+        // always read at chunk-aligned boundaries so the cache stores
+        // canonical chunks: simpler bookkeeping and lets the chunk be
+        // reused by mmaps with different offsets.
+        let chunk_off = (next_to_fetch * CACHE_CHUNK_SIZE) as u64;
+        let file_size = if cache_slot != 0xFF {
+            LIB_CACHE[cache_slot as usize].file_size
+        } else {
+            // Fallback — fall through to "fetch at base offset" mode.
+            // Without a cache slot we don't know file_size for sure;
+            // use total_target as an upper bound.
+            file_offset_base + total_target as u64
+        };
+        let chunk_data_len = if cache_slot != 0xFF {
+            CACHE_CHUNK_SIZE.min((file_size - chunk_off) as usize)
+        } else {
+            total_target.min(CACHE_CHUNK_SIZE)
+        };
+        let fetch_off = if cache_slot != 0xFF { chunk_off } else { file_offset_base };
+        let fetch_len = chunk_data_len;
+
         let correlation = next_correlation_id();
         let prot_flags = (kern_prot & 0x07) | if need_bump { 0x80 } else { 0 };
         PENDING_ASYNC[pending_slot] = PendingAsync {
@@ -2747,36 +2817,48 @@ fn try_irfs_read_mmap(
             buf_va: mapped_va,
             buf_len: total_target,
             scratch_slot,
-            total_so_far: 0,
+            total_so_far: total_so_far as u32,
             mmap_prot_flags: prot_flags,
             mmap_aligned_len: aligned_len as u32,
             extra_handle: handle,
+            cache_slot,
+            in_flight_chunk: next_to_fetch as u8,
         };
-        let d0 = (handle & 0xFFFF_FFFF) | (((chunk as u64) & 0xFFFF_FFFF) << 32);
+        let d0 = (handle & 0xFFFF_FFFF) | (((fetch_len as u64) & 0xFFFF_FFFF) << 32);
         let r = syscall::send_nb_4(
             irfs,
             IRFS_IO_READ_ASYNC,
             d0,
-            file_offset_base,
+            fetch_off,
             async_scratch_remote_va(scratch_slot) as u64,
             correlation,
         );
         if r != 0 {
             async_free_slot(pending_slot);
             free_async_scratch_slot(scratch_slot);
-            return false;
+            return MmapFillResult::Failed;
         }
-        true
+        MmapFillResult::Deferred
     }
 }
 
 /// Continuation for an `IrfsReadMmap` async read.  Fires when
 /// initramfs_srv posts IRFS_IO_READ_REPLY(correlation, bytes_read) for
-/// each chunk of the mapping.  Copies the chunk into the caller's
-/// mapped region; if more bytes remain, dispatches the next chunk on
-/// the same scratch slot (no copy back into PENDING_ASYNC needed —
-/// only correlation + total_so_far advance).  When the whole region
-/// is filled, restores prot (if bumped) and replies the mapped va.
+/// the just-fetched chunk.  Path:
+///   1. Copy scratch → backing (cache write — only if a cache slot
+///      is associated with this fill).
+///   2. Mark `in_flight_chunk` cached in the bitmap.
+///   3. Walk forward through cached chunks, copying each from backing
+///      into the caller's mapping (re-uses the just-marked chunk, plus
+///      any subsequent chunks that are already cached from prior fills).
+///   4. If the request range is fully covered, restore prot and reply va.
+///   5. Otherwise, fire IRFS_IO_READ_ASYNC for the next uncached chunk
+///      on the same scratch slot.
+///
+/// In the no-cache fallback (cache_slot == 0xFF), step 1 is skipped and
+/// step 3 just copies the bytes we have in scratch directly into the
+/// caller's mapping (the existing Step-4 behaviour, no caching side
+/// effect).
 fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
     unsafe {
         let info = PENDING_ASYNC[slot];
@@ -2784,14 +2866,6 @@ fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
         let pi = info.pi;
         let fd_idx = info.listen_fd;
 
-        // Defensive: caller process / fd may have gone away mid-fill
-        // (close-on-exit, fd close, …).  Tear down without a reply —
-        // if the process is alive its syscall is still parked, but
-        // returning EFAULT/EBADF for an in-progress mmap leaves an
-        // anonymously-mapped region the caller can't recover from.
-        // Surface EIO so ld.so etc. fail explicitly (matches sync
-        // SHORT-READ behavior) and the partial mapping leaks anon-zero
-        // until process exit.
         let fd_dead = fd_idx >= MAX_FDS
             || !PROC_TABLE[pi].fds[fd_idx].in_use
             || PROC_TABLE[pi].fds[fd_idx].kind != FdKind::Initramfs;
@@ -2813,8 +2887,104 @@ fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
 
         let got = bytes_read as usize;
         let scratch = async_scratch_local_va(info.scratch_slot) as *const u8;
+        let mut total_so_far = info.total_so_far as usize;
+
+        if info.cache_slot != 0xFF {
+            // Cached path: scratch -> backing (in-process), then walk
+            // chunks copying backing -> user.
+            let cache_idx = info.cache_slot as usize;
+            let chunk_idx = info.in_flight_chunk as usize;
+            let chunk_off = chunk_idx * CACHE_CHUNK_SIZE;
+            let backing_va = LIB_CACHE[cache_idx].backing_va;
+            let dst = (backing_va + chunk_off) as *mut u8;
+            // 8-byte stride for the bulk, then byte tail.
+            let words = got / 8;
+            let tail_start = words * 8;
+            let src_u64 = scratch as *const u64;
+            let dst_u64 = dst as *mut u64;
+            for i in 0..words {
+                core::ptr::write_volatile(
+                    dst_u64.add(i),
+                    core::ptr::read_volatile(src_u64.add(i)),
+                );
+            }
+            for i in tail_start..got {
+                core::ptr::write_volatile(
+                    dst.add(i),
+                    core::ptr::read_volatile(scratch.add(i)),
+                );
+            }
+            cache_chunk_mark(cache_idx, chunk_idx);
+
+            // Now walk cached chunks (including the just-marked one)
+            // forward through the request range.
+            match cache_process_cached_chunks(
+                cache_idx,
+                info.flags,
+                info.buf_len,
+                info.buf_va,
+                caller,
+                chunk_idx,
+                &mut total_so_far,
+            ) {
+                Ok(()) => {
+                    // All chunks in request range covered.
+                    async_free_slot(slot);
+                    free_async_scratch_slot(info.scratch_slot);
+                    if info.mmap_prot_flags & 0x80 != 0 {
+                        let kern_prot = info.mmap_prot_flags & 0x07;
+                        syscall::personality_mprotect(
+                            caller,
+                            info.buf_va,
+                            info.mmap_aligned_len as usize,
+                            kern_prot,
+                        );
+                    }
+                    let _ = syscall::personality_reply(caller, info.buf_va as u64);
+                    return;
+                }
+                Err(next_chunk) => {
+                    // More to fetch — fire next chunk on the same scratch slot.
+                    let irfs = get_initramfs_port();
+                    if irfs == 0 {
+                        async_free_slot(slot);
+                        free_async_scratch_slot(info.scratch_slot);
+                        let _ = syscall::personality_reply(caller, linux_err(EIO));
+                        return;
+                    }
+                    let file_size = LIB_CACHE[cache_idx].file_size;
+                    let next_off = (next_chunk * CACHE_CHUNK_SIZE) as u64;
+                    let next_len =
+                        CACHE_CHUNK_SIZE.min((file_size - next_off) as usize);
+                    let correlation = next_correlation_id();
+                    let d0 = (info.extra_handle & 0xFFFF_FFFF)
+                        | (((next_len as u64) & 0xFFFF_FFFF) << 32);
+                    let r = syscall::send_nb_4(
+                        irfs,
+                        IRFS_IO_READ_ASYNC,
+                        d0,
+                        next_off,
+                        async_scratch_remote_va(info.scratch_slot) as u64,
+                        correlation,
+                    );
+                    if r != 0 {
+                        async_free_slot(slot);
+                        free_async_scratch_slot(info.scratch_slot);
+                        let _ = syscall::personality_reply(caller, linux_err(EIO));
+                        return;
+                    }
+                    PENDING_ASYNC[slot].correlation = correlation;
+                    PENDING_ASYNC[slot].total_so_far = total_so_far as u32;
+                    PENDING_ASYNC[slot].in_flight_chunk = next_chunk as u8;
+                }
+            }
+            return;
+        }
+
+        // No-cache fallback: scratch -> user directly, then optionally
+        // fire next chunk for the remaining range.
         let src = core::slice::from_raw_parts(scratch, got);
-        let chunk_dst = info.buf_va + info.total_so_far as usize;
+        let chunk_dst = info.buf_va + total_so_far;
         let written = syscall::personality_copy_out(caller, chunk_dst, src);
         if written == 0 {
             async_free_slot(slot);
@@ -2822,11 +2992,8 @@ fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
             let _ = syscall::personality_reply(caller, linux_err(EFAULT));
             return;
         }
-        let new_total = info.total_so_far as usize + written;
-
-        if new_total >= info.buf_len {
-            // Final chunk.  Restore protection if we bumped it, then
-            // reply the mapped va to the caller.
+        total_so_far += written;
+        if total_so_far >= info.buf_len {
             async_free_slot(slot);
             free_async_scratch_slot(info.scratch_slot);
             if info.mmap_prot_flags & 0x80 != 0 {
@@ -2841,8 +3008,6 @@ fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
             let _ = syscall::personality_reply(caller, info.buf_va as u64);
             return;
         }
-
-        // More to fill — issue the next chunk on the same scratch slot.
         let irfs = get_initramfs_port();
         if irfs == 0 {
             async_free_slot(slot);
@@ -2850,11 +3015,12 @@ fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
             let _ = syscall::personality_reply(caller, linux_err(EIO));
             return;
         }
-        let remaining = info.buf_len - new_total;
-        let chunk = remaining.min(FS_ASYNC_SCRATCH_PAGES * 4096);
-        let next_off = info.flags + new_total as u64;
+        let remaining = info.buf_len - total_so_far;
+        let chunk = remaining.min(CACHE_CHUNK_SIZE);
+        let next_off = info.flags + total_so_far as u64;
         let correlation = next_correlation_id();
-        let d0 = (info.extra_handle & 0xFFFF_FFFF) | (((chunk as u64) & 0xFFFF_FFFF) << 32);
+        let d0 = (info.extra_handle & 0xFFFF_FFFF)
+            | (((chunk as u64) & 0xFFFF_FFFF) << 32);
         let r = syscall::send_nb_4(
             irfs,
             IRFS_IO_READ_ASYNC,
@@ -2870,7 +3036,7 @@ fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
             return;
         }
         PENDING_ASYNC[slot].correlation = correlation;
-        PENDING_ASYNC[slot].total_so_far = new_total as u32;
+        PENDING_ASYNC[slot].total_so_far = total_so_far as u32;
     }
 }
 
@@ -2928,20 +3094,79 @@ const LIB_CACHE_FILE_CAP: u64 = 16 * 1024 * 1024; // 16 MiB per file (bumped fro
                                                   // r29 saw SHORT-READ on a >4 MiB lib that
                                                   // got rejected from cache and fell to IPC)
 
+/// One cache slot per file we've started caching from initramfs.  The
+/// slot owns a backing region of `file_size` bytes that's filled
+/// chunk-by-chunk as a side effect of `handle_mmap`.  A `u64` bitmap
+/// tracks which chunks are valid; mmaps that hit fully-cached chunks
+/// avoid IPC entirely.  Each chunk is FS_ASYNC_SCRATCH_PAGES × 4 KiB
+/// (256 KiB by default), giving 64 chunks of coverage per slot —
+/// matches LIB_CACHE_FILE_CAP exactly (16 MiB / 256 KiB = 64).
 #[derive(Clone, Copy)]
 struct LibCacheSlot {
     in_use: bool,
     irfs_handle: u64,   // handle returned by IRFS_IO_CONNECT_OK
     file_size: u64,
-    backing_va: usize,  // anon-mapped region, file_size bytes valid
+    backing_va: usize,  // anon-mapped, file_size bytes (chunks 0..chunk_count valid where bit set)
+    /// Bit i set ⇒ chunk i (file bytes [i*CACHE_CHUNK_SIZE, (i+1)*CACHE_CHUNK_SIZE))
+    /// is present and valid in `backing_va`.
+    chunks_cached: u64,
+    /// ceil(file_size / CACHE_CHUNK_SIZE).  Always ≤ 64.
+    chunk_count: u8,
 }
 
+/// Bytes per cache chunk.  Matches the per-slot async scratch size so
+/// one IRFS_IO_READ_ASYNC reply maps exactly to one cache chunk.
+const CACHE_CHUNK_SIZE: usize = FS_ASYNC_SCRATCH_PAGES * 4096;
+
 static mut LIB_CACHE: [LibCacheSlot; LIB_CACHE_MAX] = [
-    LibCacheSlot { in_use: false, irfs_handle: 0, file_size: 0, backing_va: 0 };
+    LibCacheSlot {
+        in_use: false, irfs_handle: 0, file_size: 0, backing_va: 0,
+        chunks_cached: 0, chunk_count: 0,
+    };
     LIB_CACHE_MAX
 ];
 
+fn cache_chunk_count_for(file_size: u64) -> u8 {
+    let n = (file_size as usize + CACHE_CHUNK_SIZE - 1) / CACHE_CHUNK_SIZE;
+    n.min(64) as u8
+}
+
+fn cache_full_mask(chunk_count: u8) -> u64 {
+    if chunk_count >= 64 { u64::MAX } else { (1u64 << chunk_count) - 1 }
+}
+
+/// Returns the slot index iff *every* chunk of `handle` is cached.
+/// Used by handle_read and the handle_mmap full-hit fast path; both
+/// assume backing_va is fully valid for any read offset/length.
 fn lib_cache_lookup(handle: u64) -> Option<usize> {
+    unsafe {
+        for i in 0..LIB_CACHE_MAX {
+            if LIB_CACHE[i].in_use && LIB_CACHE[i].irfs_handle == handle {
+                let mask = cache_full_mask(LIB_CACHE[i].chunk_count);
+                if (LIB_CACHE[i].chunks_cached & mask) == mask {
+                    return Some(i);
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Find the slot already targeting `handle` (any cache state) or
+/// allocate a fresh one and claim its backing region.  Used by the
+/// handle_mmap fill path — mmap-fill writes each fetched chunk into
+/// the backing region, lighting up `chunks_cached` bit by bit so
+/// later mmaps (from any process) skip IPC for chunks that have
+/// already been fetched.
+///
+/// Returns None when the slot table is full, the file exceeds
+/// LIB_CACHE_FILE_CAP, or backing-region allocation fails.  Callers
+/// fall back to non-caching mmap-fill on None.
+fn lib_cache_lookup_or_alloc(handle: u64, file_size: u64) -> Option<usize> {
+    if file_size == 0 || file_size > LIB_CACHE_FILE_CAP {
+        return None;
+    }
     unsafe {
         for i in 0..LIB_CACHE_MAX {
             if LIB_CACHE[i].in_use && LIB_CACHE[i].irfs_handle == handle {
@@ -2949,24 +3174,6 @@ fn lib_cache_lookup(handle: u64) -> Option<usize> {
             }
         }
     }
-    None
-}
-
-/// Populate the cache for a freshly-opened initramfs handle.  Reads the
-/// full file content via the existing irfs_read_bulk path, copies it into
-/// a dedicated anon-mapped backing region, and registers the slot.  On
-/// any failure (out of slots, mmap_anon failure, short read mid-populate)
-/// silently aborts — the open still succeeds, just without a cache entry,
-/// and future reads/mmaps fall through to the normal IPC path.
-fn lib_cache_populate(handle: u64, file_size: u64) -> Option<usize> {
-    if file_size == 0 || file_size > LIB_CACHE_FILE_CAP {
-        return None;
-    }
-    let irfs_port = get_initramfs_port();
-    if irfs_port == 0 {
-        return None;
-    }
-    // Find empty slot.
     let slot_idx = unsafe {
         let mut found: Option<usize> = None;
         for i in 0..LIB_CACHE_MAX {
@@ -2977,60 +3184,86 @@ fn lib_cache_populate(handle: u64, file_size: u64) -> Option<usize> {
         }
         found?
     };
-    // Try the scratch grant *first* — if irfs_read_bulk would return None
-    // because initramfs_task isn't registered yet (preload runs at startup
-    // before initramfs_srv finishes registering), avoid allocating
-    // backing pages that we'd then leak.
-    ensure_fs_scratch_grants();
-    if unsafe { FS_SCRATCH_GRANTED_MASK & (1 << 4) == 0 } {
-        return None;
-    }
-    // Allocate backing pages.
     let ps = syscall::page_size();
     let pages = ((file_size as usize) + ps - 1) / ps;
     let va = match syscall::mmap_anon(0, pages, 1) {
         Some(v) => v,
-        None => {
-            return None;
-        }
+        None => return None,
     };
-    // Pre-fault each page.
     for i in 0..pages {
         unsafe { core::ptr::write_volatile((va + i * ps) as *mut u8, 0u8); }
     }
-    // Read full content via existing scratch+grant path.
-    let mut total: u64 = 0;
-    while total < file_size {
-        let want = (file_size - total) as usize;
-        let got = match irfs_read_bulk(irfs_port, handle, total, want) {
-            Some(g) if g > 0 => g,
-            _ => {
-                // Free the allocation so we don't leak under repeated
-                // failure (preload-time grant-not-yet-registered race).
-                syscall::munmap(va);
-                return None;
-            }
-        };
-        // Copy from scratch into backing region.
-        unsafe {
-            let src = LIN_PATH_SCRATCH_LOCAL as *const u8;
-            let dst = (va + total as usize) as *mut u8;
-            for i in 0..got {
-                core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
-            }
-        }
-        total += got as u64;
-    }
-    // Register the slot.
+    let chunk_count = cache_chunk_count_for(file_size);
     unsafe {
         LIB_CACHE[slot_idx] = LibCacheSlot {
             in_use: true,
             irfs_handle: handle,
             file_size,
             backing_va: va,
+            chunks_cached: 0,
+            chunk_count,
         };
     }
     Some(slot_idx)
+}
+
+fn cache_chunk_is_cached(cache_idx: usize, chunk_idx: usize) -> bool {
+    if chunk_idx >= 64 { return false; }
+    unsafe { LIB_CACHE[cache_idx].chunks_cached & (1u64 << chunk_idx) != 0 }
+}
+
+fn cache_chunk_mark(cache_idx: usize, chunk_idx: usize) {
+    if chunk_idx >= 64 { return; }
+    unsafe { LIB_CACHE[cache_idx].chunks_cached |= 1u64 << chunk_idx; }
+}
+
+/// Walk chunks in `[start_chunk..=last_chunk]` of the mmap request:
+/// for each cached chunk, copy its overlap with [file_offset,
+/// file_offset+to_read) from `backing_va` into the caller's mapping;
+/// for the first uncached chunk encountered, return `Err(chunk)` so
+/// the caller can fetch it.  Updates `*total_so_far` with bytes copied.
+fn cache_process_cached_chunks(
+    cache_idx: usize,
+    file_offset: u64,
+    to_read: usize,
+    mapped_va: usize,
+    caller_port: u64,
+    start_chunk: usize,
+    total_so_far: &mut usize,
+) -> Result<(), usize> {
+    let (file_size, backing_va) = unsafe {
+        (LIB_CACHE[cache_idx].file_size, LIB_CACHE[cache_idx].backing_va)
+    };
+    if to_read == 0 { return Ok(()); }
+    let last_chunk =
+        ((file_offset + to_read as u64 - 1) / CACHE_CHUNK_SIZE as u64) as usize;
+    let req_end = file_offset + to_read as u64;
+    let mut chunk = start_chunk;
+    while chunk <= last_chunk {
+        if !cache_chunk_is_cached(cache_idx, chunk) {
+            return Err(chunk);
+        }
+        let chunk_off = (chunk * CACHE_CHUNK_SIZE) as u64;
+        if chunk_off >= file_size {
+            return Ok(());
+        }
+        let chunk_data_len = CACHE_CHUNK_SIZE.min((file_size - chunk_off) as usize);
+        let chunk_end = chunk_off + chunk_data_len as u64;
+        let overlap_start = file_offset.max(chunk_off);
+        let overlap_end = req_end.min(chunk_end);
+        if overlap_end > overlap_start {
+            let overlap_len = (overlap_end - overlap_start) as usize;
+            let user_dst = mapped_va + (overlap_start - file_offset) as usize;
+            let backing_src = backing_va + overlap_start as usize;
+            let src = unsafe {
+                core::slice::from_raw_parts(backing_src as *const u8, overlap_len)
+            };
+            syscall::personality_copy_out(caller_port, user_dst, src);
+            *total_so_far += overlap_len;
+        }
+        chunk += 1;
+    }
+    Ok(())
 }
 
 /// Read up to one page (4096 bytes max) from a file into the local scratch
@@ -3159,14 +3392,10 @@ fn try_open_initramfs(path: &[u8]) -> Option<(u64, u64)> {
         // d0 = handle, d1 = size, d2 = server_aspace_id.
         let handle = resp.data[0];
         let size = resp.data[1];
-        // Eagerly populate the content cache on first open of this handle
-        // (lib_cache_lookup miss).  Subsequent opens of the same lib by
-        // different processes skip initramfs_srv entirely on read/mmap.
-        // Silent fail on populate is acceptable — caller still has a
-        // valid handle and can fall through to the normal IPC path.
-        if lib_cache_lookup(handle).is_none() {
-            let _ = lib_cache_populate(handle, size);
-        }
+        // Cache is now populated as a side effect of handle_mmap fetching
+        // chunks (option-2 design): no separate populate at open() time,
+        // so open() returns immediately.  See lib_cache_lookup_or_alloc
+        // and try_irfs_read_mmap.
         Some((handle, size))
     } else {
         None
@@ -5678,15 +5907,19 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                 else { (file_size - file_offset) as usize };
                     let to_read = len.min(avail);
                     if to_read > 0 {
-                        // Async fast path: dispatch the fill to initramfs_srv
-                        // via IRFS_IO_READ_ASYNC and let linux_srv's main
-                        // thread serve other Linux clients while the file
-                        // bytes flow back chunk-by-chunk.  finish_irfs_read_mmap
-                        // copies each chunk into the mapping and replies the
-                        // mapped va when the whole region is filled.  Falls
-                        // through to the sync loop on any precondition miss
-                        // (registration not done, no scratch slot free, etc.).
-                        if try_irfs_read_mmap(
+                        // Cache-aware async fill: try to attach this mmap
+                        // to a LIB_CACHE slot for `handle` (allocate one if
+                        // we have room).  Each chunk fetched from
+                        // initramfs_srv is mirrored into the slot's
+                        // backing region, so subsequent mmaps of the same
+                        // file from any process serve cached chunks
+                        // without IPC.  cache_slot=0xFF disables caching
+                        // (slot table full or file too big); the function
+                        // still works without it but doesn't populate.
+                        let cs = lib_cache_lookup_or_alloc(handle, file_size)
+                            .map(|i| i as u8)
+                            .unwrap_or(0xFF);
+                        match try_irfs_read_mmap(
                             pi,
                             caller_port,
                             fd_idx,
@@ -5697,9 +5930,22 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                             aligned_len,
                             kern_prot as u8,
                             need_bump,
+                            cs,
                         ) {
-                            unsafe { REPLY_DEFERRED = true; }
-                            return 0; // ignored — REPLY_DEFERRED suppresses reply
+                            MmapFillResult::Sync => {
+                                if need_bump {
+                                    syscall::personality_mprotect(
+                                        caller_port, va, aligned_len, kern_prot as u8);
+                                }
+                                return va as u64;
+                            }
+                            MmapFillResult::Deferred => {
+                                unsafe { REPLY_DEFERRED = true; }
+                                return 0; // REPLY_DEFERRED suppresses reply
+                            }
+                            MmapFillResult::Failed => {
+                                // fall through to sync irfs_read_bulk loop
+                            }
                         }
                         let mut total = 0usize;
                         ensure_fs_scratch_grants();
@@ -8341,6 +8587,8 @@ fn read_socket(caller_port: u64, srv_port: u64, handle: u64, domain: u8, buf_va:
                 mmap_prot_flags: 0,
                 mmap_aligned_len: 0,
                 extra_handle: 0,
+                cache_slot: 0xFF,
+                in_flight_chunk: 0,
             };
         }
         let rp = unsafe { BACKEND_REPLY_PORT };
@@ -8886,6 +9134,8 @@ fn handle_accept_inner(pi: usize, caller_port: u64, args: &[u64; 6], flags: u64)
                 mmap_prot_flags: 0,
                 mmap_aligned_len: 0,
                 extra_handle: 0,
+                cache_slot: 0xFF,
+                in_flight_chunk: 0,
             };
             let uds_port = PROC_TABLE[pi].fds[fd].fs_port;
             let handle   = PROC_TABLE[pi].fds[fd].handle;
