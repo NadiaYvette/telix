@@ -5394,7 +5394,17 @@ pub fn wake_parked_thread(tid: ThreadId) {
 /// CALL_REPLY_TIMEOUT_NS.  Uses the same abandon_for_interrupt CAS as the
 /// signal-interrupt path to safely coordinate with concurrent server replies.
 /// Called periodically from tick() on CPU 0 (~every 1 second).
-const CALL_REPLY_TIMEOUT_NS: u64 = 10_000_000_000; // 10 seconds
+///
+/// 30s (was 10s) — under heavy lib-load contention (e.g. concurrent
+/// xeyes + Xwayland forks each opening 50+ shared libraries through
+/// initramfs_srv) a single grant-based read can take >10s of wall-clock
+/// while waiting in linux_srv's IPC queue.  The 10s timeout would fire
+/// SERVER_DIED on a perfectly healthy chain, causing linux_srv's
+/// mmap-fill loop to surface the partial fill as EIO ("file too short"
+/// / "failed to map segment from shared object") and Xwayland to bail.
+/// 30s is generous enough to ride out boot-time queue spikes without
+/// papering over an actual server hang.
+const CALL_REPLY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 seconds
 
 #[cold]
 #[inline(never)]
