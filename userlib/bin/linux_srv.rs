@@ -744,6 +744,14 @@ enum PendingAsyncKind {
     /// Blocking recv/recvfrom on an AF_UNIX socket; completed by
     /// UDS_RECV_REPLY.
     RecvUnix,
+    /// Single-chunk read of FdKind::Initramfs via IRFS_IO_READ_ASYNC;
+    /// completed by IRFS_IO_READ_REPLY.  Reuses fields:
+    ///   listen_fd → fd index in PROC_TABLE[pi].fds (for offset write-back)
+    ///   buf_va    → caller's user-space dst buffer
+    ///   buf_len   → max bytes to copy out
+    ///   flags     → caller's offset within the file (used to confirm we
+    ///               read what they asked for and for fd offset update)
+    IrfsReadFd,
 }
 
 #[derive(Copy, Clone)]
@@ -758,10 +766,15 @@ struct PendingAsync {
     /// (RecvUnix: for validation on completion).
     listen_fd: usize,
     /// accept4 flags (SOCK_CLOEXEC / SOCK_NONBLOCK) — AcceptUnix only.
+    /// IrfsReadFd: file offset at which the read was issued (for fd
+    /// offset write-back semantics).
     flags: u64,
     /// Destination buffer VA in the caller's aspace — RecvUnix only.
+    /// Also IrfsReadFd: where to copy the bytes the irfs server wrote
+    /// into our scratch.
     buf_va: usize,
     /// Destination buffer capacity — RecvUnix only.
+    /// Also IrfsReadFd: max bytes to copy out (== request length).
     buf_len: usize,
 }
 
@@ -1736,6 +1749,18 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             }
             return 0; // EOF
         }
+        // Async fast path: if the request fits in one scratch buffer and
+        // no other async IRFS read is in flight, dispatch async so
+        // linux_srv's main thread can serve other Linux clients while
+        // initramfs_srv processes this read.  Suppresses
+        // personality_reply via REPLY_DEFERRED; finish_irfs_read_fd
+        // completes the syscall when IRFS_IO_READ_REPLY arrives.
+        if want > 0 && want <= FS_SCRATCH_PAGES * 4096 {
+            if try_irfs_read_async(pi, caller_port, fd, handle, offset, want, buf_va).is_some() {
+                unsafe { REPLY_DEFERRED = true; }
+                return 0;
+            }
+        }
         while total < want {
             let req = want - total;
             let got = match irfs_read_bulk(fs_port, handle, offset + total as u64, req) {
@@ -2426,6 +2451,124 @@ fn irfs_read_bulk(irfs_port: u64, handle: u64, offset: u64, max_len: usize) -> O
     Some(bytes_read)
 }
 
+/// Try to fire an IRFS_IO_READ_ASYNC.  Returns Some(slot_idx) on success;
+/// caller must set REPLY_DEFERRED and is responsible for whatever the
+/// continuation does on completion (via finish_irfs_read_fd).  Returns
+/// None if any preconditions fail — caller should fall back to the sync
+/// `irfs_read_bulk` path in that case.
+///
+/// Preconditions: registration done, scratch grant up, no other async
+/// IRFS read currently in flight (we serialize so the single
+/// `LIN_FS_SCRATCH_VA` doesn't get overwritten before the continuation
+/// reads it), an async slot is free, and `length` fits in a single
+/// scratch buffer (FS_SCRATCH_PAGES × 4 KiB).
+fn try_irfs_read_async(
+    pi: usize,
+    caller_port: u64,
+    fd_idx: usize,
+    handle: u64,
+    offset: u64,
+    length: usize,
+    user_buf_va: usize,
+) -> Option<usize> {
+    unsafe {
+        if !IRFS_ASYNC_REGISTERED || IRFS_IN_FLIGHT {
+            return None;
+        }
+        ensure_fs_scratch_grants();
+        if FS_SCRATCH_GRANTED_MASK & (1 << 4) == 0 {
+            return None;
+        }
+        if length == 0 || length > FS_SCRATCH_PAGES * 4096 {
+            return None;
+        }
+        let irfs = get_initramfs_port();
+        if irfs == 0 {
+            return None;
+        }
+        let slot = match async_alloc_slot() {
+            Some(s) => s,
+            None => return None,
+        };
+        let correlation = next_correlation_id();
+        PENDING_ASYNC[slot] = PendingAsync {
+            kind: PendingAsyncKind::IrfsReadFd,
+            correlation,
+            pi,
+            caller_task_port: caller_port,
+            listen_fd: fd_idx,
+            flags: offset,
+            buf_va: user_buf_va,
+            buf_len: length,
+        };
+        // Pack args per the IRFS_IO_READ_ASYNC contract:
+        //   d0 = handle (low 32) | length (high 32)
+        //   d1 = offset
+        //   d2 = grant_va
+        //   d3 = correlation
+        let d0 = (handle & 0xFFFF_FFFF) | (((length as u64) & 0xFFFF_FFFF) << 32);
+        let r = syscall::send_nb_4(
+            irfs,
+            IRFS_IO_READ_ASYNC,
+            d0,
+            offset,
+            LIN_FS_SCRATCH_VA as u64,
+            correlation,
+        );
+        if r != 0 {
+            // send failed (queue full, port dead, etc.) — undo and let
+            // caller fall back to sync.
+            async_free_slot(slot);
+            return None;
+        }
+        IRFS_IN_FLIGHT = true;
+        Some(slot)
+    }
+}
+
+/// Continuation for a `IrfsReadFd` async read.  Fires when initramfs_srv
+/// posts IRFS_IO_READ_REPLY(correlation, bytes_read).  Copies the bytes
+/// from our scratch into the caller's buffer, updates fd offset, and
+/// completes the deferred Linux read syscall.
+fn finish_irfs_read_fd(slot: usize, bytes_read: u64) {
+    unsafe {
+        let info = PENDING_ASYNC[slot];
+        async_free_slot(slot);
+        IRFS_IN_FLIGHT = false;
+
+        let caller = info.caller_task_port;
+        let pi = info.pi;
+        let fd_idx = info.listen_fd;
+        let len = (bytes_read as usize).min(info.buf_len);
+
+        // Validate fd is still alive — caller process may have closed it
+        // or exited mid-flight.  Also surface SHORT-READ as EIO so the
+        // caller doesn't see a silent partial fill (matches sync path
+        // semantics).
+        if fd_idx >= MAX_FDS
+            || !PROC_TABLE[pi].fds[fd_idx].in_use
+            || PROC_TABLE[pi].fds[fd_idx].kind != FdKind::Initramfs
+        {
+            let _ = syscall::personality_reply(caller, linux_err(EBADF));
+            return;
+        }
+        if len == 0 {
+            let _ = syscall::personality_reply(caller, linux_err(EIO));
+            return;
+        }
+        // Copy from scratch to caller's user-space buffer.
+        let scratch = LIN_PATH_SCRATCH_LOCAL as *const u8;
+        let src = core::slice::from_raw_parts(scratch, len);
+        let written = syscall::personality_copy_out(caller, info.buf_va, src);
+        if written == 0 {
+            let _ = syscall::personality_reply(caller, linux_err(EFAULT));
+            return;
+        }
+        PROC_TABLE[pi].fds[fd_idx].offset += written as u64;
+        let _ = syscall::personality_reply(caller, written as u64);
+    }
+}
+
 /// initramfs file content cache.  Once a file has been read fully into a
 /// dedicated anon-mapped backing region in linux_srv's aspace, all future
 /// reads/mmaps for the same handle serve from local memory — no IPC, no
@@ -2577,8 +2720,23 @@ static mut INITRAMFS_PORT: u64 = 0;
 /// the main IPC loop once initramfs_srv is reachable.
 static mut IRFS_ASYNC_REGISTERED: bool = false;
 
+/// True while exactly one IRFS_IO_READ_ASYNC is outstanding waiting
+/// for IRFS_IO_READ_REPLY.  Serializes async IRFS reads so the single
+/// `LIN_FS_SCRATCH_VA` doesn't get stomped by overlapping replies.
+/// Other Linux syscalls (open, write, socket, mmap of memfd, …) still
+/// run in parallel because linux_srv's main thread isn't blocked
+/// waiting for the reply — the whole point of this design.
+///
+/// When set, callers that would issue an async IRFS read fall back to
+/// the synchronous path (which blocks linux_srv's thread for the
+/// duration of one read).  This is OK for bringup; a future revision
+/// could queue the request behind the in-flight one instead.
+static mut IRFS_IN_FLIGHT: bool = false;
+
 /// IRFS protocol tag for the registration call (matches initramfs_srv).
 const IRFS_IO_SET_ASYNC_REPLY_PORT: u64 = 0x204;
+const IRFS_IO_READ_ASYNC: u64 = 0x202;
+const IRFS_IO_READ_REPLY: u64 = 0x203;
 
 fn get_initramfs_port() -> u64 {
     unsafe {
@@ -8526,6 +8684,30 @@ fn handle_async_reply(msg: &syscall::Message) -> bool {
             match kind {
                 PendingAsyncKind::RecvUnix => finish_recv_unix(slot, b0, len_raw, b1),
                 _ => async_free_slot(slot),
+            }
+            true
+        }
+        IRFS_IO_READ_REPLY => {
+            // data[0] = correlation, data[1] = bytes_read.
+            let correlation = msg.data[0];
+            let bytes_read = msg.data[1];
+            let slot = match async_find_by_correlation(correlation) {
+                Some(s) => s,
+                None => {
+                    // Stale reply (caller likely exited and reaper freed
+                    // the slot).  Clear the in-flight flag so we don't
+                    // permanently lock out async reads, then drop.
+                    unsafe { IRFS_IN_FLIGHT = false; }
+                    return false;
+                }
+            };
+            let kind = unsafe { PENDING_ASYNC[slot].kind };
+            match kind {
+                PendingAsyncKind::IrfsReadFd => finish_irfs_read_fd(slot, bytes_read),
+                _ => {
+                    async_free_slot(slot);
+                    unsafe { IRFS_IN_FLIGHT = false; }
+                }
             }
             true
         }
