@@ -8853,13 +8853,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         static PATH: &[u8] = b"/Xwayland\0";
                         static A0: &[u8]   = b"Xwayland\0";
                         static A1: &[u8]   = b"-terminate\0";
-                        // -verbose 0: silence Xwayland's startup chatter.
-                        // Each fprintf goes through linux_srv's write path
-                        // (one IPC per call) and serial-prints synchronously
-                        // — at -verbose 3 that's hundreds of round trips
-                        // during lib load, glamor probe, and wayland init.
+                        // -verbose 1: surface Xwayland's startup messages
+                        // so we can see WHERE it's exiting now that lib
+                        // loading is reliable (preload landed in 4310112).
+                        // r32 saw xw_exit=1 (not 127), meaning Xwayland
+                        // ran user code but bailed before binding X0.
+                        // Each fprintf does cost a linux_srv write IPC,
+                        // but only -verbose 0→1 (a few dozen lines)
+                        // rather than the hundreds at -verbose 3.
                         static A2: &[u8]   = b"-verbose\0";
-                        static A3: &[u8]   = b"0\0";
+                        static A3: &[u8]   = b"3\0";
                         static E0: &[u8]   = b"LD_LIBRARY_PATH=/lib64\0";
                         static E1: &[u8]   = b"WAYLAND_DISPLAY=wayland-0\0";
                         static E2: &[u8]   = b"XDG_RUNTIME_DIR=/run/user/0\0";

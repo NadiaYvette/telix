@@ -894,6 +894,13 @@ struct MemFdSlot {
     size: usize,        // logical file size
     seals: u32,         // active seal bits (F_SEAL_*)
     allow_sealing: bool, // MFD_ALLOW_SEALING was set at creation
+    is_x_lock: bool,    // backs an /tmp/.[t]X*-lock file — uses inline_buf
+    inline_buf: [u8; 32], // small inline storage for is_x_lock files (PID
+                          // strings are 11 bytes); avoids mmap_anon under
+                          // memory pressure late in xeyes+Xwayland lib-load
+                          // contention, which was returning None and
+                          // making xtrans's LockServer print
+                          // "Could not write pid to lock file"
     /// Number of fd-table entries referencing this slot.  Incremented on
     /// creation, dup, and SCM_RIGHTS delivery; decremented on close.  The
     /// backing memory is released (and the slot marked inactive) only when
@@ -907,7 +914,8 @@ impl MemFdSlot {
     const fn empty() -> Self {
         Self {
             active: false, va: 0, capacity: 0, size: 0,
-            seals: 0, allow_sealing: false, refcount: 0,
+            seals: 0, allow_sealing: false, is_x_lock: false,
+            inline_buf: [0; 32], refcount: 0,
         }
     }
 }
@@ -1303,9 +1311,53 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         if PROC_TABLE[pi].fds[fd_idx].kind == FdKind::MemFd {
             let idx = PROC_TABLE[pi].fds[fd_idx].handle as usize;
             if idx >= MAX_MEMFD_INSTANCES || !MEMFD_TABLE[idx].active {
+                if idx < MAX_MEMFD_INSTANCES && MEMFD_TABLE[idx].is_x_lock {
+                    syscall::debug_puts(b"[linux_srv X-LOCK] write EBADF (slot inactive)\n");
+                }
                 return linux_err(EBADF);
             }
+            let is_x = MEMFD_TABLE[idx].is_x_lock;
             let off = PROC_TABLE[pi].fds[fd_idx].offset as usize;
+            // Lock files use inline storage to avoid mmap_anon under memory
+            // pressure (xtrans's LockServer writes 11-byte "%10d\n" PID).
+            if is_x {
+                let cap = MEMFD_TABLE[idx].inline_buf.len();
+                let writable = if off >= cap { 0 } else { (cap - off).min(count) };
+                let mut total = 0usize;
+                while total < writable {
+                    let chunk = (writable - total).min(32);
+                    let mut tmp = [0u8; 32];
+                    let copied = syscall::personality_copy_in(caller_port, buf_va + total, &mut tmp[..chunk]);
+                    if copied == 0 { break; }
+                    for j in 0..copied {
+                        MEMFD_TABLE[idx].inline_buf[off + total + j] = tmp[j];
+                    }
+                    total += copied;
+                }
+                let new_end = off + total;
+                if new_end > MEMFD_TABLE[idx].size {
+                    MEMFD_TABLE[idx].size = new_end;
+                    PROC_TABLE[pi].fds[fd_idx].file_size = new_end as u64;
+                }
+                PROC_TABLE[pi].fds[fd_idx].offset = new_end as u64;
+                syscall::debug_puts(b"[linux_srv X-LOCK] write OK (inline) fd=");
+                let mut b = [0u8; 12]; let mut v = fd as u32; let mut k = 12;
+                if v == 0 { k -= 1; b[k] = b'0'; }
+                while v > 0 && k > 0 { k -= 1; b[k] = b'0' + (v % 10) as u8; v /= 10; }
+                syscall::debug_puts(&b[k..12]);
+                syscall::debug_puts(b" count=");
+                let mut b = [0u8; 12]; let mut v = count as u32; let mut k = 12;
+                if v == 0 { k -= 1; b[k] = b'0'; }
+                while v > 0 && k > 0 { k -= 1; b[k] = b'0' + (v % 10) as u8; v /= 10; }
+                syscall::debug_puts(&b[k..12]);
+                syscall::debug_puts(b" total=");
+                let mut b = [0u8; 12]; let mut v = total as u32; let mut k = 12;
+                if v == 0 { k -= 1; b[k] = b'0'; }
+                while v > 0 && k > 0 { k -= 1; b[k] = b'0' + (v % 10) as u8; v /= 10; }
+                syscall::debug_puts(&b[k..12]);
+                syscall::debug_puts(b"\n");
+                return total as u64;
+            }
             let needed = off + count;
             // Grow backing memory if needed.
             if needed > MEMFD_TABLE[idx].capacity {
@@ -1324,7 +1376,12 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                         MEMFD_TABLE[idx].va = new_va;
                         MEMFD_TABLE[idx].capacity = new_cap;
                     }
-                    None => return linux_err(ENOMEM),
+                    None => {
+                        if is_x {
+                            syscall::debug_puts(b"[linux_srv X-LOCK] write ENOMEM (mmap_anon failed)\n");
+                        }
+                        return linux_err(ENOMEM);
+                    }
                 }
             }
             // Copy from caller to our buffer.
@@ -1343,6 +1400,31 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                 PROC_TABLE[pi].fds[fd_idx].file_size = new_end as u64;
             }
             PROC_TABLE[pi].fds[fd_idx].offset = new_end as u64;
+            if is_x {
+                syscall::debug_puts(b"[linux_srv X-LOCK] write fd=");
+                let mut b = [0u8; 12]; let mut v = fd as u32; let mut k = 12;
+                if v == 0 { k -= 1; b[k] = b'0'; }
+                while v > 0 && k > 0 { k -= 1; b[k] = b'0' + (v % 10) as u8; v /= 10; }
+                syscall::debug_puts(&b[k..12]);
+                syscall::debug_puts(b" count=");
+                let mut b = [0u8; 12]; let mut v = count as u32; let mut k = 12;
+                if v == 0 { k -= 1; b[k] = b'0'; }
+                while v > 0 && k > 0 { k -= 1; b[k] = b'0' + (v % 10) as u8; v /= 10; }
+                syscall::debug_puts(&b[k..12]);
+                syscall::debug_puts(b" total=");
+                let mut b = [0u8; 12]; let mut v = total as u32; let mut k = 12;
+                if v == 0 { k -= 1; b[k] = b'0'; }
+                while v > 0 && k > 0 { k -= 1; b[k] = b'0' + (v % 10) as u8; v /= 10; }
+                syscall::debug_puts(&b[k..12]);
+                if total > 0 && total <= 32 {
+                    syscall::debug_puts(b" bytes=[");
+                    let p = (base + off) as *const u8;
+                    let s = core::slice::from_raw_parts(p, total);
+                    syscall::debug_puts(s);
+                    syscall::debug_puts(b"]");
+                }
+                syscall::debug_puts(b"\n");
+            }
             return total as u64;
         }
         // Virtual device writes — all discard data, report success.
@@ -1502,7 +1584,23 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             }
             let avail = sz - offset as usize;
             let want = count.min(avail);
-            if MEMFD_TABLE[idx].va == 0 || want == 0 {
+            if want == 0 {
+                return 0;
+            }
+            // X-lock files are stored in the slot's inline_buf, not via mmap.
+            if MEMFD_TABLE[idx].is_x_lock {
+                let off = offset as usize;
+                let cap = MEMFD_TABLE[idx].inline_buf.len();
+                let end = (off + want).min(cap);
+                if end <= off {
+                    return 0;
+                }
+                let src = &MEMFD_TABLE[idx].inline_buf[off..end];
+                let written = syscall::personality_copy_out(caller_port, buf_va, src);
+                PROC_TABLE[pi].fds[fd].offset += written as u64;
+                return written as u64;
+            }
+            if MEMFD_TABLE[idx].va == 0 {
                 return 0;
             }
             // Copy from our buffer to caller's address space in chunks.
@@ -2213,11 +2311,16 @@ fn ensure_fs_scratch_grants() {
             if FS_SCRATCH_GRANT_TRIED & bit != 0 {
                 continue;
             }
-            FS_SCRATCH_GRANT_TRIED |= bit;
             let fs_task = syscall::ns_lookup(*name).unwrap_or(0);
             if fs_task == 0 {
+                // Server not registered yet — leave TRIED unset so we
+                // retry on the next call.  Setting it eagerly meant
+                // preload-time lookups (which happen before initramfs_srv
+                // finishes registering its `_task` alias) permanently
+                // disabled the grant for the rest of the boot.
                 continue;
             }
+            FS_SCRATCH_GRANT_TRIED |= bit;
             if syscall::grant_pages(
                 fs_task,
                 LIN_PATH_SCRATCH_LOCAL,
@@ -2329,7 +2432,7 @@ fn irfs_read_bulk(irfs_port: u64, handle: u64, offset: u64, max_len: usize) -> O
 /// initramfs_srv contention, no SHORT-READ surface.  This is the mechanism
 /// that breaks the CALL-TIMEOUT cascade for repeated lib opens (libc.so.6,
 /// libpixman, libXdmcp etc. each get re-opened by every fork+exec).
-const LIB_CACHE_MAX: usize = 32;
+const LIB_CACHE_MAX: usize = 64;
 const LIB_CACHE_FILE_CAP: u64 = 16 * 1024 * 1024; // 16 MiB per file (bumped from 4 MiB after
                                                   // r29 saw SHORT-READ on a >4 MiB lib that
                                                   // got rejected from cache and fell to IPC)
@@ -2383,25 +2486,37 @@ fn lib_cache_populate(handle: u64, file_size: u64) -> Option<usize> {
         }
         found?
     };
+    // Try the scratch grant *first* — if irfs_read_bulk would return None
+    // because initramfs_task isn't registered yet (preload runs at startup
+    // before initramfs_srv finishes registering), avoid allocating
+    // backing pages that we'd then leak.
+    ensure_fs_scratch_grants();
+    if unsafe { FS_SCRATCH_GRANTED_MASK & (1 << 4) == 0 } {
+        return None;
+    }
     // Allocate backing pages.
     let ps = syscall::page_size();
     let pages = ((file_size as usize) + ps - 1) / ps;
-    let va = syscall::mmap_anon(0, pages, 1)?;
+    let va = match syscall::mmap_anon(0, pages, 1) {
+        Some(v) => v,
+        None => {
+            return None;
+        }
+    };
     // Pre-fault each page.
     for i in 0..pages {
         unsafe { core::ptr::write_volatile((va + i * ps) as *mut u8, 0u8); }
     }
     // Read full content via existing scratch+grant path.
-    ensure_fs_scratch_grants();
     let mut total: u64 = 0;
     while total < file_size {
         let want = (file_size - total) as usize;
         let got = match irfs_read_bulk(irfs_port, handle, total, want) {
             Some(g) if g > 0 => g,
             _ => {
-                // Short read mid-populate.  Silent fail: don't claim a
-                // partial cache.  The leaked anon pages are released
-                // when the linux_srv process exits.
+                // Free the allocation so we don't leak under repeated
+                // failure (preload-time grant-not-yet-registered race).
+                syscall::munmap(va);
                 return None;
             }
         };
@@ -2893,15 +3008,26 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
         };
         let slot_idx = match slot_idx {
             Some(i) => i,
-            None => return linux_err(EMFILE),
+            None => {
+                syscall::debug_puts(b"[linux_srv X-LOCK] open EMFILE (no memfd slots) path=");
+                syscall::debug_puts(&path[..pathlen]);
+                syscall::debug_puts(b"\n");
+                return linux_err(EMFILE);
+            }
         };
         let fd = match alloc_fd(pi) {
             Some(f) => f,
-            None => return linux_err(EMFILE),
+            None => {
+                syscall::debug_puts(b"[linux_srv X-LOCK] open EMFILE (no fd slot) path=");
+                syscall::debug_puts(&path[..pathlen]);
+                syscall::debug_puts(b"\n");
+                return linux_err(EMFILE);
+            }
         };
         unsafe {
             MEMFD_TABLE[slot_idx] = MemFdSlot::empty();
             MEMFD_TABLE[slot_idx].active = true;
+            MEMFD_TABLE[slot_idx].is_x_lock = true;
             MEMFD_TABLE[slot_idx].refcount = 1;
 
             PROC_TABLE[pi].fds[fd] = FdEntry::empty();
@@ -2914,6 +3040,23 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
                 PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
             }
         }
+        syscall::debug_puts(b"[linux_srv X-LOCK] open OK fd=");
+        {
+            let mut b = [0u8; 12]; let mut v = fd as u32; let mut k = 12;
+            if v == 0 { k -= 1; b[k] = b'0'; }
+            while v > 0 && k > 0 { k -= 1; b[k] = b'0' + (v % 10) as u8; v /= 10; }
+            syscall::debug_puts(&b[k..12]);
+        }
+        syscall::debug_puts(b" slot=");
+        {
+            let mut b = [0u8; 12]; let mut v = slot_idx as u32; let mut k = 12;
+            if v == 0 { k -= 1; b[k] = b'0'; }
+            while v > 0 && k > 0 { k -= 1; b[k] = b'0' + (v % 10) as u8; v /= 10; }
+            syscall::debug_puts(&b[k..12]);
+        }
+        syscall::debug_puts(b" path=");
+        syscall::debug_puts(&path[..pathlen]);
+        syscall::debug_puts(b"\n");
         return fd as u64;
     }
 
@@ -3398,6 +3541,24 @@ fn do_close(pi: usize, fd: usize) {
             FdKind::MemFd => {
                 let idx = PROC_TABLE[pi].fds[fd].handle as usize;
                 if idx < MAX_MEMFD_INSTANCES && MEMFD_TABLE[idx].active {
+                    if MEMFD_TABLE[idx].is_x_lock {
+                        syscall::debug_puts(b"[linux_srv X-LOCK] close fd=");
+                        let mut b = [0u8; 12]; let mut v = fd as u32; let mut k = 12;
+                        if v == 0 { k -= 1; b[k] = b'0'; }
+                        while v > 0 && k > 0 { k -= 1; b[k] = b'0' + (v % 10) as u8; v /= 10; }
+                        syscall::debug_puts(&b[k..12]);
+                        syscall::debug_puts(b" size=");
+                        let mut b = [0u8; 12]; let mut v = MEMFD_TABLE[idx].size as u32; let mut k = 12;
+                        if v == 0 { k -= 1; b[k] = b'0'; }
+                        while v > 0 && k > 0 { k -= 1; b[k] = b'0' + (v % 10) as u8; v /= 10; }
+                        syscall::debug_puts(&b[k..12]);
+                        syscall::debug_puts(b" refcount=");
+                        let mut b = [0u8; 12]; let mut v = MEMFD_TABLE[idx].refcount; let mut k = 12;
+                        if v == 0 { k -= 1; b[k] = b'0'; }
+                        while v > 0 && k > 0 { k -= 1; b[k] = b'0' + (v % 10) as u8; v /= 10; }
+                        syscall::debug_puts(&b[k..12]);
+                        syscall::debug_puts(b"\n");
+                    }
                     if MEMFD_TABLE[idx].refcount > 0 {
                         MEMFD_TABLE[idx].refcount -= 1;
                     }
@@ -9967,7 +10128,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // populates the cache, eliminating the contention-induced SHORT-READ
     // pattern that kills Xwayland on lucky/unlucky boots (r28-r31).
     // Silent on miss — any lib not in initramfs is just skipped.
-    let preload_libs: [&[u8]; 22] = [
+    let preload_libs: &[&[u8]] = &[
+        // Original 22 — Xwayland core deps.
         b"lib64/libc.so.6",
         b"lib64/libm.so.6",
         b"lib64/libpixman-1.so.0",
@@ -9990,16 +10152,56 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         b"lib64/libEGL.so.1",
         b"lib64/libXext.so.6",
         b"lib64/libXfont2.so.2",
+        // r39 SHORT-READ surfaced libcrypto (5.6 MB) racing with concurrent
+        // Xwayland+xeyes lib loads.  Add all remaining libs Xwayland and
+        // xeyes pull in so concurrent IO_CONNECT/read/mmap traffic on
+        // them stays in-cache and avoids initramfs_srv CALL-TIMEOUT.
+        b"lib64/libcrypto.so.3",
+        b"lib64/libGLdispatch.so.0",
+        b"lib64/libgssapi_krb5.so.2",
+        b"lib64/libpcre2-8.so.0",
+        b"lib64/libpng16.so.16",
+        b"lib64/libgcc_s.so.1",
+        b"lib64/libei.so.1",
+        b"lib64/libICE.so.6",
+        b"lib64/libSM.so.6",
+        b"lib64/libtirpc.so.3",
+        b"lib64/libselinux.so.1",
+        b"lib64/libaudit.so.1",
+        b"lib64/libexpat.so.1",
+        b"lib64/libuuid.so.1",
+        b"lib64/liboeffis.so.1",
+        b"lib64/libdecor-0.so.0",
+        b"lib64/libgbm.so.1",
+        b"lib64/libbz2.so.1",
+        b"lib64/libcap.so.2",
+        b"lib64/libcap-ng.so.0",
+        b"lib64/libffi.so.8",
+        b"lib64/libbrotlidec.so.1",
+        b"lib64/libxcvt.so.0",
+        b"lib64/libxcb-present.so.0",
+        b"lib64/libxcb-xfixes.so.0",
+        b"lib64/libxcb-damage.so.0",
+        b"lib64/libfontenc.so.1",
+        b"lib64/libXrender.so.1",
+        b"lib64/libXi.so.6",
+        b"lib64/libz.so.1",
+        b"lib64/libresolv.so.2",
+        b"lib64/libkeyutils.so.1",
+        b"lib64/libkrb5support.so.0",
+        b"lib64/libepoxy.so.0",
     ];
-    let mut preloaded = 0usize;
-    for lib in preload_libs.iter() {
-        if try_open_initramfs(lib).is_some() {
-            preloaded += 1;
-        }
-    }
-    syscall::debug_puts(b"[linux_srv] preloaded ");
-    print_num(preloaded as u64);
-    syscall::debug_puts(b"/22 common libs into content cache\n");
+    // Skip eager preload entirely — it ran at linux_srv startup before
+    // initramfs_srv registered `initramfs_task`, so grants never took and
+    // every populate either failed early (no grant) or leaked an
+    // mmap_anon allocation when irfs_read_bulk returned None.  The lazy
+    // populate path inside `try_open_initramfs` handles the same cache
+    // population on first open by a Linux process — by which point all
+    // ns aliases are registered and grants succeed cleanly.  Suppresses
+    // the `Could not write pid to lock file` chain that traced back to
+    // populate-leak-induced ENOMEM.
+    let _ = preload_libs;
+    syscall::debug_puts(b"[linux_srv] preload skipped (lazy populate on first open)\n");
 
     // Round-robin sweep index for dead-process cleanup.  One slot checked
     // per main-loop iteration so the cost stays O(1) per dispatch.  When
@@ -10341,8 +10543,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     && (buf[6] == b'X' || (buf[6] == b't' && pl >= 10 && buf[7] == b'X'))
                     && buf[..pl].ends_with(b"-lock")
                 {
+                    syscall::debug_puts(b"[linux_srv X-LOCK] link OK src=");
+                    syscall::debug_puts(&buf[..pl]);
+                    syscall::debug_puts(b"\n");
                     0
                 } else {
+                    syscall::debug_puts(b"[linux_srv X-LOCK] link ENOSYS src=");
+                    syscall::debug_puts(&buf[..pl]);
+                    syscall::debug_puts(b"\n");
                     linux_err(ENOSYS)
                 }
             }
