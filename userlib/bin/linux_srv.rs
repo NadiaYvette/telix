@@ -10212,6 +10212,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // hang: hello_wl crashed, its UDS socket wasn't closed, compositor's
     // recv() blocked on dead peer.  See reaper below.
     let mut reaper_idx: usize = 0;
+    let _ = preload_libs;
 
     loop {
         expire_futex_waiters();

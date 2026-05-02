@@ -8853,16 +8853,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         static PATH: &[u8] = b"/Xwayland\0";
                         static A0: &[u8]   = b"Xwayland\0";
                         static A1: &[u8]   = b"-terminate\0";
-                        // -verbose 1: surface Xwayland's startup messages
-                        // so we can see WHERE it's exiting now that lib
-                        // loading is reliable (preload landed in 4310112).
-                        // r32 saw xw_exit=1 (not 127), meaning Xwayland
-                        // ran user code but bailed before binding X0.
-                        // Each fprintf does cost a linux_srv write IPC,
-                        // but only -verbose 0→1 (a few dozen lines)
-                        // rather than the hundreds at -verbose 3.
+                        // -verbose 0: silence Xwayland's startup chatter.
+                        // Each fprintf goes through linux_srv's write
+                        // path (one IPC per call) and serial-prints
+                        // synchronously — at -verbose 3 that's hundreds
+                        // of round trips during lib load, glamor probe,
+                        // and wayland init.  Bumped to 3 for diagnosis;
+                        // back to 0 now that the X-lock blocker is
+                        // fixed (commit 70c88ee), since the extra
+                        // contention slows xeyes+Xwayland loads enough
+                        // to surface a separate lib-content corruption
+                        // flake from grant_pages races.
                         static A2: &[u8]   = b"-verbose\0";
-                        static A3: &[u8]   = b"3\0";
+                        static A3: &[u8]   = b"0\0";
                         static E0: &[u8]   = b"LD_LIBRARY_PATH=/lib64\0";
                         static E1: &[u8]   = b"WAYLAND_DISPLAY=wayland-0\0";
                         static E2: &[u8]   = b"XDG_RUNTIME_DIR=/run/user/0\0";
@@ -8981,10 +8984,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             syscall::debug_puts(b"\n");
                             xeyes_attempt_reported = xeyes_attempt;
                             // Schedule a retry if this attempt failed and we
-                            // have attempts left.  4 s gap (i + 400) covers
-                            // typical Xwayland startup time.
+                            // have attempts left.  Originally 4 s gap (i+400)
+                            // but on KVM the boot dilation factor is ~4-5x —
+                            // init reached only i=300 in 1500s wallclock in
+                            // r48, so attempt 2 at i=500 never fired before
+                            // QEMU SIGTERM.  1 s gap (i+100) lets attempt 2
+                            // fire soon enough that the Xwayland @1s X0 bind
+                            // (which we now reliably reach) catches the
+                            // xeyes connect on the second try.
                             if xeyes_code != 0 && xeyes_attempt < 3 {
-                                next_xeyes_fork_i = i as i32 + 400;
+                                next_xeyes_fork_i = i as i32 + 100;
                             }
                         }
                         // Refork xeyes once the schedule fires.

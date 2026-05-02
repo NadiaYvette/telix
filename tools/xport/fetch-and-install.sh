@@ -135,28 +135,35 @@ close($f);
     # dispatch must be re-entering the function body partway through.
     # Same fix as __intl_freemem above: splat the entire function body
     # with 0xC3 (single-byte `ret`).  Any control-flow landing on any
-    # offset inside the function returns immediately.  Function size
-    # bounded by distance to __intl_freemem (0x14110 - 0x13820 = 0x8F0);
-    # we splat 0x800 bytes (2048) to stay clear of __intl_freemem and
-    # any inter-function padding.  C-locale binaries (Xwayland with
-    # LANG=C) get back the same untranslated string they passed in,
-    # so behavior-wise this is a no-op for them.
+    # offset inside the function returns immediately.
+    #
+    # r47 still GP-faulted at libc+0x1405d, which falls into the gap
+    # between the prior 0x800-byte __dcigettext splat (ending at
+    # 0x14020) and the __intl_freemem splat (starting at 0x14110) —
+    # 0xF0 bytes of unpatched i18n helpers (DCIGETTEXT_internal_realloc
+    # / plural_eval / similar) that the indirect dispatch jumps into.
+    # Bumped to 0x9E0 bytes so the splat runs from 0x13820 through
+    # 0x14200, covering the full __intl_freemem range too — single
+    # contiguous 0xC3 slide makes any control-flow into the entire
+    # i18n region return immediately.  C-locale binaries (Xwayland
+    # with LANG=C) get back the same untranslated string they passed
+    # in, so behavior-wise this is a no-op for them.
     SECOND_BYTE_DC="$(xxd -s 0x13821 -l 1 -p "${LIBC_SO}")"
     if [ "$SECOND_BYTE_DC" != "c3" ]; then
         python3 -c "
 import sys
 with open('${LIBC_SO}', 'r+b') as f:
     f.seek(0x13820)
-    f.write(b'\\xc3' * 0x800)
+    f.write(b'\\xc3' * 0x9e0)
 " 2>/dev/null \
         || perl -e '
 open(my $f, "+<", "'${LIBC_SO}'") or die;
 seek($f, 0x13820, 0);
-print $f "\xc3" x 0x800;
+print $f "\xc3" x 0x9e0;
 close($f);
 ' 2>/dev/null \
         || dd if=/dev/zero of=/dev/null 2>/dev/null # last-resort no-op
-        echo "===> patched libc.so.6 __dcigettext body -> ret slide (2048 bytes)"
+        echo "===> patched libc.so.6 __dcigettext+gap+__intl_freemem -> ret slide (2528 bytes)"
     else
         : # already body-splatted
     fi
