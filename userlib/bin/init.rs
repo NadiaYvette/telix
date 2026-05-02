@@ -8919,7 +8919,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 static XPATH: &[u8] = b"/xeyes\0";
                                 static XA0:   &[u8] = b"xeyes\0";
                                 static XE0:   &[u8] = b"LD_LIBRARY_PATH=/lib64\0";
-                                static XE1:   &[u8] = b"DISPLAY=:0\0";
+                                // DISPLAY=unix:0 forces libxcb to only try the
+                                // Unix socket (/tmp/.X11-unix/X0) and skip the
+                                // TCP fallback to 127.0.0.1:6000.  With plain
+                                // ":0" libxcb tries Unix first, but on
+                                // ECONNREFUSED falls through to TCP — and
+                                // since we don't run an X TCP listener, the
+                                // connect parks net_srv for ~30 s until the
+                                // CALL-TIMEOUT watchdog cuts it.  Burning 30 s
+                                // per attempt × 6 retries chews most of the
+                                // H13 budget for nothing.  The Unix-only form
+                                // skips that whole detour.
+                                static XE1:   &[u8] = b"DISPLAY=unix:0\0";
                                 static XE2:   &[u8] = b"LANG=C\0";
                                 static XE3:   &[u8] = b"LC_ALL=C\0";
                                 let xargv: [u64; 2] = [XA0.as_ptr() as u64, 0];
@@ -9021,7 +9032,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     static XPATH: &[u8] = b"/xeyes\0";
                                     static XA0:   &[u8] = b"xeyes\0";
                                     static XE0:   &[u8] = b"LD_LIBRARY_PATH=/lib64\0";
-                                    static XE1:   &[u8] = b"DISPLAY=:0\0";
+                                    // See attempt-1 spawn above for why DISPLAY=unix:0.
+                                    static XE1:   &[u8] = b"DISPLAY=unix:0\0";
                                     static XE2:   &[u8] = b"LANG=C\0";
                                     static XE3:   &[u8] = b"LC_ALL=C\0";
                                     let xargv: [u64; 2] = [XA0.as_ptr() as u64, 0];

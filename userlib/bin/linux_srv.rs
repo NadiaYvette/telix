@@ -10978,6 +10978,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         UDS_PORT = syscall::ns_lookup(b"uds").unwrap_or(0);
         NET_PORT = syscall::ns_lookup(b"net").unwrap_or(0);
         BACKEND_REPLY_PORT = syscall::port_create();
+        // Bump BACKEND_REPLY_PORT to a page-backed (max-size) queue.
+        // Default port_create gives a slab-backed queue holding 32
+        // messages; under H13 burst load we have 4 in-flight async
+        // IRFS chunks plus pending UDS_ACCEPT_REPLY / UDS_RECV_REPLY,
+        // and any sync syscall::call on linux_srv's main thread parks
+        // the dispatch loop (so async replies queue up).  At 32 the
+        // queue can saturate, initramfs_srv's send_nb_4 silently drops
+        // its IO_READ_REPLY, and the parked Linux mmap never wakes —
+        // surfaces as a 5+ second WATCHDOG IPC stall with everyone
+        // wedged in PersonalityWait / PortRecv.  64 slots (one page,
+        // 4 KiB / sizeof(Message)) buys ~2× headroom for the same
+        // burst pattern.
+        let _ = syscall::port_resize(BACKEND_REPLY_PORT, 64);
     }
 
     // Build a port set covering the main service port and the backend reply
