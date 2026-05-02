@@ -2330,7 +2330,9 @@ fn irfs_read_bulk(irfs_port: u64, handle: u64, offset: u64, max_len: usize) -> O
 /// that breaks the CALL-TIMEOUT cascade for repeated lib opens (libc.so.6,
 /// libpixman, libXdmcp etc. each get re-opened by every fork+exec).
 const LIB_CACHE_MAX: usize = 32;
-const LIB_CACHE_FILE_CAP: u64 = 4 * 1024 * 1024; // 4 MiB per file
+const LIB_CACHE_FILE_CAP: u64 = 16 * 1024 * 1024; // 16 MiB per file (bumped from 4 MiB after
+                                                  // r29 saw SHORT-READ on a >4 MiB lib that
+                                                  // got rejected from cache and fell to IPC)
 
 #[derive(Clone, Copy)]
 struct LibCacheSlot {
