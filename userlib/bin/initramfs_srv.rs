@@ -10,6 +10,20 @@ const IO_CONNECT: u64 = 0x100;
 const IO_CONNECT_OK: u64 = 0x101;
 const IO_READ: u64 = 0x200;
 const IO_READ_OK: u64 = 0x201;
+/// Async grant-based read.  Caller `send`s instead of `call`s, so its
+/// thread isn't parked waiting for the reply.  Args: d0=handle (low 32)
+/// | length (high 32), d1=offset, d2=grant_dst_va, d3=correlation.
+/// initramfs_srv processes the read normally and posts an
+/// `IO_READ_REPLY` to the previously-registered async reply port with
+/// `(correlation, bytes_read)`.  No implicit `reply` — this is a pure
+/// notification path.
+const IO_READ_ASYNC: u64 = 0x202;
+const IO_READ_REPLY: u64 = 0x203;
+/// One-time registration: caller (linux_srv) tells us where to post
+/// IO_READ_REPLY notifications.  d0=async_reply_port.  Synchronous
+/// (caller uses `call`); we ack with IO_READ_OK so the registration
+/// is observably complete before any IO_READ_ASYNC is sent.
+const IO_SET_ASYNC_REPLY_PORT: u64 = 0x204;
 const IO_STAT: u64 = 0x400;
 const IO_STAT_OK: u64 = 0x401;
 const IO_CLOSE: u64 = 0x500;
@@ -211,6 +225,14 @@ fn print_num(n: u64) {
     }
 }
 
+/// Caller-supplied port for IO_READ_REPLY notifications.  Set once via
+/// IO_SET_ASYNC_REPLY_PORT (currently only linux_srv uses async reads;
+/// extending to multiple async clients would require a per-src-port
+/// table here).  Zero means async reads have not been wired up — fall
+/// back to refusing IO_READ_ASYNC with IO_ERROR rather than silently
+/// dropping notifications.
+static mut ASYNC_REPLY_PORT: u64 = 0;
+
 /// Entry: arg0 = port ID, arg1 = CPIO data VA, arg2 = CPIO data length.
 #[unsafe(no_mangle)]
 fn main(port_id: u64, data_va: u64, data_len: u64) {
@@ -371,6 +393,80 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                         0,
                     );
                 }
+            }
+
+            IO_SET_ASYNC_REPLY_PORT => {
+                // d0 = caller's reply port (where IO_READ_REPLY notifications
+                // should be delivered).  Synchronous to make the registration
+                // observably ordered before any subsequent IO_READ_ASYNC.
+                unsafe { ASYNC_REPLY_PORT = msg.data[0]; }
+                let _ = syscall::reply(IO_READ_OK, 0, 0, 0, 0, 0);
+            }
+
+            IO_READ_ASYNC => {
+                // d0 = handle (low 32) | length (high 32)
+                // d1 = offset
+                // d2 = grant_dst_va
+                // d3 = correlation
+                // No `reply` — caller used `send`, not `call`.  We process
+                // the read inline (cpio is in-memory, fast) and post
+                // IO_READ_REPLY(correlation, bytes_read) to ASYNC_REPLY_PORT.
+                let file_handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
+                let length = ((msg.data[0] >> 32) & 0xFFFF_FFFF) as usize;
+                let offset = msg.data[1] as usize;
+                let grant_va = msg.data[2] as usize;
+                let correlation = msg.data[3];
+                let async_port = unsafe { ASYNC_REPLY_PORT };
+
+                if async_port == 0 {
+                    // Caller forgot to register — drop silently; the sync
+                    // path is still available.  Logging here is cheap and
+                    // catches the misconfiguration during bringup.
+                    syscall::debug_puts(b"[irfs] IO_READ_ASYNC dropped: no reply port registered\n");
+                    continue;
+                }
+
+                let bytes_read: u64 = if file_handle >= fs.count
+                    || !fs.files[file_handle].active
+                    || grant_va == 0
+                {
+                    0
+                } else {
+                    let f = &fs.files[file_handle];
+                    let start = f.data_offset + offset.min(f.data_len);
+                    let end = f.data_offset + (offset + length).min(f.data_len);
+                    let data = &cpio_data[start..end];
+                    let n = data.len();
+                    unsafe {
+                        let src = data.as_ptr();
+                        let dst = grant_va as *mut u8;
+                        let words = n / 8;
+                        let tail_start = words * 8;
+                        let src_u64 = src as *const u64;
+                        let dst_u64 = dst as *mut u64;
+                        for i in 0..words {
+                            let v = core::ptr::read_volatile(src_u64.add(i));
+                            core::ptr::write_volatile(dst_u64.add(i), v);
+                        }
+                        for i in tail_start..n {
+                            let b = core::ptr::read_volatile(src.add(i));
+                            core::ptr::write_volatile(dst.add(i), b);
+                        }
+                    }
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe { core::arch::asm!("mfence"); }
+                    n as u64
+                };
+
+                let _ = syscall::send_nb_4(
+                    async_port,
+                    IO_READ_REPLY,
+                    correlation,
+                    bytes_read,
+                    0,
+                    0,
+                );
             }
 
             IO_STAT => {
