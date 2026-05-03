@@ -8895,17 +8895,71 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::personality_set(xw_child, 2, abi);
                     syscall::debug_puts(b"  [H13] waiting for Xwayland (120s budget)...\n");
 
-                    // --- Step H14: spawn xeyes immediately, in parallel with Xwayland ---
-                    // Forked BEFORE the Xwayland wait loop so we always get an
-                    // exit=N report regardless of how Xwayland fares.  xtrans
-                    // retries connect on its own; if Xwayland binds /tmp/.X11-unix/X0
-                    // fast enough, xeyes attaches; otherwise xeyes fails its
-                    // connect loop and we capture that exit code.  Either way
-                    // we exercise the H14 spawn path.
+                    // --- Wait for Xwayland's X0 listener before forking xeyes ---
+                    // Per project_xwayland_x0_listen_race.md, Xwayland's xtrans
+                    // bind+listen sequence is racy: Xwayland may have personality_set
+                    // before X0 is in listen state, so xeyes attempt 1 hits
+                    // ECONNREFUSED.  Probe X0 with a uds_srv test-connect; only
+                    // proceed once a connect is accepted (which means Xwayland
+                    // has bound + listened on X0).  Probes that succeed produce
+                    // a phantom client which Xwayland will close on protocol
+                    // timeout — harmless.
+                    {
+                        const UDS_SOCKET_C: u64 = 0x8000;
+                        const UDS_CONNECT_C: u64 = 0x8030;
+                        const UDS_CLOSE_C:   u64 = 0x8070;
+                        const UDS_OK_C:      u64 = 0x8100;
+                        let mut uds_port: u64 = 0;
+                        for _ in 0..200 {
+                            if let Some(p) = syscall::ns_lookup(b"uds") {
+                                uds_port = p;
+                                break;
+                            }
+                            syscall::yield_now();
+                        }
+                        if uds_port != 0 {
+                            let (n0, n1, _) = pack_name(b"X0");
+                            let pid = syscall::getpid();
+                            let uid = syscall::getuid() as u64;
+                            let mut probes: u32 = 0;
+                            let mut listening = false;
+                            const MAX_PROBES: u32 = 100; // ~10s @ 100 ms each
+                            while probes < MAX_PROBES {
+                                let sock_handle = match syscall::call(uds_port, UDS_SOCKET_C, 0, 0, 0, 0) {
+                                    Some(m) if m.tag == UDS_OK_C => m.data[0],
+                                    _ => break,
+                                };
+                                let connect_ok = match syscall::call(uds_port, UDS_CONNECT_C, n0, n1, 2, pid | (uid << 32)) {
+                                    Some(m) => m.tag == UDS_OK_C,
+                                    None => false,
+                                };
+                                let _ = syscall::call(uds_port, UDS_CLOSE_C, sock_handle, 0, 0, 0);
+                                if connect_ok {
+                                    listening = true;
+                                    break;
+                                }
+                                probes += 1;
+                                syscall::sleep_ms(100);
+                            }
+                            if listening {
+                                syscall::debug_puts(b"  [H14] X0 listener up after ");
+                                print_num(probes as u64);
+                                syscall::debug_puts(b" probes\n");
+                            } else {
+                                syscall::debug_puts(b"  [H14] X0 listener not detected within budget; spawning xeyes anyway\n");
+                            }
+                        }
+                    }
+
+                    // --- Step H14: spawn xeyes ---
+                    // Forked AFTER the X0-listener probe above so attempt 1 has
+                    // a real chance of connecting.  Retry mechanism below
+                    // handles cases where the probe times out OR a later
+                    // attempt is needed (e.g. accept-queue depleted).
                     let mut xeyes_child: u64 = u64::MAX;
                     let mut xeyes_code: i64 = -2; // -2 = "not started yet"
 
-                    syscall::debug_puts(b"  [H14] forking xeyes (parallel with Xwayland)...\n");
+                    syscall::debug_puts(b"  [H14] forking xeyes...\n");
                     {
                         let xc = syscall::fork();
                         if xc == 0 {
