@@ -685,7 +685,48 @@ fn get_net_port() -> u64 {
 
 /// Debug: when set to a valid pi, every dispatch call from that pi is logged.
 /// Used to isolate the Phase 172 EFAULT mystery.
-static mut TRACE_PI: usize = usize::MAX;
+/// Multi-PID syscall trace.  Holds up to TRACE_PI_SLOTS process indices
+/// for which the dispatch loop emits per-syscall trace lines.  Slot
+/// usize::MAX means "empty"; trace_pi_set replaces the oldest slot
+/// (FIFO) when the table is full so we never lose room for newly-
+/// attached processes.
+const TRACE_PI_SLOTS: usize = 4;
+static mut TRACE_PIS: [usize; TRACE_PI_SLOTS] = [usize::MAX; TRACE_PI_SLOTS];
+/// Round-robin replacement cursor when all slots are full.
+static mut TRACE_PI_CURSOR: usize = 0;
+
+/// Returns true if `pi` is currently being traced (any slot).
+fn trace_pi_match(pi: usize) -> bool {
+    if pi == usize::MAX { return false; }
+    unsafe {
+        let arr = &raw const TRACE_PIS;
+        for i in 0..TRACE_PI_SLOTS {
+            if (*arr)[i] == pi { return true; }
+        }
+    }
+    false
+}
+
+/// Add `pi` to the trace set.  No-op if already present.  If all slots
+/// are full, replaces the slot at TRACE_PI_CURSOR (FIFO).
+fn trace_pi_set(pi: usize) {
+    if pi == usize::MAX { return; }
+    unsafe {
+        let arr = &raw mut TRACE_PIS;
+        for i in 0..TRACE_PI_SLOTS {
+            if (*arr)[i] == pi { return; }
+        }
+        for i in 0..TRACE_PI_SLOTS {
+            if (*arr)[i] == usize::MAX {
+                (*arr)[i] = pi;
+                return;
+            }
+        }
+        let cursor = TRACE_PI_CURSOR;
+        (*arr)[cursor] = pi;
+        TRACE_PI_CURSOR = (cursor + 1) % TRACE_PI_SLOTS;
+    }
+}
 
 /// Local VA of our long-path scratch page (granted to vfs_task at LIN_SCRATCH_VA).
 /// 0 = not yet allocated.
@@ -4081,7 +4122,7 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
 
     if resp.tag == VFS_ERROR || resp.tag != VFS_OPEN_OK {
         unsafe {
-            if pi == TRACE_PI {
+            if trace_pi_match(pi) {
                 syscall::debug_puts(b"[trace] do_open short VFS_ERROR pathlen=");
                 print_num(pathlen as u64);
                 syscall::debug_puts(b" tag=");
@@ -6424,17 +6465,22 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
         return Some(linux_err(ENOENT));
     }
 
-    // Auto-attach TRACE_PI for xeyes diagnosis (env-propagation
-    // hypothesis: empty "Can't open display:" message + no
-    // socket(AF_UNIX) for slash-containing DISPLAY values).  Match
-    // either bare or leading-slash forms.  Logging fires from the
+    // Auto-attach TRACE_PI for xeyes / Xwayland diagnosis.  xeyes:
+    // env-propagation hypothesis (now resolved).  Xwayland: premature
+    // exit chase — Xwayland reports xw_exit=-9 within ~3s of fork
+    // without ever binding /tmp/.X11-unix/X0; need the syscall trace
+    // to identify the last call before exit.  Logging fires from the
     // dispatch loop (line ~11172/11652) for the new image's syscalls.
     unsafe {
-        if matches!(lookup_name, b"xeyes") || matches!(name, b"/xeyes" | b"xeyes") {
-            TRACE_PI = pi;
+        let trace = matches!(lookup_name, b"xeyes" | b"Xwayland")
+            || matches!(name, b"/xeyes" | b"xeyes" | b"/Xwayland" | b"Xwayland");
+        if trace {
+            trace_pi_set(pi);
             syscall::debug_puts(b"  [trace] attach pi=");
             print_num(pi as u64);
-            syscall::debug_puts(b" name=xeyes\n");
+            syscall::debug_puts(b" name=");
+            syscall::debug_puts(lookup_name);
+            syscall::debug_puts(b"\n");
         }
     }
 
@@ -11341,7 +11387,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // X11 connection setup (DISPLAY-format / env-propagation
         // diagnosis, see project_libxcb_unix_bug.md).
         unsafe {
-            if pi == TRACE_PI {
+            if trace_pi_match(pi) {
                 syscall::debug_puts(b"[trace] >>nr=");
                 print_num(linux_nr);
                 syscall::debug_puts(b" d0=");
@@ -11843,7 +11889,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Phase 172 EFAULT trace: show the return value before reply.
         unsafe {
-            if pi == TRACE_PI {
+            if trace_pi_match(pi) {
                 syscall::debug_puts(b"[trace] <<nr=");
                 print_num(linux_nr);
                 // Print as signed: negative errno values show as very large numbers
