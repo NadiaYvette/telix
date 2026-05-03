@@ -11414,14 +11414,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // contention and may stall mid-init (no socket() ever issued).
         b"lib64/libgraphite2.so.3",
         b"lib64/libbrotlicommon.so.1",
-        // Top-level binaries init.rs spawns.  ld.so re-opens the
-        // executable to parse Verneed / .gnu.version_r — without
-        // preload, that goes through the slow lazy-populate path
-        // and races, surfacing as "unsupported version N of Verneed
-        // record" (boot cc9mfsq337).
-        b"Xwayland",
-        b"wl_compositor_min",
-        b"xeyes",
+        // NOTE: top-level binaries (Xwayland, wl_compositor_min, xeyes)
+        // were tried in dd9mfsq338 — kernel triple-faulted at the next
+        // fork() (likely a kernel-side aspace/VMA bug exposed by the
+        // additional cache backing pages in linux_srv).  Reverted until
+        // we identify the root cause.  ld.so re-opens those binaries
+        // for Verneed parsing under contention; that's still a problem
+        // (cc9mfsq337 saw "unsupported version 17791 of Verneed
+        // record"), but a kernel reset is worse than a flaky open.
     ];
     // Re-enabled eager preload.  Under contention, the lazy populate
     // path lets concurrent Xwayland+xeyes lib loads race for
