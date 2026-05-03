@@ -6303,6 +6303,20 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
         return Some(linux_err(ENOENT));
     }
 
+    // Auto-attach TRACE_PI for xeyes diagnosis (env-propagation
+    // hypothesis: empty "Can't open display:" message + no
+    // socket(AF_UNIX) for slash-containing DISPLAY values).  Match
+    // either bare or leading-slash forms.  Logging fires from the
+    // dispatch loop (line ~11172/11652) for the new image's syscalls.
+    unsafe {
+        if matches!(lookup_name, b"xeyes") || matches!(name, b"/xeyes" | b"xeyes") {
+            TRACE_PI = pi;
+            syscall::debug_puts(b"  [trace] attach pi=");
+            print_num(pi as u64);
+            syscall::debug_puts(b" name=xeyes\n");
+        }
+    }
+
     // On success: close CLOEXEC FDs and reset BRK.
     unsafe {
         for i in 3..MAX_FDS {
@@ -11168,6 +11182,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         };
 
         // Phase 172 EFAULT trace: dump every syscall from the target pi.
+        // Extended with path-arg decode for syscalls that take a path —
+        // gives visibility into what xeyes actually reads/probes during
+        // X11 connection setup (DISPLAY-format / env-propagation
+        // diagnosis, see project_libxcb_unix_bug.md).
         unsafe {
             if pi == TRACE_PI {
                 syscall::debug_puts(b"[trace] >>nr=");
@@ -11179,6 +11197,28 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b" d2=");
                 print_num(msg.data[2]);
                 syscall::debug_puts(b"\n");
+                // Path-bearing syscalls.  nr / path-arg index:
+                //   4 stat, 6 lstat:           path in d0
+                //   21 access, 257 openat,
+                //   262 newfstatat, 263 unlinkat, 332 statx: path in d1
+                let path_arg_idx: Option<usize> = match linux_nr {
+                    4 | 6 => Some(0),
+                    21 | 257 | 262 | 263 | 332 => Some(1),
+                    _ => None,
+                };
+                if let Some(idx) = path_arg_idx {
+                    let path_va = msg.data[idx] as usize;
+                    if path_va != 0 {
+                        let mut buf = [0u8; 96];
+                        let n = syscall::personality_copy_in(caller_port, path_va, &mut buf);
+                        if n > 0 {
+                            let plen = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+                            syscall::debug_puts(b"  [trace]   path=\"");
+                            syscall::debug_puts(&buf[..plen]);
+                            syscall::debug_puts(b"\"\n");
+                        }
+                    }
+                }
             }
         }
 

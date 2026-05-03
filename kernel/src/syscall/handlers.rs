@@ -3170,12 +3170,57 @@ pub(crate) fn exec_for_task(
         data_off += slen;
     }
     // envp strings.
+    let envp_dump_start = data_off;
+    let envp_string_addrs_start = argc;
     for i in 0..envc {
         let slen = slens_local[argc + i] as usize;
         str_pos -= slen + 1;
         addr_buf[argc + i] = str_pos as u64;
         copy_to_user(new_pt_root, str_pos, &data_src[data_off..data_off + slen]);
         data_off += slen;
+    }
+
+    // Diagnostic: when execing "xeyes", read each envp string back from
+    // user memory via copy_from_user and print it.  This verifies what's
+    // actually in xeyes' aspace at the addresses its envp pointers
+    // reference — addressing the env-propagation hypothesis behind the
+    // "empty Can't open display:" message for slash-containing DISPLAY
+    // values (see memory project_libxcb_unix_bug.md).  Bracketed by
+    // BEGIN/END so the dump is visually clear in serial output.  This
+    // version also logs the raw envp_ptr (rdx value at execve time) and
+    // the 5 u64 pointer values it references in the CALLER's aspace —
+    // distinguishes "wrong envp_ptr" from "right envp_ptr, wrong content".
+    if matches!(name, b"xeyes") {
+        crate::println!("[exec/xeyes] BEGIN envp dump (envc={} pid?={} envp_ptr={:#x} argv_ptr={:#x})",
+                        envc, target_task_id, envp_ptr, argv_ptr);
+        // Raw u64 pointer values at envp_ptr+0..40 in the caller's old
+        // aspace.  These are what xenvp[0..5] CONTAINS in user memory.
+        for i in 0..6 {
+            let mut ptr_bytes = [0u8; 8];
+            let ok = copy_from_user(client_pt_root, envp_ptr + i * 8, &mut ptr_bytes);
+            let val = u64::from_le_bytes(ptr_bytes);
+            crate::println!("[exec/xeyes] envp_ptr[{}] @ {:#x} = {:#x} (ok={})",
+                            i, envp_ptr + i * 8, val, ok);
+        }
+        let _ = envp_dump_start; // suppress unused-warning if dump is empty
+        for i in 0..envc {
+            let slen = slens_local[argc + i] as usize;
+            let va = addr_buf[envp_string_addrs_start + i] as usize;
+            let mut rb = [0u8; 128];
+            let n = slen.min(rb.len() - 1);
+            let ok = copy_from_user(new_pt_root, va, &mut rb[..n]);
+            // Replace any non-printable byte with '?' for serial-safe output.
+            for b in rb[..n].iter_mut() {
+                if !(b'\x20'..=b'\x7e').contains(b) {
+                    *b = b'?';
+                }
+            }
+            // Use .to_str-like handling: print only the slen prefix.
+            let s = core::str::from_utf8(&rb[..n]).unwrap_or("<utf8?>");
+            crate::println!("[exec/xeyes] envp[{}] va={:#x} slen={} ok={} body={:?}",
+                            i, va, slen, ok, s);
+        }
+        crate::println!("[exec/xeyes] END envp dump");
     }
 
     // AT_PLATFORM string ("x86_64\0").  See sys_execve site above for
