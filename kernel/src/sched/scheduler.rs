@@ -2266,7 +2266,7 @@ pub fn tick(current_sp: u64) -> u64 {
                             target_arch = "loongarch64",
                         )))]
                         let (sgi_s, sgi_r): (u64, u64) = (0, 0);
-                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={}) sgi=(s={} r={})",
+                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={}) sgi=(s={} r={}) forced_preempt={}",
                             sends, recvs,
                             DOUBLE_ENQ_DRAIN.load(Ordering::Relaxed),
                             DOUBLE_ENQ_RESCUE.load(Ordering::Relaxed),
@@ -2277,7 +2277,8 @@ pub fn tick(current_sp: u64) -> u64 {
                             RESCUE_STALE_ON_CPU.load(Ordering::Relaxed),
                             RESCUE_PENDING.load(Ordering::Relaxed),
                             RESCUE_PHANTOM.load(Ordering::Relaxed),
-                            sgi_s, sgi_r);
+                            sgi_s, sgi_r,
+                            FORCED_PREEMPT_COUNT.load(Ordering::Relaxed));
                         // Per-CPU state: what each CPU is running, RQ sizes
                         let ncpus = smp::num_cpus();
                         for c in 0..ncpus {
@@ -5886,16 +5887,30 @@ fn check_sleep_timers() {
         trace_sched(tid, 15); // 15=sleep_wake (state=Ready, about to enqueue)
         set_enq_tag(7); // 7=sleep_timer
         percpu_enqueue(target, prio, tid);
-        // If the target is a remote CPU, send a reschedule IPI so it picks
-        // up the newly-enqueued thread promptly instead of waiting for its
-        // next timer tick (which may be up to TICK_INTERVAL_NS away, or
-        // longer if the LAPIC one-shot was lost under QEMU MTTCG).
+        // Force preemption of the target CPU's currently-running thread
+        // by setting yield_asap before sending the reschedule IPI.  The
+        // IPI's try_switch checks yield_asap and preempts when set,
+        // instead of just decrementing quantum by 1 and returning.
+        // This exposes latent preemption-unsafety that the previous
+        // ~100 ms quantum-cycle masked; the audit-and-fix path is the
+        // current strategy for boot-throughput improvement.
         let waker = smp::cpu_id();
         if target != waker {
+            let pcpu_target = smp::get(target);
+            let target_cur = pcpu_target.current_thread.load(Ordering::Relaxed);
+            let target_idle = pcpu_target.idle_thread_id.load(Ordering::Relaxed);
+            if target_cur != target_idle && target_cur != 0 {
+                thread_ref(target_cur).yield_asap.store(true, Ordering::Release);
+                FORCED_PREEMPT_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
             crate::arch::irq::send_reschedule_ipi(target);
         }
     }
 }
+
+/// Diagnostic: total forced preemptions from sleep-wake.  Surfaced in
+/// the WATCHDOG dump alongside other stall counters.
+pub static FORCED_PREEMPT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Check per-task alarm timers and deliver SIGALRM.
 /// Called from tick() before try_switch.
