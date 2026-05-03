@@ -8919,29 +8919,46 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 static XPATH: &[u8] = b"/xeyes\0";
                                 static XA0:   &[u8] = b"xeyes\0";
                                 static XE0:   &[u8] = b"LD_LIBRARY_PATH=/lib64\0";
-                                // DISPLAY=unix:0 forces libxcb to only try the
-                                // Unix socket (/tmp/.X11-unix/X0) and skip the
-                                // TCP fallback to 127.0.0.1:6000.  With plain
-                                // ":0" libxcb tries Unix first, but on
-                                // ECONNREFUSED falls through to TCP — and
-                                // since we don't run an X TCP listener, the
-                                // connect parks net_srv for ~30 s until the
-                                // CALL-TIMEOUT watchdog cuts it.  Burning 30 s
-                                // per attempt × 6 retries chews most of the
-                                // H13 budget for nothing.  The Unix-only form
-                                // skips that whole detour.
-                                static XE1:   &[u8] = b"DISPLAY=unix:0\0";
+                                // DISPLAY=/tmp/.X11-unix/X0 — full socket
+                                // path.  Per libxcb xcb_util.c line 175, when
+                                // the name starts with '/', xcb_parse_display
+                                // takes a fast path that just stat()s the
+                                // path; if the stat returns S_IFSOCK (which
+                                // our synth handler does for /tmp/.X11-unix/
+                                // X<n>), parse succeeds with host=path,
+                                // protocol="unix", display=0.  Then _xcb_open
+                                // hits the "host[0]=='/'" branch (line 263)
+                                // which calls _xcb_open_unix on the path
+                                // verbatim → socket(AF_UNIX) + connect.
+                                // Avoids both the "unix:" → stat("0") bug
+                                // (line 178) and any potential libX11 format
+                                // gate that rejects the slash forms.
+                                static XE1:   &[u8] = b"DISPLAY=/tmp/.X11-unix/X0\0";
                                 static XE2:   &[u8] = b"LANG=C\0";
                                 static XE3:   &[u8] = b"LC_ALL=C\0";
-                                let xargv: [u64; 2] = [XA0.as_ptr() as u64, 0];
-                                let xenvp: [u64; 5] = [XE0.as_ptr() as u64, XE1.as_ptr() as u64,
-                                                        XE2.as_ptr() as u64, XE3.as_ptr() as u64, 0];
+                                // Use static mut arrays for argv/envp to give
+                                // them fixed .bss addresses — bulletproof
+                                // against compiler-elision bugs that affect
+                                // stack-local arrays whose only observation is
+                                // through `.as_ptr()`.  Both write_volatile and
+                                // black_box(&array) failed empirically (boots
+                                // k9mfsq319, m9mfsq321).  See memory
+                                // project_xeyes_envp_compiler_elision.md.
+                                static mut XEYES_ARGV: [u64; 2] = [0; 2];
+                                static mut XEYES_ENVP: [u64; 5] = [0; 5];
+                                XEYES_ARGV[0] = XA0.as_ptr() as u64;
+                                XEYES_ARGV[1] = 0;
+                                XEYES_ENVP[0] = XE0.as_ptr() as u64;
+                                XEYES_ENVP[1] = XE1.as_ptr() as u64;
+                                XEYES_ENVP[2] = XE2.as_ptr() as u64;
+                                XEYES_ENVP[3] = XE3.as_ptr() as u64;
+                                XEYES_ENVP[4] = 0;
                                 core::arch::asm!(
                                     "int 0x80",
                                     inlateout("rax") 59u64 => _,
                                     in("rdi") XPATH.as_ptr() as u64,
-                                    in("rsi") xargv.as_ptr() as u64,
-                                    in("rdx") xenvp.as_ptr() as u64,
+                                    in("rsi") &raw const XEYES_ARGV as u64,
+                                    in("rdx") &raw const XEYES_ENVP as u64,
                                     lateout("rcx") _, lateout("r11") _,
                                 );
                                 core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 96u64, options(noreturn));
@@ -9032,19 +9049,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                     static XPATH: &[u8] = b"/xeyes\0";
                                     static XA0:   &[u8] = b"xeyes\0";
                                     static XE0:   &[u8] = b"LD_LIBRARY_PATH=/lib64\0";
-                                    // See attempt-1 spawn above for why DISPLAY=unix:0.
-                                    static XE1:   &[u8] = b"DISPLAY=unix:0\0";
+                                    // See attempt-1 spawn above for why /tmp/.X11-unix/X0.
+                                    static XE1:   &[u8] = b"DISPLAY=/tmp/.X11-unix/X0\0";
                                     static XE2:   &[u8] = b"LANG=C\0";
                                     static XE3:   &[u8] = b"LC_ALL=C\0";
-                                    let xargv: [u64; 2] = [XA0.as_ptr() as u64, 0];
-                                    let xenvp: [u64; 5] = [XE0.as_ptr() as u64, XE1.as_ptr() as u64,
-                                                            XE2.as_ptr() as u64, XE3.as_ptr() as u64, 0];
+                                    // See attempt-1 spawn above for why static mut.
+                                    static mut XEYES_RETRY_ARGV: [u64; 2] = [0; 2];
+                                    static mut XEYES_RETRY_ENVP: [u64; 5] = [0; 5];
+                                    XEYES_RETRY_ARGV[0] = XA0.as_ptr() as u64;
+                                    XEYES_RETRY_ARGV[1] = 0;
+                                    XEYES_RETRY_ENVP[0] = XE0.as_ptr() as u64;
+                                    XEYES_RETRY_ENVP[1] = XE1.as_ptr() as u64;
+                                    XEYES_RETRY_ENVP[2] = XE2.as_ptr() as u64;
+                                    XEYES_RETRY_ENVP[3] = XE3.as_ptr() as u64;
+                                    XEYES_RETRY_ENVP[4] = 0;
                                     core::arch::asm!(
                                         "int 0x80",
                                         inlateout("rax") 59u64 => _,
                                         in("rdi") XPATH.as_ptr() as u64,
-                                        in("rsi") xargv.as_ptr() as u64,
-                                        in("rdx") xenvp.as_ptr() as u64,
+                                        in("rsi") &raw const XEYES_RETRY_ARGV as u64,
+                                        in("rdx") &raw const XEYES_RETRY_ENVP as u64,
                                         lateout("rcx") _, lateout("r11") _,
                                     );
                                     core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 96u64, options(noreturn));
