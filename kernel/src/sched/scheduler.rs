@@ -5900,8 +5900,15 @@ fn check_sleep_timers() {
             let target_cur = pcpu_target.current_thread.load(Ordering::Relaxed);
             let target_idle = pcpu_target.idle_thread_id.load(Ordering::Relaxed);
             if target_cur != target_idle && target_cur != 0 {
-                thread_ref(target_cur).yield_asap.store(true, Ordering::Release);
-                FORCED_PREEMPT_COUNT.fetch_add(1, Ordering::Relaxed);
+                // Use the ART-checked accessor: between loading
+                // current_thread and reaching here the thread could have
+                // exited and the tid become stale.  thread_ref_opt
+                // returns None on a missing ART entry instead of
+                // dereferencing a null/garbage pointer.
+                if let Some(t) = thread_ref_opt(target_cur) {
+                    t.yield_asap.store(true, Ordering::Release);
+                    FORCED_PREEMPT_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
             }
             crate::arch::irq::send_reschedule_ipi(target);
         }
