@@ -1812,6 +1812,37 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
     // Initramfs fast path: in-memory cpio data via single IPC + grant.
     if kind == FdKind::Initramfs {
+        // Diagnostic: log cache-hit/miss per Initramfs read for traced
+        // pids.  Helps localize which path serves corrupt data when
+        // ld.so reports "invalid ELF header" despite preload reporting
+        // success.
+        if trace_pi_match(pi) {
+            let (slot_handle, slot_chunks_cached, slot_chunk_count, full_mask) =
+                if let Some(slot_idx) = (0..LIB_CACHE_MAX).find(|&i| unsafe {
+                    LIB_CACHE[i].in_use && LIB_CACHE[i].irfs_handle == handle
+                }) {
+                    let s = unsafe { LIB_CACHE[slot_idx] };
+                    (s.irfs_handle, s.chunks_cached, s.chunk_count,
+                     cache_full_mask(s.chunk_count))
+                } else {
+                    (0, 0, 0, 0)
+                };
+            syscall::debug_puts(b"[trace] read_initramfs h=");
+            print_num(handle);
+            syscall::debug_puts(b" off=");
+            print_num(offset);
+            syscall::debug_puts(b" want=");
+            print_num(want as u64);
+            syscall::debug_puts(b" slot_h=");
+            print_num(slot_handle);
+            syscall::debug_puts(b" cached=");
+            print_num(slot_chunks_cached);
+            syscall::debug_puts(b" full=");
+            print_num(full_mask);
+            syscall::debug_puts(b" cnt=");
+            print_num(slot_chunk_count as u64);
+            syscall::debug_puts(b"\n");
+        }
         // Cache fast path: serve directly from linux_srv-local memory if
         // this handle's full content has been cached.  Skips the IPC to
         // initramfs_srv entirely on cache hit.
@@ -3229,6 +3260,74 @@ struct LibCacheSlot {
 /// one IRFS_IO_READ_ASYNC reply maps exactly to one cache chunk.
 const CACHE_CHUNK_SIZE: usize = FS_ASYNC_SCRATCH_PAGES * 4096;
 
+/// Filename→handle cache built by eager preload.  Skips
+/// IRFS_IO_CONNECT IPC at try_open_initramfs entry when the same name
+/// has already been resolved.  Without this, every concurrent open()
+/// of an already-cached lib still goes through initramfs_srv and can
+/// block on its 30s CALL_REPLY watchdog under contention — surfaces
+/// as ENOENT in handle_open and "cannot open shared object" in ld.so
+/// (boot y9mfsq333).
+const NAME_CACHE_PATH_MAX: usize = 32;
+#[derive(Clone, Copy)]
+struct NameCacheSlot {
+    in_use: bool,
+    handle: u64,
+    file_size: u64,
+    name: [u8; NAME_CACHE_PATH_MAX],
+    name_len: u8,
+}
+static mut NAME_CACHE: [NameCacheSlot; LIB_CACHE_MAX] = [
+    NameCacheSlot {
+        in_use: false, handle: 0, file_size: 0,
+        name: [0u8; NAME_CACHE_PATH_MAX], name_len: 0,
+    };
+    LIB_CACHE_MAX
+];
+
+fn name_cache_insert(name: &[u8], handle: u64, file_size: u64) {
+    if name.is_empty() || name.len() > NAME_CACHE_PATH_MAX { return; }
+    unsafe {
+        let arr = &raw mut NAME_CACHE;
+        for i in 0..LIB_CACHE_MAX {
+            let slot = &mut (*arr)[i];
+            if slot.in_use && slot.name_len as usize == name.len()
+                && &slot.name[..name.len()] == name
+            {
+                slot.handle = handle;
+                slot.file_size = file_size;
+                return;
+            }
+        }
+        for i in 0..LIB_CACHE_MAX {
+            let slot = &mut (*arr)[i];
+            if !slot.in_use {
+                slot.in_use = true;
+                slot.handle = handle;
+                slot.file_size = file_size;
+                slot.name_len = name.len() as u8;
+                slot.name[..name.len()].copy_from_slice(name);
+                return;
+            }
+        }
+    }
+}
+
+fn name_cache_lookup(name: &[u8]) -> Option<(u64, u64)> {
+    if name.is_empty() || name.len() > NAME_CACHE_PATH_MAX { return None; }
+    unsafe {
+        let arr = &raw const NAME_CACHE;
+        for i in 0..LIB_CACHE_MAX {
+            let slot = &(*arr)[i];
+            if slot.in_use && slot.name_len as usize == name.len()
+                && &slot.name[..name.len()] == name
+            {
+                return Some((slot.handle, slot.file_size));
+            }
+        }
+    }
+    None
+}
+
 static mut LIB_CACHE: [LibCacheSlot; LIB_CACHE_MAX] = [
     LibCacheSlot {
         in_use: false, irfs_handle: 0, file_size: 0, backing_va: 0,
@@ -3558,6 +3657,9 @@ fn lib_cache_eager_populate(path: &[u8]) -> bool {
             return false;
         }
     }
+    // Insert into NAME_CACHE so subsequent try_open_initramfs calls
+    // (with leading "/" stripped) skip the IRFS_IO_CONNECT IPC.
+    name_cache_insert(path, handle, file_size);
     true
 }
 
@@ -3570,6 +3672,13 @@ fn try_open_initramfs(path: &[u8]) -> Option<(u64, u64)> {
     let name = if path.first() == Some(&b'/') { &path[1..] } else { path };
     if name.is_empty() || name.len() > 28 {
         return None;
+    }
+    // Cache fast path: skip IRFS_IO_CONNECT IPC if eager preload has
+    // already resolved this name.  Avoids the CALL_REPLY_TIMEOUT
+    // cascade where concurrent opens block on initramfs_srv's
+    // 30 s watchdog and surface as ENOENT to ld.so.
+    if let Some((handle, file_size)) = name_cache_lookup(name) {
+        return Some((handle, file_size));
     }
     // Pack name into 4 u64 words within syscall::call's 4-data-word ABI:
     //   d0 = bytes 0-7, d1 = bytes 8-15, d3 = bytes 16-23
@@ -6082,6 +6191,35 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
             match kind {
                 FdKind::Initramfs => {
+                    // Diagnostic: log cache state per Initramfs mmap for
+                    // traced pids.  See handle_read for rationale.
+                    if trace_pi_match(pi) {
+                        let (slot_handle, slot_chunks_cached, slot_chunk_count, full_mask) =
+                            if let Some(slot_idx) = (0..LIB_CACHE_MAX).find(|&i| unsafe {
+                                LIB_CACHE[i].in_use && LIB_CACHE[i].irfs_handle == handle
+                            }) {
+                                let s = unsafe { LIB_CACHE[slot_idx] };
+                                (s.irfs_handle, s.chunks_cached, s.chunk_count,
+                                 cache_full_mask(s.chunk_count))
+                            } else {
+                                (0, 0, 0, 0)
+                            };
+                        syscall::debug_puts(b"[trace] mmap_initramfs h=");
+                        print_num(handle);
+                        syscall::debug_puts(b" off=");
+                        print_num(file_offset);
+                        syscall::debug_puts(b" len=");
+                        print_num(len as u64);
+                        syscall::debug_puts(b" slot_h=");
+                        print_num(slot_handle);
+                        syscall::debug_puts(b" cached=");
+                        print_num(slot_chunks_cached);
+                        syscall::debug_puts(b" full=");
+                        print_num(full_mask);
+                        syscall::debug_puts(b" cnt=");
+                        print_num(slot_chunk_count as u64);
+                        syscall::debug_puts(b"\n");
+                    }
                     // Cache fast path: serve directly from linux_srv-local
                     // memory if the handle's full content is cached.  Skips
                     // initramfs_srv IPC entirely on cache hit, eliminating
