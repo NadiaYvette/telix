@@ -199,19 +199,17 @@ impl Thread {
             port_id: 0,
             base_priority: 128,
             effective_priority: 128,
-            // 4 ticks (~40 ms at 10ms TICK_INTERVAL_NS) caps the "running
-            // thread keeps its CPU" window to 1/2.5 of the previous 100 ms
-            // default.  IPC reply latency under contention drops by the
-            // same factor: a wake's reschedule IPI hits a CPU whose
-            // running thread has at most 4 quantum decrements before
-            // try_switch preempts.  Forced preemption on remote sleep-
-            // wake (sched/scheduler.rs commits a5c0c5e + 84c120c) gives
-            // sleep_ms its honored latency; this change tackles the
-            // remaining quantum-bound wakes (port recv, futex, cap
-            // reply) without the per-wake context-switch overhead that
-            // r25's blanket force-preempt experiment caused.
-            quantum: 4,
-            default_quantum: 4,
+            // 2 ticks (~20 ms at 10ms TICK_INTERVAL_NS) caps the "running
+            // thread keeps its CPU" window.  Dropped from the previous
+            // 10 (in two steps: 10 → 4 in c66c8d6, then 4 → 2 here) to
+            // tighten quantum-bound wake latency for port recv, futex,
+            // and cap reply paths that the per-wake force-preempt
+            // experiment (r25) showed too aggressive.  Each tick still
+            // decrements quantum by 1, so on a busy CPU a wake-up that
+            // can't preempt now waits at most 2 ticks for the running
+            // thread to lose its slice.
+            quantum: 2,
+            default_quantum: 2,
             saved_sp: 0,
             stack_base: 0,
             blocked_on: BlockReason::None,
