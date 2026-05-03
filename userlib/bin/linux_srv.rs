@@ -11408,6 +11408,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         b"lib64/libkeyutils.so.1",
         b"lib64/libkrb5support.so.0",
         b"lib64/libepoxy.so.0",
+        // Transitive deps observed in boot aa9 Xwayland trace —
+        // libharfbuzz pulls in libgraphite2 + libbrotlicommon.  Without
+        // these in preload, Xwayland's constructor phase hits IRFS_IO_*
+        // contention and may stall mid-init (no socket() ever issued).
+        b"lib64/libgraphite2.so.3",
+        b"lib64/libbrotlicommon.so.1",
+        // Top-level binaries init.rs spawns.  ld.so re-opens the
+        // executable to parse Verneed / .gnu.version_r — without
+        // preload, that goes through the slow lazy-populate path
+        // and races, surfacing as "unsupported version N of Verneed
+        // record" (boot cc9mfsq337).
+        b"Xwayland",
+        b"wl_compositor_min",
+        b"xeyes",
     ];
     // Re-enabled eager preload.  Under contention, the lazy populate
     // path lets concurrent Xwayland+xeyes lib loads race for
