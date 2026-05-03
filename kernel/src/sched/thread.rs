@@ -199,17 +199,17 @@ impl Thread {
             port_id: 0,
             base_priority: 128,
             effective_priority: 128,
-            // 2 ticks (~20 ms at 10ms TICK_INTERVAL_NS) caps the "running
-            // thread keeps its CPU" window.  Dropped from the previous
-            // 10 (in two steps: 10 → 4 in c66c8d6, then 4 → 2 here) to
-            // tighten quantum-bound wake latency for port recv, futex,
-            // and cap reply paths that the per-wake force-preempt
-            // experiment (r25) showed too aggressive.  Each tick still
-            // decrements quantum by 1, so on a busy CPU a wake-up that
-            // can't preempt now waits at most 2 ticks for the running
-            // thread to lose its slice.
-            quantum: 2,
-            default_quantum: 2,
+            // 1 tick (~10 ms at TICK_INTERVAL_NS=10 ms): every
+            // contended tick expires the running thread's quantum.
+            // The earlier r28 attempt at 1 livelocked because the
+            // tick handler unconditionally decremented quantum even
+            // when no one else was ready — so the per-tick CS rate
+            // saturated CPU.  Coupled with lazy preemption (skip
+            // quantum decrement when has_ready() == false), 1 is
+            // safe and gives the tightest wake-latency response for
+            // every contended scheduling decision.
+            quantum: 1,
+            default_quantum: 1,
             saved_sp: 0,
             stack_base: 0,
             blocked_on: BlockReason::None,

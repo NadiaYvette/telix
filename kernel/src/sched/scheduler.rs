@@ -2586,21 +2586,45 @@ fn try_switch(current_sp: u64) -> u64 {
         if thread_ref(prev_id).yield_asap.load(Ordering::Acquire) {
             // Will preempt — continue below.
         } else {
-            // Safety: prev_id is Running on this CPU, we own it.
-            let t = unsafe { thread_mut_from_ref(prev_id) };
-            // Advance EEVDF virtual runtime for fair accounting.
-            // Preemption is still quantum-based for stability; EEVDF deadlines
-            // drive dispatch order (earliest-deadline-first) via class_pick_next.
-            if t.sched_class == SCHED_NORMAL && t.effective_priority != 254 {
-                let weight = t.eevdf_weight as u64;
-                t.eevdf_vruntime += VTIME_UNIT / weight;
-            }
-            t.quantum = t.quantum.saturating_sub(1);
-            if t.quantum != 0 {
+            // Lazy preemption: when nothing else is ready on this CPU,
+            // there's no one to switch to anyway, so skip the quantum
+            // decrement entirely.  Without this, every tick still
+            // burned CPU on the saturating_sub + write even when the
+            // current thread had no contender — and at low quanta
+            // (default_quantum=1 in r28) the per-tick CS rate exceeded
+            // TICK_INTERVAL_NS, livelocking the system.  With this
+            // check, ticks-with-no-contender are pure no-ops, and
+            // quantum is only spent during actual contention.
+            let has_contender = {
+                let rq = percpu_rq()[cpu as usize].lock();
+                let ready = rq.has_ready();
+                drop(rq);
+                ready
+            };
+            if has_contender {
+                // Safety: prev_id is Running on this CPU, we own it.
+                let t = unsafe { thread_mut_from_ref(prev_id) };
+                // Advance EEVDF virtual runtime for fair accounting.
+                // Preemption is still quantum-based for stability; EEVDF
+                // deadlines drive dispatch order (earliest-deadline-first)
+                // via class_pick_next.
+                if t.sched_class == SCHED_NORMAL && t.effective_priority != 254 {
+                    let weight = t.eevdf_weight as u64;
+                    t.eevdf_vruntime += VTIME_UNIT / weight;
+                }
+                t.quantum = t.quantum.saturating_sub(1);
+                if t.quantum != 0 {
+                    crate::sync::rcu::rcu_quiescent();
+                    return current_sp; // No preemption needed.
+                }
+                t.quantum = t.default_quantum;
+            } else {
+                // No contender — current thread retains quantum, fall
+                // through to RCU quiescence and return without picking
+                // a "next" thread.
                 crate::sync::rcu::rcu_quiescent();
-                return current_sp; // No preemption needed.
+                return current_sp;
             }
-            t.quantum = t.default_quantum;
         }
     }
 
