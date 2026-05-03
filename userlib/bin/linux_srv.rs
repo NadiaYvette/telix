@@ -2318,7 +2318,10 @@ const FS_SCRATCH_PAGES: usize = 64;
 
 /// Lazily allocate the long-path scratch page and grant it to vfs_task at
 /// LIN_SCRATCH_REMOTE_VA. Returns true if scratch is ready to use.
-fn ensure_lin_path_scratch() -> bool {
+/// Allocate the local path-scratch region (lazily, idempotent).  Does
+/// NOT depend on any FS server being registered — only mmap_anon needs
+/// to succeed.  Returns true once LIN_PATH_SCRATCH_LOCAL is set.
+fn ensure_lin_path_scratch_alloc() -> bool {
     unsafe {
         if LIN_PATH_SCRATCH_LOCAL != 0 {
             return true;
@@ -2341,6 +2344,25 @@ fn ensure_lin_path_scratch() -> bool {
             let p = (va + i * ps) as *mut u8;
             core::ptr::write_volatile(p, 0u8);
         }
+        LIN_PATH_SCRATCH_LOCAL = va;
+        true
+    }
+}
+
+/// True once the vfs_task grant has succeeded.  Decoupled from
+/// ensure_lin_path_scratch_alloc so initramfs grants in
+/// ensure_fs_scratch_grants can proceed even when vfs_task is not yet
+/// registered.
+static mut LIN_PATH_VFS_GRANTED: bool = false;
+
+fn ensure_lin_path_scratch() -> bool {
+    unsafe {
+        if !ensure_lin_path_scratch_alloc() {
+            return false;
+        }
+        if LIN_PATH_VFS_GRANTED {
+            return true;
+        }
         let vfs_task = syscall::ns_lookup(b"vfs_task").unwrap_or(0);
         if vfs_task == 0 {
             return false;
@@ -2348,10 +2370,11 @@ fn ensure_lin_path_scratch() -> bool {
         // RW grant: VFS will normalize-in-place if needed.  VFS only
         // needs the first page for path forwarding; the rest is
         // reserved for FS_READ bulk fills via ensure_fs_scratch_grants.
-        if !syscall::grant_pages(vfs_task, va, LIN_SCRATCH_REMOTE_VA, 1, false) {
+        if !syscall::grant_pages(vfs_task, LIN_PATH_SCRATCH_LOCAL,
+                                 LIN_SCRATCH_REMOTE_VA, 1, false) {
             return false;
         }
-        LIN_PATH_SCRATCH_LOCAL = va;
+        LIN_PATH_VFS_GRANTED = true;
         true
     }
 }
@@ -2360,7 +2383,11 @@ fn ensure_lin_path_scratch() -> bool {
 /// Idempotent: each task is granted at most once. Servers that aren't running
 /// are silently skipped, but FS_SCRATCH_GRANT_TRIED prevents repeated lookups.
 fn ensure_fs_scratch_grants() {
-    if !ensure_lin_path_scratch() {
+    // Local scratch only — initramfs grants don't depend on vfs_task,
+    // so don't gate them on vfs_task registration.  Path scratch grant
+    // for vfs_task is handled by the dedicated ensure_lin_path_scratch
+    // (called by VFS_OPEN_LONG callers).
+    if !ensure_lin_path_scratch_alloc() {
         return;
     }
     unsafe {
@@ -3399,6 +3426,100 @@ fn try_register_irfs_async_reply_port() -> bool {
 /// Some((handle, file_size)) on success, None if the file isn't in
 /// initramfs or initramfs_srv isn't running.  Names up to 24 bytes
 /// (after stripping '/') fit — covers /lib64/libxcvt.so.0 (18 chars).
+/// Eagerly populate the lib_cache for one path.  Walks the file's
+/// chunks via synchronous irfs_read_bulk + ensure_fs_scratch_grants(),
+/// copying into the cache backing region and lighting up
+/// `chunks_cached` bits.  Subsequent concurrent opens by Linux
+/// processes hit the cache immediately and skip initramfs_srv IPC,
+/// avoiding the CALL_REPLY_TIMEOUT / "file too short" cascade
+/// (project_io_read_csum_verified.md).
+///
+/// Silent on missing file (returns false).  Returns false on partial
+/// fill or fetch error so the caller can log; the lazy populate path
+/// in handle_mmap will retry per chunk on first real open.
+fn lib_cache_eager_populate(path: &[u8]) -> bool {
+    let irfs_port = get_initramfs_port();
+    if irfs_port == 0 { return false; }
+    let (handle, file_size) = match try_open_initramfs(path) {
+        Some(t) => t,
+        None => return false,
+    };
+    let cache_idx = match lib_cache_lookup_or_alloc(handle, file_size) {
+        Some(i) => i,
+        None => return false,
+    };
+    ensure_fs_scratch_grants();
+    unsafe {
+        if FS_SCRATCH_GRANTED_MASK & (1 << 4) == 0 {
+            // initramfs_task scratch grant didn't take — preload can't
+            // proceed via irfs_read_bulk's bulk grant path.
+            return false;
+        }
+    }
+    let backing_va = unsafe { LIB_CACHE[cache_idx].backing_va };
+    let chunk_count = unsafe { LIB_CACHE[cache_idx].chunk_count } as usize;
+    for chunk_idx in 0..chunk_count {
+        if cache_chunk_is_cached(cache_idx, chunk_idx) { continue; }
+        let chunk_off = (chunk_idx * CACHE_CHUNK_SIZE) as u64;
+        let chunk_len = CACHE_CHUNK_SIZE.min((file_size - chunk_off) as usize);
+        let got = match irfs_read_bulk(irfs_port, handle, chunk_off, chunk_len) {
+            Some(g) => g,
+            None => return false,
+        };
+        if got < chunk_len {
+            // Short read.  Leave chunk uncached; lazy populate retries.
+            return false;
+        }
+        let dst = (backing_va + chunk_off as usize) as *mut u8;
+        let src = unsafe { LIN_PATH_SCRATCH_LOCAL } as *const u8;
+        // 8-byte stride for the bulk, then byte tail.
+        let words = got / 8;
+        let tail_start = words * 8;
+        let src_u64 = src as *const u64;
+        let dst_u64 = dst as *mut u64;
+        for i in 0..words {
+            unsafe {
+                core::ptr::write_volatile(
+                    dst_u64.add(i),
+                    core::ptr::read_volatile(src_u64.add(i)),
+                );
+            }
+        }
+        for i in tail_start..got {
+            unsafe {
+                core::ptr::write_volatile(
+                    dst.add(i),
+                    core::ptr::read_volatile(src.add(i)),
+                );
+            }
+        }
+        cache_chunk_mark(cache_idx, chunk_idx);
+    }
+    // Verify ELF magic at offset 0 of the populated cache.  This
+    // catches silent corruption where chunks claim to be marked but
+    // backing memory has stale/zero data.  Returns false on mismatch
+    // so the caller's failure count surfaces it.
+    unsafe {
+        let magic = core::slice::from_raw_parts(backing_va as *const u8, 4);
+        if magic != b"\x7fELF" {
+            syscall::debug_puts(b"  [preload] BAD ELF magic for ");
+            syscall::debug_puts(path);
+            syscall::debug_puts(b" h=");
+            print_num(handle);
+            syscall::debug_puts(b" got=");
+            for i in 0..4 {
+                let hex = b"0123456789abcdef";
+                let b = magic[i];
+                syscall::debug_putchar(hex[(b >> 4) as usize]);
+                syscall::debug_putchar(hex[(b & 0xF) as usize]);
+            }
+            syscall::debug_puts(b"\n");
+            return false;
+        }
+    }
+    true
+}
+
 fn try_open_initramfs(path: &[u8]) -> Option<(u64, u64)> {
     let irfs_port = get_initramfs_port();
     if irfs_port == 0 {
@@ -11104,17 +11225,51 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         b"lib64/libkrb5support.so.0",
         b"lib64/libepoxy.so.0",
     ];
-    // Skip eager preload entirely — it ran at linux_srv startup before
-    // initramfs_srv registered `initramfs_task`, so grants never took and
-    // every populate either failed early (no grant) or leaked an
-    // mmap_anon allocation when irfs_read_bulk returned None.  The lazy
-    // populate path inside `try_open_initramfs` handles the same cache
-    // population on first open by a Linux process — by which point all
-    // ns aliases are registered and grants succeed cleanly.  Suppresses
-    // the `Could not write pid to lock file` chain that traced back to
-    // populate-leak-induced ENOMEM.
-    let _ = preload_libs;
-    syscall::debug_puts(b"[linux_srv] preload skipped (lazy populate on first open)\n");
+    // Re-enabled eager preload.  Under contention, the lazy populate
+    // path lets concurrent Xwayland+xeyes lib loads race for
+    // initramfs_srv, hit CALL_REPLY_TIMEOUT at 30s, and surface as
+    // "file too short" / "Verdef version 0" amplification (Xwayland dies
+    // before binding X0).  Eager populate runs sequentially with no
+    // contention and warms the cache for every common Xwayland/xeyes
+    // lib.  Subsequent opens hit cache and skip initramfs_srv IPC.
+    //
+    // The earlier skip-reason ("ran before initramfs_srv registered")
+    // was a real ordering problem: ensure_fs_scratch_grants needs both
+    // vfs_task (to grant LIN_PATH_SCRATCH_LOCAL) AND initramfs_task
+    // (to grant the same scratch for IRFS reads).  We wait below until
+    // the initramfs_task grant takes, then preload.  If grants don't
+    // arrive within 5 s, fall back to lazy populate (logged).
+    {
+        let mut grants_ready = false;
+        for _ in 0..50 {
+            ensure_fs_scratch_grants();
+            unsafe {
+                if FS_SCRATCH_GRANTED_MASK & (1 << 4) != 0 {
+                    grants_ready = true;
+                    break;
+                }
+            }
+            syscall::sleep_ms(100);
+        }
+        if !grants_ready {
+            syscall::debug_puts(b"[linux_srv] eager preload: grants not ready in 5s, skipping\n");
+        } else {
+            let mut preloaded = 0usize;
+            let mut failed = 0usize;
+            for &lib_path in preload_libs.iter() {
+                if lib_cache_eager_populate(lib_path) {
+                    preloaded += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+            syscall::debug_puts(b"[linux_srv] eager preload done: ok=");
+            print_num(preloaded as u64);
+            syscall::debug_puts(b" failed=");
+            print_num(failed as u64);
+            syscall::debug_puts(b"\n");
+        }
+    }
 
     // Round-robin sweep index for dead-process cleanup.  One slot checked
     // per main-loop iteration so the cost stays O(1) per dispatch.  When
@@ -11125,7 +11280,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // hang: hello_wl crashed, its UDS socket wasn't closed, compositor's
     // recv() blocked on dead peer.  See reaper below.
     let mut reaper_idx: usize = 0;
-    let _ = preload_libs;
 
     loop {
         expire_futex_waiters();
