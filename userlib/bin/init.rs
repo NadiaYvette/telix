@@ -9115,8 +9115,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             // fire soon enough that the Xwayland @1s X0 bind
                             // (which we now reliably reach) catches the
                             // xeyes connect on the second try.
+                            //
+                            // Linear backoff after the first retry: in the
+                            // slow-boot variant (iia: Xwayland's lib load +
+                            // init takes longer than ~2 s wallclock from
+                            // fork) attempts 1+2 both fire before X0 is
+                            // bound, then attempts 3-6 burn through their
+                            // 1 s gaps before boot timeout.  Scaling the
+                            // gap as `100 * attempt` gives 1/2/3/4/5 s
+                            // gaps for attempts 2/3/4/5/6 — total spread
+                            // ~15 s, well within the 120 s H13 wait
+                            // budget, and a much better chance for slow
+                            // Xwayland init to land between attempts.
                             if xeyes_code != 0 && xeyes_attempt < MAX_XEYES_ATTEMPTS {
-                                next_xeyes_fork_i = i as i32 + 100;
+                                next_xeyes_fork_i = i as i32 + 100 * (xeyes_attempt as i32);
                             }
                         }
                         // Refork xeyes once the schedule fires.
