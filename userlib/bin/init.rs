@@ -793,14 +793,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     static PATH: &[u8] = b"/wl_compositor_min\0";
                     static A0: &[u8]   = b"wl_compositor_min\0";
                     static A1: &[u8]   = b"--one-shot\0";
-                    let argv: [u64; 3] = [A0.as_ptr() as u64, A1.as_ptr() as u64, 0];
-                    let envp: [u64; 1] = [0];
+                    // Same rustc-elision workaround as the Xwayland and
+                    // xeyes spawns: stack-local argv/envp arrays only
+                    // observed via .as_ptr() can be elided.  The
+                    // compositor has only happened to work because its
+                    // envp is NULL-only — bug latent if stack happens
+                    // to be non-zero. See project_xeyes_envp_compiler_elision.
+                    static mut COMP_ARGV: [u64; 3] = [0; 3];
+                    static mut COMP_ENVP: [u64; 1] = [0; 1];
+                    COMP_ARGV[0] = A0.as_ptr() as u64;
+                    COMP_ARGV[1] = A1.as_ptr() as u64;
+                    COMP_ARGV[2] = 0;
+                    COMP_ENVP[0] = 0;
                     core::arch::asm!(
                         "int 0x80",
                         inlateout("rax") 59u64 => _,
                         in("rdi") PATH.as_ptr() as u64,
-                        in("rsi") argv.as_ptr() as u64,
-                        in("rdx") envp.as_ptr() as u64,
+                        in("rsi") &raw const COMP_ARGV as u64,
+                        in("rdx") &raw const COMP_ENVP as u64,
                         lateout("rcx") _, lateout("r11") _,
                     );
                     core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 98u64, options(noreturn));
@@ -8817,14 +8827,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     static PATH: &[u8] = b"/wl_compositor_min\0";
                     static A0: &[u8]   = b"wl_compositor_min\0";
                     static A1: &[u8]   = b"--one-shot\0";
-                    let argv: [u64; 3] = [A0.as_ptr() as u64, A1.as_ptr() as u64, 0];
-                    let envp: [u64; 1] = [0];
+                    // Same rustc-elision workaround as the Xwayland and
+                    // xeyes spawns: stack-local argv/envp arrays only
+                    // observed via .as_ptr() can be elided.  The
+                    // compositor has only happened to work because its
+                    // envp is NULL-only — bug latent if stack happens
+                    // to be non-zero. See project_xeyes_envp_compiler_elision.
+                    static mut COMP_ARGV: [u64; 3] = [0; 3];
+                    static mut COMP_ENVP: [u64; 1] = [0; 1];
+                    COMP_ARGV[0] = A0.as_ptr() as u64;
+                    COMP_ARGV[1] = A1.as_ptr() as u64;
+                    COMP_ARGV[2] = 0;
+                    COMP_ENVP[0] = 0;
                     core::arch::asm!(
                         "int 0x80",
                         inlateout("rax") 59u64 => _,
                         in("rdi") PATH.as_ptr() as u64,
-                        in("rsi") argv.as_ptr() as u64,
-                        in("rdx") envp.as_ptr() as u64,
+                        in("rsi") &raw const COMP_ARGV as u64,
+                        in("rdx") &raw const COMP_ENVP as u64,
                         lateout("rcx") _, lateout("r11") _,
                     );
                     core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 98u64, options(noreturn));
