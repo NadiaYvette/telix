@@ -2643,6 +2643,16 @@ const DEBUG_SHORT_READ: bool = true;
 /// normal boots; flip to `true` to debug cache-hit/miss patterns.
 const DEBUG_MMAP_TRACE: bool = false;
 
+/// Diagnostic: log every syscall (entry + exit + path arg for
+/// path-bearing syscalls) for traced PIDs.  Each entry emits 9-12
+/// debug_puts IPCs and fires on EVERY syscall the traced process
+/// makes — much more frequent than DEBUG_MMAP_TRACE.  Disabling it
+/// freed up enough budget on yy9 to let Xwayland's main() reach the
+/// banner-print point.  Keep `false` for normal/perf boots; flip to
+/// `true` to debug syscall sequences (used heavily during the
+/// libxcb / DISPLAY-format / envp-elision diagnoses).
+const DEBUG_TRACE_PI: bool = false;
+
 fn irfs_csum32(data: &[u8]) -> u32 {
     let mut s1: u32 = 0;
     let mut s2: u32 = 0;
@@ -11551,7 +11561,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // X11 connection setup (DISPLAY-format / env-propagation
         // diagnosis, see project_libxcb_unix_bug.md).
         unsafe {
-            if trace_pi_match(pi) {
+            if DEBUG_TRACE_PI && trace_pi_match(pi) {
                 syscall::debug_puts(b"[trace] >>nr=");
                 print_num(linux_nr);
                 syscall::debug_puts(b" d0=");
@@ -12053,7 +12063,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Phase 172 EFAULT trace: show the return value before reply.
         unsafe {
-            if trace_pi_match(pi) {
+            if DEBUG_TRACE_PI && trace_pi_match(pi) {
                 syscall::debug_puts(b"[trace] <<nr=");
                 print_num(linux_nr);
                 // Print as signed: negative errno values show as very large numbers
