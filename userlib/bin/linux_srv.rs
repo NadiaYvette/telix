@@ -9438,6 +9438,14 @@ fn handle_connect(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             // r21 didn't see any [linux_srv connect basename[X0]] line, so
             // either xeyes never reached connect() or it tried something
             // other than "X0" — log everything to find out.
+            // tag = UDS_OK (0x8100=33024) → success, data[0] = client-end
+            //                                   handle (NOT an error code)
+            // tag = UDS_ERROR (0x8F00=36608) → failure, data[0] = errno
+            //                                   (1=ECONNREFUSED, 2=ENFILE,
+            //                                   3=ECONNREFUSED-queue-full)
+            // Print result/handle accordingly so logs aren't confusing
+            // (the prior "err=N" label was unconditional and made
+            // successful connects look like errors).
             syscall::debug_puts(b"  [linux_srv connect] tag=");
             print_num(resp.tag);
             syscall::debug_puts(b" nlen=");
@@ -9448,7 +9456,11 @@ fn handle_connect(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                 let s = if bb >= 32 && bb < 127 { [bb] } else { [b'?'] };
                 syscall::debug_puts(&s);
             }
-            syscall::debug_puts(b"] err=");
+            if resp.tag == UDS_OK {
+                syscall::debug_puts(b"] OK handle=");
+            } else {
+                syscall::debug_puts(b"] ERR errno=");
+            }
             print_num(resp.data[0]);
             syscall::debug_puts(b"\n");
             if resp.tag != UDS_OK { return linux_err(ECONNREFUSED); }
