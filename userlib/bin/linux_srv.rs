@@ -1815,8 +1815,8 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         // Diagnostic: log cache-hit/miss per Initramfs read for traced
         // pids.  Helps localize which path serves corrupt data when
         // ld.so reports "invalid ELF header" despite preload reporting
-        // success.
-        if trace_pi_match(pi) {
+        // success.  Gated on DEBUG_MMAP_TRACE — see flag comment.
+        if DEBUG_MMAP_TRACE && trace_pi_match(pi) {
             let (slot_handle, slot_chunks_cached, slot_chunk_count, full_mask) =
                 if let Some(slot_idx) = (0..LIB_CACHE_MAX).find(|&i| unsafe {
                     LIB_CACHE[i].in_use && LIB_CACHE[i].irfs_handle == handle
@@ -2635,6 +2635,13 @@ const DEBUG_IO_READ_CSUM: bool = false;
 /// the upstream of "Verdef version 0" / "file too short" / "cannot
 /// read file data".
 const DEBUG_SHORT_READ: bool = true;
+
+/// Diagnostic: log every Initramfs read/mmap for traced PIDs with the
+/// cache-slot status.  Each log emits ~10 debug_puts IPCs and adds
+/// significant per-call overhead under contention — vv9 measurement
+/// pinned ~9 s wallclock per mmap with this on.  Keep `false` for
+/// normal boots; flip to `true` to debug cache-hit/miss patterns.
+const DEBUG_MMAP_TRACE: bool = false;
 
 fn irfs_csum32(data: &[u8]) -> u32 {
     let mut s1: u32 = 0;
@@ -6193,7 +6200,8 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                 FdKind::Initramfs => {
                     // Diagnostic: log cache state per Initramfs mmap for
                     // traced pids.  See handle_read for rationale.
-                    if trace_pi_match(pi) {
+                    // Gated on DEBUG_MMAP_TRACE — see flag comment.
+                    if DEBUG_MMAP_TRACE && trace_pi_match(pi) {
                         let (slot_handle, slot_chunks_cached, slot_chunk_count, full_mask) =
                             if let Some(slot_idx) = (0..LIB_CACHE_MAX).find(|&i| unsafe {
                                 LIB_CACHE[i].in_use && LIB_CACHE[i].irfs_handle == handle

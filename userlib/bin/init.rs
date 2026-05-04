@@ -8878,12 +8878,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         // path (one IPC per call) and serial-prints
                         // synchronously — at -verbose 3 that's hundreds
                         // of round trips during lib load, glamor probe,
-                        // and wayland init.  Bumped to 3 for diagnosis;
-                        // back to 0 now that the X-lock blocker is
-                        // fixed (commit 70c88ee), since the extra
-                        // contention slows xeyes+Xwayland loads enough
-                        // to surface a separate lib-content corruption
-                        // flake from grant_pages races.
+                        // and wayland init.
                         static A2: &[u8]   = b"-verbose\0";
                         static A3: &[u8]   = b"0\0";
                         static E0: &[u8]   = b"LD_LIBRARY_PATH=/lib64\0";
