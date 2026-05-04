@@ -294,6 +294,12 @@ fn lock_aspace(id: ASpaceId) -> Option<crate::sync::SpinLockGuard<'static, Addre
 }
 
 /// Access an address space by ID within a closure. Panics if not found.
+///
+/// `#[track_caller]` makes the panic message show the caller's file:line
+/// instead of pointing here, so an "aspace N not found" panic immediately
+/// names which call site looked up a destroyed aspace.  Diagnostic for the
+/// aspace race exposed by boot eea (post-c7bb3e1).
+#[track_caller]
 pub fn with_aspace<F, R>(id: ASpaceId, f: F) -> R
 where
     F: FnOnce(&mut AddressSpace) -> R,
