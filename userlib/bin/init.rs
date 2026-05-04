@@ -8877,14 +8877,33 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         // exit path).  C locale bypasses it.
                         static E3: &[u8]   = b"LANG=C\0";
                         static E4: &[u8]   = b"LC_ALL=C\0";
-                        let argv: [u64; 5] = [A0.as_ptr() as u64, A1.as_ptr() as u64, A2.as_ptr() as u64, A3.as_ptr() as u64, 0];
-                        let envp: [u64; 6] = [E0.as_ptr() as u64, E1.as_ptr() as u64, E2.as_ptr() as u64, E3.as_ptr() as u64, E4.as_ptr() as u64, 0];
+                        // Same rustc-elision workaround as the xeyes
+                        // spawn below: stack-local argv/envp arrays only
+                        // observed via .as_ptr() can be elided, leaving
+                        // the kernel reading stale stack memory as our
+                        // pointer table.  Symptom: Xwayland's ld.so sees
+                        // garbage env values and aborts with paths like
+                        // "/lib64/tive: file too short".
+                        // See project_xeyes_envp_compiler_elision.md.
+                        static mut XWAYLAND_ARGV: [u64; 5] = [0; 5];
+                        static mut XWAYLAND_ENVP: [u64; 6] = [0; 6];
+                        XWAYLAND_ARGV[0] = A0.as_ptr() as u64;
+                        XWAYLAND_ARGV[1] = A1.as_ptr() as u64;
+                        XWAYLAND_ARGV[2] = A2.as_ptr() as u64;
+                        XWAYLAND_ARGV[3] = A3.as_ptr() as u64;
+                        XWAYLAND_ARGV[4] = 0;
+                        XWAYLAND_ENVP[0] = E0.as_ptr() as u64;
+                        XWAYLAND_ENVP[1] = E1.as_ptr() as u64;
+                        XWAYLAND_ENVP[2] = E2.as_ptr() as u64;
+                        XWAYLAND_ENVP[3] = E3.as_ptr() as u64;
+                        XWAYLAND_ENVP[4] = E4.as_ptr() as u64;
+                        XWAYLAND_ENVP[5] = 0;
                         core::arch::asm!(
                             "int 0x80",
                             inlateout("rax") 59u64 => _,
                             in("rdi") PATH.as_ptr() as u64,
-                            in("rsi") argv.as_ptr() as u64,
-                            in("rdx") envp.as_ptr() as u64,
+                            in("rsi") &raw const XWAYLAND_ARGV as u64,
+                            in("rdx") &raw const XWAYLAND_ENVP as u64,
                             lateout("rcx") _, lateout("r11") _,
                         );
                         core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 97u64, options(noreturn));

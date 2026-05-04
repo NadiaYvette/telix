@@ -11417,11 +11417,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // NOTE: binary preload (Xwayland/wl_compositor_min/xeyes) is
         // unsafe — boot dd9mfsq338 hit a kernel triple-fault on the
         // next fork, gg9mfsq341 saw garbled error path strings (memory
-        // corruption symptom).  Both with the same code, different
-        // boots → non-deterministic.  Likely a kernel-side aspace/VMA
-        // edge case exposed by the additional cache backing pages in
-        // linux_srv.  Until that bug is found and fixed, only preload
-        // libs (which have been stable for many boots).
+        // corruption symptom).  Bisect (kk9 xeyes-only SAFE / ll9
+        // Xwayland-only) showed Xwayland-in-preload broke Xwayland's
+        // own runtime lib loader (corrupt /lib64/<garbled>: file too
+        // short paths), but the same corruption flaked WITHOUT
+        // Xwayland in preload (mm9) — preload is not the trigger.
+        // Real root cause turned out to be the rustc-elision bug on
+        // Xwayland's argv/envp (project_xeyes_envp_compiler_elision).
+        // Keeping libs-only preload until any kernel-side aspace/VMA
+        // edge case from binary preload is independently audited.
     ];
     // Re-enabled eager preload.  Under contention, the lazy populate
     // path lets concurrent Xwayland+xeyes lib loads race for
