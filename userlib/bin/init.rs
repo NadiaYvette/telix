@@ -558,6 +558,51 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5k: nat_srv ETH_SUBSCRIBE auto-translate wiring ---
+    // Spawns nat_srv, gives it a moment to subscribe to eth_srv via
+    // ETH_SUBSCRIBE, then queries NAT_STATS and confirms the
+    // SUBSCRIBED bit (bit 32 of data[0]) is set.  Pass criterion is
+    // just "the auto-subscription handshake completed at startup" —
+    // proves the forwarding-plane substrate (Piece a) is composing
+    // cleanly with the NAT engine.  Real frame-translation
+    // verification waits on the NETIF_XMIT egress integration.
+    syscall::debug_puts(b"  init: running nat_srv ETH_SUBSCRIBE wiring smoke...\n");
+    {
+        let nat_tid = syscall::spawn(b"nat_srv", 50);
+        if nat_tid != u64::MAX {
+            // Give nat_srv time to register itself and complete the
+            // ETH_SUBSCRIBE handshake (~50 yields ≈ a few ms).
+            for _ in 0..200 { syscall::yield_now(); }
+            syscall::sleep_ms(50);
+            match syscall::ns_lookup(b"nat") {
+                Some(nat_port) => {
+                    match syscall::call(nat_port, 0x7C40, 0, 0, 0, 0) {
+                        Some(resp) if resp.tag == 0x7C41 => {
+                            // Bit 32 of data[0] = SUBSCRIBED flag.
+                            let subscribed = (resp.data[0] >> 32) & 1 != 0;
+                            if subscribed {
+                                syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE wiring: PASSED\n");
+                            } else {
+                                syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE wiring: FAILED (not subscribed)\n");
+                            }
+                        }
+                        Some(_) => {
+                            syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE wiring: FAILED (bad reply)\n");
+                        }
+                        None => {
+                            syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE wiring: FAILED (call timeout)\n");
+                        }
+                    }
+                }
+                None => {
+                    syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE wiring: FAILED (ns_lookup)\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE wiring: FAILED (spawn)\n");
+        }
+    }
+
     // --- Phase 5h: scheduler call/reply stress (deferred-requeue race repro) ---
     // Skipped under FOCUS_H13 because sched_stress occasionally wedges
     // (WEDGED — giving up) without exiting, which deadlocks init's

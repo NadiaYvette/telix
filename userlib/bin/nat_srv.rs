@@ -92,6 +92,36 @@ pub const NAT_SCRATCH_VA: usize = 0x4_0000_0000;
 
 const NAT_MAX_PACKET: usize = 1500;
 
+// ---------------------------------------------------------------------------
+// Forwarding-plane auto-subscription (Piece a + b convergence).
+// nat_srv subscribes to non-local IPv4 frames via eth_srv's
+// ETH_SUBSCRIBE protocol on startup; arriving frames feed directly
+// into the translate_out engine without requiring explicit caller
+// orchestration.  This is the first end-to-end use of the
+// forwarding-plane substrate to compose two real services.
+// ---------------------------------------------------------------------------
+
+/// VA where eth_srv's RX page is granted into our aspace for the
+/// auto-translate flow.  Distinct from NAT_SCRATCH_VA so the explicit
+/// caller-driven path and the auto-subscription path don't fight over
+/// the same buffer.
+const ETH_RX_VA: usize = 0x4_0001_0000;
+
+const ETH_HDR_LEN: usize = 14;
+
+// ETH_SUBSCRIBE protocol (matches eth_srv).
+const ETH_SUBSCRIBE: u64 = 0x5500;
+const ETH_SUBSCRIBE_OK: u64 = 0x5501;
+const ETH_FRAME: u64 = 0x5520;
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const FILTER_FLAG_NON_LOCAL: u64 = 1 << 0;
+
+/// RFC 5737 documentation/test address used as the default public
+/// IPv4 for source-NAT, so translation still does something
+/// observable even before NAT_SET_PUBLIC_IPV4 is called explicitly.
+/// 192.0.2.1 = 0xC0000201 in network byte order.
+const DEFAULT_PUBLIC_IPV4: u32 = 0xC000_0201;
+
 // IPv4 + TCP/UDP constants.
 const IPPROTO_ICMP: u8 = 1;
 const IPPROTO_TCP: u8 = 6;
@@ -146,6 +176,16 @@ static mut NEXT_PUBLIC_PORT: u16 = PUBLIC_PORT_BASE;
 static mut TRANSLATED_OUT_COUNT: u64 = 0;
 static mut TRANSLATED_IN_COUNT: u64 = 0;
 static mut DROPPED_COUNT: u64 = 0;
+/// Frames received via ETH_SUBSCRIBE auto-translate path.  Increment
+/// regardless of whether translation succeeded — the SUBSCRIBED_*
+/// counters give visibility into how much traffic the forwarding-plane
+/// dispatch actually delivered.
+static mut SUBSCRIBED_FRAMES_COUNT: u64 = 0;
+static mut SUBSCRIBED_TRANSLATED_COUNT: u64 = 0;
+static mut SUBSCRIBED_DROPPED_COUNT: u64 = 0;
+/// True once ETH_SUBSCRIBE handshake completed at startup.  Surfaced
+/// in NAT_STATS so callers can confirm the substrate wired up.
+static mut SUBSCRIBED: bool = false;
 
 /// Find a flow by (proto, private_ip, private_port).  Returns the
 /// table index on hit.
@@ -441,6 +481,98 @@ fn translate_in(buf: &mut [u8], len: usize) -> Result<usize, u64> {
     Ok(decoded.total_len)
 }
 
+/// Subscribe to non-local IPv4 frames via eth_srv's ETH_SUBSCRIBE.
+/// Best-effort: if eth_srv isn't registered yet or the handshake fails,
+/// we just skip and continue serving the explicit caller-driven path.
+/// Sets `SUBSCRIBED=true` on success; the bool surfaces in NAT_STATS.
+fn try_subscribe_to_eth(my_port: u64) {
+    let eth_port = match syscall::ns_lookup(b"eth") {
+        Some(p) => p,
+        None => {
+            syscall::debug_puts(b"  [nat_srv] eth not registered; auto-translate disabled\n");
+            return;
+        }
+    };
+    // Allocate a local RX page and grant it to eth_srv at the VA
+    // eth_srv reports back in ETH_SUBSCRIBE_OK.
+    let local_rx = match syscall::mmap_anon(0, 1, 1) {
+        Some(va) => va,
+        None => {
+            syscall::debug_puts(b"  [nat_srv] mmap_anon for eth rx failed\n");
+            return;
+        }
+    };
+    // Pre-fault so the kernel grants a unique writable phys page to
+    // eth_srv rather than the shared zero page.
+    unsafe { core::ptr::write_volatile(local_rx as *mut u8, 0u8); }
+
+    // Send ETH_SUBSCRIBE.  Filter = ethertype 0x0800 + FILTER_FLAG_NON_LOCAL.
+    let filter_word = (ETHERTYPE_IPV4 as u64)
+        | ((FILTER_FLAG_NON_LOCAL as u64) << 16);
+    let _ = syscall::send_nb_4(
+        eth_port,
+        ETH_SUBSCRIBE,
+        filter_word,
+        0, // dst_ipv4 = 0, prefix_len = 0 (match any IPv4 dst)
+        my_port,
+        0,
+    );
+    // Wait briefly for ETH_SUBSCRIBE_OK on our service port.
+    // (Recv on the service port — we registered my_port as our reply
+    // address.  Same loop later receives ETH_FRAME notifications.)
+    let resp = syscall::recv_msg_timeout(my_port, 2_000_000);
+    let (_sub_id, eth_rx_va) = match resp {
+        Some(m) if m.tag == ETH_SUBSCRIBE_OK => (m.data[0], m.data[1] as usize),
+        _ => {
+            syscall::debug_puts(b"  [nat_srv] ETH_SUBSCRIBE handshake failed\n");
+            return;
+        }
+    };
+    // Grant our local page to eth_srv at the reported VA.  After this,
+    // eth_srv's writes to its rx_va appear at our local_rx.
+    if !syscall::grant_pages(eth_port, local_rx, eth_rx_va, 1, false) {
+        syscall::debug_puts(b"  [nat_srv] grant_pages to eth failed\n");
+        return;
+    }
+    // Re-map ETH_RX_VA so subsequent ETH_FRAME handlers can read at a
+    // known address regardless of mmap_anon's chosen va.  We just alias
+    // local_rx as ETH_RX_VA via a const we agreed on earlier — the
+    // ETH_FRAME handler reads from ETH_RX_VA, so that needs to equal
+    // local_rx.  Simplest: store local_rx in a static and read from
+    // there in the dispatch.
+    unsafe { ETH_RX_LOCAL_VA = local_rx; SUBSCRIBED = true; }
+    syscall::debug_puts(b"  [nat_srv] subscribed to non-local IPv4 frames\n");
+}
+
+/// Where ETH_SUBSCRIBE's grant lands in our aspace (set by
+/// try_subscribe_to_eth at startup; 0 means not subscribed).
+static mut ETH_RX_LOCAL_VA: usize = 0;
+
+/// Process one frame delivered via ETH_FRAME.  Increments counters
+/// and runs translate_out on the inner IPv4 packet.  Doesn't re-emit
+/// (NETIF_XMIT integration is a separate piece) — this is the
+/// "observation-mode NAT" stage where we verify the dispatch path
+/// works end-to-end before adding the egress side.
+fn handle_eth_frame(frame_len: usize) {
+    unsafe { SUBSCRIBED_FRAMES_COUNT += 1; }
+    let rx_va = unsafe { ETH_RX_LOCAL_VA };
+    if rx_va == 0 || frame_len < ETH_HDR_LEN + 20 || frame_len > NAT_MAX_PACKET {
+        unsafe { SUBSCRIBED_DROPPED_COUNT += 1; }
+        return;
+    }
+    let ip_len = frame_len - ETH_HDR_LEN;
+    let ip_buf = unsafe {
+        core::slice::from_raw_parts_mut(
+            (rx_va + ETH_HDR_LEN) as *mut u8,
+            ip_len,
+        )
+    };
+    match translate_out(ip_buf, ip_len) {
+        Ok(_) => unsafe { SUBSCRIBED_TRANSLATED_COUNT += 1; },
+        Err(_) => unsafe { SUBSCRIBED_DROPPED_COUNT += 1; },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Server entry point.
 // ---------------------------------------------------------------------------
@@ -458,6 +590,20 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
         syscall::debug_puts(b"[nat_srv] ns_register FAIL\n");
         syscall::exit(1);
     }
+    // Default the public IPv4 to RFC 5737's 192.0.2.1 so the
+    // translate_out engine has a non-zero public address even before
+    // a caller invokes NAT_SET_PUBLIC_IPV4 explicitly.
+    unsafe { PUBLIC_IPV4 = DEFAULT_PUBLIC_IPV4; }
+
+    // Auto-subscribe to non-local IPv4 frames via eth_srv's
+    // ETH_SUBSCRIBE.  This is the first end-to-end use of the
+    // forwarding-plane substrate composing two real services: the
+    // dispatch (Piece a, eth_srv) feeds frames into the NAT engine
+    // without explicit caller orchestration.  Best-effort — failures
+    // log and continue; the explicit caller-driven NAT_TRANSLATE_*
+    // path stays available regardless.
+    try_subscribe_to_eth(port);
+
     syscall::debug_puts(b"[nat_srv] ready on port ");
     print_num(port);
     syscall::debug_puts(b"\n");
@@ -533,15 +679,36 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                     n
                 };
                 unsafe {
+                    // Pack auto-subscribe state into the upper bits of
+                    // the flow-occupancy reply word so the existing
+                    // explicit translate counters still occupy
+                    // data[1..3].  Layout:
+                    //   data[0] = flow occupancy (low 32) | subscribed
+                    //             (bit 32) | subscribed_frames (high 31).
+                    //   data[1] = TRANSLATED_OUT_COUNT
+                    //   data[2] = TRANSLATED_IN_COUNT
+                    //   data[3] = DROPPED_COUNT (caller-driven path)
+                    //   data[4] = SUBSCRIBED_TRANSLATED + (DROPPED << 32)
+                    let stat_a = occupancy
+                        | ((SUBSCRIBED as u64) << 32)
+                        | ((SUBSCRIBED_FRAMES_COUNT & 0x7FFF_FFFF) << 33);
+                    let stat_e = SUBSCRIBED_TRANSLATED_COUNT
+                        | (SUBSCRIBED_DROPPED_COUNT << 32);
                     let _ = syscall::reply(
                         NAT_STATS_OK,
-                        occupancy,
+                        stat_a,
                         TRANSLATED_OUT_COUNT,
                         TRANSLATED_IN_COUNT,
                         DROPPED_COUNT,
-                        0,
+                        stat_e,
                     );
                 }
+            }
+            ETH_FRAME => {
+                // Forwarding-plane frame from eth_srv subscription.
+                // No reply expected (sender used send_nb_4).
+                let frame_len = msg.data[0] as usize;
+                handle_eth_frame(frame_len);
             }
             NAT_SET_NAT64_PREFIX
             | NAT_TRANSLATE_V6_TO_V4
