@@ -481,6 +481,47 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5i: content-addressed service registry smoke test ---
+    // Spawns servicereg_srv + servicereg_test; the test exercises
+    // register / lookup / re-register / method-mask / unregister
+    // and exits 0 on full pass.  Always runs (even under FOCUS_H13)
+    // because the registry is a load-bearing piece of the
+    // distributed-bonding work and we want any regression visible
+    // in every boot.
+    syscall::debug_puts(b"  init: running servicereg smoke test...\n");
+    {
+        let _reg_tid = syscall::spawn(b"servicereg_srv", 50);
+        // Brief grace period for servicereg_srv to register itself in
+        // the kernel name server before the test starts polling for it.
+        // The test itself polls ns_lookup with a 5 s timeout so the
+        // exact spawn order is not strict.
+        for _ in 0..50 { syscall::yield_now(); }
+        let test_tid = syscall::spawn(b"servicereg_test", 50);
+        if test_tid != u64::MAX {
+            let mut waited = 0u32;
+            loop {
+                if let Some(code) = syscall::waitpid(test_tid) {
+                    if code == 0 {
+                        syscall::debug_puts(b"Phase 5i servicereg smoke: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 5i servicereg smoke: FAILED code=");
+                        print_num(code);
+                        syscall::debug_puts(b"\n");
+                    }
+                    break;
+                }
+                syscall::sleep_ms(10);
+                waited += 1;
+                if waited > 1500 {
+                    syscall::debug_puts(b"Phase 5i servicereg smoke: FAILED (timeout)\n");
+                    break;
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 5i servicereg smoke: FAILED (spawn)\n");
+        }
+    }
+
     // --- Phase 5h: scheduler call/reply stress (deferred-requeue race repro) ---
     // Skipped under FOCUS_H13 because sched_stress occasionally wedges
     // (WEDGED — giving up) without exiting, which deadlocks init's
