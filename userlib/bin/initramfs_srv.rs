@@ -3,6 +3,8 @@
 
 extern crate userlib;
 
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use userlib::syscall;
 
 // I/O protocol tags (must match kernel/src/io/protocol.rs).
@@ -231,33 +233,122 @@ fn print_num(n: u64) {
 /// table here).  Zero means async reads have not been wired up — fall
 /// back to refusing IO_READ_ASYNC with IO_ERROR rather than silently
 /// dropping notifications.
-static mut ASYNC_REPLY_PORT: u64 = 0;
+///
+/// Atomic because under the worker-pool design (N threads recv'ing
+/// from the shared port) one worker may handle the IO_SET while
+/// another concurrently handles an IO_READ_ASYNC; Acquire-load
+/// pairs with the Release-store on update.
+static ASYNC_REPLY_PORT: AtomicU64 = AtomicU64::new(0);
+
+/// Worker-pool globals.  initramfs_srv is single-task but multi-thread:
+/// after `main` parses the cpio archive into `FS`, it spawns
+/// (N_WORKERS - 1) sibling threads and itself enters the same server
+/// loop, so all N threads park on the same shared port and the kernel
+/// dispatches one parked recv per arriving message.  Post-parse state
+/// (`FS`, the cpio data slice, port id, aspace id) is read-only,
+/// hence safe to share without locking.
+const N_WORKERS: usize = 4;
+static mut CPIO_DATA_VA: u64 = 0;
+static mut CPIO_DATA_LEN: u64 = 0;
+static mut FS: Initramfs = Initramfs::new();
+static mut PORT_ID: u64 = 0;
+static mut MY_ASPACE: u64 = 0;
+/// Release-store after main has populated FS, CPIO_DATA_VA/LEN, PORT_ID,
+/// MY_ASPACE.  Workers spin on Acquire-load so all those plain writes
+/// are guaranteed visible before any worker reads them.  Without this
+/// gate we'd be relying on thread_create's implicit fence — works in
+/// practice but unspecified.
+static WORKERS_READY: AtomicBool = AtomicBool::new(false);
+
+fn cpio_slice() -> &'static [u8] {
+    unsafe { core::slice::from_raw_parts(CPIO_DATA_VA as *const u8, CPIO_DATA_LEN as usize) }
+}
+
+fn fs_ref() -> &'static Initramfs {
+    unsafe { &*core::ptr::addr_of!(FS) }
+}
+
+fn alloc_stack() -> u64 {
+    let va = match syscall::mmap_anon(0, 2, 1) {
+        Some(v) => v,
+        None => return 0,
+    };
+    (va + 2 * syscall::page_size()) as u64
+}
+
+extern "C" fn worker_entry(_arg: u64) -> ! {
+    while !WORKERS_READY.load(Ordering::Acquire) {
+        syscall::yield_now();
+    }
+    let port = unsafe { PORT_ID };
+    let my_aspace = unsafe { MY_ASPACE };
+    server_loop(port, my_aspace, cpio_slice(), fs_ref());
+    syscall::exit(0)
+}
 
 /// Entry: arg0 = port ID, arg1 = CPIO data VA, arg2 = CPIO data length.
 #[unsafe(no_mangle)]
 fn main(port_id: u64, data_va: u64, data_len: u64) {
     let cpio_data = unsafe { core::slice::from_raw_parts(data_va as *const u8, data_len as usize) };
 
-    let mut fs = Initramfs::new();
-    fs.parse(cpio_data);
+    unsafe {
+        CPIO_DATA_VA = data_va;
+        CPIO_DATA_LEN = data_len;
+        (*core::ptr::addr_of_mut!(FS)).parse(cpio_data);
+        PORT_ID = port_id;
+        MY_ASPACE = syscall::aspace_id();
+    }
+    let count = unsafe { (*core::ptr::addr_of!(FS)).count };
+    let my_aspace = unsafe { MY_ASPACE };
 
     syscall::debug_puts(b"  [initramfs_srv] parsed ");
-    print_num(fs.count as u64);
+    print_num(count as u64);
     syscall::debug_puts(b" files, serving on port ");
     print_num(port_id);
     syscall::debug_puts(b"\n");
 
-    let port = port_id;
-    let my_aspace = syscall::aspace_id();
-
     // Register with name server.
-    syscall::ns_register(b"initramfs", port);
+    syscall::ns_register(b"initramfs", port_id);
     // Also register our aspace under `initramfs_task` so linux_srv (and
     // others) can grant pages to us — same convention as ext_srv /
     // ext2_srv / rootfs_srv.
     syscall::ns_register(b"initramfs_task", my_aspace);
 
-    // Server loop.
+    // Spawn N_WORKERS - 1 sibling worker threads; main becomes the Nth.
+    // All threads park on the same port; the kernel's KEY_PORT_RECV_PARK
+    // turnstile dequeues one parked recv per arriving message, so up
+    // to N grant-page IO_READ_ASYNC copies can run in parallel on
+    // different CPUs.
+    let mut spawned = 0usize;
+    for _ in 1..N_WORKERS {
+        let stk = alloc_stack();
+        if stk == 0 {
+            syscall::debug_puts(b"  [initramfs_srv] worker stack alloc FAIL\n");
+            break;
+        }
+        let tid = syscall::thread_create(worker_entry as u64, stk, 0);
+        if tid == u64::MAX {
+            syscall::debug_puts(b"  [initramfs_srv] worker thread_create FAIL\n");
+            break;
+        }
+        spawned += 1;
+    }
+    // Release-store the gate AFTER all global writes (FS/CPIO/PORT_ID/
+    // MY_ASPACE) above and after thread_create — workers spinning on
+    // Acquire-load will then see those writes consistently.
+    WORKERS_READY.store(true, Ordering::Release);
+    syscall::debug_puts(b"  [initramfs_srv] worker pool up: ");
+    print_num((spawned + 1) as u64);
+    syscall::debug_puts(b" threads\n");
+
+    server_loop(port_id, my_aspace, cpio_slice(), fs_ref());
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
     loop {
         let msg = match syscall::recv_with_cap(port) {
             Some(m) => m,
@@ -399,7 +490,9 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                 // d0 = caller's reply port (where IO_READ_REPLY notifications
                 // should be delivered).  Synchronous to make the registration
                 // observably ordered before any subsequent IO_READ_ASYNC.
-                unsafe { ASYNC_REPLY_PORT = msg.data[0]; }
+                // Release-store pairs with Acquire-load in any sibling
+                // worker that subsequently handles an IO_READ_ASYNC.
+                ASYNC_REPLY_PORT.store(msg.data[0], Ordering::Release);
                 let _ = syscall::reply(IO_READ_OK, 0, 0, 0, 0, 0);
             }
 
@@ -416,7 +509,7 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                 let offset = msg.data[1] as usize;
                 let grant_va = msg.data[2] as usize;
                 let correlation = msg.data[3];
-                let async_port = unsafe { ASYNC_REPLY_PORT };
+                let async_port = ASYNC_REPLY_PORT.load(Ordering::Acquire);
 
                 if async_port == 0 {
                     // Caller forgot to register — drop silently; the sync
@@ -495,9 +588,5 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                 let _ = syscall::reply(IO_ERROR, ERR_INVALID, 0, 0, 0, 0);
             }
         }
-    }
-
-    loop {
-        core::hint::spin_loop();
     }
 }
