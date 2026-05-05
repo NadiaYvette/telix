@@ -59,6 +59,56 @@ const NETIF_RESOLVE_FAIL: u64 = 0x53FF;
 const NETIF_STATUS: u64 = 0x5400;
 const NETIF_STATUS_OK: u64 = 0x5401;
 
+// --- ETH_SUBSCRIBE: forwarding-plane subscription protocol (Piece 1) ---
+//
+// Distinct from NETIF_REGISTER: registration assumes one ethertype-owner per
+// upper-layer (existing ip6_srv usage); subscription is *observer*-style
+// — many subscribers can match the same frame, each gets a copy in its own
+// rx grant page.  Predicate filters: ethertype, IPv4 destination prefix,
+// "non-local-only" flag.  This is the forwarding-plane substrate that
+// nat_srv (intercepts non-local IPv4), proxy_srv (forwards remote-bonded
+// flows), discovery_srv (multicast advertisements) all attach onto.
+//
+// Frame delivery is via send_nb_4 (fire-and-forget, frame in the rx grant
+// page is read by the subscriber before its next ETH_FRAME).  No "steal"
+// semantics yet — subscribers observe alongside the existing client
+// dispatch; the future "intercept" variant lives behind a flag bit.
+//
+// - ETH_SUBSCRIBE (0x5500): client -> eth_srv.  Register a subscription.
+//     data[0] = ethertype filter (low 16) | flags (next 8) | reserved
+//     data[1] = IPv4 dst (BE u32, low 32) | prefix_len (next 8) | reserved
+//     data[2] = reply_port
+//   Reply: ETH_SUBSCRIBE_OK with data[0] = sub_id, data[1] = rx_grant_va.
+//          The subscriber must grant a page at rx_grant_va.  Or
+//          ETH_SUBSCRIBE_FAIL on full table / bad args.
+//
+// - ETH_FRAME (0x5520): eth_srv -> subscriber.  Frame payload available
+//   in this subscriber's rx_grant_va.
+//     data[0] = full frame length (Ethernet header + payload)
+//     data[1] = ethertype
+//     data[2] = sub_id (so a process subscribing multiple times can
+//               multiplex)
+//
+// - ETH_UNSUBSCRIBE (0x5510): client -> eth_srv.  Tear down a subscription.
+//     data[0] = sub_id
+//   Reply: ETH_UNSUBSCRIBE_OK.
+const ETH_SUBSCRIBE: u64 = 0x5500;
+const ETH_SUBSCRIBE_OK: u64 = 0x5501;
+const ETH_SUBSCRIBE_FAIL: u64 = 0x55FF;
+const ETH_UNSUBSCRIBE: u64 = 0x5510;
+const ETH_UNSUBSCRIBE_OK: u64 = 0x5511;
+const ETH_FRAME: u64 = 0x5520;
+
+/// Subscription filter flags.
+#[allow(dead_code)]
+const FILTER_FLAG_NON_LOCAL: u8 = 1 << 0;
+// Future: const FILTER_FLAG_STEAL: u8 = 1 << 1; // intercept rather than copy
+
+const MAX_SUBSCRIBERS: usize = 8;
+/// Each subscriber gets one RX grant page (one frame in flight at a time).
+/// Distinct base from CLIENT_GRANT_BASE so the two slot tables don't collide.
+const SUBSCRIBER_GRANT_BASE: usize = 0x3_8000_0000;
+
 // Legacy net_srv IPC (kept for backward compat with init test suite).
 const NET_STATUS: u64 = 0x4000;
 const NET_STATUS_OK: u64 = 0x4001;
@@ -357,6 +407,37 @@ mod pci_mmio {
 
 // --- Netif client registration ---
 
+/// Forwarding-plane subscriber (ETH_SUBSCRIBE).  Observer-style: each
+/// frame matching the predicate is copied into rx_va and delivered via
+/// send_nb_4(ETH_FRAME).  Multiple subscribers can match the same frame.
+#[derive(Copy, Clone)]
+struct Subscriber {
+    active: bool,
+    port: u64,
+    rx_va: usize,
+    /// 0 = match any ethertype; otherwise must equal frame ethertype.
+    ethertype_filter: u16,
+    flags: u8,
+    /// IPv4 destination match.  Only consulted when frame ethertype is
+    /// 0x0800 and prefix_len > 0.  prefix_len 0 = match any.
+    dst_ipv4: u32,
+    dst_prefix_len: u8,
+}
+
+impl Subscriber {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            port: 0,
+            rx_va: 0,
+            ethertype_filter: 0,
+            flags: 0,
+            dst_ipv4: 0,
+            dst_prefix_len: 0,
+        }
+    }
+}
+
 struct NetifClient {
     active: bool,
     ethertype: u16,
@@ -391,6 +472,8 @@ struct EthDev {
     arp_next: usize,
     // Registered netif clients.
     clients: [NetifClient; MAX_CLIENTS],
+    // Forwarding-plane subscribers.
+    subscribers: [Subscriber; MAX_SUBSCRIBERS],
     // Pending ARP resolve requests.
     arp_pending_ip: [[u8; 4]; 4],
     arp_pending_port: [u64; 4],
@@ -417,6 +500,7 @@ impl EthDev {
             arp_valid: [false; 8],
             arp_next: 0,
             clients: [const { NetifClient::new() }; MAX_CLIENTS],
+            subscribers: [const { Subscriber::new() }; MAX_SUBSCRIBERS],
             arp_pending_ip: [[0; 4]; 4],
             arp_pending_port: [0; 4],
             arp_pending_active: [false; 4],
@@ -1110,6 +1194,120 @@ impl EthDev {
                 self.dispatch_to_client(ethertype, frame);
             }
         }
+        // Forwarding-plane subscribers observe regardless of ethertype.
+        // Runs after the legacy dispatch so the subscriber's view doesn't
+        // race the ethertype-owner copy in CLIENT_GRANT_BASE.
+        self.deliver_to_subscribers(ethertype, frame);
+    }
+
+    // ---------------------------------------------------------------
+    // Forwarding-plane subscription (Piece 1)
+    // ---------------------------------------------------------------
+
+    /// Allocate a subscriber slot.  Replies via send_nb_4 with sub_id +
+    /// rx_grant_va; the caller must establish a grant at rx_grant_va
+    /// before any frame is delivered.
+    fn subscribe(
+        &mut self,
+        ethertype_filter: u16,
+        flags: u8,
+        dst_ipv4: u32,
+        dst_prefix_len: u8,
+        reply_port: u64,
+    ) {
+        for i in 0..MAX_SUBSCRIBERS {
+            if !self.subscribers[i].active {
+                let rx_va = SUBSCRIBER_GRANT_BASE + i * 4096;
+                self.subscribers[i] = Subscriber {
+                    active: true,
+                    port: reply_port,
+                    rx_va,
+                    ethertype_filter,
+                    flags,
+                    dst_ipv4,
+                    dst_prefix_len,
+                };
+                let _ = syscall::send_nb_4(
+                    reply_port,
+                    ETH_SUBSCRIBE_OK,
+                    i as u64,
+                    rx_va as u64,
+                    0, 0,
+                );
+                return;
+            }
+        }
+        let _ = syscall::send_nb_4(reply_port, ETH_SUBSCRIBE_FAIL, 0, 0, 0, 0);
+    }
+
+    fn unsubscribe(&mut self, sub_id: usize, reply_port: u64) {
+        if sub_id < MAX_SUBSCRIBERS {
+            self.subscribers[sub_id] = Subscriber::new();
+        }
+        let _ = syscall::send_nb_4(reply_port, ETH_UNSUBSCRIBE_OK, 0, 0, 0, 0);
+    }
+
+    /// Deliver a frame to every matching subscriber.  Observer-style: each
+    /// match gets its own copy in its own grant page.  Called from
+    /// handle_rx_packet AFTER the existing client dispatch, so subscribers
+    /// observe alongside the legacy ethertype-owner path rather than
+    /// stealing.  The "intercept" variant lives behind a future flag bit.
+    fn deliver_to_subscribers(&mut self, ethertype: u16, frame: &[u8]) {
+        if frame.len() < ETH_HDR { return; }
+        // Pre-compute IPv4 destination for prefix matching, if applicable.
+        let ipv4_dst: Option<u32> = if ethertype == 0x0800 && frame.len() >= ETH_HDR + 20 {
+            let ip = &frame[ETH_HDR..];
+            Some(((ip[16] as u32) << 24) | ((ip[17] as u32) << 16)
+                | ((ip[18] as u32) << 8) | (ip[19] as u32))
+        } else {
+            None
+        };
+        let my_ipv4 = ((MY_IP[0] as u32) << 24) | ((MY_IP[1] as u32) << 16)
+            | ((MY_IP[2] as u32) << 8) | (MY_IP[3] as u32);
+
+        for i in 0..MAX_SUBSCRIBERS {
+            let s = self.subscribers[i];
+            if !s.active { continue; }
+            // Ethertype filter: 0 means "any."
+            if s.ethertype_filter != 0 && s.ethertype_filter != ethertype { continue; }
+            // IPv4-only filters: only meaningful when frame is IPv4.
+            if let Some(dst) = ipv4_dst {
+                if s.dst_prefix_len > 0 {
+                    let mask: u32 = if s.dst_prefix_len >= 32 {
+                        u32::MAX
+                    } else {
+                        !((1u32 << (32 - s.dst_prefix_len)) - 1)
+                    };
+                    if (dst & mask) != (s.dst_ipv4 & mask) { continue; }
+                }
+                if s.flags & FILTER_FLAG_NON_LOCAL != 0 && dst == my_ipv4 {
+                    continue;
+                }
+            } else {
+                // Non-IPv4 frame: skip subscribers that requested IPv4 filtering.
+                if s.dst_prefix_len > 0 || s.flags & FILTER_FLAG_NON_LOCAL != 0 {
+                    continue;
+                }
+            }
+            // Match — copy frame to subscriber's grant page and notify.
+            let payload_len = frame.len();
+            if payload_len > MAX_FRAME { continue; }
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    frame.as_ptr(),
+                    s.rx_va as *mut u8,
+                    payload_len,
+                );
+            }
+            let _ = syscall::send_nb_4(
+                s.port,
+                ETH_FRAME,
+                payload_len as u64,
+                ethertype as u64,
+                i as u64,
+                0,
+            );
+        }
     }
 
     /// Dispatch a frame to a registered netif client. Returns true if delivered.
@@ -1275,6 +1473,21 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     let client_port = msg.data[1];
                     let reply_port = msg.data[2];
                     dev.register_client(ethertype, client_port, reply_port);
+                }
+                ETH_SUBSCRIBE => {
+                    let ethertype_filter = msg.data[0] as u16;
+                    let flags = (msg.data[0] >> 16) as u8;
+                    let dst_ipv4 = msg.data[1] as u32;
+                    let dst_prefix_len = (msg.data[1] >> 32) as u8;
+                    let reply_port = msg.data[2];
+                    dev.subscribe(
+                        ethertype_filter, flags, dst_ipv4, dst_prefix_len, reply_port,
+                    );
+                }
+                ETH_UNSUBSCRIBE => {
+                    let sub_id = msg.data[0] as usize;
+                    let reply_port = msg.data[1];
+                    dev.unsubscribe(sub_id, reply_port);
                 }
                 NETIF_XMIT => {
                     let payload_len = msg.data[0] as usize;
