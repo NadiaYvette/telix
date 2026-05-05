@@ -16,7 +16,7 @@
 
 extern crate userlib;
 
-use userlib::{syscall, sync::Mutex};
+use userlib::syscall;
 
 // --- Linux x86_64 syscall numbers ---
 const __NR_READ: u64 = 0;
@@ -782,15 +782,15 @@ static mut BACKEND_REPLY_PORT: u64 = 0;
 /// (alloc_fd in finish_accept_unix), which is service-thread-only
 /// state and thus stays where it was.
 static mut IRFS_REPLY_PORT: u64 = 0;
-static mut ASYNC_NEXT_ID: u64 = 1;
 static mut REPLY_DEFERRED: bool = false;
 
 const MAX_PENDING_ASYNC: usize = 64;
 
 #[derive(Copy, Clone)]
+#[repr(u8)]
 enum PendingAsyncKind {
-    Unused,
-    AcceptUnix,
+    Unused = 0,
+    AcceptUnix = 1,
     /// Blocking recv/recvfrom on an AF_UNIX socket; completed by
     /// UDS_RECV_REPLY.
     RecvUnix,
@@ -819,7 +819,10 @@ enum PendingAsyncKind {
     IrfsReadMmap,
 }
 
+/// `#[repr(C)]` pins `kind` at offset 0 so we can take an
+/// AtomicU8 reference to it via raw pointer cast (Plan A.2c).
 #[derive(Copy, Clone)]
+#[repr(C)]
 struct PendingAsync {
     kind: PendingAsyncKind,
     correlation: u64,
@@ -891,74 +894,123 @@ impl PendingAsync {
 static mut PENDING_ASYNC: [PendingAsync; MAX_PENDING_ASYNC] =
     [PendingAsync::empty(); MAX_PENDING_ASYNC];
 
-/// Guards the PENDING_ASYNC slot index space + ASYNC_NEXT_ID counter
-/// for cross-thread access.  Plan-A reply-thread split: the service
-/// thread allocates slots (and frees them on early-error paths); the
-/// reply thread frees them on the success path of finish_*.  The lock
-/// is held only for short index/scan operations — never around a
-/// kernel syscall.  In-place updates of an already-allocated slot's
-/// payload fields (correlation, total_so_far, in_flight_chunk) are
-/// performed by the slot's current single owner and don't need this
-/// lock; the kind transition under the lock is what defines ownership
-/// transfer.
-static ASYNC_LOCK: Mutex = Mutex::new();
+/// Plan A.2c: lockless slot index management.  PENDING_ASYNC[i].kind
+/// is the single source of truth for slot ownership: the discriminant
+/// is `#[repr(u8)]` and the field sits at offset 0 of the struct
+/// (struct is `#[repr(C)]`), so we can view it as `&AtomicU8` via raw
+/// pointer cast and use compare_exchange to claim a slot atomically.
+///
+/// Allocation: scan for `kind == Unused`, CAS to placeholder
+/// (AcceptUnix); on success the caller proceeds to populate the rest
+/// of the slot before any cross-thread reader can correlate to it
+/// (correlation is 0 in a fresh slot, so the "find by correlation"
+/// scan won't match a real correlation id while the slot is in this
+/// transient placeholder state).
+///
+/// Free: store kind = Unused with Release ordering, paired with the
+/// Acquire load on the alloc-side scan, so the caller-side write of
+/// payload fields published by the previous owner are observable to
+/// the next allocator.
+///
+/// Find: relaxed scan + Acquire load of kind to gate the correlation
+/// read.  Lockless because correlation isn't atomic, but the
+/// kind-Acquire happens-before correlation-read guarantees
+/// consistency: a slot that read as non-Unused had its correlation
+/// field written before the kind transition (single-owner pattern).
+const KIND_UNUSED: u8 = PendingAsyncKind::Unused as u8;
+const KIND_ACCEPT_UNIX_PLACEHOLDER: u8 = PendingAsyncKind::AcceptUnix as u8;
+
+fn pending_kind_atomic(slot: usize) -> &'static core::sync::atomic::AtomicU8 {
+    unsafe {
+        let p = &raw const PENDING_ASYNC[slot].kind;
+        &*(p as *const core::sync::atomic::AtomicU8)
+    }
+}
+
+/// Monotonic counter for fresh correlation ids.  Atomic — every
+/// caller (service thread or any reply thread firing next-chunk
+/// reads) increments without coordination.  0 stays reserved for
+/// "no correlation"; the wraparound check keeps that invariant.
+static ASYNC_NEXT_ID_ATOMIC: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
 
 fn async_alloc_slot() -> Option<usize> {
-    ASYNC_LOCK.lock();
-    let r = unsafe {
-        let mut found = None;
-        for i in 0..MAX_PENDING_ASYNC {
-            if matches!(PENDING_ASYNC[i].kind, PendingAsyncKind::Unused) {
-                // Stamp a non-Unused placeholder so a racing scan from
-                // a sibling thread doesn't return the same index.  The
-                // caller will overwrite the full slot before releasing
-                // any reference to it.
-                PENDING_ASYNC[i].kind = PendingAsyncKind::AcceptUnix;
-                found = Some(i);
-                break;
-            }
+    use core::sync::atomic::Ordering;
+    for i in 0..MAX_PENDING_ASYNC {
+        let k = pending_kind_atomic(i);
+        if k.load(Ordering::Relaxed) != KIND_UNUSED {
+            continue;
         }
-        found
-    };
-    ASYNC_LOCK.unlock();
-    r
+        if k.compare_exchange(
+            KIND_UNUSED,
+            KIND_ACCEPT_UNIX_PLACEHOLDER,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ).is_ok() {
+            return Some(i);
+        }
+    }
+    None
 }
 
 fn async_free_slot(idx: usize) {
+    use core::sync::atomic::Ordering;
     if idx >= MAX_PENDING_ASYNC { return; }
-    ASYNC_LOCK.lock();
-    unsafe { PENDING_ASYNC[idx] = PendingAsync::empty(); }
-    ASYNC_LOCK.unlock();
+    // Clear payload fields explicitly — must NOT use Copy-assign
+    // `PENDING_ASYNC[idx] = PendingAsync::empty()` here because
+    // that writes `.kind` first (offset 0) via a plain store,
+    // creating a window where a sibling allocator's Acquire-CAS
+    // can succeed (seeing kind=Unused via this plain store) and
+    // claim the slot before our remaining field writes complete.
+    // The remaining writes would then clobber the new owner's
+    // freshly-populated payload.  Atomic Release-store on kind
+    // is the single publish point.
+    unsafe {
+        PENDING_ASYNC[idx].correlation = 0;
+        PENDING_ASYNC[idx].pi = 0;
+        PENDING_ASYNC[idx].caller_task_port = 0;
+        PENDING_ASYNC[idx].listen_fd = 0;
+        PENDING_ASYNC[idx].flags = 0;
+        PENDING_ASYNC[idx].buf_va = 0;
+        PENDING_ASYNC[idx].buf_len = 0;
+        PENDING_ASYNC[idx].scratch_slot = 0xFF;
+        PENDING_ASYNC[idx].total_so_far = 0;
+        PENDING_ASYNC[idx].mmap_prot_flags = 0;
+        PENDING_ASYNC[idx].mmap_aligned_len = 0;
+        PENDING_ASYNC[idx].extra_handle = 0;
+        PENDING_ASYNC[idx].cache_slot = 0xFF;
+        PENDING_ASYNC[idx].in_flight_chunk = 0;
+    }
+    pending_kind_atomic(idx).store(KIND_UNUSED, Ordering::Release);
 }
 
 fn async_find_by_correlation(correlation: u64) -> Option<usize> {
-    ASYNC_LOCK.lock();
-    let r = unsafe {
-        let mut found = None;
-        for i in 0..MAX_PENDING_ASYNC {
-            if !matches!(PENDING_ASYNC[i].kind, PendingAsyncKind::Unused)
-                && PENDING_ASYNC[i].correlation == correlation
-            {
-                found = Some(i);
-                break;
-            }
+    use core::sync::atomic::Ordering;
+    for i in 0..MAX_PENDING_ASYNC {
+        if pending_kind_atomic(i).load(Ordering::Acquire) == KIND_UNUSED {
+            continue;
         }
-        found
-    };
-    ASYNC_LOCK.unlock();
-    r
+        // kind-Acquire pairs with kind-Release in the slot's last
+        // populator (alloc-side or chunk-chain in-place update),
+        // so correlation is consistent.
+        if unsafe { PENDING_ASYNC[i].correlation } == correlation {
+            return Some(i);
+        }
+    }
+    None
 }
 
 fn next_correlation_id() -> u64 {
-    ASYNC_LOCK.lock();
-    let id = unsafe {
-        let id = ASYNC_NEXT_ID;
-        ASYNC_NEXT_ID = ASYNC_NEXT_ID.wrapping_add(1);
-        if ASYNC_NEXT_ID == 0 { ASYNC_NEXT_ID = 1; } // 0 reserved for "none"
-        id
-    };
-    ASYNC_LOCK.unlock();
-    id
+    use core::sync::atomic::Ordering;
+    loop {
+        let id = ASYNC_NEXT_ID_ATOMIC.fetch_add(1, Ordering::Relaxed);
+        // 0 is reserved for "no correlation"; on wraparound to 0 we
+        // skip past it.  Any concurrent caller observing this will
+        // see a different non-zero id (since fetch_add is atomic).
+        if id != 0 {
+            return id;
+        }
+    }
 }
 
 // Epoll subsystem
@@ -9794,7 +9846,7 @@ fn handle_async_reply(msg: &syscall::Message) -> bool {
 /// finish_irfs_read_fd.  These continuations don't write PROC_TABLE
 /// (only LIB_CACHE chunks_cached + scratch slot bitmap + the user's
 /// mmap backing region), which keeps cross-thread state to the
-/// async-table primitives already wrapped in ASYNC_LOCK.
+/// async-table primitives already lockless via atomic kind discriminant.
 extern "C" fn reply_thread_entry(_arg: u64) -> ! {
     let port = unsafe { IRFS_REPLY_PORT };
     loop {
