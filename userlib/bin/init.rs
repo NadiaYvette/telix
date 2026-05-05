@@ -522,6 +522,42 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5j: forwarding-plane subscription smoke (router_srv) ---
+    // Spawns router_srv which subscribes to non-local IPv4 frames via
+    // ETH_SUBSCRIBE, grants a page back to eth_srv, observes for ~1 s,
+    // then unsubscribes.  Pass criterion: subscribe + grant + unsubscribe
+    // round-trip succeeds.  Frame count is informational (depends on
+    // what's flowing on the virtual NIC during the window).  Always runs
+    // — the subscription protocol is load-bearing for the same reason
+    // servicereg_srv is.
+    syscall::debug_puts(b"  init: running router_srv (ETH_SUBSCRIBE smoke)...\n");
+    {
+        let r_tid = syscall::spawn(b"router_srv", 50);
+        if r_tid != u64::MAX {
+            let mut waited = 0u32;
+            loop {
+                if let Some(code) = syscall::waitpid(r_tid) {
+                    if code == 0 {
+                        syscall::debug_puts(b"Phase 5j router_srv ETH_SUBSCRIBE smoke: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 5j router_srv ETH_SUBSCRIBE smoke: FAILED code=");
+                        print_num(code);
+                        syscall::debug_puts(b"\n");
+                    }
+                    break;
+                }
+                syscall::sleep_ms(10);
+                waited += 1;
+                if waited > 500 {
+                    syscall::debug_puts(b"Phase 5j router_srv ETH_SUBSCRIBE smoke: FAILED (timeout)\n");
+                    break;
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 5j router_srv ETH_SUBSCRIBE smoke: FAILED (spawn)\n");
+        }
+    }
+
     // --- Phase 5h: scheduler call/reply stress (deferred-requeue race repro) ---
     // Skipped under FOCUS_H13 because sched_stress occasionally wedges
     // (WEDGED — giving up) without exiting, which deadlocks init's
