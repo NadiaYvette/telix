@@ -304,7 +304,16 @@ pub fn with_aspace<F, R>(id: ASpaceId, f: F) -> R
 where
     F: FnOnce(&mut AddressSpace) -> R,
 {
-    let mut guard = lock_aspace(id).unwrap_or_else(|| panic!("aspace {} not found", id));
+    // Direct match instead of unwrap_or_else(|| panic!(...)): the
+    // closure body isn't track_caller'd, so a panic fired from inside
+    // it reports `Location::caller()` as the closure's definition site
+    // (this very file:line) rather than the caller of with_aspace.
+    // Panicking from with_aspace's own body — which IS track_caller'd —
+    // makes Location::caller() walk one frame up to the actual caller.
+    let mut guard = match lock_aspace(id) {
+        Some(g) => g,
+        None => panic!("aspace {} not found", id),
+    };
     f(&mut guard)
 }
 
