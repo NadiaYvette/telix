@@ -2266,7 +2266,16 @@ pub fn tick(current_sp: u64) -> u64 {
                             target_arch = "loongarch64",
                         )))]
                         let (sgi_s, sgi_r): (u64, u64) = (0, 0);
-                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={}) sgi=(s={} r={}) forced_preempt={}",
+                        let wake_count = SLEEP_WAKE_LATENCY_COUNT.load(Ordering::Relaxed);
+                        let wake_total = SLEEP_WAKE_LATENCY_NS_TOTAL.load(Ordering::Relaxed);
+                        let wake_max = SLEEP_WAKE_LATENCY_NS_MAX.load(Ordering::Relaxed);
+                        let wake_avg_us = if wake_count > 0 {
+                            (wake_total / 1000) / wake_count
+                        } else {
+                            0
+                        };
+                        let wake_max_us = wake_max / 1000;
+                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={}) sgi=(s={} r={}) forced_preempt={} wake_lat=(n={} avg_us={} max_us={})",
                             sends, recvs,
                             DOUBLE_ENQ_DRAIN.load(Ordering::Relaxed),
                             DOUBLE_ENQ_RESCUE.load(Ordering::Relaxed),
@@ -2278,7 +2287,8 @@ pub fn tick(current_sp: u64) -> u64 {
                             RESCUE_PENDING.load(Ordering::Relaxed),
                             RESCUE_PHANTOM.load(Ordering::Relaxed),
                             sgi_s, sgi_r,
-                            FORCED_PREEMPT_COUNT.load(Ordering::Relaxed));
+                            FORCED_PREEMPT_COUNT.load(Ordering::Relaxed),
+                            wake_count, wake_avg_us, wake_max_us);
                         // Per-CPU state: what each CPU is running, RQ sizes
                         let ncpus = smp::num_cpus();
                         for c in 0..ncpus {
@@ -2654,6 +2664,35 @@ fn try_switch(current_sp: u64) -> u64 {
 
     crate::sched::stats::CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
     crate::trace::trace_event(crate::trace::EVT_CTX_SWITCH, prev_id, next_id);
+
+    // Wake-to-dispatch latency: if this thread carries a non-zero
+    // wake_pending_ts_ns, this is the first dispatch since wake.
+    // Swap-to-0 to avoid double-counting if try_switch picks the same
+    // thread again before the next park.  Accumulates total + count
+    // for running average, and tracks the running max.
+    {
+        let pending = thread_ref(next_id)
+            .wake_pending_ts_ns
+            .swap(0, Ordering::Relaxed);
+        if pending != 0 {
+            let now = get_monotonic_ns();
+            let lat = now.saturating_sub(pending);
+            SLEEP_WAKE_LATENCY_NS_TOTAL.fetch_add(lat, Ordering::Relaxed);
+            SLEEP_WAKE_LATENCY_COUNT.fetch_add(1, Ordering::Relaxed);
+            let mut prev_max = SLEEP_WAKE_LATENCY_NS_MAX.load(Ordering::Relaxed);
+            while lat > prev_max {
+                match SLEEP_WAKE_LATENCY_NS_MAX.compare_exchange_weak(
+                    prev_max,
+                    lat,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(seen) => prev_max = seen,
+                }
+            }
+        }
+    }
 
     // Save current thread's SP. Safety: we own the running thread.
     let prev_task;
@@ -5907,6 +5946,11 @@ fn check_sleep_timers() {
         // BEFORE state=Ready, so rescue's on==MAX orphan predicate cannot
         // observe (state=Ready ∧ on_cpu=MAX).
         thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+        // Diagnostic: stamp wake timestamp for the wake-to-dispatch
+        // latency histogram.  Set BEFORE state=Ready so try_switch on
+        // any CPU that picks up this thread observes a non-zero
+        // timestamp.
+        thread_ref(tid).wake_pending_ts_ns.store(now_ns, Ordering::Relaxed);
         t.state = ThreadState::Ready;
         trace_sched(tid, 15); // 15=sleep_wake (state=Ready, about to enqueue)
         set_enq_tag(7); // 7=sleep_timer
@@ -5942,6 +5986,16 @@ fn check_sleep_timers() {
 /// Diagnostic: total forced preemptions from sleep-wake.  Surfaced in
 /// the WATCHDOG dump alongside other stall counters.
 pub static FORCED_PREEMPT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic: aggregate wake-to-dispatch latency (ns) for threads
+/// woken by check_sleep_timers (or any other code path that stamps
+/// `wake_pending_ts_ns`).  Cleared by try_switch when the thread is
+/// first dispatched onto a CPU.  WATCHDOG dump derives the running
+/// average from these two counters, exposing what the actual sleep_ms
+/// wake latency floor looks like under live load.
+pub static SLEEP_WAKE_LATENCY_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static SLEEP_WAKE_LATENCY_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static SLEEP_WAKE_LATENCY_NS_MAX: AtomicU64 = AtomicU64::new(0);
 
 /// Check per-task alarm timers and deliver SIGALRM.
 /// Called from tick() before try_switch.

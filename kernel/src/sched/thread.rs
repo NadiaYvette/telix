@@ -69,6 +69,12 @@ pub struct Thread {
     pub sleep_deadline_ns: u64,
     /// Next thread in the global sorted sleep queue (u32::MAX = not linked / tail).
     pub sleep_next: u32,
+    /// Diagnostic: monotonic_ns timestamp when check_sleep_timers (or any
+    /// other waker) marked this thread Ready.  Cleared (swap-to-0) by
+    /// try_switch when the thread is first dispatched onto a CPU.  The
+    /// difference is the wake-to-dispatch latency, accumulated into
+    /// SLEEP_WAKE_LATENCY_* counters surfaced in the WATCHDOG dump.
+    pub wake_pending_ts_ns: core::sync::atomic::AtomicU64,
     /// Thread blocked in thread_join() waiting for us to exit (u32::MAX = none).
     pub join_waiter: u32,
     /// Thread-local storage base address (Phase 74).
@@ -219,6 +225,7 @@ impl Thread {
             sig_pending: 0,
             sleep_deadline_ns: 0,
             sleep_next: u32::MAX,
+            wake_pending_ts_ns: core::sync::atomic::AtomicU64::new(0),
             join_waiter: u32::MAX,
             tls_base: 0,
             timer_signal: 0,
