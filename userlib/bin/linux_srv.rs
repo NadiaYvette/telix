@@ -11468,27 +11468,37 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(if a2 { b"ok" } else { b"FAIL" });
     syscall::debug_puts(b"\n");
 
-    // Spawn the reply thread.  It parks on IRFS_REPLY_PORT and processes
-    // IRFS_IO_READ_REPLY notifications via finish_irfs_read_mmap (and
-    // siblings).  Coordination with the service thread is via ASYNC_LOCK
-    // around PENDING_ASYNC slot index manipulation; in-place updates of
-    // an already-allocated slot are single-owner.
-    {
+    // Plan A.2b WIP: pool of reply threads, all parked on IRFS_REPLY_PORT.
+    // Designed for N=4 to match initramfs_srv's worker count; the existing
+    // synchronization (ASYNC_LOCK + atomic chunks_cached + atomic scratch
+    // bitmap) already covers the data-race surface.  But boot 91amfsq377
+    // with N=4 deadlocked linux_srv at startup before reaching the
+    // dispatch loop ("ready on port" debug never printed; tid stuck in
+    // CallReply(1); initramfs_srv banner and IO_CONNECT_OK traffic both
+    // absent — strongly suggests one reply thread panicked, the userlib
+    // panic handler called exit(1), which terminated the whole task).
+    // Held back to N=1 until the per-thread crash is understood.
+    const N_REPLY_THREADS: usize = 1;
+    let mut spawned = 0usize;
+    for i in 0..N_REPLY_THREADS {
         let stk = match syscall::mmap_anon(0, 4, 1) {
             Some(v) => (v + 4 * syscall::page_size()) as u64,
             None => 0,
         };
         if stk == 0 {
             syscall::debug_puts(b"[linux_srv] reply-thread stack alloc FAIL\n");
-        } else {
-            let tid = syscall::thread_create(reply_thread_entry as u64, stk, 0);
-            if tid == u64::MAX {
-                syscall::debug_puts(b"[linux_srv] reply-thread spawn FAIL\n");
-            } else {
-                syscall::debug_puts(b"[linux_srv] reply-thread spawned\n");
-            }
+            break;
         }
+        let tid = syscall::thread_create(reply_thread_entry as u64, stk, i as u64);
+        if tid == u64::MAX {
+            syscall::debug_puts(b"[linux_srv] reply-thread spawn FAIL\n");
+            break;
+        }
+        spawned += 1;
     }
+    syscall::debug_puts(b"[linux_srv] reply-thread pool up: ");
+    print_num(spawned as u64);
+    syscall::debug_puts(b" threads\n");
 
     // Eagerly set up the long-path scratch grant to VFS so the first openat()
     // for a >16-byte path doesn't race with vfs_task ns publication.
