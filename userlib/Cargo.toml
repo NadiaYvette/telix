@@ -295,3 +295,7 @@ path = "bin/zfs_srv.rs"
 [[bin]]
 name = "servicereg_srv"
 path = "bin/servicereg_srv.rs"
+
+[[bin]]
+name = "servicereg_test"
+path = "bin/servicereg_test.rs"
