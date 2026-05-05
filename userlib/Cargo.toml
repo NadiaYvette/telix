@@ -279,3 +279,15 @@ path = "bin/usb_srv.rs"
 [[bin]]
 name = "hda_srv"
 path = "bin/hda_srv.rs"
+
+[[bin]]
+name = "bt_srv"
+path = "bin/bt_srv.rs"
+
+[[bin]]
+name = "nat_srv"
+path = "bin/nat_srv.rs"
+
+[[bin]]
+name = "zfs_srv"
+path = "bin/zfs_srv.rs"
