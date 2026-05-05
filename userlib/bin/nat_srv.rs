@@ -116,6 +116,16 @@ const ETH_FRAME: u64 = 0x5520;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const FILTER_FLAG_NON_LOCAL: u64 = 1 << 0;
 
+// NETIF_REGISTER / NETIF_XMIT (matches eth_srv).  We register with a
+// placeholder ethertype (0xFFFE — IEEE-reserved, won't appear on real
+// frames) just to obtain a tx_grant_va; tcp4_srv keeps the legitimate
+// ownership of 0x0800 for RX dispatch.  RX delivery to us still flows
+// through ETH_SUBSCRIBE, not through the legacy NETIF_INPUT path.
+const NETIF_REGISTER: u64 = 0x5000;
+const NETIF_REGISTER_OK: u64 = 0x5001;
+const NETIF_XMIT: u64 = 0x5200;
+const NETIF_XMIT_PLACEHOLDER_ETHERTYPE: u16 = 0xFFFE;
+
 /// RFC 5737 documentation/test address used as the default public
 /// IPv4 for source-NAT, so translation still does something
 /// observable even before NAT_SET_PUBLIC_IPV4 is called explicitly.
@@ -183,9 +193,25 @@ static mut DROPPED_COUNT: u64 = 0;
 static mut SUBSCRIBED_FRAMES_COUNT: u64 = 0;
 static mut SUBSCRIBED_TRANSLATED_COUNT: u64 = 0;
 static mut SUBSCRIBED_DROPPED_COUNT: u64 = 0;
+/// Frames re-emitted via NETIF_XMIT after successful translation.
+/// Distinct from SUBSCRIBED_TRANSLATED_COUNT because translate_out can
+/// succeed even if the egress copy or NETIF_XMIT fails.
+static mut SUBSCRIBED_EMITTED_COUNT: u64 = 0;
 /// True once ETH_SUBSCRIBE handshake completed at startup.  Surfaced
 /// in NAT_STATS so callers can confirm the substrate wired up.
 static mut SUBSCRIBED: bool = false;
+/// True once NETIF_REGISTER handshake completed and tx grant is in
+/// place.  Egress is gated on this — translate_out runs even if
+/// egress isn't ready, but the emit step is skipped.
+static mut TX_REGISTERED: bool = false;
+/// Local VA where eth_srv reads transmit payloads from.  Set by
+/// try_register_eth_tx at startup.
+static mut ETH_TX_LOCAL_VA: usize = 0;
+/// Cached netif client id from the NETIF_REGISTER handshake.  Passed
+/// back on every NETIF_XMIT.
+static mut ETH_TX_CLIENT_ID: u64 = 0;
+/// Cached eth_srv port for fast NETIF_XMIT dispatch.
+static mut ETH_PORT: u64 = 0;
 
 /// Find a flow by (proto, private_ip, private_port).  Returns the
 /// table index on hit.
@@ -548,6 +574,102 @@ fn try_subscribe_to_eth(my_port: u64) {
 /// try_subscribe_to_eth at startup; 0 means not subscribed).
 static mut ETH_RX_LOCAL_VA: usize = 0;
 
+/// Register with eth_srv via NETIF_REGISTER to obtain a tx_grant_va
+/// and client_id.  We use a placeholder ethertype (0xFFFE) so we
+/// don't displace tcp4_srv's IPv4 ownership for RX dispatch — RX to
+/// us flows through ETH_SUBSCRIBE, this registration is purely for
+/// the egress side.  Best-effort: failures log and continue, leaving
+/// observation-mode translation (no emit) as the fallback.
+fn try_register_eth_tx(my_port: u64) {
+    let eth_port = match syscall::ns_lookup(b"eth") {
+        Some(p) => p,
+        None => return,
+    };
+    unsafe { ETH_PORT = eth_port; }
+    let local_tx = match syscall::mmap_anon(0, 1, 1) {
+        Some(va) => va,
+        None => {
+            syscall::debug_puts(b"  [nat_srv] mmap_anon for eth tx failed\n");
+            return;
+        }
+    };
+    // Pre-fault.
+    unsafe { core::ptr::write_volatile(local_tx as *mut u8, 0u8); }
+
+    // Send NETIF_REGISTER on a fresh reply port to avoid colliding
+    // with ETH_FRAME notifications on our service port.
+    let reply_port = syscall::port_create();
+    if reply_port == u64::MAX {
+        syscall::debug_puts(b"  [nat_srv] port_create for tx reply failed\n");
+        return;
+    }
+    let _ = syscall::send_nb_4(
+        eth_port,
+        NETIF_REGISTER,
+        NETIF_XMIT_PLACEHOLDER_ETHERTYPE as u64,
+        my_port, // eth_srv would use this for NETIF_INPUT — never fires
+        reply_port,
+        0,
+    );
+    let resp = syscall::recv_msg_timeout(reply_port, 2_000_000);
+    let (cid, _eth_rx_va, eth_tx_va) = match resp {
+        Some(m) if m.tag == NETIF_REGISTER_OK => {
+            (m.data[0], m.data[1] as usize, m.data[2] as usize)
+        }
+        _ => {
+            syscall::debug_puts(b"  [nat_srv] NETIF_REGISTER handshake failed\n");
+            return;
+        }
+    };
+    if !syscall::grant_pages(eth_port, local_tx, eth_tx_va, 1, false) {
+        syscall::debug_puts(b"  [nat_srv] grant_pages tx -> eth failed\n");
+        return;
+    }
+    unsafe {
+        ETH_TX_LOCAL_VA = local_tx;
+        ETH_TX_CLIENT_ID = cid;
+        TX_REGISTERED = true;
+    }
+    syscall::debug_puts(b"  [nat_srv] egress (NETIF_XMIT) ready\n");
+}
+
+/// Emit a translated IPv4 packet via eth_srv's NETIF_XMIT path.
+/// `ip_packet` is the IP packet bytes (no Ethernet header — eth_srv
+/// builds the header from dst_mac + ethertype).  `dst_mac=0` =
+/// broadcast; for real NAT this would be the gateway MAC resolved
+/// via NETIF_RESOLVE.  Returns true on emit success.
+fn emit_translated(ip_packet: &[u8]) -> bool {
+    unsafe {
+        if !TX_REGISTERED || ETH_TX_LOCAL_VA == 0 {
+            return false;
+        }
+        if ip_packet.len() > NAT_MAX_PACKET {
+            return false;
+        }
+        // Copy into the granted TX page (which eth_srv reads from).
+        core::ptr::copy_nonoverlapping(
+            ip_packet.as_ptr(),
+            ETH_TX_LOCAL_VA as *mut u8,
+            ip_packet.len(),
+        );
+        // NETIF_XMIT data layout (matches eth_srv):
+        //   data[0] = payload_len
+        //   data[1] = dst_mac (0 = broadcast)
+        //   data[2] = ethertype (low 16) | reply_port (high 32) — we
+        //             don't bother with the reply.
+        //   data[3] = client_id
+        let _ = syscall::send_nb_4(
+            ETH_PORT,
+            NETIF_XMIT,
+            ip_packet.len() as u64,
+            0, // dst_mac = broadcast
+            ETHERTYPE_IPV4 as u64,
+            ETH_TX_CLIENT_ID,
+        );
+    }
+    true
+}
+
 /// Process one frame delivered via ETH_FRAME.  Increments counters
 /// and runs translate_out on the inner IPv4 packet.  Doesn't re-emit
 /// (NETIF_XMIT integration is a separate piece) — this is the
@@ -568,7 +690,24 @@ fn handle_eth_frame(frame_len: usize) {
         )
     };
     match translate_out(ip_buf, ip_len) {
-        Ok(_) => unsafe { SUBSCRIBED_TRANSLATED_COUNT += 1; },
+        Ok((new_len, _public_port)) => {
+            unsafe { SUBSCRIBED_TRANSLATED_COUNT += 1; }
+            // Emit the translated packet via NETIF_XMIT.  Best-effort:
+            // egress may not be ready (TX_REGISTERED=false) on the
+            // first frames; subsequent frames will succeed once the
+            // handshake catches up.  In observation mode (no TX
+            // registration) this becomes a no-op and the frame is
+            // simply translated-but-not-emitted.
+            let emit_buf = unsafe {
+                core::slice::from_raw_parts(
+                    (rx_va + ETH_HDR_LEN) as *const u8,
+                    new_len,
+                )
+            };
+            if emit_translated(emit_buf) {
+                unsafe { SUBSCRIBED_EMITTED_COUNT += 1; }
+            }
+        }
         Err(_) => unsafe { SUBSCRIBED_DROPPED_COUNT += 1; },
     }
 }
@@ -603,6 +742,12 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
     // log and continue; the explicit caller-driven NAT_TRANSLATE_*
     // path stays available regardless.
     try_subscribe_to_eth(port);
+
+    // Register with eth_srv for NETIF_XMIT egress.  This closes the
+    // NAT loop end-to-end: subscribe -> translate -> emit.  Uses a
+    // placeholder ethertype (0xFFFE) so we don't displace tcp4_srv's
+    // ownership of 0x0800 for RX.
+    try_register_eth_tx(port);
 
     syscall::debug_puts(b"[nat_srv] ready on port ");
     print_num(port);
@@ -683,17 +828,23 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                     // the flow-occupancy reply word so the existing
                     // explicit translate counters still occupy
                     // data[1..3].  Layout:
-                    //   data[0] = flow occupancy (low 32) | subscribed
-                    //             (bit 32) | subscribed_frames (high 31).
+                    //   data[0] = flow occupancy (low 32) |
+                    //             SUBSCRIBED (bit 32) |
+                    //             TX_REGISTERED (bit 33) |
+                    //             subscribed_frames (high 30 bits).
                     //   data[1] = TRANSLATED_OUT_COUNT
                     //   data[2] = TRANSLATED_IN_COUNT
                     //   data[3] = DROPPED_COUNT (caller-driven path)
-                    //   data[4] = SUBSCRIBED_TRANSLATED + (DROPPED << 32)
+                    //   data[4] = SUBSCRIBED_TRANSLATED |
+                    //             (SUBSCRIBED_EMITTED << 24) |
+                    //             (SUBSCRIBED_DROPPED << 48)
                     let stat_a = occupancy
                         | ((SUBSCRIBED as u64) << 32)
-                        | ((SUBSCRIBED_FRAMES_COUNT & 0x7FFF_FFFF) << 33);
-                    let stat_e = SUBSCRIBED_TRANSLATED_COUNT
-                        | (SUBSCRIBED_DROPPED_COUNT << 32);
+                        | ((TX_REGISTERED as u64) << 33)
+                        | ((SUBSCRIBED_FRAMES_COUNT & 0x3FFF_FFFF) << 34);
+                    let stat_e = (SUBSCRIBED_TRANSLATED_COUNT & 0xFFFFFF)
+                        | ((SUBSCRIBED_EMITTED_COUNT & 0xFFFFFF) << 24)
+                        | ((SUBSCRIBED_DROPPED_COUNT & 0xFFFF) << 48);
                     let _ = syscall::reply(
                         NAT_STATS_OK,
                         stat_a,

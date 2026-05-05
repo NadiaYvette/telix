@@ -578,12 +578,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 Some(nat_port) => {
                     match syscall::call(nat_port, 0x7C40, 0, 0, 0, 0) {
                         Some(resp) if resp.tag == 0x7C41 => {
-                            // Bit 32 of data[0] = SUBSCRIBED flag.
+                            // Bit 32 of data[0] = SUBSCRIBED, bit 33 =
+                            // TX_REGISTERED.  Both should be set for
+                            // the full ETH_SUBSCRIBE + NETIF_XMIT
+                            // egress wiring to be considered live.
                             let subscribed = (resp.data[0] >> 32) & 1 != 0;
-                            if subscribed {
-                                syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE wiring: PASSED\n");
+                            let tx_ready = (resp.data[0] >> 33) & 1 != 0;
+                            if subscribed && tx_ready {
+                                syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE+NETIF_XMIT wiring: PASSED\n");
+                            } else if subscribed {
+                                syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE+NETIF_XMIT wiring: FAILED (egress not ready)\n");
                             } else {
-                                syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE wiring: FAILED (not subscribed)\n");
+                                syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE+NETIF_XMIT wiring: FAILED (not subscribed)\n");
                             }
                         }
                         Some(_) => {
