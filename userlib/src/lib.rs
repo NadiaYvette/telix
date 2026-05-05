@@ -9,6 +9,7 @@ pub mod pipe;
 pub mod poll;
 pub mod profile;
 pub mod pty;
+pub mod services;
 pub mod start;
 pub mod sync;
 pub mod syscall;
