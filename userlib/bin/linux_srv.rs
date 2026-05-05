@@ -11468,21 +11468,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(if a2 { b"ok" } else { b"FAIL" });
     syscall::debug_puts(b"\n");
 
-    // Plan A.2b WIP: pool of reply threads, all parked on IRFS_REPLY_PORT.
-    // Designed for N=4 to match initramfs_srv's worker count; the existing
-    // synchronization (ASYNC_LOCK + atomic chunks_cached + atomic scratch
-    // bitmap) already covers the data-race surface.  But boot 91amfsq377
-    // with N=4 deadlocked linux_srv at startup before reaching the
-    // dispatch loop ("ready on port" debug never printed; tid stuck in
-    // CallReply(1); initramfs_srv banner and IO_CONNECT_OK traffic both
-    // absent — strongly suggests one reply thread panicked, the userlib
-    // panic handler called exit(1), which terminated the whole task).
-    // Held back to N=1 until the per-thread crash is understood.
-    const N_REPLY_THREADS: usize = 1;
+    // Plan A.2b: pool of reply threads, all parked on IRFS_REPLY_PORT.
+    // N=4 to match initramfs_srv's worker count.  Stack bumped to 8
+    // pages (32 KiB) — a previous boot 91amfsq377 attempt at N=4 with
+    // 4-page stacks deadlocked linux_srv at startup, hypothesis being
+    // that finish_irfs_read_mmap's call frame overflowed the smaller
+    // stack on one of the threads.  Now that the userlib panic handler
+    // prints file:line:msg before exit, the next failure mode (if any)
+    // will leave a usable trace.
+    const N_REPLY_THREADS: usize = 4;
+    const REPLY_STACK_PAGES: usize = 8;
     let mut spawned = 0usize;
     for i in 0..N_REPLY_THREADS {
-        let stk = match syscall::mmap_anon(0, 4, 1) {
-            Some(v) => (v + 4 * syscall::page_size()) as u64,
+        let stk = match syscall::mmap_anon(0, REPLY_STACK_PAGES, 1) {
+            Some(v) => (v + REPLY_STACK_PAGES * syscall::page_size()) as u64,
             None => 0,
         };
         if stk == 0 {
