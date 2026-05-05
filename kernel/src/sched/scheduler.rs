@@ -2200,6 +2200,30 @@ pub fn reschedule_ipi(current_sp: u64) -> u64 {
 }
 
 pub fn tick(current_sp: u64) -> u64 {
+    // Record per-CPU last-tick timestamp + update max-gap.  Diagnostic
+    // for wake-latency tail: if a CPU's tick stops firing for seconds,
+    // we'd see PER_CPU_TICK_MAX_GAP_NS blow up to match.  Healthy ticks
+    // produce gaps near TICK_INTERVAL_NS.
+    {
+        let cpu = smp::cpu_id() as usize;
+        if cpu < smp::MAX_CPUS {
+            let now = get_monotonic_ns();
+            let prev = PER_CPU_LAST_TICK_NS[cpu].swap(now, Ordering::Relaxed);
+            if prev != 0 {
+                let gap = now.saturating_sub(prev);
+                let mut max = PER_CPU_TICK_MAX_GAP_NS.load(Ordering::Relaxed);
+                while gap > max {
+                    match PER_CPU_TICK_MAX_GAP_NS.compare_exchange_weak(
+                        max, gap, Ordering::Relaxed, Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(seen) => max = seen,
+                    }
+                }
+            }
+        }
+    }
+
     check_sleep_timers();
     check_alarm_timers();
     check_interval_timers();
@@ -2275,7 +2299,15 @@ pub fn tick(current_sp: u64) -> u64 {
                             0
                         };
                         let wake_max_us = wake_max / 1000;
-                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={}) sgi=(s={} r={}) forced_preempt={} wake_lat=(n={} avg_us={} max_us={})",
+                        let b0 = SLEEP_WAKE_LATENCY_BUCKETS[0].load(Ordering::Relaxed);
+                        let b1 = SLEEP_WAKE_LATENCY_BUCKETS[1].load(Ordering::Relaxed);
+                        let b2 = SLEEP_WAKE_LATENCY_BUCKETS[2].load(Ordering::Relaxed);
+                        let b3 = SLEEP_WAKE_LATENCY_BUCKETS[3].load(Ordering::Relaxed);
+                        let b4 = SLEEP_WAKE_LATENCY_BUCKETS[4].load(Ordering::Relaxed);
+                        let b5 = SLEEP_WAKE_LATENCY_BUCKETS[5].load(Ordering::Relaxed);
+                        let b6 = SLEEP_WAKE_LATENCY_BUCKETS[6].load(Ordering::Relaxed);
+                        let tick_max_gap_us = PER_CPU_TICK_MAX_GAP_NS.load(Ordering::Relaxed) / 1000;
+                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={}) sgi=(s={} r={}) forced_preempt={} wake_lat=(n={} avg_us={} max_us={}) wake_hist=(<100us:{} <1ms:{} <10ms:{} <100ms:{} <1s:{} <10s:{} >=10s:{}) tick_max_gap_us={}",
                             sends, recvs,
                             DOUBLE_ENQ_DRAIN.load(Ordering::Relaxed),
                             DOUBLE_ENQ_RESCUE.load(Ordering::Relaxed),
@@ -2288,7 +2320,9 @@ pub fn tick(current_sp: u64) -> u64 {
                             RESCUE_PHANTOM.load(Ordering::Relaxed),
                             sgi_s, sgi_r,
                             FORCED_PREEMPT_COUNT.load(Ordering::Relaxed),
-                            wake_count, wake_avg_us, wake_max_us);
+                            wake_count, wake_avg_us, wake_max_us,
+                            b0, b1, b2, b3, b4, b5, b6,
+                            tick_max_gap_us);
                         // Per-CPU state: what each CPU is running, RQ sizes
                         let ncpus = smp::num_cpus();
                         for c in 0..ncpus {
@@ -2691,6 +2725,16 @@ fn try_switch(current_sp: u64) -> u64 {
                     Err(seen) => prev_max = seen,
                 }
             }
+            // Histogram bucket: log10-ish, see SLEEP_WAKE_LATENCY_BUCKETS
+            // declaration for the bin definitions.
+            let bucket = if lat < 100_000 { 0 }              // <100us
+                else if lat < 1_000_000 { 1 }                // <1ms
+                else if lat < 10_000_000 { 2 }               // <10ms
+                else if lat < 100_000_000 { 3 }              // <100ms
+                else if lat < 1_000_000_000 { 4 }            // <1s
+                else if lat < 10_000_000_000 { 5 }           // <10s
+                else { 6 };                                  // >=10s
+            SLEEP_WAKE_LATENCY_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -5996,6 +6040,36 @@ pub static FORCED_PREEMPT_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static SLEEP_WAKE_LATENCY_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static SLEEP_WAKE_LATENCY_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static SLEEP_WAKE_LATENCY_NS_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// Bucketed histogram of wake-to-dispatch latencies, log10-style.
+/// Bucket index → upper bound (monotonic ns):
+///   0: <  100 us         (sub-tick fast path)
+///   1: <    1 ms
+///   2: <   10 ms          (one TICK_INTERVAL_NS — expected typical)
+///   3: <  100 ms          (10 ticks — IPI loss recovery floor)
+///   4: <    1 s
+///   5: <   10 s
+///   6: >= 10 s            (catastrophic outlier)
+pub static SLEEP_WAKE_LATENCY_BUCKETS: [AtomicU64; 7] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Per-CPU last tick timestamp (monotonic ns).  Updated at the top
+/// of `tick()`.  A multi-second gap means the LAPIC tick on that CPU
+/// stopped firing — the most likely cause of the wake-latency
+/// long-tail outliers when target CPU's IPI was lost AND its own
+/// tick didn't recover.
+pub static PER_CPU_LAST_TICK_NS: [AtomicU64; smp::MAX_CPUS] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; smp::MAX_CPUS]
+};
+/// Largest observed gap between consecutive ticks on any CPU (ns).
+/// If this stays close to TICK_INTERVAL_NS, ticks are healthy; if it
+/// blows up to multi-second values, the tick handler isn't running
+/// when expected.
+pub static PER_CPU_TICK_MAX_GAP_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Check per-task alarm timers and deliver SIGALRM.
 /// Called from tick() before try_switch.
