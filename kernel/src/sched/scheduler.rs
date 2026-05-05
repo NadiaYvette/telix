@@ -2307,7 +2307,12 @@ pub fn tick(current_sp: u64) -> u64 {
                         let b5 = SLEEP_WAKE_LATENCY_BUCKETS[5].load(Ordering::Relaxed);
                         let b6 = SLEEP_WAKE_LATENCY_BUCKETS[6].load(Ordering::Relaxed);
                         let tick_max_gap_us = PER_CPU_TICK_MAX_GAP_NS.load(Ordering::Relaxed) / 1000;
-                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={}) sgi=(s={} r={}) forced_preempt={} wake_lat=(n={} avg_us={} max_us={}) wake_hist=(<100us:{} <1ms:{} <10ms:{} <100ms:{} <1s:{} <10s:{} >=10s:{}) tick_max_gap_us={}",
+                        let stale_retarget = STALE_TARGET_RETARGET_COUNT.load(Ordering::Relaxed);
+                        let steal_us = crate::arch::hypervisor::ops()
+                            .steal_time_ns()
+                            .map(|ns| ns / 1000)
+                            .unwrap_or(u64::MAX);
+                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={}) sgi=(s={} r={}) forced_preempt={} wake_lat=(n={} avg_us={} max_us={}) wake_hist=(<100us:{} <1ms:{} <10ms:{} <100ms:{} <1s:{} <10s:{} >=10s:{}) tick_max_gap_us={} stale_retarget={} bsp_steal_us={} hv={:?}",
                             sends, recvs,
                             DOUBLE_ENQ_DRAIN.load(Ordering::Relaxed),
                             DOUBLE_ENQ_RESCUE.load(Ordering::Relaxed),
@@ -2322,7 +2327,8 @@ pub fn tick(current_sp: u64) -> u64 {
                             FORCED_PREEMPT_COUNT.load(Ordering::Relaxed),
                             wake_count, wake_avg_us, wake_max_us,
                             b0, b1, b2, b3, b4, b5, b6,
-                            tick_max_gap_us);
+                            tick_max_gap_us, stale_retarget,
+                            steal_us, crate::arch::hypervisor::kind());
                         // Per-CPU state: what each CPU is running, RQ sizes
                         let ncpus = smp::num_cpus();
                         for c in 0..ncpus {
@@ -5976,9 +5982,30 @@ fn check_sleep_timers() {
         SLEEP_QUEUE_HEAD.store(cur, Ordering::Release);
     }
 
+    let waker_cpu = smp::cpu_id();
     // Wake collected threads (outside the lock).
     for i in 0..count {
-        let (tid, prio, target) = to_wake[i];
+        let (tid, prio, mut target) = to_wake[i];
+        // Plan A: steal-to-waker for stale targets.  If target CPU's
+        // last tick is more than STALE_TICK_THRESHOLD_NS old (KVM
+        // virtual-timer dropped, vCPU host-descheduled, etc.), the
+        // IPI we'd send won't be processed promptly and the woken
+        // thread would sit on target's runqueue for hundreds of ms
+        // to seconds.  Re-target to the waker CPU instead — the
+        // thread runs immediately at the cost of cache locality.
+        // Skip this re-target for the (target == waker) case
+        // because last_cpu == self isn't a tail concern.
+        const STALE_TICK_THRESHOLD_NS: u64 = 100_000_000; // 100 ms
+        if target != waker_cpu && (target as usize) < smp::MAX_CPUS {
+            let target_last = PER_CPU_LAST_TICK_NS[target as usize]
+                .load(Ordering::Relaxed);
+            if target_last != 0
+                && now_ns.saturating_sub(target_last) > STALE_TICK_THRESHOLD_NS
+            {
+                target = waker_cpu;
+                STALE_TARGET_RETARGET_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // Wait for the thread's parking stack switch to complete.
         while thread_ref(tid).stack_switch_pending.load(Ordering::Acquire) {
             core::hint::spin_loop();
@@ -6006,7 +6033,7 @@ fn check_sleep_timers() {
         // This exposes latent preemption-unsafety that the previous
         // ~100 ms quantum-cycle masked; the audit-and-fix path is the
         // current strategy for boot-throughput improvement.
-        let waker = smp::cpu_id();
+        let waker = waker_cpu;
         if target != waker {
             let pcpu_target = smp::get(target);
             let target_cur = pcpu_target.current_thread.load(Ordering::Relaxed);
@@ -6070,6 +6097,14 @@ pub static PER_CPU_LAST_TICK_NS: [AtomicU64; smp::MAX_CPUS] = {
 /// blows up to multi-second values, the tick handler isn't running
 /// when expected.
 pub static PER_CPU_TICK_MAX_GAP_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Plan A counter: number of sleep wakes that were re-targeted from
+/// last_cpu to the waker CPU because last_cpu's tick had gone stale
+/// past STALE_TICK_THRESHOLD_NS.  A high ratio (relative to
+/// SLEEP_WAKE_LATENCY_COUNT) means the tail mitigation is firing
+/// often — i.e., target CPUs are routinely going silent under host
+/// load.
+pub static STALE_TARGET_RETARGET_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Check per-task alarm timers and deliver SIGALRM.
 /// Called from tick() before try_switch.

@@ -251,6 +251,16 @@ pub fn wait_for_interrupt() {
 /// /tmp/telix-tickless-smp-ipi.md (QEMU-side session, 2026-04-24).
 #[inline]
 pub fn send_reschedule_ipi(target_cpu: u32) {
+    // Hypervisor fast path: when running under KVM (or any
+    // hypervisor that advertises a PV IPI hypercall), bypass the
+    // native LAPIC ICR write and ask the host directly.  Host-side
+    // delivery is typically faster than emulating the LAPIC write
+    // and reduces vmexit overhead.  send_reschedule_ipi returns
+    // false if the hypervisor isn't ready or doesn't support PV
+    // IPI; falling through to the native path then.
+    if crate::arch::hypervisor::ops().send_reschedule_ipi(target_cpu) {
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::lapic::send_reschedule(target_cpu);
     #[cfg(target_arch = "aarch64")]

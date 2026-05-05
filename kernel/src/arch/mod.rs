@@ -26,6 +26,7 @@ pub use mips64 as platform;
 // Architecture-independent abstraction layers.
 pub mod cpu;
 pub mod elf;
+pub mod hypervisor;
 pub mod irq;
 pub mod timer;
 pub mod trapframe;

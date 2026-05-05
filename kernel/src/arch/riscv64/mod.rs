@@ -1,4 +1,5 @@
 pub mod boot;
+pub mod hypervisor;
 pub mod mm;
 pub mod plic;
 pub mod serial;

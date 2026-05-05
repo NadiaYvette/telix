@@ -1,6 +1,7 @@
 pub mod boot;
 pub mod exception;
 pub mod gdt;
+pub mod hypervisor;
 pub mod idt;
 pub mod lapic;
 pub mod mm;

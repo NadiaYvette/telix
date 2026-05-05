@@ -30,6 +30,11 @@ pub fn kmain() -> ! {
     // Platform init: exceptions, interrupt controller, timer.
     arch::platform::init();
 
+    // Hypervisor detection — runs early enough that the rest of boot
+    // (and ops()) can query the kind, but after platform::init so any
+    // arch-specific hypercall mechanism is ready.
+    arch::hypervisor::detect_and_install();
+
     // Parse firmware tables (DTB / Multiboot+ACPI) to discover RAM, CPUs,
     // devices. Must happen before phys::init() — firmware data lives in
     // physical memory that the allocator could overwrite.

@@ -1,5 +1,6 @@
 pub mod boot;
 pub mod exception;
+pub mod hypervisor;
 pub mod irq;
 pub mod mm;
 pub mod serial;
