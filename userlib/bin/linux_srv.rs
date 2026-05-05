@@ -11469,14 +11469,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"\n");
 
     // Plan A.2b: pool of reply threads, all parked on IRFS_REPLY_PORT.
-    // N=4 to match initramfs_srv's worker count.  Stack bumped to 8
-    // pages (32 KiB) — a previous boot 91amfsq377 attempt at N=4 with
-    // 4-page stacks deadlocked linux_srv at startup, hypothesis being
-    // that finish_irfs_read_mmap's call frame overflowed the smaller
-    // stack on one of the threads.  Now that the userlib panic handler
-    // prints file:line:msg before exit, the next failure mode (if any)
-    // will leave a usable trace.
-    const N_REPLY_THREADS: usize = 4;
+    // 8-page stacks fixed the original N=4 stack-overflow crash.
+    // Empirically N=4 also works correctness-wise but introduces
+    // significant boot-wallclock variance (boot 91amfsq380 ran
+    // cleanly, boot 91amfsq381 had 208 WATCHDOG IPC stalls and early
+    // phase failures), so we step down to N=2 — half the parallelism
+    // ceiling, but enough to overlap one in-flight chunk-fill with
+    // one pending UDS reply, and the smaller scheduling pressure
+    // should keep the boot stable.  Bumping back to 4 is safe once
+    // scheduler wake-latency variance is reduced.
+    const N_REPLY_THREADS: usize = 2;
     const REPLY_STACK_PAGES: usize = 8;
     let mut spawned = 0usize;
     for i in 0..N_REPLY_THREADS {
