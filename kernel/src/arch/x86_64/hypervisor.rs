@@ -48,10 +48,10 @@ struct KvmStealTime {
     _pad1: [u32; 11],
 }
 
-/// One steal-time page for the BSP (CPU 0).  AP support would
-/// allocate one per CPU at SMP bring-up.  Aligned to 64 bytes per
-/// the kvm_para ABI requirement.
-static BSP_STEAL_TIME: KvmStealTime = KvmStealTime {
+/// Per-CPU steal-time pages.  Each vCPU gets its own page, with the
+/// MSR pointing at it written from that CPU at bring-up.  The host
+/// updates the steal field while the vCPU is host-descheduled.
+const KVM_ST_NEW: KvmStealTime = KvmStealTime {
     steal: core::sync::atomic::AtomicU64::new(0),
     version: core::sync::atomic::AtomicU32::new(0),
     flags: 0,
@@ -59,7 +59,24 @@ static BSP_STEAL_TIME: KvmStealTime = KvmStealTime {
     _pad0: [0; 3],
     _pad1: [0; 11],
 };
+static STEAL_TIME: [KvmStealTime; crate::sched::smp::MAX_CPUS] =
+    [KVM_ST_NEW; crate::sched::smp::MAX_CPUS];
 static KVM_STEAL_TIME_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable STEAL_TIME for the calling CPU.  Reads the flag set by
+/// `detect_and_install` (BSP-side) — APs check it and bind their
+/// own page if the feature is advertised.  Idempotent.
+pub fn enable_steal_time_self() {
+    if !KVM_STEAL_TIME_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let cpu = crate::sched::smp::cpu_id() as usize;
+    if cpu >= crate::sched::smp::MAX_CPUS {
+        return;
+    }
+    let pa = &STEAL_TIME[cpu] as *const _ as u64;
+    unsafe { wrmsr(MSR_KVM_STEAL_TIME, pa | 1); }
+}
 
 #[inline]
 unsafe fn wrmsr(msr: u32, value: u64) {
@@ -176,8 +193,13 @@ impl HypervisorOps for KvmHypervisor {
         // Read with a version-pair check (Linux pattern): odd version
         // means the host is mid-update.  Retry until version is even
         // and stable across the read.  In practice it converges in 1
-        // iteration, but the loop is a safety net.
-        let p = &BSP_STEAL_TIME;
+        // iteration, but the loop is a safety net.  Returns the
+        // calling CPU's stolen time.
+        let cpu = crate::sched::smp::cpu_id() as usize;
+        if cpu >= crate::sched::smp::MAX_CPUS {
+            return None;
+        }
+        let p = &STEAL_TIME[cpu];
         for _ in 0..8 {
             let v0 = p.version.load(Ordering::Acquire);
             if v0 & 1 != 0 { continue; }
@@ -214,8 +236,15 @@ impl HypervisorOps for KvmHypervisor {
         // 0xFD is the reschedule IPI used by Linux on KVM; Telix's
         // own IRQ wiring uses crate::arch::irq::RESCHEDULE_VECTOR.
         // Reschedule IPI vector is 0xFD (matches lapic::send_reschedule).
+        // ICR encoding for KVM_HC_SEND_IPI: just vector | delivery
+        // mode (Fixed=0) | dest mode (Physical=0).  Linux's
+        // __prepare_ICR does NOT set the assert bit (1<<14) here —
+        // that's a bit for the in-guest LAPIC ICR write path, not
+        // for the PV hypercall.  Setting it caused boot 91amfsq390
+        // to regress at Phase 145e because the hypercall succeeded
+        // but the host's IPI delivery had the wrong shape.
         const RESCHEDULE_VECTOR: u64 = 0xFD;
-        let icr = RESCHEDULE_VECTOR | (1u64 << 14);
+        let icr = RESCHEDULE_VECTOR;
         let r = unsafe {
             kvm_hypercall(KVM_HC_SEND_IPI, bitmap_low, bitmap_high, min, icr)
         };
@@ -285,30 +314,18 @@ pub fn detect_and_install() {
         // KVM feature flags advertised at CPUID 0x40000001 EAX.
         let (eax_kvm, _, _, _) = cpuid(0x40000001);
         if eax_kvm & KVM_FEATURE_PV_SEND_IPI != 0 {
-            // Detected but kept disabled by default until the hypercall
-            // bitmap/ICR encoding is verified end-to-end against the
-            // KVM_HC_SEND_IPI ABI.  Boot 91amfsq390 with PV_SEND_IPI
-            // turned on regressed at Phase 145e (rt_sigaction) where
-            // Plan-A-only boot 91amfsq388 reached Phase 180+ — most
-            // likely the hypercall succeeds but delivers the IPI with
-            // the wrong vector/CPU mapping, so the target CPU never
-            // wakes.  Set KVM_PV_SEND_IPI_ENABLED=true here once the
-            // ABI is verified (e.g. compare a single-target call to
-            // KVM's expected return value).
-            crate::println!("[hypervisor] KVM PV_SEND_IPI advertised (gated off)");
+            KVM_PV_SEND_IPI_ENABLED.store(true, Ordering::Relaxed);
+            crate::println!("[hypervisor] KVM PV_SEND_IPI enabled");
         } else {
             crate::println!("[hypervisor] KVM PV_SEND_IPI not advertised");
         }
         if eax_kvm & KVM_FEATURE_STEAL_TIME != 0 {
-            // Bind the steal-time page to this vCPU (BSP).  We use the
-            // identity-mapped kernel virtual address as the physical
-            // address — Telix maps the kernel image identity early in
-            // boot, so &BSP_STEAL_TIME's VA == its PA.  AP coverage
-            // would do the equivalent on each CPU's bring-up.
-            let pa = &BSP_STEAL_TIME as *const _ as u64;
-            unsafe { wrmsr(MSR_KVM_STEAL_TIME, pa | 1); }
             KVM_STEAL_TIME_ENABLED.store(true, Ordering::Relaxed);
-            crate::println!("[hypervisor] KVM STEAL_TIME enabled (BSP only)");
+            // Bind the BSP's per-CPU steal-time page.  APs do their
+            // own equivalent at AP-rust-entry by calling
+            // enable_steal_time_self.
+            enable_steal_time_self();
+            crate::println!("[hypervisor] KVM STEAL_TIME enabled");
         } else {
             crate::println!("[hypervisor] KVM STEAL_TIME not advertised");
         }

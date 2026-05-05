@@ -223,6 +223,12 @@ extern "C" fn ap_rust_entry(cpu_id: u32) {
     crate::sched::scheduler::init_ap(cpu_id);
     crate::sched::topology::init_ap(cpu_id);
 
+    // Bind this AP's KVM_STEAL_TIME page (no-op if not running on
+    // KVM or if STEAL_TIME wasn't advertised).  Each AP has its own
+    // page — STEAL_TIME[cpu] — that the host updates while this
+    // vCPU is host-descheduled.
+    super::hypervisor::enable_steal_time_self();
+
     // Signal ready.
     AP_READY_COUNT.fetch_add(1, Ordering::Release);
 
