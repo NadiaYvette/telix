@@ -285,8 +285,17 @@ pub fn detect_and_install() {
         // KVM feature flags advertised at CPUID 0x40000001 EAX.
         let (eax_kvm, _, _, _) = cpuid(0x40000001);
         if eax_kvm & KVM_FEATURE_PV_SEND_IPI != 0 {
-            KVM_PV_SEND_IPI_ENABLED.store(true, Ordering::Relaxed);
-            crate::println!("[hypervisor] KVM PV_SEND_IPI enabled");
+            // Detected but kept disabled by default until the hypercall
+            // bitmap/ICR encoding is verified end-to-end against the
+            // KVM_HC_SEND_IPI ABI.  Boot 91amfsq390 with PV_SEND_IPI
+            // turned on regressed at Phase 145e (rt_sigaction) where
+            // Plan-A-only boot 91amfsq388 reached Phase 180+ — most
+            // likely the hypercall succeeds but delivers the IPI with
+            // the wrong vector/CPU mapping, so the target CPU never
+            // wakes.  Set KVM_PV_SEND_IPI_ENABLED=true here once the
+            // ABI is verified (e.g. compare a single-target call to
+            // KVM's expected return value).
+            crate::println!("[hypervisor] KVM PV_SEND_IPI advertised (gated off)");
         } else {
             crate::println!("[hypervisor] KVM PV_SEND_IPI not advertised");
         }
