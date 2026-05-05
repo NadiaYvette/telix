@@ -85,23 +85,27 @@ static CPU_VENDOR: AtomicU8 = AtomicU8::new(VENDOR_UNKNOWN);
 static KVM_PV_SEND_IPI_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Run CPUID leaf `leaf` with `subleaf` 0; returns (eax, ebx, ecx, edx).
+/// LLVM reserves rbx so we can't bind it directly — capture EBX into a
+/// temporary register and copy it out as a u64.
 #[inline]
 fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
-    let (eax, ebx, ecx, edx);
+    let eax: u32;
+    let ebx_tmp: u64;
+    let ecx: u32;
+    let edx: u32;
     unsafe {
         asm!(
             "mov {tmp:r}, rbx",
             "cpuid",
             "xchg {tmp:r}, rbx",
-            tmp = lateout(reg) _,
+            tmp = lateout(reg) ebx_tmp,
             inout("eax") leaf => eax,
-            lateout("ebx") ebx,
             inout("ecx") 0u32 => ecx,
             lateout("edx") edx,
             options(nostack, preserves_flags),
         );
     }
-    (eax, ebx, ecx, edx)
+    (eax, ebx_tmp as u32, ecx, edx)
 }
 
 /// Pack three u32s into the 12-byte signature buffer.
@@ -121,13 +125,19 @@ fn signature_from_regs(ebx: u32, ecx: u32, edx: u32) -> [u8; 12] {
 #[inline]
 unsafe fn kvm_hypercall(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let ret: u64;
+    // LLVM reserves rbx for its own use, so we can't pass it as an
+    // operand directly.  Save → load → restore around the hypercall.
     let vendor = CPU_VENDOR.load(Ordering::Relaxed);
     if vendor == VENDOR_AMD {
         unsafe {
             asm!(
+                "mov {tmp:r}, rbx",
+                "mov rbx, {a0:r}",
                 "vmmcall",
+                "mov rbx, {tmp:r}",
+                tmp = lateout(reg) _,
+                a0 = in(reg) a0,
                 inout("rax") nr => ret,
-                in("rbx") a0,
                 in("rcx") a1,
                 in("rdx") a2,
                 in("rsi") a3,
@@ -140,9 +150,13 @@ unsafe fn kvm_hypercall(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         // as equivalent on its side.
         unsafe {
             asm!(
+                "mov {tmp:r}, rbx",
+                "mov rbx, {a0:r}",
                 "vmcall",
+                "mov rbx, {tmp:r}",
+                tmp = lateout(reg) _,
+                a0 = in(reg) a0,
                 inout("rax") nr => ret,
-                in("rbx") a0,
                 in("rcx") a1,
                 in("rdx") a2,
                 in("rsi") a3,
