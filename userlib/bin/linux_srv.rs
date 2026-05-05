@@ -16,7 +16,7 @@
 
 extern crate userlib;
 
-use userlib::syscall;
+use userlib::{syscall, sync::Mutex};
 
 // --- Linux x86_64 syscall numbers ---
 const __NR_READ: u64 = 0;
@@ -773,6 +773,15 @@ static mut SOCKETPAIR_SEQ: u32 = 0;
 // checks it after dispatch to decide whether to call personality_reply now or
 // wait for the backend reply to resume.
 static mut BACKEND_REPLY_PORT: u64 = 0;
+/// Plan-A reply-thread split: dedicated port for IRFS_IO_READ_REPLY
+/// notifications.  Read by the reply thread, which dispatches them
+/// to finish_irfs_read_mmap / finish_irfs_read_fd off the service
+/// thread's hot path.  UDS replies still go to BACKEND_REPLY_PORT
+/// where the service thread's port_set picks them up alongside
+/// incoming Linux syscalls — those continuations write PROC_TABLE
+/// (alloc_fd in finish_accept_unix), which is service-thread-only
+/// state and thus stays where it was.
+static mut IRFS_REPLY_PORT: u64 = 0;
 static mut ASYNC_NEXT_ID: u64 = 1;
 static mut REPLY_DEFERRED: bool = false;
 
@@ -882,42 +891,74 @@ impl PendingAsync {
 static mut PENDING_ASYNC: [PendingAsync; MAX_PENDING_ASYNC] =
     [PendingAsync::empty(); MAX_PENDING_ASYNC];
 
+/// Guards the PENDING_ASYNC slot index space + ASYNC_NEXT_ID counter
+/// for cross-thread access.  Plan-A reply-thread split: the service
+/// thread allocates slots (and frees them on early-error paths); the
+/// reply thread frees them on the success path of finish_*.  The lock
+/// is held only for short index/scan operations — never around a
+/// kernel syscall.  In-place updates of an already-allocated slot's
+/// payload fields (correlation, total_so_far, in_flight_chunk) are
+/// performed by the slot's current single owner and don't need this
+/// lock; the kind transition under the lock is what defines ownership
+/// transfer.
+static ASYNC_LOCK: Mutex = Mutex::new();
+
 fn async_alloc_slot() -> Option<usize> {
-    unsafe {
+    ASYNC_LOCK.lock();
+    let r = unsafe {
+        let mut found = None;
         for i in 0..MAX_PENDING_ASYNC {
             if matches!(PENDING_ASYNC[i].kind, PendingAsyncKind::Unused) {
-                return Some(i);
+                // Stamp a non-Unused placeholder so a racing scan from
+                // a sibling thread doesn't return the same index.  The
+                // caller will overwrite the full slot before releasing
+                // any reference to it.
+                PENDING_ASYNC[i].kind = PendingAsyncKind::AcceptUnix;
+                found = Some(i);
+                break;
             }
         }
-    }
-    None
+        found
+    };
+    ASYNC_LOCK.unlock();
+    r
 }
 
 fn async_free_slot(idx: usize) {
     if idx >= MAX_PENDING_ASYNC { return; }
+    ASYNC_LOCK.lock();
     unsafe { PENDING_ASYNC[idx] = PendingAsync::empty(); }
+    ASYNC_LOCK.unlock();
 }
 
 fn async_find_by_correlation(correlation: u64) -> Option<usize> {
-    unsafe {
+    ASYNC_LOCK.lock();
+    let r = unsafe {
+        let mut found = None;
         for i in 0..MAX_PENDING_ASYNC {
             if !matches!(PENDING_ASYNC[i].kind, PendingAsyncKind::Unused)
                 && PENDING_ASYNC[i].correlation == correlation
             {
-                return Some(i);
+                found = Some(i);
+                break;
             }
         }
-    }
-    None
+        found
+    };
+    ASYNC_LOCK.unlock();
+    r
 }
 
 fn next_correlation_id() -> u64 {
-    unsafe {
+    ASYNC_LOCK.lock();
+    let id = unsafe {
         let id = ASYNC_NEXT_ID;
         ASYNC_NEXT_ID = ASYNC_NEXT_ID.wrapping_add(1);
         if ASYNC_NEXT_ID == 0 { ASYNC_NEXT_ID = 1; } // 0 reserved for "none"
         id
-    }
+    };
+    ASYNC_LOCK.unlock();
+    id
 }
 
 // Epoll subsystem
@@ -2532,8 +2573,11 @@ const LIN_FS_ASYNC_SCRATCH_REMOTE_BASE: usize = 0x5_0010_0000;
 static mut FS_ASYNC_SCRATCH_LOCAL: usize = 0;
 /// True once the bulk grant to initramfs_srv has succeeded.
 static mut FS_ASYNC_SCRATCH_GRANTED: bool = false;
-/// Bit per scratch slot — set means in flight.
-static mut FS_ASYNC_SCRATCH_BUSY: u8 = 0;
+/// Bit per scratch slot — set means in flight.  Atomic because the
+/// service thread allocates (CAS-loop set bit) and the reply thread
+/// frees (atomic AND-NOT) under the Plan-A split.
+static FS_ASYNC_SCRATCH_BUSY: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
 
 /// Lazily allocate the async scratch region and grant it to initramfs_srv.
 /// Returns true once scratch is ready.
@@ -2578,30 +2622,46 @@ fn ensure_irfs_async_scratch() -> bool {
 }
 
 /// Reserve an async scratch slot.  Returns slot index on success, None if
-/// all slots are in flight.
+/// all slots are in flight.  CAS-loop alloc to make this safe against
+/// concurrent free from the reply thread.
 fn alloc_async_scratch_slot() -> Option<u8> {
+    use core::sync::atomic::Ordering;
     unsafe {
         if !FS_ASYNC_SCRATCH_GRANTED {
             return None;
         }
+    }
+    loop {
+        let busy = FS_ASYNC_SCRATCH_BUSY.load(Ordering::Acquire);
+        let mut chosen: Option<u8> = None;
         for i in 0..FS_ASYNC_SCRATCH_SLOTS {
-            let bit = 1u8 << i;
-            if FS_ASYNC_SCRATCH_BUSY & bit == 0 {
-                FS_ASYNC_SCRATCH_BUSY |= bit;
-                return Some(i as u8);
+            if busy & (1u8 << i) == 0 {
+                chosen = Some(i as u8);
+                break;
             }
         }
+        let i = chosen?;
+        let bit = 1u8 << i;
+        match FS_ASYNC_SCRATCH_BUSY.compare_exchange_weak(
+            busy,
+            busy | bit,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(i),
+            Err(_) => continue, // someone else changed BUSY, retry
+        }
     }
-    None
 }
 
 fn free_async_scratch_slot(slot: u8) {
     if (slot as usize) >= FS_ASYNC_SCRATCH_SLOTS {
         return;
     }
-    unsafe {
-        FS_ASYNC_SCRATCH_BUSY &= !(1u8 << slot);
-    }
+    FS_ASYNC_SCRATCH_BUSY.fetch_and(
+        !(1u8 << slot),
+        core::sync::atomic::Ordering::Release,
+    );
 }
 
 fn async_scratch_local_va(slot: u8) -> usize {
@@ -3370,7 +3430,13 @@ fn lib_cache_lookup(handle: u64) -> Option<usize> {
         for i in 0..LIB_CACHE_MAX {
             if LIB_CACHE[i].in_use && LIB_CACHE[i].irfs_handle == handle {
                 let mask = cache_full_mask(LIB_CACHE[i].chunk_count);
-                if (LIB_CACHE[i].chunks_cached & mask) == mask {
+                // Acquire-load pairs with the Release-store in
+                // cache_chunk_mark (reply thread) so we see the
+                // chunk's bytes in backing memory before observing
+                // the bit set.
+                let cached = chunks_cached_atomic(i)
+                    .load(core::sync::atomic::Ordering::Acquire);
+                if (cached & mask) == mask {
                     return Some(i);
                 }
                 return None;
@@ -3434,14 +3500,30 @@ fn lib_cache_lookup_or_alloc(handle: u64, file_size: u64) -> Option<usize> {
     Some(slot_idx)
 }
 
+/// View `chunks_cached` as an AtomicU64 for cross-thread ordering.
+/// Required because the reply thread sets bits after copying chunk
+/// bytes into the backing region, and the service thread reads
+/// chunks_cached to decide whether to skip an IPC.  Without
+/// Release/Acquire pairing the service thread could see the bit set
+/// while the bytes are still in the reply thread's CPU store buffer.
+fn chunks_cached_atomic(cache_idx: usize) -> &'static core::sync::atomic::AtomicU64 {
+    unsafe {
+        let p = &raw const LIB_CACHE[cache_idx].chunks_cached;
+        &*(p as *const core::sync::atomic::AtomicU64)
+    }
+}
+
 fn cache_chunk_is_cached(cache_idx: usize, chunk_idx: usize) -> bool {
     if chunk_idx >= 64 { return false; }
-    unsafe { LIB_CACHE[cache_idx].chunks_cached & (1u64 << chunk_idx) != 0 }
+    let val = chunks_cached_atomic(cache_idx)
+        .load(core::sync::atomic::Ordering::Acquire);
+    val & (1u64 << chunk_idx) != 0
 }
 
 fn cache_chunk_mark(cache_idx: usize, chunk_idx: usize) {
     if chunk_idx >= 64 { return; }
-    unsafe { LIB_CACHE[cache_idx].chunks_cached |= 1u64 << chunk_idx; }
+    chunks_cached_atomic(cache_idx)
+        .fetch_or(1u64 << chunk_idx, core::sync::atomic::Ordering::Release);
 }
 
 /// Walk chunks in `[start_chunk..=last_chunk]` of the mmap request:
@@ -3545,10 +3627,12 @@ fn get_initramfs_port() -> u64 {
     }
 }
 
-/// Lazily register our BACKEND_REPLY_PORT with initramfs_srv so future
+/// Lazily register our IRFS_REPLY_PORT with initramfs_srv so future
 /// IRFS_IO_READ_ASYNC reads can be delivered as IO_READ_REPLY
-/// notifications back to us.  Idempotent; safe to call repeatedly from
-/// the main loop.  Returns true once registration has succeeded.
+/// notifications back to us — and specifically to the reply thread,
+/// which is the only consumer of IRFS_REPLY_PORT.  Idempotent; safe
+/// to call repeatedly from the main loop.  Returns true once
+/// registration has succeeded.
 fn try_register_irfs_async_reply_port() -> bool {
     unsafe {
         if IRFS_ASYNC_REGISTERED {
@@ -3558,7 +3642,7 @@ fn try_register_irfs_async_reply_port() -> bool {
         if irfs == 0 {
             return false;
         }
-        let rp = BACKEND_REPLY_PORT;
+        let rp = IRFS_REPLY_PORT;
         if rp == 0 {
             return false;
         }
@@ -9697,32 +9781,48 @@ fn handle_async_reply(msg: &syscall::Message) -> bool {
             }
             true
         }
-        IRFS_IO_READ_REPLY => {
-            // data[0] = correlation, data[1] = bytes_read.
-            let correlation = msg.data[0];
-            let bytes_read = msg.data[1];
-            let slot = match async_find_by_correlation(correlation) {
-                Some(s) => s,
-                None => {
-                    // Stale reply (caller likely exited and reaper freed
-                    // the slot).  Drop — the scratch slot was already
-                    // freed when the pending slot was reaped.
-                    return false;
-                }
-            };
-            let kind = unsafe { PENDING_ASYNC[slot].kind };
-            match kind {
-                PendingAsyncKind::IrfsReadFd => finish_irfs_read_fd(slot, bytes_read),
-                PendingAsyncKind::IrfsReadMmap => finish_irfs_read_mmap(slot, bytes_read),
-                _ => {
-                    let scratch = unsafe { PENDING_ASYNC[slot].scratch_slot };
-                    async_free_slot(slot);
-                    free_async_scratch_slot(scratch);
-                }
-            }
-            true
-        }
+        // IRFS_IO_READ_REPLY is exclusively handled by the reply
+        // thread (see reply_thread_entry).  Replies are routed there
+        // because we register IRFS_REPLY_PORT with initramfs_srv —
+        // nothing should arrive on BACKEND_REPLY_PORT with this tag.
         _ => false,
+    }
+}
+
+/// Plan-A reply-thread entry: park on IRFS_REPLY_PORT and dispatch
+/// IRFS_IO_READ_REPLY notifications via finish_irfs_read_mmap /
+/// finish_irfs_read_fd.  These continuations don't write PROC_TABLE
+/// (only LIB_CACHE chunks_cached + scratch slot bitmap + the user's
+/// mmap backing region), which keeps cross-thread state to the
+/// async-table primitives already wrapped in ASYNC_LOCK.
+extern "C" fn reply_thread_entry(_arg: u64) -> ! {
+    let port = unsafe { IRFS_REPLY_PORT };
+    loop {
+        let msg = match syscall::recv_with_cap(port) {
+            Some(m) => m,
+            None => continue,
+        };
+        if msg.tag != IRFS_IO_READ_REPLY {
+            // Not expected on this port; drop quietly so a stray
+            // sender doesn't wedge the loop.
+            continue;
+        }
+        let correlation = msg.data[0];
+        let bytes_read = msg.data[1];
+        let slot = match async_find_by_correlation(correlation) {
+            Some(s) => s,
+            None => continue,
+        };
+        let kind = unsafe { PENDING_ASYNC[slot].kind };
+        match kind {
+            PendingAsyncKind::IrfsReadFd => finish_irfs_read_fd(slot, bytes_read),
+            PendingAsyncKind::IrfsReadMmap => finish_irfs_read_mmap(slot, bytes_read),
+            _ => {
+                let scratch = unsafe { PENDING_ASYNC[slot].scratch_slot };
+                async_free_slot(slot);
+                free_async_scratch_slot(scratch);
+            }
+        }
     }
 }
 
@@ -11340,6 +11440,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // 4 KiB / sizeof(Message)) buys ~2× headroom for the same
         // burst pattern.
         let _ = syscall::port_resize(BACKEND_REPLY_PORT, 64);
+
+        // Plan-A reply-thread split: dedicated port for IRFS replies,
+        // sized identically — under burst load the reply thread can
+        // accumulate up to FS_ASYNC_SCRATCH_SLOTS in-flight chunks
+        // plus prefetched continuations.  64 buys ~2× headroom.
+        IRFS_REPLY_PORT = syscall::port_create();
+        let _ = syscall::port_resize(IRFS_REPLY_PORT, 64);
     }
 
     // Build a port set covering the main service port and the backend reply
@@ -11347,6 +11454,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // makes async dispatch work: while a previously-delegated UDS_ACCEPT is
     // pending on the backend_reply_port, new Linux syscalls on the service
     // port are still serviced.
+    //
+    // IRFS_REPLY_PORT is intentionally NOT in this port set — it's owned
+    // exclusively by the reply thread spawned below.
     let port_set = syscall::port_set_create() as u32;
     let a1 = syscall::port_set_add(port_set, port);
     let a2 = syscall::port_set_add(port_set, unsafe { BACKEND_REPLY_PORT });
@@ -11357,6 +11467,28 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b" rpl_add=");
     syscall::debug_puts(if a2 { b"ok" } else { b"FAIL" });
     syscall::debug_puts(b"\n");
+
+    // Spawn the reply thread.  It parks on IRFS_REPLY_PORT and processes
+    // IRFS_IO_READ_REPLY notifications via finish_irfs_read_mmap (and
+    // siblings).  Coordination with the service thread is via ASYNC_LOCK
+    // around PENDING_ASYNC slot index manipulation; in-place updates of
+    // an already-allocated slot are single-owner.
+    {
+        let stk = match syscall::mmap_anon(0, 4, 1) {
+            Some(v) => (v + 4 * syscall::page_size()) as u64,
+            None => 0,
+        };
+        if stk == 0 {
+            syscall::debug_puts(b"[linux_srv] reply-thread stack alloc FAIL\n");
+        } else {
+            let tid = syscall::thread_create(reply_thread_entry as u64, stk, 0);
+            if tid == u64::MAX {
+                syscall::debug_puts(b"[linux_srv] reply-thread spawn FAIL\n");
+            } else {
+                syscall::debug_puts(b"[linux_srv] reply-thread spawned\n");
+            }
+        }
+    }
 
     // Eagerly set up the long-path scratch grant to VFS so the first openat()
     // for a >16-byte path doesn't race with vfs_task ns publication.
