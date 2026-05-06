@@ -65,7 +65,7 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
         syscall::exit(1);
     }
     let mask_a: u64 = 0b1011;
-    let ok = services::register(&TEST_UUID, mask_a, svc_port_a);
+    let ok = services::register(&TEST_UUID, mask_a, services::CAP_DEFAULT, svc_port_a);
     all_pass &= report(b"S1 register succeeded", ok);
     let r = services::lookup(&TEST_UUID, 0);
     all_pass &= report(
@@ -95,7 +95,7 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
         syscall::exit(1);
     }
     let mask_b: u64 = 0b0100; // only method 2 supported
-    let ok = services::register(&TEST_UUID, mask_b, svc_port_b);
+    let ok = services::register(&TEST_UUID, mask_b, services::CAP_DEFAULT, svc_port_b);
     all_pass &= report(b"S4 re-register succeeded", ok);
     let r_old_method = services::lookup(&TEST_UUID, 0);
     all_pass &= report(
@@ -116,7 +116,7 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
         let _ = report(b"port_create for service C", false);
         syscall::exit(1);
     }
-    let ok = services::register(&TEST_UUID_2, u64::MAX, svc_port_c);
+    let ok = services::register(&TEST_UUID_2, u64::MAX, services::CAP_DEFAULT, svc_port_c);
     all_pass &= report(b"S5 register second UUID", ok);
     let r1 = services::lookup(&TEST_UUID, 2);
     let r2 = services::lookup(&TEST_UUID_2, 0);
@@ -138,9 +138,35 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
         matches!(r2, Some(ep) if ep.port == svc_port_c),
     );
 
+    // Scenario 7: capability bundle round-trip + attenuation (Piece c).
+    // Re-register TEST_UUID_2 with a specific bundle, look it up,
+    // verify the bundle is returned in capability_hint.  Then run
+    // attenuate() against a narrowing mask and verify the result.
+    let bundle_full = services::CAP_INVOKE | services::CAP_READ
+        | services::CAP_WRITE | services::CAP_FORWARD
+        | services::CAP_LOCAL_ONLY;
+    let ok = services::register(&TEST_UUID_2, u64::MAX, bundle_full, svc_port_c);
+    all_pass &= report(b"S7 register with full bundle", ok);
+    let r = services::lookup(&TEST_UUID_2, 0);
+    all_pass &= report(
+        b"S7 lookup returns bundle in capability_hint",
+        matches!(r, Some(ep) if ep.capability_hint == bundle_full),
+    );
+    // Attenuate: drop CAP_FORWARD + CAP_WRITE.  The result should
+    // have CAP_INVOKE + CAP_READ + CAP_LOCAL_ONLY only.
+    let narrowing = services::CAP_INVOKE | services::CAP_READ
+        | services::CAP_LOCAL_ONLY;
+    let attenuated = services::attenuate(bundle_full, narrowing);
+    all_pass &= report(
+        b"S7 attenuate yields strictly narrower bundle",
+        attenuated == narrowing
+            && attenuated & services::CAP_FORWARD == 0
+            && attenuated & services::CAP_WRITE == 0,
+    );
+
     // Final summary.
     if all_pass {
-        syscall::debug_puts(b"[servicereg_test] PASSED (6 scenarios)\n");
+        syscall::debug_puts(b"[servicereg_test] PASSED (7 scenarios)\n");
         syscall::exit(0);
     } else {
         syscall::debug_puts(b"[servicereg_test] FAILED\n");

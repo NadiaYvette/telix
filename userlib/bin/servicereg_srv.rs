@@ -78,7 +78,8 @@ const MAX_ENTRIES: usize = 64;
 struct Entry {
     in_use: bool,
     uuid: [u8; 16],
-    method_mask: u64,
+    method_mask: u32,
+    bundle: u32,
     port: u64,
 }
 
@@ -88,6 +89,7 @@ impl Entry {
             in_use: false,
             uuid: [0; 16],
             method_mask: 0,
+            bundle: 0,
             port: 0,
         }
     }
@@ -138,7 +140,11 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
         match msg.tag {
             SVCREG_REGISTER => {
                 let uuid = uuid_from_words(msg.data[0], msg.data[1]);
-                let method_mask = msg.data[2];
+                // Wire format: low 32 bits of data[2] = method_mask,
+                // high 32 bits = capability bundle.  See
+                // userlib::services::register for the rationale.
+                let method_mask = (msg.data[2] & 0xFFFF_FFFF) as u32;
+                let bundle = ((msg.data[2] >> 32) & 0xFFFF_FFFF) as u32;
                 let svc_port = msg.data[3];
                 // Reuse the slot if this UUID is already registered
                 // (re-registration updates the port + mask).
@@ -163,6 +169,7 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                             in_use: true,
                             uuid,
                             method_mask,
+                            bundle,
                             port: svc_port,
                         };
                     }
@@ -187,24 +194,33 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
             SVCREG_LOOKUP => {
                 let uuid = uuid_from_words(msg.data[0], msg.data[1]);
                 let method = msg.data[2] as u32;
-                let mask_bit = if method < 64 { 1u64 << method } else { 0 };
-                let resolved = unsafe {
-                    let mut hit = None;
+                let mask_bit: u32 = if method < 32 { 1u32 << method } else { 0 };
+                let resolved: Option<(u64, u32)> = unsafe {
+                    let mut hit: Option<(u64, u32)> = None;
                     for i in 0..MAX_ENTRIES {
                         if TABLE[i].in_use && TABLE[i].uuid == uuid
                             && (mask_bit == 0 || TABLE[i].method_mask & mask_bit != 0)
                         {
-                            hit = Some(TABLE[i].port);
+                            hit = Some((TABLE[i].port, TABLE[i].bundle));
                             break;
                         }
                     }
                     hit
                 };
                 match resolved {
-                    Some(p) => {
-                        // Capability hint = 0 today; reserved for the
-                        // attenuated capability bundle from piece (c).
-                        let _ = syscall::reply(SVCREG_LOOKUP_OK, p, 0, 0, 0, 0);
+                    Some((p, bundle)) => {
+                        // Piece (c): capability_hint slot now carries
+                        // the bundle the caller's session is authorised
+                        // under.  Bundle is u32 on the wire (packed
+                        // alongside method_mask in register), widened
+                        // back to u64 here for the caller's
+                        // convenience and forward compatibility.
+                        let _ = syscall::reply(
+                            SVCREG_LOOKUP_OK,
+                            p,
+                            bundle as u64,
+                            0, 0, 0,
+                        );
                     }
                     None => {
                         let _ = syscall::reply(SVCREG_LOOKUP_NOTFOUND, 0, 0, 0, 0, 0);

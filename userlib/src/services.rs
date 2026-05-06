@@ -27,13 +27,63 @@ const SVCREG_LOOKUP_OK: u64 = 0x7E11;
 /// UUID for their service kind; all implementations use the same UUID.
 pub type ServiceUuid = [u8; 16];
 
-/// Successful lookup result: a port to send to, plus a capability
-/// hint (placeholder u64 today; piece (c) will carry the attenuated
-/// capability bundle authorising the calling session).
+/// Capability-bundle bitmask (Piece c).  A u64 of rights bits carried
+/// alongside every (register, lookup) pair.  Producers (registrants)
+/// declare what they grant; consumers (lookup callers) receive the
+/// bundle and decide whether the granted rights match what they need.
+/// Attenuation along a forwarding chain is bitwise AND with a mask —
+/// a NAT rewrite might drop CAP_LOCAL_ADDRESSING; an encryption proxy
+/// might add CAP_CONFIDENTIAL.  Each transformer narrows or augments
+/// the bundle; the receiver at egress sees the final attenuated set.
+pub type CapabilityBundle = u64;
+
+/// Holder may issue read-style requests to the service.
+pub const CAP_READ: CapabilityBundle = 1 << 0;
+/// Holder may issue write-style requests.
+pub const CAP_WRITE: CapabilityBundle = 1 << 1;
+/// Holder may issue call/reply invocations (most common).
+pub const CAP_INVOKE: CapabilityBundle = 1 << 2;
+/// Holder may forward the capability to a third party (delegation).
+pub const CAP_FORWARD: CapabilityBundle = 1 << 3;
+/// Holder may produce strictly-attenuated derivatives.
+pub const CAP_ATTENUATE: CapabilityBundle = 1 << 4;
+/// Holder may revoke the capability.
+pub const CAP_REVOKE: CapabilityBundle = 1 << 5;
+/// Service guarantees confidentiality on the wire (e.g., encrypted
+/// proxy hop).  Set by transformers, not by the original registrant.
+pub const CAP_CONFIDENTIAL: CapabilityBundle = 1 << 6;
+/// Service guarantees integrity (signed messages, MAC, etc.).
+pub const CAP_INTEGRITY: CapabilityBundle = 1 << 7;
+/// Service is reachable only on the local node (not crossed any
+/// network boundary).  Inverse-attenuation: a remote-bonded session
+/// drops this bit.
+pub const CAP_LOCAL_ONLY: CapabilityBundle = 1 << 8;
+
+/// Default bundle for "ordinary" callable services: invoke + read +
+/// write + local-only.  Suitable for a registrant that doesn't have
+/// specific rights it wants to advertise.
+pub const CAP_DEFAULT: CapabilityBundle =
+    CAP_INVOKE | CAP_READ | CAP_WRITE | CAP_LOCAL_ONLY;
+
+/// Successful lookup result: a port to send to, plus the capability
+/// bundle the caller's session is authorised under.  The bundle is
+/// the (possibly attenuated) rights set propagated through the
+/// forwarding chain — the caller can inspect it to decide whether
+/// the granted rights match what they need.
 #[derive(Copy, Clone, Debug)]
 pub struct ServiceEndpoint {
     pub port: u64,
-    pub capability_hint: u64,
+    pub capability_hint: CapabilityBundle,
+}
+
+/// Attenuate a bundle: produce a strictly-narrower derivative by
+/// AND'ing with a mask.  Pure function, no IPC.  Transformers along
+/// the forwarding chain call this to narrow the rights they propagate.
+/// Cannot add rights — a transformer that wants to *augment* (e.g.,
+/// an encryption proxy adding CAP_CONFIDENTIAL) needs separate
+/// machinery and a signed assertion of the new guarantee.
+pub fn attenuate(bundle: CapabilityBundle, mask: CapabilityBundle) -> CapabilityBundle {
+    bundle & mask
 }
 
 fn pack_uuid(uuid: &ServiceUuid) -> (u64, u64) {
@@ -50,17 +100,34 @@ fn registry_port() -> Option<u64> {
 
 /// Register `service_port` as the local provider of service `uuid`,
 /// supporting the methods specified by `method_mask` (bit `i` set =
-/// method index `i` is supported).  Returns true on success.
+/// method index `i` is supported), declaring the rights bundle
+/// `bundle` to callers.  The bundle is packed into the upper 32 bits
+/// of `method_mask` over the wire — the kernel name server's IPC
+/// shape only carries 4 u64 data words and we need both the UUID
+/// pair, the mask, the port, and the bundle.  Method count is
+/// effectively limited to 32 by this packing; a future revision can
+/// lift the limit by adding a multi-word register variant.
 ///
-/// Re-registering with the same UUID updates the port + mask.  Use
-/// `unregister` to remove a registration.
-pub fn register(uuid: &ServiceUuid, method_mask: u64, service_port: u64) -> bool {
+/// Returns true on success.  Re-registering with the same UUID
+/// updates the port + mask + bundle.
+pub fn register(
+    uuid: &ServiceUuid,
+    method_mask: u64,
+    bundle: CapabilityBundle,
+    service_port: u64,
+) -> bool {
     let reg = match registry_port() {
         Some(p) => p,
         None => return false,
     };
     let (w0, w1) = pack_uuid(uuid);
-    match syscall::call(reg, SVCREG_REGISTER, w0, w1, method_mask, service_port) {
+    // Pack: low 32 bits = method_mask, high 32 bits = bundle (low 32
+    // bits of the full u64 bundle).  Bundles wider than 32 bits will
+    // be silently truncated for now; the rights set we ship is a
+    // small u32 in practice.
+    let mask_and_bundle =
+        (method_mask & 0xFFFF_FFFF) | ((bundle & 0xFFFF_FFFF) << 32);
+    match syscall::call(reg, SVCREG_REGISTER, w0, w1, mask_and_bundle, service_port) {
         Some(m) => m.tag == SVCREG_REGISTER_OK,
         None => false,
     }
