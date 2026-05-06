@@ -884,8 +884,12 @@ static void handle_wl_display(struct client *c, uint16_t opcode,
         }
         obj_clear(c, new_id);
         c->objs[new_id].type = OBJ_WL_REGISTRY;
-        for (int i = 0; i < N_GLOBALS; i++)
+        for (int i = 0; i < N_GLOBALS; i++) {
             send_registry_global(c, new_id, &GLOBALS[i]);
+            LOG("-> wl_registry.global name=%u iface=%s v=%u",
+                GLOBALS[i].name, GLOBALS[i].interface, GLOBALS[i].version);
+        }
+        LOG("get_registry: sent %d globals", N_GLOBALS);
         break;
     }
     default:
