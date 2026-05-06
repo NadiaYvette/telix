@@ -130,15 +130,19 @@ pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
     // Stack memory dump.  Anchor at the page containing RSP and
     // include STACK_PAGES pages downward toward higher addresses
     // (stack grows down, so memory above RSP holds the saved frames).
+    //
+    // Emit in 256-byte chunks: 16 lines per page (32 lines for the
+    // default 2-page dump).  4× fewer println calls than the original
+    // 64-byte chunking; meaningful under serial-port-bandwidth
+    // constraints.  Each line carries ~344 base64 chars + framing —
+    // well under any reasonable serial / line-buffer limit.
     let stack_base = rsp & !(PAGE_SIZE as u64 - 1);
+    const CHUNK_SIZE: usize = 256;
     for page in 0..STACK_PAGES {
         let page_va = stack_base + (page * PAGE_SIZE) as u64;
-        // Emit in 64-byte chunks: 64 lines per page; each line ~88
-        // base64 chars.  Manageable for serial throughput.
-        let chunk_size = 64;
         let mut off = 0;
         while off < PAGE_SIZE {
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; CHUNK_SIZE];
             let got = user_read_block(page_va + off as u64, &mut buf);
             if got == 0 {
                 // Hit an unmapped page; emit a marker and stop this
@@ -146,14 +150,13 @@ pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
                 crate::println!(
                     "[CORE-MEM-GAP va={:#x} len={}]",
                     page_va + off as u64,
-                    chunk_size
+                    CHUNK_SIZE
                 );
                 break;
             }
-            let mut b64 = [0u8; 96];
+            // base64 expansion: ⌈n/3⌉ × 4.  256 → 344 chars.
+            let mut b64 = [0u8; 352];
             let n = b64_encode(&buf[..got], &mut b64);
-            // Print the base64 as a string slice.  We know it's pure
-            // ASCII, so direct utf-8 conversion is sound.
             let s = unsafe { core::str::from_utf8_unchecked(&b64[..n]) };
             crate::println!(
                 "[CORE-MEM va={:#x} len={} b64={}]",
@@ -161,8 +164,8 @@ pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
                 got,
                 s
             );
-            off += chunk_size;
-            if got < chunk_size {
+            off += CHUNK_SIZE;
+            if got < CHUNK_SIZE {
                 break;
             }
         }
