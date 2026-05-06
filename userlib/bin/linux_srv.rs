@@ -2763,7 +2763,7 @@ const DEBUG_MMAP_TRACE: bool = false;
 /// banner-print point.  Keep `false` for normal/perf boots; flip to
 /// `true` to debug syscall sequences (used heavily during the
 /// libxcb / DISPLAY-format / envp-elision diagnoses).
-const DEBUG_TRACE_PI: bool = false;
+const DEBUG_TRACE_PI: bool = true;
 
 fn irfs_csum32(data: &[u8]) -> u32 {
     let mut s1: u32 = 0;
@@ -6330,6 +6330,48 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     if !is_anon && fd >= 0 {
         let fd_idx = fd as usize;
         if fd_idx < MAX_FDS {
+            // Diagnostic: log every file-backed mmap of an Initramfs FD with
+            // its load address.  Pairs with initramfs_srv's existing
+            // [irfs] IO_CONNECT_OK h=N name=PATH lines: cross-reference
+            // the handle to map (pid, base_va) → library path, which
+            // is the prerequisite for resolving any captured RIP back
+            // to a function via addr2line on the host.
+            //
+            // Format:
+            //   [lib-load] pid=PID handle=H file_off=O base=0xVA len=L
+            //
+            // Light enough to leave on by default; one line per
+            // library-segment mmap (typically ~5 lines per dyn-linked
+            // process).
+            const LIB_LOAD_LOG: bool = true;
+            if LIB_LOAD_LOG {
+                let kind_now = unsafe { PROC_TABLE[pi].fds[fd_idx].kind };
+                if matches!(kind_now, FdKind::Initramfs) {
+                    let h_now = unsafe { PROC_TABLE[pi].fds[fd_idx].handle };
+                    syscall::debug_puts(b"  [lib-load] pid=");
+                    print_num(pi as u64);
+                    syscall::debug_puts(b" handle=");
+                    print_num(h_now);
+                    syscall::debug_puts(b" file_off=");
+                    print_num(file_offset);
+                    syscall::debug_puts(b" base=0x");
+                    {
+                        let hex = b"0123456789abcdef";
+                        let mut buf = [0u8; 16];
+                        let v = va as u64;
+                        for i in 0..16 {
+                            buf[15 - i] = hex[((v >> (i * 4)) & 0xF) as usize];
+                        }
+                        // Trim leading zeros for readability.
+                        let mut start = 0usize;
+                        while start < 15 && buf[start] == b'0' { start += 1; }
+                        syscall::debug_puts(&buf[start..]);
+                    }
+                    syscall::debug_puts(b" len=");
+                    print_num(len as u64);
+                    syscall::debug_puts(b"\n");
+                }
+            }
             let (kind, fs_port, handle, file_size) = unsafe {
                 if PROC_TABLE[pi].fds[fd_idx].in_use {
                     (PROC_TABLE[pi].fds[fd_idx].kind, PROC_TABLE[pi].fds[fd_idx].fs_port,

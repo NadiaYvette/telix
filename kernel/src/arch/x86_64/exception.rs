@@ -437,6 +437,30 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
                 crate::sched::scheduler::current_thread_id(),
                 crate::sched::scheduler::thread_ref(crate::sched::scheduler::current_thread_id()).task_id,
             );
+            // Stack snapshot + RBP chain walk — same shape as
+            // exception_fault's enhanced dump.  Pair RIPs with
+            // [lib-load] entries to resolve via addr2line.
+            let rsp = frame.rsp() as *const u64;
+            let mut sw = [0u64; 8];
+            for i in 0..8 {
+                sw[i] = unsafe { core::ptr::read_volatile(rsp.add(i)) };
+            }
+            crate::println!(
+                "  STACK[0..8]@RSP: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]
+            );
+            let mut rbp = frame.rbp() as *const u64;
+            for f in 0..6 {
+                if rbp.is_null() || (rbp as u64) < 0x1000 { break; }
+                let saved_rbp = unsafe { core::ptr::read_volatile(rbp) };
+                let saved_rip = unsafe { core::ptr::read_volatile(rbp.add(1)) };
+                crate::println!(
+                    "  FRAME[{}]: rbp={:#x} caller_rip={:#x}",
+                    f, saved_rbp, saved_rip
+                );
+                if saved_rbp == 0 || saved_rbp <= rbp as u64 { break; }
+                rbp = saved_rbp as *const u64;
+            }
             crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
         }
         _ => {}
@@ -477,6 +501,43 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
         frame.ss()
     );
     if is_user {
+        // Stack snapshot: 64 bytes (8 u64s) at RSP.  Lets the
+        // host post-mortem see saved return addresses + arguments
+        // in registers' spill slots.  Faults here would re-fault
+        // the thread (which we're killing anyway), so reads are
+        // best-effort.
+        let rsp = frame.rsp() as *const u64;
+        let mut sw = [0u64; 8];
+        for i in 0..8 {
+            sw[i] = unsafe { core::ptr::read_volatile(rsp.add(i)) };
+        }
+        crate::println!(
+            "  STACK[0..8]@RSP: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+            sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]
+        );
+        // RBP chain walk: print the saved-RIP at each frame for up
+        // to 6 frames.  Each frame's layout (per System V AMD64):
+        //   [RBP]      = caller's RBP
+        //   [RBP + 8]  = caller's saved RIP (return address)
+        // Pair these RIPs with the [lib-load] log lines emitted by
+        // linux_srv to map them to function names via addr2line.
+        let mut rbp = frame.rbp() as *const u64;
+        for f in 0..6 {
+            if rbp.is_null() || (rbp as u64) < 0x1000 {
+                break;
+            }
+            let saved_rbp = unsafe { core::ptr::read_volatile(rbp) };
+            let saved_rip = unsafe { core::ptr::read_volatile(rbp.add(1)) };
+            crate::println!(
+                "  FRAME[{}]: rbp={:#x} caller_rip={:#x}",
+                f, saved_rbp, saved_rip
+            );
+            // Stop if RBP didn't decrease (corrupted chain or top of stack).
+            if saved_rbp == 0 || saved_rbp <= rbp as u64 {
+                break;
+            }
+            rbp = saved_rbp as *const u64;
+        }
         // Kill the faulting thread so the CPU can continue running others.
         // Signal number: SIGILL(4) for #UD, SIGSEGV(11) for #GP/#SS, etc.
         crate::sched::scheduler::exit_current_thread(-11);
