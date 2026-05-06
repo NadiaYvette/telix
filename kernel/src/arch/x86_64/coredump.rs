@@ -71,28 +71,66 @@ fn b64_encode(input: &[u8], out: &mut [u8]) -> usize {
     o
 }
 
-/// Read a single byte from a userspace address in the current address
-/// space.  Returns None on read fault.  (We assume the page-fault path
-/// is set up to recover; in practice, dumping a faulting thread has
-/// the caller already in fault context, and re-faulting just kills
-/// later lines — acceptable.)
-fn user_read_byte(va: u64) -> Option<u8> {
-    if va < 0x1000 {
-        return None;
+/// Read CR3 to get the active address space's PML4 root.
+#[inline]
+fn current_pml4() -> usize {
+    let cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
     }
-    Some(unsafe { core::ptr::read_volatile(va as *const u8) })
+    (cr3 & !0xfff) as usize
 }
 
-/// Try to read up to `len` bytes starting at `va` into `out`.  Stops
-/// at the first read fault.  Returns the number of bytes successfully
-/// read.
+/// Page-mapped check.  Walks the active PML4 — does NOT itself fault on
+/// missing user mapping.  Boot 448 hit a kernel #PF inside the dump path
+/// when the stack walk crossed below RSP into an unmapped guard page;
+/// gating reads on this check stops that.
+#[inline]
+fn user_va_mapped(va: u64) -> bool {
+    crate::arch::x86_64::mm::translate_va(current_pml4(), va as usize).is_some()
+}
+
+/// Read a u64 from userspace, returning None if the page is unmapped.
+/// Exposed for the RBP-chain walker and STACK[0..8] dump in
+/// exception.rs — those code paths used raw read_volatile and crashed
+/// the kernel on unmapped pages (boot 448).
+pub(crate) fn safe_read_user_u64(va: u64) -> Option<u64> {
+    if va < 0x1000 || va.checked_add(8).is_none() {
+        return None;
+    }
+    if !user_va_mapped(va) {
+        return None;
+    }
+    // 8-byte read could straddle a page boundary; if the second byte's
+    // page differs from the first, verify it too.
+    if (va & !0xfff) != ((va + 7) & !0xfff) && !user_va_mapped(va + 7) {
+        return None;
+    }
+    Some(unsafe { core::ptr::read_volatile(va as *const u64) })
+}
+
+/// Try to read up to `len` bytes starting at `va` into `out`.  Stops at
+/// the first unmapped page.  Performs a page-table walk only at page
+/// boundaries (4 KiB granularity) — once a page is verified mapped,
+/// subsequent bytes within it are read directly.
 fn user_read_block(va: u64, out: &mut [u8]) -> usize {
     let mut got = 0;
+    let mut current_page: u64 = u64::MAX; // sentinel — never matches a real page
+    let mut current_page_mapped = false;
     for i in 0..out.len() {
-        match user_read_byte(va + i as u64) {
-            Some(b) => out[i] = b,
-            None => return got,
+        let cur_va = va + i as u64;
+        if cur_va < 0x1000 {
+            return got;
         }
+        let page = cur_va & !0xfff;
+        if page != current_page {
+            current_page = page;
+            current_page_mapped = user_va_mapped(page);
+        }
+        if !current_page_mapped {
+            return got;
+        }
+        out[i] = unsafe { core::ptr::read_volatile(cur_va as *const u8) };
         got += 1;
     }
     got

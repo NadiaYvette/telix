@@ -443,26 +443,32 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
             // Stack snapshot + RBP chain walk — same shape as
             // exception_fault's enhanced dump.  Pair RIPs with
             // [lib-load] entries to resolve via addr2line.
-            let rsp = frame.rsp() as *const u64;
+            let rsp = frame.rsp();
             let mut sw = [0u64; 8];
             for i in 0..8 {
-                sw[i] = unsafe { core::ptr::read_volatile(rsp.add(i)) };
+                sw[i] = crate::arch::x86_64::coredump::safe_read_user_u64(
+                    rsp.wrapping_add((i * 8) as u64),
+                ).unwrap_or(0);
             }
             crate::println!(
                 "  STACK[0..8]@RSP: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
                 sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]
             );
-            let mut rbp = frame.rbp() as *const u64;
+            let mut rbp = frame.rbp();
             for f in 0..6 {
-                if rbp.is_null() || (rbp as u64) < 0x1000 { break; }
-                let saved_rbp = unsafe { core::ptr::read_volatile(rbp) };
-                let saved_rip = unsafe { core::ptr::read_volatile(rbp.add(1)) };
+                if rbp < 0x1000 { break; }
+                let saved_rbp = match crate::arch::x86_64::coredump::safe_read_user_u64(rbp) {
+                    Some(v) => v, None => break,
+                };
+                let saved_rip = match crate::arch::x86_64::coredump::safe_read_user_u64(rbp.wrapping_add(8)) {
+                    Some(v) => v, None => break,
+                };
                 crate::println!(
                     "  FRAME[{}]: rbp={:#x} caller_rip={:#x}",
                     f, saved_rbp, saved_rip
                 );
-                if saved_rbp == 0 || saved_rbp <= rbp as u64 { break; }
-                rbp = saved_rbp as *const u64;
+                if saved_rbp == 0 || saved_rbp <= rbp { break; }
+                rbp = saved_rbp;
             }
             crate::sched::scheduler::exit_current_thread(-11); // SIGSEGV
         }
@@ -514,10 +520,12 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
         // in registers' spill slots.  Faults here would re-fault
         // the thread (which we're killing anyway), so reads are
         // best-effort.
-        let rsp = frame.rsp() as *const u64;
+        let rsp = frame.rsp();
         let mut sw = [0u64; 8];
         for i in 0..8 {
-            sw[i] = unsafe { core::ptr::read_volatile(rsp.add(i)) };
+            sw[i] = crate::arch::x86_64::coredump::safe_read_user_u64(
+                rsp.wrapping_add((i * 8) as u64),
+            ).unwrap_or(0);
         }
         crate::println!(
             "  STACK[0..8]@RSP: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
@@ -529,22 +537,26 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
         //   [RBP + 8]  = caller's saved RIP (return address)
         // Pair these RIPs with the [lib-load] log lines emitted by
         // linux_srv to map them to function names via addr2line.
-        let mut rbp = frame.rbp() as *const u64;
+        let mut rbp = frame.rbp();
         for f in 0..6 {
-            if rbp.is_null() || (rbp as u64) < 0x1000 {
+            if rbp < 0x1000 {
                 break;
             }
-            let saved_rbp = unsafe { core::ptr::read_volatile(rbp) };
-            let saved_rip = unsafe { core::ptr::read_volatile(rbp.add(1)) };
+            let saved_rbp = match crate::arch::x86_64::coredump::safe_read_user_u64(rbp) {
+                Some(v) => v, None => break,
+            };
+            let saved_rip = match crate::arch::x86_64::coredump::safe_read_user_u64(rbp.wrapping_add(8)) {
+                Some(v) => v, None => break,
+            };
             crate::println!(
                 "  FRAME[{}]: rbp={:#x} caller_rip={:#x}",
                 f, saved_rbp, saved_rip
             );
             // Stop if RBP didn't decrease (corrupted chain or top of stack).
-            if saved_rbp == 0 || saved_rbp <= rbp as u64 {
+            if saved_rbp == 0 || saved_rbp <= rbp {
                 break;
             }
-            rbp = saved_rbp as *const u64;
+            rbp = saved_rbp;
         }
         // Kill the faulting thread so the CPU can continue running others.
         // Signal number: SIGILL(4) for #UD, SIGSEGV(11) for #GP/#SS, etc.
