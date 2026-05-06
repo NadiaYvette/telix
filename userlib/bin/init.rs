@@ -676,8 +676,40 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             syscall::debug_puts(b"  [disc] LIST_PEERS call failed\n");
                         }
                     }
+                    // GET_STATS round 1: capture initial announce_count + tx_ready bit.
+                    let (n0, tx_ready) = match syscall::call(disc_port, 0x4D05, 0, 0, 0, 0) {
+                        Some(r) if r.tag == 0x4D06 => (r.data[0], r.data[1]),
+                        _ => {
+                            ok = false;
+                            syscall::debug_puts(b"  [disc] GET_STATS call failed\n");
+                            (0, 0)
+                        }
+                    };
+                    // Sleep across at least one announce interval (1 s
+                    // configured in discovery_srv) so we can observe the
+                    // count tick up.  Use 1500 ms to be safe under boot
+                    // contention where sleep_ms can be inflated.
+                    syscall::sleep_ms(1500);
+                    let n1 = match syscall::call(disc_port, 0x4D05, 0, 0, 0, 0) {
+                        Some(r) if r.tag == 0x4D06 => r.data[0],
+                        _ => 0,
+                    };
+                    if tx_ready == 1 && n1 <= n0 {
+                        ok = false;
+                        syscall::debug_puts(
+                            b"  [disc] announce count did not advance with tx ready\n",
+                        );
+                    }
                     if ok {
-                        syscall::debug_puts(b"Phase 5l discovery_srv smoke: PASSED\n");
+                        if tx_ready == 1 {
+                            syscall::debug_puts(
+                                b"Phase 5l discovery_srv smoke: PASSED (broadcasting)\n",
+                            );
+                        } else {
+                            syscall::debug_puts(
+                                b"Phase 5l discovery_srv smoke: PASSED (RPC only; eth not ready)\n",
+                            );
+                        }
                     } else {
                         syscall::debug_puts(b"Phase 5l discovery_srv smoke: FAILED\n");
                     }

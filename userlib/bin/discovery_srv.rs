@@ -65,30 +65,40 @@ use userlib::syscall;
 /// Ethertype reserved for Telix discovery announcements.  Distinct from
 /// IPv4 (0x0800) and IPv6 (0x86dd) so the discovery channel doesn't
 /// share bandwidth or filter logic with regular network traffic.
-const _ETHERTYPE_DISCOVERY: u16 = 0xD15C;
+const ETHERTYPE_DISCOVERY: u16 = 0xD15C;
 
 /// Wire payload magic — "TLXD" little-endian.  Receivers reject any
 /// frame whose payload starts with a different value, providing a
 /// cheap sanity check before parsing the rest of the header.
-const _DISCOVERY_MAGIC: u32 = 0x44584C54;
+const DISCOVERY_MAGIC: u32 = 0x44584C54;
 
 /// Current protocol version.  Receivers tolerate higher versions by
 /// ignoring trailing fields (forward compat) but reject lower (because
 /// older senders won't have the fields we read).
-const _DISCOVERY_VERSION: u16 = 1;
+const DISCOVERY_VERSION: u16 = 1;
 
 /// How often (in milliseconds) we broadcast our own announcement.
 /// 1 second is a reasonable starting cadence — frequent enough that a
 /// freshly-booted peer is visible to others within a couple seconds,
 /// rare enough that announcement traffic stays well under any
 /// reasonable bandwidth budget.
-const _ANNOUNCE_INTERVAL_MS: u64 = 1000;
+const ANNOUNCE_INTERVAL_MS: u64 = 1000;
 
 /// How long a peer entry is considered live.  After this many
 /// milliseconds without a fresh announcement, we evict.  3× the
 /// announce interval handles single dropped frames; missing 3 in a
 /// row is enough to call a peer dead.
 const _PEER_TTL_MS: u64 = 3000;
+
+/// Minimum announcement payload size: header only, no service UUIDs.
+const ANNOUNCE_HEADER_LEN: usize = 36;
+
+// ---------------------------------------------------------------------------
+// eth_srv interface (matches eth_srv NETIF protocol).
+// ---------------------------------------------------------------------------
+const NETIF_REGISTER: u64 = 0x5000;
+const NETIF_REGISTER_OK: u64 = 0x5001;
+const NETIF_XMIT: u64 = 0x5200;
 
 // ---------------------------------------------------------------------------
 // RPC tags.
@@ -98,6 +108,12 @@ const DISCOVERY_LIST_PEERS: u64 = 0x4D01;
 const DISCOVERY_LIST_PEERS_OK: u64 = 0x4D02;
 const DISCOVERY_GET_LOCAL_UUID: u64 = 0x4D03;
 const DISCOVERY_GET_LOCAL_UUID_OK: u64 = 0x4D04;
+/// Cumulative announcement broadcasts since startup.  Useful for
+/// integration tests: the validator pings GET_STATS, sleeps briefly,
+/// pings again, asserts the count went up — proves the announce
+/// loop is firing without needing to capture network frames.
+const DISCOVERY_GET_STATS: u64 = 0x4D05;
+const DISCOVERY_GET_STATS_OK: u64 = 0x4D06;
 const DISCOVERY_ERR: u64 = 0x4DFF;
 
 // ---------------------------------------------------------------------------
@@ -144,6 +160,18 @@ static mut PEERS: [PeerEntry; MAX_PEERS] = [PeerEntry::empty(); MAX_PEERS];
 /// the lifetime of this discovery_srv process; resets on restart
 /// (peers will re-discover us under the new UUID).
 static mut LOCAL_UUID: [u8; 16] = [0; 16];
+
+/// Cached eth_srv port + tx state from NETIF_REGISTER handshake.
+/// Zero / 0 / false until the handshake completes; broadcast becomes
+/// a no-op until then so we don't crash if eth_srv isn't up yet.
+static mut ETH_PORT: u64 = 0;
+static mut ETH_TX_LOCAL_VA: usize = 0;
+static mut ETH_TX_CLIENT_ID: u64 = 0;
+static mut TX_REGISTERED: bool = false;
+/// Counters surfaced to the boot log (and useful for cross-instance
+/// validation later: peer A's announce_count should equal peer B's
+/// frames_received_count modulo loss).
+static mut ANNOUNCE_COUNT: u64 = 0;
 
 fn count_active_peers() -> u64 {
     let mut n = 0u64;
@@ -203,6 +231,132 @@ fn generate_local_uuid() {
     }
 }
 
+/// Register with eth_srv for our discovery ethertype, allocating a tx
+/// grant we can broadcast announcements through.  Best-effort: if
+/// eth_srv isn't up yet, we just skip and broadcast becomes a no-op.
+/// Modeled after nat_srv::try_register_eth_tx.
+fn try_register_eth_tx(my_port: u64) {
+    let eth_port = match syscall::ns_lookup(b"eth") {
+        Some(p) => p,
+        None => {
+            syscall::debug_puts(
+                b"  [discovery_srv] eth not registered; broadcast disabled\n",
+            );
+            return;
+        }
+    };
+    unsafe { ETH_PORT = eth_port; }
+    let local_tx = match syscall::mmap_anon(0, 1, 1) {
+        Some(va) => va,
+        None => {
+            syscall::debug_puts(b"  [discovery_srv] mmap_anon for tx failed\n");
+            return;
+        }
+    };
+    // Pre-fault so the kernel grants a unique writable phys page to
+    // eth_srv rather than the shared zero page.
+    unsafe { core::ptr::write_volatile(local_tx as *mut u8, 0u8); }
+
+    let reply_port = syscall::port_create();
+    if reply_port == u64::MAX {
+        syscall::debug_puts(b"  [discovery_srv] port_create for tx reply failed\n");
+        return;
+    }
+    let _ = syscall::send_nb_4(
+        eth_port,
+        NETIF_REGISTER,
+        ETHERTYPE_DISCOVERY as u64,
+        my_port,
+        reply_port,
+        0,
+    );
+    let resp = syscall::recv_msg_timeout(reply_port, 2_000_000);
+    let (cid, _eth_rx_va, eth_tx_va) = match resp {
+        Some(m) if m.tag == NETIF_REGISTER_OK => {
+            (m.data[0], m.data[1] as usize, m.data[2] as usize)
+        }
+        _ => {
+            syscall::debug_puts(
+                b"  [discovery_srv] NETIF_REGISTER handshake failed\n",
+            );
+            return;
+        }
+    };
+    if !syscall::grant_pages(eth_port, local_tx, eth_tx_va, 1, false) {
+        syscall::debug_puts(b"  [discovery_srv] grant_pages tx -> eth failed\n");
+        return;
+    }
+    unsafe {
+        ETH_TX_LOCAL_VA = local_tx;
+        ETH_TX_CLIENT_ID = cid;
+        TX_REGISTERED = true;
+    }
+    syscall::debug_puts(b"  [discovery_srv] eth tx registered (announce ready)\n");
+}
+
+/// Build the 36-byte announcement header into the granted tx page,
+/// then send NETIF_XMIT to eth_srv with broadcast destination.
+/// No-op when TX_REGISTERED is false (eth_srv handshake skipped).
+fn broadcast_announcement() {
+    unsafe {
+        if !TX_REGISTERED || ETH_TX_LOCAL_VA == 0 || ETH_PORT == 0 {
+            return;
+        }
+        // Layout (matches the wire-protocol comment at the top):
+        //   0:  magic ("TLXD")               4 bytes
+        //   4:  version                       u16
+        //   6:  flags                         u16
+        //   8:  node_uuid                     16 bytes
+        //   24: timestamp_ns                  u64
+        //   32: manifest_count                u8
+        //   33: reserved                      3 bytes
+        //   36: service_uuids[manifest_count] (none for now)
+        let dst = ETH_TX_LOCAL_VA as *mut u8;
+        // magic
+        let mag = DISCOVERY_MAGIC.to_le_bytes();
+        for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
+        // version + flags
+        let ver = DISCOVERY_VERSION.to_le_bytes();
+        let flg = 0u16.to_le_bytes();
+        core::ptr::write_volatile(dst.add(4), ver[0]);
+        core::ptr::write_volatile(dst.add(5), ver[1]);
+        core::ptr::write_volatile(dst.add(6), flg[0]);
+        core::ptr::write_volatile(dst.add(7), flg[1]);
+        // node_uuid
+        for i in 0..16 {
+            core::ptr::write_volatile(dst.add(8 + i), LOCAL_UUID[i]);
+        }
+        // timestamp
+        let ts = syscall::clock_gettime().to_le_bytes();
+        for i in 0..8 {
+            core::ptr::write_volatile(dst.add(24 + i), ts[i]);
+        }
+        // manifest_count + reserved
+        core::ptr::write_volatile(dst.add(32), 0u8);
+        for i in 0..3 {
+            core::ptr::write_volatile(dst.add(33 + i), 0u8);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("mfence");
+
+        // NETIF_XMIT data layout (matches eth_srv):
+        //   data[0] = payload_len
+        //   data[1] = dst_mac (0 = broadcast)
+        //   data[2] = ethertype (low 16) | reply_port (high 32, unused)
+        //   data[3] = client_id
+        let _ = syscall::send_nb_4(
+            ETH_PORT,
+            NETIF_XMIT,
+            ANNOUNCE_HEADER_LEN as u64,
+            0u64, // broadcast
+            ETHERTYPE_DISCOVERY as u64,
+            ETH_TX_CLIENT_ID,
+        );
+        ANNOUNCE_COUNT += 1;
+    }
+}
+
 #[unsafe(no_mangle)]
 fn main(_a0: u64, _a1: u64, _a2: u64) {
     syscall::debug_puts(b"[discovery_srv] starting\n");
@@ -229,17 +383,34 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
     print_num(port);
     syscall::debug_puts(b"\n");
 
-    // Future work: register with eth_srv via NETIF_REGISTER for
-    // ethertype 0xD15C and start the announcement timer.  For now we
-    // serve the synchronous RPC surface so callers can verify the
-    // server is up + introspect the local UUID.
+    // Register with eth_srv for our discovery ethertype + start the
+    // announce loop.  Best-effort: if eth_srv isn't up the RPC surface
+    // still works, just no broadcast.
+    try_register_eth_tx(port);
 
+    // Single-threaded main loop: receive RPCs with a timeout matching
+    // the announce interval, broadcast on each timeout boundary.
+    // Using clock_gettime as the source of truth so we don't drift
+    // when an RPC arrives mid-interval.
+    let mut last_announce_ns: u64 = 0;
     loop {
-        let msg = match syscall::recv_with_cap(port) {
+        let now_ns = syscall::clock_gettime();
+        let elapsed_ms = (now_ns.wrapping_sub(last_announce_ns)) / 1_000_000;
+        if elapsed_ms >= ANNOUNCE_INTERVAL_MS {
+            broadcast_announcement();
+            last_announce_ns = now_ns;
+        }
+        // Block at most until the next announce.  recv_msg_timeout takes
+        // microseconds.  Floor at 1 ms so a backed-up announce
+        // schedule doesn't pin a busy loop.
+        let remaining_ms = ANNOUNCE_INTERVAL_MS.saturating_sub(elapsed_ms);
+        let timeout_us = remaining_ms.max(1) * 1_000;
+        let msg = syscall::recv_msg_timeout(port, timeout_us);
+        let m = match msg {
             Some(m) => m,
-            None => continue,
+            None => continue, // timeout — loop back to announce check
         };
-        match msg.tag {
+        match m.tag {
             DISCOVERY_LIST_PEERS => {
                 let n = count_active_peers();
                 let _ = syscall::reply(DISCOVERY_LIST_PEERS_OK, n, 0, 0, 0, 0);
@@ -253,6 +424,14 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                     (u64::from_le_bytes(lo_bytes), u64::from_le_bytes(hi_bytes))
                 };
                 let _ = syscall::reply(DISCOVERY_GET_LOCAL_UUID_OK, lo, hi, 0, 0, 0);
+            }
+            DISCOVERY_GET_STATS => {
+                let n = unsafe { ANNOUNCE_COUNT };
+                let tx_ready = unsafe { TX_REGISTERED } as u64;
+                let _ = syscall::reply(
+                    DISCOVERY_GET_STATS_OK,
+                    n, tx_ready, 0, 0, 0,
+                );
             }
             _ => {
                 let _ = syscall::reply(DISCOVERY_ERR, 0, 0, 0, 0, 0);
