@@ -104,9 +104,18 @@ pub fn putc(c: u8) {
     Serial.putc(c);
 }
 
+// Holding this lock across the duration of one `_print` call serialises
+// concurrent writers — without it, multi-CPU `println!` calls interleave
+// at byte granularity and produce unparseable output (per-CPU bytes
+// land out of order on the wire).  `SpinLock` is interrupt-safe so
+// IRQ-context prints don't deadlock against thread-context prints on
+// the same CPU.
+static PRINT_LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
+    let _g = PRINT_LOCK.lock();
     Serial.write_fmt(args).unwrap();
     // Mirror output to framebuffer console (if initialized).
     if crate::drivers::fb_console::available() {
