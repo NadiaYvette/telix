@@ -136,6 +136,120 @@ fn user_read_block(va: u64, out: &mut [u8]) -> usize {
     got
 }
 
+/// Map a 4-bit AMD64 register number (REX.R/B-extended) to a name.
+fn reg64_name(num: u8) -> &'static str {
+    match num & 0xf {
+        0 => "rax", 1 => "rcx", 2 => "rdx", 3 => "rbx",
+        4 => "rsp", 5 => "rbp", 6 => "rsi", 7 => "rdi",
+        8 => "r8",  9 => "r9", 10 => "r10", 11 => "r11",
+        12 => "r12", 13 => "r13", 14 => "r14", 15 => "r15",
+        _ => "?",
+    }
+}
+
+/// Tiny opcode classifier — enough to name the dereferenced register
+/// for the common faulting instruction classes.  Not a real disassembler.
+/// We only really need to answer "did this instruction fault because
+/// it dereferenced register X" for #GP non-canonical / #PF unmapped
+/// faults.  When in doubt, return a hex tag.
+fn decode_insn_mnem(bytes: &[u8], _frame: &ExceptionFrame) -> &'static str {
+    if bytes.is_empty() {
+        return "(no bytes)";
+    }
+    // Skip a single legacy prefix group if present (most common: 0xf2/0xf3 rep,
+    // 0x66 operand-size, 0x67 address-size, 0x2e/0x36/0x3e/0x26/0x64/0x65 segment).
+    let mut i = 0;
+    while i < bytes.len() && matches!(bytes[i],
+        0xf0 | 0xf2 | 0xf3 | 0x66 | 0x67 |
+        0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65)
+    {
+        i += 1;
+    }
+    // Skip REX prefix if present.
+    let rex_b = if i < bytes.len() && (bytes[i] & 0xf0) == 0x40 {
+        let r = bytes[i] & 0x01;
+        i += 1;
+        r
+    } else { 0 };
+    if i >= bytes.len() { return "(prefixes only)"; }
+    let op = bytes[i];
+    let modrm = bytes.get(i + 1).copied();
+    match op {
+        0xc3 | 0xc2 => return "RET (deref [rsp])",
+        0xcb | 0xca => return "RET FAR (deref [rsp])",
+        0xcf      => return "IRET (deref [rsp])",
+        0x50..=0x57 => return "PUSH r (no memop)",
+        0x58..=0x5f => return "POP r (deref [rsp])",
+        0xe8 => return "CALL rel32 (deref [rsp] on push)",
+        0xe9 => return "JMP rel32 (no memop)",
+        _ => {}
+    }
+    if op == 0xff {
+        if let Some(m) = modrm {
+            let reg_field = (m >> 3) & 0x7;
+            let rm = m & 0x7;
+            let base = reg64_name(rm | (rex_b << 3));
+            // Synthesize static strings via a 6×16 cell of common
+            // (op, base) combos.  Keeping the return type &'static
+            // means we can't format on the fly, so we hand-pick the
+            // ones we care about most: CALL/JMP through any of the
+            // 16 GPRs (the most common faulting indirect opcodes).
+            return match (reg_field, base) {
+                (2, "rax") => "CALL [rax]", (2, "rcx") => "CALL [rcx]",
+                (2, "rdx") => "CALL [rdx]", (2, "rbx") => "CALL [rbx]",
+                (2, "rsp") => "CALL [rsp]", (2, "rbp") => "CALL [rbp]",
+                (2, "rsi") => "CALL [rsi]", (2, "rdi") => "CALL [rdi]",
+                (2, "r8")  => "CALL [r8]",  (2, "r9")  => "CALL [r9]",
+                (2, "r10") => "CALL [r10]", (2, "r11") => "CALL [r11]",
+                (2, "r12") => "CALL [r12]", (2, "r13") => "CALL [r13]",
+                (2, "r14") => "CALL [r14]", (2, "r15") => "CALL [r15]",
+                (4, "rax") => "JMP [rax]",  (4, "rcx") => "JMP [rcx]",
+                (4, "rdx") => "JMP [rdx]",  (4, "rbx") => "JMP [rbx]",
+                (4, "rsp") => "JMP [rsp]",  (4, "rbp") => "JMP [rbp]",
+                (4, "rsi") => "JMP [rsi]",  (4, "rdi") => "JMP [rdi]",
+                (4, "r8")  => "JMP [r8]",   (4, "r9")  => "JMP [r9]",
+                (4, "r10") => "JMP [r10]",  (4, "r11") => "JMP [r11]",
+                (4, "r12") => "JMP [r12]",  (4, "r13") => "JMP [r13]",
+                (4, "r14") => "JMP [r14]",  (4, "r15") => "JMP [r15]",
+                (6, _)     => "PUSH [r/m]",
+                _ => "FF /? (CALL/JMP/PUSH r/m — see modrm)",
+            };
+        }
+        return "FF (truncated)";
+    }
+    if op == 0x8b || op == 0x89 {
+        if let Some(m) = modrm {
+            let mode = (m >> 6) & 0x3;
+            let rm = m & 0x7;
+            if mode != 0x3 {
+                // memop with base register `rm` (+ REX.B)
+                let base = reg64_name(rm | (rex_b << 3));
+                return match (op, base) {
+                    (0x8b, "rax") => "MOV r, [rax]", (0x8b, "rcx") => "MOV r, [rcx]",
+                    (0x8b, "rdx") => "MOV r, [rdx]", (0x8b, "rbx") => "MOV r, [rbx]",
+                    (0x8b, "rsp") => "MOV r, [rsp+sib]", (0x8b, "rbp") => "MOV r, [rbp+disp]",
+                    (0x8b, "rsi") => "MOV r, [rsi]", (0x8b, "rdi") => "MOV r, [rdi]",
+                    (0x8b, "r8")  => "MOV r, [r8]",  (0x8b, "r9")  => "MOV r, [r9]",
+                    (0x8b, "r10") => "MOV r, [r10]", (0x8b, "r11") => "MOV r, [r11]",
+                    (0x8b, "r12") => "MOV r, [r12+sib]", (0x8b, "r13") => "MOV r, [r13+disp]",
+                    (0x8b, "r14") => "MOV r, [r14]", (0x8b, "r15") => "MOV r, [r15]",
+                    (0x89, "rax") => "MOV [rax], r", (0x89, "rcx") => "MOV [rcx], r",
+                    (0x89, "rdx") => "MOV [rdx], r", (0x89, "rbx") => "MOV [rbx], r",
+                    (0x89, "rsp") => "MOV [rsp+sib], r", (0x89, "rbp") => "MOV [rbp+disp], r",
+                    (0x89, "rsi") => "MOV [rsi], r", (0x89, "rdi") => "MOV [rdi], r",
+                    (0x89, "r8")  => "MOV [r8], r",  (0x89, "r9")  => "MOV [r9], r",
+                    (0x89, "r10") => "MOV [r10], r", (0x89, "r11") => "MOV [r11], r",
+                    (0x89, "r12") => "MOV [r12+sib], r", (0x89, "r13") => "MOV [r13+disp], r",
+                    (0x89, "r14") => "MOV [r14], r", (0x89, "r15") => "MOV [r15], r",
+                    _ => "MOV (unrecognized)",
+                };
+            }
+            return "MOV reg, reg";
+        }
+    }
+    "(other — see bytes)"
+}
+
 /// Emit the per-fault core dump block to the debug log.  Caller is
 /// expected to be in user-fault context (RSP is a userspace stack).
 pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
@@ -164,6 +278,27 @@ pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
         frame.rip(), frame.cs(),  frame.rflags(),
         frame.rsp(), frame.ss()
     );
+
+    // Faulting-instruction hint: read 16 bytes at RIP and decode just
+    // enough to identify the instruction class and (if it dereferences
+    // a register) name the base register.  Lets a human grep the dump
+    // for "what was 0x20000da45 *doing* with rdi=non-canonical" without
+    // disassembling on the host.
+    {
+        let mut bytes = [0u8; 16];
+        let got = user_read_block(rip, &mut bytes);
+        let mnem = decode_insn_mnem(&bytes[..got], frame);
+        let mut hex = [0u8; 16 * 3];
+        let mut hi = 0usize;
+        for i in 0..got {
+            hex[hi]     = b"0123456789abcdef"[(bytes[i] >> 4) as usize];
+            hex[hi + 1] = b"0123456789abcdef"[(bytes[i] & 0xf) as usize];
+            hex[hi + 2] = b' ';
+            hi += 3;
+        }
+        let hex_str = unsafe { core::str::from_utf8_unchecked(&hex[..hi.saturating_sub(1)]) };
+        crate::println!("[CORE-INSN-HINT rip={:#x} bytes={} mnem=\"{}\"]", rip, hex_str, mnem);
+    }
 
     // Code-page snapshot: dump the page containing RIP.  Critical for
     // diagnosing "bytes don't match on-disk binary" bugs — host-side
