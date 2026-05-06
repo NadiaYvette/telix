@@ -5159,7 +5159,33 @@ pub fn clear_pending_switch(cpu: usize) {
     if cpu < pt.len() {
         let tid = pt[cpu].swap(u32::MAX, Ordering::AcqRel);
         if tid != u32::MAX {
-            thread_ref(tid).stack_switch_pending.store(false, Ordering::Release);
+            let tref = thread_ref(tid);
+            tref.stack_switch_pending.store(false, Ordering::Release);
+
+            // Self-enqueue handshake: if a wake already fired while we
+            // were stack-switching, it left park_state = PARK_WOKEN and
+            // skipped the enqueue (waiting for us).  CAS WOKEN → NONE
+            // to claim ownership; if we win, do the percpu_enqueue
+            // here on the local (parking) CPU.  If wake's fast path
+            // beat us, the CAS fails and we no-op.
+            if tref
+                .park_state
+                .compare_exchange(PARK_WOKEN, PARK_NONE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let prio = tref.prio.load(Ordering::Acquire);
+                tref.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
+                trace_sched(tid, 16); // 16 = ipc_wake (deferred enqueue path)
+                set_enq_tag(8); // 8 = clear_pending_switch deferred enqueue
+                percpu_enqueue(cpu as u32, prio, tid);
+                // We're already on the parking CPU and about to return
+                // from the exception that triggered this clear; setting
+                // need_resched ensures the return picks up the newly
+                // enqueued thread.
+                smp::get(cpu as u32).need_resched.store(true, Ordering::Release);
+                trace_point("clear_pending_switch.deferred_enqueue", tid as u32);
+            }
         }
     }
 }
@@ -5193,6 +5219,20 @@ pub fn thread_saved_sp(tid: ThreadId) -> u64 {
 pub const PARK_NONE: u8 = 0;
 pub const PARK_ENQUEUED: u8 = 1;
 pub const PARK_COMMITTED: u8 = 2;
+/// Wake fired while the thread was at COMMITTED but its parking CPU
+/// hadn't completed the assembly stack switch yet.  Whoever first
+/// CAS's `WOKEN → NONE` claims responsibility for `percpu_enqueue`-ing
+/// the thread:
+///   - `wake_parked_thread` itself, if it observes `stack_switch_pending`
+///     already cleared (fast path: stack switch was already done).
+///   - `clear_pending_switch` on the parking CPU, on its next exception
+///     entry after the assembly switch completes.
+/// The arbitration eliminates the unbounded spin that the previous
+/// design had in `wake_parked_thread` (waiting for the parking CPU to
+/// finish its `mov rsp, rax` switch); under KVM virt-timer coalescing
+/// that spin was the dominant cost of `sys_reply` (~17 ms avg of 24 ms
+/// total handler time per boot 418's reply-time split data).
+pub const PARK_WOKEN: u8 = 3;
 
 /// Pre-save the current exception frame pointer into the thread's `saved_sp`
 /// and set park_state to PARK_ENQUEUED.
@@ -5441,60 +5481,89 @@ pub fn wake_parked_thread(tid: ThreadId) {
         return;
     }
 
-    // Try normal wake: CAS PARK_COMMITTED → PARK_NONE.
-    // Thread is off-CPU — enqueue it on a run queue.
+    // Try normal wake: CAS PARK_COMMITTED → PARK_WOKEN.
+    // Thread is at COMMITTED, but its parking CPU may not have completed
+    // the assembly stack switch yet.  Transition to PARK_WOKEN and let
+    // arbitration decide who enqueues:
+    //   - This wake's fast path (if stack_switch_pending is already false)
+    //   - clear_pending_switch on the parking CPU (deferred path)
+    // The CAS PARK_WOKEN → PARK_NONE is the arbitration: whoever wins
+    // does the enqueue, the other no-ops.  No spin.
     if tref
         .park_state
-        .compare_exchange(PARK_COMMITTED, PARK_NONE, Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(PARK_COMMITTED, PARK_WOKEN, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
         trace_point("wake_parked.committed_wake", tid as u32);
         unsafe { thread_mut_from_ref(tid) }.ipc_frame_sp = 0;
-        // park_current_for_ipc staged a context switch on the parking CPU.
-        // The actual stack switch (`mov rsp, rax`) happens later in assembly.
-        // Wait for the per-thread flag (set before park_state CAS, cleared
-        // at exception handler entry) so we don't enqueue while the stack
-        // is still in use.
-        while tref.stack_switch_pending.load(Ordering::Acquire) {
-            core::hint::spin_loop();
+        let waker_cpu = smp::cpu_id();
+        let parking_cpu = tref.last_cpu.load(Ordering::Relaxed);
+
+        // Fast path: stack switch already complete.  We can safely do
+        // the enqueue ourselves and apply steal-to-waker re-targeting.
+        if !tref.stack_switch_pending.load(Ordering::Acquire) {
+            if tref
+                .park_state
+                .compare_exchange(PARK_WOKEN, PARK_NONE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let prio = tref.prio.load(Ordering::Acquire);
+                let target = parking_cpu;
+                // NEW_INV: store ON_CPU_PENDING BEFORE state=Ready.
+                tref.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
+                trace_sched(tid, 16);
+                set_enq_tag(6);
+                percpu_enqueue(target, prio, tid);
+                if target == waker_cpu {
+                    smp::get(waker_cpu).need_resched.store(true, Ordering::Release);
+                    crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
+                    trace_point("wake_parked.local_resched", tid as u32);
+                } else {
+                    crate::arch::irq::send_reschedule_ipi(target);
+                    trace_point("wake_parked.remote_ipi", tid as u32);
+                }
+                return;
+            }
+            // CAS failed: clear_pending_switch beat us.  It already
+            // enqueued.  Done.
+            trace_point("wake_parked.lost_to_cps", tid as u32);
+            return;
         }
 
-        let prio = tref.prio.load(Ordering::Acquire);
-        let target = tref.last_cpu.load(Ordering::Relaxed);
-        // NEW_INV: store ON_CPU_PENDING (was u32::MAX from park_current_for_ipc)
-        // BEFORE state=Ready, so rescue's on==MAX orphan predicate cannot
-        // observe (state=Ready ∧ on_cpu=MAX) and the wake is not racing with
-        // a phantom-enqueue caused by an in_queue swap collision.
-        tref.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
-        unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
-        trace_sched(tid, 16); // 16=ipc_wake (COMMITTED→NONE, about to enqueue)
-        set_enq_tag(6); // 6=wake_parked
-        percpu_enqueue(target, prio, tid);
-        // IPC wakes are latency-critical: the caller is blocked waiting for
-        // its reply.  Trigger preemption so the woken thread runs promptly
-        // rather than waiting for the current thread's quantum to expire.
-        let waker_cpu = smp::cpu_id();
-        if target == waker_cpu {
-            // Local: set need_resched so check_preempt_on_return triggers
-            // voluntary_reschedule on syscall return.  Reprogram the timer
-            // in case the waker enters a user-space loop without syscalls.
+        // Slow path: stack switch still pending.  Don't enqueue here.
+        // Send IPI so the parking CPU wakes from HLT and runs its
+        // exception entry — clear_pending_switch will then see
+        // PARK_WOKEN and do the enqueue locally.  This is what
+        // eliminates the unbounded spin: wake's worst-case latency
+        // is now bounded by the IPI delivery + parking CPU's
+        // exception entry path, not by the parking CPU's vCPU
+        // de-scheduling under KVM.
+        if parking_cpu == waker_cpu {
+            // We are the parking CPU (rare — wake fired while still on
+            // syscall path before exception return).  Set need_resched
+            // and reprogram timer so exception entry runs promptly.
             smp::get(waker_cpu).need_resched.store(true, Ordering::Release);
             crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
-            trace_point("wake_parked.local_resched", tid as u32);
+            trace_point("wake_parked.deferred_local", tid as u32);
         } else {
-            // Remote: send IPI to wake from HLT.  The IPI fires try_switch
-            // which drains the deferred slot and picks from the queue at
-            // the next quantum boundary.
-            crate::arch::irq::send_reschedule_ipi(target);
-            trace_point("wake_parked.remote_ipi", tid as u32);
+            crate::arch::irq::send_reschedule_ipi(parking_cpu);
+            trace_point("wake_parked.deferred_ipi", tid as u32);
         }
     } else {
-        // Both CAS operations failed — park_state is already PARK_NONE.
-        // This means the thread was already woken or never parked. If this
-        // happens on a thread that was just dequeued from the turnstile for
-        // IPC injection, the injected message is lost (thread is already
-        // running and will return with stale frame data).
+        // Both CAS operations failed — park_state is now NONE or WOKEN.
+        // If WOKEN, an earlier wake already fired and the enqueue path is
+        // in flight (either via clear_pending_switch or the previous
+        // wake's fast path) — duplicate wake is a no-op.
+        // If NONE, the thread was already woken or never parked.  If this
+        // happens on a thread that was just dequeued from the turnstile
+        // for IPC injection, the injected message is lost (thread is
+        // already running and will return with stale frame data).
         let state = tref.park_state.load(Ordering::Acquire);
+        if state == PARK_WOKEN {
+            trace_point("wake_parked.dup_wake", tid as u32);
+            return;
+        }
         let tstate = unsafe { thread_mut_from_ref(tid) }.state;
         let blocked = unsafe { thread_mut_from_ref(tid) }.blocked_on;
         crate::println!(
