@@ -263,6 +263,29 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                     }
                     return frame_sp;
                 }
+                // Diagnostic: dump 16 bytes at the faulting RIP so we can
+                // decode the instruction post-mortem.  Boot 421 caught an
+                // unexplained #UD inside a userspace dynamic-library
+                // region (RIP=0x200bf52d5) — without the bytes it's
+                // impossible to tell whether it's an unsupported
+                // CPU-feature instruction (AVX-512, CET ENDBR64, etc),
+                // memcpy corruption from the IO_READ path, or something
+                // else.  Read can fault again if the RIP page is
+                // unmapped, but at this point we're about to kill the
+                // thread anyway, so a triple-fault here is no worse than
+                // the current behavior.
+                let mut bytes = [0u8; 16];
+                for i in 0..16 {
+                    bytes[i] = unsafe { *rip.add(i) };
+                }
+                crate::println!(
+                    "  #UD bytes at RIP: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} \
+                     {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                    bytes[4], bytes[5], bytes[6], bytes[7],
+                    bytes[8], bytes[9], bytes[10], bytes[11],
+                    bytes[12], bytes[13], bytes[14], bytes[15]
+                );
             }
             exception_fault("Invalid Opcode (#UD)", frame)
         }
