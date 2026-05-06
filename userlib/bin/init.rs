@@ -627,6 +627,70 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5l: discovery_srv smoke ---
+    // Spawn discovery_srv (Tier 5 distributed-bonding skeleton),
+    // verify it registers with the name server, and exercise its
+    // GET_LOCAL_UUID + LIST_PEERS RPCs.  First-cut criterion: server
+    // responds with a non-zero UUID and reports zero peers (no
+    // cross-device traffic yet).
+    syscall::debug_puts(b"  init: running discovery_srv smoke...\n");
+    {
+        let disc_tid = syscall::spawn(b"discovery_srv", 50);
+        if disc_tid != u64::MAX {
+            // Give it a moment to register itself.
+            for _ in 0..200 { syscall::yield_now(); }
+            syscall::sleep_ms(50);
+            let mut wait = 0u32;
+            while syscall::ns_lookup(b"discovery").is_none() && wait < 200 {
+                syscall::sleep_ms(10);
+                wait += 1;
+            }
+            match syscall::ns_lookup(b"discovery") {
+                Some(disc_port) => {
+                    let mut ok = true;
+                    // Local UUID — both halves must be non-zero (1 in
+                    // 2^128 chance of false negative; treat as proof
+                    // we got a real getrandom result).
+                    match syscall::call(disc_port, 0x4D03, 0, 0, 0, 0) {
+                        Some(r) if r.tag == 0x4D04 => {
+                            if r.data[0] == 0 && r.data[1] == 0 {
+                                ok = false;
+                                syscall::debug_puts(b"  [disc] local UUID is zero\n");
+                            }
+                        }
+                        _ => {
+                            ok = false;
+                            syscall::debug_puts(b"  [disc] GET_LOCAL_UUID call failed\n");
+                        }
+                    }
+                    // Peer count — should be 0 in single-instance mode.
+                    match syscall::call(disc_port, 0x4D01, 0, 0, 0, 0) {
+                        Some(r) if r.tag == 0x4D02 => {
+                            if r.data[0] != 0 {
+                                ok = false;
+                                syscall::debug_puts(b"  [disc] unexpected non-zero peers\n");
+                            }
+                        }
+                        _ => {
+                            ok = false;
+                            syscall::debug_puts(b"  [disc] LIST_PEERS call failed\n");
+                        }
+                    }
+                    if ok {
+                        syscall::debug_puts(b"Phase 5l discovery_srv smoke: PASSED\n");
+                    } else {
+                        syscall::debug_puts(b"Phase 5l discovery_srv smoke: FAILED\n");
+                    }
+                }
+                None => {
+                    syscall::debug_puts(b"Phase 5l discovery_srv smoke: FAILED (ns_lookup)\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 5l discovery_srv smoke: FAILED (spawn)\n");
+        }
+    }
+
     // --- Phase 5h: scheduler call/reply stress (deferred-requeue race repro) ---
     // Skipped under FOCUS_H13 because sched_stress occasionally wedges
     // (WEDGED — giving up) without exiting, which deadlocks init's

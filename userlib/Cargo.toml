@@ -303,3 +303,7 @@ path = "bin/servicereg_test.rs"
 [[bin]]
 name = "router_srv"
 path = "bin/router_srv.rs"
+
+[[bin]]
+name = "discovery_srv"
+path = "bin/discovery_srv.rs"
