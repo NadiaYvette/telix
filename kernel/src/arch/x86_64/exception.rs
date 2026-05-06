@@ -437,6 +437,9 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
                 crate::sched::scheduler::current_thread_id(),
                 crate::sched::scheduler::thread_ref(crate::sched::scheduler::current_thread_id()).task_id,
             );
+            // Tier-3 core dump for unhandled user-space page faults.
+            // Vector 14 = #PF.
+            crate::arch::x86_64::coredump::dump_user_fault(frame, 14);
             // Stack snapshot + RBP chain walk — same shape as
             // exception_fault's enhanced dump.  Pair RIPs with
             // [lib-load] entries to resolve via addr2line.
@@ -501,6 +504,11 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
         frame.ss()
     );
     if is_user {
+        // Tier-3 core dump: emit machine-readable register +
+        // stack-page block to the debug log.  Host script
+        // tools/extract-core.py reconstructs an ELF64 core file
+        // from these markers + the [lib-load] log lines.
+        crate::arch::x86_64::coredump::dump_user_fault(frame, frame.vector());
         // Stack snapshot: 64 bytes (8 u64s) at RSP.  Lets the
         // host post-mortem see saved return addresses + arguments
         // in registers' spill slots.  Faults here would re-fault

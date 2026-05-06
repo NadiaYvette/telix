@@ -1,4 +1,5 @@
 pub mod boot;
+pub mod coredump;
 pub mod exception;
 pub mod gdt;
 pub mod hypervisor;
