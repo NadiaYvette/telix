@@ -758,8 +758,9 @@ pub fn personality_mmap_anon(target_port: u64, va_hint: u64, page_count: u64, pr
         };
         let pa_usize = pa.as_usize();
 
-        // Zero the page.
-        unsafe { core::ptr::write_bytes(pa_usize as *mut u8, 0, ps); }
+        // Fill with poison byte (typically 0xCD) so that uninitialized
+        // reads by user code are visible — see mm::ANON_POISON_BYTE.
+        unsafe { core::ptr::write_bytes(pa_usize as *mut u8, crate::mm::ANON_POISON_BYTE, ps); }
 
         let mmu_start = page_idx * mmu_count;
         let mmu_end = core::cmp::min(mmu_start + mmu_count, mmu_pages);
@@ -902,7 +903,7 @@ pub fn personality_mmap_fixed(target_port: u64, va: u64, page_count: u64, prot: 
             _ => return u64::MAX,
         };
         let pa_usize = pa.as_usize();
-        unsafe { core::ptr::write_bytes(pa_usize as *mut u8, 0, ps); }
+        unsafe { core::ptr::write_bytes(pa_usize as *mut u8, crate::mm::ANON_POISON_BYTE, ps); }
 
         let mmu_start = page_idx * mmu_count;
         let mmu_end = core::cmp::min(mmu_start + mmu_count, mmu_pages);

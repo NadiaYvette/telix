@@ -293,7 +293,11 @@ pub fn complete_fault(token: u32, data_va: usize, data_len: usize) -> bool {
     unsafe {
         core::ptr::copy_nonoverlapping(src_pa as *const u8, phys_addr as *mut u8, copy_len);
         if copy_len < ps {
-            core::ptr::write_bytes((phys_addr + copy_len) as *mut u8, 0, ps - copy_len);
+            // Poison the tail so reads past end-of-data are visible —
+            // see mm::ANON_POISON_BYTE.  ld.so explicitly zeros .bss,
+            // so its [filesz, memsz) range is overwritten before user
+            // code observes it.
+            core::ptr::write_bytes((phys_addr + copy_len) as *mut u8, crate::mm::ANON_POISON_BYTE, ps - copy_len);
         }
     }
 

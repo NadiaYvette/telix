@@ -247,8 +247,10 @@ pub fn handle_page_fault(
                 }
             }
         } else if !is_zeroed {
+            // Poisoned (0xCD) instead of zero so uninitialized reads by
+            // user code are diagnosable — see mm::ANON_POISON_BYTE.
             unsafe {
-                core::ptr::write_bytes(mmu_pa as *mut u8, 0, MMUPAGE_SIZE);
+                core::ptr::write_bytes(mmu_pa as *mut u8, crate::mm::ANON_POISON_BYTE, MMUPAGE_SIZE);
             }
             stats::PAGES_ZEROED.fetch_add(1, Ordering::Relaxed);
         }

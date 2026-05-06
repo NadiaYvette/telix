@@ -103,10 +103,12 @@ pub fn zero_daemon() -> ! {
             }
         };
 
-        // Zero the full page. This is the expensive part and
-        // happens WITHOUT holding any lock.
+        // Fill the full page with poison (0xCD) instead of zero. This
+        // is the expensive part and happens WITHOUT holding any lock.
+        // Pool clients are user-page allocators (mm::fault, personality
+        // mmap) — see mm::ANON_POISON_BYTE.
         unsafe {
-            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, page::page_size());
+            core::ptr::write_bytes(pa.as_usize() as *mut u8, crate::mm::ANON_POISON_BYTE, page::page_size());
         }
 
         // Push the zeroed page into the pool.
