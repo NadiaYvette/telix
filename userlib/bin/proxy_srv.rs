@@ -37,6 +37,25 @@ const NET_TCP_CLOSED: u64 = 0x44FF;
 const WIRE_MAGIC: u32 = 0x544C5850; // "TLXP"
 const WIRE_FRAME_SIZE: usize = 64;
 
+// --- Capability bundle bits (mirror userlib::services::CAP_*) ---
+// Kept inline here so the wire frame can attenuate without a userlib
+// dependency cycle.  Must match userlib/src/services.rs.
+const CAP_READ: u64 = 1 << 0;
+const CAP_WRITE: u64 = 1 << 1;
+const CAP_INVOKE: u64 = 1 << 2;
+const CAP_LOCAL_ONLY: u64 = 1 << 8;
+/// Default outbound bundle when the caller doesn't supply one.  Same
+/// shape as userlib::services::CAP_DEFAULT (INVOKE | READ | WRITE |
+/// LOCAL_ONLY); LOCAL_ONLY gets attenuated below before leaving the
+/// node.
+const PROXY_DEFAULT_BUNDLE: u64 = CAP_INVOKE | CAP_READ | CAP_WRITE | CAP_LOCAL_ONLY;
+/// Mask applied on the egress path: drop CAP_LOCAL_ONLY because by the
+/// time a frame leaves this node over TCP it has, by definition, left
+/// the local addressing domain.  Other bits (READ/WRITE/INVOKE/FORWARD/
+/// CONFIDENTIAL/INTEGRITY/etc.) propagate unchanged so the receiver
+/// sees the rights set the registrant declared, minus locality.
+const PROXY_EGRESS_ATTENUATION: u64 = !CAP_LOCAL_ONLY;
+
 // --- Limits ---
 const MAX_NODES: usize = 16;
 const LISTEN_TCP_PORT: u16 = 9100;
@@ -109,6 +128,7 @@ fn serialize_frame(
     tag: u64,
     data: &[u64; 4],
     src_node: u16,
+    bundle: u64,
 ) {
     // Bytes 0-3: magic
     buf[0..4].copy_from_slice(&WIRE_MAGIC.to_le_bytes());
@@ -124,11 +144,17 @@ fn serialize_frame(
     }
     // Bytes 48-49: source node ID
     buf[48..50].copy_from_slice(&src_node.to_le_bytes());
-    // Bytes 50-63: padding
-    buf[50..64].fill(0);
+    // Bytes 50-57: capability bundle (attenuated for egress — see
+    // PROXY_EGRESS_ATTENUATION; CAP_LOCAL_ONLY is dropped because the
+    // frame is leaving this node).
+    let attenuated = bundle & PROXY_EGRESS_ATTENUATION;
+    buf[50..58].copy_from_slice(&attenuated.to_le_bytes());
+    // Bytes 58-63: padding (reserved for future protocol extensions —
+    // candidates: integrity MAC, sequence number, flow-id).
+    buf[58..64].fill(0);
 }
 
-fn deserialize_frame(buf: &[u8; WIRE_FRAME_SIZE]) -> Option<(u64, u64, [u64; 4], u16)> {
+fn deserialize_frame(buf: &[u8; WIRE_FRAME_SIZE]) -> Option<(u64, u64, [u64; 4], u16, u64)> {
     let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     if magic != WIRE_MAGIC {
         return None;
@@ -152,7 +178,10 @@ fn deserialize_frame(buf: &[u8; WIRE_FRAME_SIZE]) -> Option<(u64, u64, [u64; 4],
         ]);
     }
     let src_node = u16::from_le_bytes([buf[48], buf[49]]);
-    Some((target_port, tag, data, src_node))
+    let bundle = u64::from_le_bytes([
+        buf[50], buf[51], buf[52], buf[53], buf[54], buf[55], buf[56], buf[57],
+    ]);
+    Some((target_port, tag, data, src_node, bundle))
 }
 
 // --- TCP helpers ---
@@ -287,12 +316,21 @@ impl ProxySrv {
         }
 
         let mut frame = [0u8; WIRE_FRAME_SIZE];
+        // Cross-device send carries a capability bundle so the remote
+        // recipient sees the rights set the originator declared.  We
+        // don't yet have per-flow bundle plumbing back to the kernel
+        // proxy redirect path (msg.data carries (target_port, tag,
+        // data...) but no bundle slot today), so use the default
+        // bundle here; serialize_frame attenuates LOCAL_ONLY before
+        // the bytes hit the wire.  When proxy_register grows a
+        // per-port bundle hint, this picks it up automatically.
         serialize_frame(
             &mut frame,
             target_port,
             original_tag,
             &original_data,
             self.my_node_id,
+            PROXY_DEFAULT_BUNDLE,
         );
         self.tcp_send_frame(self.nodes[node_idx].conn_id, &frame);
     }
@@ -326,8 +364,16 @@ impl ProxySrv {
             }
             entry.rx_len = remaining;
 
-            if let Some((target_port, tag, data, _src_node)) = deserialize_frame(&frame) {
-                // Deliver locally.
+            if let Some((target_port, tag, data, _src_node, _bundle)) =
+                deserialize_frame(&frame)
+            {
+                // Deliver locally.  The bundle the sender propagated
+                // is dropped on the floor for now — the local IPC
+                // shape (4 data words) has no slot to forward it
+                // through.  When ports grow per-message bundle
+                // metadata, the inbound bundle would attach here so
+                // the local receiver sees the (already-attenuated)
+                // cross-device rights set.
                 syscall::send_nb_4(target_port, tag, data[0], data[1], data[2], data[3]);
             }
         }

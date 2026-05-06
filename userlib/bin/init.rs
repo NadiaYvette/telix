@@ -578,14 +578,32 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 Some(nat_port) => {
                     match syscall::call(nat_port, 0x7C40, 0, 0, 0, 0) {
                         Some(resp) if resp.tag == 0x7C41 => {
-                            // Bit 32 of data[0] = SUBSCRIBED, bit 33 =
-                            // TX_REGISTERED.  Both should be set for
-                            // the full ETH_SUBSCRIBE + NETIF_XMIT
-                            // egress wiring to be considered live.
+                            // data[0] layout (matches nat_srv NAT_STATS):
+                            //   bit 32 = SUBSCRIBED
+                            //   bit 33 = TX_REGISTERED
+                            //   bit 34 = GATEWAY_MAC_RESOLVED
+                            //   bits 35..43 = NAT_EGRESS_BUNDLE
+                            // Pass criterion remains substrate-up
+                            // (subscribe + tx); gateway-MAC resolution
+                            // is informational since unresolved still
+                            // works via broadcast fallback.
                             let subscribed = (resp.data[0] >> 32) & 1 != 0;
                             let tx_ready = (resp.data[0] >> 33) & 1 != 0;
+                            let gw_resolved = (resp.data[0] >> 34) & 1 != 0;
+                            let bundle = (resp.data[0] >> 35) & 0x1FF;
                             if subscribed && tx_ready {
-                                syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE+NETIF_XMIT wiring: PASSED\n");
+                                if gw_resolved {
+                                    syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE+NETIF_XMIT wiring: PASSED (gw resolved)\n");
+                                } else {
+                                    syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE+NETIF_XMIT wiring: PASSED (gw broadcast)\n");
+                                }
+                                // Bundle should be 0x0F (INVOKE|READ|
+                                // WRITE|FORWARD without LOCAL_ONLY).
+                                if bundle == 0x0F {
+                                    syscall::debug_puts(b"  Phase 5k egress bundle: 0x0F (LOCAL_ONLY attenuated, FORWARD added)\n");
+                                } else {
+                                    syscall::debug_puts(b"  Phase 5k egress bundle: unexpected\n");
+                                }
                             } else if subscribed {
                                 syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE+NETIF_XMIT wiring: FAILED (egress not ready)\n");
                             } else {

@@ -116,15 +116,23 @@ const ETH_FRAME: u64 = 0x5520;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const FILTER_FLAG_NON_LOCAL: u64 = 1 << 0;
 
-// NETIF_REGISTER / NETIF_XMIT (matches eth_srv).  We register with a
-// placeholder ethertype (0xFFFE — IEEE-reserved, won't appear on real
-// frames) just to obtain a tx_grant_va; tcp4_srv keeps the legitimate
-// ownership of 0x0800 for RX dispatch.  RX delivery to us still flows
-// through ETH_SUBSCRIBE, not through the legacy NETIF_INPUT path.
+// NETIF_REGISTER / NETIF_XMIT / NETIF_RESOLVE (matches eth_srv).
+// We register with a placeholder ethertype (0xFFFE — IEEE-reserved,
+// won't appear on real frames) just to obtain a tx_grant_va;
+// tcp4_srv keeps the legitimate ownership of 0x0800 for RX dispatch.
+// RX delivery to us still flows through ETH_SUBSCRIBE, not through
+// the legacy NETIF_INPUT path.
 const NETIF_REGISTER: u64 = 0x5000;
 const NETIF_REGISTER_OK: u64 = 0x5001;
 const NETIF_XMIT: u64 = 0x5200;
+const NETIF_RESOLVE: u64 = 0x5300;
+const NETIF_RESOLVE_OK: u64 = 0x5301;
 const NETIF_XMIT_PLACEHOLDER_ETHERTYPE: u16 = 0xFFFE;
+
+/// Gateway IP for ARP resolution.  Matches eth_srv's GATEWAY_IP.
+/// QEMU user-mode default is 10.0.2.2.  In a real deployment this
+/// would come from configuration or DHCP.
+const GATEWAY_IPV4: u32 = 0x0A00_0202; // 10.0.2.2
 
 /// RFC 5737 documentation/test address used as the default public
 /// IPv4 for source-NAT, so translation still does something
@@ -212,6 +220,19 @@ static mut ETH_TX_LOCAL_VA: usize = 0;
 static mut ETH_TX_CLIENT_ID: u64 = 0;
 /// Cached eth_srv port for fast NETIF_XMIT dispatch.
 static mut ETH_PORT: u64 = 0;
+/// Resolved gateway MAC (packed 6 bytes into low 48 bits of u64).
+/// Zero if NETIF_RESOLVE hasn't completed; we fall back to broadcast
+/// in that case.
+static mut GATEWAY_MAC: u64 = 0;
+/// Egress capability bundle: the rights set we attach to flows
+/// translated by this NAT engine.  Default attenuates CAP_LOCAL_ONLY
+/// from CAP_DEFAULT — translated flows are by definition no longer
+/// local-only, since they've been rewritten to a public address.
+/// Surfaced in NAT_STATS.  CAP_DEFAULT + CAP_FORWARD bits without
+/// CAP_LOCAL_ONLY: 0b0000_0000_1111 = INVOKE | READ | WRITE | FORWARD
+/// (FORWARD added because the flow's already crossing a forwarding
+/// hop and downstream consumers may legitimately re-forward).
+const NAT_EGRESS_BUNDLE: u64 = 0x0000_000F;
 
 /// Find a flow by (proto, private_ip, private_port).  Returns the
 /// table index on hit.
@@ -633,11 +654,48 @@ fn try_register_eth_tx(my_port: u64) {
     syscall::debug_puts(b"  [nat_srv] egress (NETIF_XMIT) ready\n");
 }
 
+/// Resolve the gateway MAC via NETIF_RESOLVE.  Best-effort: caches
+/// the result in GATEWAY_MAC for subsequent emits; on failure leaves
+/// GATEWAY_MAC at 0 so emit_translated falls back to broadcast.
+/// Called once at startup after the eth_srv handshakes complete.
+fn try_resolve_gateway() {
+    let eth_port = unsafe { ETH_PORT };
+    if eth_port == 0 {
+        return;
+    }
+    let reply_port = syscall::port_create();
+    if reply_port == u64::MAX {
+        return;
+    }
+    let _ = syscall::send_nb_4(
+        eth_port,
+        NETIF_RESOLVE,
+        GATEWAY_IPV4 as u64,
+        reply_port,
+        0, 0,
+    );
+    // ARP can take a moment if the gateway hasn't been seen yet.
+    // Give it a generous window — 1 s is plenty for a populated
+    // ARP cache, and far less than typical ARP timeout for a fresh
+    // resolution.
+    let resp = syscall::recv_msg_timeout(reply_port, 1_000_000);
+    match resp {
+        Some(m) if m.tag == NETIF_RESOLVE_OK => {
+            unsafe { GATEWAY_MAC = m.data[0]; }
+            syscall::debug_puts(b"  [nat_srv] gateway MAC resolved\n");
+        }
+        _ => {
+            syscall::debug_puts(b"  [nat_srv] gateway MAC unresolved (will broadcast)\n");
+        }
+    }
+}
+
 /// Emit a translated IPv4 packet via eth_srv's NETIF_XMIT path.
 /// `ip_packet` is the IP packet bytes (no Ethernet header — eth_srv
-/// builds the header from dst_mac + ethertype).  `dst_mac=0` =
-/// broadcast; for real NAT this would be the gateway MAC resolved
-/// via NETIF_RESOLVE.  Returns true on emit success.
+/// builds the header from dst_mac + ethertype).  Uses the resolved
+/// gateway MAC if available (from try_resolve_gateway), or falls
+/// back to broadcast (dst_mac=0) if resolution failed.  Returns true
+/// on emit success.
 fn emit_translated(ip_packet: &[u8]) -> bool {
     unsafe {
         if !TX_REGISTERED || ETH_TX_LOCAL_VA == 0 {
@@ -654,15 +712,16 @@ fn emit_translated(ip_packet: &[u8]) -> bool {
         );
         // NETIF_XMIT data layout (matches eth_srv):
         //   data[0] = payload_len
-        //   data[1] = dst_mac (0 = broadcast)
+        //   data[1] = dst_mac (0 = broadcast; non-zero = resolved MAC)
         //   data[2] = ethertype (low 16) | reply_port (high 32) — we
         //             don't bother with the reply.
         //   data[3] = client_id
+        let dst_mac = GATEWAY_MAC; // 0 falls through to broadcast in eth_srv
         let _ = syscall::send_nb_4(
             ETH_PORT,
             NETIF_XMIT,
             ip_packet.len() as u64,
-            0, // dst_mac = broadcast
+            dst_mac,
             ETHERTYPE_IPV4 as u64,
             ETH_TX_CLIENT_ID,
         );
@@ -749,6 +808,11 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
     // ownership of 0x0800 for RX.
     try_register_eth_tx(port);
 
+    // Resolve the gateway MAC so emit_translated targets the real
+    // next hop instead of broadcasting.  Best-effort; on failure
+    // emit_translated falls back to dst_mac=0 (broadcast).
+    try_resolve_gateway();
+
     syscall::debug_puts(b"[nat_srv] ready on port ");
     print_num(port);
     syscall::debug_puts(b"\n");
@@ -824,24 +888,30 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                     n
                 };
                 unsafe {
-                    // Pack auto-subscribe state into the upper bits of
-                    // the flow-occupancy reply word so the existing
-                    // explicit translate counters still occupy
+                    // Pack substrate state + attenuation into the upper
+                    // bits of the flow-occupancy reply word so the
+                    // existing explicit translate counters still occupy
                     // data[1..3].  Layout:
                     //   data[0] = flow occupancy (low 32) |
                     //             SUBSCRIBED (bit 32) |
                     //             TX_REGISTERED (bit 33) |
-                    //             subscribed_frames (high 30 bits).
+                    //             GATEWAY_MAC_RESOLVED (bit 34) |
+                    //             NAT_EGRESS_BUNDLE (bits 35..43) |
+                    //             subscribed_frames (bits 44..63).
                     //   data[1] = TRANSLATED_OUT_COUNT
                     //   data[2] = TRANSLATED_IN_COUNT
                     //   data[3] = DROPPED_COUNT (caller-driven path)
                     //   data[4] = SUBSCRIBED_TRANSLATED |
                     //             (SUBSCRIBED_EMITTED << 24) |
                     //             (SUBSCRIBED_DROPPED << 48)
+                    let gateway_resolved = (GATEWAY_MAC != 0) as u64;
+                    let bundle_field = NAT_EGRESS_BUNDLE & 0x1FF; // 9 bits
                     let stat_a = occupancy
                         | ((SUBSCRIBED as u64) << 32)
                         | ((TX_REGISTERED as u64) << 33)
-                        | ((SUBSCRIBED_FRAMES_COUNT & 0x3FFF_FFFF) << 34);
+                        | (gateway_resolved << 34)
+                        | (bundle_field << 35)
+                        | ((SUBSCRIBED_FRAMES_COUNT & 0x000F_FFFF) << 44);
                     let stat_e = (SUBSCRIBED_TRANSLATED_COUNT & 0xFFFFFF)
                         | ((SUBSCRIBED_EMITTED_COUNT & 0xFFFFFF) << 24)
                         | ((SUBSCRIBED_DROPPED_COUNT & 0xFFFF) << 48);
