@@ -604,12 +604,30 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
                     n as u64
                 };
 
+                // Compute csum of the source bytes (cpio side) so the
+                // reply carries it; linux_srv computes the same csum from
+                // its scratch view after the fence and compares.  A
+                // mismatch means initramfs_srv's grant_va writes didn't
+                // reach linux_srv's scratch — the grant_pages phys-page
+                // mismatch shape from project_grant_pages_phys_mismatch.md.
+                // Source-side csum is taken from cpio_data (the bytes we
+                // wrote, not what we wrote them to) — a self-consistency
+                // check between source and destination.
+                let csum: u64 = if bytes_read > 0 && file_handle < fs.count {
+                    let f = &fs.files[file_handle];
+                    let start = f.data_offset + offset.min(f.data_len);
+                    let end = f.data_offset + (offset + length).min(f.data_len);
+                    csum32(&cpio_data[start..end]) as u64
+                } else {
+                    0
+                };
+
                 let _ = syscall::send_nb_4(
                     async_port,
                     IO_READ_REPLY,
                     correlation,
                     bytes_read,
-                    0,
+                    csum,
                     0,
                 );
             }

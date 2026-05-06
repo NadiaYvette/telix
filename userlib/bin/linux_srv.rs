@@ -9907,11 +9907,43 @@ extern "C" fn reply_thread_entry(_arg: u64) -> ! {
         }
         let correlation = msg.data[0];
         let bytes_read = msg.data[1];
+        let irfs_csum = msg.data[2] as u32; // 0 if irfs side didn't compute one
         let slot = match async_find_by_correlation(correlation) {
             Some(s) => s,
             None => continue,
         };
         let kind = unsafe { PENDING_ASYNC[slot].kind };
+        // Verify scratch-bytes csum matches what initramfs_srv just wrote.
+        // Diverging csums = phys-page mismatch / cache coherence shape
+        // (project_grant_pages_phys_mismatch.md).  Logged regardless of
+        // which finish_* takes the slot — happens before consumption so
+        // the dump captures the exact corruption window.
+        if irfs_csum != 0 && bytes_read > 0 {
+            let scratch_local = unsafe {
+                async_scratch_local_va(PENDING_ASYNC[slot].scratch_slot)
+            };
+            let view = unsafe {
+                core::slice::from_raw_parts(scratch_local as *const u8, bytes_read as usize)
+            };
+            let lin_csum = irfs_csum32(view);
+            if lin_csum != irfs_csum {
+                syscall::debug_puts(b"[lsrv] CSUM-MISMATCH IRFS_ASYNC corr=");
+                let mut buf = [0u8; 20]; let mut val = correlation; let mut k = 20;
+                if val == 0 { k -= 1; buf[k] = b'0'; }
+                while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                syscall::debug_puts(&buf[k..20]);
+                syscall::debug_puts(b" len=");
+                let mut buf = [0u8; 12]; let mut val = bytes_read as u32; let mut k = 12;
+                if val == 0 { k -= 1; buf[k] = b'0'; }
+                while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                syscall::debug_puts(&buf[k..12]);
+                syscall::debug_puts(b" irfs_csum=");
+                irfs_print_hex32(irfs_csum);
+                syscall::debug_puts(b" lin_csum=");
+                irfs_print_hex32(lin_csum);
+                syscall::debug_puts(b"\n");
+            }
+        }
         match kind {
             PendingAsyncKind::IrfsReadFd => finish_irfs_read_fd(slot, bytes_read),
             PendingAsyncKind::IrfsReadMmap => finish_irfs_read_mmap(slot, bytes_read),
