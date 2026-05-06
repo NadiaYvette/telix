@@ -9440,11 +9440,15 @@ fn handle_bind(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                     return linux_err(ECONNREFUSED);
                 }
             };
-            // Diagnostic: log every bind whose basename starts with 'X'
-            // (covers Xwayland's /tmp/.X11-unix/X0).  Prints success and
-            // failure so we can see whether Xwayland reaches bind at all.
-            let basename_is_x = nlen > 0 && name[0] == b'X';
-            if basename_is_x || resp.tag != UDS_OK {
+            // Diagnostic: log EVERY bind attempt (was previously gated
+            // on basename starting with 'X', which masked the case where
+            // Xwayland's xtrans binds a path whose basename doesn't
+            // start with X — e.g. a tempfile or non-X11 socket — and
+            // hid the bind syscall flow entirely from H14 traces.
+            // Boot 403 confirmed Xwayland reaches socket()+listen() but
+            // had no bind log line; widening the filter so we see what
+            // actually hits this handler.
+            {
                 syscall::debug_puts(b"  [linux_srv bind] tag=");
                 print_num(resp.tag);
                 syscall::debug_puts(b" handle=");
