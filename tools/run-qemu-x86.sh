@@ -115,4 +115,26 @@ if [ "${1:-}" = "--debug" ]; then
     echo "Waiting for GDB on localhost:${GDB_PORT} ..." >&2
 fi
 
+# Non-freezing gdb stub (for catching live faults without halting at
+# entry).  Pair with -no-reboot so a triple fault halts the CPU
+# instead of resetting the VM, leaving state intact for gdb to inspect.
+#
+#   TELIX_GDB_ATTACH=1 tools/boot-h14.sh ...
+#   # In another terminal:
+#   gdb /path/to/telix-kernel
+#   (gdb) target remote localhost:3234
+#   (gdb) ...
+#
+if [ "${TELIX_GDB_ATTACH:-}" = "1" ]; then
+    QEMU_ARGS+=(-gdb tcp::${GDB_PORT} -no-reboot)
+    echo "GDB attach available on localhost:${GDB_PORT} (no -S, no auto-reboot)" >&2
+fi
+
+# Disable auto-reboot on triple fault even without gdb — useful for
+# capturing post-fault serial output.  Without this QEMU resets the
+# VM on triple fault and SeaBIOS re-runs, garbling the boot log.
+if [ "${TELIX_NO_REBOOT:-}" = "1" ]; then
+    QEMU_ARGS+=(-no-reboot)
+fi
+
 exec qemu-system-x86_64 "${QEMU_ARGS[@]}"
