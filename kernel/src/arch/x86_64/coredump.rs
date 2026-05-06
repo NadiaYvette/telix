@@ -127,6 +127,42 @@ pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
         frame.rsp(), frame.ss()
     );
 
+    // Code-page snapshot: dump the page containing RIP.  Critical for
+    // diagnosing "bytes don't match on-disk binary" bugs — host-side
+    // can compare these bytes to the file at the resolved offset and
+    // tell whether the file load was corrupted (bytes wrong) vs.
+    // control-flow corruption (bytes correct but wild jump).
+    {
+        let rip_page = rip & !(PAGE_SIZE as u64 - 1);
+        let chunk_size = 256;
+        let mut off = 0usize;
+        while off < PAGE_SIZE {
+            let mut buf = [0u8; 256];
+            let got = user_read_block(rip_page + off as u64, &mut buf);
+            if got == 0 {
+                crate::println!(
+                    "[CORE-MEM-GAP va={:#x} len={}]",
+                    rip_page + off as u64,
+                    chunk_size
+                );
+                break;
+            }
+            let mut b64 = [0u8; 352];
+            let n = b64_encode(&buf[..got], &mut b64);
+            let s = unsafe { core::str::from_utf8_unchecked(&b64[..n]) };
+            crate::println!(
+                "[CORE-MEM va={:#x} len={} b64={}]",
+                rip_page + off as u64,
+                got,
+                s
+            );
+            off += chunk_size;
+            if got < chunk_size {
+                break;
+            }
+        }
+    }
+
     // Stack memory dump.  Anchor at the page containing RSP and
     // include STACK_PAGES pages downward toward higher addresses
     // (stack grows down, so memory above RSP holds the saved frames).
