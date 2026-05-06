@@ -260,6 +260,26 @@ static mut MY_ASPACE: u64 = 0;
 /// practice but unspecified.
 static WORKERS_READY: AtomicBool = AtomicBool::new(false);
 
+// ---------------------------------------------------------------------------
+// Diagnostic counters — surface where time goes when callers see CALL-TIMEOUT
+// blocks of 30+ s on this server (boots 408/411/413 confirmed this server's
+// port is the timeout target during Xwayland startup).  Two-axis breakdown:
+//
+//   REQS_TOTAL              — count of request handlers entered
+//   REQS_TIME_NS            — cumulative time inside handlers
+//   REQS_MAX_NS             — longest single handler duration
+//
+// If REQS_TIME_NS / REQS_TOTAL is small (< 1 ms avg) but CALL-TIMEOUTs are
+// still firing, the bottleneck is IPC dispatch / port-queue / scheduler, not
+// this server's work.  If the avg is large, this server is the bottleneck.
+// Periodic log line every PROGRESS_INTERVAL requests lets us read the live
+// rate from the boot log without external instrumentation.
+// ---------------------------------------------------------------------------
+static REQS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REQS_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static REQS_MAX_NS: AtomicU64 = AtomicU64::new(0);
+const PROGRESS_INTERVAL: u64 = 32;
+
 fn cpio_slice() -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(CPIO_DATA_VA as *const u8, CPIO_DATA_LEN as usize) }
 }
@@ -354,6 +374,13 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
             Some(m) => m,
             None => break,
         };
+        // Per-request timing.  We treat the time between recv-return and
+        // reply-send as the in-handler service time.  Note: any time the
+        // request waits in the kernel port queue *before* recv_with_cap
+        // returns is NOT counted here — that's the IPC-dispatch time and
+        // is the most likely contributor to caller-side CALL-TIMEOUT
+        // when this server is otherwise idle.
+        let req_start_ns = syscall::clock_gettime();
 
         match msg.tag {
             IO_CONNECT => {
@@ -587,6 +614,51 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
             _ => {
                 let _ = syscall::reply(IO_ERROR, ERR_INVALID, 0, 0, 0, 0);
             }
+        }
+
+        // Per-request accounting.  All four workers share these atomics —
+        // the cumulative + max number reflect the whole pool.
+        let elapsed_ns = syscall::clock_gettime().wrapping_sub(req_start_ns);
+        REQS_TIME_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+        let prev_max = REQS_MAX_NS.load(Ordering::Relaxed);
+        if elapsed_ns > prev_max {
+            // CAS loop so the recorded max is monotonic across workers.
+            let mut cur = prev_max;
+            while elapsed_ns > cur {
+                match REQS_MAX_NS.compare_exchange_weak(
+                    cur, elapsed_ns, Ordering::Relaxed, Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
+        // Outlier log: if a single handler runs >1s, dump its tag and
+        // latency immediately so we can correlate with the request kind
+        // (IO_CONNECT / IO_READ / IO_READ_ASYNC / IO_STAT / etc).  This
+        // is the key piece for root-causing the 30s CALL-TIMEOUTs:
+        // once we see "tag=0x200 took 18s" we know it's IO_READ
+        // memcpy that's slow, not the dispatch.
+        if elapsed_ns > 1_000_000_000 {
+            syscall::debug_puts(b"  [initramfs_srv] SLOW tag=");
+            print_hex32(msg.tag as u32);
+            syscall::debug_puts(b" took=");
+            print_num(elapsed_ns / 1_000_000);
+            syscall::debug_puts(b"ms\n");
+        }
+        let n = REQS_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % PROGRESS_INTERVAL == 0 {
+            let total_time = REQS_TIME_NS.load(Ordering::Relaxed);
+            let max_ns = REQS_MAX_NS.load(Ordering::Relaxed);
+            let avg_us = (total_time / n) / 1_000;
+            let max_us = max_ns / 1_000;
+            syscall::debug_puts(b"  [initramfs_srv] reqs=");
+            print_num(n);
+            syscall::debug_puts(b" avg=");
+            print_num(avg_us);
+            syscall::debug_puts(b"us max=");
+            print_num(max_us);
+            syscall::debug_puts(b"us\n");
         }
     }
 }
