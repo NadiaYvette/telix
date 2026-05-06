@@ -278,7 +278,32 @@ static WORKERS_READY: AtomicBool = AtomicBool::new(false);
 static REQS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQS_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static REQS_MAX_NS: AtomicU64 = AtomicU64::new(0);
+/// Cumulative time spent inside the reply syscall itself (across all
+/// workers).  If REPLY_TIME_NS dominates REQS_TIME_NS the bottleneck is
+/// the reply path (kernel scheduler / cap-slot / wakeup), not handler work.
+static REPLY_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static REPLY_MAX_NS: AtomicU64 = AtomicU64::new(0);
 const PROGRESS_INTERVAL: u64 = 32;
+
+/// Time a `syscall::reply` call and accumulate into REPLY_TIME_NS /
+/// REPLY_MAX_NS.  Returning the syscall result keeps callers happy.
+#[inline(always)]
+fn reply_timed(tag: u64, d0: u64, d1: u64, d2: u64, d3: u64, d4: u64) -> u64 {
+    let s = syscall::clock_gettime();
+    let r = syscall::reply(tag, d0, d1, d2, d3, d4);
+    let e = syscall::clock_gettime().wrapping_sub(s);
+    REPLY_TIME_NS.fetch_add(e, Ordering::Relaxed);
+    let mut cur = REPLY_MAX_NS.load(Ordering::Relaxed);
+    while e > cur {
+        match REPLY_MAX_NS.compare_exchange_weak(
+            cur, e, Ordering::Relaxed, Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
+    r
+}
 
 fn cpio_slice() -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(CPIO_DATA_VA as *const u8, CPIO_DATA_LEN as usize) }
@@ -418,7 +443,7 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
                             }
                             syscall::debug_puts(b"\n");
                         }
-                        let _ = syscall::reply(
+                        let _ = reply_timed(
                             IO_CONNECT_OK,
                             idx as u64,
                             fs.files[idx].data_len as u64,
@@ -428,7 +453,7 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
                         );
                     }
                     None => {
-                        let _ = syscall::reply(IO_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
+                        let _ = reply_timed(IO_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     }
                 }
             }
@@ -443,7 +468,7 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
                 let grant_va = msg.data[3] as usize;
 
                 if file_handle >= fs.count || !fs.files[file_handle].active {
-                    let _ = syscall::reply(IO_ERROR, ERR_INVALID, 0, 0, 0, 0);
+                    let _ = reply_timed(IO_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
@@ -497,12 +522,12 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
                     core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
                     #[cfg(target_arch = "x86_64")]
                     unsafe { core::arch::asm!("mfence"); }
-                    let _ = syscall::reply(IO_READ_OK, bytes_read as u64, 0, 0, 0, 0);
+                    let _ = reply_timed(IO_READ_OK, bytes_read as u64, 0, 0, 0, 0);
                 } else {
                     // Inline read: pack into message words.
                     let bytes_read = data.len().min(MAX_INLINE_READ);
                     let packed = pack_inline_data(&data[..bytes_read]);
-                    let _ = syscall::reply(
+                    let _ = reply_timed(
                         IO_READ_OK,
                         bytes_read as u64,
                         packed[0],
@@ -520,7 +545,7 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
                 // Release-store pairs with Acquire-load in any sibling
                 // worker that subsequently handles an IO_READ_ASYNC.
                 ASYNC_REPLY_PORT.store(msg.data[0], Ordering::Release);
-                let _ = syscall::reply(IO_READ_OK, 0, 0, 0, 0, 0);
+                let _ = reply_timed(IO_READ_OK, 0, 0, 0, 0, 0);
             }
 
             IO_READ_ASYNC => {
@@ -594,11 +619,11 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
                 let file_handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
 
                 if file_handle >= fs.count || !fs.files[file_handle].active {
-                    let _ = syscall::reply(IO_ERROR, ERR_INVALID, 0, 0, 0, 0);
+                    let _ = reply_timed(IO_ERROR, ERR_INVALID, 0, 0, 0, 0);
                     continue;
                 }
 
-                let _ = syscall::reply(
+                let _ = reply_timed(
                     IO_STAT_OK,
                     fs.files[file_handle].data_len as u64,
                     0,
@@ -609,10 +634,10 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
             }
 
             IO_CLOSE => {
-                let _ = syscall::reply(IO_CONNECT_OK, 0, 0, 0, 0, 0);
+                let _ = reply_timed(IO_CONNECT_OK, 0, 0, 0, 0, 0);
             }
             _ => {
-                let _ = syscall::reply(IO_ERROR, ERR_INVALID, 0, 0, 0, 0);
+                let _ = reply_timed(IO_ERROR, ERR_INVALID, 0, 0, 0, 0);
             }
         }
 
@@ -650,14 +675,24 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
         if n % PROGRESS_INTERVAL == 0 {
             let total_time = REQS_TIME_NS.load(Ordering::Relaxed);
             let max_ns = REQS_MAX_NS.load(Ordering::Relaxed);
+            let reply_total = REPLY_TIME_NS.load(Ordering::Relaxed);
+            let reply_max_ns = REPLY_MAX_NS.load(Ordering::Relaxed);
             let avg_us = (total_time / n) / 1_000;
             let max_us = max_ns / 1_000;
+            let reply_avg_us = (reply_total / n) / 1_000;
+            let reply_max_us = reply_max_ns / 1_000;
+            // Format: total_avg / total_max | reply_avg / reply_max
+            // total - reply ≈ work (memcpy + decode + dispatch).
             syscall::debug_puts(b"  [initramfs_srv] reqs=");
             print_num(n);
-            syscall::debug_puts(b" avg=");
+            syscall::debug_puts(b" total avg=");
             print_num(avg_us);
             syscall::debug_puts(b"us max=");
             print_num(max_us);
+            syscall::debug_puts(b"us  reply avg=");
+            print_num(reply_avg_us);
+            syscall::debug_puts(b"us max=");
+            print_num(reply_max_us);
             syscall::debug_puts(b"us\n");
         }
     }
