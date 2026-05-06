@@ -4839,7 +4839,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // With swap=ram:N enabled, kswapd evicts pages to swap under
     // pressure; fork inherits swap slots so both sides can fault the
     // data back in. Without swap this is a plain COW fork test.
-    if STEP_H_DEBUG_SKIP_SLOW_PHASES {
+    //
+    // Toggle to override STEP_H_DEBUG and run Phase 176 even on the
+    // FOCUS_H13 path.  Used for swap-validation boots: assert that
+    // swap is functional under the same conditions H14 runs under,
+    // since H14 success is a prerequisite for the long-running
+    // demos that will actually exercise memory pressure.
+    const RUN_PHASE_176_ALWAYS: bool = true;
+    if STEP_H_DEBUG_SKIP_SLOW_PHASES && !RUN_PHASE_176_ALWAYS {
         syscall::debug_puts(b"Phase 176 swap stress: SKIPPED (STEP_H_DEBUG)\n");
     } else {
     syscall::debug_puts(b"  init: Phase 176 swap stress...\n");
