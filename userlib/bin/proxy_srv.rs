@@ -142,6 +142,18 @@ const NET_TCP_CLOSED: u64 = 0x44FF;
 
 // --- Wire protocol ---
 const WIRE_MAGIC: u32 = 0x544C5850; // "TLXP"
+
+/// Tier-5 piece D: cluster PSK and SipHash-2-4 auth tag length.
+/// Must match userlib/bin/discovery_srv.rs's CLUSTER_PSK exactly —
+/// proxy frames and discovery announcements share the same cluster
+/// boundary, so the same key authenticates both.  The tag sits at
+/// the END of the frame body (after dst_uuid + src_uuid + req_id +
+/// payload) and is computed over everything preceding it.
+const AUTH_TAG_LEN: usize = 8;
+const CLUSTER_PSK: [u8; 16] = [
+    0x54, 0x4c, 0x58, 0x2d, 0x43, 0x4c, 0x55, 0x53,
+    0x54, 0x45, 0x52, 0x2d, 0x50, 0x53, 0x4b, 0x21,
+];
 const WIRE_FRAME_SIZE: usize = 64;
 
 // --- Capability bundle bits (mirror userlib::services::CAP_*) ---
@@ -430,8 +442,9 @@ fn try_register_eth_proxy(eth: &mut EthernetTransport, my_port: u64) {
 fn parse_proxy_frame_from(buf_va: usize, frame_len: usize, src_mac: u64) {
     unsafe {
         INBOUND_FRAMES_RECEIVED += 1;
-        // Need 8-byte wire header + 40-byte routing header at minimum.
-        if buf_va == 0 || frame_len < 8 + ROUTING_HDR_LEN {
+        // Need 8-byte wire header + 40-byte routing header + 8-byte
+        // auth tag at minimum.
+        if buf_va == 0 || frame_len < 8 + ROUTING_HDR_LEN + AUTH_TAG_LEN {
             INBOUND_FRAMES_REJECTED += 1;
             return;
         }
@@ -451,8 +464,26 @@ fn parse_proxy_frame_from(buf_va: usize, frame_len: usize, src_mac: u64) {
         let len_lo = core::ptr::read_volatile(buf.add(6));
         let len_hi = core::ptr::read_volatile(buf.add(7));
         let body_len = (len_lo as usize) | ((len_hi as usize) << 8);
-        if 8 + body_len > frame_len || body_len < ROUTING_HDR_LEN {
+        if 8 + body_len > frame_len
+            || body_len < ROUTING_HDR_LEN + AUTH_TAG_LEN
+        {
             INBOUND_FRAMES_REJECTED += 1;
+            return;
+        }
+        // Tier-5 piece D: verify SipHash-2-4 auth tag at the tail of
+        // the body before any further parsing or subscriber demux.
+        let signed_len = body_len - AUTH_TAG_LEN;
+        let mut signed = [0u8; 1500];
+        for i in 0..signed_len { signed[i] = core::ptr::read_volatile(buf.add(8 + i)); }
+        let mut tag_b = [0u8; 8];
+        for i in 0..AUTH_TAG_LEN {
+            tag_b[i] = core::ptr::read_volatile(buf.add(8 + signed_len + i));
+        }
+        let received = u64::from_le_bytes(tag_b);
+        let expected = userlib::siphash::siphash_2_4(&CLUSTER_PSK, &signed[..signed_len]);
+        if received != expected {
+            INBOUND_FRAMES_REJECTED += 1;
+            syscall::debug_puts(b"  [proxy-parse] reject: bad auth tag\n");
             return;
         }
         // Read dst_service_uuid from body bytes 0..16.
@@ -475,18 +506,18 @@ fn parse_proxy_frame_from(buf_va: usize, frame_len: usize, src_mac: u64) {
             }
         };
         let sub = &INBOUND_SUBSCRIBERS[idx];
-        // Copy body bytes (the routing header + payload) into the
-        // subscriber's grant_va.  Single contiguous write — subscriber
-        // reads back from their granted VA.
+        // Copy ONLY the signed prefix (routing header + payload) into
+        // the subscriber's grant_va.  The auth tag stays an internal
+        // proxy_srv concern — subscribers shouldn't have to strip it.
         let dst = sub.grant_va as *mut u8;
-        for i in 0..body_len {
+        for i in 0..signed_len {
             core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(body_va.add(i)));
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         let _ = syscall::send_nb_4(
             sub.port,
             PROXY_INBOUND_FRAME,
-            body_len as u64,
+            signed_len as u64,
             src_mac,
             0, 0,
         );
@@ -520,23 +551,34 @@ fn eth_send_to_peer(eth: &EthernetTransport, peer_mac: u64, body: &[u8]) -> bool
     if body.len() < ROUTING_HDR_LEN {
         return false;
     }
+    // Tier-5 piece D: append SipHash-2-4 auth tag over the body bytes.
+    // The on-wire body length includes the tag.
+    let tag = userlib::siphash::siphash_2_4(&CLUSTER_PSK, body);
+    let tag_b = tag.to_le_bytes();
+    let signed_body_len = body.len() + AUTH_TAG_LEN;
+    if 8 + signed_body_len > 1500 {
+        return false;
+    }
     unsafe {
         let dst = eth.tx_local_va as *mut u8;
         let mag = WIRE_MAGIC.to_le_bytes();
         for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
         core::ptr::write_volatile(dst.add(4), 1u8); // version
         core::ptr::write_volatile(dst.add(5), 0u8); // reserved
-        let len_le = (body.len() as u16).to_le_bytes();
+        let len_le = (signed_body_len as u16).to_le_bytes();
         core::ptr::write_volatile(dst.add(6), len_le[0]);
         core::ptr::write_volatile(dst.add(7), len_le[1]);
         for i in 0..body.len() {
             core::ptr::write_volatile(dst.add(8 + i), body[i]);
         }
+        for i in 0..AUTH_TAG_LEN {
+            core::ptr::write_volatile(dst.add(8 + body.len() + i), tag_b[i]);
+        }
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         #[cfg(target_arch = "x86_64")]
         core::arch::asm!("mfence");
 
-        let frame_len = 8 + body.len();
+        let frame_len = 8 + signed_body_len;
         let _ = syscall::send_nb_4(
             eth.eth_port,
             ETH_NETIF_XMIT,

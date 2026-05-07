@@ -1120,7 +1120,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             };
             if ok {
-                let body_len: usize = 16 + 16 + 8 + 4;
+                let signed_len: usize = 16 + 16 + 8 + 4;
+                let body_len: usize = signed_len + 8; // includes auth tag
                 let frame_len: usize = 8 + body_len;
                 unsafe {
                     let dst = inject_local as *mut u8;
@@ -1139,6 +1140,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     for i in 0..8 { core::ptr::write_volatile(dst.add(8 + 32 + i), req_id[i]); }
                     let payload = b"PING";
                     for i in 0..4 { core::ptr::write_volatile(dst.add(8 + 40 + i), payload[i]); }
+                    // Tier-5 piece D: append auth tag over the signed body.
+                    let mut signed = [0u8; 64];
+                    for i in 0..signed_len {
+                        signed[i] = core::ptr::read_volatile(dst.add(8 + i));
+                    }
+                    let tag = userlib::siphash::siphash_2_4(&CLUSTER_PSK, &signed[..signed_len]);
+                    let tag_b = tag.to_le_bytes();
+                    for i in 0..8 {
+                        core::ptr::write_volatile(dst.add(8 + signed_len + i), tag_b[i]);
+                    }
                 }
                 const INJECT_GRANT_VA: usize = 0xB_0000_0000;
                 if !syscall::grant_pages(proxy_port, inject_local, INJECT_GRANT_VA, 1, false) {
@@ -1161,7 +1172,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if let Some(m) = syscall::recv_msg_timeout(sub_port, 10_000_000) {
                             if m.tag == 0x5022 {
                                 let len = m.data[0] as usize;
-                                if len != body_len {
+                                if len != signed_len {
                                     syscall::debug_puts(b"  [proxy] inbound body_len wrong\n");
                                 } else {
                                     // Read body from sub_local; verify
@@ -1747,6 +1758,108 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 5s cluster auth rejection: PASSED\n");
         } else {
             syscall::debug_puts(b"Phase 5s cluster auth rejection: FAILED\n");
+        }
+    }
+
+    // --- Phase 5t: proxy frame auth rejection (Tier-5 piece D, step 2/2) ---
+    // Inject a proxy frame whose body has a wrong auth tag.  proxy_srv
+    // must NOT deliver to the subscriber.  We reuse Phase 5n's
+    // subscriber registration so any leak shows up there; check via
+    // INBOUND_FRAMES counter delta is not exposed today, so we use a
+    // simpler observation: a recv_msg_timeout on sub_port returns
+    // None within a short window (no PROXY_INBOUND_FRAME).
+    syscall::debug_puts(b"  init: running proxy frame auth rejection test...\n");
+    {
+        let mut ok = true;
+        let proxy_port = match syscall::ns_lookup(b"proxy") {
+            Some(p) => p,
+            None => { ok = false; syscall::debug_puts(b"  [pauth] proxy ns_lookup failed\n"); 0 }
+        };
+        let sub_port = syscall::port_create();
+        // dst_uuid same as Phase 5n's so the demux table has a target.
+        let dst_uuid: [u8; 16] = [
+            0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
+            0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
+        ];
+        let src_uuid: [u8; 16] = [0x33; 16];
+        let dst_lo = u64::from_le_bytes([0x77; 8]);
+        let dst_hi = u64::from_le_bytes([0x77; 8]);
+        // Subscribe so any leaked delivery shows up.
+        let sub_local = match syscall::mmap_anon(0, 1, 1) {
+            Some(va) => { unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); } va }
+            None => { ok = false; 0 }
+        };
+        const SUB_GRANT_VA: usize = 0xB_0001_1000;
+        if ok && !syscall::grant_pages(proxy_port, sub_local, SUB_GRANT_VA, 1, false) {
+            ok = false;
+            syscall::debug_puts(b"  [pauth] grant_pages sub failed\n");
+        }
+        if ok {
+            match syscall::call(proxy_port, 0x5020,
+                                dst_lo, dst_hi, sub_port, SUB_GRANT_VA as u64) {
+                Some(r) if r.tag == 0x5021 => {}
+                _ => { ok = false; syscall::debug_puts(b"  [pauth] SUBSCRIBE_INBOUND failed\n"); }
+            }
+        }
+        // Build a frame with a deliberately-wrong tag.
+        if ok {
+            let signed_len: usize = 16 + 16 + 8 + 4;
+            let body_len: usize = signed_len + 8;
+            let frame_len: usize = 8 + body_len;
+            let inject_local = match syscall::mmap_anon(0, 1, 1) {
+                Some(va) => { unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); } va }
+                None => { ok = false; 0 }
+            };
+            if ok {
+                unsafe {
+                    let dst = inject_local as *mut u8;
+                    let mag = 0x544C5850u32.to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
+                    core::ptr::write_volatile(dst.add(4), 1u8);
+                    core::ptr::write_volatile(dst.add(5), 0u8);
+                    let len_le = (body_len as u16).to_le_bytes();
+                    core::ptr::write_volatile(dst.add(6), len_le[0]);
+                    core::ptr::write_volatile(dst.add(7), len_le[1]);
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(8 + i), dst_uuid[i]); }
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(8 + 16 + i), src_uuid[i]); }
+                    let req_id = 0xfeedfeedfeedfeedu64.to_le_bytes();
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(8 + 32 + i), req_id[i]); }
+                    let payload = b"BAD!";
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(8 + 40 + i), payload[i]); }
+                    // Wrong tag — would never match siphash output.
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(8 + signed_len + i), 0xBBu8); }
+                }
+                const INJECT_GRANT_VA: usize = 0xB_0002_0000;
+                if !syscall::grant_pages(proxy_port, inject_local, INJECT_GRANT_VA, 1, false) {
+                    ok = false;
+                    syscall::debug_puts(b"  [pauth] grant_pages inject failed\n");
+                }
+                if ok {
+                    let _ = syscall::call(proxy_port, 0x5030,
+                                          INJECT_GRANT_VA as u64, frame_len as u64, 0, 0);
+                }
+            }
+        }
+        // Subscriber should NOT have received PROXY_INBOUND_FRAME.
+        if ok {
+            let mut leaked = false;
+            for _ in 0..30 {
+                if let Some(m) = syscall::recv_msg_timeout(sub_port, 10_000_000) {
+                    if m.tag == 0x5022 {
+                        leaked = true;
+                        break;
+                    }
+                }
+            }
+            if leaked {
+                ok = false;
+                syscall::debug_puts(b"  [pauth] bad-tag frame leaked to subscriber\n");
+            }
+        }
+        if ok {
+            syscall::debug_puts(b"Phase 5t proxy frame auth rejection: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5t proxy frame auth rejection: FAILED\n");
         }
     }
 
