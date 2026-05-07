@@ -783,9 +783,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     for i in 0..8 {
                         core::ptr::write_volatile(dst.add(24 + i), ts[i]);
                     }
-                    // manifest_count=0, reserved=0
-                    for i in 0..4 {
-                        core::ptr::write_volatile(dst.add(32 + i), 0u8);
+                    // manifest_count=1: we'll advertise one fake
+                    // service UUID so the LOOKUP_SERVICE RPC has
+                    // something to find.
+                    core::ptr::write_volatile(dst.add(32), 1u8);
+                    for i in 0..3 {
+                        core::ptr::write_volatile(dst.add(33 + i), 0u8);
+                    }
+                    // service_uuid[0]: a different distinctive pattern
+                    // so we can verify lookup returns this peer's UUID
+                    // when queried for THIS service UUID.
+                    let fake_svc: [u8; 16] = [
+                        0xa1, 0xb2, 0xc3, 0xd4,
+                        0xe5, 0xf6, 0x07, 0x18,
+                        0x29, 0x3a, 0x4b, 0x5c,
+                        0x6d, 0x7e, 0x8f, 0x90,
+                    ];
+                    for i in 0..16 {
+                        core::ptr::write_volatile(dst.add(36 + i), fake_svc[i]);
                     }
                 }
                 // Grant inject page into discovery_srv's aspace.
@@ -795,12 +810,44 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  [disc] grant_pages inject failed\n");
                 }
                 if ok {
-                    // Send INJECT_FRAME with payload_len=36 (header only).
-                    match syscall::call(disc_port, 0x4D07, INJECT_GRANT_VA as u64, 36, 0, 0) {
+                    // Send INJECT_FRAME with payload_len = header + 1 service UUID.
+                    match syscall::call(disc_port, 0x4D07, INJECT_GRANT_VA as u64, 36 + 16, 0, 0) {
                         Some(r) if r.tag == 0x4D08 => {}
                         _ => {
                             ok = false;
                             syscall::debug_puts(b"  [disc] INJECT_FRAME call failed\n");
+                        }
+                    }
+                }
+                // Verify the new DISCOVERY_LOOKUP_SERVICE inverse query:
+                // ask "who has this service UUID?" → must return the
+                // peer UUID we just injected.
+                if ok {
+                    // Pack the fake service UUID into two u64 words.
+                    let svc_lo = u64::from_le_bytes([
+                        0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18,
+                    ]);
+                    let svc_hi = u64::from_le_bytes([
+                        0x29, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e, 0x8f, 0x90,
+                    ]);
+                    match syscall::call(disc_port, 0x4D09, svc_lo, svc_hi, 0, 0) {
+                        Some(r) if r.tag == 0x4D0A => {
+                            let expected_lo = u64::from_le_bytes([
+                                0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef,
+                            ]);
+                            let expected_hi = u64::from_le_bytes([
+                                0xca, 0xfe, 0xba, 0xbe, 0x12, 0x34, 0x56, 0x78,
+                            ]);
+                            if r.data[0] != expected_lo || r.data[1] != expected_hi {
+                                ok = false;
+                                syscall::debug_puts(
+                                    b"  [disc] LOOKUP_SERVICE returned wrong peer UUID\n",
+                                );
+                            }
+                        }
+                        _ => {
+                            ok = false;
+                            syscall::debug_puts(b"  [disc] LOOKUP_SERVICE call failed or NOTFOUND\n");
                         }
                     }
                 }

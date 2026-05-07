@@ -138,6 +138,24 @@ const DISCOVERY_GET_STATS_OK: u64 = 0x4D06;
 /// same code path as a real NETIF_INPUT frame.
 const DISCOVERY_INJECT_FRAME: u64 = 0x4D07;
 const DISCOVERY_INJECT_FRAME_OK: u64 = 0x4D08;
+/// Service-routing inverse query: "which peer offers service UUID X?".
+/// Caller passes the 16-byte service UUID via two u64 words
+/// (data[0] = bytes 0..8, data[1] = bytes 8..16).  Server scans
+/// PEERS and returns the FIRST peer whose service_uuids contains a
+/// match.
+///
+/// out: DISCOVERY_LOOKUP_SERVICE_OK
+///        data[0] = peer UUID bytes 0..8 (LE)
+///        data[1] = peer UUID bytes 8..16 (LE)
+///        data[2] = last_seen_ns (so caller can age-out stale routes)
+///      DISCOVERY_LOOKUP_SERVICE_NOTFOUND on no match.
+///
+/// Foundation for the discovery → servicereg → proxy chain: a future
+/// SVCREG_LOOKUP that misses locally consults this RPC, learns the
+/// remote peer's UUID, and routes via proxy_srv.
+const DISCOVERY_LOOKUP_SERVICE: u64 = 0x4D09;
+const DISCOVERY_LOOKUP_SERVICE_OK: u64 = 0x4D0A;
+const DISCOVERY_LOOKUP_SERVICE_NOTFOUND: u64 = 0x4D0B;
 const DISCOVERY_ERR: u64 = 0x4DFF;
 
 // ---------------------------------------------------------------------------
@@ -803,6 +821,50 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                     (u64::from_le_bytes(lo_bytes), u64::from_le_bytes(hi_bytes))
                 };
                 let _ = syscall::reply(DISCOVERY_GET_LOCAL_UUID_OK, lo, hi, 0, 0, 0);
+            }
+            DISCOVERY_LOOKUP_SERVICE => {
+                // Caller-supplied UUID, packed LE into two u64 words.
+                let mut want = [0u8; 16];
+                want[0..8].copy_from_slice(&m.data[0].to_le_bytes());
+                want[8..16].copy_from_slice(&m.data[1].to_le_bytes());
+                let mut hit: Option<(usize)> = None;
+                unsafe {
+                    'outer: for i in 0..MAX_PEERS {
+                        if !PEERS[i].in_use { continue; }
+                        let n = PEERS[i].service_count as usize;
+                        for s in 0..n.min(MAX_PEER_SERVICES) {
+                            if PEERS[i].service_uuids[s] == want {
+                                hit = Some(i);
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                match hit {
+                    Some(i) => {
+                        let (lo, hi, ts) = unsafe {
+                            let mut lo_b = [0u8; 8];
+                            let mut hi_b = [0u8; 8];
+                            lo_b.copy_from_slice(&PEERS[i].uuid[0..8]);
+                            hi_b.copy_from_slice(&PEERS[i].uuid[8..16]);
+                            (
+                                u64::from_le_bytes(lo_b),
+                                u64::from_le_bytes(hi_b),
+                                PEERS[i].last_seen_ns,
+                            )
+                        };
+                        let _ = syscall::reply(
+                            DISCOVERY_LOOKUP_SERVICE_OK,
+                            lo, hi, ts, 0, 0,
+                        );
+                    }
+                    None => {
+                        let _ = syscall::reply(
+                            DISCOVERY_LOOKUP_SERVICE_NOTFOUND,
+                            0, 0, 0, 0, 0,
+                        );
+                    }
+                }
             }
             DISCOVERY_INJECT_FRAME => {
                 // Test-only: caller has granted a page at data[0] in
