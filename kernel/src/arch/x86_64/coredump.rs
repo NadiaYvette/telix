@@ -90,6 +90,42 @@ fn user_va_mapped(va: u64) -> bool {
     crate::arch::x86_64::mm::translate_va(current_pml4(), va as usize).is_some()
 }
 
+/// Walk the page table for `va` and return the raw 64-bit PTE at the
+/// leaf level (or 0 if any intermediate level is missing).  Used by
+/// the [CORE-PTE] line — preserves all the hardware bits (P/W/X/A/D/
+/// AVL/frame) so post-mortem can decode without re-walking.  Stops at
+/// a 2 MiB / 1 GiB superpage block as well; the returned value is
+/// still the PTE_PS-marked entry from that level, which carries the
+/// frame plus protection bits.
+fn pte_for(pml4: usize, va: u64) -> u64 {
+    // X86Pte::LEVELS == 4.  Walk PML4→PDPT→PD→PT, stop early on a
+    // PS=1 (block) or P=0 (unmapped) entry.
+    let va = va as usize;
+    let pml4_idx = (va >> 39) & 0x1ff;
+    let pdpt_idx = (va >> 30) & 0x1ff;
+    let pd_idx   = (va >> 21) & 0x1ff;
+    let pt_idx   = (va >> 12) & 0x1ff;
+    const PTE_P:  u64 = 1 << 0;
+    const PTE_PS: u64 = 1 << 7;
+    const FRAME_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    unsafe {
+        let table0 = pml4 as *const u64;
+        let e0 = *table0.add(pml4_idx);
+        if e0 & PTE_P == 0 { return 0; }
+        let table1 = (e0 & FRAME_MASK) as *const u64;
+        let e1 = *table1.add(pdpt_idx);
+        if e1 & PTE_P == 0 { return 0; }
+        if e1 & PTE_PS != 0 { return e1; } // 1 GiB superpage
+        let table2 = (e1 & FRAME_MASK) as *const u64;
+        let e2 = *table2.add(pd_idx);
+        if e2 & PTE_P == 0 { return 0; }
+        if e2 & PTE_PS != 0 { return e2; } // 2 MiB superpage
+        let table3 = (e2 & FRAME_MASK) as *const u64;
+        let e3 = *table3.add(pt_idx);
+        e3
+    }
+}
+
 /// Read a u64 from userspace, returning None if the page is unmapped.
 /// Exposed for the RBP-chain walker and STACK[0..8] dump in
 /// exception.rs — those code paths used raw read_volatile and crashed
@@ -278,6 +314,27 @@ pub fn dump_user_fault(frame: &ExceptionFrame, vector: u64) {
         frame.rip(), frame.cs(),  frame.rflags(),
         frame.rsp(), frame.ss()
     );
+
+    // (A) PTE snapshot at fault.  Walks the active PML4 (CR3) to the
+    // leaf entry for each anchor VA and dumps the raw 64-bit PTE
+    // value.  Distinguishes "kernel says this VA maps to phys P" from
+    // "hardware actually reads from phys Q" for the lib-corruption
+    // family — a non-zero PTE here, combined with all-zero CORE-MEM
+    // around the same VA, says the kernel-side bookkeeping disagrees
+    // with whatever the CPU is doing for that load.  The raw PTE
+    // includes P/W/X/A/D bits + frame address + AVL bits in standard
+    // x86-64 layout.
+    {
+        let pml4 = current_pml4();
+        let rip_page = rip & !(PAGE_SIZE as u64 - 1);
+        let rsp_page = rsp & !(PAGE_SIZE as u64 - 1);
+        let pte_rip = pte_for(pml4, rip_page);
+        let pte_rsp = pte_for(pml4, rsp_page);
+        crate::println!(
+            "[CORE-PTE pml4={:#x} rip_page={:#x} pte_rip={:#x} rsp_page={:#x} pte_rsp={:#x}]",
+            pml4 as u64, rip_page, pte_rip, rsp_page, pte_rsp,
+        );
+    }
 
     // Faulting-instruction hint: read 16 bytes at RIP and decode just
     // enough to identify the instruction class and (if it dereferences
