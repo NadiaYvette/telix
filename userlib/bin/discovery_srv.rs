@@ -33,10 +33,24 @@
 //! Tag space 0x4D00..0x4DFF reserved for discovery_srv.
 //!
 //!   DISCOVERY_LIST_PEERS (0x4D01)
-//!     → DISCOVERY_LIST_PEERS_OK (0x4D02)
-//!     data[0] = peer count
-//!     For now, peer details are exposed via debug log only;
-//!     a follow-up RPC will return per-peer info via grant.
+//!     in:  data[0] = grant_va in caller's aspace where peer records
+//!                    should be written.  Caller must have already
+//!                    grant_pages'd a page at that VA into our aspace.
+//!                    Pass 0 to skip the payload write and only get the
+//!                    count back (legacy form).
+//!          data[1] = max_records the grant can hold (cap; caller-
+//!                    supplied so we don't overrun whatever they
+//!                    granted)
+//!     out: DISCOVERY_LIST_PEERS_OK (0x4D02)
+//!          data[0] = number of records actually written
+//!          data[1] = total active peers (may exceed max_records)
+//!
+//!     Record layout (24 bytes each, contiguous at grant_va):
+//!       bytes  0..16: uuid
+//!       bytes 16..24: last_seen_ns (LE u64; sender's monotonic_ns
+//!                     mapped through our local-monotonic at receive
+//!                     time, so values are comparable across peers
+//!                     within bounded clock-skew tolerance)
 //!
 //!   DISCOVERY_GET_LOCAL_UUID (0x4D03)
 //!     → DISCOVERY_GET_LOCAL_UUID_OK (0x4D04)
@@ -289,6 +303,42 @@ fn handle_netif_input(payload_len: usize) {
             }
         }
     }
+}
+
+/// Serialize active PEERS into the caller's grant page at grant_va.
+/// Returns the number of records actually written (capped at
+/// max_records).  Layout per record (24 bytes contiguous):
+///   bytes  0..16: uuid
+///   bytes 16..24: last_seen_ns (LE u64)
+fn write_peer_records(grant_va: usize, max_records: usize) -> usize {
+    const RECORD_SIZE: usize = 24;
+    let mut written = 0usize;
+    unsafe {
+        let dst_base = grant_va as *mut u8;
+        for i in 0..MAX_PEERS {
+            if !PEERS[i].in_use {
+                continue;
+            }
+            if written >= max_records {
+                break;
+            }
+            let off = written * RECORD_SIZE;
+            // uuid
+            for b in 0..16 {
+                core::ptr::write_volatile(dst_base.add(off + b), PEERS[i].uuid[b]);
+            }
+            // last_seen_ns
+            let ts = PEERS[i].last_seen_ns.to_le_bytes();
+            for b in 0..8 {
+                core::ptr::write_volatile(dst_base.add(off + 16 + b), ts[b]);
+            }
+            written += 1;
+        }
+        // Release fence so the receiver (caller's CPU) sees our writes
+        // before observing the reply.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+    }
+    written
 }
 
 /// Sweep PEERS, evicting entries whose last_seen_ns is older than
@@ -573,8 +623,18 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                 // not a call.
             }
             DISCOVERY_LIST_PEERS => {
-                let n = count_active_peers();
-                let _ = syscall::reply(DISCOVERY_LIST_PEERS_OK, n, 0, 0, 0, 0);
+                let grant_va = m.data[0] as usize;
+                let max_records = m.data[1] as usize;
+                let total = count_active_peers();
+                let written = if grant_va == 0 || max_records == 0 {
+                    0u64
+                } else {
+                    write_peer_records(grant_va, max_records) as u64
+                };
+                let _ = syscall::reply(
+                    DISCOVERY_LIST_PEERS_OK,
+                    written, total, 0, 0, 0,
+                );
             }
             DISCOVERY_GET_LOCAL_UUID => {
                 let (lo, hi) = unsafe {
