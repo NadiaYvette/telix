@@ -2784,6 +2784,83 @@ fn irfs_print_hex32(n: u32) {
     syscall::debug_puts(&buf);
 }
 
+fn print_hex64(n: u64) {
+    let hex = b"0123456789abcdef";
+    let mut buf = [0u8; 16];
+    for i in 0..16 {
+        buf[15 - i] = hex[((n >> (i * 4)) & 0xF) as usize];
+    }
+    syscall::debug_puts(&buf);
+}
+
+/// Toggle for [POST-COPY-MISMATCH] verification.  Each successful
+/// personality_copy_out into a Linux process is followed by a
+/// personality_copy_in of the same range; we csum both views and log
+/// any disagreement.  Catches corruption between linux_srv and the
+/// destination user va that the existing scratch-csum check misses
+/// (phys-page mismatch, TLB staleness, downstream cache-coherence
+/// shapes).  Off by default; flip on for diagnostic boots.
+const DEBUG_POST_COPY_VERIFY: bool = true;
+
+/// Verify the first up-to-4-KiB of a personality_copy_out call by
+/// reading back via personality_copy_in and csum-comparing.  Caller
+/// supplies the *source* slice (linux_srv-side bytes that were
+/// written) plus the user va they were written to.  Tag is a short
+/// label included in the mismatch log line (e.g. b"mmap-cache",
+/// b"mmap-direct") so we can tell which copy site failed.
+fn post_copy_verify(caller_port: u64, user_va: usize, src: &[u8], tag: &[u8]) {
+    if !DEBUG_POST_COPY_VERIFY || src.is_empty() {
+        return;
+    }
+    const VERIFY_LEN: usize = 4096;
+    let n = src.len().min(VERIFY_LEN);
+    let mut buf = [0u8; VERIFY_LEN];
+    let got = syscall::personality_copy_in(caller_port, user_va, &mut buf[..n]);
+    if got == 0 {
+        return;
+    }
+    let src_csum = irfs_csum32(&src[..got]);
+    let dst_csum = irfs_csum32(&buf[..got]);
+    if src_csum != dst_csum {
+        syscall::debug_puts(b"[lsrv] POST-COPY-MISMATCH tag=");
+        syscall::debug_puts(tag);
+        syscall::debug_puts(b" va=0x");
+        print_hex64(user_va as u64);
+        syscall::debug_puts(b" len=");
+        let mut nbuf = [0u8; 12]; let mut val = got as u32; let mut k = 12;
+        if val == 0 { k -= 1; nbuf[k] = b'0'; }
+        while val > 0 && k > 0 { k -= 1; nbuf[k] = b'0' + (val % 10) as u8; val /= 10; }
+        syscall::debug_puts(&nbuf[k..12]);
+        syscall::debug_puts(b" src_csum=");
+        irfs_print_hex32(src_csum);
+        syscall::debug_puts(b" dst_csum=");
+        irfs_print_hex32(dst_csum);
+        // Sample the first 16 bytes of each side so a human reading the
+        // log can see which bytes diverged (e.g. zeros in dst, real bytes
+        // in src — typical short-read shape).
+        let sample = got.min(16);
+        syscall::debug_puts(b" src_head=");
+        for i in 0..sample {
+            let hex = b"0123456789abcdef";
+            let h = src[i];
+            let mut hb = [0u8; 2];
+            hb[0] = hex[(h >> 4) as usize];
+            hb[1] = hex[(h & 0xf) as usize];
+            syscall::debug_puts(&hb);
+        }
+        syscall::debug_puts(b" dst_head=");
+        for i in 0..sample {
+            let hex = b"0123456789abcdef";
+            let h = buf[i];
+            let mut hb = [0u8; 2];
+            hb[0] = hex[(h >> 4) as usize];
+            hb[1] = hex[(h & 0xf) as usize];
+            syscall::debug_puts(&hb);
+        }
+        syscall::debug_puts(b"\n");
+    }
+}
+
 fn irfs_read_bulk(irfs_port: u64, handle: u64, offset: u64, max_len: usize) -> Option<usize> {
     ensure_fs_scratch_grants();
     unsafe {
@@ -3263,6 +3340,7 @@ fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
             let _ = syscall::personality_reply(caller, linux_err(EFAULT));
             return;
         }
+        post_copy_verify(caller, chunk_dst, &src[..written], b"mmap-direct");
         total_so_far += written;
         if total_so_far >= info.buf_len {
             async_free_slot(slot);
@@ -3620,6 +3698,7 @@ fn cache_process_cached_chunks(
                 core::slice::from_raw_parts(backing_src as *const u8, overlap_len)
             };
             syscall::personality_copy_out(caller_port, user_dst, src);
+            post_copy_verify(caller_port, user_dst, src, b"mmap-cache");
             *total_so_far += overlap_len;
         }
         chunk += 1;
