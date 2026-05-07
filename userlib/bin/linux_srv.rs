@@ -6648,6 +6648,7 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                             let scratch = unsafe { LIN_PATH_SCRATCH_LOCAL } as *const u8;
                             let src = unsafe { core::slice::from_raw_parts(scratch, got) };
                             let written = syscall::personality_copy_out(caller_port, va + total, src);
+                            post_copy_verify(caller_port, va + total, &src[..written], b"mmap-sync-fb");
                             if DEBUG_SHORT_READ && written != got {
                                 syscall::debug_puts(b"[lsrv] SHORT-COPYOUT mmap initramfs got=");
                                 let mut buf = [0u8; 12]; let mut val = got as u32; let mut k = 12;
