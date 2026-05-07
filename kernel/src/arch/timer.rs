@@ -50,8 +50,10 @@ pub fn timer_freq() -> u64 {
     } // QEMU virt timebase
     #[cfg(target_arch = "x86_64")]
     {
-        1_000_000_000
-    } // approximate RDTSC freq on QEMU
+        // Calibrated at boot via CPUID 0x15/0x16; defaults to 1 GHz
+        // until `arch::x86_64::timer::init_tsc_freq` runs.
+        crate::arch::x86_64::timer::TSC_HZ.load(core::sync::atomic::Ordering::Acquire)
+    }
     #[cfg(target_arch = "loongarch64")]
     {
         100_000_000

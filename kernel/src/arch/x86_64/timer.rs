@@ -64,3 +64,93 @@ pub fn enable_interrupts() {
         core::arch::asm!("sti", options(nomem, nostack));
     }
 }
+
+/// Calibrated TSC frequency in Hz.  Set once at boot by `init_tsc_freq`
+/// (called from arch::x86_64::mod::init).  Defaults to 1 GHz so any code
+/// reading it before init returns the historical value.
+///
+/// Pre-fix, the freq was hardcoded to 1 GHz in `arch::timer::timer_freq`.
+/// On real KVM the host TSC is typically 2–4 GHz, so monotonic_ns came
+/// back ~2–4× larger than real elapsed time — every sleep_ms / watchdog /
+/// retry budget was dilated by the same factor, blowing chase budgets.
+pub static TSC_HZ: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1_000_000_000);
+
+/// Detect TSC frequency via CPUID and store it in TSC_HZ.  Tries leaf
+/// 0x15 (TSC/crystal ratio) first, then leaf 0x16 (base CPU MHz) as a
+/// fallback.  If neither leaf is available, leaves the conservative
+/// 1 GHz default in place.  Idempotent; safe to call multiple times.
+pub fn init_tsc_freq() {
+    if let Some(hz) = tsc_freq_from_cpuid() {
+        TSC_HZ.store(hz, core::sync::atomic::Ordering::Release);
+        crate::println!("  TSC frequency: {} Hz (CPUID)", hz);
+    } else {
+        crate::println!(
+            "  TSC frequency: assumed {} Hz (CPUID 0x15/0x16 unavailable)",
+            TSC_HZ.load(core::sync::atomic::Ordering::Acquire),
+        );
+    }
+}
+
+/// Try to get TSC frequency from CPUID.  Returns Some(hz) on success.
+fn tsc_freq_from_cpuid() -> Option<u64> {
+    // CPUID(EAX=0): EAX = max basic leaf supported.
+    let max_leaf: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 0",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 0u32 => max_leaf,
+            out("ecx") _,
+            out("edx") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    if max_leaf >= 0x15 {
+        // CPUID 0x15: EBX/EAX = TSC:crystal ratio numerator/denominator,
+        // ECX = crystal frequency Hz (0 if unknown).
+        let denom: u32;
+        let numer: u32;
+        let crystal_hz: u32;
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "mov eax, 0x15",
+                "cpuid",
+                "mov {numer:e}, ebx",
+                "pop rbx",
+                inout("eax") 0u32 => denom,
+                numer = out(reg) numer,
+                out("ecx") crystal_hz,
+                out("edx") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        if denom != 0 && numer != 0 && crystal_hz != 0 {
+            return Some((crystal_hz as u64) * (numer as u64) / (denom as u64));
+        }
+    }
+    if max_leaf >= 0x16 {
+        // CPUID 0x16: EAX low 16 bits = base CPU frequency in MHz.
+        let base_mhz: u32;
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "mov eax, 0x16",
+                "cpuid",
+                "pop rbx",
+                inout("eax") 0u32 => base_mhz,
+                out("ecx") _,
+                out("edx") _,
+                options(nostack, preserves_flags),
+            );
+        }
+        let mhz = base_mhz & 0xFFFF;
+        if mhz != 0 {
+            return Some((mhz as u64) * 1_000_000);
+        }
+    }
+    None
+}

@@ -27,6 +27,7 @@ pub fn init() {
     idt::init();
     pic::init();
     timer::init();        // PIT fires for LAPIC calibration reference
+    timer::init_tsc_freq(); // Calibrate TSC freq via CPUID before LAPIC calibration
     lapic::init_bsp();
     lapic::calibrate_timer();
     lapic::setup_timer(); // LAPIC one-shot mode, vector 32
