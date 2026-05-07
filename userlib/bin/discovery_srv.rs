@@ -129,6 +129,15 @@ const DISCOVERY_GET_LOCAL_UUID_OK: u64 = 0x4D04;
 /// loop is firing without needing to capture network frames.
 const DISCOVERY_GET_STATS: u64 = 0x4D05;
 const DISCOVERY_GET_STATS_OK: u64 = 0x4D06;
+/// Test-only: inject a synthesized announcement frame as if it had
+/// arrived via eth_srv NETIF_INPUT.  QEMU user-mode networking
+/// doesn't echo broadcasts back to the same VM, so a single-instance
+/// integration test can't exercise the receive path through eth_srv.
+/// This RPC bypasses eth_srv: caller pre-grants a page and sends
+/// data[0] = grant_va, data[1] = payload_len.  We parse via the
+/// same code path as a real NETIF_INPUT frame.
+const DISCOVERY_INJECT_FRAME: u64 = 0x4D07;
+const DISCOVERY_INJECT_FRAME_OK: u64 = 0x4D08;
 const DISCOVERY_ERR: u64 = 0x4DFF;
 
 // ---------------------------------------------------------------------------
@@ -223,12 +232,27 @@ fn count_active_peers() -> u64 {
 
 /// Handle a NETIF_INPUT notification: parse the announcement at
 /// ETH_RX_LOCAL_VA, validate, then upsert the sender in PEERS.
-/// Silently drops malformed frames (counted in FRAMES_REJECTED_COUNT)
-/// — discovery is best-effort by design.
 fn handle_netif_input(payload_len: usize) {
     unsafe {
-        FRAMES_RECEIVED_COUNT += 1;
         if ETH_RX_LOCAL_VA == 0 {
+            FRAMES_RECEIVED_COUNT += 1;
+            FRAMES_REJECTED_COUNT += 1;
+            return;
+        }
+    }
+    parse_announcement_from(unsafe { ETH_RX_LOCAL_VA }, payload_len);
+}
+
+/// Parse an announcement payload at `buf_va` (in our aspace) of
+/// `payload_len` bytes; validate, then upsert the sender in PEERS.
+/// Silently drops malformed frames (counted in FRAMES_REJECTED_COUNT)
+/// — discovery is best-effort by design.  Shared by the real receive
+/// path (handle_netif_input) and the test-only injection path
+/// (DISCOVERY_INJECT_FRAME) so they can't drift.
+fn parse_announcement_from(buf_va: usize, payload_len: usize) {
+    unsafe {
+        FRAMES_RECEIVED_COUNT += 1;
+        if buf_va == 0 {
             FRAMES_REJECTED_COUNT += 1;
             return;
         }
@@ -236,7 +260,7 @@ fn handle_netif_input(payload_len: usize) {
             FRAMES_REJECTED_COUNT += 1;
             return;
         }
-        let buf = ETH_RX_LOCAL_VA as *const u8;
+        let buf = buf_va as *const u8;
         // Read header fields (LE).
         let mut magic_bytes = [0u8; 4];
         for i in 0..4 { magic_bytes[i] = core::ptr::read_volatile(buf.add(i)); }
@@ -779,6 +803,14 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                     (u64::from_le_bytes(lo_bytes), u64::from_le_bytes(hi_bytes))
                 };
                 let _ = syscall::reply(DISCOVERY_GET_LOCAL_UUID_OK, lo, hi, 0, 0, 0);
+            }
+            DISCOVERY_INJECT_FRAME => {
+                // Test-only: caller has granted a page at data[0] in
+                // our aspace.  Parse it as if it arrived via eth_srv.
+                let buf_va = m.data[0] as usize;
+                let payload_len = m.data[1] as usize;
+                parse_announcement_from(buf_va, payload_len);
+                let _ = syscall::reply(DISCOVERY_INJECT_FRAME_OK, 0, 0, 0, 0, 0);
             }
             DISCOVERY_GET_STATS => {
                 // data[0]: announce_count

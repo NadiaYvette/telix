@@ -723,6 +723,149 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5m: discovery_srv receive-path smoke via DISCOVERY_INJECT_FRAME ---
+    // QEMU user-mode networking doesn't loop broadcasts back to the
+    // sender, so a single-instance test can't exercise the receive
+    // path through eth_srv.  discovery_srv exposes a test-only
+    // DISCOVERY_INJECT_FRAME (0x4D07) that calls the same parser as
+    // the real NETIF_INPUT path — we build a fake announcement with
+    // a different UUID, grant the page to discovery_srv, inject, and
+    // verify DISCOVERY_LIST_PEERS reports the new peer.
+    syscall::debug_puts(b"  init: running discovery_srv inject test...\n");
+    {
+        let mut ok = true;
+        let disc_port = match syscall::ns_lookup(b"discovery") {
+            Some(p) => p,
+            None => {
+                ok = false;
+                syscall::debug_puts(b"  [disc] ns_lookup failed\n");
+                0
+            }
+        };
+        if ok {
+            // Build a fake announcement payload in our aspace.
+            let inject_local = match syscall::mmap_anon(0, 1, 1) {
+                Some(va) => va,
+                None => {
+                    ok = false;
+                    syscall::debug_puts(b"  [disc] mmap_anon for inject failed\n");
+                    0
+                }
+            };
+            if ok {
+                unsafe {
+                    let dst = inject_local as *mut u8;
+                    // Pre-fault.
+                    core::ptr::write_volatile(dst, 0u8);
+                    // magic "TLXD"
+                    let mag = 0x44584C54u32.to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
+                    // version=1, flags=0
+                    let v = 1u16.to_le_bytes();
+                    core::ptr::write_volatile(dst.add(4), v[0]);
+                    core::ptr::write_volatile(dst.add(5), v[1]);
+                    core::ptr::write_volatile(dst.add(6), 0u8);
+                    core::ptr::write_volatile(dst.add(7), 0u8);
+                    // node_uuid: distinctive pattern that can't collide
+                    // with discovery_srv's randomly-generated own UUID.
+                    let fake_uuid: [u8; 16] = [
+                        0xfe, 0xed, 0xfa, 0xce,
+                        0xde, 0xad, 0xbe, 0xef,
+                        0xca, 0xfe, 0xba, 0xbe,
+                        0x12, 0x34, 0x56, 0x78,
+                    ];
+                    for i in 0..16 {
+                        core::ptr::write_volatile(dst.add(8 + i), fake_uuid[i]);
+                    }
+                    // timestamp (any value — discovery_srv recomputes
+                    // on receive using its own monotonic)
+                    let ts = syscall::clock_gettime().to_le_bytes();
+                    for i in 0..8 {
+                        core::ptr::write_volatile(dst.add(24 + i), ts[i]);
+                    }
+                    // manifest_count=0, reserved=0
+                    for i in 0..4 {
+                        core::ptr::write_volatile(dst.add(32 + i), 0u8);
+                    }
+                }
+                // Grant inject page into discovery_srv's aspace.
+                const INJECT_GRANT_VA: usize = 0xA_0000_0000;
+                if !syscall::grant_pages(disc_port, inject_local, INJECT_GRANT_VA, 1, false) {
+                    ok = false;
+                    syscall::debug_puts(b"  [disc] grant_pages inject failed\n");
+                }
+                if ok {
+                    // Send INJECT_FRAME with payload_len=36 (header only).
+                    match syscall::call(disc_port, 0x4D07, INJECT_GRANT_VA as u64, 36, 0, 0) {
+                        Some(r) if r.tag == 0x4D08 => {}
+                        _ => {
+                            ok = false;
+                            syscall::debug_puts(b"  [disc] INJECT_FRAME call failed\n");
+                        }
+                    }
+                }
+                // Allocate + grant a page for LIST_PEERS reply.
+                if ok {
+                    let list_local = match syscall::mmap_anon(0, 1, 1) {
+                        Some(va) => {
+                            unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); }
+                            va
+                        }
+                        None => {
+                            ok = false;
+                            0
+                        }
+                    };
+                    const LIST_GRANT_VA: usize = 0xA_0000_1000;
+                    if ok && !syscall::grant_pages(disc_port, list_local, LIST_GRANT_VA, 1, false) {
+                        ok = false;
+                        syscall::debug_puts(b"  [disc] grant_pages list failed\n");
+                    }
+                    if ok {
+                        // LIST_PEERS with grant_va + max_records.
+                        match syscall::call(disc_port, 0x4D01, LIST_GRANT_VA as u64, 32, 0, 0) {
+                            Some(r) if r.tag == 0x4D02 => {
+                                let written = r.data[0];
+                                if written < 1 {
+                                    ok = false;
+                                    syscall::debug_puts(b"  [disc] LIST_PEERS wrote 0 records after inject\n");
+                                } else {
+                                    // First record's UUID at offset 0.
+                                    let mut got_uuid = [0u8; 16];
+                                    unsafe {
+                                        let src = list_local as *const u8;
+                                        for i in 0..16 {
+                                            got_uuid[i] = core::ptr::read_volatile(src.add(i));
+                                        }
+                                    }
+                                    let expected: [u8; 16] = [
+                                        0xfe, 0xed, 0xfa, 0xce,
+                                        0xde, 0xad, 0xbe, 0xef,
+                                        0xca, 0xfe, 0xba, 0xbe,
+                                        0x12, 0x34, 0x56, 0x78,
+                                    ];
+                                    if got_uuid != expected {
+                                        ok = false;
+                                        syscall::debug_puts(b"  [disc] LIST_PEERS returned wrong UUID\n");
+                                    }
+                                }
+                            }
+                            _ => {
+                                ok = false;
+                                syscall::debug_puts(b"  [disc] LIST_PEERS (with grant) call failed\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if ok {
+            syscall::debug_puts(b"Phase 5m discovery_srv inject + list: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5m discovery_srv inject + list: FAILED\n");
+        }
+    }
+
     // --- Phase 5h: scheduler call/reply stress (deferred-requeue race repro) ---
     // Skipped under FOCUS_H13 because sched_stress occasionally wedges
     // (WEDGED — giving up) without exiting, which deadlocks init's
