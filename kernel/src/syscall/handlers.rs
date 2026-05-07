@@ -1512,6 +1512,17 @@ fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64, arg0: u64) -> u64 {
     match crate::sched::scheduler::spawn_user(name, priority as u8, 20, arg0) {
         Some(tid) => {
             let task_id = crate::sched::thread_task_id(tid);
+            // Spawn-name log: surfaces the task→binary mapping in the
+            // boot log so fault dumps can resolve "task=N" without
+            // archaeology.  Tiny: one println per spawn.  Caller's
+            // own debug_puts logging often duplicates this, but the
+            // unified format here is what fault investigations grep.
+            crate::println!(
+                "[spawn] tid={} task={} name=\"{}\"",
+                tid,
+                task_id,
+                core::str::from_utf8(name).unwrap_or("?"),
+            );
             crate::sched::task_port_id(task_id)
         }
         None => u64::MAX,
@@ -2285,6 +2296,13 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
     let result = match crate::sched::spawn_user_from_elf(buf_slice, priority as u8, 20, arg0) {
         Some(tid) => {
             let task_id = crate::sched::thread_task_id(tid);
+            // Spawn-name log: from-ELF spawns don't have a filename
+            // (the ELF is anonymous bytes), so we tag them generically
+            // to keep the format uniform with sys_spawn's output.
+            crate::println!(
+                "[spawn] tid={} task={} name=\"<elf:bytes>\"",
+                tid, task_id,
+            );
             crate::sched::task_port_id(task_id)
         }
         None => u64::MAX,
