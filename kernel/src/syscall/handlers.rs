@@ -2446,6 +2446,7 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
             }
         }
     }
+    inject_malloc_perturb(meta_lens, data_buf, &mut data_cursor, &mut total_strings, &mut envc, arg_max_strings, arg_max_total);
 
     let string_total = data_cursor; // total bytes of string data (excluding null terminators)
 
@@ -2822,6 +2823,36 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
 /// Called by the personality server on behalf of a Linux client.
 /// The name is in the *caller's* (personality server's) address space.
 /// Returns 0 on success, u64::MAX on failure.
+/// Append `MALLOC_PERTURB_=50` to the envp staged for an exec'ing
+/// process, so glibc fills malloc()'d memory with `~0x32 = 0xCD` and
+/// freed memory with `0x32`.  Catches the same class of "uninitialised
+/// heap read" bug that the kernel-side anon-page poison would, but
+/// surgically — direct `mmap(MAP_ANONYMOUS)` retains POSIX zero
+/// semantics, which Linux programs (Xwayland, glibc internals) rely on.
+///
+/// Idempotent if the user already set MALLOC_PERTURB_; in that case
+/// they get *two* entries and glibc reads whichever it sees first.
+/// Best-effort: silently skipped if the staging buffer is full.
+fn inject_malloc_perturb(
+    meta_lens: &mut [u16],
+    data_buf: &mut [u8],
+    data_cursor: &mut usize,
+    total_strings: &mut usize,
+    envc: &mut usize,
+    arg_max_strings: usize,
+    arg_max_total: usize,
+) {
+    const PERTURB: &[u8] = b"MALLOC_PERTURB_=50";
+    let plen = PERTURB.len();
+    if *total_strings < arg_max_strings && *data_cursor + plen <= arg_max_total {
+        data_buf[*data_cursor..*data_cursor + plen].copy_from_slice(PERTURB);
+        meta_lens[*total_strings] = plen as u16;
+        *data_cursor += plen;
+        *total_strings += 1;
+        *envc += 1;
+    }
+}
+
 pub(crate) fn exec_for_task(
     target_task_id: u32,
     target_tid: u32,
@@ -2955,6 +2986,7 @@ pub(crate) fn exec_for_task(
             }
         }
     }
+    inject_malloc_perturb(meta_lens, data_buf, &mut data_cursor, &mut total_strings, &mut envc, arg_max_strings, arg_max_total);
     let string_total = data_cursor;
 
     // === POINT OF NO RETURN ===
