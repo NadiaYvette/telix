@@ -1024,9 +1024,48 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let sub_port = if ok { syscall::port_create() } else { u64::MAX };
         if sub_port == u64::MAX { ok = false; }
 
+        // Pick a synthetic dst service UUID for this test.
+        let dst_uuid: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01,
+        ];
+        let src_uuid: [u8; 16] = [
+            0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0x00, 0x10,
+            0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90,
+        ];
+        let dst_lo = u64::from_le_bytes([
+            dst_uuid[0], dst_uuid[1], dst_uuid[2], dst_uuid[3],
+            dst_uuid[4], dst_uuid[5], dst_uuid[6], dst_uuid[7],
+        ]);
+        let dst_hi = u64::from_le_bytes([
+            dst_uuid[8], dst_uuid[9], dst_uuid[10], dst_uuid[11],
+            dst_uuid[12], dst_uuid[13], dst_uuid[14], dst_uuid[15],
+        ]);
+
+        // Allocate the subscriber's inbound page (where proxy_srv
+        // will deliver each frame body).  Pre-fault + grant to
+        // proxy_srv at a chosen VA.
+        let sub_grant_va: usize = 0xB_0001_0000;
+        let sub_local = if ok {
+            match syscall::mmap_anon(0, 1, 1) {
+                Some(va) => {
+                    unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); }
+                    va
+                }
+                None => {
+                    ok = false;
+                    0
+                }
+            }
+        } else { 0 };
+        if ok && !syscall::grant_pages(proxy_port, sub_local, sub_grant_va, 1, false) {
+            ok = false;
+            syscall::debug_puts(b"  [proxy] grant_pages sub_grant failed\n");
+        }
+
         if ok {
-            // Subscribe.
-            match syscall::call(proxy_port, 0x5020, sub_port, 0, 0, 0) {
+            // Subscribe with dst_uuid + sub_port + sub_grant_va.
+            match syscall::call(proxy_port, 0x5020, dst_lo, dst_hi, sub_port, sub_grant_va as u64) {
                 Some(r) if r.tag == 0x5021 => {}
                 _ => {
                     ok = false;
@@ -1036,33 +1075,38 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         if ok {
-            // Build a fake proxy frame: WIRE_MAGIC "TLXP" + version 1 +
-            // 4-byte payload "PING".
+            // Build the proxy body in our aspace: dst_uuid (16) +
+            // src_uuid (16) + request_id (8) + payload "PING" (4).
+            // Then prepend the wire header (8 bytes magic+ver+len) so
+            // the inject path can parse it directly via the same
+            // parser the real receive path uses.
             let inject_local = match syscall::mmap_anon(0, 1, 1) {
                 Some(va) => va,
                 None => {
                     ok = false;
-                    syscall::debug_puts(b"  [proxy] inject mmap failed\n");
                     0
                 }
             };
             if ok {
+                let body_len: usize = 16 + 16 + 8 + 4;
+                let frame_len: usize = 8 + body_len;
                 unsafe {
                     let dst = inject_local as *mut u8;
                     core::ptr::write_volatile(dst, 0u8);
-                    // magic "TLXP"
                     let mag = 0x544C5850u32.to_le_bytes();
                     for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
-                    // version=1, reserved=0, len=4 LE
                     core::ptr::write_volatile(dst.add(4), 1u8);
                     core::ptr::write_volatile(dst.add(5), 0u8);
-                    core::ptr::write_volatile(dst.add(6), 4u8);
-                    core::ptr::write_volatile(dst.add(7), 0u8);
-                    // payload "PING"
-                    core::ptr::write_volatile(dst.add(8), b'P');
-                    core::ptr::write_volatile(dst.add(9), b'I');
-                    core::ptr::write_volatile(dst.add(10), b'N');
-                    core::ptr::write_volatile(dst.add(11), b'G');
+                    let len_le = (body_len as u16).to_le_bytes();
+                    core::ptr::write_volatile(dst.add(6), len_le[0]);
+                    core::ptr::write_volatile(dst.add(7), len_le[1]);
+                    // Body: dst_uuid + src_uuid + request_id + payload.
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(8 + i), dst_uuid[i]); }
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(8 + 16 + i), src_uuid[i]); }
+                    let req_id = 0xdeadbeefcafef00du64.to_le_bytes();
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(8 + 32 + i), req_id[i]); }
+                    let payload = b"PING";
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(8 + 40 + i), payload[i]); }
                 }
                 const INJECT_GRANT_VA: usize = 0xB_0000_0000;
                 if !syscall::grant_pages(proxy_port, inject_local, INJECT_GRANT_VA, 1, false) {
@@ -1070,9 +1114,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  [proxy] grant_pages inject failed\n");
                 }
                 if ok {
-                    // Inject (8-byte header + 4-byte payload = 12).
                     match syscall::call(proxy_port, 0x5030,
-                                        INJECT_GRANT_VA as u64, 12, 0, 0) {
+                                        INJECT_GRANT_VA as u64, frame_len as u64, 0, 0) {
                         Some(r) if r.tag == 0x5031 => {}
                         _ => {
                             ok = false;
@@ -1081,23 +1124,33 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
                 if ok {
-                    // Wait briefly for the inbound notification.
                     let mut got = false;
                     for _ in 0..100 {
                         if let Some(m) = syscall::recv_msg_timeout(sub_port, 10_000_000) {
                             if m.tag == 0x5022 {
-                                // data[0] low 16 bits = inner_len, must be 4.
-                                let len = m.data[0] & 0xFFFF;
-                                if len != 4 {
-                                    syscall::debug_puts(b"  [proxy] inbound len wrong\n");
+                                let len = m.data[0] as usize;
+                                if len != body_len {
+                                    syscall::debug_puts(b"  [proxy] inbound body_len wrong\n");
                                 } else {
-                                    // bytes 2..6 of data[0] = first 6 bytes of payload.
-                                    let d0 = m.data[0].to_le_bytes();
-                                    if d0[2] == b'P' && d0[3] == b'I'
-                                        && d0[4] == b'N' && d0[5] == b'G' {
-                                        got = true;
+                                    // Read body from sub_local; verify
+                                    // dst_uuid + src_uuid + payload.
+                                    let mut got_dst = [0u8; 16];
+                                    let mut got_src = [0u8; 16];
+                                    let mut got_pay = [0u8; 4];
+                                    unsafe {
+                                        let p = sub_local as *const u8;
+                                        for i in 0..16 { got_dst[i] = core::ptr::read_volatile(p.add(i)); }
+                                        for i in 0..16 { got_src[i] = core::ptr::read_volatile(p.add(16 + i)); }
+                                        for i in 0..4 { got_pay[i] = core::ptr::read_volatile(p.add(40 + i)); }
+                                    }
+                                    if got_dst != dst_uuid {
+                                        syscall::debug_puts(b"  [proxy] dst_uuid mismatch\n");
+                                    } else if got_src != src_uuid {
+                                        syscall::debug_puts(b"  [proxy] src_uuid mismatch\n");
+                                    } else if &got_pay != b"PING" {
+                                        syscall::debug_puts(b"  [proxy] payload mismatch\n");
                                     } else {
-                                        syscall::debug_puts(b"  [proxy] inbound payload wrong\n");
+                                        got = true;
                                     }
                                 }
                                 break;

@@ -16,16 +16,26 @@ const PROXY_MARKER_LO: u64 = 0xFFFF_0001;
 const PROXY_ADD_NODE: u64 = 0x5000;
 const PROXY_ADD_NODE_OK: u64 = 0x5001;
 
-/// Send a frame to a peer over the Ethernet-direct transport.  First
-/// piece of the multi-transport Tier 5 chain: caller has already
-/// resolved the peer via SVCREG_LOOKUP_REMOTE_OK and supplies its MAC
-/// in data[0] (mac_to_u64 encoding).  Payload (≤ 24 bytes inline)
-/// goes in data[1..4].  Larger payloads get a grant-based variant in a
-/// follow-up.
+/// Send a frame to a peer over the Ethernet-direct transport.
+///
+/// Caller pre-grants a page in our aspace containing the message
+/// *body* — exactly:
+///   bytes  0..16: dst_service_uuid
+///   bytes 16..32: src_service_uuid
+///   bytes 32..40: request_id (LE u64; 0 if not needed for matching)
+///   bytes 40..N:  payload
+/// proxy_srv prepends the 8-byte wire header (magic + version +
+/// reserved + len) and ships via NETIF_XMIT.  Body length is bounded
+/// by MTU - 8 ≈ 1492 bytes (40-byte routing header + ≤ 1452 payload).
+///
+/// in:  data[0] = peer MAC (mac_to_u64 encoding; resolved from
+///                SVCREG_LOOKUP_REMOTE_OK)
+///      data[1] = grant_va in our aspace where the body lives
+///      data[2] = body_len (>= 40 for the routing header to be valid)
 ///
 /// Reply: PROXY_SEND_BY_PEER_OK on success; PROXY_SEND_BY_PEER_FAIL
 /// if the Ethernet transport hasn't completed its eth_srv handshake
-/// yet.
+/// yet, or body_len is too small / too large.
 ///
 /// Transport selection is per-call for now (this RPC means "use
 /// Ethernet"); a future trait-based dispatcher will pick TCP vs.
@@ -34,17 +44,27 @@ const PROXY_SEND_BY_PEER: u64 = 0x5010;
 const PROXY_SEND_BY_PEER_OK: u64 = 0x5011;
 const PROXY_SEND_BY_PEER_FAIL: u64 = 0x501F;
 
-/// Subscribe a port to receive demuxed inbound proxy frames (RX side).
-/// Caller passes its receiving port in data[0]; on each successful
-/// inbound frame validation, proxy_srv send_nb's PROXY_INBOUND_FRAME
-/// (0x5021) to that port with the frame's payload (up to 24 inline
-/// bytes for now, mirroring the TX path).
+/// Routing header prefix size (dst_uuid + src_uuid + request_id) at the
+/// start of every proxy frame body.
+const ROUTING_HDR_LEN: usize = 16 + 16 + 8;
+
+/// Subscribe a port to receive demuxed inbound proxy frames whose
+/// dst_service_uuid matches a specified UUID.  proxy_srv maintains a
+/// linear table of (uuid, port) pairs; on each inbound frame, the
+/// dst_service_uuid is looked up and forwarded to that subscriber.
 ///
-/// One subscriber per proxy_srv instance for the first cut; a per-
-/// service-UUID demux happens in the future when the trait + auth
-/// pieces land.
+/// in:  data[0..2] = service UUID (LE-packed two u64 words)
+///      data[2]    = subscriber port
+///      data[3]    = inbound_grant_va — caller pre-grants a page in
+///                   their aspace at this VA where proxy_srv writes
+///                   each delivered frame body (UUIDs + payload).
+///                   Notification (PROXY_INBOUND_FRAME) carries the
+///                   length; subscriber reads bytes from grant_va.
 const PROXY_SUBSCRIBE_INBOUND: u64 = 0x5020;
 const PROXY_SUBSCRIBE_INBOUND_OK: u64 = 0x5021;
+/// Notification fired to a subscriber's port when a matching frame
+/// arrives.  data[0] = body_len (header + payload that got written
+/// to the subscriber's grant_va).  data[1] = src_mac of the sender.
 const PROXY_INBOUND_FRAME: u64 = 0x5022;
 
 /// Test-only inject path, mirroring discovery_srv's
@@ -178,12 +198,26 @@ static mut ETH_TX_LOCAL_VA: usize = 0;
 static mut ETH_RX_LOCAL_VA: usize = 0;
 static mut ETH_TX_CLIENT_ID: u64 = 0;
 static mut ETH_TX_REGISTERED: bool = false;
-/// Currently-registered subscriber port for demuxed inbound frames.
-/// Single-subscriber model for the first cut.  0 means no subscriber
-/// (frames are validated and counted but not forwarded).
-static mut INBOUND_SUBSCRIBER_PORT: u64 = 0;
+/// Per-UUID subscriber registration.
+#[derive(Copy, Clone)]
+struct InboundSubscriber {
+    in_use: bool,
+    uuid: [u8; 16],
+    port: u64,
+    /// Caller-supplied VA where we write each delivered frame body.
+    /// In the caller's aspace (granted to us at sub time).
+    grant_va: usize,
+}
+
+const MAX_INBOUND_SUBSCRIBERS: usize = 16;
+static mut INBOUND_SUBSCRIBERS: [InboundSubscriber; MAX_INBOUND_SUBSCRIBERS] = [
+    InboundSubscriber { in_use: false, uuid: [0; 16], port: 0, grant_va: 0 };
+    MAX_INBOUND_SUBSCRIBERS
+];
+
 static mut INBOUND_FRAMES_RECEIVED: u64 = 0;
 static mut INBOUND_FRAMES_REJECTED: u64 = 0;
+static mut INBOUND_FRAMES_NO_SUB: u64 = 0;
 
 /// Best-effort registration with eth_srv for ETHERTYPE_PROXY on the TX
 /// side.  Same shape as discovery_srv::try_register_eth_tx — alloc an
@@ -262,13 +296,15 @@ fn try_register_eth_proxy(my_port: u64) {
 }
 
 /// Parse an inbound proxy frame at `buf_va` (in our aspace) and, if
-/// valid, forward to the registered subscriber.  Shared by the real
-/// receive path (handle_eth_inbound) and the test-only inject path
-/// (PROXY_INJECT_FRAME) so they can't drift on header layout / magic.
-fn parse_proxy_frame_from(buf_va: usize, payload_len: usize, _src_mac: u64) {
+/// valid, demux to the subscriber registered for the dst_service_uuid.
+/// Shared by the real receive path (handle_eth_inbound) and the
+/// test-only inject path (PROXY_INJECT_FRAME) so they can't drift on
+/// header layout / magic / UUID layout.
+fn parse_proxy_frame_from(buf_va: usize, frame_len: usize, src_mac: u64) {
     unsafe {
         INBOUND_FRAMES_RECEIVED += 1;
-        if buf_va == 0 || payload_len < 8 {
+        // Need 8-byte wire header + 40-byte routing header at minimum.
+        if buf_va == 0 || frame_len < 8 + ROUTING_HDR_LEN {
             INBOUND_FRAMES_REJECTED += 1;
             return;
         }
@@ -280,7 +316,6 @@ fn parse_proxy_frame_from(buf_va: usize, payload_len: usize, _src_mac: u64) {
             INBOUND_FRAMES_REJECTED += 1;
             return;
         }
-        // version + reserved + len
         let version = core::ptr::read_volatile(buf.add(4));
         if version != 1 {
             INBOUND_FRAMES_REJECTED += 1;
@@ -288,40 +323,45 @@ fn parse_proxy_frame_from(buf_va: usize, payload_len: usize, _src_mac: u64) {
         }
         let len_lo = core::ptr::read_volatile(buf.add(6));
         let len_hi = core::ptr::read_volatile(buf.add(7));
-        let inner_len = (len_lo as usize) | ((len_hi as usize) << 8);
-        // inner_len must fit within the frame payload.
-        if 8 + inner_len > payload_len {
+        let body_len = (len_lo as usize) | ((len_hi as usize) << 8);
+        if 8 + body_len > frame_len || body_len < ROUTING_HDR_LEN {
             INBOUND_FRAMES_REJECTED += 1;
             return;
         }
-        if INBOUND_SUBSCRIBER_PORT == 0 {
-            return; // counted as received, no subscriber to forward to
+        // Read dst_service_uuid from body bytes 0..16.
+        let body_va = buf.add(8);
+        let mut dst_uuid = [0u8; 16];
+        for i in 0..16 { dst_uuid[i] = core::ptr::read_volatile(body_va.add(i)); }
+        // Look up subscriber.
+        let mut sub_idx: Option<usize> = None;
+        for i in 0..MAX_INBOUND_SUBSCRIBERS {
+            if INBOUND_SUBSCRIBERS[i].in_use && INBOUND_SUBSCRIBERS[i].uuid == dst_uuid {
+                sub_idx = Some(i);
+                break;
+            }
         }
-        // Pack up to 24 inline bytes into the notification (data[0..3]
-        // = bytes 0..24).  Larger payloads need the grant-based path
-        // — follow-up commit.
-        let n = inner_len.min(24);
-        let mut bytes = [0u8; 24];
-        for i in 0..n {
-            bytes[i] = core::ptr::read_volatile(buf.add(8 + i));
+        let idx = match sub_idx {
+            Some(i) => i,
+            None => {
+                INBOUND_FRAMES_NO_SUB += 1;
+                return; // no demux target; drop silently (counted)
+            }
+        };
+        let sub = &INBOUND_SUBSCRIBERS[idx];
+        // Copy body bytes (the routing header + payload) into the
+        // subscriber's grant_va.  Single contiguous write — subscriber
+        // reads back from their granted VA.
+        let dst = sub.grant_va as *mut u8;
+        for i in 0..body_len {
+            core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(body_va.add(i)));
         }
-        // Pack length in low 16 bits of data[0], then 6 bytes of
-        // payload after; data[1..3] take the remaining 16 bytes.
-        let mut d0_bytes = [0u8; 8];
-        d0_bytes[0] = (n & 0xff) as u8;
-        d0_bytes[1] = ((n >> 8) & 0xff) as u8;
-        for i in 0..6 { d0_bytes[2 + i] = bytes[i]; }
-        let d0 = u64::from_le_bytes(d0_bytes);
-        let mut d1_bytes = [0u8; 8];
-        for i in 0..8 { d1_bytes[i] = bytes[6 + i]; }
-        let d1 = u64::from_le_bytes(d1_bytes);
-        let mut d2_bytes = [0u8; 8];
-        for i in 0..8 { d2_bytes[i] = bytes[14 + i]; }
-        let d2 = u64::from_le_bytes(d2_bytes);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         let _ = syscall::send_nb_4(
-            INBOUND_SUBSCRIBER_PORT,
+            sub.port,
             PROXY_INBOUND_FRAME,
-            d0, d1, d2, 0,
+            body_len as u64,
+            src_mac,
+            0, 0,
         );
     }
 }
@@ -340,39 +380,37 @@ fn handle_eth_inbound(payload_len: usize, src_mac: u64) {
     parse_proxy_frame_from(unsafe { ETH_RX_LOCAL_VA }, payload_len, src_mac);
 }
 
-/// Build a frame at ETH_TX_LOCAL_VA from the supplied inline payload
-/// and send it via NETIF_XMIT to the given peer MAC.  Returns true on
-/// success, false if the eth_srv handshake hasn't completed yet (the
-/// caller is expected to have checked SVCREG_LOOKUP_REMOTE_OK got a
-/// non-zero src_mac before calling this).
-fn eth_send_to_peer(peer_mac: u64, payload: &[u8]) -> bool {
+/// Build a frame at ETH_TX_LOCAL_VA from a fully-formed body (must
+/// already include the 40-byte routing header: dst_uuid + src_uuid +
+/// request_id, followed by payload) and send it via NETIF_XMIT to
+/// the given peer MAC.  Returns true on success.  body length is
+/// bounded by MTU - 8 ≈ 1492 bytes.
+fn eth_send_to_peer(peer_mac: u64, body: &[u8]) -> bool {
     unsafe {
         if !ETH_TX_REGISTERED || ETH_TX_LOCAL_VA == 0 || ETH_PORT == 0 {
             return false;
         }
-        // Wire format starts with the same 4-byte magic the TCP
-        // transport uses, so future RX-side code can sniff frames
-        // and validate they're from a Telix proxy.  Keeps the wire
-        // contract uniform across transports.
+        if body.len() < ROUTING_HDR_LEN {
+            return false;
+        }
+        // Wire format: 8-byte header (magic + version + reserved + len)
+        // followed by the supplied body.
         let dst = ETH_TX_LOCAL_VA as *mut u8;
         let mag = WIRE_MAGIC.to_le_bytes();
         for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
-        // Version + length, mirroring the TCP wire frame's first 8
-        // bytes.  Version=1 for now; length is the inline payload.
         core::ptr::write_volatile(dst.add(4), 1u8); // version
         core::ptr::write_volatile(dst.add(5), 0u8); // reserved
-        let len_le = (payload.len() as u16).to_le_bytes();
+        let len_le = (body.len() as u16).to_le_bytes();
         core::ptr::write_volatile(dst.add(6), len_le[0]);
         core::ptr::write_volatile(dst.add(7), len_le[1]);
-        // Payload.
-        for i in 0..payload.len() {
-            core::ptr::write_volatile(dst.add(8 + i), payload[i]);
+        for i in 0..body.len() {
+            core::ptr::write_volatile(dst.add(8 + i), body[i]);
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         #[cfg(target_arch = "x86_64")]
         core::arch::asm!("mfence");
 
-        let frame_len = 8 + payload.len();
+        let frame_len = 8 + body.len();
         let _ = syscall::send_nb_4(
             ETH_PORT,
             ETH_NETIF_XMIT,
@@ -862,9 +900,42 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // data[0] = payload_len, data[1] = src_mac.
                 handle_eth_inbound(msg.data[0] as usize, msg.data[1]);
             } else if msg.tag == PROXY_SUBSCRIBE_INBOUND {
-                let port = msg.data[0];
-                unsafe { INBOUND_SUBSCRIBER_PORT = port; }
-                let _ = syscall::reply(PROXY_SUBSCRIBE_INBOUND_OK, 0, 0, 0, 0, 0);
+                // data[0..2] = uuid (LE-packed), data[2] = port,
+                // data[3] = grant_va (where to deliver bodies).
+                let mut uuid = [0u8; 16];
+                uuid[0..8].copy_from_slice(&msg.data[0].to_le_bytes());
+                uuid[8..16].copy_from_slice(&msg.data[1].to_le_bytes());
+                let port = msg.data[2];
+                let grant_va = msg.data[3] as usize;
+                let mut ok = false;
+                unsafe {
+                    // If this UUID is already subscribed, update the
+                    // entry (re-subscription is allowed).  Otherwise
+                    // find a free slot.
+                    let mut slot: Option<usize> = None;
+                    for i in 0..MAX_INBOUND_SUBSCRIBERS {
+                        if INBOUND_SUBSCRIBERS[i].in_use && INBOUND_SUBSCRIBERS[i].uuid == uuid {
+                            slot = Some(i);
+                            break;
+                        }
+                    }
+                    if slot.is_none() {
+                        for i in 0..MAX_INBOUND_SUBSCRIBERS {
+                            if !INBOUND_SUBSCRIBERS[i].in_use {
+                                slot = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(i) = slot {
+                        INBOUND_SUBSCRIBERS[i] = InboundSubscriber {
+                            in_use: true, uuid, port, grant_va,
+                        };
+                        ok = true;
+                    }
+                }
+                let tag = if ok { PROXY_SUBSCRIBE_INBOUND_OK } else { PROXY_SEND_BY_PEER_FAIL };
+                let _ = syscall::reply(tag, 0, 0, 0, 0, 0);
             } else if msg.tag == PROXY_INJECT_FRAME {
                 // Test-only path mirroring discovery_srv's
                 // DISCOVERY_INJECT_FRAME.  Caller has granted a page
@@ -876,23 +947,31 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 parse_proxy_frame_from(buf_va, payload_len, src_mac);
                 let _ = syscall::reply(PROXY_INJECT_FRAME_OK, 0, 0, 0, 0, 0);
             } else if msg.tag == PROXY_SEND_BY_PEER {
-                // Ethernet-direct transport entry point.  data[0] =
-                // peer MAC (mac_to_u64 encoding), data[1..4] = up to
-                // 24 bytes inline payload (len in low 16 bits of
-                // data[1]).  Reply OK / FAIL back to the caller.
+                // Grant-based path: caller pre-granted a body page
+                // at data[1] containing dst_uuid + src_uuid +
+                // request_id + payload.  Reply OK / FAIL.
                 let mac = msg.data[0];
-                let len = (msg.data[1] & 0xFFFF) as usize;
-                let mut payload = [0u8; 24];
-                // Bytes 2..8 of data[1] (6 bytes after the 16-bit
-                // length), then full data[2..4].
-                let d1_bytes = msg.data[1].to_le_bytes();
-                for i in 0..6 { payload[i] = d1_bytes[2 + i]; }
-                let d2_bytes = msg.data[2].to_le_bytes();
-                for i in 0..8 { payload[6 + i] = d2_bytes[i]; }
-                let d3_bytes = msg.data[3].to_le_bytes();
-                for i in 0..8 { payload[14 + i] = d3_bytes[i]; }
-                let n = len.min(22);
-                let ok = eth_send_to_peer(mac, &payload[..n]);
+                let body_va = msg.data[1] as usize;
+                let body_len = msg.data[2] as usize;
+                let ok = if body_va == 0
+                    || body_len < ROUTING_HDR_LEN
+                    || body_len > 1492
+                {
+                    false
+                } else {
+                    // Validate the grant is mapped (cache_srv-style
+                    // defensive check via SYS_VA_WRITABLE — though
+                    // this is a read so writable is overstrict; we
+                    // just want "is it mapped").
+                    if !syscall::va_writable(body_va) {
+                        false
+                    } else {
+                        let body = unsafe {
+                            core::slice::from_raw_parts(body_va as *const u8, body_len)
+                        };
+                        eth_send_to_peer(mac, body)
+                    }
+                };
                 let tag = if ok { PROXY_SEND_BY_PEER_OK } else { PROXY_SEND_BY_PEER_FAIL };
                 let _ = syscall::reply(tag, 0, 0, 0, 0, 0);
             } else if msg.tag == PROXY_ADD_NODE {
