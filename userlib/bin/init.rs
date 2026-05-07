@@ -9178,24 +9178,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::personality_set(xw_child, 2, abi);
                     syscall::debug_puts(b"  [H13] waiting for Xwayland (120s budget)...\n");
 
-                    // --- X0 listener probe — disabled under FOCUS_H13 ---
-                    // The probe was added (project_xwayland_x0_listen_race.md)
-                    // to avoid xeyes attempt-1 hitting ECONNREFUSED on the
-                    // common "Xwayland still warming up" race.  But under
-                    // FOCUS_H13 boot contention (project_h14_xwayland_failure
-                    // _modes.md), the probe consumes a connection from
-                    // Xwayland's accept backlog (boot 408 hypothesis: probe's
-                    // accepted-but-never-drained UDS slot makes xeyes's
-                    // subsequent connect fail).  Skip the probe and let the
-                    // xeyes retry loop below handle the racy case naturally
-                    // — boot 406 confirmed retries do trigger when xeyes
-                    // fails fast.  Conditional on FOCUS_H13 so the probe is
-                    // still available for the polished non-FOCUS path.
-                    if !STEP_H_FOCUS_H13 {
-                        const UDS_SOCKET_C: u64 = 0x8000;
-                        const UDS_CONNECT_C: u64 = 0x8030;
-                        const UDS_CLOSE_C:   u64 = 0x8070;
-                        const UDS_OK_C:      u64 = 0x8100;
+                    // --- X0 listener probe (non-consuming) ---
+                    // Asks uds_srv whether a listening socket named "X0"
+                    // exists.  The old probe used UDS_SOCKET + UDS_CONNECT +
+                    // UDS_CLOSE which consumed an accept slot from Xwayland's
+                    // backlog and starved xeyes (boot 408 hypothesis).  The
+                    // new UDS_QUERY_LISTENING tag is a pure lookup against
+                    // uds_srv's socket table — no allocation, no state
+                    // change.  Safe to enable under FOCUS_H13.
+                    {
+                        const UDS_QUERY_LISTENING_C: u64 = 0x80B0;
+                        const UDS_OK_C: u64 = 0x8100;
                         let mut uds_port: u64 = 0;
                         for _ in 0..200 {
                             if let Some(p) = syscall::ns_lookup(b"uds") {
@@ -9206,32 +9199,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         }
                         if uds_port != 0 {
                             let (n0, n1, _) = pack_name(b"X0");
-                            let pid = syscall::getpid();
-                            let uid = syscall::getuid() as u64;
                             let mut probes: u32 = 0;
                             let mut listening = false;
-                            // Boot 404 trace confirmed Xwayland *does* bind X0
-                            // successfully but only after the H13 budget +
-                            // probe budget have already been spent.  Boot 405
-                            // (MAX_PROBES=600 = 60s) ate so much wallclock
-                            // that retry attempts couldn't run before the
-                            // 1500s boot timeout.  Net: no improvement over
-                            // 10s probe, and *less* wallclock available for
-                            // retry-based recovery.  Revert to 10s and rely
-                            // on the xeyes-retry loop below to retry until
-                            // Xwayland's bind catches up.
-                            const MAX_PROBES: u32 = 100; // ~10s @ 100 ms each
+                            // 10s budget @ 100 ms/probe — same as the old
+                            // probe.  Non-consuming so cost is just the IPC
+                            // round trip, no risk of starving xeyes.
+                            const MAX_PROBES: u32 = 100;
                             while probes < MAX_PROBES {
-                                let sock_handle = match syscall::call(uds_port, UDS_SOCKET_C, 0, 0, 0, 0) {
-                                    Some(m) if m.tag == UDS_OK_C => m.data[0],
-                                    _ => break,
-                                };
-                                let connect_ok = match syscall::call(uds_port, UDS_CONNECT_C, n0, n1, 2, pid | (uid << 32)) {
+                                let ok = match syscall::call(uds_port, UDS_QUERY_LISTENING_C, n0, n1, 2, 0) {
                                     Some(m) => m.tag == UDS_OK_C,
                                     None => false,
                                 };
-                                let _ = syscall::call(uds_port, UDS_CLOSE_C, sock_handle, 0, 0, 0);
-                                if connect_ok {
+                                if ok {
                                     listening = true;
                                     break;
                                 }
@@ -9246,8 +9225,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 syscall::debug_puts(b"  [H14] X0 listener not detected within budget; spawning xeyes anyway\n");
                             }
                         }
-                    } else {
-                        syscall::debug_puts(b"  [H14] X0 listener probe SKIPPED (FOCUS_H13 contention path; relying on xeyes retry loop)\n");
                     }
 
                     // --- Step H14: spawn xeyes ---

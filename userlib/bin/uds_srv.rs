@@ -17,6 +17,12 @@
 //!   UDS_CLOSE(0x8070)   — close socket, d0=handle
 //!   UDS_GETPEERCRED(0x8080) — get peer creds, d0=handle
 //!   UDS_GETPEER(0x80A0)    — get peer handle, d0=handle
+//!   UDS_QUERY_LISTENING(0x80B0) — non-consuming readiness check; d0/d1=name,
+//!                                 d2 low16=name_len. UDS_OK if a listening
+//!                                 socket exists with that name, UDS_ERROR
+//!                                 otherwise. Pure lookup — does not allocate
+//!                                 a connection slot or consume the accept
+//!                                 backlog (unlike connect+close probing).
 
 extern crate userlib;
 
@@ -49,6 +55,7 @@ const UDS_CLOSE: u64 = 0x8070;
 const UDS_GETPEERCRED: u64 = 0x8080;
 const UDS_POLL: u64 = 0x8090;
 const UDS_GETPEER: u64 = 0x80A0;
+const UDS_QUERY_LISTENING: u64 = 0x80B0;
 
 const POLL_SUBSCRIBE: u64 = 0xF010;
 const POLL_UNSUBSCRIBE: u64 = 0xF020;
@@ -390,6 +397,21 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 s.state = SockState::Listening;
                 reply(UDS_OK, 0, 0, 0, 0);
+            }
+
+            UDS_QUERY_LISTENING => {
+                // Non-consuming readiness check: returns UDS_OK if a listening
+                // socket with the given name exists.  Used by init.rs to gate
+                // xeyes spawn on Xwayland having reached listen() — replaces
+                // the old socket+connect+close probe that consumed an accept
+                // slot from Xwayland's backlog (boot 408 hypothesis).
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                let (name, nlen) = unpack_name(msg.data[0], msg.data[1], name_len);
+                if find_listening(&name, nlen).is_some() {
+                    reply(UDS_OK, 0, 0, 0, 0);
+                } else {
+                    reply(UDS_ERROR, 0, 0, 0, 0);
+                }
             }
 
             UDS_CONNECT => {
