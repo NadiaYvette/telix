@@ -82,6 +82,25 @@ pub const SVCREG_STATS_OK: u64 = 0x7E21;
 pub const SVCREG_LIST_UUIDS: u64 = 0x7E22;
 pub const SVCREG_LIST_UUIDS_OK: u64 = 0x7E23;
 
+/// Look up a service that may be registered on a *remote* peer.
+/// Local table is searched first; on miss we delegate to discovery_srv
+/// (DISCOVERY_LOOKUP_SERVICE, 0x4D09) and forward its answer.
+///
+/// in:  data[0..2] = UUID (LE-packed two u64 words; same shape as
+///                   SVCREG_LOOKUP)
+/// out:
+///   SVCREG_LOOKUP_OK (0x7E11) — local hit; data[0] = port,
+///                                 data[1] = bundle (same as SVCREG_LOOKUP)
+///   SVCREG_LOOKUP_REMOTE_OK    — remote peer offers it;
+///                                 data[0..2] = peer UUID
+///                                 data[2]    = last_seen_ns
+///   SVCREG_LOOKUP_NOTFOUND     — neither local nor any peer has it
+///
+/// Caller policy: on REMOTE_OK, hand the peer UUID to proxy_srv (or
+/// future name-server-backed forwarding) to obtain a routable port.
+pub const SVCREG_LOOKUP_REMOTE: u64 = 0x7E24;
+pub const SVCREG_LOOKUP_REMOTE_OK: u64 = 0x7E25;
+
 /// Maximum simultaneous registrations.
 const MAX_ENTRIES: usize = 64;
 
@@ -107,6 +126,14 @@ impl Entry {
 }
 
 static mut TABLE: [Entry; MAX_ENTRIES] = [Entry::empty(); MAX_ENTRIES];
+
+/// Cached discovery_srv port — lazy-resolved at first SVCREG_LOOKUP_REMOTE.
+/// 0 = not yet looked up; u64::MAX = looked up and found nothing
+/// (don't keep retrying every call).
+static mut DISCOVERY_PORT: u64 = 0;
+
+const DISCOVERY_LOOKUP_SERVICE: u64 = 0x4D09;
+const DISCOVERY_LOOKUP_SERVICE_OK: u64 = 0x4D0A;
 
 fn uuid_from_words(w0: u64, w1: u64) -> [u8; 16] {
     let mut u = [0u8; 16];
@@ -247,6 +274,52 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                     c
                 };
                 let _ = syscall::reply(SVCREG_STATS_OK, n, 0, 0, 0, 0);
+            }
+            SVCREG_LOOKUP_REMOTE => {
+                let uuid = uuid_from_words(msg.data[0], msg.data[1]);
+                // 1. Try local first (any-method match — bundle is
+                //    irrelevant for the remote-routing case).
+                let local: Option<(u64, u32)> = unsafe {
+                    let mut hit: Option<(u64, u32)> = None;
+                    for i in 0..MAX_ENTRIES {
+                        if TABLE[i].in_use && TABLE[i].uuid == uuid {
+                            hit = Some((TABLE[i].port, TABLE[i].bundle));
+                            break;
+                        }
+                    }
+                    hit
+                };
+                if let Some((p, bundle)) = local {
+                    let _ = syscall::reply(SVCREG_LOOKUP_OK, p, bundle as u64, 0, 0, 0);
+                    continue;
+                }
+                // 2. No local match — ask discovery_srv.
+                let disc_port = unsafe {
+                    if DISCOVERY_PORT == 0 {
+                        match syscall::ns_lookup(b"discovery") {
+                            Some(p) => { DISCOVERY_PORT = p; p }
+                            None => { DISCOVERY_PORT = u64::MAX; u64::MAX }
+                        }
+                    } else {
+                        DISCOVERY_PORT
+                    }
+                };
+                if disc_port == u64::MAX {
+                    let _ = syscall::reply(SVCREG_LOOKUP_NOTFOUND, 0, 0, 0, 0, 0);
+                    continue;
+                }
+                match syscall::call(disc_port, DISCOVERY_LOOKUP_SERVICE,
+                                    msg.data[0], msg.data[1], 0, 0) {
+                    Some(r) if r.tag == DISCOVERY_LOOKUP_SERVICE_OK => {
+                        let _ = syscall::reply(
+                            SVCREG_LOOKUP_REMOTE_OK,
+                            r.data[0], r.data[1], r.data[2], 0, 0,
+                        );
+                    }
+                    _ => {
+                        let _ = syscall::reply(SVCREG_LOOKUP_NOTFOUND, 0, 0, 0, 0, 0);
+                    }
+                }
             }
             SVCREG_LIST_UUIDS => {
                 let grant_va = msg.data[0] as usize;

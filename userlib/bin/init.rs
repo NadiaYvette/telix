@@ -850,6 +850,39 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             syscall::debug_puts(b"  [disc] LOOKUP_SERVICE call failed or NOTFOUND\n");
                         }
                     }
+                    // Also verify the bridged path: SVCREG_LOOKUP_REMOTE
+                    // on servicereg_srv should delegate to discovery_srv
+                    // and return the same peer UUID, with reply tag
+                    // SVCREG_LOOKUP_REMOTE_OK (0x7E25).
+                    if ok {
+                        if let Some(svcreg_port) = syscall::ns_lookup(b"servicereg") {
+                            match syscall::call(svcreg_port, 0x7E24, svc_lo, svc_hi, 0, 0) {
+                                Some(r) if r.tag == 0x7E25 => {
+                                    let expected_lo = u64::from_le_bytes([
+                                        0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef,
+                                    ]);
+                                    let expected_hi = u64::from_le_bytes([
+                                        0xca, 0xfe, 0xba, 0xbe, 0x12, 0x34, 0x56, 0x78,
+                                    ]);
+                                    if r.data[0] != expected_lo || r.data[1] != expected_hi {
+                                        ok = false;
+                                        syscall::debug_puts(
+                                            b"  [disc] SVCREG_LOOKUP_REMOTE returned wrong peer UUID\n",
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    ok = false;
+                                    syscall::debug_puts(
+                                        b"  [disc] SVCREG_LOOKUP_REMOTE failed or didn't bridge\n",
+                                    );
+                                }
+                            }
+                        } else {
+                            ok = false;
+                            syscall::debug_puts(b"  [disc] servicereg ns_lookup failed\n");
+                        }
+                    }
                 }
                 // Allocate + grant a page for LIST_PEERS reply.
                 if ok {
