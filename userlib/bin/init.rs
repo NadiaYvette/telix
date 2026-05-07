@@ -996,8 +996,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: running proxy_srv inject test...\n");
     {
         let mut ok = true;
-        // proxy_srv registers AFTER blocking on ns_lookup("net"), so it
-        // can take a moment.  Match Phase 5l's pattern: retry for ~5s.
+        // proxy_srv normally spawns much later in init (line ~14110);
+        // spawn it early here so Phase 5n can exercise its receive
+        // path right after Phase 5m.  proxy_srv blocks on ns_lookup("net")
+        // before its own ns_register, so retry for ~5s after spawn.
+        if syscall::ns_lookup(b"proxy").is_none() {
+            let _ = syscall::spawn(b"proxy_srv", 50);
+        }
         let mut wait = 0u32;
         let mut found: Option<u64> = None;
         while wait < 500 {
