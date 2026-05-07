@@ -2802,62 +2802,82 @@ fn print_hex64(n: u64) {
 /// shapes).  Off by default; flip on for diagnostic boots.
 const DEBUG_POST_COPY_VERIFY: bool = true;
 
-/// Verify the first up-to-4-KiB of a personality_copy_out call by
-/// reading back via personality_copy_in and csum-comparing.  Caller
-/// supplies the *source* slice (linux_srv-side bytes that were
-/// written) plus the user va they were written to.  Tag is a short
-/// label included in the mismatch log line (e.g. b"mmap-cache",
-/// b"mmap-direct") so we can tell which copy site failed.
+/// Verify a personality_copy_out by walking the entire source in
+/// 4 KiB strides, reading each stride back via personality_copy_in
+/// and csum-comparing.  Catches corruption anywhere in the copy
+/// (CACHE_CHUNK_SIZE = 256 KiB chunks; verifying only the first 4 KiB
+/// missed corruption past offset 4096 — boot 458's lib-load garbage
+/// was in .dynstr which lives well past the segment start).  Caller
+/// supplies the source slice (linux_srv-side bytes that were written)
+/// plus the user va they were written to.  Tag is a short label in
+/// the mismatch log line so we can tell which copy site failed.
 fn post_copy_verify(caller_port: u64, user_va: usize, src: &[u8], tag: &[u8]) {
     if !DEBUG_POST_COPY_VERIFY || src.is_empty() {
         return;
     }
-    const VERIFY_LEN: usize = 4096;
-    let n = src.len().min(VERIFY_LEN);
-    let mut buf = [0u8; VERIFY_LEN];
-    let got = syscall::personality_copy_in(caller_port, user_va, &mut buf[..n]);
-    if got == 0 {
-        return;
-    }
-    let src_csum = irfs_csum32(&src[..got]);
-    let dst_csum = irfs_csum32(&buf[..got]);
-    if src_csum != dst_csum {
-        syscall::debug_puts(b"[lsrv] POST-COPY-MISMATCH tag=");
-        syscall::debug_puts(tag);
-        syscall::debug_puts(b" va=0x");
-        print_hex64(user_va as u64);
-        syscall::debug_puts(b" len=");
-        let mut nbuf = [0u8; 12]; let mut val = got as u32; let mut k = 12;
-        if val == 0 { k -= 1; nbuf[k] = b'0'; }
-        while val > 0 && k > 0 { k -= 1; nbuf[k] = b'0' + (val % 10) as u8; val /= 10; }
-        syscall::debug_puts(&nbuf[k..12]);
-        syscall::debug_puts(b" src_csum=");
-        irfs_print_hex32(src_csum);
-        syscall::debug_puts(b" dst_csum=");
-        irfs_print_hex32(dst_csum);
-        // Sample the first 16 bytes of each side so a human reading the
-        // log can see which bytes diverged (e.g. zeros in dst, real bytes
-        // in src — typical short-read shape).
-        let sample = got.min(16);
-        syscall::debug_puts(b" src_head=");
-        for i in 0..sample {
-            let hex = b"0123456789abcdef";
-            let h = src[i];
-            let mut hb = [0u8; 2];
-            hb[0] = hex[(h >> 4) as usize];
-            hb[1] = hex[(h & 0xf) as usize];
-            syscall::debug_puts(&hb);
+    const STRIDE: usize = 4096;
+    let mut off = 0usize;
+    while off < src.len() {
+        let n = (src.len() - off).min(STRIDE);
+        let mut buf = [0u8; STRIDE];
+        let got = syscall::personality_copy_in(caller_port, user_va + off, &mut buf[..n]);
+        if got == 0 {
+            return;
         }
-        syscall::debug_puts(b" dst_head=");
-        for i in 0..sample {
-            let hex = b"0123456789abcdef";
-            let h = buf[i];
-            let mut hb = [0u8; 2];
-            hb[0] = hex[(h >> 4) as usize];
-            hb[1] = hex[(h & 0xf) as usize];
-            syscall::debug_puts(&hb);
+        let src_view = &src[off..off + got];
+        let dst_view = &buf[..got];
+        let src_csum = irfs_csum32(src_view);
+        let dst_csum = irfs_csum32(dst_view);
+        if src_csum != dst_csum {
+            syscall::debug_puts(b"[lsrv] POST-COPY-MISMATCH tag=");
+            syscall::debug_puts(tag);
+            syscall::debug_puts(b" va=0x");
+            print_hex64((user_va + off) as u64);
+            syscall::debug_puts(b" off_in_copy=");
+            let mut nbuf = [0u8; 12]; let mut val = off as u32; let mut k = 12;
+            if val == 0 { k -= 1; nbuf[k] = b'0'; }
+            while val > 0 && k > 0 { k -= 1; nbuf[k] = b'0' + (val % 10) as u8; val /= 10; }
+            syscall::debug_puts(&nbuf[k..12]);
+            syscall::debug_puts(b" len=");
+            let mut nbuf = [0u8; 12]; let mut val = got as u32; let mut k = 12;
+            if val == 0 { k -= 1; nbuf[k] = b'0'; }
+            while val > 0 && k > 0 { k -= 1; nbuf[k] = b'0' + (val % 10) as u8; val /= 10; }
+            syscall::debug_puts(&nbuf[k..12]);
+            syscall::debug_puts(b" src_csum=");
+            irfs_print_hex32(src_csum);
+            syscall::debug_puts(b" dst_csum=");
+            irfs_print_hex32(dst_csum);
+            // Sample the first 16 bytes of each side so a human reading
+            // the log can see which bytes diverged (zeros in dst → short
+            // read shape; different bytes → phys mismatch).
+            let sample = got.min(16);
+            syscall::debug_puts(b" src_head=");
+            for i in 0..sample {
+                let hex = b"0123456789abcdef";
+                let h = src_view[i];
+                let mut hb = [0u8; 2];
+                hb[0] = hex[(h >> 4) as usize];
+                hb[1] = hex[(h & 0xf) as usize];
+                syscall::debug_puts(&hb);
+            }
+            syscall::debug_puts(b" dst_head=");
+            for i in 0..sample {
+                let hex = b"0123456789abcdef";
+                let h = dst_view[i];
+                let mut hb = [0u8; 2];
+                hb[0] = hex[(h >> 4) as usize];
+                hb[1] = hex[(h & 0xf) as usize];
+                syscall::debug_puts(&hb);
+            }
+            syscall::debug_puts(b"\n");
+            // First mismatch is enough — return rather than spam the log
+            // with one line per 4 KiB stride of a corrupted region.
+            return;
         }
-        syscall::debug_puts(b"\n");
+        off += got;
+        if got < n {
+            return;
+        }
     }
 }
 
