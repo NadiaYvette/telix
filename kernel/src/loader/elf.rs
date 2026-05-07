@@ -294,6 +294,30 @@ fn load_segment(
     let filesz = phdr.p_filesz as usize;
     let file_off = phdr.p_offset as usize;
 
+    // (D) PT_LOAD population trace.  Computes a quick csum over the
+    // file-backed portion so post-mortem grep can verify a faulting
+    // VA was actually populated and with which expected content.
+    // 16-bit Fletcher-style sum is enough to distinguish "all zero
+    // (load dropped)" from "real bytes" without paying a full crc.
+    let trace_csum: u16 = {
+        let bytes = if file_off + filesz <= data.len() {
+            &data[file_off..file_off + filesz]
+        } else {
+            &[]
+        };
+        let mut s1: u16 = 0;
+        let mut s2: u16 = 0;
+        for &b in bytes {
+            s1 = s1.wrapping_add(b as u16);
+            s2 = s2.wrapping_add(s1);
+        }
+        s2.wrapping_shl(8) ^ s1
+    };
+    crate::println!(
+        "[elf-load] aspace={} vaddr={:#x} file_off={:#x} filesz={:#x} memsz={:#x} flags={:#x} csum={:04x}",
+        aspace_id, vaddr, file_off, filesz, memsz, phdr.p_flags, trace_csum,
+    );
+
     // Align VA range to page_size().
     let ps = page::page_size();
     let va_start = vaddr & !(ps - 1);
