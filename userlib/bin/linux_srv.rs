@@ -3282,6 +3282,16 @@ fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
                     core::ptr::read_volatile(scratch.add(i)),
                 );
             }
+            // Snapshot the chunk's csum from backing's POV right after fill.
+            // This becomes the file-source-of-truth for any later verify
+            // when we copy backing→user — the IO_READ_REPLY's irfs_csum
+            // already validated scratch matches, and the volatile loop
+            // above is in-aspace so backing now matches scratch.
+            let backing_chunk = core::slice::from_raw_parts(dst as *const u8, got);
+            let backing_csum_at_fill = irfs_csum32(backing_chunk);
+            if chunk_idx < 64 {
+                LIB_CACHE[cache_idx].chunk_csums[chunk_idx] = backing_csum_at_fill;
+            }
             cache_chunk_mark(cache_idx, chunk_idx);
 
             // Now walk cached chunks (including the just-marked one)
@@ -3481,6 +3491,15 @@ struct LibCacheSlot {
     chunks_cached: u64,
     /// ceil(file_size / CACHE_CHUNK_SIZE).  Always ≤ 64.
     chunk_count: u8,
+    /// Per-chunk csum (irfs_csum32) of bytes as they were just after the
+    /// scratch→backing copy completed.  Used by the three-way verify in
+    /// cache_process_cached_chunks: file-source-of-truth (this) vs
+    /// backing-now (re-csum) vs user-now (via personality_copy_in).
+    /// Diverging values pinpoint *which* hop corrupted, where boots
+    /// 484/485 had garbage in user-space but post_copy_verify saw
+    /// matching csums on both sides — the cross-aspace pair were
+    /// consistently wrong vs. the file source.
+    chunk_csums: [u32; 64],
 }
 
 /// Bytes per cache chunk.  Matches the per-slot async scratch size so
@@ -3558,7 +3577,7 @@ fn name_cache_lookup(name: &[u8]) -> Option<(u64, u64)> {
 static mut LIB_CACHE: [LibCacheSlot; LIB_CACHE_MAX] = [
     LibCacheSlot {
         in_use: false, irfs_handle: 0, file_size: 0, backing_va: 0,
-        chunks_cached: 0, chunk_count: 0,
+        chunks_cached: 0, chunk_count: 0, chunk_csums: [0u32; 64],
     };
     LIB_CACHE_MAX
 ];
@@ -3645,6 +3664,7 @@ fn lib_cache_lookup_or_alloc(handle: u64, file_size: u64) -> Option<usize> {
             backing_va: va,
             chunks_cached: 0,
             chunk_count,
+            chunk_csums: [0u32; 64],
         };
     }
     Some(slot_idx)
@@ -3719,6 +3739,84 @@ fn cache_process_cached_chunks(
             };
             syscall::personality_copy_out(caller_port, user_dst, src);
             post_copy_verify(caller_port, user_dst, src, b"mmap-cache");
+            // Three-way verify against the file-source csum stored at
+            // chunk-fill time.  Catches the boot-484/485 mode where
+            // post_copy_verify sees consistent (matching) bytes on
+            // backing-side and user-side, but both are wrong relative to
+            // the file source — i.e. the cross-aspace pair landed on
+            // a wrong phys page that's the same wrong page from both
+            // views.  Only valid when this overlap covers the whole
+            // chunk (else the partial-range csum doesn't match the
+            // stored full-chunk csum); for partial overlaps we just
+            // skip the file-source check.
+            if chunk < 64 {
+                let chunk_data_len = CACHE_CHUNK_SIZE
+                    .min((file_size - chunk_off) as usize);
+                let chunk_starts_here = overlap_start == chunk_off;
+                let chunk_ends_here = overlap_end == chunk_off + chunk_data_len as u64;
+                if chunk_starts_here && chunk_ends_here {
+                    let stored = unsafe { LIB_CACHE[cache_idx].chunk_csums[chunk] };
+                    if stored != 0 {
+                        let backing_now = irfs_csum32(src);
+                        if backing_now != stored {
+                            // Backing changed between fill and now — a
+                            // writer touched backing_va.  Shouldn't
+                            // happen if backing_va is unique to this
+                            // slot.
+                            syscall::debug_puts(b"[lsrv] BACKING-DRIFT cache_idx=");
+                            let mut buf = [0u8; 4]; let mut val = cache_idx as u32; let mut k = 4;
+                            if val == 0 { k -= 1; buf[k] = b'0'; }
+                            while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                            syscall::debug_puts(&buf[k..4]);
+                            syscall::debug_puts(b" chunk=");
+                            let mut buf = [0u8; 4]; let mut val = chunk as u32; let mut k = 4;
+                            if val == 0 { k -= 1; buf[k] = b'0'; }
+                            while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                            syscall::debug_puts(&buf[k..4]);
+                            syscall::debug_puts(b" stored=");
+                            irfs_print_hex32(stored);
+                            syscall::debug_puts(b" now=");
+                            irfs_print_hex32(backing_now);
+                            syscall::debug_puts(b"\n");
+                        }
+                        // Also re-fetch user-side and compare to the
+                        // stored file-source csum.  If user_csum !=
+                        // stored AND backing_now == stored, the
+                        // cross-aspace mechanism is delivering wrong
+                        // bytes to user space despite linux_srv's
+                        // local view being correct.
+                        const VLEN: usize = 4096;
+                        let n = overlap_len.min(VLEN);
+                        let mut buf = [0u8; VLEN];
+                        let got = syscall::personality_copy_in(caller_port, user_dst, &mut buf[..n]);
+                        if got > 0 {
+                            // For partial-page samples, compare like-for-like
+                            // by csumming the same range on backing.
+                            let user_sample_csum = irfs_csum32(&buf[..got]);
+                            let backing_sample_csum = irfs_csum32(&src[..got]);
+                            if user_sample_csum != backing_sample_csum {
+                                syscall::debug_puts(b"[lsrv] CROSS-ASPACE-MISMATCH cache_idx=");
+                                let mut nb = [0u8; 4]; let mut val = cache_idx as u32; let mut k = 4;
+                                if val == 0 { k -= 1; nb[k] = b'0'; }
+                                while val > 0 && k > 0 { k -= 1; nb[k] = b'0' + (val % 10) as u8; val /= 10; }
+                                syscall::debug_puts(&nb[k..4]);
+                                syscall::debug_puts(b" chunk=");
+                                let mut nb = [0u8; 4]; let mut val = chunk as u32; let mut k = 4;
+                                if val == 0 { k -= 1; nb[k] = b'0'; }
+                                while val > 0 && k > 0 { k -= 1; nb[k] = b'0' + (val % 10) as u8; val /= 10; }
+                                syscall::debug_puts(&nb[k..4]);
+                                syscall::debug_puts(b" va=0x");
+                                print_hex64(user_dst as u64);
+                                syscall::debug_puts(b" backing_csum=");
+                                irfs_print_hex32(backing_sample_csum);
+                                syscall::debug_puts(b" user_csum=");
+                                irfs_print_hex32(user_sample_csum);
+                                syscall::debug_puts(b"\n");
+                            }
+                        }
+                    }
+                }
+            }
             *total_so_far += overlap_len;
         }
         chunk += 1;
