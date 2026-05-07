@@ -88,7 +88,7 @@ const ANNOUNCE_INTERVAL_MS: u64 = 1000;
 /// milliseconds without a fresh announcement, we evict.  3× the
 /// announce interval handles single dropped frames; missing 3 in a
 /// row is enough to call a peer dead.
-const _PEER_TTL_MS: u64 = 3000;
+const PEER_TTL_MS: u64 = 3000;
 
 /// Minimum announcement payload size: header only, no service UUIDs.
 const ANNOUNCE_HEADER_LEN: usize = 36;
@@ -98,6 +98,7 @@ const ANNOUNCE_HEADER_LEN: usize = 36;
 // ---------------------------------------------------------------------------
 const NETIF_REGISTER: u64 = 0x5000;
 const NETIF_REGISTER_OK: u64 = 0x5001;
+const NETIF_INPUT: u64 = 0x5100;  // eth_srv → client when a matching frame arrives
 const NETIF_XMIT: u64 = 0x5200;
 
 // ---------------------------------------------------------------------------
@@ -161,17 +162,22 @@ static mut PEERS: [PeerEntry; MAX_PEERS] = [PeerEntry::empty(); MAX_PEERS];
 /// (peers will re-discover us under the new UUID).
 static mut LOCAL_UUID: [u8; 16] = [0; 16];
 
-/// Cached eth_srv port + tx state from NETIF_REGISTER handshake.
+/// Cached eth_srv port + tx/rx state from NETIF_REGISTER handshake.
 /// Zero / 0 / false until the handshake completes; broadcast becomes
 /// a no-op until then so we don't crash if eth_srv isn't up yet.
 static mut ETH_PORT: u64 = 0;
 static mut ETH_TX_LOCAL_VA: usize = 0;
+static mut ETH_RX_LOCAL_VA: usize = 0;
 static mut ETH_TX_CLIENT_ID: u64 = 0;
 static mut TX_REGISTERED: bool = false;
 /// Counters surfaced to the boot log (and useful for cross-instance
 /// validation later: peer A's announce_count should equal peer B's
 /// frames_received_count modulo loss).
 static mut ANNOUNCE_COUNT: u64 = 0;
+static mut FRAMES_RECEIVED_COUNT: u64 = 0;
+static mut FRAMES_REJECTED_COUNT: u64 = 0;
+static mut PEER_INSERT_COUNT: u64 = 0;
+static mut PEER_EVICT_COUNT: u64 = 0;
 
 fn count_active_peers() -> u64 {
     let mut n = 0u64;
@@ -183,6 +189,124 @@ fn count_active_peers() -> u64 {
         }
     }
     n
+}
+
+/// Handle a NETIF_INPUT notification: parse the announcement at
+/// ETH_RX_LOCAL_VA, validate, then upsert the sender in PEERS.
+/// Silently drops malformed frames (counted in FRAMES_REJECTED_COUNT)
+/// — discovery is best-effort by design.
+fn handle_netif_input(payload_len: usize) {
+    unsafe {
+        FRAMES_RECEIVED_COUNT += 1;
+        if ETH_RX_LOCAL_VA == 0 {
+            FRAMES_REJECTED_COUNT += 1;
+            return;
+        }
+        if payload_len < ANNOUNCE_HEADER_LEN {
+            FRAMES_REJECTED_COUNT += 1;
+            return;
+        }
+        let buf = ETH_RX_LOCAL_VA as *const u8;
+        // Read header fields (LE).
+        let mut magic_bytes = [0u8; 4];
+        for i in 0..4 { magic_bytes[i] = core::ptr::read_volatile(buf.add(i)); }
+        let magic = u32::from_le_bytes(magic_bytes);
+        if magic != DISCOVERY_MAGIC {
+            FRAMES_REJECTED_COUNT += 1;
+            return;
+        }
+        let mut ver_bytes = [0u8; 2];
+        ver_bytes[0] = core::ptr::read_volatile(buf.add(4));
+        ver_bytes[1] = core::ptr::read_volatile(buf.add(5));
+        let ver = u16::from_le_bytes(ver_bytes);
+        if ver < DISCOVERY_VERSION {
+            // Older sender than us; we'd be missing fields they don't
+            // have.  Reject rather than misparse.
+            FRAMES_REJECTED_COUNT += 1;
+            return;
+        }
+        // Skip flags (offset 6, 2 bytes).
+        // node_uuid at offset 8.
+        let mut uuid = [0u8; 16];
+        for i in 0..16 { uuid[i] = core::ptr::read_volatile(buf.add(8 + i)); }
+        // Reject our own announcement (loopback).  When eth_srv hairpins
+        // a broadcast back to all clients including the sender we'd
+        // otherwise insert ourselves as a peer.
+        if uuid == LOCAL_UUID {
+            return;
+        }
+        // Skip timestamp_ns (offset 24, 8 bytes) — not currently consumed.
+        let manifest_count = core::ptr::read_volatile(buf.add(32)) as usize;
+        // Bound manifest_count to what fits in the rest of the payload
+        // AND our per-peer storage.
+        let max_from_payload = (payload_len - ANNOUNCE_HEADER_LEN) / 16;
+        let svc_count = manifest_count.min(MAX_PEER_SERVICES).min(max_from_payload);
+
+        // Find existing slot or insert new.
+        let now_ns = syscall::clock_gettime();
+        let mut slot: Option<usize> = None;
+        for i in 0..MAX_PEERS {
+            if PEERS[i].in_use && PEERS[i].uuid == uuid {
+                slot = Some(i);
+                break;
+            }
+        }
+        let idx = match slot {
+            Some(i) => i,
+            None => {
+                // Linear scan for free slot.  Full table → drop the
+                // announcement; eviction in maintain_peer_table will
+                // free space at the next interval.
+                let mut found: Option<usize> = None;
+                for i in 0..MAX_PEERS {
+                    if !PEERS[i].in_use {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                match found {
+                    Some(i) => {
+                        PEERS[i].in_use = true;
+                        PEERS[i].uuid = uuid;
+                        PEER_INSERT_COUNT += 1;
+                        i
+                    }
+                    None => {
+                        FRAMES_REJECTED_COUNT += 1;
+                        return;
+                    }
+                }
+            }
+        };
+
+        PEERS[idx].last_seen_ns = now_ns;
+        // Copy service UUIDs from offset 36 onward.
+        PEERS[idx].service_count = svc_count as u8;
+        for s in 0..svc_count {
+            for b in 0..16 {
+                PEERS[idx].service_uuids[s][b] =
+                    core::ptr::read_volatile(buf.add(36 + s * 16 + b));
+            }
+        }
+    }
+}
+
+/// Sweep PEERS, evicting entries whose last_seen_ns is older than
+/// PEER_TTL_MS.  Called once per main-loop tick — the linear scan is
+/// O(MAX_PEERS) so cost is bounded.
+fn maintain_peer_table(now_ns: u64) {
+    let ttl_ns = PEER_TTL_MS * 1_000_000;
+    unsafe {
+        for i in 0..MAX_PEERS {
+            if PEERS[i].in_use {
+                let age = now_ns.wrapping_sub(PEERS[i].last_seen_ns);
+                if age > ttl_ns {
+                    PEERS[i] = PeerEntry::empty();
+                    PEER_EVICT_COUNT += 1;
+                }
+            }
+        }
+    }
 }
 
 fn print_num(n: u64) {
@@ -232,9 +356,10 @@ fn generate_local_uuid() {
 }
 
 /// Register with eth_srv for our discovery ethertype, allocating a tx
-/// grant we can broadcast announcements through.  Best-effort: if
-/// eth_srv isn't up yet, we just skip and broadcast becomes a no-op.
-/// Modeled after nat_srv::try_register_eth_tx.
+/// grant we can broadcast announcements through *and* an rx grant
+/// where eth_srv will deposit incoming discovery-ethertype frames.
+/// Best-effort: if eth_srv isn't up yet, we just skip and broadcast
+/// + receive both become no-ops.  Modeled after nat_srv's pattern.
 fn try_register_eth_tx(my_port: u64) {
     let eth_port = match syscall::ns_lookup(b"eth") {
         Some(p) => p,
@@ -246,6 +371,9 @@ fn try_register_eth_tx(my_port: u64) {
         }
     };
     unsafe { ETH_PORT = eth_port; }
+    // Allocate two anon pages: one for tx (we write announcement, eth_srv
+    // reads & sends), one for rx (eth_srv writes incoming payload, we
+    // read & parse).
     let local_tx = match syscall::mmap_anon(0, 1, 1) {
         Some(va) => va,
         None => {
@@ -253,9 +381,19 @@ fn try_register_eth_tx(my_port: u64) {
             return;
         }
     };
-    // Pre-fault so the kernel grants a unique writable phys page to
-    // eth_srv rather than the shared zero page.
-    unsafe { core::ptr::write_volatile(local_tx as *mut u8, 0u8); }
+    let local_rx = match syscall::mmap_anon(0, 1, 1) {
+        Some(va) => va,
+        None => {
+            syscall::debug_puts(b"  [discovery_srv] mmap_anon for rx failed\n");
+            return;
+        }
+    };
+    // Pre-fault both so the kernel grants unique writable phys pages
+    // (rather than the shared zero page) before the grant_pages calls.
+    unsafe {
+        core::ptr::write_volatile(local_tx as *mut u8, 0u8);
+        core::ptr::write_volatile(local_rx as *mut u8, 0u8);
+    }
 
     let reply_port = syscall::port_create();
     if reply_port == u64::MAX {
@@ -271,7 +409,7 @@ fn try_register_eth_tx(my_port: u64) {
         0,
     );
     let resp = syscall::recv_msg_timeout(reply_port, 2_000_000);
-    let (cid, _eth_rx_va, eth_tx_va) = match resp {
+    let (cid, eth_rx_va, eth_tx_va) = match resp {
         Some(m) if m.tag == NETIF_REGISTER_OK => {
             (m.data[0], m.data[1] as usize, m.data[2] as usize)
         }
@@ -286,12 +424,19 @@ fn try_register_eth_tx(my_port: u64) {
         syscall::debug_puts(b"  [discovery_srv] grant_pages tx -> eth failed\n");
         return;
     }
+    if !syscall::grant_pages(eth_port, local_rx, eth_rx_va, 1, false) {
+        syscall::debug_puts(b"  [discovery_srv] grant_pages rx -> eth failed\n");
+        return;
+    }
     unsafe {
         ETH_TX_LOCAL_VA = local_tx;
+        ETH_RX_LOCAL_VA = local_rx;
         ETH_TX_CLIENT_ID = cid;
         TX_REGISTERED = true;
     }
-    syscall::debug_puts(b"  [discovery_srv] eth tx registered (announce ready)\n");
+    syscall::debug_puts(
+        b"  [discovery_srv] eth tx+rx registered (announce + receive ready)\n",
+    );
 }
 
 /// Build the 36-byte announcement header into the granted tx page,
@@ -388,29 +533,45 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
     // still works, just no broadcast.
     try_register_eth_tx(port);
 
-    // Single-threaded main loop: receive RPCs with a timeout matching
-    // the announce interval, broadcast on each timeout boundary.
-    // Using clock_gettime as the source of truth so we don't drift
-    // when an RPC arrives mid-interval.
+    // Single-threaded main loop: receive RPCs in a polling shape that
+    // ALSO triggers periodic broadcasts when the announce interval
+    // elapses.  recv_with_cap_nb (not recv_msg_timeout) is critical:
+    // the latter doesn't install the held_reply_cap that syscall::reply
+    // needs, so any RPC received via the timeout variant would fail to
+    // reply (caller hangs, then times out).  Use the cap-aware
+    // non-blocking variant in a sleep_ms-paced loop so RPCs reply
+    // correctly and the announce timer advances.
     let mut last_announce_ns: u64 = 0;
     loop {
         let now_ns = syscall::clock_gettime();
         let elapsed_ms = (now_ns.wrapping_sub(last_announce_ns)) / 1_000_000;
         if elapsed_ms >= ANNOUNCE_INTERVAL_MS {
             broadcast_announcement();
+            maintain_peer_table(now_ns);
             last_announce_ns = now_ns;
         }
-        // Block at most until the next announce.  recv_msg_timeout takes
-        // microseconds.  Floor at 1 ms so a backed-up announce
-        // schedule doesn't pin a busy loop.
-        let remaining_ms = ANNOUNCE_INTERVAL_MS.saturating_sub(elapsed_ms);
-        let timeout_us = remaining_ms.max(1) * 1_000;
-        let msg = syscall::recv_msg_timeout(port, timeout_us);
-        let m = match msg {
+        // Drain any queued RPCs / NETIF_INPUT notifications.  Each
+        // iteration handles one if present; the outer loop continues
+        // if none.
+        let m = match syscall::recv_with_cap_nb(port) {
             Some(m) => m,
-            None => continue, // timeout — loop back to announce check
+            None => {
+                // No message; idle until a few ms before the next
+                // announce boundary, then loop back.  A 10 ms slice
+                // bounds RPC + frame-arrival latency without busy-
+                // waiting.
+                syscall::sleep_ms(10);
+                continue;
+            }
         };
         match m.tag {
+            NETIF_INPUT => {
+                // eth_srv delivered a discovery-ethertype frame.
+                // data[0] = payload_len, data[1] = src_mac (unused).
+                handle_netif_input(m.data[0] as usize);
+                // No reply needed — NETIF_INPUT is a notification,
+                // not a call.
+            }
             DISCOVERY_LIST_PEERS => {
                 let n = count_active_peers();
                 let _ = syscall::reply(DISCOVERY_LIST_PEERS_OK, n, 0, 0, 0, 0);
@@ -426,11 +587,23 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                 let _ = syscall::reply(DISCOVERY_GET_LOCAL_UUID_OK, lo, hi, 0, 0, 0);
             }
             DISCOVERY_GET_STATS => {
-                let n = unsafe { ANNOUNCE_COUNT };
-                let tx_ready = unsafe { TX_REGISTERED } as u64;
+                // data[0]: announce_count
+                // data[1]: tx_ready (1 if NETIF_REGISTER completed)
+                // data[2]: frames_received_count
+                // data[3]: peer_insert_count - peer_evict_count
+                //          (currently-live insertions; equals
+                //          count_active_peers() under steady state)
+                let (n, tx_ready, rx_n, live) = unsafe {
+                    (
+                        ANNOUNCE_COUNT,
+                        TX_REGISTERED as u64,
+                        FRAMES_RECEIVED_COUNT,
+                        PEER_INSERT_COUNT.wrapping_sub(PEER_EVICT_COUNT),
+                    )
+                };
                 let _ = syscall::reply(
                     DISCOVERY_GET_STATS_OK,
-                    n, tx_ready, 0, 0, 0,
+                    n, tx_ready, rx_n, live, 0,
                 );
             }
             _ => {
