@@ -16,6 +16,40 @@ const PROXY_MARKER_LO: u64 = 0xFFFF_0001;
 const PROXY_ADD_NODE: u64 = 0x5000;
 const PROXY_ADD_NODE_OK: u64 = 0x5001;
 
+/// Send a frame to a peer over the Ethernet-direct transport.  First
+/// piece of the multi-transport Tier 5 chain: caller has already
+/// resolved the peer via SVCREG_LOOKUP_REMOTE_OK and supplies its MAC
+/// in data[0] (mac_to_u64 encoding).  Payload (≤ 24 bytes inline)
+/// goes in data[1..4].  Larger payloads get a grant-based variant in a
+/// follow-up.
+///
+/// Reply: PROXY_SEND_BY_PEER_OK on success; PROXY_SEND_BY_PEER_FAIL
+/// if the Ethernet transport hasn't completed its eth_srv handshake
+/// yet.
+///
+/// Transport selection is per-call for now (this RPC means "use
+/// Ethernet"); a future trait-based dispatcher will pick TCP vs.
+/// Ethernet based on per-node config.
+const PROXY_SEND_BY_PEER: u64 = 0x5010;
+const PROXY_SEND_BY_PEER_OK: u64 = 0x5011;
+const PROXY_SEND_BY_PEER_FAIL: u64 = 0x501F;
+
+// Eth_srv NETIF protocol — must match userlib/bin/eth_srv.rs.  Inlined
+// here so this binary doesn't take a userlib dependency on eth_srv's
+// header constants.  Note: NETIF_REGISTER's wire value (0x5000) is the
+// same as PROXY_ADD_NODE's, but they're disambiguated by destination
+// port — proxy_srv sends NETIF_REGISTER to eth_srv's port, and
+// receives PROXY_ADD_NODE on its own.
+const ETH_NETIF_REGISTER: u64 = 0x5000;
+const ETH_NETIF_REGISTER_OK: u64 = 0x5001;
+const ETH_NETIF_INPUT: u64 = 0x5100;
+const ETH_NETIF_XMIT: u64 = 0x5200;
+
+/// Ethertype reserved for Telix proxy (cross-device IPC) frames.
+/// Adjacent to discovery_srv's 0xD15C so the two distributed-bonding
+/// channels are easy to identify in packet captures.
+const ETHERTYPE_PROXY: u64 = 0xD15D;
+
 // --- Net_srv IPC tags ---
 const NET_TCP_CONNECT: u64 = 0x4200;
 const NET_TCP_CONNECTED: u64 = 0x4201;
@@ -99,6 +133,134 @@ struct ProxySrv {
     nodes: [NodeEntry; MAX_NODES],
     // Pending accept: true if we're waiting for incoming connections.
     accepting: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Ethernet-direct transport (Tier 5 first synthesis-path piece).
+//
+// Parallel to the existing TCP transport.  Uses eth_srv NETIF_XMIT to
+// frame proxy payloads as raw Ethernet frames with ETHERTYPE_PROXY,
+// addressed by the destination peer's MAC (resolved upstream via
+// SVCREG_LOOKUP_REMOTE_OK from discovery_srv).
+//
+// Worklist (near-term, separate commits):
+// - Refactor existing TCP code under a `Transport` trait so this and
+//   TCP both implement the same dispatch surface
+// - RX side: register for ETHERTYPE_PROXY inbound, deliver to a
+//   subscriber port
+// - Larger payloads via grant page rather than 24-byte inline
+// - Reassembly when payload > MTU
+// ---------------------------------------------------------------------------
+
+static mut ETH_PORT: u64 = 0;
+static mut ETH_TX_LOCAL_VA: usize = 0;
+static mut ETH_TX_CLIENT_ID: u64 = 0;
+static mut ETH_TX_REGISTERED: bool = false;
+
+/// Best-effort registration with eth_srv for ETHERTYPE_PROXY on the TX
+/// side.  Same shape as discovery_srv::try_register_eth_tx — alloc an
+/// anon page, pre-fault it, NETIF_REGISTER, grant the page in.  RX
+/// side comes in a follow-up.
+fn try_register_eth_proxy(my_port: u64) {
+    let eth_port = match syscall::ns_lookup(b"eth") {
+        Some(p) => p,
+        None => {
+            syscall::debug_puts(
+                b"  [proxy_srv] eth not registered; ethernet xmit disabled\n",
+            );
+            return;
+        }
+    };
+    unsafe { ETH_PORT = eth_port; }
+    let local_tx = match syscall::mmap_anon(0, 1, 1) {
+        Some(va) => va,
+        None => {
+            syscall::debug_puts(b"  [proxy_srv] mmap_anon for eth tx failed\n");
+            return;
+        }
+    };
+    unsafe { core::ptr::write_volatile(local_tx as *mut u8, 0u8); }
+
+    let reply_port = syscall::port_create();
+    if reply_port == u64::MAX {
+        syscall::debug_puts(b"  [proxy_srv] port_create for eth tx reply failed\n");
+        return;
+    }
+    let _ = syscall::send_nb_4(
+        eth_port,
+        ETH_NETIF_REGISTER,
+        ETHERTYPE_PROXY,
+        my_port,
+        reply_port,
+        0,
+    );
+    let resp = syscall::recv_msg_timeout(reply_port, 2_000_000);
+    let (cid, _eth_rx_va, eth_tx_va) = match resp {
+        Some(m) if m.tag == ETH_NETIF_REGISTER_OK => {
+            (m.data[0], m.data[1] as usize, m.data[2] as usize)
+        }
+        _ => {
+            syscall::debug_puts(b"  [proxy_srv] eth NETIF_REGISTER handshake failed\n");
+            return;
+        }
+    };
+    if !syscall::grant_pages(eth_port, local_tx, eth_tx_va, 1, false) {
+        syscall::debug_puts(b"  [proxy_srv] grant_pages eth tx failed\n");
+        return;
+    }
+    unsafe {
+        ETH_TX_LOCAL_VA = local_tx;
+        ETH_TX_CLIENT_ID = cid;
+        ETH_TX_REGISTERED = true;
+    }
+    syscall::debug_puts(
+        b"  [proxy_srv] ethernet xmit registered (peer-routed transport ready)\n",
+    );
+}
+
+/// Build a frame at ETH_TX_LOCAL_VA from the supplied inline payload
+/// and send it via NETIF_XMIT to the given peer MAC.  Returns true on
+/// success, false if the eth_srv handshake hasn't completed yet (the
+/// caller is expected to have checked SVCREG_LOOKUP_REMOTE_OK got a
+/// non-zero src_mac before calling this).
+fn eth_send_to_peer(peer_mac: u64, payload: &[u8]) -> bool {
+    unsafe {
+        if !ETH_TX_REGISTERED || ETH_TX_LOCAL_VA == 0 || ETH_PORT == 0 {
+            return false;
+        }
+        // Wire format starts with the same 4-byte magic the TCP
+        // transport uses, so future RX-side code can sniff frames
+        // and validate they're from a Telix proxy.  Keeps the wire
+        // contract uniform across transports.
+        let dst = ETH_TX_LOCAL_VA as *mut u8;
+        let mag = WIRE_MAGIC.to_le_bytes();
+        for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
+        // Version + length, mirroring the TCP wire frame's first 8
+        // bytes.  Version=1 for now; length is the inline payload.
+        core::ptr::write_volatile(dst.add(4), 1u8); // version
+        core::ptr::write_volatile(dst.add(5), 0u8); // reserved
+        let len_le = (payload.len() as u16).to_le_bytes();
+        core::ptr::write_volatile(dst.add(6), len_le[0]);
+        core::ptr::write_volatile(dst.add(7), len_le[1]);
+        // Payload.
+        for i in 0..payload.len() {
+            core::ptr::write_volatile(dst.add(8 + i), payload[i]);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("mfence");
+
+        let frame_len = 8 + payload.len();
+        let _ = syscall::send_nb_4(
+            ETH_PORT,
+            ETH_NETIF_XMIT,
+            frame_len as u64,
+            peer_mac,
+            ETHERTYPE_PROXY,
+            ETH_TX_CLIENT_ID,
+        );
+    }
+    true
 }
 
 fn print_num(n: u64) {
@@ -518,6 +680,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(my_port);
     syscall::debug_puts(b"\n");
 
+    // Bring up the parallel Ethernet-direct transport.  Best-effort —
+    // if eth_srv isn't up yet, ETH_TX_REGISTERED stays false and any
+    // PROXY_SEND_BY_PEER call returns FAIL until eth_srv comes online.
+    try_register_eth_proxy(my_port);
+
     // Bind + listen on LISTEN_TCP_PORT for incoming proxy connections.
     let d1_bind = (LISTEN_TCP_PORT as u64) | ((reply_port) << 32);
     syscall::send(
@@ -568,6 +735,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if msg.tag == PROXY_MARKER_LO && from_port == my_port {
                 // Outbound: kernel-redirected non-local send.
                 srv.handle_outbound(&msg);
+            } else if msg.tag == PROXY_SEND_BY_PEER {
+                // Ethernet-direct transport entry point.  data[0] =
+                // peer MAC (mac_to_u64 encoding), data[1..4] = up to
+                // 24 bytes inline payload (len in low 16 bits of
+                // data[1]).  Reply OK / FAIL back to the caller.
+                let mac = msg.data[0];
+                let len = (msg.data[1] & 0xFFFF) as usize;
+                let mut payload = [0u8; 24];
+                // Bytes 2..8 of data[1] (6 bytes after the 16-bit
+                // length), then full data[2..4].
+                let d1_bytes = msg.data[1].to_le_bytes();
+                for i in 0..6 { payload[i] = d1_bytes[2 + i]; }
+                let d2_bytes = msg.data[2].to_le_bytes();
+                for i in 0..8 { payload[6 + i] = d2_bytes[i]; }
+                let d3_bytes = msg.data[3].to_le_bytes();
+                for i in 0..8 { payload[14 + i] = d3_bytes[i]; }
+                let n = len.min(22);
+                let ok = eth_send_to_peer(mac, &payload[..n]);
+                let tag = if ok { PROXY_SEND_BY_PEER_OK } else { PROXY_SEND_BY_PEER_FAIL };
+                let _ = syscall::reply(tag, 0, 0, 0, 0, 0);
             } else if msg.tag == PROXY_ADD_NODE {
                 srv.handle_add_node(&msg);
             } else if msg.tag == NET_TCP_DATA && from_port == reply_port {
