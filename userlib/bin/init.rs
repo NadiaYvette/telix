@@ -996,11 +996,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"  init: running proxy_srv inject test...\n");
     {
         let mut ok = true;
-        let proxy_port = match syscall::ns_lookup(b"proxy") {
+        // proxy_srv registers AFTER blocking on ns_lookup("net"), so it
+        // can take a moment.  Match Phase 5l's pattern: retry for ~5s.
+        let mut wait = 0u32;
+        let mut found: Option<u64> = None;
+        while wait < 500 {
+            if let Some(p) = syscall::ns_lookup(b"proxy") {
+                found = Some(p);
+                break;
+            }
+            syscall::sleep_ms(10);
+            wait += 1;
+        }
+        let proxy_port = match found {
             Some(p) => p,
             None => {
                 ok = false;
-                syscall::debug_puts(b"  [proxy] ns_lookup failed\n");
+                syscall::debug_puts(b"  [proxy] ns_lookup failed (5s timeout)\n");
                 0
             }
         };
