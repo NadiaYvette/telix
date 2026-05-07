@@ -75,6 +75,23 @@ const PROXY_INBOUND_FRAME: u64 = 0x5022;
 const PROXY_INJECT_FRAME: u64 = 0x5030;
 const PROXY_INJECT_FRAME_OK: u64 = 0x5031;
 
+/// Look up a learned-via-discovery peer by UUID and confirm it's
+/// addressable over TCP.  Step 3/3 of Tier-5 piece C: verifies the
+/// discovery → proxy_srv pipeline plumbed end-to-end so a caller
+/// holding a peer UUID can ask "is this peer reachable over the TCP
+/// transport?" without knowing its endpoint.  Actual frame send
+/// remains via PROXY_SEND_BY_PEER (Ethernet) for now; the real TCP
+/// wire path needs non-blocking connect + per-node send queue, which
+/// is a separate piece.
+///
+/// in:   data[0..2] = peer UUID (LE-packed two u64 words).
+/// out:  PROXY_SEND_BY_UUID_OK with data[0]=node_idx, data[1]=ip_le,
+///       data[2]=port.  PROXY_SEND_BY_UUID_NO_NODE if the UUID is
+///       absent from the node table or has no TCP endpoint.
+const PROXY_SEND_BY_UUID: u64 = 0x5050;
+const PROXY_SEND_BY_UUID_OK: u64 = 0x5051;
+const PROXY_SEND_BY_UUID_NO_NODE: u64 = 0x505E;
+
 /// Trigger a discovery_srv poll: enumerate known peers via
 /// DISCOVERY_LIST_PEERS, then DISCOVERY_GET_PEER each to fetch their
 /// TCP endpoint.  Insert/refresh the corresponding NodeEntry rows so
@@ -1212,6 +1229,27 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let n = srv.learn_from_discovery();
                 let _ = syscall::reply(PROXY_LEARN_FROM_DISCOVERY_OK,
                                        n as u64, 0, 0, 0, 0);
+            } else if msg.tag == PROXY_SEND_BY_UUID {
+                let mut uuid = [0u8; 16];
+                uuid[0..8].copy_from_slice(&msg.data[0].to_le_bytes());
+                uuid[8..16].copy_from_slice(&msg.data[1].to_le_bytes());
+                match srv.find_node_by_uuid(&uuid) {
+                    Some(idx) if srv.nodes[idx].tcp_port != 0 => {
+                        let _ = syscall::reply(
+                            PROXY_SEND_BY_UUID_OK,
+                            idx as u64,
+                            srv.nodes[idx].ip_be32 as u64,
+                            srv.nodes[idx].tcp_port as u64,
+                            0, 0,
+                        );
+                    }
+                    _ => {
+                        let _ = syscall::reply(
+                            PROXY_SEND_BY_UUID_NO_NODE,
+                            0, 0, 0, 0, 0,
+                        );
+                    }
+                }
             } else if msg.tag == NET_TCP_DATA && from_port == reply_port {
                 // Inbound TCP data.
                 let conn_id_guess = 0; // We need to figure out which conn this is for.

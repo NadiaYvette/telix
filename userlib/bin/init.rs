@@ -1529,6 +1529,73 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5r: send-by-UUID routing dispatch (Tier-5 piece C, step 3/3) ---
+    // Phase 5q populated proxy_srv's node table via discovery.  Verify
+    // PROXY_SEND_BY_UUID resolves the same peer UUID back to a node
+    // with the expected TCP endpoint, AND that an unknown UUID gets
+    // PROXY_SEND_BY_UUID_NO_NODE (proves the negative path actually
+    // checks the table rather than always replying OK).
+    syscall::debug_puts(b"  init: running proxy_srv send-by-UUID routing test...\n");
+    {
+        let mut ok = true;
+        let proxy_port = match syscall::ns_lookup(b"proxy") {
+            Some(p) => p,
+            None => { ok = false; syscall::debug_puts(b"  [route] proxy ns_lookup failed\n"); 0 }
+        };
+        // Same UUID Phase 5p injected.
+        let known_uuid: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        const ENDPOINT_IP_LE: u32 = 0x07_2a_a8_c0;
+        const ENDPOINT_PORT: u16 = 5555;
+        if ok {
+            let lo = u64::from_le_bytes([
+                known_uuid[0], known_uuid[1], known_uuid[2], known_uuid[3],
+                known_uuid[4], known_uuid[5], known_uuid[6], known_uuid[7],
+            ]);
+            let hi = u64::from_le_bytes([
+                known_uuid[8], known_uuid[9], known_uuid[10], known_uuid[11],
+                known_uuid[12], known_uuid[13], known_uuid[14], known_uuid[15],
+            ]);
+            match syscall::call(proxy_port, 0x5050, lo, hi, 0, 0) {
+                Some(r) if r.tag == 0x5051 => {
+                    if (r.data[1] as u32) != ENDPOINT_IP_LE
+                        || (r.data[2] as u16) != ENDPOINT_PORT
+                    {
+                        ok = false;
+                        syscall::debug_puts(b"  [route] PROXY_SEND_BY_UUID returned wrong endpoint\n");
+                    }
+                }
+                _ => {
+                    ok = false;
+                    syscall::debug_puts(b"  [route] PROXY_SEND_BY_UUID for known peer failed\n");
+                }
+            }
+        }
+        // Negative case: random UUID should hit NO_NODE (not OK).
+        if ok {
+            match syscall::call(proxy_port, 0x5050,
+                                0xDEAD_C0DE_DEAD_C0DEu64,
+                                0xCAFE_F00D_CAFE_F00Du64, 0, 0) {
+                Some(r) if r.tag == 0x505E => {} // NO_NODE — expected
+                Some(r) if r.tag == 0x5051 => {
+                    ok = false;
+                    syscall::debug_puts(b"  [route] PROXY_SEND_BY_UUID falsely OK for unknown peer\n");
+                }
+                _ => {
+                    ok = false;
+                    syscall::debug_puts(b"  [route] PROXY_SEND_BY_UUID call failed (expected NO_NODE)\n");
+                }
+            }
+        }
+        if ok {
+            syscall::debug_puts(b"Phase 5r proxy_srv send-by-UUID routing: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5r proxy_srv send-by-UUID routing: FAILED\n");
+        }
+    }
+
     // --- Phase 5h: scheduler call/reply stress (deferred-requeue race repro) ---
     // Skipped under FOCUS_H13 because sched_stress occasionally wedges
     // (WEDGED — giving up) without exiting, which deadlocks init's
