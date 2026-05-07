@@ -107,6 +107,14 @@ const PEER_TTL_MS: u64 = 3000;
 /// Minimum announcement payload size: header only, no service UUIDs.
 const ANNOUNCE_HEADER_LEN: usize = 36;
 
+/// Flags bits for the 16-bit flags field at offset 6.  HAS_TCP4_ENDPOINT
+/// signals that 6 bytes (4-byte IPv4 + 2-byte port, both LE) are appended
+/// after the service-UUID array.  Receivers that don't recognise the
+/// flag treat the trailing bytes as padding and ignore them.
+const FLAG_HAS_TCP4_ENDPOINT: u16 = 0x0001;
+/// Trailer length when FLAG_HAS_TCP4_ENDPOINT is set.
+const TCP4_ENDPOINT_LEN: usize = 6;
+
 // ---------------------------------------------------------------------------
 // eth_srv interface (matches eth_srv NETIF protocol).
 // ---------------------------------------------------------------------------
@@ -193,6 +201,14 @@ struct PeerEntry {
     /// servicereg_srv's UUID space).  Populated from announcement.
     service_uuids: [[u8; 16]; MAX_PEER_SERVICES],
     service_count: u8,
+    /// IPv4 endpoint advertised by the peer (host byte order u32, with
+    /// port).  `has_endpoint` gates validity — peers may broadcast over
+    /// pure-Ethernet without TCP and skip the endpoint trailer.  When
+    /// the peer reannounces without the trailer we clear has_endpoint
+    /// (most-recent announcement wins, matches src_mac semantics).
+    tcp_ip: u32,
+    tcp_port: u16,
+    has_endpoint: bool,
 }
 
 impl PeerEntry {
@@ -204,6 +220,9 @@ impl PeerEntry {
             src_mac: 0,
             service_uuids: [[0; 16]; MAX_PEER_SERVICES],
             service_count: 0,
+            tcp_ip: 0,
+            tcp_port: 0,
+            has_endpoint: false,
         }
     }
 }
@@ -289,10 +308,12 @@ fn parse_announcement_from(buf_va: usize, payload_len: usize, src_mac: u64) {
         FRAMES_RECEIVED_COUNT += 1;
         if buf_va == 0 {
             FRAMES_REJECTED_COUNT += 1;
+            syscall::debug_puts(b"  [disc-parse] reject: buf_va==0\n");
             return;
         }
         if payload_len < ANNOUNCE_HEADER_LEN {
             FRAMES_REJECTED_COUNT += 1;
+            syscall::debug_puts(b"  [disc-parse] reject: short payload\n");
             return;
         }
         let buf = buf_va as *const u8;
@@ -302,6 +323,9 @@ fn parse_announcement_from(buf_va: usize, payload_len: usize, src_mac: u64) {
         let magic = u32::from_le_bytes(magic_bytes);
         if magic != DISCOVERY_MAGIC {
             FRAMES_REJECTED_COUNT += 1;
+            syscall::debug_puts(b"  [disc-parse] reject: bad magic 0x");
+            print_hex32(magic);
+            syscall::debug_puts(b"\n");
             return;
         }
         let mut ver_bytes = [0u8; 2];
@@ -312,9 +336,13 @@ fn parse_announcement_from(buf_va: usize, payload_len: usize, src_mac: u64) {
             // Older sender than us; we'd be missing fields they don't
             // have.  Reject rather than misparse.
             FRAMES_REJECTED_COUNT += 1;
+            syscall::debug_puts(b"  [disc-parse] reject: old version\n");
             return;
         }
-        // Skip flags (offset 6, 2 bytes).
+        let mut flags_bytes = [0u8; 2];
+        flags_bytes[0] = core::ptr::read_volatile(buf.add(6));
+        flags_bytes[1] = core::ptr::read_volatile(buf.add(7));
+        let flags = u16::from_le_bytes(flags_bytes);
         // node_uuid at offset 8.
         let mut uuid = [0u8; 16];
         for i in 0..16 { uuid[i] = core::ptr::read_volatile(buf.add(8 + i)); }
@@ -324,6 +352,9 @@ fn parse_announcement_from(buf_va: usize, payload_len: usize, src_mac: u64) {
         if uuid == LOCAL_UUID {
             return;
         }
+        syscall::debug_puts(b"  [disc-parse] accept uuid[0..4]=0x");
+        print_hex32(u32::from_le_bytes([uuid[0], uuid[1], uuid[2], uuid[3]]));
+        syscall::debug_puts(b"\n");
         // Skip timestamp_ns (offset 24, 8 bytes) — not currently consumed.
         let manifest_count = core::ptr::read_volatile(buf.add(32)) as usize;
         // Bound manifest_count to what fits in the rest of the payload
@@ -362,6 +393,7 @@ fn parse_announcement_from(buf_va: usize, payload_len: usize, src_mac: u64) {
                     }
                     None => {
                         FRAMES_REJECTED_COUNT += 1;
+                        syscall::debug_puts(b"  [disc-parse] reject: PEERS full\n");
                         return;
                     }
                 }
@@ -383,6 +415,27 @@ fn parse_announcement_from(buf_va: usize, payload_len: usize, src_mac: u64) {
                 PEERS[idx].service_uuids[s][b] =
                     core::ptr::read_volatile(buf.add(36 + s * 16 + b));
             }
+        }
+        // Optional tcp4_endpoint trailer (Tier-5 piece C).  Sits at
+        // offset 36 + 16*svc_count when FLAG_HAS_TCP4_ENDPOINT is set.
+        // We treat absence as "clear" — a peer dropping its TCP
+        // endpoint reannounces without the flag.
+        let endpoint_off = 36 + svc_count * 16;
+        if (flags & FLAG_HAS_TCP4_ENDPOINT) != 0
+            && payload_len >= endpoint_off + TCP4_ENDPOINT_LEN
+        {
+            let mut ip_b = [0u8; 4];
+            for i in 0..4 { ip_b[i] = core::ptr::read_volatile(buf.add(endpoint_off + i)); }
+            let mut port_b = [0u8; 2];
+            port_b[0] = core::ptr::read_volatile(buf.add(endpoint_off + 4));
+            port_b[1] = core::ptr::read_volatile(buf.add(endpoint_off + 5));
+            PEERS[idx].tcp_ip = u32::from_le_bytes(ip_b);
+            PEERS[idx].tcp_port = u16::from_le_bytes(port_b);
+            PEERS[idx].has_endpoint = true;
+        } else {
+            PEERS[idx].has_endpoint = false;
+            PEERS[idx].tcp_ip = 0;
+            PEERS[idx].tcp_port = 0;
         }
     }
 }
@@ -464,6 +517,13 @@ fn print_hex_byte(b: u8) {
     let hex = b"0123456789abcdef";
     syscall::debug_putchar(hex[(b >> 4) as usize]);
     syscall::debug_putchar(hex[(b & 0xF) as usize]);
+}
+
+fn print_hex32(v: u32) {
+    print_hex_byte((v >> 24) as u8);
+    print_hex_byte((v >> 16) as u8);
+    print_hex_byte((v >> 8) as u8);
+    print_hex_byte(v as u8);
 }
 
 fn print_uuid(u: &[u8; 16]) {
@@ -868,21 +928,35 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                 }
                 match hit {
                     Some(i) => {
-                        let (lo, hi, ts, mac) = unsafe {
+                        let (lo, hi, ts, mac, endpoint) = unsafe {
                             let mut lo_b = [0u8; 8];
                             let mut hi_b = [0u8; 8];
                             lo_b.copy_from_slice(&PEERS[i].uuid[0..8]);
                             hi_b.copy_from_slice(&PEERS[i].uuid[8..16]);
+                            // data[4] layout (Tier-5 piece C):
+                            //   bits  0..32: tcp_ip (LE u32)
+                            //   bits 32..48: tcp_port (LE u16)
+                            //   bit  48:     has_endpoint flag (1 = valid)
+                            // Zero when has_endpoint is false; receivers
+                            // that ignore data[4] still get a sane reply.
+                            let endpoint = if PEERS[i].has_endpoint {
+                                (1u64 << 48)
+                                    | ((PEERS[i].tcp_port as u64) << 32)
+                                    | (PEERS[i].tcp_ip as u64)
+                            } else {
+                                0
+                            };
                             (
                                 u64::from_le_bytes(lo_b),
                                 u64::from_le_bytes(hi_b),
                                 PEERS[i].last_seen_ns,
                                 PEERS[i].src_mac,
+                                endpoint,
                             )
                         };
                         let _ = syscall::reply(
                             DISCOVERY_LOOKUP_SERVICE_OK,
-                            lo, hi, ts, mac, 0,
+                            lo, hi, ts, mac, endpoint,
                         );
                     }
                     None => {

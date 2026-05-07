@@ -311,12 +311,13 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                 match syscall::call(disc_port, DISCOVERY_LOOKUP_SERVICE,
                                     msg.data[0], msg.data[1], 0, 0) {
                     Some(r) if r.tag == DISCOVERY_LOOKUP_SERVICE_OK => {
-                        // Forward all four useful words: peer UUID lo/hi,
-                        // last_seen_ns, src_mac.  See discovery_srv's
-                        // DISCOVERY_LOOKUP_SERVICE_OK doc for layout.
+                        // Forward all five useful words: peer UUID lo/hi,
+                        // last_seen_ns, src_mac, packed tcp4_endpoint.
+                        // See discovery_srv's DISCOVERY_LOOKUP_SERVICE_OK
+                        // doc for the data[4] layout.
                         let _ = syscall::reply(
                             SVCREG_LOOKUP_REMOTE_OK,
-                            r.data[0], r.data[1], r.data[2], r.data[3], 0,
+                            r.data[0], r.data[1], r.data[2], r.data[3], r.data[4],
                         );
                     }
                     _ => {

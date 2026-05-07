@@ -1362,6 +1362,134 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5p: discovery tcp4_endpoint round-trip (Tier-5 piece C) ---
+    // Inject an announcement carrying the FLAG_HAS_TCP4_ENDPOINT trailer
+    // (4-byte IP + 2-byte port), then issue SVCREG_LOOKUP_REMOTE for the
+    // service UUID and verify the endpoint round-trips through
+    // discovery_srv → servicereg → caller via data[4]'s packed layout.
+    syscall::debug_puts(b"  init: running discovery tcp4_endpoint round-trip test...\n");
+    {
+        let mut ok = true;
+
+        // Synthetic identities — distinct from Phase 5o's so the two
+        // tests don't collide in the PEERS table.
+        let peer_uuid: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let svc_uuid: [u8; 16] = [
+            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+            0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+        ];
+        // 192.168.42.7:5555 — recognisable test endpoint.  IP packed LE
+        // so byte 0=192, byte 1=168, byte 2=42, byte 3=7 → u32 LE.
+        const ENDPOINT_IP_LE: u32 = 0x07_2a_a8_c0; // 192.168.42.7 LE bytes
+        const ENDPOINT_PORT: u16 = 5555;
+
+        let disc_port = match syscall::ns_lookup(b"discovery") {
+            Some(p) => p,
+            None => { ok = false; syscall::debug_puts(b"  [endp] discovery ns_lookup failed\n"); 0 }
+        };
+        let svcreg_port = match syscall::ns_lookup(b"servicereg") {
+            Some(p) => p,
+            None => { ok = false; syscall::debug_puts(b"  [endp] servicereg ns_lookup failed\n"); 0 }
+        };
+
+        // Step 1: inject announcement w/ FLAG_HAS_TCP4_ENDPOINT.
+        if ok {
+            let inj_local = match syscall::mmap_anon(0, 1, 1) {
+                Some(va) => {
+                    unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); }
+                    va
+                }
+                None => { ok = false; 0 }
+            };
+            if ok {
+                unsafe {
+                    let dst = inj_local as *mut u8;
+                    let mag = 0x44584C54u32.to_le_bytes(); // "TLXD"
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
+                    let v = 1u16.to_le_bytes();
+                    core::ptr::write_volatile(dst.add(4), v[0]);
+                    core::ptr::write_volatile(dst.add(5), v[1]);
+                    // flags = FLAG_HAS_TCP4_ENDPOINT (0x0001)
+                    core::ptr::write_volatile(dst.add(6), 0x01u8);
+                    core::ptr::write_volatile(dst.add(7), 0x00u8);
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(8 + i), peer_uuid[i]); }
+                    let ts = syscall::clock_gettime().to_le_bytes();
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(24 + i), ts[i]); }
+                    core::ptr::write_volatile(dst.add(32), 1u8); // manifest_count=1
+                    for i in 0..3 { core::ptr::write_volatile(dst.add(33 + i), 0u8); }
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(36 + i), svc_uuid[i]); }
+                    // Endpoint trailer at offset 36 + 16 = 52.
+                    let ip_b = ENDPOINT_IP_LE.to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(52 + i), ip_b[i]); }
+                    let port_b = ENDPOINT_PORT.to_le_bytes();
+                    core::ptr::write_volatile(dst.add(56), port_b[0]);
+                    core::ptr::write_volatile(dst.add(57), port_b[1]);
+                }
+                const INJ_GRANT: usize = 0xC_0002_0000;
+                if !syscall::grant_pages(disc_port, inj_local, INJ_GRANT, 1, false) {
+                    ok = false;
+                    syscall::debug_puts(b"  [endp] grant inj-to-disc failed\n");
+                }
+                if ok {
+                    // payload_len = header(36) + 1 service(16) + endpoint(6) = 58
+                    match syscall::call(disc_port, 0x4D07,
+                                        INJ_GRANT as u64, 58,
+                                        0, 0) {
+                        Some(r) if r.tag == 0x4D08 => {}
+                        _ => {
+                            ok = false;
+                            syscall::debug_puts(b"  [endp] inject discovery frame failed\n");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 2: SVCREG_LOOKUP_REMOTE returns endpoint in data[4].
+        if ok {
+            let svc_lo = u64::from_le_bytes([
+                svc_uuid[0], svc_uuid[1], svc_uuid[2], svc_uuid[3],
+                svc_uuid[4], svc_uuid[5], svc_uuid[6], svc_uuid[7],
+            ]);
+            let svc_hi = u64::from_le_bytes([
+                svc_uuid[8], svc_uuid[9], svc_uuid[10], svc_uuid[11],
+                svc_uuid[12], svc_uuid[13], svc_uuid[14], svc_uuid[15],
+            ]);
+            match syscall::call(svcreg_port, 0x7E24, svc_lo, svc_hi, 0, 0) {
+                Some(r) if r.tag == 0x7E25 => {
+                    let endpoint = r.data[4];
+                    let present = (endpoint >> 48) & 1 != 0;
+                    let port = ((endpoint >> 32) & 0xFFFF) as u16;
+                    let ip = (endpoint & 0xFFFF_FFFF) as u32;
+                    if !present {
+                        ok = false;
+                        syscall::debug_puts(b"  [endp] data[4] has_endpoint=0\n");
+                    } else if ip != ENDPOINT_IP_LE || port != ENDPOINT_PORT {
+                        ok = false;
+                        syscall::debug_puts(b"  [endp] endpoint mismatch (got ip_le=");
+                        print_num(ip as u64);
+                        syscall::debug_puts(b" port=");
+                        print_num(port as u64);
+                        syscall::debug_puts(b")\n");
+                    }
+                }
+                _ => {
+                    ok = false;
+                    syscall::debug_puts(b"  [endp] SVCREG_LOOKUP_REMOTE call failed\n");
+                }
+            }
+        }
+
+        if ok {
+            syscall::debug_puts(b"Phase 5p discovery tcp4_endpoint round-trip: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5p discovery tcp4_endpoint round-trip: FAILED\n");
+        }
+    }
+
     // --- Phase 5h: scheduler call/reply stress (deferred-requeue race repro) ---
     // Skipped under FOCUS_H13 because sched_stress occasionally wedges
     // (WEDGED — giving up) without exiting, which deadlocks init's
