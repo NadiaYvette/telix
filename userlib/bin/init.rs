@@ -987,6 +987,119 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5n: proxy_srv inbound RX path via PROXY_INJECT_FRAME ---
+    // Mirrors Phase 5m's pattern: build a fake proxy frame in our
+    // aspace, grant it to proxy_srv, subscribe a port for inbound
+    // notifications, inject the frame, expect the subscribe-port to
+    // receive PROXY_INBOUND_FRAME with our payload.  Verifies the RX
+    // demux end-to-end without needing eth_srv loopback.
+    syscall::debug_puts(b"  init: running proxy_srv inject test...\n");
+    {
+        let mut ok = true;
+        let proxy_port = match syscall::ns_lookup(b"proxy") {
+            Some(p) => p,
+            None => {
+                ok = false;
+                syscall::debug_puts(b"  [proxy] ns_lookup failed\n");
+                0
+            }
+        };
+        let sub_port = if ok { syscall::port_create() } else { u64::MAX };
+        if sub_port == u64::MAX { ok = false; }
+
+        if ok {
+            // Subscribe.
+            match syscall::call(proxy_port, 0x5020, sub_port, 0, 0, 0) {
+                Some(r) if r.tag == 0x5021 => {}
+                _ => {
+                    ok = false;
+                    syscall::debug_puts(b"  [proxy] SUBSCRIBE_INBOUND failed\n");
+                }
+            }
+        }
+
+        if ok {
+            // Build a fake proxy frame: WIRE_MAGIC "TLXP" + version 1 +
+            // 4-byte payload "PING".
+            let inject_local = match syscall::mmap_anon(0, 1, 1) {
+                Some(va) => va,
+                None => {
+                    ok = false;
+                    syscall::debug_puts(b"  [proxy] inject mmap failed\n");
+                    0
+                }
+            };
+            if ok {
+                unsafe {
+                    let dst = inject_local as *mut u8;
+                    core::ptr::write_volatile(dst, 0u8);
+                    // magic "TLXP"
+                    let mag = 0x544C5850u32.to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
+                    // version=1, reserved=0, len=4 LE
+                    core::ptr::write_volatile(dst.add(4), 1u8);
+                    core::ptr::write_volatile(dst.add(5), 0u8);
+                    core::ptr::write_volatile(dst.add(6), 4u8);
+                    core::ptr::write_volatile(dst.add(7), 0u8);
+                    // payload "PING"
+                    core::ptr::write_volatile(dst.add(8), b'P');
+                    core::ptr::write_volatile(dst.add(9), b'I');
+                    core::ptr::write_volatile(dst.add(10), b'N');
+                    core::ptr::write_volatile(dst.add(11), b'G');
+                }
+                const INJECT_GRANT_VA: usize = 0xB_0000_0000;
+                if !syscall::grant_pages(proxy_port, inject_local, INJECT_GRANT_VA, 1, false) {
+                    ok = false;
+                    syscall::debug_puts(b"  [proxy] grant_pages inject failed\n");
+                }
+                if ok {
+                    // Inject (8-byte header + 4-byte payload = 12).
+                    match syscall::call(proxy_port, 0x5030,
+                                        INJECT_GRANT_VA as u64, 12, 0, 0) {
+                        Some(r) if r.tag == 0x5031 => {}
+                        _ => {
+                            ok = false;
+                            syscall::debug_puts(b"  [proxy] INJECT_FRAME failed\n");
+                        }
+                    }
+                }
+                if ok {
+                    // Wait briefly for the inbound notification.
+                    let mut got = false;
+                    for _ in 0..100 {
+                        if let Some(m) = syscall::recv_msg_timeout(sub_port, 10_000_000) {
+                            if m.tag == 0x5022 {
+                                // data[0] low 16 bits = inner_len, must be 4.
+                                let len = m.data[0] & 0xFFFF;
+                                if len != 4 {
+                                    syscall::debug_puts(b"  [proxy] inbound len wrong\n");
+                                } else {
+                                    // bytes 2..6 of data[0] = first 6 bytes of payload.
+                                    let d0 = m.data[0].to_le_bytes();
+                                    if d0[2] == b'P' && d0[3] == b'I'
+                                        && d0[4] == b'N' && d0[5] == b'G' {
+                                        got = true;
+                                    } else {
+                                        syscall::debug_puts(b"  [proxy] inbound payload wrong\n");
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if !got {
+                        ok = false;
+                    }
+                }
+            }
+        }
+        if ok {
+            syscall::debug_puts(b"Phase 5n proxy_srv inject + inbound: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5n proxy_srv inject + inbound: FAILED\n");
+        }
+    }
+
     // --- Phase 5h: scheduler call/reply stress (deferred-requeue race repro) ---
     // Skipped under FOCUS_H13 because sched_stress occasionally wedges
     // (WEDGED — giving up) without exiting, which deadlocks init's

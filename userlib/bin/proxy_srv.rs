@@ -34,6 +34,27 @@ const PROXY_SEND_BY_PEER: u64 = 0x5010;
 const PROXY_SEND_BY_PEER_OK: u64 = 0x5011;
 const PROXY_SEND_BY_PEER_FAIL: u64 = 0x501F;
 
+/// Subscribe a port to receive demuxed inbound proxy frames (RX side).
+/// Caller passes its receiving port in data[0]; on each successful
+/// inbound frame validation, proxy_srv send_nb's PROXY_INBOUND_FRAME
+/// (0x5021) to that port with the frame's payload (up to 24 inline
+/// bytes for now, mirroring the TX path).
+///
+/// One subscriber per proxy_srv instance for the first cut; a per-
+/// service-UUID demux happens in the future when the trait + auth
+/// pieces land.
+const PROXY_SUBSCRIBE_INBOUND: u64 = 0x5020;
+const PROXY_SUBSCRIBE_INBOUND_OK: u64 = 0x5021;
+const PROXY_INBOUND_FRAME: u64 = 0x5022;
+
+/// Test-only inject path, mirroring discovery_srv's
+/// DISCOVERY_INJECT_FRAME.  Lets a single-instance test exercise the
+/// receive path without needing eth_srv loopback (which QEMU user-mode
+/// networking doesn't provide).  Caller grants a page at data[0],
+/// sends payload_len in data[1], synthetic src_mac in data[2].
+const PROXY_INJECT_FRAME: u64 = 0x5030;
+const PROXY_INJECT_FRAME_OK: u64 = 0x5031;
+
 // Eth_srv NETIF protocol — must match userlib/bin/eth_srv.rs.  Inlined
 // here so this binary doesn't take a userlib dependency on eth_srv's
 // header constants.  Note: NETIF_REGISTER's wire value (0x5000) is the
@@ -154,8 +175,15 @@ struct ProxySrv {
 
 static mut ETH_PORT: u64 = 0;
 static mut ETH_TX_LOCAL_VA: usize = 0;
+static mut ETH_RX_LOCAL_VA: usize = 0;
 static mut ETH_TX_CLIENT_ID: u64 = 0;
 static mut ETH_TX_REGISTERED: bool = false;
+/// Currently-registered subscriber port for demuxed inbound frames.
+/// Single-subscriber model for the first cut.  0 means no subscriber
+/// (frames are validated and counted but not forwarded).
+static mut INBOUND_SUBSCRIBER_PORT: u64 = 0;
+static mut INBOUND_FRAMES_RECEIVED: u64 = 0;
+static mut INBOUND_FRAMES_REJECTED: u64 = 0;
 
 /// Best-effort registration with eth_srv for ETHERTYPE_PROXY on the TX
 /// side.  Same shape as discovery_srv::try_register_eth_tx — alloc an
@@ -179,7 +207,17 @@ fn try_register_eth_proxy(my_port: u64) {
             return;
         }
     };
-    unsafe { core::ptr::write_volatile(local_tx as *mut u8, 0u8); }
+    let local_rx = match syscall::mmap_anon(0, 1, 1) {
+        Some(va) => va,
+        None => {
+            syscall::debug_puts(b"  [proxy_srv] mmap_anon for eth rx failed\n");
+            return;
+        }
+    };
+    unsafe {
+        core::ptr::write_volatile(local_tx as *mut u8, 0u8);
+        core::ptr::write_volatile(local_rx as *mut u8, 0u8);
+    }
 
     let reply_port = syscall::port_create();
     if reply_port == u64::MAX {
@@ -195,7 +233,7 @@ fn try_register_eth_proxy(my_port: u64) {
         0,
     );
     let resp = syscall::recv_msg_timeout(reply_port, 2_000_000);
-    let (cid, _eth_rx_va, eth_tx_va) = match resp {
+    let (cid, eth_rx_va, eth_tx_va) = match resp {
         Some(m) if m.tag == ETH_NETIF_REGISTER_OK => {
             (m.data[0], m.data[1] as usize, m.data[2] as usize)
         }
@@ -208,14 +246,98 @@ fn try_register_eth_proxy(my_port: u64) {
         syscall::debug_puts(b"  [proxy_srv] grant_pages eth tx failed\n");
         return;
     }
+    if !syscall::grant_pages(eth_port, local_rx, eth_rx_va, 1, false) {
+        syscall::debug_puts(b"  [proxy_srv] grant_pages eth rx failed\n");
+        return;
+    }
     unsafe {
         ETH_TX_LOCAL_VA = local_tx;
+        ETH_RX_LOCAL_VA = local_rx;
         ETH_TX_CLIENT_ID = cid;
         ETH_TX_REGISTERED = true;
     }
     syscall::debug_puts(
-        b"  [proxy_srv] ethernet xmit registered (peer-routed transport ready)\n",
+        b"  [proxy_srv] ethernet xmit+rx registered (peer-routed transport ready)\n",
     );
+}
+
+/// Parse an inbound proxy frame at `buf_va` (in our aspace) and, if
+/// valid, forward to the registered subscriber.  Shared by the real
+/// receive path (handle_eth_inbound) and the test-only inject path
+/// (PROXY_INJECT_FRAME) so they can't drift on header layout / magic.
+fn parse_proxy_frame_from(buf_va: usize, payload_len: usize, _src_mac: u64) {
+    unsafe {
+        INBOUND_FRAMES_RECEIVED += 1;
+        if buf_va == 0 || payload_len < 8 {
+            INBOUND_FRAMES_REJECTED += 1;
+            return;
+        }
+        let buf = buf_va as *const u8;
+        // Validate magic (first 4 bytes).
+        let mut mag_bytes = [0u8; 4];
+        for i in 0..4 { mag_bytes[i] = core::ptr::read_volatile(buf.add(i)); }
+        if u32::from_le_bytes(mag_bytes) != WIRE_MAGIC {
+            INBOUND_FRAMES_REJECTED += 1;
+            return;
+        }
+        // version + reserved + len
+        let version = core::ptr::read_volatile(buf.add(4));
+        if version != 1 {
+            INBOUND_FRAMES_REJECTED += 1;
+            return;
+        }
+        let len_lo = core::ptr::read_volatile(buf.add(6));
+        let len_hi = core::ptr::read_volatile(buf.add(7));
+        let inner_len = (len_lo as usize) | ((len_hi as usize) << 8);
+        // inner_len must fit within the frame payload.
+        if 8 + inner_len > payload_len {
+            INBOUND_FRAMES_REJECTED += 1;
+            return;
+        }
+        if INBOUND_SUBSCRIBER_PORT == 0 {
+            return; // counted as received, no subscriber to forward to
+        }
+        // Pack up to 24 inline bytes into the notification (data[0..3]
+        // = bytes 0..24).  Larger payloads need the grant-based path
+        // — follow-up commit.
+        let n = inner_len.min(24);
+        let mut bytes = [0u8; 24];
+        for i in 0..n {
+            bytes[i] = core::ptr::read_volatile(buf.add(8 + i));
+        }
+        // Pack length in low 16 bits of data[0], then 6 bytes of
+        // payload after; data[1..3] take the remaining 16 bytes.
+        let mut d0_bytes = [0u8; 8];
+        d0_bytes[0] = (n & 0xff) as u8;
+        d0_bytes[1] = ((n >> 8) & 0xff) as u8;
+        for i in 0..6 { d0_bytes[2 + i] = bytes[i]; }
+        let d0 = u64::from_le_bytes(d0_bytes);
+        let mut d1_bytes = [0u8; 8];
+        for i in 0..8 { d1_bytes[i] = bytes[6 + i]; }
+        let d1 = u64::from_le_bytes(d1_bytes);
+        let mut d2_bytes = [0u8; 8];
+        for i in 0..8 { d2_bytes[i] = bytes[14 + i]; }
+        let d2 = u64::from_le_bytes(d2_bytes);
+        let _ = syscall::send_nb_4(
+            INBOUND_SUBSCRIBER_PORT,
+            PROXY_INBOUND_FRAME,
+            d0, d1, d2, 0,
+        );
+    }
+}
+
+/// Handle a NETIF_INPUT notification from eth_srv.  data[0] =
+/// payload_len, data[1] = src_mac.  Shared parser keeps the real and
+/// inject paths consistent.
+fn handle_eth_inbound(payload_len: usize, src_mac: u64) {
+    unsafe {
+        if ETH_RX_LOCAL_VA == 0 {
+            INBOUND_FRAMES_RECEIVED += 1;
+            INBOUND_FRAMES_REJECTED += 1;
+            return;
+        }
+    }
+    parse_proxy_frame_from(unsafe { ETH_RX_LOCAL_VA }, payload_len, src_mac);
 }
 
 /// Build a frame at ETH_TX_LOCAL_VA from the supplied inline payload
@@ -735,6 +857,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             if msg.tag == PROXY_MARKER_LO && from_port == my_port {
                 // Outbound: kernel-redirected non-local send.
                 srv.handle_outbound(&msg);
+            } else if msg.tag == ETH_NETIF_INPUT {
+                // eth_srv delivered an ETHERTYPE_PROXY frame.
+                // data[0] = payload_len, data[1] = src_mac.
+                handle_eth_inbound(msg.data[0] as usize, msg.data[1]);
+            } else if msg.tag == PROXY_SUBSCRIBE_INBOUND {
+                let port = msg.data[0];
+                unsafe { INBOUND_SUBSCRIBER_PORT = port; }
+                let _ = syscall::reply(PROXY_SUBSCRIBE_INBOUND_OK, 0, 0, 0, 0, 0);
+            } else if msg.tag == PROXY_INJECT_FRAME {
+                // Test-only path mirroring discovery_srv's
+                // DISCOVERY_INJECT_FRAME.  Caller has granted a page
+                // at data[0]; parse via the same code path as a real
+                // NETIF_INPUT frame.
+                let buf_va = msg.data[0] as usize;
+                let payload_len = msg.data[1] as usize;
+                let src_mac = msg.data[2];
+                parse_proxy_frame_from(buf_va, payload_len, src_mac);
+                let _ = syscall::reply(PROXY_INJECT_FRAME_OK, 0, 0, 0, 0, 0);
             } else if msg.tag == PROXY_SEND_BY_PEER {
                 // Ethernet-direct transport entry point.  data[0] =
                 // peer MAC (mac_to_u64 encoding), data[1..4] = up to
