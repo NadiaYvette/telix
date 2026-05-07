@@ -177,27 +177,113 @@ struct ProxySrv {
 }
 
 // ---------------------------------------------------------------------------
-// Ethernet-direct transport (Tier 5 first synthesis-path piece).
+// Transport abstraction.
 //
-// Parallel to the existing TCP transport.  Uses eth_srv NETIF_XMIT to
-// frame proxy payloads as raw Ethernet frames with ETHERTYPE_PROXY,
-// addressed by the destination peer's MAC (resolved upstream via
-// SVCREG_LOOKUP_REMOTE_OK from discovery_srv).
+// proxy_srv supports multiple transports (today: Ethernet-direct;
+// near-term follow-ups: TCP under this same trait, eventually TLS/
+// BLE-PAN).  PeerAddr is the union of address types each transport
+// expects; Transport is the dispatch enum the main loop calls into.
+// Per-call selection today comes from the IPC tag (PROXY_SEND_BY_PEER
+// implies "use Ethernet").  Future per-node config will let
+// SVCREG_LOOKUP_REMOTE pick the right transport for each peer.
 //
-// Worklist (near-term, separate commits):
-// - Refactor existing TCP code under a `Transport` trait so this and
-//   TCP both implement the same dispatch surface
-// - RX side: register for ETHERTYPE_PROXY inbound, deliver to a
-//   subscriber port
-// - Larger payloads via grant page rather than 24-byte inline
-// - Reassembly when payload > MTU
+// Worklist (next commits):
+// - Migrate existing TCP code (handle_outbound/handle_inbound_data/
+//   handle_accept) into Transport::Tcp variant
+// - Reassembly when body > MTU
+// - Pre-shared-key auth as a transport-agnostic middleware
 // ---------------------------------------------------------------------------
 
-static mut ETH_PORT: u64 = 0;
-static mut ETH_TX_LOCAL_VA: usize = 0;
-static mut ETH_RX_LOCAL_VA: usize = 0;
-static mut ETH_TX_CLIENT_ID: u64 = 0;
-static mut ETH_TX_REGISTERED: bool = false;
+#[allow(dead_code)] // Tcp4 variant is staged for the next commit
+enum PeerAddr {
+    /// L2 Ethernet address (mac_to_u64 encoding).  Resolved from
+    /// SVCREG_LOOKUP_REMOTE_OK.data[3].
+    Ethernet { mac: u64 },
+    /// IPv4+TCP — used by the existing TCP transport once it migrates
+    /// under the trait.  Currently the TCP path doesn't go through
+    /// Transport so this variant is unconstructed.
+    Tcp4 { ip: u32, port: u16 },
+}
+
+/// Ethernet transport state — what was a flock of static muts before
+/// the trait refactor, now owned by a single struct so multiple
+/// instances (e.g. for testing, or for separate ethertypes) can be
+/// instantiated independently.
+struct EthernetTransport {
+    eth_port: u64,
+    tx_local_va: usize,
+    rx_local_va: usize,
+    tx_client_id: u64,
+    registered: bool,
+}
+
+impl EthernetTransport {
+    const fn new() -> Self {
+        Self {
+            eth_port: 0,
+            tx_local_va: 0,
+            rx_local_va: 0,
+            tx_client_id: 0,
+            registered: false,
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.registered
+    }
+
+    fn rx_local_va(&self) -> usize {
+        self.rx_local_va
+    }
+}
+
+/// Dispatch enum.  Add variants for new transports; the main loop
+/// uses `Transport::send`, `Transport::ready`, and (for inbound)
+/// `Transport::rx_local_va`.
+#[allow(dead_code)] // Tcp variant is staged for the next commit
+enum Transport {
+    Ethernet(EthernetTransport),
+    /// TODO: migrate existing handle_outbound/handle_inbound_data/
+    /// handle_accept into a TcpTransport that constructs into this
+    /// variant.  Tracked as next clustering worklist item.
+    Tcp,
+}
+
+impl Transport {
+    /// Send a fully-formed proxy body (40-byte routing header +
+    /// payload) to the peer.  Returns true on successful submission.
+    fn send(&self, peer: &PeerAddr, body: &[u8]) -> bool {
+        match self {
+            Transport::Ethernet(eth) => match peer {
+                PeerAddr::Ethernet { mac } => eth_send_to_peer(eth, *mac, body),
+                _ => false, // wrong peer addr type for this transport
+            },
+            Transport::Tcp => false, // not yet under the trait
+        }
+    }
+
+    fn ready(&self) -> bool {
+        match self {
+            Transport::Ethernet(e) => e.ready(),
+            Transport::Tcp => false,
+        }
+    }
+
+    /// Returns the local VA where inbound frames land for this
+    /// transport, or 0 if the transport isn't ready / has no inbound
+    /// path.
+    fn rx_local_va(&self) -> usize {
+        match self {
+            Transport::Ethernet(e) => e.rx_local_va(),
+            Transport::Tcp => 0,
+        }
+    }
+}
+
+/// Single global transport handle.  Future revisions may have
+/// multiple (one per network or transport class) and dispatch by
+/// per-node config; for now there's exactly one Ethernet transport.
+static mut TRANSPORT: Transport = Transport::Ethernet(EthernetTransport::new());
 /// Per-UUID subscriber registration.
 #[derive(Copy, Clone)]
 struct InboundSubscriber {
@@ -221,9 +307,9 @@ static mut INBOUND_FRAMES_NO_SUB: u64 = 0;
 
 /// Best-effort registration with eth_srv for ETHERTYPE_PROXY on the TX
 /// side.  Same shape as discovery_srv::try_register_eth_tx — alloc an
-/// anon page, pre-fault it, NETIF_REGISTER, grant the page in.  RX
-/// side comes in a follow-up.
-fn try_register_eth_proxy(my_port: u64) {
+/// anon page, pre-fault it, NETIF_REGISTER, grant the page in.  Also
+/// allocates an RX page so eth_srv can deliver inbound proxy frames.
+fn try_register_eth_proxy(eth: &mut EthernetTransport, my_port: u64) {
     let eth_port = match syscall::ns_lookup(b"eth") {
         Some(p) => p,
         None => {
@@ -233,7 +319,7 @@ fn try_register_eth_proxy(my_port: u64) {
             return;
         }
     };
-    unsafe { ETH_PORT = eth_port; }
+    eth.eth_port = eth_port;
     let local_tx = match syscall::mmap_anon(0, 1, 1) {
         Some(va) => va,
         None => {
@@ -284,12 +370,10 @@ fn try_register_eth_proxy(my_port: u64) {
         syscall::debug_puts(b"  [proxy_srv] grant_pages eth rx failed\n");
         return;
     }
-    unsafe {
-        ETH_TX_LOCAL_VA = local_tx;
-        ETH_RX_LOCAL_VA = local_rx;
-        ETH_TX_CLIENT_ID = cid;
-        ETH_TX_REGISTERED = true;
-    }
+    eth.tx_local_va = local_tx;
+    eth.rx_local_va = local_rx;
+    eth.tx_client_id = cid;
+    eth.registered = true;
     syscall::debug_puts(
         b"  [proxy_srv] ethernet xmit+rx registered (peer-routed transport ready)\n",
     );
@@ -370,32 +454,36 @@ fn parse_proxy_frame_from(buf_va: usize, frame_len: usize, src_mac: u64) {
 /// payload_len, data[1] = src_mac.  Shared parser keeps the real and
 /// inject paths consistent.
 fn handle_eth_inbound(payload_len: usize, src_mac: u64) {
-    unsafe {
-        if ETH_RX_LOCAL_VA == 0 {
+    let rx_va = unsafe {
+        match &*(&raw const TRANSPORT) {
+            Transport::Ethernet(e) => e.rx_local_va(),
+            _ => 0,
+        }
+    };
+    if rx_va == 0 {
+        unsafe {
             INBOUND_FRAMES_RECEIVED += 1;
             INBOUND_FRAMES_REJECTED += 1;
-            return;
         }
+        return;
     }
-    parse_proxy_frame_from(unsafe { ETH_RX_LOCAL_VA }, payload_len, src_mac);
+    parse_proxy_frame_from(rx_va, payload_len, src_mac);
 }
 
-/// Build a frame at ETH_TX_LOCAL_VA from a fully-formed body (must
-/// already include the 40-byte routing header: dst_uuid + src_uuid +
-/// request_id, followed by payload) and send it via NETIF_XMIT to
-/// the given peer MAC.  Returns true on success.  body length is
-/// bounded by MTU - 8 ≈ 1492 bytes.
-fn eth_send_to_peer(peer_mac: u64, body: &[u8]) -> bool {
+/// Build a frame at the transport's tx_local_va from a fully-formed
+/// body (must already include the 40-byte routing header: dst_uuid +
+/// src_uuid + request_id, followed by payload) and send it via
+/// NETIF_XMIT to the given peer MAC.  Returns true on success.
+/// body length is bounded by MTU - 8 ≈ 1492 bytes.
+fn eth_send_to_peer(eth: &EthernetTransport, peer_mac: u64, body: &[u8]) -> bool {
+    if !eth.registered || eth.tx_local_va == 0 || eth.eth_port == 0 {
+        return false;
+    }
+    if body.len() < ROUTING_HDR_LEN {
+        return false;
+    }
     unsafe {
-        if !ETH_TX_REGISTERED || ETH_TX_LOCAL_VA == 0 || ETH_PORT == 0 {
-            return false;
-        }
-        if body.len() < ROUTING_HDR_LEN {
-            return false;
-        }
-        // Wire format: 8-byte header (magic + version + reserved + len)
-        // followed by the supplied body.
-        let dst = ETH_TX_LOCAL_VA as *mut u8;
+        let dst = eth.tx_local_va as *mut u8;
         let mag = WIRE_MAGIC.to_le_bytes();
         for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
         core::ptr::write_volatile(dst.add(4), 1u8); // version
@@ -412,12 +500,12 @@ fn eth_send_to_peer(peer_mac: u64, body: &[u8]) -> bool {
 
         let frame_len = 8 + body.len();
         let _ = syscall::send_nb_4(
-            ETH_PORT,
+            eth.eth_port,
             ETH_NETIF_XMIT,
             frame_len as u64,
             peer_mac,
             ETHERTYPE_PROXY,
-            ETH_TX_CLIENT_ID,
+            eth.tx_client_id,
         );
     }
     true
@@ -840,10 +928,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(my_port);
     syscall::debug_puts(b"\n");
 
-    // Bring up the parallel Ethernet-direct transport.  Best-effort —
-    // if eth_srv isn't up yet, ETH_TX_REGISTERED stays false and any
-    // PROXY_SEND_BY_PEER call returns FAIL until eth_srv comes online.
-    try_register_eth_proxy(my_port);
+    // Bring up the parallel Ethernet-direct transport via the
+    // Transport abstraction.  Best-effort — if eth_srv isn't up yet,
+    // the transport stays !ready() and PROXY_SEND_BY_PEER returns
+    // FAIL until eth_srv comes online.
+    unsafe {
+        if let Transport::Ethernet(eth) = &mut *(&raw mut TRANSPORT) {
+            try_register_eth_proxy(eth, my_port);
+        }
+    }
 
     // Bind + listen on LISTEN_TCP_PORT for incoming proxy connections.
     let d1_bind = (LISTEN_TCP_PORT as u64) | ((reply_port) << 32);
@@ -949,28 +1042,24 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             } else if msg.tag == PROXY_SEND_BY_PEER {
                 // Grant-based path: caller pre-granted a body page
                 // at data[1] containing dst_uuid + src_uuid +
-                // request_id + payload.  Reply OK / FAIL.
+                // request_id + payload.  Reply OK / FAIL.  Dispatch
+                // through the Transport abstraction so future TLS /
+                // BLE-PAN transports plug in at the same call site.
                 let mac = msg.data[0];
                 let body_va = msg.data[1] as usize;
                 let body_len = msg.data[2] as usize;
                 let ok = if body_va == 0
                     || body_len < ROUTING_HDR_LEN
                     || body_len > 1492
+                    || !syscall::va_writable(body_va)
                 {
                     false
                 } else {
-                    // Validate the grant is mapped (cache_srv-style
-                    // defensive check via SYS_VA_WRITABLE — though
-                    // this is a read so writable is overstrict; we
-                    // just want "is it mapped").
-                    if !syscall::va_writable(body_va) {
-                        false
-                    } else {
-                        let body = unsafe {
-                            core::slice::from_raw_parts(body_va as *const u8, body_len)
-                        };
-                        eth_send_to_peer(mac, body)
-                    }
+                    let body = unsafe {
+                        core::slice::from_raw_parts(body_va as *const u8, body_len)
+                    };
+                    let peer = PeerAddr::Ethernet { mac };
+                    unsafe { (*(&raw const TRANSPORT)).send(&peer, body) }
                 };
                 let tag = if ok { PROXY_SEND_BY_PEER_OK } else { PROXY_SEND_BY_PEER_FAIL };
                 let _ = syscall::reply(tag, 0, 0, 0, 0, 0);
