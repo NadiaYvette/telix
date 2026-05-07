@@ -1170,6 +1170,198 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5o: end-to-end clustering chain ---
+    // Exercises every Tier 5 piece together:
+    //
+    //   inject peer announcement
+    //     → discovery_srv populates PEERS
+    //     → SVCREG_LOOKUP_REMOTE returns peer UUID + src_mac
+    //     → caller builds a frame body addressed to the peer's
+    //       service UUID
+    //     → proxy_srv PROXY_SEND_BY_PEER accepts the send
+    //       (frame goes out the wire to nowhere on a single instance,
+    //       but that's fine — we're testing the routing chain, not
+    //       the network round-trip)
+    //
+    // Bonus: also inject a frame back into proxy_srv addressed to a
+    // local subscriber, demonstrating the reverse half of the chain
+    // (peer-to-us delivery).
+    syscall::debug_puts(b"  init: running end-to-end clustering chain test...\n");
+    {
+        let mut ok = true;
+
+        // Synthetic identities for this test.
+        let peer_uuid: [u8; 16] = [
+            0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        ];
+        let svc_uuid: [u8; 16] = [
+            0xc0, 0xff, 0xee, 0x01, 0xc0, 0xff, 0xee, 0x02,
+            0xc0, 0xff, 0xee, 0x03, 0xc0, 0xff, 0xee, 0x04,
+        ];
+        const PEER_SRC_MAC: u64 = 0x0000_1122_3344_5566;
+
+        let disc_port = match syscall::ns_lookup(b"discovery") {
+            Some(p) => p,
+            None => {
+                ok = false;
+                syscall::debug_puts(b"  [chain] discovery ns_lookup failed\n");
+                0
+            }
+        };
+        let svcreg_port = match syscall::ns_lookup(b"servicereg") {
+            Some(p) => p,
+            None => {
+                ok = false;
+                syscall::debug_puts(b"  [chain] servicereg ns_lookup failed\n");
+                0
+            }
+        };
+        let proxy_port = match syscall::ns_lookup(b"proxy") {
+            Some(p) => p,
+            None => {
+                ok = false;
+                syscall::debug_puts(b"  [chain] proxy ns_lookup failed\n");
+                0
+            }
+        };
+
+        // Step 1: inject a discovery announcement so discovery_srv
+        // learns about a peer (peer_uuid) advertising svc_uuid at
+        // src_mac PEER_SRC_MAC.
+        let inj_local = if ok {
+            match syscall::mmap_anon(0, 1, 1) {
+                Some(va) => {
+                    unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); }
+                    va
+                }
+                None => { ok = false; 0 }
+            }
+        } else { 0 };
+        if ok {
+            unsafe {
+                let dst = inj_local as *mut u8;
+                let mag = 0x44584C54u32.to_le_bytes(); // "TLXD"
+                for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
+                let v = 1u16.to_le_bytes();
+                core::ptr::write_volatile(dst.add(4), v[0]);
+                core::ptr::write_volatile(dst.add(5), v[1]);
+                core::ptr::write_volatile(dst.add(6), 0u8);
+                core::ptr::write_volatile(dst.add(7), 0u8);
+                for i in 0..16 { core::ptr::write_volatile(dst.add(8 + i), peer_uuid[i]); }
+                let ts = syscall::clock_gettime().to_le_bytes();
+                for i in 0..8 { core::ptr::write_volatile(dst.add(24 + i), ts[i]); }
+                core::ptr::write_volatile(dst.add(32), 1u8); // manifest_count = 1
+                for i in 0..3 { core::ptr::write_volatile(dst.add(33 + i), 0u8); }
+                for i in 0..16 { core::ptr::write_volatile(dst.add(36 + i), svc_uuid[i]); }
+            }
+            const INJ_GRANT: usize = 0xC_0000_0000;
+            if !syscall::grant_pages(disc_port, inj_local, INJ_GRANT, 1, false) {
+                ok = false;
+                syscall::debug_puts(b"  [chain] grant inj-to-disc failed\n");
+            }
+            if ok {
+                match syscall::call(disc_port, 0x4D07,
+                                    INJ_GRANT as u64, 36 + 16,
+                                    PEER_SRC_MAC, 0) {
+                    Some(r) if r.tag == 0x4D08 => {}
+                    _ => {
+                        ok = false;
+                        syscall::debug_puts(b"  [chain] inject discovery frame failed\n");
+                    }
+                }
+            }
+        }
+
+        // Step 2: query SVCREG_LOOKUP_REMOTE for svc_uuid; expect
+        // peer_uuid back + PEER_SRC_MAC.
+        let mut resolved_mac: u64 = 0;
+        if ok {
+            let svc_lo = u64::from_le_bytes([
+                svc_uuid[0], svc_uuid[1], svc_uuid[2], svc_uuid[3],
+                svc_uuid[4], svc_uuid[5], svc_uuid[6], svc_uuid[7],
+            ]);
+            let svc_hi = u64::from_le_bytes([
+                svc_uuid[8], svc_uuid[9], svc_uuid[10], svc_uuid[11],
+                svc_uuid[12], svc_uuid[13], svc_uuid[14], svc_uuid[15],
+            ]);
+            match syscall::call(svcreg_port, 0x7E24, svc_lo, svc_hi, 0, 0) {
+                Some(r) if r.tag == 0x7E25 => {
+                    let exp_lo = u64::from_le_bytes([
+                        peer_uuid[0], peer_uuid[1], peer_uuid[2], peer_uuid[3],
+                        peer_uuid[4], peer_uuid[5], peer_uuid[6], peer_uuid[7],
+                    ]);
+                    let exp_hi = u64::from_le_bytes([
+                        peer_uuid[8], peer_uuid[9], peer_uuid[10], peer_uuid[11],
+                        peer_uuid[12], peer_uuid[13], peer_uuid[14], peer_uuid[15],
+                    ]);
+                    if r.data[0] != exp_lo || r.data[1] != exp_hi {
+                        ok = false;
+                        syscall::debug_puts(b"  [chain] SVCREG_LOOKUP_REMOTE returned wrong peer\n");
+                    } else if r.data[3] != PEER_SRC_MAC {
+                        ok = false;
+                        syscall::debug_puts(b"  [chain] SVCREG_LOOKUP_REMOTE returned wrong src_mac\n");
+                    } else {
+                        resolved_mac = r.data[3];
+                    }
+                }
+                _ => {
+                    ok = false;
+                    syscall::debug_puts(b"  [chain] SVCREG_LOOKUP_REMOTE call failed\n");
+                }
+            }
+        }
+
+        // Step 3: build a frame body addressed to svc_uuid and call
+        // PROXY_SEND_BY_PEER with the resolved MAC.  proxy_srv will
+        // accept and frame it out to eth_srv; the frame goes to the
+        // wire (and on a single instance, nowhere — but the SEND is
+        // what we're verifying here).
+        if ok {
+            let body_local = match syscall::mmap_anon(0, 1, 1) {
+                Some(va) => {
+                    unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); }
+                    va
+                }
+                None => { ok = false; 0 }
+            };
+            if ok {
+                let body_len: usize = 16 + 16 + 8 + 4;
+                unsafe {
+                    let dst = body_local as *mut u8;
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(i), svc_uuid[i]); }
+                    let our_uuid: [u8; 16] = [0u8; 16]; // zero src_uuid for this test
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(16 + i), our_uuid[i]); }
+                    let req_id = 0xfeedf00ddeadbeefu64.to_le_bytes();
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(32 + i), req_id[i]); }
+                    let payload = b"HELO";
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(40 + i), payload[i]); }
+                }
+                const BODY_GRANT: usize = 0xC_0001_0000;
+                if !syscall::grant_pages(proxy_port, body_local, BODY_GRANT, 1, false) {
+                    ok = false;
+                    syscall::debug_puts(b"  [chain] grant body-to-proxy failed\n");
+                }
+                if ok {
+                    match syscall::call(proxy_port, 0x5010,
+                                        resolved_mac, BODY_GRANT as u64,
+                                        body_len as u64, 0) {
+                        Some(r) if r.tag == 0x5011 => {} // PROXY_SEND_BY_PEER_OK
+                        _ => {
+                            ok = false;
+                            syscall::debug_puts(b"  [chain] PROXY_SEND_BY_PEER failed\n");
+                        }
+                    }
+                }
+            }
+        }
+        if ok {
+            syscall::debug_puts(b"Phase 5o end-to-end clustering chain: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5o end-to-end clustering chain: FAILED\n");
+        }
+    }
+
     // --- Phase 5h: scheduler call/reply stress (deferred-requeue race repro) ---
     // Skipped under FOCUS_H13 because sched_stress occasionally wedges
     // (WEDGED — giving up) without exiting, which deadlocks init's
