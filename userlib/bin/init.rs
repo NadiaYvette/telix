@@ -1490,6 +1490,45 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5q: proxy_srv learn-from-discovery (Tier-5 piece C) ---
+    // Phase 5p left a peer (peer_uuid 0x10..0x1f) with a TCP endpoint
+    // in discovery's PEERS table.  PROXY_LEARN_FROM_DISCOVERY should
+    // walk that table, fetch the endpoint via DISCOVERY_GET_PEER, and
+    // insert at least one node row in TcpTransport.  We just check the
+    // returned count; verifying internal node-table state would need
+    // a second RPC and isn't needed for this slice.
+    syscall::debug_puts(b"  init: running proxy_srv learn-from-discovery test...\n");
+    {
+        let mut ok = true;
+        let proxy_port = match syscall::ns_lookup(b"proxy") {
+            Some(p) => p,
+            None => { ok = false; syscall::debug_puts(b"  [learn] proxy ns_lookup failed\n"); 0 }
+        };
+        if ok {
+            match syscall::call(proxy_port, 0x5040, 0, 0, 0, 0) {
+                Some(r) if r.tag == 0x5041 => {
+                    if r.data[0] == 0 {
+                        ok = false;
+                        syscall::debug_puts(b"  [learn] PROXY_LEARN_FROM_DISCOVERY returned 0 nodes\n");
+                    } else {
+                        syscall::debug_puts(b"  [learn] inserted/updated nodes=");
+                        print_num(r.data[0]);
+                        syscall::debug_puts(b"\n");
+                    }
+                }
+                _ => {
+                    ok = false;
+                    syscall::debug_puts(b"  [learn] PROXY_LEARN_FROM_DISCOVERY call failed\n");
+                }
+            }
+        }
+        if ok {
+            syscall::debug_puts(b"Phase 5q proxy_srv learn-from-discovery: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5q proxy_srv learn-from-discovery: FAILED\n");
+        }
+    }
+
     // --- Phase 5h: scheduler call/reply stress (deferred-requeue race repro) ---
     // Skipped under FOCUS_H13 because sched_stress occasionally wedges
     // (WEDGED — giving up) without exiting, which deadlocks init's

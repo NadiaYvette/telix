@@ -167,6 +167,26 @@ const DISCOVERY_INJECT_FRAME_OK: u64 = 0x4D08;
 const DISCOVERY_LOOKUP_SERVICE: u64 = 0x4D09;
 const DISCOVERY_LOOKUP_SERVICE_OK: u64 = 0x4D0A;
 const DISCOVERY_LOOKUP_SERVICE_NOTFOUND: u64 = 0x4D0B;
+
+/// Peer-UUID-keyed lookup: "give me everything I know about this peer".
+/// Caller passes the 16-byte peer UUID via two u64 words (data[0]=lo,
+/// data[1]=hi).  Returns the same shape as DISCOVERY_LOOKUP_SERVICE_OK
+/// but keyed on peer identity rather than service.  Used by
+/// TcpTransport to resolve UUID → TCP endpoint without scanning the
+/// service-UUID table.
+///
+/// out: DISCOVERY_GET_PEER_OK
+///        data[0] = peer UUID bytes 0..8 (LE) — echoes input
+///        data[1] = peer UUID bytes 8..16 (LE)
+///        data[2] = last_seen_ns
+///        data[3] = src_mac
+///        data[4] = packed tcp4_endpoint (same layout as
+///                  DISCOVERY_LOOKUP_SERVICE_OK's data[4])
+///      DISCOVERY_GET_PEER_NOTFOUND on no entry.
+const DISCOVERY_GET_PEER: u64 = 0x4D0C;
+const DISCOVERY_GET_PEER_OK: u64 = 0x4D0D;
+const DISCOVERY_GET_PEER_NOTFOUND: u64 = 0x4D0E;
+
 const DISCOVERY_ERR: u64 = 0x4DFF;
 
 // ---------------------------------------------------------------------------
@@ -962,6 +982,51 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                     None => {
                         let _ = syscall::reply(
                             DISCOVERY_LOOKUP_SERVICE_NOTFOUND,
+                            0, 0, 0, 0, 0,
+                        );
+                    }
+                }
+            }
+            DISCOVERY_GET_PEER => {
+                // Look up by peer UUID (data[0]=lo, data[1]=hi).
+                let mut want = [0u8; 16];
+                want[0..8].copy_from_slice(&m.data[0].to_le_bytes());
+                want[8..16].copy_from_slice(&m.data[1].to_le_bytes());
+                let mut hit: Option<usize> = None;
+                unsafe {
+                    for i in 0..MAX_PEERS {
+                        if PEERS[i].in_use && PEERS[i].uuid == want {
+                            hit = Some(i);
+                            break;
+                        }
+                    }
+                }
+                match hit {
+                    Some(i) => {
+                        let (lo, hi, ts, mac, endpoint) = unsafe {
+                            let endpoint = if PEERS[i].has_endpoint {
+                                (1u64 << 48)
+                                    | ((PEERS[i].tcp_port as u64) << 32)
+                                    | (PEERS[i].tcp_ip as u64)
+                            } else {
+                                0
+                            };
+                            (
+                                m.data[0],
+                                m.data[1],
+                                PEERS[i].last_seen_ns,
+                                PEERS[i].src_mac,
+                                endpoint,
+                            )
+                        };
+                        let _ = syscall::reply(
+                            DISCOVERY_GET_PEER_OK,
+                            lo, hi, ts, mac, endpoint,
+                        );
+                    }
+                    None => {
+                        let _ = syscall::reply(
+                            DISCOVERY_GET_PEER_NOTFOUND,
                             0, 0, 0, 0, 0,
                         );
                     }

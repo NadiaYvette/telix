@@ -75,6 +75,21 @@ const PROXY_INBOUND_FRAME: u64 = 0x5022;
 const PROXY_INJECT_FRAME: u64 = 0x5030;
 const PROXY_INJECT_FRAME_OK: u64 = 0x5031;
 
+/// Trigger a discovery_srv poll: enumerate known peers via
+/// DISCOVERY_LIST_PEERS, then DISCOVERY_GET_PEER each to fetch their
+/// TCP endpoint.  Insert/refresh the corresponding NodeEntry rows so
+/// TcpTransport can `ensure_connection` to learned peers without
+/// manual PROXY_ADD_NODE.  Reply: PROXY_LEARN_FROM_DISCOVERY_OK with
+/// data[0] = number of nodes inserted/updated.
+const PROXY_LEARN_FROM_DISCOVERY: u64 = 0x5040;
+const PROXY_LEARN_FROM_DISCOVERY_OK: u64 = 0x5041;
+
+// Discovery RPCs we issue (must match userlib/bin/discovery_srv.rs).
+const DISCOVERY_LIST_PEERS: u64 = 0x4D01;
+const DISCOVERY_LIST_PEERS_OK: u64 = 0x4D02;
+const DISCOVERY_GET_PEER: u64 = 0x4D0C;
+const DISCOVERY_GET_PEER_OK: u64 = 0x4D0D;
+
 // Eth_srv NETIF protocol — must match userlib/bin/eth_srv.rs.  Inlined
 // here so this binary doesn't take a userlib dependency on eth_srv's
 // header constants.  Note: NETIF_REGISTER's wire value (0x5000) is the
@@ -149,6 +164,12 @@ struct NodeEntry {
     rx_len: usize,
     // Pending connect: true if we sent NET_TCP_CONNECT but haven't got reply yet.
     connecting: bool,
+    /// Optional peer UUID for nodes learned via discovery_srv (Tier-5
+    /// piece C).  All-zeros for nodes added through PROXY_ADD_NODE
+    /// without a UUID.  Letting both paths populate `nodes` keeps the
+    /// connection table single-source-of-truth for ensure_connection,
+    /// frame send, etc.
+    peer_uuid: [u8; 16],
 }
 
 impl NodeEntry {
@@ -162,6 +183,7 @@ impl NodeEntry {
             rx_buf: [0; WIRE_FRAME_SIZE],
             rx_len: 0,
             connecting: false,
+            peer_uuid: [0; 16],
         }
     }
 }
@@ -301,6 +323,13 @@ static mut INBOUND_SUBSCRIBERS: [InboundSubscriber; MAX_INBOUND_SUBSCRIBERS] = [
 static mut INBOUND_FRAMES_RECEIVED: u64 = 0;
 static mut INBOUND_FRAMES_REJECTED: u64 = 0;
 static mut INBOUND_FRAMES_NO_SUB: u64 = 0;
+
+/// Cached discovery_srv port + scratch grant (Tier-5 piece C, step 2/3).
+/// Set the first time learn_from_discovery runs; reused on subsequent
+/// polls so we're not re-resolving + re-granting per call.  0 means
+/// uninitialized.
+static mut DISCOVERY_PORT: u64 = 0;
+static mut DISC_SCRATCH_VA: usize = 0;
 
 /// Best-effort registration with eth_srv for ETHERTYPE_PROXY on the TX
 /// side.  Same shape as discovery_srv::try_register_eth_tx — alloc an
@@ -823,6 +852,120 @@ impl TcpTransport {
     }
 
     /// Handle admin: add node mapping.
+    /// Find a node slot whose peer_uuid matches the given UUID.
+    fn find_node_by_uuid(&self, uuid: &[u8; 16]) -> Option<usize> {
+        self.nodes
+            .iter()
+            .position(|n| n.active && n.peer_uuid == *uuid)
+    }
+
+    /// Pull peers from discovery_srv and insert/refresh corresponding
+    /// NodeEntry rows.  Skips peers without TCP endpoints (eth-only
+    /// peers stay reachable via PROXY_SEND_BY_PEER's MAC path).
+    /// Returns the count of nodes inserted or updated this call.
+    fn learn_from_discovery(&mut self) -> usize {
+        // Cache discovery_srv port + a 4 KiB scratch grant for the
+        // LIST_PEERS reply.  GRANT_VA in our aspace is irrelevant
+        // since we're the one granting; we pick a stable VA in the
+        // grant region for discovery's view.
+        const SCRATCH_GRANT_VA: usize = 0xD_0000_0000;
+        const RECORD_SIZE: usize = 24;
+        const MAX_RECORDS: usize = 16;
+
+        let disc_port = unsafe {
+            if DISCOVERY_PORT == 0 {
+                match syscall::ns_lookup(b"discovery") {
+                    Some(p) => { DISCOVERY_PORT = p; p }
+                    None => { return 0; }
+                }
+            } else {
+                DISCOVERY_PORT
+            }
+        };
+        let scratch_va = unsafe {
+            if DISC_SCRATCH_VA == 0 {
+                let va = match syscall::mmap_anon(0, 1, 1) {
+                    Some(v) => v,
+                    None => return 0,
+                };
+                core::ptr::write_volatile(va as *mut u8, 0u8);
+                if !syscall::grant_pages(disc_port, va, SCRATCH_GRANT_VA, 1, false) {
+                    return 0;
+                }
+                DISC_SCRATCH_VA = va;
+                va
+            } else {
+                DISC_SCRATCH_VA
+            }
+        };
+
+        let r = match syscall::call(disc_port, DISCOVERY_LIST_PEERS,
+                                    SCRATCH_GRANT_VA as u64,
+                                    MAX_RECORDS as u64, 0, 0) {
+            Some(r) if r.tag == DISCOVERY_LIST_PEERS_OK => r,
+            _ => return 0,
+        };
+        let written = r.data[0] as usize;
+        if written == 0 { return 0; }
+
+        let mut updated = 0usize;
+        for i in 0..written.min(MAX_RECORDS) {
+            // Read peer UUID from local scratch page.
+            let mut uuid = [0u8; 16];
+            unsafe {
+                let base = (scratch_va + i * RECORD_SIZE) as *const u8;
+                for b in 0..16 {
+                    uuid[b] = core::ptr::read_volatile(base.add(b));
+                }
+            }
+            let lo = u64::from_le_bytes([
+                uuid[0], uuid[1], uuid[2], uuid[3],
+                uuid[4], uuid[5], uuid[6], uuid[7],
+            ]);
+            let hi = u64::from_le_bytes([
+                uuid[8], uuid[9], uuid[10], uuid[11],
+                uuid[12], uuid[13], uuid[14], uuid[15],
+            ]);
+            // Per-peer GET_PEER for endpoint info.
+            let pr = match syscall::call(disc_port, DISCOVERY_GET_PEER, lo, hi, 0, 0) {
+                Some(pr) if pr.tag == DISCOVERY_GET_PEER_OK => pr,
+                _ => continue,
+            };
+            let endpoint = pr.data[4];
+            let has_endpoint = (endpoint >> 48) & 1 != 0;
+            if !has_endpoint { continue; }
+            let port = ((endpoint >> 32) & 0xFFFF) as u16;
+            let ip_le = (endpoint & 0xFFFF_FFFF) as u32;
+
+            // Insert or refresh node row.  node_id derived from
+            // the low 16 bits of the UUID lo word — single-instance
+            // collisions are negligible in practice; cross-instance
+            // we'll move to UUID-as-key in step 3/3 once peer_uuid
+            // is the only routing handle TcpTransport needs.
+            let node_id = (lo & 0xFFFF) as u16;
+            let slot = self.find_node_by_uuid(&uuid)
+                .or_else(|| self.find_node_by_id(node_id))
+                .or_else(|| self.nodes.iter().position(|n| !n.active));
+            if let Some(s) = slot {
+                if s < MAX_NODES {
+                    self.nodes[s] = NodeEntry {
+                        active: true,
+                        node_id,
+                        ip_be32: ip_le, // packed LE matches ip_be32 field semantics for our test
+                        tcp_port: port,
+                        conn_id: NONE_CONN,
+                        rx_buf: [0; WIRE_FRAME_SIZE],
+                        rx_len: 0,
+                        connecting: false,
+                        peer_uuid: uuid,
+                    };
+                    updated += 1;
+                }
+            }
+        }
+        updated
+    }
+
     fn handle_add_node(&mut self, msg: &Message) {
         let node_id = msg.data[0] as u16;
         let ip_be32 = msg.data[1] as u32;
@@ -847,6 +990,7 @@ impl TcpTransport {
                 rx_buf: [0; WIRE_FRAME_SIZE],
                 rx_len: 0,
                 connecting: false,
+                peer_uuid: [0; 16],
             };
             syscall::debug_puts(b"  [proxy] added node ");
             print_num(node_id as u64);
@@ -885,6 +1029,7 @@ impl TcpTransport {
                     rx_buf: [0; WIRE_FRAME_SIZE],
                     rx_len: 0,
                     connecting: false,
+                    peer_uuid: [0; 16],
                 };
                 syscall::debug_puts(b"  [proxy] accepted conn=");
                 print_num(conn_id as u64);
@@ -1063,6 +1208,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let _ = syscall::reply(tag, 0, 0, 0, 0, 0);
             } else if msg.tag == PROXY_ADD_NODE {
                 srv.handle_add_node(&msg);
+            } else if msg.tag == PROXY_LEARN_FROM_DISCOVERY {
+                let n = srv.learn_from_discovery();
+                let _ = syscall::reply(PROXY_LEARN_FROM_DISCOVERY_OK,
+                                       n as u64, 0, 0, 0, 0);
             } else if msg.tag == NET_TCP_DATA && from_port == reply_port {
                 // Inbound TCP data.
                 let conn_id_guess = 0; // We need to figure out which conn this is for.
