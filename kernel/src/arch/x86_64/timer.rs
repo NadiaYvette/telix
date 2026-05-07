@@ -76,19 +76,83 @@ pub fn enable_interrupts() {
 pub static TSC_HZ: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(1_000_000_000);
 
-/// Detect TSC frequency via CPUID and store it in TSC_HZ.  Tries leaf
-/// 0x15 (TSC/crystal ratio) first, then leaf 0x16 (base CPU MHz) as a
-/// fallback.  If neither leaf is available, leaves the conservative
-/// 1 GHz default in place.  Idempotent; safe to call multiple times.
+/// Detect TSC frequency and store it in TSC_HZ.  Order:
+///   1. CPUID leaf 0x15 (TSC/crystal ratio + crystal Hz from CPUID)
+///   2. CPUID leaf 0x16 (base CPU MHz from CPUID)
+///   3. PIT-channel-2 gated calibration (counts RDTSC over a known
+///      number of PIT cycles)
+///   4. Conservative 1 GHz default (if all three fail)
+/// Idempotent; safe to call multiple times.  Must be called *before*
+/// LAPIC calibration in the boot sequence so monotonic_ns is correct
+/// for any timer scheduling that follows.
 pub fn init_tsc_freq() {
     if let Some(hz) = tsc_freq_from_cpuid() {
         TSC_HZ.store(hz, core::sync::atomic::Ordering::Release);
         crate::println!("  TSC frequency: {} Hz (CPUID)", hz);
-    } else {
-        crate::println!(
-            "  TSC frequency: assumed {} Hz (CPUID 0x15/0x16 unavailable)",
-            TSC_HZ.load(core::sync::atomic::Ordering::Acquire),
-        );
+        return;
+    }
+    if let Some(hz) = tsc_freq_from_pit() {
+        TSC_HZ.store(hz, core::sync::atomic::Ordering::Release);
+        crate::println!("  TSC frequency: {} Hz (PIT-calibrated)", hz);
+        return;
+    }
+    crate::println!(
+        "  TSC frequency: assumed {} Hz (CPUID + PIT calibration both unavailable)",
+        TSC_HZ.load(core::sync::atomic::Ordering::Acquire),
+    );
+}
+
+/// PIT-channel-2 gated TSC calibration.  Channel 2's gate is software-
+/// controlled (port 0x61 bit 0) and its OUT pin is observable on port
+/// 0x61 bit 5 — so we can program a one-shot, time it from outside the
+/// IRQ path, and read RDTSC at the OUT-pin transition.  This is the
+/// classic TSC-calibration method on bare PCs and works on any x86 KVM
+/// configuration that exposes PIT (essentially all of them).
+///
+/// Method: program channel 2 mode 0 (interrupt-on-terminal-count) with
+/// a divisor near 64 ms worth of ticks (76544 / 1193182 Hz ≈ 64 ms),
+/// snapshot RDTSC, busy-wait for OUT to go high, snapshot RDTSC again,
+/// extrapolate.  Doesn't disturb channel 0 (the kernel tick source).
+fn tsc_freq_from_pit() -> Option<u64> {
+    use super::serial::{inb, outb};
+    const PIT_FREQ: u32 = 1_193_182;
+    const PIT_CH2_DATA: u16 = 0x42;
+    const PIT_CMD: u16 = 0x43;
+    const PORT_61: u16 = 0x61;
+    // ~64 ms gives good resolution; max 16-bit value is 65535 (~55 ms).
+    const DIVISOR: u16 = 65000;
+    unsafe {
+        // Save and configure port 0x61: bit 0 = ch2 gate, bit 1 = speaker.
+        // Disable speaker (bit 1 = 0), enable ch2 gate (bit 0 = 1).
+        let saved_61 = inb(PORT_61);
+        outb(PORT_61, (saved_61 & 0xfd) | 0x01);
+        // PIT command: ch2, lo/hi, mode 0, binary.
+        outb(PIT_CMD, 0xb0);
+        outb(PIT_CH2_DATA, (DIVISOR & 0xff) as u8);
+        outb(PIT_CH2_DATA, (DIVISOR >> 8) as u8);
+        let t0 = rdtsc();
+        // Wait for OUT (port 0x61 bit 5) to go high — this happens when
+        // the down-counter reaches zero.  Budget enough for the full
+        // ~55 ms wait plus slack.
+        let mut spins: u64 = 0;
+        const MAX_SPINS: u64 = 1_000_000_000;
+        while (inb(PORT_61) & 0x20) == 0 {
+            spins += 1;
+            if spins >= MAX_SPINS {
+                // Something is wrong — PIT didn't tick.  Restore port and bail.
+                outb(PORT_61, saved_61);
+                return None;
+            }
+        }
+        let t1 = rdtsc();
+        // Restore original port 0x61 state.
+        outb(PORT_61, saved_61);
+        let cycles = t1.wrapping_sub(t0);
+        if cycles == 0 {
+            return None;
+        }
+        // tsc_freq = cycles * PIT_FREQ / DIVISOR
+        Some((cycles as u128 * PIT_FREQ as u128 / DIVISOR as u128) as u64)
     }
 }
 
