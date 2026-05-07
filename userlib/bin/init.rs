@@ -810,8 +810,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  [disc] grant_pages inject failed\n");
                 }
                 if ok {
-                    // Send INJECT_FRAME with payload_len = header + 1 service UUID.
-                    match syscall::call(disc_port, 0x4D07, INJECT_GRANT_VA as u64, 36 + 16, 0, 0) {
+                    // Send INJECT_FRAME with payload_len = header + 1 service UUID,
+                    // synthetic src_mac so we can verify it round-trips through
+                    // DISCOVERY_LOOKUP_SERVICE_OK / SVCREG_LOOKUP_REMOTE_OK.
+                    // 0x0000_aabbccdd_eeff is a recognisable test MAC
+                    // (low 48 bits == aa:bb:cc:dd:ee:ff, mac_to_u64 encoding).
+                    const TEST_SRC_MAC: u64 = 0x0000_aabbccdd_eeff;
+                    match syscall::call(disc_port, 0x4D07,
+                                        INJECT_GRANT_VA as u64, 36 + 16,
+                                        TEST_SRC_MAC, 0) {
                         Some(r) if r.tag == 0x4D08 => {}
                         _ => {
                             ok = false;
@@ -842,6 +849,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                                 ok = false;
                                 syscall::debug_puts(
                                     b"  [disc] LOOKUP_SERVICE returned wrong peer UUID\n",
+                                );
+                            }
+                            // Verify src_mac round-trips: r.data[3]
+                            // should match the TEST_SRC_MAC we injected.
+                            if r.data[3] != 0x0000_aabbccdd_eeff {
+                                ok = false;
+                                syscall::debug_puts(
+                                    b"  [disc] LOOKUP_SERVICE returned wrong src_mac\n",
                                 );
                             }
                         }

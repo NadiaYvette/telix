@@ -148,6 +148,9 @@ const DISCOVERY_INJECT_FRAME_OK: u64 = 0x4D08;
 ///        data[0] = peer UUID bytes 0..8 (LE)
 ///        data[1] = peer UUID bytes 8..16 (LE)
 ///        data[2] = last_seen_ns (so caller can age-out stale routes)
+///        data[3] = src_mac (mac_to_u64 encoding; 0 if peer was
+///                  test-injected without a MAC).  Lets proxy_srv
+///                  route Ethernet frames straight to the peer.
 ///      DISCOVERY_LOOKUP_SERVICE_NOTFOUND on no match.
 ///
 /// Foundation for the discovery → servicereg → proxy chain: a future
@@ -178,6 +181,14 @@ struct PeerEntry {
     /// Last time we saw an announcement from this peer (our local
     /// monotonic ns).  Used for TTL-based eviction.
     last_seen_ns: u64,
+    /// Source Ethernet MAC of the most recent announcement, packed as
+    /// a u64 (low 48 bits, big-endian-on-the-wire bytes copied byte-by-
+    /// byte into the lower bytes — same encoding eth_srv uses for
+    /// `mac_to_u64`).  proxy_srv consumes this to route IPC to the
+    /// peer over the same broadcast domain.  0 if the peer was
+    /// inserted via DISCOVERY_INJECT_FRAME (test path) without
+    /// supplying a MAC.
+    src_mac: u64,
     /// Per-peer service-UUID list (content-addressed; cross-references
     /// servicereg_srv's UUID space).  Populated from announcement.
     service_uuids: [[u8; 16]; MAX_PEER_SERVICES],
@@ -190,6 +201,7 @@ impl PeerEntry {
             in_use: false,
             uuid: [0; 16],
             last_seen_ns: 0,
+            src_mac: 0,
             service_uuids: [[0; 16]; MAX_PEER_SERVICES],
             service_count: 0,
         }
@@ -250,7 +262,9 @@ fn count_active_peers() -> u64 {
 
 /// Handle a NETIF_INPUT notification: parse the announcement at
 /// ETH_RX_LOCAL_VA, validate, then upsert the sender in PEERS.
-fn handle_netif_input(payload_len: usize) {
+/// `src_mac` comes from eth_srv's NETIF_INPUT data[1] (the on-the-wire
+/// source MAC, packed via mac_to_u64).
+fn handle_netif_input(payload_len: usize, src_mac: u64) {
     unsafe {
         if ETH_RX_LOCAL_VA == 0 {
             FRAMES_RECEIVED_COUNT += 1;
@@ -258,16 +272,19 @@ fn handle_netif_input(payload_len: usize) {
             return;
         }
     }
-    parse_announcement_from(unsafe { ETH_RX_LOCAL_VA }, payload_len);
+    parse_announcement_from(unsafe { ETH_RX_LOCAL_VA }, payload_len, src_mac);
 }
 
 /// Parse an announcement payload at `buf_va` (in our aspace) of
 /// `payload_len` bytes; validate, then upsert the sender in PEERS.
-/// Silently drops malformed frames (counted in FRAMES_REJECTED_COUNT)
-/// — discovery is best-effort by design.  Shared by the real receive
-/// path (handle_netif_input) and the test-only injection path
+/// `src_mac` is the Ethernet source MAC packed as u64 (eth_srv's
+/// mac_to_u64 encoding) — 0 for the test-only inject path that
+/// doesn't have a real frame source.  Silently drops malformed
+/// frames (counted in FRAMES_REJECTED_COUNT) — discovery is best-
+/// effort by design.  Shared by the real receive path
+/// (handle_netif_input) and the test-only injection path
 /// (DISCOVERY_INJECT_FRAME) so they can't drift.
-fn parse_announcement_from(buf_va: usize, payload_len: usize) {
+fn parse_announcement_from(buf_va: usize, payload_len: usize, src_mac: u64) {
     unsafe {
         FRAMES_RECEIVED_COUNT += 1;
         if buf_va == 0 {
@@ -352,6 +369,13 @@ fn parse_announcement_from(buf_va: usize, payload_len: usize) {
         };
 
         PEERS[idx].last_seen_ns = now_ns;
+        // Update src_mac on every refresh — peers can move between
+        // bridge ports legitimately (multi-NIC devices, wifi roam).
+        // 0 is reserved for "no MAC available" (inject test path);
+        // don't overwrite a known MAC with 0.
+        if src_mac != 0 {
+            PEERS[idx].src_mac = src_mac;
+        }
         // Copy service UUIDs from offset 36 onward.
         PEERS[idx].service_count = svc_count as u8;
         for s in 0..svc_count {
@@ -793,8 +817,10 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
         match m.tag {
             NETIF_INPUT => {
                 // eth_srv delivered a discovery-ethertype frame.
-                // data[0] = payload_len, data[1] = src_mac (unused).
-                handle_netif_input(m.data[0] as usize);
+                // data[0] = payload_len, data[1] = src_mac (mac_to_u64
+                // encoding — used by handle_netif_input to populate
+                // the peer's src_mac for downstream routing).
+                handle_netif_input(m.data[0] as usize, m.data[1]);
                 // No reply needed — NETIF_INPUT is a notification,
                 // not a call.
             }
@@ -842,7 +868,7 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                 }
                 match hit {
                     Some(i) => {
-                        let (lo, hi, ts) = unsafe {
+                        let (lo, hi, ts, mac) = unsafe {
                             let mut lo_b = [0u8; 8];
                             let mut hi_b = [0u8; 8];
                             lo_b.copy_from_slice(&PEERS[i].uuid[0..8]);
@@ -851,11 +877,12 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                                 u64::from_le_bytes(lo_b),
                                 u64::from_le_bytes(hi_b),
                                 PEERS[i].last_seen_ns,
+                                PEERS[i].src_mac,
                             )
                         };
                         let _ = syscall::reply(
                             DISCOVERY_LOOKUP_SERVICE_OK,
-                            lo, hi, ts, 0, 0,
+                            lo, hi, ts, mac, 0,
                         );
                     }
                     None => {
@@ -869,9 +896,13 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
             DISCOVERY_INJECT_FRAME => {
                 // Test-only: caller has granted a page at data[0] in
                 // our aspace.  Parse it as if it arrived via eth_srv.
+                // data[2] = synthetic src_mac (mac_to_u64 encoding;
+                // 0 is allowed and means "no MAC info" — useful when
+                // the test only cares about UUID-level routing).
                 let buf_va = m.data[0] as usize;
                 let payload_len = m.data[1] as usize;
-                parse_announcement_from(buf_va, payload_len);
+                let src_mac = m.data[2];
+                parse_announcement_from(buf_va, payload_len, src_mac);
                 let _ = syscall::reply(DISCOVERY_INJECT_FRAME_OK, 0, 0, 0, 0, 0);
             }
             DISCOVERY_GET_STATS => {
