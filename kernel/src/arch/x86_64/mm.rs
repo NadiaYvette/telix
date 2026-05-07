@@ -335,6 +335,31 @@ pub fn read_and_clear_ref_bit(pml4: usize, va: usize) -> bool {
     referenced
 }
 
+/// Walk the x86-64 PT for `va` and return whether the leaf entry is
+/// present and writable from user-mode.  Cheap defensive check —
+/// userspace servers can validate caller-supplied addresses before
+/// dereferencing.  Used by SYS_VA_WRITABLE.
+pub fn va_writable(pml4: usize, va: usize) -> bool {
+    let mut table = pml4 as *mut u64;
+    for level in 0..X86Pte::LEVELS {
+        let idx = X86Pte::va_index(va, level);
+        let entry = unsafe { *table.add(idx) };
+        if entry & PTE_P == 0 {
+            return false;
+        }
+        let is_leaf = level == X86Pte::LEVELS - 1;
+        let is_block = !is_leaf && (entry & PTE_PS) != 0;
+        if is_leaf || is_block {
+            // PTE_RW bit set + PTE_US set (user-accessible).  PTE_NX
+            // is fine for a writable check; we don't care about
+            // execute.
+            return (entry & PTE_RW) != 0 && (entry & PTE_US) != 0;
+        }
+        table = X86Pte::table_pa(entry) as *mut u64;
+    }
+    false
+}
+
 /// Translate a user VA to a physical address by walking the x86-64 page table.
 /// Returns None if the page is not mapped.
 pub fn translate_va(pml4: usize, va: usize) -> Option<usize> {

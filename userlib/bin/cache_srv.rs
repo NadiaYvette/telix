@@ -559,6 +559,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                 if let Some((ptr, bytes_read)) = cache.read(&blk, offset, length, max_sectors) {
                     if grant_va != 0 {
+                        // Defensive validation per project_storage_srv_efi_part_pf.md:
+                        // historical bug had caller-supplied grant_va not actually
+                        // mapped in our aspace, so the write_volatile faulted +
+                        // cascaded the storage stack.  Validate before deref.
+                        if !syscall::va_writable(grant_va) {
+                            syscall::send_nb_4(
+                                reply_port,
+                                IO_ERROR,
+                                2, // distinct from IO_ERROR=1 (cache miss) for diagnosis
+                                request_id,
+                                0, 0,
+                            );
+                            continue;
+                        }
                         let dst = grant_va as *mut u8;
                         // Volatile u64 loop — see read_sector for why.
                         // Tail bytes (when bytes_read isn't a multiple of 8)

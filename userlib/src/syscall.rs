@@ -35,6 +35,7 @@ const SYS_KILL: u64 = 34;
 const SYS_GETPID: u64 = 35;
 const SYS_GET_CYCLES: u64 = 36;
 const SYS_GET_TIMER_FREQ: u64 = 37;
+const SYS_VA_WRITABLE: u64 = 126;
 const SYS_PORT_SET_CREATE: u64 = 5;
 const SYS_PORT_SET_ADD: u64 = 6;
 #[allow(dead_code)]
@@ -629,6 +630,14 @@ pub fn get_cycles() -> u64 {
 /// Get the timer frequency in Hz.
 pub fn get_timer_freq() -> u64 {
     unsafe { arch::syscall0(SYS_GET_TIMER_FREQ) }
+}
+
+/// Returns true if `va` is mapped writable in the current aspace.
+/// Cheap PT walk done by the kernel; lets servers defensively
+/// validate caller-supplied addresses (grant_va etc.) before
+/// dereferencing — converts a fault-and-cascade into an error reply.
+pub fn va_writable(va: usize) -> bool {
+    unsafe { arch::syscall1(SYS_VA_WRITABLE, va as u64) != 0 }
 }
 
 /// Get the userspace initramfs server's port ID.

@@ -121,6 +121,25 @@ pub fn translate_va(root: usize, va: usize) -> Option<usize> {
     arch_mm::translate_va(root, va)
 }
 
+/// Walk page table and return whether the leaf is mapped + writable
+/// from user mode.  Used by SYS_VA_WRITABLE.  Currently x86-64 has the
+/// only optimised implementation; other archs fall back to "mapped"
+/// (translate_va.is_some) — they don't enforce the user-mode-write
+/// distinction in their PTE format yet, so a present leaf in those
+/// arches' user space is trusted to be writable.  Tightening on each
+/// arch is a separate per-arch pass.
+#[inline]
+pub fn va_writable(root: usize, va: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch_mm::va_writable(root, va)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        arch_mm::translate_va(root, va).is_some()
+    }
+}
+
 /// Read and atomically clear the hardware reference/accessed bit.
 #[inline]
 pub fn read_and_clear_ref_bit(root: usize, va: usize) -> bool {

@@ -156,6 +156,11 @@ pub const SYS_REPLY_TAKE: u64 = 122;
 pub const SYS_REPLY_TO: u64 = 123;
 pub const SYS_RECV_WITH_CAP_NB: u64 = 124;
 pub const SYS_FW_INFO: u64 = 125;
+/// Returns 1 if `va` is mapped writable in the caller's current aspace,
+/// 0 otherwise.  Cheap PT walk; lets userspace defensively validate
+/// caller-supplied addresses (e.g. cache_srv's grant_va) before
+/// dereferencing — converts a fault-and-cascade into an error reply.
+pub const SYS_VA_WRITABLE: u64 = 126;
 
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
@@ -327,6 +332,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_GETPID => sys_getpid(),
         SYS_GET_CYCLES => sys_get_cycles(),
         SYS_GET_TIMER_FREQ => sys_get_timer_freq(),
+        SYS_VA_WRITABLE => sys_va_writable(a0),
         SYS_SET_QUOTA => sys_set_quota(a0, a1, a2),
         SYS_FORK => crate::sched::scheduler::fork_current(),
         SYS_SEND_CAP => sys_send_cap(a0, a1, a2, a3, a4, a5),
@@ -1469,6 +1475,15 @@ fn sys_getpid() -> u64 {
 
 fn sys_get_cycles() -> u64 {
     crate::arch::timer::read_cycles()
+}
+
+fn sys_va_writable(va: u64) -> u64 {
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    if aspace_id == 0 {
+        return 0;
+    }
+    let pt_root = crate::sched::scheduler::current_page_table_root();
+    if crate::mm::hat::va_writable(pt_root, va as usize) { 1 } else { 0 }
 }
 
 fn sys_get_timer_freq() -> u64 {
