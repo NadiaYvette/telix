@@ -31,6 +31,34 @@ fn print_num(n: u64) {
 /// actual time on the host wall clock.
 static mut PHASE_T0_NS: u64 = 0;
 
+/// Cluster pre-shared key — must match discovery_srv::CLUSTER_PSK.
+/// Tier-5 piece D: SipHash-2-4 keyed auth tag on every announcement.
+/// Production will load from a config file; for now hardcoded so the
+/// inject-test phases can sign their synthetic frames.
+const CLUSTER_PSK: [u8; 16] = [
+    0x54, 0x4c, 0x58, 0x2d, 0x43, 0x4c, 0x55, 0x53,
+    0x54, 0x45, 0x52, 0x2d, 0x50, 0x53, 0x4b, 0x21,
+];
+
+/// Sign an announcement at `buf_va` whose signed prefix is `tag_off`
+/// bytes long, by writing 8 bytes of SipHash-2-4(PSK, prefix) at
+/// `buf_va + tag_off`.  Caller is responsible for sizing the buffer
+/// to hold the tag (i.e., payload_len passed to INJECT_FRAME must be
+/// `tag_off + 8`).
+fn sign_announcement(buf_va: usize, tag_off: usize) {
+    let mut signed = [0u8; 1500];
+    unsafe {
+        let src = buf_va as *const u8;
+        for i in 0..tag_off { signed[i] = core::ptr::read_volatile(src.add(i)); }
+    }
+    let tag = userlib::siphash::siphash_2_4(&CLUSTER_PSK, &signed[..tag_off]);
+    let tag_b = tag.to_le_bytes();
+    unsafe {
+        let dst = buf_va as *mut u8;
+        for i in 0..8 { core::ptr::write_volatile(dst.add(tag_off + i), tag_b[i]); }
+    }
+}
+
 /// Stamp a phase boundary with elapsed-since-init in ms.  Use sparingly
 /// at known-interesting phase transitions so a slow boot's log shows
 /// exactly which phase ate the budget.  Format:
@@ -786,11 +814,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // magic "TLXD"
                     let mag = 0x44584C54u32.to_le_bytes();
                     for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
-                    // version=1, flags=0
+                    // version=1, flags=FLAG_AUTH_TAG_PRESENT (0x0002)
                     let v = 1u16.to_le_bytes();
                     core::ptr::write_volatile(dst.add(4), v[0]);
                     core::ptr::write_volatile(dst.add(5), v[1]);
-                    core::ptr::write_volatile(dst.add(6), 0u8);
+                    core::ptr::write_volatile(dst.add(6), 0x02u8);
                     core::ptr::write_volatile(dst.add(7), 0u8);
                     // node_uuid: distinctive pattern that can't collide
                     // with discovery_srv's randomly-generated own UUID.
@@ -836,14 +864,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  [disc] grant_pages inject failed\n");
                 }
                 if ok {
-                    // Send INJECT_FRAME with payload_len = header + 1 service UUID,
+                    // Sign the announcement at the tail of the signed
+                    // region (after svc UUID).  payload_len becomes
+                    // 36 + 16 + 8 = 60.
+                    sign_announcement(inject_local, 36 + 16);
+                    // Send INJECT_FRAME with payload_len = header + 1 service UUID + auth tag,
                     // synthetic src_mac so we can verify it round-trips through
                     // DISCOVERY_LOOKUP_SERVICE_OK / SVCREG_LOOKUP_REMOTE_OK.
                     // 0x0000_aabbccdd_eeff is a recognisable test MAC
                     // (low 48 bits == aa:bb:cc:dd:ee:ff, mac_to_u64 encoding).
                     const TEST_SRC_MAC: u64 = 0x0000_aabbccdd_eeff;
                     match syscall::call(disc_port, 0x4D07,
-                                        INJECT_GRANT_VA as u64, 36 + 16,
+                                        INJECT_GRANT_VA as u64, 36 + 16 + 8,
                                         TEST_SRC_MAC, 0) {
                         Some(r) if r.tag == 0x4D08 => {}
                         _ => {
@@ -1246,7 +1278,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let v = 1u16.to_le_bytes();
                 core::ptr::write_volatile(dst.add(4), v[0]);
                 core::ptr::write_volatile(dst.add(5), v[1]);
-                core::ptr::write_volatile(dst.add(6), 0u8);
+                // flags = FLAG_AUTH_TAG_PRESENT (0x0002)
+                core::ptr::write_volatile(dst.add(6), 0x02u8);
                 core::ptr::write_volatile(dst.add(7), 0u8);
                 for i in 0..16 { core::ptr::write_volatile(dst.add(8 + i), peer_uuid[i]); }
                 let ts = syscall::clock_gettime().to_le_bytes();
@@ -1255,6 +1288,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 for i in 0..3 { core::ptr::write_volatile(dst.add(33 + i), 0u8); }
                 for i in 0..16 { core::ptr::write_volatile(dst.add(36 + i), svc_uuid[i]); }
             }
+            sign_announcement(inj_local, 36 + 16);
             const INJ_GRANT: usize = 0xC_0000_0000;
             if !syscall::grant_pages(disc_port, inj_local, INJ_GRANT, 1, false) {
                 ok = false;
@@ -1262,7 +1296,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
             if ok {
                 match syscall::call(disc_port, 0x4D07,
-                                    INJ_GRANT as u64, 36 + 16,
+                                    INJ_GRANT as u64, 36 + 16 + 8,
                                     PEER_SRC_MAC, 0) {
                     Some(r) if r.tag == 0x4D08 => {}
                     _ => {
@@ -1412,8 +1446,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     let v = 1u16.to_le_bytes();
                     core::ptr::write_volatile(dst.add(4), v[0]);
                     core::ptr::write_volatile(dst.add(5), v[1]);
-                    // flags = FLAG_HAS_TCP4_ENDPOINT (0x0001)
-                    core::ptr::write_volatile(dst.add(6), 0x01u8);
+                    // flags = FLAG_HAS_TCP4_ENDPOINT | FLAG_AUTH_TAG_PRESENT
+                    //       = 0x0001 | 0x0002 = 0x0003
+                    core::ptr::write_volatile(dst.add(6), 0x03u8);
                     core::ptr::write_volatile(dst.add(7), 0x00u8);
                     for i in 0..16 { core::ptr::write_volatile(dst.add(8 + i), peer_uuid[i]); }
                     let ts = syscall::clock_gettime().to_le_bytes();
@@ -1428,15 +1463,17 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     core::ptr::write_volatile(dst.add(56), port_b[0]);
                     core::ptr::write_volatile(dst.add(57), port_b[1]);
                 }
+                // Sign over header + svc + endpoint (tag at offset 58).
+                sign_announcement(inj_local, 36 + 16 + 6);
                 const INJ_GRANT: usize = 0xC_0002_0000;
                 if !syscall::grant_pages(disc_port, inj_local, INJ_GRANT, 1, false) {
                     ok = false;
                     syscall::debug_puts(b"  [endp] grant inj-to-disc failed\n");
                 }
                 if ok {
-                    // payload_len = header(36) + 1 service(16) + endpoint(6) = 58
+                    // payload_len = header(36) + svc(16) + endpoint(6) + tag(8) = 66
                     match syscall::call(disc_port, 0x4D07,
-                                        INJ_GRANT as u64, 58,
+                                        INJ_GRANT as u64, 66,
                                         0, 0) {
                         Some(r) if r.tag == 0x4D08 => {}
                         _ => {
@@ -1593,6 +1630,123 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 5r proxy_srv send-by-UUID routing: PASSED\n");
         } else {
             syscall::debug_puts(b"Phase 5r proxy_srv send-by-UUID routing: FAILED\n");
+        }
+    }
+
+    // --- Phase 5s: cluster auth tag rejection (Tier-5 piece D) ---
+    // Inject TWO bad announcements (no flag, and flag-but-bad-tag) and
+    // verify discovery_srv's PEER_INSERT_COUNT does NOT advance.  We
+    // can't directly observe REJECT counts without a new RPC, so use
+    // count_active_peers via DISCOVERY_GET_STATS as a proxy: the bad
+    // injects must not appear as live peers.
+    syscall::debug_puts(b"  init: running cluster auth rejection test...\n");
+    {
+        let mut ok = true;
+        let disc_port = match syscall::ns_lookup(b"discovery") {
+            Some(p) => p,
+            None => { ok = false; syscall::debug_puts(b"  [auth] discovery ns_lookup failed\n"); 0 }
+        };
+        // Snapshot peer_insert - peer_evict via GET_STATS data[3].
+        let live_before = if ok {
+            match syscall::call(disc_port, 0x4D05, 0, 0, 0, 0) {
+                Some(r) if r.tag == 0x4D06 => r.data[3],
+                _ => { ok = false; 0 }
+            }
+        } else { 0 };
+        // Build a no-flag announcement (FLAG_AUTH_TAG_PRESENT cleared).
+        if ok {
+            let nf_local = match syscall::mmap_anon(0, 1, 1) {
+                Some(va) => { unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); } va }
+                None => { ok = false; 0 }
+            };
+            if ok {
+                unsafe {
+                    let dst = nf_local as *mut u8;
+                    let mag = 0x44584C54u32.to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
+                    core::ptr::write_volatile(dst.add(4), 1u8);
+                    core::ptr::write_volatile(dst.add(5), 0u8);
+                    // flags = 0 — should be rejected (no auth tag).
+                    core::ptr::write_volatile(dst.add(6), 0u8);
+                    core::ptr::write_volatile(dst.add(7), 0u8);
+                    let bad_uuid: [u8; 16] = [0x99; 16];
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(8 + i), bad_uuid[i]); }
+                    let ts = syscall::clock_gettime().to_le_bytes();
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(24 + i), ts[i]); }
+                    core::ptr::write_volatile(dst.add(32), 0u8);
+                    for i in 0..3 { core::ptr::write_volatile(dst.add(33 + i), 0u8); }
+                }
+                const NF_GRANT: usize = 0xC_0003_0000;
+                if !syscall::grant_pages(disc_port, nf_local, NF_GRANT, 1, false) {
+                    ok = false;
+                    syscall::debug_puts(b"  [auth] grant nf-to-disc failed\n");
+                }
+                if ok {
+                    // INJECT replies OK regardless of internal accept/reject.
+                    let _ = syscall::call(disc_port, 0x4D07, NF_GRANT as u64, 36, 0, 0);
+                }
+            }
+        }
+        // Build a wrong-tag announcement (flag set but tag is garbage).
+        if ok {
+            let bt_local = match syscall::mmap_anon(0, 1, 1) {
+                Some(va) => { unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); } va }
+                None => { ok = false; 0 }
+            };
+            if ok {
+                unsafe {
+                    let dst = bt_local as *mut u8;
+                    let mag = 0x44584C54u32.to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
+                    core::ptr::write_volatile(dst.add(4), 1u8);
+                    core::ptr::write_volatile(dst.add(5), 0u8);
+                    // flags = FLAG_AUTH_TAG_PRESENT but tag below is wrong.
+                    core::ptr::write_volatile(dst.add(6), 0x02u8);
+                    core::ptr::write_volatile(dst.add(7), 0u8);
+                    let bad_uuid: [u8; 16] = [0x88; 16];
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(8 + i), bad_uuid[i]); }
+                    let ts = syscall::clock_gettime().to_le_bytes();
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(24 + i), ts[i]); }
+                    core::ptr::write_volatile(dst.add(32), 0u8);
+                    for i in 0..3 { core::ptr::write_volatile(dst.add(33 + i), 0u8); }
+                    // Bogus tag bytes (would never match siphash output).
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(36 + i), 0xAAu8); }
+                }
+                const BT_GRANT: usize = 0xC_0004_0000;
+                if !syscall::grant_pages(disc_port, bt_local, BT_GRANT, 1, false) {
+                    ok = false;
+                    syscall::debug_puts(b"  [auth] grant bt-to-disc failed\n");
+                }
+                if ok {
+                    let _ = syscall::call(disc_port, 0x4D07, BT_GRANT as u64, 44, 0, 0);
+                }
+            }
+        }
+        // Snapshot peer_insert - peer_evict again; must NOT have grown.
+        // (It may shrink — TTL-based eviction can fire during the test
+        // and that's not a Phase 5s failure.)
+        if ok {
+            match syscall::call(disc_port, 0x4D05, 0, 0, 0, 0) {
+                Some(r) if r.tag == 0x4D06 => {
+                    if r.data[3] > live_before {
+                        ok = false;
+                        syscall::debug_puts(b"  [auth] live count grew despite bad tag (before=");
+                        print_num(live_before);
+                        syscall::debug_puts(b" after=");
+                        print_num(r.data[3]);
+                        syscall::debug_puts(b")\n");
+                    }
+                }
+                _ => {
+                    ok = false;
+                    syscall::debug_puts(b"  [auth] GET_STATS post-inject failed\n");
+                }
+            }
+        }
+        if ok {
+            syscall::debug_puts(b"Phase 5s cluster auth rejection: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5s cluster auth rejection: FAILED\n");
         }
     }
 

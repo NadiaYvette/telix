@@ -114,6 +114,20 @@ const ANNOUNCE_HEADER_LEN: usize = 36;
 const FLAG_HAS_TCP4_ENDPOINT: u16 = 0x0001;
 /// Trailer length when FLAG_HAS_TCP4_ENDPOINT is set.
 const TCP4_ENDPOINT_LEN: usize = 6;
+/// Tier-5 piece D: cluster auth tag (8-byte SipHash-2-4 truncation
+/// over the announcement bytes preceding the tag, computed with
+/// CLUSTER_PSK).  Receivers that recognise the flag REQUIRE a matching
+/// tag; receivers that don't see the flag REJECT the announcement
+/// (cluster auth is mandatory once enabled).
+const FLAG_AUTH_TAG_PRESENT: u16 = 0x0002;
+const AUTH_TAG_LEN: usize = 8;
+/// Cluster pre-shared key.  Hardcoded for the first cut; production
+/// will load from a config file or env-var.  Any node sharing this
+/// constant is in our cluster.
+const CLUSTER_PSK: [u8; 16] = [
+    0x54, 0x4c, 0x58, 0x2d, 0x43, 0x4c, 0x55, 0x53,
+    0x54, 0x45, 0x52, 0x2d, 0x50, 0x53, 0x4b, 0x21,
+];
 
 // ---------------------------------------------------------------------------
 // eth_srv interface (matches eth_srv NETIF protocol).
@@ -363,6 +377,17 @@ fn parse_announcement_from(buf_va: usize, payload_len: usize, src_mac: u64) {
         flags_bytes[0] = core::ptr::read_volatile(buf.add(6));
         flags_bytes[1] = core::ptr::read_volatile(buf.add(7));
         let flags = u16::from_le_bytes(flags_bytes);
+        // Cluster auth (Tier-5 piece D) is mandatory: a frame without
+        // FLAG_AUTH_TAG_PRESENT can't be from a peer that knows our
+        // PSK, so we reject before reading any further.  The actual
+        // tag verification happens after we know svc_count and the
+        // optional endpoint trailer's footprint, since those determine
+        // where the tag sits.
+        if (flags & FLAG_AUTH_TAG_PRESENT) == 0 {
+            FRAMES_REJECTED_COUNT += 1;
+            syscall::debug_puts(b"  [disc-parse] reject: no auth tag flag\n");
+            return;
+        }
         // node_uuid at offset 8.
         let mut uuid = [0u8; 16];
         for i in 0..16 { uuid[i] = core::ptr::read_volatile(buf.add(8 + i)); }
@@ -382,7 +407,33 @@ fn parse_announcement_from(buf_va: usize, payload_len: usize, src_mac: u64) {
         let max_from_payload = (payload_len - ANNOUNCE_HEADER_LEN) / 16;
         let svc_count = manifest_count.min(MAX_PEER_SERVICES).min(max_from_payload);
 
-        // Find existing slot or insert new.
+        // Determine where the auth tag sits: after the manifest, plus
+        // the endpoint trailer if FLAG_HAS_TCP4_ENDPOINT is set.
+        let endpoint_off = 36 + svc_count * 16;
+        let endpoint_present = (flags & FLAG_HAS_TCP4_ENDPOINT) != 0
+            && payload_len >= endpoint_off + TCP4_ENDPOINT_LEN;
+        let tag_off = endpoint_off + if endpoint_present { TCP4_ENDPOINT_LEN } else { 0 };
+
+        // Verify the auth tag BEFORE allocating any peer slot — bad
+        // tags must not perturb PEER_INSERT_COUNT or squat an entry.
+        if payload_len < tag_off + AUTH_TAG_LEN {
+            FRAMES_REJECTED_COUNT += 1;
+            syscall::debug_puts(b"  [disc-parse] reject: short auth tag\n");
+            return;
+        }
+        let mut signed = [0u8; 1500];
+        for i in 0..tag_off { signed[i] = core::ptr::read_volatile(buf.add(i)); }
+        let mut tag_b = [0u8; 8];
+        for i in 0..AUTH_TAG_LEN { tag_b[i] = core::ptr::read_volatile(buf.add(tag_off + i)); }
+        let received = u64::from_le_bytes(tag_b);
+        let expected = userlib::siphash::siphash_2_4(&CLUSTER_PSK, &signed[..tag_off]);
+        if received != expected {
+            FRAMES_REJECTED_COUNT += 1;
+            syscall::debug_puts(b"  [disc-parse] reject: bad auth tag\n");
+            return;
+        }
+
+        // Tag verified — now safe to allocate / refresh a slot.
         let now_ns = syscall::clock_gettime();
         let mut slot: Option<usize> = None;
         for i in 0..MAX_PEERS {
@@ -394,9 +445,6 @@ fn parse_announcement_from(buf_va: usize, payload_len: usize, src_mac: u64) {
         let idx = match slot {
             Some(i) => i,
             None => {
-                // Linear scan for free slot.  Full table → drop the
-                // announcement; eviction in maintain_peer_table will
-                // free space at the next interval.
                 let mut found: Option<usize> = None;
                 for i in 0..MAX_PEERS {
                     if !PEERS[i].in_use {
@@ -436,14 +484,8 @@ fn parse_announcement_from(buf_va: usize, payload_len: usize, src_mac: u64) {
                     core::ptr::read_volatile(buf.add(36 + s * 16 + b));
             }
         }
-        // Optional tcp4_endpoint trailer (Tier-5 piece C).  Sits at
-        // offset 36 + 16*svc_count when FLAG_HAS_TCP4_ENDPOINT is set.
-        // We treat absence as "clear" — a peer dropping its TCP
-        // endpoint reannounces without the flag.
-        let endpoint_off = 36 + svc_count * 16;
-        if (flags & FLAG_HAS_TCP4_ENDPOINT) != 0
-            && payload_len >= endpoint_off + TCP4_ENDPOINT_LEN
-        {
+        // Optional tcp4_endpoint trailer (Tier-5 piece C).
+        if endpoint_present {
             let mut ip_b = [0u8; 4];
             for i in 0..4 { ip_b[i] = core::ptr::read_volatile(buf.add(endpoint_off + i)); }
             let mut port_b = [0u8; 2];
@@ -760,9 +802,10 @@ fn broadcast_announcement() {
         // magic
         let mag = DISCOVERY_MAGIC.to_le_bytes();
         for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
-        // version + flags
+        // version + flags.  FLAG_AUTH_TAG_PRESENT is mandatory under
+        // Tier-5 piece D — receivers reject unflagged announcements.
         let ver = DISCOVERY_VERSION.to_le_bytes();
-        let flg = 0u16.to_le_bytes();
+        let flg = FLAG_AUTH_TAG_PRESENT.to_le_bytes();
         core::ptr::write_volatile(dst.add(4), ver[0]);
         core::ptr::write_volatile(dst.add(5), ver[1]);
         core::ptr::write_volatile(dst.add(6), flg[0]);
@@ -808,7 +851,17 @@ fn broadcast_announcement() {
         }
         core::ptr::write_volatile(dst.add(32), svc_count as u8);
 
-        let payload_len = ANNOUNCE_HEADER_LEN + svc_count * 16;
+        // Append cluster auth tag (Tier-5 piece D) at the tail of the
+        // signed region.  Self-broadcast doesn't carry an endpoint
+        // (yet), so the tag sits immediately after the manifest.
+        let tag_off = ANNOUNCE_HEADER_LEN + svc_count * 16;
+        let mut signed = [0u8; 1500];
+        for i in 0..tag_off { signed[i] = core::ptr::read_volatile(dst.add(i)); }
+        let tag = userlib::siphash::siphash_2_4(&CLUSTER_PSK, &signed[..tag_off]);
+        let tag_b = tag.to_le_bytes();
+        for i in 0..AUTH_TAG_LEN { core::ptr::write_volatile(dst.add(tag_off + i), tag_b[i]); }
+
+        let payload_len = tag_off + AUTH_TAG_LEN;
 
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         #[cfg(target_arch = "x86_64")]
