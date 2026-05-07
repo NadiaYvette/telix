@@ -166,13 +166,17 @@ impl NodeEntry {
     }
 }
 
-struct ProxySrv {
+/// TCP-direct transport: existing IP+port-based path.  Owns the
+/// per-node connection table, net_srv handle, and accept-state.
+/// Migrated from the previous ProxySrv struct so it can sit
+/// alongside EthernetTransport under the multi-transport dispatch.
+struct TcpTransport {
     my_port: u64,
     reply_port: u64,
     net_port: u64,
     my_node_id: u16,
     nodes: [NodeEntry; MAX_NODES],
-    // Pending accept: true if we're waiting for incoming connections.
+    /// True if we're waiting for incoming connections.
     accepting: bool,
 }
 
@@ -237,53 +241,46 @@ impl EthernetTransport {
     }
 }
 
-/// Dispatch enum.  Add variants for new transports; the main loop
-/// uses `Transport::send`, `Transport::ready`, and (for inbound)
-/// `Transport::rx_local_va`.
-#[allow(dead_code)] // Tcp variant is staged for the next commit
-enum Transport {
-    Ethernet(EthernetTransport),
-    /// TODO: migrate existing handle_outbound/handle_inbound_data/
-    /// handle_accept into a TcpTransport that constructs into this
-    /// variant.  Tracked as next clustering worklist item.
-    Tcp,
+/// Multi-transport container.  Owns one of each transport type; the
+/// dispatcher (Transports::send) picks based on PeerAddr variant.
+/// Both transports register independently and run their inbound
+/// paths in parallel — the dispatch loop polls each.
+struct Transports {
+    ethernet: EthernetTransport,
+    /// Set lazily once main() has the my_port + reply_port + net_port
+    /// available; before that the TCP transport is not addressable
+    /// (peers with PeerAddr::Tcp4 routes get FAIL on send).
+    tcp_ready: bool,
 }
 
-impl Transport {
+impl Transports {
+    const fn new() -> Self {
+        Self {
+            ethernet: EthernetTransport::new(),
+            tcp_ready: false,
+        }
+    }
+
     /// Send a fully-formed proxy body (40-byte routing header +
-    /// payload) to the peer.  Returns true on successful submission.
+    /// payload) to the peer.  Picks transport from peer addr type.
+    /// For Tcp4, the actual TCP send still goes through the legacy
+    /// TcpTransport methods (handle_outbound / ensure_connection)
+    /// — this dispatcher just signals "this peer is reachable via
+    /// the TCP path" by returning the address pieces; the caller
+    /// is responsible for invoking the TCP method (transitional
+    /// state, narrowed in the next commit when the TCP send path
+    /// is fully encapsulated).
     fn send(&self, peer: &PeerAddr, body: &[u8]) -> bool {
-        match self {
-            Transport::Ethernet(eth) => match peer {
-                PeerAddr::Ethernet { mac } => eth_send_to_peer(eth, *mac, body),
-                _ => false, // wrong peer addr type for this transport
-            },
-            Transport::Tcp => false, // not yet under the trait
-        }
-    }
-
-    fn ready(&self) -> bool {
-        match self {
-            Transport::Ethernet(e) => e.ready(),
-            Transport::Tcp => false,
-        }
-    }
-
-    /// Returns the local VA where inbound frames land for this
-    /// transport, or 0 if the transport isn't ready / has no inbound
-    /// path.
-    fn rx_local_va(&self) -> usize {
-        match self {
-            Transport::Ethernet(e) => e.rx_local_va(),
-            Transport::Tcp => 0,
+        match peer {
+            PeerAddr::Ethernet { mac } => eth_send_to_peer(&self.ethernet, *mac, body),
+            PeerAddr::Tcp4 { .. } => self.tcp_ready, // signal-only for now
         }
     }
 }
 
-/// Single global transport handle.  Future revisions may have
-/// multiple (one per network or transport class) and dispatch by
-/// per-node config; for now there's exactly one Ethernet transport.
-static mut TRANSPORT: Transport = Transport::Ethernet(EthernetTransport::new());
+/// Single global Transports container.  Holds both transports'
+/// state; dispatch by PeerAddr variant.
+static mut TRANSPORT: Transports = Transports::new();
 /// Per-UUID subscriber registration.
 #[derive(Copy, Clone)]
 struct InboundSubscriber {
@@ -454,12 +451,7 @@ fn parse_proxy_frame_from(buf_va: usize, frame_len: usize, src_mac: u64) {
 /// payload_len, data[1] = src_mac.  Shared parser keeps the real and
 /// inject paths consistent.
 fn handle_eth_inbound(payload_len: usize, src_mac: u64) {
-    let rx_va = unsafe {
-        match &*(&raw const TRANSPORT) {
-            Transport::Ethernet(e) => e.rx_local_va(),
-            _ => 0,
-        }
-    };
+    let rx_va = unsafe { (*(&raw const TRANSPORT)).ethernet.rx_local_va() };
     if rx_va == 0 {
         unsafe {
             INBOUND_FRAMES_RECEIVED += 1;
@@ -623,7 +615,7 @@ fn unpack24(d1: u64, d2: u64, d3: u64, out: &mut [u8], len: usize) {
     }
 }
 
-impl ProxySrv {
+impl TcpTransport {
     fn find_node_by_id(&self, node_id: u16) -> Option<usize> {
         self.nodes
             .iter()
@@ -933,9 +925,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // the transport stays !ready() and PROXY_SEND_BY_PEER returns
     // FAIL until eth_srv comes online.
     unsafe {
-        if let Transport::Ethernet(eth) = &mut *(&raw mut TRANSPORT) {
-            try_register_eth_proxy(eth, my_port);
-        }
+        let t = &mut *(&raw mut TRANSPORT);
+        try_register_eth_proxy(&mut t.ethernet, my_port);
+        // tcp_ready is set below once the TcpTransport (srv) is
+        // constructed and its bind/listen is in place.
     }
 
     // Bind + listen on LISTEN_TCP_PORT for incoming proxy connections.
@@ -964,7 +957,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
-    let mut srv = ProxySrv {
+    let mut srv = TcpTransport {
         my_port,
         reply_port,
         net_port,
@@ -975,6 +968,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // Start accepting incoming connections.
     srv.try_accept();
+
+    // Signal the dispatcher that the TCP transport is now ready.
+    unsafe {
+        (*(&raw mut TRANSPORT)).tcp_ready = true;
+    }
 
     // Create port set for multiplexed recv.
     let set_id = syscall::port_set_create() as u32;
@@ -1059,7 +1057,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         core::slice::from_raw_parts(body_va as *const u8, body_len)
                     };
                     let peer = PeerAddr::Ethernet { mac };
-                    unsafe { (*(&raw const TRANSPORT)).send(&peer, body) }
+                    unsafe { (&*(&raw const TRANSPORT)).send(&peer, body) }
                 };
                 let tag = if ok { PROXY_SEND_BY_PEER_OK } else { PROXY_SEND_BY_PEER_FAIL };
                 let _ = syscall::reply(tag, 0, 0, 0, 0, 0);
