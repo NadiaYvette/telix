@@ -71,6 +71,17 @@ pub const SVCREG_LOOKUP_NOTFOUND: u64 = 0x7E1F;
 pub const SVCREG_STATS: u64 = 0x7E20;
 pub const SVCREG_STATS_OK: u64 = 0x7E21;
 
+/// Enumerate registered service UUIDs.  Caller must have grant_pages'd
+/// a page at `grant_va` into our aspace; we serialize active entries'
+/// UUIDs (16 bytes each, contiguous) into it, capped at `max_records`.
+/// Reply data[0] = number actually written, data[1] = total registered
+/// (so the caller can detect a too-small grant).
+///
+/// Used by discovery_srv to populate the manifest of its outgoing
+/// announcement frames.
+pub const SVCREG_LIST_UUIDS: u64 = 0x7E22;
+pub const SVCREG_LIST_UUIDS_OK: u64 = 0x7E23;
+
 /// Maximum simultaneous registrations.
 const MAX_ENTRIES: usize = 64;
 
@@ -236,6 +247,31 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                     c
                 };
                 let _ = syscall::reply(SVCREG_STATS_OK, n, 0, 0, 0, 0);
+            }
+            SVCREG_LIST_UUIDS => {
+                let grant_va = msg.data[0] as usize;
+                let max_records = msg.data[1] as usize;
+                let mut written = 0usize;
+                let mut total = 0u64;
+                unsafe {
+                    for i in 0..MAX_ENTRIES {
+                        if TABLE[i].in_use {
+                            total += 1;
+                            if grant_va != 0 && written < max_records {
+                                let dst = (grant_va + written * 16) as *mut u8;
+                                for b in 0..16 {
+                                    core::ptr::write_volatile(dst.add(b), TABLE[i].uuid[b]);
+                                }
+                                written += 1;
+                            }
+                        }
+                    }
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                }
+                let _ = syscall::reply(
+                    SVCREG_LIST_UUIDS_OK,
+                    written as u64, total, 0, 0, 0,
+                );
             }
             _ => {
                 let _ = syscall::reply(SVCREG_REGISTER_FAIL, 0, 0, 0, 0, 0);

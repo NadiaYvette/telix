@@ -184,6 +184,22 @@ static mut ETH_TX_LOCAL_VA: usize = 0;
 static mut ETH_RX_LOCAL_VA: usize = 0;
 static mut ETH_TX_CLIENT_ID: u64 = 0;
 static mut TX_REGISTERED: bool = false;
+
+/// Cached servicereg_srv port + scratch page where we serialize the
+/// list of locally-registered service UUIDs.  Zero until the first
+/// successful ns_lookup("servicereg").  Refreshed every announce
+/// (1 Hz) so newly-registered services land in the next broadcast.
+static mut SVCREG_PORT: u64 = 0;
+static mut SVCREG_SCRATCH_VA: usize = 0;
+/// Number of UUIDs currently in SVCREG_SCRATCH_VA, ≤ MAX_LOCAL_SVCS.
+static mut LOCAL_SVC_COUNT: u8 = 0;
+
+/// Cap on services advertised in our announcement.  Bounded by what
+/// fits in one Ethernet MTU after the 36-byte header (1500 - 36) / 16
+/// = 91, but our scratch page (4 KiB / 16 = 256) is the tighter
+/// constraint after we cap at 64 here for parity with eth_srv MTU
+/// math and to keep the scratch pre-fault simple.
+const MAX_LOCAL_SVCS: usize = 64;
 /// Counters surfaced to the boot log (and useful for cross-instance
 /// validation later: peer A's announce_count should equal peer B's
 /// frames_received_count modulo loss).
@@ -489,6 +505,94 @@ fn try_register_eth_tx(my_port: u64) {
     );
 }
 
+// servicereg_srv RPC tags — must match servicereg_srv.rs.  We pin them
+// here rather than importing because servicereg_srv exports them as
+// `pub const` on a binary crate, and binaries can't depend on each
+// other directly.  Drift is caught at runtime: a wrong tag returns
+// SVCREG_REGISTER_FAIL (0x7E0F) and we count it as a query failure.
+const SVCREG_LIST_UUIDS: u64 = 0x7E22;
+const SVCREG_LIST_UUIDS_OK: u64 = 0x7E23;
+
+/// Lazy-resolve servicereg_srv's port and allocate a scratch page
+/// where we'll cache its UUID list.  Best-effort; if servicereg_srv
+/// isn't up yet we'll retry on the next announce tick.
+fn ensure_svcreg() {
+    unsafe {
+        if SVCREG_PORT == 0 {
+            if let Some(p) = syscall::ns_lookup(b"servicereg") {
+                SVCREG_PORT = p;
+            } else {
+                return;
+            }
+        }
+        if SVCREG_SCRATCH_VA == 0 {
+            if let Some(va) = syscall::mmap_anon(0, 1, 1) {
+                core::ptr::write_volatile(va as *mut u8, 0u8);
+                SVCREG_SCRATCH_VA = va;
+            }
+        }
+    }
+}
+
+/// Refresh the cached LOCAL_SVCS list from servicereg_srv.  Called
+/// once per announce tick; one syscall + one IPC round-trip, bounded
+/// cost.
+fn refresh_local_svcs() {
+    ensure_svcreg();
+    unsafe {
+        if SVCREG_PORT == 0 || SVCREG_SCRATCH_VA == 0 {
+            LOCAL_SVC_COUNT = 0;
+            return;
+        }
+        // Per piece (b) of project_personality_vm_layout_abi note:
+        // pass the scratch_va in our aspace; servicereg_srv writes
+        // there because we'll also want to grant_pages it once at
+        // setup time.  No grant yet — servicereg_srv currently
+        // expects the va in its own aspace, which means we need to
+        // grant once before the first call.  Lazily set up here.
+    }
+    // Grant scratch into servicereg_srv's aspace once.  Subsequent
+    // calls reuse the grant.
+    static mut GRANTED: bool = false;
+    unsafe {
+        if !GRANTED && SVCREG_PORT != 0 && SVCREG_SCRATCH_VA != 0 {
+            // Reuse a per-server grant_va we choose.  Pick a value
+            // distinct from other servers to avoid the unchecked-deref
+            // shape from project_storage_srv_efi_part_pf.md.
+            const GRANT_VA: usize = 0x9_0000_0000;
+            // svcreg_srv resolves grant_va from our msg payload, so
+            // we encode it into msg.data[0] of SVCREG_LIST_UUIDS;
+            // the actual grant must already be in place when the
+            // server reads.
+            if syscall::grant_pages(SVCREG_PORT, SVCREG_SCRATCH_VA, GRANT_VA, 1, false) {
+                GRANTED = true;
+            } else {
+                return;
+            }
+        }
+        if !GRANTED {
+            return;
+        }
+        const GRANT_VA: usize = 0x9_0000_0000;
+        let resp = syscall::call(
+            SVCREG_PORT,
+            SVCREG_LIST_UUIDS,
+            GRANT_VA as u64,
+            MAX_LOCAL_SVCS as u64,
+            0, 0,
+        );
+        match resp {
+            Some(m) if m.tag == SVCREG_LIST_UUIDS_OK => {
+                let n = (m.data[0] as usize).min(MAX_LOCAL_SVCS);
+                LOCAL_SVC_COUNT = n as u8;
+            }
+            _ => {
+                // Leave previous count in place.  Next tick retries.
+            }
+        }
+    }
+}
+
 /// Build the 36-byte announcement header into the granted tx page,
 /// then send NETIF_XMIT to eth_srv with broadcast destination.
 /// No-op when TX_REGISTERED is false (eth_srv handshake skipped).
@@ -526,11 +630,40 @@ fn broadcast_announcement() {
         for i in 0..8 {
             core::ptr::write_volatile(dst.add(24 + i), ts[i]);
         }
-        // manifest_count + reserved
-        core::ptr::write_volatile(dst.add(32), 0u8);
+        // manifest_count + reserved.  manifest_count is written below
+        // after we copy the UUIDs in (so we can use the source-of-truth
+        // count post-cap rather than the value we promised).
         for i in 0..3 {
             core::ptr::write_volatile(dst.add(33 + i), 0u8);
         }
+
+        // Manifest: copy LOCAL_SVC_COUNT × 16-byte UUIDs from
+        // SVCREG_SCRATCH_VA (filled by refresh_local_svcs at announce
+        // time) into bytes [36, 36 + 16*N) of the announcement.
+        // Bounds: cap at MAX_LOCAL_SVCS and at MTU - 36 to fit one
+        // Ethernet frame.
+        let mut svc_count = LOCAL_SVC_COUNT as usize;
+        if svc_count > MAX_LOCAL_SVCS {
+            svc_count = MAX_LOCAL_SVCS;
+        }
+        // Don't blow the 1500-byte MTU: 36 header + 16 per UUID.
+        let max_by_mtu = (1500 - ANNOUNCE_HEADER_LEN) / 16;
+        if svc_count > max_by_mtu {
+            svc_count = max_by_mtu;
+        }
+        if svc_count > 0 && SVCREG_SCRATCH_VA != 0 {
+            let svc_src = SVCREG_SCRATCH_VA as *const u8;
+            for i in 0..(svc_count * 16) {
+                core::ptr::write_volatile(
+                    dst.add(36 + i),
+                    core::ptr::read_volatile(svc_src.add(i)),
+                );
+            }
+        }
+        core::ptr::write_volatile(dst.add(32), svc_count as u8);
+
+        let payload_len = ANNOUNCE_HEADER_LEN + svc_count * 16;
+
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         #[cfg(target_arch = "x86_64")]
         core::arch::asm!("mfence");
@@ -543,7 +676,7 @@ fn broadcast_announcement() {
         let _ = syscall::send_nb_4(
             ETH_PORT,
             NETIF_XMIT,
-            ANNOUNCE_HEADER_LEN as u64,
+            payload_len as u64,
             0u64, // broadcast
             ETHERTYPE_DISCOVERY as u64,
             ETH_TX_CLIENT_ID,
@@ -596,6 +729,7 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
         let now_ns = syscall::clock_gettime();
         let elapsed_ms = (now_ns.wrapping_sub(last_announce_ns)) / 1_000_000;
         if elapsed_ms >= ANNOUNCE_INTERVAL_MS {
+            refresh_local_svcs();
             broadcast_announcement();
             maintain_peer_table(now_ns);
             last_announce_ns = now_ns;
