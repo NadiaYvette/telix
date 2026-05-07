@@ -25,6 +25,27 @@ fn print_num(n: u64) {
     }
 }
 
+/// Captured at main() entry; subsequent phase_log calls subtract from
+/// this to print elapsed-since-init wallclock.  In real ns post the
+/// TSC-calibration fix (commit 06dfa12), so the timestamps reflect
+/// actual time on the host wall clock.
+static mut PHASE_T0_NS: u64 = 0;
+
+/// Stamp a phase boundary with elapsed-since-init in ms.  Use sparingly
+/// at known-interesting phase transitions so a slow boot's log shows
+/// exactly which phase ate the budget.  Format:
+///   [t+NNNNms] label
+fn phase_log(label: &[u8]) {
+    let now = syscall::clock_gettime();
+    let elapsed_ns = unsafe { now.wrapping_sub(PHASE_T0_NS) };
+    let elapsed_ms = elapsed_ns / 1_000_000;
+    syscall::debug_puts(b"[t+");
+    print_num(elapsed_ms);
+    syscall::debug_puts(b"ms] ");
+    syscall::debug_puts(label);
+    syscall::debug_puts(b"\n");
+}
+
 fn pack_name(name: &[u8]) -> (u64, u64, u64) {
     let mut words = [0u64; 3];
     for (i, &b) in name.iter().enumerate().take(24) {
@@ -76,7 +97,9 @@ const STEP_H_FOCUS_H13: bool = true;
 
 #[unsafe(no_mangle)]
 fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
+    unsafe { PHASE_T0_NS = syscall::clock_gettime(); }
     syscall::debug_puts(b"Telix init starting\n");
+    phase_log(b"main entry");
 
     // --- Test 1: Process lifecycle (spawn + exit + waitpid) ---
     let tid_hello = syscall::spawn(b"hello", 50);
@@ -123,6 +146,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
 
     syscall::debug_puts(b"Phase 5 process lifecycle + IPC test: PASSED\n");
+    phase_log(b"Phase 5 PASSED");
 
     // --- Test 5b: seL4-style call/reply IPC (run early, before long tests) ---
     syscall::debug_puts(b"  init: running call/reply IPC test (early)...\n");
@@ -627,6 +651,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    phase_log(b"entering Phase 5l (discovery_srv)");
+
     // --- Phase 5l: discovery_srv smoke ---
     // Spawn discovery_srv (Tier 5 distributed-bonding skeleton),
     // verify it registers with the name server, and exercise its
@@ -989,6 +1015,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    phase_log(b"entering Phase 145e (chronic stall point)");
+
     // --- Phase 145e: rt_sigaction early repro (before flaky I/O phases) ---
     syscall::debug_puts(b"  init: Phase 145e rt_sigaction early...\n");
     {
@@ -1156,6 +1184,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     //   3. Memfd SHM (memfd_create + ftruncate + mmap MAP_SHARED)
     //   4. Unix domain sockets (socket + bind + listen)
     // wayland_test.c returns 0 on success, 1-4 on failure.
+    phase_log(b"entering Step F (wayland infra)");
     syscall::debug_puts(b"  init: Step F wayland infra test...\n");
     {
         // Ensure uds_srv is up — section 4 of the test needs AF_UNIX sockets.
@@ -9297,6 +9326,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // exits within the budget without crashing.  Even a clean exit
     // saying "couldn't bind compositor protocol XYZ" tells us the
     // wayland socket handshake worked end-to-end.
+    phase_log(b"entering Step H13 (Xwayland + compositor)");
     syscall::debug_puts(b"  init: Step H13 Xwayland + wl_compositor_min...\n");
     {
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
