@@ -16,6 +16,7 @@ use crate::arch::platform::mm as arch_mm;
 // ---------------------------------------------------------------------------
 
 pub const USER_RWX_FLAGS: u64 = arch_mm::USER_RWX_FLAGS;
+pub const USER_RX_FLAGS: u64 = arch_mm::USER_RX_FLAGS;
 pub const USER_RW_FLAGS: u64 = arch_mm::USER_RW_FLAGS;
 pub const USER_RO_FLAGS: u64 = arch_mm::USER_RO_FLAGS;
 pub const PTE_SW_ZEROED: u64 = arch_mm::PTE_SW_ZEROED;
@@ -256,7 +257,12 @@ pub fn pte_flags_for_prot(prot: VmaProt) -> u64 {
     match prot {
         VmaProt::ReadOnly => USER_RO_FLAGS,
         VmaProt::ReadWrite => USER_RW_FLAGS,
-        VmaProt::ReadExec | VmaProt::ReadWriteExec => USER_RWX_FLAGS,
+        // Split: ReadExec (R-X) is true W^X — writes to .text fault.
+        // ReadWriteExec (RWX) stays writable (e.g. JITs that explicitly
+        // ask for RWX).  Pre-fix, both collapsed to RWX, leaving every
+        // .text segment silently writable.
+        VmaProt::ReadExec => USER_RX_FLAGS,
+        VmaProt::ReadWriteExec => USER_RWX_FLAGS,
         VmaProt::None => 0,
     }
 }

@@ -47,6 +47,10 @@ const MMU_PAGE_SIZE: usize = 4096;
 pub const USER_RWX_FLAGS: u64 = PTE_V | PTE_D | PTE_C_CC | PTE_SW_REF;
 pub const USER_RW_FLAGS: u64 = PTE_V | PTE_D | PTE_C_CC | PTE_SW_REF;
 pub const USER_RO_FLAGS: u64 = PTE_V | PTE_C_CC | PTE_SW_REF;
+/// R-X.  MIPS64 doesn't have a per-PTE no-execute bit in this PTE format
+/// (NX would need PageGrain RIE/XIE on R5+).  Same as USER_RO until that
+/// gets wired up — at minimum non-writable, which is what W^X demands.
+pub const USER_RX_FLAGS: u64 = PTE_V | PTE_C_CC | PTE_SW_REF;
 
 /// Create a leaf PTE from a physical address and flags.
 #[inline]

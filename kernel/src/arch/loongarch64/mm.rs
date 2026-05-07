@@ -63,6 +63,8 @@ unsafe fn pte_write(ptr: *mut u64, val: u64) {
 pub const USER_RWX_FLAGS: u64 = PTE_V | PTE_D | PTE_PLV_USER | PTE_MAT_CC | PTE_SW_REF;
 pub const USER_RW_FLAGS: u64 = PTE_V | PTE_D | PTE_PLV_USER | PTE_MAT_CC | PTE_NR | PTE_SW_REF;
 pub const USER_RO_FLAGS: u64 = PTE_V | PTE_PLV_USER | PTE_MAT_CC | PTE_NR | PTE_SW_REF;
+/// R-X (readable, executable, NOT writable): no PTE_D, no PTE_NR.  W^X for .text.
+pub const USER_RX_FLAGS: u64 = PTE_V | PTE_PLV_USER | PTE_MAT_CC | PTE_SW_REF;
 
 /// Create a leaf PTE from a physical address and flags.
 #[inline]

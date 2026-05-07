@@ -30,6 +30,9 @@ use crate::mm::radix_pt::{self, PteFormat};
 
 /// User page flags (public for main.rs).
 pub const USER_RWX_FLAGS: u64 = PTE_P | PTE_RW | PTE_US;
+/// R-X (executable, NOT writable).  Distinct from RWX so .text segments
+/// from ELF PT_LOAD with prot=R+X get true W^X — writes to .text fault.
+pub const USER_RX_FLAGS: u64 = PTE_P | PTE_US; // No PTE_RW, no PTE_NX
 pub const USER_RW_FLAGS: u64 = PTE_P | PTE_RW | PTE_US | PTE_NX;
 pub const USER_RO_FLAGS: u64 = PTE_P | PTE_US | PTE_NX; // No PTE_RW = read-only
 

@@ -119,6 +119,9 @@ pub const USER_RW_FLAGS: u64 = USER_PAGE | PT_UXN;
 const PT_AP_RO_ALL: u64 = 3 << 6;
 pub const USER_RO_FLAGS: u64 =
     PT_VALID | PT_PAGE | PT_AF | PT_SH_INNER | PT_AP_RO_ALL | PT_ATTR_IDX_0 | PT_UXN;
+/// R-X (executable, NOT writable): AP_RO_ALL, no UXN.  W^X for .text.
+pub const USER_RX_FLAGS: u64 =
+    PT_VALID | PT_PAGE | PT_AF | PT_SH_INNER | PT_AP_RO_ALL | PT_ATTR_IDX_0;
 
 // ---------------------------------------------------------------------------
 // PteFormat implementation for the generic radix walker
