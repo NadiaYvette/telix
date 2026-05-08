@@ -931,12 +931,24 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
     // reply (caller hangs, then times out).  Use the cap-aware
     // non-blocking variant in a sleep_ms-paced loop so RPCs reply
     // correctly and the announce timer advances.
+    // Tier-5 deadlock fix: refresh_local_svcs blocks on servicereg
+    // (SVCREG_LIST_UUIDS).  servicereg, while servicing
+    // SVCREG_LOOKUP_REMOTE from elsewhere, calls back into us via
+    // DISCOVERY_LOOKUP_SERVICE.  Both wait on each other → 30 s mutual
+    // timeout, peers age past TTL, Phase 5p flake.  Local services
+    // are registered at boot and don't change at runtime, so a single
+    // refresh on first announce is enough; subsequent broadcasts use
+    // the cached LOCAL_SVC_COUNT.
+    let mut local_svcs_refreshed = false;
     let mut last_announce_ns: u64 = 0;
     loop {
         let now_ns = syscall::clock_gettime();
         let elapsed_ms = (now_ns.wrapping_sub(last_announce_ns)) / 1_000_000;
         if elapsed_ms >= ANNOUNCE_INTERVAL_MS {
-            refresh_local_svcs();
+            if !local_svcs_refreshed {
+                refresh_local_svcs();
+                local_svcs_refreshed = true;
+            }
             broadcast_announcement();
             maintain_peer_table(now_ns);
             last_announce_ns = now_ns;
