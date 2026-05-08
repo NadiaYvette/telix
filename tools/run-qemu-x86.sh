@@ -91,7 +91,10 @@ if [ "${TELIX_AUDIO:-}" = "1" ]; then
 fi
 
 # Add virtio-net.
-# TELIX_NET=tap uses a TAP device (requires sudo setup, supports raw IP proto 132).
+# TELIX_NET=tap        TAP device (requires sudo setup, supports raw IP).
+# TELIX_NET=sock_listen   Socket netdev listening on TELIX_NET_PORT
+#                         (Tier-5 piece F: virtual L2 between two QEMUs).
+# TELIX_NET=sock_connect  Socket netdev connecting to TELIX_NET_PORT.
 # Default: SLIRP user-mode networking (no raw IP, but zero-config).
 case "${TELIX_NET:-}" in
     tap)
@@ -99,6 +102,23 @@ case "${TELIX_NET:-}" in
         QEMU_ARGS+=(
             -netdev tap,id=net0,ifname="$TAP_IF",script=no,downscript=no
             -device virtio-net-pci,netdev=net0
+        )
+        ;;
+    sock_listen|sock_connect)
+        # Tier-5 piece F: UDP-multicast socket netdev — both instances
+        # join the same multicast group so all L2 frames each sends are
+        # seen by the other.  Simpler than TCP listen/connect and works
+        # without timing-coordinated startup.  MAC differs per instance
+        # so the kernel virtio-net RX filter accepts both broadcast and
+        # the unique unicast.
+        MCAST_GROUP="${TELIX_NET_MCAST:-230.0.0.1:7710}"
+        case "${TELIX_NET}" in
+            sock_listen)  MAC="52:54:00:11:11:01" ;;
+            sock_connect) MAC="52:54:00:11:11:02" ;;
+        esac
+        QEMU_ARGS+=(
+            -netdev socket,id=net0,mcast=${MCAST_GROUP},localaddr=127.0.0.1
+            -device virtio-net-pci,netdev=net0,mac=${MAC}
         )
         ;;
     *)

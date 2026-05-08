@@ -1176,6 +1176,31 @@ impl EthDev {
             return;
         }
         let ethertype = get_u16_be(frame, 12);
+        // Tier-5 piece F probe: log only cluster-relevant ethertypes
+        // (0xd15c discovery, 0xd15d proxy) so the two-instance pair
+        // log shows when each side receives the other's broadcasts
+        // without drowning the trace in batman/IPv4/ARP/0x4305 noise.
+        if ethertype == 0xd15c || ethertype == 0xd15d {
+            syscall::debug_puts(b"  [eth-rx] et=0x");
+            let mut buf = [0u8; 4];
+            for i in 0..4 {
+                let nibble = (ethertype >> (12 - i * 4)) & 0xF;
+                buf[i] = if nibble < 10 {
+                    b'0' + nibble as u8
+                } else {
+                    b'a' + (nibble as u8 - 10)
+                };
+            }
+            syscall::debug_puts(&buf);
+            syscall::debug_puts(b" len=");
+            let mut nbuf = [0u8; 8];
+            let mut n = frame_len;
+            let mut i = 8;
+            if n == 0 { i -= 1; nbuf[i] = b'0'; }
+            while n > 0 && i > 0 { i -= 1; nbuf[i] = b'0' + (n % 10) as u8; n /= 10; }
+            syscall::debug_puts(&nbuf[i..8]);
+            syscall::debug_puts(b"\n");
+        }
 
         match ethertype {
             0x0806 => {
