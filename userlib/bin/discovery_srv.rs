@@ -99,10 +99,14 @@ const DISCOVERY_VERSION: u16 = 1;
 const ANNOUNCE_INTERVAL_MS: u64 = 1000;
 
 /// How long a peer entry is considered live.  After this many
-/// milliseconds without a fresh announcement, we evict.  3× the
-/// announce interval handles single dropped frames; missing 3 in a
-/// row is enough to call a peer dead.
-const PEER_TTL_MS: u64 = 3000;
+/// milliseconds without a fresh announcement, we evict.  Originally
+/// 3 × announce interval (= 3 s) — tight enough to catch dead peers
+/// quickly, but tight enough that KVM-steal-time hiccups (we've
+/// observed 13 s wake_lat tails on busy hosts) evict freshly-injected
+/// peers before tests can look them up.  10 s gives 10× the announce
+/// interval, comfortably absorbing scheduler stutters while still
+/// reaping truly-dead peers within a reasonable window.
+const PEER_TTL_MS: u64 = 10000;
 
 /// Minimum announcement payload size: header only, no service UUIDs.
 const ANNOUNCE_HEADER_LEN: usize = 36;

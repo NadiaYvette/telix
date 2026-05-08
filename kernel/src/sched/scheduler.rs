@@ -6064,7 +6064,12 @@ fn check_sleep_timers() {
         // thread runs immediately at the cost of cache locality.
         // Skip this re-target for the (target == waker) case
         // because last_cpu == self isn't a tail concern.
-        const STALE_TICK_THRESHOLD_NS: u64 = 100_000_000; // 100 ms
+        // Lowered from 100 ms to 30 ms after Phase 5p flake hunt:
+        // when KVM descheduled the host vCPU for >100 ms (we saw 94 s
+        // tick gaps), the original 100 ms threshold meant most wakes
+        // still went to a CPU that had no recent tick.  Retargeting
+        // to the waker CPU much sooner reduces the wake-latency tail.
+        const STALE_TICK_THRESHOLD_NS: u64 = 30_000_000; // 30 ms
         if target != waker_cpu && (target as usize) < smp::MAX_CPUS {
             let target_last = PER_CPU_LAST_TICK_NS[target as usize]
                 .load(Ordering::Relaxed);
