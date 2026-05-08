@@ -154,13 +154,40 @@ const WIRE_MAGIC: u32 = 0x544C5850; // "TLXP"
 /// Must match userlib/bin/discovery_srv.rs's CLUSTER_PSK exactly —
 /// proxy frames and discovery announcements share the same cluster
 /// boundary, so the same key authenticates both.  The tag sits at
-/// the END of the frame body (after dst_uuid + src_uuid + req_id +
-/// payload) and is computed over everything preceding it.
+/// the END of the frame body (after the fragment header + chunk) and
+/// is computed over everything preceding it.
 const AUTH_TAG_LEN: usize = 8;
 const CLUSTER_PSK: [u8; 16] = [
     0x54, 0x4c, 0x58, 0x2d, 0x43, 0x4c, 0x55, 0x53,
     0x54, 0x45, 0x52, 0x2d, 0x50, 0x53, 0x4b, 0x21,
 ];
+
+/// Tier-5 piece E: fragment header sits between the 8-byte TLXP
+/// wire header and the payload chunk.  Receivers reassemble bodies
+/// > MTU by accumulating chunks keyed on fragment_id.
+///
+/// Layout (16 bytes, little-endian):
+///   bytes 0..8   fragment_id     (u64) — identifies all fragments
+///                                       belonging to one logical body
+///   bytes 8..12  total_body_len  (u32) — full body byte count once
+///                                       fully reassembled
+///   bytes 12..16 fragment_offset (u32) — byte offset within the body
+///                                       where this fragment's chunk
+///                                       lands
+const FRAG_HDR_LEN: usize = 16;
+/// Maximum chunk payload that fits in one Ethernet MTU after the TLXP
+/// header, fragment header, and auth tag.  1500 - 8 - 16 - 8 = 1468.
+const MAX_FRAG_PAYLOAD: usize = 1500 - 8 - FRAG_HDR_LEN - AUTH_TAG_LEN;
+/// Maximum total body the reassembler handles per in-flight
+/// fragment_id.  Sized for the largest realistic IPC body we expect
+/// to ferry — multi-page grants are still single-frame today, so 8 KiB
+/// gives ample headroom without bloating per-subscriber buffers.
+const REASSEMBLY_MAX_BYTES: usize = 8192;
+/// Per-subscriber reassembly slots: how many independent in-flight
+/// fragment_ids we track concurrently.  4 is enough for typical
+/// cluster traffic patterns; over-quota fragments fall on the floor
+/// (with a counter bump) until a slot frees.
+const REASSEMBLY_SLOTS: usize = 4;
 const WIRE_FRAME_SIZE: usize = 64;
 
 // --- Capability bundle bits (mirror userlib::services::CAP_*) ---
@@ -374,6 +401,52 @@ static mut INBOUND_FRAMES_RECEIVED: u64 = 0;
 static mut INBOUND_FRAMES_REJECTED: u64 = 0;
 static mut INBOUND_FRAMES_NO_SUB: u64 = 0;
 
+/// Tier-5 piece E: in-flight reassembly slot.  Each slot tracks one
+/// fragment_id's accumulated bytes.  When `received_bytes` equals
+/// `total_body_len`, we deliver the buffer to the subscriber and free
+/// the slot.  Slots are claimed lazily on first-fragment arrival;
+/// stale slots get evicted when `REASSEMBLY_SLOTS` is reached and a
+/// new fragment_id arrives (FIFO, oldest wins eviction).  No timeout
+/// today — partial bodies linger until their slot is reused, which
+/// matches "best-effort delivery, no retransmit" semantics for now.
+struct ReassemblySlot {
+    in_use: bool,
+    fragment_id: u64,
+    total_body_len: usize,
+    received_bytes: usize,
+    /// Bitmap of received-byte ranges so duplicate fragments don't
+    /// double-count.  Tracked at FRAG_HDR-aligned offsets only.
+    /// NOTE: For the first cut we just count bytes and trust the
+    /// sender — duplicates inflate received_bytes and would deliver
+    /// early if a sender retransmits.  Tighten when (F) lights up.
+    buf: [u8; REASSEMBLY_MAX_BYTES],
+}
+
+impl ReassemblySlot {
+    const fn empty() -> Self {
+        Self {
+            in_use: false,
+            fragment_id: 0,
+            total_body_len: 0,
+            received_bytes: 0,
+            buf: [0; REASSEMBLY_MAX_BYTES],
+        }
+    }
+}
+
+static mut REASSEMBLY: [ReassemblySlot; REASSEMBLY_SLOTS] = [
+    ReassemblySlot::empty(),
+    ReassemblySlot::empty(),
+    ReassemblySlot::empty(),
+    ReassemblySlot::empty(),
+];
+
+/// Counter for the next fragment_id we assign on send.  64-bit so
+/// rollover is irrelevant.  Single-instance test variant; a real
+/// cluster wants this seeded from getrandom to avoid cross-node
+/// id collisions.
+static mut NEXT_FRAGMENT_ID: u64 = 1;
+
 /// Cached discovery_srv port + scratch grant (Tier-5 piece C, step 2/3).
 /// Set the first time learn_from_discovery runs; reused on subsequent
 /// polls so we're not re-resolving + re-granting per call.  0 means
@@ -463,9 +536,10 @@ fn try_register_eth_proxy(eth: &mut EthernetTransport, my_port: u64) {
 fn parse_proxy_frame_from(buf_va: usize, frame_len: usize, src_mac: u64) {
     unsafe {
         INBOUND_FRAMES_RECEIVED += 1;
-        // Need 8-byte wire header + 40-byte routing header + 8-byte
-        // auth tag at minimum.
-        if buf_va == 0 || frame_len < 8 + ROUTING_HDR_LEN + AUTH_TAG_LEN {
+        // Minimum frame: 8-byte TLXP header + 16-byte fragment header
+        // + 40-byte routing header + 8-byte auth tag.  (Even single-
+        // fragment frames carry a fragment header now — Tier-5 piece E.)
+        if buf_va == 0 || frame_len < 8 + FRAG_HDR_LEN + ROUTING_HDR_LEN + AUTH_TAG_LEN {
             INBOUND_FRAMES_REJECTED += 1;
             return;
         }
@@ -486,13 +560,14 @@ fn parse_proxy_frame_from(buf_va: usize, frame_len: usize, src_mac: u64) {
         let len_hi = core::ptr::read_volatile(buf.add(7));
         let body_len = (len_lo as usize) | ((len_hi as usize) << 8);
         if 8 + body_len > frame_len
-            || body_len < ROUTING_HDR_LEN + AUTH_TAG_LEN
+            || body_len < FRAG_HDR_LEN + AUTH_TAG_LEN
         {
             INBOUND_FRAMES_REJECTED += 1;
             return;
         }
         // Tier-5 piece D: verify SipHash-2-4 auth tag at the tail of
-        // the body before any further parsing or subscriber demux.
+        // the body before any further parsing.  Tag covers fragment
+        // header + chunk payload.
         let signed_len = body_len - AUTH_TAG_LEN;
         let mut signed = [0u8; 1500];
         for i in 0..signed_len { signed[i] = core::ptr::read_volatile(buf.add(8 + i)); }
@@ -507,11 +582,64 @@ fn parse_proxy_frame_from(buf_va: usize, frame_len: usize, src_mac: u64) {
             syscall::debug_puts(b"  [proxy-parse] reject: bad auth tag\n");
             return;
         }
-        // Read dst_service_uuid from body bytes 0..16.
-        let body_va = buf.add(8);
+        // Tier-5 piece E: parse fragment header at body bytes 0..16.
+        let mut frag_id_b = [0u8; 8];
+        for i in 0..8 { frag_id_b[i] = core::ptr::read_volatile(buf.add(8 + i)); }
+        let fragment_id = u64::from_le_bytes(frag_id_b);
+        let mut total_len_b = [0u8; 4];
+        for i in 0..4 { total_len_b[i] = core::ptr::read_volatile(buf.add(8 + 8 + i)); }
+        let total_body_len = u32::from_le_bytes(total_len_b) as usize;
+        let mut frag_off_b = [0u8; 4];
+        for i in 0..4 { frag_off_b[i] = core::ptr::read_volatile(buf.add(8 + 12 + i)); }
+        let fragment_offset = u32::from_le_bytes(frag_off_b) as usize;
+        let chunk_len = signed_len - FRAG_HDR_LEN;
+        if total_body_len > REASSEMBLY_MAX_BYTES
+            || total_body_len < ROUTING_HDR_LEN
+            || fragment_offset + chunk_len > total_body_len
+        {
+            INBOUND_FRAMES_REJECTED += 1;
+            syscall::debug_puts(b"  [proxy-parse] reject: bad fragment header\n");
+            return;
+        }
+        // Find or claim a reassembly slot keyed on fragment_id.
+        let mut slot_idx: Option<usize> = None;
+        for i in 0..REASSEMBLY_SLOTS {
+            if REASSEMBLY[i].in_use && REASSEMBLY[i].fragment_id == fragment_id {
+                slot_idx = Some(i);
+                break;
+            }
+        }
+        if slot_idx.is_none() {
+            // No existing slot — claim a free one, or evict the
+            // first occupied (FIFO; partial bodies are best-effort).
+            let mut free: Option<usize> = None;
+            for i in 0..REASSEMBLY_SLOTS {
+                if !REASSEMBLY[i].in_use { free = Some(i); break; }
+            }
+            let chosen = match free {
+                Some(i) => i,
+                None => 0, // evict slot 0
+            };
+            REASSEMBLY[chosen] = ReassemblySlot::empty();
+            REASSEMBLY[chosen].in_use = true;
+            REASSEMBLY[chosen].fragment_id = fragment_id;
+            REASSEMBLY[chosen].total_body_len = total_body_len;
+            slot_idx = Some(chosen);
+        }
+        let s = slot_idx.unwrap();
+        // Copy chunk into reassembly buffer at fragment_offset.
+        let chunk_va = buf.add(8 + FRAG_HDR_LEN);
+        for i in 0..chunk_len {
+            REASSEMBLY[s].buf[fragment_offset + i] = core::ptr::read_volatile(chunk_va.add(i));
+        }
+        REASSEMBLY[s].received_bytes += chunk_len;
+        if REASSEMBLY[s].received_bytes < REASSEMBLY[s].total_body_len {
+            return; // wait for more fragments
+        }
+        // Body fully reassembled — demux to subscriber.
+        let body_total = REASSEMBLY[s].total_body_len;
         let mut dst_uuid = [0u8; 16];
-        for i in 0..16 { dst_uuid[i] = core::ptr::read_volatile(body_va.add(i)); }
-        // Look up subscriber.
+        for i in 0..16 { dst_uuid[i] = REASSEMBLY[s].buf[i]; }
         let mut sub_idx: Option<usize> = None;
         for i in 0..MAX_INBOUND_SUBSCRIBERS {
             if INBOUND_SUBSCRIBERS[i].in_use && INBOUND_SUBSCRIBERS[i].uuid == dst_uuid {
@@ -519,29 +647,28 @@ fn parse_proxy_frame_from(buf_va: usize, frame_len: usize, src_mac: u64) {
                 break;
             }
         }
-        let idx = match sub_idx {
-            Some(i) => i,
+        match sub_idx {
+            Some(idx) => {
+                let sub = &INBOUND_SUBSCRIBERS[idx];
+                let dst = sub.grant_va as *mut u8;
+                for i in 0..body_total {
+                    core::ptr::write_volatile(dst.add(i), REASSEMBLY[s].buf[i]);
+                }
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                let _ = syscall::send_nb_4(
+                    sub.port,
+                    PROXY_INBOUND_FRAME,
+                    body_total as u64,
+                    src_mac,
+                    0, 0,
+                );
+            }
             None => {
                 INBOUND_FRAMES_NO_SUB += 1;
-                return; // no demux target; drop silently (counted)
             }
-        };
-        let sub = &INBOUND_SUBSCRIBERS[idx];
-        // Copy ONLY the signed prefix (routing header + payload) into
-        // the subscriber's grant_va.  The auth tag stays an internal
-        // proxy_srv concern — subscribers shouldn't have to strip it.
-        let dst = sub.grant_va as *mut u8;
-        for i in 0..signed_len {
-            core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(body_va.add(i)));
         }
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-        let _ = syscall::send_nb_4(
-            sub.port,
-            PROXY_INBOUND_FRAME,
-            signed_len as u64,
-            src_mac,
-            0, 0,
-        );
+        // Free the slot.
+        REASSEMBLY[s] = ReassemblySlot::empty();
     }
 }
 
@@ -572,42 +699,66 @@ fn eth_send_to_peer(eth: &EthernetTransport, peer_mac: u64, body: &[u8]) -> bool
     if body.len() < ROUTING_HDR_LEN {
         return false;
     }
-    // Tier-5 piece D: append SipHash-2-4 auth tag over the body bytes.
-    // The on-wire body length includes the tag.
-    let tag = userlib::siphash::siphash_2_4(&CLUSTER_PSK, body);
-    let tag_b = tag.to_le_bytes();
-    let signed_body_len = body.len() + AUTH_TAG_LEN;
-    if 8 + signed_body_len > 1500 {
+    if body.len() > REASSEMBLY_MAX_BYTES {
         return false;
     }
-    unsafe {
-        let dst = eth.tx_local_va as *mut u8;
-        let mag = WIRE_MAGIC.to_le_bytes();
-        for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
-        core::ptr::write_volatile(dst.add(4), 1u8); // version
-        core::ptr::write_volatile(dst.add(5), 0u8); // reserved
-        let len_le = (signed_body_len as u16).to_le_bytes();
-        core::ptr::write_volatile(dst.add(6), len_le[0]);
-        core::ptr::write_volatile(dst.add(7), len_le[1]);
-        for i in 0..body.len() {
-            core::ptr::write_volatile(dst.add(8 + i), body[i]);
+    // Tier-5 piece E: assign a fresh fragment_id for this body.  Even
+    // single-fragment frames carry the fragment header so the
+    // receiver path is uniform.
+    let fragment_id = unsafe {
+        let id = NEXT_FRAGMENT_ID;
+        NEXT_FRAGMENT_ID = NEXT_FRAGMENT_ID.wrapping_add(1);
+        id
+    };
+    let total_body_len = body.len();
+    let mut offset = 0usize;
+    while offset < total_body_len {
+        let chunk_len = (total_body_len - offset).min(MAX_FRAG_PAYLOAD);
+        let chunk = &body[offset..offset + chunk_len];
+        // Build fragment header + chunk into a scratch buffer, then
+        // sign over (fragment header || chunk) and append the tag.
+        let mut signed = [0u8; 1500];
+        let frag_id_b = fragment_id.to_le_bytes();
+        for i in 0..8 { signed[i] = frag_id_b[i]; }
+        let total_b = (total_body_len as u32).to_le_bytes();
+        for i in 0..4 { signed[8 + i] = total_b[i]; }
+        let off_b = (offset as u32).to_le_bytes();
+        for i in 0..4 { signed[12 + i] = off_b[i]; }
+        for i in 0..chunk_len { signed[FRAG_HDR_LEN + i] = chunk[i]; }
+        let signed_len = FRAG_HDR_LEN + chunk_len;
+        let tag = userlib::siphash::siphash_2_4(&CLUSTER_PSK, &signed[..signed_len]);
+        let tag_b = tag.to_le_bytes();
+        let on_wire_body_len = signed_len + AUTH_TAG_LEN;
+        if 8 + on_wire_body_len > 1500 { return false; }
+        unsafe {
+            let dst = eth.tx_local_va as *mut u8;
+            let mag = WIRE_MAGIC.to_le_bytes();
+            for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
+            core::ptr::write_volatile(dst.add(4), 1u8); // version
+            core::ptr::write_volatile(dst.add(5), 0u8); // reserved
+            let len_le = (on_wire_body_len as u16).to_le_bytes();
+            core::ptr::write_volatile(dst.add(6), len_le[0]);
+            core::ptr::write_volatile(dst.add(7), len_le[1]);
+            for i in 0..signed_len {
+                core::ptr::write_volatile(dst.add(8 + i), signed[i]);
+            }
+            for i in 0..AUTH_TAG_LEN {
+                core::ptr::write_volatile(dst.add(8 + signed_len + i), tag_b[i]);
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!("mfence");
+            let frame_len = 8 + on_wire_body_len;
+            let _ = syscall::send_nb_4(
+                eth.eth_port,
+                ETH_NETIF_XMIT,
+                frame_len as u64,
+                peer_mac,
+                ETHERTYPE_PROXY,
+                eth.tx_client_id,
+            );
         }
-        for i in 0..AUTH_TAG_LEN {
-            core::ptr::write_volatile(dst.add(8 + body.len() + i), tag_b[i]);
-        }
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-        #[cfg(target_arch = "x86_64")]
-        core::arch::asm!("mfence");
-
-        let frame_len = 8 + signed_body_len;
-        let _ = syscall::send_nb_4(
-            eth.eth_port,
-            ETH_NETIF_XMIT,
-            frame_len as u64,
-            peer_mac,
-            ETHERTYPE_PROXY,
-            eth.tx_client_id,
-        );
+        offset += chunk_len;
     }
     true
 }
@@ -791,47 +942,64 @@ impl TcpTransport {
     /// occupied (caller can retry).
     fn tcp_send_to_peer(&mut self, node_idx: usize, body: &[u8]) -> bool {
         if body.len() < ROUTING_HDR_LEN { return false; }
-        let signed_body_len = body.len() + AUTH_TAG_LEN;
-        if 8 + signed_body_len > PENDING_BODY_MAX { return false; }
+        if body.len() > REASSEMBLY_MAX_BYTES { return false; }
 
         if self.nodes[node_idx].conn_id != NONE_CONN {
-            // Connected — send the framed body straight away.  We
-            // build the wire frame in pending_body as a scratch buf
-            // (it's not "pending" since we send immediately), then
-            // hand it to NET_TCP_SEND.
-            let tag = userlib::siphash::siphash_2_4(&CLUSTER_PSK, body);
-            let tag_b = tag.to_le_bytes();
+            // Connected — send the framed body straight away,
+            // chunked at MAX_FRAG_PAYLOAD per Tier-5 piece E.  Each
+            // chunk gets its own TLXP header + fragment header + tag.
             let conn_id = self.nodes[node_idx].conn_id;
-            let mut frame = [0u8; PENDING_BODY_MAX];
-            let mag = WIRE_MAGIC.to_le_bytes();
-            for i in 0..4 { frame[i] = mag[i]; }
-            frame[4] = 1; // version
-            frame[5] = 0; // reserved
-            let len_le = (signed_body_len as u16).to_le_bytes();
-            frame[6] = len_le[0];
-            frame[7] = len_le[1];
-            for i in 0..body.len() { frame[8 + i] = body[i]; }
-            for i in 0..AUTH_TAG_LEN { frame[8 + body.len() + i] = tag_b[i]; }
-            let frame_len = 8 + signed_body_len;
-            // Send in 16-byte chunks via NET_TCP_SEND (4 chunks/64 bytes
-            // for typical bodies; bigger bodies loop more).  Reuse the
-            // existing per-chunk pack16 + reply-drain pattern.
-            let mut off = 0;
-            while off < frame_len {
-                let n = (frame_len - off).min(16);
-                let (w0, w1) = pack16(&frame[off..off + n]);
-                let d1 = (n as u64) | ((self.reply_port as u64) << 16);
-                syscall::send(self.net_port, NET_TCP_SEND, conn_id as u64, d1, w0, w1);
-                loop {
-                    if let Some(reply) = syscall::recv_msg(self.reply_port) {
-                        if reply.tag == NET_TCP_SEND_OK
-                            || reply.tag == NET_TCP_FAIL
-                            || reply.tag == NET_TCP_CLOSED
-                        { break; }
-                        self.handle_reply(reply);
-                    } else { break; }
+            let fragment_id = unsafe {
+                let id = NEXT_FRAGMENT_ID;
+                NEXT_FRAGMENT_ID = NEXT_FRAGMENT_ID.wrapping_add(1);
+                id
+            };
+            let total_body_len = body.len();
+            let mut offset = 0usize;
+            while offset < total_body_len {
+                let chunk_len = (total_body_len - offset).min(MAX_FRAG_PAYLOAD);
+                let chunk = &body[offset..offset + chunk_len];
+                let mut signed = [0u8; 1500];
+                let frag_id_b = fragment_id.to_le_bytes();
+                for i in 0..8 { signed[i] = frag_id_b[i]; }
+                let total_b = (total_body_len as u32).to_le_bytes();
+                for i in 0..4 { signed[8 + i] = total_b[i]; }
+                let off_b = (offset as u32).to_le_bytes();
+                for i in 0..4 { signed[12 + i] = off_b[i]; }
+                for i in 0..chunk_len { signed[FRAG_HDR_LEN + i] = chunk[i]; }
+                let signed_len = FRAG_HDR_LEN + chunk_len;
+                let tag = userlib::siphash::siphash_2_4(&CLUSTER_PSK, &signed[..signed_len]);
+                let tag_b = tag.to_le_bytes();
+                let on_wire_body_len = signed_len + AUTH_TAG_LEN;
+                let mut frame = [0u8; PENDING_BODY_MAX];
+                let mag = WIRE_MAGIC.to_le_bytes();
+                for i in 0..4 { frame[i] = mag[i]; }
+                frame[4] = 1;
+                frame[5] = 0;
+                let len_le = (on_wire_body_len as u16).to_le_bytes();
+                frame[6] = len_le[0];
+                frame[7] = len_le[1];
+                for i in 0..signed_len { frame[8 + i] = signed[i]; }
+                for i in 0..AUTH_TAG_LEN { frame[8 + signed_len + i] = tag_b[i]; }
+                let frame_len = 8 + on_wire_body_len;
+                let mut off = 0;
+                while off < frame_len {
+                    let n = (frame_len - off).min(16);
+                    let (w0, w1) = pack16(&frame[off..off + n]);
+                    let d1 = (n as u64) | ((self.reply_port as u64) << 16);
+                    syscall::send(self.net_port, NET_TCP_SEND, conn_id as u64, d1, w0, w1);
+                    loop {
+                        if let Some(reply) = syscall::recv_msg(self.reply_port) {
+                            if reply.tag == NET_TCP_SEND_OK
+                                || reply.tag == NET_TCP_FAIL
+                                || reply.tag == NET_TCP_CLOSED
+                            { break; }
+                            self.handle_reply(reply);
+                        } else { break; }
+                    }
+                    off += n;
                 }
-                off += n;
+                offset += chunk_len;
             }
             return true;
         }

@@ -1120,8 +1120,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 }
             };
             if ok {
-                let signed_len: usize = 16 + 16 + 8 + 4;
-                let body_len: usize = signed_len + 8; // includes auth tag
+                // Body = dst_uuid + src_uuid + req_id + payload (44 bytes).
+                let routing_body_len: usize = 16 + 16 + 8 + 4;
+                // Single-fragment frame: TLXP(8) + frag_hdr(16) + body(44) + tag(8).
+                let signed_len: usize = 16 + routing_body_len; // frag_hdr + body
+                let body_len: usize = signed_len + 8; // + auth tag
                 let frame_len: usize = 8 + body_len;
                 unsafe {
                     let dst = inject_local as *mut u8;
@@ -1133,15 +1136,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     let len_le = (body_len as u16).to_le_bytes();
                     core::ptr::write_volatile(dst.add(6), len_le[0]);
                     core::ptr::write_volatile(dst.add(7), len_le[1]);
+                    // Tier-5 piece E fragment header: id (8), total (4), offset (4).
+                    let frag_id = 0xfeedf00d_cafebabeu64.to_le_bytes();
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(8 + i), frag_id[i]); }
+                    let total = (routing_body_len as u32).to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(8 + 8 + i), total[i]); }
+                    let off = 0u32.to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(8 + 12 + i), off[i]); }
                     // Body: dst_uuid + src_uuid + request_id + payload.
-                    for i in 0..16 { core::ptr::write_volatile(dst.add(8 + i), dst_uuid[i]); }
-                    for i in 0..16 { core::ptr::write_volatile(dst.add(8 + 16 + i), src_uuid[i]); }
+                    let body_off = 8 + 16;
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(body_off + i), dst_uuid[i]); }
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(body_off + 16 + i), src_uuid[i]); }
                     let req_id = 0xdeadbeefcafef00du64.to_le_bytes();
-                    for i in 0..8 { core::ptr::write_volatile(dst.add(8 + 32 + i), req_id[i]); }
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(body_off + 32 + i), req_id[i]); }
                     let payload = b"PING";
-                    for i in 0..4 { core::ptr::write_volatile(dst.add(8 + 40 + i), payload[i]); }
-                    // Tier-5 piece D: append auth tag over the signed body.
-                    let mut signed = [0u8; 64];
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(body_off + 40 + i), payload[i]); }
+                    // Auth tag covers (frag_hdr + body).
+                    let mut signed = [0u8; 80];
                     for i in 0..signed_len {
                         signed[i] = core::ptr::read_volatile(dst.add(8 + i));
                     }
@@ -1172,7 +1183,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if let Some(m) = syscall::recv_msg_timeout(sub_port, 10_000_000) {
                             if m.tag == 0x5022 {
                                 let len = m.data[0] as usize;
-                                if len != signed_len {
+                                if len != routing_body_len {
                                     syscall::debug_puts(b"  [proxy] inbound body_len wrong\n");
                                 } else {
                                     // Read body from sub_local; verify
@@ -1801,9 +1812,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 _ => { ok = false; syscall::debug_puts(b"  [pauth] SUBSCRIBE_INBOUND failed\n"); }
             }
         }
-        // Build a frame with a deliberately-wrong tag.
+        // Build a frame with a deliberately-wrong tag.  Format
+        // matches the post-(E) wire (TLXP + frag_hdr + body + tag).
         if ok {
-            let signed_len: usize = 16 + 16 + 8 + 4;
+            let routing_body_len: usize = 16 + 16 + 8 + 4;
+            let signed_len: usize = 16 + routing_body_len;
             let body_len: usize = signed_len + 8;
             let frame_len: usize = 8 + body_len;
             let inject_local = match syscall::mmap_anon(0, 1, 1) {
@@ -1820,12 +1833,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     let len_le = (body_len as u16).to_le_bytes();
                     core::ptr::write_volatile(dst.add(6), len_le[0]);
                     core::ptr::write_volatile(dst.add(7), len_le[1]);
-                    for i in 0..16 { core::ptr::write_volatile(dst.add(8 + i), dst_uuid[i]); }
-                    for i in 0..16 { core::ptr::write_volatile(dst.add(8 + 16 + i), src_uuid[i]); }
+                    // Fragment header (single fragment).
+                    let frag_id = 0xbadbadbadbadbadbu64.to_le_bytes();
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(8 + i), frag_id[i]); }
+                    let total = (routing_body_len as u32).to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(8 + 8 + i), total[i]); }
+                    let off = 0u32.to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(8 + 12 + i), off[i]); }
+                    let body_off = 8 + 16;
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(body_off + i), dst_uuid[i]); }
+                    for i in 0..16 { core::ptr::write_volatile(dst.add(body_off + 16 + i), src_uuid[i]); }
                     let req_id = 0xfeedfeedfeedfeedu64.to_le_bytes();
-                    for i in 0..8 { core::ptr::write_volatile(dst.add(8 + 32 + i), req_id[i]); }
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(body_off + 32 + i), req_id[i]); }
                     let payload = b"BAD!";
-                    for i in 0..4 { core::ptr::write_volatile(dst.add(8 + 40 + i), payload[i]); }
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(body_off + 40 + i), payload[i]); }
                     // Wrong tag — would never match siphash output.
                     for i in 0..8 { core::ptr::write_volatile(dst.add(8 + signed_len + i), 0xBBu8); }
                 }
@@ -1956,6 +1977,179 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 5u proxy TCP send-by-UUID: PASSED\n");
         } else {
             syscall::debug_puts(b"Phase 5u proxy TCP send-by-UUID: FAILED\n");
+        }
+    }
+
+    // --- Phase 5v: proxy reassembly across MTU boundary (Tier-5 piece E) ---
+    // Build a 3 KiB body and inject it via PROXY_INJECT_FRAME as TWO
+    // fragments (offset 0 + offset MAX_FRAG_PAYLOAD).  proxy_srv must
+    // accumulate both chunks and deliver the full 3 KiB body to the
+    // subscriber as a single PROXY_INBOUND_FRAME.
+    syscall::debug_puts(b"  init: running proxy reassembly test...\n");
+    {
+        let mut ok = true;
+        let proxy_port = match syscall::ns_lookup(b"proxy") {
+            Some(p) => p,
+            None => { ok = false; syscall::debug_puts(b"  [reasm] proxy ns_lookup failed\n"); 0 }
+        };
+        let sub_port = syscall::port_create();
+        let dst_uuid: [u8; 16] = [0xCC; 16];
+        let src_uuid: [u8; 16] = [0xDD; 16];
+        let dst_lo = u64::from_le_bytes([0xCC; 8]);
+        let dst_hi = u64::from_le_bytes([0xCC; 8]);
+        let sub_local = match syscall::mmap_anon(0, 4, 1) {
+            Some(va) => { unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); } va }
+            None => { ok = false; 0 }
+        };
+        const SUB_GRANT_VA: usize = 0xB_0010_0000;
+        if ok && !syscall::grant_pages(proxy_port, sub_local, SUB_GRANT_VA, 4, false) {
+            ok = false;
+            syscall::debug_puts(b"  [reasm] grant_pages sub failed\n");
+        }
+        if ok {
+            match syscall::call(proxy_port, 0x5020, dst_lo, dst_hi, sub_port, SUB_GRANT_VA as u64) {
+                Some(r) if r.tag == 0x5021 => {}
+                _ => { ok = false; syscall::debug_puts(b"  [reasm] SUBSCRIBE_INBOUND failed\n"); }
+            }
+        }
+        // Build a 3 KiB body in our local scratch.
+        const TOTAL_BODY_LEN: usize = 3072;
+        const FRAG_PAYLOAD: usize = 1468; // matches MAX_FRAG_PAYLOAD
+        let body_local = match syscall::mmap_anon(0, 1, 1) {
+            Some(va) => { unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); } va }
+            None => { ok = false; 0 }
+        };
+        if ok {
+            unsafe {
+                let dst = body_local as *mut u8;
+                for i in 0..16 { core::ptr::write_volatile(dst.add(i), dst_uuid[i]); }
+                for i in 0..16 { core::ptr::write_volatile(dst.add(16 + i), src_uuid[i]); }
+                let req = 0xfeedfeedfeedfeedu64.to_le_bytes();
+                for i in 0..8 { core::ptr::write_volatile(dst.add(32 + i), req[i]); }
+                // Fill payload with a recognisable byte pattern: byte i
+                // gets value (i & 0xFF) so reassembly errors show up
+                // as gaps in the modular sequence.
+                for i in 0..(TOTAL_BODY_LEN - 40) {
+                    core::ptr::write_volatile(dst.add(40 + i), (i & 0xFF) as u8);
+                }
+            }
+        }
+        // Inject fragment 0 (offset 0, payload first 1468 bytes).
+        let frag0 = match syscall::mmap_anon(0, 1, 1) {
+            Some(va) => { unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); } va }
+            None => { ok = false; 0 }
+        };
+        let frag1 = match syscall::mmap_anon(0, 1, 1) {
+            Some(va) => { unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); } va }
+            None => { ok = false; 0 }
+        };
+        let frag2 = match syscall::mmap_anon(0, 1, 1) {
+            Some(va) => { unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); } va }
+            None => { ok = false; 0 }
+        };
+        if ok {
+            const FRAG_ID: u64 = 0x5151_5151_5151_5151u64;
+            let frag_id = FRAG_ID.to_le_bytes();
+            // 3072 bytes split into 1468 + 1468 + 136 chunks (each
+            // ≤ MAX_FRAG_PAYLOAD).
+            for (frag_va, off, chunk_len) in [
+                (frag0, 0usize, FRAG_PAYLOAD),
+                (frag1, FRAG_PAYLOAD, FRAG_PAYLOAD),
+                (frag2, 2 * FRAG_PAYLOAD, TOTAL_BODY_LEN - 2 * FRAG_PAYLOAD),
+            ] {
+                let signed_len = 16 + chunk_len;
+                let body_len = signed_len + 8;
+                let frame_len = 8 + body_len;
+                unsafe {
+                    let dst = frag_va as *mut u8;
+                    let mag = 0x544C5850u32.to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
+                    core::ptr::write_volatile(dst.add(4), 1u8);
+                    core::ptr::write_volatile(dst.add(5), 0u8);
+                    let len_le = (body_len as u16).to_le_bytes();
+                    core::ptr::write_volatile(dst.add(6), len_le[0]);
+                    core::ptr::write_volatile(dst.add(7), len_le[1]);
+                    for i in 0..8 { core::ptr::write_volatile(dst.add(8 + i), frag_id[i]); }
+                    let total = (TOTAL_BODY_LEN as u32).to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(16 + i), total[i]); }
+                    let off_b = (off as u32).to_le_bytes();
+                    for i in 0..4 { core::ptr::write_volatile(dst.add(20 + i), off_b[i]); }
+                    let body_off_in_frame = 24; // 8 TLXP + 16 frag_hdr
+                    let src = body_local as *const u8;
+                    for i in 0..chunk_len {
+                        core::ptr::write_volatile(
+                            dst.add(body_off_in_frame + i),
+                            core::ptr::read_volatile(src.add(off + i)),
+                        );
+                    }
+                    // Auth tag covers bytes 8..(8+signed_len).
+                    let mut signed = [0u8; 1500];
+                    for i in 0..signed_len {
+                        signed[i] = core::ptr::read_volatile(dst.add(8 + i));
+                    }
+                    let tag = userlib::siphash::siphash_2_4(&CLUSTER_PSK, &signed[..signed_len]);
+                    let tag_b = tag.to_le_bytes();
+                    for i in 0..8 {
+                        core::ptr::write_volatile(dst.add(8 + signed_len + i), tag_b[i]);
+                    }
+                }
+                let grant_dst: usize = match off {
+                    0 => 0xB_0011_0000,
+                    o if o == FRAG_PAYLOAD => 0xB_0012_0000,
+                    _ => 0xB_0013_0000,
+                };
+                if !syscall::grant_pages(proxy_port, frag_va, grant_dst, 1, false) {
+                    ok = false;
+                    syscall::debug_puts(b"  [reasm] grant_pages frag failed\n");
+                    break;
+                }
+                let _ = syscall::call(proxy_port, 0x5030,
+                                      grant_dst as u64, frame_len as u64, 0, 0);
+            }
+        }
+        // Wait for the subscriber to receive a single PROXY_INBOUND_FRAME
+        // carrying TOTAL_BODY_LEN bytes.
+        if ok {
+            let mut got = false;
+            for _ in 0..100 {
+                if let Some(m) = syscall::recv_msg_timeout(sub_port, 10_000_000) {
+                    if m.tag == 0x5022 {
+                        let len = m.data[0] as usize;
+                        if len != TOTAL_BODY_LEN {
+                            ok = false;
+                            syscall::debug_puts(b"  [reasm] reassembled length wrong: ");
+                            print_num(len as u64);
+                            syscall::debug_puts(b" expected ");
+                            print_num(TOTAL_BODY_LEN as u64);
+                            syscall::debug_puts(b"\n");
+                        } else {
+                            // Spot-check 4 bytes from the second-fragment
+                            // region (offset >= FRAG_PAYLOAD).
+                            unsafe {
+                                let p = sub_local as *const u8;
+                                let probe = 40 + FRAG_PAYLOAD + 16; // well into frag 1
+                                let val = core::ptr::read_volatile(p.add(probe));
+                                let expected = ((probe - 40) & 0xFF) as u8;
+                                if val != expected {
+                                    ok = false;
+                                    syscall::debug_puts(b"  [reasm] payload mismatch at offset\n");
+                                }
+                            }
+                            got = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if ok && !got {
+                ok = false;
+                syscall::debug_puts(b"  [reasm] no PROXY_INBOUND_FRAME within window\n");
+            }
+        }
+        if ok {
+            syscall::debug_puts(b"Phase 5v proxy reassembly: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5v proxy reassembly: FAILED\n");
         }
     }
 
