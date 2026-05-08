@@ -175,7 +175,24 @@ const ETH_HDR: usize = 14;
 const MTU: usize = 1500;
 
 // Network config (QEMU user-mode defaults).
-const MY_IP: [u8; 4] = [10, 0, 2, 15];
+/// Default self-IP when the device MAC isn't yet known (or for
+/// single-instance boots where mcast pairing isn't in play).  Tier-5
+/// piece F overrides this from the low byte of the MAC at startup so
+/// two-instance pairs end up with distinct IPs (10.0.2.16 vs 10.0.2.17).
+static mut MY_IP: [u8; 4] = [10, 0, 2, 15];
+
+fn my_ip() -> [u8; 4] { unsafe { MY_IP } }
+
+fn set_my_ip_from_mac(mac: [u8; 6]) {
+    // Use the low MAC byte as the host part: distinct across pair
+    // instances (52:54:00:11:11:01 → 10.0.2.16; ...:02 → 10.0.2.17).
+    // The 15+ offset keeps the SLIRP default 10.0.2.15 free for
+    // single-instance user-mode boots where MAC differentiation
+    // doesn't apply.
+    unsafe {
+        MY_IP = [10, 0, 2, 15u8.wrapping_add(mac[5])];
+    }
+}
 const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 
 const PING_TIMEOUT: u32 = 5000;
@@ -969,7 +986,7 @@ impl EthDev {
         frame[19] = 4;
         put_u16_be(&mut frame, 20, 1); // op = request
         frame[22..28].copy_from_slice(&self.mac);
-        frame[28..32].copy_from_slice(&MY_IP);
+        frame[28..32].copy_from_slice(&my_ip());
         frame[32..38].copy_from_slice(&[0; 6]);
         frame[38..42].copy_from_slice(&target_ip);
         self.tx_send(&frame);
@@ -987,7 +1004,7 @@ impl EthDev {
         frame[19] = 4;
         put_u16_be(&mut frame, 20, 2); // op = reply
         frame[22..28].copy_from_slice(&self.mac);
-        frame[28..32].copy_from_slice(&MY_IP);
+        frame[28..32].copy_from_slice(&my_ip());
         frame[32..38].copy_from_slice(&dst_mac);
         frame[38..42].copy_from_slice(&dst_ip);
         self.tx_send(&frame);
@@ -1023,7 +1040,7 @@ impl EthDev {
         } else if op == 1 {
             // ARP request for our IP: reply.
             let target_ip = [data[24], data[25], data[26], data[27]];
-            if target_ip == MY_IP {
+            if target_ip == my_ip() {
                 let sender_mac = [data[8], data[9], data[10], data[11], data[12], data[13]];
                 let sender_ip = [data[14], data[15], data[16], data[17]];
                 self.arp_store(sender_ip, sender_mac);
@@ -1049,7 +1066,7 @@ impl EthDev {
         put_u16_be(ip, 6, 0x4000);
         ip[8] = 64;
         ip[9] = 1; // ICMP
-        ip[12..16].copy_from_slice(&MY_IP);
+        ip[12..16].copy_from_slice(&my_ip());
         ip[16..20].copy_from_slice(&dst_ip);
         let cksum = inet_checksum(ip);
         ip[10] = (cksum >> 8) as u8;
@@ -1287,8 +1304,9 @@ impl EthDev {
         } else {
             None
         };
-        let my_ipv4 = ((MY_IP[0] as u32) << 24) | ((MY_IP[1] as u32) << 16)
-            | ((MY_IP[2] as u32) << 8) | (MY_IP[3] as u32);
+        let mip = my_ip();
+        let my_ipv4 = ((mip[0] as u32) << 24) | ((mip[1] as u32) << 16)
+            | ((mip[2] as u32) << 8) | (mip[3] as u32);
 
         for i in 0..MAX_SUBSCRIBERS {
             let s = self.subscribers[i];
@@ -1466,10 +1484,11 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
         }
     };
 
+    set_my_ip_from_mac(dev.mac);
     syscall::debug_puts(b"  [eth_srv] ready, MAC=");
     print_mac(dev.mac);
     syscall::debug_puts(b" IP=");
-    print_ip(MY_IP);
+    print_ip(my_ip());
     syscall::debug_puts(b"\n");
 
     // Register with name server as "eth" (link-layer service).
@@ -1541,7 +1560,7 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 NET_STATUS => {
                     let reply_port = msg.data[0];
                     let mac_val = mac_to_u64(dev.mac);
-                    let ip_val = u32::from_be_bytes(MY_IP) as u64;
+                    let ip_val = u32::from_be_bytes(my_ip()) as u64;
                     syscall::send_nb(reply_port, NET_STATUS_OK, mac_val, ip_val);
                 }
                 NET_PING => {
