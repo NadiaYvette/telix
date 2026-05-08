@@ -276,6 +276,17 @@ static mut LOCAL_UUID: [u8; 16] = [0; 16];
 /// Zero / 0 / false until the handshake completes; broadcast becomes
 /// a no-op until then so we don't crash if eth_srv isn't up yet.
 static mut ETH_PORT: u64 = 0;
+/// Tier-5 piece F: cached local IPv4 from eth_srv's NET_STATUS RPC.
+/// Set once after eth registration so broadcasts can advertise our
+/// own TCP endpoint.  0 means we haven't queried yet.
+static mut LOCAL_IPV4: u32 = 0;
+/// TCP port proxy_srv listens on (must match LISTEN_TCP_PORT in
+/// userlib/bin/proxy_srv.rs).  When LOCAL_IPV4 is set, broadcasts
+/// advertise the pair (LOCAL_IPV4, LOCAL_TCP_PORT) so peers know
+/// where to dial proxy_srv for cross-instance frame send.
+const LOCAL_TCP_PORT: u16 = 9100;
+const NET_STATUS_TAG: u64 = 0x4000;
+const NET_STATUS_OK_TAG: u64 = 0x4001;
 static mut ETH_TX_LOCAL_VA: usize = 0;
 static mut ETH_RX_LOCAL_VA: usize = 0;
 static mut ETH_TX_CLIENT_ID: u64 = 0;
@@ -700,6 +711,43 @@ fn try_register_eth_tx(my_port: u64) {
         ETH_TX_CLIENT_ID = cid;
         TX_REGISTERED = true;
     }
+    // Tier-5 piece F: query eth_srv for our local IPv4 + MAC.  IP
+    // gets cached in LOCAL_IPV4 for broadcast endpoint advertising.
+    // MAC is mixed into LOCAL_UUID so two-instance pairs get distinct
+    // UUIDs even when the kernel PRNG happens to seed identically
+    // (both kernels start monotonic_ns from 0 and getrandom seeds
+    // from monotonic_ns at first call, so two instances racing to
+    // similar boot times produce identical UUIDs without this mix).
+    // eth_srv's NET_STATUS handler uses the send_nb + reply_port
+    // pattern (msg.data[0] = reply_port), not syscall::call's
+    // implicit reply slot.  Mirror NETIF_REGISTER's pattern: send to
+    // eth_srv with our reply_port, recv from there with timeout.
+    let _ = syscall::send_nb(eth_port, NET_STATUS_TAG, reply_port, 0);
+    if let Some(r) = syscall::recv_msg_timeout(reply_port, 100_000_000) {
+        if r.tag == NET_STATUS_OK_TAG {
+            let mac_lo = r.data[0]; // mac_to_u64 packing
+            let ip_be = r.data[1] as u32;
+            unsafe {
+                LOCAL_IPV4 = ip_be.swap_bytes();
+                let mac_b = mac_lo.to_le_bytes();
+                for i in 0..6 {
+                    LOCAL_UUID[i] ^= mac_b[i];
+                }
+                syscall::debug_puts(b"  [disc] LOCAL_UUID[0..4]=0x");
+                print_hex32(u32::from_le_bytes([
+                    LOCAL_UUID[0], LOCAL_UUID[1],
+                    LOCAL_UUID[2], LOCAL_UUID[3],
+                ]));
+                syscall::debug_puts(b" IP=0x");
+                print_hex32(LOCAL_IPV4);
+                syscall::debug_puts(b"\n");
+            }
+        } else {
+            syscall::debug_puts(b"  [disc] NET_STATUS reply tag wrong\n");
+        }
+    } else {
+        syscall::debug_puts(b"  [disc] NET_STATUS recv timeout\n");
+    }
     syscall::debug_puts(
         b"  [discovery_srv] eth tx+rx registered (announce + receive ready)\n",
     );
@@ -816,8 +864,14 @@ fn broadcast_announcement() {
         for i in 0..4 { core::ptr::write_volatile(dst.add(i), mag[i]); }
         // version + flags.  FLAG_AUTH_TAG_PRESENT is mandatory under
         // Tier-5 piece D — receivers reject unflagged announcements.
+        // FLAG_HAS_TCP4_ENDPOINT (Tier-5 piece F) when LOCAL_IPV4
+        // is known so peers can dial proxy_srv directly.
         let ver = DISCOVERY_VERSION.to_le_bytes();
-        let flg = FLAG_AUTH_TAG_PRESENT.to_le_bytes();
+        let mut flags = FLAG_AUTH_TAG_PRESENT;
+        if LOCAL_IPV4 != 0 {
+            flags |= FLAG_HAS_TCP4_ENDPOINT;
+        }
+        let flg = flags.to_le_bytes();
         core::ptr::write_volatile(dst.add(4), ver[0]);
         core::ptr::write_volatile(dst.add(5), ver[1]);
         core::ptr::write_volatile(dst.add(6), flg[0]);
@@ -863,10 +917,23 @@ fn broadcast_announcement() {
         }
         core::ptr::write_volatile(dst.add(32), svc_count as u8);
 
+        // Tier-5 piece F: optional tcp4_endpoint trailer at offset
+        // (header + manifest).  Layout matches parse_announcement_from
+        // and Phase 5p test inject: 4-byte LE IPv4 + 2-byte LE port.
+        let endpoint_off = ANNOUNCE_HEADER_LEN + svc_count * 16;
+        let endpoint_present = LOCAL_IPV4 != 0;
+        if endpoint_present {
+            let ip_b = LOCAL_IPV4.to_le_bytes();
+            for i in 0..4 { core::ptr::write_volatile(dst.add(endpoint_off + i), ip_b[i]); }
+            let port_b = LOCAL_TCP_PORT.to_le_bytes();
+            core::ptr::write_volatile(dst.add(endpoint_off + 4), port_b[0]);
+            core::ptr::write_volatile(dst.add(endpoint_off + 5), port_b[1]);
+        }
+
         // Append cluster auth tag (Tier-5 piece D) at the tail of the
-        // signed region.  Self-broadcast doesn't carry an endpoint
-        // (yet), so the tag sits immediately after the manifest.
-        let tag_off = ANNOUNCE_HEADER_LEN + svc_count * 16;
+        // signed region — covers everything before it (header +
+        // manifest + endpoint trailer if present).
+        let tag_off = endpoint_off + if endpoint_present { TCP4_ENDPOINT_LEN } else { 0 };
         let mut signed = [0u8; 1500];
         for i in 0..tag_off { signed[i] = core::ptr::read_volatile(dst.add(i)); }
         let tag = userlib::siphash::siphash_2_4(&CLUSTER_PSK, &signed[..tag_off]);
