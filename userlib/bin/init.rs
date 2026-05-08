@@ -1863,6 +1863,102 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 5u: TCP send via PROXY_SEND_BY_UUID with body (Tier-5 piece B) ---
+    // Phase 5q populated proxy_srv's node table with a TCP endpoint
+    // (192.168.42.7:5555).  Now send a real body via PROXY_SEND_BY_UUID
+    // — proxy_srv kicks an async TCP_CONNECT, queues the body in
+    // pending_body, and replies OK.  In single-instance QEMU
+    // user-mode networking the connect itself never completes (no
+    // peer at 192.168.42.7), but the dispatch + queue path is what
+    // we're verifying.  A second send to the same UUID with the
+    // queue still occupied returns BUSY.
+    syscall::debug_puts(b"  init: running proxy TCP send-by-UUID (B) test...\n");
+    {
+        let mut ok = true;
+        let proxy_port = match syscall::ns_lookup(b"proxy") {
+            Some(p) => p,
+            None => { ok = false; syscall::debug_puts(b"  [tcps] proxy ns_lookup failed\n"); 0 }
+        };
+        let known_uuid: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let body_local = match syscall::mmap_anon(0, 1, 1) {
+            Some(va) => { unsafe { core::ptr::write_volatile(va as *mut u8, 0u8); } va }
+            None => { ok = false; 0 }
+        };
+        if ok {
+            // 40-byte routing header + 4-byte payload = 44 bytes.
+            let dst_uuid: [u8; 16] = [0x55; 16];
+            let src_uuid: [u8; 16] = [0x66; 16];
+            unsafe {
+                let dst = body_local as *mut u8;
+                for i in 0..16 { core::ptr::write_volatile(dst.add(i), dst_uuid[i]); }
+                for i in 0..16 { core::ptr::write_volatile(dst.add(16 + i), src_uuid[i]); }
+                let req = 0xa5a5a5a5a5a5a5a5u64.to_le_bytes();
+                for i in 0..8 { core::ptr::write_volatile(dst.add(32 + i), req[i]); }
+                let pay = b"TCP!";
+                for i in 0..4 { core::ptr::write_volatile(dst.add(40 + i), pay[i]); }
+            }
+            const BODY_GRANT: usize = 0xC_0005_0000;
+            if !syscall::grant_pages(proxy_port, body_local, BODY_GRANT, 1, false) {
+                ok = false;
+                syscall::debug_puts(b"  [tcps] grant body-to-proxy failed\n");
+            }
+            let lo = u64::from_le_bytes([
+                known_uuid[0], known_uuid[1], known_uuid[2], known_uuid[3],
+                known_uuid[4], known_uuid[5], known_uuid[6], known_uuid[7],
+            ]);
+            let hi = u64::from_le_bytes([
+                known_uuid[8], known_uuid[9], known_uuid[10], known_uuid[11],
+                known_uuid[12], known_uuid[13], known_uuid[14], known_uuid[15],
+            ]);
+            // First send: should hit OK (queued behind async connect).
+            if ok {
+                match syscall::call(proxy_port, 0x5050, lo, hi, BODY_GRANT as u64, 44) {
+                    Some(r) if r.tag == 0x5051 => {} // OK
+                    Some(r) => {
+                        ok = false;
+                        syscall::debug_puts(b"  [tcps] first send: unexpected tag 0x");
+                        print_num(r.tag);
+                        syscall::debug_puts(b"\n");
+                    }
+                    None => {
+                        ok = false;
+                        syscall::debug_puts(b"  [tcps] first send: call timed out\n");
+                    }
+                }
+            }
+            // Second send (still pending): expect BUSY.
+            if ok {
+                match syscall::call(proxy_port, 0x5050, lo, hi, BODY_GRANT as u64, 44) {
+                    Some(r) if r.tag == 0x505D => {} // BUSY
+                    Some(r) if r.tag == 0x5051 => {
+                        // Connect may have failed in the meantime (NET_TCP_FAIL
+                        // dispatch clears pending_len), in which case OK is
+                        // valid too.  Note this and don't fail.
+                        syscall::debug_puts(b"  [tcps] second send: OK (queue cleared by connect-fail)\n");
+                    }
+                    Some(r) => {
+                        ok = false;
+                        syscall::debug_puts(b"  [tcps] second send: unexpected tag 0x");
+                        print_num(r.tag);
+                        syscall::debug_puts(b"\n");
+                    }
+                    None => {
+                        ok = false;
+                        syscall::debug_puts(b"  [tcps] second send: call timed out\n");
+                    }
+                }
+            }
+        }
+        if ok {
+            syscall::debug_puts(b"Phase 5u proxy TCP send-by-UUID: PASSED\n");
+        } else {
+            syscall::debug_puts(b"Phase 5u proxy TCP send-by-UUID: FAILED\n");
+        }
+    }
+
     // --- Phase 5h: scheduler call/reply stress (deferred-requeue race repro) ---
     // Skipped under FOCUS_H13 because sched_stress occasionally wedges
     // (WEDGED — giving up) without exiting, which deadlocks init's

@@ -75,21 +75,28 @@ const PROXY_INBOUND_FRAME: u64 = 0x5022;
 const PROXY_INJECT_FRAME: u64 = 0x5030;
 const PROXY_INJECT_FRAME_OK: u64 = 0x5031;
 
-/// Look up a learned-via-discovery peer by UUID and confirm it's
-/// addressable over TCP.  Step 3/3 of Tier-5 piece C: verifies the
-/// discovery → proxy_srv pipeline plumbed end-to-end so a caller
-/// holding a peer UUID can ask "is this peer reachable over the TCP
-/// transport?" without knowing its endpoint.  Actual frame send
-/// remains via PROXY_SEND_BY_PEER (Ethernet) for now; the real TCP
-/// wire path needs non-blocking connect + per-node send queue, which
-/// is a separate piece.
+/// Look up a learned-via-discovery peer by UUID and route a body to
+/// it over the TCP transport.  Step 3/3 of Tier-5 piece C plus
+/// piece B's actual TCP send: callers holding a peer UUID + body
+/// invoke this to dispatch through the discovery-driven node table
+/// without knowing the endpoint themselves.
 ///
 /// in:   data[0..2] = peer UUID (LE-packed two u64 words).
-/// out:  PROXY_SEND_BY_UUID_OK with data[0]=node_idx, data[1]=ip_le,
-///       data[2]=port.  PROXY_SEND_BY_UUID_NO_NODE if the UUID is
-///       absent from the node table or has no TCP endpoint.
+///       data[2]    = body grant_va in our aspace (caller pre-grants).
+///       data[3]    = body_len.  Use 0 for a lookup-only call (no body
+///                    grant); reply still carries node_idx + endpoint
+///                    so callers can verify routing without sending.
+/// out:  PROXY_SEND_BY_UUID_OK   data[0]=node_idx, data[1]=ip_le,
+///                                data[2]=port.  Body sent (or queued
+///                                behind an async connect) when
+///                                body_len > 0.
+///       PROXY_SEND_BY_UUID_NO_NODE   UUID isn't in the node table
+///                                    or has no TCP endpoint.
+///       PROXY_SEND_BY_UUID_BUSY      Node has a pending body waiting
+///                                    for connect — caller should retry.
 const PROXY_SEND_BY_UUID: u64 = 0x5050;
 const PROXY_SEND_BY_UUID_OK: u64 = 0x5051;
+const PROXY_SEND_BY_UUID_BUSY: u64 = 0x505D;
 const PROXY_SEND_BY_UUID_NO_NODE: u64 = 0x505E;
 
 /// Trigger a discovery_srv poll: enumerate known peers via
@@ -182,6 +189,11 @@ const LISTEN_TCP_PORT: u16 = 9100;
 const NONE_CONN: usize = usize::MAX;
 
 // --- Node table entry ---
+/// Maximum size of the per-node deferred body queued while a TCP
+/// connect is in flight.  One MTU's worth — enough for a single
+/// PROXY_SEND_BY_UUID body (40-byte routing header + ≤1452 payload).
+const PENDING_BODY_MAX: usize = 1500;
+
 struct NodeEntry {
     active: bool,
     node_id: u16,
@@ -199,6 +211,13 @@ struct NodeEntry {
     /// connection table single-source-of-truth for ensure_connection,
     /// frame send, etc.
     peer_uuid: [u8; 16],
+    /// Tier-5 piece B: deferred body queued while a non-blocking
+    /// connect is in flight.  Drained when NET_TCP_CONNECTED arrives.
+    /// Single-slot for now; SEND_BY_UUID returns BUSY when occupied,
+    /// caller can retry.  Real flow control (multi-slot ring) is a
+    /// follow-up.
+    pending_body: [u8; PENDING_BODY_MAX],
+    pending_len: usize,
 }
 
 impl NodeEntry {
@@ -213,6 +232,8 @@ impl NodeEntry {
             rx_len: 0,
             connecting: false,
             peer_uuid: [0; 16],
+            pending_body: [0; PENDING_BODY_MAX],
+            pending_len: 0,
         }
     }
 }
@@ -741,6 +762,105 @@ impl TcpTransport {
         }
     }
 
+    /// Tier-5 piece B: kick off a TCP connect WITHOUT blocking the
+    /// main loop on the reply.  Returns immediately after sending
+    /// NET_TCP_CONNECT.  The reply (NET_TCP_CONNECTED / NET_TCP_FAIL)
+    /// is dispatched in the main loop's tag-match path.  Caller is
+    /// responsible for queuing any pending body in
+    /// nodes[node_idx].pending_body before calling this so the body
+    /// gets drained when the connect completes.
+    fn ensure_connection_async(&mut self, node_idx: usize) {
+        if self.nodes[node_idx].conn_id != NONE_CONN || self.nodes[node_idx].connecting {
+            return;
+        }
+        let ip = self.nodes[node_idx].ip_be32;
+        let port = self.nodes[node_idx].tcp_port;
+        let d1 = (port as u64) | ((self.reply_port) << 32);
+        syscall::send(self.net_port, NET_TCP_CONNECT, ip as u64, d1, 0, 0);
+        self.nodes[node_idx].connecting = true;
+    }
+
+    /// Tier-5 piece B: send a TLXP-format proxy body over the TCP
+    /// transport for the given node.  Mirrors eth_send_to_peer's
+    /// framing (8-byte header + body + 8-byte SipHash auth tag) so
+    /// receivers parse both transports through the same code path.
+    /// On a connected node: sends right now.  On a disconnected node:
+    /// kicks an async connect and stashes the body in pending_body for
+    /// the connect-completion path to drain.  Returns true if the body
+    /// was either sent or queued; false if pending_body was already
+    /// occupied (caller can retry).
+    fn tcp_send_to_peer(&mut self, node_idx: usize, body: &[u8]) -> bool {
+        if body.len() < ROUTING_HDR_LEN { return false; }
+        let signed_body_len = body.len() + AUTH_TAG_LEN;
+        if 8 + signed_body_len > PENDING_BODY_MAX { return false; }
+
+        if self.nodes[node_idx].conn_id != NONE_CONN {
+            // Connected — send the framed body straight away.  We
+            // build the wire frame in pending_body as a scratch buf
+            // (it's not "pending" since we send immediately), then
+            // hand it to NET_TCP_SEND.
+            let tag = userlib::siphash::siphash_2_4(&CLUSTER_PSK, body);
+            let tag_b = tag.to_le_bytes();
+            let conn_id = self.nodes[node_idx].conn_id;
+            let mut frame = [0u8; PENDING_BODY_MAX];
+            let mag = WIRE_MAGIC.to_le_bytes();
+            for i in 0..4 { frame[i] = mag[i]; }
+            frame[4] = 1; // version
+            frame[5] = 0; // reserved
+            let len_le = (signed_body_len as u16).to_le_bytes();
+            frame[6] = len_le[0];
+            frame[7] = len_le[1];
+            for i in 0..body.len() { frame[8 + i] = body[i]; }
+            for i in 0..AUTH_TAG_LEN { frame[8 + body.len() + i] = tag_b[i]; }
+            let frame_len = 8 + signed_body_len;
+            // Send in 16-byte chunks via NET_TCP_SEND (4 chunks/64 bytes
+            // for typical bodies; bigger bodies loop more).  Reuse the
+            // existing per-chunk pack16 + reply-drain pattern.
+            let mut off = 0;
+            while off < frame_len {
+                let n = (frame_len - off).min(16);
+                let (w0, w1) = pack16(&frame[off..off + n]);
+                let d1 = (n as u64) | ((self.reply_port as u64) << 16);
+                syscall::send(self.net_port, NET_TCP_SEND, conn_id as u64, d1, w0, w1);
+                loop {
+                    if let Some(reply) = syscall::recv_msg(self.reply_port) {
+                        if reply.tag == NET_TCP_SEND_OK
+                            || reply.tag == NET_TCP_FAIL
+                            || reply.tag == NET_TCP_CLOSED
+                        { break; }
+                        self.handle_reply(reply);
+                    } else { break; }
+                }
+                off += n;
+            }
+            return true;
+        }
+        // Not connected — queue and kick async connect.
+        if self.nodes[node_idx].pending_len != 0 {
+            return false; // queue full
+        }
+        let blen = body.len();
+        for i in 0..blen { self.nodes[node_idx].pending_body[i] = body[i]; }
+        self.nodes[node_idx].pending_len = blen;
+        self.ensure_connection_async(node_idx);
+        true
+    }
+
+    /// Tier-5 piece B: drain a node's pending body once the connect
+    /// has succeeded.  Called from the NET_TCP_CONNECTED dispatch.
+    /// Idempotent: no-op when pending_len is 0.
+    fn drain_pending(&mut self, node_idx: usize) {
+        let n = self.nodes[node_idx].pending_len;
+        if n == 0 { return; }
+        // Move the queued body into a stack buffer first so the
+        // mutable borrow of `self.nodes[idx]` doesn't fight
+        // tcp_send_to_peer's &mut self.
+        let mut tmp = [0u8; PENDING_BODY_MAX];
+        for i in 0..n { tmp[i] = self.nodes[node_idx].pending_body[i]; }
+        self.nodes[node_idx].pending_len = 0;
+        let _ = self.tcp_send_to_peer(node_idx, &tmp[..n]);
+    }
+
     /// Initiate TCP connection to a node if not already connected.
     fn ensure_connection(&mut self, node_idx: usize) {
         if self.nodes[node_idx].conn_id != NONE_CONN || self.nodes[node_idx].connecting {
@@ -1017,6 +1137,8 @@ impl TcpTransport {
                         rx_len: 0,
                         connecting: false,
                         peer_uuid: uuid,
+                        pending_body: [0; PENDING_BODY_MAX],
+                        pending_len: 0,
                     };
                     updated += 1;
                 }
@@ -1050,6 +1172,8 @@ impl TcpTransport {
                 rx_len: 0,
                 connecting: false,
                 peer_uuid: [0; 16],
+                pending_body: [0; PENDING_BODY_MAX],
+                pending_len: 0,
             };
             syscall::debug_puts(b"  [proxy] added node ");
             print_num(node_id as u64);
@@ -1089,6 +1213,8 @@ impl TcpTransport {
                     rx_len: 0,
                     connecting: false,
                     peer_uuid: [0; 16],
+                    pending_body: [0; PENDING_BODY_MAX],
+                    pending_len: 0,
                 };
                 syscall::debug_puts(b"  [proxy] accepted conn=");
                 print_num(conn_id as u64);
@@ -1275,15 +1401,33 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let mut uuid = [0u8; 16];
                 uuid[0..8].copy_from_slice(&msg.data[0].to_le_bytes());
                 uuid[8..16].copy_from_slice(&msg.data[1].to_le_bytes());
+                let body_va = msg.data[2] as usize;
+                let body_len = msg.data[3] as usize;
                 match srv.find_node_by_uuid(&uuid) {
                     Some(idx) if srv.nodes[idx].tcp_port != 0 => {
-                        let _ = syscall::reply(
-                            PROXY_SEND_BY_UUID_OK,
-                            idx as u64,
-                            srv.nodes[idx].ip_be32 as u64,
-                            srv.nodes[idx].tcp_port as u64,
-                            0, 0,
-                        );
+                        let ip = srv.nodes[idx].ip_be32 as u64;
+                        let port = srv.nodes[idx].tcp_port as u64;
+                        // body_va == 0 → lookup-only (Phase 5r mode).
+                        // body_va != 0 → real TCP send (Phase 5u mode).
+                        let send_ok = if body_va != 0
+                            && body_len >= ROUTING_HDR_LEN
+                            && body_len <= 1492
+                            && syscall::va_writable(body_va)
+                        {
+                            let body = unsafe {
+                                core::slice::from_raw_parts(body_va as *const u8, body_len)
+                            };
+                            srv.tcp_send_to_peer(idx, body)
+                        } else {
+                            // No body — pure lookup; treat as success.
+                            true
+                        };
+                        let tag = if send_ok {
+                            PROXY_SEND_BY_UUID_OK
+                        } else {
+                            PROXY_SEND_BY_UUID_BUSY
+                        };
+                        let _ = syscall::reply(tag, idx as u64, ip, port, 0, 0);
                     }
                     _ => {
                         let _ = syscall::reply(
@@ -1316,7 +1460,34 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let conn_id = msg.data[0] as usize;
                 srv.handle_accept(conn_id);
             } else if msg.tag == NET_TCP_CONNECTED && from_port == reply_port {
-                // Connection established — handled in ensure_connection's blocking loop.
+                // Tier-5 piece B: a non-blocking connect completed.
+                // Find the connecting node by matching the conn_id +
+                // pre-set connecting flag, then drain its pending body.
+                // (The blocking ensure_connection path also receives
+                // this message on its own recv_msg call; if that
+                // happened first, no node has connecting=true here and
+                // we no-op.)
+                let conn_id = msg.data[0] as usize;
+                for i in 0..MAX_NODES {
+                    if srv.nodes[i].active && srv.nodes[i].connecting
+                        && srv.nodes[i].conn_id == NONE_CONN
+                    {
+                        srv.nodes[i].conn_id = conn_id;
+                        srv.nodes[i].connecting = false;
+                        srv.drain_pending(i);
+                        break;
+                    }
+                }
+            } else if msg.tag == NET_TCP_FAIL && from_port == reply_port {
+                // Tier-5 piece B: clear connecting flag + drop pending
+                // body on connect failure so the node isn't stuck.
+                for i in 0..MAX_NODES {
+                    if srv.nodes[i].active && srv.nodes[i].connecting {
+                        srv.nodes[i].connecting = false;
+                        srv.nodes[i].pending_len = 0;
+                        break;
+                    }
+                }
             } else if msg.tag == NET_TCP_RECV_NONE {
                 // No data, ignore.
             }
