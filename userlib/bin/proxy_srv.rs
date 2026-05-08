@@ -1481,6 +1481,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     loop {
         // Try non-blocking port set recv first.
         if let Some((from_port, msg)) = syscall::port_set_recv(set_id) {
+            // Tier-5 phase 5t flake-investigation: log every dispatch.
+            // Boot 533 (with this print) passed 5t every time; boots
+            // without it hang at 5t in slow variance.  That's
+            // suspicious enough that the instrumentation stays in
+            // until we understand the root cause.
+            syscall::debug_puts(b"  [proxy-rx] tag=");
+            print_num(msg.tag);
+            syscall::debug_puts(b"\n");
             if msg.tag == PROXY_MARKER_LO && from_port == my_port {
                 // Outbound: kernel-redirected non-local send.
                 srv.handle_outbound(&msg);

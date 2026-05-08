@@ -548,6 +548,14 @@ fn maintain_peer_table(now_ns: u64) {
             if PEERS[i].in_use {
                 let age = now_ns.wrapping_sub(PEERS[i].last_seen_ns);
                 if age > ttl_ns {
+                    syscall::debug_puts(b"  [disc-evict] uuid[0..4]=0x");
+                    print_hex32(u32::from_le_bytes([
+                        PEERS[i].uuid[0], PEERS[i].uuid[1],
+                        PEERS[i].uuid[2], PEERS[i].uuid[3],
+                    ]));
+                    syscall::debug_puts(b" age_ms=");
+                    print_num(age / 1_000_000);
+                    syscall::debug_puts(b"\n");
                     PEERS[i] = PeerEntry::empty();
                     PEER_EVICT_COUNT += 1;
                 }
