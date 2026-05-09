@@ -515,22 +515,48 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
         // tools/extract-core.py reconstructs an ELF64 core file
         // from these markers + the [lib-load] log lines.
         crate::arch::x86_64::coredump::dump_user_fault(frame, frame.vector());
-        // Stack snapshot: 64 bytes (8 u64s) at RSP.  Lets the
-        // host post-mortem see saved return addresses + arguments
-        // in registers' spill slots.  Faults here would re-fault
-        // the thread (which we're killing anyway), so reads are
-        // best-effort.
+        // Stack snapshot: 256 bytes (32 u64s) at RSP.  Wide enough to
+        // cover the saved return address that pushed the faulting RIP
+        // (typically at RBP+8, often well above RSP for ret-faults) plus
+        // surrounding spill slots.  Faults here would re-fault the
+        // thread (which we're killing anyway), so reads are best-effort.
         let rsp = frame.rsp();
-        let mut sw = [0u64; 8];
-        for i in 0..8 {
+        let mut sw = [0u64; 32];
+        for i in 0..32 {
             sw[i] = crate::arch::x86_64::coredump::safe_read_user_u64(
                 rsp.wrapping_add((i * 8) as u64),
             ).unwrap_or(0);
         }
-        crate::println!(
-            "  STACK[0..8]@RSP: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
-            sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]
-        );
+        for row in 0..4 {
+            let b = row * 8;
+            crate::println!(
+                "  STACK[{}..{}]@RSP+{:#x}: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                b, b + 8, (b * 8) as u64,
+                sw[b], sw[b+1], sw[b+2], sw[b+3],
+                sw[b+4], sw[b+5], sw[b+6], sw[b+7]
+            );
+        }
+        // Code-pointer scan: walk one 4 KiB page above RSP and print every
+        // qword that falls into a plausible user-text range.  The pre-fault
+        // call chain emerges as a sparse list of code pointers; noise
+        // (heap data, FP bit-patterns, etc.) drops out.  The 0x4xxx_xxxxx
+        // range matches Telix's standard libc / Xwayland load addresses.
+        // Output format: `CODE@<offset_above_rsp>: <pointer>` so the host
+        // can resolve via addr2line / objdump.
+        let mut printed = 0u32;
+        for i in 32..512 { // already printed 0..32 above
+            let v = match crate::arch::x86_64::coredump::safe_read_user_u64(
+                rsp.wrapping_add((i * 8) as u64),
+            ) { Some(v) => v, None => break };
+            // Plausible user code: top 32 bits == 0x4 OR == 0x2 (Telix
+            // userspace text typically lives in 0x100000000..0x500000000).
+            let hi = v >> 32;
+            if hi == 0x4 || hi == 0x2 || hi == 0x1 {
+                crate::println!("  CODE@RSP+{:#x}: {:#x}", (i * 8) as u64, v);
+                printed += 1;
+                if printed >= 16 { break; } // cap to avoid log flood
+            }
+        }
         // RBP chain walk: print the saved-RIP at each frame for up
         // to 6 frames.  Each frame's layout (per System V AMD64):
         //   [RBP]      = caller's RBP

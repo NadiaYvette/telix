@@ -152,6 +152,15 @@ extern "C" fn exception_sync_el1(frame_sp: u64) -> u64 {
 /// If the scheduler decides to preempt, it returns a different thread's SP.
 #[unsafe(no_mangle)]
 extern "C" fn exception_irq_el1(frame_sp: u64) -> u64 {
+    // PARK_WOKEN arbitration & per-thread stack_switch_pending clear.
+    // Mirrors x86_64's exception handler.  Without this, a thread that
+    // parked on an IPC call has stack_switch_pending stuck at true forever,
+    // forcing every wake_parked_thread to take the slow deferred-enqueue
+    // path — which delegates to clear_pending_switch on the parking CPU,
+    // which never runs.  Result: the wake is permanently lost and the
+    // parker hangs in PARK_COMMITTED.  This was the aarch64 Phase 5b
+    // call_reply_test stall (`memory/project_aarch64_post_phase5_stall.md`).
+    crate::sched::scheduler::clear_pending_switch(crate::sched::smp::cpu_id() as usize);
     crate::arch::aarch64::irq::handle_irq();
     // After handling the IRQ (which includes the timer), let the scheduler
     // decide if we should switch threads.
@@ -167,6 +176,11 @@ extern "C" fn exception_serror_el1(frame: &ExceptionFrame) {
 }
 #[unsafe(no_mangle)]
 extern "C" fn exception_sync_el0(frame_sp: u64) -> u64 {
+    // See exception_irq_el1 — every exception entry needs to drain any
+    // pending PARK_WOKEN arbitration so wake_parked_thread's deferred-local
+    // path completes.  Must run before syscall dispatch since the syscall
+    // itself may park or wake a peer.
+    crate::sched::scheduler::clear_pending_switch(crate::sched::smp::cpu_id() as usize);
     let frame = unsafe { &mut *(frame_sp as *mut ExceptionFrame) };
     let ec = (frame.esr >> 26) & 0x3f;
     match ec {
@@ -256,6 +270,8 @@ fn handle_abort_el0(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
 
 #[unsafe(no_mangle)]
 extern "C" fn exception_irq_el0(frame_sp: u64) -> u64 {
+    // See exception_irq_el1 — PARK_WOKEN arbitration on every IRQ entry.
+    crate::sched::scheduler::clear_pending_switch(crate::sched::smp::cpu_id() as usize);
     crate::arch::aarch64::irq::handle_irq();
     crate::sched::tick(frame_sp)
 }

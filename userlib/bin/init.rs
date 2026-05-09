@@ -252,6 +252,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
             if ok {
                 syscall::debug_puts(b"Phase 5d shm_srv call/reply smoke: PASSED\n");
+                phase_log(b"after 5d");
             } else {
                 syscall::debug_puts(b"Phase 5d shm_srv call/reply smoke: FAILED\n");
             }
@@ -527,6 +528,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
             if ok {
                 syscall::debug_puts(b"Phase 5g event_srv call/reply smoke: PASSED\n");
+                phase_log(b"after 5g");
             } else {
                 syscall::debug_puts(b"Phase 5g event_srv call/reply smoke: FAILED\n");
             }
@@ -555,6 +557,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if let Some(code) = syscall::waitpid(test_tid) {
                     if code == 0 {
                         syscall::debug_puts(b"Phase 5i servicereg smoke: PASSED\n");
+                        phase_log(b"after 5i");
                     } else {
                         syscall::debug_puts(b"Phase 5i servicereg smoke: FAILED code=");
                         print_num(code);
@@ -591,6 +594,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 if let Some(code) = syscall::waitpid(r_tid) {
                     if code == 0 {
                         syscall::debug_puts(b"Phase 5j router_srv ETH_SUBSCRIBE smoke: PASSED\n");
+                        phase_log(b"after 5j");
                     } else {
                         syscall::debug_puts(b"Phase 5j router_srv ETH_SUBSCRIBE smoke: FAILED code=");
                         print_num(code);
@@ -646,8 +650,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             if subscribed && tx_ready {
                                 if gw_resolved {
                                     syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE+NETIF_XMIT wiring: PASSED (gw resolved)\n");
+                                    phase_log(b"after 5k");
                                 } else {
                                     syscall::debug_puts(b"Phase 5k nat_srv ETH_SUBSCRIBE+NETIF_XMIT wiring: PASSED (gw broadcast)\n");
+                                    phase_log(b"after 5k (gw broadcast)");
                                 }
                                 // Bundle should be 0x0F (INVOKE|READ|
                                 // WRITE|FORWARD without LOCAL_ONLY).
@@ -2312,14 +2318,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // Use blocking wait4 instead of a 2000×sleep_ms(5) poll loop:
+                // SYS_WAIT4 (kernel/src/sched/scheduler.rs::wait4) blocks on
+                // BlockReason::WaitChild and is woken by wake_wait_child_threads
+                // when the child exits, so we pay one wake instead of bursting
+                // through ~2000 sleep_ms wake-latency cycles.  See task #118.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => status as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 145e rt_sigaction early: PASSED\n");
                 } else if exit_code == -1 {
@@ -2433,6 +2440,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Step F wayland infra test: SKIPPED\n");
         }
     }
+    phase_log(b"after Step F");
 
     // --- Step G: Wayland compositor + client end-to-end under Linux personality ---
     //
@@ -5087,6 +5095,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 62 COW reservation pipeline: FAILED (mmap)\n");
         }
     }
+    phase_log(b"after Phase 62 (COW reservation)");
 
     // --- Test 22: M:N Green Threads + Scheduler Activations ---
     syscall::debug_puts(b"  init: testing M:N green threads...\n");
@@ -6582,6 +6591,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"Phase 194 FS syscall dispatch: SKIPPED\n");
         }
     }
+    phase_log(b"after Phase 194 (Linux FS dispatch)");
 
     // --- Phase 177: ISO 9660 filesystem server ---
     if STEP_H_DEBUG_SKIP_SLOW_PHASES {
@@ -8363,6 +8373,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
     } // end 'phase_18x_19x labeled block
+    phase_log(b"after Phase 193 (storage/peripheral suite)");
 
     // --- Tests 31-50: pre-H syscall coverage tests (Phases 41-50, etc.) ---
     // Xwayland uses signals/execve/mprotect/mmap/FD/creds/wait/rlimit/VFS
@@ -9940,6 +9951,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
     } // end 'pre_h_tests labeled block
+    phase_log(b"after Phase 51 (VFS) - entering Step H batch");
 
     // --- Step H (early): run libxcvt dyn-link RIGHT AFTER Phase 51 so it ---
     // runs before the slow Phase 177-180 CALL-TIMEOUTs that would otherwise

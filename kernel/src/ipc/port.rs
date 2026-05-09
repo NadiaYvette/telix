@@ -259,6 +259,14 @@ pub struct Port {
     pub recv_holder: AtomicU32,
     /// Port flags (PORT_ALIVE, etc.).
     flags: AtomicU32,
+    /// Diagnostic counters for the wake-recv-waiter race (#120).
+    /// Incremented in port.rs's send/wake paths so we can prove the
+    /// missed-wakeup hypothesis at CALL-TIMEOUT time without chasing it
+    /// in production logs.  All start at zero (write_bytes zero-fill).
+    pub diag_wake_calls: AtomicU64,
+    pub diag_wake_no_parker: AtomicU64,
+    pub diag_wake_inject_ok: AtomicU64,
+    pub diag_wake_reenq:    AtomicU64,
 }
 
 impl Port {
@@ -709,6 +717,9 @@ fn do_send(port: &Port, msg: &Message) -> Result<(), ()> {
 /// needs wake_thread for spin-wait).
 fn wake_recv_waiter(port_id: PortId) {
     use crate::sync::turnstile::{KEY_PORT_RECV, KEY_PORT_RECV_PARK};
+    if let Some(p) = port_ref(port_id) {
+        p.diag_wake_calls.fetch_add(1, Ordering::Relaxed);
+    }
     // Try parked receivers first (they've been waiting longer / expect direct injection).
     if let Some(tid) = crate::sync::turnstile::port_dequeue_one(port_id, KEY_PORT_RECV_PARK) {
         // Parked receivers expect the message to be injected into their saved
@@ -736,13 +747,25 @@ fn wake_recv_waiter(port_id: PortId) {
         // future recv_or_park will pick it up; re-enqueue the thread so the
         // next send can wake it.
         if injected {
+            if let Some(p) = port_ref(port_id) {
+                p.diag_wake_inject_ok.fetch_add(1, Ordering::Relaxed);
+            }
             crate::sched::scheduler::wake_parked_thread(tid);
         } else {
             // Message consumed by concurrent recv — re-enqueue on turnstile
             // so a future send finds this waiter.
+            if let Some(p) = port_ref(port_id) {
+                p.diag_wake_reenq.fetch_add(1, Ordering::Relaxed);
+            }
             crate::sync::turnstile::port_enqueue_raw(port_id, KEY_PORT_RECV_PARK, tid);
         }
         return;
+    }
+    // No parker found.  Track this — if the destination has parkers blocked
+    // *now* but the dequeue above missed them, that's the missed-wakeup race
+    // (#120, kernel/src/ipc/port.rs wake_recv_waiter race window).
+    if let Some(p) = port_ref(port_id) {
+        p.diag_wake_no_parker.fetch_add(1, Ordering::Relaxed);
     }
     // Then try normal recv blockers (spin-waiting via block_current).
     crate::sync::turnstile::port_wake_one(port_id, KEY_PORT_RECV);
@@ -851,7 +874,7 @@ pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
 /// If a receiver is parked on this port, returns DirectTransfer(tid)
 /// without queueing the message.
 pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
-    use crate::sync::turnstile::KEY_PORT_RECV_PARK;
+    use crate::sync::turnstile::{KEY_PORT_RECV, KEY_PORT_RECV_PARK};
 
     // Priority inheritance for DirectTransfer is handled in sys_send/sys_call
     // handlers (direct boost_priority call). Queued messages don't need PI.
@@ -876,6 +899,16 @@ pub fn send_direct(port_id: PortId, msg: &mut Message) -> SendDirectResult {
     // Only KEY_PORT_RECV_PARK waiters are eligible — they expect message injection
     // into their frame, not via the queue.
     if let Some(waiter) = crate::sync::turnstile::port_dequeue_one(port_id, KEY_PORT_RECV_PARK) {
+        // #120 sub-pattern B fix: also wake one KEY_PORT_RECV waiter.
+        // Receivers using the older block_current(BlockReason::PortRecv) path
+        // park on KEY_PORT_RECV, NOT KEY_PORT_RECV_PARK.  When all sends
+        // satisfy via DirectTransfer (RECV_PARK side), the wake_recv_waiter
+        // fallthrough that would normally wake a RECV-side parker never
+        // fires, and RECV-parkers starve indefinitely (boot 581 caught
+        // 3 such threads with ts_blocked_on != 0 but wake_calls=0).
+        // Costs one extra wake per send — cheap if RECV is empty (the
+        // common case once all receivers migrate to recv_or_park).
+        crate::sync::turnstile::port_wake_one(port_id, KEY_PORT_RECV);
         return SendDirectResult::DirectTransfer(waiter);
     }
 

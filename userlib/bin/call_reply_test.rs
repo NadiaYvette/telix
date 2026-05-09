@@ -122,9 +122,13 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
     }
 
     syscall::debug_puts(b"[cr_test] client: calling\n");
+    syscall::debug_puts(b"[cr_test] client: pre-syscall\n");
 
     let reply = match syscall::call(port, REQ_TAG, 10, 20, 30, 40) {
-        Some(m) => m,
+        Some(m) => {
+            syscall::debug_puts(b"[cr_test] client: call returned (Some)\n");
+            m
+        }
         None => {
             syscall::debug_puts(b"[cr_test] call returned None FAIL\n");
             syscall::exit(1);

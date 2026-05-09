@@ -251,6 +251,17 @@ pub fn send_sgi(target_cpu: u32, sgi_id: u32) {
         );
     }
     SGI_SEND_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Phase-5b stall instrumentation: per-target-CPU last-send timestamp
+    // (monotonic_ns).  Paired with PER_CPU_IPI_RECV_TS_NS, lets the
+    // WATCHDOG dump compute IPI delivery latency.
+    if (target_cpu as usize) < PER_CPU_IPI_SEND_TS_NS.len() {
+        PER_CPU_IPI_SEND_TS_NS[target_cpu as usize].store(
+            crate::arch::timer::monotonic_ns(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        PER_CPU_IPI_SEND_COUNT[target_cpu as usize]
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 pub static SGI_SEND_COUNT: core::sync::atomic::AtomicU64 =
@@ -258,8 +269,50 @@ pub static SGI_SEND_COUNT: core::sync::atomic::AtomicU64 =
 pub static SGI_RECV_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Phase-5b stall instrumentation (aarch64-only).
+/// Indexed by target CPU.  Records `monotonic_ns()` at IPI send.
+pub static PER_CPU_IPI_SEND_TS_NS: [core::sync::atomic::AtomicU64; 16] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; 16]
+};
+/// Per-target-CPU send count (waker side).
+pub static PER_CPU_IPI_SEND_COUNT: [core::sync::atomic::AtomicU64; 16] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; 16]
+};
+/// Indexed by receiving CPU.  Records `monotonic_ns()` at IPI receive.
+pub static PER_CPU_IPI_RECV_TS_NS: [core::sync::atomic::AtomicU64; 16] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; 16]
+};
+/// Per-CPU receive count (target side).
+pub static PER_CPU_IPI_RECV_COUNT: [core::sync::atomic::AtomicU64; 16] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; 16]
+};
+/// Per-CPU exception entry counter (handle_irq invocations).
+pub static PER_CPU_EXCEPTION_ENTRY_COUNT: [core::sync::atomic::AtomicU64; 16] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; 16]
+};
+/// Per-CPU `clear_pending_switch` entry counter (called from arch IRQ entry on aarch64).
+pub static PER_CPU_CLEAR_SWITCH_COUNT: [core::sync::atomic::AtomicU64; 16] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; 16]
+};
+
 /// Top-level IRQ handler called from exception vectors.
 pub fn handle_irq() {
+    // Phase-5b stall instrumentation: bump per-CPU exception entry count.
+    // Paired with PER_CPU_IPI_RECV_TS_NS for IPI delivery latency.
+    {
+        let cpu = crate::sched::smp::cpu_id() as usize;
+        if cpu < PER_CPU_EXCEPTION_ENTRY_COUNT.len() {
+            PER_CPU_EXCEPTION_ENTRY_COUNT[cpu]
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     let intid = acknowledge();
     if intid == INTID_SPURIOUS {
         return;
@@ -273,6 +326,16 @@ pub fn handle_irq() {
             // up any newly-enqueued work on this CPU's runqueue.
             SGI_RECV_COUNT
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // Phase-5b stall instrumentation: per-CPU last-receive timestamp.
+            let cpu = crate::sched::smp::cpu_id() as usize;
+            if cpu < PER_CPU_IPI_RECV_TS_NS.len() {
+                PER_CPU_IPI_RECV_TS_NS[cpu].store(
+                    crate::arch::timer::monotonic_ns(),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                PER_CPU_IPI_RECV_COUNT[cpu]
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
         }
         INTID_TIMER_EL1_PHYS => {
             crate::arch::aarch64::timer::handle_timer_irq();

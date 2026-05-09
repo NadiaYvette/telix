@@ -40,12 +40,22 @@ pub fn grant_pages(
     readonly: bool,
 ) -> Result<(), GrantError> {
     let pmc = page::page_mmucount();
-    let alloc_page_count = (mmu_page_count + pmc - 1) / pmc;
 
     // Step 1: Look up the source VMA and collect its object ID + offset + phys pages.
-    let (obj_id, obj_mmu_offset, phys_pages) = aspace::with_aspace(src_aspace, |aspace| {
+    // The granted range may start at any sub-page offset within the granter's
+    // first alloc page when (object_offset + mmu_idx_start) % pmc != 0 — typical
+    // for non-PAGE-aligned VMAs (e.g. ELF segments at MMU-aligned but not
+    // PAGE-aligned addresses) or for src_va that isn't vma.va_start.  Capture
+    // that residue `r` so step 4 can compute correct sub-page indices into the
+    // collected phys_pages list.  Without `r`, unaligned grants silently mapped
+    // the destination onto sub-pages r positions earlier than intended.
+    let (obj_id, obj_mmu_offset, phys_pages, r) = aspace::with_aspace(src_aspace, |aspace| {
         let vma = aspace.find_vma(src_va).ok_or(GrantError::NoSourceVma)?;
         let mmu_idx_start = vma.mmu_index_of(src_va);
+        let r = (vma.object_offset as usize + mmu_idx_start) % pmc;
+        // Number of alloc pages spanning the granted range — must include the
+        // leading partial alloc page when r > 0.
+        let alloc_page_count = (r + mmu_page_count + pmc - 1) / pmc;
         let mut pages = [0usize; 256];
         for i in 0..alloc_page_count {
             let obj_page = vma.obj_page_index(mmu_idx_start + i * pmc);
@@ -56,7 +66,7 @@ pub fn grant_pages(
         }
         // object_offset for destination in MMUPAGE_SIZE units.
         let dst_obj_offset = vma.object_offset + mmu_idx_start as u32;
-        Ok((vma.object_id, dst_obj_offset, pages))
+        Ok((vma.object_id, dst_obj_offset, pages, r))
     })?;
 
     // Step 2: Register the mapping in the object.
@@ -88,8 +98,12 @@ pub fn grant_pages(
         };
 
         for mmu_idx in 0..mmu_page_count {
-            let page_i = mmu_idx / pmc;
-            let mmu_i = mmu_idx % pmc;
+            // Apply source-residue `r` so phys_pages[page_i] indexes the list
+            // correctly: phys_pages[0] holds the alloc page that contains the
+            // granter's first MMU page at sub-index r, NOT at sub-index 0.
+            let off = r + mmu_idx;
+            let page_i = off / pmc;
+            let mmu_i = off % pmc;
             let pa_base = phys_pages[page_i];
             if pa_base == 0 {
                 continue;

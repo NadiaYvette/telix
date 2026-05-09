@@ -181,6 +181,20 @@ pub struct PerCpuData {
     /// false-fire stale_on_cpu, re-enqueue the dispatching thread, and
     /// trigger DOUBLE-SCHED detection that kills it.
     pub dispatching_tid: AtomicU32,
+    /// Total successful dispatches on this CPU since boot.  Diagnostic for
+    /// #120-class issues — divides total runtime / dispatches gives average
+    /// timeslice; lets us spot CPUs that are idle vs CPUs that thrash.
+    pub dispatch_count: core::sync::atomic::AtomicU64,
+    /// Tid most recently dispatched on this CPU.  Combined with `dispatch_streak`
+    /// it reveals the EEVDF LIFO cycling pattern: with all-equal deadlines
+    /// strict-`<` pick_eligible drains position 0, the heap backfills from
+    /// the tail, and the re-enqueued thread lands at the tail again — so the
+    /// same tid wins picks back-to-back.  A long streak on one CPU paired
+    /// with starved tids in the same heap is the smoking gun.
+    pub last_dispatched_tid: AtomicU32,
+    /// Consecutive dispatches of the same tid on this CPU; reset to 1 when
+    /// a different tid is dispatched.
+    pub dispatch_streak: AtomicU32,
 }
 
 impl PerCpuData {
@@ -191,6 +205,9 @@ impl PerCpuData {
             online: AtomicBool::new(false),
             need_resched: AtomicBool::new(false),
             dispatching_tid: AtomicU32::new(0),
+            dispatch_count: core::sync::atomic::AtomicU64::new(0),
+            last_dispatched_tid: AtomicU32::new(0),
+            dispatch_streak: AtomicU32::new(0),
         }
     }
 }

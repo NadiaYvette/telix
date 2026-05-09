@@ -59,6 +59,10 @@ pub struct Thread {
     pub blocked_on: BlockReason,
     /// Debug: destination port for sys_call (set at CallReply park time).
     pub call_dest_port: u64,
+    /// Debug: message tag/opcode for sys_call (set at CallReply park time).
+    /// Lets CALL-TIMEOUT diagnostics identify *what* the caller was asking
+    /// the destination to do, not just *who* it was talking to.
+    pub call_tag: u64,
     /// Exit code set by sys_exit (for thread_join).
     pub exit_code: i32,
     /// Per-thread signal mask — bitmask of blocked signals (bit N = signal N+1).
@@ -134,6 +138,17 @@ pub struct Thread {
     pub ts_prev: core::sync::atomic::AtomicU32,
     /// Turnstile pointer we're currently blocked on (0 = not blocked).
     pub ts_blocked_on: core::sync::atomic::AtomicUsize,
+    /// #120 instrumentation H: monotonic_ns timestamp of the last
+    /// transition into ThreadState::Ready.  Used in CALL-TIMEOUT diag
+    /// to show whether a stuck-Ready thread has been Ready since long
+    /// ago (orphan) or recently (oscillating between states).
+    pub last_ready_ns: core::sync::atomic::AtomicU64,
+    /// #120 instrumentation I: count of percpu_enqueue calls for this
+    /// thread.  Initial wake = 1; rescue re-enqueues bump it.  Lets
+    /// CALL-TIMEOUT diag distinguish "thread enqueued once and never
+    /// dispatched" from "thread re-enqueued repeatedly by rescue but
+    /// dispatch keeps missing it".
+    pub enqueue_count: core::sync::atomic::AtomicU64,
     // --- Personality forwarding ---
     /// Result value from personality server reply (written by SYS_PERSONALITY_REPLY).
     pub personality_result: core::sync::atomic::AtomicU64,
@@ -220,6 +235,7 @@ impl Thread {
             stack_base: 0,
             blocked_on: BlockReason::None,
             call_dest_port: 0,
+            call_tag: 0,
             exit_code: 0,
             sig_mask: 0,
             sig_pending: 0,
@@ -252,6 +268,8 @@ impl Thread {
             ts_next: core::sync::atomic::AtomicU32::new(0),
             ts_prev: core::sync::atomic::AtomicU32::new(0),
             ts_blocked_on: core::sync::atomic::AtomicUsize::new(0),
+            last_ready_ns: core::sync::atomic::AtomicU64::new(0),
+            enqueue_count: core::sync::atomic::AtomicU64::new(0),
             personality_result: core::sync::atomic::AtomicU64::new(0),
             personality_frame_sp: 0,
             syscall_frame_sp: 0,

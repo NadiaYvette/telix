@@ -142,6 +142,53 @@ const ON_CPU_DEFERRED: u32 = u32::MAX - 2;
 // to 0 at boot (no-trace).
 pub static TRACE_TID: AtomicU32 = AtomicU32::new(0);
 
+// Phase-5b stall instrumentation — per-tid wake outcome ring (aarch64-only).
+//
+// Each entry holds the most recent `wake_parked_thread` outcome for a tid:
+//   - `WAKE_TRACE_TID[i]`        : tid this slot is recording (0 = empty)
+//   - `WAKE_TRACE_OUTCOME[i]`    : outcome code packed into u32:
+//        bits[3:0]   = path code (1=early, 2=fast-path-enq, 3=lost-to-cps,
+//                                 4=deferred-local, 5=deferred-ipi,
+//                                 6=dup-wake, 7=noop, 8=neither-cas)
+//        bits[7:4]   = waker_cpu
+//        bits[15:8]  = parking_cpu (when applicable)
+//        bits[31:16] = unused
+//   - `WAKE_TRACE_TS_NS[i]`      : monotonic_ns at the wake call
+//
+// Slot is hashed by (tid % WAKE_TRACE_RING).  Last writer wins.
+#[cfg(target_arch = "aarch64")]
+pub const WAKE_TRACE_RING: usize = 64;
+#[cfg(target_arch = "aarch64")]
+pub static WAKE_TRACE_TID: [AtomicU32; WAKE_TRACE_RING] = {
+    const Z: AtomicU32 = AtomicU32::new(0);
+    [Z; WAKE_TRACE_RING]
+};
+#[cfg(target_arch = "aarch64")]
+pub static WAKE_TRACE_OUTCOME: [AtomicU32; WAKE_TRACE_RING] = {
+    const Z: AtomicU32 = AtomicU32::new(0);
+    [Z; WAKE_TRACE_RING]
+};
+#[cfg(target_arch = "aarch64")]
+pub static WAKE_TRACE_TS_NS: [AtomicU64; WAKE_TRACE_RING] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; WAKE_TRACE_RING]
+};
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn record_wake_trace(tid: ThreadId, path_code: u8, waker_cpu: u32, parking_cpu: u32) {
+    let slot = (tid as usize) % WAKE_TRACE_RING;
+    let v: u32 = (path_code as u32 & 0xF)
+        | ((waker_cpu & 0xF) << 4)
+        | ((parking_cpu & 0xFF) << 8);
+    WAKE_TRACE_TID[slot].store(tid, Ordering::Relaxed);
+    WAKE_TRACE_OUTCOME[slot].store(v, Ordering::Relaxed);
+    WAKE_TRACE_TS_NS[slot].store(crate::arch::timer::monotonic_ns(), Ordering::Relaxed);
+}
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+pub fn record_wake_trace(_tid: ThreadId, _path_code: u8, _waker_cpu: u32, _parking_cpu: u32) {}
+
 /// Emit a trace line if either the current thread or `subject` matches
 /// `TRACE_TID`.  Subject = u32::MAX means "current only".
 #[inline]
@@ -850,6 +897,10 @@ static RESCUE_PHANTOM: AtomicU64 = AtomicU64::new(0);
 static RESCUE_MAX: AtomicU64 = AtomicU64::new(0);
 static RESCUE_STALE_ON_CPU: AtomicU64 = AtomicU64::new(0);
 static RESCUE_PENDING: AtomicU64 = AtomicU64::new(0);
+/// #120 sub-pattern A: counts every time the new STUCK_PENDING_AGE check
+/// fires its rescue (logs RESCUE-STUCK-PENDING).  Dumped on CALL-TIMEOUT
+/// so we can tell whether the rescue is even being entered for orphans.
+static RESCUE_STUCK_PENDING_FIRES: AtomicU64 = AtomicU64::new(0);
 
 /// Per-tid rescue counter for the watchdog dump.  Lets us see *which*
 /// tids account for the bulk of rescue traffic when a stall storm fires —
@@ -891,6 +942,10 @@ fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
     }
     trace_point("percpu_enqueue.insert", tid as u32);
     ENQ_TOTAL.fetch_add(1, Ordering::Relaxed);
+    // #120 instrumentation I: per-thread enqueue counter.
+    thread_ref(tid).enqueue_count.fetch_add(1, Ordering::Relaxed);
+    // #120 instrumentation H: timestamp the Ready-enqueue event.
+    thread_ref(tid).last_ready_ns.store(get_monotonic_ns(), Ordering::Relaxed);
     let mut rq = percpu_rq()[target_cpu as usize].lock();
     let t = thread_ref(tid);
     if t.sched_class == SCHED_NORMAL && prio != 254 {
@@ -2397,6 +2452,78 @@ pub fn tick(current_sp: u64) -> u64 {
                                 top_idx[3], top_cnt[3],
                                 top_idx[4], top_cnt[4]);
                         }
+
+                        // Phase-5b stall instrumentation (aarch64-only).
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            let now = get_monotonic_ns();
+                            let ncpus_a = smp::num_cpus().min(16);
+                            for c in 0..ncpus_a {
+                                let send_ts = crate::arch::aarch64::irq::PER_CPU_IPI_SEND_TS_NS[c]
+                                    .load(Ordering::Relaxed);
+                                let recv_ts = crate::arch::aarch64::irq::PER_CPU_IPI_RECV_TS_NS[c]
+                                    .load(Ordering::Relaxed);
+                                let send_n  = crate::arch::aarch64::irq::PER_CPU_IPI_SEND_COUNT[c]
+                                    .load(Ordering::Relaxed);
+                                let recv_n  = crate::arch::aarch64::irq::PER_CPU_IPI_RECV_COUNT[c]
+                                    .load(Ordering::Relaxed);
+                                let ex_n    = crate::arch::aarch64::irq::PER_CPU_EXCEPTION_ENTRY_COUNT[c]
+                                    .load(Ordering::Relaxed);
+                                let cps_n   = crate::arch::aarch64::irq::PER_CPU_CLEAR_SWITCH_COUNT[c]
+                                    .load(Ordering::Relaxed);
+                                let send_age_us = if send_ts != 0 { (now.saturating_sub(send_ts)) / 1000 } else { 0 };
+                                let recv_age_us = if recv_ts != 0 { (now.saturating_sub(recv_ts)) / 1000 } else { 0 };
+                                let lat_us = if recv_ts >= send_ts && send_ts != 0 {
+                                    (recv_ts - send_ts) / 1000
+                                } else {
+                                    u64::MAX
+                                };
+                                crate::println!(
+                                    "  AA64-IPI cpu{}: send=(n={} age_us={}) recv=(n={} age_us={}) lat_us={} ex_n={} cps_n={} pkpend={} parked_tid={}",
+                                    c, send_n, send_age_us, recv_n, recv_age_us, lat_us,
+                                    ex_n, cps_n,
+                                    park_switch_pending()[c].load(Ordering::Relaxed),
+                                    parked_tid()[c].load(Ordering::Relaxed),
+                                );
+                            }
+                            // Recent wake_parked_thread outcomes (top-N slots
+                            // with non-zero tid).  Path codes:
+                            // 1=early, 2=fast-enq, 3=lost-cps, 4=def-local,
+                            // 5=def-ipi, 6=dup, 7=neither-cas-noop.
+                            let mut printed = 0u32;
+                            for i in 0..WAKE_TRACE_RING {
+                                let t = WAKE_TRACE_TID[i].load(Ordering::Relaxed);
+                                if t == 0 { continue; }
+                                let v = WAKE_TRACE_OUTCOME[i].load(Ordering::Relaxed);
+                                let ts = WAKE_TRACE_TS_NS[i].load(Ordering::Relaxed);
+                                let path = v & 0xF;
+                                let waker_cpu = (v >> 4) & 0xF;
+                                let park_cpu = (v >> 8) & 0xFF;
+                                let age_us = if ts != 0 { now.saturating_sub(ts) / 1000 } else { 0 };
+                                crate::println!(
+                                    "  AA64-WAKE tid={} path={} waker_cpu={} park_cpu={} age_us={}",
+                                    t, path, waker_cpu, park_cpu, age_us
+                                );
+                                printed += 1;
+                                if printed >= 16 { break; }
+                            }
+                            // Per-thread stack_switch_pending for blocked threads.
+                            let max_tid = NEXT_THREAD_ID.load(Ordering::Relaxed).min(64);
+                            for tid in 1..max_tid {
+                                let t = unsafe { &*(THREAD_TABLE.get(tid) as *const Thread) };
+                                if t.task_id == 0 || t.state == ThreadState::Dead { continue; }
+                                let park = t.park_state.load(Ordering::Relaxed);
+                                let ssp = t.stack_switch_pending.load(Ordering::Relaxed);
+                                if park != 0 || ssp {
+                                    crate::println!(
+                                        "  AA64-PARK tid={} park_state={} stack_switch_pending={} state={:?} blocked_on={:?} on_cpu={} last_cpu={}",
+                                        tid, park, ssp, t.state, t.blocked_on,
+                                        t.on_cpu.load(Ordering::Relaxed),
+                                        t.last_cpu.load(Ordering::Relaxed),
+                                    );
+                                }
+                            }
+                        }
                     }
                     // On every stall tick, attempt to rescue orphaned threads.
                     // TOCTOU false positives are harmless: DOUBLE-ENQ handler
@@ -2899,6 +3026,14 @@ fn try_switch(current_sp: u64) -> u64 {
         // state=Ready + on_cpu=cpu + current_thread≠tid → false orphan.
         unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
         trace_sched(next_id, 4); // 4=on_cpu_set
+        // #120 dispatch-pattern diagnostic: count + same-tid streak.
+        pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
+        let prev_picked = pcpu.last_dispatched_tid.swap(next_id as u32, Ordering::Relaxed);
+        if prev_picked == next_id as u32 {
+            pcpu.dispatch_streak.fetch_add(1, Ordering::Relaxed);
+        } else {
+            pcpu.dispatch_streak.store(1, Ordering::Relaxed);
+        }
     } else {
         // Idle thread: no CAS needed, just set Running.
         unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
@@ -3128,6 +3263,14 @@ pub fn voluntary_reschedule() {
         thread_ref(next_id).on_cpu_set_by.store(2, Ordering::Relaxed); // 2=vol_resched
         // Set Running IMMEDIATELY after CAS — close TOCTOU window (see try_switch).
         unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
+        // #120 dispatch-pattern diagnostic (vol_resched path).
+        pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
+        let prev_picked = pcpu.last_dispatched_tid.swap(next_id as u32, Ordering::Relaxed);
+        if prev_picked == next_id as u32 {
+            pcpu.dispatch_streak.fetch_add(1, Ordering::Relaxed);
+        } else {
+            pcpu.dispatch_streak.store(1, Ordering::Relaxed);
+        }
     } else {
         unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
     }
@@ -5152,6 +5295,17 @@ pub fn take_pending_switch() -> u64 {
 /// thread's kernel stack is no longer in use.  This unblocks
 /// `wake_parked_thread`'s spin-wait.
 pub fn clear_pending_switch(cpu: usize) {
+    // Phase-5b stall instrumentation (aarch64-only).  If aarch64 IRQ
+    // entry never calls this, this counter stays 0 — direct evidence
+    // that the parking CPU never clears `stack_switch_pending`, so
+    // `wake_parked_thread` is forced down the IPI path forever.
+    #[cfg(target_arch = "aarch64")]
+    {
+        if cpu < crate::arch::aarch64::irq::PER_CPU_CLEAR_SWITCH_COUNT.len() {
+            crate::arch::aarch64::irq::PER_CPU_CLEAR_SWITCH_COUNT[cpu]
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     park_switch_pending()[cpu].store(false, Ordering::Release);
     // Also clear the per-thread stack_switch_pending for whatever thread
     // was parked on this CPU. The assembly stack switch is now complete.
@@ -5161,6 +5315,26 @@ pub fn clear_pending_switch(cpu: usize) {
         if tid != u32::MAX {
             let tref = thread_ref(tid);
             tref.stack_switch_pending.store(false, Ordering::Release);
+
+            // SeqCst fence — pairs with the matching fence in
+            // `wake_parked_thread` between its CAS PARK_COMMITTED→PARK_WOKEN
+            // and its load of `stack_switch_pending`.  Loom found that on
+            // a non-TSO ISA (aarch64/riscv64) a waker's Acquire load of
+            // `stack_switch_pending` after observing PARK_COMMITTED can
+            // legally return the older `true` value (set by
+            // `park_current_for_ipc` before its commit-CAS), missing this
+            // CPU's later `store(false)` — even though program order on
+            // *this* CPU is store-false then CAS-WOKEN→NONE.  Without a
+            // total order across the two variables the waker takes the
+            // slow IPI path, the IPI lands here after `parked_tid` has
+            // been swapped to MAX, and no-one ever enqueues the woken
+            // thread → permanent lost wakeup.  SeqCst fences on both
+            // sides give us a single total order: either this store(false)
+            // is before the waker's load (waker reads false, takes fast
+            // path), or our CAS reads PARK_WOKEN (we win arbitration and
+            // enqueue here).  x86 TSO already provides this implicitly,
+            // so the fence is a no-op there in practice.
+            core::sync::atomic::fence(Ordering::SeqCst);
 
             // Self-enqueue handshake: if a wake already fired while we
             // were stack-switching, it left park_state = PARK_WOKEN and
@@ -5477,6 +5651,7 @@ pub fn wake_parked_thread(tid: ThreadId) {
         .is_ok()
     {
         trace_point("wake_parked.early_wake", tid as u32);
+        record_wake_trace(tid, 1, smp::cpu_id(), u32::MAX);
         unsafe { thread_mut_from_ref(tid) }.ipc_frame_sp = 0;
         return;
     }
@@ -5498,6 +5673,28 @@ pub fn wake_parked_thread(tid: ThreadId) {
         unsafe { thread_mut_from_ref(tid) }.ipc_frame_sp = 0;
         let waker_cpu = smp::cpu_id();
         let parking_cpu = tref.last_cpu.load(Ordering::Relaxed);
+
+        // SeqCst fence — pairs with the matching fence in
+        // `clear_pending_switch` between its `stack_switch_pending.store(false)`
+        // and its CAS PARK_WOKEN→PARK_NONE.  Loom found that on a non-TSO
+        // ISA (aarch64/riscv64) without this fence the Acquire load below
+        // can legally observe the *older* `true` value — set by
+        // `park_current_for_ipc` before its commit-CAS — even though the
+        // parking CPU's `clear_pending_switch` has already stored `false`
+        // and given up on the WOKEN→NONE CAS (which then fails because we
+        // hadn't reached this point yet).  Result: we'd take the slow IPI
+        // path, but `parked_tid` is already MAX so the IPI's
+        // `clear_pending_switch` no-ops → permanent lost wakeup.  With
+        // SeqCst fences on both sides, store(false) and the load below
+        // are totally ordered, so either we read `false` and take the
+        // fast path, or `clear_pending_switch` reads `PARK_WOKEN` and
+        // enqueues on its side.  x86 TSO already provides this implicitly.
+        // Surgical fence preferred over upgrading the bool's load/store to
+        // SeqCst because only this one fast-path read needs the
+        // cross-variable ordering — the spin-wait readers at handlers.rs
+        // L843, scheduler.rs L3526 / L6303 reload until they see false and
+        // are not vulnerable to the stale-read window.
+        core::sync::atomic::fence(Ordering::SeqCst);
 
         // Fast path: stack switch already complete.  We can safely do
         // the enqueue ourselves and apply steal-to-waker re-targeting.
@@ -5523,11 +5720,13 @@ pub fn wake_parked_thread(tid: ThreadId) {
                     crate::arch::irq::send_reschedule_ipi(target);
                     trace_point("wake_parked.remote_ipi", tid as u32);
                 }
+                record_wake_trace(tid, 2, waker_cpu, parking_cpu);
                 return;
             }
             // CAS failed: clear_pending_switch beat us.  It already
             // enqueued.  Done.
             trace_point("wake_parked.lost_to_cps", tid as u32);
+            record_wake_trace(tid, 3, waker_cpu, parking_cpu);
             return;
         }
 
@@ -5546,9 +5745,11 @@ pub fn wake_parked_thread(tid: ThreadId) {
             smp::get(waker_cpu).need_resched.store(true, Ordering::Release);
             crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
             trace_point("wake_parked.deferred_local", tid as u32);
+            record_wake_trace(tid, 4, waker_cpu, parking_cpu);
         } else {
             crate::arch::irq::send_reschedule_ipi(parking_cpu);
             trace_point("wake_parked.deferred_ipi", tid as u32);
+            record_wake_trace(tid, 5, waker_cpu, parking_cpu);
         }
     } else {
         // Both CAS operations failed — park_state is now NONE or WOKEN.
@@ -5562,8 +5763,10 @@ pub fn wake_parked_thread(tid: ThreadId) {
         let state = tref.park_state.load(Ordering::Acquire);
         if state == PARK_WOKEN {
             trace_point("wake_parked.dup_wake", tid as u32);
+            record_wake_trace(tid, 6, smp::cpu_id(), u32::MAX);
             return;
         }
+        record_wake_trace(tid, 7, smp::cpu_id(), u32::MAX);
         let tstate = unsafe { thread_mut_from_ref(tid) }.state;
         let blocked = unsafe { thread_mut_from_ref(tid) }.blocked_on;
         crate::println!(
@@ -5637,10 +5840,163 @@ fn call_reply_timeout_sweep() {
             // Clear the timestamp so we don't re-fire on next sweep.
             t.call_blocked_ns.store(0, Ordering::Relaxed);
             crate::println!(
-                "CALL-TIMEOUT: tid={} slot={} task={} port={:#x} blocked_for={}ms",
-                tid, slot, t.task_id, t.call_dest_port,
+                "CALL-TIMEOUT: tid={} slot={} task={} port={:#x} tag={:#x} blocked_for={}ms",
+                tid, slot, t.task_id, t.call_dest_port, t.call_tag,
                 (now - blocked_ns) / 1_000_000
             );
+            // Per-CPU dispatch state on CALL-TIMEOUT (#120 instrument G):
+            // tells us whether the orphan tid is queue-depth-starved (CPUs
+            // busy with other work) or whether dispatch-trigger is lost
+            // (CPUs idle but not picking up the orphan).
+            {
+                let ncpus = crate::sched::smp::num_cpus().min(8);
+                let stuck_pending_fires = RESCUE_STUCK_PENDING_FIRES.load(Ordering::Relaxed);
+                let rescue_pending = RESCUE_PENDING.load(Ordering::Relaxed);
+                crate::println!(
+                    "  CPU-DIAG: rescue_stuck_pending_fires={} rescue_pending_obs={}",
+                    stuck_pending_fires, rescue_pending
+                );
+                for c in 0..ncpus {
+                    let pcpu = crate::sched::smp::get(c as u32);
+                    let cur = pcpu.current_thread.load(Ordering::Acquire);
+                    let dispatching = pcpu.dispatching_tid.load(Ordering::Acquire);
+                    let need_resched = pcpu.need_resched.load(Ordering::Acquire);
+                    // #120 instrumentation J: run-queue depth (try_lock to avoid
+                    // contending the rq if some CPU is mid-dispatch).
+                    // Snapshot up to 8 EEVDF heap entries for vruntime/deadline
+                    // dump — disambiguates "heap stuck because nothing eligible"
+                    // (vruntime > min_vruntime for all) vs "phantom heap entries"
+                    // (heap holds tids whose state is no longer Ready).
+                    let mut entries: [(u32, u64, u64, u8); 8] = [(0, 0, 0, 0); 8];
+                    let mut entries_n: usize = 0;
+                    let mut min_vrt: u64 = 0;
+                    let (rq_eevdf_count, rq_locked) =
+                        if (c as usize) < percpu_rq().len() {
+                            if let Some(rq) = percpu_rq()[c as usize].try_lock() {
+                                let n = rq.eevdf_nr_running;
+                                let any_rt = rq.active[0] != 0 || rq.active[1] != 0;
+                                let any_legacy = rq.active[2] != 0 || rq.active[3] != 0;
+                                min_vrt = rq.eevdf_min_vruntime;
+                                rq.eevdf_heap.for_each_entry(|tid, key| {
+                                    if entries_n < 8 {
+                                        let tt = thread_ref(tid);
+                                        let vrt = tt.eevdf_vruntime;
+                                        let st = tt.state as u8;
+                                        entries[entries_n] = (tid, key, vrt, st);
+                                        entries_n += 1;
+                                    }
+                                });
+                                drop(rq);
+                                (n as u64, (any_rt, any_legacy))
+                            } else {
+                                (u64::MAX, (false, false))
+                            }
+                        } else {
+                            (0, (false, false))
+                        };
+                    let disp_n = pcpu.dispatch_count.load(Ordering::Relaxed);
+                    let disp_last = pcpu.last_dispatched_tid.load(Ordering::Relaxed);
+                    let disp_streak = pcpu.dispatch_streak.load(Ordering::Relaxed);
+                    crate::println!(
+                        "  CPU-DIAG: cpu={} current_thread={} dispatching_tid={} need_resched={} eevdf_n={} eevdf_min_vrt={} rt_pending={} legacy_pending={} dispatches={} last_disp_tid={} streak={}",
+                        c, cur, dispatching, need_resched,
+                        rq_eevdf_count, min_vrt, rq_locked.0, rq_locked.1,
+                        disp_n, disp_last, disp_streak
+                    );
+                    for i in 0..entries_n {
+                        let (etid, ekey, evrt, est) = entries[i];
+                        let eligible = evrt <= min_vrt;
+                        crate::println!(
+                            "    EEVDF[{}]: tid={} deadline={} vruntime={} state={} eligible={}",
+                            i, etid, ekey, evrt, est, eligible
+                        );
+                    }
+                }
+            }
+            // Diagnostic dump for #120: per-port wake counters + state of
+            // threads in the destination port's owning aspace.  If
+            // wake_no_parker > 0 while parkers exist, we have direct
+            // evidence of the wake_recv_waiter race window.
+            if let Some(p) = crate::ipc::port::port_ref(t.call_dest_port) {
+                let calls    = p.diag_wake_calls.load(Ordering::Relaxed);
+                let no_park  = p.diag_wake_no_parker.load(Ordering::Relaxed);
+                let inj_ok   = p.diag_wake_inject_ok.load(Ordering::Relaxed);
+                let reenq    = p.diag_wake_reenq.load(Ordering::Relaxed);
+                let recv_h   = p.recv_holder.load(Ordering::Relaxed);
+                crate::println!(
+                    "  PORT-DIAG: wake_calls={} no_parker={} inject_ok={} reenq={} recv_holder={}",
+                    calls, no_park, inj_ok, reenq, recv_h
+                );
+                // Cross-check: does the HAMT actually map (port_id, RECV_PARK)
+                // to a turnstile right now?  If hamt_found=false while parked
+                // threads have ts_blocked_on != 0, we have proof of HAMT/turnstile
+                // divergence (orphan turnstile — the bug we're hunting).
+                let (hamt_found_park, hamt_ts_park) = crate::sync::turnstile::lookup_port_turnstile(
+                    t.call_dest_port,
+                    crate::sync::turnstile::KEY_PORT_RECV_PARK,
+                );
+                let (hamt_found_recv, hamt_ts_recv) = crate::sync::turnstile::lookup_port_turnstile(
+                    t.call_dest_port,
+                    crate::sync::turnstile::KEY_PORT_RECV,
+                );
+                crate::println!(
+                    "  PORT-DIAG: hamt_lookup RECV_PARK={{found={} ts={:#x}}} RECV={{found={} ts={:#x}}}",
+                    hamt_found_park, hamt_ts_park, hamt_found_recv, hamt_ts_recv
+                );
+                // Walk threads in the recv-holder's task and print any blocked
+                // on this very port.  Cap at 8 to avoid log flood.
+                if recv_h != u32::MAX {
+                    let mut printed = 0u32;
+                    SCHED_THREAD_ART.for_each(|_key, val| {
+                        if printed >= 8 { return; }
+                        let other = unsafe { &*(val as *const Thread) };
+                        if other.task_id != recv_h
+                            || other.state == ThreadState::Dead
+                        {
+                            return;
+                        }
+                        if let BlockReason::PortRecv(rp) = other.blocked_on {
+                            if rp == t.call_dest_port {
+                                // ts_blocked_on disambiguates #120 sub-patterns:
+                                //   != 0  → thread IS on a turnstile (port_dequeue_one
+                                //          buggy, or different key, or contention).
+                                //   == 0  → thread was dequeued from turnstile but
+                                //          state never transitioned Blocked → Ready.
+                                // last_ready_ns shows whether the thread has been
+                                // Ready since long ago (orphan) or recently (oscillating).
+                                // enqueue_count: 1 = just one wake; >1 = rescue
+                                // re-enqueued repeatedly but dispatch keeps missing.
+                                let now_ns = get_monotonic_ns();
+                                let lr = other.last_ready_ns.load(Ordering::Relaxed);
+                                let ready_age_ms = if lr > 0 { (now_ns - lr) / 1_000_000 } else { 0 };
+                                let ts_addr = other.ts_blocked_on.load(Ordering::Relaxed);
+                                crate::println!(
+                                    "  PORT-DIAG: dest tid={} state={:?} blocked_on=PortRecv({:#x}) on_cpu={} ts_blocked_on={:#x} enq_count={} ready_age_ms={}",
+                                    other.id, other.state, rp,
+                                    other.on_cpu.load(Ordering::Relaxed),
+                                    ts_addr,
+                                    other.enqueue_count.load(Ordering::Relaxed),
+                                    ready_age_ms,
+                                );
+                                // If ts_blocked_on != 0, decode the turnstile so
+                                // we know which key/port it's actually registered
+                                // under — flags HAMT-orphan turnstiles directly.
+                                if let Some((k, asp, va, wc, h)) =
+                                    unsafe { crate::sync::turnstile::turnstile_info(ts_addr) }
+                                {
+                                    let hamt_match = (hamt_found_park && hamt_ts_park == ts_addr)
+                                        || (hamt_found_recv && hamt_ts_recv == ts_addr);
+                                    crate::println!(
+                                        "    TS@{:#x}: key_type={} aspace={} va={:#x} waiter_count={} hash={:#x} hamt_match={}",
+                                        ts_addr, k, asp, va, wc, h, hamt_match,
+                                    );
+                                }
+                                printed += 1;
+                            }
+                        }
+                    });
+                }
+            }
             wake_parked_thread(tid as ThreadId);
         }
     }
@@ -5694,14 +6050,49 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
         // generic on_cpu==MAX orphan (which has wider race windows with
         // park/wake paths and warrants the age filter).
         let mut stale_on_cpu = false;
+        // Threshold for declaring an "ON_CPU_PENDING for so long it must
+        // be stuck" orphan.  Normal PENDING windows are sub-millisecond
+        // (set by percpu_enqueue, cleared by try_switch on the next tick).
+        // Anything past STUCK_PENDING_AGE consecutive sweeps means the
+        // wake's IPI was lost / the target CPU's try_switch never picked
+        // the thread up (#120 root cause: wake_parked_thread fast path
+        // runs but the parking CPU never dispatches).
+        const STUCK_PENDING_AGE: u32 = 16; // ~16s at 1Hz rescue cadence
         let is_orphan = if on == u32::MAX {
             true
         } else if on == ON_CPU_PENDING {
-            // Transient — dequeue_set_pending just set this.  Count
-            // observations so we know how often the scan sees this state,
-            // even though we deliberately don't rescue here.
+            // Transient — dequeue_set_pending just set this — UNLESS the
+            // age counter says we've seen this for too long.  Use a
+            // separate counter so this state's age doesn't conflict with
+            // the on_cpu==MAX path (which has its own age semantics).
             RESCUE_PENDING.fetch_add(1, Ordering::Relaxed);
-            false
+            let pending_age = if (tid as usize) < ORPHAN_AGE.len() {
+                ORPHAN_AGE[tid as usize].fetch_add(1, Ordering::Relaxed)
+            } else { 0 };
+            if pending_age >= STUCK_PENDING_AGE {
+                // Stuck PENDING: treat as orphan.  Re-enqueue path below
+                // will check for actual queue membership and DOUBLE_ENQ
+                // before doing the percpu_enqueue, so this is safe.
+                RESCUE_STUCK_PENDING_FIRES.fetch_add(1, Ordering::Relaxed);
+                // Rate-limit the println: only log on first crossing
+                // (age == STUCK_PENDING_AGE).  Subsequent stuckness still
+                // counts in RESCUE_STUCK_PENDING_FIRES but doesn't flood
+                // the serial log every sweep.
+                if pending_age == STUCK_PENDING_AGE {
+                    crate::println!(
+                        "RESCUE-STUCK-PENDING: tid={} age={} task={} on_cpu=PENDING - \
+                        treating as orphan (#120 IPI/dispatch loss)",
+                        tid, pending_age, t.task_id
+                    );
+                }
+                true
+            } else {
+                // PENDING but not yet aged enough — do NOT fall through
+                // to the "if !is_orphan { reset age }" line below, that
+                // would zero the counter and the threshold would never
+                // be reached.  Skip this tid for this sweep.
+                continue;
+            }
         } else if on < ncpus as u32 {
             // Check if the claimed CPU is actually running this thread.
             // Also consult dispatching_tid: the claimed CPU may be in the
@@ -5837,8 +6228,15 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 // Not in deferred slot. Re-read on_cpu to filter out the
                 // narrow drain window (between swap(0) and store(ON_CPU_PENDING)).
                 // If drain just handled it, on_cpu will be ON_CPU_PENDING now.
+                //
+                // Exception: if `on` was already PENDING when we entered this
+                // branch (i.e. we got here via the new STUCK_PENDING_AGE path
+                // above), seeing PENDING again on re-read is NOT "drain just
+                // handled it" — it's "thread has been PENDING for >=16s and
+                // is actually stuck."  Continue to the re-enqueue path.
+                let was_stuck_pending = on == ON_CPU_PENDING;
                 let on2 = t.on_cpu.load(Ordering::Acquire);
-                if on2 == ON_CPU_PENDING {
+                if on2 == ON_CPU_PENDING && !was_stuck_pending {
                     if (tid as usize) < ORPHAN_AGE.len() { ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed); }
                     continue; // drain just handled it
                 }

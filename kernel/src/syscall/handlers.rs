@@ -1192,8 +1192,14 @@ fn sys_call(
     // Park on the cap. pre_save_frame already ran above. If sys_reply beat
     // us to it, park_current_for_ipc's CAS fails and it returns immediately.
     let slot = (handle & 0xFFFF_FFFF) as u32;
-    // Store dest_port for diagnostics (visible in watchdog dumps).
-    unsafe { crate::sched::scheduler::thread_mut_from_ref(caller_tid) }.call_dest_port = dest_port;
+    // Store dest_port + tag for diagnostics (visible in watchdog dumps and
+    // CALL-TIMEOUT log lines).  Lets us identify which OPCODE got stuck on
+    // a given port — required for triaging unresponsive servers (e.g. #120).
+    unsafe {
+        let t = crate::sched::scheduler::thread_mut_from_ref(caller_tid);
+        t.call_dest_port = dest_port;
+        t.call_tag = tag;
+    }
     crate::sched::scheduler::park_current_for_ipc(
         crate::sched::thread::BlockReason::CallReply(slot),
     );

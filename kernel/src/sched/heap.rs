@@ -51,6 +51,20 @@ impl HeapEntry {
 pub struct Heap4 {
     entries: [HeapEntry; HEAP_CAP],
     len: u32,
+    /// Rotating scan-start index for `pick_eligible` tie-breaks.
+    ///
+    /// Strict-`<` over physical positions means all-equal-deadline ties
+    /// always resolve to position 0; the heap then backfills position 0 from
+    /// the tail and the just-re-enqueued thread (which lands at the new tail)
+    /// wins the next pick — LIFO cycling that starves entries at positions
+    /// 1..n-2 indefinitely (#120 dispatch oscillation).
+    ///
+    /// Rotating the scan start each call gives every position a turn at being
+    /// "position 0" without forcing strict FIFO (which broke cache locality
+    /// in boot 91amfsq585).  Over `len` consecutive picks each entry gets one
+    /// turn at the rotation origin while still benefiting from the heap
+    /// property when keys actually differ.
+    scan_start: u32,
 }
 
 impl Heap4 {
@@ -59,6 +73,7 @@ impl Heap4 {
         Self {
             entries: [HeapEntry::ZERO; HEAP_CAP],
             len: 0,
+            scan_start: 0,
         }
     }
 
@@ -72,6 +87,16 @@ impl Heap4 {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Iterate `(tid, key)` for each entry in physical (unsorted) order.
+    /// Caller-supplied closure is invoked under whatever lock the caller
+    /// holds — used by CALL-TIMEOUT diagnostic dump.
+    #[inline]
+    pub fn for_each_entry<F: FnMut(u32, u64)>(&self, mut f: F) {
+        for i in 0..(self.len as usize) {
+            f(self.entries[i].tid, self.entries[i].key);
+        }
     }
 
     /// Peek at the minimum entry without removing it.
@@ -124,7 +149,14 @@ impl Heap4 {
         let n = self.len as usize;
         let mut best_pos: Option<usize> = None;
         let mut best_key: u64 = u64::MAX;
-        for i in 0..n {
+        // Rotate the scan starting position each call.  Strict-`<` is kept
+        // (preserves heap-property selection when keys actually differ) but
+        // the *origin* rotates, so equal-key ties don't always go to physical
+        // position 0.  See `scan_start` field doc for the LIFO-starvation
+        // motivation.
+        let start = (self.scan_start as usize) % n;
+        for k in 0..n {
+            let i = (start + k) % n;
             let e = &self.entries[i];
             let vrt = super::scheduler::thread_ref(e.tid).eevdf_vruntime;
             if vrt <= max_vruntime && e.key < best_key {
@@ -132,6 +164,9 @@ impl Heap4 {
                 best_pos = Some(i);
             }
         }
+        // Advance scan_start regardless of pick outcome so successive calls
+        // visit different origins even when the heap is partially eligible.
+        self.scan_start = self.scan_start.wrapping_add(1);
         if let Some(pos) = best_pos {
             Some(self.remove(pos))
         } else {

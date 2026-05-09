@@ -802,6 +802,37 @@ pub fn cleanup_blocked(tid: u32) {
     cleanup_blocked_inner(tid, ts_addr, bucket, hash, key_type, aspace_id, va);
 }
 
+/// Read turnstile fields for diagnostic dumps.  Returns
+/// `(key_type, aspace_id, va, waiter_count, hash)` if the address is non-zero.
+///
+/// # Safety
+/// Caller must guarantee that `ts_addr` (typically read from
+/// `Thread::ts_blocked_on`) still points at a live Turnstile slab — i.e. the
+/// thread has not been re-enqueued or cleaned up.  Used from CALL-TIMEOUT
+/// diagnostic context where the parked thread holds a stable reference.
+pub unsafe fn turnstile_info(ts_addr: usize) -> Option<(u8, u64, usize, u16, u64)> {
+    if ts_addr == 0 {
+        return None;
+    }
+    let ts = unsafe { &*(ts_addr as *const Turnstile) };
+    Some((ts.key_type, ts.aspace_id, ts.va, ts.waiter_count, ts.hash))
+}
+
+/// Re-derive the HAMT lookup result for `(port_id, key_type)` and report
+/// whether it currently maps to a turnstile (and if so, which one).
+/// Returns `(found_in_hamt, hamt_ts_addr)`.  Diagnostic-only.
+pub fn lookup_port_turnstile(port_id: u64, key_type: u8) -> (bool, usize) {
+    let hash = port_key_hash(port_id, key_type);
+    let bucket = bucket_index(hash);
+    let aspace_id = 0u64;
+    let va = port_id as usize;
+    let root = WAIT_HAMT[bucket].lock();
+    match hamt_lookup(&root, hash, key_type, aspace_id, va) {
+        Some(ts) => (true, ts as usize),
+        None => (false, 0),
+    }
+}
+
 /// Allocate a turnstile for a new thread. Returns phys addr or 0 on OOM.
 pub fn alloc_thread_turnstile() -> usize {
     match alloc_turnstile() {
