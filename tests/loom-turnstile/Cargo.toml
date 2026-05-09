@@ -1,0 +1,36 @@
+[package]
+name = "loom-turnstile"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone (excluded from the kernel workspace) for the same reason as
+# tests/loom-park-state: loom needs std/Arc; the kernel is no_std.
+#
+# We model the bucket-locked HAMT lookup + the three concurrent paths that
+# touch a single port turnstile:
+#
+#   * port_enqueue_with_check  (enqueue waiter; alloc + hamt_insert if first)
+#   * port_wake_one            (lookup + ts_dequeue_head; remove from HAMT
+#                               when waiter_count drops to zero)
+#   * cleanup_blocked_inner    (kill-path: remove a specific tid from the ts
+#                               and remove from HAMT when empty)
+#
+# The kernel uses a per-bucket SpinLock for the HAMT. We model that as a
+# loom Mutex covering both the HAMT-membership and the per-turnstile waiter
+# bookkeeping (which is what the real lock does — both reads/writes of the
+# Turnstile happen under the bucket lock in port_*).
+#
+# Things deliberately NOT modeled:
+#   * Multiple buckets, multiple ports, priority ordering.
+#   * The post-drop wake_thread call (it's outside the lock, but its
+#     correctness is covered by the loom-park-state crate).
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }

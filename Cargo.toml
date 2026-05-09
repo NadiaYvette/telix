@@ -1,4 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["kernel", "userlib"]
-exclude = ["boot/efi"]
+exclude = [
+    "boot/efi",
+    "tests/loom-park-state",
+    "tests/loom-turnstile",
+    "tests/loom-turnstile-slab",
+    "tests/loom-runqueue",
+]

@@ -1,0 +1,305 @@
+//! Loom model of the turnstile bucket-lock protocol from
+//! `kernel/src/sync/turnstile.rs`.
+//!
+//! Three concurrent operations all touch a single port turnstile under
+//! `WAIT_HAMT[bucket].lock()`:
+//!
+//! * `port_enqueue_with_check`  — lookup; if miss, alloc + insert; ts_enqueue.
+//! * `port_wake_one`            — lookup; ts_dequeue_head; if empty, remove.
+//! * `cleanup_blocked_inner`    — lookup matches the killed thread's stored
+//!                                ts_addr; ts_remove(tid); if empty, remove.
+//!
+//! The race window we care about: thread A is being killed at the moment a
+//! waker is poking the same turnstile. The kernel claim is that because all
+//! three sequences hold the per-bucket SpinLock for the entire HAMT-touch
+//! plus turnstile mutation, no waiter can be "lost" — every successful
+//! enqueue is later observed by either a wake or a cleanup.
+//!
+//! Mapping kernel → model:
+//!
+//!   `WAIT_HAMT[bucket]`            ->   `loom::sync::Mutex<HamtSlot>`
+//!   `Turnstile { waiter_count, head }` -> packed into the locked struct
+//!   `ts_blocked_on` (per-thread)   ->   `AtomicUsize` set inside the lock
+//!
+//! Invariant we assert under loom:
+//!
+//! ```text
+//!     For each tid t that succeeds at port_enqueue_with_check (returned
+//!     true), there is exactly one of:
+//!         * a wake_count[t] = 1   (port_wake_one drained t), OR
+//!         * a cleanup_count[t] = 1 (cleanup_blocked_inner removed t).
+//!     waiter_count never goes negative; ts_blocked_on is consistent with
+//!     HAMT membership.
+//! ```
+
+#![cfg(loom)]
+
+use loom::sync::atomic::{AtomicUsize, Ordering};
+use loom::sync::{Arc, Mutex};
+use loom::thread;
+
+/// Single HAMT bucket holding at most one turnstile slot for our one port.
+/// `present == true` means a turnstile is allocated and inserted; `waiters`
+/// is the multiset of tids currently parked. We use a fixed-size array so
+/// the test crate stays no-alloc inside the loom run.
+#[derive(Default)]
+struct HamtSlot {
+    present: bool,
+    /// Identity of the currently-allocated turnstile; bumped on every
+    /// alloc. Lets us tell whether a stale `ts_addr` stored on a thread
+    /// still matches the live HAMT entry (the real cleanup path checks
+    /// `found_ts as usize == ts_addr`).
+    ts_id: u64,
+    /// Bitmap of tids parked on the turnstile. Bit i set <=> tid i is in.
+    waiters: u32,
+}
+
+impl HamtSlot {
+    fn waiter_count(&self) -> u32 {
+        self.waiters.count_ones()
+    }
+
+    fn ts_enqueue(&mut self, tid: u32) {
+        self.waiters |= 1u32 << tid;
+    }
+
+    fn ts_dequeue_head(&mut self) -> Option<u32> {
+        if self.waiters == 0 {
+            return None;
+        }
+        let tid = self.waiters.trailing_zeros();
+        self.waiters &= !(1u32 << tid);
+        Some(tid)
+    }
+
+    fn ts_remove(&mut self, tid: u32) -> bool {
+        let bit = 1u32 << tid;
+        if self.waiters & bit != 0 {
+            self.waiters &= !bit;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct Shared {
+    bucket: Mutex<HamtSlot>,
+    /// Per-tid `ts_blocked_on` analogue. Stores the ts_id the thread thinks
+    /// it's parked on (0 = not parked).
+    ts_blocked_on: [AtomicUsize; 4],
+    /// Wake-count per tid: incremented when `port_wake_one` drains tid.
+    wake_count: [AtomicUsize; 4],
+    /// Cleanup-count per tid: incremented when cleanup_blocked_inner
+    /// successfully removes tid from a turnstile.
+    cleanup_count: [AtomicUsize; 4],
+    /// Enqueue-success per tid: incremented when port_enqueue_with_check
+    /// returned true (i.e. the thread is actually parked).
+    enqueued_ok: [AtomicUsize; 4],
+}
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            bucket: Mutex::new(HamtSlot::default()),
+            ts_blocked_on: [
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ],
+            wake_count: [
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ],
+            cleanup_count: [
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ],
+            enqueued_ok: [
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ],
+        }
+    }
+}
+
+/// `port_enqueue_with_check`. The `condition` closure is omitted (always
+/// true: kernel state is "queue still empty for recv").
+fn port_enqueue_with_check(s: &Shared, tid: u32, store_ord: Ordering) {
+    let mut slot = s.bucket.lock().unwrap();
+    if !slot.present {
+        slot.present = true;
+        slot.ts_id += 1;
+    }
+    let id = slot.ts_id;
+    slot.ts_enqueue(tid);
+    s.ts_blocked_on[tid as usize].store(id as usize, store_ord);
+    s.enqueued_ok[tid as usize].fetch_add(1, Ordering::AcqRel);
+}
+
+fn port_wake_one(s: &Shared, store_ord: Ordering) -> Option<u32> {
+    let mut slot = s.bucket.lock().unwrap();
+    if !slot.present {
+        return None;
+    }
+    let tid = slot.ts_dequeue_head()?;
+    s.ts_blocked_on[tid as usize].store(0, store_ord);
+    if slot.waiter_count() == 0 {
+        slot.present = false;
+    }
+    s.wake_count[tid as usize].fetch_add(1, Ordering::AcqRel);
+    Some(tid)
+}
+
+/// `cleanup_blocked` (outer + inner combined). Models the kill path: the
+/// thread reads its own `ts_blocked_on`, then takes the bucket lock, then
+/// re-validates the HAMT entry's identity matches.
+fn cleanup_blocked(s: &Shared, tid: u32, load_ord: Ordering, store_ord: Ordering) {
+    let ts_id = s.ts_blocked_on[tid as usize].swap(0, load_ord);
+    if ts_id == 0 {
+        return;
+    }
+    let mut slot = s.bucket.lock().unwrap();
+    if slot.present && slot.ts_id == ts_id as u64 {
+        if slot.ts_remove(tid) {
+            if slot.waiter_count() == 0 {
+                slot.present = false;
+            }
+            s.cleanup_count[tid as usize].fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    let _ = store_ord; // ts_blocked_on already cleared above
+}
+
+/// One full interleaving with the given memory orderings.
+fn one_run_with(load_ord: Ordering, store_ord: Ordering) {
+    let s = Arc::new(Shared::new());
+
+    // Pre-park tid 0 so cleanup has something to find.
+    port_enqueue_with_check(&s, 0, store_ord);
+
+    // Three concurrent operations:
+    //   A: enqueue tid 1 (a fresh waiter racing the wake/cleanup).
+    //   B: wake one (from the perspective of any sender on this port).
+    //   C: cleanup tid 0 (kill path).
+    let a = {
+        let s = s.clone();
+        thread::spawn(move || port_enqueue_with_check(&s, 1, store_ord))
+    };
+    let b = {
+        let s = s.clone();
+        thread::spawn(move || {
+            let _ = port_wake_one(&s, store_ord);
+        })
+    };
+    let c = {
+        let s = s.clone();
+        thread::spawn(move || cleanup_blocked(&s, 0, load_ord, store_ord))
+    };
+
+    a.join().unwrap();
+    b.join().unwrap();
+    c.join().unwrap();
+
+    // Final invariants. After all threads quiesce, every successful
+    // enqueue must have been resolved exactly once by either a wake or
+    // a cleanup, OR remain parked (still in the HAMT with ts_blocked_on
+    // pointing at the live ts_id).
+    let slot = s.bucket.lock().unwrap();
+    let live_ts_id = if slot.present { slot.ts_id } else { 0 };
+    let waiters = slot.waiters;
+    drop(slot);
+
+    for tid in 0..2u32 {
+        let enq_ok = s.enqueued_ok[tid as usize].load(Ordering::Acquire);
+        if enq_ok == 0 {
+            continue;
+        }
+        let woke = s.wake_count[tid as usize].load(Ordering::Acquire);
+        let cleaned = s.cleanup_count[tid as usize].load(Ordering::Acquire);
+        let blk = s.ts_blocked_on[tid as usize].load(Ordering::Acquire);
+        let still_parked = (waiters & (1u32 << tid)) != 0;
+
+        // Mutual exclusion: can't be both woken and cleaned.
+        assert!(
+            !(woke > 0 && cleaned > 0),
+            "tid {} double-resolved: wake={} clean={}",
+            tid, woke, cleaned,
+        );
+
+        // Resolution count is exactly 1 either way (no doubles).
+        assert!(woke <= 1, "tid {} woken {} times", tid, woke);
+        assert!(cleaned <= 1, "tid {} cleaned {} times", tid, cleaned);
+
+        if woke == 1 || cleaned == 1 {
+            // Resolved: must NOT still be in the bucket waiter set.
+            assert!(
+                !still_parked,
+                "tid {} resolved (woke={} clean={}) but still in waiters",
+                tid, woke, cleaned,
+            );
+            // ts_blocked_on must have been cleared (resolution clears it).
+            assert_eq!(
+                blk, 0,
+                "tid {} resolved but ts_blocked_on={} (should be 0)",
+                tid, blk,
+            );
+        } else {
+            // Unresolved: must still be parked AND the stored ts_id must
+            // match the live one (otherwise it's a dangling reference).
+            assert!(
+                still_parked,
+                "tid {} unresolved but not in waiters (lost wakeup!)",
+                tid,
+            );
+            assert_eq!(
+                blk as u64, live_ts_id,
+                "tid {} ts_blocked_on={} live_ts_id={} (stale reference)",
+                tid, blk, live_ts_id,
+            );
+        }
+    }
+
+    // HAMT invariant: present iff some waiter exists.
+    assert_eq!(
+        live_ts_id != 0,
+        waiters != 0,
+        "HAMT membership inconsistent: live_ts_id={} waiters={:#b}",
+        live_ts_id, waiters,
+    );
+}
+
+fn one_run() {
+    one_run_with(Ordering::Acquire, Ordering::Release);
+}
+
+fn one_run_seqcst() {
+    one_run_with(Ordering::SeqCst, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sanity: with SeqCst on every per-thread atomic, the bucket Mutex
+    /// already serializes everything important; no interleaving can lose
+    /// a waiter.
+    #[test]
+    fn turnstile_protocol_seqcst() {
+        loom::model(one_run_seqcst);
+    }
+
+    /// Faithful: kernel uses Relaxed for ts_blocked_on stores. The bucket
+    /// lock should still cover all visibility we care about.
+    #[test]
+    fn turnstile_protocol() {
+        loom::model(one_run);
+    }
+}

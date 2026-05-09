@@ -1,0 +1,42 @@
+[package]
+name = "loom-turnstile-slab"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone (excluded from the kernel workspace) for the same reason as
+# tests/loom-turnstile: loom needs std/Arc; the kernel is no_std.
+#
+# Models the **slab-recycle race** in `kernel/src/sync/turnstile.rs`:
+#
+#   * `port_wake_one` / `port_dequeue_one` (turnstile.rs:~882, ~954) pop a
+#     waiter; if `waiter_count` drops to 0 they `hamt_remove` then
+#     `compare_exchange(0, ts_ptr)` into the woken thread's per-thread
+#     cache slot.  On CAS failure they `free_turnstile(ts_ptr)`.
+#
+#   * `take_or_alloc_turnstile(tid)` (turnstile.rs:~378) does
+#     `thread_ref(tid).turnstile.swap(0, Relaxed)` to consume a thread's
+#     cached turnstile, then init+hamt_insert it for a fresh enqueue.
+#
+# The race window: thread A is woken from turnstile T, the wake path tries
+# to gift T into A's cache slot; concurrently another path reads A's cache
+# slot for take_or_alloc and either receives T or causes the wake path to
+# free() T.  We assert: T is never simultaneously held by two distinct
+# users, and the slot/HAMT membership stays consistent with waiters.
+#
+# Things deliberately NOT modeled:
+#   * Multiple buckets, multiple ports, priority ordering.
+#   * The full Turnstile struct beyond {key/aspace/va, head/tail surrogate,
+#     waiter_count} — only fields the recycle window touches.
+#   * The slab allocator itself: we collapse it to a single-slot pool that
+#     hands the same address back on alloc-after-free, which is the worst
+#     case the recycle race must survive.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }

@@ -1,0 +1,17 @@
+# Hard-wire the `--cfg loom` flag so `cargo test` enables loom's
+# `loom::sync` shims without environment fiddling. Without this, our
+# tests are gated out by `#![cfg(loom)]` and `loom::model` deadlocks
+# because the real `std` atomics aren't instrumented.
+#
+# We also override the parent `.cargo/config.toml`'s `target =
+# "aarch64-unknown-none"` (intended for the kernel) and force the host
+# triple so loom's `std` deps build.
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = ["--cfg", "loom"]
+
+# Drop the kernel-targeted `build-std` setting from the parent config —
+# host builds use the precompiled std/core that ships with the toolchain.
+[unstable]
+build-std = []
+build-std-features = []

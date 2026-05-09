@@ -1,0 +1,10 @@
+# Mirror of tests/loom-turnstile/.cargo/config.toml — see that file for
+# rationale.  Hard-wires --cfg loom and overrides the parent's
+# kernel-targeted aarch64 build settings.
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = ["--cfg", "loom"]
+
+[unstable]
+build-std = []
+build-std-features = []

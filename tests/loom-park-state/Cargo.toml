@@ -1,0 +1,29 @@
+[package]
+name = "loom-park-state"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone (excluded from the kernel workspace) because:
+#   * loom requires `std` and `Box`/`Arc`; the kernel is `no_std`.
+#   * The kernel's nightly cfg(target = "*-unknown-none") targets cannot
+#     link an `std` crate.
+#   * Reusing the kernel's atomic protocol in a tiny faithful copy is
+#     much smaller than refactoring scheduler.rs to be loom-pluggable.
+#
+# We model only the four-state CAS protocol (PARK_NONE, PARK_ENQUEUED,
+# PARK_COMMITTED, PARK_WOKEN) plus the `stack_switch_pending` flag that
+# arbitrates between `wake_parked_thread` and `clear_pending_switch`.
+# The rest of the kernel (run queues, frame save/restore, IRQs, IPIs)
+# is irrelevant to wake-correctness and is omitted.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+# Loom needs to be enabled via `RUSTFLAGS="--cfg loom"`; we hard-wire it here
+# so that `cargo test` "just works" without environment fiddling.
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }

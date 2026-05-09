@@ -1,0 +1,8 @@
+# See tests/loom-park-state/.cargo/config.toml for rationale.
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = ["--cfg", "loom"]
+
+[unstable]
+build-std = []
+build-std-features = []

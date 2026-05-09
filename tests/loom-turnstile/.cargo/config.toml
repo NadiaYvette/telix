@@ -1,0 +1,10 @@
+# Mirror of tests/loom-park-state/.cargo/config.toml — see that file for
+# rationale. Hard-wires --cfg loom and overrides the kernel-targeted parent
+# .cargo/config.toml.
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = ["--cfg", "loom"]
+
+[unstable]
+build-std = []
+build-std-features = []
