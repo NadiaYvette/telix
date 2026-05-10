@@ -228,11 +228,25 @@ impl Heap4 {
     /// Find and remove an eligible thread in the given coscheduling group,
     /// preferring the one with the earliest deadline.
     /// Returns `(tid, key)` or `None` if no group mate is present.
+    ///
+    /// Uses the same rotating `scan_start` as `pick_eligible` so equal-key
+    /// ties within a coscheduling group don't always resolve to the same
+    /// physical position.  Without this rotation, sched_stress workers in
+    /// a cosched group with identical EEVDF deadlines could starve through
+    /// the cosched dispatch path even after the `pick_eligible` rotating
+    /// fix landed (#120 residual oscillation, surfaced 2026-05-10 by
+    /// PENDING-STUCK-LOW diagnostic pointing at prio=50 sched_stress
+    /// workers re-enqueued hundreds of times without dispatch).
     pub fn pop_for_group(&mut self, group: u32, max_vruntime: u64) -> Option<(u32, u64)> {
         let n = self.len as usize;
+        if n == 0 {
+            return None;
+        }
         let mut best_pos: Option<usize> = None;
         let mut best_key: u64 = u64::MAX;
-        for i in 0..n {
+        let start = (self.scan_start as usize) % n;
+        for k in 0..n {
+            let i = (start + k) % n;
             let e = &self.entries[i];
             let t = super::scheduler::thread_ref(e.tid);
             if t.cosched_group.load(core::sync::atomic::Ordering::Relaxed) == group
@@ -243,6 +257,10 @@ impl Heap4 {
                 best_pos = Some(i);
             }
         }
+        // Advance scan_start regardless of whether a match was found, so
+        // successive cosched picks visit different origins even when the
+        // group is partially eligible.
+        self.scan_start = self.scan_start.wrapping_add(1);
         best_pos.map(|pos| self.remove(pos))
     }
 

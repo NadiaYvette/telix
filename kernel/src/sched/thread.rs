@@ -149,6 +149,14 @@ pub struct Thread {
     /// dispatched" from "thread re-enqueued repeatedly by rescue but
     /// dispatch keeps missing it".
     pub enqueue_count: core::sync::atomic::AtomicU64,
+    /// #120 dispatch-symmetry: monotonic_ns timestamp at which a dispatching
+    /// path stored `ON_CPU_PENDING` on this thread (via
+    /// `dequeue_set_pending`).  Cleared (set to 0) by the `try_switch` /
+    /// `voluntary_reschedule` `cas_ok` path once the thread becomes Running.
+    /// The rescue scan reads this to fire a low-threshold (2s)
+    /// "PENDING-STUCK-LOW" diagnostic that's independent of the 16s/30s
+    /// rescue-and-CALL-TIMEOUT thresholds.
+    pub pending_set_ns: core::sync::atomic::AtomicU64,
     // --- Personality forwarding ---
     /// Result value from personality server reply (written by SYS_PERSONALITY_REPLY).
     pub personality_result: core::sync::atomic::AtomicU64,
@@ -270,6 +278,7 @@ impl Thread {
             ts_blocked_on: core::sync::atomic::AtomicUsize::new(0),
             last_ready_ns: core::sync::atomic::AtomicU64::new(0),
             enqueue_count: core::sync::atomic::AtomicU64::new(0),
+            pending_set_ns: core::sync::atomic::AtomicU64::new(0),
             personality_result: core::sync::atomic::AtomicU64::new(0),
             personality_frame_sp: 0,
             syscall_frame_sp: 0,

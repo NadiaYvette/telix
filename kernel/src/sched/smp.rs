@@ -195,6 +195,18 @@ pub struct PerCpuData {
     /// Consecutive dispatches of the same tid on this CPU; reset to 1 when
     /// a different tid is dispatched.
     pub dispatch_streak: AtomicU32,
+    /// #120 dispatch-symmetry pair (set-pending side).  Bumped each time
+    /// `dequeue_set_pending` runs, i.e. each time a dispatching path on this
+    /// CPU pops a tid from the run queue and stores ON_CPU_PENDING on it.
+    /// Compare with `dispatch_cas_ok_count`: if `set_pending` >> `cas_ok`,
+    /// threads enter PENDING but never reach the try_switch CAS-ok point,
+    /// which is the residual #120 oscillation signature.
+    pub dispatch_set_pending_count: core::sync::atomic::AtomicU64,
+    /// #120 dispatch-symmetry pair (cas-ok side).  Bumped at the
+    /// `try_switch.cas_ok` trace point in both try_switch and
+    /// voluntary_reschedule, after `compare_exchange(PENDING, cpu)`
+    /// succeeds.  See `dispatch_set_pending_count`.
+    pub dispatch_cas_ok_count: core::sync::atomic::AtomicU64,
 }
 
 impl PerCpuData {
@@ -208,6 +220,8 @@ impl PerCpuData {
             dispatch_count: core::sync::atomic::AtomicU64::new(0),
             last_dispatched_tid: AtomicU32::new(0),
             dispatch_streak: AtomicU32::new(0),
+            dispatch_set_pending_count: core::sync::atomic::AtomicU64::new(0),
+            dispatch_cas_ok_count: core::sync::atomic::AtomicU64::new(0),
         }
     }
 }

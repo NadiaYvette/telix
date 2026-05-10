@@ -326,14 +326,40 @@ fn deferred_requeue() -> &'static [AtomicU64] {
     unsafe { core::slice::from_raw_parts(ptr, smp::num_cpus()) }
 }
 
+/// Mirror of `dequeue_set_pending`: called from each PENDING→cpu CAS-ok
+/// site after the thread successfully transitions to Running.  Clears
+/// `pending_set_ns` so the low-threshold rescue diag doesn't false-fire,
+/// resets the per-tid one-shot log gate, and bumps the CPU's
+/// `dispatch_cas_ok_count` to mirror `dispatch_set_pending_count`.
+#[inline]
+fn dispatch_cas_ok(pcpu: &smp::PerCpuData, tid: ThreadId) {
+    thread_ref(tid).pending_set_ns.store(0, Ordering::Relaxed);
+    if (tid as usize) < PENDING_LOW_LOGGED.len() {
+        PENDING_LOW_LOGGED[tid as usize].store(false, Ordering::Relaxed);
+    }
+    pcpu.dispatch_cas_ok_count.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Transition a dequeued thread's on_cpu to ON_CPU_PENDING so try_switch's
 /// CAS(ON_CPU_PENDING → cpu) can claim it.
 ///
 /// Idempotent under NEW_INV: every dispatching path expects on_cpu to be
 /// ON_CPU_PENDING just before the CAS to a real CPU number.
+///
+/// #120 dispatch-symmetry: bumps `pcpu.dispatch_set_pending_count` and
+/// stamps `pending_set_ns` on the thread.  The matching `cas_ok` site in
+/// try_switch / voluntary_reschedule clears `pending_set_ns` and bumps
+/// `pcpu.dispatch_cas_ok_count`.  Comparing the two on a CPU-by-CPU basis
+/// localizes paths where a thread enters PENDING but never makes it to a
+/// successful CAS — the residual oscillation pattern.
 #[inline]
 fn dequeue_set_pending(tid: ThreadId) {
+    let now = get_monotonic_ns();
+    thread_ref(tid).pending_set_ns.store(now, Ordering::Relaxed);
     thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    smp::current()
+        .dispatch_set_pending_count
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -666,6 +692,18 @@ impl PerCpuRunQueues {
 
     /// Find and dequeue a thread in the given coscheduling group.
     /// Checks RT bitmap queues first, then the EEVDF heap.
+    ///
+    /// #120 dispatch-symmetry audit (2026-05-09): callers of `pop_for_group`
+    /// at `percpu_pick_next_cosched` correctly invoke `dequeue_set_pending`
+    /// after the pop, mirroring the `class_pick_next` path. The cosched
+    /// dispatch path is NOT asymmetric on the on_cpu transition.
+    ///
+    /// Separate observation (not addressed here): the EEVDF heap variant
+    /// scans `0..n` linearly without the rotating `scan_start` origin used
+    /// by `pick_eligible`. If multiple cosched group mates share the same
+    /// deadline, the lowest physical position wins back-to-back, which can
+    /// reproduce the LIFO-starvation pattern within a cosched burst. Out of
+    /// scope for the dispatch-symmetry counter pair, flagged for follow-up.
     fn pop_for_group(&mut self, group: u32) -> Option<ThreadId> {
         // 1. RT bitmap queues (priorities 0-127).
         for word in 0..2 {
@@ -901,6 +939,22 @@ static RESCUE_PENDING: AtomicU64 = AtomicU64::new(0);
 /// fires its rescue (logs RESCUE-STUCK-PENDING).  Dumped on CALL-TIMEOUT
 /// so we can tell whether the rescue is even being entered for orphans.
 static RESCUE_STUCK_PENDING_FIRES: AtomicU64 = AtomicU64::new(0);
+
+/// #120 low-threshold PENDING-stuck diagnostic.  Counts the lower-bound (2s)
+/// "PENDING-STUCK-LOW" prints — fires when a thread's `pending_set_ns` is
+/// older than `PENDING_LOW_THRESHOLD_NS` regardless of whether the 16s
+/// rescue threshold is reached.  Lets us see *slow* dispatch oscillations
+/// that hard-wedge fixes (commits 644c7b0 / 27cf951) didn't eliminate.
+static PENDING_LOW_FIRES: AtomicU64 = AtomicU64::new(0);
+
+/// Per-tid "already logged for this PENDING episode" flag, cleared when
+/// `pending_set_ns` returns to 0 (CAS-ok path) or when the thread leaves
+/// the Ready/Pending state.  Prevents flooding the serial log when the
+/// same tid keeps re-PENDING-ing.  Indexed by tid, capped at 256.
+static PENDING_LOW_LOGGED: [core::sync::atomic::AtomicBool; 256] = {
+    const Z: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    [Z; 256]
+};
 
 /// Per-tid rescue counter for the watchdog dump.  Lets us see *which*
 /// tids account for the bulk of rescue traffic when a stall storm fires —
@@ -3021,6 +3075,8 @@ fn try_switch(current_sp: u64) -> u64 {
         }
         trace_point("try_switch.cas_ok", next_id as u32);
         thread_ref(next_id).on_cpu_set_by.store(1, Ordering::Relaxed); // 1=try_switch
+        // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
+        dispatch_cas_ok(pcpu, next_id);
         // Set Running IMMEDIATELY after CAS to close the TOCTOU window:
         // between CAS(on_cpu=cpu) and state=Running, rescue sees
         // state=Ready + on_cpu=cpu + current_thread≠tid → false orphan.
@@ -3261,6 +3317,8 @@ pub fn voluntary_reschedule() {
             return;
         }
         thread_ref(next_id).on_cpu_set_by.store(2, Ordering::Relaxed); // 2=vol_resched
+        // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
+        dispatch_cas_ok(pcpu, next_id);
         // Set Running IMMEDIATELY after CAS — close TOCTOU window (see try_switch).
         unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
         // #120 dispatch-pattern diagnostic (vol_resched path).
@@ -5560,6 +5618,8 @@ pub fn park_current_for_ipc(reason: BlockReason) {
             return;
         }
         thread_ref(next_id).on_cpu_set_by.store(3, Ordering::Relaxed); // 3=park_ipc
+        // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
+        dispatch_cas_ok(pcpu, next_id);
         // Set Running IMMEDIATELY after CAS — close TOCTOU window (see try_switch).
         unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
     } else {
@@ -5852,9 +5912,10 @@ fn call_reply_timeout_sweep() {
                 let ncpus = crate::sched::smp::num_cpus().min(8);
                 let stuck_pending_fires = RESCUE_STUCK_PENDING_FIRES.load(Ordering::Relaxed);
                 let rescue_pending = RESCUE_PENDING.load(Ordering::Relaxed);
+                let pending_low_fires = PENDING_LOW_FIRES.load(Ordering::Relaxed);
                 crate::println!(
-                    "  CPU-DIAG: rescue_stuck_pending_fires={} rescue_pending_obs={}",
-                    stuck_pending_fires, rescue_pending
+                    "  CPU-DIAG: rescue_stuck_pending_fires={} rescue_pending_obs={} pending_low_fires={}",
+                    stuck_pending_fires, rescue_pending, pending_low_fires
                 );
                 for c in 0..ncpus {
                     let pcpu = crate::sched::smp::get(c as u32);
@@ -5897,11 +5958,14 @@ fn call_reply_timeout_sweep() {
                     let disp_n = pcpu.dispatch_count.load(Ordering::Relaxed);
                     let disp_last = pcpu.last_dispatched_tid.load(Ordering::Relaxed);
                     let disp_streak = pcpu.dispatch_streak.load(Ordering::Relaxed);
+                    let set_pend = pcpu.dispatch_set_pending_count.load(Ordering::Relaxed);
+                    let cas_ok   = pcpu.dispatch_cas_ok_count.load(Ordering::Relaxed);
                     crate::println!(
-                        "  CPU-DIAG: cpu={} current_thread={} dispatching_tid={} need_resched={} eevdf_n={} eevdf_min_vrt={} rt_pending={} legacy_pending={} dispatches={} last_disp_tid={} streak={}",
+                        "  CPU-DIAG: cpu={} current_thread={} dispatching_tid={} need_resched={} eevdf_n={} eevdf_min_vrt={} rt_pending={} legacy_pending={} dispatches={} last_disp_tid={} streak={} set_pend={} cas_ok={} pend_minus_cas={}",
                         c, cur, dispatching, need_resched,
                         rq_eevdf_count, min_vrt, rq_locked.0, rq_locked.1,
-                        disp_n, disp_last, disp_streak
+                        disp_n, disp_last, disp_streak,
+                        set_pend, cas_ok, set_pend.saturating_sub(cas_ok)
                     );
                     for i in 0..entries_n {
                         let (etid, ekey, evrt, est) = entries[i];
@@ -6035,8 +6099,11 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
     for tid in 1..max_tid {
         let t = unsafe { &*(THREAD_TABLE.get(tid) as *const Thread) };
         if t.task_id == 0 || t.state != ThreadState::Ready {
-            // Not a candidate — reset orphan age.
+            // Not a candidate — reset orphan age and the low-threshold log gate.
             if (tid as usize) < ORPHAN_AGE.len() { ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed); }
+            if (tid as usize) < PENDING_LOW_LOGGED.len() {
+                PENDING_LOW_LOGGED[tid as usize].store(false, Ordering::Relaxed);
+            }
             continue;
         }
         let on = t.on_cpu.load(Ordering::Acquire);
@@ -6058,6 +6125,12 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
         // the thread up (#120 root cause: wake_parked_thread fast path
         // runs but the parking CPU never dispatches).
         const STUCK_PENDING_AGE: u32 = 16; // ~16s at 1Hz rescue cadence
+        // Low-threshold PENDING-stuck diagnostic — independent of the 16s
+        // rescue and 30s CALL-TIMEOUT.  Fires once per stuck episode when
+        // `pending_set_ns` is older than ~2s in real time.  Cleared via
+        // PENDING_LOW_LOGGED when CAS-ok zeroes pending_set_ns (or when the
+        // thread leaves Ready below).
+        const PENDING_LOW_THRESHOLD_NS: u64 = 2_000_000_000;
         let is_orphan = if on == u32::MAX {
             true
         } else if on == ON_CPU_PENDING {
@@ -6066,6 +6139,35 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
             // separate counter so this state's age doesn't conflict with
             // the on_cpu==MAX path (which has its own age semantics).
             RESCUE_PENDING.fetch_add(1, Ordering::Relaxed);
+
+            // Low-threshold one-shot logger.  Multiple ON_CPU_PENDING
+            // store sites in the scheduler (wake/release/rescue) do NOT
+            // call `dequeue_set_pending`, so pending_set_ns may be 0 even
+            // for a genuinely-stuck thread.  In that case, stamp `now`
+            // here so the next sweep can compute an age.
+            let pset = t.pending_set_ns.load(Ordering::Relaxed);
+            let now_ns = get_monotonic_ns();
+            if pset == 0 {
+                t.pending_set_ns.store(now_ns, Ordering::Relaxed);
+            } else {
+                let age_ns = now_ns.saturating_sub(pset);
+                if age_ns >= PENDING_LOW_THRESHOLD_NS
+                    && (tid as usize) < PENDING_LOW_LOGGED.len()
+                    && !PENDING_LOW_LOGGED[tid as usize].swap(true, Ordering::Relaxed)
+                {
+                    PENDING_LOW_FIRES.fetch_add(1, Ordering::Relaxed);
+                    let target = t.last_cpu.load(Ordering::Relaxed);
+                    let prio = t.prio.load(Ordering::Relaxed);
+                    let inq_now = t.in_queue.load(Ordering::Relaxed);
+                    let enq_n = t.enqueue_count.load(Ordering::Relaxed);
+                    let (tevt, tcpu, tseq) = trace_last(tid as u32);
+                    crate::println!(
+                        "PENDING-STUCK-LOW: tid={} task={} age_ns={} last_cpu={} prio={} inq={} enq_n={} trace=(evt={} cpu={} seq={})",
+                        tid, t.task_id, age_ns, target, prio, inq_now, enq_n,
+                        tevt, tcpu, tseq
+                    );
+                }
+            }
             let pending_age = if (tid as usize) < ORPHAN_AGE.len() {
                 ORPHAN_AGE[tid as usize].fetch_add(1, Ordering::Relaxed)
             } else { 0 };
@@ -6760,6 +6862,8 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
             return;
         }
         thread_ref(next_id).on_cpu_set_by.store(5, Ordering::Relaxed); // 5=park_sleep
+        // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
+        dispatch_cas_ok(pcpu, next_id);
         // Set Running IMMEDIATELY after CAS — close TOCTOU window (see try_switch).
         unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
     } else {
