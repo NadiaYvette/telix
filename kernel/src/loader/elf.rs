@@ -71,6 +71,10 @@ pub enum ElfError {
     BadPhdr,
     MapFailed,
     AllocFailed,
+    /// Destination address space was deallocated mid-load — typically a
+    /// short-lived child whose parent reaped it before the loader's
+    /// per-page mapping loop completed (project_aspace_lifecycle_race.md).
+    AspaceGone,
 }
 
 /// Information returned by ELF loader for auxv construction.
@@ -336,7 +340,7 @@ fn load_segment(
 
         // Check if this page is already mapped by a previous segment.
         // If so, merge permissions (take the union) so we don't narrow earlier flags.
-        let (obj_id, already_mapped, merged_flags) = aspace::with_aspace(aspace_id, |aspace| {
+        let (obj_id, already_mapped, merged_flags) = aspace::with_aspace_mut(aspace_id, |aspace| {
             if let Some(vma) = aspace.find_vma_mut(page_va) {
                 let merged = merge_prot(vma.prot, prot);
                 vma.prot = merged;
@@ -348,7 +352,8 @@ fn load_segment(
                     .ok_or(ElfError::MapFailed)?;
                 Ok((vma.object_id, false, pte_flags))
             }
-        })?;
+        })
+        .ok_or(ElfError::AspaceGone)??;
         let effective_flags = if already_mapped {
             merged_flags | sw_z
         } else {

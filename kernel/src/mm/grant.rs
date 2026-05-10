@@ -20,6 +20,12 @@ pub enum GrantError {
     /// Failed to install PTEs in destination.
     #[allow(dead_code)]
     PteFailed,
+    /// Source or destination address space was deallocated between the
+    /// caller obtaining the ID and grant_pages running.  Surfaces under
+    /// concurrent process teardown / IPC reply teardown — e.g. a
+    /// short-lived child that exits before the granter's IPC reply is
+    /// delivered (project_aspace_lifecycle_race.md).
+    AspaceGone,
 }
 
 /// Grant `mmu_page_count` MMU pages from one address space to another.
@@ -49,7 +55,7 @@ pub fn grant_pages(
     // that residue `r` so step 4 can compute correct sub-page indices into the
     // collected phys_pages list.  Without `r`, unaligned grants silently mapped
     // the destination onto sub-pages r positions earlier than intended.
-    let (obj_id, obj_mmu_offset, phys_pages, r) = aspace::with_aspace(src_aspace, |aspace| {
+    let (obj_id, obj_mmu_offset, phys_pages, r) = aspace::with_aspace_mut(src_aspace, |aspace| {
         let vma = aspace.find_vma(src_va).ok_or(GrantError::NoSourceVma)?;
         let mmu_idx_start = vma.mmu_index_of(src_va);
         let r = (vma.object_offset as usize + mmu_idx_start) % pmc;
@@ -67,7 +73,8 @@ pub fn grant_pages(
         // object_offset for destination in MMUPAGE_SIZE units.
         let dst_obj_offset = vma.object_offset + mmu_idx_start as u32;
         Ok((vma.object_id, dst_obj_offset, pages, r))
-    })?;
+    })
+    .ok_or(GrantError::AspaceGone)??;
 
     // Step 2: Register the mapping in the object.
     object::with_object(obj_id, |obj| {
@@ -75,7 +82,7 @@ pub fn grant_pages(
     });
 
     // Step 3: Create a shared VMA in the destination address space.
-    aspace::with_aspace(dst_aspace, |aspace| {
+    aspace::with_aspace_mut(dst_aspace, |aspace| {
         let prot = if readonly {
             VmaProt::ReadOnly
         } else {
@@ -115,11 +122,15 @@ pub fn grant_pages(
 
         Ok(())
     })
+    .ok_or(GrantError::AspaceGone)?
 }
 
 /// Revoke a grant: unmap all PTEs and remove the VMA from the destination.
+///
+/// Silently no-ops if the destination address space has been deallocated
+/// (the grant is already invisibly gone — there's nothing to revoke).
 pub fn revoke_grant(dst_aspace: ASpaceId, dst_va: usize) {
-    aspace::with_aspace(dst_aspace, |aspace| {
+    let _ = aspace::with_aspace_mut(dst_aspace, |aspace| {
         let pt_root = aspace.page_table_root;
         if let Some(vma) = aspace.find_vma(dst_va) {
             let obj_id = vma.object_id;
