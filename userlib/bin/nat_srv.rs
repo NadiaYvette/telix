@@ -789,10 +789,6 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
         syscall::debug_puts(b"[nat_srv] port_create FAIL\n");
         syscall::exit(1);
     }
-    if !syscall::ns_register(b"nat", port) {
-        syscall::debug_puts(b"[nat_srv] ns_register FAIL\n");
-        syscall::exit(1);
-    }
     // Default the public IPv4 to RFC 5737's 192.0.2.1 so the
     // translate_out engine has a non-zero public address even before
     // a caller invokes NAT_SET_PUBLIC_IPV4 explicitly.
@@ -805,6 +801,17 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
     // without explicit caller orchestration.  Best-effort — failures
     // log and continue; the explicit caller-driven NAT_TRANSLATE_*
     // path stays available regardless.
+    //
+    // CRITICAL: try_subscribe_to_eth's recv_msg_timeout consumes
+    // ANY message at `port`, not just ETH_SUBSCRIBE_OK.  If
+    // ns_register("nat") happens before this call, init's
+    // ns_lookup_wait("nat") returns immediately and a follow-up
+    // syscall::call (e.g. NAT_STATS in Phase 5k) lands on `port`
+    // before subscribe runs — and gets eaten silently by the
+    // recv_msg_timeout below, with no reply, leading to a
+    // CALL_REPLY_SERVER_DIED watchdog reply ("FAILED (bad reply)").
+    // Subscribe + register + resolve must complete BEFORE we publish
+    // the port via ns_register.
     try_subscribe_to_eth(port);
 
     // Register with eth_srv for NETIF_XMIT egress.  This closes the
@@ -817,6 +824,14 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
     // next hop instead of broadcasting.  Best-effort; on failure
     // emit_translated falls back to dst_mac=0 (broadcast).
     try_resolve_gateway();
+
+    // Publish the service port now that bring-up is complete.  Any
+    // messages that arrive after this land in the main-loop's
+    // recv_with_cap (which installs reply caps correctly).
+    if !syscall::ns_register(b"nat", port) {
+        syscall::debug_puts(b"[nat_srv] ns_register FAIL\n");
+        syscall::exit(1);
+    }
 
     syscall::debug_puts(b"[nat_srv] ready on port ");
     print_num(port);
@@ -935,6 +950,25 @@ fn main(_a0: u64, _a1: u64, _a2: u64) {
                 // No reply expected (sender used send_nb_4).
                 let frame_len = msg.data[0] as usize;
                 handle_eth_frame(frame_len);
+            }
+            // Late-arriving handshake replies on our main service port.
+            // try_subscribe_to_eth and try_register_eth_tx use this port
+            // as their reply target; if the round-trip exceeds the
+            // bringup timeout the *_OK message can still land here after
+            // the main loop is running.  No cap, no reply expected — but
+            // we MUST handle them explicitly: the catch-all `_` arm
+            // below replies with NAT_ERR, which would re-use the held
+            // cap from a *different* in-flight call (e.g. init's
+            // NAT_STATS) and surface as "FAILED (bad reply)" upstream.
+            ETH_SUBSCRIBE_OK
+            | NETIF_REGISTER_OK => {
+                // Silently consume — nothing to do.  These succeeded
+                // late; the bringup path already gave up and proceeded
+                // best-effort, so we can't flip the SUBSCRIBED /
+                // TX_REGISTERED bits without re-running the grant
+                // setup.  Matters more that we DON'T misuse the cap
+                // by falling through to the catch-all NAT_ERR reply
+                // below.
             }
             NAT_SET_NAT64_PREFIX
             | NAT_TRANSLATE_V6_TO_V4
