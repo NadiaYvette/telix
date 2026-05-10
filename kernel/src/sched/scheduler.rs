@@ -2453,8 +2453,9 @@ pub fn tick(current_sp: u64) -> u64 {
                             let def_tid = if def_v != 0 { (def_v & 0xFFFFFFFF) as u32 } else { 0 };
                             let cur_task = thread_ref(cur as u32).task_id;
                             let cur_blk = unsafe { &*(THREAD_TABLE.get(cur as u32) as *const Thread) }.blocked_on;
-                            crate::println!("  cpu{}: cur=tid{} task={} idle={} rq_eevdf={} has_ready={} def={} blk={:?}",
-                                c, cur, cur_task, is_idle, rq_len, has_rdy, def_tid, cur_blk);
+                            let rescue_stuck = pc.rescue_stuck_pending_count.load(Ordering::Relaxed);
+                            crate::println!("  cpu{}: cur=tid{} task={} idle={} rq_eevdf={} has_ready={} def={} blk={:?} rescue_stuck={}",
+                                c, cur, cur_task, is_idle, rq_len, has_rdy, def_tid, cur_blk, rescue_stuck);
                         }
                         let max_tid = NEXT_THREAD_ID.load(Ordering::Relaxed).min(200);
                         for tid in 1..max_tid {
@@ -5960,12 +5961,14 @@ fn call_reply_timeout_sweep() {
                     let disp_streak = pcpu.dispatch_streak.load(Ordering::Relaxed);
                     let set_pend = pcpu.dispatch_set_pending_count.load(Ordering::Relaxed);
                     let cas_ok   = pcpu.dispatch_cas_ok_count.load(Ordering::Relaxed);
+                    let rescue_stuck = pcpu.rescue_stuck_pending_count.load(Ordering::Relaxed);
                     crate::println!(
-                        "  CPU-DIAG: cpu={} current_thread={} dispatching_tid={} need_resched={} eevdf_n={} eevdf_min_vrt={} rt_pending={} legacy_pending={} dispatches={} last_disp_tid={} streak={} set_pend={} cas_ok={} pend_minus_cas={}",
+                        "  CPU-DIAG: cpu={} current_thread={} dispatching_tid={} need_resched={} eevdf_n={} eevdf_min_vrt={} rt_pending={} legacy_pending={} dispatches={} last_disp_tid={} streak={} set_pend={} cas_ok={} pend_minus_cas={} rescue_stuck={}",
                         c, cur, dispatching, need_resched,
                         rq_eevdf_count, min_vrt, rq_locked.0, rq_locked.1,
                         disp_n, disp_last, disp_streak,
-                        set_pend, cas_ok, set_pend.saturating_sub(cas_ok)
+                        set_pend, cas_ok, set_pend.saturating_sub(cas_ok),
+                        rescue_stuck
                     );
                     for i in 0..entries_n {
                         let (etid, ekey, evrt, est) = entries[i];
@@ -6176,6 +6179,19 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 // will check for actual queue membership and DOUBLE_ENQ
                 // before doing the percpu_enqueue, so this is safe.
                 RESCUE_STUCK_PENDING_FIRES.fetch_add(1, Ordering::Relaxed);
+                // Per-CPU asymmetry probe (#120 lead from
+                // project_120_eevdf_dispatch.md): attribute to the thread's
+                // last_cpu, since on_cpu == ON_CPU_PENDING here so the
+                // identity of the parking/dispatching CPU lives in
+                // last_cpu.  Dumped by the WATCHDOG and CALL-TIMEOUT
+                // per-CPU loops below as `rescue_stuck=N`.
+                let attrib_cpu = t.last_cpu.load(Ordering::Relaxed);
+                let ncpus = crate::sched::smp::num_cpus() as u32;
+                if attrib_cpu < ncpus {
+                    crate::sched::smp::get(attrib_cpu)
+                        .rescue_stuck_pending_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 // Rate-limit the println: only log on first crossing
                 // (age == STUCK_PENDING_AGE).  Subsequent stuckness still
                 // counts in RESCUE_STUCK_PENDING_FIRES but doesn't flood

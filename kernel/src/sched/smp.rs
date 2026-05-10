@@ -207,6 +207,14 @@ pub struct PerCpuData {
     /// voluntary_reschedule, after `compare_exchange(PENDING, cpu)`
     /// succeeds.  See `dispatch_set_pending_count`.
     pub dispatch_cas_ok_count: core::sync::atomic::AtomicU64,
+    /// #120 per-CPU asymmetry probe: counts RESCUE-STUCK-PENDING fires
+    /// attributed to this CPU.  Attribution uses the stuck thread's
+    /// `last_cpu` (since `on_cpu == ON_CPU_PENDING` at that point, the
+    /// dispatching/parking CPU identity is in `last_cpu`).  If one CPU's
+    /// count dominates by 10×+, the original #120 lead — "EEVDF pick-next
+    /// never picks rescue-enqueued threads on CPU N specifically" — is
+    /// still live.  Pure diagnostic; no concurrency-protocol meaning.
+    pub rescue_stuck_pending_count: core::sync::atomic::AtomicU64,
 }
 
 impl PerCpuData {
@@ -222,6 +230,7 @@ impl PerCpuData {
             dispatch_streak: AtomicU32::new(0),
             dispatch_set_pending_count: core::sync::atomic::AtomicU64::new(0),
             dispatch_cas_ok_count: core::sync::atomic::AtomicU64::new(0),
+            rescue_stuck_pending_count: core::sync::atomic::AtomicU64::new(0),
         }
     }
 }
