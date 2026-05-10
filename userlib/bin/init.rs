@@ -6392,9 +6392,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     //
     // Placed adjacent to Phases 173-175 so it runs early (before Phase 172
     // which can wedge under SMP).  Self-spawns linux_srv if not yet up.
-    if STEP_H_DEBUG_SKIP_SLOW_PHASES {
-        syscall::debug_puts(b"Phase 200 Tier-2 pthread: SKIPPED (STEP_H_DEBUG)\n");
-    } else {
+    // Phase 200 is fast (~seconds) and is the canonical verification for
+    // the linux_srv __NR_EXIT thread-local split (commit 311a6dd).  Run
+    // unconditionally — it's never been the "slow phase" that
+    // STEP_H_DEBUG_SKIP_SLOW_PHASES is meant to gate.
     syscall::debug_puts(b"  init: Phase 200 Tier-2 pthread...\n");
     {
         if syscall::ns_lookup(b"linux").is_none() {
@@ -6472,7 +6473,6 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             syscall::debug_puts(b"Phase 200 Tier-2 pthread: SKIPPED (no linux)\n");
         }
-    }
     }
 
     // --- Phase 176: swap stress (memory pressure + fork + data integrity) ---
