@@ -972,28 +972,47 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         // LIST_PEERS with grant_va + max_records.
                         match syscall::call(disc_port, 0x4D01, LIST_GRANT_VA as u64, 32, 0, 0) {
                             Some(r) if r.tag == 0x4D02 => {
-                                let written = r.data[0];
+                                let written = r.data[0] as usize;
                                 if written < 1 {
                                     ok = false;
                                     syscall::debug_puts(b"  [disc] LIST_PEERS wrote 0 records after inject\n");
                                 } else {
-                                    // First record's UUID at offset 0.
-                                    let mut got_uuid = [0u8; 16];
-                                    unsafe {
-                                        let src = list_local as *const u8;
-                                        for i in 0..16 {
-                                            got_uuid[i] = core::ptr::read_volatile(src.add(i));
-                                        }
-                                    }
+                                    // Scan all returned records for the
+                                    // fake UUID — in pair-boot mode the
+                                    // peer table can already hold the
+                                    // real peer's announcement at offset
+                                    // 0, so a strict offset-0 check would
+                                    // false-fail.  Record size is 24 B
+                                    // (16 UUID + 8 last_seen_ns); see
+                                    // discovery_srv.rs::write_peer_records.
+                                    const REC_SIZE: usize = 24;
                                     let expected: [u8; 16] = [
                                         0xfe, 0xed, 0xfa, 0xce,
                                         0xde, 0xad, 0xbe, 0xef,
                                         0xca, 0xfe, 0xba, 0xbe,
                                         0x12, 0x34, 0x56, 0x78,
                                     ];
-                                    if got_uuid != expected {
+                                    let mut found = false;
+                                    unsafe {
+                                        let src = list_local as *const u8;
+                                        'rec: for rec in 0..written {
+                                            let off = rec * REC_SIZE;
+                                            for i in 0..16 {
+                                                if core::ptr::read_volatile(src.add(off + i))
+                                                    != expected[i]
+                                                {
+                                                    continue 'rec;
+                                                }
+                                            }
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    if !found {
                                         ok = false;
-                                        syscall::debug_puts(b"  [disc] LIST_PEERS returned wrong UUID\n");
+                                        syscall::debug_puts(
+                                            b"  [disc] LIST_PEERS did not contain injected UUID\n",
+                                        );
                                     }
                                 }
                             }
