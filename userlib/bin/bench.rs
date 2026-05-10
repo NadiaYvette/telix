@@ -432,33 +432,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let t1 = syscall::get_cycles();
             print_result(b"prio_ipc_loaded", t1 - t0, N, freq);
 
-            // Cleanup (use sleep_ms retries — yield_now alone can't preempt
-            // to let the killed process run its exit path on another CPU).
+            // Cleanup: blocking wait4 reaps killed/quit children
+            // without polling.  kill() flips the exit path; wait4
+            // wakes the moment the kernel records the exit (#119).
             if spin1 != u64::MAX {
                 syscall::kill(spin1);
-                for _ in 0..100 {
-                    if syscall::waitpid(spin1).is_some() {
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                let _ = syscall::wait4(spin1 as i64, 0);
             }
             if spin2 != u64::MAX {
                 syscall::kill(spin2);
-                for _ in 0..100 {
-                    if syscall::waitpid(spin2).is_some() {
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                let _ = syscall::wait4(spin2 as i64, 0);
             }
             syscall::send_nb(pong_port, BENCH_QUIT, 0, 0);
-            for _ in 0..100 {
-                if syscall::waitpid(pong_tid).is_some() {
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
+            let _ = syscall::wait4(pong_tid as i64, 0);
         } else {
             syscall::debug_puts(b"  bench: prio_ipc: SKIP (spawn failed)\n");
         }

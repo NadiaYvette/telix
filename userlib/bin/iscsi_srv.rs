@@ -883,7 +883,10 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     // Issue TEST UNIT READY.
     if !test_unit_ready(&mut sess) {
         syscall::debug_puts(b"  [iscsi_srv] TUR failed (retrying)\n");
-        // Some targets need a moment. Try again.
+        // Real-world delay: some iSCSI targets need ~tens of ms
+        // between LUN-ready transitions.  This is a target-side
+        // wallclock requirement — no blocking IPC primitive replaces
+        // a real time elapse here (#119: category D).
         syscall::sleep_ms(100);
         test_unit_ready(&mut sess);
     }

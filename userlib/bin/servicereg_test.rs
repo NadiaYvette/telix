@@ -40,16 +40,10 @@ fn report(label: &[u8], pass: bool) -> bool {
 fn main(_a0: u64, _a1: u64, _a2: u64) {
     syscall::debug_puts(b"[servicereg_test] starting\n");
 
-    // Wait briefly for servicereg_srv to register itself in the
-    // nameserver — we may be spawned alongside it.  ns_lookup_wait
-    // would be the proper API but we use the simple polling form
-    // here to keep the test bin minimal.
-    let mut wait = 0u32;
-    while syscall::ns_lookup(b"servicereg").is_none() && wait < 500 {
-        syscall::sleep_ms(10);
-        wait += 1;
-    }
-    if syscall::ns_lookup(b"servicereg").is_none() {
+    // Wait for servicereg_srv to register itself in the nameserver
+    // — we may be spawned alongside it.  ns_lookup_wait blocks
+    // inside the kernel until the service appears.
+    if syscall::ns_lookup_wait(b"servicereg").is_none() {
         let _ = report(b"servicereg_srv never registered", false);
         syscall::exit(1);
     }

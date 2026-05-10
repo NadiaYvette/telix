@@ -552,9 +552,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         for _ in 0..50 { syscall::yield_now(); }
         let test_tid = syscall::spawn(b"servicereg_test", 50);
         if test_tid != u64::MAX {
-            let mut waited = 0u32;
-            loop {
-                if let Some(code) = syscall::waitpid(test_tid) {
+            // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+            match syscall::wait4(test_tid as i64, 0) {
+                Some((_p, status)) => {
+                    let code = ((status >> 8) & 0xFF) as u64;
                     if code == 0 {
                         syscall::debug_puts(b"Phase 5i servicereg smoke: PASSED\n");
                         phase_log(b"after 5i");
@@ -563,13 +564,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         print_num(code);
                         syscall::debug_puts(b"\n");
                     }
-                    break;
                 }
-                syscall::sleep_ms(10);
-                waited += 1;
-                if waited > 1500 {
-                    syscall::debug_puts(b"Phase 5i servicereg smoke: FAILED (timeout)\n");
-                    break;
+                None => {
+                    syscall::debug_puts(b"Phase 5i servicereg smoke: FAILED (ECHILD)\n");
                 }
             }
         } else {
@@ -589,9 +586,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     {
         let r_tid = syscall::spawn(b"router_srv", 50);
         if r_tid != u64::MAX {
-            let mut waited = 0u32;
-            loop {
-                if let Some(code) = syscall::waitpid(r_tid) {
+            // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+            match syscall::wait4(r_tid as i64, 0) {
+                Some((_p, status)) => {
+                    let code = ((status >> 8) & 0xFF) as u64;
                     if code == 0 {
                         syscall::debug_puts(b"Phase 5j router_srv ETH_SUBSCRIBE smoke: PASSED\n");
                         phase_log(b"after 5j");
@@ -600,13 +598,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         print_num(code);
                         syscall::debug_puts(b"\n");
                     }
-                    break;
                 }
-                syscall::sleep_ms(10);
-                waited += 1;
-                if waited > 500 {
-                    syscall::debug_puts(b"Phase 5j router_srv ETH_SUBSCRIBE smoke: FAILED (timeout)\n");
-                    break;
+                None => {
+                    syscall::debug_puts(b"Phase 5j router_srv ETH_SUBSCRIBE smoke: FAILED (ECHILD)\n");
                 }
             }
         } else {
@@ -626,10 +620,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     {
         let nat_tid = syscall::spawn(b"nat_srv", 50);
         if nat_tid != u64::MAX {
-            // Give nat_srv time to register itself and complete the
-            // ETH_SUBSCRIBE handshake (~50 yields ≈ a few ms).
-            for _ in 0..200 { syscall::yield_now(); }
-            syscall::sleep_ms(50);
+            // Block until nat_srv registers (#119: ns_lookup_wait
+            // replaces yield-burst + 50ms warmup poll).
+            let _ = syscall::ns_lookup_wait(b"nat");
             match syscall::ns_lookup(b"nat") {
                 Some(nat_port) => {
                     match syscall::call(nat_port, 0x7C40, 0, 0, 0, 0) {
@@ -697,14 +690,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     {
         let disc_tid = syscall::spawn(b"discovery_srv", 50);
         if disc_tid != u64::MAX {
-            // Give it a moment to register itself.
-            for _ in 0..200 { syscall::yield_now(); }
-            syscall::sleep_ms(50);
-            let mut wait = 0u32;
-            while syscall::ns_lookup(b"discovery").is_none() && wait < 200 {
-                syscall::sleep_ms(10);
-                wait += 1;
-            }
+            // Block until discovery_srv registers (#119: replaced
+            // ns_lookup polling with ns_lookup_wait).
+            let _ = syscall::ns_lookup_wait(b"discovery");
             match syscall::ns_lookup(b"discovery") {
                 Some(disc_port) => {
                     let mut ok = true;
@@ -1041,21 +1029,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if syscall::ns_lookup(b"proxy").is_none() {
             let _ = syscall::spawn(b"proxy_srv", 50);
         }
-        let mut wait = 0u32;
-        let mut found: Option<u64> = None;
-        while wait < 500 {
-            if let Some(p) = syscall::ns_lookup(b"proxy") {
-                found = Some(p);
-                break;
-            }
-            syscall::sleep_ms(10);
-            wait += 1;
-        }
-        let proxy_port = match found {
+        // #119: blocking ns_lookup_wait replaces 500-iter sleep_ms poll.
+        let proxy_port = match syscall::ns_lookup_wait(b"proxy") {
             Some(p) => p,
             None => {
                 ok = false;
-                syscall::debug_puts(b"  [proxy] ns_lookup failed (5s timeout)\n");
+                syscall::debug_puts(b"  [proxy] ns_lookup_wait failed\n");
                 0
             }
         };
@@ -2324,7 +2303,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // when the child exits, so we pay one wake instead of bursting
                 // through ~2000 sleep_ms wake-latency cycles.  See task #118.
                 let exit_code: i64 = match syscall::wait4(child as i64, 0) {
-                    Some((_p, status)) => status as i64,
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
                     None => -1,
                 };
                 if exit_code == 0 {
@@ -2413,14 +2392,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..12000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step F wayland infra test: PASSED\n");
                 } else if exit_code == -1 {
@@ -2509,7 +2485,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::debug_puts(b"  [G] compositor personality set; sleeping 1s\n");
 
                 // Give the compositor a chance to bind + listen on the UDS.
-                for _ in 0..200 { syscall::sleep_ms(5); }
+                // (#119: simplified loop-of-sleeps to a single sleep_ms;
+                // a UDS bind is not name-server-visible so ns_lookup_wait
+                // can't replace this — category D real-time delay.)
+                syscall::sleep_ms(1000);
                 syscall::debug_puts(b"  [G] sleep done; forking client\n");
 
                 let cli_child = syscall::fork();
@@ -2541,6 +2520,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::personality_set(cli_child, 2, abi);
                     syscall::debug_puts(b"  [G] client personality set; waitpid client\n");
 
+                    // #119: heartbeated waitpid poll kept (category D) —
+                    // the per-iteration heartbeat is the diagnostic
+                    // load-bearing here, and would be lost under wait4.
                     let mut cli_code: i64 = -1;
                     for i in 0..12000 {
                         if let Some(code) = syscall::waitpid(cli_child) {
@@ -2558,6 +2540,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                     syscall::debug_puts(b"  [G] client waitpid done; waitpid compositor\n");
 
+                    // #119: heartbeated waitpid poll kept (category D).
                     let mut comp_code: i64 = -1;
                     for i in 0..3000 {
                         if let Some(code) = syscall::waitpid(comp_child) {
@@ -3601,14 +3584,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         syscall::yield_now();
     }
 
-    let mut net_port: Option<u64> = None;
-    for _ in 0..20 {
-        if let Some(p) = syscall::ns_lookup(b"net") {
-            net_port = Some(p);
-            break;
-        }
-        syscall::sleep_ms(10);
-    }
+    // #119: blocking ns_lookup_wait replaces 20-iter sleep_ms poll.
+    let net_port: Option<u64> = syscall::ns_lookup_wait(b"net");
 
     if let Some(np) = net_port {
         syscall::debug_puts(b"  init: ns_lookup(net) = port ");
@@ -3644,12 +3621,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // Uses broadcast MAC fallback since SLIRP doesn't do RS/RA.
     syscall::debug_puts(b"  init: testing IPv6 ping6...\n");
     {
-        let mut ip6_port_opt: Option<u64> = None;
-        for _ in 0..20 {
-            ip6_port_opt = syscall::ns_lookup(b"ip6");
-            if ip6_port_opt.is_some() { break; }
-            syscall::sleep_ms(10);
-        }
+        // #119: blocking ns_lookup_wait replaces 20-iter poll.
+        let ip6_port_opt: Option<u64> = syscall::ns_lookup_wait(b"ip6");
         if let Some(ip6_port) = ip6_port_opt {
             let ip6_reply = syscall::port_create();
 
@@ -3774,15 +3747,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             let tid = syscall::spawn_elf(elf_data, 50, 0);
                             syscall::debug_puts(b"  init: spawn_elf returned\n");
                             if tid != u64::MAX {
-                                // Wait for child to exit.
+                                // Wait for child to exit. (#119: blocking wait4.)
                                 syscall::debug_puts(b"  init: waiting for child exit\n");
-                                for _ in 0..2000 {
-                                    if let Some(_code) = syscall::waitpid(tid) {
-                                        exec_ok = true;
-                                        break;
-                                    }
-                                    syscall::sleep_ms(1);
-                                }
+                                exec_ok = syscall::wait4(tid as i64, 0).is_some();
                             } else {
                                 syscall::debug_puts(b"  init: spawn_elf failed\n");
                             }
@@ -4193,12 +4160,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
     // --- Test 19b: TCP6 self-loopback echo ---
     {
-        let mut ip6_port_opt: Option<u64> = None;
-        for _ in 0..20 {
-            ip6_port_opt = syscall::ns_lookup(b"ip6");
-            if ip6_port_opt.is_some() { break; }
-            syscall::sleep_ms(10);
-        }
+        // #119: blocking ns_lookup_wait replaces 20-iter poll.
+        let ip6_port_opt: Option<u64> = syscall::ns_lookup_wait(b"ip6");
         if let Some(ip6_port) = ip6_port_opt {
             let tcp6_reply = syscall::port_create();
             let mut tcp6_ok = false;
@@ -4222,6 +4185,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 ];
 
                 // Wait for SLAAC to complete (gateway discovery).
+                // (#119: real-time poll on ND/RA — Category D; the
+                // 50 ms cadence paces ICMPv6 retransmits, no blocking
+                // primitive available.)
                 let mut slaac_ok = false;
                 for _ in 0..200 {
                     syscall::send(ip6_port, 0x6200, tcp6_reply, 0, 0, 0); // IP6_GATEWAY
@@ -4326,12 +4292,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // --- Test 19c: UDP6 self-loopback ---
     syscall::debug_puts(b"  init: testing UDP6 loopback...\n");
     {
-        let mut ip6_opt: Option<u64> = None;
-        for _ in 0..20 {
-            ip6_opt = syscall::ns_lookup(b"ip6");
-            if ip6_opt.is_some() { break; }
-            syscall::sleep_ms(10);
-        }
+        // #119: blocking ns_lookup_wait replaces 20-iter poll.
+        let ip6_opt: Option<u64> = syscall::ns_lookup_wait(b"ip6");
         if let Some(ip6_port) = ip6_opt {
             let rp = syscall::port_create();
             let mut udp6_ok = false;
@@ -4418,12 +4380,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         const DNS_RESOLVE_OK: u64 = 0x4801;
 
         let mut dns_ok = false;
-        let mut net_port_opt: Option<u64> = None;
-        for _ in 0..20 {
-            net_port_opt = syscall::ns_lookup(b"net");
-            if net_port_opt.is_some() { break; }
-            syscall::sleep_ms(10);
-        }
+        // #119: blocking ns_lookup_wait replaces 20-iter poll.
+        let net_port_opt: Option<u64> = syscall::ns_lookup_wait(b"net");
         if let Some(net_port) = net_port_opt {
             let rp = syscall::port_create();
             // Resolve "google.com" (10 bytes).
@@ -6200,14 +6158,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..1000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 174 full threads: PASSED\n");
                 } else if exit_code == -1 {
@@ -6339,14 +6294,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..3000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 175 signals end-to-end: PASSED\n");
                 } else if exit_code == -1 {
@@ -6441,19 +6393,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
                 }
 
-                // Wait for child.
-                let mut child_exit: i64 = -1;
-                for _ in 0..6000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        child_exit = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // Wait for child. (#119: blocking wait4.)
+                let child_exit: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if child_exit != 0 {
                     p176_ok = false;
                     if child_exit == -1 {
-                        syscall::debug_puts(b"    p176: child timeout\n");
+                        syscall::debug_puts(b"    p176: child ECHILD\n");
                     }
                 }
             } else {
@@ -6480,10 +6428,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Ensure VFS is running (normally spawned later in Phase 51).
         if syscall::ns_lookup(b"vfs").is_none() {
             let _ = syscall::spawn(b"vfs_srv", 50);
-            for _ in 0..200 {
-                if syscall::ns_lookup(b"vfs").is_some() { break; }
-                syscall::sleep_ms(10);
-            }
+            // #119: blocking ns_lookup_wait replaces sleep_ms-paced poll.
+            let _ = syscall::ns_lookup_wait(b"vfs");
         }
         let linux_ok = syscall::ns_lookup(b"linux").is_some();
         let vfs_ok = syscall::ns_lookup(b"vfs").is_some();
@@ -6564,14 +6510,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..3000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 4 {
                     syscall::debug_puts(b"Phase 194 FS syscall dispatch: PASSED (4/4)\n");
                 } else if exit_code == -1 {
@@ -6627,20 +6570,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::spawn_with_arg(b"iso9660_srv", 50, ISO_OFFSET)
         };
         if iso_tid != u64::MAX {
-            // Wait for iso9660_srv to register.
-            let iso_port = {
-                let mut retries = 500;
-                loop {
-                    if let Some(p) = syscall::ns_lookup(b"iso9660") {
-                        break Some(p);
-                    }
-                    retries -= 1;
-                    if retries == 0 {
-                        break None;
-                    }
-                    syscall::sleep_ms(2);
-                }
-            };
+            // Wait for iso9660_srv to register. (#119: blocking
+            // ns_lookup_wait replaces 500x2ms poll.)
+            let iso_port = syscall::ns_lookup_wait(b"iso9660");
 
             if let Some(iso_port) = iso_port {
                 let mut passed = true;
@@ -6804,20 +6736,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::spawn_with_arg(b"udf_srv", 50, UDF_OFFSET)
         };
         if udf_tid != u64::MAX {
-            // Wait for udf_srv to register.
-            let udf_port = {
-                let mut retries = 500;
-                loop {
-                    if let Some(p) = syscall::ns_lookup(b"udf") {
-                        break Some(p);
-                    }
-                    retries -= 1;
-                    if retries == 0 {
-                        break None;
-                    }
-                    syscall::sleep_ms(2);
-                }
-            };
+            // Wait for udf_srv to register. (#119: blocking
+            // ns_lookup_wait replaces 500x2ms poll.)
+            let udf_port = syscall::ns_lookup_wait(b"udf");
 
             if let Some(udf_port) = udf_port {
                 let mut passed = true;
@@ -7356,15 +7277,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if iscsi_tid == 0 {
             syscall::debug_puts(b"Phase 181 iSCSI: SKIPPED (spawn failed)\n");
         } else {
-            // Poll for iscsi_srv registration (TCP connect + login + SCSI init over SLIRP).
-            let mut iscsi_found = None;
-            for _ in 0..150 { // 150 * 100ms = 15s max
-                if let Some(p) = syscall::ns_lookup(b"iscsi") {
-                    iscsi_found = Some(p);
-                    break;
-                }
-                syscall::sleep_ms(100);
-            }
+            // Wait for iscsi_srv registration (TCP connect + login +
+            // SCSI init over SLIRP). (#119: blocking ns_lookup_wait
+            // replaces 150x100ms poll.)
+            let iscsi_found = syscall::ns_lookup_wait(b"iscsi");
             match iscsi_found {
                 Some(iscsi_port) => {
                     // Try IO_CONNECT.
@@ -7405,15 +7321,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if sctp_tid == 0 {
             syscall::debug_puts(b"Phase 182 SCTP: SKIPPED (spawn failed)\n");
         } else {
-            // Wait for sctp_srv to register.
-            let mut sctp_port = None;
-            for _ in 0..50 { // 50 * 100ms = 5s
-                if let Some(p) = syscall::ns_lookup(b"sctp") {
-                    sctp_port = Some(p);
-                    break;
-                }
-                syscall::sleep_ms(100);
-            }
+            // Wait for sctp_srv to register. (#119: blocking
+            // ns_lookup_wait replaces 50x100ms poll.)
+            let sctp_port = syscall::ns_lookup_wait(b"sctp");
             match sctp_port {
                 Some(sp) => {
                     let rp = syscall::port_create();
@@ -8797,7 +8707,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             phase44_ok = false;
         }
 
-        // Test sleep_ms convenience wrapper.
+        // Test sleep_ms convenience wrapper.  (#119: this is the
+        // self-test of sleep_ms itself — Category D, must keep.)
         let before2 = syscall::clock_gettime();
         syscall::sleep_ms(30);
         let after2 = syscall::clock_gettime();
@@ -9413,21 +9324,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 syscall::exit(if ok { 0 } else { 1 });
                 unreachable!();
             }
-            // Parent: wait for child to finish.
-            let mut waited = false;
-            for _ in 0..50 {
-                if let Some(code) = syscall::waitpid(child) {
+            // Parent: wait for child to finish. (#119: blocking wait4.)
+            match syscall::wait4(child as i64, 0) {
+                Some((_p, status)) => {
+                    let code = ((status >> 8) & 0xFF) as i32;
                     if code != 0 {
                         phase48_ok = false;
                     }
-                    waited = true;
-                    break;
                 }
-                syscall::sleep_ms(10);
-            }
-            if !waited {
-                syscall::debug_puts(b"  FAIL: phase48 child did not exit\n");
-                phase48_ok = false;
+                None => {
+                    syscall::debug_puts(b"  FAIL: phase48 child ECHILD\n");
+                    phase48_ok = false;
+                }
             }
         }
 
@@ -9774,14 +9682,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 phase51_ok = false;
                 0
             } else {
-                let mut found = 0u64;
-                for _ in 0..100 {
-                    if let Some(p) = syscall::ns_lookup(b"vfs") {
-                        found = p;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking ns_lookup_wait replaces sleep_ms-paced poll.
+                let found: u64 = syscall::ns_lookup_wait(b"vfs").unwrap_or(0);
                 if found == 0 {
                     syscall::debug_puts(b"  FAIL: ns_lookup(vfs) failed\n");
                     phase51_ok = false;
@@ -9810,14 +9712,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             // No block device — use rootfs (CPIO-backed writable tmpfs).
             root_fs_port = if phase51_ok {
-                let mut found = 0u64;
-                for _ in 0..100 {
-                    if let Some(p) = syscall::ns_lookup(b"rootfs") {
-                        found = p;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking ns_lookup_wait replaces sleep_ms-paced poll.
+                let found: u64 = syscall::ns_lookup_wait(b"rootfs").unwrap_or(0);
                 if found == 0 {
                     syscall::debug_puts(b"  FAIL: ns_lookup(rootfs) failed\n");
                     phase51_ok = false;
@@ -9884,6 +9780,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
 
         // Brief pause to let VFS server process mount table updates.
+        // (#119: Category D — VFS_MOUNT replies before its in-RAM
+        // mount-table propagation completes; the 20ms is a real-time
+        // settle window.  No blocking primitive replaces it.)
         syscall::sleep_ms(20);
 
         // Test 3: VFS_OPEN "/hello.txt" — should resolve to root FS on "/".
@@ -9999,17 +9898,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                // 30000 × 10 ms = 300 s.  libc.so.6 + libxcvt mmap +
-                // main + cleanup totals up to 250 s on slow KVM trials
-                // even with the initramfs fast path; budget generously.
-                for _ in 0..30000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H libxcvt dyn-link (early): PASSED\n");
                 } else if exit_code == -1 {
@@ -10082,14 +9975,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..30000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H7 libwayland-client dyn-link: PASSED\n");
                 } else if exit_code == -1 {
@@ -10158,14 +10048,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..30000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H8 libX11 dyn-link: PASSED\n");
                 } else if exit_code == -1 {
@@ -10237,14 +10124,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..30000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H9 Tier-3 X11ext batch: PASSED\n");
                 } else if exit_code == -1 {
@@ -10312,14 +10196,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..30000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H10 Tier-4 fonts batch: PASSED\n");
                 } else if exit_code == -1 {
@@ -10387,14 +10268,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..30000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H11 Tier-5 SSL batch: PASSED\n");
                 } else if exit_code == -1 {
@@ -10466,14 +10344,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..30000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H12 Xwayland binary load: PASSED\n");
                 } else if exit_code == -1 {
@@ -10550,8 +10425,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(target_arch = "x86_64"))]
                 let abi = 0u8;
                 syscall::personality_set(comp_child, 2, abi);
-                // Give compositor 1s to bind the UDS.
-                for _ in 0..200 { syscall::sleep_ms(5); }
+                // Give compositor 1s to bind the UDS.  (#119: UDS bind
+                // isn't name-server-visible, so ns_lookup_wait can't
+                // replace this — Category D real-time delay.)
+                syscall::sleep_ms(1000);
                 syscall::debug_puts(b"  [H13] forking Xwayland...\n");
 
                 let xw_child = syscall::fork();
@@ -10633,14 +10510,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     {
                         const UDS_QUERY_LISTENING_C: u64 = 0x80B0;
                         const UDS_OK_C: u64 = 0x8100;
-                        let mut uds_port: u64 = 0;
-                        for _ in 0..200 {
-                            if let Some(p) = syscall::ns_lookup(b"uds") {
-                                uds_port = p;
-                                break;
-                            }
-                            syscall::yield_now();
-                        }
+                        // #119: blocking ns_lookup_wait replaces yield-poll.
+                        let uds_port: u64 = syscall::ns_lookup_wait(b"uds").unwrap_or(0);
                         if uds_port != 0 {
                             let (n0, n1, _) = pack_name(b"X0");
                             let mut probes: u32 = 0;
@@ -10648,6 +10519,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             // 10s budget @ 100 ms/probe — same as the old
                             // probe.  Non-consuming so cost is just the IPC
                             // round trip, no risk of starving xeyes.
+                            // (#119: Category D — Xwayland's UDS bind isn't
+                            // name-server visible; only path is to ask
+                            // uds_srv via a paced probe.)
                             const MAX_PROBES: u32 = 100;
                             while probes < MAX_PROBES {
                                 let ok = match syscall::call(uds_port, UDS_QUERY_LISTENING_C, n0, n1, 2, 0) {
@@ -10777,6 +10651,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // exit values).
                     let xeyes_alive_threshold_iter: i32 = 600; // ~6 logical s
                     let mut xeyes_killed_alive = false;
+                    // #119: this loop is Category C/D — it runs xeyes
+                    // retry scheduling, alive-killed detection, and
+                    // heartbeat instrumentation in concert with the
+                    // Xwayland waitpid; replacing with wait4 would lose
+                    // the schedule and heartbeats.  sleep_ms is the
+                    // pacing primitive here, intentionally.
                     for i in 0..12000 {
                         if let Some(code) = syscall::waitpid(xw_child) {
                             xw_code = code as i64;
@@ -10949,14 +10829,13 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         if i == 6000 { syscall::debug_puts(b"  [H13] Xwayland @60s\n"); }
                         if i == 9000 { syscall::debug_puts(b"  [H13] Xwayland @90s\n"); }
                     }
-                    // Final xeyes reap if still running.
+                    // Final xeyes reap if still running. (#119: blocking
+                    // wait4.  Always reaps; the never_reaped sentinel is
+                    // unreachable here but kept for the outer-loop case
+                    // where xw_code break short-circuits before this line.)
                     if xeyes_child != u64::MAX && xeyes_code == -1 {
-                        for _ in 0..500 {
-                            if let Some(code) = syscall::waitpid(xeyes_child) {
-                                xeyes_code = code as i64;
-                                break;
-                            }
-                            syscall::sleep_ms(10);
+                        if let Some((_p, status)) = syscall::wait4(xeyes_child as i64, 0) {
+                            xeyes_code = ((status >> 8) & 0xFF) as i64;
                         }
                     }
                     // Print "Step H14 xeyes: ..." summary covering the
@@ -10982,14 +10861,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         syscall::debug_puts(b"\n");
                     }
                     syscall::debug_puts(b"  [H13] reaping compositor...\n");
-                    let mut comp_code: i64 = -1;
-                    for _ in 0..1000 {
-                        if let Some(code) = syscall::waitpid(comp_child) {
-                            comp_code = code as i64;
-                            break;
-                        }
-                        syscall::sleep_ms(10);
-                    }
+                    // #119: blocking wait4 replaces sleep_ms-paced reap.
+                    let comp_code: i64 = match syscall::wait4(comp_child as i64, 0) {
+                        Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                        None => -1,
+                    };
 
                     if xw_code != -1 {
                         syscall::debug_puts(b"Step H13 Xwayland + compositor: PASSED (xw_exit=");
@@ -11060,14 +10936,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..30000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H2 libdrm dyn-link: PASSED\n");
                 } else if exit_code == -1 {
@@ -11131,14 +11004,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..30000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H3 libxshmfence dyn-link: PASSED\n");
                 } else if exit_code == -1 {
@@ -11203,14 +11073,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..30000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H4 libXau dyn-link: PASSED\n");
                 } else if exit_code == -1 {
@@ -11273,14 +11140,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..30000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H5 libXdmcp dyn-link: PASSED\n");
                 } else if exit_code == -1 {
@@ -11345,14 +11209,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..30000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H6 libpixman dyn-link: PASSED\n");
                 } else if exit_code == -1 {
@@ -11415,14 +11276,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(target_arch = "x86_64"))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..3000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 172d fsprobe: PASSED\n");
                 } else {
@@ -11507,14 +11365,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..12000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 4 {
                     syscall::debug_puts(b"Phase 172e dynamic glibc binary: PASSED\n");
                 } else if exit_code == -1 {
@@ -11582,14 +11437,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..6000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Step H libxcvt dyn-link: PASSED\n");
                 } else if exit_code == -1 {
@@ -11711,7 +11563,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // Step 3: FS_CLOSE (triggers inode flush)
         if phase53_ok {
             let _ = syscall::call(ext_port, 0x2400, handle, 0, 0, 0);
-            syscall::sleep_ms(50); // Wait for disk I/O
+            // Wait for disk I/O. (#119: Category D — ext_srv's flush
+            // is async and acks before the block layer drains.)
+            syscall::sleep_ms(50);
         }
 
         // Step 4: Re-open and verify
@@ -11799,6 +11653,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Step 6: Verify file is gone
         if phase53_ok {
+            // (#119: Category D — directory deletion needs a flush
+            // settle window before the lookup is guaranteed to miss.)
             syscall::sleep_ms(20);
             let fname = b"WTEST.TXT";
             let (fn0, fn1, _) = pack_name(fname);
@@ -11851,14 +11707,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Look up tmpfs port.
         let tmpfs_port = if phase54_ok {
-            let mut found = 0u64;
-            for _ in 0..100 {
-                if let Some(p) = syscall::ns_lookup(b"tmpfs") {
-                    found = p;
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
+            // #119: blocking ns_lookup_wait replaces sleep_ms-paced poll.
+            let found: u64 = syscall::ns_lookup_wait(b"tmpfs").unwrap_or(0);
             if found == 0 {
                 syscall::debug_puts(b"  FAIL: ns_lookup(tmpfs) failed\n");
                 phase54_ok = false;
@@ -12099,14 +11949,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Look up devfs port.
         let devfs_port = if phase55_ok {
-            let mut found = 0u64;
-            for _ in 0..100 {
-                if let Some(p) = syscall::ns_lookup(b"devfs") {
-                    found = p;
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
+            // #119: blocking ns_lookup_wait replaces sleep_ms-paced poll.
+            let found: u64 = syscall::ns_lookup_wait(b"devfs").unwrap_or(0);
             if found == 0 {
                 syscall::debug_puts(b"  FAIL: ns_lookup(devfs) failed\n");
                 phase55_ok = false;
@@ -12328,14 +12172,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Look up procfs port.
         let procfs_port = if phase56_ok {
-            let mut found = 0u64;
-            for _ in 0..100 {
-                if let Some(p) = syscall::ns_lookup(b"procfs") {
-                    found = p;
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
+            // #119: blocking ns_lookup_wait replaces sleep_ms-paced poll.
+            let found: u64 = syscall::ns_lookup_wait(b"procfs").unwrap_or(0);
             if found == 0 {
                 syscall::debug_puts(b"  FAIL: ns_lookup(procfs) failed\n");
                 phase56_ok = false;
@@ -13510,14 +13348,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Wait for pty server to register.
         if phase62_ok {
-            let mut found = false;
-            for _ in 0..100 {
-                if syscall::ns_lookup(b"pty").is_some() {
-                    found = true;
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
+            // #119: blocking ns_lookup_wait replaces sleep_ms-paced poll.
+            let found: bool = syscall::ns_lookup_wait(b"pty").is_some();
             if !found {
                 syscall::debug_puts(b"  FAIL: ns_lookup(pty) failed\n");
                 phase62_ok = false;
@@ -13940,13 +13772,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         let probe = syscall::spawn(b"hello_c", 50);
         let has_hello_c = probe != u64::MAX;
         if has_hello_c {
-            // Reap the probe process.
-            for _ in 0..300 {
-                if syscall::waitpid(probe).is_some() {
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
+            // Reap the probe process. (#119: blocking wait4.)
+            let _ = syscall::wait4(probe as i64, 0);
         }
         if !has_hello_c {
             syscall::debug_puts(b"Phase 67 auxiliary vector & argv: SKIPPED (no native hello_c)\n");
@@ -13959,23 +13786,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::execve(b"hello_c");
             syscall::exit(1);
         } else if fork_ret != u64::MAX {
-            // Parent: wait for child.
-            let mut ok = false;
-            for _ in 0..300 {
-                if let Some(code) = syscall::waitpid(fork_ret) {
+            // Parent: wait for child. (#119: blocking wait4.)
+            match syscall::wait4(fork_ret as i64, 0) {
+                Some((_p, status)) => {
+                    let code = ((status >> 8) & 0xFF) as i32;
                     // hello_c exits with argc. No argv passed → argc=0.
                     if code != 0 {
                         syscall::debug_puts(b"    FAIL: hello_c no-argv exit code != 0\n");
                         phase67_ok = false;
                     }
-                    ok = true;
-                    break;
                 }
-                syscall::sleep_ms(10);
-            }
-            if !ok {
-                syscall::debug_puts(b"    FAIL: hello_c no-argv waitpid timeout\n");
-                phase67_ok = false;
+                None => {
+                    syscall::debug_puts(b"    FAIL: hello_c no-argv wait4 ECHILD\n");
+                    phase67_ok = false;
+                }
             }
         } else {
             syscall::debug_puts(b"    FAIL: fork for hello_c\n");
@@ -14002,22 +13826,20 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             );
             syscall::exit(1);
         } else if fork_ret2 != u64::MAX {
-            let mut ok = false;
-            for _ in 0..300 {
-                if let Some(code) = syscall::waitpid(fork_ret2) {
+            // (#119: blocking wait4.)
+            match syscall::wait4(fork_ret2 as i64, 0) {
+                Some((_p, status)) => {
+                    let code = ((status >> 8) & 0xFF) as i32;
                     // hello_c exits with argc=3 (hello_c, foo, bar).
                     if code != 3 {
                         syscall::debug_puts(b"    FAIL: hello_c argv exit code != 3\n");
                         phase67_ok = false;
                     }
-                    ok = true;
-                    break;
                 }
-                syscall::sleep_ms(10);
-            }
-            if !ok {
-                syscall::debug_puts(b"    FAIL: hello_c argv waitpid timeout\n");
-                phase67_ok = false;
+                None => {
+                    syscall::debug_puts(b"    FAIL: hello_c argv wait4 ECHILD\n");
+                    phase67_ok = false;
+                }
             }
         } else {
             syscall::debug_puts(b"    FAIL: fork for hello_c argv\n");
@@ -14109,13 +13931,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             // Wait for registration with retry.
             let mut event_port = 0u64;
-            for _ in 0..100 {
-                if let Some(p) = syscall::ns_lookup(b"event") {
-                    event_port = p;
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
+            // #119: blocking ns_lookup_wait replaces sleep_ms-paced poll.
+            event_port = syscall::ns_lookup_wait(b"event").unwrap_or(0);
             if event_port == 0 {
                 syscall::debug_puts(b"    FAIL: event_srv not registered\n");
                 phase68_ok = false;
@@ -14218,22 +14035,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"    FAIL: cannot spawn ld-telix\n");
             phase66_ok = false;
         } else {
-            let mut ok = false;
-            for _ in 0..300 {
-                if let Some(code) = syscall::waitpid(ld_tid) {
-                    if code != 127 {
+            // (#119: blocking wait4.)
+            match syscall::wait4(ld_tid as i64, 0) {
+                Some((_p, status)) => {
+                    if status != 127 {
                         syscall::debug_puts(b"    WARN: ld-telix exit code != 127\n");
                     }
-                    ok = true;
-                    break;
                 }
-                syscall::sleep_ms(10);
-            }
-            if !ok {
-                syscall::debug_puts(
-                    b"    WARN: ld-telix waitpid timeout (C binary may not exit cleanly)\n",
-                );
-                // Not a hard failure — the dynamic linker infrastructure is tested via PT_INTERP.
+                None => {
+                    syscall::debug_puts(
+                        b"    WARN: ld-telix wait4 ECHILD (C binary may not exit cleanly)\n",
+                    );
+                    // Not a hard failure — the dynamic linker infrastructure is tested via PT_INTERP.
+                }
             }
         }
 
@@ -14258,13 +14072,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         } else {
             // Wait for registration with retry.
             let mut syslog_port_opt = None;
-            for _ in 0..100 {
-                if let Some(p) = syscall::ns_lookup(b"syslog") {
-                    syslog_port_opt = Some(p);
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
+            // #119: blocking ns_lookup_wait replaces sleep_ms-paced poll.
+            syslog_port_opt = syscall::ns_lookup_wait(b"syslog");
 
             if let Some(syslog_port) = syslog_port_opt {
                 let reply = syscall::port_create();
@@ -14319,21 +14128,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"    SKIP: tz_test not in initramfs\n");
             phase72_ok = false;
         } else {
-            let mut ok = false;
-            for _ in 0..200 {
-                if let Some(code) = syscall::waitpid(tz_tid) {
+            // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+            match syscall::wait4(tz_tid as i64, 0) {
+                Some((_p, status)) => {
+                    let code = ((status >> 8) & 0xFF) as u64;
                     if code != 0 {
                         syscall::debug_puts(b"    FAIL: tz_test exit code != 0\n");
                         phase72_ok = false;
                     }
-                    ok = true;
-                    break;
                 }
-                syscall::sleep_ms(10);
-            }
-            if !ok {
+                None => {
                 syscall::debug_puts(b"    FAIL: tz_test waitpid timeout\n");
                 phase72_ok = false;
+                }
             }
         }
 
@@ -14412,21 +14219,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             syscall::debug_puts(b"    SKIP: pthread_test not in initramfs\n");
             phase74_ok = false;
         } else {
-            let mut ok = false;
-            for _ in 0..500 {
-                if let Some(code) = syscall::waitpid(pt_tid) {
+            // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+            match syscall::wait4(pt_tid as i64, 0) {
+                Some((_p, status)) => {
+                    let code = ((status >> 8) & 0xFF) as u64;
                     if code != 0 {
                         syscall::debug_puts(b"    FAIL: pthread_test exit code != 0\n");
                         phase74_ok = false;
                     }
-                    ok = true;
-                    break;
                 }
-                syscall::sleep_ms(10);
-            }
-            if !ok {
+                None => {
                 syscall::debug_puts(b"    FAIL: pthread_test waitpid timeout\n");
                 phase74_ok = false;
+                }
             }
         }
 
@@ -14712,13 +14517,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             phase79_ok = false;
         } else {
             let mut sysv_port_opt = None;
-            for _ in 0..100 {
-                if let Some(p) = syscall::ns_lookup(b"sysv") {
-                    sysv_port_opt = Some(p);
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
+            // #119: blocking ns_lookup_wait replaces sleep_ms-paced poll.
+            sysv_port_opt = syscall::ns_lookup_wait(b"sysv");
 
             if let Some(sysv_port) = sysv_port_opt {
                 // SEM_GET: d0=key(0=IPC_PRIVATE), d1=nsems(1), d2=flags|reply<<32
@@ -15076,9 +14876,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     {
         let tid = syscall::spawn(b"libc_test", 50);
         if tid != u64::MAX {
-            let mut exited = false;
-            for _ in 0..300 {
-                if let Some(code) = syscall::waitpid(tid) {
+            // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+            match syscall::wait4(tid as i64, 0) {
+                Some((_p, status)) => {
+                    let code = ((status >> 8) & 0xFF) as u64;
                     if code == 0 {
                         syscall::debug_puts(b"Phase 102 libc integration test: PASSED\n");
                     } else {
@@ -15086,13 +14887,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             b"Phase 102 libc integration test: FAILED (nonzero exit)\n",
                         );
                     }
-                    exited = true;
-                    break;
                 }
-                syscall::sleep_ms(10);
-            }
-            if !exited {
+                None => {
                 syscall::debug_puts(b"Phase 102 libc integration test: FAILED (timeout)\n");
+                }
             }
         } else {
             syscall::debug_puts(b"Phase 102 libc integration test: SKIPPED (spawn failed)\n");
@@ -15104,21 +14902,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     {
         let tid = syscall::spawn(b"calc", 50);
         if tid != u64::MAX {
-            let mut exited = false;
-            for _ in 0..300 {
-                if let Some(code) = syscall::waitpid(tid) {
+            // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+            match syscall::wait4(tid as i64, 0) {
+                Some((_p, status)) => {
+                    let code = ((status >> 8) & 0xFF) as u64;
                     if code == 0 {
                         syscall::debug_puts(b"Phase 103 calculator: PASSED\n");
                     } else {
                         syscall::debug_puts(b"Phase 103 calculator: FAILED (nonzero exit)\n");
                     }
-                    exited = true;
-                    break;
                 }
-                syscall::sleep_ms(10);
-            }
-            if !exited {
+                None => {
                 syscall::debug_puts(b"Phase 103 calculator: FAILED (timeout)\n");
+                }
             }
         } else {
             syscall::debug_puts(b"Phase 103 calculator: SKIPPED (spawn failed)\n");
@@ -15130,21 +14926,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     {
         let tid = syscall::spawn(b"stress_test", 50);
         if tid != u64::MAX {
-            let mut exited = false;
-            for _ in 0..300 {
-                if let Some(code) = syscall::waitpid(tid) {
+            // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+            match syscall::wait4(tid as i64, 0) {
+                Some((_p, status)) => {
+                    let code = ((status >> 8) & 0xFF) as u64;
                     if code == 0 {
                         syscall::debug_puts(b"Phase 104 stress test: PASSED\n");
                     } else {
                         syscall::debug_puts(b"Phase 104 stress test: FAILED (nonzero exit)\n");
                     }
-                    exited = true;
-                    break;
                 }
-                syscall::sleep_ms(10);
-            }
-            if !exited {
+                None => {
                 syscall::debug_puts(b"Phase 104 stress test: FAILED (timeout)\n");
+                }
             }
         } else {
             syscall::debug_puts(b"Phase 104 stress test: SKIPPED (spawn failed)\n");
@@ -15171,13 +14965,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if phase105_ok {
             // Wait for proxy_srv to register with name server.
             let mut proxy_port = 0u64;
-            for _ in 0..200 {
-                if let Some(p) = syscall::ns_lookup(b"proxy") {
-                    proxy_port = p;
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
+            // #119: blocking ns_lookup_wait replaces sleep_ms-paced poll.
+            proxy_port = syscall::ns_lookup_wait(b"proxy").unwrap_or(0);
             if proxy_port == 0 {
                 syscall::debug_puts(b"  FAIL: proxy_srv not found in name server\n");
                 phase105_ok = false;
@@ -15194,7 +14983,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let d2 = (9100u64) | (reply_port << 32);
                 syscall::send(proxy_port, 0x5000, 1, ip_loopback, d2, 0);
 
-                // Wait for add_node reply.
+                // Wait for add_node reply. (#119: poll on a non-blocking
+                // recv loop with a 1 s budget — Category D.  Could be
+                // recv_msg_timeout but that's outside this audit's scope.)
                 for _ in 0..100 {
                     if let Some(reply) = syscall::recv_nb_msg(reply_port) {
                         if reply.tag == 0x5001 {
@@ -15309,14 +15100,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     }
 
                     // Wait for child to exit.
-                    let mut exited = false;
-                    for _ in 0..300 {
-                        if let Some(_code) = syscall::waitpid(child) {
-                            exited = true;
-                            break;
-                        }
-                        syscall::sleep_ms(5);
-                    }
+                    // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                    let exited: bool = syscall::wait4(child as i64, 0).is_some();
                     if exited {
                         syscall::debug_puts(b"Phase 106 linux personality: PASSED\n");
                     } else {
@@ -15485,7 +15270,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         if comp_ok && pty_ok {
             let term_tid = syscall::spawn(b"term_srv", 50);
             if term_tid != u64::MAX {
-                // Give term_srv time to create window, open PTY, spawn shell.
+                // Give term_srv time to create window, open PTY, spawn
+                // shell.  (#119: Category D — none of those steps register
+                // a name-server-visible service we could wait on.)
                 syscall::sleep_ms(100);
                 syscall::debug_puts(b"Phase 110 terminal emulator: PASSED\n");
             } else {
@@ -15699,14 +15486,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exited = false;
-                for _ in 0..300 {
-                    if let Some(_code) = syscall::waitpid(child) {
-                        exited = true;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exited: bool = syscall::wait4(child as i64, 0).is_some();
                 if exited {
                     syscall::debug_puts(b"Phase 122 linux personality I/O: PASSED\n");
                 } else {
@@ -15814,14 +15595,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exited = false;
-                for _ in 0..500 {
-                    if let Some(_code) = syscall::waitpid(child) {
-                        exited = true;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exited: bool = syscall::wait4(child as i64, 0).is_some();
                 if exited {
                     syscall::debug_puts(b"Phase 123 linux fork+wait4: PASSED\n");
                 } else {
@@ -15993,14 +15768,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 124 linux pipe2+dup2: PASSED\n");
                 } else if exit_code == -1 {
@@ -16071,14 +15843,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 42 {
                     syscall::debug_puts(b"Phase 125 linux execve: PASSED\n");
                 } else if exit_code == -1 {
@@ -16193,14 +15962,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 126 linux dir ops: PASSED\n");
                 } else if exit_code == -1 {
@@ -16361,14 +16127,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     syscall::debug_puts(b"  p127: personality_set OK\n");
                 }
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 127 linux syscall coverage: PASSED\n");
                 } else if exit_code == -1 {
@@ -16439,14 +16202,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 128 linux per-process state: PASSED\n");
                 } else if exit_code == -1 {
@@ -16604,14 +16364,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 129 linux socket syscalls: PASSED\n");
                 } else if exit_code == -1 {
@@ -16760,14 +16517,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 130 linux epoll: PASSED\n");
                 } else if exit_code == -1 {
@@ -16935,14 +16689,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 131 linux eventfd/timerfd: PASSED\n");
                 } else if exit_code == -1 {
@@ -17087,14 +16838,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 132 linux memfd_create: PASSED\n");
                 } else if exit_code == -1 {
@@ -17277,14 +17025,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 133 linux sendmsg/recvmsg: PASSED\n");
                 } else if exit_code == -1 {
@@ -17413,14 +17158,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 134 linux sched/prlimit: PASSED\n");
                 } else if exit_code == -1 {
@@ -17539,14 +17281,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 135 linux 6-arg routing: PASSED\n");
                 } else if exit_code == -1 {
@@ -17785,14 +17524,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 136 linux SCM_RIGHTS: PASSED\n");
                 } else if exit_code == -1 {
@@ -17930,14 +17666,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 137 linux metadata syscalls: PASSED\n");
                 } else if exit_code == -1 {
@@ -18117,14 +17850,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 138 linux positional I/O: PASSED\n");
                 } else if exit_code == -1 {
@@ -18296,14 +18026,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 139 linux file metadata: PASSED\n");
                 } else if exit_code == -1 {
@@ -18421,14 +18148,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..500 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 140 linux kill/flock: PASSED\n");
                 } else if exit_code == -1 {
@@ -18566,14 +18290,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 141 linux mmap/mremap/brk: PASSED\n");
                 } else if exit_code == -1 {
@@ -18676,14 +18397,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 142 linux TLS arch_prctl: PASSED\n");
                 } else if exit_code == -1 {
@@ -18833,14 +18551,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 143 linux poll: PASSED\n");
                 } else if exit_code == -1 {
@@ -18942,14 +18657,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 144 linux futex: PASSED\n");
                 } else if exit_code == -1 {
@@ -19098,14 +18810,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 145 linux signals: PASSED\n");
                 } else if exit_code == -1 {
@@ -19219,14 +18928,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 146 linux rlimit+rusage: PASSED\n");
                 } else if exit_code == -1 {
@@ -19392,14 +19098,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 147 linux select: PASSED\n");
                 } else if exit_code == -1 {
@@ -19553,14 +19256,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 148 linux sockopt: PASSED\n");
                 } else if exit_code == -1 {
@@ -19662,14 +19362,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 149 linux file mmap: PASSED\n");
                 } else if exit_code == -1 {
@@ -19769,14 +19466,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 150 linux pipe/fchdir/shutdown: PASSED\n");
                 } else if exit_code == -1 {
@@ -19866,14 +19560,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 151 linux misc stubs: PASSED\n");
                 } else if exit_code == -1 {
@@ -19979,14 +19670,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 152 linux sched/mlock/preadv: PASSED\n");
                 } else if exit_code == -1 {
@@ -20076,14 +19764,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 153 linux xattr/inotify stubs: PASSED\n");
                 } else if exit_code == -1 {
@@ -20178,14 +19863,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 155 linux sysinfo/times: PASSED\n");
                 } else if exit_code == -1 {
@@ -20252,14 +19934,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                     let abi = 0u8;
                     syscall::personality_set(child, 2, abi);
-                    let mut exit_code: i64 = -1;
-                    for _ in 0..500 {
-                        if let Some(code) = syscall::waitpid(child) {
-                            exit_code = code as i64;
-                            break;
-                        }
-                        syscall::sleep_ms(5);
-                    }
+                    // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                    let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                        Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                        None => -1,
+                    };
                     if exit_code != 0 { ok = false; break; }
                 }
             }
@@ -20362,14 +20041,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 158 linux cred/fs stubs: PASSED\n");
                 } else if exit_code == -1 {
@@ -20530,14 +20206,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 159 linux virtual devices: PASSED\n");
                 } else if exit_code == -1 {
@@ -20685,14 +20358,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 160 linux proc+devtty: PASSED\n");
                 } else if exit_code == -1 {
@@ -20791,14 +20461,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 161 linux mmap+isatty: PASSED\n");
                 } else if exit_code == -1 {
@@ -20922,14 +20589,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 162 linux ioctl+close_range: PASSED\n");
                 } else if exit_code == -1 {
@@ -21045,14 +20709,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 163 linux waitid+getcpu+maps: PASSED\n");
                 } else if exit_code == -1 {
@@ -21196,14 +20857,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 164 linux procfs+sysfs: PASSED\n");
                 } else if exit_code == -1 {
@@ -21303,14 +20961,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 165 linux batch stubs: PASSED\n");
                 } else if exit_code == -1 {
@@ -21440,14 +21095,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 166 linux etc+virtual files: PASSED\n");
                 } else if exit_code == -1 {
@@ -21569,14 +21221,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 167 linux dup+openat: PASSED\n");
                 } else if exit_code == -1 {
@@ -21724,14 +21373,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
-                let mut exit_code: i64 = -1;
-                for _ in 0..3000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 168 linux clone CLONE_VM: PASSED\n");
                 } else if exit_code == -1 {
@@ -21845,14 +21491,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 169 linux MAP_FIXED: PASSED\n");
                 } else if exit_code == -1 {
@@ -21967,14 +21610,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..2000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(5);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 0 {
                     syscall::debug_puts(b"Phase 170 linux signal delivery: PASSED\n");
                 } else if exit_code == -1 {
@@ -22062,14 +21702,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..1000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 4 {
                     syscall::debug_puts(b"Phase 171 real glibc binary: PASSED\n");
                 } else if exit_code == -1 {
@@ -22162,14 +21799,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 let abi = 0u8;
                 syscall::personality_set(child, 2, abi);
 
-                let mut exit_code: i64 = -1;
-                for _ in 0..12000 {
-                    if let Some(code) = syscall::waitpid(child) {
-                        exit_code = code as i64;
-                        break;
-                    }
-                    syscall::sleep_ms(10);
-                }
+                // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
                 if exit_code == 4 {
                     syscall::debug_puts(b"Phase 172 dynamic glibc binary: PASSED\n");
                 } else if exit_code == -1 {
@@ -22196,14 +21830,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     {
         let bench_tid = syscall::spawn(b"bench", 50);
         if bench_tid != u64::MAX {
-            let mut exited = false;
-            for _ in 0..500 {
-                if let Some(_code) = syscall::waitpid(bench_tid) {
-                    exited = true;
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
+            // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+            let exited: bool = syscall::wait4(bench_tid as i64, 0).is_some();
             if exited {
                 syscall::debug_puts(b"Phase 22 benchmarks: PASSED\n");
             } else {
@@ -22219,14 +21847,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     {
         let mbench_tid = syscall::spawn(b"macro_bench", 50);
         if mbench_tid != u64::MAX {
-            let mut exited = false;
-            for _ in 0..500 {
-                if let Some(_code) = syscall::waitpid(mbench_tid) {
-                    exited = true;
-                    break;
-                }
-                syscall::sleep_ms(10);
-            }
+            // #119: blocking wait4 replaces sleep_ms-paced waitpid poll.
+            let exited: bool = syscall::wait4(mbench_tid as i64, 0).is_some();
             if exited {
                 syscall::debug_puts(b"Phase 23 macrobenchmarks: PASSED\n");
             } else {

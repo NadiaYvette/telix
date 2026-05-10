@@ -55,18 +55,14 @@ fn report(label: &[u8], pass: bool) -> bool {
 fn main(_a0: u64, _a1: u64, _a2: u64) {
     syscall::debug_puts(b"[router_srv] starting\n");
 
-    // Wait for eth_srv to be ready.
-    let mut wait = 0u32;
-    let eth_port = loop {
-        if let Some(p) = syscall::ns_lookup(b"eth") {
-            break p;
-        }
-        if wait >= 500 {
+    // Wait for eth_srv to be ready.  ns_lookup_wait blocks until
+    // the service registers (no time-based polling required).
+    let eth_port = match syscall::ns_lookup_wait(b"eth") {
+        Some(p) => p,
+        None => {
             let _ = report(b"eth_srv never registered", false);
             syscall::exit(1);
         }
-        syscall::sleep_ms(10);
-        wait += 1;
     };
 
     // Allocate local RX page.  eth_srv copies frame bytes here once

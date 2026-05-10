@@ -1434,6 +1434,10 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             comp.flip();
         }
 
+        // Compositor main-loop pacing: ~1 kHz so input + nb-recvs
+        // drain and dirty regions composite at real-time cadence
+        // without spinning.  A proper event-driven multi-port wait
+        // would replace this — not available yet (#119).
         syscall::sleep_ms(1);
     }
 }

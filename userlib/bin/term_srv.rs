@@ -621,20 +621,22 @@ pub extern "C" fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     let _ = arg0;
     syscall::debug_puts(b"  [term_srv] starting\n");
 
-    // 1. Wait for compositor.
-    let comp_port = loop {
-        if let Some(p) = syscall::ns_lookup(b"compositor") {
-            break p;
+    // 1. Wait for compositor.  ns_lookup_wait blocks until registration.
+    let comp_port = match syscall::ns_lookup_wait(b"compositor") {
+        Some(p) => p,
+        None => {
+            syscall::debug_puts(b"  [term_srv] ns_lookup_wait(compositor) FAILED\n");
+            syscall::exit(1);
         }
-        syscall::sleep_ms(10);
     };
 
     // 2. Wait for pty_srv.
-    let pty_port = loop {
-        if let Some(p) = syscall::ns_lookup(b"pty") {
-            break p;
+    let pty_port = match syscall::ns_lookup_wait(b"pty") {
+        Some(p) => p,
+        None => {
+            syscall::debug_puts(b"  [term_srv] ns_lookup_wait(pty) FAILED\n");
+            syscall::exit(1);
         }
-        syscall::sleep_ms(10);
     };
 
     let event_port = syscall::port_create();
@@ -812,6 +814,11 @@ pub extern "C" fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             term.dirty = false;
         }
 
+        // Render-loop pacing: ~1 kHz cadence so input drains and the
+        // dirty bitmap commits in roughly real time without busy-
+        // looping a CPU.  No blocking primitive fits — we'd want a
+        // proper event-driven recv on input + pty, but that needs
+        // multi-port wait which we don't expose yet (#119).
         syscall::sleep_ms(1);
     }
 }
