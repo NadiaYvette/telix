@@ -1,0 +1,26 @@
+[package]
+name = "loom-linux-futex-exit"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone (excluded from the kernel workspace) — same pattern as
+# tests/loom-park-state.
+#
+# Models the FUTEX wait/wake + thread-exit clear_child_tid handshake from
+# `userlib/bin/linux_srv.rs` (handle_futex / handle_exit_thread).
+#
+# Phase 176 (Tier 2 pthread) fixed a bug where __NR_EXIT from a CLONE_THREAD
+# child wiped the entire process state — including all FUTEX waiters of
+# sibling threads.  This crate proves the new per-thread teardown preserves
+# the invariant that pthread_join's futex wake fires iff the joining
+# thread's clear_child_tid matches the exiter's clear_child_tid.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }

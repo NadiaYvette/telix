@@ -1,0 +1,10 @@
+# Hard-wire `--cfg loom` and override the parent .cargo/config's
+# kernel-target so loom's std-using deps build.  See sibling loom crates
+# for the rationale.
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = ["--cfg", "loom"]
+
+[unstable]
+build-std = []
+build-std-features = []

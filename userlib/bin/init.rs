@@ -6383,6 +6383,98 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     }
     }
 
+    // --- Phase 200: Tier-2 glibc pthread_create + pthread_join ---
+    //
+    // Real glibc, statically-PIE-linked, exercises clone(CLONE_VM|CLONE_THREAD|
+    // CLONE_SETTLS|...), set_tid_address per-thread, set_robust_list, FUTEX_WAIT
+    // for pthread_join, and TLS via FS-base.  Success = child returns 42 and
+    // pthread_join propagates it: process exit code 42.
+    //
+    // Placed adjacent to Phases 173-175 so it runs early (before Phase 172
+    // which can wedge under SMP).  Self-spawns linux_srv if not yet up.
+    if STEP_H_DEBUG_SKIP_SLOW_PHASES {
+        syscall::debug_puts(b"Phase 200 Tier-2 pthread: SKIPPED (STEP_H_DEBUG)\n");
+    } else {
+    syscall::debug_puts(b"  init: Phase 200 Tier-2 pthread...\n");
+    {
+        if syscall::ns_lookup(b"linux").is_none() {
+            let _ = syscall::spawn(b"linux_srv", 50);
+            for _ in 0..200 {
+                if syscall::ns_lookup(b"linux").is_some() { break; }
+                syscall::yield_now();
+            }
+        }
+        let linux_ok = syscall::ns_lookup(b"linux").is_some();
+        if linux_ok {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        static PATH: &[u8] = b"/glibc_pthread_hello\0";
+                        static A0:   &[u8] = b"glibc_pthread_hello\0";
+                        static E0:   &[u8] = b"PATH=/usr/bin\0";
+                        let argv: [u64; 2] = [A0.as_ptr() as u64, 0];
+                        let envp: [u64; 2] = [E0.as_ptr() as u64, 0];
+                        // Force the local arrays to materialize (avoid
+                        // compiler elision per project_xeyes_envp_compiler_elision).
+                        core::hint::black_box(&argv);
+                        core::hint::black_box(&envp);
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => _,
+                            in("rdi") PATH.as_ptr() as u64,
+                            in("rsi") argv.as_ptr() as u64,
+                            in("rdx") envp.as_ptr() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 96u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
+                if exit_code == 42 {
+                    syscall::debug_puts(b"Phase 200 Tier-2 pthread: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 200 Tier-2 pthread: FAILED (timeout - likely futex/exit deadlock)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 200 Tier-2 pthread: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 200 Tier-2 pthread: SKIPPED (no linux)\n");
+        }
+    }
+    }
+
     // --- Phase 176: swap stress (memory pressure + fork + data integrity) ---
     //
     // Allocates a large anonymous region, writes a pattern to every u64,

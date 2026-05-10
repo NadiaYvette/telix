@@ -7,4 +7,5 @@ exclude = [
     "tests/loom-turnstile",
     "tests/loom-turnstile-slab",
     "tests/loom-runqueue",
+    "tests/loom-linux-futex-exit",
 ]

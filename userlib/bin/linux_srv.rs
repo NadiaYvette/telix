@@ -615,6 +615,11 @@ struct ProcessState {
     // address space. Used so that syscalls (esp. futex wake) from any thread
     // of the process resolve to the same pi, sharing futex table keys.
     thread_ports: [u64; 8],
+    // Phase 176 (Tier 2 pthread): per-thread clear_child_tid pointer. glibc's
+    // pthread_create issues set_tid_address from each new thread; the
+    // process-wide `clear_child_tid` field above is the leader's only.
+    // Index parallels `thread_ports`. 0 means "not set / inactive".
+    thread_clear_child_tid: [usize; 8],
 }
 
 impl ProcessState {
@@ -638,6 +643,7 @@ impl ProcessState {
             sig_altstack_size: 0,
             sig_altstack_flags: 0,
             thread_ports: [0u64; 8],
+            thread_clear_child_tid: [0usize; 8],
         }
     }
 }
@@ -6923,30 +6929,122 @@ fn handle_arch_prctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 /// Handle Linux set_tid_address(tidptr).
 /// Stores tidptr for CLONE_CHILD_CLEARTID futex wake on thread exit.
 /// Returns the caller's "tid" (we use the port_id).
+///
+/// Phase 176 (Tier 2): glibc's pthread_create runs set_tid_address from each
+/// new thread.  Record per-thread tidptr in `thread_clear_child_tid[]` for
+/// threads, and `clear_child_tid` for the process leader.  Without this,
+/// every thread's set_tid_address clobbers the leader's, so on
+/// pthread_join's futex_wait we'd target the wrong address.
 fn handle_set_tid_address(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let tidptr = args[0] as usize;
-    unsafe { PROC_TABLE[pi].clear_child_tid = tidptr; }
+    unsafe {
+        if PROC_TABLE[pi].port == caller_port {
+            PROC_TABLE[pi].clear_child_tid = tidptr;
+        } else {
+            // Thread caller — find its slot.
+            for t in 0..PROC_TABLE[pi].thread_ports.len() {
+                if PROC_TABLE[pi].thread_ports[t] == caller_port {
+                    PROC_TABLE[pi].thread_clear_child_tid[t] = tidptr;
+                    break;
+                }
+            }
+        }
+    }
     caller_port
 }
 
-/// Handle Linux exit(code) or exit_group(code).
-fn handle_exit(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
-    let _code = args[0];
+/// Handle Linux exit(code) — thread-local exit.
+///
+/// Phase 176 (Tier 2 pthread): a CLONE_THREAD child calling __NR_EXIT must
+/// kill ONLY itself, leaving the process intact for sibling threads and the
+/// leader.  This is what pthread_exit / thread_main-return does under glibc.
+/// Previously linux_srv treated __NR_EXIT exactly like __NR_EXIT_GROUP — it
+/// wiped the entire `PROC_TABLE[pi]`, closed all FDs of every thread, and
+/// cancelled all futex waiters — so as soon as any pthread terminated the
+/// main thread would lose its FD table and pthread_join would wedge.
+///
+/// If the caller is the process leader, fall through to handle_exit_group.
+fn handle_exit_thread(pi: usize, caller_port: u64, _args: &[u64; 6]) -> u64 {
     unsafe {
-        // CLONE_CHILD_CLEARTID: write 0 to clear_child_tid and futex-wake one waiter.
+        if PROC_TABLE[pi].port == caller_port {
+            // Leader calling __NR_EXIT — treat as exit_group for compatibility
+            // with single-threaded callers (no live thread_ports survive when
+            // the leader exits).
+            return handle_exit_group(pi, caller_port, _args);
+        }
+        // Find this thread's slot.
+        let mut tslot: Option<usize> = None;
+        for t in 0..PROC_TABLE[pi].thread_ports.len() {
+            if PROC_TABLE[pi].thread_ports[t] == caller_port {
+                tslot = Some(t);
+                break;
+            }
+        }
+        // CLONE_CHILD_CLEARTID for THIS thread: clear its tidptr and wake one
+        // futex waiter on that address.  This is exactly what glibc's
+        // pthread_join is parked on.
+        if let Some(t) = tslot {
+            let ctid = PROC_TABLE[pi].thread_clear_child_tid[t];
+            if ctid != 0 {
+                let zero = 0u32.to_ne_bytes();
+                syscall::personality_copy_out(caller_port, ctid, &zero);
+                for i in 0..MAX_FUTEX_WAITERS {
+                    if FUTEX_TABLE[i].active && FUTEX_TABLE[i].uaddr == ctid as u64
+                        && FUTEX_TABLE[i].pi == pi
+                    {
+                        syscall::personality_reply(FUTEX_TABLE[i].caller_port, 0);
+                        FUTEX_TABLE[i].active = false;
+                        break;
+                    }
+                }
+            }
+            // Drop the thread slot.
+            PROC_TABLE[pi].thread_ports[t] = 0;
+            PROC_TABLE[pi].thread_clear_child_tid[t] = 0;
+        }
+        // Cancel only THIS thread's pending futex waiters (if any).
+        for i in 0..MAX_FUTEX_WAITERS {
+            if FUTEX_TABLE[i].active
+                && FUTEX_TABLE[i].pi == pi
+                && FUTEX_TABLE[i].caller_port == caller_port
+            {
+                FUTEX_TABLE[i].active = false;
+            }
+        }
+        // Do NOT touch FDs, signal handlers, or sibling thread state.
+    }
+    syscall::kill(caller_port);
+    0
+}
+
+/// Handle Linux exit_group(code) — process-wide exit.  Tears down the entire
+/// PROC_TABLE entry plus all sibling threads.
+fn handle_exit_group(pi: usize, caller_port: u64, _args: &[u64; 6]) -> u64 {
+    unsafe {
+        // CLONE_CHILD_CLEARTID for the leader.
         let ctid = PROC_TABLE[pi].clear_child_tid;
         if ctid != 0 {
             let zero = 0u32.to_ne_bytes();
             syscall::personality_copy_out(caller_port, ctid, &zero);
-            // Wake one futex waiter on this address.
             for i in 0..MAX_FUTEX_WAITERS {
-                if FUTEX_TABLE[i].active && FUTEX_TABLE[i].uaddr == ctid as u64 && FUTEX_TABLE[i].pi == pi {
+                if FUTEX_TABLE[i].active && FUTEX_TABLE[i].uaddr == ctid as u64
+                    && FUTEX_TABLE[i].pi == pi
+                {
                     syscall::personality_reply(FUTEX_TABLE[i].caller_port, 0);
                     FUTEX_TABLE[i].active = false;
                     break;
                 }
             }
             PROC_TABLE[pi].clear_child_tid = 0;
+        }
+        // Kill any still-living sibling threads.
+        for t in 0..PROC_TABLE[pi].thread_ports.len() {
+            let tp = PROC_TABLE[pi].thread_ports[t];
+            if tp != 0 && tp != caller_port {
+                syscall::kill(tp);
+            }
+            PROC_TABLE[pi].thread_ports[t] = 0;
+            PROC_TABLE[pi].thread_clear_child_tid[t] = 0;
         }
         // Close all open FDs for this process.
         for i in 3..MAX_FDS {
@@ -12137,9 +12235,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_BRK => handle_brk(pi, caller_port, &msg.data),
             __NR_ARCH_PRCTL => handle_arch_prctl(pi, caller_port, &msg.data),
             __NR_SET_TID_ADDRESS => handle_set_tid_address(pi, caller_port, &msg.data),
-            __NR_EXIT | __NR_EXIT_GROUP => {
-                handle_exit(pi, caller_port, &msg.data);
-                continue; // Don't reply — task is dead.
+            __NR_EXIT => {
+                // Phase 176 (Tier 2 pthread): per-thread exit — preserve
+                // sibling threads and process FDs.
+                handle_exit_thread(pi, caller_port, &msg.data);
+                continue; // Don't reply — caller thread is dead.
+            }
+            __NR_EXIT_GROUP => {
+                handle_exit_group(pi, caller_port, &msg.data);
+                continue; // Don't reply — entire process is dead.
             }
             __NR_GETPID | __NR_GETTID | __NR_GETUID | __NR_GETEUID
             | __NR_GETGID | __NR_GETEGID => handle_getid(linux_nr, caller_port),
