@@ -1269,13 +1269,16 @@ impl EthDev {
                     dst_ipv4,
                     dst_prefix_len,
                 };
-                let _ = syscall::send_nb_4(
+                let rc = syscall::send_nb_4(
                     reply_port,
                     ETH_SUBSCRIBE_OK,
                     i as u64,
                     rx_va as u64,
                     0, 0,
                 );
+                syscall::debug_puts(b"  [eth_srv] subscribe send_nb_4 rc=");
+                print_num(rc);
+                syscall::debug_puts(b"\n");
                 return;
             }
         }
@@ -1500,15 +1503,16 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(port as u64);
     syscall::debug_puts(b"\n");
 
-    // Poll-based server loop.
+    // Poll-based server loop.  IPC is polled BEFORE RX so control-plane
+    // messages (NETIF_REGISTER, ETH_SUBSCRIBE, NETIF_XMIT) don't queue
+    // behind data-plane RX work under heavy traffic.  Pair-boot
+    // (#116) showed 2-second handshake timeouts firing while the
+    // SUBSCRIBE message was still pending in our queue because each
+    // loop iteration only processed one IPC after one RX.  With IPC
+    // first, a control message is acknowledged within microseconds
+    // even when the netdev RX queue is full.
     loop {
-        // 1. Poll RX.
-        if let Some(frame_len) = dev.poll_rx() {
-            dev.handle_rx_packet(frame_len);
-            dev.post_rx();
-        }
-
-        // 2. Poll IPC.
+        // 1. Poll IPC (was 2 — flipped 2026-05-10 for #116).
         if let Some(msg) = syscall::recv_nb_msg(port) {
             match msg.tag {
                 // --- Netif protocol ---
@@ -1524,9 +1528,13 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     let dst_ipv4 = msg.data[1] as u32;
                     let dst_prefix_len = (msg.data[1] >> 32) as u8;
                     let reply_port = msg.data[2];
+                    syscall::debug_puts(b"  [eth_srv] SUBSCRIBE recv: reply_port=");
+                    print_num(reply_port);
+                    syscall::debug_puts(b"\n");
                     dev.subscribe(
                         ethertype_filter, flags, dst_ipv4, dst_prefix_len, reply_port,
                     );
+                    syscall::debug_puts(b"  [eth_srv] SUBSCRIBE replied\n");
                 }
                 ETH_UNSUBSCRIBE => {
                     let sub_id = msg.data[0] as usize;
@@ -1573,6 +1581,12 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 }
                 _ => {}
             }
+        }
+
+        // 2. Poll RX (was 1 — flipped 2026-05-10 for #116).
+        if let Some(frame_len) = dev.poll_rx() {
+            dev.handle_rx_packet(frame_len);
+            dev.post_rx();
         }
 
         // 3. Tick timeouts.

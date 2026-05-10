@@ -564,10 +564,15 @@ fn try_subscribe_to_eth(my_port: u64) {
         my_port,
         0,
     );
-    // Wait briefly for ETH_SUBSCRIBE_OK on our service port.
-    // (Recv on the service port — we registered my_port as our reply
-    // address.  Same loop later receives ETH_FRAME notifications.)
-    let resp = syscall::recv_msg_timeout(my_port, 2_000_000);
+    // Wait for ETH_SUBSCRIBE_OK on our service port.  Bumped to 10s
+    // because under pair-boot conditions eth_srv's IPC queue can be
+    // backlogged behind NETIF_XMIT/handle_rx_packet work — observed
+    // 2s timeout firing while the subscribe message was still pending
+    // in eth_srv's queue (instance B Phase 5k, 2026-05-10).  10s gives
+    // headroom; the proper architectural fix is to make eth_srv
+    // drain IPC before poll_rx so control-plane messages don't queue
+    // behind data-plane traffic.
+    let resp = syscall::recv_msg_timeout(my_port, 10_000_000);
     let (_sub_id, eth_rx_va) = match resp {
         Some(m) if m.tag == ETH_SUBSCRIBE_OK => (m.data[0], m.data[1] as usize),
         _ => {
