@@ -516,40 +516,55 @@ impl BlkClient {
 
     /// Read `len` bytes at byte offset `off` (relative to partition start) into `out`.
     /// `out` must be <= 512 bytes. Only reads from the sector containing `off`.
+    ///
+    /// Step H robustness: retries up to BLK_RETRIES on a `recv_match` timeout
+    /// (blk_srv slow under boot-time load).  Each retry issues a fresh nonce
+    /// so we don't accidentally pick up the late reply of the previous
+    /// attempt.  Total wall-clock budget per retry ≈ 5 s (recv_msg_timeout)
+    /// + 1 ms (yield).  Reduces "file too short" cascade in linux_srv mmap
+    /// fill (project_io_read_csum_verified.md) — surfacing partial reads as
+    /// FS_ERROR was the root cause of the libxcvt cannot-read-file-data
+    /// failure under concurrent boot pressure.
     fn read_bytes(&self, off: u64, out: &mut [u8]) -> bool {
         let abs_off = self.partition_offset + off;
         let sector = abs_off / 512;
         let offset_in_sector = (abs_off % 512) as usize;
 
-        let nonce = self.next_nonce();
-        let d2 = 512u64 | ((self.reply_port as u64) << 32);
-        syscall::send(
-            self.blk_port,
-            IO_READ,
-            nonce,
-            sector * 512,
-            d2,
-            self.grant_va as u64,
-        );
+        const BLK_RETRIES: u32 = 3;
+        for attempt in 0..BLK_RETRIES {
+            let nonce = self.next_nonce();
+            let d2 = 512u64 | ((self.reply_port as u64) << 32);
+            syscall::send(
+                self.blk_port,
+                IO_READ,
+                nonce,
+                sector * 512,
+                d2,
+                self.grant_va as u64,
+            );
 
-        if let Some(rr) = self.recv_match(nonce) {
-            if rr.tag == IO_READ_OK && rr.data[0] == 512 {
-                let copy_len = out.len().min(512 - offset_in_sector);
-                let src = (self.scratch_va + offset_in_sector) as *const u8;
-                let dst = out.as_mut_ptr();
-                unsafe {
-                    for i in 0..copy_len {
-                        let b = core::ptr::read_volatile(src.add(i));
-                        core::ptr::write_volatile(dst.add(i), b);
+            if let Some(rr) = self.recv_match(nonce) {
+                if rr.tag == IO_READ_OK && rr.data[0] == 512 {
+                    let copy_len = out.len().min(512 - offset_in_sector);
+                    let src = (self.scratch_va + offset_in_sector) as *const u8;
+                    let dst = out.as_mut_ptr();
+                    unsafe {
+                        for i in 0..copy_len {
+                            let b = core::ptr::read_volatile(src.add(i));
+                            core::ptr::write_volatile(dst.add(i), b);
+                        }
                     }
+                    return true;
                 }
-                true
-            } else {
-                false
+                // IO_ERROR or short read: don't retry — it's a real error.
+                return false;
             }
-        } else {
-            false
+            // recv_match timed out: blk_srv backpressure.  Yield and retry.
+            if attempt + 1 < BLK_RETRIES {
+                syscall::yield_now();
+            }
         }
+        false
     }
 
     /// Read a full block (block_size bytes) into memory at `dest`.
@@ -573,41 +588,52 @@ impl BlkClient {
         // so issue one IO_READ for block sizes ≤ 4096; only chunk for larger
         // ext4 blocks (8 KiB / 16 KiB / 32 KiB / 64 KiB).
         const MAX_BATCH: usize = 4096;
+        // Step H robustness: see read_bytes for retry rationale.
+        const BLK_RETRIES: u32 = 3;
         let mut consumed = 0usize;
         while consumed < bs {
             let chunk = (bs - consumed).min(MAX_BATCH);
-
-            let nonce = self.next_nonce();
             let chunk_byte = abs_off + consumed as u64;
-            let d2 = (chunk as u64) | ((self.reply_port as u64) << 32);
-            syscall::send(
-                self.blk_port,
-                IO_READ,
-                nonce,
-                chunk_byte,
-                d2,
-                self.grant_va as u64,
-            );
 
-            let ok = if let Some(rr) = self.recv_match(nonce) {
-                if rr.tag == IO_READ_OK && rr.data[0] as usize == chunk {
-                    let src = self.scratch_va as *const u8;
-                    let dst = (dest + consumed) as *mut u8;
-                    unsafe {
-                        for i in 0..chunk {
-                            let b = core::ptr::read_volatile(src.add(i));
-                            core::ptr::write_volatile(dst.add(i), b);
+            let mut chunk_ok = false;
+            'attempt: for attempt in 0..BLK_RETRIES {
+                let nonce = self.next_nonce();
+                let d2 = (chunk as u64) | ((self.reply_port as u64) << 32);
+                syscall::send(
+                    self.blk_port,
+                    IO_READ,
+                    nonce,
+                    chunk_byte,
+                    d2,
+                    self.grant_va as u64,
+                );
+
+                match self.recv_match(nonce) {
+                    Some(rr) if rr.tag == IO_READ_OK && rr.data[0] as usize == chunk => {
+                        let src = self.scratch_va as *const u8;
+                        let dst = (dest + consumed) as *mut u8;
+                        unsafe {
+                            for i in 0..chunk {
+                                let b = core::ptr::read_volatile(src.add(i));
+                                core::ptr::write_volatile(dst.add(i), b);
+                            }
+                        }
+                        chunk_ok = true;
+                        break 'attempt;
+                    }
+                    Some(_) => {
+                        // IO_ERROR or short read — real error, no retry.
+                        return false;
+                    }
+                    None => {
+                        // recv_match timeout: blk_srv backpressure.  Retry.
+                        if attempt + 1 < BLK_RETRIES {
+                            syscall::yield_now();
                         }
                     }
-                    true
-                } else {
-                    false
                 }
-            } else {
-                false
-            };
-
-            if !ok {
+            }
+            if !chunk_ok {
                 return false;
             }
             consumed += chunk;

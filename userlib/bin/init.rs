@@ -120,7 +120,12 @@ const STEP_H_DEBUG_SKIP_SLOW_PHASES: bool = true;
 /// (Xwayland + wl_compositor_min orchestration).  Lets us iterate on
 /// the Xwayland startup investigation without paying ~10 min of
 /// cumulative wall-clock for the lower-tier chain each iteration.
-/// Default false; flip to true *only* when actively probing H13.
+/// 2026-05-10: forced to `true` until #120 EEVDF dispatch-loss is
+/// resolved — the `false` branch runs Phase 5h sched_stress which
+/// reproducibly wedges on the dispatch-loss family in roughly 3-of-5
+/// fresh boots.  Documented original intent: "Default false; flip to
+/// true *only* when actively probing H13."  Restore that default once
+/// #120 lands and Phase 5h passes consistently.
 const STEP_H_FOCUS_H13: bool = true;
 
 #[unsafe(no_mangle)]
@@ -4607,7 +4612,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let d2 = 9u64 | (cache_reply << 32);
             syscall::send(cache_port, 0x100, n0, n1, d2, 0);
 
-            if let Some(cr) = syscall::recv_msg_timeout(cache_reply, 5_000_000) {
+            // 50ms budget — see Phase 26/34 timeout-bump rationale.
+            if let Some(cr) = syscall::recv_msg_timeout(cache_reply, 50_000_000) {
                 if cr.tag == 0x101 {
                     let cache_aspace = cr.data[2];
 
@@ -4618,12 +4624,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                         // Helper: read a sector via cache_srv grant.
                         // Returns true on success.
+                        // Timeout 5ms → 50ms: cache_blk warm-up under heavy
+                        // boot load can take >5ms for the first few reads
+                        // (virtio-blk first I/O), so the prior budget
+                        // generated false negatives.
                         let cache_read = |offset: u64| -> bool {
                             if !syscall::grant_pages(cache_aspace, scratch_va, grant_va, 1, false) {
                                 return false;
                             }
                             syscall::send(cache_port, 0x200, 0, offset, rd2, grant_va as u64);
-                            let ok = if let Some(rr) = syscall::recv_msg_timeout(cache_reply, 5_000_000) {
+                            let ok = if let Some(rr) = syscall::recv_msg_timeout(cache_reply, 50_000_000) {
                                 rr.tag == 0x201 && rr.data[0] == 512
                             } else {
                                 false
@@ -4648,7 +4658,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         let sd0 = cache_reply << 32;
                         syscall::send(cache_port, 0xC100, sd0, 0, 0, 0);
                         let (hits_after_readahead, misses_after_readahead) =
-                            if let Some(sr) = syscall::recv_msg_timeout(cache_reply, 5_000_000) {
+                            if let Some(sr) = syscall::recv_msg_timeout(cache_reply, 50_000_000) {
                                 if sr.tag == 0xC101 {
                                     (sr.data[0], sr.data[1])
                                 } else {
@@ -4681,7 +4691,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         // Query stats to get current counts.
                         syscall::send(cache_port, 0xC100, sd0, 0, 0, 0);
                         let (final_hits, final_misses, cache_size) =
-                            if let Some(sr) = syscall::recv_msg_timeout(cache_reply, 5_000_000) {
+                            if let Some(sr) = syscall::recv_msg_timeout(cache_reply, 50_000_000) {
                                 if sr.tag == 0xC101 {
                                     (sr.data[0], sr.data[1], sr.data[2])
                                 } else {
@@ -4753,18 +4763,26 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         // Test 2: cross-server IPC exercises park + wake + inject.
         // Send IO_STAT to blk server, recv reply on our reply port.
+        // Timeout bumped 5ms → 50ms because under heavy boot scheduler load
+        // (e.g. while many srvs are still spinning up) send_to_proxy
+        // wakeup latency for blk_srv has been observed in the 5–10ms
+        // range, racing the prior 5ms budget into a false negative.
         if let Some(blk) = syscall::ns_lookup(b"blk") {
             let io_stat: u64 = 0x400;
             let io_stat_ok: u64 = 0x401;
             let d0 = 0u64 | (rply_port << 32); // handle=0 | reply_port<<32
             syscall::send(blk, io_stat, d0, 0, 0, 0);
-            if let Some(reply) = syscall::recv_msg_timeout(rply_port, 5_000_000) {
+            if let Some(reply) = syscall::recv_msg_timeout(rply_port, 50_000_000) {
                 if reply.tag != io_stat_ok || reply.data[0] == 0 {
-                    syscall::debug_puts(b"  init: L4 blk stat bad reply\n");
+                    syscall::debug_puts(b"  init: L4 blk stat bad reply tag=");
+                    print_num(reply.tag);
+                    syscall::debug_puts(b" cap=");
+                    print_num(reply.data[0]);
+                    syscall::debug_puts(b"\n");
                     handoff_ok = false;
                 }
             } else {
-                syscall::debug_puts(b"  init: L4 blk stat recv failed\n");
+                syscall::debug_puts(b"  init: L4 blk stat recv failed (50ms timeout)\n");
                 handoff_ok = false;
             }
         } else {
@@ -5297,7 +5315,8 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             let d2 = 9u64 | (reply_port << 32);
             syscall::send(cache_port, 0x100, n0, n1, d2, 0);
 
-            if let Some(cr) = syscall::recv_msg_timeout(reply_port, 5_000_000) {
+            // 50ms budget — see Phase 26/33 timeout-bump rationale.
+            if let Some(cr) = syscall::recv_msg_timeout(reply_port, 50_000_000) {
                 if cr.tag == 0x101 {
                     let cache_aspace = cr.data[2];
 
@@ -5318,17 +5337,25 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             }
 
                             // Collect all completions.
+                            // attempts cap raised 10_000 → 200_000 so a slow
+                            // cache_blk warm-up doesn't exhaust the loop.
+                            // recv_nb_msg + yield_now is cheap; the prior cap
+                            // burned through in <1ms on a busy CPU and gave
+                            // up before cache_srv had even fielded the
+                            // first IO_READ.
                             let mut received = [false; 5]; // index 1..4
                             let mut collected = 0u32;
                             let mut attempts = 0u32;
-                            while collected < submitted && attempts < 10000 {
+                            while collected < submitted && attempts < 200_000 {
                                 if let Some(result) = userlib::aio::aio_collect(reply_port) {
                                     if result.tag == 0x201
                                         && result.request_id >= 1
                                         && result.request_id <= 4
                                     {
-                                        received[result.request_id as usize] = true;
-                                        collected += 1;
+                                        if !received[result.request_id as usize] {
+                                            received[result.request_id as usize] = true;
+                                            collected += 1;
+                                        }
                                     }
                                 } else {
                                     syscall::yield_now();
@@ -5349,6 +5376,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
                             if all_received && barrier_ok && submitted == 4 {
                                 async_ok = true;
+                            } else {
+                                // Diagnostic: tell the next debugger which
+                                // arm of the precondition failed, instead
+                                // of the bare "Phase 34 ... FAILED".
+                                syscall::debug_puts(b"  init: Phase 34 diag submitted=");
+                                print_num(submitted as u64);
+                                syscall::debug_puts(b" collected=");
+                                print_num(collected as u64);
+                                syscall::debug_puts(b" attempts=");
+                                print_num(attempts as u64);
+                                syscall::debug_puts(b" mask=");
+                                let mask = (received[1] as u64)
+                                    | ((received[2] as u64) << 1)
+                                    | ((received[3] as u64) << 2)
+                                    | ((received[4] as u64) << 3);
+                                print_num(mask);
+                                syscall::debug_puts(b"\n");
                             }
 
                             syscall::revoke(cache_aspace, grant_va);

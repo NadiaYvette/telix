@@ -356,32 +356,47 @@ impl BlkClient {
     }
 
     fn read_sector(&self, sector: u64, out: &mut [u8; 512]) -> bool {
-        let nonce = self.next_nonce();
+        // Step H robustness: retry IO_READ on recv_match timeout.  cache_srv
+        // sits between fs_srv (ext_srv et al.) and blk_srv; under boot-time
+        // load blk_srv recv backpressure caused a single 5 s timeout to
+        // propagate as a cache-miss IO_ERROR all the way up to linux_srv
+        // mmap fill, leaving anon-zero gaps in the loaded ELF
+        // (project_io_read_csum_verified.md).  3 attempts × 5 s recv
+        // timeout = 15 s total budget — well below the kernel's 30 s
+        // CALL_REPLY_TIMEOUT.
+        const BLK_RETRIES: u32 = 3;
         let offset = sector * 512;
-        let d2 = 512u64 | ((self.reply_port as u64) << 32);
-        syscall::send(self.blk_port, IO_READ, nonce, offset, d2, BLK_GRANT_VA as u64);
+        for attempt in 0..BLK_RETRIES {
+            let nonce = self.next_nonce();
+            let d2 = 512u64 | ((self.reply_port as u64) << 32);
+            syscall::send(self.blk_port, IO_READ, nonce, offset, d2, BLK_GRANT_VA as u64);
 
-        if let Some(rr) = self.recv_match(nonce) {
-            if rr.tag == IO_READ_OK && rr.data[0] == 512 {
-                // Volatile u64 loop — empirically required (compiler_fence
-                // alone is NOT sufficient; LLVM still elides reads from the
-                // grant page).  u64 stride is 8× fewer iterations than the
-                // byte loop while still producing real load/store insns.
-                let src = self.scratch_va as *const u64;
-                let dst = out.as_mut_ptr() as *mut u64;
-                unsafe {
-                    for i in 0..64 {
-                        let v = core::ptr::read_volatile(src.add(i));
-                        core::ptr::write_volatile(dst.add(i), v);
+            match self.recv_match(nonce) {
+                Some(rr) if rr.tag == IO_READ_OK && rr.data[0] == 512 => {
+                    // Volatile u64 loop — empirically required (compiler_fence
+                    // alone is NOT sufficient; LLVM still elides reads from the
+                    // grant page).  u64 stride is 8× fewer iterations than the
+                    // byte loop while still producing real load/store insns.
+                    let src = self.scratch_va as *const u64;
+                    let dst = out.as_mut_ptr() as *mut u64;
+                    unsafe {
+                        for i in 0..64 {
+                            let v = core::ptr::read_volatile(src.add(i));
+                            core::ptr::write_volatile(dst.add(i), v);
+                        }
+                    }
+                    return true;
+                }
+                Some(_) => return false, // real error, no retry
+                None => {
+                    // recv_match timeout — blk_srv backpressure.  Yield + retry.
+                    if attempt + 1 < BLK_RETRIES {
+                        syscall::yield_now();
                     }
                 }
-                true
-            } else {
-                false
             }
-        } else {
-            false
         }
+        false
     }
 
     fn write_sector(&self, sector: u64, data: &[u8; 512]) -> bool {
