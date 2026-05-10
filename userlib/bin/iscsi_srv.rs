@@ -830,6 +830,34 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     // arg0 = target IP (big-endian u32), or 0 for default (10.0.2.2).
     let target_ip = if arg0 != 0 { arg0 as u32 } else { TARGET_IP_DEFAULT };
 
+    // CRITICAL ORDERING (task #129):  Create the service port and
+    // ns_register("iscsi", port) BEFORE attempting any TCP/SCSI bringup.
+    // The previous shape registered LAST -- after TCP connect + iSCSI
+    // login + READ_CAPACITY all succeeded -- and on early exit (the
+    // common case in test boots that have no iSCSI target reachable on
+    // 10.0.2.2:3260) iscsi_srv silently spun without registering.
+    // init.rs Phase 181 calls `ns_lookup_wait("iscsi")` which then
+    // blocks forever, cascading to make Phase 51 (VFS_OPEN of
+    // /mnt/HELLO.TXT, much later in init) unreachable.
+    //
+    // Mirrors the canonical fix shape from commit a5e4b00 (nat_srv:
+    // defer ns_register until bringup completes), but inverted: there
+    // bringup HAD to come first so the recv_msg_timeout in
+    // try_subscribe_to_eth wasn't fed Phase-5k traffic.  Here, bringup
+    // talks to tcp4_srv on a DIFFERENT port (sess.reply_port) so the
+    // service port stays empty during bringup regardless -- there is
+    // no recv_msg_timeout race to lose, and registering early is
+    // strictly better.
+    //
+    // The main loop below tolerates !sess.logged_in: IO_CONNECT replies
+    // with capacity=0 (which Phase 181 logs as "PASSED (zero-cap)" --
+    // the no-target healthy outcome), IO_READ/IO_WRITE reply IO_ERROR.
+    let port = syscall::port_create();
+    if !syscall::ns_register(b"iscsi", port) {
+        syscall::debug_puts(b"  [iscsi_srv] ns_register FAIL\n");
+        syscall::exit(1);
+    }
+
     // Look up tcp4_srv (registered as "net").
     let tcp_port = loop {
         match syscall::ns_lookup(b"net") {
@@ -849,60 +877,64 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(TARGET_PORT as u64);
     syscall::debug_puts(b"\n");
 
-    // Establish TCP connection to target.
-    // Use same reply_port for connect and all subsequent TCP ops (matches init.rs pattern).
+    // Establish TCP connection to target.  Use sess.reply_port (NOT
+    // the service port) for connect and all subsequent TCP ops so the
+    // service port stays drainable for IO_* messages from clients.
     let d0 = target_ip as u64;
     let d1 = (TARGET_PORT as u64) | ((sess.reply_port as u64) << 16);
     syscall::send(tcp_port, NET_TCP_CONNECT, d0, d1, 0, 0);
 
-    // Wait for connection (with timeout ��� blocking recv like init.rs Phase 19).
-    let mut connected = false;
+    // Wait for connection (with timeout). recv_msg_timeout on the
+    // PRIVATE reply_port -- service-port traffic is unaffected.
+    let mut bringup_ok = false;
     if let Some(m) = syscall::recv_msg_timeout(sess.reply_port, 5_000_000) {
         if m.tag == NET_TCP_CONNECTED {
             sess.conn_id = m.data[0];
             sess.connected = true;
-            connected = true;
             syscall::debug_puts(b"  [iscsi_srv] TCP connected, conn_id=");
             print_num(sess.conn_id);
             syscall::debug_puts(b"\n");
+
+            // iSCSI login + LUN bringup. Each step is best-effort:
+            // a failure leaves sess.{connected,logged_in} reflecting
+            // the last success and we fall through to the main loop,
+            // which replies IO_ERROR or IO_CONNECT_OK(zero-cap) per
+            // the message tag.
+            if iscsi_login(&mut sess) {
+                if !test_unit_ready(&mut sess) {
+                    syscall::debug_puts(b"  [iscsi_srv] TUR failed (retrying)\n");
+                    // Real-world delay: some iSCSI targets need ~tens
+                    // of ms between LUN-ready transitions.  Target-side
+                    // wallclock requirement -- no IPC primitive replaces
+                    // a real time elapse here (#119: category D).
+                    syscall::sleep_ms(100);
+                    test_unit_ready(&mut sess);
+                }
+                if read_capacity(&mut sess) {
+                    bringup_ok = true;
+                } else {
+                    syscall::debug_puts(b"  [iscsi_srv] capacity query failed\n");
+                }
+            } else {
+                syscall::debug_puts(b"  [iscsi_srv] login FAILED\n");
+            }
         } else {
             syscall::debug_puts(b"  [iscsi_srv] TCP connect rejected\n");
         }
-    }
-    if !connected {
+    } else {
         syscall::debug_puts(b"  [iscsi_srv] TCP connect FAILED (timeout)\n");
-        loop { syscall::yield_now(); }
     }
 
-    // Perform iSCSI login.
-    if !iscsi_login(&mut sess) {
-        syscall::debug_puts(b"  [iscsi_srv] login FAILED\n");
-        loop { syscall::yield_now(); }
+    if bringup_ok {
+        syscall::debug_puts(b"  [iscsi_srv] ready, serving block device\n");
+    } else {
+        syscall::debug_puts(b"  [iscsi_srv] ready (degraded -- no target)\n");
     }
 
-    // Issue TEST UNIT READY.
-    if !test_unit_ready(&mut sess) {
-        syscall::debug_puts(b"  [iscsi_srv] TUR failed (retrying)\n");
-        // Real-world delay: some iSCSI targets need ~tens of ms
-        // between LUN-ready transitions.  This is a target-side
-        // wallclock requirement — no blocking IPC primitive replaces
-        // a real time elapse here (#119: category D).
-        syscall::sleep_ms(100);
-        test_unit_ready(&mut sess);
-    }
-
-    // Read capacity.
-    if !read_capacity(&mut sess) {
-        syscall::debug_puts(b"  [iscsi_srv] capacity query failed\n");
-        loop { syscall::yield_now(); }
-    }
-
-    // Register with name server.
-    let port = syscall::port_create();
-    syscall::ns_register(b"iscsi", port);
-    syscall::debug_puts(b"  [iscsi_srv] ready, serving block device\n");
-
-    // Main service loop.
+    // Main service loop.  Runs whether or not bringup succeeded; in
+    // the degraded case sess.capacity_blocks==0 so IO_CONNECT/IO_STAT
+    // reply capacity=0 (Phase 181 reads as "PASSED (zero-cap)") and
+    // IO_READ/IO_WRITE reply IO_ERROR.
     loop {
         let msg = match syscall::recv_msg(port) {
             Some(m) => m,
@@ -915,8 +947,22 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let capacity = (sess.capacity_blocks as u64) * (sess.block_size as u64);
                 syscall::send(reply_port, IO_CONNECT_OK, 0, capacity, 0, 0);
             }
-            IO_READ => handle_io_read(&mut sess, &msg),
-            IO_WRITE => handle_io_write(&mut sess, &msg),
+            IO_READ => {
+                if sess.logged_in {
+                    handle_io_read(&mut sess, &msg);
+                } else {
+                    let reply_port = msg.data[2] >> 32;
+                    syscall::send(reply_port, IO_ERROR, 1, 0, 0, 0);
+                }
+            }
+            IO_WRITE => {
+                if sess.logged_in {
+                    handle_io_write(&mut sess, &msg);
+                } else {
+                    let reply_port = msg.data[2] >> 32;
+                    syscall::send(reply_port, IO_ERROR, 1, 0, 0, 0);
+                }
+            }
             IO_STAT => {
                 let reply_port = msg.data[0] >> 32;
                 let capacity = (sess.capacity_blocks as u64) * (sess.block_size as u64);
