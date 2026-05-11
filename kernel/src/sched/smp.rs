@@ -215,6 +215,24 @@ pub struct PerCpuData {
     /// never picks rescue-enqueued threads on CPU N specifically" — is
     /// still live.  Pure diagnostic; no concurrency-protocol meaning.
     pub rescue_stuck_pending_count: core::sync::atomic::AtomicU64,
+    /// #120 IPI-to-idle latency probe (#135).  Histogram of
+    /// (cas_ok_ts − pending_set_ns) ns deltas per CPU, bucketed by order
+    /// of magnitude.  Bumped in `dispatch_cas_ok` when the matching
+    /// `pending_set_ns` is non-zero.  Distribution tells whether the
+    /// residual oscillation on under-busy CPUs is concentrated in the
+    /// 10-100ms range (IPI-to-idle latency hypothesis) or spread evenly
+    /// (some other cause).
+    ///
+    /// Bucket boundaries (Δ ns):
+    ///   [0] <       1_000     (< 1 µs)
+    ///   [1] <      10_000     (< 10 µs)
+    ///   [2] <     100_000     (< 100 µs)
+    ///   [3] <   1_000_000     (< 1 ms)
+    ///   [4] <  10_000_000     (< 10 ms)
+    ///   [5] < 100_000_000     (< 100 ms)
+    ///   [6] < 1_000_000_000   (< 1 s)
+    ///   [7] >= 1_000_000_000  (≥ 1 s)
+    pub dispatch_latency_hist: [core::sync::atomic::AtomicU64; 8],
 }
 
 impl PerCpuData {
@@ -231,6 +249,16 @@ impl PerCpuData {
             dispatch_set_pending_count: core::sync::atomic::AtomicU64::new(0),
             dispatch_cas_ok_count: core::sync::atomic::AtomicU64::new(0),
             rescue_stuck_pending_count: core::sync::atomic::AtomicU64::new(0),
+            dispatch_latency_hist: [
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+            ],
         }
     }
 }
