@@ -83,6 +83,14 @@ impl Heap4 {
         self.len
     }
 
+    /// Current rotating scan-start origin (not yet wrapped mod len).
+    /// Used by #120 PENDING-STUCK-LOW diagnostics to confirm the pick
+    /// rotation is advancing on the CPU that holds a stuck thread.
+    #[inline]
+    pub fn scan_start_raw(&self) -> u32 {
+        self.scan_start
+    }
+
     /// Whether the heap is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -168,10 +176,20 @@ impl Heap4 {
         // visit different origins even when the heap is partially eligible.
         self.scan_start = self.scan_start.wrapping_add(1);
         if let Some(pos) = best_pos {
-            Some(self.remove(pos))
+            let (tid, key) = self.remove(pos);
+            super::scheduler::thread_ref(tid)
+                .picked_count
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Some((tid, key))
         } else {
             // No eligible thread — fall back to earliest deadline to avoid livelock.
-            self.pop_min()
+            let res = self.pop_min();
+            if let Some((tid, _)) = res {
+                super::scheduler::thread_ref(tid)
+                    .picked_count
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            res
         }
     }
 
@@ -261,7 +279,13 @@ impl Heap4 {
         // successive cosched picks visit different origins even when the
         // group is partially eligible.
         self.scan_start = self.scan_start.wrapping_add(1);
-        best_pos.map(|pos| self.remove(pos))
+        best_pos.map(|pos| {
+            let (tid, key) = self.remove(pos);
+            super::scheduler::thread_ref(tid)
+                .picked_count
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            (tid, key)
+        })
     }
 
     /// Update the key of the entry at `pos` to `new_key` (may increase or decrease).

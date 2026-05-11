@@ -6236,6 +6236,80 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                             );
                         }
                     }
+                    // #135 pick-blindness probe: locate which CPU's runqueue
+                    // actually holds the stuck thread, then dump that heap's
+                    // entries + scan_start.  rescue_stuck is attributed to
+                    // `last_cpu` but a thread woken via sleep_wake or
+                    // wake_parked_thread can be enqueued on a *different* CPU
+                    // (the wake's `target`).  If the locating CPU's heap shows
+                    // tid present alongside other entries but `scan_start`
+                    // isn't rotating through its position, we have direct
+                    // evidence of pick-rotation breaking down.
+                    {
+                        let hp = t.eevdf_heap_pos;
+                        if hp != super::heap::HEAP_POS_NONE {
+                            let ncpus = crate::sched::smp::num_cpus().min(8);
+                            let mut located_cpu: i32 = -1;
+                            let mut located_n: u32 = 0;
+                            let mut located_scan: u32 = 0;
+                            let mut located_entries: [(u32, u64, u64, u8); 8] =
+                                [(0, 0, 0, 0); 8];
+                            let mut located_entries_n: usize = 0;
+                            for c in 0..ncpus {
+                                if let Some(rq) = percpu_rq()[c].try_lock() {
+                                    if rq_contains_tid(&rq, tid as ThreadId) {
+                                        located_cpu = c as i32;
+                                        located_n = rq.eevdf_heap.len();
+                                        located_scan = rq.eevdf_heap.scan_start_raw();
+                                        rq.eevdf_heap.for_each_entry(|etid, ekey| {
+                                            if located_entries_n < 8 {
+                                                let tt = thread_ref(etid);
+                                                let vrt = tt.eevdf_vruntime;
+                                                let st = tt.state as u8;
+                                                located_entries[located_entries_n] =
+                                                    (etid, ekey, vrt, st);
+                                                located_entries_n += 1;
+                                            }
+                                        });
+                                        drop(rq);
+                                        break;
+                                    }
+                                    drop(rq);
+                                }
+                            }
+                            if located_cpu >= 0 {
+                                crate::println!(
+                                    "  PICK-LOCATE: stuck tid={} (heap_pos={}) in cpu={} eevdf_n={} scan_start={} (scan%n={}) picked_count={} enq_count={}",
+                                    tid, hp, located_cpu, located_n, located_scan,
+                                    if located_n > 0 {
+                                        located_scan % located_n
+                                    } else { 0 },
+                                    t.picked_count.load(Ordering::Relaxed),
+                                    t.enqueue_count.load(Ordering::Relaxed),
+                                );
+                                for i in 0..located_entries_n {
+                                    let (etid, ekey, evrt, est) = located_entries[i];
+                                    let marker = if etid == tid as u32 { "  <-- STUCK" } else { "" };
+                                    let etpick = thread_ref(etid).picked_count.load(Ordering::Relaxed);
+                                    let etenq = thread_ref(etid).enqueue_count.load(Ordering::Relaxed);
+                                    crate::println!(
+                                        "    HEAP[{}]: tid={} deadline={} vruntime={} state={} picked={} enq={}{}",
+                                        i, etid, ekey, evrt, est, etpick, etenq, marker
+                                    );
+                                }
+                            } else {
+                                crate::println!(
+                                    "  PICK-LOCATE: stuck tid={} (heap_pos={}) NOT FOUND in any cpu runqueue (locks contended or phantom)",
+                                    tid, hp
+                                );
+                            }
+                        } else {
+                            crate::println!(
+                                "  PICK-LOCATE: stuck tid={} eevdf_heap_pos=NONE (not in eevdf heap — check bitmap or just-removed)",
+                                tid
+                            );
+                        }
+                    }
                 }
             }
             let pending_age = if (tid as usize) < ORPHAN_AGE.len() {

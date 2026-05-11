@@ -157,6 +157,11 @@ pub struct Thread {
     /// "PENDING-STUCK-LOW" diagnostic that's independent of the 16s/30s
     /// rescue-and-CALL-TIMEOUT thresholds.
     pub pending_set_ns: core::sync::atomic::AtomicU64,
+    /// #135 pick-rotation probe: count of pick_eligible / pop_for_group
+    /// successful selections for this thread.  Compared to enqueue_count
+    /// in PICK-LOCATE dumps to reveal whether a stuck thread is being
+    /// scanned-but-skipped vs never-scanned vs picked-but-not-dispatched.
+    pub picked_count: core::sync::atomic::AtomicU64,
     // --- Personality forwarding ---
     /// Result value from personality server reply (written by SYS_PERSONALITY_REPLY).
     pub personality_result: core::sync::atomic::AtomicU64,
@@ -279,6 +284,7 @@ impl Thread {
             last_ready_ns: core::sync::atomic::AtomicU64::new(0),
             enqueue_count: core::sync::atomic::AtomicU64::new(0),
             pending_set_ns: core::sync::atomic::AtomicU64::new(0),
+            picked_count: core::sync::atomic::AtomicU64::new(0),
             personality_result: core::sync::atomic::AtomicU64::new(0),
             personality_frame_sp: 0,
             syscall_frame_sp: 0,
