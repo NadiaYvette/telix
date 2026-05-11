@@ -259,13 +259,15 @@ pub fn send_reschedule_ipi(target_cpu: u32) {
     // false if the hypervisor isn't ready or doesn't support PV
     // IPI; falling through to the native path then.
     if crate::arch::hypervisor::ops().send_reschedule_ipi(target_cpu) {
-        // KVM_HC_KICK_CPU belt-and-suspenders: if the target's vCPU is
-        // host-descheduled (likely under HLT after running out of
-        // local work), ask the host to bring it back even before the
-        // IPI is delivered.  Investigating #120 residual IPI-to-idle
-        // latency — under-busy CPUs have rescue_stuck rates 10-100x
-        // higher than busy ones.  No-op when PV_UNHALT isn't advertised.
-        crate::arch::hypervisor::ops().kick_cpu(target_cpu);
+        // NOTE: KVM_HC_KICK_CPU (kick_cpu) is intentionally NOT issued
+        // here.  Boot 91amfsq626 verified that the LAPIC IPI alone
+        // already provides wake-from-HLT semantics under KVM; pairing
+        // an additional KICK_CPU hypercall doubled the vmexit cost
+        // without reducing per-dispatch rescue_stuck rate (0.013% vs
+        // 0.017% baseline — within noise).  The kick_cpu primitive
+        // remains in HypervisorOps for targeted future use (e.g. PV
+        // spinlock paths where there's no IPI), but should not fire
+        // on every cross-CPU reschedule.
         return;
     }
     #[cfg(target_arch = "x86_64")]
