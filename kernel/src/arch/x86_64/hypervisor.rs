@@ -21,13 +21,15 @@ use crate::arch::hypervisor::{HypervisorKind, HypervisorOps, set_ops};
 const KVM_FEATURE_PV_SEND_IPI: u32 = 1 << 11;
 #[allow(dead_code)]
 const KVM_FEATURE_STEAL_TIME: u32 = 1 << 5;
-#[allow(dead_code)]
 const KVM_FEATURE_PV_UNHALT: u32 = 1 << 7;
 #[allow(dead_code)]
 const KVM_FEATURE_PV_SCHED_YIELD: u32 = 1 << 13;
 
 // KVM hypercall numbers (matches arch/x86/include/uapi/asm/kvm_para.h).
 const KVM_HC_SEND_IPI: u64 = 12;
+/// Wake target vCPU from HLT.  Paired with KVM_FEATURE_PV_UNHALT.
+/// Args: a0 = flags (0), a1 = target apicid.
+const KVM_HC_KICK_CPU: u64 = 5;
 
 // KVM model-specific registers (kvm_para.h).
 /// MSR for per-vCPU steal-time page address.  Write phys_addr | 1 to
@@ -100,6 +102,11 @@ const VENDOR_AMD: u8 = 2;
 
 static CPU_VENDOR: AtomicU8 = AtomicU8::new(VENDOR_UNKNOWN);
 static KVM_PV_SEND_IPI_ENABLED: AtomicBool = AtomicBool::new(false);
+/// PV wake-from-HLT (KVM_HC_KICK_CPU) available.  Used by `kick_cpu`
+/// to wake a vCPU whose physical CPU is host-descheduled, pairing
+/// with the reschedule IPI so cross-CPU wakes don't stall waiting
+/// for the host scheduler to bring the target vCPU back in.
+static KVM_PV_UNHALT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Run CPUID leaf `leaf` with `subleaf` 0; returns (eax, ebx, ecx, edx).
 /// LLVM reserves rbx so we can't bind it directly — capture EBX into a
@@ -253,6 +260,20 @@ impl HypervisorOps for KvmHypervisor {
         // failure and return false so the caller falls back.
         r < 256
     }
+
+    fn kick_cpu(&self, target_cpu: u32) -> bool {
+        if !KVM_PV_UNHALT_ENABLED.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Pure hint to the host: schedule `target_cpu`'s vCPU back if
+        // it's currently HALTed.  flags=0 (a0), apicid=target_cpu (a1).
+        // The hypercall returns 0 on success and is documented to be
+        // safe to issue against any apicid — the host validates.
+        unsafe {
+            kvm_hypercall(KVM_HC_KICK_CPU, 0, target_cpu as u64, 0, 0);
+        }
+        true
+    }
 }
 
 static KVM: KvmHypervisor = KvmHypervisor;
@@ -328,6 +349,12 @@ pub fn detect_and_install() {
             crate::println!("[hypervisor] KVM STEAL_TIME enabled");
         } else {
             crate::println!("[hypervisor] KVM STEAL_TIME not advertised");
+        }
+        if eax_kvm & KVM_FEATURE_PV_UNHALT != 0 {
+            KVM_PV_UNHALT_ENABLED.store(true, Ordering::Relaxed);
+            crate::println!("[hypervisor] KVM PV_UNHALT (KICK_CPU) enabled");
+        } else {
+            crate::println!("[hypervisor] KVM PV_UNHALT not advertised");
         }
     }
 

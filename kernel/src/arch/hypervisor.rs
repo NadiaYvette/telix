@@ -72,6 +72,18 @@ pub trait HypervisorOps: Sync {
     fn yield_to(&self, _target_cpu: u32) -> bool {
         false
     }
+
+    /// Ask the hypervisor to schedule `target_cpu`'s vCPU back to a
+    /// running state if it is currently host-descheduled (e.g. HALTed
+    /// waiting for work).  Pure hint; the hypervisor may ignore it.
+    /// Returns true if the hypercall was issued, false if the PV
+    /// wake-from-HLT primitive (KVM_HC_KICK_CPU / equivalent) is not
+    /// available.  Pair with `send_reschedule_ipi` when the target is
+    /// likely halted — the IPI causes the vmexit, the kick guarantees
+    /// the vCPU is scheduled to take it.
+    fn kick_cpu(&self, _target_cpu: u32) -> bool {
+        false
+    }
 }
 
 /// Default no-op implementation.  Used when no hypervisor is

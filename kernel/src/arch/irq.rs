@@ -259,6 +259,13 @@ pub fn send_reschedule_ipi(target_cpu: u32) {
     // false if the hypervisor isn't ready or doesn't support PV
     // IPI; falling through to the native path then.
     if crate::arch::hypervisor::ops().send_reschedule_ipi(target_cpu) {
+        // KVM_HC_KICK_CPU belt-and-suspenders: if the target's vCPU is
+        // host-descheduled (likely under HLT after running out of
+        // local work), ask the host to bring it back even before the
+        // IPI is delivered.  Investigating #120 residual IPI-to-idle
+        // latency — under-busy CPUs have rescue_stuck rates 10-100x
+        // higher than busy ones.  No-op when PV_UNHALT isn't advertised.
+        crate::arch::hypervisor::ops().kick_cpu(target_cpu);
         return;
     }
     #[cfg(target_arch = "x86_64")]
