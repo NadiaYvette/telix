@@ -73,6 +73,19 @@ int main(int argc, char **argv) {
         syscall(SYS_write, 1, e, sizeof(e) - 1);
         return 1;
     }
+    /* CRITICAL: Telix's mmap(MAP_ANONYMOUS) returns a VMA but does NOT
+     * populate the pages.  The first write would normally fault the
+     * page in — but for a child thread, an unhandled #PF on the new
+     * stack kills the thread silently (boot 91amfsq641: CR2=0x200db0030
+     * RIP=0x200001d5a tid=51).  Pre-touch every page from the parent
+     * (which has a working fault path) so the pages are guaranteed
+     * present when the child resumes execution on this stack. */
+    {
+        volatile char *p = (volatile char *)stack_base;
+        for (size_t i = 0; i < STACK_SIZE; i += 4096) {
+            p[i] = 0;
+        }
+    }
 
     struct clone_args args = {
         .flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND
@@ -89,15 +102,56 @@ int main(int argc, char **argv) {
         .cgroup = 0,
     };
 
-    long ret = syscall(SYS_clone3, &args, sizeof(args));
-    if (ret == 0) {
-        child_entry();
-    }
+    /* CRITICAL: clone3 + a child path written in C does NOT WORK.
+     * The compiler generates RBP/RSP-relative addressing based on
+     * main()'s frame layout, but the child runs on a NEW stack.
+     * Boot 91amfsq641 captured the bug: Unhandled #PF CR2=0x200db0030
+     * RIP=0x200001d5a — child writing 0x30 BEYOND its new RSP, killing
+     * itself silently.
+     *
+     * Standard fix: in the child path, jump immediately to inline asm
+     * that does the child's syscalls using ONLY registers, no stack
+     * access until the syscall instructions complete the thread's
+     * lifecycle.  The static `child_msg` lives in .rodata (shared
+     * via CLONE_VM with parent — guaranteed present). */
+    static const char child_msg[] = "[clone_child_w]\n";
+    long ret;
+    __asm__ volatile (
+        "mov %1, %%rdi\n"             /* arg0 = &args */
+        "mov %2, %%rsi\n"             /* arg1 = sizeof(args) */
+        "mov $435, %%rax\n"           /* SYS_clone3 */
+        "syscall\n"
+        "test %%rax, %%rax\n"
+        "jnz 2f\n"                    /* parent: jump out, ret in rax */
+        /* === CHILD PATH (pure asm, no stack reads) === */
+        /* write(1, child_msg, 16) — sizeof("[clone_child_w]\n") - 1 = 16 */
+        "mov %3, %%rsi\n"             /* buf = child_msg from input %3 */
+        "mov $1, %%rax\n"             /* SYS_write */
+        "mov $1, %%rdi\n"             /* fd = 1 */
+        "mov $16, %%rdx\n"            /* count = 16 */
+        "syscall\n"
+        /* exit(0) — terminates the thread; kernel does CLEARTID + FUTEX_WAKE */
+        "mov $60, %%rax\n"            /* SYS_exit */
+        "xor %%rdi, %%rdi\n"          /* status = 0 */
+        "syscall\n"
+        /* Should never reach here; if we do, halt-loop */
+        "1: hlt\n"
+        "jmp 1b\n"
+        "2:\n"
+        : "=a"(ret)
+        : "r"((long)(uintptr_t)&args),
+          "r"((long)sizeof(args)),
+          "r"((long)(uintptr_t)child_msg)
+        : "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+    );
     if (ret < 0) {
         const char e[] = "[clone_test] clone3 FAILED\n";
         syscall(SYS_write, 1, e, sizeof(e) - 1);
         return 2;
     }
+    /* Suppress unused warning for child_entry (kept for documentation). */
+    (void)child_entry;
+    (void)child_msg;
 
     {
         const char m2[] = "[clone_test] clone3 ok, waiting\n";
