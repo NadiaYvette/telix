@@ -7099,11 +7099,17 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
     // env-propagation hypothesis (now resolved).  Xwayland: premature
     // exit chase — Xwayland reports xw_exit=-9 within ~3s of fork
     // without ever binding /tmp/.X11-unix/X0; need the syscall trace
-    // to identify the last call before exit.  Logging fires from the
-    // dispatch loop (line ~11172/11652) for the new image's syscalls.
+    // to identify the last call before exit.  glibc_pthread_hello /
+    // pthread_test: Phase 200 Tier-2 wedge — task=39 (single tid)
+    // stuck in PENDING after execve, never reaches pthread_create.
+    // Logging fires from the dispatch loop (line ~11172/11652) for the
+    // new image's syscalls.
     unsafe {
-        let trace = matches!(lookup_name, b"xeyes" | b"Xwayland")
-            || matches!(name, b"/xeyes" | b"xeyes" | b"/Xwayland" | b"Xwayland");
+        let trace = matches!(lookup_name, b"xeyes" | b"Xwayland"
+                                       | b"glibc_pthread_hello" | b"pthread_test")
+            || matches!(name, b"/xeyes" | b"xeyes" | b"/Xwayland" | b"Xwayland"
+                            | b"/glibc_pthread_hello" | b"glibc_pthread_hello"
+                            | b"/pthread_test" | b"pthread_test");
         if trace {
             trace_pi_set(pi);
             syscall::debug_puts(b"  [trace] attach pi=");

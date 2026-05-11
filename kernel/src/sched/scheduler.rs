@@ -6337,20 +6337,35 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                             let mut located_entries_n: usize = 0;
                             for c in 0..ncpus {
                                 if let Some(rq) = percpu_rq()[c].try_lock() {
-                                    if rq_contains_tid(&rq, tid as ThreadId) {
+                                    // rq_contains_tid's heap_pos fast path
+                                    // returns true if the thread is in ANY
+                                    // CPU's heap (heap_pos is per-thread, not
+                                    // per-CPU).  For PICK-LOCATE we need to
+                                    // confirm the thread is in *this* CPU's
+                                    // heap — walk for_each_entry and capture
+                                    // its presence directly.
+                                    let mut here = false;
+                                    let mut tmp_entries: [(u32, u64, u64, u8); 8] =
+                                        [(0, 0, 0, 0); 8];
+                                    let mut tmp_n: usize = 0;
+                                    rq.eevdf_heap.for_each_entry(|etid, ekey| {
+                                        if etid == tid as u32 {
+                                            here = true;
+                                        }
+                                        if tmp_n < 8 {
+                                            let tt = thread_ref(etid);
+                                            let vrt = tt.eevdf_vruntime;
+                                            let st = tt.state as u8;
+                                            tmp_entries[tmp_n] = (etid, ekey, vrt, st);
+                                            tmp_n += 1;
+                                        }
+                                    });
+                                    if here {
                                         located_cpu = c as i32;
                                         located_n = rq.eevdf_heap.len();
                                         located_scan = rq.eevdf_heap.scan_start_raw();
-                                        rq.eevdf_heap.for_each_entry(|etid, ekey| {
-                                            if located_entries_n < 8 {
-                                                let tt = thread_ref(etid);
-                                                let vrt = tt.eevdf_vruntime;
-                                                let st = tt.state as u8;
-                                                located_entries[located_entries_n] =
-                                                    (etid, ekey, vrt, st);
-                                                located_entries_n += 1;
-                                            }
-                                        });
+                                        located_entries = tmp_entries;
+                                        located_entries_n = tmp_n;
                                         drop(rq);
                                         break;
                                     }
