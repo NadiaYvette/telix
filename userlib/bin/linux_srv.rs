@@ -7106,10 +7106,12 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
     // new image's syscalls.
     unsafe {
         let trace = matches!(lookup_name, b"xeyes" | b"Xwayland"
-                                       | b"glibc_pthread_hello" | b"pthread_test")
+                                       | b"glibc_pthread_hello" | b"pthread_test"
+                                       | b"clone3_test")
             || matches!(name, b"/xeyes" | b"xeyes" | b"/Xwayland" | b"Xwayland"
                             | b"/glibc_pthread_hello" | b"glibc_pthread_hello"
-                            | b"/pthread_test" | b"pthread_test");
+                            | b"/pthread_test" | b"pthread_test"
+                            | b"/clone3_test" | b"clone3_test");
         if trace {
             trace_pi_set(pi);
             syscall::debug_puts(b"  [trace] attach pi=");

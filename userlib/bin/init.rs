@@ -6396,6 +6396,89 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // the linux_srv __NR_EXIT thread-local split (commit 311a6dd).  Run
     // unconditionally — it's never been the "slow phase" that
     // STEP_H_DEBUG_SKIP_SLOW_PHASES is meant to gate.
+    // Phase 200a (#136 probe-α): direct clone3 without libpthread.
+    // Same fork+personality_set+wait4 dance as Phase 200, but the child
+    // execs `clone3_test` which calls clone3 directly via raw syscall,
+    // does write+exit in its grandchild, and FUTEX_WAITs on
+    // child_tid_storage.  Outcome partitions the Phase 200 wedge into:
+    //   PASS → kernel CLONE_THREAD ok, Phase 200 wedge is in libpthread
+    //   FAIL → kernel CLONE_THREAD plumbing is the bug
+    syscall::debug_puts(b"  init: Phase 200a clone3 probe...\n");
+    {
+        if syscall::ns_lookup(b"linux").is_none() {
+            let _ = syscall::spawn(b"linux_srv", 50);
+            for _ in 0..200 {
+                if syscall::ns_lookup(b"linux").is_some() { break; }
+                syscall::yield_now();
+            }
+        }
+        if syscall::ns_lookup(b"linux").is_some() {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        static PATH: &[u8] = b"/clone3_test\0";
+                        static A0:   &[u8] = b"clone3_test\0";
+                        static E0:   &[u8] = b"PATH=/usr/bin\0";
+                        let argv: [u64; 2] = [A0.as_ptr() as u64, 0];
+                        let envp: [u64; 2] = [E0.as_ptr() as u64, 0];
+                        core::hint::black_box(&argv);
+                        core::hint::black_box(&envp);
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => _,
+                            in("rdi") PATH.as_ptr() as u64,
+                            in("rsi") argv.as_ptr() as u64,
+                            in("rdx") envp.as_ptr() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 96u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 200a clone3 probe: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 200a clone3 probe: FAILED (timeout - CLONE_THREAD likely wedged)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 200a clone3 probe: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 200a clone3 probe: SKIPPED (no linux)\n");
+        }
+    }
+
     syscall::debug_puts(b"  init: Phase 200 Tier-2 pthread...\n");
     {
         if syscall::ns_lookup(b"linux").is_none() {

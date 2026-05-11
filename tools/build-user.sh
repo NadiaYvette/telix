@@ -147,6 +147,17 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
     else
         echo "  WARNING: glibc_pthread_hello build failed"
     fi
+    # #136 probe-α: direct clone3 without libpthread.  Isolates kernel
+    # CLONE_THREAD plumbing from glibc NPTL bootstrap.  Statically linked
+    # with glibc for _start but uses direct syscall() for clone3/write/exit.
+    echo "Building clone3_test (#136 probe-α)..."
+    if gcc -static-pie -fPIE -O2 -fno-stack-protector -s \
+            -o "$BINDIR/clone3_test" "$ROOTDIR/tools/clone3_test.c" 2>&1; then
+        echo "  clone3_test: $(wc -c < "$BINDIR/clone3_test") bytes"
+        cp "$BINDIR/clone3_test" "$ROOTDIR/initramfs/clone3_test"
+    else
+        echo "  WARNING: clone3_test build failed"
+    fi
     # fsprobe: minimal static-PIE Linux probe that exercises the FS
     # path (open + fstat + read) for /lib64/libc.so.6 with NO ld.so /
     # glibc so we can isolate kernel/linux_srv/ext_srv issues from
@@ -362,7 +373,7 @@ if [ "$ARCH" = "x86_64" ] && command -v gcc >/dev/null 2>&1; then
 fi
 
 # Copy ELF binaries to initramfs directory.
-for bin in init hello echo_client initramfs_srv rootfs_srv ramdisk_srv blk_srv nvme_srv iwl_srv cache_srv fat16_srv fat_srv ext2_srv ext_srv xfs_srv iso9660_srv udf_srv apfs_srv iscsi_srv sctp_srv acpi_srv pci_srv part_srv console_srv shell net_srv eth_srv batman_srv ip6_srv tcp4_srv pipe_upper pipe_drain spin bench pong grant_echo grant_echo_srv grant_echo_test macro_bench cap_test call_reply_test sched_stress security_srv shm_srv vfs_srv tmpfs_srv devfs_srv procfs_srv uds_srv pipe_srv pty_srv event_srv inotify_srv syslog_srv sysv_srv hello_c sock_test sock6_test tsh getty_login ld-telix tz_test pthread_test initdb_test postmaster_test pg_full_test libc_test calc stress_test sshd proxy_srv linux_srv linux_exit42 glibc_hello glibc_pthread_hello wayland_test wl_compositor_min hello_wl libxcvt_dyn_test libdrm_dyn_test libxshmfence_dyn_test libXau_dyn_test libXdmcp_dyn_test libpixman_dyn_test libwayland_dyn_test libX11_dyn_test libX11ext_dyn_test libfont_dyn_test libssl_dyn_test fsprobe fb_srv input_srv compositor_srv term_srv mtk_srv ntfs_srv btrfs_srv i915_srv usb_srv hda_srv bt_srv nat_srv zfs_srv servicereg_srv servicereg_test router_srv discovery_srv; do
+for bin in init hello echo_client initramfs_srv rootfs_srv ramdisk_srv blk_srv nvme_srv iwl_srv cache_srv fat16_srv fat_srv ext2_srv ext_srv xfs_srv iso9660_srv udf_srv apfs_srv iscsi_srv sctp_srv acpi_srv pci_srv part_srv console_srv shell net_srv eth_srv batman_srv ip6_srv tcp4_srv pipe_upper pipe_drain spin bench pong grant_echo grant_echo_srv grant_echo_test macro_bench cap_test call_reply_test sched_stress security_srv shm_srv vfs_srv tmpfs_srv devfs_srv procfs_srv uds_srv pipe_srv pty_srv event_srv inotify_srv syslog_srv sysv_srv hello_c sock_test sock6_test tsh getty_login ld-telix tz_test pthread_test initdb_test postmaster_test pg_full_test libc_test calc stress_test sshd proxy_srv linux_srv linux_exit42 glibc_hello glibc_pthread_hello clone3_test wayland_test wl_compositor_min hello_wl libxcvt_dyn_test libdrm_dyn_test libxshmfence_dyn_test libXau_dyn_test libXdmcp_dyn_test libpixman_dyn_test libwayland_dyn_test libX11_dyn_test libX11ext_dyn_test libfont_dyn_test libssl_dyn_test fsprobe fb_srv input_srv compositor_srv term_srv mtk_srv ntfs_srv btrfs_srv i915_srv usb_srv hda_srv bt_srv nat_srv zfs_srv servicereg_srv servicereg_test router_srv discovery_srv; do
     if [ -f "$BINDIR/$bin" ]; then
         cp "$BINDIR/$bin" "$INITRAMFS_DIR/$bin"
         SIZE=$(wc -c < "$INITRAMFS_DIR/$bin")
