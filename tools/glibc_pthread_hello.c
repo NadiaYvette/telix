@@ -14,9 +14,19 @@
  */
 #include <stdio.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 static void *thread_main(void *arg)
 {
+    /* #136 probe: direct write() before printf to confirm thread_main
+     * actually runs.  Boot 91amfsq632 trace showed the child making
+     * its libpthread setup syscalls (set_robust_list, sigprocmask)
+     * but never reaching printf's write().  This bypasses glibc stdio
+     * entirely so a missing "[t_main]" marker proves the wedge is
+     * BEFORE thread_main; a visible marker localizes it to printf or
+     * its stdio dependencies. */
+    syscall(SYS_write, 1, "[t_main]\n", 9);
     long n = (long)arg;
     printf("[pthread_hello] child thread n=%ld\n", n);
     return (void *)(n + 1);

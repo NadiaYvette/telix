@@ -30,12 +30,14 @@ case "$ACCEL" in
     *)    CPU_MODEL=qemu64; ACCEL=tcg ;;
 esac
 
+SMP="${TELIX_SMP:-4}"
+
 QEMU_ARGS=(
     -machine q35,accel=$ACCEL
     -cpu $CPU_MODEL
     -m 512M
     -kernel "$KERNEL32"
-    -smp 4
+    -smp "$SMP"
 )
 
 # Display mode: TELIX_DISPLAY=gpu|vbe (default: none/nographic).
