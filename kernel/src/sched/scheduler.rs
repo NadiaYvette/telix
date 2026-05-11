@@ -967,6 +967,13 @@ static RESCUE_STUCK_PENDING_FIRES: AtomicU64 = AtomicU64::new(0);
 /// that hard-wedge fixes (commits 644c7b0 / 27cf951) didn't eliminate.
 static PENDING_LOW_FIRES: AtomicU64 = AtomicU64::new(0);
 
+/// #135 false-positive probe: count of try_switch invocations where
+/// pick returned the running thread (concurrent re-enqueue + self-pick).
+/// In this branch we now clear pending_set_ns so the rescue's stale-stamp
+/// false positive no longer fires.  High SELF_PICK_COUNT in a boot
+/// indicates a noisy false-enqueue source worth chasing separately.
+static SELF_PICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Per-tid "already logged for this PENDING episode" flag, cleared when
 /// `pending_set_ns` returns to 0 (CAS-ok path) or when the thread leaves
 /// the Ready/Pending state.  Prevents flooding the serial log when the
@@ -2908,6 +2915,20 @@ fn try_switch(current_sp: u64) -> u64 {
         // or the thread would appear orphaned).
         if prev_id != idle_id {
             thread_ref(prev_id).on_cpu.store(cpu, Ordering::Release);
+            // #135 self-pick PENDING-STUCK-LOW false-positive fix:
+            // percpu_pick_next_cosched called dequeue_set_pending which
+            // stamped pending_set_ns to "now" and set on_cpu=PENDING.
+            // We just restored on_cpu but the stale stamp would survive
+            // until the next REAL preemption, then the rescue sweep would
+            // compute age_ns from this stale stamp and fire PENDING-STUCK-
+            // LOW falsely on a thread that ran continuously between.
+            // Mirror what dispatch_cas_ok does on the real dispatch path:
+            // clear pending_set_ns and reset PENDING_LOW_LOGGED.
+            thread_ref(prev_id).pending_set_ns.store(0, Ordering::Relaxed);
+            if (prev_id as usize) < PENDING_LOW_LOGGED.len() {
+                PENDING_LOW_LOGGED[prev_id as usize].store(false, Ordering::Relaxed);
+            }
+            SELF_PICK_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         crate::sync::rcu::rcu_quiescent();
         return current_sp;
@@ -5943,9 +5964,10 @@ fn call_reply_timeout_sweep() {
                 let stuck_pending_fires = RESCUE_STUCK_PENDING_FIRES.load(Ordering::Relaxed);
                 let rescue_pending = RESCUE_PENDING.load(Ordering::Relaxed);
                 let pending_low_fires = PENDING_LOW_FIRES.load(Ordering::Relaxed);
+                let self_pick_count = SELF_PICK_COUNT.load(Ordering::Relaxed);
                 crate::println!(
-                    "  CPU-DIAG: rescue_stuck_pending_fires={} rescue_pending_obs={} pending_low_fires={}",
-                    stuck_pending_fires, rescue_pending, pending_low_fires
+                    "  CPU-DIAG: rescue_stuck_pending_fires={} rescue_pending_obs={} pending_low_fires={} self_pick={}",
+                    stuck_pending_fires, rescue_pending, pending_low_fires, self_pick_count
                 );
                 for c in 0..ncpus {
                     let pcpu = crate::sched::smp::get(c as u32);
