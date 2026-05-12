@@ -116,19 +116,38 @@ int main(int argc, char **argv) {
      * via CLONE_VM with parent — guaranteed present). */
     static const char child_msg[] = "[clone_child_w]\n";
     long ret;
+    /* Stash the child_msg address into a callee-saved register (r12)
+     * BEFORE the clone3 syscall.  Otherwise gcc may place it in a
+     * caller-saved register that the syscall instruction clobbers
+     * (rcx, r11) or that handler register-pressure invalidates,
+     * leaving the child path reading garbage when it tries to load
+     * %rsi for the write syscall.  Using a callee-saved reg means
+     * the kernel preserves it across the clone3 vmexit. */
     __asm__ volatile (
         "mov %1, %%rdi\n"             /* arg0 = &args */
         "mov %2, %%rsi\n"             /* arg1 = sizeof(args) */
+        "mov %3, %%r12\n"             /* stash child_msg in r12 */
         "mov $435, %%rax\n"           /* SYS_clone3 */
         "syscall\n"
         "test %%rax, %%rax\n"
         "jnz 2f\n"                    /* parent: jump out, ret in rax */
         /* === CHILD PATH (pure asm, no stack reads) === */
         /* write(1, child_msg, 16) — sizeof("[clone_child_w]\n") - 1 = 16 */
-        "mov %3, %%rsi\n"             /* buf = child_msg from input %3 */
+        "mov %%r12, %%rsi\n"          /* buf = child_msg (from r12) */
         "mov $1, %%rax\n"             /* SYS_write */
         "mov $1, %%rdi\n"             /* fd = 1 */
         "mov $16, %%rdx\n"            /* count = 16 */
+        "syscall\n"
+        /* int3 marker: if execution reaches HERE the kernel sees #BP
+         * (vector 3) which exception_fault logs as
+         * "EXCEPTION: Breakpoint (#BP) at RIP=...".  Confirms RIP
+         * advancement past the first syscall instruction works. */
+        "int3\n"
+        /* Second write before exit — confirms execution past int3. */
+        "mov %%r12, %%rsi\n"
+        "mov $1, %%rax\n"
+        "mov $1, %%rdi\n"
+        "mov $16, %%rdx\n"
         "syscall\n"
         /* exit(0) — terminates the thread; kernel does CLEARTID + FUTEX_WAKE */
         "mov $60, %%rax\n"            /* SYS_exit */
@@ -142,7 +161,7 @@ int main(int argc, char **argv) {
         : "r"((long)(uintptr_t)&args),
           "r"((long)sizeof(args)),
           "r"((long)(uintptr_t)child_msg)
-        : "rdi", "rsi", "rdx", "rcx", "r11", "memory"
+        : "rdi", "rsi", "rdx", "rcx", "r11", "r12", "memory"
     );
     if (ret < 0) {
         const char e[] = "[clone_test] clone3 FAILED\n";

@@ -6202,11 +6202,14 @@ fn handle_clone(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     }
 
     // Phase 174: register thread_port so syscalls from the new thread resolve
-    // to the parent's pi (shared futex/FD state).
+    // to the parent's pi (shared futex/FD state).  Also record the slot
+    // index so we can stash CLONE_CHILD_CLEARTID's tidptr per-thread below.
+    let mut slot_idx: Option<usize> = None;
     unsafe {
         for t in 0..PROC_TABLE[pi].thread_ports.len() {
             if PROC_TABLE[pi].thread_ports[t] == 0 {
                 PROC_TABLE[pi].thread_ports[t] = thread_port;
+                slot_idx = Some(t);
                 break;
             }
         }
@@ -6225,6 +6228,22 @@ fn handle_clone(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     if (flags & (CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID)) != 0 && child_tid_ptr != 0 {
         let tid_bytes = (thread_port as u32).to_ne_bytes();
         syscall::personality_copy_out(caller_port, child_tid_ptr, &tid_bytes);
+    }
+
+    // #136 fix: stash the CLEARTID address per-thread so handle_exit_thread
+    // can write 0 to it and FUTEX_WAKE on the new thread's exit.  Without
+    // this, pthread_join's FUTEX_WAIT on the child's tid storage hangs
+    // forever — boot 91amfsq649 captured this: the child reached
+    // [clone_child_w], called __NR_EXIT cleanly, but the parent's FUTEX_WAIT
+    // never woke because thread_clear_child_tid[t] was 0 at handle_exit_thread
+    // time (only handle_set_tid_address was storing it, which a raw clone3
+    // child doesn't call).
+    if flags & CLONE_CHILD_CLEARTID != 0 && child_tid_ptr != 0 {
+        if let Some(t) = slot_idx {
+            unsafe {
+                PROC_TABLE[pi].thread_clear_child_tid[t] = child_tid_ptr;
+            }
+        }
     }
 
     // Return the new thread's port as the "child pid" to the parent.

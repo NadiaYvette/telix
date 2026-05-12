@@ -4997,6 +4997,16 @@ pub fn wait4_for_task(target_task_id: u32, pid: i64, flags: u32) -> (u64, i32, i
 /// Terminate the current thread and destroy its task's resources.
 /// This function never returns.
 pub fn exit_current_thread(exit_code: i32) -> ! {
+    // DIAG: confirm this fires for clone3_test child.  Will remove
+    // once #136 INVOL-EXIT validation completes.
+    {
+        let _tmp_tid = smp::current().current_thread.load(Ordering::Relaxed);
+        let _tmp_task = thread_ref(_tmp_tid).task_id;
+        crate::println!(
+            "EXIT-THREAD-ENTRY: tid={} task={} exit={}",
+            _tmp_tid, _tmp_task, exit_code
+        );
+    }
     let (
         tid,
         is_last_thread,
@@ -5080,13 +5090,6 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
     // log line is more interesting for involuntary deaths.  Fire for
     // all non-last-thread Linux exits to keep behavior uniform.
     if task_personality_port != 0 && !is_last_thread && thread_port != 0 {
-        if exit_code < 0 {
-            crate::println!(
-                "INVOL-EXIT: linux thread tid={} task={} port={:#x} exit={} \
-                 — forwarding synthetic __NR_EXIT to personality",
-                tid, task_id_for_exit, thread_port, exit_code
-            );
-        }
         // Tag = (__NR_EXIT=60) | (caller_port << 32).  This matches the
         // shape forward_to_server uses for syscall-forwarded messages.
         const NR_EXIT_LINUX: u64 = 60;
@@ -5094,7 +5097,18 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
             tag: NR_EXIT_LINUX | (thread_port << 32),
             data: [exit_code as i64 as u64, 0, 0, 0, 0, 0],
         };
-        let _ = crate::ipc::port::try_send(task_personality_port, msg);
+        let send_result = crate::ipc::port::try_send(task_personality_port, msg);
+        // Print for ALL non-last-thread Linux exits (voluntary + signal),
+        // so we can confirm the cleanup forwarding fires.  Voluntary
+        // __NR_EXIT from glibc's pthread bootstrap goes through the
+        // kernel's direct shortcut at handlers.rs:262, bypassing
+        // linux_srv — without this forward, CLEARTID + FUTEX_WAKE
+        // never happen and pthread_join hangs forever.
+        crate::println!(
+            "INVOL-EXIT: linux thread tid={} task={} port={:#x} exit={} send={}",
+            tid, task_id_for_exit, thread_port, exit_code,
+            if send_result.is_ok() { "ok" } else { "FAILED" }
+        );
     }
 
     // If the dying thread is holding a reply-cap, deliver a server-died
