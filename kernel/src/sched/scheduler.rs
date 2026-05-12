@@ -3556,6 +3556,24 @@ pub fn block_current(_reason: BlockReason) {
     // is a spin-wait — the thread never goes through try_switch on wake-up,
     // so FSBASE would otherwise stay stale until a context switch.
     crate::arch::cpu::set_tls(tref.tls_base);
+    // #136 saved_sp re-sync: while we were spinning, timer-driven
+    // try_switch (line 3046) may have overwritten saved_sp with a deep
+    // kernel SP from the timer trap entry.  After wake-up the caller
+    // returns up the stack to the original syscall x86_exception_handler,
+    // which uses the LOCAL frame_sp for iretq — so for the IPI/syscall
+    // entry path that's fine.  BUT: if this thread is then preempted
+    // AGAIN before iretq fires (e.g. via check_preempt_on_return →
+    // voluntary_reschedule), voluntary_reschedule reads saved_sp via
+    // syscall_frame_sp — which is correct.  Hmm — most paths are OK.
+    //
+    // The pathological case (per loom-clone-thread-iretq + Phase 200a
+    // boot 656): a CLONE_THREAD child's syscall blocks here, gets
+    // preempted, wakes back up on a different CPU.  The next dispatch
+    // for this thread restores saved_sp = the OLD timer-trap deep SP,
+    // not the user trap frame.  Mirror park_current_for_ipc's explicit
+    // re-sync (line 5691) here too: re-establish the invariant before
+    // returning that saved_sp == syscall_frame_sp.
+    unsafe { thread_mut_from_ref(tid) }.saved_sp = tref.syscall_frame_sp;
     crate::arch::irq::restore(saved);
 }
 
