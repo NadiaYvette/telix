@@ -7002,11 +7002,21 @@ fn handle_exit_thread(pi: usize, caller_port: u64, _args: &[u64; 6]) -> u64 {
         // CLONE_CHILD_CLEARTID for THIS thread: clear its tidptr and wake one
         // futex waiter on that address.  This is exactly what glibc's
         // pthread_join is parked on.
+        //
+        // #136 fix: use PROC_TABLE[pi].port (the leader's port) for the
+        // personality_copy_out call rather than caller_port (the dying
+        // thread's port).  When handle_exit_thread runs from a synthesized
+        // INVOL-EXIT message, the dying thread's port may already have
+        // been destroyed by the kernel between when the message was queued
+        // and when linux_srv dequeued it.  The leader's port is durable
+        // — it survives until the entire process exits — and resolves to
+        // the same aspace (shared via CLONE_VM).
         if let Some(t) = tslot {
             let ctid = PROC_TABLE[pi].thread_clear_child_tid[t];
             if ctid != 0 {
                 let zero = 0u32.to_ne_bytes();
-                syscall::personality_copy_out(caller_port, ctid, &zero);
+                let aspace_target = PROC_TABLE[pi].port;
+                syscall::personality_copy_out(aspace_target, ctid, &zero);
                 for i in 0..MAX_FUTEX_WAITERS {
                     if FUTEX_TABLE[i].active && FUTEX_TABLE[i].uaddr == ctid as u64
                         && FUTEX_TABLE[i].pi == pi

@@ -258,6 +258,61 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                     let _ = crate::arch::irq::disable();
                     crate::sched::scheduler::check_preempt_on_return();
                     let pending = crate::sched::scheduler::take_pending_switch();
+                    // #136 IRETQ-RIP probe: for Linux-personality threads,
+                    // dump the frame's RIP just before iretq.  Boots 654-658
+                    // show the child reaches its first syscall and returns
+                    // (write prints [clone_child_w]) but never reaches the
+                    // immediately-next instruction (int3 placed there never
+                    // traps).  If the RIP printed here is 0x1c64 (the int3
+                    // address), the iretq is correct and the bug is on the
+                    // userspace side or in the int3 trap path.  If RIP is
+                    // SOMETHING ELSE, the kernel iretq is misdirecting and
+                    // we've localized the bug to here.  Rate-limit to the
+                    // first ~6 fires per Linux thread to avoid log spam.
+                    {
+                        let tid = crate::sched::scheduler::current_thread_id();
+                        let task_id =
+                            crate::sched::scheduler::thread_ref(tid).task_id;
+                        let task = crate::sched::scheduler::task_ref(task_id);
+                        if task.personality as u8 != 0 {
+                            // Use a tid-indexed counter so we only see the
+                            // first few syscall returns per Linux thread.
+                            static IRETQ_LOG_COUNT: [
+                                core::sync::atomic::AtomicU32; 256
+                            ] = {
+                                const Z: core::sync::atomic::AtomicU32 =
+                                    core::sync::atomic::AtomicU32::new(0);
+                                [Z; 256]
+                            };
+                            if (tid as usize) < IRETQ_LOG_COUNT.len() {
+                                let n = IRETQ_LOG_COUNT[tid as usize]
+                                    .fetch_add(
+                                        1,
+                                        core::sync::atomic::Ordering::Relaxed,
+                                    );
+                                if n < 100 {
+                                    let final_sp = if pending != 0 {
+                                        pending
+                                    } else {
+                                        frame_sp
+                                    };
+                                    let final_frame = unsafe {
+                                        &*(final_sp as *const ExceptionFrame)
+                                    };
+                                    crate::println!(
+                                        "IRETQ: tid={} task={} sp={:#x} \
+                                         rip={:#x} cs={:#x} rax={:#x} \
+                                         pending={}",
+                                        tid, task_id, final_sp,
+                                        final_frame.rip(),
+                                        final_frame.cs(),
+                                        final_frame.rax(),
+                                        if pending != 0 { "yes" } else { "no" }
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if pending != 0 {
                         return validate_iretq_frame(pending, frame_sp, 6);
                     }

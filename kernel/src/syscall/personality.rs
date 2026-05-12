@@ -103,7 +103,7 @@ pub fn set_personality(target_port: u64, personality_id: u8, abi_id: u8) -> u64 
             .load(Ordering::Relaxed);
         crate::sched::scheduler::thread_ref(tid).task_id
     } else {
-        match crate::sched::task_id_from_port(target_port) {
+        match crate::sched::task_id_from_any_port(target_port) {
             Some(id) => id,
             None => {
                 match crate::sched::task_id_from_any_port(target_port) {
@@ -166,9 +166,52 @@ pub fn forward_to_server(
     }
 
     // Identify the calling thread/task.
+    // #136 fix: send the THREAD's port_id (not the task's port) so the
+    // personality server's reply can route to the *specific* calling
+    // thread.  For CLONE_THREAD tasks (multiple threads sharing one
+    // task_id) the task port is ambiguous — find_personality_waiter
+    // would pick "any" waiter, sending the child's reply to whichever
+    // thread happened to be parked first.  Per-thread port routing
+    // preserves the wake target.
     let tid = crate::sched::current_thread_id();
     let task_id = crate::sched::scheduler::thread_ref(tid).task_id;
-    let caller_port = crate::sched::scheduler::task_ref(task_id).port_id;
+    let caller_port = crate::sched::scheduler::thread_ref(tid).port_id;
+
+    // #136 IRETQ probe: log every forward (gives us entry + RIP per
+    // syscall), rate-limited per-tid.  Pairs with the IRETQ exit
+    // print in exception.rs.  If a CHILD of clone3 makes syscalls
+    // that show up here but NOT in IRETQ exit prints, that means
+    // forward_to_server is being called but the syscall return path
+    // doesn't go back through the #UD-emulated dispatcher — possibly
+    // a different return route for child threads.
+    {
+        static FWD_LOG_COUNT: [core::sync::atomic::AtomicU32; 256] = {
+            const Z: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            [Z; 256]
+        };
+        if (tid as usize) < FWD_LOG_COUNT.len() {
+            let n = FWD_LOG_COUNT[tid as usize]
+                .fetch_add(1, Ordering::Relaxed);
+            if n < 30 {
+                let frame_sp_now =
+                    unsafe { crate::sched::scheduler::thread_mut_from_ref(tid) }
+                        .syscall_frame_sp;
+                let rip_at_entry = if frame_sp_now != 0 {
+                    let f = unsafe {
+                        &*(frame_sp_now as *const crate::syscall::handlers::ExceptionFrame)
+                    };
+                    f.rip()
+                } else {
+                    0
+                };
+                crate::println!(
+                    "FWD: tid={} task={} nr={} rip_after_inst={:#x} caller_port={:#x}",
+                    tid, task_id, nr, rip_at_entry, caller_port
+                );
+            }
+        }
+    }
 
     // Build the forwarded message.
     // Pack syscall number (low 32 bits) and caller port (high 32 bits) into tag,
@@ -291,17 +334,26 @@ pub fn personality_reply(target_task_port: u64, result: u64) -> u64 {
         }
     }
 
-    // Find the target task.
-    let target_task_id = match crate::sched::task_id_from_port(target_task_port) {
-        Some(id) => id,
-        None => return u64::MAX,
-    };
-
-    // Find a thread in the target task that is blocked on PersonalityWait.
-    let target_tid = find_personality_waiter(target_task_id);
-    if target_tid == u32::MAX {
+    // #136 fix: target_task_port can now be a THREAD port (per-thread
+    // routing — see forward_to_server's caller_port change).  Resolve
+    // to a specific thread if it's a thread port; fall back to the
+    // legacy "find any waiter in the task" path for task ports (single-
+    // thread Linux processes, etc.).
+    let target_tid: u32 = if let Some(thread_tid) =
+        crate::sched::validated_thread_from_port(target_task_port)
+    {
+        thread_tid
+    } else if let Some(target_task_id) =
+        crate::sched::task_id_from_any_port(target_task_port)
+    {
+        let waiter = find_personality_waiter(target_task_id);
+        if waiter == u32::MAX {
+            return u64::MAX;
+        }
+        waiter
+    } else {
         return u64::MAX;
-    }
+    };
 
     // Deliver the result and wake.
     crate::sched::scheduler::thread_ref(target_tid)
@@ -343,7 +395,7 @@ pub fn personality_read_args(
     }
 
     // Find the target task and its personality-waiting thread.
-    let target_task_id = match crate::sched::task_id_from_port(target_task_port) {
+    let target_task_id = match crate::sched::task_id_from_any_port(target_task_port) {
         Some(id) => id,
         None => return u64::MAX,
     };
@@ -407,7 +459,7 @@ pub fn personality_copy_in(target_port: u64, src_va: usize, dst_va: usize, len: 
         None => return u64::MAX,
     };
 
-    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+    let target_task_id = match crate::sched::task_id_from_any_port(target_port) {
         Some(id) => id,
         None => return u64::MAX,
     };
@@ -460,7 +512,7 @@ pub fn personality_copy_out(target_port: u64, dst_va: usize, src_va: usize, len:
         None => return u64::MAX,
     };
 
-    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+    let target_task_id = match crate::sched::task_id_from_any_port(target_port) {
         Some(id) => id,
         None => return u64::MAX,
     };
@@ -544,7 +596,7 @@ pub fn personality_fork(target_port: u64) -> u64 {
         None => return u64::MAX,
     };
 
-    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+    let target_task_id = match crate::sched::task_id_from_any_port(target_port) {
         Some(id) => id,
         None => return u64::MAX,
     };
@@ -570,7 +622,7 @@ pub fn personality_wait4(
         None => return u64::MAX,
     };
 
-    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+    let target_task_id = match crate::sched::task_id_from_any_port(target_port) {
         Some(id) => id,
         None => return u64::MAX,
     };
@@ -604,7 +656,7 @@ pub fn personality_execve(
         None => return u64::MAX,
     };
 
-    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+    let target_task_id = match crate::sched::task_id_from_any_port(target_port) {
         Some(id) => id,
         None => return u64::MAX,
     };
@@ -661,7 +713,12 @@ fn find_personality_waiter(task_id: u32) -> u32 {
 /// Returns (target_task_id, target_aspace_id) or None.
 fn resolve_personality_target(target_port: u64) -> Option<(u32, u64)> {
     let _caller_task_id = check_personality_server()?;
-    let target_task_id = crate::sched::task_id_from_port(target_port)?;
+    // #136 fix: target_port may be a THREAD port (per-thread routing
+    // introduced by the forward_to_server change).  Resolve to the
+    // task_id either way: thread_port → thread → task_id; task_port →
+    // task_id directly.  Memory ops are aspace-wide so any thread of
+    // the same task resolves to the same aspace.
+    let target_task_id = crate::sched::task_id_from_any_port(target_port)?;
     let target_tid = find_personality_waiter(target_task_id);
     if target_tid == u32::MAX {
         return None;
@@ -968,7 +1025,7 @@ pub fn personality_thread_create(
         None => return u64::MAX,
     };
 
-    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+    let target_task_id = match crate::sched::task_id_from_any_port(target_port) {
         Some(id) => id,
         None => return u64::MAX,
     };
@@ -1004,7 +1061,7 @@ pub fn personality_dequeue_signal(target_port: u64, mask: u64) -> u64 {
         None => return u64::MAX,
     };
 
-    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+    let target_task_id = match crate::sched::task_id_from_any_port(target_port) {
         Some(id) => id,
         None => return u64::MAX,
     };
@@ -1035,7 +1092,7 @@ pub fn personality_peek_signals(target_port: u64) -> u64 {
         Some(id) => id,
         None => return u64::MAX,
     };
-    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+    let target_task_id = match crate::sched::task_id_from_any_port(target_port) {
         Some(id) => id,
         None => return u64::MAX,
     };
@@ -1057,7 +1114,7 @@ pub fn personality_read_frame(target_port: u64, dst_va: usize, len: usize) -> u6
         None => return u64::MAX,
     };
 
-    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+    let target_task_id = match crate::sched::task_id_from_any_port(target_port) {
         Some(id) => id,
         None => return u64::MAX,
     };
@@ -1100,7 +1157,7 @@ pub fn personality_write_frame(target_port: u64, src_va: usize, len: usize) -> u
         None => return u64::MAX,
     };
 
-    let target_task_id = match crate::sched::task_id_from_port(target_port) {
+    let target_task_id = match crate::sched::task_id_from_any_port(target_port) {
         Some(id) => id,
         None => return u64::MAX,
     };
