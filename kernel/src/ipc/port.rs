@@ -816,6 +816,23 @@ pub fn send_from_kernel(port_id: PortId, msg: Message) -> Result<(), ()> {
 
 /// Send a message to a port (blocking).
 /// Blocks if the queue is full until space is available.
+/// Non-blocking send.  Returns Err if the port is missing, the queue
+/// is full, or a transient error occurs.  Used by exit_current_thread
+/// to forward a synthetic __NR_EXIT to a personality when a Linux
+/// thread dies involuntarily — we cannot block in that context.
+///
+/// Does NOT do priority inheritance and does NOT touch the calling
+/// thread's blocked_on state.
+pub fn try_send(port_id: PortId, msg: Message) -> Result<(), ()> {
+    let port = port_ref(port_id).ok_or(())?;
+    if port.is_kernel_held() {
+        let handler_fn: KernelHandler = unsafe { core::mem::transmute(port.kernel_handler) };
+        let _reply = handler_fn(port_id, port.kernel_user_data, &msg);
+        return Ok(());
+    }
+    do_send(port, &msg)
+}
+
 pub fn send(port_id: PortId, mut msg: Message) -> Result<(), ()> {
     use crate::sched::thread::BlockReason;
     use crate::sync::turnstile::KEY_PORT_SEND;

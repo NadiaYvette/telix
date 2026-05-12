@@ -5006,6 +5006,8 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         parent_task_id,
         _task_port,
         thread_port,
+        task_personality_port,
+        task_id_for_exit,
     ) = {
         let pcpu = smp::current();
         let tid = pcpu.current_thread.load(Ordering::Relaxed);
@@ -5035,6 +5037,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
         let is_last = task.thread_count == 0;
         let parent_task_id = task.parent_task;
         let task_port = task.port_id;
+        let task_personality_port = task.personality_port;
         if is_last {
             task.exit_code = exit_code;
             task.exited = true;
@@ -5053,8 +5056,46 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
             parent_task_id,
             task_port,
             thread_port,
+            task_personality_port,
+            task_id,
         )
     };
+
+    // #136 involuntary-exit cleanup: when a thread of a Linux-personality
+    // task dies via SIGSEGV/etc. without calling __NR_EXIT, linux_srv
+    // never runs handle_exit_thread, so the thread's CLONE_CHILD_CLEARTID
+    // address isn't cleared and any FUTEX_WAIT on it (typically
+    // pthread_join) hangs forever.  Synthesize a __NR_EXIT message and
+    // fire it at linux_srv from kernel context so the cleanup happens.
+    //
+    // Skip when is_last_thread because:
+    //   (a) the leader thread's __NR_EXIT is treated as __NR_EXIT_GROUP
+    //       by handle_exit_thread (PROC_TABLE[pi].port == caller_port),
+    //       which is the right semantic for "process died"
+    //   (b) handle_exit_group also tears down PROC_TABLE state, which we
+    //       want to happen exactly once
+    //
+    // exit_code < 0 marks involuntary exit (signal numbers are negative
+    // by Telix convention here): we always want the cleanup, but the
+    // log line is more interesting for involuntary deaths.  Fire for
+    // all non-last-thread Linux exits to keep behavior uniform.
+    if task_personality_port != 0 && !is_last_thread && thread_port != 0 {
+        if exit_code < 0 {
+            crate::println!(
+                "INVOL-EXIT: linux thread tid={} task={} port={:#x} exit={} \
+                 — forwarding synthetic __NR_EXIT to personality",
+                tid, task_id_for_exit, thread_port, exit_code
+            );
+        }
+        // Tag = (__NR_EXIT=60) | (caller_port << 32).  This matches the
+        // shape forward_to_server uses for syscall-forwarded messages.
+        const NR_EXIT_LINUX: u64 = 60;
+        let msg = crate::ipc::Message {
+            tag: NR_EXIT_LINUX | (thread_port << 32),
+            data: [exit_code as i64 as u64, 0, 0, 0, 0, 0],
+        };
+        let _ = crate::ipc::port::try_send(task_personality_port, msg);
+    }
 
     // If the dying thread is holding a reply-cap, deliver a server-died
     // reply to the parked caller so they don't hang forever.
