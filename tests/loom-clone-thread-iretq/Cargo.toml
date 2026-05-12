@@ -1,0 +1,26 @@
+[package]
+name = "loom-clone-thread-iretq"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone — same pattern as tests/loom-park-state and
+# tests/loom-linux-futex-exit.  Models the saved_sp / syscall_frame_sp
+# lifecycle in `kernel/src/sched/scheduler.rs` for a CLONE_THREAD child
+# making consecutive syscalls.
+#
+# #136 boots 654/655/656 showed: child reaches its FIRST syscall, write
+# returns (ret=16, [clone_child_w] prints), but the next instruction
+# (int3 placed immediately after) NEVER traps as #BP — yet picked_count
+# for the child keeps growing.  Suspect: kernel's iretq target frame
+# (or the SP it pops from) is wrong on the path back to user mode for
+# the second syscall, sending the child to a non-instruction location.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
