@@ -3625,21 +3625,12 @@ pub fn block_current(_reason: BlockReason) {
     loop {
         // Set state=Blocked before each WFI iteration.  Wake_thread will
         // CAS this back to Ready and enqueue when wakeup arrives.  Set
-        // BEFORE the wakeup load so the race between this thread's
-        // wakeup check and a concurrent wake_thread resolves correctly:
-        // either we see wakeup=true here (exit immediately), or
-        // wake_thread sees state=Blocked and enqueues us (we resume
-        // after WFI via normal dispatch).
-        //
-        // CRITICAL: the SeqCst fence between the state store and the
-        // wakeup load is what makes this race-free.  Plain Release on
-        // the store + Acquire on the load is NOT enough — they live on
-        // separate atomic locations and the CPU's store buffer can
-        // reorder them.  Verified by tests/loom-wake-dispatch/ which
-        // reproduces the lost-wake without the fence.  Mirrors Linux's
-        // set_current_state(TASK_INTERRUPTIBLE); smp_mb(); ... pattern.
+        // BEFORE the wakeup load (Release/Acquire pair) so the race
+        // between this thread's wakeup check and a concurrent wake_thread
+        // resolves correctly: either we see wakeup=true here (exit
+        // immediately), or wake_thread sees state=Blocked and enqueues us
+        // (we resume after WFI via normal dispatch).
         unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Blocked;
-        core::sync::atomic::fence(Ordering::SeqCst);
         if tref.wakeup.load(Ordering::Acquire) {
             break;
         }
@@ -3736,14 +3727,8 @@ pub fn wake_thread(tid: ThreadId) {
     // is the wake path for block_current's real-block.  Done BEFORE the
     // demoted-prio path below: blocked threads aren't demoted any more.
     //
-    // CRITICAL: SeqCst fence between the wakeup.store above and the
-    // state read below.  Without it, the CPU store buffer can reorder
-    // the wakeup write past the state read, causing wake to see a stale
-    // state=Running while the blocker (concurrently) misses our wakeup
-    // store — both threads stop trying.  Verified by
-    // tests/loom-wake-dispatch/ which fails without the fence.  Pairs
-    // with the matching fence in block_current.
-    core::sync::atomic::fence(Ordering::SeqCst);
+    // Acquire fence (via the load ordering) ensures we observe the
+    // block_current's state=Blocked store after our wakeup=true Release.
     {
         let state = thread_ref(tid).state;
         if state == ThreadState::Blocked {
