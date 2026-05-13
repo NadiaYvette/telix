@@ -6558,6 +6558,196 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 201: SCM_RIGHTS + memfd round-trip (Wayland compositor port Step 1) ---
+    //
+    // Validates the wl_shm fd-passing ABI before vendoring wlroots/cage.
+    // The test program creates a memfd, fills it with a pattern, sends it
+    // via SCM_RIGHTS over a socketpair, the receiver mmaps MAP_SHARED on
+    // the recv'd fd, and verifies the pattern.  Without this working, the
+    // whole compositor port is doomed — every wl_shm buffer transfer
+    // between Wayland client and compositor rides on this exact chain.
+    //
+    // See docs/wayland-compositor-port-plan.md §4 priority 1.
+    syscall::debug_puts(b"  init: Phase 201 SCM_RIGHTS + memfd probe...\n");
+    {
+        if syscall::ns_lookup(b"linux").is_some() {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        static PATH: &[u8] = b"/scm_rights_test\0";
+                        static A0:   &[u8] = b"scm_rights_test\0";
+                        static E0:   &[u8] = b"PATH=/usr/bin\0";
+                        let argv: [u64; 2] = [A0.as_ptr() as u64, 0];
+                        let envp: [u64; 2] = [E0.as_ptr() as u64, 0];
+                        core::hint::black_box(&argv);
+                        core::hint::black_box(&envp);
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => _,
+                            in("rdi") PATH.as_ptr() as u64,
+                            in("rsi") argv.as_ptr() as u64,
+                            in("rdx") envp.as_ptr() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 96u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 201 SCM_RIGHTS + memfd: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 201 SCM_RIGHTS + memfd: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 201 SCM_RIGHTS + memfd: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 201 SCM_RIGHTS + memfd: SKIPPED (no linux)\n");
+        }
+    }
+
+    // --- Phase 202: cage headless smoke test (Wayland compositor port Stage 6) ---
+    //
+    // Spawns the cage kiosk compositor with WLR_BACKENDS=headless so it
+    // skips DRM/libinput entirely (those need linux_srv ENOSYS gaps
+    // closed first — DRM_IOCTL_MODE_ATOMIC etc., see plan §4).  The
+    // child is /hello_wl, a tiny Wayland client that pushes a 256x256
+    // wl_shm buffer and exits 0 on wl_buffer.release.
+    //
+    // Exit code 0 means:
+    //   - libwlroots-0.18.so loaded clean
+    //   - libseat builtin backend opened (no seatd/logind needed)
+    //   - cage bound /tmp/wayland-0
+    //   - hello_wl connected, transferred a buffer via SCM_RIGHTS, exited
+    //   - cage saw child exit and tore down cleanly
+    //
+    // This is the protocol+lifecycle smoke before Stage 7 swaps cage into
+    // the H13 path with real DRM under xeyes/Xwayland.  See
+    // docs/wayland-compositor-port-plan.md §6 Step H+1 (parity).
+    syscall::debug_puts(b"  init: Phase 202 cage headless smoke...\n");
+    {
+        if syscall::ns_lookup(b"linux").is_some() {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        // cage CLI: `cage -- <child>`.  argv[0]=cage,
+                        // argv[1]="--", argv[2]=path to child binary.
+                        static PATH: &[u8] = b"/usr/bin/cage\0";
+                        static A0:   &[u8] = b"cage\0";
+                        static A1:   &[u8] = b"--\0";
+                        static A2:   &[u8] = b"/hello_wl\0";
+                        // env: enough to let cage + libwlroots + libseat
+                        // pick the right code paths without doing DRM.
+                        static E0:   &[u8] = b"XDG_RUNTIME_DIR=/tmp\0";
+                        static E1:   &[u8] = b"LIBSEAT_BACKEND=builtin\0";
+                        static E2:   &[u8] = b"WLR_BACKENDS=headless\0";
+                        static E3:   &[u8] = b"WAYLAND_DISPLAY=wayland-0\0";
+                        static E4:   &[u8] = b"PATH=/usr/bin:/bin\0";
+                        let argv: [u64; 4] = [
+                            A0.as_ptr() as u64,
+                            A1.as_ptr() as u64,
+                            A2.as_ptr() as u64,
+                            0,
+                        ];
+                        let envp: [u64; 6] = [
+                            E0.as_ptr() as u64,
+                            E1.as_ptr() as u64,
+                            E2.as_ptr() as u64,
+                            E3.as_ptr() as u64,
+                            E4.as_ptr() as u64,
+                            0,
+                        ];
+                        // Force materialisation — same rustc-elision
+                        // workaround as Phase 201 / project_xeyes_envp_compiler_elision.
+                        core::hint::black_box(&argv);
+                        core::hint::black_box(&envp);
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => _,
+                            in("rdi") PATH.as_ptr() as u64,
+                            in("rsi") argv.as_ptr() as u64,
+                            in("rdx") envp.as_ptr() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 97u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 202 cage headless smoke: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 202 cage headless smoke: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 202 cage headless smoke: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 202 cage headless smoke: SKIPPED (no linux)\n");
+        }
+    }
+
     // --- Phase 176: swap stress (memory pressure + fork + data integrity) ---
     //
     // Allocates a large anonymous region, writes a pattern to every u64,

@@ -7136,11 +7136,13 @@ fn handle_execve(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
     unsafe {
         let trace = matches!(lookup_name, b"xeyes" | b"Xwayland"
                                        | b"glibc_pthread_hello" | b"pthread_test"
-                                       | b"clone3_test")
+                                       | b"clone3_test"
+                                       | b"cage")
             || matches!(name, b"/xeyes" | b"xeyes" | b"/Xwayland" | b"Xwayland"
                             | b"/glibc_pthread_hello" | b"glibc_pthread_hello"
                             | b"/pthread_test" | b"pthread_test"
-                            | b"/clone3_test" | b"clone3_test");
+                            | b"/clone3_test" | b"clone3_test"
+                            | b"/usr/bin/cage" | b"cage");
         if trace {
             trace_pi_set(pi);
             syscall::debug_puts(b"  [trace] attach pi=");
@@ -7868,6 +7870,11 @@ fn handle_evdev_ioctl(dev: usize, caller_port: u64, request: u64, arg_va: usize)
 
     // EVIOCGRAB = 0x4590 — exclusive grab (no-op, always succeed)
     if req_lo == 0x4590 { return 0; }
+
+    // EVIOCREVOKE = 0x4591 — revoke fd on seat handover. libinput issues it
+    // during VT/seat switches; with no seatd/logind we never hand off, so
+    // ENOSYS signals "not implemented" and libinput keeps using the fd.
+    if req_lo == 0x4591 { return linux_err(ENOSYS); }
 
     // EVIOCGPROP = 0x4509 — input properties (return empty)
     if req_lo == 0x4509 {
@@ -12678,8 +12685,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             __NR_RECVMMSG => handle_recvmmsg(pi, caller_port, &msg.data),
 
             _ => {
-                syscall::debug_puts(b"[linux_srv] unhandled nr=");
+                // Enhanced ENOSYS log — include caller_port (so we can
+                // correlate with TRACE_PI / FWD output) and the first
+                // arg.  Most ENOSYS gaps surface during Wayland
+                // compositor startup; this gives us tight feedback on
+                // which syscall to wire up next.
+                syscall::debug_puts(b"[ENOSYS] nr=");
                 print_num(linux_nr);
+                syscall::debug_puts(b" caller_port=");
+                print_num(caller_port);
+                syscall::debug_puts(b" arg0=");
+                print_num(msg.data[0]);
+                syscall::debug_puts(b" arg1=");
+                print_num(msg.data[1]);
                 syscall::debug_puts(b"\n");
                 linux_err(ENOSYS)
             }
