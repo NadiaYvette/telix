@@ -182,6 +182,42 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
         let tls = crate::sched::scheduler::thread_ref(tid).tls_base;
         crate::arch::cpu::set_tls(tls);
     }
+    // #135 first-iretq-to-user probe: log the FIRST time we return-to-user
+    // for each tid.  Tells us whether iretq is delivering correct (RIP, CS,
+    // SS) to userspace.  If a freshly-spawned thread shows FIRST-IRETQ with
+    // a garbage RIP or non-23 CS, the spawn_user fake-frame setup is broken.
+    // One-shot per tid via 256-slot bitmap.
+    {
+        static FIRST_IRETQ_USER_LOGGED: [core::sync::atomic::AtomicBool; 256] = {
+            const Z: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            [Z; 256]
+        };
+        let frame_peek = unsafe { &*(sp as *const ExceptionFrame) };
+        let cs_peek = frame_peek.cs();
+        if (cs_peek & 3) == 3 {
+            // Going to userspace (CS RPL=3).
+            let tid = crate::sched::scheduler::current_thread_id();
+            if (tid as usize) < FIRST_IRETQ_USER_LOGGED.len() {
+                if !FIRST_IRETQ_USER_LOGGED[tid as usize]
+                    .swap(true, core::sync::atomic::Ordering::Relaxed)
+                {
+                    crate::println!(
+                        "FIRST-IRETQ-USER: tid={} cpu={} vec={} sp={:#x} \
+                         rip={:#x} cs={:#x} ss={:#x} rax={:#x} rsp={:#x}",
+                        tid,
+                        crate::sched::smp::cpu_id(),
+                        vector, sp,
+                        frame_peek.rip(),
+                        cs_peek,
+                        frame_peek.ss(),
+                        frame_peek.rax(),
+                        frame_peek.rsp(),
+                    );
+                }
+            }
+        }
+    }
     // Absolute minimum: no valid kstack frame can be below 64K — catch
     // saved_sp=0 or any pointer into the real-mode IVT / BIOS data area.
     if sp < 0x10000 {

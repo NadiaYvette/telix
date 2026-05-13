@@ -3732,19 +3732,37 @@ pub fn wake_thread(tid: ThreadId) {
     {
         let state = thread_ref(tid).state;
         if state == ThreadState::Blocked {
-            // Transition Blocked → Ready and enqueue at base prio on the
-            // waker's CPU.  percpu_enqueue's in_queue swap is the
-            // double-enqueue guard if a concurrent path also enqueues.
+            // Transition Blocked → Ready and enqueue at base prio.  Use
+            // the *waker's* CPU as the enqueue target because (a) we hold
+            // its run-queue contended only by other CPUs' rescue paths,
+            // (b) cache locality if the wake-event data was just
+            // produced on this CPU.  percpu_enqueue's in_queue swap is
+            // the double-enqueue guard if a concurrent path also
+            // enqueues.
             unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
             tref.prio.store(tref.base_priority, Ordering::Release);
             unsafe { thread_mut_from_ref(tid) }.effective_priority =
                 tref.base_priority;
+            let target_cpu = smp::cpu_id();
             set_enq_tag(3); // 3=wake_thread
-            percpu_enqueue(smp::cpu_id(), tref.base_priority, tid);
+            percpu_enqueue(target_cpu, tref.base_priority, tid);
             // Reprogram timer so try_switch runs and picks us up promptly.
             crate::arch::timer::program_oneshot_ns(
                 get_monotonic_ns() + TICK_INTERVAL_NS
             );
+            // If the woken thread had been running on a different CPU,
+            // and that CPU is currently HLT-idle, no try_switch will
+            // run there until an interrupt arrives.  Send a reschedule
+            // IPI so it picks up the queue change (parallels the
+            // existing demoted-prio path below + the wake_parked_thread
+            // IPI sites — without it, blocked-then-woken threads can
+            // sit in the queue indefinitely on idle CPUs).
+            let old_cpu = tref.last_cpu.load(Ordering::Relaxed);
+            if old_cpu != target_cpu
+                && (old_cpu as usize) < crate::sched::smp::num_cpus()
+            {
+                crate::arch::irq::send_reschedule_ipi(old_cpu);
+            }
             return;
         }
     }
