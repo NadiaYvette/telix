@@ -8,6 +8,11 @@ unsafe extern "Rust" {
 /// Arguments are passed in registers (x0-x2 / a0-a2 / rdi,rsi,rdx) by the kernel.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(arg0: u64, arg1: u64, arg2: u64) -> ! {
+    // #135 first-instruction probe — fires for EVERY Telix-native userspace
+    // binary at its very first instruction.  If we see this for init but
+    // not the "Telix init starting" line below, init crashed mid-main.  If
+    // we don't see this for init at all, init never reached userspace.
+    crate::syscall::debug_puts(b"START\n");
     unsafe {
         main(arg0, arg1, arg2);
     }

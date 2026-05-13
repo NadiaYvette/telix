@@ -2868,14 +2868,18 @@ fn try_switch(current_sp: u64) -> u64 {
     let pcpu = smp::get(cpu);
     let idle_id_for_load = pcpu.idle_thread_id.load(Ordering::Relaxed);
 
-    // #135 dispatch-bug investigation: rate-limited trace of try_switch
-    // decisions on cpu=0.  Each line: prev/idle/has_ready/quantum so we can
-    // see WHY cpu0 keeps re-picking the same task instead of switching to
-    // a ready thread.  Bounded to a couple-hundred calls to avoid spam.
-    static TS_TRACE_COUNT: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
-    let trace_on = cpu == 0 && {
-        let n = TS_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    // #135 dispatch-bug investigation: per-cpu rate-limited try_switch trace.
+    // Each line: prev/idle/has_ready/quantum so we can see who's running on
+    // each CPU.  Per-CPU array of counters means cpu=1 etc. each get their
+    // own 200-line quota — needed to see init (which lands on a non-bsp CPU
+    // when SMP>1).
+    static TS_TRACE_COUNT: [core::sync::atomic::AtomicU32; 8] = {
+        const Z: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        [Z; 8]
+    };
+    let trace_on = (cpu as usize) < TS_TRACE_COUNT.len() && {
+        let n = TS_TRACE_COUNT[cpu as usize].fetch_add(1, Ordering::Relaxed);
         n < 200
     };
     if trace_on {
@@ -2893,6 +2897,24 @@ fn try_switch(current_sp: u64) -> u64 {
             "TS-IN: cpu={} prev={} idle={} has_ready={} quantum={} dq={} yield={}",
             cpu, cur_tid, idle_id_for_load, rq_has_ready, quantum, dq, yield_asap,
         );
+    }
+
+    // First-dispatch probe: log when a tid is picked to run for the FIRST
+    // time after its spawn.  Tells us which CPU eventually claims newly-
+    // created threads.  One-shot per tid (256-slot bitmap).
+    static FIRST_DISPATCH_LOGGED: [core::sync::atomic::AtomicBool; 256] = {
+        const Z: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        [Z; 256]
+    };
+    fn maybe_log_first_dispatch(cpu: u32, tid: u32) {
+        if (tid as usize) < FIRST_DISPATCH_LOGGED.len() {
+            if !FIRST_DISPATCH_LOGGED[tid as usize]
+                .swap(true, Ordering::Relaxed)
+            {
+                crate::println!("FIRST-DISP: cpu={} tid={}", cpu, tid);
+            }
+        }
     }
     let cur_for_load = pcpu.current_thread.load(Ordering::Relaxed);
     super::hotplug::tick_load(cpu, cur_for_load == idle_id_for_load);
@@ -3238,6 +3260,8 @@ fn try_switch(current_sp: u64) -> u64 {
         // state=Ready + on_cpu=cpu + current_thread≠tid → false orphan.
         unsafe { thread_mut_from_ref(next_id) }.state = ThreadState::Running;
         trace_sched(next_id, 4); // 4=on_cpu_set
+        // #135 first-dispatch probe — log the first time each tid is picked.
+        maybe_log_first_dispatch(cpu, next_id);
         // #120 dispatch-pattern diagnostic: count + same-tid streak.
         pcpu.dispatch_count.fetch_add(1, Ordering::Relaxed);
         let prev_picked = pcpu.last_dispatched_tid.swap(next_id as u32, Ordering::Relaxed);
