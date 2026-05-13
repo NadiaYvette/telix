@@ -7,6 +7,23 @@
 use crate::sched::task::PersonalityId;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Per-tid FWD probe counter.  Module-scope so exit_current_thread can
+/// reset the counter for the dying tid — tid slots are reused, and
+/// without this the next user gets a quenched counter and zero trace.
+static FWD_LOG_COUNT: [core::sync::atomic::AtomicU32; 256] = {
+    const Z: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    [Z; 256]
+};
+
+/// Called from scheduler::exit_current_thread when a thread dies.
+pub fn reset_fwd_log_count(tid: u32) {
+    if (tid as usize) < FWD_LOG_COUNT.len() {
+        FWD_LOG_COUNT[tid as usize]
+            .store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Per-personality server registration.
 /// Each personality server registers its port here via SYS_PERSONALITY_REGISTER.
 struct PersonalityServer {
@@ -185,11 +202,6 @@ pub fn forward_to_server(
     // doesn't go back through the #UD-emulated dispatcher — possibly
     // a different return route for child threads.
     {
-        static FWD_LOG_COUNT: [core::sync::atomic::AtomicU32; 256] = {
-            const Z: core::sync::atomic::AtomicU32 =
-                core::sync::atomic::AtomicU32::new(0);
-            [Z; 256]
-        };
         if (tid as usize) < FWD_LOG_COUNT.len() {
             let n = FWD_LOG_COUNT[tid as usize]
                 .fetch_add(1, Ordering::Relaxed);

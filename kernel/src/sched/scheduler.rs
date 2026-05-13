@@ -2867,6 +2867,33 @@ fn try_switch(current_sp: u64) -> u64 {
     drain_deferred_requeue(cpu);
     let pcpu = smp::get(cpu);
     let idle_id_for_load = pcpu.idle_thread_id.load(Ordering::Relaxed);
+
+    // #135 dispatch-bug investigation: rate-limited trace of try_switch
+    // decisions on cpu=0.  Each line: prev/idle/has_ready/quantum so we can
+    // see WHY cpu0 keeps re-picking the same task instead of switching to
+    // a ready thread.  Bounded to a couple-hundred calls to avoid spam.
+    static TS_TRACE_COUNT: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let trace_on = cpu == 0 && {
+        let n = TS_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        n < 200
+    };
+    if trace_on {
+        let cur_tid = pcpu.current_thread.load(Ordering::Relaxed);
+        let rq_has_ready = {
+            let rq = percpu_rq()[cpu as usize].lock();
+            let r = rq.has_ready();
+            drop(rq);
+            r
+        };
+        let quantum = thread_ref(cur_tid).quantum;
+        let dq = thread_ref(cur_tid).default_quantum;
+        let yield_asap = thread_ref(cur_tid).yield_asap.load(Ordering::Acquire);
+        crate::println!(
+            "TS-IN: cpu={} prev={} idle={} has_ready={} quantum={} dq={} yield={}",
+            cpu, cur_tid, idle_id_for_load, rq_has_ready, quantum, dq, yield_asap,
+        );
+    }
     let cur_for_load = pcpu.current_thread.load(Ordering::Relaxed);
     super::hotplug::tick_load(cpu, cur_for_load == idle_id_for_load);
 
@@ -3067,7 +3094,17 @@ fn try_switch(current_sp: u64) -> u64 {
         // impossible by construction. drain_deferred_requeue therefore needs
         // no CAS to detect rescue-races; it just enqueues unconditionally.
         // Don't re-enqueue Dead threads (they are exiting).
-        if prev_id != idle_id && prev_t.state != ThreadState::Dead {
+        if prev_id != idle_id
+            && prev_t.state != ThreadState::Dead
+            && prev_t.state != ThreadState::Blocked
+        {
+            // #135 real-block: if prev set state=Blocked (via block_current),
+            // we do NOT deferred_requeue here.  The thread leaves the
+            // runqueue entirely until wake_thread re-enqueues it at base
+            // priority.  We still need to mark on_cpu as not-running so
+            // rescue's stale-on-cpu predicate doesn't misfire.  Done in
+            // the surrounding block below — see the matching else arm.
+            //
             // If the thread was killed, mark Dead + defer full cleanup
             // so it doesn't keep getting scheduled.
             if thread_ref(prev_id).killed.load(Ordering::Relaxed) {
@@ -3124,6 +3161,11 @@ fn try_switch(current_sp: u64) -> u64 {
                 prev_t.state = ThreadState::Ready;
                 trace_sched(prev_id, 1); // 1=deferred_store
             }
+        } else if prev_id != idle_id && prev_t.state == ThreadState::Blocked {
+            // #135 real-block: mark on_cpu so rescue/work-stealing leaves
+            // us alone.  We are NOT in any runqueue — wake_thread will
+            // re-enqueue when wakeup arrives.
+            thread_ref(prev_id).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
         }
     }
 
@@ -3497,60 +3539,96 @@ pub fn clear_wakeup_flag(tid: ThreadId) {
 /// the relevant lock, BEFORE adding itself as a waiter and dropping the lock.
 pub fn block_current(_reason: BlockReason) {
     let tid = current_thread_id();
+    // #135 deadlock probe: rate-limited per-tid log of who's blocking and why.
+    {
+        static BC_LOG_COUNT: [core::sync::atomic::AtomicU32; 16] = {
+            const Z: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            [Z; 16]
+        };
+        if (tid as usize) < BC_LOG_COUNT.len() {
+            let n = BC_LOG_COUNT[tid as usize].fetch_add(1, Ordering::Relaxed);
+            if n < 10 {
+                let reason_tag: u32 = match _reason {
+                    BlockReason::None => 0,
+                    BlockReason::PortRecv(_) => 1,
+                    BlockReason::PortSend(_) => 2,
+                    BlockReason::PortSetRecv(_) => 3,
+                    BlockReason::FutexWait => 4,
+                    BlockReason::ActivationWait => 5,
+                    BlockReason::ZeroPool => 6,
+                    BlockReason::Sleep => 7,
+                    BlockReason::PagerFault => 8,
+                    BlockReason::PagerWait => 9,
+                    BlockReason::WaitChild => 10,
+                    BlockReason::PersonalityWait => 11,
+                    BlockReason::Kswapd => 12,
+                    BlockReason::SvcLookup => 13,
+                    BlockReason::CallReply(_) => 14,
+                };
+                let task_id = thread_ref(tid).task_id;
+                crate::println!(
+                    "BC: tid={} task={} reason={}",
+                    tid, task_id, reason_tag
+                );
+            }
+        }
+    }
     if matches!(_reason, BlockReason::CallReply(_)) {
         trace_point("block_current.CallReply", tid as u32);
     } else {
         trace_point("block_current.entry", tid as u32);
     }
-    // Demote effective_priority to 254 (lowest non-idle) so try_switch
-    // re-enqueues us at the bottom. This prevents blocked-spinning threads
-    // from starving lower-priority threads on single-CPU.
+    // #135 real-block: set state=Blocked + blocked_on=reason so try_switch
+    // skips deferred_requeue (see try_switch state check) and the thread
+    // leaves the runqueue entirely.  Previously this was a spin-wait with
+    // a +1 priority demotion, which caused zero_daemon (base=1, demoted=2)
+    // and kswapd (base=200, demoted=201) to monopolise EEVDF dispatch on
+    // SMP=1 — startup_thread (base=60) never got a slice, Phase 3 never
+    // ran, boot wedged in early kernel.  Real block: blocked threads truly
+    // leave the runqueue; wake_thread re-enqueues them at base priority.
     let tref = thread_ref(tid);
-    // Save and demote by one level — enough for try_switch to prefer
-    // productive threads but not so extreme that the blocked thread
-    // starves (prio=254 caused indefinite starvation under load).
-    let demoted = (tref.base_priority as u16 + 1).min(253) as u8;
-    let saved_prio = tref.prio.swap(demoted, Ordering::AcqRel);
-    unsafe { thread_mut_from_ref(tid) }.effective_priority = demoted;
+    unsafe { thread_mut_from_ref(tid) }.blocked_on = _reason;
     // Signal the scheduler to preempt us on the next timer tick instead of
-    // waiting for the full quantum. This prevents spinning threads from
-    // starving real work on SMP systems.
+    // waiting for the full quantum.  Combined with state=Blocked this means
+    // try_switch picks another thread and does NOT re-enqueue us.
     tref.yield_asap.store(true, Ordering::Release);
     // With dynamic tick, the timer might be programmed far in the future.
     // Reprogram it to fire within one tick so we get preempted promptly.
     crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
-    // Enable interrupts so the timer can preempt us while we spin.
-    // This is critical when called from a syscall handler (SVC/ecall/int),
-    // because hardware masks IRQs on exception entry.
+    // Enable interrupts so the timer can preempt us.
     let saved = crate::arch::irq::save_and_enable();
-    // Spin until the wakeup flag is set. The thread stays Running and
-    // gets preempted normally by timer ticks (quantum-based). This avoids
-    // a race where wake_thread() re-enqueues a Blocked thread that's still
-    // executing on its CPU, causing double-scheduling on SMP.
-    while !tref.wakeup.load(Ordering::Acquire) {
-        // Check if this thread was killed — break out immediately.
+    loop {
+        // Set state=Blocked before each WFI iteration.  Wake_thread will
+        // CAS this back to Ready and enqueue when wakeup arrives.  Set
+        // BEFORE the wakeup load (Release/Acquire pair) so the race
+        // between this thread's wakeup check and a concurrent wake_thread
+        // resolves correctly: either we see wakeup=true here (exit
+        // immediately), or wake_thread sees state=Blocked and enqueues us
+        // (we resume after WFI via normal dispatch).
+        unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Blocked;
+        if tref.wakeup.load(Ordering::Acquire) {
+            break;
+        }
         if tref.killed.load(Ordering::Acquire) {
             break;
         }
-        // Reprogram the timer before HLT. After being preempted and
-        // scheduled back, compute_next_event may have set the timer far in
-        // the future (up to MAX_IDLE_NS). We need a prompt tick so
-        // try_switch preempts us and other threads can run.
+        // Reprogram the timer to fire within one tick so try_switch runs
+        // and picks another thread (we're state=Blocked, so the deferred-
+        // requeue path skips us).
         crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
-        // Use WFI to wait for the next interrupt (timer tick or device IRQ).
-        // This is critical on QEMU TCG: spin_loop() keeps the vCPU busy,
-        // starving QEMU's I/O thread from processing virtio requests.
-        // WFI causes the vCPU to pause until an interrupt arrives.
-        crate::arch::irq::wait_for_interrupt();
-        // Re-arm: try_switch() clears YIELD_ASAP when it preempts us,
-        // but we need it set again so the *next* tick also preempts
-        // immediately (we're still blocked, not doing useful work).
+        // Re-arm yield_asap — try_switch clears it when it preempts.
         tref.yield_asap.store(true, Ordering::Release);
+        // WFI until next interrupt.  When we resume here (after wake +
+        // re-enqueue + dispatch), state has been set to Running by
+        // try_switch.  Loop top will reset state=Blocked if we didn't
+        // see the wakeup — handles spurious wake.
+        crate::arch::irq::wait_for_interrupt();
     }
+    // We're returning to running state.  state=Blocked → Running.
+    unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Running;
+    unsafe { thread_mut_from_ref(tid) }.blocked_on = BlockReason::None;
     tref.yield_asap.store(false, Ordering::Release);
-    // Restore effective priority — no SCHEDULER lock needed.
-    tref.prio.store(saved_prio, Ordering::Release);
-    unsafe { thread_mut_from_ref(tid) }.effective_priority = saved_prio;
     // Re-apply this thread's TLS base in case it was modified while blocked
     // (e.g. by personality_set_tls from the personality server). block_current
     // is a spin-wait — the thread never goes through try_switch on wake-up,
@@ -3620,6 +3698,32 @@ pub fn wake_thread(tid: ThreadId) {
     // Clear yield_asap so the thread isn't preempted on the very next tick
     // before it can check the wakeup flag and exit block_current.
     tref.yield_asap.store(false, Ordering::Release);
+    // #135 real-block: if the thread is state=Blocked (off the runqueue
+    // entirely), transition to Ready and enqueue at base priority.  This
+    // is the wake path for block_current's real-block.  Done BEFORE the
+    // demoted-prio path below: blocked threads aren't demoted any more.
+    //
+    // Acquire fence (via the load ordering) ensures we observe the
+    // block_current's state=Blocked store after our wakeup=true Release.
+    {
+        let state = thread_ref(tid).state;
+        if state == ThreadState::Blocked {
+            // Transition Blocked → Ready and enqueue at base prio on the
+            // waker's CPU.  percpu_enqueue's in_queue swap is the
+            // double-enqueue guard if a concurrent path also enqueues.
+            unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
+            tref.prio.store(tref.base_priority, Ordering::Release);
+            unsafe { thread_mut_from_ref(tid) }.effective_priority =
+                tref.base_priority;
+            set_enq_tag(3); // 3=wake_thread
+            percpu_enqueue(smp::cpu_id(), tref.base_priority, tid);
+            // Reprogram timer so try_switch runs and picks us up promptly.
+            crate::arch::timer::program_oneshot_ns(
+                get_monotonic_ns() + TICK_INTERVAL_NS
+            );
+            return;
+        }
+    }
     // If the thread was demoted by block_current, restore its priority
     // and send an IPI so it exits the WFI loop promptly.
     let demoted_prio = tref.prio.load(Ordering::Acquire);
@@ -5024,6 +5128,13 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
             "EXIT-THREAD-ENTRY: tid={} task={} exit={}",
             _tmp_tid, _tmp_task, exit_code
         );
+        // Reset-on-exit of IRETQ/FWD probe counters was tried here but
+        // correlated with 4/4 boot wedges before init produced output.
+        // Reverted; tid reuse still quenches trace, but that's a smaller
+        // problem than boots not progressing.  Investigate at lower
+        // priority: maybe call from a different lifecycle hook (e.g.,
+        // task_create instead of thread_exit), or use a per-task-id
+        // counter that doesn't get reused on the same boot.
     }
     let (
         tid,

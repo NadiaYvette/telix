@@ -3,6 +3,25 @@
 //! The vector stubs and IDT loading are in vectors.S and idt.rs.
 //! This file contains the ExceptionFrame definition and Rust handlers.
 
+/// Per-tid IRETQ probe counter.  Module-scope (not function-local) so
+/// scheduler::exit_current_thread can reset it when a tid is freed —
+/// otherwise tid reuse leaves the new thread with a quenched counter
+/// and we get zero syscall trace.  See Stage 6 cage debug.
+static IRETQ_LOG_COUNT: [core::sync::atomic::AtomicU32; 256] = {
+    const Z: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    [Z; 256]
+};
+
+/// Called from `scheduler::exit_current_thread` when a thread dies, so
+/// the next thread to reuse the tid slot starts with a fresh quota.
+pub fn reset_iretq_log_count(tid: u32) {
+    if (tid as usize) < IRETQ_LOG_COUNT.len() {
+        IRETQ_LOG_COUNT[tid as usize]
+            .store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Exception context saved on the stack by the vector entry stubs.
 ///
 /// Layout (matching vectors.S push order):
@@ -275,15 +294,6 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                             crate::sched::scheduler::thread_ref(tid).task_id;
                         let task = crate::sched::scheduler::task_ref(task_id);
                         if task.personality as u8 != 0 {
-                            // Use a tid-indexed counter so we only see the
-                            // first few syscall returns per Linux thread.
-                            static IRETQ_LOG_COUNT: [
-                                core::sync::atomic::AtomicU32; 256
-                            ] = {
-                                const Z: core::sync::atomic::AtomicU32 =
-                                    core::sync::atomic::AtomicU32::new(0);
-                                [Z; 256]
-                            };
                             if (tid as usize) < IRETQ_LOG_COUNT.len() {
                                 let n = IRETQ_LOG_COUNT[tid as usize]
                                     .fetch_add(
