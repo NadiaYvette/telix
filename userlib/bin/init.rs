@@ -6748,6 +6748,111 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         }
     }
 
+    // --- Phase 203: cage with DRM backend (Wayland compositor port Stage 7) ---
+    //
+    // Same as Phase 202 but WITHOUT WLR_BACKENDS=headless, so wlroots
+    // exercises the real DRM + libinput chain (plan §8 step 6: parity
+    // milestone with wl_compositor_min, except via cage).  WLR_DRM_NO_
+    // ATOMIC=1 mitigates the absent DRM_IOCTL_MODE_ATOMIC; the wlroots
+    // pixman renderer (the only one we built) drives scanout without
+    // GBM/dmabuf.
+    //
+    // Exit 0 = cage launched, wlroots opened /dev/dri/card0, hello_wl
+    // connected via Wayland protocol, ran, exited.  This validates the
+    // DRM ioctl coverage in linux_srv at compositor-startup level.
+    // Failures here surface as `[ENOSYS] nr=...` in the linux_srv log
+    // — the next gap to fill, per plan §4 priority 3.
+    syscall::debug_puts(b"  init: Phase 203 cage DRM smoke...\n");
+    {
+        if syscall::ns_lookup(b"linux").is_some() {
+            let child = syscall::fork();
+            if child == 0 {
+                for _ in 0..100 {
+                    let (p, _) = syscall::personality_get();
+                    if p != 0 { break; }
+                    syscall::yield_now();
+                }
+                let (p, _) = syscall::personality_get();
+                if p == 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        static PATH: &[u8] = b"/usr/bin/cage\0";
+                        static A0:   &[u8] = b"cage\0";
+                        static A1:   &[u8] = b"--\0";
+                        static A2:   &[u8] = b"/hello_wl\0";
+                        // env: WLR_BACKENDS deliberately omitted →
+                        // wlroots autocreate picks drm + libinput.
+                        // WLR_DRM_NO_ATOMIC keeps us off the atomic-KMS
+                        // path which Telix doesn't yet implement.
+                        static E0:   &[u8] = b"XDG_RUNTIME_DIR=/tmp\0";
+                        static E1:   &[u8] = b"LIBSEAT_BACKEND=builtin\0";
+                        static E2:   &[u8] = b"WLR_DRM_NO_ATOMIC=1\0";
+                        static E3:   &[u8] = b"WAYLAND_DISPLAY=wayland-0\0";
+                        static E4:   &[u8] = b"PATH=/usr/bin:/bin\0";
+                        let argv: [u64; 4] = [
+                            A0.as_ptr() as u64,
+                            A1.as_ptr() as u64,
+                            A2.as_ptr() as u64,
+                            0,
+                        ];
+                        let envp: [u64; 6] = [
+                            E0.as_ptr() as u64,
+                            E1.as_ptr() as u64,
+                            E2.as_ptr() as u64,
+                            E3.as_ptr() as u64,
+                            E4.as_ptr() as u64,
+                            0,
+                        ];
+                        core::hint::black_box(&argv);
+                        core::hint::black_box(&envp);
+                        core::arch::asm!(
+                            "int 0x80",
+                            inlateout("rax") 59u64 => _,
+                            in("rdi") PATH.as_ptr() as u64,
+                            in("rsi") argv.as_ptr() as u64,
+                            in("rdx") envp.as_ptr() as u64,
+                            lateout("rcx") _,
+                            lateout("r11") _,
+                        );
+                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 96u64, options(noreturn));
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    syscall::exit(0);
+                } else {
+                    syscall::exit(1);
+                }
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                let abi = 3u8;
+                #[cfg(target_arch = "aarch64")]
+                let abi = 1u8;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let abi = 0u8;
+                syscall::personality_set(child, 2, abi);
+                let exit_code: i64 = match syscall::wait4(child as i64, 0) {
+                    Some((_p, status)) => ((status >> 8) & 0xFF) as i64,
+                    None => -1,
+                };
+                if exit_code == 0 {
+                    syscall::debug_puts(b"Phase 203 cage DRM smoke: PASSED\n");
+                } else if exit_code == -1 {
+                    syscall::debug_puts(b"Phase 203 cage DRM smoke: FAILED (timeout)\n");
+                } else {
+                    syscall::debug_puts(b"Phase 203 cage DRM smoke: FAILED (exit=");
+                    let mut buf = [0u8; 10];
+                    let mut val = exit_code as u32;
+                    let mut i = 10;
+                    if val == 0 { i -= 1; buf[i] = b'0'; }
+                    while val > 0 && i > 0 { i -= 1; buf[i] = b'0' + (val % 10) as u8; val /= 10; }
+                    syscall::debug_puts(&buf[i..10]);
+                    syscall::debug_puts(b")\n");
+                }
+            }
+        } else {
+            syscall::debug_puts(b"Phase 203 cage DRM smoke: SKIPPED (no linux)\n");
+        }
+    }
+
     // --- Phase 176: swap stress (memory pressure + fork + data integrity) ---
     //
     // Allocates a large anonymous region, writes a pattern to every u64,
