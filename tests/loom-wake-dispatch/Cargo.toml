@@ -1,0 +1,41 @@
+[package]
+name = "loom-wake-dispatch"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Loom model of the #135 real-block + wake_thread + try_switch race
+# (kernel commits 8386f90, f8c2cb8).  We model:
+#
+#   block_current (running thread voluntarily blocks):
+#     1. state.store(Blocked, Release)
+#     2. if wakeup.load(Acquire) { state.store(Running); return; }    // race-safe re-check
+#     3. WFI (modeled as yielding)
+#     4. on wake: state was set to Ready (by waker) → set Running, return
+#
+#   wake_thread (some other thread wakes us):
+#     1. wakeup.store(true, Release)
+#     2. if state.load(Acquire) == Blocked:
+#          CAS Blocked→Ready, enqueue, send IPI
+#
+#   try_switch (target CPU picks new thread):
+#     1. pop from queue: tid
+#     2. CAS state Ready→Running
+#     3. dispatch
+#
+# The invariant under test: if block_current returns AND wakeup was set
+# by a waker, the thread must have been dispatched at least once (i.e.
+# its block_current loop exited via wakeup=true, not via spurious
+# wakeup or timeout).  Equivalently: no "lost wake" — every wake must
+# eventually transition the thread to Running.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
+
+[workspace]
