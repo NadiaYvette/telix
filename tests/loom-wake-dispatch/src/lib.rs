@@ -1,5 +1,16 @@
 //! Loom model of the #135 real-block + wake_thread + try_switch race.
 //!
+//! IMPORTANT: this model assumes `state` is an AtomicU8.  In the
+//! kernel today (kernel/src/sched/thread.rs), `state` is a plain
+//! enum field, accessed from multiple CPUs without synchronization
+//! — i.e. an existing data race.  Adding the SeqCst fence WITHOUT
+//! also making `state` atomic empirically degrades boot reliability
+//! (6× fewer userspace _start fires across a 6-boot histogram, see
+//! reverted commit f918699 for the data).  The proper kernel fix is
+//! to convert `state` to AtomicU8 (or equivalent) so the loom-proven
+//! protocol works as written.  Until that lands, this test serves
+//! as proof-of-bug, not as a recipe to lift directly.
+//!
 //! Kernel context: after commits 8386f90 and f8c2cb8, block_current is
 //! a "real block" — the thread transitions to state=Blocked and leaves
 //! the runqueue.  wake_thread transitions Blocked → Ready and
