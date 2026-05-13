@@ -7,3 +7,6 @@ test.img
 BENCH.DAT
 HELLO.ELF
 tools/xport/cache/
+vendor/
+build/
+stage/
