@@ -247,6 +247,12 @@ pub struct PerCpuData {
     pub cli_max_cycles: core::sync::atomic::AtomicU64,
     /// Count of outermost CLI regions (one per disable/restore pair).
     pub cli_count: core::sync::atomic::AtomicU64,
+    /// #135 last try_switch entry timestamp (monotonic_ns).  Stamped at
+    /// try_switch entry on this CPU.  If a stuck thread's last_cpu shows
+    /// last_try_switch_ns far in the past (e.g. >5s ago when rescue fires),
+    /// that CPU has stopped scheduling — the wedge is a per-CPU halt, not
+    /// a per-thread loss.
+    pub last_try_switch_ns: core::sync::atomic::AtomicU64,
 }
 
 impl PerCpuData {
@@ -270,6 +276,7 @@ impl PerCpuData {
             cli_total_cycles: core::sync::atomic::AtomicU64::new(0),
             cli_max_cycles: core::sync::atomic::AtomicU64::new(0),
             cli_count: core::sync::atomic::AtomicU64::new(0),
+            last_try_switch_ns: core::sync::atomic::AtomicU64::new(0),
         }
     }
 }

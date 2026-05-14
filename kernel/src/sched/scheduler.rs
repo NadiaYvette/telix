@@ -2956,6 +2956,10 @@ fn compute_next_event(cpu: u32, is_idle: bool) -> u64 {
 /// Uses only per-CPU run queue locks — does NOT take the global SCHEDULER lock.
 fn try_switch(current_sp: u64) -> u64 {
     let cpu = smp::cpu_id();
+    // #135: stamp last try_switch entry so rescue can detect dead CPUs.
+    smp::get(cpu)
+        .last_try_switch_ns
+        .store(get_monotonic_ns(), Ordering::Relaxed);
     drain_deferred_requeue(cpu);
     let pcpu = smp::get(cpu);
     let idle_id_for_load = pcpu.idle_thread_id.load(Ordering::Relaxed);
@@ -6794,12 +6798,23 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     let pri = t.prio.load(Ordering::Relaxed);
                     let enq_n = t.enqueue_count.load(Ordering::Relaxed);
                     let pick_n = t.picked_count.load(Ordering::Relaxed);
+                    let now = get_monotonic_ns();
+                    let lts = if (last_cpu as usize) < crate::sched::smp::num_cpus() {
+                        crate::sched::smp::get(last_cpu)
+                            .last_try_switch_ns
+                            .load(Ordering::Relaxed)
+                    } else { 0 };
+                    let last_ts_age_ms = if lts != 0 && now > lts {
+                        (now - lts) / 1_000_000
+                    } else { 0 };
                     crate::println!(
                         "RESCUE-STUCK-PENDING: tid={} age={} task={} on_cpu=PENDING - \
                         treating as orphan (#120 IPI/dispatch loss) \
-                        in_q={} heap_pos={} last_cpu={} prio={} enq_n={} pick_n={}",
+                        in_q={} heap_pos={} last_cpu={} prio={} enq_n={} pick_n={} \
+                        last_cpu_ts_ago_ms={}",
                         tid, pending_age, t.task_id,
                         in_q, hp, last_cpu, pri, enq_n, pick_n,
+                        last_ts_age_ms,
                     );
                     // #135 dump the last 4 transitions of the stuck thread.
                     let next_pos = t.trans_pos.load(Ordering::Relaxed) as usize;
@@ -6847,6 +6862,39 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                             if cli_enter != 0 { 1 } else { 0 },
                             cli_total, cli_max, cli_count,
                         );
+                    }
+                    // #135 Fix A: force-migrate stuck thread away from its
+                    // last_cpu if that CPU has stopped scheduling (>1s since
+                    // last try_switch).  Without this, future percpu_enqueue
+                    // calls are silent no-ops because in_queue=true — the
+                    // thread stays in the dead CPU's heap forever.
+                    if in_q && last_ts_age_ms > 1000
+                        && (last_cpu as usize) < crate::sched::smp::num_cpus()
+                    {
+                        let here = smp::cpu_id();
+                        if last_cpu != here {
+                            // try_lock: if contended (shouldn't be on a halted
+                            // CPU), retry next rescue tick.
+                            if let Some(mut rq) =
+                                percpu_rq()[last_cpu as usize].try_lock()
+                            {
+                                let hp_now = t.eevdf_heap_pos;
+                                if hp_now != crate::sched::heap::HEAP_POS_NONE {
+                                    rq.eevdf_heap.remove(hp_now as usize);
+                                    rq.eevdf_nr_running =
+                                        rq.eevdf_nr_running.saturating_sub(1);
+                                }
+                                drop(rq);
+                                t.in_queue.store(false, Ordering::Release);
+                                crate::println!(
+                                    "RESCUE-MIGRATE: tid={} from cpu={} (stale {}ms) to cpu={}",
+                                    tid, last_cpu, last_ts_age_ms, here,
+                                );
+                                t.last_cpu.store(here, Ordering::Relaxed);
+                                set_enq_tag(11); // 11 = rescue-migrate
+                                percpu_enqueue(here, pri, tid as ThreadId);
+                            }
+                        }
                     }
                 }
                 true

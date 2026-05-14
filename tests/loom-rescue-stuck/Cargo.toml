@@ -1,0 +1,36 @@
+[package]
+name = "loom-rescue-stuck"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Loom model of the #135 rescue-cannot-recover-stuck-thread bug
+# discovered in boot 734 (commits 6f49e02, e75d672).
+#
+# Background: when a CPU stops calling try_switch (the "dead CPU"
+# case observed for CPU 1 in boot 734), threads in its run-queue
+# stay there forever with in_queue=true.  The rescue path's
+# percpu_enqueue silently no-ops because in_queue.swap(true)
+# returns true (already enqueued), so the rescue cannot relocate
+# the thread to a healthy CPU.
+#
+# This loom model:
+#  1. Demonstrates the bug under the OLD (silent-skip) semantics:
+#     `naive_rescue` test shows the stuck thread is never
+#     dispatched even after rescue runs.
+#  2. Validates the FIX (Fix A: force-clear in_queue then
+#     re-enqueue on rescue's CPU): `migrating_rescue` test shows
+#     the thread eventually reaches Running under all
+#     interleavings, including when the dead CPU briefly wakes
+#     up and tries to pick concurrently.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
+
+[workspace]
