@@ -6799,22 +6799,27 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     let enq_n = t.enqueue_count.load(Ordering::Relaxed);
                     let pick_n = t.picked_count.load(Ordering::Relaxed);
                     let now = get_monotonic_ns();
-                    let lts = if (last_cpu as usize) < crate::sched::smp::num_cpus() {
-                        crate::sched::smp::get(last_cpu)
-                            .last_try_switch_ns
-                            .load(Ordering::Relaxed)
-                    } else { 0 };
+                    let (lts, lirq) = if (last_cpu as usize) < crate::sched::smp::num_cpus() {
+                        let pc = crate::sched::smp::get(last_cpu);
+                        (
+                            pc.last_try_switch_ns.load(Ordering::Relaxed),
+                            pc.last_irq_ns.load(Ordering::Relaxed),
+                        )
+                    } else { (0, 0) };
                     let last_ts_age_ms = if lts != 0 && now > lts {
                         (now - lts) / 1_000_000
+                    } else { 0 };
+                    let last_irq_age_ms = if lirq != 0 && now > lirq {
+                        (now - lirq) / 1_000_000
                     } else { 0 };
                     crate::println!(
                         "RESCUE-STUCK-PENDING: tid={} age={} task={} on_cpu=PENDING - \
                         treating as orphan (#120 IPI/dispatch loss) \
                         in_q={} heap_pos={} last_cpu={} prio={} enq_n={} pick_n={} \
-                        last_cpu_ts_ago_ms={}",
+                        last_cpu_ts_ago_ms={} last_irq_ago_ms={}",
                         tid, pending_age, t.task_id,
                         in_q, hp, last_cpu, pri, enq_n, pick_n,
-                        last_ts_age_ms,
+                        last_ts_age_ms, last_irq_age_ms,
                     );
                     // #135 dump the last 4 transitions of the stuck thread.
                     let next_pos = t.trans_pos.load(Ordering::Relaxed) as usize;

@@ -284,6 +284,15 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
     let frame = unsafe { &mut *(frame_sp as *mut ExceptionFrame) };
     let vector = frame.vector();
 
+    // #135 last_irq_ns: stamp every exception/IRQ entry so the rescue
+    // can distinguish "CPU is alive but try_switch not reached" from
+    // "CPU is truly halted (no IRQs arriving)".
+    if vector >= 32 {
+        crate::sched::smp::get(cpu as u32)
+            .last_irq_ns
+            .store(crate::arch::timer::monotonic_ns(), core::sync::atomic::Ordering::Relaxed);
+    }
+
     match vector {
         // CPU exceptions 0-31.
         0 => exception_fault("Divide Error (#DE)", frame),

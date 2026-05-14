@@ -253,6 +253,14 @@ pub struct PerCpuData {
     /// that CPU has stopped scheduling — the wedge is a per-CPU halt, not
     /// a per-thread loss.
     pub last_try_switch_ns: core::sync::atomic::AtomicU64,
+    /// #135 last interrupt entry timestamp on this CPU (any vector).
+    /// Compare with `last_try_switch_ns` to distinguish:
+    ///   * last_irq fresh, last_try_switch stale: CPU is taking IRQs
+    ///     but the handler isn't reaching the scheduler (stuck in some
+    ///     IRQ handler that doesn't go through try_switch).
+    ///   * Both stale: CPU is truly halted — no IRQs arriving, LAPIC
+    ///     delivery broken or vCPU descheduled by host.
+    pub last_irq_ns: core::sync::atomic::AtomicU64,
 }
 
 impl PerCpuData {
@@ -277,6 +285,7 @@ impl PerCpuData {
             cli_max_cycles: core::sync::atomic::AtomicU64::new(0),
             cli_count: core::sync::atomic::AtomicU64::new(0),
             last_try_switch_ns: core::sync::atomic::AtomicU64::new(0),
+            last_irq_ns: core::sync::atomic::AtomicU64::new(0),
         }
     }
 }
