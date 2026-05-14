@@ -21,6 +21,10 @@ scheduler to be kinder to QEMU:
 |                   |         | • else: `chrt -f $TELIX_RTPRIO qemu …` (needs caller rtprio).|
 | `TELIX_RT_SHIM`   | unset   | Path to a setcap'd `qemu-rt-shim` binary; bypasses caller's  |
 |                   |         | rtprio rlimit by self-elevating via its own CAP_SYS_NICE.    |
+| `TELIX_RT_CGROUP` | unset   | Path to an isolated cgroup v2 cpuset (created by             |
+|                   |         | `setup-qemu-rt-cgroup.sh`).  Wrapper writes its own pid to   |
+|                   |         | `$TELIX_RT_CGROUP/cgroup.procs` before exec; qemu inherits.  |
+|                   |         | Keeps SCHED_OTHER tasks off the pinned CPUs.                 |
 | `TELIX_MLOCK`     | unset   | Adds `-overcommit mem-lock=on` to qemu args.  Uses qemu's    |
 |                   |         | own CAP_SYS_NICE file cap to mlockall its memory image —     |
 |                   |         | reduces paging-out under host pressure.  Complementary to    |
@@ -136,6 +140,50 @@ TELIX_RTPRIO=50 tools/boot-h14.sh
 The shim is ~70 lines and lives in the repo, so `dnf` won't ever
 unsetcap it.  Caveat: rebuild + re-setcap when you change toolchains
 or the binary content, since the cap is on the inode.
+
+## Option 5 — isolated cgroup v2 cpuset partition (pairs with FIFO)
+
+SCHED_FIFO on its own has a known caveat: ordinary SCHED_OTHER tasks
+scheduled onto the same CPUs as the FIFO qemu vCPUs get starved
+indefinitely (FIFO runs to block).  The fix is to tell the kernel's
+load balancer **not to** schedule other tasks onto those CPUs at all.
+
+cgroup v2 `cpuset.cpus.partition=isolated` does exactly that: CPUs
+in an isolated partition are excluded from load balancing, and only
+tasks explicitly placed there (via `cgroup.procs`) or affined to
+those CPUs (via `sched_setaffinity` / `taskset`) will run there.
+
+Setup (one sudo per boot, since the cgroup vanishes at reboot):
+
+```bash
+sudo tools/host-setup/setup-qemu-rt-cgroup.sh             # CPUs 0-3
+# or with a custom CPU list:
+# sudo tools/host-setup/setup-qemu-rt-cgroup.sh 0-3,6-7
+```
+
+The script enables the cpuset controller, creates `/sys/fs/cgroup/qemu-rt`,
+sets its `cpuset.cpus` and `cpuset.cpus.partition=isolated`, then
+`chown`s `cgroup.procs` to you so the wrapper can write to it without
+sudo.
+
+Then in your shell:
+
+```bash
+export TELIX_RT_CGROUP=/sys/fs/cgroup/qemu-rt
+TELIX_RTPRIO=50 TELIX_MLOCK=1 tools/boot-h14.sh
+```
+
+The full pipeline composes nicely:
+* `taskset -c 0-3` pins qemu to the isolated CPUs.
+* `cpuset.cpus.partition=isolated` keeps other tasks away from 0-3.
+* `qemu-rt-shim` (via TELIX_RT_SHIM) elevates qemu to SCHED_FIFO.
+* `-overcommit mem-lock=on` (via TELIX_MLOCK) locks qemu memory
+  against host swap pressure.
+
+Verify after launching with `cat /sys/fs/cgroup/qemu-rt/cgroup.procs`
+— the qemu pid should appear.  `htop` or `top -1` then shows CPUs 0-3
+dedicated to qemu's vCPU threads, with system tasks crowded onto the
+remaining CPUs.
 
 ## Verifying it worked
 

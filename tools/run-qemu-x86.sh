@@ -211,4 +211,23 @@ if [ -z "${TELIX_NICE_OFF:-}" ]; then
     fi
 fi
 
+# Optional: join an isolated cgroup v2 cpuset so the kernel scheduler's
+# load balancer keeps other tasks off our pinned CPUs.  Without this,
+# SCHED_FIFO vCPUs starve any SCHED_OTHER tasks that happen to be
+# scheduled to the same CPU.  See docs/host-scheduling-setup.md
+# (Option 5) and tools/host-setup/setup-qemu-rt-cgroup.sh.
+#
+# We write our own pid to cgroup.procs *before* exec'ing qemu — exec
+# preserves the pid so qemu inherits the cgroup membership.  Failures
+# are non-fatal (qemu still runs, just unisolated).
+if [ -n "${TELIX_RT_CGROUP:-}" ]; then
+    if [ -w "$TELIX_RT_CGROUP/cgroup.procs" ]; then
+        echo $$ > "$TELIX_RT_CGROUP/cgroup.procs" 2>/dev/null \
+            && echo "  [run-qemu] joined cgroup: $TELIX_RT_CGROUP" \
+            || echo "  [run-qemu] WARN: could not enter $TELIX_RT_CGROUP" >&2
+    else
+        echo "  [run-qemu] WARN: $TELIX_RT_CGROUP/cgroup.procs not writable; run setup-qemu-rt-cgroup.sh" >&2
+    fi
+fi
+
 exec "${LAUNCH_PREFIX[@]}" qemu-system-x86_64 "${QEMU_ARGS[@]}"
