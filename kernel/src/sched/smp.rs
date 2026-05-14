@@ -215,6 +215,18 @@ pub struct PerCpuData {
     /// never picks rescue-enqueued threads on CPU N specifically" — is
     /// still live.  Pure diagnostic; no concurrency-protocol meaning.
     pub rescue_stuck_pending_count: core::sync::atomic::AtomicU64,
+    /// #135 IPI delivery probe: count of vector 0xFD (reschedule IPI)
+    /// entries on this CPU.  Bumped at IPI vector handler entry in
+    /// arch/x86_64/exception.rs.  Compared with `dispatch_count` to
+    /// detect "IPI arrives but try_switch picks nothing" — a sign of
+    /// run-queue / on_cpu transition problems.
+    pub ipi_recv_count: core::sync::atomic::AtomicU64,
+    /// #135 IPI send breakdown by target.  send_reschedule_ipi bumps
+    /// `smp::current().ipi_send_to[target]`.  Sum across all CPUs'
+    /// arrays gives the global send-to-target totals; the per-CPU
+    /// breakdown identifies which CPU is doing the waking.  Compared
+    /// with `ipi_recv_count` (target side) to find delivery losses.
+    pub ipi_send_to: [core::sync::atomic::AtomicU64; 8],
     /// #135 wake-to-dispatch latency histogram.  4 sub-buckets per decade
     /// over 1µs..1s (6 decades = 24 sub-buckets), plus an underflow
     /// bucket (<1µs) and an overflow bucket (≥1s) for 26 total.  Bumped
@@ -224,6 +236,17 @@ pub struct PerCpuData {
     /// compute p50/p90/p99/p99.9 from cumulative sums so the per-CPU
     /// log line stays narrow while preserving tail visibility.
     pub dispatch_latency_hist: [core::sync::atomic::AtomicU64; 26],
+    /// #135 CLI-residency probe: TSC at the most recent first-level
+    /// `arch::irq::disable()` on this CPU.  Updated only on outermost
+    /// transition (IF was set before).  Restore reads it back to
+    /// compute the CLI-region duration.  0 means no CLI region open.
+    pub cli_enter_tsc: core::sync::atomic::AtomicU64,
+    /// Cumulative TSC cycles spent with interrupts disabled on this CPU.
+    pub cli_total_cycles: core::sync::atomic::AtomicU64,
+    /// Largest single CLI region observed on this CPU (TSC cycles).
+    pub cli_max_cycles: core::sync::atomic::AtomicU64,
+    /// Count of outermost CLI regions (one per disable/restore pair).
+    pub cli_count: core::sync::atomic::AtomicU64,
 }
 
 impl PerCpuData {
@@ -240,7 +263,13 @@ impl PerCpuData {
             dispatch_set_pending_count: core::sync::atomic::AtomicU64::new(0),
             dispatch_cas_ok_count: core::sync::atomic::AtomicU64::new(0),
             rescue_stuck_pending_count: core::sync::atomic::AtomicU64::new(0),
+            ipi_recv_count: core::sync::atomic::AtomicU64::new(0),
+            ipi_send_to: [const { core::sync::atomic::AtomicU64::new(0) }; 8],
             dispatch_latency_hist: [const { core::sync::atomic::AtomicU64::new(0) }; 26],
+            cli_enter_tsc: core::sync::atomic::AtomicU64::new(0),
+            cli_total_cycles: core::sync::atomic::AtomicU64::new(0),
+            cli_max_cycles: core::sync::atomic::AtomicU64::new(0),
+            cli_count: core::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -267,6 +296,53 @@ static ONLINE_CPUS: AtomicU32 = AtomicU32::new(0);
 #[inline]
 pub fn cpu_id() -> u32 {
     crate::arch::cpu::cpu_id()
+}
+
+/// #135 CLI-residency probe: called from `arch::irq::disable()` on the
+/// outermost transition (when IF was set before).  Records the entry TSC
+/// on the current CPU.  No-op until PER_CPU_PTR is populated.
+#[inline]
+pub fn record_cli_enter() {
+    let ptr = PER_CPU_PTR.load(Ordering::Relaxed);
+    if ptr.is_null() { return; }
+    let cpu = cpu_id() as usize;
+    if cpu >= num_cpus() { return; }
+    #[cfg(target_arch = "x86_64")]
+    let tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    #[cfg(not(target_arch = "x86_64"))]
+    let tsc: u64 = 0;
+    unsafe { (*ptr.add(cpu)).cli_enter_tsc.store(tsc, Ordering::Relaxed); }
+}
+
+/// #135 CLI-residency probe: called from `arch::irq::restore()` on the
+/// outermost transition (when IF will be re-enabled).  Reads the matching
+/// entry TSC and accumulates the delta into total/max/count.
+#[inline]
+pub fn record_cli_exit() {
+    let ptr = PER_CPU_PTR.load(Ordering::Relaxed);
+    if ptr.is_null() { return; }
+    let cpu = cpu_id() as usize;
+    if cpu >= num_cpus() { return; }
+    let pcpu = unsafe { &*ptr.add(cpu) };
+    let enter = pcpu.cli_enter_tsc.load(Ordering::Relaxed);
+    if enter == 0 { return; }
+    #[cfg(target_arch = "x86_64")]
+    let now = unsafe { core::arch::x86_64::_rdtsc() };
+    #[cfg(not(target_arch = "x86_64"))]
+    let now: u64 = 0;
+    let delta = now.wrapping_sub(enter);
+    pcpu.cli_total_cycles.fetch_add(delta, Ordering::Relaxed);
+    pcpu.cli_count.fetch_add(1, Ordering::Relaxed);
+    let mut cur_max = pcpu.cli_max_cycles.load(Ordering::Relaxed);
+    while delta > cur_max {
+        match pcpu.cli_max_cycles.compare_exchange_weak(
+            cur_max, delta, Ordering::Relaxed, Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => cur_max = observed,
+        }
+    }
+    pcpu.cli_enter_tsc.store(0, Ordering::Relaxed);
 }
 
 /// Get per-CPU data for the given CPU index.

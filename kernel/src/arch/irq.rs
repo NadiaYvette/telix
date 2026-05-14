@@ -41,7 +41,11 @@ pub fn disable() -> usize {
                 out(reg) flags,
             );
         }
-        flags as usize
+        let saved = flags as usize;
+        if saved & 0x200 != 0 {
+            crate::sched::smp::record_cli_enter();
+        }
+        saved
     }
     #[cfg(target_arch = "loongarch64")]
     {
@@ -90,6 +94,7 @@ pub fn restore(saved: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if saved & 0x200 != 0 {
+            crate::sched::smp::record_cli_exit();
             unsafe {
                 core::arch::asm!("sti");
             }
@@ -251,6 +256,16 @@ pub fn wait_for_interrupt() {
 /// /tmp/telix-tickless-smp-ipi.md (QEMU-side session, 2026-04-24).
 #[inline]
 pub fn send_reschedule_ipi(target_cpu: u32) {
+    // #135 IPI per-target counter — bump BEFORE the actual send so the
+    // count reflects send attempts, not just successful sends.  See
+    // sched/smp.rs ipi_send_to for the matching probe.
+    {
+        let src = crate::sched::smp::cpu_id();
+        let pcpu = crate::sched::smp::get(src);
+        let slot = (target_cpu as usize).min(pcpu.ipi_send_to.len() - 1);
+        pcpu.ipi_send_to[slot]
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     // Hypervisor fast path: when running under KVM (or any
     // hypervisor that advertises a PV IPI hypercall), bypass the
     // native LAPIC ICR write and ask the host directly.  Host-side

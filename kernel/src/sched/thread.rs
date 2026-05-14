@@ -222,6 +222,19 @@ pub struct Thread {
     /// High-water count of staged leases (slots may be cleared below this;
     /// iterate by `dst_aspace != 0`).
     pub pending_lease_count: core::sync::atomic::AtomicU32,
+    /// #135 transition ring: last 4 state/on_cpu transitions.  Each entry
+    /// is packed as:
+    ///   bits  0..7   action id (1=SET_PENDING, 2=CAS_OK, 3=CAS_FAIL,
+    ///                 4=DESCHED, 5=WAKE_SET_READY)
+    ///   bits  8..15  cpu (0..255, 0xFF = unknown)
+    ///   bits 16..23  state (Ready=0, Running=1, Blocked=2, Dead=3)
+    ///   bits 24..31  on_cpu encoded (0..0xFD = cpu, 0xFE = PENDING, 0xFF = MAX)
+    ///   bits 32..63  low 32 bits of monotonic_ns
+    /// Written from `sched::record_thread_transition()`.  Dumped from the
+    /// RESCUE-STUCK-PENDING block for the stuck tid.
+    pub trans_ring: [core::sync::atomic::AtomicU64; 4],
+    /// Next slot index (modulo 4) to write into trans_ring.
+    pub trans_pos: core::sync::atomic::AtomicU8,
 }
 
 impl Thread {
@@ -303,6 +316,8 @@ impl Thread {
             pending_leases: [const { crate::ipc::call_reply::LeaseSlot::empty() };
                 crate::ipc::call_reply::MAX_LEASES_PER_CAP],
             pending_lease_count: core::sync::atomic::AtomicU32::new(0),
+            trans_ring: [const { core::sync::atomic::AtomicU64::new(0) }; 4],
+            trans_pos: core::sync::atomic::AtomicU8::new(0),
         }
     }
 }

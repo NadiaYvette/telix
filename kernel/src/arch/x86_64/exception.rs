@@ -458,6 +458,16 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         0xFD => {
             super::lapic::IPI_RECV_COUNT
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // #135 per-CPU IPI recv counter — combined with per-CPU
+            // dispatch_count, exposes "IPI arrives but try_switch
+            // doesn't dispatch" — the suspected on_cpu / pick-side
+            // failure mode for the boot variability.
+            {
+                let cpu = crate::sched::smp::cpu_id();
+                let pcpu = crate::sched::smp::get(cpu);
+                pcpu.ipi_recv_count
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
             super::lapic::eoi();
             return validate_iretq_frame(crate::sched::scheduler::reschedule_ipi(frame_sp), frame_sp, 0xFD);
         }

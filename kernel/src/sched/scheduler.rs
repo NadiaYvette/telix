@@ -123,6 +123,52 @@ const MAX_IDLE_NS: u64 = 10_000_000; // 10ms — one tick interval, matches TICK
 /// the re-enqueued thread before the original CAS completes).
 const ON_CPU_PENDING: u32 = u32::MAX - 1;
 
+/// #135 transition-ring action IDs.
+pub const TRANS_SET_PENDING: u8 = 1;
+pub const TRANS_CAS_OK: u8 = 2;
+pub const TRANS_CAS_FAIL: u8 = 3;
+#[allow(dead_code)]
+pub const TRANS_DESCHED: u8 = 4;
+#[allow(dead_code)]
+pub const TRANS_WAKE_SET_READY: u8 = 5;
+
+/// #135 set on_cpu=ON_CPU_PENDING with action-tagged transition record.
+/// Use this instead of `t.on_cpu.store(ON_CPU_PENDING, Release)` at any
+/// site where the thread is transitioning Ready/Blocked → about-to-be-picked.
+/// `action_tag`: 5 = WAKE_SET_READY (wake/enqueue path),
+///               6 = PARK_SET_PENDING (park_current_for_* deferred store).
+#[inline]
+pub fn set_on_cpu_pending(tid: ThreadId, action_tag: u8, state: ThreadState) {
+    thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+    record_trans(tid as u32, action_tag, state, ON_CPU_PENDING);
+}
+
+/// #135 record one transition into the per-thread `trans_ring`.  Each
+/// entry packs (action, cpu, state, on_cpu_enc, ts_low32) into a u64.
+/// `on_cpu_enc`: 0..0xFD = real CPU id, 0xFE = PENDING, 0xFF = MAX.
+#[inline]
+pub fn record_trans(tid: u32, action: u8, state: ThreadState, on_cpu: u32) {
+    let t = thread_ref(tid);
+    let cpu = smp::cpu_id() as u8;
+    let on_cpu_enc: u8 = if on_cpu == u32::MAX {
+        0xFF
+    } else if on_cpu == ON_CPU_PENDING {
+        0xFE
+    } else if on_cpu < 0xFD {
+        on_cpu as u8
+    } else {
+        0xFD
+    };
+    let ts = (crate::arch::timer::monotonic_ns() & 0xFFFF_FFFF) as u64;
+    let entry: u64 = (action as u64)
+        | ((cpu as u64) << 8)
+        | ((state as u8 as u64) << 16)
+        | ((on_cpu_enc as u64) << 24)
+        | (ts << 32);
+    let pos = (t.trans_pos.fetch_add(1, Ordering::Relaxed) as usize) & 3;
+    t.trans_ring[pos].store(entry, Ordering::Relaxed);
+}
+
 /// on_cpu sentinel (unused — kept for documentation):
 /// Old sentinel for threads in deferred-requeue slots. Removed because leaving
 /// on_cpu at the CPU number and using a CAS-from-cpu in drain is simpler and
@@ -445,6 +491,7 @@ fn dequeue_set_pending(tid: ThreadId) {
     smp::current()
         .dispatch_set_pending_count
         .fetch_add(1, Ordering::Relaxed);
+    record_trans(tid as u32, TRANS_SET_PENDING, thread_ref(tid).state, ON_CPU_PENDING);
 }
 
 #[inline]
@@ -2443,6 +2490,41 @@ pub fn tick(current_sp: u64) -> u64 {
         let cpu = smp::cpu_id();
         if cpu == 0 {
             let n = WATCHDOG_TICK.fetch_add(1, Ordering::Relaxed);
+            // #135 periodic CLI residency dump (every 1s ≈ 100 ticks) to
+            // catch large CLI regions BEFORE the first RESCUE-STUCK-PENDING
+            // contaminates the readings with rescue-path print storms.
+            // Only logs when cli_max changes on any CPU (monotonic max), so
+            // the log doesn't repeat constant values.
+            static CLI_MAX_SEEN: [core::sync::atomic::AtomicU64; 4] = [
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+            ];
+            if n > 0 && n % 100 == 0 {
+                let mut changed = false;
+                for c in 0..4u32.min(smp::num_cpus() as u32) {
+                    let pc = smp::get(c);
+                    let cur_max = pc.cli_max_cycles.load(Ordering::Relaxed);
+                    let prev = CLI_MAX_SEEN[c as usize].load(Ordering::Relaxed);
+                    if cur_max > prev {
+                        CLI_MAX_SEEN[c as usize].store(cur_max, Ordering::Relaxed);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    for c in 0..4u32.min(smp::num_cpus() as u32) {
+                        let pc = smp::get(c);
+                        let max = pc.cli_max_cycles.load(Ordering::Relaxed);
+                        let tot = pc.cli_total_cycles.load(Ordering::Relaxed);
+                        let cnt = pc.cli_count.load(Ordering::Relaxed);
+                        crate::println!(
+                            "CLI-MAX-TICK: cpu={} tick={} max={} total={} count={}",
+                            c, n, max, tot, cnt,
+                        );
+                    }
+                }
+            }
             // Check roughly every 5 seconds (tick ≈ 10ms → 500 ticks).
             if n > 0 && n % 500 == 0 {
                 let sends = crate::sched::stats::IPC_SENDS.load(Ordering::Relaxed);
@@ -3162,6 +3244,7 @@ fn try_switch(current_sp: u64) -> u64 {
                 // state=Ready. Once that store is visible, rescue's stale-
                 // on-cpu predicate (state=Ready ∧ on_cpu<ncpus) cannot match.
                 thread_ref(prev_id).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                record_trans(prev_id as u32, 7, prev_t.state, ON_CPU_PENDING);
                 let packed = (prev_id as u64) | ((prev_prio as u64) << 32) | ((cpu as u64) << 40);
                 let old_deferred = deferred_requeue()[cpu as usize].swap(packed, Ordering::AcqRel);
                 if old_deferred != 0 {
@@ -3188,6 +3271,7 @@ fn try_switch(current_sp: u64) -> u64 {
             // us alone.  We are NOT in any runqueue — wake_thread will
             // re-enqueue when wakeup arrives.
             thread_ref(prev_id).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+            record_trans(prev_id as u32, 10, ThreadState::Blocked, ON_CPU_PENDING);
         }
     }
 
@@ -3236,6 +3320,7 @@ fn try_switch(current_sp: u64) -> u64 {
             ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire,
         ) {
             trace_point("try_switch.cas_fail", next_id as u32);
+            record_trans(next_id as u32, TRANS_CAS_FAIL, thread_ref(next_id).state, other_cpu);
             crate::println!(
                 "DOUBLE-SCHED: tid={} on_cpu={} this_cpu={} prev={} src={} set_by={} inq={} state={:?}",
                 next_id, other_cpu, cpu, prev_id,
@@ -3252,6 +3337,7 @@ fn try_switch(current_sp: u64) -> u64 {
             return idle_sp;
         }
         trace_point("try_switch.cas_ok", next_id as u32);
+        record_trans(next_id as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
         thread_ref(next_id).on_cpu_set_by.store(1, Ordering::Relaxed); // 1=try_switch
         // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
         dispatch_cas_ok(pcpu, next_id);
@@ -3433,6 +3519,7 @@ pub fn voluntary_reschedule() {
     // long after the assembly switch has completed).
     if cur_id != idle_id {
         thread_ref(cur_id).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+        record_trans(cur_id as u32, 7, thread_ref(cur_id).state, ON_CPU_PENDING);
         let packed = (cur_id as u64) | ((cur_prio as u64) << 32) | ((cpu as u64) << 40);
         let old_deferred = deferred_requeue()[cpu as usize].swap(packed, Ordering::AcqRel);
         if old_deferred != 0 {
@@ -3462,6 +3549,7 @@ pub fn voluntary_reschedule() {
         if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
             ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire,
         ) {
+            record_trans(next_id as u32, TRANS_CAS_FAIL, thread_ref(next_id).state, other_cpu);
             crate::println!(
                 "DOUBLE-SCHED(vol): tid={} already on cpu={}, this cpu={}",
                 next_id, other_cpu, cpu
@@ -3496,6 +3584,7 @@ pub fn voluntary_reschedule() {
             );
             return;
         }
+        record_trans(next_id as u32, TRANS_CAS_OK, ThreadState::Running, cpu);
         thread_ref(next_id).on_cpu_set_by.store(2, Ordering::Relaxed); // 2=vol_resched
         // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
         dispatch_cas_ok(pcpu, next_id);
@@ -3631,6 +3720,7 @@ pub fn block_current(_reason: BlockReason) {
         // immediately), or wake_thread sees state=Blocked and enqueues us
         // (we resume after WFI via normal dispatch).
         unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Blocked;
+        record_trans(tid as u32, 13, ThreadState::Blocked, tref.on_cpu.load(Ordering::Relaxed));
         if tref.wakeup.load(Ordering::Acquire) {
             break;
         }
@@ -3740,6 +3830,7 @@ pub fn wake_thread(tid: ThreadId) {
             // the double-enqueue guard if a concurrent path also
             // enqueues.
             unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
+            record_trans(tid as u32, 14, ThreadState::Ready, tref.on_cpu.load(Ordering::Relaxed));
             tref.prio.store(tref.base_priority, Ordering::Release);
             unsafe { thread_mut_from_ref(tid) }.effective_priority =
                 tref.base_priority;
@@ -5748,6 +5839,7 @@ pub fn clear_pending_switch(cpu: usize) {
                 let prio = tref.prio.load(Ordering::Acquire);
                 tref.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
                 unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
+                record_trans(tid as u32, 11, ThreadState::Ready, ON_CPU_PENDING);
                 trace_sched(tid, 16); // 16 = ipc_wake (deferred enqueue path)
                 set_enq_tag(8); // 8 = clear_pending_switch deferred enqueue
                 percpu_enqueue(cpu as u32, prio, tid);
@@ -5945,6 +6037,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
         if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
             ON_CPU_PENDING, cpu_idx, Ordering::AcqRel, Ordering::Acquire,
         ) {
+            record_trans(next_id as u32, TRANS_CAS_FAIL, thread_ref(next_id).state, other_cpu);
             crate::println!(
                 "DOUBLE-SCHED(park): tid={} already on cpu={}, this cpu={}",
                 next_id, other_cpu, cpu_idx
@@ -5957,6 +6050,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
             pending_switch_sp()[cpu].store(idle_sp2, Ordering::Release);
             return;
         }
+        record_trans(next_id as u32, TRANS_CAS_OK, ThreadState::Running, cpu_idx);
         thread_ref(next_id).on_cpu_set_by.store(3, Ordering::Relaxed); // 3=park_ipc
         // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
         dispatch_cas_ok(pcpu, next_id);
@@ -6109,6 +6203,7 @@ pub fn wake_parked_thread(tid: ThreadId) {
                 // NEW_INV: store ON_CPU_PENDING BEFORE state=Ready.
                 tref.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
                 unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
+                record_trans(tid as u32, 12, ThreadState::Ready, ON_CPU_PENDING);
                 trace_sched(tid, 16);
                 set_enq_tag(6);
                 percpu_enqueue(target, prio, tid);
@@ -6535,10 +6630,27 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                             let p99 = lat_percentile_ns(&hist, 9900);
                             let p999 = lat_percentile_ns(&hist, 9990);
                             let p9999 = lat_percentile_ns(&hist, 9999);
+                            // #135 per-CPU IPI accounting: recv = vector
+                            // 0xFD entries on this CPU; send_to[0..4] =
+                            // IPIs this CPU has sent to each target
+                            // (target_cpu indexed); dispatched = total
+                            // try_switch picks of non-idle threads on
+                            // this CPU (existing dispatch_count).  The
+                            // recv/dispatched ratio tells us whether
+                            // IPIs are arriving but failing to trigger
+                            // a pick; send_to asymmetry tells us if one
+                            // CPU is doing all the waking.
+                            let recv = pc.ipi_recv_count.load(Ordering::Relaxed);
+                            let dispatched = pc.dispatch_count.load(Ordering::Relaxed);
+                            let s0 = pc.ipi_send_to[0].load(Ordering::Relaxed);
+                            let s1 = pc.ipi_send_to[1].load(Ordering::Relaxed);
+                            let s2 = pc.ipi_send_to[2].load(Ordering::Relaxed);
+                            let s3 = pc.ipi_send_to[3].load(Ordering::Relaxed);
                             crate::println!(
-                                "  IPI-LAT: cpu={} n={} p50={} p90={} p99={} p999={} p9999={} rescue_stuck={}",
+                                "  IPI-LAT: cpu={} n={} p50={} p90={} p99={} p999={} p9999={} rescue_stuck={} ipi_recv={} disp={} send_to=[{},{},{},{}]",
                                 c, n, p50, p90, p99, p999, p9999,
                                 pc.rescue_stuck_pending_count.load(Ordering::Relaxed),
+                                recv, dispatched, s0, s1, s2, s3,
                             );
                         }
                     }
@@ -6664,6 +6776,53 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                         treating as orphan (#120 IPI/dispatch loss)",
                         tid, pending_age, t.task_id
                     );
+                    // #135 dump the last 4 transitions of the stuck thread.
+                    let next_pos = t.trans_pos.load(Ordering::Relaxed) as usize;
+                    crate::println!(
+                        "  TRANS-RING: tid={} (oldest→newest, format: action/cpu/state/on_cpu@ts32):",
+                        tid,
+                    );
+                    for i in 0..4usize {
+                        let slot = (next_pos + i) & 3;
+                        let entry = t.trans_ring[slot].load(Ordering::Relaxed);
+                        if entry == 0 {
+                            continue;
+                        }
+                        let action = (entry & 0xFF) as u8;
+                        let cpu = ((entry >> 8) & 0xFF) as u8;
+                        let state = ((entry >> 16) & 0xFF) as u8;
+                        let on_cpu_enc = ((entry >> 24) & 0xFF) as u8;
+                        let ts = (entry >> 32) as u32;
+                        crate::println!(
+                            "    [{}]: action={} cpu={} state={} on_cpu={} ts={}",
+                            i, action, cpu, state, on_cpu_enc, ts,
+                        );
+                    }
+                    for c in 0..4usize {
+                        let pc = crate::sched::smp::get(c as u32);
+                        let recv = pc.ipi_recv_count.load(Ordering::Relaxed);
+                        let disp = pc.dispatch_count.load(Ordering::Relaxed);
+                        let s0 = pc.ipi_send_to[0].load(Ordering::Relaxed);
+                        let s1 = pc.ipi_send_to[1].load(Ordering::Relaxed);
+                        let s2 = pc.ipi_send_to[2].load(Ordering::Relaxed);
+                        let s3 = pc.ipi_send_to[3].load(Ordering::Relaxed);
+                        let cur = pc.current_thread.load(Ordering::Relaxed);
+                        let dispg = pc.dispatching_tid.load(Ordering::Relaxed);
+                        let idle = pc.idle_thread_id.load(Ordering::Relaxed);
+                        let cli_total = pc.cli_total_cycles.load(Ordering::Relaxed);
+                        let cli_max = pc.cli_max_cycles.load(Ordering::Relaxed);
+                        let cli_count = pc.cli_count.load(Ordering::Relaxed);
+                        let cli_enter = pc.cli_enter_tsc.load(Ordering::Relaxed);
+                        crate::println!(
+                            "IPI-CNT: cpu={} recv={} disp={} send_to=[{},{},{},{}] \
+                             cur={} dispg={} idle={} cli_open={} \
+                             cli_total={} cli_max={} cli_count={}",
+                            c, recv, disp, s0, s1, s2, s3,
+                            cur, dispg, idle,
+                            if cli_enter != 0 { 1 } else { 0 },
+                            cli_total, cli_max, cli_count,
+                        );
+                    }
                 }
                 true
             } else {
@@ -6744,6 +6903,7 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     rescue_per_tid_inc(tid as u32);
                     t.in_queue.store(false, Ordering::Release);
                     t.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                    record_trans(tid as u32, 8, t.state, ON_CPU_PENDING);
                     trace_sched(tid as u32, 8); // 8=rescue_enq
                     set_enq_tag(7); // 7=rescue
                     percpu_enqueue(target, prio, tid as ThreadId);
@@ -6852,6 +7012,7 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 // try_switch reads on_cpu as a stale CPU number before
                 // dequeue.
                 t.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+                record_trans(tid as u32, 8, t.state, ON_CPU_PENDING);
                 trace_sched(tid as u32, 8); // 8=rescue_enq
                 set_enq_tag(7); // 7=rescue
                 // Per-branch rescue counter: the two predicates that lead
@@ -7069,6 +7230,7 @@ fn check_sleep_timers() {
         // BEFORE state=Ready, so rescue's on==MAX orphan predicate cannot
         // observe (state=Ready ∧ on_cpu=MAX).
         thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+        record_trans(tid as u32, 15, ThreadState::Ready, ON_CPU_PENDING);
         // Diagnostic: stamp wake timestamp for the wake-to-dispatch
         // latency histogram.  Set BEFORE state=Ready so try_switch on
         // any CPU that picks up this thread observes a non-zero
@@ -7326,6 +7488,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
         if let Err(other_cpu) = thread_ref(next_id).on_cpu.compare_exchange(
             ON_CPU_PENDING, cpu_idx, Ordering::AcqRel, Ordering::Acquire,
         ) {
+            record_trans(next_id as u32, TRANS_CAS_FAIL, thread_ref(next_id).state, other_cpu);
             crate::println!(
                 "DOUBLE-SCHED(sleep): tid={} already on cpu={}, this cpu={}",
                 next_id, other_cpu, cpu_idx
@@ -7339,6 +7502,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
             let _ = irq_saved;
             return;
         }
+        record_trans(next_id as u32, TRANS_CAS_OK, ThreadState::Running, cpu_idx);
         thread_ref(next_id).on_cpu_set_by.store(5, Ordering::Relaxed); // 5=park_sleep
         // #120 dispatch-symmetry: clear pending state + bump cas_ok counter.
         dispatch_cas_ok(pcpu, next_id);
@@ -7451,6 +7615,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
             thread_ref(sender_tid as ThreadId)
                 .on_cpu
                 .store(ON_CPU_PENDING, Ordering::Release);
+            record_trans(sender_tid as u32, 16, ThreadState::Running, ON_CPU_PENDING);
             let packed = (sender_tid as u64) | ((sender_prio as u64) << 32)
                 | ((cpu_id as u64) << 40);
             let old_deferred = deferred_requeue()[cpu].swap(packed, Ordering::AcqRel);
