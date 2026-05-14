@@ -2478,6 +2478,26 @@ pub fn tick(current_sp: u64) -> u64 {
                         Err(seen) => max = seen,
                     }
                 }
+                // #135 host vCPU desched probe: log when this CPU's tick
+                // gap exceeds 500ms.  Rate-limited per-CPU to 30 events to
+                // avoid flooding when host load is consistently high.
+                if gap > 500_000_000 {
+                    static TICK_GAP_LOG_COUNT: [core::sync::atomic::AtomicU32; 4] = [
+                        core::sync::atomic::AtomicU32::new(0),
+                        core::sync::atomic::AtomicU32::new(0),
+                        core::sync::atomic::AtomicU32::new(0),
+                        core::sync::atomic::AtomicU32::new(0),
+                    ];
+                    let slot = cpu.min(3);
+                    let n = TICK_GAP_LOG_COUNT[slot]
+                        .fetch_add(1, Ordering::Relaxed);
+                    if n < 30 {
+                        crate::println!(
+                            "TICK-GAP: cpu={} gap_ms={} (n={}) — host vCPU likely descheduled",
+                            cpu, gap / 1_000_000, n + 1,
+                        );
+                    }
+                }
             }
         }
     }
@@ -6873,7 +6893,12 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     // last try_switch).  Without this, future percpu_enqueue
                     // calls are silent no-ops because in_queue=true — the
                     // thread stays in the dead CPU's heap forever.
-                    if in_q && last_ts_age_ms > 1000
+                    // Migrate threshold = 100ms (was 1000ms): host vCPU
+                    // descheduling can blip for a few hundred ms even on a
+                    // healthy boot.  100ms catches recurring multi-tick
+                    // halts while still allowing one missed tick to slide
+                    // (10ms structural diff between irq and try_switch).
+                    if in_q && last_ts_age_ms > 100
                         && (last_cpu as usize) < crate::sched::smp::num_cpus()
                     {
                         let here = smp::cpu_id();
