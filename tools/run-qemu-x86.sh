@@ -179,18 +179,17 @@ fi
 #   TELIX_NICE_OFF  — set to skip both pinning and chrt entirely.
 LAUNCH_PREFIX=()
 if [ -z "${TELIX_NICE_OFF:-}" ]; then
-    PIN_CPUS="${TELIX_PIN_CPUS-0-3}"
-    if [ -n "$PIN_CPUS" ] && command -v taskset >/dev/null 2>&1; then
-        LAUNCH_PREFIX+=(taskset -c "$PIN_CPUS")
-    fi
+    # The shim, if used, must come FIRST in LAUNCH_PREFIX so it joins the
+    # cgroup while it still has access to all CPUs.  After the cgroup
+    # join, the process's effective cpuset is constrained to the
+    # cgroup's cpus.cpus (e.g. 0-3), so taskset within that set is
+    # redundant — and taskset would fail before the join, because
+    # the parent shell's cgroup has 0-3 excluded by the partition.
+    SHIM_USED=false
     if [ -n "${TELIX_RTPRIO:-}" ]; then
         if [ -n "${TELIX_RT_SHIM:-}" ] && [ -x "$TELIX_RT_SHIM" ]; then
-            # Preferred path: setcap'd shim has its own CAP_SYS_NICE and
-            # self-elevates before exec.  Doesn't require the caller's
-            # rtprio ulimit, so it works inside screen / nested shells
-            # that inherited zero rtprio from a PAM session pre-dating
-            # /etc/security/limits.conf changes.
             LAUNCH_PREFIX+=("$TELIX_RT_SHIM")
+            SHIM_USED=true
         elif command -v chrt >/dev/null 2>&1; then
             RTLIMIT="$(ulimit -r 2>/dev/null || echo 0)"
             if [ "$RTLIMIT" -lt "$TELIX_RTPRIO" ] 2>/dev/null; then
@@ -206,28 +205,26 @@ if [ -z "${TELIX_NICE_OFF:-}" ]; then
             echo "  [run-qemu] WARN: neither TELIX_RT_SHIM nor chrt available; ignoring TELIX_RTPRIO=$TELIX_RTPRIO" >&2
         fi
     fi
+    PIN_CPUS="${TELIX_PIN_CPUS-0-3}"
+    # Skip taskset when shim+cgroup will handle affinity via membership.
+    if [ "$SHIM_USED" = "true" ] && [ -n "${TELIX_RT_CGROUP:-}" ]; then
+        : # cgroup constrains affinity; taskset would be redundant
+    elif [ -n "$PIN_CPUS" ] && command -v taskset >/dev/null 2>&1; then
+        LAUNCH_PREFIX+=(taskset -c "$PIN_CPUS")
+    fi
     if [ ${#LAUNCH_PREFIX[@]} -gt 0 ]; then
         echo "  [run-qemu] launch prefix: ${LAUNCH_PREFIX[*]}"
     fi
 fi
 
-# Optional: join an isolated cgroup v2 cpuset so the kernel scheduler's
-# load balancer keeps other tasks off our pinned CPUs.  Without this,
-# SCHED_FIFO vCPUs starve any SCHED_OTHER tasks that happen to be
-# scheduled to the same CPU.  See docs/host-scheduling-setup.md
-# (Option 5) and tools/host-setup/setup-qemu-rt-cgroup.sh.
-#
-# We write our own pid to cgroup.procs *before* exec'ing qemu — exec
-# preserves the pid so qemu inherits the cgroup membership.  Failures
-# are non-fatal (qemu still runs, just unisolated).
-if [ -n "${TELIX_RT_CGROUP:-}" ]; then
-    if [ -w "$TELIX_RT_CGROUP/cgroup.procs" ]; then
-        echo $$ > "$TELIX_RT_CGROUP/cgroup.procs" 2>/dev/null \
-            && echo "  [run-qemu] joined cgroup: $TELIX_RT_CGROUP" \
-            || echo "  [run-qemu] WARN: could not enter $TELIX_RT_CGROUP" >&2
-    else
-        echo "  [run-qemu] WARN: $TELIX_RT_CGROUP/cgroup.procs not writable; run setup-qemu-rt-cgroup.sh" >&2
-    fi
-fi
+# Cgroup join (TELIX_RT_CGROUP) is performed by qemu-rt-shim, not here.
+# Bash can't migrate itself between sibling cgroup subtrees without
+# CAP_SYS_ADMIN (the cgroup v2 common-ancestor rule denies it for
+# unprivileged callers), and trying it from bash then breaks the
+# subsequent taskset -c 0-3 with EINVAL because our shell stays in
+# user.slice (effective cpuset 4-19 once the partition is isolated).
+# The shim joins the cgroup FIRST while it still has access to all
+# CPUs, then taskset and SCHED_FIFO settings apply within that
+# constrained set.  See docs/host-scheduling-setup.md Option 5.
 
 exec "${LAUNCH_PREFIX[@]}" qemu-system-x86_64 "${QEMU_ARGS[@]}"

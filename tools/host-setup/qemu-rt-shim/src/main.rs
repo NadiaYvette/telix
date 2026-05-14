@@ -1,22 +1,30 @@
-//! qemu-rt-shim — self-elevate to SCHED_FIFO via this binary's own
-//! CAP_SYS_NICE file capability, then execvp the wrapped command.
+//! qemu-rt-shim — self-elevate to SCHED_FIFO and (optionally) join a
+//! cgroup v2 isolated cpuset, then execvp the wrapped command.
 //!
 //! Motivated by Telix #135 host vCPU descheduling: running QEMU under
 //! SCHED_FIFO suppresses the multi-second tick gaps that the kernel-side
-//! Fix A (RESCUE-MIGRATE) can only mitigate after-the-fact.
+//! Fix A (RESCUE-MIGRATE) can only mitigate after-the-fact.  Pair with
+//! a cgroup v2 isolated cpuset partition (see
+//! `tools/host-setup/setup-qemu-rt-cgroup.sh`) so SCHED_OTHER tasks
+//! don't get starved behind FIFO on the pinned CPUs.
 //!
-//! Build + install:
-//!   cargo build --release
-//!   sudo setcap 'cap_sys_nice=ep' target/release/qemu-rt-shim
+//! File capabilities (apply ONE of):
+//!   sudo setcap 'cap_sys_nice=ep' qemu-rt-shim                # FIFO only
+//!   sudo setcap 'cap_sys_nice,cap_sys_admin=ep' qemu-rt-shim  # FIFO + cgroup
 //!
-//! Usage (from `tools/run-qemu-x86.sh`):
-//!   TELIX_RTPRIO=50 \
-//!   TELIX_RT_SHIM=$ROOT/tools/host-setup/qemu-rt-shim/target/release/qemu-rt-shim \
-//!     tools/boot-h14.sh
+//! CAP_SYS_ADMIN is needed because cgroup v2's "common ancestor" rule
+//! refuses migrations between sibling subtrees (e.g. /user.slice/...
+//! → /qemu-rt) when the caller lacks write on the common ancestor
+//! (the root cgroup, which is root-owned).  CAP_SYS_ADMIN bypasses
+//! that check.  Without it, the cgroup join logs a warning and the
+//! shim continues without isolation.
 //!
-//! When TELIX_RTPRIO is unset, the shim is a no-op exec wrapper (still
-//! works, just doesn't bump priority).  Designed so the same wrapper
-//! pipeline works whether or not the cap is installed.
+//! Env knobs (read by main(), all optional):
+//!   TELIX_RTPRIO=N      — SCHED_FIFO priority (1..99).  Uses CAP_SYS_NICE.
+//!   TELIX_RT_CGROUP=DIR — cgroup v2 path; writes own pid to
+//!                          $DIR/cgroup.procs.  Uses CAP_SYS_ADMIN.
+//!
+//! Failure of either step is logged but non-fatal — qemu still runs.
 
 use std::env;
 use std::ffi::CString;
@@ -30,11 +38,43 @@ fn main() {
     if args.is_empty() {
         eprintln!("qemu-rt-shim: usage: qemu-rt-shim <program> [args...]");
         eprintln!("  env TELIX_RTPRIO=N (1..99) sets SCHED_FIFO priority before exec");
+        eprintln!("  env TELIX_RT_CGROUP=DIR writes our pid to DIR/cgroup.procs");
         process::exit(64);
     }
 
-    // Try to elevate.  Failure is logged but non-fatal — the wrapped
-    // command still runs at default scheduling.
+    // Step 1: optionally join an isolated cpuset cgroup.  Done FIRST
+    // because moving the process restricts its CPU affinity, and we
+    // want the subsequent FIFO scheduling decision to be made within
+    // that affinity (the kernel scheduler picks an initial CPU when
+    // FIFO is enabled).  CAP_SYS_ADMIN required to bypass the cgroup
+    // common-ancestor migration check.
+    if let Ok(cgroup_dir) = env::var("TELIX_RT_CGROUP") {
+        let procs_path = format!("{}/cgroup.procs", cgroup_dir);
+        let pid_str = std::process::id().to_string();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .open(&procs_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, pid_str.as_bytes()))
+        {
+            Ok(()) => {
+                eprintln!("qemu-rt-shim: joined cgroup {}", cgroup_dir);
+            }
+            Err(e) => {
+                eprintln!(
+                    "qemu-rt-shim: cgroup join {} failed: {}",
+                    procs_path, e,
+                );
+                eprintln!(
+                    "  setcap cap_sys_admin=ep needed (or cap_sys_nice,cap_sys_admin=ep)"
+                );
+                eprintln!("  Continuing without cgroup isolation.");
+            }
+        }
+    }
+
+    // Step 2: optionally elevate to SCHED_FIFO.  CAP_SYS_NICE required.
+    // Failure is logged but non-fatal — the wrapped command still runs
+    // at default scheduling.
     if let Ok(prio_str) = env::var("TELIX_RTPRIO") {
         match prio_str.parse::<libc::c_int>() {
             Ok(prio) if (1..=99).contains(&prio) => {
