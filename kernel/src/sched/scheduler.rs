@@ -1124,6 +1124,13 @@ fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
     if thread_ref(tid).in_queue.swap(true, Ordering::AcqRel) {
         trace_sched(tid, 11); // 11=double_enq
         trace_point("percpu_enqueue.skip_in_queue", tid as u32);
+        // #135 action=18: percpu_enqueue silent skip (in_queue already true).
+        // This is the suspect mechanism for the sleep_wake wedge — if a
+        // post-CAS racer leaves in_queue=true on a thread that sleep_wake
+        // is trying to enqueue, this branch returns silently and the thread
+        // is then state=Ready ∧ on_cpu=PEND ∧ in_queue=true but NOT in any
+        // heap, so no pick fires.
+        record_trans(tid as u32, 18, thread_ref(tid).state, ON_CPU_PENDING);
         let src = get_enq_tag();
         match src {
             1 => { DOUBLE_ENQ_DRAIN.fetch_add(1, Ordering::Relaxed); }
@@ -1146,6 +1153,9 @@ fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
     } else {
         rq.push(prio, tid);
     }
+    // #135 action=17: enqueue succeeded.  Record the target CPU so we can
+    // see whether the thread landed where sleep_wake intended.
+    record_trans(tid as u32, 17, thread_ref(tid).state, target_cpu);
 }
 
 /// Compute EEVDF deadline and insert a thread into the per-CPU heap.
@@ -6771,10 +6781,25 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 // counts in RESCUE_STUCK_PENDING_FIRES but doesn't flood
                 // the serial log every sweep.
                 if pending_age == STUCK_PENDING_AGE {
+                    // #135: dump stuck thread's runqueue presence facts.
+                    // If in_queue=true + heap_pos!=NONE, the thread IS in the
+                    // eevdf heap on `last_cpu` and the bug is on the pick side.
+                    // If in_queue=true + heap_pos==NONE, phantom enqueue: the
+                    // thread was enqueued but lost its heap position (no actual
+                    // membership), and percpu_enqueue's in_queue swap will keep
+                    // silently skipping all future re-enqueues.
+                    let in_q = t.in_queue.load(Ordering::Relaxed);
+                    let hp = t.eevdf_heap_pos;
+                    let last_cpu = t.last_cpu.load(Ordering::Relaxed);
+                    let pri = t.prio.load(Ordering::Relaxed);
+                    let enq_n = t.enqueue_count.load(Ordering::Relaxed);
+                    let pick_n = t.picked_count.load(Ordering::Relaxed);
                     crate::println!(
                         "RESCUE-STUCK-PENDING: tid={} age={} task={} on_cpu=PENDING - \
-                        treating as orphan (#120 IPI/dispatch loss)",
-                        tid, pending_age, t.task_id
+                        treating as orphan (#120 IPI/dispatch loss) \
+                        in_q={} heap_pos={} last_cpu={} prio={} enq_n={} pick_n={}",
+                        tid, pending_age, t.task_id,
+                        in_q, hp, last_cpu, pri, enq_n, pick_n,
                     );
                     // #135 dump the last 4 transitions of the stuck thread.
                     let next_pos = t.trans_pos.load(Ordering::Relaxed) as usize;
