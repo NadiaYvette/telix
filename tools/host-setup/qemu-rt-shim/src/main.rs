@@ -42,6 +42,18 @@ fn main() {
         process::exit(64);
     }
 
+    // Diagnostic: dump our own runtime capabilities so failures are
+    // explicable.  If CapEff is 0 here despite getcap showing file
+    // caps, the kernel didn't apply the file caps (mount nosuid?
+    // user namespace?  AppArmor/SELinux stripping?).
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("Cap") {
+                eprintln!("qemu-rt-shim: {}", line);
+            }
+        }
+    }
+
     // Step 1: optionally join an isolated cpuset cgroup.  Done FIRST
     // because moving the process restricts its CPU affinity, and we
     // want the subsequent FIFO scheduling decision to be made within

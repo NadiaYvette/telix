@@ -37,11 +37,22 @@ mkdir -p "$CG"
 # Set the cpus.  Cleared first to avoid "value too short" on resize.
 echo "$CPUS" > "$CG/cpuset.cpus"
 
-# Mark as an isolated partition.  Kernel docs (cgroup-v2.rst):
-#   isolated:  Like a "root" partition with the additional restriction
-#              that all the CPUs in cpus.cpus are excluded from load
-#              balancing.
-echo "isolated" > "$CG/cpuset.cpus.partition"
+# Mark as a "root" partition (NOT "isolated"!).  Kernel docs:
+#   root:      cgroup gets exclusive access to its cpuset.cpus AND load
+#              balancing happens within the partition.  This is what we
+#              want: other tasks stay off our cores, but the kernel
+#              spreads our own multi-threaded workload (qemu's vCPU
+#              threads) across them.
+#   isolated:  Like "root" but the kernel scheduler load balancer is
+#              DISABLED for these CPUs.  Looks attractive but kills
+#              parallelism — observed boot 99amfsq2 (2026-05-14): 4
+#              SCHED_FIFO vCPU threads all stuck on host CPU 16, the
+#              other 3 cores idle, qemu effectively running at 1/4
+#              speed.  "isolated" is right for true CPU-pinning RT
+#              workloads with explicit per-thread taskset assignment,
+#              not for our case where qemu spawns threads and we want
+#              them balanced.
+echo "root" > "$CG/cpuset.cpus.partition"
 
 # Verify it took.  Some kernels reject the transition with an error
 # stored in cpuset.cpus.partition itself (e.g. "isolated invalid (no

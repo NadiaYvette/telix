@@ -217,14 +217,20 @@ if [ -z "${TELIX_NICE_OFF:-}" ]; then
     fi
 fi
 
-# Cgroup join (TELIX_RT_CGROUP) is performed by qemu-rt-shim, not here.
-# Bash can't migrate itself between sibling cgroup subtrees without
-# CAP_SYS_ADMIN (the cgroup v2 common-ancestor rule denies it for
-# unprivileged callers), and trying it from bash then breaks the
-# subsequent taskset -c 0-3 with EINVAL because our shell stays in
-# user.slice (effective cpuset 4-19 once the partition is isolated).
-# The shim joins the cgroup FIRST while it still has access to all
-# CPUs, then taskset and SCHED_FIFO settings apply within that
-# constrained set.  See docs/host-scheduling-setup.md Option 5.
+# Cgroup join via sudo helper (TELIX_RT_CGROUP).  We have a known issue
+# on Fedora 43 + kernel 6.18: the shim's CAP_SYS_ADMIN doesn't bypass
+# the cgroup v2 common-ancestor migration check despite CapEff
+# confirming the cap is effective.  Workaround: invoke the sudo'd
+# qemu-rt-attach.sh helper to do the migration as root.  Install once
+# with NOPASSWD sudoers (see tools/host-setup/qemu-rt-attach.sh header).
+# Migration must happen BEFORE exec so qemu inherits the cgroup.
+if [ -n "${TELIX_RT_CGROUP:-}" ] && [ -x /home/nyc/src/telix/tools/host-setup/qemu-rt-attach.sh ]; then
+    if sudo -n /home/nyc/src/telix/tools/host-setup/qemu-rt-attach.sh "$$" 2>&1; then
+        echo "  [run-qemu] cgroup-attached via sudo helper"
+    else
+        echo "  [run-qemu] WARN: sudo cgroup-attach failed; falling back to shim's CAP_SYS_ADMIN" >&2
+        echo "  [run-qemu]       install NOPASSWD sudoers per tools/host-setup/qemu-rt-attach.sh header" >&2
+    fi
+fi
 
 exec "${LAUNCH_PREFIX[@]}" qemu-system-x86_64 "${QEMU_ARGS[@]}"
