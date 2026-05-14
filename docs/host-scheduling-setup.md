@@ -13,11 +13,19 @@ wallclock.
 `tools/run-qemu-x86.sh` now supports two env knobs that ask the host
 scheduler to be kinder to QEMU:
 
-| Var               | Default | Effect                                                      |
-|-------------------|---------|-------------------------------------------------------------|
-| `TELIX_PIN_CPUS`  | `0-3`   | `taskset -c $TELIX_PIN_CPUS qemu …`.  Free, no caps needed. |
-| `TELIX_RTPRIO`    | unset   | `chrt -f $TELIX_RTPRIO qemu …` (SCHED_FIFO).  Needs caps.   |
-| `TELIX_NICE_OFF`  | unset   | Skip both wrappers entirely (legacy behaviour).             |
+| Var               | Default | Effect                                                       |
+|-------------------|---------|--------------------------------------------------------------|
+| `TELIX_PIN_CPUS`  | `0-3`   | `taskset -c $TELIX_PIN_CPUS qemu …`.  Free, no caps needed.  |
+| `TELIX_RTPRIO`    | unset   | Self-elevate to SCHED_FIFO prio N.  Path depends on caps:    |
+|                   |         | • `TELIX_RT_SHIM=<path>` set → use shim (preferred).         |
+|                   |         | • else: `chrt -f $TELIX_RTPRIO qemu …` (needs caller rtprio).|
+| `TELIX_RT_SHIM`   | unset   | Path to a setcap'd `qemu-rt-shim` binary; bypasses caller's  |
+|                   |         | rtprio rlimit by self-elevating via its own CAP_SYS_NICE.    |
+| `TELIX_MLOCK`     | unset   | Adds `-overcommit mem-lock=on` to qemu args.  Uses qemu's    |
+|                   |         | own CAP_SYS_NICE file cap to mlockall its memory image —     |
+|                   |         | reduces paging-out under host pressure.  Complementary to    |
+|                   |         | (not a replacement for) SCHED_FIFO.                          |
+| `TELIX_NICE_OFF`  | unset   | Skip pinning + RT wrappers entirely (legacy behaviour).      |
 
 Pinning alone usually helps and costs nothing.  For the dramatic wins
 (suppressing the 10–80 second tick gaps observed under heavy host
@@ -93,11 +101,41 @@ to `run-qemu-x86.sh`.
 sudo setcap 'cap_sys_nice=ep' /usr/bin/qemu-system-x86_64
 ```
 
-Lets just this binary call `sched_setscheduler` to SCHED_FIFO without
-any other setup.  Survives reboots but **not dnf upgrades** — the
-capability is on the inode and `dnf upgrade qemu-system-x86_64` swaps
-in a fresh binary with no caps.  Workable if you re-apply via a
-systemd-tmpfiles rule or a post-upgrade hook.
+Note: this cap belongs to qemu *after* it execs — it does NOT let an
+outer `chrt -f $PRIO qemu` call work (chrt itself needs the cap to set
+FIFO before exec'ing qemu, and chrt has no cap of its own).  The qemu
+binary cap is still useful: with `TELIX_MLOCK=1`, qemu uses it to
+mlockall its memory image and resist host swap-out pressure.
+
+Caveat: `dnf upgrade qemu-system-x86_64` replaces the binary inode and
+drops the cap.  Re-`setcap` after upgrades, or install a one-line
+`/etc/tmpfiles.d/telix-qemu-cap.conf`:
+```
+e /usr/bin/qemu-system-x86_64 - - - - cap_sys_nice=ep
+```
+…to have systemd-tmpfiles re-apply on boot.
+
+## Option 4 — setcap'd `qemu-rt-shim` (recommended for screen / nested shells)
+
+`tools/host-setup/qemu-rt-shim/` is a small Rust binary that
+self-elevates to SCHED_FIFO using its own CAP_SYS_NICE file capability,
+then `execvp`s the wrapped command.  Unlike Options 1-2, it doesn't
+depend on the calling shell having any rtprio rlimit or polkit grant.
+Particularly useful when your boots are launched from inside a long-
+running `screen` session that pre-dates `/etc/security/limits.conf`
+changes (the screen daemon already inherited the old zero-rtprio
+limit, and reloading PAM doesn't reach existing processes).
+
+```bash
+cd tools/host-setup/qemu-rt-shim
+./build-and-install.sh            # builds + sudo setcap
+export TELIX_RT_SHIM="$(pwd)/target/x86_64-unknown-linux-gnu/release/qemu-rt-shim"
+TELIX_RTPRIO=50 tools/boot-h14.sh
+```
+
+The shim is ~70 lines and lives in the repo, so `dnf` won't ever
+unsetcap it.  Caveat: rebuild + re-setcap when you change toolchains
+or the binary content, since the cap is on the inode.
 
 ## Verifying it worked
 

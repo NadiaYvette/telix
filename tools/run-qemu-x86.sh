@@ -159,6 +159,14 @@ if [ "${TELIX_NO_REBOOT:-}" = "1" ]; then
     QEMU_ARGS+=(-no-reboot)
 fi
 
+# Memory locking: prevent host from paging out QEMU memory under load.
+# Uses CAP_SYS_NICE on the qemu binary (setcap'd separately).  Helps when
+# the host is swap-pressured but does NOT set SCHED_FIFO scheduling.
+# See docs/host-scheduling-setup.md for the full host-tuning matrix.
+if [ "${TELIX_MLOCK:-}" = "1" ]; then
+    QEMU_ARGS+=(-overcommit mem-lock=on)
+fi
+
 # Host scheduling: pin vCPUs and (optionally) elevate to SCHED_FIFO to
 # reduce multi-second host-desched halts that cause #135 boot wedges.
 # See docs/host-scheduling-setup.md for the rtprio / polkit options.
@@ -176,17 +184,26 @@ if [ -z "${TELIX_NICE_OFF:-}" ]; then
         LAUNCH_PREFIX+=(taskset -c "$PIN_CPUS")
     fi
     if [ -n "${TELIX_RTPRIO:-}" ]; then
-        if ! command -v chrt >/dev/null 2>&1; then
-            echo "  [run-qemu] WARN: chrt not found; ignoring TELIX_RTPRIO=$TELIX_RTPRIO" >&2
-        else
+        if [ -n "${TELIX_RT_SHIM:-}" ] && [ -x "$TELIX_RT_SHIM" ]; then
+            # Preferred path: setcap'd shim has its own CAP_SYS_NICE and
+            # self-elevates before exec.  Doesn't require the caller's
+            # rtprio ulimit, so it works inside screen / nested shells
+            # that inherited zero rtprio from a PAM session pre-dating
+            # /etc/security/limits.conf changes.
+            LAUNCH_PREFIX+=("$TELIX_RT_SHIM")
+        elif command -v chrt >/dev/null 2>&1; then
             RTLIMIT="$(ulimit -r 2>/dev/null || echo 0)"
             if [ "$RTLIMIT" -lt "$TELIX_RTPRIO" ] 2>/dev/null; then
                 echo "  [run-qemu] WARN: ulimit -r=$RTLIMIT < TELIX_RTPRIO=$TELIX_RTPRIO" >&2
                 echo "  [run-qemu]       chrt -f would fail.  See docs/host-scheduling-setup.md" >&2
-                echo "  [run-qemu]       — falling back to plain qemu (still pinned)." >&2
+                echo "  [run-qemu]       — set TELIX_RT_SHIM to a setcap'd qemu-rt-shim, or fix" >&2
+                echo "  [run-qemu]       rtprio limits, to get SCHED_FIFO.  Falling back to plain" >&2
+                echo "  [run-qemu]       qemu (still pinned)." >&2
             else
                 LAUNCH_PREFIX+=(chrt -f "$TELIX_RTPRIO")
             fi
+        else
+            echo "  [run-qemu] WARN: neither TELIX_RT_SHIM nor chrt available; ignoring TELIX_RTPRIO=$TELIX_RTPRIO" >&2
         fi
     fi
     if [ ${#LAUNCH_PREFIX[@]} -gt 0 ]; then

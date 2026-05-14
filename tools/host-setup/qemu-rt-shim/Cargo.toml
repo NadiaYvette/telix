@@ -1,0 +1,27 @@
+[package]
+name = "qemu-rt-shim"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# Small setcap'd exec-wrapper: self-elevates to SCHED_FIFO using its own
+# CAP_SYS_NICE file capability, then execvp's the wrapped command (e.g.
+# qemu-system-x86_64).  Built for the host (not the kernel), so this is
+# its own workspace and uses std.
+#
+# Build + install:
+#   cargo build --release
+#   sudo setcap 'cap_sys_nice=ep' target/release/qemu-rt-shim
+#   # then in run-qemu-x86.sh, TELIX_RT_SHIM=<path> chains it in front of qemu.
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[workspace]
