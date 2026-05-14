@@ -159,4 +159,39 @@ if [ "${TELIX_NO_REBOOT:-}" = "1" ]; then
     QEMU_ARGS+=(-no-reboot)
 fi
 
-exec qemu-system-x86_64 "${QEMU_ARGS[@]}"
+# Host scheduling: pin vCPUs and (optionally) elevate to SCHED_FIFO to
+# reduce multi-second host-desched halts that cause #135 boot wedges.
+# See docs/host-scheduling-setup.md for the rtprio / polkit options.
+#
+#   TELIX_PIN_CPUS  — taskset cpuset (default 0-3). Empty disables pinning.
+#                     Pinning is free (no caps needed); helps cache locality.
+#   TELIX_RTPRIO    — SCHED_FIFO priority (default empty). Needs ulimit -r
+#                     > 0 (rtprio limit) or CAP_SYS_NICE; falls back to
+#                     plain qemu with a warning if chrt would fail.
+#   TELIX_NICE_OFF  — set to skip both pinning and chrt entirely.
+LAUNCH_PREFIX=()
+if [ -z "${TELIX_NICE_OFF:-}" ]; then
+    PIN_CPUS="${TELIX_PIN_CPUS-0-3}"
+    if [ -n "$PIN_CPUS" ] && command -v taskset >/dev/null 2>&1; then
+        LAUNCH_PREFIX+=(taskset -c "$PIN_CPUS")
+    fi
+    if [ -n "${TELIX_RTPRIO:-}" ]; then
+        if ! command -v chrt >/dev/null 2>&1; then
+            echo "  [run-qemu] WARN: chrt not found; ignoring TELIX_RTPRIO=$TELIX_RTPRIO" >&2
+        else
+            RTLIMIT="$(ulimit -r 2>/dev/null || echo 0)"
+            if [ "$RTLIMIT" -lt "$TELIX_RTPRIO" ] 2>/dev/null; then
+                echo "  [run-qemu] WARN: ulimit -r=$RTLIMIT < TELIX_RTPRIO=$TELIX_RTPRIO" >&2
+                echo "  [run-qemu]       chrt -f would fail.  See docs/host-scheduling-setup.md" >&2
+                echo "  [run-qemu]       — falling back to plain qemu (still pinned)." >&2
+            else
+                LAUNCH_PREFIX+=(chrt -f "$TELIX_RTPRIO")
+            fi
+        fi
+    fi
+    if [ ${#LAUNCH_PREFIX[@]} -gt 0 ]; then
+        echo "  [run-qemu] launch prefix: ${LAUNCH_PREFIX[*]}"
+    fi
+fi
+
+exec "${LAUNCH_PREFIX[@]}" qemu-system-x86_64 "${QEMU_ARGS[@]}"

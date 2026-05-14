@@ -1,0 +1,27 @@
+// polkit rule: authorise the current user to create transient
+// `systemd-run --scope` units with SCHED_FIFO priority, without a
+// password prompt.  Lets `systemd-run --scope -p CPUSchedulingPolicy=fifo
+// -p CPUSchedulingPriority=N tools/boot-h14.sh` work for the user.
+//
+// Install:
+//   sudo install -m 644 tools/host-setup/50-telix-qemu-rt.rules \
+//       /etc/polkit-1/rules.d/50-telix-qemu-rt.rules
+//   sudo systemctl reload polkit
+//
+// Scope of the grant:
+//   * Only the user named below.
+//   * Only `start` actions on transient units (name starts with `run-r`,
+//     which is what `systemd-run` auto-generates — it does NOT match
+//     persistent `.service` units the user might install).
+// Audit with: journalctl -u polkit
+//
+// Adjust the username before installing.
+
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units"
+        && subject.user == "nyc"
+        && action.lookup("verb") == "start"
+        && action.lookup("unit").indexOf("run-r") == 0) {
+        return polkit.Result.YES;
+    }
+});
