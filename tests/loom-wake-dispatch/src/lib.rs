@@ -1,15 +1,26 @@
 //! Loom model of the #135 real-block + wake_thread + try_switch race.
 //!
-//! IMPORTANT: this model assumes `state` is an AtomicU8.  In the
-//! kernel today (kernel/src/sched/thread.rs), `state` is a plain
-//! enum field, accessed from multiple CPUs without synchronization
-//! — i.e. an existing data race.  Adding the SeqCst fence WITHOUT
-//! also making `state` atomic empirically degrades boot reliability
-//! (6× fewer userspace _start fires across a 6-boot histogram, see
-//! reverted commit f918699 for the data).  The proper kernel fix is
-//! to convert `state` to AtomicU8 (or equivalent) so the loom-proven
-//! protocol works as written.  Until that lands, this test serves
-//! as proof-of-bug, not as a recipe to lift directly.
+//! IMPORTANT — empirical results from porting this fix to the kernel:
+//!
+//!   1. Fence-only (no atomic state): 7-boot histogram mean STARTs
+//!      2.0 vs 14.8 baseline — 6-7× regression.  Reverted in f918699.
+//!   2. Atomic state + fence: 4-boot histogram mean STARTs 1.75 vs
+//!      14.8 baseline — even worse than fence-only.  Boot 716 also
+//!      crashed with #UD at RIP=0x7 in kernel mode, suggesting the
+//!      layout change exposes a separate bug or the fence-induced
+//!      timing surfaces it.  Reverted.
+//!
+//! Conclusion: the lost-wake race this model captures IS real in the
+//! kernel (the protocol matches what scheduler.rs implements), and
+//! the fence + atomic-state fix is theoretically correct — but it is
+//! NOT the dominant cause of the boot variability that motivates
+//! looking at this code.  Something else in the wake-or-dispatch
+//! chain (most likely an IPI delivery / on_cpu transition issue, see
+//! project_135_real_block_session.md memory note) is the actual
+//! culprit.  This loom test stands as documented proof of one
+//! lingering concurrency bug; do not ship the kernel-side fix
+//! standalone — it needs to be paired with whichever real fix
+//! resolves the boot variability.
 //!
 //! Kernel context: after commits 8386f90 and f8c2cb8, block_current is
 //! a "real block" — the thread transitions to state=Blocked and leaves
