@@ -65,8 +65,22 @@ pub fn timer_freq() -> u64 {
 }
 
 /// Get monotonic time in nanoseconds since boot.
+///
+/// On x86_64 under KVM with pvclock (CLOCKSOURCE2) enabled, this
+/// returns vCPU-monotonic time read from the per-CPU pvclock page —
+/// time advances only while the vCPU is actually running, so host
+/// descheduling no longer manifests as huge wallclock jumps that
+/// break Telix's scheduler heuristics (STUCK_PENDING_AGE,
+/// pending_set_ns gates, check_sleep_timers, etc.).  Falls back to
+/// raw TSC arithmetic on bare metal or other arches.
 #[inline]
 pub fn monotonic_ns() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(ns) = crate::arch::x86_64::hypervisor::pvclock_now_ns() {
+            return ns;
+        }
+    }
     let c = read_cycles() as u128;
     let f = timer_freq() as u128;
     ((c * 1_000_000_000u128) / f) as u64

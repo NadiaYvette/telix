@@ -24,6 +24,11 @@ const KVM_FEATURE_STEAL_TIME: u32 = 1 << 5;
 const KVM_FEATURE_PV_UNHALT: u32 = 1 << 7;
 #[allow(dead_code)]
 const KVM_FEATURE_PV_SCHED_YIELD: u32 = 1 << 13;
+/// MSR_KVM_SYSTEM_TIME_NEW pvclock support advertised at bit 3 of
+/// CPUID 0x40000001 EAX.  Telix scheduler residual #135 / paravirt
+/// Layer 2: replaces TSC-based monotonic_ns with vCPU-monotonic
+/// time that excludes host-pause durations.
+const KVM_FEATURE_CLOCKSOURCE2: u32 = 1 << 3;
 
 // KVM hypercall numbers (matches arch/x86/include/uapi/asm/kvm_para.h).
 const KVM_HC_SEND_IPI: u64 = 12;
@@ -35,6 +40,11 @@ const KVM_HC_KICK_CPU: u64 = 5;
 /// MSR for per-vCPU steal-time page address.  Write phys_addr | 1 to
 /// enable; the host accumulates stolen-time updates into the page.
 const MSR_KVM_STEAL_TIME: u32 = 0x4b56_4d03;
+
+/// MSR for per-vCPU pvclock (CLOCKSOURCE2) page address.  Write
+/// phys_addr | 1 to enable; the host updates a `pvclock_vcpu_time_info`
+/// at that address with a seqlock-style version field.
+const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
 
 /// Layout matches Linux's `struct kvm_steal_time` (arch/x86/include/uapi/
 /// asm/kvm_para.h).  64 bytes total.  Host writes; guest reads volatile.
@@ -78,6 +88,99 @@ pub fn enable_steal_time_self() {
     }
     let pa = &STEAL_TIME[cpu] as *const _ as u64;
     unsafe { wrmsr(MSR_KVM_STEAL_TIME, pa | 1); }
+}
+
+/// Per-vCPU pvclock page.  Host writes a `pvclock_vcpu_time_info` here
+/// (32 bytes packed in Linux), guest reads seqlock-style.  We hold one
+/// 64-byte-aligned slot per CPU; the MSR is written from each CPU at
+/// bringup, pointing to its own slot.  All fields are atomic for cross-
+/// CPU read safety; the seqlock pattern on `version` guarantees a
+/// consistent snapshot of the rest.
+#[repr(C, align(64))]
+struct PvclockVcpuTimeInfo {
+    version: core::sync::atomic::AtomicU32,
+    pad0: u32,
+    tsc_timestamp: core::sync::atomic::AtomicU64,
+    system_time: core::sync::atomic::AtomicU64,
+    tsc_to_system_mul: core::sync::atomic::AtomicU32,
+    tsc_shift: core::sync::atomic::AtomicI8,
+    flags: core::sync::atomic::AtomicU8,
+    _pad: [u8; 2],
+}
+
+const PVCLOCK_NEW: PvclockVcpuTimeInfo = PvclockVcpuTimeInfo {
+    version: core::sync::atomic::AtomicU32::new(0),
+    pad0: 0,
+    tsc_timestamp: core::sync::atomic::AtomicU64::new(0),
+    system_time: core::sync::atomic::AtomicU64::new(0),
+    tsc_to_system_mul: core::sync::atomic::AtomicU32::new(0),
+    tsc_shift: core::sync::atomic::AtomicI8::new(0),
+    flags: core::sync::atomic::AtomicU8::new(0),
+    _pad: [0u8; 2],
+};
+
+static PVCLOCK: [PvclockVcpuTimeInfo; crate::sched::smp::MAX_CPUS] =
+    [PVCLOCK_NEW; crate::sched::smp::MAX_CPUS];
+static KVM_PVCLOCK_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable pvclock for the calling CPU.  Each vCPU writes its own
+/// per-CPU page address into MSR_KVM_SYSTEM_TIME_NEW.  Idempotent.
+pub fn enable_pvclock_self() {
+    if !KVM_PVCLOCK_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let cpu = crate::sched::smp::cpu_id() as usize;
+    if cpu >= crate::sched::smp::MAX_CPUS {
+        return;
+    }
+    let pa = &PVCLOCK[cpu] as *const _ as u64;
+    unsafe {
+        wrmsr(MSR_KVM_SYSTEM_TIME_NEW, pa | 1);
+    }
+}
+
+/// Read pvclock-based monotonic ns for this CPU, or None if pvclock
+/// isn't enabled / mapped / valid.  Implements the standard seqlock
+/// reader pattern from Linux's `pvclock_clocksource_read`: read
+/// version (odd = in-progress, retry), read fields, re-read version,
+/// retry on mismatch.  Time arithmetic: `system_time + scaled_delta`
+/// where `scaled_delta = (((tsc - tsc_timestamp) << shift) * mul) >> 32`
+/// for shift >= 0; right-shift by `-shift` otherwise.
+#[inline]
+pub fn pvclock_now_ns() -> Option<u64> {
+    if !KVM_PVCLOCK_ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let cpu = crate::sched::smp::cpu_id() as usize;
+    if cpu >= crate::sched::smp::MAX_CPUS {
+        return None;
+    }
+    let p = &PVCLOCK[cpu];
+    for _ in 0..16 {
+        let v0 = p.version.load(Ordering::Acquire);
+        if v0 == 0 || v0 & 1 != 0 {
+            // 0 = host hasn't initialised yet; odd = update in progress.
+            continue;
+        }
+        let ts = p.tsc_timestamp.load(Ordering::Relaxed);
+        let st = p.system_time.load(Ordering::Relaxed);
+        let mul = p.tsc_to_system_mul.load(Ordering::Relaxed);
+        let shift = p.tsc_shift.load(Ordering::Relaxed);
+        let tsc = unsafe { core::arch::x86_64::_rdtsc() };
+        let v1 = p.version.load(Ordering::Acquire);
+        if v0 != v1 {
+            continue;
+        }
+        let mut delta = tsc.wrapping_sub(ts) as u128;
+        if shift >= 0 {
+            delta <<= shift as u32;
+        } else {
+            delta >>= (-shift) as u32;
+        }
+        let scaled = (delta * (mul as u128)) >> 32;
+        return Some(st.wrapping_add(scaled as u64));
+    }
+    None
 }
 
 #[inline]
@@ -355,6 +458,15 @@ pub fn detect_and_install() {
             crate::println!("[hypervisor] KVM PV_UNHALT (KICK_CPU) enabled");
         } else {
             crate::println!("[hypervisor] KVM PV_UNHALT not advertised");
+        }
+        if eax_kvm & KVM_FEATURE_CLOCKSOURCE2 != 0 {
+            KVM_PVCLOCK_ENABLED.store(true, Ordering::Relaxed);
+            // Bind BSP's pvclock page; APs do the same in their bringup
+            // path next to enable_steal_time_self.
+            enable_pvclock_self();
+            crate::println!("[hypervisor] KVM PVCLOCK (CLOCKSOURCE2) enabled");
+        } else {
+            crate::println!("[hypervisor] KVM PVCLOCK not advertised");
         }
     }
 
