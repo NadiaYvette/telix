@@ -1260,6 +1260,71 @@ pub fn stats() -> (usize, usize) {
     )
 }
 
+/// #155 reconciliation probe: compare `free_count_global` against the
+/// sum of every chunk's per-chunk `fc` field.  The invariant is
+/// `global == sum(fc)` — the bitmap page is metadata and not counted
+/// in either side.  Any non-zero drift indicates one of the
+/// chunk_alloc_one / chunk_free_one paths has miscounted.
+///
+/// Hooked into `sched::tick` on BSP, rate-limited to one sample per
+/// 1024 ticks (~10s at TICK_INTERVAL_NS=10ms).  Prints only when the
+/// drift changes from the last sample — this captures both onset and
+/// each subsequent step, without spamming the log when steady-state.
+pub fn verify_global_counter() {
+    static PROBE_TICKS: AtomicUsize = AtomicUsize::new(0);
+    static LAST_DRIFT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    let n = PROBE_TICKS.fetch_add(1, Ordering::Relaxed);
+    if n & 0x3FF != 0 {
+        return;
+    }
+    // Don't run before init (chunks pointer would be null).
+    if ALLOC.total_chunks == 0 {
+        return;
+    }
+
+    let global = ALLOC.free_count_global.load(Ordering::Relaxed);
+    let mut sum: usize = 0;
+    let mut chunks_fc_gt_0: usize = 0;
+    let mut max_fc: u32 = 0;
+    let mut bitmap_chunks: usize = 0;
+    for ci in 0..ALLOC.total_chunks {
+        let s = ALLOC.chunk(ci).load();
+        let fc = free_count(s);
+        if has_bitmap(s) {
+            bitmap_chunks += 1;
+        }
+        if fc > 0 {
+            chunks_fc_gt_0 += 1;
+            sum += fc as usize;
+            if fc > max_fc {
+                max_fc = fc;
+            }
+        }
+    }
+
+    // Encode drift as usize for atomic; bias by 1<<31 to allow negatives.
+    let drift_signed = global as isize - sum as isize;
+    let drift_encoded = (drift_signed + (1isize << 31)) as usize;
+    let prev = LAST_DRIFT.swap(drift_encoded, Ordering::Relaxed);
+    if prev == drift_encoded {
+        return;
+    }
+
+    if drift_signed != 0 {
+        crate::println!(
+            "[phys::verify] DRIFT global={} sum_fc={} drift={} chunks_fc>0={}/{} bitmap={} max_fc={}",
+            global, sum, drift_signed, chunks_fc_gt_0, ALLOC.total_chunks, bitmap_chunks, max_fc,
+        );
+    } else if prev != usize::MAX && prev != drift_encoded {
+        // Drift cleared after being non-zero — also worth noting.
+        crate::println!(
+            "[phys::verify] HEALED global={} sum_fc={} (drift back to 0)",
+            global, sum,
+        );
+    }
+}
+
 // ── Bitmap scanning ──────────────────────────────────────────────────
 
 /// Find `need` contiguous set bits in `bmp`, avoiding `skip_bit` (the bitmap page).

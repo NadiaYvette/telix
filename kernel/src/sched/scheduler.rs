@@ -2606,6 +2606,13 @@ pub fn tick(current_sp: u64) -> u64 {
     check_alarm_timers();
     check_interval_timers();
 
+    // #155 reconciliation probe — BSP only, internally rate-limited
+    // to one sample per 1024 ticks.  Logs when free_count_global drifts
+    // away from sum-of-per-chunk-fc (or back to consistent).
+    if smp::cpu_id() == 0 {
+        crate::mm::phys::verify_global_counter();
+    }
+
     // Drain deferred killed-thread cleanup from the previous tick.
     drain_deferred_kills();
 
