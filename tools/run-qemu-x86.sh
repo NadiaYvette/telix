@@ -31,11 +31,16 @@ case "$ACCEL" in
 esac
 
 SMP="${TELIX_SMP:-4}"
+# Memory: bumped 512M → 2G default to push back near-OOM during testing
+# while #155/#157 allocator work is finalized and the memory scheduler
+# (admission control) lands.  Override with TELIX_MEM (e.g. `TELIX_MEM=512M
+# tools/boot-h14.sh` for the historical sizing).
+MEM="${TELIX_MEM:-2G}"
 
 QEMU_ARGS=(
     -machine q35,accel=$ACCEL
     -cpu $CPU_MODEL
-    -m 512M
+    -m "$MEM"
     -kernel "$KERNEL32"
     -smp "$SMP"
 )
