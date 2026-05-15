@@ -1166,12 +1166,30 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                 }
                 if !ok {
                     // Race lost — undo any chunks we already claimed and retry.
+                    //
+                    // #155: use unconditional store here, NOT cas().  cas() is
+                    // compare_exchange_weak which can spurious-fail even when
+                    // the value matches.  Under BULK_LOCK no other multi-chunk
+                    // alloc runs, and single-page alloc_page skips fc==0
+                    // chunks, so our fc=0 marking is unchanged — a spurious
+                    // CAS failure here would leave the chunk orphaned (fc=0
+                    // with all 64 pages physically free), making them
+                    // permanently unallocatable.  This is one mechanism for
+                    // the boot-33+ "free_count_global=127 tried_with_free=1"
+                    // symptom.
+                    let mut restored = 0usize;
                     for c in run_start..(run_start + chunks_needed) {
                         let cur = ALLOC.chunk(c).load();
                         if free_count(cur) == 0 && !has_bitmap(cur) {
-                            // Restore to all-free (we were the ones who zeroed it).
-                            let _ = ALLOC.chunk(c).cas(cur, make_state(64, NO_CPU, false, 0, 0));
+                            ALLOC.chunk(c).store(make_state(64, NO_CPU, false, 0, 0));
+                            restored += 1;
                         }
+                    }
+                    if restored > 0 {
+                        crate::println!(
+                            "[alloc_pages] ROLLBACK-RESTORE: chunks_needed={} restored={} run_start={}",
+                            chunks_needed, restored, run_start,
+                        );
                     }
                     run_len = 0;
                     continue;
