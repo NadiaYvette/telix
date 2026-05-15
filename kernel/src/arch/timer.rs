@@ -66,19 +66,28 @@ pub fn timer_freq() -> u64 {
 
 /// Get monotonic time in nanoseconds since boot.
 ///
-/// On x86_64 under KVM with pvclock (CLOCKSOURCE2) enabled, this
-/// returns vCPU-monotonic time read from the per-CPU pvclock page —
-/// time advances only while the vCPU is actually running, so host
-/// descheduling no longer manifests as huge wallclock jumps that
-/// break Telix's scheduler heuristics (STUCK_PENDING_AGE,
-/// pending_set_ns gates, check_sleep_timers, etc.).  Falls back to
-/// raw TSC arithmetic on bare metal or other arches.
+/// On x86_64 under KVM, this returns a vCPU-runtime monotonic clock:
+/// pvclock (CLOCKSOURCE2) for TSC-frequency-corrected time, then
+/// subtract STEAL_TIME (nanoseconds the vCPU has been host-
+/// descheduled) to exclude host-pause durations from the reading.
+/// Boot 91amfsq47/48 showed pvclock alone does NOT exclude host
+/// pauses — KVM's master-clock advertises wallclock-like monotonic
+/// time across host descheduling.  STEAL_TIME is the documented
+/// mechanism for the guest to subtract that.
+///
+/// Falls back to raw TSC arithmetic on bare metal or other arches.
 #[inline]
 pub fn monotonic_ns() -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
         if let Some(ns) = crate::arch::x86_64::hypervisor::pvclock_now_ns() {
-            return ns;
+            // Subtract steal-time so the result advances only while
+            // the vCPU was running.  steal_time_ns() returns None on
+            // bare-metal / non-KVM; treat as zero subtraction.
+            let steal = crate::arch::hypervisor::ops()
+                .steal_time_ns()
+                .unwrap_or(0);
+            return ns.saturating_sub(steal);
         }
     }
     let c = read_cycles() as u128;
