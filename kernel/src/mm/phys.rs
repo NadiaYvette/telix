@@ -325,8 +325,32 @@ fn chunk_alloc_one(chunk_idx: usize) -> Option<u32> {
             let new_fc = fc - 1;
 
             // Check if we should transition to inline mode.
+            //
+            // #155 transition accounting fix: the transition has two
+            // shapes whose fc/global accounting differs.  Tracked via
+            // `transition_with_bp` so the post-transition fc/global
+            // updates are correct in each case.
+            //
+            //   * With-bp (new_fc < INLINE_K): count = new_fc + 1
+            //     = old_fc.  Inline indices = surviving bitmap bits + bp.
+            //     bp was metadata (not in fc, not in global); now in fc.
+            //     Net effect of alloc + transition: chunk fc unchanged,
+            //     global unchanged — the alloc and the bp reclassification
+            //     cancel.
+            //
+            //   * No-bp (new_fc == INLINE_K): count = new_fc.  bp is
+            //     dropped from inline indices (permanent leak — accepted
+            //     trade-off).  Net effect: chunk fc -= 1, global -= 1.
+            //
+            // Previously the code unconditionally ran a separate fc-dec
+            // loop and a fetch_sub(1), which double-decremented in the
+            // no-bp case (chunk fc -= 2 but global -= 1, leaving global
+            // +1 above sum_fc per transition).  The reconciliation probe
+            // observed exactly this drift growing by ~110 over an early-
+            // boot window in 91amfsq40.
+            let mut transitioned = false;
+            let mut transition_with_bp = false;
             if new_fc <= INLINE_K && new_fc > 0 {
-                // Collect remaining free indices from the updated bitmap.
                 let remaining_bmp = new_bmp;
                 let mut indices = [0u32; INLINE_K as usize];
                 let mut count = 0u32;
@@ -338,43 +362,49 @@ fn chunk_alloc_one(chunk_idx: usize) -> Option<u32> {
                     count += 1;
                 }
 
-                // Free the bitmap page itself (add it to the inline set if room).
-                if count < INLINE_K {
+                let bp_added = count < INLINE_K;
+                if bp_added {
                     indices[count as usize] = bp;
                     count += 1;
                 }
 
                 let inline_bits = pack_inline(&indices[..count as usize]);
                 let new_s = make_state(count, owner(s), false, 0, inline_bits);
-                // Best-effort CAS. If it fails, the bitmap is still valid;
-                // next operation will retry.
-                let _ = node.cas(
-                    (s & !(FREE_COUNT_MASK)) | (fc as u64), // old with original fc
+                // Best-effort CAS. If it fails, the bitmap is still valid
+                // and the fall-through fc dec loop handles the alloc.
+                if node.cas(
+                    (s & !(FREE_COUNT_MASK)) | (fc as u64),
                     new_s,
-                );
-                // Note: even if the CAS fails, the bitmap has already been
-                // updated (the page is allocated). The free_count in the node
-                // will be corrected by the next successful CAS. This is safe
-                // because the bitmap is the source of truth for which pages
-                // are free; the node's free_count is an advisory hint.
-                // However, for correctness we should retry with a fresh load.
-                // Let's do a simpler approach: just update free_count.
-            }
-
-            // Update free_count in the node.
-            loop {
-                let cur = node.load();
-                let cur_fc = free_count(cur);
-                if cur_fc == 0 {
-                    break;
-                } // someone else already decremented
-                let upd = (cur & !FREE_COUNT_MASK) | ((cur_fc - 1) as u64);
-                if node.cas(cur, upd).is_ok() {
-                    break;
+                ).is_ok() {
+                    transitioned = true;
+                    transition_with_bp = bp_added;
                 }
             }
 
-            ALLOC.free_count_global.fetch_sub(1, Ordering::Relaxed);
+            if !transitioned {
+                // Still in bitmap mode (no transition or CAS lost).
+                // Decrement fc to reflect the alloc.
+                loop {
+                    let cur = node.load();
+                    let cur_fc = free_count(cur);
+                    if cur_fc == 0 {
+                        break;
+                    }
+                    let upd = (cur & !FREE_COUNT_MASK) | ((cur_fc - 1) as u64);
+                    if node.cas(cur, upd).is_ok() {
+                        break;
+                    }
+                }
+                ALLOC.free_count_global.fetch_sub(1, Ordering::Relaxed);
+            } else if transition_with_bp {
+                // Alloc accounted by `count`; bp reclassification offsets it.
+                // Net 0 change to chunk fc or global.
+            } else {
+                // No-bp transition: count = new_fc already reflects the alloc.
+                // chunk fc went old_fc → new_fc (= old_fc - 1).  Match with
+                // a single global -= 1.  bp is permanently leaked.
+                ALLOC.free_count_global.fetch_sub(1, Ordering::Relaxed);
+            }
             return Some(bit);
         }
 
