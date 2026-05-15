@@ -401,6 +401,36 @@ fn load_segment(
                             copy_len,
                         );
                     }
+                    // #155 anon-zero-page family probe: after the copy,
+                    // verify the destination bytes match the source via
+                    // Fletcher-16 csum.  If a concurrent path (alloc race,
+                    // VMA aliasing, etc.) wrote zeros over our copy, the
+                    // dest csum will be 0 while src csum is non-zero —
+                    // catch the corruption AT LOAD TIME with the phys page
+                    // recorded.  Cost: ~one csum pass per copy_len bytes,
+                    // happens only at spawn (not hot-path).
+                    unsafe {
+                        let src = data.as_ptr().add(src_start);
+                        let dst = (mmu_pa + dst_offset) as *const u8;
+                        let mut s1_src: u16 = 0; let mut s2_src: u16 = 0;
+                        let mut s1_dst: u16 = 0; let mut s2_dst: u16 = 0;
+                        for i in 0..copy_len {
+                            s1_src = s1_src.wrapping_add(*src.add(i) as u16);
+                            s2_src = s2_src.wrapping_add(s1_src);
+                            s1_dst = s1_dst.wrapping_add(*dst.add(i) as u16);
+                            s2_dst = s2_dst.wrapping_add(s1_dst);
+                        }
+                        let src_csum = s2_src.wrapping_shl(8) ^ s1_src;
+                        let dst_csum = s2_dst.wrapping_shl(8) ^ s1_dst;
+                        if src_csum != dst_csum {
+                            crate::println!(
+                                "[elf-load] POST-COPY MISMATCH aspace={} mmu_va={:#x} mmu_pa={:#x} \
+                                 src_csum={:04x} dst_csum={:04x} copy_len={} src_start={}",
+                                aspace_id, mmu_va, mmu_pa,
+                                src_csum, dst_csum, copy_len, src_start,
+                            );
+                        }
+                    }
                 }
             }
 
