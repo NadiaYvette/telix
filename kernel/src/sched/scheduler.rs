@@ -7028,6 +7028,41 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                             cli_total, cli_max, cli_max_rip, cli_count,
                             sp, ok, sp.saturating_sub(ok),
                         );
+                        // #135 cli_max-per-callsite: dump the top-N
+                        // distinct CLI offenders by max single-region
+                        // duration on this CPU.  Boot 26 showed
+                        // cli_max=97ms with a single cli_max_rip; this
+                        // surfaces whether that's one path or a family.
+                        // Sort indices by cycles desc for readable output.
+                        let mut idx: [usize; crate::sched::smp::CLI_TOP_N] = [0usize; crate::sched::smp::CLI_TOP_N];
+                        for i in 0..crate::sched::smp::CLI_TOP_N { idx[i] = i; }
+                        let cyc: [u64; crate::sched::smp::CLI_TOP_N] = {
+                            let mut a = [0u64; crate::sched::smp::CLI_TOP_N];
+                            for i in 0..crate::sched::smp::CLI_TOP_N {
+                                a[i] = pc.cli_top[i].cycles.load(Ordering::Relaxed);
+                            }
+                            a
+                        };
+                        // Selection sort, descending — N=8 so O(N²)=64 is fine.
+                        for i in 0..crate::sched::smp::CLI_TOP_N {
+                            for j in (i + 1)..crate::sched::smp::CLI_TOP_N {
+                                if cyc[idx[j]] > cyc[idx[i]] {
+                                    idx.swap(i, j);
+                                }
+                            }
+                        }
+                        let mut printed = 0usize;
+                        for &i in idx.iter() {
+                            let r = pc.cli_top[i].rip.load(Ordering::Relaxed);
+                            let cy = pc.cli_top[i].cycles.load(Ordering::Relaxed);
+                            let ct = pc.cli_top[i].count.load(Ordering::Relaxed);
+                            if r == 0 || cy == 0 { continue; }
+                            crate::println!(
+                                "CLI-TOP: cpu={} slot={} rip=0x{:x} max={} count={}",
+                                c, printed, r, cy, ct,
+                            );
+                            printed += 1;
+                        }
                         // #135 LAPIC probe: each CPU snapshots its own
                         // LAPIC state in the timer-tick handler (vector
                         // 32, which works on every CPU even when 0xFD

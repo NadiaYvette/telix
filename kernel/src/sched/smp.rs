@@ -161,6 +161,31 @@ pub(crate) fn init_dynamic_percpu_trap_scratch() {
     }
 }
 
+/// #135 cli_max-per-callsite top-N table size.  Each entry holds a
+/// unique caller RIP, its max single-CLI duration, and a hit count.
+/// 8 slots gives plenty of headroom — a 4-CPU kernel rarely has more
+/// than a handful of distinct CLI offenders worth printing.
+pub const CLI_TOP_N: usize = 8;
+
+/// One entry in the cli_max-per-callsite table.  All fields are
+/// AtomicU64 for lock-free single-writer access (the owning CPU's
+/// `record_cli_exit`) plus diagnostic cross-CPU reads.
+pub struct CliTopSlot {
+    pub rip: core::sync::atomic::AtomicU64,
+    pub cycles: core::sync::atomic::AtomicU64,
+    pub count: core::sync::atomic::AtomicU64,
+}
+
+impl CliTopSlot {
+    pub const fn new() -> Self {
+        Self {
+            rip: core::sync::atomic::AtomicU64::new(0),
+            cycles: core::sync::atomic::AtomicU64::new(0),
+            count: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
 /// Per-CPU data. Each CPU has its own instance, accessed lock-free by cpu_id().
 pub struct PerCpuData {
     /// Currently running thread on this CPU.
@@ -269,6 +294,14 @@ pub struct PerCpuData {
     /// the RIP nails the offending Linux-personality forward path.
     pub cli_enter_rip: core::sync::atomic::AtomicU64,
     pub cli_max_rip: core::sync::atomic::AtomicU64,
+    /// #135 cli_max-per-callsite table.  Top-N RIPs by max single-CLI
+    /// duration on this CPU, with a hit count per RIP.  The single
+    /// cli_max_rip above gives the *worst* offender; this table shows
+    /// the *top several* so we can see whether the 97ms culprit is one
+    /// callsite or a family.  Only the owning CPU writes to it
+    /// (record_cli_exit), so torn cross-CPU reads in the rescue dump
+    /// are acceptable — diagnostic-only.
+    pub cli_top: [CliTopSlot; CLI_TOP_N],
     /// #135 LAPIC state snapshot — written by this CPU's own timer-tick
     /// handler (vector 32, which is known-working across all CPUs).
     /// Read cross-CPU by the rescue dump.  Diagnoses vector-0xFD
@@ -322,6 +355,7 @@ impl PerCpuData {
             last_irq_ns: core::sync::atomic::AtomicU64::new(0),
             cli_enter_rip: core::sync::atomic::AtomicU64::new(0),
             cli_max_rip: core::sync::atomic::AtomicU64::new(0),
+            cli_top: [const { CliTopSlot::new() }; CLI_TOP_N],
             lapic_isr_f: core::sync::atomic::AtomicU32::new(0),
             lapic_irr_f: core::sync::atomic::AtomicU32::new(0),
             lapic_tpr: core::sync::atomic::AtomicU32::new(0),
@@ -414,7 +448,55 @@ pub fn record_cli_exit() {
         let rip = pcpu.cli_enter_rip.load(Ordering::Relaxed);
         pcpu.cli_max_rip.store(rip, Ordering::Relaxed);
     }
+    // #135 per-callsite tracking: update the top-N table.  Only consider
+    // CLI regions > CLI_TOP_THRESHOLD (~100µs) to avoid drowning the
+    // table in trivial disable/restore pairs.  Single-writer (this CPU
+    // owns the table), so no CAS needed — plain loads/stores.
+    let rip = pcpu.cli_enter_rip.load(Ordering::Relaxed);
+    if rip != 0 && delta > CLI_TOP_THRESHOLD_CYCLES {
+        update_cli_top(pcpu, rip, delta);
+    }
     pcpu.cli_enter_tsc.store(0, Ordering::Relaxed);
+}
+
+/// #135 cli_top threshold: only track CLI regions > ~100µs.  At
+/// TSC=2.19GHz this is ~219K cycles.  Hard-coding a cycle threshold
+/// avoids a runtime divide; the actual cutoff scales with TSC freq
+/// but that's fine for relative ordering.
+const CLI_TOP_THRESHOLD_CYCLES: u64 = 200_000;
+
+/// Update the per-CPU cli_top table with one observation.  Single-
+/// writer (the owning CPU); other CPUs only READ for diagnostics.
+fn update_cli_top(pcpu: &PerCpuData, rip: u64, delta: u64) {
+    // Linear scan for matching RIP first.  Track the slot with the
+    // smallest cycles (the eviction candidate) in case we need to
+    // insert a new RIP.
+    let mut min_idx: usize = 0;
+    let mut min_cycles: u64 = u64::MAX;
+    for i in 0..CLI_TOP_N {
+        let slot_rip = pcpu.cli_top[i].rip.load(Ordering::Relaxed);
+        let slot_cycles = pcpu.cli_top[i].cycles.load(Ordering::Relaxed);
+        if slot_rip == rip {
+            // Existing entry — update max if greater, always bump count.
+            if delta > slot_cycles {
+                pcpu.cli_top[i].cycles.store(delta, Ordering::Relaxed);
+            }
+            pcpu.cli_top[i].count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if slot_cycles < min_cycles {
+            min_cycles = slot_cycles;
+            min_idx = i;
+        }
+    }
+    // No matching RIP.  Evict smallest-cycles slot ONLY IF our delta
+    // is larger — otherwise the existing entry was the bigger offender
+    // and we should leave it.
+    if delta > min_cycles {
+        pcpu.cli_top[min_idx].rip.store(rip, Ordering::Relaxed);
+        pcpu.cli_top[min_idx].cycles.store(delta, Ordering::Relaxed);
+        pcpu.cli_top[min_idx].count.store(1, Ordering::Relaxed);
+    }
 }
 
 /// Get per-CPU data for the given CPU index.
