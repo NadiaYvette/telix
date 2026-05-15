@@ -519,16 +519,42 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
             }
 
             // Increment free_count.
+            //
+            // #155: cap at 63 in bitmap mode (one bit always reserved
+            // for bmp_page).  Without the cap, concurrent frees that
+            // race past the fc==63 transition can push fc to 64+ here
+            // without transitioning out of bitmap mode, then keep
+            // incrementing on each subsequent free up to 127 (the 7-bit
+            // field max).  This is the "free_count_global drifts to 127"
+            // mechanism observed in boots 33-36.
+            let mut bumped = false;
             loop {
                 let cur = node.load();
                 let cur_fc = free_count(cur);
+                if cur_fc >= 63 {
+                    // Chunk is at-cap in bitmap mode.  The bitmap CAS
+                    // above already recorded our page as free, so don't
+                    // bump fc OR global — both would over-count.  This
+                    // is a race-narrow recovery: the chunk should
+                    // transition to fc==64 (all-free, no bitmap) via the
+                    // fc==63 branch on a future free, but a concurrent
+                    // racer beat us through 63 already.
+                    crate::println!(
+                        "[phys::free] OVER-FREE (bitmap fc>=63, page bit set ok): chunk={} page_idx={} pa={:#x}",
+                        chunk_idx, page_idx, page_pa(chunk_idx, page_idx),
+                    );
+                    break;
+                }
                 let upd = (cur & !FREE_COUNT_MASK) | ((cur_fc + 1) as u64);
                 if node.cas(cur, upd).is_ok() {
+                    bumped = true;
                     break;
                 }
             }
 
-            ALLOC.free_count_global.fetch_add(1, Ordering::Relaxed);
+            if bumped {
+                ALLOC.free_count_global.fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
 
