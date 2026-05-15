@@ -348,25 +348,29 @@ fn chunk_alloc_one(chunk_idx: usize) -> Option<u32> {
             // +1 above sum_fc per transition).  The reconciliation probe
             // observed exactly this drift growing by ~110 over an early-
             // boot window in 91amfsq40.
+            //
+            // Transition condition: require room for bp.  Without bp, the
+            // bp page is permanently leaked from the chunk's tracking
+            // (and physically from the free pool).  Boot 41 reached
+            // free=18 with my prior fix because no-bp transitions were
+            // still consuming bp pages.  By only transitioning when bp
+            // fits, chunks stay in bitmap mode at fc==INLINE_K and bp
+            // remains as metadata — no leak.
             let mut transitioned = false;
-            let mut transition_with_bp = false;
-            if new_fc <= INLINE_K && new_fc > 0 {
+            if new_fc < INLINE_K && new_fc > 0 {
                 let remaining_bmp = new_bmp;
                 let mut indices = [0u32; INLINE_K as usize];
                 let mut count = 0u32;
                 let mut b = remaining_bmp;
-                while b != 0 && count < INLINE_K {
+                while b != 0 && count < INLINE_K - 1 {
                     let idx = b.trailing_zeros();
                     indices[count as usize] = idx;
                     b &= !(1u64 << idx);
                     count += 1;
                 }
-
-                let bp_added = count < INLINE_K;
-                if bp_added {
-                    indices[count as usize] = bp;
-                    count += 1;
-                }
+                // bp always fits because new_fc < INLINE_K → count ≤ new_fc < INLINE_K.
+                indices[count as usize] = bp;
+                count += 1;
 
                 let inline_bits = pack_inline(&indices[..count as usize]);
                 let new_s = make_state(count, owner(s), false, 0, inline_bits);
@@ -377,13 +381,12 @@ fn chunk_alloc_one(chunk_idx: usize) -> Option<u32> {
                     new_s,
                 ).is_ok() {
                     transitioned = true;
-                    transition_with_bp = bp_added;
                 }
             }
 
             if !transitioned {
-                // Still in bitmap mode (no transition or CAS lost).
-                // Decrement fc to reflect the alloc.
+                // Still in bitmap mode (no transition condition or CAS
+                // lost).  Decrement fc to reflect the alloc.
                 loop {
                     let cur = node.load();
                     let cur_fc = free_count(cur);
@@ -396,14 +399,11 @@ fn chunk_alloc_one(chunk_idx: usize) -> Option<u32> {
                     }
                 }
                 ALLOC.free_count_global.fetch_sub(1, Ordering::Relaxed);
-            } else if transition_with_bp {
-                // Alloc accounted by `count`; bp reclassification offsets it.
-                // Net 0 change to chunk fc or global.
             } else {
-                // No-bp transition: count = new_fc already reflects the alloc.
-                // chunk fc went old_fc → new_fc (= old_fc - 1).  Match with
-                // a single global -= 1.  bp is permanently leaked.
-                ALLOC.free_count_global.fetch_sub(1, Ordering::Relaxed);
+                // Transitioned with bp.  count = new_fc + 1 = old_fc.
+                // Inline indices = (new_fc bitmap survivors) + bp.  fc=count.
+                // The alloc decrement and bp reclassification (metadata→fc-
+                // tracked) cancel out.  Net 0 change to chunk fc or global.
             }
             return Some(bit);
         }
