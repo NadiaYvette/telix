@@ -792,6 +792,25 @@ pub fn alloc_page() -> Option<PhysAddr> {
         }
     }
 
+    // Final fallback: per-CPU reservations can hoard free pages.  When
+    // free_count_global > 0 but the unowned-chunk scan above finds
+    // nothing, all remaining free pages sit in other CPUs' reservations.
+    // chunk_alloc_one is atomic CAS internally, so allocating from
+    // another CPU's reserved chunk without disturbing the ownership
+    // record is safe — at worst the owning CPU's next alloc sees one
+    // fewer page and falls through to slow-path normally.  Without this
+    // fallback, observed phys_free=216/6740 with alloc_task_entry FAILED
+    // (boot 24): all 216 pages locked in non-current-CPU reservations.
+    for ci in 0..ALLOC.total_chunks {
+        let fc = free_count(ALLOC.chunk(ci).load());
+        if fc == 0 {
+            continue;
+        }
+        if let Some(pi) = chunk_alloc_one(ci) {
+            return Some(PhysAddr::new(page_pa(ci, pi)));
+        }
+    }
+
     None
 }
 

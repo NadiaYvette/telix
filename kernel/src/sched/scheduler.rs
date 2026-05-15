@@ -1442,11 +1442,29 @@ fn alloc_thread_id() -> Option<ThreadId> {
     }
     let id = NEXT_THREAD_ID.load(Ordering::Relaxed);
     if id as usize >= RadixTable::capacity() {
+        crate::println!(
+            "[alloc_thread_id] CAP-EXCEEDED next_id={} cap={}",
+            id, RadixTable::capacity(),
+        );
         return None;
     }
-    let ptr = alloc_thread_entry()?;
+    let ptr = match alloc_thread_entry() {
+        Some(p) => p,
+        None => {
+            let (total, free) = crate::mm::phys::stats();
+            crate::println!(
+                "[alloc_thread_id] alloc_thread_entry FAILED next_id={} phys_free={}/{}",
+                id, free, total,
+            );
+            return None;
+        }
+    };
     SCHED_THREAD_ART.insert(id as u64, ptr as usize);
     if !THREAD_TABLE.ensure_l1(id) {
+        crate::println!(
+            "[alloc_thread_id] THREAD_TABLE.ensure_l1 FAILED next_id={}",
+            id,
+        );
         return None;
     }
     THREAD_TABLE.set(id, ptr as *mut u8);
@@ -1475,11 +1493,29 @@ fn alloc_task_id() -> Option<TaskId> {
     }
     let id = NEXT_TASK_ID.load(Ordering::Relaxed);
     if id as usize >= RadixTable::capacity() {
+        crate::println!(
+            "[alloc_task_id] CAP-EXCEEDED next_id={} cap={}",
+            id, RadixTable::capacity(),
+        );
         return None;
     }
-    let ptr = alloc_task_entry()?;
+    let ptr = match alloc_task_entry() {
+        Some(p) => p,
+        None => {
+            let (total, free) = crate::mm::phys::stats();
+            crate::println!(
+                "[alloc_task_id] alloc_task_entry FAILED next_id={} phys_free={}/{} ({} KiB free)",
+                id, free, total, free * (crate::mm::page::page_size() / 1024),
+            );
+            return None;
+        }
+    };
     SCHED_TASK_ART.insert(id as u64, ptr as usize);
     if !TASK_TABLE.ensure_l1(id) {
+        crate::println!(
+            "[alloc_task_id] TASK_TABLE.ensure_l1 FAILED next_id={}",
+            id,
+        );
         return None;
     }
     TASK_TABLE.set(id, ptr as *mut u8);
@@ -4173,6 +4209,13 @@ pub fn kill_task_by_id(task_id: TaskId) -> bool {
             // NEW_INV: on_cpu must be ON_CPU_PENDING before state=Ready
             // (was u32::MAX from park_for_sleep).
             thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
+            // #135 action=20: kill_thread waking a Sleep-blocked victim.
+            // If a rescue captures a tid whose TRANS-RING ends with
+            // action=20 just before the orphan signature, the victim
+            // was kill-promoted out of sleep and the wake path didn't
+            // complete percpu_enqueue.  Otherwise this path is rare
+            // (only fires during kill_thread on a Sleep-blocked target).
+            record_trans(tid as u32, 20, ThreadState::Ready, ON_CPU_PENDING);
             t.state = ThreadState::Ready;
             t.blocked_on = BlockReason::None;
             t.sleep_deadline_ns = 0;
@@ -6070,6 +6113,13 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     // ensure the re-enqueued thread passes the CAS.
     if (tid as ThreadId) != idle_id {
         thread_ref(tid as ThreadId).on_cpu.store(u32::MAX, Ordering::Release);
+        // #135 action=21: park_ipc set on_cpu=MAX.  This is the IPC
+        // call/reply blocking path.  If a rescue captures a tid whose
+        // TRANS-RING ends with action=21 just before the orphan signature
+        // (on_cpu=PEND, in_q=false, heap_pos=NONE), the orphan was
+        // produced by an IPC park whose wake_parked_thread didn't
+        // complete the percpu_enqueue (action=12 would normally follow).
+        record_trans(tid as u32, 21, ThreadState::Blocked, u32::MAX);
     }
     trace_sched(tid as u32, 14); // 14=park_ipc (state=Blocked, on_cpu=MAX)
 
@@ -7648,6 +7698,12 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     // park_current_for_ipc.
     if (tid as ThreadId) != idle_id {
         thread_ref(tid as ThreadId).on_cpu.store(u32::MAX, Ordering::Release);
+        // #135 action=22: park_sleep set on_cpu=MAX.  Sleep-blocking
+        // path (sleep_ms / SYS_NANOSLEEP / etc.).  A rescue capturing
+        // a tid whose TRANS-RING ends with action=22 saw an orphan that
+        // didn't complete its sleep_wake re-enqueue (action=15 would
+        // normally follow).
+        record_trans(tid as u32, 22, ThreadState::Blocked, u32::MAX);
     }
     trace_sched(tid as u32, 13); // 13=park_sleep (state=Blocked, on_cpu=MAX)
 
