@@ -2028,29 +2028,71 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
     let arg0_is_port = arg0 > 0 && crate::ipc::port::port_is_active(arg0);
 
     // Look up the ELF binary (no locks needed).
-    let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
+    // #149 fix-probe: surface lookup_file misses so spawn failures
+    // don't show as opaque "FAILED (spawn)" in init's logs.  Diagnoses
+    // both genuine missing-file and parser-state-divergence cases (the
+    // kernel-internal PARSED table is built lazily by the first
+    // lookup_file caller and would not be visible from initramfs_srv's
+    // local copy).
+    let elf_data = match crate::io::initramfs::lookup_file(elf_name) {
+        Some(d) => d,
+        None => {
+            crate::println!(
+                "[spawn-user] lookup_file MISS name={:?} (len={})",
+                core::str::from_utf8(elf_name).unwrap_or("?"),
+                elf_name.len(),
+            );
+            return None;
+        }
+    };
 
     // Phase 1: allocate IDs under SPAWN_LOCK.
     let (task_id, thread_id, mut parent) = {
         let _lock = SPAWN_LOCK.lock();
-        alloc_spawn_ids()?
+        match alloc_spawn_ids() {
+            Some(ids) => ids,
+            None => {
+                crate::println!(
+                    "[spawn-user] alloc_spawn_ids FAILED for name={:?}",
+                    core::str::from_utf8(elf_name).unwrap_or("?"),
+                );
+                return None;
+            }
+        }
     };
 
     // Phase 2: heavy work (page tables, ELF load, etc.) without locks.
-    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) = do_spawn_heavy_work(
-        task_id,
-        thread_id,
-        &parent,
-        elf_data,
-        priority,
-        quantum,
-        arg0,
-        arg0_is_port,
-        None,
-    )?;
+    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
+        match do_spawn_heavy_work(
+            task_id,
+            thread_id,
+            &parent,
+            elf_data,
+            priority,
+            quantum,
+            arg0,
+            arg0_is_port,
+            None,
+        ) {
+            Some(r) => r,
+            None => {
+                crate::println!(
+                    "[spawn-user] do_spawn_heavy_work FAILED for name={:?} task_id={} tid={}",
+                    core::str::from_utf8(elf_name).unwrap_or("?"),
+                    task_id,
+                    thread_id,
+                );
+                return None;
+            }
+        };
 
     // Duplicate groups overflow page for child.
     if !dup_groups_overflow(&mut parent) {
+        crate::println!(
+            "[spawn-user] dup_groups_overflow FAILED for name={:?} task_id={}",
+            core::str::from_utf8(elf_name).unwrap_or("?"),
+            task_id,
+        );
         return None;
     }
 
