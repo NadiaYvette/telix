@@ -415,6 +415,22 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
         let s = node.load();
         let fc = free_count(s);
 
+        // #155 explicit fc==64 (already all-free) handler.  Without
+        // this, the outer loop falls through to the inline-to-bitmap
+        // transition code at the bottom which is undefined behavior for
+        // fc==64 (assumes fc==INLINE_K).  This path most commonly fires
+        // when two CPUs race on the 63→64 all-free transition: CPU A
+        // wins the CAS to fc=64, CPU B retries, sees fc=64, and the
+        // garbage path corrupts chunk state.  Treat as a no-op
+        // double-free: the page is already in the free pool.
+        if fc == 64 {
+            crate::println!(
+                "[phys::free] DOUBLE-FREE (all-free chunk): chunk={} page_idx={} pa={:#x}",
+                chunk_idx, page_idx, page_pa(chunk_idx, page_idx),
+            );
+            return;
+        }
+
         if fc == 0 {
             // First free into a fully-allocated chunk.
             // The freed page becomes an inline entry (fc=1, inline mode).
@@ -433,15 +449,27 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
             // Was 63 free, now becomes 64 = all-free.
             // If has_bitmap, the bitmap page also becomes free.
             // Transition to all-free state.
+            //
+            // #155 root-cause fix: VERIFY that page_idx was actually
+            // allocated (its bit is CLEAR in the bitmap).  Otherwise this
+            // is a double-free, and we must NOT add to global free count.
+            // Boot 33 STRESSED observed free_count_global drift to 127
+            // with no actual free pages — explained by repeated +2
+            // increments here without the page actually being allocated.
+            if has_bitmap(s) {
+                let bp = bmp_page(s);
+                let bpa = bitmap_pa(chunk_idx, bp);
+                let bmp = unsafe { read_bitmap(bpa) };
+                if (bmp >> page_idx) & 1 != 0 {
+                    // page_idx is already free in bitmap — double-free.
+                    crate::println!(
+                        "[phys::free] DOUBLE-FREE (fc=63, bit-already-set): chunk={} page_idx={} pa={:#x}",
+                        chunk_idx, page_idx, page_pa(chunk_idx, page_idx),
+                    );
+                    return;
+                }
+            }
             let new_s = make_state(64, owner(s), false, 0, 0);
-            // The bitmap page (if any) is implicitly freed.
-            // But we need to account for it: if has_bitmap, the bitmap page
-            // wasn't counted in fc, so total free becomes 64.
-            // Actually, let's think carefully:
-            // fc=63 means 63 pages available to callers. If has_bitmap=true,
-            // the bitmap page is one of the 64 physical pages but not in fc.
-            // So 63 available + 1 bitmap = 64 - 0 allocated.
-            // Adding page_idx: 64 available. Dissolve bitmap.
             match node.cas(s, new_s) {
                 Ok(_) => {
                     if has_bitmap(s) {
@@ -460,18 +488,34 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
             // Set the freed page's bit in the bitmap.
             let bp = bmp_page(s);
             let bpa = bitmap_pa(chunk_idx, bp);
+            // #155 root-cause fix: distinguish double-free (bit already
+            // set) from successful CAS.  Boot 33 STRESSED captured the
+            // bug — the prior code incremented fc + free_count_global
+            // even when the bit was already set, phantom-adding ~63
+            // pages to the global counter over the boot, eventually
+            // producing `[alloc_page] FAIL despite free=127
+            // tried_with_free=1`.  Double-frees should be a no-op.
+            let mut was_double_free = false;
             loop {
                 let bmp = unsafe { read_bitmap(bpa) };
                 let new_bmp = bmp | (1u64 << page_idx);
                 if new_bmp == bmp {
+                    was_double_free = true;
                     break;
-                } // already set (double-free?)
+                }
                 unsafe {
                     match cas_bitmap(bpa, bmp, new_bmp) {
                         Ok(_) => break,
                         Err(_) => continue,
                     }
                 }
+            }
+            if was_double_free {
+                crate::println!(
+                    "[phys::free] DOUBLE-FREE detected: chunk={} page_idx={} pa={:#x}",
+                    chunk_idx, page_idx, page_pa(chunk_idx, page_idx),
+                );
+                return;
             }
 
             // Increment free_count.
@@ -488,7 +532,40 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
             return;
         }
 
-        // Inline mode: fc in 1..=INLINE_K.
+        // Inline mode: fc in 1..=INLINE_K legitimately.
+        //
+        // #155 inline-mode double-free check: if page_idx is already among
+        // the inline indices, this is a double-free.  Without this check,
+        // the add-or-transition paths below would append/encode page_idx
+        // a second time and bump free_count_global, drifting it above the
+        // true free count.  Boot 33-36 STRESSED observed exactly this
+        // drift (free=127, tried_with_free=1) with no DOUBLE-FREE lines
+        // from the bitmap-mode / fc==63 / fc==64 checks.
+        //
+        // Clamp scan to INLINE_K — if fc > INLINE_K (corrupted state),
+        // positions past INLINE_K read into the OWNER/has_bitmap/bmp_page
+        // bits via inline_idx, which can false-positive against page_idx.
+        let scan_fc = fc.min(INLINE_K);
+        for i in 0..scan_fc {
+            if inline_idx(s, i) == page_idx {
+                crate::println!(
+                    "[phys::free] DOUBLE-FREE (inline, fc={}, slot={}): chunk={} page_idx={} pa={:#x}",
+                    fc, i, chunk_idx, page_idx, page_pa(chunk_idx, page_idx),
+                );
+                return;
+            }
+        }
+        if fc > INLINE_K {
+            // Corrupted: inline mode with fc > INLINE_K should be impossible
+            // (chunk_free_one transitions to bitmap at fc==INLINE_K).  Bail
+            // out rather than feed the corruption.
+            crate::println!(
+                "[phys::free] CORRUPT inline-mode fc={} > INLINE_K={}: chunk={} page_idx={}",
+                fc, INLINE_K, chunk_idx, page_idx,
+            );
+            return;
+        }
+
         if fc < INLINE_K {
             // Room to add another inline index.
             // Append page_idx at position fc.
@@ -508,6 +585,8 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
         // fc == INLINE_K: must transition to bitmap mode.
         // Pick page_idx (the one being freed) as the bitmap page.
         // Collect existing inline indices + page_idx into a bitmap.
+        // (Double-free against existing inline indices already filtered
+        // above, so we know page_idx is NOT among indices[0..fc].)
         let mut bmp: u64 = 0;
         for i in 0..fc {
             bmp |= 1u64 << inline_idx(s, i);
