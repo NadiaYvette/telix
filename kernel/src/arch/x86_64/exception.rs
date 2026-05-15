@@ -444,6 +444,11 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             super::timer::handle_timer_irq();
             super::lapic::eoi();
             super::pic::send_eoi(0);
+            // #135 LAPIC probe: snapshot AFTER EOI so vector 32's own
+            // ISR bit (priority class 2 ⇒ PPR=0x20) doesn't pollute
+            // readings.  Post-EOI, the snapshot reveals any OTHER stuck
+            // ISR / pending IRR that would block vector 0xFD.
+            super::lapic::snapshot_state_to_pcpu();
             return validate_iretq_frame(crate::sched::tick(frame_sp), frame_sp, 32);
         }
 

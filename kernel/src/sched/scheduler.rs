@@ -1795,6 +1795,16 @@ fn finalize_spawn(
     // ON_CPU_PENDING (overrides any stale value from a recycled tid).
     thread.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
     thread.in_queue.store(false, Ordering::Release);
+    // #135 reset diagnostic fields on thread reuse.  Without this,
+    // enqueue_count / picked_count / trans_ring carry forward from
+    // the previous incarnation of this tid, polluting rescue dumps
+    // (e.g. enq_n=16M reflecting cumulative not current behavior).
+    thread.enqueue_count.store(0, Ordering::Relaxed);
+    thread.picked_count.store(0, Ordering::Relaxed);
+    thread.trans_pos.store(0, Ordering::Relaxed);
+    for i in 0..4 {
+        thread.trans_ring[i].store(0, Ordering::Relaxed);
+    }
 
     thread.id = thread_id;
     thread.state = ThreadState::Ready;
@@ -6907,6 +6917,36 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                             if cli_enter != 0 { 1 } else { 0 },
                             cli_total, cli_max, cli_count,
                             sp, ok, sp.saturating_sub(ok),
+                        );
+                        // #135 LAPIC probe: each CPU snapshots its own
+                        // LAPIC state in the timer-tick handler (vector
+                        // 32, which works on every CPU even when 0xFD
+                        // doesn't).  Diagnose per-CPU vector-0xFD
+                        // blockage modes:
+                        //   isr_f bit 29 = vector 0xFD ISR set → missed
+                        //     EOI; new 0xFD IPIs queue in IRR but won't
+                        //     deliver until ISR clears.
+                        //   irr_f bit 29 set persistently → pending IPI
+                        //     waiting to deliver but blocked.
+                        //   tpr ≥ 0xF0 → task-priority class 0xF blocks
+                        //     vector 0xFD (priority class = vec>>4 = 0xF).
+                        //   svr bit 8 cleared → LAPIC software-disabled.
+                        let isr_f = pc.lapic_isr_f.load(Ordering::Relaxed);
+                        let irr_f = pc.lapic_irr_f.load(Ordering::Relaxed);
+                        let tpr = pc.lapic_tpr.load(Ordering::Relaxed);
+                        let svr = pc.lapic_svr.load(Ordering::Relaxed);
+                        let ppr = pc.lapic_ppr.load(Ordering::Relaxed);
+                        let esr = pc.lapic_esr.load(Ordering::Relaxed);
+                        let isr_lo = pc.lapic_isr_lo_or.load(Ordering::Relaxed);
+                        let fd_in_isr = (isr_f >> 29) & 1;
+                        let fd_in_irr = (irr_f >> 29) & 1;
+                        crate::println!(
+                            "LAPIC: cpu={} isr_f=0x{:08x} irr_f=0x{:08x} tpr=0x{:02x} \
+                             ppr=0x{:02x} svr=0x{:08x} esr=0x{:08x} isr_lo_or=0x{:08x} \
+                             fd_in_isr={} fd_in_irr={}",
+                            c, isr_f, irr_f, tpr & 0xff,
+                            ppr & 0xff, svr, esr, isr_lo,
+                            fd_in_isr, fd_in_irr,
                         );
                     }
                     // #135 Fix A: force-migrate stuck thread away from its

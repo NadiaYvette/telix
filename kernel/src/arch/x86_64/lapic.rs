@@ -93,6 +93,39 @@ pub fn eoi() {
     write(LAPIC_EOI, 0);
 }
 
+/// #135 LAPIC state probe — snapshots this CPU's own LAPIC registers
+/// into its `PerCpuData` slot.  Called from the timer-tick handler
+/// (vector 32), which is known-working on all CPUs even when vector
+/// 0xFD (reschedule IPI) has stopped delivering.  The rescue dump
+/// reads these cross-CPU to diagnose per-CPU vector-0xFD blockage:
+///   * `isr_f` bit 29 (vector 0xFD = 253; 253-224=29) set → ISR is
+///     stuck (missed-EOI), new 0xFD IPIs queue in IRR but won't deliver
+///   * `irr_f` bit 29 set persistently → pending IPI not being delivered
+///   * `tpr` ≥ 0xF0 → priority class blocks 0xFD (priority class = 0xF)
+///   * `svr` bit 8 cleared → LAPIC software-disabled
+pub fn snapshot_state_to_pcpu() {
+    let cpu = crate::sched::smp::cpu_id() as usize;
+    if cpu >= crate::sched::smp::MAX_CPUS {
+        return;
+    }
+    let pcpu = crate::sched::smp::get(cpu as u32);
+    use core::sync::atomic::Ordering;
+    pcpu.lapic_isr_f.store(read(0x170), Ordering::Relaxed);
+    pcpu.lapic_irr_f.store(read(0x270), Ordering::Relaxed);
+    pcpu.lapic_tpr.store(read(0x080), Ordering::Relaxed);
+    pcpu.lapic_svr.store(read(0x0F0), Ordering::Relaxed);
+    pcpu.lapic_ppr.store(read(0x0A0), Ordering::Relaxed);
+    // ESR: writing first latches current error state for reading.
+    // We don't currently use APIC errors for control, just observe.
+    pcpu.lapic_esr.store(read(0x280), Ordering::Relaxed);
+    // OR of low ISR registers (0x100-0x160, 7 dwords covering vectors
+    // 0-223).  Anything non-zero means a vector below 0xE0 is in-service,
+    // which raises PPR and blocks higher classes for the duration.
+    let isr_or = read(0x100) | read(0x110) | read(0x120) | read(0x130)
+        | read(0x140) | read(0x150) | read(0x160);
+    pcpu.lapic_isr_lo_or.store(isr_or, Ordering::Relaxed);
+}
+
 /// Send INIT IPI to a target LAPIC ID.
 pub fn send_init(target_id: u32) {
     // ICR high: destination = target LAPIC ID.

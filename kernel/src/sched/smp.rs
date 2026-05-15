@@ -261,6 +261,32 @@ pub struct PerCpuData {
     ///   * Both stale: CPU is truly halted — no IRQs arriving, LAPIC
     ///     delivery broken or vCPU descheduled by host.
     pub last_irq_ns: core::sync::atomic::AtomicU64,
+    /// #135 LAPIC state snapshot — written by this CPU's own timer-tick
+    /// handler (vector 32, which is known-working across all CPUs).
+    /// Read cross-CPU by the rescue dump.  Diagnoses vector-0xFD
+    /// stuck-ISR (missed-EOI), abnormal TPR (priority class blocking
+    /// 0xFD), or disabled SVR (LAPIC software-disabled).
+    ///   lapic_isr_f: register 0x170 (ISR vectors 224-255; bit 29 = 0xFD)
+    ///   lapic_irr_f: register 0x270 (IRR vectors 224-255; bit 29 = 0xFD)
+    ///   lapic_tpr:   register 0x080 (Task Priority Register)
+    ///   lapic_svr:   register 0x0F0 (Spurious-Interrupt Vector Register)
+    ///   lapic_ppr:   register 0x0A0 (Processor Priority Register —
+    ///                effective mask = max(TPR_class, ISR_class).  If
+    ///                anything stuck in low-vector ISR, PPR is high
+    ///                even when ISR_F (high) is clean.)
+    ///   lapic_esr:   register 0x280 (Error Status Register — APIC
+    ///                detected delivery errors, IPI send/receive faults)
+    ///   lapic_isr_lo_or: OR of ISR vectors 0-223 (registers 0x100-0x160,
+    ///                7 dwords).  Non-zero means SOMETHING low-priority
+    ///                is in-service somewhere, which raises PPR and
+    ///                blocks higher-class vectors during the window.
+    pub lapic_isr_f: core::sync::atomic::AtomicU32,
+    pub lapic_irr_f: core::sync::atomic::AtomicU32,
+    pub lapic_tpr: core::sync::atomic::AtomicU32,
+    pub lapic_svr: core::sync::atomic::AtomicU32,
+    pub lapic_ppr: core::sync::atomic::AtomicU32,
+    pub lapic_esr: core::sync::atomic::AtomicU32,
+    pub lapic_isr_lo_or: core::sync::atomic::AtomicU32,
 }
 
 impl PerCpuData {
@@ -286,6 +312,13 @@ impl PerCpuData {
             cli_count: core::sync::atomic::AtomicU64::new(0),
             last_try_switch_ns: core::sync::atomic::AtomicU64::new(0),
             last_irq_ns: core::sync::atomic::AtomicU64::new(0),
+            lapic_isr_f: core::sync::atomic::AtomicU32::new(0),
+            lapic_irr_f: core::sync::atomic::AtomicU32::new(0),
+            lapic_tpr: core::sync::atomic::AtomicU32::new(0),
+            lapic_svr: core::sync::atomic::AtomicU32::new(0),
+            lapic_ppr: core::sync::atomic::AtomicU32::new(0),
+            lapic_esr: core::sync::atomic::AtomicU32::new(0),
+            lapic_isr_lo_or: core::sync::atomic::AtomicU32::new(0),
         }
     }
 }
