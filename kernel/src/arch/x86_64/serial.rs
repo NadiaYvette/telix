@@ -147,17 +147,29 @@ pub fn putc(c: u8) {
     Serial.putc(c);
 }
 
-// Holding this lock across the duration of one `_print` call serialises
-// concurrent writers — without it, multi-CPU `println!` calls interleave
-// at byte granularity and produce unparseable output (per-CPU bytes
-// land out of order on the wire).  `SpinLock` is interrupt-safe so
-// IRQ-context prints don't deadlock against thread-context prints on
-// the same CPU.
+// #154 v2 polite-lock for print serialization.
 //
-// #154: the lock holds IRQs OFF for the duration of byte-push.  We
-// keep that property (same-CPU re-entry safety) but minimize the hold
-// time by pre-formatting outside the lock — see `_print`.
-static PRINT_LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+// Replaces the previous interrupt-safe `SpinLock`, which disabled IRQs
+// across the wait for the lock (so a contended print blocked IRQs on
+// the waiting CPU for the full duration of the holder's critical
+// section).  Polite-lock pattern:
+//   - spin with IRQs ON until the lock looks free
+//   - disable IRQs, try to claim; on failure restore IRQs and retry
+//   - hold lock with IRQs OFF for the critical section
+//
+// Same-CPU re-entry (an IRQ handler firing while a thread on the same
+// CPU is in _print) is handled via `PRINT_HOLDER_CPU`: if we see our
+// own CPU as the holder, skip the lock and push bytes directly.  The
+// inner call may interleave bytes with the outer call's output, but
+// that's better than the deadlock the old regular spinlock would
+// produce if it lacked IRQ-safety (and is preferable to blocking IRQs
+// for tens of ms during cross-CPU contention, which is what we had).
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering as AOrdering};
+
+static PRINT_LOCK: AtomicU32 = AtomicU32::new(0);
+/// CPU id of the current PRINT_LOCK holder, or -1 if free.  Set under
+/// the lock; checked before attempting to acquire (re-entry guard).
+static PRINT_HOLDER_CPU: AtomicI32 = AtomicI32::new(-1);
 
 /// #154 print buffer size.  2048 bytes is enough for the long-form
 /// rescue/IPI-CNT/CLI-TOP debug lines (typically 100-500 bytes each);
@@ -233,11 +245,43 @@ pub fn _print(args: fmt::Arguments) {
         }
     }
 
-    // Phase 2: acquire the lock and push the pre-formatted bytes
-    // through the 16-byte UART FIFO.  IRQs are OFF only for this push.
-    {
-        let _g = PRINT_LOCK.lock();
+    // Phase 2: polite-lock acquire + push bytes.
+    //
+    // Re-entry check first: if we're already the holder on this CPU
+    // (IRQ context interrupting a thread mid-_print), bypass the lock
+    // and push directly.  The IRQ's bytes will interleave with the
+    // outer call's output but no deadlock and no IRQ-blocking wait.
+    let my_cpu = crate::sched::smp::cpu_id() as i32;
+    if PRINT_HOLDER_CPU.load(AOrdering::Acquire) == my_cpu {
         Serial.push_bytes(wirebuf.as_bytes());
+    } else {
+        // Polite-lock acquire: spin IRQ-ON until the lock looks free,
+        // then disable IRQs and CAS-try.  On lost race, restore IRQs
+        // and re-spin.  Worst-case IRQ-off duration is one critical
+        // section (byte-push) rather than full cross-CPU contention.
+        let saved;
+        loop {
+            // Wait phase: IRQs ON (or already-off in IRQ context).
+            while PRINT_LOCK.load(AOrdering::Relaxed) != 0 {
+                core::hint::spin_loop();
+            }
+            // Acquire attempt: IRQs OFF.
+            let s = crate::arch::irq::disable();
+            if PRINT_LOCK
+                .compare_exchange(0, 1, AOrdering::Acquire, AOrdering::Relaxed)
+                .is_ok()
+            {
+                saved = s;
+                break;
+            }
+            crate::arch::irq::restore(s);
+        }
+        // Critical section.
+        PRINT_HOLDER_CPU.store(my_cpu, AOrdering::Release);
+        Serial.push_bytes(wirebuf.as_bytes());
+        PRINT_HOLDER_CPU.store(-1, AOrdering::Release);
+        PRINT_LOCK.store(0, AOrdering::Release);
+        crate::arch::irq::restore(saved);
     }
 
     // Mirror to the framebuffer console (no UART contention).
