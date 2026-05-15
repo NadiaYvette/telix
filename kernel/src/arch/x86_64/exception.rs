@@ -202,17 +202,38 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
                 if !FIRST_IRETQ_USER_LOGGED[tid as usize]
                     .swap(true, core::sync::atomic::Ordering::Relaxed)
                 {
+                    // #155 anon-zero-page family probe: peek at the
+                    // first 16 bytes the user is about to execute.  If
+                    // they're zero or otherwise corrupt at this moment,
+                    // the corruption happened BEFORE iretq (i.e. in
+                    // finalize_spawn / percpu_enqueue / context-switch).
+                    // If they look like valid x86 code here, the
+                    // corruption is in iretq itself or the very-first
+                    // instruction fetch.  copy_from_user walks the
+                    // user's PT so we see exactly what the user CPU
+                    // will see.
+                    let rip = frame_peek.rip();
+                    let mut bytes = [0u8; 16];
+                    let pt_root = crate::sched::scheduler::current_page_table_root();
+                    let ok = crate::syscall::handlers::copy_from_user(
+                        pt_root, rip as usize, &mut bytes,
+                    );
+                    let all_zero = bytes.iter().all(|&b| b == 0);
                     crate::println!(
                         "FIRST-IRETQ-USER: tid={} cpu={} vec={} sp={:#x} \
-                         rip={:#x} cs={:#x} ss={:#x} rax={:#x} rsp={:#x}",
+                         rip={:#x} cs={:#x} ss={:#x} rax={:#x} rsp={:#x} \
+                         rip_bytes_ok={} rip_bytes_zero={} rip_bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
                         tid,
                         crate::sched::smp::cpu_id(),
                         vector, sp,
-                        frame_peek.rip(),
+                        rip,
                         cs_peek,
                         frame_peek.ss(),
                         frame_peek.rax(),
                         frame_peek.rsp(),
+                        ok, all_zero,
+                        bytes[0], bytes[1], bytes[2], bytes[3],
+                        bytes[4], bytes[5], bytes[6], bytes[7],
                     );
                 }
             }
