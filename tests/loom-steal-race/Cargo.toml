@@ -1,0 +1,29 @@
+[package]
+name = "loom-steal-race"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Loom model of the #135 residual-bug suspected race: between
+# `percpu_pick_next`'s steal+dequeue_set_pending and `try_switch`'s
+# CAS, a concurrent wake_thread on the same tid may interact with
+# `in_queue` state and either silently-skip its own enqueue or
+# leave the thread in an orphaned (in_queue=false, heap_pos=NONE,
+# on_cpu=PEND, state=Ready) configuration.
+#
+# Boot 99amfsq3 (2026-05-15) data: CPU 3's disp count was 506x
+# less than CPU 2 in an otherwise-quiet host environment, with
+# 1738 RESCUE-STUCK events for one tid alone on CPU 3.  The
+# orphan pattern: thread was on CPU 1, got stolen by CPU 3,
+# never dispatched.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
+
+[workspace]

@@ -1232,15 +1232,27 @@ fn rq_contains_tid(rq: &PerCpuRunQueues, tid: ThreadId) -> bool {
 /// Try to steal a thread from another CPU's run queue.
 /// Returns the stolen thread's ID, or None.
 fn try_steal(cpu: u32) -> Option<ThreadId> {
-    try_steal_min(cpu, 2)
+    try_steal_min(cpu, 2).map(|(tid, victim)| {
+        // #135 residual investigation: record steal events into the
+        // per-thread transition ring.  Action 19 = STEAL_SUCCESS, the
+        // cpu field is the THIEF, on_cpu_enc is the VICTIM CPU.  If a
+        // thread shows up as wedged with last_cpu=N and a STEAL entry
+        // shortly before the wedge, the orphan happened in the
+        // steal → dequeue_set_pending → try_switch CAS path.
+        record_trans(tid as u32, 19, thread_ref(tid).state, victim);
+        tid
+    })
 }
 
 /// Try to steal from idle — allows taking the only thread at a priority level.
 fn try_steal_for_idle(cpu: u32) -> Option<ThreadId> {
-    try_steal_min(cpu, 1)
+    try_steal_min(cpu, 1).map(|(tid, victim)| {
+        record_trans(tid as u32, 19, thread_ref(tid).state, victim);
+        tid
+    })
 }
 
-fn try_steal_min(cpu: u32, min_len: u32) -> Option<ThreadId> {
+fn try_steal_min(cpu: u32, min_len: u32) -> Option<(ThreadId, u32)> {
     let online = smp::online_cpus() as usize;
     if online <= 1 {
         return None;
@@ -1249,7 +1261,7 @@ fn try_steal_min(cpu: u32, min_len: u32) -> Option<ThreadId> {
         let victim = ((cpu as usize + i) % online) as u32;
         if let Some(mut rq) = percpu_rq()[victim as usize].try_lock() {
             if let Some(tid) = rq.steal_one_min(cpu, min_len) {
-                return Some(tid);
+                return Some((tid, victim));
             }
         }
     }
@@ -6878,14 +6890,23 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                         let cli_max = pc.cli_max_cycles.load(Ordering::Relaxed);
                         let cli_count = pc.cli_count.load(Ordering::Relaxed);
                         let cli_enter = pc.cli_enter_tsc.load(Ordering::Relaxed);
+                        // #135 residual: set_pending vs cas_ok counters
+                        // expose per-CPU pick-vs-dispatch asymmetry.
+                        // Big gap (set_pend >> cas_ok) means picks land
+                        // in dequeue_set_pending but never reach a
+                        // successful CAS — the orphaning pattern.
+                        let sp = pc.dispatch_set_pending_count.load(Ordering::Relaxed);
+                        let ok = pc.dispatch_cas_ok_count.load(Ordering::Relaxed);
                         crate::println!(
                             "IPI-CNT: cpu={} recv={} disp={} send_to=[{},{},{},{}] \
                              cur={} dispg={} idle={} cli_open={} \
-                             cli_total={} cli_max={} cli_count={}",
+                             cli_total={} cli_max={} cli_count={} \
+                             set_pend={} cas_ok={} delta={}",
                             c, recv, disp, s0, s1, s2, s3,
                             cur, dispg, idle,
                             if cli_enter != 0 { 1 } else { 0 },
                             cli_total, cli_max, cli_count,
+                            sp, ok, sp.saturating_sub(ok),
                         );
                     }
                     // #135 Fix A: force-migrate stuck thread away from its
