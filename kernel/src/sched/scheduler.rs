@@ -6999,15 +6999,16 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                         // successful CAS — the orphaning pattern.
                         let sp = pc.dispatch_set_pending_count.load(Ordering::Relaxed);
                         let ok = pc.dispatch_cas_ok_count.load(Ordering::Relaxed);
+                        let cli_max_rip = pc.cli_max_rip.load(Ordering::Relaxed);
                         crate::println!(
                             "IPI-CNT: cpu={} recv={} disp={} send_to=[{},{},{},{}] \
                              cur={} dispg={} idle={} cli_open={} \
-                             cli_total={} cli_max={} cli_count={} \
+                             cli_total={} cli_max={} cli_max_rip=0x{:x} cli_count={} \
                              set_pend={} cas_ok={} delta={}",
                             c, recv, disp, s0, s1, s2, s3,
                             cur, dispg, idle,
                             if cli_enter != 0 { 1 } else { 0 },
-                            cli_total, cli_max, cli_count,
+                            cli_total, cli_max, cli_max_rip, cli_count,
                             sp, ok, sp.saturating_sub(ok),
                         );
                         // #135 LAPIC probe: each CPU snapshots its own

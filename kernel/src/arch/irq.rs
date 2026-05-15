@@ -43,7 +43,22 @@ pub fn disable() -> usize {
         }
         let saved = flags as usize;
         if saved & 0x200 != 0 {
-            crate::sched::smp::record_cli_enter();
+            // #135 CLI callsite probe: capture the RIP of the lea
+            // instruction itself.  Since arch::irq::disable is
+            // #[inline(always)], this lea materializes in the *caller's*
+            // body — the RIP we capture is the caller's instruction
+            // address right after their CLI sequence.  Use that to find
+            // the kernel callsite of the longest cli_max via the
+            // cli_max_rip rescue field.
+            let rip: u64;
+            unsafe {
+                core::arch::asm!(
+                    "lea {0}, [rip + 0]",
+                    out(reg) rip,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            crate::sched::smp::record_cli_enter(rip);
         }
         saved
     }

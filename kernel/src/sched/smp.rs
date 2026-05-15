@@ -261,6 +261,14 @@ pub struct PerCpuData {
     ///   * Both stale: CPU is truly halted — no IRQs arriving, LAPIC
     ///     delivery broken or vCPU descheduled by host.
     pub last_irq_ns: core::sync::atomic::AtomicU64,
+    /// #135 CLI callsite probe: RIP captured when entering the outermost
+    /// CLI region.  Updated by `record_cli_enter_rip` from arch::irq::disable.
+    /// On a max-CLI update in `record_cli_exit`, copied into `cli_max_rip`
+    /// so the rescue dump can identify the kernel callsite that held
+    /// interrupts off the longest.  Boot 26: cpu=3 cli_max=97ms — finding
+    /// the RIP nails the offending Linux-personality forward path.
+    pub cli_enter_rip: core::sync::atomic::AtomicU64,
+    pub cli_max_rip: core::sync::atomic::AtomicU64,
     /// #135 LAPIC state snapshot — written by this CPU's own timer-tick
     /// handler (vector 32, which is known-working across all CPUs).
     /// Read cross-CPU by the rescue dump.  Diagnoses vector-0xFD
@@ -312,6 +320,8 @@ impl PerCpuData {
             cli_count: core::sync::atomic::AtomicU64::new(0),
             last_try_switch_ns: core::sync::atomic::AtomicU64::new(0),
             last_irq_ns: core::sync::atomic::AtomicU64::new(0),
+            cli_enter_rip: core::sync::atomic::AtomicU64::new(0),
+            cli_max_rip: core::sync::atomic::AtomicU64::new(0),
             lapic_isr_f: core::sync::atomic::AtomicU32::new(0),
             lapic_irr_f: core::sync::atomic::AtomicU32::new(0),
             lapic_tpr: core::sync::atomic::AtomicU32::new(0),
@@ -349,9 +359,13 @@ pub fn cpu_id() -> u32 {
 
 /// #135 CLI-residency probe: called from `arch::irq::disable()` on the
 /// outermost transition (when IF was set before).  Records the entry TSC
-/// on the current CPU.  No-op until PER_CPU_PTR is populated.
+/// and caller RIP on the current CPU.  No-op until PER_CPU_PTR is
+/// populated.  The RIP is captured at the CLI call-site by the caller
+/// (irq::disable is #[inline(always)] so the lea materializes in the
+/// caller's body); seeing this RIP in the cli_max_rip rescue field
+/// pinpoints which kernel function holds interrupts off the longest.
 #[inline]
-pub fn record_cli_enter() {
+pub fn record_cli_enter(rip: u64) {
     let ptr = PER_CPU_PTR.load(Ordering::Relaxed);
     if ptr.is_null() { return; }
     let cpu = cpu_id() as usize;
@@ -360,7 +374,9 @@ pub fn record_cli_enter() {
     let tsc = unsafe { core::arch::x86_64::_rdtsc() };
     #[cfg(not(target_arch = "x86_64"))]
     let tsc: u64 = 0;
-    unsafe { (*ptr.add(cpu)).cli_enter_tsc.store(tsc, Ordering::Relaxed); }
+    let pcpu = unsafe { &*ptr.add(cpu) };
+    pcpu.cli_enter_tsc.store(tsc, Ordering::Relaxed);
+    pcpu.cli_enter_rip.store(rip, Ordering::Relaxed);
 }
 
 /// #135 CLI-residency probe: called from `arch::irq::restore()` on the
@@ -383,13 +399,20 @@ pub fn record_cli_exit() {
     pcpu.cli_total_cycles.fetch_add(delta, Ordering::Relaxed);
     pcpu.cli_count.fetch_add(1, Ordering::Relaxed);
     let mut cur_max = pcpu.cli_max_cycles.load(Ordering::Relaxed);
+    let mut bumped_max = false;
     while delta > cur_max {
         match pcpu.cli_max_cycles.compare_exchange_weak(
             cur_max, delta, Ordering::Relaxed, Ordering::Relaxed,
         ) {
-            Ok(_) => break,
+            Ok(_) => { bumped_max = true; break; }
             Err(observed) => cur_max = observed,
         }
+    }
+    if bumped_max {
+        // Record the RIP that produced this new cli_max so the rescue
+        // dump shows which kernel callsite is the worst offender.
+        let rip = pcpu.cli_enter_rip.load(Ordering::Relaxed);
+        pcpu.cli_max_rip.store(rip, Ordering::Relaxed);
     }
     pcpu.cli_enter_tsc.store(0, Ordering::Relaxed);
 }
