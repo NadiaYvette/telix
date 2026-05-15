@@ -123,8 +123,24 @@ static PVCLOCK: [PvclockVcpuTimeInfo; crate::sched::smp::MAX_CPUS] =
     [PVCLOCK_NEW; crate::sched::smp::MAX_CPUS];
 static KVM_PVCLOCK_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Enable pvclock for the calling CPU.  Each vCPU writes its own
-/// per-CPU page address into MSR_KVM_SYSTEM_TIME_NEW.  Idempotent.
+/// Per-CPU cache of the last valid pvclock-derived time, in ns since
+/// boot.  Used by `pvclock_now_ns` as a fallback when the host hasn't
+/// yet written the per-CPU page (version == 0) or the seqlock loop
+/// doesn't converge — returning this prevents mixing TSC-based and
+/// pvclock-based readings across calls (which would make tick-gap
+/// computations meaningless and produce spurious 100+ second
+/// TICK-GAP reports per boot 91amfsq47).  Monotonically increasing
+/// per CPU; the host's pvclock writes only ratchet it forward.
+static PVCLOCK_LAST_NS: [core::sync::atomic::AtomicU64; crate::sched::smp::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::sched::smp::MAX_CPUS];
+
+/// Enable pvclock for the calling CPU.  Writes the per-CPU page PA
+/// into MSR_KVM_SYSTEM_TIME_NEW, then busy-waits up to ~10ms for the
+/// host to publish a valid version stamp.  KVM updates the page on
+/// vcpu_load and on each VMENTER, so a fresh MSR write usually
+/// produces a valid version within a few VMEXIT round-trips.  Without
+/// this wait, the first `pvclock_now_ns` reads can race the host's
+/// first write and fall back to TSC, producing inconsistent units.
 pub fn enable_pvclock_self() {
     if !KVM_PVCLOCK_ENABLED.load(Ordering::Relaxed) {
         return;
@@ -136,6 +152,17 @@ pub fn enable_pvclock_self() {
     let pa = &PVCLOCK[cpu] as *const _ as u64;
     unsafe {
         wrmsr(MSR_KVM_SYSTEM_TIME_NEW, pa | 1);
+    }
+    // Spin briefly waiting for the host's first update.  Bound the
+    // wait at ~10ms worth of spin iterations to avoid blocking boot
+    // if the host doesn't honour the registration.
+    let p = &PVCLOCK[cpu];
+    for _ in 0..1_000_000 {
+        let v = p.version.load(Ordering::Acquire);
+        if v != 0 && v & 1 == 0 {
+            return;
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -156,7 +183,7 @@ pub fn pvclock_now_ns() -> Option<u64> {
         return None;
     }
     let p = &PVCLOCK[cpu];
-    for _ in 0..16 {
+    for _ in 0..32 {
         let v0 = p.version.load(Ordering::Acquire);
         if v0 == 0 || v0 & 1 != 0 {
             // 0 = host hasn't initialised yet; odd = update in progress.
@@ -178,9 +205,28 @@ pub fn pvclock_now_ns() -> Option<u64> {
             delta >>= (-shift) as u32;
         }
         let scaled = (delta * (mul as u128)) >> 32;
-        return Some(st.wrapping_add(scaled as u64));
+        let now = st.wrapping_add(scaled as u64);
+        // Ratchet the per-CPU cache forward.  Only update if our read
+        // exceeds the cached value — prevents cross-CPU writes from
+        // appearing to go backwards (we read this CPU's slot, but
+        // we read against a single AtomicU64 monotonically).
+        let prev = PVCLOCK_LAST_NS[cpu].load(Ordering::Relaxed);
+        if now > prev {
+            PVCLOCK_LAST_NS[cpu].store(now, Ordering::Relaxed);
+        }
+        return Some(now);
     }
-    None
+    // Seqlock didn't converge (16+ retries, host hammering updates).
+    // Return the last valid value rather than None, which would force
+    // the caller to TSC-fallback and mix time scales — boot 47 measured
+    // 100+ second TICK-GAP because the BSP saw a pvclock reading then
+    // the next reading hit this path and returned a TSC value.
+    let cached = PVCLOCK_LAST_NS[cpu].load(Ordering::Relaxed);
+    if cached != 0 {
+        Some(cached)
+    } else {
+        None
+    }
 }
 
 #[inline]
