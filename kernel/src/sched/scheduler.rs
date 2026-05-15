@@ -2659,6 +2659,39 @@ pub fn tick(current_sp: u64) -> u64 {
                             "CLI-MAX-TICK: cpu={} tick={} max={} total={} count={}",
                             c, n, max, tot, cnt,
                         );
+                        // #135 cli_max-per-callsite: also dump the top-N
+                        // CLI offenders for this CPU when cli_max changed.
+                        // Triggered on the same monotonic-growth gate as
+                        // CLI-MAX-TICK so the log doesn't repeat steady-state
+                        // entries.  N=8 selection sort = 64 cmps, fine.
+                        let mut idx: [usize; smp::CLI_TOP_N] = [0usize; smp::CLI_TOP_N];
+                        for i in 0..smp::CLI_TOP_N { idx[i] = i; }
+                        let cyc: [u64; smp::CLI_TOP_N] = {
+                            let mut a = [0u64; smp::CLI_TOP_N];
+                            for i in 0..smp::CLI_TOP_N {
+                                a[i] = pc.cli_top[i].cycles.load(Ordering::Relaxed);
+                            }
+                            a
+                        };
+                        for i in 0..smp::CLI_TOP_N {
+                            for j in (i + 1)..smp::CLI_TOP_N {
+                                if cyc[idx[j]] > cyc[idx[i]] {
+                                    idx.swap(i, j);
+                                }
+                            }
+                        }
+                        let mut printed = 0usize;
+                        for &i in idx.iter() {
+                            let r = pc.cli_top[i].rip.load(Ordering::Relaxed);
+                            let cy = pc.cli_top[i].cycles.load(Ordering::Relaxed);
+                            let ct = pc.cli_top[i].count.load(Ordering::Relaxed);
+                            if r == 0 || cy == 0 { continue; }
+                            crate::println!(
+                                "CLI-TOP-TICK: cpu={} tick={} slot={} rip=0x{:x} max={} count={}",
+                                c, n, printed, r, cy, ct,
+                            );
+                            printed += 1;
+                        }
                     }
                 }
             }
