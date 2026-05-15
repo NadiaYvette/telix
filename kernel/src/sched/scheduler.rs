@@ -6717,7 +6717,17 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
         // wake's IPI was lost / the target CPU's try_switch never picked
         // the thread up (#120 root cause: wake_parked_thread fast path
         // runs but the parking CPU never dispatches).
-        const STUCK_PENDING_AGE: u32 = 16; // ~16s at 1Hz rescue cadence
+        // Rescue actually fires at ~10Hz (every 40 cross-CPU ticks ≈ 100ms,
+        // per the RESCUE_COUNTER % 40 schedule in tick()), NOT the 1Hz the
+        // original comment assumed.  At 16 sweeps × 100ms = 1.6s, false
+        // positives fire constantly during normal sleep_ms cycles (e.g.
+        // compositor_srv's 1s periodic work) and the rescue dump's
+        // serial output then holds PRINT_LOCK CLI for ~100ms per print,
+        // starving every other CPU's dispatch latency, triggering MORE
+        // rescue fires (positive-feedback observer effect — confirmed
+        // boot 27 cli_max_rip=0x17d723 = serial::_print).  Raise to 160
+        // sweeps × 100ms = ~16s — only genuine multi-second wedges fire.
+        const STUCK_PENDING_AGE: u32 = 160; // ~16s at 10Hz rescue cadence
         // Low-threshold PENDING-stuck diagnostic — independent of the 16s
         // rescue and 30s CALL-TIMEOUT.  Fires once per stuck episode when
         // `pending_set_ns` is older than ~2s in real time.  Cleared via

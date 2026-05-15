@@ -801,16 +801,26 @@ pub fn alloc_page() -> Option<PhysAddr> {
     // fewer page and falls through to slow-path normally.  Without this
     // fallback, observed phys_free=216/6740 with alloc_task_entry FAILED
     // (boot 24): all 216 pages locked in non-current-CPU reservations.
+    let mut tried_with_free = 0usize;
     for ci in 0..ALLOC.total_chunks {
         let fc = free_count(ALLOC.chunk(ci).load());
         if fc == 0 {
             continue;
         }
+        tried_with_free += 1;
         if let Some(pi) = chunk_alloc_one(ci) {
             return Some(PhysAddr::new(page_pa(ci, pi)));
         }
     }
 
+    // Diagnostic: we found `free_count_global > 0` (the early-exit at
+    // line 695 would have returned None otherwise) but no chunk yielded
+    // a page.  Either the global counter is racing ahead of per-chunk
+    // counters, or chunk_alloc_one is failing for a non-fc-zero reason.
+    crate::println!(
+        "[alloc_page] FAIL despite free={} (total_chunks={}, tried_with_free={})",
+        free, ALLOC.total_chunks, tried_with_free,
+    );
     None
 }
 
