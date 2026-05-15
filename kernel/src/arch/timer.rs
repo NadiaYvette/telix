@@ -66,33 +66,46 @@ pub fn timer_freq() -> u64 {
 
 /// Get monotonic time in nanoseconds since boot.
 ///
-/// On x86_64 under KVM, this returns a vCPU-runtime monotonic clock:
-/// pvclock (CLOCKSOURCE2) for TSC-frequency-corrected time, then
-/// subtract STEAL_TIME (nanoseconds the vCPU has been host-
-/// descheduled) to exclude host-pause durations from the reading.
-/// Boot 91amfsq47/48 showed pvclock alone does NOT exclude host
-/// pauses — KVM's master-clock advertises wallclock-like monotonic
-/// time across host descheduling.  STEAL_TIME is the documented
-/// mechanism for the guest to subtract that.
+/// REVERTED to pure TSC arithmetic.  Boots 47/48/49 showed that
+/// folding pvclock or pvclock-steal_time into the primary monotonic
+/// clock makes the scale inconsistent across initialization phases:
+/// callers comparing readings taken at different times can see scale
+/// jumps (TSC vs pvclock vs pvclock-steal) that produce 100+ second
+/// spurious deltas.  Many heuristics depend on monotonic_ns's
+/// absolute value (sleep deadlines, etc.), not just deltas, so a
+/// post-init drop in the value would break them.
 ///
-/// Falls back to raw TSC arithmetic on bare metal or other arches.
+/// Use `vcpu_runtime_ns()` for the paravirt-aware "time the vCPU has
+/// actually been running" reading.  Scheduler rescue heuristics that
+/// should exclude host-pause durations call that instead.
 #[inline]
 pub fn monotonic_ns() -> u64 {
+    let c = read_cycles() as u128;
+    let f = timer_freq() as u128;
+    ((c * 1_000_000_000u128) / f) as u64
+}
+
+/// Get vCPU-runtime time in nanoseconds since boot — like monotonic_ns
+/// but with host-pause durations subtracted.  On x86_64 under KVM with
+/// both pvclock and STEAL_TIME enabled, this returns pvclock_ns minus
+/// the accumulated stolen ns from the per-CPU STEAL_TIME page.
+///
+/// Use for scheduler heuristics that should NOT count host-pause time
+/// as "real" elapsed time (rescue ages, stuck-thread timeouts, etc.).
+/// Falls back to monotonic_ns on bare metal or when paravirt isn't
+/// available.
+#[inline]
+pub fn vcpu_runtime_ns() -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
         if let Some(ns) = crate::arch::x86_64::hypervisor::pvclock_now_ns() {
-            // Subtract steal-time so the result advances only while
-            // the vCPU was running.  steal_time_ns() returns None on
-            // bare-metal / non-KVM; treat as zero subtraction.
             let steal = crate::arch::hypervisor::ops()
                 .steal_time_ns()
                 .unwrap_or(0);
             return ns.saturating_sub(steal);
         }
     }
-    let c = read_cycles() as u128;
-    let f = timer_freq() as u128;
-    ((c * 1_000_000_000u128) / f) as u64
+    monotonic_ns()
 }
 
 /// Program the per-CPU timer to fire once at `deadline_ns` (nanoseconds since boot).
