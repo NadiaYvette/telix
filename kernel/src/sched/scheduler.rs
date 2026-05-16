@@ -2574,6 +2574,13 @@ pub fn tick(current_sp: u64) -> u64 {
         if cpu < smp::MAX_CPUS {
             let now = get_monotonic_ns();
             let prev = PER_CPU_LAST_TICK_NS[cpu].swap(now, Ordering::Relaxed);
+            // Companion vcpu_runtime stamp for paravirt-aware heuristics
+            // (see PER_CPU_LAST_TICK_VCPU_NS docstring).  Updated in lockstep
+            // with the wallclock stamp above so any reader can correlate.
+            PER_CPU_LAST_TICK_VCPU_NS[cpu].store(
+                crate::arch::timer::vcpu_runtime_ns(),
+                Ordering::Relaxed,
+            );
             if prev != 0 {
                 let gap = now.saturating_sub(prev);
                 let mut max = PER_CPU_TICK_MAX_GAP_NS.load(Ordering::Relaxed);
@@ -7800,12 +7807,19 @@ fn check_sleep_timers() {
         // tick gaps), the original 100 ms threshold meant most wakes
         // still went to a CPU that had no recent tick.  Retargeting
         // to the waker CPU much sooner reduces the wake-latency tail.
+        //
+        // Paravirt Layer 1: compare in vcpu_runtime_ns (not wallclock)
+        // so a host-pause that froze ALL guest CPUs for tens of
+        // seconds doesn't cause every wake to false-retarget to the
+        // waker.  The real signal we want is "target CPU hasn't had
+        // vCPU time recently", which excludes host pauses.
         const STALE_TICK_THRESHOLD_NS: u64 = 30_000_000; // 30 ms
         if target != waker_cpu && (target as usize) < smp::MAX_CPUS {
-            let target_last = PER_CPU_LAST_TICK_NS[target as usize]
+            let target_last = PER_CPU_LAST_TICK_VCPU_NS[target as usize]
                 .load(Ordering::Relaxed);
+            let now_vcpu = crate::arch::timer::vcpu_runtime_ns();
             if target_last != 0
-                && now_ns.saturating_sub(target_last) > STALE_TICK_THRESHOLD_NS
+                && now_vcpu.saturating_sub(target_last) > STALE_TICK_THRESHOLD_NS
             {
                 target = waker_cpu;
                 STALE_TARGET_RETARGET_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -7895,6 +7909,19 @@ pub static SLEEP_WAKE_LATENCY_BUCKETS: [AtomicU64; 7] = [
 /// long-tail outliers when target CPU's IPI was lost AND its own
 /// tick didn't recover.
 pub static PER_CPU_LAST_TICK_NS: [AtomicU64; smp::MAX_CPUS] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; smp::MAX_CPUS]
+};
+/// Per-CPU last tick timestamp in vcpu_runtime_ns scale.  Paravirt
+/// Layer 1 companion to PER_CPU_LAST_TICK_NS: the wallclock stamp
+/// above is what the TICK-GAP probe uses to detect host pauses, but
+/// scheduler heuristics (e.g. STALE_TICK_THRESHOLD retarget in
+/// check_sleep_timers) should not falsely classify a target CPU as
+/// "stale" simply because the host descheduled the guest for tens
+/// of seconds — that's not the target CPU's fault.  Comparing against
+/// vcpu_runtime_ns gives us "the target CPU hasn't had vCPU time
+/// recently", which is the actual signal we want.
+pub static PER_CPU_LAST_TICK_VCPU_NS: [AtomicU64; smp::MAX_CPUS] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [Z; smp::MAX_CPUS]
 };
