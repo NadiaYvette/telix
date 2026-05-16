@@ -1,0 +1,29 @@
+[package]
+name = "verus-phys"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone (excluded from the kernel workspace) like the loom tests,
+# because verus brings its own toolchain pin (rust-toolchain at the
+# verus repo, currently 1.95.0) and a vstd dependency that depends on
+# the verus-built rustc.
+#
+# This crate proves data-structure-level invariants of the bit-packed
+# chunk-state word used by kernel/src/mm/phys.rs:
+#
+#   * The bit-layout encoding round-trips: each accessor
+#     (free_count, owner, has_bitmap, bmp_page) recovers the field that
+#     was written by make_state, given the field is in-range.
+#   * Future iterations: prove the chunk_alloc_one / chunk_free_one
+#     transitions preserve the invariant `free_count_global == sum(per-
+#     chunk fc)` that the boot 91amfsq40 reconciliation probe surfaced
+#     manually.
+#
+# To verify:
+#   /home/nyc/src/verus/source/target-verus/release/verus \
+#       --crate-type=lib src/lib.rs
+#
+# (Verus needs its own rustc, so `cargo verify`-style flows require
+# the cargo-verus shim from the verus repo's source/target-verus tree;
+# the manual invocation above is the minimal-fuss path.)
