@@ -459,4 +459,54 @@ proof fn lemma_popcnt_set_bit(bmp: u64, b: u64)
     lemma_popcnt_from_set_bit(bmp, b, 0);
 }
 
+// ── Popcount bounds + extremes ─────────────────────────────────────
+//
+// Useful corollaries: popcnt is bounded by 64, the empty bitmap has
+// popcnt 0, and the full bitmap has popcnt 64.  These compose with
+// the change-by-1 lemmas to bound `fc` ∈ [0, 64] across alloc/free.
+
+proof fn lemma_popcnt_from_bound(x: u64, i: u64)
+    requires
+        i <= 64,
+    ensures
+        popcnt_from(x, i) <= (64 - i) as nat,
+    decreases (64 - i) as int,
+{
+    if i < 64 {
+        lemma_popcnt_from_bound(x, (i + 1) as u64);
+    }
+}
+
+/// popcnt is bounded by 64.  Justifies the chunk-fc field's 7-bit
+/// width (max value 127) being more than enough — and motivates the
+/// commit-90bd1ce fc>=63 cap as a defensive sanity rather than an
+/// unrealistic concern.
+proof fn lemma_popcnt_bound(x: u64)
+    ensures
+        popcnt(x) <= 64,
+{
+    lemma_popcnt_from_bound(x, 0);
+}
+
+/// Empty bitmap → popcnt 0.  Base case for inductive reasoning.
+proof fn lemma_popcnt_zero()
+    ensures
+        popcnt(0u64) == 0,
+{
+    lemma_popcnt_from_zero(0);
+}
+
+proof fn lemma_popcnt_from_zero(i: u64)
+    requires
+        i <= 64,
+    ensures
+        popcnt_from(0u64, i) == 0,
+    decreases (64 - i) as int,
+{
+    if i < 64 {
+        assert((0u64 >> i) & 1u64 == 0) by (bit_vector);
+        lemma_popcnt_from_zero((i + 1) as u64);
+    }
+}
+
 } // verus!
