@@ -388,7 +388,10 @@ fn dispatch_cas_ok(pcpu: &smp::PerCpuData, tid: ThreadId) {
     // would race with parallel rescue re-enqueues.
     let pend_ts = thread_ref(tid).pending_set_ns.swap(0, Ordering::Relaxed);
     if pend_ts != 0 {
-        let now = get_monotonic_ns();
+        // #163 paravirt fix: pending_set_ns + delta in vcpu_runtime so
+        // host-pause time doesn't inflate dispatch-latency histograms.
+        // Stamp side: dequeue_set_pending uses the same clock.
+        let now = crate::arch::timer::vcpu_runtime_ns();
         let delta = now.saturating_sub(pend_ts);
         let bucket = lat_bucket(delta);
         pcpu.dispatch_latency_hist[bucket].fetch_add(1, Ordering::Relaxed);
@@ -485,7 +488,11 @@ fn lat_snapshot(pcpu: &smp::PerCpuData) -> [u64; 26] {
 /// successful CAS — the residual oscillation pattern.
 #[inline]
 fn dequeue_set_pending(tid: ThreadId) {
-    let now = get_monotonic_ns();
+    // #163 paravirt fix: stamp pending_set_ns in vcpu_runtime so the
+    // age computation in the rescue path measures "time waiting on a
+    // running vCPU" rather than wall time (which includes host pause).
+    // Wall-time stamps produced 100s spurious rescues per boot 49.
+    let now = crate::arch::timer::vcpu_runtime_ns();
     thread_ref(tid).pending_set_ns.store(now, Ordering::Relaxed);
     thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
     smp::current()
@@ -6789,7 +6796,9 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
             // for a genuinely-stuck thread.  In that case, stamp `now`
             // here so the next sweep can compute an age.
             let pset = t.pending_set_ns.load(Ordering::Relaxed);
-            let now_ns = get_monotonic_ns();
+            // #163 paravirt fix: read/stamp pending_set_ns in
+            // vcpu_runtime to match dequeue_set_pending's scale.
+            let now_ns = crate::arch::timer::vcpu_runtime_ns();
             if pset == 0 {
                 t.pending_set_ns.store(now_ns, Ordering::Relaxed);
             } else {
