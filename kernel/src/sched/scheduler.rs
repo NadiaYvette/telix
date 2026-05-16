@@ -3859,6 +3859,7 @@ pub fn block_current(_reason: BlockReason) {
                     BlockReason::Kswapd => 12,
                     BlockReason::SvcLookup => 13,
                     BlockReason::CallReply(_) => 14,
+                    BlockReason::SuspendedMemPressure => 15,
                 };
                 let task_id = thread_ref(tid).task_id;
                 crate::println!(
@@ -4168,6 +4169,106 @@ pub fn wake_thread(tid: ThreadId) {
     }
     // Signal all CPUs so any core spinning in block_current's WFE wakes immediately.
     crate::arch::irq::send_event();
+}
+
+// ── #164 Memory-scheduler suspend/resume ───────────────────────────
+//
+// VMS-style balance set: when memory pressure persists past what the
+// admission gate (#160 Stage 3) can refuse, the long-term scheduler
+// picks an existing task as the eviction candidate and suspends ALL
+// its threads.  WSCLOCK then evicts the suspended task's working set
+// aggressively (its pages have no active references and become
+// reclaim-first).  When pressure drops, resume_task brings the threads
+// back to Ready; the page-fault path demand-pages the working set
+// from swap.
+
+/// Number of threads transitioned by the most recent suspend/resume
+/// call, surfaced for diagnostics in the WATCHDOG dump.
+static LAST_SUSPEND_COUNT: AtomicU32 = AtomicU32::new(0);
+static LAST_RESUME_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// #164 Suspend every thread of `task_id`.  Ready/Running threads
+/// transition to Blocked with reason=SuspendedMemPressure.  Threads
+/// already Blocked for other reasons are left alone (their original
+/// wakeup will fire normally; if they re-enter Ready while their task
+/// is still suspended, resume_task will catch them next pass — or, in
+/// the strict policy, we'd convert them too).  Dead threads are
+/// skipped.  Returns the count of threads transitioned.
+pub fn suspend_task(task_id: u32) -> u32 {
+    let mut transitioned = 0u32;
+    SCHED_THREAD_ART.for_each(|key, val| {
+        let t = unsafe { &*(val as *const Thread) };
+        if t.task_id != task_id {
+            return;
+        }
+        match t.state {
+            ThreadState::Ready | ThreadState::Running => {
+                let tid = key as u32;
+                let tref = thread_ref(tid);
+                unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Blocked;
+                unsafe { thread_mut_from_ref(tid) }.blocked_on =
+                    BlockReason::SuspendedMemPressure;
+                record_trans(tid, 16, ThreadState::Blocked, tref.on_cpu.load(Ordering::Relaxed));
+                transitioned += 1;
+            }
+            _ => {}
+        }
+    });
+    LAST_SUSPEND_COUNT.store(transitioned, Ordering::Relaxed);
+    if transitioned > 0 {
+        crate::println!(
+            "[mem-sched] SUSPEND task={} ({} threads transitioned)",
+            task_id, transitioned,
+        );
+    }
+    transitioned
+}
+
+/// #164 Resume every thread of `task_id` that was suspended by
+/// `suspend_task`.  Transitions Blocked+SuspendedMemPressure threads
+/// to Ready and enqueues them at base priority.  Other Blocked
+/// threads (e.g., real IPC waits) stay put.  Returns the count of
+/// threads transitioned.
+pub fn resume_task(task_id: u32) -> u32 {
+    let mut transitioned = 0u32;
+    SCHED_THREAD_ART.for_each(|key, val| {
+        let t = unsafe { &*(val as *const Thread) };
+        if t.task_id != task_id {
+            return;
+        }
+        if t.state == ThreadState::Blocked
+            && matches!(t.blocked_on, BlockReason::SuspendedMemPressure)
+        {
+            let tid = key as u32;
+            let tref = thread_ref(tid);
+            unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
+            unsafe { thread_mut_from_ref(tid) }.blocked_on = BlockReason::None;
+            record_trans(tid, 17, ThreadState::Ready, tref.on_cpu.load(Ordering::Relaxed));
+            tref.prio.store(tref.base_priority, Ordering::Release);
+            // Enqueue on the current CPU for cache locality at resume time.
+            let target_cpu = smp::cpu_id();
+            set_enq_tag(4); // 4=resume_task
+            percpu_enqueue(target_cpu, tref.base_priority, tid);
+            transitioned += 1;
+        }
+    });
+    LAST_RESUME_COUNT.store(transitioned, Ordering::Relaxed);
+    if transitioned > 0 {
+        crate::println!(
+            "[mem-sched] RESUME task={} ({} threads transitioned)",
+            task_id, transitioned,
+        );
+    }
+    transitioned
+}
+
+/// #164 read-only accessors for diagnostics.
+pub fn last_suspend_count() -> u32 {
+    LAST_SUSPEND_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn last_resume_count() -> u32 {
+    LAST_RESUME_COUNT.load(Ordering::Relaxed)
 }
 
 /// Called on syscall return. If need_resched was set (by wake_thread or a

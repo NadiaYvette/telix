@@ -32,6 +32,14 @@ pub enum BlockReason {
     SvcLookup,
     /// Parked in sys_call waiting for sys_reply on a reply-cap slot.
     CallReply(u32),
+    /// #164 Memory-scheduler suspend: thread blocked because the
+    /// memory scheduler chose its task as the eviction candidate.
+    /// Only the explicit `resume_task` call (from the long-term
+    /// scheduler when memory pressure drops) wakes it.  No automatic
+    /// wakeup via IPC/timer.  When a client sends to a Suspended
+    /// server's port the send blocks normally; the queued message is
+    /// delivered when the server resumes.
+    SuspendedMemPressure,
 }
 
 // Thread ID capacity is determined by RadixTable::capacity() — no fixed constant needed.
