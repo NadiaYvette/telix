@@ -13,12 +13,19 @@
 extern crate userlib;
 
 use userlib::syscall;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static ASYNC_READ_REPLY_PORT: AtomicU64 = AtomicU64::new(0);
 
 // FS protocol constants.
 const FS_OPEN: u64 = 0x2000;
 const FS_OPEN_OK: u64 = 0x2001;
 const FS_READ: u64 = 0x2100;
 const FS_READ_OK: u64 = 0x2101;
+const FS_READ_ASYNC: u64 = 0x2102;
+const FS_READ_REPLY: u64 = 0x2103;
+const FS_SET_READ_REPLY_PORT: u64 = 0x2104;
+const FS_SET_READ_REPLY_PORT_OK: u64 = 0x2105;
 const FS_READDIR: u64 = 0x2200;
 const FS_READDIR_OK: u64 = 0x2201;
 const FS_READDIR_END: u64 = 0x2202;
@@ -244,6 +251,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
     syscall::ns_register(b"procfs", port);
+    syscall::ns_register(b"procfs_task", syscall::aspace_id());
     syscall::debug_puts(b"  [procfs_srv] ready\n");
 
     let mut handles = [OpenHandle::empty(); MAX_OPEN];
@@ -299,6 +307,36 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         0,
                     );
                 }
+            }
+
+            FS_SET_READ_REPLY_PORT => {
+                ASYNC_READ_REPLY_PORT.store(msg.data[0], Ordering::Release);
+                let _ = syscall::reply(FS_SET_READ_REPLY_PORT_OK, 0, 0, 0, 0, 0);
+            }
+
+            FS_READ_ASYNC => {
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
+                let length = ((msg.data[0] >> 32) & 0xFFFF_FFFF) as usize;
+                let offset = msg.data[1] as usize;
+                let grant_va = msg.data[2] as usize;
+                let correlation = msg.data[3];
+                let reply_port = ASYNC_READ_REPLY_PORT.load(Ordering::Acquire);
+                if reply_port == 0 { continue; }
+                let send = |bytes: u64| {
+                    let _ = syscall::send_nb_4(reply_port, FS_READ_REPLY, correlation, bytes, 0, 0);
+                };
+                if handle >= MAX_OPEN || !handles[handle].active || grant_va == 0 {
+                    send(0); continue;
+                }
+                let hnd = &handles[handle];
+                if offset >= hnd.buf_len { send(0); continue; }
+                let avail = hnd.buf_len - offset;
+                let to_read = length.min(avail).min(PAGE_SIZE);
+                let dst = grant_va as *mut u8;
+                for i in 0..to_read {
+                    unsafe { *dst.add(i) = hnd.buf[offset + i]; }
+                }
+                send(to_read as u64);
             }
 
             FS_READ => {

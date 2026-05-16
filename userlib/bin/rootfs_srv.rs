@@ -11,6 +11,9 @@
 extern crate userlib;
 
 use userlib::syscall;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static ASYNC_READ_REPLY_PORT: AtomicU64 = AtomicU64::new(0);
 
 // FS protocol constants.
 const FS_OPEN: u64 = 0x2000;
@@ -18,6 +21,10 @@ const FS_OPEN_OK: u64 = 0x2001;
 const FS_OPEN_LONG: u64 = 0x2002;
 const FS_READ: u64 = 0x2100;
 const FS_READ_OK: u64 = 0x2101;
+const FS_READ_ASYNC: u64 = 0x2102;
+const FS_READ_REPLY: u64 = 0x2103;
+const FS_SET_READ_REPLY_PORT: u64 = 0x2104;
+const FS_SET_READ_REPLY_PORT_OK: u64 = 0x2105;
 const FS_READDIR: u64 = 0x2200;
 const FS_READDIR_OK: u64 = 0x2201;
 const FS_READDIR_END: u64 = 0x2202;
@@ -450,6 +457,35 @@ fn main(port_id: u64, data_va: u64, data_len: u64) {
                         let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     }
                 }
+            }
+
+            FS_SET_READ_REPLY_PORT => {
+                ASYNC_READ_REPLY_PORT.store(msg.data[0], Ordering::Release);
+                let _ = syscall::reply(FS_SET_READ_REPLY_PORT_OK, 0, 0, 0, 0, 0);
+            }
+
+            FS_READ_ASYNC => {
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
+                let length = ((msg.data[0] >> 32) & 0xFFFF_FFFF) as usize;
+                let offset = msg.data[1] as usize;
+                let grant_va = msg.data[2] as usize;
+                let correlation = msg.data[3];
+                let reply_port = ASYNC_READ_REPLY_PORT.load(Ordering::Acquire);
+                if reply_port == 0 { continue; }
+                let send = |bytes: u64| {
+                    let _ = syscall::send_nb_4(reply_port, FS_READ_REPLY, correlation, bytes, 0, 0);
+                };
+                if handle >= MAX_OPEN || !handles[handle].active || grant_va == 0 {
+                    send(0); continue;
+                }
+                let fi = handles[handle].file_idx;
+                let file = &files[fi];
+                if offset >= file.size as usize { send(0); continue; }
+                let avail = (file.size as usize).saturating_sub(offset);
+                let to_read = length.min(avail);
+                let dst = unsafe { core::slice::from_raw_parts_mut(grant_va as *mut u8, to_read) };
+                let bytes_read = read_file(file, cpio_data, offset, dst);
+                send(bytes_read as u64);
             }
 
             FS_READ => {

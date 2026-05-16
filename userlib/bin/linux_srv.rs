@@ -465,6 +465,19 @@ const VFS_ERROR: u64 = 0x6F00;
 // FS server protocol tags
 const FS_READ: u64 = 0x2100;
 const FS_READ_OK: u64 = 0x2101;
+/// Async variant of FS_READ.  Wire format:
+///   d0 = handle (low 32) | length (high 32)
+///   d1 = offset
+///   d2 = grant_va (where the FS server should write the bytes)
+///   d3 = correlation (echoes back in FS_READ_REPLY)
+/// FS server replies with FS_READ_REPLY to the port registered via
+/// FS_SET_READ_REPLY_PORT.  Mirrors the IRFS_IO_READ_ASYNC pattern so
+/// the same PendingAsyncKind::IrfsReadFd / IrfsReadMmap continuations
+/// can finish the syscall regardless of which FS served the bytes.
+const FS_READ_ASYNC: u64 = 0x2102;
+const FS_READ_REPLY: u64 = 0x2103;
+const FS_SET_READ_REPLY_PORT: u64 = 0x2104;
+const FS_SET_READ_REPLY_PORT_OK: u64 = 0x2105;
 const FS_READDIR: u64 = 0x2200;
 const FS_READDIR_OK: u64 = 0x2201;
 const FS_READDIR_END: u64 = 0x2202;
@@ -2098,7 +2111,19 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         return total as u64;
     }
 
-    // FS_READ returns max 16 bytes per message.
+    // Async fast path: if this fs_port has been registered for
+    // FS_READ_ASYNC and the request fits one scratch slot, fire async
+    // so linux_srv's main thread doesn't block on the FS server.  The
+    // continuation finishes the syscall when FS_READ_REPLY lands; we
+    // set REPLY_DEFERRED so the dispatch loop suppresses its own reply.
+    if want > 0 && want <= FS_ASYNC_SCRATCH_PAGES * 4096 {
+        if try_fs_read_async(pi, caller_port, fd, fs_port, handle, offset, want, buf_va).is_some() {
+            unsafe { REPLY_DEFERRED = true; }
+            return 0;
+        }
+    }
+
+    // Sync fallback: FS_READ returns max 16 bytes per message.
     while total < want {
         let chunk = (want - total).min(16);
         let d2 = chunk as u64;
@@ -2701,13 +2726,38 @@ static mut FS_ASYNC_SCRATCH_GRANTED: bool = false;
 static FS_ASYNC_SCRATCH_BUSY: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
 
-/// Lazily allocate the async scratch region and grant it to initramfs_srv.
-/// Returns true once scratch is ready.
-fn ensure_irfs_async_scratch() -> bool {
+/// Per-FS-task grant tracking for the shared async scratch region.
+/// Each successful grant_pages records the target aspace_id here so we
+/// don't re-grant.  Sized for 14 FS servers + initramfs + headroom.
+const FS_ASYNC_GRANTED_TASKS_MAX: usize = 16;
+static mut FS_ASYNC_GRANTED_TASKS: [u64; FS_ASYNC_GRANTED_TASKS_MAX] =
+    [0; FS_ASYNC_GRANTED_TASKS_MAX];
+
+fn is_fs_async_granted(fs_task: u64) -> bool {
+    if fs_task == 0 { return false; }
     unsafe {
-        if FS_ASYNC_SCRATCH_GRANTED {
-            return true;
+        for &t in (*core::ptr::addr_of!(FS_ASYNC_GRANTED_TASKS)).iter() {
+            if t == fs_task { return true; }
         }
+    }
+    false
+}
+
+fn mark_fs_async_granted(fs_task: u64) {
+    unsafe {
+        for slot in (*core::ptr::addr_of_mut!(FS_ASYNC_GRANTED_TASKS)).iter_mut() {
+            if *slot == 0 { *slot = fs_task; return; }
+        }
+    }
+}
+
+/// Lazily allocate the async scratch region (idempotent) and grant it
+/// to one FS task.  Replaces the initramfs-specific path with a
+/// general one; ensure_irfs_async_scratch is now a thin wrapper.
+fn ensure_fs_async_scratch_grant_to(fs_task: u64) -> bool {
+    if fs_task == 0 { return false; }
+    if is_fs_async_granted(fs_task) { return true; }
+    unsafe {
         if FS_ASYNC_SCRATCH_LOCAL == 0 {
             let total_pages = FS_ASYNC_SCRATCH_PAGES * FS_ASYNC_SCRATCH_SLOTS;
             let va = match syscall::mmap_anon(0, total_pages, 1) {
@@ -2723,24 +2773,32 @@ fn ensure_irfs_async_scratch() -> bool {
             }
             FS_ASYNC_SCRATCH_LOCAL = va;
         }
-        let irfs_task = syscall::ns_lookup(b"initramfs_task").unwrap_or(0);
-        if irfs_task == 0 {
-            return false;
-        }
         let total_pages = FS_ASYNC_SCRATCH_PAGES * FS_ASYNC_SCRATCH_SLOTS;
         if syscall::grant_pages(
-            irfs_task,
+            fs_task,
             FS_ASYNC_SCRATCH_LOCAL,
             LIN_FS_ASYNC_SCRATCH_REMOTE_BASE,
             total_pages,
             false,
         ) {
+            // First grant lights up the FS_ASYNC_SCRATCH_GRANTED bit that
+            // gates alloc_async_scratch_slot.  Subsequent grants for
+            // additional FS tasks just publish the same local pages
+            // into their aspaces.
             FS_ASYNC_SCRATCH_GRANTED = true;
+            mark_fs_async_granted(fs_task);
             true
         } else {
             false
         }
     }
+}
+
+/// Lazily allocate the async scratch region and grant it to initramfs_srv.
+/// Returns true once scratch is ready.
+fn ensure_irfs_async_scratch() -> bool {
+    let irfs_task = syscall::ns_lookup(b"initramfs_task").unwrap_or(0);
+    ensure_fs_async_scratch_grant_to(irfs_task)
 }
 
 /// Reserve an async scratch slot.  Returns slot index on success, None if
@@ -2795,6 +2853,171 @@ fn async_scratch_local_va(slot: u8) -> usize {
 
 fn async_scratch_remote_va(slot: u8) -> usize {
     LIN_FS_ASYNC_SCRATCH_REMOTE_BASE + (slot as usize) * FS_ASYNC_SCRATCH_PAGES * 4096
+}
+
+/// Per-FS-server registration tracking for FS_READ_ASYNC.  An entry of
+/// 0 = empty; otherwise it's the fs_port we sent FS_SET_READ_REPLY_PORT
+/// to and got an OK back from.  16 slots cover the 14 known FS servers
+/// plus headroom for future ones.
+const FS_ASYNC_REGISTERED_PORTS_MAX: usize = 16;
+static mut FS_ASYNC_REGISTERED_PORTS: [u64; FS_ASYNC_REGISTERED_PORTS_MAX] =
+    [0; FS_ASYNC_REGISTERED_PORTS_MAX];
+
+fn is_fs_async_registered(fs_port: u64) -> bool {
+    if fs_port == 0 { return false; }
+    unsafe {
+        for &p in (*core::ptr::addr_of!(FS_ASYNC_REGISTERED_PORTS)).iter() {
+            if p == fs_port { return true; }
+        }
+    }
+    false
+}
+
+fn mark_fs_async_registered(fs_port: u64) {
+    unsafe {
+        for slot in (*core::ptr::addr_of_mut!(FS_ASYNC_REGISTERED_PORTS)).iter_mut() {
+            if *slot == 0 { *slot = fs_port; return; }
+        }
+    }
+}
+
+/// Register IRFS_REPLY_PORT with one FS server, granting the async
+/// scratch region to its task on the way through.  Idempotent on
+/// success.  Returns true once the server has acked FS_SET_READ_REPLY_PORT.
+fn try_register_fs_async(fs_name: &[u8], fs_task_name: &[u8]) -> bool {
+    let fs_port = match syscall::ns_lookup(fs_name) {
+        Some(p) => p,
+        None => return false,
+    };
+    if is_fs_async_registered(fs_port) {
+        return true;
+    }
+    let fs_task = match syscall::ns_lookup(fs_task_name) {
+        Some(t) => t,
+        None => return false,
+    };
+    if !ensure_fs_async_scratch_grant_to(fs_task) {
+        return false;
+    }
+    let rp = unsafe { IRFS_REPLY_PORT };
+    if rp == 0 {
+        return false;
+    }
+    let resp = match syscall::call(fs_port, FS_SET_READ_REPLY_PORT, rp, 0, 0, 0) {
+        Some(m) => m,
+        None => return false,
+    };
+    if resp.tag == FS_SET_READ_REPLY_PORT_OK {
+        mark_fs_async_registered(fs_port);
+        syscall::debug_puts(b"[linux_srv] FS_READ async registered: ");
+        syscall::debug_puts(fs_name);
+        syscall::debug_puts(b"\n");
+        true
+    } else {
+        false
+    }
+}
+
+/// Try to register the known FS servers for async reads.  Called once
+/// per main-loop iteration (after IRFS / VFS registration).  Servers
+/// that haven't published their ns aliases yet are silently retried.
+fn try_register_all_fs_async() {
+    let pairs: [(&[u8], &[u8]); 14] = [
+        (b"ext", b"ext_task"),
+        (b"ext2", b"ext2_task"),
+        (b"rootfs", b"rootfs_task"),
+        (b"fat", b"fat_task"),
+        (b"fat16", b"fat16_task"),
+        (b"iso9660", b"iso9660_task"),
+        (b"udf", b"udf_task"),
+        (b"btrfs", b"btrfs_task"),
+        (b"ntfs", b"ntfs_task"),
+        (b"apfs", b"apfs_task"),
+        (b"xfs", b"xfs_task"),
+        (b"tmpfs", b"tmpfs_task"),
+        (b"procfs", b"procfs_task"),
+        (b"devfs", b"devfs_task"),
+    ];
+    for (fs_name, fs_task_name) in pairs.iter() {
+        let _ = try_register_fs_async(fs_name, fs_task_name);
+    }
+}
+
+/// Try to fire an FS_READ_ASYNC against an arbitrary FS server.  Returns
+/// Some(slot_idx) on success; caller must set REPLY_DEFERRED.  Returns
+/// None if any precondition fails — caller falls back to the sync inline
+/// FS_READ loop.  Mirrors try_irfs_read_async; the kind is reused
+/// (PendingAsyncKind::IrfsReadFd) because the completion semantics are
+/// identical regardless of which FS server served the bytes.
+fn try_fs_read_async(
+    pi: usize,
+    caller_port: u64,
+    fd_idx: usize,
+    fs_port: u64,
+    handle: u64,
+    offset: u64,
+    length: usize,
+    user_buf_va: usize,
+) -> Option<usize> {
+    if !is_fs_async_registered(fs_port) {
+        return None;
+    }
+    unsafe {
+        if FS_ASYNC_SCRATCH_LOCAL == 0 || !FS_ASYNC_SCRATCH_GRANTED {
+            return None;
+        }
+    }
+    if length == 0 || length > FS_ASYNC_SCRATCH_PAGES * 4096 {
+        return None;
+    }
+    let scratch_slot = alloc_async_scratch_slot()?;
+    let slot = match async_alloc_slot() {
+        Some(s) => s,
+        None => {
+            free_async_scratch_slot(scratch_slot);
+            return None;
+        }
+    };
+    let correlation = next_correlation_id();
+    unsafe {
+        PENDING_ASYNC[slot] = PendingAsync {
+            kind: PendingAsyncKind::IrfsReadFd,
+            correlation,
+            pi,
+            caller_task_port: caller_port,
+            listen_fd: fd_idx,
+            flags: offset,
+            buf_va: user_buf_va,
+            buf_len: length,
+            scratch_slot,
+            total_so_far: 0,
+            mmap_prot_flags: 0,
+            mmap_aligned_len: 0,
+            extra_handle: 0,
+            cache_slot: 0xFF,
+            in_flight_chunk: 0,
+        };
+    }
+    // Wire format mirrors IRFS_IO_READ_ASYNC:
+    //   d0 = handle (low 32) | length (high 32)
+    //   d1 = offset
+    //   d2 = grant_va (FS server's view of the scratch slot)
+    //   d3 = correlation
+    let d0 = (handle & 0xFFFF_FFFF) | (((length as u64) & 0xFFFF_FFFF) << 32);
+    let r = syscall::send_nb_4(
+        fs_port,
+        FS_READ_ASYNC,
+        d0,
+        offset,
+        async_scratch_remote_va(scratch_slot) as u64,
+        correlation,
+    );
+    if r != 0 {
+        async_free_slot(slot);
+        free_async_scratch_slot(scratch_slot);
+        return None;
+    }
+    Some(slot)
 }
 
 /// Read from initramfs_srv via IO_READ + grant_va.  Mirrors
@@ -10888,9 +11111,11 @@ extern "C" fn reply_thread_entry(_arg: u64) -> ! {
             Some(m) => m,
             None => continue,
         };
-        if msg.tag != IRFS_IO_READ_REPLY {
+        if msg.tag != IRFS_IO_READ_REPLY && msg.tag != FS_READ_REPLY {
             // Not expected on this port; drop quietly so a stray
-            // sender doesn't wedge the loop.
+            // sender doesn't wedge the loop.  FS_READ_REPLY shares the
+            // port (and the same payload shape: correlation, bytes_read,
+            // optional csum) so the rest of the loop handles both.
             continue;
         }
         let correlation = msg.data[0];
@@ -12788,6 +13013,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // VFS_OPEN_REPLY / VFS_STAT_REPLY get routed to the main
         // dispatch thread.
         let _ = try_register_vfs_async_reply_port();
+        // ...and the 14 FS servers — each gets IRFS_REPLY_PORT
+        // registered so FS_READ_REPLY routes to the reply thread.
+        // Idempotent on success; servers not yet up are silently
+        // retried each tick.
+        try_register_all_fs_async();
 
         // Reaper: check one PROC_TABLE slot per iteration, closing its
         // FDs if the owner's task port has gone dead (task exited or was

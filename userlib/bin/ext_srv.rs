@@ -20,6 +20,13 @@
 extern crate userlib;
 
 use core::cell::Cell;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Reply port registered by linux_srv via FS_SET_READ_REPLY_PORT.
+/// 0 = no port; FS_READ_ASYNC silently drops in that case.  Otherwise
+/// FS_READ_REPLY notifications are sent here via send_nb_4 carrying
+/// (correlation, bytes_read, 0, 0).
+static ASYNC_READ_REPLY_PORT: AtomicU64 = AtomicU64::new(0);
 use userlib::syscall;
 
 // --- I/O protocol constants (for talking to blk_srv) ---
@@ -36,6 +43,10 @@ const FS_OPEN_OK: u64 = 0x2001;
 const FS_OPEN_LONG: u64 = 0x2002;
 const FS_READ: u64 = 0x2100;
 const FS_READ_OK: u64 = 0x2101;
+const FS_READ_ASYNC: u64 = 0x2102;
+const FS_READ_REPLY: u64 = 0x2103;
+const FS_SET_READ_REPLY_PORT: u64 = 0x2104;
+const FS_SET_READ_REPLY_PORT_OK: u64 = 0x2105;
 const FS_READDIR: u64 = 0x2200;
 const FS_READDIR_OK: u64 = 0x2201;
 const FS_READDIR_END: u64 = 0x2202;
@@ -2036,6 +2047,123 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 } else {
                     let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                 }
+            }
+
+            FS_SET_READ_REPLY_PORT => {
+                ASYNC_READ_REPLY_PORT.store(msg.data[0], Ordering::Release);
+                let _ = syscall::reply(FS_SET_READ_REPLY_PORT_OK, 0, 0, 0, 0, 0);
+            }
+
+            FS_READ_ASYNC => {
+                // Wire format:
+                //   d0 = handle (low 32) | length (high 32)
+                //   d1 = offset
+                //   d2 = grant_va
+                //   d3 = correlation
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
+                let length = (msg.data[0] >> 32) & 0xFFFF_FFFF;
+                let offset = msg.data[1];
+                let grant_va = msg.data[2] as usize;
+                let correlation = msg.data[3];
+                let reply_port = ASYNC_READ_REPLY_PORT.load(Ordering::Acquire);
+                if reply_port == 0 {
+                    // No port registered — drop silently.  linux_srv
+                    // gates async dispatch on registration so this
+                    // shouldn't happen in practice.
+                    continue;
+                }
+                let send_err = || {
+                    let _ = syscall::send_nb_4(reply_port, FS_READ_REPLY, correlation, 0, 0, 0);
+                };
+                if handle >= MAX_OPEN_FILES || !open_files[handle].active || grant_va == 0 {
+                    send_err();
+                    continue;
+                }
+                let file = &open_files[handle];
+                if offset >= file.file_size {
+                    let _ = syscall::send_nb_4(reply_port, FS_READ_REPLY, correlation, 0, 0, 0);
+                    continue;
+                }
+                let avail = file.file_size - offset;
+                let to_read = length.min(avail);
+
+                // Same multi-block fill loop as the sync grant_va branch
+                // below.  Differences: parse handle/length from packed
+                // d0, drop the inline-path branch, reply via send_nb_4.
+                const MAX_BLOCKS_PER_REPLY_ASYNC: u64 = 4;
+                let mut bytes_done: u64 = 0;
+                let mut io_err = false;
+                let mut blocks_done: u64 = 0;
+                while bytes_done < to_read && blocks_done < MAX_BLOCKS_PER_REPLY_ASYNC {
+                    if blocks_done > 0 {
+                        syscall::yield_now();
+                    }
+                    let cur_off = offset + bytes_done;
+                    let blk_idx = cur_off / sb.block_size as u64;
+                    let off_in_blk = (cur_off % sb.block_size as u64) as usize;
+                    let phys = resolve_block(
+                        &blk, &sb, file.inode_flags, &file.block_ptrs,
+                        blk_idx, indirect_buf_va,
+                    );
+                    let sparse = phys.is_none();
+                    let phys = phys.unwrap_or(0);
+                    if sparse {
+                        unsafe {
+                            core::ptr::write_bytes(
+                                block_buf_va as *mut u8,
+                                0,
+                                sb.block_size as usize,
+                            );
+                            DATA_BLOCK_CACHE_VALID = false;
+                        }
+                    } else {
+                        let hit = unsafe {
+                            DATA_BLOCK_CACHE_VALID && DATA_BLOCK_CACHE_PHYS == phys
+                        };
+                        if !hit {
+                            if !blk.read_block(phys, sb.block_size, block_buf_va) {
+                                unsafe { DATA_BLOCK_CACHE_VALID = false; }
+                                io_err = true;
+                                break;
+                            }
+                            unsafe {
+                                DATA_BLOCK_CACHE_PHYS = phys;
+                                DATA_BLOCK_CACHE_VALID = true;
+                            }
+                        }
+                    }
+                    let chunk = ((sb.block_size as u64) - off_in_blk as u64)
+                        .min(to_read - bytes_done) as usize;
+                    unsafe {
+                        let src = (block_buf_va + off_in_blk) as *const u8;
+                        let dst = (grant_va + bytes_done as usize) as *mut u8;
+                        let words = chunk / 8;
+                        let tail_start = words * 8;
+                        let src_u64 = src as *const u64;
+                        let dst_u64 = dst as *mut u64;
+                        for i in 0..words {
+                            let v = core::ptr::read_volatile(src_u64.add(i));
+                            core::ptr::write_volatile(dst_u64.add(i), v);
+                        }
+                        for i in tail_start..chunk {
+                            let b = core::ptr::read_volatile(src.add(i));
+                            core::ptr::write_volatile(dst.add(i), b);
+                        }
+                    }
+                    bytes_done += chunk as u64;
+                    blocks_done += 1;
+                }
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                #[cfg(target_arch = "x86_64")]
+                unsafe { core::arch::asm!("mfence"); }
+                let _ = syscall::send_nb_4(
+                    reply_port,
+                    FS_READ_REPLY,
+                    correlation,
+                    if io_err && bytes_done == 0 { 0 } else { bytes_done },
+                    0,
+                    0,
+                );
             }
 
             FS_READ => {

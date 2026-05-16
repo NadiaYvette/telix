@@ -10,12 +10,21 @@
 extern crate userlib;
 
 use userlib::syscall;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Reply port registered by linux_srv via FS_SET_READ_REPLY_PORT for
+/// FS_READ_ASYNC completions.  0 = not yet registered.
+static ASYNC_READ_REPLY_PORT: AtomicU64 = AtomicU64::new(0);
 
 // FS protocol constants.
 const FS_OPEN: u64 = 0x2000;
 const FS_OPEN_OK: u64 = 0x2001;
 const FS_READ: u64 = 0x2100;
 const FS_READ_OK: u64 = 0x2101;
+const FS_READ_ASYNC: u64 = 0x2102;
+const FS_READ_REPLY: u64 = 0x2103;
+const FS_SET_READ_REPLY_PORT: u64 = 0x2104;
+const FS_SET_READ_REPLY_PORT_OK: u64 = 0x2105;
 const FS_READDIR: u64 = 0x2200;
 const FS_READDIR_OK: u64 = 0x2201;
 const FS_READDIR_END: u64 = 0x2202;
@@ -360,6 +369,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     let port = syscall::port_create();
     let my_aspace = syscall::aspace_id();
     syscall::ns_register(b"tmpfs", port);
+    syscall::ns_register(b"tmpfs_task", syscall::aspace_id());
     syscall::debug_puts(b"  [tmpfs_srv] ready\n");
 
     let mut files = [TmpfsFile::empty(); MAX_FILES];
@@ -410,6 +420,52 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         let _ = syscall::reply(FS_ERROR, ERR_NOT_FOUND, 0, 0, 0, 0);
                     }
                 }
+            }
+
+            FS_SET_READ_REPLY_PORT => {
+                ASYNC_READ_REPLY_PORT.store(msg.data[0], Ordering::Release);
+                let _ = syscall::reply(FS_SET_READ_REPLY_PORT_OK, 0, 0, 0, 0, 0);
+            }
+
+            FS_READ_ASYNC => {
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
+                let length = ((msg.data[0] >> 32) & 0xFFFF_FFFF) as u32;
+                let offset = msg.data[1] as u32;
+                let grant_va = msg.data[2] as usize;
+                let correlation = msg.data[3];
+                let reply_port = ASYNC_READ_REPLY_PORT.load(Ordering::Acquire);
+                if reply_port == 0 { continue; }
+                let send = |bytes: u64| {
+                    let _ = syscall::send_nb_4(reply_port, FS_READ_REPLY, correlation, bytes, 0, 0);
+                };
+                if handle >= MAX_OPEN || !handles[handle].active || grant_va == 0 {
+                    send(0);
+                    continue;
+                }
+                let fi = handles[handle].file_idx;
+                let file = &files[fi];
+                if offset >= file.size {
+                    send(0);
+                    continue;
+                }
+                let avail = file.size - offset;
+                let to_read = length.min(avail) as usize;
+                let page_idx = offset as usize / PAGE_SIZE;
+                let off_in_page = offset as usize % PAGE_SIZE;
+                let bytes_in_page = (PAGE_SIZE - off_in_page).min(to_read);
+                if page_idx >= MAX_PAGES_PER_FILE || file.pages[page_idx] == 0 {
+                    send(0);
+                    continue;
+                }
+                let src = file.pages[page_idx] + off_in_page;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src as *const u8,
+                        grant_va as *mut u8,
+                        bytes_in_page,
+                    );
+                }
+                send(bytes_in_page as u64);
             }
 
             FS_READ => {
