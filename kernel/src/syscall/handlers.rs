@@ -1544,14 +1544,24 @@ fn sys_get_pf_count() -> u64 {
 ///   a0 == 0 → total MMU pages
 ///   a0 == 1 → free MMU pages
 ///   a0 == 2 → total working set across all aspaces
+///   a0 == 3 → #164 balance-set evict count (whole-process suspends fired)
+///   a0 == 4 → #164 total threads suspended across all evicts
+///   a0 == 5 → #164 admission gate refusals (after evict failed)
+///   a0 == 6 → #164 admission gate recoveries (evict freed enough)
 ///   else    → 0 (reserved for future fields)
 ///
-/// All values in MMU pages (page::MMUPAGE_SIZE).  Cheap atomic reads.
+/// Fields 0-2 in MMU pages (page::MMUPAGE_SIZE); 3-6 are counters.
+/// Cheap atomic reads.
 fn sys_get_memory_stats(field: u64) -> u64 {
+    use core::sync::atomic::Ordering;
     match field {
         0 => crate::mm::phys::stats().0 as u64,
         1 => crate::mm::phys::stats().1 as u64,
         2 => crate::mm::aspace::total_working_set(),
+        3 => crate::mm::stats::BALANCE_SET_EVICTS.load(Ordering::Relaxed),
+        4 => crate::mm::stats::BALANCE_SET_SUSPENDED.load(Ordering::Relaxed),
+        5 => crate::mm::stats::ADMISSION_REFUSALS.load(Ordering::Relaxed),
+        6 => crate::mm::stats::ADMISSION_RECOVERIES.load(Ordering::Relaxed),
         _ => 0,
     }
 }
