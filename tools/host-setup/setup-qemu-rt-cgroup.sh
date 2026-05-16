@@ -59,11 +59,11 @@ echo "root" > "$CG/cpuset.cpus.partition"
 # usable CPUs)").
 state="$(cat "$CG/cpuset.cpus.partition")"
 case "$state" in
-    isolated)
-        echo "OK: $CG → isolated partition on CPUs $CPUS"
+    root)
+        echo "OK: $CG → root partition on CPUs $CPUS"
         ;;
     *)
-        echo "FAILED: $CG/cpuset.cpus.partition = '$state'" >&2
+        echo "FAILED: $CG/cpuset.cpus.partition = '$state' (expected 'root')" >&2
         echo "  Common causes:" >&2
         echo "    • Parent cgroup doesn't have $CPUS in its effective cpuset" >&2
         echo "    • A sibling cgroup already claims overlapping CPUs" >&2
