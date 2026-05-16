@@ -65,6 +65,13 @@ This design borrows from all of these but is not a direct port of any
 one. The closest match is io_uring augmented with K42-style upcalls
 for events that don't fit the submit/complete pattern.
 
+A fuller bibliography for the language+OS co-design tradition this
+work draws on — including the Midori lineage, Akaros, Barrelfish,
+the Mach continuations paper, the capability-language tradition,
+and the polyglot-managed-runtime literature relevant to
+Frankenstein — is maintained in
+`docs/related_work_reading_list.md`.
+
 ---
 
 ## 2. Architecture Overview

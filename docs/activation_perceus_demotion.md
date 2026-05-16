@@ -9,6 +9,9 @@ completion-based syscall ABI lands first.
 A novel observation connecting two previously separate lines of
 systems research: scheduler activations (Anderson et al. 1992, K42)
 and Perceus-style reference counting (Leijen/Reinking et al. 2021).
+See `docs/related_work_reading_list.md` for the broader
+bibliography this draws on (Midori lineage, Verona, biased reference
+counting, the polyglot-runtime literature, etc.).
 The core insight is that a non-blocking kernel interface with
 upcalls gives language runtimes precise knowledge of thread
 scheduling state, which enables safe demotion of reference counts
