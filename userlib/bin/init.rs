@@ -6655,7 +6655,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // This is the protocol+lifecycle smoke before Stage 7 swaps cage into
     // the H13 path with real DRM under xeyes/Xwayland.  See
     // docs/wayland-compositor-port-plan.md §6 Step H+1 (parity).
+    //
+    // Skipped under FOCUS_H13: this phase wait4s on cage which can hang
+    // indefinitely (no kill-after-timeout), blocking H13/H14 (the real
+    // X-app tests).  H13 spawns its OWN wl_compositor_min (not cage), so
+    // Phase 202's cage cycle is independent of the X-app path.
     syscall::debug_puts(b"  init: Phase 202 cage headless smoke...\n");
+    if STEP_H_FOCUS_H13 {
+        syscall::debug_puts(b"Phase 202 cage headless smoke: SKIPPED (FOCUS_H13)\n");
+    } else
     {
         if syscall::ns_lookup(b"linux").is_some() {
             let child = syscall::fork();
@@ -6762,7 +6770,14 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     // DRM ioctl coverage in linux_srv at compositor-startup level.
     // Failures here surface as `[ENOSYS] nr=...` in the linux_srv log
     // — the next gap to fill, per plan §4 priority 3.
+    //
+    // Skipped under FOCUS_H13 alongside Phase 202: cage's wait4 can
+    // hang, and H13 uses wl_compositor_min directly, so this phase
+    // doesn't gate the X-app path.
     syscall::debug_puts(b"  init: Phase 203 cage DRM smoke...\n");
+    if STEP_H_FOCUS_H13 {
+        syscall::debug_puts(b"Phase 203 cage DRM smoke: SKIPPED (FOCUS_H13)\n");
+    } else
     {
         if syscall::ns_lookup(b"linux").is_some() {
             let child = syscall::fork();
