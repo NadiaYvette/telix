@@ -10,6 +10,35 @@ use userlib::syscall;
 // I/O protocol tags (must match kernel/src/io/protocol.rs).
 const IO_CONNECT: u64 = 0x100;
 const IO_CONNECT_OK: u64 = 0x101;
+/// Async variant of IO_CONNECT: same name packing as IO_CONNECT except
+/// the d2 word now holds a 32-bit correlation in bits 16..48 (where
+/// the sync path packs name bytes 24-27).  This limits async names to
+/// 24 bytes — longer names fall back to the sync IO_CONNECT path.
+/// Reply lands as IO_CONNECT_REPLY on the port linux_srv registered
+/// via IO_SET_ASYNC_REPLY_PORT.
+///
+/// data[0] = name bytes 0-7
+/// data[1] = name bytes 8-15
+/// data[2] = name_len (low 16) | correlation (bits 16..48) | reserved (48..64)
+/// data[3] = name bytes 16-23
+///
+/// No reply is sent on the original caller's reply slot — the request
+/// is fire-and-forget.
+const IO_CONNECT_ASYNC: u64 = 0x102;
+/// Companion of IO_CONNECT_ASYNC.  Sent via send_nb_4 to the
+/// async reply port.
+///
+/// data[0] = correlation (echoes the request word)
+/// data[1] = handle    (0 if not-found)
+/// data[2] = size      (0 if not-found)
+/// data[3] = server_aspace_id (0 if not-found)
+///
+/// "not-found" is signalled by handle == 0 && size == 0; linux_srv
+/// distinguishes this from a real handle 0 by reserving handle 0 as
+/// "no file" in its async path.  (initramfs_srv's normal handles are
+/// indices into fs.files, which is 0-based but the 0th slot is the
+/// CPIO trailer entry — never a real file.)
+const IO_CONNECT_REPLY: u64 = 0x103;
 const IO_READ: u64 = 0x200;
 const IO_READ_OK: u64 = 0x201;
 /// Async grant-based read.  Caller `send`s instead of `call`s, so its
@@ -26,6 +55,15 @@ const IO_READ_REPLY: u64 = 0x203;
 /// (caller uses `call`); we ack with IO_READ_OK so the registration
 /// is observably complete before any IO_READ_ASYNC is sent.
 const IO_SET_ASYNC_REPLY_PORT: u64 = 0x204;
+/// One-time registration: caller (linux_srv) tells us where to post
+/// IO_CONNECT_REPLY notifications.  Separate from IO_SET_ASYNC_REPLY_PORT
+/// because IO_CONNECT_REPLY needs to be handled on linux_srv's main
+/// dispatch thread (it writes PROC_TABLE.fds when populating the new fd),
+/// whereas IO_READ_REPLY can be processed by a dedicated reply thread
+/// (it writes only LIB_CACHE backing pages and per-process mmap state
+/// that the main thread isn't concurrently touching).
+/// d0=connect_reply_port.  Synchronous; we ack with IO_READ_OK.
+const IO_SET_CONNECT_REPLY_PORT: u64 = 0x205;
 const IO_STAT: u64 = 0x400;
 const IO_STAT_OK: u64 = 0x401;
 const IO_CLOSE: u64 = 0x500;
@@ -239,6 +277,11 @@ fn print_num(n: u64) {
 /// another concurrently handles an IO_READ_ASYNC; Acquire-load
 /// pairs with the Release-store on update.
 static ASYNC_REPLY_PORT: AtomicU64 = AtomicU64::new(0);
+/// Companion of ASYNC_REPLY_PORT: where IO_CONNECT_REPLY notifications
+/// are sent.  Separate so linux_srv can route connect-completions to
+/// its main dispatch thread (PROC_TABLE-writing) while read-completions
+/// go to a dedicated reply thread.  Set via IO_SET_CONNECT_REPLY_PORT.
+static CONNECT_REPLY_PORT: AtomicU64 = AtomicU64::new(0);
 
 /// Worker-pool globals.  initramfs_srv is single-task but multi-thread:
 /// after `main` parses the cpio archive into `FS`, it spawns
@@ -458,6 +501,55 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
                 }
             }
 
+            IO_CONNECT_ASYNC => {
+                // Name packing differs from IO_CONNECT: d2 holds a
+                // 32-bit correlation in bits 16..48 instead of name
+                // bytes 24-27.  Names are therefore capped at 24
+                // bytes in this path (linux_srv falls back to sync
+                // IO_CONNECT for longer names).
+                //
+                // Fire-and-forget: no reply on this request's slot;
+                // instead, send IO_CONNECT_REPLY via send_nb_4 to the
+                // ASYNC_REPLY_PORT.  Worst case if the reply port is
+                // full: linux_srv times out its pending slot via the
+                // normal CALL-TIMEOUT path (cost is the same as a
+                // single sync timeout, far better than blocking the
+                // server thread).
+                let name_len = (msg.data[2] & 0xFFFF) as usize;
+                // No bytes 24-27 in async path — w2_extra forced to 0.
+                let name_buf = unpack_name(msg.data[0], msg.data[1], 0u32, msg.data[3], name_len);
+                let name = &name_buf[..name_len.min(24)];
+                let correlation = (msg.data[2] >> 16) & 0xFFFF_FFFF;
+                let reply_port = CONNECT_REPLY_PORT.load(Ordering::Acquire);
+                if reply_port == 0 {
+                    // No reply port registered.  Reply via the normal
+                    // path so the caller doesn't hang.  (Should only
+                    // happen if linux_srv sent IO_CONNECT_ASYNC before
+                    // its own IO_SET_ASYNC_REPLY_PORT landed.)
+                    let _ = reply_timed(IO_ERROR, ERR_INVALID, 0, 0, 0, 0);
+                    continue;
+                }
+                let (handle, size, srv_aspace) = match fs.find(name) {
+                    Some(idx) => (
+                        idx as u64,
+                        fs.files[idx].data_len as u64,
+                        my_aspace as u64,
+                    ),
+                    None => (0u64, 0u64, 0u64),
+                };
+                let _ = syscall::send_nb_4(
+                    reply_port,
+                    IO_CONNECT_REPLY,
+                    correlation,
+                    handle,
+                    size,
+                    srv_aspace,
+                );
+                // No reply to the original IO_CONNECT_ASYNC slot — we
+                // just consumed the message.  Skip reply_timed.
+                continue;
+            }
+
             IO_READ => {
                 // data[0] = handle, data[1] = offset
                 // data[2] = length (low 32)
@@ -545,6 +637,17 @@ fn server_loop(port: u64, my_aspace: u64, cpio_data: &[u8], fs: &Initramfs) {
                 // Release-store pairs with Acquire-load in any sibling
                 // worker that subsequently handles an IO_READ_ASYNC.
                 ASYNC_REPLY_PORT.store(msg.data[0], Ordering::Release);
+                let _ = reply_timed(IO_READ_OK, 0, 0, 0, 0, 0);
+            }
+
+            IO_SET_CONNECT_REPLY_PORT => {
+                // d0 = caller's reply port for IO_CONNECT_REPLY.  Separate
+                // from ASYNC_REPLY_PORT so linux_srv can route connect
+                // completions to its main dispatch thread (PROC_TABLE-
+                // touching).  Same observability/ordering rationale as
+                // IO_SET_ASYNC_REPLY_PORT above.  Reusing IO_READ_OK as
+                // the ack tag — there's no need for a dedicated ACK type.
+                CONNECT_REPLY_PORT.store(msg.data[0], Ordering::Release);
                 let _ = reply_timed(IO_READ_OK, 0, 0, 0, 0, 0);
             }
 

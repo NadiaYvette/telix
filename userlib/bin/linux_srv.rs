@@ -404,6 +404,15 @@ fn linux_err(e: u64) -> u64 {
 // Used by the initramfs fast path in do_open / handle_read / handle_mmap.
 const IRFS_IO_CONNECT: u64 = 0x100;
 const IRFS_IO_CONNECT_OK: u64 = 0x101;
+/// Async variants matching initramfs_srv's IO_CONNECT_ASYNC /
+/// IO_CONNECT_REPLY (see userlib/bin/initramfs_srv.rs).  When linux_srv
+/// hits a NAME_CACHE miss in try_open_initramfs, it sends
+/// IRFS_IO_CONNECT_ASYNC (with a correlation word) and parks the
+/// caller's reply, freeing this thread to handle other Linux syscalls.
+/// IRFS_IO_CONNECT_REPLY arrives on BACKEND_REPLY_PORT and the
+/// continuation populates the fd + replies to the original caller.
+const IRFS_IO_CONNECT_ASYNC: u64 = 0x102;
+const IRFS_IO_CONNECT_REPLY: u64 = 0x103;
 const IRFS_IO_READ: u64 = 0x200;
 const IRFS_IO_READ_OK: u64 = 0x201;
 
@@ -823,6 +832,21 @@ enum PendingAsyncKind {
     ///   mmap_prot_flags → kern_prot in bits 0..=2; bit 7 = need_bump
     ///   mmap_aligned_len → page-aligned len for mprotect on completion
     IrfsReadMmap,
+    /// Async open(2) lookup against initramfs.  When try_open_initramfs
+    /// misses NAME_CACHE we send IRFS_IO_CONNECT_ASYNC and defer the
+    /// caller's reply until IRFS_IO_CONNECT_REPLY lands on
+    /// BACKEND_REPLY_PORT.  Field reuse:
+    ///   pi               → caller process index
+    ///   caller_task_port → port for personality_reply
+    ///   flags            → open flags (for O_CLOEXEC handling)
+    ///   buf_va, buf_len  → unused
+    ///   extra_handle     → packed name[0..8] (for NAME_CACHE insert)
+    ///   total_so_far     → packed name[8..16]
+    ///   mmap_aligned_len → packed name[16..24] (low 32) + name_len (high 32)
+    /// On not-found (handle == 0 in reply) we reply ENOENT.  VFS fallback
+    /// for initramfs-misses is NOT in this async path yet — tracked as a
+    /// known regression until VFS_OPEN gets its own async variant.
+    ConnectInitramfs,
 }
 
 /// `#[repr(C)]` pins `kind` at offset 0 so we can take an
@@ -3867,6 +3891,11 @@ static mut IRFS_ASYNC_REGISTERED: bool = false;
 
 /// IRFS protocol tag for the registration call (matches initramfs_srv).
 const IRFS_IO_SET_ASYNC_REPLY_PORT: u64 = 0x204;
+/// Companion registration for IRFS_IO_CONNECT_REPLY's reply port.
+/// Separate from IRFS_IO_SET_ASYNC_REPLY_PORT so connect replies can
+/// be routed to BACKEND_REPLY_PORT (main thread, PROC_TABLE writes)
+/// while read replies stay on IRFS_REPLY_PORT (reply thread).
+const IRFS_IO_SET_CONNECT_REPLY_PORT: u64 = 0x205;
 const IRFS_IO_READ_ASYNC: u64 = 0x202;
 const IRFS_IO_READ_REPLY: u64 = 0x203;
 
@@ -3907,6 +3936,14 @@ fn try_register_irfs_async_reply_port() -> bool {
         };
         // initramfs_srv acks with IO_READ_OK (0x201) on success.
         if resp.tag == 0x201 {
+            // Register BACKEND_REPLY_PORT as the IO_CONNECT_REPLY port
+            // too (separate channel so connect completions go to the
+            // main dispatch thread).  Failure here is non-fatal — the
+            // sync IRFS_IO_CONNECT fallback covers the gap.
+            let cp = BACKEND_REPLY_PORT;
+            if cp != 0 {
+                let _ = syscall::call(irfs, IRFS_IO_SET_CONNECT_REPLY_PORT, cp, 0, 0, 0);
+            }
             IRFS_ASYNC_REGISTERED = true;
             syscall::debug_puts(b"[linux_srv] IRFS async reply port registered\n");
             true
@@ -3936,9 +3973,16 @@ fn try_register_irfs_async_reply_port() -> bool {
 fn lib_cache_eager_populate(path: &[u8]) -> bool {
     let irfs_port = get_initramfs_port();
     if irfs_port == 0 { return false; }
-    let (handle, file_size) = match try_open_initramfs(path) {
-        Some(t) => t,
-        None => return false,
+    // Eager populate runs once at linux_srv startup before the
+    // dispatch loop — async would have no reply pickup yet.  Use the
+    // sync helper directly with leading-'/' stripping.
+    let name = if path.first() == Some(&b'/') { &path[1..] } else { path };
+    if name.is_empty() || name.len() > 28 {
+        return false;
+    }
+    let (handle, file_size) = match try_open_initramfs_sync(irfs_port, name) {
+        TryOpenInitramfs::Sync(Some(t)) => t,
+        _ => return false,
     };
     let cache_idx = match lib_cache_lookup_or_alloc(handle, file_size) {
         Some(i) => i,
@@ -4019,27 +4063,24 @@ fn lib_cache_eager_populate(path: &[u8]) -> bool {
     true
 }
 
-fn try_open_initramfs(path: &[u8]) -> Option<(u64, u64)> {
-    let irfs_port = get_initramfs_port();
-    if irfs_port == 0 {
-        return None;
-    }
-    // Strip leading '/'.
-    let name = if path.first() == Some(&b'/') { &path[1..] } else { path };
-    if name.is_empty() || name.len() > 28 {
-        return None;
-    }
-    // Cache fast path: skip IRFS_IO_CONNECT IPC if eager preload has
-    // already resolved this name.  Avoids the CALL_REPLY_TIMEOUT
-    // cascade where concurrent opens block on initramfs_srv's
-    // 30 s watchdog and surface as ENOENT to ld.so.
-    if let Some((handle, file_size)) = name_cache_lookup(name) {
-        return Some((handle, file_size));
-    }
-    // Pack name into 4 u64 words within syscall::call's 4-data-word ABI:
-    //   d0 = bytes 0-7, d1 = bytes 8-15, d3 = bytes 16-23
-    //   d2 = name_len (low 16 bits) | bytes 24-27 (upper 32 bits)
-    // 28-char limit covers "lib64/libwayland-client.so.0" (28 chars).
+/// Result type for `try_open_initramfs`: sync hit, deferred async, or
+/// not-applicable (no port, name too long, etc.).
+enum TryOpenInitramfs {
+    /// NAME_CACHE hit or initramfs not usable in a way the caller
+    /// should fall through (no irfs_port, malformed name).  The
+    /// `Option` holds (handle, size) on cache hit, None on fall-through.
+    Sync(Option<(u64, u64)>),
+    /// Async IPC fired; caller must set REPLY_DEFERRED and return.
+    /// The continuation in finish_connect_initramfs will personality_reply
+    /// the caller when IRFS_IO_CONNECT_REPLY arrives.
+    Deferred,
+}
+
+/// Pack up to 28 bytes of `name` into four u64 words for either
+/// IRFS_IO_CONNECT or IRFS_IO_CONNECT_ASYNC.  See initramfs_srv's
+/// IO_CONNECT comment for the ABI.  Returns (w0, w1, w3, d2) where
+/// d2 = name_len (low 16) | bytes 24-27 (upper 32).
+fn pack_irfs_name(name: &[u8]) -> (u64, u64, u64, u64) {
     let mut w0 = 0u64;
     let mut w1 = 0u64;
     let mut w3 = 0u64;
@@ -4057,19 +4098,138 @@ fn try_open_initramfs(path: &[u8]) -> Option<(u64, u64)> {
         w2_extra |= (name[i] as u64) << ((i - 24) * 8);
     }
     let d2 = (name.len() as u64 & 0xFFFF) | (w2_extra << 32);
-    let resp = syscall::call(irfs_port, IRFS_IO_CONNECT, w0, w1, d2, w3)?;
-    if resp.tag == IRFS_IO_CONNECT_OK {
-        // d0 = handle, d1 = size, d2 = server_aspace_id.
-        let handle = resp.data[0];
-        let size = resp.data[1];
-        // Cache is now populated as a side effect of handle_mmap fetching
-        // chunks (option-2 design): no separate populate at open() time,
-        // so open() returns immediately.  See lib_cache_lookup_or_alloc
-        // and try_irfs_read_mmap.
-        Some((handle, size))
-    } else {
-        None
+    (w0, w1, w3, d2)
+}
+
+/// Try to look up `path` against initramfs_srv.  The fast path is a
+/// NAME_CACHE hit (preloaded at boot) — returns Sync(Some(...)).
+/// If no irfs port or name unsuitable, returns Sync(None).  Otherwise
+/// fires IRFS_IO_CONNECT_ASYNC and returns Deferred — caller must set
+/// REPLY_DEFERRED + remember the path so finish_connect_initramfs can
+/// populate NAME_CACHE on success.
+fn try_open_initramfs(pi: usize, caller_port: u64, flags: u64, path: &[u8]) -> TryOpenInitramfs {
+    let irfs_port = get_initramfs_port();
+    if irfs_port == 0 {
+        return TryOpenInitramfs::Sync(None);
     }
+    // Strip leading '/'.
+    let name = if path.first() == Some(&b'/') { &path[1..] } else { path };
+    if name.is_empty() || name.len() > 28 {
+        return TryOpenInitramfs::Sync(None);
+    }
+    // Cache fast path: skip IRFS_IO_CONNECT IPC if eager preload has
+    // already resolved this name.  Avoids the CALL_REPLY_TIMEOUT
+    // cascade where concurrent opens block on initramfs_srv's
+    // 30 s watchdog and surface as ENOENT to ld.so.
+    if let Some((handle, file_size)) = name_cache_lookup(name) {
+        return TryOpenInitramfs::Sync(Some((handle, file_size)));
+    }
+    // Async path is restricted to names <= 24 bytes because we need to
+    // pack a 32-bit correlation into the IO_CONNECT_ASYNC d2 word
+    // (where the sync IO_CONNECT path stuffs name bytes 24-27).  For
+    // 25-28 byte names we fall back to sync.  In practice the common
+    // long names (e.g. "lib64/libwayland-client.so.0") are pre-cached
+    // at boot, so this path rarely fires for them.
+    if name.len() > 24 {
+        return try_open_initramfs_sync(irfs_port, name);
+    }
+    // Cache miss: dispatch async.  Failures (no async slot, port queue
+    // full) fall back to the sync syscall::call path so we don't lose
+    // openability under transient pressure.
+    let slot = match async_alloc_slot() {
+        Some(s) => s,
+        None => return try_open_initramfs_sync(irfs_port, name),
+    };
+    let correlation = next_correlation_id();
+    let (w0, w1, w3, _d2_sync) = pack_irfs_name(name);
+    // Pack the name into reusable PendingAsync fields so the
+    // continuation can re-insert into NAME_CACHE on success.
+    let n1_lo = (w1 & 0xFFFF_FFFF) as u32;
+    let n1_hi = (w1 >> 32) as u32;
+    unsafe {
+        PENDING_ASYNC[slot] = PendingAsync {
+            kind: PendingAsyncKind::ConnectInitramfs,
+            correlation,
+            pi,
+            caller_task_port: caller_port,
+            listen_fd: 0,
+            flags,
+            buf_va: w3 as usize,        // name[16..24]
+            buf_len: name.len(),         // length only (no byte-24..27 needed in async)
+            scratch_slot: 0xFF,
+            total_so_far: n1_lo,
+            mmap_prot_flags: 0,
+            mmap_aligned_len: n1_hi,
+            extra_handle: w0,
+            cache_slot: 0xFF,
+            in_flight_chunk: 0,
+        };
+    }
+    // Repack d2 for the async ABI:
+    //   bits 0..16  = name_len (always 0..24 here)
+    //   bits 16..48 = correlation (low 32 bits — slot+gen disambiguator)
+    //   bits 48..64 = unused / reserved (0)
+    let d2_async = (name.len() as u64 & 0xFFFF)
+        | (((correlation as u32) as u64 & 0xFFFF_FFFF) << 16);
+    let r = syscall::send_nb_4(
+        irfs_port,
+        IRFS_IO_CONNECT_ASYNC,
+        w0,
+        w1,
+        d2_async,
+        w3,
+    );
+    if r != 0 {
+        // Port queue full or other send failure: free slot, fall back
+        // to sync.
+        async_free_slot(slot);
+        return try_open_initramfs_sync(irfs_port, name);
+    }
+    TryOpenInitramfs::Deferred
+}
+
+/// Sync fallback for `try_open_initramfs` when async dispatch fails.
+/// Caller has already validated irfs_port != 0 and 1 <= name.len() <= 28.
+fn try_open_initramfs_sync(irfs_port: u64, name: &[u8]) -> TryOpenInitramfs {
+    let (w0, w1, w3, d2) = pack_irfs_name(name);
+    let resp = match syscall::call(irfs_port, IRFS_IO_CONNECT, w0, w1, d2, w3) {
+        Some(r) => r,
+        None => return TryOpenInitramfs::Sync(None),
+    };
+    if resp.tag == IRFS_IO_CONNECT_OK {
+        // Populate NAME_CACHE so the next lookup hits the fast path.
+        name_cache_insert(name, resp.data[0], resp.data[1]);
+        TryOpenInitramfs::Sync(Some((resp.data[0], resp.data[1])))
+    } else {
+        TryOpenInitramfs::Sync(None)
+    }
+}
+
+/// Reconstruct the 28-byte name buffer from packed PendingAsync fields.
+/// Returns (buf, name_len).  Inverse of the packing done in
+/// try_open_initramfs.
+fn unpack_irfs_name(slot: usize) -> ([u8; 28], usize) {
+    let mut out = [0u8; 28];
+    let (w0, w1_lo, w1_hi, w3, name_len) = unsafe {
+        let s = &PENDING_ASYNC[slot];
+        let len = (s.buf_len as u64 & 0xFFFF) as usize;
+        (s.extra_handle, s.total_so_far, s.mmap_aligned_len, s.buf_va as u64, len)
+    };
+    let w1: u64 = (w1_lo as u64) | ((w1_hi as u64) << 32);
+    for i in 0..name_len.min(8) {
+        out[i] = ((w0 >> (i * 8)) & 0xFF) as u8;
+    }
+    for i in 8..name_len.min(16) {
+        out[i] = ((w1 >> ((i - 8) * 8)) & 0xFF) as u8;
+    }
+    for i in 16..name_len.min(24) {
+        out[i] = ((w3 >> ((i - 16) * 8)) & 0xFF) as u8;
+    }
+    let w2_extra = (unsafe { PENDING_ASYNC[slot].buf_len as u64 } >> 32) & 0xFFFF_FFFF;
+    for i in 24..name_len.min(28) {
+        out[i] = ((w2_extra >> ((i - 24) * 8)) & 0xFF) as u8;
+    }
+    (out, name_len)
 }
 
 /// Write a path into the scratch page. Returns the truncated length actually
@@ -4523,23 +4683,37 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
     // initramfs first; on miss fall through to VFS.  Only attempt for
     // names that fit initramfs_srv's 24-char inline limit (after stripping
     // the leading '/'), which covers most lib paths.
-    if let Some((handle, file_size)) = try_open_initramfs(&path[..pathlen]) {
-        let irfs_port = get_initramfs_port();
-        let fd = match alloc_fd(pi) {
-            Some(f) => f,
-            None => return linux_err(EMFILE),
-        };
-        unsafe {
-            PROC_TABLE[pi].fds[fd].kind = FdKind::Initramfs;
-            PROC_TABLE[pi].fds[fd].fs_port = irfs_port;
-            PROC_TABLE[pi].fds[fd].handle = handle;
-            PROC_TABLE[pi].fds[fd].file_size = file_size;
-            PROC_TABLE[pi].fds[fd].offset = 0;
-            if flags & 0x80000 != 0 { // O_CLOEXEC
-                PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+    //
+    // try_open_initramfs returns:
+    //   Sync(Some(t)) — cache hit (or sync fallback succeeded) → install fd here
+    //   Sync(None)    — initramfs not usable for this name → fall through to VFS
+    //   Deferred      — async fired; finish_connect_initramfs replies later
+    match try_open_initramfs(pi, caller_port, flags, &path[..pathlen]) {
+        TryOpenInitramfs::Sync(Some((handle, file_size))) => {
+            let irfs_port = get_initramfs_port();
+            let fd = match alloc_fd(pi) {
+                Some(f) => f,
+                None => return linux_err(EMFILE),
+            };
+            unsafe {
+                PROC_TABLE[pi].fds[fd].kind = FdKind::Initramfs;
+                PROC_TABLE[pi].fds[fd].fs_port = irfs_port;
+                PROC_TABLE[pi].fds[fd].handle = handle;
+                PROC_TABLE[pi].fds[fd].file_size = file_size;
+                PROC_TABLE[pi].fds[fd].offset = 0;
+                if flags & 0x80000 != 0 { // O_CLOEXEC
+                    PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+                }
             }
+            return fd as u64;
         }
-        return fd as u64;
+        TryOpenInitramfs::Deferred => {
+            unsafe { REPLY_DEFERRED = true; }
+            return 0; // value ignored; REPLY_DEFERRED suppresses reply
+        }
+        TryOpenInitramfs::Sync(None) => {
+            // Fall through to VFS.
+        }
     }
 
     // Below here we need the VFS server.  Virtual devices handled above
@@ -10219,12 +10393,85 @@ fn handle_async_reply(msg: &syscall::Message) -> bool {
             }
             true
         }
+        IRFS_IO_CONNECT_REPLY => {
+            // data[0] = correlation (echoes request)
+            // data[1] = handle (0 = not-found)
+            // data[2] = size   (0 = not-found)
+            // data[3] = server_aspace_id
+            let correlation = msg.data[0];
+            let handle = msg.data[1];
+            let size = msg.data[2];
+            let slot = match async_find_by_correlation(correlation) {
+                Some(s) => s,
+                None => return false,
+            };
+            let kind = unsafe { PENDING_ASYNC[slot].kind };
+            match kind {
+                PendingAsyncKind::ConnectInitramfs => {
+                    finish_connect_initramfs(slot, handle, size);
+                }
+                _ => async_free_slot(slot),
+            }
+            true
+        }
         // IRFS_IO_READ_REPLY is exclusively handled by the reply
         // thread (see reply_thread_entry).  Replies are routed there
         // because we register IRFS_REPLY_PORT with initramfs_srv —
         // nothing should arrive on BACKEND_REPLY_PORT with this tag.
         _ => false,
     }
+}
+
+/// Continuation for ConnectInitramfs.  Inputs:
+///   slot   — PENDING_ASYNC index allocated by try_open_initramfs
+///   handle — initramfs file handle, or 0 = not-found
+///   size   — file size, or 0 = not-found
+///
+/// On success: allocate the new fd in PROC_TABLE[pi].fds, populate
+/// metadata + FD_CLOEXEC, insert name into NAME_CACHE so the next
+/// open hits the sync fast path, and personality_reply the fd.
+///
+/// On not-found: personality_reply ENOENT.  No VFS fallback in this
+/// async path — see the ConnectInitramfs docstring on PendingAsyncKind
+/// for the known regression and how it's mitigated by the NAME_CACHE
+/// fast path covering common files at boot.
+fn finish_connect_initramfs(slot: usize, handle: u64, size: u64) {
+    let (pi, caller_port, flags) = unsafe {
+        let s = &PENDING_ASYNC[slot];
+        (s.pi, s.caller_task_port, s.flags)
+    };
+    // Reconstruct the original name for NAME_CACHE insertion.
+    let (name_buf, name_len) = unpack_irfs_name(slot);
+    async_free_slot(slot);
+
+    if handle == 0 && size == 0 {
+        // Not found in initramfs.  Send ENOENT to the caller.
+        let _ = syscall::personality_reply(caller_port, linux_err(ENOENT));
+        return;
+    }
+    // Populate NAME_CACHE for future opens of the same path.
+    let name = &name_buf[..name_len.min(28)];
+    name_cache_insert(name, handle, size);
+
+    let fd = match alloc_fd(pi) {
+        Some(f) => f,
+        None => {
+            let _ = syscall::personality_reply(caller_port, linux_err(EMFILE));
+            return;
+        }
+    };
+    let irfs_port = get_initramfs_port();
+    unsafe {
+        PROC_TABLE[pi].fds[fd].kind = FdKind::Initramfs;
+        PROC_TABLE[pi].fds[fd].fs_port = irfs_port;
+        PROC_TABLE[pi].fds[fd].handle = handle;
+        PROC_TABLE[pi].fds[fd].file_size = size;
+        PROC_TABLE[pi].fds[fd].offset = 0;
+        if flags & 0x80000 != 0 { // O_CLOEXEC
+            PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+        }
+    }
+    let _ = syscall::personality_reply(caller_port, fd as u64);
 }
 
 /// Plan-A reply-thread entry: park on IRFS_REPLY_PORT and dispatch
