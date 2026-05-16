@@ -101,7 +101,35 @@ pub fn kswapd() -> ! {
         let aspace_id = snapshot.ids[rr_idx];
         rr_idx += 1;
 
-        let result = wsclock::scan(aspace_id, PAGES_PER_SCAN);
+        // #160 PFF (Chu & Opderbeck 1976): adjust scan aggressiveness
+        // per aspace based on fault rate.  pf_count_delta returns
+        // faults-since-last-scan and updates the per-aspace previous
+        // sample atomically.
+        //
+        //   delta > PFF_UPPER → aspace is thrashing — back off (scan
+        //                       fewer pages so we don't evict more)
+        //   delta < PFF_LOWER → aspace is cold — scan harder (free
+        //                       pages it isn't using)
+        //   between           → default cadence
+        //
+        // PFF_UPPER and PFF_LOWER are tuned vs PAGES_PER_SCAN so the
+        // thresholds are meaningful at this scan granularity.  When
+        // userspace experimentation settles a better policy, swap the
+        // constants without changing the structure.
+        const PFF_UPPER: u64 = 32;  // faults/scan above which we back off
+        const PFF_LOWER: u64 = 1;   // faults/scan below which we scan harder
+        let pf_delta = super::aspace::pf_count_delta(aspace_id);
+        let scan_target = if pf_delta > PFF_UPPER {
+            // Thrashing — don't evict anything this round.
+            0
+        } else if pf_delta < PFF_LOWER {
+            // Cold — scan twice as aggressively.
+            PAGES_PER_SCAN.saturating_mul(2)
+        } else {
+            PAGES_PER_SCAN
+        };
+
+        let result = wsclock::scan(aspace_id, scan_target);
         if result.pages_freed > 0 {
             super::stats::KSWAPD_RECLAIMED
                 .fetch_add(result.pages_freed as u64, Ordering::Relaxed);

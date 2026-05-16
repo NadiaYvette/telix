@@ -244,6 +244,11 @@ struct ASpaceEntry {
     /// sample this at two times to compute fault rate, then grow/shrink
     /// the aspace's reclaim target based on the rate.
     pf_count: core::sync::atomic::AtomicU64,
+    /// #160 PFF previous sample: kswapd stores the last-observed
+    /// pf_count value here, so the next scan can compute the rate as
+    /// `pf_count - pf_count_prev` and feed it into the scan-target
+    /// adjustment heuristic.
+    pf_count_prev: core::sync::atomic::AtomicU64,
     /// The actual address space data, protected by a per-entry lock.
     inner: SpinLock<AddressSpace>,
 }
@@ -414,6 +419,21 @@ pub fn pf_count(id: ASpaceId) -> u64 {
     }
 }
 
+/// #160 PFF kswapd hook: sample the current pf_count, take the delta
+/// since the previous sample (stored in the aspace), and update the
+/// previous-sample slot.  Returns the delta.  Cheap atomic load + swap.
+pub fn pf_count_delta(id: ASpaceId) -> u64 {
+    match resolve_entry(id) {
+        Some(entry_ptr) => {
+            let entry = unsafe { &*entry_ptr };
+            let now = entry.pf_count.load(Ordering::Relaxed);
+            let prev = entry.pf_count_prev.swap(now, Ordering::Relaxed);
+            now.saturating_sub(prev)
+        }
+        None => 0,
+    }
+}
+
 /// #160 Sum of `working_set()` across all active aspaces.  Used by
 /// `sys_spawn`'s admission-control gate to decide whether the system
 /// has enough free pages to accept a new process.  O(num_aspaces) —
@@ -465,6 +485,7 @@ pub fn create(page_table_root: usize) -> Option<ASpaceId> {
         (*ptr).pager_waiter = AtomicU32::new(0);
         (*ptr).ws_pages_recent = AtomicU32::new(0);
         (*ptr).pf_count = core::sync::atomic::AtomicU64::new(0);
+        (*ptr).pf_count_prev = core::sync::atomic::AtomicU64::new(0);
         let mut space = AddressSpace::empty();
         space.id = port_id;
         space.page_table_root = page_table_root;
