@@ -76,31 +76,78 @@ Frankenstein — is maintained in
 
 ## 2. Architecture Overview
 
-### 2.1 Two Mechanisms, Each for Its Right Use
+### 2.1 Completion Delivery as a Per-Submission Choice
 
-The interface has two distinct kernel-userspace communication
-mechanisms:
+Every syscall under this design is logically split into two halves:
+*submission* (asks the kernel to do something, returns immediately
+with a correlation handle) and *completion* (the result, delivered
+later when the operation finishes). The submission half is uniform
+across all syscalls — userspace fills in an operation code,
+arguments, and a *completion destination* tag.
 
-**The completion ring path** handles operations that userspace
-explicitly submitted. Userspace places a submission entry in the
-submission ring; the kernel processes it asynchronously; the result
-appears in the completion ring; userspace reads the completion. No
-interruption of userspace execution occurs at submission or
-completion — userspace pulls events at its own pace.
+The destination tag selects, per-submission, where the completion
+will be delivered. The kernel implements a small fixed enumeration:
 
-**The upcall path** handles events that userspace did not explicitly
-submit. Page faults that require userspace handling (e.g.,
-user-managed memory regions, copy-on-write breaks involving
-userspace-managed allocation), notifications about activation
-availability changes, signal-like events from other processes, and
-other exceptional events arrive via upcall. The kernel interrupts
-userspace execution to deliver these.
+1. **Synchronous return.** The operation completes in bounded time
+   without yielding the calling thread; the result is returned in
+   the submission syscall's own return path. Used for fast
+   operations where the submit/complete round-trip would add more
+   overhead than the operation itself costs.
 
-The two mechanisms coexist. Userspace's event loop handles both: it
-polls or sleeps on the completion ring, and it has registered upcall
-handlers for the events that arrive via upcall. The choice of
-mechanism per event type is made by the kernel based on whether the
-event corresponds to a userspace-initiated operation.
+2. **Reply capability.** A generation-counted reply slot is allocated
+   on the caller's behalf and the completion lands as a reply
+   message there. Identical to today's `sys_call` + reply-cap
+   mechanism in `kernel/src/ipc/call_reply.rs`. Backward compatible
+   with every existing Telix server.
+
+3. **Port message.** The completion is delivered as an IPC message
+   to a specified port. The port may be local or remote (routed
+   transparently through `proxy_srv`), making this the natural
+   cluster-friendly choice. Bounded by the port's queue length;
+   the usual `send_nb` semantics apply if the port is full.
+
+4. **Ring entry.** The completion is written into a specified
+   ring's CQ in shared memory; userspace polls or waits on the
+   ring. Best for high-throughput batched workloads. Only
+   submissions that explicitly select this destination contribute
+   to ring fullness — so ring overflow is contained to workloads
+   that opted in.
+
+5. **Direct upcall.** The kernel transfers control to a registered
+   continuation, with the completion frame on the upcall stack.
+   Pairs with the continuation-passing runtime model.
+
+The kernel's "operation complete" path is a small dispatch table
+keyed by destination tag — the operation handlers themselves don't
+need to know how their results will be delivered.
+
+Each destination has different overflow, latency, and cluster
+behaviour, so per-submission choice matters: a high-throughput
+storage workload uses (4) rings to amortise dispatch; a remote
+service call uses (3) port message for transparent routing through
+the existing distributed-service substrate; a trivially fast
+operation uses (1) sync return to skip async overhead; an
+existing-pattern Telix server keeps using (2) reply cap unchanged;
+a continuation-style language runtime uses (5) upcall delivery.
+
+Beyond these five completion paths, an orthogonal mechanism handles
+events that userspace did not explicitly submit: page faults that
+require userspace handling, activation-availability changes,
+signal-like notifications from other processes. These flow through
+the *upcall* facility, structurally the same machinery as (5) above
+but registered per-process (per upcall type) rather than
+per-submission. The two share the kernel's upcall delivery path;
+the choice of "is this completion of a userspace-submitted op" vs
+"is this an externally-originated event" is just whether the
+upcall registration matches a pending submission's correlation tag
+or a long-lived per-process registration.
+
+The remainder of this section details each destination type. (1),
+(2), and (3) reuse machinery already in
+`kernel/src/syscall/handlers.rs`, `kernel/src/ipc/call_reply.rs`,
+and `kernel/src/ipc/port.rs` respectively. (4) and (5) are the
+genuinely new mechanisms — the shared-memory ring layer and the
+per-process upcall registration.
 
 ### 2.2 The Ring Data Structures
 
@@ -157,75 +204,258 @@ one per upcall type. If an upcall fires for a type with no registered
 handler, the kernel takes a default action (typically signal-like
 termination for unhandled faults).
 
-### 2.5 Two Runtime Models Over the Same ABI
+### 2.5 Five Runtime Patterns Over the Five Destinations
 
-The completion-ring ABI described above intentionally supports two
-distinct runtime models. Both are first-class — the kernel ABI is
-agnostic to which a given activation uses, and the choice is made
-per-activation at the runtime-library layer. Different activations
-in the same process can use different models, and a single
-activation can switch models over its lifetime.
+Each completion destination from §2.1 admits a natural runtime
+pattern that uses it as the dominant delivery mechanism. The five
+patterns are summarised here side by side for comparison. The
+kernel ABI is agnostic to which pattern a given runtime adopts;
+different activations within the same process can use different
+patterns, and a single activation can mix destinations across its
+own submissions. The "dominant pattern" framing below is the
+typical case, not a constraint.
 
-**The event-loop model** (poll-and-dispatch): the runtime registers
-no per-handle upcall. Its main thread of control calls
-`ring_wait(min_completions, timeout)` (or `ring_peek_completion()`
-when non-blocking), drains some completions, looks each one up in a
-runtime-maintained handler table by handle, and dispatches the
-appropriate handler. Control flow is a top-level loop;
-"asynchronous" operations are encoded as state machines in the
-handler table. This is the io_uring / libuv / Node.js shape.
+Each subsection follows the same structure: **shape** (what code
+looks like), **concurrency** (how parallelism is expressed),
+**workload** (where it fits), **precedent** (existing systems),
+**cluster** (how the pattern behaves across hosts), and
+**tradeoffs**.
 
-**The continuation-passing model** (upcall-and-resume): each ring
-submission is accompanied by a *continuation* — a function pointer
-plus closure data — registered with the kernel via a CQ-edge upcall
-handler. When a completion arrives, the kernel delivers it as an
-upcall directly into the registered continuation, on whichever
-activation the runtime has marked as available. The runtime has no
-top-level loop; control flow is a chain of continuations, each
-either finishing (terminating the activation's current work), or
-submitting another op + continuation, or transferring control
-directly to another already-registered continuation. This is the
-Mach-continuation / K42-closure / Cilk-spawn shape.
+#### 2.5.1 Synchronous code (destination 1: sync return)
 
-Both models share the same SQ/CQ data structures and the same
-underlying ring-drainer in the kernel. The only mechanical
-difference is whether the kernel keeps the activation parked when
-new completions arrive (event loop case — the runtime has called
-`ring_wait` and will pull when it wakes) or invokes a registered
-handler immediately on the CQ producing a new entry (continuation
-case — the runtime registered an upcall on CQ-edge instead of
-parking). The same upcall plumbing in §2.4 carries continuation
-deliveries; from the kernel's perspective they are just another
-upcall type with per-submission registration rather than per-process.
+**Shape.** Straight procedural code:
+```rust
+let result = syscall_do_thing(arg)?;
+process(result);
+```
+No event loop, no callbacks, no rings. Each operation completes
+before the next line runs.
 
-**Tradeoffs that drive the choice:**
+**Concurrency.** None within a single thread; multiple threads
+each execute their own straight-line code. Concurrency is
+expressed by spawning more threads, not by interleaving operations.
 
-- *Event loop* wins on batching (drain N completions before doing
-  anything), simpler debugging (one thread of control to inspect),
-  easier reasoning about ordering, simpler implementation for
-  languages without first-class closures, and better fit for timer
-  wheels / priority dispatch where the runtime wants global
-  scheduling control.
+**Workload.** Simple CLI tools, scripts, embedded compute, test
+harnesses, the body of any code whose performance is bounded by
+computation rather than I/O wait. Also the right default for
+operations the kernel can complete in bounded time without
+yielding (capability lookups, thread-state queries).
 
-- *Continuation passing* wins on lower per-completion latency (no
-  poll-then-dispatch overhead, the activation receiving the upcall
-  is already the right one to run the continuation), no central
-  choke point (no shared event-loop thread is the bottleneck),
-  natural locality (the continuation runs where the upcall landed),
-  finer-grained quiescent points (every continuation boundary is a
-  yield point — relevant for runtimes that need precise scheduling
-  knowledge, e.g. the activation-aware Perceus protocol in
-  `docs/activation_perceus_demotion.md`), and simpler shape for
-  workloads that don't naturally form an event loop (short-lived
-  async operations dispatched from many call sites).
+**Precedent.** Every K&R-style C program. Most shell tools. The
+default mode of every traditional Unix syscall.
 
-For Telix's near-term consumers, the Linux personality server is a
-natural fit for the event-loop model (it manages many Linux
-processes, each modelled as a state machine, with a single supervising
-loop). Sophisticated language runtimes — especially ones with
-first-class closures or work-stealing schedulers — are more naturally
-fitted to the continuation-passing model. The ABI supports both
-without commitment.
+**Cluster.** Poor fit. A "remote" sync operation would block the
+calling thread until the round trip completes; that's acceptable
+for a few operations but pathological as a default.
+
+**Tradeoffs.** Simplest possible programming model — debuggable
+with `printf`, no state machines, no race windows around completion
+delivery. Cost is that operations involving any wait (I/O, IPC,
+page faults) block the thread; the only concurrency escape valve
+is more threads.
+
+#### 2.5.2 Classic server (destination 2: reply capability)
+
+**Shape.** Recv/dispatch/reply loop, each request servicing running
+to completion (possibly invoking nested sync calls) before the next
+request is dequeued:
+```rust
+loop {
+    let (msg, reply_cap) = recv_with_cap(port);
+    let result = handle(msg);
+    reply(reply_cap, result);
+}
+```
+
+**Concurrency.** One thread per server, or a thread pool drawing
+from a shared port. Concurrency among clients is the queue depth
+of the port; concurrency within request handling is whatever the
+handler itself does (usually nothing — handlers run to completion).
+
+**Workload.** Stateless or simple-stateful services. Existing
+Telix init_srv, namesrv, discovery_srv, proxy_srv all use this
+pattern today.
+
+**Precedent.** Mach servers, L4 servers, every microkernel's
+"service" component, classic Plan 9 file servers.
+
+**Cluster.** Reply caps are local-only; a reply cap allocated on
+node A cannot be invoked from node B without proxy_srv-style
+re-marshalling. Pattern works *to* a remote server (the client
+sends to a port that's locally a proxy stub, gets a local reply
+cap), but the server-side reply path is bound to the server's host.
+
+**Tradeoffs.** Backward compatible with every existing Telix
+server — no refactor required. Bottleneck is the per-server thread
+parking on a sync backend call (`linux_srv`'s blocking
+`IRFS_IO_CONNECT` problem from earlier today is the canonical
+case). Mitigations: thread pool, or split into multiple servers
+per logical responsibility. Pattern is well-understood and
+inexpensive to debug.
+
+#### 2.5.3 Actor / message-passing (destination 3: port message)
+
+**Shape.** Each "actor" is a process or activation with an inbox;
+the runtime is a recv loop dispatching by message type, possibly
+sending fresh messages to other actors:
+```rust
+loop {
+    let msg = recv(inbox);
+    match msg.tag {
+        Tag::DoX(args) => { send(peer, Tag::XResult(compute(args))); }
+        Tag::DoY(args) => { /* ... */ }
+    }
+}
+```
+
+**Concurrency.** Inherent: every actor is independently scheduled,
+sharing no mutable state, communicating only via messages. The
+runtime can run many actors per OS thread, or one actor per
+thread, or any mixture.
+
+**Workload.** Distributed services, supervised process trees, soft
+real-time systems, telecom-style "let it crash" architectures.
+Anything where the unit of concurrency *is* the message handler.
+
+**Precedent.** Erlang/OTP, Akka, Orleans, Microsoft Service Fabric.
+The runtime-as-OS model: BEAM is structurally an operating system
+implementing only the actor abstraction.
+
+**Cluster.** The pattern's best feature. Ports may be local or
+remote (routed transparently through proxy_srv), and the actor
+code doesn't know or care which. Supervision trees, naming, and
+failure detection all extend naturally across nodes.
+
+**Tradeoffs.** Encoding sequential logic that doesn't fit the
+message-handler shape (long-lived state machines, multi-step
+transactions) requires explicit state-machine bookkeeping inside
+the actor — not as ergonomic as event-loop or continuation
+patterns for those workloads. But the cluster property is a
+direct, no-effort win that no other pattern matches.
+
+#### 2.5.4 Event loop (destination 4: ring entry)
+
+**Shape.** Top-level loop polls or waits on a completion ring,
+drains entries, dispatches each by correlation handle to a
+runtime-maintained handler table:
+```rust
+loop {
+    let completions = ring_wait(min=1, timeout=...);
+    for c in completions {
+        let handler = handler_table.lookup(c.handle);
+        handler(c.result);
+    }
+}
+```
+Each "asynchronous" operation is encoded as a state machine living
+in the handler table.
+
+**Concurrency.** The ring drains many completions per loop
+iteration, so concurrency manifests as interleaved handler calls
+on the same OS thread. For multi-thread parallelism, one ring per
+worker thread.
+
+**Workload.** High-throughput I/O servers: web servers, databases,
+proxies, network packet processors. Any workload where the win is
+amortising dispatch overhead across batched completions.
+
+**Precedent.** Linux io_uring, libuv (Node.js), Tokio (Rust),
+.NET's IOCP-based runtime, every modern async HTTP server.
+
+**Cluster.** Ring is local-only — shared memory between kernel and
+userspace on a single host. Cluster operations need the escape
+valve of mixing destinations (a remote operation submitted with
+destination=port-message rather than ring).
+
+**Tradeoffs.** Best throughput for batched workloads; the ring
+amortises dispatch cost. Cost is the per-completion overhead of
+"look up handler in table" + the global ordering imposed by a
+single drainer (parallelism comes from multiple rings, not from
+within one ring). Ring overflow is a real concern (see §6 and §7),
+bounded to the ring's workload.
+
+#### 2.5.5 Continuation passing (destination 5: direct upcall)
+
+**Shape.** No top-level loop. Each submission carries its
+continuation; the kernel invokes the continuation directly when
+the operation completes, on whichever activation the runtime has
+marked available:
+```rust
+ring_submit_with_continuation(DO_THING, arg, |result| {
+    // this runs as an upcall when the operation completes
+    process(result);
+    // possibly submit more with their own continuations
+});
+// activation returns to its scheduler
+```
+
+**Concurrency.** Continuations are independent units of work; the
+runtime can run them in parallel on any available activation. No
+single drainer thread — concurrency comes from many activations
+each running their own current continuation. Cilk-style
+work-stealing fits naturally here.
+
+**Workload.** Language runtimes with first-class closures (Verona,
+Pony, Cilk, OCaml effect handlers), work-stealing schedulers,
+fine-grained parallel computation (parallel reductions,
+divide-and-conquer algorithms). Also the natural fit for the
+activation-aware Perceus demotion protocol
+(`docs/activation_perceus_demotion.md`) because every continuation
+boundary is a precisely-located quiescent point.
+
+**Precedent.** Mach continuations (1990s), K42 closure-based
+activations, Cilk's spawn-and-sync, modern JavaScript async/await
+(after compilation to CPS-style state machines).
+
+**Cluster.** Local-only by default; upcalls don't cross machines.
+A continuation that needs a remote result mixes destinations (the
+remote call uses destination=port-message; the local post-processing
+uses destination=upcall).
+
+**Tradeoffs.** Lowest per-completion latency (no poll-then-dispatch),
+no central bottleneck, natural locality (the continuation runs where
+the upcall landed), and the finest-grained quiescent points
+available. Cost is more invasive code shape — each operation needs
+its closure data structured for the continuation pipeline — and
+harder debugging (no central "event loop thread" to inspect).
+Requires the runtime to be designed around CPS from the start;
+retrofitting an existing event-loop runtime to CPS is rarely worth
+the effort.
+
+#### 2.5.6 Comparing the five
+
+The patterns trade off along consistent axes:
+
+| Pattern              | Shape          | Concurrency       | Cluster   | Latency           | Code cost |
+|----------------------|----------------|-------------------|-----------|-------------------|-----------|
+| 2.5.1 Sync           | line-by-line   | thread-level only | poor      | varies (blocking) | trivial   |
+| 2.5.2 Classic server | recv/reply     | server pool       | poor      | bounded by IPC    | low       |
+| 2.5.3 Actor          | msg handler    | per-actor         | excellent | port latency      | medium    |
+| 2.5.4 Event loop     | poll/dispatch  | batched           | local only| dispatch + drain  | medium    |
+| 2.5.5 Continuation   | CPS            | per-continuation  | local only| minimal           | high      |
+
+For Telix's near-term consumers, the typical fit is:
+
+- **Existing system servers** (init_srv, discovery_srv, namesrv,
+  proxy_srv): 2.5.2, unchanged from today.
+- **Linux personality server** (`linux_srv`): currently 2.5.2 with
+  hand-coded async state machines via `PENDING_ASYNC`; would
+  benefit from migrating to 2.5.4 (event loop) for the
+  many-concurrent-Linux-processes case.
+- **Distributed-service substrate** (proxy_srv, discovery_srv when
+  routing cross-node): inherently 2.5.3 — port-message delivery is
+  what makes cluster routing transparent.
+- **A future Frankenstein language runtime** with first-class
+  closures: 2.5.5 (continuation passing), to take advantage of the
+  activation-aware Perceus demotion protocol.
+- **Simple Telix-native binaries** (test tools, init helpers):
+  2.5.1, the blocking convenience wrappers from §3.1.
+
+Different activations within the same process can use different
+patterns; a single Frankenstein-compiled program might use 2.5.5
+for its main computation while invoking a Telix server via 2.5.2
+for capability operations and the network stack via 2.5.4 for
+high-throughput packet I/O. The ABI doesn't constrain the mix.
 
 ### 2.6 Parent-Constructed Child Tasks
 
@@ -628,46 +858,118 @@ but provides better safety.
 io_uring uses userspace-chosen handles (the `user_data` field). This
 is the simpler choice and probably the right default.
 
-### 6.4 Submission Ring Full
+### 6.4 Overflow Handling Per Destination
 
-When the submission ring fills, the submitter's options are:
+With completion delivery as a per-submission destination choice
+(§2.1), overflow ceases to be a single design decision and becomes
+a per-destination question. Each destination has its own overflow
+semantics, which is one of the reasons to make the destination
+choice per-submission rather than process-wide.
 
-**Block.** The kernel parks the submitter until ring space is
-available. Defeats the non-blocking property for this specific case
-but matches what the blocking wrapper would do anyway.
+- **Destination 1 (sync return)** — no overflow concept. The
+  operation completes inline; there is no queue to fill.
 
-**Return error.** The submitter receives an error and must handle
-the ring-full case (typically by waiting for some completions to
-clear and retrying).
+- **Destination 2 (reply cap)** — overflow is "reply-slot pool
+  exhausted," already handled by `kernel/src/ipc/call_reply.rs`
+  with its generation-counter allocator. Either submission fails
+  with a clear error or the caller waits for a slot to free.
+  Telix has years of operational experience with this case.
 
-**Wait then submit.** A combined operation that drains some
-completions if needed and then submits, returning when the
-submission is accepted.
+- **Destination 3 (port message)** — overflow is "destination
+  port queue full." Existing `send_nb` returns EAGAIN; `send`
+  blocks the caller. Standard behaviour; well-understood by every
+  existing Telix consumer.
 
-The right answer is probably to provide all three as different
-submission operations. Most callers use a wrapper that picks the
-appropriate one based on context.
+- **Destination 4 (ring entry)** — the genuinely new overflow
+  case. When the submission ring (SQ) fills, the submitter has
+  three options:
+  - *Block* the submitter until ring space is available.
+  - *Return error* and the submitter handles it explicitly
+    (typically by waiting for some completions to clear).
+  - *Wait then submit* — a combined operation that drains some
+    completions if needed before submitting.
 
-### 6.5 Runtime Model: Event Loop vs Continuation Passing
+  When the completion ring (CQ) fills, the kernel has the harder
+  problem (the operation has already completed somewhere
+  internally; there's no "wait" option). io_uring's answer is an
+  overflow buffer in kernel memory, which makes laggy consumers
+  grow kernel memory unboundedly. The cleaner answer here is
+  *backpressure at submission time*: when the CQ is full, the
+  kernel refuses to accept new submissions destined for that ring
+  until the CQ drains. This bounds the total in-flight work per
+  ring to (SQ size + CQ size), making memory accounting
+  predictable.
 
-Both models are supported by the same kernel ABI (§2.5). The
-design decision is therefore not "which model does Telix
-prescribe?" but "how minimal a kernel ABI suffices to support
-both?" The answer is: the kernel exposes the ring data structures
-plus a `cq_edge` upcall registration. A runtime that does not
-register a `cq_edge` upcall uses the event-loop model (calls
-`ring_wait` to sleep); a runtime that does register one uses
-continuation passing (each completion immediately invokes the
-registered handler). Per-handle continuations are layered on top by
-the runtime library — the runtime tags each submission's handle in
-a continuation table and the `cq_edge` upcall dispatches by handle.
+  The right answer is to provide all three submission options for
+  SQ-full and the backpressure rule for CQ-full. Most callers use
+  a wrapper that picks the appropriate one based on context.
 
-Per-handle continuations could alternatively be a kernel-tracked
-concept (each SQ entry carrying a continuation pointer the kernel
-remembers and invokes directly on completion), but this pushes more
-semantics into the kernel ABI than is necessary: a per-process
-`cq_edge` upcall + userspace-side continuation table is functionally
-equivalent and keeps the kernel ABI minimal.
+- **Destination 5 (direct upcall)** — overflow is "the
+  registered continuation can't be invoked right now" (e.g., the
+  target activation is unavailable). The kernel either parks the
+  completion until an activation is available, or invokes a
+  fallback upcall (signalling "your upcall fired with no
+  activation to receive it") that the runtime registers
+  separately. The choice is per-process at upcall registration
+  time.
+
+The fact that overflow is *per-destination* means ring overflow
+(the most architecturally novel case) only constrains workloads
+that opt into ring delivery. Workloads that use the other four
+destinations have overflow semantics already proven in Telix or
+elsewhere.
+
+### 6.5 Default Completion Destination per Operation
+
+With destinations as a per-submission choice, each syscall in the
+ABI also has a *default* destination — what happens if userspace
+submits without explicitly specifying. The defaults should follow
+each operation's natural use case:
+
+- **Capability operations, thread-state queries, ring-peek
+  operations**: default destination 1 (sync return). These complete
+  in bounded time; async overhead would dominate.
+
+- **IPC send/recv on a port**: default destination 2 (reply cap)
+  for `call`-style operations; destination 3 (port message) for
+  fire-and-forget sends. Matches existing Telix semantics.
+
+- **File I/O, block I/O, network I/O**: no clear single default —
+  these are the operations where the destination choice matters
+  most. Suggest defaulting to destination 2 (reply cap) for
+  backward compatibility, with high-throughput consumers
+  explicitly opting into destination 4 (ring entry).
+
+- **Page-fault handling operations** (user-managed mmap regions):
+  default destination 5 (upcall) — these are naturally upcall-shaped.
+
+The defaults can be overridden per-submission. The point of having
+defaults is that simple programs (using the destination 1 / 2
+defaults) don't need to know about the multi-destination machinery
+at all; the design degrades gracefully into "Telix as it is today"
+for callers that don't care.
+
+### 6.6 Runtime Pattern Choice
+
+With five completion destinations (§2.1) come five natural runtime
+patterns (§2.5). The choice is per-activation and per-submission;
+the kernel ABI doesn't constrain the mix.
+
+The design decision is therefore not "which pattern does Telix
+prescribe?" but "how minimal a kernel ABI suffices to support all
+five?" The answer is: the kernel exposes the five destination tags
+plus the ring data structures (for destination 4) plus the upcall
+registration table (for destination 5). Destinations 1, 2, and 3
+reuse existing primitives unchanged.
+
+Per-handle continuations (the destination 5 use case) could
+alternatively be a kernel-tracked concept (each SQ entry carrying
+a continuation pointer the kernel remembers and invokes directly
+on completion), but pushing this into the kernel ABI doesn't add
+expressiveness: a per-process upcall-on-CQ-edge + userspace-side
+continuation table is functionally equivalent and keeps the
+kernel ABI minimal. The kernel just delivers "completion arrived";
+the userspace runtime knows how to dispatch.
 
 ### 6.6 Cancellation
 
@@ -685,24 +987,26 @@ stages of execution.
 ## 7. Risks and Mitigations
 
 **Memory ordering correctness in ring access.** The lock-free ring
-access requires careful use of memory barriers. Getting this wrong
-causes hard-to-reproduce races. Mitigation: use well-tested ring
-data structures (e.g., the same approach as io_uring's verified
+access (destination 4 only) requires careful use of memory barriers.
+Getting this wrong causes hard-to-reproduce races. Risk is scoped
+to ring-using workloads; the other four destinations don't use
+lock-free shared memory. Mitigation: use well-tested ring data
+structures (e.g., the same approach as io_uring's verified
 implementation), write specifications, formally verify the ring
 access patterns with Verus.
 
-**Performance overhead for fast operations.** Submitting through a
-ring and waiting for a completion is more work than a direct
-synchronous syscall for operations that complete immediately.
-Mitigation: keep truly fast operations synchronous (per §3.2),
-benchmark to ensure the ring overhead is small relative to operation
-cost.
+**Performance overhead for fast operations.** Routing through any
+async destination (rings, ports, upcalls) is more work than a
+direct synchronous syscall for operations that complete immediately.
+Mitigation: keep truly fast operations on destination 1 (sync
+return) by default (per §6.5), so the destination machinery is
+opt-in for operations that actually benefit.
 
 **Userspace complexity for simple programs.** Programs that don't
-have an event loop need the blocking wrapper, adding a small
-overhead. Mitigation: make the wrappers efficient (single-entry SQ,
-single completion polled before sleeping); accept the small overhead
-as a cost of the architecture.
+have an event loop or actor structure should use destination 1
+(sync return) or destination 2 (reply cap), which both look like
+ordinary syscalls. The other destinations are opt-in. Simple
+programs don't pay for complexity they don't use.
 
 **Migration complexity for existing servers.** Existing system
 servers work but aren't optimized for the new interface. Mitigation:
@@ -725,27 +1029,41 @@ for runtime sizing.
 ## 8. Conclusion
 
 Converting Telix's native syscall interface to a completion-based
-asynchronous model with submission/completion rings and
-selectively-used scheduler activation upcalls is a bounded
-engineering effort — approximately 4,000–9,000 lines of new or
-modified code across the kernel and userspace runtime library — that
-produces an architectural foundation more amenable to
-high-concurrency workloads than the current blocking interface.
+asynchronous model — with completion delivery as a per-submission
+choice across five destinations (sync return, reply cap, port
+message, ring entry, direct upcall) — is a bounded engineering
+effort that produces an architectural foundation more amenable to
+diverse high-concurrency workloads than the current blocking
+interface. Approximately 4,000–9,000 lines of new or modified code
+across the kernel and userspace runtime library; most of the
+destination types reuse existing Telix primitives (capability
+slots, port queues, reply caps), so the genuinely new mechanisms
+are the shared-memory ring layer and the generalised upcall
+registration table.
 
 The Linux personality server's concurrency challenge dissolves
-naturally under this interface: instead of layering concurrency
-machinery on top of a blocking kernel, the personality server uses
-the same event-loop and state-machine pattern that the kernel
-provides as its native interaction model. Other sophisticated
-consumers (language runtimes, distributed service proxies,
-high-throughput servers) benefit equivalently.
+naturally under this interface: rather than layering concurrency
+machinery on top of a blocking kernel, the personality server
+uses whichever of the five runtime patterns fits its workload
+(typically the event-loop pattern for many-concurrent-Linux-process
+service). Other sophisticated consumers (language runtimes using
+the continuation-passing pattern, distributed service proxies
+using the actor pattern, high-throughput I/O servers using the
+event-loop pattern) each pick the destination mix that fits.
+
+Cluster operation is no longer a special case requiring a separate
+substrate: port-message destination delivery routes transparently
+through proxy_srv to remote nodes, and the calling code doesn't
+know whether the completion came from local or remote. The same
+kernel ABI serves single-host and cluster scenarios.
 
 The design is well-anchored in prior art (io_uring, Windows IOCP,
-K42, Mach continuations) without being a direct port of any single
-system. It is achievable with the current Telix codebase, does not
-require restructuring the kernel's internal architecture, and
-preserves the existing syscall semantics — only the invocation and
-result delivery mechanism changes. The conversion is a candidate for
+K42, Mach continuations, Erlang/BEAM, Singularity's contract
+channels) without being a direct port of any single system. It is
+achievable with the current Telix codebase, does not require
+restructuring the kernel's internal architecture, and preserves the
+existing syscall semantics — only the invocation and result
+delivery mechanism changes. The conversion is a candidate for
 serious near-term work once the existing kernel stability and I/O
 infrastructure milestones are sufficiently complete.
 
@@ -800,29 +1118,54 @@ pattern that completion rings would generalise:
 
 ### A.2 What is genuinely new
 
-- **Shared-memory rings.** Today, every IPC submission is a
-  syscall (`sys_send_nb`); even non-blocking calls trap into the
-  kernel. The ring design moves the submit/peek hot path to
+Of the five completion destinations from §2.1:
+
+- **Destinations 1, 2, 3** (sync return, reply cap, port message)
+  reuse existing Telix primitives unchanged. The "new" work is just
+  the per-submission *destination tag* — a small enum the kernel
+  reads from the SQ entry and dispatches against.
+- **Destinations 4 and 5** (ring entry, direct upcall) are the
+  genuinely new mechanisms, with the kernel-side machinery sketched
+  below.
+
+Specifically:
+
+- **Shared-memory rings (destination 4).** Today, every IPC submission
+  is a syscall (`sys_send_nb`); even non-blocking calls trap into
+  the kernel. The ring design moves the submit/peek hot path to
   userspace-only memory accesses, with a syscall only on
   ring-empty/ring-full or explicit wait. That is the qualitative
-  jump in throughput.
+  jump in throughput. Only workloads opting into destination 4 use
+  this path; everything else routes through the existing
+  primitives.
+
 - **A `ring_wait` primitive.** `port_set_recv` is close but
   port-keyed; the new primitive is CQ-keyed and integrates with
   `ring_wait_handle` for the blocking-wrapper case (§3.1).
-- **Generalised upcall delivery.** A signal-style upcall path exists
-  for Linux personality processes (sigaction etc. plumbed in
-  `linux_srv` and the kernel's signal-frame setup), but it is
-  Linux-personality-specific and not exposed to Telix-native
+
+- **Generalised upcall delivery (destination 5).** A signal-style
+  upcall path exists for Linux personality processes (sigaction etc.
+  plumbed in `linux_srv` and the kernel's signal-frame setup), but
+  it is Linux-personality-specific and not exposed to Telix-native
   consumers. The proposed upcall mechanism is a single, native
-  facility — kernel writes a frame, transfers control to a registered
-  handler, returns to the original context on handler exit. The
-  kernel-side mechanics are mostly present; the API surface and
-  per-process registration table are new.
+  facility — kernel writes a frame, transfers control to a
+  registered handler, returns to the original context on handler
+  exit. The kernel-side mechanics are mostly present; the API
+  surface and per-process registration table are new.
+
 - **Per-thread/per-activation ring registration in `Thread`.** Adds
   ring base/length fields to the `Thread` struct in
   `kernel/src/sched/thread.rs`, plus init in
   `scheduler::alloc_thread_id` and teardown in the thread-death
-  path. Mechanical but touches every thread-create site.
+  path. Only allocated when destination 4 is in use. Mechanical but
+  touches every thread-create site.
+
+- **The submission-side destination tag and dispatch table.** A
+  small kernel-side switch in the submission handler that reads the
+  destination tag and routes the eventual completion to the
+  appropriate path. The handler implementations themselves don't
+  change — they still produce a result; the dispatch table just
+  decides where it goes.
 
 ### A.3 Capability semantics in a handle-based world
 
