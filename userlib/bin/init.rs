@@ -11208,6 +11208,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     // exit values).
                     let xeyes_alive_threshold_iter: i32 = 600; // ~6 logical s
                     let mut xeyes_killed_alive = false;
+                    // Step H14b multi-client: after xeyes alive-killed
+                    // confirms one X client connects, fork xclock as a
+                    // second client and verify Xwayland accepts both.
+                    // xclock has more deps (libXaw/libXft/libfontconfig)
+                    // so its startup window can be longer; allow another
+                    // 6 logical s after spawn.
+                    let xclock_alive_threshold_iter: i32 = 600;
+                    let mut xclock_child: u64 = u64::MAX;
+                    let mut xclock_spawned_at_i: i32 = -1;
+                    let mut xclock_resolved = false;
                     // #119: this loop is Category C/D — it runs xeyes
                     // retry scheduling, alive-killed detection, and
                     // heartbeat instrumentation in concert with the
@@ -11240,22 +11250,110 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             syscall::debug_puts(
                                 b": alive-killed (CONNECTED - Xwayland accepted)\n",
                             );
-                            let _ = syscall::kill(xeyes_child);
                             xeyes_attempt_reported = xeyes_attempt;
                             xeyes_killed_alive = true;
-                            // Also kill Xwayland so the H13 reap loop
-                            // below doesn't have to wait the full 10s
-                            // logical / ~minute wallclock budget for
-                            // Xwayland to exit on its own.  Boot 412
-                            // SIGTERMed before reaping completed — kill
-                            // both processes so the next H-step phases
-                            // fit within the 1500s budget.
+                            // H14b: fork xclock as a second X client to
+                            // validate multi-client.  Leave xeyes AND
+                            // Xwayland alive until xclock resolves —
+                            // they're the X server + first client; we
+                            // want both visible to xclock concurrently.
+                            // The xclock-resolved branch below kills
+                            // all three.
+                            syscall::debug_puts(b"  [H14b] forking xclock (second X client)...\n");
+                            let xc = syscall::fork();
+                            if xc == 0 {
+                                for _ in 0..100 {
+                                    let (p, _) = syscall::personality_get();
+                                    if p != 0 { break; }
+                                    syscall::yield_now();
+                                }
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    static XCPATH: &[u8] = b"/xclock\0";
+                                    static XCA0:   &[u8] = b"xclock\0";
+                                    static XCE0:   &[u8] = b"LD_LIBRARY_PATH=/lib64\0";
+                                    static XCE1:   &[u8] = b"DISPLAY=/tmp/.X11-unix/X0\0";
+                                    static XCE2:   &[u8] = b"LANG=C\0";
+                                    static XCE3:   &[u8] = b"LC_ALL=C\0";
+                                    static mut XCLOCK_ARGV: [u64; 2] = [0; 2];
+                                    static mut XCLOCK_ENVP: [u64; 5] = [0; 5];
+                                    XCLOCK_ARGV[0] = XCA0.as_ptr() as u64;
+                                    XCLOCK_ARGV[1] = 0;
+                                    XCLOCK_ENVP[0] = XCE0.as_ptr() as u64;
+                                    XCLOCK_ENVP[1] = XCE1.as_ptr() as u64;
+                                    XCLOCK_ENVP[2] = XCE2.as_ptr() as u64;
+                                    XCLOCK_ENVP[3] = XCE3.as_ptr() as u64;
+                                    XCLOCK_ENVP[4] = 0;
+                                    core::arch::asm!(
+                                        "int 0x80",
+                                        inlateout("rax") 59u64 => _,
+                                        in("rdi") XCPATH.as_ptr() as u64,
+                                        in("rsi") &raw const XCLOCK_ARGV as u64,
+                                        in("rdx") &raw const XCLOCK_ENVP as u64,
+                                        lateout("rcx") _, lateout("r11") _,
+                                    );
+                                    core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 95u64, options(noreturn));
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                { syscall::exit(99); }
+                            } else if xc != u64::MAX {
+                                syscall::personality_set(xc, 2, abi);
+                                xclock_child = xc;
+                                xclock_spawned_at_i = i as i32;
+                            } else {
+                                // Fork failed — treat as resolved (no
+                                // second-client check possible) and fall
+                                // through to the original tear-down.
+                                xclock_resolved = true;
+                            }
+                        }
+
+                        // H14b second-client check: xclock_spawned_at_i
+                        // is set when we forked xclock above.  Wait
+                        // until xclock either exits or survives past
+                        // its alive threshold, then tear everything
+                        // down and break.
+                        if !xclock_resolved
+                            && xclock_spawned_at_i >= 0
+                            && xclock_child != u64::MAX
+                        {
+                            // Check if xclock exited.
+                            if let Some(code) = syscall::waitpid(xclock_child) {
+                                let xcv = code as i64;
+                                if xcv == 0 {
+                                    syscall::debug_puts(
+                                        b"Step H14b xclock: exit=0 (CONNECTED + clean exit)\n",
+                                    );
+                                } else {
+                                    syscall::debug_puts(b"Step H14b xclock: exit=");
+                                    let mut buf = [0u8; 12]; let mut val = xcv as u32; let mut k = 12;
+                                    if val == 0 { k -= 1; buf[k] = b'0'; }
+                                    while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                                    syscall::debug_puts(&buf[k..12]);
+                                    syscall::debug_puts(b" (FAILED to connect)\n");
+                                }
+                                xclock_resolved = true;
+                            } else if (i as i32 - xclock_spawned_at_i)
+                                >= xclock_alive_threshold_iter
+                            {
+                                // xclock has been alive for the full
+                                // threshold without exiting — multi-
+                                // client connect succeeded.
+                                syscall::debug_puts(
+                                    b"Step H14b xclock: alive-killed (CONNECTED - multi-client OK)\n",
+                                );
+                                let _ = syscall::kill(xclock_child);
+                                xclock_resolved = true;
+                            }
+                        }
+
+                        if xclock_resolved && xeyes_killed_alive {
+                            // Now tear everything down.  Original
+                            // alive-killed behaviour: kill xeyes,
+                            // xw_child, set xw_code=0 sentinel for
+                            // PASSED summary.
+                            let _ = syscall::kill(xeyes_child);
                             let _ = syscall::kill(xw_child);
-                            // Set xw_code to a sentinel so the H13
-                            // summary prints PASSED with the same
-                            // signal we sent.  Real xw_exit is still
-                            // captured if reap succeeds before next
-                            // print.
                             xw_code = 0;
                             break;
                         }
