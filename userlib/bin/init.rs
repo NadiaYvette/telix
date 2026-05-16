@@ -11218,6 +11218,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     let mut xclock_child: u64 = u64::MAX;
                     let mut xclock_spawned_at_i: i32 = -1;
                     let mut xclock_resolved = false;
+                    // Step H14c scale: after H14b validates xeyes+xclock
+                    // concurrent, fork N more xeyes processes to verify
+                    // Xwayland + IPC + scheduler handle a heavier
+                    // multi-client load.  Each child must survive its
+                    // own alive-killed threshold (6 logical s after its
+                    // fork).  Mirrors H14b's per-child resolution pattern.
+                    const H14C_XEYES_COUNT: usize = 3;
+                    let mut h14c_started = false;
+                    let mut h14c_children: [u64; H14C_XEYES_COUNT]
+                        = [u64::MAX; H14C_XEYES_COUNT];
+                    let mut h14c_spawned_at: [i32; H14C_XEYES_COUNT]
+                        = [-1; H14C_XEYES_COUNT];
+                    let mut h14c_resolved: [bool; H14C_XEYES_COUNT]
+                        = [false; H14C_XEYES_COUNT];
+                    let mut h14c_passed: [bool; H14C_XEYES_COUNT]
+                        = [false; H14C_XEYES_COUNT];
+                    let mut h14c_reported = false;
                     // #119: this loop is Category C/D — it runs xeyes
                     // retry scheduling, alive-killed detection, and
                     // heartbeat instrumentation in concert with the
@@ -11347,11 +11364,118 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             }
                         }
 
-                        if xclock_resolved && xeyes_killed_alive {
-                            // Now tear everything down.  Original
-                            // alive-killed behaviour: kill xeyes,
-                            // xw_child, set xw_code=0 sentinel for
-                            // PASSED summary.
+                        // H14c scale test: kick off when xclock has
+                        // resolved (success path) — fork N concurrent
+                        // xeyes processes while xeyes (orig) + xclock
+                        // (if still alive but waiting on kill) +
+                        // Xwayland are all still alive.
+                        if xclock_resolved && xeyes_killed_alive && !h14c_started {
+                            h14c_started = true;
+                            syscall::debug_puts(b"  [H14c] forking ");
+                            syscall::debug_putchar(b'0' + H14C_XEYES_COUNT as u8);
+                            syscall::debug_puts(b" concurrent xeyes (scale test)...\n");
+                            for slot in 0..H14C_XEYES_COUNT {
+                                let xc = syscall::fork();
+                                if xc == 0 {
+                                    for _ in 0..100 {
+                                        let (p, _) = syscall::personality_get();
+                                        if p != 0 { break; }
+                                        syscall::yield_now();
+                                    }
+                                    #[cfg(target_arch = "x86_64")]
+                                    unsafe {
+                                        static XPATH: &[u8] = b"/xeyes\0";
+                                        static XA0:   &[u8] = b"xeyes\0";
+                                        static XE0:   &[u8] = b"LD_LIBRARY_PATH=/lib64\0";
+                                        static XE1:   &[u8] = b"DISPLAY=/tmp/.X11-unix/X0\0";
+                                        static XE2:   &[u8] = b"LANG=C\0";
+                                        static XE3:   &[u8] = b"LC_ALL=C\0";
+                                        static mut H14C_XEYES_ARGV: [u64; 2] = [0; 2];
+                                        static mut H14C_XEYES_ENVP: [u64; 5] = [0; 5];
+                                        H14C_XEYES_ARGV[0] = XA0.as_ptr() as u64;
+                                        H14C_XEYES_ARGV[1] = 0;
+                                        H14C_XEYES_ENVP[0] = XE0.as_ptr() as u64;
+                                        H14C_XEYES_ENVP[1] = XE1.as_ptr() as u64;
+                                        H14C_XEYES_ENVP[2] = XE2.as_ptr() as u64;
+                                        H14C_XEYES_ENVP[3] = XE3.as_ptr() as u64;
+                                        H14C_XEYES_ENVP[4] = 0;
+                                        core::arch::asm!(
+                                            "int 0x80",
+                                            inlateout("rax") 59u64 => _,
+                                            in("rdi") XPATH.as_ptr() as u64,
+                                            in("rsi") &raw const H14C_XEYES_ARGV as u64,
+                                            in("rdx") &raw const H14C_XEYES_ENVP as u64,
+                                            lateout("rcx") _, lateout("r11") _,
+                                        );
+                                        core::arch::asm!("int 0x80", in("rax") 231u64, in("rdi") 94u64, options(noreturn));
+                                    }
+                                    #[cfg(not(target_arch = "x86_64"))]
+                                    { syscall::exit(99); }
+                                } else if xc != u64::MAX {
+                                    syscall::personality_set(xc, 2, abi);
+                                    h14c_children[slot] = xc;
+                                    h14c_spawned_at[slot] = i as i32;
+                                } else {
+                                    // Fork failed — count slot as
+                                    // resolved (and failed) so we don't
+                                    // wait on it.
+                                    h14c_resolved[slot] = true;
+                                    h14c_passed[slot] = false;
+                                }
+                            }
+                        }
+
+                        // H14c per-child poll: each child either exits
+                        // (and we record the code) or survives past
+                        // the alive-killed threshold (success).
+                        if h14c_started && !h14c_reported {
+                            let mut all_done = true;
+                            for slot in 0..H14C_XEYES_COUNT {
+                                if h14c_resolved[slot] { continue; }
+                                if h14c_children[slot] == u64::MAX {
+                                    h14c_resolved[slot] = true;
+                                    continue;
+                                }
+                                if let Some(code) = syscall::waitpid(h14c_children[slot]) {
+                                    let xcv = code as i64;
+                                    h14c_resolved[slot] = true;
+                                    h14c_passed[slot] = xcv == 0;
+                                } else if (i as i32 - h14c_spawned_at[slot])
+                                    >= xeyes_alive_threshold_iter
+                                {
+                                    let _ = syscall::kill(h14c_children[slot]);
+                                    h14c_resolved[slot] = true;
+                                    h14c_passed[slot] = true;
+                                } else {
+                                    all_done = false;
+                                }
+                            }
+                            if all_done {
+                                let mut alive_count = 0u32;
+                                for slot in 0..H14C_XEYES_COUNT {
+                                    if h14c_passed[slot] {
+                                        alive_count += 1;
+                                    }
+                                }
+                                syscall::debug_puts(b"Step H14c xeyes scale: ");
+                                syscall::debug_putchar(b'0' + alive_count as u8);
+                                syscall::debug_puts(b"/");
+                                syscall::debug_putchar(b'0' + H14C_XEYES_COUNT as u8);
+                                syscall::debug_puts(b" CONNECTED ");
+                                if alive_count as usize == H14C_XEYES_COUNT {
+                                    syscall::debug_puts(b"(PASSED)\n");
+                                } else {
+                                    syscall::debug_puts(b"(FAILED)\n");
+                                }
+                                h14c_reported = true;
+                            }
+                        }
+
+                        // Final tear-down: after H14b passes AND H14c
+                        // reports (success or partial), kill everyone.
+                        if xclock_resolved && xeyes_killed_alive
+                            && (h14c_reported || !h14c_started)
+                        {
                             let _ = syscall::kill(xeyes_child);
                             let _ = syscall::kill(xw_child);
                             xw_code = 0;
