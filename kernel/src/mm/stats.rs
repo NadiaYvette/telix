@@ -25,6 +25,18 @@ pub static PT_COW_BREAKS: AtomicU64 = AtomicU64::new(0);
 pub static KSWAPD_SCANS: AtomicU64 = AtomicU64::new(0);
 pub static KSWAPD_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 pub static SWAP_SLOTS_DUPED: AtomicU64 = AtomicU64::new(0);
+/// #164 Number of balance-set whole-process evictions (suspend_task
+/// triggers fired by sys_spawn admission or kswapd starvation).
+pub static BALANCE_SET_EVICTS: AtomicU64 = AtomicU64::new(0);
+/// #164 Total threads transitioned to SuspendedMemPressure across all
+/// balance-set evictions.
+pub static BALANCE_SET_SUSPENDED: AtomicU64 = AtomicU64::new(0);
+/// #164 Number of admission gate refusals (after balance-set evict
+/// failed to free enough headroom).
+pub static ADMISSION_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// #164 Number of admission gate recoveries (balance-set evict freed
+/// enough memory to satisfy the spawn).
+pub static ADMISSION_RECOVERIES: AtomicU64 = AtomicU64::new(0);
 
 pub fn print() {
     crate::println!("  VM stats:");
@@ -116,5 +128,15 @@ pub fn print() {
     crate::println!(
         "    Swap slots duped: {}",
         SWAP_SLOTS_DUPED.load(Ordering::Relaxed)
+    );
+    crate::println!(
+        "    Balance-set evictions: {}  (threads suspended total: {})",
+        BALANCE_SET_EVICTS.load(Ordering::Relaxed),
+        BALANCE_SET_SUSPENDED.load(Ordering::Relaxed),
+    );
+    crate::println!(
+        "    Admission gate: refusals={}  recoveries={}",
+        ADMISSION_REFUSALS.load(Ordering::Relaxed),
+        ADMISSION_RECOVERIES.load(Ordering::Relaxed),
     );
 }

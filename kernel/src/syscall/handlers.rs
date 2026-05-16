@@ -1583,14 +1583,39 @@ fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64, arg0: u64) -> u64 {
             .saturating_add(ADMISSION_ESTIMATED_NEW_WS_MMU_PAGES)
             .saturating_add(reserve);
         if demand > total_pages {
+            // #164 Stage 5: rather than failing the spawn immediately,
+            // ask the long-term scheduler to evict the largest existing
+            // working set (whole-process suspend).  If that frees up
+            // enough headroom, re-check admission and proceed.  This is
+            // the VMS-style balance-set policy: when memory is too
+            // crowded for a new arrival, suspend an existing tenant
+            // wholesale rather than letting everyone thrash.
+            let evicted =
+                crate::sched::scheduler::try_balance_set_evict();
+            let (_total_after, _free_after) = crate::mm::phys::stats();
+            let ws_total_after = crate::mm::aspace::total_working_set();
+            let demand_after = ws_total_after
+                .saturating_add(ADMISSION_ESTIMATED_NEW_WS_MMU_PAGES)
+                .saturating_add(reserve);
+            if demand_after > total_pages {
+                crate::mm::stats::ADMISSION_REFUSALS
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                crate::println!(
+                    "[sys_spawn] admission REFUSED (post-evict): ws={} + new={} + reserve={} > total={} evict={:?}",
+                    ws_total_after,
+                    ADMISSION_ESTIMATED_NEW_WS_MMU_PAGES,
+                    reserve,
+                    total_pages,
+                    evicted,
+                );
+                return u64::MAX;
+            }
+            crate::mm::stats::ADMISSION_RECOVERIES
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             crate::println!(
-                "[sys_spawn] admission REFUSED: ws_total={} + new_est={} + reserve={} > total={}",
-                ws_total,
-                ADMISSION_ESTIMATED_NEW_WS_MMU_PAGES,
-                reserve,
-                total_pages,
+                "[sys_spawn] admission RECOVERED via balance-set evict={:?} ws_before={} ws_after={}",
+                evicted, ws_total, ws_total_after,
             );
-            return u64::MAX;
         }
     }
 

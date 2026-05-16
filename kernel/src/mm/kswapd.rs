@@ -71,9 +71,43 @@ pub fn kswapd() -> ! {
     // Round-robin index into the aspace registry.
     let mut rr_idx: usize = 0;
 
+    // #164 balance-set trigger: count consecutive scans where free
+    // stays below the LOW watermark.  When this stays starved across
+    // BALANCE_SET_TRIGGER_THRESHOLD scans, working-set trimming alone
+    // has failed to relieve pressure and we promote to whole-process
+    // suspend.
+    let mut starved_streak: u32 = 0;
+    const BALANCE_SET_TRIGGER_THRESHOLD: u32 = 8;
+    // Cool-down to avoid suspending a second tenant on the same
+    // pressure event before the first eviction's pages have time to be
+    // observed and reclaimed by subsequent scans.
+    let mut evict_cooldown: u32 = 0;
+    const EVICT_COOLDOWN_SCANS: u32 = 16;
+
     loop {
-        let (_, free) = phys::stats();
+        let (total, free) = phys::stats();
         let hi = high_watermark();
+
+        // #164 If we're well above the high watermark and tasks remain
+        // suspended for memory pressure, resume one.  Threshold: free
+        // exceeds 1.5× the high watermark (i.e., we've recovered with
+        // real headroom to spare).  Resuming greedily would cause an
+        // immediate re-entry into pressure, so we only do this when
+        // free is comfortable.
+        let resume_threshold = hi.saturating_add(hi >> 1);
+        if free >= resume_threshold {
+            if let Some(rid) =
+                crate::sched::scheduler::try_balance_set_resume()
+            {
+                crate::println!(
+                    "[kswapd] BALANCE-SET resume task={} free={} threshold={} total={}",
+                    rid, free, resume_threshold, total,
+                );
+                // Continue rather than block — the resumed task may
+                // immediately allocate; we want to be responsive.
+                continue;
+            }
+        }
 
         if free >= hi {
             // Enough free pages — block until woken.
@@ -139,5 +173,31 @@ pub fn kswapd() -> ! {
         // admission control.
         super::aspace::update_working_set(aspace_id, result.pages_referenced as u32);
         super::stats::KSWAPD_SCANS.fetch_add(1, Ordering::Relaxed);
+
+        // #164 balance-set escalation.  Re-sample free *after* the scan
+        // and decide whether working-set trimming is keeping up.  If
+        // pressure persists across BALANCE_SET_TRIGGER_THRESHOLD
+        // consecutive scans, promote to whole-process suspend.
+        let (_, free_after) = phys::stats();
+        if free_after < low_watermark() {
+            starved_streak = starved_streak.saturating_add(1);
+        } else {
+            starved_streak = 0;
+        }
+        if evict_cooldown > 0 {
+            evict_cooldown -= 1;
+        } else if starved_streak >= BALANCE_SET_TRIGGER_THRESHOLD {
+            let outcome =
+                crate::sched::scheduler::try_balance_set_evict();
+            crate::println!(
+                "[kswapd] BALANCE-SET trigger free={} low={} streak={} outcome={:?}",
+                free_after,
+                low_watermark(),
+                starved_streak,
+                outcome,
+            );
+            starved_streak = 0;
+            evict_cooldown = EVICT_COOLDOWN_SCANS;
+        }
     }
 }

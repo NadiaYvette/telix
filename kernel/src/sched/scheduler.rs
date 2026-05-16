@@ -4267,8 +4267,139 @@ pub fn last_suspend_count() -> u32 {
     LAST_SUSPEND_COUNT.load(Ordering::Relaxed)
 }
 
+/// #164 Pick the best suspend candidate for memory-pressure eviction.
+/// Selection criterion: maximum working-set among non-kernel,
+/// non-already-suspended tasks.  Larger WS means more memory reclaimed
+/// per suspend.  Returns None if no eligible candidate exists.
+///
+/// Future iterations can refine the score (priority weighting,
+/// last-touched-time bias, balance-set tunables).  For now: just WS.
+pub fn pick_suspend_candidate() -> Option<u32> {
+    let mut best_task_id: Option<u32> = None;
+    let mut best_ws: u32 = 0;
+    SCHED_TASK_ART.for_each(|key, val| {
+        let task_id = key as u32;
+        if task_id == 0 {
+            return;  // kernel task — never suspend
+        }
+        let task = unsafe { &*(val as *const Task) };
+        if !task.active || task.exited {
+            return;
+        }
+        let aspace_id = task.aspace_id;
+        if aspace_id == 0 {
+            return;  // no aspace, nothing to evict
+        }
+        // Skip if ANY thread of this task is already SuspendedMemPressure.
+        let mut already_suspended = false;
+        SCHED_THREAD_ART.for_each(|tkey, tval| {
+            let t = unsafe { &*(tval as *const Thread) };
+            if t.task_id == task_id
+                && t.state == ThreadState::Blocked
+                && matches!(t.blocked_on, BlockReason::SuspendedMemPressure)
+            {
+                already_suspended = true;
+                let _ = tkey;
+            }
+        });
+        if already_suspended {
+            return;
+        }
+        let ws = crate::mm::aspace::working_set(aspace_id);
+        if ws > best_ws {
+            best_ws = ws;
+            best_task_id = Some(task_id);
+        }
+    });
+    best_task_id
+}
+
+/// #164 Try to evict an existing task's working set wholesale to relieve
+/// memory pressure.  Picks a candidate via `pick_suspend_candidate`,
+/// suspends its threads, then aggressively scans its aspace with WSCLOCK
+/// to drive eviction.  Returns Some((task_id, pages_freed)) on success,
+/// None if no candidate or eviction failed.
+///
+/// Note: the FIRST scan immediately after suspend mostly just clears
+/// access bits (since the threads were just running).  The actual
+/// eviction happens on subsequent kswapd cycles — the suspended threads
+/// don't touch their pages, so the bits stay clear and the pages
+/// become reclaim-eligible.  This function returns immediately after
+/// kicking off the first scan; full reclaim takes 1-2 more kswapd
+/// cycles.
+pub fn try_balance_set_evict() -> Option<(u32, usize)> {
+    let candidate = pick_suspend_candidate()?;
+    let task = task_ref(candidate);
+    // Re-validate post-pick: between iteration and suspend, the task
+    // could have exited and its slot been recycled.  If active is
+    // false now, bail rather than suspend a fresh tenant of the same
+    // slot.
+    if !task.active || task.exited {
+        return None;
+    }
+    let aspace_id = task.aspace_id;
+    if aspace_id == 0 {
+        return None;
+    }
+    let ws_before = crate::mm::aspace::working_set(aspace_id);
+    let transitioned = suspend_task(candidate);
+    if transitioned == 0 {
+        return None;
+    }
+    // Aggressive first-pass scan to clear access bits.  Use a target
+    // 4× the kswapd cadence so we sweep the full aspace if reasonable.
+    let target = (ws_before as usize).saturating_mul(2).max(256);
+    let scan = crate::mm::wsclock::scan(aspace_id, target);
+    crate::mm::stats::BALANCE_SET_EVICTS
+        .fetch_add(1, Ordering::Relaxed);
+    crate::mm::stats::BALANCE_SET_SUSPENDED
+        .fetch_add(transitioned as u64, Ordering::Relaxed);
+    crate::println!(
+        "[mem-sched] EVICT task={} aspace={} ws_before={} suspended={} target={} freed={} cleared={}",
+        candidate, aspace_id, ws_before, transitioned, target,
+        scan.pages_freed, scan.ptes_cleared,
+    );
+    Some((candidate, scan.pages_freed))
+}
+
 pub fn last_resume_count() -> u32 {
     LAST_RESUME_COUNT.load(Ordering::Relaxed)
+}
+
+/// #164 Find one suspended task to resume.  Simple FIFO-ish policy:
+/// return the lowest-task_id task that has at least one
+/// SuspendedMemPressure thread.  No timestamps required — when more
+/// than one task is suspended, prefer the one allocated earliest as a
+/// rough age proxy.  Future iterations could track a "suspended_at"
+/// timestamp on Task for true FIFO, but for now the task_id is good
+/// enough since task IDs are assigned in approximately allocation
+/// order.
+pub fn pick_resume_candidate() -> Option<u32> {
+    let mut best: Option<u32> = None;
+    SCHED_THREAD_ART.for_each(|_, val| {
+        let t = unsafe { &*(val as *const Thread) };
+        if t.state == ThreadState::Blocked
+            && matches!(t.blocked_on, BlockReason::SuspendedMemPressure)
+        {
+            match best {
+                None => best = Some(t.task_id),
+                Some(prev) if t.task_id < prev => best = Some(t.task_id),
+                _ => {}
+            }
+        }
+    });
+    best
+}
+
+/// #164 Try to resume a suspended task when memory pressure has eased.
+/// Returns Some(task_id) if one was resumed.
+pub fn try_balance_set_resume() -> Option<u32> {
+    let candidate = pick_resume_candidate()?;
+    let transitioned = resume_task(candidate);
+    if transitioned == 0 {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// Called on syscall return. If need_resched was set (by wake_thread or a
