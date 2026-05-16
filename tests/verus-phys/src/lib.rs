@@ -234,4 +234,105 @@ proof fn lemma_inline_does_not_corrupt_owner(own: u64, inline_bits: u64)
 {
 }
 
+// ── State-machine bit-level lemmas ─────────────────────────────────
+//
+// The chunk-level invariant `bitmap.count_ones() == fc` (for the
+// bitmap-mode subset) must be preserved across every alloc/free call.
+// The bitmap-CAS step does the work: alloc clears a set bit, free
+// sets a clear bit.
+//
+// Verus's bit_vector solver doesn't reason natively about
+// `u64::count_ones()` (it's outside SMT-LIB's bit-vector theory), so
+// we factor the proof:
+//
+//   (a) prove the BIT-LEVEL change: that exactly the target bit
+//       differs between bmp and new_bmp, every other bit unchanged
+//       (this lemma family, bit_vector-discharged below)
+//   (b) defer popcount-delta-by-1 to a separate spec `popcnt` and
+//       prove it by induction once — left to a future iteration
+//
+// The bit-level lemmas already pin the structural fact that lets
+// (b) follow: if exactly one bit changes from 1→0, popcount drops
+// by 1; if exactly one bit changes from 0→1, popcount rises by 1.
+
+/// alloc bitmap-CAS step: clearing one set bit changes EXACTLY that
+/// bit from 1 to 0, every other bit unchanged.  Combined with a
+/// popcount lemma (future), this gives `count_ones(new_bmp) ==
+/// count_ones(bmp) - 1` whenever the chosen bit was set.
+#[verifier::bit_vector]
+proof fn lemma_alloc_clears_exactly_target_bit(bmp: u64, bit: u64)
+    requires
+        bit < 64,
+        (bmp >> bit) & 1 == 1,
+    ensures
+        // The target bit is now 0:
+        ((bmp & !(1u64 << bit)) >> bit) & 1 == 0,
+        // Every OTHER bit unchanged:
+        forall|j: u64|
+            j < 64 && j != bit
+                ==> ((bmp & !(1u64 << bit)) >> j) & 1 == (bmp >> j) & 1,
+{
+}
+
+/// free bitmap-CAS step: setting one clear bit changes EXACTLY that
+/// bit from 0 to 1, every other bit unchanged.
+#[verifier::bit_vector]
+proof fn lemma_free_sets_exactly_target_bit(bmp: u64, bit: u64)
+    requires
+        bit < 64,
+        (bmp >> bit) & 1 == 0,
+    ensures
+        ((bmp | (1u64 << bit)) >> bit) & 1 == 1,
+        forall|j: u64|
+            j < 64 && j != bit
+                ==> ((bmp | (1u64 << bit)) >> j) & 1 == (bmp >> j) & 1,
+{
+}
+
+/// Double-free detection: `new_bmp == bmp` iff the target bit was
+/// already set in bmp.  This is the c525ce0 commit's invariant —
+/// the early-return path catches exactly the case where the bit is
+/// already free.
+#[verifier::bit_vector]
+proof fn lemma_free_no_op_iff_already_free(bmp: u64, bit: u64)
+    requires
+        bit < 64,
+    ensures
+        (bmp | (1u64 << bit)) == bmp <==> (bmp >> bit) & 1 == 1,
+{
+}
+
+/// Alloc retry correctness: clearing the same bit twice is idempotent.
+/// If chunk_alloc_one's bitmap CAS fails and we retry, the new bmp
+/// might have the bit already cleared (by another thread); applying
+/// our clear-the-same-bit again is a no-op.  This makes the retry
+/// safe and the outer loop's invariant inductive.
+#[verifier::bit_vector]
+proof fn lemma_clear_bit_idempotent(bmp: u64, bit: u64)
+    requires
+        bit < 64,
+    ensures
+        ((bmp & !(1u64 << bit)) & !(1u64 << bit)) == (bmp & !(1u64 << bit)),
+{
+}
+
+/// Lowest-set-bit (trailing_zeros) is set: if any bit is set in bmp,
+/// then the trailing_zeros position has bit value 1.  This is the
+/// precondition chunk_alloc_one uses when calling
+/// `bmp.trailing_zeros()` — without this, the subsequent
+/// `(bmp >> tz) & 1 == 1` would not be a known fact for downstream
+/// lemmas.
+///
+/// Phrased indirectly to avoid needing trailing_zeros support: for
+/// any specific bit b that is set in bmp, the conjunction holds.
+#[verifier::bit_vector]
+proof fn lemma_set_bit_observed(bmp: u64, bit: u64)
+    requires
+        bit < 64,
+        bmp & (1u64 << bit) != 0,
+    ensures
+        (bmp >> bit) & 1 == 1,
+{
+}
+
 } // verus!
