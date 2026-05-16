@@ -19,6 +19,13 @@ pub struct ScanResult {
     pub pages_scanned: usize,
     pub ptes_cleared: usize,
     pub pages_freed: usize,
+    /// #160 working-set probe: count of PTEs the scan observed with
+    /// the hardware access bit SET (i.e., referenced since the last
+    /// pass).  Sum across an aspace's worth of scans approximates
+    /// Denning's working-set window for the time between scans.  Used
+    /// by `kswapd` to maintain a per-aspace WS estimate that feeds
+    /// admission control for `sys_spawn`.
+    pub pages_referenced: usize,
 }
 
 /// Run the WSCLOCK scan on the given address space, trying to reclaim
@@ -33,6 +40,7 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
             pages_scanned: 0,
             ptes_cleared: 0,
             pages_freed: 0,
+            pages_referenced: 0,
         };
 
         let total_mmu_pages = aspace.vmas.total_mmu_pages();
@@ -83,6 +91,12 @@ pub fn scan(aspace_id: ASpaceId, target_pages: usize) -> ScanResult {
                     }
 
                     let referenced = read_and_clear_ref_bit(pt_root, va);
+                    if referenced {
+                        // #160 working-set probe: count pages that were
+                        // accessed since the last scan.  Sum across scans
+                        // approximates the aspace's working set.
+                        result.pages_referenced += 1;
+                    }
 
                     if !referenced {
                         // Skip eviction if this page is in a superpage range

@@ -106,6 +106,10 @@ pub fn kswapd() -> ! {
             super::stats::KSWAPD_RECLAIMED
                 .fetch_add(result.pages_freed as u64, Ordering::Relaxed);
         }
+        // #160 working-set tracking: feed observed access-bit count
+        // back into the per-aspace EWMA estimate.  Used by sys_spawn
+        // admission control.
+        super::aspace::update_working_set(aspace_id, result.pages_referenced as u32);
         super::stats::KSWAPD_SCANS.fetch_add(1, Ordering::Relaxed);
     }
 }

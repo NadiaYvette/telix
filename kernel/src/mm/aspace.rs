@@ -234,6 +234,11 @@ struct ASpaceEntry {
     /// Per-aspace pager waiter thread ID (0 = none). Accessed atomically
     /// without holding the per-aspace lock.
     pager_waiter: AtomicU32,
+    /// #160 working-set estimate (Denning's working-set approximation).
+    /// Updated from kswapd after each WSCLOCK scan with an EWMA-decayed
+    /// count of PTEs observed with the hardware access bit set.  Read
+    /// lock-free by `working_set()` for admission control in sys_spawn.
+    ws_pages_recent: AtomicU32,
     /// The actual address space data, protected by a per-entry lock.
     inner: SpinLock<AddressSpace>,
 }
@@ -352,6 +357,50 @@ pub fn clear_pager_waiter(id: ASpaceId) {
     set_pager_waiter(id, 0);
 }
 
+/// #160 Read the current working-set estimate (in MMU pages) for an
+/// aspace.  Lock-free.  Returns 0 if the aspace is gone or never
+/// scanned.
+pub fn working_set(id: ASpaceId) -> u32 {
+    match resolve_entry(id) {
+        Some(entry_ptr) => {
+            let entry = unsafe { &*entry_ptr };
+            entry.ws_pages_recent.load(Ordering::Relaxed)
+        }
+        None => 0,
+    }
+}
+
+/// #160 Update the working-set estimate for an aspace.  Called from
+/// `kswapd` after each WSCLOCK scan.  Uses an EWMA with α=1/2 so a
+/// single scan can't dominate but the estimate tracks changes
+/// reasonably.  The input is the count of MMU pages observed with
+/// the hardware access bit set in this scan.
+pub fn update_working_set(id: ASpaceId, scan_referenced: u32) {
+    if let Some(entry_ptr) = resolve_entry(id) {
+        let entry = unsafe { &*entry_ptr };
+        // EWMA: new = (old + sample) / 2.  Bounded: a single all-zero
+        // scan halves the estimate; sustained high activity converges
+        // upward.
+        let prev = entry.ws_pages_recent.load(Ordering::Relaxed);
+        let next = (prev / 2).saturating_add(scan_referenced);
+        entry.ws_pages_recent.store(next, Ordering::Relaxed);
+    }
+}
+
+/// #160 Sum of `working_set()` across all active aspaces.  Used by
+/// `sys_spawn`'s admission-control gate to decide whether the system
+/// has enough free pages to accept a new process.  O(num_aspaces) —
+/// callable from spawn paths which are not on any hot loop.
+pub fn total_working_set() -> u64 {
+    let ids = active_aspace_ids();
+    let mut total: u64 = 0;
+    for i in 0..ids.len {
+        let id = ids.ids[i];
+        total = total.saturating_add(working_set(id) as u64);
+    }
+    total
+}
+
 // ---------------------------------------------------------------------------
 // Create / Destroy / Reset
 // ---------------------------------------------------------------------------
@@ -387,6 +436,7 @@ pub fn create(page_table_root: usize) -> Option<ASpaceId> {
     unsafe {
         (*ptr).port_id = port_id;
         (*ptr).pager_waiter = AtomicU32::new(0);
+        (*ptr).ws_pages_recent = AtomicU32::new(0);
         let mut space = AddressSpace::empty();
         space.id = port_id;
         space.page_table_root = page_table_root;
