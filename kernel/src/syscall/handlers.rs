@@ -1497,6 +1497,43 @@ fn sys_get_timer_freq() -> u64 {
 }
 
 fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64, arg0: u64) -> u64 {
+    // #160 memory-scheduler admission gate.  Refuse the spawn if the
+    // sum of all running aspaces' working-set estimates plus the new
+    // process's estimated WS plus a small reserve would exceed total
+    // memory.  Prevents over-commit thrashing that Linux just lets
+    // OOM-kill its way out of.
+    //
+    // Constants:
+    //   ADMISSION_ESTIMATED_NEW_WS_MMU_PAGES — first-guess WS for the
+    //     new process before any WSCLOCK observations.  64 MMU pages
+    //     × 64 KB = 4 MB, reasonable for a small statically-linked
+    //     init service.  Once the new process has been running, its
+    //     real WS replaces this estimate.
+    //   ADMISSION_RESERVE_FRACTION_INV — keep at least 1/N of total
+    //     memory free for kernel allocations and recovery from
+    //     emergencies.  N=20 → 5% reserve.
+    {
+        const ADMISSION_ESTIMATED_NEW_WS_MMU_PAGES: u64 = 64;
+        const ADMISSION_RESERVE_FRACTION_INV: u64 = 20;
+        let (total_pages, _free) = crate::mm::phys::stats();
+        let total_pages = total_pages as u64;
+        let ws_total = crate::mm::aspace::total_working_set();
+        let reserve = total_pages / ADMISSION_RESERVE_FRACTION_INV;
+        let demand = ws_total
+            .saturating_add(ADMISSION_ESTIMATED_NEW_WS_MMU_PAGES)
+            .saturating_add(reserve);
+        if demand > total_pages {
+            crate::println!(
+                "[sys_spawn] admission REFUSED: ws_total={} + new_est={} + reserve={} > total={}",
+                ws_total,
+                ADMISSION_ESTIMATED_NEW_WS_MMU_PAGES,
+                reserve,
+                total_pages,
+            );
+            return u64::MAX;
+        }
+    }
+
     // Enforce RLIMIT_NPROC: count active tasks owned by the same uid (lock-free).
     {
         let task_id = crate::sched::current_task_id();
