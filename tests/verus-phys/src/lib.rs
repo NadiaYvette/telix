@@ -344,116 +344,119 @@ proof fn lemma_set_bit_observed(bmp: u64, bit: u64)
 // step case (bit > 0) are each discharged by inlined bit_vector
 // helpers that pin the shift-and-mask arithmetic.
 
-/// Spec popcount: recursive over the bits of x.  Decreases via the
-/// nat view of x because Verus needs a well-founded order for the
-/// termination proof.
-spec fn popcnt(x: u64) -> nat
-    decreases x when x > 0
-    via decreases_popcnt
+/// Spec popcount as a sum over bit positions [i, 64).  Indexing on
+/// the start position makes the well-founded order `(64 - i)`, which
+/// Verus handles directly without needing a `decreases_by` witness.
+///
+/// `popcnt(x) = popcnt_from(x, 0)` is the user-facing entry point.
+spec fn popcnt_from(x: u64, i: u64) -> nat
+    decreases (64 - i) as int
 {
-    if x == 0 {
+    if i >= 64 {
         0
     } else {
-        (x & 1) as nat + popcnt(x >> 1)
+        (if (x >> i) & 1u64 == 1 { 1nat } else { 0nat })
+            + popcnt_from(x, (i + 1) as u64)
     }
 }
 
-#[verifier::decreases_by]
-proof fn decreases_popcnt(x: u64) {
-    assert(x > 0 ==> (x >> 1) < x) by (bit_vector);
+spec fn popcnt(x: u64) -> nat {
+    popcnt_from(x, 0)
 }
 
-/// Helper: when bit > 0, clearing bit `bit` from `bmp` doesn't touch
-/// bit 0 — `(bmp & !(1<<bit)) & 1 == bmp & 1`.
-#[verifier::bit_vector]
-proof fn lemma_clear_high_bit_keeps_low(bmp: u64, bit: u64)
-    requires
-        0 < bit < 64,
-    ensures
-        (bmp & !(1u64 << bit)) & 1 == bmp & 1,
-{
-}
-
-/// Helper: when bit > 0, shifting after clearing bit `bit` equals
-/// clearing bit `bit-1` after shifting — i.e.
-/// `(bmp & !(1<<bit)) >> 1 == (bmp >> 1) & !(1 << (bit-1))`.
-#[verifier::bit_vector]
-proof fn lemma_clear_shift_commutes(bmp: u64, bit: u64)
-    requires
-        0 < bit < 64,
-    ensures
-        (bmp & !(1u64 << bit)) >> 1 == (bmp >> 1) & !(1u64 << ((bit - 1) as u64)),
-{
-}
-
-/// Helper: bit-set status is preserved across the shift — if bit `bit`
-/// (for bit > 0) is set in bmp, then bit `bit-1` is set in `bmp >> 1`.
-#[verifier::bit_vector]
-proof fn lemma_set_bit_shifts(bmp: u64, bit: u64)
-    requires
-        0 < bit < 64,
-        (bmp >> bit) & 1 == 1,
-    ensures
-        ((bmp >> 1) >> ((bit - 1) as u64)) & 1 == 1,
-{
-}
-
-/// Mirror helpers for the free-side proof (setting a clear bit).
-/// These bit_vector-discharged lemmas are needed for the future
-/// popcnt-set-bit induction (deferred — see below).
-#[verifier::bit_vector]
-proof fn lemma_set_high_bit_keeps_low(bmp: u64, bit: u64)
-    requires
-        0 < bit < 64,
-    ensures
-        (bmp | (1u64 << bit)) & 1 == bmp & 1,
-{
-}
-
-#[verifier::bit_vector]
-proof fn lemma_set_shift_commutes(bmp: u64, bit: u64)
-    requires
-        0 < bit < 64,
-    ensures
-        (bmp | (1u64 << bit)) >> 1 == (bmp >> 1) | (1u64 << ((bit - 1) as u64)),
-{
-}
-
-#[verifier::bit_vector]
-proof fn lemma_clear_bit_shifts(bmp: u64, bit: u64)
-    requires
-        0 < bit < 64,
-        (bmp >> bit) & 1 == 0,
-    ensures
-        ((bmp >> 1) >> ((bit - 1) as u64)) & 1 == 0,
-{
-}
-
-// ── Popcount-by-1 induction (DEFERRED) ─────────────────────────────
+// ── Popcount-by-1 induction ────────────────────────────────────────
 //
-// The full proof obligations:
+// Connecting the bit-level changes (the structural lemmas above) to
+// the numeric popcnt delta.  Strategy: induct on the bit-position
+// index `i` of popcnt_from, with `decreases (64 - i)`.
 //
-//   proof fn lemma_popcnt_clear_bit(bmp: u64, bit: u64)
-//     requires bit < 64, (bmp >> bit) & 1 == 1
-//     ensures  popcnt(bmp & !(1u64 << bit)) + 1 == popcnt(bmp)
-//
-//   proof fn lemma_popcnt_set_bit(bmp: u64, bit: u64)
-//     requires bit < 64, (bmp >> bit) & 1 == 0
-//     ensures  popcnt(bmp | (1u64 << bit)) == popcnt(bmp) + 1
-//
-// These require induction over `bit` with `decreases bit`, manual
-// unfolding of `popcnt` at each level, and chaining the bit_vector
-// helpers above.  Drafted but the manual-unfold tactic interplay with
-// Verus's SMT trigger heuristics didn't converge in this session.
-//
-// The bit-level structure is already proven (the lemmas above), so
-// the popcnt-delta-by-1 follows from those + induction.  Left as a
-// follow-up iteration: try `reveal_with_fuel(popcnt, N)` or convert to
-// state-machine style with vstd::map / Seq<bool> intermediary.
-//
-// All other lemmas (encoding round-trip, inline-slot round-trip,
-// field non-overlap, bit-level alloc/free changes, idempotence,
-// double-free no-op iff, set-bit observed) ARE verified and form a
-// reusable library for the future state-machine proof.
+// Helper lemma for both clear and set: prove the change-by-1 holds at
+// every prefix popcnt_from(_, i).  The user-facing lemmas
+// `lemma_popcnt_clear_bit` / `lemma_popcnt_set_bit` are corollaries
+// at i == 0.
+
+/// Helper: clearing bit `b` from bmp drops `popcnt_from(_, i)` by 1
+/// when `i <= b` (the bit is still in the [i, 64) summation range)
+/// and by 0 when `i > b` (the bit is already past i, not summed).
+proof fn lemma_popcnt_from_clear_bit(bmp: u64, b: u64, i: u64)
+    requires
+        b < 64,
+        i <= 64,
+        (bmp >> b) & 1 == 1,
+    ensures
+        popcnt_from(bmp & !(1u64 << b), i) + (if i <= b { 1nat } else { 0nat })
+            == popcnt_from(bmp, i),
+    decreases (64 - i) as int,
+{
+    if i < 64 {
+        let cleared = bmp & !(1u64 << b);
+        if i == b {
+            // At i == b, the bit-i-term differs by 1: bmp has it set,
+            // cleared has it clear.  Apply IH to (i+1).
+            assert((cleared >> i) & 1u64 == 0) by (bit_vector)
+                requires cleared == bmp & !(1u64 << b), i == b;
+            lemma_popcnt_from_clear_bit(bmp, b, (i + 1) as u64);
+        } else {
+            // At i != b, both bitmaps agree on bit i.  Apply IH to (i+1).
+            assert((cleared >> i) & 1u64 == (bmp >> i) & 1u64) by (bit_vector)
+                requires
+                    cleared == bmp & !(1u64 << b),
+                    b < 64, i < 64, i != b;
+            lemma_popcnt_from_clear_bit(bmp, b, (i + 1) as u64);
+        }
+    }
+}
+
+/// User-facing: alloc's bitmap-CAS preserves the inductive invariant
+/// `bitmap.count_ones() == fc` modulo the matching `fc -= 1`.
+proof fn lemma_popcnt_clear_bit(bmp: u64, b: u64)
+    requires
+        b < 64,
+        (bmp >> b) & 1 == 1,
+    ensures
+        popcnt(bmp & !(1u64 << b)) + 1 == popcnt(bmp),
+{
+    lemma_popcnt_from_clear_bit(bmp, b, 0);
+}
+
+/// Mirror for free: setting a clear bit raises popcnt_from by 1
+/// when i <= b, 0 otherwise.
+proof fn lemma_popcnt_from_set_bit(bmp: u64, b: u64, i: u64)
+    requires
+        b < 64,
+        i <= 64,
+        (bmp >> b) & 1 == 0,
+    ensures
+        popcnt_from(bmp, i) + (if i <= b { 1nat } else { 0nat })
+            == popcnt_from(bmp | (1u64 << b), i),
+    decreases (64 - i) as int,
+{
+    if i < 64 {
+        let set = bmp | (1u64 << b);
+        if i == b {
+            assert((set >> i) & 1u64 == 1) by (bit_vector)
+                requires set == bmp | (1u64 << b), i == b, b < 64;
+            lemma_popcnt_from_set_bit(bmp, b, (i + 1) as u64);
+        } else {
+            assert((set >> i) & 1u64 == (bmp >> i) & 1u64) by (bit_vector)
+                requires
+                    set == bmp | (1u64 << b),
+                    b < 64, i < 64, i != b;
+            lemma_popcnt_from_set_bit(bmp, b, (i + 1) as u64);
+        }
+    }
+}
+
+/// User-facing: free's bitmap-CAS preserves the inductive invariant
+/// `bitmap.count_ones() == fc` modulo the matching `fc += 1`.
+proof fn lemma_popcnt_set_bit(bmp: u64, b: u64)
+    requires
+        b < 64,
+        (bmp >> b) & 1 == 0,
+    ensures
+        popcnt(bmp | (1u64 << b)) == popcnt(bmp) + 1,
+{
+    lemma_popcnt_from_set_bit(bmp, b, 0);
+}
 
 } // verus!
