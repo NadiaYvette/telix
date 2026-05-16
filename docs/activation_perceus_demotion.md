@@ -101,6 +101,17 @@ running, which are idle, and when transitions between these states
 occur.** The kernel does not make scheduling decisions that are
 invisible to the runtime.
 
+The kernel's activation upcall mechanism supports two distinct
+runtime models above it (see §2.5 of
+`completion_based_syscalls.md`): an *event-loop* model where the
+runtime drains a completion queue and dispatches handlers by handle,
+and a *continuation-passing* model where each operation submission
+carries a continuation that the kernel invokes directly on
+completion via upcall. Both models are first-class consumers of
+the same kernel facility; the demotion protocol below is described
+under both, since the choice materially affects where quiescent
+points fall.
+
 ---
 
 ## 2. The Problem: Unnecessary Atomic Operations in Polyglot Runtimes
@@ -240,7 +251,10 @@ conditions atomically with respect to its own scheduling state:
 ### 3.3 The Demotion Protocol
 
 A practical demotion protocol for a Perceus runtime on a
-scheduler-activation-based kernel:
+scheduler-activation-based kernel. The protocol's *triggers* depend
+on the runtime model (event loop vs continuation passing); the
+*safety verification* is identical in both. Each block describes
+the trigger under one model and the equivalent under the other.
 
 **At green thread quiescent points** (scheduling boundaries, GC
 safepoints, or explicit yield points):
@@ -257,12 +271,32 @@ safepoints, or explicit yield points):
    Subsequent reference count operations on this block use
    non-atomic instructions.
 
+*Under the event-loop model:* the quiescent points are the natural
+"between dispatches" instants — after one handler returns and
+before the next is dispatched. The runtime's event loop runs the
+demotion scan at this boundary.
+
+*Under the continuation-passing model:* every continuation entry
+and exit is a quiescent point. The runtime can either scan on
+every continuation boundary (highest demotion density, highest
+per-boundary cost) or amortise by scanning only when the
+candidate list grows past a threshold or when an activation
+becomes idle.
+
 **On activation idle transitions** (an activation runs out of work):
 
 1. All demotion candidates reachable solely from green threads that
    were assigned to this activation and are now parked can be
    bulk-demoted, because no activation is executing code that could
    access them.
+
+*Both runtime models hit this trigger identically* — an idle
+activation is an idle activation regardless of how it got there.
+Under the event-loop model the activation enters this state when
+its loop calls `ring_wait` with no immediately-available
+completions; under the continuation-passing model it enters this
+state when all registered continuations have run to completion
+and no new submissions are pending.
 
 **On green thread migration** (work stealing moves a green thread
 from activation A to activation B):
@@ -272,6 +306,47 @@ from activation A to activation B):
 2. After migration, if activation A's remaining green threads are
    the sole owners of some previously-shared data, those blocks
    become demotion candidates.
+
+*Under both runtime models* migration is an explicit runtime
+action; the runtime knows it's happening and runs the
+promote/candidate-mark step inline with the migration.
+
+### 3.4 Quiescent-Point Density and Demotion Throughput
+
+The continuation-passing model gives the demotion protocol
+substantially more frequent and more precisely-placed quiescent
+points than the event-loop model. Under the event loop, demotion
+runs once per completion-dispatch cycle — typically several
+operations are batched between scans. Under continuation passing,
+every continuation entry/exit is a quiescent point, which means
+the runtime can demote *immediately* after a continuation drops
+its reference, instead of waiting for the next loop boundary.
+
+This matters for the pipeline-parallelism workload pattern
+(§4.2 scenario 2): a value is shared during a consumer
+continuation, the consumer drops its reference at continuation
+exit, and the producer's next continuation sees the value as
+already-demoted with no scan latency between the drop and the
+demotion.
+
+In quantitative terms, the demotion-window cost — the duration
+during which a block is unnecessarily synchronised after its
+reference count has returned to 1 — is bounded by the inter-scan
+interval. Under event loop, that's the cycle time of the
+dispatcher (typically tens of microseconds under load). Under
+continuation passing, it's the time from the dropping continuation's
+exit to its caller's next reference-count operation (typically
+nanoseconds). For workloads where the same value is repeatedly
+shared and unshared on short timescales, the continuation model
+captures demotion opportunities the event-loop model would miss.
+
+The corresponding cost is bookkeeping overhead per continuation
+boundary. The right answer depends on workload: for runtimes that
+heavily share short-lived values across activations (pipelines,
+fork-join), continuation passing's denser quiescent points pay
+back; for runtimes dominated by long-lived shared structures
+(caches, configuration), the event-loop model's looser cadence is
+adequate and cheaper.
 
 ---
 
@@ -478,11 +553,31 @@ document to apply to Frankenstein-compiled code, the runtime must:
    runtime must translate these into green thread scheduling
    decisions.
 
+4. **Choose between event-loop and continuation-passing runtime
+   models** (see §1.2 and §3.4). For Frankenstein the
+   continuation-passing model is the natural fit: language
+   frontends that compile to Perceus typically have first-class
+   closures, and the denser quiescent points improve demotion
+   throughput on the pipeline-and-fork-join workloads functional
+   programs tend to produce. The Mercury frontend specifically
+   benefits because its mode system already statically places
+   uniqueness boundaries that align with continuation boundaries —
+   the runtime gets precise demotion opportunities at points the
+   compiler has already verified are safe.
+
 The most realistic near-term path is therefore: get one language's
 threading model working under Frankenstein on Telix (Mercury's,
-given its mature runtime), validate the demotion protocol with that
-single-language workload, then generalize to cross-language
-scenarios as additional frontends' threading models are addressed.
+given its mature runtime), pick the continuation-passing runtime
+model from the start (since it composes more cleanly with Mercury's
+mode-system-driven uniqueness analysis), validate the demotion
+protocol with that single-language workload, then generalize to
+cross-language scenarios as additional frontends' threading models
+are addressed. Other frontends whose source languages don't naturally
+produce continuation-shaped code (e.g. Java, where the runtime
+expects threads-and-monitors) can keep the event-loop runtime model
+for their own activations — different activations in the same
+Frankenstein-built process can use different runtime models against
+the same kernel ABI (§2.5 of `completion_based_syscalls.md`).
 
 ---
 
@@ -632,12 +727,26 @@ Frankenstein runtime would need: per-logical-thread state machine
 keyed by a correlation/handle, dispatched off a reply port. If you
 squint, `linux_srv` today is a tiny, hand-written version of what
 §4.2 describes for the language-runtime layer — except the "Linux
-threads" are real Linux processes rather than green threads.
+threads" are real Linux processes rather than green threads, and
+the dispatcher is an event-loop shape (single thread of control
+polling the reply port via `port_set_recv`).
 
 This is an unexpectedly direct precedent. The Mercury or
 Frankenstein runtime building its own scheduler on Telix would
 recapitulate the same shape with green threads replacing Linux
-processes.
+processes — and, if it picks the continuation-passing runtime model,
+with kernel-delivered upcalls replacing the explicit `port_set_recv`
+poll.
+
+The `PENDING_ASYNC` table itself is shape-compatible with both
+runtime models: it's already a slot-indexed continuation table.
+Under the event-loop model the dispatcher reads completions and
+indexes into it; under the continuation-passing model the kernel's
+upcall handler does the same indexing. The structural change is
+where the dispatch happens (top-of-loop vs upcall-entry), not in
+the table itself. This is reassuring for the migration story: the
+existing PENDING_ASYNC table doesn't need to be redesigned to
+accommodate the runtime-model choice.
 
 ### A.4 Verus connection (open question 7.3)
 
@@ -679,7 +788,44 @@ activation is" means. The demotion proof relies on local
 runtime omniscience; distributed activations would need a different
 analysis.
 
-### A.7 The "Mercury first" tactical recommendation
+### A.7 Parent-constructed children and initial ownership state
+
+The parent-constructs-child pattern (see §2.6 of
+`completion_based_syscalls.md`) interacts cleanly with the demotion
+protocol. When a parent task spawns a child by populating the
+child's initial state directly, the parent already knows *exactly*
+which heap blocks are reachable from the child's initial root set.
+The parent can mark those blocks with the appropriate
+synchronisation state at spawn time:
+
+- Blocks unique to the child (transferred to the child as part of
+  the spawn) start unsynchronised — only the child's activation can
+  reach them.
+- Blocks shared between parent and child (e.g. shared message
+  buffers, configuration) start synchronised, with the demotion
+  protocol available to demote them later if the parent drops its
+  reference.
+- The Mercury mode system's uniqueness information at the source
+  level translates directly: a unique-mode value transferred to the
+  child can be marked unsynchronised from the start without any
+  runtime check.
+
+This means the child never has an "initial synchronisation
+upgrade" cost — the cap-table population step that the parent
+performs is also where the synchronisation state of each transferred
+block is set. Contrast with a self-initialising child that would
+have to scan its initial heap and decide synchronisation status
+itself, paying atomic costs unnecessarily.
+
+The combination is particularly valuable for fork-join-style
+parallelism: the parent spawns a child to compute on a value, marks
+the value synchronised at spawn, the child runs, the child exits,
+the parent reclaims sole ownership and demotes. End-to-end this
+adds exactly one synchronised→unsynchronised demotion to the
+critical path, with no other atomic-RC overhead beyond what the
+sharing duration genuinely requires.
+
+### A.8 The "Mercury first" tactical recommendation
 
 §6.4's suggestion to start with Mercury is well-grounded against
 the codebase: Telix already has a working
@@ -696,7 +842,7 @@ milestone is far more reachable than "Frankenstein's full polyglot
 linker" and would let the demotion protocol be prototyped against
 a real workload.
 
-### A.8 What this means for the near-term
+### A.9 What this means for the near-term
 
 The completion-based syscall doc (`completion_based_syscalls.md`)
 is the immediate next architectural piece. Once that lands, the

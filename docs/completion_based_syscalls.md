@@ -150,6 +150,119 @@ one per upcall type. If an upcall fires for a type with no registered
 handler, the kernel takes a default action (typically signal-like
 termination for unhandled faults).
 
+### 2.5 Two Runtime Models Over the Same ABI
+
+The completion-ring ABI described above intentionally supports two
+distinct runtime models. Both are first-class — the kernel ABI is
+agnostic to which a given activation uses, and the choice is made
+per-activation at the runtime-library layer. Different activations
+in the same process can use different models, and a single
+activation can switch models over its lifetime.
+
+**The event-loop model** (poll-and-dispatch): the runtime registers
+no per-handle upcall. Its main thread of control calls
+`ring_wait(min_completions, timeout)` (or `ring_peek_completion()`
+when non-blocking), drains some completions, looks each one up in a
+runtime-maintained handler table by handle, and dispatches the
+appropriate handler. Control flow is a top-level loop;
+"asynchronous" operations are encoded as state machines in the
+handler table. This is the io_uring / libuv / Node.js shape.
+
+**The continuation-passing model** (upcall-and-resume): each ring
+submission is accompanied by a *continuation* — a function pointer
+plus closure data — registered with the kernel via a CQ-edge upcall
+handler. When a completion arrives, the kernel delivers it as an
+upcall directly into the registered continuation, on whichever
+activation the runtime has marked as available. The runtime has no
+top-level loop; control flow is a chain of continuations, each
+either finishing (terminating the activation's current work), or
+submitting another op + continuation, or transferring control
+directly to another already-registered continuation. This is the
+Mach-continuation / K42-closure / Cilk-spawn shape.
+
+Both models share the same SQ/CQ data structures and the same
+underlying ring-drainer in the kernel. The only mechanical
+difference is whether the kernel keeps the activation parked when
+new completions arrive (event loop case — the runtime has called
+`ring_wait` and will pull when it wakes) or invokes a registered
+handler immediately on the CQ producing a new entry (continuation
+case — the runtime registered an upcall on CQ-edge instead of
+parking). The same upcall plumbing in §2.4 carries continuation
+deliveries; from the kernel's perspective they are just another
+upcall type with per-submission registration rather than per-process.
+
+**Tradeoffs that drive the choice:**
+
+- *Event loop* wins on batching (drain N completions before doing
+  anything), simpler debugging (one thread of control to inspect),
+  easier reasoning about ordering, simpler implementation for
+  languages without first-class closures, and better fit for timer
+  wheels / priority dispatch where the runtime wants global
+  scheduling control.
+
+- *Continuation passing* wins on lower per-completion latency (no
+  poll-then-dispatch overhead, the activation receiving the upcall
+  is already the right one to run the continuation), no central
+  choke point (no shared event-loop thread is the bottleneck),
+  natural locality (the continuation runs where the upcall landed),
+  finer-grained quiescent points (every continuation boundary is a
+  yield point — relevant for runtimes that need precise scheduling
+  knowledge, e.g. the activation-aware Perceus protocol in
+  `docs/activation_perceus_demotion.md`), and simpler shape for
+  workloads that don't naturally form an event loop (short-lived
+  async operations dispatched from many call sites).
+
+For Telix's near-term consumers, the Linux personality server is a
+natural fit for the event-loop model (it manages many Linux
+processes, each modelled as a state machine, with a single supervising
+loop). Sophisticated language runtimes — especially ones with
+first-class closures or work-stealing schedulers — are more naturally
+fitted to the continuation-passing model. The ABI supports both
+without commitment.
+
+### 2.6 Parent-Constructed Child Tasks
+
+Orthogonal to the runtime-model choice above, the spawning interface
+itself follows a *parent-constructs-child* pattern: the spawning
+task uses ordinary userspace operations to configure the to-be-spawned
+child's initial state — capability table, IPC endpoints, initial
+activation entrypoint, ring registration, upcall handler
+registration, file-descriptor inheritance — *before* the child runs
+any instruction. The child wakes up fully configured; there is no
+`init()` phase in the child where it queries the kernel for what
+it needs.
+
+This is the seL4 / Genode pattern (the parent constructs the child's
+entire cap space and the child runs with exactly what it has),
+generalised from Plan 9's `rfork` (sharing/non-sharing flags) and
+POSIX's `posix_spawn` with file actions (parent-side `dup2`,
+`chdir`, `sigaction` etc. applied before the child runs).
+
+Concretely on Telix the existing `sys_spawn` evolves to take a
+parent-constructed initial-state descriptor: a list of capabilities
+to populate the child's cap table with, an initial entry frame
+(pc/sp/argv/envp), and — under the new ABI — pre-configured ring
+addresses and the initial continuation/upcall registrations the
+child should boot with. The parent has full authority over what the
+child can do and which entrypoints it can be activated at; the child
+has no need to call back into the kernel for setup.
+
+The combination with the continuation-passing runtime model is
+particularly clean: a child task can be configured to receive its
+first activation as a kernel upcall into a parent-registered
+entrypoint, with the parent's chosen rings and continuation table
+already mapped. The child literally never executes an "I am starting
+up" code path of its own. This is the shape modern capability
+kernels favour, and Telix's existing capability model
+(`kernel/src/ipc/call_reply.rs`'s generation-counted reply caps,
+the per-task `aspace_id` / cap table) already supports it.
+
+This pattern remains valuable under the event-loop runtime model
+too — the parent simply registers the child's initial activation as
+a long-running event loop instead of a one-shot continuation — but
+it shines most where the child's lifetime is a finite sequence of
+continuations rather than a perpetual loop.
+
 ---
 
 ## 3. The Syscall Conversion
@@ -183,8 +296,30 @@ fn ipc_send_recv_blocking(endpoint: Endpoint, request: Request) -> Result {
 }
 ```
 
-The wrapper is implemented in the userspace runtime library, not in
-the kernel. The kernel sees only ring operations.
+For code using the continuation-passing model (§2.5), the same
+operation is expressed by registering a continuation at submission
+time and never explicitly waiting:
+
+```rust
+ring_submit_with_continuation(IPC_SEND_RECV, endpoint, request,
+    |completion| process(completion.result))?;
+// activation returns to its scheduler; the closure runs on whichever
+// activation receives the completion upcall.
+```
+
+For the event-loop model, the runtime maintains a handler table and
+the top-level loop dispatches by handle:
+
+```rust
+let handle = ring_submit(IPC_SEND_RECV, endpoint, request)?;
+handler_table.register(handle, |completion| process(completion.result));
+// ... event_loop() elsewhere pulls completions, dispatches by handle ...
+```
+
+All three wrappers are implemented in the userspace runtime library,
+not in the kernel. The kernel sees only ring operations and (for
+the continuation form) the upcall registration that turns each new
+CQ entry into an immediate handler invocation.
 
 ### 3.2 What Stays Synchronous
 
@@ -262,26 +397,58 @@ interface.
 ### 4.2 How Completion-Based Telix Resolves This Naturally
 
 Under the completion-based Telix interface, the personality server's
-structure becomes:
+structure can take either runtime shape from §2.5. Both eliminate
+the blocking-thread-per-Linux-syscall problem; they differ in how
+the work is dispatched.
 
-- One Telix thread (or a small pool, one per activation) running the
-  personality server's event loop.
+**Event-loop shape** (the natural fit for the personality server's
+current style):
+
+- One Telix thread (or a small pool, one per activation) running
+  the personality server's event loop.
 - A state machine per Linux thread, recording what Linux syscall is
   in progress, what Telix operations have been submitted to service
   it, and what return value to provide to the Linux thread when
   servicing completes.
 - The event loop reads completions from the Telix completion ring,
   looks up which Linux thread is waiting for each completion,
-  advances that Linux thread's state machine, and either submits more
-  Telix operations (if the Linux syscall requires multiple stages) or
-  returns the final result to the Linux thread.
+  advances that Linux thread's state machine, and either submits
+  more Telix operations (if the Linux syscall requires multiple
+  stages) or returns the final result to the Linux thread.
 
-The personality server never blocks except in the ring wait
-operation. It services many concurrent Linux syscalls with a small,
-fixed number of Telix threads. The state machine per Linux thread is
-exactly the bookkeeping required to model Linux's blocking semantics —
-it cannot be avoided, but it's no longer in addition to a Telix-level
+**Continuation-passing shape** (lower per-syscall latency, no
+central loop):
+
+- The personality server has no top-level loop. Each Linux process
+  is represented as a chain of continuations; the entry point for
+  each Linux syscall arrival is itself a continuation that the
+  kernel invokes via upcall when a Linux process's syscall message
+  arrives on the personality port.
+- The "state machine per Linux thread" is encoded as the closure
+  data carried by each in-flight continuation. When the personality
+  server submits a Telix operation to service the Linux syscall, it
+  registers the next-step continuation with the submission; on
+  completion, the kernel dispatches directly into that continuation
+  on the appropriate activation.
+- The transition from "Linux syscall arrived" to "Linux syscall
+  replied" is a chain of activation entries, never a poll loop.
+
+Either way, the personality server never blocks except (in the
+event-loop case) on the explicit ring wait. It services many
+concurrent Linux syscalls with a small, fixed number of Telix
+threads. The state machine per Linux thread is exactly the
+bookkeeping required to model Linux's blocking semantics — it
+cannot be avoided, but it's no longer in addition to a Telix-level
 concurrency mechanism.
+
+The choice between the two shapes for the personality server can
+be made empirically once both are buildable. The event-loop shape
+is closer to the current `linux_srv` architecture (commit
+`4569f0d` extends its `PendingAsyncKind` table); the
+continuation-passing shape is more invasive to introduce but
+cleaner if measurements show the per-completion dispatch overhead
+matters for the personality server's typical workload (many short
+syscalls, modest in-flight depth).
 
 ### 4.3 Why This Is More Fundamental Than Layered Concurrency
 
@@ -474,7 +641,28 @@ The right answer is probably to provide all three as different
 submission operations. Most callers use a wrapper that picks the
 appropriate one based on context.
 
-### 6.5 Cancellation
+### 6.5 Runtime Model: Event Loop vs Continuation Passing
+
+Both models are supported by the same kernel ABI (§2.5). The
+design decision is therefore not "which model does Telix
+prescribe?" but "how minimal a kernel ABI suffices to support
+both?" The answer is: the kernel exposes the ring data structures
+plus a `cq_edge` upcall registration. A runtime that does not
+register a `cq_edge` upcall uses the event-loop model (calls
+`ring_wait` to sleep); a runtime that does register one uses
+continuation passing (each completion immediately invokes the
+registered handler). Per-handle continuations are layered on top by
+the runtime library — the runtime tags each submission's handle in
+a continuation table and the `cq_edge` upcall dispatches by handle.
+
+Per-handle continuations could alternatively be a kernel-tracked
+concept (each SQ entry carrying a continuation pointer the kernel
+remembers and invokes directly on completion), but this pushes more
+semantics into the kernel ABI than is necessary: a per-process
+`cq_edge` upcall + userspace-side continuation table is functionally
+equivalent and keeps the kernel ABI minimal.
+
+### 6.6 Cancellation
 
 Best-effort cancellation by handle. The kernel attempts to cancel the
 operation if it hasn't yet started. If it has started, cancellation
@@ -730,7 +918,53 @@ The flag-day cost is high (touching every callsite); the incremental
 path lets each subsystem move when it benefits, and the existing
 blocking wrappers around `syscall::call` continue to work throughout.
 
-### A.6 Open questions surfaced by the codebase
+### A.6 Continuation passing and parent-constructed children in the current tree
+
+The two patterns introduced in §2.5 and §2.6 already have partial
+precedent in the codebase, and the kernel ABI changes to fully
+support them are mostly in service of regularising what's already
+ad-hoc.
+
+For **continuation passing** (§2.5), Telix's existing
+exception-handler delivery — the kernel writes a fault frame and
+transfers to a userspace handler — is structurally an upcall. The
+Linux personality's signal-frame setup
+(`userlib/bin/linux_srv.rs` plus the kernel-side signal entry) is
+the same mechanic dressed in Linux semantics. The new piece is a
+*native* per-process registration table — `kernel/src/sched/task.rs`
+has `sig_actions` for Linux signals; the equivalent for native
+upcalls (CQ-edge, page-fault, activation-availability) is a parallel
+table with a small set of upcall types.
+
+For **parent-constructed children** (§2.6), `sys_spawn` already
+takes the new task's name, priority, and parent's choice of initial
+arg — the parent is shaping the child. `personality_set` is the
+existing inflection where the parent imposes a personality before
+the child runs Linux code. Extending this to "the parent populates
+the child's full cap table and initial ring/continuation state
+before the child is resumable" is incremental:
+
+- The child's cap table (today implicit in the task's aspace_id +
+  port ownership) becomes parent-writable for the pre-start window.
+- The child's initial frame (entry rip, stack, registers) is
+  already parent-controlled via the spawn syscall.
+- New: the parent registers the child's initial ring buffer
+  locations and (optionally) a first-activation continuation that
+  the kernel invokes when the child is started, rather than
+  resuming at the spawn-syscall return.
+
+Combining the two: a child task can be configured by its parent to
+boot directly into a continuation handler with its rings already
+mapped — no "child startup" code in the child's image is required.
+This is the seL4/Genode pattern adapted to Telix's port/cap model.
+
+The kernel ABI delta for both patterns is small relative to the
+ring infrastructure itself: a few new syscalls (or new operations on
+existing ones) for upcall registration and parent-side child setup.
+The userspace runtime library is where the bulk of the new code
+lives.
+
+### A.7 Open questions surfaced by the codebase
 
 - **Where do completions land when the receiver is parked in
   `block_current`?** Today the kernel wakes the recv'er via
