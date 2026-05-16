@@ -177,6 +177,17 @@ pub const SYS_GET_WORKING_SET: u64 = 127;
 /// before invoking heavy services.
 pub const SYS_GET_MEMORY_STATS: u64 = 128;
 
+/// #160 query the calling aspace's monotonic page-fault counter.
+/// Userspace samples at two times t0 < t1, computes
+/// (pf(t1) - pf(t0)) / (t1 - t0) for the fault rate, and applies a
+/// PFF threshold (Chu & Opderbeck 1976):
+///   rate > UPPER → process is thrashing, grow allocation
+///   rate < LOWER → process has too many pages, shrink
+/// The kernel doesn't yet auto-adjust based on this — left as a
+/// future Stage 4b/c iteration.  Exposed first so userspace can
+/// experiment with PFF policies before the kernel commits to one.
+pub const SYS_GET_PF_COUNT: u64 = 129;
+
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
 
@@ -350,6 +361,7 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_VA_WRITABLE => sys_va_writable(a0),
         SYS_GET_WORKING_SET => sys_get_working_set(),
         SYS_GET_MEMORY_STATS => sys_get_memory_stats(a0),
+        SYS_GET_PF_COUNT => sys_get_pf_count(),
         SYS_SET_QUOTA => sys_set_quota(a0, a1, a2),
         SYS_FORK => crate::sched::scheduler::fork_current(),
         SYS_SEND_CAP => sys_send_cap(a0, a1, a2, a3, a4, a5),
@@ -1519,6 +1531,13 @@ fn sys_get_timer_freq() -> u64 {
 fn sys_get_working_set() -> u64 {
     let aspace_id = crate::sched::scheduler::current_aspace_id();
     crate::mm::aspace::working_set(aspace_id) as u64
+}
+
+/// #160 SYS_GET_PF_COUNT: monotonic page-fault count for the calling
+/// aspace.  Userspace samples at two times to compute fault rate.
+fn sys_get_pf_count() -> u64 {
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    crate::mm::aspace::pf_count(aspace_id)
 }
 
 /// #160 SYS_GET_MEMORY_STATS: system-wide memory snapshot.

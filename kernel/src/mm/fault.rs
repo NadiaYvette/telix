@@ -83,6 +83,11 @@ pub fn handle_page_fault(
     fault_addr: usize,
     fault_type: FaultType,
 ) -> FaultResult {
+    // #160 PFF groundwork: count every page-fault entry, regardless of
+    // whether the fault is handled or fails.  Userspace samples this
+    // (or kswapd, once PFF grow/shrink is wired up) to compute the
+    // aspace's fault rate and react.
+    aspace::bump_pf_count(aspace_id);
     aspace::with_aspace(aspace_id, |aspace| {
         let pt_root = aspace.page_table_root;
         let fork_group = aspace.fork_group;

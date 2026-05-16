@@ -239,6 +239,11 @@ struct ASpaceEntry {
     /// count of PTEs observed with the hardware access bit set.  Read
     /// lock-free by `working_set()` for admission control in sys_spawn.
     ws_pages_recent: AtomicU32,
+    /// #160 page-fault counter (minor + major).  Monotonic.  Stage 4
+    /// PFF (Chu & Opderbeck 1976) groundwork: userspace or kswapd can
+    /// sample this at two times to compute fault rate, then grow/shrink
+    /// the aspace's reclaim target based on the rate.
+    pf_count: core::sync::atomic::AtomicU64,
     /// The actual address space data, protected by a per-entry lock.
     inner: SpinLock<AddressSpace>,
 }
@@ -387,6 +392,28 @@ pub fn update_working_set(id: ASpaceId, scan_referenced: u32) {
     }
 }
 
+/// #160 Bump the per-aspace page-fault counter.  Called from
+/// fault::handle_*_fault and pager paths.  Monotonic.  Cheap atomic
+/// add.  If the aspace is gone (stale tear-down), the bump is a no-op.
+pub fn bump_pf_count(id: ASpaceId) {
+    if let Some(entry_ptr) = resolve_entry(id) {
+        let entry = unsafe { &*entry_ptr };
+        entry.pf_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// #160 Read the per-aspace page-fault counter.  Userspace can sample
+/// at two times to compute fault rate, then react (PFF-style).
+pub fn pf_count(id: ASpaceId) -> u64 {
+    match resolve_entry(id) {
+        Some(entry_ptr) => {
+            let entry = unsafe { &*entry_ptr };
+            entry.pf_count.load(Ordering::Relaxed)
+        }
+        None => 0,
+    }
+}
+
 /// #160 Sum of `working_set()` across all active aspaces.  Used by
 /// `sys_spawn`'s admission-control gate to decide whether the system
 /// has enough free pages to accept a new process.  O(num_aspaces) —
@@ -437,6 +464,7 @@ pub fn create(page_table_root: usize) -> Option<ASpaceId> {
         (*ptr).port_id = port_id;
         (*ptr).pager_waiter = AtomicU32::new(0);
         (*ptr).ws_pages_recent = AtomicU32::new(0);
+        (*ptr).pf_count = core::sync::atomic::AtomicU64::new(0);
         let mut space = AddressSpace::empty();
         space.id = port_id;
         space.page_table_root = page_table_root;
