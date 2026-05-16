@@ -189,6 +189,67 @@ proof fn lemma_inline_idx1(fc: u64, own: u64, hb_bit: u64, bmp_pg: u64,
 }
 
 #[verifier::bit_vector]
+proof fn lemma_inline_idx2(fc: u64, own: u64, hb_bit: u64, bmp_pg: u64,
+                           idx0: u64, idx1: u64, idx2: u64, rest: u64)
+    requires
+        fc <= 0x7F,
+        own <= 0x7F,
+        hb_bit == 0 || hb_bit == (1u64 << 14),
+        bmp_pg <= 0x3F,
+        idx0 <= 0x3F,
+        idx1 <= 0x3F,
+        idx2 <= 0x3F,
+        rest < (1u64 << 18),
+    ensures
+        (((fc & 0x7F)
+            | (own << 7)
+            | hb_bit
+            | (bmp_pg << 15)
+            | ((idx0 | (idx1 << 6) | (idx2 << 12) | (rest << 18)) << 21)) >> (21 + 12)) & 0x3F == idx2,
+{
+}
+
+#[verifier::bit_vector]
+proof fn lemma_inline_idx3(fc: u64, own: u64, hb_bit: u64, bmp_pg: u64,
+                           low: u64, idx3: u64, rest: u64)
+    requires
+        fc <= 0x7F,
+        own <= 0x7F,
+        hb_bit == 0 || hb_bit == (1u64 << 14),
+        bmp_pg <= 0x3F,
+        low < (1u64 << 18),
+        idx3 <= 0x3F,
+        rest < (1u64 << 12),
+    ensures
+        (((fc & 0x7F)
+            | (own << 7)
+            | hb_bit
+            | (bmp_pg << 15)
+            | ((low | (idx3 << 18) | (rest << 24)) << 21)) >> (21 + 18)) & 0x3F == idx3,
+{
+}
+
+#[verifier::bit_vector]
+proof fn lemma_inline_idx4(fc: u64, own: u64, hb_bit: u64, bmp_pg: u64,
+                           low: u64, idx4: u64, rest: u64)
+    requires
+        fc <= 0x7F,
+        own <= 0x7F,
+        hb_bit == 0 || hb_bit == (1u64 << 14),
+        bmp_pg <= 0x3F,
+        low < (1u64 << 24),
+        idx4 <= 0x3F,
+        rest < (1u64 << 6),
+    ensures
+        (((fc & 0x7F)
+            | (own << 7)
+            | hb_bit
+            | (bmp_pg << 15)
+            | ((low | (idx4 << 24) | (rest << 30)) << 21)) >> (21 + 24)) & 0x3F == idx4,
+{
+}
+
+#[verifier::bit_vector]
 proof fn lemma_inline_idx5(fc: u64, own: u64, hb_bit: u64, bmp_pg: u64,
                            low: u64, idx5: u64)
     requires
