@@ -162,6 +162,21 @@ pub const SYS_FW_INFO: u64 = 125;
 /// dereferencing — converts a fault-and-cascade into an error reply.
 pub const SYS_VA_WRITABLE: u64 = 126;
 
+/// #160 query the calling aspace's working-set estimate (in MMU pages).
+/// 0 if the aspace hasn't been scanned yet (kswapd hasn't observed it).
+/// No arguments; returns the EWMA-tracked WS that admission control
+/// uses.  Userspace can poll this to react to its own memory pressure
+/// (e.g. drop caches, balloon down, OOM-self-elect) before the kernel
+/// has to.
+pub const SYS_GET_WORKING_SET: u64 = 127;
+
+/// #160 query system-wide memory stats:
+///   a0=0 → total MMU pages,  a0=1 → free MMU pages,
+///   a0=2 → total_working_set sum across all aspaces.
+/// Lets userspace approximate `/proc/meminfo` for admission decisions
+/// before invoking heavy services.
+pub const SYS_GET_MEMORY_STATS: u64 = 128;
+
 /// Error code: capability check failed.
 const ECAP: u64 = 2;
 
@@ -333,6 +348,8 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
         SYS_GET_CYCLES => sys_get_cycles(),
         SYS_GET_TIMER_FREQ => sys_get_timer_freq(),
         SYS_VA_WRITABLE => sys_va_writable(a0),
+        SYS_GET_WORKING_SET => sys_get_working_set(),
+        SYS_GET_MEMORY_STATS => sys_get_memory_stats(a0),
         SYS_SET_QUOTA => sys_set_quota(a0, a1, a2),
         SYS_FORK => crate::sched::scheduler::fork_current(),
         SYS_SEND_CAP => sys_send_cap(a0, a1, a2, a3, a4, a5),
@@ -1494,6 +1511,30 @@ fn sys_va_writable(va: u64) -> u64 {
 
 fn sys_get_timer_freq() -> u64 {
     crate::arch::timer::timer_freq()
+}
+
+/// #160 SYS_GET_WORKING_SET: return calling aspace's WS estimate
+/// (MMU pages, EWMA-tracked by kswapd).  0 if aspace gone / not
+/// scanned yet.  Lock-free.
+fn sys_get_working_set() -> u64 {
+    let aspace_id = crate::sched::scheduler::current_aspace_id();
+    crate::mm::aspace::working_set(aspace_id) as u64
+}
+
+/// #160 SYS_GET_MEMORY_STATS: system-wide memory snapshot.
+///   a0 == 0 → total MMU pages
+///   a0 == 1 → free MMU pages
+///   a0 == 2 → total working set across all aspaces
+///   else    → 0 (reserved for future fields)
+///
+/// All values in MMU pages (page::MMUPAGE_SIZE).  Cheap atomic reads.
+fn sys_get_memory_stats(field: u64) -> u64 {
+    match field {
+        0 => crate::mm::phys::stats().0 as u64,
+        1 => crate::mm::phys::stats().1 as u64,
+        2 => crate::mm::aspace::total_working_set(),
+        _ => 0,
+    }
 }
 
 fn sys_spawn(name_ptr: u64, name_len: u64, priority: u64, arg0: u64) -> u64 {
