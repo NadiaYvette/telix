@@ -423,6 +423,21 @@ const VFS_OPEN_OK: u64 = 0x6110;
 const VFS_STAT_LONG: u64 = 0x6021;
 const VFS_STAT: u64 = 0x6020;
 const VFS_STAT_OK: u64 = 0x6120;
+/// Async variants matching vfs_srv's VFS_OPEN_ASYNC / VFS_STAT_ASYNC
+/// (and _LONG_ASYNC).  Same args as the sync versions plus a 32-bit
+/// correlation id packed into d2 bits 16..48 (for the short variants,
+/// limiting path length to 24 bytes — longer falls back to the LONG
+/// variant) or as a dedicated word (for the LONG variants where the
+/// path is in a grant page).  Reply lands as VFS_OPEN_REPLY /
+/// VFS_STAT_REPLY on the port registered via VFS_SET_REPLY_PORT.
+const VFS_OPEN_ASYNC: u64 = 0x6012;
+const VFS_OPEN_LONG_ASYNC: u64 = 0x6013;
+const VFS_STAT_ASYNC: u64 = 0x6022;
+const VFS_STAT_LONG_ASYNC: u64 = 0x6023;
+const VFS_OPEN_REPLY: u64 = 0x6112;
+const VFS_STAT_REPLY: u64 = 0x6122;
+const VFS_SET_REPLY_PORT: u64 = 0x6019;
+const VFS_SET_REPLY_PORT_OK: u64 = 0x6119;
 const VFS_MKDIR: u64 = 0x6040;
 const VFS_MKDIR_OK: u64 = 0x6140;
 const VFS_UNLINK: u64 = 0x6050;
@@ -847,6 +862,31 @@ enum PendingAsyncKind {
     /// for initramfs-misses is NOT in this async path yet — tracked as a
     /// known regression until VFS_OPEN gets its own async variant.
     ConnectInitramfs,
+    /// Async VFS_OPEN / VFS_OPEN_LONG.  Used when handle_open's
+    /// initramfs fast path misses and we need to fall through to VFS.
+    /// Field reuse:
+    ///   pi               → caller process index
+    ///   caller_task_port → port for personality_reply
+    ///   flags            → open flags (for O_CLOEXEC handling)
+    ///   buf_va, buf_len  → unused
+    /// On reply: alloc fd, populate PROC_TABLE.fds[fd] as FdKind::File,
+    /// personality_reply with the fd.  Error tags route to linux_err
+    /// (typically ENOENT).
+    OpenVfs,
+    /// Async VFS_STAT / VFS_STAT_LONG.  Used by handle_stat, handle_fstat,
+    /// handle_newfstatat and similar paths that resolve a path and
+    /// retrieve metadata.
+    /// Field reuse:
+    ///   pi               → caller process index
+    ///   caller_task_port → port for personality_reply
+    ///   buf_va           → caller's statbuf VA (where to copy out the
+    ///                      formatted stat result)
+    ///   buf_len          → statbuf size (typically 144 for newfstatat)
+    ///   flags            → caller's stat-style flags (AT_SYMLINK_NOFOLLOW etc.)
+    /// On reply: format the {size, mode, ftype, ...} reply data into the
+    /// Linux stat buffer layout, copy out via personality_copy_out, then
+    /// personality_reply with 0 or a negated errno.
+    StatVfs,
 }
 
 /// `#[repr(C)]` pins `kind` at offset 0 so we can take an
@@ -3953,6 +3993,45 @@ fn try_register_irfs_async_reply_port() -> bool {
     }
 }
 
+/// Tracks whether VFS_SET_REPLY_PORT has been delivered to vfs_srv.
+/// Until this flips to true, handle_open/handle_stat fall back to the
+/// synchronous VFS_OPEN / VFS_STAT path.  Set inside
+/// `try_register_vfs_async_reply_port`, called lazily from the main IPC
+/// loop once vfs_srv is reachable.
+static mut VFS_ASYNC_REGISTERED: bool = false;
+
+/// Lazily register BACKEND_REPLY_PORT with vfs_srv so future
+/// VFS_OPEN_ASYNC / VFS_STAT_ASYNC reads can be delivered as
+/// VFS_OPEN_REPLY / VFS_STAT_REPLY back to the main dispatch thread.
+/// Idempotent; safe to call repeatedly.  Returns true once registration
+/// has succeeded.
+fn try_register_vfs_async_reply_port() -> bool {
+    unsafe {
+        if VFS_ASYNC_REGISTERED {
+            return true;
+        }
+        let vfs = get_vfs_port();
+        if vfs == 0 {
+            return false;
+        }
+        let cp = BACKEND_REPLY_PORT;
+        if cp == 0 {
+            return false;
+        }
+        let resp = match syscall::call(vfs, VFS_SET_REPLY_PORT, cp, 0, 0, 0) {
+            Some(m) => m,
+            None => return false,
+        };
+        if resp.tag == VFS_SET_REPLY_PORT_OK {
+            VFS_ASYNC_REGISTERED = true;
+            syscall::debug_puts(b"[linux_srv] VFS async reply port registered\n");
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Try to open a file via initramfs_srv (the in-memory cpio archive).
 /// `path` is the absolute path with a leading '/'; we strip it because
 /// initramfs_srv stores names without the leading slash.  Returns
@@ -4203,6 +4282,156 @@ fn try_open_initramfs_sync(irfs_port: u64, name: &[u8]) -> TryOpenInitramfs {
     } else {
         TryOpenInitramfs::Sync(None)
     }
+}
+
+/// Result type for `try_open_vfs_async` / `try_stat_vfs_async`.
+enum TryAsyncVfs {
+    /// Async path didn't apply (port not registered, path too long, no
+    /// slot, send failed).  Caller should fall back to the sync path.
+    NotTaken,
+    /// Async IPC fired; caller must set REPLY_DEFERRED and return.  The
+    /// continuation (`finish_open_vfs` / `finish_stat_vfs`) replies when
+    /// VFS_OPEN_REPLY / VFS_STAT_REPLY arrives.
+    Deferred,
+}
+
+/// Pack a path of length 1..=24 bytes into (w0, w1, w3) for the
+/// VFS_OPEN_ASYNC / VFS_STAT_ASYNC ABI.  Returns (w0, w1, w3).  Inverse
+/// is on vfs_srv's side (`unpack_path` analog).
+fn pack_path_async24(path: &[u8]) -> (u64, u64, u64) {
+    let mut w0 = 0u64;
+    let mut w1 = 0u64;
+    let mut w3 = 0u64;
+    for i in 0..path.len().min(8) {
+        w0 |= (path[i] as u64) << (i * 8);
+    }
+    for i in 8..path.len().min(16) {
+        w1 |= (path[i] as u64) << ((i - 8) * 8);
+    }
+    for i in 16..path.len().min(24) {
+        w3 |= (path[i] as u64) << ((i - 16) * 8);
+    }
+    (w0, w1, w3)
+}
+
+/// Try to dispatch an open against vfs_srv asynchronously.  Returns
+/// Deferred on success (caller sets REPLY_DEFERRED) and NotTaken
+/// otherwise (caller falls back to sync VFS_OPEN / do_open_long).
+/// Path is the absolute path (length 1..=24).  Flags are currently
+/// dropped on the wire — matching the existing sync short-VFS_OPEN
+/// behavior, which also drops flags before reaching the FS server.
+fn try_open_vfs_async(
+    pi: usize,
+    caller_port: u64,
+    flags: u64,
+    path: &[u8],
+) -> TryAsyncVfs {
+    unsafe {
+        if !VFS_ASYNC_REGISTERED {
+            return TryAsyncVfs::NotTaken;
+        }
+    }
+    if path.is_empty() || path.len() > 24 {
+        return TryAsyncVfs::NotTaken;
+    }
+    let vfs_port = get_vfs_port();
+    if vfs_port == 0 {
+        return TryAsyncVfs::NotTaken;
+    }
+    let slot = match async_alloc_slot() {
+        Some(s) => s,
+        None => return TryAsyncVfs::NotTaken,
+    };
+    let correlation = next_correlation_id();
+    let (w0, w1, w3) = pack_path_async24(path);
+    // Pack the path into reusable PendingAsync fields so finish_open_vfs
+    // can recover it for the Dir FD fallback path on FS_ERROR.  Layout
+    // matches unpack_irfs_name's expectation so we can reuse that helper.
+    let n1_lo = (w1 & 0xFFFF_FFFF) as u32;
+    let n1_hi = (w1 >> 32) as u32;
+    unsafe {
+        PENDING_ASYNC[slot] = PendingAsync {
+            kind: PendingAsyncKind::OpenVfs,
+            correlation,
+            pi,
+            caller_task_port: caller_port,
+            listen_fd: 0,
+            flags,
+            buf_va: w3 as usize,         // path[16..24]
+            buf_len: path.len(),          // pathlen in low bits
+            scratch_slot: 0xFF,
+            total_so_far: n1_lo,          // path[8..12]
+            mmap_prot_flags: 0,
+            mmap_aligned_len: n1_hi,      // path[12..16]
+            extra_handle: w0,             // path[0..8]
+            cache_slot: 0xFF,
+            in_flight_chunk: 0,
+        };
+    }
+    // d2 layout: bits 0..16 = pathlen, bits 16..48 = correlation (low 32).
+    let d2 = (path.len() as u64 & 0xFFFF)
+        | (((correlation as u32) as u64 & 0xFFFF_FFFF) << 16);
+    let r = syscall::send_nb_4(vfs_port, VFS_OPEN_ASYNC, w0, w1, d2, w3);
+    if r != 0 {
+        async_free_slot(slot);
+        return TryAsyncVfs::NotTaken;
+    }
+    TryAsyncVfs::Deferred
+}
+
+/// Try to dispatch a stat against vfs_srv asynchronously.  On Deferred,
+/// caller must set REPLY_DEFERRED; the continuation `finish_stat_vfs`
+/// formats the result into `statbuf_va` on completion.
+fn try_stat_vfs_async(
+    caller_port: u64,
+    statbuf_va: usize,
+    path: &[u8],
+) -> TryAsyncVfs {
+    unsafe {
+        if !VFS_ASYNC_REGISTERED {
+            return TryAsyncVfs::NotTaken;
+        }
+    }
+    if path.is_empty() || path.len() > 24 {
+        return TryAsyncVfs::NotTaken;
+    }
+    let vfs_port = get_vfs_port();
+    if vfs_port == 0 {
+        return TryAsyncVfs::NotTaken;
+    }
+    let slot = match async_alloc_slot() {
+        Some(s) => s,
+        None => return TryAsyncVfs::NotTaken,
+    };
+    let correlation = next_correlation_id();
+    let (w0, w1, w3) = pack_path_async24(path);
+    unsafe {
+        PENDING_ASYNC[slot] = PendingAsync {
+            kind: PendingAsyncKind::StatVfs,
+            correlation,
+            pi: 0,
+            caller_task_port: caller_port,
+            listen_fd: 0,
+            flags: 0,
+            buf_va: statbuf_va,
+            buf_len: 144,
+            scratch_slot: 0xFF,
+            total_so_far: 0,
+            mmap_prot_flags: 0,
+            mmap_aligned_len: 0,
+            extra_handle: 0,
+            cache_slot: 0xFF,
+            in_flight_chunk: 0,
+        };
+    }
+    let d2 = (path.len() as u64 & 0xFFFF)
+        | (((correlation as u32) as u64 & 0xFFFF_FFFF) << 16);
+    let r = syscall::send_nb_4(vfs_port, VFS_STAT_ASYNC, w0, w1, d2, w3);
+    if r != 0 {
+        async_free_slot(slot);
+        return TryAsyncVfs::NotTaken;
+    }
+    TryAsyncVfs::Deferred
 }
 
 /// Reconstruct the 28-byte name buffer from packed PendingAsync fields.
@@ -4721,6 +4950,14 @@ fn do_open(pi: usize, caller_port: u64, path_va: usize, flags: u64) -> u64 {
     let vfs_port = get_vfs_port();
     if vfs_port == 0 {
         return linux_err(ENOSYS);
+    }
+
+    // Try async first (covers paths 1-24 bytes once VFS_SET_REPLY_PORT
+    // has been delivered).  NotTaken falls through to the synchronous
+    // paths below; the long-path variant covers paths > 24 bytes too.
+    if let TryAsyncVfs::Deferred = try_open_vfs_async(pi, caller_port, flags, &path[..pathlen]) {
+        unsafe { REPLY_DEFERRED = true; }
+        return 0;
     }
 
     // For paths longer than the 16-byte inline limit, use the long-path
@@ -5411,6 +5648,15 @@ fn handle_stat(caller_port: u64, args: &[u64; 6]) -> u64 {
         stat_buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
         let written = syscall::personality_copy_out(caller_port, statbuf_va, &stat_buf);
         if written < 144 { return linux_err(EFAULT); }
+        return 0;
+    }
+
+    // Try async first (paths 1-24 bytes once VFS_SET_REPLY_PORT has
+    // been delivered).  finish_stat_vfs formats the result into the
+    // caller's statbuf and personality_replies — handle_stat returns
+    // 0 and the dispatch loop suppresses its reply via REPLY_DEFERRED.
+    if let TryAsyncVfs::Deferred = try_stat_vfs_async(caller_port, statbuf_va, &path[..pathlen]) {
+        unsafe { REPLY_DEFERRED = true; }
         return 0;
     }
 
@@ -10414,6 +10660,50 @@ fn handle_async_reply(msg: &syscall::Message) -> bool {
             }
             true
         }
+        VFS_OPEN_REPLY => {
+            // data[0] = correlation
+            // data[1] = fs_port (0 = error — caller gets ENOENT)
+            // data[2] = handle
+            // data[3] = file_size
+            let correlation = msg.data[0];
+            let fs_port = msg.data[1];
+            let handle = msg.data[2];
+            let file_size = msg.data[3];
+            let slot = match async_find_by_correlation(correlation) {
+                Some(s) => s,
+                None => return false,
+            };
+            let kind = unsafe { PENDING_ASYNC[slot].kind };
+            match kind {
+                PendingAsyncKind::OpenVfs => {
+                    finish_open_vfs(slot, fs_port, handle, file_size);
+                }
+                _ => async_free_slot(slot),
+            }
+            true
+        }
+        VFS_STAT_REPLY => {
+            // data[0] = correlation
+            // data[1] = file_size (raw FS reply data[0])
+            // data[2] = mode      (raw FS reply data[1]; 0 = error)
+            // data[3] = ino       (raw FS reply data[3])
+            let correlation = msg.data[0];
+            let file_size = msg.data[1];
+            let mode = msg.data[2];
+            let ino = msg.data[3];
+            let slot = match async_find_by_correlation(correlation) {
+                Some(s) => s,
+                None => return false,
+            };
+            let kind = unsafe { PENDING_ASYNC[slot].kind };
+            match kind {
+                PendingAsyncKind::StatVfs => {
+                    finish_stat_vfs(slot, file_size, mode, ino);
+                }
+                _ => async_free_slot(slot),
+            }
+            true
+        }
         // IRFS_IO_READ_REPLY is exclusively handled by the reply
         // thread (see reply_thread_entry).  Replies are routed there
         // because we register IRFS_REPLY_PORT with initramfs_srv —
@@ -10472,6 +10762,117 @@ fn finish_connect_initramfs(slot: usize, handle: u64, size: u64) {
         }
     }
     let _ = syscall::personality_reply(caller_port, fd as u64);
+}
+
+/// Continuation for VFS_OPEN_ASYNC.  Inputs:
+///   slot      — PENDING_ASYNC index allocated by try_open_vfs_async
+///   fs_port   — fs server port, or 0 = error
+///   handle    — fs server handle for the opened file
+///   file_size — size in bytes
+///
+/// On error, recover the original path from the PendingAsync slot and
+/// install a Dir FD — mirrors the sync handle_open behavior so apps
+/// that opendir() on real directories get the same enumeration path
+/// (getdents64 via VFS_READDIR) instead of a regressed ENOENT.
+fn finish_open_vfs(slot: usize, fs_port: u64, handle: u64, file_size: u64) {
+    let (pi, caller_port, flags) = unsafe {
+        let s = &PENDING_ASYNC[slot];
+        (s.pi, s.caller_task_port, s.flags)
+    };
+    let (path_buf, pathlen) = unpack_irfs_name(slot);
+    async_free_slot(slot);
+
+    if fs_port == 0 {
+        // VFS_OPEN failure — could be a real ENOENT or a directory
+        // (FS servers don't open dirs).  Install a Dir FD so
+        // getdents64 can enumerate via VFS_READDIR.  Same pre-existing
+        // semantics as the sync path: real ENOENT also produces a
+        // (mostly-empty) Dir FD, which apps treat as an empty dir.
+        let pl = pathlen.min(16);
+        let mut dir_path16 = [0u8; 16];
+        let (dir_path, dir_len) = if pl > 0 && path_buf[0] == b'/' {
+            for i in 0..pl { dir_path16[i] = path_buf[i]; }
+            (dir_path16, pl)
+        } else {
+            unsafe {
+                let clen = PROC_TABLE[pi].cwd_len;
+                let mut buf = [0u8; 16];
+                let mut pos = 0;
+                for i in 0..clen { if pos < 16 { buf[pos] = PROC_TABLE[pi].cwd[i]; pos += 1; } }
+                if pos > 0 && buf[pos - 1] != b'/' { if pos < 16 { buf[pos] = b'/'; pos += 1; } }
+                for i in 0..pl { if pos < 16 { buf[pos] = path_buf[i]; pos += 1; } }
+                (buf, pos)
+            }
+        };
+        let fd = match alloc_fd(pi) {
+            Some(f) => f,
+            None => {
+                let _ = syscall::personality_reply(caller_port, linux_err(EBADF));
+                return;
+            }
+        };
+        unsafe {
+            PROC_TABLE[pi].fds[fd].kind = FdKind::Dir;
+            PROC_TABLE[pi].fds[fd].offset = 0;
+            PROC_TABLE[pi].fds[fd].dir_path_len = dir_len as u8;
+            for i in 0..dir_len.min(16) {
+                PROC_TABLE[pi].fds[fd].dir_path[i] = dir_path[i];
+            }
+        }
+        let _ = syscall::personality_reply(caller_port, fd as u64);
+        return;
+    }
+    let fd = match alloc_fd(pi) {
+        Some(f) => f,
+        None => {
+            let _ = syscall::personality_reply(caller_port, linux_err(EMFILE));
+            return;
+        }
+    };
+    unsafe {
+        PROC_TABLE[pi].fds[fd].kind = FdKind::File;
+        PROC_TABLE[pi].fds[fd].fs_port = fs_port;
+        PROC_TABLE[pi].fds[fd].handle = handle;
+        PROC_TABLE[pi].fds[fd].file_size = file_size;
+        PROC_TABLE[pi].fds[fd].offset = 0;
+        if flags & 0x80000 != 0 { // O_CLOEXEC
+            PROC_TABLE[pi].fds[fd].fd_flags = FD_CLOEXEC;
+        }
+    }
+    let _ = syscall::personality_reply(caller_port, fd as u64);
+}
+
+/// Continuation for VFS_STAT_ASYNC.  Inputs are the raw FS_STAT reply
+/// fields (size, mode, ino).  mode == 0 means error → ENOENT.  On
+/// success, format the Linux struct stat (144 bytes) into the caller's
+/// statbuf VA recorded in PendingAsync.buf_va and reply 0.
+fn finish_stat_vfs(slot: usize, size: u64, mode: u64, ino: u64) {
+    let (caller_port, statbuf_va) = unsafe {
+        let s = &PENDING_ASYNC[slot];
+        (s.caller_task_port, s.buf_va)
+    };
+    async_free_slot(slot);
+
+    if mode == 0 {
+        let _ = syscall::personality_reply(caller_port, linux_err(ENOENT));
+        return;
+    }
+    let mut stat_buf = [0u8; 144];
+    let mode32 = mode as u32;
+    // st_ino at offset 8 (u64)
+    stat_buf[8..16].copy_from_slice(&ino.to_le_bytes());
+    // st_mode at offset 24 (u32)
+    stat_buf[24..28].copy_from_slice(&mode32.to_le_bytes());
+    // st_size at offset 48 (i64)
+    stat_buf[48..56].copy_from_slice(&size.to_le_bytes());
+    // st_blksize at offset 56 (i64)
+    stat_buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+    let written = syscall::personality_copy_out(caller_port, statbuf_va, &stat_buf);
+    if written < 144 {
+        let _ = syscall::personality_reply(caller_port, linux_err(EFAULT));
+        return;
+    }
+    let _ = syscall::personality_reply(caller_port, 0);
 }
 
 /// Plan-A reply-thread entry: park on IRFS_REPLY_PORT and dispatch
@@ -12383,6 +12784,10 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // main-loop iteration retries until it sticks, then becomes a
         // no-op via IRFS_ASYNC_REGISTERED.
         let _ = try_register_irfs_async_reply_port();
+        // Same idea for vfs_srv — register BACKEND_REPLY_PORT so
+        // VFS_OPEN_REPLY / VFS_STAT_REPLY get routed to the main
+        // dispatch thread.
+        let _ = try_register_vfs_async_reply_port();
 
         // Reaper: check one PROC_TABLE slot per iteration, closing its
         // FDs if the owner's task port has gone dead (task exited or was

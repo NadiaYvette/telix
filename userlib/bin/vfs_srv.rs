@@ -18,6 +18,7 @@ extern crate userlib;
 use core::cmp::Ord;
 use core::iter::Iterator;
 use core::option::Option::{self, None, Some};
+use core::sync::atomic::{AtomicU64, Ordering};
 use userlib::syscall;
 
 // VFS protocol tags.
@@ -25,8 +26,14 @@ const VFS_MOUNT: u64 = 0x6000;
 const VFS_UNMOUNT: u64 = 0x6001;
 const VFS_OPEN: u64 = 0x6010;
 const VFS_OPEN_LONG: u64 = 0x6011;
+const VFS_OPEN_ASYNC: u64 = 0x6012;
+const VFS_OPEN_REPLY: u64 = 0x6112;
+const VFS_SET_REPLY_PORT: u64 = 0x6019;
+const VFS_SET_REPLY_PORT_OK: u64 = 0x6119;
 const VFS_STAT: u64 = 0x6020;
 const VFS_STAT_LONG: u64 = 0x6021;
+const VFS_STAT_ASYNC: u64 = 0x6022;
+const VFS_STAT_REPLY: u64 = 0x6122;
 const VFS_READDIR: u64 = 0x6030;
 
 const VFS_OK: u64 = 0x6100;
@@ -206,7 +213,7 @@ fn notify_inotify(event_mask: u64, path_w0: u64, path_w1: u64) {
 }
 
 const MAX_MOUNTS: usize = 8;
-const MAX_PATH: usize = 16; // fits in 2 data words
+const MAX_PATH: usize = 32; // 24-byte VFS_OPEN_ASYNC paths + headroom
 
 /// Mount table entry.
 struct MountEntry {
@@ -229,6 +236,12 @@ impl MountEntry {
 
 static mut MOUNTS: [MountEntry; MAX_MOUNTS] = [const { MountEntry::empty() }; MAX_MOUNTS];
 
+/// Reply port registered by a personality (e.g. linux_srv) via
+/// VFS_SET_REPLY_PORT.  Async replies (VFS_OPEN_REPLY / VFS_STAT_REPLY)
+/// are sent here via send_nb_4.  0 = no port registered yet; async
+/// handlers refuse to run until set.
+static ASYNC_REPLY_PORT: AtomicU64 = AtomicU64::new(0);
+
 /// Unpack a path from data[0..1] (up to 16 bytes).
 fn unpack_path(d0: u64, d1: u64, len: usize) -> ([u8; MAX_PATH], usize) {
     let mut buf = [0u8; MAX_PATH];
@@ -239,6 +252,24 @@ fn unpack_path(d0: u64, d1: u64, len: usize) -> ([u8; MAX_PATH], usize) {
         } else {
             buf[i] = (d1 >> ((i - 8) * 8)) as u8;
         }
+    }
+    (buf, actual_len)
+}
+
+/// Unpack a path from data[0..1] + data[3] (up to 24 bytes) for the
+/// VFS_OPEN_ASYNC / VFS_STAT_ASYNC ABI.  Inverse of pack_path_async24
+/// on the linux_srv side.
+fn unpack_path_24(d0: u64, d1: u64, d3: u64, len: usize) -> ([u8; MAX_PATH], usize) {
+    let mut buf = [0u8; MAX_PATH];
+    let actual_len = if len < MAX_PATH { len } else { MAX_PATH };
+    for i in 0..actual_len.min(8) {
+        buf[i] = (d0 >> (i * 8)) as u8;
+    }
+    for i in 8..actual_len.min(16) {
+        buf[i] = (d1 >> ((i - 8) * 8)) as u8;
+    }
+    for i in 16..actual_len.min(24) {
+        buf[i] = (d3 >> ((i - 16) * 8)) as u8;
     }
     (buf, actual_len)
 }
@@ -989,6 +1020,169 @@ fn handle_stat(data: &[u64; 6]) {
     }
 }
 
+/// Handle VFS_SET_REPLY_PORT: store the personality's async-reply port
+/// for future VFS_OPEN_ASYNC / VFS_STAT_ASYNC completions.  Replies
+/// VFS_SET_REPLY_PORT_OK so the caller (linux_srv) flips its
+/// VFS_ASYNC_REGISTERED bit.
+fn handle_set_reply_port(data: &[u64; 6]) {
+    let reply_port = data[0];
+    ASYNC_REPLY_PORT.store(reply_port, Ordering::Release);
+    let _ = syscall::reply(VFS_SET_REPLY_PORT_OK, 0, 0, 0, 0, 0);
+}
+
+/// Common forwarder for async OPEN.  Resolves the path, picks short
+/// (FS_OPEN) or long (FS_OPEN_LONG via FS_SCRATCH_VA grant) variant
+/// based on the relativized name length, then sends VFS_OPEN_REPLY to
+/// ASYNC_REPLY_PORT.  Caller is responsible for sending the
+/// no-reply-port ack via syscall::reply().
+fn async_open_forward(
+    abs_path: &[u8; MAX_PATH],
+    plen: usize,
+    correlation: u64,
+    reply_port: u64,
+) {
+    let send_err = |corr: u64| {
+        let _ = syscall::send_nb_4(reply_port, VFS_OPEN_REPLY, corr, 0, 0, 0);
+    };
+    let (mount_idx, prefix_end) = match find_mount(abs_path, plen) {
+        Some(r) => r,
+        None => return send_err(correlation),
+    };
+    let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
+    let (rel, rel_len) = relative_path(abs_path, plen, prefix_end);
+
+    // Choose short vs long based on relative name length.
+    let fs_reply = if rel_len <= 16 {
+        let (n0, n1) = pack_name_2(rel, rel_len);
+        let d2 = rel_len as u64;
+        syscall::call(fs_port, FS_OPEN, n0, n1, d2, 0)
+    } else {
+        if !ensure_fs_scratch_grant(fs_port) {
+            return send_err(correlation);
+        }
+        let scratch = unsafe { VFS_SCRATCH_VA };
+        if scratch == 0 {
+            return send_err(correlation);
+        }
+        let dst = scratch as *mut u8;
+        for i in 0..rel_len.min(MAX_LONG_PATH) {
+            unsafe { *dst.add(i) = rel[i] };
+        }
+        let d0 = rel_len as u64;
+        syscall::call(fs_port, FS_OPEN_LONG, d0, 0, 0, 0)
+    };
+    match fs_reply {
+        Some(r) if r.tag == FS_OPEN_OK => {
+            let handle = r.data[0];
+            let size = r.data[1];
+            let _ = syscall::send_nb_4(
+                reply_port,
+                VFS_OPEN_REPLY,
+                correlation,
+                fs_port,
+                handle,
+                size,
+            );
+        }
+        _ => send_err(correlation),
+    }
+}
+
+/// Common forwarder for async STAT.  Mirror of async_open_forward but
+/// for FS_STAT / FS_STAT_LONG.  On error returns mode=0 so the
+/// linux_srv continuation distinguishes from a real stat.
+fn async_stat_forward(
+    abs_path: &[u8; MAX_PATH],
+    plen: usize,
+    correlation: u64,
+    reply_port: u64,
+) {
+    let send_err = |corr: u64| {
+        let _ = syscall::send_nb_4(reply_port, VFS_STAT_REPLY, corr, 0, 0, 0);
+    };
+    let (mount_idx, prefix_end) = match find_mount(abs_path, plen) {
+        Some(r) => r,
+        None => return send_err(correlation),
+    };
+    let fs_port = unsafe { (*core::ptr::addr_of!(MOUNTS))[mount_idx].fs_port };
+    let (rel, rel_len) = relative_path(abs_path, plen, prefix_end);
+
+    let fs_reply = if rel_len <= 16 {
+        let (n0, n1) = pack_name_2(rel, rel_len);
+        let d2 = rel_len as u64;
+        syscall::call(fs_port, FS_STAT, n0, n1, d2, 0)
+    } else {
+        if !ensure_fs_scratch_grant(fs_port) {
+            return send_err(correlation);
+        }
+        let scratch = unsafe { VFS_SCRATCH_VA };
+        if scratch == 0 {
+            return send_err(correlation);
+        }
+        let dst = scratch as *mut u8;
+        for i in 0..rel_len.min(MAX_LONG_PATH) {
+            unsafe { *dst.add(i) = rel[i] };
+        }
+        let d0 = rel_len as u64;
+        syscall::call(fs_port, FS_STAT_LONG, d0, 0, 0, 0)
+    };
+    match fs_reply {
+        Some(r) if r.tag == FS_STAT_OK => {
+            // size = data[0], mode = data[1], ftype = data[2], mtime/ino = data[3].
+            let size = r.data[0];
+            let mode = r.data[1];
+            let ino = r.data[3];
+            let _ = syscall::send_nb_4(
+                reply_port,
+                VFS_STAT_REPLY,
+                correlation,
+                size,
+                mode,
+                ino,
+            );
+        }
+        _ => send_err(correlation),
+    }
+}
+
+/// Handle VFS_OPEN_ASYNC: 1-24 byte path inline-packed in data[0..2,3],
+/// correlation in data[2] bits 16..48.  Replies via VFS_OPEN_REPLY
+/// asynchronously to ASYNC_REPLY_PORT — no reply on the request port.
+fn handle_open_async(data: &[u64; 6]) {
+    let path_len = (data[2] & 0xFFFF) as usize;
+    let correlation = (data[2] >> 16) & 0xFFFF_FFFF;
+    let reply_port = ASYNC_REPLY_PORT.load(Ordering::Acquire);
+    if reply_port == 0 {
+        // No reply port registered yet; drop silently — the caller is
+        // expected to fall back to the sync VFS_OPEN path.
+        return;
+    }
+    let (mut path, plen) = unpack_path_24(data[0], data[1], data[3], path_len);
+    let plen = normalize_path(&mut path, plen);
+    if plen == 0 {
+        let _ = syscall::send_nb_4(reply_port, VFS_OPEN_REPLY, correlation, 0, 0, 0);
+        return;
+    }
+    async_open_forward(&path, plen, correlation, reply_port);
+}
+
+/// Handle VFS_STAT_ASYNC: same packing as VFS_OPEN_ASYNC.
+fn handle_stat_async(data: &[u64; 6]) {
+    let path_len = (data[2] & 0xFFFF) as usize;
+    let correlation = (data[2] >> 16) & 0xFFFF_FFFF;
+    let reply_port = ASYNC_REPLY_PORT.load(Ordering::Acquire);
+    if reply_port == 0 {
+        return;
+    }
+    let (mut path, plen) = unpack_path_24(data[0], data[1], data[3], path_len);
+    let plen = normalize_path(&mut path, plen);
+    if plen == 0 {
+        let _ = syscall::send_nb_4(reply_port, VFS_STAT_REPLY, correlation, 0, 0, 0);
+        return;
+    }
+    async_stat_forward(&path, plen, correlation, reply_port);
+}
+
 /// Handle VFS_READDIR: resolve path, forward FS_READDIR to FS server.
 /// Under call/reply, this is per-entry: client sends offset in data[3],
 /// VFS forwards one FS_READDIR call, relays the single reply (OK or END).
@@ -1397,8 +1591,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             VFS_UNMOUNT => handle_unmount(&msg.data),
             VFS_OPEN => handle_open(&msg.data),
             VFS_OPEN_LONG => handle_open_long(&msg.data),
+            VFS_OPEN_ASYNC => handle_open_async(&msg.data),
             VFS_STAT => handle_stat(&msg.data),
             VFS_STAT_LONG => handle_stat_long(&msg.data),
+            VFS_STAT_ASYNC => handle_stat_async(&msg.data),
+            VFS_SET_REPLY_PORT => handle_set_reply_port(&msg.data),
             VFS_READDIR => handle_readdir(&msg.data),
             VFS_MKDIR => handle_mkdir(&msg.data),
             VFS_UNLINK => handle_unlink(&msg.data),
