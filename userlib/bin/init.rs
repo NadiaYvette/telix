@@ -10990,13 +10990,23 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     unsafe {
                         static PATH: &[u8] = b"/Xwayland\0";
                         static A0: &[u8]   = b"Xwayland\0";
-                        static A1: &[u8]   = b"-terminate\0";
                         // -verbose 0: silence Xwayland's startup chatter.
                         // Each fprintf goes through linux_srv's write
                         // path (one IPC per call) and serial-prints
                         // synchronously — at -verbose 3 that's hundreds
                         // of round trips during lib load, glamor probe,
                         // and wayland init.
+                        //
+                        // `-terminate` was previously argv[1]; removed
+                        // because it makes Xwayland exit when the LAST
+                        // client disconnects — i.e., the moment xeyes
+                        // attempt 1 fails-and-exits, Xwayland goes too,
+                        // breaking the wait loop before attempt 2 can
+                        // fire.  Without -terminate, Xwayland persists
+                        // and init.rs is responsible for killing it
+                        // explicitly: the alive-killed success path
+                        // (line ~11244) already does this on PASS, and
+                        // the failure-path kill below handles exhaust.
                         static A2: &[u8]   = b"-verbose\0";
                         static A3: &[u8]   = b"0\0";
                         static E0: &[u8]   = b"LD_LIBRARY_PATH=/lib64\0";
@@ -11018,13 +11028,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                         // garbage env values and aborts with paths like
                         // "/lib64/tive: file too short".
                         // See project_xeyes_envp_compiler_elision.md.
-                        static mut XWAYLAND_ARGV: [u64; 5] = [0; 5];
+                        static mut XWAYLAND_ARGV: [u64; 4] = [0; 4];
                         static mut XWAYLAND_ENVP: [u64; 6] = [0; 6];
                         XWAYLAND_ARGV[0] = A0.as_ptr() as u64;
-                        XWAYLAND_ARGV[1] = A1.as_ptr() as u64;
-                        XWAYLAND_ARGV[2] = A2.as_ptr() as u64;
-                        XWAYLAND_ARGV[3] = A3.as_ptr() as u64;
-                        XWAYLAND_ARGV[4] = 0;
+                        XWAYLAND_ARGV[1] = A2.as_ptr() as u64;
+                        XWAYLAND_ARGV[2] = A3.as_ptr() as u64;
+                        XWAYLAND_ARGV[3] = 0;
                         XWAYLAND_ENVP[0] = E0.as_ptr() as u64;
                         XWAYLAND_ENVP[1] = E1.as_ptr() as u64;
                         XWAYLAND_ENVP[2] = E2.as_ptr() as u64;
@@ -11358,6 +11367,22 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                             }
                             next_xeyes_fork_i = -1;
                         }
+                        // Without `-terminate`, Xwayland persists across
+                        // xeyes failures.  Once we've exhausted retries
+                        // AND the last attempt has been reaped, there's
+                        // nothing more for the wait loop to wait on —
+                        // break out and let the failure-path kill below
+                        // tear Xwayland down.
+                        if xeyes_attempt >= MAX_XEYES_ATTEMPTS
+                            && xeyes_code != -1
+                            && next_xeyes_fork_i < 0
+                            && !xeyes_killed_alive
+                        {
+                            syscall::debug_puts(
+                                b"  [H14] all xeyes attempts exhausted; breaking wait\n",
+                            );
+                            break;
+                        }
                         syscall::sleep_ms(10);
                         // Fine-grained checkpoints so silent stalls in the wait
                         // loop leave a visible trace.  Earlier we'd see only @5s,
@@ -11384,6 +11409,19 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     if xeyes_child != u64::MAX && xeyes_code == -1 {
                         if let Some((_p, status)) = syscall::wait4(xeyes_child as i64, 0) {
                             xeyes_code = ((status >> 8) & 0xFF) as i64;
+                        }
+                    }
+                    // With `-terminate` removed, Xwayland persists past
+                    // xeyes failures.  Kill it explicitly if it's still
+                    // alive (i.e., we exited the wait loop without an
+                    // alive-killed event or a natural waitpid reap).
+                    // The alive-killed path (line ~11244) already issues
+                    // its own kill before breaking, so this is a no-op
+                    // there; redundant kill is harmless.
+                    if xw_code == -1 {
+                        let _ = syscall::kill(xw_child);
+                        if let Some(code) = syscall::waitpid(xw_child) {
+                            xw_code = code as i64;
                         }
                     }
                     // Print "Step H14 xeyes: ..." summary covering the
