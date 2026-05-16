@@ -335,4 +335,125 @@ proof fn lemma_set_bit_observed(bmp: u64, bit: u64)
 {
 }
 
+// ── Popcount-by-1 induction ────────────────────────────────────────
+//
+// Defining a custom spec `popcnt` and proving the change-by-1 lemmas
+// that connect the bit-level changes above to a numeric delta.
+//
+// Strategy: induct on the bit position.  Base case (bit == 0) and
+// step case (bit > 0) are each discharged by inlined bit_vector
+// helpers that pin the shift-and-mask arithmetic.
+
+/// Spec popcount: recursive over the bits of x.  Decreases via the
+/// nat view of x because Verus needs a well-founded order for the
+/// termination proof.
+spec fn popcnt(x: u64) -> nat
+    decreases x when x > 0
+    via decreases_popcnt
+{
+    if x == 0 {
+        0
+    } else {
+        (x & 1) as nat + popcnt(x >> 1)
+    }
+}
+
+#[verifier::decreases_by]
+proof fn decreases_popcnt(x: u64) {
+    assert(x > 0 ==> (x >> 1) < x) by (bit_vector);
+}
+
+/// Helper: when bit > 0, clearing bit `bit` from `bmp` doesn't touch
+/// bit 0 — `(bmp & !(1<<bit)) & 1 == bmp & 1`.
+#[verifier::bit_vector]
+proof fn lemma_clear_high_bit_keeps_low(bmp: u64, bit: u64)
+    requires
+        0 < bit < 64,
+    ensures
+        (bmp & !(1u64 << bit)) & 1 == bmp & 1,
+{
+}
+
+/// Helper: when bit > 0, shifting after clearing bit `bit` equals
+/// clearing bit `bit-1` after shifting — i.e.
+/// `(bmp & !(1<<bit)) >> 1 == (bmp >> 1) & !(1 << (bit-1))`.
+#[verifier::bit_vector]
+proof fn lemma_clear_shift_commutes(bmp: u64, bit: u64)
+    requires
+        0 < bit < 64,
+    ensures
+        (bmp & !(1u64 << bit)) >> 1 == (bmp >> 1) & !(1u64 << ((bit - 1) as u64)),
+{
+}
+
+/// Helper: bit-set status is preserved across the shift — if bit `bit`
+/// (for bit > 0) is set in bmp, then bit `bit-1` is set in `bmp >> 1`.
+#[verifier::bit_vector]
+proof fn lemma_set_bit_shifts(bmp: u64, bit: u64)
+    requires
+        0 < bit < 64,
+        (bmp >> bit) & 1 == 1,
+    ensures
+        ((bmp >> 1) >> ((bit - 1) as u64)) & 1 == 1,
+{
+}
+
+/// Mirror helpers for the free-side proof (setting a clear bit).
+/// These bit_vector-discharged lemmas are needed for the future
+/// popcnt-set-bit induction (deferred — see below).
+#[verifier::bit_vector]
+proof fn lemma_set_high_bit_keeps_low(bmp: u64, bit: u64)
+    requires
+        0 < bit < 64,
+    ensures
+        (bmp | (1u64 << bit)) & 1 == bmp & 1,
+{
+}
+
+#[verifier::bit_vector]
+proof fn lemma_set_shift_commutes(bmp: u64, bit: u64)
+    requires
+        0 < bit < 64,
+    ensures
+        (bmp | (1u64 << bit)) >> 1 == (bmp >> 1) | (1u64 << ((bit - 1) as u64)),
+{
+}
+
+#[verifier::bit_vector]
+proof fn lemma_clear_bit_shifts(bmp: u64, bit: u64)
+    requires
+        0 < bit < 64,
+        (bmp >> bit) & 1 == 0,
+    ensures
+        ((bmp >> 1) >> ((bit - 1) as u64)) & 1 == 0,
+{
+}
+
+// ── Popcount-by-1 induction (DEFERRED) ─────────────────────────────
+//
+// The full proof obligations:
+//
+//   proof fn lemma_popcnt_clear_bit(bmp: u64, bit: u64)
+//     requires bit < 64, (bmp >> bit) & 1 == 1
+//     ensures  popcnt(bmp & !(1u64 << bit)) + 1 == popcnt(bmp)
+//
+//   proof fn lemma_popcnt_set_bit(bmp: u64, bit: u64)
+//     requires bit < 64, (bmp >> bit) & 1 == 0
+//     ensures  popcnt(bmp | (1u64 << bit)) == popcnt(bmp) + 1
+//
+// These require induction over `bit` with `decreases bit`, manual
+// unfolding of `popcnt` at each level, and chaining the bit_vector
+// helpers above.  Drafted but the manual-unfold tactic interplay with
+// Verus's SMT trigger heuristics didn't converge in this session.
+//
+// The bit-level structure is already proven (the lemmas above), so
+// the popcnt-delta-by-1 follows from those + induction.  Left as a
+// follow-up iteration: try `reveal_with_fuel(popcnt, N)` or convert to
+// state-machine style with vstd::map / Seq<bool> intermediary.
+//
+// All other lemmas (encoding round-trip, inline-slot round-trip,
+// field non-overlap, bit-level alloc/free changes, idempotence,
+// double-free no-op iff, set-bit observed) ARE verified and form a
+// reusable library for the future state-machine proof.
+
 } // verus!
