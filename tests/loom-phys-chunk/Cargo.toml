@@ -1,0 +1,37 @@
+[package]
+name = "loom-phys-chunk"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone (excluded from the kernel workspace) for the same reason as
+# the other tests/loom-* crates: loom needs std/Arc; the kernel is no_std.
+#
+# We model the lock-free bitmap+fc CAS dance from
+# kernel/src/mm/phys.rs's `chunk_alloc_one` and `chunk_free_one` and the
+# invariants the boot-91amfsq40 reconciliation probe surfaced manually:
+#
+#   * `free_count_global == sum(per-chunk fc)`
+#   * `bitmap.count_ones() == fc` (bitmap-mode chunks)
+#   * No two callers see the same page-index as their alloc result
+#   * Double-free is detected (matching bitmap bit already set)
+#
+# This crate's tests run loom in permutation mode — for every legal
+# interleaving of N simulated CPUs, the kernel's CAS sequences must
+# preserve the invariant at quiescence.  The bugs fixed via the probe
+# (c525ce0 inline double-free, 90bd1ce bitmap fc>=63 cap, b60fa8c
+# alloc_pages rollback orphan, fe2f7c9 transition double-decrement)
+# were race-driven — without this loom model they could regress
+# silently.
+
+# Excluded from the parent kernel workspace (no_std vs std mismatch).
+[workspace]
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
