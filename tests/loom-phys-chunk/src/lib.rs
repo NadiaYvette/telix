@@ -296,6 +296,109 @@ mod tests {
         });
     }
 
+    /// Two threads alloc + one thread free, interleaved.  This is the
+    /// shape that produced the bitmap→inline transition double-decrement
+    /// in commit fe2f7c9: two consumers + one producer, the chunk's fc
+    /// must end at (initial - 2 + 1) regardless of interleaving.  We
+    /// don't model the inline transition itself (mode-switch is bigger
+    /// than this crate scopes), but we do verify that fc and bitmap.
+    /// count_ones() stay consistent across the racing CAS sequences.
+    ///
+    /// Marked #[ignore] because loom's permutation space at 3 threads
+    /// × CAS-retry loops × bitmap exploration is large (>10 minutes).
+    /// Run explicitly via `cargo test --release -- --ignored
+    /// two_alloc_one_free_race`.
+    #[test]
+    #[ignore = "3-thread loom exploration takes >10 min; run on demand"]
+    fn two_alloc_one_free_race() {
+        loom::model(|| {
+            // bits 0, 1, 2 free; bit 7 pre-held (to be freed concurrently)
+            let c = Arc::new(Chunk::new(0b0000_0111));
+            *c.holders.lock().unwrap() |= 1 << 7;
+
+            let ca = c.clone();
+            let cb = c.clone();
+            let cf = c.clone();
+            let ta = thread::spawn(move || alloc(&ca));
+            let tb = thread::spawn(move || alloc(&cb));
+            let tf = thread::spawn(move || free(&cf, 7));
+            let ra = ta.join().unwrap();
+            let rb = tb.join().unwrap();
+            let rf = tf.join().unwrap();
+
+            assert!(ra.is_some(), "alloc A failed");
+            assert!(rb.is_some(), "alloc B failed");
+            assert_eq!(rf, Ok(()), "free failed");
+            assert_ne!(ra, rb, "double-alloc: both got bit {:?}", ra);
+
+            // 3 initial free + 1 freed - 2 allocated = 2 free pages.
+            let bmp = c.bitmap.load(Ordering::Acquire);
+            assert_eq!(
+                bmp.count_ones(),
+                2,
+                "expected 2 free bits, bmp={:b}",
+                bmp
+            );
+            check_invariants(&c);
+        });
+    }
+
+    /// Three threads freeing concurrently into a chunk near the fc=63
+    /// cap.  Models the 90bd1ce-fixed race where bitmap-mode increment
+    /// could push fc past 63 (the chunk's fc field is 7 bits, so
+    /// without the cap it climbed toward 127).
+    ///
+    /// Marked #[ignore] because loom's permutation space at 3 threads
+    /// × bitmap-CAS-retry × fc-CAS-retry is large (>10 minutes).
+    /// Run explicitly via `cargo test --release -- --ignored
+    /// three_concurrent_frees_near_cap`.  The 2-thread variants above
+    /// validate the cap path with cheaper exploration.
+    #[test]
+    #[ignore = "3-thread loom exploration takes >10 min; run on demand"]
+    fn three_concurrent_frees_near_cap() {
+        loom::model(|| {
+            let mut initial_bmp: u64 = 0;
+            for b in 0..60 {
+                initial_bmp |= 1u64 << b;
+            }
+            initial_bmp |= 1u64 << 63;  // bit 63 pre-free
+            let c = Arc::new(Chunk::new(initial_bmp));
+            {
+                let mut h = c.holders.lock().unwrap();
+                for b in 60..63 {
+                    *h |= 1u64 << b;
+                }
+            }
+
+            let c1 = c.clone();
+            let c2 = c.clone();
+            let c3 = c.clone();
+            let t1 = thread::spawn(move || free(&c1, 60));
+            let t2 = thread::spawn(move || free(&c2, 61));
+            let t3 = thread::spawn(move || free(&c3, 62));
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+            let r3 = t3.join().unwrap();
+            assert_eq!(r1, Ok(()));
+            assert_eq!(r2, Ok(()));
+            assert_eq!(r3, Ok(()));
+
+            let bmp = c.bitmap.load(Ordering::Acquire);
+            assert_eq!(
+                bmp.count_ones(),
+                64,
+                "expected all bits set, bmp={:b}",
+                bmp
+            );
+            let fc = c.fc.load(Ordering::Acquire);
+            assert!(
+                fc <= 63,
+                "fc cap violated: fc={} (should be <= 63)",
+                fc
+            );
+        });
+    }
+
     /// Two frees of the same bit.  One should succeed, the other
     /// should return DoubleFree.  This is the c525ce0 fix's invariant.
     #[test]

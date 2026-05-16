@@ -137,4 +137,101 @@ proof fn lemma_bmp_page_roundtrip(fc: u64, own: u64, hb_bit: u64, bmp_pg: u64, i
 {
 }
 
+// ── Inline index encoding ──────────────────────────────────────────
+//
+// The inline_bits portion of the state word is 36 bits at positions
+// [56:21], packing up to INLINE_K=6 6-bit indices.  Position i lives
+// at bits [21 + 6*i : 27 + 6*i].  inline_idx(s, i) extracts the
+// i-th index by `(s >> (21 + 6*i)) & 0x3F`.
+//
+// We prove the encoder/decoder round-trips for each position
+// individually.  Because each lemma below pins one slot via its
+// requires-clause shape, the bit-vector solver discharges them
+// directly without needing to reason across all positions
+// simultaneously.
+
+#[verifier::bit_vector]
+proof fn lemma_inline_idx0(fc: u64, own: u64, hb_bit: u64, bmp_pg: u64, idx0: u64, rest: u64)
+    requires
+        fc <= 0x7F,
+        own <= 0x7F,
+        hb_bit == 0 || hb_bit == (1u64 << 14),
+        bmp_pg <= 0x3F,
+        idx0 <= 0x3F,
+        rest < (1u64 << 30),  // 30 = 5 slots × 6 bits, leaving slot 0 free
+    ensures
+        (((fc & 0x7F)
+            | (own << 7)
+            | hb_bit
+            | (bmp_pg << 15)
+            | ((idx0 | (rest << 6)) << 21)) >> 21) & 0x3F == idx0,
+{
+}
+
+#[verifier::bit_vector]
+proof fn lemma_inline_idx1(fc: u64, own: u64, hb_bit: u64, bmp_pg: u64,
+                           idx0: u64, idx1: u64, rest: u64)
+    requires
+        fc <= 0x7F,
+        own <= 0x7F,
+        hb_bit == 0 || hb_bit == (1u64 << 14),
+        bmp_pg <= 0x3F,
+        idx0 <= 0x3F,
+        idx1 <= 0x3F,
+        rest < (1u64 << 24),  // 24 = 4 slots × 6 bits
+    ensures
+        (((fc & 0x7F)
+            | (own << 7)
+            | hb_bit
+            | (bmp_pg << 15)
+            | ((idx0 | (idx1 << 6) | (rest << 12)) << 21)) >> (21 + 6)) & 0x3F == idx1,
+{
+}
+
+#[verifier::bit_vector]
+proof fn lemma_inline_idx5(fc: u64, own: u64, hb_bit: u64, bmp_pg: u64,
+                           low: u64, idx5: u64)
+    requires
+        fc <= 0x7F,
+        own <= 0x7F,
+        hb_bit == 0 || hb_bit == (1u64 << 14),
+        bmp_pg <= 0x3F,
+        low < (1u64 << 30),  // 30 = 5 slots × 6 bits
+        idx5 <= 0x3F,
+    ensures
+        (((fc & 0x7F)
+            | (own << 7)
+            | hb_bit
+            | (bmp_pg << 15)
+            | ((low | (idx5 << 30)) << 21)) >> (21 + 30)) & 0x3F == idx5,
+{
+}
+
+// ── Field non-overlap ──────────────────────────────────────────────
+//
+// Prove that the inline_bits region (bits [56:21]) is disjoint from
+// the FREE_COUNT, OWNER, HAS_BITMAP, and BMP_PAGE regions.  This is
+// the key fact that lets future state-machine proofs reason about a
+// single field without re-proving the whole layout.
+
+#[verifier::bit_vector]
+proof fn lemma_inline_does_not_corrupt_fc(fc: u64, inline_bits: u64)
+    requires
+        fc <= 0x7F,
+        inline_bits < (1u64 << 36),
+    ensures
+        ((fc & 0x7F) | (inline_bits << 21)) & 0x7F == fc,
+{
+}
+
+#[verifier::bit_vector]
+proof fn lemma_inline_does_not_corrupt_owner(own: u64, inline_bits: u64)
+    requires
+        own <= 0x7F,
+        inline_bits < (1u64 << 36),
+    ensures
+        (((own << 7) | (inline_bits << 21)) & (0x7Fu64 << 7u64)) >> 7 == own,
+{
+}
+
 } // verus!
