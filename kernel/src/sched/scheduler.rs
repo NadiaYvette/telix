@@ -6376,10 +6376,16 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     t.state = ThreadState::Blocked;
     t.blocked_on = reason;
 
-    // Record wall-clock time for CallReply timeout sweep.
+    // Record vCPU-runtime time for CallReply timeout sweep.  Using
+    // vcpu_runtime_ns rather than wallclock monotonic_ns makes the 30s
+    // CALL_REPLY_TIMEOUT_NS robust to KVM host descheduling: a long
+    // host pause (200s+ TICK-GAP observed) advances wallclock but not
+    // vcpu_runtime, so an in-flight call doesn't get falsely abandoned
+    // with CALL_REPLY_SERVER_DIED.  Paravirt Layer 1 defensive fix —
+    // see project_scheduler_paravirt_robustness.
     if matches!(reason, BlockReason::CallReply(_)) {
         thread_ref(tid as ThreadId).call_blocked_ns.store(
-            get_monotonic_ns(),
+            crate::arch::timer::vcpu_runtime_ns(),
             Ordering::Release,
         );
         trace_point("park_ipc.CallReply", tid as u32);
@@ -6717,7 +6723,10 @@ const CALL_REPLY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 seconds
 #[cold]
 #[inline(never)]
 fn call_reply_timeout_sweep() {
-    let now = get_monotonic_ns();
+    // vcpu_runtime_ns matches the scale used to stamp call_blocked_ns
+    // in park_ipc — see commentary there.  Host pauses don't advance
+    // either, so the 30s threshold reflects real in-guest blocked time.
+    let now = crate::arch::timer::vcpu_runtime_ns();
     let max_tid = NEXT_THREAD_ID.load(Ordering::Relaxed).min(200);
     for tid in 1..max_tid {
         let t = unsafe { &*(THREAD_TABLE.get(tid) as *const Thread) };
