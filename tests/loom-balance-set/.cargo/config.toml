@@ -1,0 +1,16 @@
+# Hard-wire the `--cfg loom` flag so `cargo test` enables loom's
+# `loom::sync` shims without environment fiddling.  Without this, our
+# tests are gated out by `#![cfg(loom)]` and the real `std` atomics
+# aren't instrumented.
+#
+# Also override the workspace's `target = "aarch64-unknown-none"` to
+# force the host triple — loom's std deps don't build for bare-metal.
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = ["--cfg", "loom"]
+
+# Drop the kernel-targeted build-std setting from the workspace config —
+# host builds use the precompiled std/core that ships with the toolchain.
+[unstable]
+build-std = []
+build-std-features = []

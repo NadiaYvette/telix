@@ -3,6 +3,7 @@ resolver = "2"
 members = ["kernel", "userlib"]
 exclude = [
     "boot/efi",
+    "tests/loom-balance-set",
     "tests/loom-park-state",
     "tests/loom-turnstile",
     "tests/loom-turnstile-slab",

@@ -1,0 +1,38 @@
+[package]
+name = "loom-balance-set"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone (excluded from the kernel workspace) because:
+#   * loom requires `std` and `Box`/`Arc`; the kernel is `no_std`.
+#   * The kernel's nightly cfg(target = "*-unknown-none") targets cannot
+#     link an `std` crate.
+#   * We model only the suspend/resume thread-state CAS dance (kernel
+#     `suspend_task` / `resume_task` in src/sched/scheduler.rs), not
+#     the full scheduler.
+#
+# Invariants we assert under loom:
+#   * Suspend/resume are atomic: a thread is either Suspended or Ready,
+#     never some torn intermediate value visible to a concurrent reader.
+#   * `pick_resume_candidate` always picks a *currently-suspended* task
+#     (no resurrection of a thread that already raced back to Ready).
+#   * The race between (a) external wake_thread arriving while
+#     suspend_task is mid-flight and (b) resume_task running
+#     concurrently with a legitimate wake produces a well-defined
+#     final state.
+#
+# Things deliberately NOT modeled:
+#   * The full SCHED_THREAD_ART traversal — we hold one or two thread
+#     slots in arrays.  Iteration order over multiple threads is
+#     orthogonal to the state-transition correctness we want.
+#   * Run-queue enqueue effects — we just record `enqueue_count`.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
