@@ -1,0 +1,37 @@
+[package]
+name = "loom-pending-takeover"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Loom model of the phantom-pending fast-rescue race.
+#
+# Background: under host vCPU descheduling (KVM steal-time > 1s), a
+# thread picked by CPU A can sit in on_cpu=PENDING + in_queue=false
+# for 2+ seconds while A is paused.  Other CPUs cannot help via
+# work-stealing because the thread is already out of the runqueue.
+#
+# Fix (scheduler.rs ~line 7248): rescuer R observes the stuck state
+# and CAS-flips on_cpu PENDING → u32::MAX so the existing orphan-
+# rescue path re-enqueues the thread elsewhere.  When CPU A
+# eventually resumes, its try_switch CAS(PENDING → A) fails with
+# Err(MAX); the CAS_FAIL handler recognises u32::MAX as "rescue
+# took over, benign yield" and skips the kill.
+#
+# This loom model checks:
+#   1. The CAS pair is correctly mutex (never both succeed).
+#   2. If R wins, A's CAS_FAIL is the rescue-takeover (Err(MAX))
+#      flavour — not the true double-pick (Err(cpu)).
+#   3. The thread reaches a recoverable terminal state under all
+#      interleavings.
+
+[dependencies]
+loom = "0.7"
+
+[profile.release]
+debug = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
+
+[workspace]

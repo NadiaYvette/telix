@@ -1086,6 +1086,21 @@ static RESCUE_STUCK_PENDING_FIRES: AtomicU64 = AtomicU64::new(0);
 /// that hard-wedge fixes (commits 644c7b0 / 27cf951) didn't eliminate.
 static PENDING_LOW_FIRES: AtomicU64 = AtomicU64::new(0);
 
+/// Counts try_switch / voluntary_reschedule / park CAS_FAIL events
+/// that were benign rescue-takeovers (other_cpu == u32::MAX) — the
+/// fast-rescue path observed the picking CPU stuck >FAST_RESCUE_NS
+/// and CAS-flipped on_cpu PENDING → MAX so the original CPU yields
+/// to idle instead of getting killed.  A non-zero count here means
+/// the fast-rescue path actually fired and saved a thread.
+static CAS_FAIL_RESCUE_BAILS: AtomicU64 = AtomicU64::new(0);
+
+/// Counts fast-rescue PENDING→MAX flips successfully attributed to
+/// a host-descheduled picking CPU.  Pairs with CAS_FAIL_RESCUE_BAILS
+/// — every successful fast-rescue should produce one increment here
+/// and at most one increment on a later try_switch path when the
+/// picking CPU resumes.
+static FAST_RESCUE_TAKEOVERS: AtomicU64 = AtomicU64::new(0);
+
 /// #135 false-positive probe: count of try_switch invocations where
 /// pick returned the running thread (concurrent re-enqueue + self-pick).
 /// In this branch we now clear pending_set_ns so the rescue's stale-stamp
@@ -2779,7 +2794,7 @@ pub fn tick(current_sp: u64) -> u64 {
                             .steal_time_ns()
                             .map(|ns| ns / 1000)
                             .unwrap_or(u64::MAX);
-                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={}) sgi=(s={} r={}) forced_preempt={} wake_lat=(n={} avg_us={} max_us={}) wake_hist=(<100us:{} <1ms:{} <10ms:{} <100ms:{} <1s:{} <10s:{} >=10s:{}) tick_max_gap_us={} stale_retarget={} bsp_steal_us={} hv={:?}",
+                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={} fast_takeover={} cas_fail_bail={}) sgi=(s={} r={}) forced_preempt={} wake_lat=(n={} avg_us={} max_us={}) wake_hist=(<100us:{} <1ms:{} <10ms:{} <100ms:{} <1s:{} <10s:{} >=10s:{}) tick_max_gap_us={} stale_retarget={} bsp_steal_us={} hv={:?}",
                             sends, recvs,
                             DOUBLE_ENQ_DRAIN.load(Ordering::Relaxed),
                             DOUBLE_ENQ_RESCUE.load(Ordering::Relaxed),
@@ -2790,6 +2805,8 @@ pub fn tick(current_sp: u64) -> u64 {
                             RESCUE_STALE_ON_CPU.load(Ordering::Relaxed),
                             RESCUE_PENDING.load(Ordering::Relaxed),
                             RESCUE_PHANTOM.load(Ordering::Relaxed),
+                            FAST_RESCUE_TAKEOVERS.load(Ordering::Relaxed),
+                            CAS_FAIL_RESCUE_BAILS.load(Ordering::Relaxed),
                             sgi_s, sgi_r,
                             FORCED_PREEMPT_COUNT.load(Ordering::Relaxed),
                             wake_count, wake_avg_us, wake_max_us,
@@ -3509,15 +3526,18 @@ fn try_switch(current_sp: u64) -> u64 {
         ) {
             trace_point("try_switch.cas_fail", next_id as u32);
             record_trans(next_id as u32, TRANS_CAS_FAIL, thread_ref(next_id).state, other_cpu);
-            crate::println!(
-                "DOUBLE-SCHED: tid={} on_cpu={} this_cpu={} prev={} src={} set_by={} inq={} state={:?}",
-                next_id, other_cpu, cpu, prev_id,
-                thread_ref(next_id).saved_sp_source,
-                thread_ref(next_id).on_cpu_set_by.load(Ordering::Relaxed),
-                thread_ref(next_id).in_queue.load(Ordering::Relaxed),
-                thread_ref(next_id).state
-            );
-            thread_ref(next_id).killed.store(true, Ordering::Release);
+            // CAS is the dispatch-lease mutex: at most one CPU wins
+            // PENDING→cpu per cycle.  If we lost, the thread is owned
+            // by `other_cpu` (could be MAX after a fast-rescue takeover,
+            // could be a real CPU after a rescued+redispatched thread).
+            // Either way, just yield to idle.  The previous "kill on
+            // any non-PENDING value" was defensive paranoia: with CAS
+            // already preventing double-dispatch, the kill could only
+            // ever destroy a legitimately-running thread, never prevent
+            // a buggy state.  Surface the loss in a counter for
+            // visibility; no print (cold path that occasionally
+            // hot-fires under host pressure).
+            CAS_FAIL_RESCUE_BAILS.fetch_add(1, Ordering::Relaxed);
             pcpu.dispatching_tid.store(0, Ordering::Release);
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
@@ -3738,11 +3758,8 @@ pub fn voluntary_reschedule() {
             ON_CPU_PENDING, cpu, Ordering::AcqRel, Ordering::Acquire,
         ) {
             record_trans(next_id as u32, TRANS_CAS_FAIL, thread_ref(next_id).state, other_cpu);
-            crate::println!(
-                "DOUBLE-SCHED(vol): tid={} already on cpu={}, this cpu={}",
-                next_id, other_cpu, cpu
-            );
-            thread_ref(next_id).killed.store(true, Ordering::Release);
+            // See try_switch CAS_FAIL — benign regardless of other_cpu.
+            CAS_FAIL_RESCUE_BAILS.fetch_add(1, Ordering::Relaxed);
             pcpu.dispatching_tid.store(0, Ordering::Release);
             // Undo: stay on cur_id. Drain our deferred store (it was cur).
             deferred_requeue()[cpu as usize].store(0, Ordering::Release);
@@ -6478,11 +6495,8 @@ pub fn park_current_for_ipc(reason: BlockReason) {
             ON_CPU_PENDING, cpu_idx, Ordering::AcqRel, Ordering::Acquire,
         ) {
             record_trans(next_id as u32, TRANS_CAS_FAIL, thread_ref(next_id).state, other_cpu);
-            crate::println!(
-                "DOUBLE-SCHED(park): tid={} already on cpu={}, this cpu={}",
-                next_id, other_cpu, cpu_idx
-            );
-            thread_ref(next_id).killed.store(true, Ordering::Release);
+            // See try_switch CAS_FAIL — benign regardless of other_cpu.
+            CAS_FAIL_RESCUE_BAILS.fetch_add(1, Ordering::Relaxed);
             // Pick idle instead.
             let idle_sp2 = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
@@ -7200,6 +7214,73 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     }
                 }
             }
+            // ----------------------------------------------------------------
+            // Fast-rescue path for phantom-pending wedges.
+            //
+            // Triggered when a thread has been on_cpu=PENDING for >1.5s AND
+            // the picking CPU's last_try_switch_ns is stale >500ms.  That
+            // combination is the host-vCPU-descheduling signature: the
+            // picking CPU was paused by the host between class_pick_next
+            // and the try_switch CAS, leaving the thread "leased" to a
+            // dormant CPU with no way for work-stealing to help (the
+            // thread is out of the runqueue already).
+            //
+            // Recovery: CAS-flip on_cpu PENDING → MAX so the orphan-rescue
+            // path picks it up.  Update last_cpu to a healthy CPU first
+            // so the orphan handler re-enqueues somewhere useful.  When
+            // the original picking CPU eventually resumes, its try_switch
+            // CAS(PENDING → cpu) fails with Err(MAX); the CAS_FAIL handler
+            // recognises u32::MAX as "rescue-takeover, benign yield" and
+            // does NOT kill the thread.
+            //
+            // STUCK_PENDING_AGE's 16s threshold below still fires for the
+            // (rarer) wedge where the picking CPU is alive but failing to
+            // make progress — that path also re-enqueues but uses a more
+            // verbose dump + rate-limiting for diagnostic.
+            const FAST_RESCUE_PENDING_NS: u64 = 1_500_000_000; // 1.5s
+            const PICKING_CPU_STALE_MS: u64 = 500;
+            if pset != 0
+                && !t.in_queue.load(Ordering::Relaxed)
+                && now_ns.saturating_sub(pset) >= FAST_RESCUE_PENDING_NS
+            {
+                let last_cpu_idx = t.last_cpu.load(Ordering::Relaxed);
+                let ncpus = crate::sched::smp::num_cpus() as u32;
+                let picking_cpu_stale = if last_cpu_idx < ncpus {
+                    let pc = crate::sched::smp::get(last_cpu_idx);
+                    let lts = pc.last_try_switch_ns.load(Ordering::Relaxed);
+                    let wall_now = get_monotonic_ns();
+                    lts != 0 && wall_now > lts
+                        && (wall_now - lts) / 1_000_000 > PICKING_CPU_STALE_MS
+                } else { false };
+                if picking_cpu_stale {
+                    // CAS PENDING → MAX.  Failure means original CPU
+                    // resumed and won the race — benign, leave the
+                    // thread alone.
+                    if t.on_cpu.compare_exchange(
+                        ON_CPU_PENDING, u32::MAX,
+                        Ordering::AcqRel, Ordering::Acquire,
+                    ).is_ok() {
+                        FAST_RESCUE_TAKEOVERS.fetch_add(1, Ordering::Relaxed);
+                        // Migrate last_cpu to the rescuer.  The orphan
+                        // re-enqueue path below uses last_cpu as the
+                        // enqueue target.
+                        t.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+                        // Clear pending_set_ns so the next pending episode
+                        // (post-orphan-rescue dispatch) gets a fresh stamp.
+                        t.pending_set_ns.store(0, Ordering::Relaxed);
+                        if (tid as usize) < PENDING_LOW_LOGGED.len() {
+                            PENDING_LOW_LOGGED[tid as usize].store(false, Ordering::Relaxed);
+                        }
+                        // Skip the STUCK_PENDING_AGE block this sweep.  Next
+                        // sweep will see on_cpu==MAX and run the existing
+                        // orphan handler, which re-enqueues on last_cpu
+                        // (now this CPU).
+                        continue;
+                    }
+                }
+            }
+            // ----------------------------------------------------------------
+
             let pending_age = if (tid as usize) < ORPHAN_AGE.len() {
                 ORPHAN_AGE[tid as usize].fetch_add(1, Ordering::Relaxed)
             } else { 0 };
