@@ -7421,16 +7421,29 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                         let sp = pc.dispatch_set_pending_count.load(Ordering::Relaxed);
                         let ok = pc.dispatch_cas_ok_count.load(Ordering::Relaxed);
                         let cli_max_rip = pc.cli_max_rip.load(Ordering::Relaxed);
+                        // Layer 3 paravirt diagnostic: per-CPU steal-time
+                        // accumulation since boot, plus "steal since last
+                        // successful dispatch" — the latter is the value
+                        // the fast-rescue trigger compares against.
+                        let steal_now = crate::arch::hypervisor::ops()
+                            .steal_time_ns_of_cpu(c as u32)
+                            .unwrap_or(0);
+                        let steal_at_disp = pc.steal_ns_at_last_dispatch
+                            .load(Ordering::Relaxed);
+                        let steal_since_disp_ms = if steal_now > steal_at_disp {
+                            (steal_now - steal_at_disp) / 1_000_000
+                        } else { 0 };
                         crate::println!(
                             "IPI-CNT: cpu={} recv={} disp={} send_to=[{},{},{},{}] \
                              cur={} dispg={} idle={} cli_open={} \
                              cli_total={} cli_max={} cli_max_rip=0x{:x} cli_count={} \
-                             set_pend={} cas_ok={} delta={}",
+                             set_pend={} cas_ok={} delta={} steal_total_us={} steal_since_disp_ms={}",
                             c, recv, disp, s0, s1, s2, s3,
                             cur, dispg, idle,
                             if cli_enter != 0 { 1 } else { 0 },
                             cli_total, cli_max, cli_max_rip, cli_count,
                             sp, ok, sp.saturating_sub(ok),
+                            steal_now / 1000, steal_since_disp_ms,
                         );
                         // #135 cli_max-per-callsite: dump the top-N
                         // distinct CLI offenders by max single-region
