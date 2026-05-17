@@ -15,7 +15,12 @@
 
 extern crate userlib;
 use core::cell::Cell;
+use core::sync::atomic::{AtomicU64, Ordering};
 use userlib::syscall;
+
+/// Reply port registered by linux_srv via FS_SET_READ_REPLY_PORT.
+/// 0 = no port; FS_READ_ASYNC silently drops in that case.
+static ASYNC_READ_REPLY_PORT: AtomicU64 = AtomicU64::new(0);
 
 // =====================================================================
 // IPC protocol constants
@@ -32,6 +37,10 @@ const FS_OPEN_OK: u64 = 0x2001;
 const FS_OPEN_LONG: u64 = 0x2002;
 const FS_READ_FS: u64 = 0x2100;
 const FS_READ_OK: u64 = 0x2101;
+const FS_READ_ASYNC: u64 = 0x2102;
+const FS_READ_REPLY: u64 = 0x2103;
+const FS_SET_READ_REPLY_PORT: u64 = 0x2104;
+const FS_SET_READ_REPLY_PORT_OK: u64 = 0x2105;
 const FS_READDIR: u64 = 0x2200;
 const FS_READDIR_OK: u64 = 0x2201;
 const FS_READDIR_END: u64 = 0x2202;
@@ -2289,6 +2298,67 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                     handles[handle].active = false;
                 }
                 let _ = syscall::reply(FS_CLOSE_OK, 0, 0, 0, 0, 0);
+            }
+
+            FS_SET_READ_REPLY_PORT => {
+                ASYNC_READ_REPLY_PORT.store(msg.data[0], Ordering::Release);
+                let _ = syscall::reply(FS_SET_READ_REPLY_PORT_OK, 0, 0, 0, 0, 0);
+            }
+
+            FS_READ_ASYNC => {
+                // Wire format:
+                //   d0 = handle (low 32) | length (high 32)
+                //   d1 = offset
+                //   d2 = grant_va
+                //   d3 = correlation
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as usize;
+                let length = ((msg.data[0] >> 32) & 0xFFFF_FFFF) as usize;
+                let offset = msg.data[1];
+                let grant_va = msg.data[2] as usize;
+                let correlation = msg.data[3];
+                let reply_port = ASYNC_READ_REPLY_PORT.load(Ordering::Acquire);
+                if reply_port == 0 {
+                    continue;
+                }
+                let send_err = || {
+                    let _ = syscall::send_nb_4(
+                        reply_port, FS_READ_REPLY, correlation, 0, 0, 0,
+                    );
+                };
+                if handle >= MAX_OPEN
+                    || !handles[handle].active
+                    || grant_va == 0
+                {
+                    send_err();
+                    continue;
+                }
+                let inode = handles[handle].inode;
+                if offset >= inode.size {
+                    let _ = syscall::send_nb_4(
+                        reply_port, FS_READ_REPLY, correlation, 0, 0, 0,
+                    );
+                    continue;
+                }
+                let n = read_file_data(
+                    &blk,
+                    &vol,
+                    inode.objectid,
+                    inode.size,
+                    offset,
+                    grant_va,
+                    length,
+                );
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                #[cfg(target_arch = "x86_64")]
+                unsafe { core::arch::asm!("mfence"); }
+                let _ = syscall::send_nb_4(
+                    reply_port,
+                    FS_READ_REPLY,
+                    correlation,
+                    n as u64,
+                    0,
+                    0,
+                );
             }
 
             // ----- FS_READ -----
