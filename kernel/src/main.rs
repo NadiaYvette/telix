@@ -164,6 +164,32 @@ pub fn kmain() -> ! {
 /// Runs as a normal kernel thread (not the idle thread) so the scheduler
 /// can preempt between it and the threads it spawns — critical for single-CPU.
 fn startup_thread() -> ! {
+    // #178 probe: detect re-entry of the kernel boot init flow.  Boot 530
+    // showed `Phase 4: Spawning init process...` printed twice with two
+    // distinct initramfs_srv aspaces, suggesting startup_thread itself
+    // runs twice.  Count + identify the invoking thread / CPU on entry.
+    static STARTUP_INVOCATION: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let inv_n = STARTUP_INVOCATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    let entry_tid = sched::current_thread_id();
+    let entry_cpu = sched::smp::cpu_id();
+    println!(
+        "  [STARTUP-PROBE] invocation #{} tid={} cpu={}",
+        inv_n, entry_tid, entry_cpu
+    );
+    if inv_n > 1 {
+        // Don't double-spawn — bail.  We want the log evidence above; the
+        // second-pass spawn block is what creates the duplicate
+        // initramfs_srv on port 6083 and wedges the boot per #178.
+        println!(
+            "  [STARTUP-PROBE] startup_thread re-entered — parking; \
+             the first invocation already owns Phase 3/4 spawns."
+        );
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
     // Phase 3: I/O server stack.
     println!("Phase 3: Starting I/O servers...");
 
