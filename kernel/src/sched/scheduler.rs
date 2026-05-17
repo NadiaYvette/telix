@@ -2803,7 +2803,7 @@ pub fn tick(current_sp: u64) -> u64 {
                             .steal_time_ns()
                             .map(|ns| ns / 1000)
                             .unwrap_or(u64::MAX);
-                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={} fast_takeover={} cas_fail_bail={}) sgi=(s={} r={}) forced_preempt={} wake_lat=(n={} avg_us={} max_us={}) wake_hist=(<100us:{} <1ms:{} <10ms:{} <100ms:{} <1s:{} <10s:{} >=10s:{}) tick_max_gap_us={} stale_retarget={} bsp_steal_us={} hv={:?}",
+                        crate::println!("WATCHDOG: IPC stall detected (sends={} recvs={}) double_enq: drain={} rescue={} wake={} other={} total_enq={} rescue=(max={} stale={} pend={} phantom={} fast_takeover={} cas_fail_bail={} wake_reroute={}) sgi=(s={} r={}) forced_preempt={} wake_lat=(n={} avg_us={} max_us={}) wake_hist=(<100us:{} <1ms:{} <10ms:{} <100ms:{} <1s:{} <10s:{} >=10s:{}) tick_max_gap_us={} stale_retarget={} bsp_steal_us={} hv={:?}",
                             sends, recvs,
                             DOUBLE_ENQ_DRAIN.load(Ordering::Relaxed),
                             DOUBLE_ENQ_RESCUE.load(Ordering::Relaxed),
@@ -2816,6 +2816,7 @@ pub fn tick(current_sp: u64) -> u64 {
                             RESCUE_PHANTOM.load(Ordering::Relaxed),
                             FAST_RESCUE_TAKEOVERS.load(Ordering::Relaxed),
                             CAS_FAIL_RESCUE_BAILS.load(Ordering::Relaxed),
+                            STEAL_AWARE_REROUTES.load(Ordering::Relaxed),
                             sgi_s, sgi_r,
                             FORCED_PREEMPT_COUNT.load(Ordering::Relaxed),
                             wake_count, wake_avg_us, wake_max_us,
@@ -4020,6 +4021,67 @@ pub fn restore_thread_priority(tid: ThreadId, saved_prio: u8) {
     unsafe { thread_mut_from_ref(tid) }.effective_priority = saved_prio;
 }
 
+/// Layer 3 paravirt: steal-aware wake-target selection.  When the
+/// caller's natural enqueue target (`default_cpu`) has accumulated
+/// significant host-steal since its last successful dispatch, prefer
+/// a less-stolen CPU instead.  This breaks the thrashing pattern
+/// where waking threads land on a host-paused CPU, pend for seconds,
+/// get rescued to a fresh CPU, then run briefly and re-pend on the
+/// SAME host-paused CPU because last_cpu drives the next wake target.
+///
+/// Returns `default_cpu` when:
+///   - steal-time isn't available (bare metal / pre-init),
+///   - only one CPU online,
+///   - `default_cpu` has less than `HEAVY_STEAL_NS` of recent steal,
+///   - or no other CPU has materially less recent steal.
+///
+/// Cost: one steal-time MSR-page read per CPU (small fixed-size loop;
+/// NR_CPUS is 4–8 in typical Telix configurations).  Cold path —
+/// called only from wake_thread / wake_parked_thread, not from the
+/// dispatch loop.
+fn choose_wake_target_steal_aware(default_cpu: u32) -> u32 {
+    const HEAVY_STEAL_NS: u64 = 200_000_000; // 200ms — same threshold as fast-rescue
+    const ADVANTAGE_NS: u64 = 100_000_000; // must beat default by ≥100ms to migrate
+    let ncpus = smp::num_cpus() as u32;
+    if ncpus <= 1 {
+        return default_cpu;
+    }
+    let recent_steal = |cpu: u32| -> u64 {
+        let pc = smp::get(cpu);
+        let steal_now = crate::arch::hypervisor::ops()
+            .steal_time_ns_of_cpu(cpu)
+            .unwrap_or(0);
+        let steal_at_disp = pc.steal_ns_at_last_dispatch.load(Ordering::Relaxed);
+        steal_now.saturating_sub(steal_at_disp)
+    };
+    let default_steal = recent_steal(default_cpu);
+    if default_steal < HEAVY_STEAL_NS {
+        return default_cpu;
+    }
+    let mut best_cpu = default_cpu;
+    let mut best_steal = default_steal;
+    for c in 0..ncpus {
+        if c == default_cpu { continue; }
+        let s = recent_steal(c);
+        if s + ADVANTAGE_NS <= best_steal {
+            best_steal = s;
+            best_cpu = c;
+        }
+    }
+    if best_cpu != default_cpu {
+        STEAL_AWARE_REROUTES.fetch_add(1, Ordering::Relaxed);
+    }
+    best_cpu
+}
+
+/// Counts wake-target reroutes by `choose_wake_target_steal_aware`.
+/// Each increment is one wake_thread / wake_parked_thread call that
+/// chose a different CPU than the caller's natural choice because
+/// the default was being heavily host-stolen.  Surfaced in the
+/// WATCHDOG IPC-stall dump alongside fast_takeover.
+static STEAL_AWARE_REROUTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Wake a blocked thread, making it runnable.
 pub fn wake_thread(tid: ThreadId) {
     let tref = thread_ref(tid);
@@ -4049,7 +4111,12 @@ pub fn wake_thread(tid: ThreadId) {
             tref.prio.store(tref.base_priority, Ordering::Release);
             unsafe { thread_mut_from_ref(tid) }.effective_priority =
                 tref.base_priority;
-            let target_cpu = smp::cpu_id();
+            // Layer 3 paravirt: steal-aware target.  Default = waker's
+            // CPU (cache locality), but reroute to a less-stolen CPU
+            // when the waker is being host-paused — the woken thread
+            // would otherwise pend on this stolen CPU and thrash
+            // through the rescue path.
+            let target_cpu = choose_wake_target_steal_aware(smp::cpu_id());
             set_enq_tag(3); // 3=wake_thread
             percpu_enqueue(target_cpu, tref.base_priority, tid);
             // Reprogram timer so try_switch runs and picks us up promptly.
@@ -6662,7 +6729,11 @@ pub fn wake_parked_thread(tid: ThreadId) {
                 .is_ok()
             {
                 let prio = tref.prio.load(Ordering::Acquire);
-                let target = parking_cpu;
+                // Layer 3 paravirt: steal-aware target.  Default to the
+                // parking CPU (where the thread last ran) but reroute
+                // when that CPU is currently being host-stolen so the
+                // re-dispatch doesn't immediately pend.
+                let target = choose_wake_target_steal_aware(parking_cpu);
                 // NEW_INV: store ON_CPU_PENDING BEFORE state=Ready.
                 tref.on_cpu.store(ON_CPU_PENDING, Ordering::Release);
                 unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
