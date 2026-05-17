@@ -46,6 +46,92 @@ const MSR_KVM_STEAL_TIME: u32 = 0x4b56_4d03;
 /// at that address with a seqlock-style version field.
 const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
 
+/// KVM_FEATURE_ASYNC_PF — host advertises async page-fault delivery.
+/// When enabled via MSR_KVM_ASYNC_PF_EN, the host delivers a #PF
+/// (vector 14) with reason written to the per-vCPU APF data page
+/// when servicing a guest fault requires host-side I/O (e.g. swap-in).
+/// Guest can park the faulting thread and dispatch another instead of
+/// blocking the entire vCPU.
+const KVM_FEATURE_ASYNC_PF: u32 = 1 << 4;
+
+/// MSR for per-vCPU async-PF data page address.  Write
+/// `phys_addr | enable_bits` where enable_bits at minimum has
+/// `KVM_ASYNC_PF_ENABLED=0x1`.  The host then writes `reason` and
+/// `token` to the page on each async-PF event.
+const MSR_KVM_ASYNC_PF_EN: u32 = 0x4b56_4d02;
+const KVM_ASYNC_PF_ENABLED: u64 = 0x1;
+
+/// Async-PF "reason" values (host → guest, written into APF_DATA.reason).
+const KVM_PV_REASON_PAGE_NOT_PRESENT: u32 = 1;
+const KVM_PV_REASON_PAGE_READY: u32 = 2;
+
+/// Layout matches Linux's `struct kvm_vcpu_pv_apf_data` (arch/x86/
+/// include/uapi/asm/kvm_para.h).  Host writes; guest reads volatile.
+/// Size = 64 bytes (16-byte fields + 48 bytes padding to keep the
+/// MSR-pointed page well within one cache line).
+#[repr(C, align(64))]
+struct KvmAsyncPfData {
+    /// 0 = no event; KVM_PV_REASON_PAGE_NOT_PRESENT / PAGE_READY.
+    /// Guest writes 0 after handling.
+    reason: core::sync::atomic::AtomicU32,
+    /// Token identifying the fault.  NOT_PRESENT and PAGE_READY
+    /// share the same token for a given page-in.
+    token: core::sync::atomic::AtomicU32,
+    _pad: [u8; 56],
+}
+
+const KVM_APF_NEW: KvmAsyncPfData = KvmAsyncPfData {
+    reason: core::sync::atomic::AtomicU32::new(0),
+    token: core::sync::atomic::AtomicU32::new(0),
+    _pad: [0; 56],
+};
+static APF_DATA: [KvmAsyncPfData; crate::sched::smp::MAX_CPUS] =
+    [KVM_APF_NEW; crate::sched::smp::MAX_CPUS];
+static KVM_ASYNC_PF_ENABLED_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Enable async-PF for the calling CPU.  Reads the BSP-side
+/// availability flag and binds this CPU's APF_DATA page via the MSR.
+/// Idempotent; no-op if the feature isn't advertised.
+pub fn enable_async_pf_self() {
+    if !KVM_ASYNC_PF_ENABLED_FLAG.load(Ordering::Relaxed) {
+        return;
+    }
+    let cpu = crate::sched::smp::cpu_id() as usize;
+    if cpu >= crate::sched::smp::MAX_CPUS {
+        return;
+    }
+    let pa = &APF_DATA[cpu] as *const _ as u64;
+    unsafe { wrmsr(MSR_KVM_ASYNC_PF_EN, pa | KVM_ASYNC_PF_ENABLED); }
+}
+
+/// Take a pending async-PF event for the calling CPU.  Returns
+/// `Some((reason, token))` if the host posted one and we cleared it,
+/// or `None` if nothing pending.  Called from the #PF handler at the
+/// very top, before normal fault resolution — if reason != 0 the
+/// fault is a paravirt async-PF event rather than a real fault on CR2.
+pub fn take_async_pf_event() -> Option<(u32, u32)> {
+    if !KVM_ASYNC_PF_ENABLED_FLAG.load(Ordering::Relaxed) {
+        return None;
+    }
+    let cpu = crate::sched::smp::cpu_id() as usize;
+    if cpu >= crate::sched::smp::MAX_CPUS {
+        return None;
+    }
+    let p = &APF_DATA[cpu];
+    let reason = p.reason.load(Ordering::Acquire);
+    if reason == 0 {
+        return None;
+    }
+    let token = p.token.load(Ordering::Relaxed);
+    // Ack to host so the next event can be delivered.
+    p.reason.store(0, Ordering::Release);
+    Some((reason, token))
+}
+
+/// Const-export the reason codes for the #PF handler.
+pub const ASYNC_PF_REASON_NOT_PRESENT: u32 = KVM_PV_REASON_PAGE_NOT_PRESENT;
+pub const ASYNC_PF_REASON_PAGE_READY: u32 = KVM_PV_REASON_PAGE_READY;
+
 /// Layout matches Linux's `struct kvm_steal_time` (arch/x86/include/uapi/
 /// asm/kvm_para.h).  64 bytes total.  Host writes; guest reads volatile.
 /// `steal` is accumulated host-descheduled time in nanoseconds for the
@@ -520,6 +606,15 @@ pub fn detect_and_install() {
             crate::println!("[hypervisor] KVM PVCLOCK (CLOCKSOURCE2) enabled");
         } else {
             crate::println!("[hypervisor] KVM PVCLOCK not advertised");
+        }
+        if eax_kvm & KVM_FEATURE_ASYNC_PF != 0 {
+            KVM_ASYNC_PF_ENABLED_FLAG.store(true, Ordering::Relaxed);
+            // Bind BSP's APF data page.  APs do their own equivalent
+            // at AP-rust-entry by calling enable_async_pf_self.
+            enable_async_pf_self();
+            crate::println!("[hypervisor] KVM ASYNC_PF enabled (Phase 1: detect + dispatch)");
+        } else {
+            crate::println!("[hypervisor] KVM ASYNC_PF not advertised");
         }
     }
 

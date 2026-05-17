@@ -528,7 +528,128 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
     validate_iretq_frame(frame_sp, frame_sp, vector)
 }
 
+// ---------------------------------------------------------------------------
+// Async-PF (Layer 3 paravirt)
+// ---------------------------------------------------------------------------
+
+/// Counts async-PF events received from the host (sum of NOT_PRESENT
+/// + PAGE_READY).  Non-zero indicates the host is actually using
+/// async-PF — i.e. memory is being swapped out and the host wants
+/// the guest to dispatch around the faulting thread instead of
+/// blocking the vCPU.  In CPU-pressure-only scenarios this stays 0.
+static ASYNC_PF_EVENTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Fixed-size map from async-PF token → parked tid.  Tokens are
+/// 32-bit host-assigned identifiers; we never look at more than ~16
+/// at once in practice (one per outstanding swap-in).  Linear scan
+/// is fine for that scale.  Slot value: low 32 = tid, high 32 = token.
+/// A slot with token == 0 is empty (host never uses token 0).
+const APF_MAP_SLOTS: usize = 64;
+static APF_MAP: [core::sync::atomic::AtomicU64; APF_MAP_SLOTS] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; APF_MAP_SLOTS]
+};
+
+fn async_pf_insert(token: u32, tid: u32) -> bool {
+    use core::sync::atomic::Ordering;
+    let want_empty: u64 = 0;
+    let new_entry: u64 = (tid as u64) | ((token as u64) << 32);
+    for slot in APF_MAP.iter() {
+        if slot.compare_exchange(
+            want_empty, new_entry,
+            Ordering::AcqRel, Ordering::Relaxed,
+        ).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn async_pf_remove(token: u32) -> Option<u32> {
+    use core::sync::atomic::Ordering;
+    for slot in APF_MAP.iter() {
+        let v = slot.load(Ordering::Acquire);
+        let entry_tok = (v >> 32) as u32;
+        if entry_tok == token && v != 0 {
+            // Try to claim by CASing to 0.
+            if slot.compare_exchange(
+                v, 0,
+                Ordering::AcqRel, Ordering::Relaxed,
+            ).is_ok() {
+                return Some(v as u32);
+            }
+            // Lost the race — another waker took it.
+        }
+    }
+    None
+}
+
+/// Park the current thread on `token`.  Called from the #PF handler
+/// when the host posted KVM_PV_REASON_PAGE_NOT_PRESENT.  Falls back
+/// to immediately retrying the fault if the map is full (rare).
+fn async_pf_park(token: u32) {
+    let tid = crate::sched::current_thread_id();
+    if !async_pf_insert(token, tid) {
+        // Map full — fall back to no-op.  The thread will refault
+        // and either the host's normal sync-PF path eventually
+        // delivers, or the next async-PF event reuses the map.
+        return;
+    }
+    // Block on a generic pager-wait.  When PAGE_READY arrives,
+    // async_pf_wake removes the entry and wake_thread runs.
+    crate::sched::block_current(crate::sched::thread::BlockReason::PagerWait);
+}
+
+/// Wake the thread parked on `token`, if any.
+fn async_pf_wake(token: u32) {
+    if let Some(tid) = async_pf_remove(token) {
+        crate::sched::scheduler::wake_thread(tid);
+    }
+}
+
+/// Diagnostic export.
+pub fn async_pf_event_count() -> u64 {
+    ASYNC_PF_EVENTS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
+    // Layer 3 paravirt: KVM async-PF dispatch.  Before normal fault
+    // handling, check whether the host posted an async-PF event for
+    // this CPU.  If reason == NOT_PRESENT the host has started a swap-in
+    // (or similar) for the faulting page; park the thread on its token
+    // so the vCPU can run other work.  If reason == PAGE_READY the
+    // swap-in completed; wake the thread that was parked on that token.
+    if let Some((reason, token)) = crate::arch::x86_64::hypervisor::take_async_pf_event() {
+        ASYNC_PF_EVENTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        match reason {
+            crate::arch::x86_64::hypervisor::ASYNC_PF_REASON_NOT_PRESENT => {
+                // Park the current thread on this token.  Will be woken
+                // when the matching PAGE_READY arrives.  block_current
+                // performs the dispatch internally.
+                async_pf_park(token);
+                // We return — block_current rescheduled.  frame_sp is
+                // updated via the existing pending-switch mechanism.
+                let pending = crate::sched::scheduler::take_pending_switch();
+                return if pending != 0 { pending } else { frame_sp };
+            }
+            crate::arch::x86_64::hypervisor::ASYNC_PF_REASON_PAGE_READY => {
+                async_pf_wake(token);
+                // Falls through to retry the faulting instruction —
+                // the page may already be present from the perspective
+                // of the next CPU access, but we still need to return
+                // from the trap.  CR2 holds either the original faulting
+                // VA or a synthetic value; either way the IRETQ returns
+                // to the same RIP which will re-fault if needed.
+                return frame_sp;
+            }
+            _ => {
+                // Unknown reason — ack via take_async_pf_event already,
+                // fall through to normal PF handling.
+            }
+        }
+    }
+
     let cr2: u64;
     unsafe {
         core::arch::asm!("mov {}, cr2", out(reg) cr2);

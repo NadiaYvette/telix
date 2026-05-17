@@ -234,6 +234,11 @@ extern "C" fn ap_rust_entry(cpu_id: u32) {
     // host-pause durations — fixes scheduler heuristics that
     // previously treated wallclock jumps as elapsed time.
     super::hypervisor::enable_pvclock_self();
+    // Bind this AP's KVM_ASYNC_PF data page.  Phase 1: detect +
+    // dispatch — when the host posts an async-PF event the #PF
+    // handler reads (reason, token) from the page and parks/wakes
+    // the faulting thread via the existing pager-wait mechanism.
+    super::hypervisor::enable_async_pf_self();
 
     // Signal ready.
     AP_READY_COUNT.fetch_add(1, Ordering::Release);
