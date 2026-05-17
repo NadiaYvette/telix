@@ -86,16 +86,10 @@ impl GlobalArt {
     }
 }
 
-/// Global thread ART — lock-free reads (RCU), writes under THREAD_ART_WRITE_LOCK.
+/// Global thread ART — lock-free reads (RCU); writes serialized by `SPAWN_LOCK`.
 pub static SCHED_THREAD_ART: GlobalArt = GlobalArt::new();
-/// Global task ART — lock-free reads (RCU), writes under TASK_ART_WRITE_LOCK.
+/// Global task ART — lock-free reads (RCU); writes serialized by `SPAWN_LOCK`.
 pub static SCHED_TASK_ART: GlobalArt = GlobalArt::new();
-/// Write serializer for thread ART structural mutations.
-#[allow(dead_code)]
-pub static THREAD_ART_WRITE_LOCK: SpinLock<()> = SpinLock::new(());
-/// Write serializer for task ART structural mutations.
-#[allow(dead_code)]
-pub static TASK_ART_WRITE_LOCK: SpinLock<()> = SpinLock::new(());
 
 // ---------------------------------------------------------------------------
 // Sleep queue — sorted singly-linked list of sleeping threads by deadline.
@@ -1424,7 +1418,7 @@ fn sched_init() {
 }
 
 /// Create an idle thread for a secondary CPU. Returns its ThreadId.
-/// Must be called under THREAD_ART_WRITE_LOCK.
+/// Caller serializes thread-ART writes via `SPAWN_LOCK`.
 fn create_idle_thread() -> Option<ThreadId> {
     let id = NEXT_THREAD_ID.load(Ordering::Relaxed);
     if id as usize >= RadixTable::capacity() {
@@ -1462,7 +1456,7 @@ fn create_idle_thread() -> Option<ThreadId> {
 }
 
 /// Find a reusable (Dead) thread slot, or allocate a new one.
-/// Must be called under THREAD_ART_WRITE_LOCK.
+/// Caller serializes thread-ART writes via `SPAWN_LOCK`.
 fn alloc_thread_id() -> Option<ThreadId> {
     let mut found_id: Option<ThreadId> = None;
     SCHED_THREAD_ART.for_each(|key, val| {
@@ -1513,7 +1507,7 @@ fn alloc_thread_id() -> Option<ThreadId> {
 }
 
 /// Find a reusable (inactive) task slot, or allocate a new one.
-/// Must be called under TASK_ART_WRITE_LOCK.
+/// Caller serializes task-ART writes via `SPAWN_LOCK`.
 fn alloc_task_id() -> Option<TaskId> {
     let mut found_id: Option<TaskId> = None;
     SCHED_TASK_ART.for_each(|key, val| {
@@ -1563,7 +1557,7 @@ fn alloc_task_id() -> Option<TaskId> {
     Some(id)
 }
 
-/// Create a kernel-mode thread. Must hold THREAD_ART_WRITE_LOCK.
+/// Create a kernel-mode thread. Caller must hold `SPAWN_LOCK`.
 fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
     let id = alloc_thread_id()?;
 
@@ -1779,7 +1773,7 @@ fn do_spawn_heavy_work(
 }
 
 /// Phase 1 of user thread creation: allocate task/thread IDs and read parent info.
-/// Must hold both TASK_ART_WRITE_LOCK and THREAD_ART_WRITE_LOCK.
+/// Caller must hold `SPAWN_LOCK` (which serializes both thread- and task-ART writes).
 fn alloc_spawn_ids() -> Option<(u32, ThreadId, SpawnParentInfo)> {
     let task_id = alloc_task_id()?;
     let thread_id = alloc_thread_id()?;
@@ -2037,9 +2031,18 @@ fn percpu_pick_next_cosched(cpu: u32, idle_id: ThreadId, prev_group: u32) -> (Th
     (idle_id, false)
 }
 
-/// Spawn write lock: serializes all spawn/fork/thread-create operations.
+/// Spawn write lock: serializes all spawn/fork/thread-create operations
+/// AND the (insert-only) writes to `SCHED_THREAD_ART` / `SCHED_TASK_ART`.
 /// This is the only remaining global lock for the scheduler subsystem.
-static SPAWN_LOCK: SpinLock<()> = SpinLock::new(());
+///
+/// FIFO-fair + PV-aware: spawn is syscall-driven (sys_spawn/fork/clone/
+/// thread_create) and burst-contended during Linux personality task-tree
+/// expansion (multi-thread processes, server fan-out).  No IRQ handler
+/// takes this lock — timer tick + IPI handlers route through dispatch,
+/// not spawn.  Ticket ordering bounds acquisition latency, PV-aware spin
+/// keeps timer/IPI flow alive while the holder is host-paused.
+static SPAWN_LOCK: crate::sync::TicketSpinLock<()> =
+    crate::sync::TicketSpinLock::new(());
 
 pub fn init() {
     sched_init();
@@ -2053,7 +2056,7 @@ pub fn init() {
 /// Called by secondary CPUs to create their idle thread and register.
 pub fn init_ap(cpu: u32) {
     let idle_id = {
-        let _lock = SPAWN_LOCK.lock();
+        let _lock = SPAWN_LOCK.lock_pv_aware();
         create_idle_thread().expect("AP idle thread")
     };
     smp::init_ap(cpu, idle_id);
@@ -2067,7 +2070,7 @@ pub fn thread_task_id(tid: ThreadId) -> u32 {
 }
 
 pub fn spawn(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
-    let _lock = SPAWN_LOCK.lock();
+    let _lock = SPAWN_LOCK.lock_pv_aware();
     create_thread(entry, priority, quantum)
 }
 
@@ -2124,7 +2127,7 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
 
     // Phase 1: allocate IDs under SPAWN_LOCK.
     let (task_id, thread_id, mut parent) = {
-        let _lock = SPAWN_LOCK.lock();
+        let _lock = SPAWN_LOCK.lock_pv_aware();
         match alloc_spawn_ids() {
             Some(ids) => ids,
             None => {
@@ -2206,7 +2209,7 @@ pub fn spawn_user_with_mmio_cap(
     let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
 
     let (task_id, thread_id, mut parent) = {
-        let _lock = SPAWN_LOCK.lock();
+        let _lock = SPAWN_LOCK.lock_pv_aware();
         alloc_spawn_ids()?
     };
 
@@ -2252,7 +2255,7 @@ pub fn spawn_user_from_elf(
     let arg0_is_port = arg0 > 0 && crate::ipc::port::port_is_active(arg0);
 
     let (task_id, thread_id, mut parent) = {
-        let _lock = SPAWN_LOCK.lock();
+        let _lock = SPAWN_LOCK.lock_pv_aware();
         alloc_spawn_ids()?
     };
 
@@ -2303,7 +2306,7 @@ pub fn spawn_user_with_data(
     let elf_data = crate::io::initramfs::lookup_file(elf_name)?;
 
     let (task_id, thread_id, mut parent) = {
-        let _lock = SPAWN_LOCK.lock();
+        let _lock = SPAWN_LOCK.lock_pv_aware();
         alloc_spawn_ids()?
     };
 
@@ -2402,7 +2405,7 @@ pub fn thread_create(task_id: u32, entry: u64, stack_top: u64, arg: u64) -> Opti
     };
     // Allocate thread ID under SPAWN_LOCK.
     let thread_id = {
-        let _lock = SPAWN_LOCK.lock();
+        let _lock = SPAWN_LOCK.lock_pv_aware();
         alloc_thread_id()?
     };
     // Create kernel-held port for the new thread.
@@ -5214,7 +5217,7 @@ pub fn fork_current() -> u64 {
         parent_syscall_abi,
         parent_personality_port,
     ) = {
-        let _lock = SPAWN_LOCK.lock();
+        let _lock = SPAWN_LOCK.lock_pv_aware();
         let child_task_id = match alloc_task_id() {
             Some(id) => id,
             None => return u64::MAX,
@@ -5351,7 +5354,7 @@ pub fn fork_current() -> u64 {
 
     // Allocate child thread ID under SPAWN_LOCK.
     let child_tid = match {
-        let _lock = SPAWN_LOCK.lock();
+        let _lock = SPAWN_LOCK.lock_pv_aware();
         alloc_thread_id()
     } {
         Some(id) => id,
@@ -5468,7 +5471,7 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
         parent_rlimits,
         parent_personality, parent_syscall_abi, parent_personality_port,
     ) = {
-        let _lock = SPAWN_LOCK.lock();
+        let _lock = SPAWN_LOCK.lock_pv_aware();
         let child_task_id = match alloc_task_id() {
             Some(id) => id,
             None => return u64::MAX,
@@ -5588,7 +5591,7 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
 
     // Allocate child thread ID.
     let child_tid = match {
-        let _lock = SPAWN_LOCK.lock();
+        let _lock = SPAWN_LOCK.lock_pv_aware();
         alloc_thread_id()
     } {
         Some(id) => id,
@@ -5702,7 +5705,7 @@ pub fn clone_thread_in_task(
 
     // Allocate thread ID and port.
     let child_tid = match {
-        let _lock = SPAWN_LOCK.lock();
+        let _lock = SPAWN_LOCK.lock_pv_aware();
         alloc_thread_id()
     } {
         Some(id) => id,
