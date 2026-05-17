@@ -148,7 +148,14 @@ pub fn svc_register(name: &[u8], port_id: u64) -> u64 {
     let wake_count;
 
     {
-        let mut table = TABLE.lock();
+        // PV-aware: under host descheduling of the previous lock
+        // holder, the spinner would sit in CLI for the entire host
+        // pause (#162: cli_max=611ms attributed to this site in boot
+        // 91amfsq520).  lock_pv_aware periodically re-enables IRQs
+        // during spin so timer + IPIs flow while we wait.  No IRQ
+        // handler reaches namesrv::TABLE, so the brief IRQ-enable
+        // window is safe.
+        let mut table = TABLE.lock_pv_aware();
         if !table.register(name, port_id) {
             return 1;
         }
@@ -189,7 +196,8 @@ pub fn svc_lookup(name: &[u8], wait: bool) -> u64 {
     let task_id = crate::sched::scheduler::current_task_id();
 
     loop {
-        let mut table = TABLE.lock();
+        // PV-aware spin (see svc_register for rationale).
+        let mut table = TABLE.lock_pv_aware();
         if let Some(port_id) = table.lookup(name) {
             drop(table);
             crate::cap::grant_send_cap(task_id, port_id);
