@@ -246,6 +246,13 @@ pub struct PerCpuData {
     /// detect "IPI arrives but try_switch picks nothing" — a sign of
     /// run-queue / on_cpu transition problems.
     pub ipi_recv_count: core::sync::atomic::AtomicU64,
+    /// Layer 4 paravirt: `get_monotonic_ns()` snapshot at the most
+    /// recent reschedule-IPI receipt on this CPU.  Used by wake routing
+    /// to detect "this vCPU is online and dispatching but isn't being
+    /// reached by IPIs" — a residual #135 / virt-IPI-delivery pathology
+    /// that steal-time can't see.  Stamped at IPI handler entry beside
+    /// `ipi_recv_count`.
+    pub last_ipi_recv_ns: core::sync::atomic::AtomicU64,
     /// #135 IPI send breakdown by target.  send_reschedule_ipi bumps
     /// `smp::current().ipi_send_to[target]`.  Sum across all CPUs'
     /// arrays gives the global send-to-target totals; the per-CPU
@@ -353,6 +360,7 @@ impl PerCpuData {
             dispatch_cas_ok_count: core::sync::atomic::AtomicU64::new(0),
             rescue_stuck_pending_count: core::sync::atomic::AtomicU64::new(0),
             ipi_recv_count: core::sync::atomic::AtomicU64::new(0),
+            last_ipi_recv_ns: core::sync::atomic::AtomicU64::new(0),
             ipi_send_to: [const { core::sync::atomic::AtomicU64::new(0) }; 8],
             dispatch_latency_hist: [const { core::sync::atomic::AtomicU64::new(0) }; 26],
             cli_enter_tsc: core::sync::atomic::AtomicU64::new(0),

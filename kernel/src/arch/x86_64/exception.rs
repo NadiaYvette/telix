@@ -502,6 +502,11 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                 let pcpu = crate::sched::smp::get(cpu);
                 pcpu.ipi_recv_count
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                // Layer 4 paravirt: stamp recv timestamp for IPI-delivery-
+                // health checks in choose_wake_target_steal_aware.
+                let now_ns = crate::sched::scheduler::get_monotonic_ns();
+                pcpu.last_ipi_recv_ns
+                    .store(now_ns, core::sync::atomic::Ordering::Relaxed);
             }
             super::lapic::eoi();
             return validate_iretq_frame(crate::sched::scheduler::reschedule_ipi(frame_sp), frame_sp, 0xFD);

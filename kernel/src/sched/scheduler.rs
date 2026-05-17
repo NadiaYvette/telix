@@ -3058,14 +3058,15 @@ pub fn tick(current_sp: u64) -> u64 {
                 let frt = FAST_RESCUE_TAKEOVERS.load(Ordering::Relaxed);
                 let cfb = CAS_FAIL_RESCUE_BAILS.load(Ordering::Relaxed);
                 let sar = STEAL_AWARE_REROUTES.load(Ordering::Relaxed);
+                let isr = IPI_STALE_REROUTES.load(Ordering::Relaxed);
                 #[cfg(target_arch = "x86_64")]
                 let apf = crate::arch::x86_64::exception::async_pf_event_count();
                 #[cfg(not(target_arch = "x86_64"))]
                 let apf: u64 = 0;
-                if frt | cfb | sar | apf != 0 {
+                if frt | cfb | sar | isr | apf != 0 {
                     crate::println!(
-                        "LAYER3-DIAG: fast_takeover={} cas_fail_bail={} wake_reroute={} async_pf={}",
-                        frt, cfb, sar, apf,
+                        "LAYER3-DIAG: fast_takeover={} cas_fail_bail={} wake_reroute={} ipi_stale_reroute={} async_pf={}",
+                        frt, cfb, sar, isr, apf,
                     );
                 }
                 LAYER3_DIAG_LOCK.store(0, Ordering::Release);
@@ -4082,6 +4083,14 @@ pub fn restore_thread_priority(tid: ThreadId, saved_prio: u8) {
 fn choose_wake_target_steal_aware(default_cpu: u32) -> u32 {
     const HEAVY_STEAL_NS: u64 = 200_000_000; // 200ms — same threshold as fast-rescue
     const ADVANTAGE_NS: u64 = 100_000_000; // must beat default by ≥100ms to migrate
+    // Layer 4 paravirt: IPI-delivery health.  A vCPU can be online and
+    // dispatching but persistently not receive IPIs sent to it (residual
+    // #135 / virt-IPI-delivery pathology).  Steal-time can't see this —
+    // the CPU isn't being stolen, it just isn't getting woken up.  If
+    // the default target hasn't received an IPI in this long while at
+    // least one peer has fresher IPI activity, route there instead.
+    const IPI_STALE_NS: u64 = 1_000_000_000; // 1s of no IPIs on candidate
+    const IPI_FRESH_NS: u64 = 200_000_000;   // peer must have one within 200ms
     let ncpus = smp::num_cpus() as u32;
     if ncpus <= 1 {
         return default_cpu;
@@ -4094,24 +4103,49 @@ fn choose_wake_target_steal_aware(default_cpu: u32) -> u32 {
         let steal_at_disp = pc.steal_ns_at_last_dispatch.load(Ordering::Relaxed);
         steal_now.saturating_sub(steal_at_disp)
     };
+    let now_ns = get_monotonic_ns();
+    let ipi_staleness = |cpu: u32| -> u64 {
+        let pc = smp::get(cpu);
+        let last = pc.last_ipi_recv_ns.load(Ordering::Relaxed);
+        if last == 0 { 0 } else { now_ns.saturating_sub(last) }
+    };
+
     let default_steal = recent_steal(default_cpu);
-    if default_steal < HEAVY_STEAL_NS {
-        return default_cpu;
+    let default_ipi_stale = ipi_staleness(default_cpu);
+
+    // Tier 1: heavy host steal on default → look for less-stolen peer.
+    if default_steal >= HEAVY_STEAL_NS {
+        let mut best_cpu = default_cpu;
+        let mut best_steal = default_steal;
+        for c in 0..ncpus {
+            if c == default_cpu { continue; }
+            let s = recent_steal(c);
+            if s + ADVANTAGE_NS <= best_steal {
+                best_steal = s;
+                best_cpu = c;
+            }
+        }
+        if best_cpu != default_cpu {
+            STEAL_AWARE_REROUTES.fetch_add(1, Ordering::Relaxed);
+        }
+        return best_cpu;
     }
-    let mut best_cpu = default_cpu;
-    let mut best_steal = default_steal;
-    for c in 0..ncpus {
-        if c == default_cpu { continue; }
-        let s = recent_steal(c);
-        if s + ADVANTAGE_NS <= best_steal {
-            best_steal = s;
-            best_cpu = c;
+
+    // Tier 2: IPI-delivery shortage on default → look for an IPI-fresh peer.
+    // Only fires when default is genuinely starved (≥1s without an IPI) AND
+    // at least one peer has IPIs landing recently (≤200ms) — so we don't
+    // misroute at boot when no IPIs have fired anywhere yet.
+    if default_ipi_stale >= IPI_STALE_NS {
+        for c in 0..ncpus {
+            if c == default_cpu { continue; }
+            if ipi_staleness(c) <= IPI_FRESH_NS {
+                IPI_STALE_REROUTES.fetch_add(1, Ordering::Relaxed);
+                return c;
+            }
         }
     }
-    if best_cpu != default_cpu {
-        STEAL_AWARE_REROUTES.fetch_add(1, Ordering::Relaxed);
-    }
-    best_cpu
+
+    default_cpu
 }
 
 /// Counts wake-target reroutes by `choose_wake_target_steal_aware`.
@@ -4120,6 +4154,16 @@ fn choose_wake_target_steal_aware(default_cpu: u32) -> u32 {
 /// the default was being heavily host-stolen.  Surfaced in the
 /// WATCHDOG IPC-stall dump alongside fast_takeover.
 static STEAL_AWARE_REROUTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Counts wake-target reroutes triggered by IPI-delivery staleness on
+/// the default target.  Distinct from `STEAL_AWARE_REROUTES`: this
+/// fires when the default vCPU is *not* being host-stolen but simply
+/// isn't receiving IPIs (residual #135 / virt-IPI pathology).  Without
+/// this signal, steal-aware routing leaves these wakeups on a vCPU
+/// that won't be reached and the rescue has to migrate every wake-
+/// pending pair via the slow 1.5–3s timeout path.
+static IPI_STALE_REROUTES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// Wake a blocked thread, making it runnable.
