@@ -144,7 +144,7 @@ pub fn grant_send_cap(task_id: u32, port_id: u64) -> Option<usize> {
     }
     let cap = Capability::new(CapType::Port, Rights::SEND, port_id as usize);
     let result = {
-        let mut cdt = CDT_LOCK.lock();
+        let mut cdt = CDT_LOCK.lock_pv_aware();
         space.insert(cap, &mut *cdt)
     };
     if result.is_some() {
@@ -159,7 +159,7 @@ pub fn grant_full_port_cap(task_id: u32, port_id: u64) -> Option<usize> {
     let _task_guard = lock_task_caps(task_id);
     let cap = Capability::new(CapType::Port, rights, port_id as usize);
     let result = {
-        let mut cdt = CDT_LOCK.lock();
+        let mut cdt = CDT_LOCK.lock_pv_aware();
         task_capspace(task_id).insert(cap, &mut *cdt)
     };
     if result.is_some() {
@@ -177,7 +177,7 @@ pub fn grant_port_cap(task_id: u32, port_id: u64, rights: Rights) -> Option<usiz
     }
     let cap = Capability::new(CapType::Port, rights, port_id as usize);
     let result = {
-        let mut cdt = CDT_LOCK.lock();
+        let mut cdt = CDT_LOCK.lock_pv_aware();
         space.insert(cap, &mut *cdt)
     };
     if result.is_some() {
@@ -196,7 +196,7 @@ pub fn grant_mmio_cap(task_id: u32, region_id: u32, rights: Rights) -> Option<us
     let cap = mmio::make_cap(region_id, rights)?;
     let _task_guard = lock_task_caps(task_id);
     let space = task_capspace(task_id);
-    let mut cdt = CDT_LOCK.lock();
+    let mut cdt = CDT_LOCK.lock_pv_aware();
     space.insert(cap, &mut *cdt)
 }
 
@@ -212,7 +212,7 @@ pub fn remove_port_caps(task_id: u32, port_id: u64) {
 pub fn revoke_slot(task_id: u32, slot: usize) -> usize {
     let _task_guard = lock_task_caps(task_id);
     let space = task_capspace(task_id);
-    let mut cdt = CDT_LOCK.lock();
+    let mut cdt = CDT_LOCK.lock_pv_aware();
     space.revoke(slot, &mut *cdt)
 }
 
