@@ -165,6 +165,18 @@ pub struct Thread {
     /// "PENDING-STUCK-LOW" diagnostic that's independent of the 16s/30s
     /// rescue-and-CALL-TIMEOUT thresholds.
     pub pending_set_ns: core::sync::atomic::AtomicU64,
+    /// Layer 3 paravirt snapshot: picking CPU's accumulated host
+    /// steal-time at the moment `dequeue_set_pending` stamped
+    /// `pending_set_ns`.  Read by the fast-rescue path to determine
+    /// "how much was the picking CPU stolen DURING this pending
+    /// wait", which is the correct signal for phantom-pending due
+    /// to host descheduling.  Using `PerCpu::steal_ns_at_last_dispatch`
+    /// instead is wrong: that field refreshes on every dispatch on
+    /// that CPU, so the delta is always small even when the picking
+    /// CPU has been heavily stolen since this specific pending stamp.
+    /// 0 = bare metal / steal-time not enabled (rescue treats as
+    /// "no baseline, fall through to stale-CPU check alone").
+    pub pending_set_steal_ns: core::sync::atomic::AtomicU64,
     /// #135 pick-rotation probe: count of pick_eligible / pop_for_group
     /// successful selections for this thread.  Compared to enqueue_count
     /// in PICK-LOCATE dumps to reveal whether a stuck thread is being
@@ -305,6 +317,7 @@ impl Thread {
             last_ready_ns: core::sync::atomic::AtomicU64::new(0),
             enqueue_count: core::sync::atomic::AtomicU64::new(0),
             pending_set_ns: core::sync::atomic::AtomicU64::new(0),
+            pending_set_steal_ns: core::sync::atomic::AtomicU64::new(0),
             picked_count: core::sync::atomic::AtomicU64::new(0),
             personality_result: core::sync::atomic::AtomicU64::new(0),
             personality_frame_sp: 0,

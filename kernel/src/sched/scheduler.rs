@@ -503,6 +503,15 @@ fn dequeue_set_pending(tid: ThreadId) {
     // Wall-time stamps produced 100s spurious rescues per boot 49.
     let now = crate::arch::timer::vcpu_runtime_ns();
     thread_ref(tid).pending_set_ns.store(now, Ordering::Relaxed);
+    // Layer 3 paravirt: snapshot this CPU's steal-time at pending
+    // stamp time.  The fast-rescue path compares against this to
+    // detect "host paused the picking CPU DURING this pending wait"
+    // — the correct signal, distinct from "since-last-dispatch"
+    // (which refreshes every dispatch and underreports the delta).
+    let steal_at_pending = crate::arch::hypervisor::ops()
+        .steal_time_ns()
+        .unwrap_or(0);
+    thread_ref(tid).pending_set_steal_ns.store(steal_at_pending, Ordering::Relaxed);
     thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
     smp::current()
         .dispatch_set_pending_count
@@ -7361,25 +7370,30 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     let picking_cpu_stale = lts != 0 && wall_now > lts
                         && (wall_now - lts) / 1_000_000 > PICKING_CPU_STALE_MS;
                     // Layer 3 paravirt: positive host-pause confirmation.
-                    // If steal-time advanced on `last_cpu` since its last
-                    // successful dispatch, the CPU is being host-descheduled
-                    // (vs. legitimately busy in a long CLI region — those
-                    // don't accumulate steal).  When steal isn't available
-                    // (bare metal or pre-init), the host-confirm degrades
-                    // to "unknown", and we fall back to picking_cpu_stale
-                    // alone for the trigger.
-                    let steal_at_disp =
-                        pc.steal_ns_at_last_dispatch.load(Ordering::Relaxed);
-                    let host_stealing = if steal_at_disp == 0 {
-                        // No baseline yet — accept the stale-CPU signal
-                        // alone (older boots / bare metal).
+                    // Compare current steal on `last_cpu` against the
+                    // snapshot taken WHEN THIS THREAD ENTERED PENDING
+                    // (dequeue_set_pending stamped t.pending_set_steal_ns).
+                    // Delta = "ns the picking CPU was stolen during this
+                    // specific pending wait", exactly the right signal.
+                    //
+                    // Earlier (boot 524) we compared against
+                    // pcpu.steal_ns_at_last_dispatch which refreshes on
+                    // every dispatch — so delta was always tiny even
+                    // under 100s host pauses.  fast_takeover stayed 0
+                    // despite 100+ PENDING-STUCK-LOW events.  Fix: per-
+                    // thread snapshot taken at the pending stamp.
+                    let steal_at_pending =
+                        t.pending_set_steal_ns.load(Ordering::Relaxed);
+                    let host_stealing = if steal_at_pending == 0 {
+                        // No baseline (bare metal or stamp predates
+                        // Layer 3) — accept the stale-CPU signal alone.
                         true
                     } else {
                         let steal_now = crate::arch::hypervisor::ops()
                             .steal_time_ns_of_cpu(last_cpu_idx)
                             .unwrap_or(0);
-                        steal_now > steal_at_disp
-                            && (steal_now - steal_at_disp) / 1_000_000
+                        steal_now > steal_at_pending
+                            && (steal_now - steal_at_pending) / 1_000_000
                                 > HOST_STEAL_CONFIRM_MS
                     };
                     picking_cpu_stale && host_stealing
