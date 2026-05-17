@@ -129,8 +129,8 @@ pub fn capset_copy(parent_task: u32, child_task: u32) {
 
 /// Lock a task's cap_lock. Returns the guard.
 #[inline]
-fn lock_task_caps(task_id: u32) -> crate::sync::spinlock::SpinLockGuard<'static, ()> {
-    unsafe { task_ref(task_id) }.cap_lock.lock()
+fn lock_task_caps(task_id: u32) -> crate::sync::spinlock::TicketSpinLockGuard<'static, ()> {
+    unsafe { task_ref(task_id) }.cap_lock.lock_pv_aware()
 }
 
 // ---------------------------------------------------------------------------

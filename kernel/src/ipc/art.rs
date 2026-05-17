@@ -568,7 +568,13 @@ unsafe fn num_children(node_ptr: usize) -> u8 {
 /// Readers (lookup) never acquire this. Writers (insert/remove) are
 /// Write serializer for ART structural mutations (insert/remove/grow).
 /// Readers are lock-free via RCU; only writers need this lock.
-pub static ART_WRITE_LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+// FIFO-fair + PV-aware: serializes port-ART (radix tree) writes only.
+// Readers are lock-free RCU and reachable from IRQ handlers, but no
+// IRQ handler ever takes this write lock — writes happen at port
+// creation / destruction / resize (all syscall path).  Burst contention
+// during boot-time service registration and Linux personality spawn
+// maps cleanly onto the ticket-fair PV-aware pattern.
+pub static ART_WRITE_LOCK: crate::sync::TicketSpinLock<()> = crate::sync::TicketSpinLock::new(());
 
 /// When true, `Art::insert` runs a post-insert lookup self-check and
 /// dumps structural state on mismatch. Off by default to avoid runtime

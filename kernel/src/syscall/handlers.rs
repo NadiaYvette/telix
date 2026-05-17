@@ -2139,7 +2139,7 @@ fn sys_mmio_map_cap(slot: u64) -> u64 {
         if task_ptr.is_null() {
             return u64::MAX;
         }
-        let _guard = unsafe { (*task_ptr).cap_lock.lock() };
+        let _guard = unsafe { (*task_ptr).cap_lock.lock_pv_aware() };
         let capspace = unsafe { &(*task_ptr).capspace };
         let cap = match capspace.lookup(slot) {
             Some(c) => *c,

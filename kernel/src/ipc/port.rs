@@ -477,7 +477,7 @@ pub fn create() -> Option<PortId> {
         (*ptr).creator_task = creator;
     }
 
-    let _wlock = ART_WRITE_LOCK.lock();
+    let _wlock = ART_WRITE_LOCK.lock_pv_aware();
     if !PORT_ART.insert(local, ptr) {
         drop(_wlock);
         free_port(ptr);
@@ -498,7 +498,7 @@ pub fn create_kernel_port(handler: KernelHandler, user_data: usize) -> Option<Po
         (*ptr).kernel_user_data = user_data;
     }
 
-    let _wlock = ART_WRITE_LOCK.lock();
+    let _wlock = ART_WRITE_LOCK.lock_pv_aware();
     if !PORT_ART.insert(local, ptr) {
         drop(_wlock);
         free_port(ptr);
@@ -522,7 +522,7 @@ pub fn destroy(port_id: PortId) {
 
     // Remove from ART under write lock — new lookups will return None.
     let ptr = {
-        let _wlock = ART_WRITE_LOCK.lock();
+        let _wlock = ART_WRITE_LOCK.lock_pv_aware();
         match PORT_ART.remove(local) {
             Some(p) => p,
             None => return,
@@ -627,7 +627,7 @@ pub fn resize(port_id: PortId, new_capacity: usize) -> bool {
         return false;
     }
 
-    let _wlock = ART_WRITE_LOCK.lock();
+    let _wlock = ART_WRITE_LOCK.lock_pv_aware();
     let port_ptr = match PORT_ART.lookup_mut(local) {
         Some(p) => p,
         None => return false,

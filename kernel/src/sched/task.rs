@@ -232,7 +232,9 @@ pub struct Task {
     pub personality_port: u64,
     // --- Embedded capability data (lockless access via TASK_TABLE) ---
     /// Per-task lock protecting CNode/CapSpace mutations.
-    pub cap_lock: crate::sync::SpinLock<()>,
+    /// FIFO-fair + PV-aware: held during cap-space mutations alongside
+    /// `CDT_LOCK`; same burstiness pattern (spawn / cap-grant storms).
+    pub cap_lock: crate::sync::TicketSpinLock<()>,
     /// Per-task sparse capability set for lockless cap checks.
     pub capset: crate::cap::capset::CapSet,
     /// Per-task capability space (CNode + CDT tracking).
@@ -325,7 +327,7 @@ impl Task {
             personality: PersonalityId::TelixNative,
             syscall_abi: SyscallAbi::TelixNative,
             personality_port: 0,
-            cap_lock: crate::sync::SpinLock::new(()),
+            cap_lock: crate::sync::TicketSpinLock::new(()),
             capset: crate::cap::capset::CapSet::new(),
             capspace: crate::cap::space::CapSpace::new(0),
             sa_pending: core::sync::atomic::AtomicBool::new(false),

@@ -133,7 +133,7 @@ impl PortSet {
     }
 }
 
-use crate::sync::SpinLock;
+use crate::sync::TicketSpinLock;
 
 struct PortSetTable {
     sets: PagedArray<PortSet>,
@@ -149,11 +149,16 @@ impl PortSetTable {
     }
 }
 
-static PORT_SET_TABLE: SpinLock<PortSetTable> = SpinLock::new(PortSetTable::new());
+// FIFO-fair + PV-aware (callers are all syscall-path — sys_port_set_*; no
+// IRQ handler takes this lock).  Linux personality multi-threaded servers
+// can issue bursts of port_set operations during connect/poll fan-out;
+// ticket ordering bounds acquisition latency under that burstiness, and
+// PV-aware spin keeps timer/IPI flow alive while the holder is host-paused.
+static PORT_SET_TABLE: TicketSpinLock<PortSetTable> = TicketSpinLock::new(PortSetTable::new());
 
 /// Create a new port set.
 pub fn create() -> Option<PortSetId> {
-    let mut table = PORT_SET_TABLE.lock();
+    let mut table = PORT_SET_TABLE.lock_pv_aware();
     let id = table.next_id;
     if !table.sets.ensure_capacity(id as usize + 1) {
         return None;
@@ -166,7 +171,7 @@ pub fn create() -> Option<PortSetId> {
 /// Add a port to a port set. Also tags the port with its set membership.
 pub fn add_port(set_id: PortSetId, port_id: PortId) -> bool {
     let ok = {
-        let mut table = PORT_SET_TABLE.lock();
+        let mut table = PORT_SET_TABLE.lock_pv_aware();
         if (set_id as usize) < table.next_id as usize {
             table.sets.get_mut(set_id as usize).add(port_id)
         } else {
@@ -182,7 +187,7 @@ pub fn add_port(set_id: PortSetId, port_id: PortId) -> bool {
 /// Remove a port from a port set. Also clears the port's set membership tag.
 pub fn remove_port(set_id: PortSetId, port_id: PortId) -> bool {
     let ok = {
-        let mut table = PORT_SET_TABLE.lock();
+        let mut table = PORT_SET_TABLE.lock_pv_aware();
         if (set_id as usize) < table.next_id as usize
             && table.sets.get(set_id as usize).active
         {
@@ -199,7 +204,7 @@ pub fn remove_port(set_id: PortSetId, port_id: PortId) -> bool {
 
 /// Destroy a port set, clearing membership on all member ports.
 pub fn destroy(set_id: PortSetId) -> bool {
-    let mut table = PORT_SET_TABLE.lock();
+    let mut table = PORT_SET_TABLE.lock_pv_aware();
     if (set_id as usize) < table.next_id as usize
         && table.sets.get(set_id as usize).active
     {
@@ -213,7 +218,7 @@ pub fn destroy(set_id: PortSetId) -> bool {
 /// Try to receive from any port in a set (non-blocking).
 #[allow(dead_code)]
 pub fn recv(set_id: PortSetId) -> Option<(PortId, Message)> {
-    let table = PORT_SET_TABLE.lock();
+    let table = PORT_SET_TABLE.lock_pv_aware();
     if (set_id as usize) < table.next_id as usize {
         table.sets.get(set_id as usize).try_recv()
     } else {
@@ -231,7 +236,7 @@ pub fn recv_blocking(set_id: PortSetId) -> Option<(PortId, Message)> {
     loop {
         // First try a non-blocking recv (PORT_SET_TABLE lock held briefly).
         {
-            let table = PORT_SET_TABLE.lock();
+            let table = PORT_SET_TABLE.lock_pv_aware();
             if (set_id as usize) >= table.next_id as usize
                 || !table.sets.get(set_id as usize).active
             {
@@ -244,7 +249,7 @@ pub fn recv_blocking(set_id: PortSetId) -> Option<(PortId, Message)> {
 
         // No message — register as waiter and block.
         {
-            let mut table = PORT_SET_TABLE.lock();
+            let mut table = PORT_SET_TABLE.lock_pv_aware();
             // Double-check: a message may have arrived between the two locks.
             if let Some((port_id, mut msg)) = table.sets.get(set_id as usize).try_recv() {
                 crate::sched::boost_priority_from_sender(my_tid, &mut msg.data[4]);
@@ -263,7 +268,7 @@ pub fn recv_blocking(set_id: PortSetId) -> Option<(PortId, Message)> {
 /// Wake the thread blocked on a port set (called from port send path).
 pub fn wake_set_waiter(set_id: u32) {
     let waiter = {
-        let mut table = PORT_SET_TABLE.lock();
+        let mut table = PORT_SET_TABLE.lock_pv_aware();
         if (set_id as usize) < table.next_id as usize {
             table.sets.get_mut(set_id as usize).waiter.take()
         } else {
