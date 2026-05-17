@@ -11,12 +11,17 @@ pub use space::CapSpace;
 
 use crate::ipc::port::port_local;
 use crate::sched::task::Task;
-use crate::sync::SpinLock;
+use crate::sync::TicketSpinLock;
 
 /// Narrow lock protecting the global CDT (capability derivation tree).
 /// Only held during CDT node allocation/linkage/revocation — much shorter
 /// than the old CAP_SYSTEM lock that serialized all cap mutations.
-pub static CDT_LOCK: SpinLock<Cdt> = SpinLock::new(Cdt::new());
+///
+/// FIFO-fair + PV-aware: spawn-storms and revocation-storms create
+/// bursty contention; ticket ordering bounds acquisition latency
+/// proportional to queue depth (no starvation), and the PV-aware
+/// spin breaks CLI bloat when the host pauses the holder.
+pub static CDT_LOCK: TicketSpinLock<Cdt> = TicketSpinLock::new(Cdt::new());
 
 /// Initialize the CDT. Called once at boot.
 pub fn init() {

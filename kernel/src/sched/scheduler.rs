@@ -7354,12 +7354,14 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
             // (rarer) wedge where the picking CPU is alive but failing to
             // make progress — that path also re-enqueues but uses a more
             // verbose dump + rate-limiting for diagnostic.
-            const FAST_RESCUE_PENDING_NS: u64 = 1_500_000_000; // 1.5s
+            const FAST_RESCUE_PENDING_NS: u64 = 1_500_000_000; // 1.5s (short tier)
+            const FAST_RESCUE_LONG_AGE_NS: u64 = 3_000_000_000; // 3s (age-only tier)
             const PICKING_CPU_STALE_MS: u64 = 500;
             const HOST_STEAL_CONFIRM_MS: u64 = 200;
+            let pending_age_ns = now_ns.saturating_sub(pset);
             if pset != 0
                 && !t.in_queue.load(Ordering::Relaxed)
-                && now_ns.saturating_sub(pset) >= FAST_RESCUE_PENDING_NS
+                && pending_age_ns >= FAST_RESCUE_PENDING_NS
             {
                 let last_cpu_idx = t.last_cpu.load(Ordering::Relaxed);
                 let ncpus = crate::sched::smp::num_cpus() as u32;
@@ -7375,13 +7377,6 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     // (dequeue_set_pending stamped t.pending_set_steal_ns).
                     // Delta = "ns the picking CPU was stolen during this
                     // specific pending wait", exactly the right signal.
-                    //
-                    // Earlier (boot 524) we compared against
-                    // pcpu.steal_ns_at_last_dispatch which refreshes on
-                    // every dispatch — so delta was always tiny even
-                    // under 100s host pauses.  fast_takeover stayed 0
-                    // despite 100+ PENDING-STUCK-LOW events.  Fix: per-
-                    // thread snapshot taken at the pending stamp.
                     let steal_at_pending =
                         t.pending_set_steal_ns.load(Ordering::Relaxed);
                     let host_stealing = if steal_at_pending == 0 {
@@ -7396,7 +7391,26 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                             && (steal_now - steal_at_pending) / 1_000_000
                                 > HOST_STEAL_CONFIRM_MS
                     };
-                    picking_cpu_stale && host_stealing
+                    // Short-tier (1.5s) requires both confirmations:
+                    // picking CPU CURRENTLY stale AND host stealing during
+                    // this pending episode.  This catches active pauses
+                    // tightly.  But under bursty host pressure the picking
+                    // CPU often resumes briefly between pauses, refreshing
+                    // last_try_switch and falsifying picking_cpu_stale even
+                    // though the thread is genuinely wedged.  Boot 525
+                    // showed 7 PENDING-STUCK-LOW events with 0 fast_takeover
+                    // because of this miss.
+                    //
+                    // Long-tier (3s) escape hatch: pending_age in
+                    // vcpu_runtime accumulates ONLY when some CPU is
+                    // actually running, so 3s of age is hard evidence that
+                    // the thread should have dispatched somewhere by now.
+                    // CAS_FAIL is benign (any racing dispatch wins), so a
+                    // false positive at this tier just costs one redundant
+                    // CAS — well worth the wider catch.
+                    let short_tier_ok = picking_cpu_stale && host_stealing;
+                    let long_tier_ok = pending_age_ns >= FAST_RESCUE_LONG_AGE_NS;
+                    short_tier_ok || long_tier_ok
                 } else { false };
                 if trigger {
                     // CAS PENDING → MAX.  Failure means original CPU

@@ -68,6 +68,7 @@ impl<T> SpinLock<T> {
     /// handlers do NOT take this lock (otherwise the brief IRQ
     /// re-enable could re-enter and deadlock).  Callers must audit
     /// their lock's IRQ-handler footprint.
+    #[allow(dead_code)]
     pub fn lock_pv_aware(&self) -> SpinLockGuard<'_, T> {
         let saved = arch_disable_irqs();
         const SPIN_BUDGET: u32 = 1024;
@@ -121,6 +122,105 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.lock.store(0, Ordering::Release);
+        arch_restore_irqs(self.saved);
+    }
+}
+
+// ===========================================================================
+// TicketSpinLock — FIFO-fair spinlock
+// ===========================================================================
+//
+// `SpinLock` above uses a single AtomicU32 flag and cmpxchg-based acquire,
+// which is starvation-prone: under sustained contention, a single CPU can
+// repeatedly win the CAS and lock out other CPUs entirely.  Linux's
+// qspinlock is more elaborate; for kernel-side use we adopt a simpler
+// ticket scheme that gives FIFO fairness:
+//
+//   acquire: my_ticket = next_ticket.fetch_add(1)
+//            spin while now_serving != my_ticket
+//   release: now_serving.fetch_add(1)
+//
+// Each waiter has a unique ticket and gets the lock in arrival order.
+// The `lock_pv_aware` variant additionally re-enables IRQs every
+// `SPIN_BUDGET` iterations so timer ticks/IPIs can fire on this CPU
+// while the holder is host-paused.
+
+pub struct TicketSpinLock<T> {
+    next_ticket: AtomicU32,
+    now_serving: AtomicU32,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Sync for TicketSpinLock<T> {}
+unsafe impl<T: Send> Send for TicketSpinLock<T> {}
+
+impl<T> TicketSpinLock<T> {
+    pub const fn new(data: T) -> Self {
+        Self {
+            next_ticket: AtomicU32::new(0),
+            now_serving: AtomicU32::new(0),
+            data: UnsafeCell::new(data),
+        }
+    }
+
+    pub fn lock(&self) -> TicketSpinLockGuard<'_, T> {
+        let saved = arch_disable_irqs();
+        let my = self.next_ticket.fetch_add(1, Ordering::AcqRel);
+        while self.now_serving.load(Ordering::Acquire) != my {
+            core::hint::spin_loop();
+        }
+        TicketSpinLockGuard { lock: self, saved }
+    }
+
+    /// Paravirt-aware FIFO acquire.  Same correctness as `lock()`, but
+    /// while waiting we periodically restore IRQ state so timer ticks
+    /// and IPIs can be serviced on this CPU even if the lock holder
+    /// (or an earlier ticket holder) is host-paused.  Identical IRQ-
+    /// reachability contract as `SpinLock::lock_pv_aware`.
+    pub fn lock_pv_aware(&self) -> TicketSpinLockGuard<'_, T> {
+        let saved = arch_disable_irqs();
+        let my = self.next_ticket.fetch_add(1, Ordering::AcqRel);
+        const SPIN_BUDGET: u32 = 1024;
+        let mut spin_count: u32 = 0;
+        loop {
+            if self.now_serving.load(Ordering::Acquire) == my {
+                return TicketSpinLockGuard { lock: self, saved };
+            }
+            core::hint::spin_loop();
+            spin_count = spin_count.wrapping_add(1);
+            if spin_count == SPIN_BUDGET {
+                spin_count = 0;
+                arch_restore_irqs(saved);
+                core::hint::spin_loop();
+                let _ = arch_disable_irqs();
+            }
+        }
+    }
+}
+
+pub struct TicketSpinLockGuard<'a, T> {
+    lock: &'a TicketSpinLock<T>,
+    saved: usize,
+}
+
+impl<T> Deref for TicketSpinLockGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> DerefMut for TicketSpinLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for TicketSpinLockGuard<'_, T> {
+    fn drop(&mut self) {
+        // Hand off to the next ticket.  Release ordering pairs with
+        // the waiters' Acquire load in lock()/lock_pv_aware().
+        self.lock.now_serving.fetch_add(1, Ordering::Release);
         arch_restore_irqs(self.saved);
     }
 }

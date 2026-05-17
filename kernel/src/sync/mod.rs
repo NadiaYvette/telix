@@ -4,4 +4,4 @@ pub mod rcu;
 pub mod spinlock;
 pub mod turnstile;
 
-pub use spinlock::{SpinLock, SpinLockGuard};
+pub use spinlock::{SpinLock, SpinLockGuard, TicketSpinLock};

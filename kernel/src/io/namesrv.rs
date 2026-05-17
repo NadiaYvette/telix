@@ -12,7 +12,7 @@
 
 use crate::mm::paged_array::PagedArray;
 use crate::sched::thread::BlockReason;
-use crate::sync::SpinLock;
+use crate::sync::TicketSpinLock;
 
 const MAX_SVC_NAME: usize = 24;
 
@@ -137,7 +137,12 @@ impl NameTable {
     }
 }
 
-static TABLE: SpinLock<NameTable> = SpinLock::new(NameTable::new());
+// FIFO-fair + PV-aware: under bursty boot-time contention (many tasks
+// concurrently registering and looking up services), an unfair CAS-
+// spinlock can starve waiters arbitrarily.  TicketSpinLock gives
+// arrival-order acquisition, bounded latency proportional to queue
+// depth.
+static TABLE: TicketSpinLock<NameTable> = TicketSpinLock::new(NameTable::new());
 
 /// Register a service. Called from `SYS_SVC_REGISTER`.
 ///
