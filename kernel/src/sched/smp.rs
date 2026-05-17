@@ -286,6 +286,14 @@ pub struct PerCpuData {
     ///   * Both stale: CPU is truly halted — no IRQs arriving, LAPIC
     ///     delivery broken or vCPU descheduled by host.
     pub last_irq_ns: core::sync::atomic::AtomicU64,
+    /// Layer 3 paravirt: host-vCPU steal time (ns) snapshot taken on
+    /// each successful try_switch CAS_OK on this CPU.  The rescue path
+    /// compares this against `steal_time_ns_of_cpu(last_cpu)` to
+    /// compute "stolen ns since last successful dispatch on last_cpu" —
+    /// a positive confirmation that the picking CPU is currently being
+    /// host-descheduled (vs. legitimately busy in a long CLI region).
+    /// 0 = never set / hypervisor doesn't expose steal-time.
+    pub steal_ns_at_last_dispatch: core::sync::atomic::AtomicU64,
     /// #135 CLI callsite probe: RIP captured when entering the outermost
     /// CLI region.  Updated by `record_cli_enter_rip` from arch::irq::disable.
     /// On a max-CLI update in `record_cli_exit`, copied into `cli_max_rip`
@@ -353,6 +361,7 @@ impl PerCpuData {
             cli_count: core::sync::atomic::AtomicU64::new(0),
             last_try_switch_ns: core::sync::atomic::AtomicU64::new(0),
             last_irq_ns: core::sync::atomic::AtomicU64::new(0),
+            steal_ns_at_last_dispatch: core::sync::atomic::AtomicU64::new(0),
             cli_enter_rip: core::sync::atomic::AtomicU64::new(0),
             cli_max_rip: core::sync::atomic::AtomicU64::new(0),
             cli_top: [const { CliTopSlot::new() }; CLI_TOP_N],

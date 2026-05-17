@@ -340,30 +340,37 @@ unsafe fn kvm_hypercall(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     ret
 }
 
+/// Shared seqlock reader for `STEAL_TIME[cpu]`.  Used by both
+/// `steal_time_ns` (current CPU) and `steal_time_ns_of_cpu`
+/// (any CPU — for the rescue path's cross-CPU host-pause probe).
+fn steal_time_ns_of_cpu_impl(cpu: u32) -> Option<u64> {
+    if !KVM_STEAL_TIME_ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let cpu = cpu as usize;
+    if cpu >= crate::sched::smp::MAX_CPUS {
+        return None;
+    }
+    let p = &STEAL_TIME[cpu];
+    for _ in 0..8 {
+        let v0 = p.version.load(Ordering::Acquire);
+        if v0 & 1 != 0 { continue; }
+        let s = p.steal.load(Ordering::Relaxed);
+        let v1 = p.version.load(Ordering::Acquire);
+        if v0 == v1 { return Some(s); }
+    }
+    None
+}
+
 struct KvmHypervisor;
 impl HypervisorOps for KvmHypervisor {
     fn steal_time_ns(&self) -> Option<u64> {
-        if !KVM_STEAL_TIME_ENABLED.load(Ordering::Relaxed) {
-            return None;
-        }
-        // Read with a version-pair check (Linux pattern): odd version
-        // means the host is mid-update.  Retry until version is even
-        // and stable across the read.  In practice it converges in 1
-        // iteration, but the loop is a safety net.  Returns the
-        // calling CPU's stolen time.
-        let cpu = crate::sched::smp::cpu_id() as usize;
-        if cpu >= crate::sched::smp::MAX_CPUS {
-            return None;
-        }
-        let p = &STEAL_TIME[cpu];
-        for _ in 0..8 {
-            let v0 = p.version.load(Ordering::Acquire);
-            if v0 & 1 != 0 { continue; }
-            let s = p.steal.load(Ordering::Relaxed);
-            let v1 = p.version.load(Ordering::Acquire);
-            if v0 == v1 { return Some(s); }
-        }
-        None
+        let cpu = crate::sched::smp::cpu_id() as u32;
+        steal_time_ns_of_cpu_impl(cpu)
+    }
+
+    fn steal_time_ns_of_cpu(&self, cpu: u32) -> Option<u64> {
+        steal_time_ns_of_cpu_impl(cpu)
     }
 
     fn send_reschedule_ipi(&self, target_cpu: u32) -> bool {

@@ -65,6 +65,15 @@ pub trait HypervisorOps: Sync {
         None
     }
 
+    /// Stolen time in nanoseconds since boot for an arbitrary vCPU.
+    /// Used by the cross-CPU rescue path to detect "this vCPU has
+    /// been host-descheduled recently" as a positive confirmation
+    /// before doing a takeover.  Returns `None` if the hypervisor
+    /// doesn't expose per-vCPU steal or `cpu` is out of range.
+    fn steal_time_ns_of_cpu(&self, _cpu: u32) -> Option<u64> {
+        None
+    }
+
     /// Hint the hypervisor that the calling vCPU is waiting for
     /// `target_cpu` (which holds a contended lock or is the
     /// recipient of a pending IPI).  Returns true if the hint was

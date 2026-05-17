@@ -400,6 +400,15 @@ fn dispatch_cas_ok(pcpu: &smp::PerCpuData, tid: ThreadId) {
         PENDING_LOW_LOGGED[tid as usize].store(false, Ordering::Relaxed);
     }
     pcpu.dispatch_cas_ok_count.fetch_add(1, Ordering::Relaxed);
+    // Layer 3 paravirt: snapshot this CPU's steal-time at the moment of
+    // a successful dispatch.  The fast-rescue path on another CPU will
+    // read this value and the picking CPU's CURRENT steal to compute
+    // "stolen ns since last successful dispatch on last_cpu", a positive
+    // confirmation that the picking CPU is host-descheduled (vs. just
+    // legitimately busy in a long CLI region — those don't grow steal).
+    if let Some(s) = crate::arch::hypervisor::ops().steal_time_ns() {
+        pcpu.steal_ns_at_last_dispatch.store(s, Ordering::Relaxed);
+    }
 }
 
 /// #135 latency histogram cutpoints (ns).  Log-spaced at 10^(0.25·k):
@@ -7239,20 +7248,44 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
             // verbose dump + rate-limiting for diagnostic.
             const FAST_RESCUE_PENDING_NS: u64 = 1_500_000_000; // 1.5s
             const PICKING_CPU_STALE_MS: u64 = 500;
+            const HOST_STEAL_CONFIRM_MS: u64 = 200;
             if pset != 0
                 && !t.in_queue.load(Ordering::Relaxed)
                 && now_ns.saturating_sub(pset) >= FAST_RESCUE_PENDING_NS
             {
                 let last_cpu_idx = t.last_cpu.load(Ordering::Relaxed);
                 let ncpus = crate::sched::smp::num_cpus() as u32;
-                let picking_cpu_stale = if last_cpu_idx < ncpus {
+                let trigger = if last_cpu_idx < ncpus {
                     let pc = crate::sched::smp::get(last_cpu_idx);
                     let lts = pc.last_try_switch_ns.load(Ordering::Relaxed);
                     let wall_now = get_monotonic_ns();
-                    lts != 0 && wall_now > lts
-                        && (wall_now - lts) / 1_000_000 > PICKING_CPU_STALE_MS
+                    let picking_cpu_stale = lts != 0 && wall_now > lts
+                        && (wall_now - lts) / 1_000_000 > PICKING_CPU_STALE_MS;
+                    // Layer 3 paravirt: positive host-pause confirmation.
+                    // If steal-time advanced on `last_cpu` since its last
+                    // successful dispatch, the CPU is being host-descheduled
+                    // (vs. legitimately busy in a long CLI region — those
+                    // don't accumulate steal).  When steal isn't available
+                    // (bare metal or pre-init), the host-confirm degrades
+                    // to "unknown", and we fall back to picking_cpu_stale
+                    // alone for the trigger.
+                    let steal_at_disp =
+                        pc.steal_ns_at_last_dispatch.load(Ordering::Relaxed);
+                    let host_stealing = if steal_at_disp == 0 {
+                        // No baseline yet — accept the stale-CPU signal
+                        // alone (older boots / bare metal).
+                        true
+                    } else {
+                        let steal_now = crate::arch::hypervisor::ops()
+                            .steal_time_ns_of_cpu(last_cpu_idx)
+                            .unwrap_or(0);
+                        steal_now > steal_at_disp
+                            && (steal_now - steal_at_disp) / 1_000_000
+                                > HOST_STEAL_CONFIRM_MS
+                    };
+                    picking_cpu_stale && host_stealing
                 } else { false };
-                if picking_cpu_stale {
+                if trigger {
                     // CAS PENDING → MAX.  Failure means original CPU
                     // resumed and won the race — benign, leave the
                     // thread alone.
