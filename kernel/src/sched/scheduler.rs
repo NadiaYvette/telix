@@ -3032,6 +3032,34 @@ pub fn tick(current_sp: u64) -> u64 {
             const Z: AtomicU32 = AtomicU32::new(0);
             [Z; 16]
         };
+        // Periodic Layer-3 counter dump (unconditional, ~1Hz aggregated
+        // across all CPUs at 4 cpus × 25-tick period).  Surfaces
+        // FAST_RESCUE_TAKEOVERS, CAS_FAIL_RESCUE_BAILS,
+        // STEAL_AWARE_REROUTES, and ASYNC_PF_EVENTS without needing
+        // the WATCHDOG IPC-stall trigger to fire.  Lets us see
+        // whether the recent paravirt fixes are firing under stress.
+        static LAYER3_DIAG_COUNTER: AtomicU64 = AtomicU64::new(0);
+        static LAYER3_DIAG_LOCK: AtomicU32 = AtomicU32::new(0);
+        let l3 = LAYER3_DIAG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if l3 > 0 && l3 % 100 == 0 {
+            if LAYER3_DIAG_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                let frt = FAST_RESCUE_TAKEOVERS.load(Ordering::Relaxed);
+                let cfb = CAS_FAIL_RESCUE_BAILS.load(Ordering::Relaxed);
+                let sar = STEAL_AWARE_REROUTES.load(Ordering::Relaxed);
+                #[cfg(target_arch = "x86_64")]
+                let apf = crate::arch::x86_64::exception::async_pf_event_count();
+                #[cfg(not(target_arch = "x86_64"))]
+                let apf: u64 = 0;
+                if frt | cfb | sar | apf != 0 {
+                    crate::println!(
+                        "LAYER3-DIAG: fast_takeover={} cas_fail_bail={} wake_reroute={} async_pf={}",
+                        frt, cfb, sar, apf,
+                    );
+                }
+                LAYER3_DIAG_LOCK.store(0, Ordering::Release);
+            }
+        }
+
         static HEARTBEAT_COUNTER: AtomicU64 = AtomicU64::new(0);
         static HEARTBEAT_LOCK: AtomicU32 = AtomicU32::new(0);
         let hb = HEARTBEAT_COUNTER.fetch_add(1, Ordering::Relaxed);
