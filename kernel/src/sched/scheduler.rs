@@ -8195,11 +8195,8 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
             ON_CPU_PENDING, cpu_idx, Ordering::AcqRel, Ordering::Acquire,
         ) {
             record_trans(next_id as u32, TRANS_CAS_FAIL, thread_ref(next_id).state, other_cpu);
-            crate::println!(
-                "DOUBLE-SCHED(sleep): tid={} already on cpu={}, this cpu={}",
-                next_id, other_cpu, cpu_idx
-            );
-            thread_ref(next_id).killed.store(true, Ordering::Release);
+            // See try_switch CAS_FAIL — benign regardless of other_cpu.
+            CAS_FAIL_RESCUE_BAILS.fetch_add(1, Ordering::Relaxed);
             // Pick idle instead.
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
@@ -8375,14 +8372,16 @@ pub fn handoff_to(receiver_tid: ThreadId) {
         let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
         if receiver_tid != idle_id {
             pcpu.dispatching_tid.store(receiver_tid, Ordering::Release);
-            if let Err(other_cpu) = thread_ref(receiver_tid).on_cpu.compare_exchange(
+            if let Err(_other_cpu) = thread_ref(receiver_tid).on_cpu.compare_exchange(
                 u32::MAX, cpu_id, Ordering::AcqRel, Ordering::Acquire,
             ) {
-                crate::println!(
-                    "DOUBLE-SCHED(handoff): tid={} already on cpu={}, this cpu={}",
-                    receiver_tid, other_cpu, cpu_id
-                );
-                thread_ref(receiver_tid).killed.store(true, Ordering::Release);
+                // CAS_FAIL on the MAX→cpu handoff path: receiver was
+                // already claimed by another CPU (e.g. wake_thread set
+                // on_cpu=PENDING concurrently).  Mutex-by-CAS still
+                // holds — at most one CPU dispatches.  Yield to sender
+                // benignly instead of killing the receiver.  See
+                // try_switch CAS_FAIL rationale.
+                CAS_FAIL_RESCUE_BAILS.fetch_add(1, Ordering::Relaxed);
                 pcpu.dispatching_tid.store(0, Ordering::Release);
                 // Stay on sender. Clear deferred store and restore on_cpu.
                 deferred_requeue()[cpu].store(0, Ordering::Release);
