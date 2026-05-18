@@ -489,9 +489,15 @@ const AT_FDCWD: u64 = 0xFFFF_FFFF_FFFF_FF9C; // -100 as u64
 // Pipe server protocol tags
 const PIPE_CREATE: u64 = 0x5010;
 const PIPE_WRITE_TAG: u64 = 0x5020;
+const PIPE_WRITE_ASYNC: u64 = 0x5022;
+const PIPE_WRITE_REPLY: u64 = 0x5023;
 const PIPE_READ_TAG: u64 = 0x5030;
+const PIPE_READ_ASYNC: u64 = 0x5032;
+const PIPE_READ_REPLY: u64 = 0x5033;
 const PIPE_CLOSE_TAG: u64 = 0x5040;
 const PIPE_POLL_TAG: u64 = 0x5050;
+const PIPE_SET_REPLY_PORT: u64 = 0x5060;
+const PIPE_SET_REPLY_PORT_OK: u64 = 0x5061;
 const PIPE_OK: u64 = 0x5100;
 const PIPE_EOF_TAG: u64 = 0x51FF;
 

@@ -19,9 +19,15 @@ use userlib::syscall;
 // Protocol tags.
 const PIPE_CREATE: u64 = 0x5010;
 const PIPE_WRITE: u64 = 0x5020;
+const PIPE_WRITE_ASYNC: u64 = 0x5022;
+const PIPE_WRITE_REPLY: u64 = 0x5023;
 const PIPE_READ: u64 = 0x5030;
+const PIPE_READ_ASYNC: u64 = 0x5032;
+const PIPE_READ_REPLY: u64 = 0x5033;
 const PIPE_CLOSE: u64 = 0x5040;
 const PIPE_POLL: u64 = 0x5050;
+const PIPE_SET_REPLY_PORT: u64 = 0x5060;
+const PIPE_SET_REPLY_PORT_OK: u64 = 0x5061;
 
 const POLL_SUBSCRIBE: u64 = 0xF010;
 const POLL_UNSUBSCRIBE: u64 = 0xF020;
@@ -30,6 +36,13 @@ const POLL_NOTIFY: u64 = 0xF030;
 const PIPE_OK: u64 = 0x5100;
 const PIPE_EOF: u64 = 0x51FF;
 const PIPE_ERROR: u64 = 0x5F00;
+
+/// Reply port registered by linux_srv via PIPE_SET_REPLY_PORT.  When
+/// non-zero, PIPE_WRITE_REPLY / PIPE_READ_REPLY notifications are
+/// sent here via send_nb_4 instead of the normal sync reply path.
+/// Mirrors the FS_READ_ASYNC pattern landed for the 14 FS servers.
+static ASYNC_REPLY_PORT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 // Limits.
 const MAX_PIPES: usize = 32;
@@ -45,6 +58,15 @@ struct PipeSlot {
     // Deferred reply-cap handle for a blocked reader (u64::MAX = none).
     // Saved via sys_reply_take; fulfilled later via sys_reply_to.
     recv_reply_cap: u64,
+    // Async-pending reader (Phase A1 of linux_srv worker-pool work).
+    // When a PIPE_READ_ASYNC arrives and the pipe is empty + writer
+    // not closed, park the request in these fields instead of via
+    // sys_reply_take.  Fulfilled by send_nb_4 to ASYNC_REPLY_PORT
+    // when data arrives or writer closes.  Only one async reader
+    // per slot for now (matches existing single recv_reply_cap).
+    async_read_pending: bool,
+    async_read_correlation: u64,
+    async_read_max_len: u32,
     // Poll subscription ports (u64::MAX = no subscriber).
     // When readiness changes, we send POLL_NOTIFY to these ports.
     poll_notify_read: u64,  // subscriber watching the read end
@@ -61,6 +83,9 @@ impl PipeSlot {
             writer_closed: false,
             reader_closed: false,
             recv_reply_cap: u64::MAX,
+            async_read_pending: false,
+            async_read_correlation: 0,
+            async_read_max_len: 0,
             poll_notify_read: u64::MAX,
             poll_notify_write: u64::MAX,
         }
@@ -133,7 +158,7 @@ fn pack_bytes(data: &[u8], len: usize) -> (u64, u64) {
 }
 
 /// Deliver data (or EOF) to a pipe that has a blocked reader whose
-/// reply-cap was saved via sys_reply_take.
+/// reply-cap was saved via sys_reply_take.  Sync path.
 fn try_wake_reader(slot: u32) {
     let s = unsafe { &mut PIPES[slot as usize] };
     if s.recv_reply_cap == u64::MAX {
@@ -149,6 +174,39 @@ fn try_wake_reader(slot: u32) {
     } else if s.writer_closed {
         s.recv_reply_cap = u64::MAX;
         let _ = syscall::reply_to(cap, PIPE_EOF, 0, 0, 0, 0);
+    }
+}
+
+/// Async equivalent of try_wake_reader: satisfy a PIPE_READ_ASYNC
+/// that was parked because the pipe was empty.  Sends PIPE_READ_REPLY
+/// via send_nb_4 to the registered ASYNC_REPLY_PORT.
+fn try_wake_async_reader(slot: u32) {
+    let s = unsafe { &mut PIPES[slot as usize] };
+    if !s.async_read_pending {
+        return;
+    }
+    let reply_port = ASYNC_REPLY_PORT.load(core::sync::atomic::Ordering::Acquire);
+    if reply_port == 0 {
+        // No reply port registered — drop silently; will retry on next wake.
+        return;
+    }
+    let correlation = s.async_read_correlation;
+    let max_len = s.async_read_max_len as usize;
+    if s.len() > 0 {
+        let mut tmp = [0u8; 16];
+        let n = s.pop(&mut tmp).min(max_len);
+        let (w0, w1) = pack_bytes(&tmp, n);
+        s.async_read_pending = false;
+        s.async_read_correlation = 0;
+        s.async_read_max_len = 0;
+        let _ = syscall::send_nb_4(reply_port, PIPE_READ_REPLY, correlation, w0, w1, n as u64);
+    } else if s.writer_closed {
+        s.async_read_pending = false;
+        s.async_read_correlation = 0;
+        s.async_read_max_len = 0;
+        // n=0 means EOF or error; linux_srv's continuation treats 0
+        // as "no more data — read(2) returns 0".
+        let _ = syscall::send_nb_4(reply_port, PIPE_READ_REPLY, correlation, 0, 0, 0);
     }
 }
 
@@ -374,6 +432,130 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
                 let rc = syscall::reply(PIPE_OK, revents as u64, 0, 0, 0, 0);
                 syscall::debug_puts(b"  [pipe] POLL reply rc=");
                 if rc == 0 { syscall::debug_puts(b"0\n"); } else { syscall::debug_puts(b"ERR\n"); }
+            }
+
+            PIPE_SET_REPLY_PORT => {
+                ASYNC_REPLY_PORT.store(msg.data[0], core::sync::atomic::Ordering::Release);
+                let _ = syscall::reply(PIPE_SET_REPLY_PORT_OK, 0, 0, 0, 0, 0);
+            }
+
+            PIPE_WRITE_ASYNC => {
+                // Wire format mirrors PIPE_WRITE but with correlation
+                // displacing the len field's word:
+                //   d0 = handle (low 32) | len (high 32)
+                //   d1 = bytes 0-7
+                //   d2 = correlation
+                //   d3 = bytes 8-15
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as u32;
+                let len = ((msg.data[0] >> 32) & 0xFFFF_FFFF) as usize;
+                let len = if len > 16 { 16 } else { len };
+                let correlation = msg.data[2];
+                let reply_port = ASYNC_REPLY_PORT.load(core::sync::atomic::Ordering::Acquire);
+                if reply_port == 0 {
+                    // No reply port registered — drop silently.
+                    continue;
+                }
+                if handle & 1 == 0 || (handle / 2) as usize >= MAX_PIPES {
+                    let _ = syscall::send_nb_4(reply_port, PIPE_WRITE_REPLY, correlation, 0, 0, 0);
+                    continue;
+                }
+                let slot = (handle / 2) as usize;
+                let s = unsafe { &mut PIPES[slot] };
+                if !s.active || s.reader_closed {
+                    let _ = syscall::send_nb_4(reply_port, PIPE_WRITE_REPLY, correlation, 0, 0, 0);
+                    continue;
+                }
+
+                let was_empty = s.len() == 0;
+
+                let mut tmp = [0u8; 16];
+                let b0 = msg.data[1].to_le_bytes();
+                let b1 = msg.data[3].to_le_bytes();
+                let mut i = 0;
+                while i < len && i < 8 {
+                    tmp[i] = b0[i];
+                    i += 1;
+                }
+                while i < len && i < 16 {
+                    tmp[i] = b1[i - 8];
+                    i += 1;
+                }
+
+                let written = s.push(&tmp[..len]);
+                let _ = syscall::send_nb_4(
+                    reply_port, PIPE_WRITE_REPLY, correlation, written as u64, 0, 0,
+                );
+
+                // Wake any blocked reader (sync or async) — data arrived.
+                try_wake_reader(slot as u32);
+                try_wake_async_reader(slot as u32);
+
+                if was_empty && written > 0 {
+                    notify_poll_read(slot as u32);
+                }
+            }
+
+            PIPE_READ_ASYNC => {
+                // Wire format:
+                //   d0 = handle (low 32) | max_len (high 32)
+                //   d1 = correlation
+                //   d2-3 = unused
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as u32;
+                let max_len = ((msg.data[0] >> 32) & 0xFFFF_FFFF) as u32;
+                let correlation = msg.data[1];
+                let reply_port = ASYNC_REPLY_PORT.load(core::sync::atomic::Ordering::Acquire);
+                if reply_port == 0 {
+                    continue;
+                }
+                if handle & 1 != 0 || (handle / 2) as usize >= MAX_PIPES {
+                    let _ = syscall::send_nb_4(reply_port, PIPE_READ_REPLY, correlation, 0, 0, 0);
+                    continue;
+                }
+                let slot = (handle / 2) as usize;
+                let s = unsafe { &mut PIPES[slot] };
+                if !s.active {
+                    let _ = syscall::send_nb_4(reply_port, PIPE_READ_REPLY, correlation, 0, 0, 0);
+                    continue;
+                }
+
+                let was_full = s.free() == 0;
+                let max_n = (max_len as usize).min(16);
+
+                if s.len() > 0 {
+                    let mut tmp = [0u8; 16];
+                    let n = {
+                        // pop up to max_n bytes
+                        let mut taken = [0u8; 16];
+                        let got = s.pop(&mut taken);
+                        let take = got.min(max_n);
+                        tmp[..take].copy_from_slice(&taken[..take]);
+                        // any bytes popped beyond max_n are lost; with
+                        // max_n=16 (the inline limit) this can't happen.
+                        take
+                    };
+                    let (w0, w1) = pack_bytes(&tmp, n);
+                    let _ = syscall::send_nb_4(reply_port, PIPE_READ_REPLY, correlation, w0, w1, n as u64);
+                    if was_full {
+                        notify_poll_write(slot as u32);
+                    }
+                } else if s.writer_closed {
+                    // EOF: n=0 in the reply.
+                    let _ = syscall::send_nb_4(reply_port, PIPE_READ_REPLY, correlation, 0, 0, 0);
+                } else {
+                    // Park the async read; fulfilled later by
+                    // try_wake_async_reader.  Only one async reader per
+                    // slot — overwrite is safe in practice because
+                    // linux_srv serialises per-pipe reads, but be
+                    // defensive: if there's an existing pending reader,
+                    // satisfy this one immediately with 0 bytes.
+                    if s.async_read_pending {
+                        let _ = syscall::send_nb_4(reply_port, PIPE_READ_REPLY, correlation, 0, 0, 0);
+                    } else {
+                        s.async_read_pending = true;
+                        s.async_read_correlation = correlation;
+                        s.async_read_max_len = max_len;
+                    }
+                }
             }
 
             POLL_SUBSCRIBE => {
