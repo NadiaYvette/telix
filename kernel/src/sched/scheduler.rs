@@ -4139,12 +4139,23 @@ fn choose_wake_target_steal_aware(default_cpu: u32) -> u32 {
     let default_ipi_stale = ipi_staleness(default_cpu);
     let default_threshold = ipi_stale_threshold(default_cpu);
 
-    // Tier 1: heavy host steal on default → look for less-stolen peer.
+    // Tier 1: heavy host steal on default → look for less-stolen peer
+    // that is ALSO not IPI-starved.  Boot 534 surfaced the trap: an
+    // IPI-starved vCPU (cpu=3 in that boot, 627 IPIs/hour vs peers'
+    // 18000+) has near-zero accumulated steal_time precisely because
+    // the host isn't bothering to schedule it.  A naive least-stolen
+    // pick would route work to that vCPU, where it would then never
+    // be woken.  Filter candidates by IPI freshness before comparing.
     if default_steal >= HEAVY_STEAL_NS {
         let mut best_cpu = default_cpu;
         let mut best_steal = default_steal;
         for c in 0..ncpus {
             if c == default_cpu { continue; }
+            if ipi_staleness(c) >= ipi_stale_threshold(c) {
+                // IPI-starved peer — would be a worse target than the
+                // host-stolen default.  Skip.
+                continue;
+            }
             let s = recent_steal(c);
             if s + ADVANTAGE_NS <= best_steal {
                 best_steal = s;
