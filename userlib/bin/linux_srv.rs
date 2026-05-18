@@ -4257,6 +4257,15 @@ static mut PIPE_ASYNC_REGISTERED: bool = false;
 /// PIPE_SET_REPLY_PORT_OK ACK.  Prevents the main-loop retry from
 /// spamming pipe_srv every iteration with duplicate registrations.
 static mut PIPE_ASYNC_REG_PENDING: bool = false;
+/// One-shot bitmap recording which failure mode try_register_pipe_async
+/// has already logged.  Phase A1 boots 537 + 538 showed the registration
+/// print never fires; isolating *why* requires per-failure-mode logging
+/// without flooding the log.  Bits:
+///   0x01 — ns_lookup returned 0 (pipe service not yet registered)
+///   0x02 — BACKEND_REPLY_PORT == 0 (linux_srv init not done)
+///   0x04 — send_nb_4 returned nonzero rc (port queue full / cap missing)
+/// Once a bit is set, the corresponding message is suppressed.
+static mut PIPE_REG_DIAG_FLAGS: u8 = 0;
 
 /// Lazily register BACKEND_REPLY_PORT with vfs_srv so future
 /// VFS_OPEN_ASYNC / VFS_STAT_ASYNC reads can be delivered as
@@ -4315,15 +4324,34 @@ fn try_register_pipe_async() -> bool {
         }
         let pp = PIPE_PORT;
         if pp == 0 {
+            if PIPE_REG_DIAG_FLAGS & 0x01 == 0 {
+                PIPE_REG_DIAG_FLAGS |= 0x01;
+                syscall::debug_puts(b"[linux_srv] pipe reg: ns_lookup(pipe) == 0 (service not yet registered)\n");
+            }
             return false;
         }
         let cp = BACKEND_REPLY_PORT;
         if cp == 0 {
+            if PIPE_REG_DIAG_FLAGS & 0x02 == 0 {
+                PIPE_REG_DIAG_FLAGS |= 0x02;
+                syscall::debug_puts(b"[linux_srv] pipe reg: BACKEND_REPLY_PORT == 0\n");
+            }
             return false;
         }
         let rc = syscall::send_nb_4(pp, PIPE_SET_REPLY_PORT, cp, 0, 0, 0);
         if rc == 0 {
             PIPE_ASYNC_REG_PENDING = true;
+            syscall::debug_puts(b"[linux_srv] pipe reg: PIPE_SET_REPLY_PORT sent, awaiting ACK\n");
+        } else {
+            if PIPE_REG_DIAG_FLAGS & 0x04 == 0 {
+                PIPE_REG_DIAG_FLAGS |= 0x04;
+                syscall::debug_puts(b"[linux_srv] pipe reg: send_nb_4 rc=");
+                let mut buf = [0u8; 20]; let mut val = rc; let mut k = 20;
+                if val == 0 { k -= 1; buf[k] = b'0'; }
+                while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+                syscall::debug_puts(&buf[k..20]);
+                syscall::debug_puts(b" (port queue full / cap missing)\n");
+            }
         }
         // Registration completion is handled async — return false here
         // until the ACK lands.
