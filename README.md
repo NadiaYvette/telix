@@ -129,7 +129,15 @@ See [`docs/personality-architecture.md`](docs/personality-architecture.md) for t
 
 ## License
 
-This project is currently unlicensed. A license will be selected before any release.
+Telix is dual-licensed under either of:
+
+- **Apache License, Version 2.0** ([LICENSE-APACHE-2.0](LICENSE-APACHE-2.0))
+- **MIT License** ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. This is the same dual-license arrangement used throughout the
+Rust ecosystem; downstream users may pick either license depending on their
+own constraints. See [`LICENSE.md`](LICENSE.md) for the full text, contribution
+terms, and notes on future third-party components.
 
 ## Author
 
