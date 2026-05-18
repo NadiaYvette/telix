@@ -13171,6 +13171,16 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(port);
     syscall::debug_puts(b"\n");
 
+    // Phase A1 registration: fire the pipe-async handshake BEFORE the
+    // eager preload starts.  The preload uses sync calls to initramfs_srv
+    // and can take many minutes under heavy host stress, during which
+    // the main dispatch loop (where the other periodic registrations
+    // run) never executes.  Pipe registration is send_nb-based, so it
+    // doesn't block — and the ACK queues on BACKEND_REPLY_PORT for the
+    // main loop to drain.  This is the difference between "registration
+    // happens during stress" vs "registration deferred forever".
+    let _ = try_register_pipe_async();
+
     // Preload common Xwayland/xeyes libs into the content cache.  Each
     // call to try_open_initramfs populates a cache slot via the existing
     // irfs_read_bulk path, so subsequent opens by Linux processes hit
