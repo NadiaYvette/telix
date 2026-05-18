@@ -631,6 +631,53 @@ Active work on the personality server has been addressing this
 through various concurrency mechanisms layered on the blocking Telix
 interface.
 
+#### 4.1.1 Two distinct blocking concerns
+
+The personality server's concurrency problem actually has two
+layers that the design should keep separate:
+
+1. **Per-syscall blocking on backend RPCs.** A Linux syscall like
+   `read(2)` requires a Telix message to a filesystem server; if
+   the personality server's main thread blocks on that message, no
+   other Linux syscall can be serviced.  This is the layer the
+   `PendingAsync` state-machine table (commit `4569f0d` and
+   descendants) addresses — when a Linux thread submits an I/O
+   request, the personality server records the in-flight Telix
+   message and continues its dispatch loop; the message reply lands
+   on the backend reply port and the state machine completes the
+   Linux syscall later.
+
+2. **Cross-client blocking via shared kernel objects.** Two Linux
+   processes communicating through pipes, AF_UNIX sockets,
+   wait4/exit, futexes, eventfd, etc., wait on *each other*
+   through the personality server.  Even with per-syscall async
+   on backend RPCs, if the personality server still issues a
+   *sync* `pipe_srv` call (say) on behalf of client A while
+   client B's matching call is queued behind it, the server
+   deadlocks A-and-B against itself: A's call won't complete
+   until B's runs, and B's call won't dequeue until A's
+   completes.
+
+   Adding worker threads to the personality server addresses this
+   partially: with N workers, you can have up to N concurrent
+   blocking calls.  But under a fork-bomb-like load or genuinely
+   complex multi-process IPC, blocked-syscall depth can exceed
+   any fixed N and the deadlock returns.
+
+The completion-based interface attacks both layers with the same
+mechanism: every Telix syscall returns immediately; every blocking
+operation parks an activation in a per-process pending table; the
+activation resumes (or its continuation fires) when the completion
+arrives.  Cross-client deadlock becomes architecturally impossible
+because no Telix thread is ever physically blocked on a kernel
+object — at most it's parked in `ring_wait`, which any incoming
+completion can satisfy.
+
+In other words: **worker-pool gives parallelism; async-conversion
+of the blocking ops eliminates the deadlock class.**  Both are
+useful, but the load-bearing piece for correctness is the async
+conversion.
+
 ### 4.2 How Completion-Based Telix Resolves This Naturally
 
 Under the completion-based Telix interface, the personality server's
@@ -1267,6 +1314,34 @@ migration of the *native Telix* ABI on top of that:
 The flag-day cost is high (touching every callsite); the incremental
 path lets each subsystem move when it benefits, and the existing
 blocking wrappers around `syscall::call` continue to work throughout.
+
+#### Interim sync-paths to convert before the full ring migration
+
+Until the full ring-based ABI lands, the current message-pair pattern
+(`*_ASYNC` tag + reply on a dedicated reply port, with continuation
+state in `PENDING_ASYNC`) already addresses the cross-CLIENT
+deadlock class incrementally.  The conversion roadmap for `linux_srv`
+(per `project_linux_srv_worker_pool.md`):
+
+- Already converted: UDS_ACCEPT_ASYNC, UDS_RECV_ASYNC,
+  IRFS_IO_CONNECT_ASYNC, IRFS_IO_READ_ASYNC (single-chunk +
+  mmap-fill), VFS_OPEN_ASYNC, VFS_STAT_ASYNC, FS_READ_ASYNC (all
+  14 FS servers).
+- Still sync (to convert):
+  1. PIPE_WRITE_ASYNC + PIPE_READ_ASYNC
+  2. UDS_SEND_ASYNC (complement to existing accept/recv async)
+  3. wait4 / waitpid internal async-park + child-exit notification
+  4. futex_wait / futex_wake park/wake machinery
+  5. eventfd / timerfd / signalfd async-read queueing
+  6. FS_WRITE_ASYNC + VFS_WRITE_ASYNC (deferrable; not on Xwayland
+     hot path)
+  7. mq_send / mq_receive (when POSIX MQ lands)
+
+This sweep is the load-bearing piece for deadlock correctness
+(§4.1.1); the worker-pool conversion of `linux_srv`'s syscall
+dispatch is throughput on top.  Doing the sweep first means the
+correctness property is achieved at N=1 worker; widening the pool
+later is pure speedup.
 
 ### A.6 Continuation passing and parent-constructed children in the current tree
 
