@@ -266,6 +266,7 @@ const EINVAL: u64 = 22;
 const EAGAIN: u64 = 11;
 const ECHILD: u64 = 10;
 const EMFILE: u64 = 24;
+const EPIPE: u64 = 32;
 const ESPIPE: u64 = 29;
 const ERANGE: u64 = 34;
 const ENOSYS: u64 = 38;
@@ -906,6 +907,29 @@ enum PendingAsyncKind {
     /// Linux stat buffer layout, copy out via personality_copy_out, then
     /// personality_reply with 0 or a negated errno.
     StatVfs,
+    /// Async pipe write (Phase A1).  Up to 16 bytes per chunk; on reply,
+    /// `personality_reply` to the caller with bytes_written.  Linux
+    /// permits partial writes for pipes > PIPE_BUF or under signal, so
+    /// returning bytes from a single 16-byte chunk is valid even when
+    /// the user requested more.
+    /// Field reuse:
+    ///   pi               → caller process index
+    ///   caller_task_port → port for personality_reply
+    ///   listen_fd        → fd index in PROC_TABLE[pi].fds (for offset/diagnostic)
+    ///   flags            → pipe handle (low 32 bits)
+    ///   buf_va, buf_len  → unused
+    PipeWrite,
+    /// Async pipe read (Phase A1).  Up to 16 bytes per chunk; on reply,
+    /// copy `n` bytes from inline data into the caller's buffer via
+    /// `personality_copy_out`, then `personality_reply` with n.
+    /// Field reuse:
+    ///   pi               → caller process index
+    ///   caller_task_port → port for personality_reply
+    ///   listen_fd        → fd index in PROC_TABLE[pi].fds
+    ///   flags            → pipe handle (low 32 bits)
+    ///   buf_va           → caller's destination VA
+    ///   buf_len          → caller's requested read length (capped to 16)
+    PipeRead,
 }
 
 /// `#[repr(C)]` pins `kind` at offset 0 so we can take an
@@ -1566,8 +1590,8 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             return linux_err(EBADF);
         }
         if PROC_TABLE[pi].fds[fd_idx].kind == FdKind::Pipe {
-            return write_pipe(caller_port, PROC_TABLE[pi].fds[fd_idx].fs_port,
-                              PROC_TABLE[pi].fds[fd_idx].handle, buf_va, count);
+            return write_pipe(pi, caller_port, PROC_TABLE[pi].fds[fd_idx].fs_port,
+                              PROC_TABLE[pi].fds[fd_idx].handle, fd_idx, buf_va, count);
         }
         if PROC_TABLE[pi].fds[fd_idx].kind == FdKind::Socket {
             let dom = PROC_TABLE[pi].fds[fd_idx].sock_domain;
@@ -1802,7 +1826,7 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     };
 
     if kind == FdKind::Pipe {
-        return read_pipe(caller_port, fs_port, handle, buf_va, count);
+        return read_pipe(pi, caller_port, fs_port, handle, fd, buf_va, count);
     }
 
     if kind == FdKind::Socket {
@@ -4228,6 +4252,7 @@ fn try_register_irfs_async_reply_port() -> bool {
 /// `try_register_vfs_async_reply_port`, called lazily from the main IPC
 /// loop once vfs_srv is reachable.
 static mut VFS_ASYNC_REGISTERED: bool = false;
+static mut PIPE_ASYNC_REGISTERED: bool = false;
 
 /// Lazily register BACKEND_REPLY_PORT with vfs_srv so future
 /// VFS_OPEN_ASYNC / VFS_STAT_ASYNC reads can be delivered as
@@ -4259,6 +4284,167 @@ fn try_register_vfs_async_reply_port() -> bool {
             false
         }
     }
+}
+
+/// Register BACKEND_REPLY_PORT with pipe_srv so PIPE_*_ASYNC replies
+/// (PIPE_WRITE_REPLY / PIPE_READ_REPLY) flow back to the main dispatch
+/// thread.  Phase A1 of the linux_srv async sweep
+/// (project_linux_srv_worker_pool.md): pipe writes/reads were the first
+/// remaining cross-CLIENT deadlock vector after the IRFS/VFS/FS_READ
+/// conversions.
+fn try_register_pipe_async() -> bool {
+    unsafe {
+        if PIPE_ASYNC_REGISTERED {
+            return true;
+        }
+        if PIPE_PORT == 0 {
+            PIPE_PORT = syscall::ns_lookup(b"pipe").unwrap_or(0);
+        }
+        let pp = PIPE_PORT;
+        if pp == 0 {
+            return false;
+        }
+        let cp = BACKEND_REPLY_PORT;
+        if cp == 0 {
+            return false;
+        }
+        let resp = match syscall::call(pp, PIPE_SET_REPLY_PORT, cp, 0, 0, 0) {
+            Some(m) => m,
+            None => return false,
+        };
+        if resp.tag == PIPE_SET_REPLY_PORT_OK {
+            PIPE_ASYNC_REGISTERED = true;
+            syscall::debug_puts(b"[linux_srv] pipe async reply port registered\n");
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Issue one chunk of PIPE_WRITE_ASYNC for a pipe write(2).  Allocates a
+/// pending-async slot and sends via send_nb_4 to pipe_srv.  Returns
+/// Some(slot) on success (caller sets REPLY_DEFERRED and returns 0);
+/// None if registration not yet ready or no slot available — caller
+/// falls back to the existing sync write_pipe path.
+fn try_pipe_write_async(
+    pi: usize,
+    caller_port: u64,
+    fd: usize,
+    pipe_port: u64,
+    handle: u64,
+    bytes: &[u8],
+) -> Option<usize> {
+    use core::sync::atomic::Ordering;
+    if !try_register_pipe_async() { return None; }
+    let n = bytes.len().min(16);
+    if n == 0 { return None; }
+    let slot = async_alloc_slot()?;
+    let mut w0 = 0u64;
+    let mut w1 = 0u64;
+    for i in 0..n.min(8) { w0 |= (bytes[i] as u64) << (i * 8); }
+    for i in 8..n { w1 |= (bytes[i] as u64) << ((i - 8) * 8); }
+    let correlation = ASYNC_NEXT_ID_ATOMIC.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        PENDING_ASYNC[slot].correlation = correlation;
+        PENDING_ASYNC[slot].pi = pi;
+        PENDING_ASYNC[slot].caller_task_port = caller_port;
+        PENDING_ASYNC[slot].listen_fd = fd;
+        PENDING_ASYNC[slot].flags = handle;
+        PENDING_ASYNC[slot].buf_va = 0;
+        PENDING_ASYNC[slot].buf_len = n;
+    }
+    // Publish the real kind LAST (Release) so a sibling thread can't
+    // see PipeWrite with stale payload.  See async_free_slot comment.
+    pending_kind_atomic(slot).store(
+        PendingAsyncKind::PipeWrite as u8, Ordering::Release,
+    );
+    // Wire: d0 = handle (low32) | n (high32), d1 = bytes 0-7,
+    //       d2 = correlation, d3 = bytes 8-15.
+    let d0 = (handle & 0xFFFF_FFFF) | ((n as u64) << 32);
+    let rc = syscall::send_nb_4(pipe_port, PIPE_WRITE_ASYNC, d0, w0, correlation, w1);
+    if rc != 0 {
+        async_free_slot(slot);
+        return None;
+    }
+    Some(slot)
+}
+
+/// Issue one chunk of PIPE_READ_ASYNC for a pipe read(2).
+fn try_pipe_read_async(
+    pi: usize,
+    caller_port: u64,
+    fd: usize,
+    pipe_port: u64,
+    handle: u64,
+    buf_va: usize,
+    max_len: usize,
+) -> Option<usize> {
+    use core::sync::atomic::Ordering;
+    if !try_register_pipe_async() { return None; }
+    if max_len == 0 { return None; }
+    let n = max_len.min(16) as u32;
+    let slot = async_alloc_slot()?;
+    let correlation = ASYNC_NEXT_ID_ATOMIC.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        PENDING_ASYNC[slot].correlation = correlation;
+        PENDING_ASYNC[slot].pi = pi;
+        PENDING_ASYNC[slot].caller_task_port = caller_port;
+        PENDING_ASYNC[slot].listen_fd = fd;
+        PENDING_ASYNC[slot].flags = handle;
+        PENDING_ASYNC[slot].buf_va = buf_va;
+        PENDING_ASYNC[slot].buf_len = n as usize;
+    }
+    pending_kind_atomic(slot).store(
+        PendingAsyncKind::PipeRead as u8, Ordering::Release,
+    );
+    // Wire: d0 = handle (low32) | max_len (high32), d1 = correlation.
+    let d0 = (handle & 0xFFFF_FFFF) | ((n as u64) << 32);
+    let rc = syscall::send_nb_4(pipe_port, PIPE_READ_ASYNC, d0, correlation, 0, 0);
+    if rc != 0 {
+        async_free_slot(slot);
+        return None;
+    }
+    Some(slot)
+}
+
+/// Continuation for PIPE_WRITE_REPLY.  `bytes_written` is the count
+/// returned by pipe_srv (0 = error / broken pipe).
+fn finish_pipe_write(slot: usize, bytes_written: u64) {
+    let caller = unsafe { PENDING_ASYNC[slot].caller_task_port };
+    let _result = if bytes_written == 0 {
+        // 0 indicates pipe_srv rejected the write (reader closed,
+        // bad handle, etc.).  Translate to EPIPE for now.
+        linux_err(EPIPE)
+    } else {
+        bytes_written
+    };
+    let _ = syscall::personality_reply(caller, _result);
+    async_free_slot(slot);
+}
+
+/// Continuation for PIPE_READ_REPLY.  `n` is the bytes returned by
+/// pipe_srv; 0 means EOF.  Copy the inline bytes into the caller's
+/// buffer via personality_copy_out, then reply with the byte count.
+fn finish_pipe_read(slot: usize, w0: u64, w1: u64, n: u64) {
+    let caller = unsafe { PENDING_ASYNC[slot].caller_task_port };
+    let buf_va = unsafe { PENDING_ASYNC[slot].buf_va };
+    let buf_len = unsafe { PENDING_ASYNC[slot].buf_len };
+    let result = if n == 0 {
+        // EOF — read(2) returns 0.
+        0
+    } else {
+        let n = (n as usize).min(buf_len).min(16);
+        let mut tmp = [0u8; 16];
+        let b0 = w0.to_le_bytes();
+        let b1 = w1.to_le_bytes();
+        tmp[..8].copy_from_slice(&b0);
+        tmp[8..16].copy_from_slice(&b1);
+        let written = syscall::personality_copy_out(caller, buf_va, &tmp[..n]);
+        if written == 0 { linux_err(EFAULT) } else { written as u64 }
+    };
+    let _ = syscall::personality_reply(caller, result);
+    async_free_slot(slot);
 }
 
 /// Try to open a file via initramfs_srv (the in-memory cpio archive).
@@ -6597,7 +6783,22 @@ fn handle_tgkill(caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Read from a pipe FD into the caller's buffer via personality_copy_out.
-fn read_pipe(caller_port: u64, pipe_port: u64, handle: u64, buf_va: usize, count: usize) -> u64 {
+///
+/// Async fast path: if pipe_srv has been registered for PIPE_READ_ASYNC,
+/// fire async + defer the caller's reply.  The continuation in
+/// `finish_pipe_read` finishes the syscall when PIPE_READ_REPLY lands
+/// on BACKEND_REPLY_PORT, even if the pipe is currently empty — this
+/// is the cross-CLIENT deadlock fix (linux_srv no longer blocks on
+/// pipe_srv).  Falls back to sync syscall::call if not yet registered.
+fn read_pipe(pi: usize, caller_port: u64, pipe_port: u64, handle: u64, fd: usize, buf_va: usize, count: usize) -> u64 {
+    if count > 0 {
+        if let Some(_slot) = try_pipe_read_async(
+            pi, caller_port, fd, pipe_port, handle, buf_va, count,
+        ) {
+            unsafe { REPLY_DEFERRED = true; }
+            return 0;
+        }
+    }
     let msg = match syscall::call(pipe_port, PIPE_READ_TAG, handle, 0, 0, 0) {
         Some(m) => m,
         None => {
@@ -6630,24 +6831,52 @@ fn read_pipe(caller_port: u64, pipe_port: u64, handle: u64, buf_va: usize, count
 }
 
 /// Write from the caller's buffer to a pipe FD via personality_copy_in.
-fn write_pipe(caller_port: u64, pipe_port: u64, handle: u64, buf_va: usize, count: usize) -> u64 {
-    let mut offset = 0usize;
-    while offset < count {
-        let chunk_len = (count - offset).min(16);
+///
+/// Async fast path: issue the FIRST 16-byte chunk via PIPE_WRITE_ASYNC
+/// and defer the caller's reply.  Linux semantics permit a partial
+/// write for pipes (especially under signal interrupt), so returning
+/// just the first chunk's byte count is valid even when the caller
+/// requested more.  Falls back to the sync chunk loop if pipe_srv
+/// async isn't yet registered.
+fn write_pipe(pi: usize, caller_port: u64, pipe_port: u64, handle: u64, fd: usize, buf_va: usize, count: usize) -> u64 {
+    if count > 0 {
+        let chunk_len = count.min(16);
         let mut tmp = [0u8; 16];
-        let copied = syscall::personality_copy_in(caller_port, buf_va + offset, &mut tmp[..chunk_len]);
+        let copied = syscall::personality_copy_in(caller_port, buf_va, &mut tmp[..chunk_len]);
         if copied == 0 {
             syscall::debug_puts(b"[linux_srv] write_pipe: copy_in failed\n");
-            return if offset > 0 { offset as u64 } else { linux_err(EFAULT) };
+            return linux_err(EFAULT);
         }
+        if let Some(_slot) = try_pipe_write_async(
+            pi, caller_port, fd, pipe_port, handle, &tmp[..copied],
+        ) {
+            unsafe { REPLY_DEFERRED = true; }
+            return 0;
+        }
+        // Async setup not ready — fall through to sync path with this
+        // first chunk in `tmp`.
         let mut w0 = 0u64;
         let mut w1 = 0u64;
         for i in 0..copied.min(8) { w0 |= (tmp[i] as u64) << (i * 8); }
         for i in 8..copied { w1 |= (tmp[i] as u64) << ((i - 8) * 8); }
         let _ = syscall::call(pipe_port, PIPE_WRITE_TAG, handle, w0, copied as u64, w1);
-        offset += copied;
+        let mut offset = copied;
+        while offset < count {
+            let chunk_len = (count - offset).min(16);
+            let copied = syscall::personality_copy_in(caller_port, buf_va + offset, &mut tmp[..chunk_len]);
+            if copied == 0 {
+                return offset as u64;
+            }
+            let mut w0 = 0u64;
+            let mut w1 = 0u64;
+            for i in 0..copied.min(8) { w0 |= (tmp[i] as u64) << (i * 8); }
+            for i in 8..copied { w1 |= (tmp[i] as u64) << ((i - 8) * 8); }
+            let _ = syscall::call(pipe_port, PIPE_WRITE_TAG, handle, w0, copied as u64, w1);
+            offset += copied;
+        }
+        return offset as u64;
     }
-    offset as u64
+    0
 }
 
 /// Handle Linux pipe2(pipefd, flags).
@@ -10933,6 +11162,42 @@ fn handle_async_reply(msg: &syscall::Message) -> bool {
             }
             true
         }
+        PIPE_WRITE_REPLY => {
+            // data[0] = correlation
+            // data[1] = bytes_written (0 = pipe_srv-side error / broken pipe)
+            let correlation = msg.data[0];
+            let bytes_written = msg.data[1];
+            let slot = match async_find_by_correlation(correlation) {
+                Some(s) => s,
+                None => return false,
+            };
+            let kind = unsafe { PENDING_ASYNC[slot].kind };
+            match kind {
+                PendingAsyncKind::PipeWrite => finish_pipe_write(slot, bytes_written),
+                _ => async_free_slot(slot),
+            }
+            true
+        }
+        PIPE_READ_REPLY => {
+            // data[0] = correlation
+            // data[1] = bytes 0-7
+            // data[2] = bytes 8-15
+            // data[3] = n (bytes; 0 = EOF or error)
+            let correlation = msg.data[0];
+            let w0 = msg.data[1];
+            let w1 = msg.data[2];
+            let n = msg.data[3];
+            let slot = match async_find_by_correlation(correlation) {
+                Some(s) => s,
+                None => return false,
+            };
+            let kind = unsafe { PENDING_ASYNC[slot].kind };
+            match kind {
+                PendingAsyncKind::PipeRead => finish_pipe_read(slot, w0, w1, n),
+                _ => async_free_slot(slot),
+            }
+            true
+        }
         // IRFS_IO_READ_REPLY is exclusively handled by the reply
         // thread (see reply_thread_entry).  Replies are routed there
         // because we register IRFS_REPLY_PORT with initramfs_srv —
@@ -13019,6 +13284,12 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // VFS_OPEN_REPLY / VFS_STAT_REPLY get routed to the main
         // dispatch thread.
         let _ = try_register_vfs_async_reply_port();
+        // Phase A1: pipe_srv — register BACKEND_REPLY_PORT so
+        // PIPE_WRITE_REPLY / PIPE_READ_REPLY route here.  This is the
+        // load-bearing piece eliminating the linux_srv-blocks-on-pipe
+        // deadlock vector between two Linux processes communicating
+        // via a pipe.
+        let _ = try_register_pipe_async();
         // ...and the 14 FS servers — each gets IRFS_REPLY_PORT
         // registered so FS_READ_REPLY routes to the reply thread.
         // Idempotent on success; servers not yet up are silently
