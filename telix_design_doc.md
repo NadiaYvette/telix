@@ -68,7 +68,7 @@ Architectures such as ARM64 (4 KiB to 2 MiB, a 512× gap) and x86-64 (4 KiB to 2
 
 Page clustering bridges this gap in two ways. First, by guaranteeing subpage superpages (e.g. 64 KiB contiguous PTEs on ARM64 with `PAGE_SIZE` ≥ 64 KiB), it shifts the failure mode from external fragmentation to outright memory exhaustion — these superpage sizes cannot fail when memory is available. Second, by reducing the assembly ratio for the 2 MiB superpage (32 pieces at 64 KiB, 8 at 256 KiB), it makes active contiguity management in the allocator substantially more effective. The superpages enabled by these guarantees are what deliver TLB efficiency; page clustering itself provides the proportionality constants and fragmentation-shifting that make them reliably obtainable. ARM64 is the greatest beneficiary, as it has hardware support for the intermediate 64 KiB contiguous PTE hint that x86-64 lacks.
 
-> **Novelty assessment:** Novel combination. Babaoğlu-Joy page clustering applied to guarantee Navarro-style subpage superpage sizes and improve superpage assembly. Not previously published in this specific form; the closest prior work is Linux multi-size THP (6.8), which attacks the same gap from the allocator side rather than by construction.
+> **Novelty assessment:** Novel combination. Babaoğlu-Joy-Dickins page clustering applied to guarantee Navarro-style subpage superpage sizes and improve superpage assembly. Not previously published in this specific form; the closest prior work is Linux multi-size THP (6.8), which attacks the same gap from the allocator side rather than by construction.
 
 ### 4.3. VM Architecture with Sublinear Reserved Memory Footprint
 

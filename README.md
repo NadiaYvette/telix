@@ -8,7 +8,7 @@ Telix (from Latin *tela*, web/fabric) is a capability-based microkernel inspired
 
 ### Page Clustering for Superpaging
 
-Telix's central research contribution is **page clustering** — using [Babaoğlu-Joy](https://doi.org/10.1145/800217.806663) large kernel allocation pages (a configurable multiple of the hardware MMU page) to enable [Navarro-Iyer-Druschel-Cox](https://www.usenix.org/legacy/events/osdi02/tech/full_papers/navarro/navarro.pdf) superpage promotion. This solves two problems:
+Telix's central research contribution is **page clustering** — using [Babaoğlu-Joy-Dickins](https://doi.org/10.1145/800217.806663) large kernel allocation pages (a configurable multiple of the hardware MMU page) to enable [Navarro-Iyer-Druschel-Cox](https://www.usenix.org/legacy/events/osdi02/tech/full_papers/navarro/navarro.pdf) superpage promotion. This solves two problems:
 
 1. **Eliminating external fragmentation for small superpages.** When the kernel allocation unit is larger than the MMU page, superpages up to the allocation unit size are guaranteed to succeed whenever memory is available at all — failures are due to exhaustion, not fragmentation. For example, MIPS with a 1 KiB minimum TLB mapping granularity and a 256 KiB kernel allocation unit guarantees that 4 KiB, 16 KiB, 64 KiB, and 256 KiB superpage allocations cannot fail due to fragmentation.
 
