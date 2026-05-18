@@ -4710,6 +4710,8 @@ pub fn kill_task_by_id(task_id: TaskId) -> bool {
             t.sleep_deadline_ns = 0;
             let target = t.last_cpu.load(Ordering::Relaxed);
             set_enq_tag(9); // 9=kill_sleep
+            // Layer 3/4 paravirt: avoid waking onto a starved/stolen CPU.
+            let target = choose_wake_target_steal_aware(target);
             percpu_enqueue(target, t.effective_priority, tid);
         } else {
             wake_thread(tid);
@@ -7832,6 +7834,10 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     record_trans(tid as u32, 8, t.state, ON_CPU_PENDING);
                     trace_sched(tid as u32, 8); // 8=rescue_enq
                     set_enq_tag(7); // 7=rescue
+                    // Layer 3/4 paravirt: rescuing onto `t.last_cpu` re-
+                    // pends on the same starved/stolen CPU that orphaned
+                    // the thread.  Reroute if so.
+                    let target = choose_wake_target_steal_aware(target);
                     percpu_enqueue(target, prio, tid as ThreadId);
                     if (tid as usize) < ORPHAN_AGE.len() {
                         ORPHAN_AGE[tid as usize].store(0, Ordering::Relaxed);
@@ -7951,6 +7957,9 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                     RESCUE_MAX.fetch_add(1, Ordering::Relaxed);
                 }
                 rescue_per_tid_inc(tid as u32);
+                // Layer 3/4 paravirt: avoid re-pending on the same
+                // starved/stolen CPU that orphaned the thread.
+                let target = choose_wake_target_steal_aware(target);
                 percpu_enqueue(target, prio, tid as ThreadId);
             }
         }
@@ -8152,6 +8161,11 @@ fn check_sleep_timers() {
                 STALE_TARGET_RETARGET_COUNT.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // Layer 3/4 paravirt: even after the (older) tick-stale retarget
+        // above, the chosen target may be heavily host-stolen or IPI-
+        // starved.  Apply choose_wake_target_steal_aware to bring the
+        // Stage-1 adaptive IPI-staleness + steal-time checks here.
+        target = choose_wake_target_steal_aware(target);
         // Wait for the thread's parking stack switch to complete.
         while thread_ref(tid).stack_switch_pending.load(Ordering::Acquire) {
             core::hint::spin_loop();
