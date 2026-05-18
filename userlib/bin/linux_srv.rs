@@ -4253,6 +4253,10 @@ fn try_register_irfs_async_reply_port() -> bool {
 /// loop once vfs_srv is reachable.
 static mut VFS_ASYNC_REGISTERED: bool = false;
 static mut PIPE_ASYNC_REGISTERED: bool = false;
+/// True between sending PIPE_SET_REPLY_PORT and receiving the
+/// PIPE_SET_REPLY_PORT_OK ACK.  Prevents the main-loop retry from
+/// spamming pipe_srv every iteration with duplicate registrations.
+static mut PIPE_ASYNC_REG_PENDING: bool = false;
 
 /// Lazily register BACKEND_REPLY_PORT with vfs_srv so future
 /// VFS_OPEN_ASYNC / VFS_STAT_ASYNC reads can be delivered as
@@ -4292,10 +4296,19 @@ fn try_register_vfs_async_reply_port() -> bool {
 /// (project_linux_srv_worker_pool.md): pipe writes/reads were the first
 /// remaining cross-CLIENT deadlock vector after the IRFS/VFS/FS_READ
 /// conversions.
+///
+/// Uses `send_nb_4` rather than `syscall::call` so the 30 s CALL_REPLY_-
+/// TIMEOUT cannot wedge registration under host stress.  The ACK
+/// (PIPE_SET_REPLY_PORT_OK) lands on BACKEND_REPLY_PORT and is consumed
+/// by `handle_async_reply`, which sets `PIPE_ASYNC_REGISTERED`.
 fn try_register_pipe_async() -> bool {
     unsafe {
         if PIPE_ASYNC_REGISTERED {
             return true;
+        }
+        if PIPE_ASYNC_REG_PENDING {
+            // Already sent — waiting for ACK on BACKEND_REPLY_PORT.
+            return false;
         }
         if PIPE_PORT == 0 {
             PIPE_PORT = syscall::ns_lookup(b"pipe").unwrap_or(0);
@@ -4308,17 +4321,13 @@ fn try_register_pipe_async() -> bool {
         if cp == 0 {
             return false;
         }
-        let resp = match syscall::call(pp, PIPE_SET_REPLY_PORT, cp, 0, 0, 0) {
-            Some(m) => m,
-            None => return false,
-        };
-        if resp.tag == PIPE_SET_REPLY_PORT_OK {
-            PIPE_ASYNC_REGISTERED = true;
-            syscall::debug_puts(b"[linux_srv] pipe async reply port registered\n");
-            true
-        } else {
-            false
+        let rc = syscall::send_nb_4(pp, PIPE_SET_REPLY_PORT, cp, 0, 0, 0);
+        if rc == 0 {
+            PIPE_ASYNC_REG_PENDING = true;
         }
+        // Registration completion is handled async — return false here
+        // until the ACK lands.
+        false
     }
 }
 
@@ -11160,6 +11169,15 @@ fn handle_async_reply(msg: &syscall::Message) -> bool {
                 }
                 _ => async_free_slot(slot),
             }
+            true
+        }
+        PIPE_SET_REPLY_PORT_OK => {
+            // Registration ACK from pipe_srv.  See try_register_pipe_async.
+            unsafe {
+                PIPE_ASYNC_REGISTERED = true;
+                PIPE_ASYNC_REG_PENDING = false;
+            }
+            syscall::debug_puts(b"[linux_srv] pipe async reply port registered\n");
             true
         }
         PIPE_WRITE_REPLY => {

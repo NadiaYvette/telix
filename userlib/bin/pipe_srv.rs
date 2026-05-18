@@ -435,8 +435,19 @@ fn main(arg0: u64, _arg1: u64, _arg2: u64) {
             }
 
             PIPE_SET_REPLY_PORT => {
-                ASYNC_REPLY_PORT.store(msg.data[0], core::sync::atomic::Ordering::Release);
-                let _ = syscall::reply(PIPE_SET_REPLY_PORT_OK, 0, 0, 0, 0, 0);
+                // The client (linux_srv) sends this via send_nb_4 — no
+                // reply cap is installed.  ACK by sending
+                // PIPE_SET_REPLY_PORT_OK to the very port being
+                // registered (it's also the client's BACKEND_REPLY_PORT,
+                // which is parked in its main port_set wait).  This
+                // avoids the 30 s CALL_REPLY_TIMEOUT trap a sync
+                // syscall::call would hit when the host has the client's
+                // vCPU paused at registration time.
+                let reply_port = msg.data[0];
+                ASYNC_REPLY_PORT.store(reply_port, core::sync::atomic::Ordering::Release);
+                let _ = syscall::send_nb_4(
+                    reply_port, PIPE_SET_REPLY_PORT_OK, 0, 0, 0, 0,
+                );
             }
 
             PIPE_WRITE_ASYNC => {
