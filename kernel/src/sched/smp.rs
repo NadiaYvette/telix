@@ -253,6 +253,17 @@ pub struct PerCpuData {
     /// that steal-time can't see.  Stamped at IPI handler entry beside
     /// `ipi_recv_count`.
     pub last_ipi_recv_ns: core::sync::atomic::AtomicU64,
+    /// Layer 4 Stage-1 autotune: EWMA mean of IPI inter-arrival
+    /// times in ns.  Updated at IPI handler entry.  Used together
+    /// with `ipi_interarrival_mad_ns` to compute an adaptive
+    /// staleness threshold (μ + k·MAD) per CPU, replacing the
+    /// hand-coded `IPI_STALE_NS` constant.  α = 1/16 (fixed).
+    pub ipi_interarrival_mean_ns: core::sync::atomic::AtomicU64,
+    /// EWMA of mean absolute deviation (MAD) of IPI inter-arrival
+    /// times.  MAD is used instead of stddev to avoid sqrt and to
+    /// be more robust to outliers (single huge gaps don't poison
+    /// the dispersion estimate as quickly).
+    pub ipi_interarrival_mad_ns: core::sync::atomic::AtomicU64,
     /// #135 IPI send breakdown by target.  send_reschedule_ipi bumps
     /// `smp::current().ipi_send_to[target]`.  Sum across all CPUs'
     /// arrays gives the global send-to-target totals; the per-CPU
@@ -361,6 +372,8 @@ impl PerCpuData {
             rescue_stuck_pending_count: core::sync::atomic::AtomicU64::new(0),
             ipi_recv_count: core::sync::atomic::AtomicU64::new(0),
             last_ipi_recv_ns: core::sync::atomic::AtomicU64::new(0),
+            ipi_interarrival_mean_ns: core::sync::atomic::AtomicU64::new(0),
+            ipi_interarrival_mad_ns: core::sync::atomic::AtomicU64::new(0),
             ipi_send_to: [const { core::sync::atomic::AtomicU64::new(0) }; 8],
             dispatch_latency_hist: [const { core::sync::atomic::AtomicU64::new(0) }; 26],
             cli_enter_tsc: core::sync::atomic::AtomicU64::new(0),

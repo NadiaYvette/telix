@@ -4087,10 +4087,20 @@ fn choose_wake_target_steal_aware(default_cpu: u32) -> u32 {
     // dispatching but persistently not receive IPIs sent to it (residual
     // #135 / virt-IPI-delivery pathology).  Steal-time can't see this —
     // the CPU isn't being stolen, it just isn't getting woken up.  If
-    // the default target hasn't received an IPI in this long while at
-    // least one peer has fresher IPI activity, route there instead.
-    const IPI_STALE_NS: u64 = 1_000_000_000; // 1s of no IPIs on candidate
-    const IPI_FRESH_NS: u64 = 200_000_000;   // peer must have one within 200ms
+    // the default target's IPI-receipt latency exceeds its own adaptive
+    // EWMA threshold (Stage-1 autotune: μ + K·MAD, bounded by absolute
+    // floor/ceiling), AND a peer has fresh IPI activity, reroute there.
+    //
+    // Stage 1 replaces the hand-coded IPI_STALE_NS with a per-CPU
+    // adaptive threshold derived from the EWMA mean/MAD of inter-
+    // arrival times, updated at every IPI handler entry (see
+    // arch::x86_64::exception).  The hand-coded floor/ceiling guard
+    // against (a) under-sampled CPUs whose EWMA is meaningless and
+    // (b) absurd outliers regardless of estimated variance.
+    const IPI_STALE_FLOOR_NS: u64 = 200_000_000;  // never trigger below this
+    const IPI_STALE_CEIL_NS: u64 = 5_000_000_000; // always trigger by this
+    const IPI_THRESHOLD_K: u64 = 4;               // μ + K·MAD multiplier
+    const IPI_FRESH_NS: u64 = 200_000_000;        // peer must have one within 200ms
     let ncpus = smp::num_cpus() as u32;
     if ncpus <= 1 {
         return default_cpu;
@@ -4109,9 +4119,25 @@ fn choose_wake_target_steal_aware(default_cpu: u32) -> u32 {
         let last = pc.last_ipi_recv_ns.load(Ordering::Relaxed);
         if last == 0 { 0 } else { now_ns.saturating_sub(last) }
     };
+    // Stage-1 adaptive threshold for IPI staleness on a candidate CPU.
+    // Returns the staleness duration above which we consider that CPU
+    // "IPI-starved" — used to gate the reroute decision below.
+    let ipi_stale_threshold = |cpu: u32| -> u64 {
+        let pc = smp::get(cpu);
+        let mean = pc.ipi_interarrival_mean_ns.load(Ordering::Relaxed);
+        let mad = pc.ipi_interarrival_mad_ns.load(Ordering::Relaxed);
+        // Pre-EWMA bootstrap: if no data yet, be conservative (only fire
+        // at the absolute ceiling).
+        if mean == 0 {
+            return IPI_STALE_CEIL_NS;
+        }
+        let adaptive = mean.saturating_add(mad.saturating_mul(IPI_THRESHOLD_K));
+        adaptive.max(IPI_STALE_FLOOR_NS).min(IPI_STALE_CEIL_NS)
+    };
 
     let default_steal = recent_steal(default_cpu);
     let default_ipi_stale = ipi_staleness(default_cpu);
+    let default_threshold = ipi_stale_threshold(default_cpu);
 
     // Tier 1: heavy host steal on default → look for less-stolen peer.
     if default_steal >= HEAVY_STEAL_NS {
@@ -4132,10 +4158,10 @@ fn choose_wake_target_steal_aware(default_cpu: u32) -> u32 {
     }
 
     // Tier 2: IPI-delivery shortage on default → look for an IPI-fresh peer.
-    // Only fires when default is genuinely starved (≥1s without an IPI) AND
-    // at least one peer has IPIs landing recently (≤200ms) — so we don't
-    // misroute at boot when no IPIs have fired anywhere yet.
-    if default_ipi_stale >= IPI_STALE_NS {
+    // Threshold is per-CPU adaptive (μ + K·MAD bounded by floor/ceiling).
+    // Only fires when at least one peer has fresh IPI activity (≤200ms),
+    // so we don't misroute at boot when no IPIs have fired anywhere yet.
+    if default_ipi_stale >= default_threshold {
         for c in 0..ncpus {
             if c == default_cpu { continue; }
             if ipi_staleness(c) <= IPI_FRESH_NS {
