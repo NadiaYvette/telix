@@ -1190,6 +1190,19 @@ fn percpu_enqueue(target_cpu: u32, prio: u8, tid: ThreadId) {
     // #135 action=17: enqueue succeeded.  Record the target CPU so we can
     // see whether the thread landed where sleep_wake intended.
     record_trans(tid as u32, 17, thread_ref(tid).state, target_cpu);
+    drop(rq);
+    // Boot 544 dispatch starvation fix: every enqueue to a *different* CPU
+    // sends a reschedule IPI to the target.  Without this, callers like
+    // wake_thread (after choose_wake_target_steal_aware) and spawn fan-out
+    // place a Ready thread on a remote heap that may be HLT-idle; nothing
+    // wakes that CPU until its next periodic tick, which under dynamic-
+    // tick can be MAX_IDLE_NS away.  Boot 544 caught cpu=0 idle for 23 min
+    // with 11 entries in its heap.  IPI cost is one vmexit when the target
+    // is running and one resched-vector when idle — both negligible vs
+    // the cost of dispatch starvation we saw.
+    if target_cpu != smp::cpu_id() {
+        crate::arch::irq::send_reschedule_ipi(target_cpu);
+    }
 }
 
 /// Compute EEVDF deadline and insert a thread into the per-CPU heap.
@@ -7448,10 +7461,17 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
             const PICKING_CPU_STALE_MS: u64 = 500;
             const HOST_STEAL_CONFIRM_MS: u64 = 200;
             let pending_age_ns = now_ns.saturating_sub(pset);
-            if pset != 0
-                && !t.in_queue.load(Ordering::Relaxed)
-                && pending_age_ns >= FAST_RESCUE_PENDING_NS
-            {
+            // Boot 544 widening: original gate required `!in_queue` since the
+            // intended pattern was "thread was picked (in_queue=false) but
+            // try_switch never completed (on_cpu=PENDING)".  The dispatch-
+            // starvation pattern surfaced in boot 544 is *different*:
+            // in_queue=true ∧ on_cpu=PENDING ∧ thread sits in an idle CPU's
+            // heap with no IPI to wake the heap-CPU.  Fix A (percpu_enqueue
+            // IPI to remote target) should prevent it on the wake path; this
+            // widening is the second-net for any path that enqueues without
+            // an IPI (rescue, fork, deferred-requeue drain).
+            let in_q = t.in_queue.load(Ordering::Relaxed);
+            if pset != 0 && pending_age_ns >= FAST_RESCUE_PENDING_NS {
                 let last_cpu_idx = t.last_cpu.load(Ordering::Relaxed);
                 let ncpus = crate::sched::smp::num_cpus() as u32;
                 let trigger = if last_cpu_idx < ncpus {
@@ -7510,20 +7530,41 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                         Ordering::AcqRel, Ordering::Acquire,
                     ).is_ok() {
                         FAST_RESCUE_TAKEOVERS.fetch_add(1, Ordering::Relaxed);
-                        // Migrate last_cpu to the rescuer.  The orphan
-                        // re-enqueue path below uses last_cpu as the
-                        // enqueue target.
-                        t.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
                         // Clear pending_set_ns so the next pending episode
                         // (post-orphan-rescue dispatch) gets a fresh stamp.
                         t.pending_set_ns.store(0, Ordering::Relaxed);
                         if (tid as usize) < PENDING_LOW_LOGGED.len() {
                             PENDING_LOW_LOGGED[tid as usize].store(false, Ordering::Relaxed);
                         }
+                        if in_q {
+                            // in_queue=true variant (boot 544): the thread
+                            // is already sitting in some CPU's heap.  We
+                            // don't know which CPU without locking each
+                            // run-queue, so broadcast a reschedule IPI —
+                            // the heap-owning CPU runs try_switch and
+                            // picks it up.  Cheap (~ncpus-1 vmexits) vs
+                            // 23-min dispatch starvation.  Do NOT migrate
+                            // last_cpu and do NOT enter the orphan re-
+                            // enqueue path (would DOUBLE_ENQ-skip and
+                            // produce no net progress).
+                            let ncpus = crate::sched::smp::num_cpus() as u32;
+                            let me = smp::cpu_id();
+                            for c in 0..ncpus {
+                                if c != me {
+                                    crate::arch::irq::send_reschedule_ipi(c);
+                                }
+                            }
+                        } else {
+                            // Original (in_queue=false) variant: migrate
+                            // last_cpu to the rescuer.  The orphan re-
+                            // enqueue path below uses last_cpu as the
+                            // enqueue target.
+                            t.last_cpu.store(smp::cpu_id(), Ordering::Relaxed);
+                        }
                         // Skip the STUCK_PENDING_AGE block this sweep.  Next
                         // sweep will see on_cpu==MAX and run the existing
-                        // orphan handler, which re-enqueues on last_cpu
-                        // (now this CPU).
+                        // orphan handler (in_queue=false variant only), which
+                        // re-enqueues on last_cpu (now this CPU).
                         continue;
                     }
                 }
