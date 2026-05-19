@@ -42,6 +42,19 @@ const UDS_ACCEPT: u64 = 0x8040;
 const UDS_ACCEPT_ASYNC: u64 = 0x8041;
 const UDS_ACCEPT_REPLY: u64 = 0x8042;
 const UDS_SEND: u64 = 0x8050;
+/// Async send (Phase A2): equivalent to UDS_SEND but the reply
+/// (UDS_SEND_REPLY) lands on a pre-registered reply port via
+/// send_nb_4 instead of blocking the caller's main thread in
+/// syscall::call.  Reply port is registered via UDS_SET_SEND_REPLY_PORT.
+/// Wire format:
+///   d0 = handle (low 32) | len (high 32)
+///   d1 = bytes 0-7
+///   d2 = correlation
+///   d3 = bytes 8-15
+const UDS_SEND_ASYNC: u64 = 0x8052;
+const UDS_SEND_REPLY: u64 = 0x8053;
+const UDS_SET_SEND_REPLY_PORT: u64 = 0x8054;
+const UDS_SET_SEND_REPLY_PORT_OK: u64 = 0x8055;
 const UDS_RECV: u64 = 0x8060;
 // Async recv: equivalent to UDS_RECV but when no data is buffered the
 // request is registered on the socket and completed later when the peer
@@ -64,6 +77,12 @@ const POLL_NOTIFY: u64 = 0xF030;
 const UDS_OK: u64 = 0x8100;
 const UDS_EOF: u64 = 0x81FF;
 const UDS_ERROR: u64 = 0x8F00;
+
+/// Phase A2: reply port for UDS_SEND_REPLY notifications.  Set by
+/// linux_srv via UDS_SET_SEND_REPLY_PORT (one-shot, send_nb-based to
+/// avoid the 30 s CALL_REPLY_TIMEOUT trap under host stress).
+static ASYNC_SEND_REPLY_PORT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 // Limits.
 const MAX_SOCKETS: usize = 32;
@@ -632,6 +651,86 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                 // Wake blocked recv on peer if any.
                 try_wake_recv(peer_idx);
                 // Notify poll subscriber on peer (new data = POLLIN).
+                notify_poll(peer_idx);
+            }
+
+            UDS_SET_SEND_REPLY_PORT => {
+                // linux_srv sends this via send_nb_4 — no reply cap
+                // installed.  ACK by sending UDS_SET_SEND_REPLY_PORT_OK
+                // back to the very port being registered.  Mirrors the
+                // pipe_srv handshake; avoids the 30 s
+                // CALL_REPLY_TIMEOUT under host stress.
+                let reply_port = msg.data[0];
+                ASYNC_SEND_REPLY_PORT.store(
+                    reply_port, core::sync::atomic::Ordering::Release,
+                );
+                let _ = syscall::send_nb_4(
+                    reply_port, UDS_SET_SEND_REPLY_PORT_OK, 0, 0, 0, 0,
+                );
+            }
+
+            UDS_SEND_ASYNC => {
+                // Wire format:
+                //   d0 = handle (low 32) | len (high 32)
+                //   d1 = bytes 0-7
+                //   d2 = correlation
+                //   d3 = bytes 8-15
+                let handle = (msg.data[0] & 0xFFFF_FFFF) as u32;
+                let len = ((msg.data[0] >> 32) & 0xFFFF_FFFF) as usize;
+                let len = if len > 16 { 16 } else { len };
+                let correlation = msg.data[2];
+                let reply_port = ASYNC_SEND_REPLY_PORT.load(
+                    core::sync::atomic::Ordering::Acquire,
+                );
+                if reply_port == 0 {
+                    // No reply port registered — drop silently.  Caller
+                    // (linux_srv) gates async dispatch on registration,
+                    // so this shouldn't happen in practice.
+                    continue;
+                }
+                let send_err = |c: u64| {
+                    let _ = syscall::send_nb_4(reply_port, UDS_SEND_REPLY, c, 0, 0, 0);
+                };
+                if handle as usize >= MAX_SOCKETS {
+                    send_err(correlation);
+                    continue;
+                }
+                let s = unsafe { &SOCKS[handle as usize] };
+                if s.state != SockState::Connected {
+                    send_err(correlation);
+                    continue;
+                }
+                let peer_idx = s.peer;
+                if peer_idx == u32::MAX || peer_idx as usize >= MAX_SOCKETS {
+                    send_err(correlation);
+                    continue;
+                }
+
+                // Unpack data bytes.
+                let mut tmp = [0u8; 16];
+                let b0 = msg.data[1].to_le_bytes();
+                let b1 = msg.data[3].to_le_bytes();
+                let mut i = 0;
+                while i < len && i < 8 {
+                    tmp[i] = b0[i];
+                    i += 1;
+                }
+                while i < len && i < 16 {
+                    tmp[i] = b1[i - 8];
+                    i += 1;
+                }
+
+                let peer = unsafe { &mut SOCKS[peer_idx as usize] };
+                if peer.state == SockState::Closed || peer.state == SockState::Free {
+                    send_err(correlation);
+                    continue;
+                }
+                let written = peer.rx_push(&tmp[..len]);
+                let _ = syscall::send_nb_4(
+                    reply_port, UDS_SEND_REPLY, correlation, written as u64, 0, 0,
+                );
+
+                try_wake_recv(peer_idx);
                 notify_poll(peer_idx);
             }
 

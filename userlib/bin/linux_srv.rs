@@ -513,6 +513,10 @@ const UDS_ACCEPT_REPLY: u64 = 0x8042;
 const UDS_RECV_ASYNC: u64 = 0x8061;
 const UDS_RECV_REPLY: u64 = 0x8062;
 const UDS_SEND: u64 = 0x8050;
+const UDS_SEND_ASYNC: u64 = 0x8052;
+const UDS_SEND_REPLY: u64 = 0x8053;
+const UDS_SET_SEND_REPLY_PORT: u64 = 0x8054;
+const UDS_SET_SEND_REPLY_PORT_OK: u64 = 0x8055;
 const UDS_RECV: u64 = 0x8060;
 const UDS_CLOSE: u64 = 0x8070;
 const UDS_GETPEERCRED: u64 = 0x8080;
@@ -930,6 +934,18 @@ enum PendingAsyncKind {
     ///   buf_va           → caller's destination VA
     ///   buf_len          → caller's requested read length (capped to 16)
     PipeRead,
+    /// Async AF_UNIX send (Phase A2).  Up to 16 bytes per chunk;
+    /// on reply, `personality_reply` to the caller with bytes_written.
+    /// Linux permits partial sendmsg returns for stream sockets under
+    /// signal or flow-control conditions, so returning bytes from a
+    /// single 16-byte chunk is valid even when the user requested more.
+    /// Field reuse:
+    ///   pi               → caller process index
+    ///   caller_task_port → port for personality_reply
+    ///   listen_fd        → fd index in PROC_TABLE[pi].fds
+    ///   flags            → UDS handle (low 32 bits)
+    ///   buf_va, buf_len  → unused
+    UdsSend,
 }
 
 /// `#[repr(C)]` pins `kind` at offset 0 so we can take an
@@ -1595,8 +1611,8 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
         }
         if PROC_TABLE[pi].fds[fd_idx].kind == FdKind::Socket {
             let dom = PROC_TABLE[pi].fds[fd_idx].sock_domain;
-            return write_socket(caller_port, PROC_TABLE[pi].fds[fd_idx].fs_port,
-                                PROC_TABLE[pi].fds[fd_idx].handle, dom, buf_va, count);
+            return write_socket(pi, caller_port, PROC_TABLE[pi].fds[fd_idx].fs_port,
+                                PROC_TABLE[pi].fds[fd_idx].handle, dom, fd_idx, buf_va, count);
         }
         if PROC_TABLE[pi].fds[fd_idx].kind == FdKind::EventFd {
             if count < 8 { return linux_err(EINVAL); }
@@ -4257,6 +4273,12 @@ static mut PIPE_ASYNC_REGISTERED: bool = false;
 /// PIPE_SET_REPLY_PORT_OK ACK.  Prevents the main-loop retry from
 /// spamming pipe_srv every iteration with duplicate registrations.
 static mut PIPE_ASYNC_REG_PENDING: bool = false;
+/// Phase A2: UDS_SEND_ASYNC registration state.  Same shape as the
+/// pipe-async flags — flipped to REGISTERED when
+/// UDS_SET_SEND_REPLY_PORT_OK lands on BACKEND_REPLY_PORT.
+static mut UDS_ASYNC_SEND_REGISTERED: bool = false;
+static mut UDS_ASYNC_SEND_REG_PENDING: bool = false;
+static mut UDS_SEND_REG_DIAG_FLAGS: u8 = 0;
 /// One-shot bitmap recording which failure mode try_register_pipe_async
 /// has already logged.  Phase A1 boots 537 + 538 showed the registration
 /// print never fires; isolating *why* requires per-failure-mode logging
@@ -4479,6 +4501,109 @@ fn finish_pipe_read(slot: usize, w0: u64, w1: u64, n: u64) {
         tmp[8..16].copy_from_slice(&b1);
         let written = syscall::personality_copy_out(caller, buf_va, &tmp[..n]);
         if written == 0 { linux_err(EFAULT) } else { written as u64 }
+    };
+    let _ = syscall::personality_reply(caller, result);
+    async_free_slot(slot);
+}
+
+/// Phase A2: register BACKEND_REPLY_PORT with uds_srv for
+/// UDS_SEND_REPLY notifications.  Same send_nb-based handshake as
+/// `try_register_pipe_async` so the 30 s CALL_REPLY_TIMEOUT can't
+/// wedge it under host stress.
+fn try_register_uds_send_async() -> bool {
+    unsafe {
+        if UDS_ASYNC_SEND_REGISTERED {
+            return true;
+        }
+        if UDS_ASYNC_SEND_REG_PENDING {
+            return false;
+        }
+        if UDS_PORT == 0 {
+            UDS_PORT = syscall::ns_lookup(b"uds").unwrap_or(0);
+        }
+        let up = UDS_PORT;
+        if up == 0 {
+            if UDS_SEND_REG_DIAG_FLAGS & 0x01 == 0 {
+                UDS_SEND_REG_DIAG_FLAGS |= 0x01;
+                syscall::debug_puts(b"[linux_srv] uds-send reg: ns_lookup(uds) == 0\n");
+            }
+            return false;
+        }
+        let cp = BACKEND_REPLY_PORT;
+        if cp == 0 {
+            if UDS_SEND_REG_DIAG_FLAGS & 0x02 == 0 {
+                UDS_SEND_REG_DIAG_FLAGS |= 0x02;
+                syscall::debug_puts(b"[linux_srv] uds-send reg: BACKEND_REPLY_PORT == 0\n");
+            }
+            return false;
+        }
+        let rc = syscall::send_nb_4(up, UDS_SET_SEND_REPLY_PORT, cp, 0, 0, 0);
+        if rc == 0 {
+            UDS_ASYNC_SEND_REG_PENDING = true;
+            syscall::debug_puts(b"[linux_srv] uds-send reg: UDS_SET_SEND_REPLY_PORT sent, awaiting ACK\n");
+        } else if UDS_SEND_REG_DIAG_FLAGS & 0x04 == 0 {
+            UDS_SEND_REG_DIAG_FLAGS |= 0x04;
+            syscall::debug_puts(b"[linux_srv] uds-send reg: send_nb_4 rc=");
+            let mut buf = [0u8; 20]; let mut val = rc; let mut k = 20;
+            if val == 0 { k -= 1; buf[k] = b'0'; }
+            while val > 0 && k > 0 { k -= 1; buf[k] = b'0' + (val % 10) as u8; val /= 10; }
+            syscall::debug_puts(&buf[k..20]);
+            syscall::debug_puts(b"\n");
+        }
+        false
+    }
+}
+
+/// Issue one chunk of UDS_SEND_ASYNC for an AF_UNIX send.  Returns
+/// Some(slot) on success (caller defers reply); None if registration
+/// not ready or allocation failed — caller falls back to sync UDS_SEND.
+fn try_uds_send_async(
+    pi: usize,
+    caller_port: u64,
+    fd: usize,
+    uds_port: u64,
+    handle: u64,
+    bytes: &[u8],
+) -> Option<usize> {
+    use core::sync::atomic::Ordering;
+    if !try_register_uds_send_async() { return None; }
+    let n = bytes.len().min(16);
+    if n == 0 { return None; }
+    let slot = async_alloc_slot()?;
+    let mut w0 = 0u64;
+    let mut w1 = 0u64;
+    for i in 0..n.min(8) { w0 |= (bytes[i] as u64) << (i * 8); }
+    for i in 8..n { w1 |= (bytes[i] as u64) << ((i - 8) * 8); }
+    let correlation = ASYNC_NEXT_ID_ATOMIC.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        PENDING_ASYNC[slot].correlation = correlation;
+        PENDING_ASYNC[slot].pi = pi;
+        PENDING_ASYNC[slot].caller_task_port = caller_port;
+        PENDING_ASYNC[slot].listen_fd = fd;
+        PENDING_ASYNC[slot].flags = handle;
+        PENDING_ASYNC[slot].buf_va = 0;
+        PENDING_ASYNC[slot].buf_len = n;
+    }
+    pending_kind_atomic(slot).store(
+        PendingAsyncKind::UdsSend as u8, Ordering::Release,
+    );
+    let d0 = (handle & 0xFFFF_FFFF) | ((n as u64) << 32);
+    let rc = syscall::send_nb_4(uds_port, UDS_SEND_ASYNC, d0, w0, correlation, w1);
+    if rc != 0 {
+        async_free_slot(slot);
+        return None;
+    }
+    Some(slot)
+}
+
+/// Continuation for UDS_SEND_REPLY.  `bytes_written` is 0 on error
+/// (broken connection, bad handle, etc.) — translate to EPIPE.
+fn finish_uds_send(slot: usize, bytes_written: u64) {
+    let caller = unsafe { PENDING_ASYNC[slot].caller_task_port };
+    let result = if bytes_written == 0 {
+        linux_err(EPIPE)
+    } else {
+        bytes_written
     };
     let _ = syscall::personality_reply(caller, result);
     async_free_slot(slot);
@@ -10444,9 +10569,39 @@ fn read_socket(caller_port: u64, srv_port: u64, handle: u64, domain: u8, buf_va:
 }
 
 /// Write to a socket FD (UDS or TCP).
-fn write_socket(caller_port: u64, srv_port: u64, handle: u64, domain: u8, buf_va: usize, count: usize) -> u64 {
+fn write_socket(pi: usize, caller_port: u64, srv_port: u64, handle: u64, domain: u8, fd: usize, buf_va: usize, count: usize) -> u64 {
     let mut total = 0usize;
     if domain == AF_UNIX as u8 {
+        // Phase A2: try async first.  Single-chunk per call — Linux
+        // permits partial sendmsg for stream sockets under signal /
+        // flow control, so returning N≤16 bytes is valid even when
+        // count > 16.  Sync chunk loop runs only if async registration
+        // hasn't completed yet.
+        if count > 0 {
+            let chunk = count.min(16);
+            let mut tmp = [0u8; 16];
+            let copied = syscall::personality_copy_in(caller_port, buf_va, &mut tmp[..chunk]);
+            if copied == 0 {
+                return linux_err(EFAULT);
+            }
+            if let Some(_slot) = try_uds_send_async(
+                pi, caller_port, fd, srv_port, handle, &tmp[..copied],
+            ) {
+                unsafe { REPLY_DEFERRED = true; }
+                return 0;
+            }
+            // Async not ready — fall through to sync with this chunk in `tmp`.
+            let w0 = u64::from_le_bytes([tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6], tmp[7]]);
+            let w1 = u64::from_le_bytes([tmp[8], tmp[9], tmp[10], tmp[11], tmp[12], tmp[13], tmp[14], tmp[15]]);
+            let d2 = copied as u64;
+            let resp = match syscall::call(srv_port, UDS_SEND, handle, w0, d2, w1) {
+                Some(m) => m,
+                None => { return 0; }
+            };
+            if resp.tag != UDS_OK { return 0; }
+            let sent = (resp.data[0] & 0xFFFF) as usize;
+            total += sent;
+        }
         while total < count {
             let chunk = (count - total).min(16);
             let mut tmp = [0u8; 16];
@@ -11208,6 +11363,31 @@ fn handle_async_reply(msg: &syscall::Message) -> bool {
             syscall::debug_puts(b"[linux_srv] pipe async reply port registered\n");
             true
         }
+        UDS_SET_SEND_REPLY_PORT_OK => {
+            // Registration ACK from uds_srv.  Phase A2.
+            unsafe {
+                UDS_ASYNC_SEND_REGISTERED = true;
+                UDS_ASYNC_SEND_REG_PENDING = false;
+            }
+            syscall::debug_puts(b"[linux_srv] uds-send async reply port registered\n");
+            true
+        }
+        UDS_SEND_REPLY => {
+            // data[0] = correlation
+            // data[1] = bytes_written (0 = error)
+            let correlation = msg.data[0];
+            let bytes_written = msg.data[1];
+            let slot = match async_find_by_correlation(correlation) {
+                Some(s) => s,
+                None => return false,
+            };
+            let kind = unsafe { PENDING_ASYNC[slot].kind };
+            match kind {
+                PendingAsyncKind::UdsSend => finish_uds_send(slot, bytes_written),
+                _ => async_free_slot(slot),
+            }
+            true
+        }
         PIPE_WRITE_REPLY => {
             // data[0] = correlation
             // data[1] = bytes_written (0 = pipe_srv-side error / broken pipe)
@@ -11500,7 +11680,7 @@ fn handle_sendto(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             return linux_err(ENOTSOCK);
         }
         let dom = PROC_TABLE[pi].fds[fd].sock_domain;
-        write_socket(caller_port, PROC_TABLE[pi].fds[fd].fs_port, PROC_TABLE[pi].fds[fd].handle, dom, buf_va, count)
+        write_socket(pi, caller_port, PROC_TABLE[pi].fds[fd].fs_port, PROC_TABLE[pi].fds[fd].handle, dom, fd, buf_va, count)
     }
 }
 
@@ -11693,8 +11873,8 @@ fn handle_sendmsg(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                            iov_buf[12], iov_buf[13], iov_buf[14], iov_buf[15]]) as usize;
             if base == 0 || len == 0 { return 0; }
             let dom = PROC_TABLE[pi].fds[fd].sock_domain;
-            return write_socket(caller_port, PROC_TABLE[pi].fds[fd].fs_port,
-                                PROC_TABLE[pi].fds[fd].handle, dom, base, len);
+            return write_socket(pi, caller_port, PROC_TABLE[pi].fds[fd].fs_port,
+                                PROC_TABLE[pi].fds[fd].handle, dom, fd, base, len);
         }
 
         // Multi-iovec: gather into temporary buffer (max 4096 bytes)
@@ -13171,15 +13351,15 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(port);
     syscall::debug_puts(b"\n");
 
-    // Phase A1 registration: fire the pipe-async handshake BEFORE the
-    // eager preload starts.  The preload uses sync calls to initramfs_srv
-    // and can take many minutes under heavy host stress, during which
-    // the main dispatch loop (where the other periodic registrations
-    // run) never executes.  Pipe registration is send_nb-based, so it
-    // doesn't block — and the ACK queues on BACKEND_REPLY_PORT for the
-    // main loop to drain.  This is the difference between "registration
-    // happens during stress" vs "registration deferred forever".
+    // Phase A1+A2 registration: fire the pipe + uds-send async handshakes
+    // BEFORE the eager preload starts.  The preload uses sync calls to
+    // initramfs_srv and can take many minutes under heavy host stress,
+    // during which the main dispatch loop (where the other periodic
+    // registrations run) never executes.  Both registrations are
+    // send_nb-based, so they don't block — and the ACKs queue on
+    // BACKEND_REPLY_PORT for the main loop to drain.
     let _ = try_register_pipe_async();
+    let _ = try_register_uds_send_async();
 
     // Preload common Xwayland/xeyes libs into the content cache.  Each
     // call to try_open_initramfs populates a cache slot via the existing
