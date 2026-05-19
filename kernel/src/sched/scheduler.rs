@@ -6826,6 +6826,22 @@ pub fn wake_parked_thread(tid: ThreadId) {
     let tref = thread_ref(tid);
     trace_point("wake_parked.entry", tid as u32);
 
+    // Boot 553 #196 sweep: defensive turnstile cleanup.  Most callers
+    // (port_dequeue_one in wake_recv_waiter, DirectTransfer in
+    // send_direct) dequeue from the turnstile BEFORE calling
+    // wake_parked_thread, so by the time we get here ts_blocked_on=0.
+    // BUT: rescue paths (scheduler.rs:4410 abandon, 7213 stuck-pending,
+    // 8089 server-died) call wake_parked_thread directly on a tid
+    // that may still be linked.  Without this cleanup, the woken
+    // thread runs, calls a new recv_or_park, and ts_enqueue's
+    // double-enqueue guard fires (boot 553 caught tid=19 still on
+    // TS at position 3 after never being dequeued).  cleanup_blocked
+    // is a no-op when ts_blocked_on=0 so the common-path cost is
+    // a single relaxed load.
+    if tref.ts_blocked_on.load(Ordering::Relaxed) != 0 {
+        crate::sync::turnstile::cleanup_blocked(tid);
+    }
+
     // Try early wake: CAS PARK_ENQUEUED → PARK_NONE.
     // If the thread hasn't committed to parking yet, just prevent the park.
     // park_current_for_ipc's CAS(ENQUEUED→COMMITTED) will fail and it will
