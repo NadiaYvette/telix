@@ -15,7 +15,7 @@ use crate::mm::page::PhysAddr;
 use crate::mm::slab;
 use crate::sched::thread::BlockReason;
 use crate::sync::SpinLock;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -991,13 +991,33 @@ pub fn port_dequeue_one(port_id: u64, key_type: u8) -> Option<u32> {
     let mut root = WAIT_HAMT[bucket].lock();
     let ts_ptr = match hamt_lookup(&root, hash, key_type, aspace_id, va) {
         Some(ts) => ts,
-        None => return None,
+        None => {
+            DEQ_HAMT_MISS.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     };
     let ts = unsafe { &mut *ts_ptr };
 
     let tid = match ts_dequeue_head(ts) {
         Some(t) => t,
-        None => return None,
+        None => {
+            // Smoking-gun for port-0x17bb / #192 wedge: HAMT had the TS but
+            // its waiter linked list is empty.  If waiter_count > 0 here,
+            // that's a structural inconsistency (count vs head/tail).
+            if ts.waiter_count > 0 {
+                let n = DEQ_TS_EMPTY_BUG.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    crate::println!(
+                        "DEQ-STUCK: port={:#x} key={} ts={:#x} head=NIL tail={} wc={} hash={:#x}",
+                        port_id, key_type, ts_ptr as usize,
+                        ts.tail, ts.waiter_count, ts.hash,
+                    );
+                }
+            } else {
+                DEQ_TS_EMPTY_OK.fetch_add(1, Ordering::Relaxed);
+            }
+            return None;
+        }
     };
     thread_ref(tid).ts_blocked_on.store(0, Ordering::Relaxed);
 
@@ -1015,6 +1035,20 @@ pub fn port_dequeue_one(port_id: u64, key_type: u8) -> Option<u32> {
 
     drop(root);
     Some(tid)
+}
+
+// Counters for #192 port-0x17bb wedge diagnosis.  Read via deq_counters().
+pub static DEQ_HAMT_MISS: AtomicU64 = AtomicU64::new(0);
+pub static DEQ_TS_EMPTY_OK: AtomicU64 = AtomicU64::new(0);
+pub static DEQ_TS_EMPTY_BUG: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot the dequeue-miss reason counters: (hamt_miss, ts_empty_ok, ts_empty_bug).
+pub fn deq_counters() -> (u64, u64, u64) {
+    (
+        DEQ_HAMT_MISS.load(Ordering::Relaxed),
+        DEQ_TS_EMPTY_OK.load(Ordering::Relaxed),
+        DEQ_TS_EMPTY_BUG.load(Ordering::Relaxed),
+    )
 }
 
 /// Wake all threads waiting on a port turnstile.
