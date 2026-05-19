@@ -4233,6 +4233,23 @@ pub fn wake_thread(tid: ThreadId) {
     {
         let state = thread_ref(tid).state;
         if state == ThreadState::Blocked {
+            // Boot 551 #192 fix: if the thread is parked on a turnstile
+            // (`ts_blocked_on != 0`), remove it from that list and clear
+            // `ts_blocked_on` BEFORE transitioning to Ready.  Without
+            // this, the woken thread runs and calls a syscall that
+            // tries to park on a different turnstile via `ts_enqueue`,
+            // which unconditionally `tref.ts_next.store(NIL)` —
+            // breaking the prior list's forward chain at that point
+            // (boot 545/548 wc>walked corruption shape).  The new
+            // `TS-DOUBLE-ENQ` guard in `ts_enqueue` would catch this
+            // and refuse, but the legitimate fix is to never leave a
+            // turnstile-parked thread Ready with `ts_blocked_on` set.
+            // `cleanup_blocked` does the right dance: swap-zero the
+            // field, take the right bucket lock, ts_remove, hamt_remove
+            // if empty, attach TS to thread or free.
+            if tref.ts_blocked_on.load(Ordering::Relaxed) != 0 {
+                crate::sync::turnstile::cleanup_blocked(tid);
+            }
             // Transition Blocked → Ready and enqueue at base prio.  Use
             // the *waker's* CPU as the enqueue target because (a) we hold
             // its run-queue contended only by other CPUs' rescue paths,
