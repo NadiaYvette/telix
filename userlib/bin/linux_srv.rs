@@ -962,6 +962,29 @@ enum PendingAsyncKind {
     ///   buf_va           → caller's wstatus VA (0 if NULL)
     ///   buf_len          → options (WNOHANG, etc.)
     Wait4,
+    /// Async eventfd blocking-read park (Phase A5).  When a Linux
+    /// process reads from a blocking-mode eventfd with counter == 0,
+    /// previously we returned EAGAIN unconditionally — wrong for
+    /// blocking semantics (should park until eventfd_write fires).
+    /// This slot defers the read; eventfd_write_wake_pending walks
+    /// these and replies with the counter on the next write.
+    /// Field reuse:
+    ///   pi               → caller process index
+    ///   caller_task_port → port for personality_reply
+    ///   flags            → EVENTFD_TABLE index
+    ///   buf_va           → caller's destination VA (8 bytes)
+    ///   buf_len          → 0 (no extra)
+    EventFdRead,
+    /// Async timerfd blocking-read park (Phase A5).  Parks on a
+    /// blocking-mode timerfd with expirations == 0.  The main-loop
+    /// timerfd-expiry check wakes parked readers.
+    /// Field reuse:
+    ///   pi               → caller process index
+    ///   caller_task_port → port for personality_reply
+    ///   flags            → TIMERFD_TABLE index
+    ///   buf_va           → caller's destination VA (8 bytes)
+    ///   buf_len          → 0
+    TimerFdRead,
 }
 
 /// `#[repr(C)]` pins `kind` at offset 0 so we can take an
@@ -1641,6 +1664,8 @@ fn handle_write(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
             if copied < 8 { return linux_err(EFAULT); }
             let val = u64::from_le_bytes(tmp);
             EVENTFD_TABLE[idx].counter = EVENTFD_TABLE[idx].counter.saturating_add(val);
+            // Phase A5: wake any parked blocking-readers on this eventfd.
+            eventfd_wake_parked(idx);
             // Notify epoll watchers of this eventfd.
             epoll_notify_local_fd(pi, fd_idx, EPOLLIN);
             return 8;
@@ -1869,11 +1894,21 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     if kind == FdKind::EventFd {
         if count < 8 { return linux_err(EINVAL); }
         let idx = handle as usize;
+        let status_flags = unsafe { PROC_TABLE[pi].fds[fd].status_flags };
+        let is_nonblocking = status_flags & (O_NONBLOCK as u32) != 0;
         unsafe {
             if idx >= MAX_EVENT_INSTANCES || !EVENTFD_TABLE[idx].active {
                 return linux_err(EBADF);
             }
             if EVENTFD_TABLE[idx].counter == 0 {
+                // Phase A5: blocking-mode → park.  Non-blocking → EAGAIN.
+                if is_nonblocking { return linux_err(EAGAIN); }
+                if let Some(_slot) = eventfd_read_park(pi, caller_port, idx, buf_va) {
+                    REPLY_DEFERRED = true;
+                    return 0;
+                }
+                // Park-slot allocation failed — degrade to EAGAIN
+                // rather than block the dispatch loop.
                 return linux_err(EAGAIN);
             }
             let val = if EVENTFD_TABLE[idx].flags & EFD_SEMAPHORE != 0 {
@@ -1893,12 +1928,19 @@ fn handle_read(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     if kind == FdKind::TimerFd {
         if count < 8 { return linux_err(EINVAL); }
         let idx = handle as usize;
+        let status_flags = unsafe { PROC_TABLE[pi].fds[fd].status_flags };
+        let is_nonblocking = status_flags & (O_NONBLOCK as u32) != 0;
         unsafe {
             if idx >= MAX_EVENT_INSTANCES || !TIMERFD_TABLE[idx].active {
                 return linux_err(EBADF);
             }
             check_timerfd_expiry(idx);
             if TIMERFD_TABLE[idx].expirations == 0 {
+                if is_nonblocking { return linux_err(EAGAIN); }
+                if let Some(_slot) = timerfd_read_park(pi, caller_port, idx, buf_va) {
+                    REPLY_DEFERRED = true;
+                    return 0;
+                }
                 return linux_err(EAGAIN);
             }
             let exp = TIMERFD_TABLE[idx].expirations;
@@ -7426,6 +7468,139 @@ fn wait4_park(
 /// common case.
 static WAIT4_PENDING_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
+
+/// Phase A5: parked-readers counter, same idiom as WAIT4_PENDING_COUNT.
+/// EventFd writers / timerfd-expiry main-loop checks use this to early-
+/// out when no one is parked.
+static EVENTFD_PARKED_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static TIMERFD_PARKED_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Park an eventfd read whose target counter is currently 0.  Caller
+/// must hold the PROC_TABLE / EVENTFD_TABLE invariants already
+/// validated.  Returns None on slot-allocation failure (caller falls
+/// back to EAGAIN to avoid blocking the dispatch loop).
+fn eventfd_read_park(
+    pi: usize,
+    caller_port: u64,
+    eventfd_idx: usize,
+    buf_va: usize,
+) -> Option<usize> {
+    use core::sync::atomic::Ordering;
+    let slot = async_alloc_slot()?;
+    unsafe {
+        PENDING_ASYNC[slot].correlation = 0;
+        PENDING_ASYNC[slot].pi = pi;
+        PENDING_ASYNC[slot].caller_task_port = caller_port;
+        PENDING_ASYNC[slot].flags = eventfd_idx as u64;
+        PENDING_ASYNC[slot].buf_va = buf_va;
+        PENDING_ASYNC[slot].buf_len = 0;
+    }
+    pending_kind_atomic(slot).store(
+        PendingAsyncKind::EventFdRead as u8, Ordering::Release,
+    );
+    EVENTFD_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
+    Some(slot)
+}
+
+fn timerfd_read_park(
+    pi: usize,
+    caller_port: u64,
+    timerfd_idx: usize,
+    buf_va: usize,
+) -> Option<usize> {
+    use core::sync::atomic::Ordering;
+    let slot = async_alloc_slot()?;
+    unsafe {
+        PENDING_ASYNC[slot].correlation = 0;
+        PENDING_ASYNC[slot].pi = pi;
+        PENDING_ASYNC[slot].caller_task_port = caller_port;
+        PENDING_ASYNC[slot].flags = timerfd_idx as u64;
+        PENDING_ASYNC[slot].buf_va = buf_va;
+        PENDING_ASYNC[slot].buf_len = 0;
+    }
+    pending_kind_atomic(slot).store(
+        PendingAsyncKind::TimerFdRead as u8, Ordering::Release,
+    );
+    TIMERFD_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
+    Some(slot)
+}
+
+/// Wake one (or more, up to a cap) parked EventFdRead waiters on this
+/// idx.  Called from the eventfd write path after the counter has
+/// been incremented.  Decrements counter / handles EFD_SEMAPHORE the
+/// same way the sync read path does.
+fn eventfd_wake_parked(eventfd_idx: usize) {
+    use core::sync::atomic::Ordering;
+    if EVENTFD_PARKED_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    for slot in 0..MAX_PENDING_ASYNC {
+        let k = pending_kind_atomic(slot);
+        if k.load(Ordering::Acquire) != PendingAsyncKind::EventFdRead as u8 {
+            continue;
+        }
+        let parked_idx = unsafe { PENDING_ASYNC[slot].flags } as usize;
+        if parked_idx != eventfd_idx { continue; }
+        // Re-read the counter; if a previous wake in this iteration
+        // already drained it, stop.
+        unsafe {
+            if EVENTFD_TABLE[eventfd_idx].counter == 0 { break; }
+            let val = if EVENTFD_TABLE[eventfd_idx].flags & EFD_SEMAPHORE != 0 {
+                EVENTFD_TABLE[eventfd_idx].counter -= 1;
+                1u64
+            } else {
+                let v = EVENTFD_TABLE[eventfd_idx].counter;
+                EVENTFD_TABLE[eventfd_idx].counter = 0;
+                v
+            };
+            let caller = PENDING_ASYNC[slot].caller_task_port;
+            let buf_va = PENDING_ASYNC[slot].buf_va;
+            syscall::personality_copy_out(caller, buf_va, &val.to_le_bytes());
+            let _ = syscall::personality_reply(caller, 8);
+        }
+        async_free_slot(slot);
+        EVENTFD_PARKED_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Main-loop poller for parked TimerFdRead waiters.  For each parked
+/// slot, check if the timer has expired; if so, retire it.
+fn poll_timerfd_pending() {
+    use core::sync::atomic::Ordering;
+    if TIMERFD_PARKED_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    for slot in 0..MAX_PENDING_ASYNC {
+        let k = pending_kind_atomic(slot);
+        if k.load(Ordering::Acquire) != PendingAsyncKind::TimerFdRead as u8 {
+            continue;
+        }
+        let parked_idx = unsafe { PENDING_ASYNC[slot].flags } as usize;
+        if parked_idx >= MAX_EVENT_INSTANCES { continue; }
+        unsafe {
+            if !TIMERFD_TABLE[parked_idx].active {
+                // FD was closed under us; reply EBADF and free.
+                let caller = PENDING_ASYNC[slot].caller_task_port;
+                let _ = syscall::personality_reply(caller, linux_err(EBADF));
+                async_free_slot(slot);
+                TIMERFD_PARKED_COUNT.fetch_sub(1, Ordering::Relaxed);
+                continue;
+            }
+            check_timerfd_expiry(parked_idx);
+            if TIMERFD_TABLE[parked_idx].expirations == 0 { continue; }
+            let exp = TIMERFD_TABLE[parked_idx].expirations;
+            TIMERFD_TABLE[parked_idx].expirations = 0;
+            let caller = PENDING_ASYNC[slot].caller_task_port;
+            let buf_va = PENDING_ASYNC[slot].buf_va;
+            syscall::personality_copy_out(caller, buf_va, &exp.to_le_bytes());
+            let _ = syscall::personality_reply(caller, 8);
+        }
+        async_free_slot(slot);
+        TIMERFD_PARKED_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Main-loop poller for parked wait4 slots.  Called once per main
 /// dispatch iteration when WAIT4_PENDING_COUNT > 0.  For each parked
@@ -13626,6 +13801,9 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
         // atomic load, early return); only does the full PENDING_ASYNC
         // scan when at least one wait4 is parked.
         poll_wait4_pending();
+        // Phase A5: retire any parked timerfd-read slots whose timer
+        // has expired.  Same early-out idiom as wait4.
+        poll_timerfd_pending();
 
         // Lazily register our async-reply port with initramfs_srv.  At
         // linux_srv startup the `initramfs` ns alias may not be published
