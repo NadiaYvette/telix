@@ -559,6 +559,24 @@ fn take_or_alloc_turnstile(tid: u32) -> Option<*mut Turnstile> {
 fn ts_enqueue(ts: &mut Turnstile, tid: u32) {
     check_invariant(ts, ts as *const Turnstile, 1);
     let tref = thread_ref(tid);
+    // Double-enqueue guard.  Boot 548 trace ring caught a wedge whose
+    // shape is "ts_enqueue called on a tid already linked in *some*
+    // turnstile" — clearing tref.ts_next breaks the existing list's
+    // forward chain at that point.  ts_blocked_on != 0 means the
+    // thread is currently parked on *some* turnstile; if true, we
+    // must NOT clobber its links.  Drop the redundant enqueue and
+    // log loudly so the upstream caller can be identified.
+    let existing_ts = tref.ts_blocked_on.load(Ordering::Relaxed);
+    if existing_ts != 0 {
+        let n = TS_DOUBLE_ENQ_AVERTED.fetch_add(1, Ordering::Relaxed);
+        if n < 8 {
+            crate::println!(
+                "TS-DOUBLE-ENQ: tid={} already on ts={:#x}, refusing enqueue on ts={:#x} (would corrupt prev list)",
+                tid, existing_ts, ts as *const Turnstile as usize,
+            );
+        }
+        return; // Bail without touching the list.
+    }
     tref.ts_next.store(TS_NIL, Ordering::Relaxed);
     tref.ts_prev.store(ts.tail, Ordering::Relaxed);
     if ts.tail != TS_NIL {
@@ -570,6 +588,10 @@ fn ts_enqueue(ts: &mut Turnstile, tid: u32) {
     ts.waiter_count += 1;
     record_ts_mut(1, tid, ts as *const Turnstile);
 }
+
+/// Counter for averted double-enqueues — surfaces the upstream bug
+/// without corrupting the existing turnstile state.
+pub static TS_DOUBLE_ENQ_AVERTED: AtomicU64 = AtomicU64::new(0);
 
 fn ts_dequeue_head(ts: &mut Turnstile) -> Option<u32> {
     check_invariant(ts, ts as *const Turnstile, 2);
