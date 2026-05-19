@@ -574,6 +574,13 @@ fn ts_enqueue(ts: &mut Turnstile, tid: u32) {
                 "TS-DOUBLE-ENQ: tid={} already on ts={:#x}, refusing enqueue on ts={:#x} (would corrupt prev list)",
                 tid, existing_ts, ts as *const Turnstile as usize,
             );
+            // Dump the trace ring for the EXISTING turnstile so we can
+            // see when tid was added and what else has happened on it.
+            // Identifies the upstream caller that left tid linked.
+            if n == 0 {
+                crate::println!("  (recent ops on existing ts={:#x})", existing_ts);
+                dump_ts_trace_for(existing_ts);
+            }
         }
         return; // Bail without touching the list.
     }

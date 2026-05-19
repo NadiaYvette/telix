@@ -4492,6 +4492,14 @@ pub fn resume_task(task_id: u32) -> u32 {
         {
             let tid = key as u32;
             let tref = thread_ref(tid);
+            // Boot 552 #196 sweep: parallel to wake_thread (eda25f4) — a
+            // thread suspended by mem-pressure might have been on a
+            // turnstile when suspended.  Resume must remove it from the
+            // stale turnstile so subsequent ts_enqueue (when it parks
+            // again on a new port) doesn't clobber the prior list.
+            if tref.ts_blocked_on.load(Ordering::Relaxed) != 0 {
+                crate::sync::turnstile::cleanup_blocked(tid);
+            }
             unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Ready;
             unsafe { thread_mut_from_ref(tid) }.blocked_on = BlockReason::None;
             record_trans(tid, 17, ThreadState::Ready, tref.on_cpu.load(Ordering::Relaxed));
