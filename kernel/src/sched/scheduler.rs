@@ -1113,6 +1113,18 @@ static CAS_FAIL_RESCUE_BAILS: AtomicU64 = AtomicU64::new(0);
 /// picking CPU resumes.
 static FAST_RESCUE_TAKEOVERS: AtomicU64 = AtomicU64::new(0);
 
+/// #198 host-pause-aware peer-steal counters.
+/// `HOST_PAUSE_PEERS_DETECTED`: number of (sweep, peer-cpu) pairs where
+/// we observed a peer CPU with both last_try_switch_ns AND last_irq_ns
+/// stale beyond `HOST_PAUSE_RESCUE_NS`.  Distinct from
+/// `IPI_STALE_REROUTES` (wake-side) — this fires from the rescue sweep.
+/// `HOST_PAUSE_STEALS`: count of threads actually migrated off a paused
+/// peer's run-queue and onto the local CPU.  Each successful migration
+/// converts a stranded Ready thread into a dispatched one within the
+/// next try_switch on this CPU.
+static HOST_PAUSE_PEERS_DETECTED: AtomicU64 = AtomicU64::new(0);
+static HOST_PAUSE_STEALS: AtomicU64 = AtomicU64::new(0);
+
 /// #135 false-positive probe: count of try_switch invocations where
 /// pick returned the running thread (concurrent re-enqueue + self-pick).
 /// In this branch we now clear pending_set_ns so the rescue's stale-stamp
@@ -1313,6 +1325,99 @@ fn try_steal_min(cpu: u32, min_len: u32) -> Option<(ThreadId, u32)> {
         }
     }
     None
+}
+
+/// #198 host-pause-aware peer-steal.  Scan peer CPUs from the periodic
+/// rescue sweep: any peer whose `last_try_switch_ns` AND `last_irq_ns`
+/// are both wallclock-stale beyond `HOST_PAUSE_RESCUE_NS` has been
+/// host-descheduled by KVM for the full window (both stamps are
+/// wallclock — a paused vCPU updates neither).  Drain such peers'
+/// run-queues onto the local CPU so stranded Ready threads dispatch
+/// within the next try_switch instead of waiting tens of seconds for
+/// the host to resume the paused vCPU.
+///
+/// Boot 555 motivating case: cpu=3 advanced 450 dispatches while peers
+/// advanced 300-400k each, a 57s wallclock pause.  Threads on cpu=3's
+/// EEVDF heap were stranded the whole time.
+///
+/// Affinity is preserved: `steal_one_min` filters affinity-pinned
+/// threads (bitmap via `find_remove_with_affinity`, EEVDF via
+/// `affinity_mask.test`).  Threads bound to the paused CPU stay put.
+///
+/// Cap per-peer steal count at `HOST_PAUSE_STEAL_CAP` so a single
+/// sweep doesn't hold the local CPU's CLI for too long.  The peer
+/// will be revisited on the next 100ms sweep tick.
+fn rescue_host_paused_peers() {
+    const HOST_PAUSE_RESCUE_NS: u64 = 1_500_000_000; // 1.5s
+    const HOST_PAUSE_STEAL_CAP: u32 = 8;
+
+    let my_cpu = smp::cpu_id();
+    let ncpus = smp::num_cpus();
+    if ncpus <= 1 {
+        return;
+    }
+    let now = get_monotonic_ns();
+    for c in 0..ncpus.min(16) {
+        let c = c as u32;
+        if c == my_cpu {
+            continue;
+        }
+        let pc = smp::get(c);
+        let lts = pc.last_try_switch_ns.load(Ordering::Relaxed);
+        let lirq = pc.last_irq_ns.load(Ordering::Relaxed);
+        // Stamps of 0 mean the CPU never ran try_switch / never took an
+        // IRQ — boot init transient; don't steal from it.
+        if lts == 0 || lirq == 0 {
+            continue;
+        }
+        if now <= lts || now <= lirq {
+            continue;
+        }
+        let ts_age = now - lts;
+        let irq_age = now - lirq;
+        if ts_age < HOST_PAUSE_RESCUE_NS || irq_age < HOST_PAUSE_RESCUE_NS {
+            continue;
+        }
+        HOST_PAUSE_PEERS_DETECTED.fetch_add(1, Ordering::Relaxed);
+        // Drain up to N threads from the paused peer's run-queue onto
+        // this CPU.  try_lock so a (briefly) racing access from the
+        // peer doesn't deadlock — next sweep will retry.
+        let Some(mut rq) = percpu_rq()[c as usize].try_lock() else {
+            continue;
+        };
+        let mut migrated: u32 = 0;
+        while migrated < HOST_PAUSE_STEAL_CAP {
+            let Some(tid) = rq.steal_one_min(my_cpu, 1) else {
+                break;
+            };
+            migrated += 1;
+            HOST_PAUSE_STEALS.fetch_add(1, Ordering::Relaxed);
+            drop(rq);
+            let prio = thread_ref(tid).prio.load(Ordering::Relaxed);
+            set_enq_tag(5); // 5=steal
+            percpu_enqueue(my_cpu, prio, tid);
+            // Re-lock for the next iteration.
+            if let Some(rq2) = percpu_rq()[c as usize].try_lock() {
+                rq = rq2;
+            } else {
+                break;
+            }
+        }
+        // Rate-limited log: first 8 firings only, captures the steady-
+        // state pattern without flooding the serial log under sustained
+        // host pressure.
+        static LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+        if migrated > 0 {
+            let n = LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                crate::println!(
+                    "HOST-PAUSE-RESCUE: my_cpu={} paused_peer={} ts_age_ms={} irq_age_ms={} migrated={} (n={})",
+                    my_cpu, c, ts_age / 1_000_000, irq_age / 1_000_000,
+                    migrated, n + 1,
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3072,14 +3177,16 @@ pub fn tick(current_sp: u64) -> u64 {
                 let cfb = CAS_FAIL_RESCUE_BAILS.load(Ordering::Relaxed);
                 let sar = STEAL_AWARE_REROUTES.load(Ordering::Relaxed);
                 let isr = IPI_STALE_REROUTES.load(Ordering::Relaxed);
+                let hpd = HOST_PAUSE_PEERS_DETECTED.load(Ordering::Relaxed);
+                let hps = HOST_PAUSE_STEALS.load(Ordering::Relaxed);
                 #[cfg(target_arch = "x86_64")]
                 let apf = crate::arch::x86_64::exception::async_pf_event_count();
                 #[cfg(not(target_arch = "x86_64"))]
                 let apf: u64 = 0;
-                if frt | cfb | sar | isr | apf != 0 {
+                if frt | cfb | sar | isr | apf | hpd | hps != 0 {
                     crate::println!(
-                        "LAYER3-DIAG: fast_takeover={} cas_fail_bail={} wake_reroute={} ipi_stale_reroute={} async_pf={}",
-                        frt, cfb, sar, isr, apf,
+                        "LAYER3-DIAG: fast_takeover={} cas_fail_bail={} wake_reroute={} ipi_stale_reroute={} async_pf={} host_pause_peers={} host_pause_steals={}",
+                        frt, cfb, sar, isr, apf, hpd, hps,
                     );
                 }
                 LAYER3_DIAG_LOCK.store(0, Ordering::Release);
@@ -7258,6 +7365,13 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
     // NOTE: we MUST NOT drain remote CPUs' deferred slots — the remote CPU
     // may still be between the deferred store and the assembly stack switch.
     drain_deferred_requeue(smp::cpu_id());
+
+    // #198 host-pause-aware peer-steal.  Before scanning threads, scan
+    // peer CPUs: any peer whose tick + try_switch stamps are both
+    // stale-wallclock for >1.5s has been host-descheduled.  Drain its
+    // run-queue onto this CPU so stranded Ready threads dispatch now
+    // instead of waiting for the host to resume the paused vCPU.
+    rescue_host_paused_peers();
 
     let max_tid = NEXT_THREAD_ID.load(Ordering::Relaxed).min(200);
     let ncpus = smp::num_cpus();
