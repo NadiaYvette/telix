@@ -245,6 +245,28 @@ static ALLOC: LLFreeAllocator = LLFreeAllocator::new();
 use crate::sync::SpinLock;
 static BULK_LOCK: SpinLock<()> = SpinLock::new(());
 
+/// #155 atomicity probe: count of times the alloc_pages bitmap-mode
+/// chunk-state CAS lost a race against a concurrent chunk_free_one /
+/// chunk_alloc_one and had to fall through to the retry-loop fc-dec.
+/// Each fallback used to leak the alloc accounting (`let _ = cas(...)`
+/// + unconditional `fetch_sub`) → `free_count_global` undercount by 1
+/// per fallback (boot 99amfsq544 surfaced this as drift=-1).  Now the
+/// retry loop atomically applies the fc decrement so global and
+/// sum_fc remain consistent.
+static BITMAP_ALLOC_STATE_CAS_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// #155 sanity counter: increments when the retry-loop sees `cur_fc <
+/// allocated` — should not happen if the chunk was consistent at our
+/// bitmap-CAS time.  Non-zero here means deeper allocator state
+/// corruption still exists.
+static BITMAP_ALLOC_STATE_CAS_SANITY_FAILS: AtomicU64 = AtomicU64::new(0);
+
+pub fn bitmap_alloc_state_cas_counts() -> (u64, u64) {
+    (
+        BITMAP_ALLOC_STATE_CAS_FALLBACKS.load(Ordering::Relaxed),
+        BITMAP_ALLOC_STATE_CAS_SANITY_FAILS.load(Ordering::Relaxed),
+    )
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// Physical address of page `page_idx` within chunk `chunk_idx`.
@@ -1130,7 +1152,13 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                 }
 
                 let new_fc = new_bmp.count_ones();
-                // Possibly transition to inline mode.
+                let allocated = (bmp.count_ones() - new_bmp.count_ones()) as u32;
+
+                // Try optimized state transitions first.  All three are
+                // best-effort against `s` — they can fail if a concurrent
+                // chunk_free_one bumped fc (or chunk_alloc_one ran any
+                // bitmap-mode path that re-CAS'd the node).
+                let mut state_updated = false;
                 if new_fc <= INLINE_K && new_fc > 0 {
                     let mut indices = [0u32; INLINE_K as usize];
                     let mut count = 0u32;
@@ -1146,20 +1174,65 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                         count += 1;
                     }
                     let inline_bits = pack_inline(&indices[..count as usize]);
-                    let _ = ALLOC
+                    if ALLOC
                         .chunk(ci)
-                        .cas(s, make_state(count, owner(s), false, 0, inline_bits));
+                        .cas(s, make_state(count, owner(s), false, 0, inline_bits))
+                        .is_ok()
+                    {
+                        state_updated = true;
+                    }
                 } else if new_fc == 0 {
-                    // Also free the bitmap page since chunk is now fully allocated.
-                    let _ = ALLOC.chunk(ci).cas(s, make_state(0, NO_CPU, false, 0, 0));
-                } else {
-                    let _ = ALLOC
+                    if ALLOC
                         .chunk(ci)
-                        .cas(s, (s & !FREE_COUNT_MASK) | (new_fc as u64));
+                        .cas(s, make_state(0, NO_CPU, false, 0, 0))
+                        .is_ok()
+                    {
+                        state_updated = true;
+                    }
+                } else if ALLOC
+                    .chunk(ci)
+                    .cas(s, (s & !FREE_COUNT_MASK) | (new_fc as u64))
+                    .is_ok()
+                {
+                    state_updated = true;
                 }
 
-                // Use actual bitmap popcount difference for accurate accounting.
-                let allocated = bmp.count_ones() - new_bmp.count_ones();
+                // #155 leak-direction drift fix: when the best-effort
+                // state CAS lost (concurrent chunk_free_one bumped fc
+                // between our load and our CAS), the prior code
+                // silently discarded the failure (`let _ = ...`) but
+                // still ran `fetch_sub(allocated)` on global below,
+                // leaving global undercounted by `allocated` vs
+                // sum_fc.  Boot 99amfsq544 reproduced this once under
+                // extreme stress (drift=-1).  Retry-loop fc-dec
+                // applies the alloc accounting atomically against
+                // whatever state the concurrent op left.
+                if !state_updated {
+                    BITMAP_ALLOC_STATE_CAS_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    loop {
+                        let cur = ALLOC.chunk(ci).load();
+                        let cur_fc = free_count(cur);
+                        if cur_fc < allocated {
+                            // Our bitmap CAS owned `allocated` bits, so
+                            // chunk fc at our load was >= allocated.  If
+                            // it's less now, a concurrent mode transition
+                            // (e.g. bitmap→inline with bp reclassification)
+                            // shifted accounting in a way we can't model
+                            // here.  Bail rather than risk fc underflow;
+                            // a small leak is harmless and the next
+                            // free into this chunk will heal it.
+                            BITMAP_ALLOC_STATE_CAS_SANITY_FAILS
+                                .fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        let upd = (cur & !FREE_COUNT_MASK)
+                            | ((cur_fc - allocated) as u64);
+                        if ALLOC.chunk(ci).cas(cur, upd).is_ok() {
+                            break;
+                        }
+                    }
+                }
+
                 ALLOC.free_count_global.fetch_sub(allocated as usize, Ordering::Relaxed);
                 return Some(PhysAddr::new(page_pa(ci, start_bit as u32)));
             }
@@ -1341,16 +1414,18 @@ pub fn verify_global_counter() {
         return;
     }
 
+    let (cas_fallbacks, cas_sanity_fails) = bitmap_alloc_state_cas_counts();
     if drift_signed != 0 {
         crate::println!(
-            "[phys::verify] DRIFT global={} sum_fc={} drift={} chunks_fc>0={}/{} bitmap={} max_fc={}",
+            "[phys::verify] DRIFT global={} sum_fc={} drift={} chunks_fc>0={}/{} bitmap={} max_fc={} cas_fb={} cas_sanity={}",
             global, sum, drift_signed, chunks_fc_gt_0, ALLOC.total_chunks, bitmap_chunks, max_fc,
+            cas_fallbacks, cas_sanity_fails,
         );
     } else if prev != usize::MAX && prev != drift_encoded {
         // Drift cleared after being non-zero — also worth noting.
         crate::println!(
-            "[phys::verify] HEALED global={} sum_fc={} (drift back to 0)",
-            global, sum,
+            "[phys::verify] HEALED global={} sum_fc={} (drift back to 0) cas_fb={} cas_sanity={}",
+            global, sum, cas_fallbacks, cas_sanity_fails,
         );
     }
 }
