@@ -946,6 +946,22 @@ enum PendingAsyncKind {
     ///   flags            → UDS handle (low 32 bits)
     ///   buf_va, buf_len  → unused
     UdsSend,
+    /// Async wait4 park (Phase A3).  Unlike A1/A2 this is purely
+    /// internal — there's no remote server to talk to; the wait
+    /// completes when a child exits and the kernel reaps it.  Without
+    /// async, the dispatch loop spins in a 5000-iteration
+    /// yield_now/personality_wait4(WNOHANG) loop, which blocks every
+    /// other Linux syscall serviced by this linux_srv thread.  The
+    /// async form allocates this slot, defers the caller's reply, and
+    /// lets the main loop's `poll_wait4_pending` scan retire it when
+    /// a matching child is reapable.
+    /// Field reuse:
+    ///   pi               → caller process index
+    ///   caller_task_port → port for personality_reply
+    ///   flags            → target pid (i64 cast to u64; -1 = any child)
+    ///   buf_va           → caller's wstatus VA (0 if NULL)
+    ///   buf_len          → options (WNOHANG, etc.)
+    Wait4,
 }
 
 /// `#[repr(C)]` pins `kind` at offset 0 so we can take an
@@ -7324,37 +7340,133 @@ fn handle_clone3(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 }
 
 /// Handle Linux wait4(pid, wstatus, options, rusage).
-fn handle_wait4(caller_port: u64, args: &[u64; 6]) -> u64 {
+fn handle_wait4(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
     let pid = args[0] as i64;
     let wstatus_va = args[1] as usize;
     let options = args[2] as u32;
     let wnohang = options & 1; // WNOHANG = 1
 
-    // Poll loop for blocking wait.
-    for _ in 0..5000 {
-        let child_port = syscall::personality_wait4(caller_port, pid, 1); // always WNOHANG
-        if child_port == u64::MAX {
-            // No children at all → ECHILD
-            return linux_err(ECHILD);
+    // Fast path: try once non-blocking.  If a child is ready (or we
+    // got ECHILD), return synchronously.  This covers the WNOHANG
+    // case and the "child already exited before parent wait4'd" case
+    // without async overhead.
+    let child_port = syscall::personality_wait4(caller_port, pid, 1);
+    if child_port == u64::MAX {
+        return linux_err(ECHILD);
+    }
+    if child_port != 0 {
+        if wstatus_va != 0 {
+            let status: u32 = 0;
+            let status_bytes = status.to_le_bytes();
+            syscall::personality_copy_out(caller_port, wstatus_va, &status_bytes);
         }
+        return child_port;
+    }
+    if wnohang != 0 {
+        return 0;
+    }
+
+    // Phase A3: async-park.  Allocate a Wait4 PendingAsync slot; the
+    // main-loop poller `poll_wait4_pending` will retry
+    // personality_wait4(WNOHANG) on each iteration and retire the
+    // slot when a matching child becomes reapable.  This frees the
+    // dispatch loop to service other Linux syscalls during the wait.
+    if let Some(slot) = wait4_park(pi, caller_port, pid, wstatus_va, options) {
+        let _ = slot;
+        unsafe { REPLY_DEFERRED = true; }
+        return 0;
+    }
+    // Slot allocation failed — fall back to the legacy spin to
+    // preserve correctness (rare; only fires when PENDING_ASYNC is
+    // fully exhausted).
+    for _ in 0..5000 {
+        let child_port = syscall::personality_wait4(caller_port, pid, 1);
+        if child_port == u64::MAX { return linux_err(ECHILD); }
         if child_port != 0 {
-            // Found an exited child. Write status to caller if requested.
             if wstatus_va != 0 {
-                // Normal exit status: (exit_code << 8) & 0xFF00
-                // For now, write 0 (exited with code 0).
                 let status: u32 = 0;
-                let status_bytes = status.to_le_bytes();
-                syscall::personality_copy_out(caller_port, wstatus_va, &status_bytes);
+                syscall::personality_copy_out(caller_port, wstatus_va, &status.to_le_bytes());
             }
             return child_port;
         }
-        if wnohang != 0 {
-            return 0; // No child ready, WNOHANG.
-        }
         syscall::yield_now();
     }
-    // Timeout — return 0 (no child ready).
     0
+}
+
+/// Park a wait4 request as a PendingAsyncKind::Wait4 slot.  Returns
+/// None on allocation failure.  Called by handle_wait4 when no child
+/// is immediately reapable and WNOHANG is not set.
+fn wait4_park(
+    pi: usize,
+    caller_port: u64,
+    pid: i64,
+    wstatus_va: usize,
+    options: u32,
+) -> Option<usize> {
+    use core::sync::atomic::Ordering;
+    let slot = async_alloc_slot()?;
+    unsafe {
+        PENDING_ASYNC[slot].correlation = 0; // not used (no remote correlation)
+        PENDING_ASYNC[slot].pi = pi;
+        PENDING_ASYNC[slot].caller_task_port = caller_port;
+        PENDING_ASYNC[slot].flags = pid as u64;
+        PENDING_ASYNC[slot].buf_va = wstatus_va;
+        PENDING_ASYNC[slot].buf_len = options as usize;
+    }
+    pending_kind_atomic(slot).store(
+        PendingAsyncKind::Wait4 as u8, Ordering::Release,
+    );
+    WAIT4_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
+    Some(slot)
+}
+
+/// Counter of currently-parked Wait4 slots.  Lets the main-loop
+/// poller skip the full PENDING_ASYNC scan entirely when zero — the
+/// common case.
+static WAIT4_PENDING_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Main-loop poller for parked wait4 slots.  Called once per main
+/// dispatch iteration when WAIT4_PENDING_COUNT > 0.  For each parked
+/// Wait4, do a non-blocking personality_wait4; if a matching child is
+/// reapable, write the wstatus, personality_reply, and free the slot.
+fn poll_wait4_pending() {
+    use core::sync::atomic::Ordering;
+    if WAIT4_PENDING_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    for slot in 0..MAX_PENDING_ASYNC {
+        let k = pending_kind_atomic(slot);
+        if k.load(Ordering::Acquire) != PendingAsyncKind::Wait4 as u8 {
+            continue;
+        }
+        let (caller, pid, wstatus_va) = unsafe {
+            (PENDING_ASYNC[slot].caller_task_port,
+             PENDING_ASYNC[slot].flags as i64,
+             PENDING_ASYNC[slot].buf_va)
+        };
+        let child_port = syscall::personality_wait4(caller, pid, 1);
+        if child_port == u64::MAX {
+            // ECHILD: no children at all (race — was reaped by sibling).
+            let _ = syscall::personality_reply(caller, linux_err(ECHILD));
+            async_free_slot(slot);
+            WAIT4_PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+            continue;
+        }
+        if child_port == 0 {
+            // No reapable child yet — keep parked.
+            continue;
+        }
+        // Reap succeeded.  Write wstatus if requested.
+        if wstatus_va != 0 {
+            let status: u32 = 0;
+            syscall::personality_copy_out(caller, wstatus_va, &status.to_le_bytes());
+        }
+        let _ = syscall::personality_reply(caller, child_port);
+        async_free_slot(slot);
+        WAIT4_PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Handle Linux waitid(idtype, id, infop, options).
@@ -13509,6 +13621,11 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     loop {
         expire_futex_waiters();
         expire_poll_waiters();
+        // Phase A3: retire any parked wait4 slots whose target child
+        // has exited.  Cheap when WAIT4_PENDING_COUNT == 0 (single
+        // atomic load, early return); only does the full PENDING_ASYNC
+        // scan when at least one wait4 is parked.
+        poll_wait4_pending();
 
         // Lazily register our async-reply port with initramfs_srv.  At
         // linux_srv startup the `initramfs` ns alias may not be published
@@ -13670,7 +13787,7 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
                     None => continue, // Success: kernel woke target directly, skip reply.
                 }
             }
-            __NR_WAIT4 => handle_wait4(caller_port, &msg.data),
+            __NR_WAIT4 => handle_wait4(pi, caller_port, &msg.data),
             __NR_BRK => handle_brk(pi, caller_port, &msg.data),
             __NR_ARCH_PRCTL => handle_arch_prctl(pi, caller_port, &msg.data),
             __NR_SET_TID_ADDRESS => handle_set_tid_address(pi, caller_port, &msg.data),
