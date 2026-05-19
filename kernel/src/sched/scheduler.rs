@@ -7107,10 +7107,13 @@ fn call_reply_timeout_sweep() {
                 let recv_h   = p.recv_holder.load(Ordering::Relaxed);
                 let (deq_hamt_miss, deq_ts_empty_ok, deq_ts_empty_bug) =
                     crate::sync::turnstile::deq_counters();
+                let inv_fails = crate::sync::turnstile::TS_INVARIANT_FAILS
+                    .load(Ordering::Relaxed);
                 crate::println!(
-                    "  PORT-DIAG: wake_calls={} no_parker={} inject_ok={} reenq={} recv_holder={} deq_miss=(hamt={} empty_ok={} empty_bug={})",
+                    "  PORT-DIAG: wake_calls={} no_parker={} inject_ok={} reenq={} recv_holder={} deq_miss=(hamt={} empty_ok={} empty_bug={}) inv_fails={}",
                     calls, no_park, inj_ok, reenq, recv_h,
-                    deq_hamt_miss, deq_ts_empty_ok, deq_ts_empty_bug
+                    deq_hamt_miss, deq_ts_empty_ok, deq_ts_empty_bug,
+                    inv_fails
                 );
                 // Cross-check: does the HAMT actually map (port_id, RECV_PARK)
                 // to a turnstile right now?  If hamt_found=false while parked

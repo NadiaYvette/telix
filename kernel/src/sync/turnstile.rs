@@ -332,6 +332,15 @@ fn hamt_remove_at(
 // Turnstile struct and alloc/free
 // ---------------------------------------------------------------------------
 
+/// Canary pattern stored in the trailing 12 bytes of the slab object.
+/// Detects out-of-bounds writes from co-located CACHE_64 objects (VMA tree
+/// nodes, ART leaves/Node4, fork group, etc).  If `check_invariant` finds
+/// the canary altered, an outside-bucket-lock writer scribbled the slab.
+const TS_CANARY: [u8; 12] = [
+    0xC0, 0xDE, 0xCA, 0xFE, 0xBA, 0xAA,
+    0xDD, 0xEE, 0xFA, 0xCE, 0xAD, 0x11,
+];
+
 #[repr(C)]
 struct Turnstile {
     aspace_id: u64,
@@ -346,6 +355,9 @@ struct Turnstile {
     owner_tid: u32,
     max_waiter_prio: u8,
     _pad2: [u8; 3],
+    /// Canary at struct end.  See TS_CANARY.  Total Turnstile size becomes
+    /// 64 bytes, matching the slab cache.
+    canary_tail: [u8; 12],
 }
 
 // =============================================================================
@@ -474,8 +486,61 @@ fn init_turnstile(ts: *mut Turnstile, key_type: u8, aspace_id: u64, va: usize, h
     t.waiter_count = 0;
     t.owner_tid = 0;
     t.max_waiter_prio = 255;
+    t.canary_tail = TS_CANARY;
     record_ts_mut(5, 0, ts);
 }
+
+/// Proactive invariant + canary check.  Called at the TOP of each ts_*
+/// mutation under the bucket lock.  If the canary is mangled or the
+/// linked list walk count disagrees with `waiter_count`, dumps the
+/// trace ring for this TS and bumps `TS_INVARIANT_FAILS` so the
+/// CALL-TIMEOUT report surfaces it.
+///
+/// Walk is capped at MAX_WALK to prevent infinite-loop on a cyclic
+/// list (a corruption mode we also want to detect — finite walk means
+/// the cycle was hit before completion).
+#[inline]
+fn check_invariant(ts: &Turnstile, ts_ptr: *const Turnstile, about_to_run: u8) {
+    const MAX_WALK: u32 = 64;
+    // Canary check first — cheapest signal.
+    if ts.canary_tail != TS_CANARY {
+        let n = TS_INVARIANT_FAILS.fetch_add(1, Ordering::Relaxed);
+        if n < 4 {
+            crate::println!(
+                "TS-CANARY-CORRUPT: ts={:#x} about_to_run_op={} got={:02x?} expected={:02x?}",
+                ts_ptr as usize, about_to_run, ts.canary_tail, TS_CANARY
+            );
+            dump_ts_trace_for(ts_ptr as usize);
+        }
+        return; // Don't try to walk a corrupted struct.
+    }
+    // Linked-list walk.
+    let mut walked = 0u32;
+    let mut cur = ts.head;
+    let mut steps = 0u32;
+    while cur != TS_NIL && steps < MAX_WALK {
+        walked += 1;
+        // Safe: under bucket lock, ts_next is stable.
+        cur = thread_ref(cur).ts_next.load(Ordering::Relaxed);
+        steps += 1;
+    }
+    let wc = ts.waiter_count as u32;
+    if walked != wc || (wc == 0) != (ts.head == TS_NIL) {
+        let n = TS_INVARIANT_FAILS.fetch_add(1, Ordering::Relaxed);
+        if n < 4 {
+            crate::println!(
+                "TS-INVARIANT-FAIL: ts={:#x} about_to_run_op={} head={} tail={} wc={} walked={} (walk_capped={})",
+                ts_ptr as usize, about_to_run,
+                ts.head, ts.tail, ts.waiter_count, walked,
+                steps == MAX_WALK,
+            );
+            dump_ts_trace_for(ts_ptr as usize);
+        }
+    }
+}
+
+/// Counter for proactive invariant failures (canary OR walk mismatch).
+pub static TS_INVARIANT_FAILS: AtomicU64 = AtomicU64::new(0);
 
 /// Take the current thread's pre-allocated turnstile, or allocate a fresh one.
 fn take_or_alloc_turnstile(tid: u32) -> Option<*mut Turnstile> {
@@ -492,6 +557,7 @@ fn take_or_alloc_turnstile(tid: u32) -> Option<*mut Turnstile> {
 // ---------------------------------------------------------------------------
 
 fn ts_enqueue(ts: &mut Turnstile, tid: u32) {
+    check_invariant(ts, ts as *const Turnstile, 1);
     let tref = thread_ref(tid);
     tref.ts_next.store(TS_NIL, Ordering::Relaxed);
     tref.ts_prev.store(ts.tail, Ordering::Relaxed);
@@ -506,6 +572,7 @@ fn ts_enqueue(ts: &mut Turnstile, tid: u32) {
 }
 
 fn ts_dequeue_head(ts: &mut Turnstile) -> Option<u32> {
+    check_invariant(ts, ts as *const Turnstile, 2);
     let head = ts.head;
     if head == TS_NIL {
         return None;
@@ -527,6 +594,7 @@ fn ts_dequeue_head(ts: &mut Turnstile) -> Option<u32> {
 
 /// Remove a specific thread from the wait queue. Returns true if found.
 fn ts_remove(ts: &mut Turnstile, tid: u32) -> bool {
+    check_invariant(ts, ts as *const Turnstile, 3);
     let mut cur = ts.head;
     while cur != TS_NIL {
         if cur == tid {
@@ -557,6 +625,7 @@ fn ts_remove(ts: &mut Turnstile, tid: u32) -> bool {
 /// Enqueue in priority order (ascending numeric = highest priority first).
 /// Used by PI futex variants.
 fn ts_enqueue_prio(ts: &mut Turnstile, tid: u32) {
+    check_invariant(ts, ts as *const Turnstile, 4);
     let my_prio = thread_ref(tid).prio.load(Ordering::Acquire);
     let mut cur = ts.head;
     let mut prev_tid = TS_NIL;
