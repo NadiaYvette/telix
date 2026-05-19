@@ -284,6 +284,233 @@ fn one_run_seqcst() {
     one_run_with(Ordering::SeqCst, Ordering::SeqCst);
 }
 
+// =============================================================================
+// Linked-list / waiter_count invariant model
+//
+// Boot 545 observed a Turnstile in the HAMT with head=tail=TS_NIL but
+// waiter_count=3 under the bucket lock.  The bitmap model above can't
+// catch that — `waiter_count` is *defined* as `waiters.count_ones()`.
+// This new model represents head/tail/wc as separate fields plus
+// per-thread ts_next/ts_prev links, mirroring the real Turnstile.
+//
+// Operations modeled (each is an entire kernel-side ts_* call, run under
+// the bucket Mutex in our model):
+//   * `ts_enqueue(tid)`        — tail-append
+//   * `ts_dequeue_head()`      — head-remove (returns Option<tid>)
+//   * `ts_remove(tid)`         — find-and-remove
+//
+// Invariant checked after all loom threads join: walk forward from head
+// `wc` times and land on tail (with ts_next == NIL); equivalently walk
+// backward from tail `wc` times and land on head.  Both reachability
+// and count must agree.
+// =============================================================================
+
+const LL_NIL: u32 = u32::MAX;
+const LL_N_TIDS: usize = 4;
+
+#[derive(Clone, Copy)]
+struct LinkedTurnstile {
+    head: u32,
+    tail: u32,
+    wc: u16,
+    ts_next: [u32; LL_N_TIDS],
+    ts_prev: [u32; LL_N_TIDS],
+    /// `in_list[t]` mirrors our model's enq/deq bookkeeping so each
+    /// invariant check can detect off-by-one mutations independently.
+    in_list: [bool; LL_N_TIDS],
+}
+
+impl Default for LinkedTurnstile {
+    fn default() -> Self {
+        Self {
+            head: LL_NIL,
+            tail: LL_NIL,
+            wc: 0,
+            ts_next: [LL_NIL; LL_N_TIDS],
+            ts_prev: [LL_NIL; LL_N_TIDS],
+            in_list: [false; LL_N_TIDS],
+        }
+    }
+}
+
+impl LinkedTurnstile {
+    fn ts_enqueue(&mut self, tid: u32) {
+        let t = tid as usize;
+        self.ts_next[t] = LL_NIL;
+        self.ts_prev[t] = self.tail;
+        if self.tail != LL_NIL {
+            self.ts_next[self.tail as usize] = tid;
+        } else {
+            self.head = tid;
+        }
+        self.tail = tid;
+        self.wc += 1;
+        self.in_list[t] = true;
+    }
+
+    fn ts_dequeue_head(&mut self) -> Option<u32> {
+        let head = self.head;
+        if head == LL_NIL {
+            return None;
+        }
+        let h = head as usize;
+        let next = self.ts_next[h];
+        self.ts_next[h] = LL_NIL;
+        self.ts_prev[h] = LL_NIL;
+        self.head = next;
+        if next != LL_NIL {
+            self.ts_prev[next as usize] = LL_NIL;
+        } else {
+            self.tail = LL_NIL;
+        }
+        self.wc -= 1;
+        self.in_list[h] = false;
+        Some(head)
+    }
+
+    fn ts_remove(&mut self, tid: u32) -> bool {
+        let mut cur = self.head;
+        while cur != LL_NIL {
+            if cur == tid {
+                let t = tid as usize;
+                let prev = self.ts_prev[t];
+                let next = self.ts_next[t];
+                if prev != LL_NIL {
+                    self.ts_next[prev as usize] = next;
+                } else {
+                    self.head = next;
+                }
+                if next != LL_NIL {
+                    self.ts_prev[next as usize] = prev;
+                } else {
+                    self.tail = prev;
+                }
+                self.ts_next[t] = LL_NIL;
+                self.ts_prev[t] = LL_NIL;
+                self.wc -= 1;
+                self.in_list[t] = false;
+                return true;
+            }
+            cur = self.ts_next[cur as usize];
+        }
+        false
+    }
+
+    /// Walk forward from head and assert wc == walk count.
+    fn check_invariant(&self) {
+        let mut walked = 0u16;
+        let mut cur = self.head;
+        let mut last = LL_NIL;
+        let mut seen = [false; LL_N_TIDS];
+        while cur != LL_NIL {
+            assert!(
+                !seen[cur as usize],
+                "cycle in linked list: tid {} visited twice",
+                cur
+            );
+            seen[cur as usize] = true;
+            assert!(
+                self.in_list[cur as usize],
+                "tid {} in linked list but in_list[{}]=false",
+                cur, cur
+            );
+            walked += 1;
+            last = cur;
+            cur = self.ts_next[cur as usize];
+        }
+        assert_eq!(
+            walked, self.wc,
+            "wc mismatch: walked {} entries forward, wc={}",
+            walked, self.wc
+        );
+        if self.wc == 0 {
+            assert_eq!(self.head, LL_NIL, "wc=0 but head={}", self.head);
+            assert_eq!(self.tail, LL_NIL, "wc=0 but tail={}", self.tail);
+        } else {
+            assert_eq!(self.tail, last, "tail={} but walk-last={}", self.tail, last);
+        }
+        // Backward walk.
+        let mut walked_b = 0u16;
+        let mut cur = self.tail;
+        while cur != LL_NIL {
+            walked_b += 1;
+            let prev = self.ts_prev[cur as usize];
+            if prev == LL_NIL {
+                assert_eq!(self.head, cur,
+                    "backward walk reached NIL prev but head={} cur={}",
+                    self.head, cur);
+            }
+            cur = prev;
+        }
+        assert_eq!(
+            walked_b, self.wc,
+            "wc mismatch: walked {} entries backward, wc={}",
+            walked_b, self.wc
+        );
+    }
+}
+
+struct LinkedShared {
+    bucket: Mutex<LinkedTurnstile>,
+}
+
+fn ll_run_three_concurrent_enqueues() {
+    let s = Arc::new(LinkedShared { bucket: Mutex::new(LinkedTurnstile::default()) });
+    let t1 = {
+        let s = s.clone();
+        thread::spawn(move || s.bucket.lock().unwrap().ts_enqueue(0))
+    };
+    let t2 = {
+        let s = s.clone();
+        thread::spawn(move || s.bucket.lock().unwrap().ts_enqueue(1))
+    };
+    let t3 = {
+        let s = s.clone();
+        thread::spawn(move || s.bucket.lock().unwrap().ts_enqueue(2))
+    };
+    t1.join().unwrap();
+    t2.join().unwrap();
+    t3.join().unwrap();
+    let ts = s.bucket.lock().unwrap();
+    ts.check_invariant();
+    assert_eq!(ts.wc, 3);
+}
+
+fn ll_run_enqueue_dequeue_remove() {
+    let s = Arc::new(LinkedShared { bucket: Mutex::new(LinkedTurnstile::default()) });
+    // Seed with tid 0 already enqueued so dequeue + remove have work.
+    s.bucket.lock().unwrap().ts_enqueue(0);
+    let t1 = {
+        let s = s.clone();
+        thread::spawn(move || s.bucket.lock().unwrap().ts_enqueue(1))
+    };
+    let t2 = {
+        let s = s.clone();
+        thread::spawn(move || { let _ = s.bucket.lock().unwrap().ts_dequeue_head(); })
+    };
+    let t3 = {
+        let s = s.clone();
+        thread::spawn(move || { let _ = s.bucket.lock().unwrap().ts_remove(0); })
+    };
+    t1.join().unwrap();
+    t2.join().unwrap();
+    t3.join().unwrap();
+    let ts = s.bucket.lock().unwrap();
+    ts.check_invariant();
+}
+
+/// Explanatory: prove the invariant CAN catch corruption, by running a
+/// double-enqueue of the same tid on a plain (non-loom) struct.  No loom
+/// concurrency — purely a sanity check on `check_invariant`.
+fn ll_double_enqueue_invariant_catches() {
+    let mut t = LinkedTurnstile::default();
+    t.ts_enqueue(0);
+    t.ts_enqueue(0); // duplicate
+    let r = std::panic::catch_unwind(|| t.check_invariant());
+    assert!(r.is_err(),
+        "double-enqueue of same tid did NOT produce invariant violation — model bug");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +528,27 @@ mod tests {
     #[test]
     fn turnstile_protocol() {
         loom::model(one_run);
+    }
+
+    /// Linked-list / waiter_count invariant under three concurrent enqueues.
+    /// Boot 545 observed wc=3 with head=NIL; this model would catch any
+    /// path that violates the count↔list invariant under loom interleavings.
+    #[test]
+    fn linked_list_three_enqueues() {
+        loom::model(ll_run_three_concurrent_enqueues);
+    }
+
+    /// Linked-list invariant under mixed enqueue + dequeue_head + remove.
+    #[test]
+    fn linked_list_enq_deq_remove() {
+        loom::model(ll_run_enqueue_dequeue_remove);
+    }
+
+    /// Explanatory: confirms that a double-enqueue of the same tid produces
+    /// the observed corruption shape, so the model can recognise it.
+    /// Not under loom::model — purely a sanity check on `check_invariant`.
+    #[test]
+    fn linked_list_double_enqueue_recognised() {
+        ll_double_enqueue_invariant_catches();
     }
 }

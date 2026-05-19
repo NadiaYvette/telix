@@ -348,6 +348,108 @@ struct Turnstile {
     _pad2: [u8; 3],
 }
 
+// =============================================================================
+// Mutation trace ring (#192 / project_turnstile_wc_corruption.md)
+//
+// Records every mutation of (head, tail, waiter_count) so that when DEQ-STUCK
+// fires we can replay the recent op history on the offending turnstile and
+// see which mutation broke the invariant `waiter_count == walk(head)`.
+//
+// Each slot stores the AFTER snapshot.  Lock-free best-effort:
+// concurrent writes can interleave across fields, but the bucket lock
+// serialises any two writes on the same turnstile, so per-turnstile
+// op ordering is preserved.  Wrap-around is tolerable for diagnosis.
+//
+// Op tags:
+//   1 = ts_enqueue          (tail-append)
+//   2 = ts_dequeue_head     (head-remove)
+//   3 = ts_remove           (specific tid remove)
+//   4 = ts_enqueue_prio     (priority-order insert)
+//   5 = init_turnstile      (zero head/tail/wc)
+// =============================================================================
+
+const TS_TRACE_LEN: usize = 256;
+
+#[repr(C)]
+struct TsTraceSlot {
+    seq: core::sync::atomic::AtomicU32,  // monotonic to disambiguate wrap
+    op_tid: core::sync::atomic::AtomicU64, // hi32=tid lo8=op lo16(of hi32-low)=cpu
+    ts_ptr: core::sync::atomic::AtomicU64,
+    head_tail: core::sync::atomic::AtomicU64, // hi32=tail lo32=head
+    wc: core::sync::atomic::AtomicU32,
+}
+
+impl TsTraceSlot {
+    const fn new() -> Self {
+        Self {
+            seq: core::sync::atomic::AtomicU32::new(0),
+            op_tid: core::sync::atomic::AtomicU64::new(0),
+            ts_ptr: core::sync::atomic::AtomicU64::new(0),
+            head_tail: core::sync::atomic::AtomicU64::new(0),
+            wc: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+static TS_TRACE: [TsTraceSlot; TS_TRACE_LEN] = {
+    const Z: TsTraceSlot = TsTraceSlot::new();
+    [Z; TS_TRACE_LEN]
+};
+static TS_TRACE_HEAD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+#[inline]
+fn record_ts_mut(op: u8, tid: u32, ts_ptr: *const Turnstile) {
+    let ts = unsafe { &*ts_ptr };
+    let seq = TS_TRACE_HEAD.fetch_add(1, Ordering::Relaxed);
+    let idx = (seq as usize) % TS_TRACE_LEN;
+    let slot = &TS_TRACE[idx];
+    let cpu = crate::sched::smp::cpu_id() as u64;
+    slot.seq.store(seq.wrapping_add(1), Ordering::Relaxed); // non-zero sentinel
+    slot.op_tid.store(((tid as u64) << 32) | (cpu << 8) | (op as u64),
+                      Ordering::Relaxed);
+    slot.ts_ptr.store(ts_ptr as u64, Ordering::Relaxed);
+    slot.head_tail.store(((ts.tail as u64) << 32) | (ts.head as u64),
+                         Ordering::Relaxed);
+    slot.wc.store(ts.waiter_count as u32, Ordering::Relaxed);
+}
+
+/// Dump the last N trace entries that match `ts_ptr`.  Called from the
+/// DEQ-STUCK fast path.  Cap at 16 entries to limit serial flood.
+pub fn dump_ts_trace_for(ts_ptr: usize) {
+    let head = TS_TRACE_HEAD.load(Ordering::Relaxed);
+    let mut printed = 0u32;
+    // Walk backward from the most recent entry.
+    let mut i = head.wrapping_sub(1);
+    let max_walk = TS_TRACE_LEN as u32;
+    for _ in 0..max_walk {
+        let idx = (i as usize) % TS_TRACE_LEN;
+        let slot = &TS_TRACE[idx];
+        let p = slot.ts_ptr.load(Ordering::Relaxed) as usize;
+        if p == ts_ptr {
+            let op_tid = slot.op_tid.load(Ordering::Relaxed);
+            let ht = slot.head_tail.load(Ordering::Relaxed);
+            let wc = slot.wc.load(Ordering::Relaxed);
+            let op = (op_tid & 0xFF) as u8;
+            let cpu = ((op_tid >> 8) & 0xFF) as u8;
+            let tid = (op_tid >> 32) as u32;
+            let head32 = (ht & 0xFFFF_FFFF) as u32;
+            let tail32 = (ht >> 32) as u32;
+            crate::println!(
+                "  TS-TRACE[{}] op={} cpu={} tid={} head={} tail={} wc={}",
+                slot.seq.load(Ordering::Relaxed),
+                op, cpu, tid, head32, tail32, wc
+            );
+            printed += 1;
+            if printed >= 16 { break; }
+        }
+        i = i.wrapping_sub(1);
+    }
+    if printed == 0 {
+        crate::println!("  TS-TRACE: no matching entries for ts={:#x}", ts_ptr);
+    }
+}
+
 fn alloc_turnstile() -> Option<*mut Turnstile> {
     let pa = slab::alloc(TS_SLAB_SIZE)?;
     let p = pa.as_usize() as *mut Turnstile;
@@ -372,6 +474,7 @@ fn init_turnstile(ts: *mut Turnstile, key_type: u8, aspace_id: u64, va: usize, h
     t.waiter_count = 0;
     t.owner_tid = 0;
     t.max_waiter_prio = 255;
+    record_ts_mut(5, 0, ts);
 }
 
 /// Take the current thread's pre-allocated turnstile, or allocate a fresh one.
@@ -399,6 +502,7 @@ fn ts_enqueue(ts: &mut Turnstile, tid: u32) {
     }
     ts.tail = tid;
     ts.waiter_count += 1;
+    record_ts_mut(1, tid, ts as *const Turnstile);
 }
 
 fn ts_dequeue_head(ts: &mut Turnstile) -> Option<u32> {
@@ -417,6 +521,7 @@ fn ts_dequeue_head(ts: &mut Turnstile) -> Option<u32> {
         ts.tail = TS_NIL;
     }
     ts.waiter_count -= 1;
+    record_ts_mut(2, head, ts as *const Turnstile);
     Some(head)
 }
 
@@ -441,6 +546,7 @@ fn ts_remove(ts: &mut Turnstile, tid: u32) -> bool {
             tref.ts_next.store(TS_NIL, Ordering::Relaxed);
             tref.ts_prev.store(TS_NIL, Ordering::Relaxed);
             ts.waiter_count -= 1;
+            record_ts_mut(3, tid, ts as *const Turnstile);
             return true;
         }
         cur = thread_ref(cur).ts_next.load(Ordering::Relaxed);
@@ -475,6 +581,7 @@ fn ts_enqueue_prio(ts: &mut Turnstile, tid: u32) {
         ts.tail = tid;
     }
     ts.waiter_count += 1;
+    record_ts_mut(4, tid, ts as *const Turnstile);
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,12 +1113,19 @@ pub fn port_dequeue_one(port_id: u64, key_type: u8) -> Option<u32> {
             // that's a structural inconsistency (count vs head/tail).
             if ts.waiter_count > 0 {
                 let n = DEQ_TS_EMPTY_BUG.fetch_add(1, Ordering::Relaxed);
-                if n < 8 {
+                if n < 4 {
                     crate::println!(
                         "DEQ-STUCK: port={:#x} key={} ts={:#x} head=NIL tail={} wc={} hash={:#x}",
                         port_id, key_type, ts_ptr as usize,
                         ts.tail, ts.waiter_count, ts.hash,
                     );
+                    // Replay the recent op history on this turnstile.
+                    // First DEQ-STUCK fire dumps the trace; subsequent
+                    // fires are usually the same TS so skip to avoid
+                    // serial spam.
+                    if n == 0 {
+                        dump_ts_trace_for(ts_ptr as usize);
+                    }
                 }
             } else {
                 DEQ_TS_EMPTY_OK.fetch_add(1, Ordering::Relaxed);
