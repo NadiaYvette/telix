@@ -240,6 +240,61 @@ pub fn validate_thread_canary(tid: ThreadId, callsite: &str) -> bool {
     true
 }
 
+/// #206 saved_sp last-writer log.
+///
+/// Boot 572 caught `BUG: try_switch tid=4 saved_sp=0x0 ... source=1`.
+/// saved_sp_source=1 says try_switch was the last LEGITIMATE writer of
+/// saved_sp_source, but saved_sp itself is 0 — meaning something
+/// AFTER try_switch's write cleared saved_sp to 0.  This log records
+/// the most recent write to saved_sp for each tid so we can identify
+/// the actual writer that produced the 0.
+///
+/// `SAVED_SP_LAST_VALUE[tid]`: the value written.
+/// `SAVED_SP_LAST_META[tid]`: packed (callsite_tag<<0 | cpu<<8 | ts32<<32).
+///
+/// Capped at 256 tids — matches PER_TID_RESCUE_CAP elsewhere.  Beyond
+/// that, the log silently no-ops (the bug surfaces at low tids ≤ 64
+/// in observed boots, so 256 is plenty).
+const SAVED_SP_LOG_CAP: usize = 256;
+static SAVED_SP_LAST_VALUE: [core::sync::atomic::AtomicU64; SAVED_SP_LOG_CAP] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; SAVED_SP_LOG_CAP]
+};
+static SAVED_SP_LAST_META: [core::sync::atomic::AtomicU64; SAVED_SP_LOG_CAP] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; SAVED_SP_LOG_CAP]
+};
+
+#[inline]
+pub fn record_saved_sp_write(tid: ThreadId, new_value: u64, callsite_tag: u8) {
+    let i = tid as usize;
+    if i >= SAVED_SP_LOG_CAP {
+        return;
+    }
+    let cpu = smp::cpu_id() as u8;
+    let ts32 = (crate::arch::timer::monotonic_ns() & 0xFFFF_FFFF) as u64;
+    let meta = (callsite_tag as u64) | ((cpu as u64) << 8) | (ts32 << 32);
+    SAVED_SP_LAST_VALUE[i].store(new_value, Ordering::Relaxed);
+    SAVED_SP_LAST_META[i].store(meta, Ordering::Relaxed);
+}
+
+/// Dump the last saved_sp write for `tid` (called from BUG: try_switch path).
+pub fn dump_saved_sp_log(tid: ThreadId) {
+    let i = tid as usize;
+    if i >= SAVED_SP_LOG_CAP {
+        return;
+    }
+    let value = SAVED_SP_LAST_VALUE[i].load(Ordering::Relaxed);
+    let meta = SAVED_SP_LAST_META[i].load(Ordering::Relaxed);
+    let tag = (meta & 0xFF) as u8;
+    let cpu = ((meta >> 8) & 0xFF) as u8;
+    let ts32 = (meta >> 32) as u32;
+    crate::println!(
+        "  SAVED-SP-LAST: tid={} value={:#x} tag={} cpu={} ts={}",
+        tid, value, tag, cpu, ts32,
+    );
+}
+
 /// #204 follow-on: kernel stack guard canary.
 ///
 /// Boots 568/569/570 with `validate_thread_canary` showed Thread struct
@@ -1874,6 +1929,7 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
     thread.quantum = quantum;
     thread.default_quantum = quantum;
     thread.saved_sp = frame_sp as u64;
+    record_saved_sp_write(id, frame_sp as u64, 1); // create_thread
     thread.stack_base = stack_base;
     thread.sig_mask = 0;
     thread.sig_pending = 0;
@@ -2163,6 +2219,7 @@ fn finalize_spawn(
     thread.quantum = quantum;
     thread.default_quantum = quantum;
     thread.saved_sp = frame_sp;
+    record_saved_sp_write(thread_id, frame_sp, 2); // spawn_user
     thread.stack_base = kstack_base;
     thread.sig_mask = 0;
     thread.sig_pending = 0;
@@ -2223,6 +2280,7 @@ fn create_thread_in_task(
     thread.quantum = quantum;
     thread.default_quantum = quantum;
     thread.saved_sp = frame_sp as u64;
+    record_saved_sp_write(id, frame_sp as u64, 3); // spawn_user variant
     thread.stack_base = kstack_base;
     thread.exit_code = 0;
     thread.sig_mask = 0;
@@ -3710,6 +3768,7 @@ fn try_switch(current_sp: u64) -> u64 {
     {
         let prev_t = unsafe { thread_mut_from_ref(prev_id) };
         prev_t.saved_sp = current_sp;
+        record_saved_sp_write(prev_id, current_sp, 4); // try_switch
         prev_t.saved_sp_source = 1; // try_switch
         let mut prev_prio = prev_t.effective_priority;
         prev_task = prev_t.task_id;
@@ -3938,6 +3997,8 @@ fn try_switch(current_sp: u64) -> u64 {
                 "BUG: try_switch: tid={} saved_sp={:#x} OUTSIDE kstack {:#x}..{:#x} (source={})",
                 next_id, sp, kbase, kend, next_t.saved_sp_source
             );
+            // #206: dump the last saved_sp writer to attribute the bad value.
+            dump_saved_sp_log(next_id);
             crate::println!(
                 "  prev={} next={} task={} state={:?}",
                 prev_id, next_id, next_t.task_id, next_t.state
@@ -4012,6 +4073,7 @@ pub fn voluntary_reschedule() {
     {
         let t = unsafe { thread_mut_from_ref(cur_id) };
         t.saved_sp = frame_sp;
+        record_saved_sp_write(cur_id, frame_sp, 5); // voluntary_reschedule
         t.saved_sp_source = 2; // voluntary_reschedule
         cur_prio = t.effective_priority;
         cur_task = t.task_id;
@@ -4312,6 +4374,7 @@ pub fn block_current(_reason: BlockReason) {
     // re-sync (line 5691) here too: re-establish the invariant before
     // returning that saved_sp == syscall_frame_sp.
     unsafe { thread_mut_from_ref(tid) }.saved_sp = tref.syscall_frame_sp;
+    record_saved_sp_write(tid, tref.syscall_frame_sp, 6); // resync clone-thread
     crate::arch::irq::restore(saved);
 }
 
@@ -5786,6 +5849,7 @@ pub fn fork_current() -> u64 {
     thread.quantum = parent_quantum;
     thread.default_quantum = parent_quantum;
     thread.saved_sp = child_frame_sp as u64;
+    record_saved_sp_write(child_tid, child_frame_sp as u64, 7); // fork
     thread.stack_base = kstack_base;
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
@@ -6022,6 +6086,7 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     thread.quantum = parent_quantum;
     thread.default_quantum = parent_quantum;
     thread.saved_sp = child_frame_sp as u64;
+    record_saved_sp_write(child_tid, child_frame_sp as u64, 8); // clone variant
     thread.stack_base = kstack_base;
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
@@ -6137,6 +6202,7 @@ pub fn clone_thread_in_task(
     thread.quantum = parent_quantum;
     thread.default_quantum = parent_quantum;
     thread.saved_sp = child_frame_sp as u64;
+    record_saved_sp_write(child_tid, child_frame_sp as u64, 9); // clone-third
     thread.stack_base = kstack_base;
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
@@ -6869,6 +6935,7 @@ pub fn pre_save_frame(tid: ThreadId) {
     let frame_sp = unsafe { thread_mut_from_ref(tid) }.syscall_frame_sp;
     let t = unsafe { thread_mut_from_ref(tid) };
     t.saved_sp = frame_sp;
+    record_saved_sp_write(tid, frame_sp, 10); // pre_save_frame
     t.saved_sp_source = 3; // pre_save_frame
     t.ipc_frame_sp = frame_sp;
     // Clear stale wakeup flag from a prior block_current iteration. Without
@@ -6919,6 +6986,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     // never touched by try_switch, so it always holds the correct value.
     let t = unsafe { thread_mut_from_ref(tid as ThreadId) };
     t.saved_sp = t.syscall_frame_sp;
+    record_saved_sp_write(tid as ThreadId, t.syscall_frame_sp, 11); // park_ipc
     t.saved_sp_source = 3; // park_ipc
     t.state = ThreadState::Blocked;
     t.blocked_on = reason;
@@ -8789,6 +8857,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     let thread = unsafe { thread_mut_from_ref(tid as ThreadId) };
     thread.sleep_deadline_ns = deadline_ns;
     thread.saved_sp = frame_sp;
+    record_saved_sp_write(tid as ThreadId, frame_sp, 12); // park_for_sleep
     thread.saved_sp_source = 5; // park_for_sleep
     thread.state = ThreadState::Blocked;
     thread.blocked_on = BlockReason::Sleep;
@@ -8961,6 +9030,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     {
         let sender = unsafe { thread_mut_from_ref(sender_tid as ThreadId) };
         sender.saved_sp = frame_sp;
+        record_saved_sp_write(sender_tid as ThreadId, frame_sp, 13); // direct-transfer sender
         sender_prio = sender.effective_priority;
         remaining_quantum = sender.quantum;
         sender_task = sender.task_id;
