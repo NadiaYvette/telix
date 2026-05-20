@@ -721,6 +721,43 @@ fn proc_lock(pi: usize) -> TicketSpinLockGuard<'static, ()> {
     debug_assert!(pi < MAX_PROCS);
     PROC_LOCKS[pi].lock()
 }
+
+// Phase B3 (linux_srv worker-pool, #185): coarse per-table locks.
+//
+// One TicketSpinLock per global table, sufficient to serialize
+// concurrent M:N worker-pool access (Phase 4).  Coarse because each
+// table is small and accesses are short; if contention becomes
+// visible we can split (e.g., per-instance locks like PROC_LOCKS).
+//
+// All UNUSED in this commit — call-site conversion is Phase B4.
+// Adding the locks here lets Phase 4 (spawn N workers) land without
+// blocking on the full B4 sweep, and keeps the diff trivially
+// reviewable.
+
+static EPOLL_LOCK:        TicketSpinLock<()> = TicketSpinLock::new(());
+static EVENTFD_LOCK:      TicketSpinLock<()> = TicketSpinLock::new(());
+static TIMERFD_LOCK:      TicketSpinLock<()> = TicketSpinLock::new(());
+static MEMFD_LOCK:        TicketSpinLock<()> = TicketSpinLock::new(());
+static PROCBUF_LOCK:      TicketSpinLock<()> = TicketSpinLock::new(());
+static DRM_LOCK:          TicketSpinLock<()> = TicketSpinLock::new(());
+static EVDEV_LOCK:        TicketSpinLock<()> = TicketSpinLock::new(());
+static FD_TRANSFER_LOCK:  TicketSpinLock<()> = TicketSpinLock::new(());
+static POLL_LOCK:         TicketSpinLock<()> = TicketSpinLock::new(());
+static FUTEX_LOCK:        TicketSpinLock<()> = TicketSpinLock::new(());
+static TRACE_PI_LOCK:     TicketSpinLock<()> = TicketSpinLock::new(());
+
+#[allow(dead_code)] fn epoll_lock()       -> TicketSpinLockGuard<'static, ()> { EPOLL_LOCK.lock() }
+#[allow(dead_code)] fn eventfd_lock()     -> TicketSpinLockGuard<'static, ()> { EVENTFD_LOCK.lock() }
+#[allow(dead_code)] fn timerfd_lock()     -> TicketSpinLockGuard<'static, ()> { TIMERFD_LOCK.lock() }
+#[allow(dead_code)] fn memfd_lock()       -> TicketSpinLockGuard<'static, ()> { MEMFD_LOCK.lock() }
+#[allow(dead_code)] fn procbuf_lock()     -> TicketSpinLockGuard<'static, ()> { PROCBUF_LOCK.lock() }
+#[allow(dead_code)] fn drm_lock()         -> TicketSpinLockGuard<'static, ()> { DRM_LOCK.lock() }
+#[allow(dead_code)] fn evdev_lock()       -> TicketSpinLockGuard<'static, ()> { EVDEV_LOCK.lock() }
+#[allow(dead_code)] fn fd_transfer_lock() -> TicketSpinLockGuard<'static, ()> { FD_TRANSFER_LOCK.lock() }
+#[allow(dead_code)] fn poll_lock()        -> TicketSpinLockGuard<'static, ()> { POLL_LOCK.lock() }
+#[allow(dead_code)] fn futex_lock()       -> TicketSpinLockGuard<'static, ()> { FUTEX_LOCK.lock() }
+#[allow(dead_code)] fn trace_pi_lock()    -> TicketSpinLockGuard<'static, ()> { TRACE_PI_LOCK.lock() }
+
 static mut VFS_PORT: u64 = 0;
 static mut REPLY_PORT: u64 = 0;
 
