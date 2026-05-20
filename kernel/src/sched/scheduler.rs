@@ -3767,6 +3767,34 @@ fn try_switch(current_sp: u64) -> u64 {
     let prev_task;
     {
         let prev_t = unsafe { thread_mut_from_ref(prev_id) };
+        // Probe #208: log idle's saved_sp writes.  Boot 582 caught
+        // idle.saved_sp pointing into executable code (frame[0..21] = real
+        // x86 instruction bytes) and into other threads' kstacks (BAD frame
+        // fires with src=1, tid=0).  Every (cpu, current_sp, in_kstack)
+        // tuple here helps attribute the exact moment the bad value lands
+        // — whether current_sp itself is bogus on entry, or prev_id is
+        // stale-pointing at idle while the real running thread is something
+        // else.  Rate-limited per CPU to avoid log flood.
+        if prev_id == idle_id_for_load {
+            static IDLE_SP_TRACE_COUNT: [core::sync::atomic::AtomicU32; 8] = {
+                const Z: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                [Z; 8]
+            };
+            if (cpu as usize) < IDLE_SP_TRACE_COUNT.len() {
+                let n = IDLE_SP_TRACE_COUNT[cpu as usize]
+                    .fetch_add(1, Ordering::Relaxed);
+                if n < 200 {
+                    let kbase = prev_t.stack_base;
+                    let kend = kbase as u64 + kstack_size() as u64;
+                    let in_kstack = (current_sp >= kbase as u64) && (current_sp < kend);
+                    crate::println!(
+                        "IDLE-SP-WRITE: cpu={} prev={} new_sp={:#x} idle_kstack=[{:#x}..{:#x}) in_kstack={} n={}",
+                        cpu, prev_id, current_sp, kbase, kend, in_kstack, n
+                    );
+                }
+            }
+        }
         prev_t.saved_sp = current_sp;
         record_saved_sp_write(prev_id, current_sp, 4); // try_switch
         prev_t.saved_sp_source = 1; // try_switch
