@@ -697,6 +697,30 @@ impl ProcessState {
 }
 
 static mut PROC_TABLE: [ProcessState; MAX_PROCS] = [const { ProcessState::empty() }; MAX_PROCS];
+
+// Phase B2 (linux_srv worker-pool, #184): parallel per-pi locks for
+// future M:N worker-pool serialization of PROC_TABLE[pi] accesses.
+//
+// Stored separately from ProcessState because ProcessState is
+// `#[derive(Clone, Copy)]` and embedding a lock with UnsafeCell would
+// break that (each copy of ProcessState would carry its own lock
+// instance — meaningless).
+//
+// Currently UNUSED — no callers added in this commit.  Phase B3 will
+// wrap PROC_TABLE[pi] accesses in `proc_lock(pi)` guards in batches
+// to keep diffs reviewable.  Single-threaded today, so the locks are
+// always uncontended; adding them is zero-overhead (one atomic
+// fetch_add, one acquire load comparing equal, two atomic stores
+// per critical section).
+use userlib::sync::{TicketSpinLock, TicketSpinLockGuard};
+static PROC_LOCKS: [TicketSpinLock<()>; MAX_PROCS] =
+    [const { TicketSpinLock::new(()) }; MAX_PROCS];
+
+#[allow(dead_code)]
+fn proc_lock(pi: usize) -> TicketSpinLockGuard<'static, ()> {
+    debug_assert!(pi < MAX_PROCS);
+    PROC_LOCKS[pi].lock()
+}
 static mut VFS_PORT: u64 = 0;
 static mut REPLY_PORT: u64 = 0;
 
