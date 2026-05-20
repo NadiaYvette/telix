@@ -19,27 +19,51 @@ real-world distro-shaped tools.
 ## One-time setup
 
 ```sh
-git clone https://github.com/rxrbln/t2sde ~/src/t2sde
+git clone --depth=1 https://github.com/rxrbln/t2sde ~/src/t2sde
 export TELIX_T2_HOME=~/src/t2sde
 tools/t2/sync-target.sh
+```
+
+The clone is ~17k files, ~200MB.  Build prereqs: gcc, make, ar, cpp,
+ncurses-devel.  Verify with:
+
+```sh
+which gcc make ar cpp && pkg-config --exists ncurses && echo prereqs-OK
 ```
 
 ## Per-build workflow
 
 ```sh
-# Inside the t2sde checkout, run the interactive config menu
-# and select Target → tlx-min, then build.
+# Inside the t2sde checkout: run the interactive ncurses config menu.
+# Pick: Target → "Telix minimal userspace ..." (our tlx-min target).
+# Architecture and other options can stay default for x86_64 host→target.
+# Press F2 / "Save" then exit.
 cd "$TELIX_T2_HOME"
-./t2 config --cfg telix-min
-./t2 build telix-min                 # ~30min-2hr first time
+./t2 config -cfg telix-min
+
+# Then kick the build (long-running; outputs into build/telix-min-*/).
+./t2 build -cfg telix-min            # ~30min-2hr first time
 
 # Back in the Telix tree
 cd /path/to/telix
+TELIX_T2_HOME=~/src/t2sde \
+TELIX_T2_BUILD=telix-min \
 tools/t2/install-into-initramfs.sh   # merges T2's rootfs into initramfs/
 tools/make-initramfs.sh              # rebuild the cpio
 tools/build-kernel.sh x86_64 --release
 tools/boot-h14.sh                    # boot Telix with the T2 userspace included
 ```
+
+## Why the config step is interactive
+
+T2's config TUI cascades from architecture → kernel → target → packages,
+each layer driving the next.  A non-interactive `-cfg` arg-mode exists
+for *updating* an already-populated config (e.g.
+`./t2 config -cfg telix-min target=tlx-min`) but it can't bootstrap a
+fresh one — the empty config file has no SDECFG_* lines for sed to
+edit, so the args silently no-op.  Bootstrap from empty requires the
+TUI.  Once `config/telix-min/config` is populated, args-mode can
+tweak it.
 
 ## Design choices baked into `targets/tlx-min/`
 
