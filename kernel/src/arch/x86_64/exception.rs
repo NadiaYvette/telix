@@ -319,7 +319,39 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         0 => exception_fault("Divide Error (#DE)", frame),
         1 => exception_fault("Debug (#DB)", frame),
         2 => exception_fault("NMI", frame),
-        3 => exception_fault("Breakpoint (#BP)", frame),
+        3 => {
+            // #BP (vector 3) from user mode is the Linux SIGTRAP path:
+            // glibc abort/assertion sequences emit INT 3 (0xCC) after
+            // writing the diagnostic message via sys_write.  Linux
+            // contract: deliver SIGTRAP to the user task.  Telix's
+            // minimum viable handling is to terminate with the
+            // SIGTRAP exit code, mirroring the user's clear intent
+            // to abort.  Future work: full signal-delivery so the
+            // task's installed SIGTRAP handler can run.
+            //
+            // From kernel mode, #BP is unexpected (debug placement,
+            // corrupted control flow) — fall through to the generic
+            // fault dump + panic.
+            //
+            // Pattern C (boots 547/550/556 deterministic) — see
+            // [[project-overnight-boot-patterns]] memory note.
+            let from_user = (frame.cs() & 3) == 3;
+            if from_user {
+                // Advance past the INT 3 (1 byte) so a hypothetical
+                // future signal handler would resume after the trap.
+                // Currently we exit the thread, so this is for
+                // diagnostic consistency only.
+                frame.set_rip(frame.rip() + 1);
+                crate::println!(
+                    "USER #BP (INT 3) at RIP={:#x} tid={} → exit SIGTRAP(5)",
+                    frame.rip() - 1,
+                    crate::sched::scheduler::current_thread_id(),
+                );
+                crate::sched::scheduler::exit_current_thread(-5);
+                // exit_current_thread is divergent; unreachable below.
+            }
+            exception_fault("Breakpoint (#BP)", frame)
+        }
         4 => exception_fault("Overflow (#OF)", frame),
         5 => exception_fault("Bound Range (#BR)", frame),
         6 => {

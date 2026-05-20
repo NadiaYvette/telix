@@ -76,7 +76,14 @@ pub fn init() {
         let idt = &mut *IDT.0.get();
         for i in 0..IDT_ENTRIES {
             let handler = __isr_stub_table[i];
-            let dpl3 = i == 0x80;
+            // DPL=3 (user-callable):
+            //   - 0x80: legacy int 0x80 syscall ABI
+            //   - 3 (#BP): user-mode INT 3 (0xCC) is the Linux SIGTRAP path.
+            //     glibc's abort/assertion sequences emit INT 3 after printing
+            //     the error message — without DPL=3 the CPU raises #GP(IDT3)
+            //     instead of delivering #BP to the kernel handler.
+            //     Pattern C (boots 547/550/556) was this exact symptom.
+            let dpl3 = i == 0x80 || i == 3;
             idt[i].set(handler, dpl3);
         }
         // Vector 8 (#DF) uses IST 1 → TSS.ist[0] so it gets a clean stack
