@@ -899,6 +899,18 @@ static mut BACKEND_REPLY_PORT: u64 = 0;
 static mut IRFS_REPLY_PORT: u64 = 0;
 static mut REPLY_DEFERRED: bool = false;
 
+// Phase B4 (linux_srv worker-pool, #186): N=2 syscall workers parked
+// on a dedicated port.  Main thread routes selected "worker-safe"
+// syscalls (pure / no PROC_TABLE access) here via send_nb_4 when
+// WORKERS_ENABLED is true.  Default false → workers stay idle and
+// dispatch is unchanged from today, so this commit is a no-op in
+// behavior.  Flipping the flag at boot or via a future runtime knob
+// exercises the M:N path; phase 5+ expands the subset and integrates
+// proc_lock(pi) for PROC_TABLE-touching syscalls.
+static mut SYSCALL_WORKER_PORT: u64 = 0;
+static WORKERS_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 const MAX_PENDING_ASYNC: usize = 64;
 
 #[derive(Copy, Clone)]
@@ -11943,6 +11955,60 @@ fn finish_stat_vfs(slot: usize, size: u64, mode: u64, ino: u64) {
     let _ = syscall::personality_reply(caller_port, 0);
 }
 
+/// Phase B4 (linux_srv worker-pool, #186) predicate: which Linux
+/// syscall numbers are safe to dispatch on a syscall worker thread.
+///
+/// Initial subset criteria: pure / no PROC_TABLE access / no global
+/// table access / never defers reply.  All handlers below either
+/// only read caller_port (handle_getid, handle_getppid), call a
+/// kernel syscall (yield, getrandom), or copy a small buffer out
+/// (uname, clock_*, gettimeofday) — none touch PROC_TABLE or any
+/// of the per-table globals locked in Phase B3.
+#[inline]
+fn is_worker_safe_syscall(linux_nr: u64) -> bool {
+    matches!(linux_nr,
+        __NR_GETPID | __NR_GETTID
+        | __NR_GETUID | __NR_GETEUID
+        | __NR_GETGID | __NR_GETEGID
+        | __NR_GETPPID
+        | __NR_SCHED_YIELD
+        | __NR_CLOCK_GETTIME | __NR_GETTIMEOFDAY | __NR_CLOCK_GETRES
+        | __NR_UNAME | __NR_GETRANDOM
+    )
+}
+
+/// Phase B4 (#186): syscall worker thread.  Parks on
+/// SYSCALL_WORKER_PORT and dispatches the worker-safe subset.  Multi-
+/// thread safe because the subset never touches PROC_TABLE or any
+/// other shared mutable state in linux_srv.  Phase 5+ will expand
+/// the subset, integrating proc_lock(pi) for PROC_TABLE-touching
+/// syscalls and the per-table locks (epoll_lock, futex_lock, ...) for
+/// table-touching ones.
+extern "C" fn syscall_worker_entry(_arg: u64) -> ! {
+    let port = unsafe { SYSCALL_WORKER_PORT };
+    loop {
+        let msg = match syscall::recv_with_cap(port) {
+            Some(m) => m,
+            None => continue,
+        };
+        let linux_nr = msg.tag & 0xFFFF_FFFF;
+        let caller_port = msg.tag >> 32;
+        let result = match linux_nr {
+            __NR_GETPID | __NR_GETTID | __NR_GETUID | __NR_GETEUID
+            | __NR_GETGID | __NR_GETEGID => handle_getid(linux_nr, caller_port),
+            __NR_GETPPID => handle_getppid(),
+            __NR_SCHED_YIELD => { syscall::yield_now(); 0 }
+            __NR_CLOCK_GETTIME => handle_clock_gettime(caller_port, &msg.data),
+            __NR_GETTIMEOFDAY => handle_gettimeofday(caller_port, &msg.data),
+            __NR_CLOCK_GETRES => handle_clock_getres(caller_port, &msg.data),
+            __NR_UNAME => handle_uname(caller_port, &msg.data),
+            __NR_GETRANDOM => handle_getrandom(caller_port, &msg.data),
+            _ => linux_err(ENOSYS), // main shouldn't forward unsafe nrs
+        };
+        let _ = syscall::personality_reply(caller_port, result);
+    }
+}
+
 /// Plan-A reply-thread entry: park on IRFS_REPLY_PORT and dispatch
 /// IRFS_IO_READ_REPLY notifications via finish_irfs_read_mmap /
 /// finish_irfs_read_fd.  These continuations don't write PROC_TABLE
@@ -13689,6 +13755,44 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     print_num(spawned as u64);
     syscall::debug_puts(b" threads\n");
 
+    // Phase B4 (#186): spawn syscall-worker pool.  N=2 matches the
+    // reply-thread pool's empirical sweet spot (boot-wallclock variance
+    // grows quickly with N).  Workers park on SYSCALL_WORKER_PORT;
+    // main routes selected syscalls (see is_worker_safe_syscall) via
+    // send_nb_4 when WORKERS_ENABLED is true.  Default flag is false,
+    // so this pool is idle out of the box — flipping the flag at boot
+    // or at runtime turns the M:N path on without rebuilding.
+    unsafe {
+        SYSCALL_WORKER_PORT = syscall::port_create();
+        let _ = syscall::port_resize(SYSCALL_WORKER_PORT, 64);
+    }
+    const N_SYSCALL_WORKERS: usize = 2;
+    const SYSCALL_WORKER_STACK_PAGES: usize = 8;
+    let mut sw_spawned = 0usize;
+    for i in 0..N_SYSCALL_WORKERS {
+        let stk = match syscall::mmap_anon(0, SYSCALL_WORKER_STACK_PAGES, 1) {
+            Some(v) => (v + SYSCALL_WORKER_STACK_PAGES * syscall::page_size()) as u64,
+            None => 0,
+        };
+        if stk == 0 {
+            syscall::debug_puts(b"[linux_srv] syscall-worker stack alloc FAIL\n");
+            break;
+        }
+        let tid = syscall::thread_create(syscall_worker_entry as u64, stk, i as u64);
+        if tid == u64::MAX {
+            syscall::debug_puts(b"[linux_srv] syscall-worker spawn FAIL\n");
+            break;
+        }
+        sw_spawned += 1;
+    }
+    syscall::debug_puts(b"[linux_srv] syscall-worker pool up: ");
+    print_num(sw_spawned as u64);
+    syscall::debug_puts(b" threads (enabled=");
+    syscall::debug_puts(
+        if WORKERS_ENABLED.load(core::sync::atomic::Ordering::Relaxed) { b"yes" } else { b"no" }
+    );
+    syscall::debug_puts(b")\n");
+
     // Eagerly set up the long-path scratch grant to VFS so the first openat()
     // for a >16-byte path doesn't race with vfs_task ns publication.
     if !ensure_lin_path_scratch() {
@@ -13921,6 +14025,28 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
 
         let linux_nr = msg.tag & 0xFFFF_FFFF;
         let caller_port = msg.tag >> 32;
+
+        // Phase B4 (#186): if workers are enabled and this nr is in the
+        // worker-safe subset, forward via send_nb_4 and skip inline
+        // dispatch.  The worker thread replies directly to caller_port.
+        // send_nb_4 returns 0 on success; nonzero (queue full, etc.)
+        // falls through to inline handling for graceful degradation.
+        if WORKERS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+            && is_worker_safe_syscall(linux_nr)
+        {
+            let sent = syscall::send_nb_4(
+                unsafe { SYSCALL_WORKER_PORT },
+                msg.tag,
+                msg.data[0],
+                msg.data[1],
+                msg.data[2],
+                msg.data[3],
+            );
+            if sent == 0 {
+                continue;
+            }
+            // Forward failed; fall through to inline path.
+        }
 
         // Resolve per-process state index.
         let pi = match get_or_init_proc(caller_port) {
