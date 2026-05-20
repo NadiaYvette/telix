@@ -3659,6 +3659,7 @@ fn finish_irfs_read_mmap(slot: usize, bytes_read: u64) {
         let info = PENDING_ASYNC[slot];
         let caller = info.caller_task_port;
         let pi = info.pi;
+        let _g = proc_lock(pi); // B5b: serialize PROC_TABLE[pi] mutation with main dispatch
         let fd_idx = info.listen_fd;
 
         let fd_dead = fd_idx >= MAX_FDS
@@ -3901,6 +3902,7 @@ fn finish_irfs_read_fd(slot: usize, bytes_read: u64) {
 
         let caller = info.caller_task_port;
         let pi = info.pi;
+        let _g = proc_lock(pi); // B5b: serialize PROC_TABLE[pi] mutation with main dispatch
         let fd_idx = info.listen_fd;
         let len = (bytes_read as usize).min(info.buf_len);
 
@@ -11546,6 +11548,7 @@ fn finish_accept_unix(slot: usize, srv_end: u64) {
         let info = PENDING_ASYNC[slot];
         async_free_slot(slot);
         let pi = info.pi;
+        let _g = proc_lock(pi); // B5b: serialize PROC_TABLE[pi] mutation with main dispatch
         let listen_fd = info.listen_fd;
         let caller = info.caller_task_port;
 
@@ -11810,6 +11813,7 @@ fn finish_connect_initramfs(slot: usize, handle: u64, size: u64) {
         let s = &PENDING_ASYNC[slot];
         (s.pi, s.caller_task_port, s.flags)
     };
+    let _g = proc_lock(pi); // B5b: serialize PROC_TABLE[pi] mutation with main dispatch
     // Reconstruct the original name for NAME_CACHE insertion.
     let (name_buf, name_len) = unpack_irfs_name(slot);
     async_free_slot(slot);
@@ -11859,6 +11863,7 @@ fn finish_open_vfs(slot: usize, fs_port: u64, handle: u64, file_size: u64) {
         let s = &PENDING_ASYNC[slot];
         (s.pi, s.caller_task_port, s.flags)
     };
+    let _g = proc_lock(pi); // B5b: serialize PROC_TABLE[pi] mutation with main dispatch
     let (path_buf, pathlen) = unpack_irfs_name(slot);
     async_free_slot(slot);
 
