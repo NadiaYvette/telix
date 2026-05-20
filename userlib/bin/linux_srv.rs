@@ -9180,6 +9180,7 @@ fn evdev_set_bit(buf: &mut [u8], n: usize) {
 
 /// Handle evdev ioctls. `dev` = 0 for keyboard, 1 for mouse.
 fn handle_evdev_ioctl(dev: usize, caller_port: u64, request: u64, arg_va: usize) -> u64 {
+    let _g = evdev_lock(); // B5c: serialize EVDEV_STATE/EVDEV_*_RING under M:N workers
     if !evdev_ensure_init() { return linux_err(ENODEV); }
 
     // Match on low 16 bits to handle variable size encoding in EVIOCGBIT.
@@ -9810,6 +9811,7 @@ fn drm_ioctl_page_flip(caller_port: u64, arg_va: usize) -> u64 {
 
 /// Top-level DRM ioctl dispatcher.
 fn handle_drm_ioctl(caller_port: u64, request: u64, arg_va: usize) -> u64 {
+    let _g = drm_lock(); // B5c: serialize DRM_STATE/DRM_DUMB_TABLE/DRM_FB_TABLE under M:N workers
     if !drm_ensure_init() { return linux_err(ENODEV); }
     match request {
         DRM_IOCTL_VERSION => drm_ioctl_version(caller_port, arg_va),
@@ -10007,6 +10009,7 @@ fn handle_nanosleep(caller_port: u64, args: &[u64; 6]) -> u64 {
 /// Handle Linux poll(fds, nfds, timeout) — basic stub.
 /// Returns 0 (timeout) for non-zero timeouts, or nfds with POLLNVAL for unknown fds.
 fn handle_poll(pi: usize, caller_port: u64, args: &[u64; 6], is_ppoll: bool) -> u64 {
+    let _g = poll_lock(); // B5c: serialize POLL_TABLE under M:N workers
     let fds_va = args[0] as usize;
     let nfds = args[1] as usize;
     // poll: args[2] is i32 timeout_ms (-1 = infinite, 0 = poll, >0 = ms).
@@ -10141,6 +10144,7 @@ fn poll_check_ready(pi: usize, buf: &mut [u8]) -> u32 {
 /// that have an fd ready or whose deadline has passed.  Called once
 /// per dispatch loop iteration, just like expire_futex_waiters.
 fn expire_poll_waiters() {
+    let _g = poll_lock(); // B5c: serialize POLL_TABLE under M:N workers
     // Quick presence check.
     let mut any_active = false;
     unsafe {
@@ -10185,6 +10189,7 @@ fn expire_poll_waiters() {
 
 /// Handle Linux select(nfds, readfds, writefds, exceptfds, timeout) and pselect6.
 fn handle_select(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let _g = poll_lock(); // B5c: serialize POLL_TABLE under M:N workers (select shares POLL)
     let nfds = (args[0] as usize).min(MAX_FDS);
     let readfds_va = args[1] as usize;
     let writefds_va = args[2] as usize;
@@ -10314,6 +10319,7 @@ fn handle_prctl(args: &[u64; 6]) -> u64 {
 /// Stub: FUTEX_WAIT yields, FUTEX_WAKE returns 0.
 /// Handle futex. Returns None to defer reply (WAIT queued), Some(val) for immediate reply.
 fn handle_futex(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
+    let _g = futex_lock(); // B5c: serialize FUTEX_TABLE under M:N workers
     let uaddr = args[0];
     let op = args[1] & 0x7F; // Mask out FUTEX_PRIVATE_FLAG
     let val = args[2];
@@ -10429,6 +10435,7 @@ fn handle_futex(pi: usize, caller_port: u64, args: &[u64; 6]) -> Option<u64> {
 
 /// Expire timed-out futex waiters. Call once per main loop iteration.
 fn expire_futex_waiters() {
+    let _g = futex_lock(); // B5c: serialize FUTEX_TABLE under M:N workers
     // Quick scan: any active waiters with deadlines?
     let mut has_deadlines = false;
     unsafe {
@@ -13094,6 +13101,7 @@ fn epoll_notify_local_fd(pi: usize, fd: usize, revents: u32) {
 
 /// Handle epoll_create(size) / epoll_create1(flags).
 fn handle_epoll_create1(pi: usize, flags: u64) -> u64 {
+    let _g = epoll_lock(); // B5c: serialize EPOLL_TABLE under M:N workers
     // Allocate an epoll instance.
     let ep_idx = unsafe {
         let mut found = None;
@@ -13134,6 +13142,7 @@ fn handle_epoll_create1(pi: usize, flags: u64) -> u64 {
 
 /// Handle epoll_ctl(epfd, op, fd, event_ptr).
 fn handle_epoll_ctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let _g = epoll_lock(); // B5c: serialize EPOLL_TABLE under M:N workers
     let epfd = args[0] as usize;
     let op = args[1];
     let target_fd = args[2] as usize;
@@ -13228,6 +13237,7 @@ fn handle_epoll_ctl(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 /// Handle epoll_wait(epfd, events, maxevents, timeout).
 /// Uses port-set-based blocking instead of busy-loop polling.
 fn handle_epoll_wait(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let _g = epoll_lock(); // B5c: serialize EPOLL_TABLE under M:N workers
     let epfd = args[0] as usize;
     let events_va = args[1] as usize;
     let maxevents = args[2] as usize;
@@ -13390,6 +13400,7 @@ fn check_timerfd_expiry(idx: usize) {
 
 /// eventfd2(initval, flags)
 fn handle_eventfd2(pi: usize, args: &[u64; 6]) -> u64 {
+    let _g = eventfd_lock(); // B5c: serialize EVENTFD_TABLE under M:N workers
     let initval = args[0] as u32;
     let flags = args[1] as u32;
 
@@ -13439,6 +13450,7 @@ fn handle_eventfd2(pi: usize, args: &[u64; 6]) -> u64 {
 
 /// timerfd_create(clockid, flags)
 fn handle_timerfd_create(pi: usize, _args: &[u64; 6]) -> u64 {
+    let _g = timerfd_lock(); // B5c: serialize TIMERFD_TABLE under M:N workers
     // Allocate table slot.
     let slot_idx = unsafe {
         let mut found = None;
@@ -13486,6 +13498,7 @@ fn handle_timerfd_create(pi: usize, _args: &[u64; 6]) -> u64 {
 /// new_value points to struct itimerspec { timespec it_interval; timespec it_value; }
 /// Each timespec is { i64 tv_sec, i64 tv_nsec } = 16 bytes. Total 32 bytes.
 fn handle_timerfd_settime(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let _g = timerfd_lock(); // B5c: serialize TIMERFD_TABLE under M:N workers
     let fd = args[0] as usize;
     let _flags = args[1]; // TFD_TIMER_ABSTIME etc. — ignored for now (relative only)
     let new_va = args[2] as usize;
@@ -13531,6 +13544,7 @@ fn handle_timerfd_settime(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
 /// timerfd_gettime(fd, curr_value)
 fn handle_timerfd_gettime(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
+    let _g = timerfd_lock(); // B5c: serialize TIMERFD_TABLE under M:N workers
     let fd = args[0] as usize;
     let curr_va = args[1] as usize;
 
@@ -13574,6 +13588,7 @@ fn handle_timerfd_gettime(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
 
 /// memfd_create(name, flags) — NR 319
 fn handle_memfd_create(pi: usize, _caller_port: u64, args: &[u64; 6]) -> u64 {
+    let _g = memfd_lock(); // B5c: serialize MEMFD_TABLE under M:N workers
     let flags = args[1];
 
     // Allocate table slot.
