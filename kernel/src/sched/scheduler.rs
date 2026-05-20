@@ -240,6 +240,83 @@ pub fn validate_thread_canary(tid: ThreadId, callsite: &str) -> bool {
     true
 }
 
+/// #204 follow-on: kernel stack guard canary.
+///
+/// Boots 568/569/570 with `validate_thread_canary` showed Thread struct
+/// fields stay clean even when corruption fires (RIP=0x3 → ret popped
+/// 3 from stack).  The corruption is in the kernel stack itself, NOT
+/// the Thread struct.  This canary catches stack underflow: a known
+/// 16-byte magic at the BOTTOM of each kstack (lowest address).  Stack
+/// grows down — overflow writes past stack_base — canary gets clobbered
+/// first.
+///
+/// Limitation: catches GRADUAL overflow.  A single large `sub $N, %rsp`
+/// frame allocation that jumps past the bottom would miss the canary
+/// (writes land below stack_base in adjacent physical memory).  Future
+/// upgrade = guard pages with PROT_NONE.
+const STACK_CANARY_LO: u64 = 0xCAFEBEEFDEADBEEFu64;
+const STACK_CANARY_HI: u64 = 0xFEEDFACEBADC0FFEu64;
+
+#[inline]
+pub fn init_stack_canary(stack_base: usize) {
+    if stack_base == 0 {
+        return;
+    }
+    unsafe {
+        let p = stack_base as *mut u64;
+        p.write_volatile(STACK_CANARY_LO);
+        p.add(1).write_volatile(STACK_CANARY_HI);
+    }
+}
+
+#[inline]
+pub fn check_stack_canary(tid: ThreadId, callsite: &str) -> bool {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static FAIL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    let t = thread_ref(tid);
+    let sb = t.stack_base;
+    if sb == 0 {
+        return false; // idle / dead thread, no canary
+    }
+    // Sanity: stack_base must be canonical-low and reasonable.
+    if sb < 0x10000 || sb >= 0x0000_8000_0000_0000 {
+        let n = FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 8 {
+            crate::println!(
+                "STACK-CANARY-FAIL @{}: tid={} stack_base={:#x} OUT-OF-RANGE (n={})",
+                callsite, tid, sb, n + 1,
+            );
+        }
+        return true;
+    }
+    let (lo, hi) = unsafe {
+        let p = sb as *const u64;
+        (p.read_volatile(), p.add(1).read_volatile())
+    };
+    if lo == STACK_CANARY_LO && hi == STACK_CANARY_HI {
+        return false;
+    }
+    let n = FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        crate::println!(
+            "STACK-CANARY-FAIL @{}: tid={} stack_base={:#x} got lo={:#x} hi={:#x} (expect lo={:#x} hi={:#x}) (n={})",
+            callsite, tid, sb, lo, hi, STACK_CANARY_LO, STACK_CANARY_HI, n + 1,
+        );
+        // Read current RSP via inline asm to see how close it is to overflow.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let rsp: u64;
+            core::arch::asm!("mov %rsp, {0}", out(reg) rsp, options(att_syntax, nostack, preserves_flags));
+            crate::println!(
+                "  current_rsp={:#x} stack_top={:#x} headroom={}",
+                rsp, sb + kstack_size(), (rsp as usize).saturating_sub(sb),
+            );
+        }
+    }
+    true
+}
+
 /// on_cpu sentinel (unused — kept for documentation):
 /// Old sentinel for threads in deferred-requeue slots. Removed because leaving
 /// on_cpu at the CPU number and using a CAS-from-cpu in drain is simpler and
@@ -1594,6 +1671,7 @@ fn sched_init() {
     // Without this, stack_base defaults to 0 and RSP0 = 0 + kstack_size(),
     // causing interrupts on the idle CPU to corrupt low memory.
     let bsp_kstack = crate::mm::phys::alloc_pages(KSTACK_ORDER).expect("thread 0 kstack");
+    init_stack_canary(bsp_kstack.as_usize());
     unsafe {
         (*thread_ptr).id = 0;
         (*thread_ptr).state = ThreadState::Running;
@@ -1626,6 +1704,7 @@ fn create_idle_thread() -> Option<ThreadId> {
     // Allocate a proper kernel stack so update_kernel_stack() sets correct
     // TSS RSP0 when switching to this idle thread.
     let idle_kstack = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
+    init_stack_canary(idle_kstack.as_usize());
     unsafe {
         (*ptr).id = id;
         (*ptr).state = ThreadState::Running;
@@ -1758,6 +1837,7 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
 
     let stack_page = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
     let stack_base = stack_page.as_usize();
+    init_stack_canary(stack_base);
     let stack_top = stack_base + kstack_size();
 
     // Create a fake exception frame at the top of the stack.
@@ -1944,6 +2024,7 @@ fn do_spawn_heavy_work(
     // Allocate kernel stack for this thread.
     let kstack_page = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
     let kstack_base = kstack_page.as_usize();
+    init_stack_canary(kstack_base);
     let kstack_top = kstack_base + kstack_size();
 
     // Build a fake exception frame for user-mode entry.
@@ -2109,6 +2190,7 @@ fn create_thread_in_task(
 
     let kstack_page = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
     let kstack_base = kstack_page.as_usize();
+    init_stack_canary(kstack_base);
     let kstack_top = kstack_base + kstack_size();
 
     let frame_sp = kstack_top - EXCEPTION_FRAME_SIZE;
@@ -3845,6 +3927,10 @@ fn try_switch(current_sp: u64) -> u64 {
         // (existing check) or spread across the whole Thread struct
         // (canary check covers id, state, src, on_cpu).
         validate_thread_canary(next_id, "try_switch.next");
+        // #205 stack guard canary — catches kernel stack overflow on
+        // the thread we're switching into.  If clobbered, we've
+        // localized the corruption to writes near stack_base.
+        check_stack_canary(next_id, "try_switch.next");
         // Idle threads run on boot stacks (ring 0), not their allocated kstack.
         // Their saved_sp is legitimately outside the kstack range — skip the check.
         if !is_idle && (sp < kbase as u64 || sp >= kend) {
@@ -5644,6 +5730,7 @@ pub fn fork_current() -> u64 {
         None => return u64::MAX,
     };
     let kstack_base = kstack_page.as_usize();
+    init_stack_canary(kstack_base);
     let kstack_top = kstack_base + kstack_size();
 
     // Copy parent's exception frame to child's kernel stack.
@@ -5881,6 +5968,7 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
         None => return u64::MAX,
     };
     let kstack_base = kstack_page.as_usize();
+    init_stack_canary(kstack_base);
     let kstack_top = kstack_base + kstack_size();
 
     // Copy target's exception frame to child's kernel stack.
@@ -5991,6 +6079,7 @@ pub fn clone_thread_in_task(
         None => return u64::MAX,
     };
     let kstack_base = kstack_page.as_usize();
+    init_stack_canary(kstack_base);
     let kstack_top = kstack_base + kstack_size();
 
     // Copy parent's exception frame to the new thread's kernel stack.
@@ -6819,6 +6908,9 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     // #204 probe: validate Thread struct on park entry — catches
     // corruption that happened during the thread's last quantum.
     validate_thread_canary(tid as ThreadId, "park_ipc.entry");
+    // #205 probe: check kernel stack guard canary.  If overflowed,
+    // catches the corruption from project_ts_inv_is_thread_corruption.
+    check_stack_canary(tid as ThreadId, "park_ipc.entry");
 
     // Re-assign saved_sp from syscall_frame_sp. pre_save_frame set it
     // earlier, but try_switch may have overwritten saved_sp if a timer
@@ -7023,6 +7115,8 @@ pub fn wake_parked_thread(tid: ThreadId) {
     // catches corruption between the time the parker set up its state
     // and the waker reaches it.
     validate_thread_canary(tid, "wake_parked.entry");
+    // #205 stack guard canary on wake target.
+    check_stack_canary(tid, "wake_parked.entry");
 
     // Boot 553 #196 sweep: defensive turnstile cleanup.  Most callers
     // (port_dequeue_one in wake_recv_waiter, DirectTransfer in
