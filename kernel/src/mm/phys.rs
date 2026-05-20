@@ -1159,6 +1159,17 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                 // chunk_free_one bumped fc (or chunk_alloc_one ran any
                 // bitmap-mode path that re-CAS'd the node).
                 let mut state_updated = false;
+                // #155 with-bp accounting: when the bitmap→inline
+                // transition succeeds AND bp fits in the inline indices,
+                // the bp page reclassifies from "metadata (excluded
+                // from global+fc)" to "free (counted in global+fc)".
+                // Chunk fc effectively goes X → new_fc + 1, while we
+                // allocated `need` pages.  Global must dec by
+                // `allocated - 1` (mirrors chunk_alloc_one's "net 0"
+                // rationale).  Boot 99amfsq546 surfaced drift=-5 from 5
+                // such transitions where the prior code dec'd global by
+                // `allocated` flat — leak direction.
+                let mut transitioned_with_bp = false;
                 if new_fc <= INLINE_K && new_fc > 0 {
                     let mut indices = [0u32; INLINE_K as usize];
                     let mut count = 0u32;
@@ -1169,7 +1180,8 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                         b &= !(1u64 << idx);
                         count += 1;
                     }
-                    if count < INLINE_K {
+                    let with_bp = count < INLINE_K;
+                    if with_bp {
                         indices[count as usize] = bp;
                         count += 1;
                     }
@@ -1180,6 +1192,7 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                         .is_ok()
                     {
                         state_updated = true;
+                        transitioned_with_bp = with_bp;
                     }
                 } else if new_fc == 0 {
                     if ALLOC
@@ -1233,7 +1246,18 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                     }
                 }
 
-                ALLOC.free_count_global.fetch_sub(allocated as usize, Ordering::Relaxed);
+                // With-bp transition reclassifies bp page from metadata
+                // to free; net global change is `-(allocated - 1)`.
+                // Without with-bp transition (no-bp transition, plain fc
+                // update, or retry-loop fallback): net change is `-allocated`.
+                let global_dec = if transitioned_with_bp {
+                    allocated - 1
+                } else {
+                    allocated
+                };
+                ALLOC
+                    .free_count_global
+                    .fetch_sub(global_dec as usize, Ordering::Relaxed);
                 return Some(PhysAddr::new(page_pa(ci, start_bit as u32)));
             }
         }
