@@ -12,6 +12,7 @@ SECTIONS {
     .text : ALIGN(4K) {
         KEEP(*(.text.boot))
         *(.text .text.*)
+        __text_end = .;
     }
 
     .rodata : ALIGN(4K) {

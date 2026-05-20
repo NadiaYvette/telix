@@ -302,7 +302,15 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
     // the old check by having CS=0x08 with a userspace-ish RIP like 0x9fc42
     // (truncated from 0x10009fc42) — they iretq'd to a non-kernel-text RIP
     // in kernel mode and #UD'd on instruction fetch.
-    let bad_kernel_rip = cs == 0x08 && !(rip >= 0x101000 && rip < 0x1ac1be);
+    // Use linker-provided __text_end (set in linker.ld at end of .text)
+    // so the bound tracks kernel size across builds.  Earlier hardcoded
+    // 0x1ac1be was too tight: boot 586 caught RIP=0x1ac1d9 in compiler
+    // memset (rep stos) past the nominal section end — false positive.
+    unsafe extern "C" {
+        static __text_end: u8;
+    }
+    let text_end = unsafe { &__text_end as *const _ as u64 };
+    let bad_kernel_rip = cs == 0x08 && !(rip >= 0x101000 && rip < text_end);
     let bad_user_rip = cs == 0x23 && {
         let hi = rip >> 32;
         !(hi == 0x1 || hi == 0x2 || hi == 0x4)
