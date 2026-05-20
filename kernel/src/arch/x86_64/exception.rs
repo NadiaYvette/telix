@@ -255,9 +255,25 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
     let f = unsafe { &*(sp as *const ExceptionFrame) };
     let cs = f.cs();
     let ss = f.ss();
+    let rip = f.rip();
     let bad_cs = cs != 0x08 && cs != 0x23;
     let bad_ss = ss != 0x00 && ss != 0x10 && ss != 0x1B;
-    if bad_cs || bad_ss {
+    // Tightened RIP check (chasing #UD corruption family, task #208):
+    // for kernel-mode iretq (CS=0x08), RIP must be in kernel
+    // .text range (0x101000–0x1ac1be) because there's no other place kernel
+    // execution belongs.  For user iretq (CS=0x23), RIP must be in the
+    // user-binary range (top 32 bits in {0x1, 0x2, 0x4}) because all
+    // userspace binaries load at 0x100000000+ and Linux personality stacks
+    // map at 0x200000000+ / 0x400000000+.  Boots 575/576/578 slipped past
+    // the old check by having CS=0x08 with a userspace-ish RIP like 0x9fc42
+    // (truncated from 0x10009fc42) — they iretq'd to a non-kernel-text RIP
+    // in kernel mode and #UD'd on instruction fetch.
+    let bad_kernel_rip = cs == 0x08 && !(rip >= 0x101000 && rip < 0x1ac1be);
+    let bad_user_rip = cs == 0x23 && {
+        let hi = rip >> 32;
+        !(hi == 0x1 || hi == 0x2 || hi == 0x4)
+    };
+    if bad_cs || bad_ss || bad_kernel_rip || bad_user_rip {
         let tid = crate::sched::scheduler::current_thread_id();
         let tref = crate::sched::scheduler::thread_ref(tid);
         let cur_cpu = crate::sched::smp::cpu_id();
@@ -858,6 +874,58 @@ fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
         frame.rflags(),
         frame.ss()
     );
+    // Kernel-fault stack dump: 16 quads from RSP.  At #UD time, an indirect
+    // call through a corrupted function pointer has just pushed its return
+    // address (the instruction after the bad `call *reg`) to [RSP], then
+    // jumped to the bad target — which faults here.  So [RSP] reveals the
+    // call site that dispatched to RIP={0,3,7,…}.  Bounds-check RSP first
+    // because reads through a bogus pointer would triple-fault.
+    if !is_user {
+        let rsp = frame.rsp();
+        if rsp != 0 && (rsp & 7) == 0 && rsp < 0x8000_0000 {
+            let mut sw = [0u64; 16];
+            unsafe {
+                for i in 0..16 {
+                    let p = rsp.wrapping_add((i * 8) as u64) as *const u64;
+                    sw[i] = core::ptr::read_volatile(p);
+                }
+            }
+            for row in 0..2 {
+                let b = row * 8;
+                crate::println!(
+                    "  KSTACK[{}..{}]@RSP+{:#x}: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                    b, b + 8, (b * 8) as u64,
+                    sw[b], sw[b+1], sw[b+2], sw[b+3],
+                    sw[b+4], sw[b+5], sw[b+6], sw[b+7]
+                );
+            }
+            // Also walk the RBP chain if RBP is sane.  Each frame layout
+            // (SysV AMD64): [RBP] = caller RBP, [RBP+8] = caller RIP.
+            let mut rbp = frame.rbp();
+            for f in 0..6 {
+                if rbp < 0x1000 || (rbp & 7) != 0 || rbp >= 0x8000_0000 {
+                    break;
+                }
+                let saved_rbp = unsafe { core::ptr::read_volatile(rbp as *const u64) };
+                let saved_rip = unsafe {
+                    core::ptr::read_volatile(rbp.wrapping_add(8) as *const u64)
+                };
+                crate::println!(
+                    "  KFRAME[{}]: rbp={:#x} caller_rip={:#x}",
+                    f, saved_rbp, saved_rip
+                );
+                if saved_rbp == 0 || saved_rbp <= rbp {
+                    break;
+                }
+                rbp = saved_rbp;
+            }
+        } else {
+            crate::println!(
+                "  KSTACK skipped: RSP={:#x} out of kernel range / misaligned",
+                rsp
+            );
+        }
+    }
     if is_user {
         // Tier-3 core dump: emit machine-readable register +
         // stack-page block to the debug log.  Host script
