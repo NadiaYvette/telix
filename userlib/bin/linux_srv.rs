@@ -14057,6 +14057,18 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
             }
         };
 
+        // Phase B5 (linux_srv worker-pool, #185-#186): take the per-process
+        // lock for the duration of this dispatch iteration.  Serializes
+        // concurrent syscalls from the same pi (worker threads + main
+        // thread + any future forks of this work) so each handler sees
+        // PROC_TABLE[pi] in a consistent state.  Different pi remain
+        // parallel (workers process other pi concurrently while we hold
+        // this guard).  Dropped automatically at the end of the loop
+        // iteration — whether the body falls through, `continue`s, or
+        // a deferred-reply handler returns: the guard's scope is the
+        // loop body.
+        let _proc_guard = proc_lock(pi);
+
         // Phase 172 EFAULT trace: dump every syscall from the target pi.
         // Extended with path-arg decode for syscalls that take a path —
         // gives visibility into what xeyes actually reads/probes during
