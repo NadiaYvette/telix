@@ -1,0 +1,23 @@
+# --- T2-COPYRIGHT-BEGIN ---
+# t2/target/tlx-min/config.in
+# Copyright (C) 2026 The Telix Project
+# SPDX-License-Identifier: GPL-2.0
+# --- T2-COPYRIGHT-END ---
+
+#Description: Telix minimal userspace (kernel-less, glibc, busybox)
+
+# Telix supplies the kernel.  T2 builds only the userspace.
+# Mirrors T2's `embedded-minimal` shape but with glibc instead of
+# uClibc, since Telix's Linux personality has the best coverage for
+# glibc (per project_phase171_gap_a memory note).  Switch to "musl"
+# if glibc's __intl_freemem exit-path issue keeps biting.
+
+SDECFGSET_INIT='busybox'
+SDECFGSET_OPT='size'
+SDECFGSET_DO_REBUILD_STAGE=0
+# Same-arch native build is faster than cross.  Toggle CROSSBUILD=1
+# when targeting a different arch than the build host (e.g. aarch64
+# from x86_64).
+SDECFGSET_CROSSBUILD=0
+SDECFGSET_DISABLE_NLS=1
+SDECFGSET_LIBC="glibc"
