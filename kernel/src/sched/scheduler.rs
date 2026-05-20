@@ -163,6 +163,83 @@ pub fn record_trans(tid: u32, action: u8, state: ThreadState, on_cpu: u32) {
     t.trans_ring[pos].store(entry, Ordering::Relaxed);
 }
 
+/// #203 (Thread struct corruption probe — 2026-05-20).
+///
+/// Validate that a Thread struct's stable fields hold sane values.
+/// Catches the corruption family that boot 563 captured: saved_sp set
+/// to BIOS-region 32-bit-repeating garbage (`0xf000ff53f000ff53`),
+/// saved_sp_source=255 (out of valid 0-5 range).
+///
+/// Called at key entry points (park_current_for_ipc, try_switch,
+/// wake_parked_thread) — fires CLOSER to the time of corruption than
+/// the existing BUG: park_ipc check, which only fires when the
+/// outgoing thread switches IN to a corrupted thread state.
+///
+/// Logs to serial only (non-fatal) — boot continues so we can correlate
+/// with downstream symptoms (TS-INVARIANT-FAIL, kernel #GP/#UD, etc.).
+/// Rate-limited to first 8 fires across all callers (atomic counter).
+///
+/// Returns true if any anomaly was detected.
+#[inline]
+pub fn validate_thread_canary(tid: ThreadId, callsite: &str) -> bool {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static FAIL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    if tid == 0 {
+        return false; // idle thread — skip
+    }
+    let t = thread_ref(tid);
+
+    let id_ok = t.id == tid;
+    let src = t.saved_sp_source;
+    let src_ok = src <= 5;
+    let state_byte = t.state as u8;
+    let state_ok = state_byte <= 7;
+    let on = t.on_cpu.load(Ordering::Relaxed);
+    let ncpus = smp::num_cpus() as u32;
+    let on_ok = on < ncpus || on == ON_CPU_PENDING || on == u32::MAX;
+    let stack_ok = t.stack_base != 0 || tid == 0;
+
+    if id_ok && src_ok && state_ok && on_ok && stack_ok {
+        return false;
+    }
+
+    let n = FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        crate::println!(
+            "THREAD-CANARY-FAIL @{}: tid={} (n={})",
+            callsite, tid, n + 1,
+        );
+        crate::println!(
+            "  id={} (expect={}) state={} src={} on_cpu={:#x} stack_base={:#x} task_id={}",
+            t.id, tid, state_byte, src, on, t.stack_base, t.task_id,
+        );
+        crate::println!(
+            "  saved_sp={:#x} ipc_frame_sp={:#x} syscall_frame_sp={:#x}",
+            t.saved_sp, t.ipc_frame_sp, t.syscall_frame_sp,
+        );
+        // Dump trans_ring (last 4 transitions).
+        let next_pos = t.trans_pos.load(Ordering::Relaxed) as usize;
+        for i in 0..4usize {
+            let slot = (next_pos + i) & 3;
+            let entry = t.trans_ring[slot].load(Ordering::Relaxed);
+            if entry == 0 {
+                continue;
+            }
+            let action = (entry & 0xFF) as u8;
+            let cpu_e = ((entry >> 8) & 0xFF) as u8;
+            let st_e = ((entry >> 16) & 0xFF) as u8;
+            let on_e = ((entry >> 24) & 0xFF) as u8;
+            let ts = (entry >> 32) as u32;
+            crate::println!(
+                "  TRANS[{}]: act={} cpu={} st={} on={} ts={}",
+                i, action, cpu_e, st_e, on_e, ts,
+            );
+        }
+    }
+    true
+}
+
 /// on_cpu sentinel (unused — kept for documentation):
 /// Old sentinel for threads in deferred-requeue slots. Removed because leaving
 /// on_cpu at the CPU number and using a CAS-from-cpu in drain is simpler and
@@ -3762,6 +3839,12 @@ fn try_switch(current_sp: u64) -> u64 {
         let kbase = next_t.stack_base;
         let kend = kbase as u64 + kstack_size() as u64;
         let is_idle = next_id == idle_id;
+        // #204 probe: validate next_t at switch-in.  Fires CONCURRENTLY
+        // with the BUG: try_switch check below — its job is to confirm
+        // whether the corruption is isolated to saved_sp/stack_base
+        // (existing check) or spread across the whole Thread struct
+        // (canary check covers id, state, src, on_cpu).
+        validate_thread_canary(next_id, "try_switch.next");
         // Idle threads run on boot stacks (ring 0), not their allocated kstack.
         // Their saved_sp is legitimately outside the kstack range — skip the check.
         if !is_idle && (sp < kbase as u64 || sp >= kend) {
@@ -6733,6 +6816,10 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     let tid = pcpu.current_thread.load(Ordering::Relaxed) as usize;
     let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
 
+    // #204 probe: validate Thread struct on park entry — catches
+    // corruption that happened during the thread's last quantum.
+    validate_thread_canary(tid as ThreadId, "park_ipc.entry");
+
     // Re-assign saved_sp from syscall_frame_sp. pre_save_frame set it
     // earlier, but try_switch may have overwritten saved_sp if a timer
     // preempted us between pre_save_frame and this point.
@@ -6932,6 +7019,10 @@ pub fn park_current_for_ipc(reason: BlockReason) {
 pub fn wake_parked_thread(tid: ThreadId) {
     let tref = thread_ref(tid);
     trace_point("wake_parked.entry", tid as u32);
+    // #204 probe: validate Thread struct of target on wake entry —
+    // catches corruption between the time the parker set up its state
+    // and the waker reaches it.
+    validate_thread_canary(tid, "wake_parked.entry");
 
     // Boot 553 #196 sweep: defensive turnstile cleanup.  Most callers
     // (port_dequeue_one in wake_recv_waiter, DirectTransfer in
