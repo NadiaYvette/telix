@@ -253,9 +253,43 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
         loop { core::hint::spin_loop(); }
     }
     let f = unsafe { &*(sp as *const ExceptionFrame) };
-    let cs = f.cs();
-    let ss = f.ss();
-    let rip = f.rip();
+    // Use volatile reads so the compiler can't fuse the first read with the
+    // re-read below.  Without volatile, LLVM would CSE the second `f.cs()`
+    // back to the first, and the flicker probe would always show "no change."
+    let cs;
+    let ss;
+    let rip;
+    unsafe {
+        cs = core::ptr::read_volatile(&f.regs[18] as *const u64);
+        ss = core::ptr::read_volatile(&f.regs[21] as *const u64);
+        rip = core::ptr::read_volatile(&f.regs[17] as *const u64);
+    }
+    // Probe #208: latching frame snapshot.  Immediately re-read CS/SS/RIP
+    // and log if any of them changed.  Boot 584 caught the SS field
+    // flickering between validate's first read (0x109431, BAD) and the
+    // subsequent dump loop's read (0x0, valid) ~50 println-lines later —
+    // strong evidence a different CPU is writing to this kstack page
+    // concurrently with the validation.  This probe puts the second read
+    // in the same hot path, ~ns apart from the first, so any flicker
+    // attributable to a concurrent writer surfaces with a tight time
+    // bound.
+    let cs2: u64;
+    let ss2: u64;
+    let rip2: u64;
+    unsafe {
+        cs2 = core::ptr::read_volatile(&f.regs[18] as *const u64);
+        ss2 = core::ptr::read_volatile(&f.regs[21] as *const u64);
+        rip2 = core::ptr::read_volatile(&f.regs[17] as *const u64);
+    }
+    if cs != cs2 || ss != ss2 || rip != rip2 {
+        let tid_local = crate::sched::scheduler::current_thread_id();
+        let cur_cpu = crate::sched::smp::cpu_id();
+        crate::println!(
+            "FRAME-FLICKER: vec={} tid={} cpu={} sp={:#x} CS={:#x}->{:#x} SS={:#x}->{:#x} RIP={:#x}->{:#x}",
+            vector, tid_local, cur_cpu, sp,
+            cs, cs2, ss, ss2, rip, rip2
+        );
+    }
     let bad_cs = cs != 0x08 && cs != 0x23;
     let bad_ss = ss != 0x00 && ss != 0x10 && ss != 0x1B;
     // Tightened RIP check (chasing #UD corruption family, task #208):
