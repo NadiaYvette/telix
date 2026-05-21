@@ -7210,18 +7210,20 @@ pub fn pre_save_frame(tid: ThreadId) {
         t.saved_sp_source = 3; // pre_save_frame
         t.ipc_frame_sp = frame_sp;
 
-        // #208 DR0 arm.  When the chosen target tid first parks via
-        // pre_save_frame, set DR0 to watch writes to its iretq CS
-        // slot (offset +144 from saved_sp).  Catches the writer that
-        // corrupts iretq fields (boot 642 BAD frame fingerprint).
-        // Single-CPU watch — may miss cross-CPU writers; expand later
-        // if needed.
+        // #208 DR0 arm.  On the FIRST pre_save_frame for any non-idle
+        // tid, set DR0 to watch writes to its iretq CS slot (offset
+        // +144 from saved_sp).  Catches the writer that corrupts
+        // iretq fields.  Single-CPU watch.  We don't pick a specific
+        // tid because the corruption hits various ones — first parker
+        // is good enough.
         #[cfg(target_arch = "x86_64")]
         {
-            const DR0_TARGET_TID: u32 = 12;
             static DR0_ARMED: core::sync::atomic::AtomicBool =
                 core::sync::atomic::AtomicBool::new(false);
-            if tid == DR0_TARGET_TID
+            let idle_id = smp::current()
+                .idle_thread_id
+                .load(Ordering::Relaxed);
+            if tid != idle_id
                 && !DR0_ARMED.swap(true, Ordering::Relaxed)
             {
                 let cs_slot = frame_sp + 144;
