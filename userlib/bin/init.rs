@@ -181,6 +181,43 @@ fn main(_arg0: u64, _arg1: u64, _arg2: u64) {
     syscall::debug_puts(b"Phase 5 process lifecycle + IPC test: PASSED\n");
     phase_log(b"Phase 5 PASSED");
 
+    // --- Phase THRASH: kernel-side stress for #208 corruption family ---
+    // Spawns waves of short-lived threads to force rapid tid alloc / exit /
+    // recycle traffic.  Each worker yields a few times (user↔kernel
+    // transitions) then exits.  Compile-time guard; flip THRASH_ENABLED to
+    // run.  Triggers tid-reuse + RSP0 race windows much more reliably
+    // than ambient boot churn.
+    const THRASH_ENABLED: bool = true;
+    const THRASH_THREADS: usize = 24;
+    const THRASH_WAVES: usize = 50;
+    if THRASH_ENABLED {
+        syscall::debug_puts(b"  init: THRASH starting...\n");
+        let stack_size: usize = 0x2000; // 8 KiB per stack
+        let total_bytes = (THRASH_THREADS + 1) * stack_size;
+        let ps = syscall::page_size();
+        let npages = (total_bytes + ps - 1) / ps;
+        if let Some(sk) = syscall::mmap_anon(0, npages, 1) {
+            let mut tids = [u64::MAX; THRASH_THREADS];
+            for _wave in 0..THRASH_WAVES {
+                for i in 0..THRASH_THREADS {
+                    tids[i] = syscall::thread_create(
+                        thrash_worker as u64,
+                        (sk + (i + 1) * stack_size) as u64,
+                        0,
+                    );
+                }
+                for i in 0..THRASH_THREADS {
+                    if tids[i] != u64::MAX {
+                        syscall::thread_join(tids[i]);
+                    }
+                }
+            }
+            syscall::debug_puts(b"Phase THRASH: complete\n");
+        } else {
+            syscall::debug_puts(b"Phase THRASH: SKIPPED (mmap)\n");
+        }
+    }
+
     // --- Test 5b: seL4-style call/reply IPC (run early, before long tests) ---
     syscall::debug_puts(b"  init: running call/reply IPC test (early)...\n");
     {
@@ -22776,6 +22813,17 @@ extern "C" fn cosched_worker(group_id: u64) {
 #[unsafe(no_mangle)]
 extern "C" fn affinity_test_worker(_arg: u64) {
     for _ in 0..10 {
+        syscall::yield_now();
+    }
+    syscall::exit(0);
+}
+
+/// Phase THRASH worker — short-lived thread that does a few user↔kernel
+/// transitions then exits.  Goal is to maximize tid create / exit /
+/// recycle churn for #208 corruption-family reproduction.
+#[unsafe(no_mangle)]
+extern "C" fn thrash_worker(_arg: u64) {
+    for _ in 0..4 {
         syscall::yield_now();
     }
     syscall::exit(0);
