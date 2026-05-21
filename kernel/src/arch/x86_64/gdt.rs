@@ -176,6 +176,38 @@ pub fn get_rsp0() -> u64 {
     unsafe { (*tss_for(cpu)).rsp0 }
 }
 
+/// #208 DR0 watchpoint helpers.  Used to catch the writer that
+/// corrupts iretq frame slots.  Single-CPU watch: arms DR0 on the
+/// calling CPU only; if the writer is on another CPU, this won't
+/// catch it.
+pub fn dr0_set_watch_write_qword(addr: u64) {
+    unsafe {
+        core::arch::asm!("mov dr0, {0}", in(reg) addr, options(nostack));
+        // DR7: L0=1, RW0=01 (write), LEN0=10 (8 bytes).
+        let dr7: u64 = (1u64 << 0) | (0b01u64 << 16) | (0b10u64 << 18);
+        core::arch::asm!("mov dr7, {0}", in(reg) dr7, options(nostack));
+    }
+}
+
+pub fn dr0_clear() {
+    unsafe {
+        let zero: u64 = 0;
+        core::arch::asm!("mov dr7, {0}", in(reg) zero, options(nostack));
+        core::arch::asm!("mov dr0, {0}", in(reg) zero, options(nostack));
+    }
+}
+
+/// Read DR6, clear the B0..B3 status bits, return the original value.
+pub fn dr6_read_clear() -> u64 {
+    let val: u64;
+    unsafe {
+        core::arch::asm!("mov {0}, dr6", out(reg) val, options(nostack));
+        let cleared = val & !0xFu64;
+        core::arch::asm!("mov dr6, {0}", in(reg) cleared, options(nostack));
+    }
+    val
+}
+
 /// Build and load a TSS descriptor into the given CPU's GDT, then lgdt + ltr.
 fn load_gdt_for_cpu(cpu: usize) {
     let gdt = gdt_for(cpu);

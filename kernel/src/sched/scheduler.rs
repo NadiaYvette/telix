@@ -7209,6 +7209,29 @@ pub fn pre_save_frame(tid: ThreadId) {
         record_saved_sp_write(tid, frame_sp, 10); // pre_save_frame
         t.saved_sp_source = 3; // pre_save_frame
         t.ipc_frame_sp = frame_sp;
+
+        // #208 DR0 arm.  When the chosen target tid first parks via
+        // pre_save_frame, set DR0 to watch writes to its iretq CS
+        // slot (offset +144 from saved_sp).  Catches the writer that
+        // corrupts iretq fields (boot 642 BAD frame fingerprint).
+        // Single-CPU watch — may miss cross-CPU writers; expand later
+        // if needed.
+        #[cfg(target_arch = "x86_64")]
+        {
+            const DR0_TARGET_TID: u32 = 12;
+            static DR0_ARMED: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if tid == DR0_TARGET_TID
+                && !DR0_ARMED.swap(true, Ordering::Relaxed)
+            {
+                let cs_slot = frame_sp + 144;
+                crate::arch::x86_64::gdt::dr0_set_watch_write_qword(cs_slot);
+                crate::println!(
+                    "DR0-ARM: tid={} cs_slot={:#x} cpu={}",
+                    tid, cs_slot, smp::cpu_id(),
+                );
+            }
+        }
     }
     // Clear stale wakeup flag from a prior block_current iteration. Without
     // this, a SIGCHLD that called wake_thread on a thread that then exited

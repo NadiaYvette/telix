@@ -424,7 +424,27 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
     match vector {
         // CPU exceptions 0-31.
         0 => exception_fault("Divide Error (#DE)", frame),
-        1 => exception_fault("Debug (#DB)", frame),
+        1 => {
+            // #208 DR0 hit handler.  If any of DR0..DR3 fired, log
+            // the writer's RIP (this exception is a "trap" type, so
+            // frame.rip() is past the writing instruction) and
+            // continue.  Disable DR0 to avoid further fires.
+            let dr6 = crate::arch::x86_64::gdt::dr6_read_clear();
+            if dr6 & 0xF != 0 {
+                let tid = crate::sched::scheduler::current_thread_id();
+                crate::println!(
+                    "DR0-HIT: dr6={:#x} rip={:#x} tid={} cpu={} cs={:#x}",
+                    dr6,
+                    frame.rip(),
+                    tid,
+                    cpu,
+                    frame.cs(),
+                );
+                crate::arch::x86_64::gdt::dr0_clear();
+                return validate_iretq_frame(frame_sp, frame_sp, 1);
+            }
+            exception_fault("Debug (#DB)", frame)
+        }
         2 => exception_fault("NMI", frame),
         3 => {
             // #BP (vector 3) from user mode is the Linux SIGTRAP path:
