@@ -489,10 +489,13 @@ pub fn setup_signal_entry(
 /// x86_64: writes TSS RSP0 for ring 3→0 transitions.
 /// riscv64/loongarch64/mips64: writes TrapScratch.kernel_sp for the
 /// current CPU so the next user→kernel trap entry loads the right stack.
+///
+/// `_target_tid` is the thread the RSP0 is being set up for.  Used by
+/// the #208 RSP0 update ring for diagnostic attribution.
 #[inline]
-pub fn update_kernel_stack(_next_kstack_top: usize) {
+pub fn update_kernel_stack(_target_tid: u32, _next_kstack_top: usize) {
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::gdt::set_rsp0(_next_kstack_top as u64);
+    crate::arch::x86_64::gdt::set_rsp0(_target_tid, _next_kstack_top as u64);
 
     #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "mips64"))]
     {

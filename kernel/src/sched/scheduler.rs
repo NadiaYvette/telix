@@ -308,6 +308,72 @@ static KEPOCH_BAIL_LOG_COUNT: core::sync::atomic::AtomicU32 =
 static FRAME_DELTA_LOG_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
+/// #208 RSP0 update ring — per-CPU last 4 set_rsp0 calls.  Slot stores
+/// (tid in high 32 | rsp0 in low 32 — truncated for compactness; the
+/// full rsp0 is in the companion `RSP0_RING_FULL` slot).  Read by
+/// RSP0-MISMATCH probe to attribute "TSS was set up for tid=X with
+/// rsp0=Y" vs "TSS never updated for this transition".
+const RSP0_RING_SLOTS: usize = 4;
+const RSP0_RING_MASK: usize = RSP0_RING_SLOTS - 1;
+const RSP0_RING_TOTAL: usize = smp::MAX_CPUS * RSP0_RING_SLOTS;
+static RSP0_RING_FULL: [core::sync::atomic::AtomicU64; RSP0_RING_TOTAL] = {
+    const Z: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    [Z; RSP0_RING_TOTAL]
+};
+static RSP0_RING_TID_TS: [core::sync::atomic::AtomicU64; RSP0_RING_TOTAL] = {
+    const Z: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    [Z; RSP0_RING_TOTAL]
+};
+static RSP0_RING_POS: [core::sync::atomic::AtomicU32; smp::MAX_CPUS] = {
+    const Z: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    [Z; smp::MAX_CPUS]
+};
+
+/// Append a (target_tid, new_rsp0) record to this CPU's RSP0 ring.
+/// Called from gdt::set_rsp0 after the TSS write.
+#[inline]
+pub fn record_rsp0_update(cpu: u32, target_tid: u32, new_rsp0: u64) {
+    let cpu_idx = cpu as usize;
+    if cpu_idx >= smp::MAX_CPUS {
+        return;
+    }
+    let pos = RSP0_RING_POS[cpu_idx].fetch_add(1, Ordering::Relaxed) as usize;
+    let slot = pos & RSP0_RING_MASK;
+    let idx = cpu_idx * RSP0_RING_SLOTS + slot;
+    let ts32 = (crate::arch::timer::monotonic_ns() & 0xFFFF_FFFF) as u64;
+    let tid_ts = (target_tid as u64) | (ts32 << 32);
+    RSP0_RING_FULL[idx].store(new_rsp0, Ordering::Relaxed);
+    RSP0_RING_TID_TS[idx].store(tid_ts, Ordering::Relaxed);
+}
+
+/// Dump the last RSP0 updates for `cpu` (most-recent first).  Called by
+/// the RSP0-MISMATCH probe at fire time.
+pub fn dump_rsp0_ring(cpu: u32) {
+    let cpu_idx = cpu as usize;
+    if cpu_idx >= smp::MAX_CPUS {
+        return;
+    }
+    let pos = RSP0_RING_POS[cpu_idx].load(Ordering::Relaxed) as usize;
+    for i in 0..RSP0_RING_SLOTS {
+        let slot_pos = (pos.wrapping_sub(1 + i)) & RSP0_RING_MASK;
+        let idx = cpu_idx * RSP0_RING_SLOTS + slot_pos;
+        let rsp0 = RSP0_RING_FULL[idx].load(Ordering::Relaxed);
+        let tid_ts = RSP0_RING_TID_TS[idx].load(Ordering::Relaxed);
+        if tid_ts == 0 {
+            continue;
+        }
+        let tid = (tid_ts & 0xFFFF_FFFF) as u32;
+        let ts32 = (tid_ts >> 32) as u32;
+        crate::println!(
+            "  RSP0-RING[{}]: tid={} rsp0={:#x} ts32={}",
+            i, tid, rsp0, ts32,
+        );
+    }
+}
+
 /// #208 Probe A: snapshot the iretq frame slots at park-time so we can
 /// detect corruption that happens between park and dispatch.  Stores
 /// RIP / CS / RFLAGS / RSP / SS into the Thread's shadow fields.  No-op
@@ -4072,7 +4138,7 @@ fn try_switch(current_sp: u64) -> u64 {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
+    crate::arch::trapframe::update_kernel_stack(next_id as u32, thread_ref(next_id).stack_base + kstack_size());
 
     // Restore TLS base register for the next thread.
     // Always write FSBASE so stale values from another thread don't leak.
@@ -4297,7 +4363,7 @@ pub fn voluntary_reschedule() {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
+    crate::arch::trapframe::update_kernel_stack(next_id as u32, thread_ref(next_id).stack_base + kstack_size());
 
     // NEW_INV: cur.on_cpu = ON_CPU_PENDING is stored BEFORE the slot fill and
     // BEFORE state=Ready, so rescue's stale-on-cpu predicate cannot observe
@@ -4371,6 +4437,7 @@ pub fn voluntary_reschedule() {
                 }
             }
             crate::arch::trapframe::update_kernel_stack(
+                cur_id as u32,
                 thread_ref(cur_id).stack_base + kstack_size(),
             );
             return;
@@ -7275,7 +7342,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
+    crate::arch::trapframe::update_kernel_stack(next_id as u32, thread_ref(next_id).stack_base + kstack_size());
 
     // on_cpu for parked thread was released above (before park_state CAS).
     // Claim on_cpu for next (ON_CPU_PENDING → cpu).
@@ -9115,7 +9182,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(thread_ref(next_id).stack_base + kstack_size());
+    crate::arch::trapframe::update_kernel_stack(next_id as u32, thread_ref(next_id).stack_base + kstack_size());
 
     // Claim on_cpu for next thread (ON_CPU_PENDING → cpu).
     if next_id != idle_id {
@@ -9296,7 +9363,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
         }
     }
 
-    crate::arch::trapframe::update_kernel_stack(receiver.stack_base + kstack_size());
+    crate::arch::trapframe::update_kernel_stack(receiver_tid as u32, receiver.stack_base + kstack_size());
 
     // Claim on_cpu for receiver (parked threads have on_cpu=MAX from
     // park_current_for_ipc, so CAS expects MAX).

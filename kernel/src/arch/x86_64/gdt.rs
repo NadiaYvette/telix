@@ -157,12 +157,15 @@ fn tss_for(cpu: usize) -> *mut Tss {
 }
 
 /// Set the kernel stack pointer used when entering ring 0 from ring 3.
-/// Updates the current CPU's TSS.
-pub fn set_rsp0(rsp0: u64) {
+/// Updates the current CPU's TSS.  `target_tid` is the thread that
+/// will use this RSP0 — recorded in the #208 RSP0 update ring for
+/// diagnostic attribution.
+pub fn set_rsp0(target_tid: u32, rsp0: u64) {
     let cpu = smp::cpu_id() as usize;
     unsafe {
         (*tss_for(cpu)).rsp0 = rsp0;
     }
+    crate::sched::scheduler::record_rsp0_update(cpu as u32, target_tid, rsp0);
 }
 
 /// Read the current CPU's TSS RSP0.  Used by the #208 RSP0-MISMATCH
