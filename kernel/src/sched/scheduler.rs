@@ -4244,9 +4244,12 @@ pub fn voluntary_reschedule() {
     let cur_task;
     {
         let t = unsafe { thread_mut_from_ref(cur_id) };
-        t.saved_sp = frame_sp;
-        record_saved_sp_write(cur_id, frame_sp, 5); // voluntary_reschedule
-        t.saved_sp_source = 2; // voluntary_reschedule
+        // #208 KEPOCH guard: skip if frame_sp falls outside cur_id's kstack.
+        if validate_kstack_inject(cur_id, frame_sp, "voluntary_resched") {
+            t.saved_sp = frame_sp;
+            record_saved_sp_write(cur_id, frame_sp, 5); // voluntary_reschedule
+            t.saved_sp_source = 2; // voluntary_reschedule
+        }
         cur_prio = t.effective_priority;
         cur_task = t.task_id;
         // NOTE: state stays Running here. Set to Ready AFTER the deferred
@@ -4545,8 +4548,12 @@ pub fn block_current(_reason: BlockReason) {
     // not the user trap frame.  Mirror park_current_for_ipc's explicit
     // re-sync (line 5691) here too: re-establish the invariant before
     // returning that saved_sp == syscall_frame_sp.
-    unsafe { thread_mut_from_ref(tid) }.saved_sp = tref.syscall_frame_sp;
-    record_saved_sp_write(tid, tref.syscall_frame_sp, 6); // resync clone-thread
+    // #208 KEPOCH guard.
+    let _fsp_resync = tref.syscall_frame_sp;
+    if validate_kstack_inject(tid, _fsp_resync, "resync_clone") {
+        unsafe { thread_mut_from_ref(tid) }.saved_sp = _fsp_resync;
+        record_saved_sp_write(tid, _fsp_resync, 6); // resync clone-thread
+    }
     crate::arch::irq::restore(saved);
 }
 
@@ -7109,10 +7116,13 @@ pub const PARK_WOKEN: u8 = 3;
 pub fn pre_save_frame(tid: ThreadId) {
     let frame_sp = unsafe { thread_mut_from_ref(tid) }.syscall_frame_sp;
     let t = unsafe { thread_mut_from_ref(tid) };
-    t.saved_sp = frame_sp;
-    record_saved_sp_write(tid, frame_sp, 10); // pre_save_frame
-    t.saved_sp_source = 3; // pre_save_frame
-    t.ipc_frame_sp = frame_sp;
+    // #208 KEPOCH guard.
+    if validate_kstack_inject(tid, frame_sp, "pre_save_frame") {
+        t.saved_sp = frame_sp;
+        record_saved_sp_write(tid, frame_sp, 10); // pre_save_frame
+        t.saved_sp_source = 3; // pre_save_frame
+        t.ipc_frame_sp = frame_sp;
+    }
     // Clear stale wakeup flag from a prior block_current iteration. Without
     // this, a SIGCHLD that called wake_thread on a thread that then exited
     // block_current and did a fresh sys_call would leave wakeup=true across
@@ -7160,9 +7170,13 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     // syscall_frame_sp is set once at syscall entry (store_frame_sp) and
     // never touched by try_switch, so it always holds the correct value.
     let t = unsafe { thread_mut_from_ref(tid as ThreadId) };
-    t.saved_sp = t.syscall_frame_sp;
-    record_saved_sp_write(tid as ThreadId, t.syscall_frame_sp, 11); // park_ipc
-    t.saved_sp_source = 3; // park_ipc
+    let _fsp_park_ipc = t.syscall_frame_sp;
+    // #208 KEPOCH guard.
+    if validate_kstack_inject(tid as ThreadId, _fsp_park_ipc, "park_ipc") {
+        t.saved_sp = _fsp_park_ipc;
+        record_saved_sp_write(tid as ThreadId, _fsp_park_ipc, 11); // park_ipc
+        t.saved_sp_source = 3; // park_ipc
+    }
     t.state = ThreadState::Blocked;
     t.blocked_on = reason;
 
@@ -9031,9 +9045,12 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     // Set deadline before marking Blocked. Lock-free: we own the running thread.
     let thread = unsafe { thread_mut_from_ref(tid as ThreadId) };
     thread.sleep_deadline_ns = deadline_ns;
-    thread.saved_sp = frame_sp;
-    record_saved_sp_write(tid as ThreadId, frame_sp, 12); // park_for_sleep
-    thread.saved_sp_source = 5; // park_for_sleep
+    // #208 KEPOCH guard.
+    if validate_kstack_inject(tid as ThreadId, frame_sp, "park_sleep") {
+        thread.saved_sp = frame_sp;
+        record_saved_sp_write(tid as ThreadId, frame_sp, 12); // park_for_sleep
+        thread.saved_sp_source = 5; // park_for_sleep
+    }
     thread.state = ThreadState::Blocked;
     thread.blocked_on = BlockReason::Sleep;
 
@@ -9204,8 +9221,11 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     let (sender_prio, remaining_quantum, sender_task);
     {
         let sender = unsafe { thread_mut_from_ref(sender_tid as ThreadId) };
-        sender.saved_sp = frame_sp;
-        record_saved_sp_write(sender_tid as ThreadId, frame_sp, 13); // direct-transfer sender
+        // #208 KEPOCH guard.
+        if validate_kstack_inject(sender_tid as ThreadId, frame_sp, "handoff") {
+            sender.saved_sp = frame_sp;
+            record_saved_sp_write(sender_tid as ThreadId, frame_sp, 13); // direct-transfer sender
+        }
         sender_prio = sender.effective_priority;
         remaining_quantum = sender.quantum;
         sender_task = sender.task_id;
