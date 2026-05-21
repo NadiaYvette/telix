@@ -165,6 +165,14 @@ pub fn set_rsp0(rsp0: u64) {
     }
 }
 
+/// Read the current CPU's TSS RSP0.  Used by the #208 RSP0-MISMATCH
+/// probe to distinguish "update_kernel_stack never ran" from "ran but
+/// the CPU's exception-entry didn't observe it".
+pub fn get_rsp0() -> u64 {
+    let cpu = smp::cpu_id() as usize;
+    unsafe { (*tss_for(cpu)).rsp0 }
+}
+
 /// Build and load a TSS descriptor into the given CPU's GDT, then lgdt + ltr.
 fn load_gdt_for_cpu(cpu: usize) {
     let gdt = gdt_for(cpu);

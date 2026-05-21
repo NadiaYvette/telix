@@ -406,9 +406,12 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                         1, core::sync::atomic::Ordering::Relaxed,
                     );
                     if n < 100 {
+                        let tss_rsp0 = crate::arch::x86_64::gdt::get_rsp0();
+                        let expected_rsp0 = sb + sz;
                         crate::println!(
-                            "RSP0-MISMATCH: tid={} cpu={} vec={} frame_sp={:#x} expected_kstack=[{:#x}..{:#x}) cs={:#x} n={}",
+                            "RSP0-MISMATCH: tid={} cpu={} vec={} frame_sp={:#x} expected_kstack=[{:#x}..{:#x}) tss_rsp0={:#x} expected_rsp0={:#x} cs={:#x} n={}",
                             tid, cpu, vector, frame_sp, sb, sb + sz,
+                            tss_rsp0, expected_rsp0,
                             frame.cs(), n,
                         );
                     }
