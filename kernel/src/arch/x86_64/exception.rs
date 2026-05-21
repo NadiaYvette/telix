@@ -339,10 +339,21 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
             "  saved_sp={:#x} kstack={:#x} task={}",
             tref.saved_sp, tref.stack_base, tref.task_id
         );
-        // Raw dump: 22 u64 values at [sp..sp+176)
+        // Raw dump: 22 u64 values at [sp..sp+176).  Annotate any value
+        // that falls in a live thread's kstack range (#208 ladder
+        // step 1: visually distinguish kstack pointers from garbage).
         for i in 0..22u64 {
             let val = unsafe { *((sp + i * 8) as *const u64) };
-            crate::println!("  frame[{}]={:#018x}", i, val);
+            if let Some((annot_tid, off)) =
+                crate::sched::scheduler::classify_kstack_value(val)
+            {
+                crate::println!(
+                    "  frame[{}]={:#018x} [kstack tid={} +{:#x}]",
+                    i, val, annot_tid, off,
+                );
+            } else {
+                crate::println!("  frame[{}]={:#018x}", i, val);
+            }
         }
         // Mark the current thread (the one with corrupt state) as killed
         // so the scheduler won't re-enqueue it on the next tick.

@@ -210,10 +210,20 @@ pub fn forward_to_server(
                     unsafe { crate::sched::scheduler::thread_mut_from_ref(tid) }
                         .syscall_frame_sp;
                 let rip_at_entry = if frame_sp_now != 0 {
-                    let f = unsafe {
-                        &*(frame_sp_now as *const crate::syscall::handlers::ExceptionFrame)
-                    };
-                    f.rip()
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let f = unsafe {
+                            &*(frame_sp_now as *const crate::syscall::handlers::ExceptionFrame)
+                        };
+                        f.rip()
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        // Other arches: no easy rip() accessor on ExceptionFrame;
+                        // omit from log (this is a debug trace, x86-specific
+                        // diagnostic).  Returning 0 keeps log structure parseable.
+                        0u64
+                    }
                 } else {
                     0
                 };

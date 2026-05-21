@@ -578,6 +578,33 @@ pub fn validate_kstack_inject(
 const STACK_CANARY_LO: u64 = 0xCAFEBEEFDEADBEEFu64;
 const STACK_CANARY_HI: u64 = 0xFEEDFACEBADC0FFEu64;
 
+/// #208 helper: scan THREAD_TABLE for any live thread whose kstack range
+/// contains `v`.  Returns Some((tid, offset_in_kstack)) on hit.  Used at
+/// BAD-frame dump time to annotate raw u64 values that look like
+/// pointers — instead of staring at `frame[3]=0x5f60520` and wondering
+/// what that is, we get `frame[3]=0x5f60520 [kstack tid=8 +0x520]`.
+pub fn classify_kstack_value(v: u64) -> Option<(ThreadId, usize)> {
+    // Quick range gate: kstacks live in physical kernel-low addresses
+    // (below 4 GiB on x86 in current layout).  Saves the table scan for
+    // small ints / large user pointers.
+    if v < 0x10000 || v >= 0x1_0000_0000 {
+        return None;
+    }
+    let ksz = kstack_size() as u64;
+    let cap = RadixTable::capacity();
+    for tid in 0..(cap as ThreadId) {
+        let ptr = THREAD_TABLE.get(tid) as *const super::thread::Thread;
+        if ptr.is_null() {
+            continue;
+        }
+        let sb = unsafe { (*ptr).stack_base } as u64;
+        if sb != 0 && v >= sb && v < sb + ksz {
+            return Some((tid, (v - sb) as usize));
+        }
+    }
+    None
+}
+
 #[inline]
 pub fn init_stack_canary(stack_base: usize) {
     if stack_base == 0 {
