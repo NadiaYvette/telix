@@ -313,7 +313,7 @@ static FRAME_DELTA_LOG_COUNT: core::sync::atomic::AtomicU32 =
 /// full rsp0 is in the companion `RSP0_RING_FULL` slot).  Read by
 /// RSP0-MISMATCH probe to attribute "TSS was set up for tid=X with
 /// rsp0=Y" vs "TSS never updated for this transition".
-const RSP0_RING_SLOTS: usize = 4;
+const RSP0_RING_SLOTS: usize = 16;
 const RSP0_RING_MASK: usize = RSP0_RING_SLOTS - 1;
 const RSP0_RING_TOTAL: usize = smp::MAX_CPUS * RSP0_RING_SLOTS;
 static RSP0_RING_FULL: [core::sync::atomic::AtomicU64; RSP0_RING_TOTAL] = {
