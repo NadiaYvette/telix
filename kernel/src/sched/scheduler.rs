@@ -276,6 +276,10 @@ pub fn record_saved_sp_write(tid: ThreadId, new_value: u64, callsite_tag: u8) {
     let meta = (callsite_tag as u64) | ((cpu as u64) << 8) | (ts32 << 32);
     SAVED_SP_LAST_VALUE[i].store(new_value, Ordering::Relaxed);
     SAVED_SP_LAST_META[i].store(meta, Ordering::Relaxed);
+    // #208 Probe A: snapshot iretq fields immediately after the saved_sp
+    // write so we can detect later corruption.  Cheap (5 reads) and
+    // idempotent across writers.
+    snapshot_iretq_shadow(tid, new_value);
 }
 
 /// Dump the last saved_sp write for `tid` (called from BUG: try_switch path).
@@ -299,6 +303,83 @@ pub fn dump_saved_sp_log(tid: ThreadId) {
 /// site catching the deferred-free race, rate-limited to avoid log flood.
 static KEPOCH_BAIL_LOG_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
+
+/// #208 Probe A: counter for FRAME-DELTA log lines.
+static FRAME_DELTA_LOG_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// #208 Probe A: snapshot the iretq frame slots at park-time so we can
+/// detect corruption that happens between park and dispatch.  Stores
+/// RIP / CS / RFLAGS / RSP / SS into the Thread's shadow fields.  No-op
+/// if `sp` is not within `tid`'s current kstack.
+#[inline]
+pub fn snapshot_iretq_shadow(tid: ThreadId, sp: u64) {
+    if sp < 0x10000 {
+        return;
+    }
+    let t = unsafe { thread_mut_from_ref(tid) };
+    let sb = t.stack_base as u64;
+    let sz = kstack_size() as u64;
+    if sb == 0
+        || sp < sb
+        || sp.saturating_add(EXCEPTION_FRAME_SIZE as u64) > sb + sz
+    {
+        return;
+    }
+    unsafe {
+        let frame = sp as *const u64;
+        t.iretq_shadow_rip = *frame.add(17);
+        t.iretq_shadow_cs = *frame.add(18);
+        t.iretq_shadow_rflags = *frame.add(19);
+        t.iretq_shadow_rsp = *frame.add(20);
+        t.iretq_shadow_ss = *frame.add(21);
+        t.iretq_shadow_sp = sp;
+    }
+}
+
+/// #208 Probe A: compare live iretq slots at `sp` to the shadow recorded
+/// at the most recent park.  Logs FRAME-DELTA if any field differs.
+/// Skipped if no shadow exists or it was taken for a different sp.
+#[inline]
+pub fn check_iretq_shadow(tid: ThreadId, sp: u64) {
+    let t = thread_ref(tid);
+    if t.iretq_shadow_sp == 0 || t.iretq_shadow_sp != sp {
+        return;
+    }
+    let rip;
+    let cs;
+    let rflags;
+    let rsp;
+    let ss;
+    unsafe {
+        let frame = sp as *const u64;
+        rip = core::ptr::read_volatile(frame.add(17));
+        cs = core::ptr::read_volatile(frame.add(18));
+        rflags = core::ptr::read_volatile(frame.add(19));
+        rsp = core::ptr::read_volatile(frame.add(20));
+        ss = core::ptr::read_volatile(frame.add(21));
+    }
+    if rip != t.iretq_shadow_rip
+        || cs != t.iretq_shadow_cs
+        || rflags != t.iretq_shadow_rflags
+        || rsp != t.iretq_shadow_rsp
+        || ss != t.iretq_shadow_ss
+    {
+        let n = FRAME_DELTA_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 100 {
+            crate::println!(
+                "FRAME-DELTA: tid={} sp={:#x} src={} RIP={:#x}->{:#x} CS={:#x}->{:#x} RFLAGS={:#x}->{:#x} RSP={:#x}->{:#x} SS={:#x}->{:#x} n={}",
+                tid, sp, t.saved_sp_source,
+                t.iretq_shadow_rip, rip,
+                t.iretq_shadow_cs, cs,
+                t.iretq_shadow_rflags, rflags,
+                t.iretq_shadow_rsp, rsp,
+                t.iretq_shadow_ss, ss,
+                n
+            );
+        }
+    }
+}
 
 /// Bump the per-thread kstack epoch.  Call AFTER writing `stack_base`
 /// (whether to a new alloc or to 0 on free).  See [[project-kernel-ud-writer-audit]].

@@ -68,6 +68,16 @@ pub struct Thread {
     /// mismatch between the epoch it captured at park and the current epoch.
     /// See [[project-kernel-ud-writer-audit]].
     pub kstack_epoch: u64,
+    /// #208 Probe A: shadow of the iretq frame slots captured at park time.
+    /// Compared at dispatch to detect corruption that happens between park
+    /// and resume.  `iretq_shadow_sp` is the saved_sp value at snapshot time
+    /// (0 = no shadow valid).  See [[project-kepoch-probe-first-boot]].
+    pub iretq_shadow_rip: u64,
+    pub iretq_shadow_cs: u64,
+    pub iretq_shadow_rflags: u64,
+    pub iretq_shadow_rsp: u64,
+    pub iretq_shadow_ss: u64,
+    pub iretq_shadow_sp: u64,
     /// Why this thread is blocked (only valid when state == Blocked).
     #[allow(dead_code)]
     pub blocked_on: BlockReason,
@@ -286,6 +296,12 @@ impl Thread {
             saved_sp: 0,
             stack_base: 0,
             kstack_epoch: 0,
+            iretq_shadow_rip: 0,
+            iretq_shadow_cs: 0,
+            iretq_shadow_rflags: 0,
+            iretq_shadow_rsp: 0,
+            iretq_shadow_ss: 0,
+            iretq_shadow_sp: 0,
             blocked_on: BlockReason::None,
             call_dest_port: 0,
             call_tag: 0,

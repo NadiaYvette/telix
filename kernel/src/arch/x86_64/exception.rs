@@ -252,6 +252,12 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
         crate::arch::irq::enable();
         loop { core::hint::spin_loop(); }
     }
+    // #208 Probe A: compare live iretq fields against the shadow recorded
+    // at park time.  Fires FRAME-DELTA whenever fields changed in between.
+    {
+        let tid = crate::sched::scheduler::current_thread_id();
+        crate::sched::scheduler::check_iretq_shadow(tid, sp);
+    }
     let f = unsafe { &*(sp as *const ExceptionFrame) };
     // Use volatile reads so the compiler can't fuse the first read with the
     // re-read below.  Without volatile, LLVM would CSE the second `f.cs()`
