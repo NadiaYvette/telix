@@ -42,7 +42,7 @@ const KSTACK_ORDER: usize = 1;
 
 /// Kernel stack size in bytes (2^KSTACK_ORDER pages).
 #[inline]
-fn kstack_size() -> usize {
+pub fn kstack_size() -> usize {
     page::page_size() << KSTACK_ORDER
 }
 

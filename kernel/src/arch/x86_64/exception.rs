@@ -372,6 +372,45 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             .store(crate::arch::timer::monotonic_ns(), core::sync::atomic::Ordering::Relaxed);
     }
 
+    // #208 RSP0-MISMATCH probe.  When entering from user mode (CPL=3),
+    // the CPU loaded the new RSP from TSS RSP0.  If RSP0 was stale
+    // relative to `current_thread` (e.g., not updated between
+    // dispatch and the next user-mode trap), `frame_sp` now points
+    // into the wrong thread's kstack — exactly the symptom of the
+    // kernel #UD family.  Boot 600 tid=13 had frame_sp=0x835fda0
+    // while its real kstack was [0x7f70000..0x7f90000).  One log
+    // line per fire, rate-limited to 100/boot.
+    {
+        let from_user = (frame.cs() & 3) == 3;
+        if from_user {
+            let tid = crate::sched::smp::current()
+                .current_thread
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let idle_id = crate::sched::smp::current()
+                .idle_thread_id
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if tid != idle_id {
+                let t = crate::sched::scheduler::thread_ref(tid);
+                let sb = t.stack_base as u64;
+                let sz = crate::sched::scheduler::kstack_size() as u64;
+                if sb != 0 && !(frame_sp >= sb && frame_sp <= sb + sz) {
+                    static RSP0_MISMATCH_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = RSP0_MISMATCH_LOG.fetch_add(
+                        1, core::sync::atomic::Ordering::Relaxed,
+                    );
+                    if n < 100 {
+                        crate::println!(
+                            "RSP0-MISMATCH: tid={} cpu={} vec={} frame_sp={:#x} expected_kstack=[{:#x}..{:#x}) cs={:#x} n={}",
+                            tid, cpu, vector, frame_sp, sb, sb + sz,
+                            frame.cs(), n,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     match vector {
         // CPU exceptions 0-31.
         0 => exception_fault("Divide Error (#DE)", frame),
