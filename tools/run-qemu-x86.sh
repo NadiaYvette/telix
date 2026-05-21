@@ -18,7 +18,15 @@ SSH_PORT="${TELIX_SSH_PORT:-3222}"
 GDB_PORT="${TELIX_GDB_PORT:-3234}"
 
 # Convert 64-bit ELF to 32-bit ELF for QEMU's Multiboot loader.
-KERNEL32="${KERNEL}.mb32"
+# Per-slot output name so parallel boots (via boot-h14-multi.sh) don't
+# race on writing the same .mb32 file — symptom was "Error while
+# loading elf kernel" when multiple objcopy invocations overlapped.
+SLOT="${TELIX_BOOT_SLOT:-0}"
+if [ "$SLOT" = "0" ]; then
+    KERNEL32="${KERNEL}.mb32"
+else
+    KERNEL32="${KERNEL}.mb32.s${SLOT}"
+fi
 objcopy -O elf32-i386 "$KERNEL" "$KERNEL32"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
