@@ -346,6 +346,15 @@ pub fn check_iretq_shadow(tid: ThreadId, sp: u64) {
     if t.iretq_shadow_sp == 0 || t.iretq_shadow_sp != sp {
         return;
     }
+    // Only check for truly-parked threads.  Running threads can
+    // legitimately have their frame contents change between snapshot
+    // and validate (user-mode RIP advances between successive syscalls
+    // at the same kstack_top frame slot).  Boot 619 had 194 noise
+    // fires on Running threads; this gate eliminates them so any
+    // surviving DELTA actually means "frame at parked address changed."
+    if t.state != ThreadState::Blocked {
+        return;
+    }
     let rip;
     let cs;
     let rflags;
