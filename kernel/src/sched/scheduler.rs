@@ -434,12 +434,23 @@ pub fn check_iretq_shadow(tid: ThreadId, sp: u64) {
         rsp = core::ptr::read_volatile(frame.add(20));
         ss = core::ptr::read_volatile(frame.add(21));
     }
-    if rip != t.iretq_shadow_rip
+    // RIP/CS/RFLAGS are pushed by the CPU on every exception entry
+    // (same-CPL and cross-CPL).  RSP and SS are only pushed on
+    // cross-CPL (user→kernel) — for kernel-mode parks they reside in
+    // memory beyond the actual iretq frame and contain unrelated
+    // kernel-stack data.  Boot 627 fired 13 false positives this way
+    // on tid=34 (CS=0x8 same-CPL, SS slot held 0x109491 from prior
+    // kernel state).  Only flag deltas in the 3 always-pushed fields,
+    // and gate RSP/SS checks on shadow_cs being user CS (0x23).
+    let user_iretq = t.iretq_shadow_cs == 0x23;
+    let core_changed = rip != t.iretq_shadow_rip
         || cs != t.iretq_shadow_cs
-        || rflags != t.iretq_shadow_rflags
-        || rsp != t.iretq_shadow_rsp
+        || rflags != t.iretq_shadow_rflags;
+    let ext_changed = user_iretq && (
+        rsp != t.iretq_shadow_rsp
         || ss != t.iretq_shadow_ss
-    {
+    );
+    if core_changed || ext_changed {
         let n = FRAME_DELTA_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 100 {
             crate::println!(
