@@ -3844,18 +3844,23 @@ fn try_switch(current_sp: u64) -> u64 {
                 }
             }
         }
-        // #208 KEPOCH save-side check.  If prev_t.stack_base is 0
-        // (kstack already deferred-freed) or current_sp lies outside
-        // prev's kstack range, the deferred-free race has fired —
-        // we're about to save an sp on a dead thread.  Idle is exempt
-        // because it runs on the boot stack (sp legitimately outside
-        // its allocated kstack).
-        if prev_id != idle_id_for_load {
-            let _ = validate_kstack_inject(prev_id, current_sp, "try_switch.save");
+        // #208 tid-reuse race fix: validate that current_sp falls inside
+        // prev_t's current kstack BEFORE writing saved_sp.  If the
+        // deferred-free + alloc_thread_id reuse race fired between the
+        // top of try_switch and here, prev_t has been recycled for a
+        // NEW thread with a different kstack — writing current_sp (a
+        // stale address from the OLD incarnation) would corrupt NEW's
+        // already-correct saved_sp set by spawn_user/clone.  Skip the
+        // write in that case.  Idle is exempt because it runs on the
+        // boot stack (sp legitimately outside its allocated kstack).
+        // Captured by KEPOCH-BAIL: site=try_switch.save boot 595.
+        let save_ok = prev_id == idle_id_for_load
+            || validate_kstack_inject(prev_id, current_sp, "try_switch.save");
+        if save_ok {
+            prev_t.saved_sp = current_sp;
+            record_saved_sp_write(prev_id, current_sp, 4); // try_switch
+            prev_t.saved_sp_source = 1; // try_switch
         }
-        prev_t.saved_sp = current_sp;
-        record_saved_sp_write(prev_id, current_sp, 4); // try_switch
-        prev_t.saved_sp_source = 1; // try_switch
         let mut prev_prio = prev_t.effective_priority;
         prev_task = prev_t.task_id;
         // If the thread was demoted by block_current and has been woken
