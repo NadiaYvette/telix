@@ -637,6 +637,18 @@ pub fn dispatch(frame: &mut ExceptionFrame) {
 /// Called by sender after direct-transfer from send_direct().
 fn inject_recv_into_frame(receiver_tid: u32, msg: &crate::ipc::Message) {
     let sp = crate::sched::scheduler::thread_saved_sp(receiver_tid);
+    // #208: skip the write if receiver's kstack has been freed or sp is
+    // out of range — catches the deferred-free + stale-saved_sp race
+    // (see project-kernel-ud-writer-audit).
+    if sp == 0
+        || !crate::sched::scheduler::validate_kstack_inject(
+            receiver_tid,
+            sp,
+            "inject_recv",
+        )
+    {
+        return;
+    }
     let frame = unsafe { &mut *(sp as *mut ExceptionFrame) };
     set_return(frame, 0); // recv returns 0 = success
     set_reg(frame, 1, msg.tag);

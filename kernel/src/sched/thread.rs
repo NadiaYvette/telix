@@ -62,6 +62,12 @@ pub struct Thread {
     pub saved_sp: u64,
     /// Physical address of the base of this thread's stack page.
     pub stack_base: usize,
+    /// Generation counter bumped each time `stack_base` changes (alloc or
+    /// free).  Lets the IPC frame-injection sites detect the deferred-free
+    /// race: a sender holding a stale `thread_saved_sp(tid)` would see a
+    /// mismatch between the epoch it captured at park and the current epoch.
+    /// See [[project-kernel-ud-writer-audit]].
+    pub kstack_epoch: u64,
     /// Why this thread is blocked (only valid when state == Blocked).
     #[allow(dead_code)]
     pub blocked_on: BlockReason,
@@ -279,6 +285,7 @@ impl Thread {
             default_quantum: 1,
             saved_sp: 0,
             stack_base: 0,
+            kstack_epoch: 0,
             blocked_on: BlockReason::None,
             call_dest_port: 0,
             call_tag: 0,

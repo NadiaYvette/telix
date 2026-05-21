@@ -295,6 +295,50 @@ pub fn dump_saved_sp_log(tid: ThreadId) {
     );
 }
 
+/// #208 kstack epoch probe — counts how many times to log an injection
+/// site catching the deferred-free race, rate-limited to avoid log flood.
+static KEPOCH_BAIL_LOG_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Bump the per-thread kstack epoch.  Call AFTER writing `stack_base`
+/// (whether to a new alloc or to 0 on free).  See [[project-kernel-ud-writer-audit]].
+#[inline]
+pub fn bump_kstack_epoch(t: &mut Thread) {
+    t.kstack_epoch = t.kstack_epoch.wrapping_add(1);
+}
+
+/// #208 inject-site validator.  Returns true if `sp` is a plausible
+/// iretq frame inside `tid`'s current kstack.  Logs (rate-limited) and
+/// returns false if `tid` has been freed (stack_base==0) or `sp` falls
+/// outside the kstack range.  Callsites are expected to skip the
+/// `*mut ExceptionFrame` write when this returns false — that's the
+/// deferred-free + stale-saved_sp race we are trying to detect.
+#[inline]
+pub fn validate_kstack_inject(
+    tid: ThreadId,
+    sp: u64,
+    site: &'static str,
+) -> bool {
+    let t = thread_ref(tid);
+    let sb = t.stack_base as u64;
+    let sz = kstack_size() as u64;
+    let epoch = t.kstack_epoch;
+    let ok = sb != 0
+        && sp >= sb
+        && sp.checked_add(EXCEPTION_FRAME_SIZE as u64)
+            .is_some_and(|end| end <= sb + sz);
+    if !ok {
+        let n = KEPOCH_BAIL_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 100 {
+            crate::println!(
+                "KEPOCH-BAIL: site={} tid={} sp={:#x} stack_base={:#x} size={:#x} epoch={} n={}",
+                site, tid, sp, sb, sz, epoch, n
+            );
+        }
+    }
+    ok
+}
+
 /// #204 follow-on: kernel stack guard canary.
 ///
 /// Boots 568/569/570 with `validate_thread_canary` showed Thread struct
@@ -1655,8 +1699,9 @@ fn thread_port_handler(
 // Thread/Task slab/page allocation
 // ---------------------------------------------------------------------------
 
-/// Slab size for Thread entries (Thread is ~408 bytes, 512-byte slab).
-const THREAD_SLAB_SIZE: usize = 512;
+/// Slab size for Thread entries.  Bumped to 1024 after kstack_epoch
+/// (#208 probe) push Thread past 512 bytes.
+const THREAD_SLAB_SIZE: usize = 1024;
 const _: () = assert!(core::mem::size_of::<Thread>() <= THREAD_SLAB_SIZE);
 
 fn alloc_thread_entry() -> Option<*mut Thread> {
@@ -1931,6 +1976,7 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
     thread.saved_sp = frame_sp as u64;
     record_saved_sp_write(id, frame_sp as u64, 1); // create_thread
     thread.stack_base = stack_base;
+    bump_kstack_epoch(thread); // #208
     thread.sig_mask = 0;
     thread.sig_pending = 0;
 
@@ -2221,6 +2267,7 @@ fn finalize_spawn(
     thread.saved_sp = frame_sp;
     record_saved_sp_write(thread_id, frame_sp, 2); // spawn_user
     thread.stack_base = kstack_base;
+    bump_kstack_epoch(thread); // #208
     thread.sig_mask = 0;
     thread.sig_pending = 0;
 
@@ -2282,6 +2329,7 @@ fn create_thread_in_task(
     thread.saved_sp = frame_sp as u64;
     record_saved_sp_write(id, frame_sp as u64, 3); // spawn_user variant
     thread.stack_base = kstack_base;
+    bump_kstack_epoch(thread); // #208
     thread.exit_code = 0;
     thread.sig_mask = 0;
     thread.sig_pending = 0;
@@ -3608,6 +3656,7 @@ fn try_switch(current_sp: u64) -> u64 {
                 // Safety: dead thread is Dead, not on any queue or CPU.
                 let t = unsafe { thread_mut_from_ref(dead_tid as ThreadId) };
                 t.stack_base = 0;
+                bump_kstack_epoch(t); // #208
             }
         }
     }
@@ -3794,6 +3843,15 @@ fn try_switch(current_sp: u64) -> u64 {
                     );
                 }
             }
+        }
+        // #208 KEPOCH save-side check.  If prev_t.stack_base is 0
+        // (kstack already deferred-freed) or current_sp lies outside
+        // prev's kstack range, the deferred-free race has fired —
+        // we're about to save an sp on a dead thread.  Idle is exempt
+        // because it runs on the boot stack (sp legitimately outside
+        // its allocated kstack).
+        if prev_id != idle_id_for_load {
+            let _ = validate_kstack_inject(prev_id, current_sp, "try_switch.save");
         }
         prev_t.saved_sp = current_sp;
         record_saved_sp_write(prev_id, current_sp, 4); // try_switch
@@ -4751,7 +4809,7 @@ pub fn wake_thread(tid: ThreadId) {
                     // error into the thread's saved frame so userspace sees a
                     // clean error rather than stale register values.
                     let sp = thread_saved_sp(tid);
-                    if sp != 0 {
+                    if sp != 0 && validate_kstack_inject(tid, sp, "abandon_interrupt") {
                         let tag = crate::ipc::call_reply::CALL_REPLY_INTERRUPTED;
                         unsafe {
                             use crate::arch::trapframe::ExceptionFrame;
@@ -5879,6 +5937,7 @@ pub fn fork_current() -> u64 {
     thread.saved_sp = child_frame_sp as u64;
     record_saved_sp_write(child_tid, child_frame_sp as u64, 7); // fork
     thread.stack_base = kstack_base;
+    bump_kstack_epoch(thread); // #208
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;
@@ -6116,6 +6175,7 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     thread.saved_sp = child_frame_sp as u64;
     record_saved_sp_write(child_tid, child_frame_sp as u64, 8); // clone variant
     thread.stack_base = kstack_base;
+    bump_kstack_epoch(thread); // #208
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;
@@ -6232,6 +6292,7 @@ pub fn clone_thread_in_task(
     thread.saved_sp = child_frame_sp as u64;
     record_saved_sp_write(child_tid, child_frame_sp as u64, 9); // clone-third
     thread.stack_base = kstack_base;
+    bump_kstack_epoch(thread); // #208
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;
@@ -6443,7 +6504,7 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
                 crate::ipc::call_reply::FulfillResult::WakeCaller(caller_tid) => {
                     // Inject into the caller's parked frame, then wake.
                     let sp = thread_saved_sp(caller_tid);
-                    if sp != 0 {
+                    if sp != 0 && validate_kstack_inject(caller_tid, sp, "server_died") {
                         unsafe {
                             use crate::arch::trapframe::ExceptionFrame;
                             let frame = &mut *(sp as *mut ExceptionFrame);
@@ -7414,7 +7475,7 @@ fn call_reply_timeout_sweep() {
         // Thread has been in CallReply for >10s. Force-wake with SERVER_DIED.
         if crate::ipc::call_reply::abandon_for_interrupt(slot, tid as u32) {
             let sp = thread_saved_sp(tid as ThreadId);
-            if sp != 0 {
+            if sp != 0 && validate_kstack_inject(tid as ThreadId, sp, "callreply_timeout") {
                 let tag = crate::ipc::call_reply::CALL_REPLY_SERVER_DIED;
                 unsafe {
                     use crate::arch::trapframe::ExceptionFrame;
@@ -8482,7 +8543,7 @@ fn rescue_orphaned_threads_impl(rescue_parked: bool) {
                 tid, t.task_id, t.blocked_on, tevt, tcpu, tseq
             );
             let sp = thread_saved_sp(tid as ThreadId);
-            if sp != 0 {
+            if sp != 0 && validate_kstack_inject(tid as ThreadId, sp, "rescue_park") {
                 let died_tag = crate::ipc::call_reply::CALL_REPLY_SERVER_DIED;
                 unsafe {
                     use crate::arch::trapframe::ExceptionFrame;
