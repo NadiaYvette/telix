@@ -313,7 +313,7 @@ static FRAME_DELTA_LOG_COUNT: core::sync::atomic::AtomicU32 =
 /// full rsp0 is in the companion `RSP0_RING_FULL` slot).  Read by
 /// RSP0-MISMATCH probe to attribute "TSS was set up for tid=X with
 /// rsp0=Y" vs "TSS never updated for this transition".
-const RSP0_RING_SLOTS: usize = 16;
+const RSP0_RING_SLOTS: usize = 65536;
 const RSP0_RING_MASK: usize = RSP0_RING_SLOTS - 1;
 const RSP0_RING_TOTAL: usize = smp::MAX_CPUS * RSP0_RING_SLOTS;
 static RSP0_RING_FULL: [core::sync::atomic::AtomicU64; RSP0_RING_TOTAL] = {
@@ -388,7 +388,8 @@ pub fn dump_ct_ring(cpu: u32) {
         return;
     }
     let pos = CT_RING_POS[cpu_idx].load(Ordering::Relaxed) as usize;
-    for i in 0..RSP0_RING_SLOTS {
+    let limit = RSP0_RING_DUMP_LIMIT.min(RSP0_RING_SLOTS);
+    for i in 0..limit {
         let slot_pos = (pos.wrapping_sub(1 + i)) & RSP0_RING_MASK;
         let idx = cpu_idx * RSP0_RING_SLOTS + slot_pos;
         let tid_ts = CT_RING_TID_TS[idx].load(Ordering::Relaxed);
@@ -406,13 +407,19 @@ pub fn dump_ct_ring(cpu: u32) {
 
 /// Dump the last RSP0 updates for `cpu` (most-recent first).  Called by
 /// the RSP0-MISMATCH probe at fire time.
+/// Maximum entries to print in a single ring dump.  The ring itself is
+/// large (RSP0_RING_SLOTS) so we can look further back when grepping the
+/// log, but each dump only prints this many to keep serial output sane.
+const RSP0_RING_DUMP_LIMIT: usize = 256;
+
 pub fn dump_rsp0_ring(cpu: u32) {
     let cpu_idx = cpu as usize;
     if cpu_idx >= smp::MAX_CPUS {
         return;
     }
     let pos = RSP0_RING_POS[cpu_idx].load(Ordering::Relaxed) as usize;
-    for i in 0..RSP0_RING_SLOTS {
+    let limit = RSP0_RING_DUMP_LIMIT.min(RSP0_RING_SLOTS);
+    for i in 0..limit {
         let slot_pos = (pos.wrapping_sub(1 + i)) & RSP0_RING_MASK;
         let idx = cpu_idx * RSP0_RING_SLOTS + slot_pos;
         let rsp0 = RSP0_RING_FULL[idx].load(Ordering::Relaxed);
