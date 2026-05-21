@@ -437,22 +437,44 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         // CPU exceptions 0-31.
         0 => exception_fault("Divide Error (#DE)", frame),
         1 => {
-            // #208 DR0 hit handler.  If any of DR0..DR3 fired, log
-            // the writer's RIP (this exception is a "trap" type, so
-            // frame.rip() is past the writing instruction) and
-            // continue.  Disable DR0 to avoid further fires.
+            // #208 DR0 hit handler.  Two cases:
+            //   1. RIP is inside the __isr_stub_* region: that's the
+            //      CPU's automatic CS push at exception entry on a
+            //      thread sharing the watched address.  Expected
+            //      noise — re-arm DR0 silently and continue.
+            //   2. RIP is OUTSIDE the stub region: a kernel function
+            //      wrote to the watched CS slot.  Log it (this is
+            //      the corruption writer we're hunting) and disable
+            //      DR0 to prevent further fires.
             let dr6 = crate::arch::x86_64::gdt::dr6_read_clear();
             if dr6 & 0xF != 0 {
-                let tid = crate::sched::scheduler::current_thread_id();
-                crate::println!(
-                    "DR0-HIT: dr6={:#x} rip={:#x} tid={} cpu={} cs={:#x}",
-                    dr6,
-                    frame.rip(),
-                    tid,
-                    cpu,
-                    frame.cs(),
-                );
-                crate::arch::x86_64::gdt::dr0_clear();
+                let rip = frame.rip();
+                unsafe extern "C" {
+                    static __isr_stub_0: u8;
+                }
+                let stub_lo = unsafe { &__isr_stub_0 as *const _ as u64 };
+                // Each stub is 16-byte aligned; 256 stubs = 0x1000 span.
+                let stub_hi = stub_lo + 0x1000;
+                let in_stub_region = rip >= stub_lo && rip < stub_hi;
+                if in_stub_region {
+                    // Expected CPU push at exception entry.  Re-arm DR0
+                    // with the same address so we keep watching for the
+                    // off-path writer.
+                    let watched =
+                        crate::arch::x86_64::gdt::dr0_get_watched();
+                    if watched != 0 {
+                        crate::arch::x86_64::gdt::dr0_set_watch_write_qword(
+                            watched,
+                        );
+                    }
+                } else {
+                    let tid = crate::sched::scheduler::current_thread_id();
+                    crate::println!(
+                        "DR0-HIT-OFF-PATH: dr6={:#x} rip={:#x} tid={} cpu={} cs={:#x}",
+                        dr6, rip, tid, cpu, frame.cs(),
+                    );
+                    crate::arch::x86_64::gdt::dr0_clear();
+                }
                 return validate_iretq_frame(frame_sp, frame_sp, 1);
             }
             exception_fault("Debug (#DB)", frame)

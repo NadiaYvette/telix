@@ -180,7 +180,14 @@ pub fn get_rsp0() -> u64 {
 /// corrupts iretq frame slots.  Single-CPU watch: arms DR0 on the
 /// calling CPU only; if the writer is on another CPU, this won't
 /// catch it.
+///
+/// `DR0_WATCH_ADDR` lets the #DB handler re-arm with the same
+/// address after stub-region hits.
+static DR0_WATCH_ADDR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 pub fn dr0_set_watch_write_qword(addr: u64) {
+    DR0_WATCH_ADDR.store(addr, core::sync::atomic::Ordering::Relaxed);
     unsafe {
         core::arch::asm!("mov dr0, {0}", in(reg) addr, options(nostack));
         // DR7: L0=1, RW0=01 (write), LEN0=10 (8 bytes).
@@ -189,7 +196,12 @@ pub fn dr0_set_watch_write_qword(addr: u64) {
     }
 }
 
+pub fn dr0_get_watched() -> u64 {
+    DR0_WATCH_ADDR.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn dr0_clear() {
+    DR0_WATCH_ADDR.store(0, core::sync::atomic::Ordering::Relaxed);
     unsafe {
         let zero: u64 = 0;
         core::arch::asm!("mov dr7, {0}", in(reg) zero, options(nostack));
