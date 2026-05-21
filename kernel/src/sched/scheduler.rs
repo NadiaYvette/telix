@@ -349,6 +349,61 @@ pub fn record_rsp0_update(cpu: u32, target_tid: u32, new_rsp0: u64) {
     RSP0_RING_TID_TS[idx].store(tid_ts, Ordering::Relaxed);
 }
 
+/// #208 current_thread transition ring — per-CPU last 4 stores.
+/// Used together with the RSP0 ring to find "current_thread changed
+/// but RSP0 didn't update" paths.  If a tid appears in this ring but
+/// NOT in the RSP0 ring, that's the missing update_kernel_stack
+/// path we're hunting.
+static CT_RING_TID_TS: [core::sync::atomic::AtomicU64; RSP0_RING_TOTAL] = {
+    const Z: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    [Z; RSP0_RING_TOTAL]
+};
+static CT_RING_POS: [core::sync::atomic::AtomicU32; smp::MAX_CPUS] = {
+    const Z: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    [Z; smp::MAX_CPUS]
+};
+
+/// Record a current_thread store.  Called from every site that writes
+/// pcpu.current_thread (idle and non-idle alike).
+#[inline]
+pub fn record_current_thread_change(cpu: u32, new_tid: u32) {
+    let cpu_idx = cpu as usize;
+    if cpu_idx >= smp::MAX_CPUS {
+        return;
+    }
+    let pos = CT_RING_POS[cpu_idx].fetch_add(1, Ordering::Relaxed) as usize;
+    let slot = pos & RSP0_RING_MASK;
+    let idx = cpu_idx * RSP0_RING_SLOTS + slot;
+    let ts32 = (crate::arch::timer::monotonic_ns() & 0xFFFF_FFFF) as u64;
+    let tid_ts = (new_tid as u64) | (ts32 << 32);
+    CT_RING_TID_TS[idx].store(tid_ts, Ordering::Relaxed);
+}
+
+/// Dump the last current_thread changes for `cpu` (most-recent first).
+pub fn dump_ct_ring(cpu: u32) {
+    let cpu_idx = cpu as usize;
+    if cpu_idx >= smp::MAX_CPUS {
+        return;
+    }
+    let pos = CT_RING_POS[cpu_idx].load(Ordering::Relaxed) as usize;
+    for i in 0..RSP0_RING_SLOTS {
+        let slot_pos = (pos.wrapping_sub(1 + i)) & RSP0_RING_MASK;
+        let idx = cpu_idx * RSP0_RING_SLOTS + slot_pos;
+        let tid_ts = CT_RING_TID_TS[idx].load(Ordering::Relaxed);
+        if tid_ts == 0 {
+            continue;
+        }
+        let tid = (tid_ts & 0xFFFF_FFFF) as u32;
+        let ts32 = (tid_ts >> 32) as u32;
+        crate::println!(
+            "  CT-RING[{}]: tid={} ts32={}",
+            i, tid, ts32,
+        );
+    }
+}
+
 /// Dump the last RSP0 updates for `cpu` (most-recent first).  Called by
 /// the RSP0-MISMATCH probe at fire time.
 pub fn dump_rsp0_ring(cpu: u32) {
@@ -4189,6 +4244,7 @@ fn try_switch(current_sp: u64) -> u64 {
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
             pcpu.current_thread.store(idle_id, Ordering::Relaxed);
+            record_current_thread_change(smp::cpu_id(), idle_id as u32);
             return idle_sp;
         }
         trace_point("try_switch.cas_ok", next_id as u32);
@@ -4220,6 +4276,7 @@ fn try_switch(current_sp: u64) -> u64 {
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     trace_sched(next_id, 7); // 7=state_running
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
+    record_current_thread_change(smp::cpu_id(), next_id as u32);
     // Clear dispatching_tid: dispatch is fully visible — on_cpu=cpu,
     // state=Running, current_thread=tid all observable to other CPUs.
     if next_id != idle_id {
@@ -4267,6 +4324,7 @@ fn try_switch(current_sp: u64) -> u64 {
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
             pcpu.current_thread.store(idle_id, Ordering::Relaxed);
+            record_current_thread_change(smp::cpu_id(), idle_id as u32);
             return idle_sp;
         }
         // Check for corrupt exception frame (architecture-specific).
@@ -4287,6 +4345,7 @@ fn try_switch(current_sp: u64) -> u64 {
                 let idle_sp = thread_ref(idle_id).saved_sp;
                 unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
                 pcpu.current_thread.store(idle_id, Ordering::Relaxed);
+            record_current_thread_change(smp::cpu_id(), idle_id as u32);
                 return idle_sp;
             }
         }
@@ -4303,6 +4362,7 @@ fn try_switch(current_sp: u64) -> u64 {
                 let idle_sp = thread_ref(idle_id).saved_sp;
                 unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
                 pcpu.current_thread.store(idle_id, Ordering::Relaxed);
+            record_current_thread_change(smp::cpu_id(), idle_id as u32);
                 return idle_sp;
             }
         }
@@ -4473,6 +4533,7 @@ pub fn voluntary_reschedule() {
 
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
+    record_current_thread_change(smp::cpu_id(), next_id as u32);
     if next_id != idle_id {
         pcpu.dispatching_tid.store(0, Ordering::Release);
     }
@@ -7393,6 +7454,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
             let idle_sp2 = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
             pcpu.current_thread.store(idle_id, Ordering::Relaxed);
+            record_current_thread_change(smp::cpu_id(), idle_id as u32);
             pending_switch_sp()[cpu].store(idle_sp2, Ordering::Release);
             return;
         }
@@ -7409,6 +7471,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
+    record_current_thread_change(smp::cpu_id(), next_id as u32);
     let next_sp = next_t.saved_sp;
 
     // Sanity check: saved_sp must be within the thread's kstack.
@@ -7428,6 +7491,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
             pcpu.current_thread.store(idle_id, Ordering::Relaxed);
+            record_current_thread_change(smp::cpu_id(), idle_id as u32);
             pending_switch_sp()[cpu].store(idle_sp, Ordering::Release);
             return;
         }
@@ -9232,6 +9296,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
             pcpu.current_thread.store(idle_id, Ordering::Relaxed);
+            record_current_thread_change(smp::cpu_id(), idle_id as u32);
             pending_switch_sp()[cpu].store(idle_sp, Ordering::Release);
             let _ = irq_saved;
             return;
@@ -9249,6 +9314,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     pcpu.current_thread.store(next_id, Ordering::Relaxed);
+    record_current_thread_change(smp::cpu_id(), next_id as u32);
     let next_sp = next_t.saved_sp;
 
     // Reprogram the one-shot timer so this CPU wakes at the sleep deadline.
@@ -9432,6 +9498,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
     // Activate receiver.
     receiver.state = ThreadState::Running;
     pcpu.current_thread.store(receiver_tid, Ordering::Relaxed);
+    record_current_thread_change(smp::cpu_id(), receiver_tid as u32);
     {
         let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
         if receiver_tid != idle_id {
@@ -9457,6 +9524,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
             pcpu.current_thread.store(idle_id, Ordering::Relaxed);
+            record_current_thread_change(smp::cpu_id(), idle_id as u32);
             pending_switch_sp()[cpu].store(idle_sp, Ordering::Release);
             return;
         }

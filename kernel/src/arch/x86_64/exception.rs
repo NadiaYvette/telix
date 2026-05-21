@@ -415,6 +415,7 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                             frame.cs(), n,
                         );
                         crate::sched::scheduler::dump_rsp0_ring(cpu as u32);
+                        crate::sched::scheduler::dump_ct_ring(cpu as u32);
                     }
                 }
             }
