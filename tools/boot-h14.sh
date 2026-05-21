@@ -14,6 +14,12 @@
 #   TELIX_ACCEL         — passed through to run-qemu-x86.sh; default kvm
 #                         (KVM is required — TCG deadlocks the kernel
 #                         timer, per feedback_kvm_required.md)
+#   TELIX_BOOT_SLOT     — integer offset (default 0) for host port
+#                         allocation.  SSH port = 3222 + SLOT;
+#                         GDB port = 3234 + SLOT.  Use distinct slots
+#                         when launching parallel boots so they don't
+#                         collide on host TCP forwarding.  See
+#                         tools/boot-h14-multi.sh for the wrapper.
 
 set -e
 
@@ -43,6 +49,13 @@ fi
 LOGFILE="$LOGDIR/${ID}.log"
 TIMEOUT="${TELIX_BOOT_TIMEOUT:-1500}"
 ACCEL="${TELIX_ACCEL:-kvm}"
+
+# Per-slot host-port assignment so parallel boots don't collide on
+# port 3222 / 3234.  See boot-h14-multi.sh for the orchestrator that
+# uses this.
+SLOT="${TELIX_BOOT_SLOT:-0}"
+export TELIX_SSH_PORT="$((3222 + SLOT))"
+export TELIX_GDB_PORT="$((3234 + SLOT))"
 
 if [ -z "${TELIX_SKIP_BUILD:-}" ]; then
     echo "  [boot-h14] building kernel + userspace..."
