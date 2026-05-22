@@ -46,6 +46,28 @@ pub fn kstack_size() -> usize {
     page::page_size() << KSTACK_ORDER
 }
 
+/// #208 fix attempt: phys::alloc_pages does NOT zero pages on return.
+/// Kstacks were inheriting stale page contents — observed pattern was
+/// BIOS-region data (`0xf000ff53...`) at high kstack offsets where the
+/// running thread's call stack never reached.  When validate_iretq_frame
+/// read parked/transient frame slots above the live stack pointer, it
+/// saw that stale data and flagged it as BAD frame corruption.
+///
+/// Eight kstack alloc sites now call this helper; behavior identical to
+/// `alloc_pages(KSTACK_ORDER)` except the page is zeroed before return.
+#[inline]
+fn alloc_kstack_zeroed() -> Option<PhysAddr> {
+    let pa = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
+    unsafe {
+        core::ptr::write_bytes(
+            pa.as_usize() as *mut u8,
+            0,
+            kstack_size(),
+        );
+    }
+    Some(pa)
+}
+
 /// Two-level radix table for lockless task pointer lookup.
 /// Used by has_port_cap_fast() and SA atomics on the hot path.
 pub static TASK_TABLE: RadixTable = RadixTable::new();
@@ -2026,7 +2048,7 @@ fn sched_init() {
     // update_kernel_stack() sets TSS RSP0 correctly when switching to idle.
     // Without this, stack_base defaults to 0 and RSP0 = 0 + kstack_size(),
     // causing interrupts on the idle CPU to corrupt low memory.
-    let bsp_kstack = crate::mm::phys::alloc_pages(KSTACK_ORDER).expect("thread 0 kstack");
+    let bsp_kstack = alloc_kstack_zeroed().expect("thread 0 kstack");
     init_stack_canary(bsp_kstack.as_usize());
     unsafe {
         (*thread_ptr).id = 0;
@@ -2059,7 +2081,7 @@ fn create_idle_thread() -> Option<ThreadId> {
     let idle_port = crate::ipc::port::create_kernel_port(thread_port_handler, id as usize)?;
     // Allocate a proper kernel stack so update_kernel_stack() sets correct
     // TSS RSP0 when switching to this idle thread.
-    let idle_kstack = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
+    let idle_kstack = alloc_kstack_zeroed()?;
     init_stack_canary(idle_kstack.as_usize());
     unsafe {
         (*ptr).id = id;
@@ -2191,7 +2213,7 @@ fn alloc_task_id() -> Option<TaskId> {
 fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadId> {
     let id = alloc_thread_id()?;
 
-    let stack_page = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
+    let stack_page = alloc_kstack_zeroed()?;
     let stack_base = stack_page.as_usize();
     init_stack_canary(stack_base);
     let stack_top = stack_base + kstack_size();
@@ -2380,7 +2402,7 @@ fn do_spawn_heavy_work(
     }
 
     // Allocate kernel stack for this thread.
-    let kstack_page = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
+    let kstack_page = alloc_kstack_zeroed()?;
     let kstack_base = kstack_page.as_usize();
     init_stack_canary(kstack_base);
     let kstack_top = kstack_base + kstack_size();
@@ -2548,7 +2570,7 @@ fn create_thread_in_task(
         return None;
     }
 
-    let kstack_page = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
+    let kstack_page = alloc_kstack_zeroed()?;
     let kstack_base = kstack_page.as_usize();
     init_stack_canary(kstack_base);
     let kstack_top = kstack_base + kstack_size();
@@ -4377,9 +4399,31 @@ fn try_switch(current_sp: u64) -> u64 {
                 // Skip this thread — mark killed and pick idle instead.
                 thread_ref(next_id).killed.store(true, Ordering::Release);
                 let idle_sp = thread_ref(idle_id).saved_sp;
+                // #208 fallback-safety: BEFORE switching to idle, sanity-check
+                // idle's saved_sp.  Boot 11amfsq841 showed idle.saved_sp =
+                // 0xffffffff9df27900 (HIGH-VMA kernel data, in_kstack=false).
+                // Dispatching to that would set RSP to kernel-data memory →
+                // push/pop corrupt code or trigger #PF cascade → triple-fault.
+                // If idle is also corrupt, halt this CPU instead of restoring
+                // to a known-bad sp.  The other CPUs continue.
+                let idle_t = thread_ref(idle_id);
+                let idle_kbase = idle_t.stack_base as u64;
+                let idle_kend = idle_kbase + kstack_size() as u64;
+                let idle_sp_in_kstack =
+                    idle_sp >= idle_kbase && idle_sp < idle_kend;
+                if !idle_sp_in_kstack {
+                    crate::println!(
+                        "BUG: try_switch fallback: idle saved_sp={:#x} also OUTSIDE idle kstack {:#x}..{:#x} — halting CPU {}",
+                        idle_sp, idle_kbase, idle_kend, cpu
+                    );
+                    crate::arch::irq::disable();
+                    loop {
+                        unsafe { core::arch::asm!("hlt"); }
+                    }
+                }
                 unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
                 pcpu.current_thread.store(idle_id, Ordering::Relaxed);
-            record_current_thread_change(smp::cpu_id(), idle_id as u32);
+                record_current_thread_change(smp::cpu_id(), idle_id as u32);
                 return idle_sp;
             }
         }
@@ -6149,7 +6193,7 @@ pub fn fork_current() -> u64 {
     }
 
     // Allocate kernel stack for child thread.
-    let kstack_page = match crate::mm::phys::alloc_pages(KSTACK_ORDER) {
+    let kstack_page = match alloc_kstack_zeroed() {
         Some(p) => p,
         None => return u64::MAX,
     };
@@ -6389,7 +6433,7 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     }
 
     // Allocate kernel stack for child thread.
-    let kstack_page = match crate::mm::phys::alloc_pages(KSTACK_ORDER) {
+    let kstack_page = match alloc_kstack_zeroed() {
         Some(p) => p,
         None => return u64::MAX,
     };
@@ -6502,7 +6546,7 @@ pub fn clone_thread_in_task(
     let parent_sig_mask = thread_ref(parent_tid).sig_mask;
 
     // Allocate kernel stack for the new thread.
-    let kstack_page = match crate::mm::phys::alloc_pages(KSTACK_ORDER) {
+    let kstack_page = match alloc_kstack_zeroed() {
         Some(p) => p,
         None => return u64::MAX,
     };
