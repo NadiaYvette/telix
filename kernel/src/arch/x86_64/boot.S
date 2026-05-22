@@ -1,7 +1,14 @@
 // Telix kernel entry point for x86-64.
 //
+// Higher-half kernel: linker places us at VMA 0xFFFFFFFF80100000+, LMA 0x100000.
+// The bootloader loads the image at phys 0x100000 and jumps to `_start` at
+// phys 0x100000 (Multiboot doesn't care about VMA).  In 32-bit mode we
+// reference all symbols via `symbol - KERNEL_VIRT_OFFSET` to recover the
+// physical address.  After paging is on we long-jump to the 64-bit code at
+// its high-half VMA, where every later symbol reference works without
+// adjustment.
+//
 // Multiboot1 header + 32-bit protected mode entry + transition to 64-bit long mode.
-// QEMU -kernel loads Multiboot1 images into 32-bit protected mode.
 
 // ============================================================================
 // Multiboot1 Header (must be in first 8 KiB of the binary)
@@ -13,6 +20,10 @@
 .set MB_MAGIC,    0x1BADB002
 .set MB_FLAGS,    0x00000003    // Align modules on page boundaries + provide memory map
 .set MB_CHECKSUM, -(MB_MAGIC + MB_FLAGS)
+
+// KERNEL_VIRT_OFFSET = VMA - LMA.  Defined via linker.ld but assemblers can't
+// import linker variables, so duplicate here.  Keep in sync with linker.ld.
+.set KERNEL_VIRT_OFFSET, 0xFFFFFFFF80000000
 
 multiboot_header:
     .long   MB_MAGIC
@@ -26,8 +37,8 @@ multiboot_header:
 _efi_header:
     .long   EFI_HDR_MAGIC
     .long   0                       // reserved
-    .quad   _rust_entry             // 64-bit entry point
-    .quad   __boot_stack_top        // boot stack top
+    .quad   _rust_entry             // 64-bit entry point (high-half VMA)
+    .quad   __boot_stack_top        // boot stack top (high-half VMA)
 
 // ============================================================================
 // 32-bit entry point
@@ -41,6 +52,10 @@ _start:
     //   EAX = 0x2BADB002 (Multiboot1 magic)
     //   EBX = physical address of Multiboot info structure
     //   Interrupts disabled, A20 enabled, paging off, protected mode on.
+    //
+    // CS:EIP points at `_start`'s LMA (= phys 0x100000+).  All symbols in
+    // 32-bit code must be referenced via `[symbol - KERNEL_VIRT_OFFSET]` to
+    // recover the LMA.
 
     // Disable interrupts
     cli
@@ -49,29 +64,39 @@ _start:
     mov     esi, ebx
 
     // --- Zero BSS FIRST (before setting up page tables which live in BSS) ---
-    lea     edi, [__bss_start]
-    lea     ecx, [__bss_end]
+    lea     edi, [__bss_start - KERNEL_VIRT_OFFSET]
+    lea     ecx, [__bss_end - KERNEL_VIRT_OFFSET]
     sub     ecx, edi
     shr     ecx, 2             // Count in dwords
     xor     eax, eax
     rep     stosd
 
-    // --- Set up page tables for identity mapping first 1 GiB using 2 MiB pages ---
-    // PML4[0] -> PDPT
-    // PDPT[0] -> PD
-    // PD[0..511] -> 2 MiB pages (identity mapped)
+    // --- Set up page tables: low identity (PML4[0]) + high-half (PML4[511]) ---
     //
-    // Page tables are in BSS (just zeroed above), so they start clean.
+    // Low identity (PML4[0] → boot_pdpt → 4 × 1 GiB gigapages 0..4 GiB):
+    //   Needed for (a) the post-paging-on CR3 load that runs at low EIP, and
+    //   (b) phys::alloc_page consumers that use the returned PA as a virt.
+    //
+    // High-half (PML4[511] → boot_pdpt_hi → 1 GiB gigapages 0..2 GiB at
+    //   PDPT[510] and PDPT[511]):
+    //   Maps VA 0xFFFFFFFF80000000..0xFFFFFFFFFFFFFFFF → PA 0..0x80000000.
+    //   Kernel image (loaded at phys 0x100000) is reachable at high-half VMA
+    //   0xFFFFFFFF80100000.
 
-    // PML4[0] = address of PDPT | present | writable
-    lea     eax, [boot_pdpt]
-    or      eax, 0x03       // Present + Writable
-    mov     [boot_pml4], eax
+    // PML4[0] = boot_pdpt (present + writable)
+    lea     eax, [boot_pdpt - KERNEL_VIRT_OFFSET]
+    or      eax, 0x03
+    lea     ebx, [boot_pml4 - KERNEL_VIRT_OFFSET]
+    mov     [ebx], eax
 
-    // Fill PDPT with 4 entries using 1 GiB pages (identity map 0..4 GiB).
-    // This covers the LAPIC MMIO region at 0xFEE00000 (in the 3-4 GiB range).
-    // PDPT entry: address | Present | Writable | PageSize (1 GiB page).
-    lea     ebx, [boot_pdpt]
+    // PML4[511] = boot_pdpt_hi (present + writable)
+    lea     eax, [boot_pdpt_hi - KERNEL_VIRT_OFFSET]
+    or      eax, 0x03
+    mov     [ebx + 511*8], eax
+
+    // Fill boot_pdpt: 4 × 1 GiB gigapages identity-mapping 0..4 GiB.
+    // PDPT entry: address | Present | Writable | PageSize (1 GiB page) = 0x83.
+    lea     ebx, [boot_pdpt - KERNEL_VIRT_OFFSET]
     mov     dword ptr [ebx + 0x00], 0x00000083     // 0 GiB
     mov     dword ptr [ebx + 0x04], 0x00000000
     mov     dword ptr [ebx + 0x08], 0x40000083     // 1 GiB
@@ -80,6 +105,15 @@ _start:
     mov     dword ptr [ebx + 0x14], 0x00000000
     mov     dword ptr [ebx + 0x18], 0xC0000083     // 3 GiB (includes LAPIC)
     mov     dword ptr [ebx + 0x1C], 0x00000000
+
+    // Fill boot_pdpt_hi: only entries 510 + 511 (2 × 1 GiB at low 2 GiB phys).
+    // VA 0xFFFFFFFF80000000 → PDPT[510] → phys 0x00000000.
+    // VA 0xFFFFFFFFC0000000 → PDPT[511] → phys 0x40000000.
+    lea     ebx, [boot_pdpt_hi - KERNEL_VIRT_OFFSET]
+    mov     dword ptr [ebx + 510*8 + 0], 0x00000083    // → phys 0x00000000
+    mov     dword ptr [ebx + 510*8 + 4], 0x00000000
+    mov     dword ptr [ebx + 511*8 + 0], 0x40000083    // → phys 0x40000000
+    mov     dword ptr [ebx + 511*8 + 4], 0x00000000
 
     // --- Enable PAE + SSE (OSFXSR, OSXMMEXCPT) ---
     mov     eax, cr4
@@ -92,7 +126,7 @@ _start:
     mov     cr0, eax
 
     // --- Load PML4 into CR3 ---
-    lea     eax, [boot_pml4]
+    lea     eax, [boot_pml4 - KERNEL_VIRT_OFFSET]
     mov     cr3, eax
 
     // --- Enable long mode via EFER MSR ---
@@ -106,15 +140,38 @@ _start:
     or      eax, (1 << 31)  // CR0.PG
     mov     cr0, eax
 
-    // --- Load 64-bit GDT and far jump to 64-bit code ---
-    lgdt    [boot_gdt_ptr]
-    ljmp    0x08, offset _start64
+    // --- Load 64-bit GDT and far jump to 64-bit code at LOW (LMA) RIP first ---
+    // We can't ljmp directly to the high-half VMA from 32-bit (immediate is
+    // truncated to 32 bits and the high VMA's upper half would be lost).
+    // Instead: ljmp to `_start64` at its LMA (phys = VMA - KERNEL_VIRT_OFFSET).
+    // PML4[0] still identity-maps low 4 GiB, so the CPU continues fetching
+    // at the low VMA without faulting.  Inside _start64, immediately do a
+    // 64-bit absolute jump to the high-VMA copy.
+    lgdt    [boot_gdt_ptr - KERNEL_VIRT_OFFSET]
+    ljmp    0x08, offset _start64_low
+
+// `_start64_low` is the LMA-relative location of the 64-bit entry; the linker
+// resolves `_start64_low` to its VMA, but `offset` in a 32-bit ljmp truncates
+// to 32 bits.  Define the symbol so it has the same LMA byte position as
+// `_start64`'s VMA byte position minus KERNEL_VIRT_OFFSET; the assembler will
+// emit the LMA as the immediate.
+.set _start64_low, _start64 - KERNEL_VIRT_OFFSET
 
 // ============================================================================
 // 64-bit entry point
 // ============================================================================
 .code64
 _start64:
+    // We just arrived at LOW (LMA) RIP via ljmp from 32-bit code.  CPU is in
+    // 64-bit mode now; we can use full 64-bit immediates.  First, jump to
+    // the HIGH-half VMA copy of ourselves.
+    movabs  rax, offset _start64_high
+    jmp     rax
+
+_start64_high:
+    // Now executing at HIGH (VMA) RIP.  All later code uses linker-assigned
+    // high VMAs uniformly.
+
     // Load data segment selectors
     mov     ax, 0x10
     mov     ds, ax
@@ -123,7 +180,7 @@ _start64:
     mov     gs, ax
     mov     ss, ax
 
-    // Set up the boot stack
+    // Set up the boot stack at its high-half VMA (BSS is in the high mapping).
     lea     rsp, [__boot_stack_top]
 
     // BSS was already zeroed in 32-bit mode above.
@@ -153,7 +210,12 @@ boot_gdt_end:
 
 boot_gdt_ptr:
     .short  boot_gdt_end - boot_gdt - 1
-    .long   boot_gdt
+    // GDT base needs to be the LMA so the 32-bit lgdt picks up the right
+    // physical address.  Subtract KERNEL_VIRT_OFFSET from the linker-assigned
+    // VMA to recover the LMA.  The full 64-bit value is encoded as 8 bytes
+    // (lgdt with REX.W = 8-byte base in long mode; in 32-bit lgdt it's 4
+    // bytes, and the linker truncates to low 32 = the LMA).
+    .quad   boot_gdt - KERNEL_VIRT_OFFSET
 
 // ============================================================================
 // Boot page tables (must be page-aligned)
@@ -169,6 +231,11 @@ boot_pdpt:
     .space  4096
 
 boot_pd:
+    .space  4096
+
+// High-half PDPT (PML4[511] → here).  Maps two 1-GiB gigapages covering
+// the low 2 GiB physical, exposed at VA 0xFFFFFFFF80000000..0xFFFFFFFFFFFFFFFF.
+boot_pdpt_hi:
     .space  4096
 
 // ============================================================================

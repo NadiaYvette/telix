@@ -86,6 +86,23 @@ pub fn start_secondary_cpus() {
         );
     }
 
+    // Higher-half adjustment: sgdt records the GDT's high-half VMA, but the
+    // AP trampoline's 32-bit `lgdt [0x8F20]` (ap_trampoline.S:81) decodes
+    // operands as m16:32 — 2-byte limit + 4-byte linear base.  It reads the
+    // low 4 bytes of the 8-byte sgdt base, which for a high VMA like
+    // 0xFFFFFFFF80100A00 is `0x80100A00` ≈ 2 GiB phys.  That is NOT where
+    // the GDT actually lives (its LMA is ~1 MiB), so the AP loads a bogus
+    // GDT and the subsequent far-jump faults → "(APIC X) startup timeout".
+    // Rewrite the 8-byte base in place to the LMA so the trampoline's
+    // 32-bit lgdt reads the correct low 4 bytes (the LMA itself, < 4 GiB).
+    {
+        const KERNEL_VIRT_OFFSET: u64 = 0xFFFFFFFF80000000;
+        let vma_base =
+            u64::from_le_bytes(gdt_ptr_bytes[2..10].try_into().unwrap());
+        let lma_base = vma_base.wrapping_sub(KERNEL_VIRT_OFFSET);
+        gdt_ptr_bytes[2..10].copy_from_slice(&lma_base.to_le_bytes());
+    }
+
     // Build list of APIC IDs to start. Use ACPI MADT if available,
     // otherwise probe sequentially 0..num_cpus().
     //

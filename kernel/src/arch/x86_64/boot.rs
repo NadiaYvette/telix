@@ -18,8 +18,15 @@ unsafe extern "C" {
 pub const RAM_BASE: usize = 0x10_0000;
 
 /// Physical address past the end of the kernel image (from linker script).
+///
+/// `__kernel_end` is a linker symbol; its address carries the high-half VMA
+/// because the linker links the kernel at `0xFFFFFFFF80100000+`.  We need to
+/// return the corresponding PA (= VMA - KERNEL_VIRT_OFFSET) so the phys
+/// allocator can correctly compute the managed-RAM range against `ram_end`,
+/// which is itself a low PA.
 pub fn kernel_end_addr() -> usize {
-    unsafe { &__kernel_end as *const u8 as usize }
+    const KERNEL_VIRT_OFFSET: usize = 0xFFFFFFFF80000000;
+    unsafe { (&__kernel_end as *const u8 as usize) - KERNEL_VIRT_OFFSET }
 }
 
 /// Rust entry point called from assembly (Multiboot) or EFI stub.
