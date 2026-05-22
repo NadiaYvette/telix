@@ -3486,9 +3486,11 @@ fn try_irfs_read_mmap(
             return MmapFillResult::Failed;
         }
         if total_target == 0 {
+            // Unreachable from handle_mmap (caller guards with `if to_read > 0`).
             return MmapFillResult::Failed;
         }
         if total_target > u32::MAX as usize || aligned_len > u32::MAX as usize {
+            // Unreachable in practice: mmap_anon rejects >4 GiB requests first.
             return MmapFillResult::Failed;
         }
 
@@ -8056,7 +8058,14 @@ fn handle_mmap(pi: usize, caller_port: u64, args: &[u64; 6]) -> u64 {
                                 return 0; // REPLY_DEFERRED suppresses reply
                             }
                             MmapFillResult::Failed => {
-                                // fall through to sync irfs_read_bulk loop
+                                // fall through to sync irfs_read_bulk loop.
+                                // Reaches here when scratch slots are exhausted
+                                // (FS_ASYNC_SCRATCH_SLOTS=4), pending-async slots
+                                // are full (MAX_PENDING_ASYNC=64), or send_nb to
+                                // initramfs_srv fails under backpressure.  The
+                                // lib_cache fast-path at line 7996 eliminates this
+                                // arm for files already fully cached, but the first
+                                // mmap and contention-time arrivals still land here.
                             }
                         }
                         let mut total = 0usize;
