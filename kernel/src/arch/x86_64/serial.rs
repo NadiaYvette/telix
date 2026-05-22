@@ -147,6 +147,27 @@ pub fn putc(c: u8) {
     Serial.putc(c);
 }
 
+/// #208 panic-print bypass: a `core::fmt::Write` impl that emits every
+/// byte directly to the UART without going through `StackBuf` or the
+/// print lock.  When `StackBuf::len` has been corrupted by the #208
+/// corruption family, the regular `println!` path can't print the panic
+/// message (the bounds-check panic on the corrupted slice recursively
+/// re-enters the panic handler, leading to silent triple-fault).  The
+/// panic handler should write through this instead.
+pub struct DirectUart;
+
+impl fmt::Write for DirectUart {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for &b in s.as_bytes() {
+            if b == b'\n' {
+                Serial.putc(b'\r');
+            }
+            Serial.putc(b);
+        }
+        Ok(())
+    }
+}
+
 // #154 v2 polite-lock for print serialization.
 //
 // Replaces the previous interrupt-safe `SpinLock`, which disabled IRQs

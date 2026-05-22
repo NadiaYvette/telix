@@ -209,6 +209,27 @@ pub fn dr0_clear() {
     }
 }
 
+/// #208 saved_sp watchpoint — global target address that EVERY CPU
+/// arms DR0 to watch.  When set non-zero, each CPU lazily arms its
+/// own DR0 (via dr0_ensure_watching) at top of x86_exception_handler.
+/// Any write triggers DR0-HIT; the handler filters CPU stub pushes,
+/// so legitimate try_switch writes log as DR0-HIT-OFF-PATH with the
+/// writer's RIP.
+pub static GLOBAL_SAVED_SP_WATCH_ADDR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub fn dr0_ensure_watching(addr: u64) {
+    if addr == 0 {
+        return;
+    }
+    let cur = DR0_WATCH_ADDR.load(core::sync::atomic::Ordering::Relaxed);
+    if cur == addr {
+        return;
+    }
+    dr0_set_watch_write_qword(addr);
+}
+
 /// Read DR6, clear the B0..B3 status bits, return the original value.
 pub fn dr6_read_clear() -> u64 {
     let val: u64;

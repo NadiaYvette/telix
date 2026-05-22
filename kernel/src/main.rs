@@ -18,7 +18,22 @@ mod trace;
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    println!("KERNEL PANIC: {}", info);
+    // #208: panic via `DirectUart` rather than `println!`.  The regular
+    // path uses `StackBuf` which is the same field family the #208
+    // corruption hits — when `len` is overwritten with a kstack-shaped
+    // value, the bounds-check inside `_print` re-panics, recursing the
+    // panic handler and producing a silent triple-fault.  Going direct
+    // bypasses StackBuf entirely so we see the panic text.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::fmt::Write;
+        let mut d = crate::arch::x86_64::serial::DirectUart;
+        let _ = writeln!(d, "KERNEL PANIC: {}", info);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        println!("KERNEL PANIC: {}", info);
+    }
     loop {
         core::hint::spin_loop();
     }

@@ -355,6 +355,44 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
                 crate::println!("  frame[{}]={:#018x}", i, val);
             }
         }
+        // #208 H-A vs H-B probe: also dump the frame at tref.saved_sp.
+        // If validate's sp ≠ saved_sp, we're checking the wrong frame.
+        // If BOTH frames are corrupt → page-reuse / aliasing bug (H-A).
+        // If saved_sp frame is clean → validate's sp path is wrong (H-B).
+        let saved_sp = tref.saved_sp;
+        if saved_sp != 0 && saved_sp != sp {
+            crate::println!(
+                "  [also dumping at saved_sp={:#x} (Δ={:#x})]",
+                saved_sp,
+                saved_sp.wrapping_sub(sp) as i64,
+            );
+            for i in 17..22u64 {
+                let val = unsafe { *((saved_sp + i * 8) as *const u64) };
+                let label = match i {
+                    17 => "RIP",
+                    18 => "CS ",
+                    19 => "FLG",
+                    20 => "RSP",
+                    21 => "SS ",
+                    _ => "   ",
+                };
+                crate::println!(
+                    "  ssp[{}={}]={:#018x}", i, label, val,
+                );
+            }
+        }
+        // #208 saved_sp watchpoint: arm GLOBAL DR0 to catch the next
+        // write to tref.saved_sp.  All CPUs will arm DR0 on this
+        // address at their next x86_exception_handler entry.  Any
+        // writer outside the stub-region (which is filtered in the
+        // #DB handler) logs as DR0-HIT-OFF-PATH with the writer's RIP.
+        let saved_sp_addr = &tref.saved_sp as *const u64 as u64;
+        crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
+            .store(saved_sp_addr, core::sync::atomic::Ordering::Relaxed);
+        crate::println!(
+            "DR0-WATCH-ARMED: addr={:#x} (= &tref({}).saved_sp)",
+            saved_sp_addr, tid,
+        );
         // Mark the current thread (the one with corrupt state) as killed
         // so the scheduler won't re-enqueue it on the next tick.
         tref.killed.store(true, core::sync::atomic::Ordering::Release);
@@ -377,8 +415,70 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
     let cpu = crate::sched::smp::cpu_id() as usize;
     crate::sched::scheduler::clear_pending_switch(cpu);
 
+    // #208 saved_sp watchpoint — one-shot arm on tid=4's saved_sp
+    // field as soon as the Thread is allocated.  Pre-fix, BIOS-IVT
+    // corruption clusters on tid=4 (init).  Proactive arming catches
+    // writes BEFORE BAD frame fires (post-fire arming was useless
+    // because killed thread is never written again).
+    {
+        let target = crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if target == 0 {
+            // First exception_handler call where tid=4 exists: arm it.
+            let t4 =
+                crate::sched::scheduler::thread_ref_opt(4);
+            if let Some(t) = t4 {
+                let addr = &t.saved_sp as *const u64 as u64;
+                crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
+                    .store(addr, core::sync::atomic::Ordering::Relaxed);
+                crate::println!(
+                    "DR0-WATCH-PROACTIVE: addr={:#x} cpu={}",
+                    addr, cpu,
+                );
+            }
+        } else {
+            crate::arch::x86_64::gdt::dr0_ensure_watching(target);
+        }
+    }
+
     let frame = unsafe { &mut *(frame_sp as *mut ExceptionFrame) };
     let vector = frame.vector();
+
+    // #208 early-stage CS sanity check.  Runs IMMEDIATELY at handler
+    // entry, before any other Rust code that could write to the
+    // iretq slots.  If CS is bad here, the corruption is in the
+    // assembly stub or earlier (extremely unlikely — CPU push and
+    // __isr_common pushes don't touch +144).  If CS is OK here but
+    // bad at validate (end of handler), the corruption happened
+    // during the Rust handler — narrows the writer hunt to the
+    // dispatch/tick/syscall code paths.  Rate-limited to 50.
+    {
+        let cs_early = unsafe {
+            core::ptr::read_volatile(&frame.regs[18] as *const u64)
+        };
+        if cs_early != 0x08 && cs_early != 0x23 {
+            static EARLY_BAD_CS: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = EARLY_BAD_CS.fetch_add(
+                1, core::sync::atomic::Ordering::Relaxed,
+            );
+            if n < 50 {
+                crate::println!(
+                    "EARLY-BAD-CS: vec={} cs={:#x} rip={:#x} frame_sp={:#x} cpu={} n={}",
+                    vector,
+                    cs_early,
+                    unsafe {
+                        core::ptr::read_volatile(
+                            &frame.regs[17] as *const u64,
+                        )
+                    },
+                    frame_sp,
+                    cpu,
+                    n,
+                );
+            }
+        }
+    }
 
     // #135 last_irq_ns: stamp every exception/IRQ entry so the rescue
     // can distinguish "CPU is alive but try_switch not reached" from
@@ -469,6 +569,29 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                     }
                 } else {
                     let tid = crate::sched::scheduler::current_thread_id();
+                    let tref = crate::sched::scheduler::thread_ref(tid);
+                    let kbase = tref.stack_base as u64;
+                    let ksize = crate::sched::scheduler::kstack_size() as u64;
+                    let watched =
+                        crate::arch::x86_64::gdt::dr0_get_watched();
+                    // Read actual DR0 register to verify it matches.
+                    let dr0_reg: u64;
+                    unsafe {
+                        core::arch::asm!("mov {0}, dr0", out(reg) dr0_reg);
+                    }
+                    let in_kstack =
+                        watched >= kbase && watched < kbase + ksize;
+                    // frame_sp is rsp at handler entry; compute rsp at
+                    // exception entry (before CPU/stub pushes). Same-CPL:
+                    // CPU pushes 3 quads + stub pushes 2 (vec, err) + 15
+                    // GPRs = 20 * 8 = 160 bytes.
+                    let rsp_entry = frame_sp + 22 * 8;
+                    let rdi = frame.regs[12]; // GPR push order check
+                    let rax = frame.regs[14];
+                    crate::println!(
+                        "DR0-HIT-OFF-PATH-OVERLAP: watched={:#x} dr0_reg={:#x} kbase={:#x}..{:#x} in_kstack={} rsp_entry={:#x} rdi={:#x} rax={:#x}",
+                        watched, dr0_reg, kbase, kbase + ksize, in_kstack, rsp_entry, rdi, rax,
+                    );
                     crate::println!(
                         "DR0-HIT-OFF-PATH: dr6={:#x} rip={:#x} tid={} cpu={} cs={:#x}",
                         dr6, rip, tid, cpu, frame.cs(),
@@ -615,24 +738,35 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
         }
         7 => exception_fault("Device Not Available (#NM)", frame),
         8 => {
-            // #DF now runs on IST stack — safe to print diagnostics.
+            // #DF runs on IST stack — safe to print diagnostics.  Use
+            // DirectUart (#208) instead of println! because if the kernel
+            // got into #DF via the corruption family, StackBuf's `len`
+            // field is likely also corrupted and println! would re-panic
+            // → silent triple-fault.  DirectUart writes one byte at a
+            // time directly to COM1 with no kstack temporaries.
+            use core::fmt::Write;
             let cr2: u64;
             unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2); }
             let tid = crate::sched::scheduler::current_thread_id();
-            crate::println!(
+            let mut d = crate::arch::x86_64::serial::DirectUart;
+            let _ = writeln!(
+                d,
                 "DOUBLE FAULT (#DF): RIP={:#x} RSP={:#x} CR2={:#x} tid={} error={:#x}",
                 frame.rip(), frame.rsp(), cr2, tid, frame.error_code()
             );
-            crate::println!(
+            let _ = writeln!(
+                d,
                 "  RAX={:#x} RBX={:#x} RCX={:#x} RDX={:#x}",
                 frame.rax(), frame.rbx(), frame.rcx(), frame.rdx()
             );
-            crate::println!(
+            let _ = writeln!(
+                d,
                 "  RSI={:#x} RDI={:#x} RBP={:#x} CS={:#x} SS={:#x}",
                 frame.rsi(), frame.rdi(), frame.rbp(), frame.cs(), frame.ss()
             );
             let tref = crate::sched::scheduler::thread_ref(tid);
-            crate::println!(
+            let _ = writeln!(
+                d,
                 "  task={} saved_sp={:#x} kstack={:#x} personality_frame_sp={:#x}",
                 tref.task_id, tref.saved_sp, tref.stack_base,
                 tref.personality_frame_sp
