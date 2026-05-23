@@ -241,21 +241,40 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
     // happened BEFORE validate_iretq_frame was called — the validator is
     // innocent for these cases.  Captures the BAD-frame data path before
     // any of our own work could possibly perturb the bytes.
+    //
+    // ALSO dump the iretq SHADOW (taken at park-time) and saved_sp last-
+    // writer log.  Three discriminations now possible:
+    //   1. Shadow inside kstack, shadow.cs valid, pre snap garbage
+    //      → saved_sp itself was OK; the memory at sp got mutated after
+    //        save (use-after-recycle of stack page).
+    //   2. Shadow not taken (sp outside kstack at save time)
+    //      → saved_sp was bogus from the start; check writer log for who
+    //        set it and to what.
+    //   3. Shadow garbage too
+    //      → the save itself observed garbage (snapshot at wrong sp).
     if sp >= 0x10000 {
         let pre_cs = pre_snap_all[5];
         if pre_cs > 0xffff || (pre_cs != 0x08 && pre_cs != 0x23) {
             let tid = crate::sched::scheduler::current_thread_id();
+            let tref = crate::sched::scheduler::thread_ref(tid);
             crate::println!(
                 "VALIDATOR-PRE-BAD: tid={} cpu={} sp={:#x} vec={} pre_rsp={:#x} \
+                 stack_base={:#x} saved_sp_now={:#x} saved_sp_source={} \
                  pre.rip={:#x} pre.cs={:#x} pre.rflags={:#x} pre.rsp={:#x} pre.ss={:#x} \
-                 pre_below=[{:#x} {:#x} {:#x} {:#x}] pre_above=[{:#x} {:#x} {:#x} {:#x}]",
+                 pre_below=[{:#x} {:#x} {:#x} {:#x}] pre_above=[{:#x} {:#x} {:#x} {:#x}] \
+                 shadow.sp={:#x} shadow.rip={:#x} shadow.cs={:#x} shadow.rflags={:#x} shadow.rsp={:#x} shadow.ss={:#x}",
                 tid,
                 crate::sched::smp::cpu_id(),
                 sp, vector, pre_rsp,
+                tref.stack_base, tref.saved_sp, tref.saved_sp_source,
                 pre_snap_all[4], pre_snap_all[5], pre_snap_all[6], pre_snap_all[7], pre_snap_all[8],
                 pre_snap_all[0], pre_snap_all[1], pre_snap_all[2], pre_snap_all[3],
                 pre_snap_all[9], pre_snap_all[10], pre_snap_all[11], pre_snap_all[12],
+                tref.iretq_shadow_sp, tref.iretq_shadow_rip, tref.iretq_shadow_cs,
+                tref.iretq_shadow_rflags, tref.iretq_shadow_rsp, tref.iretq_shadow_ss,
             );
+            // Last-writer log: who SET saved_sp last, with what value + tag.
+            crate::sched::scheduler::dump_saved_sp_log(tid);
         }
     }
     // #135 first-iretq-to-user probe: log the FIRST time we return-to-user
