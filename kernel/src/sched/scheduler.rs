@@ -492,6 +492,22 @@ pub fn snapshot_iretq_shadow(tid: ThreadId, sp: u64) {
 /// Skipped if no shadow exists or it was taken for a different sp.
 #[inline]
 pub fn check_iretq_shadow(tid: ThreadId, sp: u64) {
+    check_iretq_shadow_inner(tid, sp, true);
+}
+
+/// At-dispatch variant — skips the `state == Blocked` gate because
+/// try_switch flips state to Running BEFORE the check fires.  The
+/// shadow vs actual comparison at this exact moment captures
+/// "frame at saved_sp changed since last park" — which is the
+/// #208 STALE-WRITE-RACE complement targeting frame memory rather
+/// than the saved_sp field.
+#[inline]
+pub fn check_iretq_shadow_at_dispatch(tid: ThreadId, sp: u64) {
+    check_iretq_shadow_inner(tid, sp, false);
+}
+
+#[inline]
+fn check_iretq_shadow_inner(tid: ThreadId, sp: u64, require_blocked: bool) {
     let t = thread_ref(tid);
     if t.iretq_shadow_sp == 0 || t.iretq_shadow_sp != sp {
         return;
@@ -502,7 +518,7 @@ pub fn check_iretq_shadow(tid: ThreadId, sp: u64) {
     // at the same kstack_top frame slot).  Boot 619 had 194 noise
     // fires on Running threads; this gate eliminates them so any
     // surviving DELTA actually means "frame at parked address changed."
-    if t.state != ThreadState::Blocked {
+    if require_blocked && t.state != ThreadState::Blocked {
         return;
     }
     let rip;
@@ -4361,6 +4377,47 @@ fn try_switch(current_sp: u64) -> u64 {
         // the thread we're switching into.  If clobbered, we've
         // localized the corruption to writes near stack_base.
         check_stack_canary(next_id, "try_switch.next");
+        // #208 FRAME-DELTA at dispatch — compare iretq frame contents
+        // at saved_sp against the shadow taken at park-time.  STALE-WRITE
+        // showed saved_sp itself is correct; this catches the
+        // complement: frame memory at saved_sp got overwritten since
+        // last park.  Skips the state==Blocked gate because state was
+        // just flipped to Running for this dispatch.
+        if !is_idle {
+            check_iretq_shadow_at_dispatch(next_id, sp);
+        }
+        // #208 STALE-WRITE invariant: every legitimate writer of
+        // `saved_sp` pairs the field write with `record_saved_sp_write`.
+        // If `t.saved_sp != SAVED_SP_LAST_VALUE[tid]` at dispatch, some
+        // path is writing saved_sp WITHOUT going through the canonical
+        // record path — and that path is the unknown corruption source.
+        // Skip idle (its saved_sp may legitimately differ — it runs on
+        // the boot/AP stack instead of its allocated kstack).  Skip if
+        // recorded == 0 (no write recorded yet — fresh slot).
+        if !is_idle && (next_id as usize) < SAVED_SP_LOG_CAP {
+            let rec_value = SAVED_SP_LAST_VALUE[next_id as usize]
+                .load(Ordering::Relaxed);
+            if rec_value != 0 && rec_value != sp {
+                static STALE_WRITE_LOG_COUNT:
+                    core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = STALE_WRITE_LOG_COUNT.fetch_add(
+                    1, Ordering::Relaxed,
+                );
+                if n < 16 {
+                    let rec_meta = SAVED_SP_LAST_META[next_id as usize]
+                        .load(Ordering::Relaxed);
+                    let tag = (rec_meta & 0xFF) as u8;
+                    let cpu_logged = ((rec_meta >> 8) & 0xFF) as u8;
+                    let ts32 = (rec_meta >> 32) as u32;
+                    crate::println!(
+                        "STALE-WRITE-RACE: tid={} actual_sp={:#x} recorded={:#x} (writer_tag={} cpu={} ts32={}) src={} n={}",
+                        next_id, sp, rec_value, tag, cpu_logged, ts32,
+                        next_t.saved_sp_source, n
+                    );
+                }
+            }
+        }
         // Idle threads run on boot stacks (ring 0), not their allocated kstack.
         // Their saved_sp is legitimately outside the kstack range — skip the check.
         if !is_idle && (sp < kbase as u64 || sp >= kend) {
