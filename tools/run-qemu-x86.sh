@@ -172,6 +172,15 @@ if [ "${TELIX_NO_REBOOT:-}" = "1" ]; then
     QEMU_ARGS+=(-no-reboot)
 fi
 
+# QEMU CPU-trace dump for debugging silent triple-faults.  Writes
+# every exception/IRQ delivery to /tmp/qemu-int-${ID}.log.  Voluminous
+# but invaluable when the kernel hits a triple fault with no serial
+# output.  Set TELIX_QEMU_INT=1 to enable (KVM filters most events;
+# use TCG for full coverage at cost of timer-deadlock risk).
+if [ "${TELIX_QEMU_INT:-}" = "1" ]; then
+    QEMU_ARGS+=(-d int,cpu_reset,guest_errors -D "/tmp/qemu-int-${ID:-debug}.log")
+fi
+
 # Memory locking: prevent host from paging out QEMU memory under load.
 # Uses CAP_SYS_NICE on the qemu binary (setcap'd separately).  Helps when
 # the host is swap-pressured but does NOT set SCHED_FIFO scheduling.

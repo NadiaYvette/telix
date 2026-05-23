@@ -70,7 +70,7 @@ START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "[boot $ID start] $START_TS" > "$LOGFILE"
 
 # QEMU exits 124 on timeout (matches GNU `timeout`'s exit code).
-TELIX_ACCEL="$ACCEL" timeout --foreground "${TIMEOUT}" \
+ID="$ID" TELIX_ACCEL="$ACCEL" timeout --foreground "${TIMEOUT}" \
     "$ROOTDIR/tools/run-qemu-x86.sh" "$KERNEL" >> "$LOGFILE" 2>&1
 RC=$?
 
