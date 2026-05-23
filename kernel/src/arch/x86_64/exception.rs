@@ -759,9 +759,14 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                         "DR0-HIT-OFF-PATH-OVERLAP: watched={:#x} dr0_reg={:#x} kbase={:#x}..{:#x} in_kstack={} rsp_entry={:#x} rdi={:#x} rax={:#x}",
                         watched, dr0_reg, kbase, kbase + ksize, in_kstack, rsp_entry, rdi, rax,
                     );
+                    // #208 ts probe: timestamp DR0 hits so a post-mortem can
+                    // sort by time and look for overlapping write windows
+                    // from different CPUs on the same tid — signature of
+                    // concurrent dispatch of the same thread.
+                    let ts_ns = crate::arch::timer::monotonic_ns();
                     crate::println!(
-                        "DR0-HIT-OFF-PATH: dr6={:#x} rip={:#x} tid={} cpu={} cs={:#x}",
-                        dr6, rip, tid, cpu, frame.cs(),
+                        "DR0-HIT-OFF-PATH: dr6={:#x} rip={:#x} tid={} cpu={} cs={:#x} ts_ns={}",
+                        dr6, rip, tid, cpu, frame.cs(), ts_ns,
                     );
                     crate::arch::x86_64::gdt::dr0_clear();
                 }
