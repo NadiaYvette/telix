@@ -4828,6 +4828,26 @@ pub fn block_current(_reason: BlockReason) {
     crate::arch::timer::program_oneshot_ns(get_monotonic_ns() + TICK_INTERVAL_NS);
     // Enable interrupts so the timer can preempt us.
     let saved = crate::arch::irq::save_and_enable();
+    // #208 zero_daemon corruption-family fix: force at least one WFI
+    // cycle before allowing wakeup-based exit.  Previously, if a
+    // wake_thread arrived in the window between the caller's
+    // clear_wakeup_flag and block_current's first wakeup check, the
+    // loop broke immediately — no IRQ ever fired, so try_switch never
+    // ran with prev=tid, so saved_sp stayed pinned at create_thread's
+    // initial frame_sp.  zero_daemon then runs again, its calls
+    // overwrite that frame, and the next dispatch reads a corrupted
+    // iretq frame (RIP=0/CS=0) → kernel detects "BUG: try_switch bad
+    // frame" → kills zero_daemon → boot resets.
+    //
+    // The `yielded` gate ensures we WFI at least once, which fires
+    // at minimum the just-programmed timer IRQ; that IRQ runs
+    // try_switch with prev=tid (yield_asap was set above), which
+    // saves saved_sp to a valid IRQ frame via the try_switch.save
+    // path.  Subsequent dispatches then iretq from a valid frame.
+    //
+    // Killed remains an immediate exit (thread is being torn down,
+    // no need to preserve restart state).
+    let mut yielded = false;
     loop {
         // Set state=Blocked before each WFI iteration.  Wake_thread will
         // CAS this back to Ready and enqueue when wakeup arrives.  Set
@@ -4838,10 +4858,10 @@ pub fn block_current(_reason: BlockReason) {
         // (we resume after WFI via normal dispatch).
         unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Blocked;
         record_trans(tid as u32, 13, ThreadState::Blocked, tref.on_cpu.load(Ordering::Relaxed));
-        if tref.wakeup.load(Ordering::Acquire) {
+        if tref.killed.load(Ordering::Acquire) {
             break;
         }
-        if tref.killed.load(Ordering::Acquire) {
+        if yielded && tref.wakeup.load(Ordering::Acquire) {
             break;
         }
         // Reprogram the timer to fire within one tick so try_switch runs
@@ -4855,6 +4875,7 @@ pub fn block_current(_reason: BlockReason) {
         // try_switch.  Loop top will reset state=Blocked if we didn't
         // see the wakeup — handles spurious wake.
         crate::arch::irq::wait_for_interrupt();
+        yielded = true;
     }
     // We're returning to running state.  state=Blocked → Running.
     unsafe { thread_mut_from_ref(tid) }.state = ThreadState::Running;
