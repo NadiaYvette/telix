@@ -484,6 +484,12 @@ pub fn snapshot_iretq_shadow(tid: ThreadId, sp: u64) {
         t.iretq_shadow_rsp = *frame.add(20);
         t.iretq_shadow_ss = *frame.add(21);
         t.iretq_shadow_sp = sp;
+        // #208 full-frame snapshot — captures all 22 u64 slots so the
+        // dispatch-time byte-compare can pinpoint ANY changed slot.
+        for i in 0..22 {
+            t.iretq_shadow_frame[i] =
+                core::ptr::read_volatile(frame.add(i));
+        }
     }
 }
 
@@ -563,6 +569,44 @@ fn check_iretq_shadow_inner(tid: ThreadId, sp: u64, require_blocked: bool) {
                 t.iretq_shadow_ss, ss,
                 n
             );
+        }
+    }
+    // #208 full-frame byte compare — independent of the 5-field check
+    // above so we don't lose precision on changes that happen at
+    // off-by-non-5-fields offsets (vec, errcode, GPRs).  Scans the
+    // full 22-slot shadow and logs EVERY index that differs (capped at
+    // 64 total log lines, 22 max per frame so one corrupted frame
+    // gets fully captured).  Letting the loop continue past the first
+    // mismatch reveals whether neighboring slots share a structure
+    // (e.g. consecutive PerCpuData fields) — diagnostic for the
+    // cluster-B addresses identified in project-208-percpu-data-match.
+    {
+        static FRAME_BYTE_DELTA_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        unsafe {
+            let frame_ptr = sp as *const u64;
+            let mut per_frame = 0u32;
+            for i in 0..22usize {
+                let live = core::ptr::read_volatile(frame_ptr.add(i));
+                let shadow = t.iretq_shadow_frame[i];
+                if shadow != live {
+                    let nn = FRAME_BYTE_DELTA_LOG
+                        .fetch_add(1, Ordering::Relaxed);
+                    if nn < 64 {
+                        let cpu = smp::cpu_id();
+                        let cur = smp::current().current_thread
+                            .load(Ordering::Relaxed);
+                        crate::println!(
+                            "FRAME-BYTE-DELTA: tid={} sp={:#x} src={} slot[{}]: shadow={:#x} live={:#x} cpu={} cur={} n={}",
+                            tid, sp, t.saved_sp_source, i, shadow, live, cpu, cur, nn
+                        );
+                    }
+                    per_frame += 1;
+                    if per_frame >= 22 {
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -2267,10 +2311,14 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
     thread.prio.store(priority, Ordering::Relaxed);
     thread.quantum = quantum;
     thread.default_quantum = quantum;
-    thread.saved_sp = frame_sp as u64;
-    record_saved_sp_write(id, frame_sp as u64, 1); // create_thread
+    // #208: set stack_base BEFORE record_saved_sp_write (which calls
+    // snapshot_iretq_shadow → would bail if stack_base==0).  Previously
+    // record-then-stack_base order silently dropped snapshots for fresh
+    // threads, making FBD silent on freshly-created threads.
     thread.stack_base = stack_base;
     bump_kstack_epoch(thread); // #208
+    thread.saved_sp = frame_sp as u64;
+    record_saved_sp_write(id, frame_sp as u64, 1); // create_thread
     thread.sig_mask = 0;
     thread.sig_pending = 0;
 
@@ -2558,10 +2606,12 @@ fn finalize_spawn(
     thread.thread_task.store(task_id, Ordering::Relaxed);
     thread.quantum = quantum;
     thread.default_quantum = quantum;
-    thread.saved_sp = frame_sp;
-    record_saved_sp_write(thread_id, frame_sp, 2); // spawn_user
+    // #208: stack_base BEFORE record_saved_sp_write (snapshot gate
+    // requires stack_base != 0).
     thread.stack_base = kstack_base;
     bump_kstack_epoch(thread); // #208
+    thread.saved_sp = frame_sp;
+    record_saved_sp_write(thread_id, frame_sp, 2); // spawn_user
     thread.sig_mask = 0;
     thread.sig_pending = 0;
 
@@ -2620,10 +2670,11 @@ fn create_thread_in_task(
     thread.thread_task.store(task_id, Ordering::Relaxed);
     thread.quantum = quantum;
     thread.default_quantum = quantum;
-    thread.saved_sp = frame_sp as u64;
-    record_saved_sp_write(id, frame_sp as u64, 3); // spawn_user variant
+    // #208: stack_base BEFORE record (snapshot needs stack_base != 0).
     thread.stack_base = kstack_base;
     bump_kstack_epoch(thread); // #208
+    thread.saved_sp = frame_sp as u64;
+    record_saved_sp_write(id, frame_sp as u64, 3); // spawn_user variant
     thread.exit_code = 0;
     thread.sig_mask = 0;
     thread.sig_pending = 0;
@@ -6310,10 +6361,11 @@ pub fn fork_current() -> u64 {
     thread.thread_task.store(child_task_id, Ordering::Relaxed);
     thread.quantum = parent_quantum;
     thread.default_quantum = parent_quantum;
-    thread.saved_sp = child_frame_sp as u64;
-    record_saved_sp_write(child_tid, child_frame_sp as u64, 7); // fork
+    // #208: stack_base BEFORE record (snapshot needs stack_base != 0).
     thread.stack_base = kstack_base;
     bump_kstack_epoch(thread); // #208
+    thread.saved_sp = child_frame_sp as u64;
+    record_saved_sp_write(child_tid, child_frame_sp as u64, 7); // fork
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;
@@ -6548,10 +6600,11 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     thread.thread_task.store(child_task_id, Ordering::Relaxed);
     thread.quantum = parent_quantum;
     thread.default_quantum = parent_quantum;
-    thread.saved_sp = child_frame_sp as u64;
-    record_saved_sp_write(child_tid, child_frame_sp as u64, 8); // clone variant
+    // #208: stack_base BEFORE record (snapshot needs stack_base != 0).
     thread.stack_base = kstack_base;
     bump_kstack_epoch(thread); // #208
+    thread.saved_sp = child_frame_sp as u64;
+    record_saved_sp_write(child_tid, child_frame_sp as u64, 8); // clone variant
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;
@@ -6665,10 +6718,11 @@ pub fn clone_thread_in_task(
     thread.thread_task.store(task_id, Ordering::Relaxed);
     thread.quantum = parent_quantum;
     thread.default_quantum = parent_quantum;
-    thread.saved_sp = child_frame_sp as u64;
-    record_saved_sp_write(child_tid, child_frame_sp as u64, 9); // clone-third
+    // #208: stack_base BEFORE record (snapshot needs stack_base != 0).
     thread.stack_base = kstack_base;
     bump_kstack_epoch(thread); // #208
+    thread.saved_sp = child_frame_sp as u64;
+    record_saved_sp_write(child_tid, child_frame_sp as u64, 9); // clone-third
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
     thread.sig_pending = 0;

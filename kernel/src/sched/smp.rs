@@ -76,6 +76,14 @@ pub fn init_dynamic_percpu() {
         // PerCpuData::new() produces an all-zero image, matching what
         // alloc_static_slice gives us. No explicit init needed.
         PER_CPU_PTR.store(s.as_mut_ptr(), Ordering::Release);
+        // #208 STATIC-LAYOUT: PerCpuData base + stride (0x290 from FBD
+        // analysis matched PerCpuData size — print here to confirm).
+        let base = s.as_mut_ptr() as u64;
+        let stride = core::mem::size_of::<PerCpuData>() as u64;
+        crate::println!(
+            "STATIC-LAYOUT: PER_CPU_PTR={:#x} stride={:#x} ({} bytes) n={}",
+            base, stride, stride, n
+        );
     }
 
     // Per-module slices.

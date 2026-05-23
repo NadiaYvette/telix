@@ -112,6 +112,30 @@ pub(crate) fn init_dynamic_percpu() {
     }
 }
 
+/// #208 STATIC-LAYOUT probe: print absolute addresses of the per-CPU
+/// statics so we can attribute FRAME-BYTE-DELTA `live=` values to a
+/// specific structure.  Called once from `smp::init_dynamic_percpu`
+/// after the AP slices are allocated.
+pub fn debug_print_static_layout() {
+    let ist = (&raw const IST_STACKS) as u64;
+    let gdt_boot = (&raw const PER_CPU_GDT_BOOT) as u64;
+    let tss_boot = (&raw const PER_CPU_TSS_BOOT) as u64;
+    let gdt_ap = PER_CPU_GDT_AP_PTR.load(Ordering::Relaxed) as u64;
+    let tss_ap = PER_CPU_TSS_AP_PTR.load(Ordering::Relaxed) as u64;
+    crate::println!(
+        "STATIC-LAYOUT: IST_STACKS={:#x}..{:#x} GDT_BOOT={:#x} TSS_BOOT={:#x} GDT_AP={:#x} TSS_AP={:#x} IstStack={} Tss={} PerCpuGdt={}",
+        ist,
+        ist + (core::mem::size_of::<[IstStack; MAX_IST_CPUS]>() as u64),
+        gdt_boot,
+        tss_boot,
+        gdt_ap,
+        tss_ap,
+        core::mem::size_of::<IstStack>(),
+        core::mem::size_of::<Tss>(),
+        core::mem::size_of::<PerCpuGdt>(),
+    );
+}
+
 /// Pointer to this CPU's GDT storage. BSP uses bootstrap, APs use the
 /// dynamic slice.
 #[inline]

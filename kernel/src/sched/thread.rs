@@ -78,6 +78,12 @@ pub struct Thread {
     pub iretq_shadow_rsp: u64,
     pub iretq_shadow_ss: u64,
     pub iretq_shadow_sp: u64,
+    /// #208 full-frame shadow — 22 u64s = entire ExceptionFrame (GPRs +
+    /// vec + err + RIP/CS/RFLAGS/RSP/SS).  Captured by
+    /// `snapshot_iretq_shadow` at park.  Byte-compared by
+    /// `check_iretq_shadow_at_dispatch` to identify ANY byte that
+    /// changed between park and dispatch — pinpoints write target.
+    pub iretq_shadow_frame: [u64; 22],
     /// Why this thread is blocked (only valid when state == Blocked).
     #[allow(dead_code)]
     pub blocked_on: BlockReason,
@@ -302,6 +308,7 @@ impl Thread {
             iretq_shadow_rsp: 0,
             iretq_shadow_ss: 0,
             iretq_shadow_sp: 0,
+            iretq_shadow_frame: [0u64; 22],
             blocked_on: BlockReason::None,
             call_dest_port: 0,
             call_tag: 0,

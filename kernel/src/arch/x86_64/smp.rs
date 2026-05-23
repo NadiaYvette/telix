@@ -48,6 +48,19 @@ pub(crate) fn init_dynamic_percpu() {
     }
     // Per-AP GDT/TSS slices.
     super::gdt::init_dynamic_percpu();
+    // #208 STATIC-LAYOUT probe — one-time print of static base addresses
+    // so FRAME-BYTE-DELTA live= values can be attributed to structures.
+    let ap_base = AP_STACKS_PTR.load(Ordering::Relaxed) as u64;
+    let ap_end = ap_base + ((n * AP_STACK_SIZE) as u64);
+    let kend = super::boot::kernel_end_addr() as u64;
+    crate::println!(
+        "STATIC-LAYOUT: AP_STACKS={:#x}..{:#x} stride={:#x} kernel_end={:#x}",
+        ap_base,
+        ap_end,
+        AP_STACK_SIZE as u64,
+        kend,
+    );
+    super::gdt::debug_print_static_layout();
 }
 
 /// Start secondary CPUs via INIT-SIPI-SIPI.
