@@ -182,6 +182,59 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
         let tls = crate::sched::scheduler::thread_ref(tid).tls_base;
         crate::arch::cpu::set_tls(tls);
     }
+    // #208 self-scribble probe: snapshot the 5 hardware-pushed iretq fields
+    // (rip/cs/rflags/rsp/ss at u64 slots [17..21]) AT ENTRY to this function
+    // AND after each subsequent step (FIRST-IRETQ-USER println, below-64K
+    // check, check_iretq_shadow).  Logging which transition introduces the
+    // first diff pinpoints the culprit.  Also snapshot 4 u64s ABOVE and 4
+    // u64s BELOW the iretq frame so we can see scribble extent — buffer
+    // overlap from an inline-call's stack frame would smear past the iretq
+    // boundaries.  Boot 1021 caught a BAD frame whose bytes spelled the
+    // FIRST-IRETQ-USER println format literally — strong hint the validator
+    // scribbles its own input.
+    //
+    // Layout of pre_snap_all / mid_*_snap / post_snap (each [u64; 13]):
+    //   slot[0..4]   = u64s at sp+8*13..sp+8*16  (4 slots BELOW iretq region)
+    //   slot[4]      = errcode/dummy at sp+8*16
+    //   slot[5..10]  = iretq fields: rip, cs, rflags, rsp, ss  (slot[17..21])
+    //   slot[10..13] = u64s at sp+8*22..sp+8*25  (3 slots ABOVE iretq region)
+    #[inline(always)]
+    fn snap_iretq_region(sp: u64) -> [u64; 13] {
+        unsafe {
+            [
+                core::ptr::read_volatile((sp + 13 * 8) as *const u64),
+                core::ptr::read_volatile((sp + 14 * 8) as *const u64),
+                core::ptr::read_volatile((sp + 15 * 8) as *const u64),
+                core::ptr::read_volatile((sp + 16 * 8) as *const u64),
+                core::ptr::read_volatile((sp + 17 * 8) as *const u64), // rip
+                core::ptr::read_volatile((sp + 18 * 8) as *const u64), // cs
+                core::ptr::read_volatile((sp + 19 * 8) as *const u64), // rflags
+                core::ptr::read_volatile((sp + 20 * 8) as *const u64), // rsp
+                core::ptr::read_volatile((sp + 21 * 8) as *const u64), // ss
+                core::ptr::read_volatile((sp + 22 * 8) as *const u64),
+                core::ptr::read_volatile((sp + 23 * 8) as *const u64),
+                core::ptr::read_volatile((sp + 24 * 8) as *const u64),
+                core::ptr::read_volatile((sp + 25 * 8) as *const u64),
+            ]
+        }
+    }
+    // Take an RSP snapshot alongside each iretq snap so we know if the
+    // validator's own stack pushed past the iretq region (geometric overlap
+    // check).
+    #[inline(always)]
+    fn cur_rsp() -> u64 {
+        let r: u64;
+        unsafe {
+            core::arch::asm!("mov {0}, rsp", out(reg) r, options(nomem, nostack, preserves_flags));
+        }
+        r
+    }
+    let pre_snap_all: [u64; 13] = if sp >= 0x10000 {
+        snap_iretq_region(sp)
+    } else {
+        [0; 13]
+    };
+    let pre_rsp: u64 = cur_rsp();
     // #135 first-iretq-to-user probe: log the FIRST time we return-to-user
     // for each tid.  Tells us whether iretq is delivering correct (RIP, CS,
     // SS) to userspace.  If a freshly-spawned thread shows FIRST-IRETQ with
@@ -252,11 +305,65 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
         crate::arch::irq::enable();
         loop { core::hint::spin_loop(); }
     }
+    // #208 mid-validator snapshot: BEFORE check_iretq_shadow, so a diff at
+    // this point vs pre_snap_all isolates corruption to the
+    // FIRST-IRETQ-USER block + below-64K check (the two steps run above).
+    let mid1_snap_all: [u64; 13] = if sp >= 0x10000 {
+        snap_iretq_region(sp)
+    } else {
+        [0; 13]
+    };
+    let mid1_rsp: u64 = cur_rsp();
     // #208 Probe A: compare live iretq fields against the shadow recorded
     // at park time.  Fires FRAME-DELTA whenever fields changed in between.
     {
         let tid = crate::sched::scheduler::current_thread_id();
         crate::sched::scheduler::check_iretq_shadow(tid, sp);
+    }
+    // #208 self-scribble check: re-read the iretq region and compare to
+    // pre_snap_all and mid1_snap_all.  A diff between pre→mid1 isolates
+    // FIRST-IRETQ-USER or below-64K as the corrupter; a diff between
+    // mid1→post implicates check_iretq_shadow.  Surrounding bytes show
+    // scribble extent (geometric overlap with a stack buffer).
+    if sp >= 0x10000 {
+        let post_snap_all: [u64; 13] = snap_iretq_region(sp);
+        let post_rsp: u64 = cur_rsp();
+        if pre_snap_all != post_snap_all {
+            let tid = crate::sched::scheduler::current_thread_id();
+            // Find first slot that differs at each transition.
+            let mut pre_mid_first = -1i32;
+            let mut mid_post_first = -1i32;
+            for i in 0..13 {
+                if pre_mid_first < 0 && pre_snap_all[i] != mid1_snap_all[i] {
+                    pre_mid_first = i as i32;
+                }
+                if mid_post_first < 0 && mid1_snap_all[i] != post_snap_all[i] {
+                    mid_post_first = i as i32;
+                }
+            }
+            crate::println!(
+                "VALIDATOR-SELF-SCRIBBLE: tid={} cpu={} sp={:#x} vec={} \
+                 pre_rsp={:#x} mid1_rsp={:#x} post_rsp={:#x} \
+                 pre_mid_first_diff={} mid_post_first_diff={} \
+                 pre.rip={:#x} pre.cs={:#x} pre.rflags={:#x} pre.rsp={:#x} pre.ss={:#x} \
+                 mid1.rip={:#x} mid1.cs={:#x} mid1.rflags={:#x} mid1.rsp={:#x} mid1.ss={:#x} \
+                 post.rip={:#x} post.cs={:#x} post.rflags={:#x} post.rsp={:#x} post.ss={:#x} \
+                 pre_below=[{:#x} {:#x} {:#x} {:#x}] pre_above=[{:#x} {:#x} {:#x} {:#x}] \
+                 post_below=[{:#x} {:#x} {:#x} {:#x}] post_above=[{:#x} {:#x} {:#x} {:#x}]",
+                tid,
+                crate::sched::smp::cpu_id(),
+                sp, vector,
+                pre_rsp, mid1_rsp, post_rsp,
+                pre_mid_first, mid_post_first,
+                pre_snap_all[4], pre_snap_all[5], pre_snap_all[6], pre_snap_all[7], pre_snap_all[8],
+                mid1_snap_all[4], mid1_snap_all[5], mid1_snap_all[6], mid1_snap_all[7], mid1_snap_all[8],
+                post_snap_all[4], post_snap_all[5], post_snap_all[6], post_snap_all[7], post_snap_all[8],
+                pre_snap_all[0], pre_snap_all[1], pre_snap_all[2], pre_snap_all[3],
+                pre_snap_all[9], pre_snap_all[10], pre_snap_all[11], pre_snap_all[12],
+                post_snap_all[0], post_snap_all[1], post_snap_all[2], post_snap_all[3],
+                post_snap_all[9], post_snap_all[10], post_snap_all[11], post_snap_all[12],
+            );
+        }
     }
     let f = unsafe { &*(sp as *const ExceptionFrame) };
     // Use volatile reads so the compiler can't fuse the first read with the
