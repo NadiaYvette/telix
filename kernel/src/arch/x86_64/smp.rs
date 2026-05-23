@@ -197,6 +197,16 @@ pub fn start_secondary_cpus() {
             ); // base
         }
 
+        // #208 paranoid fence: ensure all data-block writes above are
+        // globally visible before LAPIC ICR triggers the AP.  x86 TSO
+        // would order WB stores before the volatile MMIO write naturally,
+        // but the Rust compiler is free to reorder non-volatile writes
+        // past write_volatile (which `send_init` uses internally) — the
+        // ordering guarantee of `write_volatile` only applies between
+        // volatile ops.  A full SeqCst fence emits MFENCE, blocking both
+        // compiler and hardware reordering across this point.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
         // INIT-SIPI-SIPI sequence.
         super::lapic::send_init(cpu);
         super::lapic::delay_us(200);
@@ -269,6 +279,16 @@ extern "C" fn ap_rust_entry(cpu_id: u32) {
     // handler reads (reason, token) from the page and parks/wakes
     // the faulting thread via the existing pager-wait mechanism.
     super::hypervisor::enable_async_pf_self();
+
+    // #208 paranoid fence: ensure all per-CPU init writes above
+    // (LAPIC, GDT, IDT, timer, hypervisor pages, scheduler/topology
+    // registration) are globally visible before the BSP observes
+    // AP_READY_COUNT incrementing.  The Release on fetch_add below
+    // gives store→store ordering on this CPU, but a full SeqCst
+    // fence here additionally orders prior volatile MMIO setup
+    // against the atomic publication, matching the symmetric
+    // SeqCst fence on the BSP side before SIPI.
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
     // Signal ready.
     AP_READY_COUNT.fetch_add(1, Ordering::Release);
