@@ -530,6 +530,24 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
                 );
             }
         }
+        // #208 shadow + saved_sp last-writer dump: tell whether the
+        // SHADOW (taken at park-time by snapshot_iretq_shadow) was
+        // already corrupt (in which case the save itself was wrong)
+        // or is valid (in which case the memory at sp got mutated
+        // between save and validate).  The dump_saved_sp_log call
+        // emits SAVED-SP-LAST with the tag (1=try_switch, 2=voluntary,
+        // 3=pre_save_frame/park_ipc, 5=park_for_sleep, 6=resync_clone)
+        // identifying who set saved_sp last.
+        crate::println!(
+            "  shadow.sp={:#x} shadow.rip={:#x} shadow.cs={:#x} shadow.rflags={:#x} shadow.rsp={:#x} shadow.ss={:#x}",
+            tref.iretq_shadow_sp,
+            tref.iretq_shadow_rip,
+            tref.iretq_shadow_cs,
+            tref.iretq_shadow_rflags,
+            tref.iretq_shadow_rsp,
+            tref.iretq_shadow_ss,
+        );
+        crate::sched::scheduler::dump_saved_sp_log(tid);
         // #208 saved_sp watchpoint: arm GLOBAL DR0 to catch the next
         // write to tref.saved_sp.  All CPUs will arm DR0 on this
         // address at their next x86_exception_handler entry.  Any
