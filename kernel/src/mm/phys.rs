@@ -710,6 +710,11 @@ fn chunk_free_one(chunk_idx: usize, page_idx: u32) {
 /// Metadata (chunk array) is carved from the start of usable RAM at boot,
 /// so there is no compile-time cap on managed memory.
 pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: usize) {
+    #[cfg(feature = "dumb_phys_alloc")]
+    {
+        return super::phys_dumb::init(ram_start, ram_end, kernel_start, kernel_end);
+    }
+    #[allow(unreachable_code)]
     let ps = page::page_size();
     let pshift = page::page_shift();
     let start = PhysAddr::new(ram_start).align_up(ps).as_usize();
@@ -848,6 +853,11 @@ pub fn init(ram_start: usize, ram_end: usize, kernel_start: usize, kernel_end: u
 
 /// Allocate a single page. Returns its physical address.
 pub fn alloc_page() -> Option<PhysAddr> {
+    #[cfg(feature = "dumb_phys_alloc")]
+    {
+        return super::phys_dumb::alloc_page();
+    }
+    #[allow(unreachable_code)]
     let free = ALLOC.free_count_global.load(Ordering::Relaxed);
     if free == 0 {
         return None;
@@ -1031,6 +1041,11 @@ pub fn alloc_page() -> Option<PhysAddr> {
 
 /// Free a single page.
 pub fn free_page(addr: PhysAddr) {
+    #[cfg(feature = "dumb_phys_alloc")]
+    {
+        return super::phys_dumb::free_page(addr);
+    }
+    #[allow(unreachable_code)]
     let pa = addr.as_usize();
     if pa < ALLOC.base {
         return;
@@ -1045,8 +1060,14 @@ pub fn free_page(addr: PhysAddr) {
 /// Allocate 2^order contiguous pages. Returns physical address.
 /// For order=0, delegates to alloc_page(). For larger orders, uses
 /// a locked scan path.
+#[cfg_attr(feature = "dumb_phys_alloc", allow(unused))]
 #[allow(dead_code)]
 pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
+    #[cfg(feature = "dumb_phys_alloc")]
+    {
+        return super::phys_dumb::alloc_pages(order);
+    }
+    #[allow(unreachable_code)]
     if order == 0 {
         return alloc_page();
     }
@@ -1337,6 +1358,11 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
 /// Free 2^order contiguous pages.
 #[allow(dead_code)]
 pub fn free_pages(addr: PhysAddr, order: usize) {
+    #[cfg(feature = "dumb_phys_alloc")]
+    {
+        return super::phys_dumb::free_pages(addr, order);
+    }
+    #[allow(unreachable_code)]
     let base = addr.as_usize();
     let count = 1usize << order;
     for i in 0..count {
@@ -1381,6 +1407,11 @@ pub unsafe fn alloc_static_slice<T>(len: usize) -> &'static mut [T] {
 
 /// Get (total_pages, free_pages).
 pub fn stats() -> (usize, usize) {
+    #[cfg(feature = "dumb_phys_alloc")]
+    {
+        return super::phys_dumb::stats();
+    }
+    #[allow(unreachable_code)]
     (
         ALLOC.total_pages,
         ALLOC.free_count_global.load(Ordering::Relaxed),

@@ -34,6 +34,8 @@ pub mod paged_array;
 pub mod pager;
 pub mod pagevec;
 pub mod phys;
+#[cfg(feature = "dumb_phys_alloc")]
+pub mod phys_dumb;
 pub mod ptshare;
 pub mod slab;
 pub mod stats;

@@ -19,3 +19,12 @@ max_cpus_64 = []
 max_cpus_256 = []
 max_cpus_1024 = []
 max_cpus_4096 = []
+
+# Debug-only allocator selection.  Default off — the production `phys`
+# module uses the per-CPU-reserved-chunk allocator (LLFree-style).  When
+# `dumb_phys_alloc` is enabled, the public `phys::alloc_page` /
+# `phys::alloc_pages` / `phys::free_page` / `phys::free_pages` / `phys::init`
+# entry points are routed to a global-locked bitmap allocator with no
+# per-CPU caches.  Lets us A/B test whether the smart allocator's
+# concurrency machinery is implicated in the #208 corruption family.
+dumb_phys_alloc = []
