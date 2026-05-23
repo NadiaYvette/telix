@@ -26,6 +26,43 @@ const MMU_PAGE_SIZE: usize = 4096;
 /// may be a user process's page table during sys_spawn).
 static BOOT_PML4: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+// =========================================================================
+// #208 VA-isolation regions (docs/slab-pt-va-isolation.md, Phase 1).
+//
+// Each region is a top-level PML4 entry reserved by boot.S, pointing at
+// an empty PDPT.  Phase 1 just establishes the slots; later phases route
+// allocations into these VA ranges with sparse per-object windows that
+// produce unmapped guard gaps for free.
+//
+// PML4 slot 511 = kernel text/data/bss (existing)
+// PML4 slot 510 = PT_REGION              (page tables)
+// PML4 slot 509 = SLAB_REGION            (slab caches)
+// PML4 slot 508 = KSTACK_REGION          (kernel thread stacks)
+// PML4 slot 507 = PHYS_DIRECT_MAP        (offset-mapped raw phys)
+// =========================================================================
+
+/// VA base of PT_REGION (PML4[510]).
+pub const PT_REGION_BASE: u64 = 0xFFFF_FF00_0000_0000;
+
+/// VA base of SLAB_REGION (PML4[509]).
+pub const SLAB_REGION_BASE: u64 = 0xFFFF_FE80_0000_0000;
+
+/// VA base of KSTACK_REGION (PML4[508]).
+pub const KSTACK_REGION_BASE: u64 = 0xFFFF_FE00_0000_0000;
+
+/// VA base of PHYS_DIRECT_MAP (PML4[507]).
+pub const PHYS_DIRECT_MAP_BASE: u64 = 0xFFFF_FD80_0000_0000;
+
+/// Size of one PML4 slot's coverage (512 GiB).
+pub const PML4_SLOT_SIZE: u64 = 1 << 39;
+
+/// VA window allocated per kernel thread stack within KSTACK_REGION.
+/// 2 MiB per kstack, with only the top 128 KiB phys-backed and the rest
+/// unmapped (guard).  Stack grows downward from window_base + 2 MiB
+/// toward window_base; any push past window_base + (2 MiB - 128 KiB)
+/// faults on the unmapped guard.
+pub const KSTACK_WINDOW_SIZE: u64 = 1 << 21;
+
 use crate::mm::radix_pt::{self, PteFormat};
 
 /// User page flags (public for main.rs).

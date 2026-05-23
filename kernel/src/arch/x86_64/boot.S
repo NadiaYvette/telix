@@ -94,6 +94,27 @@ _start:
     or      eax, 0x03
     mov     [ebx + 511*8], eax
 
+    // #208 VA-isolation reservations (docs/slab-pt-va-isolation.md).
+    // Each PML4 entry points at an empty (all-zero) PDPT, so any access
+    // to these VA ranges page-faults until the PDPT is populated.  Phase
+    // 1 just establishes the slots; later phases route allocations here.
+    //   PML4[510] = PT_REGION          (boot_pdpt_pt)
+    //   PML4[509] = SLAB_REGION        (boot_pdpt_slab)
+    //   PML4[508] = KSTACK_REGION      (boot_pdpt_kstack)
+    //   PML4[507] = PHYS_DIRECT_MAP    (boot_pdpt_phys_direct)
+    lea     eax, [boot_pdpt_pt - KERNEL_VIRT_OFFSET]
+    or      eax, 0x03
+    mov     [ebx + 510*8], eax
+    lea     eax, [boot_pdpt_slab - KERNEL_VIRT_OFFSET]
+    or      eax, 0x03
+    mov     [ebx + 509*8], eax
+    lea     eax, [boot_pdpt_kstack - KERNEL_VIRT_OFFSET]
+    or      eax, 0x03
+    mov     [ebx + 508*8], eax
+    lea     eax, [boot_pdpt_phys_direct - KERNEL_VIRT_OFFSET]
+    or      eax, 0x03
+    mov     [ebx + 507*8], eax
+
     // Fill boot_pdpt: 4 × 1 GiB gigapages identity-mapping 0..4 GiB.
     // PDPT entry: address | Present | Writable | PageSize (1 GiB page) = 0x83.
     lea     ebx, [boot_pdpt - KERNEL_VIRT_OFFSET]
@@ -236,6 +257,25 @@ boot_pd:
 // High-half PDPT (PML4[511] → here).  Maps two 1-GiB gigapages covering
 // the low 2 GiB physical, exposed at VA 0xFFFFFFFF80000000..0xFFFFFFFFFFFFFFFF.
 boot_pdpt_hi:
+    .space  4096
+
+// #208 VA-isolation reserved PDPTs (docs/slab-pt-va-isolation.md, Phase 1).
+// Empty (zero-initialized) at boot; later phases populate entries as
+// allocations happen.  Each backs one PML4 slot:
+//   boot_pdpt_pt          → PML4[510] → PT_REGION
+//   boot_pdpt_slab        → PML4[509] → SLAB_REGION
+//   boot_pdpt_kstack      → PML4[508] → KSTACK_REGION
+//   boot_pdpt_phys_direct → PML4[507] → PHYS_DIRECT_MAP
+boot_pdpt_pt:
+    .space  4096
+
+boot_pdpt_slab:
+    .space  4096
+
+boot_pdpt_kstack:
+    .space  4096
+
+boot_pdpt_phys_direct:
     .space  4096
 
 // ============================================================================
