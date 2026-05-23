@@ -443,6 +443,23 @@ pub fn create_user_page_table() -> Option<usize> {
         for i in 1..4 {
             *dst.add(i) = *src.add(i);
         }
+
+        // #208 higher-half follow-on: copy PML4[511] (kernel high-half VMA).
+        // With the higher-half kernel layout (boot.S:80, linker.ld:6), kernel
+        // text and data live at 0xFFFFFFFF80000000+, mapped via PML4[511] →
+        // boot_pdpt_hi.  Without this copy, a userspace task's page table
+        // omits the kernel high-half — the first time CPU runs kernel code
+        // on that task's CR3 (i.e. any syscall, IRQ, or context-switch
+        // dispatch into kernel), instruction fetch faults at the kernel
+        // high-half RIP → #PF → #DF (no IST except for #DF, and #DF handler
+        // RIP is also high-half) → triple fault.  Captured in
+        // qemu-int-11amfsq1012.log: #DB → #PF (CR2=RIP=0xffffffff80105af2)
+        // → check_exception old=0x8 new=0xe → Triple fault.
+        //
+        // Boot.S only ever writes PML4[0] (low identity) and PML4[511]
+        // (high-half kernel) plus 1..4 shallow copy; copying [511] is
+        // sufficient to restore kernel reachability from user tasks.
+        *dst.add(511) = *src.add(511);
     }
 
     Some(new_pml4)
