@@ -235,6 +235,29 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
         [0; 13]
     };
     let pre_rsp: u64 = cur_rsp();
+    // #208 pre-bad probe: if the iretq frame is ALREADY corrupt at entry
+    // (cs neither 0x08 kernel nor 0x23 user, or otherwise out of selector
+    // range), log the pre_snap immediately.  That tells us the corruption
+    // happened BEFORE validate_iretq_frame was called — the validator is
+    // innocent for these cases.  Captures the BAD-frame data path before
+    // any of our own work could possibly perturb the bytes.
+    if sp >= 0x10000 {
+        let pre_cs = pre_snap_all[5];
+        if pre_cs > 0xffff || (pre_cs != 0x08 && pre_cs != 0x23) {
+            let tid = crate::sched::scheduler::current_thread_id();
+            crate::println!(
+                "VALIDATOR-PRE-BAD: tid={} cpu={} sp={:#x} vec={} pre_rsp={:#x} \
+                 pre.rip={:#x} pre.cs={:#x} pre.rflags={:#x} pre.rsp={:#x} pre.ss={:#x} \
+                 pre_below=[{:#x} {:#x} {:#x} {:#x}] pre_above=[{:#x} {:#x} {:#x} {:#x}]",
+                tid,
+                crate::sched::smp::cpu_id(),
+                sp, vector, pre_rsp,
+                pre_snap_all[4], pre_snap_all[5], pre_snap_all[6], pre_snap_all[7], pre_snap_all[8],
+                pre_snap_all[0], pre_snap_all[1], pre_snap_all[2], pre_snap_all[3],
+                pre_snap_all[9], pre_snap_all[10], pre_snap_all[11], pre_snap_all[12],
+            );
+        }
+    }
     // #135 first-iretq-to-user probe: log the FIRST time we return-to-user
     // for each tid.  Tells us whether iretq is delivering correct (RIP, CS,
     // SS) to userspace.  If a freshly-spawned thread shows FIRST-IRETQ with
