@@ -295,11 +295,15 @@ boot_pdpt_phys_direct:
     .space  4096
 
 // ============================================================================
-// Boot stack: 64 KiB in BSS
+// Boot stack: 256 KiB in BSS.  Sized large because BSP early init can use
+// substantial stack (println! StackBufs, kernel data structure setup) and
+// overflow into adjacent .bss boot_pdpt_* pages corrupts page tables —
+// surfaces as Phase-5b "kstack VA not present" #PF with garbage in the
+// PDPT entry (a kernel function pointer, indicating a stack frame).
 // ============================================================================
 .section .bss.boot_stack, "aw", @nobits
 .balign 16
 __boot_stack_bottom:
-    .space  65536
+    .space  262144
 .global __boot_stack_top
 __boot_stack_top:
