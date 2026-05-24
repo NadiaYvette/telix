@@ -620,8 +620,17 @@ pub fn free_page_table_tree(root: usize, fg: *mut crate::mm::ptshare::ForkGroup)
             crate::mm::phys::free_page(PhysAddr::new(pdpt));
         }
         // PML4[1..3] are shared with boot — do NOT free.
-        // PML4[4..511]: user-range entries — may be shared markers.
-        for i in 4..512 {
+        // PML4[4..507]: user-range entries — may be shared markers.
+        // PML4[507..=511] are shallow-copied from boot_pml4 (VA-isolation
+        // regions + high-half kernel: PHYS_DIRECT_MAP / KSTACK_REGION /
+        // SLAB_REGION / PT_REGION / kernel high-half).  Their PDPTs live
+        // in BSS and are shared across every CR3 — freeing them returns
+        // boot_pdpt_kstack / boot_pdpt_hi etc. to the phys allocator,
+        // which then hands them out as fresh pages and the new owner
+        // zeroes them, wiping every other CR3's PDPT chain for those
+        // regions.  Surfaces as spurious kstack-VA #PFs (pml4_e+pdpt_e
+        // valid, pd_e=0) — see project_pml4_free_root_cause memory note.
+        for i in 4..507 {
             let entry = *pml4.add(i);
             if X86Pte::is_shared_entry(entry) {
                 let sub_pa = X86Pte::shared_entry_pa(entry);
