@@ -63,6 +63,25 @@ pub const PML4_SLOT_SIZE: u64 = 1 << 39;
 /// faults on the unmapped guard.
 pub const KSTACK_WINDOW_SIZE: u64 = 1 << 21;
 
+/// Phase 2: convert a physical address to its PHYS_DIRECT_MAP virtual
+/// address.  Use this when you need a kernel-mode pointer to a specific
+/// phys page that isn't accessible via the identity map (PML4[0]) —
+/// e.g., when PML4[0] is eventually unmapped to enforce VA/phys
+/// separation per the slab-pt-va-isolation design.
+#[inline]
+pub fn phys_to_kva(pa: usize) -> usize {
+    PHYS_DIRECT_MAP_BASE as usize + pa
+}
+
+/// Phase 2: convert a PHYS_DIRECT_MAP virtual address back to its
+/// physical address.  Inverse of `phys_to_kva`.  Caller must ensure
+/// `va` lies within PHYS_DIRECT_MAP_BASE..(PHYS_DIRECT_MAP_BASE + 4 GiB).
+#[inline]
+pub fn kva_to_phys(va: usize) -> usize {
+    debug_assert!(va >= PHYS_DIRECT_MAP_BASE as usize);
+    va - PHYS_DIRECT_MAP_BASE as usize
+}
+
 use crate::mm::radix_pt::{self, PteFormat};
 
 /// User page flags (public for main.rs).

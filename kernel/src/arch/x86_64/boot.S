@@ -136,6 +136,22 @@ _start:
     mov     dword ptr [ebx + 511*8 + 0], 0x40000083    // → phys 0x40000000
     mov     dword ptr [ebx + 511*8 + 4], 0x00000000
 
+    // #208 VA-isolation Phase 2: PHYS_DIRECT_MAP at PML4[507].
+    // Populate boot_pdpt_phys_direct with 4 × 1 GiB gigapages mapping
+    // phys 0..4 GiB at VA 0xFFFFFD80_00000000+.  Lets kernel access any
+    // phys page via a uniform offset map without going through identity
+    // PML4[0], so PML4[0] can eventually be unmapped to enforce
+    // VA/phys separation.
+    lea     ebx, [boot_pdpt_phys_direct - KERNEL_VIRT_OFFSET]
+    mov     dword ptr [ebx + 0x00], 0x00000083    // → phys 0x00000000 (0 GiB)
+    mov     dword ptr [ebx + 0x04], 0x00000000
+    mov     dword ptr [ebx + 0x08], 0x40000083    // → phys 0x40000000 (1 GiB)
+    mov     dword ptr [ebx + 0x0C], 0x00000000
+    mov     dword ptr [ebx + 0x10], 0x80000083    // → phys 0x80000000 (2 GiB)
+    mov     dword ptr [ebx + 0x14], 0x00000000
+    mov     dword ptr [ebx + 0x18], 0xC0000083    // → phys 0xC0000000 (3 GiB)
+    mov     dword ptr [ebx + 0x1C], 0x00000000
+
     // --- Enable PAE + SSE (OSFXSR, OSXMMEXCPT) ---
     mov     eax, cr4
     or      eax, (1 << 5) | (1 << 9) | (1 << 10)   // CR4.PAE | CR4.OSFXSR | CR4.OSXMMEXCPT
