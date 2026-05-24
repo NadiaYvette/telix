@@ -82,6 +82,72 @@ pub fn kva_to_phys(va: usize) -> usize {
     va - PHYS_DIRECT_MAP_BASE as usize
 }
 
+// =========================================================================
+// Phase 5a: KSTACK_REGION VA window allocator + mapper.
+//
+// Each kernel thread stack gets a 2 MiB VA window within KSTACK_REGION.
+// Only the top `kstack_size_bytes` of the window (typically 128 KiB =
+// 2 × 64 KiB pages) is phys-backed; the rest is unmapped VA, acting as
+// a guard zone.  Stack underflow / overflow into the guard generates
+// a page fault, naming the source RIP — catches the residual #208
+// kstack-mutation bug class that survives Fix D.
+//
+// Phase 5a (this commit) installs only the infrastructure: bump-pointer
+// VA allocator + map_kstack_window helper.  No allocator migration yet
+// — alloc_kstack_zeroed continues to return PhysAddr (used as
+// identity-mapped pointer).  Phase 5b migrates callers to use VA.
+// =========================================================================
+
+/// Bump-pointer cursor for KSTACK_REGION VA windows.  Starts at the
+/// region base + one window (skip the first window so VA=0 + offset
+/// doesn't collide with any code that treats null-ish VAs specially).
+static KSTACK_VA_NEXT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(KSTACK_REGION_BASE + KSTACK_WINDOW_SIZE);
+
+/// Reserve the next 2 MiB VA window in KSTACK_REGION.  Returns the
+/// VA base of the window.  Bumps the cursor atomically — safe under
+/// concurrent allocation.
+#[inline]
+pub fn alloc_kstack_va_window() -> u64 {
+    KSTACK_VA_NEXT.fetch_add(KSTACK_WINDOW_SIZE, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Map the top `num_mmu_pages` of a kstack VA window to phys page
+/// `pa_base`.  The remainder of the window (below the mapped pages)
+/// stays unmapped — guard zone catches stack underflow.
+///
+/// Returns the VA of the kstack TOP (highest address, one past the
+/// last byte of mapped memory).  This is the value to write to TSS
+/// RSP0 and the value `stack_base + kstack_size` should equal once
+/// Phase 5b migrates the allocator.
+///
+/// pml4 = the current PML4 to map into (typically boot_pml4).
+pub fn map_kstack_window(
+    pml4: usize,
+    va_window_base: u64,
+    pa_base: usize,
+    num_mmu_pages: usize,
+) -> Option<u64> {
+    let kstack_byte_size = num_mmu_pages * MMU_PAGE_SIZE;
+    let va_kstack_base = va_window_base + KSTACK_WINDOW_SIZE - kstack_byte_size as u64;
+    for i in 0..num_mmu_pages {
+        let va = va_kstack_base + (i * MMU_PAGE_SIZE) as u64;
+        let pa = pa_base + i * MMU_PAGE_SIZE;
+        // Kernel-only mapping: P + RW + NX (data, not code).
+        let flags = PTE_P | PTE_RW | PTE_NX;
+        if !map_single_mmupage(pml4, va as usize, pa, flags) {
+            // Roll back partial mappings.  Best-effort; under OOM the
+            // caller will see None and abort.
+            for j in 0..i {
+                let va_j = va_kstack_base + (j * MMU_PAGE_SIZE) as u64;
+                unmap_single_mmupage(pml4, va_j as usize);
+            }
+            return None;
+        }
+    }
+    Some(va_kstack_base + kstack_byte_size as u64)
+}
+
 use crate::mm::radix_pt::{self, PteFormat};
 
 /// User page flags (public for main.rs).
