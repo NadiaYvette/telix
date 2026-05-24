@@ -60,6 +60,18 @@ __isr_common:
     cmp     rax, 0x10000
     jb      1f
     mov     rsp, rax
+    // #208 Fix D Stage 2: at this point cpu_old has just left prev's
+    // kstack (rsp now on next's kstack).  Drain the per-CPU release
+    // slot and CAS-transition prev's on_cpu RELEASING→PENDING so peer
+    // CPUs can safely dispatch prev.  Call is intentionally placed
+    // ONLY on the success path (rax >= 0x10000); the bail-on-corrupt-
+    // frame path doesn't actually leave the original stack so we
+    // must not advertise prev as PENDING.  The slot in that case
+    // stays populated until the next try_switch's publish overwrites
+    // it.  Caller-saved registers are clobbered by the call but all
+    // of them are popped from the new stack in the sequence below,
+    // refreshing their values before any depend on them.
+    call    finalize_release_after_stack_switch
 1:
 
     pop     r15

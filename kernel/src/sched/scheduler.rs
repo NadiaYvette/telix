@@ -169,33 +169,63 @@ pub fn set_on_cpu_pending(tid: ThreadId, action_tag: u8, state: ThreadState) {
     record_trans(tid as u32, action_tag, state, ON_CPU_PENDING);
 }
 
-/// #208 Fix D: transition prev's on_cpu from RELEASING → PENDING.
+/// #208 Fix D — per-CPU release slot.  Populated by try_switch (via
+/// `transition_release_to_pending`) just before returning to its asm
+/// caller; drained by `finalize_release_after_stack_switch` invoked from
+/// vectors.S AFTER `mov rsp, rax`.  Holds the tid that needs its on_cpu
+/// transitioned RELEASING→PENDING once cpu_old has actually left prev's
+/// kstack.  0 = no pending release on this CPU.
+static RELEASE_SLOT_TID: [core::sync::atomic::AtomicU32; smp::MAX_CPUS] = {
+    const Z: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    [Z; smp::MAX_CPUS]
+};
+
+/// #208 Fix D Stage 2 — publish prev's tid to the per-CPU release slot.
 ///
-/// Called from each post-park-side return path in try_switch.  At that
-/// point, try_switch has done all of its bookkeeping for prev (saved_sp
-/// store, state=Ready/Blocked, deferred_requeue arming, dispatching_tid
-/// publication) and is about to return to its asm caller.  The asm
-/// caller will then `mov rsp, rax` to switch off prev's kstack.
+/// Called just before each post-park-side return in try_switch.  Does
+/// NOT itself transition on_cpu RELEASING→PENDING; that transition is
+/// done by `finalize_release_after_stack_switch` after vectors.S's
+/// `mov rsp, rax` has actually moved cpu_old off prev's kstack.
 ///
-/// Transitioning prev's on_cpu RELEASING → PENDING *here* (just before
-/// return) instead of at the park-side line 4276/4303 shrinks the
-/// migration-handoff race window from "all of try_switch + asm postlude"
-/// to just "asm postlude" — peer CPUs cannot dispatch prev during the
-/// scheduler bookkeeping interval, which is most of the previously-racy
-/// window.  Residual exposure is only the few asm instructions until
-/// `mov rsp, rax` commits.
-///
-/// CAS is used so this is a no-op if prev's on_cpu is no longer
-/// RELEASING (e.g., a Drop / panic path that didn't go through line
-/// 4276/4303).
+/// Until finalize runs, peer CPUs that observe RELEASING fail the
+/// dispatch CAS (which expects PENDING) and yield to idle — naturally
+/// retrying on the next tick when finalize has completed.
 #[inline]
 pub fn transition_release_to_pending(prev_id: ThreadId) {
-    let _ = thread_ref(prev_id).on_cpu.compare_exchange(
-        ON_CPU_RELEASING,
-        ON_CPU_PENDING,
-        Ordering::Release,
-        Ordering::Relaxed,
-    );
+    let cpu = smp::cpu_id() as usize;
+    if cpu < smp::MAX_CPUS {
+        RELEASE_SLOT_TID[cpu].store(
+            prev_id as u32,
+            core::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
+/// #208 Fix D Stage 2 — drain the per-CPU release slot and transition
+/// the stashed tid's on_cpu RELEASING→PENDING.
+///
+/// Called from vectors.S asm postlude immediately after `mov rsp, rax`.
+/// By this point, cpu_old's RSP has moved off prev's kstack onto next's
+/// kstack — it is safe for peer CPUs to dispatch prev.  Publishing
+/// PENDING here is the precise "kstack released" handoff.
+///
+/// CAS protects against races with paths that also transition the slot
+/// (e.g., a backstop drain at exception-handler entry).
+#[unsafe(no_mangle)]
+pub extern "C" fn finalize_release_after_stack_switch() {
+    let cpu = smp::cpu_id() as usize;
+    if cpu >= smp::MAX_CPUS {
+        return;
+    }
+    let tid = RELEASE_SLOT_TID[cpu].swap(0, core::sync::atomic::Ordering::Acquire);
+    if tid != 0 {
+        let _ = thread_ref(tid).on_cpu.compare_exchange(
+            ON_CPU_RELEASING,
+            ON_CPU_PENDING,
+            core::sync::atomic::Ordering::Release,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 /// #135 record one transition into the per-thread `trans_ring`.  Each
