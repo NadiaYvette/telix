@@ -214,21 +214,24 @@ impl<const N: usize> StackBuf<N> {
         Self { buf: [0u8; N], len: 0 }
     }
     fn as_bytes(&self) -> &[u8] {
-        &self.buf[..self.len]
+        let n = self.len.min(N);
+        &self.buf[..n]
     }
     fn as_str(&self) -> &str {
         // format_args produces UTF-8; our pushes preserve it.
-        unsafe { core::str::from_utf8_unchecked(&self.buf[..self.len]) }
+        let n = self.len.min(N);
+        unsafe { core::str::from_utf8_unchecked(&self.buf[..n]) }
     }
 }
 
 impl<const N: usize> fmt::Write for StackBuf<N> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let bytes = s.as_bytes();
-        let space = N - self.len;
+        let cur = self.len.min(N);
+        let space = N - cur;
         let n = bytes.len().min(space);
-        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
-        self.len += n;
+        self.buf[cur..cur + n].copy_from_slice(&bytes[..n]);
+        self.len = cur + n;
         if bytes.len() > n { Err(fmt::Error) } else { Ok(()) }
     }
 }

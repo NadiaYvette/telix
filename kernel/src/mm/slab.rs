@@ -545,7 +545,10 @@ pub fn free(addr: PhysAddr, size: usize) {
     // Slow path: flush backup to global cache, then swap and push.
     // Collect backup contents while IRQs disabled, then release IRQs for lock.
     let mut flush_buf = [0usize; MAG_CAPACITY];
-    let flush_count = mag.backup.count as usize;
+    // Clamp count defensively: if magazine state has been corrupted
+    // (#208 family), use 0 rather than panic on out-of-bounds slice.
+    // This lets the primary failure print before we'd otherwise mask it.
+    let flush_count = (mag.backup.count as usize).min(MAG_CAPACITY);
     flush_buf[..flush_count].copy_from_slice(&mag.backup.objs[..flush_count]);
     mag.backup.count = 0;
 
