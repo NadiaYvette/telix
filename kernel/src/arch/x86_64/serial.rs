@@ -250,6 +250,25 @@ pub fn _print(args: fmt::Arguments) {
     // First-call FIFO init.  Cheap atomic check on subsequent calls.
     init_uart_fifo_once();
 
+    // #208 PRINT-RET entry probe: capture the saved return address NOW,
+    // before any of __print's body runs.  Compared against an end-of-body
+    // probe to see whether the corruption happens DURING __print (and not
+    // before we entered).  Offset 0xd38 is the post-prologue position of
+    // the saved ret addr (frame 0xd08 + 6×8 saved regs) — re-verify if
+    // frame size changes.
+    #[cfg(target_arch = "x86_64")]
+    let entry_ret: u64 = {
+        let v: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {0}, [rsp + 0xd38]",
+                out(reg) v,
+                options(readonly, nostack, preserves_flags),
+            );
+        }
+        v
+    };
+
     // Phase 1: format into a per-call stack buffer with IRQs ON.
     // Two buffers: one for the raw format output, one for CRLF-expanded
     // bytes that go to the UART.  Keeping them split lets the
@@ -311,6 +330,74 @@ pub fn _print(args: fmt::Arguments) {
     // Mirror to the framebuffer console (no UART contention).
     if crate::drivers::fb_console::available() {
         crate::drivers::fb_console::write_str(fmtbuf.as_str());
+    }
+
+    // #208 PRINT-RET probe: read the saved return address from this
+    // function's frame just before the compiler's epilogue runs.  If
+    // it's been overwritten with a non-canonical value (the recurring
+    // #GP at the `ret` instruction = error_code=0, signature of a ret
+    // to non-canonical RIP), log via DirectUart bypass — the regular
+    // print path is what we're about to fault out of.
+    //
+    // Frame layout per `objdump -d` (x86_64-unknown-none release):
+    //   push %rbp / push %r15..%rbx (6 × 8 = 48 bytes) + sub $0xcd8, %rsp
+    //   (frame size includes this probe's locals; was 0xc18 before, 0xcd8
+    //   after — re-verify via `objdump -d` if you change anything in
+    //   this function).  Saved ret addr is at [rsp + 0xd38]
+    //   (frame 0xd08 + 6 × 8 saved regs = 0xd38).
+    // This offset is fragile — bumps if the local-frame size changes.
+    // If the layout shifts, the probe just reads garbage at that offset,
+    // which will likely look non-canonical and surface itself.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let saved_ret: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {0}, [rsp + 0xd38]",
+                out(reg) saved_ret,
+                options(readonly, nostack, preserves_flags),
+            );
+        }
+        // Canonical = upper 17 bits all match bit 47.
+        let bit47 = (saved_ret >> 47) & 1;
+        let upper = saved_ret >> 48;
+        let canonical = if bit47 == 1 { upper == 0xFFFF } else { upper == 0 };
+        let mutated = saved_ret != entry_ret;
+        if !canonical || mutated {
+            use core::sync::atomic::{AtomicU32, Ordering as O};
+            static LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = LOG_COUNT.fetch_add(1, O::Relaxed);
+            if n < 16 {
+                let mut rsp_now: u64;
+                unsafe {
+                    core::arch::asm!(
+                        "mov {0}, rsp",
+                        out(reg) rsp_now,
+                        options(nomem, nostack, preserves_flags),
+                    );
+                }
+                // Sample the 4 quadwords below the ret-addr slot too,
+                // so we can see what scribble pattern is present.
+                let below: [u64; 4] = unsafe {
+                    [
+                        core::ptr::read_volatile((rsp_now + 0xd30) as *const u64),
+                        core::ptr::read_volatile((rsp_now + 0xd28) as *const u64),
+                        core::ptr::read_volatile((rsp_now + 0xd20) as *const u64),
+                        core::ptr::read_volatile((rsp_now + 0xd18) as *const u64),
+                    ]
+                };
+                let mut bypass = DirectUart;
+                let _ = core::fmt::Write::write_fmt(
+                    &mut bypass,
+                    format_args!(
+                        "PRINT-RET-SCRIBBLE: cpu={} entry_ret={:#x} exit_ret={:#x} mutated={} canonical={} rsp={:#x} below=[{:#x} {:#x} {:#x} {:#x}] n={}\n",
+                        my_cpu, entry_ret, saved_ret, mutated, canonical,
+                        rsp_now,
+                        below[0], below[1], below[2], below[3], n + 1,
+                    ),
+                );
+            }
+        }
     }
 }
 
