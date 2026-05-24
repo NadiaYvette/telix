@@ -290,8 +290,13 @@ pub fn validate_thread_canary(tid: ThreadId, callsite: &str) -> bool {
     let ncpus = smp::num_cpus() as u32;
     let on_ok = on < ncpus || on == ON_CPU_PENDING || on == ON_CPU_RELEASING || on == u32::MAX;
     let stack_ok = t.stack_base != 0 || tid == 0;
+    // #214 magic canary adjacent to saved_sp_source.  If a writer
+    // scribbled the mid-region of the Thread struct, this should change
+    // too — distinguishes "single-byte targeted reset" from "bulk
+    // overwrite" corruption.
+    let canary_ok = t.canary_around_source == crate::sched::thread::THREAD_CANARY_MAGIC;
 
-    if id_ok && src_ok && state_ok && on_ok && stack_ok {
+    if id_ok && src_ok && state_ok && on_ok && stack_ok && canary_ok {
         return false;
     }
 
@@ -302,8 +307,9 @@ pub fn validate_thread_canary(tid: ThreadId, callsite: &str) -> bool {
             callsite, tid, n + 1,
         );
         crate::println!(
-            "  id={} (expect={}) state={} src={} on_cpu={:#x} stack_base={:#x} task_id={}",
+            "  id={} (expect={}) state={} src={} on_cpu={:#x} stack_base={:#x} task_id={} canary={:#x} (expect={:#x})",
             t.id, tid, state_byte, src, on, t.stack_base, t.task_id,
+            t.canary_around_source, crate::sched::thread::THREAD_CANARY_MAGIC,
         );
         crate::println!(
             "  saved_sp={:#x} ipc_frame_sp={:#x} syscall_frame_sp={:#x}",

@@ -45,6 +45,11 @@ pub enum BlockReason {
 // Thread ID capacity is determined by RadixTable::capacity() — no fixed constant needed.
 
 /// Thread control block.
+/// #214 magic value for canary_around_source.  Distinct from common
+/// kernel patterns and Telix's own slab/IPC sentinels so corruption
+/// values stand out clearly in logs.
+pub const THREAD_CANARY_MAGIC: u64 = 0xA11C0DED_DEFEC8EDu64;
+
 pub struct Thread {
     pub id: ThreadId,
     pub state: ThreadState,
@@ -221,6 +226,16 @@ pub struct Thread {
     /// pre_save_frame and preserves the correct syscall frame for
     /// inject_recv_into_frame / inject_fault_into_frame.
     pub ipc_frame_sp: u64,
+    /// #214 Thread struct corruption canary — magic value adjacent to
+    /// saved_sp_source.  Set at Thread::empty (CANARY_MAGIC).  Checked
+    /// by validate_thread_canary; if value differs, a writer has
+    /// scribbled the Thread struct's mid-region.  Boot 1492 captured a
+    /// residual #208 mode where saved_sp_source had been reset to 4
+    /// (default) on a thread that ran try_switch many times — slab/
+    /// heap overlap is the leading hypothesis.  Catching the canary
+    /// changing tells us the surrounding bytes were touched too,
+    /// not just a single byte.
+    pub canary_around_source: u64,
     /// Debug: tracks which code path last wrote saved_sp.
     /// 1 = try_switch, 2 = voluntary_reschedule, 3 = pre_save_frame, 4 = init.
     pub saved_sp_source: u8,
@@ -353,6 +368,7 @@ impl Thread {
             personality_frame_sp: 0,
             syscall_frame_sp: 0,
             ipc_frame_sp: 0,
+            canary_around_source: THREAD_CANARY_MAGIC,
             saved_sp_source: 4,
             sched_class: SCHED_NORMAL,
             eevdf_weight: 1024,
