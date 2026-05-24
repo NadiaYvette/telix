@@ -65,8 +65,21 @@ pub struct Thread {
     /// Saved kernel stack pointer. When the thread is not running,
     /// this points to a saved exception frame on its kernel stack.
     pub saved_sp: u64,
-    /// Physical address of the base of this thread's stack page.
+    /// Address of the base of this thread's stack region.
+    ///
+    /// Phase 5b: this is now the VIRTUAL address of the kstack base
+    /// (within KSTACK_REGION, PML4[508]).  The corresponding PHYSICAL
+    /// address is in `stack_phys_base` — needed for phys::free_pages
+    /// on the deferred-kill path.
+    ///
+    /// Range checks (`addr >= stack_base && addr < stack_base + kstack_size`)
+    /// work unchanged because they operate purely on the VA returned by
+    /// alloc_kstack_zeroed and stored here.
     pub stack_base: usize,
+    /// Phase 5b: physical address of the kstack base, kept for
+    /// phys::free_pages when this thread's stack is reclaimed.  0 if
+    /// uninitialized or already freed.
+    pub stack_phys_base: usize,
     /// Generation counter bumped each time `stack_base` changes (alloc or
     /// free).  Lets the IPC frame-injection sites detect the deferred-free
     /// race: a sender holding a stale `thread_saved_sp(tid)` would see a
@@ -316,6 +329,7 @@ impl Thread {
             default_quantum: 1,
             saved_sp: 0,
             stack_base: 0,
+            stack_phys_base: 0,
             kstack_epoch: 0,
             iretq_shadow_rip: 0,
             iretq_shadow_cs: 0,

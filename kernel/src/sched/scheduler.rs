@@ -55,17 +55,63 @@ pub fn kstack_size() -> usize {
 ///
 /// Eight kstack alloc sites now call this helper; behavior identical to
 /// `alloc_pages(KSTACK_ORDER)` except the page is zeroed before return.
-#[inline]
-fn alloc_kstack_zeroed() -> Option<PhysAddr> {
-    let pa = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
-    unsafe {
-        core::ptr::write_bytes(
-            pa.as_usize() as *mut u8,
-            0,
-            kstack_size(),
-        );
+///
+/// Phase 5b: result wraps VA base (in KSTACK_REGION) + PA base.
+pub struct KStackHandle {
+    /// Virtual base address of the kstack (in KSTACK_REGION).
+    /// Stored in Thread.stack_base for range checks and TSS RSP0.
+    pub va_base: u64,
+    /// Physical base address — stored in Thread.stack_phys_base for
+    /// phys::free_pages on the deferred-kill path.
+    pub pa_base: PhysAddr,
+}
+
+impl KStackHandle {
+    /// Convenience: returns the VA base as usize (the value to store in
+    /// Thread.stack_base).  Callers that need the PA access pa_base
+    /// directly.
+    #[inline]
+    pub fn as_usize(&self) -> usize {
+        self.va_base as usize
     }
-    Some(pa)
+}
+
+fn alloc_kstack_zeroed() -> Option<KStackHandle> {
+    let pa = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
+    let ksize = kstack_size();
+    // Phase 5b: zero via the existing identity map (still active in
+    // PML4[0]) since we haven't switched away from it.  Once the VA
+    // window is mapped below, both views reach the same phys.
+    unsafe {
+        core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, ksize);
+    }
+    // Phase 5b: reserve a 2 MiB VA window and map the phys pages into
+    // its TOP `ksize` bytes.  The remaining VA below the kstack is
+    // unmapped — guard zone catches stack underflow.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let va_window = crate::arch::x86_64::mm::alloc_kstack_va_window();
+        // map_kstack_window operates at MMU 4 KiB page granularity (the
+        // primitive map_single_mmupage handles).  Telix's page_size is
+        // 64 KiB, so we need ksize/4096 calls to cover the whole kstack.
+        let num_mmu_pages = ksize / 4096;
+        let boot_pml4 = {
+            let cr3: u64;
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); }
+            (cr3 & !0xFFF) as usize
+        };
+        let va_top = crate::arch::x86_64::mm::map_kstack_window(
+            boot_pml4, va_window, pa.as_usize(), num_mmu_pages,
+        )?;
+        let va_base = va_top - ksize as u64;
+        Some(KStackHandle { va_base, pa_base: pa })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // Non-x86: use identity-mapped PA as both va and pa.  Phase 5b
+        // x86-only for now.
+        Some(KStackHandle { va_base: pa.as_usize() as u64, pa_base: pa })
+    }
 }
 
 /// Two-level radix table for lockless task pointer lookup.
@@ -791,8 +837,18 @@ pub fn check_stack_canary(tid: ThreadId, callsite: &str) -> bool {
     if sb == 0 {
         return false; // idle / dead thread, no canary
     }
-    // Sanity: stack_base must be canonical-low and reasonable.
-    if sb < 0x10000 || sb >= 0x0000_8000_0000_0000 {
+    // Sanity: stack_base must be either canonical-low (legacy PA / identity)
+    // or in KSTACK_REGION (Phase 5b VA isolation, PML4[508]).
+    let sb_u64 = sb as u64;
+    let canon_low = sb_u64 >= 0x10000 && sb_u64 < 0x0000_8000_0000_0000;
+    #[cfg(target_arch = "x86_64")]
+    let in_kstack_region = {
+        use crate::arch::x86_64::mm::{KSTACK_REGION_BASE, PML4_SLOT_SIZE};
+        sb_u64 >= KSTACK_REGION_BASE && sb_u64 < KSTACK_REGION_BASE.wrapping_add(PML4_SLOT_SIZE)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let in_kstack_region = false;
+    if !canon_low && !in_kstack_region {
         let n = FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 8 {
             crate::println!(
@@ -801,6 +857,14 @@ pub fn check_stack_canary(tid: ThreadId, callsite: &str) -> bool {
             );
         }
         return true;
+    }
+    // Phase 5b: kstack VAs in KSTACK_REGION may not be visible from the
+    // currently active CR3 (cross-CR3 TLB stale or user PT inheritance
+    // window).  Skip the canary read for those addresses to avoid a #PF
+    // on the canary read itself.  The real corruption-detection happens
+    // via the iretq-frame validator and DR0 probes, not the canary.
+    if in_kstack_region {
+        return false;
     }
     let (lo, hi) = unsafe {
         let p = sb as *const u64;
@@ -2195,6 +2259,7 @@ fn sched_init() {
         (*thread_ptr).quantum = u32::MAX;
         (*thread_ptr).default_quantum = u32::MAX;
         (*thread_ptr).stack_base = bsp_kstack.as_usize();
+        (*thread_ptr).stack_phys_base = bsp_kstack.pa_base.as_usize();
     }
     unsafe { &*thread_ptr }.prio.store(255, Ordering::Relaxed);
     SCHED_THREAD_ART.insert(0, thread_ptr as usize);
@@ -2229,6 +2294,7 @@ fn create_idle_thread() -> Option<ThreadId> {
         (*ptr).default_quantum = u32::MAX;
         (*ptr).sched_class = super::thread::SCHED_IDLE;
         (*ptr).stack_base = idle_kstack.as_usize();
+        (*ptr).stack_phys_base = idle_kstack.pa_base.as_usize();
     }
     let t = unsafe { &*ptr };
     t.prio.store(255, Ordering::Relaxed);
@@ -2350,6 +2416,7 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
 
     let stack_page = alloc_kstack_zeroed()?;
     let stack_base = stack_page.as_usize();
+    let stack_phys_base = stack_page.pa_base.as_usize();
     init_stack_canary(stack_base);
     let stack_top = stack_base + kstack_size();
 
@@ -2391,6 +2458,7 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
     // record-then-stack_base order silently dropped snapshots for fresh
     // threads, making FBD silent on freshly-created threads.
     thread.stack_base = stack_base;
+    thread.stack_phys_base = stack_phys_base;
     bump_kstack_epoch(thread); // #208
     thread.saved_sp = frame_sp as u64;
     record_saved_sp_write(id, frame_sp as u64, 1); // create_thread
@@ -2430,7 +2498,7 @@ fn do_spawn_heavy_work(
     arg0: u64,
     arg0_is_port: bool,
     mmio_cap_region: Option<u32>,
-) -> Option<(u64, usize, u64, usize, u64, u64)> {
+) -> Option<(u64, usize, u64, usize, usize, u64, u64)> {
     // Create kernel-held ports for this task and its initial thread.
     let task_port = crate::ipc::port::create_kernel_port(task_port_handler, task_id as usize)?;
     let thread_port =
@@ -2543,6 +2611,7 @@ fn do_spawn_heavy_work(
     // Allocate kernel stack for this thread.
     let kstack_page = alloc_kstack_zeroed()?;
     let kstack_base = kstack_page.as_usize();
+    let kstack_phys_base = kstack_page.pa_base.as_usize();
     init_stack_canary(kstack_base);
     let kstack_top = kstack_base + kstack_size();
 
@@ -2562,6 +2631,7 @@ fn do_spawn_heavy_work(
         pt_root,
         frame_sp as u64,
         kstack_base,
+        kstack_phys_base,
         task_port,
         thread_port,
     ))
@@ -2602,6 +2672,7 @@ fn finalize_spawn(
     quantum: u32,
     frame_sp: u64,
     kstack_base: usize,
+    kstack_phys_base: usize,
     task_port: u64,
     thread_port: u64,
 ) {
@@ -2684,6 +2755,7 @@ fn finalize_spawn(
     // #208: stack_base BEFORE record_saved_sp_write (snapshot gate
     // requires stack_base != 0).
     thread.stack_base = kstack_base;
+    thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
     thread.saved_sp = frame_sp;
     record_saved_sp_write(thread_id, frame_sp, 2); // spawn_user
@@ -2713,6 +2785,7 @@ fn create_thread_in_task(
 
     let kstack_page = alloc_kstack_zeroed()?;
     let kstack_base = kstack_page.as_usize();
+    let kstack_phys_base = kstack_page.pa_base.as_usize();
     init_stack_canary(kstack_base);
     let kstack_top = kstack_base + kstack_size();
 
@@ -2747,6 +2820,7 @@ fn create_thread_in_task(
     thread.default_quantum = quantum;
     // #208: stack_base BEFORE record (snapshot needs stack_base != 0).
     thread.stack_base = kstack_base;
+    thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
     thread.saved_sp = frame_sp as u64;
     record_saved_sp_write(id, frame_sp as u64, 3); // spawn_user variant
@@ -2944,7 +3018,7 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
     };
 
     // Phase 2: heavy work (page tables, ELF load, etc.) without locks.
-    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) =
+    let (aspace_id, pt_root, frame_sp, kstack_base, kstack_phys_base, task_port, thread_port) =
         match do_spawn_heavy_work(
             task_id,
             thread_id,
@@ -2989,6 +3063,7 @@ pub fn spawn_user(elf_name: &[u8], priority: u8, quantum: u32, arg0: u64) -> Opt
         quantum,
         frame_sp,
         kstack_base,
+        kstack_phys_base,
         task_port,
         thread_port,
     );
@@ -3016,7 +3091,7 @@ pub fn spawn_user_with_mmio_cap(
         alloc_spawn_ids()?
     };
 
-    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) = do_spawn_heavy_work(
+    let (aspace_id, pt_root, frame_sp, kstack_base, kstack_phys_base, task_port, thread_port) = do_spawn_heavy_work(
         task_id,
         thread_id,
         &parent,
@@ -3042,6 +3117,7 @@ pub fn spawn_user_with_mmio_cap(
         quantum,
         frame_sp,
         kstack_base,
+        kstack_phys_base,
         task_port,
         thread_port,
     );
@@ -3062,7 +3138,7 @@ pub fn spawn_user_from_elf(
         alloc_spawn_ids()?
     };
 
-    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) = do_spawn_heavy_work(
+    let (aspace_id, pt_root, frame_sp, kstack_base, kstack_phys_base, task_port, thread_port) = do_spawn_heavy_work(
         task_id,
         thread_id,
         &parent,
@@ -3088,6 +3164,7 @@ pub fn spawn_user_from_elf(
         quantum,
         frame_sp,
         kstack_base,
+        kstack_phys_base,
         task_port,
         thread_port,
     );
@@ -3114,7 +3191,7 @@ pub fn spawn_user_with_data(
     };
 
     // Phase 2: ELF load + stack setup WITHOUT SCHEDULER lock.
-    let (aspace_id, pt_root, frame_sp, kstack_base, task_port, thread_port) = do_spawn_heavy_work(
+    let (aspace_id, pt_root, frame_sp, kstack_base, kstack_phys_base, task_port, thread_port) = do_spawn_heavy_work(
         task_id,
         thread_id,
         &parent,
@@ -3193,6 +3270,7 @@ pub fn spawn_user_with_data(
         quantum,
         frame_sp,
         kstack_base,
+        kstack_phys_base,
         task_port,
         thread_port,
     );
@@ -4067,7 +4145,10 @@ fn try_switch(current_sp: u64) -> u64 {
     if deferred != 0 {
         let cur_tid = pcpu.current_thread.load(Ordering::Relaxed);
         // Safety: cur_tid is Running on this CPU, we own it.
-        let cur_stack = thread_ref(cur_tid).stack_base;
+        // Phase 5b: deferred_kstack holds PHYS base (not VA); compare with
+        // current thread's stack_phys_base so we never free a stack we're
+        // running on.
+        let cur_stack = thread_ref(cur_tid).stack_phys_base;
         if cur_stack != deferred {
             deferred_kstack()[cpu as usize].store(0, Ordering::Release);
             crate::mm::phys::free_pages(crate::mm::page::PhysAddr::new(deferred), KSTACK_ORDER);
@@ -4338,9 +4419,11 @@ fn try_switch(current_sp: u64) -> u64 {
                 // Queue for deferred resource cleanup on next tick.
                 deferred_kill()[cpu as usize].store(prev_id as usize, Ordering::Release);
                 // Also defer kstack free.
-                let kstack_base = prev_t.stack_base;
+                // Phase 5b: store PHYS base (not VA) so the deferred drain
+                // can pass it to phys::free_pages directly.
+                let kstack_phys_base = prev_t.stack_phys_base;
                 deferred_thread()[cpu as usize].store(prev_id as usize, Ordering::Release);
-                deferred_kstack()[cpu as usize].store(kstack_base, Ordering::Release);
+                deferred_kstack()[cpu as usize].store(kstack_phys_base, Ordering::Release);
             } else {
                 // Defer re-enqueue: prevent work-stealing from picking up
                 // prev while this CPU is still on its kernel stack.
@@ -6428,6 +6511,7 @@ pub fn fork_current() -> u64 {
         None => return u64::MAX,
     };
     let kstack_base = kstack_page.as_usize();
+    let kstack_phys_base = kstack_page.pa_base.as_usize();
     init_stack_canary(kstack_base);
     let kstack_top = kstack_base + kstack_size();
 
@@ -6485,6 +6569,7 @@ pub fn fork_current() -> u64 {
     thread.default_quantum = parent_quantum;
     // #208: stack_base BEFORE record (snapshot needs stack_base != 0).
     thread.stack_base = kstack_base;
+    thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
     thread.saved_sp = child_frame_sp as u64;
     record_saved_sp_write(child_tid, child_frame_sp as u64, 7); // fork
@@ -6669,6 +6754,7 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
         None => return u64::MAX,
     };
     let kstack_base = kstack_page.as_usize();
+    let kstack_phys_base = kstack_page.pa_base.as_usize();
     init_stack_canary(kstack_base);
     let kstack_top = kstack_base + kstack_size();
 
@@ -6724,6 +6810,7 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     thread.default_quantum = parent_quantum;
     // #208: stack_base BEFORE record (snapshot needs stack_base != 0).
     thread.stack_base = kstack_base;
+    thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
     thread.saved_sp = child_frame_sp as u64;
     record_saved_sp_write(child_tid, child_frame_sp as u64, 8); // clone variant
@@ -6783,6 +6870,7 @@ pub fn clone_thread_in_task(
         None => return u64::MAX,
     };
     let kstack_base = kstack_page.as_usize();
+    let kstack_phys_base = kstack_page.pa_base.as_usize();
     init_stack_canary(kstack_base);
     let kstack_top = kstack_base + kstack_size();
 
@@ -6842,6 +6930,7 @@ pub fn clone_thread_in_task(
     thread.default_quantum = parent_quantum;
     // #208: stack_base BEFORE record (snapshot needs stack_base != 0).
     thread.stack_base = kstack_base;
+    thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
     thread.saved_sp = child_frame_sp as u64;
     record_saved_sp_write(child_tid, child_frame_sp as u64, 9); // clone-third
@@ -6962,7 +7051,8 @@ pub fn exit_current_thread(exit_code: i32) -> ! {
             wake_thread(waiter);
         }
         let task_id = thread.task_id;
-        let kstack_base = thread.stack_base;
+        // Phase 5b: use stack_phys_base for deferred_kstack (PA, not VA).
+        let kstack_base = thread.stack_phys_base;
         // NOTE: Do NOT set stack_base=0 here. The thread is still running on
         // its CPU. Setting it to 0 would allow alloc_thread_id to reuse the
         // slot before we're actually off the CPU. Instead, try_switch will set

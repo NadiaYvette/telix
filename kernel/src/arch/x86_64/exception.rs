@@ -200,23 +200,22 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
     //   slot[10..13] = u64s at sp+8*22..sp+8*25  (3 slots ABOVE iretq region)
     #[inline(always)]
     fn snap_iretq_region(sp: u64) -> [u64; 13] {
-        unsafe {
-            [
-                core::ptr::read_volatile((sp + 13 * 8) as *const u64),
-                core::ptr::read_volatile((sp + 14 * 8) as *const u64),
-                core::ptr::read_volatile((sp + 15 * 8) as *const u64),
-                core::ptr::read_volatile((sp + 16 * 8) as *const u64),
-                core::ptr::read_volatile((sp + 17 * 8) as *const u64), // rip
-                core::ptr::read_volatile((sp + 18 * 8) as *const u64), // cs
-                core::ptr::read_volatile((sp + 19 * 8) as *const u64), // rflags
-                core::ptr::read_volatile((sp + 20 * 8) as *const u64), // rsp
-                core::ptr::read_volatile((sp + 21 * 8) as *const u64), // ss
-                core::ptr::read_volatile((sp + 22 * 8) as *const u64),
-                core::ptr::read_volatile((sp + 23 * 8) as *const u64),
-                core::ptr::read_volatile((sp + 24 * 8) as *const u64),
-                core::ptr::read_volatile((sp + 25 * 8) as *const u64),
-            ]
+        use crate::arch::x86_64::mm::{KSTACK_REGION_BASE, KSTACK_WINDOW_SIZE, PML4_SLOT_SIZE};
+        let max_safe: u64 = if sp >= KSTACK_REGION_BASE
+            && sp < KSTACK_REGION_BASE.wrapping_add(PML4_SLOT_SIZE)
+        {
+            (sp & !(KSTACK_WINDOW_SIZE - 1)).wrapping_add(KSTACK_WINDOW_SIZE)
+        } else {
+            u64::MAX
+        };
+        let mut out = [0u64; 13];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let addr = sp + (13 + i as u64) * 8;
+            if addr.wrapping_add(8) <= max_safe {
+                *slot = unsafe { core::ptr::read_volatile(addr as *const u64) };
+            }
         }
+        out
     }
     // Take an RSP snapshot alongside each iretq snap so we know if the
     // validator's own stack pushed past the iretq region (geometric overlap
@@ -1214,11 +1213,28 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
     };
     let is_user = (error & (1 << 2)) != 0;
     if !is_user {
+        let cr3: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)); }
+        let cpu = crate::sched::smp::cpu_id();
+        // Walk the PT chain for CR2 to identify which level is missing.
+        // Bit-level breakdown of the 4 levels of pointers.
+        let cr3_pa = (cr3 & !0xFFF) as usize;
+        let pml4_e = unsafe { *((cr3_pa + ((cr2 >> 39) & 0x1FF) as usize * 8) as *const u64) };
+        let pdpt_e = if pml4_e & 1 != 0 {
+            let pdpt_pa = (pml4_e & 0x000F_FFFF_FFFF_F000) as usize;
+            unsafe { *((pdpt_pa + ((cr2 >> 30) & 0x1FF) as usize * 8) as *const u64) }
+        } else { 0 };
+        let pd_e = if pdpt_e & 1 != 0 {
+            let pd_pa = (pdpt_e & 0x000F_FFFF_FFFF_F000) as usize;
+            unsafe { *((pd_pa + ((cr2 >> 21) & 0x1FF) as usize * 8) as *const u64) }
+        } else { 0 };
+        let pt_e = if pd_e & 1 != 0 {
+            let pt_pa = (pd_e & 0x000F_FFFF_FFFF_F000) as usize;
+            unsafe { *((pt_pa + ((cr2 >> 12) & 0x1FF) as usize * 8) as *const u64) }
+        } else { 0 };
         crate::println!(
-            "Kernel #PF at RIP={:#x} CR2={:#x} error={:#x}",
-            frame.rip(),
-            cr2,
-            error
+            "Kernel #PF at RIP={:#x} CR2={:#x} error={:#x} cpu={} cr3={:#x} pml4_e={:#x} pdpt_e={:#x} pd_e={:#x} pt_e={:#x}",
+            frame.rip(), cr2, error, cpu, cr3, pml4_e, pdpt_e, pd_e, pt_e,
         );
         loop {
             core::hint::spin_loop();

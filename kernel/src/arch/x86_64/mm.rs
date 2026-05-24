@@ -145,6 +145,26 @@ pub fn map_kstack_window(
             return None;
         }
     }
+    // Verify mapping: walk the PT for each page and confirm PTE_P set.
+    // Catches silent partial-map failures (PDPT/PD/PT alloc returning the
+    // same slot, etc.).
+    let mut bad_idx: i32 = -1;
+    let mut bad_pte: u64 = 0;
+    for i in 0..num_mmu_pages {
+        let va = va_kstack_base + (i * MMU_PAGE_SIZE) as u64;
+        let pte = read_pte(pml4, va as usize);
+        if pte & PTE_P == 0 {
+            bad_idx = i as i32;
+            bad_pte = pte;
+            break;
+        }
+    }
+    if bad_idx >= 0 {
+        crate::println!(
+            "MAP-KSTACK-VERIFY-FAIL: pml4={:#x} va_window={:#x} pa_base={:#x} num={} bad_idx={} bad_pte={:#x}",
+            pml4, va_window_base, pa_base, num_mmu_pages, bad_idx, bad_pte,
+        );
+    }
     Some(va_kstack_base + kstack_byte_size as u64)
 }
 
@@ -566,6 +586,14 @@ pub fn create_user_page_table() -> Option<usize> {
             *dst.add(i) = *src.add(i);
         }
 
+        // #208 Phase 5b: copy the VA-isolation region PML4 entries
+        // (KSTACK_REGION/SLAB_REGION/PT_REGION/PHYS_DIRECT_MAP) so user
+        // PTs can also reach them.  Required because the kernel runs on
+        // the user task's CR3 (no PT switch on syscall entry), so any
+        // kernel access to these regions must be mapped in the user PT.
+        for i in 507..=510 {
+            *dst.add(i) = *src.add(i);
+        }
         // #208 higher-half follow-on: copy PML4[511] (kernel high-half VMA).
         // With the higher-half kernel layout (boot.S:80, linker.ld:6), kernel
         // text and data live at 0xFFFFFFFF80000000+, mapped via PML4[511] →
@@ -625,11 +653,10 @@ pub fn free_page_table_tree(root: usize, fg: *mut crate::mm::ptshare::ForkGroup)
         // regions + high-half kernel: PHYS_DIRECT_MAP / KSTACK_REGION /
         // SLAB_REGION / PT_REGION / kernel high-half).  Their PDPTs live
         // in BSS and are shared across every CR3 — freeing them returns
-        // boot_pdpt_kstack / boot_pdpt_hi etc. to the phys allocator,
-        // which then hands them out as fresh pages and the new owner
-        // zeroes them, wiping every other CR3's PDPT chain for those
-        // regions.  Surfaces as spurious kstack-VA #PFs (pml4_e+pdpt_e
-        // valid, pd_e=0) — see project_pml4_free_root_cause memory note.
+        // boot_pdpt_kstack et al. to the phys allocator, which then hands
+        // them out as fresh pages and the new owner zeroes them, wiping
+        // every other CR3's PDPT chain for those regions and causing
+        // spurious kstack-VA #PFs (pml4_e+pdpt_e valid, pd_e=0).
         for i in 4..507 {
             let entry = *pml4.add(i);
             if X86Pte::is_shared_entry(entry) {
