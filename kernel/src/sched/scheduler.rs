@@ -2182,18 +2182,69 @@ const THREAD_SLAB_SIZE: usize = 1024;
 const _: () = assert!(core::mem::size_of::<Thread>() <= THREAD_SLAB_SIZE);
 
 fn alloc_thread_entry() -> Option<*mut Thread> {
-    let pa = slab::alloc(THREAD_SLAB_SIZE)?;
-    let p = pa.as_usize() as *mut Thread;
-    unsafe {
-        core::ptr::write_bytes(p as *mut u8, 0, THREAD_SLAB_SIZE);
-        core::ptr::write(p, Thread::empty());
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Phase 4 (slab-pt-va-isolation): each Thread gets its own 4 KiB
+        // phys page mapped into a unique SLAB_THREAD_REGION VA window
+        // (16 KiB) with 12 KiB of unmapped guard below.  A stray write
+        // to a Thread struct's address from unrelated code (e.g., extent
+        // tree or scheduler heap pointer arithmetic landing in the slab
+        // region) now faults instead of scribbling a sibling Thread —
+        // catches the residual #208 family that survives Phase 5b kstack
+        // isolation (canary intact, but Thread fields scribbled).
+        let pa = crate::mm::phys::alloc_page()?;
+        unsafe {
+            core::ptr::write_bytes(
+                pa.as_usize() as *mut u8,
+                0,
+                crate::mm::page::page_size(),
+            );
+        }
+        let va_window = crate::arch::x86_64::mm::alloc_slab_thread_va_window();
+        let boot_pml4 = {
+            let cr3: u64;
+            unsafe {
+                core::arch::asm!(
+                    "mov {}, cr3", out(reg) cr3,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            (cr3 & !0xFFF) as usize
+        };
+        let va = crate::arch::x86_64::mm::map_slab_thread_window(
+            boot_pml4, va_window, pa.as_usize(),
+        )?;
+        let p = va as *mut Thread;
+        unsafe {
+            core::ptr::write(p, Thread::empty());
+        }
+        Some(p)
     }
-    Some(p)
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let pa = slab::alloc(THREAD_SLAB_SIZE)?;
+        let p = pa.as_usize() as *mut Thread;
+        unsafe {
+            core::ptr::write_bytes(p as *mut u8, 0, THREAD_SLAB_SIZE);
+            core::ptr::write(p, Thread::empty());
+        }
+        Some(p)
+    }
 }
 
 #[allow(dead_code)]
 fn free_thread_entry(p: *mut Thread) {
-    slab::free(PhysAddr::new(p as usize), THREAD_SLAB_SIZE);
+    // Phase 4: Thread VAs in SLAB_THREAD_REGION are never freed; the
+    // SCHED_THREAD_ART lookup reuses Dead slots (see alloc_thread_id).
+    // Non-x86 still routes through slab.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        slab::free(PhysAddr::new(p as usize), THREAD_SLAB_SIZE);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = p;
+    }
 }
 
 fn alloc_task_entry() -> Option<*mut Task> {

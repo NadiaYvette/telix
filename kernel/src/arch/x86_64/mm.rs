@@ -104,6 +104,55 @@ pub fn kva_to_phys(va: usize) -> usize {
 static KSTACK_VA_NEXT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(KSTACK_REGION_BASE + KSTACK_WINDOW_SIZE);
 
+// =========================================================================
+// Phase 4 (slab-pt-va-isolation doc): SLAB_THREAD_REGION sub-allocator.
+//
+// Each Thread struct gets its own 16 KiB VA window within SLAB_REGION,
+// with one 4 KiB phys page mapped at the TOP and 12 KiB of unmapped
+// guard below.  A stray write to a Thread struct's address from
+// unrelated kernel code (e.g., extent-tree pointer arithmetic landing
+// in the slab region) faults instead of silently scribbling a sibling
+// Thread.  Per-instance isolation is the goal — sharing a 4 KiB slab
+// page between 4 Threads (as the legacy slab cache did) doesn't catch
+// within-slab cross-Thread scribbles.
+// =========================================================================
+
+/// Size of each Thread's VA window in SLAB_THREAD_REGION (16 KiB).
+/// 4 KiB mapped at the top + 12 KiB guard below.
+pub const SLAB_THREAD_WINDOW_SIZE: u64 = 16 * 1024;
+
+/// Bump-pointer cursor for SLAB_THREAD_REGION VA windows.
+static SLAB_THREAD_VA_NEXT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(SLAB_REGION_BASE + SLAB_THREAD_WINDOW_SIZE);
+
+/// Reserve the next SLAB_THREAD_WINDOW_SIZE VA window in SLAB_REGION.
+/// Returns the VA base of the window (low address).  The Thread struct
+/// itself lives in the TOP 4 KiB; bytes 0..(WINDOW - 4 KiB) are guard.
+#[inline]
+pub fn alloc_slab_thread_va_window() -> u64 {
+    SLAB_THREAD_VA_NEXT.fetch_add(
+        SLAB_THREAD_WINDOW_SIZE,
+        core::sync::atomic::Ordering::Relaxed,
+    )
+}
+
+/// Map a single 4 KiB phys page at the TOP of a SLAB_THREAD_REGION VA
+/// window.  Returns the VA of the mapped page (i.e., `va_window_base +
+/// SLAB_THREAD_WINDOW_SIZE - 4 KiB`).  The rest of the window stays
+/// unmapped — stray accesses to "near-Thread" addresses fault.
+pub fn map_slab_thread_window(
+    pml4: usize,
+    va_window_base: u64,
+    pa: usize,
+) -> Option<u64> {
+    let va = va_window_base + SLAB_THREAD_WINDOW_SIZE - MMU_PAGE_SIZE as u64;
+    let flags = PTE_P | PTE_RW | PTE_NX;
+    if !map_single_mmupage(pml4, va as usize, pa, flags) {
+        return None;
+    }
+    Some(va)
+}
+
 /// Reserve the next 2 MiB VA window in KSTACK_REGION.  Returns the
 /// VA base of the window.  Bumps the cursor atomically — safe under
 /// concurrent allocation.
