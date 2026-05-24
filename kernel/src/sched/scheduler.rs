@@ -138,6 +138,16 @@ const MAX_IDLE_NS: u64 = 10_000_000; // 10ms — one tick interval, matches TICK
 /// transient window (which could cause DOUBLE-SCHED if a third CPU steals
 /// the re-enqueued thread before the original CAS completes).
 const ON_CPU_PENDING: u32 = u32::MAX - 1;
+/// #208 Fix D: intermediate state between Running and PENDING.  Set by the
+/// park-side of try_switch (scheduler.rs:4276/4303) when prev is about to be
+/// re-enqueued or marked Blocked.  Indicates "this thread is being released
+/// but cpu_old is still using its kstack."  Peer CPUs' dispatch CAS
+/// only accepts PENDING, so they cannot dispatch a RELEASING thread —
+/// closes the migration-handoff race where cpu_old and cpu_new would both
+/// hold prev's kstack pages and produce iretq-frame scribbles.  Transitioned
+/// to PENDING by `transition_release_to_pending` just before try_switch
+/// returns to its asm caller (which then `mov rsp, rax`s off prev's kstack).
+const ON_CPU_RELEASING: u32 = u32::MAX - 2;
 
 /// #135 transition-ring action IDs.
 pub const TRANS_SET_PENDING: u8 = 1;
@@ -157,6 +167,35 @@ pub const TRANS_WAKE_SET_READY: u8 = 5;
 pub fn set_on_cpu_pending(tid: ThreadId, action_tag: u8, state: ThreadState) {
     thread_ref(tid).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
     record_trans(tid as u32, action_tag, state, ON_CPU_PENDING);
+}
+
+/// #208 Fix D: transition prev's on_cpu from RELEASING → PENDING.
+///
+/// Called from each post-park-side return path in try_switch.  At that
+/// point, try_switch has done all of its bookkeeping for prev (saved_sp
+/// store, state=Ready/Blocked, deferred_requeue arming, dispatching_tid
+/// publication) and is about to return to its asm caller.  The asm
+/// caller will then `mov rsp, rax` to switch off prev's kstack.
+///
+/// Transitioning prev's on_cpu RELEASING → PENDING *here* (just before
+/// return) instead of at the park-side line 4276/4303 shrinks the
+/// migration-handoff race window from "all of try_switch + asm postlude"
+/// to just "asm postlude" — peer CPUs cannot dispatch prev during the
+/// scheduler bookkeeping interval, which is most of the previously-racy
+/// window.  Residual exposure is only the few asm instructions until
+/// `mov rsp, rax` commits.
+///
+/// CAS is used so this is a no-op if prev's on_cpu is no longer
+/// RELEASING (e.g., a Drop / panic path that didn't go through line
+/// 4276/4303).
+#[inline]
+pub fn transition_release_to_pending(prev_id: ThreadId) {
+    let _ = thread_ref(prev_id).on_cpu.compare_exchange(
+        ON_CPU_RELEASING,
+        ON_CPU_PENDING,
+        Ordering::Release,
+        Ordering::Relaxed,
+    );
 }
 
 /// #135 record one transition into the per-thread `trans_ring`.  Each
@@ -219,7 +258,7 @@ pub fn validate_thread_canary(tid: ThreadId, callsite: &str) -> bool {
     let state_ok = state_byte <= 7;
     let on = t.on_cpu.load(Ordering::Relaxed);
     let ncpus = smp::num_cpus() as u32;
-    let on_ok = on < ncpus || on == ON_CPU_PENDING || on == u32::MAX;
+    let on_ok = on < ncpus || on == ON_CPU_PENDING || on == ON_CPU_RELEASING || on == u32::MAX;
     let stack_ok = t.stack_base != 0 || tid == 0;
 
     if id_ok && src_ok && state_ok && on_ok && stack_ok {
@@ -4270,11 +4309,18 @@ fn try_switch(current_sp: u64) -> u64 {
                 // Defer re-enqueue: prevent work-stealing from picking up
                 // prev while this CPU is still on its kernel stack.
                 //
-                // NEW_INV: store ON_CPU_PENDING BEFORE slot fill and BEFORE
-                // state=Ready. Once that store is visible, rescue's stale-
-                // on-cpu predicate (state=Ready ∧ on_cpu<ncpus) cannot match.
-                thread_ref(prev_id).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
-                record_trans(prev_id as u32, 7, prev_t.state, ON_CPU_PENDING);
+                // #208 Fix D: store ON_CPU_RELEASING (not PENDING) here.
+                // RELEASING is treated as "parked" by rescue (it's > ncpus,
+                // so on_cpu<ncpus predicate fails) but the dispatch CAS at
+                // line ~4388 only accepts PENDING, so peer CPUs cannot pick
+                // prev up.  `transition_release_to_pending(prev_id)` is
+                // called just before each post-park-side return so prev
+                // becomes dispatchable only AFTER all try_switch bookkeeping
+                // is complete — closing the migration-handoff race window
+                // that previously let cpu_new dispatch prev while cpu_old
+                // still held its kstack.
+                thread_ref(prev_id).on_cpu.store(ON_CPU_RELEASING, Ordering::Release);
+                record_trans(prev_id as u32, 7, prev_t.state, ON_CPU_RELEASING);
                 let packed = (prev_id as u64) | ((prev_prio as u64) << 32) | ((cpu as u64) << 40);
                 let old_deferred = deferred_requeue()[cpu as usize].swap(packed, Ordering::AcqRel);
                 if old_deferred != 0 {
@@ -4300,8 +4346,11 @@ fn try_switch(current_sp: u64) -> u64 {
             // #135 real-block: mark on_cpu so rescue/work-stealing leaves
             // us alone.  We are NOT in any runqueue — wake_thread will
             // re-enqueue when wakeup arrives.
-            thread_ref(prev_id).on_cpu.store(ON_CPU_PENDING, Ordering::Release);
-            record_trans(prev_id as u32, 10, ThreadState::Blocked, ON_CPU_PENDING);
+            // #208 Fix D: use ON_CPU_RELEASING (see Fix-D notes at the
+            // deferred-requeue branch above and at
+            // transition_release_to_pending).
+            thread_ref(prev_id).on_cpu.store(ON_CPU_RELEASING, Ordering::Release);
+            record_trans(prev_id as u32, 10, ThreadState::Blocked, ON_CPU_RELEASING);
         }
     }
 
@@ -4368,6 +4417,10 @@ fn try_switch(current_sp: u64) -> u64 {
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
             pcpu.current_thread.store(idle_id, Ordering::Relaxed);
             record_current_thread_change(smp::cpu_id(), idle_id as u32);
+            // #208 Fix D: release prev to PENDING just before returning,
+            // so peer CPUs can now dispatch it (asm `mov rsp, rax`
+            // immediately follows this return).
+            transition_release_to_pending(prev_id);
             return idle_sp;
         }
         trace_point("try_switch.cas_ok", next_id as u32);
@@ -4489,6 +4542,8 @@ fn try_switch(current_sp: u64) -> u64 {
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
             pcpu.current_thread.store(idle_id, Ordering::Relaxed);
             record_current_thread_change(smp::cpu_id(), idle_id as u32);
+            // #208 Fix D: release prev → PENDING just before return.
+            transition_release_to_pending(prev_id);
             return idle_sp;
         }
         // Check for corrupt exception frame (architecture-specific).
@@ -4532,6 +4587,8 @@ fn try_switch(current_sp: u64) -> u64 {
                 unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
                 pcpu.current_thread.store(idle_id, Ordering::Relaxed);
                 record_current_thread_change(smp::cpu_id(), idle_id as u32);
+                // #208 Fix D: release prev → PENDING just before return.
+                transition_release_to_pending(prev_id);
                 return idle_sp;
             }
         }
@@ -4549,10 +4606,18 @@ fn try_switch(current_sp: u64) -> u64 {
                 unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
                 pcpu.current_thread.store(idle_id, Ordering::Relaxed);
             record_current_thread_change(smp::cpu_id(), idle_id as u32);
+                // #208 Fix D: release prev → PENDING just before return.
+                transition_release_to_pending(prev_id);
                 return idle_sp;
             }
         }
     }
+    // #208 Fix D: release prev → PENDING just before returning new_sp.
+    // The asm caller will `mov rsp, rax` (= next_t.saved_sp) immediately
+    // after this, moving cpu_old off prev's kstack within a few
+    // instructions.  Peer CPUs may then dispatch prev with reasonable
+    // confidence that the kstack is no longer being mutated.
+    transition_release_to_pending(prev_id);
     next_t.saved_sp
 }
 
