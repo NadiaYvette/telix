@@ -269,6 +269,34 @@ pub fn _print(args: fmt::Arguments) {
         v
     };
 
+    // #208 DR0 watch arm: install hardware watchpoint on our saved
+    // return address slot via the GLOBAL_SAVED_SP_WATCH_ADDR mechanism
+    // (all CPUs lazily arm DR0 at exception entry).  Override any
+    // pre-existing watch for the duration of __print and restore on
+    // exit — the pre-existing proactive arm on tid=4.saved_sp catches
+    // legitimate try_switch writes, which crowd out the __print bug
+    // captures we want.  When the writer hits __print's slot, the #DB
+    // handler logs DR0-HIT-OFF-PATH with the writer's RIP, CPU, tid.
+    #[cfg(target_arch = "x86_64")]
+    let dr0_saved_prev: u64 = {
+        let slot_addr: u64;
+        unsafe {
+            core::arch::asm!(
+                "lea {0}, [rsp + 0xd38]",
+                out(reg) slot_addr,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        use core::sync::atomic::Ordering as O;
+        // Atomic swap: save prior watch, install ours.
+        let prev = crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
+            .swap(slot_addr, O::AcqRel);
+        // Arm local DR0 immediately so this CPU catches writes during
+        // this __print (other CPUs lazily arm at next exception entry).
+        crate::arch::x86_64::gdt::dr0_set_watch_write_qword(slot_addr);
+        prev
+    };
+
     // Phase 1: format into a per-call stack buffer with IRQs ON.
     // Two buffers: one for the raw format output, one for CRLF-expanded
     // bytes that go to the UART.  Keeping them split lets the
@@ -357,6 +385,19 @@ pub fn _print(args: fmt::Arguments) {
                 out(reg) saved_ret,
                 options(readonly, nostack, preserves_flags),
             );
+        }
+        // Restore the pre-__print global watch (so the proactive arm
+        // on tid=4.saved_sp resumes) and disarm/re-arm local DR0
+        // accordingly.
+        {
+            use core::sync::atomic::Ordering as O;
+            crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
+                .store(dr0_saved_prev, O::Release);
+            if dr0_saved_prev != 0 {
+                crate::arch::x86_64::gdt::dr0_set_watch_write_qword(dr0_saved_prev);
+            } else {
+                crate::arch::x86_64::gdt::dr0_clear();
+            }
         }
         // Canonical = upper 17 bits all match bit 47.
         let bit47 = (saved_ret >> 47) & 1;
