@@ -79,6 +79,11 @@ impl KStackHandle {
 fn alloc_kstack_zeroed() -> Option<KStackHandle> {
     let pa = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
     let ksize = kstack_size();
+    // #208 KSTACK_WRITE_RING tag: action=1, alloc_kstack_zeroed
+    // write_bytes(0) of the entire kstack via identity-map PA.  If the
+    // phys allocator double-issued this PA (use-after-free), the zero
+    // hits the other VA that's still mapped to it — a SCRIBBLE.
+    record_kstack_write(pa.as_usize() as u64, ksize as u32, 1);
     // Phase 5b: zero via the existing identity map (still active in
     // PML4[0]) since we haven't switched away from it.  Once the VA
     // window is mapped below, both views reach the same phys.
@@ -440,6 +445,89 @@ pub fn dump_saved_sp_log(tid: ThreadId) {
         "  SAVED-SP-LAST: tid={} value={:#x} tag={} cpu={} ts={}",
         tid, value, tag, cpu, ts32,
     );
+}
+
+/// #208 KSTACK_WRITE_RING — global ring of suspected kstack-VA writes
+/// (iretq-frame injects + page zeroings).  Each slot stores
+/// (target_va, len, action, cpu, ts_ns).  Queried at PRINT-RET-SCRIBBLE
+/// detection: dump entries whose [va, va+len) intersects the SCRIBBLE
+/// slot AND ts_ns is within a recent window — identifies WHICH writer
+/// scribbled the slot.  Distinguishes "alloc_kstack_zeroed zero-fill"
+/// from "init_kernel_frame inject" from "try_switch saved_sp save".
+///
+/// Action codes:
+///   1 = alloc_kstack_zeroed write_bytes(0)  [len = 128 KiB typically]
+///   2 = alloc_thread_entry write_bytes(0)   [len = 4 KiB]
+///   3 = init_kernel_frame  RIP slot  [len = 8]
+///   4 = init_kernel_frame  CS+RFLAGS+RSP+SS slots  [len = 32]
+///   5 = init_user_frame  RIP slot  [len = 8]
+///   6 = init_user_frame  CS+RFLAGS+RSP+SS slots  [len = 32]
+const KSTACK_WRITE_RING_SLOTS: usize = 512;
+const KSTACK_WRITE_RING_MASK: usize = KSTACK_WRITE_RING_SLOTS - 1;
+static KSTACK_WRITE_RING_VA: [core::sync::atomic::AtomicU64; KSTACK_WRITE_RING_SLOTS] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; KSTACK_WRITE_RING_SLOTS]
+};
+static KSTACK_WRITE_RING_META: [core::sync::atomic::AtomicU64; KSTACK_WRITE_RING_SLOTS] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [Z; KSTACK_WRITE_RING_SLOTS]
+};
+static KSTACK_WRITE_RING_POS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+#[inline]
+pub fn record_kstack_write(va: u64, len: u32, action: u8) {
+    let cpu = smp::cpu_id() as u8;
+    let ts_ns = crate::arch::timer::monotonic_ns();
+    let meta = (action as u64) | ((cpu as u64) << 8) | ((len as u64) << 16) | (ts_ns << 32);
+    let idx = (KSTACK_WRITE_RING_POS.fetch_add(1, Ordering::Relaxed) as usize)
+        & KSTACK_WRITE_RING_MASK;
+    KSTACK_WRITE_RING_VA[idx].store(va, Ordering::Relaxed);
+    KSTACK_WRITE_RING_META[idx].store(meta, Ordering::Relaxed);
+}
+
+/// Dump KSTACK_WRITE_RING entries whose [va, va+len) intersects
+/// [slot_va, slot_va+8) AND ts_ns is within `window_ns` of `now_ns`.
+/// Called from PRINT-RET-SCRIBBLE handler — identifies the writer of
+/// the corrupted ret slot.
+pub fn dump_kstack_writes_near(slot_va: u64, now_ns: u64, window_ns: u64) {
+    let mut hits = 0u32;
+    for i in 0..KSTACK_WRITE_RING_SLOTS {
+        let va = KSTACK_WRITE_RING_VA[i].load(Ordering::Relaxed);
+        if va == 0 {
+            continue;
+        }
+        let meta = KSTACK_WRITE_RING_META[i].load(Ordering::Relaxed);
+        let action = (meta & 0xFF) as u8;
+        let cpu = ((meta >> 8) & 0xFF) as u8;
+        let len = ((meta >> 16) & 0xFFFF) as u32;
+        let ts_ns = meta >> 32;
+        // Time window check.
+        let dt = now_ns.wrapping_sub(ts_ns);
+        if dt > window_ns && (ts_ns.wrapping_sub(now_ns)) > window_ns {
+            continue;
+        }
+        // Range intersect: [va, va+len) ∩ [slot_va, slot_va+8) != ∅
+        let end = va.saturating_add(len as u64);
+        let slot_end = slot_va.saturating_add(8);
+        if end <= slot_va || va >= slot_end {
+            continue;
+        }
+        crate::println!(
+            "KSTACK-WRITE-NEAR: action={} cpu={} va={:#x} len={} ts_ns={} slot={:#x}",
+            action, cpu, va, len, ts_ns, slot_va,
+        );
+        hits += 1;
+        if hits >= 16 {
+            break;
+        }
+    }
+    if hits == 0 {
+        crate::println!(
+            "KSTACK-WRITE-NEAR: NO MATCH slot={:#x} now_ns={} window_ns={}",
+            slot_va, now_ns, window_ns,
+        );
+    }
 }
 
 /// #208 kstack epoch probe — counts how many times to log an injection
@@ -2193,6 +2281,14 @@ fn alloc_thread_entry() -> Option<*mut Thread> {
         // catches the residual #208 family that survives Phase 5b kstack
         // isolation (canary intact, but Thread fields scribbled).
         let pa = crate::mm::phys::alloc_page()?;
+        // #208 KSTACK_WRITE_RING tag: action=2, alloc_thread_entry zero
+        // of fresh Thread struct page via identity-map PA.  Same double-
+        // map concern as alloc_kstack_zeroed.
+        record_kstack_write(
+            pa.as_usize() as u64,
+            crate::mm::page::page_size() as u32,
+            2,
+        );
         unsafe {
             core::ptr::write_bytes(
                 pa.as_usize() as *mut u8,
@@ -2483,6 +2579,16 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
         }
 
         crate::arch::trapframe::init_kernel_frame(frame, entry as *const () as usize, stack_top);
+        // #208 KSTACK_WRITE_RING tag: action=3 = init_kernel_frame
+        // installed iretq frame (RIP+CS+RFLAGS+RSP+SS = 5 quadwords)
+        // at this kstack VA.  If a later __print on the SAME kstack
+        // ends up with its saved-ret-addr coinciding with frame+17..21,
+        // KSTACK-WRITE-NEAR will fire on the SCRIBBLE event.
+        record_kstack_write(
+            frame as u64 + 17 * 8,
+            40, // 5 quadwords
+            3,
+        );
     }
 
     // Clear killed/affinity flags from any previous occupant of this slot.

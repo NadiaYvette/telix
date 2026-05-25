@@ -447,6 +447,16 @@ pub fn _print(args: fmt::Arguments) {
                         below[0], below[1], below[2], below[3],
                     ),
                 );
+                // #208 cross-reference: dump KSTACK_WRITE_RING entries
+                // whose [target_va, target_va+len) intersects this
+                // SCRIBBLE's slot AND ts_ns is within ±10 ms.  Identifies
+                // WHICH suspected writer (zero-fill / inject) scribbled
+                // the slot.
+                crate::sched::scheduler::dump_kstack_writes_near(
+                    rsp_now + 0xd08,
+                    ts_ns,
+                    10_000_000, // 10 ms
+                );
             }
         }
     }
