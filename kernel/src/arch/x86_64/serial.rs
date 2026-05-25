@@ -253,7 +253,7 @@ pub fn _print(args: fmt::Arguments) {
     // #208 PRINT-RET entry probe: capture the saved return address NOW,
     // before any of __print's body runs.  Compared against an end-of-body
     // probe to see whether the corruption happens DURING __print (and not
-    // before we entered).  Offset 0xd58 is the post-prologue position of
+    // before we entered).  Offset 0xd08 is the post-prologue position of
     // the saved ret addr (frame 0xd08 + 6×8 saved regs) — re-verify if
     // frame size changes.
     #[cfg(target_arch = "x86_64")]
@@ -261,7 +261,7 @@ pub fn _print(args: fmt::Arguments) {
         let v: u64;
         unsafe {
             core::arch::asm!(
-                "mov {0}, [rsp + 0xd58]",
+                "mov {0}, [rsp + 0xd08]",
                 out(reg) v,
                 options(readonly, nostack, preserves_flags),
             );
@@ -282,7 +282,7 @@ pub fn _print(args: fmt::Arguments) {
         let slot_addr: u64;
         unsafe {
             core::arch::asm!(
-                "lea {0}, [rsp + 0xd58]",
+                "lea {0}, [rsp + 0xd08]",
                 out(reg) slot_addr,
                 options(nomem, nostack, preserves_flags),
             );
@@ -371,8 +371,8 @@ pub fn _print(args: fmt::Arguments) {
     //   push %rbp / push %r15..%rbx (6 × 8 = 48 bytes) + sub $0xcd8, %rsp
     //   (frame size includes this probe's locals; was 0xc18 before, 0xcd8
     //   after — re-verify via `objdump -d` if you change anything in
-    //   this function).  Saved ret addr is at [rsp + 0xd58]
-    //   (frame 0xd28 + 6 × 8 saved regs = 0xd58).
+    //   this function).  Saved ret addr is at [rsp + 0xd08]
+    //   (frame 0xcd8 + 6 × 8 saved regs = 0xd08).
     // This offset is fragile — bumps if the local-frame size changes.
     // If the layout shifts, the probe just reads garbage at that offset,
     // which will likely look non-canonical and surface itself.
@@ -381,7 +381,7 @@ pub fn _print(args: fmt::Arguments) {
         let saved_ret: u64;
         unsafe {
             core::arch::asm!(
-                "mov {0}, [rsp + 0xd58]",
+                "mov {0}, [rsp + 0xd08]",
                 out(reg) saved_ret,
                 options(readonly, nostack, preserves_flags),
             );
@@ -421,25 +421,30 @@ pub fn _print(args: fmt::Arguments) {
                 // so we can see what scribble pattern is present.
                 let below: [u64; 4] = unsafe {
                     [
-                        core::ptr::read_volatile((rsp_now + 0xd50) as *const u64),
-                        core::ptr::read_volatile((rsp_now + 0xd48) as *const u64),
-                        core::ptr::read_volatile((rsp_now + 0xd40) as *const u64),
-                        core::ptr::read_volatile((rsp_now + 0xd38) as *const u64),
+                        core::ptr::read_volatile((rsp_now + 0xd00) as *const u64),
+                        core::ptr::read_volatile((rsp_now + 0xcf8) as *const u64),
+                        core::ptr::read_volatile((rsp_now + 0xcf0) as *const u64),
+                        core::ptr::read_volatile((rsp_now + 0xce8) as *const u64),
                     ]
                 };
                 // Timestamp for cross-reference with DR0-HIT-OFF-PATH ts_ns.
-                // Writers that fire within a narrow ±N ns window of this
-                // SCRIBBLE event are the corrupting writers, distinguished
-                // from random function-prologue noise.
+                // ts_ns FIRST so it survives truncation if the boot
+                // crashes mid-output.  Detail in a separate line.
                 let ts_ns = crate::arch::timer::monotonic_ns();
                 let mut bypass = DirectUart;
                 let _ = core::fmt::Write::write_fmt(
                     &mut bypass,
                     format_args!(
-                        "PRINT-RET-SCRIBBLE: cpu={} entry_ret={:#x} exit_ret={:#x} mutated={} canonical={} rsp={:#x} below=[{:#x} {:#x} {:#x} {:#x}] n={} ts_ns={}\n",
-                        my_cpu, entry_ret, saved_ret, mutated, canonical,
-                        rsp_now,
-                        below[0], below[1], below[2], below[3], n + 1, ts_ns,
+                        "PRINT-RET-SCRIBBLE: ts_ns={} cpu={} entry={:#x} exit={:#x} mut={} cano={} n={}\n",
+                        ts_ns, my_cpu, entry_ret, saved_ret, mutated, canonical, n + 1,
+                    ),
+                );
+                let _ = core::fmt::Write::write_fmt(
+                    &mut bypass,
+                    format_args!(
+                        "PRINT-RET-DETAIL: ts_ns={} rsp={:#x} below=[{:#x} {:#x} {:#x} {:#x}]\n",
+                        ts_ns, rsp_now,
+                        below[0], below[1], below[2], below[3],
                     ),
                 );
             }
