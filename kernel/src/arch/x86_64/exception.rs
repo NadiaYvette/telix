@@ -1232,32 +1232,53 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
             let pt_pa = (pd_e & 0x000F_FFFF_FFFF_F000) as usize;
             unsafe { *((pt_pa + ((cr2 >> 12) & 0x1FF) as usize * 8) as *const u64) }
         } else { 0 };
+        // Stack-content snapshot: read 16 quads at and below rsp.  For
+        // the wild-RIP-in-kstack pattern (boots 1690/1691), the saved
+        // return address that was popped lives at `*(rsp - 8)` from the
+        // perspective of the ret that jumped wild.  Walk *up* from the
+        // current rsp to find it.  Stops on first non-kstack quad
+        // (heuristic: address with high bits not 0xfffffe...) to avoid
+        // dereferencing wild pointers.
+        let rsp = frame.rsp();
+        let mut stack_words: [u64; 16] = [0; 16];
+        for i in 0..16 {
+            let addr = rsp.wrapping_add((i as u64) * 8);
+            // Only read if addr is in a plausible kstack range
+            // (PML4[508] = 0xfffffe0000000000..0xfffffe7fffffffff).
+            if (addr & 0xffffff8000000000) == 0xfffffe0000000000 {
+                stack_words[i] = unsafe { *(addr as *const u64) };
+            } else {
+                stack_words[i] = 0xdeadbeefcafef00d;
+                break;
+            }
+        }
+
+        // Coalesce all PF info into a single println! to avoid
+        // interleaving with peer-CPU UART traffic.  Multi-arg fmt args
+        // are formatted into the per-call StackBuf, then flushed atomic
+        // by serial::__print's spinlock, so this gives an unbroken
+        // record.
         crate::println!(
-            "Kernel #PF at RIP={:#x} CR2={:#x} error={:#x} cpu={} cr3={:#x} pml4_e={:#x} pdpt_e={:#x} pd_e={:#x} pt_e={:#x}",
+"Kernel #PF at RIP={:#x} CR2={:#x} error={:#x} cpu={} cr3={:#x} pml4_e={:#x} pdpt_e={:#x} pd_e={:#x} pt_e={:#x}
+  rsp={:#x} rbp={:#x} cs={:#x} ss={:#x} rflags={:#x}
+  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}
+  rsi={:#x} rdi={:#x} r8={:#x} r9={:#x}
+  r10={:#x} r11={:#x} r12={:#x} r13={:#x}
+  r14={:#x} r15={:#x}
+  stk[0..4]={:#x} {:#x} {:#x} {:#x}
+  stk[4..8]={:#x} {:#x} {:#x} {:#x}
+  stk[8..12]={:#x} {:#x} {:#x} {:#x}
+  stk[12..16]={:#x} {:#x} {:#x} {:#x}",
             frame.rip(), cr2, error, cpu, cr3, pml4_e, pdpt_e, pd_e, pt_e,
-        );
-        // GPR + frame dump — needed for wild-index decode (e.g. boot 1685
-        // sched::tick crash where r14 held 0x80000000 and walked the
-        // %rsp,%rax,4 displacement off the kstack).
-        crate::println!(
-            "  rsp={:#x} rbp={:#x} cs={:#x} ss={:#x} rflags={:#x}",
             frame.rsp(), frame.rbp(), frame.cs(), frame.ss(), frame.rflags(),
-        );
-        crate::println!(
-            "  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}",
             frame.rax(), frame.rbx(), frame.rcx(), frame.rdx(),
-        );
-        crate::println!(
-            "  rsi={:#x} rdi={:#x} r8={:#x} r9={:#x}",
             frame.rsi(), frame.rdi(), frame.r8(), frame.r9(),
-        );
-        crate::println!(
-            "  r10={:#x} r11={:#x} r12={:#x} r13={:#x}",
             frame.r10(), frame.r11(), frame.r12(), frame.r13(),
-        );
-        crate::println!(
-            "  r14={:#x} r15={:#x}",
             frame.r14(), frame.r15(),
+            stack_words[0], stack_words[1], stack_words[2], stack_words[3],
+            stack_words[4], stack_words[5], stack_words[6], stack_words[7],
+            stack_words[8], stack_words[9], stack_words[10], stack_words[11],
+            stack_words[12], stack_words[13], stack_words[14], stack_words[15],
         );
         loop {
             core::hint::spin_loop();
