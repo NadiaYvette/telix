@@ -700,6 +700,99 @@ pub fn snapshot_iretq_shadow(tid: ThreadId, sp: u64) {
                 core::ptr::read_volatile(frame.add(i));
         }
     }
+    // Extended snapshot — 128 quads (1 KiB) starting at saved_sp
+    // going up.  Covers the iretq+GPR area (offsets 0..22, already
+    // shadowed in iretq_shadow_frame) plus the calling function's
+    // frame contents (offsets 22..128) where corrupted saved-RIP
+    // slots that cause wild-ret crashes (boots 1690/1691) would
+    // live.  Snapshotted at park, verified at dispatch.
+    snapshot_park_stack_ext(tid, sp);
+}
+
+/// Per-tid extended-stack snapshot.  Covers 1 KiB of parked-frame
+/// memory starting at saved_sp.  Detects peer-CPU writes into the
+/// parked thread's calling-function frames (wild-RIP family).
+const PARK_STACK_EXT_QUADS: usize = 128;
+const PARK_STACK_EXT_CAP: usize = 256;
+static PARK_STACK_EXT_SP: [core::sync::atomic::AtomicU64; PARK_STACK_EXT_CAP] = {
+    const Z: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    [Z; PARK_STACK_EXT_CAP]
+};
+// Store as raw u64 cells inside an UnsafeCell-equivalent — we serialize
+// access via the dispatch protocol (only one CPU dispatches/parks a
+// given tid at a time), so atomic store/load isn't needed.  Use a
+// per-tid array.
+struct ParkStackExt {
+    cells: core::cell::UnsafeCell<[u64; PARK_STACK_EXT_QUADS]>,
+}
+unsafe impl Sync for ParkStackExt {}
+static PARK_STACK_EXT: [ParkStackExt; PARK_STACK_EXT_CAP] = {
+    const Z: ParkStackExt = ParkStackExt {
+        cells: core::cell::UnsafeCell::new([0u64; PARK_STACK_EXT_QUADS]),
+    };
+    [Z; PARK_STACK_EXT_CAP]
+};
+
+fn snapshot_park_stack_ext(tid: ThreadId, sp: u64) {
+    let i = tid as usize;
+    if i >= PARK_STACK_EXT_CAP {
+        return;
+    }
+    // Bounds: read only if [sp, sp + 128*8) lies entirely in the
+    // thread's kstack.  Otherwise zero the SP marker so dispatch
+    // skips verification.
+    let t = unsafe { &*(THREAD_TABLE.get(tid) as *const Thread) };
+    let sb = t.stack_base as u64;
+    let sz = kstack_size() as u64;
+    let bytes = (PARK_STACK_EXT_QUADS * 8) as u64;
+    if sb == 0 || sp < sb || sp.saturating_add(bytes) > sb + sz {
+        PARK_STACK_EXT_SP[i].store(0, Ordering::Relaxed);
+        return;
+    }
+    let cells = unsafe { &mut *PARK_STACK_EXT[i].cells.get() };
+    unsafe {
+        let p = sp as *const u64;
+        for q in 0..PARK_STACK_EXT_QUADS {
+            cells[q] = core::ptr::read_volatile(p.add(q));
+        }
+    }
+    PARK_STACK_EXT_SP[i].store(sp, Ordering::Release);
+}
+
+/// At-dispatch verification of the extended parked-frame snapshot.
+/// Walks the 128 quads above `saved_sp` and logs any mismatch with
+/// the value snapshotted at park.  Only fires if `sp` matches the SP
+/// at which the snapshot was taken (catches park/resume mismatches
+/// too).  Bounded at 32 mismatches per boot to prevent runaway logs.
+pub fn check_park_stack_ext(tid: ThreadId, sp: u64) {
+    let i = tid as usize;
+    if i >= PARK_STACK_EXT_CAP {
+        return;
+    }
+    let snap_sp = PARK_STACK_EXT_SP[i].load(Ordering::Acquire);
+    if snap_sp == 0 || snap_sp != sp {
+        return;
+    }
+    static PARK_EXT_DELTA_LOG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let cells = unsafe { &*PARK_STACK_EXT[i].cells.get() };
+    unsafe {
+        let p = sp as *const u64;
+        for q in 0..PARK_STACK_EXT_QUADS {
+            let live = core::ptr::read_volatile(p.add(q));
+            let snap = cells[q];
+            if live != snap {
+                let n = PARK_EXT_DELTA_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    crate::println!(
+                        "PARK-EXT-DELTA: tid={} sp={:#x} quad={} addr={:#x} was={:#x} now={:#x} n={}",
+                        tid, sp, q, sp + (q as u64 * 8), snap, live, n,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// #208 Probe A: compare live iretq slots at `sp` to the shadow recorded
@@ -4765,6 +4858,10 @@ fn try_switch(current_sp: u64) -> u64 {
         // just flipped to Running for this dispatch.
         if !is_idle {
             check_iretq_shadow_at_dispatch(next_id, sp);
+            // Extended-stack snapshot check (1 KiB above saved_sp) —
+            // catches wild-RIP-family corruption in calling-function
+            // frames where iretq_shadow_frame (22 quads) doesn't reach.
+            check_park_stack_ext(next_id, sp);
         }
         // #208 STALE-WRITE invariant: every legitimate writer of
         // `saved_sp` pairs the field write with `record_saved_sp_write`.
