@@ -166,6 +166,26 @@ static mut IST_STACKS: [IstStack; MAX_IST_CPUS] = {
     [EMPTY; MAX_IST_CPUS]
 };
 
+/// Per-CPU IRQ/fault stack (Fix B, #208/#216).  Configured as TSS.ist[1]
+/// (IST 2 in IDT terms).  Vectors 0..32 (faults except #DF) and 32..256
+/// (IRQs/syscalls except 0x80) are configured to use IST 2 in idt.rs, so
+/// any interrupt or fault entry switches to this dedicated per-CPU stack
+/// REGARDLESS of CPL — eliminating the case where a kernel→kernel IRQ
+/// lands on the running thread's kstack and the IRQ handler's frame
+/// overlaps the thread's frame.  Larger than the #DF IST stack because
+/// IRQ handlers do real work (println, sched dispatch).
+const IRQ_IST_STACK_SIZE: usize = 32768;
+
+#[repr(C, align(4096))]
+struct IrqIstStack {
+    data: [u8; IRQ_IST_STACK_SIZE],
+}
+
+static mut IRQ_IST_STACKS: [IrqIstStack; MAX_IST_CPUS] = {
+    const EMPTY: IrqIstStack = IrqIstStack { data: [0; IRQ_IST_STACK_SIZE] };
+    [EMPTY; MAX_IST_CPUS]
+};
+
 /// Pointer to this CPU's TSS storage. BSP uses bootstrap, APs use the
 /// dynamic slice.
 #[inline]
@@ -328,6 +348,10 @@ pub fn init() {
         // IST[0] → dedicated double-fault stack (stack grows down, so point to top).
         (*tss_for(0)).ist[0] =
             IST_STACKS[0].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+        // IST[1] → per-CPU IRQ/fault stack (Fix B).  Used by all non-#DF
+        // fault + IRQ vectors via IDT IST=2.  See idt.rs init.
+        (*tss_for(0)).ist[1] =
+            IRQ_IST_STACKS[0].data.as_ptr() as u64 + IRQ_IST_STACK_SIZE as u64;
     }
 
     load_gdt_for_cpu(0);
@@ -346,6 +370,10 @@ pub fn init_ap(cpu: u32) {
         if cpu < MAX_IST_CPUS {
             (*tss_for(cpu)).ist[0] =
                 IST_STACKS[cpu].data.as_ptr() as u64 + IST_STACK_SIZE as u64;
+            // IST[1] → per-CPU IRQ/fault stack (Fix B).
+            (*tss_for(cpu)).ist[1] =
+                IRQ_IST_STACKS[cpu].data.as_ptr() as u64
+                    + IRQ_IST_STACK_SIZE as u64;
         }
     }
 

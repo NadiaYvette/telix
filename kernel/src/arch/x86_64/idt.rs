@@ -90,6 +90,24 @@ pub fn init() {
         // even when the current kernel stack is corrupted/overflowed.
         idt[8].set_ist(1);
 
+        // Fix B (#208/#216) Phase 2: incremental IST=2 migration.
+        //
+        // Previous attempts:
+        // - Broad (all vec 0..256 except 8 + 0x80): 5/5 boots #UD RIP=0x3
+        // - Narrow (IRQs 32..256 except 0x80):     5/5 boots various
+        //   (#GP __isr_common, #PF validate_iretq_frame at user-VA, etc)
+        //
+        // Both regressed because IST switching changes iretq frame
+        // layout (uniform 5-quad push) and the asm/validator paths
+        // assume same-CPL non-IST layout (3-quad push) in some places.
+        //
+        // Phase 2 strategy: enable IST=2 for ONE vector at a time,
+        // starting with vectors that NEVER trigger context switches
+        // inside the handler (faults that panic, not IRQs that tick()).
+        // Start with vec 6 (#UD) — invalid opcode, always indicates
+        // kernel-state corruption, no scheduling decisions.
+        idt[6].set_ist(2);  // #UD
+
         let ptr = IdtPtr {
             limit: (core::mem::size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
             base: idt.as_ptr() as u64,
