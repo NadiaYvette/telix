@@ -76,9 +76,70 @@ impl KStackHandle {
     }
 }
 
+/// Phys-allocator audit: track which 64-KiB phys pages are currently
+/// in use as kstacks.  If phys::alloc_pages returns a PA that's still
+/// marked live, we have a double-allocation — the bug hypothesis behind
+/// the wild-RIP-in-kstack family.  Indexed by `pa >> 16` (page index
+/// for a 64 KiB-granularity tracker), sized for 2 GiB of phys.
+const KSTACK_PA_OWNER_CAP: usize = 32768; // 2 GiB / 64 KiB
+static KSTACK_PA_OWNER: [core::sync::atomic::AtomicU32; KSTACK_PA_OWNER_CAP] = {
+    const Z: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    [Z; KSTACK_PA_OWNER_CAP]
+};
+
+/// Audit hook called on every kstack PA alloc/free.  `delta` is +1
+/// (alloc) or -1 (free); we track an integer count rather than a boolean
+/// so we can detect ANY repeat-alloc, not just double — and so concurrent
+/// alloc/free order doesn't matter to the detection.
+#[inline]
+fn kstack_pa_audit(pa: usize, ksize: usize, delta: i32, tag: &str) {
+    // 64 KiB granularity — every page in the kstack gets stamped.
+    let base = pa >> 16;
+    let pages = (ksize + 0xffff) >> 16;
+    for i in 0..pages {
+        let slot = base + i;
+        if slot >= KSTACK_PA_OWNER_CAP {
+            continue;
+        }
+        if delta > 0 {
+            let prev = KSTACK_PA_OWNER[slot]
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if prev != 0 {
+                static DUP_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = DUP_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 32 {
+                    crate::println!(
+                        "KSTACK-PA-DOUBLE-ALLOC: tag={} pa={:#x} page_idx={} prev_count={} n={}",
+                        tag, pa + (i << 16), slot, prev, n,
+                    );
+                }
+            }
+        } else {
+            let prev = KSTACK_PA_OWNER[slot]
+                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            if prev == 0 {
+                static UNDER_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = UNDER_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 16 {
+                    // Underflow: freed a PA that wasn't tracked as live.
+                    // Either we missed an alloc (instrumentation gap) or
+                    // someone freed twice.
+                    crate::println!(
+                        "KSTACK-PA-FREE-UNDERFLOW: tag={} pa={:#x} page_idx={} n={}",
+                        tag, pa + (i << 16), slot, n,
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn alloc_kstack_zeroed() -> Option<KStackHandle> {
     let pa = crate::mm::phys::alloc_pages(KSTACK_ORDER)?;
     let ksize = kstack_size();
+    kstack_pa_audit(pa.as_usize(), ksize, 1, "alloc");
     // #208 KSTACK_WRITE_RING tag: action=1, alloc_kstack_zeroed
     // write_bytes(0) of the entire kstack via identity-map PA.  If the
     // phys allocator double-issued this PA (use-after-free), the zero
@@ -4401,6 +4462,7 @@ fn try_switch(current_sp: u64) -> u64 {
         let cur_stack = thread_ref(cur_tid).stack_phys_base;
         if cur_stack != deferred {
             deferred_kstack()[cpu as usize].store(0, Ordering::Release);
+            kstack_pa_audit(deferred, kstack_size(), -1, "free");
             crate::mm::phys::free_pages(crate::mm::page::PhysAddr::new(deferred), KSTACK_ORDER);
             let dead_tid = deferred_thread()[cpu as usize].swap(usize::MAX, Ordering::AcqRel);
             if dead_tid < RadixTable::capacity() {
