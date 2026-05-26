@@ -1236,6 +1236,29 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
             "Kernel #PF at RIP={:#x} CR2={:#x} error={:#x} cpu={} cr3={:#x} pml4_e={:#x} pdpt_e={:#x} pd_e={:#x} pt_e={:#x}",
             frame.rip(), cr2, error, cpu, cr3, pml4_e, pdpt_e, pd_e, pt_e,
         );
+        // GPR + frame dump — needed for wild-index decode (e.g. boot 1685
+        // sched::tick crash where r14 held 0x80000000 and walked the
+        // %rsp,%rax,4 displacement off the kstack).
+        crate::println!(
+            "  rsp={:#x} rbp={:#x} cs={:#x} ss={:#x} rflags={:#x}",
+            frame.rsp(), frame.rbp(), frame.cs(), frame.ss(), frame.rflags(),
+        );
+        crate::println!(
+            "  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}",
+            frame.rax(), frame.rbx(), frame.rcx(), frame.rdx(),
+        );
+        crate::println!(
+            "  rsi={:#x} rdi={:#x} r8={:#x} r9={:#x}",
+            frame.rsi(), frame.rdi(), frame.r8(), frame.r9(),
+        );
+        crate::println!(
+            "  r10={:#x} r11={:#x} r12={:#x} r13={:#x}",
+            frame.r10(), frame.r11(), frame.r12(), frame.r13(),
+        );
+        crate::println!(
+            "  r14={:#x} r15={:#x}",
+            frame.r14(), frame.r15(),
+        );
         loop {
             core::hint::spin_loop();
         }
