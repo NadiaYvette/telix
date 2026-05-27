@@ -88,6 +88,34 @@ fn record_set(
 /// Dump all SET_LOG entries matching `target_tid`, oldest-first.  Called
 /// from VALIDATOR-BAD-TREF and similar paths to reveal the value
 /// trajectory of the offending slot.
+///
+/// Avoids `println!{:#x}` because under deep corruption (boot 1823) the
+/// fmt machinery's digit buffer gets scribbled — we observed the
+/// VALIDATOR-BAD-TREF integer values come through as raw stack-garbage
+/// bytes instead of formatted hex.  Instead, write directly to the UART
+/// using a stateless nibble-loop and pre-baked rodata literals.
+#[cfg(target_arch = "x86_64")]
+pub fn dump_set_log_for_tid(target_tid: u32) {
+    let head = SET_LOG_HEAD.load(Ordering::Relaxed);
+    let mut hits: u32 = 0;
+    let start = if head >= SET_LOG_SIZE as u64 {
+        head - SET_LOG_SIZE as u64
+    } else {
+        0
+    };
+    direct_uart_dump_set_log_header(target_tid, head, start);
+    for seq in start..head {
+        let idx = (seq as usize) % SET_LOG_SIZE;
+        let entry = unsafe { *SET_LOG[idx].0.get() };
+        if entry.tid == target_tid {
+            direct_uart_dump_set_log_entry(&entry);
+            hits += 1;
+        }
+    }
+    direct_uart_dump_set_log_footer(target_tid, hits);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 pub fn dump_set_log_for_tid(target_tid: u32) {
     let head = SET_LOG_HEAD.load(Ordering::Relaxed);
     let mut hits: u32 = 0;
@@ -117,6 +145,118 @@ pub fn dump_set_log_for_tid(target_tid: u32) {
         "RADIX-SET-LOG-DUMP-END: tid={} hits={}",
         target_tid, hits
     );
+}
+
+// ---- direct-UART formatters (x86_64 only) ----
+//
+// These bypass `fmt::Arguments` entirely so the dump survives even when
+// the formatter's stack scratch buffers are corrupted (boot 1823 mode).
+// Each writes one nibble at a time straight to COM1 via `Serial.putc`.
+
+#[cfg(target_arch = "x86_64")]
+fn uart_putc(c: u8) {
+    crate::arch::x86_64::serial::putc(c);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn uart_write_str(s: &str) {
+    for &b in s.as_bytes() {
+        if b == b'\n' {
+            uart_putc(b'\r');
+        }
+        uart_putc(b);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn uart_write_hex64(val: u64) {
+    uart_putc(b'0');
+    uart_putc(b'x');
+    for i in 0..16 {
+        let nib = ((val >> (60 - i * 4)) & 0xf) as u8;
+        let c = if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) };
+        uart_putc(c);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn uart_write_u32(val: u32) {
+    // Decimal, up to 10 digits.  Right-aligned w/o leading zeros.
+    let mut digits = [0u8; 10];
+    let mut n = val;
+    let mut len = 0;
+    if n == 0 {
+        uart_putc(b'0');
+        return;
+    }
+    while n > 0 {
+        digits[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
+    for i in (0..len).rev() {
+        uart_putc(digits[i]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn uart_write_u64(val: u64) {
+    let mut digits = [0u8; 20];
+    let mut n = val;
+    let mut len = 0;
+    if n == 0 {
+        uart_putc(b'0');
+        return;
+    }
+    while n > 0 {
+        digits[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
+    for i in (0..len).rev() {
+        uart_putc(digits[i]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn direct_uart_dump_set_log_header(tid: u32, head: u64, start: u64) {
+    uart_write_str("RADIX-SET-LOG-DUMP-BEGIN: tid=");
+    uart_write_u32(tid);
+    uart_write_str(" head=");
+    uart_write_u64(head);
+    uart_write_str(" window=[");
+    uart_write_u64(start);
+    uart_write_str("..");
+    uart_write_u64(head);
+    uart_write_str(")\n");
+}
+
+#[cfg(target_arch = "x86_64")]
+fn direct_uart_dump_set_log_entry(e: &SetLogEntry) {
+    uart_write_str("RADIX-SET-LOG: seq=");
+    uart_write_u64(e.seq);
+    uart_write_str(" tid=");
+    uart_write_u32(e.tid);
+    uart_write_str(" l1_idx=");
+    uart_write_u32(e.l1_idx);
+    uart_write_str(" val=");
+    uart_write_hex64(e.val);
+    uart_write_str(" prev_val=");
+    uart_write_hex64(e.prev_val);
+    uart_write_str(" caller_loc=");
+    uart_write_hex64(e.caller_loc);
+    uart_write_str(" l1_va=");
+    uart_write_hex64(e.l1_va);
+    uart_write_str("\n");
+}
+
+#[cfg(target_arch = "x86_64")]
+fn direct_uart_dump_set_log_footer(tid: u32, hits: u32) {
+    uart_write_str("RADIX-SET-LOG-DUMP-END: tid=");
+    uart_write_u32(tid);
+    uart_write_str(" hits=");
+    uart_write_u32(hits);
+    uart_write_str("\n");
 }
 
 // ---------------------------------------------------------------------------
