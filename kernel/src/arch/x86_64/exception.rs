@@ -552,16 +552,39 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
         // address at their next x86_exception_handler entry.  Any
         // writer outside the stub-region (which is filtered in the
         // #DB handler) logs as DR0-HIT-OFF-PATH with the writer's RIP.
-        let saved_sp_addr = &tref.saved_sp as *const u64 as u64;
-        crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
-            .store(saved_sp_addr, core::sync::atomic::Ordering::Relaxed);
-        crate::println!(
-            "DR0-WATCH-ARMED: addr={:#x} (= &tref({}).saved_sp)",
-            saved_sp_addr, tid,
-        );
-        // Mark the current thread (the one with corrupt state) as killed
-        // so the scheduler won't re-enqueue it on the next tick.
-        tref.killed.store(true, core::sync::atomic::Ordering::Release);
+        // Boot 1798 #PF root cause: tref pointer was 0xfffffe00031fff50
+        // (a kstack VA, not a SLAB_THREAD_REGION VA — Thread structs live
+        // at 0xfffffe80_..., PML4[509]).  Writing `killed=true` at offset
+        // 0x2f0 hit unmapped memory and PF'd here.  Guard the write by
+        // verifying tref points into SLAB_REGION before touching it.
+        let tref_addr = tref as *const _ as u64;
+        let tref_ok = tref_addr >= crate::arch::x86_64::mm::SLAB_REGION_BASE
+            && tref_addr < crate::arch::x86_64::mm::SLAB_REGION_BASE
+                .wrapping_add(crate::arch::x86_64::mm::PML4_SLOT_SIZE);
+        if !tref_ok {
+            crate::dump_atomic!(
+                "VALIDATOR-BAD-TREF: tid={} tref={:#x} (NOT in SLAB_REGION \
+                 {:#x}..{:#x}) — THREAD_TABLE[{}] corrupted; skipping \
+                 killed.store and DR0-arm",
+                tid, tref_addr,
+                crate::arch::x86_64::mm::SLAB_REGION_BASE,
+                crate::arch::x86_64::mm::SLAB_REGION_BASE
+                    .wrapping_add(crate::arch::x86_64::mm::PML4_SLOT_SIZE),
+                tid,
+            );
+        } else {
+            let saved_sp_addr = &tref.saved_sp as *const u64 as u64;
+            crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
+                .store(saved_sp_addr, core::sync::atomic::Ordering::Relaxed);
+            crate::println!(
+                "DR0-WATCH-ARMED: addr={:#x} (= &tref({}).saved_sp)",
+                saved_sp_addr, tid,
+            );
+            // Mark the current thread (the one with corrupt state) as
+            // killed so the scheduler won't re-enqueue it on the next
+            // tick.
+            tref.killed.store(true, core::sync::atomic::Ordering::Release);
+        }
         // Enable interrupts so timer can switch us off this thread.
         crate::arch::irq::enable();
         loop { core::hint::spin_loop(); }
@@ -1399,33 +1422,19 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
 /// can continue running other threads. For kernel faults, halt (fatal).
 fn exception_fault(name: &str, frame: &ExceptionFrame) -> ! {
     let is_user = (frame.cs() & 3) == 3;
-    crate::println!(
-        "EXCEPTION: {} at RIP={:#x} error_code={:#x} tid={} {}",
+    // Coalesced atomic dump — peer CPUs cannot interleave this block.
+    crate::dump_atomic!(
+        "EXCEPTION: {} at RIP={:#x} error_code={:#x} tid={} {}\n\
+         \x20 RAX={:#x} RBX={:#x} RCX={:#x} RDX={:#x}\n\
+         \x20 RSP={:#x} RBP={:#x} RSI={:#x} RDI={:#x}\n\
+         \x20 CS={:#x} RFLAGS={:#x} SS={:#x}",
         name,
-        frame.rip(),
-        frame.error_code(),
+        frame.rip(), frame.error_code(),
         crate::sched::scheduler::current_thread_id(),
-        if is_user { "(user)" } else { "(KERNEL)" }
-    );
-    crate::println!(
-        "  RAX={:#x} RBX={:#x} RCX={:#x} RDX={:#x}",
-        frame.rax(),
-        frame.rbx(),
-        frame.rcx(),
-        frame.rdx()
-    );
-    crate::println!(
-        "  RSP={:#x} RBP={:#x} RSI={:#x} RDI={:#x}",
-        frame.rsp(),
-        frame.rbp(),
-        frame.rsi(),
-        frame.rdi()
-    );
-    crate::println!(
-        "  CS={:#x} RFLAGS={:#x} SS={:#x}",
-        frame.cs(),
-        frame.rflags(),
-        frame.ss()
+        if is_user { "(user)" } else { "(KERNEL)" },
+        frame.rax(), frame.rbx(), frame.rcx(), frame.rdx(),
+        frame.rsp(), frame.rbp(), frame.rsi(), frame.rdi(),
+        frame.cs(), frame.rflags(), frame.ss(),
     );
     // Kernel-fault stack dump: 16 quads from RSP.  At #UD time, an indirect
     // call through a corrupted function pointer has just pushed its return
