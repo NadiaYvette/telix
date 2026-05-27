@@ -10280,6 +10280,17 @@ pub fn handoff_to(receiver_tid: ThreadId) {
                 let sender2 = unsafe { thread_mut_from_ref(sender_tid as ThreadId) };
                 sender2.state = ThreadState::Running;
                 thread_ref(sender_tid as ThreadId).on_cpu.store(cpu_id, Ordering::Release);
+                // #208 ROOT CAUSE FIX: we set TSS.RSP0 = receiver's kstack
+                // above (line ~10259), and we're now bailing back to sender.
+                // Without restoring TSS.RSP0, the sender returning to user
+                // mode would push its next IRQ/syscall iret frame onto the
+                // receiver's parked kstack — corrupting whoever is parked
+                // there.  Captured by RSP0-MISMATCH boot 1706 (tid=20 sender,
+                // tid=13 receiver, alternating CALL/REPLY).
+                crate::arch::trapframe::update_kernel_stack(
+                    sender_tid as u32,
+                    sender2.stack_base + kstack_size(),
+                );
                 return;
             }
             thread_ref(receiver_tid).on_cpu_set_by.store(4, Ordering::Relaxed); // 4=handoff
