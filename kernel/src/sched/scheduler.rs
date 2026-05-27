@@ -38,7 +38,14 @@ const VTIME_UNIT: u64 = 1 << 20;
 
 /// Kernel stack allocation order (0 = 1 page, 1 = 2 pages).
 /// 2 pages provides headroom for deep syscall call chains.
-const KSTACK_ORDER: usize = 1;
+// Bumped 1→2 for #208 residual probe (boots 1765/1766/1767).  Doubles
+// the per-thread kstack from 128 KiB to 256 KiB.  If the residual wild-
+// RIP/wild-INDEX PFs disappear, the corruption depends on tight overlap
+// between deep println!/format frames and outer-caller local-variable
+// slots — bigger stack creates headroom that masks it.  If they
+// persist, the corruption is from a fixed-offset slot reuse pattern
+// independent of stack depth.
+const KSTACK_ORDER: usize = 2;
 
 /// Kernel stack size in bytes (2^KSTACK_ORDER pages).
 #[inline]
