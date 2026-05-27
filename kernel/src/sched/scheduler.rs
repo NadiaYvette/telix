@@ -4014,27 +4014,24 @@ pub fn tick(current_sp: u64) -> u64 {
                     if t.task_id == 0 {
                         continue;
                     }
-                    // #208 residual: extend sweep to Ready threads too —
-                    // freshly-created threads sit Ready until first dispatch,
-                    // and the iretq frame at their saved_sp shouldn't change
-                    // until iretq pops it.  If a peer CPU corrupts the frame
-                    // between thread_create and first dispatch, the Blocked-
-                    // only gate would miss it (boot 1750 PF in
-                    // sys_thread_create chain).  Skip Running (legit frame
-                    // churn from active syscalls).
-                    if t.state == ThreadState::Running
-                        || t.state == ThreadState::Dead
-                    {
-                        continue;
-                    }
                     let sp = t.iretq_shadow_sp;
                     if sp == 0 {
                         continue;
                     }
-                    // Inline the iretq_shadow comparison since
-                    // check_iretq_shadow_inner has require_blocked=true.
-                    // Use the dispatch variant which gates only on shadow
-                    // validity, not state — Ready threads pass through.
+                    // Blocked threads are always safe to check (parked at
+                    // saved_sp, no legitimate writer).
+                    let is_blocked = t.state == ThreadState::Blocked;
+                    // Ready threads with KERNEL-CS shadow are typically
+                    // freshly-created (init_kernel_frame set CS=0x8) and
+                    // haven't been dispatched yet — also safe.  Ready with
+                    // user-CS shadow means a previously-dispatched user
+                    // thread that re-Ready'd via wake_thread; its iretq
+                    // frame may legitimately have advanced (boot 1753 noise).
+                    let is_fresh_ready = t.state == ThreadState::Ready
+                        && t.iretq_shadow_cs == 0x08;
+                    if !is_blocked && !is_fresh_ready {
+                        continue;
+                    }
                     check_iretq_shadow_at_dispatch(tid, sp);
                     check_park_stack_ext(tid, sp);
                     checked += 1;
