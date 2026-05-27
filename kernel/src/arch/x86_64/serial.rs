@@ -2,7 +2,9 @@
 //!
 //! Uses x86 port I/O instructions (outb/inb) for polled transmit.
 
+use core::cell::UnsafeCell;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicUsize};
 
 const COM1_PORT: u16 = 0x3F8;
 
@@ -244,75 +246,106 @@ impl<const N: usize> fmt::Write for StackBuf<N> {
 /// room.
 const PRINT_FMT_LIMIT: usize = 1024;
 
+/// Per-CPU print buffers.  #208 wild-RIP-in-kstack residual was
+/// traced to __print's deep stack frame (~3.4 KiB) overlapping with
+/// outer-caller local-variable slots — both PRINT-RET-SCRIBBLE and
+/// the post-fix residuals (boots 1765/1766/1767/1772) showed the
+/// same fixed-offset corruption pattern despite KSTACK_ORDER bumps.
+/// Moving fmtbuf/wirebuf off the stack to per-CPU statics shrinks
+/// the frame to ~200 B, drastically changing the absolute saved-RIP
+/// slot offset and removing the depth-dependent overlap window.
+const MAX_PRINT_CPUS: usize = 16;
+struct CpuPrintBufs {
+    fmt: UnsafeCell<[u8; PRINT_FMT_LIMIT]>,
+    wire: UnsafeCell<[u8; PRINT_BUF_SIZE]>,
+    busy: AtomicBool,
+}
+unsafe impl Sync for CpuPrintBufs {}
+static PRINT_BUFS: [CpuPrintBufs; MAX_PRINT_CPUS] = [const {
+    CpuPrintBufs {
+        fmt: UnsafeCell::new([0u8; PRINT_FMT_LIMIT]),
+        wire: UnsafeCell::new([0u8; PRINT_BUF_SIZE]),
+        busy: AtomicBool::new(false),
+    }
+}; MAX_PRINT_CPUS];
+
+/// Slice-based fmt::Write adapter — writes into a caller-provided
+/// mutable slice + length counter.  Used to format into the per-CPU
+/// static fmt buffer without allocating any stack frame.
+struct SliceWriter<'a> {
+    buf: &'a mut [u8],
+    len: &'a mut usize,
+}
+impl<'a> fmt::Write for SliceWriter<'a> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let bytes = s.as_bytes();
+        let cap = self.buf.len();
+        let cur = (*self.len).min(cap);
+        let space = cap - cur;
+        let n = bytes.len().min(space);
+        self.buf[cur..cur + n].copy_from_slice(&bytes[..n]);
+        *self.len = cur + n;
+        if bytes.len() > n { Err(fmt::Error) } else { Ok(()) }
+    }
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
-    // First-call FIFO init.  Cheap atomic check on subsequent calls.
     init_uart_fifo_once();
 
-    // #208 PRINT-RET entry probe: capture the saved return address NOW,
-    // before any of __print's body runs.  Compared against an end-of-body
-    // probe to see whether the corruption happens DURING __print (and not
-    // before we entered).  Offset 0xd08 is the post-prologue position of
-    // the saved ret addr (frame 0xd08 + 6×8 saved regs) — re-verify if
-    // frame size changes.
-    #[cfg(target_arch = "x86_64")]
-    let entry_ret: u64 = {
-        let v: u64;
-        unsafe {
-            core::arch::asm!(
-                "mov {0}, [rsp + 0xd08]",
-                out(reg) v,
-                options(readonly, nostack, preserves_flags),
-            );
-        }
-        v
-    };
-
-    // #208 DR0 watch arm: install hardware watchpoint on our saved
-    // return address slot via the GLOBAL_SAVED_SP_WATCH_ADDR mechanism
-    // (all CPUs lazily arm DR0 at exception entry).  Override any
-    // pre-existing watch for the duration of __print and restore on
-    // exit — the pre-existing proactive arm on tid=4.saved_sp catches
-    // legitimate try_switch writes, which crowd out the __print bug
-    // captures we want.  When the writer hits __print's slot, the #DB
-    // handler logs DR0-HIT-OFF-PATH with the writer's RIP, CPU, tid.
-    #[cfg(target_arch = "x86_64")]
-    let dr0_saved_prev: u64 = {
-        let slot_addr: u64;
-        unsafe {
-            core::arch::asm!(
-                "lea {0}, [rsp + 0xd08]",
-                out(reg) slot_addr,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
-        use core::sync::atomic::Ordering as O;
-        // Atomic swap: save prior watch, install ours.
-        let prev = crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
-            .swap(slot_addr, O::AcqRel);
-        // Arm local DR0 immediately so this CPU catches writes during
-        // this __print (other CPUs lazily arm at next exception entry).
-        crate::arch::x86_64::gdt::dr0_set_watch_write_qword(slot_addr);
-        prev
-    };
-
-    // Phase 1: format into a per-call stack buffer with IRQs ON.
-    // Two buffers: one for the raw format output, one for CRLF-expanded
-    // bytes that go to the UART.  Keeping them split lets the
-    // framebuffer mirror use the un-expanded text (it handles \n itself).
-    let mut fmtbuf = StackBuf::<PRINT_FMT_LIMIT>::new();
-    let _ = fmtbuf.write_fmt(args);  // truncation OK
-
-    // CRLF-expand into the wire buffer.
-    let mut wirebuf = StackBuf::<PRINT_BUF_SIZE>::new();
-    for &b in fmtbuf.as_bytes() {
-        if b == b'\n' {
-            let _ = wirebuf.write_str("\r\n");
+    // Acquire this CPU's print buffer slot.  If busy (re-entry from
+    // an IRQ that fired while we were already inside _print, or the
+    // CPU index exceeds MAX_PRINT_CPUS), fall back to a small
+    // stack-local buffer and degrade gracefully.
+    let cpu = crate::sched::smp::cpu_id() as usize;
+    let slot = if cpu < MAX_PRINT_CPUS {
+        let s = &PRINT_BUFS[cpu];
+        if s.busy.compare_exchange(
+            false, true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        ).is_ok() {
+            Some(s)
         } else {
-            // write_str of a 1-byte slice that we own.
-            let one = [b];
-            let _ = wirebuf.write_str(unsafe { core::str::from_utf8_unchecked(&one) });
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut fmt_len: usize = 0;
+    let mut wire_len: usize = 0;
+    let mut fallback_fmt = [0u8; 256];
+    let mut fallback_wire = [0u8; 512];
+
+    // Split borrow: get raw pointers to the per-CPU buffers (or fall
+    // through to the fallback arrays).  We hold the busy flag, so no
+    // other path on this CPU touches the per-CPU buffers concurrently.
+    let (fmt_buf, wire_buf): (&mut [u8], &mut [u8]) = if let Some(s) = slot {
+        unsafe { (&mut *s.fmt.get(), &mut *s.wire.get()) }
+    } else {
+        (&mut fallback_fmt[..], &mut fallback_wire[..])
+    };
+
+    // Phase 1: format into fmt_buf with IRQs ON.
+    {
+        let mut w = SliceWriter { buf: fmt_buf, len: &mut fmt_len };
+        let _ = w.write_fmt(args);
+    }
+
+    // CRLF-expand into wire_buf.
+    for i in 0..fmt_len {
+        let b = fmt_buf[i];
+        if b == b'\n' {
+            if wire_len + 2 <= wire_buf.len() {
+                wire_buf[wire_len] = b'\r';
+                wire_buf[wire_len + 1] = b'\n';
+                wire_len += 2;
+            }
+        } else if wire_len < wire_buf.len() {
+            wire_buf[wire_len] = b;
+            wire_len += 1;
         }
     }
 
@@ -323,8 +356,9 @@ pub fn _print(args: fmt::Arguments) {
     // and push directly.  The IRQ's bytes will interleave with the
     // outer call's output but no deadlock and no IRQ-blocking wait.
     let my_cpu = crate::sched::smp::cpu_id() as i32;
+    let wire_slice = &wire_buf[..wire_len];
     if PRINT_HOLDER_CPU.load(AOrdering::Acquire) == my_cpu {
-        Serial.push_bytes(wirebuf.as_bytes());
+        Serial.push_bytes(wire_slice);
     } else {
         // Polite-lock acquire: spin IRQ-ON until the lock looks free,
         // then disable IRQs and CAS-try.  On lost race, restore IRQs
@@ -332,11 +366,9 @@ pub fn _print(args: fmt::Arguments) {
         // section (byte-push) rather than full cross-CPU contention.
         let saved;
         loop {
-            // Wait phase: IRQs ON (or already-off in IRQ context).
             while PRINT_LOCK.load(AOrdering::Relaxed) != 0 {
                 core::hint::spin_loop();
             }
-            // Acquire attempt: IRQs OFF.
             let s = crate::arch::irq::disable();
             if PRINT_LOCK
                 .compare_exchange(0, 1, AOrdering::Acquire, AOrdering::Relaxed)
@@ -347,9 +379,8 @@ pub fn _print(args: fmt::Arguments) {
             }
             crate::arch::irq::restore(s);
         }
-        // Critical section.
         PRINT_HOLDER_CPU.store(my_cpu, AOrdering::Release);
-        Serial.push_bytes(wirebuf.as_bytes());
+        Serial.push_bytes(wire_slice);
         PRINT_HOLDER_CPU.store(-1, AOrdering::Release);
         PRINT_LOCK.store(0, AOrdering::Release);
         crate::arch::irq::restore(saved);
@@ -357,108 +388,17 @@ pub fn _print(args: fmt::Arguments) {
 
     // Mirror to the framebuffer console (no UART contention).
     if crate::drivers::fb_console::available() {
-        crate::drivers::fb_console::write_str(fmtbuf.as_str());
+        let fmtstr = unsafe {
+            core::str::from_utf8_unchecked(&fmt_buf[..fmt_len])
+        };
+        crate::drivers::fb_console::write_str(fmtstr);
     }
 
-    // #208 PRINT-RET probe: read the saved return address from this
-    // function's frame just before the compiler's epilogue runs.  If
-    // it's been overwritten with a non-canonical value (the recurring
-    // #GP at the `ret` instruction = error_code=0, signature of a ret
-    // to non-canonical RIP), log via DirectUart bypass — the regular
-    // print path is what we're about to fault out of.
-    //
-    // Frame layout per `objdump -d` (x86_64-unknown-none release):
-    //   push %rbp / push %r15..%rbx (6 × 8 = 48 bytes) + sub $0xcd8, %rsp
-    //   (frame size includes this probe's locals; was 0xc18 before, 0xcd8
-    //   after — re-verify via `objdump -d` if you change anything in
-    //   this function).  Saved ret addr is at [rsp + 0xd08]
-    //   (frame 0xcd8 + 6 × 8 saved regs = 0xd08).
-    // This offset is fragile — bumps if the local-frame size changes.
-    // If the layout shifts, the probe just reads garbage at that offset,
-    // which will likely look non-canonical and surface itself.
-    #[cfg(target_arch = "x86_64")]
-    {
-        let saved_ret: u64;
-        unsafe {
-            core::arch::asm!(
-                "mov {0}, [rsp + 0xd08]",
-                out(reg) saved_ret,
-                options(readonly, nostack, preserves_flags),
-            );
-        }
-        // Restore the pre-__print global watch (so the proactive arm
-        // on tid=4.saved_sp resumes) and disarm/re-arm local DR0
-        // accordingly.
-        {
-            use core::sync::atomic::Ordering as O;
-            crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
-                .store(dr0_saved_prev, O::Release);
-            if dr0_saved_prev != 0 {
-                crate::arch::x86_64::gdt::dr0_set_watch_write_qword(dr0_saved_prev);
-            } else {
-                crate::arch::x86_64::gdt::dr0_clear();
-            }
-        }
-        // Canonical = upper 17 bits all match bit 47.
-        let bit47 = (saved_ret >> 47) & 1;
-        let upper = saved_ret >> 48;
-        let canonical = if bit47 == 1 { upper == 0xFFFF } else { upper == 0 };
-        let mutated = saved_ret != entry_ret;
-        if !canonical || mutated {
-            use core::sync::atomic::{AtomicU32, Ordering as O};
-            static LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-            let n = LOG_COUNT.fetch_add(1, O::Relaxed);
-            if n < 16 {
-                let mut rsp_now: u64;
-                unsafe {
-                    core::arch::asm!(
-                        "mov {0}, rsp",
-                        out(reg) rsp_now,
-                        options(nomem, nostack, preserves_flags),
-                    );
-                }
-                // Sample the 4 quadwords below the ret-addr slot too,
-                // so we can see what scribble pattern is present.
-                let below: [u64; 4] = unsafe {
-                    [
-                        core::ptr::read_volatile((rsp_now + 0xd00) as *const u64),
-                        core::ptr::read_volatile((rsp_now + 0xcf8) as *const u64),
-                        core::ptr::read_volatile((rsp_now + 0xcf0) as *const u64),
-                        core::ptr::read_volatile((rsp_now + 0xce8) as *const u64),
-                    ]
-                };
-                // Timestamp for cross-reference with DR0-HIT-OFF-PATH ts_ns.
-                // ts_ns FIRST so it survives truncation if the boot
-                // crashes mid-output.  Detail in a separate line.
-                let ts_ns = crate::arch::timer::monotonic_ns();
-                let mut bypass = DirectUart;
-                let _ = core::fmt::Write::write_fmt(
-                    &mut bypass,
-                    format_args!(
-                        "PRINT-RET-SCRIBBLE: ts_ns={} cpu={} entry={:#x} exit={:#x} mut={} cano={} n={}\n",
-                        ts_ns, my_cpu, entry_ret, saved_ret, mutated, canonical, n + 1,
-                    ),
-                );
-                let _ = core::fmt::Write::write_fmt(
-                    &mut bypass,
-                    format_args!(
-                        "PRINT-RET-DETAIL: ts_ns={} rsp={:#x} below=[{:#x} {:#x} {:#x} {:#x}]\n",
-                        ts_ns, rsp_now,
-                        below[0], below[1], below[2], below[3],
-                    ),
-                );
-                // #208 cross-reference: dump KSTACK_WRITE_RING entries
-                // whose [target_va, target_va+len) intersects this
-                // SCRIBBLE's slot AND ts_ns is within ±10 ms.  Identifies
-                // WHICH suspected writer (zero-fill / inject) scribbled
-                // the slot.
-                crate::sched::scheduler::dump_kstack_writes_near(
-                    rsp_now + 0xd08,
-                    ts_ns,
-                    10_000_000, // 10 ms
-                );
-            }
-        }
+    // Release the per-CPU buffer slot (if we acquired it).  Doing this
+    // last ensures no peer (IRQ-context reentry on this CPU) tries to
+    // reuse it while we're still reading.
+    if let Some(s) = slot {
+        s.busy.store(false, core::sync::atomic::Ordering::Release);
     }
 }
 
