@@ -338,6 +338,44 @@ pub extern "C" fn finalize_release_after_stack_switch() {
             core::sync::atomic::Ordering::Relaxed,
         );
     }
+    // #208 defensive TSS.RSP0 sync (Path C).  We just landed on next's
+    // kstack.  If any earlier code path changed current_thread without
+    // pairing it with update_kernel_stack, this CPU's TSS.RSP0 still
+    // points at the previous thread's kstack — the exact bug captured
+    // by RSP0-MISMATCH in boot 1706.  Re-set TSS.RSP0 unconditionally
+    // here so a subsequent user→kernel transition pushes onto the
+    // correct kstack.  Logged as DEFENSIVE-RSP0-FIX when the value
+    // would have been stale; bounded to avoid log flood.
+    //
+    // This is a stopgap until every current_thread.store callsite is
+    // audited (option A) or the pair is centralized in a helper
+    // (option B).
+    #[cfg(target_arch = "x86_64")]
+    {
+        let pcpu = smp::current();
+        let current_tid = pcpu.current_thread.load(Ordering::Relaxed) as u32;
+        let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed) as u32;
+        if current_tid != idle_id {
+            let t = thread_ref(current_tid);
+            let sb = t.stack_base as u64;
+            if sb != 0 {
+                let expected = sb + kstack_size() as u64;
+                let actual = crate::arch::x86_64::gdt::get_rsp0();
+                if actual != expected {
+                    static FIX_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = FIX_LOG.fetch_add(1, Ordering::Relaxed);
+                    if n < 64 {
+                        crate::println!(
+                            "DEFENSIVE-RSP0-FIX: cpu={} tid={} actual={:#x} -> expected={:#x} n={}",
+                            cpu, current_tid, actual, expected, n,
+                        );
+                    }
+                    crate::arch::x86_64::gdt::set_rsp0(current_tid, expected);
+                }
+            }
+        }
+    }
 }
 
 /// #135 record one transition into the per-thread `trans_ring`.  Each
