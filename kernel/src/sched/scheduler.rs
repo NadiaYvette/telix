@@ -378,6 +378,28 @@ pub extern "C" fn finalize_release_after_stack_switch() {
     }
 }
 
+/// #208 root-cause prevention (option B): the only way to set
+/// pcpu.current_thread.  Pairs the store with update_kernel_stack
+/// so TSS.RSP0 can never drift relative to the running thread.
+///
+/// Before this helper existed, sites like handoff_to's CAS-fail bail
+/// stored current_thread without updating TSS.RSP0, leaving a window
+/// where the CPU would push iret frames onto the WRONG thread's
+/// kstack on the next user→kernel transition.  See commit f250848.
+#[inline]
+pub fn set_current_thread(pcpu: &smp::PerCpuData, tid: ThreadId) {
+    pcpu.current_thread.store(tid, Ordering::Relaxed);
+    record_current_thread_change(smp::cpu_id(), tid as u32);
+    let t = thread_ref(tid);
+    let kbase = t.stack_base;
+    if kbase != 0 {
+        crate::arch::trapframe::update_kernel_stack(
+            tid as u32,
+            kbase + kstack_size(),
+        );
+    }
+}
+
 /// #135 record one transition into the per-thread `trans_ring`.  Each
 /// entry packs (action, cpu, state, on_cpu_enc, ts_low32) into a u64.
 /// `on_cpu_enc`: 0..0xFD = real CPU id, 0xFE = PENDING, 0xFF = MAX.
@@ -4920,8 +4942,7 @@ fn try_switch(current_sp: u64) -> u64 {
             pcpu.dispatching_tid.store(0, Ordering::Release);
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
-            pcpu.current_thread.store(idle_id, Ordering::Relaxed);
-            record_current_thread_change(smp::cpu_id(), idle_id as u32);
+            set_current_thread(pcpu, idle_id);
             // #208 Fix D: release prev to PENDING just before returning,
             // so peer CPUs can now dispatch it (asm `mov rsp, rax`
             // immediately follows this return).
@@ -4956,8 +4977,7 @@ fn try_switch(current_sp: u64) -> u64 {
     // Activate next thread.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
     trace_sched(next_id, 7); // 7=state_running
-    pcpu.current_thread.store(next_id, Ordering::Relaxed);
-    record_current_thread_change(smp::cpu_id(), next_id as u32);
+    set_current_thread(pcpu, next_id);
     // Clear dispatching_tid: dispatch is fully visible — on_cpu=cpu,
     // state=Running, current_thread=tid all observable to other CPUs.
     if next_id != idle_id {
@@ -5049,8 +5069,7 @@ fn try_switch(current_sp: u64) -> u64 {
             thread_ref(next_id).killed.store(true, Ordering::Release);
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
-            pcpu.current_thread.store(idle_id, Ordering::Relaxed);
-            record_current_thread_change(smp::cpu_id(), idle_id as u32);
+            set_current_thread(pcpu, idle_id);
             // #208 Fix D: release prev → PENDING just before return.
             transition_release_to_pending(prev_id);
             return idle_sp;
@@ -5094,8 +5113,7 @@ fn try_switch(current_sp: u64) -> u64 {
                     }
                 }
                 unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
-                pcpu.current_thread.store(idle_id, Ordering::Relaxed);
-                record_current_thread_change(smp::cpu_id(), idle_id as u32);
+                set_current_thread(pcpu, idle_id);
                 // #208 Fix D: release prev → PENDING just before return.
                 transition_release_to_pending(prev_id);
                 return idle_sp;
@@ -5113,8 +5131,7 @@ fn try_switch(current_sp: u64) -> u64 {
                 thread_ref(next_id).killed.store(true, Ordering::Release);
                 let idle_sp = thread_ref(idle_id).saved_sp;
                 unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
-                pcpu.current_thread.store(idle_id, Ordering::Relaxed);
-            record_current_thread_change(smp::cpu_id(), idle_id as u32);
+                set_current_thread(pcpu, idle_id);
                 // #208 Fix D: release prev → PENDING just before return.
                 transition_release_to_pending(prev_id);
                 return idle_sp;
@@ -5292,8 +5309,7 @@ pub fn voluntary_reschedule() {
     }
 
     let next_t = unsafe { thread_mut_from_ref(next_id) };
-    pcpu.current_thread.store(next_id, Ordering::Relaxed);
-    record_current_thread_change(smp::cpu_id(), next_id as u32);
+    set_current_thread(pcpu, next_id);
     if next_id != idle_id {
         pcpu.dispatching_tid.store(0, Ordering::Release);
     }
@@ -8244,8 +8260,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
             // Pick idle instead.
             let idle_sp2 = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
-            pcpu.current_thread.store(idle_id, Ordering::Relaxed);
-            record_current_thread_change(smp::cpu_id(), idle_id as u32);
+            set_current_thread(pcpu, idle_id);
             pending_switch_sp()[cpu].store(idle_sp2, Ordering::Release);
             return;
         }
@@ -8261,8 +8276,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
 
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
-    pcpu.current_thread.store(next_id, Ordering::Relaxed);
-    record_current_thread_change(smp::cpu_id(), next_id as u32);
+    set_current_thread(pcpu, next_id);
     let next_sp = next_t.saved_sp;
 
     // Sanity check: saved_sp must be within the thread's kstack.
@@ -8281,8 +8295,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
             let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
-            pcpu.current_thread.store(idle_id, Ordering::Relaxed);
-            record_current_thread_change(smp::cpu_id(), idle_id as u32);
+            set_current_thread(pcpu, idle_id);
             pending_switch_sp()[cpu].store(idle_sp, Ordering::Release);
             return;
         }
@@ -10086,8 +10099,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
             // Pick idle instead.
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
-            pcpu.current_thread.store(idle_id, Ordering::Relaxed);
-            record_current_thread_change(smp::cpu_id(), idle_id as u32);
+            set_current_thread(pcpu, idle_id);
             pending_switch_sp()[cpu].store(idle_sp, Ordering::Release);
             let _ = irq_saved;
             return;
@@ -10104,8 +10116,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
 
     // Safety: next_id was just dequeued, we own it.
     let next_t = unsafe { thread_mut_from_ref(next_id) };
-    pcpu.current_thread.store(next_id, Ordering::Relaxed);
-    record_current_thread_change(smp::cpu_id(), next_id as u32);
+    set_current_thread(pcpu, next_id);
     let next_sp = next_t.saved_sp;
 
     // Reprogram the one-shot timer so this CPU wakes at the sleep deadline.
@@ -10299,8 +10310,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
 
     // Activate receiver.
     receiver.state = ThreadState::Running;
-    pcpu.current_thread.store(receiver_tid, Ordering::Relaxed);
-    record_current_thread_change(smp::cpu_id(), receiver_tid as u32);
+    set_current_thread(pcpu, receiver_tid);
     {
         let idle_id = pcpu.idle_thread_id.load(Ordering::Relaxed);
         if receiver_tid != idle_id {
@@ -10325,8 +10335,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
             thread_ref(receiver_tid).killed.store(true, Ordering::Release);
             let idle_sp = thread_ref(idle_id).saved_sp;
             unsafe { thread_mut_from_ref(idle_id) }.state = ThreadState::Running;
-            pcpu.current_thread.store(idle_id, Ordering::Relaxed);
-            record_current_thread_change(smp::cpu_id(), idle_id as u32);
+            set_current_thread(pcpu, idle_id);
             pending_switch_sp()[cpu].store(idle_sp, Ordering::Release);
             return;
         }
