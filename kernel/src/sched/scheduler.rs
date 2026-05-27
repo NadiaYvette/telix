@@ -3937,6 +3937,42 @@ pub fn tick(current_sp: u64) -> u64 {
                     }
                 }
             }
+            // #208 periodic FRAME-DELTA sweep — walks all Blocked threads
+            // every ~1s and verifies their iretq_shadow_frame against the
+            // current contents at saved_sp.  Catches corruption that lands
+            // between two park-resume cycles (the at-dispatch check only
+            // sees the SAME park cycle's write; a peer write that's later
+            // overwritten by a subsequent legitimate park would be invisible
+            // at dispatch).
+            if n > 0 && n % 100 == 0 {
+                static SWEEP_SCAN_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let max_tid = NEXT_THREAD_ID.load(Ordering::Relaxed).min(256);
+                let mut checked = 0u32;
+                for tid in 1..max_tid {
+                    let t = unsafe { &*(THREAD_TABLE.get(tid) as *const Thread) };
+                    if t.task_id == 0 || t.state != ThreadState::Blocked {
+                        continue;
+                    }
+                    let sp = t.iretq_shadow_sp;
+                    if sp == 0 {
+                        continue;
+                    }
+                    // check_iretq_shadow uses require_blocked=true and will
+                    // emit FRAME-DELTA / FRAME-BYTE-DELTA on mismatch.
+                    check_iretq_shadow(tid, sp);
+                    // Also walk the extended snapshot for parked frames.
+                    check_park_stack_ext(tid, sp);
+                    checked += 1;
+                }
+                let nlog = SWEEP_SCAN_LOG.fetch_add(1, Ordering::Relaxed);
+                if nlog < 3 || nlog % 10 == 0 {
+                    crate::println!(
+                        "PERIODIC-SHADOW-SWEEP: tick={} checked={} max_tid={}",
+                        n, checked, max_tid,
+                    );
+                }
+            }
             // Check roughly every 5 seconds (tick ≈ 10ms → 500 ticks).
             if n > 0 && n % 500 == 0 {
                 let sends = crate::sched::stats::IPC_SENDS.load(Ordering::Relaxed);
