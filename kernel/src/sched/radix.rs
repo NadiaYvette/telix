@@ -14,7 +14,112 @@
 use crate::mm::page;
 use crate::mm::phys;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+
+// ---------------------------------------------------------------------------
+// SET-LOG probe (THREAD_TABLE corruption hunt)
+// ---------------------------------------------------------------------------
+//
+// Boot 1798 caught `thread_ref(tid=4)` returning a kstack VA instead of a
+// SLAB_REGION VA — i.e. THREAD_TABLE[4] was OVERWRITTEN with a kstack-VA
+// value after a clean initial set.  Three theories:
+//   (a) some set() call stored a bad val (set-side bug — unlikely given
+//       all 3 sites use freshly-allocated SLAB_REGION pointers)
+//   (b) memory aliasing: the L1 page's PA is the same as some kstack /
+//       slab page's PA, so writes to that other page scribble L1
+//   (c) a wild pointer from elsewhere lands on the L1 slot
+//
+// To discriminate, log every set() invocation: (tid, val, prev_val,
+// caller_loc, l1_va, l1_idx).  At guard-hit time dump all entries
+// matching the offending tid.  If prev_val was correct on the most
+// recent set, the corruption is post-set (b or c).
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SetLogEntry {
+    seq: u64,
+    tid: u32,
+    l1_idx: u32,
+    val: u64,
+    prev_val: u64,
+    caller_loc: u64,
+    l1_va: u64,
+}
+
+const SET_LOG_SIZE: usize = 256;
+struct SetLogCell(core::cell::UnsafeCell<SetLogEntry>);
+unsafe impl Sync for SetLogCell {}
+static SET_LOG: [SetLogCell; SET_LOG_SIZE] = [const {
+    SetLogCell(core::cell::UnsafeCell::new(SetLogEntry {
+        seq: 0,
+        tid: 0,
+        l1_idx: 0,
+        val: 0,
+        prev_val: 0,
+        caller_loc: 0,
+        l1_va: 0,
+    }))
+}; SET_LOG_SIZE];
+static SET_LOG_HEAD: AtomicU64 = AtomicU64::new(0);
+
+fn record_set(
+    tid: u32,
+    val: u64,
+    prev_val: u64,
+    caller_loc: u64,
+    l1_va: u64,
+    l1_idx: u32,
+) {
+    let seq = SET_LOG_HEAD.fetch_add(1, Ordering::Relaxed);
+    let idx = (seq as usize) % SET_LOG_SIZE;
+    unsafe {
+        *SET_LOG[idx].0.get() = SetLogEntry {
+            seq: seq + 1,
+            tid,
+            l1_idx,
+            val,
+            prev_val,
+            caller_loc,
+            l1_va,
+        };
+    }
+}
+
+/// Dump all SET_LOG entries matching `target_tid`, oldest-first.  Called
+/// from VALIDATOR-BAD-TREF and similar paths to reveal the value
+/// trajectory of the offending slot.
+pub fn dump_set_log_for_tid(target_tid: u32) {
+    let head = SET_LOG_HEAD.load(Ordering::Relaxed);
+    let mut hits: u32 = 0;
+    let start = if head >= SET_LOG_SIZE as u64 {
+        head - SET_LOG_SIZE as u64
+    } else {
+        0
+    };
+    crate::println!(
+        "RADIX-SET-LOG-DUMP-BEGIN: tid={} head={} window=[{}..{})",
+        target_tid, head, start, head
+    );
+    for seq in start..head {
+        let idx = (seq as usize) % SET_LOG_SIZE;
+        let entry = unsafe { *SET_LOG[idx].0.get() };
+        if entry.tid == target_tid {
+            crate::println!(
+                "RADIX-SET-LOG: seq={} tid={} l1_idx={} val={:#x} \
+                 prev_val={:#x} caller_loc={:#x} l1_va={:#x}",
+                entry.seq, entry.tid, entry.l1_idx, entry.val,
+                entry.prev_val, entry.caller_loc, entry.l1_va
+            );
+            hits += 1;
+        }
+    }
+    crate::println!(
+        "RADIX-SET-LOG-DUMP-END: tid={} hits={}",
+        target_tid, hits
+    );
+}
+
+// ---------------------------------------------------------------------------
 
 /// Maximum pointer entries per allocation page (upper bound for const contexts).
 #[allow(dead_code)]
@@ -84,7 +189,9 @@ impl RadixTable {
     /// Store an entity pointer by ID. Caller must have called `ensure_l1(id)`
     /// first (under a serializing lock). Uses Release ordering.
     #[inline]
+    #[track_caller]
     pub fn set(&self, id: u32, val: *mut u8) {
+        let caller_loc = core::panic::Location::caller() as *const _ as u64;
         let l0 = self.l0.load(Ordering::Relaxed);
         let fanout = radix_fanout();
         let l0_idx = (id as usize) / fanout;
@@ -92,7 +199,20 @@ impl RadixTable {
 
         let l1_page = unsafe { &*l0.add(l0_idx) }.load(Ordering::Relaxed);
         let l1 = l1_page as *const AtomicPtr<u8>;
-        unsafe { &*l1.add(l1_idx) }.store(val, Ordering::Release);
+        let slot = unsafe { &*l1.add(l1_idx) };
+        let prev = slot.load(Ordering::Relaxed);
+        slot.store(val, Ordering::Release);
+        // Probe: record this set in the global ring so VALIDATOR-BAD-TREF can
+        // dump the value trajectory of any tid.  Cheap (one fetch_add + one
+        // 56-byte struct copy); fires for both THREAD_TABLE and TASK_TABLE.
+        record_set(
+            id,
+            val as u64,
+            prev as u64,
+            caller_loc,
+            l1_page as u64,
+            l1_idx as u32,
+        );
     }
 
     /// Ensure the L1 page covering `id` exists. Allocates if needed.

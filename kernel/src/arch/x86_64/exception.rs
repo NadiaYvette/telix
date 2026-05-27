@@ -572,6 +572,10 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
                     .wrapping_add(crate::arch::x86_64::mm::PML4_SLOT_SIZE),
                 tid,
             );
+            // Dump the SET-LOG trajectory for this tid to discriminate
+            // set-side bug (prev_val already wrong) vs post-set scribble
+            // (prev_val was SLAB_REGION on the last set).
+            crate::sched::radix::dump_set_log_for_tid(tid);
         } else {
             let saved_sp_addr = &tref.saved_sp as *const u64 as u64;
             crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
