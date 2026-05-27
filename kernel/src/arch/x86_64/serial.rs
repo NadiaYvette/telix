@@ -170,6 +170,59 @@ impl fmt::Write for DirectUart {
     }
 }
 
+/// Atomically format and emit `args` under the global PRINT_LOCK using
+/// DirectUart's byte-by-byte writes (no per-CPU buffer, no internal
+/// state).  Holds PRINT_LOCK with IRQs disabled across the whole emit
+/// so other CPUs' regular prints CANNOT interleave with the output —
+/// they spin until we release.  Intended for exception-handler dumps
+/// where multi-line atomicity matters.
+///
+/// CAUTION: this writes byte-by-byte at the UART line rate (~115 kbps),
+/// so a long dump takes ~10ms per ~150 chars.  Other CPUs spin during
+/// this window.  Acceptable for fatal-path dumps (we're about to
+/// `spin_loop()` anyway) but should NOT be used for routine logging.
+pub fn dump_atomic(args: fmt::Arguments) {
+    use fmt::Write;
+    init_uart_fifo_once();
+    let my_cpu = crate::sched::smp::cpu_id() as i32;
+    // Re-entry bypass: if we're already the lock-holder on this CPU
+    // (nested exception during a dump_atomic), write directly without
+    // re-acquiring — the outer caller already holds the lock so peer
+    // CPUs are still excluded; only the inner write may interleave
+    // with the outer.  Avoids deadlock.
+    if PRINT_HOLDER_CPU.load(AOrdering::Acquire) == my_cpu {
+        let mut d = DirectUart;
+        let _ = d.write_fmt(args);
+        return;
+    }
+    let saved = crate::arch::irq::disable();
+    loop {
+        while PRINT_LOCK.load(AOrdering::Relaxed) != 0 {
+            core::hint::spin_loop();
+        }
+        if PRINT_LOCK
+            .compare_exchange(0, 1, AOrdering::Acquire, AOrdering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    PRINT_HOLDER_CPU.store(my_cpu, AOrdering::Release);
+    let mut d = DirectUart;
+    let _ = d.write_fmt(args);
+    PRINT_HOLDER_CPU.store(-1, AOrdering::Release);
+    PRINT_LOCK.store(0, AOrdering::Release);
+    crate::arch::irq::restore(saved);
+}
+
+/// Macro variant of `dump_atomic` mirroring `println!` ergonomics.
+#[macro_export]
+macro_rules! dump_atomic {
+    ($($arg:tt)*) => ($crate::arch::x86_64::serial::dump_atomic(
+        format_args!("{}\n", format_args!($($arg)*))
+    ));
+}
+
 // #154 v2 polite-lock for print serialization.
 //
 // Replaces the previous interrupt-safe `SpinLock`, which disabled IRQs

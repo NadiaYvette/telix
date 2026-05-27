@@ -1289,12 +1289,12 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
             bp = unsafe { *(bp as *const u64) };
         }
 
-        // Coalesce all PF info into a single println! to avoid
-        // interleaving with peer-CPU UART traffic.  Multi-arg fmt args
-        // are formatted into the per-call StackBuf, then flushed atomic
-        // by serial::__print's spinlock, so this gives an unbroken
-        // record.
-        crate::println!(
+        // Use dump_atomic! — holds PRINT_LOCK across the whole emit so
+        // other CPUs' prints cannot interleave (regular println! showed
+        // mid-dump truncation in boot 1786 even with a coalesced single
+        // call; bytes from peer CPUs appeared after ~250 bytes of cpu=1's
+        // dump despite the lock).
+        crate::dump_atomic!(
 "Kernel #PF at RIP={:#x} CR2={:#x} error={:#x} cpu={} cr3={:#x} pml4_e={:#x} pdpt_e={:#x} pd_e={:#x} pt_e={:#x}
   rsp={:#x} rbp={:#x} cs={:#x} ss={:#x} rflags={:#x}
   rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}
