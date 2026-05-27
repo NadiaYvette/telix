@@ -1260,6 +1260,34 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
                 break;
             }
         }
+        // Also read 8 quads BELOW rsp (recently-popped slots).  After a
+        // `ret`, the popped RIP value lives at `*(rsp - 8)` until the
+        // next push overwrites it.  Wild-RIP-via-ret crashes leave that
+        // signature here.
+        let mut stack_words_below: [u64; 8] = [0; 8];
+        for i in 0..8 {
+            let addr = rsp.wrapping_sub(((i + 1) as u64) * 8);
+            if (addr & 0xffffff8000000000) == 0xfffffe0000000000 {
+                stack_words_below[i] = unsafe { *(addr as *const u64) };
+            } else {
+                stack_words_below[i] = 0xdeadbeefcafef00d;
+            }
+        }
+        // Walk the RBP chain up to 6 frames.  Each frame's saved RIP is
+        // at `*(rbp + 8)`, the previous RBP is at `*rbp`.  Stops on
+        // non-kstack or null RBP.
+        let mut backtrace: [u64; 6] = [0; 6];
+        let mut bp = frame.rbp();
+        for slot in backtrace.iter_mut() {
+            if (bp & 0xffffff8000000000) != 0xfffffe0000000000 || bp == 0 {
+                *slot = 0;
+                break;
+            }
+            let saved_rip_addr = bp + 8;
+            *slot = unsafe { *(saved_rip_addr as *const u64) };
+            // Next RBP
+            bp = unsafe { *(bp as *const u64) };
+        }
 
         // Coalesce all PF info into a single println! to avoid
         // interleaving with peer-CPU UART traffic.  Multi-arg fmt args
@@ -1276,7 +1304,10 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
   stk[0..4]={:#x} {:#x} {:#x} {:#x}
   stk[4..8]={:#x} {:#x} {:#x} {:#x}
   stk[8..12]={:#x} {:#x} {:#x} {:#x}
-  stk[12..16]={:#x} {:#x} {:#x} {:#x}",
+  stk[12..16]={:#x} {:#x} {:#x} {:#x}
+  below[1..4]={:#x} {:#x} {:#x} {:#x}
+  below[5..8]={:#x} {:#x} {:#x} {:#x}
+  backtrace={:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
             frame.rip(), cr2, error, cpu, cr3, pml4_e, pdpt_e, pd_e, pt_e,
             frame.rsp(), frame.rbp(), frame.cs(), frame.ss(), frame.rflags(),
             frame.rax(), frame.rbx(), frame.rcx(), frame.rdx(),
@@ -1287,6 +1318,9 @@ fn handle_page_fault_x86(frame: &ExceptionFrame, frame_sp: u64) -> u64 {
             stack_words[4], stack_words[5], stack_words[6], stack_words[7],
             stack_words[8], stack_words[9], stack_words[10], stack_words[11],
             stack_words[12], stack_words[13], stack_words[14], stack_words[15],
+            stack_words_below[0], stack_words_below[1], stack_words_below[2], stack_words_below[3],
+            stack_words_below[4], stack_words_below[5], stack_words_below[6], stack_words_below[7],
+            backtrace[0], backtrace[1], backtrace[2], backtrace[3], backtrace[4], backtrace[5],
         );
         loop {
             core::hint::spin_loop();
