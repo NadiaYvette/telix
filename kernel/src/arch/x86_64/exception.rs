@@ -694,6 +694,14 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
                         crate::sched::scheduler::dump_rsp0_ring(cpu as u32);
                         crate::sched::scheduler::dump_ct_ring(cpu as u32);
                     }
+                    // #208 Path C extension: fix TSS.RSP0 now so the NEXT
+                    // user→kernel transition pushes onto the correct
+                    // kstack.  The CURRENT iret frame is already pushed
+                    // wrong (we can't fix that retroactively), but
+                    // subsequent transitions will be safe until
+                    // current_thread changes again.
+                    let expected_rsp0 = sb + sz;
+                    crate::arch::x86_64::gdt::set_rsp0(tid, expected_rsp0);
                 }
             }
         }
