@@ -7936,6 +7936,34 @@ pub fn store_frame_sp(sp: u64) {
     current_frame_sp()[cpu].store(sp, Ordering::Release);
     // Also store per-thread so the value survives preemptive CPU migration.
     let tid = smp::get(cpu as u32).current_thread.load(Ordering::Relaxed);
+    // #208 sentinel write guard: if current_thread.load(Relaxed) observed a
+    // transient 0 (e.g. between two valid set_current_thread stores on a
+    // peer CPU, before the new value globally propagates), writing to
+    // THREAD_TABLE[0].syscall_frame_sp would corrupt the sentinel slot.
+    // Boot 1750 wild-RIP traced to exactly this: the sentinel slot held a
+    // freshly-created thread's saved_sp value (kstack VA), which later
+    // surfaced as a wild execute-target via the block_current resync path.
+    //
+    // Bail and increment a counter so we can see how often it fires.
+    // Skipping the per-thread store leaves only the per-CPU current_frame_sp
+    // updated — which is what existed before the per-thread mirror was
+    // added and still correctly serves the syscall_frame_sp consumers on
+    // the local CPU.  Consumers that walk per-thread on remote CPUs
+    // would temporarily miss this one entry; that window is tiny because
+    // by the next store_frame_sp call current_thread will have settled.
+    if tid == 0 || (tid as usize) >= RadixTable::capacity() {
+        static SENTINEL_GUARD_HITS: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let n = SENTINEL_GUARD_HITS
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 32 {
+            crate::println!(
+                "STORE-FRAME-SP-GUARD: cpu={} sp={:#x} tid={} (sentinel, skipped) n={}",
+                cpu, sp, tid, n,
+            );
+        }
+        return;
+    }
     unsafe { thread_mut_from_ref(tid) }.syscall_frame_sp = sp;
 }
 
