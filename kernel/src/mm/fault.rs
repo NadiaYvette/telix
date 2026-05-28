@@ -252,12 +252,33 @@ pub fn handle_page_fault(
                 }
             }
         } else if !is_zeroed {
-            // Poisoned (0xCD) instead of zero so uninitialized reads by
-            // user code are diagnosable — see mm::ANON_POISON_BYTE.
-            unsafe {
-                core::ptr::write_bytes(mmu_pa as *mut u8, crate::mm::ANON_POISON_BYTE, MMUPAGE_SIZE);
+            // #208 defensive: don't poison a page that's currently in use
+            // as a kstack — would scribble its iretq frame.  Same family
+            // as the zero_daemon fix; phys allocator sometimes hands us a
+            // PA that the kstack tracker still owns.
+            if crate::sched::scheduler::pa_in_kstack_slot(mmu_pa) {
+                static FAULT_SKIP_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = FAULT_SKIP_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    crate::println!(
+                        "FAULT-POISON-SKIP-KSTACK: mmu_pa={:#x} n={}",
+                        mmu_pa, n,
+                    );
+                }
+                // The PTE install below uses the bogus PA — without
+                // poisoning, user reads will see whatever the kstack
+                // contained (not zeros).  This is acceptable as a
+                // temporary defensive measure; the user gets garbage
+                // but the kernel stays alive.
+            } else {
+                // Poisoned (0xCD) instead of zero so uninitialized reads by
+                // user code are diagnosable — see mm::ANON_POISON_BYTE.
+                unsafe {
+                    core::ptr::write_bytes(mmu_pa as *mut u8, crate::mm::ANON_POISON_BYTE, MMUPAGE_SIZE);
+                }
+                stats::PAGES_ZEROED.fetch_add(1, Ordering::Relaxed);
             }
-            stats::PAGES_ZEROED.fetch_add(1, Ordering::Relaxed);
         }
 
         // Install the PTE with SW_ZEROED flag.
