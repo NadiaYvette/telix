@@ -577,13 +577,12 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
             // (prev_val was SLAB_REGION on the last set).
             crate::sched::radix::dump_set_log_for_tid(tid);
         } else {
-            let saved_sp_addr = &tref.saved_sp as *const u64 as u64;
-            crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
-                .store(saved_sp_addr, core::sync::atomic::Ordering::Relaxed);
-            crate::println!(
-                "DR0-WATCH-ARMED: addr={:#x} (= &tref({}).saved_sp)",
-                saved_sp_addr, tid,
-            );
+            // (Old saved_sp DR0-arm removed: it overrode the TT4 L1-slot
+            // watch in radix.rs, redirecting DR0 to legitimate try_switch
+            // saved_sp writes instead of the actual L1-slot corruption.
+            // The TT4 L1-slot watch armed at THREAD_TABLE.set time is the
+            // current source of truth.)
+            //
             // Mark the current thread (the one with corrupt state) as
             // killed so the scheduler won't re-enqueue it on the next
             // tick.
