@@ -582,6 +582,45 @@ static SAVED_SP_LAST_META: [core::sync::atomic::AtomicU64; SAVED_SP_LOG_CAP] = {
     [Z; SAVED_SP_LOG_CAP]
 };
 
+/// Validated write to `Thread.saved_sp`.  Verifies the Thread* address is
+/// in SLAB_REGION (PML4[509]) before writing; logs SAVED-SP-WRITE-BAD-THREAD
+/// with the caller location if not.  Hypothesis: the wild-RIP / iretq-zero
+/// corruption family is rooted in some path writing `thread.saved_sp = sp`
+/// where `thread` is a stale/corrupted pointer landing on a kstack frame
+/// or radix L1 slot instead of a real Thread struct.  This wrapper catches
+/// the bad write AT WRITE TIME with the call-site identified.
+#[inline]
+#[track_caller]
+pub fn write_saved_sp(thread: &mut Thread, new_value: u64) {
+    let _thread_addr = thread as *const _ as u64;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let thread_addr = _thread_addr;
+        let in_slab = thread_addr
+            >= crate::arch::x86_64::mm::SLAB_REGION_BASE
+            && thread_addr
+                < crate::arch::x86_64::mm::SLAB_REGION_BASE
+                    .wrapping_add(crate::arch::x86_64::mm::PML4_SLOT_SIZE);
+        if !in_slab {
+            let caller = core::panic::Location::caller();
+            static BAD_THREAD_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = BAD_THREAD_LOG.fetch_add(1, Ordering::Relaxed);
+            if n < 32 {
+                crate::println!(
+                    "SAVED-SP-WRITE-BAD-THREAD: thread={:#x} new_sp={:#x} caller_file_line={}:{} n={}",
+                    thread_addr,
+                    new_value,
+                    caller.file(),
+                    caller.line(),
+                    n,
+                );
+            }
+        }
+    }
+    thread.saved_sp = new_value;
+}
+
 #[inline]
 pub fn record_saved_sp_write(tid: ThreadId, new_value: u64, callsite_tag: u8) {
     let i = tid as usize;
@@ -2879,7 +2918,7 @@ fn create_thread(entry: fn() -> !, priority: u8, quantum: u32) -> Option<ThreadI
     thread.stack_base = stack_base;
     thread.stack_phys_base = stack_phys_base;
     bump_kstack_epoch(thread); // #208
-    thread.saved_sp = frame_sp as u64;
+    write_saved_sp(thread, frame_sp as u64);
     record_saved_sp_write(id, frame_sp as u64, 1); // create_thread
     thread.sig_mask = 0;
     thread.sig_pending = 0;
@@ -3176,7 +3215,7 @@ fn finalize_spawn(
     thread.stack_base = kstack_base;
     thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
-    thread.saved_sp = frame_sp;
+    write_saved_sp(thread, frame_sp);
     record_saved_sp_write(thread_id, frame_sp, 2); // spawn_user
     thread.sig_mask = 0;
     thread.sig_pending = 0;
@@ -3241,7 +3280,7 @@ fn create_thread_in_task(
     thread.stack_base = kstack_base;
     thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
-    thread.saved_sp = frame_sp as u64;
+    write_saved_sp(thread, frame_sp as u64);
     record_saved_sp_write(id, frame_sp as u64, 3); // spawn_user variant
     thread.exit_code = 0;
     thread.sig_mask = 0;
@@ -4825,7 +4864,7 @@ fn try_switch(current_sp: u64) -> u64 {
         let save_ok = prev_id == idle_id_for_load
             || validate_kstack_inject(prev_id, current_sp, "try_switch.save");
         if save_ok {
-            prev_t.saved_sp = current_sp;
+            write_saved_sp(prev_t, current_sp);
             record_saved_sp_write(prev_id, current_sp, 4); // try_switch
             prev_t.saved_sp_source = 1; // try_switch
         }
@@ -5228,7 +5267,7 @@ pub fn voluntary_reschedule() {
         let t = unsafe { thread_mut_from_ref(cur_id) };
         // #208 KEPOCH guard: skip if frame_sp falls outside cur_id's kstack.
         if validate_kstack_inject(cur_id, frame_sp, "voluntary_resched") {
-            t.saved_sp = frame_sp;
+            write_saved_sp(t, frame_sp);
             record_saved_sp_write(cur_id, frame_sp, 5); // voluntary_reschedule
             t.saved_sp_source = 2; // voluntary_reschedule
         }
@@ -5555,7 +5594,8 @@ pub fn block_current(_reason: BlockReason) {
     // #208 KEPOCH guard.
     let _fsp_resync = tref.syscall_frame_sp;
     if validate_kstack_inject(tid, _fsp_resync, "resync_clone") {
-        unsafe { thread_mut_from_ref(tid) }.saved_sp = _fsp_resync;
+        let t = unsafe { thread_mut_from_ref(tid) };
+        write_saved_sp(t, _fsp_resync);
         record_saved_sp_write(tid, _fsp_resync, 6); // resync clone-thread
     }
     crate::arch::irq::restore(saved);
@@ -7036,7 +7076,7 @@ pub fn fork_current() -> u64 {
     thread.stack_base = kstack_base;
     thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
-    thread.saved_sp = child_frame_sp as u64;
+    write_saved_sp(thread, child_frame_sp as u64);
     record_saved_sp_write(child_tid, child_frame_sp as u64, 7); // fork
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
@@ -7277,7 +7317,7 @@ pub fn fork_for_task(target_task_id: u32, target_tid: u32) -> u64 {
     thread.stack_base = kstack_base;
     thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
-    thread.saved_sp = child_frame_sp as u64;
+    write_saved_sp(thread, child_frame_sp as u64);
     record_saved_sp_write(child_tid, child_frame_sp as u64, 8); // clone variant
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
@@ -7397,7 +7437,7 @@ pub fn clone_thread_in_task(
     thread.stack_base = kstack_base;
     thread.stack_phys_base = kstack_phys_base;
     bump_kstack_epoch(thread); // #208
-    thread.saved_sp = child_frame_sp as u64;
+    write_saved_sp(thread, child_frame_sp as u64);
     record_saved_sp_write(child_tid, child_frame_sp as u64, 9); // clone-third
     thread.exit_code = 0;
     thread.sig_mask = parent_sig_mask;
@@ -8160,7 +8200,7 @@ pub fn pre_save_frame(tid: ThreadId) {
     let t = unsafe { thread_mut_from_ref(tid) };
     // #208 KEPOCH guard.
     if validate_kstack_inject(tid, frame_sp, "pre_save_frame") {
-        t.saved_sp = frame_sp;
+        write_saved_sp(t, frame_sp);
         record_saved_sp_write(tid, frame_sp, 10); // pre_save_frame
         t.saved_sp_source = 3; // pre_save_frame
         t.ipc_frame_sp = frame_sp;
@@ -8240,7 +8280,7 @@ pub fn park_current_for_ipc(reason: BlockReason) {
     let _fsp_park_ipc = t.syscall_frame_sp;
     // #208 KEPOCH guard.
     if validate_kstack_inject(tid as ThreadId, _fsp_park_ipc, "park_ipc") {
-        t.saved_sp = _fsp_park_ipc;
+        write_saved_sp(t, _fsp_park_ipc);
         record_saved_sp_write(tid as ThreadId, _fsp_park_ipc, 11); // park_ipc
         t.saved_sp_source = 3; // park_ipc
     }
@@ -10114,7 +10154,7 @@ pub fn park_current_for_sleep(deadline_ns: u64) {
     thread.sleep_deadline_ns = deadline_ns;
     // #208 KEPOCH guard.
     if validate_kstack_inject(tid as ThreadId, frame_sp, "park_sleep") {
-        thread.saved_sp = frame_sp;
+        write_saved_sp(thread, frame_sp);
         record_saved_sp_write(tid as ThreadId, frame_sp, 12); // park_for_sleep
         thread.saved_sp_source = 5; // park_for_sleep
     }
@@ -10290,7 +10330,7 @@ pub fn handoff_to(receiver_tid: ThreadId) {
         let sender = unsafe { thread_mut_from_ref(sender_tid as ThreadId) };
         // #208 KEPOCH guard.
         if validate_kstack_inject(sender_tid as ThreadId, frame_sp, "handoff") {
-            sender.saved_sp = frame_sp;
+            write_saved_sp(sender, frame_sp);
             record_saved_sp_write(sender_tid as ThreadId, frame_sp, 13); // direct-transfer sender
         }
         sender_prio = sender.effective_priority;
