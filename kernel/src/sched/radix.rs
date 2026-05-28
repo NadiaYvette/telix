@@ -345,6 +345,7 @@ impl RadixTable {
     /// before any concurrent access.
     pub fn init(&self) {
         let pa = phys::alloc_page().expect("radix L0 alloc");
+        crate::sched::scheduler::record_pa_alias_check(pa.as_usize(), "radix-L0");
         let p = pa.as_usize() as *mut u8;
         unsafe {
             ptr::write_bytes(p, 0, page::page_size());
@@ -462,6 +463,10 @@ impl RadixTable {
             Some(p) => p,
             None => return false,
         };
+        // PA-alias probe: check if this PA's 64 KiB slot already owns
+        // a kstack.  If so, writes through the kstack VA will scribble
+        // this L1 page — the THREAD_TABLE[4] corruption signature.
+        crate::sched::scheduler::record_pa_alias_check(pa.as_usize(), "radix-L1");
         let p = pa.as_usize() as *mut u8;
         unsafe {
             ptr::write_bytes(p, 0, page::page_size());

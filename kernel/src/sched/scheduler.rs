@@ -88,11 +88,52 @@ impl KStackHandle {
 /// marked live, we have a double-allocation — the bug hypothesis behind
 /// the wild-RIP-in-kstack family.  Indexed by `pa >> 16` (page index
 /// for a 64 KiB-granularity tracker), sized for 2 GiB of phys.
+///
+/// Also reused (via `record_pa_alias_check`) to detect alias between
+/// kstack PAs and other allocations (e.g. RadixTable L1 pages).  An
+/// L1 page at PA P falls into the 64 KiB tracker slot `P >> 16` — if
+/// any kstack is currently using that slot, writes through the kstack
+/// VA scribble the L1 page contents (which is exactly the
+/// THREAD_TABLE[4] corruption signature: DR0 on the identity VA can't
+/// see the write because the writer goes through the kstack VA).
 const KSTACK_PA_OWNER_CAP: usize = 32768; // 2 GiB / 64 KiB
 static KSTACK_PA_OWNER: [core::sync::atomic::AtomicU32; KSTACK_PA_OWNER_CAP] = {
     const Z: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     [Z; KSTACK_PA_OWNER_CAP]
 };
+
+/// Check whether `pa` (4 KiB-granularity) falls into a 64 KiB slot
+/// currently owned by a kstack, and stamp the slot so a later kstack
+/// alloc on the same PA detects the alias via `KSTACK-PA-DOUBLE-ALLOC`.
+/// Bidirectional detection: this catches the "radix-first then
+/// kstack-on-same-PA" case (via the existing kstack audit) AND the
+/// "kstack-first then radix-on-same-PA" case (via PA-ALIAS here).
+pub fn record_pa_alias_check(pa: usize, tag: &str) {
+    let slot = pa >> 16;
+    if slot >= KSTACK_PA_OWNER_CAP {
+        return;
+    }
+    // Read-modify-write: detect prior kstack ownership AND stamp so we
+    // catch any later kstack alloc on the same slot.
+    let prev = KSTACK_PA_OWNER[slot]
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if prev != 0 {
+        static ALIAS_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = ALIAS_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 32 {
+            crate::println!(
+                "PA-ALIAS: tag={} pa={:#x} slot={} prev_count={} n={}",
+                tag, pa, slot, prev, n,
+            );
+        }
+    }
+    // Note: never decrement — radix L0/L1 pages live forever, so the
+    // stamp is permanent.  This means a kstack free + re-alloc on the
+    // same slot won't underflow because the radix stamp keeps it >0.
+    // The existing KSTACK-PA-FREE-UNDERFLOW check will see this and
+    // log; tag it as a known-benign side effect of this probe.
+}
 
 /// Audit hook called on every kstack PA alloc/free.  `delta` is +1
 /// (alloc) or -1 (free); we track an integer count rather than a boolean
