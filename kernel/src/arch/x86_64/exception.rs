@@ -608,28 +608,18 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
     let cpu = crate::sched::smp::cpu_id() as usize;
     crate::sched::scheduler::clear_pending_switch(cpu);
 
-    // #208 saved_sp watchpoint — one-shot arm on tid=4's saved_sp
-    // field as soon as the Thread is allocated.  Pre-fix, BIOS-IVT
-    // corruption clusters on tid=4 (init).  Proactive arming catches
-    // writes BEFORE BAD frame fires (post-fire arming was useless
-    // because killed thread is never written again).
+    // #208 L1-slot watchpoint — every CPU re-arms its DR0 on the
+    // global watch address (set by sched::radix's TT4-WATCH-ARM probe
+    // when THREAD_TABLE[4] is first written with a SLAB VA).  Always
+    // calls dr0_ensure_watching unconditionally so each CPU's HW DR0
+    // converges on the current global target — the old "if target==0
+    // then set saved_sp" branch was a stale saved_sp-era arm that
+    // overrode the L1-slot watch and caused DR0 hits to fire on
+    // legitimate saved_sp writes instead of the L1-slot corruption.
     {
         let target = crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
             .load(core::sync::atomic::Ordering::Relaxed);
-        if target == 0 {
-            // First exception_handler call where tid=4 exists: arm it.
-            let t4 =
-                crate::sched::scheduler::thread_ref_opt(4);
-            if let Some(t) = t4 {
-                let addr = &t.saved_sp as *const u64 as u64;
-                crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
-                    .store(addr, core::sync::atomic::Ordering::Relaxed);
-                crate::println!(
-                    "DR0-WATCH-PROACTIVE: addr={:#x} cpu={}",
-                    addr, cpu,
-                );
-            }
-        } else {
+        if target != 0 {
             crate::arch::x86_64::gdt::dr0_ensure_watching(target);
         }
     }

@@ -247,8 +247,17 @@ pub fn dr0_ensure_watching(addr: u64) {
     if addr == 0 {
         return;
     }
-    let cur = DR0_WATCH_ADDR.load(core::sync::atomic::Ordering::Relaxed);
-    if cur == addr {
+    // Always re-arm: DR0_WATCH_ADDR is a global, but HW DR0 is per-CPU,
+    // so the global-equal check fails to detect that a peer CPU's DR0
+    // register is stale (set by an older arm) while DR0_WATCH_ADDR was
+    // updated by a different CPU since.  Boot 1872 caught DR0 firing
+    // on a stale saved_sp address despite `watched` being L1-slot.
+    // Cost is one outb + 2 GPR-to-DR moves per exception — cheap.
+    let cur_reg: u64;
+    unsafe {
+        core::arch::asm!("mov {0}, dr0", out(reg) cur_reg, options(nomem, nostack));
+    }
+    if cur_reg == addr {
         return;
     }
     dr0_set_watch_write_qword(addr);
