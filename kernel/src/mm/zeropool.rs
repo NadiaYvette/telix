@@ -103,6 +103,17 @@ pub fn zero_daemon() -> ! {
             }
         };
 
+        // PROBE (2026-05-28): the residual #208 BAD-frame family writes
+        // 0x00 into iretq frame slots on kstack pages of tid=4/34 etc.
+        // ANON_POISON_BYTE is 0x00, and this path zeroes via identity VA.
+        // If the allocator handed us a PA that's currently in use as a
+        // kstack (the per-CPU kstack tracker says so), our write_bytes is
+        // about to scribble the kstack iretq frame — the smoking gun.
+        crate::sched::scheduler::record_pa_alias_check(
+            pa.as_usize(),
+            "zero-daemon",
+        );
+
         // Fill the full page with poison (0xCD) instead of zero. This
         // is the expensive part and happens WITHOUT holding any lock.
         // Pool clients are user-page allocators (mm::fault, personality
