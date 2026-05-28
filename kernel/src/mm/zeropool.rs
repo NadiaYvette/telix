@@ -103,16 +103,37 @@ pub fn zero_daemon() -> ! {
             }
         };
 
-        // PROBE (2026-05-28): the residual #208 BAD-frame family writes
-        // 0x00 into iretq frame slots on kstack pages of tid=4/34 etc.
-        // ANON_POISON_BYTE is 0x00, and this path zeroes via identity VA.
-        // If the allocator handed us a PA that's currently in use as a
-        // kstack (the per-CPU kstack tracker says so), our write_bytes is
-        // about to scribble the kstack iretq frame — the smoking gun.
-        crate::sched::scheduler::record_pa_alias_check(
-            pa.as_usize(),
-            "zero-daemon",
-        );
+        // #208 BAD-frame fix: the phys allocator occasionally hands out
+        // a PA that's currently in use as a kstack page (KSTACK_PA_OWNER
+        // says so, but the buddy allocator doesn't know).  Writing 0x00
+        // (ANON_POISON_BYTE) via identity VA scribbles the kstack's
+        // iretq frame → BAD frame with CS=SS=RIP=0 → crash family for
+        // tid=4 (zero_daemon itself) and tid=34 (init).  Boot
+        // 11amfsq2203 reproduced this with 34 PA-ALIAS hits.
+        //
+        // Defensive fix: if the alloc landed in a kstack slot, skip
+        // the zero AND skip pushing the page into the pool.  The page
+        // is intentionally leaked from zero_daemon's perspective — we
+        // never decrement nor pool it, so the buddy allocator's count
+        // remains decremented and the in-use kstack stays intact.
+        // Per-boot leak observed in 2203 = 34 × 64 KiB = ~2 MiB.
+        // Acceptable trade-off until the phys allocator double-issue
+        // is root-caused; the corruption is fatal, the leak is not.
+        if crate::sched::scheduler::pa_in_kstack_slot(pa.as_usize()) {
+            static SKIP_LOG: AtomicU32 = AtomicU32::new(0);
+            let n = SKIP_LOG.fetch_add(1, Ordering::Relaxed);
+            if n < 32 {
+                crate::println!(
+                    "ZERO-DAEMON-SKIP-KSTACK: pa={:#x} n={}",
+                    pa.as_usize(),
+                    n,
+                );
+            }
+            // Drop the PhysAddr without write_bytes / pool / free —
+            // intentional leak (see comment above).
+            let _ = pa;
+            continue;
+        }
 
         // Fill the full page with poison (0xCD) instead of zero. This
         // is the expensive part and happens WITHOUT holding any lock.

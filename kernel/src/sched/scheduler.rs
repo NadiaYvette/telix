@@ -102,6 +102,17 @@ static KSTACK_PA_OWNER: [core::sync::atomic::AtomicU32; KSTACK_PA_OWNER_CAP] = {
     [Z; KSTACK_PA_OWNER_CAP]
 };
 
+/// Query whether `pa`'s 64 KiB slot is currently owned by a kstack.
+/// Used by zero_daemon to skip writing to PAs that are in use as
+/// kstack pages (the #208 BAD-frame root cause).
+pub fn pa_in_kstack_slot(pa: usize) -> bool {
+    let slot = pa >> 16;
+    if slot >= KSTACK_PA_OWNER_CAP {
+        return false;
+    }
+    KSTACK_PA_OWNER[slot].load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
 /// Check whether `pa` (4 KiB-granularity) falls into a 64 KiB slot
 /// currently owned by a kstack, and stamp the slot so a later kstack
 /// alloc on the same PA detects the alias via `KSTACK-PA-DOUBLE-ALLOC`.
