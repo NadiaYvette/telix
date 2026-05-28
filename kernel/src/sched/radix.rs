@@ -318,6 +318,11 @@ impl RadixTable {
         }
     }
 
+    /// Address of the L0 page (raw — for DR0 watchpoint arming).
+    pub fn l0_page_addr(&self) -> u64 {
+        self.l0.load(Ordering::Acquire) as u64
+    }
+
     /// Diagnostic: read L0 page address + L0[0] entry value (the L1 page
     /// pointer for tid=0..fanout-1).  Used at VALIDATOR-BAD-TREF time to
     /// test whether L0[0] was corrupted (would explain why a DR0 watch
@@ -417,23 +422,25 @@ impl RadixTable {
         if id < 32 {
             trace_set_live(id, val as u64, prev as u64, caller_loc, l1_page as u64);
         }
-        // Boot 1862 SET-LIVE proves THREAD_TABLE[4] is set correctly to a
-        // SLAB_REGION VA, then later overwritten with a kstack VA.  Arm
-        // global DR0 on the L1 slot address so the next write triggers
-        // #DB and logs the writer's RIP.  Restricted to id=4 (only known
-        // recurring victim) to avoid interfering with other watches.
+        // PA-alias probe (DISCONFIRMED across 8 boots: zero hits).  Boot
+        // 1860 VBT path showed tref = a kstack VA but DR0 on L1[4] never
+        // fired — so the L1 slot is NOT being scribbled via a CPU write.
+        // Switch to watching L0[0] (the L1-page-pointer slot) instead:
+        // if L0[0] gets scribbled, get(4) would chase a wild L1 page
+        // and pull tref from a kstack address.  DR0 on L0[0] catches
+        // that writer.
         #[cfg(target_arch = "x86_64")]
         if id == 4 && caller_loc != 0 {
-            // Caller is at scheduler.rs:2725 (alloc_thread_id THREAD_TABLE.set)
-            // i.e. tid=4 freshly created.  We don't filter on table identity
-            // because tid=4 in TASK_TABLE also exists, but the L1 PAs differ.
-            // L1 slot address = l1_page + l1_idx * 8.
-            let slot_addr = (l1_page as u64).wrapping_add((l1_idx as u64) * 8);
-            // Skip if the val being written looks like a PA-as-ptr (Task
-            // pointer is PA-cast, not SLAB VA) — only arm for SLAB VAs.
             let val_u = val as u64;
             if val_u >= 0xFFFF_FE80_0000_0000 && val_u < 0xFFFF_FF00_0000_0000 {
-                arm_thread_table_4_watchpoint(slot_addr, val_u);
+                // Compute L0[0] address: the L0 page is `self.l0.load()`.
+                // We don't have `self` here, but l1_page = *(L0[0]), so
+                // L0[0]'s ADDRESS is what `unsafe { &*l0.add(0) }` returns
+                // — i.e. the L0 page address itself.  The L0 page address
+                // = THREAD_TABLE.l0.load() — re-read it.
+                let l0_addr = crate::sched::scheduler::THREAD_TABLE
+                    .l0_page_addr();
+                arm_thread_table_4_watchpoint(l0_addr, val_u);
             }
         }
     }
