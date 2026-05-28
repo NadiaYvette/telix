@@ -251,6 +251,21 @@ fn direct_uart_dump_set_log_entry(e: &SetLogEntry) {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn trace_set_live(id: u32, val: u64, prev: u64, caller_loc: u64, l1_page: u64) {
+    uart_write_str("SET-LIVE: id=");
+    uart_write_u32(id);
+    uart_write_str(" val=");
+    uart_write_hex64(val);
+    uart_write_str(" prev=");
+    uart_write_hex64(prev);
+    uart_write_str(" loc=");
+    uart_write_hex64(caller_loc);
+    uart_write_str(" l1=");
+    uart_write_hex64(l1_page);
+    uart_write_str("\n");
+}
+
+#[cfg(target_arch = "x86_64")]
 fn direct_uart_dump_set_log_footer(tid: u32, hits: u32) {
     uart_write_str("RADIX-SET-LOG-DUMP-END: tid=");
     uart_write_u32(tid);
@@ -353,6 +368,15 @@ impl RadixTable {
             l1_page as u64,
             l1_idx as u32,
         );
+        // Live-trace to UART for low-tid THREAD_TABLE entries (boot 1860
+        // showed dump_set_log_for_tid producing zero output — the static
+        // SET_LOG ring may itself be getting scribbled).  Emitting per-set
+        // straight to UART catches the trail in real time.  Limit to ID<32
+        // to avoid log spam (we only care about tid=4 family).
+        #[cfg(target_arch = "x86_64")]
+        if id < 32 {
+            trace_set_live(id, val as u64, prev as u64, caller_loc, l1_page as u64);
+        }
     }
 
     /// Ensure the L1 page covering `id` exists. Allocates if needed.
