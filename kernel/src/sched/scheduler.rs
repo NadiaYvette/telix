@@ -3298,8 +3298,40 @@ fn create_thread_in_task(
 /// # Safety: Caller must ensure exclusive access (thread is owned by current CPU,
 /// or is Blocked/Dead and not accessible from any other path).
 #[inline]
+#[track_caller]
 pub(crate) unsafe fn thread_mut_from_ref(tid: ThreadId) -> &'static mut Thread {
     let p = THREAD_TABLE.get(tid) as *mut Thread;
+    // Validate the returned pointer is in SLAB_REGION (PML4[509], where
+    // Thread structs live post VA isolation Phase 4).  Catches every
+    // code path that uses a corrupted THREAD_TABLE entry to obtain a
+    // mutable Thread ref — not just the saved_sp writer family.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let addr = p as u64;
+        if addr != 0 {
+            let in_slab = addr
+                >= crate::arch::x86_64::mm::SLAB_REGION_BASE
+                && addr
+                    < crate::arch::x86_64::mm::SLAB_REGION_BASE
+                        .wrapping_add(crate::arch::x86_64::mm::PML4_SLOT_SIZE);
+            if !in_slab {
+                static BAD_TMUT_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = BAD_TMUT_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    let caller = core::panic::Location::caller();
+                    crate::println!(
+                        "THREAD-MUT-BAD-PTR: tid={} ptr={:#x} caller={}:{} n={}",
+                        tid,
+                        addr,
+                        caller.file(),
+                        caller.line(),
+                        n,
+                    );
+                }
+            }
+        }
+    }
     unsafe { &mut *p }
 }
 
