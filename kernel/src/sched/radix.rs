@@ -251,6 +251,22 @@ fn direct_uart_dump_set_log_entry(e: &SetLogEntry) {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn arm_thread_table_4_watchpoint(slot_addr: u64, val: u64) {
+    // Emit a marker line so we can verify the arm fired and capture the
+    // L1 slot address — letting us cross-reference with future DR0 hits.
+    uart_write_str("TT4-WATCH-ARM: slot=");
+    uart_write_hex64(slot_addr);
+    uart_write_str(" val=");
+    uart_write_hex64(val);
+    uart_write_str("\n");
+    // Hijack GLOBAL_SAVED_SP_WATCH_ADDR (used by the existing #DB handler
+    // for saved_sp tracking).  Every CPU will lazily arm its own DR0 on
+    // this address via dr0_ensure_watching at the next exception entry.
+    crate::arch::x86_64::gdt::GLOBAL_SAVED_SP_WATCH_ADDR
+        .store(slot_addr, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(target_arch = "x86_64")]
 fn trace_set_live(id: u32, val: u64, prev: u64, caller_loc: u64, l1_page: u64) {
     uart_write_str("SET-LIVE: id=");
     uart_write_u32(id);
@@ -376,6 +392,25 @@ impl RadixTable {
         #[cfg(target_arch = "x86_64")]
         if id < 32 {
             trace_set_live(id, val as u64, prev as u64, caller_loc, l1_page as u64);
+        }
+        // Boot 1862 SET-LIVE proves THREAD_TABLE[4] is set correctly to a
+        // SLAB_REGION VA, then later overwritten with a kstack VA.  Arm
+        // global DR0 on the L1 slot address so the next write triggers
+        // #DB and logs the writer's RIP.  Restricted to id=4 (only known
+        // recurring victim) to avoid interfering with other watches.
+        #[cfg(target_arch = "x86_64")]
+        if id == 4 && caller_loc != 0 {
+            // Caller is at scheduler.rs:2725 (alloc_thread_id THREAD_TABLE.set)
+            // i.e. tid=4 freshly created.  We don't filter on table identity
+            // because tid=4 in TASK_TABLE also exists, but the L1 PAs differ.
+            // L1 slot address = l1_page + l1_idx * 8.
+            let slot_addr = (l1_page as u64).wrapping_add((l1_idx as u64) * 8);
+            // Skip if the val being written looks like a PA-as-ptr (Task
+            // pointer is PA-cast, not SLAB VA) — only arm for SLAB VAs.
+            let val_u = val as u64;
+            if val_u >= 0xFFFF_FE80_0000_0000 && val_u < 0xFFFF_FF00_0000_0000 {
+                arm_thread_table_4_watchpoint(slot_addr, val_u);
+            }
         }
     }
 
