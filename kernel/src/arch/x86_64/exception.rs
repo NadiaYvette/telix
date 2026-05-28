@@ -576,6 +576,16 @@ fn validate_iretq_frame(sp: u64, fallback_sp: u64, vector: u64) -> u64 {
             // set-side bug (prev_val already wrong) vs post-set scribble
             // (prev_val was SLAB_REGION on the last set).
             crate::sched::radix::dump_set_log_for_tid(tid);
+            // Also dump L0[0] + L1[4] separately to test the L0 corruption
+            // hypothesis: if L0[0] is bogus, get(4) chases a wild L1 page
+            // and reads tref from a kstack address — which explains why
+            // a DR0 watch on the OLD L1[4] slot doesn't fire.
+            let (l0_addr, l0_entry_0, l1_4_val) =
+                crate::sched::scheduler::THREAD_TABLE.raw_l0_slots();
+            crate::dump_atomic!(
+                "VALIDATOR-RAW-RADIX: l0={:#x} l0[0]={:#x} *(l0[0]+0x20)={:#x}",
+                l0_addr, l0_entry_0, l1_4_val
+            );
         } else {
             // (Old saved_sp DR0-arm removed: it overrode the TT4 L1-slot
             // watch in radix.rs, redirecting DR0 to legitimate try_switch

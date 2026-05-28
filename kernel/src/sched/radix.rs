@@ -318,6 +318,29 @@ impl RadixTable {
         }
     }
 
+    /// Diagnostic: read L0 page address + L0[0] entry value (the L1 page
+    /// pointer for tid=0..fanout-1).  Used at VALIDATOR-BAD-TREF time to
+    /// test whether L0[0] was corrupted (would explain why a DR0 watch
+    /// on the L1 slot doesn't fire — corruption is upstream).
+    pub fn raw_l0_slots(&self) -> (u64, u64, u64) {
+        let l0 = self.l0.load(Ordering::Acquire);
+        let l0_addr = l0 as u64;
+        if l0.is_null() {
+            return (0, 0, 0);
+        }
+        let l0_entry_0 = unsafe { &*l0 }.load(Ordering::Acquire) as u64;
+        let l1_4_addr = l0_entry_0.wrapping_add(4 * 8);
+        let l1_4_val = if l0_entry_0 != 0 {
+            unsafe { core::ptr::read_volatile(l1_4_addr as *const u64) }
+        } else {
+            0
+        };
+        (l0_addr, l0_entry_0, l1_4_val)
+    }
+}
+
+impl RadixTable {
+
     /// Allocate the L0 page. Must be called once during kernel init,
     /// before any concurrent access.
     pub fn init(&self) {
