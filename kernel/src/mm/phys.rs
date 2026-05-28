@@ -13,6 +13,88 @@
 use super::page::{self, PhysAddr};
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
+// ── Per-chunk event ring (option 2 — root-cause double-issue) ────────
+//
+// Records every chunk allocator event so we can dump filtered events
+// at PA-ALIAS time and see the exact race that let two allocators
+// claim the same page.
+//
+// Each entry packs into a u64:
+//   bits [0..3]   = action code
+//   bits [4..7]   = cpu (4 bits — up to 16 CPUs)
+//   bits [8..23]  = chunk_idx
+//   bits [24..31] = page_idx (within chunk, 0..63)
+//   bits [32..63] = timestamp low 32 bits of monotonic_ns
+//
+// Ring size 1024 = ~8 KB.  At boot when allocs are heavy we record
+// 100s/sec, so 1024 entries gives ~10s of recent history.
+
+const PHYS_EVT_RING: usize = 1024;
+static PHYS_EVT: [AtomicU64; PHYS_EVT_RING] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; PHYS_EVT_RING]
+};
+static PHYS_EVT_POS: AtomicU64 = AtomicU64::new(0);
+
+// Action codes.
+const EVT_ALLOC1: u64 = 1;        // chunk_alloc_one — single page from bitmap
+const EVT_ALLOC1_FRESH: u64 = 2;  // chunk_alloc_one — all-free chunk transition
+const EVT_ALLOC1_INLINE: u64 = 3; // chunk_alloc_one — inline mode pop
+const EVT_ALLOCN_FRESH: u64 = 4;  // alloc_pages — all-free chunk
+const EVT_ALLOCN_BMP: u64 = 5;    // alloc_pages — bitmap mode
+const EVT_ALLOCN_MULTI: u64 = 6;  // alloc_pages — multi-chunk (order > 6)
+const EVT_FREE1: u64 = 7;         // chunk_free_one
+const EVT_FREEN: u64 = 8;         // free_pages
+const EVT_RESERVE: u64 = 9;       // per-CPU reservation grabbed
+const EVT_RELEASE: u64 = 10;      // per-CPU reservation released
+const EVT_CAS_FAIL_STATE: u64 = 11;  // chunk-state CAS failed (race observed)
+const EVT_CAS_FAIL_BMP: u64 = 12;    // cas_bitmap failed (race observed)
+
+#[inline]
+fn record_evt(action: u64, chunk_idx: usize, page_idx: u32) {
+    let cpu = smp::cpu_id() as u64;
+    let ts = (crate::arch::timer::monotonic_ns() & 0xFFFFFFFF) as u64;
+    let entry = (action & 0xF)
+        | ((cpu & 0xF) << 4)
+        | (((chunk_idx as u64) & 0xFFFF) << 8)
+        | (((page_idx as u64) & 0xFF) << 24)
+        | (ts << 32);
+    let i = PHYS_EVT_POS.fetch_add(1, Ordering::Relaxed) as usize % PHYS_EVT_RING;
+    PHYS_EVT[i].store(entry, Ordering::Relaxed);
+}
+
+/// Dump every event recorded in the ring that matches `target_chunk`.
+/// Called from scheduler at PA-ALIAS detection time.
+pub fn dump_evt_ring_for_chunk(target_chunk: usize) {
+    let head = PHYS_EVT_POS.load(Ordering::Relaxed);
+    let start = head.saturating_sub(PHYS_EVT_RING as u64);
+    let mut hits = 0u32;
+    crate::println!(
+        "PHYS-EVT-DUMP-BEGIN: chunk={} head={} window=[{}..{})",
+        target_chunk, head, start, head
+    );
+    for seq in start..head {
+        let i = (seq as usize) % PHYS_EVT_RING;
+        let e = PHYS_EVT[i].load(Ordering::Relaxed);
+        if e == 0 { continue; }
+        let chunk_idx = ((e >> 8) & 0xFFFF) as usize;
+        if chunk_idx != target_chunk { continue; }
+        let action = e & 0xF;
+        let cpu = (e >> 4) & 0xF;
+        let page_idx = (e >> 24) & 0xFF;
+        let ts = (e >> 32) & 0xFFFFFFFF;
+        crate::println!(
+            "PHYS-EVT: seq={} action={} cpu={} chunk={} page={} ts={}",
+            seq, action, cpu, chunk_idx, page_idx, ts
+        );
+        hits += 1;
+    }
+    crate::println!(
+        "PHYS-EVT-DUMP-END: chunk={} hits={}",
+        target_chunk, hits
+    );
+}
+
 /// Pages per chunk — matches one u64 bitmap.
 const CHUNK_PAGES: usize = 64;
 const CHUNK_SHIFT: usize = 6;
@@ -895,6 +977,7 @@ pub fn alloc_page() -> Option<PhysAddr> {
                     }
                 }
             }
+            record_evt(EVT_ALLOC1, reserved, pi);
             return Some(PhysAddr::new(pa));
         }
         // Reservation exhausted; release it.
@@ -924,6 +1007,7 @@ pub fn alloc_page() -> Option<PhysAddr> {
         if !can_reserve {
             // CPU ID doesn't fit in owner field — alloc without reservation.
             if let Some(pi) = chunk_alloc_one(ci) {
+                record_evt(EVT_ALLOC1, ci, pi);
                 return Some(PhysAddr::new(page_pa(ci, pi)));
             }
             continue;
@@ -955,6 +1039,7 @@ pub fn alloc_page() -> Option<PhysAddr> {
                     }
                 }
             }
+            record_evt(EVT_ALLOC1, ci, pi);
             return Some(PhysAddr::new(pa));
         }
     }
@@ -976,6 +1061,7 @@ pub fn alloc_page() -> Option<PhysAddr> {
         }
         tried_with_free += 1;
         if let Some(pi) = chunk_alloc_one(ci) {
+            record_evt(EVT_ALLOC1, ci, pi);
             return Some(PhysAddr::new(page_pa(ci, pi)));
         }
     }
@@ -1054,6 +1140,7 @@ pub fn free_page(addr: PhysAddr) {
     if ci >= ALLOC.total_chunks {
         return;
     }
+    record_evt(EVT_FREE1, ci, pi);
     chunk_free_one(ci, pi);
 }
 
@@ -1144,6 +1231,7 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                     .free_count_global
                     .fetch_sub(consumed as usize, Ordering::Relaxed);
 
+                record_evt(EVT_ALLOCN_FRESH, ci, 0);
                 return Some(PhysAddr::new(page_pa(ci, 0)));
             }
 
@@ -1279,6 +1367,7 @@ pub fn alloc_pages(order: usize) -> Option<PhysAddr> {
                 ALLOC
                     .free_count_global
                     .fetch_sub(global_dec as usize, Ordering::Relaxed);
+                record_evt(EVT_ALLOCN_BMP, ci, start_bit as u32);
                 return Some(PhysAddr::new(page_pa(ci, start_bit as u32)));
             }
         }
@@ -1364,6 +1453,8 @@ pub fn free_pages(addr: PhysAddr, order: usize) {
     }
     #[allow(unreachable_code)]
     let base = addr.as_usize();
+    let (ci0, pi0) = addr_to_chunk_page(base);
+    record_evt(EVT_FREEN, ci0, pi0);
     let count = 1usize << order;
     for i in 0..count {
         free_page(PhysAddr::new(base + (i << page::page_shift())));

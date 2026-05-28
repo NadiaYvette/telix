@@ -128,6 +128,15 @@ pub fn zero_daemon() -> ! {
                     pa.as_usize(),
                     n,
                 );
+                // First few skips: dump the phys allocator event ring
+                // filtered to this PA's chunk so we can see the race
+                // that let kstack + zero_daemon both think they own
+                // this page.  chunk_idx = pa / (64 pages * page_size).
+                if n < 4 {
+                    let chunk_size = 64 * crate::mm::page::page_size();
+                    let chunk_idx = pa.as_usize() / chunk_size;
+                    super::phys::dump_evt_ring_for_chunk(chunk_idx);
+                }
             }
             // Drop the PhysAddr without write_bytes / pool / free —
             // intentional leak (see comment above).
