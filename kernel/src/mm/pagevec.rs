@@ -58,13 +58,18 @@ impl PageVec {
             super::phys::alloc_page()?
         };
 
+        // #235 Phase 2b: store heap_ptr as a PHYS_DIRECT_MAP VA, not a
+        // PA, so derefs (get/set/as_slice/clear) work without PML4[0]
+        // identity.  free_heap converts back to PA via kva_to_phys.
+        let heap_va = crate::mm::page::phys_to_kva(pa.as_usize());
+
         // Zero the buffer.
         unsafe {
-            core::ptr::write_bytes(pa.as_usize() as *mut u8, 0, slab_size.min(page::page_size()));
+            core::ptr::write_bytes(heap_va as *mut u8, 0, slab_size.min(page::page_size()));
         }
 
         Some(Self {
-            heap_ptr: pa.as_usize(),
+            heap_ptr: heap_va,
             capacity: rounded as u16,
             inline: [0; INLINE_CAP],
         })
@@ -157,11 +162,13 @@ impl PageVec {
     pub fn free_heap(&mut self) {
         if self.heap_ptr != 0 {
             let slab_size = self.capacity as usize * core::mem::size_of::<usize>();
+            // #235 Phase 2b: heap_ptr is a kva; recover PA at the free edge.
+            let pa = crate::mm::page::kva_to_phys(self.heap_ptr);
             if slab_size <= 2048 {
-                super::slab::free(PhysAddr::new(self.heap_ptr), slab_size);
+                super::slab::free(PhysAddr::new(pa), slab_size);
             } else {
                 // Full page — free to phys allocator.
-                let page_base = self.heap_ptr & !(page::page_size() - 1);
+                let page_base = pa & !(page::page_size() - 1);
                 super::phys::free_page(PhysAddr::new(page_base));
             }
             self.heap_ptr = 0;

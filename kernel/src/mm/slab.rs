@@ -90,8 +90,10 @@ impl SlabCache {
     /// Ensure the slab directory page is allocated. Returns false on OOM.
     fn ensure_dir(&mut self) -> bool {
         if self.slab_dir.is_null() {
+            // #235 Phase 2b: slab_dir is a kva pointer (PHYS_DIRECT_MAP);
+            // the *values* stored in slots remain PAs.
             let page = match phys::alloc_page() {
-                Some(pa) => pa.as_usize() as *mut usize,
+                Some(pa) => crate::mm::page::phys_to_kva(pa.as_usize()) as *mut usize,
                 None => return false,
             };
             unsafe {
@@ -126,7 +128,9 @@ impl SlabCache {
         // Try existing slabs with free objects.
         for i in 0..self.slab_count {
             let page_addr = self.slab_page(i);
-            let header = unsafe { &mut *(page_addr as *mut SlabHeader) };
+            let header = unsafe {
+                &mut *(crate::mm::page::phys_to_kva(page_addr) as *mut SlabHeader)
+            };
             if header.free_head != NONE {
                 return Some(self.alloc_from_slab(page_addr, header));
             }
@@ -144,7 +148,9 @@ impl SlabCache {
         // Initialize the slab.
         self.init_slab(page_addr);
 
-        let header = unsafe { &mut *(page_addr as *mut SlabHeader) };
+        let header = unsafe {
+            &mut *(crate::mm::page::phys_to_kva(page_addr) as *mut SlabHeader)
+        };
         Some(self.alloc_from_slab(page_addr, header))
     }
 
@@ -156,7 +162,9 @@ impl SlabCache {
 
         for i in 0..self.slab_count {
             if self.slab_page(i) == page_base {
-                let header = unsafe { &mut *(page_base as *mut SlabHeader) };
+                let header = unsafe {
+                    &mut *(crate::mm::page::phys_to_kva(page_base) as *mut SlabHeader)
+                };
                 let obj_index = (addr_val - page_base - self.data_offset) / self.obj_size;
 
                 // Sanity: obj_index must be within the page's object capacity.
@@ -181,9 +189,10 @@ impl SlabCache {
                     );
                 }
 
-                // Push onto free list.
-                let obj_ptr =
-                    (page_base + self.data_offset + obj_index * self.obj_size) as *mut u16;
+                // Push onto free list (deref via direct-map VA).
+                let obj_ptr = (crate::mm::page::phys_to_kva(page_base)
+                    + self.data_offset
+                    + obj_index * self.obj_size) as *mut u16;
                 unsafe { *obj_ptr = header.free_head };
                 header.free_head = obj_index as u16;
                 header.in_use -= 1;
@@ -204,13 +213,14 @@ impl SlabCache {
 
     /// Initialize a freshly allocated slab page.
     fn init_slab(&self, page_addr: usize) {
-        // Zero the header.
-        let header = unsafe { &mut *(page_addr as *mut SlabHeader) };
+        // #235 Phase 2b: page_addr is a PA; dereference via PHYS_DIRECT_MAP.
+        let page_va = crate::mm::page::phys_to_kva(page_addr);
+        let header = unsafe { &mut *(page_va as *mut SlabHeader) };
         header.in_use = 0;
         header.capacity = self.objs_per_slab as u16;
 
         // Build free list: each free slot points to the next.
-        let base = page_addr + self.data_offset;
+        let base = page_va + self.data_offset;
         for i in 0..self.objs_per_slab {
             let slot = (base + i * self.obj_size) as *mut u16;
             let next = if i + 1 < self.objs_per_slab {
@@ -237,8 +247,10 @@ impl SlabCache {
         }
         let obj_addr = page_addr + self.data_offset + index * self.obj_size;
 
-        // Advance free list.
-        let next = unsafe { *(obj_addr as *const u16) };
+        // Advance free list (read via direct-map VA).
+        let next = unsafe {
+            *(crate::mm::page::phys_to_kva(obj_addr) as *const u16)
+        };
         header.free_head = next;
         header.in_use += 1;
 
