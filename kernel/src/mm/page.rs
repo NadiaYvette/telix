@@ -89,6 +89,27 @@ pub fn page_mmucount() -> usize {
     if v != 0 { v } else { PAGE_MMUCOUNT }
 }
 
+/// Convert a physical address to a kernel-mode virtual address through
+/// the arch's direct/identity map.  Used by callsites that historically
+/// cast `pa as *mut T` and relied on a low-VA identity mapping.
+///
+/// On x86_64 this routes through the PHYS_DIRECT_MAP at PML4[507]
+/// (`0xFFFF_FD80_0000_0000 + pa`), so the result remains kernel-reachable
+/// even after PML4[0] is eventually unmapped (#235).  On the other archs
+/// the kernel is identity-mapped and the value of `pa` is itself a
+/// valid kernel VA, so the function returns it unchanged.
+#[inline]
+pub fn phys_to_kva(pa: usize) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::x86_64::mm::phys_to_kva(pa)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        pa
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Superpage (large page) level table — architecture-dependent
 // ---------------------------------------------------------------------------

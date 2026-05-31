@@ -1489,7 +1489,11 @@ pub unsafe fn alloc_static_slice<T>(len: usize) -> &'static mut [T] {
     let page_count = (bytes + page_sz - 1) / page_sz;
     let order = (page_count.next_power_of_two()).trailing_zeros() as usize;
     let pa = alloc_pages(order).expect("alloc_static_slice: out of memory");
-    let ptr = pa.as_usize() as *mut T;
+    // #235 Phase 1: route through arch direct/identity map instead of
+    // raw PA cast.  On x86_64 this returns a PHYS_DIRECT_MAP VA so the
+    // result survives eventual PML4[0] unmapping.  Other arches are
+    // identity-mapped and `phys_to_kva` is an identity function.
+    let ptr = crate::mm::page::phys_to_kva(pa.as_usize()) as *mut T;
     unsafe {
         core::ptr::write_bytes(ptr, 0, len);
         core::slice::from_raw_parts_mut(ptr, len)
