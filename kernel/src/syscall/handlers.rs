@@ -2374,15 +2374,21 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
         None => return u64::MAX,
     };
     let header_len = if len < ps { len } else { ps };
-    let scratch_slice =
-        unsafe { core::slice::from_raw_parts_mut(scratch.as_usize() as *mut u8, header_len) };
+    let scratch_slice = unsafe {
+        core::slice::from_raw_parts_mut(
+            crate::mm::page::phys_to_kva(scratch.as_usize()) as *mut u8,
+            header_len,
+        )
+    };
     if !copy_from_user(pt_root, elf_ptr as usize, scratch_slice) {
         crate::mm::phys::free_page(scratch);
         return u64::MAX;
     }
 
     // Parse ELF header to find maximum file extent needed.
-    let ehdr = unsafe { &*(scratch.as_usize() as *const u8 as *const [u8; 64]) };
+    let ehdr = unsafe {
+        &*(crate::mm::page::phys_to_kva(scratch.as_usize()) as *const u8 as *const [u8; 64])
+    };
     if ehdr[0] != 0x7f || ehdr[1] != b'E' || ehdr[2] != b'L' || ehdr[3] != b'F' {
         crate::mm::phys::free_page(scratch);
         return u64::MAX;
@@ -2473,7 +2479,12 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
         };
         // Copy full ELF data from userspace.
         let buf_slice =
-            unsafe { core::slice::from_raw_parts_mut(pages.as_usize() as *mut u8, max_file_end) };
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    crate::mm::page::phys_to_kva(pages.as_usize()) as *mut u8,
+                    max_file_end,
+                )
+            };
         if !copy_from_user(pt_root, elf_ptr as usize, buf_slice) {
             crate::mm::phys::free_pages(pages, order);
             crate::mm::phys::free_page(scratch);
@@ -2486,7 +2497,12 @@ fn sys_spawn_elf(elf_ptr: u64, elf_len: u64, priority: u64, arg0: u64) -> u64 {
 
     // Phase C: Spawn from the buffer, then free it.
     let buf_slice =
-        unsafe { core::slice::from_raw_parts(buf_addr.as_usize() as *const u8, max_file_end) };
+        unsafe {
+            core::slice::from_raw_parts(
+                crate::mm::page::phys_to_kva(buf_addr.as_usize()) as *const u8,
+                max_file_end,
+            )
+        };
     let result = match crate::sched::spawn_user_from_elf(buf_slice, priority as u8, 20, arg0) {
         Some(tid) => {
             let task_id = crate::sched::thread_task_id(tid);
@@ -2569,9 +2585,15 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
 
     // Metadata page: array of u16 string lengths.
     let meta_lens =
-        unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u16, ps / 2) };
+        unsafe { core::slice::from_raw_parts_mut(
+            crate::mm::page::phys_to_kva(meta_page.as_usize()) as *mut u16,
+            ps / 2,
+        ) };
     let data_buf =
-        unsafe { core::slice::from_raw_parts_mut(data_pages.as_usize() as *mut u8, arg_max_total) };
+        unsafe { core::slice::from_raw_parts_mut(
+            crate::mm::page::phys_to_kva(data_pages.as_usize()) as *mut u8,
+            arg_max_total,
+        ) };
 
     let mut argc: usize = 0;
     let mut envc: usize = 0;
@@ -2835,9 +2857,15 @@ fn sys_execve(name_ptr: u64, name_len: u64, frame: &mut ExceptionFrame) {
     // We store addresses in a temporary array on the metadata page (reinterpreted as u64).
     // meta_page can hold ps/8 u64 addresses.
     let addr_buf =
-        unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u64, ps / 8) };
+        unsafe { core::slice::from_raw_parts_mut(
+            crate::mm::page::phys_to_kva(meta_page.as_usize()) as *mut u64,
+            ps / 8,
+        ) };
     let data_src =
-        unsafe { core::slice::from_raw_parts(data_pages.as_usize() as *const u8, arg_max_total) };
+        unsafe { core::slice::from_raw_parts(
+            crate::mm::page::phys_to_kva(data_pages.as_usize()) as *const u8,
+            arg_max_total,
+        ) };
 
     // Write argv strings (from top down).
     for i in 0..argc {
@@ -3125,9 +3153,15 @@ pub(crate) fn exec_for_task(
     };
 
     let meta_lens =
-        unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u16, ps / 2) };
+        unsafe { core::slice::from_raw_parts_mut(
+            crate::mm::page::phys_to_kva(meta_page.as_usize()) as *mut u16,
+            ps / 2,
+        ) };
     let data_buf = unsafe {
-        core::slice::from_raw_parts_mut(data_pages.as_usize() as *mut u8, arg_max_total)
+        core::slice::from_raw_parts_mut(
+            crate::mm::page::phys_to_kva(data_pages.as_usize()) as *mut u8,
+            arg_max_total,
+        )
     };
 
     let mut argc: usize = 0;
@@ -3401,9 +3435,15 @@ pub(crate) fn exec_for_task(
         slens_local[i] = meta_lens[i];
     }
     let addr_buf =
-        unsafe { core::slice::from_raw_parts_mut(meta_page.as_usize() as *mut u64, ps / 8) };
+        unsafe { core::slice::from_raw_parts_mut(
+            crate::mm::page::phys_to_kva(meta_page.as_usize()) as *mut u64,
+            ps / 8,
+        ) };
     let data_src =
-        unsafe { core::slice::from_raw_parts(data_pages.as_usize() as *const u8, arg_max_total) };
+        unsafe { core::slice::from_raw_parts(
+            crate::mm::page::phys_to_kva(data_pages.as_usize()) as *const u8,
+            arg_max_total,
+        ) };
 
     // argv strings (top down).
     for i in 0..argc {

@@ -693,12 +693,12 @@ fn handle_cow_fault(
             slot,
         ) {
             Some(rs) if !rs.already_copied => {
-                // Copy into the reserved slot.
+                // Copy into the reserved slot via PHYS_DIRECT_MAP.
                 let dest = rs.dest_page_pa;
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        old_pa.as_usize() as *const u8,
-                        dest as *mut u8,
+                        crate::mm::page::phys_to_kva(old_pa.as_usize()) as *const u8,
+                        crate::mm::page::phys_to_kva(dest) as *mut u8,
                         ps,
                     );
                 }
@@ -715,8 +715,8 @@ fn handle_cow_fault(
                     Some(pa) => {
                         unsafe {
                             core::ptr::copy_nonoverlapping(
-                                old_pa.as_usize() as *const u8,
-                                pa.as_usize() as *mut u8,
+                                crate::mm::page::phys_to_kva(old_pa.as_usize()) as *const u8,
+                                crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u8,
                                 ps,
                             );
                         }
@@ -732,8 +732,8 @@ fn handle_cow_fault(
             Some(pa) => {
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        old_pa.as_usize() as *const u8,
-                        pa.as_usize() as *mut u8,
+                        crate::mm::page::phys_to_kva(old_pa.as_usize()) as *const u8,
+                        crate::mm::page::phys_to_kva(pa.as_usize()) as *mut u8,
                         ps,
                     );
                 }
