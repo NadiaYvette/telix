@@ -258,6 +258,26 @@ pub fn program_oneshot(deadline_ns: u64) {
 pub static IPI_SEND_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static IPI_RECV_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Broadcast a TLB-flush IPI (vector 0xFC) to all other CPUs.
+/// The handler does `mov rax, cr3; mov cr3, rax`, flushing non-global
+/// TLB entries on the receiving CPU.  Used after demoting shared page
+/// tables (e.g. PHYS_DIRECT_MAP gigapages) so peers don't keep stale
+/// cached translations.  Spins until ICR idle; returns without waiting
+/// for the peer to actually finish the CR3 reload (caller is responsible
+/// for any additional synchronization).
+pub fn broadcast_tlb_flush() {
+    wait_icr_idle();
+    // ICR high unused (destination shorthand = all-excluding-self).
+    write(LAPIC_ICR_HIGH, 0);
+    // Vector 0xFC, fixed delivery, physical, edge, assert,
+    // destination-shorthand = 11 (All Excluding Self, bits 18-19).
+    write(LAPIC_ICR_LOW, 0xFC | (0b11 << 18));
+    wait_icr_idle();
+}
+
+/// TLB-flush IPI receive counter (diagnostic).
+pub static TLB_FLUSH_RECV_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Send a reschedule IPI (vector 0xFD) to a target CPU.
 ///
 /// The target CPU wakes from HLT (if idle) and runs try_switch(),

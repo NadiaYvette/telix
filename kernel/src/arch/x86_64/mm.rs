@@ -523,7 +523,14 @@ pub fn wprot_4k_via_direct_map(pml4: usize, pa: usize) -> bool {
     {
         return false;
     }
-    set_pte_writable(pml4, dm_va, false)
+    let ok = set_pte_writable(pml4, dm_va, false);
+    if ok {
+        // Cross-CPU shootdown: peer CPUs may have cached the 1 GiB
+        // gigapage entry covering this PA range.  Force them to drop
+        // non-global TLB entries so the new RW=0 leaf takes effect.
+        super::lapic::broadcast_tlb_flush();
+    }
+    ok
 }
 
 /// Evict a 4K MMU page: clear Present bit but preserve PTE_SW_ZEROED hint.

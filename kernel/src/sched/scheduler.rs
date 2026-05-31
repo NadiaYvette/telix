@@ -388,6 +388,13 @@ fn alloc_kstack_zeroed() -> Option<KStackHandle> {
                 let ok = crate::arch::x86_64::mm::set_pte_writable(
                     boot_pml4, (slot_va as usize) & !0xFFF, false,
                 );
+                if ok {
+                    // Cross-CPU shootdown: peers may have walked +
+                    // cached this VA from a prior visit on the same
+                    // kstack window (recycled PA).  Force them to drop
+                    // stale RW entries.
+                    crate::arch::x86_64::lapic::broadcast_tlb_flush();
+                }
                 crate::println!(
                     "PF-WPROT-ARMED: slot_va={:#x} page_base={:#x} ok={}",
                     slot_va, slot_va & !0xFFF, ok,

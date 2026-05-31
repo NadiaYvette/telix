@@ -1591,6 +1591,25 @@ extern "C" fn x86_exception_handler(frame_sp: u64) -> u64 {
             return validate_iretq_frame(crate::sched::scheduler::reschedule_ipi(frame_sp), frame_sp, 0xFD);
         }
 
+        // TLB shootdown IPI (vector 0xFC).  Sent by `broadcast_tlb_flush`
+        // after demoting shared page tables (PHYS_DIRECT_MAP gigapages).
+        // Reload CR3 to drop all non-global TLB entries so the receiving
+        // CPU walks the new PT and observes any leaf wprot.
+        0xFC => {
+            super::lapic::TLB_FLUSH_RECV_COUNT
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                core::arch::asm!(
+                    "mov {tmp}, cr3",
+                    "mov cr3, {tmp}",
+                    tmp = out(reg) _,
+                    options(nostack, preserves_flags),
+                );
+            }
+            super::lapic::eoi();
+            return validate_iretq_frame(frame_sp, frame_sp, 0xFC);
+        }
+
         // Other IRQs (33-47).
         33..=47 => {
             let irq = (vector - 32) as u8;
